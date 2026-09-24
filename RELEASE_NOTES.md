@@ -2,7 +2,7 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
-## 2026-09-24 — The SessionStart hook survives an install path with a space in it
+## 2026-09-24 — v0.2.2: the SessionStart hook survives an install path with a space in it
 
 ### Fixed
 - **The `SessionStart` hook failed whenever the plugin was installed under a path containing a space.** `hooks/hooks.json` ran `${CLAUDE_PLUGIN_ROOT}/hooks/scripts/session-start.sh` unquoted, so the shell split the expanded path into several words and the hook exited 127 (`not found`) instead of injecting recent memories. The command is now double-quoted. `claude plugin validate` flagged it.
@@ -10,7 +10,7 @@ Dated entries, newest first. One entry per merged pull request.
 
 ### Provenance
 
-Ran the hook command through `sh -c` with `CLAUDE_PLUGIN_ROOT` set to a directory containing a space: the quoted form runs the script (exit 0), the previous form fails (exit 127). The script's fallback output still parses as JSON. `claude plugin validate` no longer reports the hooks warning. No version bump: this ships with the next release, so an installed plugin keeps the old hook until then.
+Ran the hook command through `sh -c` with `CLAUDE_PLUGIN_ROOT` set to a directory containing a space: the quoted form runs the script (exit 0), the previous form fails (exit 127). The script's fallback output still parses as JSON. `claude plugin validate` no longer reports the hooks warning. Bumped to 0.2.2 (all six crates and `.claude-plugin/plugin.json`), so this ships as its own release and installed plugins pick up the new hook.
 
 ## 2026-09-24 — v0.2.1: moved into the Rusty Mill monorepo
 
