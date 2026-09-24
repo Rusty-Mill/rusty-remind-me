@@ -1,12 +1,12 @@
 {
   "name": "rusty-remind-me",
   "displayName": "Rusty Remind Me",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Persistent long-term memory for Claude Code: MCP tools for search/recall, a SessionStart hook that surfaces recent memories automatically, and /remember + /recall slash commands for direct CLI-backed writes and searches.",
   "author": {
     "name": "rusty_remind_me contributors"
   },
-  "repository": "https://github.com/baileyrd/rusty_remind_me",
+  "repository": "https://github.com/Rusty-Mill/rusty_mill",
   "license": "MIT",
   "keywords": ["memory", "mcp", "recall", "knowledge-graph", "reminders"],
   "mcpServers": "./.mcp.json",

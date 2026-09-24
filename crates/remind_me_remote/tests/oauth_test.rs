@@ -697,7 +697,11 @@ async fn a_2026_07_28_discover_lifecycle_request_authenticates_via_oauth_bearer_
     let response = client
         .post(format!("http://{addr}/mcp"))
         .headers(headers)
-        .body(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#)
+        // The per-request `_meta` every 2026-07-28 request carries -- see
+        // `discover_meta` in http_test.rs.
+        .body(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}"#,
+        )
         .send()
         .await
         .unwrap();

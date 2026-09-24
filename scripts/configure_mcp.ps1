@@ -17,8 +17,19 @@ param (
 
 # 1. Resolve Executable Path
 if ([string]::IsNullOrWhiteSpace($ExecutablePath)) {
-    $ReleaseExe = "C:\dev\rusty_remind_me\target\release\rusty-remind-me.exe"
-    $DebugExe   = "C:\dev\rusty_remind_me\target\debug\rusty-remind-me.exe"
+    # The Cargo workspace root (where Cargo.lock and target\ live) at or
+    # above this product's directory -- since the move into the rusty_mill
+    # monorepo that is the monorepo root, not the product directory itself.
+    $WorkspaceRoot = Split-Path -Parent $PSScriptRoot
+    while ($WorkspaceRoot -and -not (Test-Path (Join-Path $WorkspaceRoot "Cargo.lock"))) {
+        $WorkspaceRoot = Split-Path -Parent $WorkspaceRoot
+    }
+    if (-not $WorkspaceRoot) {
+        Write-Error "No Cargo.lock found at or above $PSScriptRoot"
+        exit 1
+    }
+    $ReleaseExe = Join-Path $WorkspaceRoot "target\release\rusty-remind-me.exe"
+    $DebugExe   = Join-Path $WorkspaceRoot "target\debug\rusty-remind-me.exe"
 
     if (Test-Path $ReleaseExe) {
         $ExecutablePath = $ReleaseExe
@@ -26,8 +37,8 @@ if ([string]::IsNullOrWhiteSpace($ExecutablePath)) {
         $ExecutablePath = $DebugExe
     } else {
         Write-Host "Building rusty-remind-me release binary..." -ForegroundColor Yellow
-        Push-Location "C:\dev\rusty_remind_me"
-        cargo build --release
+        Push-Location $WorkspaceRoot
+        cargo build --release -p rusty-remind-me
         Pop-Location
         $ExecutablePath = $ReleaseExe
     }

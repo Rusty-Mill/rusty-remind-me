@@ -86,6 +86,18 @@ fn sse_events(body: &str) -> Vec<(Option<String>, Option<Value>)> {
         .collect()
 }
 
+/// The per-request `_meta` a 2026-07-28 client attaches to every
+/// session-free (discover-lifecycle) request. The spec requires both keys,
+/// and rmcp enforces it from 3.1 on (a missing one is `-32602 Invalid
+/// params`); 3.0.1, which this crate used before joining the rusty_mill
+/// workspace, did not check.
+fn discover_meta() -> Value {
+    json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {}
+    })
+}
+
 fn mcp_headers() -> reqwest::header::HeaderMap {
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert("Content-Type", "application/json".parse().unwrap());
@@ -318,7 +330,12 @@ async fn a_2026_07_28_client_calls_a_tool_in_one_post_with_no_session_at_all() {
     let response = client
         .post(format!("http://{addr}/mcp/{TOKEN}"))
         .headers(headers)
-        .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": { "_meta": discover_meta() }
+        }))
         .send()
         .await
         .unwrap();
@@ -403,7 +420,8 @@ async fn a_2026_07_28_client_calls_a_mutating_tool_in_one_post_with_no_session_a
             "method": "tools/call",
             "params": {
                 "name": "remind_me_add",
-                "arguments": { "content": "written through the discover lifecycle" }
+                "arguments": { "content": "written through the discover lifecycle" },
+                "_meta": discover_meta()
             }
         }))
         .send()
@@ -449,7 +467,7 @@ async fn a_2026_07_28_client_reads_the_stats_resource_with_no_session() {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "resources/read",
-            "params": { "uri": "memory://stats" }
+            "params": { "uri": "memory://stats", "_meta": discover_meta() }
         }))
         .send()
         .await
@@ -479,7 +497,12 @@ async fn a_2026_07_28_client_lists_prompts_with_no_session() {
     let response = client
         .post(format!("http://{addr}/mcp/{TOKEN}"))
         .headers(headers)
-        .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": "prompts/list" }))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "prompts/list",
+            "params": { "_meta": discover_meta() }
+        }))
         .send()
         .await
         .unwrap();
@@ -521,7 +544,12 @@ async fn a_2026_07_28_client_resumes_a_dropped_response_stream_via_last_event_id
     let response = client
         .post(format!("http://{addr}/mcp/{TOKEN}"))
         .headers(headers)
-        .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": { "_meta": discover_meta() }
+        }))
         .send()
         .await
         .unwrap();

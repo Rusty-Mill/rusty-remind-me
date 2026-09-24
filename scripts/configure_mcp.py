@@ -6,14 +6,27 @@ to use rusty_remind_me as their long-term memory backend.
 
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
 
+def find_workspace_root(start: Path) -> Path:
+    """The Cargo workspace root at or above `start`: where `Cargo.lock` and
+    `target/` live. Since the move into the rusty_mill monorepo that is the
+    monorepo root, not this product's own directory."""
+    for candidate in (start, *start.parents):
+        if (candidate / "Cargo.lock").exists():
+            return candidate
+    sys.exit(f"Error: no Cargo.lock found at or above {start}")
+
+
 def find_executable() -> str:
-    root = Path(__file__).resolve().parent.parent
-    release_exe = root / "target" / "release" / ("rusty-remind-me.exe" if os.name == "nt" else "rusty-remind-me")
-    debug_exe = root / "target" / "debug" / ("rusty-remind-me.exe" if os.name == "nt" else "rusty-remind-me")
+    product_root = Path(__file__).resolve().parent.parent
+    root = find_workspace_root(product_root)
+    exe_name = "rusty-remind-me.exe" if os.name == "nt" else "rusty-remind-me"
+    release_exe = root / "target" / "release" / exe_name
+    debug_exe = root / "target" / "debug" / exe_name
 
     if release_exe.exists():
         return str(release_exe)
@@ -21,7 +34,9 @@ def find_executable() -> str:
         return str(debug_exe)
 
     print("Building rusty-remind-me binary...")
-    os.system(f"cargo build --release --manifest-path {root / 'Cargo.toml'}")
+    # `-p` rather than a bare build: at the monorepo root a bare build would
+    # compile every Rusty Mill crate, not just this one.
+    subprocess.run(["cargo", "build", "--release", "-p", "rusty-remind-me"], cwd=root, check=False)
     if release_exe.exists():
         return str(release_exe)
 

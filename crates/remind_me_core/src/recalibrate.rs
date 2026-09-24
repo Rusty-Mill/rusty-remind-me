@@ -126,8 +126,11 @@ pub fn candidates(
         predicate = predicate
     ))?;
 
+    // rusqlite 0.32+ has no `ToSql` for `usize`; a limit past `i64::MAX` is
+    // unbounded either way, so saturating is exact rather than a truncation.
+    let limit = i64::try_from(input.limit).unwrap_or(i64::MAX);
     let candidates = stmt
-        .query_map(params![input.limit], |r| {
+        .query_map(params![limit], |r| {
             Ok(RecalibrateCandidate {
                 id: r.get(0)?,
                 content_snippet: r.get(1)?,

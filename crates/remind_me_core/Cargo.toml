@@ -1,22 +1,29 @@
 [package]
 name = "remind_me_core"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+version = "0.2.1"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Rusty-Mill/rusty_mill"
+
+[package.metadata.rusty_mill]
+layer = "apps"
 
 [dependencies]
 
-serde.workspace = true
-serde_json.workspace = true
-async-trait.workspace = true
-thiserror.workspace = true
-tokio.workspace = true
-rusqlite.workspace = true
-chrono.workspace = true
-uuid.workspace = true
-sha256.workspace = true
-dirs.workspace = true
-parking_lot.workspace = true
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+async-trait = "0.1"
+thiserror = "2.0"
+tokio = { version = "1.0", features = ["full"] }
+# 0.39 rather than the 0.31 this crate used standalone: rusqlite declares
+# `links = "sqlite3"`, so Cargo allows one version per graph, and the rest of
+# the rusty_mill workspace is on 0.39.
+rusqlite = { version = "0.39", features = ["bundled", "backup", "functions"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.0", features = ["v4"] }
+sha256 = "1.5"
+dirs = "5.0"
+parking_lot = "0.12"
 pdf-extract = { version = "0.12", optional = true }
 aws-sdk-s3 = { version = "1", optional = true }
 aws-config = { version = "1", optional = true }
