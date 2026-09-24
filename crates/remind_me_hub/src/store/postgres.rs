@@ -321,6 +321,14 @@ impl HubStore for PostgresStore {
         let mut tx = client.transaction().map_err(err)?;
         let applied = match record {
             Record::Memory(m) => {
+                // Serialise memory writes until this transaction ends, so
+                // `hub_seq` (handed out by `nextval()` at statement time)
+                // becomes visible in the order it was assigned. Without it,
+                // concurrent pushes commit out of sequence order and a puller
+                // on the `Seq` cursor advances past a value that commits a
+                // moment later, skipping that row for good.
+                tx.execute("SELECT pg_advisory_xact_lock($1)", &[&HUB_SEQ_LOCK_KEY])
+                    .map_err(err)?;
                 let access_count = i32::try_from(m.access_count).unwrap_or(i32::MAX);
                 let changed = tx
                     .execute(
@@ -738,6 +746,11 @@ impl HubStore for PostgresStore {
             .collect())
     }
 }
+
+/// Key for the transaction-scoped advisory lock that orders memory writes by
+/// `hub_seq` (see `apply_record`). Any fixed value works as long as nothing
+/// else in the hub's database uses it; this one is ASCII "rrmhbseq".
+const HUB_SEQ_LOCK_KEY: i64 = 0x7272_6d68_6273_6571;
 
 /// Whole-row LWW on `updated_at`, with `hub_seq` bumped on every write.
 ///

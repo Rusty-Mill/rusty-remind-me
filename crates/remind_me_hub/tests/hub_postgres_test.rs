@@ -20,7 +20,8 @@
 //!
 //! - the legacy TIMESTAMPTZ→TEXT migration, which is the whole "drop-in"
 //!   claim and cannot be exercised anywhere else,
-//! - `nextval()`-driven `hub_seq`,
+//! - `nextval()`-driven `hub_seq`, including that concurrent pushes cannot
+//!   commit out of sequence order and make a `Seq`-cursor puller skip a row,
 //! - planner estimates, which SQLite answers `None` to,
 //! - and a differential check that both backends agree, which is the only
 //!   thing that makes the trait more than a hopeful interface.
@@ -390,5 +391,92 @@ fn both_backends_answer_the_same_protocol_identically() {
         pg.count_tables(&COUNTABLE).unwrap(),
         lite.count_tables(&COUNTABLE).unwrap(),
         "the two backends disagreed on /count"
+    );
+}
+
+/// Concurrent pushes must never let a puller on the `Seq` cursor skip a row.
+///
+/// `nextval()` hands out `hub_seq` at statement time, but a row becomes
+/// visible at commit. Without the advisory lock in `apply_record`, a push
+/// holding seq 11 could commit after one holding seq 12; a puller that had
+/// already read 12 would move its cursor past 11 and never see that row. This
+/// ran 1200 pushes on 8 threads and skipped 36-40 rows on every run before
+/// the fix. The SQLite backend serialises writes and never skipped any.
+#[test]
+fn a_seq_puller_sees_every_row_under_concurrent_pushes() {
+    let Some(url) = url() else {
+        eprintln!("SKIP: REMIND_ME_HUB_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let _guard = DB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let store = std::sync::Arc::new(store(&url));
+    const WRITERS: usize = 8;
+    const PER_WRITER: usize = 150;
+    let pushing_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let puller = {
+        let store = std::sync::Arc::clone(&store);
+        let pushing_done = std::sync::Arc::clone(&pushing_done);
+        std::thread::spawn(move || {
+            let mut seen = std::collections::HashSet::new();
+            let mut cursor = 0i64;
+            loop {
+                // Read the flag before draining, so the drain after the last
+                // push has finished is always a complete one.
+                let finished = pushing_done.load(std::sync::atomic::Ordering::SeqCst);
+                loop {
+                    let page = store
+                        .pull_memories(&PullQuery {
+                            cursor: PullCursor::Seq(cursor),
+                            exclude_node: None,
+                            full: false,
+                            limit: 50,
+                        })
+                        .expect("pull");
+                    if page.is_empty() {
+                        break;
+                    }
+                    for row in &page {
+                        seen.insert(row["id"].as_str().expect("id").to_string());
+                        cursor = cursor.max(row["hub_seq"].as_i64().expect("hub_seq"));
+                    }
+                }
+                if finished {
+                    return seen;
+                }
+            }
+        })
+    };
+
+    let pushers: Vec<_> = (0..WRITERS)
+        .map(|w| {
+            let store = std::sync::Arc::clone(&store);
+            std::thread::spawn(move || {
+                for i in 0..PER_WRITER {
+                    apply(
+                        store.as_ref(),
+                        &memory(&format!("m-{w}-{i}"), "2026-08-05T12:00:00Z"),
+                        "node-a",
+                    );
+                }
+            })
+        })
+        .collect();
+    for pusher in pushers {
+        pusher.join().expect("pusher thread");
+    }
+    pushing_done.store(true, std::sync::atomic::Ordering::SeqCst);
+    let seen = puller.join().expect("puller thread");
+
+    let missed: Vec<String> = (0..WRITERS)
+        .flat_map(|w| (0..PER_WRITER).map(move |i| format!("m-{w}-{i}")))
+        .filter(|id| !seen.contains(id))
+        .collect();
+    assert!(
+        missed.is_empty(),
+        "a Seq-cursor puller skipped {} of {} rows, e.g. {:?}",
+        missed.len(),
+        WRITERS * PER_WRITER,
+        &missed[..missed.len().min(5)]
     );
 }
