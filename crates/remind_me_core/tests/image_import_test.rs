@@ -12,6 +12,12 @@ use remind_me_core::models::{ImportKind, ImportOutcome};
 use remind_me_core::Database;
 
 /// Model paths are process-wide env vars, so these run one at a time.
+///
+/// Every test that *reads* the environment takes this too, not just the
+/// ones that write it: `import()` opens a `Database`, which reads its
+/// configuration from env vars, and glibc's `getenv` racing another
+/// thread's `setenv`/`unsetenv` can read a freed `environ` and SIGSEGV the
+/// whole test binary (seen in CI, and about 1 run in 400 locally).
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn clear_model_env() {
@@ -53,6 +59,7 @@ fn availability_matches_the_compiled_feature() {
 
 #[test]
 fn every_image_suffix_is_accepted_as_a_supported_format() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     for name in ["shot.png", "shot.jpg", "shot.jpeg"] {
         let reason = refusal(import(b"not really an image", name, ImportKind::Auto));
         // Whatever else goes wrong, it must not be "we don't handle .png".
@@ -65,12 +72,14 @@ fn every_image_suffix_is_accepted_as_a_supported_format() {
 
 #[test]
 fn an_image_import_is_refused_for_a_non_image_file() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let reason = refusal(import(b"# notes", "notes.md", ImportKind::Image));
     assert!(reason.contains("image import does not support"), "{reason}");
 }
 
 #[test]
 fn an_image_cannot_be_forced_through_a_text_parser() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // The bytes have no text reading at all, so parsing them as prose would
     // produce a memory full of lossily-decoded binary rather than an error.
     let reason = refusal(import(b"\x89PNG\r\n", "shot.png", ImportKind::Document));
@@ -168,6 +177,7 @@ mod without_the_feature {
 
     #[test]
     fn importing_an_image_fails_loudly_rather_than_succeeding_with_nothing() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let reason = refusal(import(
             b"\x89PNG\r\n\x1a\n",
             "receipt.png",
