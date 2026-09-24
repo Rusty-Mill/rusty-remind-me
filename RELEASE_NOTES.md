@@ -2,6 +2,23 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-24 — Test binaries no longer segfault when a test changes an env var
+
+### Fixed
+- **Any test binary could crash with SIGSEGV when a test changed an environment variable.** Tests run on parallel threads. A core dump showed the crash was SQLite's one-time setup, which runs on the first connection a process opens and reads `SQLITE_TMPDIR`/`TMPDIR` with C `getenv`. That call takes no lock, and glibc's `setenv` on another thread can free the array it is walking. `image_import_test` hit this in CI twice.
+- Every test-side env write (480 call sites across 64 files) now goes through `crate::test_env::set_var`/`remove_var`. The helper, in `remind_me_core/src/test_env.rs`, finishes SQLite's setup once per binary before its first write. After that SQLite never reads the environment again, so no test needs a lock merely to be safe from a write it never sees.
+- A new `clippy.toml` at the product root disallows `std::env::set_var`/`remove_var`, so a direct call fails `clippy -D warnings`. CONTRIBUTING documents the rule.
+
+Test-only: no product code or behaviour changes, so no version bump.
+
+### Provenance
+
+Reproduced the crash on the pre-fix `image_import_test` binary: it segfaulted on run 1214, and the core dump's faulting frame was `getenv("SQLITE_TMPDIR")` inside `sqlite3_initialize`, racing a concurrent `set_var`. The same pre-fix test, changed only to write through the helper, ran 3000 times with 0 segfaults, where about 7 would be expected at the old rate.
+
+Also checked that no two library test modules write the same variable under different locks. The only shared one, `SYNC_SECRET_ENV`, already shares `sync`'s lock. Clippy with `-D warnings` on Rust 1.98 is clean for the default, combined-features and `cloud-backup` builds; a probe test calling `std::env::set_var` directly is rejected.
+
+Full suites on Rust 1.98: default features across all six crates 1950 passed, 0 failed; `remind_me_core` with `ann,ocr,rerank,local-embed,pdf` 1478 passed; with `cloud-backup` 1477 passed.
+
 ## 2026-09-24 — v0.2.2: the SessionStart hook survives an install path with a space in it
 
 ### Fixed
