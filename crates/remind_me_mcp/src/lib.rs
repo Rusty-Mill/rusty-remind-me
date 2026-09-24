@@ -8,6 +8,10 @@
 // restructuring is the better answer once it is closer to sixty.
 #![recursion_limit = "512"]
 
+#[cfg(test)]
+#[path = "../../remind_me_core/src/test_env.rs"]
+mod test_env;
+
 pub mod render;
 
 /// The response format a call asked for, defaulting to **JSON** (#206).
@@ -4064,7 +4068,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let state_file = dir.join("oauth.json");
-        std::env::set_var(
+        crate::test_env::set_var(
             remind_me_core::remote::REMOTE_OAUTH_STATE_FILE_ENV,
             &state_file,
         );
@@ -4160,7 +4164,7 @@ mod tests {
         .unwrap();
         assert_eq!(unknown["status"], "error");
 
-        std::env::remove_var(remind_me_core::remote::REMOTE_OAUTH_STATE_FILE_ENV);
+        crate::test_env::remove_var(remind_me_core::remote::REMOTE_OAUTH_STATE_FILE_ENV);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4169,7 +4173,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // No REMIND_ME_EMBEDDING_BACKEND in the test environment, so this
         // must report degraded rather than silently doing nothing.
-        std::env::remove_var(remind_me_core::embedder::EMBEDDING_BACKEND_ENV);
+        crate::test_env::remove_var(remind_me_core::embedder::EMBEDDING_BACKEND_ENV);
         let db = Database::open_in_memory().unwrap();
         let server = McpServer::new(db);
 
@@ -4530,7 +4534,7 @@ mod tests {
     #[test]
     fn test_server_status_carries_the_webhook() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var(remind_me_core::embedder::EMBEDDING_BACKEND_ENV);
+        crate::test_env::remove_var(remind_me_core::embedder::EMBEDDING_BACKEND_ENV);
         let db = Database::open_in_memory().unwrap();
         let server = McpServer::new(db);
 
@@ -4584,12 +4588,12 @@ mod tests {
                 .expect("write response");
         });
 
-        std::env::set_var(remind_me_core::embedder::EMBEDDING_BACKEND_ENV, "ollama");
-        std::env::set_var(
+        crate::test_env::set_var(remind_me_core::embedder::EMBEDDING_BACKEND_ENV, "ollama");
+        crate::test_env::set_var(
             remind_me_core::embedder::OLLAMA_URL_ENV,
             format!("http://127.0.0.1:{port}"),
         );
-        std::env::set_var(remind_me_core::embedder::EMBEDDING_DIM_ENV, "2");
+        crate::test_env::set_var(remind_me_core::embedder::EMBEDDING_DIM_ENV, "2");
 
         let db = Database::open_in_memory().unwrap();
         let server = McpServer::new(db);
@@ -4600,9 +4604,9 @@ mod tests {
         )))
         .unwrap();
 
-        std::env::remove_var(remind_me_core::embedder::EMBEDDING_BACKEND_ENV);
-        std::env::remove_var(remind_me_core::embedder::OLLAMA_URL_ENV);
-        std::env::remove_var(remind_me_core::embedder::EMBEDDING_DIM_ENV);
+        crate::test_env::remove_var(remind_me_core::embedder::EMBEDDING_BACKEND_ENV);
+        crate::test_env::remove_var(remind_me_core::embedder::OLLAMA_URL_ENV);
+        crate::test_env::remove_var(remind_me_core::embedder::EMBEDDING_DIM_ENV);
         handle.join().unwrap();
 
         assert_eq!(
@@ -4746,7 +4750,7 @@ mod tests {
         let _lock = CODE_ROOTS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var(remind_me_core::code_refs::CODE_ROOTS_ENV);
+        crate::test_env::remove_var(remind_me_core::code_refs::CODE_ROOTS_ENV);
 
         let db = Database::open_in_memory().unwrap();
         let server = McpServer::new(db);
@@ -4771,7 +4775,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let file = root.join("auth.rs");
         std::fs::write(&file, "fn login() {}\n").unwrap();
-        std::env::set_var(
+        crate::test_env::set_var(
             remind_me_core::code_refs::CODE_ROOTS_ENV,
             root.display().to_string(),
         );
@@ -4786,7 +4790,7 @@ mod tests {
         std::fs::remove_file(&file).unwrap();
 
         let res = call(&server, "remind_me_stale_candidates", json!({}));
-        std::env::remove_var(remind_me_core::code_refs::CODE_ROOTS_ENV);
+        crate::test_env::remove_var(remind_me_core::code_refs::CODE_ROOTS_ENV);
         let _ = std::fs::remove_dir_all(&root);
 
         assert!(res.get("isError").is_none());
@@ -4806,7 +4810,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let file = root.join("auth.rs");
         std::fs::write(&file, "fn login() {}\n").unwrap();
-        std::env::set_var(
+        crate::test_env::set_var(
             remind_me_core::code_refs::CODE_ROOTS_ENV,
             root.display().to_string(),
         );
@@ -4823,7 +4827,7 @@ mod tests {
         std::fs::remove_file(&file).unwrap();
 
         let res = call(&server, "remind_me_stale_candidates", json!({ "limit": 2 }));
-        std::env::remove_var(remind_me_core::code_refs::CODE_ROOTS_ENV);
+        crate::test_env::remove_var(remind_me_core::code_refs::CODE_ROOTS_ENV);
         let _ = std::fs::remove_dir_all(&root);
 
         assert!(res.get("isError").is_none());

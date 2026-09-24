@@ -1,5 +1,8 @@
 //! Coverage for the on-disk wiki: reconcile, load and compile.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 use remind_me_core::db::queries;
 use remind_me_core::wiki::WikiDeleteOutcome;
 use remind_me_core::wiki_fs::{
@@ -678,13 +681,13 @@ fn from_env_defaults_to_the_hyphenated_data_directory() {
     // "hyphenated, not underscored" without depending on which OS this
     // runs on.
     let original_wiki_dir = std::env::var(WIKI_DIR_ENV).ok();
-    std::env::remove_var(WIKI_DIR_ENV);
+    crate::test_env::remove_var(WIKI_DIR_ENV);
 
     let wiki = Wiki::from_env();
 
     match original_wiki_dir {
-        Some(v) => std::env::set_var(WIKI_DIR_ENV, v),
-        None => std::env::remove_var(WIKI_DIR_ENV),
+        Some(v) => crate::test_env::set_var(WIKI_DIR_ENV, v),
+        None => crate::test_env::remove_var(WIKI_DIR_ENV),
     }
 
     let home = std::path::PathBuf::from(remind_me_core::import_paths::home_dir_var().unwrap());

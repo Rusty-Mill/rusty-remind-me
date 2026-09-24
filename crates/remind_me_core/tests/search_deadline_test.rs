@@ -13,6 +13,9 @@
 //! someone later makes the deadline preemptive, that test should be the one
 //! that tells them the contract changed.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 use remind_me_core::db::queries;
 use remind_me_core::embedder::{EmbedError, EmbedRole, Embedder, EmbeddingIdentity};
 use remind_me_core::retrieval::{Deadline, SEARCH_DEADLINE_ENV};
@@ -102,20 +105,20 @@ fn query(q: &str) -> MemorySearchInput {
 struct EnvGuard;
 impl EnvGuard {
     fn set(ms: &str) -> Self {
-        std::env::set_var(SEARCH_DEADLINE_ENV, ms);
+        crate::test_env::set_var(SEARCH_DEADLINE_ENV, ms);
         EnvGuard
     }
 }
 impl Drop for EnvGuard {
     fn drop(&mut self) {
-        std::env::remove_var(SEARCH_DEADLINE_ENV);
+        crate::test_env::remove_var(SEARCH_DEADLINE_ENV);
     }
 }
 
 #[test]
 fn without_a_deadline_nothing_is_reported_and_nothing_is_skipped() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var(SEARCH_DEADLINE_ENV);
+    crate::test_env::remove_var(SEARCH_DEADLINE_ENV);
 
     let db = db("unset");
     let conn = db.conn();
@@ -232,7 +235,7 @@ fn a_zero_or_malformed_deadline_reads_as_unbounded() {
 #[test]
 fn elapsed_time_is_reported_even_on_a_clean_run() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var(SEARCH_DEADLINE_ENV);
+    crate::test_env::remove_var(SEARCH_DEADLINE_ENV);
 
     let db = db("elapsed");
     let conn = db.conn();
@@ -252,7 +255,7 @@ fn elapsed_time_is_reported_even_on_a_clean_run() {
 #[test]
 fn an_empty_query_still_reports_its_timing() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var(SEARCH_DEADLINE_ENV);
+    crate::test_env::remove_var(SEARCH_DEADLINE_ENV);
 
     let db = db("empty_query");
     let conn = db.conn();
@@ -275,7 +278,7 @@ fn a_category_containing_a_single_quote_is_matched_via_bound_parameter() {
     // input this test exercises, on the code path (`search_memories_budgeted`
     // / `search_memories_deadlined`) that had the bug.
     let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var(SEARCH_DEADLINE_ENV);
+    crate::test_env::remove_var(SEARCH_DEADLINE_ENV);
 
     let db = db("quote_category");
     let conn = db.conn();

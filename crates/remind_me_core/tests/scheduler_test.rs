@@ -6,6 +6,9 @@
 //! tests drive `poll_once_with` through a counting hook rather than asserting
 //! on log output.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 use remind_me_core::models::ReminderWindow;
 use remind_me_core::reminders::{list_reminders, set_reminder};
 use remind_me_core::scheduler::{due_reminders, poll_once_with};
@@ -303,7 +306,7 @@ fn the_running_loop_delivers_without_anyone_calling_a_tool() {
     // because something asked. Everything above this test drives `poll_once`
     // by hand, which would pass just as happily against a loop that never ran.
     let _env = POLL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var(remind_me_core::scheduler::POLL_INTERVAL_ENV, "1");
+    crate::test_env::set_var(remind_me_core::scheduler::POLL_INTERVAL_ENV, "1");
     let scheduler = remind_me_core::scheduler::start_scheduler(path.clone());
 
     let observer = Database::open(&path).unwrap();
@@ -325,7 +328,7 @@ fn the_running_loop_delivers_without_anyone_calling_a_tool() {
     }
 
     scheduler.stop();
-    std::env::remove_var(remind_me_core::scheduler::POLL_INTERVAL_ENV);
+    crate::test_env::remove_var(remind_me_core::scheduler::POLL_INTERVAL_ENV);
 
     assert_eq!(delivered, 1, "the loop delivered it unprompted");
 }
@@ -340,11 +343,11 @@ fn stopping_the_loop_does_not_wait_out_the_poll_interval() {
     // most of it. Shutdown has to interrupt the wait, or stopping a server
     // stalls on a thread with nothing left to do.
     let _env = POLL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var(remind_me_core::scheduler::POLL_INTERVAL_ENV, "3600");
+    crate::test_env::set_var(remind_me_core::scheduler::POLL_INTERVAL_ENV, "3600");
     let scheduler = remind_me_core::scheduler::start_scheduler(path);
     let started = std::time::Instant::now();
     scheduler.stop();
-    std::env::remove_var(remind_me_core::scheduler::POLL_INTERVAL_ENV);
+    crate::test_env::remove_var(remind_me_core::scheduler::POLL_INTERVAL_ENV);
 
     assert!(
         started.elapsed() < std::time::Duration::from_secs(10),

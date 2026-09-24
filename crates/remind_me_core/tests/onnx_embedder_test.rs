@@ -7,6 +7,9 @@
 //! exercising — the same reasoning `reranker_test.rs` states for its own
 //! `a_model_file_that_is_not_a_model_keeps_the_rrf_order`.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 use remind_me_core::embedder::{
     self, EmbedRole, Embedder, OnnxEmbedder, DEFAULT_EMBEDDING_DIM, EMBEDDING_BACKEND_ENV,
     EMBEDDING_DIM_ENV, ONNX_MODEL_PATH_ENV, ONNX_TOKENIZER_PATH_ENV,
@@ -26,7 +29,7 @@ fn clear_env() {
         ONNX_MODEL_PATH_ENV,
         ONNX_TOKENIZER_PATH_ENV,
     ] {
-        std::env::remove_var(var);
+        crate::test_env::remove_var(var);
     }
 }
 
@@ -34,10 +37,10 @@ fn clear_env() {
 fn resolve_embedder_dispatches_to_onnx_with_the_configured_paths_and_dim() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_env();
-    std::env::set_var(EMBEDDING_BACKEND_ENV, "onnx");
-    std::env::set_var(ONNX_MODEL_PATH_ENV, "/some/model.rten");
-    std::env::set_var(ONNX_TOKENIZER_PATH_ENV, "/some/tokenizer.json");
-    std::env::set_var(EMBEDDING_DIM_ENV, "384");
+    crate::test_env::set_var(EMBEDDING_BACKEND_ENV, "onnx");
+    crate::test_env::set_var(ONNX_MODEL_PATH_ENV, "/some/model.rten");
+    crate::test_env::set_var(ONNX_TOKENIZER_PATH_ENV, "/some/tokenizer.json");
+    crate::test_env::set_var(EMBEDDING_DIM_ENV, "384");
 
     let resolved = embedder::resolve_embedder().expect("onnx backend should resolve");
     let identity = resolved.identity();
@@ -53,9 +56,9 @@ fn resolve_embedder_dispatches_to_onnx_with_the_configured_paths_and_dim() {
 fn resolve_embedder_defaults_the_dimension_when_unset() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_env();
-    std::env::set_var(EMBEDDING_BACKEND_ENV, "onnx");
-    std::env::set_var(ONNX_MODEL_PATH_ENV, "/some/model.rten");
-    std::env::set_var(ONNX_TOKENIZER_PATH_ENV, "/some/tokenizer.json");
+    crate::test_env::set_var(EMBEDDING_BACKEND_ENV, "onnx");
+    crate::test_env::set_var(ONNX_MODEL_PATH_ENV, "/some/model.rten");
+    crate::test_env::set_var(ONNX_TOKENIZER_PATH_ENV, "/some/tokenizer.json");
 
     let resolved = embedder::resolve_embedder().unwrap();
     assert_eq!(resolved.dim(), DEFAULT_EMBEDDING_DIM);
@@ -67,7 +70,7 @@ fn resolve_embedder_defaults_the_dimension_when_unset() {
 fn resolve_embedder_is_none_for_a_backend_that_is_neither_ollama_nor_onnx() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_env();
-    std::env::set_var(EMBEDDING_BACKEND_ENV, "something-else");
+    crate::test_env::set_var(EMBEDDING_BACKEND_ENV, "something-else");
     assert!(embedder::resolve_embedder().is_none());
     clear_env();
 }

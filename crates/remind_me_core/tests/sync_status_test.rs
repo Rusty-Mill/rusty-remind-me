@@ -9,6 +9,9 @@
 //! Reading liveness off the content cursors conflates them, and the conflation
 //! is invisible until a peer actually stalls.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 use remind_me_core::db::queries;
 use remind_me_core::sync::{sync_repair, sync_status, HUB_URL_ENV, NODE_ID_ENV, SYNC_SECRET_ENV};
 use remind_me_core::{Database, DrainVerdict, MemoryAddInput, SyncStatus};
@@ -24,15 +27,15 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 const EPOCH: &str = "1970-01-01T00:00:00+00:00";
 
 fn enable_sync() {
-    std::env::set_var(NODE_ID_ENV, "node-status-test");
-    std::env::set_var(HUB_URL_ENV, "http://hub.example");
-    std::env::set_var(SYNC_SECRET_ENV, "shh");
+    crate::test_env::set_var(NODE_ID_ENV, "node-status-test");
+    crate::test_env::set_var(HUB_URL_ENV, "http://hub.example");
+    crate::test_env::set_var(SYNC_SECRET_ENV, "shh");
 }
 
 fn disable_sync() {
-    std::env::remove_var(NODE_ID_ENV);
-    std::env::remove_var(HUB_URL_ENV);
-    std::env::remove_var(SYNC_SECRET_ENV);
+    crate::test_env::remove_var(NODE_ID_ENV);
+    crate::test_env::remove_var(HUB_URL_ENV);
+    crate::test_env::remove_var(SYNC_SECRET_ENV);
 }
 
 fn add(conn: &Connection, content: &str) {

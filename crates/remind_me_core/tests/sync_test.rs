@@ -8,6 +8,9 @@
 //! default, so every test that touches any of them holds `ENV_LOCK` for the
 //! duration -- the same convention `mempalace_import_test.rs` established.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 mod support;
 
 use remind_me_core::db::queries;
@@ -284,9 +287,9 @@ fn outbox_row_count(conn: &Connection, memory_id: &str, sent: bool) -> i64 {
 #[test]
 fn applying_an_incoming_record_marks_only_its_own_echo_as_sent() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var(NODE_ID_ENV, "local-node");
-    std::env::set_var(HUB_URL_ENV, "http://hub.example");
-    std::env::set_var(SYNC_SECRET_ENV, "shh");
+    crate::test_env::set_var(NODE_ID_ENV, "local-node");
+    crate::test_env::set_var(HUB_URL_ENV, "http://hub.example");
+    crate::test_env::set_var(SYNC_SECRET_ENV, "shh");
     let db = Database::open_in_memory().unwrap();
     let conn = db.conn();
     let id = add(&conn, "local content");
@@ -321,9 +324,9 @@ fn applying_an_incoming_record_marks_only_its_own_echo_as_sent() {
         1,
         "only this write's own echo is marked sent"
     );
-    std::env::remove_var(NODE_ID_ENV);
-    std::env::remove_var(HUB_URL_ENV);
-    std::env::remove_var(SYNC_SECRET_ENV);
+    crate::test_env::remove_var(NODE_ID_ENV);
+    crate::test_env::remove_var(HUB_URL_ENV);
+    crate::test_env::remove_var(SYNC_SECRET_ENV);
 }
 
 // ---------------------------------------------------------------------------
@@ -333,8 +336,8 @@ fn applying_an_incoming_record_marks_only_its_own_echo_as_sent() {
 #[test]
 fn add_memory_stamps_the_configured_node_id_and_client() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var(NODE_ID_ENV, "node-a");
-    std::env::set_var(CLIENT_ENV, "laptop");
+    crate::test_env::set_var(NODE_ID_ENV, "node-a");
+    crate::test_env::set_var(CLIENT_ENV, "laptop");
 
     let db = Database::open_in_memory().unwrap();
     let conn = db.conn();
@@ -348,8 +351,8 @@ fn add_memory_stamps_the_configured_node_id_and_client() {
         )
         .unwrap();
 
-    std::env::remove_var(NODE_ID_ENV);
-    std::env::remove_var(CLIENT_ENV);
+    crate::test_env::remove_var(NODE_ID_ENV);
+    crate::test_env::remove_var(CLIENT_ENV);
     assert_eq!(node_id, "node-a");
     assert_eq!(client, "laptop");
 }
@@ -357,8 +360,8 @@ fn add_memory_stamps_the_configured_node_id_and_client() {
 #[test]
 fn add_memory_stamps_empty_node_id_and_unknown_client_by_default() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var(NODE_ID_ENV);
-    std::env::remove_var(CLIENT_ENV);
+    crate::test_env::remove_var(NODE_ID_ENV);
+    crate::test_env::remove_var(CLIENT_ENV);
 
     let db = Database::open_in_memory().unwrap();
     let conn = db.conn();
@@ -378,9 +381,9 @@ fn add_memory_stamps_empty_node_id_and_unknown_client_by_default() {
 #[test]
 fn delete_is_a_hard_delete_when_sync_is_not_configured() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var(NODE_ID_ENV);
-    std::env::remove_var(HUB_URL_ENV);
-    std::env::remove_var(SYNC_SECRET_ENV);
+    crate::test_env::remove_var(NODE_ID_ENV);
+    crate::test_env::remove_var(HUB_URL_ENV);
+    crate::test_env::remove_var(SYNC_SECRET_ENV);
     assert!(!sync::sync_enabled());
 
     let db = Database::open_in_memory().unwrap();
@@ -403,9 +406,9 @@ fn delete_is_a_hard_delete_when_sync_is_not_configured() {
 #[test]
 fn delete_tombstones_instead_of_hard_deleting_when_sync_is_configured() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var(NODE_ID_ENV, "node-a");
-    std::env::set_var(HUB_URL_ENV, "http://hub.example:8766");
-    std::env::set_var(SYNC_SECRET_ENV, "s3cret");
+    crate::test_env::set_var(NODE_ID_ENV, "node-a");
+    crate::test_env::set_var(HUB_URL_ENV, "http://hub.example:8766");
+    crate::test_env::set_var(SYNC_SECRET_ENV, "s3cret");
     assert!(sync::sync_enabled());
 
     let db = Database::open_in_memory().unwrap();
@@ -414,9 +417,9 @@ fn delete_tombstones_instead_of_hard_deleting_when_sync_is_configured() {
 
     let deleted = queries::delete_memory(&conn, &id).unwrap();
 
-    std::env::remove_var(NODE_ID_ENV);
-    std::env::remove_var(HUB_URL_ENV);
-    std::env::remove_var(SYNC_SECRET_ENV);
+    crate::test_env::remove_var(NODE_ID_ENV);
+    crate::test_env::remove_var(HUB_URL_ENV);
+    crate::test_env::remove_var(SYNC_SECRET_ENV);
 
     assert!(deleted);
     let (deleted_at, updated_at): (Option<String>, String) = conn
@@ -435,9 +438,9 @@ fn delete_tombstones_instead_of_hard_deleting_when_sync_is_configured() {
 #[test]
 fn a_second_delete_of_an_already_tombstoned_memory_reports_not_found() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var(NODE_ID_ENV, "node-a");
-    std::env::set_var(HUB_URL_ENV, "http://hub.example:8766");
-    std::env::set_var(SYNC_SECRET_ENV, "s3cret");
+    crate::test_env::set_var(NODE_ID_ENV, "node-a");
+    crate::test_env::set_var(HUB_URL_ENV, "http://hub.example:8766");
+    crate::test_env::set_var(SYNC_SECRET_ENV, "s3cret");
 
     let db = Database::open_in_memory().unwrap();
     let conn = db.conn();
@@ -446,9 +449,9 @@ fn a_second_delete_of_an_already_tombstoned_memory_reports_not_found() {
 
     let second = queries::delete_memory(&conn, &id).unwrap();
 
-    std::env::remove_var(NODE_ID_ENV);
-    std::env::remove_var(HUB_URL_ENV);
-    std::env::remove_var(SYNC_SECRET_ENV);
+    crate::test_env::remove_var(NODE_ID_ENV);
+    crate::test_env::remove_var(HUB_URL_ENV);
+    crate::test_env::remove_var(SYNC_SECRET_ENV);
     assert!(
         !second,
         "an already-tombstoned memory is not live to delete again"
@@ -471,15 +474,15 @@ const SECRET: &str = "hub-secret";
 /// that pushes a locally-written memory holds `ENV_LOCK` and sets the three
 /// sync env vars first.
 fn enable_sync(node_id: &str) {
-    std::env::set_var(NODE_ID_ENV, node_id);
-    std::env::set_var(HUB_URL_ENV, "http://hub.example");
-    std::env::set_var(SYNC_SECRET_ENV, SECRET);
+    crate::test_env::set_var(NODE_ID_ENV, node_id);
+    crate::test_env::set_var(HUB_URL_ENV, "http://hub.example");
+    crate::test_env::set_var(SYNC_SECRET_ENV, SECRET);
 }
 
 fn disable_sync() {
-    std::env::remove_var(NODE_ID_ENV);
-    std::env::remove_var(HUB_URL_ENV);
-    std::env::remove_var(SYNC_SECRET_ENV);
+    crate::test_env::remove_var(NODE_ID_ENV);
+    crate::test_env::remove_var(HUB_URL_ENV);
+    crate::test_env::remove_var(SYNC_SECRET_ENV);
 }
 
 #[test]

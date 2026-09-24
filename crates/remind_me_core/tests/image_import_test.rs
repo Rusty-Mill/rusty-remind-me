@@ -7,22 +7,24 @@
 //! configuration surface and the refusal paths, which is honestly the whole
 //! of what is checkable without one.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 use remind_me_core::image_import;
 use remind_me_core::models::{ImportKind, ImportOutcome};
 use remind_me_core::Database;
 
 /// Model paths are process-wide env vars, so these run one at a time.
 ///
-/// Every test that *reads* the environment takes this too, not just the
-/// ones that write it: `import()` opens a `Database`, which reads its
-/// configuration from env vars, and glibc's `getenv` racing another
-/// thread's `setenv`/`unsetenv` can read a freed `environ` and SIGSEGV the
-/// whole test binary (seen in CI, and about 1 run in 400 locally).
+/// The tests that import take this too, not just the ones that write: an
+/// import reads the model paths, so without it an import could see another
+/// test's half-set configuration. (The SIGSEGV this file used to hit is
+/// fixed in `test_env`, not by this lock.)
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn clear_model_env() {
-    std::env::remove_var(image_import::DETECTION_MODEL_ENV);
-    std::env::remove_var(image_import::RECOGNITION_MODEL_ENV);
+    crate::test_env::remove_var(image_import::DETECTION_MODEL_ENV);
+    crate::test_env::remove_var(image_import::RECOGNITION_MODEL_ENV);
 }
 
 fn import(bytes: &[u8], filename: &str, kind: ImportKind) -> ImportOutcome {
@@ -109,7 +111,7 @@ fn unconfigured_models_name_both_variables_and_refuse_to_download() {
 fn half_configured_models_are_as_refused_as_none() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_model_env();
-    std::env::set_var(image_import::DETECTION_MODEL_ENV, "/tmp/detection.rten");
+    crate::test_env::set_var(image_import::DETECTION_MODEL_ENV, "/tmp/detection.rten");
 
     // Detection alone finds where text is and cannot read a character of it.
     // Proceeding on a partial configuration would OCR every image to nothing,
@@ -123,8 +125,8 @@ fn half_configured_models_are_as_refused_as_none() {
 fn a_model_path_that_does_not_exist_names_the_variable_not_just_the_file() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_model_env();
-    std::env::set_var(image_import::DETECTION_MODEL_ENV, "/nonexistent/det.rten");
-    std::env::set_var(image_import::RECOGNITION_MODEL_ENV, "/nonexistent/rec.rten");
+    crate::test_env::set_var(image_import::DETECTION_MODEL_ENV, "/nonexistent/det.rten");
+    crate::test_env::set_var(image_import::RECOGNITION_MODEL_ENV, "/nonexistent/rec.rten");
 
     let err = image_import::model_paths().unwrap_err();
     assert!(err.contains(image_import::DETECTION_MODEL_ENV), "{err}");
@@ -147,8 +149,8 @@ fn a_configured_pair_of_real_files_is_accepted() {
     std::fs::write(&detection, b"placeholder").unwrap();
     std::fs::write(&recognition, b"placeholder").unwrap();
 
-    std::env::set_var(image_import::DETECTION_MODEL_ENV, &detection);
-    std::env::set_var(image_import::RECOGNITION_MODEL_ENV, &recognition);
+    crate::test_env::set_var(image_import::DETECTION_MODEL_ENV, &detection);
+    crate::test_env::set_var(image_import::RECOGNITION_MODEL_ENV, &recognition);
 
     let (got_detection, got_recognition) = image_import::model_paths().unwrap();
     assert_eq!(got_detection, detection);
@@ -228,8 +230,8 @@ mod with_the_feature {
         let recognition = dir.join("rec.rten");
         std::fs::write(&detection, b"not a model").unwrap();
         std::fs::write(&recognition, b"not a model").unwrap();
-        std::env::set_var(image_import::DETECTION_MODEL_ENV, &detection);
-        std::env::set_var(image_import::RECOGNITION_MODEL_ENV, &recognition);
+        crate::test_env::set_var(image_import::DETECTION_MODEL_ENV, &detection);
+        crate::test_env::set_var(image_import::RECOGNITION_MODEL_ENV, &recognition);
 
         let err = image_import::parse_image(b"\x89PNG\r\n\x1a\n", 2000).unwrap_err();
         // Names the file that is wrong, rather than blaming the image.

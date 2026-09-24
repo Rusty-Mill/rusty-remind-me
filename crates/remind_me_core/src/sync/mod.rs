@@ -450,9 +450,9 @@ pub(crate) mod tests {
     pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn clear_env() {
-        std::env::remove_var(NODE_ID_ENV);
-        std::env::remove_var(HUB_URL_ENV);
-        std::env::remove_var(SYNC_SECRET_ENV);
+        crate::test_env::remove_var(NODE_ID_ENV);
+        crate::test_env::remove_var(HUB_URL_ENV);
+        crate::test_env::remove_var(SYNC_SECRET_ENV);
     }
 
     /// A stray literal `${user_config.KEY}` string in one of these vars --
@@ -465,9 +465,9 @@ pub(crate) mod tests {
     fn unresolved_user_config_placeholder_does_not_enable_sync() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
-        std::env::set_var(NODE_ID_ENV, "${user_config.node_id}");
-        std::env::set_var(HUB_URL_ENV, "${user_config.hub_url}");
-        std::env::set_var(SYNC_SECRET_ENV, "${user_config.sync_secret}");
+        crate::test_env::set_var(NODE_ID_ENV, "${user_config.node_id}");
+        crate::test_env::set_var(HUB_URL_ENV, "${user_config.hub_url}");
+        crate::test_env::set_var(SYNC_SECRET_ENV, "${user_config.sync_secret}");
 
         assert!(!sync_enabled());
         assert_eq!(configured_node_id(), "");
@@ -484,9 +484,9 @@ pub(crate) mod tests {
     fn a_real_triple_still_enables_sync() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
-        std::env::set_var(NODE_ID_ENV, "my-laptop");
-        std::env::set_var(HUB_URL_ENV, "https://hub.example.com");
-        std::env::set_var(SYNC_SECRET_ENV, "s3cr3t");
+        crate::test_env::set_var(NODE_ID_ENV, "my-laptop");
+        crate::test_env::set_var(HUB_URL_ENV, "https://hub.example.com");
+        crate::test_env::set_var(SYNC_SECRET_ENV, "s3cr3t");
 
         assert!(sync_enabled());
         assert_eq!(configured_node_id(), "my-laptop");

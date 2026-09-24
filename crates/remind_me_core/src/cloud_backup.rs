@@ -300,8 +300,8 @@ mod put_object_tests {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn clear() {
-        std::env::remove_var(ENDPOINT_ENV);
-        std::env::remove_var(REGION_ENV);
+        crate::test_env::remove_var(ENDPOINT_ENV);
+        crate::test_env::remove_var(REGION_ENV);
     }
 
     #[test]
@@ -338,7 +338,7 @@ mod put_object_tests {
     fn a_custom_endpoint_forces_path_style_addressing() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear();
-        std::env::set_var(ENDPOINT_ENV, "https://s3.us-west-002.backblazeb2.com");
+        crate::test_env::set_var(ENDPOINT_ENV, "https://s3.us-west-002.backblazeb2.com");
 
         let plan = plan_put_object("bucket", "key");
 
@@ -360,7 +360,7 @@ mod put_object_tests {
     fn a_configured_region_is_passed_through() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear();
-        std::env::set_var(REGION_ENV, "us-west-002");
+        crate::test_env::set_var(REGION_ENV, "us-west-002");
 
         let plan = plan_put_object("bucket", "key");
 
@@ -372,8 +372,8 @@ mod put_object_tests {
     fn a_blank_endpoint_or_region_is_treated_as_unset() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear();
-        std::env::set_var(ENDPOINT_ENV, "   ");
-        std::env::set_var(REGION_ENV, "   ");
+        crate::test_env::set_var(ENDPOINT_ENV, "   ");
+        crate::test_env::set_var(REGION_ENV, "   ");
 
         let plan = plan_put_object("bucket", "key");
 

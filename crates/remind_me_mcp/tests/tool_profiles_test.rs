@@ -4,6 +4,9 @@
 //! tests in `lib.rs` assume the default `full` surface. Setting it there would
 //! quietly shrink what those tests see.
 
+#[path = "../../remind_me_core/src/test_env.rs"]
+mod test_env;
+
 use remind_me_core::tool_profiles::TOOL_PROFILE_ENV;
 use remind_me_core::Database;
 use remind_me_mcp::McpServer;
@@ -43,7 +46,7 @@ fn call(server: &McpServer, name: &str) -> Value {
 #[test]
 fn full_advertises_everything() {
     let _guard = env_lock();
-    std::env::remove_var(TOOL_PROFILE_ENV);
+    crate::test_env::remove_var(TOOL_PROFILE_ENV);
 
     let tools = listed_tools(&server());
 
@@ -57,7 +60,7 @@ fn full_advertises_everything() {
 #[test]
 fn core_lists_only_the_conversational_surface() {
     let _guard = env_lock();
-    std::env::set_var(TOOL_PROFILE_ENV, "core");
+    crate::test_env::set_var(TOOL_PROFILE_ENV, "core");
 
     let tools = listed_tools(&server());
 
@@ -70,13 +73,13 @@ fn core_lists_only_the_conversational_surface() {
         "core listed {} tools — the whole point is a small surface",
         tools.len()
     );
-    std::env::remove_var(TOOL_PROFILE_ENV);
+    crate::test_env::remove_var(TOOL_PROFILE_ENV);
 }
 
 #[test]
 fn standard_keeps_maintenance_but_drops_ops() {
     let _guard = env_lock();
-    std::env::set_var(TOOL_PROFILE_ENV, "standard");
+    crate::test_env::set_var(TOOL_PROFILE_ENV, "standard");
 
     let tools = listed_tools(&server());
 
@@ -84,13 +87,13 @@ fn standard_keeps_maintenance_but_drops_ops() {
     assert!(tools.iter().any(|t| t == "remind_me_search"));
     assert!(!tools.iter().any(|t| t == "remind_me_import_chat"));
     assert!(!tools.iter().any(|t| t == "remind_me_sync_status"));
-    std::env::remove_var(TOOL_PROFILE_ENV);
+    crate::test_env::remove_var(TOOL_PROFILE_ENV);
 }
 
 #[test]
 fn a_hidden_tool_is_refused_on_call_not_merely_undocumented() {
     let _guard = env_lock();
-    std::env::set_var(TOOL_PROFILE_ENV, "core");
+    crate::test_env::set_var(TOOL_PROFILE_ENV, "core");
 
     let result = call(&server(), "remind_me_import_chat");
 
@@ -103,25 +106,25 @@ fn a_hidden_tool_is_refused_on_call_not_merely_undocumented() {
     // The refusal names the way out, so a caller who trimmed too far is not
     // left guessing why a documented tool vanished.
     assert!(text.contains(TOOL_PROFILE_ENV), "no remedy offered: {text}");
-    std::env::remove_var(TOOL_PROFILE_ENV);
+    crate::test_env::remove_var(TOOL_PROFILE_ENV);
 }
 
 #[test]
 fn a_visible_tool_still_works_under_a_narrowed_profile() {
     let _guard = env_lock();
-    std::env::set_var(TOOL_PROFILE_ENV, "core");
+    crate::test_env::set_var(TOOL_PROFILE_ENV, "core");
 
     // Narrowing must not break what it keeps.
     let result = call(&server(), "remind_me_stats");
 
     assert_ne!(result["isError"], true, "core broke a core tool: {result}");
-    std::env::remove_var(TOOL_PROFILE_ENV);
+    crate::test_env::remove_var(TOOL_PROFILE_ENV);
 }
 
 #[test]
 fn every_listed_tool_is_callable_under_the_same_profile() {
     let _guard = env_lock();
-    std::env::set_var(TOOL_PROFILE_ENV, "core");
+    crate::test_env::set_var(TOOL_PROFILE_ENV, "core");
     let server = server();
 
     // List and call must agree. A tool advertised but refused is the same
@@ -134,5 +137,5 @@ fn every_listed_tool_is_callable_under_the_same_profile() {
             "{name} was listed but refused by the profile"
         );
     }
-    std::env::remove_var(TOOL_PROFILE_ENV);
+    crate::test_env::remove_var(TOOL_PROFILE_ENV);
 }

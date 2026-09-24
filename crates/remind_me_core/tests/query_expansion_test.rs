@@ -4,6 +4,9 @@
 //! client, since this module hand-rolls its own `/api/generate` client for
 //! the reasons documented in its module doc.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 use remind_me_core::embedder::OLLAMA_URL_ENV;
 use remind_me_core::query_expansion::{self, EXPANSION_MODE_ENV, HYDE_MODEL_ENV, HYDE_TIMEOUT_ENV};
 use std::io::{Read, Write};
@@ -22,7 +25,7 @@ fn clear_env() {
         HYDE_TIMEOUT_ENV,
         OLLAMA_URL_ENV,
     ] {
-        std::env::remove_var(var);
+        crate::test_env::remove_var(var);
     }
 }
 
@@ -116,7 +119,7 @@ fn hyde_passage_returns_the_generated_text_trimmed() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_env();
     let (url, handle) = fake_server(vec![generate_response("  a plausible passage  ")]);
-    std::env::set_var(OLLAMA_URL_ENV, url);
+    crate::test_env::set_var(OLLAMA_URL_ENV, url);
 
     let passage = query_expansion::hyde_passage("what does the user prefer for editors");
 
@@ -130,8 +133,8 @@ fn hyde_passage_sends_the_configured_model_and_the_query_in_the_prompt() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_env();
     let (url, handle) = fake_server(vec![generate_response("passage")]);
-    std::env::set_var(OLLAMA_URL_ENV, url);
-    std::env::set_var(HYDE_MODEL_ENV, "custom-instruct-model");
+    crate::test_env::set_var(OLLAMA_URL_ENV, url);
+    crate::test_env::set_var(HYDE_MODEL_ENV, "custom-instruct-model");
 
     query_expansion::hyde_passage("quokka habitat facts");
 
@@ -158,7 +161,7 @@ fn hyde_passage_truncates_to_the_max_char_cap() {
     clear_env();
     let long_text = "x".repeat(900);
     let (url, handle) = fake_server(vec![generate_response(&long_text)]);
-    std::env::set_var(OLLAMA_URL_ENV, url);
+    crate::test_env::set_var(OLLAMA_URL_ENV, url);
 
     let passage = query_expansion::hyde_passage("query").unwrap();
 
@@ -172,7 +175,7 @@ fn hyde_passage_is_none_for_an_empty_response() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_env();
     let (url, handle) = fake_server(vec![generate_response("   ")]);
-    std::env::set_var(OLLAMA_URL_ENV, url);
+    crate::test_env::set_var(OLLAMA_URL_ENV, url);
 
     assert!(query_expansion::hyde_passage("query").is_none());
     handle.join().unwrap();
@@ -184,7 +187,7 @@ fn hyde_passage_is_none_on_a_non_2xx_status() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_env();
     let (url, handle) = fake_server_with_status("404 Not Found", "model not found");
-    std::env::set_var(OLLAMA_URL_ENV, url);
+    crate::test_env::set_var(OLLAMA_URL_ENV, url);
 
     assert!(query_expansion::hyde_passage("query").is_none());
     handle.join().unwrap();
@@ -197,7 +200,7 @@ fn hyde_passage_is_none_on_an_unreachable_daemon_not_a_panic() {
     clear_env();
     // Port 1 is a reserved low port nothing binds to; a fast local refusal
     // proves this degrades rather than hangs the caller.
-    std::env::set_var(OLLAMA_URL_ENV, "http://127.0.0.1:1");
+    crate::test_env::set_var(OLLAMA_URL_ENV, "http://127.0.0.1:1");
 
     assert!(query_expansion::hyde_passage("query").is_none());
     clear_env();
@@ -215,7 +218,7 @@ fn expand_query_is_empty_when_disabled() {
 fn expand_query_is_empty_for_a_blank_query_even_when_enabled() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_env();
-    std::env::set_var(EXPANSION_MODE_ENV, "hyde");
+    crate::test_env::set_var(EXPANSION_MODE_ENV, "hyde");
     assert!(query_expansion::expand_query("   ").is_empty());
     clear_env();
 }
@@ -225,8 +228,8 @@ fn expand_query_returns_the_hyde_passage_when_enabled_and_generation_succeeds() 
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_env();
     let (url, handle) = fake_server(vec![generate_response("a hypothetical answer")]);
-    std::env::set_var(OLLAMA_URL_ENV, url);
-    std::env::set_var(EXPANSION_MODE_ENV, "hyde");
+    crate::test_env::set_var(OLLAMA_URL_ENV, url);
+    crate::test_env::set_var(EXPANSION_MODE_ENV, "hyde");
 
     let expanded =
         query_expansion::expand_query("expand_query_returns_the_hyde_passage unique query");
@@ -244,9 +247,9 @@ fn expand_query_caches_a_successful_expansion_so_a_repeat_query_makes_no_second_
     // `expand_query` call would block on a connection nothing accepts and
     // eventually time out instead of returning immediately.
     let (url, handle) = fake_server(vec![generate_response("cached passage")]);
-    std::env::set_var(OLLAMA_URL_ENV, url);
-    std::env::set_var(EXPANSION_MODE_ENV, "hyde");
-    std::env::set_var(HYDE_TIMEOUT_ENV, "2");
+    crate::test_env::set_var(OLLAMA_URL_ENV, url);
+    crate::test_env::set_var(EXPANSION_MODE_ENV, "hyde");
+    crate::test_env::set_var(HYDE_TIMEOUT_ENV, "2");
     let query = "expand_query_caches_a_successful_expansion unique query";
 
     let first = query_expansion::expand_query(query);
@@ -270,7 +273,7 @@ fn expand_query_caches_a_successful_expansion_so_a_repeat_query_makes_no_second_
 fn expand_query_is_disabled_for_a_mode_other_than_hyde() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_env();
-    std::env::set_var(EXPANSION_MODE_ENV, "off");
+    crate::test_env::set_var(EXPANSION_MODE_ENV, "off");
     assert!(query_expansion::expand_query("query").is_empty());
     clear_env();
 }

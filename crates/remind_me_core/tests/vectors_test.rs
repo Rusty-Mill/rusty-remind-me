@@ -7,6 +7,9 @@
 //! access. `OllamaEmbedder` itself — the HTTP client — has its own coverage
 //! in `ollama_embedder_test.rs`, against a fake HTTP server.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 use remind_me_core::db::queries;
 use remind_me_core::embedder::{EmbedError, EmbedRole, Embedder, EmbeddingIdentity};
 use remind_me_core::vectors::{
@@ -434,7 +437,7 @@ fn reindex_reports_degraded_with_no_embedder_configured() {
     // Deliberately does not touch REMIND_ME_EMBEDDING_BACKEND: this asserts
     // the default (unset) case, which every other test in this crate's
     // suite already relies on being the ambient state.
-    std::env::remove_var(remind_me_core::embedder::EMBEDDING_BACKEND_ENV);
+    crate::test_env::remove_var(remind_me_core::embedder::EMBEDDING_BACKEND_ENV);
     let db = Database::open_in_memory().unwrap();
     let conn = db.conn();
     add(&conn, "never embedded");

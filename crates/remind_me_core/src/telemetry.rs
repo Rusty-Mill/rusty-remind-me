@@ -418,7 +418,7 @@ mod tests {
 
     #[test]
     fn maybe_span_is_a_true_no_op_when_tracing_is_disabled() {
-        std::env::remove_var(OTEL_ENABLED_ENV);
+        crate::test_env::remove_var(OTEL_ENABLED_ENV);
         let span = maybe_span("noop.test");
         assert!(span.0.is_none());
         assert!(!is_enabled());

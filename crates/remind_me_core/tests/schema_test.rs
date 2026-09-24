@@ -5,6 +5,9 @@
 //! unnoticed — the check was shaped like the mistake. These compare the whole
 //! schema: every table, index and trigger, by normalised DDL.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 use remind_me_core::backup::list_backups;
 use remind_me_core::db::migrations::SCHEMA_VERSION;
 use remind_me_core::db::queries;
@@ -353,9 +356,9 @@ fn a_legacy_database_is_reconciled_to_the_generated_schema() {
 #[test]
 fn writes_still_reach_the_sync_outbox() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var(NODE_ID_ENV, "node-a");
-    std::env::set_var(HUB_URL_ENV, "http://hub.example");
-    std::env::set_var(SYNC_SECRET_ENV, "shh");
+    crate::test_env::set_var(NODE_ID_ENV, "node-a");
+    crate::test_env::set_var(HUB_URL_ENV, "http://hub.example");
+    crate::test_env::set_var(SYNC_SECRET_ENV, "shh");
 
     let db = Database::open_in_memory().unwrap();
     let conn = db.conn();
@@ -387,9 +390,9 @@ fn writes_still_reach_the_sync_outbox() {
     assert_eq!(parsed["content"], "syncable");
     assert!(parsed.get("base_weight").is_some());
 
-    std::env::remove_var(NODE_ID_ENV);
-    std::env::remove_var(HUB_URL_ENV);
-    std::env::remove_var(SYNC_SECRET_ENV);
+    crate::test_env::remove_var(NODE_ID_ENV);
+    crate::test_env::remove_var(HUB_URL_ENV);
+    crate::test_env::remove_var(SYNC_SECRET_ENV);
 }
 
 #[test]
@@ -398,9 +401,9 @@ fn writes_do_not_reach_the_outbox_while_sync_is_unconfigured() {
     // sync_flags.sync_enabled, so a write on a node that has never
     // configured sync must not queue anything at all.
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var(NODE_ID_ENV);
-    std::env::remove_var(HUB_URL_ENV);
-    std::env::remove_var(SYNC_SECRET_ENV);
+    crate::test_env::remove_var(NODE_ID_ENV);
+    crate::test_env::remove_var(HUB_URL_ENV);
+    crate::test_env::remove_var(SYNC_SECRET_ENV);
 
     let db = Database::open_in_memory().unwrap();
     let conn = db.conn();
@@ -491,9 +494,9 @@ fn stored_vector_counts(conn: &Connection) -> (i64, i64) {
 fn reopening_with_an_unchanged_ollama_model_leaves_stored_vectors_alone() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = TempDb::new("embedding_versioning_match");
-    std::env::set_var(EMBEDDING_BACKEND_ENV, "ollama");
-    std::env::set_var(OLLAMA_MODEL_ENV, "nomic-embed-text");
-    std::env::set_var(EMBEDDING_DIM_ENV, "4");
+    crate::test_env::set_var(EMBEDDING_BACKEND_ENV, "ollama");
+    crate::test_env::set_var(OLLAMA_MODEL_ENV, "nomic-embed-text");
+    crate::test_env::set_var(EMBEDDING_DIM_ENV, "4");
 
     {
         let db = Database::open(&tmp.0).unwrap();
@@ -504,25 +507,25 @@ fn reopening_with_an_unchanged_ollama_model_leaves_stored_vectors_alone() {
     let db = Database::open(&tmp.0).unwrap();
     assert_eq!(stored_vector_counts(&db.conn()), (1, 1));
 
-    std::env::remove_var(EMBEDDING_BACKEND_ENV);
-    std::env::remove_var(OLLAMA_MODEL_ENV);
-    std::env::remove_var(EMBEDDING_DIM_ENV);
+    crate::test_env::remove_var(EMBEDDING_BACKEND_ENV);
+    crate::test_env::remove_var(OLLAMA_MODEL_ENV);
+    crate::test_env::remove_var(EMBEDDING_DIM_ENV);
 }
 
 #[test]
 fn reopening_with_a_changed_ollama_model_clears_stored_vectors() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = TempDb::new("embedding_versioning_model_change");
-    std::env::set_var(EMBEDDING_BACKEND_ENV, "ollama");
-    std::env::set_var(OLLAMA_MODEL_ENV, "old-model");
-    std::env::set_var(EMBEDDING_DIM_ENV, "4");
+    crate::test_env::set_var(EMBEDDING_BACKEND_ENV, "ollama");
+    crate::test_env::set_var(OLLAMA_MODEL_ENV, "old-model");
+    crate::test_env::set_var(EMBEDDING_DIM_ENV, "4");
 
     {
         let db = Database::open(&tmp.0).unwrap();
         plant_stale_vector(&db.conn(), "old-model", 4);
     }
 
-    std::env::set_var(OLLAMA_MODEL_ENV, "new-model");
+    crate::test_env::set_var(OLLAMA_MODEL_ENV, "new-model");
     let db = Database::open(&tmp.0).unwrap();
     assert_eq!(
         stored_vector_counts(&db.conn()),
@@ -530,25 +533,25 @@ fn reopening_with_a_changed_ollama_model_clears_stored_vectors() {
         "a changed REMIND_ME_OLLAMA_EMBED_MODEL must clear the stale vector on open"
     );
 
-    std::env::remove_var(EMBEDDING_BACKEND_ENV);
-    std::env::remove_var(OLLAMA_MODEL_ENV);
-    std::env::remove_var(EMBEDDING_DIM_ENV);
+    crate::test_env::remove_var(EMBEDDING_BACKEND_ENV);
+    crate::test_env::remove_var(OLLAMA_MODEL_ENV);
+    crate::test_env::remove_var(EMBEDDING_DIM_ENV);
 }
 
 #[test]
 fn reopening_with_a_changed_embedding_dimension_clears_stored_vectors() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = TempDb::new("embedding_versioning_dim_change");
-    std::env::set_var(EMBEDDING_BACKEND_ENV, "ollama");
-    std::env::set_var(OLLAMA_MODEL_ENV, "nomic-embed-text");
-    std::env::set_var(EMBEDDING_DIM_ENV, "4");
+    crate::test_env::set_var(EMBEDDING_BACKEND_ENV, "ollama");
+    crate::test_env::set_var(OLLAMA_MODEL_ENV, "nomic-embed-text");
+    crate::test_env::set_var(EMBEDDING_DIM_ENV, "4");
 
     {
         let db = Database::open(&tmp.0).unwrap();
         plant_stale_vector(&db.conn(), "nomic-embed-text", 4);
     }
 
-    std::env::set_var(EMBEDDING_DIM_ENV, "8");
+    crate::test_env::set_var(EMBEDDING_DIM_ENV, "8");
     let db = Database::open(&tmp.0).unwrap();
     assert_eq!(
         stored_vector_counts(&db.conn()),
@@ -556,9 +559,9 @@ fn reopening_with_a_changed_embedding_dimension_clears_stored_vectors() {
         "a changed REMIND_ME_EMBEDDING_DIM must clear the stale vector on open"
     );
 
-    std::env::remove_var(EMBEDDING_BACKEND_ENV);
-    std::env::remove_var(OLLAMA_MODEL_ENV);
-    std::env::remove_var(EMBEDDING_DIM_ENV);
+    crate::test_env::remove_var(EMBEDDING_BACKEND_ENV);
+    crate::test_env::remove_var(OLLAMA_MODEL_ENV);
+    crate::test_env::remove_var(EMBEDDING_DIM_ENV);
 }
 
 #[test]
@@ -570,9 +573,9 @@ fn a_first_ever_open_with_no_prior_embedding_meta_does_not_touch_vec_chunks() {
     // own identity already).
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = TempDb::new("embedding_versioning_first_run");
-    std::env::remove_var(EMBEDDING_BACKEND_ENV);
-    std::env::remove_var(OLLAMA_MODEL_ENV);
-    std::env::remove_var(EMBEDDING_DIM_ENV);
+    crate::test_env::remove_var(EMBEDDING_BACKEND_ENV);
+    crate::test_env::remove_var(OLLAMA_MODEL_ENV);
+    crate::test_env::remove_var(EMBEDDING_DIM_ENV);
 
     {
         let conn = Connection::open(&tmp.0).unwrap();
@@ -585,9 +588,9 @@ fn a_first_ever_open_with_no_prior_embedding_meta_does_not_touch_vec_chunks() {
         .unwrap();
     }
 
-    std::env::set_var(EMBEDDING_BACKEND_ENV, "ollama");
-    std::env::set_var(OLLAMA_MODEL_ENV, "nomic-embed-text");
-    std::env::set_var(EMBEDDING_DIM_ENV, "4");
+    crate::test_env::set_var(EMBEDDING_BACKEND_ENV, "ollama");
+    crate::test_env::set_var(OLLAMA_MODEL_ENV, "nomic-embed-text");
+    crate::test_env::set_var(EMBEDDING_DIM_ENV, "4");
     // This open both creates vec_chunks/vec_embeddings for the first time
     // (they did not exist in the hand-built database above) and runs the
     // startup reconcile -- there is nothing in either table to clear, and
@@ -603,9 +606,9 @@ fn a_first_ever_open_with_no_prior_embedding_meta_does_not_touch_vec_chunks() {
         "the startup check itself must not write embedding_meta -- only a real embed does"
     );
 
-    std::env::remove_var(EMBEDDING_BACKEND_ENV);
-    std::env::remove_var(OLLAMA_MODEL_ENV);
-    std::env::remove_var(EMBEDDING_DIM_ENV);
+    crate::test_env::remove_var(EMBEDDING_BACKEND_ENV);
+    crate::test_env::remove_var(OLLAMA_MODEL_ENV);
+    crate::test_env::remove_var(EMBEDDING_DIM_ENV);
 }
 
 #[test]
@@ -618,21 +621,21 @@ fn reopening_with_the_embedding_backend_disabled_never_clears_stored_vectors() {
     // identity.
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = TempDb::new("embedding_versioning_backend_disabled");
-    std::env::set_var(EMBEDDING_BACKEND_ENV, "ollama");
-    std::env::set_var(OLLAMA_MODEL_ENV, "nomic-embed-text");
-    std::env::set_var(EMBEDDING_DIM_ENV, "4");
+    crate::test_env::set_var(EMBEDDING_BACKEND_ENV, "ollama");
+    crate::test_env::set_var(OLLAMA_MODEL_ENV, "nomic-embed-text");
+    crate::test_env::set_var(EMBEDDING_DIM_ENV, "4");
 
     {
         let db = Database::open(&tmp.0).unwrap();
         plant_stale_vector(&db.conn(), "nomic-embed-text", 4);
     }
 
-    std::env::remove_var(EMBEDDING_BACKEND_ENV);
+    crate::test_env::remove_var(EMBEDDING_BACKEND_ENV);
     let db = Database::open(&tmp.0).unwrap();
     assert_eq!(stored_vector_counts(&db.conn()), (1, 1));
 
-    std::env::remove_var(OLLAMA_MODEL_ENV);
-    std::env::remove_var(EMBEDDING_DIM_ENV);
+    crate::test_env::remove_var(OLLAMA_MODEL_ENV);
+    crate::test_env::remove_var(EMBEDDING_DIM_ENV);
 }
 
 // ---------------------------------------------------------------------------

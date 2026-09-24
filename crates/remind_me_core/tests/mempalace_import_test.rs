@@ -13,6 +13,9 @@
 //! deliberately does not have (see the ADR: the store location is operator
 //! configuration, not a per-call parameter).
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 use remind_me_core::mempalace_import::{
     parse_frontmatter, pull_mempalace, MempalaceImportError, COLLECTION_NAME, DEFAULT_CATEGORY,
     OPAQUE_SOURCE,
@@ -126,9 +129,9 @@ const NATIVE_DOCUMENT: &str = "---\ncategory: fact\nsource: remind_me/manual\nta
 /// process-wide env lock for the duration.
 fn with_store_at<R>(dir: &std::path::Path, body: impl FnOnce() -> R) -> R {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("REMIND_ME_MEMPALACE_PATH", dir);
+    crate::test_env::set_var("REMIND_ME_MEMPALACE_PATH", dir);
     let result = body();
-    std::env::remove_var("REMIND_ME_MEMPALACE_PATH");
+    crate::test_env::remove_var("REMIND_ME_MEMPALACE_PATH");
     result
 }
 

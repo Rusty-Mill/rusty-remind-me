@@ -18,6 +18,9 @@
 //! was omission at a call site rather than a wrong value in a shared helper —
 //! and a test of the helper alone would have passed throughout.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 use remind_me_core::sync::{
     configured_client, memory_provenance, set_handshake_client, CLIENT_ENV, DEFAULT_CLIENT,
     NODE_ID_ENV,
@@ -38,16 +41,16 @@ const TEST_CLIENT: &str = "test-client";
 struct Ident;
 impl Ident {
     fn set() -> Self {
-        std::env::set_var(NODE_ID_ENV, TEST_NODE);
-        std::env::set_var(CLIENT_ENV, TEST_CLIENT);
+        crate::test_env::set_var(NODE_ID_ENV, TEST_NODE);
+        crate::test_env::set_var(CLIENT_ENV, TEST_CLIENT);
         set_handshake_client(None);
         Ident
     }
 }
 impl Drop for Ident {
     fn drop(&mut self) {
-        std::env::remove_var(NODE_ID_ENV);
-        std::env::remove_var(CLIENT_ENV);
+        crate::test_env::remove_var(NODE_ID_ENV);
+        crate::test_env::remove_var(CLIENT_ENV);
         set_handshake_client(None);
     }
 }
@@ -258,8 +261,8 @@ fn the_handshake_identity_beats_the_configured_one() {
 #[test]
 fn with_nothing_configured_the_client_is_unknown_and_the_node_is_empty() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var(NODE_ID_ENV);
-    std::env::remove_var(CLIENT_ENV);
+    crate::test_env::remove_var(NODE_ID_ENV);
+    crate::test_env::remove_var(CLIENT_ENV);
     set_handshake_client(None);
 
     // The default is still `unknown`; this change makes the column *consistent*,

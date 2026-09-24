@@ -652,13 +652,13 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn clear_env() {
-        std::env::remove_var(REMOTE_ENABLED_ENV);
-        std::env::remove_var(REMOTE_HOST_ENV);
-        std::env::remove_var(REMOTE_PORT_ENV);
-        std::env::remove_var(REMOTE_TOKEN_ENV);
-        std::env::remove_var(REMOTE_TOKEN_FILE_ENV);
-        std::env::remove_var(REMOTE_ISSUER_ENV);
-        std::env::remove_var(REMOTE_OAUTH_STATE_FILE_ENV);
+        crate::test_env::remove_var(REMOTE_ENABLED_ENV);
+        crate::test_env::remove_var(REMOTE_HOST_ENV);
+        crate::test_env::remove_var(REMOTE_PORT_ENV);
+        crate::test_env::remove_var(REMOTE_TOKEN_ENV);
+        crate::test_env::remove_var(REMOTE_TOKEN_FILE_ENV);
+        crate::test_env::remove_var(REMOTE_ISSUER_ENV);
+        crate::test_env::remove_var(REMOTE_OAUTH_STATE_FILE_ENV);
     }
 
     #[test]
@@ -675,8 +675,8 @@ mod tests {
     fn remote_config_reads_host_and_port_overrides() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
-        std::env::set_var(REMOTE_HOST_ENV, "0.0.0.0");
-        std::env::set_var(REMOTE_PORT_ENV, "9999");
+        crate::test_env::set_var(REMOTE_HOST_ENV, "0.0.0.0");
+        crate::test_env::set_var(REMOTE_PORT_ENV, "9999");
         let config = RemoteConfig::from_env();
         assert_eq!(config.host, "0.0.0.0");
         assert_eq!(config.port, 9999);
@@ -689,10 +689,10 @@ mod tests {
         clear_env();
         assert!(!remote_enabled());
         for value in ["1", "true", "TRUE", "yes"] {
-            std::env::set_var(REMOTE_ENABLED_ENV, value);
+            crate::test_env::set_var(REMOTE_ENABLED_ENV, value);
             assert!(remote_enabled(), "{value:?} should enable the connector");
         }
-        std::env::set_var(REMOTE_ENABLED_ENV, "0");
+        crate::test_env::set_var(REMOTE_ENABLED_ENV, "0");
         assert!(!remote_enabled());
         clear_env();
     }
@@ -730,12 +730,12 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let file = dir.join("connector_token");
         fs::write(&file, "file-token\n").unwrap();
-        std::env::set_var(REMOTE_TOKEN_FILE_ENV, &file);
-        std::env::set_var(REMOTE_TOKEN_ENV, "env-token");
+        crate::test_env::set_var(REMOTE_TOKEN_FILE_ENV, &file);
+        crate::test_env::set_var(REMOTE_TOKEN_ENV, "env-token");
 
         assert_eq!(resolve_connector_token(), "env-token");
 
-        std::env::remove_var(REMOTE_TOKEN_ENV);
+        crate::test_env::remove_var(REMOTE_TOKEN_ENV);
         assert_eq!(resolve_connector_token(), "file-token");
 
         let _ = fs::remove_dir_all(&dir);
@@ -749,7 +749,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rrm_remote_token_gen_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let file = dir.join("nested").join("connector_token");
-        std::env::set_var(REMOTE_TOKEN_FILE_ENV, &file);
+        crate::test_env::set_var(REMOTE_TOKEN_FILE_ENV, &file);
 
         assert!(!file.is_file());
         let first = resolve_connector_token();
@@ -773,8 +773,8 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let file = dir.join("connector_token");
-        std::env::set_var(REMOTE_TOKEN_FILE_ENV, &file);
-        std::env::set_var(REMOTE_OAUTH_STATE_FILE_ENV, dir.join("oauth.json"));
+        crate::test_env::set_var(REMOTE_TOKEN_FILE_ENV, &file);
+        crate::test_env::set_var(REMOTE_OAUTH_STATE_FILE_ENV, dir.join("oauth.json"));
 
         let status = remote_status();
         assert!(!status.enabled);
@@ -796,14 +796,14 @@ mod tests {
         clear_env();
         assert_eq!(RemoteConfig::from_env().issuer, None);
 
-        std::env::set_var(REMOTE_ISSUER_ENV, "  https://machine.tailnet.ts.net  ");
+        crate::test_env::set_var(REMOTE_ISSUER_ENV, "  https://machine.tailnet.ts.net  ");
         assert_eq!(
             RemoteConfig::from_env().issuer,
             Some("https://machine.tailnet.ts.net".to_string())
         );
 
         // Blank (whitespace-only) is treated the same as unset.
-        std::env::set_var(REMOTE_ISSUER_ENV, "   ");
+        crate::test_env::set_var(REMOTE_ISSUER_ENV, "   ");
         assert_eq!(RemoteConfig::from_env().issuer, None);
         clear_env();
     }
@@ -817,9 +817,9 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let state_file = dir.join("oauth.json");
-        std::env::set_var(REMOTE_TOKEN_FILE_ENV, dir.join("connector_token"));
-        std::env::set_var(REMOTE_OAUTH_STATE_FILE_ENV, &state_file);
-        std::env::set_var(REMOTE_ISSUER_ENV, "https://machine.tailnet.ts.net");
+        crate::test_env::set_var(REMOTE_TOKEN_FILE_ENV, dir.join("connector_token"));
+        crate::test_env::set_var(REMOTE_OAUTH_STATE_FILE_ENV, &state_file);
+        crate::test_env::set_var(REMOTE_ISSUER_ENV, "https://machine.tailnet.ts.net");
 
         let status = remote_status();
         assert!(status.oauth_enabled);

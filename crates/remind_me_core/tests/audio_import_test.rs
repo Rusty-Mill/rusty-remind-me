@@ -7,6 +7,9 @@
 //! last part is deterministic maths over synthesised audio, so it is tested
 //! properly rather than waved through as "part of the untestable feature".
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 use remind_me_core::audio_import::{self, WHISPER_SAMPLE_RATE};
 use remind_me_core::models::{ImportKind, ImportOutcome};
 use remind_me_core::Database;
@@ -102,7 +105,7 @@ fn a_recording_cannot_be_forced_through_a_text_parser() {
 #[test]
 fn an_unconfigured_model_names_the_variable_and_refuses_to_download() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var(audio_import::MODEL_ENV);
+    crate::test_env::remove_var(audio_import::MODEL_ENV);
 
     let err = audio_import::model_path().unwrap_err();
 
@@ -113,13 +116,13 @@ fn an_unconfigured_model_names_the_variable_and_refuses_to_download() {
 #[test]
 fn a_model_path_that_does_not_exist_names_the_variable() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var(audio_import::MODEL_ENV, "/nonexistent/ggml-base.bin");
+    crate::test_env::set_var(audio_import::MODEL_ENV, "/nonexistent/ggml-base.bin");
 
     let err = audio_import::model_path().unwrap_err();
     assert!(err.contains(audio_import::MODEL_ENV), "{err}");
     assert!(err.contains("/nonexistent/ggml-base.bin"), "{err}");
 
-    std::env::remove_var(audio_import::MODEL_ENV);
+    crate::test_env::remove_var(audio_import::MODEL_ENV);
 }
 
 // ---------------------------------------------------------------------------
@@ -277,7 +280,7 @@ mod with_the_feature {
     #[test]
     fn an_import_with_no_model_configured_refuses_rather_than_downloading_one() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var(audio_import::MODEL_ENV);
+        crate::test_env::remove_var(audio_import::MODEL_ENV);
 
         // The most important feature-on assertion CI can make: turning audio
         // import on must not turn reading a voice memo into a several-hundred-
@@ -294,13 +297,13 @@ mod with_the_feature {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let path = std::env::temp_dir().join("remind_me_audio_bad_model.bin");
         std::fs::write(&path, b"not a whisper model").unwrap();
-        std::env::set_var(audio_import::MODEL_ENV, &path);
+        crate::test_env::set_var(audio_import::MODEL_ENV, &path);
 
         let bytes = wav(&sine(440.0, 16_000, 0.1), 16_000, 1);
         let err = audio_import::parse_audio(&bytes, 2000).unwrap_err();
         assert!(err.to_lowercase().contains("model"), "{err}");
 
-        std::env::remove_var(audio_import::MODEL_ENV);
+        crate::test_env::remove_var(audio_import::MODEL_ENV);
         let _ = std::fs::remove_file(&path);
     }
 }

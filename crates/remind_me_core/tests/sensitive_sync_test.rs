@@ -11,15 +11,18 @@
 //! search — the flag defeated by the first sync rather than by any bug visible
 //! locally.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 use remind_me_core::db::queries;
 use remind_me_core::sync::{upsert_record, SyncRecord, HUB_URL_ENV, NODE_ID_ENV, SYNC_SECRET_ENV};
 use remind_me_core::{Database, MemoryAddInput, MemorySearchInput};
 use rusqlite::Connection;
 
 fn enable_sync() {
-    std::env::set_var(NODE_ID_ENV, "node-sensitive-test");
-    std::env::set_var(HUB_URL_ENV, "http://hub.example");
-    std::env::set_var(SYNC_SECRET_ENV, "shh");
+    crate::test_env::set_var(NODE_ID_ENV, "node-sensitive-test");
+    crate::test_env::set_var(HUB_URL_ENV, "http://hub.example");
+    crate::test_env::set_var(SYNC_SECRET_ENV, "shh");
 }
 
 fn add(conn: &Connection, content: &str, sensitive: bool) -> String {

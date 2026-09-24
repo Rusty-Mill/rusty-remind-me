@@ -10,6 +10,9 @@
 
 #![cfg(unix)]
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 use remind_me_core::sync::{
     discover_peers, probe_peer, Peer, PeerServerConfig, STATIC_PEERS_ENV, TAILSCALE_SOCKET_ENV,
 };
@@ -22,9 +25,9 @@ use std::sync::Mutex;
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn clear_env() {
-    std::env::remove_var(STATIC_PEERS_ENV);
-    std::env::remove_var(TAILSCALE_SOCKET_ENV);
-    std::env::remove_var("REMIND_ME_PEER_PORT");
+    crate::test_env::remove_var(STATIC_PEERS_ENV);
+    crate::test_env::remove_var(TAILSCALE_SOCKET_ENV);
+    crate::test_env::remove_var("REMIND_ME_PEER_PORT");
 }
 
 /// Serves one `GET /localapi/v0/status` request over a Unix socket at a
@@ -62,7 +65,7 @@ fn discover_peers_is_empty_when_nothing_is_configured() {
     clear_env();
     // No static peers, and a Tailscale socket path that doesn't exist --
     // the same degraded state as a machine with no Tailscale installed.
-    std::env::set_var(TAILSCALE_SOCKET_ENV, "/nonexistent/path/to/a.sock");
+    crate::test_env::set_var(TAILSCALE_SOCKET_ENV, "/nonexistent/path/to/a.sock");
 
     let peers = discover_peers();
 
@@ -74,11 +77,11 @@ fn discover_peers_is_empty_when_nothing_is_configured() {
 fn discover_peers_reads_a_well_formed_static_peer() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_env();
-    std::env::set_var(
+    crate::test_env::set_var(
         STATIC_PEERS_ENV,
         r#"[{"node_id":"laptop","url":"http://100.64.0.9:8766"}]"#,
     );
-    std::env::set_var(TAILSCALE_SOCKET_ENV, "/nonexistent/path/to/a.sock");
+    crate::test_env::set_var(TAILSCALE_SOCKET_ENV, "/nonexistent/path/to/a.sock");
 
     let peers = discover_peers();
 
@@ -107,8 +110,8 @@ fn discover_peers_parses_tailscale_status_filtering_offline_and_ipless_peers() {
     })
     .to_string();
     let socket = fake_tailscale_socket("filter", &status);
-    std::env::set_var(TAILSCALE_SOCKET_ENV, &socket);
-    std::env::set_var("REMIND_ME_PEER_PORT", "8766");
+    crate::test_env::set_var(TAILSCALE_SOCKET_ENV, &socket);
+    crate::test_env::set_var("REMIND_ME_PEER_PORT", "8766");
 
     let peers = discover_peers();
 
@@ -134,9 +137,9 @@ fn discover_peers_a_static_entry_wins_a_url_collision_with_a_tailscale_peer() {
     })
     .to_string();
     let socket = fake_tailscale_socket("collision", &status);
-    std::env::set_var(TAILSCALE_SOCKET_ENV, &socket);
-    std::env::set_var("REMIND_ME_PEER_PORT", "8766");
-    std::env::set_var(
+    crate::test_env::set_var(TAILSCALE_SOCKET_ENV, &socket);
+    crate::test_env::set_var("REMIND_ME_PEER_PORT", "8766");
+    crate::test_env::set_var(
         STATIC_PEERS_ENV,
         r#"[{"node_id":"static-dup","url":"http://100.64.0.4:8766"}]"#,
     );
@@ -161,8 +164,8 @@ fn discover_peers_falls_back_to_the_dict_key_when_hostname_is_absent() {
     })
     .to_string();
     let socket = fake_tailscale_socket("nohostname", &status);
-    std::env::set_var(TAILSCALE_SOCKET_ENV, &socket);
-    std::env::set_var("REMIND_ME_PEER_PORT", "8766");
+    crate::test_env::set_var(TAILSCALE_SOCKET_ENV, &socket);
+    crate::test_env::set_var("REMIND_ME_PEER_PORT", "8766");
 
     let peers = discover_peers();
 

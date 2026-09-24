@@ -1,3 +1,10 @@
+// Lets `test_env.rs` name this crate `remind_me_core`, as it does from
+// every other test binary it is `#[path]`-included into.
+#[cfg(test)]
+extern crate self as remind_me_core;
+#[cfg(test)]
+mod test_env;
+
 pub mod analytics;
 pub mod ann_index;
 pub mod api_keys;

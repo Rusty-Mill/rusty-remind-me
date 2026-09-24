@@ -10,6 +10,9 @@
 //! nothing about the bytes on the wire, which is exactly where the two things
 //! this change had to add (a default port, and omitting the auth header) live.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 use remind_me_core::notifications::{
     any_channel_configured, configured_notifiers, notify, webhook_payload, WEBHOOK_URL_ENV,
 };
@@ -24,7 +27,7 @@ fn env_lock() -> &'static Mutex<()> {
 }
 
 fn clear_channels() {
-    std::env::remove_var(WEBHOOK_URL_ENV);
+    crate::test_env::remove_var(WEBHOOK_URL_ENV);
 }
 
 /// Accept exactly one request, answer `status`, and hand back what was sent.
@@ -83,7 +86,7 @@ fn nothing_configured_means_no_channels_and_no_attempt() {
 fn a_blank_webhook_url_is_not_a_configured_channel() {
     let _guard = env_lock().lock().unwrap();
     clear_channels();
-    std::env::set_var(WEBHOOK_URL_ENV, "   ");
+    crate::test_env::set_var(WEBHOOK_URL_ENV, "   ");
 
     // An env var set to whitespace is how a half-finished config file reads.
     // Treating it as configured would mean every notification attempt failing
@@ -98,7 +101,7 @@ fn the_webhook_receives_the_documented_payload() {
     let _guard = env_lock().lock().unwrap();
     clear_channels();
     let (url, receiver) = one_shot_receiver(200);
-    std::env::set_var(WEBHOOK_URL_ENV, &url);
+    crate::test_env::set_var(WEBHOOK_URL_ENV, &url);
 
     let accepted = notify("Reminder due: memory `mem_1`", "feed the quokka");
     let raw = receiver.join().unwrap();
@@ -133,7 +136,7 @@ fn a_webhook_url_without_a_port_still_reaches_a_receiver() {
     // rejected, which it was before this change.
     let _guard = env_lock().lock().unwrap();
     clear_channels();
-    std::env::set_var(WEBHOOK_URL_ENV, "http://example.invalid/hook");
+    crate::test_env::set_var(WEBHOOK_URL_ENV, "http://example.invalid/hook");
 
     // Unreachable host, so it fails — but it fails at *connect*, meaning the
     // URL parsed. Before the default port it failed before ever resolving.
@@ -147,7 +150,7 @@ fn a_non_2xx_response_is_not_counted_as_accepted() {
     let _guard = env_lock().lock().unwrap();
     clear_channels();
     let (url, receiver) = one_shot_receiver(500);
-    std::env::set_var(WEBHOOK_URL_ENV, &url);
+    crate::test_env::set_var(WEBHOOK_URL_ENV, &url);
 
     let accepted = notify("subject", "body");
     let _ = receiver.join();
@@ -167,7 +170,7 @@ fn an_unreachable_webhook_fails_without_propagating() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.local_addr().unwrap()
     };
-    std::env::set_var(WEBHOOK_URL_ENV, format!("http://{}/hook", dead));
+    crate::test_env::set_var(WEBHOOK_URL_ENV, format!("http://{}/hook", dead));
 
     // The caller is a background loop delivering something else. A dead
     // endpoint must be a return value, never an unwind that takes the loop

@@ -69,6 +69,9 @@ cargo test -p remind_me_core -- --nocapture
 - **Unit Tests**: Placed inside module files within `src/` (e.g., `vitality.rs`, `retrieval.rs`) under `#[cfg(test)]`.
 - **Integration Tests**: Placed in crate `tests/` directories (e.g., `crates/remind_me_core/tests/db_test.rs`).
 
+### Changing environment variables in tests
+Use `crate::test_env::set_var` / `remove_var` (`crates/remind_me_core/src/test_env.rs`), never `std::env::set_var` / `remove_var`; `clippy.toml` rejects the `std` pair. Tests run on parallel threads, and a raw write can segfault the whole test binary if it lands while SQLite is reading the environment during its first-connection setup. The helper finishes that setup before writing. An integration test binary declares the helper with `#[path = "../src/test_env.rs"] mod test_env;` (`../../remind_me_core/src/test_env.rs` from another crate). A test that depends on a variable's *value* still holds its file's env lock.
+
 ---
 
 ## 4. The Rusty Mill Ecosystem — Siblings, Not Dependencies (Yet)

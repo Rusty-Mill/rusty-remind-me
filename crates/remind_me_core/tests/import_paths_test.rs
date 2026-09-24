@@ -13,6 +13,9 @@
 //! compile-time choice, not a runtime one this test could fake on Linux.
 //! That is exactly what the `windows` CI job added for #271 now runs.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 use remind_me_core::import_paths::{
     is_contained, resolve_lexically, split_path_list, validate_import_file, ImportPathError,
     IMPORT_ROOTS_ENV,
@@ -216,14 +219,14 @@ impl Root {
         let dir: PathBuf = dir.to_string_lossy().replace(['(', ')', ' '], "").into();
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var(IMPORT_ROOTS_ENV, &dir);
+        crate::test_env::set_var(IMPORT_ROOTS_ENV, &dir);
         Self { dir }
     }
 }
 
 impl Drop for Root {
     fn drop(&mut self) {
-        std::env::remove_var(IMPORT_ROOTS_ENV);
+        crate::test_env::remove_var(IMPORT_ROOTS_ENV);
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }

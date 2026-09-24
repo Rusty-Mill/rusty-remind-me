@@ -1,3 +1,7 @@
+#[cfg(test)]
+#[path = "../../remind_me_core/src/test_env.rs"]
+mod test_env;
+
 use remind_me_api::ApiServer;
 use remind_me_core::db::queries;
 use remind_me_core::{
@@ -1174,13 +1178,13 @@ mod tests {
         let _guard = SECRET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let previous = std::env::var(remind_me_core::sync::SYNC_SECRET_ENV).ok();
         match value {
-            Some(v) => std::env::set_var(remind_me_core::sync::SYNC_SECRET_ENV, v),
-            None => std::env::remove_var(remind_me_core::sync::SYNC_SECRET_ENV),
+            Some(v) => crate::test_env::set_var(remind_me_core::sync::SYNC_SECRET_ENV, v),
+            None => crate::test_env::remove_var(remind_me_core::sync::SYNC_SECRET_ENV),
         }
         let result = f();
         match previous {
-            Some(v) => std::env::set_var(remind_me_core::sync::SYNC_SECRET_ENV, v),
-            None => std::env::remove_var(remind_me_core::sync::SYNC_SECRET_ENV),
+            Some(v) => crate::test_env::set_var(remind_me_core::sync::SYNC_SECRET_ENV, v),
+            None => crate::test_env::remove_var(remind_me_core::sync::SYNC_SECRET_ENV),
         }
         result
     }

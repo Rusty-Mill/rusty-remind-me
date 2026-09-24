@@ -6,15 +6,18 @@
 //! `ENV_LOCK` serialising the whole file or a race that shows up as a flake
 //! months later.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 use remind_me_core::sync::{HUB_URL_ENV, NODE_ID_ENV, SYNC_SECRET_ENV};
 use remind_me_core::undo_import::undo_import;
 use remind_me_core::{Database, UndoImportInput, UndoImportKind};
 use rusqlite::Connection;
 
 fn enable_sync() {
-    std::env::set_var(NODE_ID_ENV, "node-undo-test");
-    std::env::set_var(HUB_URL_ENV, "http://hub.example");
-    std::env::set_var(SYNC_SECRET_ENV, "shh");
+    crate::test_env::set_var(NODE_ID_ENV, "node-undo-test");
+    crate::test_env::set_var(HUB_URL_ENV, "http://hub.example");
+    crate::test_env::set_var(SYNC_SECRET_ENV, "shh");
 }
 
 fn plant_chat_import(conn: &Connection, ids: &[&str], import_id: &str) {

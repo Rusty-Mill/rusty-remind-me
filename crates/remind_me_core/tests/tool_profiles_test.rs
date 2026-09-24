@@ -5,6 +5,9 @@
 //! does not exist silently shrinks the profile, and neither the table nor the
 //! server would complain.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 use remind_me_core::tool_profiles::{
     allowed_tools, configured_profile, prompt_allowed, tool_allowed, CORE, MAINTENANCE,
     MAINTENANCE_PROMPTS, TOOL_PROFILE_ENV, VALID_PROFILES,
@@ -21,7 +24,7 @@ fn env_lock() -> MutexGuard<'static, ()> {
 #[test]
 fn the_default_profile_is_full() {
     let _guard = env_lock();
-    std::env::remove_var(TOOL_PROFILE_ENV);
+    crate::test_env::remove_var(TOOL_PROFILE_ENV);
 
     // Upgrading must change nothing for an existing install.
     assert_eq!(configured_profile(), "full");
@@ -31,21 +34,21 @@ fn the_default_profile_is_full() {
 #[test]
 fn an_unknown_profile_falls_back_to_full_rather_than_failing() {
     let _guard = env_lock();
-    std::env::set_var(TOOL_PROFILE_ENV, "minimal");
+    crate::test_env::set_var(TOOL_PROFILE_ENV, "minimal");
 
     // A typo yields the widest surface. Refusing to start over a misspelled
     // optimisation would be worse than the misspelling, and an empty surface
     // would look like a broken server.
     assert_eq!(configured_profile(), "full");
-    std::env::remove_var(TOOL_PROFILE_ENV);
+    crate::test_env::remove_var(TOOL_PROFILE_ENV);
 }
 
 #[test]
 fn profile_names_are_case_and_whitespace_insensitive() {
     let _guard = env_lock();
-    std::env::set_var(TOOL_PROFILE_ENV, "  Core \n");
+    crate::test_env::set_var(TOOL_PROFILE_ENV, "  Core \n");
     assert_eq!(configured_profile(), "core");
-    std::env::remove_var(TOOL_PROFILE_ENV);
+    crate::test_env::remove_var(TOOL_PROFILE_ENV);
 }
 
 #[test]

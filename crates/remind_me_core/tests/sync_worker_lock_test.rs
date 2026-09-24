@@ -10,6 +10,9 @@
 //! process-global, so this holds `ENV_LOCK` for its duration -- the same
 //! convention `sync_test.rs` established.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 use remind_me_core::sync::{SyncWorker, HUB_URL_ENV, NODE_ID_ENV, SYNC_SECRET_ENV};
 use remind_me_core::Database;
 use std::io::Read;
@@ -44,9 +47,9 @@ fn a_stuck_hub_never_blocks_an_ordinary_database_read() {
     let db_path = dir.join("memory.db");
     let db = Arc::new(Database::open(&db_path).unwrap());
 
-    std::env::set_var(NODE_ID_ENV, "lock-test-node");
-    std::env::set_var(HUB_URL_ENV, format!("http://{hub_addr}"));
-    std::env::set_var(SYNC_SECRET_ENV, "lock-test-secret");
+    crate::test_env::set_var(NODE_ID_ENV, "lock-test-node");
+    crate::test_env::set_var(HUB_URL_ENV, format!("http://{hub_addr}"));
+    crate::test_env::set_var(SYNC_SECRET_ENV, "lock-test-secret");
 
     let mut worker = SyncWorker::from_env(db_path.clone()).expect("sync enabled by env");
 
@@ -60,9 +63,9 @@ fn a_stuck_hub_never_blocks_an_ordinary_database_read() {
     let elapsed = start.elapsed();
 
     worker.stop();
-    std::env::remove_var(NODE_ID_ENV);
-    std::env::remove_var(HUB_URL_ENV);
-    std::env::remove_var(SYNC_SECRET_ENV);
+    crate::test_env::remove_var(NODE_ID_ENV);
+    crate::test_env::remove_var(HUB_URL_ENV);
+    crate::test_env::remove_var(SYNC_SECRET_ENV);
     let _ = std::fs::remove_dir_all(&dir);
 
     assert!(

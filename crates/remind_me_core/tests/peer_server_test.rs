@@ -8,6 +8,9 @@
 //! `REMIND_ME_SYNC_SECRET`/`REMIND_ME_NODE_ID`/`REMIND_ME_HUB_URL` are
 //! process-global; the two tests here that touch them hold `ENV_LOCK`.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 use remind_me_core::db::queries;
 use remind_me_core::sync::{
     self, serve_once, PeerServerConfig, HUB_URL_ENV, NODE_ID_ENV, SYNC_SECRET_ENV,
@@ -363,28 +366,28 @@ fn pull_over_an_empty_store_returns_no_records() {
 #[test]
 fn peer_server_config_is_none_without_a_secret() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var(SYNC_SECRET_ENV);
+    crate::test_env::remove_var(SYNC_SECRET_ENV);
     assert!(PeerServerConfig::from_env().is_none());
 }
 
 #[test]
 fn sync_enabled_requires_all_three_of_node_id_hub_url_and_secret() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var(NODE_ID_ENV);
-    std::env::remove_var(HUB_URL_ENV);
-    std::env::remove_var(SYNC_SECRET_ENV);
+    crate::test_env::remove_var(NODE_ID_ENV);
+    crate::test_env::remove_var(HUB_URL_ENV);
+    crate::test_env::remove_var(SYNC_SECRET_ENV);
     assert!(!sync::sync_enabled());
 
-    std::env::set_var(NODE_ID_ENV, "node-a");
-    std::env::set_var(HUB_URL_ENV, "http://hub:8766");
+    crate::test_env::set_var(NODE_ID_ENV, "node-a");
+    crate::test_env::set_var(HUB_URL_ENV, "http://hub:8766");
     assert!(!sync::sync_enabled(), "still missing the secret");
 
-    std::env::set_var(SYNC_SECRET_ENV, "s3cret");
+    crate::test_env::set_var(SYNC_SECRET_ENV, "s3cret");
     assert!(sync::sync_enabled());
 
-    std::env::remove_var(NODE_ID_ENV);
-    std::env::remove_var(HUB_URL_ENV);
-    std::env::remove_var(SYNC_SECRET_ENV);
+    crate::test_env::remove_var(NODE_ID_ENV);
+    crate::test_env::remove_var(HUB_URL_ENV);
+    crate::test_env::remove_var(SYNC_SECRET_ENV);
 }
 
 // ---------------------------------------------------------------------------

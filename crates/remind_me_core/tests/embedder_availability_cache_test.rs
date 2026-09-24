@@ -17,6 +17,9 @@
 //! `ENV_LOCK` convention those tests follow serialises the environment, but a
 //! process-global cache is not the environment, so the lock never covered it.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 use remind_me_core::embedder::{
     available_embedder, EMBEDDING_BACKEND_ENV, EMBEDDING_DIM_ENV, OLLAMA_URL_ENV,
 };
@@ -53,15 +56,15 @@ fn fake_daemon() -> (u16, std::thread::JoinHandle<()>) {
 }
 
 fn set_backend(port: u16) {
-    std::env::set_var(EMBEDDING_BACKEND_ENV, "ollama");
-    std::env::set_var(OLLAMA_URL_ENV, format!("http://127.0.0.1:{port}"));
-    std::env::set_var(EMBEDDING_DIM_ENV, "2");
+    crate::test_env::set_var(EMBEDDING_BACKEND_ENV, "ollama");
+    crate::test_env::set_var(OLLAMA_URL_ENV, format!("http://127.0.0.1:{port}"));
+    crate::test_env::set_var(EMBEDDING_DIM_ENV, "2");
 }
 
 fn clear_backend() {
-    std::env::remove_var(EMBEDDING_BACKEND_ENV);
-    std::env::remove_var(OLLAMA_URL_ENV);
-    std::env::remove_var(EMBEDDING_DIM_ENV);
+    crate::test_env::remove_var(EMBEDDING_BACKEND_ENV);
+    crate::test_env::remove_var(OLLAMA_URL_ENV);
+    crate::test_env::remove_var(EMBEDDING_DIM_ENV);
 }
 
 /// A dead address, then a live one, with no wait in between.

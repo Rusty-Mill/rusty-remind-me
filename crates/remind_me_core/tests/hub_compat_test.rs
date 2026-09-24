@@ -18,6 +18,9 @@
 //! *internal* schema rather than the protocol the two crates actually agree
 //! on.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 mod support;
 
 use remind_me_core::db::queries;
@@ -54,15 +57,15 @@ fn add(conn: &Connection, content: &str) -> String {
 /// sync env vars are process-global, so every test that touches them holds
 /// `ENV_LOCK` for its duration.
 fn enable_sync(node_id: &str) {
-    std::env::set_var(NODE_ID_ENV, node_id);
-    std::env::set_var(HUB_URL_ENV, "http://hub.example");
-    std::env::set_var(SYNC_SECRET_ENV, SECRET);
+    crate::test_env::set_var(NODE_ID_ENV, node_id);
+    crate::test_env::set_var(HUB_URL_ENV, "http://hub.example");
+    crate::test_env::set_var(SYNC_SECRET_ENV, SECRET);
 }
 
 fn disable_sync() {
-    std::env::remove_var(NODE_ID_ENV);
-    std::env::remove_var(HUB_URL_ENV);
-    std::env::remove_var(SYNC_SECRET_ENV);
+    crate::test_env::remove_var(NODE_ID_ENV);
+    crate::test_env::remove_var(HUB_URL_ENV);
+    crate::test_env::remove_var(SYNC_SECRET_ENV);
 }
 
 #[test]

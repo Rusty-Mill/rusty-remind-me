@@ -8,6 +8,9 @@
 //! A read-scoped key that can still write is worse than no feature at all: it
 //! gets handed to someone on the understanding that it is safe.
 
+#[path = "../../remind_me_core/src/test_env.rs"]
+mod test_env;
+
 mod common;
 use common::{authed_server, call, KEY};
 use remind_me_core::api_keys::{
@@ -35,14 +38,14 @@ impl Store {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("api_keys.json");
-        std::env::set_var(API_KEYS_FILE_ENV, &path);
+        crate::test_env::set_var(API_KEYS_FILE_ENV, &path);
         Self(path)
     }
 }
 
 impl Drop for Store {
     fn drop(&mut self) {
-        std::env::remove_var(API_KEYS_FILE_ENV);
+        crate::test_env::remove_var(API_KEYS_FILE_ENV);
         if let Some(parent) = self.0.parent() {
             let _ = std::fs::remove_dir_all(parent);
         }

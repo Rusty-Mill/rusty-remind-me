@@ -5,6 +5,9 @@
 //! a `# TYPE` without its family, a sample whose name does not match its
 //! header — and substring assertions pass on both.
 
+#[path = "../../remind_me_core/src/test_env.rs"]
+mod test_env;
+
 mod common;
 use common::{get, server};
 use remind_me_core::metrics::METRICS_ENABLED_ENV;
@@ -68,13 +71,13 @@ fn parse(text: &str) -> Exposition {
 fn with_metrics<T>(enabled: bool, body: impl FnOnce() -> T) -> T {
     let _guard = env_lock().lock().unwrap();
     if enabled {
-        std::env::set_var(METRICS_ENABLED_ENV, "1");
+        crate::test_env::set_var(METRICS_ENABLED_ENV, "1");
     } else {
-        std::env::remove_var(METRICS_ENABLED_ENV);
+        crate::test_env::remove_var(METRICS_ENABLED_ENV);
     }
     remind_me_core::metrics::reset();
     let out = body();
-    std::env::remove_var(METRICS_ENABLED_ENV);
+    crate::test_env::remove_var(METRICS_ENABLED_ENV);
     out
 }
 

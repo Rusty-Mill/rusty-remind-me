@@ -9,6 +9,9 @@
 //! and the receiving side silently dropped it, so each side's test passed
 //! while the join did nothing.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 use remind_me_core::db::queries;
 use remind_me_core::models::ReminderWindow;
 use remind_me_core::reminders::{list_reminders, set_reminder};
@@ -17,9 +20,9 @@ use remind_me_core::{Database, MemoryAddInput};
 use rusqlite::Connection;
 
 fn enable_sync() {
-    std::env::set_var(NODE_ID_ENV, "node-reminders-test");
-    std::env::set_var(HUB_URL_ENV, "http://hub.example");
-    std::env::set_var(SYNC_SECRET_ENV, "shh");
+    crate::test_env::set_var(NODE_ID_ENV, "node-reminders-test");
+    crate::test_env::set_var(HUB_URL_ENV, "http://hub.example");
+    crate::test_env::set_var(SYNC_SECRET_ENV, "shh");
 }
 
 fn add(conn: &Connection, content: &str) -> String {

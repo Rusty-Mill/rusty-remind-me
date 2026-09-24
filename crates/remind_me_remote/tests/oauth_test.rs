@@ -7,6 +7,9 @@
 //! (`_register`, `_authorize`, `_pkce_pair`, ...) so this file's coverage
 //! maps onto that one test-for-test where the scenario applies.
 
+#[path = "../../remind_me_core/src/test_env.rs"]
+mod test_env;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -78,7 +81,7 @@ async fn isolated_oauth_state_file(label: &str) -> tokio::sync::MutexGuard<'stat
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    std::env::set_var(
+    crate::test_env::set_var(
         remind_me_core::remote::REMOTE_OAUTH_STATE_FILE_ENV,
         dir.join("oauth.json"),
     );

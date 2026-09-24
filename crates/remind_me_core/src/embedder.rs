@@ -935,7 +935,7 @@ mod tests {
         // behind a lock, so this unit test only asserts the case that is
         // always safe to assume — nobody else in this crate's own test suite
         // sets that variable to "ollama" and leaves it set.
-        std::env::remove_var(EMBEDDING_BACKEND_ENV);
+        crate::test_env::remove_var(EMBEDDING_BACKEND_ENV);
         assert!(resolve_embedder().is_none());
     }
 }

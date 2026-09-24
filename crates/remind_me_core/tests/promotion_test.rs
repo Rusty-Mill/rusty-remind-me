@@ -9,6 +9,9 @@
 //! - **Demotion is automatic.** Superseding a fact has to withdraw the persona
 //!   built on it, with nothing scheduled and nobody asked.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 use remind_me_core::entity::link_memory_entity;
 use remind_me_core::promotion::{
     demoted, persona, promote, promotion_candidates, provenance, PromotionError,
@@ -494,7 +497,7 @@ fn an_empty_backlog_says_so_rather_than_rendering_blank() {
 #[test]
 fn the_nudge_is_off_unless_an_interval_is_configured() {
     let _guard = NUDGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var(remind_me_core::promotion::NUDGE_INTERVAL_ENV);
+    crate::test_env::remove_var(remind_me_core::promotion::NUDGE_INTERVAL_ENV);
 
     assert!(remind_me_core::promotion::nudge_interval().is_none());
 
@@ -507,22 +510,22 @@ fn the_nudge_is_off_unless_an_interval_is_configured() {
 #[test]
 fn a_zero_interval_is_treated_as_off_not_as_a_busy_loop() {
     let _guard = NUDGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var(remind_me_core::promotion::NUDGE_INTERVAL_ENV, "0");
+    crate::test_env::set_var(remind_me_core::promotion::NUDGE_INTERVAL_ENV, "0");
     assert!(remind_me_core::promotion::nudge_interval().is_none());
 
-    std::env::set_var(
+    crate::test_env::set_var(
         remind_me_core::promotion::NUDGE_INTERVAL_ENV,
         "not a number",
     );
     assert!(remind_me_core::promotion::nudge_interval().is_none());
 
-    std::env::set_var(remind_me_core::promotion::NUDGE_INTERVAL_ENV, "900");
+    crate::test_env::set_var(remind_me_core::promotion::NUDGE_INTERVAL_ENV, "900");
     assert_eq!(
         remind_me_core::promotion::nudge_interval(),
         Some(std::time::Duration::from_secs(900))
     );
 
-    std::env::remove_var(remind_me_core::promotion::NUDGE_INTERVAL_ENV);
+    crate::test_env::remove_var(remind_me_core::promotion::NUDGE_INTERVAL_ENV);
 }
 
 #[test]

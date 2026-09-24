@@ -1,5 +1,8 @@
 //! Coverage for `remind_me_server_status`.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 use remind_me_core::backup::create_backup;
 use remind_me_core::db::queries;
 use remind_me_core::db::schema::SCHEMA_VERSION;
@@ -172,7 +175,7 @@ fn backups_are_inventoried_newest_first() {
 #[test]
 fn absent_subsystems_are_named_with_a_reason() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var(EMBEDDING_BACKEND_ENV);
+    crate::test_env::remove_var(EMBEDDING_BACKEND_ENV);
     let db = Database::open_in_memory().unwrap();
 
     let report = server_status(&db.conn()).unwrap();
@@ -199,12 +202,12 @@ fn absent_subsystems_are_named_with_a_reason() {
 #[test]
 fn embeddings_status_is_active_when_a_backend_is_configured() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var(EMBEDDING_BACKEND_ENV, "ollama");
+    crate::test_env::set_var(EMBEDDING_BACKEND_ENV, "ollama");
     let db = Database::open_in_memory().unwrap();
 
     let report = server_status(&db.conn()).unwrap();
 
-    std::env::remove_var(EMBEDDING_BACKEND_ENV);
+    crate::test_env::remove_var(EMBEDDING_BACKEND_ENV);
     assert!(
         matches!(report.embeddings, SubsystemStatus::Active),
         "expected Active, got {:?}",
@@ -215,7 +218,7 @@ fn embeddings_status_is_active_when_a_backend_is_configured() {
 #[test]
 fn embeddings_status_is_not_implemented_without_a_configured_backend() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var(EMBEDDING_BACKEND_ENV);
+    crate::test_env::remove_var(EMBEDDING_BACKEND_ENV);
     let db = Database::open_in_memory().unwrap();
 
     let report = server_status(&db.conn()).unwrap();
@@ -229,7 +232,7 @@ fn embeddings_status_is_not_implemented_without_a_configured_backend() {
 #[test]
 fn the_report_serialises_with_the_subsystem_state_tagged() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var(EMBEDDING_BACKEND_ENV);
+    crate::test_env::remove_var(EMBEDDING_BACKEND_ENV);
     let db = Database::open_in_memory().unwrap();
 
     let report = server_status(&db.conn()).unwrap();

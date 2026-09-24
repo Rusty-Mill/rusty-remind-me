@@ -7,6 +7,9 @@
 //! assertion for nothing. Two tests do go over TCP, to cover the parts a fake
 //! stream cannot: that a port is really bound, and that stopping really joins.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 use remind_me_core::sync::{CLIENT_ENV, NODE_ID_ENV};
 use remind_me_core::webhook::{
     self, constant_time_eq, validate_payload, Webhook, WebhookConfig, WebhookCounters,
@@ -86,7 +89,7 @@ fn serve(conn: &Connection, raw: &str) -> (u16, serde_json::Value) {
 /// Set from every helper rather than once, because the tests run in parallel
 /// and there is no ordered setup hook.
 fn disable_rate_limit() {
-    std::env::set_var(remind_me_core::rate_limit::RATE_LIMIT_ENABLED_ENV, "");
+    crate::test_env::set_var(remind_me_core::rate_limit::RATE_LIMIT_ENABLED_ENV, "");
 }
 
 fn serve_with(
@@ -492,8 +495,8 @@ fn a_pushed_memory_is_stamped_with_the_configured_node_and_client() {
     let _guard = PROVENANCE_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    std::env::set_var(NODE_ID_ENV, "webhook-test-node");
-    std::env::set_var(CLIENT_ENV, "webhook-test-client");
+    crate::test_env::set_var(NODE_ID_ENV, "webhook-test-node");
+    crate::test_env::set_var(CLIENT_ENV, "webhook-test-client");
 
     let db = Database::open_in_memory().unwrap();
     let conn = db.conn();
@@ -506,8 +509,8 @@ fn a_pushed_memory_is_stamped_with_the_configured_node_and_client() {
         })
         .unwrap();
 
-    std::env::remove_var(NODE_ID_ENV);
-    std::env::remove_var(CLIENT_ENV);
+    crate::test_env::remove_var(NODE_ID_ENV);
+    crate::test_env::remove_var(CLIENT_ENV);
 
     assert_eq!(node_id.as_deref(), Some("webhook-test-node"));
     assert_eq!(client, "webhook-test-client");

@@ -6,6 +6,9 @@
 //! never be wrong, and gating its coverage behind a feature flag would mean
 //! the default build never checks the control that protects the default build.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 use remind_me_core::cloud_backup::{
     self, object_key, plaintext_gate, upload_backup, UploadOutcome,
 };
@@ -22,7 +25,7 @@ fn clear() {
         cloud_backup::ALLOW_PLAINTEXT_ENV,
         cloud_backup::DB_ENCRYPTION_KEY_ENV,
     ] {
-        std::env::remove_var(var);
+        crate::test_env::remove_var(var);
     }
 }
 
@@ -51,7 +54,7 @@ fn an_unencrypted_backup_is_refused_without_explicit_consent() {
 fn an_encrypted_backup_needs_no_opt_in() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear();
-    std::env::set_var(cloud_backup::DB_ENCRYPTION_KEY_ENV, "a-key");
+    crate::test_env::set_var(cloud_backup::DB_ENCRYPTION_KEY_ENV, "a-key");
 
     // Already ciphertext, so there is nothing to consent to.
     assert!(plaintext_gate().is_ok());
@@ -62,7 +65,7 @@ fn an_encrypted_backup_needs_no_opt_in() {
 fn the_explicit_opt_in_permits_a_plaintext_upload() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear();
-    std::env::set_var(cloud_backup::ALLOW_PLAINTEXT_ENV, "1");
+    crate::test_env::set_var(cloud_backup::ALLOW_PLAINTEXT_ENV, "1");
 
     assert!(plaintext_gate().is_ok());
     clear();
@@ -74,13 +77,13 @@ fn only_a_truthy_opt_in_counts() {
     clear();
 
     for truthy in ["1", "true", "TRUE", "yes", "on"] {
-        std::env::set_var(cloud_backup::ALLOW_PLAINTEXT_ENV, truthy);
+        crate::test_env::set_var(cloud_backup::ALLOW_PLAINTEXT_ENV, truthy);
         assert!(plaintext_gate().is_ok(), "{truthy} should permit");
     }
     // An unset-looking value must not accidentally grant consent — this is the
     // direction where being wrong ships someone's data.
     for falsy in ["0", "false", "no", "off", "", "  "] {
-        std::env::set_var(cloud_backup::ALLOW_PLAINTEXT_ENV, falsy);
+        crate::test_env::set_var(cloud_backup::ALLOW_PLAINTEXT_ENV, falsy);
         assert!(plaintext_gate().is_err(), "{falsy:?} must not permit");
     }
     clear();
@@ -90,9 +93,9 @@ fn only_a_truthy_opt_in_counts() {
 fn the_gate_is_checked_before_anything_leaves_the_machine() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear();
-    std::env::set_var(cloud_backup::BUCKET_ENV, "my-bucket");
+    crate::test_env::set_var(cloud_backup::BUCKET_ENV, "my-bucket");
     // An endpoint that would fail loudly if it were ever contacted.
-    std::env::set_var(cloud_backup::ENDPOINT_ENV, "http://127.0.0.1:1");
+    crate::test_env::set_var(cloud_backup::ENDPOINT_ENV, "http://127.0.0.1:1");
 
     let outcome = upload_backup(std::path::Path::new("/nonexistent/backup.db"));
 
@@ -170,7 +173,7 @@ fn availability_matches_the_compiled_feature() {
 fn a_refused_upload_does_not_stop_the_local_backup() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear();
-    std::env::set_var(cloud_backup::BUCKET_ENV, "my-bucket");
+    crate::test_env::set_var(cloud_backup::BUCKET_ENV, "my-bucket");
 
     let dir = std::env::temp_dir().join(format!("rrm_cloud_backup_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);

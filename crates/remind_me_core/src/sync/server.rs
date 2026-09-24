@@ -908,9 +908,9 @@ mod tests {
     use super::super::tests::ENV_LOCK;
 
     fn clear_env() {
-        std::env::remove_var(super::super::SYNC_SECRET_ENV);
-        std::env::remove_var(super::super::PEER_BIND_ENV);
-        std::env::remove_var(super::super::PEER_PORT_ENV);
+        crate::test_env::remove_var(super::super::SYNC_SECRET_ENV);
+        crate::test_env::remove_var(super::super::PEER_BIND_ENV);
+        crate::test_env::remove_var(super::super::PEER_PORT_ENV);
     }
 
     /// A stray literal `${user_config.sync_secret}` string in the secret var
@@ -926,7 +926,7 @@ mod tests {
     fn unresolved_user_config_placeholder_does_not_start_a_peer_server() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
-        std::env::set_var(super::super::SYNC_SECRET_ENV, "${user_config.sync_secret}");
+        crate::test_env::set_var(super::super::SYNC_SECRET_ENV, "${user_config.sync_secret}");
 
         assert!(PeerServerConfig::from_env().is_none());
 
@@ -937,7 +937,7 @@ mod tests {
     fn a_real_secret_still_starts_a_peer_server() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
-        std::env::set_var(super::super::SYNC_SECRET_ENV, "s3cr3t");
+        crate::test_env::set_var(super::super::SYNC_SECRET_ENV, "s3cr3t");
 
         assert!(PeerServerConfig::from_env().is_some());
 

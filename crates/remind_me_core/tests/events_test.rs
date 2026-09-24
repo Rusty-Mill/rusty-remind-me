@@ -6,6 +6,9 @@
 //! test that only reads `payload()` would keep passing if a later change
 //! started sending the whole memory from the emit path.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 use remind_me_core::events::{self, Event};
 use remind_me_core::{Database, MemoryAddInput};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -85,7 +88,7 @@ fn received(rx: &mpsc::Receiver<String>) -> serde_json::Value {
 fn the_payload_carries_no_memory_content() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (url, rx) = capture(1);
-    std::env::set_var(events::EVENT_WEBHOOK_URL_ENV, &url);
+    crate::test_env::set_var(events::EVENT_WEBHOOK_URL_ENV, &url);
 
     let db = Database::open_in_memory().unwrap();
     let conn = db.conn();
@@ -108,14 +111,14 @@ fn the_payload_carries_no_memory_content() {
     assert_eq!(event["category"], "general");
     assert!(event["timestamp"].is_string());
 
-    std::env::remove_var(events::EVENT_WEBHOOK_URL_ENV);
+    crate::test_env::remove_var(events::EVENT_WEBHOOK_URL_ENV);
 }
 
 #[test]
 fn each_mutation_kind_emits_its_own_event() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (url, rx) = capture(3);
-    std::env::set_var(events::EVENT_WEBHOOK_URL_ENV, &url);
+    crate::test_env::set_var(events::EVENT_WEBHOOK_URL_ENV, &url);
 
     let db = Database::open_in_memory().unwrap();
     let conn = db.conn();
@@ -153,14 +156,14 @@ fn each_mutation_kind_emits_its_own_event() {
     // Nothing currently makes one.
     kinds.sort();
     assert_eq!(kinds, vec!["created", "deleted", "updated"]);
-    std::env::remove_var(events::EVENT_WEBHOOK_URL_ENV);
+    crate::test_env::remove_var(events::EVENT_WEBHOOK_URL_ENV);
 }
 
 #[test]
 fn a_delete_still_reports_the_category_it_had() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (url, rx) = capture(2);
-    std::env::set_var(events::EVENT_WEBHOOK_URL_ENV, &url);
+    crate::test_env::set_var(events::EVENT_WEBHOOK_URL_ENV, &url);
 
     let db = Database::open_in_memory().unwrap();
     let conn = db.conn();
@@ -175,7 +178,7 @@ fn a_delete_still_reports_the_category_it_had() {
     assert_eq!(deleted["event"], "deleted");
     assert_eq!(deleted["category"], "engineering");
 
-    std::env::remove_var(events::EVENT_WEBHOOK_URL_ENV);
+    crate::test_env::remove_var(events::EVENT_WEBHOOK_URL_ENV);
 }
 
 // ---------------------------------------------------------------------------
@@ -185,7 +188,7 @@ fn a_delete_still_reports_the_category_it_had() {
 #[test]
 fn an_unconfigured_stream_is_a_true_no_op() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var(events::EVENT_WEBHOOK_URL_ENV);
+    crate::test_env::remove_var(events::EVENT_WEBHOOK_URL_ENV);
 
     assert!(!events::enabled());
 
@@ -200,22 +203,22 @@ fn an_unconfigured_stream_is_a_true_no_op() {
 #[test]
 fn a_blank_url_counts_as_unconfigured() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var(events::EVENT_WEBHOOK_URL_ENV, "   ");
+    crate::test_env::set_var(events::EVENT_WEBHOOK_URL_ENV, "   ");
 
     // A blank env var is how "unset" arrives from a lot of process managers.
     assert!(!events::enabled());
 
-    std::env::remove_var(events::EVENT_WEBHOOK_URL_ENV);
+    crate::test_env::remove_var(events::EVENT_WEBHOOK_URL_ENV);
 }
 
 #[test]
 fn a_sync_applied_write_emits_nothing() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (url, rx) = capture(1);
-    std::env::set_var(events::EVENT_WEBHOOK_URL_ENV, &url);
-    std::env::set_var(remind_me_core::sync::NODE_ID_ENV, "node-events-test");
-    std::env::set_var(remind_me_core::sync::HUB_URL_ENV, "http://hub.example");
-    std::env::set_var(remind_me_core::sync::SYNC_SECRET_ENV, "shh");
+    crate::test_env::set_var(events::EVENT_WEBHOOK_URL_ENV, &url);
+    crate::test_env::set_var(remind_me_core::sync::NODE_ID_ENV, "node-events-test");
+    crate::test_env::set_var(remind_me_core::sync::HUB_URL_ENV, "http://hub.example");
+    crate::test_env::set_var(remind_me_core::sync::SYNC_SECRET_ENV, "shh");
 
     let db = Database::open_in_memory().unwrap();
     let conn = db.conn();
@@ -259,10 +262,10 @@ fn a_sync_applied_write_emits_nothing() {
         "a record arriving from a peer must not emit a local event"
     );
 
-    std::env::remove_var(events::EVENT_WEBHOOK_URL_ENV);
-    std::env::remove_var(remind_me_core::sync::NODE_ID_ENV);
-    std::env::remove_var(remind_me_core::sync::HUB_URL_ENV);
-    std::env::remove_var(remind_me_core::sync::SYNC_SECRET_ENV);
+    crate::test_env::remove_var(events::EVENT_WEBHOOK_URL_ENV);
+    crate::test_env::remove_var(remind_me_core::sync::NODE_ID_ENV);
+    crate::test_env::remove_var(remind_me_core::sync::HUB_URL_ENV);
+    crate::test_env::remove_var(remind_me_core::sync::SYNC_SECRET_ENV);
 }
 
 // ---------------------------------------------------------------------------
@@ -277,7 +280,7 @@ fn a_dead_endpoint_does_not_fail_the_write() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         format!("http://{}/events", listener.local_addr().unwrap())
     };
-    std::env::set_var(events::EVENT_WEBHOOK_URL_ENV, &dead);
+    crate::test_env::set_var(events::EVENT_WEBHOOK_URL_ENV, &dead);
 
     let db = Database::open_in_memory().unwrap();
     let conn = db.conn();
@@ -291,14 +294,14 @@ fn a_dead_endpoint_does_not_fail_the_write() {
         .unwrap()
         .is_some());
 
-    std::env::remove_var(events::EVENT_WEBHOOK_URL_ENV);
+    crate::test_env::remove_var(events::EVENT_WEBHOOK_URL_ENV);
 }
 
 #[test]
 fn there_is_no_throttle() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (url, rx) = capture(5);
-    std::env::set_var(events::EVENT_WEBHOOK_URL_ENV, &url);
+    crate::test_env::set_var(events::EVENT_WEBHOOK_URL_ENV, &url);
 
     let db = Database::open_in_memory().unwrap();
     let conn = db.conn();
@@ -314,7 +317,7 @@ fn there_is_no_throttle() {
         assert_eq!(received(&rx)["event"], "created");
     }
 
-    std::env::remove_var(events::EVENT_WEBHOOK_URL_ENV);
+    crate::test_env::remove_var(events::EVENT_WEBHOOK_URL_ENV);
 }
 
 #[test]

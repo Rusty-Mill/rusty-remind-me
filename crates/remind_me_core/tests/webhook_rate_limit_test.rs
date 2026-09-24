@@ -12,6 +12,9 @@
 //! that fails intermittently and looks like a limiter bug. Each test also uses
 //! a distinct peer address, so no test depends on a fresh allowance.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 use remind_me_core::rate_limit::RATE_LIMIT_ENABLED_ENV;
 use remind_me_core::webhook::{self, WebhookConfig, WebhookCounters};
 use remind_me_core::Database;
@@ -92,7 +95,7 @@ fn serve_from(conn: &rusqlite::Connection, peer: &str) -> (u16, String) {
 #[test]
 fn an_unauthenticated_flood_is_cut_off_before_it_reaches_auth() {
     let _guard = env_lock();
-    std::env::set_var(RATE_LIMIT_ENABLED_ENV, "1");
+    crate::test_env::set_var(RATE_LIMIT_ENABLED_ENV, "1");
     let db = Database::open_in_memory().unwrap();
     let conn = db.conn();
     let peer = "198.51.100.7";
@@ -149,7 +152,7 @@ fn an_unauthenticated_flood_is_cut_off_before_it_reaches_auth() {
 #[test]
 fn one_floods_peer_does_not_lock_out_another() {
     let _guard = env_lock();
-    std::env::set_var(RATE_LIMIT_ENABLED_ENV, "1");
+    crate::test_env::set_var(RATE_LIMIT_ENABLED_ENV, "1");
     let db = Database::open_in_memory().unwrap();
     let conn = db.conn();
 
@@ -174,7 +177,7 @@ fn one_floods_peer_does_not_lock_out_another() {
 #[test]
 fn the_limiter_can_be_turned_off() {
     let _guard = env_lock();
-    std::env::set_var(RATE_LIMIT_ENABLED_ENV, "");
+    crate::test_env::set_var(RATE_LIMIT_ENABLED_ENV, "");
     let db = Database::open_in_memory().unwrap();
     let conn = db.conn();
 
@@ -183,5 +186,5 @@ fn the_limiter_can_be_turned_off() {
     for _ in 0..80 {
         assert_eq!(serve_from(&conn, "198.51.100.10").0, 401);
     }
-    std::env::set_var(RATE_LIMIT_ENABLED_ENV, "1");
+    crate::test_env::set_var(RATE_LIMIT_ENABLED_ENV, "1");
 }

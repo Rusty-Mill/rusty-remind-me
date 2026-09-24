@@ -10,6 +10,9 @@
 //! process-global, so this holds `ENV_LOCK` for its duration -- the same
 //! convention `sync_test.rs` established.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 use remind_me_core::sync::{SyncPeer, PEER_BIND_ENV, PEER_PORT_ENV, SYNC_SECRET_ENV};
 use remind_me_core::Database;
 use std::net::TcpStream;
@@ -28,9 +31,9 @@ fn a_stuck_peer_connection_never_blocks_an_ordinary_database_read() {
     std::fs::create_dir_all(&dir).unwrap();
     let db = Arc::new(Database::open(dir.join("memory.db")).unwrap());
 
-    std::env::set_var(SYNC_SECRET_ENV, "lock-test-secret");
-    std::env::set_var(PEER_BIND_ENV, "127.0.0.1");
-    std::env::set_var(PEER_PORT_ENV, "0");
+    crate::test_env::set_var(SYNC_SECRET_ENV, "lock-test-secret");
+    crate::test_env::set_var(PEER_BIND_ENV, "127.0.0.1");
+    crate::test_env::set_var(PEER_PORT_ENV, "0");
 
     let peer = SyncPeer::from_env(Arc::clone(&db));
     let SyncPeer::Running(server) = &peer else {
@@ -53,9 +56,9 @@ fn a_stuck_peer_connection_never_blocks_an_ordinary_database_read() {
         .expect("a plain local read");
     let elapsed = start.elapsed();
 
-    std::env::remove_var(SYNC_SECRET_ENV);
-    std::env::remove_var(PEER_BIND_ENV);
-    std::env::remove_var(PEER_PORT_ENV);
+    crate::test_env::remove_var(SYNC_SECRET_ENV);
+    crate::test_env::remove_var(PEER_BIND_ENV);
+    crate::test_env::remove_var(PEER_PORT_ENV);
     let _ = std::fs::remove_dir_all(&dir);
 
     assert!(

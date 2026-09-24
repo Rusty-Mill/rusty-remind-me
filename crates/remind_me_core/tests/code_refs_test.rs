@@ -14,6 +14,9 @@
 //! is entirely about filesystem state, and a fixture that never touches disk
 //! would not exercise the part that can actually be wrong.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 use remind_me_core::code_refs::{
     configured_code_roots, detect_code_refs, stale_candidates, StaleReason, CODE_ROOTS_ENV,
 };
@@ -50,7 +53,7 @@ impl Fixture {
     }
 
     fn set_env(&self) {
-        std::env::set_var(CODE_ROOTS_ENV, self.root.display().to_string());
+        crate::test_env::set_var(CODE_ROOTS_ENV, self.root.display().to_string());
     }
 }
 
@@ -63,7 +66,7 @@ impl Drop for Fixture {
 struct EnvGuard;
 impl Drop for EnvGuard {
     fn drop(&mut self) {
-        std::env::remove_var(CODE_ROOTS_ENV);
+        crate::test_env::remove_var(CODE_ROOTS_ENV);
     }
 }
 
@@ -90,7 +93,7 @@ fn add(conn: &Connection, content: &str) -> String {
 #[test]
 fn unconfigured_is_completely_inert() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var(CODE_ROOTS_ENV);
+    crate::test_env::remove_var(CODE_ROOTS_ENV);
 
     let fixture = Fixture::new("inert");
     assert!(configured_code_roots().is_empty());
@@ -220,7 +223,7 @@ fn add_memory_anchors_when_configured() {
 #[test]
 fn add_memory_records_nothing_when_unconfigured() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var(CODE_ROOTS_ENV);
+    crate::test_env::remove_var(CODE_ROOTS_ENV);
     let fixture = Fixture::new("add_memory_off");
 
     let db = db("add_off");

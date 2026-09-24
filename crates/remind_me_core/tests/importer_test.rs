@@ -1,5 +1,8 @@
 //! Coverage for `remind_me_import_chat` / `remind_me_import_directory`.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 use remind_me_core::import_paths::{validate_import_dir, validate_import_file, ImportPathError};
 use remind_me_core::importer::{
     chunk_text, import_chat, import_directory, looks_like_chat_markdown, parse_document,
@@ -141,8 +144,8 @@ fn a_chat_import_is_stamped_with_the_configured_node_and_client() {
     let _guard = PROVENANCE_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    std::env::set_var(NODE_ID_ENV, "import-test-node");
-    std::env::set_var(CLIENT_ENV, "import-test-client");
+    crate::test_env::set_var(NODE_ID_ENV, "import-test-node");
+    crate::test_env::set_var(CLIENT_ENV, "import-test-client");
 
     let db = Database::open_in_memory().unwrap();
     let conn = db.conn();
@@ -158,8 +161,8 @@ fn a_chat_import_is_stamped_with_the_configured_node_and_client() {
         })
         .unwrap();
 
-    std::env::remove_var(NODE_ID_ENV);
-    std::env::remove_var(CLIENT_ENV);
+    crate::test_env::remove_var(NODE_ID_ENV);
+    crate::test_env::remove_var(CLIENT_ENV);
     std::fs::remove_dir_all(&dir).unwrap();
 
     assert_eq!(node_id.as_deref(), Some("import-test-node"));

@@ -231,12 +231,12 @@ mod tests {
     #[test]
     fn parse_static_peers_reads_well_formed_entries() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var(
+        crate::test_env::set_var(
             STATIC_PEERS_ENV,
             r#"[{"node_id":"laptop","url":"http://100.64.0.9:8766"}]"#,
         );
         let peers = parse_static_peers();
-        std::env::remove_var(STATIC_PEERS_ENV);
+        crate::test_env::remove_var(STATIC_PEERS_ENV);
         assert_eq!(
             peers,
             vec![Peer {
@@ -249,12 +249,12 @@ mod tests {
     #[test]
     fn parse_static_peers_skips_malformed_entries() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var(
+        crate::test_env::set_var(
             STATIC_PEERS_ENV,
             r#"["not-a-dict", {"node_id":"x"}, {"url":"http://ok:1"}, 42]"#,
         );
         let peers = parse_static_peers();
-        std::env::remove_var(STATIC_PEERS_ENV);
+        crate::test_env::remove_var(STATIC_PEERS_ENV);
         assert!(peers.is_empty());
     }
 
@@ -263,16 +263,16 @@ mod tests {
         // Deliberate divergence from the reference, which lets this crash
         // the whole process at import time -- documented in ADR-0006.
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var(STATIC_PEERS_ENV, "not json at all");
+        crate::test_env::set_var(STATIC_PEERS_ENV, "not json at all");
         let peers = parse_static_peers();
-        std::env::remove_var(STATIC_PEERS_ENV);
+        crate::test_env::remove_var(STATIC_PEERS_ENV);
         assert!(peers.is_empty());
     }
 
     #[test]
     fn parse_static_peers_is_empty_when_unset() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var(STATIC_PEERS_ENV);
+        crate::test_env::remove_var(STATIC_PEERS_ENV);
         assert!(parse_static_peers().is_empty());
     }
 
@@ -280,8 +280,8 @@ mod tests {
     #[test]
     fn tailscale_socket_path_honors_the_env_override() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var(TAILSCALE_SOCKET_ENV, "/tmp/custom.sock");
+        crate::test_env::set_var(TAILSCALE_SOCKET_ENV, "/tmp/custom.sock");
         assert_eq!(tailscale_socket_path(), "/tmp/custom.sock");
-        std::env::remove_var(TAILSCALE_SOCKET_ENV);
+        crate::test_env::remove_var(TAILSCALE_SOCKET_ENV);
     }
 }

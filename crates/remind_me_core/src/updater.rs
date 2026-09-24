@@ -949,14 +949,14 @@ mod tests {
     fn an_expected_origin_mismatch_refuses_before_touching_anything() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let setup = origin_and_clone("originpin");
-        std::env::set_var(
+        crate::test_env::set_var(
             UPDATE_EXPECTED_ORIGIN_ENV,
             "https://example.com/expected.git",
         );
 
         let result = perform_update_at(&setup.clone.0, false);
 
-        std::env::remove_var(UPDATE_EXPECTED_ORIGIN_ENV);
+        crate::test_env::remove_var(UPDATE_EXPECTED_ORIGIN_ENV);
         assert!(!result.success);
         assert!(result.error.unwrap().contains(UPDATE_EXPECTED_ORIGIN_ENV));
     }
@@ -1076,7 +1076,7 @@ mod tests {
     #[test]
     fn auto_update_check_is_enabled_by_default() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var(AUTO_UPDATE_CHECK_ENV);
+        crate::test_env::remove_var(AUTO_UPDATE_CHECK_ENV);
         assert!(auto_update_check_enabled());
     }
 
@@ -1084,12 +1084,12 @@ mod tests {
     fn auto_update_check_env_values_that_disable_it() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         for value in ["false", "0", "no", "off", "FALSE", "Off"] {
-            std::env::set_var(AUTO_UPDATE_CHECK_ENV, value);
+            crate::test_env::set_var(AUTO_UPDATE_CHECK_ENV, value);
             assert!(
                 !auto_update_check_enabled(),
                 "{value:?} should disable the check"
             );
         }
-        std::env::remove_var(AUTO_UPDATE_CHECK_ENV);
+        crate::test_env::remove_var(AUTO_UPDATE_CHECK_ENV);
     }
 }

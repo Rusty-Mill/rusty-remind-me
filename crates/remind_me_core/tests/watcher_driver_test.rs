@@ -10,6 +10,9 @@
 //! only checked `start_watcher_for` returned `Some` would pass with a thread
 //! that did nothing at all, which is the bug this replaces.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 use remind_me_core::watcher::{start_watcher_for, WatcherHandle, WATCH_DIRS_ENV};
 use remind_me_core::Database;
 use std::path::PathBuf;
@@ -89,9 +92,9 @@ fn memory_count(path: &std::path::Path) -> usize {
 
 /// Start a watcher over `dir` against `db_path`, with a 1-second interval.
 fn start(dir: &std::path::Path, db_path: &std::path::Path) -> Option<WatcherHandle> {
-    std::env::set_var(WATCH_DIRS_ENV, dir.display().to_string());
-    std::env::set_var("REMIND_ME_WATCH_INTERVAL", "1");
-    std::env::set_var("REMIND_ME_WATCH_GRACE", "0");
+    crate::test_env::set_var(WATCH_DIRS_ENV, dir.display().to_string());
+    crate::test_env::set_var("REMIND_ME_WATCH_INTERVAL", "1");
+    crate::test_env::set_var("REMIND_ME_WATCH_GRACE", "0");
     let db = Database::open(db_path).unwrap();
     // Bound rather than passed inline: `db.conn()` borrows `db`, and the
     // handle does not, so the connection has to be dropped before `db` goes
@@ -103,9 +106,9 @@ fn start(dir: &std::path::Path, db_path: &std::path::Path) -> Option<WatcherHand
 }
 
 fn clear_env() {
-    std::env::remove_var(WATCH_DIRS_ENV);
-    std::env::remove_var("REMIND_ME_WATCH_INTERVAL");
-    std::env::remove_var("REMIND_ME_WATCH_GRACE");
+    crate::test_env::remove_var(WATCH_DIRS_ENV);
+    crate::test_env::remove_var("REMIND_ME_WATCH_INTERVAL");
+    crate::test_env::remove_var("REMIND_ME_WATCH_GRACE");
 }
 
 #[test]
@@ -205,7 +208,7 @@ fn an_in_memory_database_does_not_start_a_loop() {
     // read. Same reason the scheduler refuses.
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let scratch = Scratch::new("inmem");
-    std::env::set_var(WATCH_DIRS_ENV, scratch.0.display().to_string());
+    crate::test_env::set_var(WATCH_DIRS_ENV, scratch.0.display().to_string());
 
     let db = Database::open_in_memory().unwrap();
     assert!(

@@ -4,6 +4,9 @@
 //! same reason `telemetry_export_test.rs` is: the exporter is a process-wide,
 //! initialize-once singleton.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 use remind_me_core::telemetry::{self, OTEL_ENABLED_ENV, OTEL_ENDPOINT_ENV};
 use std::net::TcpListener;
 use std::time::Duration;
@@ -15,8 +18,8 @@ fn an_unreachable_collector_permanently_disables_tracing_after_one_failure() {
     let port = listener.local_addr().unwrap().port();
     drop(listener);
 
-    std::env::set_var(OTEL_ENABLED_ENV, "1");
-    std::env::set_var(
+    crate::test_env::set_var(OTEL_ENABLED_ENV, "1");
+    crate::test_env::set_var(
         OTEL_ENDPOINT_ENV,
         format!("http://127.0.0.1:{port}/v1/traces"),
     );

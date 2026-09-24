@@ -14,6 +14,9 @@
 //! behavior from both sides — a read queues nothing, a real edit still queues
 //! exactly one.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 use chrono::{Duration, Utc};
 use remind_me_core::db::queries;
 use remind_me_core::sync::{
@@ -29,9 +32,9 @@ use rusqlite::Connection;
 /// in the same binary racing it to a different value — there is no
 /// different value any test here ever wants.
 fn ensure_sync_enabled() {
-    std::env::set_var(NODE_ID_ENV, "node-outbox-test");
-    std::env::set_var(HUB_URL_ENV, "http://hub.example");
-    std::env::set_var(SYNC_SECRET_ENV, "shh");
+    crate::test_env::set_var(NODE_ID_ENV, "node-outbox-test");
+    crate::test_env::set_var(HUB_URL_ENV, "http://hub.example");
+    crate::test_env::set_var(SYNC_SECRET_ENV, "shh");
 }
 
 fn add(conn: &Connection, content: &str) -> String {

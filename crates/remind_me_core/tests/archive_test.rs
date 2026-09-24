@@ -6,6 +6,9 @@
 //! in. Asserting only that "an archive file appeared" would pass with the
 //! spans wired to the wrong lines, which is the failure worth catching.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 use remind_me_core::archive::{
     self, ARCHIVE_DIR_ENV, ARCHIVE_MAX_AGE_DAYS_ENV, ARCHIVE_MAX_BYTES_ENV,
 };
@@ -83,7 +86,7 @@ fn open(dir: &std::path::Path) -> Database {
 #[test]
 fn retention_is_off_unless_the_directory_is_configured() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var(ARCHIVE_DIR_ENV);
+    crate::test_env::remove_var(ARCHIVE_DIR_ENV);
 
     assert!(archive::archive_root().is_none());
     assert!(!archive::is_enabled());
@@ -92,7 +95,7 @@ fn retention_is_off_unless_the_directory_is_configured() {
 #[test]
 fn an_import_with_retention_off_records_no_spans() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var(ARCHIVE_DIR_ENV);
+    crate::test_env::remove_var(ARCHIVE_DIR_ENV);
 
     let dir = scratch("off");
     let path = dir.join("chat.jsonl");
@@ -125,7 +128,7 @@ fn a_memory_can_recover_the_blocks_the_importer_dropped() {
 
     let dir = scratch("roundtrip");
     let archive_dir = dir.join("archive");
-    std::env::set_var(ARCHIVE_DIR_ENV, &archive_dir);
+    crate::test_env::set_var(ARCHIVE_DIR_ENV, &archive_dir);
 
     let path = dir.join("chat.jsonl");
     std::fs::write(
@@ -162,7 +165,7 @@ fn a_memory_can_recover_the_blocks_the_importer_dropped() {
     assert!(!source.truncated);
     assert_eq!(source.filename, "chat.jsonl");
 
-    std::env::remove_var(ARCHIVE_DIR_ENV);
+    crate::test_env::remove_var(ARCHIVE_DIR_ENV);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -171,7 +174,7 @@ fn each_memory_points_at_its_own_line_not_the_whole_file() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let dir = scratch("spans");
-    std::env::set_var(ARCHIVE_DIR_ENV, dir.join("archive"));
+    crate::test_env::set_var(ARCHIVE_DIR_ENV, dir.join("archive"));
 
     let path = dir.join("chat.jsonl");
     std::fs::write(
@@ -206,7 +209,7 @@ fn each_memory_points_at_its_own_line_not_the_whole_file() {
         (second.byte_start, second.byte_end)
     );
 
-    std::env::remove_var(ARCHIVE_DIR_ENV);
+    crate::test_env::remove_var(ARCHIVE_DIR_ENV);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -215,7 +218,7 @@ fn undoing_an_import_takes_its_archive_with_it() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let dir = scratch("undo");
-    std::env::set_var(ARCHIVE_DIR_ENV, dir.join("archive"));
+    crate::test_env::set_var(ARCHIVE_DIR_ENV, dir.join("archive"));
 
     let path = dir.join("chat.jsonl");
     std::fs::write(&path, transcript_line("a fact", "a thought", "/one")).unwrap();
@@ -271,7 +274,7 @@ fn undoing_an_import_takes_its_archive_with_it() {
         "the blob itself should be gone too"
     );
 
-    std::env::remove_var(ARCHIVE_DIR_ENV);
+    crate::test_env::remove_var(ARCHIVE_DIR_ENV);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -292,8 +295,8 @@ fn archive_rows(conn: &Connection) -> i64 {
 }
 
 fn clear_limits() {
-    std::env::remove_var(ARCHIVE_MAX_AGE_DAYS_ENV);
-    std::env::remove_var(ARCHIVE_MAX_BYTES_ENV);
+    crate::test_env::remove_var(ARCHIVE_MAX_AGE_DAYS_ENV);
+    crate::test_env::remove_var(ARCHIVE_MAX_BYTES_ENV);
 }
 
 #[test]
@@ -302,7 +305,7 @@ fn with_no_limits_configured_pruning_removes_nothing() {
     clear_limits();
 
     let dir = scratch("nolimits");
-    std::env::set_var(ARCHIVE_DIR_ENV, dir.join("archive"));
+    crate::test_env::set_var(ARCHIVE_DIR_ENV, dir.join("archive"));
 
     let path = dir.join("chat.jsonl");
     std::fs::write(&path, transcript_line("a fact", "t", "/one")).unwrap();
@@ -324,7 +327,7 @@ fn with_no_limits_configured_pruning_removes_nothing() {
     assert_eq!(report.removed_for_age, 0);
     assert_eq!(archive_rows(&conn), 1);
 
-    std::env::remove_var(ARCHIVE_DIR_ENV);
+    crate::test_env::remove_var(ARCHIVE_DIR_ENV);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -334,7 +337,7 @@ fn an_archive_past_the_age_limit_is_removed_but_its_memories_are_not() {
     clear_limits();
 
     let dir = scratch("age");
-    std::env::set_var(ARCHIVE_DIR_ENV, dir.join("archive"));
+    crate::test_env::set_var(ARCHIVE_DIR_ENV, dir.join("archive"));
 
     let path = dir.join("chat.jsonl");
     std::fs::write(&path, transcript_line("a fact", "a thought", "/one")).unwrap();
@@ -354,7 +357,7 @@ fn an_archive_past_the_age_limit_is_removed_but_its_memories_are_not() {
         .unwrap();
 
     backdate(&conn, &import_id, 40);
-    std::env::set_var(ARCHIVE_MAX_AGE_DAYS_ENV, "30");
+    crate::test_env::set_var(ARCHIVE_MAX_AGE_DAYS_ENV, "30");
 
     let report = archive::prune(&conn, false).unwrap();
 
@@ -373,7 +376,7 @@ fn an_archive_past_the_age_limit_is_removed_but_its_memories_are_not() {
         .is_none());
 
     clear_limits();
-    std::env::remove_var(ARCHIVE_DIR_ENV);
+    crate::test_env::remove_var(ARCHIVE_DIR_ENV);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -383,7 +386,7 @@ fn a_dry_run_reports_without_removing() {
     clear_limits();
 
     let dir = scratch("dryrun");
-    std::env::set_var(ARCHIVE_DIR_ENV, dir.join("archive"));
+    crate::test_env::set_var(ARCHIVE_DIR_ENV, dir.join("archive"));
 
     let path = dir.join("chat.jsonl");
     std::fs::write(&path, transcript_line("a fact", "t", "/one")).unwrap();
@@ -394,7 +397,7 @@ fn a_dry_run_reports_without_removing() {
         other => panic!("expected an import, got {:?}", other),
     };
     backdate(&conn, &import_id, 40);
-    std::env::set_var(ARCHIVE_MAX_AGE_DAYS_ENV, "30");
+    crate::test_env::set_var(ARCHIVE_MAX_AGE_DAYS_ENV, "30");
 
     let report = archive::prune(&conn, true).unwrap();
 
@@ -403,7 +406,7 @@ fn a_dry_run_reports_without_removing() {
     assert_eq!(archive_rows(&conn), 1, "and then not remove it");
 
     clear_limits();
-    std::env::remove_var(ARCHIVE_DIR_ENV);
+    crate::test_env::remove_var(ARCHIVE_DIR_ENV);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -413,7 +416,7 @@ fn the_size_ceiling_evicts_oldest_first_and_keeps_the_newest() {
     clear_limits();
 
     let dir = scratch("size");
-    std::env::set_var(ARCHIVE_DIR_ENV, dir.join("archive"));
+    crate::test_env::set_var(ARCHIVE_DIR_ENV, dir.join("archive"));
     let db = open(&dir);
     let conn = db.conn();
 
@@ -444,7 +447,7 @@ fn the_size_ceiling_evicts_oldest_first_and_keeps_the_newest() {
     assert!(total > one_row, "fixture needs distinct blobs");
 
     // A ceiling that fits roughly one of the three.
-    std::env::set_var(ARCHIVE_MAX_BYTES_ENV, (one_row + 8).to_string());
+    crate::test_env::set_var(ARCHIVE_MAX_BYTES_ENV, (one_row + 8).to_string());
     let report = archive::prune(&conn, false).unwrap();
 
     assert_eq!(report.removed_for_size, 2);
@@ -458,7 +461,7 @@ fn the_size_ceiling_evicts_oldest_first_and_keeps_the_newest() {
     assert_eq!(survivor, import_ids[2]);
 
     clear_limits();
-    std::env::remove_var(ARCHIVE_DIR_ENV);
+    crate::test_env::remove_var(ARCHIVE_DIR_ENV);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -467,7 +470,7 @@ fn a_malformed_line_does_not_shift_the_spans_after_it() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let dir = scratch("malformed");
-    std::env::set_var(ARCHIVE_DIR_ENV, dir.join("archive"));
+    crate::test_env::set_var(ARCHIVE_DIR_ENV, dir.join("archive"));
 
     // The importer skips a bad line rather than failing. Offsets are counted
     // over `split_inclusive('\n')`, so the skip must not desynchronise them —
@@ -496,6 +499,6 @@ fn a_malformed_line_does_not_shift_the_spans_after_it() {
     assert!(!second.content.contains("not json at all"));
     assert!(!second.content.contains("before the break"));
 
-    std::env::remove_var(ARCHIVE_DIR_ENV);
+    crate::test_env::remove_var(ARCHIVE_DIR_ENV);
     let _ = std::fs::remove_dir_all(&dir);
 }

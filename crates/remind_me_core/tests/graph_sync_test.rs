@@ -2,6 +2,9 @@
 //! `entities`, `entity_relations`, and `memory_entities` mention links over
 //! the same push/pull protocol the memories-only slice established.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 mod support;
 
 use remind_me_core::entity::{self, entity_id, entity_relation_id};
@@ -26,15 +29,15 @@ const SECRET: &str = "hub-secret";
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn enable_sync(node_id: &str) {
-    std::env::set_var(remind_me_core::sync::NODE_ID_ENV, node_id);
-    std::env::set_var(remind_me_core::sync::HUB_URL_ENV, "http://hub.example");
-    std::env::set_var(remind_me_core::sync::SYNC_SECRET_ENV, SECRET);
+    crate::test_env::set_var(remind_me_core::sync::NODE_ID_ENV, node_id);
+    crate::test_env::set_var(remind_me_core::sync::HUB_URL_ENV, "http://hub.example");
+    crate::test_env::set_var(remind_me_core::sync::SYNC_SECRET_ENV, SECRET);
 }
 
 fn disable_sync() {
-    std::env::remove_var(remind_me_core::sync::NODE_ID_ENV);
-    std::env::remove_var(remind_me_core::sync::HUB_URL_ENV);
-    std::env::remove_var(remind_me_core::sync::SYNC_SECRET_ENV);
+    crate::test_env::remove_var(remind_me_core::sync::NODE_ID_ENV);
+    crate::test_env::remove_var(remind_me_core::sync::HUB_URL_ENV);
+    crate::test_env::remove_var(remind_me_core::sync::SYNC_SECRET_ENV);
 }
 
 fn entity_row(

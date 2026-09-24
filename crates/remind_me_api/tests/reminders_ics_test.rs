@@ -6,6 +6,9 @@
 //! be *required*, a wrong one must not be distinguishable from a route that
 //! does not exist, and no other path may inherit the bypass.
 
+#[path = "../../remind_me_core/src/test_env.rs"]
+mod test_env;
+
 mod common;
 use common::{get, seeded_server, server};
 use remind_me_core::ics::{ICS_TOKEN_ENV, ICS_TOKEN_FILE_ENV};
@@ -23,10 +26,10 @@ fn with_token<T>(body: impl FnOnce() -> T) -> T {
     let _guard = env_lock().lock().unwrap();
     // Pinned rather than generated, so a failure is a real one and not a
     // stray token file left by another test.
-    std::env::set_var(ICS_TOKEN_ENV, TOKEN);
-    std::env::remove_var(ICS_TOKEN_FILE_ENV);
+    crate::test_env::set_var(ICS_TOKEN_ENV, TOKEN);
+    crate::test_env::remove_var(ICS_TOKEN_FILE_ENV);
     let out = body();
-    std::env::remove_var(ICS_TOKEN_ENV);
+    crate::test_env::remove_var(ICS_TOKEN_ENV);
     out
 }
 

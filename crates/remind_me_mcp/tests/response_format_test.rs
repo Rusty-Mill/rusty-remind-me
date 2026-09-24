@@ -25,6 +25,9 @@
 //!   JSON, so the parameter is a pure addition here and JSON keeps this port's
 //!   existing callers working (#206).
 
+#[path = "../../remind_me_core/src/test_env.rs"]
+mod test_env;
+
 use remind_me_mcp::McpServer;
 use serde_json::json;
 
@@ -251,13 +254,13 @@ fn with_default_format<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let previous = std::env::var(remind_me_mcp::DEFAULT_FORMAT_ENV).ok();
     match value {
-        Some(v) => std::env::set_var(remind_me_mcp::DEFAULT_FORMAT_ENV, v),
-        None => std::env::remove_var(remind_me_mcp::DEFAULT_FORMAT_ENV),
+        Some(v) => crate::test_env::set_var(remind_me_mcp::DEFAULT_FORMAT_ENV, v),
+        None => crate::test_env::remove_var(remind_me_mcp::DEFAULT_FORMAT_ENV),
     }
     let out = f();
     match previous {
-        Some(v) => std::env::set_var(remind_me_mcp::DEFAULT_FORMAT_ENV, v),
-        None => std::env::remove_var(remind_me_mcp::DEFAULT_FORMAT_ENV),
+        Some(v) => crate::test_env::set_var(remind_me_mcp::DEFAULT_FORMAT_ENV, v),
+        None => crate::test_env::remove_var(remind_me_mcp::DEFAULT_FORMAT_ENV),
     }
     out
 }

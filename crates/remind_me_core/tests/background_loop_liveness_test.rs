@@ -10,6 +10,9 @@
 //! direct unit tests in `scheduler.rs`, including one that forces an actual
 //! unwind through a held guard.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 use remind_me_core::Database;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -78,7 +81,7 @@ fn a_started_scheduler_reports_running_and_stopping_it_clears_that() {
 #[test]
 fn a_started_nudge_loop_reports_running_and_stopping_it_clears_that() {
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var(remind_me_core::promotion::NUDGE_INTERVAL_ENV, "1");
+    crate::test_env::set_var(remind_me_core::promotion::NUDGE_INTERVAL_ENV, "1");
     let db = TempDb::new("nudge");
     let database = Database::open(&db.0).unwrap();
     let handle = remind_me_core::promotion::start_nudge_for(&database.conn())
@@ -95,13 +98,13 @@ fn a_started_nudge_loop_reports_running_and_stopping_it_clears_that() {
         !remind_me_core::promotion::nudge_running(),
         "a stopped nudge loop must not still report itself running"
     );
-    std::env::remove_var(remind_me_core::promotion::NUDGE_INTERVAL_ENV);
+    crate::test_env::remove_var(remind_me_core::promotion::NUDGE_INTERVAL_ENV);
 }
 
 #[test]
 fn nudge_running_is_false_with_no_interval_configured() {
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var(remind_me_core::promotion::NUDGE_INTERVAL_ENV);
+    crate::test_env::remove_var(remind_me_core::promotion::NUDGE_INTERVAL_ENV);
     assert!(
         !remind_me_core::promotion::nudge_running(),
         "nothing configured, so nothing started, so nothing running"

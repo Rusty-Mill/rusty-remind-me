@@ -11,6 +11,9 @@
 //! The governing rule under test throughout: **reranking may never break
 //! search.** Every failure path returns the incoming order untouched.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 use remind_me_core::models::MemorySearchResult;
 use remind_me_core::reranker::{self, Status};
 
@@ -24,7 +27,7 @@ fn clear_env() {
         reranker::MODEL_ENV,
         reranker::TOKENIZER_ENV,
     ] {
-        std::env::remove_var(var);
+        crate::test_env::remove_var(var);
     }
 }
 
@@ -107,7 +110,7 @@ fn reranking_is_on_by_default() {
 fn an_empty_backend_turns_it_off() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_env();
-    std::env::set_var(reranker::BACKEND_ENV, "");
+    crate::test_env::set_var(reranker::BACKEND_ENV, "");
 
     assert!(!reranker::enabled());
     assert_eq!(reranker::status(), Status::Disabled);
@@ -124,7 +127,7 @@ fn top_k_defaults_and_survives_a_bad_value() {
     // A typo in a tuning knob must not silently disable the feature — that is
     // REMIND_ME_RERANK's job, and only its job.
     for bad in ["nonsense", "0", "-4", ""] {
-        std::env::set_var(reranker::TOP_K_ENV, bad);
+        crate::test_env::set_var(reranker::TOP_K_ENV, bad);
         assert_eq!(
             reranker::top_k_from_env(),
             reranker::TOP_K_DEFAULT,
@@ -132,7 +135,7 @@ fn top_k_defaults_and_survives_a_bad_value() {
         );
     }
 
-    std::env::set_var(reranker::TOP_K_ENV, "5");
+    crate::test_env::set_var(reranker::TOP_K_ENV, "5");
     assert_eq!(reranker::top_k_from_env(), 5);
 
     clear_env();
@@ -172,8 +175,8 @@ fn an_unconfigured_model_names_both_variables_and_refuses_to_download() {
 fn a_model_path_that_does_not_exist_names_the_variable() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_env();
-    std::env::set_var(reranker::MODEL_ENV, "/nonexistent/reranker.rten");
-    std::env::set_var(reranker::TOKENIZER_ENV, "/nonexistent/tokenizer.json");
+    crate::test_env::set_var(reranker::MODEL_ENV, "/nonexistent/reranker.rten");
+    crate::test_env::set_var(reranker::TOKENIZER_ENV, "/nonexistent/tokenizer.json");
 
     let err = reranker::model_paths().unwrap_err();
     assert!(err.contains(reranker::MODEL_ENV), "{err}");
@@ -194,7 +197,7 @@ fn status_distinguishes_off_from_unconfigured() {
     assert_ne!(on_but_unconfigured, Status::Disabled);
     assert_ne!(on_but_unconfigured, Status::Ready);
 
-    std::env::set_var(reranker::BACKEND_ENV, "");
+    crate::test_env::set_var(reranker::BACKEND_ENV, "");
     assert_eq!(reranker::status(), Status::Disabled);
 
     clear_env();
@@ -336,7 +339,7 @@ fn a_scorer_returning_the_wrong_number_of_scores_keeps_the_rrf_order() {
 fn maybe_rerank_is_a_no_op_when_turned_off() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_env();
-    std::env::set_var(reranker::BACKEND_ENV, "");
+    crate::test_env::set_var(reranker::BACKEND_ENV, "");
 
     let out = reranker::maybe_rerank("q", ranked(5));
     assert_eq!(ids(&out), ["m0", "m1", "m2", "m3", "m4"]);
@@ -428,8 +431,8 @@ mod with_the_feature {
         let tokenizer = dir.join("tokenizer.json");
         std::fs::write(&model, b"not a model").unwrap();
         std::fs::write(&tokenizer, b"not a tokenizer").unwrap();
-        std::env::set_var(reranker::MODEL_ENV, &model);
-        std::env::set_var(reranker::TOKENIZER_ENV, &tokenizer);
+        crate::test_env::set_var(reranker::MODEL_ENV, &model);
+        crate::test_env::set_var(reranker::TOKENIZER_ENV, &tokenizer);
 
         // Configuration looks complete, so this gets all the way to a real
         // load and fails there. Search still has to survive it.

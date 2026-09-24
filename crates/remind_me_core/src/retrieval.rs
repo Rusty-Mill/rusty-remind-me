@@ -784,13 +784,13 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn clear_env() {
-        std::env::remove_var(ENV_RRF_K);
-        std::env::remove_var(ENV_RRF_W_KEYWORD);
-        std::env::remove_var(ENV_RRF_W_SEMANTIC);
-        std::env::remove_var(ENV_RRF_W_RECENCY);
-        std::env::remove_var(ENV_RRF_W_VITALITY);
-        std::env::remove_var(ENV_RRF_W_IDF);
-        std::env::remove_var(ENV_RRF_FUSION);
+        crate::test_env::remove_var(ENV_RRF_K);
+        crate::test_env::remove_var(ENV_RRF_W_KEYWORD);
+        crate::test_env::remove_var(ENV_RRF_W_SEMANTIC);
+        crate::test_env::remove_var(ENV_RRF_W_RECENCY);
+        crate::test_env::remove_var(ENV_RRF_W_VITALITY);
+        crate::test_env::remove_var(ENV_RRF_W_IDF);
+        crate::test_env::remove_var(ENV_RRF_FUSION);
     }
 
     #[test]
@@ -814,7 +814,7 @@ mod tests {
     fn rrf_k_reads_a_valid_override() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
-        std::env::set_var(ENV_RRF_K, "12.5");
+        crate::test_env::set_var(ENV_RRF_K, "12.5");
         assert_eq!(rrf_k_from_env(), 12.5);
         clear_env();
     }
@@ -823,7 +823,7 @@ mod tests {
     fn rrf_k_falls_back_to_default_on_an_unparseable_value() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
-        std::env::set_var(ENV_RRF_K, "not-a-number");
+        crate::test_env::set_var(ENV_RRF_K, "not-a-number");
         assert_eq!(rrf_k_from_env(), RRF_K_DEFAULT);
         clear_env();
     }
@@ -832,9 +832,9 @@ mod tests {
     fn rrf_k_falls_back_to_default_on_a_non_finite_value() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
-        std::env::set_var(ENV_RRF_K, "NaN");
+        crate::test_env::set_var(ENV_RRF_K, "NaN");
         assert_eq!(rrf_k_from_env(), RRF_K_DEFAULT);
-        std::env::set_var(ENV_RRF_K, "inf");
+        crate::test_env::set_var(ENV_RRF_K, "inf");
         assert_eq!(rrf_k_from_env(), RRF_K_DEFAULT);
         clear_env();
     }
@@ -843,11 +843,11 @@ mod tests {
     fn rrf_weights_from_env_reads_all_five_overrides() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
-        std::env::set_var(ENV_RRF_W_KEYWORD, "2.0");
-        std::env::set_var(ENV_RRF_W_SEMANTIC, "0.25");
-        std::env::set_var(ENV_RRF_W_RECENCY, "0.0");
-        std::env::set_var(ENV_RRF_W_VITALITY, "3.0");
-        std::env::set_var(ENV_RRF_W_IDF, "1.0");
+        crate::test_env::set_var(ENV_RRF_W_KEYWORD, "2.0");
+        crate::test_env::set_var(ENV_RRF_W_SEMANTIC, "0.25");
+        crate::test_env::set_var(ENV_RRF_W_RECENCY, "0.0");
+        crate::test_env::set_var(ENV_RRF_W_VITALITY, "3.0");
+        crate::test_env::set_var(ENV_RRF_W_IDF, "1.0");
 
         let w = RrfWeights::from_env();
 
@@ -876,8 +876,8 @@ mod tests {
     fn a_malformed_weight_falls_back_to_its_own_default_not_the_whole_profile() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
-        std::env::set_var(ENV_RRF_W_KEYWORD, "garbage");
-        std::env::set_var(ENV_RRF_W_SEMANTIC, "0.75");
+        crate::test_env::set_var(ENV_RRF_W_KEYWORD, "garbage");
+        crate::test_env::set_var(ENV_RRF_W_SEMANTIC, "0.75");
 
         let w = RrfWeights::from_env();
 
@@ -892,7 +892,7 @@ mod tests {
         // deliberate way to penalize a signal, not malformed input.
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
-        std::env::set_var(ENV_RRF_W_KEYWORD, "-2.5");
+        crate::test_env::set_var(ENV_RRF_W_KEYWORD, "-2.5");
         assert_eq!(RrfWeights::from_env().w_keyword, -2.5);
         clear_env();
     }
@@ -910,7 +910,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
         for value in ["score", "SCORE", "Score", "  score  "] {
-            std::env::set_var(ENV_RRF_FUSION, value);
+            crate::test_env::set_var(ENV_RRF_FUSION, value);
             assert_eq!(RrfFusion::from_env(), RrfFusion::Score, "{value:?}");
         }
         clear_env();
@@ -920,7 +920,7 @@ mod tests {
     fn an_unrecognized_fusion_string_falls_back_to_rank_not_an_error() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
-        std::env::set_var(ENV_RRF_FUSION, "banana");
+        crate::test_env::set_var(ENV_RRF_FUSION, "banana");
         assert_eq!(RrfFusion::from_env(), RrfFusion::Rank);
         clear_env();
     }
@@ -932,7 +932,7 @@ mod tests {
         // discard the env override in favor of a fixed absolute number.
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
-        std::env::set_var(ENV_RRF_W_KEYWORD, "2.0");
+        crate::test_env::set_var(ENV_RRF_W_KEYWORD, "2.0");
         let w = choose_rrf_weights("id", RetrievalStrategy::Auto);
         assert_eq!(w.w_keyword, 3.0);
         clear_env();

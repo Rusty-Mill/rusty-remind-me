@@ -7,6 +7,9 @@
 //! the two ways it could go wrong: a bootstrap that crowds out the answer, and
 //! one that resurrects a statement the ladder has already withdrawn.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 use remind_me_core::db::queries::search_with_expansions;
 use remind_me_core::models::MemorySearchInput;
 use remind_me_core::promotion::{
@@ -194,7 +197,7 @@ fn a_large_persona_cannot_starve_the_ranked_results() {
     // The pathological setting: a caller asking for the whole budget to go to
     // the persona. The cap is what makes this survivable, so test it at the
     // value that would break it rather than at the default.
-    std::env::set_var("REMIND_ME_BOOTSTRAP_RESERVE", "4.0");
+    crate::test_env::set_var("REMIND_ME_BOOTSTRAP_RESERVE", "4.0");
 
     let db = db("starvation");
     let conn = db.conn();
@@ -219,7 +222,7 @@ fn a_large_persona_cannot_starve_the_ranked_results() {
 
     let budget = 400usize;
     let res = search_with_expansions(&conn, &search(&conn, "quokka", true, budget)).unwrap();
-    std::env::remove_var("REMIND_ME_BOOTSTRAP_RESERVE");
+    crate::test_env::remove_var("REMIND_ME_BOOTSTRAP_RESERVE");
 
     let boot = res.bootstrap.expect("asked for one");
     let ceiling = (budget as f64 * BOOTSTRAP_RESERVE_MAX) as usize;
@@ -331,27 +334,27 @@ fn the_reserve_fraction_is_clamped_rather_than_trusted() {
     // the clamp engaged or the default did -- 0.25 and a clamped 0.5 both sit
     // under the ceiling it checks. This is the assertion that fails if the
     // clamp is removed.
-    std::env::set_var("REMIND_ME_BOOTSTRAP_RESERVE", "4.0");
+    crate::test_env::set_var("REMIND_ME_BOOTSTRAP_RESERVE", "4.0");
     assert_eq!(bootstrap_reserve_fraction(), BOOTSTRAP_RESERVE_MAX);
 
     // A percentage typed where a fraction was wanted is the likely slip, and
     // it must not hand the whole budget to the persona either.
-    std::env::set_var("REMIND_ME_BOOTSTRAP_RESERVE", "90");
+    crate::test_env::set_var("REMIND_ME_BOOTSTRAP_RESERVE", "90");
     assert_eq!(bootstrap_reserve_fraction(), BOOTSTRAP_RESERVE_MAX);
 
     // Malformed input falls back rather than failing the search around it.
-    std::env::set_var("REMIND_ME_BOOTSTRAP_RESERVE", "not-a-number");
+    crate::test_env::set_var("REMIND_ME_BOOTSTRAP_RESERVE", "not-a-number");
     assert_eq!(bootstrap_reserve_fraction(), BOOTSTRAP_RESERVE_DEFAULT);
 
-    std::env::set_var("REMIND_ME_BOOTSTRAP_RESERVE", "-1");
+    crate::test_env::set_var("REMIND_ME_BOOTSTRAP_RESERVE", "-1");
     assert_eq!(bootstrap_reserve_fraction(), BOOTSTRAP_RESERVE_DEFAULT);
 
     // Zero is a legitimate setting -- "assemble no bootstrap" -- and must not
     // be mistaken for unset.
-    std::env::set_var("REMIND_ME_BOOTSTRAP_RESERVE", "0");
+    crate::test_env::set_var("REMIND_ME_BOOTSTRAP_RESERVE", "0");
     assert_eq!(bootstrap_reserve_fraction(), 0.0);
 
-    std::env::remove_var("REMIND_ME_BOOTSTRAP_RESERVE");
+    crate::test_env::remove_var("REMIND_ME_BOOTSTRAP_RESERVE");
     assert_eq!(bootstrap_reserve_fraction(), BOOTSTRAP_RESERVE_DEFAULT);
 }
 
