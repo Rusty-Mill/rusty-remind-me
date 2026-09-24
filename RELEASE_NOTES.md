@@ -2,6 +2,16 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-24 — The SessionStart hook survives an install path with a space in it
+
+### Fixed
+- **The `SessionStart` hook failed whenever the plugin was installed under a path containing a space.** `hooks/hooks.json` ran `${CLAUDE_PLUGIN_ROOT}/hooks/scripts/session-start.sh` unquoted, so the shell split the expanded path into several words and the hook exited 127 (`not found`) instead of injecting recent memories. The command is now double-quoted. `claude plugin validate` flagged it.
+- **The hook's "not on PATH" hint named a path that no longer exists.** It suggested `cargo install --path crates/remind_me_cli`, which went stale with the move into the monorepo. It now names `crates/apps/rusty_remind_me/crates/remind_me_cli` from a rusty_mill checkout.
+
+### Provenance
+
+Ran the hook command through `sh -c` with `CLAUDE_PLUGIN_ROOT` set to a directory containing a space: the quoted form runs the script (exit 0), the previous form fails (exit 127). The script's fallback output still parses as JSON. `claude plugin validate` no longer reports the hooks warning. No version bump: this ships with the next release, so an installed plugin keeps the old hook until then.
+
 ## 2026-09-24 — v0.2.1: moved into the Rusty Mill monorepo
 
 This product now lives in [`Rusty-Mill/rusty_mill`](https://github.com/Rusty-Mill/rusty_mill) at `crates/apps/rusty_remind_me`, imported with its full history via `git subtree`. `baileyrd/rusty_remind_me` is frozen at v0.2.0. The decision records are `docs/adr/0020` here and the monorepo's `docs/adr/0004`.
