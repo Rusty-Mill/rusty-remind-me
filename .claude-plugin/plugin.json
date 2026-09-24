@@ -1,7 +1,7 @@
 {
   "name": "rusty-remind-me",
   "displayName": "Rusty Remind Me",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Persistent long-term memory for Claude Code: MCP tools for search/recall, a SessionStart hook that surfaces recent memories automatically, and /remember + /recall slash commands for direct CLI-backed writes and searches.",
   "author": {
     "name": "rusty_remind_me contributors"

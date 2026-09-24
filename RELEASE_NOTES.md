@@ -2,6 +2,18 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-25 — v0.2.3: the Postgres hub no longer lets a node's pull skip rows
+
+### Fixed
+- **A node pulling from a Postgres-backed hub could silently miss memories pushed at the same time.** The hub numbers each memory write with `hub_seq` from `nextval()`, which Postgres assigns when the statement runs, but a row only becomes visible when its transaction commits. Two concurrent pushes could therefore commit out of order. A node that had already pulled seq 12 moved its cursor past 11, and when 11 committed a moment later, that node never pulled it, short of a full re-sync. In a test of 1200 concurrent pushes on 8 threads, a puller on the `since_seq` cursor (the one nodes use) missed 36 to 40 rows on every run.
+- `apply_record` now takes a transaction-scoped advisory lock before assigning `hub_seq`, so memory writes commit in sequence order. That is the ordering the SQLite hub store already had, since it serialises writes; it missed no rows in the same test. Memory pushes to a Postgres hub are now applied one at a time.
+- **If you run a Postgres hub:** a node that pulled while other nodes were pushing may be missing rows. Its next `full` pull re-fetches everything.
+- Bumped to 0.2.3 (all six crates and `.claude-plugin/plugin.json`), so this ships as its own release.
+
+### Provenance
+
+New regression test `a_seq_puller_sees_every_row_under_concurrent_pushes` in `remind_me_hub/tests/hub_postgres_test.rs`, which CI runs against a real Postgres. Against Postgres 16 it skipped 37 of 1200 rows without the fix, and passed 5 runs out of 5 with it. All hub tests pass (80), and clippy with `-D warnings` on Rust 1.98 is clean.
+
 ## 2026-09-24 — Test binaries no longer segfault when a test changes an env var
 
 ### Fixed
