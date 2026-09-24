@@ -4013,7 +4013,7 @@ mod tests {
         // end: both discover their repository from the process's current
         // working directory (docs/adr/0003-self-update-strategy.md), and
         // remind_me_self_update would really run `git pull`/`cargo build
-        // --release --workspace` against whatever repo contains this test
+        // --release -p rusty-remind-me -p remind_me_hub` against whatever repo contains this test
         // binary's cwd -- which, inside this workspace's own test suite, is
         // this very checkout. That behavior is exercised instead in
         // remind_me_core's updater.rs unit tests, against real but

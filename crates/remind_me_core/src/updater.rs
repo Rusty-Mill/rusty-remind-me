@@ -7,6 +7,14 @@
 //! `remind_me_self_update` means "`git pull --ff-only`, then `cargo build
 //! --release --workspace`, then tell the operator to restart" rather than
 //! attempting to fetch or swap a prebuilt binary.
+//!
+//! Since the move into the `Rusty-Mill/rusty_mill` monorepo (under
+//! `crates/apps/rusty_remind_me`), the repository root and this product's
+//! directory are no longer the same place. The updater therefore recognises
+//! both layouts ([`product_dir`]), scopes "commits behind" to commits that
+//! touch this product rather than any monorepo commit, and rebuilds only this
+//! product's two shipped binaries ([`BUILD_PACKAGES`]) instead of
+//! `--workspace`, which in the monorepo would compile ~240 unrelated crates.
 
 use serde::{Deserialize, Serialize};
 use std::io::Read;
@@ -77,15 +85,38 @@ pub struct UpdateResult {
 // Repository discovery
 // ---------------------------------------------------------------------------
 
-/// Whether `candidate`'s own `Cargo.toml` identifies it as this workspace,
-/// not some unrelated repository the upward walk happened to pass through
-/// (e.g. a nested vendor checkout). Checks for this workspace's own
-/// distinctive member path rather than parsing TOML with a new dependency
-/// just for this one check.
+/// Where this product lives relative to the repository root in the
+/// `Rusty-Mill/rusty_mill` monorepo.
+pub const MONOREPO_PRODUCT_DIR: &str = "crates/apps/rusty_remind_me";
+
+/// The packages `remind_me_self_update` rebuilds: the two binaries a release
+/// ships (`rusty-remind-me` and `rusty-remind-me-hub`). Named explicitly
+/// rather than `--workspace` because in the monorepo the workspace is every
+/// Rusty Mill crate, not just this product.
+pub const BUILD_PACKAGES: [&str; 2] = ["rusty-remind-me", "remind_me_hub"];
+
+/// This product's directory relative to `repo`: [`MONOREPO_PRODUCT_DIR`] in
+/// the monorepo, `"."` in a standalone `baileyrd/rusty_remind_me` clone (the
+/// layout before the move, still recognised so an old clone reports
+/// accurately instead of failing to find itself). `None` when `repo`'s root
+/// `Cargo.toml` names neither.
+///
+/// Checks for this product's own distinctive member path rather than
+/// parsing TOML with a new dependency just for this one check. The monorepo
+/// path is tested first because it also contains the standalone one.
+pub fn product_dir(repo: &Path) -> Option<&'static str> {
+    let manifest = std::fs::read_to_string(repo.join("Cargo.toml")).ok()?;
+    if manifest.contains(&format!("{MONOREPO_PRODUCT_DIR}/crates/remind_me_core")) {
+        return Some(MONOREPO_PRODUCT_DIR);
+    }
+    manifest.contains("crates/remind_me_core").then_some(".")
+}
+
+/// Whether `candidate` is a repository root holding this product, not some
+/// unrelated repository the upward walk happened to pass through (e.g. a
+/// nested vendor checkout).
 fn looks_like_this_workspace(candidate: &Path) -> bool {
-    std::fs::read_to_string(candidate.join("Cargo.toml"))
-        .map(|contents| contents.contains("crates/remind_me_core"))
-        .unwrap_or(false)
+    product_dir(candidate).is_some()
 }
 
 /// Walk upward from `start` looking for this workspace's own `.git`
@@ -196,8 +227,10 @@ fn run_git(repo: &Path, args: &[&str]) -> Result<String, String> {
 
 fn run_cargo_build(repo: &Path) -> Result<(), String> {
     let mut cmd = Command::new("cargo");
-    cmd.args(["build", "--release", "--workspace"])
-        .current_dir(repo);
+    cmd.args(["build", "--release"]).current_dir(repo);
+    for package in BUILD_PACKAGES {
+        cmd.args(["-p", package]);
+    }
     run_with_timeout(cmd, BUILD_TIMEOUT).map(|_| ())
 }
 
@@ -275,13 +308,29 @@ fn check_for_update_at(repo: &Path) -> UpdateStatus {
         };
     }
 
-    let commits_behind = run_git(repo, &["rev-list", "--count", "HEAD..origin/main"])
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+    // Only commits touching this product count: in the monorepo, `main`
+    // moves for every Rusty Mill crate, and reporting each of those as an
+    // update to this one would make the notice permanently on and useless.
+    // (A root `Cargo.lock` bump alone is deliberately not counted either --
+    // it is picked up by the next update that does touch this product.)
+    let scope = product_dir(repo).unwrap_or(".");
+    let commits_behind = run_git(
+        repo,
+        &["rev-list", "--count", "HEAD..origin/main", "--", scope],
+    )
+    .ok()
+    .and_then(|s| s.parse().ok())
+    .unwrap_or(0);
     let commit_messages = run_git(
         repo,
-        &["log", "--oneline", "HEAD..origin/main", "--max-count=10"],
+        &[
+            "log",
+            "--oneline",
+            "HEAD..origin/main",
+            "--max-count=10",
+            "--",
+            scope,
+        ],
     )
     .map(|s| s.lines().map(String::from).collect())
     .unwrap_or_default();
@@ -633,6 +682,39 @@ mod tests {
     }
 
     #[test]
+    fn product_dir_recognises_the_monorepo_layout() {
+        let tmp = TempDir::new("monorepo_layout");
+        std::fs::write(
+            tmp.0.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/apps/rusty_remind_me/crates/remind_me_core\"]\n",
+        )
+        .unwrap();
+
+        assert_eq!(product_dir(&tmp.0), Some(MONOREPO_PRODUCT_DIR));
+    }
+
+    #[test]
+    fn product_dir_recognises_the_standalone_layout() {
+        let tmp = TempDir::new("standalone_layout");
+        std::fs::write(
+            tmp.0.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/remind_me_core\"]\n",
+        )
+        .unwrap();
+
+        assert_eq!(product_dir(&tmp.0), Some("."));
+    }
+
+    #[test]
+    fn product_dir_is_none_for_an_unrelated_manifest_or_none_at_all() {
+        let tmp = TempDir::new("no_layout");
+        assert_eq!(product_dir(&tmp.0), None);
+
+        std::fs::write(tmp.0.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        assert_eq!(product_dir(&tmp.0), None);
+    }
+
+    #[test]
     fn get_origin_url_reads_the_configured_remote() {
         let tmp = TempDir::new("originurl");
         init_repo(&tmp.0);
@@ -742,6 +824,70 @@ mod tests {
     }
 
     #[test]
+    fn in_the_monorepo_only_commits_touching_this_product_count() {
+        let setup = origin_and_clone("monorepo_scope");
+        commit(
+            &setup.origin.0,
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"crates/apps/rusty_remind_me/crates/remind_me_core\"]\n",
+            "add the monorepo manifest",
+        );
+        run_git(
+            &setup.clone.0,
+            &["pull", "--quiet", "--ff-only", "origin", "main"],
+        )
+        .unwrap();
+
+        std::fs::create_dir_all(setup.origin.0.join(MONOREPO_PRODUCT_DIR)).unwrap();
+        commit(
+            &setup.origin.0,
+            &format!("{MONOREPO_PRODUCT_DIR}/NOTES.md"),
+            "ours",
+            "touch rusty_remind_me",
+        );
+        commit(
+            &setup.origin.0,
+            "other.txt",
+            "theirs",
+            "touch another crate",
+        );
+
+        let status = check_for_update_at(&setup.clone.0);
+
+        assert!(status.update_available);
+        assert_eq!(status.commits_behind, 1, "{:?}", status.commit_messages);
+        assert!(status.commit_messages[0].contains("touch rusty_remind_me"));
+    }
+
+    #[test]
+    fn in_the_monorepo_unrelated_commits_alone_are_not_an_update() {
+        let setup = origin_and_clone("monorepo_unrelated");
+        commit(
+            &setup.origin.0,
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"crates/apps/rusty_remind_me/crates/remind_me_core\"]\n",
+            "add the monorepo manifest",
+        );
+        run_git(
+            &setup.clone.0,
+            &["pull", "--quiet", "--ff-only", "origin", "main"],
+        )
+        .unwrap();
+        commit(
+            &setup.origin.0,
+            "other.txt",
+            "theirs",
+            "touch another crate",
+        );
+
+        let status = check_for_update_at(&setup.clone.0);
+
+        assert!(status.error.is_none(), "{:?}", status.error);
+        assert!(!status.update_available);
+        assert_eq!(status.commits_behind, 0);
+    }
+
+    #[test]
     fn an_unreachable_origin_is_a_clear_error_not_a_panic() {
         let tmp = TempDir::new("badorigin");
         init_repo(&tmp.0);
@@ -815,14 +961,31 @@ mod tests {
         assert!(result.error.unwrap().contains(UPDATE_EXPECTED_ORIGIN_ENV));
     }
 
+    /// A workspace whose members carry exactly the names in
+    /// [`BUILD_PACKAGES`], so `run_cargo_build`'s `-p` selection resolves
+    /// the same way it does against the real product.
     fn write_minimal_binary_crate(dir: &Path) {
+        let members: Vec<String> = BUILD_PACKAGES.iter().map(|p| format!("\"{p}\"")).collect();
         std::fs::write(
             dir.join("Cargo.toml"),
-            "[package]\nname = \"scratch\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            format!(
+                "[workspace]\nresolver = \"2\"\nmembers = [{}]\n",
+                members.join(", ")
+            ),
         )
         .unwrap();
-        std::fs::create_dir_all(dir.join("src")).unwrap();
-        std::fs::write(dir.join("src").join("main.rs"), "fn main() {}\n").unwrap();
+        for package in BUILD_PACKAGES {
+            let src = dir.join(package).join("src");
+            std::fs::create_dir_all(&src).unwrap();
+            std::fs::write(
+                dir.join(package).join("Cargo.toml"),
+                format!(
+                    "[package]\nname = \"{package}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+                ),
+            )
+            .unwrap();
+            std::fs::write(src.join("main.rs"), "fn main() {}\n").unwrap();
+        }
     }
 
     #[test]
@@ -832,9 +995,9 @@ mod tests {
         write_minimal_binary_crate(&setup.origin.0);
         commit(
             &setup.origin.0,
-            "src/main.rs",
+            &format!("{}/src/main.rs", BUILD_PACKAGES[0]),
             "fn main() {}\n",
-            "add a buildable crate",
+            "add a buildable workspace",
         );
 
         let result = perform_update_at(&setup.clone.0, false);
