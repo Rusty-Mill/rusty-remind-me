@@ -2,6 +2,24 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-24 — v0.2.1: moved into the Rusty Mill monorepo
+
+This product now lives in [`Rusty-Mill/rusty_mill`](https://github.com/Rusty-Mill/rusty_mill) at `crates/apps/rusty_remind_me`, imported with its full history via `git subtree`. `baileyrd/rusty_remind_me` is frozen at v0.2.0. The decision records are `docs/adr/0020` here and the monorepo's `docs/adr/0004`.
+
+### Changed
+- **Releases come from the monorepo, tagged `rusty-remind-me-vX.Y.Z`.** `.github/workflows/remind-me-release.yml` at the monorepo root builds the same four platform archives and the plugin archive, triggered by a version bump in any of the six crate manifests. v0.2.1 is the first; v0.2.0 and earlier stay on the standalone repository's Releases page.
+- **The plugin marketplace moved to the monorepo root** (`claude plugin marketplace add Rusty-Mill/rusty_mill`, then `rusty-remind-me@rusty-mill`). The standalone repository's marketplace entry now uses a `git-subdir` source pointing at this directory, so existing `rusty-remind-me@rusty-remind-me` installs keep updating without doing anything.
+- **`remind_me_self_update` rebuilds `-p rusty-remind-me -p remind_me_hub`, not `--workspace`.** At the monorepo root, `--workspace` is ~240 crates, several of which need system libraries this product never did.
+- **`remind_me_check_update` counts only commits that touch this product.** In the monorepo, `main` moves for every crate; counting all of them would leave the update notice on permanently. Both layouts are recognised (`updater::product_dir`), so an old standalone clone still reports accurately.
+- **Each crate carries a literal `version`**, since the monorepo's `[workspace.package]` belongs to other crates. `scripts/get_workspace_version.sh` now fails when the six disagree, the lockstep that inheritance used to guarantee, and `check_plugin_version.sh` runs it.
+- **`rusqlite` 0.31 → 0.39 and `rmcp` 3.0.1 → 3.1.4**, forced by the shared `Cargo.lock`: `rusqlite`'s `links = "sqlite3"` allows one version per graph, and Cargo keeps one `rmcp` per semver-compatible range, where the rest of the workspace needs `^3.1`. One source change came from `rusqlite`: `recalibrate.rs` binds its `LIMIT` as a saturating `i64`, because `usize` lost `ToSql` in 0.32.
+- **A session-free `2026-07-28` request without per-request `_meta` is now rejected** with `-32602` by `remind_me_remote`. `rmcp` 3.1 enforces the spec's requirement for `io.modelcontextprotocol/protocolVersion` and `clientCapabilities` on those requests. A conformant client already sends both; the six test fixtures that didn't were fixed, not the server. Session-based and pre-`2026-07-28` requests are unaffected.
+- **No more `rust-toolchain.toml`.** CI builds with stable, like the rest of the monorepo; the 1.94 floor is unchanged. `scripts/configure_mcp.py`/`.ps1` now find `target/` at the Cargo workspace root, and the `.ps1` no longer hardcodes `C:\dev\rusty_remind_me`.
+
+### Provenance
+
+From the monorepo root, local rustc 1.94.1 (the floor), `RUSTFLAGS=-D warnings`: `cargo test --locked` over the six crates, 1950 passed / 0 failed across 144 test binaries; `cargo test --locked -p remind_me_hub --no-default-features` 73/73; `cargo clippy --locked --all-targets -- -D warnings` over the six, clean. The optional-feature legs and the Postgres leg were not run locally and are left to CI. Updater: five new tests (`product_dir` in both layouts and neither; in the monorepo layout, only commits under this product count, and unrelated ones alone are not an update), and the successful-build test's fixture is now a two-member workspace named after `BUILD_PACKAGES`. `scripts/check_schema_drift.sh` and `check_schema_regen_drift.sh` run from their new location: in parity at v29, no regen drift. `get_workspace_version.sh` checked against a copy with one crate bumped (exit 1, names the crate). `claude plugin validate` passes on the monorepo marketplace, the plugin directory, and the standalone repository's redirected marketplace. The rmcp cause was read out of `rmcp` 3.1.4's `handler/server.rs` (`missing_required_keys` for 2026-07-28) after capturing the actual 400 body, not inferred.
+
 ## 2026-09-06 — Every reply carries `resultType`, so a `2026-07-28` client can call a tool again
 
 ### Fixed

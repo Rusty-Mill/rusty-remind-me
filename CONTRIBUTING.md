@@ -7,19 +7,21 @@ Thank you for contributing to `rusty_remind_me`! This document outlines our deve
 ## 1. Development Setup
 
 ### Prerequisites
-- **Rust Toolchain**: Rust 1.94+ with Cargo (`rust-version` in the workspace `Cargo.toml` — a demonstrated floor, not a bisected minimum; `rust-toolchain.toml` pins the newer version CI and developers actually build with).
+- **Rust Toolchain**: Rust 1.94+ with Cargo (a demonstrated floor, not a bisected minimum). CI builds with current stable, like the rest of the Rusty Mill monorepo; the `rust-toolchain.toml` pin this product had as a standalone repo did not come across (a nested one would only apply when cargo runs from this directory, giving two toolchains in one checkout).
 
 ### Local Workspace Setup
+This product lives in the Rusty Mill monorepo at `crates/apps/rusty_remind_me`. Run cargo from the monorepo root and always select this product's crates with `-p` — `--workspace` there means every Rusty Mill crate.
+
 ```bash
 # Clone the repository
-git clone https://github.com/baileyrd/rusty_remind_me
-cd rusty_remind_me
+git clone https://github.com/Rusty-Mill/rusty_mill
+cd rusty_mill
 
 # Validate cargo dependencies and path resolution
-cargo check --workspace
+cargo check -p remind_me_core -p remind_me_mcp -p remind_me_api -p rusty-remind-me -p remind_me_remote -p remind_me_hub
 
 # Run tests
-cargo test --workspace
+cargo test -p remind_me_core -p remind_me_mcp -p remind_me_api -p rusty-remind-me -p remind_me_remote -p remind_me_hub
 ```
 
 ---
@@ -36,7 +38,7 @@ Run the following commands before submitting code:
 cargo fmt --all
 
 # Run Clippy lints
-cargo clippy --workspace -- -D warnings
+cargo clippy -p remind_me_core -p remind_me_mcp -p remind_me_api -p rusty-remind-me -p remind_me_remote -p remind_me_hub --all-targets -- -D warnings
 ```
 
 ### Key Coding Conventions
@@ -53,14 +55,14 @@ Every feature or bug fix must be accompanied by automated unit or integration te
 
 ### Running Test Suites
 ```bash
-# Run unit tests across all crates
-cargo test --workspace
+# Run unit tests across all six crates
+cargo test -p remind_me_core -p remind_me_mcp -p remind_me_api -p rusty-remind-me -p remind_me_remote -p remind_me_hub
 
 # Run a specific test by name
 cargo test test_database_creation_and_add_memory
 
 # Run tests with output printed
-cargo test --workspace -- --nocapture
+cargo test -p remind_me_core -- --nocapture
 ```
 
 ### Test Locations
@@ -69,30 +71,33 @@ cargo test --workspace -- --nocapture
 
 ---
 
-## 4. The Rusty Mill Ecosystem — Not a Dependency Today
+## 4. The Rusty Mill Ecosystem — Siblings, Not Dependencies (Yet)
 
-Every crate in this workspace once listed the `rusty_*` "Rusty Mill" crates
+Every crate in this product once listed the `rusty_*` "Rusty Mill" crates
 (`rusty_tokio`, `rusty-db`, `rusty_json`, `rusty-search`, `rusty_http`,
 `rusty_lines`, `rusty_term`, `rusty_time`, `rusty_config`) as
-`../Rusty_Mill/...` path dependencies against a monorepo that never existed
+`../Rusty_Mill/...` path dependencies against a monorepo that did not exist
 at those paths — the workspace failed to load, and not one source file
-actually called into any of them. They were removed; see the "Rusty Mill
-ecosystem dependencies" comment in the workspace `Cargo.toml` for the full
-account.
+actually called into any of them. They were removed.
 
-Upstream, Rusty Mill is ~40 standalone repositories (`baileyrd/rusty_db`,
-`baileyrd/rusty_json`, ...), not a monorepo. **Do not add a `rusty_*` crate
-speculatively.** If a real call site needs a capability one of those repos
-provides, add it as a git dependency at that point — not the whole suite up
-front — and prefer it over an equivalent crates.io crate only once it is
-actually pulled in and used.
+That monorepo now exists, and this product lives in it: those crates are
+workspace siblings under the monorepo's `crates/`. **Still do not add a
+`rusty_*` crate speculatively.** If a real call site needs a capability one
+of them provides, depend on it as a workspace path dependency (its
+`[workspace.dependencies]` entry in the root `Cargo.toml`, via
+`crate.workspace = true`) — never as a git dependency, which the monorepo's
+dependency-policy CI job rejects for any crate that is also a workspace
+member (root `docs/adr/0002-dependency-sovereignty-policy.md`). The layer
+rule applies too: this product is in `apps/`, so it may depend on
+`foundation/`, `platform/` and `libs/` crates, but nothing may depend on it
+(root `docs/adr/0003-workspace-layout-by-layer.md`).
 
 ---
 
 ## 5. Pull Request Checklist
 
 Before submitting a Pull Request:
-- [ ] `cargo check --workspace` compiles cleanly.
-- [ ] `cargo test --workspace` passes all unit and integration tests.
+- [ ] `cargo check` (with the six `-p` flags above) compiles cleanly.
+- [ ] `cargo test` (with the six `-p` flags above) passes all unit and integration tests.
 - [ ] `cargo fmt --all` formats all code files.
 - [ ] Documentation in `README.md` and `ARCHITECTURE.md` is updated if API signatures or CLI subcommands changed.

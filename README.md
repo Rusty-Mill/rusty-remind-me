@@ -2,6 +2,13 @@
 
 > High-performance, persistent long-term memory engine and Model Context Protocol (MCP) server written in Rust, built on the **Rusty Mill** ecosystem.
 
+> **Lives in the Rusty Mill monorepo.** Since v0.2.1 this product is developed
+> and released from [`Rusty-Mill/rusty_mill`](https://github.com/Rusty-Mill/rusty_mill)
+> under `crates/apps/rusty_remind_me` (imported with full history). The
+> standalone [`baileyrd/rusty_remind_me`](https://github.com/baileyrd/rusty_remind_me)
+> repository is frozen at v0.2.0. Paths below are relative to this directory
+> unless they say otherwise; `cargo` commands run from the monorepo root.
+
 `rusty_remind_me` is a native Rust port of `remind-me`. It equips AI assistants (such as Claude Desktop, Antigravity, Cursor, OpenAI Codex, and custom LLM agents) with persistent, searchable memory using SQLite FTS5 full-text search, ACT-R inspired memory vitality decay, Reciprocal Rank Fusion (RRF) search ranking, a structured Knowledge Graph entity system, and automated markdown wiki compilation.
 
 ---
@@ -31,7 +38,7 @@ optionally add multi-node sync and the other off-by-default features.
 
 ### Prerequisites
 
-- **Rust 1.94+** with Cargo (`rust-version` in the workspace `Cargo.toml`).
+- **Rust 1.94+** with Cargo.
 - Nothing else is required for the base install. Semantic search's `ollama`
   backend and HyDE query expansion need a running
   [Ollama](https://ollama.com) daemon — optional, see [Search
@@ -40,16 +47,18 @@ optionally add multi-node sync and the other off-by-default features.
 ### 1. Clone & build
 
 ```bash
-git clone https://github.com/baileyrd/rusty_remind_me
-cd rusty_remind_me
+git clone https://github.com/Rusty-Mill/rusty_mill
+cd rusty_mill
 cargo build --release -p rusty-remind-me
 ```
 
-This produces `target/release/rusty-remind-me`. Put it on `PATH` either by
-adding `target/release` to it, or by installing it directly:
+Always pass `-p`: a bare `cargo build` at the monorepo root builds every
+Rusty Mill crate. This produces `target/release/rusty-remind-me` (at the
+monorepo root). Put it on `PATH` either by adding `target/release` to it, or
+by installing it directly:
 
 ```bash
-cargo install --path crates/remind_me_cli
+cargo install --path crates/apps/rusty_remind_me/crates/remind_me_cli
 ```
 
 Verify it's reachable:
@@ -64,23 +73,30 @@ first use.
 
 Prebuilt binaries for Linux, macOS (Intel/Apple Silicon), and Windows are
 also published on the [Releases
-page](https://github.com/baileyrd/rusty_remind_me/releases) for every
-tagged version — each includes both `rusty-remind-me` and
+page](https://github.com/Rusty-Mill/rusty_mill/releases) for every
+tagged version (tags `rusty-remind-me-vX.Y.Z`; v0.2.0 and earlier are on the
+[standalone repo's Releases
+page](https://github.com/baileyrd/rusty_remind_me/releases)) — each includes both `rusty-remind-me` and
 `rusty-remind-me-hub` — if you'd rather skip the build step. See [Releases
 and versioning](#releases-and-versioning) below for how those get produced.
 
 ### 2. Connect it to a client
 
-**Claude Code plugin** (recommended if you're using Claude Code): this repo
-ships its own single-plugin marketplace (`.claude-plugin/marketplace.json`,
-pointing at the plugin manifest described in [Claude Code
+**Claude Code plugin** (recommended if you're using Claude Code): the
+monorepo ships a marketplace at its root (`.claude-plugin/marketplace.json`,
+pointing at this directory's plugin manifest, described in [Claude Code
 Plugin](#claude-code-plugin) below), so no separate marketplace repo is
 needed —
 
 ```bash
-claude plugin marketplace add baileyrd/rusty_remind_me
-claude plugin install rusty-remind-me@rusty-remind-me
+claude plugin marketplace add Rusty-Mill/rusty_mill
+claude plugin install rusty-remind-me@rusty-mill
 ```
+
+An existing install from the old `rusty-remind-me` marketplace
+(`baileyrd/rusty_remind_me`) keeps working: that marketplace's entry now
+points at this directory of the monorepo, so updates arrive from here either
+way. Switching to `rusty-remind-me@rusty-mill` is still recommended.
 
 `rusty-remind-me` must already be on `PATH` (step 1) — the plugin's
 `.mcp.json` runs it as a subprocess, it isn't bundled. Verify with
@@ -161,7 +177,7 @@ section — enable only what you need:
 
 ## Workspace Structure
 
-`rusty_remind_me` is organized as a Cargo workspace containing six modular crates:
+`rusty_remind_me` is six modular crates (members of the Rusty Mill monorepo's Cargo workspace):
 
 ```
 rusty_remind_me/
@@ -187,38 +203,43 @@ rusty_remind_me/
 
 ## Releases and versioning
 
-`.github/workflows/release.yml` watches every push to `main` that touches
-the root `Cargo.toml`. When `[workspace.package].version` there has moved
-past the last version this repo published (checked against existing `vX.Y.Z`
-tags — nothing hand-maintains a changelog of already-shipped versions), it:
+`.github/workflows/remind-me-release.yml` (at the monorepo root) watches
+every push to `main` that touches one of this product's six crate manifests.
+When their `version` has moved past the last version published from the
+monorepo (checked against existing `rusty-remind-me-vX.Y.Z` tags — nothing
+hand-maintains a changelog of already-shipped versions), it:
 
 1. Builds `rusty-remind-me` and `rusty-remind-me-hub` in release mode,
    natively, for `x86_64-unknown-linux-gnu`, `x86_64-apple-darwin`,
    `aarch64-apple-darwin`, and `x86_64-pc-windows-msvc` — one job per
    platform, no cross-compilation, matching the "no system binary at build
    time" convention the optional feature flags already follow (see
-   `Cargo.toml`).
+   `crates/remind_me_core/Cargo.toml`).
 2. Packages the Claude Code plugin surface (`.claude-plugin/`, `commands/`,
    `hooks/`, `.mcp.json`) into its own archive.
-3. Publishes a GitHub Release tagged `vX.Y.Z`, with all of the above
-   attached as downloadable assets.
+3. Publishes a GitHub Release tagged `rusty-remind-me-vX.Y.Z` — prefixed,
+   because the monorepo releases more than one product — with all of the
+   above attached as downloadable assets.
 
 Bumping the version is therefore the entire release process — there is no
 separate "cut a release" step, and nothing here pushes a tag by hand; the
 release action creates it from the version it read.
 
-A CI job (`plugin-version` in `.github/workflows/ci.yml`,
-`scripts/check_plugin_version.sh`) fails any PR where
-`.claude-plugin/plugin.json`'s `"version"` has drifted from the workspace
-version, so a version bump PR that forgets to update the plugin manifest
-never merges in the first place — the release workflow's plugin archive is
-never a version behind the binaries it ships alongside.
+The six crates each carry their own literal `version` (the monorepo's
+`[workspace.package]` belongs to other crates), and must be bumped together
+with `.claude-plugin/plugin.json`'s `"version"`.
+`scripts/get_workspace_version.sh` fails if the six disagree, and
+`scripts/check_plugin_version.sh` fails if the plugin manifest differs from
+them; both run on every PR touching this directory (the `plugin-version` job
+in the monorepo's `.github/workflows/remind-me-checks.yml`), so a bump that
+misses one never merges — the release's plugin archive is never a version
+behind the binaries it ships alongside.
 
 ---
 
 ## Claude Code Plugin
 
-`rusty_remind_me` also ships as a [Claude Code plugin](https://code.claude.com/docs/en/plugins) — `.claude-plugin/plugin.json` at the repo root, bundling:
+`rusty_remind_me` also ships as a [Claude Code plugin](https://code.claude.com/docs/en/plugins) — `.claude-plugin/plugin.json` in this directory (the plugin root), bundling:
 
 - **`.mcp.json`** — the same stdio MCP server (`rusty-remind-me server`) described above, registered automatically instead of via the `configure` command or a manual client config edit.
 - **`hooks/hooks.json`** — a `SessionStart` hook (`hooks/scripts/session-start.sh`) that runs `rusty-remind-me list --limit 8` directly (no MCP round-trip, no model decision required) and injects the most recently written memories as context at the start of every session.
@@ -234,7 +255,7 @@ Three different connections, each with a different trigger:
 
 The hook and the slash commands both bypass MCP entirely — they invoke the plain CLI binary as a subprocess and never speak the MCP JSON-RPC protocol. The hook degrades safely: if `rusty-remind-me` isn't on `PATH` yet, or the store is empty, it emits `{"continue": true}` (optionally with a one-line `systemMessage` nudge to build the binary) rather than failing the session. The slash commands surface the same "not on PATH" condition as plain shell output for the model to relay, rather than silently retrying some other way.
 
-To use it, `rusty-remind-me` must be on `PATH` (`cargo build --release -p rusty-remind-me` then add `target/release` to `PATH`, or `cargo install --path crates/remind_me_cli`), then add this repo as a plugin source in Claude Code.
+To use it, `rusty-remind-me` must be on `PATH` (`cargo build --release -p rusty-remind-me` then add `target/release` to `PATH`, or `cargo install --path crates/apps/rusty_remind_me/crates/remind_me_cli` from the monorepo root), then add the monorepo as a plugin marketplace in Claude Code (see [Connect it to a client](#2-connect-it-to-a-client)).
 
 ### Multi-node sync through the plugin
 
