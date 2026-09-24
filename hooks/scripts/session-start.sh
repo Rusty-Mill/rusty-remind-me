@@ -8,7 +8,7 @@ set -euo pipefail
 BIN="rusty-remind-me"
 
 if ! command -v "$BIN" >/dev/null 2>&1; then
-  echo '{"continue": true, "systemMessage": "rusty-remind-me is not on PATH, so the rusty_remind_me plugin cannot inject recent memories. Build it (cargo build --release -p rusty-remind-me) and put target/release on PATH, or `cargo install --path crates/remind_me_cli`."}'
+  echo '{"continue": true, "systemMessage": "rusty-remind-me is not on PATH, so the rusty_remind_me plugin cannot inject recent memories. Build it (cargo build --release -p rusty-remind-me) and put target/release on PATH, or `cargo install --path crates/apps/rusty_remind_me/crates/remind_me_cli` from a Rusty-Mill/rusty_mill checkout."}'
   exit 0
 fi
 
