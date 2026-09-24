@@ -89,10 +89,9 @@ pub fn dimension_of(bytes: &[u8]) -> usize {
 }
 
 pub(crate) fn le_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
+    // A trailing partial chunk (a corrupt blob) is dropped, as it always was.
+    let (chunks, _remainder) = bytes.as_chunks::<4>();
+    chunks.iter().map(|c| f32::from_le_bytes(*c)).collect()
 }
 
 /// Drop every chunk vector belonging to a memory.

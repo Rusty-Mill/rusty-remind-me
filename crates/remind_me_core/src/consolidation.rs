@@ -352,11 +352,7 @@ fn fetch_candidates(
     let mut embeddings = HashMap::new();
     for row in rows {
         let (member, bytes) = row?;
-        let vector: Vec<f32> = bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        embeddings.insert(member.id.clone(), vector);
+        embeddings.insert(member.id.clone(), crate::vectors::le_bytes_to_f32(&bytes));
         members.push(member);
     }
     Ok((members, embeddings))

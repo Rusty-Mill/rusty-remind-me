@@ -81,21 +81,35 @@ pub fn resource_metadata_url(issuer: &Issuer) -> String {
     format!("{}{PR_METADATA_PATH}", issuer.as_str())
 }
 
-/// Run a blocking (file-I/O-touching) closure off the async runtime,
-/// mapping a task panic to a generic 500 rather than propagating it —
-/// no `unwrap`/`expect` on the join result in non-test code.
-async fn run_blocking<T, F>(f: F) -> Result<T, Response>
-where
-    F: FnOnce() -> T + Send + 'static,
-    T: Send + 'static,
-{
-    tokio::task::spawn_blocking(f).await.map_err(|_| {
+/// A [`run_blocking`] closure panicked. Rendered as a generic 500.
+///
+/// Its own zero-sized type rather than a ready-made `Response` in the `Err`
+/// arm: a `Response` is 128+ bytes, which every `Ok` path would carry too
+/// (`clippy::result_large_err`).
+#[derive(Debug, Clone, Copy)]
+struct BlockingTaskPanicked;
+
+impl IntoResponse for BlockingTaskPanicked {
+    fn into_response(self) -> Response {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": "server_error" })),
         )
             .into_response()
-    })
+    }
+}
+
+/// Run a blocking (file-I/O-touching) closure off the async runtime,
+/// mapping a task panic to a generic 500 rather than propagating it —
+/// no `unwrap`/`expect` on the join result in non-test code.
+async fn run_blocking<T, F>(f: F) -> Result<T, BlockingTaskPanicked>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|_| BlockingTaskPanicked)
 }
 
 // ---------------------------------------------------------------------------
@@ -275,7 +289,7 @@ async fn handle_authorize(state: OAuthAppState, params: AuthorizeParams) -> Resp
     let lookup_id = client_id.clone();
     let client = match run_blocking(move || provider.get_client(&lookup_id)).await {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(panicked) => return panicked.into_response(),
     };
     let Some(client) = client else {
         return authorize_json_error(
@@ -363,7 +377,7 @@ async fn handle_authorize(state: OAuthAppState, params: AuthorizeParams) -> Resp
     let cid = client_id.clone();
     let location = match run_blocking(move || provider.authorize(&cid, auth_params, now)).await {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(panicked) => return panicked.into_response(),
     };
     redirect_to(&location)
 }
@@ -439,7 +453,7 @@ async fn consent_get(
     let lookup_txn = txn.clone();
     let view = match run_blocking(move || provider.pending_consent(&lookup_txn, now)).await {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(panicked) => return panicked.into_response(),
     };
     let Some(view) = view else {
         return (StatusCode::BAD_REQUEST, Html(EXPIRED_HTML)).into_response();
@@ -474,7 +488,7 @@ async fn consent_post(
     let txn = form.txn.clone();
     let outcome = match run_blocking(move || provider.decide_consent(&txn, approved, now)).await {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(panicked) => return panicked.into_response(),
     };
     match outcome {
         ConsentOutcome::Expired => (StatusCode::BAD_REQUEST, Html(EXPIRED_HTML)).into_response(),
@@ -553,7 +567,7 @@ async fn token(State(state): State<OAuthAppState>, Form(form): Form<TokenForm>) 
     let lookup_id = client_id.clone();
     let client = match run_blocking(move || provider.get_client(&lookup_id)).await {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(panicked) => return panicked.into_response(),
     };
     // `client.client_secret` is always `None` for a client this server ever
     // registers (see `Provider::register_client`), so there is no secret to
@@ -583,7 +597,7 @@ async fn token(State(state): State<OAuthAppState>, Form(form): Form<TokenForm>) 
             .await
             {
                 Ok(v) => v,
-                Err(resp) => return resp,
+                Err(panicked) => return panicked.into_response(),
             };
             let Some(loaded) = loaded else {
                 return token_error(
@@ -638,7 +652,7 @@ async fn token(State(state): State<OAuthAppState>, Form(form): Form<TokenForm>) 
             .await
             {
                 Ok(v) => v,
-                Err(resp) => return resp,
+                Err(panicked) => return panicked.into_response(),
             };
             match tokens {
                 Ok(Some(tokens)) => token_success(tokens),
@@ -677,7 +691,7 @@ async fn token(State(state): State<OAuthAppState>, Form(form): Form<TokenForm>) 
             .await
             {
                 Ok(v) => v,
-                Err(resp) => return resp,
+                Err(panicked) => return panicked.into_response(),
             };
             let Some(loaded) = loaded else {
                 return token_error(
@@ -707,7 +721,7 @@ async fn token(State(state): State<OAuthAppState>, Form(form): Form<TokenForm>) 
             .await
             {
                 Ok(v) => v,
-                Err(resp) => return resp,
+                Err(panicked) => return panicked.into_response(),
             };
             match tokens {
                 Ok(tokens) => token_success(tokens),
@@ -740,7 +754,7 @@ async fn register(
     let provider = Arc::clone(&state.provider);
     let result = match run_blocking(move || provider.register_client(metadata)).await {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(panicked) => return panicked.into_response(),
     };
     match result {
         Ok(info) => (StatusCode::CREATED, Json(info)).into_response(),
@@ -782,7 +796,7 @@ async fn revoke(State(state): State<OAuthAppState>, Form(form): Form<RevokeForm>
     let lookup_id = form.client_id.clone();
     let client = match run_blocking(move || provider.get_client(&lookup_id)).await {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(panicked) => return panicked.into_response(),
     };
     if client.is_none() {
         return (
@@ -820,7 +834,7 @@ async fn revoke(State(state): State<OAuthAppState>, Form(form): Form<RevokeForm>
     .await
     {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(panicked) => return panicked.into_response(),
     };
 
     // If the token is not found, or belongs to a different client, this is
@@ -847,7 +861,7 @@ async fn revoke(State(state): State<OAuthAppState>, Form(form): Form<RevokeForm>
                 )
                     .into_response();
             }
-            Err(resp) => return resp,
+            Err(panicked) => return panicked.into_response(),
         }
     }
 
@@ -902,7 +916,7 @@ pub async fn require_bearer(
     let token_owned = token.to_string();
     let verified = match run_blocking(move || provider.load_access_token(&token_owned, now)).await {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(panicked) => return panicked.into_response(),
     };
     if verified.is_none() {
         return unauthorized_bearer(&state);
