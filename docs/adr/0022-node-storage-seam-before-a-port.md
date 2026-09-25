@@ -122,7 +122,7 @@ remaining groups gain little until the triggers can move.
 |---|---|---|---|
 | 1 | Saved searches | `db::saved_searches::SavedSearches` | Done |
 | 2 | Reminders and deliveries | `db::reminders::Reminders` | Done |
-| 3 | Sync bookkeeping | | |
+| 3 | Sync bookkeeping | `db::sync_state::SyncState` | Done |
 | 4 | History and feedback | | |
 | 5 | Stats and analytics | | |
 
@@ -152,6 +152,24 @@ attempted. The scheduler thread's own `Connection::open` and its
 timeout. The 42 existing reminder, scheduler, reminder-sync and digest
 tests pass unchanged, and they already pin the delivery rules: once only,
 a reschedule re-arms, and a deleted memory never fires.
+
+**Step 3.** `db::sync_state` holds every statement that touches only
+`sync_log`, `sync_flags` or `sync_sends`:
+- both pull cursors (keyset and `hub_seq`);
+- the push and pull liveness stamps;
+- every remote's stamps;
+- the repair reset;
+- flags;
+- recording sends.
+
+The sync code keeps the policy: a missing cursor means the epoch or
+`SEQ_UNKNOWN`, a reset returns to `SEQ_UNKNOWN` rather than 0, and stamps
+are best-effort. Four statements also read `sync_outbox`, so they stay
+with the outbox for its own step:
+- fetching a push batch;
+- counting pending rows per remote;
+- clearing and backfilling the outbox when sync is toggled;
+- pruning sends.
 
 ## Related
 

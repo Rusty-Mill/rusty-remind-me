@@ -13,7 +13,8 @@ use super::graph::{
 use super::http;
 use super::record::{canon_ts, upsert_record, SyncRecord};
 use super::record_pull;
-use rusqlite::{params, Connection, OptionalExtension};
+use crate::db::sync_state::SyncState;
+use rusqlite::Connection;
 use serde_json::Value;
 
 pub const PULL_PAGE_SIZE: usize = 500;
@@ -83,32 +84,19 @@ fn urlencode(raw: &str) -> String {
 }
 
 fn read_cursor(conn: &Connection, remote_id: &str) -> rusqlite::Result<(String, String)> {
-    conn.query_row(
-        "SELECT last_pull, last_pull_id FROM sync_log WHERE remote_id = ?",
-        params![remote_id],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-    )
-    .optional()
-    .map(|opt| opt.unwrap_or_else(|| (EPOCH.to_string(), String::new())))
+    Ok(SyncState::new(conn)
+        .pull_cursor(remote_id)?
+        .unwrap_or_else(|| (EPOCH.to_string(), String::new())))
 }
 
 fn read_seq_cursor(conn: &Connection, remote_id: &str) -> rusqlite::Result<i64> {
-    conn.query_row(
-        "SELECT last_pull_seq FROM sync_log WHERE remote_id = ?",
-        params![remote_id],
-        |row| row.get::<_, i64>(0),
-    )
-    .optional()
-    .map(|opt| opt.unwrap_or(SEQ_UNKNOWN))
+    Ok(SyncState::new(conn)
+        .seq_cursor(remote_id)?
+        .unwrap_or(SEQ_UNKNOWN))
 }
 
 fn persist_seq_cursor(conn: &Connection, remote_id: &str, seq: i64) -> rusqlite::Result<()> {
-    conn.execute(
-        "INSERT INTO sync_log (remote_id, last_pull_seq) VALUES (?, ?)
-         ON CONFLICT(remote_id) DO UPDATE SET last_pull_seq = excluded.last_pull_seq",
-        params![remote_id, seq],
-    )?;
-    Ok(())
+    SyncState::new(conn).set_seq_cursor(remote_id, seq)
 }
 
 /// Decide whether `remote_id` supports the `since_seq` cursor.
@@ -191,12 +179,7 @@ fn persist_cursor(
     since: &str,
     since_id: &str,
 ) -> rusqlite::Result<()> {
-    conn.execute(
-        "INSERT INTO sync_log (remote_id, last_pull, last_pull_id) VALUES (?, ?, ?)
-         ON CONFLICT(remote_id) DO UPDATE SET last_pull = excluded.last_pull, last_pull_id = excluded.last_pull_id",
-        params![remote_id, since, since_id],
-    )?;
-    Ok(())
+    SyncState::new(conn).set_pull_cursor(remote_id, since, since_id)
 }
 
 /// Pull every change `remote_id` (reached at `hub_url`) has made since the

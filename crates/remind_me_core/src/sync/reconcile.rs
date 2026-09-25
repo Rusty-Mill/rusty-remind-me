@@ -29,8 +29,9 @@
 //! eventually disagree about what drift means.
 
 use super::{configured_hub_url, configured_sync_secret, sync_enabled};
+use crate::db::sync_state::SyncState;
 use crate::models::{CategoryDrift, ReconcileReport, ReconcileVerdict, RemoteCounts};
-use rusqlite::{params, Connection, OptionalExtension, Result};
+use rusqlite::{Connection, Result};
 
 /// How stale a successful pull may be before hub-ahead drift stops reading as
 /// ordinary lag. Generous relative to the sync interval, because a single
@@ -119,13 +120,7 @@ fn local_counts(conn: &Connection) -> Result<(i64, i64, std::collections::BTreeM
 /// Seconds since the last successful pull from `remote_id`, or `None` when it
 /// has never been pulled from.
 fn last_pull_age(conn: &Connection, remote_id: &str) -> Result<Option<i64>> {
-    let at: Option<String> = conn
-        .query_row(
-            "SELECT last_pull_at FROM sync_log WHERE remote_id = ?",
-            params![remote_id],
-            |r| r.get(0),
-        )
-        .optional()?;
+    let at = SyncState::new(conn).last_pull_at(remote_id)?;
 
     let Some(at) = at else { return Ok(None) };
     // The epoch default means "never", not "56 years stale".

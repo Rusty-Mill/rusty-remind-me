@@ -6,6 +6,7 @@
 //! [`live_status_against`].
 
 use super::{prune_outbox, pull_remote, push_outbox};
+use crate::db::sync_state::SyncState;
 use crate::Database;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -350,11 +351,11 @@ pub fn superseded(conn: &Connection, failed_cycle_at: Option<&str>) -> rusqlite:
         return Ok(false);
     };
 
-    let mut stmt = conn.prepare("SELECT last_push_at, last_pull_at FROM sync_log")?;
-    let rows: Vec<(String, String)> = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    drop(stmt);
+    let rows: Vec<(String, String)> = SyncState::new(conn)
+        .remotes()?
+        .into_iter()
+        .map(|log| (log.last_push_at, log.last_pull_at))
+        .collect();
 
     if rows.is_empty() {
         return Ok(false);

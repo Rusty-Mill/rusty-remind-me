@@ -9,6 +9,7 @@
 //! costs nothing but a wasted round-trip.
 
 use super::{http, record_push};
+use crate::db::sync_state::SyncState;
 use chrono::Utc;
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
@@ -109,14 +110,7 @@ fn fetch_batch(
 }
 
 fn mark_sent(conn: &Connection, remote_id: &str, outbox_ids: &[i64]) -> rusqlite::Result<()> {
-    let now = Utc::now().to_rfc3339();
-    for id in outbox_ids {
-        conn.execute(
-            "INSERT OR REPLACE INTO sync_sends (remote_id, outbox_id, sent_at) VALUES (?, ?, ?)",
-            params![remote_id, id, now],
-        )?;
-    }
-    Ok(())
+    SyncState::new(conn).record_sends(remote_id, outbox_ids, &Utc::now().to_rfc3339())
 }
 
 /// Push every not-yet-sent-to-`remote_id` outbox row to `{hub_url}/sync/push`,

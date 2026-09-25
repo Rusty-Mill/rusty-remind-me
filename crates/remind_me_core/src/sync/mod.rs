@@ -13,6 +13,7 @@
 //! all set — the same default-off posture as the webhook endpoint (`#56`)
 //! and the folder watcher (`#55`).
 
+use crate::db::sync_state::SyncState;
 use chrono::{Duration, Utc};
 use rusqlite::{params, Connection, Result};
 
@@ -249,6 +250,9 @@ pub fn probe_hub_version() -> Option<String> {
 
 const NOW_ISO_EXPR: &str = "strftime('%Y-%m-%dT%H:%M:%f000', 'now') || '+00:00'";
 
+/// The `sync_flags` key recording whether the outbox is being filled.
+const SYNC_ENABLED_FLAG: &str = "sync_enabled";
+
 /// Align `sync_flags.sync_enabled` with [`sync_enabled`], every time the
 /// schema is opened — matching the reference's own `_reconcile_sync_enabled_flag`,
 /// called on every startup, verbatim:
@@ -272,16 +276,9 @@ const NOW_ISO_EXPR: &str = "strftime('%Y-%m-%dT%H:%M:%f000', 'now') || '+00:00'"
 ///   diverging ones for "true fresh" vs. "upgraded from an older,
 ///   once-ungated build."
 pub fn reconcile_sync_enabled_flag(conn: &Connection) -> Result<()> {
-    use rusqlite::OptionalExtension;
-
     let desired = if sync_enabled() { "1" } else { "0" };
-    let stored: Option<String> = conn
-        .query_row(
-            "SELECT value FROM sync_flags WHERE key = 'sync_enabled'",
-            [],
-            |r| r.get(0),
-        )
-        .optional()?;
+    let state = SyncState::new(conn);
+    let stored = state.flag(SYNC_ENABLED_FLAG)?;
 
     if stored.as_deref() == Some(desired) {
         return Ok(());
@@ -324,13 +321,7 @@ pub fn reconcile_sync_enabled_flag(conn: &Connection) -> Result<()> {
         conn.execute_batch("DELETE FROM sync_outbox; DELETE FROM sync_sends;")?;
     }
 
-    conn.execute(
-        "INSERT INTO sync_flags (key, value) VALUES ('sync_enabled', ?)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        params![desired],
-    )?;
-
-    Ok(())
+    state.set_flag(SYNC_ENABLED_FLAG, desired)
 }
 
 /// Days an unsent outbox row is kept before being pruned.
@@ -409,27 +400,13 @@ pub fn prune_outbox(conn: &Connection) -> Result<usize> {
 /// write failure here is telemetry, not correctness, and must not turn a
 /// successful sync into a reported failure.
 pub(crate) fn record_push(conn: &Connection, remote_id: &str) {
-    let now = Utc::now().to_rfc3339();
-    let _ = conn.execute(
-        "INSERT INTO sync_log (remote_id, last_attempt_at, last_push_at) VALUES (?, ?, ?)
-         ON CONFLICT(remote_id) DO UPDATE SET
-             last_attempt_at = excluded.last_attempt_at,
-             last_push_at = excluded.last_push_at",
-        params![remote_id, now, now],
-    );
+    let _ = SyncState::new(conn).stamp_push(remote_id, &Utc::now().to_rfc3339());
 }
 
 /// Same as [`record_push`], but for a successful pull -- sets
 /// `last_attempt_at` and `last_pull_at` instead.
 pub(crate) fn record_pull(conn: &Connection, remote_id: &str) {
-    let now = Utc::now().to_rfc3339();
-    let _ = conn.execute(
-        "INSERT INTO sync_log (remote_id, last_attempt_at, last_pull_at) VALUES (?, ?, ?)
-         ON CONFLICT(remote_id) DO UPDATE SET
-             last_attempt_at = excluded.last_attempt_at,
-             last_pull_at = excluded.last_pull_at",
-        params![remote_id, now, now],
-    );
+    let _ = SyncState::new(conn).stamp_pull(remote_id, &Utc::now().to_rfc3339());
 }
 
 #[cfg(test)]
