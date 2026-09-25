@@ -27,11 +27,21 @@ postgres = { version = "0.19", features = [
     "with-serde_json-1",
 ], optional = true }
 
+# The embedded-engine backend (docs/adr/0021): `rusty_multimodal_db`'s
+# storage engine, in-process. `uuid` with `v5` derives each record's engine
+# id from its string id; the engine itself only needs `Uuid` as a type.
+rusty_multimodal_db_engine = { workspace = true, optional = true }
+uuid = { version = "1", features = ["v5"], optional = true }
+
 [features]
 default = ["postgres-store"]
 # Postgres storage. Named `postgres-store` rather than `postgres` so it does
 # not collide with the optional dependency's own implicit feature name.
 postgres-store = ["dep:postgres"]
+# Storage on the embedded `rusty_multimodal_db` engine: a data directory, no
+# database server. Off by default until the copy tool and the default switch
+# land (docs/adr/0021, phase 3).
+multimodal-store = ["dep:rusty_multimodal_db_engine", "dep:uuid"]
 
 [dev-dependencies]
 # The Postgres tests build a legacy-schema database directly, which is the

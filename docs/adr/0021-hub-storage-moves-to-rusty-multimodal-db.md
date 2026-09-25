@@ -159,6 +159,40 @@ with record types the hub owns.**
 - **An allow-list exception in the layer check.** Quicker than extracting the
   engine, but weakens a rule the whole workspace relies on.
 
+## Phase 2 notes (2026-09-25)
+
+`MultimodalHubStore` (`remind_me_hub/src/store/multimodal/`) is the third
+backend, behind the off-by-default `multimodal-store` feature and selected by
+`REMIND_ME_HUB_DATA_DIR`. The spike came first
+(`rusty_multimodal_db_engine/tests/stacked_ordered.rs`): three stacked
+`Ordered` layers page correctly through writes and a reopen, so no engine
+change was needed. Building it settled details the decisions above left open:
+
+- **Four engine stores, one per table,** in one data directory. Memories stack
+  two sort orders (`hub_seq`; `(updated_at, id)`), the other tables one each.
+  Each store's equality index is keyed on the engine id, since the hub looks
+  nothing up by value.
+- **NUL bytes are refused in ids, as well as ids over 64 bytes.** Zero padding
+  cannot tell `"m"` from `"m\0"`, and Postgres TEXT cannot hold NUL either.
+  A link's engine id is derived from a length-prefixed pair, so `"a|b"+"c"`
+  and `"a"+"b|c"` stay distinct.
+- **`hub_seq` has a floor file.** The counter restarts from the highest stored
+  `hub_seq`, which a tombstone compaction can delete. Before deleting,
+  `compact_tombstones` records the counter, so a reopen never issues a number
+  again. The SQLite store's `MAX(hub_seq)+1` has that reuse bug today.
+- **Compaction runs hourly** (`REMIND_ME_HUB_COMPACT_INTERVAL_SECS`) when
+  anything was written, and on every `/admin/compact_tombstones`.
+- **A cursor timestamp is canonicalised** before it becomes microseconds, and
+  an unparseable one is a storage error (500) where the SQL stores compare the
+  bytes as sent.
+- **The route suite runs against SQLite and this store, and a differential
+  script against all three.** Postgres's `hub_seq` has gaps (`nextval()` spends
+  a number on an LWW loss), so the differential compares it by order there;
+  SQLite and this store agree exactly.
+
+Not yet measured: pull latency under push load, which this ADR requires before
+the default switches (phase 3).
+
 ## Related
 
 - The same mapping found that the Postgres hub assigned `hub_seq` at statement

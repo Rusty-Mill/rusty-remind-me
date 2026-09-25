@@ -129,7 +129,6 @@ fn run() -> Result<(), String> {
 
     eprintln!("hub: schema ready; v{HUB_VERSION} listening on {bind}:{port}");
 
-    let store: Arc<dyn HubStore> = Arc::from(store);
     let config = Arc::new(config);
     for stream in listener.incoming() {
         match stream {
@@ -155,49 +154,142 @@ fn run() -> Result<(), String> {
 
 /// Build the configured store.
 ///
-/// `DATABASE_URL` selects Postgres, matching the reference's only
-/// configuration. `REMIND_ME_HUB_DB_PATH` selects SQLite. Setting neither is
-/// an error rather than a silent default: a hub that quietly created an empty
-/// SQLite file when its `DATABASE_URL` was misspelled would look healthy while
-/// serving nothing.
-fn open_store() -> Result<Box<dyn HubStore>, String> {
-    let database_url = std::env::var("DATABASE_URL").unwrap_or_default();
-    let sqlite_path = std::env::var("REMIND_ME_HUB_DB_PATH").unwrap_or_default();
+/// Exactly one of three variables selects it: `DATABASE_URL` for Postgres,
+/// matching the reference's only configuration; `REMIND_ME_HUB_DB_PATH` for
+/// SQLite; `REMIND_ME_HUB_DATA_DIR` for the embedded `rusty_multimodal_db`
+/// engine (docs/adr/0021). Setting none is an error rather than a silent
+/// default: a hub that quietly created an empty store when its
+/// `DATABASE_URL` was misspelled would look healthy while serving nothing.
+/// Setting more than one is an error too, so it is never ambiguous which
+/// store is serving.
+fn open_store() -> Result<Arc<dyn HubStore>, String> {
+    let configured: Vec<Backend> = [
+        Backend::from_env("DATABASE_URL", Backend::Postgres),
+        Backend::from_env("REMIND_ME_HUB_DB_PATH", Backend::Sqlite),
+        Backend::from_env("REMIND_ME_HUB_DATA_DIR", Backend::Multimodal),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
 
-    match (database_url.is_empty(), sqlite_path.is_empty()) {
-        (false, true) => open_postgres(&database_url),
-        (true, false) => {
-            eprintln!("hub: using the SQLite backend at {sqlite_path}");
-            Ok(Box::new(SqliteStore::open(&sqlite_path).map_err(|e| e.0)?))
+    match configured.as_slice() {
+        [Backend::Postgres(url)] => open_postgres(url),
+        [Backend::Sqlite(path)] => {
+            eprintln!("hub: using the SQLite backend at {path}");
+            Ok(Arc::new(SqliteStore::open(path).map_err(|e| e.0)?))
         }
-        (false, false) => Err("both DATABASE_URL and REMIND_ME_HUB_DB_PATH are set — \
-             set exactly one so it is unambiguous which store is serving"
+        [Backend::Multimodal(dir)] => open_multimodal(dir),
+        [] => Err("no store configured — set DATABASE_URL for Postgres, \
+             REMIND_ME_HUB_DB_PATH for SQLite, or REMIND_ME_HUB_DATA_DIR for \
+             the embedded engine"
             .to_string()),
-        (true, true) => Err("no store configured — set DATABASE_URL for Postgres or \
-             REMIND_ME_HUB_DB_PATH for SQLite"
-            .to_string()),
+        several => {
+            let names: Vec<&str> = several.iter().map(Backend::variable).collect();
+            Err(format!(
+                "{} are set — set exactly one so it is unambiguous which \
+                 store is serving",
+                names.join(" and ")
+            ))
+        }
+    }
+}
+
+/// A store selection, carrying the value of the variable that chose it.
+enum Backend {
+    Postgres(String),
+    Sqlite(String),
+    Multimodal(String),
+}
+
+impl Backend {
+    /// The backend `variable` selects, if it is set and non-empty.
+    fn from_env(variable: &str, backend: fn(String) -> Backend) -> Option<Backend> {
+        std::env::var(variable)
+            .ok()
+            .filter(|value| !value.is_empty())
+            .map(backend)
+    }
+
+    fn variable(&self) -> &'static str {
+        match self {
+            Backend::Postgres(_) => "DATABASE_URL",
+            Backend::Sqlite(_) => "REMIND_ME_HUB_DB_PATH",
+            Backend::Multimodal(_) => "REMIND_ME_HUB_DATA_DIR",
+        }
     }
 }
 
 #[cfg(feature = "postgres-store")]
-fn open_postgres(url: &str) -> Result<Box<dyn HubStore>, String> {
+fn open_postgres(url: &str) -> Result<Arc<dyn HubStore>, String> {
     eprintln!("hub: using the Postgres backend");
-    Ok(Box::new(
+    Ok(Arc::new(
         remind_me_hub::store::postgres::PostgresStore::new(url),
     ))
 }
 
 /// Built without the Postgres backend, `DATABASE_URL` must fail loudly.
 ///
-/// Silently falling back to SQLite would be the worst possible outcome: the
-/// hub would come up healthy, serving an empty database, while the real one
-/// sat untouched.
+/// Silently falling back to another store would be the worst possible
+/// outcome: the hub would come up healthy, serving an empty database, while
+/// the real one sat untouched.
 #[cfg(not(feature = "postgres-store"))]
-fn open_postgres(_url: &str) -> Result<Box<dyn HubStore>, String> {
+fn open_postgres(_url: &str) -> Result<Arc<dyn HubStore>, String> {
     Err("DATABASE_URL is set but this binary was built without the \
-         `postgres-store` feature — rebuild with it, or set \
-         REMIND_ME_HUB_DB_PATH to use SQLite"
+         `postgres-store` feature — rebuild with it, or configure another store"
         .to_string())
+}
+
+/// Default interval between scheduled compactions of the embedded store.
+#[cfg(feature = "multimodal-store")]
+const DEFAULT_COMPACT_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+#[cfg(feature = "multimodal-store")]
+fn open_multimodal(dir: &str) -> Result<Arc<dyn HubStore>, String> {
+    use remind_me_hub::store::multimodal::MultimodalHubStore;
+
+    eprintln!("hub: using the embedded rusty_multimodal_db backend in {dir}");
+    let store = Arc::new(MultimodalHubStore::open(std::path::Path::new(dir)).map_err(|e| e.0)?);
+    let interval = std::env::var("REMIND_ME_HUB_COMPACT_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map_or(DEFAULT_COMPACT_INTERVAL, Duration::from_secs);
+    spawn_compactor(Arc::clone(&store), interval)?;
+    Ok(store)
+}
+
+/// Fold the embedded store's insert logs on a schedule (docs/adr/0021:
+/// they grow with every write until compacted). A failed run is logged and
+/// retried at the next tick: the logs stay correct, only larger.
+#[cfg(feature = "multimodal-store")]
+fn spawn_compactor(
+    store: Arc<remind_me_hub::store::multimodal::MultimodalHubStore>,
+    interval: Duration,
+) -> Result<(), String> {
+    std::thread::Builder::new()
+        .name("hub-compact".to_string())
+        .spawn(move || loop {
+            std::thread::sleep(interval);
+            match store.compact() {
+                Ok(true) => eprintln!("hub: compacted the store's insert logs"),
+                Ok(false) => {}
+                Err(e) => eprintln!("hub: scheduled compaction failed: {e}"),
+            }
+        })
+        .map(|_| ())
+        .map_err(|e| format!("could not start the compaction thread: {e}"))
+}
+
+/// Built without the embedded engine, `REMIND_ME_HUB_DATA_DIR` fails loudly
+/// for the same reason `DATABASE_URL` does.
+#[cfg(not(feature = "multimodal-store"))]
+fn open_multimodal(_dir: &str) -> Result<Arc<dyn HubStore>, String> {
+    Err(
+        "REMIND_ME_HUB_DATA_DIR is set but this binary was built without \
+         the `multimodal-store` feature — rebuild with it, or configure \
+         another store"
+            .to_string(),
+    )
 }
 
 fn serve_connection(mut stream: TcpStream, store: &dyn HubStore, config: &Config) {

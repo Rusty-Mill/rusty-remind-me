@@ -2,6 +2,25 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-25 — The hub gains a third storage backend: the embedded rusty_multimodal_db engine (preview)
+
+### Added
+- **`MultimodalHubStore`, behind the new `multimodal-store` feature (off by default).** Phase 2 of ADR-0021. Set `REMIND_ME_HUB_DATA_DIR` to run the hub on `rusty_multimodal_db`'s storage engine in-process: one data directory, no database server. Selecting more than one of `DATABASE_URL`, `REMIND_ME_HUB_DB_PATH` and `REMIND_ME_HUB_DATA_DIR` is a startup error, as is a variable for a backend the binary was built without.
+- It answers every route as the SQLite store does. The differences: it refuses ids over 64 bytes or containing NUL (the record counts as `failed` and stays in the sender's outbox); it keeps the whole dataset in memory; pulls wait while a push is being written; it folds its insert logs hourly (`REMIND_ME_HUB_COMPACT_INTERVAL_SECS`) and on every `/admin/compact_tombstones`; and it locks its data directory against a second hub.
+- `hub_seq` never repeats on this backend, even after a tombstone compaction deletes the row holding the highest one.
+
+### Changed (tests and CI)
+- The route suite (`tests/suite/routes.rs`) now runs once per backend that needs no server: SQLite, and the engine under `multimodal-store`.
+- A shared differential script (`tests/suite/differential.rs`) replaces the Postgres-vs-SQLite check. It pushes ids that prefix each other, an id at the 64-byte cap, LWW wins and losses and tombstones, then walks every cursor a page at a time and compares every read. It runs SQLite against the engine with no server, and all three backends against Postgres in CI. A cursor walk that never advances now fails with a message instead of looping.
+- The CI hub job also runs clippy and the tests with `multimodal-store`.
+- `rusty_multimodal_db_engine` gains `tests/stacked_ordered.rs`, the phase-2 spike: three stacked sort orders page correctly through writes and a reopen.
+
+Not the default, and no copy tool yet: an existing hub cannot move onto this backend until phase 3.
+
+### Provenance
+
+`cargo test -p remind_me_hub` passes with every feature combination (default, `multimodal-store`, `--no-default-features` with and without it), including against Postgres 16 with `REMIND_ME_HUB_REQUIRE_POSTGRES=1`. Clippy with `-D warnings` is clean on all four. Mutation checks: breaking the `created_at` rule, the `hub_seq` cursor, the keyset cursor or `exclude_node` in the engine store each fails the differential test.
+
 ## 2026-09-25 — ADR-0021: the hub's storage is to move to an embedded rusty_multimodal_db
 
 ### Added

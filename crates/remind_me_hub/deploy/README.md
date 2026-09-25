@@ -39,9 +39,11 @@ wire-identical, so no client can tell the difference — but it is **not**
 schema-identical, so there is no in-place switch between the two backends.
 Decide before you have data. `docs/adr/0015` records the reasoning.
 
-Setting both `DATABASE_URL` and `REMIND_ME_HUB_DB_PATH` is a startup error
-rather than a silent precedence rule: it should never be ambiguous which store
-is serving.
+Setting more than one of `DATABASE_URL`, `REMIND_ME_HUB_DB_PATH` and
+`REMIND_ME_HUB_DATA_DIR` is a startup error rather than a silent precedence
+rule: it should never be ambiguous which store is serving. The third, the
+embedded-engine backend, is a preview none of these templates use yet (see the
+crate README).
 
 ## Exposure
 

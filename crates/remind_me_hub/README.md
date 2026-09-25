@@ -61,15 +61,36 @@ REMIND_ME_HUB_DB_PATH=./hub.db \
 | `SYNC_SECRET` | — | Shared bearer token. **Required**; the hub refuses to start without it. |
 | `DATABASE_URL` | — | Postgres connection string. Selects the Postgres backend. |
 | `REMIND_ME_HUB_DB_PATH` | — | SQLite file. Selects the SQLite backend. |
+| `REMIND_ME_HUB_DATA_DIR` | — | Data directory. Selects the embedded-engine backend (built with `--features multimodal-store`). |
+| `REMIND_ME_HUB_COMPACT_INTERVAL_SECS` | `3600` | How often the embedded-engine backend folds its insert logs. |
 | `REMIND_ME_HUB_BIND` | `127.0.0.1` | Listen address. The image sets `0.0.0.0`. |
 | `REMIND_ME_HUB_PORT` | `8765` | Listen port. |
 | `REMIND_ME_HUB_METRICS_ENABLED` | off | Serve `GET /metrics`. Off returns 404. |
 | `REMIND_ME_HUB_TOMBSTONE_RETENTION_DAYS` | `90` | Age past which `/admin/compact_tombstones` hard-deletes. |
 | `REMIND_ME_HUB_STATEMENT_TIMEOUT_MS` | `15000` | Postgres statement timeout. |
 
-Exactly one of `DATABASE_URL` and `REMIND_ME_HUB_DB_PATH` must be set. Both is
-an error, and so is neither — a hub that quietly created an empty SQLite file
-because `DATABASE_URL` was misspelled would look healthy while serving nothing.
+Exactly one of `DATABASE_URL`, `REMIND_ME_HUB_DB_PATH` and
+`REMIND_ME_HUB_DATA_DIR` must be set. More than one is an error, and so is none
+— a hub that quietly created an empty SQLite file because `DATABASE_URL` was
+misspelled would look healthy while serving nothing.
+
+### The embedded-engine backend (preview)
+
+`REMIND_ME_HUB_DATA_DIR` runs the hub on `rusty_multimodal_db`'s storage engine
+in-process (`docs/adr/0021`): one data directory, no database server. It is
+behind the `multimodal-store` feature and off by default until a copy tool can
+move an existing hub onto it. Compared with SQLite it:
+
+- keeps the whole dataset in memory, and writes each change to a per-table
+  insert log that is `fsync`'d before the push returns;
+- refuses ids over 64 bytes or containing a NUL byte. Such a record counts as
+  `failed` and stays in the sender's outbox;
+- makes pulls wait while a push is being written, where SQLite in WAL mode
+  lets them run alongside;
+- folds the insert logs every `REMIND_ME_HUB_COMPACT_INTERVAL_SECS`, and on
+  every `/admin/compact_tombstones`;
+- locks its data directory, so a second hub pointed at it refuses to start.
+  Back it up by copying the directory while the hub is stopped.
 
 ## Routes
 
@@ -196,9 +217,15 @@ can miss a delete, the same accepted gap the client-side compaction lives with.
 
 ```sh
 cargo test -p remind_me_hub                       # SQLite; Postgres tests skip
+cargo test -p remind_me_hub --features multimodal-store  # plus the embedded engine
 REMIND_ME_HUB_TEST_DATABASE_URL=postgresql://… \
   cargo test -p remind_me_hub -- --test-threads=1 # with a real Postgres
 ```
+
+The route suite (`tests/suite/routes.rs`) runs once per backend that needs no
+server. `tests/suite/differential.rs` pushes one script to several backends and
+requires every read to match: SQLite against the embedded engine in
+`hub_multimodal_test.rs`, and all of them in `hub_postgres_test.rs`.
 
 The Postgres tests skip when no database is configured — and it is worth being
 precise about what that means: a skipped test reports as **passed**, and cargo
@@ -206,8 +233,10 @@ hides the `SKIP` line unless you pass `--nocapture`. Locally that is fine. For
 CI it is not, so `REMIND_ME_HUB_REQUIRE_POSTGRES=1` turns the skip into a hard
 failure and CI sets it; the environment cannot lose its database and stay
 green. They cover what only a real server can: the legacy migration, `nextval()`-driven `hub_seq`, planner
-estimates, and a differential test that runs one script through **both**
-backends and asserts the pulled records, `/stats` and `/count` match.
+estimates, and the differential test with Postgres among the backends. It
+compares `hub_seq` by order there, not by value: `nextval()` also spends a
+number on a push that loses last-write-wins, so Postgres's sequence has gaps
+the other backends' does not.
 
-CI runs both, plus a `--no-default-features` build so a `postgres::` reference
+CI runs all of these, with and without `multimodal-store`, plus a `--no-default-features` build so a `postgres::` reference
 leaking outside the feature gate cannot go unnoticed.

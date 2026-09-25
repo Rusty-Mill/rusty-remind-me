@@ -23,7 +23,7 @@
 //! - `nextval()`-driven `hub_seq`, including that concurrent pushes cannot
 //!   commit out of sequence order and make a `Seq`-cursor puller skip a row,
 //! - planner estimates, which SQLite answers `None` to,
-//! - and a differential check that both backends agree, which is the only
+//! - and a differential check that every backend agrees, which is the only
 //!   thing that makes the trait more than a hopeful interface.
 #![cfg(feature = "postgres-store")]
 
@@ -32,6 +32,9 @@ use remind_me_hub::store::postgres::PostgresStore;
 use remind_me_hub::store::sqlite::SqliteStore;
 use remind_me_hub::store::{HubStore, PullCursor, PullQuery, COUNTABLE};
 use serde_json::{json, Value};
+
+#[path = "suite/differential.rs"]
+mod differential;
 
 /// Each test gets its own schema-clean database via a unique table prefix is
 /// not possible here, so instead every test drops and recreates the tables it
@@ -288,9 +291,12 @@ fn migrate_is_idempotent() {
     );
 }
 
-/// The check that makes the trait more than a hopeful interface.
+/// The check that makes the trait more than a hopeful interface: the
+/// shared differential script (`suite/differential.rs`) against Postgres,
+/// SQLite, and the embedded engine when the `multimodal-store` feature
+/// builds it.
 #[test]
-fn both_backends_answer_the_same_protocol_identically() {
+fn every_backend_answers_the_same_protocol_identically() {
     let Some(url) = url() else {
         eprintln!("SKIP: REMIND_ME_HUB_TEST_DATABASE_URL is not set");
         return;
@@ -300,98 +306,33 @@ fn both_backends_answer_the_same_protocol_identically() {
     let pg = store(&url);
     let lite = SqliteStore::open_in_memory().expect("sqlite");
     lite.migrate().expect("migrate sqlite");
+    #[cfg_attr(not(feature = "multimodal-store"), allow(unused_mut))]
+    let mut backends: Vec<(&str, &dyn HubStore)> = vec![("postgres", &pg), ("sqlite", &lite)];
 
-    let script: Vec<(Value, &str)> = vec![
-        (memory("m1", "2026-08-05T10:00:00Z"), "node-a"),
-        (memory("m2", "2026-08-05T11:00:00Z"), "node-b"),
-        // An LWW loser.
-        (memory("m1", "2026-08-05T09:00:00Z"), "node-b"),
-        (
-            json!({
-                "record_type": "entity",
-                "id": "e1",
-                "name": "Ada",
-                "aliases": ["Ada"],
-                "created_at": "2026-08-01T00:00:00Z",
-                "updated_at": "2026-08-05T10:00:00Z",
-            }),
-            "node-a",
-        ),
-        (
-            json!({
-                "record_type": "memory_entity",
-                "memory_id": "m1",
-                "entity_id": "e1",
-                "created_at": "2026-08-05T10:00:00Z",
-            }),
-            "node-a",
-        ),
-        (
-            json!({
-                "record_type": "entity_relation",
-                "id": "r1",
-                "subject_entity_id": "e1",
-                "relation": "knows",
-                "object_entity_id": "e2",
-                "created_at": "2026-08-05T10:00:00Z",
-            }),
-            "node-a",
-        ),
-    ];
+    #[cfg(feature = "multimodal-store")]
+    let engine_dir = std::env::temp_dir().join(format!(
+        "remind_me_hub_pg_differential_{}",
+        std::process::id()
+    ));
+    #[cfg(feature = "multimodal-store")]
+    let engine = {
+        let _ = std::fs::remove_dir_all(&engine_dir);
+        remind_me_hub::store::multimodal::MultimodalHubStore::open(&engine_dir)
+            .expect("open the engine store")
+    };
+    #[cfg(feature = "multimodal-store")]
+    backends.push(("multimodal", &engine));
 
-    for (raw, origin) in &script {
-        let parsed = record::parse(raw).expect("well-formed");
-        let pg_applied = pg.apply_record(&parsed, Some(origin)).expect("pg apply");
-        let lite_applied = lite
-            .apply_record(&parsed, Some(origin))
-            .expect("sqlite apply");
-        assert_eq!(
-            pg_applied, lite_applied,
-            "backends disagreed on whether {raw} applied"
-        );
+    // Ranked: Postgres's sequence has gaps where the others have none (see
+    // `SeqComparison`); `hub_multimodal_test` compares the other two exactly.
+    differential::assert_backends_agree(&backends, differential::SeqComparison::Ranked);
+
+    #[cfg(feature = "multimodal-store")]
+    {
+        drop(backends);
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&engine_dir);
     }
-
-    // Memory records must match field for field, hub_seq included.
-    assert_eq!(
-        pull_all(&pg),
-        pull_all(&lite),
-        "the two backends returned different memory records"
-    );
-
-    let graph = remind_me_hub::store::GraphPullQuery {
-        since: remind_me_hub::EPOCH.to_string(),
-        since_id: String::new(),
-        limit: 500,
-    };
-    assert_eq!(
-        pg.pull_links(&graph).unwrap(),
-        lite.pull_links(&graph).unwrap()
-    );
-    assert_eq!(
-        pg.pull_entity_relations(&graph).unwrap(),
-        lite.pull_entity_relations(&graph).unwrap()
-    );
-
-    let entity_query = PullQuery {
-        cursor: PullCursor::Since(remind_me_hub::EPOCH.to_string()),
-        exclude_node: None,
-        full: false,
-        limit: 500,
-    };
-    assert_eq!(
-        pg.pull_entities(&entity_query).unwrap(),
-        lite.pull_entities(&entity_query).unwrap()
-    );
-
-    // And the aggregates.
-    let pg_stats = pg.stats().unwrap();
-    let lite_stats = lite.stats().unwrap();
-    assert_eq!(pg_stats, lite_stats, "the two backends disagreed on /stats");
-    assert_eq!(
-        pg.count_tables(&COUNTABLE).unwrap(),
-        lite.count_tables(&COUNTABLE).unwrap(),
-        "the two backends disagreed on /count"
-    );
 }
 
 /// Concurrent pushes must never let a puller on the `Seq` cursor skip a row.

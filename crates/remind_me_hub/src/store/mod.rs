@@ -1,4 +1,4 @@
-//! The storage interface, and the two backends behind it.
+//! The storage interface, and the backends behind it.
 //!
 //! # Why a trait at all
 //!
@@ -6,12 +6,13 @@
 //! SQLite, and `docs/adr/0015` records why: a hub that cannot take over an
 //! existing Postgres deployment is not a successor, and a hub that *requires*
 //! Postgres is a heavy ask of the single-operator self-host case the SQLite
-//! node already serves happily.
+//! node already serves happily. `docs/adr/0021` adds a third, `multimodal`
+//! (behind the `multimodal-store` feature), which is to replace both.
 //!
 //! # What the trait deliberately does not expose
 //!
 //! No connections, no transactions, no SQL. Every method is one complete
-//! operation, because the two backends differ in exactly the places a leakier
+//! operation, because the backends differ in exactly the places a leakier
 //! interface would have to paper over: sequences (`nextval` vs. `MAX(...)+1`),
 //! upsert syntax, JSONB vs. TEXT-holding-JSON, planner statistics that only
 //! one of them has.
@@ -29,6 +30,9 @@ pub mod sqlite;
 
 #[cfg(feature = "postgres-store")]
 pub mod postgres;
+
+#[cfg(feature = "multimodal-store")]
+pub mod multimodal;
 
 /// Anything that went wrong talking to storage.
 ///
