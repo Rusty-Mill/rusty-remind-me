@@ -2,6 +2,18 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-25 — The SQLite hub no longer reissues a `hub_seq` after tombstone compaction
+
+### Fixed
+- **A node pulling from a SQLite-backed hub could miss a memory written just after a tombstone compaction.** The SQLite store numbered each memory write `MAX(hub_seq)+1`. If `/admin/compact_tombstones` purged the row holding the highest `hub_seq`, the next write was given that same number again. A node whose `since_seq` cursor already sat on it resumes strictly after it, so it never pulled the new row, short of a `full` pull.
+- The store now keeps the highest `hub_seq` it has issued in a one-row `hub_meta` table, written in the same transaction as each memory write and pinned again before compaction deletes anything. The next number is one past the larger of that mark and `MAX(hub_seq)`. Numbering is otherwise unchanged: an LWW loser still consumes no number.
+- `migrate` creates the table and seeds it from the rows present, idempotently, so an existing hub is covered from its first start on this version. A number already reissued before the upgrade cannot be recovered; a node stuck behind one needs a `full` pull.
+- The Postgres store (a real sequence) and the embedded-engine store (its seq floor file) were not affected.
+
+### Provenance
+
+New route-suite test `compacting_the_newest_tombstone_never_reissues_its_hub_seq` runs against SQLite and the engine store. It failed on SQLite before the fix (the node at cursor 2 pulled nothing) and passes after. Two SQLite unit tests cover an upgraded database without `hub_meta` and a repeated `migrate`. `cargo test -p remind_me_hub` passes with and without `multimodal-store`, and clippy with `-D warnings` is clean.
+
 ## 2026-09-25 — The hub gains a third storage backend: the embedded rusty_multimodal_db engine (preview)
 
 ### Added

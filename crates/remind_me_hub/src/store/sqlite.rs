@@ -6,10 +6,12 @@
 //!
 //! # Where SQLite forces a real difference
 //!
-//! - **`hub_seq`.** Postgres has a sequence; SQLite does not. `MAX(hub_seq)+1`
-//!   under the write lock gives the same monotonic property, because SQLite
-//!   serialises writers anyway — the very thing that makes it the weaker
-//!   choice for a busy hub is what makes this safe.
+//! - **`hub_seq`.** Postgres has a sequence; SQLite does not. Issuing
+//!   `MAX(hub_seq, high_water)+1` under the write lock gives the same monotonic
+//!   property, because SQLite serialises writers anyway — the very thing that
+//!   makes it the weaker choice for a busy hub is what makes this safe. The
+//!   `hub_meta.high_water` half is what stops compaction, which deletes rows,
+//!   from letting the number go backwards.
 //! - **JSON columns.** Stored as TEXT holding JSON. The wire format is
 //!   unchanged: [`crate::record`] has already parsed them into `Value`, and
 //!   pulls parse them back out, so a client cannot tell.
@@ -96,6 +98,13 @@ CREATE TABLE IF NOT EXISTS entity_relations (
     origin_node       TEXT
 );
 
+-- The highest hub_seq ever issued, kept apart from `memories` because
+-- compaction deletes rows and MAX(hub_seq) alone would then go backwards.
+CREATE TABLE IF NOT EXISTS hub_meta (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    high_water INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_memories_updated_at_id ON memories (updated_at, id);
 CREATE INDEX IF NOT EXISTS idx_memories_hub_seq ON memories (hub_seq);
 CREATE INDEX IF NOT EXISTS idx_entities_updated_at_id ON entities (updated_at, id);
@@ -156,17 +165,43 @@ fn err(e: rusqlite::Error) -> StoreError {
     StoreError(e.to_string())
 }
 
+/// The highest hub_seq ever issued: the larger of the live rows' maximum and
+/// the recorded high-water mark.
+///
+/// Both halves are needed. `MAX(hub_seq)` alone goes backwards when
+/// compaction deletes the newest row, and a node whose `since_seq` cursor
+/// sits on the reissued number would then never pull the new row. The
+/// high-water mark alone would miss rows written before it existed.
+fn issued_seq(conn: &Connection) -> StoreResult<i64> {
+    conn.query_row(
+        "SELECT MAX(COALESCE((SELECT MAX(hub_seq) FROM memories), 0), \
+                    COALESCE((SELECT high_water FROM hub_meta WHERE id = 1), 0))",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(err)
+}
+
+/// Record `seq` as the high-water mark. Never lowers it.
+fn raise_high_water(conn: &Connection, seq: i64) -> StoreResult<()> {
+    conn.execute(
+        "INSERT INTO hub_meta (id, high_water) VALUES (1, ?1) \
+         ON CONFLICT(id) DO UPDATE SET high_water = MAX(high_water, excluded.high_water)",
+        params![seq],
+    )
+    .map_err(err)?;
+    Ok(())
+}
+
 /// Next value for the hub sequence.
 ///
 /// Safe under the write lock: SQLite serialises writers, so no two
-/// transactions can read the same maximum and both commit.
+/// transactions can read the same maximum and both commit. The caller raises
+/// the high-water mark only once the write lands, in the same transaction, so
+/// an LWW loser burns no number — the numbering stays gap-free, matching the
+/// embedded-engine store (the differential suite compares seqs exactly).
 fn next_seq(conn: &Connection) -> StoreResult<i64> {
-    let current: Option<i64> = conn
-        .query_row("SELECT MAX(hub_seq) FROM memories", [], |row| row.get(0))
-        .optional()
-        .map_err(err)?
-        .flatten();
-    Ok(current.unwrap_or(0) + 1)
+    Ok(issued_seq(conn)? + 1)
 }
 
 fn json_text(value: &Value) -> String {
@@ -285,13 +320,7 @@ impl HubStore for SqliteStore {
                     rows.collect::<rusqlite::Result<Vec<String>>>()
                         .map_err(err)?
                 };
-                let base: i64 = tx
-                    .query_row(
-                        "SELECT COALESCE(MAX(hub_seq), 0) FROM memories",
-                        [],
-                        |row| row.get(0),
-                    )
-                    .map_err(err)?;
+                let base = issued_seq(&tx)?;
                 for (offset, id) in ids.iter().enumerate() {
                     tx.execute(
                         "UPDATE memories SET hub_seq = ?1 WHERE id = ?2",
@@ -301,6 +330,13 @@ impl HubStore for SqliteStore {
                 }
                 tx.commit().map_err(err)?;
             }
+            // Seed (or catch up) the high-water mark from the rows present,
+            // so a hub upgraded from before `hub_meta` existed is protected
+            // from its very first compaction. Idempotent: it never lowers the
+            // mark. A number already reissued before this upgrade cannot be
+            // recovered here; only a `full` pull heals a node stuck on it.
+            let issued = issued_seq(conn)?;
+            raise_high_water(conn, issued)?;
             Ok(())
         })
     }
@@ -393,6 +429,9 @@ impl HubStore for SqliteStore {
                             ],
                         )
                         .map_err(err)?;
+                    if changed > 0 {
+                        raise_high_water(&tx, seq)?;
+                    }
                     changed > 0
                 }
                 Record::Entity(e) => apply_entity(&tx, e, origin)?,
@@ -596,6 +635,11 @@ impl HubStore for SqliteStore {
                     .map_err(err)?
             };
             if !ids.is_empty() {
+                // Pin the high-water mark before the rows that may hold it go.
+                // `next_seq` already keeps it current; this is the backstop for
+                // a mark that somehow lags the rows.
+                let issued = issued_seq(&tx)?;
+                raise_high_water(&tx, issued)?;
                 let placeholders = vec!["?"; ids.len()].join(",");
                 tx.execute(
                     &format!("DELETE FROM memories WHERE id IN ({placeholders})"),
@@ -881,4 +925,86 @@ fn group_counts_with(
         groups.insert(key, count);
     }
     Ok(stable_group_order(groups))
+}
+
+#[cfg(test)]
+mod tests {
+    //! What is only true of this backend. The protocol itself is the route
+    //! suite's (`tests/hub_routes_test.rs`), which runs against this store too.
+
+    use super::*;
+    use crate::record;
+
+    fn memory(id: &str, updated: &str) -> Record {
+        record::parse(&json!({
+            "id": id,
+            "content": format!("content of {id}"),
+            "created_at": "2026-08-01T00:00:00Z",
+            "updated_at": updated,
+        }))
+        .expect("a valid memory")
+    }
+
+    fn seq_of(store: &SqliteStore, id: &str) -> i64 {
+        store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT hub_seq FROM memories WHERE id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .map_err(err)
+            })
+            .expect("the memory exists")
+    }
+
+    #[test]
+    fn a_hub_upgraded_from_before_hub_meta_does_not_reissue_after_compaction() {
+        // A database written by a hub that predates `hub_meta`: two rows,
+        // the newest an expired tombstone, and no high-water mark anywhere.
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    "DROP TABLE hub_meta;
+                     INSERT INTO memories (id, content, created_at, updated_at, hub_seq)
+                         VALUES ('m1', 'a', '2026-08-01T00:00:00Z', '2026-08-01T00:00:00Z', 1);
+                     INSERT INTO memories
+                         (id, content, created_at, updated_at, deleted_at, hub_seq)
+                         VALUES ('m2', 'b', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z',
+                                 '2026-01-01T00:00:00Z', 2);",
+                )
+                .map_err(err)
+            })
+            .unwrap();
+
+        store.migrate().unwrap();
+        assert_eq!(store.compact_tombstones("2026-06-01T00:00:00Z").unwrap(), 1);
+        store
+            .apply_record(&memory("m3", "2026-08-02T00:00:00Z"), None)
+            .unwrap();
+
+        assert_eq!(seq_of(&store, "m3"), 3, "seq 2 was issued once already");
+    }
+
+    #[test]
+    fn migrate_twice_keeps_the_high_water_mark() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        store
+            .apply_record(&memory("m1", "2026-08-01T00:00:00Z"), None)
+            .unwrap();
+        store.migrate().unwrap();
+        store.migrate().unwrap();
+        let mark: i64 = store
+            .with_conn(|conn| {
+                conn.query_row("SELECT high_water FROM hub_meta WHERE id = 1", [], |row| {
+                    row.get(0)
+                })
+                .map_err(err)
+            })
+            .unwrap();
+        assert_eq!(mark, 1);
+    }
 }

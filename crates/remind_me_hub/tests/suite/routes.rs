@@ -812,6 +812,40 @@ fn a_live_memory_is_never_compacted_however_old() {
     assert_eq!(body["count"], 1);
 }
 
+#[test]
+fn compacting_the_newest_tombstone_never_reissues_its_hub_seq() {
+    // A node's since_seq cursor resumes strictly after the last hub_seq it
+    // saw. If compaction purged the row holding the highest seq and the next
+    // write reused that number, a node already at that cursor would never
+    // pull the new row.
+    let store = store();
+    push(&store, "node-a", vec![memory("m1", "2026-08-01T00:00:00Z")]);
+    let mut m2 = memory("m2", "2026-01-01T00:00:00Z");
+    m2["deleted_at"] = json!("2026-01-01T00:00:00Z");
+    push(&store, "node-a", vec![m2]);
+
+    let (_, body) = get(&store, "/sync/pull", "since_seq=0");
+    assert_eq!(body["records"][1]["id"], "m2");
+    let cursor = body["records"][1]["hub_seq"].as_i64().unwrap();
+    assert_eq!(cursor, 2);
+
+    let (_, body) = call(
+        &store,
+        "POST",
+        "/admin/compact_tombstones",
+        "",
+        &json!(null),
+    );
+    assert_eq!(body["purged"], 1, "m2 is the expired tombstone");
+
+    push(&store, "node-a", vec![memory("m3", "2026-08-02T00:00:00Z")]);
+
+    let (_, body) = get(&store, "/sync/pull", &format!("since_seq={cursor}"));
+    assert_eq!(body["count"], 1, "a node at the old cursor must see m3");
+    assert_eq!(body["records"][0]["id"], "m3");
+    assert_eq!(body["records"][0]["hub_seq"], 3);
+}
+
 /// Minimal percent-encoding for the query values these tests build.
 fn urlencode(raw: &str) -> String {
     raw.chars()
