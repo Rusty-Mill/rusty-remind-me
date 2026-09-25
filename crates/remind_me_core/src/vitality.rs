@@ -1,3 +1,4 @@
+use crate::db::feedback::{Feedback, FeedbackEvent};
 use crate::models::{Memory, MemorySearchResult};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, Result};
@@ -194,41 +195,33 @@ pub fn record_feedback(
     signal: FeedbackSignal,
     query: Option<&str>,
 ) -> Result<Option<f64>> {
-    let mut stmt = conn.prepare(
-        // decay_rate is deliberately not selected: at zero elapsed days the
-        // decay factor is exp(0) = 1, so it drops out of the snapshot entirely.
-        "SELECT access_count, base_weight, vitality FROM memories
-         WHERE id = ? AND deleted_at IS NULL",
-    )?;
-    let mut rows = stmt.query([memory_id])?;
-    let Some(row) = rows.next()? else {
+    let feedback = Feedback::new(conn);
+    // decay_rate is deliberately not read: at zero elapsed days the decay
+    // factor is exp(0) = 1, so it drops out of the snapshot entirely.
+    let Some(importance) = feedback.importance(memory_id)? else {
         return Ok(None);
     };
-    let access_count: i64 = row.get(0)?;
-    let base_weight: f64 = row.get(1)?;
-    let vitality: f64 = row.get(2)?;
-    drop(rows);
-    drop(stmt);
+    let access_count = importance.access_count;
+    let base_weight = importance.base_weight;
 
     if let Some(query) = query.filter(|q| !q.trim().is_empty()) {
-        conn.execute(
-            "INSERT INTO memory_feedback
-                (id, memory_id, query, query_tokens, signal, magnitude, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
-            rusqlite::params![
-                format!("fb_{}", uuid::Uuid::new_v4().simple()),
-                memory_id,
-                query,
-                tokenize_query(query).join(" "),
-                match signal {
-                    FeedbackSignal::Helpful => "helpful",
-                    FeedbackSignal::Unhelpful => "unhelpful",
-                },
-                FEEDBACK_MAGNITUDE,
-                Utc::now().to_rfc3339(),
-            ],
+        let event = FeedbackEvent {
+            query_tokens: tokenize_query(query).join(" "),
+            signal: match signal {
+                FeedbackSignal::Helpful => "helpful",
+                FeedbackSignal::Unhelpful => "unhelpful",
+            }
+            .to_string(),
+            magnitude: FEEDBACK_MAGNITUDE,
+        };
+        feedback.log_event(
+            &format!("fb_{}", uuid::Uuid::new_v4().simple()),
+            memory_id,
+            query,
+            &event,
+            &Utc::now().to_rfc3339(),
         )?;
-        return Ok(Some(vitality));
+        return Ok(Some(importance.vitality));
     }
 
     let new_base_weight = match signal {
@@ -243,18 +236,15 @@ pub fn record_feedback(
     // `effective_vitality` applies decay on read.
     let new_vitality = new_base_weight * ((access_count as f64) + 1.0).sqrt();
 
-    conn.execute(
-        "UPDATE memories SET base_weight = ?, vitality = ?, status = ? WHERE id = ?",
-        rusqlite::params![
-            new_base_weight,
-            new_vitality,
-            if is_dormant(new_vitality) {
-                "dormant"
-            } else {
-                "active"
-            },
-            memory_id
-        ],
+    feedback.set_importance(
+        memory_id,
+        new_base_weight,
+        new_vitality,
+        if is_dormant(new_vitality) {
+            "dormant"
+        } else {
+            "active"
+        },
     )?;
 
     Ok(Some(new_vitality))
@@ -298,22 +288,18 @@ pub fn contextual_feedback_adjustment(
     memory_id: &str,
     query: &str,
 ) -> Result<f64> {
-    let mut stmt = conn.prepare(
-        "SELECT query_tokens, signal, magnitude FROM memory_feedback WHERE memory_id = ?",
-    )?;
-    let rows = stmt.query_map([memory_id], |row| {
-        let query_tokens: String = row.get(0)?;
-        let signal: String = row.get(1)?;
-        let magnitude: f64 = row.get(2)?;
-        Ok((query_tokens, signal, magnitude))
-    })?;
+    let events = Feedback::new(conn).events(memory_id)?;
 
     let current_tokens = tokenize_query(query);
     let current_set: HashSet<&str> = current_tokens.iter().map(String::as_str).collect();
 
     let mut total = 0.0;
-    for row in rows {
-        let (query_tokens, signal, magnitude) = row?;
+    for FeedbackEvent {
+        query_tokens,
+        signal,
+        magnitude,
+    } in events
+    {
         let past_set: HashSet<&str> = query_tokens.split(' ').filter(|t| !t.is_empty()).collect();
         let similarity = jaccard(&current_set, &past_set);
         if similarity < FEEDBACK_SIMILARITY_THRESHOLD {

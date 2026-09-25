@@ -21,10 +21,9 @@
 //! `base_weight` alone when the type is right but the weight is not. A third
 //! writer here would duplicate both.
 
-use crate::models::{
-    RecalibrateCandidate, RecalibrateCandidatesInput, RecalibrateCandidatesResult,
-};
-use rusqlite::{params, Connection, Result};
+use crate::db::feedback::{Feedback, ReviewFilter};
+use crate::models::{RecalibrateCandidatesInput, RecalibrateCandidatesResult};
+use rusqlite::{Connection, Result};
 
 /// `base_weight` floor for the "looks important" half of the heuristic.
 ///
@@ -49,36 +48,24 @@ pub const RECALIBRATION_STALE_DAYS: i64 = 90;
 /// returning whole documents.
 const SNIPPET_CHARS: usize = 500;
 
-/// Which memories look important, have gone quiet, and have never been
-/// reviewed.
+/// What makes a memory due for review, from the thresholds above. Shared by
+/// the count and the batch, so the nudge never disagrees with the tool it
+/// points at.
+fn review_filter() -> ReviewFilter<'static> {
+    ReviewFilter {
+        min_base_weight: RECALIBRATION_MIN_BASE_WEIGHT,
+        durable_types: &RECALIBRATION_DURABLE_TYPES,
+        stale_days: RECALIBRATION_STALE_DAYS,
+    }
+}
+
+/// How many memories are due an importance review, without materialising them.
 ///
-/// The three clauses are independent and all required. `base_weight` OR a
-/// durable `memory_type` covers importance from either direction — a memory can
-/// be born important by type without its weight ever moving. The absence of any
-/// `memory_feedback` row stands in for "never actually reviewed", which is the
-/// reference's own stated proxy rather than a claim that feedback is the only
-/// form review takes.
-fn candidate_where() -> String {
-    let types = RECALIBRATION_DURABLE_TYPES
-        .iter()
-        .map(|t| format!("'{}'", t))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        "m.superseded_by IS NULL
-         AND m.deleted_at IS NULL
-         AND (
-             m.base_weight >= {min_weight}
-             OR m.memory_type IN ({types})
-         )
-         AND (julianday('now') - julianday(COALESCE(m.accessed_at, m.created_at))) >= {stale_days}
-         AND NOT EXISTS (
-             SELECT 1 FROM memory_feedback mf WHERE mf.memory_id = m.id
-         )",
-        min_weight = RECALIBRATION_MIN_BASE_WEIGHT,
-        types = types,
-        stale_days = RECALIBRATION_STALE_DAYS
-    )
+/// Reuses [`review_filter`] for the same reason as the contradiction count:
+/// a nudge that disagrees with the tool it points at trains the reader to
+/// ignore it.
+pub fn candidate_count(conn: &Connection) -> Result<i64> {
+    Feedback::new(conn).review_count(&review_filter())
 }
 
 /// A batch of memories whose importance classification may be stale, plus the
@@ -87,62 +74,17 @@ fn candidate_where() -> String {
 /// `total_candidates` is counted rather than derived from the returned batch:
 /// the point of the number is to tell the caller how much is left behind the
 /// `limit`, so it has to come from the same predicate without it.
-/// How many memories are due an importance review, without materialising them.
-///
-/// Reuses [`candidate_where`] for the same reason as the contradiction count:
-/// a nudge that disagrees with the tool it points at trains the reader to
-/// ignore it.
-pub fn candidate_count(conn: &Connection) -> Result<i64> {
-    conn.query_row(
-        &format!(
-            "SELECT COUNT(*) FROM memories m WHERE {}",
-            candidate_where()
-        ),
-        [],
-        |r| r.get(0),
-    )
-}
-
 pub fn candidates(
     conn: &Connection,
     input: &RecalibrateCandidatesInput,
 ) -> Result<RecalibrateCandidatesResult> {
-    let predicate = candidate_where();
-
-    let total: i64 = conn.query_row(
-        &format!("SELECT COUNT(*) FROM memories m WHERE {}", predicate),
-        [],
-        |r| r.get(0),
-    )?;
-
-    let mut stmt = conn.prepare(&format!(
-        "SELECT id, substr(content, 1, {snippet}) AS content_snippet, category,
-                memory_type, base_weight, access_count, accessed_at, created_at
-           FROM memories m
-          WHERE {predicate}
-          ORDER BY m.base_weight DESC, m.accessed_at ASC
-          LIMIT ?",
-        snippet = SNIPPET_CHARS,
-        predicate = predicate
-    ))?;
-
+    let feedback = Feedback::new(conn);
+    let filter = review_filter();
+    let total = feedback.review_count(&filter)?;
     // rusqlite 0.32+ has no `ToSql` for `usize`; a limit past `i64::MAX` is
     // unbounded either way, so saturating is exact rather than a truncation.
     let limit = i64::try_from(input.limit).unwrap_or(i64::MAX);
-    let candidates = stmt
-        .query_map(params![limit], |r| {
-            Ok(RecalibrateCandidate {
-                id: r.get(0)?,
-                content_snippet: r.get(1)?,
-                category: r.get(2)?,
-                memory_type: r.get(3)?,
-                base_weight: r.get(4)?,
-                access_count: r.get(5)?,
-                accessed_at: r.get(6)?,
-                created_at: r.get(7)?,
-            })
-        })?
-        .collect::<Result<Vec<_>>>()?;
+    let candidates = feedback.review_batch(&filter, SNIPPET_CHARS, limit)?;
 
     Ok(RecalibrateCandidatesResult {
         candidates,

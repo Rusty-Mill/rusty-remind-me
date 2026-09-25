@@ -123,7 +123,7 @@ remaining groups gain little until the triggers can move.
 | 1 | Saved searches | `db::saved_searches::SavedSearches` | Done |
 | 2 | Reminders and deliveries | `db::reminders::Reminders` | Done |
 | 3 | Sync bookkeeping | `db::sync_state::SyncState` | Done |
-| 4 | History and feedback | | |
+| 4 | History and feedback | `db::history::Revisions`, `db::feedback::Feedback` | Done |
 | 5 | Stats and analytics | | |
 
 **Step 1.** `saved_searches.rs` keeps the rules: update by name, the id
@@ -170,6 +170,26 @@ with the outbox for its own step:
 - counting pending rows per remote;
 - clearing and backfilling the outbox when sync is toggled;
 - pruning sends.
+
+**Step 4.** `db::history` holds the revision statements:
+- the current tracked columns;
+- inserting, listing and reading revisions;
+- the liveness check;
+- the revert's write-back.
+
+`db::feedback` holds:
+- the importance snapshot and its rewrite;
+- the feedback event log;
+- the recalibration count and batch.
+
+The rules stay in `history.rs`, `vitality.rs` and `recalibrate.rs`: what
+counts as a change, revert semantics, the feedback maths, and the review
+thresholds. The thresholds are now bound as parameters rather than written
+into the SQL text. The 64 existing history, feedback, recalibration and
+vitality-report tests pass unchanged, and a repository test covers the
+review predicate. The rest of `vitality.rs` (access tracking and the
+vitality report) writes the core `memories` columns, so it is not part of
+this step.
 
 ## Related
 

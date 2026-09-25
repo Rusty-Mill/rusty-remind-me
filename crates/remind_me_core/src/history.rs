@@ -28,8 +28,9 @@
 //!   column, never produces one. A vault would otherwise accumulate a revision
 //!   per read.
 
+use crate::db::history::{Revisions, Tracked};
 use crate::models::{MemoryRevision, RevertOutcome};
-use rusqlite::{params, Connection, OptionalExtension, Result};
+use rusqlite::{Connection, Result};
 
 /// Snapshot a memory's current tracked columns before an update overwrites
 /// them.
@@ -52,38 +53,18 @@ pub fn capture_revision(
         return Ok(false);
     }
 
-    let current: Option<(String, String, String, String, Option<i64>)> = conn
-        .query_row(
-            "SELECT content, category, tags, metadata, sensitive
-               FROM memories WHERE id = ?",
-            params![memory_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4).ok())),
-        )
-        .optional()?;
-
-    let Some((content, category, tags, metadata, sensitive)) = current else {
+    let revisions = Revisions::new(conn);
+    let Some(current) = revisions.current(memory_id)? else {
         return Ok(false);
     };
-
-    if !incoming.differs_from(&content, &category, &tags, &metadata, sensitive) {
+    if !incoming.differs_from(&current) {
         return Ok(false);
     }
-
-    conn.execute(
-        "INSERT INTO memory_revisions
-             (memory_id, content, category, tags, metadata, sensitive,
-              edited_at, revision_reason)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        params![
-            memory_id,
-            content,
-            category,
-            tags,
-            metadata,
-            sensitive,
-            chrono::Utc::now().to_rfc3339(),
-            reason,
-        ],
+    revisions.insert(
+        memory_id,
+        &current,
+        &chrono::Utc::now().to_rfc3339(),
+        reason,
     )?;
     Ok(true)
 }
@@ -112,21 +93,20 @@ impl TrackedChanges {
             && self.sensitive.is_none()
     }
 
-    fn differs_from(
-        &self,
-        content: &str,
-        category: &str,
-        tags: &str,
-        metadata: &str,
-        sensitive: Option<i64>,
-    ) -> bool {
-        self.content.as_deref().is_some_and(|v| v != content)
-            || self.category.as_deref().is_some_and(|v| v != category)
-            || self.tags_json.as_deref().is_some_and(|v| v != tags)
-            || self.metadata_json.as_deref().is_some_and(|v| v != metadata)
+    fn differs_from(&self, stored: &Tracked) -> bool {
+        self.content.as_deref().is_some_and(|v| v != stored.content)
+            || self
+                .category
+                .as_deref()
+                .is_some_and(|v| v != stored.category)
+            || self.tags_json.as_deref().is_some_and(|v| v != stored.tags)
+            || self
+                .metadata_json
+                .as_deref()
+                .is_some_and(|v| v != stored.metadata)
             || self
                 .sensitive
-                .is_some_and(|v| v != (sensitive.unwrap_or(0) != 0))
+                .is_some_and(|v| v != stored.sensitive.unwrap_or(false))
     }
 }
 
@@ -137,42 +117,12 @@ impl TrackedChanges {
 /// burst of edits would list in an arbitrary order and the ids a caller passes
 /// to revert would not mean what the list implied.
 pub fn history(conn: &Connection, memory_id: &str, limit: usize) -> Result<Vec<MemoryRevision>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, memory_id, content, category, tags, metadata, sensitive,
-                edited_at, revision_reason
-           FROM memory_revisions
-          WHERE memory_id = ?
-          ORDER BY edited_at DESC, id DESC
-          LIMIT ?",
-    )?;
-    let rows = stmt
-        .query_map(params![memory_id, limit as i64], |r| {
-            Ok(MemoryRevision {
-                id: r.get(0)?,
-                memory_id: r.get(1)?,
-                content: r.get(2)?,
-                category: r.get(3)?,
-                tags: r.get(4)?,
-                metadata: r.get(5)?,
-                sensitive: r.get::<_, Option<i64>>(6)?.map(|v| v != 0),
-                edited_at: r.get(7)?,
-                revision_reason: r.get(8)?,
-            })
-        })?
-        .collect();
-    rows
+    Revisions::new(conn).list(memory_id, limit)
 }
 
 /// Whether a memory exists and is not soft-deleted.
 pub fn memory_is_live(conn: &Connection, memory_id: &str) -> Result<bool> {
-    let found: Option<i64> = conn
-        .query_row(
-            "SELECT 1 FROM memories WHERE id = ? AND deleted_at IS NULL",
-            params![memory_id],
-            |r| r.get(0),
-        )
-        .optional()?;
-    Ok(found.is_some())
+    Revisions::new(conn).is_live(memory_id)
 }
 
 /// Restore a memory's tracked columns to a prior revision.
@@ -194,30 +144,22 @@ pub fn revert(
         return Ok(RevertOutcome::MemoryNotFound);
     }
 
-    let revision: Option<(String, String, String, String, Option<i64>)> = conn
-        .query_row(
-            "SELECT content, category, tags, metadata, sensitive
-               FROM memory_revisions WHERE id = ? AND memory_id = ?",
-            params![revision_id, memory_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4).ok())),
-        )
-        .optional()?;
-
-    let Some((content, category, tags, metadata, sensitive)) = revision else {
+    let revisions = Revisions::new(conn);
+    let Some(mut target) = revisions.revision(memory_id, revision_id)? else {
         return Ok(RevertOutcome::RevisionNotFound);
     };
 
     // A revision captured before the `sensitive` column existed has no value
     // for it. Falling back to "not sensitive" rather than refusing keeps old
     // revisions revertable, which is the whole point of keeping them.
-    let sensitive = sensitive.unwrap_or(0) != 0;
+    target.sensitive = Some(target.sensitive.unwrap_or(false));
 
     let changes = TrackedChanges {
-        content: Some(content.clone()),
-        category: Some(category.clone()),
-        tags_json: Some(tags.clone()),
-        metadata_json: Some(metadata.clone()),
-        sensitive: Some(sensitive),
+        content: Some(target.content.clone()),
+        category: Some(target.category.clone()),
+        tags_json: Some(target.tags.clone()),
+        metadata_json: Some(target.metadata.clone()),
+        sensitive: target.sensitive,
     };
     let stated = reason
         .map(str::to_string)
@@ -231,29 +173,14 @@ pub fn revert(
         return Ok(RevertOutcome::NoChange);
     }
 
-    let now = chrono::Utc::now().to_rfc3339();
-    conn.execute(
-        "UPDATE memories
-            SET content = ?, category = ?, tags = ?, metadata = ?,
-                sensitive = ?, updated_at = ?
-          WHERE id = ?",
-        params![
-            content,
-            category,
-            tags,
-            metadata,
-            sensitive as i64,
-            now,
-            memory_id
-        ],
-    )?;
+    revisions.restore(memory_id, &target, &chrono::Utc::now().to_rfc3339())?;
 
     // Content changed means the stored vectors describe text that is no longer
     // there. Best-effort, like every other embed in this crate: a missing
     // embedder leaves the memory keyword-searchable rather than failing an
     // edit that already committed.
     if let Some(embedder) = crate::embedder::available_embedder() {
-        let _ = crate::vectors::embed_and_store(conn, &*embedder, memory_id, &content);
+        let _ = crate::vectors::embed_and_store(conn, &*embedder, memory_id, &target.content);
     }
 
     Ok(RevertOutcome::Reverted { revision_id })
