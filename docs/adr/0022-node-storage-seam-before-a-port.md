@@ -1,6 +1,6 @@
 # ADR-0022: A storage seam in the node before any storage port
 
-Status: Proposed
+Status: Accepted (2026-09-25)
 Date: 2026-09-25
 
 ## Context
@@ -47,7 +47,7 @@ not cover the parts that make moving the node hard, because those are in
 SQL and shared with Python. That is the speculative generality this project's
 Tenet 2 warns against, applied to interfaces instead of dependencies.
 
-## Decision (proposed)
+## Decision
 
 **Build a seam, not a port.** Gather each table group's SQL behind a concrete
 repository type in `remind_me_core::db`. Extract traits only when a second
@@ -115,6 +115,26 @@ remaining groups gain little until the triggers can move.
   shown what it needs.
 - **Move change capture out of triggers first.** This is where the real
   difficulty is, but it breaks Python sync the moment it ships.
+
+## Progress
+
+| Step | Table group | Repository | State |
+|---|---|---|---|
+| 1 | Saved searches | `db::saved_searches::SavedSearches` | Done |
+| 2 | Reminder deliveries | | |
+| 3 | Sync bookkeeping | | |
+| 4 | History and feedback | | |
+| 5 | Stats and analytics | | |
+
+**Step 1.** `saved_searches.rs` keeps the rules: update by name, the id
+derived from the name, seeding a first poll, and diffing seen matches. All
+of its SQL moved to `db::saved_searches`. Its public functions keep their
+signatures, so the API and MCP callers did not change. The 12 existing
+saved-search tests pass unchanged, and the repository has 3 tests of its
+own:
+- an update keeps the stored name and `created_at`;
+- malformed `filters` JSON reads as empty;
+- `mark_seen` keeps the first sighting.
 
 ## Related
 

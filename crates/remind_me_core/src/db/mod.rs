@@ -1,5 +1,6 @@
 pub mod migrations;
 pub mod queries;
+pub mod saved_searches;
 pub mod schema;
 
 use parking_lot::{Mutex, MutexGuard};
