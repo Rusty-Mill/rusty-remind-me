@@ -209,9 +209,12 @@ in one pass (`MultimodalHubStore::create_from_snapshot`).
   - A row that does not parse is reported, not dropped.
 - **Where `hub_seq` starts.** A memory with no `hub_seq` gets one in
   `(updated_at, id)` order, as the stores' own `migrate` backfills them. The
-  counter starts above the source's high-water mark: for Postgres, the
-  sequence's `last_value`, which can be above every remaining row. A test
-  shows the next write gets the same `hub_seq` on the copy as on the source.
+  counter starts above the source's high-water mark, which can be above
+  every remaining row: for Postgres, the sequence's `last_value`; for
+  SQLite, the `hub_meta` mark it has kept since it stopped reissuing a
+  compacted `hub_seq`. Tests for both show the next write gets the same
+  `hub_seq` on the copy as on the source, including after the source
+  compacted away its newest row.
 - **The Postgres reader is behind `postgres-import`, not `postgres-store`,**
   so it outlives the Postgres store (decision 6).
 - **The copy refuses rather than drops.** Ids the engine cannot hold, and two

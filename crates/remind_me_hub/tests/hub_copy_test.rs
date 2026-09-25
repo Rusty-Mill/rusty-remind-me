@@ -118,6 +118,36 @@ fn a_copied_sqlite_hub_answers_every_read_as_the_source_did() {
 }
 
 #[test]
+fn a_copy_never_reissues_a_hub_seq_the_source_compacted_away() {
+    // The SQLite store remembers the highest hub_seq it issued in
+    // `hub_meta`, above every remaining row once compaction purged the
+    // newest. The copy must start above that mark too, or a node whose
+    // cursor sits on the purged number never pulls the copy's next write.
+    let dir = Scratch::new("high_water");
+    let lite = sqlite_hub(&dir.path("hub.db"));
+    lite.apply_record(&memory("m1", "2026-08-02T00:00:00Z"), None)
+        .unwrap();
+    let doomed = record::parse(&json!({
+        "id": "m2",
+        "content": "gone",
+        "created_at": "2026-08-01T00:00:00Z",
+        "updated_at": "2026-08-02T00:00:00Z",
+        "deleted_at": "2026-08-02T00:00:00Z",
+    }))
+    .unwrap();
+    lite.apply_record(&doomed, None).unwrap();
+    assert_eq!(lite.compact_tombstones("2026-09-01T00:00:00Z").unwrap(), 1);
+    assert_eq!(last_seq(&lite), 1, "the row holding hub_seq 2 is gone");
+
+    let engine = copy(&dir.path("hub.db"), &dir.path("engine"));
+    let next = memory("after-copy", "2026-09-01T00:00:00Z");
+    assert!(lite.apply_record(&next, None).unwrap());
+    assert!(engine.apply_record(&next, None).unwrap());
+    assert_eq!(last_seq(&lite), 3);
+    assert_eq!(last_seq(&engine), 3, "the copy reissued a purged hub_seq");
+}
+
+#[test]
 fn ids_the_engine_cannot_store_are_listed_and_never_copied_silently() {
     let dir = Scratch::new("invalid");
     let lite = sqlite_hub(&dir.path("hub.db"));

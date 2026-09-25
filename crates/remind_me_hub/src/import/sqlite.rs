@@ -36,24 +36,42 @@ pub fn read(path: &Path) -> StoreResult<Snapshot> {
         entities: table(&tx, "entities")?,
         links: table(&tx, "memory_entities")?,
         relations: table(&tx, "entity_relations")?,
-        // SQLite keeps no sequence: its highest `hub_seq` is its rows' own.
-        seq_high_water: 0,
+        seq_high_water: high_water(&tx)?,
     };
     tx.finish().map_err(err)?;
     Ok(raw.into_snapshot())
 }
 
+fn table_exists(conn: &Connection, name: &str) -> StoreResult<bool> {
+    conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        [name],
+        |row| row.get(0),
+    )
+    .map_err(err)
+}
+
+/// The highest `hub_seq` the SQLite store has issued, from its `hub_meta`
+/// table. It can be above every remaining row: compaction deletes rows,
+/// the newest included. Zero for a database from before `hub_meta`
+/// existed, whose rows' own highest `hub_seq` is the mark, and which
+/// [`RawTables::into_snapshot`] takes into account anyway.
+fn high_water(conn: &Connection) -> StoreResult<i64> {
+    if !table_exists(conn, "hub_meta")? {
+        return Ok(0);
+    }
+    conn.query_row(
+        "SELECT COALESCE((SELECT high_water FROM hub_meta WHERE id = 1), 0)",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(err)
+}
+
 /// Every row of `name` as a column-keyed JSON object, or none if the table
 /// does not exist.
 fn table(conn: &Connection, name: &str) -> StoreResult<Vec<Map<String, Value>>> {
-    let exists: bool = conn
-        .query_row(
-            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
-            [name],
-            |row| row.get(0),
-        )
-        .map_err(err)?;
-    if !exists {
+    if !table_exists(conn, name)? {
         return Ok(Vec::new());
     }
     // `name` is one of four literals above, never input.

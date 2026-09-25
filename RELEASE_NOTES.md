@@ -28,7 +28,7 @@ With one pusher, the engine manages 1893 pushes/s against SQLite's 828. The full
 
 ### Added
 - **`rusty-remind-me-hub-copy`** (feature `multimodal-store`). Phase 3 of ADR-0021. It copies a SQLite hub (`--from-sqlite PATH`) or a Postgres hub (`--from-postgres`, which reads `DATABASE_URL`) into a new embedded-engine data directory.
-- **Every `hub_seq` and `origin_node` is kept exactly**, so nodes carry on from their cursors. The next `hub_seq` starts above the highest the source ever issued. For Postgres that is the sequence's last value, which can be above every remaining row.
+- **Every `hub_seq` and `origin_node` is kept exactly**, so nodes carry on from their cursors. The next `hub_seq` starts above the highest the source ever issued. That can be above every remaining row. For Postgres it is the sequence's last value, and for SQLite the mark it keeps in `hub_meta`.
 - **Rows the engine cannot store are listed, and nothing is written**: ids over 64 bytes or holding NUL, and rows that do not parse. `--check` lists them without writing; `--drop-invalid` copies everything else.
 - **After writing, the tool reads every row back and compares it with the source.**
 - **The source is only ever read.** SQLite is opened read-only. Postgres is read in one repeatable-read, read-only transaction. A legacy Python-hub database (`TIMESTAMPTZ` columns) is read as it stands, not migrated.
@@ -41,7 +41,20 @@ New tests:
 - In `hub_postgres_test.rs`, two cases:
   - a Postgres hub with `hub_seq` gaps copies exactly, and the next write gets the same `hub_seq` on both;
   - a legacy database copies to exactly what the Postgres store's own in-place migration makes of it.
+- In `hub_copy_test.rs`, a SQLite hub that compacted away its newest row: the copy's next write gets the same `hub_seq` as the source's. It failed (2 against 3) before the SQLite reader read `hub_meta`.
 - A mutation check: when the copy ignores the sequence's high-water mark, the gap test fails.
+
+## 2026-09-25 — The SQLite hub no longer reissues a `hub_seq` after tombstone compaction
+
+### Fixed
+- **A node pulling from a SQLite-backed hub could miss a memory written just after a tombstone compaction.** The SQLite store numbered each memory write `MAX(hub_seq)+1`. If `/admin/compact_tombstones` purged the row holding the highest `hub_seq`, the next write was given that same number again. A node whose `since_seq` cursor already sat on it resumes strictly after it, so it never pulled the new row, short of a `full` pull.
+- The store now keeps the highest `hub_seq` it has issued in a one-row `hub_meta` table, written in the same transaction as each memory write and pinned again before compaction deletes anything. The next number is one past the larger of that mark and `MAX(hub_seq)`. Numbering is otherwise unchanged: an LWW loser still consumes no number.
+- `migrate` creates the table and seeds it from the rows present, idempotently, so an existing hub is covered from its first start on this version. A number already reissued before the upgrade cannot be recovered; a node stuck behind one needs a `full` pull.
+- The Postgres store (a real sequence) and the embedded-engine store (its seq floor file) were not affected.
+
+### Provenance
+
+New route-suite test `compacting_the_newest_tombstone_never_reissues_its_hub_seq` runs against SQLite and the engine store. It failed on SQLite before the fix (the node at cursor 2 pulled nothing) and passes after. Two SQLite unit tests cover an upgraded database without `hub_meta` and a repeated `migrate`. `cargo test -p remind_me_hub` passes with and without `multimodal-store`, and clippy with `-D warnings` is clean.
 
 ## 2026-09-25 — The hub gains a third storage backend: the embedded rusty_multimodal_db engine (preview)
 

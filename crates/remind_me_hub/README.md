@@ -108,7 +108,8 @@ DATABASE_URL=postgresql://… rusty-remind-me-hub-copy --from-postgres --to ./hu
 - **Every `hub_seq` and `origin_node` is kept**, so nodes carry on from their
   cursors and `exclude_node` still means what it did. The next `hub_seq` is
   issued above the highest the source ever handed out, not only above its
-  remaining rows: for Postgres that is the sequence's last value.
+  remaining rows: for Postgres that is the sequence's last value, for SQLite
+  the mark it keeps in `hub_meta`.
 - **Rows the engine cannot store are listed, and nothing is written**: ids
   over 64 bytes or holding NUL, and rows the reader could not parse. `--check`
   lists them without writing; `--drop-invalid` copies everything else.
