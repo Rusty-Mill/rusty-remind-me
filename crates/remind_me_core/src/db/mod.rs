@@ -5,6 +5,7 @@ pub mod queries;
 pub mod reminders;
 pub mod saved_searches;
 pub mod schema;
+pub mod stats;
 pub mod sync_state;
 
 use parking_lot::{Mutex, MutexGuard};

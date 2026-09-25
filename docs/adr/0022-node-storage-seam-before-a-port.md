@@ -124,7 +124,7 @@ remaining groups gain little until the triggers can move.
 | 2 | Reminders and deliveries | `db::reminders::Reminders` | Done |
 | 3 | Sync bookkeeping | `db::sync_state::SyncState` | Done |
 | 4 | History and feedback | `db::history::Revisions`, `db::feedback::Feedback` | Done |
-| 5 | Stats and analytics | | |
+| 5 | Stats and analytics | `db::stats::StoreStats` | Done |
 
 **Step 1.** `saved_searches.rs` keeps the rules: update by name, the id
 derived from the name, seeding a first poll, and diffing seen matches. All
@@ -190,6 +190,36 @@ vitality-report tests pass unchanged, and a repository test covers the
 review predicate. The rest of `vitality.rs` (access tracking and the
 vitality report) writes the core `memories` columns, so it is not part of
 this step.
+
+**Step 5.** `db::stats` holds:
+- the live-memory, import, grouped and tag counts;
+- the recent-memories list;
+- `storage_info()`, which replaces the `PRAGMA database_list`, `page_count`,
+  `page_size` and `user_version` reads in `stats.rs` and `status.rs`;
+- the analytics snapshot lookup, insert and series.
+
+`analytics.rs` had its own copy of the category count, and now uses the
+shared one. The report shapes, the rounding, and the rule of one snapshot
+per calendar day stay in `stats.rs`, `status.rs` and `analytics.rs`. The
+maintenance queue counts (`maintenance.rs`) define the curation backlogs
+and mirror the batch queries of decompose, annotate, normalize and
+classify, so they belong with that group rather than here.
+
+### Where this leaves the node (2026-09-25)
+
+The five planned steps are done. By the stop criterion, the remaining
+groups wait for a plan on the Python side:
+- core memory CRUD and search;
+- the outbox;
+- vectors;
+- entities;
+- wiki;
+- imports;
+- curation.
+
+Five table groups now have one home each for their SQL. No behaviour,
+schema or public signature changed along the way, and the full core, API
+and MCP test suites passed after every step.
 
 ## Related
 

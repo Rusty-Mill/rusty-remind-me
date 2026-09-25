@@ -31,6 +31,7 @@
 
 use crate::backup::{backup_dir, list_backups, BackupInfo};
 use crate::db::migrations::SCHEMA_VERSION;
+use crate::db::stats::StoreStats;
 use rusqlite::{Connection, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -103,15 +104,6 @@ pub struct ServerStatus {
     pub watchdog: crate::watchdog::WatchdogStatus,
 }
 
-fn database_file(conn: &Connection) -> Result<Option<PathBuf>> {
-    let path: String = conn.query_row("PRAGMA database_list", [], |row| row.get(2))?;
-    Ok(if path.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(path))
-    })
-}
-
 /// Collect the status snapshot.
 ///
 /// Reports only what this crate actually has. Subsystems it lacks are named
@@ -119,19 +111,17 @@ fn database_file(conn: &Connection) -> Result<Option<PathBuf>> {
 /// "not running" for something that was never built is the hollow-stub failure
 /// mode, and it makes a real outage indistinguishable from an absent feature.
 pub fn server_status(conn: &Connection) -> Result<ServerStatus> {
-    let database_path = database_file(conn)?;
+    let stats = StoreStats::new(conn);
+    let info = stats.storage_info()?;
+    let database_path: Option<PathBuf> = info.path;
     let database_exists = database_path.as_ref().map(|p| p.exists()).unwrap_or(true); // in-memory: it exists, it just has no file
     let database_bytes = database_path
         .as_ref()
         .and_then(|p| std::fs::metadata(p).ok())
         .map(|m| m.len());
 
-    let schema_version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    let memory_count: i64 = conn.query_row(
-        "SELECT count(*) FROM memories WHERE deleted_at IS NULL",
-        [],
-        |row| row.get(0),
-    )?;
+    let schema_version = info.schema_version;
+    let memory_count = stats.live_memories()?;
 
     // An in-memory database has no directory to hold backups, so this is
     // absent rather than empty.

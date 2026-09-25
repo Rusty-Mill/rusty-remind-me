@@ -1,6 +1,7 @@
 //! Memory-store statistics, shared by the MCP tool, the MCP resource, and the
 //! HTTP route so the three cannot drift apart.
 
+use crate::db::stats::{GroupBy, StorageInfo, StoreStats};
 use rusqlite::{Connection, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -66,39 +67,21 @@ pub struct DashboardStats {
 /// How many recent memories the reference includes.
 const RECENT_LIMIT: usize = 5;
 
-fn count_by(conn: &Connection, column: &str) -> Result<BTreeMap<String, i64>> {
-    // `column` is never caller-supplied — it is one of the two literals below.
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {0}, count(*) FROM memories WHERE deleted_at IS NULL GROUP BY {0}",
-        column
-    ))?;
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-    })?;
-
-    let mut counts = BTreeMap::new();
-    for row in rows {
-        let (key, count) = row?;
-        counts.insert(key, count);
-    }
-    Ok(counts)
-}
-
 /// Size of the main database in MiB, rounded to two decimals.
 ///
 /// Derived from SQLite's own page accounting rather than a filesystem `stat`,
 /// so it is correct for an in-memory database too — where there is no file to
 /// stat and the reference would report 0.
-fn db_size_mb(conn: &Connection) -> Result<f64> {
-    let page_count: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
-    let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
-    let bytes = (page_count * page_size) as f64;
-    Ok((bytes / 1_048_576.0 * 100.0).round() / 100.0)
+fn size_mb(info: &StorageInfo) -> f64 {
+    (info.size_bytes as f64 / 1_048_576.0 * 100.0).round() / 100.0
 }
 
 /// Path of the main database, or an empty string for an in-memory one.
-fn db_path(conn: &Connection) -> Result<String> {
-    conn.query_row("PRAGMA database_list", [], |row| row.get::<_, String>(2))
+fn path_text(info: &StorageInfo) -> String {
+    info.path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default()
 }
 
 /// Collect statistics for the whole memory store.
@@ -108,87 +91,38 @@ fn db_path(conn: &Connection) -> Result<String> {
 /// was actually unreadable — `CONTRIBUTING.md` §2 forbids swallowing failures
 /// that way.
 pub fn collect(conn: &Connection) -> Result<Stats> {
-    let total_memories: i64 = conn.query_row(
-        "SELECT count(*) FROM memories WHERE deleted_at IS NULL",
-        [],
-        |r| r.get(0),
-    )?;
-    let total_imports: i64 =
-        conn.query_row("SELECT count(*) FROM chat_imports", [], |r| r.get(0))?;
-
-    let mut stmt = conn.prepare(
-        "SELECT id, category, substr(content, 1, 80), created_at
-         FROM memories WHERE deleted_at IS NULL
-         ORDER BY created_at DESC, id DESC LIMIT ?",
-    )?;
-    let rows = stmt.query_map([RECENT_LIMIT as i64], |row| {
-        Ok(RecentMemory {
-            id: row.get(0)?,
-            category: row.get(1)?,
-            preview: row.get(2)?,
-            created_at: row.get(3)?,
-        })
-    })?;
-    let mut recent = Vec::new();
-    for row in rows {
-        recent.push(row?);
-    }
-
+    let stats = StoreStats::new(conn);
+    let info = stats.storage_info()?;
     Ok(Stats {
-        total_memories,
-        total_imports,
-        categories: count_by(conn, "category")?,
-        sources: count_by(conn, "source")?,
-        recent,
-        db_path: db_path(conn)?,
-        db_size_mb: db_size_mb(conn)?,
+        total_memories: stats.live_memories()?,
+        total_imports: stats.imports()?,
+        categories: stats.count_by(GroupBy::Category)?,
+        sources: stats.count_by(GroupBy::Source)?,
+        recent: stats.recent(RECENT_LIMIT as i64)?,
+        db_path: path_text(&info),
+        db_size_mb: size_mb(&info),
     })
 }
 
 /// Collect statistics in the dashboard's own shape ([`DashboardStats`]),
 /// not the MCP tool's ([`Stats`]) — see that struct's doc for why the two
-/// differ. Reuses [`count_by`]/[`db_path`]/[`db_size_mb`] rather than
+/// differ. Reuses the same repository queries and [`path_text`]/[`size_mb`] rather than
 /// re-deriving them, so the counts cannot disagree with [`collect`]'s.
 pub fn collect_dashboard(conn: &Connection) -> Result<DashboardStats> {
-    let total: i64 = conn.query_row(
-        "SELECT count(*) FROM memories WHERE deleted_at IS NULL",
-        [],
-        |r| r.get(0),
-    )?;
-    let imports: i64 = conn.query_row("SELECT count(*) FROM chat_imports", [], |r| r.get(0))?;
-
+    let stats = StoreStats::new(conn);
+    let info = stats.storage_info()?;
     Ok(DashboardStats {
-        total,
-        imports,
-        categories: count_by(conn, "category")?,
-        sources: count_by(conn, "source")?,
-        tags: tag_counts(conn)?,
-        db_path: db_path(conn)?,
-        db_size_mb: db_size_mb(conn)?,
+        total: stats.live_memories()?,
+        imports: stats.imports()?,
+        categories: stats.count_by(GroupBy::Category)?,
+        sources: stats.count_by(GroupBy::Source)?,
+        // Via the normalized `memory_tags` index rather than parsing every
+        // row's JSON `tags` column (the reference's own approach): the tag
+        // triggers keep the two in step, and it avoids a `json_each` scan.
+        tags: stats.count_by_tag()?,
+        db_path: path_text(&info),
+        db_size_mb: size_mb(&info),
     })
-}
-
-/// Tag -> live-memory count, via the normalized `memory_tags` index rather
-/// than parsing every row's JSON `tags` column (the reference's own
-/// approach) — `memory_tags` is kept in step with that column by the
-/// `memories_tags_ai`/`_au`/`_ad` triggers (`db/queries.rs`'s `list_filters`
-/// doc), so the two cannot drift, and this avoids a per-row `json_each` scan.
-fn tag_counts(conn: &Connection) -> Result<BTreeMap<String, i64>> {
-    let mut stmt = conn.prepare(
-        "SELECT mt.tag, count(*) FROM memory_tags mt
-         JOIN memories m ON m.id = mt.memory_id
-         WHERE m.deleted_at IS NULL
-         GROUP BY mt.tag",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-    })?;
-    let mut counts = BTreeMap::new();
-    for row in rows {
-        let (tag, count) = row?;
-        counts.insert(tag, count);
-    }
-    Ok(counts)
 }
 
 /// Render the stats snapshot the way the reference's `remind_me_stats`
