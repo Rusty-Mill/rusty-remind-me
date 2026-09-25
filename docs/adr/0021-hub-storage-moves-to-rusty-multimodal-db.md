@@ -255,8 +255,44 @@ load is a few records a minute, and a node's first full sync of 20 000
 memories takes about 20 s. The real fix is batching a push under one sync,
 which needs an engine batch-insert API. That is a follow-up, not a gate.
 
-Still to do in phase 3: switch the default, then remove the old stores a
-release later.
+### The default switch
+
+The engine is now the default store for a new hub:
+
+- `remind_me_hub`'s default features gain `postgres-import`, which brings in
+  the engine and the copy tool. `postgres-store` stays in the defaults.
+- `setup.sh install` installs the engine unless given `--postgres` or
+  `--sqlite`.
+- `deploy/docker-compose.engine.yml` is the documented default for Compose.
+- The image and the release archives ship `rusty-remind-me-hub-copy`.
+
+Existing deployments are left alone on purpose:
+
+- `setup.sh` takes the backend from an existing `hub.env`, and refuses a flag
+  that contradicts it. Re-running `install` on a Postgres hub would otherwise
+  swap its units for the single-container one and strand its database.
+- The existing `docker-compose.yml` stays on Postgres, since a changed default
+  there would bring up an empty hub on the next `docker compose up`.
+- Fly and Railway stay on managed Postgres.
+
+Building the default found that every container path had been broken since
+the monorepo import. The Containerfile, `setup.sh` and every template built
+from `crates/apps/rusty_remind_me`, which holds no workspace manifest. Two
+fixes:
+
+- They now build from the monorepo root, with BuildKit cache mounts in place
+  of the standalone repo's stub-manifest trick.
+- The image now creates `/data` owned by the hub user. Otherwise a Compose
+  named volume came up root-owned and the hub could not create its store. The
+  existing SQLite Compose file had the same latent problem.
+
+The image was built and run end to end:
+- the engine on a fresh named volume;
+- the health check;
+- a restart;
+- the copy tool moving a SQLite hub onto the engine.
+
+Still to do in phase 3: remove the old stores a release later.
 
 ## Related
 

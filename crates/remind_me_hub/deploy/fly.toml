@@ -4,7 +4,7 @@
 # `fly postgres attach` — that's what supplies the DATABASE_URL secret below,
 # so it isn't set in this file. SYNC_SECRET is a plain secret you generate.
 #
-# Quick start (run from the WORKSPACE ROOT, three levels up from this file —
+# Quick start (run from the MONOREPO ROOT, six levels up from this file —
 # the Containerfile's context must be the workspace, since the hub is one
 # crate in it and the build needs the root Cargo.toml and Cargo.lock. This is
 # the one place the Rust hub's packaging differs materially from the Python
@@ -14,8 +14,8 @@
 #   fly apps create remind-me-hub
 #   fly postgres attach remind-me-db -a remind-me-hub   # sets DATABASE_URL
 #   fly secrets set SYNC_SECRET=$(openssl rand -hex 32) -a remind-me-hub
-#   fly deploy --config crates/remind_me_hub/deploy/fly.toml \
-#              --dockerfile crates/remind_me_hub/Containerfile
+#   fly deploy --config crates/apps/rusty_remind_me/crates/remind_me_hub/deploy/fly.toml \
+#              --dockerfile crates/apps/rusty_remind_me/crates/remind_me_hub/Containerfile
 #
 # No [[services]]/http_service block below on purpose: the hub is reached over
 # Fly's private 6PN network (WireGuard peer, or a Tailscale-to-Fly bridge) at
@@ -25,17 +25,19 @@
 # Add your own [[services]] block only if you specifically want a public HTTPS
 # endpoint, and put real TLS + rate limiting in front of it if you do.
 #
-# SQLite on Fly: possible with a Fly Volume mounted at /data and
-# REMIND_ME_HUB_DB_PATH=/data/hub.db, but think before you do. A Fly Volume is
-# pinned to one machine, so the app cannot scale past a single instance and a
-# host failure takes the hub offline until it returns. Managed Postgres is the
-# better fit for anything you would deploy to Fly in the first place.
+# The embedded engine or SQLite on Fly: possible with a Fly Volume mounted at
+# /data and REMIND_ME_HUB_DATA_DIR=/data/hub (or REMIND_ME_HUB_DB_PATH=/data/
+# hub.db) in place of the DATABASE_URL secret, but think before you do. A Fly
+# Volume is pinned to one machine, so the app cannot scale past a single
+# instance and a host failure takes the hub offline until it returns. Managed
+# Postgres stays this template's store, even though the engine is the default
+# for a self-hosted hub (docs/adr/0021).
 
 app = "remind-me-hub"
 primary_region = "iad" # change to your nearest Fly region
 
 [build]
-  dockerfile = "crates/remind_me_hub/Containerfile"
+  dockerfile = "crates/apps/rusty_remind_me/crates/remind_me_hub/Containerfile"
 
 [[vm]]
   # Smaller than the Python hub's 256mb: this image is a ~30 MB static-ish

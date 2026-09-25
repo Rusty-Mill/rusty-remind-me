@@ -10,19 +10,23 @@ SQLite. A client cannot tell a hub from a peer, which is the point.
 
 ## Quick start
 
-Rootless Podman, with Postgres:
+Rootless Podman, one container, no database server (the embedded engine):
 
 ```sh
 crates/remind_me_hub/setup.sh install
 ```
 
-One container, no database server:
+With Postgres in a second container, or on SQLite instead:
 
 ```sh
+crates/remind_me_hub/setup.sh --postgres install
 crates/remind_me_hub/setup.sh --sqlite install
 ```
 
-Either prints the generated `SYNC_SECRET` that clients need. Then, on each
+Each prints the generated `SYNC_SECRET` that clients need. Re-running
+`install` on a machine that already has a hub keeps that hub's store: an
+existing `~/remind-me-hub/hub.env` decides, whatever the default or the flags
+say. Then, on each
 client machine:
 
 ```sh
@@ -61,7 +65,7 @@ REMIND_ME_HUB_DB_PATH=./hub.db \
 | `SYNC_SECRET` | — | Shared bearer token. **Required**; the hub refuses to start without it. |
 | `DATABASE_URL` | — | Postgres connection string. Selects the Postgres backend. |
 | `REMIND_ME_HUB_DB_PATH` | — | SQLite file. Selects the SQLite backend. |
-| `REMIND_ME_HUB_DATA_DIR` | — | Data directory. Selects the embedded-engine backend (built with `--features multimodal-store`). |
+| `REMIND_ME_HUB_DATA_DIR` | — | Data directory. Selects the embedded-engine backend, the default for a new hub. |
 | `REMIND_ME_HUB_COMPACT_INTERVAL_SECS` | `3600` | How often the embedded-engine backend folds its insert logs. |
 | `REMIND_ME_HUB_BIND` | `127.0.0.1` | Listen address. The image sets `0.0.0.0`. |
 | `REMIND_ME_HUB_PORT` | `8765` | Listen port. |
@@ -74,19 +78,24 @@ Exactly one of `DATABASE_URL`, `REMIND_ME_HUB_DB_PATH` and
 — a hub that quietly created an empty SQLite file because `DATABASE_URL` was
 misspelled would look healthy while serving nothing.
 
-### The embedded-engine backend (preview)
+### The embedded-engine backend (the default)
 
 `REMIND_ME_HUB_DATA_DIR` runs the hub on `rusty_multimodal_db`'s storage engine
 in-process (`docs/adr/0021`): one data directory, no database server. It is
-behind the `multimodal-store` feature and off by default until a copy tool can
-move an existing hub onto it. Compared with SQLite it:
+built in by default (the `multimodal-store` feature, through
+`postgres-import`), and `setup.sh` and `deploy/docker-compose.engine.yml` use
+it for a new hub. The Postgres and SQLite stores are still built in, and
+existing deployments keep using them; they are removed in a later release.
+Compared with SQLite it:
 
 - keeps the whole dataset in memory, and writes each change to a per-table
   insert log that is `fsync`'d before the push returns;
 - refuses ids over 64 bytes or containing a NUL byte. Such a record counts as
   `failed` and stays in the sender's outbox;
-- makes pulls wait while a push is being written, where SQLite in WAL mode
-  lets them run alongside;
+- makes a pull wait for at most one push being written. Pulls are faster than
+  SQLite's under push load (3 ms against 27 ms median in
+  `examples/pull_latency.rs`); contended pushes are slower, since each write
+  syncs twice;
 - folds the insert logs every `REMIND_ME_HUB_COMPACT_INTERVAL_SECS`, and on
   every `/admin/compact_tombstones`;
 - locks its data directory, so a second hub pointed at it refuses to start.
@@ -97,8 +106,10 @@ move an existing hub onto it. Compared with SQLite it:
 `rusty-remind-me-hub-copy` copies a SQLite or Postgres hub into a new data
 directory. Stop the hub first; the source is only ever read.
 
+The tool ships in the hub image and in the release archives. From source:
+
 ```sh
-cargo build -p remind_me_hub --features postgres-import --bin rusty-remind-me-hub-copy
+cargo build -p remind_me_hub --bin rusty-remind-me-hub-copy
 
 rusty-remind-me-hub-copy --from-sqlite ./hub.db --to ./hub-data --check
 rusty-remind-me-hub-copy --from-sqlite ./hub.db --to ./hub-data
@@ -119,6 +130,25 @@ DATABASE_URL=postgresql://… rusty-remind-me-hub-copy --from-postgres --to ./hu
   row back and compares it with the source.
 - **`--from-postgres` reads `DATABASE_URL`**, so the password never appears
   on the command line.
+
+A `setup.sh` hub on SQLite moves over like this. The volume is the one its
+unit already mounts, so the copy lands beside the old file, which stays as it
+was:
+
+```sh
+systemctl --user stop remind-me-hub
+podman run --rm -v ~/remind-me-hub/data:/data:Z,U localhost/remind-me-hub \
+    rusty-remind-me-hub-copy --from-sqlite /data/hub.db --to /data/hub
+sed -i 's|^REMIND_ME_HUB_DB_PATH=.*|REMIND_ME_HUB_DATA_DIR=/data/hub|' ~/remind-me-hub/hub.env
+systemctl --user start remind-me-hub
+```
+
+A Postgres hub does the same with `--from-postgres`, run on the `remind-me`
+network with `DATABASE_URL` from its `hub.env`
+(`podman run --rm --network remind-me --env-file ~/remind-me-hub/hub.env ...`).
+Then install `deploy/remind-me-hub-standalone.container` in place of the two
+Postgres units, and replace `DATABASE_URL` in `hub.env` with
+`REMIND_ME_HUB_DATA_DIR`.
 
 ## Routes
 
@@ -244,8 +274,7 @@ can miss a delete, the same accepted gap the client-side compaction lives with.
 ## Testing
 
 ```sh
-cargo test -p remind_me_hub                       # SQLite; Postgres tests skip
-cargo test -p remind_me_hub --features multimodal-store  # plus the embedded engine
+cargo test -p remind_me_hub                       # the engine and SQLite; Postgres tests skip
 REMIND_ME_HUB_TEST_DATABASE_URL=postgresql://… \
   cargo test -p remind_me_hub -- --test-threads=1 # with a real Postgres
 ```
@@ -266,5 +295,6 @@ compares `hub_seq` by order there, not by value: `nextval()` also spends a
 number on a push that loses last-write-wins, so Postgres's sequence has gaps
 the other backends' does not.
 
-CI runs all of these, with and without `multimodal-store`, plus a `--no-default-features` build so a `postgres::` reference
-leaking outside the feature gate cannot go unnoticed.
+CI runs all of these, plus `--no-default-features` builds with and without
+`multimodal-store`, so a `postgres::` reference leaking outside its feature
+gate cannot go unnoticed.

@@ -2,8 +2,8 @@
 # Install to ~/.config/containers/systemd/remind-me-postgres.container
 # Secrets live in ~/remind-me-hub/postgres.env (see postgres.env.example).
 #
-# Not needed at all if the hub runs on the SQLite backend — see
-# remind-me-hub-sqlite.container.
+# Not needed at all if the hub runs on the embedded engine or SQLite — see
+# remind-me-hub-standalone.container.
 [Unit]
 Description=Remind Me PostgreSQL
 After=network-online.target

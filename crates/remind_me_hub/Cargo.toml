@@ -34,13 +34,16 @@ rusty_multimodal_db_engine = { workspace = true, optional = true }
 uuid = { version = "1", features = ["v5"], optional = true }
 
 [features]
-default = ["postgres-store"]
+# The embedded engine is the default store (docs/adr/0021, phase 3), and
+# `postgres-import` brings it in along with the copy tool's Postgres reader.
+# The Postgres and SQLite stores stay built in for this release, so existing
+# deployments keep working unchanged; they are removed in a later one.
+default = ["postgres-store", "postgres-import"]
 # Postgres storage. Named `postgres-store` rather than `postgres` so it does
 # not collide with the optional dependency's own implicit feature name.
 postgres-store = ["dep:postgres"]
 # Storage on the embedded `rusty_multimodal_db` engine: a data directory, no
-# database server. Off by default until the copy tool and the default switch
-# land (docs/adr/0021, phase 3).
+# database server. On by default, through `postgres-import`.
 multimodal-store = ["dep:rusty_multimodal_db_engine", "dep:uuid"]
 # The copy tool's Postgres reader (docs/adr/0021). Separate from
 # `postgres-store` so it can outlive that store: a hub still on Postgres when

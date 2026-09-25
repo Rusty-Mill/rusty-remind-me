@@ -21,8 +21,8 @@
 services:
   remind-me-hub:
     build:
-      context: ../../..
-      dockerfile: crates/remind_me_hub/Containerfile
+      context: ../../../../../..
+      dockerfile: crates/apps/rusty_remind_me/crates/remind_me_hub/Containerfile
     restart: always
     env_file: hub.env
     volumes:

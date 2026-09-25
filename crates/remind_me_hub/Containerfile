@@ -1,72 +1,43 @@
 # Container image for the remind-me sync hub.
 #
-# Build from the **workspace root**, not this directory — the hub is a crate in
-# a Cargo workspace, so the build needs the root `Cargo.toml` and `Cargo.lock`:
+# Build from the **monorepo root** (the directory holding the workspace
+# `Cargo.toml` and `Cargo.lock`), not this directory and not
+# `crates/apps/rusty_remind_me`:
 #
-#     podman build -f crates/remind_me_hub/Containerfile -t remind-me-hub .
+#     podman build -f crates/apps/rusty_remind_me/crates/remind_me_hub/Containerfile \
+#                  -t remind-me-hub .
 #
-# That differs from the reference's `hub/Containerfile`, whose context is
-# `hub/` alone because it copies a single `main.py`. Every template and script
-# here passes the right context; it is called out because a hand-run
-# `podman build crates/remind_me_hub` fails in a way that does not explain
-# itself.
+# `setup.sh` and every deploy template pass that context. The hub is one crate
+# in a workspace of several hundred, so cargo needs the workspace manifest and
+# lockfile, and every member's manifest, to resolve it. The root
+# `.dockerignore` keeps `target/` and `.git` out of the context.
 
 # ---------------------------------------------------------------------------
 # Build
 # ---------------------------------------------------------------------------
 FROM docker.io/library/rust:1-slim-bookworm AS build
 
-# `rusqlite`'s bundled SQLite and `libsqlite3-sys` compile C, so the build
-# stage needs a C toolchain. The runtime stage below does not, which is the
-# whole point of splitting them.
+# `rusqlite`'s bundled SQLite compiles C. The runtime stage below needs none of
+# this, which is the point of splitting them.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends pkg-config libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
+COPY . .
 
-# Manifests first, then a throwaway build, so the dependency layer is cached
-# independently of the source. Editing hub code then rebuilds in seconds
-# instead of recompiling the whole dependency graph.
-COPY Cargo.toml Cargo.lock ./
-COPY crates/remind_me_core/Cargo.toml crates/remind_me_core/
-COPY crates/remind_me_mcp/Cargo.toml crates/remind_me_mcp/
-COPY crates/remind_me_api/Cargo.toml crates/remind_me_api/
-COPY crates/remind_me_cli/Cargo.toml crates/remind_me_cli/
-COPY crates/remind_me_remote/Cargo.toml crates/remind_me_remote/
-COPY crates/remind_me_hub/Cargo.toml crates/remind_me_hub/
-# Stub sources so `cargo build` resolves and compiles dependencies without the
-# real code. Cargo validates every target a manifest declares before it builds
-# anything, so `remind_me_core` needs its `build.rs` *and* the
-# `watchdog_stack_probe` bin here -- even though that bin is
-# `required-features = ["stack-dumps"]` and is never built. Omitting it fails
-# with "can't find `watchdog_stack_probe` bin", which reads like a source
-# problem rather than a missing stub.
-RUN mkdir -p crates/remind_me_core/src/bin crates/remind_me_mcp/src \
-             crates/remind_me_api/src crates/remind_me_cli/src \
-             crates/remind_me_remote/src crates/remind_me_hub/src \
-    && echo 'fn main() {}' > crates/remind_me_core/build.rs \
-    && for c in core mcp api remote hub; do \
-           echo '' > "crates/remind_me_$c/src/lib.rs"; \
-       done \
-    && echo 'fn main() {}' > crates/remind_me_cli/src/main.rs \
-    && echo 'fn main() {}' > crates/remind_me_hub/src/main.rs \
-    && echo 'fn main() {}' > crates/remind_me_core/src/bin/watchdog_stack_probe.rs \
-    && cargo build --release -p remind_me_hub --bin rusty-remind-me-hub --locked \
-    && rm -rf crates/*/src crates/remind_me_core/build.rs
-
-COPY crates crates
-# `COPY` preserves the build context's mtimes, which are routinely older than
-# the stub artifacts just built above -- so cargo would consider the stubs
-# current and link them. Touching *every* source, rather than a hand-listed
-# few, is what makes that safe: naming files individually looks tidier and
-# quietly ships the empty stub for whichever one the list forgot (this file
-# did exactly that, and the symptom was `E0432: unresolved import` from the
-# real `main.rs` against a stub `lib.rs`, which does not read like a caching
-# problem at all). Registry dependencies are unaffected and stay cached.
-RUN find crates -name '*.rs' -exec touch {} + \
-    && cargo build --release -p remind_me_hub --bin rusty-remind-me-hub --locked \
-    && strip target/release/rusty-remind-me-hub
+# Cache mounts keep the registry and the build directory between builds, so
+# an update recompiles only what changed. (This replaces the stub-manifest
+# trick the standalone repo used, which cannot scale to a workspace of this
+# size.) Both binaries: the hub, and the copy tool that moves an existing
+# hub's data onto the embedded engine. They are copied out of the cache mount,
+# which does not survive into the next stage by itself.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --release --locked -p remind_me_hub --bins \
+    && mkdir -p /out \
+    && cp target/release/rusty-remind-me-hub target/release/rusty-remind-me-hub-copy /out/ \
+    && strip /out/rusty-remind-me-hub /out/rusty-remind-me-hub-copy
 
 # ---------------------------------------------------------------------------
 # Runtime
@@ -88,20 +59,29 @@ RUN apt-get update \
 ARG HUB_VERSION=unknown
 
 # Non-root. The reference's image runs as root because the Python base image
-# does; there is no reason to inherit that here, and a hub with a SQLite
-# backend writes to a volume that should not be root-owned.
-RUN useradd --system --create-home --uid 10001 hub
+# does; there is no reason to inherit that here, and a hub with a local store
+# (the engine or SQLite) writes to a volume that should not be root-owned.
+RUN useradd --system --create-home --uid 10001 hub \
+    && mkdir /data && chown hub:hub /data
+# /data exists, owned by `hub`, so a named volume mounted there (the compose
+# files) starts out writable: Docker copies an image path's ownership into a
+# new named volume only when the path exists in the image. Without it the
+# volume is root-owned and the hub cannot create its store. (Podman Quadlets
+# bind-mount with `:U` instead, which chowns the host directory.)
 USER hub
 WORKDIR /home/hub
 
-COPY --from=build /src/target/release/rusty-remind-me-hub /usr/local/bin/
+# The copy tool ships in the image so a container deployment can move its
+# SQLite or Postgres data onto the engine without a Rust toolchain
+# (docs/adr/0021; the crate README's "Moving a hub onto the engine").
+COPY --from=build /out/rusty-remind-me-hub /out/rusty-remind-me-hub-copy /usr/local/bin/
 
 # The running hub reports its version over HTTP, which is no help when the
 # container is stopped or crash-looping -- exactly when you most need to know
 # which build you have. These make `podman inspect` answer it too.
 LABEL org.opencontainers.image.title="remind-me sync hub (Rust)" \
       org.opencontainers.image.description="Central sync point for the remind_me distributed sync engine" \
-      org.opencontainers.image.source="https://github.com/baileyrd/rusty_remind_me" \
+      org.opencontainers.image.source="https://github.com/Rusty-Mill/rusty_mill" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.version="${HUB_VERSION}"
 

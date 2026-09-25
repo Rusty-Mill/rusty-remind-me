@@ -137,8 +137,8 @@ sync is entirely opt-in. To share memories across machines, stand up a hub
 once and point every node at it:
 
 ```bash
-# On the hub machine — SQLite backend, no separate database server:
-crates/remind_me_hub/setup.sh --sqlite install
+# On the hub machine — one container, no separate database server:
+crates/remind_me_hub/setup.sh install
 # Prints the generated SYNC_SECRET every client below needs.
 
 # On each client machine:
@@ -146,8 +146,9 @@ REMIND_ME_SYNC_SECRET=<printed secret> rusty-remind-me configure \
     --node-id my-laptop --hub-url http://<hub-host>:8765
 ```
 
-`crates/remind_me_hub/setup.sh install` (without `--sqlite`) instead brings
-up Postgres in a rootless Podman container, and `crates/remind_me_hub/client-setup.sh
+That runs the hub on its embedded storage engine. `--postgres` instead brings
+up Postgres in a second rootless Podman container, `--sqlite` keeps the hub in
+one SQLite file, and `crates/remind_me_hub/client-setup.sh
 --node-id my-laptop --tunnel me@hub-host` automates the SSH-tunnel case.
 Docker Compose, Fly.io, and Railway deployments are under
 `crates/remind_me_hub/deploy/`. See [`crates/remind_me_hub/README.md`](crates/remind_me_hub/README.md)

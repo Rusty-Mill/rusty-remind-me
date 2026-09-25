@@ -11,33 +11,41 @@
 #   ./setup.sh status                Service state, hub health, per-node counts.
 #   ./setup.sh update                git pull, rebuild the hub image, restart.
 #
+# Backend (a new install only; an existing hub.env decides for itself):
+#   (default)    the embedded engine: one container, a data directory, no
+#                database server (docs/adr/0021).
+#   --postgres   Postgres in a second container: the drop-in for a Python
+#                hub's database, restorable with `restore`.
+#   --sqlite     SQLite: one container, one file.
+#   Choose before you have data. Moving an existing hub onto the engine is a
+#   copy (rusty-remind-me-hub-copy; see the crate README), not a flag.
+#
 # Flags:
-#   --sqlite     install the SQLite backend: one container, no Postgres. Not a
-#                migration path — SQLite and Postgres are different deployments
-#                (see docs/adr/0015), so choose before you have data.
 #   --force      allow restore to drop a non-empty database
 #   --dry-run    print mutating commands instead of executing them (install)
 #
 # Layout it manages:
-#   ~/remind-me-hub/postgres.env       Postgres credentials   (chmod 600)
-#   ~/remind-me-hub/hub.env            DATABASE_URL + SYNC_SECRET (chmod 600)
-#   ~/remind-me-hub/postgres-data/     Postgres data directory (bind mount)
-#   ~/remind-me-hub/data/              SQLite database        (--sqlite only)
-#   ~/.config/containers/systemd/      Quadlet units (postgres, hub, network)
+#   ~/remind-me-hub/hub.env            store setting + SYNC_SECRET (chmod 600)
+#   ~/remind-me-hub/data/              engine data or SQLite file (engine, --sqlite)
+#   ~/remind-me-hub/postgres.env       Postgres credentials   (--postgres, chmod 600)
+#   ~/remind-me-hub/postgres-data/     Postgres data directory (--postgres)
+#   ~/.config/containers/systemd/      Quadlet units
 
 set -euo pipefail
 
 HUB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# The workspace root, not the crate: the image build context must include the
-# root Cargo.toml and Cargo.lock. This is the main structural difference from
-# the reference's setup.sh, whose context was the hub directory alone.
-REPO_DIR="$(cd "$HUB_DIR/../.." && pwd)"
+# The monorepo root, five levels up, not the crate: the image build context
+# must hold the workspace Cargo.toml and Cargo.lock (see the Containerfile).
+REPO_DIR="$(cd "$HUB_DIR/../../../../.." && pwd)"
 DATA_DIR="${REMIND_ME_HUB_DATA:-$HOME/remind-me-hub}"
 QUADLET_DIR="$HOME/.config/containers/systemd"
 
 FORCE=0
 DRY_RUN=0
-SQLITE=0
+# The backend flag the operator passed (postgres or sqlite), and the backend
+# this run acts on. See resolve_backend.
+REQUESTED=""
+BACKEND=""
 
 log()  { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2; }
@@ -71,6 +79,38 @@ _hub_publish_host() {
 
 HEALTH_URL=""
 _set_health_url() { HEALTH_URL="http://$(_hub_publish_host):8765/health"; }
+
+# Which backend an existing hub.env configures, or nothing if there is none.
+backend_of_env() {
+    local env="$DATA_DIR/hub.env"
+    [ -f "$env" ] || return 0
+    if [[ -n "$(env_value "$env" DATABASE_URL)" ]]; then
+        printf 'postgres'
+    elif [[ -n "$(env_value "$env" REMIND_ME_HUB_DB_PATH)" ]]; then
+        printf 'sqlite'
+    elif [[ -n "$(env_value "$env" REMIND_ME_HUB_DATA_DIR)" ]]; then
+        printf 'engine'
+    fi
+}
+
+# An existing hub.env always wins. Re-running `install` on a Postgres hub
+# after the default changed must not swap its units for the engine's and
+# leave its database unreachable, so a flag that contradicts hub.env is
+# refused rather than obeyed.
+resolve_backend() {
+    local existing
+    existing=$(backend_of_env)
+    if [[ -n "$existing" ]]; then
+        if [[ -n "$REQUESTED" && "$REQUESTED" != "$existing" ]]; then
+            die "$DATA_DIR/hub.env configures the $existing backend, not $REQUESTED. To move this hub onto another store, copy it (see the crate README) rather than re-running install over it."
+        fi
+        BACKEND="$existing"
+    elif [[ -f "$DATA_DIR/hub.env" ]]; then
+        die "$DATA_DIR/hub.env sets none of DATABASE_URL, REMIND_ME_HUB_DB_PATH, REMIND_ME_HUB_DATA_DIR"
+    else
+        BACKEND="${REQUESTED:-engine}"
+    fi
+}
 
 psql_in() {  # psql_in <db> [psql args...]
     local db="$1"; shift
@@ -137,15 +177,19 @@ ensure_linger() {
 ensure_env_files() {
     run mkdir -p "$QUADLET_DIR"
 
-    if (( SQLITE )); then
+    if [[ "$BACKEND" != postgres ]]; then
         run mkdir -p "$DATA_DIR/data"
         if [ -f "$DATA_DIR/hub.env" ]; then
             log "Keeping existing $DATA_DIR/hub.env"
         else
-            log "Generating $DATA_DIR/hub.env (SQLite backend)"
+            # The engine keeps its tables in a directory inside the volume;
+            # SQLite keeps one file there.
+            local store_line="REMIND_ME_HUB_DATA_DIR=/data/hub"
+            [[ "$BACKEND" == sqlite ]] && store_line="REMIND_ME_HUB_DB_PATH=/data/hub.db"
+            log "Generating $DATA_DIR/hub.env ($BACKEND backend)"
             if ! (( DRY_RUN )); then
                 cat > "$DATA_DIR/hub.env" <<EOF
-REMIND_ME_HUB_DB_PATH=/data/hub.db
+$store_line
 SYNC_SECRET=$(rand_hex 32)
 EOF
                 chmod 600 "$DATA_DIR/hub.env"
@@ -189,10 +233,10 @@ EOF
 
 install_quadlets() {
     log "Installing Quadlet units to $QUADLET_DIR"
-    if (( SQLITE )); then
+    if [[ "$BACKEND" != postgres ]]; then
         # Installed under the same unit name as the Postgres variant, so
         # `systemctl --user start remind-me-hub` is the same command either way.
-        run cp "$HUB_DIR/deploy/remind-me-hub-sqlite.container" \
+        run cp "$HUB_DIR/deploy/remind-me-hub-standalone.container" \
                "$QUADLET_DIR/remind-me-hub.container"
     else
         run cp "$HUB_DIR/deploy/remind-me.network" \
@@ -223,6 +267,8 @@ build_image() {
     # -- so a rollback is a retag rather than a rebuild from an older
     # checkout, under exactly the time pressure that makes that unpleasant.
     log "Building the hub image (version $version) — a release build, allow a few minutes"
+    [[ -f "$REPO_DIR/Cargo.lock" ]] \
+        || die "no Cargo.lock in $REPO_DIR; run setup.sh from inside the monorepo checkout"
     run podman build \
         --build-arg "HUB_VERSION=$version" \
         -f "$HUB_DIR/Containerfile" \
@@ -232,7 +278,7 @@ build_image() {
 }
 
 start_services() {
-    if (( SQLITE )); then
+    if [[ "$BACKEND" != postgres ]]; then
         log "Starting the hub"
         run systemctl --user start remind-me-hub.service
     else
@@ -263,7 +309,7 @@ cmd_install() {
     log "Hub is up: $(curl -fsS "$HEALTH_URL")"
     cat <<EOF
 
-Server setup complete$( (( SQLITE )) && printf ' (SQLite backend)' ).
+Server setup complete ($BACKEND backend).
 
 Sync secret (clients need this as REMIND_ME_SYNC_SECRET):
   $secret
@@ -272,14 +318,17 @@ Next steps:
   - configure a client:  run crates/remind_me_hub/client-setup.sh on each client
   - check anytime:       $0 status
 EOF
-    (( SQLITE )) || printf '  - restore a backup:    %s restore /path/to/postgres-backup.sql\n' "$0"
+    if [[ "$BACKEND" == postgres ]]; then
+        printf '  - restore a backup:    %s restore /path/to/postgres-backup.sql\n' "$0"
+    fi
 }
 
 cmd_restore() {
     local dump="${1:-}"
     [[ -n "$dump" ]] || die "usage: $0 restore <dump.sql> [--force]"
     [[ -f "$dump" ]] || die "no such file: $dump"
-    (( SQLITE )) && die "restore is Postgres-only; the SQLite backend has no dump format in common with it"
+    [[ "$BACKEND" == postgres ]] \
+        || die "restore is Postgres-only; this hub uses the $BACKEND backend, which has no dump format in common with it"
 
     podman container exists remind-me-postgres \
         || die "remind-me-postgres is not running; run '$0 install' first"
@@ -312,7 +361,7 @@ cmd_restore() {
 
 cmd_status() {
     local units=(remind-me-hub.service)
-    (( SQLITE )) || units=(remind-me-postgres.service remind-me-hub.service)
+    [[ "$BACKEND" == postgres ]] && units=(remind-me-postgres.service remind-me-hub.service)
     local unit
     for unit in "${units[@]}"; do
         printf '%-32s %s\n' "$unit" "$(systemctl --user is-active "$unit" 2>/dev/null || echo inactive)"
@@ -368,8 +417,10 @@ main() {
         case "$1" in
             --force)   FORCE=1 ;;
             --dry-run) DRY_RUN=1 ;;
-            --sqlite)  SQLITE=1 ;;
-            -h|--help) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+            --postgres|--sqlite)
+                [[ -z "$REQUESTED" ]] || die "choose one backend flag"
+                REQUESTED="${1#--}" ;;
+            -h|--help) sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
             install|restore|status|update)
                 cmd="$1" ;;
             *)  args+=("$1") ;;
@@ -378,6 +429,7 @@ main() {
     done
 
     _set_health_url
+    resolve_backend
 
     case "${cmd:-install}" in
         install) cmd_install ;;

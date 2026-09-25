@@ -5,7 +5,8 @@
 # remind-me-postgres.container) — this is an alternative to the quadlets for
 # environments that prefer docker-compose, not a different hub.
 #
-# For a hub with no database server at all, see docker-compose.sqlite.yml.
+# For a hub with no database server at all, see docker-compose.engine.yml
+# (the recommended default for a new hub) or docker-compose.sqlite.yml.
 #
 # Quick start (from this directory):
 #   cp hub.env.example hub.env
@@ -50,12 +51,12 @@ services:
 
   remind-me-hub:
     build:
-      # The workspace root, three levels up — the hub is a crate in a Cargo
-      # workspace, so the build needs the root Cargo.toml and Cargo.lock.
+      # The monorepo root, six levels up: the hub is one crate in a Cargo
+      # workspace, so the build needs the workspace Cargo.toml and Cargo.lock.
       # The Python hub's context was its own directory because it copied a
       # single file; this one cannot be.
-      context: ../../..
-      dockerfile: crates/remind_me_hub/Containerfile
+      context: ../../../../../..
+      dockerfile: crates/apps/rusty_remind_me/crates/remind_me_hub/Containerfile
     restart: always
     env_file: hub.env
     depends_on:

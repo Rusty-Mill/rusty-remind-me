@@ -1,49 +1,56 @@
 # Hub deploy templates
 
-Four ways to run the hub, plus the env files they share. All of them build the
-same image from `../Containerfile` and speak the same `SYNC_SECRET` /
-`DATABASE_URL` contract — these are alternative deployments, not different
-hubs.
+Several ways to run the hub, plus the env files they share. All of them build
+the same image from `../Containerfile` and speak the same `SYNC_SECRET`
+contract, with one variable choosing the store — these are alternative
+deployments, not different hubs.
 
 | File | Deployment |
 | --- | --- |
+| `remind-me-hub-standalone.container` | Podman Quadlet, rootless, one container: the embedded engine (default) or SQLite |
 | `remind-me.network`, `remind-me-postgres.container`, `remind-me-hub.container` | Podman Quadlet, rootless, with Postgres |
-| `remind-me-hub-sqlite.container` | Podman Quadlet, rootless, SQLite — one container |
+| `docker-compose.engine.yml` | Docker Compose, the embedded engine — one container |
 | `docker-compose.yml` | Docker Compose, with Postgres |
 | `docker-compose.sqlite.yml` | Docker Compose, SQLite — one container |
 | `fly.toml` | Fly.io, with managed Fly Postgres |
 | `railway.json` | Railway, with a managed Postgres plugin |
 
 `../setup.sh install` does the Quadlet path end to end (secrets, units, image,
-services) and is the shortest route to a working hub. Add `--sqlite` for the
-SQLite variant.
+services) and is the shortest route to a working hub. It installs the embedded
+engine unless you pass `--postgres` or `--sqlite`. On a machine that already
+has a `hub.env`, it keeps that hub's store whatever the flags say.
 
-## The build context is the workspace root
+## The build context is the monorepo root
 
-Every template here builds with the workspace root as context and
-`crates/remind_me_hub/Containerfile` as the file. That differs from the Python
-hub, whose context was `hub/` alone because it copied one `main.py`; this hub
-is a crate in a Cargo workspace and needs the root `Cargo.toml` and
-`Cargo.lock`. Building with this directory as context fails on a missing
-manifest, which does not explain itself.
+Every template here builds with the monorepo root (the directory holding the
+workspace `Cargo.toml` and `Cargo.lock`) as context and
+`crates/apps/rusty_remind_me/crates/remind_me_hub/Containerfile` as the file. That differs from the Python hub, whose context
+was `hub/` alone because it copied one `main.py`; this hub is a crate in a
+Cargo workspace. Building with any other directory as context fails on a
+missing manifest, which does not explain itself.
 
-## Postgres or SQLite
+## Which store
 
-**Postgres** is the default and the drop-in: it reads the Python hub's own
-schema, legacy dumps included, so an existing deployment can be taken over in
-place. Choose it when several nodes push concurrently.
+**The embedded engine** is the default for a new hub (`docs/adr/0021`). One
+container, a data directory, no database server. It holds every record in
+memory and logs each write to disk before answering, and its pulls stay fast
+while pushes run.
 
-**SQLite** has no counterpart in the Python hub. One container, one file, no
-database server. Choose it for a single operator's handful of devices. It is
-wire-identical, so no client can tell the difference — but it is **not**
-schema-identical, so there is no in-place switch between the two backends.
-Decide before you have data. `docs/adr/0015` records the reasoning.
+**Postgres** is the drop-in for an existing Python hub: it reads that hub's own
+schema, legacy dumps included, so a deployment can be taken over in place and
+restored with `setup.sh restore`.
+
+**SQLite** is one container and one file.
+
+The three are wire-identical, so no client can tell the difference, but they
+are **not** schema-identical: there is no switching a store in place. To move a
+hub onto the engine, copy it with `rusty-remind-me-hub-copy` (in the image and
+the release archives; see the crate README), which keeps every `hub_seq` so
+nodes carry on from their cursors.
 
 Setting more than one of `DATABASE_URL`, `REMIND_ME_HUB_DB_PATH` and
 `REMIND_ME_HUB_DATA_DIR` is a startup error rather than a silent precedence
-rule: it should never be ambiguous which store is serving. The third, the
-embedded-engine backend, is a preview none of these templates use yet (see the
-crate README).
+rule: it should never be ambiguous which store is serving.
 
 ## Exposure
 
@@ -60,6 +67,7 @@ healthchecks keep working when the database is down, and it reports no counts.
 
 | File | For |
 | --- | --- |
+| `hub-engine.env.example` | Embedded-engine deployments (the default) |
 | `hub.env.example` | Postgres deployments |
 | `hub-sqlite.env.example` | SQLite deployments |
 | `postgres.env.example` | The Postgres container itself |

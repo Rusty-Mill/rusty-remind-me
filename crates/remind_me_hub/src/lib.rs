@@ -5,8 +5,9 @@
 //! trait, so the same hub runs on Postgres (the drop-in for an existing
 //! deployment) or on SQLite (a self-hosted hub that wants one file and no
 //! server). `docs/adr/0015` records why. A third backend, the embedded
-//! `rusty_multimodal_db` engine behind the `multimodal-store` feature, is
-//! the one `docs/adr/0021` plans to replace both with.
+//! `rusty_multimodal_db` engine (the `multimodal-store` feature, on by
+//! default), is the default for a new hub and is to replace both
+//! (`docs/adr/0021`).
 //!
 //! # What a hub is, relative to a peer
 //!

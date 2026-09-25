@@ -179,9 +179,9 @@ fn open_store() -> Result<Arc<dyn HubStore>, String> {
             Ok(Arc::new(SqliteStore::open(path).map_err(|e| e.0)?))
         }
         [Backend::Multimodal(dir)] => open_multimodal(dir),
-        [] => Err("no store configured — set DATABASE_URL for Postgres, \
-             REMIND_ME_HUB_DB_PATH for SQLite, or REMIND_ME_HUB_DATA_DIR for \
-             the embedded engine"
+        [] => Err("no store configured — set REMIND_ME_HUB_DATA_DIR for the \
+             embedded engine (the default for a new hub), DATABASE_URL for \
+             Postgres, or REMIND_ME_HUB_DB_PATH for SQLite"
             .to_string()),
         several => {
             let names: Vec<&str> = several.iter().map(Backend::variable).collect();

@@ -7,7 +7,8 @@
 //! existing Postgres deployment is not a successor, and a hub that *requires*
 //! Postgres is a heavy ask of the single-operator self-host case the SQLite
 //! node already serves happily. `docs/adr/0021` adds a third, `multimodal`
-//! (behind the `multimodal-store` feature), which is to replace both.
+//! (the `multimodal-store` feature, on by default), which is the default for
+//! a new hub and is to replace both.
 //!
 //! # What the trait deliberately does not expose
 //!
