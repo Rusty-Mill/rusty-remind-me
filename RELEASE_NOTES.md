@@ -2,6 +2,15 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-25 — ADR-0021: the hub's storage is to move to an embedded rusty_multimodal_db
+
+### Added
+- **`docs/adr/0021-hub-storage-moves-to-rusty-multimodal-db.md` (Proposed).** It records the plan to replace the hub's Postgres and SQLite stores with `rusty_multimodal_db`'s storage engine embedded in the hub process, with record types the hub owns. The node's own SQLite stays, because of Tenet 3 and the SQLite features it depends on.
+- Planned in four phases: extract the engine to a libs crate; add a third `HubStore` backend tested alongside the other two; build a copy tool that preserves `hub_seq`, then switch the default and retire the old stores; later, a storage port in core.
+- It also records the behaviour changes and costs: ids capped at 64 bytes, the whole dataset held in RAM, pushes that block pulls, scheduled compaction, and backups that copy the data directory.
+
+Documentation only; no code or behaviour change.
+
 ## 2026-09-25 — v0.2.3: the Postgres hub no longer lets a node's pull skip rows
 
 ### Fixed
