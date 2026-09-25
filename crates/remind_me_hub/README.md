@@ -96,8 +96,9 @@ Compared with SQLite it:
   waits for at most one chunk. In `examples/pull_latency.rs` it takes
   pushes of 100 records about six times as fast as SQLite, with a pull
   median of 4 ms against SQLite's 47 ms;
-- pauses writes once each time a table's row count passes a power of two,
-  while an in-memory map regrows: about 0.2–0.4 s at 115 000 memories;
+- pauses writes briefly each time a table's row count passes a power of
+  two, while an in-memory map regrows: under 10 ms at 115 000 memories,
+  37 ms at 229 000;
 - after a failed `fsync`, refuses every write and fails `/health` until
   restarted;
 - folds the insert logs every `REMIND_ME_HUB_COMPACT_INTERVAL_SECS`, and on

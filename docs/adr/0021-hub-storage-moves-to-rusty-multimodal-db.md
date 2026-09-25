@@ -290,9 +290,22 @@ Group-commit runs reach 115 000 memories within the 10 s. At that size,
 one pull in each run waited about 0.2 to 1 s. Timing the lock hold placed the
 wait in a single insert at row 114 729, just past 7/8 of 2^17: the engine
 core's `HashMap`s regrowing. The sync took under 1 ms.
-- The pause happens once each time the row count doubles, batched or not.
-- Pre-sizing or a map that grows incrementally would remove it.
-- It is a follow-up, not a gate: a personal hub stays far below that size.
+The pause happened once each time the row count doubled, batched or not.
+It was all under the write lock: the record map held each ~800-byte
+memory inline, so a regrow copied every row into a new table of twice the
+size. The core now boxes its records, so a regrow moves a key and a pointer
+per row:
+
+| Worst lock hold at a regrow | Records inline | Records boxed |
+|---|---|---|
+| 115 000 rows | 170–370 ms | under 10 ms |
+| 229 000 rows | not measured | 37 ms |
+
+In the same 20 s run, the worst pull was 42 ms, and p99 stayed at 10 ms.
+A regrow is still linear in the row count (an estimated 0.15 s
+at a million rows). A map that grows incrementally would remove the pause
+entirely, but it would add a dependency to the engine for sizes a personal
+hub does not reach.
 
 ### The default switch
 

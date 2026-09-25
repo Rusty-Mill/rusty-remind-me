@@ -16,9 +16,10 @@ Dated entries, newest first. One entry per merged pull request.
 ### Fixed
 - **After a failed `fsync`, the engine store now refuses every write, and `/health` fails, until the hub restarts.** A failed sync leaves the chunk it covered applied in memory but possibly not on disk. Acknowledging later writes on top of that could lose them in a crash. The whole chunk is reported `failed`, so senders retry it.
 
-### Known limitations
-- **A one-off write pause at large sizes.** A table crossing a power of two in rows pauses writes, and pulls queued behind them, once while an in-memory map regrows. It took about 0.2–0.4 s at 115 000 memories, and up to 1 s once under benchmark load.
-- **Found by the benchmark, not new:** before this change, the benchmark never grew a hub that large.
+- **A write pause at each power of two of rows, cut from up to a second to tens of milliseconds.**
+  - The engine's record map regrows in one step under the write lock. With each ~800-byte memory held inline, that copied every row, and the lock hold reached 170–370 ms at 115 000 memories. Pulls behind it waited up to 1 s once under benchmark load.
+  - The engine now boxes its records. The hold is under 10 ms at 115 000 memories and 37 ms at 229 000.
+  - The pause was not new: the benchmark had never grown a hub that large before.
 
 `examples/pull_latency.rs` gains a `BATCH` argument.
 
