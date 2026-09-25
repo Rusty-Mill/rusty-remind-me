@@ -41,6 +41,8 @@
 
 pub mod canon;
 pub mod http;
+#[cfg(feature = "multimodal-store")]
+pub mod import;
 pub mod record;
 pub mod routes;
 pub mod store;

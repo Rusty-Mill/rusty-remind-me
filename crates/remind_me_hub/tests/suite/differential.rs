@@ -231,8 +231,6 @@ fn relations(store: &dyn HubStore, q: &GraphPullQuery) -> Vec<Value> {
 }
 
 /// How to compare `hub_seq` across backends.
-// Each test crate that includes this module uses one variant.
-#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SeqComparison {
     /// The same numbers: SQLite and the embedded engine both issue one per
@@ -313,7 +311,6 @@ fn observe(store: &dyn HubStore) -> Value {
 /// compaction. `backends` names each store for the failure message.
 pub fn assert_backends_agree(backends: &[(&str, &dyn HubStore)], seq: SeqComparison) {
     let (first_name, first) = backends[0];
-
     for (raw, node) in script() {
         let parsed = record::parse(&raw).expect("a well-formed record");
         let expected = first
@@ -329,27 +326,7 @@ pub fn assert_backends_agree(backends: &[(&str, &dyn HubStore)], seq: SeqCompari
             );
         }
     }
-
-    let observe = |store: &dyn HubStore| {
-        let mut observed = observe(store);
-        if seq == SeqComparison::Ranked {
-            rank_seqs(&mut observed);
-        }
-        observed
-    };
-    let compare = |stage: &str| {
-        let expected = observe(first);
-        for (name, store) in &backends[1..] {
-            let got = observe(*store);
-            for (key, want) in expected.as_object().unwrap() {
-                assert_eq!(
-                    &got[key], want,
-                    "{stage}: {name} and {first_name} disagreed on {key}"
-                );
-            }
-        }
-    };
-    compare("after the pushes");
+    assert_answers_agree(backends, seq, "after the pushes");
 
     let cutoff = "2026-08-04T00:00:00+00:00";
     let expected = first.compact_tombstones(cutoff).expect("compact");
@@ -361,5 +338,37 @@ pub fn assert_backends_agree(backends: &[(&str, &dyn HubStore)], seq: SeqCompari
             "{name}"
         );
     }
-    compare("after compacting tombstones");
+    assert_answers_agree(backends, seq, "after compacting tombstones");
+}
+
+/// Push the script to one store, for a test that then copies it.
+pub fn apply_script(store: &dyn HubStore) {
+    for (raw, node) in script() {
+        let parsed = record::parse(&raw).expect("a well-formed record");
+        store
+            .apply_record(&parsed, origin(node))
+            .unwrap_or_else(|e| panic!("apply {raw}: {e}"));
+    }
+}
+
+/// Require every read to answer alike on every backend, as they stand.
+pub fn assert_answers_agree(backends: &[(&str, &dyn HubStore)], seq: SeqComparison, stage: &str) {
+    let observe = |store: &dyn HubStore| {
+        let mut observed = observe(store);
+        if seq == SeqComparison::Ranked {
+            rank_seqs(&mut observed);
+        }
+        observed
+    };
+    let (first_name, first) = backends[0];
+    let expected = observe(first);
+    for (name, store) in &backends[1..] {
+        let got = observe(*store);
+        for (key, want) in expected.as_object().unwrap() {
+            assert_eq!(
+                &got[key], want,
+                "{stage}: {name} and {first_name} disagreed on {key}"
+            );
+        }
+    }
 }

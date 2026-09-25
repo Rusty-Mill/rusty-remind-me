@@ -92,6 +92,33 @@ move an existing hub onto it. Compared with SQLite it:
 - locks its data directory, so a second hub pointed at it refuses to start.
   Back it up by copying the directory while the hub is stopped.
 
+### Moving a hub onto the engine
+
+`rusty-remind-me-hub-copy` copies a SQLite or Postgres hub into a new data
+directory. Stop the hub first; the source is only ever read.
+
+```sh
+cargo build -p remind_me_hub --features postgres-import --bin rusty-remind-me-hub-copy
+
+rusty-remind-me-hub-copy --from-sqlite ./hub.db --to ./hub-data --check
+rusty-remind-me-hub-copy --from-sqlite ./hub.db --to ./hub-data
+DATABASE_URL=postgresql://… rusty-remind-me-hub-copy --from-postgres --to ./hub-data
+```
+
+- **Every `hub_seq` and `origin_node` is kept**, so nodes carry on from their
+  cursors and `exclude_node` still means what it did. The next `hub_seq` is
+  issued above the highest the source ever handed out, not only above its
+  remaining rows: for Postgres that is the sequence's last value.
+- **Rows the engine cannot store are listed, and nothing is written**: ids
+  over 64 bytes or holding NUL, and rows the reader could not parse. `--check`
+  lists them without writing; `--drop-invalid` copies everything else.
+- **A legacy Postgres database** (the Python hub's `TIMESTAMPTZ` schema) is
+  read as it stands. It is not migrated first.
+- **The target must be empty or absent.** After writing, the tool reads every
+  row back and compares it with the source.
+- **`--from-postgres` reads `DATABASE_URL`**, so the password never appears
+  on the command line.
+
 ## Routes
 
 | Route | Auth | Purpose |

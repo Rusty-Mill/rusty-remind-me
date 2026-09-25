@@ -29,6 +29,7 @@
 
 mod keys;
 mod rows;
+pub mod snapshot;
 
 use super::{
     stable_group_order, Counts, GraphPullQuery, HubStore, MemoryCounts, PullCursor, PullQuery,
@@ -139,14 +140,58 @@ impl MultimodalHubStore {
         std::fs::create_dir_all(dir).map_err(|e| io_err("could not create", dir, e))?;
         let dir_lock = take_dir_lock(dir)?;
 
-        let open = |name: &str| dir.join(format!("{name}.mmap"));
-        let memories = Ordered::new(Ordered::new(
-            open_core(&open("memories")).map_err(engine_err)?,
-        ));
-        let entities = Ordered::new(open_core(&open("entities")).map_err(engine_err)?);
-        let links = Ordered::new(open_core(&open("memory_entities")).map_err(engine_err)?);
-        let relations = Ordered::new(open_core(&open("entity_relations")).map_err(engine_err)?);
+        let path = |name: &str| table_path(dir, name);
+        let memories = open_core(&path(MEMORIES)).map_err(engine_err)?;
+        let entities = open_core(&path(ENTITIES)).map_err(engine_err)?;
+        let links = open_core(&path(LINKS)).map_err(engine_err)?;
+        let relations = open_core(&path(RELATIONS)).map_err(engine_err)?;
+        Self::assemble(dir, dir_lock, memories, entities, links, relations)
+    }
 
+    /// Create a hub in `dir` holding `snapshot`, every row written in one
+    /// pass with its `hub_seq` and `origin_node` kept exactly (ADR-0021,
+    /// decision 7). The next `hub_seq` issued is above both the highest
+    /// copied and the source's own high-water mark.
+    ///
+    /// `dir` must not exist or must be empty: this is how a hub moves onto
+    /// the engine, never a merge into one.
+    ///
+    /// # Errors
+    ///
+    /// Fails if `dir` holds anything, if the snapshot has a row
+    /// [`snapshot::Snapshot::validate`] rejects (the copy tool drops those
+    /// first, or refuses), or on any I/O error.
+    pub fn create_from_snapshot(dir: &Path, snapshot: &snapshot::Snapshot) -> StoreResult<Self> {
+        if let Some(rejected) = snapshot.validate().first() {
+            return Err(StoreError(format!(
+                "the snapshot holds a row the engine cannot store: {rejected}"
+            )));
+        }
+        ensure_empty_dir(dir)?;
+        std::fs::create_dir_all(dir).map_err(|e| io_err("could not create", dir, e))?;
+        let dir_lock = take_dir_lock(dir)?;
+        write_seq_floor(dir, snapshot.seq_floor())?;
+
+        let rows = snapshot.rows()?;
+        let path = |name: &str| table_path(dir, name);
+        let memories = Core::create(rows.memories, &path(MEMORIES)).map_err(engine_err)?;
+        let entities = Core::create(rows.entities, &path(ENTITIES)).map_err(engine_err)?;
+        let links = Core::create(rows.links, &path(LINKS)).map_err(engine_err)?;
+        let relations = Core::create(rows.relations, &path(RELATIONS)).map_err(engine_err)?;
+        Self::assemble(dir, dir_lock, memories, entities, links, relations)
+    }
+
+    /// Wrap the four open engine stores in their sort orders and start the
+    /// `hub_seq` counter above everything issued so far.
+    fn assemble(
+        dir: &Path,
+        dir_lock: File,
+        memories: Core<MemoryRow, Seq>,
+        entities: Core<EntityRow, Micros>,
+        links: Core<LinkRow, Micros>,
+        relations: Core<RelationRow, Micros>,
+    ) -> StoreResult<Self> {
+        let memories: MemoryTable = Ordered::new(Ordered::new(memories));
         let stored_max = PageBy::<MemoryRow, Seq>::page_by_desc(&memories, None, 1)
             .first()
             .and_then(|id| memories.get(*id))
@@ -157,9 +202,9 @@ impl MultimodalHubStore {
             dir: dir.to_path_buf(),
             tables: RwLock::new(Tables {
                 memories,
-                entities,
-                links,
-                relations,
+                entities: Ordered::new(entities),
+                links: Ordered::new(links),
+                relations: Ordered::new(relations),
                 next_seq,
                 writes_since_compact: 0,
             }),
@@ -186,6 +231,43 @@ impl MultimodalHubStore {
     /// panicking request must not make every later request panic too.
     fn write(&self) -> RwLockWriteGuard<'_, Tables> {
         self.tables.write().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+const MEMORIES: &str = "memories";
+const ENTITIES: &str = "entities";
+const LINKS: &str = "memory_entities";
+const RELATIONS: &str = "entity_relations";
+
+fn table_path(dir: &Path, table: &str) -> PathBuf {
+    dir.join(format!("{table}.mmap"))
+}
+
+impl MultimodalHubStore {
+    /// Refuse a copy target that already holds anything, before anything
+    /// is read: [`Self::create_from_snapshot`] refuses it too, but only
+    /// after the whole source has been read.
+    ///
+    /// # Errors
+    ///
+    /// Fails if `dir` holds anything or cannot be read.
+    pub fn check_copy_target(dir: &Path) -> StoreResult<()> {
+        ensure_empty_dir(dir)
+    }
+}
+
+/// Refuse a target directory that already holds anything.
+fn ensure_empty_dir(dir: &Path) -> StoreResult<()> {
+    match std::fs::read_dir(dir) {
+        Ok(mut entries) => match entries.next() {
+            None => Ok(()),
+            Some(_) => Err(StoreError(format!(
+                "{} is not empty; a hub is only ever copied into an empty directory",
+                dir.display()
+            ))),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(io_err("could not read", dir, e)),
     }
 }
 

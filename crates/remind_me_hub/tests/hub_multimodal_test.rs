@@ -6,6 +6,8 @@
 //! runs the same check with Postgres as a third backend.
 #![cfg(feature = "multimodal-store")]
 
+// Each test crate uses part of the shared suite.
+#[allow(dead_code)]
 #[path = "suite/differential.rs"]
 mod differential;
 

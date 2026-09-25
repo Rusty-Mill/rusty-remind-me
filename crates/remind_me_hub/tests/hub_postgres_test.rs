@@ -33,6 +33,8 @@ use remind_me_hub::store::sqlite::SqliteStore;
 use remind_me_hub::store::{HubStore, PullCursor, PullQuery, COUNTABLE};
 use serde_json::{json, Value};
 
+// Each test crate uses part of the shared suite.
+#[allow(dead_code)]
 #[path = "suite/differential.rs"]
 mod differential;
 
@@ -420,4 +422,123 @@ fn a_seq_puller_sees_every_row_under_concurrent_pushes() {
         WRITERS * PER_WRITER,
         &missed[..missed.len().min(5)]
     );
+}
+
+/// The copy tool's Postgres reader (ADR-0021, phase 3), against a hub with
+/// `hub_seq` gaps: every LWW loss spends a `nextval()`. The copy keeps every
+/// number exactly, and issues the next one above the sequence's high-water
+/// mark, not just above the rows, as Postgres itself would.
+#[cfg(feature = "postgres-import")]
+#[test]
+fn a_postgres_hub_copies_onto_the_engine_with_every_hub_seq_kept() {
+    let Some(url) = url() else {
+        eprintln!("SKIP: REMIND_ME_HUB_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let _guard = DB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let pg = store(&url);
+    differential::apply_script(&pg);
+    // One more LWW loss, so the sequence ends above every row's hub_seq.
+    assert!(!apply(&pg, &memory("m1", "2026-01-01T00:00:00Z"), "node-b"));
+
+    let dir = std::env::temp_dir().join(format!("remind_me_hub_pg_copy_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let snapshot = remind_me_hub::import::postgres::read(&url).expect("read the Postgres hub");
+    assert!(snapshot.validate().is_empty(), "{:?}", snapshot.validate());
+    let engine =
+        remind_me_hub::store::multimodal::MultimodalHubStore::create_from_snapshot(&dir, &snapshot)
+            .expect("copy");
+    remind_me_hub::import::verify(&snapshot, &engine).expect("the copy verifies");
+
+    differential::assert_answers_agree(
+        &[("postgres", &pg), ("copy", &engine)],
+        differential::SeqComparison::Exact,
+        "after the copy",
+    );
+
+    // The next write gets the same hub_seq on both: the copy starts above
+    // the sequence's last value, gaps and all.
+    let next = memory("after-copy", "2026-09-01T00:00:00Z");
+    assert!(apply(&pg, &next, "node-a"));
+    assert!(apply(&engine, &next, "node-a"));
+    let seq_of = |store: &dyn HubStore| {
+        pull_all(store)
+            .iter()
+            .find(|m| m["id"] == "after-copy")
+            .and_then(|m| m["hub_seq"].as_i64())
+            .unwrap()
+    };
+    assert_eq!(seq_of(&engine), seq_of(&pg));
+
+    drop(engine);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A legacy database the Python hub left behind reads without being
+/// migrated, and copies to what the Postgres store's own in-place
+/// migration makes of it.
+#[cfg(feature = "postgres-import")]
+#[test]
+fn a_legacy_postgres_hub_copies_without_being_migrated() {
+    let Some(url) = url() else {
+        eprintln!("SKIP: REMIND_ME_HUB_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let _guard = DB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    reset(&url);
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("connect");
+    client
+        .batch_execute(
+            "CREATE TABLE memories (
+                 id         TEXT PRIMARY KEY,
+                 content    TEXT NOT NULL,
+                 category   TEXT NOT NULL DEFAULT 'general',
+                 tags       JSONB NOT NULL DEFAULT '[]',
+                 source     TEXT NOT NULL DEFAULT 'manual',
+                 metadata   JSONB NOT NULL DEFAULT '{}',
+                 created_at TIMESTAMPTZ NOT NULL,
+                 updated_at TIMESTAMPTZ NOT NULL,
+                 capture_id TEXT,
+                 node_id    TEXT,
+                 client     TEXT NOT NULL DEFAULT 'unknown'
+             );
+             INSERT INTO memories (id, content, tags, created_at, updated_at)
+             VALUES ('legacy-1', 'from the old hub', '[\"a\"]',
+                     '2026-08-05 10:00:00+00', '2026-08-05 11:30:00+00'),
+                    ('legacy-2', 'also old', '[]',
+                     '2026-08-04 08:00:00+00', '2026-08-04 09:00:00.500000+00');",
+        )
+        .expect("create the legacy schema");
+
+    let snapshot = remind_me_hub::import::postgres::read(&url).expect("read the legacy hub");
+    assert_eq!(snapshot.memories.len(), 2);
+    let column_type: String = client
+        .query_one(
+            "SELECT data_type FROM information_schema.columns \
+             WHERE table_name = 'memories' AND column_name = 'updated_at'",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert!(
+        column_type.starts_with("timestamp"),
+        "reading must not migrate the source (updated_at is now {column_type})"
+    );
+    drop(client);
+
+    let dir =
+        std::env::temp_dir().join(format!("remind_me_hub_legacy_copy_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let engine =
+        remind_me_hub::store::multimodal::MultimodalHubStore::create_from_snapshot(&dir, &snapshot)
+            .expect("copy");
+
+    // Now let the Postgres store migrate the source in place, and require
+    // the copy to match it field for field, backfilled hub_seq included.
+    let pg = PostgresStore::new(&url);
+    pg.migrate().expect("migrate the legacy database");
+    assert_eq!(pull_all(&engine), pull_all(&pg));
+
+    drop(engine);
+    let _ = std::fs::remove_dir_all(&dir);
 }

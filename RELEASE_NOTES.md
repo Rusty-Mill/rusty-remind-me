@@ -2,6 +2,25 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-25 — rusty-remind-me-hub-copy: move a SQLite or Postgres hub onto the embedded engine
+
+### Added
+- **`rusty-remind-me-hub-copy`** (feature `multimodal-store`). Phase 3 of ADR-0021. It copies a SQLite hub (`--from-sqlite PATH`) or a Postgres hub (`--from-postgres`, which reads `DATABASE_URL`) into a new embedded-engine data directory.
+- **Every `hub_seq` and `origin_node` is kept exactly**, so nodes carry on from their cursors. The next `hub_seq` starts above the highest the source ever issued. For Postgres that is the sequence's last value, which can be above every remaining row.
+- **Rows the engine cannot store are listed, and nothing is written**: ids over 64 bytes or holding NUL, and rows that do not parse. `--check` lists them without writing; `--drop-invalid` copies everything else.
+- **After writing, the tool reads every row back and compares it with the source.**
+- **The source is only ever read.** SQLite is opened read-only. Postgres is read in one repeatable-read, read-only transaction. A legacy Python-hub database (`TIMESTAMPTZ` columns) is read as it stands, not migrated.
+- **New feature `postgres-import`** for the Postgres reader. It is kept apart from `postgres-store` so it can outlive that store.
+
+### Provenance
+
+New tests:
+- `tests/hub_copy_test.rs`. A copied SQLite hub answers every read of the shared differential script exactly as the source does, before and after a reopen. It covers refused and dropped ids, a source left byte-for-byte unchanged, a non-empty target, and the binary end to end.
+- In `hub_postgres_test.rs`, two cases:
+  - a Postgres hub with `hub_seq` gaps copies exactly, and the next write gets the same `hub_seq` on both;
+  - a legacy database copies to exactly what the Postgres store's own in-place migration makes of it.
+- A mutation check: when the copy ignores the sequence's high-water mark, the gap test fails.
+
 ## 2026-09-25 — The hub gains a third storage backend: the embedded rusty_multimodal_db engine (preview)
 
 ### Added

@@ -193,6 +193,34 @@ change was needed. Building it settled details the decisions above left open:
 Not yet measured: pull latency under push load, which this ADR requires before
 the default switches (phase 3).
 
+## Phase 3 notes: the copy tool (2026-09-25)
+
+`rusty-remind-me-hub-copy` (`remind_me_hub/src/bin/copy.rs`, the `import`
+module) reads a SQLite or Postgres hub and writes a new engine data directory
+in one pass (`MultimodalHubStore::create_from_snapshot`).
+
+- **Rows are read as JSON and parsed like a push.** Each reader turns a row
+  into a column-keyed object: SQLite by column, Postgres by `to_jsonb(row)`.
+  `record::parse` then validates it and fills defaults, so a legacy schema
+  with missing columns reads correctly and is never migrated.
+  - Stored empty strings in `category`, `source`, `client`, `status` and
+    `memory_type` are kept as they are. A push would replace them with
+    defaults.
+  - A row that does not parse is reported, not dropped.
+- **Where `hub_seq` starts.** A memory with no `hub_seq` gets one in
+  `(updated_at, id)` order, as the stores' own `migrate` backfills them. The
+  counter starts above the source's high-water mark: for Postgres, the
+  sequence's `last_value`, which can be above every remaining row. A test
+  shows the next write gets the same `hub_seq` on the copy as on the source.
+- **The Postgres reader is behind `postgres-import`, not `postgres-store`,**
+  so it outlives the Postgres store (decision 6).
+- **The copy refuses rather than drops.** Ids the engine cannot hold, and two
+  rows mapping to one engine id, stop the copy with nothing written, unless
+  `--drop-invalid` says to go ahead without those rows.
+
+Still to do in phase 3: measure pull latency under push load, switch the
+default, then remove the old stores a release later.
+
 ## Related
 
 - The same mapping found that the Postgres hub assigned `hub_seq` at statement

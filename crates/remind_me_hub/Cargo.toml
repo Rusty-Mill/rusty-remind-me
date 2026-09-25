@@ -42,6 +42,10 @@ postgres-store = ["dep:postgres"]
 # database server. Off by default until the copy tool and the default switch
 # land (docs/adr/0021, phase 3).
 multimodal-store = ["dep:rusty_multimodal_db_engine", "dep:uuid"]
+# The copy tool's Postgres reader (docs/adr/0021). Separate from
+# `postgres-store` so it can outlive that store: a hub still on Postgres when
+# the old backends go can still be copied onto the engine.
+postgres-import = ["dep:postgres", "multimodal-store"]
 
 [dev-dependencies]
 # The Postgres tests build a legacy-schema database directly, which is the
@@ -51,3 +55,10 @@ postgres = { version = "0.19", features = ["with-serde_json-1"] }
 [[bin]]
 name = "rusty-remind-me-hub"
 path = "src/main.rs"
+
+# Copies a SQLite or Postgres hub into an embedded-engine data directory,
+# keeping every hub_seq (docs/adr/0021, phase 3).
+[[bin]]
+name = "rusty-remind-me-hub-copy"
+path = "src/bin/copy.rs"
+required-features = ["multimodal-store"]
