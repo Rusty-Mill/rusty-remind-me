@@ -121,7 +121,7 @@ remaining groups gain little until the triggers can move.
 | Step | Table group | Repository | State |
 |---|---|---|---|
 | 1 | Saved searches | `db::saved_searches::SavedSearches` | Done |
-| 2 | Reminder deliveries | | |
+| 2 | Reminders and deliveries | `db::reminders::Reminders` | Done |
 | 3 | Sync bookkeeping | | |
 | 4 | History and feedback | | |
 | 5 | Stats and analytics | | |
@@ -135,6 +135,23 @@ own:
 - an update keeps the stored name and `created_at`;
 - malformed `filters` JSON reads as empty;
 - `mark_seen` keeps the first sighting.
+
+**Step 2.** `db::reminders` holds the four statements behind reminders:
+- whether a memory is live;
+- setting or clearing `remind_at` (stamping `updated_at`, which the outbox
+  trigger picks up);
+- the window query that listing, the digest and the scheduler's "due"
+  check all share;
+- recording a delivery.
+
+The rules stay in `reminders.rs` and `scheduler.rs`: parsing `remind_at`,
+refusing one in the past, and recording a delivery only after it was
+attempted. The scheduler thread's own `Connection::open` and its
+`PRAGMA database_list` are left for the connection-ownership item (decision
+4), because routing them through `Database` changes the thread's busy
+timeout. The 42 existing reminder, scheduler, reminder-sync and digest
+tests pass unchanged, and they already pin the delivery rules: once only,
+a reschedule re-arms, and a deleted memory never fires.
 
 ## Related
 

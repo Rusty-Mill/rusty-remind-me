@@ -27,10 +27,10 @@
 //! Both exclude tombstones. A deleted memory's reminder firing would surface
 //! content the user deleted.
 
-use crate::db::queries::{parse_memory_row, prefixed_memory_columns};
+use crate::db::reminders::Reminders;
 use crate::models::{Memory, ReminderWindow, SetReminderOutcome};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
-use rusqlite::{params, Connection, OptionalExtension, Result};
+use rusqlite::{Connection, Result};
 
 /// Parse an ISO-8601 timestamp the way the reference's `datetime.fromisoformat`
 /// does, and canonicalize it to UTC.
@@ -80,14 +80,8 @@ pub fn set_reminder(
     memory_id: &str,
     remind_at: Option<&str>,
 ) -> Result<SetReminderOutcome> {
-    let exists: Option<String> = conn
-        .query_row(
-            "SELECT id FROM memories WHERE id = ? AND deleted_at IS NULL",
-            params![memory_id],
-            |r| r.get(0),
-        )
-        .optional()?;
-    if exists.is_none() {
+    let repo = Reminders::new(conn);
+    if !repo.is_live(memory_id)? {
         return Ok(SetReminderOutcome::NotFound {
             memory_id: memory_id.to_string(),
         });
@@ -99,10 +93,7 @@ pub fn set_reminder(
     // the reference: a blank string arriving from a form field is not a
     // timestamp, and rejecting it would make clearing awkward to express.
     let Some(raw) = remind_at.map(str::trim).filter(|r| !r.is_empty()) else {
-        conn.execute(
-            "UPDATE memories SET remind_at = NULL, updated_at = ? WHERE id = ?",
-            params![now.to_rfc3339(), memory_id],
-        )?;
+        repo.set_remind_at(memory_id, None, &now.to_rfc3339())?;
         return Ok(SetReminderOutcome::Cleared {
             memory_id: memory_id.to_string(),
         });
@@ -124,28 +115,11 @@ pub fn set_reminder(
     }
 
     let stored = when.to_rfc3339();
-    conn.execute(
-        "UPDATE memories SET remind_at = ?, updated_at = ? WHERE id = ?",
-        params![stored, now.to_rfc3339(), memory_id],
-    )?;
+    repo.set_remind_at(memory_id, Some(&stored), &now.to_rfc3339())?;
     Ok(SetReminderOutcome::Set {
         memory_id: memory_id.to_string(),
         remind_at: stored,
     })
-}
-
-/// The SQL fragment for one window, and how many `now` bindings it consumes.
-fn window_sql(when: ReminderWindow) -> (String, usize) {
-    let not_delivered = "NOT EXISTS (SELECT 1 FROM reminder_deliveries rd \
-         WHERE rd.memory_id = m.id AND rd.remind_at = m.remind_at)";
-    let upcoming = "m.remind_at > ?";
-    let overdue = format!("(m.remind_at <= ? AND {})", not_delivered);
-
-    match when {
-        ReminderWindow::Upcoming => (upcoming.to_string(), 1),
-        ReminderWindow::Overdue => (overdue, 1),
-        ReminderWindow::All => (format!("({} OR {})", upcoming, overdue), 2),
-    }
 }
 
 /// Memories with a reminder set, filtered to a window, soonest first.
@@ -153,33 +127,7 @@ fn window_sql(when: ReminderWindow) -> (String, usize) {
 /// Shared with the digest rather than re-derived there, so the two can never
 /// disagree about what is overdue.
 pub fn list_reminders(conn: &Connection, when: ReminderWindow, limit: i64) -> Result<Vec<Memory>> {
-    let now = Utc::now().to_rfc3339();
-    let (window, now_bindings) = window_sql(when);
-
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {} FROM memories m
-          WHERE m.remind_at IS NOT NULL
-            AND m.deleted_at IS NULL
-            AND {}
-          ORDER BY m.remind_at ASC
-          LIMIT ?",
-        prefixed_memory_columns("m"),
-        window
-    ))?;
-
-    let mut bindings: Vec<rusqlite::types::Value> = Vec::new();
-    for _ in 0..now_bindings {
-        bindings.push(rusqlite::types::Value::Text(now.clone()));
-    }
-    bindings.push(rusqlite::types::Value::Integer(limit));
-
-    let rows = stmt
-        .query_map(
-            rusqlite::params_from_iter(bindings.iter()),
-            parse_memory_row,
-        )?
-        .collect::<Result<Vec<_>>>()?;
-    Ok(rows)
+    Reminders::new(conn).in_window(when, &Utc::now().to_rfc3339(), limit)
 }
 
 /// Render memories the way the reference's `_fmt_memory_md` does.

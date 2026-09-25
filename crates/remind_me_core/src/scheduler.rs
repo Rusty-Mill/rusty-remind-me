@@ -33,10 +33,11 @@
 //! attempted, not whether the reminder is considered handled — a vault with no
 //! webhook must not silently accumulate undelivered reminders forever.
 
+use crate::db::reminders::Reminders;
 use crate::models::Memory;
 use crate::notifications;
 use crate::reminders;
-use rusqlite::{params, Connection, Result};
+use rusqlite::{Connection, Result};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -109,6 +110,7 @@ pub fn poll_once(conn: &Connection) -> Result<usize> {
 /// without touching the due query.
 pub fn poll_once_with(conn: &Connection, deliver: &mut dyn FnMut(&Memory)) -> Result<usize> {
     let due = due_reminders(conn)?;
+    let repo = Reminders::new(conn);
     let mut delivered = 0usize;
 
     for memory in &due {
@@ -118,14 +120,8 @@ pub fn poll_once_with(conn: &Connection, deliver: &mut dyn FnMut(&Memory)) -> Re
         deliver(memory);
         // Written after the delivery attempt, not before: a panic in a
         // delivery hook should leave the reminder pending rather than mark it
-        // handled. `INSERT OR IGNORE` because the unique index is the real
-        // guarantee — two racing pollers must produce one delivery, not an
-        // error that aborts the pass.
-        conn.execute(
-            "INSERT OR IGNORE INTO reminder_deliveries (memory_id, remind_at, delivered_at)
-             VALUES (?, ?, ?)",
-            params![memory.id, remind_at, chrono::Utc::now().to_rfc3339()],
-        )?;
+        // handled.
+        repo.record_delivery(&memory.id, remind_at, &chrono::Utc::now().to_rfc3339())?;
         delivered += 1;
     }
 
