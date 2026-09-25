@@ -168,6 +168,21 @@ pub trait HubStore: Send + Sync {
     /// and is reported separately from one.
     fn apply_record(&self, record: &Record, origin: Option<&str>) -> StoreResult<bool>;
 
+    /// Apply a push's records, each isolated from the others exactly as
+    /// [`Self::apply_record`] isolates it: one result per record, in order.
+    ///
+    /// A backend may share durability work across the batch (the engine
+    /// store syncs once per chunk, not once per record); it must not let
+    /// one record's failure change another's outcome, except that a failed
+    /// sync fails every record it covered. The default applies them one by
+    /// one.
+    fn apply_records(&self, records: &[Record], origin: Option<&str>) -> Vec<StoreResult<bool>> {
+        records
+            .iter()
+            .map(|record| self.apply_record(record, origin))
+            .collect()
+    }
+
     fn stats(&self) -> StoreResult<Stats>;
 
     /// Exact counts, by scan.

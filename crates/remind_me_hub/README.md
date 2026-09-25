@@ -92,10 +92,14 @@ Compared with SQLite it:
   insert log that is `fsync`'d before the push returns;
 - refuses ids over 64 bytes or containing a NUL byte. Such a record counts as
   `failed` and stays in the sender's outbox;
-- makes a pull wait for at most one push being written. Pulls are faster than
-  SQLite's under push load (3 ms against 27 ms median in
-  `examples/pull_latency.rs`); contended pushes are slower, since each write
-  syncs twice;
+- applies a push in chunks of 64 records, each under one sync, and a pull
+  waits for at most one chunk. In `examples/pull_latency.rs` it takes
+  pushes of 100 records about six times as fast as SQLite, with a pull
+  median of 4 ms against SQLite's 47 ms;
+- pauses writes once each time a table's row count passes a power of two,
+  while an in-memory map regrows: about 0.2–0.4 s at 115 000 memories;
+- after a failed `fsync`, refuses every write and fails `/health` until
+  restarted;
 - folds the insert logs every `REMIND_ME_HUB_COMPACT_INTERVAL_SECS`, and on
   every `/admin/compact_tombstones`;
 - locks its data directory, so a second hub pointed at it refuses to start.

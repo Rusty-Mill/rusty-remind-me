@@ -3,12 +3,13 @@
 //!
 //! ```sh
 //! cargo run --release -p remind_me_hub --features multimodal-store \
-//!     --example pull_latency -- [PRELOAD] [SECONDS] [PUSHERS] [PULLERS]
+//!     --example pull_latency -- [PRELOAD] [SECONDS] [PUSHERS] [PULLERS] [BATCH]
 //! ```
 //!
 //! Each backend gets a fresh on-disk hub preloaded with `PRELOAD` memories
-//! (default 20000). Then `PUSHERS` threads (default 4) apply one memory
-//! at a time, as `/sync/push` does, while `PULLERS` threads (default 2)
+//! (default 20000). Then `PUSHERS` threads (default 4) apply `BATCH`
+//! memories at a time (default 1), as one `/sync/push` of that many
+//! records does, while `PULLERS` threads (default 2)
 //! page `since_seq` pulls of 500 from random cursors, for `SECONDS`
 //! (default 10). It reports push throughput and pull latency percentiles.
 //!
@@ -30,6 +31,7 @@ struct Settings {
     duration: Duration,
     pushers: u64,
     pullers: u64,
+    batch: u64,
 }
 
 fn settings() -> Settings {
@@ -44,6 +46,7 @@ fn settings() -> Settings {
         duration: Duration::from_secs(arg(2, 10)),
         pushers: arg(3, 4),
         pullers: arg(4, 2),
+        batch: arg(5, 1).max(1),
     }
 }
 
@@ -81,15 +84,18 @@ fn run(name: &str, store: Arc<dyn HubStore>, s: &Settings) {
     let mut pushers = Vec::new();
     for t in 0..s.pushers {
         let (store, stop, pushed) = (Arc::clone(&store), Arc::clone(&stop), Arc::clone(&pushed));
+        let batch = s.batch;
         pushers.push(std::thread::spawn(move || {
             let mut n = 0u64;
             while !stop.load(Ordering::Relaxed) {
-                let id = format!("push-{t}-{n}");
-                store
-                    .apply_record(&memory(&id, n), Some("pusher"))
-                    .expect("push");
-                pushed.fetch_add(1, Ordering::Relaxed);
-                n += 1;
+                let records: Vec<Record> = (n..n + batch)
+                    .map(|k| memory(&format!("push-{t}-{k}"), k))
+                    .collect();
+                for result in store.apply_records(&records, Some("pusher")) {
+                    result.expect("push");
+                }
+                pushed.fetch_add(batch, Ordering::Relaxed);
+                n += batch;
             }
         }));
     }
@@ -158,8 +164,8 @@ fn remove(dir: &Path) {
 fn main() {
     let s = settings();
     println!(
-        "preload {} memories; {} pushers and {} pullers (since_seq, limit {MAX_PULL_LIMIT}) for {:?}",
-        s.preload, s.pushers, s.pullers, s.duration
+        "preload {} memories; {} pushers of {}-record batches and {} pullers (since_seq, limit {MAX_PULL_LIMIT}) for {:?}",
+        s.preload, s.pushers, s.batch, s.pullers, s.duration
     );
 
     let dir = scratch("sqlite");

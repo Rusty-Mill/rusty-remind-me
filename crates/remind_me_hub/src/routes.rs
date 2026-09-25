@@ -310,16 +310,19 @@ pub fn push(store: &dyn HubStore, body: &[u8]) -> Response {
     let mut failed = 0usize;
     let mut processed_ids: Vec<String> = Vec::new();
 
+    let mut valid = Vec::with_capacity(records.len());
     for raw in records {
-        let record = match record::parse(raw) {
-            Ok(r) => r,
+        match record::parse(raw) {
+            Ok(record) => valid.push(record),
             Err(e) => {
                 failed += 1;
                 eprintln!("hub: skipping malformed sync record: {e}");
-                continue;
             }
-        };
-        match store.apply_record(&record, origin.as_deref()) {
+        }
+    }
+    let outcomes = store.apply_records(&valid, origin.as_deref());
+    for (record, outcome) in valid.iter().zip(outcomes) {
+        match outcome {
             Ok(applied) => {
                 processed_ids.push(record.wire_id());
                 if applied {

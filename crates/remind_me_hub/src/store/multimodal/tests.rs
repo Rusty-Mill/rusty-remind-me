@@ -169,6 +169,25 @@ fn a_panic_under_the_lock_does_not_take_later_requests_down() {
 }
 
 #[test]
+fn a_panic_inside_a_group_commit_does_not_leave_later_writes_unsynced() {
+    let dir = TempDir::new("panic_in_batch");
+    let store = MultimodalHubStore::open(&dir.0).unwrap();
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut t = store.write().unwrap();
+        t.defer_sync();
+        apply_one(&mut t, &memory("m1", "2026-08-02T00:00:00Z"), None).unwrap();
+        panic!("a request panics before its commit");
+    }));
+    assert!(panicked.is_err());
+
+    let t = store.write().unwrap();
+    assert!(
+        !t.memories.inner().inner().is_sync_deferred(),
+        "the next writer starts with each write synced"
+    );
+}
+
+#[test]
 fn a_second_hub_cannot_open_a_directory_in_use() {
     let dir = TempDir::new("dir_lock");
     let first = MultimodalHubStore::open(&dir.0).unwrap();
@@ -258,4 +277,77 @@ fn a_malformed_cursor_timestamp_is_an_error_not_an_empty_page() {
         })
         .unwrap_err();
     assert!(err.0.contains("yesterday"), "{}", err.0);
+}
+
+#[test]
+fn a_batch_over_several_chunks_keeps_each_record_isolated_and_in_order() {
+    let dir = TempDir::new("batch");
+    let long = "x".repeat(ID_CAP + 1);
+    let mut batch: Vec<Record> = (0..GROUP_COMMIT * 2 + 5)
+        .map(|n| memory(&format!("m{n:03}"), "2026-08-02T00:00:00Z"))
+        .collect();
+    // A refused id in the first chunk, an LWW loss against a record earlier
+    // in the same chunk, and one straddling into the next chunk.
+    batch[3] = memory(&long, "2026-08-02T00:00:00Z");
+    batch[10] = memory("m005", "2026-08-01T00:00:00Z");
+    batch[GROUP_COMMIT] = memory("m001", "2026-08-03T00:00:00Z");
+    let expected_ids: Vec<String> = {
+        let mut ids: Vec<String> = (0..batch.len())
+            .filter(|n| ![3, 10, GROUP_COMMIT].contains(n))
+            .map(|n| format!("m{n:03}"))
+            .collect();
+        // m001 won LWW in the second chunk, so it moved to the next hub_seq.
+        ids.retain(|id| id != "m001");
+        ids.insert(GROUP_COMMIT - 3, "m001".to_string());
+        ids
+    };
+    {
+        let store = MultimodalHubStore::open(&dir.0).unwrap();
+        let results = store.apply_records(&batch, Some("n1"));
+        assert_eq!(results.len(), batch.len());
+        for (n, result) in results.iter().enumerate() {
+            match n {
+                3 => assert!(result.is_err(), "record {n}: {result:?}"),
+                10 => assert_eq!(result, &Ok(false), "record {n}"),
+                _ => assert_eq!(result, &Ok(true), "record {n}"),
+            }
+        }
+    }
+    let store = MultimodalHubStore::open(&dir.0).unwrap();
+    let after = seqs(&store);
+    let ids: Vec<String> = after.iter().map(|(id, _)| id.clone()).collect();
+    assert_eq!(
+        ids, expected_ids,
+        "the reopened hub holds the batch, in hub_seq order"
+    );
+    let issued: Vec<i64> = after.iter().map(|(_, seq)| *seq).collect();
+    assert!(issued.windows(2).all(|w| w[0] < w[1]), "{issued:?}");
+    assert_eq!(
+        issued.last().copied(),
+        Some(i64::try_from(batch.len() - 2).unwrap()),
+        "one hub_seq per applied memory write, none for the refused id or the LWW loss"
+    );
+}
+
+#[test]
+fn after_a_failed_sync_every_write_is_refused_and_ping_fails() {
+    let dir = TempDir::new("sync_failure");
+    let store = MultimodalHubStore::open(&dir.0).unwrap();
+    store
+        .apply_record(&memory("m1", "2026-08-02T00:00:00Z"), None)
+        .unwrap();
+    // No portable way to make `fsync` fail, so set what a failed commit
+    // leaves behind.
+    store.tables.write().unwrap().sync_failure = Some(StoreError("disk gone".into()));
+
+    assert_eq!(store.ping(), Err(StoreError("disk gone".into())));
+    let batch = [memory("m2", "2026-08-02T00:00:00Z"), link("m1", "e1")];
+    assert_eq!(
+        store.apply_records(&batch, None),
+        vec![Err(StoreError("disk gone".into())); 2]
+    );
+    assert!(store.compact().is_err());
+    assert!(store.compact_tombstones("2026-09-01T00:00:00Z").is_err());
+    // Reads carry on.
+    assert_eq!(seqs(&store), vec![("m1".into(), 1)]);
 }

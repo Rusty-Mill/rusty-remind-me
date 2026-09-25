@@ -2,6 +2,26 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-25 — The engine hub applies a push under one sync per chunk
+
+### Changed
+- **`/sync/push` on the embedded engine is about 13 times faster for batched pushes.**
+  - The store applies a push in chunks of 64 records, each under one `fsync` per table rather than one per record (the engine's new `GroupCommit`).
+  - In `examples/pull_latency.rs` with 4 pushers sending 100 records each, it went from 1327 to 17 040 records/s. SQLite managed 2780.
+  - Pull p99 stayed at 11 ms.
+  - A node's first full sync of 20 000 memories now spends about a second in the store, not 20.
+- `HubStore` gains `apply_records`, which the push route calls once per request. The SQL stores keep the default, record by record, so their behaviour is unchanged.
+- Each record is still isolated. A refused id or an LWW loss affects only its own outcome.
+
+### Fixed
+- **After a failed `fsync`, the engine store now refuses every write, and `/health` fails, until the hub restarts.** A failed sync leaves the chunk it covered applied in memory but possibly not on disk. Acknowledging later writes on top of that could lose them in a crash. The whole chunk is reported `failed`, so senders retry it.
+
+### Known limitations
+- **A one-off write pause at large sizes.** A table crossing a power of two in rows pauses writes, and pulls queued behind them, once while an in-memory map regrows. It took about 0.2–0.4 s at 115 000 memories, and up to 1 s once under benchmark load.
+- **Found by the benchmark, not new:** before this change, the benchmark never grew a hub that large.
+
+`examples/pull_latency.rs` gains a `BATCH` argument.
+
 ## 2026-09-25 — The embedded engine becomes the hub's default store; hub images build again
 
 ### Changed
