@@ -1,5 +1,0 @@
-blank_issues_enabled: false
-contact_links:
-  - name: Security vulnerability
-    url: https://github.com/baileyrd/rustils_async/security/advisories/new
-    about: Do not open a public issue for security reports — see SECURITY.md

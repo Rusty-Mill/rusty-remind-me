@@ -1,6 +1,0 @@
-{
-  "identifier": "default",
-  "description": "Permissions for the main window: this app's own commands (never gated by Tauri's ACL, only its built-in core APIs are) plus the one core API the frontend actually calls -- event:listen, for `session-event`.",
-  "windows": ["main"],
-  "permissions": ["core:default", "core:event:default"]
-}

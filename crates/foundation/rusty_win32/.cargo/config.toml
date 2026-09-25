@@ -1,7 +1,0 @@
-# Lets `cargo build/check/clippy --target x86_64-pc-windows-gnu` cross-compile
-# from a Linux host with `mingw-w64` installed — a fast local/CI sanity check
-# for the parts of this crate that can't run without a real Windows machine.
-# Has no effect on the windows-latest CI job, which builds natively with the
-# default MSVC toolchain.
-[target.x86_64-pc-windows-gnu]
-linker = "x86_64-w64-mingw32-gcc"

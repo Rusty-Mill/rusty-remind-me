@@ -1,0 +1,49 @@
+# docker-compose.sqlite.yml — Remind Me sync hub, SQLite backend.
+#
+# One container, one file, no database server. This has no counterpart in the
+# Python hub, which is Postgres-only; see `docs/adr/0015` for why the Rust hub
+# has both.
+#
+# Choose this when the hub serves one operator's handful of devices. Choose
+# docker-compose.yml (Postgres) when several nodes push concurrently, or when
+# you are taking over an existing Python hub's database — SQLite is
+# wire-identical but NOT schema-identical, so there is no in-place switch
+# between the two.
+#
+# Quick start (from this directory):
+#   cp hub-sqlite.env.example hub.env
+#   # openssl rand -hex 32   -> SYNC_SECRET (hub.env)
+#   docker compose -f docker-compose.sqlite.yml up -d
+#   curl http://127.0.0.1:8765/health
+#
+# Same exposure posture as the Postgres compose file: 127.0.0.1 only.
+
+services:
+  remind-me-hub:
+    build:
+      context: ../../..
+      dockerfile: crates/remind_me_hub/Containerfile
+    restart: always
+    env_file: hub.env
+    volumes:
+      # The image runs as uid 10001 (user `hub`), so a named volume is used
+      # rather than a bind mount: Docker initialises a named volume with the
+      # image path's ownership, whereas a host bind mount arrives owned by the
+      # host user and leaves the hub unable to create its database. If you do
+      # bind-mount a host directory, `chown 10001:10001` it first.
+      - hub-data:/data
+    ports:
+      - "127.0.0.1:8765:8765"
+    healthcheck:
+      # The binary is the only thing in the image — no curl, no wget — so the
+      # check is the hub asking itself. `/health` answers unauthenticated by
+      # design, which is what makes this possible without baking the secret
+      # into the healthcheck.
+      test: ["CMD", "rusty-remind-me-hub", "--health-check"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  hub-data:

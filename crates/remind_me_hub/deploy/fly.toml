@@ -1,0 +1,51 @@
+# fly.toml — Remind Me sync hub, deployed as a Fly.io app.
+#
+# Postgres is a separate managed Fly app (Fly Postgres), attached via
+# `fly postgres attach` — that's what supplies the DATABASE_URL secret below,
+# so it isn't set in this file. SYNC_SECRET is a plain secret you generate.
+#
+# Quick start (run from the WORKSPACE ROOT, three levels up from this file —
+# the Containerfile's context must be the workspace, since the hub is one
+# crate in it and the build needs the root Cargo.toml and Cargo.lock. This is
+# the one place the Rust hub's packaging differs materially from the Python
+# hub's, whose context was `hub/` alone):
+#
+#   fly postgres create --name remind-me-db
+#   fly apps create remind-me-hub
+#   fly postgres attach remind-me-db -a remind-me-hub   # sets DATABASE_URL
+#   fly secrets set SYNC_SECRET=$(openssl rand -hex 32) -a remind-me-hub
+#   fly deploy --config crates/remind_me_hub/deploy/fly.toml \
+#              --dockerfile crates/remind_me_hub/Containerfile
+#
+# No [[services]]/http_service block below on purpose: the hub is reached over
+# Fly's private 6PN network (WireGuard peer, or a Tailscale-to-Fly bridge) at
+# remind-me-hub.internal:8765, not the public internet — same "SYNC_SECRET is
+# the only thing standing between the internet and your memory database, so
+# don't expose this publicly" posture as the quadlet and compose templates.
+# Add your own [[services]] block only if you specifically want a public HTTPS
+# endpoint, and put real TLS + rate limiting in front of it if you do.
+#
+# SQLite on Fly: possible with a Fly Volume mounted at /data and
+# REMIND_ME_HUB_DB_PATH=/data/hub.db, but think before you do. A Fly Volume is
+# pinned to one machine, so the app cannot scale past a single instance and a
+# host failure takes the hub offline until it returns. Managed Postgres is the
+# better fit for anything you would deploy to Fly in the first place.
+
+app = "remind-me-hub"
+primary_region = "iad" # change to your nearest Fly region
+
+[build]
+  dockerfile = "crates/remind_me_hub/Containerfile"
+
+[[vm]]
+  # Smaller than the Python hub's 256mb: this image is a ~30 MB static-ish
+  # binary with no interpreter or ASGI server behind it. Raise it if you run
+  # the SQLite backend with a large database.
+  size = "shared-cpu-1x"
+  memory = "256mb"
+
+# Check health from a WireGuard peer (`fly wireguard create`, or the
+# Tailscale-to-Fly bridge) since there's no public endpoint here:
+#   curl http://remind-me-hub.internal:8765/health
+# `fly status`/`fly machine status` also report whether the Machine itself is
+# running, independent of application-level health.

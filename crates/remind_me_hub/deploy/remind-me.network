@@ -1,0 +1,5 @@
+# Podman Quadlet network — containers on it resolve each other by name
+# (remind-me-postgres, remind-me-hub), so no static IPs are needed.
+# Install to ~/.config/containers/systemd/remind-me.network
+[Network]
+NetworkName=remind-me

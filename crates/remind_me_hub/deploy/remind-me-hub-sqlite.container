@@ -1,0 +1,27 @@
+# Podman Quadlet — remind-me sync hub on the SQLite backend: one container,
+# one file, no database server. Use this INSTEAD OF remind-me-hub.container
+# and remind-me-postgres.container, not alongside them.
+# Install to ~/.config/containers/systemd/remind-me-hub.container
+# Secrets live in ~/remind-me-hub/hub.env (see hub-sqlite.env.example).
+[Unit]
+Description=Remind Me Sync Hub (SQLite)
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+ContainerName=remind-me-hub
+Image=localhost/remind-me-hub:latest
+PublishPort=100.83.168.90:8765:8765
+EnvironmentFile=%h/remind-me-hub/hub.env
+# The image runs as uid 10001. `:U` tells Podman to chown the host directory
+# to the container user, which is what makes a rootless bind mount writable
+# here -- without it the hub cannot create its database file and exits.
+Volume=%h/remind-me-hub/data:/data:Z,U
+# No Network= line: with no Postgres to reach, the hub needs no shared
+# network, and leaving it off keeps it off the remind-me bridge entirely.
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=default.target

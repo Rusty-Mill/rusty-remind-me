@@ -1,0 +1,53 @@
+[package]
+name = "remind_me_hub"
+version = "0.2.3"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Rusty-Mill/rusty_mill"
+
+[package.metadata.rusty_mill]
+layer = "apps"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+rusqlite = { version = "0.39", features = ["bundled", "backup", "functions"] }
+
+# The Postgres backend. Optional because the SQLite backend is complete on its
+# own and a self-hosted single-operator hub has no reason to carry a Postgres
+# driver -- but see `docs/adr/0015`: it is *on* by default, because the
+# reference hub is Postgres-backed and a "successor" that cannot take over an
+# existing deployment would not be one.
+#
+# `with-serde_json-1` is what lets JSONB columns round-trip as
+# `serde_json::Value`, which is the same type the wire records already use, so
+# tags/metadata/aliases need no bespoke conversion.
+postgres = { version = "0.19", features = [
+    "with-serde_json-1",
+], optional = true }
+
+# The embedded-engine backend (docs/adr/0021): `rusty_multimodal_db`'s
+# storage engine, in-process. `uuid` with `v5` derives each record's engine
+# id from its string id; the engine itself only needs `Uuid` as a type.
+rusty_multimodal_db_engine = { workspace = true, optional = true }
+uuid = { version = "1", features = ["v5"], optional = true }
+
+[features]
+default = ["postgres-store"]
+# Postgres storage. Named `postgres-store` rather than `postgres` so it does
+# not collide with the optional dependency's own implicit feature name.
+postgres-store = ["dep:postgres"]
+# Storage on the embedded `rusty_multimodal_db` engine: a data directory, no
+# database server. Off by default until the copy tool and the default switch
+# land (docs/adr/0021, phase 3).
+multimodal-store = ["dep:rusty_multimodal_db_engine", "dep:uuid"]
+
+[dev-dependencies]
+# The Postgres tests build a legacy-schema database directly, which is the
+# only way to exercise the migration that makes this a drop-in.
+postgres = { version = "0.19", features = ["with-serde_json-1"] }
+
+[[bin]]
+name = "rusty-remind-me-hub"
+path = "src/main.rs"

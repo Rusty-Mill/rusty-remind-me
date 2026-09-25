@@ -1,4 +1,0 @@
-/target
-**/gen/schemas
-*.sqlite3
-*.sqlite3-*

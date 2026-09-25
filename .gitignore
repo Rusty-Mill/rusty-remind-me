@@ -1,13 +1,21 @@
-# Not anchored to the workspace root: some subtree-merged crates (e.g.
-# rusty_config, see the "cleanup" PR that removed its already-tracked
-# target/) had a stray per-crate target/ committed upstream, from being
-# built standalone before this workspace existed. Matching it at every
-# depth stops that from silently recurring on a future import.
-target/
+# Cargo build artifacts
+/target/
+**/*.rs.bk
 
-# Python bytecode from running .github/scripts tests locally
-__pycache__/
-*.pyc
+# Local SQLite databases (created at runtime; never a source artifact)
+*.db
+*.db-wal
+*.db-shm
 
-# Runtime SQLite artifacts
-meshed_registry.db
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local-only debug scratch (not part of this repo's project)
+/.profile-check.ps1
+/rc/flatbuffers/
+
+# Claude Code agent worktree bookkeeping (not part of this repo's project)
+/.claude/worktrees/

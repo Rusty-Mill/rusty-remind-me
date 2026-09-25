@@ -1,5 +1,0 @@
-/target
-# This is a library crate; per Cargo's guidance, the lockfile is not
-# committed so downstream consumers resolve against their own dependency
-# graph.
-Cargo.lock

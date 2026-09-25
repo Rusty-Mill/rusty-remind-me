@@ -1,0 +1,139 @@
+[package]
+name = "remind_me_core"
+version = "0.2.3"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Rusty-Mill/rusty_mill"
+
+[package.metadata.rusty_mill]
+layer = "apps"
+
+[dependencies]
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+async-trait = "0.1"
+thiserror = "2.0"
+tokio = { version = "1.0", features = ["full"] }
+# 0.39 rather than the 0.31 this crate used standalone: rusqlite declares
+# `links = "sqlite3"`, so Cargo allows one version per graph, and the rest of
+# the rusty_mill workspace is on 0.39.
+rusqlite = { version = "0.39", features = ["bundled", "backup", "functions"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.0", features = ["v4"] }
+sha256 = "1.5"
+dirs = "5.0"
+parking_lot = "0.12"
+pdf-extract = { version = "0.12", optional = true }
+aws-sdk-s3 = { version = "1", optional = true }
+aws-config = { version = "1", optional = true }
+usearch = { version = "2", optional = true }
+ocrs = { version = "0.12", optional = true }
+# Pinned to the major version `ocrs` itself links against: `OcrEngineParams`
+# takes an `rten::Model`, so a newer `rten` here is a *different type* and the
+# build fails with a confusing "expected Model, found Model".
+rten = { version = "0.24", optional = true }
+image = { version = "0.25", optional = true, default-features = false, features = [
+    "png",
+    "jpeg",
+] }
+rten-tensor = { version = "0.24", optional = true }
+tokenizers = { version = "0.23", optional = true }
+whisper-rs = { version = "0.16", optional = true }
+symphonia = { version = "0.6", optional = true, default-features = false, features = [
+    "mp3",
+    "aac",
+    "isomp4",
+    "vorbis",
+    "ogg",
+    "wav",
+    "pcm",
+] }
+
+[dev-dependencies]
+# The real remind_me_hub binary's library, SQLite-only (no `postgres-store`:
+# tests need an in-memory store, not a Postgres connection) -- used by
+# `tests/support`'s `MockHub` to run actual remind_me_hub request handling
+# against this crate's sync client, not just another copy of this crate's
+# own peer server (which `tests/support`'s `MockNode` already covers).
+# remind_me_hub has no dependency the other direction, so this is a
+# dev-only, test-only edge, not a runtime one.
+# `workspace = true` deliberately not used: Cargo ignores a downstream
+# `default-features = false` on a `workspace = true` dependency unless the
+# workspace table itself opts into that (a real restriction, not a bug --
+# confirmed by the build warning it produces, and it would otherwise
+# silently pull in the full `postgres`/`tokio-postgres` tree here).
+remind_me_hub = { path = "../remind_me_hub", default-features = false }
+
+[features]
+default = []
+# PDF text extraction. Optional so a build that does not want a PDF parser
+# does not carry one (71 transitive crates), matching the reference's own
+# lazily-imported `pdf` extra. Feature-off, `.pdf` import reports the format
+# as unavailable rather than failing obscurely.
+pdf = ["dep:pdf-extract"]
+# Cloud backup upload. Optional for the same reason as `pdf`: the AWS SDK is a
+# 233-crate tree, and a build that does not upload backups should not carry it.
+cloud-backup = ["dep:aws-sdk-s3", "dep:aws-config"]
+# Approximate nearest-neighbour vector search. Optional because usearch is a
+# C++ library built from source (~5 minutes), and brute-force search already
+# works — this is a scale improvement, not a capability.
+ann = ["dep:usearch"]
+# OCR for `.png`/`.jpg`/`.jpeg`. Optional because it carries a neural-network
+# runtime and its models. `ocrs`/`rten` are pure Rust — unlike the ONNX
+# Runtime binding, which fetches a native runtime at *run* time, which would
+# be exactly the implicit download this feature is required not to do.
+ocr = ["dep:ocrs", "dep:rten", "dep:image"]
+# Speech-to-text for `.mp3`/`.m4a`/`.wav`/`.ogg`. `whisper-rs` builds
+# whisper.cpp from source; `symphonia` decodes the containers in pure Rust, so
+# no system ffmpeg is needed — the same "no system binary" rule that made the
+# reference pick faster-whisper over pywhispercpp.
+audio = ["dep:whisper-rs", "dep:symphonia"]
+# Cross-encoder reranking of the head of the RRF-ranked list. Shares `rten`
+# with `ocr` rather than pulling a second neural-network runtime in, and for
+# the same reason: it is pure Rust and takes explicit model paths, so enabling
+# reranking can never turn a search into a model download.
+rerank = ["dep:rten", "dep:rten-tensor", "dep:tokenizers"]
+# Local ONNX embedding backend (in-process, no daemon), matching the
+# reference's default `_Embedder` (sentence-transformers/all-MiniLM-L6-v2 by
+# convention, but any BERT-family bi-encoder exported to ONNX works). Shares
+# `rten`/`tokenizers` with `rerank` for the same reason `rerank` shares them
+# with `ocr`: one neural-network runtime, not a second. Takes explicit model
+# paths like `rerank` does — enabling it can never turn a search into an
+# implicit HuggingFace download.
+local-embed = ["dep:rten", "dep:rten-tensor", "dep:tokenizers"]
+# Dump every thread's stack when a tool call hangs, matching the reference's
+# `faulthandler.dump_traceback_later`. Optional and Linux-only, and unlike
+# every other feature here it needs *system* libraries (`libunwind-dev` and
+# `liblzma-dev` -- see `build.rs` for why the second is not optional) plus
+# permission to `ptrace`. That is a real departure
+# from this list's "no system binary" rule, which is why it is off by default
+# and why `docs/adr/0014` exists. Feature-off, the watchdog reports the stuck
+# call's identity and duration exactly as it does today.
+stack-dumps = ["dep:rstack-self"]
+
+# The workspace's only *unconditional* FFI dependency, and target-gated so it
+# exists nowhere else. `docs/adr/0013` records why the sidecar teardown gap was
+# worth closing and `docs/adr/0012` records the general reluctance -- read both
+# before adding a second one. (`stack-dumps` also reaches FFI, but only when
+# someone opts in; see `docs/adr/0014`.)
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_JobObjects",
+] }
+
+# Thread-stack dumping for the slow-call watchdog, behind the `stack-dumps`
+# feature. Linux-only because it works by `ptrace`-ing this process from a
+# short-lived child -- out-of-process by design, so a thread wedged in
+# CPU-bound code still gets dumped, which is the whole point and is exactly
+# what an in-process signal handler could not do safely.
+[target.'cfg(target_os = "linux")'.dependencies]
+rstack-self = { version = "0.3", optional = true }
+
+# Test fixture for `stack-dumps`, not a shipped tool. Declared explicitly so
+# `required-features` applies: without it, a default build would try to compile
+# a binary whose whole purpose is the feature it is missing.
+[[bin]]
+name = "watchdog_stack_probe"
+required-features = ["stack-dumps"]

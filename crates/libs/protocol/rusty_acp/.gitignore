@@ -1,7 +1,0 @@
-/target
-**/*.rs.bk
-Cargo.lock
-
-# Redis writes a snapshot into whatever directory it was started from. Running
-# the Redis half of the test suite from the repo root therefore drops one here.
-dump.rdb

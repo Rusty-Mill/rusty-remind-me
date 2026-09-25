@@ -1,4 +1,0 @@
-# rusty_lines is a private git dependency: fetch it with the system git
-# CLI (which has the credentials) instead of cargo's built-in fetcher.
-[net]
-git-fetch-with-cli = true

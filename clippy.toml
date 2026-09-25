@@ -1,0 +1,6 @@
+# Applies to every crate under crates/apps/rusty_remind_me (clippy walks up
+# from each crate's manifest dir to the nearest clippy.toml).
+disallowed-methods = [
+    { path = "std::env::set_var", reason = "changing the environment while another test thread runs C code that reads it (SQLite's initialisation) can segfault the test binary; use crate::test_env::set_var (remind_me_core/src/test_env.rs)" },
+    { path = "std::env::remove_var", reason = "changing the environment while another test thread runs C code that reads it (SQLite's initialisation) can segfault the test binary; use crate::test_env::remove_var (remind_me_core/src/test_env.rs)" },
+]

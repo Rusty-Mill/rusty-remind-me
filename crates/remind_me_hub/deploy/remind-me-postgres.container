@@ -1,0 +1,23 @@
+# Podman Quadlet — rootless Postgres for the remind-me sync hub.
+# Install to ~/.config/containers/systemd/remind-me-postgres.container
+# Secrets live in ~/remind-me-hub/postgres.env (see postgres.env.example).
+#
+# Not needed at all if the hub runs on the SQLite backend — see
+# remind-me-hub-sqlite.container.
+[Unit]
+Description=Remind Me PostgreSQL
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+ContainerName=remind-me-postgres
+Image=docker.io/library/postgres:16-alpine
+Network=remind-me.network
+Volume=%h/remind-me-hub/postgres-data:/var/lib/postgresql/data:Z
+EnvironmentFile=%h/remind-me-hub/postgres.env
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=default.target

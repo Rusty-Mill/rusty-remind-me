@@ -1,440 +1,703 @@
-# rusty_mill
+# `rusty_remind_me`
 
-The Rusty Mill monorepo: a Cargo workspace consolidating previously
-standalone `baileyrd/*` crates into one repository, one build, and one CI
-pipeline. Each crate keeps its full original commit history, merged in via
-`git subtree` under `crates/`.
+> High-performance, persistent long-term memory engine and Model Context Protocol (MCP) server written in Rust, built on the **Rusty Mill** ecosystem.
 
-A first wave merged fourteen crates (below the `rusty_term` row through
-`rusty_text`). A second wave added fifteen more (`rusty_tokio` through
-`rustils_async`), and a third wave twenty-six more (`rusty_wire` through
-`rusty_voice`). A fourth wave merged the last eleven standalone
-`baileyrd/*` repos — `rusty_croc`, `rusty_test`, `rusty_inventrory`,
-`rusty_skillopt`, `rusty_key`, `rusty_llama`, `rusty_tailscale`,
-`rusty_adk`, `rusty_provider`, `rusty_yirp`, and `rusty_agent_gateway` —
-one crate at a time, the same way. All four waves are complete: every
-`baileyrd/rusty_*` repo that was in scope now lives under `crates/`, and
-the standalone repos carry an archive notice pointing here.
+> **Lives in the Rusty Mill monorepo.** Since v0.2.1 this product is developed
+> and released from [`Rusty-Mill/rusty_mill`](https://github.com/Rusty-Mill/rusty_mill)
+> under `crates/apps/rusty_remind_me` (imported with full history). The
+> standalone [`baileyrd/rusty_remind_me`](https://github.com/baileyrd/rusty_remind_me)
+> repository is frozen at v0.2.0. Paths below are relative to this directory
+> unless they say otherwise; `cargo` commands run from the monorepo root.
 
-A fifth merge, outside that `baileyrd/rusty_*` wave numbering, brought in
-`baileyrd/nexus` — a 42-crate microkernel note-taking/AI-agent workspace,
-not a `rusty_*`-prefixed leaf crate — under `crates/nexus/`, keeping the
-same `git subtree` process. Its own nested `[workspace]` and `Cargo.lock`
-were dropped the same way rusty_agent_gateway's and rusty_yirp's were; its
-42 crates join this workspace's member list directly rather than through
-their own path prefix, since nexus's crate names (`nexus-*`) don't
-collide with anything already here. `crates/nexus/shell` (nexus's own
-Tauri desktop shell, `shell/src-tauri`) is `exclude`d the same way as
-`rusty_key`'s `desktop/src-tauri` — it's a separate pnpm-driven Tauri
-workspace, not a `cargo test` target.
+`rusty_remind_me` is a native Rust port of `remind-me`. It equips AI assistants (such as Claude Desktop, Antigravity, Cursor, OpenAI Codex, and custom LLM agents) with persistent, searchable memory using SQLite FTS5 full-text search, ACT-R inspired memory vitality decay, Reciprocal Rank Fusion (RRF) search ranking, a structured Knowledge Graph entity system, and automated markdown wiki compilation.
 
-A sixth merge, also outside the wave numbering, brought in
-`baileyrd/rusty_multimodal_db` — a single-crate benchmark harness for
-record-store backend design — under `crates/rusty_multimodal_db/`, the
-same `git subtree` process. Its one pinned git dependency on `rusty_tls`
-(`Rusty-Mill/rusty_mill`, a specific commit) retired to a plain path
-dependency on this workspace's own `crates/rusty_tls` (ADR-0002), and its
-`rusqlite` pin bumped `0.32` → `0.39` to match `crates/rusty_inventrory`'s
-`inventory-core` — `rusqlite`'s `links = "sqlite3"` key allows only one
-version in the whole dependency graph, the same constraint the `nexus`
-merge hit.
+---
 
-A seventh addition, `rusty_hister` under `crates/rusty_hister/`, is fresh
-work rather than a merge: a Rust port of
-[asciimoo/hister](https://github.com/asciimoo/hister) (AGPL-3.0-or-later),
-bootstrapped as eight native crates (`rusty-hister-core` through
-`rusty-hister-mcp`, see `crates/rusty_hister/README.md`) with a full
-capability inventory and two open decision-requests (search engine, JS-
-rendering crawler) — no port implementation lands until those are decided.
+## Key Features
 
-An eighth addition, `rusty_proxmox`, `rusty_opnsense`, `rusty_homelab_mcp`,
-`rusty_fedora_agent`, and `rusty_fedora`, is a homelab-infrastructure
-cluster: Proxmox VE and OPNsense REST clients, an MCP server exposing that
-homelab control as tools, and an agent/client pair for scoped local Fedora
-host control. Unlike the numbered waves and the nexus/`rusty_multimodal_db`/
-`rusty_hister` merges above, no record of when or how these 5 crates landed
-survives — they predate `RELEASE_NOTES.md`'s earliest recorded entries, so
-their arrival is placed here, alongside the broader crate build-out,
-without a specific date.
+- **Hybrid Search Engine**: FTS5 BM25 keyword matching combined with Reciprocal Rank Fusion (RRF) rank scoring.
+- **Semantic Search, Reranking & Query Expansion**: Optional vector search (Ollama or an in-process ONNX bi-encoder), cross-encoder reranking, and HyDE query expansion — each off by default, each degrading to keyword-only on any failure.
+- **ACT-R Memory Vitality Model**: Time-based exponential decay, write-time priors by category/source, and bridge protection (decay rate halved for frequently accessed memories).
+- **Forward-Compatible Model Context Protocol (MCP) Server**: Stdio JSON-RPC MCP server with dynamic protocol version negotiation (supporting `2024-11-05` through upcoming 2026 releases), resources, prompts, dynamic tool change notifications (`listChanged`), and tool execution.
+- **Automated Client Setup**: Built-in `configure` command & scripts for 1-click MCP setup across **Claude Desktop**, **Antigravity**, **Cursor**, and **Codex**.
+- **REST API Server**: Synchronous HTTP daemon hand-rolled on `std::net::TcpListener` (no framework, not even `tokio`) exposing endpoints for health checks, memory storage, FTS5 retrieval, and stats.
+- **Multi-Node Sync & Remote Connector**: Push/pull sync against a hub or discovered peers (static list or Tailscale), plus a Streamable HTTP remote MCP connector (secret-path/bearer or OAuth 2.1) for network-reachable clients like claude.ai.
+- **Knowledge Graph Entities**: Canonical entity deduplication, alias resolution, and relation traversal up to 3 hops.
+- **Markdown Wiki Synthesis**: Topic-based wiki page compilation, queryable topic search, and
+  bulk import of Markdown directories (`wiki-import`) — the ingestion path for
+  [`dbs export-wiki`](https://github.com/baileyrd/Daily-Backup-System).
+- **Rusty Mill Ecosystem**: Part of the `Rusty Mill` project family; no `rusty_*` crates are wired in as dependencies yet — current dependencies are ordinary crates.io crates (`serde`, `tokio`, `rusqlite`, `chrono`, `uuid`).
 
-## Crates
+---
 
-| Crate | Path | Purpose |
-|---|---|---|
-| [`rusty_term`](crates/libs/ui/rusty_term) | `crates/libs/ui/rusty_term` | Terminal emulator (VT/ANSI parser, optional native GUI/GPU backends) |
-| [`rusty_term_l13`](crates/libs/ui/rusty_term/l13) | `crates/libs/ui/rusty_term/l13` | `rusty_term`'s L13 structured side-channel (MCP + LSP/ACP over private OSC) |
-| [`rusty_gpu`](crates/libs/ui/rusty_gpu) | `crates/libs/ui/rusty_gpu` | `no_std` software framebuffer presenter and SIMD rasterizer |
-| [`rusty_gui`](crates/libs/ui/rusty_gui) | `crates/libs/ui/rusty_gui` | `no_std` windowing, event loop, and clipboard manager |
-| [`rusty_font`](crates/libs/ui/rusty_font) | `crates/libs/ui/rusty_font` | `no_std` TrueType/OpenType parser and glyph rasterizer |
-| [`rusty_regx`](crates/foundation/rusty_regx) | `crates/foundation/rusty_regx` | Zero-dependency, linear-time POSIX ERE regex engine |
-| [`rusty_win32`](crates/foundation/rusty_win32) | `crates/foundation/rusty_win32` | Minimal-dependency Win32 API wrapper (leaf crate) |
-| [`rush`](crates/apps/rush) | `crates/apps/rush` | A small, bash-compatible shell |
-| [`rusty_lines`](crates/libs/ui/rusty_lines) | `crates/libs/ui/rusty_lines` | Hand-rolled readline alternative (emacs/vi keymaps, history, completion hooks) |
-| [`mill-term`](crates/apps/mill-term) | `crates/apps/mill-term` | Integrated terminal + environment launcher hosting `rush` inside `rusty_term` |
-| [`rpath`](crates/foundation/rpath) | `crates/foundation/rpath` | Path translation/normalization for MSYS2/Git Bash/POSIX ↔ Windows |
-| [`rusty_git`](crates/libs/rusty_git) | `crates/libs/rusty_git` | Pure-Rust Git object model, index, refs, and `rgit` CLI |
-| [`rusty_diff`](crates/foundation/rusty_diff) | `crates/foundation/rusty_diff` | Myers/Patience diff algorithms, unified diff formatting, patch application |
-| [`rusty_compress`](crates/foundation/rusty_compress) | `crates/foundation/rusty_compress` | Sans-IO DEFLATE/Gzip/Zlib/LZMA stream compression |
-| [`rusty_text`](crates/apps/rusty_text) | `crates/apps/rusty_text` | Pure-Rust sed (`rsed`) and awk (`rawk`) engines |
-| [`rusty_tokio`](crates/libs/async/rusty_tokio) | `crates/libs/async/rusty_tokio` | Hand-rolled, from-scratch async runtime: work-stealing scheduler, epoll/io_uring reactor, timers, async sync primitives |
-| [`rusty_tokio-macros`](crates/libs/async/rusty_tokio/rusty_tokio-macros) | `crates/libs/async/rusty_tokio/rusty_tokio-macros` | `rusty_tokio`'s `#[main]`/`#[test]` proc-macro attributes |
-| [`rusty_rusqlite`](crates/libs/storage/rusty_rusqlite) | `crates/libs/storage/rusty_rusqlite` | Pure-Rust, from-scratch SQLite reimplementation aiming for `rusqlite` API parity |
-| [`rusty_libc`](crates/foundation/rusty_libc) | `crates/foundation/rusty_libc` | `no_std`, zero-dependency, Linux-only raw-syscall replacement for the `libc` crate |
-| [`rusty_acp`](crates/libs/protocol/rusty_acp) | `crates/libs/protocol/rusty_acp` | Agent Communication Protocol (ACP) v0.2.0: protocol types, an HTTP client, and a server framework for hosting agents |
-| [`rusty_tls`](crates/libs/net/rusty_tls) | `crates/libs/net/rusty_tls` | A `rustls`-based TLS library, with an optional `rusty_tokio`-backed async stream and an experimental hand-rolled record-layer engine |
-| [`rusty_serde`](crates/foundation/rusty_serde/rusty_serde) | `crates/foundation/rusty_serde/rusty_serde` | Hand-rolled, dependency-free `Serialize`/`Deserialize` data model plus JSON and RON-inspired formats |
-| [`rusty_serde_derive`](crates/foundation/rusty_serde/rusty_serde_derive) | `crates/foundation/rusty_serde/rusty_serde_derive` | `rusty_serde`'s `#[derive(Serialize, Deserialize)]` proc-macro, hand-written directly on `proc_macro` (no `syn`/`quote`) |
-| [`rusty_serde_erased`](crates/foundation/rusty_serde/rusty_serde_erased) | `crates/foundation/rusty_serde/rusty_serde_erased` | Minimal unsafe primitive erasing a serializer/deserializer's associated `Ok` type across an object-safe boundary — internal to `rusty_serde` |
-| [`rusty_lsp`](crates/libs/protocol/rusty_lsp) | `crates/libs/protocol/rusty_lsp` | Small, reusable async Language Server Protocol framework: own the protocol plumbing, implement one trait for your language |
-| [`rusty_a2a`](crates/libs/protocol/rusty_a2a) | `crates/libs/protocol/rusty_a2a` | Reusable implementation of the Agent2Agent (A2A) protocol: JSON-RPC/REST/gRPC transports, client and server |
-| [`rusty-mcp`](crates/libs/protocol/rusty_mcp/crates/rusty-mcp) | `crates/libs/protocol/rusty_mcp/crates/rusty-mcp` | Reusable scaffold for building Model Context Protocol servers, built on `rmcp` |
-| [`rusty-mcp-demo`](crates/libs/protocol/rusty_mcp/crates/rusty-mcp-demo) | `crates/libs/protocol/rusty_mcp/crates/rusty-mcp-demo` | Example MCP server built on the `rusty-mcp` scaffold |
-| [`rusty_stream`](crates/libs/async/rusty_stream) | `crates/libs/async/rusty_stream` | Single-node durable log, built on `rusty_wire` and `rusty_tokio` |
-| [`rusty_url`](crates/foundation/rusty_url) | `crates/foundation/rusty_url` | From-scratch WHATWG URL Standard implementation, aiming for parity with the `url` crate |
-| [`rusty_http`](crates/libs/net/rusty_http) | `crates/libs/net/rusty_http` | Sans-IO HTTP/1.1 message layer and `Url` type, with optional sync/`rusty_tokio`/real-tokio async adapters |
-| [`rusty_json`](crates/foundation/rusty_json) | `crates/foundation/rusty_json` | From-scratch JSON library, `no_std`-capable, with `serde` interop |
-| [`rusty_json-derive`](crates/foundation/rusty_json/rusty_json-derive) | `crates/foundation/rusty_json/rusty_json-derive` | `rusty_json`'s `#[derive(RustyJson)]` proc-macro |
-| [`rusty_oauth`](crates/libs/net/rusty_oauth) | `crates/libs/net/rusty_oauth` | Hand-rolled, zero-dependency OAuth 2.0 / 2.1 protocol implementation |
-| [`rusty_proxmox`](crates/libs/homelab/rusty_proxmox) | `crates/libs/homelab/rusty_proxmox` | Async client for the Proxmox VE REST API: nodes, guests (QEMU/LXC), and power control |
-| [`rusty_opnsense`](crates/libs/homelab/rusty_opnsense) | `crates/libs/homelab/rusty_opnsense` | Async client for the OPNsense REST API: system status, services, interfaces, firewall aliases, and gateways |
-| [`rusty_homelab_mcp`](crates/apps/rusty_homelab_mcp) | `crates/apps/rusty_homelab_mcp` | MCP server exposing homelab control (Proxmox VE, OPNsense) as tools, built on the `rusty-mcp` scaffold |
-| [`rusty_fedora_agent`](crates/apps/rusty_fedora_agent) | `crates/apps/rusty_fedora_agent` | Unprivileged local agent exposing scoped systemd/dnf/config-file control over HTTP — the backend `rusty_homelab_mcp`'s fedora module talks to |
-| [`rusty_fedora`](crates/libs/homelab/rusty_fedora) | `crates/libs/homelab/rusty_fedora` | Async client for `rusty_fedora_agent`'s local HTTP API: system status, systemd services, journal reads, dnf updates/install/remove, and allowlisted config file read/write |
-| [`reactor-core`](crates/platform/rustils_async/crates/reactor-core) | `crates/platform/rustils_async/crates/reactor-core` | Runtime-agnostic async-io primitives (a provider framework, not a universal capability) |
-| [`platform-async`](crates/platform/rustils_async/crates/platform-async) | `crates/platform/rustils_async/crates/platform-async` | Async trait counterparts to `rustils::platform`'s process domain |
-| [`platform-async-mock`](crates/platform/rustils_async/crates/platform-async-mock) | `crates/platform/rustils_async/crates/platform-async-mock` | In-memory async process backend for `platform-async`, for consumer tests without a real OS reactor |
-| [`platform-async-linux`](crates/platform/rustils_async/crates/platform-async-linux) | `crates/platform/rustils_async/crates/platform-async-linux` | The real Linux backend for `platform-async`: `pidfd` + `epoll` async wait path |
-| [`threading`](crates/platform/rustils_async/crates/threading) | `crates/platform/rustils_async/crates/threading` | Minimal multithreading primitives: scoped-thread spawn, `Mutex`/`RwLock` with explicit poisoning policy |
-| [`coreutils-async`](crates/apps/coreutils-async) | `crates/apps/coreutils-async` | Reference consumer for `platform-async`: `arun`, an async port of `rustils`' `rrun` |
-| [`rusty_wire`](crates/foundation/rusty_wire) | `crates/foundation/rusty_wire` | Minimal, zero-dependency endian-explicit byte cursor Reader/Writer |
-| [`rusty_std`](crates/foundation/rusty_std) | `crates/foundation/rusty_std` | `no_std` + `alloc` sovereign standard library, built on `rusty_libc`/`rusty_win32` |
-| [`rusty_err`](crates/foundation/rusty_err) | `crates/foundation/rusty_err` | `no_std` + `alloc` sovereign error trait, context extension, and proc-macro error derive library, built on `rusty_std` |
-| [`rusty_err_derive`](crates/foundation/rusty_err/derive) | `crates/foundation/rusty_err/derive` | `rusty_err`'s `#[derive(Error)]` proc-macro |
-| [`rusty_request`](crates/libs/net/rusty_request) | `crates/libs/net/rusty_request` | Async HTTP client (a Rust take on Python's `requests`), built on `rusty_tokio`/`rusty_tls`/`rusty_http` |
-| [`rusty_sqlite`](crates/libs/storage/rusty_sqlite) | `crates/libs/storage/rusty_sqlite` | A thin, ergonomic wrapper over `rusqlite`: bundled SQLite, typed FTS5 schema building, and connection/migration lifecycle management |
-| [`rusty_time`](crates/foundation/rusty_time) | `crates/foundation/rusty_time` | `no_std` + `alloc` sovereign DateTime, Date, Time, ISO-8601, and timezone offset calculation crate, built on `rusty_std` |
-| [`rusty_uuid`](crates/foundation/rusty_uuid) | `crates/foundation/rusty_uuid` | Minimal, dependency-free UUID v4 generation |
-| [`rusty_wiremock`](crates/libs/rusty_wiremock) | `crates/libs/rusty_wiremock` | `no_std` + `alloc` sovereign HTTP mock server and request matcher for Rusty Mill test suites, built on `rusty_http`/`rusty_json`/`rusty_std` |
-| [`rusty-search-core`](crates/libs/storage/rusty_search/crates/rusty-search-core) | `crates/libs/storage/rusty_search/crates/rusty-search-core` | Backend-agnostic async search interface: documents, schema, query DSL, and the pluggable `SearchBackend` trait |
-| [`rusty-search-memory`](crates/libs/storage/rusty_search/crates/rusty-search-memory) | `crates/libs/storage/rusty_search/crates/rusty-search-memory` | In-memory `SearchBackend` implementation: no external engine required |
-| [`rusty-search-tantivy`](crates/libs/storage/rusty_search/crates/rusty-search-tantivy) | `crates/libs/storage/rusty_search/crates/rusty-search-tantivy` | Tantivy-backed `SearchBackend` implementation: embedded full-text search |
-| [`rusty-search-sqlite-fts5`](crates/libs/storage/rusty_search/crates/rusty-search-sqlite-fts5) | `crates/libs/storage/rusty_search/crates/rusty-search-sqlite-fts5` | SQLite FTS5-backed `SearchBackend` implementation: embedded full-text search via SQL virtual tables |
-| [`rusty-search-elasticsearch`](crates/libs/storage/rusty_search/crates/rusty-search-elasticsearch) | `crates/libs/storage/rusty_search/crates/rusty-search-elasticsearch` | Elasticsearch-backed `SearchBackend` implementation: a remote HTTP search cluster |
-| [`rusty-search-meilisearch`](crates/libs/storage/rusty_search/crates/rusty-search-meilisearch) | `crates/libs/storage/rusty_search/crates/rusty-search-meilisearch` | Meilisearch-backed `SearchBackend` implementation: a remote HTTP search engine |
-| [`rusty-search-opensearch`](crates/libs/storage/rusty_search/crates/rusty-search-opensearch) | `crates/libs/storage/rusty_search/crates/rusty-search-opensearch` | OpenSearch-backed `SearchBackend` implementation: a remote HTTP search cluster |
-| [`rusty-search-solr`](crates/libs/storage/rusty_search/crates/rusty-search-solr) | `crates/libs/storage/rusty_search/crates/rusty-search-solr` | Apache Solr-backed `SearchBackend` implementation: a remote HTTP search cluster |
-| [`rusty-search-algolia`](crates/libs/storage/rusty_search/crates/rusty-search-algolia) | `crates/libs/storage/rusty_search/crates/rusty-search-algolia` | Algolia-backed `SearchBackend` implementation: a hosted search SaaS |
-| [`rusty-search-azure-search`](crates/libs/storage/rusty_search/crates/rusty-search-azure-search) | `crates/libs/storage/rusty_search/crates/rusty-search-azure-search` | Azure AI Search-backed `SearchBackend` implementation: a hosted search-as-a-service on Azure |
-| [`rusty-search-cloud`](crates/libs/storage/rusty_search/crates/rusty-search-cloud) | `crates/libs/storage/rusty_search/crates/rusty-search-cloud` | Sovereign zero-dependency HTTP JSON remote cloud search provider |
-| [`rusty-search`](crates/libs/storage/rusty_search/crates/rusty-search) | `crates/libs/storage/rusty_search/crates/rusty-search` | Async, pluggable search interface: swap search engines without changing application code |
-| [`rusty_vulkan`](crates/libs/ui/rusty_vulkan) | `crates/libs/ui/rusty_vulkan` | `no_std` + `alloc` sovereign raw Vulkan hardware command buffer and GPU surface layer (Windows-only for now), built on `rusty_win32` |
-| [`rusty_sync`](crates/foundation/rusty_sync) | `crates/foundation/rusty_sync` | `no_std` + `alloc` sovereign atomic spinlock, spinlock-protected MPMC channel, and ring buffer crate, built on `rusty_std` |
-| [`rusty_simd`](crates/foundation/rusty_simd) | `crates/foundation/rusty_simd` | Zero-dependency SIMD (AVX2/NEON/FMA) accelerated block dequantization kernel library for LLM and Whisper inference |
-| [`rusty_codec`](crates/foundation/rusty_codec) | `crates/foundation/rusty_codec` | `no_std` + `alloc` sovereign TOML configuration parser and binary buffer serialization crate, built on `rusty_wire`/`rusty_std` |
-| [`rusty_h2`](crates/libs/net/rusty_h2) | `crates/libs/net/rusty_h2` | A from-scratch HTTP/2 (RFC 9113) implementation, including HPACK header compression |
-| [`rusty_audio`](crates/libs/ui/rusty_audio) | `crates/libs/ui/rusty_audio` | `no_std` + `alloc` sovereign PCM audio capture and playback device driver (hand-written WASAPI COM FFI on Windows, ALSA on Linux) |
-| [`rusty_crypto_key`](crates/foundation/rusty_crypto_key) | `crates/foundation/rusty_crypto_key` | A zeroize-on-drop key storage and file persistence micro-crate (`0600` permissions on Unix) |
-| [`rusty-db-core`](crates/libs/storage/rusty_db/crates/rusty-db-core) | `crates/libs/storage/rusty_db/crates/rusty-db-core` | Database-agnostic query builder and driver abstraction (the SQLAlchemy-Core-like layer of `rusty_db`) |
-| [`rusty-db-derive`](crates/libs/storage/rusty_db/crates/rusty-db-derive) | `crates/libs/storage/rusty_db/crates/rusty-db-derive` | `#[derive(Mapped)]` macro for `rusty_db`: maps a struct to a table |
-| [`rusty-db-sqlite`](crates/libs/storage/rusty_db/crates/rusty-db-sqlite) | `crates/libs/storage/rusty_db/crates/rusty-db-sqlite` | SQLite driver for `rusty_db`, built on `sqlx` |
-| [`rusty-db-postgres`](crates/libs/storage/rusty_db/crates/rusty-db-postgres) | `crates/libs/storage/rusty_db/crates/rusty-db-postgres` | PostgreSQL driver for `rusty_db`, built on `sqlx` |
-| [`rusty-db-mysql`](crates/libs/storage/rusty_db/crates/rusty-db-mysql) | `crates/libs/storage/rusty_db/crates/rusty-db-mysql` | MySQL/MariaDB driver for `rusty_db`, built on `sqlx` |
-| [`rusty-db`](crates/libs/storage/rusty_db/rusty_db) | `crates/libs/storage/rusty_db/rusty_db` | A database-agnostic query builder and connection abstraction, in the spirit of SQLAlchemy Core |
-| [`rusty_ansi`](crates/libs/ui/rusty_ansi) | `crates/libs/ui/rusty_ansi` | Zero-allocation, `no_std` VT100/CSI/OSC ANSI escape sequence parser core |
-| [`rusty_config`](crates/foundation/rusty_config) | `crates/foundation/rusty_config` | Zero-dependency, `no_std` INI and Key-Value configuration file parser |
-| [`rusty_jinja`](crates/foundation/rusty_jinja) | `crates/foundation/rusty_jinja` | `no_std` + `alloc` sovereign, zero-dependency Jinja2 LLM chat template evaluator |
-| [`rusty_ansder`](crates/foundation/rusty_ansder) | `crates/foundation/rusty_ansder` | ASN.1 BER/DER TLV encoder and decoder, built on `rusty_wire` |
-| [`rusty_rag`](crates/libs/ai/rusty_rag) | `crates/libs/ai/rusty_rag` | Sovereign AI Retrieval-Augmented Generation (RAG) & Question Answering engine, built on `rusty_simd`; split out of `rusty_ansder`, which used to bundle both under one portmanteau name |
-| [`rusty_boot`](crates/tools/rusty_boot) | `crates/tools/rusty_boot` | `no_std` + `alloc` sovereign bootstrapper demonstrating kernel-to-application execution without Rust `std`, exercising the full stack of merged crates |
-| [`rusty-whisper`](crates/libs/ai/rusty_whisper) | `crates/libs/ai/rusty_whisper` | A pure-Rust port of whisper.cpp (OpenAI Whisper speech recognition) |
-| [`rusty_rdp`](crates/libs/net/rusty_rdp) | `crates/libs/net/rusty_rdp` | A minimal, dependency-free implementation of the Remote Desktop Protocol (RDP) wire format |
-| [`rusty_voice`](crates/apps/rusty_voice) | `crates/apps/rusty_voice` | A sovereign voice-to-text application leveraging `rusty_whisper` and `rusty_audio`, built exclusively with Rusty Mill libraries |
-| [`platform`](crates/platform/rustils/crates/platform) | `crates/platform/rustils/crates/platform` | rustils' portable trait surface and types — the PAL's api layer, no I/O, no unsafe |
-| [`platform-mock`](crates/platform/rustils/crates/platform-mock) | `crates/platform/rustils/crates/platform-mock` | In-memory backend implementing every `platform` trait — the injectable test double |
-| [`platform-parity`](crates/platform/rustils/crates/platform-parity) | `crates/platform/rustils/crates/platform-parity` | Shared behavior-spec assertion sets for the PAL parity suites (test-support only) |
-| [`platform-linux`](crates/platform/rustils/crates/platform-linux) | `crates/platform/rustils/crates/platform-linux` | Linux backend for `platform`: libc floor, with a `rusty_libc`-backed raw-syscall track behind a feature flag |
-| [`platform-windows`](crates/platform/rustils/crates/platform-windows) | `crates/platform/rustils/crates/platform-windows` | Windows backend for `platform`: `windows-sys` floor, with a `rusty_win32`-backed track behind a feature flag |
-| [`platform-bsd`](crates/platform/rustils/crates/platform-bsd) | `crates/platform/rustils/crates/platform-bsd` | BSD backend for `platform` (net-only slice): macOS, FreeBSD, OpenBSD, NetBSD, DragonFly |
-| [`winargv`](crates/platform/rustils/crates/winargv) | `crates/platform/rustils/crates/winargv` | Windows argv → command-line construction (MSVCRT + cmd-rules quoting, refuse-unrepresentable) |
-| [`coreutils`](crates/apps/coreutils) | `crates/apps/coreutils` | Modular pure-Rust implementation of core GNU/POSIX utilities (`rcat`, `rls`, `rrun`, `rgrep`, and more) |
-| [`rusty-croc`](crates/apps/rusty_croc) | `crates/apps/rusty_croc` | Rust port of [croc](https://github.com/schollz/croc): wire-compatible secure peer-to-peer file transfer (PAKE, relay, resume) |
-| [`contract`](crates/platform/portable-runtime/crates/contract) | `crates/platform/portable-runtime/crates/contract` | Portable tool-runtime trait boundary: one execution contract, no OS-specific code |
-| [`compat`](crates/platform/portable-runtime/crates/compat) | `crates/platform/portable-runtime/crates/compat` | Per-host adapter implementing `contract` over `cap-std`/`portable-pty`/`dirs` plus `std`'s file locking |
-| [`conformance`](crates/platform/portable-runtime/crates/conformance) | `crates/platform/portable-runtime/crates/conformance` | Cross-cutting verification of `contract`/`compat`: probe suite and conformance report |
-| [`stat-tool`](crates/platform/portable-runtime/tools/stat-tool) | `crates/platform/portable-runtime/tools/stat-tool` | Reference tool over `contract`: scoped filesystem primitive |
-| [`proc-runner`](crates/platform/portable-runtime/tools/proc-runner) | `crates/platform/portable-runtime/tools/proc-runner` | Reference tool over `contract`: process spawn + stdio capture primitive |
-| [`pty-shell`](crates/platform/portable-runtime/tools/pty-shell) | `crates/platform/portable-runtime/tools/pty-shell` | Reference tool over `contract`: interactive PTY primitive (manual, not CI) |
-| [`inventory-core`](crates/apps/rusty_inventory/crates/inventory-core) | `crates/apps/rusty_inventory/crates/inventory-core` | Local-first encrypted index over the conversation history AI coding tools write to disk |
-| [`inventory-cli`](crates/apps/rusty_inventory/crates/inventory-cli) | `crates/apps/rusty_inventory/crates/inventory-cli` | `inv`: search every AI agent and IDE conversation on your machine, from the terminal |
-| [`inventory-tauri`](crates/apps/rusty_inventory/crates/inventory-tauri) | `crates/apps/rusty_inventory/crates/inventory-tauri` | Menu-bar app over `inventory-core`: one keystroke to every AI conversation on your machine |
-| [`skillopt-core`](crates/apps/rusty_skillopt/crates/skillopt-core) | `crates/apps/rusty_skillopt/crates/skillopt-core` | Text-space optimizer for skill markdown: epochs, batches, and a validation gate over a frozen LLM agent |
-| [`skillopt-model`](crates/apps/rusty_skillopt/crates/skillopt-model) | `crates/apps/rusty_skillopt/crates/skillopt-model` | LLM provider adapters for `skillopt-core` |
-| [`skillopt-envs`](crates/apps/rusty_skillopt/crates/skillopt-envs) | `crates/apps/rusty_skillopt/crates/skillopt-envs` | Task environments and benchmark adapters `skillopt-core` optimizes against |
-| [`skillopt-cli`](crates/apps/rusty_skillopt/crates/skillopt-cli) | `crates/apps/rusty_skillopt/crates/skillopt-cli` | `skillopt`: the training-loop command line front end |
-| [`rk-config`](crates/apps/rusty_key/crates/config) | `crates/apps/rusty_key/crates/config` | Rusty Keys' configuration layer: typed settings, env overrides, workspace discovery |
-| [`rk-observe`](crates/apps/rusty_key/crates/observe) | `crates/apps/rusty_key/crates/observe` | Rusty Keys' *observe* pillar: structured attribution and turn-level observation records |
-| [`rk-constrain`](crates/apps/rusty_key/crates/constrain) | `crates/apps/rusty_key/crates/constrain` | Rusty Keys' *constrain* pillar: policy enforcement around tool dispatch |
-| [`rk-feed`](crates/apps/rusty_key/crates/feed) | `crates/apps/rusty_key/crates/feed` | Rusty Keys' *feed* pillar: guides, memory, recall, and the built-in tool set |
-| [`rk-kernel`](crates/apps/rusty_key/crates/kernel) | `crates/apps/rusty_key/crates/kernel` | Rusty Keys' kernel: the model's agent loop (turn, stream, complete) |
-| [`rk-mcp`](crates/apps/rusty_key/crates/mcp) | `crates/apps/rusty_key/crates/mcp` | Rusty Keys' MCP client layer: server config, policy, and stdio/SSE transports |
-| [`rk-compose`](crates/apps/rusty_key/crates/compose) | `crates/apps/rusty_key/crates/compose` | Rusty Keys' *compose* pillar: subagent composition and the ratchet |
-| [`rk-app`](crates/apps/rusty_key/crates/app) | `crates/apps/rusty_key/crates/app` | `rusty-keys`: the harness binary wiring the four pillars around the kernel |
-| [`rusty_llama`](crates/libs/ai/rusty_llama) | `crates/libs/ai/rusty_llama` | From-scratch Llama/GGUF inference engine (CPU SIMD, optional wgpu and CUDA backends, OpenAI-compatible server) |
-| [`ts-types`](crates/apps/rusty_tailscale/crates/ts-types) | `crates/apps/rusty_tailscale/crates/ts-types` | Tailscale wire types shared across the client: node keys, status, netmap |
-| [`ts-key`](crates/apps/rusty_tailscale/crates/ts-key) | `crates/apps/rusty_tailscale/crates/ts-key` | Key material for the Tailscale client: machine, node, and disco keypairs |
-| [`ts-control`](crates/apps/rusty_tailscale/crates/ts-control) | `crates/apps/rusty_tailscale/crates/ts-control` | ts2021 control-plane client: Noise (control base) handshake and the map session |
-| [`ts-derp`](crates/apps/rusty_tailscale/crates/ts-derp) | `crates/apps/rusty_tailscale/crates/ts-derp` | DERP relay client: the always-available fallback data path |
-| [`ts-stun`](crates/apps/rusty_tailscale/crates/ts-stun) | `crates/apps/rusty_tailscale/crates/ts-stun` | STUN client for discovering the server-reflexive endpoint |
-| [`ts-disco`](crates/apps/rusty_tailscale/crates/ts-disco) | `crates/apps/rusty_tailscale/crates/ts-disco` | Disco protocol: ping/pong/call-me-maybe path probing |
-| [`ts-magicsock`](crates/apps/rusty_tailscale/crates/ts-magicsock) | `crates/apps/rusty_tailscale/crates/ts-magicsock` | Path multiplexer: direct UDP and DERP, path upgrade and live migration |
-| [`ts-wg`](crates/apps/rusty_tailscale/crates/ts-wg) | `crates/apps/rusty_tailscale/crates/ts-wg` | WireGuard data plane over the magicsock transport |
-| [`ts-tun`](crates/apps/rusty_tailscale/crates/ts-tun) | `crates/apps/rusty_tailscale/crates/ts-tun` | TUN device, routes, and DNS platform adapters |
-| [`ts-filter`](crates/apps/rusty_tailscale/crates/ts-filter) | `crates/apps/rusty_tailscale/crates/ts-filter` | Packet filter evaluating the tailnet ACL rules the control plane hands down |
-| [`ts-engine`](crates/apps/rusty_tailscale/crates/ts-engine) | `crates/apps/rusty_tailscale/crates/ts-engine` | The node engine wiring control, magicsock, WireGuard, TUN and filter together |
-| [`ts-localapi`](crates/apps/rusty_tailscale/crates/ts-localapi) | `crates/apps/rusty_tailscale/crates/ts-localapi` | LocalAPI server: the daemon's Unix-socket control surface |
-| [`ts-net`](crates/apps/rusty_tailscale/crates/ts-net) | `crates/apps/rusty_tailscale/crates/ts-net` | Userspace TCP/IP stack (smoltcp) on the tailnet — a tailnet service with no TUN and no root |
-| [`ts-daemon`](crates/apps/rusty_tailscale/crates/ts-daemon) | `crates/apps/rusty_tailscale/crates/ts-daemon` | `ts-daemon`: the long-running node daemon |
-| [`ts-cli`](crates/apps/rusty_tailscale/crates/ts-cli) | `crates/apps/rusty_tailscale/crates/ts-cli` | `ts-cli`: the LocalAPI-driven command line client |
-| [`xtask`](crates/apps/rusty_tailscale/xtask) | `crates/apps/rusty_tailscale/xtask` | `rusty_tailscale`'s integration harness: Headscale in a container, multi-node NAT simulation |
-| [`adk-core`](crates/libs/rusty_adk/crates/adk-core) | `crates/libs/rusty_adk/crates/adk-core` | ADK 2.0's data model: events, content, state, and the tool/callback contracts |
-| [`adk-macros`](crates/libs/rusty_adk/crates/adk-macros) | `crates/libs/rusty_adk/crates/adk-macros` | `#[tool]` and friends: `adk-core`'s derive/attribute macros |
-| [`adk-tools`](crates/libs/rusty_adk/crates/adk-tools) | `crates/libs/rusty_adk/crates/adk-tools` | Built-in tool implementations and the tool registry |
-| [`adk-models`](crates/libs/rusty_adk/crates/adk-models) | `crates/libs/rusty_adk/crates/adk-models` | LLM provider adapters for the ADK runtime |
-| [`adk-sessions`](crates/libs/rusty_adk/crates/adk-sessions) | `crates/libs/rusty_adk/crates/adk-sessions` | Session and event persistence (in-memory and SQLite stores) |
-| [`adk-graph`](crates/libs/rusty_adk/crates/adk-graph) | `crates/libs/rusty_adk/crates/adk-graph` | ADK 2.0's graph-based execution engine |
-| [`adk-agents`](crates/libs/rusty_adk/crates/adk-agents) | `crates/libs/rusty_adk/crates/adk-agents` | Agent types built on the graph engine: LLM, sequential, parallel, loop |
-| [`adk-runner`](crates/libs/rusty_adk/crates/adk-runner) | `crates/libs/rusty_adk/crates/adk-runner` | The runner: drives an agent over a session and streams its events |
-| [`adk-mcp`](crates/libs/rusty_adk/crates/adk-mcp) | `crates/libs/rusty_adk/crates/adk-mcp` | MCP bridge: consume MCP servers as ADK tools, and serve ADK tools over MCP |
-| [`adk-a2a`](crates/libs/rusty_adk/crates/adk-a2a) | `crates/libs/rusty_adk/crates/adk-a2a` | A2A bridge: serve a Rust ADK agent over the Agent2Agent protocol |
-| [`rusty-adk`](crates/libs/rusty_adk/crates/rusty-adk) | `crates/libs/rusty_adk/crates/rusty-adk` | The `rusty-adk` facade crate re-exporting the ADK stack |
-| [`weather-agent`](crates/libs/rusty_adk/examples/weather-agent) | `crates/libs/rusty_adk/examples/weather-agent` | `rusty-adk` example: a tool-using LLM agent |
-| [`mcp-tool-server`](crates/libs/rusty_adk/examples/mcp-tool-server) | `crates/libs/rusty_adk/examples/mcp-tool-server` | `rusty-adk` example: serving ADK tools over MCP |
-| [`a2a-agent-server`](crates/libs/rusty_adk/examples/a2a-agent-server) | `crates/libs/rusty_adk/examples/a2a-agent-server` | `rusty-adk` example: serving an ADK agent over A2A |
-| [`rp-core`](crates/apps/rusty_provider/crates/core) | `crates/apps/rusty_provider/crates/core` | Unified OpenAI-shaped request/response types and the provider trait |
-| [`rp-providers`](crates/apps/rusty_provider/crates/providers) | `crates/apps/rusty_provider/crates/providers` | Provider adapters: OpenAI, Anthropic, Gemini, Groq, Together AI, Fireworks |
-| [`rp-router`](crates/apps/rusty_provider/crates/router) | `crates/apps/rusty_provider/crates/router` | Config-driven routing: fallback chains, budgets, metrics, and usage persistence |
-| [`rp-mcp`](crates/apps/rusty_provider/crates/mcp) | `crates/apps/rusty_provider/crates/mcp` | MCP surface over the router, built on the `rusty-mcp` scaffold |
-| [`rp-server`](crates/apps/rusty_provider/crates/server) | `crates/apps/rusty_provider/crates/server` | The OpenAI-compatible HTTP server front end |
-| [`rp-cli`](crates/apps/rusty_provider/crates/cli) | `crates/apps/rusty_provider/crates/cli` | `rp-cli`: config inspection and routing dry-runs from the terminal |
-| [`sessionmgr-core`](crates/apps/rusty_yirp/crates/sessionmgr-core) | `crates/apps/rusty_yirp/crates/sessionmgr-core` | sessionmgr's pure domain logic: session state machine, identifiers, crash-recovery policy |
-| [`sessionmgr-protocol`](crates/apps/rusty_yirp/crates/sessionmgr-protocol) | `crates/apps/rusty_yirp/crates/sessionmgr-protocol` | Wire types shared by the sessionmgr daemon, its workers, and its clients |
-| [`sessionmgr-proc`](crates/apps/rusty_yirp/crates/sessionmgr-proc) | `crates/apps/rusty_yirp/crates/sessionmgr-proc` | Process adapter: detached spawn, PID-reuse-safe liveness, stdio-inheritance hardening |
-| [`sessionmgr-git`](crates/apps/rusty_yirp/crates/sessionmgr-git) | `crates/apps/rusty_yirp/crates/sessionmgr-git` | Git adapter: worktree lifecycle, status, and diff |
-| [`sessionmgr-pty`](crates/apps/rusty_yirp/crates/sessionmgr-pty) | `crates/apps/rusty_yirp/crates/sessionmgr-pty` | PTY adapter over `rustils`' `Pty` capability (ConPTY on Windows, `openpty` on Linux) |
-| [`sessionmgr-tui`](crates/apps/rusty_yirp/crates/sessionmgr-tui) | `crates/apps/rusty_yirp/crates/sessionmgr-tui` | The TUI grid dashboard (ratatui + `tui-term`'s vt100 screen) |
-| [`sessionmgr-agents`](crates/apps/rusty_yirp/crates/sessionmgr-agents) | `crates/apps/rusty_yirp/crates/sessionmgr-agents` | Per-agent-CLI adapters for Claude Code, Codex, and Gemini CLI |
-| [`sessionmgr-daemon`](crates/apps/rusty_yirp/crates/sessionmgr-daemon) | `crates/apps/rusty_yirp/crates/sessionmgr-daemon` | `sessionmgr`: the composition root — supervisor daemon, detached workers, CLI client |
-| [`sessionmgr-desktop`](crates/apps/rusty_yirp/crates/sessionmgr-desktop/src-tauri) | `crates/apps/rusty_yirp/crates/sessionmgr-desktop/src-tauri` | sessionmgr's Tauri 2 desktop shell over the daemon socket |
-| [`agentgateway-config`](crates/apps/rusty_agent_gateway/crates/agentgateway-config) | `crates/apps/rusty_agent_gateway/crates/agentgateway-config` | Configuration model, wire-compatible with agentgateway's own `config.yaml` |
-| [`agentgateway-core`](crates/apps/rusty_agent_gateway/crates/agentgateway-core) | `crates/apps/rusty_agent_gateway/crates/agentgateway-core` | Route matching and policy evaluation |
-| [`agentgateway-auth`](crates/apps/rusty_agent_gateway/crates/agentgateway-auth) | `crates/apps/rusty_agent_gateway/crates/agentgateway-auth` | JWT authentication policy, over `rusty-mcp`'s JWKS validator |
-| [`agentgateway-a2a`](crates/apps/rusty_agent_gateway/crates/agentgateway-a2a) | `crates/apps/rusty_agent_gateway/crates/agentgateway-a2a` | A2A method gating and agent-card discovery |
-| [`agentgateway-llm`](crates/apps/rusty_agent_gateway/crates/agentgateway-llm) | `crates/apps/rusty_agent_gateway/crates/agentgateway-llm` | OpenAI-compatible LLM gateway pillar |
-| [`agentgateway-mcp`](crates/apps/rusty_agent_gateway/crates/agentgateway-mcp) | `crates/apps/rusty_agent_gateway/crates/agentgateway-mcp` | MCP federation: several upstream MCP servers behind one endpoint, with guardrails |
-| [`agentgateway-proxy`](crates/apps/rusty_agent_gateway/crates/agentgateway-proxy) | `crates/apps/rusty_agent_gateway/crates/agentgateway-proxy` | HTTP reverse proxying for host backends |
-| [`agentgateway-tls`](crates/apps/rusty_agent_gateway/crates/agentgateway-tls) | `crates/apps/rusty_agent_gateway/crates/agentgateway-tls` | TLS termination, over `rusty_tls` |
-| [`agentgateway`](crates/apps/rusty_agent_gateway/crates/agentgateway) | `crates/apps/rusty_agent_gateway/crates/agentgateway` | `agentgateway`: the AI-native gateway binary for MCP, speaking agentgateway's config |
-| [`nexus-types`](crates/apps/nexus/crates/nexus-types) | `crates/apps/nexus/crates/nexus-types` | Nexus: shared plain-data types with no I/O, at the base of every other nexus crate |
-| [`nexus-plugin-api`](crates/apps/nexus/crates/nexus-plugin-api) | `crates/apps/nexus/crates/nexus-plugin-api` | Nexus: the versioned `CorePlugin`/capability/IPC ABI every plugin crate implements against |
-| [`nexus-hashline`](crates/apps/nexus/crates/nexus-hashline) | `crates/apps/nexus/crates/nexus-hashline` | Nexus: content-hash-anchored patch format for concurrent note edits (RFC 0005) |
-| [`nexus-kernel`](crates/apps/nexus/crates/nexus-kernel) | `crates/apps/nexus/crates/nexus-kernel` | Nexus: the microkernel — event bus, IPC dispatcher, capability system, plugin lifecycle |
-| [`nexus-kv`](crates/apps/nexus/crates/nexus-kv) | `crates/apps/nexus/crates/nexus-kv` | Nexus: the forge-scoped key/value store service plugin |
-| [`nexus-security`](crates/apps/nexus/crates/nexus-security) | `crates/apps/nexus/crates/nexus-security` | Nexus: capability grants, at-rest encryption, and the Linux Landlock/seccomp OS sandbox |
-| [`nexus-storage`](crates/apps/nexus/crates/nexus-storage) | `crates/apps/nexus/crates/nexus-storage` | Nexus: file-as-truth — SQLite index, Tantivy FTS, file watcher, knowledge graph |
-| [`nexus-plugins`](crates/apps/nexus/crates/nexus-plugins) | `crates/apps/nexus/crates/nexus-plugins` | Nexus: community plugin lifecycle — WASM (wasmtime) and JS-sandboxed plugin hosting |
-| [`nexus-ai`](crates/apps/nexus/crates/nexus-ai) | `crates/apps/nexus/crates/nexus-ai` | Nexus: AI provider integration — chat, embeddings, RAG |
-| [`nexus-ai-runtime`](crates/apps/nexus/crates/nexus-ai-runtime) | `crates/apps/nexus/crates/nexus-ai-runtime` | Nexus: local model runtime plumbing for `nexus-ai` |
-| [`nexus-mcp`](crates/apps/nexus/crates/nexus-mcp) | `crates/apps/nexus/crates/nexus-mcp` | Nexus: Host-side MCP client/server integration |
-| [`nexus-lsp`](crates/apps/nexus/crates/nexus-lsp) | `crates/apps/nexus/crates/nexus-lsp` | Nexus: Language Server Protocol integration |
-| [`nexus-dap`](crates/apps/nexus/crates/nexus-dap) | `crates/apps/nexus/crates/nexus-dap` | Nexus: Debug Adapter Protocol integration |
-| [`nexus-acp`](crates/apps/nexus/crates/nexus-acp) | `crates/apps/nexus/crates/nexus-acp` | Nexus: Agent Client Protocol integration |
-| [`nexus-remote`](crates/apps/nexus/crates/nexus-remote) | `crates/apps/nexus/crates/nexus-remote` | Nexus: remote/hosted forge connectivity |
-| [`nexus-cli`](crates/apps/nexus/crates/nexus-cli) | `crates/apps/nexus/crates/nexus-cli` | `nexus`: the CLI frontend, built on `nexus-bootstrap` |
-| [`nexus-tui`](crates/apps/nexus/crates/nexus-tui) | `crates/apps/nexus/crates/nexus-tui` | `nexus-tui`: the terminal UI frontend, built on `nexus-bootstrap` |
-| [`nexus-git`](crates/apps/nexus/crates/nexus-git) | `crates/apps/nexus/crates/nexus-git` | Nexus: Git integration (built on `git2`) |
-| [`nexus-formats`](crates/apps/nexus/crates/nexus-formats) | `crates/apps/nexus/crates/nexus-formats` | Nexus: import/export format converters (e.g. Notion `.zip` export) |
-| [`nexus-database`](crates/apps/nexus/crates/nexus-database) | `crates/apps/nexus/crates/nexus-database` | Nexus: user-facing embedded-database note views |
-| [`nexus-theme`](crates/apps/nexus/crates/nexus-theme) | `crates/apps/nexus/crates/nexus-theme` | Nexus: shell theming service |
-| [`nexus-bootstrap`](crates/apps/nexus/crates/nexus-bootstrap) | `crates/apps/nexus/crates/nexus-bootstrap` | Nexus: the orchestrator — assembles the kernel + every registered `CorePlugin` into a `Runtime` |
-| [`nexus-editor`](crates/apps/nexus/crates/nexus-editor) | `crates/apps/nexus/crates/nexus-editor` | Nexus: the note editor backend — CRDT snapshots, crash journal |
-| [`nexus-rush`](crates/apps/nexus/crates/nexus-rush) | `crates/apps/nexus/crates/nexus-rush` | Nexus: in-tree port of `rush` (RFC 0002) — the bundled shell for sandboxed sessions |
-| [`nexus-vt`](crates/apps/nexus/crates/nexus-vt) | `crates/apps/nexus/crates/nexus-vt` | Nexus: in-tree, GUI-free port of `rusty_term`'s core (RFC 0003) — the headless VT grid behind `nexus-terminal` |
-| [`nexus-terminal`](crates/apps/nexus/crates/nexus-terminal) | `crates/apps/nexus/crates/nexus-terminal` | Nexus: terminal/process-manager service plugin, built on `nexus-vt` + `portable-pty` |
-| [`nexus-agent`](crates/apps/nexus/crates/nexus-agent) | `crates/apps/nexus/crates/nexus-agent` | Nexus: the in-app agent — tool registry, planning, delegation |
-| [`nexus-skills`](crates/apps/nexus/crates/nexus-skills) | `crates/apps/nexus/crates/nexus-skills` | Nexus: agent skill loading |
-| [`nexus-templates`](crates/apps/nexus/crates/nexus-templates) | `crates/apps/nexus/crates/nexus-templates` | Nexus: note template service |
-| [`nexus-workflow`](crates/apps/nexus/crates/nexus-workflow) | `crates/apps/nexus/crates/nexus-workflow` | Nexus: multi-step workflow orchestration |
-| [`nexus-linkpreview`](crates/apps/nexus/crates/nexus-linkpreview) | `crates/apps/nexus/crates/nexus-linkpreview` | Nexus: URL link-preview fetching |
-| [`nexus-notifications`](crates/apps/nexus/crates/nexus-notifications) | `crates/apps/nexus/crates/nexus-notifications` | Nexus: notification inbox + SMTP email transport |
-| [`nexus-comments`](crates/apps/nexus/crates/nexus-comments) | `crates/apps/nexus/crates/nexus-comments` | Nexus: note comment threads |
-| [`nexus-panic-log`](crates/apps/nexus/crates/nexus-panic-log) | `crates/apps/nexus/crates/nexus-panic-log` | Nexus: structured panic capture and logging |
-| [`nexus-crdt`](crates/apps/nexus/crates/nexus-crdt) | `crates/apps/nexus/crates/nexus-crdt` | Nexus: CRDT primitives backing `nexus-editor`/`nexus-collab` |
-| [`nexus-fuzz`](crates/apps/nexus/crates/nexus-fuzz) | `crates/apps/nexus/crates/nexus-fuzz` | Nexus: fuzz targets for parser/format boundaries |
-| [`nexus-audio`](crates/apps/nexus/crates/nexus-audio) | `crates/apps/nexus/crates/nexus-audio` | Nexus: STT/TTS provider traits (local / provider-routed / platform backends) |
-| [`nexus-collab`](crates/apps/nexus/crates/nexus-collab) | `crates/apps/nexus/crates/nexus-collab` | Nexus: real-time collaboration over a WebSocket relay |
-| [`nexus-memory`](crates/apps/nexus/crates/nexus-memory) | `crates/apps/nexus/crates/nexus-memory` | Nexus: the `com.nexus.memory` service plugin — full `remind_me` schema/API parity |
-| [`nexus-memory-hub`](crates/apps/nexus/crates/nexus-memory-hub) | `crates/apps/nexus/crates/nexus-memory-hub` | Nexus: standalone `axum` HTTP sync server for `nexus-memory` — a deployable binary, not a bootstrap plugin |
-| [`nexus-context`](crates/apps/nexus/crates/nexus-context) | `crates/apps/nexus/crates/nexus-context` | Nexus: staging library, not yet wired into `nexus-bootstrap` (tracked upstream by nexus#188) |
-| [`nexus-protocol`](crates/apps/nexus/crates/nexus-protocol) | `crates/apps/nexus/crates/nexus-protocol` | Nexus: staging library, not yet wired into `nexus-bootstrap` (tracked upstream by nexus#188) |
-| [`rusty_multimodal_db`](crates/apps/rusty_multimodal_db) | `crates/apps/rusty_multimodal_db` | Benchmark harness comparing AoS, SoA, and UUID-canonical-store views as storage backends, plus a production store, network server, and schema-driven client built on the winning design |
-| [`rusty_sha1`](crates/foundation/rusty_sha1) | `crates/foundation/rusty_sha1` | Zero-dependency SHA-1 (FIPS 180-1) implementation, shared by `rusty_git`'s object hashing and `rusty_term`'s WebSocket handshake |
-| [`rusty_base64`](crates/foundation/rusty_base64) | `crates/foundation/rusty_base64` | Hand-rolled, dependency-free Base64 (RFC 4648) codec (standard and URL-safe alphabets, encode/decode), extracted from `rusty_oauth` and now shared by `rusty_acp`/`rusty-mcp`/`rusty_a2a` |
-| [`rusty_rand`](crates/foundation/rusty_rand) | `crates/foundation/rusty_rand` | OS-backed cryptographically secure random bytes (`/dev/urandom`/`BCryptGenRandom`), the CSPRNG shared by `rusty_oauth`, `rusty_uuid`, and `sessionmgr-proc` |
-| [`rusty_retry`](crates/foundation/rusty_retry) | `crates/foundation/rusty_retry` | Exponential backoff with jitter and `Retry-After` delta-seconds parsing, the retry mechanism shared by `rusty_request` and `rusty_acp` |
-| [`rusty_rsa`](crates/foundation/rusty_rsa) | `crates/foundation/rusty_rsa` | Hand-rolled, dependency-free BigUint (RSA/ECC arithmetic) and SHA-256, the primitives `rusty_oauth` and `rusty_rdp` each independently reimplemented for RSA public-key verification/encryption |
-| [`rusty_kafka`](crates/libs/net/rusty_kafka) | `crates/libs/net/rusty_kafka` | Hand-rolled Kafka wire-protocol client: producer, consumer, and admin APIs, built on `rusty_wire` and `rusty_tokio` |
-| [`rusty-meshed-core`](crates/apps/rusty_meshed/crates/rusty-meshed-core) | `crates/apps/rusty_meshed/crates/rusty-meshed-core` | `rusty_meshed`'s shared platform config: env-prefixed settings loaded once and injected into every other `rusty_meshed` crate |
-| [`rusty-meshed-schema-registry`](crates/apps/rusty_meshed/crates/rusty-meshed-schema-registry) | `crates/apps/rusty_meshed/crates/rusty-meshed-schema-registry` | Confluent Schema Registry client and compatibility-mode enforcement, ported from `meshed.schema_registry` |
-| [`rusty-meshed-governance`](crates/apps/rusty_meshed/crates/rusty-meshed-governance) | `crates/apps/rusty_meshed/crates/rusty-meshed-governance` | Policy-as-code governance engine and built-in policies, ported from `meshed.governance` |
-| [`rusty-meshed-observability`](crates/apps/rusty_meshed/crates/rusty-meshed-observability) | `crates/apps/rusty_meshed/crates/rusty-meshed-observability` | Lineage tracking, metrics collection, SLO monitoring, and the CI contract gate, ported from `meshed.observability` |
-| [`rusty-meshed-sdk`](crates/apps/rusty_meshed/crates/rusty-meshed-sdk) | `crates/apps/rusty_meshed/crates/rusty-meshed-sdk` | The data-product producer/consumer SDK, transactional outbox, and topic lifecycle management, ported from `meshed.sdk`/`meshed.infrastructure` |
-| [`rusty-meshed-registry`](crates/apps/rusty_meshed/crates/rusty-meshed-registry) | `crates/apps/rusty_meshed/crates/rusty-meshed-registry` | The data-product registry HTTP API: models, CRUD routers, and governance/lineage/metrics/monitor endpoints, ported from `meshed.registry` |
-| [`rusty-meshed-cli`](crates/apps/rusty_meshed/crates/rusty-meshed-cli) | `crates/apps/rusty_meshed/crates/rusty-meshed-cli` | The meshed operator CLI (health/lineage/metrics/slo commands), ported from `meshed.cli` |
-| [`rusty-meshed-domains`](crates/apps/rusty_meshed/crates/rusty-meshed-domains) | `crates/apps/rusty_meshed/crates/rusty-meshed-domains` | The manpower domain: event schemas, domain data products, scenario builder, and demo generators, ported from `meshed.domains` |
-| [`rusty-meshed-trace`](crates/apps/rusty_meshed/crates/rusty-meshed-trace) | `crates/apps/rusty_meshed/crates/rusty-meshed-trace` | Reverse-trace and domain-maturity model: outcome → domains → sources, with a fidelity verdict and worst-first bottleneck list |
-| [`rusty-hister-core`](crates/apps/rusty_hister/crates/rusty-hister-core) | `crates/apps/rusty_hister/crates/rusty-hister-core` | rusty_hister: shared types, IDs, error types, and the `Document`/extractor-SDK data model |
-| [`rusty-hister-model`](crates/apps/rusty_hister/crates/rusty-hister-model) | `crates/apps/rusty_hister/crates/rusty-hister-model` | rusty_hister: persisted schema on `rusty_db`, dual SQLite/Postgres (schema implemented; query layer complete — embedding-queue, `WebSession`, `DocumentVersion`, `crawl.go`, `history.go`, and `user.go` all ported) |
-| [`rusty-hister-extractor`](crates/apps/rusty_hister/crates/rusty-hister-extractor) | `crates/apps/rusty_hister/crates/rusty-hister-extractor` | rusty_hister: extractor chain-of-responsibility registry, plus all twenty built-in concrete extractors (JSON-LD, EmbeddedVideo, StackExchange, GoDoc, Lobsters, HackerNews, GitHub, ChatGPT, Basic, Wikipedia, Reddit, Discourse, Ytdlp, Markdown, OrgMode, Notion, Readability, Mastodon, Bluesky, Twitter) |
-| [`rusty-hister-indexer`](crates/apps/rusty_hister/crates/rusty-hister-indexer) | `crates/apps/rusty_hister/crates/rusty-hister-indexer` | rusty_hister: query language + full-text indexing on `rusty_search` (skeleton; unblocked by ADR-0002, not yet started) |
-| [`rusty-hister-vectorstore`](crates/apps/rusty_hister/crates/rusty-hister-vectorstore) | `crates/apps/rusty_hister/crates/rusty-hister-vectorstore` | rusty_hister: embedding pipeline and vector storage for semantic search (skeleton; unblocked by ADR-0002, not yet started) |
-| [`rusty-hister-crawler`](crates/apps/rusty_hister/crates/rusty-hister-crawler) | `crates/apps/rusty_hister/crates/rusty-hister-crawler` | rusty_hister: HTTP and JS-rendering crawler backends (skeleton; CDP backend unblocked by ADR-0003, not yet started) |
-| [`rusty-hister-server`](crates/apps/rusty_hister/crates/rusty-hister-server) | `crates/apps/rusty_hister/crates/rusty-hister-server` | rusty_hister: HTTP/JSON API + WebSocket search protocol, the v1 backend surface (skeleton) |
-| [`rusty-hister-mcp`](crates/apps/rusty_hister/crates/rusty-hister-mcp) | `crates/apps/rusty_hister/crates/rusty-hister-mcp` | rusty_hister: MCP JSON-RPC tool surface (search, get_preview, get_history) on `rusty_mcp` (skeleton) |
+## Installation & Setup
 
-Each crate's own README, docs, and issue history describe its design in
-depth — the links above point at the original standalone repos' content,
-now living under `crates/<name>/`.
+A full walkthrough from a clean clone to a working setup — build, connect a
+client (Claude Code plugin or any other MCP client), verify it, then
+optionally add multi-node sync and the other off-by-default features.
 
-## Building
+### Prerequisites
 
-```sh
-cargo build --workspace
-cargo test --workspace
+- **Rust 1.94+** with Cargo.
+- Nothing else is required for the base install. Semantic search's `ollama`
+  backend and HyDE query expansion need a running
+  [Ollama](https://ollama.com) daemon — optional, see [Search
+  Quality](#search-quality-embeddings-reranking--query-expansion) below.
+
+### 1. Clone & build
+
+```bash
+git clone https://github.com/Rusty-Mill/rusty_mill
+cd rusty_mill
+cargo build --release -p rusty-remind-me
 ```
 
-Some `rusty_term` features (`gui`, `gui-gpu`) and `rusty_gui`'s Linux
-backend link against X11/Wayland directly, `inventory-tauri` needs
-WebKitGTK/GTK3, and `inventory-core`'s Linux keyring backend needs libdbus;
-see [`.github/actions/setup-build-env/action.yml`](.github/actions/setup-build-env/action.yml)
-for the system packages a Linux build needs. `rusty_win32` and parts of `rusty_gui`/
-`rusty_gpu` are Windows-only (`cfg(windows)`-gated) and are exercised by
-the workflow's `windows-latest` matrix leg.
+Always pass `-p`: a bare `cargo build` at the monorepo root builds every
+Rusty Mill crate. This produces `target/release/rusty-remind-me` (at the
+monorepo root). Put it on `PATH` either by adding `target/release` to it, or
+by installing it directly:
 
-`mill-term`'s own test suite has one known, pre-existing, environment-
-dependent failure in this monorepo:
-`augmented_path_prepends_tool_directories_and_keeps_existing_path` hardcodes
-a Windows-style path and only ever passed on a Windows runner — unrelated
-to this merge.
+```bash
+cargo install --path crates/apps/rusty_remind_me/crates/remind_me_cli
+```
 
-`sessionmgr-daemon` has one test in the same class:
-`a_fresh_claude_session_reaches_needs_input_on_its_own` drives a real
-`claude` session and skips itself when `claude` is not on `PATH` (the state
-of a CI runner). On a machine that *does* have the CLI but cannot complete
-its interactive trust-folder prompt, the skip guard passes and the test
-times out instead.
+Verify it's reachable:
 
-## How the crates relate
+```bash
+rusty-remind-me stats
+```
 
-The crate relationship map is generated at [docs/WORKSPACE-MAP.md](docs/WORKSPACE-MAP.md)
-by `.github/scripts/generate_workspace_map.py` and checked for staleness in CI.
-An interactive, searchable snapshot of that table — browse by layer, search, inspect
-dependents — lives at [docs/WORKSPACE-ATLAS.html](docs/WORKSPACE-ATLAS.html); download
-it and open it in a browser. It's a point-in-time export, not regenerated automatically.
+A fresh install prints an empty store's stats rather than erroring — that's
+expected; the database (`~/.remind-me/memory.db` by default) is created on
+first use.
 
-## History
+Prebuilt binaries for Linux, macOS (Intel/Apple Silicon), and Windows are
+also published on the [Releases
+page](https://github.com/Rusty-Mill/rusty_mill/releases) for every
+tagged version (tags `rusty-remind-me-vX.Y.Z`; v0.2.0 and earlier are on the
+[standalone repo's Releases
+page](https://github.com/baileyrd/rusty_remind_me/releases)) — each includes both `rusty-remind-me` and
+`rusty-remind-me-hub` — if you'd rather skip the build step. See [Releases
+and versioning](#releases-and-versioning) below for how those get produced.
 
-These crates originated as standalone repos under `baileyrd`:
-[`rusty_term`](https://github.com/baileyrd/rusty_term),
-[`rusty_gpu`](https://github.com/baileyrd/rusty_gpu),
-[`rusty_gui`](https://github.com/baileyrd/rusty_gui),
-[`rusty_font`](https://github.com/baileyrd/rusty_font),
-[`rusty_regx`](https://github.com/baileyrd/rusty_regx),
-[`rusty_win32`](https://github.com/baileyrd/rusty_win32),
-[`rush`](https://github.com/baileyrd/rush),
-[`rusty_lines`](https://github.com/baileyrd/rusty_lines),
-[`mill-term`](https://github.com/baileyrd/mill-term),
-[`rpath`](https://github.com/baileyrd/rpath),
-[`rusty_git`](https://github.com/baileyrd/rusty_git),
-[`rusty_diff`](https://github.com/baileyrd/rusty_diff),
-[`rusty_compress`](https://github.com/baileyrd/rusty_compress), and
-[`rusty_text`](https://github.com/baileyrd/rusty_text). Their full commit
-history, issues, and PRs remain on those repos for reference; only the code
-history was merged here.
+### 2. Connect it to a client
 
-The second wave, merging in the same way, adds:
-[`rusty_tokio`](https://github.com/baileyrd/rusty_tokio) (plus its nested
-`rusty_tokio-macros` crate), [`rusty_rusqlite`](https://github.com/baileyrd/rusty_rusqlite),
-[`rusty_libc`](https://github.com/baileyrd/rusty_libc),
-[`rusty_acp`](https://github.com/baileyrd/rusty_acp),
-[`rusty_tls`](https://github.com/baileyrd/rusty_tls),
-[`rusty_serde`](https://github.com/baileyrd/rusty_serde),
-[`rusty_lsp`](https://github.com/baileyrd/rusty_lsp),
-[`rusty_a2a`](https://github.com/baileyrd/rusty_a2a),
-[`rusty_mcp`](https://github.com/baileyrd/rusty_mcp),
-[`rusty_stream`](https://github.com/baileyrd/rusty_stream),
-[`rusty_url`](https://github.com/baileyrd/rusty_url),
-[`rusty_http`](https://github.com/baileyrd/rusty_http),
-[`rusty_json`](https://github.com/baileyrd/rusty_json),
-[`rusty_oauth`](https://github.com/baileyrd/rusty_oauth), and
-[`rustils_async`](https://github.com/baileyrd/rustils_async) — merged one
-at a time, so the Crates table above only lists the ones already landed.
+**Claude Code plugin** (recommended if you're using Claude Code): the
+monorepo ships a marketplace at its root (`.claude-plugin/marketplace.json`,
+pointing at this directory's plugin manifest, described in [Claude Code
+Plugin](#claude-code-plugin) below), so no separate marketplace repo is
+needed —
 
-A third wave continues the same way, starting with
-[`rusty_wire`](https://github.com/baileyrd/rusty_wire) and
-[`rusty_std`](https://github.com/baileyrd/rusty_std), and now
-[`rusty_err`](https://github.com/baileyrd/rusty_err),
-[`rusty_request`](https://github.com/baileyrd/rusty_request),
-[`rusty_sqlite`](https://github.com/baileyrd/rusty_sqlite),
-[`rusty_time`](https://github.com/baileyrd/rusty_time),
-[`rusty_uuid`](https://github.com/baileyrd/rusty_uuid),
-[`rusty_wiremock`](https://github.com/baileyrd/rusty_wiremock),
-[`rusty_search`](https://github.com/baileyrd/rusty_search) (twelve crates
-behind one nested workspace),
-[`rusty_vulkan`](https://github.com/baileyrd/rusty_vulkan),
-[`rusty_sync`](https://github.com/baileyrd/rusty_sync),
-[`rusty_simd`](https://github.com/baileyrd/rusty_simd),
-[`rusty_codec`](https://github.com/baileyrd/rusty_codec),
-[`rusty_h2`](https://github.com/baileyrd/rusty_h2),
-[`rusty_audio`](https://github.com/baileyrd/rusty_audio),
-[`rusty_crypto_key`](https://github.com/baileyrd/rusty_crypto_key),
-[`rusty_db`](https://github.com/baileyrd/rusty_db) (six crates behind a
-second nested workspace),
-[`rusty_ansi`](https://github.com/baileyrd/rusty_ansi),
-[`rusty_config`](https://github.com/baileyrd/rusty_config),
-[`rusty_jinja`](https://github.com/baileyrd/rusty_jinja),
-[`rustils`](https://github.com/baileyrd/rustils) (eight crates behind one
-nested workspace),
-[`rusty_ansder`](https://github.com/baileyrd/rusty_ansder),
-[`rusty_boot`](https://github.com/baileyrd/rusty_boot),
-[`rusty_whisper`](https://github.com/baileyrd/rusty_whisper),
-[`rusty_rdp`](https://github.com/baileyrd/rusty_rdp), and
-[`rusty_voice`](https://github.com/baileyrd/rusty_voice) — merged one at
-a time, same process.
+```bash
+claude plugin marketplace add Rusty-Mill/rusty_mill
+claude plugin install rusty-remind-me@rusty-mill
+```
 
-A fourth wave finished the consolidation, merging the last eleven
-standalone repos the same way, starting with
-[`rusty_croc`](https://github.com/baileyrd/rusty_croc) and
-[`rusty_test`](https://github.com/baileyrd/rusty_test) (six crates behind
-one nested workspace) and
-[`rusty_inventrory`](https://github.com/baileyrd/rusty_inventrory) (three
-crates behind another) and
-[`rusty_skillopt`](https://github.com/baileyrd/rusty_skillopt) (four behind
-a third) and [`rusty_key`](https://github.com/baileyrd/rusty_key) (eight
-behind a fourth) and
-[`rusty_llama`](https://github.com/baileyrd/rusty_llama) and
-[`rusty_tailscale`](https://github.com/baileyrd/rusty_tailscale) (sixteen
-crates behind a fifth nested workspace) and
-[`rusty_adk`](https://github.com/baileyrd/rusty_adk) (fourteen behind a
-sixth) and [`rusty_provider`](https://github.com/baileyrd/rusty_provider)
-(six behind a seventh),
-[`rusty_yirp`](https://github.com/baileyrd/rusty_yirp) (nine behind an
-eighth), and finally
-[`rusty_agent_gateway`](https://github.com/baileyrd/rusty_agent_gateway)
-(nine behind a ninth) — one crate at a time, same process. Each of those
-eleven repos now carries an archive notice in its README pointing at its
-new home under `crates/`.
+An existing install from the old `rusty-remind-me` marketplace
+(`baileyrd/rusty_remind_me`) keeps working: that marketplace's entry now
+points at this directory of the monorepo, so updates arrive from here either
+way. Switching to `rusty-remind-me@rusty-mill` is still recommended.
 
-A fifth merge, separate from that `baileyrd/rusty_*` wave numbering,
-brought in [`baileyrd/nexus`](https://github.com/baileyrd/nexus) — a
-42-crate microkernel note-taking/AI-agent workspace — under
-`crates/nexus/`, same `git subtree` process, full history preserved.
+`rusty-remind-me` must already be on `PATH` (step 1) — the plugin's
+`.mcp.json` runs it as a subprocess, it isn't bundled. Verify with
+`claude plugin list` (shows `enabled`) and `claude mcp list` (shows the
+`rusty-remind-me` server `Connected`); a fresh Claude Code session should
+then show recent memories injected by the `SessionStart` hook, and
+`/rusty-remind-me:remember`/`/rusty-remind-me:recall` should work as slash
+commands.
+
+**Any other MCP client** (Claude Desktop, Antigravity, Cursor, Codex, or a
+generic MCP-config-reading client): run the auto-configurator, which merges
+the `rusty-remind-me` MCP server entry into every client config it finds —
+
+```bash
+rusty-remind-me configure
+```
+
+See [Automated Client
+Setup](#automated-client-setup-claude-desktop-antigravity-cursor-codex)
+below for the PowerShell/Python equivalents and exactly which config files
+this touches. Restart the client afterward — a running MCP client does not
+pick up a new stdio server until it restarts.
+
+### 3. Verify end to end
+
+```bash
+rusty-remind-me add "Installed rusty_remind_me" --category general
+rusty-remind-me search "installed"
+```
+
+Through whichever client you connected in step 2, ask it to recall something
+you just added — that exercises the actual MCP tool path, not just the CLI.
+
+### 4. Optional: multi-node sync via a hub
+
+Everything above is a complete, fully-functional single-machine install —
+sync is entirely opt-in. To share memories across machines, stand up a hub
+once and point every node at it:
+
+```bash
+# On the hub machine — SQLite backend, no separate database server:
+crates/remind_me_hub/setup.sh --sqlite install
+# Prints the generated SYNC_SECRET every client below needs.
+
+# On each client machine:
+REMIND_ME_SYNC_SECRET=<printed secret> rusty-remind-me configure \
+    --node-id my-laptop --hub-url http://<hub-host>:8765
+```
+
+`crates/remind_me_hub/setup.sh install` (without `--sqlite`) instead brings
+up Postgres in a rootless Podman container, and `crates/remind_me_hub/client-setup.sh
+--node-id my-laptop --tunnel me@hub-host` automates the SSH-tunnel case.
+Docker Compose, Fly.io, and Railway deployments are under
+`crates/remind_me_hub/deploy/`. See [`crates/remind_me_hub/README.md`](crates/remind_me_hub/README.md)
+for the full reference (routes, security posture, backends) and [Multi-Node
+Sync, Hub & Remote Connector](#multi-node-sync-hub--remote-connector) below
+for every client-side environment variable this `configure` call sets.
+
+If you installed as a Claude Code plugin (step 2), see [Multi-node sync
+through the plugin](#multi-node-sync-through-the-plugin) — the short version
+is that ambient environment inheritance (shell export, or Claude Code
+`settings.json`'s `env` key) is the supported way to get these three
+variables into the plugin's MCP server process.
+
+### 5. Optional: everything else
+
+Each of these is independently off by default and documented in its own
+section — enable only what you need:
+
+| Want | See |
+| --- | --- |
+| Semantic/vector search, cross-encoder reranking, HyDE query expansion | [Search Quality](#search-quality-embeddings-reranking--query-expansion) |
+| A network-reachable MCP endpoint (e.g. for `claude.ai`'s custom connector) | [Remote MCP connector](#remote-mcp-connector-remind_me_remote-rusty-remind-me-remote) |
+| The REST API / dashboard | [REST API Endpoints](#rest-api-endpoints) — `rusty-remind-me api [port]` |
+| Sharing a database with the Python `remind_me` reference | [Substituting for the `remind_me` MCP server](#substituting-for-the-remind_me-mcp-server) |
+
+---
+
+## Workspace Structure
+
+`rusty_remind_me` is six modular crates (members of the Rusty Mill monorepo's Cargo workspace):
+
+```
+rusty_remind_me/
+├── Cargo.toml                  # Workspace manifest (6 crates)
+├── README.md                   # User & Developer guide
+├── ARCHITECTURE.md             # Technical design & schema documentation
+├── CONTRIBUTING.md             # Development & testing guidelines
+├── docs/
+│   └── CUTOVER.md              # Runbook: migrating clients from the Python reference to this port
+├── scripts/
+│   ├── configure_mcp.ps1       # PowerShell auto-configuration script for Windows
+│   └── configure_mcp.py        # Cross-platform Python auto-configuration script
+└── crates/
+    ├── remind_me_core/         # Domain models, SQLite/FTS5 database, ACT-R decay, RRF ranking
+    ├── remind_me_mcp/          # Stdio JSON-RPC MCP protocol engine & tool handlers
+    ├── remind_me_api/          # Async REST HTTP server daemon (`rusty_http` + `tokio`)
+    ├── remind_me_remote/       # Remote MCP connector over Streamable HTTP (claude.ai, OAuth 2.1)
+    ├── remind_me_hub/          # Multi-node sync hub: push/pull relay + Tailscale peer discovery
+    └── remind_me_cli/          # Unified `rusty-remind-me` binary executable
+```
+
+---
+
+## Releases and versioning
+
+`.github/workflows/remind-me-release.yml` (at the monorepo root) watches
+every push to `main` that touches one of this product's six crate manifests.
+When their `version` has moved past the last version published from the
+monorepo (checked against existing `rusty-remind-me-vX.Y.Z` tags — nothing
+hand-maintains a changelog of already-shipped versions), it:
+
+1. Builds `rusty-remind-me` and `rusty-remind-me-hub` in release mode,
+   natively, for `x86_64-unknown-linux-gnu`, `x86_64-apple-darwin`,
+   `aarch64-apple-darwin`, and `x86_64-pc-windows-msvc` — one job per
+   platform, no cross-compilation, matching the "no system binary at build
+   time" convention the optional feature flags already follow (see
+   `crates/remind_me_core/Cargo.toml`).
+2. Packages the Claude Code plugin surface (`.claude-plugin/`, `commands/`,
+   `hooks/`, `.mcp.json`) into its own archive.
+3. Publishes a GitHub Release tagged `rusty-remind-me-vX.Y.Z` — prefixed,
+   because the monorepo releases more than one product — with all of the
+   above attached as downloadable assets.
+
+Bumping the version is therefore the entire release process — there is no
+separate "cut a release" step, and nothing here pushes a tag by hand; the
+release action creates it from the version it read.
+
+The six crates each carry their own literal `version` (the monorepo's
+`[workspace.package]` belongs to other crates), and must be bumped together
+with `.claude-plugin/plugin.json`'s `"version"`.
+`scripts/get_workspace_version.sh` fails if the six disagree, and
+`scripts/check_plugin_version.sh` fails if the plugin manifest differs from
+them; both run on every PR touching this directory (the `plugin-version` job
+in the monorepo's `.github/workflows/remind-me-checks.yml`), so a bump that
+misses one never merges — the release's plugin archive is never a version
+behind the binaries it ships alongside.
+
+---
+
+## Claude Code Plugin
+
+`rusty_remind_me` also ships as a [Claude Code plugin](https://code.claude.com/docs/en/plugins) — `.claude-plugin/plugin.json` in this directory (the plugin root), bundling:
+
+- **`.mcp.json`** — the same stdio MCP server (`rusty-remind-me server`) described above, registered automatically instead of via the `configure` command or a manual client config edit.
+- **`hooks/hooks.json`** — a `SessionStart` hook (`hooks/scripts/session-start.sh`) that runs `rusty-remind-me list --limit 8` directly (no MCP round-trip, no model decision required) and injects the most recently written memories as context at the start of every session.
+- **`commands/remember.md`, `commands/recall.md`** — `/rusty-remind-me:remember <text> [--category NAME] [--tags a,b]` and `/rusty-remind-me:recall <query> [--limit N]`, each running `rusty-remind-me add`/`search` directly (via the command body's `` !`...` `` bash-execution syntax) before the model ever sees the prompt. `allowed-tools` scopes each command to exactly one CLI invocation shape (`Bash(rusty-remind-me add *)` / `Bash(rusty-remind-me search *)`). Plugin-provided commands are namespaced as `/plugin-name:command-name` — the bare `/remember` is not registered, only `/rusty-remind-me:remember`.
+
+Three different connections, each with a different trigger:
+
+| Surface | Fires when | Model's role |
+| --- | --- | --- |
+| MCP tools | Model issues a `tools/call` | Decides whether and when to call |
+| `SessionStart` hook | Every session start, unconditionally | None — output is injected before the model sees the prompt |
+| `/rusty-remind-me:remember`, `/rusty-remind-me:recall` | User types the command | None for the CLI call itself; model only sees/summarizes the result |
+
+The hook and the slash commands both bypass MCP entirely — they invoke the plain CLI binary as a subprocess and never speak the MCP JSON-RPC protocol. The hook degrades safely: if `rusty-remind-me` isn't on `PATH` yet, or the store is empty, it emits `{"continue": true}` (optionally with a one-line `systemMessage` nudge to build the binary) rather than failing the session. The slash commands surface the same "not on PATH" condition as plain shell output for the model to relay, rather than silently retrying some other way.
+
+To use it, `rusty-remind-me` must be on `PATH` (`cargo build --release -p rusty-remind-me` then add `target/release` to `PATH`, or `cargo install --path crates/apps/rusty_remind_me/crates/remind_me_cli` from the monorepo root), then add the monorepo as a plugin marketplace in Claude Code (see [Connect it to a client](#2-connect-it-to-a-client)).
+
+### Multi-node sync through the plugin
+
+`.mcp.json` sets no `env` — Claude Code spawns a plugin's MCP server with
+`{...process.env, ...pluginEnv}`, so with nothing in `pluginEnv` the
+`rusty-remind-me server` process the plugin starts inherits Claude Code's own
+environment in full. If `REMIND_ME_NODE_ID`, `REMIND_ME_HUB_URL`, and
+`REMIND_ME_SYNC_SECRET` are already set in that environment, sync comes up
+transparently — the plugin neither enables nor blocks it, and there's
+nowhere here that would hardcode a shared secret into a file that ships with
+the plugin.
+
+What that inheritance does *not* change is which surface actually carries
+sync: per the note below, the background sync thread is a long-lived
+process's own background service (like the reminder scheduler or folder
+watcher), not something the MCP connection specifically owns — the plugin's
+bundled `rusty-remind-me server` runs one, but the `SessionStart` hook and
+both slash commands still invoke the plain CLI as one-shot subprocesses that
+exit immediately, same as `add`/`search` always have, sync thread or not. A
+memory added via `/rusty-remind-me:remember` while the MCP connection is
+down still lands in the local outbox; it just doesn't reach the hub until
+some running `rusty-remind-me server`/`api`/`remote` process — this plugin's
+or otherwise, against the same database — picks it up on its next cycle.
+
+**Why this isn't a `userConfig`-driven install prompt.** Claude Code plugins
+can declare `userConfig` fields that prompt the user for values when the
+plugin is enabled — the natural-looking way to turn "set three env vars
+yourself" into part of installing the plugin. Tried and abandoned: neither of
+Claude Code's two documented delivery paths for a configured `userConfig`
+value actually reaches this plugin's MCP server subprocess. Verified directly
+by wrapping the `rusty-remind-me` binary and logging its real spawn
+environment —
+
+- `${user_config.KEY}` substitution inside `.mcp.json`'s own `env` block
+  (what the plugin docs describe for "MCP and LSP server configs") does not
+  resolve for an `argv=["server"]` spawn; the literal, un-substituted
+  `${user_config.KEY}` string reaches the process instead. Worse than
+  useless: `sync_enabled()` sees three non-empty strings and turns sync *on*
+  against a garbage endpoint rather than leaving it off (this is what
+  `is_unresolved_placeholder` in `sync/mod.rs` now guards against).
+- `CLAUDE_PLUGIN_OPTION_<KEY>`, which Claude Code does export for a
+  configured `userConfig` option, reaches this plugin's `SessionStart` hook
+  invocation (`argv=["list", "--limit", "8"]`) but not the `argv=["server"]`
+  MCP server spawn in the same session — confirmed by tagging captured
+  environments with their argv and pid. The docs say these vars go to "hook
+  processes"; that turned out to be exact, not illustrative.
+
+Declaring `env` in `.mcp.json` is also not additive with today's ambient
+inheritance even where substitution *did* work: `pluginEnv` always wins in
+`{...process.env, ...pluginEnv}`, so wiring `userConfig` in would have
+silently broken the shell/`settings.json`-based setup described above for
+anyone already using it. Given neither delivery path works for the process
+that needs the values, ambient inheritance stays the only supported way to
+configure sync through this plugin.
+
+---
+
+## Automated Client Setup (Claude Desktop, Antigravity, Cursor, Codex)
+
+You can automatically configure all installed AI client applications (Claude Desktop, Antigravity, Cursor, Codex / Generic MCP) to use `rusty_remind_me` as their memory backend:
+
+### Option A: Via Built-in CLI Command
+```bash
+cargo run --bin rusty-remind-me -- configure
+```
+
+### Option B: Via PowerShell Script (Windows)
+```powershell
+.\scripts\configure_mcp.ps1
+```
+
+### Option C: Via Python Script (Cross-Platform)
+```bash
+python scripts/configure_mcp.py
+```
+
+Each setup option safely merges the `"rusty-remind-me"` MCP server configuration into:
+- **Claude Desktop**: `%APPDATA%\Claude\claude_desktop_config.json`
+- **Antigravity**: `%USERPROFILE%\.gemini\antigravity\mcp_config.json`
+- **Cursor**: `%USERPROFILE%\.cursor\mcp.json`
+- **Codex / Generic**: `%USERPROFILE%\.mcp\config.json`
+
+---
+
+## Database Location
+
+By default the store is `~/.remind-me/memory.db` — the same path [`remind_me`](https://github.com/baileyrd/remind_me) uses, so an unconfigured install of either one opens the same database.
+
+Two environment variables override it, most specific first:
+
+| Variable | Names a | Notes |
+| --- | --- | --- |
+| `REMIND_ME_DB_PATH` | database **file** | Wins if both are set. Specific to this implementation. |
+| `REMIND_ME_MCP_DIR` | **directory** holding `memory.db` | Shared with `remind_me`. Set this to point both implementations at one store. |
+
+A leading `~` is expanded in either. A variable set to the empty string counts as unset.
+
+To share a database with `remind_me`, set `REMIND_ME_MCP_DIR` only — `REMIND_ME_DB_PATH` has no meaning to `remind_me` and setting it there is silently ignored.
+
+## Substituting for the `remind_me` MCP server
+
+Two settings make this binary a drop-in replacement for [`remind_me`](https://github.com/baileyrd/remind_me)'s MCP server:
+
+```bash
+REMIND_ME_MCP_DIR=~/.remind-me                 # the same database (the default)
+REMIND_ME_DEFAULT_RESPONSE_FORMAT=markdown     # the same output format
+```
+
+Or write both into every MCP client config at once:
+
+```bash
+rusty-remind-me configure --default-format markdown
+```
+
+`REMIND_ME_DEFAULT_RESPONSE_FORMAT` accepts `json` (the default) or `markdown`, and affects **only** the tools where `remind_me` has no `response_format` parameter at all — it returns Markdown from those and offers no JSON, whereas this port offers both and defaults to JSON so existing callers keep working.
+
+Tools that mirror a `remind_me` input model already use that model's own default and are deliberately untouched by this setting: Markdown for `search`, `list`, `wiki_list`, `stats`, `history`, `digest` and `list_reminders`, JSON for `vitality_report`. Making `vitality_report` render Markdown because you asked for "markdown defaults" would move this port *away* from the reference.
+
+A per-call `"response_format"` argument always wins over the setting, in both directions.
+
+**Migrating an already-running client from `remind_me` to this binary?** A
+stdio client will not pick up a config change until it restarts — see
+`docs/CUTOVER.md` for the full runbook and the lessons learned cutting over
+every consumer on a real machine.
+
+## Multi-Node Sync, Hub & Remote Connector
+
+Two additional crates extend a single-machine install into a synced fleet and
+an internet-reachable MCP endpoint. Both are **off by default** — nothing
+here changes single-machine behavior unless the corresponding environment
+variables are set.
+
+### Multi-node sync (`remind_me_hub`, `remind_me_core::sync`)
+
+A node pushes its outbox to a hub and pulls the hub's changes back; peers are
+also discovered directly (a static list, or Tailscale's local API) for
+peer-to-peer push. Sync stays off until `REMIND_ME_NODE_ID`,
+`REMIND_ME_HUB_URL`, and `REMIND_ME_SYNC_SECRET` are all set.
+
+**The background sync thread needs a long-lived process to run in.**
+`SyncWorker::from_env` — the loop that actually pushes/pulls on
+`REMIND_ME_SYNC_INTERVAL` — is a background service like the reminder
+scheduler or folder watcher (`crates/remind_me_core/src/sync/worker.rs`), not
+something any single binary owns. `rusty-remind-me server`, `api`, and
+`remote` each start one alongside their own work
+(`crates/remind_me_cli/src/main.rs`); the one-shot CLI subcommands (`add`,
+`search`, `list`, ...) don't, since they exit before a cycle could ever run.
+A write from one of those one-shot commands still lands in the shared SQLite
+outbox — it isn't lost — but nothing pushes it to the hub until a process
+that *is* running a sync worker picks it up on its next cycle. Concretely:
+one of `rusty-remind-me server`/`api`/`remote` has to be running somewhere
+for sync to actually move data. Status is process-global, not tied to
+whichever instance started the worker:
+`remind_me_server_status` reports on whatever sync worker is live in *that*
+process, the same way it already reports on the folder watcher.
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `REMIND_ME_NODE_ID` | This node's identity, stamped on every row it writes | unset (sync off) |
+| `REMIND_ME_CLIENT` | Human-readable label for this install, alongside `node_id` | `unknown` |
+| `REMIND_ME_HUB_URL` | Hub this node pushes to / pulls from | unset (sync off) |
+| `REMIND_ME_SYNC_SECRET` | Bearer token for `/sync/push` and `/sync/pull`, sent and required | unset (sync off) |
+| `REMIND_ME_SYNC_INTERVAL` | Seconds between background sync cycles | `60` |
+| `REMIND_ME_PEER_BIND` | Bind address for this node's own peer server (accepts another node's push/pull) | `0.0.0.0` — all interfaces; narrow to `127.0.0.1` behind a tunnel-only setup |
+| `REMIND_ME_PEER_PORT` | Port for the peer server above, and the port every discovered peer is assumed to listen on | `8766` |
+
+`rusty-remind-me configure --node-id ID --hub-url URL [--peer-port N] [--sync-interval SECS]`
+writes both the MCP entry and this sync environment for every configured
+client in one command. There is deliberately no `--secret` flag — it is read
+from `REMIND_ME_SYNC_SECRET` only, so it never lands in argv (`/proc`, shell
+history).
+
+### Remote MCP connector (`remind_me_remote`, `rusty-remind-me remote`)
+
+Serves the MCP server over Streamable HTTP instead of stdio, for connectors
+that need a network endpoint — e.g. `claude.ai`'s custom connector. Supports
+a legacy secret-path/bearer token and, when an issuer is configured, OAuth
+2.1.
+
+Speaks both Streamable HTTP lifecycles `rmcp` implements: the
+session-managed one every client through protocol version `2025-11-25`
+uses (`Mcp-Session-Id`, including `mcp-remote`-fronted clients like Claude
+Desktop) keeps working unchanged, and SEP-2567's newer per-request
+"discover" lifecycle for `2026-07-28`+ clients, which can call a tool in a
+single POST with no `initialize`/session at all. Which one a given request
+gets is decided per request from its negotiated protocol version, not by
+configuration.
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `REMIND_ME_REMOTE_MCP` | Enables the connector (`1`/`true`/`yes`) | disabled |
+| `REMIND_ME_REMOTE_HOST` | Bind address | `127.0.0.1` |
+| `REMIND_ME_REMOTE_PORT` | Bind port | `8768` |
+| `REMIND_ME_REMOTE_TOKEN` | Connector bearer token; always wins when set | auto-generated on first use and persisted to disk |
+| `REMIND_ME_REMOTE_ISSUER` | Public HTTPS origin for OAuth 2.1 discovery | unset (OAuth off; secret-path/bearer only) |
+
+Loopback by default — expose it through an HTTPS tunnel (e.g. Tailscale
+Funnel) rather than widening the bind address directly.
+
+## Search Quality: Embeddings, Reranking & Query Expansion
+
+Three independent, optional layers on top of FTS5 keyword search. Each is
+**off by default** and degrades to keyword-only (or its next-cheapest
+fallback) on any failure — a missing daemon, an unconfigured model, or a
+disabled build feature is never a reason a search should fail.
+
+### Semantic search (`remind_me_core::embedder`)
+
+`REMIND_ME_EMBEDDING_BACKEND` selects the backend; unset, semantic search is
+off entirely.
+
+| Backend | `REMIND_ME_EMBEDDING_BACKEND` | Needs |
+| --- | --- | --- |
+| Ollama | `ollama` | A running Ollama daemon (`REMIND_ME_OLLAMA_URL`, default `http://localhost:11434`; `REMIND_ME_OLLAMA_EMBED_MODEL`, default `nomic-embed-text`) |
+| In-process ONNX | `onnx` | Build with `--features remind_me_core/local-embed`; `REMIND_ME_ONNX_MODEL_PATH`/`REMIND_ME_ONNX_TOKENIZER_PATH` pointing at a `.rten` bi-encoder + its `tokenizer.json` — no implicit download, same convention as reranking below |
+
+`REMIND_ME_EMBEDDING_DIM` (default `384`, sized for
+`sentence-transformers/all-MiniLM-L6-v2`) must match the configured model's
+actual output dimension.
+
+### Cross-encoder reranking (`remind_me_core::reranker`)
+
+Rescores the head of the RRF-ranked list with a cross-encoder for more
+precise ordering than keyword/semantic fusion alone. Build with
+`--features remind_me_core/rerank`; `REMIND_ME_RERANK` defaults to on but
+does nothing until `REMIND_ME_RERANK_MODEL_PATH`/
+`REMIND_ME_RERANK_TOKENIZER_PATH` name a `.rten` cross-encoder and its
+`tokenizer.json` — same no-implicit-download rule.
+
+### Query expansion (`remind_me_core::query_expansion`)
+
+`REMIND_ME_QUERY_EXPANSION=hyde` enables HyDE (Hypothetical Document
+Embeddings): a local LLM writes a short passage that would plausibly answer
+the query, and that passage's embedding is fused with the query's own
+before the semantic search runs — helps most on questions phrased nothing
+like the memory that answers them. Generation uses the same Ollama daemon
+the `ollama` embedding backend talks to.
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `REMIND_ME_QUERY_EXPANSION` | `hyde` to enable | unset (off) |
+| `REMIND_ME_HYDE_MODEL` | Ollama model that writes the passage | `llama3.2` |
+| `REMIND_ME_HYDE_TIMEOUT` | Seconds before falling back to the plain query | `15` |
+
+### Converting a HuggingFace ONNX export to `.rten`
+
+Both `onnx` embeddings and reranking take `rten`-format models, not raw
+ONNX. If a model's HuggingFace repo already ships an `onnx/model.onnx`
+export (most `sentence-transformers`/cross-encoder repos do), convert it
+directly — no PyTorch, no re-download:
+
+```bash
+pip install rten-convert
+python -m rten_convert path/to/model.onnx path/to/model.rten
+```
+
+On Windows, `rten-convert` 0.22.0's default shape-inference step raises a
+`PermissionError` (`tempfile.NamedTemporaryFile` stays open while its own C
+extension tries to reopen the same path) — add `--no-infer-shapes` to skip
+it; that costs a runtime graph optimization, not correctness.
+
+## Command Line Interface (CLI)
+
+The compiled binary `rusty-remind-me` provides subcommands for interactive management, MCP stdio protocol hosting, and REST API daemon mode:
+
+### 1. Stdio MCP Server (Default)
+Starts the stdio JSON-RPC MCP server for integration with MCP clients (Claude Desktop, Antigravity, Cursor, etc.):
+```bash
+rusty-remind-me server
+# OR simply run without arguments:
+rusty-remind-me
+```
+
+### 2. Auto-Configuration
+Configures all installed MCP client applications:
+```bash
+rusty-remind-me configure
+```
+
+`configure` also accepts `--node-id ID --hub-url URL` (writes the sync
+environment too — see [Multi-Node Sync, Hub & Remote
+Connector](#multi-node-sync-hub--remote-connector) below), plus `--peer-port
+N`, `--sync-interval SECS`, `--db-path PATH`, and `--default-format
+json|markdown`. The sync secret always comes from `REMIND_ME_SYNC_SECRET`,
+never a flag — argv is world-readable via `/proc` and shell history.
+
+### 3. REST API Server Daemon
+Starts the async HTTP REST server listening on the specified port (default: 8080):
+```bash
+rusty-remind-me api 8080
+```
+
+### 4. Remote MCP Connector
+Serves the MCP server over Streamable HTTP for network-reachable clients
+(e.g. `claude.ai`'s custom connector), instead of stdio:
+```bash
+REMIND_ME_REMOTE_MCP=1 rusty-remind-me remote
+```
+Off by default; binds `127.0.0.1:8768` unless `REMIND_ME_REMOTE_HOST` /
+`REMIND_ME_REMOTE_PORT` are set. See [Multi-Node Sync, Hub & Remote
+Connector](#multi-node-sync-hub--remote-connector) above for the full
+environment variable reference.
+
+### 5. Adding Memories
+Stores a new memory note, fact, or preference in SQLite with automatic FTS5 indexing:
+```bash
+rusty-remind-me add "User prefers dark mode and Rust for low-level server development"
+rusty-remind-me add "Deploy runbook lives in the ops wiki" --category engineering --tags ops,runbook
+```
+
+`--category` defaults to `general`; `--tags` is comma-separated and drops blanks. Use `--` before content that starts with dashes.
+
+### 6. Searching Memories
+Executes an FTS5 BM25 search with RRF rank fusion and ACT-R vitality scoring:
+```bash
+rusty-remind-me search "dark mode Rust"
+rusty-remind-me search "dark mode Rust" --limit 5 --json
+```
+
+Output is Markdown by default — the same rendering `list` uses — with `--json` returning the full results including scores.
+
+### 7. Fetching Memory by ID
+Retrieves a specific memory record by its primary key:
+```bash
+rusty-remind-me get mem_4b307c2bd6ec4deb8c891a4b28cc592a
+```
+
+### 8. Knowledge Graph Entity Management
+Upserts an entity with optional category/kind classification:
+```bash
+rusty-remind-me entity "Bailey Robertson" "person"
+```
+
+### 9. Markdown Wiki Synthesis
+Creates or updates a structured wiki topic page:
+```bash
+rusty-remind-me wiki-write architecture "System Architecture" "Rusty Remind Me is a high performance memory engine written in Rust."
+```
+
+Reads a wiki page by slug:
+```bash
+rusty-remind-me wiki-read architecture
+```
+
+Imports a whole directory of Markdown files into the wiki (recursively):
+```bash
+rusty-remind-me wiki-import ./wiki-pages
+```
+
+Each file's `slug`, `title` and `topic` are read from its YAML front matter,
+which is stripped from the stored `content` since those three become columns.
+Any field that is absent falls back independently — `title` from the file's
+first `# ` heading then its filename, `slug` derived from the resolved title,
+`topic` to `general` — so a hand-written note imports without ceremony. The
+import upserts on `slug`, so re-importing an updated directory revises pages
+in place rather than duplicating them.
+
+This pairs with [`daily-backup-system`](https://github.com/baileyrd/Daily-Backup-System),
+whose `dbs export-wiki --out-dir DIR` writes exactly this layout — one page per
+backup source and per tag, cross-linked with `[[wikilinks]]`:
+```bash
+dbs export-wiki --out-dir ./wiki-pages    # in the dbs repo
+rusty-remind-me wiki-import ./wiki-pages
+```
+
+### 10. System Statistics
+Prints total memory counts and database metrics:
+```bash
+rusty-remind-me stats
+```
+
+---
+
+## REST API Endpoints
+
+When running `rusty-remind-me api [port]`, the HTTP server exposes the routes
+below (`crates/remind_me_api/src/routes.rs`'s `ROUTES` table is the
+authoritative list — this table summarizes it, so check that file directly
+for anything not covered here, e.g. the dashboard/knowledge-graph/wiki
+surfaces):
+
+| Method | Endpoint | Description |
+| ------ | -------- | ----------- |
+| `GET` | `/health` | Server health check — `{"status": "ok", "version": "0.1.0"}` |
+| `GET` | `/api/stats` | Dashboard-level memory statistics |
+| `GET` | `/api/memories` | List memories |
+| `POST` | `/api/memories` | Store a new memory (`MemoryAddInput` JSON body) |
+| `GET` | `/api/memories/{memory_id}` | Fetch one memory by ID |
+| `PUT`, `PATCH` | `/api/memories/{memory_id}` | Update a memory |
+| `DELETE` | `/api/memories/{memory_id}` | Delete a memory |
+| `GET` | `/api/memories/search?q=...&limit=...` | Search memories — query params, not a POST body |
+| `POST` | `/api/memories/bulk/delete`, `/bulk/tag`, `/bulk/reclassify` | Bulk operations over a set of memory IDs |
+| `GET` | `/api/vitality` | Vitality report |
+| `GET` | `/api/versions` | Version history |
+| `GET` | `/api/analytics/trend` | Analytics trend data |
+| `POST` | `/api/import` | Import memories |
+| `GET` | `/api/export` | Export memories |
+| `GET` | `/api/entity`, `/api/entities`, `/api/entity/traverse` | Knowledge-graph entity endpoints |
+| `GET` | `/api/wiki`, `/api/wiki/search`, `/api/wiki/load`, `/api/wiki/status`, `/api/wiki/{slug}` | Markdown wiki endpoints |
+| `POST` | `/api/wiki` | Create or replace a page — `{"title": ..., "content": ..., "log_note": ...}` (`remind_me_wiki_write`) |
+| `DELETE` | `/api/wiki/{slug}` | Delete a page and its index rows (`remind_me_wiki_delete`) |
+| `POST` | `/api/wiki/compile` | Compile brief; `{"mark_integrated": true}` advances the watermark (`remind_me_wiki_compile`) |
+| `GET` | `/api/wiki/schema` | The maintainer schema the compile brief embeds |
+| `GET` | `/api/reminders?when=upcoming\|overdue\|all&limit=...` | Memories with a reminder set, soonest first (`remind_me_list_reminders`) |
+| `POST` | `/api/reminders` | Set or clear a reminder — `{"memory_id": ..., "remind_at": ISO-8601 or null}` (`remind_me_set_reminder`) |
+| `GET` | `/api/digest?since_days=...` | Recent memories, vitality, reminders and sync state (`remind_me_digest`) |
+| `GET` | `/api/status` | Build, database, schema currency, backups and subsystem state (`remind_me_server_status`) |
+| `GET` | `/api/saved-searches` | List saved searches (`remind_me_list_saved_searches`) |
+| `POST` | `/api/saved-searches` | Create or update one by name (`remind_me_save_search`) |
+| `GET` | `/api/saved-searches/{name}/run` | Re-run a saved search's stored query and filters (`remind_me_run_saved_search`) |
+| `DELETE` | `/api/saved-searches/{name}` | Delete one, with its watch-tracking rows (`remind_me_delete_saved_search`) |
+| `GET` | `/metrics`, `/manifest.json`, `/` | Metrics, PWA manifest, and the dashboard itself |
+
+Each of the reminder, digest, status, saved-search and wiki routes calls the
+same `remind_me_core` function its MCP tool does, so a reminder set from the
+dashboard and one set by Claude are the same row, validated the same way. The
+dashboard drives all of them: a clock button on every memory card, a
+**Reminders** view with the upcoming/overdue/all windows, a **Searches** view
+that runs and deletes saved searches, and a digest/server-status panel at the
+bottom of **Stats**.
+
+### Editing the wiki
+
+The wiki is LLM-curated — Claude synthesises pages from your raw memories — but
+you own the vault, so the mechanical operations are yours: the **Wiki** view
+can write a page by hand, edit or delete an existing one, and drive a compile
+pass. `index.md`, `log.md` and `schema.md` are generated and refused as page
+titles; every other title is slugified to `[a-z0-9-]+` before it becomes a
+filename, so a page can only ever land inside the wiki directory.
+
+Compiling stays two-phase, because the synthesis in the middle is a judgment
+call this server cannot make. `POST /api/wiki/compile` returns a **brief** — the
+raw memories since the last watermark, the current page index, and the
+maintainer schema — and advances nothing, so it is safe to call repeatedly. The
+dashboard shows that brief and offers it for copying into a Claude session
+(which then writes the pages with `remind_me_wiki_write`); once the pages
+exist, `{"mark_integrated": true}` moves the watermark past that batch. Marking
+integrated is not reversible from the UI: those memories will not appear in a
+future brief whether they were written up or not.
+
+---
+
+## License
+
+MIT License. See [LICENSE](LICENSE) for details.

@@ -1,6 +1,0 @@
-/target
-**/*.rs.bk
-*.pcap
-*.pcapng
-/interop/state/
-/interop/noise-server-go/noise-server-go

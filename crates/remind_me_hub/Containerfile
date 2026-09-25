@@ -1,0 +1,117 @@
+# Container image for the remind-me sync hub.
+#
+# Build from the **workspace root**, not this directory — the hub is a crate in
+# a Cargo workspace, so the build needs the root `Cargo.toml` and `Cargo.lock`:
+#
+#     podman build -f crates/remind_me_hub/Containerfile -t remind-me-hub .
+#
+# That differs from the reference's `hub/Containerfile`, whose context is
+# `hub/` alone because it copies a single `main.py`. Every template and script
+# here passes the right context; it is called out because a hand-run
+# `podman build crates/remind_me_hub` fails in a way that does not explain
+# itself.
+
+# ---------------------------------------------------------------------------
+# Build
+# ---------------------------------------------------------------------------
+FROM docker.io/library/rust:1-slim-bookworm AS build
+
+# `rusqlite`'s bundled SQLite and `libsqlite3-sys` compile C, so the build
+# stage needs a C toolchain. The runtime stage below does not, which is the
+# whole point of splitting them.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+
+# Manifests first, then a throwaway build, so the dependency layer is cached
+# independently of the source. Editing hub code then rebuilds in seconds
+# instead of recompiling the whole dependency graph.
+COPY Cargo.toml Cargo.lock ./
+COPY crates/remind_me_core/Cargo.toml crates/remind_me_core/
+COPY crates/remind_me_mcp/Cargo.toml crates/remind_me_mcp/
+COPY crates/remind_me_api/Cargo.toml crates/remind_me_api/
+COPY crates/remind_me_cli/Cargo.toml crates/remind_me_cli/
+COPY crates/remind_me_remote/Cargo.toml crates/remind_me_remote/
+COPY crates/remind_me_hub/Cargo.toml crates/remind_me_hub/
+# Stub sources so `cargo build` resolves and compiles dependencies without the
+# real code. Cargo validates every target a manifest declares before it builds
+# anything, so `remind_me_core` needs its `build.rs` *and* the
+# `watchdog_stack_probe` bin here -- even though that bin is
+# `required-features = ["stack-dumps"]` and is never built. Omitting it fails
+# with "can't find `watchdog_stack_probe` bin", which reads like a source
+# problem rather than a missing stub.
+RUN mkdir -p crates/remind_me_core/src/bin crates/remind_me_mcp/src \
+             crates/remind_me_api/src crates/remind_me_cli/src \
+             crates/remind_me_remote/src crates/remind_me_hub/src \
+    && echo 'fn main() {}' > crates/remind_me_core/build.rs \
+    && for c in core mcp api remote hub; do \
+           echo '' > "crates/remind_me_$c/src/lib.rs"; \
+       done \
+    && echo 'fn main() {}' > crates/remind_me_cli/src/main.rs \
+    && echo 'fn main() {}' > crates/remind_me_hub/src/main.rs \
+    && echo 'fn main() {}' > crates/remind_me_core/src/bin/watchdog_stack_probe.rs \
+    && cargo build --release -p remind_me_hub --bin rusty-remind-me-hub --locked \
+    && rm -rf crates/*/src crates/remind_me_core/build.rs
+
+COPY crates crates
+# `COPY` preserves the build context's mtimes, which are routinely older than
+# the stub artifacts just built above -- so cargo would consider the stubs
+# current and link them. Touching *every* source, rather than a hand-listed
+# few, is what makes that safe: naming files individually looks tidier and
+# quietly ships the empty stub for whichever one the list forgot (this file
+# did exactly that, and the symptom was `E0432: unresolved import` from the
+# real `main.rs` against a stub `lib.rs`, which does not read like a caching
+# problem at all). Registry dependencies are unaffected and stay cached.
+RUN find crates -name '*.rs' -exec touch {} + \
+    && cargo build --release -p remind_me_hub --bin rusty-remind-me-hub --locked \
+    && strip target/release/rusty-remind-me-hub
+
+# ---------------------------------------------------------------------------
+# Runtime
+# ---------------------------------------------------------------------------
+# No Rust toolchain, no C compiler, no package manager for an attacker to
+# reach. The binary statically links SQLite; `ca-certificates` is here for
+# TLS to a managed Postgres, which several of the deploy templates use.
+FROM docker.io/library/debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Kept in step with HUB_VERSION in src/lib.rs — setup.sh reads the constant out
+# of the source and passes it here, so the two cannot disagree for an image
+# built the documented way. The default is deliberately "unknown" rather than a
+# number: a hand-built image that skipped the build-arg should say it doesn't
+# know, not claim a version it may not be running.
+ARG HUB_VERSION=unknown
+
+# Non-root. The reference's image runs as root because the Python base image
+# does; there is no reason to inherit that here, and a hub with a SQLite
+# backend writes to a volume that should not be root-owned.
+RUN useradd --system --create-home --uid 10001 hub
+USER hub
+WORKDIR /home/hub
+
+COPY --from=build /src/target/release/rusty-remind-me-hub /usr/local/bin/
+
+# The running hub reports its version over HTTP, which is no help when the
+# container is stopped or crash-looping -- exactly when you most need to know
+# which build you have. These make `podman inspect` answer it too.
+LABEL org.opencontainers.image.title="remind-me sync hub (Rust)" \
+      org.opencontainers.image.description="Central sync point for the remind_me distributed sync engine" \
+      org.opencontainers.image.source="https://github.com/baileyrd/rusty_remind_me" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.version="${HUB_VERSION}"
+
+# 0.0.0.0 inside the container, published to a loopback or private address by
+# the deploy templates. The binary's own default is 127.0.0.1, which is right
+# for a bare process and wrong for a container, where it would be unreachable
+# even from the host.
+ENV REMIND_ME_HUB_BIND=0.0.0.0 \
+    REMIND_ME_HUB_PORT=8765
+
+EXPOSE 8765
+
+CMD ["rusty-remind-me-hub"]

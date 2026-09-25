@@ -1,7 +1,0 @@
-[template]
-cargo_generate_version = ">=0.18.0"
-
-[placeholders.description]
-type = "string"
-prompt = "One line describing what this server does"
-default = "An MCP server"
