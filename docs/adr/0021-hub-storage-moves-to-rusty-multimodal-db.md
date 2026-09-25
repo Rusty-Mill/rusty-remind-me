@@ -218,8 +218,42 @@ in one pass (`MultimodalHubStore::create_from_snapshot`).
   rows mapping to one engine id, stop the copy with nothing written, unless
   `--drop-invalid` says to go ahead without those rows.
 
-Still to do in phase 3: measure pull latency under push load, switch the
-default, then remove the old stores a release later.
+### Pull latency under push load (measured 2026-09-25)
+
+`remind_me_hub/examples/pull_latency.rs` preloads a hub on disk with 20 000
+memories. Pushers then apply one memory at a time while two pullers page
+`since_seq` pulls of 500 from random cursors. It ran on this project's
+shared CI-class container.
+
+| 20k preloaded, 10 s | SQLite | Engine, as first built | Engine, fixed |
+|---|---|---|---|
+| Preload, one writer | 5.7 s | 25.1 s | 5.2 s |
+| 4 pushers: pushes/s | 2534 | 259 | 1102 |
+| 4 pushers: pull p50 / p99 | 27 / 232 ms | 10 s / 10 s | 3.2 / 7.1 ms |
+| 1 pusher: pushes/s | 828 | 308 | 1893 |
+| 1 pusher: pull p50 / p99 | 6.5 / 38 ms | 4.2 / 12 ms | 3.6 / 8.9 ms |
+
+The engine as first built failed the Consequences' "pushes block pulls"
+concern badly. Three fixes brought it well past SQLite on pulls:
+
+- **Pulls starved behind queued pushes.** `std`'s `RwLock` lets a waiting
+  writer go ahead of waiting readers, so under several pushers a pull
+  waited for every queued push. Writers now queue on a mutex first, so at
+  most one writer waits on the lock.
+- **Every insert read the whole insert log** (an engine bug: four header
+  bytes read as the whole file). It was fixed in the engine, which made
+  writes linear again.
+- **Pulls held the read lock while building JSON.** They now copy their
+  rows under the lock and serialise after releasing it.
+
+Contended pushes remain below SQLite's. Each engine write syncs twice,
+the log and then the slot file, and SQLite syncs once. A personal hub's push
+load is a few records a minute, and a node's first full sync of 20 000
+memories takes about 20 s. The real fix is batching a push under one sync,
+which needs an engine batch-insert API. That is a follow-up, not a gate.
+
+Still to do in phase 3: switch the default, then remove the old stores a
+release later.
 
 ## Related
 

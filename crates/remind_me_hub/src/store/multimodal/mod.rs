@@ -57,7 +57,7 @@ use std::fs::File;
 use std::io::Write;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use uuid::Uuid;
 
 pub use keys::ID_CAP;
@@ -96,6 +96,12 @@ struct Tables {
 pub struct MultimodalHubStore {
     dir: PathBuf,
     tables: RwLock<Tables>,
+    /// Writers queue here before asking for the write lock, so at most one
+    /// writer ever waits on `tables`. `std`'s `RwLock` lets a waiting writer
+    /// go ahead of waiting readers; with several pushes queued on it, a
+    /// pull would wait for every one of them, and under steady pushes it
+    /// never got in (a pull p50 of 10 s in `examples/pull_latency.rs`).
+    writers: Mutex<()>,
     /// Held for the store's lifetime: its OS lock is what keeps a second
     /// hub off the same directory (ADR-0021, Consequences: there is no
     /// separate server to take `rusty_multimodal_db`'s ADR-0092 lock).
@@ -208,6 +214,7 @@ impl MultimodalHubStore {
                 next_seq,
                 writes_since_compact: 0,
             }),
+            writers: Mutex::new(()),
             _dir_lock: dir_lock,
         })
     }
@@ -229,8 +236,35 @@ impl MultimodalHubStore {
 
     /// The write lock, recovered after a panic (ADR-0021, decision 5): one
     /// panicking request must not make every later request panic too.
-    fn write(&self) -> RwLockWriteGuard<'_, Tables> {
-        self.tables.write().unwrap_or_else(PoisonError::into_inner)
+    ///
+    /// Taken behind the writer queue: see [`Self::writers`].
+    fn write(&self) -> WriteGuard<'_> {
+        let queued = self.writers.lock().unwrap_or_else(PoisonError::into_inner);
+        WriteGuard {
+            tables: self.tables.write().unwrap_or_else(PoisonError::into_inner),
+            _queued: queued,
+        }
+    }
+}
+
+/// The write lock and the writer-queue place it was taken behind. Fields
+/// drop in order, so the write lock goes first and a pull waiting on it
+/// gets in before the next writer can ask for it.
+struct WriteGuard<'a> {
+    tables: RwLockWriteGuard<'a, Tables>,
+    _queued: MutexGuard<'a, ()>,
+}
+
+impl std::ops::Deref for WriteGuard<'_> {
+    type Target = Tables;
+    fn deref(&self) -> &Tables {
+        &self.tables
+    }
+}
+
+impl std::ops::DerefMut for WriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Tables {
+        &mut self.tables
     }
 }
 
@@ -722,6 +756,8 @@ impl HubStore for MultimodalHubStore {
                 keep,
             )?,
         };
+        // The rows are copies: serialise them after letting writers in.
+        drop(t);
         Ok(rows.iter().map(MemoryRow::to_wire).collect())
     }
 
@@ -739,6 +775,7 @@ impl HubStore for MultimodalHubStore {
             page_where::<_, _, Keyset>(&t.entities, Some(cursor), query.limit, |e: &EntityRow| {
                 keep(e.origin_node.as_deref())
             })?;
+        drop(t);
         Ok(rows.iter().map(EntityRow::to_wire).collect())
     }
 
@@ -750,6 +787,7 @@ impl HubStore for MultimodalHubStore {
         );
         let rows =
             page_where::<_, _, Keyset>(&t.links, Some(cursor), query.limit, |_: &LinkRow| true)?;
+        drop(t);
         Ok(rows.iter().map(LinkRow::to_wire).collect())
     }
 
@@ -762,6 +800,7 @@ impl HubStore for MultimodalHubStore {
             query.limit,
             |_: &RelationRow| true,
         )?;
+        drop(t);
         Ok(rows.iter().map(RelationRow::to_wire).collect())
     }
 }

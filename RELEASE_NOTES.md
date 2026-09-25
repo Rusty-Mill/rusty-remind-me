@@ -2,6 +2,28 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-25 — The embedded-engine hub no longer starves pulls under push load
+
+### Fixed
+- **A pull could wait seconds behind queued pushes on the embedded-engine backend.** Every push holds the store's write lock through its `fsync`. `std`'s `RwLock` also lets a waiting writer go ahead of waiting readers. With four pushers, a pull's median wait was 10 s. Writers now queue on a mutex before asking for the lock, so a pull waits for at most one push. Pulls also copy their rows under the lock and build the JSON after releasing it.
+- **Writes got slower as the store grew.** This was an engine bug: every insert read the whole insert log. It was fixed in `rusty_multimodal_db_engine`.
+
+### Added
+- **`examples/pull_latency.rs`**, the measurement ADR-0021 requires before the default switches. It preloads a hub, runs pushers against pullers, and prints push throughput and pull latency percentiles for SQLite and the engine. Run it with:
+
+  ```sh
+  cargo run --release -p remind_me_hub --features multimodal-store --example pull_latency
+  ```
+
+### Provenance
+
+| 20k memories preloaded, 4 pushers, 2 pullers | SQLite | Engine before | Engine after |
+|---|---|---|---|
+| Pushes per second | 2534 | 259 | 1102 |
+| Pull latency, p50 / p99 | 27 / 232 ms | 10 s / 10 s | 3.2 / 7.1 ms |
+
+With one pusher, the engine manages 1893 pushes/s against SQLite's 828. The full table is in ADR-0021's phase 3 notes. All hub tests pass on every feature combination, including against Postgres.
+
 ## 2026-09-25 — rusty-remind-me-hub-copy: move a SQLite or Postgres hub onto the embedded engine
 
 ### Added

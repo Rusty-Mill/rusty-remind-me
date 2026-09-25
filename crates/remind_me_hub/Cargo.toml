@@ -62,3 +62,8 @@ path = "src/main.rs"
 name = "rusty-remind-me-hub-copy"
 path = "src/bin/copy.rs"
 required-features = ["multimodal-store"]
+
+# Pull latency under push load, SQLite against the engine (docs/adr/0021).
+[[example]]
+name = "pull_latency"
+required-features = ["multimodal-store"]
