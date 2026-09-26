@@ -49,6 +49,17 @@ pub struct RelationRow<'a> {
     pub node_id: Option<&'a str>,
 }
 
+/// A relation as stored.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredRelation {
+    pub id: String,
+    pub subject_entity_id: String,
+    pub relation: String,
+    pub object_entity_id: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 /// The knowledge-graph tables, over one connection.
 pub struct Entities<'c> {
     conn: &'c Connection,
@@ -232,6 +243,19 @@ impl<'c> Entities<'c> {
 
     // --- mention links ---------------------------------------------------
 
+    /// Every mention link as `(memory_id, entity_id, created_at)`, oldest
+    /// first.
+    pub fn links_oldest_first(&self) -> Result<Vec<(String, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT memory_id, entity_id, created_at FROM memory_entities
+              ORDER BY created_at, memory_id, entity_id",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect();
+        rows
+    }
+
     /// Record that `memory_id` mentions `entity_id`. Returns whether the
     /// link is new: links are immutable, so an existing one is left as is.
     pub fn link(
@@ -322,6 +346,27 @@ impl<'c> Entities<'c> {
     }
 
     // --- relations -------------------------------------------------------
+
+    /// Every relation, oldest first (ties by id).
+    pub fn relations_oldest_first(&self) -> Result<Vec<StoredRelation>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, subject_entity_id, relation, object_entity_id, created_at, updated_at
+               FROM entity_relations ORDER BY created_at, id",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(StoredRelation {
+                    id: r.get(0)?,
+                    subject_entity_id: r.get(1)?,
+                    relation: r.get(2)?,
+                    object_entity_id: r.get(3)?,
+                    created_at: r.get(4)?,
+                    updated_at: r.get(5)?,
+                })
+            })?
+            .collect();
+        rows
+    }
 
     /// Insert `row` unless its id is already taken. Returns whether it was
     /// inserted: relations are immutable.

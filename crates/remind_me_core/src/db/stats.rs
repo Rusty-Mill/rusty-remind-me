@@ -5,7 +5,7 @@
 //! here (ADR-0022). Those modules keep the shapes they report and the rules
 //! (one snapshot per calendar day, oldest-first trends, how sizes round).
 
-use crate::models::AnalyticsSnapshot;
+use crate::models::{AnalyticsSnapshot, DigestRecentMemory};
 use crate::stats::RecentMemory;
 use rusqlite::{params, Connection, OptionalExtension, Result};
 use std::collections::BTreeMap;
@@ -90,6 +90,74 @@ impl<'c> StoreStats<'c> {
         counts
     }
 
+    /// How many memories are stored, tombstones included, and how many of
+    /// them are tombstones.
+    pub fn memory_totals(&self) -> Result<(i64, i64)> {
+        self.conn.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(CASE WHEN deleted_at IS NOT NULL THEN 1 ELSE 0 END), 0)
+               FROM memories",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+    }
+
+    /// How many tombstones were deleted before `cutoff`.
+    pub fn tombstones_before(&self, cutoff: &str) -> Result<i64> {
+        self.conn.query_row(
+            "SELECT COUNT(*) FROM memories WHERE deleted_at IS NOT NULL AND deleted_at < ?",
+            params![cutoff],
+            |r| r.get(0),
+        )
+    }
+
+    /// Every stored memory, tombstones included, counted by category, with
+    /// an empty category counted as `(none)`.
+    pub fn all_by_category(&self) -> Result<BTreeMap<String, i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT COALESCE(NULLIF(category, ''), '(none)'), COUNT(*)
+               FROM memories GROUP BY 1",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+            .collect();
+        rows
+    }
+
+    /// Live, non-sensitive memories created at or after `cutoff`, newest
+    /// first, at most `limit`.
+    pub fn shareable_since(&self, cutoff: &str, limit: usize) -> Result<Vec<DigestRecentMemory>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, content, category, created_at
+               FROM memories
+              WHERE deleted_at IS NULL AND sensitive = 0 AND created_at >= ?
+              ORDER BY created_at DESC
+              LIMIT ?",
+        )?;
+        let rows = stmt
+            .query_map(params![cutoff, limit as i64], |r| {
+                Ok(DigestRecentMemory {
+                    id: r.get(0)?,
+                    content: r.get(1)?,
+                    category: r.get(2)?,
+                    created_at: r.get(3)?,
+                })
+            })?
+            .collect();
+        rows
+    }
+
+    /// How many live, non-sensitive memories were created at or after
+    /// `cutoff`.
+    pub fn count_shareable_since(&self, cutoff: &str) -> Result<i64> {
+        self.conn.query_row(
+            "SELECT COUNT(*) FROM memories
+              WHERE deleted_at IS NULL AND sensitive = 0 AND created_at >= ?",
+            params![cutoff],
+            |r| r.get(0),
+        )
+    }
+
     /// The `limit` newest live memories, content cut to 80 characters.
     pub fn recent(&self, limit: i64) -> Result<Vec<RecentMemory>> {
         let mut stmt = self.conn.prepare(
@@ -112,16 +180,14 @@ impl<'c> StoreStats<'c> {
 
     /// The database's file, size and schema version.
     pub fn storage_info(&self) -> Result<StorageInfo> {
-        let path: String = self
-            .conn
-            .query_row("PRAGMA database_list", [], |r| r.get(2))?;
+        let path = super::database_path(self.conn)?;
         let page_count: i64 = self.conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
         let page_size: i64 = self.conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
         let schema_version: i32 = self
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))?;
         Ok(StorageInfo {
-            path: (!path.is_empty()).then(|| PathBuf::from(path)),
+            path,
             size_bytes: page_count * page_size,
             schema_version,
         })

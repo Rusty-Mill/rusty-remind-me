@@ -758,13 +758,8 @@ impl NudgeHandle {
 /// different, empty one, so it would report an empty backlog forever.
 pub fn start_nudge_for(conn: &Connection) -> Option<NudgeHandle> {
     let interval = nudge_interval()?;
-    let path: String = conn
-        .query_row("PRAGMA database_list", [], |row| row.get(2))
-        .ok()?;
-    if path.is_empty() {
-        return None;
-    }
-    Some(start_nudge(std::path::PathBuf::from(path), interval))
+    let path = crate::db::database_path(conn).ok().flatten()?;
+    Some(start_nudge(path, interval))
 }
 
 pub fn start_nudge(db_path: std::path::PathBuf, interval: std::time::Duration) -> NudgeHandle {

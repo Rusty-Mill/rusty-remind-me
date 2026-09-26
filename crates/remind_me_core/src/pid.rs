@@ -66,12 +66,7 @@ type Result<T> = std::result::Result<T, PidError>;
 /// `PRAGMA` query rather than a shared helper, and this follows the same
 /// established shape.
 fn database_path(conn: &Connection) -> rusqlite::Result<Option<PathBuf>> {
-    let path: String = conn.query_row("PRAGMA database_list", [], |row| row.get(2))?;
-    Ok(if path.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(path))
-    })
+    crate::db::database_path(conn)
 }
 
 /// The PID file's path, beside the database file.

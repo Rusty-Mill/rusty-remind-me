@@ -26,7 +26,7 @@ use super::{configured_hub_url, configured_node_id, configured_sync_secret, sync
 use crate::db::outbox::Outbox;
 use crate::db::sync_state::{RemoteLog, SyncState};
 use crate::models::{DrainVerdict, OutboxStatus, RemoteStatus, SyncStatus, TombstoneStatus};
-use rusqlite::{params, Connection, Result};
+use rusqlite::{Connection, Result};
 
 /// What a never-contacted remote's timestamps read as. Not NULL — the columns
 /// are `NOT NULL DEFAULT` this — so "never" has to be recognised by value.
@@ -120,19 +120,12 @@ pub fn sync_status(conn: &Connection) -> Result<SyncStatus> {
     let total = Outbox::new(conn).len()?;
     let (verdict, per_minute) = drain(conn, pending)?;
 
-    let tombstones: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM memories WHERE deleted_at IS NOT NULL",
-        [],
-        |r| r.get(0),
-    )?;
+    let stats = crate::db::stats::StoreStats::new(conn);
+    let (_, tombstones) = stats.memory_totals()?;
     let cutoff = (chrono::Utc::now()
         - chrono::Duration::days(super::DEFAULT_OUTBOX_RETENTION_DAYS))
     .to_rfc3339();
-    let compactable: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM memories WHERE deleted_at IS NOT NULL AND deleted_at < ?",
-        params![cutoff],
-        |r| r.get(0),
-    )?;
+    let compactable = stats.tombstones_before(&cutoff)?;
 
     let rows = SyncState::new(conn).remotes()?;
 

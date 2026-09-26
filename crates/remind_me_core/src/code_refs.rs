@@ -275,18 +275,7 @@ pub struct StaleCandidatesResult {
 ///   against.
 pub fn stale_candidates(conn: &Connection, limit: usize) -> SqlResult<StaleCandidatesResult> {
     let limit = limit.clamp(STALE_CANDIDATES_LIMIT_MIN, STALE_CANDIDATES_LIMIT_MAX);
-    let mut stmt = conn.prepare(
-        "SELECT id, content, metadata
-           FROM memories
-          WHERE deleted_at IS NULL
-            AND superseded_by IS NULL
-            AND sensitive = 0
-            AND json_extract(metadata, '$.code_refs') IS NOT NULL",
-    )?;
-
-    let rows: Vec<(String, String, String)> = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-        .collect::<SqlResult<_>>()?;
+    let rows = crate::db::memories::Memories::new(conn).with_code_refs()?;
 
     let roots = configured_code_roots();
     // No early break on `limit` here -- every row is checked so

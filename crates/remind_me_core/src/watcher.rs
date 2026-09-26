@@ -617,15 +617,8 @@ impl WatcherHandle {
 }
 
 /// Where this connection's database lives, or `None` for an in-memory one.
-fn database_path(conn: &Connection) -> Option<PathBuf> {
-    let path: String = conn
-        .query_row("PRAGMA database_list", [], |row| row.get(2))
-        .ok()?;
-    if path.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(path))
-    }
+fn database_path(conn: &Connection) -> Option<std::path::PathBuf> {
+    crate::db::database_path(conn).ok().flatten()
 }
 
 /// Start the folder-watch loop for the database `conn` is attached to.

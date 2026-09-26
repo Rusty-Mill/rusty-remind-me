@@ -354,7 +354,7 @@ unchanged after each.
 | 5 | Promotions, imports, archives and curation queues | `db::promotions::Promotions`, … | In progress |
 | 6 | The outbox, with echo suppression as a flag | `db::outbox::Outbox` | Done (the flag landed with step 7) |
 | 7 | Triggers move into the repositories | `db::derived` | Done (schema v31) |
-| 8 | Callers stop taking `&Connection` | | |
+| 8 | Callers stop taking `&Connection` | a store handle | 8a done: no SQL outside `db::` |
 
 Writes go first because the triggers fire on writes. Once each table's
 writes have one home, step 7 moves its triggers there in one place.
@@ -538,6 +538,22 @@ marked it sent after a high-water mark. `Outbox::high_water` and
 no rows, and left in place they would index and queue everything twice.
 `db::derived::rebuild_indexes` rebuilds the indexes from the rows. Tests
 that plant rows with raw SQL call it, and it doubles as a repair.
+
+**Step 8a.** No statement against the node's own store is left outside
+`db::`. The last readers moved:
+- `db::related::Related` has expansion's reads (shared entities, document
+  window, co-retrieval) and its association bump.
+- `db::sync_feed::SyncFeed` has the peer server's four keyset-paged pull
+  feeds and graph counts, as the wire records the server returns.
+- `StoreStats` gained the memory totals, tombstone counts, the by-category
+  count reconciliation uses, and the digest's shareable-recent reads.
+- `Memories` gained the export filter, the live list the vitality report
+  walks, and the code-reference scan.
+- `Entities` gained the export's link and relation dumps.
+- `db::database_path` replaces six copies of `PRAGMA database_list`.
+
+The only SQL left outside `db::` reads the foreign SQLite files the dbs and
+mempalace importers take in (§6).
 
 ## Related
 

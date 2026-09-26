@@ -70,12 +70,7 @@ fn timestamp() -> String {
 
 /// Where the main database lives on disk, or `None` for an in-memory database.
 fn database_path(conn: &Connection) -> rusqlite::Result<Option<PathBuf>> {
-    let path: String = conn.query_row("PRAGMA database_list", [], |row| row.get(2))?;
-    Ok(if path.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(path))
-    })
+    crate::db::database_path(conn)
 }
 
 /// The `backups/` directory beside the database file.

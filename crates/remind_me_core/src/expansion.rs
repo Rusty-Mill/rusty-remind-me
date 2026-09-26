@@ -25,10 +25,10 @@
 //! recording them would inflate the vitality of every neighbour on every
 //! expanded search.
 
+use crate::db::related::{CoRetrieved, EntityRelative, Related, Relative};
 use crate::models::MemorySearchResult;
 use chrono::Utc;
-use rusqlite::types::Value;
-use rusqlite::{params, params_from_iter, Connection, Result};
+use rusqlite::{Connection, Result};
 use serde::{Deserialize, Serialize};
 
 /// Maximum items any one expansion returns.
@@ -124,25 +124,6 @@ pub struct MemorySearchResponse {
     pub related_via_co_retrieval: Option<Vec<RelatedMemory>>,
 }
 
-/// One sibling-chunk row, named rather than a tuple so the column order cannot
-/// be silently transposed.
-struct NeighborRow {
-    id: String,
-    content: String,
-    category: String,
-    created_at: String,
-    doc_id: Option<String>,
-    chunk_index: Option<i64>,
-}
-
-fn text_params(ids: &[String]) -> Vec<Value> {
-    ids.iter().map(|id| Value::Text(id.clone())).collect()
-}
-
-fn placeholders(n: usize) -> String {
-    vec!["?"; n].join(",")
-}
-
 /// Reinforce the association between every pair of co-retrieved memories.
 ///
 /// Called on **every** search that returns two or more results, whether or not
@@ -163,6 +144,7 @@ pub fn record_co_retrieval(conn: &Connection, memory_ids: &[String]) -> Result<u
     }
 
     let now = Utc::now().to_rfc3339();
+    let related = Related::new(conn);
     let mut touched = 0;
     for i in 0..ids.len() {
         for j in (i + 1)..ids.len() {
@@ -171,14 +153,7 @@ pub fn record_co_retrieval(conn: &Connection, memory_ids: &[String]) -> Result<u
             } else {
                 (&ids[j], &ids[i])
             };
-            conn.execute(
-                "INSERT INTO memory_associations (memory_id_a, memory_id_b, weight, updated_at)
-                 VALUES (?, ?, 1, ?)
-                 ON CONFLICT(memory_id_a, memory_id_b) DO UPDATE SET
-                     weight = MIN(weight + 1, ?),
-                     updated_at = excluded.updated_at",
-                params![a, b, now, CO_RETRIEVAL_MAX_WEIGHT],
-            )?;
+            related.bump_pair(a, b, &now, CO_RETRIEVAL_MAX_WEIGHT)?;
             touched += 1;
         }
     }
@@ -191,45 +166,24 @@ pub fn record_co_retrieval(conn: &Connection, memory_ids: &[String]) -> Result<u
 /// can deliver them out of order — stays invisible rather than producing a row
 /// with holes in it.
 pub fn expand_via_entities(conn: &Connection, seed_ids: &[String]) -> Result<Vec<RelatedMemory>> {
-    if seed_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let ph = placeholders(seed_ids.len());
-    let sql = format!(
-        "SELECT m.id, m.content, m.category, m.created_at, e.name AS entity_name
-           FROM memory_entities seed
-           JOIN memory_entities nbr ON nbr.entity_id = seed.entity_id
-           JOIN entities e ON e.id = seed.entity_id
-           JOIN memories m ON m.id = nbr.memory_id
-          WHERE seed.memory_id IN ({ph})
-            AND nbr.memory_id NOT IN ({ph})
-            AND m.superseded_by IS NULL
-            AND m.deleted_at IS NULL
-          ORDER BY m.created_at DESC, m.id, e.name",
-        ph = ph
-    );
-
-    let mut bindings = text_params(seed_ids);
-    bindings.extend(text_params(seed_ids));
-    let mut stmt = conn.prepare(&sql)?;
-    let rows: Vec<(String, String, String, String, String)> = stmt
-        .query_map(params_from_iter(bindings), |row| {
-            Ok((
-                row.get("id")?,
-                row.get("content")?,
-                row.get("category")?,
-                row.get("created_at")?,
-                row.get("entity_name")?,
-            ))
-        })?
-        .collect::<Result<_>>()?;
+    let rows = Related::new(conn).via_entities(seed_ids)?;
 
     // One row per (memory, entity) pair, so the entity names are gathered onto
     // a single item rather than producing the same memory five times.
     let mut order: Vec<String> = Vec::new();
     let mut items: std::collections::HashMap<String, RelatedMemory> =
         std::collections::HashMap::new();
-    for (id, content, category, created_at, entity_name) in rows {
+    for EntityRelative {
+        memory:
+            Relative {
+                id,
+                content,
+                category,
+                created_at,
+            },
+        entity_name,
+    } in rows
+    {
         if !items.contains_key(&id) {
             if order.len() >= EXPANSION_CAP {
                 continue;
@@ -276,44 +230,26 @@ pub fn expand_via_neighbors(
             _ => continue,
         };
 
-        let mut stmt = conn.prepare(
-            "SELECT id, content, category, created_at, doc_id, chunk_index
-               FROM memories
-              WHERE doc_id = ?
-                AND chunk_index BETWEEN ? AND ?
-                AND superseded_by IS NULL
-                AND deleted_at IS NULL
-              ORDER BY chunk_index",
+        let rows = Related::new(conn).document_window(
+            doc_id,
+            chunk_index - NEIGHBOR_WINDOW,
+            chunk_index + NEIGHBOR_WINDOW,
         )?;
-        let rows: Vec<NeighborRow> = stmt
-            .query_map(
-                params![
-                    doc_id,
-                    chunk_index - NEIGHBOR_WINDOW,
-                    chunk_index + NEIGHBOR_WINDOW
-                ],
-                |row| {
-                    Ok(NeighborRow {
-                        id: row.get("id")?,
-                        content: row.get("content")?,
-                        category: row.get("category")?,
-                        created_at: row.get("created_at")?,
-                        doc_id: row.get("doc_id")?,
-                        chunk_index: row.get("chunk_index")?,
-                    })
-                },
-            )?
-            .collect::<Result<_>>()?;
 
         for row in rows {
-            if seed_ids.contains(row.id.as_str()) || !seen.insert(row.id.clone()) {
+            let memory = row.memory;
+            if seed_ids.contains(memory.id.as_str()) || !seen.insert(memory.id.clone()) {
                 continue;
             }
             if items.len() >= EXPANSION_CAP {
                 break;
             }
-            let mut item =
-                RelatedMemory::new(row.id.clone(), &row.content, row.category, row.created_at);
+            let mut item = RelatedMemory::new(
+                memory.id.clone(),
+                &memory.content,
+                memory.category,
+                memory.created_at,
+            );
             item.doc_id = row.doc_id;
             item.chunk_index = row.chunk_index;
             items.push(item);
@@ -331,44 +267,22 @@ pub fn expand_via_co_retrieval(
     conn: &Connection,
     seed_ids: &[String],
 ) -> Result<Vec<RelatedMemory>> {
-    if seed_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let ph = placeholders(seed_ids.len());
-    let sql = format!(
-        "SELECT assoc.other_id, assoc.weight, m.content, m.category, m.created_at
-           FROM (
-                SELECT memory_id_b AS other_id, weight FROM memory_associations
-                 WHERE memory_id_a IN ({ph})
-                UNION ALL
-                SELECT memory_id_a AS other_id, weight FROM memory_associations
-                 WHERE memory_id_b IN ({ph})
-           ) assoc
-           JOIN memories m ON m.id = assoc.other_id
-          WHERE m.superseded_by IS NULL AND m.deleted_at IS NULL
-          ORDER BY assoc.weight DESC, m.created_at DESC",
-        ph = ph
-    );
-
-    let mut bindings = text_params(seed_ids);
-    bindings.extend(text_params(seed_ids));
-    let mut stmt = conn.prepare(&sql)?;
-    let rows: Vec<(String, i64, String, String, String)> = stmt
-        .query_map(params_from_iter(bindings), |row| {
-            Ok((
-                row.get("other_id")?,
-                row.get("weight")?,
-                row.get("content")?,
-                row.get("category")?,
-                row.get("created_at")?,
-            ))
-        })?
-        .collect::<Result<_>>()?;
+    let rows = Related::new(conn).co_retrieved(seed_ids)?;
 
     let seeds: std::collections::HashSet<&str> = seed_ids.iter().map(String::as_str).collect();
     let mut seen = std::collections::HashSet::new();
     let mut items = Vec::new();
-    for (id, weight, content, category, created_at) in rows {
+    for CoRetrieved {
+        memory:
+            Relative {
+                id,
+                content,
+                category,
+                created_at,
+            },
+        weight,
+    } in rows
+    {
         if seeds.contains(id.as_str()) || !seen.insert(id.clone()) {
             continue;
         }

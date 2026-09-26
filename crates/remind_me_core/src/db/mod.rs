@@ -10,10 +10,12 @@ pub mod migrations;
 pub mod outbox;
 pub mod promotions;
 pub mod queries;
+pub mod related;
 pub mod reminders;
 pub mod saved_searches;
 pub mod schema;
 pub mod stats;
+pub mod sync_feed;
 pub mod sync_state;
 pub mod vectors;
 pub mod wiki;
@@ -177,6 +179,12 @@ fn expand_tilde(raw: &str, home: &Path) -> PathBuf {
         Some(rest) if rest.starts_with('/') => home.join(rest.trim_start_matches('/')),
         _ => PathBuf::from(raw),
     }
+}
+
+/// The file `conn` has open, or `None` for an in-memory database.
+pub fn database_path(conn: &Connection) -> Result<Option<PathBuf>> {
+    let path: String = conn.query_row("PRAGMA database_list", [], |row| row.get(2))?;
+    Ok((!path.is_empty()).then(|| PathBuf::from(path)))
 }
 
 pub struct Database {

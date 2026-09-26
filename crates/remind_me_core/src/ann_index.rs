@@ -58,13 +58,9 @@ pub fn available() -> bool {
 
 /// Where the index for a given database lives.
 pub fn index_path(conn: &Connection) -> Option<std::path::PathBuf> {
-    let db: String = conn
-        .query_row("PRAGMA database_list", [], |r| r.get::<_, String>(2))
-        .ok()?;
-    if db.is_empty() {
-        return None; // in-memory: nowhere to persist, so no index
-    }
-    Some(std::path::PathBuf::from(format!("{}.ann", db)))
+    // In-memory: nowhere to persist, so no index.
+    let db = crate::db::database_path(conn).ok().flatten()?;
+    Some(std::path::PathBuf::from(format!("{}.ann", db.display())))
 }
 
 /// How many embeddings the store currently holds, and at what dimension.

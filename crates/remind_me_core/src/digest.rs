@@ -22,9 +22,9 @@
 //! subsystems now exist (issues #116 and #114), so the honest shape is the
 //! real answer.
 
-use crate::models::{DigestData, DigestRecentMemory, DigestReminder, ReminderWindow, SyncStatus};
+use crate::models::{DigestData, DigestReminder, ReminderWindow, SyncStatus};
 use crate::vitality::build_vitality_report;
-use rusqlite::{params, Connection, Result};
+use rusqlite::{Connection, Result};
 
 /// Days back that count as "recent" by default.
 pub const DEFAULT_SINCE_DAYS: i64 = 7;
@@ -55,33 +55,12 @@ fn digest_reminder(memory: &crate::models::Memory) -> DigestReminder {
 pub fn build_digest(conn: &Connection, since_days: i64) -> Result<DigestData> {
     let cutoff = (chrono::Utc::now() - chrono::Duration::days(since_days)).to_rfc3339();
 
-    let mut stmt = conn.prepare(
-        "SELECT id, content, category, created_at
-           FROM memories
-          WHERE deleted_at IS NULL AND sensitive = 0 AND created_at >= ?
-          ORDER BY created_at DESC
-          LIMIT ?",
-    )?;
-    let recent_memories: Vec<DigestRecentMemory> = stmt
-        .query_map(params![cutoff, MAX_RECENT_MEMORIES as i64], |r| {
-            Ok(DigestRecentMemory {
-                id: r.get(0)?,
-                content: r.get(1)?,
-                category: r.get(2)?,
-                created_at: r.get(3)?,
-            })
-        })?
-        .collect::<Result<Vec<_>>>()?;
-    drop(stmt);
+    let stats = crate::db::stats::StoreStats::new(conn);
+    let recent_memories = stats.shareable_since(&cutoff, MAX_RECENT_MEMORIES)?;
 
     // Counted rather than taken from the capped list, so the cap is visible
     // rather than silently making a busy week look like a quiet one.
-    let recent_total: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM memories
-          WHERE deleted_at IS NULL AND sensitive = 0 AND created_at >= ?",
-        params![cutoff],
-        |r| r.get(0),
-    )?;
+    let recent_total = stats.count_shareable_since(&cutoff)?;
 
     Ok(DigestData {
         generated_at: chrono::Utc::now().to_rfc3339(),

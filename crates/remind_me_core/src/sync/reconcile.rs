@@ -100,21 +100,9 @@ pub fn classify(
 
 /// This node's counts, in the shape a remote's `/count` returns.
 fn local_counts(conn: &Connection) -> Result<(i64, i64, std::collections::BTreeMap<String, i64>)> {
-    let (total, tombstones): (i64, i64) = conn.query_row(
-        "SELECT COUNT(*),
-                COALESCE(SUM(CASE WHEN deleted_at IS NOT NULL THEN 1 ELSE 0 END), 0)
-           FROM memories",
-        [],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
-    let mut stmt = conn.prepare(
-        "SELECT COALESCE(NULLIF(category, ''), '(none)'), COUNT(*)
-           FROM memories GROUP BY 1",
-    )?;
-    let by_category = stmt
-        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
-        .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
-    Ok((total, tombstones, by_category))
+    let stats = crate::db::stats::StoreStats::new(conn);
+    let (total, tombstones) = stats.memory_totals()?;
+    Ok((total, tombstones, stats.all_by_category()?))
 }
 
 /// Seconds since the last successful pull from `remote_id`, or `None` when it

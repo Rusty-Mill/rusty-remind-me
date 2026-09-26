@@ -2,6 +2,16 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-26 — The last store reads move into db:: (ADR-0023, phase 1, step 8a)
+
+### Changed
+- **No SQL against the node's store is left outside `db::`.** Expansion's reads and association writes (`db::related`), the peer server's pull feeds and counts (`db::sync_feed`), the digest, vitality report, code-reference scan, export, sync status and reconcile reads moved into repositories. `db::database_path` replaces six copies of `PRAGMA database_list`.
+- The only remaining SQL outside `db::` reads the foreign SQLite files the dbs and mempalace importers take in. Behaviour is unchanged.
+
+### Tests
+- New repository test: a co-retrieval pair is read from either side and its weight is capped.
+- The core, API, MCP, CLI and remote suites pass unchanged.
+
 ## 2026-09-26 — No more SQLite triggers; schema v31 (ADR-0023, phase 1, step 7)
 
 ### Breaking

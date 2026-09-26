@@ -22,10 +22,10 @@
 //! in the file for manual restoration, but a naive round-trip does not preserve
 //! them.
 
-use crate::db::queries::parse_memory_row;
+use crate::db::entities::Entities;
+use crate::db::memories::Memories;
 use crate::models::{ExportFormat, ExportInput, ExportResult};
-use rusqlite::types::Value;
-use rusqlite::{params_from_iter, Connection, Result};
+use rusqlite::{Connection, Result};
 use std::path::{Path, PathBuf};
 
 /// Environment variable listing the roots an export may write to, in the
@@ -174,41 +174,6 @@ fn display_path(path: &Path) -> String {
     path.display().to_string()
 }
 
-fn filters(input: &ExportInput) -> (String, Vec<Value>) {
-    let mut conditions: Vec<String> = Vec::new();
-    let mut bindings: Vec<Value> = Vec::new();
-
-    // Both conditions, not just `deleted_at` -- the reference gates the pair
-    // on this one flag (`exporter.py:163`), and a superseded memory is just as
-    // resurrectable as a tombstoned one: every exported record carries
-    // `role: "assistant"`, so the importer reads it back as live content.
-    if !input.include_deleted {
-        conditions.push("m.deleted_at IS NULL".to_string());
-        conditions.push("m.superseded_by IS NULL".to_string());
-    }
-
-    if let Some(category) = input.category.as_ref().filter(|c| !c.is_empty()) {
-        conditions.push("m.category = ?".to_string());
-        bindings.push(Value::Text(category.clone()));
-    }
-    // ALL-of tag semantics, against the normalized junction table — the same
-    // shape `list_memories` uses.
-    for tag in input.tags.iter().flatten() {
-        conditions.push(
-            "EXISTS (SELECT 1 FROM memory_tags mt WHERE mt.memory_id = m.id AND mt.tag = ?)"
-                .to_string(),
-        );
-        bindings.push(Value::Text(tag.clone()));
-    }
-
-    let clause = if conditions.is_empty() {
-        String::new()
-    } else {
-        format!("WHERE {}", conditions.join(" AND "))
-    };
-    (clause, bindings)
-}
-
 /// Collect the entity graph as `record_type`-tagged records.
 ///
 /// Entities are emitted first, so a sequential restore can verify that a
@@ -223,58 +188,38 @@ fn collect_graph_records(
     conn: &Connection,
     memory_ids: Option<&std::collections::HashSet<String>>,
 ) -> Result<Vec<serde_json::Value>> {
-    let mut links: Vec<(String, String, String)> = {
-        let mut stmt = conn.prepare(
-            "SELECT memory_id, entity_id, created_at FROM memory_entities
-              ORDER BY created_at, memory_id, entity_id",
-        )?;
-        let rows = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-            .collect::<Result<Vec<_>>>()?;
-        rows
-    };
-    let mut entities: Vec<serde_json::Value> = {
-        let mut stmt = conn.prepare(
-            "SELECT id, name, kind, aliases, created_at, updated_at FROM entities
-              ORDER BY created_at, id",
-        )?;
-        let rows = stmt
-            .query_map([], |r| {
-                let aliases_json: String = r.get(3)?;
-                Ok(serde_json::json!({
-                    "record_type": "entity",
-                    "id": r.get::<_, String>(0)?,
-                    "name": r.get::<_, String>(1)?,
-                    "kind": r.get::<_, Option<String>>(2)?,
-                    "aliases": serde_json::from_str::<Vec<String>>(&aliases_json)
-                        .unwrap_or_default(),
-                    "created_at": r.get::<_, String>(4)?,
-                    "updated_at": r.get::<_, String>(5)?,
-                }))
-            })?
-            .collect::<Result<Vec<_>>>()?;
-        rows
-    };
-    let mut relations: Vec<serde_json::Value> = {
-        let mut stmt = conn.prepare(
-            "SELECT id, subject_entity_id, relation, object_entity_id, created_at, updated_at
-               FROM entity_relations ORDER BY created_at, id",
-        )?;
-        let rows = stmt
-            .query_map([], |r| {
-                Ok(serde_json::json!({
-                    "record_type": "entity_relation",
-                    "id": r.get::<_, String>(0)?,
-                    "subject_entity_id": r.get::<_, String>(1)?,
-                    "relation": r.get::<_, String>(2)?,
-                    "object_entity_id": r.get::<_, String>(3)?,
-                    "created_at": r.get::<_, String>(4)?,
-                    "updated_at": r.get::<_, String>(5)?,
-                }))
-            })?
-            .collect::<Result<Vec<_>>>()?;
-        rows
-    };
+    let graph = Entities::new(conn);
+    let mut links = graph.links_oldest_first()?;
+    let mut entities: Vec<serde_json::Value> = graph
+        .all_oldest_first()?
+        .into_iter()
+        .map(|e| {
+            serde_json::json!({
+                "record_type": "entity",
+                "id": e.id,
+                "name": e.name,
+                "kind": e.kind,
+                "aliases": e.aliases,
+                "created_at": e.created_at,
+                "updated_at": e.updated_at,
+            })
+        })
+        .collect();
+    let mut relations: Vec<serde_json::Value> = graph
+        .relations_oldest_first()?
+        .into_iter()
+        .map(|r| {
+            serde_json::json!({
+                "record_type": "entity_relation",
+                "id": r.id,
+                "subject_entity_id": r.subject_entity_id,
+                "relation": r.relation,
+                "object_entity_id": r.object_entity_id,
+                "created_at": r.created_at,
+                "updated_at": r.updated_at,
+            })
+        })
+        .collect();
 
     if let Some(ids) = memory_ids {
         links.retain(|(memory_id, _, _)| ids.contains(memory_id));
@@ -313,16 +258,15 @@ pub fn collect_export_records(
     conn: &Connection,
     input: &ExportInput,
 ) -> Result<Vec<serde_json::Value>> {
-    let (where_clause, bindings) = filters(input);
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {} FROM memories m {} ORDER BY m.created_at, m.id",
-        crate::db::queries::prefixed_memory_columns("m"),
-        where_clause
-    ))?;
-    let memories: Vec<crate::models::Memory> = stmt
-        .query_map(params_from_iter(bindings.iter()), parse_memory_row)?
-        .collect::<Result<_>>()?;
-    drop(stmt);
+    // Deleted and superseded memories go together behind one flag, as the
+    // reference gates them (`exporter.py:163`): a superseded memory is just as
+    // resurrectable as a tombstoned one, since every exported record carries
+    // `role: "assistant"` and the importer reads it back as live content.
+    let memories = Memories::new(conn).exportable(
+        input.include_deleted,
+        input.category.as_deref().filter(|c| !c.is_empty()),
+        input.tags.as_deref().unwrap_or_default(),
+    )?;
 
     let mut records: Vec<serde_json::Value> = memories
         .iter()

@@ -295,14 +295,7 @@ impl SchedulerHandle {
 /// Following the shape `pid`/`backup`/`status` already established — each
 /// keeps its own copy of this one-line `PRAGMA` rather than sharing a helper.
 fn database_path(conn: &Connection) -> Option<std::path::PathBuf> {
-    let path: String = conn
-        .query_row("PRAGMA database_list", [], |row| row.get(2))
-        .ok()?;
-    if path.is_empty() {
-        None
-    } else {
-        Some(std::path::PathBuf::from(path))
-    }
+    crate::db::database_path(conn).ok().flatten()
 }
 
 /// Start the scheduler for the database `conn` is attached to.

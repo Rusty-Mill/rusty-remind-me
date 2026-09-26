@@ -517,6 +517,73 @@ impl<'c> Memories<'c> {
             .optional()
     }
 
+    /// The memories an export takes, oldest first (ties by id): of
+    /// `category` when given, carrying every one of `tags`, and only the live,
+    /// unsuperseded ones unless `include_deleted`.
+    pub fn exportable(
+        &self,
+        include_deleted: bool,
+        category: Option<&str>,
+        tags: &[String],
+    ) -> Result<Vec<Memory>> {
+        let mut conditions: Vec<&str> = Vec::new();
+        let mut bindings: Vec<SqlValue> = Vec::new();
+        if !include_deleted {
+            conditions.push("m.deleted_at IS NULL");
+            conditions.push("m.superseded_by IS NULL");
+        }
+        if let Some(category) = category {
+            conditions.push("m.category = ?");
+            bindings.push(SqlValue::Text(category.to_string()));
+        }
+        // ALL-of tag semantics, against the tag index.
+        for tag in tags {
+            conditions.push(
+                "EXISTS (SELECT 1 FROM memory_tags mt WHERE mt.memory_id = m.id AND mt.tag = ?)",
+            );
+            bindings.push(SqlValue::Text(tag.clone()));
+        }
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {} FROM memories m {where_clause} ORDER BY m.created_at, m.id",
+            crate::db::queries::prefixed_memory_columns("m")
+        ))?;
+        let rows = stmt
+            .query_map(params_from_iter(bindings), parse_memory_row)?
+            .collect();
+        rows
+    }
+
+    /// Every live memory, in no particular order.
+    pub fn all_live(&self) -> Result<Vec<Memory>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {MEMORY_COLUMNS} FROM memories WHERE deleted_at IS NULL"
+        ))?;
+        let rows = stmt.query_map([], parse_memory_row)?.collect();
+        rows
+    }
+
+    /// The id, content and metadata JSON of every live, unsuperseded,
+    /// non-sensitive memory that records code references.
+    pub fn with_code_refs(&self) -> Result<Vec<(String, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, content, metadata
+               FROM memories
+              WHERE deleted_at IS NULL
+                AND superseded_by IS NULL
+                AND sensitive = 0
+                AND json_extract(metadata, '$.code_refs') IS NOT NULL",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect();
+        rows
+    }
+
     /// Set `metadata.ingest` to `marker` on every chunk of the import
     /// `doc_id`. Returns how many were stamped.
     pub fn set_ingest_marker(&self, doc_id: &str, marker: &str) -> Result<usize> {

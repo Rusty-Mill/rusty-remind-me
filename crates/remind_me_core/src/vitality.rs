@@ -434,17 +434,12 @@ pub fn build_vitality_report(conn: &Connection) -> Result<VitalityReport> {
     // `deleted_at IS NULL` is a no-op while deletes are hard, but keeps the
     // report correct once sync introduces tombstones. The reference omits this
     // filter and would count tombstoned rows.
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {} FROM memories WHERE deleted_at IS NULL",
-        crate::db::queries::MEMORY_COLUMNS
-    ))?;
-    let rows = stmt.query_map([], crate::db::queries::parse_memory_row)?;
+    let rows = Memories::new(conn).all_live()?;
 
     let now = Utc::now();
     let mut vitalities = Vec::new();
     let mut decay_distribution: BTreeMap<String, i64> = BTreeMap::new();
-    for row in rows {
-        let memory = row?;
+    for memory in rows {
         *decay_distribution
             .entry(memory.category.clone())
             .or_insert(0) += 1;
