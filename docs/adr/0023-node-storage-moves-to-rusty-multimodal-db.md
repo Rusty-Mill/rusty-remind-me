@@ -351,7 +351,7 @@ unchanged after each.
 | 2 | Entities, relations and mentions | `db::entities::Entities` | Done |
 | 3 | Wiki pages, links and their index | `db::wiki::WikiIndex` | Done |
 | 4 | Vectors, re-keyed on memory id (§4) | `db::vectors` | |
-| 5 | Promotions, imports, archives and curation queues | one each | |
+| 5 | Promotions, imports, archives and curation queues | `db::promotions::Promotions`, … | In progress |
 | 6 | The outbox, with echo suppression as a flag | `db::outbox` | |
 | 7 | Triggers move into the repositories | | |
 | 8 | Callers stop taking `&Connection` | | |
@@ -416,6 +416,18 @@ reserved slugs, the reconcile's mtime test, the load budget and the
 watermark. One small change: deleting a page by slug through
 `delete_wiki_page` now also clears its outgoing links, as the file-backed
 delete always did. Nothing reads those links outside tests.
+
+**Step 5a.** `db::promotions` holds the `promotions` table, which it now
+creates at open, and every read `promotion.rs` ran:
+- the three rungs' candidate queries and their uncapped counts, sharing one
+  predicate each, so a listing and its count cannot disagree;
+- source checks, the duplicate-promotion lookup and recording provenance;
+- both directions of provenance, surviving sources, and the persona and
+  demoted listings.
+
+Loading a candidate's source memories moved to `db::memories::get_many`.
+The rules stay in `promotion.rs`: which rung reads which category, the fact
+threshold, the persona floor, and demotion as a read-time judgement.
 
 ## Related
 

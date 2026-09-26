@@ -8,6 +8,8 @@
 //! a consolidation writes, and how vitality is seeded, are decided there and
 //! handed over as a [`NewMemory`] or a field value.
 
+use crate::db::queries::{parse_memory_row, MEMORY_COLUMNS};
+use crate::models::Memory;
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Result};
 use serde_json::Value;
@@ -456,6 +458,21 @@ impl<'c> Memories<'c> {
             |row| row.get(0),
         )?;
         Ok(count.max(0) as usize)
+    }
+
+    /// The memories `ids` names that exist, in no particular order.
+    pub fn get_many(&self, ids: &[String]) -> Result<Vec<Memory>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let marks = vec!["?"; ids.len()].join(",");
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {MEMORY_COLUMNS} FROM memories WHERE id IN ({marks})"
+        ))?;
+        let rows = stmt
+            .query_map(params_from_iter(ids.iter()), parse_memory_row)?
+            .collect();
+        rows
     }
 
     /// Set `metadata.ingest` to `marker` on every chunk of the import

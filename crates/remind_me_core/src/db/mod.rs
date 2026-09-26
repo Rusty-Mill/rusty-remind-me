@@ -3,6 +3,7 @@ pub mod feedback;
 pub mod history;
 pub mod memories;
 pub mod migrations;
+pub mod promotions;
 pub mod queries;
 pub mod reminders;
 pub mod saved_searches;

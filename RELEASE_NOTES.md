@@ -2,6 +2,15 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-26 — Promotion's storage goes behind db::promotions (ADR-0023, phase 1, step 5a)
+
+### Changed
+- **Every statement `promotion.rs` ran now lives in `db::promotions::Promotions`.** That covers the candidate queries and counts for all three rungs, source checks, duplicate detection, provenance, and the persona and demoted listings. The `promotions` table is created by `db::promotions::ensure_table`; `promotion::ensure_schema` is gone. Behaviour is unchanged.
+
+### Tests
+- New repository tests: surviving sources count only live, unsuperseded sources; a superseded source is unusable.
+- The core suite passes unchanged.
+
 ## 2026-09-26 — The wiki index goes behind db::wiki (ADR-0023, phase 1, step 3)
 
 ### Changed
