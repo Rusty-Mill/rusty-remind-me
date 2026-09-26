@@ -34,6 +34,7 @@
 //! silence. Reporting the count and the last capture time makes "never
 //! configured" a visible state rather than something to infer.
 
+use crate::db::curation::{Backlog, Curation};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -59,72 +60,33 @@ struct Queue {
     key: &'static str,
     label: &'static str,
     prompt: &'static str,
-    sql: &'static str,
+    backlog: Backlog,
 }
-
-/// Captures with no decomposed facts pointing back at them.
-const UNDECOMPOSED: &str = "SELECT COUNT(*) FROM memories m
-     WHERE m.capture_id IS NOT NULL
-       AND m.source_capture_id IS NULL
-       AND m.deleted_at IS NULL
-       AND NOT EXISTS (
-           SELECT 1 FROM memories c WHERE c.source_capture_id = m.capture_id
-       )";
-
-/// Eligible for entity/triple annotation: not superseded, not a raw verbatim
-/// dialog (the summary gets annotated instead), and carrying neither a triple
-/// nor any entity mention.
-const UNANNOTATED: &str = "SELECT COUNT(*) FROM memories m
-     WHERE m.superseded_by IS NULL
-       AND m.deleted_at IS NULL
-       AND m.category != 'dialog'
-       AND m.subject IS NULL AND m.predicate IS NULL AND m.object IS NULL
-       AND NOT EXISTS (
-           SELECT 1 FROM memory_entities me WHERE me.memory_id = m.id
-       )";
-
-/// Raw imports with nothing pointing back at them via `normalized_from`.
-///
-/// `NOT IN` over an uncorrelated subquery rather than `NOT EXISTS`: correlated,
-/// SQLite re-scans the index once per candidate row, which on a large vault is
-/// a per-row scan rather than a seek. The set form materialises once and probes
-/// per row — same answer, dramatically cheaper.
-const UNNORMALIZED: &str = "SELECT COUNT(*) FROM memories m
-     WHERE m.superseded_by IS NULL
-       AND m.deleted_at IS NULL
-       AND m.source IN ('document_import', 'chat_import')
-       AND m.id NOT IN (
-           SELECT json_extract(metadata, '$.normalized_from') FROM memories
-           WHERE json_extract(metadata, '$.normalized_from') IS NOT NULL
-       )";
-
-const UNCLASSIFIED: &str = "SELECT COUNT(*) FROM memories m
-     WHERE m.memory_type = 'unclassified' AND m.deleted_at IS NULL";
 
 const QUEUES: &[Queue] = &[
     Queue {
         key: "undecomposed_captures",
         label: "captures not decomposed into facts",
         prompt: "decompose_facts",
-        sql: UNDECOMPOSED,
+        backlog: Backlog::Undecomposed,
     },
     Queue {
         key: "unannotated_memories",
         label: "memories with no entity/triple annotation",
         prompt: "backfill_graph",
-        sql: UNANNOTATED,
+        backlog: Backlog::Unannotated,
     },
     Queue {
         key: "unnormalized_imports",
         label: "raw imports not normalized",
         prompt: "normalize_imports",
-        sql: UNNORMALIZED,
+        backlog: Backlog::Unnormalized,
     },
     Queue {
         key: "unclassified_memories",
         label: "memories unclassified",
         prompt: "classify_memories",
-        sql: UNCLASSIFIED,
+        backlog: Backlog::Unclassified,
     },
 ];
 
@@ -133,11 +95,10 @@ const QUEUES: &[Queue] = &[
 /// Never fails: a queue whose query errors reports 0 rather than propagating,
 /// because a status helper must not be the thing that breaks a search.
 pub fn pending_counts(conn: &Connection) -> HashMap<String, i64> {
+    let curation = Curation::new(conn);
     let mut counts = HashMap::new();
     for queue in QUEUES {
-        let count = conn
-            .query_row(queue.sql, [], |r| r.get::<_, i64>(0))
-            .unwrap_or(0);
+        let count = curation.backlog_depth(queue.backlog).unwrap_or(0);
         counts.insert(queue.key.to_string(), count);
     }
 
@@ -168,16 +129,10 @@ pub struct CaptureHealth {
 }
 
 pub fn capture_health(conn: &Connection) -> CaptureHealth {
-    let row: Option<(i64, Option<String>)> = conn
-        .query_row(
-            "SELECT COUNT(DISTINCT capture_id), MAX(created_at) FROM memories
-              WHERE capture_id IS NOT NULL AND deleted_at IS NULL",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .ok();
-
-    let (captures, last_capture_at) = row.unwrap_or((0, None));
+    let (captures, last_capture_at) = Curation::new(conn)
+        .capture_activity()
+        .map(|a| (a.captures, a.last_capture_at))
+        .unwrap_or((0, None));
     CaptureHealth {
         captures,
         last_capture_at,

@@ -2,6 +2,15 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-26 — Curation queue reads go behind db::curation (ADR-0023, phase 1, step 5c)
+
+### Changed
+- **`db::curation::Curation` now holds every statement `capture.rs`, `normalize.rs`, `maintenance.rs` and `contradictions.rs` ran:** the decomposition and normalization backlogs, capture lookups, the maintenance counts, and contradiction pairs. Behaviour is unchanged.
+
+### Tests
+- New repository tests: a capture leaves the backlog once a fact names it, and an import once it is normalized, with the batch count and the maintenance count agreeing each time; contradiction pairs page by keyset and respect the fan-out ceiling.
+- The core, API, MCP and CLI suites pass unchanged.
+
 ## 2026-09-26 — Import bookkeeping goes behind db:: (ADR-0023, phase 1, step 5b)
 
 ### Changed

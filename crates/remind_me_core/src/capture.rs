@@ -5,8 +5,8 @@
 //! keys on — `remind_me_get_capture` to retrieve both halves, and
 //! `remind_me_decompose` to break the capture into atomic facts.
 
+use crate::db::curation::Curation;
 use crate::db::memories::{Memories, NewMemory};
-use crate::db::queries::{parse_memory_row, MEMORY_COLUMNS};
 use crate::entity::{
     apply_entity_mentions, maybe_link_entity_relation, supersede_contradicting_facts,
 };
@@ -18,7 +18,7 @@ use crate::models::{
 };
 use crate::vitality::{calculate_vitality, get_decay_rate, get_source_prior, get_type_prior};
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension, Result};
+use rusqlite::{Connection, Result};
 
 /// Derive a display title from a summary when the caller supplied none.
 ///
@@ -172,13 +172,7 @@ pub fn auto_capture(conn: &Connection, input: &AutoCaptureInput) -> Result<Captu
 /// that has lost a half, or gained a third row through sync, should be visible
 /// rather than silently half-reported.
 pub fn get_capture(conn: &Connection, capture_id: &str) -> Result<Option<Capture>> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {} FROM memories WHERE capture_id = ? ORDER BY category",
-        MEMORY_COLUMNS
-    ))?;
-    let rows: Vec<Memory> = stmt
-        .query_map(params![capture_id], parse_memory_row)?
-        .collect::<Result<_>>()?;
+    let rows = Curation::new(conn).capture_rows(capture_id)?;
     if rows.is_empty() {
         return Ok(None);
     }
@@ -238,16 +232,7 @@ pub fn get_capture(conn: &Connection, capture_id: &str) -> Result<Option<Capture
 ///
 /// Returns `None` when no memory carries `capture_id`.
 pub fn decompose(conn: &Connection, input: &DecomposeInput) -> Result<Option<DecomposeResult>> {
-    let parent_tags: Option<Vec<String>> = conn
-        .query_row(
-            "SELECT tags FROM memories WHERE capture_id = ? LIMIT 1",
-            params![input.capture_id],
-            |row| {
-                let tags_json: String = row.get(0)?;
-                Ok(serde_json::from_str(&tags_json).unwrap_or_default())
-            },
-        )
-        .optional()?;
+    let parent_tags = Curation::new(conn).capture_tags(&input.capture_id)?;
     let Some(parent_tags) = parent_tags else {
         return Ok(None);
     };
@@ -358,40 +343,19 @@ pub fn undecomposed_batch(
     let batch_size = input
         .batch_size
         .clamp(DECOMPOSE_BATCH_MIN, DECOMPOSE_BATCH_MAX);
-    let predicate = "m.capture_id IS NOT NULL
-         AND m.source_capture_id IS NULL
-         AND m.deleted_at IS NULL
-         AND NOT EXISTS (
-             SELECT 1 FROM memories c WHERE c.source_capture_id = m.capture_id
-         )";
-
-    let total: i64 = conn.query_row(
-        &format!("SELECT count(*) FROM memories m WHERE {}", predicate),
-        [],
-        |r| r.get(0),
-    )?;
-
-    let mut stmt = conn.prepare(&format!(
-        "SELECT m.id, m.capture_id, m.content, m.category, m.tags
-           FROM memories m
-          WHERE {}
-          ORDER BY m.created_at DESC
-          LIMIT ?",
-        predicate
-    ))?;
-    let memories: Vec<UndecomposedCapture> = stmt
-        .query_map(params![batch_size as i64], |row| {
-            let content: String = row.get("content")?;
-            let tags_json: String = row.get("tags")?;
-            Ok(UndecomposedCapture {
-                id: row.get("id")?,
-                capture_id: row.get("capture_id")?,
-                content_snippet: content.chars().take(500).collect(),
-                category: row.get("category")?,
-                tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-            })
-        })?
-        .collect::<Result<_>>()?;
+    let curation = Curation::new(conn);
+    let total = curation.count_undecomposed()?;
+    let memories: Vec<UndecomposedCapture> = curation
+        .undecomposed(batch_size)?
+        .into_iter()
+        .map(|row| UndecomposedCapture {
+            id: row.id,
+            capture_id: row.capture_id,
+            content_snippet: row.content.chars().take(500).collect(),
+            category: row.category,
+            tags: row.tags,
+        })
+        .collect();
 
     Ok(DecomposeBatchResult {
         memories,

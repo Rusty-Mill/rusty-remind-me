@@ -33,8 +33,9 @@
 //! dominated by pairs whose only relationship is naming the same project, and
 //! the tool is unusable on exactly the vaults that need it most.
 
+use crate::db::curation::Curation;
 use crate::models::{ContradictionCandidate, ContradictionCandidatesResult, ContradictionSide};
-use rusqlite::{params, Connection, Result};
+use rusqlite::{Connection, Result};
 
 /// Entities mentioned by more memories than this are excluded from the pairing
 /// join.
@@ -48,70 +49,8 @@ pub const MAX_ENTITY_FANOUT: i64 = 20;
 /// returning two whole documents per row.
 const SNIPPET_CHARS: usize = 500;
 
-/// Pairs of live, non-dialog memories sharing a low-fan-out entity, excluding
-/// anything the exact-triple mechanism already covers.
-///
-/// The triple exclusion is subtler than it looks. A pair where both sides
-/// share a normalised (subject, predicate) but differ in object *cannot* be
-/// observed here: the moment the second was written, the supersession check
-/// would have set `superseded_by` on the first, and this query only considers
-/// live rows. So excluding matching subject+predicate filters out same-object
-/// verbatim restatements — not a contradiction worth flagging — rather than
-/// defending against pairs that could otherwise slip through.
-///
-/// `lower`/`trim` approximates the entity-name normalisation rather than
-/// reproducing it exactly. This only narrows a set for human review, so an
-/// imprecise exclusion is a false negative — the caller recognises the pair
-/// and skips it — not the correctness bug it would be in the write-path check.
-fn pairs_sql() -> String {
-    format!(
-        "SELECT DISTINCT me1.memory_id AS id_a, me2.memory_id AS id_b
-           FROM memory_entities me1
-           JOIN memory_entities me2
-             ON me2.entity_id = me1.entity_id AND me2.memory_id > me1.memory_id
-           JOIN memories m1 ON m1.id = me1.memory_id
-           JOIN memories m2 ON m2.id = me2.memory_id
-           JOIN (
-               SELECT entity_id, COUNT(*) AS mentions
-                 FROM memory_entities
-                GROUP BY entity_id
-           ) fanout ON fanout.entity_id = me1.entity_id
-          WHERE m1.superseded_by IS NULL AND m1.deleted_at IS NULL
-            AND m2.superseded_by IS NULL AND m2.deleted_at IS NULL
-            AND m1.category != 'dialog' AND m2.category != 'dialog'
-            AND fanout.mentions <= {fanout}
-            AND NOT (
-                m1.subject IS NOT NULL AND m1.predicate IS NOT NULL
-                AND m2.subject IS NOT NULL AND m2.predicate IS NOT NULL
-                AND lower(trim(m1.subject)) = lower(trim(m2.subject))
-                AND lower(trim(m1.predicate)) = lower(trim(m2.predicate))
-            )",
-        fanout = MAX_ENTITY_FANOUT
-    )
-}
-
 fn side(conn: &Connection, memory_id: &str) -> Result<ContradictionSide> {
-    conn.query_row(
-        &format!(
-            "SELECT id, substr(content, 1, {}) AS content_snippet, category,
-                    memory_type, subject, predicate, object, created_at
-               FROM memories WHERE id = ?",
-            SNIPPET_CHARS
-        ),
-        params![memory_id],
-        |r| {
-            Ok(ContradictionSide {
-                id: r.get(0)?,
-                content_snippet: r.get(1)?,
-                category: r.get(2)?,
-                memory_type: r.get(3)?,
-                subject: r.get(4)?,
-                predicate: r.get(5)?,
-                object: r.get(6)?,
-                created_at: r.get(7)?,
-            })
-        },
-    )
+    Curation::new(conn).contradiction_side(memory_id, SNIPPET_CHARS)
 }
 
 /// A batch of candidate pairs, plus the full backlog size.
@@ -120,11 +59,7 @@ fn side(conn: &Connection, memory_id: &str) -> Result<ContradictionSide> {
 /// Reuses [`pairs_sql`] rather than approximating with a second query, so the
 /// maintenance nudge cannot claim a backlog that draining it does not find.
 pub fn candidate_count(conn: &Connection) -> Result<i64> {
-    conn.query_row(
-        &format!("SELECT COUNT(*) FROM ({}) p", pairs_sql()),
-        [],
-        |r| r.get(0),
-    )
+    Curation::new(conn).count_contradiction_pairs(MAX_ENTITY_FANOUT)
 }
 
 /// The entity names both memories mention, in name order.
@@ -137,17 +72,7 @@ pub fn candidate_count(conn: &Connection) -> Result<i64> {
 /// pair itself is stable across pages, and a field that reshuffled between
 /// identical requests would make responses gratuitously un-diffable.
 fn shared_entities(conn: &Connection, id_a: &str, id_b: &str) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT e.name FROM memory_entities me1
-           JOIN memory_entities me2 ON me2.entity_id = me1.entity_id
-           JOIN entities e ON e.id = me1.entity_id
-          WHERE me1.memory_id = ? AND me2.memory_id = ?
-          ORDER BY e.name",
-    )?;
-    let names = stmt
-        .query_map(params![id_a, id_b], |r| r.get::<_, String>(0))?
-        .collect::<Result<Vec<_>>>()?;
-    Ok(names)
+    Curation::new(conn).shared_entity_names(id_a, id_b)
 }
 
 /// A page of candidate pairs, optionally starting after `cursor`.
@@ -174,43 +99,14 @@ pub fn candidates(
     limit: usize,
     cursor: Option<(&str, &str)>,
 ) -> Result<ContradictionCandidatesResult> {
-    let pairs = pairs_sql();
+    let curation = Curation::new(conn);
 
     // The whole queue, deliberately not narrowed by the cursor: a caller
     // watching this number shrink as it pages would be watching the backlog
     // it has left to review, which is not what "how big is the backlog" means
     // to the maintenance nudge that also reads it.
-    let total: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM ({}) p", pairs), [], |r| {
-        r.get(0)
-    })?;
-
-    let cursor_clause = if cursor.is_some() {
-        "WHERE (id_a > ?1 OR (id_a = ?1 AND id_b > ?2))"
-    } else {
-        ""
-    };
-    let sql = format!(
-        "SELECT id_a, id_b FROM ({}) {} ORDER BY id_a, id_b LIMIT ?3",
-        pairs, cursor_clause
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let ids: Vec<(String, String)> = match cursor {
-        Some((after_a, after_b)) => stmt
-            .query_map(params![after_a, after_b, limit as i64], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })?
-            .collect::<Result<Vec<_>>>()?,
-        // Bind the unused cursor slots to NULL rather than building a second
-        // statement: the clause referencing them is not in the SQL at all, so
-        // the values are never evaluated.
-        None => stmt
-            .query_map(
-                params![Option::<&str>::None, Option::<&str>::None, limit as i64],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )?
-            .collect::<Result<Vec<_>>>()?,
-    };
-    drop(stmt);
+    let total = curation.count_contradiction_pairs(MAX_ENTITY_FANOUT)?;
+    let ids = curation.contradiction_pairs(MAX_ENTITY_FANOUT, cursor, limit)?;
 
     // Null on a short page, which is the queue being exhausted. A full page
     // whose last row happens to be the final one costs the caller one extra

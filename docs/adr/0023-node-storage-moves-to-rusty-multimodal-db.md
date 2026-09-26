@@ -444,6 +444,22 @@ Reading the foreign SQLite files the dbs and mempalace importers take in
 stays with them (§6). The rules stay in `archive.rs`, `undo_import.rs` and
 the importers.
 
+**Step 5c.** `db::curation::Curation` holds the curation queues' reads:
+- captures awaiting decomposition, a capture's rows and tags, and capture
+  activity;
+- raw imports awaiting normalization, and what a normalization copies;
+- the four maintenance backlog depths, named by a `Backlog` enum;
+- contradiction candidate pairs, their count, shared entity names and
+  sides.
+
+These came from `capture.rs`, `normalize.rs`, `maintenance.rs` and
+`contradictions.rs`, which keep the rules: snippet lengths, batch bounds,
+import sources, the fan-out ceiling, and the keyset cursor. The maintenance
+counts keep their own SQL, which is cheaper than the batch queries' and
+must count the same rows (a test holds the two together for the capture
+and import backlogs). Consolidation's candidate read joins the vector
+tables by rowid, so it moves with step 4.
+
 ## Related
 
 - ADR-0021 (the hub's move) and ADR-0022 (the seam this continues).
