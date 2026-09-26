@@ -1,12 +1,12 @@
 //! Hub storage on the embedded `rusty_multimodal_db` engine (ADR-0021).
 //!
-//! The hub's third backend: no database server and no SQL. Four engine
+//! The hub's only store: no database server and no SQL. Four engine
 //! stores, one per table, live in one data directory, with every record
 //! in memory and each write logged and `fsync`'d before it returns. The
-//! wire behaviour is the SQLite store's, method for method; the route
-//! suite runs against both.
+//! wire behaviour is the retired SQLite store's, method for method: the
+//! tests hold it to that store's recorded answers (`tests/fixtures`).
 //!
-//! # Where it differs from the SQL stores
+//! # Where it differs from the SQL stores it replaced
 //!
 //! - **Ids are capped at 64 bytes and may not contain NUL** (ADR-0021,
 //!   decision 3). A longer id fails the record as a storage error, so it
@@ -16,8 +16,7 @@
 //!   alongside a write. A push is applied in chunks of [`GROUP_COMMIT`]
 //!   records, each under one hold of the lock and one sync per table, so a
 //!   pull waits for at most one chunk. A panic while it is held does not
-//!   take the hub down with it: the lock recovers, as the SQLite store's
-//!   mutex does.
+//!   take the hub down with it: the lock recovers.
 //! - **A failed sync stops every later write** until the hub restarts. The
 //!   chunk it covered is applied in memory but may not be on disk, so
 //!   carrying on could acknowledge writes built on ones a crash loses.
@@ -542,12 +541,13 @@ fn apply_memory(t: &mut Tables, m: &MemoryRecord, origin: Option<&str>) -> Store
         None => t.memories.insert(row).map_err(engine_err)?,
         Some(local) => {
             keys::ensure_same_id(&local.id, &m.id)?;
-            // LWW, exactly the SQL upsert's `WHERE excluded.updated_at >
-            // memories.updated_at`: canonical timestamps compare as bytes.
+            // LWW, as the SQL stores' upsert did (`WHERE
+            // excluded.updated_at > memories.updated_at`): canonical
+            // timestamps compare as bytes.
             if m.updated_at <= local.updated_at {
                 return Ok(false);
             }
-            // The SQL upsert's SET list leaves `created_at` alone.
+            // A win keeps the first `created_at`, as the SQL upsert did.
             row.created_at = local.created_at;
             t.memories.replace(row).map_err(engine_err)?;
         }
@@ -556,9 +556,18 @@ fn apply_memory(t: &mut Tables, m: &MemoryRecord, origin: Option<&str>) -> Store
     Ok(true)
 }
 
-/// Entity upsert: LWW on `updated_at`, aliases always union-merged. The
-/// SQLite store's `apply_entity`, rule for rule; see it for why an
-/// LWW-losing enrichment bumps `updated_at`.
+/// Entity upsert: LWW on `updated_at`, aliases always union-merged.
+///
+/// The union merge happens regardless of which side wins, because union is
+/// commutative and idempotent, so every node converges on the same alias set
+/// without needing to agree on an order.
+///
+/// An LWW-losing enrichment (new aliases, or a `kind` where there was none)
+/// bumps `updated_at`. The peer protocol leaves `updated_at` alone, but the
+/// hub is pull-only: without a bump, nodes whose cursor has already passed
+/// this entity would never see the merged aliases. Bumping is safe because
+/// the merge is idempotent: a re-pulled merge that changes nothing does not
+/// bump again, so the cycle terminates.
 fn apply_entity(t: &mut Tables, e: &EntityRecord, origin: Option<&str>) -> StoreResult<bool> {
     keys::check_id("entity id", &e.id)?;
     let incoming = EntityRow::new(e, origin)?;
@@ -648,10 +657,6 @@ fn apply_link(t: &mut Tables, l: &LinkRecord) -> StoreResult<bool> {
 impl HubStore for MultimodalHubStore {
     /// Nothing to do: the store opens ready. A change to a record layout is
     /// a conversion under a new schema tag, not a migration (ADR-0021).
-    fn migrate(&self) -> StoreResult<()> {
-        Ok(())
-    }
-
     /// The store is in-process, so it is reachable whenever the hub is,
     /// unless a sync has failed (see the module docs).
     fn ping(&self) -> StoreResult<()> {
@@ -754,7 +759,7 @@ impl HubStore for MultimodalHubStore {
                         past((since_us, MAX_ID_KEY)),
                         Bound::Unbounded,
                     );
-                    // No live/tombstone split, as on the SQL stores.
+                    // No live/tombstone split for a `since` count.
                     counts.memories = Some(MemoryCounts {
                         total: count(n),
                         live: None,
@@ -862,8 +867,8 @@ impl HubStore for MultimodalHubStore {
         let cursor = match &query.cursor {
             PullCursor::Keyset { since, since_id } => id_cursor(since, since_id)?,
             PullCursor::Since(since) => id_cursor(since, "")?,
-            // Entities have no hub_seq; as on the SQL stores, a seq cursor
-            // degrades to the epoch rather than returning nothing.
+            // Entities have no hub_seq; a seq cursor degrades to the epoch
+            // rather than returning nothing.
             PullCursor::Seq(_) => id_cursor(crate::EPOCH, "")?,
         };
         let keep = not_excluded(query);

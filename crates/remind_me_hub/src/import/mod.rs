@@ -1,4 +1,4 @@
-//! Read a whole hub out of the SQLite or Postgres store, for the copy tool
+//! Read a whole hub out of the retired SQLite or Postgres store, for the copy tool
 //! (`rusty-remind-me-hub-copy`, ADR-0021 phase 3).
 //!
 //! Each reader turns every row into a JSON object keyed by column name and

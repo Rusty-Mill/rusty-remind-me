@@ -1,18 +1,20 @@
 //! The copy tool (ADR-0021, phase 3): a SQLite hub copied onto the embedded
 //! engine answers every read as the source did, `hub_seq` included, and
-//! nothing the engine cannot store is copied silently. The Postgres source
-//! is covered in `hub_postgres_test.rs`, which needs a server.
-#![cfg(feature = "multimodal-store")]
+//! nothing the engine cannot store is copied silently.
+//!
+//! The SQLite store is gone, so each source hub is rebuilt from a dump the
+//! store wrote before it went (`tests/fixtures/sqlite_hub*.sql`), and the
+//! copy is held to that store's recorded answers. The Postgres source is
+//! covered in `hub_postgres_copy_test.rs`, which needs a server.
 
 // Each test crate uses part of the shared suite.
 #[allow(dead_code)]
-#[path = "suite/differential.rs"]
-mod differential;
+#[path = "suite/recorded.rs"]
+mod recorded;
 
 use remind_me_hub::import;
 use remind_me_hub::record;
 use remind_me_hub::store::multimodal::MultimodalHubStore;
-use remind_me_hub::store::sqlite::SqliteStore;
 use remind_me_hub::store::{HubStore, PullCursor, PullQuery};
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -46,11 +48,18 @@ impl Drop for Scratch {
     }
 }
 
-fn sqlite_hub(path: &Path) -> SqliteStore {
-    let store = SqliteStore::open(path.to_str().unwrap()).expect("open a SQLite hub");
-    store.migrate().expect("migrate");
-    store
+/// A SQLite hub database at `path`, rebuilt from the recorded dump `dump`.
+fn sqlite_hub(path: &Path, dump: &str) {
+    let conn = rusqlite::Connection::open(path).expect("create a SQLite hub");
+    conn.execute_batch(dump).expect("load the recorded hub");
 }
+
+/// The script's hub, as the SQLite store left it before compaction.
+const SCRIPT_HUB: &str = include_str!("fixtures/sqlite_hub.sql");
+/// Two memories, the newer compacted away: `hub_meta` holds 2, the rows 1.
+const COMPACTED_HUB: &str = include_str!("fixtures/sqlite_hub_compacted.sql");
+/// `ok`, a memory with a 65-byte id, and a link to that memory.
+const INVALID_HUB: &str = include_str!("fixtures/sqlite_hub_invalid.sql");
 
 fn memory(id: &str, updated: &str) -> record::Record {
     record::parse(&json!({
@@ -87,81 +96,53 @@ fn copy(source: &Path, target: &Path) -> MultimodalHubStore {
 
 #[test]
 fn a_copied_sqlite_hub_answers_every_read_as_the_source_did() {
-    let dir = Scratch::new("differential");
-    let lite = sqlite_hub(&dir.path("hub.db"));
-    differential::apply_script(&lite);
+    let dir = Scratch::new("recorded");
+    sqlite_hub(&dir.path("hub.db"), SCRIPT_HUB);
+    let expected = recorded::recorded();
 
     let engine = copy(&dir.path("hub.db"), &dir.path("engine"));
-    // Exact: every hub_seq and origin_node carried over, so every cursor a
-    // node holds, and every exclude_node filter, means the same thing.
-    differential::assert_answers_agree(
-        &[("sqlite", &lite), ("copy", &engine)],
-        differential::SeqComparison::Exact,
-        "after the copy",
-    );
+    // Every hub_seq and origin_node carried over, so every cursor a node
+    // holds, and every exclude_node filter, means the same thing.
+    recorded::assert_answers(&engine, &expected["after_pushes"], "after the copy");
 
-    // The next write on the copy is numbered as it would have been on the
-    // source, so a node's cursor carries straight on.
+    // The next write on the copy is numbered as the source would have
+    // numbered it: nothing was compacted, so one above its highest row.
     let next = memory("after-copy", "2026-09-01T00:00:00Z");
-    assert!(lite.apply_record(&next, Some("node-a")).unwrap());
     assert!(engine.apply_record(&next, Some("node-a")).unwrap());
-    assert_eq!(last_seq(&engine), last_seq(&lite));
+    assert_eq!(
+        last_seq(&engine),
+        recorded::highest_seq(&expected["after_pushes"]) + 1
+    );
 
     // And the copy survives a reopen as it was written.
     drop(engine);
     let reopened = MultimodalHubStore::open(&dir.path("engine")).unwrap();
-    differential::assert_answers_agree(
-        &[("sqlite", &lite), ("reopened copy", &reopened)],
-        differential::SeqComparison::Exact,
-        "after a reopen",
+    assert_eq!(
+        last_seq(&reopened),
+        recorded::highest_seq(&expected["after_pushes"]) + 1
     );
 }
 
 #[test]
 fn a_copy_never_reissues_a_hub_seq_the_source_compacted_away() {
-    // The SQLite store remembers the highest hub_seq it issued in
+    // The SQLite store remembered the highest hub_seq it issued in
     // `hub_meta`, above every remaining row once compaction purged the
     // newest. The copy must start above that mark too, or a node whose
     // cursor sits on the purged number never pulls the copy's next write.
     let dir = Scratch::new("high_water");
-    let lite = sqlite_hub(&dir.path("hub.db"));
-    lite.apply_record(&memory("m1", "2026-08-02T00:00:00Z"), None)
-        .unwrap();
-    let doomed = record::parse(&json!({
-        "id": "m2",
-        "content": "gone",
-        "created_at": "2026-08-01T00:00:00Z",
-        "updated_at": "2026-08-02T00:00:00Z",
-        "deleted_at": "2026-08-02T00:00:00Z",
-    }))
-    .unwrap();
-    lite.apply_record(&doomed, None).unwrap();
-    assert_eq!(lite.compact_tombstones("2026-09-01T00:00:00Z").unwrap(), 1);
-    assert_eq!(last_seq(&lite), 1, "the row holding hub_seq 2 is gone");
+    sqlite_hub(&dir.path("hub.db"), COMPACTED_HUB);
 
     let engine = copy(&dir.path("hub.db"), &dir.path("engine"));
+    assert_eq!(last_seq(&engine), 1, "the row holding hub_seq 2 is gone");
     let next = memory("after-copy", "2026-09-01T00:00:00Z");
-    assert!(lite.apply_record(&next, None).unwrap());
     assert!(engine.apply_record(&next, None).unwrap());
-    assert_eq!(last_seq(&lite), 3);
     assert_eq!(last_seq(&engine), 3, "the copy reissued a purged hub_seq");
 }
 
 #[test]
 fn ids_the_engine_cannot_store_are_listed_and_never_copied_silently() {
     let dir = Scratch::new("invalid");
-    let lite = sqlite_hub(&dir.path("hub.db"));
-    let long = "x".repeat(65);
-    lite.apply_record(&memory("ok", "2026-08-02T00:00:00Z"), None)
-        .unwrap();
-    lite.apply_record(&memory(&long, "2026-08-02T00:00:00Z"), None)
-        .unwrap();
-    let link = record::parse(&json!({
-        "record_type": "memory_entity", "memory_id": long, "entity_id": "e1",
-        "created_at": "2026-08-02T00:00:00Z",
-    }))
-    .unwrap();
-    lite.apply_record(&link, None).unwrap();
+    sqlite_hub(&dir.path("hub.db"), INVALID_HUB);
 
     let snapshot = import::sqlite::read(&dir.path("hub.db")).unwrap();
     let rejected = snapshot.validate();
@@ -187,10 +168,7 @@ fn ids_the_engine_cannot_store_are_listed_and_never_copied_silently() {
 fn reading_the_source_writes_nothing_to_it() {
     let dir = Scratch::new("read_only");
     let path = dir.path("hub.db");
-    {
-        let lite = sqlite_hub(&path);
-        differential::apply_script(&lite);
-    }
+    sqlite_hub(&path, SCRIPT_HUB);
     let before = std::fs::read(&path).unwrap();
     import::sqlite::read(&path).unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -199,9 +177,7 @@ fn reading_the_source_writes_nothing_to_it() {
 #[test]
 fn a_copy_never_lands_in_a_directory_that_holds_anything() {
     let dir = Scratch::new("target");
-    let lite = sqlite_hub(&dir.path("hub.db"));
-    lite.apply_record(&memory("m1", "2026-08-02T00:00:00Z"), None)
-        .unwrap();
+    sqlite_hub(&dir.path("hub.db"), COMPACTED_HUB);
     let target = dir.path("engine");
     std::fs::create_dir_all(&target).unwrap();
     std::fs::write(target.join("something"), b"x").unwrap();
@@ -217,11 +193,7 @@ fn a_copy_never_lands_in_a_directory_that_holds_anything() {
 #[test]
 fn the_copy_tool_checks_refuses_and_copies() {
     let dir = Scratch::new("cli");
-    let lite = sqlite_hub(&dir.path("hub.db"));
-    differential::apply_script(&lite);
-    lite.apply_record(&memory(&"y".repeat(70), "2026-08-02T00:00:00Z"), None)
-        .unwrap();
-    drop(lite);
+    sqlite_hub(&dir.path("hub.db"), INVALID_HUB);
 
     let tool = |extra: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_rusty-remind-me-hub-copy"))
@@ -252,11 +224,10 @@ fn the_copy_tool_checks_refuses_and_copies() {
     assert!(copied.status.success(), "{stderr}");
     assert!(stderr.contains("wrote and verified"), "{stderr}");
 
-    let lite = sqlite_hub(&dir.path("hub.db"));
     let engine = MultimodalHubStore::open(&dir.path("engine")).unwrap();
     assert_eq!(
-        engine.stats().unwrap().total + 1,
-        lite.stats().unwrap().total,
-        "everything but the one over-long id"
+        engine.stats().unwrap().total,
+        1,
+        "everything but the over-long id"
     );
 }

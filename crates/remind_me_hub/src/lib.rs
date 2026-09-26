@@ -1,13 +1,11 @@
 //! The remind-me sync hub: a central sync point speaking the peer protocol.
 //!
-//! A port of the reference's `hub/main.py` — a FastAPI server backed by
-//! Postgres — with one deliberate addition: the storage backend is behind a
-//! trait, so the same hub runs on Postgres (the drop-in for an existing
-//! deployment) or on SQLite (a self-hosted hub that wants one file and no
-//! server). `docs/adr/0015` records why. A third backend, the embedded
-//! `rusty_multimodal_db` engine (the `multimodal-store` feature, on by
-//! default), is the default for a new hub and is to replace both
-//! (`docs/adr/0021`).
+//! A port of the reference's `hub/main.py`, a FastAPI server backed by
+//! Postgres. This hub stores its data in the embedded `rusty_multimodal_db`
+//! engine instead: one data directory, no database server
+//! (`docs/adr/0021`). The Postgres and SQLite stores it used to offer are
+//! gone; [`import`] reads both, and `rusty-remind-me-hub-copy` copies an
+//! old hub onto the engine.
 //!
 //! # What a hub is, relative to a peer
 //!
@@ -42,7 +40,6 @@
 
 pub mod canon;
 pub mod http;
-#[cfg(feature = "multimodal-store")]
 pub mod import;
 pub mod record;
 pub mod routes;

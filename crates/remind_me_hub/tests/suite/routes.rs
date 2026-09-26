@@ -1,7 +1,7 @@
-//! The route suite, run once per backend by `tests/hub_routes_test.rs`.
+//! The route suite, run by `tests/hub_routes_test.rs` against the store
+//! `super::store()` gives it.
 //!
-//! Everything here is about the *protocol*, which every backend must answer
-//! identically; `super::store()` is the only thing that differs.
+//! Everything here is about the *protocol*: what a node sees on the wire.
 
 use remind_me_hub::http::Head;
 use remind_me_hub::store::HubStore;
@@ -678,8 +678,8 @@ fn count_rejects_approx_combined_with_a_filter() {
 
 #[test]
 fn count_reports_approximate_false_when_the_backend_has_no_estimate() {
-    // SQLite has no planner row count, so asking for approx must fall back to
-    // exact and *say so* -- labelling a scan "approximate" is the one thing
+    // The engine has no planner row count, so asking for approx must fall back
+    // to exact and *say so* -- labelling a scan "approximate" is the one thing
     // the flag must never mean.
     let store = store();
     push(&store, "node-a", vec![memory("m1", "2026-08-05T10:00:00Z")]);

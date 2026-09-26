@@ -1,4 +1,4 @@
-//! A whole hub's rows, read from another backend, for
+//! A whole hub's rows, read from a retired backend, for
 //! [`MultimodalHubStore::create_from_snapshot`](super::MultimodalHubStore::create_from_snapshot)
 //! (ADR-0021, phase 3).
 //!
@@ -65,8 +65,8 @@ pub(super) struct Rows {
 
 /// Give every memory a `hub_seq`: its own where the source had one, and
 /// for the rest the next numbers above everything issued, in
-/// `(updated_at, id)` order. The SQL stores' own `migrate` backfills in
-/// that order, so a copy of a never-migrated database numbers it as a
+/// `(updated_at, id)` order. The retired SQL stores' `migrate` backfilled
+/// in that order, so a copy of a never-migrated database numbers it as a
 /// migration would have.
 pub fn assign_missing_seq(
     rows: Vec<(MemoryRecord, Option<String>, Option<i64>)>,

@@ -8,7 +8,7 @@
 //! crates' own module docs claim the wire protocol is interchangeable
 //! ("a node cannot tell the two apart" -- `remind_me_hub/src/lib.rs`); this
 //! file is what actually checks that claim, using `support::MockHub` (a
-//! real `SqliteStore`-backed `remind_me_hub`, wired to a real
+//! real engine-backed `remind_me_hub`, wired to a real
 //! `TcpListener` through the exact same `read_head`/`read_body`/`dispatch`/
 //! `write_response` sequence the real `rusty-remind-me-hub` binary uses).
 //!

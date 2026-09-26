@@ -1,6 +1,6 @@
 # ADR-0021: The hub's storage moves to an embedded rusty_multimodal_db
 
-Status: Proposed
+Status: Accepted (all three phases done, 2026-09-26)
 Date: 2026-09-25
 
 ## Context
@@ -91,6 +91,9 @@ with record types the hub owns.**
    into the new store; the default switches; the old stores go one release
    later. The copy tool's Postgres reader outlives them behind an import
    feature, so a hub that migrates late is not stranded.
+   *Amended 2026-09-26:* the old stores went in the same release as the
+   default switch, not one later (the owner's call; see "Phase 3 notes:
+   the stores go"). Both copy readers, SQLite and Postgres, stay.
 7. **The copy preserves `hub_seq` exactly.** Every node stores the last
    `hub_seq` it pulled from this hub and resumes from it
    (`remind_me_core/src/sync/pull.rs`). A copy that renumbered would make every
@@ -344,7 +347,47 @@ The image was built and run end to end:
 - a restart;
 - the copy tool moving a SQLite hub onto the engine.
 
-Still to do in phase 3: remove the old stores a release later.
+### The stores go (2026-09-26)
+
+The owner chose to remove the Postgres and SQLite stores now rather than one
+release after the default switch, which amends decision 6. No release had yet
+shipped the engine default, so a hub on either store upgrades straight from
+v0.2.3 to a hub that cannot serve its data. Three things keep that from
+losing anything:
+
+- **The hub refuses to start** while `DATABASE_URL` or
+  `REMIND_ME_HUB_DB_PATH` is set, even beside `REMIND_ME_HUB_DATA_DIR`, and
+  prints the copy that moves the store over. It never comes up empty in front
+  of data that was not copied.
+- **`setup.sh migrate`** does the copy for a Quadlet install: it builds the new
+  image, stops the hub, copies the store with every `hub_seq`, rewrites
+  `hub.env` (keeping the old one), installs the one-container unit and
+  starts the hub. The old Postgres container, or SQLite file, is left for the
+  operator to remove. `install` and `update` refuse a hub still on a retired
+  store and point at `migrate`.
+- **Both readers stay.** The SQLite reader is built in; the Postgres reader
+  stays behind the default `postgres-import` feature. `setup.sh restore` now
+  loads a Postgres dump through a throwaway Postgres container and the copy
+  tool.
+
+Removed: `store::sqlite`, `store::postgres`, the `postgres-store` and
+`multimodal-store` features (the engine is a plain dependency), and
+`HubStore::migrate` (the engine has nothing to migrate, so the startup wait
+for a database went with it). The deploy templates are engine-only: the
+Postgres Quadlet units and Compose file, the SQLite Compose file and env
+example, and Fly's managed-Postgres setup are gone, and the engine's files
+take the plain names.
+
+The differential test held the engine to the SQLite and Postgres stores. With
+them gone, their answers were recorded first (`remind_me_hub/tests/fixtures`,
+from `main` at `72299199d`) and are the reference now: the engine must give
+the SQLite store's answer to every read of the script, before and after a
+tombstone compaction and after a reopen. The copy tests rebuild SQLite and
+Postgres hubs from dumps those stores wrote, and hold each copy to the
+store's recorded answers. Breaking the "a win keeps the first `created_at`"
+rule makes the recorded check fail, so it still catches a regression. The
+concurrent `since_seq` puller test moved from the Postgres suite to the
+engine, which had no equivalent.
 
 ## Related
 

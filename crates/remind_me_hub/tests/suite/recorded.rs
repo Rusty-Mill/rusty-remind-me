@@ -1,17 +1,20 @@
-//! A differential check: one script of pushes, applied to every backend
-//! given, must leave them answering every read identically.
+//! A recorded check: one script of pushes, and every read's answer after it,
+//! as the retired SQLite store gave them (`tests/fixtures/script_answers.json`).
 //!
-//! Shared by `hub_multimodal_test.rs` (SQLite against the embedded engine,
-//! no server needed) and `hub_postgres_test.rs` (all backends built in).
-//! The script leans on the places backends can drift apart: ids that
-//! share a timestamp and prefix each other, uppercase before lowercase in
-//! byte order, an id at the 64-byte cap, LWW wins and losses, a win that
+//! The hub used to run on SQLite and Postgres as well as the engine, and a
+//! differential test held the three to one another. Those stores are gone
+//! (ADR-0021, phase 3), so their answers were recorded before they went and
+//! are the reference now. `tests/fixtures/README.md` says how.
+//!
+//! The script leans on the places a store can get the protocol wrong: ids
+//! that share a timestamp and prefix each other, uppercase before lowercase
+//! in byte order, an id at the 64-byte cap, LWW wins and losses, a win that
 //! must keep the first `created_at`, tombstones, and cursors walked a page
 //! at a time as a node walks them.
 //!
 //! It leaves out the one write whose result depends on the clock: an
 //! entity enrichment that loses LWW stamps `now`. The route suite covers
-//! that per backend.
+//! that.
 
 use remind_me_hub::record;
 use remind_me_hub::store::{GraphPullQuery, HubStore, PullCursor, PullQuery, COUNTABLE};
@@ -230,43 +233,8 @@ fn relations(store: &dyn HubStore, q: &GraphPullQuery) -> Vec<Value> {
     store.pull_entity_relations(q).expect("pull relations")
 }
 
-/// How to compare `hub_seq` across backends.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum SeqComparison {
-    /// The same numbers: SQLite and the embedded engine both issue one per
-    /// applied memory write, with no gaps.
-    Exact,
-    /// The same order. Postgres's `nextval()` also burns a number on every
-    /// LWW loss, so its sequence has gaps the others do not. A node only
-    /// relies on the order (it resumes strictly after its last `hub_seq`),
-    /// so each value is replaced by its rank before comparing.
-    Ranked,
-}
-
-/// Replace every memory's `hub_seq` in `observed` by its rank among the
-/// store's `hub_seq`s.
-fn rank_seqs(observed: &mut Value) {
-    let mut seqs: Vec<i64> = observed["seq_by_1"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|m| m["hub_seq"].as_i64().unwrap())
-        .collect();
-    seqs.sort_unstable();
-    for (_, list) in observed.as_object_mut().unwrap() {
-        let Some(rows) = list.as_array_mut() else {
-            continue;
-        };
-        for row in rows {
-            if let Some(seq) = row.get("hub_seq").and_then(Value::as_i64) {
-                row["hub_seq"] = json!(seqs.binary_search(&seq).expect("a seq the walk saw"));
-            }
-        }
-    }
-}
-
 /// Everything a client can read, in one comparable value.
-fn observe(store: &dyn HubStore) -> Value {
+pub fn observe(store: &dyn HubStore) -> Value {
     let entity_query = |cursor, exclude: Option<&str>| PullQuery {
         cursor,
         exclude_node: exclude.map(str::to_string),
@@ -306,69 +274,52 @@ fn observe(store: &dyn HubStore) -> Value {
     })
 }
 
-/// Apply the script to every backend, then require identical answers
-/// from all of them to every read, before and after a tombstone
-/// compaction. `backends` names each store for the failure message.
-pub fn assert_backends_agree(backends: &[(&str, &dyn HubStore)], seq: SeqComparison) {
-    let (first_name, first) = backends[0];
-    for (raw, node) in script() {
-        let parsed = record::parse(&raw).expect("a well-formed record");
-        let expected = first
-            .apply_record(&parsed, origin(node))
-            .unwrap_or_else(|e| panic!("{first_name} apply {raw}: {e}"));
-        for (name, store) in &backends[1..] {
-            let applied = store
+/// Push the script to `store`, returning whether each push applied.
+pub fn apply_script(store: &dyn HubStore) -> Vec<bool> {
+    script()
+        .into_iter()
+        .map(|(raw, node)| {
+            let parsed = record::parse(&raw).expect("a well-formed record");
+            store
                 .apply_record(&parsed, origin(node))
-                .unwrap_or_else(|e| panic!("{name} apply {raw}: {e}"));
-            assert_eq!(
-                applied, expected,
-                "{name} and {first_name} disagreed on whether {raw} applied"
-            );
-        }
-    }
-    assert_answers_agree(backends, seq, "after the pushes");
+                .unwrap_or_else(|e| panic!("apply {raw}: {e}"))
+        })
+        .collect()
+}
 
-    let cutoff = "2026-08-04T00:00:00+00:00";
-    let expected = first.compact_tombstones(cutoff).expect("compact");
-    assert_eq!(expected, 1, "the script holds one expired tombstone");
-    for (name, store) in &backends[1..] {
+/// The tombstone-compaction cutoff the recorded answers were taken at: one
+/// tombstone in the script is older.
+pub const COMPACT_CUTOFF: &str = "2026-08-04T00:00:00+00:00";
+
+/// The recorded answers: `applied` (whether each push of the script changed
+/// anything), `after_pushes`, and `after_compaction` at [`COMPACT_CUTOFF`].
+pub fn recorded() -> Value {
+    let text = include_str!("../fixtures/script_answers.json");
+    serde_json::from_str(text).expect("the recorded answers are JSON")
+}
+
+/// Require `store` to answer every read as `expected` records, naming the
+/// first read that differs.
+pub fn assert_answers(store: &dyn HubStore, expected: &Value, stage: &str) {
+    let got = observe(store);
+    for (key, want) in expected
+        .as_object()
+        .expect("recorded answers are an object")
+    {
         assert_eq!(
-            store.compact_tombstones(cutoff).expect("compact"),
-            expected,
-            "{name}"
+            &got[key], want,
+            "{stage}: {key} differs from the recorded answer"
         );
     }
-    assert_answers_agree(backends, seq, "after compacting tombstones");
 }
 
-/// Push the script to one store, for a test that then copies it.
-pub fn apply_script(store: &dyn HubStore) {
-    for (raw, node) in script() {
-        let parsed = record::parse(&raw).expect("a well-formed record");
-        store
-            .apply_record(&parsed, origin(node))
-            .unwrap_or_else(|e| panic!("apply {raw}: {e}"));
-    }
-}
-
-/// Require every read to answer alike on every backend, as they stand.
-pub fn assert_answers_agree(backends: &[(&str, &dyn HubStore)], seq: SeqComparison, stage: &str) {
-    let observe = |store: &dyn HubStore| {
-        let mut observed = observe(store);
-        if seq == SeqComparison::Ranked {
-            rank_seqs(&mut observed);
-        }
-        observed
-    };
-    let (first_name, first) = backends[0];
-    let expected = observe(first);
-    for (name, store) in &backends[1..] {
-        let got = observe(*store);
-        for (key, want) in expected.as_object().unwrap() {
-            assert_eq!(
-                &got[key], want,
-                "{stage}: {name} and {first_name} disagreed on {key}"
-            );
-        }
-    }
+/// The highest `hub_seq` among recorded answers' memories.
+pub fn highest_seq(answers: &Value) -> i64 {
+    answers["seq_by_1"]
+        .as_array()
+        .expect("a seq walk")
+        .iter()
+        .filter_map(|m| m["hub_seq"].as_i64())
+        .max()
+        .unwrap_or(0)
 }

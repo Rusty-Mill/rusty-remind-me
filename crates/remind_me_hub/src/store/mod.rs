@@ -1,23 +1,19 @@
 //! The storage interface, and the backends behind it.
 //!
-//! # Why a trait at all
+//! # One backend, still behind a trait
 //!
-//! The reference hub is Postgres-only. This one runs on either Postgres or
-//! SQLite, and `docs/adr/0015` records why: a hub that cannot take over an
-//! existing Postgres deployment is not a successor, and a hub that *requires*
-//! Postgres is a heavy ask of the single-operator self-host case the SQLite
-//! node already serves happily. `docs/adr/0021` adds a third, `multimodal`
-//! (the `multimodal-store` feature, on by default), which is the default for
-//! a new hub and is to replace both.
+//! The hub stores its data in the embedded `rusty_multimodal_db` engine
+//! ([`multimodal`], `docs/adr/0021`). The Postgres and SQLite stores that
+//! `docs/adr/0015` added are gone; `crate::import` still reads both, so an
+//! old hub can be copied onto the engine.
+//!
+//! The trait stays because the routes are written against it and the route
+//! tests put a wrapper store behind it, not in anticipation of another
+//! backend.
 //!
 //! # What the trait deliberately does not expose
 //!
-//! No connections, no transactions, no SQL. Every method is one complete
-//! operation, because the backends differ in exactly the places a leakier
-//! interface would have to paper over: sequences (`nextval` vs. `MAX(...)+1`),
-//! upsert syntax, JSONB vs. TEXT-holding-JSON, planner statistics that only
-//! one of them has.
-//!
+//! No handles, no transactions. Every method is one complete operation.
 //! [`HubStore::apply_record`] is the sharpest case. The reference wraps each
 //! record in its own savepoint so one malformed record cannot poison a batch,
 //! and *that isolation is part of the operation*, not something a caller can
@@ -27,19 +23,13 @@
 use crate::record::Record;
 use std::collections::BTreeMap;
 
-pub mod sqlite;
-
-#[cfg(feature = "postgres-store")]
-pub mod postgres;
-
-#[cfg(feature = "multimodal-store")]
 pub mod multimodal;
 
 /// Anything that went wrong talking to storage.
 ///
-/// Deliberately a string rather than a backend-specific error type: it crosses
-/// a trait boundary two very different drivers implement, and every caller
-/// either logs it or turns it into a 500. Where the *shape* of a failure
+/// Deliberately a string rather than an engine error type: it also carries
+/// the import readers' SQLite and Postgres errors, and every caller either
+/// logs it or turns it into a 500. Where the *shape* of a failure
 /// matters — a connection that is down, as opposed to a query that failed —
 /// [`HubStore::ping`] answers that question directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,9 +47,7 @@ pub type StoreResult<T> = Result<T, StoreError>;
 
 /// Tables `/count` will report, and the only values its `table` filter takes.
 ///
-/// An allowlist, not a validated identifier: the name is interpolated into SQL
-/// text because a table name is not a parameterisable position in either
-/// backend, so it must never come from the request.
+/// An allowlist: a request names a table only by one of these.
 pub const COUNTABLE: [&str; 4] = [
     "memories",
     "entities",
@@ -104,9 +92,7 @@ pub struct Stats {
     pub oldest_updated_at: Option<String>,
     pub newest_updated_at: Option<String>,
     /// Ordered by count descending, then name, so the JSON is stable across
-    /// calls and backends — Postgres and SQLite do not agree on the order of
-    /// equal-count groups otherwise, which would make a diff of two /stats
-    /// responses noisy for no reason.
+    /// calls and a diff of two /stats responses shows only real changes.
     pub by_origin_node: Vec<(String, i64)>,
     pub by_category: Vec<(String, i64)>,
     pub entities: i64,
@@ -155,9 +141,6 @@ pub fn clamp_limit(limit: usize) -> usize {
 /// Implementations must be safe to call from several request threads at once;
 /// each method is one self-contained unit of work.
 pub trait HubStore: Send + Sync {
-    /// Create the schema, and upgrade a legacy database in place.
-    fn migrate(&self) -> StoreResult<()>;
-
     /// Cheapest possible "is the database reachable" probe, for `/health`.
     fn ping(&self) -> StoreResult<()>;
 
@@ -217,8 +200,7 @@ pub trait HubStore: Send + Sync {
 pub(crate) fn stable_group_order(groups: BTreeMap<String, i64>) -> Vec<(String, i64)> {
     let mut out: Vec<(String, i64)> = groups.into_iter().collect();
     // Count descending, then name ascending. The name tiebreak is what makes
-    // this deterministic; without it two backends (or two calls) can disagree
-    // about equal-count groups.
+    // this deterministic across calls.
     out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     out
 }

@@ -347,14 +347,14 @@ jobs:
       - name: cargo clippy -p remind_me_hub
         run: cargo clippy -p remind_me_hub --all-targets --locked -- -D warnings
 
-      # No DATABASE_URL: the Postgres tests skip themselves, which is the path
-      # a contributor without a database takes. Running it here proves that
-      # path stays green rather than only ever being claimed.
-      - name: cargo test -p remind_me_hub (sqlite only)
+      # No database URL: the Postgres copy tests skip themselves, which is the
+      # path a contributor without a database takes. Running it here proves
+      # that path stays green rather than only ever being claimed.
+      - name: cargo test -p remind_me_hub (no Postgres server)
         run: cargo test -p remind_me_hub --locked
 
-      # The run that matters: the legacy-schema migration and the
-      # both-backends-agree differential only execute with a real server.
+      # The copy tool's Postgres reader, legacy schema included, only runs
+      # against a real server.
       - name: cargo test -p remind_me_hub (with postgres)
         env:
           REMIND_ME_HUB_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/hubtest
@@ -364,9 +364,9 @@ jobs:
           REMIND_ME_HUB_REQUIRE_POSTGRES: "1"
         run: cargo test -p remind_me_hub --locked -- --test-threads=1
 
-      # The SQLite-only build must keep working: it is what a self-hosted hub
-      # that wants no Postgres driver actually compiles, and a `postgres::`
-      # reference leaking outside the feature gate would only show up here.
+      # The build without the copy tool's Postgres reader must keep working: a
+      # `postgres::` reference leaking outside the feature gate would only
+      # show up here.
       - name: cargo test -p remind_me_hub --no-default-features
         run: cargo test -p remind_me_hub --no-default-features --locked
 

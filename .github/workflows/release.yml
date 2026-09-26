@@ -61,7 +61,7 @@ jobs:
           fi
 
   # One native build per platform -- no cross-compilation. `remind_me_hub`'s
-  # default `postgres-store` feature pulls in the pure-Rust `postgres` crate
+  # default `postgres-import` feature pulls in the pure-Rust `postgres` crate
   # (no libpq, no TLS feature enabled) and `rusqlite`'s `bundled` feature
   # compiles SQLite from source via `cc`, both of which need only the C
   # toolchain each of these runner images already ships -- so a native build

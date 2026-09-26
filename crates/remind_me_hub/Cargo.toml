@@ -12,47 +12,32 @@ layer = "apps"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
-rusqlite = { version = "0.39", features = ["bundled", "backup", "functions"] }
+# The copy tool's SQLite reader (`src/import/sqlite.rs`), which opens an old
+# hub's database read-only. The hub itself no longer stores anything in
+# SQLite.
+rusqlite = { version = "0.39", features = ["bundled"] }
 
-# The Postgres backend. Optional because the SQLite backend is complete on its
-# own and a self-hosted single-operator hub has no reason to carry a Postgres
-# driver -- but see `docs/adr/0015`: it is *on* by default, because the
-# reference hub is Postgres-backed and a "successor" that cannot take over an
-# existing deployment would not be one.
-#
-# `with-serde_json-1` is what lets JSONB columns round-trip as
-# `serde_json::Value`, which is the same type the wire records already use, so
-# tags/metadata/aliases need no bespoke conversion.
+# The copy tool's Postgres reader (`src/import/postgres.rs`). `with-serde_json-1`
+# is what lets a row read as `to_jsonb(row)` arrive as a `serde_json::Value`.
 postgres = { version = "0.19", features = [
     "with-serde_json-1",
 ], optional = true }
 
-# The embedded-engine backend (docs/adr/0021): `rusty_multimodal_db`'s
-# storage engine, in-process. `uuid` with `v5` derives each record's engine
-# id from its string id; the engine itself only needs `Uuid` as a type.
-rusty_multimodal_db_engine = { workspace = true, optional = true }
-uuid = { version = "1", features = ["v5"], optional = true }
+# The store (docs/adr/0021): `rusty_multimodal_db`'s storage engine,
+# in-process. `uuid` with `v5` derives each record's engine id from its
+# string id; the engine itself only needs `Uuid` as a type.
+rusty_multimodal_db_engine = { workspace = true }
+uuid = { version = "1", features = ["v5"] }
 
 [features]
-# The embedded engine is the default store (docs/adr/0021, phase 3), and
-# `postgres-import` brings it in along with the copy tool's Postgres reader.
-# The Postgres and SQLite stores stay built in for this release, so existing
-# deployments keep working unchanged; they are removed in a later one.
-default = ["postgres-store", "postgres-import"]
-# Postgres storage. Named `postgres-store` rather than `postgres` so it does
-# not collide with the optional dependency's own implicit feature name.
-postgres-store = ["dep:postgres"]
-# Storage on the embedded `rusty_multimodal_db` engine: a data directory, no
-# database server. On by default, through `postgres-import`.
-multimodal-store = ["dep:rusty_multimodal_db_engine", "dep:uuid"]
-# The copy tool's Postgres reader (docs/adr/0021). Separate from
-# `postgres-store` so it can outlive that store: a hub still on Postgres when
-# the old backends go can still be copied onto the engine.
-postgres-import = ["dep:postgres", "multimodal-store"]
+default = ["postgres-import"]
+# The copy tool's Postgres reader. It outlives the Postgres store
+# (docs/adr/0021, decision 6): a hub still on Postgres can be copied onto the
+# engine with any later release.
+postgres-import = ["dep:postgres"]
 
 [dev-dependencies]
-# The Postgres tests build a legacy-schema database directly, which is the
-# only way to exercise the migration that makes this a drop-in.
+# The copy tests load a recorded Postgres hub into a test database.
 postgres = { version = "0.19", features = ["with-serde_json-1"] }
 
 [[bin]]
@@ -64,9 +49,7 @@ path = "src/main.rs"
 [[bin]]
 name = "rusty-remind-me-hub-copy"
 path = "src/bin/copy.rs"
-required-features = ["multimodal-store"]
 
-# Pull latency under push load, SQLite against the engine (docs/adr/0021).
+# Pull latency under push load (docs/adr/0021).
 [[example]]
 name = "pull_latency"
-required-features = ["multimodal-store"]

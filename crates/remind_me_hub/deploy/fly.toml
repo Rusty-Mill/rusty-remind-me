@@ -1,8 +1,5 @@
-# fly.toml — Remind Me sync hub, deployed as a Fly.io app.
-#
-# Postgres is a separate managed Fly app (Fly Postgres), attached via
-# `fly postgres attach` — that's what supplies the DATABASE_URL secret below,
-# so it isn't set in this file. SYNC_SECRET is a plain secret you generate.
+# fly.toml — Remind Me sync hub, deployed as a Fly.io app on the embedded
+# engine: the data directory lives on a Fly Volume mounted at /data.
 #
 # Quick start (run from the MONOREPO ROOT, six levels up from this file —
 # the Containerfile's context must be the workspace, since the hub is one
@@ -10,12 +7,24 @@
 # the one place the Rust hub's packaging differs materially from the Python
 # hub's, whose context was `hub/` alone):
 #
-#   fly postgres create --name remind-me-db
 #   fly apps create remind-me-hub
-#   fly postgres attach remind-me-db -a remind-me-hub   # sets DATABASE_URL
+#   fly volumes create remind_me_hub_data --size 1 -a remind-me-hub
 #   fly secrets set SYNC_SECRET=$(openssl rand -hex 32) -a remind-me-hub
 #   fly deploy --config crates/apps/rusty_remind_me/crates/remind_me_hub/deploy/fly.toml \
 #              --dockerfile crates/apps/rusty_remind_me/crates/remind_me_hub/Containerfile
+#
+# A Fly Volume is pinned to one machine, so the app runs as a single instance
+# and a host failure takes the hub offline until it returns. The hub cannot
+# share its data directory between machines, so do not scale it past one.
+#
+# Moving off the Fly Postgres this template used to attach: stop the hub
+# (`fly scale count 0`), create the volume, then from a one-off machine with
+# the volume mounted and the old DATABASE_URL secret still set, run
+#   rusty-remind-me-hub-copy --from-postgres --to /data/hub
+# and finally `fly secrets unset DATABASE_URL` and redeploy. The hub refuses
+# to start while DATABASE_URL is set, so it never comes up empty in front of
+# data that was not copied. See the crate README's "Moving a hub onto the
+# engine".
 #
 # No [[services]]/http_service block below on purpose: the hub is reached over
 # Fly's private 6PN network (WireGuard peer, or a Tailscale-to-Fly bridge) at
@@ -24,14 +33,6 @@
 # don't expose this publicly" posture as the quadlet and compose templates.
 # Add your own [[services]] block only if you specifically want a public HTTPS
 # endpoint, and put real TLS + rate limiting in front of it if you do.
-#
-# The embedded engine or SQLite on Fly: possible with a Fly Volume mounted at
-# /data and REMIND_ME_HUB_DATA_DIR=/data/hub (or REMIND_ME_HUB_DB_PATH=/data/
-# hub.db) in place of the DATABASE_URL secret, but think before you do. A Fly
-# Volume is pinned to one machine, so the app cannot scale past a single
-# instance and a host failure takes the hub offline until it returns. Managed
-# Postgres stays this template's store, even though the engine is the default
-# for a self-hosted hub (docs/adr/0021).
 
 app = "remind-me-hub"
 primary_region = "iad" # change to your nearest Fly region
@@ -39,10 +40,15 @@ primary_region = "iad" # change to your nearest Fly region
 [build]
   dockerfile = "crates/apps/rusty_remind_me/crates/remind_me_hub/Containerfile"
 
+[env]
+  REMIND_ME_HUB_DATA_DIR = "/data/hub"
+
+[mounts]
+  source = "remind_me_hub_data"
+  destination = "/data"
+
 [[vm]]
-  # Smaller than the Python hub's 256mb: this image is a ~30 MB static-ish
-  # binary with no interpreter or ASGI server behind it. Raise it if you run
-  # the SQLite backend with a large database.
+  # The engine holds every record in memory: raise this as the hub grows.
   size = "shared-cpu-1x"
   memory = "256mb"
 

@@ -2,34 +2,34 @@
 # Remind Me sync hub (Rust) — one-command server setup for rootless Podman.
 #
 # Usage:
-#   ./setup.sh install               Full install: secrets, quadlets, image,
-#                                    services. Idempotent — never clobbers
-#                                    existing secrets or data.
-#   ./setup.sh restore <dump.sql>    Restore a Postgres dump (legacy hub dumps
-#                                    supported). Add --force to drop a database
-#                                    that already holds memories.
+#   ./setup.sh install               Full install: secret, quadlet, image,
+#                                    service. Idempotent — never clobbers an
+#                                    existing secret or data.
+#   ./setup.sh migrate               Move a hub still on Postgres or SQLite
+#                                    onto the embedded engine, keeping every
+#                                    hub_seq. Add --drop-invalid to copy past
+#                                    rows the engine cannot store.
+#   ./setup.sh restore <dump.sql>    Load a Postgres dump (legacy hub dumps
+#                                    supported) into this hub, through a
+#                                    throwaway Postgres container. Add --force
+#                                    to replace a hub that holds memories.
 #   ./setup.sh status                Service state, hub health, per-node counts.
 #   ./setup.sh update                git pull, rebuild the hub image, restart.
 #
-# Backend (a new install only; an existing hub.env decides for itself):
-#   (default)    the embedded engine: one container, a data directory, no
-#                database server (docs/adr/0021).
-#   --postgres   Postgres in a second container: the drop-in for a Python
-#                hub's database, restorable with `restore`.
-#   --sqlite     SQLite: one container, one file.
-#   Choose before you have data. Moving an existing hub onto the engine is a
-#   copy (rusty-remind-me-hub-copy; see the crate README), not a flag.
+# The hub stores its data in the embedded engine: one container, a data
+# directory, no database server (docs/adr/0021). The Postgres and SQLite
+# stores are gone; `migrate` copies a hub off either.
 #
 # Flags:
-#   --force      allow restore to drop a non-empty database
-#   --dry-run    print mutating commands instead of executing them (install)
+#   --force         allow restore to replace a hub that holds memories
+#   --drop-invalid  let migrate/restore copy past rows the engine cannot store
+#   --dry-run       print mutating commands instead of executing them
+#                   (install, migrate)
 #
 # Layout it manages:
 #   ~/remind-me-hub/hub.env            store setting + SYNC_SECRET (chmod 600)
-#   ~/remind-me-hub/data/              engine data or SQLite file (engine, --sqlite)
-#   ~/remind-me-hub/postgres.env       Postgres credentials   (--postgres, chmod 600)
-#   ~/remind-me-hub/postgres-data/     Postgres data directory (--postgres)
-#   ~/.config/containers/systemd/      Quadlet units
+#   ~/remind-me-hub/data/hub/          the engine's data directory
+#   ~/.config/containers/systemd/      the Quadlet unit
 
 set -euo pipefail
 
@@ -42,10 +42,13 @@ QUADLET_DIR="$HOME/.config/containers/systemd"
 
 FORCE=0
 DRY_RUN=0
-# The backend flag the operator passed (postgres or sqlite), and the backend
-# this run acts on. See resolve_backend.
-REQUESTED=""
+DROP_INVALID=0
+# The store an existing hub.env configures: engine, or a retired postgres or
+# sqlite. Empty for a machine with no hub yet. See resolve_backend.
 BACKEND=""
+# The engine's data directory, inside the container and under data/ on the
+# host.
+ENGINE_DIR=/data/hub
 
 log()  { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2; }
@@ -80,7 +83,7 @@ _hub_publish_host() {
 HEALTH_URL=""
 _set_health_url() { HEALTH_URL="http://$(_hub_publish_host):8765/health"; }
 
-# Which backend an existing hub.env configures, or nothing if there is none.
+# Which store an existing hub.env configures, or nothing if there is none.
 backend_of_env() {
     local env="$DATA_DIR/hub.env"
     [ -f "$env" ] || return 0
@@ -93,41 +96,31 @@ backend_of_env() {
     fi
 }
 
-# An existing hub.env always wins. Re-running `install` on a Postgres hub
-# after the default changed must not swap its units for the engine's and
-# leave its database unreachable, so a flag that contradicts hub.env is
-# refused rather than obeyed.
 resolve_backend() {
-    local existing
-    existing=$(backend_of_env)
-    if [[ -n "$existing" ]]; then
-        if [[ -n "$REQUESTED" && "$REQUESTED" != "$existing" ]]; then
-            die "$DATA_DIR/hub.env configures the $existing backend, not $REQUESTED. To move this hub onto another store, copy it (see the crate README) rather than re-running install over it."
-        fi
-        BACKEND="$existing"
-    elif [[ -f "$DATA_DIR/hub.env" ]]; then
-        die "$DATA_DIR/hub.env sets none of DATABASE_URL, REMIND_ME_HUB_DB_PATH, REMIND_ME_HUB_DATA_DIR"
-    else
-        BACKEND="${REQUESTED:-engine}"
+    BACKEND=$(backend_of_env)
+    if [[ -f "$DATA_DIR/hub.env" && -z "$BACKEND" ]]; then
+        die "$DATA_DIR/hub.env sets none of REMIND_ME_HUB_DATA_DIR, DATABASE_URL, REMIND_ME_HUB_DB_PATH"
     fi
 }
 
-psql_in() {  # psql_in <db> [psql args...]
-    local db="$1"; shift
-    podman exec -i remind-me-postgres psql -U remindme -d "$db" "$@"
+# Stop anything but `migrate` from acting on a hub still on a retired store:
+# the new image would refuse to start on its hub.env, and a rebuilt unit
+# would strand its data.
+require_engine() {
+    if [[ "$BACKEND" == postgres || "$BACKEND" == sqlite ]]; then
+        die "this hub still stores its data in ${BACKEND}, which the hub no longer supports. Run '$0 migrate' to copy it onto the embedded engine first."
+    fi
 }
 
-wait_for_postgres() {
-    # `_` rather than a named counter: this is a repeat loop, not an iteration
-    # over anything, and a named-but-unused variable trips shellcheck SC2034.
+wait_for_postgres() {  # wait_for_postgres <container> <user>
     local _
     for _ in $(seq 1 60); do
-        if podman exec remind-me-postgres pg_isready -U remindme >/dev/null 2>&1; then
+        if podman exec "$1" pg_isready -U "$2" >/dev/null 2>&1; then
             return 0
         fi
         sleep 1
     done
-    die "Postgres did not become ready within 60s"
+    die "Postgres in $1 did not become ready within 60s"
 }
 
 version_from_health() {
@@ -175,74 +168,30 @@ ensure_linger() {
 }
 
 ensure_env_files() {
-    run mkdir -p "$QUADLET_DIR"
-
-    if [[ "$BACKEND" != postgres ]]; then
-        run mkdir -p "$DATA_DIR/data"
-        if [ -f "$DATA_DIR/hub.env" ]; then
-            log "Keeping existing $DATA_DIR/hub.env"
-        else
-            # The engine keeps its tables in a directory inside the volume;
-            # SQLite keeps one file there.
-            local store_line="REMIND_ME_HUB_DATA_DIR=/data/hub"
-            [[ "$BACKEND" == sqlite ]] && store_line="REMIND_ME_HUB_DB_PATH=/data/hub.db"
-            log "Generating $DATA_DIR/hub.env ($BACKEND backend)"
-            if ! (( DRY_RUN )); then
-                cat > "$DATA_DIR/hub.env" <<EOF
-$store_line
-SYNC_SECRET=$(rand_hex 32)
-EOF
-                chmod 600 "$DATA_DIR/hub.env"
-            fi
-        fi
-        return
-    fi
-
-    run mkdir -p "$DATA_DIR/postgres-data"
-
-    local pgpw
-    if [ -f "$DATA_DIR/postgres.env" ]; then
-        pgpw=$(env_value "$DATA_DIR/postgres.env" POSTGRES_PASSWORD)
-        log "Keeping existing $DATA_DIR/postgres.env"
-    else
-        pgpw=$(rand_hex 24)
-        log "Generating $DATA_DIR/postgres.env"
-        if ! (( DRY_RUN )); then
-            cat > "$DATA_DIR/postgres.env" <<EOF
-POSTGRES_USER=remindme
-POSTGRES_PASSWORD=$pgpw
-POSTGRES_DB=remindme
-EOF
-            chmod 600 "$DATA_DIR/postgres.env"
-        fi
-    fi
-
+    run mkdir -p "$QUADLET_DIR" "$DATA_DIR/data"
     if [ -f "$DATA_DIR/hub.env" ]; then
         log "Keeping existing $DATA_DIR/hub.env"
-    else
-        log "Generating $DATA_DIR/hub.env"
-        if ! (( DRY_RUN )); then
-            cat > "$DATA_DIR/hub.env" <<EOF
-DATABASE_URL=postgresql://remindme:$pgpw@remind-me-postgres:5432/remindme
+        return
+    fi
+    log "Generating $DATA_DIR/hub.env"
+    if ! (( DRY_RUN )); then
+        cat > "$DATA_DIR/hub.env" <<EOF
+REMIND_ME_HUB_DATA_DIR=$ENGINE_DIR
 SYNC_SECRET=$(rand_hex 32)
 EOF
-            chmod 600 "$DATA_DIR/hub.env"
-        fi
+        chmod 600 "$DATA_DIR/hub.env"
     fi
 }
 
 install_quadlets() {
-    log "Installing Quadlet units to $QUADLET_DIR"
-    if [[ "$BACKEND" != postgres ]]; then
-        # Installed under the same unit name as the Postgres variant, so
-        # `systemctl --user start remind-me-hub` is the same command either way.
-        run cp "$HUB_DIR/deploy/remind-me-hub-standalone.container" \
-               "$QUADLET_DIR/remind-me-hub.container"
-    else
-        run cp "$HUB_DIR/deploy/remind-me.network" \
-               "$HUB_DIR/deploy/remind-me-postgres.container" \
-               "$HUB_DIR/deploy/remind-me-hub.container" \
-               "$QUADLET_DIR/"
+    local unit="$QUADLET_DIR/remind-me-hub.container" publish=""
+    # An installed unit's address is the operator's, edited for this host; a
+    # reinstall or a migrate keeps it rather than reverting to the template's.
+    [ -f "$unit" ] && publish=$(sed -n 's/^PublishPort=//p' "$unit" | head -n 1)
+    log "Installing the Quadlet unit to $QUADLET_DIR"
+    run cp "$HUB_DIR/deploy/remind-me-hub.container" "$unit"
+    if [[ -n "$publish" ]]; then
+        run sed -i "s|^PublishPort=.*|PublishPort=$publish|" "$unit"
     fi
     run systemctl --user daemon-reload
 }
@@ -278,20 +227,36 @@ build_image() {
 }
 
 start_services() {
-    if [[ "$BACKEND" != postgres ]]; then
-        log "Starting the hub"
-        run systemctl --user start remind-me-hub.service
-    else
-        log "Starting Postgres"
-        run systemctl --user start remind-me-postgres.service
-        (( DRY_RUN )) || wait_for_postgres
-        log "Starting the hub"
-        run systemctl --user start remind-me-hub.service
-    fi
+    log "Starting the hub"
+    run systemctl --user start remind-me-hub.service
     (( DRY_RUN )) || wait_for_hub || warn "the hub did not answer $HEALTH_URL within 60s; check: journalctl --user -u remind-me-hub -n 50"
 }
 
+# Run the copy tool in the hub image, writing to $DATA_DIR/data. Extra
+# arguments go to `podman run` before the image (a network, an env file).
+# Returns the tool's status; it has already printed what went wrong.
+copy_into_engine() {  # copy_into_engine <target> <podman run args...> -- <copy args...>
+    local target="$1"; shift
+    local podman_args=()
+    while (( $# )) && [[ "$1" != -- ]]; do podman_args+=("$1"); shift; done
+    shift
+    local extra=()
+    (( DROP_INVALID )) && extra+=(--drop-invalid)
+    # The `+` forms keep an empty array from tripping `set -u` on bash < 4.4.
+    run podman run --rm ${podman_args[@]+"${podman_args[@]}"} \
+        -v "$DATA_DIR/data:/data:Z,U" \
+        remind-me-hub:latest \
+        rusty-remind-me-hub-copy "$@" --to "$target" ${extra[@]+"${extra[@]}"}
+}
+
+# Move an engine directory inside the data volume. The volume is owned by
+# the container's user, which the host user reaches through `podman unshare`.
+move_in_data() {  # move_in_data <from> <to>, container paths under /data
+    run podman unshare mv "$DATA_DIR/data/${1#/data/}" "$DATA_DIR/data/${2#/data/}"
+}
+
 cmd_install() {
+    require_engine
     check_prereqs
     ensure_linger
     ensure_env_files
@@ -309,7 +274,7 @@ cmd_install() {
     log "Hub is up: $(curl -fsS "$HEALTH_URL")"
     cat <<EOF
 
-Server setup complete ($BACKEND backend).
+Server setup complete.
 
 Sync secret (clients need this as REMIND_ME_SYNC_SECRET):
   $secret
@@ -317,55 +282,135 @@ Sync secret (clients need this as REMIND_ME_SYNC_SECRET):
 Next steps:
   - configure a client:  run crates/remind_me_hub/client-setup.sh on each client
   - check anytime:       $0 status
+  - load a Postgres dump: $0 restore /path/to/postgres-backup.sql
 EOF
+}
+
+cmd_migrate() {
+    [[ "$BACKEND" != engine ]] || die "nothing to migrate: this hub already uses the embedded engine"
+    [[ -n "$BACKEND" ]] || die "nothing to migrate: there is no hub.env in $DATA_DIR"
+    check_prereqs
+    local from=()
     if [[ "$BACKEND" == postgres ]]; then
-        printf '  - restore a backup:    %s restore /path/to/postgres-backup.sql\n' "$0"
+        podman container exists remind-me-postgres \
+            || die "remind-me-postgres is not running; start it (systemctl --user start remind-me-postgres) so its data can be read"
+        # --env-file hands the copy DATABASE_URL without putting its password
+        # on a command line.
+        from=(--network remind-me --env-file "$DATA_DIR/hub.env" -- --from-postgres)
+    else
+        from=(-- --from-sqlite "$(env_value "$DATA_DIR/hub.env" REMIND_ME_HUB_DB_PATH)")
+    fi
+    [[ ! -e "$DATA_DIR/data/hub" ]] \
+        || die "$DATA_DIR/data/hub already exists; move it aside so the copy lands in an empty directory"
+
+    run mkdir -p "$DATA_DIR/data"
+    build_image
+    # Rows the engine cannot store stop the copy. Finding them while the hub
+    # still serves keeps them from costing any downtime. (--drop-invalid
+    # copies past them, so there is nothing to check first.)
+    if ! (( DROP_INVALID )); then
+        log "Checking that every row can be copied, while the hub still runs"
+        copy_into_engine "$ENGINE_DIR" "${from[@]}" --check \
+            || die "some rows cannot be copied (listed above); nothing was stopped or written. Re-run with --drop-invalid to copy everything else."
+    fi
+    log "Stopping the hub so nothing writes during the copy"
+    run systemctl --user stop remind-me-hub.service || true
+    log "Copying the $BACKEND store onto the engine"
+    copy_into_engine "$ENGINE_DIR" "${from[@]}" \
+        || die "the copy failed and wrote nothing (see above). The hub is stopped and its $BACKEND store is untouched; fix the cause and re-run '$0 migrate'."
+
+    log "Pointing hub.env at the engine (the old one is kept as hub.env.pre-engine)"
+    if ! (( DRY_RUN )); then
+        cp -p "$DATA_DIR/hub.env" "$DATA_DIR/hub.env.pre-engine"
+        {
+            printf 'REMIND_ME_HUB_DATA_DIR=%s\n' "$ENGINE_DIR"
+            grep -v -E '^(DATABASE_URL|REMIND_ME_HUB_DB_PATH|REMIND_ME_HUB_STATEMENT_TIMEOUT_MS)=' \
+                "$DATA_DIR/hub.env.pre-engine" || true
+        } > "$DATA_DIR/hub.env.new"
+        chmod 600 "$DATA_DIR/hub.env.new"
+        mv "$DATA_DIR/hub.env.new" "$DATA_DIR/hub.env"
+    fi
+
+    install_quadlets
+    start_services
+    (( DRY_RUN )) && { log "Dry run complete — no changes made"; return; }
+
+    log "Migrated. $(curl -fsS "$HEALTH_URL")"
+    if [[ "$BACKEND" == postgres ]]; then
+        cat <<EOF
+
+The Postgres container and its data are untouched. Once the hub looks right
+('$0 status'), remove them:
+  systemctl --user stop remind-me-postgres.service
+  rm $QUADLET_DIR/remind-me-postgres.container $QUADLET_DIR/remind-me.network
+  systemctl --user daemon-reload
+  # and, when you no longer want it: $DATA_DIR/postgres-data, postgres.env
+EOF
+    else
+        printf '\nThe SQLite file is untouched. Once the hub looks right (%s status), delete it from %s/data.\n' "$0" "$DATA_DIR"
     fi
 }
 
+# Load a Postgres dump (a Python hub's, say) into this hub. The hub no
+# longer runs Postgres, so the dump goes into a throwaway Postgres container
+# the copy tool reads from, which is removed afterwards.
 cmd_restore() {
     local dump="${1:-}"
-    [[ -n "$dump" ]] || die "usage: $0 restore <dump.sql> [--force]"
+    [[ -n "$dump" ]] || die "usage: $0 restore <dump.sql> [--force] [--drop-invalid]"
     [[ -f "$dump" ]] || die "no such file: $dump"
-    [[ "$BACKEND" == postgres ]] \
-        || die "restore is Postgres-only; this hub uses the $BACKEND backend, which has no dump format in common with it"
-
-    podman container exists remind-me-postgres \
-        || die "remind-me-postgres is not running; run '$0 install' first"
-    wait_for_postgres
+    require_engine
+    [[ "$BACKEND" == engine ]] || die "no hub here yet; run '$0 install' first"
+    check_prereqs
 
     local existing
-    existing=$(psql_in remindme -At -c \
-        "SELECT COUNT(*) FROM memories" 2>/dev/null || echo 0)
-    if [[ "$existing" != "0" ]] && (( ! FORCE )); then
-        die "database already holds $existing memories; re-run with --force to drop it"
+    existing=$(curl -fsS -H "Authorization: Bearer $(env_value "$DATA_DIR/hub.env" SYNC_SECRET)" \
+        "http://$(_hub_publish_host):8765/count?table=memories" 2>/dev/null \
+        | sed -n 's/.*"total"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p')
+    if [[ "${existing:-0}" != "0" ]] && (( ! FORCE )); then
+        die "the hub already holds $existing memories; re-run with --force to replace them (they are kept aside, not deleted)"
     fi
 
-    log "Stopping the hub so nothing writes during the restore"
+    local pg=remind-me-restore-pg net=remind-me-restore password
+    password=$(rand_hex 24)
+    # shellcheck disable=SC2064 # expand now: the names are fixed for this run.
+    trap "podman rm -f $pg >/dev/null 2>&1; podman network rm $net >/dev/null 2>&1" EXIT
+    log "Starting a throwaway Postgres to load $dump into"
+    podman network exists "$net" || podman network create "$net" >/dev/null
+    podman run -d --rm --name "$pg" --network "$net" \
+        -e POSTGRES_USER=remindme -e POSTGRES_PASSWORD="$password" -e POSTGRES_DB=remindme \
+        docker.io/library/postgres:16-alpine >/dev/null
+    wait_for_postgres "$pg" remindme
+    podman exec -i "$pg" psql -q -U remindme -d remindme < "$dump" >/dev/null
+
+    log "Copying the dump onto the engine"
+    local env_file="$DATA_DIR/restore.env"
+    (umask 077; printf 'DATABASE_URL=postgresql://remindme:%s@%s:5432/remindme\n' "$password" "$pg" > "$env_file")
+    copy_into_engine /data/hub.restored --network "$net" --env-file "$env_file" -- --from-postgres \
+        || { rm -f "$env_file"; die "the copy failed and wrote nothing (see above); the hub was not touched. Rows the engine cannot store are listed there; re-run with --drop-invalid to copy everything else."; }
+    rm -f "$env_file"
+
+    log "Stopping the hub to swap the restored data in"
     systemctl --user stop remind-me-hub.service || true
-
-    log "Recreating the database"
-    psql_in postgres -c "DROP DATABASE IF EXISTS remindme" >/dev/null
-    psql_in postgres -c "CREATE DATABASE remindme OWNER remindme" >/dev/null
-
-    log "Restoring $dump"
-    podman exec -i remind-me-postgres psql -U remindme -d remindme < "$dump" >/dev/null
-
-    # The hub migrates a legacy dump in place on startup: TIMESTAMPTZ columns
-    # become canonical TEXT, missing columns are added, hub_seq is backfilled.
-    log "Starting the hub (it will migrate the restored schema on startup)"
+    local aside=""
+    if podman unshare test -e "$DATA_DIR/data/hub"; then
+        aside="/data/hub.replaced-$(date +%Y%m%d%H%M%S)"
+        move_in_data "$ENGINE_DIR" "$aside"
+    fi
+    move_in_data /data/hub.restored "$ENGINE_DIR"
     systemctl --user start remind-me-hub.service
     wait_for_hub || die "the hub did not come back up; check: journalctl --user -u remind-me-hub -n 50"
     log "Restored. $(curl -fsS "$HEALTH_URL")"
+    if [[ -n "$aside" ]]; then
+        printf 'The data it replaced is in %s/data/%s.\n' "$DATA_DIR" "${aside#/data/}"
+    fi
 }
 
 cmd_status() {
-    local units=(remind-me-hub.service)
-    [[ "$BACKEND" == postgres ]] && units=(remind-me-postgres.service remind-me-hub.service)
-    local unit
-    for unit in "${units[@]}"; do
-        printf '%-32s %s\n' "$unit" "$(systemctl --user is-active "$unit" 2>/dev/null || echo inactive)"
-    done
+    if [[ "$BACKEND" == postgres || "$BACKEND" == sqlite ]]; then
+        warn "this hub still stores its data in $BACKEND; run '$0 migrate' before updating it"
+    fi
+    printf '%-32s %s\n' remind-me-hub.service \
+        "$(systemctl --user is-active remind-me-hub.service 2>/dev/null || echo inactive)"
 
     local health
     if health=$(curl -fsS "$HEALTH_URL" 2>/dev/null); then
@@ -385,6 +430,7 @@ cmd_status() {
 }
 
 cmd_update() {
+    require_engine
     local before after
     before=$(version_from_health || true)
 
@@ -417,11 +463,11 @@ main() {
         case "$1" in
             --force)   FORCE=1 ;;
             --dry-run) DRY_RUN=1 ;;
+            --drop-invalid) DROP_INVALID=1 ;;
             --postgres|--sqlite)
-                [[ -z "$REQUESTED" ]] || die "choose one backend flag"
-                REQUESTED="${1#--}" ;;
-            -h|--help) sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-            install|restore|status|update)
+                die "$1 is gone: the hub stores its data only in the embedded engine. To move an existing hub onto it, run '$0 migrate'." ;;
+            -h|--help) sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+            install|migrate|restore|status|update)
                 cmd="$1" ;;
             *)  args+=("$1") ;;
         esac
@@ -433,6 +479,7 @@ main() {
 
     case "${cmd:-install}" in
         install) cmd_install ;;
+        migrate) cmd_migrate ;;
         restore) cmd_restore "${args[@]:-}" ;;
         status)  cmd_status ;;
         update)  cmd_update ;;

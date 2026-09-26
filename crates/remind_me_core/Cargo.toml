@@ -51,8 +51,8 @@ symphonia = { version = "0.6", optional = true, default-features = false, featur
 ] }
 
 [dev-dependencies]
-# The real remind_me_hub binary's library, SQLite-only (no `postgres-store`:
-# tests need an in-memory store, not a Postgres connection) -- used by
+# The real remind_me_hub binary's library, without the copy tool's Postgres
+# reader (tests need no Postgres connection) -- used by
 # `tests/support`'s `MockHub` to run actual remind_me_hub request handling
 # against this crate's sync client, not just another copy of this crate's
 # own peer server (which `tests/support`'s `MockNode` already covers).

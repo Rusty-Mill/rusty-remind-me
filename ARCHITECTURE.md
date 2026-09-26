@@ -37,7 +37,7 @@ graph TD
     REMOTE --> CORE
     HUB[remind_me_hub binary: rusty-remind-me-hub]
     CORE --> RUSQLITE[rusqlite / SQLite]
-    HUB -.->|optional postgres-store feature| POSTGRES[Postgres]
+    HUB --> ENGINE[rusty_multimodal_db engine, in-process]
 ```
 
 `remind_me_hub` is its own binary (`rusty-remind-me-hub`), not reached
@@ -46,7 +46,8 @@ through the `remind_me_cli` dispatch and not a build dependency of
 and pull from over HTTP, sharing a wire protocol with `remind_me_core::sync`
 rather than a crate dependency. The one Cargo edge between them runs the
 other direction and only in tests: `remind_me_core`'s `dev-dependencies` path
-to `remind_me_hub` (SQLite-only, `default-features = false`) lets
+to `remind_me_hub` (without the copy tool's Postgres reader,
+`default-features = false`) lets
 `tests/support`'s `MockHub` exercise real `remind_me_hub` request handling
 without a spawned process.
 
@@ -98,7 +99,7 @@ without a spawned process.
 - **`remind_me_remote`**: The Streamable HTTP MCP connector, on `tokio` + `axum` + `rmcp` (the one place this workspace takes on that async stack — every other crate stays synchronous, a deliberate boundary; see `crates/remind_me_remote/src/lib.rs`'s module doc):
   - Secret-path/bearer auth (FT-05) and, when an issuer is configured, a hand-rolled OAuth 2.1 authorization server (FT-07, `docs/adr/0011`).
   - `RemindMeHandler` adapts `remind_me_mcp::McpServer::handle_request` (synchronous) to `rmcp`'s async `ServerHandler` trait via `spawn_blocking`, rather than reimplementing tool/resource/prompt dispatch.
-- **`remind_me_hub`**: The central multi-node sync server (`rusty-remind-me-hub` binary) speaking the same push/pull peer protocol `remind_me_core::sync` serves node-to-node, over a pluggable storage trait backed by SQLite or Postgres (`docs/adr/0015`). A hub never pulls; nodes push to and pull from it.
+- **`remind_me_hub`**: The central multi-node sync server (`rusty-remind-me-hub` binary) speaking the same push/pull peer protocol `remind_me_core::sync` serves node-to-node, storing its data in the embedded `rusty_multimodal_db` engine (`docs/adr/0021`); its Postgres and SQLite stores (`docs/adr/0015`) are retired, and `rusty-remind-me-hub-copy` moves an old hub onto the engine. A hub never pulls; nodes push to and pull from it.
 
 ---
 

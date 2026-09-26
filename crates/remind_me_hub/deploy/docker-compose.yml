@@ -1,24 +1,19 @@
-# docker-compose.yml — Remind Me sync hub (Postgres + hub API).
+# docker-compose.yml — Remind Me sync hub on the embedded engine.
 #
-# Reuses the exact same image (../Containerfile) and DATABASE_URL/SYNC_SECRET
-# env contract as the Podman Quadlet setup (remind-me-hub.container /
-# remind-me-postgres.container) — this is an alternative to the quadlets for
-# environments that prefer docker-compose, not a different hub.
+# One container, a data directory, no database server (docs/adr/0021). The
+# hub keeps every record in memory and logs each write to the volume before
+# answering. The same image and hub.env contract as the Podman Quadlet
+# (remind-me-hub.container), for environments that prefer Compose.
 #
-# For a hub with no database server at all, see docker-compose.engine.yml
-# (the recommended default for a new hub) or docker-compose.sqlite.yml.
+# Taking over an existing hub, or moving this file's deployment off the
+# Postgres it used to run? Copy the data onto the engine first with
+# rusty-remind-me-hub-copy, which ships in this image (see the crate README's
+# "Moving a hub onto the engine"); pointing this file at an empty volume
+# starts an empty hub.
 #
 # Quick start (from this directory):
 #   cp hub.env.example hub.env
-#   cp postgres.env.example postgres.env
-#   # Edit both files with real secrets:
-#   #   openssl rand -hex 24   -> POSTGRES_PASSWORD (postgres.env)
-#   #   openssl rand -hex 32   -> SYNC_SECRET        (hub.env)
-#   # The password must be identical in both files (hub.env's DATABASE_URL
-#   # embeds it). hub.env.example's DATABASE_URL host (remind-me-postgres) is
-#   # already correct here — the postgres service below is deliberately named
-#   # to match, so the same env files work unedited for both the quadlet and
-#   # compose deploy paths.
+#   # openssl rand -hex 32   -> SYNC_SECRET (hub.env)
 #   docker compose up -d
 #   curl http://127.0.0.1:8765/health
 #
@@ -29,41 +24,33 @@
 # understand and accept that exposure.
 
 services:
-  remind-me-postgres:
-    image: docker.io/library/postgres:16-alpine
-    restart: always
-    env_file: postgres.env
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
-    healthcheck:
-      # $$POSTGRES_USER (double-dollar) is deliberate: env_file: values are
-      # only injected into the container's own runtime environment, never
-      # into Compose's own ${...} interpolation (that only reads the shell
-      # env / a top-level .env file) -- a single-dollar ${POSTGRES_USER}
-      # here would silently always resolve to nothing at Compose parse
-      # time, before postgres.env is ever read. Escaping it lets the
-      # literal $POSTGRES_USER reach the container's own shell, which DOES
-      # have it (via env_file: postgres.env below).
-      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-
   remind-me-hub:
     build:
       # The monorepo root, six levels up: the hub is one crate in a Cargo
       # workspace, so the build needs the workspace Cargo.toml and Cargo.lock.
-      # The Python hub's context was its own directory because it copied a
-      # single file; this one cannot be.
       context: ../../../../../..
       dockerfile: crates/apps/rusty_remind_me/crates/remind_me_hub/Containerfile
     restart: always
     env_file: hub.env
-    depends_on:
-      remind-me-postgres:
-        condition: service_healthy
+    volumes:
+      # The image runs as uid 10001 (user `hub`), so a named volume is used
+      # rather than a bind mount: Docker initialises a named volume with the
+      # image path's ownership, whereas a host bind mount arrives owned by the
+      # host user and leaves the hub unable to create its data. If you do
+      # bind-mount a host directory, `chown 10001:10001` it first.
+      - hub-data:/data
     ports:
       - "127.0.0.1:8765:8765"
+    healthcheck:
+      # The binary is the only thing in the image — no curl, no wget — so the
+      # check is the hub asking itself. `/health` answers unauthenticated by
+      # design, which is what makes this possible without baking the secret
+      # into the healthcheck.
+      test: ["CMD", "rusty-remind-me-hub", "--health-check"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
 volumes:
-  postgres-data:
+  hub-data:

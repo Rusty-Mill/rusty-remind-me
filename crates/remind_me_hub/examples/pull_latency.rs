@@ -1,24 +1,23 @@
-//! Pull latency under push load, SQLite against the embedded engine: the
-//! measurement ADR-0021 requires before the default backend switches.
+//! Pull latency under push load on the engine store: the measurement
+//! ADR-0021 records for each change to the push path.
 //!
 //! ```sh
-//! cargo run --release -p remind_me_hub --features multimodal-store \
+//! cargo run --release -p remind_me_hub \
 //!     --example pull_latency -- [PRELOAD] [SECONDS] [PUSHERS] [PULLERS] [BATCH]
 //! ```
 //!
-//! Each backend gets a fresh on-disk hub preloaded with `PRELOAD` memories
+//! A fresh on-disk hub is preloaded with `PRELOAD` memories
 //! (default 20000). Then `PUSHERS` threads (default 4) apply `BATCH`
 //! memories at a time (default 1), as one `/sync/push` of that many
 //! records does, while `PULLERS` threads (default 2)
 //! page `since_seq` pulls of 500 from random cursors, for `SECONDS`
 //! (default 10). It reports push throughput and pull latency percentiles.
 //!
-//! Numbers depend on the disk's `fsync` more than anything: every engine
-//! write, and every SQLite commit, waits for one.
+//! Numbers depend on the disk's `fsync` more than anything: every chunk of
+//! a push waits for one.
 
 use remind_me_hub::record::{self, Record};
 use remind_me_hub::store::multimodal::MultimodalHubStore;
-use remind_me_hub::store::sqlite::SqliteStore;
 use remind_me_hub::store::{HubStore, PullCursor, PullQuery, MAX_PULL_LIMIT};
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -167,13 +166,6 @@ fn main() {
         "preload {} memories; {} pushers of {}-record batches and {} pullers (since_seq, limit {MAX_PULL_LIMIT}) for {:?}",
         s.preload, s.pushers, s.batch, s.pullers, s.duration
     );
-
-    let dir = scratch("sqlite");
-    let lite =
-        SqliteStore::open(dir.join("hub.db").to_str().expect("a UTF-8 path")).expect("open SQLite");
-    lite.migrate().expect("migrate");
-    run("sqlite", Arc::new(lite), &s);
-    remove(&dir);
 
     let dir = scratch("engine");
     let engine = MultimodalHubStore::open(&dir.join("data")).expect("open the engine store");

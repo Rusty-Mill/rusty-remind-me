@@ -146,13 +146,13 @@ REMIND_ME_SYNC_SECRET=<printed secret> rusty-remind-me configure \
     --node-id my-laptop --hub-url http://<hub-host>:8765
 ```
 
-That runs the hub on its embedded storage engine. `--postgres` instead brings
-up Postgres in a second rootless Podman container, `--sqlite` keeps the hub in
-one SQLite file, and `crates/remind_me_hub/client-setup.sh
+That runs the hub on its embedded storage engine. A hub still on the
+Postgres or SQLite store it used to offer moves over with
+`crates/remind_me_hub/setup.sh migrate`, and `crates/remind_me_hub/client-setup.sh
 --node-id my-laptop --tunnel me@hub-host` automates the SSH-tunnel case.
 Docker Compose, Fly.io, and Railway deployments are under
 `crates/remind_me_hub/deploy/`. See [`crates/remind_me_hub/README.md`](crates/remind_me_hub/README.md)
-for the full reference (routes, security posture, backends) and [Multi-Node
+for the full reference (routes, security posture, the store) and [Multi-Node
 Sync, Hub & Remote Connector](#multi-node-sync-hub--remote-connector) below
 for every client-side environment variable this `configure` call sets.
 

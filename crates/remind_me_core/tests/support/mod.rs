@@ -30,7 +30,7 @@
 //!   `graph_sync_test.rs`, and inline in `peer_discovery_test.rs`); shared
 //!   here instead.
 //! - [`MockHub`]: a real `remind_me_hub` instance (the actual central-hub
-//!   crate, SQLite-backed, no `postgres-store`). `MockNode` can never prove
+//!   crate, on its embedded engine store in a scratch directory). `MockNode` can never prove
 //!   this crate's sync client is compatible with the real hub binary --
 //!   only with another copy of itself. `remind_me_hub`'s own module doc
 //!   states the two are meant to be indistinguishable protocol-wise ("a
@@ -52,7 +52,7 @@ use remind_me_core::Database;
 use remind_me_hub::http::{
     read_body, read_head, write_response, HeadOutcome, Response as HubResponse,
 };
-use remind_me_hub::store::sqlite::SqliteStore;
+use remind_me_hub::store::multimodal::MultimodalHubStore;
 use remind_me_hub::store::HubStore;
 use remind_me_hub::{dispatch, Config as HubConfig};
 
@@ -142,8 +142,33 @@ impl MockNode {
 /// `remind_me_hub::dispatch`) `main.rs` does, in the same order.
 pub struct MockHub {
     pub url: String,
-    pub store: Arc<SqliteStore>,
+    pub store: Arc<MultimodalHubStore>,
     _accept: AcceptLoop,
+    // Declared last so it drops last: the directory goes once the accept
+    // loop has stopped and the store is closed.
+    _dir: ScratchDir,
+}
+
+/// A hub data directory under the system temp dir, removed on drop.
+struct ScratchDir(std::path::PathBuf);
+
+impl ScratchDir {
+    fn new() -> Self {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "remind_me_core_mock_hub_{}_{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        Self(dir)
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 impl MockHub {
@@ -151,8 +176,8 @@ impl MockHub {
     /// metrics off and the default 90-day tombstone retention (neither is
     /// under test here).
     pub fn start(secret: &str) -> Self {
-        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
-        store.migrate().unwrap();
+        let dir = ScratchDir::new();
+        let store = Arc::new(MultimodalHubStore::open(&dir.0).unwrap());
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let config = Arc::new(HubConfig {
@@ -168,6 +193,7 @@ impl MockHub {
             url: format!("http://127.0.0.1:{port}"),
             store,
             _accept: accept,
+            _dir: dir,
         }
     }
 }

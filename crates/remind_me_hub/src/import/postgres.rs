@@ -1,15 +1,14 @@
 //! Read a Postgres hub (`DATABASE_URL`) without writing to it, including a
 //! legacy database the Python hub left behind.
 //!
-//! Behind the `postgres-import` feature, apart from the Postgres store, so
-//! it can outlive that store once the old backends are removed (ADR-0021,
-//! decision 6): a hub that migrates late is not stranded.
+//! Behind the `postgres-import` feature. It outlived the Postgres store
+//! (ADR-0021, decision 6), so a hub that migrates late is not stranded.
 //!
 //! Each row is read as `to_jsonb(row)`, whatever the schema. That needs no
 //! knowledge of which columns exist, and renders a legacy `TIMESTAMPTZ` as
 //! ISO-8601 text with its offset, which `record::parse` canonicalises like
-//! any pushed timestamp. The Postgres store's own `migrate` converts such a
-//! column in place; this reads it without touching it.
+//! any pushed timestamp. The retired Postgres store's `migrate` converted
+//! such a column in place; this reads it without touching it.
 
 use super::RawTables;
 use crate::store::multimodal::snapshot::Snapshot;

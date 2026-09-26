@@ -17,8 +17,9 @@
 # ---------------------------------------------------------------------------
 FROM docker.io/library/rust:1-slim-bookworm AS build
 
-# `rusqlite`'s bundled SQLite compiles C. The runtime stage below needs none of
-# this, which is the point of splitting them.
+# `rusqlite`'s bundled SQLite (the copy tool reads old SQLite hubs) compiles C.
+# The runtime stage below needs none of this, which is the point of splitting
+# them.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends pkg-config libssl-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -43,8 +44,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # Runtime
 # ---------------------------------------------------------------------------
 # No Rust toolchain, no C compiler, no package manager for an attacker to
-# reach. The binary statically links SQLite; `ca-certificates` is here for
-# TLS to a managed Postgres, which several of the deploy templates use.
+# reach. The copy tool statically links SQLite; `ca-certificates` is here for
+# its TLS to a managed Postgres being copied onto the engine.
 FROM docker.io/library/debian:bookworm-slim
 
 RUN apt-get update \
@@ -59,21 +60,22 @@ RUN apt-get update \
 ARG HUB_VERSION=unknown
 
 # Non-root. The reference's image runs as root because the Python base image
-# does; there is no reason to inherit that here, and a hub with a local store
-# (the engine or SQLite) writes to a volume that should not be root-owned.
+# does; there is no reason to inherit that here, and the engine writes to a
+# volume that should not be root-owned.
 RUN useradd --system --create-home --uid 10001 hub \
     && mkdir /data && chown hub:hub /data
 # /data exists, owned by `hub`, so a named volume mounted there (the compose
-# files) starts out writable: Docker copies an image path's ownership into a
+# file) starts out writable: Docker copies an image path's ownership into a
 # new named volume only when the path exists in the image. Without it the
 # volume is root-owned and the hub cannot create its store. (Podman Quadlets
 # bind-mount with `:U` instead, which chowns the host directory.)
 USER hub
 WORKDIR /home/hub
 
-# The copy tool ships in the image so a container deployment can move its
-# SQLite or Postgres data onto the engine without a Rust toolchain
-# (docs/adr/0021; the crate README's "Moving a hub onto the engine").
+# The copy tool ships in the image so a container deployment can move an old
+# SQLite or Postgres hub onto the engine without a Rust toolchain
+# (docs/adr/0021; `setup.sh migrate`; the crate README's "Moving a hub onto
+# the engine").
 COPY --from=build /out/rusty-remind-me-hub /out/rusty-remind-me-hub-copy /usr/local/bin/
 
 # The running hub reports its version over HTTP, which is no help when the

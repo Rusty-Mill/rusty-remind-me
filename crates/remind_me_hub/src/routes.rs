@@ -1,13 +1,12 @@
-//! The ten routes, written against [`HubStore`] rather than any backend.
+//! The ten routes, written against [`HubStore`].
 //!
 //! Every handler here is a pure function of a request and a store, which is
-//! what lets the whole surface be tested against SQLite in-process while the
-//! Postgres backend satisfies the same trait.
+//! what lets the whole surface be tested in-process against the engine.
 //!
 //! # Auth posture, which is not uniform and should not be
 //!
 //! `/health` is deliberately unauthenticated: it is what a deploy healthcheck
-//! polls, and it must keep answering when the database is down. Everything
+//! polls, and it must keep answering when the store is down. Everything
 //! else is bearer-gated, including `/metrics` — the reference argues that one
 //! out explicitly, and the argument is that anyone scraping the hub is already
 //! the operator who provisioned the secret, so the credential is in hand

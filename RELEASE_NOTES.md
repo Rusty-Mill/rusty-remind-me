@@ -2,6 +2,55 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-26 — The hub's Postgres and SQLite stores are removed
+
+### Breaking
+- **The hub stores its data only in the embedded engine** (ADR-0021, phase 3). A hub configured with `DATABASE_URL` or `REMIND_ME_HUB_DB_PATH` now refuses to start, even beside `REMIND_ME_HUB_DATA_DIR`. It prints the copy that moves its store over, so it never comes up empty in front of data that was not copied.
+  - This lands in the same release as the engine default, not one later as ADR-0021 first planned. The ADR's decision 6 is amended.
+- **Moving an existing hub over:**
+  - A `setup.sh` hub: run `setup.sh migrate`. It builds the new image, checks every row can be copied while the hub still runs, stops the hub, copies the store with every `hub_seq` kept, rewrites `hub.env` (keeping the old one as `hub.env.pre-engine`), installs the one-container unit, and starts the hub. The old Postgres container or SQLite file is left for you to remove. `--drop-invalid` copies past rows the engine cannot store.
+  - Anything else: run `rusty-remind-me-hub-copy`, then replace the old variable with `REMIND_ME_HUB_DATA_DIR`. The crate README has the steps; `deploy/fly.toml` has Fly's.
+- **`setup.sh`:** `--postgres` and `--sqlite` are gone. `install` and `update` refuse a hub still on a retired store and point at `migrate`. `restore <dump.sql>` now loads the dump into a throwaway Postgres container and copies it onto the engine; a hub that already holds memories needs `--force`, and the data it replaces is moved aside, not deleted.
+- **Deploy templates are engine-only.**
+  - Removed: the Postgres Quadlet units and network, the Postgres and SQLite Compose files, and the Postgres and SQLite env examples.
+  - Renamed to the plain names: `remind-me-hub.container` (was `remind-me-hub-standalone.container`), `docker-compose.yml` (was `docker-compose.engine.yml`), `hub.env.example` (was `hub-engine.env.example`).
+  - `fly.toml` mounts a Fly Volume instead of attaching Fly Postgres. Railway takes a volume and two variables, set in its dashboard (`deploy/README.md`).
+- **Cargo features:** `postgres-store` and `multimodal-store` are gone; the engine is always built. `postgres-import`, on by default, is the only feature left and gates the copy tool's Postgres reader.
+- **`HubStore::migrate` is gone.** The engine has nothing to migrate, so the hub's 120-second startup wait for a database went with it. `REMIND_ME_HUB_STATEMENT_TIMEOUT_MS` no longer does anything.
+
+### Unchanged
+- The wire protocol. Nodes need no change.
+- `rusty-remind-me-hub-copy` reads both old stores in this release and later ones, so a hub that migrates late is not stranded.
+
+### Tests
+- Before the stores went, their answers and databases were recorded (`remind_me_hub/tests/fixtures`, from `main` at `72299199d`). They replace the differential test:
+  - the engine must give the SQLite store's answer to every read of the shared script, before and after a tombstone compaction and after a reopen;
+  - the copy tests rebuild SQLite and Postgres hubs from those stores' own dumps, gap-ridden `hub_seq`s and the Python hub's legacy schema included, and hold each copy to the store's recorded answers.
+- Breaking the engine's "a win keeps the first `created_at`" rule fails the recorded check.
+- The concurrent `since_seq` puller test moved from the Postgres suite to the engine, which had no equivalent.
+- The route suite now forwards `apply_records`, so it exercises the engine's batched push path rather than the one-by-one default.
+- The node's `MockHub` (`remind_me_core/tests/support`) runs on the engine.
+- New `hub_startup_test.rs` runs the binary: `DATABASE_URL` or `REMIND_ME_HUB_DB_PATH` refuses start and names the copy, even beside a data directory, and creates nothing.
+
+### Provenance
+
+The image was built with Docker 29 from the monorepo root and run end to end. A SQLite hub rebuilt from the recorded dump was:
+- refused by the hub (`REMIND_ME_HUB_DB_PATH` set);
+- copied by the tool inside the image (7 memories, highest `hub_seq` 8);
+- served from the engine: `--health-check` passed, `/count` matched, and the next push got `hub_seq` 9.
+
+`setup.sh` was run against stubbed Podman, systemd and curl:
+- a fresh install gets the engine;
+- `--postgres` and `--sqlite` are refused, pointing at `migrate`;
+- `install` and `update` refuse a Postgres `hub.env`, and `status` warns;
+- `migrate` stops nothing when the pre-copy check finds rows it cannot copy;
+- `migrate` of a Postgres hub rewrites `hub.env` (both files kept at mode 600) and keeps the installed unit's `PublishPort`;
+- `migrate --drop-invalid` of a SQLite hub skips the check;
+- `migrate` of an engine hub is refused;
+- `restore` loads through a throwaway container and swaps the copy in.
+
+`docker compose config` resolves the Compose file's build context to the monorepo root.
+
 ## 2026-09-25 — The engine hub applies a push under one sync per chunk
 
 ### Changed

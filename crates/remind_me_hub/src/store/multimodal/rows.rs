@@ -1,6 +1,6 @@
 //! The hub's own record types for the engine (ADR-0021, decision 2), one
-//! per table, each carrying every column the SQLite and Postgres stores
-//! hold.
+//! per table, each carrying every column the retired SQLite and Postgres
+//! stores held.
 //!
 //! # The shape the engine asks for
 //!
@@ -23,8 +23,7 @@
 //! # Encoding
 //!
 //! Records are bincode on disk, which cannot decode a `serde_json::Value`,
-//! so JSON columns (`tags`, `metadata`, `aliases`) are kept as JSON text,
-//! as the SQLite store keeps them. Each schema tag carries a layout
+//! so JSON columns (`tags`, `metadata`, `aliases`) are kept as JSON text. Each schema tag carries a layout
 //! version: the engine refuses a blob written under another tag, so a
 //! change to any of these structs needs a new tag and a hand-written
 //! conversion (ADR-0021, Consequences).
@@ -93,8 +92,7 @@ macro_rules! timestamp_ordered {
     };
 }
 
-/// Parse a JSON text column, degrading to `default` as the SQLite store's
-/// `json_column` does.
+/// Parse a JSON text column, degrading to `default` if it is not JSON.
 fn json_text(raw: &str, default: Value) -> Value {
     serde_json::from_str(raw).unwrap_or(default)
 }
@@ -107,7 +105,7 @@ fn to_json_text(value: &Value) -> String {
 // Memories
 // ---------------------------------------------------------------------------
 
-/// One `memories` row: all 28 columns of the SQL stores' table, the
+/// One `memories` row: all 28 columns of the retired SQL stores' table, the
 /// engine id, and `updated_at` in µs for the keyset order.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryRow {
@@ -206,7 +204,8 @@ impl MemoryRow {
         })
     }
 
-    /// The wire form, key for key what the SQLite store's pull returns.
+    /// The wire form, key for key what the retired SQLite store's pull
+    /// returned.
     pub fn to_wire(&self) -> Value {
         json!({
             "id": self.id,

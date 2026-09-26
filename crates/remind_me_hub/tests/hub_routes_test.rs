@@ -1,22 +1,11 @@
-//! The whole route surface, exercised against a real store — once per
-//! backend that needs no server.
+//! The whole route surface, exercised against a real engine store.
 //!
 //! The suite itself is `suite/routes.rs`. It goes through [`dispatch`]
 //! rather than calling handlers directly, so auth, method matching and the
 //! response envelope are covered by the same tests as the behaviour — the
 //! three places a route can be wrong independently of its logic.
 //!
-//! It runs against SQLite always and against the embedded
-//! `rusty_multimodal_db` engine under the `multimodal-store` feature
-//! (docs/adr/0021). Postgres needs a server, so its parts are in
-//! `hub_postgres_test.rs`, including a differential check across all the
-//! backends built in.
-//!
 //! [`dispatch`]: remind_me_hub::dispatch
-
-// Loading `suite/routes.rs` once per backend is the point: each copy
-// resolves `super::store()` to its own backend.
-#![allow(clippy::duplicate_mod)]
 
 use remind_me_hub::record::Record;
 use remind_me_hub::store::{Counts, GraphPullQuery, HubStore, PullQuery, Stats, StoreResult};
@@ -33,14 +22,14 @@ pub struct TestStore {
 /// `&dyn HubStore` — a `Deref` alone would not do it, because the unsizing
 /// coercion to `&dyn HubStore` is tried before a deref.
 impl HubStore for TestStore {
-    fn migrate(&self) -> StoreResult<()> {
-        self.store.migrate()
-    }
     fn ping(&self) -> StoreResult<()> {
         self.store.ping()
     }
     fn apply_record(&self, record: &Record, origin: Option<&str>) -> StoreResult<bool> {
         self.store.apply_record(record, origin)
+    }
+    fn apply_records(&self, records: &[Record], origin: Option<&str>) -> Vec<StoreResult<bool>> {
+        self.store.apply_records(records, origin)
     }
     fn stats(&self) -> StoreResult<Stats> {
         self.store.stats()
@@ -86,31 +75,11 @@ impl Drop for TestStore {
 }
 
 // `#[path = "suite"]` makes the inline module's own directory `suite/`, so
-// both backends' `routes` resolve to the one `suite/routes.rs`.
+// `routes` resolves to `suite/routes.rs`.
 #[path = "suite"]
-mod sqlite {
-    use super::TestStore;
-    use remind_me_hub::store::sqlite::SqliteStore;
-    use remind_me_hub::store::HubStore;
-
-    fn store() -> TestStore {
-        let store = SqliteStore::open_in_memory().expect("open an in-memory hub");
-        store.migrate().expect("migrate");
-        TestStore {
-            store: Box::new(store),
-            dir: None,
-        }
-    }
-
-    mod routes;
-}
-
-#[cfg(feature = "multimodal-store")]
-#[path = "suite"]
-mod multimodal {
+mod engine {
     use super::TestStore;
     use remind_me_hub::store::multimodal::MultimodalHubStore;
-    use remind_me_hub::store::HubStore;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn store() -> TestStore {
@@ -122,7 +91,6 @@ mod multimodal {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         let store = MultimodalHubStore::open(&dir).expect("open a hub data directory");
-        store.migrate().expect("migrate");
         TestStore {
             store: Box::new(store),
             dir: Some(dir),

@@ -51,7 +51,7 @@ fn table_exists(conn: &Connection, name: &str) -> StoreResult<bool> {
     .map_err(err)
 }
 
-/// The highest `hub_seq` the SQLite store has issued, from its `hub_meta`
+/// The highest `hub_seq` the SQLite store issued, from its `hub_meta`
 /// table. It can be above every remaining row: compaction deletes rows,
 /// the newest included. Zero for a database from before `hub_meta`
 /// existed, whose rows' own highest `hub_seq` is the mark, and which

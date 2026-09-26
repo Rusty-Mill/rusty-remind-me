@@ -5,29 +5,19 @@ to it and pull from it, and it never pulls from them. A port of the reference's
 `hub/main.py`, serving the same ten routes over the same wire protocol.
 
 Hub and peer are the same protocol against different topologies — a node's own
-peer server (`remind_me_core::sync::server`) answers seven of these routes over
-SQLite. A client cannot tell a hub from a peer, which is the point.
+peer server (`remind_me_core::sync::server`) answers seven of these routes from
+its SQLite database. A client cannot tell a hub from a peer, which is the point.
 
 ## Quick start
 
-Rootless Podman, one container, no database server (the embedded engine):
+Rootless Podman, one container, no database server:
 
 ```sh
 crates/remind_me_hub/setup.sh install
 ```
 
-With Postgres in a second container, or on SQLite instead:
-
-```sh
-crates/remind_me_hub/setup.sh --postgres install
-crates/remind_me_hub/setup.sh --sqlite install
-```
-
-Each prints the generated `SYNC_SECRET` that clients need. Re-running
-`install` on a machine that already has a hub keeps that hub's store: an
-existing `~/remind-me-hub/hub.env` decides, whatever the default or the flags
-say. Then, on each
-client machine:
+It prints the generated `SYNC_SECRET` that clients need. Re-running `install`
+keeps an existing secret and data. Then, on each client machine:
 
 ```sh
 crates/remind_me_hub/client-setup.sh --node-id my-laptop --tunnel me@hub-host
@@ -54,7 +44,7 @@ Other deployments — Docker Compose, Fly, Railway — are in [`deploy/`](deploy
 
 ```sh
 SYNC_SECRET=$(openssl rand -hex 32) \
-REMIND_ME_HUB_DB_PATH=./hub.db \
+REMIND_ME_HUB_DATA_DIR=./hub-data \
   cargo run -p remind_me_hub --bin rusty-remind-me-hub
 ```
 
@@ -63,39 +53,34 @@ REMIND_ME_HUB_DB_PATH=./hub.db \
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `SYNC_SECRET` | — | Shared bearer token. **Required**; the hub refuses to start without it. |
-| `DATABASE_URL` | — | Postgres connection string. Selects the Postgres backend. |
-| `REMIND_ME_HUB_DB_PATH` | — | SQLite file. Selects the SQLite backend. |
-| `REMIND_ME_HUB_DATA_DIR` | — | Data directory. Selects the embedded-engine backend, the default for a new hub. |
-| `REMIND_ME_HUB_COMPACT_INTERVAL_SECS` | `3600` | How often the embedded-engine backend folds its insert logs. |
+| `REMIND_ME_HUB_DATA_DIR` | — | The store's data directory. **Required**. |
+| `REMIND_ME_HUB_COMPACT_INTERVAL_SECS` | `3600` | How often the store folds its insert logs. |
 | `REMIND_ME_HUB_BIND` | `127.0.0.1` | Listen address. The image sets `0.0.0.0`. |
 | `REMIND_ME_HUB_PORT` | `8765` | Listen port. |
 | `REMIND_ME_HUB_METRICS_ENABLED` | off | Serve `GET /metrics`. Off returns 404. |
 | `REMIND_ME_HUB_TOMBSTONE_RETENTION_DAYS` | `90` | Age past which `/admin/compact_tombstones` hard-deletes. |
-| `REMIND_ME_HUB_STATEMENT_TIMEOUT_MS` | `15000` | Postgres statement timeout. |
 
-Exactly one of `DATABASE_URL`, `REMIND_ME_HUB_DB_PATH` and
-`REMIND_ME_HUB_DATA_DIR` must be set. More than one is an error, and so is none
-— a hub that quietly created an empty SQLite file because `DATABASE_URL` was
-misspelled would look healthy while serving nothing.
+An unset `REMIND_ME_HUB_DATA_DIR` is an error rather than a default: a hub that
+quietly created an empty store would look healthy while serving nothing.
 
-### The embedded-engine backend (the default)
+`DATABASE_URL` and `REMIND_ME_HUB_DB_PATH` selected the Postgres and SQLite
+stores, which are gone. The hub refuses to start with either set, even beside
+`REMIND_ME_HUB_DATA_DIR`, and says how to copy the old store over: an empty
+engine in front of data that was never copied would hide it.
 
-`REMIND_ME_HUB_DATA_DIR` runs the hub on `rusty_multimodal_db`'s storage engine
-in-process (`docs/adr/0021`): one data directory, no database server. It is
-built in by default (the `multimodal-store` feature, through
-`postgres-import`), and `setup.sh` and `deploy/docker-compose.engine.yml` use
-it for a new hub. The Postgres and SQLite stores are still built in, and
-existing deployments keep using them; they are removed in a later release.
-Compared with SQLite it:
+### The store
+
+The hub runs on `rusty_multimodal_db`'s storage engine in-process
+(`docs/adr/0021`): one data directory, no database server. It:
 
 - keeps the whole dataset in memory, and writes each change to a per-table
   insert log that is `fsync`'d before the push returns;
 - refuses ids over 64 bytes or containing a NUL byte. Such a record counts as
   `failed` and stays in the sender's outbox;
 - applies a push in chunks of 64 records, each under one sync, and a pull
-  waits for at most one chunk. In `examples/pull_latency.rs` it takes
-  pushes of 100 records about six times as fast as SQLite, with a pull
-  median of 4 ms against SQLite's 47 ms;
+  waits for at most one chunk. In `examples/pull_latency.rs` it took pushes
+  of 100 records about six times as fast as the SQLite store it replaced,
+  with a pull median of 4 ms against SQLite's 47 ms;
 - pauses writes briefly each time a table's row count passes a power of
   two, while an in-memory map regrows: under 10 ms at 115 000 memories,
   37 ms at 229 000;
@@ -106,12 +91,25 @@ Compared with SQLite it:
 - locks its data directory, so a second hub pointed at it refuses to start.
   Back it up by copying the directory while the hub is stopped.
 
+`GET /count?approx=1` asks for planner estimates, which the engine has no
+equivalent for. Rather than label a full scan "approximate", the hub answers
+exact counts and reports `approximate: false`.
+
 ### Moving a hub onto the engine
 
-`rusty-remind-me-hub-copy` copies a SQLite or Postgres hub into a new data
-directory. Stop the hub first; the source is only ever read.
+A hub that ran on the Postgres or SQLite store moves over with
+`rusty-remind-me-hub-copy`, which copies either into a new data directory.
 
-The tool ships in the hub image and in the release archives. From source:
+**A `setup.sh` hub:** run `setup.sh migrate`. It builds the new image, stops
+the hub, copies the old store onto the engine, rewrites `hub.env` (keeping
+the old one as `hub.env.pre-engine`), installs the one-container unit, and
+starts the hub. The Postgres container and its data, or the SQLite file,
+are left in place for you to remove once the hub looks right. If the copy
+lists rows the engine cannot store, `setup.sh migrate --drop-invalid` copies
+everything else.
+
+**Anything else:** stop the hub and run the tool; the source is only ever
+read. It ships in the hub image and in the release archives. From source:
 
 ```sh
 cargo build -p remind_me_hub --bin rusty-remind-me-hub-copy
@@ -120,6 +118,9 @@ rusty-remind-me-hub-copy --from-sqlite ./hub.db --to ./hub-data --check
 rusty-remind-me-hub-copy --from-sqlite ./hub.db --to ./hub-data
 DATABASE_URL=postgresql://… rusty-remind-me-hub-copy --from-postgres --to ./hub-data
 ```
+
+Then replace `DATABASE_URL` or `REMIND_ME_HUB_DB_PATH` in the hub's
+environment with `REMIND_ME_HUB_DATA_DIR`, pointing at the copy.
 
 - **Every `hub_seq` and `origin_node` is kept**, so nodes carry on from their
   cursors and `exclude_node` still means what it did. The next `hub_seq` is
@@ -136,30 +137,14 @@ DATABASE_URL=postgresql://… rusty-remind-me-hub-copy --from-postgres --to ./hu
 - **`--from-postgres` reads `DATABASE_URL`**, so the password never appears
   on the command line.
 
-A `setup.sh` hub on SQLite moves over like this. The volume is the one its
-unit already mounts, so the copy lands beside the old file, which stays as it
-was:
-
-```sh
-systemctl --user stop remind-me-hub
-podman run --rm -v ~/remind-me-hub/data:/data:Z,U localhost/remind-me-hub \
-    rusty-remind-me-hub-copy --from-sqlite /data/hub.db --to /data/hub
-sed -i 's|^REMIND_ME_HUB_DB_PATH=.*|REMIND_ME_HUB_DATA_DIR=/data/hub|' ~/remind-me-hub/hub.env
-systemctl --user start remind-me-hub
-```
-
-A Postgres hub does the same with `--from-postgres`, run on the `remind-me`
-network with `DATABASE_URL` from its `hub.env`
-(`podman run --rm --network remind-me --env-file ~/remind-me-hub/hub.env ...`).
-Then install `deploy/remind-me-hub-standalone.container` in place of the two
-Postgres units, and replace `DATABASE_URL` in `hub.env` with
-`REMIND_ME_HUB_DATA_DIR`.
+The readers stay in later releases (the Postgres one behind the default
+`postgres-import` feature), so a hub that migrates late is not stranded.
 
 ## Routes
 
 | Route | Auth | Purpose |
 | --- | --- | --- |
-| `GET /health` | none | Liveness. 200 when the database is reachable, 503 when not. |
+| `GET /health` | none | Liveness. 200 when the store can take writes, 503 when not. |
 | `GET /stats` | bearer | Full aggregate — once per reconcile. |
 | `GET /count` | bearer | Scalar counts, cheap enough to poll. `?table=`, `?since=`, `?by=origin_node\|category`, `?approx=1`. |
 | `GET /metrics` | bearer | Prometheus text. 404 when disabled. |
@@ -171,29 +156,11 @@ Postgres units, and replace `DATABASE_URL` in `hub.env` with
 | `GET /sync/pull_entity_relations` | bearer | Typed entity edges. |
 
 `/health` is unauthenticated on purpose: it is what a deploy healthcheck polls,
-and it must keep answering when the database is down. It carries no counts. Its
-`db` field never echoes the underlying error, which typically embeds host,
-port, database name and credentials — that goes to the log instead.
+and it must keep answering when the store is down. It carries no counts. Its
+`db` field never echoes the underlying error — that goes to the log instead.
 
 Every response carries `X-Hub-Version`, errors included, so "which build
 answered this?" never needs a second request.
-
-## Two backends
-
-**Postgres** is the drop-in. The DDL, the `COLLATE "C"`, the
-`memories_hub_seq` sequence and the legacy TIMESTAMPTZ→TEXT migration are
-deliberately the reference's rather than a tidier equivalent, because the
-contract is not "works" but *reads the database the Python hub was using an
-hour ago*.
-
-**SQLite** is for a self-hosted hub that wants one file and no server. It is
-wire-identical and **not** schema-identical; there is no in-place switch
-between the two. `docs/adr/0015` records why both exist.
-
-One honest degradation: `GET /count?approx=1` asks for planner estimates, which
-SQLite has no usable equivalent for. Rather than label a full scan
-"approximate", the SQLite backend falls back to exact counts and the response
-reports `approximate: false`.
 
 ## `origin_node`, and why pull filters on it
 
@@ -241,19 +208,21 @@ channel.
 ## Operating
 
 ```sh
-crates/remind_me_hub/setup.sh status      # units, health, per-node counts
-crates/remind_me_hub/setup.sh update      # pull, rebuild, restart, verify
-crates/remind_me_hub/setup.sh restore d.sql   # restore a Postgres dump
+crates/remind_me_hub/setup.sh status          # unit, health, per-node counts
+crates/remind_me_hub/setup.sh update          # pull, rebuild, restart, verify
+crates/remind_me_hub/setup.sh restore d.sql   # load a Postgres dump
+crates/remind_me_hub/setup.sh migrate         # move off Postgres or SQLite
 ```
 
 `update` checks that the *new build is actually serving* rather than only that
 the service restarted — a rebuilt image the unit never picked up leaves a
-perfectly healthy old hub answering, which reads as success.
+perfectly healthy old hub answering, which reads as success. On a hub still
+on Postgres or SQLite it refuses, and points at `migrate`.
 
-`restore` accepts legacy hub dumps. The hub migrates the restored schema on
-startup: TIMESTAMPTZ columns become canonical TEXT, missing columns are added
-with client-matching defaults, and `hub_seq` is backfilled in `(updated_at,
-id)` order so the migration does not itself reorder history.
+`restore` loads a Postgres dump, a Python hub's legacy one included, into a
+throwaway Postgres container, copies it onto the engine with the copy tool,
+and swaps it in. A hub that already holds memories needs `--force`, and the
+data it replaces is moved aside rather than deleted.
 
 Tombstone compaction is operator-triggered (a cron hitting
 `/admin/compact_tombstones`) rather than a background loop, since the hub has
@@ -273,33 +242,29 @@ can miss a delete, the same accepted gap the client-side compaction lives with.
   unauthenticated and would publish every route — including the one that
   hard-deletes rows. Here a route that was not written does not exist.
 - Data is stored plaintext. Encryption at rest is the storage layer's job:
-  full-disk encryption, your provider's volume encryption, or Postgres's own
-  extensions.
+  full-disk encryption or your provider's volume encryption.
 
 ## Testing
 
 ```sh
-cargo test -p remind_me_hub                       # the engine and SQLite; Postgres tests skip
+cargo test -p remind_me_hub                       # Postgres copy tests skip
 REMIND_ME_HUB_TEST_DATABASE_URL=postgresql://… \
   cargo test -p remind_me_hub -- --test-threads=1 # with a real Postgres
 ```
 
-The route suite (`tests/suite/routes.rs`) runs once per backend that needs no
-server. `tests/suite/differential.rs` pushes one script to several backends and
-requires every read to match: SQLite against the embedded engine in
-`hub_multimodal_test.rs`, and all of them in `hub_postgres_test.rs`.
+The route suite (`tests/suite/routes.rs`) covers the protocol request by
+request. `tests/suite/recorded.rs` pushes one script and requires every read
+to answer as the retired SQLite store did; those answers were recorded before
+it went (`tests/fixtures/README.md`). The copy tests rebuild SQLite and
+Postgres hubs from dumps those stores wrote, and hold each copy to the
+store's recorded answers.
 
-The Postgres tests skip when no database is configured — and it is worth being
-precise about what that means: a skipped test reports as **passed**, and cargo
-hides the `SKIP` line unless you pass `--nocapture`. Locally that is fine. For
-CI it is not, so `REMIND_ME_HUB_REQUIRE_POSTGRES=1` turns the skip into a hard
-failure and CI sets it; the environment cannot lose its database and stay
-green. They cover what only a real server can: the legacy migration, `nextval()`-driven `hub_seq`, planner
-estimates, and the differential test with Postgres among the backends. It
-compares `hub_seq` by order there, not by value: `nextval()` also spends a
-number on a push that loses last-write-wins, so Postgres's sequence has gaps
-the other backends' does not.
+The Postgres copy tests skip when no database is configured — and it is worth
+being precise about what that means: a skipped test reports as **passed**, and
+cargo hides the `SKIP` line unless you pass `--nocapture`. Locally that is
+fine. For CI it is not, so `REMIND_ME_HUB_REQUIRE_POSTGRES=1` turns the skip
+into a hard failure and CI sets it; the environment cannot lose its database
+and stay green.
 
-CI runs all of these, plus `--no-default-features` builds with and without
-`multimodal-store`, so a `postgres::` reference leaking outside its feature
-gate cannot go unnoticed.
+CI runs all of these, plus a `--no-default-features` build, so a
+`postgres::` reference leaking outside its feature gate cannot go unnoticed.
