@@ -2,6 +2,16 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-26 — The wiki index goes behind db::wiki (ADR-0023, phase 1, step 3)
+
+### Changed
+- **Every statement against `wiki_pages`, `wiki_links`, `wiki_meta` and `wiki_fts` now lives in `db::wiki::WikiIndex`.** `wiki.rs` and `wiki_fs.rs` keep the rules: files are the source of truth, reserved slugs, reconcile, the load budget and the compile watermark. The compile brief's reads of new memories moved to `db::memories`.
+- `delete_wiki_page` now also clears the deleted page's outgoing links, as the file-backed delete already did.
+
+### Tests
+- New repository tests: an unbacked write keeps the cached mtime and a new one starts at 0; removing a page takes its links and reports a missing page; `wiki_meta` round-trips and overwrites.
+- The core, API, MCP and CLI suites pass unchanged.
+
 ## 2026-09-26 — The knowledge graph's storage goes behind db::entities (ADR-0023, phase 1, step 2)
 
 ### Changed

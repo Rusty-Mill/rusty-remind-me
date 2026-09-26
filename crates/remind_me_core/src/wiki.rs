@@ -1,7 +1,8 @@
+use crate::db::wiki::WikiIndex;
 use crate::fts::sanitize_fts_query;
 use crate::wiki_import::slugify;
 use chrono::Utc;
-use rusqlite::{params, Connection, Result, Row};
+use rusqlite::{Connection, Result};
 use serde::{Deserialize, Serialize};
 
 /// Generated system pages, refused by delete and excluded from listings.
@@ -33,19 +34,6 @@ pub enum WikiDeleteOutcome {
     Reserved,
 }
 
-const WIKI_COLUMNS: &str = "slug, title, content, summary, mtime, updated_at";
-
-fn parse_wiki_row(row: &Row) -> Result<WikiPage> {
-    Ok(WikiPage {
-        slug: row.get("slug")?,
-        title: row.get("title")?,
-        content: row.get("content")?,
-        summary: row.get("summary")?,
-        mtime: row.get("mtime")?,
-        updated_at: row.get("updated_at")?,
-    })
-}
-
 /// Write a row straight into the index, bypassing the filesystem.
 ///
 /// **Not the public write path** — [`crate::wiki_fs::Wiki::write_page`] is,
@@ -59,48 +47,17 @@ pub fn write_wiki_page(
     content: &str,
     summary: &str,
 ) -> Result<WikiPage> {
-    let now = Utc::now().to_rfc3339();
-
-    conn.execute(
-        "INSERT INTO wiki_pages (slug, title, content, summary, mtime, updated_at)
-         VALUES (?, ?, ?, ?, 0, ?)
-         ON CONFLICT(slug) DO UPDATE SET
-            title = excluded.title,
-            content = excluded.content,
-            summary = excluded.summary,
-            updated_at = excluded.updated_at",
-        params![slug, title, content, summary, now],
-    )?;
-
-    get_wiki_page(conn, slug)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
+    let wiki = WikiIndex::new(conn);
+    wiki.upsert_unbacked(slug, title, content, summary, &Utc::now().to_rfc3339())?;
+    wiki.get(slug)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
 }
 
 pub fn get_wiki_page(conn: &Connection, slug: &str) -> Result<Option<WikiPage>> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {} FROM wiki_pages WHERE slug = ?",
-        WIKI_COLUMNS
-    ))?;
-    let mut rows = stmt.query_map(params![slug], parse_wiki_row)?;
-
-    if let Some(row) = rows.next() {
-        row.map(Some)
-    } else {
-        Ok(None)
-    }
+    WikiIndex::new(conn).get(slug)
 }
 
 pub fn list_wiki_pages(conn: &Connection) -> Result<Vec<WikiPage>> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {} FROM wiki_pages ORDER BY updated_at DESC",
-        WIKI_COLUMNS
-    ))?;
-    let rows = stmt.query_map([], parse_wiki_row)?;
-
-    let mut pages = Vec::new();
-    for r in rows {
-        pages.push(r?);
-    }
-    Ok(pages)
+    WikiIndex::new(conn).recent_first()
 }
 
 /// One hit from [`search_wiki_pages`].
@@ -137,26 +94,7 @@ pub fn search_wiki_pages(
     }
     let limit = limit.clamp(WIKI_SEARCH_LIMIT_MIN, WIKI_SEARCH_LIMIT_MAX);
 
-    let mut stmt = conn.prepare(
-        "SELECT wp.slug, wp.title, wp.summary,
-                snippet(wiki_fts, 1, '[', ']', '…', 12) AS snippet
-           FROM wiki_fts
-           JOIN wiki_pages wp ON wp.rowid = wiki_fts.rowid
-          WHERE wiki_fts MATCH ?
-          ORDER BY bm25(wiki_fts)
-          LIMIT ?",
-    )?;
-
-    let rows = stmt.query_map(params![match_expr, limit as i64], |row| {
-        Ok(WikiSearchHit {
-            slug: row.get("slug")?,
-            title: row.get("title")?,
-            summary: row.get("summary")?,
-            snippet: row.get("snippet")?,
-        })
-    })?;
-
-    rows.collect()
+    WikiIndex::new(conn).search(&match_expr, limit)
 }
 
 /// Delete a wiki page addressed by either its title or its slug.
@@ -174,8 +112,7 @@ pub fn delete_wiki_page(conn: &Connection, title_or_slug: &str) -> Result<WikiDe
         return Ok(WikiDeleteOutcome::Reserved);
     }
 
-    let affected = conn.execute("DELETE FROM wiki_pages WHERE slug = ?", params![slug])?;
-    Ok(if affected > 0 {
+    Ok(if WikiIndex::new(conn).remove(&slug)? {
         WikiDeleteOutcome::Deleted
     } else {
         WikiDeleteOutcome::NotFound

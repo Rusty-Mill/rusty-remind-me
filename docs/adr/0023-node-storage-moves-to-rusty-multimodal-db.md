@@ -349,7 +349,7 @@ unchanged after each.
 |---|---|---|---|
 | 1 | Memory row writes | `db::memories::Memories` | Done |
 | 2 | Entities, relations and mentions | `db::entities::Entities` | Done |
-| 3 | Wiki pages, links and their index | `db::wiki` | |
+| 3 | Wiki pages, links and their index | `db::wiki::WikiIndex` | Done |
 | 4 | Vectors, re-keyed on memory id (§4) | `db::vectors` | |
 | 5 | Promotions, imports, archives and curation queues | one each | |
 | 6 | The outbox, with echo suppression as a flag | `db::outbox` | |
@@ -399,6 +399,23 @@ read of live triples moved to `db::memories`. Nothing outside `db::` writes
 to any of the four tables now. Reads of the graph from `contradictions.rs`,
 `export.rs`, `expansion.rs`, `promotion.rs` and the sync server stay for
 their own steps.
+
+**Step 3.** `db::wiki` holds every statement `wiki.rs` and `wiki_fs.rs`
+ran:
+- page upserts, both the file-backed one and the unbacked one used by
+  imports, which keeps a cached mtime;
+- lookups, listings, the generated index's titles and summaries, and the
+  reconcile pass's cached mtimes;
+- link replacement and removal;
+- the FTS5 search, with its BM25 order and snippet;
+- `wiki_meta`.
+
+The compile brief's two reads of new memories moved to `db::memories`. The
+rules stay in `wiki.rs` and `wiki_fs.rs`: files are the source of truth,
+reserved slugs, the reconcile's mtime test, the load budget and the
+watermark. One small change: deleting a page by slug through
+`delete_wiki_page` now also clears its outgoing links, as the file-backed
+delete always did. Nothing reads those links outside tests.
 
 ## Related
 

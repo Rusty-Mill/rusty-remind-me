@@ -112,6 +112,15 @@ pub struct Triple {
     pub object: String,
 }
 
+/// A live memory as the wiki's compile brief shows it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreatedMemory {
+    pub id: String,
+    pub category: String,
+    pub content: String,
+    pub created_at: String,
+}
+
 /// The columns an insert writes, in [`insert_values`]' order.
 const INSERT_COLUMNS: &str = "id, content, category, tags, source, metadata, created_at, \
      updated_at, capture_id, subject, predicate, object, superseded_by, decay_rate, vitality, \
@@ -415,6 +424,38 @@ impl<'c> Memories<'c> {
             })?
             .collect();
         rows
+    }
+
+    /// Live, unsuperseded memories created after `cutoff`, oldest first, at
+    /// most `limit`.
+    pub fn live_created_after(&self, cutoff: &str, limit: usize) -> Result<Vec<CreatedMemory>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, category, content, created_at FROM memories
+              WHERE superseded_by IS NULL AND deleted_at IS NULL AND created_at > ?
+              ORDER BY created_at ASC LIMIT ?",
+        )?;
+        let rows = stmt
+            .query_map(params![cutoff, limit as i64], |r| {
+                Ok(CreatedMemory {
+                    id: r.get(0)?,
+                    category: r.get(1)?,
+                    content: r.get(2)?,
+                    created_at: r.get(3)?,
+                })
+            })?
+            .collect();
+        rows
+    }
+
+    /// How many live, unsuperseded memories were created after `cutoff`.
+    pub fn count_live_created_after(&self, cutoff: &str) -> Result<usize> {
+        let count: i64 = self.conn.query_row(
+            "SELECT count(*) FROM memories
+              WHERE superseded_by IS NULL AND deleted_at IS NULL AND created_at > ?",
+            params![cutoff],
+            |row| row.get(0),
+        )?;
+        Ok(count.max(0) as usize)
     }
 
     /// Set `metadata.ingest` to `marker` on every chunk of the import
