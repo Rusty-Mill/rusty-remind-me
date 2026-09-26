@@ -348,7 +348,7 @@ unchanged after each.
 | Step | Group | Repository | State |
 |---|---|---|---|
 | 1 | Memory row writes | `db::memories::Memories` | Done |
-| 2 | Entities, relations and mentions | `db::entities` | |
+| 2 | Entities, relations and mentions | `db::entities::Entities` | Done |
 | 3 | Wiki pages, links and their index | `db::wiki` | |
 | 4 | Vectors, re-keyed on memory id (§4) | `db::vectors` | |
 | 5 | Promotions, imports, archives and curation queues | one each | |
@@ -381,6 +381,24 @@ copied as text, so `["a", "b"]` becomes `["a","b"]`. Both parse the same.
 The remaining writes to `memories` are already in `db::`: `update_memory`,
 deletes, bulk tagging, annotation and reclassification in `queries.rs`, and
 the history, feedback and reminder repositories.
+
+**Step 2.** `db::entities` holds every statement `entity.rs` and
+`sync/graph.rs` ran against `entities`, `entity_relations` and
+`memory_entities`:
+- lookups, the resolve scan, the listing page and the profile's facts and
+  linked memories;
+- inserting and merging entities, mention links and relations;
+- the traversal's per-hop edge query;
+- id renormalisation's rename, merge, delete and repoint;
+- the sync apply's view, upsert and alias merge.
+
+The rules stay in `entity.rs` and `sync/graph.rs`: name normalisation and
+derived ids, "existing kind wins", alias union order, the traversal's
+frontier and cap, and LWW for synced entities. The contradiction check's
+read of live triples moved to `db::memories`. Nothing outside `db::` writes
+to any of the four tables now. Reads of the graph from `contradictions.rs`,
+`export.rs`, `expansion.rs`, `promotion.rs` and the sync server stay for
+their own steps.
 
 ## Related
 

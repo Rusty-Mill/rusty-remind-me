@@ -28,8 +28,10 @@
 //!   second, diverging source of truth.
 
 use super::record::canon_ts;
+use crate::db::entities::{Entities, RelationRow};
+use crate::entity::Entity;
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -97,26 +99,6 @@ pub struct EntitySyncRecord {
     pub node_id: Option<String>,
 }
 
-struct LocalEntity {
-    aliases: Vec<String>,
-    updated_at: String,
-}
-
-fn fetch_local_entity(conn: &Connection, id: &str) -> rusqlite::Result<Option<LocalEntity>> {
-    conn.query_row(
-        "SELECT aliases, updated_at FROM entities WHERE id = ?",
-        params![id],
-        |row| {
-            let aliases_json: String = row.get(0)?;
-            Ok(LocalEntity {
-                aliases: serde_json::from_str(&aliases_json).unwrap_or_default(),
-                updated_at: row.get(1)?,
-            })
-        },
-    )
-    .optional()
-}
-
 /// Apply one incoming `entity` record: LWW on `updated_at` governs
 /// `name`/`kind`/`node_id` (a tie loses, same as `memories`), but `aliases`
 /// always union-merges regardless of the winner, and a merge-only change
@@ -136,7 +118,8 @@ pub fn upsert_entity_record(
 
     let updated_at = canon_ts(&record.updated_at);
     let created_at = canon_ts(&record.created_at);
-    let local = fetch_local_entity(conn, &record.id)?;
+    let entities = Entities::new(conn);
+    let local = entities.sync_view(&record.id)?;
     let incoming_wins = match &local {
         None => true,
         Some(l) => updated_at > l.updated_at,
@@ -147,35 +130,21 @@ pub fn upsert_entity_record(
     let before = before_outbox_id(conn)?;
 
     if incoming_wins {
-        conn.execute(
-            "INSERT INTO entities (id, name, kind, aliases, created_at, updated_at, node_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(id) DO UPDATE SET
-                 name = excluded.name,
-                 kind = excluded.kind,
-                 aliases = excluded.aliases,
-                 updated_at = excluded.updated_at,
-                 node_id = excluded.node_id",
-            params![
-                record.id,
-                record.name,
-                record.kind,
-                serde_json::to_string(&merged_aliases).unwrap_or_else(|_| "[]".to_string()),
+        entities.upsert_synced(
+            &Entity {
+                id: record.id.clone(),
+                name: record.name.clone(),
+                kind: record.kind.clone(),
+                aliases: merged_aliases,
                 created_at,
                 updated_at,
-                record.node_id,
-            ],
+            },
+            record.node_id.as_deref(),
         )?;
     } else {
         let local = local.expect("incoming_wins is false only when a local entity was found");
         if merged_aliases != local.aliases {
-            conn.execute(
-                "UPDATE entities SET aliases = ? WHERE id = ?",
-                params![
-                    serde_json::to_string(&merged_aliases).unwrap_or_else(|_| "[]".to_string()),
-                    record.id
-                ],
-            )?;
+            entities.set_aliases(&record.id, &merged_aliases)?;
         }
     }
 
@@ -217,20 +186,17 @@ pub fn upsert_entity_relation_record(
     }
 
     let before = before_outbox_id(conn)?;
-    conn.execute(
-        "INSERT OR IGNORE INTO entity_relations
-             (id, subject_entity_id, relation, object_entity_id, created_at, updated_at, node_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
-        params![
-            record.id,
-            record.subject_entity_id,
-            record.relation,
-            record.object_entity_id,
-            canon_ts(&record.created_at),
-            canon_ts(&record.updated_at),
-            record.node_id,
-        ],
-    )?;
+    let created_at = canon_ts(&record.created_at);
+    let updated_at = canon_ts(&record.updated_at);
+    Entities::new(conn).insert_relation_or_ignore(&RelationRow {
+        id: &record.id,
+        subject_entity_id: &record.subject_entity_id,
+        relation: &record.relation,
+        object_entity_id: &record.object_entity_id,
+        created_at: &created_at,
+        updated_at: &updated_at,
+        node_id: record.node_id.as_deref(),
+    })?;
     echo_suppress(conn, &record.id, before)?;
     Ok(())
 }
@@ -262,13 +228,10 @@ pub fn upsert_link_record(
     }
 
     let before = before_outbox_id(conn)?;
-    conn.execute(
-        "INSERT OR IGNORE INTO memory_entities (memory_id, entity_id, created_at) VALUES (?, ?, ?)",
-        params![
-            record.memory_id,
-            record.entity_id,
-            canon_ts(&record.created_at)
-        ],
+    Entities::new(conn).link(
+        &record.memory_id,
+        &record.entity_id,
+        &canon_ts(&record.created_at),
     )?;
     // Echo-suppression is keyed on `memory_id` alone, matching the
     // `memory_entities_outbox_ai` trigger's own `sync_outbox.memory_id`

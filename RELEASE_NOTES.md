@@ -2,6 +2,15 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-26 — The knowledge graph's storage goes behind db::entities (ADR-0023, phase 1, step 2)
+
+### Changed
+- **Every statement against `entities`, `entity_relations` and `memory_entities` from `entity.rs` and `sync/graph.rs` now lives in `db::entities::Entities`.** That covers lookups, upserts, mention links, relations, the traversal's edge query, id renormalisation and sync apply. Nothing outside `db::` writes to the graph tables or to `memories` now. Behaviour is unchanged.
+
+### Tests
+- New repository tests: a synced entity overwrite keeps `created_at`; repointing drops a link the target already has; a traversal step from no entities is empty.
+- The core, API, MCP and CLI suites pass unchanged.
+
 ## 2026-09-26 — Memory writes go through one repository (ADR-0023, phase 1, step 1)
 
 ### Changed

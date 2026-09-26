@@ -103,6 +103,15 @@ pub struct AccessInputs {
     pub base_weight: f64,
 }
 
+/// A memory's subject-predicate-object triple, all three present.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Triple {
+    pub id: String,
+    pub subject: String,
+    pub predicate: String,
+    pub object: String,
+}
+
 /// The columns an insert writes, in [`insert_values`]' order.
 const INSERT_COLUMNS: &str = "id, content, category, tags, source, metadata, created_at, \
      updated_at, capture_id, subject, predicate, object, superseded_by, decay_rate, vitality, \
@@ -384,6 +393,28 @@ impl<'c> Memories<'c> {
             )?
             .execute(params![accessed_at, access_count, vitality, status, id])?;
         Ok(())
+    }
+
+    /// The triple of every live, unsuperseded memory other than `except_id`
+    /// that has all three parts.
+    pub fn live_triples_except(&self, except_id: &str) -> Result<Vec<Triple>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, subject, predicate, object FROM memories
+              WHERE id != ?
+                AND superseded_by IS NULL AND deleted_at IS NULL
+                AND subject IS NOT NULL AND predicate IS NOT NULL AND object IS NOT NULL",
+        )?;
+        let rows = stmt
+            .query_map(params![except_id], |row| {
+                Ok(Triple {
+                    id: row.get(0)?,
+                    subject: row.get(1)?,
+                    predicate: row.get(2)?,
+                    object: row.get(3)?,
+                })
+            })?
+            .collect();
+        rows
     }
 
     /// Set `metadata.ingest` to `marker` on every chunk of the import

@@ -1,3 +1,4 @@
+pub mod entities;
 pub mod feedback;
 pub mod history;
 pub mod memories;
