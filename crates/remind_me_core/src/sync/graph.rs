@@ -18,20 +18,15 @@
 //!   arrived yet: there is no foreign key, deliberately, so the row simply
 //!   waits — nothing here retries it, the missing row just stops being
 //!   missing whenever it eventually arrives.
-//! - The generated schema (`schema_triggers.sql`, regenerated in `#76`) ships
-//!   `entities_outbox_ai`/`_au`, `entity_relations_outbox_ai`, and
-//!   `memory_entities_outbox_ai` itself, gated on `sync_flags.sync_enabled`
-//!   exactly like `memories_outbox_ai`/`_au` — an earlier pass of this port
-//!   installed hand-rolled, ungated equivalents because the schema dump this
-//!   crate started from predated them; regenerating the dump found the real
-//!   ones, so the hand-rolled copies were removed rather than kept as a
-//!   second, diverging source of truth.
+//! - Local graph writes are queued in the outbox by `db::entities`, gated on
+//!   `sync_flags.sync_enabled` like memories. Writes applied here are
+//!   `Origin::Sync` and never queued, so a peer is not sent back what it
+//!   sent.
 
 use super::record::canon_ts;
+use crate::db::derived::Origin;
 use crate::db::entities::{Entities, RelationRow};
-use crate::db::outbox::Outbox;
 use crate::entity::Entity;
-use chrono::Utc;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -50,18 +45,6 @@ impl From<rusqlite::Error> for GraphApplyError {
     fn from(e: rusqlite::Error) -> Self {
         Self(e.to_string())
     }
-}
-
-fn before_outbox_id(conn: &Connection) -> rusqlite::Result<i64> {
-    Outbox::new(conn).high_water()
-}
-
-/// Echo-suppress whatever outbox row(s) this write itself just created for
-/// `key` (the same `sync_outbox.memory_id` value the corresponding trigger
-/// stamps) — identical technique to `record::upsert_record`'s, scoped by an
-/// outbox-id high-water-mark snapshotted before the write.
-fn echo_suppress(conn: &Connection, key: &str, before_id: i64) -> rusqlite::Result<()> {
-    Outbox::new(conn).suppress_echo(key, before_id, &Utc::now().to_rfc3339())
 }
 
 fn merge_aliases(local: &[String], incoming: &[String]) -> Vec<String> {
@@ -121,8 +104,6 @@ pub fn upsert_entity_record(
     let local_aliases: &[String] = local.as_ref().map(|l| l.aliases.as_slice()).unwrap_or(&[]);
     let merged_aliases = merge_aliases(local_aliases, &record.aliases);
 
-    let before = before_outbox_id(conn)?;
-
     if incoming_wins {
         entities.upsert_synced(
             &Entity {
@@ -142,7 +123,6 @@ pub fn upsert_entity_record(
         }
     }
 
-    echo_suppress(conn, &record.id, before)?;
     Ok(())
 }
 
@@ -179,19 +159,20 @@ pub fn upsert_entity_relation_record(
         ));
     }
 
-    let before = before_outbox_id(conn)?;
     let created_at = canon_ts(&record.created_at);
     let updated_at = canon_ts(&record.updated_at);
-    Entities::new(conn).insert_relation_or_ignore(&RelationRow {
-        id: &record.id,
-        subject_entity_id: &record.subject_entity_id,
-        relation: &record.relation,
-        object_entity_id: &record.object_entity_id,
-        created_at: &created_at,
-        updated_at: &updated_at,
-        node_id: record.node_id.as_deref(),
-    })?;
-    echo_suppress(conn, &record.id, before)?;
+    Entities::new(conn).insert_relation_or_ignore(
+        &RelationRow {
+            id: &record.id,
+            subject_entity_id: &record.subject_entity_id,
+            relation: &record.relation,
+            object_entity_id: &record.object_entity_id,
+            created_at: &created_at,
+            updated_at: &updated_at,
+            node_id: record.node_id.as_deref(),
+        },
+        Origin::Sync,
+    )?;
     Ok(())
 }
 
@@ -221,16 +202,12 @@ pub fn upsert_link_record(
         ));
     }
 
-    let before = before_outbox_id(conn)?;
     Entities::new(conn).link(
         &record.memory_id,
         &record.entity_id,
         &canon_ts(&record.created_at),
+        Origin::Sync,
     )?;
-    // Echo-suppression is keyed on `memory_id` alone, matching the
-    // `memory_entities_outbox_ai` trigger's own `sync_outbox.memory_id`
-    // value -- not the synthetic `memory_id|entity_id` wire id.
-    echo_suppress(conn, &record.memory_id, before)?;
     Ok(format!("{}|{}", record.memory_id, record.entity_id))
 }
 

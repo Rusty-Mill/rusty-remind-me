@@ -170,7 +170,7 @@ pub fn configured_client() -> String {
 /// That is worse than not having the columns. A reader of `client` could not
 /// tell "unknown because nobody configured one" from "unknown because this
 /// write path forgot", and `node_id` rides the outbox payload
-/// (`schema_triggers.sql`), so per-node attribution on the hub silently saw
+/// (`db::derived`), so per-node attribution on the hub silently saw
 /// only manually-added memories.
 pub fn memory_provenance() -> (String, String) {
     (configured_node_id(), configured_client())

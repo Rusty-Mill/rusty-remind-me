@@ -1,6 +1,6 @@
--- The node's schema. Originally dumped from the Python remind_me at v29;
--- that reference is retired (ADR-0023), so this file is edited by hand now.
--- A change here is a schema change: see db/migrations.rs.
+-- The triggers schema v30 and earlier carried, kept so tests can build an
+-- older database and check that opening it drops them (ADR-0023 phase 1,
+-- step 7). Not used by the crate itself.
 
 CREATE TRIGGER IF NOT EXISTS entities_outbox_ai
         AFTER INSERT ON entities

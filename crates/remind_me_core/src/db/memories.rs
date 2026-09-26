@@ -1,13 +1,14 @@
 //! Storage for memory rows: every insert, sync upsert and field update of
 //! `memories` that used to be written inline by a domain module.
 //!
-//! This is ADR-0023's phase 1, step 1. Once every write to `memories` goes
-//! through `db::`, the triggers that maintain its derived data (the FTS
-//! index, the tag index and the sync outbox) can move into Rust in one
-//! place. The rules stay with their modules: what a capture, a promotion or
+//! This is ADR-0023's phase 1, step 1. Every write goes through
+//! `db::derived::write_memory`, which keeps the derived data (the FTS index,
+//! the tag index and the sync outbox) in step, as triggers did up to schema
+//! v30 (step 7). The rules stay with their modules: what a capture, a promotion or
 //! a consolidation writes, and how vitality is seeded, are decided there and
 //! handed over as a [`NewMemory`] or a field value.
 
+use crate::db::derived::{memory_ids, write_memory, Origin};
 use crate::db::queries::{parse_memory_row, MEMORY_COLUMNS};
 use crate::models::Memory;
 use rusqlite::types::Value as SqlValue;
@@ -184,24 +185,28 @@ impl<'c> Memories<'c> {
         Self { conn }
     }
 
-    /// Insert `row`. An existing id is an error.
+    /// Insert `row`, made on this node. An existing id is an error.
     pub fn insert(&self, row: &NewMemory) -> Result<()> {
-        self.conn.execute(
-            &format!("INSERT INTO memories ({INSERT_COLUMNS}) VALUES ({INSERT_PLACEHOLDERS})"),
-            params_from_iter(insert_values(row)),
-        )?;
+        write_memory(self.conn, &row.id, Origin::Local, || {
+            self.conn.execute(
+                &format!("INSERT INTO memories ({INSERT_COLUMNS}) VALUES ({INSERT_PLACEHOLDERS})"),
+                params_from_iter(insert_values(row)),
+            )
+        })?;
         Ok(())
     }
 
     /// Insert `row` unless its id is already taken. Returns whether it was
     /// inserted.
     pub fn insert_or_ignore(&self, row: &NewMemory) -> Result<bool> {
-        let inserted = self.conn.execute(
-            &format!(
-                "INSERT OR IGNORE INTO memories ({INSERT_COLUMNS}) VALUES ({INSERT_PLACEHOLDERS})"
-            ),
-            params_from_iter(insert_values(row)),
-        )?;
+        let inserted = write_memory(self.conn, &row.id, Origin::Local, || {
+            self.conn.execute(
+                &format!(
+                    "INSERT OR IGNORE INTO memories ({INSERT_COLUMNS}) VALUES ({INSERT_PLACEHOLDERS})"
+                ),
+                params_from_iter(insert_values(row)),
+            )
+        })?;
         Ok(inserted > 0)
     }
 
@@ -209,8 +214,13 @@ impl<'c> Memories<'c> {
     ///
     /// An overwrite keeps the local `created_at`, `doc_id` and `chunk_index`:
     /// a peer's record does not carry the last two, and the first never
-    /// changes.
+    /// changes. Never queued for sync: it came from there.
     pub fn upsert_synced(&self, row: &NewMemory) -> Result<()> {
+        write_memory(self.conn, &row.id, Origin::Sync, || self.upsert_row(row))?;
+        Ok(())
+    }
+
+    fn upsert_row(&self, row: &NewMemory) -> Result<usize> {
         self.conn.execute(
             &format!(
                 "INSERT INTO memories ({INSERT_COLUMNS}) VALUES ({INSERT_PLACEHOLDERS})
@@ -241,8 +251,7 @@ impl<'c> Memories<'c> {
                     remind_at = excluded.remind_at"
             ),
             params_from_iter(insert_values(row)),
-        )?;
-        Ok(())
+        )
     }
 
     /// The local copy of `id` as a sync merge sees it, if there is one.
@@ -270,10 +279,12 @@ impl<'c> Memories<'c> {
     /// merge that lost last-write-wins still keeps the union, and must not
     /// look like a newer local edit.
     pub fn set_tags_and_metadata(&self, id: &str, tags: &[String], metadata: &Value) -> Result<()> {
-        self.conn.execute(
-            "UPDATE memories SET tags = ?, metadata = ? WHERE id = ?",
-            params![tags_json(tags), metadata.to_string(), id],
-        )?;
+        write_memory(self.conn, id, Origin::Sync, || {
+            self.conn.execute(
+                "UPDATE memories SET tags = ?, metadata = ? WHERE id = ?",
+                params![tags_json(tags), metadata.to_string(), id],
+            )
+        })?;
         Ok(())
     }
 
@@ -285,16 +296,16 @@ impl<'c> Memories<'c> {
         superseded_by: &str,
         updated_at: Option<&str>,
     ) -> Result<()> {
-        match updated_at {
+        write_memory(self.conn, id, Origin::Local, || match updated_at {
             Some(stamp) => self.conn.execute(
                 "UPDATE memories SET superseded_by = ?, updated_at = ? WHERE id = ?",
                 params![superseded_by, stamp, id],
-            )?,
+            ),
             None => self.conn.execute(
                 "UPDATE memories SET superseded_by = ? WHERE id = ?",
                 params![superseded_by, id],
-            )?,
-        };
+            ),
+        })?;
         Ok(())
     }
 
@@ -307,23 +318,35 @@ impl<'c> Memories<'c> {
         new_import_id: &str,
         updated_at: &str,
     ) -> Result<usize> {
-        self.conn.execute(
-            "UPDATE memories
-                SET superseded_by = ?, updated_at = ?
+        let ids = memory_ids(
+            self.conn,
+            "SELECT id FROM memories
               WHERE superseded_by IS NULL
                 AND deleted_at IS NULL
                 AND json_extract(metadata, '$.import_id') = ?",
-            params![new_import_id, updated_at, old_import_id],
-        )
+            params![old_import_id],
+        )?;
+        for id in &ids {
+            self.set_superseded_by(id, new_import_id, Some(updated_at))?;
+        }
+        Ok(ids.len())
     }
 
     /// Hard-delete every memory of `category` belonging to the capture
     /// `capture_id`. Returns how many went.
     pub fn delete_capture_category(&self, capture_id: &str, category: &str) -> Result<usize> {
-        self.conn.execute(
-            "DELETE FROM memories WHERE capture_id = ? AND category = ?",
+        let ids = memory_ids(
+            self.conn,
+            "SELECT id FROM memories WHERE capture_id = ? AND category = ?",
             params![capture_id, category],
-        )
+        )?;
+        for id in &ids {
+            write_memory(self.conn, id, Origin::Local, || {
+                self.conn
+                    .execute("DELETE FROM memories WHERE id = ?", params![id])
+            })?;
+        }
+        Ok(ids.len())
     }
 
     /// Rewrite `id` as the merge of its cluster: content, summed access
@@ -336,20 +359,24 @@ impl<'c> Memories<'c> {
         tags: &[String],
         updated_at: &str,
     ) -> Result<()> {
-        self.conn.execute(
-            "UPDATE memories SET content = ?, access_count = ?, tags = ?, updated_at = ? WHERE id = ?",
-            params![content, access_count, tags_json(tags), updated_at, id],
-        )?;
+        write_memory(self.conn, id, Origin::Local, || {
+            self.conn.execute(
+                "UPDATE memories SET content = ?, access_count = ?, tags = ?, updated_at = ? WHERE id = ?",
+                params![content, access_count, tags_json(tags), updated_at, id],
+            )
+        })?;
         Ok(())
     }
 
     /// Set `id`'s vitality and status, without stamping `updated_at`: both
     /// are local scores, not edits.
     pub fn set_vitality(&self, id: &str, vitality: f64, status: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE memories SET vitality = ?, status = ? WHERE id = ?",
-            params![vitality, status, id],
-        )?;
+        write_memory(self.conn, id, Origin::Local, || {
+            self.conn.execute(
+                "UPDATE memories SET vitality = ?, status = ? WHERE id = ?",
+                params![vitality, status, id],
+            )
+        })?;
         Ok(())
     }
 
@@ -387,12 +414,14 @@ impl<'c> Memories<'c> {
         status: &str,
     ) -> Result<()> {
         // Cached: a search records an access for every result it returns.
-        self.conn
-            .prepare_cached(
-                "UPDATE memories SET accessed_at = ?, access_count = ?, vitality = ?, status = ?
-                  WHERE id = ?",
-            )?
-            .execute(params![accessed_at, access_count, vitality, status, id])?;
+        write_memory(self.conn, id, Origin::Local, || {
+            self.conn
+                .prepare_cached(
+                    "UPDATE memories SET accessed_at = ?, access_count = ?, vitality = ?, status = ?
+                      WHERE id = ?",
+                )?
+                .execute(params![accessed_at, access_count, vitality, status, id])
+        })?;
         Ok(())
     }
 
@@ -491,10 +520,20 @@ impl<'c> Memories<'c> {
     /// Set `metadata.ingest` to `marker` on every chunk of the import
     /// `doc_id`. Returns how many were stamped.
     pub fn set_ingest_marker(&self, doc_id: &str, marker: &str) -> Result<usize> {
-        self.conn.execute(
-            "UPDATE memories SET metadata = json_set(metadata, '$.ingest', ?) WHERE doc_id = ?",
-            params![marker, doc_id],
-        )
+        let ids = memory_ids(
+            self.conn,
+            "SELECT id FROM memories WHERE doc_id = ?",
+            params![doc_id],
+        )?;
+        for id in &ids {
+            write_memory(self.conn, id, Origin::Local, || {
+                self.conn.execute(
+                    "UPDATE memories SET metadata = json_set(metadata, '$.ingest', ?) WHERE id = ?",
+                    params![marker, id],
+                )
+            })?;
+        }
+        Ok(ids.len())
     }
 }
 

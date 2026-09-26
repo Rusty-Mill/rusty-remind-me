@@ -29,7 +29,8 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 /// The schema files, as shipped: what every open must converge on.
 const SCHEMA_TABLES: &str = include_str!("../src/db/schema_tables.sql");
 const SCHEMA_INDEXES: &str = include_str!("../src/db/schema_indexes.sql");
-const SCHEMA_TRIGGERS: &str = include_str!("../src/db/schema_triggers.sql");
+/// The triggers schema v30 and earlier carried, for building older databases.
+const V30_TRIGGERS: &str = include_str!("fixtures/schema_v30_triggers.sql");
 
 struct TempDb(PathBuf);
 
@@ -156,7 +157,6 @@ fn expected() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
     conn.execute_batch(SCHEMA_TABLES).unwrap();
     conn.execute_batch(SCHEMA_INDEXES).unwrap();
-    conn.execute_batch(SCHEMA_TRIGGERS).unwrap();
     conn
 }
 
@@ -173,9 +173,11 @@ fn every_index_matches_the_generated_schema() {
 }
 
 #[test]
-fn every_trigger_matches_the_generated_schema() {
+fn a_database_has_no_triggers() {
+    // The repositories keep derived data in step since schema v31; a trigger
+    // would do the same work a second time.
     let db = Database::open_in_memory().unwrap();
-    assert_matches_schema(&db.conn(), "trigger");
+    assert!(objects(&db.conn(), "trigger").is_empty());
 }
 
 #[test]
@@ -665,7 +667,7 @@ fn the_schema_version_is_the_current_one() {
     // (27 -> 29 covered its `sync_log.last_pull_seq` and the `reference`
     // refiling); 30 is this crate's own, vector chunks keyed by memory id
     // (ADR-0023).
-    assert_eq!(SCHEMA_VERSION, 30);
+    assert_eq!(SCHEMA_VERSION, 31);
 }
 
 #[test]
@@ -717,43 +719,34 @@ fn the_generated_schema_carries_every_v27_object() {
 
 #[test]
 fn the_outbox_payloads_carry_the_new_columns() {
-    // Gap S10. A synced peer reconstructs a memory from the trigger's
-    // json_object payload alone, so a column that exists in `memories` but not
-    // in the payload is silently dropped in transit — the failure is invisible
-    // locally and only shows up as data loss on the other node.
+    // Gap S10. A synced peer reconstructs a memory from the queued payload
+    // alone, so a column that exists in `memories` but not in the payload is
+    // silently dropped in transit: the failure is invisible locally and only
+    // shows up as data loss on the other node.
     let db = Database::open_in_memory().unwrap();
-    let triggers = objects(&db.conn(), "trigger");
-
-    for trigger in ["memories_outbox_ai", "memories_outbox_au"] {
-        let sql = triggers
-            .get(trigger)
-            .unwrap_or_else(|| panic!("{} is missing entirely", trigger));
-        for column in ["remind_at", "sensitive"] {
-            assert!(
-                sql.contains(column),
-                "{} does not carry {} in its payload; a synced peer would drop it",
-                trigger,
-                column
-            );
-        }
+    let conn = db.conn();
+    conn.execute(
+        "INSERT OR REPLACE INTO sync_flags (key, value) VALUES ('sync_enabled', '1')",
+        [],
+    )
+    .unwrap();
+    remind_me_core::db::memories::Memories::new(&conn)
+        .insert(&remind_me_core::db::memories::NewMemory::new(
+            "mem_s10",
+            "x",
+            "2026-01-01T00:00:00+00:00",
+        ))
+        .unwrap();
+    let payload: String = conn
+        .query_row("SELECT payload FROM sync_outbox", [], |r| r.get(0))
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    for column in ["remind_at", "sensitive"] {
+        assert!(
+            payload.get(column).is_some(),
+            "the payload does not carry {column}; a synced peer would drop it"
+        );
     }
-}
-
-#[test]
-fn the_read_amplification_guard_survived_regeneration() {
-    // Issue #100 hand-added `AND NEW.updated_at IS NOT OLD.updated_at` to
-    // `memories_outbox_au` ahead of this regeneration, on the reasoning that a
-    // v27 dump would reinstate the identical line and erase the exception.
-    // This asserts that actually happened rather than the fix being quietly
-    // regenerated away — which would restore the bug with no test failing.
-    let db = Database::open_in_memory().unwrap();
-    let triggers = objects(&db.conn(), "trigger");
-    let sql = triggers.get("memories_outbox_au").unwrap();
-    assert!(
-        sql.contains("new.updated_at is not old.updated_at"),
-        "memories_outbox_au lost its access-tracking guard: {}",
-        sql
-    );
 }
 
 #[test]
@@ -782,16 +775,13 @@ fn a_v19_database_with_rows_reconciles_to_the_current_version() {
             conn.execute_batch(&format!("ALTER TABLE {} DROP COLUMN {};", table, column))
                 .unwrap();
         }
-        // The v19 outbox triggers: the shipped ones with the two payload pairs
+        // The v19 outbox triggers: the v30 ones with the two payload pairs
         // v23/v26 added taken back out. Installed *after* the column drops so
-        // they reference only columns that exist at v19.
-        //
-        // This is what makes the S10 half of this issue testable at all. A
-        // database that already had triggers keeps them unless something
-        // replaces them, and a trigger whose json_object payload omits
-        // `remind_at`/`sensitive` drops those fields silently in transit — the
-        // receiving peer just never sees them.
-        let v19_triggers = SCHEMA_TRIGGERS
+        // they reference only columns that exist at v19. Opening must drop
+        // them: a trigger whose payload omits `remind_at`/`sensitive` drops
+        // those fields silently in transit, and any trigger at all would queue
+        // each edit a second time.
+        let v19_triggers = V30_TRIGGERS
             .replace(", 'remind_at', NEW.remind_at", "")
             .replace(", 'sensitive', NEW.sensitive", "");
         assert!(
@@ -836,30 +826,13 @@ fn a_v19_database_with_rows_reconciles_to_the_current_version() {
     assert_matches_schema(&conn, "index");
     assert_matches_schema(&conn, "trigger");
 
-    // Explicit rather than leaning on assert_matches_schema above: this is the
-    // S10 failure mode, and it is the one that would not announce itself. A
-    // stale trigger keeps working — it just quietly ships an incomplete payload
-    // to every peer, so the damage lands on a different machine.
-    //
-    // Note what this does *not* prove. On this path the triggers are replaced
-    // because `memories` and `sync_log` changed shape, so `rebuild_table` drops
-    // them along with the tables and the create pass puts them back — the
-    // assertion below still holds with `reconcile_triggers` removed entirely
-    // (checked). `reconcile_triggers` is what covers the other case, a trigger
-    // body changing while its table does not, and `outbox_test`'s
-    // `an_existing_database_has_its_stale_trigger_rebuilt_on_open` is the test
-    // that actually fails without it.
-    let triggers = objects(&conn, "trigger");
-    for trigger in ["memories_outbox_ai", "memories_outbox_au"] {
-        for column in ["remind_at", "sensitive"] {
-            assert!(
-                triggers[trigger].contains(column),
-                "{} was not replaced during reconciliation and still omits {}",
-                trigger,
-                column
-            );
-        }
-    }
+    // Explicit rather than leaning on assert_matches_schema above: a stale
+    // trigger keeps working, quietly shipping an incomplete payload to every
+    // peer, so the damage lands on a different machine.
+    assert!(
+        objects(&conn, "trigger").is_empty(),
+        "the v19 triggers survived reconciliation"
+    );
 
     // #95's pre-migration snapshot guard has to still fire for this step in
     // particular: v19 -> v27 is the largest reconciliation this crate has ever

@@ -1,15 +1,15 @@
 //! Coverage for outbox growth and its pruning.
 //!
-//! The outbox triggers arrived with the generated schema and fire on every
-//! write while sync is configured (`#76`'s `sync_flags` gate — every test
+//! The repositories queue an outbox row for every local write while sync is
+//! configured (triggers did this up to schema v30) (`#76`'s `sync_flags` gate — every test
 //! here runs with the three sync env vars set, via [`ensure_sync_enabled`],
 //! since this file is entirely about what accumulates once they do). Nothing
 //! in this crate drains the outbox on its own, so without a retention rule
 //! the table grows without bound — carrying a full JSON copy of the memory
 //! each time.
 //!
-//! Since issue #100 "every write" excludes access tracking: `memories_outbox_au`
-//! also requires `updated_at` to have moved, so a read no longer queues a row.
+//! Since issue #100 "every write" excludes access tracking: an update is
+//! queued only when `updated_at` moved, so a read no longer queues a row.
 //! Two tests here previously asserted the opposite and now pin the new
 //! behavior from both sides — a read queues nothing, a real edit still queues
 //! exactly one.
@@ -172,8 +172,11 @@ fn a_real_content_change_still_reaches_the_outbox() {
     assert_eq!(operation, "update");
 }
 
+/// The triggers schema v30 and earlier carried.
+const V30_TRIGGERS: &str = include_str!("fixtures/schema_v30_triggers.sql");
+
 #[test]
-fn an_existing_database_has_its_stale_trigger_rebuilt_on_open() {
+fn an_older_databases_triggers_are_dropped_on_open() {
     ensure_sync_enabled();
     let dir = std::env::temp_dir().join(format!("rrm_outbox_trigger_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -185,20 +188,21 @@ fn an_existing_database_has_its_stale_trigger_rebuilt_on_open() {
         let conn = db.conn();
         let id = add(&conn, "quokka sighting");
 
-        // Put the pre-#100 trigger back, exactly as a database created by an
-        // earlier build carries it: same body, no `updated_at` guard. Every
-        // statement in schema_triggers.sql is `CREATE TRIGGER IF NOT EXISTS`,
-        // so without reconciliation the next open would leave this in place.
-        let stale = conn
-            .query_row(
-                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='memories_outbox_au'",
-                [],
-                |r| r.get::<_, String>(0),
-            )
-            .unwrap()
+        // Put the triggers of schema v30 back, as an older build left them,
+        // with the pre-#100 `memories_outbox_au` that has no `updated_at`
+        // guard. Left in place, they would do the repositories' work a second
+        // time: every edit queued twice, and every read queued at all.
+        // Only the outbox triggers: with the index triggers as well, the
+        // full-text index would be written twice and corrupt before the
+        // reopen this test is about.
+        let stale: String = V30_TRIGGERS
+            .split("CREATE TRIGGER")
+            .filter(|statement| statement.contains("_outbox_"))
+            .map(|statement| format!("CREATE TRIGGER{statement}"))
+            .collect::<Vec<_>>()
+            .join("\n")
             .replace("AND NEW.updated_at IS NOT OLD.updated_at", "");
-        conn.execute_batch(&format!("DROP TRIGGER memories_outbox_au; {};", stale))
-            .unwrap();
+        conn.execute_batch(&stale).unwrap();
         conn.execute_batch("DELETE FROM sync_outbox;").unwrap();
 
         // Guard the guard: if this read did not amplify, the rest of the test
@@ -206,7 +210,7 @@ fn an_existing_database_has_its_stale_trigger_rebuilt_on_open() {
         search(&conn, "quokka");
         assert!(
             outbox_rows(&conn) > 0,
-            "the restored pre-#100 trigger should amplify reads"
+            "the restored pre-#100 trigger should queue reads"
         );
         id
     };
@@ -219,10 +223,18 @@ fn an_existing_database_has_its_stale_trigger_rebuilt_on_open() {
     assert_eq!(
         outbox_rows(&conn),
         0,
-        "reopening must have replaced the stale trigger, not skipped it"
+        "reopening must have dropped the old triggers"
     );
+    let triggers: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'trigger'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(triggers, 0);
 
-    // And the replacement is the real one, not merely a dropped trigger.
+    // And an edit is still queued, once: by the repository, not a trigger.
     queries::update_memory(
         &conn,
         &MemoryUpdateInput {

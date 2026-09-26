@@ -4,9 +4,7 @@
 //!
 //! Every statement that only reads or writes those tables lives here
 //! (ADR-0022). Statements that also read `sync_outbox` (fetching a push batch,
-//! counting pending rows, clearing and pruning) belong to the outbox, which is
-//! filled by triggers the Python `remind_me` shares, and stay in
-//! [`crate::sync`] until the outbox moves as a whole.
+//! counting pending rows, clearing and pruning) belong to [`crate::db::outbox`].
 //!
 //! Policy stays in [`crate::sync`] too: what a missing cursor means, what the
 //! epoch default means, and when a stamp is best-effort.

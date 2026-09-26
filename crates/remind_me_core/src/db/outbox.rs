@@ -2,10 +2,10 @@
 //! push) and their `sync_sends` markers.
 //!
 //! ADR-0023 phase 1, step 6. Every statement the sync modules ran against
-//! the outbox lives here. The triggers in `schema_triggers.sql` still write
-//! the rows; step 7 moves that into the repositories. The rules stay in
-//! [`crate::sync`]: when sync is enabled, the retention window, batch size,
-//! and how a payload decodes.
+//! the outbox lives here. The rows themselves are queued by the repositories
+//! as they write (`db::derived`, step 7). The rules stay in [`crate::sync`]:
+//! when sync is enabled, the retention window, batch size, and how a payload
+//! decodes.
 
 use rusqlite::{params, Connection, OptionalExtension, Result};
 
@@ -17,8 +17,8 @@ const NOW_ISO_EXPR: &str = "strftime('%Y-%m-%dT%H:%M:%f000', 'now') || '+00:00'"
 #[derive(Debug, Clone, PartialEq)]
 pub struct OutboxEntry {
     pub id: i64,
-    /// The `memory_id` column: the key the trigger wrote, which for a link
-    /// is its memory's id.
+    /// The `memory_id` column: the key the row was queued under, which for a
+    /// link is its memory's id.
     pub key: String,
     pub payload_json: String,
 }
@@ -31,26 +31,6 @@ pub struct Outbox<'c> {
 impl<'c> Outbox<'c> {
     pub fn new(conn: &'c Connection) -> Self {
         Self { conn }
-    }
-
-    /// The highest outbox id so far, or 0 for an empty outbox. A write's
-    /// own rows are those above the value read just before it.
-    pub fn high_water(&self) -> Result<i64> {
-        self.conn
-            .query_row("SELECT COALESCE(MAX(id), 0) FROM sync_outbox", [], |r| {
-                r.get(0)
-            })
-    }
-
-    /// Mark as sent, at `sent_at`, every unsent row for `key` above
-    /// `after_id`: the echo of a write that came from a peer, which must not
-    /// be pushed back to it.
-    pub fn suppress_echo(&self, key: &str, after_id: i64, sent_at: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE sync_outbox SET sent_at = ? WHERE id > ? AND memory_id = ? AND sent_at = ''",
-            params![sent_at, after_id, key],
-        )?;
-        Ok(())
     }
 
     /// Up to `limit` unsent rows above `after_id` not yet sent to
@@ -139,7 +119,7 @@ impl<'c> Outbox<'c> {
 
     /// Queue every memory, entity and mention link as an insert, stamped
     /// with SQLite's clock: what a node that just turned sync on owes its
-    /// remotes. Payloads have the shape the triggers write.
+    /// remotes. Payloads have the shape `db::derived` queues.
     pub fn backfill_everything(&self) -> Result<()> {
         self.conn.execute_batch(&format!(
             "INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
@@ -189,28 +169,6 @@ mod tests {
         )
         .unwrap();
         conn.last_insert_rowid()
-    }
-
-    #[test]
-    fn echo_suppression_touches_only_rows_above_the_mark() {
-        let db = Database::open_in_memory().unwrap();
-        let conn = db.conn();
-        let outbox = Outbox::new(&conn);
-        assert_eq!(outbox.high_water().unwrap(), 0);
-        queue(&conn, "m", "2026-09-26");
-        let mark = outbox.high_water().unwrap();
-        queue(&conn, "m", "2026-09-26");
-        queue(&conn, "other", "2026-09-26");
-
-        outbox.suppress_echo("m", mark, "2026-09-27").unwrap();
-
-        let unsent: Vec<String> = outbox
-            .unsent_to("hub", 0, 10)
-            .unwrap()
-            .into_iter()
-            .map(|e| e.key)
-            .collect();
-        assert_eq!(unsent, vec!["m", "other"]);
     }
 
     #[test]

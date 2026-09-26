@@ -37,6 +37,9 @@ fn plant_chat_import(conn: &Connection, ids: &[&str], import_id: &str) {
         rusqlite::params![import_id],
     )
     .unwrap();
+    // Planted with raw SQL, so it needs indexing to be searchable, and to be
+    // deletable without the full-text index losing track of it.
+    remind_me_core::db::derived::rebuild_indexes(conn).unwrap();
 }
 
 fn scalar(conn: &Connection, sql: &str) -> i64 {

@@ -2,6 +2,33 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-26 — No more SQLite triggers; schema v31 (ADR-0023, phase 1, step 7)
+
+### Breaking
+- **Schema version 31.**
+  - The fifteen triggers that maintained the full-text indexes, the tag index and the sync outbox are gone, and opening an older database drops them.
+  - `db::derived` does their work in the same savepoint as each write, so a failed write leaves the indexes as they were.
+  - A write made with raw SQL outside `db::` is no longer indexed or queued; `db::derived::rebuild_indexes` rebuilds the indexes from the rows.
+- **Synced records are no longer queued at all.** Before, the triggers queued them and the apply marked them sent. `sync_outbox` no longer holds sent echo rows, and `Outbox::high_water`/`suppress_echo` are removed.
+- `Entities::link` and `Entities::insert_relation_or_ignore` take an `Origin`.
+- `schema_triggers.sql` is removed. The v30 triggers are kept as a test fixture (`tests/fixtures/schema_v30_triggers.sql`).
+
+### Unchanged
+- Outbox payloads keep the triggers' shape exactly: SQLite's `json_object` over the same columns, with tags and metadata as JSON text and `sensitive` as 0 or 1. Peers and the hub need no change.
+- Access tracking still queues nothing, and a local edit queues exactly one row.
+
+### Tests
+- New `db::derived` tests:
+  - the index and tags follow a memory through insert, update and delete;
+  - only local edits that move `updated_at` are queued, and nothing is queued with sync off;
+  - a failed write leaves the index as it was;
+  - the payload keeps the trigger shape, all 28 keys.
+- Updated tests:
+  - the stale-trigger test now installs the v30 outbox triggers and checks that reopening drops them, so an edit is queued once;
+  - the v19 migration test checks that its triggers are gone;
+  - the echo test checks that an applied record queues nothing while local edits stay queued.
+- Fixtures that plant rows with raw SQL rebuild the indexes. The core, API, MCP, CLI and remote suites pass.
+
 ## 2026-09-26 — Vectors are keyed by memory id; schema v30 (ADR-0023, phase 1, step 4)
 
 ### Breaking

@@ -75,8 +75,8 @@ impl<'c> StoreStats<'c> {
         counts
     }
 
-    /// Live memories counted by tag, through the `memory_tags` index the
-    /// tag triggers keep in step with each row's JSON `tags`.
+    /// Live memories counted by tag, through the `memory_tags` index every
+    /// write keeps in step with each row's JSON `tags`.
     pub fn count_by_tag(&self) -> Result<BTreeMap<String, i64>> {
         let mut stmt = self.conn.prepare(
             "SELECT mt.tag, count(*) FROM memory_tags mt

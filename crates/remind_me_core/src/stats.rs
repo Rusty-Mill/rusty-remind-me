@@ -117,8 +117,8 @@ pub fn collect_dashboard(conn: &Connection) -> Result<DashboardStats> {
         categories: stats.count_by(GroupBy::Category)?,
         sources: stats.count_by(GroupBy::Source)?,
         // Via the normalized `memory_tags` index rather than parsing every
-        // row's JSON `tags` column (the reference's own approach): the tag
-        // triggers keep the two in step, and it avoids a `json_each` scan.
+        // row's JSON `tags` column (the reference's own approach): every write
+        // keeps the two in step, and it avoids a `json_each` scan.
         tags: stats.count_by_tag()?,
         db_path: path_text(&info),
         db_size_mb: size_mb(&info),

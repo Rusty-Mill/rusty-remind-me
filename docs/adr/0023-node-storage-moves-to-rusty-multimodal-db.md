@@ -352,8 +352,8 @@ unchanged after each.
 | 3 | Wiki pages, links and their index | `db::wiki::WikiIndex` | Done |
 | 4 | Vectors, re-keyed on memory id (§4) | `db::vectors::Vectors` | Done (schema v30) |
 | 5 | Promotions, imports, archives and curation queues | `db::promotions::Promotions`, … | In progress |
-| 6 | The outbox, with echo suppression as a flag | `db::outbox::Outbox` | Statements moved; the flag waits for step 7 |
-| 7 | Triggers move into the repositories | | |
+| 6 | The outbox, with echo suppression as a flag | `db::outbox::Outbox` | Done (the flag landed with step 7) |
+| 7 | Triggers move into the repositories | `db::derived` | Done (schema v31) |
 | 8 | Callers stop taking `&Connection` | | |
 
 Writes go first because the triggers fire on writes. Once each table's
@@ -505,6 +505,39 @@ Three knock-on changes:
 
 Tests build the v29 layout by hand and check the carry-over, the orphan
 drop, idempotence, and the refusal.
+
+**Step 7.** Schema v31 has no triggers. `db::derived` does what the
+fifteen triggers did, and every write in `db::` goes through it.
+
+`write_memory(id, origin, write)` runs a write to one memory inside a
+savepoint:
+- it takes the row out of the full-text index as it was;
+- it runs the write;
+- it puts the row back and rebuilds its tag rows, or drops them with the
+  row;
+- for a local write, it queues an outbox `insert` when the write created
+  the row, or an `update` when it moved `updated_at`. That is the old
+  `memories_outbox_au` guard, so access tracking still queues nothing.
+
+A write that can touch several memories (superseding an import, deleting a
+capture's skeleton, stamping an ingest marker, the v29 refile) selects the
+ids first and writes each in turn. Entity, relation and link writes queue
+their own rows. Wiki writes keep `wiki_fts` in step the same way.
+
+**The payloads keep the trigger shape.** They are still built by SQLite's
+`json_object` from the row as written, with the triggers' column lists, so
+tags and metadata travel as JSON text and `sensitive` as 0 or 1. A peer or
+the hub reads exactly what it read before.
+
+**Echo suppression is now `Origin::Sync`.** Sync apply passes it, and
+nothing is queued. Before, the triggers queued the echo and the apply
+marked it sent after a high-water mark. `Outbox::high_water` and
+`suppress_echo` are gone with that.
+
+**Opening an older database** drops the fifteen triggers by name. They hold
+no rows, and left in place they would index and queue everything twice.
+`db::derived::rebuild_indexes` rebuilds the indexes from the rows. Tests
+that plant rows with raw SQL call it, and it doubles as a repair.
 
 ## Related
 

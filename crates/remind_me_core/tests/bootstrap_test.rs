@@ -40,6 +40,9 @@ fn seed(conn: &Connection, id: &str, content: &str, category: &str, sensitive: b
         params![id, content, category, now, now, sensitive as i64],
     )
     .unwrap();
+    // Planted with raw SQL, so it needs indexing to be searchable, and to be
+    // deletable without the full-text index losing track of it.
+    remind_me_core::db::derived::rebuild_indexes(conn).unwrap();
 }
 
 /// A persona statement with real provenance, built through `promote` so the

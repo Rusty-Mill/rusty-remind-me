@@ -7,6 +7,7 @@
 //! [`crate::vitality`], and what makes a memory due for review in
 //! [`crate::recalibrate`], which passes its thresholds in.
 
+use crate::db::derived::{write_memory, Origin};
 use crate::models::RecalibrateCandidate;
 use rusqlite::{params, params_from_iter, Connection, Result};
 
@@ -77,10 +78,12 @@ impl<'c> Feedback<'c> {
         vitality: f64,
         status: &str,
     ) -> Result<()> {
-        self.conn.execute(
-            "UPDATE memories SET base_weight = ?, vitality = ?, status = ? WHERE id = ?",
-            params![base_weight, vitality, status, memory_id],
-        )?;
+        write_memory(self.conn, memory_id, Origin::Local, || {
+            self.conn.execute(
+                "UPDATE memories SET base_weight = ?, vitality = ?, status = ? WHERE id = ?",
+                params![base_weight, vitality, status, memory_id],
+            )
+        })?;
         Ok(())
     }
 

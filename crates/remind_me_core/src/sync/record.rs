@@ -7,7 +7,6 @@
 //! key collision. See `docs/adr/0004-sync-protocol-and-conflict-resolution.md`.
 
 use crate::db::memories::{Memories, NewMemory};
-use crate::db::outbox::Outbox;
 use chrono::Utc;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -63,9 +62,9 @@ where
     }
 }
 
-/// One `memories` row as it travels the wire, matching the column set this
-/// crate's `memories_outbox_ai`/`memories_outbox_au` triggers snapshot into
-/// `sync_outbox.payload` — see `crates/remind_me_core/src/db/schema_triggers.sql`.
+/// One `memories` row as it travels the wire, matching the column set
+/// `db::derived` snapshots into `sync_outbox.payload` (the triggers' column
+/// set up to schema v30).
 ///
 /// Deliberately does **not** include `doc_id`/`chunk_index`: the reference's
 /// own outbox payload carries them (for wire column-list parity across every
@@ -235,12 +234,9 @@ fn merge_metadata(local: &Value, incoming: &Value, incoming_wins: bool) -> Value
 /// means the incoming side loses -- it must be *strictly* newer to win),
 /// with `tags`/`metadata` merged regardless of the outcome.
 ///
-/// Any `sync_outbox` row this write itself creates (for this memory) is
-/// immediately marked sent -- echo suppression, so the next push cycle
-/// does not hand the remote back the very change it just sent us. A
-/// concurrent, genuinely local edit to the same memory is untouched: it
-/// can only have created outbox rows *before* this call's snapshot, which
-/// is exactly what scopes the suppression to this write's own echo.
+/// The write is never queued in the outbox (`Origin::Sync`), so the next
+/// push does not hand the remote back the change it just sent us. A
+/// genuinely local edit to the same memory is queued as usual.
 pub fn upsert_record(
     conn: &Connection,
     record: &SyncRecord,
@@ -268,8 +264,6 @@ pub fn upsert_record(
         None => true,
         Some(local) => updated_at > local.updated_at,
     };
-
-    let before_outbox_id = Outbox::new(conn).high_water()?;
 
     let outcome = if incoming_wins {
         let local_tags: &[String] = local.as_ref().map(|l| l.tags.as_slice()).unwrap_or(&[]);
@@ -326,8 +320,6 @@ pub fn upsert_record(
         }
         ApplyOutcome::NotApplied
     };
-
-    Outbox::new(conn).suppress_echo(&record.id, before_outbox_id, &Utc::now().to_rfc3339())?;
 
     Ok(outcome)
 }

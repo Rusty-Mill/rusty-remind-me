@@ -1,3 +1,4 @@
+use crate::db::derived::Origin;
 use crate::db::entities::{Entities, RelationRow};
 use crate::db::memories::Memories;
 use crate::models::EntityInput;
@@ -127,7 +128,12 @@ pub(crate) fn dedup_preserving_order<I: IntoIterator<Item = String>>(items: I) -
 /// Insert-or-ignore: mention links are immutable, and re-annotating with the
 /// same entity is a no-op rather than an error.
 pub fn link_memory_entity(conn: &Connection, memory_id: &str, entity_id: &str) -> Result<bool> {
-    Entities::new(conn).link(memory_id, entity_id, &Utc::now().to_rfc3339())
+    Entities::new(conn).link(
+        memory_id,
+        entity_id,
+        &Utc::now().to_rfc3339(),
+        Origin::Local,
+    )
 }
 
 /// Upsert each mentioned entity and link it to `memory_id`.
@@ -590,15 +596,18 @@ pub fn upsert_entity_relation(
     let now = Utc::now().to_rfc3339();
     let id = entity_relation_id(subject_entity_id, relation, object_entity_id);
     let label = relation.split_whitespace().collect::<Vec<_>>().join(" ");
-    Entities::new(conn).insert_relation_or_ignore(&RelationRow {
-        id: &id,
-        subject_entity_id,
-        relation: &label,
-        object_entity_id,
-        created_at: &now,
-        updated_at: &now,
-        node_id: Some(&crate::sync::configured_node_id()),
-    })
+    Entities::new(conn).insert_relation_or_ignore(
+        &RelationRow {
+            id: &id,
+            subject_entity_id,
+            relation: &label,
+            object_entity_id,
+            created_at: &now,
+            updated_at: &now,
+            node_id: Some(&crate::sync::configured_node_id()),
+        },
+        Origin::Local,
+    )
 }
 
 /// Best-effort: record a relation edge when an SPO triple names two *known*

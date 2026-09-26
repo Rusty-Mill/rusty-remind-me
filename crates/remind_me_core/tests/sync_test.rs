@@ -101,9 +101,17 @@ fn tags_union_merge_regardless_of_which_side_wins() {
     let db = Database::open_in_memory().unwrap();
     let conn = db.conn();
     let id = add(&conn, "local content");
-    conn.execute(
-        "UPDATE memories SET tags = '[\"local-tag\"]' WHERE id = ?",
-        [&id],
+    queries::update_memory(
+        &conn,
+        &remind_me_core::MemoryUpdateInput {
+            memory_id: id.clone(),
+            content: None,
+            category: None,
+            tags: Some(vec!["local-tag".to_string()]),
+            metadata: None,
+            sensitive: None,
+            clear_superseded: false,
+        },
     )
     .unwrap();
 
@@ -285,7 +293,7 @@ fn outbox_row_count(conn: &Connection, memory_id: &str, sent: bool) -> i64 {
 }
 
 #[test]
-fn applying_an_incoming_record_marks_only_its_own_echo_as_sent() {
+fn an_incoming_record_is_not_queued_and_local_edits_stay_queued() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     crate::test_env::set_var(NODE_ID_ENV, "local-node");
     crate::test_env::set_var(HUB_URL_ENV, "http://hub.example");
@@ -293,14 +301,18 @@ fn applying_an_incoming_record_marks_only_its_own_echo_as_sent() {
     let db = Database::open_in_memory().unwrap();
     let conn = db.conn();
     let id = add(&conn, "local content");
-    // A genuinely concurrent local edit, unrelated to the incoming pull.
-    // `updated_at` moves because that is what a real edit does — every writer
-    // in this crate bumps it — and since issue #100 the outbox trigger requires
-    // it. Leaving it unchanged here would model an access-tracking write, not
-    // an edit, and would queue nothing.
-    conn.execute(
-        "UPDATE memories SET content = 'a local edit', updated_at = ? WHERE id = ?",
-        rusqlite::params!["2029-01-01T00:00:00+00:00", &id],
+    // A genuinely local edit, unrelated to the incoming pull.
+    queries::update_memory(
+        &conn,
+        &remind_me_core::MemoryUpdateInput {
+            memory_id: id.clone(),
+            content: Some("a local edit".into()),
+            category: None,
+            tags: None,
+            metadata: None,
+            sensitive: None,
+            clear_superseded: false,
+        },
     )
     .unwrap();
     assert_eq!(
@@ -312,8 +324,8 @@ fn applying_an_incoming_record_marks_only_its_own_echo_as_sent() {
     let incoming = record(&id, "remote content", "2030-01-01T00:00:00+00:00");
     upsert_record(&conn, &incoming).unwrap();
 
-    // The local edit's own outbox row must survive unsuppressed -- only the
-    // row this very upsert just created is echo-suppressed.
+    // The applied record is never queued, so there is no echo to mark sent;
+    // the local rows are untouched.
     assert_eq!(
         outbox_row_count(&conn, &id, false),
         2,
@@ -321,8 +333,8 @@ fn applying_an_incoming_record_marks_only_its_own_echo_as_sent() {
     );
     assert_eq!(
         outbox_row_count(&conn, &id, true),
-        1,
-        "only this write's own echo is marked sent"
+        0,
+        "the applied record queued nothing"
     );
     crate::test_env::remove_var(NODE_ID_ENV);
     crate::test_env::remove_var(HUB_URL_ENV);

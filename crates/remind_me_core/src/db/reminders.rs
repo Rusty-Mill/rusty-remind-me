@@ -5,6 +5,7 @@
 //! [`crate::reminders`] and [`crate::scheduler`]: what a valid `remind_at`
 //! is, that a reminder must be in the future, and when a delivery counts.
 
+use crate::db::derived::{write_memory, Origin};
 use crate::db::queries::{parse_memory_row, prefixed_memory_columns};
 use crate::models::{Memory, ReminderWindow};
 use rusqlite::{params, Connection, OptionalExtension, Result};
@@ -34,17 +35,19 @@ impl<'c> Reminders<'c> {
 
     /// Set `memory_id`'s `remind_at`, or clear it with `None`, stamping
     /// `updated_at`. The stamp is what puts the change in the sync outbox
-    /// (by trigger) and what LWW compares.
+    /// and what LWW compares.
     pub fn set_remind_at(
         &self,
         memory_id: &str,
         remind_at: Option<&str>,
         updated_at: &str,
     ) -> Result<()> {
-        self.conn.execute(
-            "UPDATE memories SET remind_at = ?, updated_at = ? WHERE id = ?",
-            params![remind_at, updated_at, memory_id],
-        )?;
+        write_memory(self.conn, memory_id, Origin::Local, || {
+            self.conn.execute(
+                "UPDATE memories SET remind_at = ?, updated_at = ? WHERE id = ?",
+                params![remind_at, updated_at, memory_id],
+            )
+        })?;
         Ok(())
     }
 

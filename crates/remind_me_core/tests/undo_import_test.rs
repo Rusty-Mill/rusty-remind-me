@@ -22,6 +22,9 @@ fn plant_memory(conn: &Connection, id: &str, source: &str, doc_id: Option<&str>,
         rusqlite::params![id, format!("content {}", id), source, metadata, doc_id],
     )
     .unwrap();
+    // Planted with raw SQL, so it needs indexing to be searchable, and to be
+    // deletable without the full-text index losing track of it.
+    remind_me_core::db::derived::rebuild_indexes(conn).unwrap();
 }
 
 fn live_ids(conn: &Connection) -> Vec<String> {

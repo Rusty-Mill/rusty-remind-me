@@ -108,7 +108,7 @@ pub fn sync_status(conn: &Connection) -> Result<SyncStatus> {
             // Naming the specific variables beats "sync is off": the caller is
             // asking because they expected it to be on.
             hint: format!(
-                "set {} to enable sync; the outbox triggers stay gated off \
+                "set {} to enable sync; nothing is queued in the outbox \
                  until then, so nothing accumulates in the meantime",
                 missing.join(", ")
             ),

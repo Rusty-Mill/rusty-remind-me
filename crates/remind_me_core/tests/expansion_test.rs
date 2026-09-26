@@ -45,6 +45,9 @@ fn chunk(conn: &Connection, id: &str, content: &str, doc: &str, index: i64) {
         rusqlite::params![id, content, doc, index],
     )
     .unwrap();
+    // Planted with raw SQL, so it needs indexing to be searchable, and to be
+    // deletable without the full-text index losing track of it.
+    remind_me_core::db::derived::rebuild_indexes(conn).unwrap();
 }
 
 fn search(

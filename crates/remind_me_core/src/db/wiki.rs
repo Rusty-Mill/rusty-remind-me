@@ -7,6 +7,7 @@
 //! The rules stay with them: slugs, reserved pages, what a reconcile
 //! re-indexes, the load budget and the compile watermark.
 
+use crate::db::derived::write_wiki_page;
 use crate::wiki::{WikiPage, WikiSearchHit};
 use rusqlite::{params, Connection, OptionalExtension, Result, Row};
 use std::collections::HashMap;
@@ -45,6 +46,11 @@ impl<'c> WikiIndex<'c> {
 
     /// Store `page`, replacing every column of an existing row with its slug.
     pub fn upsert(&self, page: &WikiPage) -> Result<()> {
+        write_wiki_page(self.conn, &page.slug, || self.upsert_row(page))?;
+        Ok(())
+    }
+
+    fn upsert_row(&self, page: &WikiPage) -> Result<usize> {
         self.conn.execute(
             "INSERT INTO wiki_pages (slug, title, content, summary, mtime, updated_at)
              VALUES (?, ?, ?, ?, ?, ?)
@@ -60,8 +66,7 @@ impl<'c> WikiIndex<'c> {
                 page.mtime,
                 page.updated_at
             ],
-        )?;
-        Ok(())
+        )
     }
 
     /// Store a page that no file backs: a new row gets mtime 0, and an
@@ -74,16 +79,18 @@ impl<'c> WikiIndex<'c> {
         summary: &str,
         updated_at: &str,
     ) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO wiki_pages (slug, title, content, summary, mtime, updated_at)
+        write_wiki_page(self.conn, slug, || {
+            self.conn.execute(
+                "INSERT INTO wiki_pages (slug, title, content, summary, mtime, updated_at)
              VALUES (?, ?, ?, ?, 0, ?)
              ON CONFLICT(slug) DO UPDATE SET
                 title = excluded.title,
                 content = excluded.content,
                 summary = excluded.summary,
                 updated_at = excluded.updated_at",
-            params![slug, title, content, summary, updated_at],
-        )?;
+                params![slug, title, content, summary, updated_at],
+            )
+        })?;
         Ok(())
     }
 
@@ -145,9 +152,10 @@ impl<'c> WikiIndex<'c> {
     /// Remove the page `slug` and the links out of it. Returns whether a
     /// page was there.
     pub fn remove(&self, slug: &str) -> Result<bool> {
-        let removed = self
-            .conn
-            .execute("DELETE FROM wiki_pages WHERE slug = ?", params![slug])?;
+        let removed = write_wiki_page(self.conn, slug, || {
+            self.conn
+                .execute("DELETE FROM wiki_pages WHERE slug = ?", params![slug])
+        })?;
         self.conn
             .execute("DELETE FROM wiki_links WHERE src_slug = ?", params![slug])?;
         Ok(removed > 0)

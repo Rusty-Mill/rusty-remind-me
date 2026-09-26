@@ -475,7 +475,9 @@ mod tests {
         let entities = crate::db::entities::Entities::new(&conn);
         for id in ["a", "b", "c"] {
             memories.insert(&NewMemory::new(id, id, NOW)).unwrap();
-            entities.link(id, "e", NOW).unwrap();
+            entities
+                .link(id, "e", NOW, crate::db::derived::Origin::Local)
+                .unwrap();
         }
         let curation = Curation::new(&conn);
         assert_eq!(curation.count_contradiction_pairs(20).unwrap(), 3);

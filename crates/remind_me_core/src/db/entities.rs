@@ -6,6 +6,7 @@
 //! name normalises into an id, how aliases merge, which kind wins, how a
 //! traversal walks, and how sync resolves a conflict.
 
+use crate::db::derived::{queue_entity, queue_link, queue_relation, Origin};
 use crate::entity::{Entity, EntityFact, EntityLinkedMemory, EntityListItem, RelationEdge};
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Result, Row};
@@ -98,8 +99,9 @@ impl<'c> Entities<'c> {
         rows
     }
 
-    /// Insert `entity`, created and updated at its own stamps, recording
-    /// `node_id` as its origin. An existing id is an error.
+    /// Insert `entity`, made on this node, created and updated at its own
+    /// stamps, recording `node_id` as where it was made. An existing id is an
+    /// error.
     pub fn insert(&self, entity: &Entity, node_id: Option<&str>) -> Result<()> {
         self.conn.execute(
             "INSERT INTO entities (id, name, kind, aliases, created_at, updated_at, node_id)
@@ -114,7 +116,7 @@ impl<'c> Entities<'c> {
                 node_id,
             ],
         )?;
-        Ok(())
+        queue_entity(self.conn, &entity.id, "insert")
     }
 
     /// Set `id`'s kind and aliases, stamping `updated_at`.
@@ -129,7 +131,7 @@ impl<'c> Entities<'c> {
             "UPDATE entities SET kind = ?, aliases = ?, updated_at = ? WHERE id = ?",
             params![kind, aliases_json(aliases), updated_at, id],
         )?;
-        Ok(())
+        queue_entity(self.conn, id, "update")
     }
 
     /// How many entities there are.
@@ -171,11 +173,12 @@ impl<'c> Entities<'c> {
     // --- id renormalisation ----------------------------------------------
 
     /// Rename the entity `from` to `to`, where `to` is free. Links and
-    /// relations are repointed separately.
+    /// relations are repointed separately. Queued for sync as an update of
+    /// `to`.
     pub fn rename(&self, from: &str, to: &str) -> Result<()> {
         self.conn
             .execute("UPDATE entities SET id = ? WHERE id = ?", params![to, from])?;
-        Ok(())
+        queue_entity(self.conn, to, "update")
     }
 
     /// Set `id`'s kind, aliases and `created_at`, without stamping
@@ -191,7 +194,7 @@ impl<'c> Entities<'c> {
             "UPDATE entities SET kind = ?, aliases = ?, created_at = ? WHERE id = ?",
             params![kind, aliases_json(aliases), created_at, id],
         )?;
-        Ok(())
+        queue_entity(self.conn, id, "update")
     }
 
     /// Delete the entity `id`. Its links and relations are not touched.
@@ -231,13 +234,22 @@ impl<'c> Entities<'c> {
 
     /// Record that `memory_id` mentions `entity_id`. Returns whether the
     /// link is new: links are immutable, so an existing one is left as is.
-    pub fn link(&self, memory_id: &str, entity_id: &str, created_at: &str) -> Result<bool> {
+    pub fn link(
+        &self,
+        memory_id: &str,
+        entity_id: &str,
+        created_at: &str,
+        origin: Origin,
+    ) -> Result<bool> {
         let inserted = self.conn.execute(
             "INSERT OR IGNORE INTO memory_entities (memory_id, entity_id, created_at)
              VALUES (?, ?, ?)",
             params![memory_id, entity_id, created_at],
-        )?;
-        Ok(inserted > 0)
+        )? > 0;
+        if inserted && origin == Origin::Local {
+            queue_link(self.conn, memory_id, entity_id)?;
+        }
+        Ok(inserted)
     }
 
     /// Live memories linked to `entity_id`, newest first, at most `limit`,
@@ -313,7 +325,7 @@ impl<'c> Entities<'c> {
 
     /// Insert `row` unless its id is already taken. Returns whether it was
     /// inserted: relations are immutable.
-    pub fn insert_relation_or_ignore(&self, row: &RelationRow<'_>) -> Result<bool> {
+    pub fn insert_relation_or_ignore(&self, row: &RelationRow<'_>, origin: Origin) -> Result<bool> {
         let inserted = self.conn.execute(
             "INSERT OR IGNORE INTO entity_relations
                  (id, subject_entity_id, relation, object_entity_id, created_at, updated_at, node_id)
@@ -327,8 +339,11 @@ impl<'c> Entities<'c> {
                 row.updated_at,
                 row.node_id,
             ],
-        )?;
-        Ok(inserted > 0)
+        )? > 0;
+        if inserted && origin == Origin::Local {
+            queue_relation(self.conn, row.id)?;
+        }
+        Ok(inserted)
     }
 
     /// Every relation with either end in `entity_ids`, and `relation` as its
@@ -414,7 +429,7 @@ impl<'c> Entities<'c> {
 
     /// Write an entity a peer sent: insert it, or overwrite the local row's
     /// name, kind, aliases, `updated_at` and `node_id`. The local
-    /// `created_at` is kept.
+    /// `created_at` is kept. Never queued for sync: it came from there.
     pub fn upsert_synced(&self, entity: &Entity, node_id: Option<&str>) -> Result<()> {
         self.conn.execute(
             "INSERT INTO entities (id, name, kind, aliases, created_at, updated_at, node_id)
@@ -439,7 +454,8 @@ impl<'c> Entities<'c> {
     }
 
     /// Replace `id`'s aliases without stamping `updated_at`: a sync merge
-    /// that lost last-write-wins still keeps the union.
+    /// that lost last-write-wins still keeps the union. Never queued for
+    /// sync.
     pub fn set_aliases(&self, id: &str, aliases: &[String]) -> Result<()> {
         self.conn.execute(
             "UPDATE entities SET aliases = ? WHERE id = ?",
@@ -489,10 +505,18 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let conn = db.conn();
         let entities = Entities::new(&conn);
-        assert!(entities.link("m1", "old", T1).unwrap());
-        assert!(entities.link("m1", "new", T1).unwrap());
-        assert!(entities.link("m2", "old", T1).unwrap());
-        assert!(!entities.link("m2", "old", T2).unwrap());
+        assert!(entities
+            .link("m1", "old", T1, crate::db::derived::Origin::Local)
+            .unwrap());
+        assert!(entities
+            .link("m1", "new", T1, crate::db::derived::Origin::Local)
+            .unwrap());
+        assert!(entities
+            .link("m2", "old", T1, crate::db::derived::Origin::Local)
+            .unwrap());
+        assert!(!entities
+            .link("m2", "old", T2, crate::db::derived::Origin::Local)
+            .unwrap());
 
         entities.repoint("old", "new").unwrap();
 

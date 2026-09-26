@@ -54,14 +54,14 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
         crate::vectors::reconcile_embedding_meta(conn, &embedder.identity())?;
     }
 
-    // Every outbox trigger (memories and the graph tables alike) is gated on
+    // Every outbox write (memories and the graph tables alike) is gated on
     // sync_flags.sync_enabled -- align it with the current configuration on
     // every open, exactly like the reference does, before anything else
     // touches sync_outbox.
     crate::sync::reconcile_sync_enabled_flag(conn)?;
 
-    // The outbox triggers fire on every write while the gate above is on, but
-    // nothing here drains them. Applying the reference's own retention rule
+    // Every local edit is queued while the gate above is on, but nothing here
+    // drains the outbox. Applying the reference's own retention rule
     // on open keeps that from growing without bound.
     crate::sync::prune_outbox(conn)?;
 

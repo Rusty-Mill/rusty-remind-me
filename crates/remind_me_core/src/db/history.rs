@@ -5,6 +5,7 @@
 //! [`crate::history`]: which columns are tracked, what counts as a change,
 //! and that a revert is itself a revisioned edit.
 
+use crate::db::derived::{write_memory, Origin};
 use crate::models::MemoryRevision;
 use rusqlite::{params, Connection, OptionalExtension, Result};
 
@@ -134,6 +135,13 @@ impl<'c> Revisions<'c> {
     /// Write `values` into `memory_id`'s tracked columns, stamping
     /// `updated_at`. A `None` `sensitive` is written as not sensitive.
     pub fn restore(&self, memory_id: &str, values: &Tracked, updated_at: &str) -> Result<()> {
+        write_memory(self.conn, memory_id, Origin::Local, || {
+            self.write_tracked(memory_id, values, updated_at)
+        })?;
+        Ok(())
+    }
+
+    fn write_tracked(&self, memory_id: &str, values: &Tracked, updated_at: &str) -> Result<usize> {
         self.conn.execute(
             "UPDATE memories
                 SET content = ?, category = ?, tags = ?, metadata = ?,
@@ -148,8 +156,7 @@ impl<'c> Revisions<'c> {
                 updated_at,
                 memory_id
             ],
-        )?;
-        Ok(())
+        )
     }
 }
 

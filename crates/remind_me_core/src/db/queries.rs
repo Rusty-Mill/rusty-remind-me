@@ -1,3 +1,4 @@
+use crate::db::derived::{write_memory, Origin};
 use crate::db::memories::{Memories, NewMemory};
 use crate::expansion::{self, MemorySearchResponse};
 use crate::fts::sanitize_fts_query;
@@ -171,8 +172,8 @@ pub fn get_memory_by_id(conn: &Connection, id: &str) -> Result<Option<Memory>> {
 ///
 /// Tag matching is ALL-of, one `EXISTS` per requested tag, against the
 /// normalized `memory_tags` index. That table is kept in step with the JSON
-/// `tags` column by the `memories_tags_ai` / `_au` / `_ad` triggers, so the two
-/// representations cannot drift.
+/// `tags` column by every write (`db::derived`), so the two representations
+/// cannot drift.
 ///
 /// The predicate stays in SQL rather than filtering parsed rows in Rust, which
 /// is what lets `COUNT`, `LIMIT` and `OFFSET` stay correct — the reference hit
@@ -333,10 +334,12 @@ pub fn update_memory(conn: &Connection, input: &MemoryUpdateInput) -> Result<Upd
     bindings.push(Value::Text(Utc::now().to_rfc3339()));
     bindings.push(Value::Text(input.memory_id.clone()));
 
-    conn.execute(
-        &format!("UPDATE memories SET {} WHERE id = ?", sets.join(", ")),
-        params_from_iter(bindings.iter()),
-    )?;
+    write_memory(conn, &input.memory_id, Origin::Local, || {
+        conn.execute(
+            &format!("UPDATE memories SET {} WHERE id = ?", sets.join(", ")),
+            params_from_iter(bindings.iter()),
+        )
+    })?;
 
     // Only a content change invalidates the stored embeddings — category,
     // tags and metadata don't change what the text means. Best-effort, same
@@ -359,25 +362,17 @@ pub fn update_memory(conn: &Connection, input: &MemoryUpdateInput) -> Result<Upd
 ///
 /// Soft-deletes (tombstones via `deleted_at` + bumps `updated_at`) when sync
 /// is configured (`NODE_ID and HUB_URL and SYNC_SECRET`, `#57`), matching the
-/// reference exactly: a hard `DELETE` produces no outbox row at all (the
-/// sync triggers only fire on INSERT/UPDATE), so it would otherwise silently
-/// resurrect on the next pull elsewhere. The tombstone is excluded from every
+/// reference exactly: a hard `DELETE` queues no outbox row at all, so it
+/// would otherwise silently resurrect on the next pull elsewhere. The tombstone is excluded from every
 /// normal read (`deleted_at IS NULL` everywhere this crate reads memories)
 /// and, on a node with sync disabled, there is nothing to propagate to, so
 /// this is a plain, immediate delete exactly as before.
 ///
-/// **Known limitation**: the installed `memories_outbox_au` trigger's
-/// payload (`schema_triggers.sql`, generated verbatim and not this crate's
-/// file to hand-edit) does not carry `deleted_at` at all, so this tombstone
-/// does not yet actually propagate over the wire even though the row is
-/// correctly marked locally — see
-/// `docs/adr/0004-sync-protocol-and-conflict-resolution.md`'s "Known
-/// limitation" section. There is no background compaction of old tombstones
-/// yet either (the reference's own `TOMBSTONE_RETENTION_DAYS`); both are
-/// left for a follow-up once the schema carries what tombstone propagation
-/// actually needs.
+/// The queued payload carries `deleted_at`, so the tombstone travels. There
+/// is no background compaction of old tombstones on the node yet (the
+/// reference's own `TOMBSTONE_RETENTION_DAYS`).
 ///
-/// The FTS row and `memory_tags` are handled by triggers. Everything else is
+/// The FTS row and `memory_tags` go with the write (`db::derived`). Everything else is
 /// cleaned up explicitly, because the reference's schema carries **no foreign
 /// keys** on `memory_entities`, `memory_feedback` or `memory_associations` —
 /// deliberately, since sync can deliver a link before the memory it points at,
@@ -403,18 +398,20 @@ pub fn delete_memory(conn: &Connection, memory_id: &str) -> Result<bool> {
     // either path.
     crate::vectors::delete_chunks_for_memory(conn, memory_id)?;
 
-    let affected = if crate::sync::sync_enabled() {
-        let now = Utc::now().to_rfc3339();
-        conn.execute(
-            "UPDATE memories SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL",
-            params![now, now, memory_id],
-        )?
-    } else {
-        conn.execute(
-            "DELETE FROM memories WHERE id = ? AND deleted_at IS NULL",
-            params![memory_id],
-        )?
-    };
+    let affected = write_memory(conn, memory_id, Origin::Local, || {
+        if crate::sync::sync_enabled() {
+            let now = Utc::now().to_rfc3339();
+            conn.execute(
+                "UPDATE memories SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL",
+                params![now, now, memory_id],
+            )
+        } else {
+            conn.execute(
+                "DELETE FROM memories WHERE id = ? AND deleted_at IS NULL",
+                params![memory_id],
+            )
+        }
+    })?;
     if affected == 0 {
         return Ok(false);
     }
@@ -483,14 +480,16 @@ pub fn bulk_tag(conn: &Connection, input: &BulkTagInput) -> Result<BulkTagResult
             ),
         };
 
-        conn.execute(
-            "UPDATE memories SET tags = ?, updated_at = ? WHERE id = ?",
-            params![
-                serde_json::to_string(&new_tags).unwrap_or_else(|_| "[]".to_string()),
-                now,
-                id
-            ],
-        )?;
+        write_memory(conn, id, Origin::Local, || {
+            conn.execute(
+                "UPDATE memories SET tags = ?, updated_at = ? WHERE id = ?",
+                params![
+                    serde_json::to_string(&new_tags).unwrap_or_else(|_| "[]".to_string()),
+                    now,
+                    id
+                ],
+            )
+        })?;
         result.updated.push(id.clone());
     }
 
@@ -538,10 +537,12 @@ pub fn annotate_memories(conn: &Connection, input: &AnnotateInput) -> Result<Ann
         bindings.push(Value::Text(now.clone()));
         bindings.push(Value::Text(annotation.memory_id.clone()));
 
-        conn.execute(
-            &format!("UPDATE memories SET {} WHERE id = ?", sets.join(", ")),
-            params_from_iter(bindings.iter()),
-        )?;
+        write_memory(conn, &annotation.memory_id, Origin::Local, || {
+            conn.execute(
+                &format!("UPDATE memories SET {} WHERE id = ?", sets.join(", ")),
+                params_from_iter(bindings.iter()),
+            )
+        })?;
 
         let entities_linked = crate::entity::apply_entity_mentions(
             conn,
@@ -593,15 +594,17 @@ pub fn reclassify_memories(conn: &Connection, input: &ReclassifyInput) -> Result
             continue;
         }
 
-        conn.execute(
-            "UPDATE memories SET memory_type = ?, decay_rate = ?, updated_at = ? WHERE id = ?",
-            params![
-                classification.memory_type,
-                get_decay_rate(&classification.memory_type),
-                now,
-                classification.memory_id
-            ],
-        )?;
+        write_memory(conn, &classification.memory_id, Origin::Local, || {
+            conn.execute(
+                "UPDATE memories SET memory_type = ?, decay_rate = ?, updated_at = ? WHERE id = ?",
+                params![
+                    classification.memory_type,
+                    get_decay_rate(&classification.memory_type),
+                    now,
+                    classification.memory_id
+                ],
+            )
+        })?;
         updated += 1;
     }
 

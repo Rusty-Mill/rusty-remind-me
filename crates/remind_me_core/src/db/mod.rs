@@ -1,5 +1,6 @@
 pub mod archives;
 pub mod curation;
+pub mod derived;
 pub mod entities;
 pub mod feedback;
 pub mod history;

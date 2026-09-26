@@ -117,10 +117,10 @@ Input (MemoryAddInput)
   ▼
 SQLite Database (`memories` table)
   │
-  └──► Automatic SQLite Trigger (`memories_ai`)
+  └──► db::derived::write_memory, in the same savepoint
          │
          ▼
-       SQLite FTS5 Index (`memories_fts`)
+       SQLite FTS5 Index (`memories_fts`), `memory_tags`, and the sync outbox
 ```
 
 ### B. Read & Search Path (`remind_me_search` / `search_memories`)
@@ -172,11 +172,13 @@ same reason §5 stopped reproducing the schema DDL.
 
 ---
 
-## 5. Database Schema Specification (Version 29)
+## 5. Database Schema Specification (Version 31)
 
-The schema lives in `crates/remind_me_core/src/db/`: `schema_tables.sql`,
-`schema_indexes.sql` and `schema_triggers.sql`. They were dumped verbatim from
-the Python `remind_me` at `_SCHEMA_VERSION = 29`, while the two shared a
+The schema lives in `crates/remind_me_core/src/db/`: `schema_tables.sql` and
+`schema_indexes.sql`. There are no triggers since v31: the repositories keep
+the full-text indexes, the tag index and the outbox in step
+(`db::derived`). The files were dumped verbatim from the Python `remind_me`
+at `_SCHEMA_VERSION = 29`, while the two shared a
 database file (ADR-0007). That reference is retired (ADR-0023), so the files
 are hand-owned now. `db/migrations.rs` reconciles any database it opens against
 them and stamps `PRAGMA user_version` (`SCHEMA_VERSION` in `db/migrations.rs`;
@@ -200,7 +202,7 @@ The copy that was here had gone stale in exactly that way — it still showed
 | The exact current DDL | `crates/remind_me_core/src/db/schema_*.sql` |
 | How an existing database is brought to it | `db/migrations.rs` (module docs: reconciliation, not a ladder) |
 | Where the schema came from | ADR-0007, and ADR-0023 for why it is hand-owned now |
-| Whether an open database matches it | `crates/remind_me_core/tests/schema_test.rs` — compares every table, index and trigger by normalised DDL |
+| Whether an open database matches it | `crates/remind_me_core/tests/schema_test.rs` — compares every table and index by normalised DDL, and checks there are no triggers |
 
 ### Objects this crate adds beyond the schema files
 
