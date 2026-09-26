@@ -7,6 +7,7 @@ Dated entries, newest first. One entry per merged pull request.
 ### Changed
 - **No SQL against the node's store is left outside `db::`.** Expansion's reads and association writes (`db::related`), the peer server's pull feeds and counts (`db::sync_feed`), the digest, vitality report, code-reference scan, export, sync status and reconcile reads moved into repositories. `db::database_path` replaces six copies of `PRAGMA database_list`.
 - The only remaining SQL outside `db::` reads the foreign SQLite files the dbs and mempalace importers take in. Behaviour is unchanged.
+- ADR-0023: step 8b (a store handle replacing `&Connection`) moves to phase 4, where the engine-backed `NodeStore` gives it a second implementation. Phase 1 is complete.
 
 ### Tests
 - New repository test: a co-retrieval pair is read from either side and its weight is capped.

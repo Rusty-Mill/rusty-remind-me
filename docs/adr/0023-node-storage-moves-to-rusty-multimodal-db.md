@@ -263,10 +263,10 @@ those two importers are gated off or rewritten.
 | Phase | What | Ships |
 |---|---|---|
 | 0 | **Retire Python.** Drop the schema-drift CI and scripts. Rewrite Tenet 3. Make the `schema_*.sql` files hand-owned. Mark `CUTOVER.md` and `gap-analysis.md` historical. Fix `configure_mcp.py`'s stale path. | Docs and CI only |
-| 1 | **Finish the seam.** Put every remaining table group behind a repository, then move the triggers and echo suppression into the repositories (FTS, tags, outbox). Re-key vectors on memory id. Drop `&Connection` from callers. | Several PRs, one group at a time, SQLite still underneath |
+| 1 | **Finish the seam.** Put every remaining table group behind a repository, then move the triggers and echo suppression into the repositories (FTS, tags, outbox). Re-key vectors on memory id. | Several PRs, one group at a time, SQLite still underneath |
 | 2 | **The daemon.** `rusty-remind-me daemon` on SQLite; MCP, CLI, hooks, `api` and `remote` become clients; auto-start. | Behaviour-preserving |
 | 3 | **Engine additions.** Full-text index, write batches, sequence allocators, directory lock (§3). | Engine PRs, each with its own tests |
-| 4 | **The engine-backed store.** `NodeStore` on the engine, run by the same test suite as the SQLite store, plus the copy tool (§5). | Behind a feature, off by default |
+| 4 | **The engine-backed store.** Callers take a `NodeStore` handle instead of `&Connection`. `NodeStore` on the engine, run by the same test suite as the SQLite store, plus the copy tool (§5). | Behind a feature, off by default |
 | 5 | **Switch.** The engine becomes the default and the daemon copies on first start. | Default switch |
 | 6 | **Remove.** Delete the SQLite store and its schema. | Removal |
 
@@ -351,10 +351,10 @@ unchanged after each.
 | 2 | Entities, relations and mentions | `db::entities::Entities` | Done |
 | 3 | Wiki pages, links and their index | `db::wiki::WikiIndex` | Done |
 | 4 | Vectors, re-keyed on memory id (§4) | `db::vectors::Vectors` | Done (schema v30) |
-| 5 | Promotions, imports, archives and curation queues | `db::promotions::Promotions`, … | In progress |
+| 5 | Promotions, imports, archives and curation queues | `db::promotions::Promotions`, … | Done |
 | 6 | The outbox, with echo suppression as a flag | `db::outbox::Outbox` | Done (the flag landed with step 7) |
 | 7 | Triggers move into the repositories | `db::derived` | Done (schema v31) |
-| 8 | Callers stop taking `&Connection` | a store handle | 8a done: no SQL outside `db::` |
+| 8 | Callers stop taking `&Connection` | a store handle | 8a done: no SQL outside `db::`; 8b moved to phase 4 |
 
 Writes go first because the triggers fire on writes. Once each table's
 writes have one home, step 7 moves its triggers there in one place.
@@ -554,6 +554,14 @@ that plant rows with raw SQL call it, and it doubles as a repair.
 
 The only SQL left outside `db::` reads the foreign SQLite files the dbs and
 mempalace importers take in (§6).
+
+**Step 8b moves to phase 4.** Replacing `&Connection` with a store handle
+touches about 100 public functions in core, 40 in the api, mcp, cli and
+remote crates, and 88 test files with some 370 raw-SQL sites. Done now, the
+handle would only wrap a `Connection`: an abstraction with one backend.
+Phase 4 introduces the engine-backed store, so the trait is shaped once,
+against two real implementations, and callers change once. With 8a done,
+phase 1 is complete.
 
 ## Related
 
