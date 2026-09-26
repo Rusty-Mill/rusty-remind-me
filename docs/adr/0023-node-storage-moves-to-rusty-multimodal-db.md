@@ -429,6 +429,21 @@ Loading a candidate's source memories moved to `db::memories::get_many`.
 The rules stay in `promotion.rs`: which rung reads which category, the fact
 threshold, the persona floor, and demotion as a read-time judgement.
 
+**Step 5b.** Import bookkeeping has two repositories:
+- `db::archives::Archives` holds `import_archives` and
+  `import_archive_spans`, which it now creates at open. It records
+  archives and spans, looks up a memory's source span, forgets an import,
+  counts a blob's references, and lists archives for pruning.
+- `db::imports::ImportLedger` holds `chat_imports`, `dbs_imports` and
+  `mempalace_imports`. It covers recording, the already-imported lookups,
+  the undo's per-kind memory queries (tracked and untracked mempalace
+  content alike), and forgetting tracking rows. A chat import still loses
+  its row only once nothing of it is left.
+
+Reading the foreign SQLite files the dbs and mempalace importers take in
+stays with them (§6). The rules stay in `archive.rs`, `undo_import.rs` and
+the importers.
+
 ## Related
 
 - ADR-0021 (the hub's move) and ADR-0022 (the seam this continues).

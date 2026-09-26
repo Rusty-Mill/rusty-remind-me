@@ -44,7 +44,7 @@
 //!
 //! `promotions` is this crate's own table, created at open by
 //! [`crate::db::promotions::ensure_table`] the way `vectors::ensure_schema`
-//! creates `vec_embeddings` and `archive::ensure_schema` creates its own
+//! creates `vec_embeddings` and `db::archives::ensure_tables` creates its own
 //! (ARCHITECTURE.md §5).
 
 use crate::db::memories::{Memories, NewMemory};

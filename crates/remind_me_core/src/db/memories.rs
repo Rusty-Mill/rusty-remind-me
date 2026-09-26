@@ -475,6 +475,29 @@ impl<'c> Memories<'c> {
         rows
     }
 
+    /// Whether `id` exists.
+    pub fn exists(&self, id: &str) -> Result<bool> {
+        let found: Option<i64> = self
+            .conn
+            .query_row("SELECT 1 FROM memories WHERE id = ?", params![id], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        Ok(found.is_some())
+    }
+
+    /// Whether `id` is marked sensitive, or `None` when there is no such
+    /// memory.
+    pub fn sensitivity(&self, id: &str) -> Result<Option<bool>> {
+        self.conn
+            .query_row(
+                "SELECT sensitive FROM memories WHERE id = ?",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()
+    }
+
     /// Set `metadata.ingest` to `marker` on every chunk of the import
     /// `doc_id`. Returns how many were stamped.
     pub fn set_ingest_marker(&self, doc_id: &str, marker: &str) -> Result<usize> {

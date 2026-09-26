@@ -115,7 +115,7 @@ fn objects(conn: &Connection, kind: &str) -> BTreeMap<String, String> {
 /// a column on `chat_imports`, which is exactly what this list existed to
 /// prevent — `schema_tables.sql` was generated verbatim then, so the column
 /// would have been reverted by the next regeneration. Target-only
-/// tables created by `archive::ensure_schema` instead, on the
+/// tables created by `db::archives::ensure_tables` instead, on the
 /// `vec_embeddings` pattern.
 /// `promotions` / `idx_promotions_source`: the refinement ladder's provenance
 /// (#208), linking a promoted artifact to the memories it was distilled from.

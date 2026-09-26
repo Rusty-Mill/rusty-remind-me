@@ -1,6 +1,8 @@
+pub mod archives;
 pub mod entities;
 pub mod feedback;
 pub mod history;
+pub mod imports;
 pub mod memories;
 pub mod migrations;
 pub mod promotions;

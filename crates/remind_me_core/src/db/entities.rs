@@ -71,6 +71,17 @@ impl<'c> Entities<'c> {
             .optional()
     }
 
+    /// Whether an entity with id `id` exists.
+    pub fn exists(&self, id: &str) -> Result<bool> {
+        let found: Option<i64> = self
+            .conn
+            .query_row("SELECT 1 FROM entities WHERE id = ?", params![id], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        Ok(found.is_some())
+    }
+
     /// Every entity, oldest first (ties by id).
     pub fn all_oldest_first(&self) -> Result<Vec<Entity>> {
         let mut stmt = self

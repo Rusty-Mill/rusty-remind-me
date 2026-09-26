@@ -45,12 +45,13 @@
 //! keying on `item_created_at` would miss them. A hash comparison does not
 //! care which timestamp the edit was filed under.
 
+use crate::db::imports::{DbsTracked as Tracked, ImportLedger};
 use crate::db::memories::{Memories, NewMemory};
 use crate::entity::{link_memory_entity, upsert_entity};
 use crate::import_paths::{validate_import_database, ImportPathError};
 use crate::models::{DbsImportInput, EntityInput, DBS_IMPORT_LIMIT_MAX, DBS_IMPORT_LIMIT_MIN};
 use chrono::Utc;
-use rusqlite::{params, params_from_iter, Connection, OpenFlags, Result};
+use rusqlite::{params_from_iter, Connection, OpenFlags, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -159,12 +160,6 @@ struct DbsItem {
     item_created_at: Option<String>,
     content_hash: String,
     source_name: String,
-}
-
-/// What a previous import recorded for one item.
-struct Tracked {
-    memory_id: String,
-    content_hash: String,
 }
 
 /// Open a `dbs` archive read-only.
@@ -325,36 +320,7 @@ fn tracked_state(
     let mut tracked = HashMap::new();
     for (source, external_ids) in by_source {
         for batch in external_ids.chunks(LOOKUP_BATCH) {
-            let placeholders = std::iter::repeat_n("?", batch.len())
-                .collect::<Vec<_>>()
-                .join(",");
-            let sql = format!(
-                "SELECT dbs_source, external_id, memory_id, content_hash
-                   FROM dbs_imports
-                  WHERE dbs_source = ? AND external_id IN ({})",
-                placeholders
-            );
-            let mut values = vec![rusqlite::types::Value::Text(source.to_string())];
-            values.extend(
-                batch
-                    .iter()
-                    .map(|id| rusqlite::types::Value::Text((*id).to_string())),
-            );
-
-            let mut statement = conn.prepare(&sql)?;
-            let rows = statement.query_map(params_from_iter(values), |row| {
-                Ok((
-                    (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
-                    Tracked {
-                        memory_id: row.get(2)?,
-                        content_hash: row.get(3)?,
-                    },
-                ))
-            })?;
-            for row in rows {
-                let (key, value) = row?;
-                tracked.insert(key, value);
-            }
+            tracked.extend(ImportLedger::new(conn).dbs_tracked(source, batch)?);
         }
     }
     Ok(tracked)
@@ -515,20 +481,12 @@ pub fn pull_dbs(
             None => result.created += 1,
         }
 
-        tx.execute(
-            "INSERT INTO dbs_imports (dbs_source, external_id, memory_id, content_hash, imported_at)
-             VALUES (?, ?, ?, ?, ?)
-             ON CONFLICT(dbs_source, external_id)
-             DO UPDATE SET memory_id = excluded.memory_id,
-                           content_hash = excluded.content_hash,
-                           imported_at = excluded.imported_at",
-            params![
-                item.source_name,
-                item.external_id,
-                memory_id,
-                item.content_hash,
-                now
-            ],
+        ImportLedger::new(&tx).record_dbs(
+            &item.source_name,
+            &item.external_id,
+            &memory_id,
+            &item.content_hash,
+            &now,
         )?;
     }
 

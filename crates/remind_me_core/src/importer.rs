@@ -21,6 +21,8 @@
 //! is checked **before** the file's text is read or parsed, so a re-import
 //! short-circuits without doing the work.
 
+use crate::db::entities::Entities;
+use crate::db::imports::ImportLedger;
 use crate::db::memories::{Memories, NewMemory};
 use crate::entity::{upsert_entity, upsert_entity_relation};
 use crate::import_paths::{
@@ -32,7 +34,7 @@ use crate::models::{
     ImportStats, IMPORT_MAX_LENGTH_MAX, IMPORT_MAX_LENGTH_MIN,
 };
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension, Result};
+use rusqlite::{Connection, Result};
 use serde::{Deserialize, Serialize};
 
 /// `source` assigned to memories from a chat export.
@@ -672,16 +674,8 @@ pub fn restore_graph_records(
         stats.entities_restored += 1;
     }
 
-    let exists = |table: &str, column: &str, id: &str| -> Result<bool> {
-        let found: Option<i64> = conn
-            .query_row(
-                &format!("SELECT 1 FROM {} WHERE {} = ?", table, column),
-                params![id],
-                |r| r.get(0),
-            )
-            .optional()?;
-        Ok(found.is_some())
-    };
+    let memories = Memories::new(conn);
+    let entities = Entities::new(conn);
 
     for record in records {
         match record.get("record_type").and_then(|v| v.as_str()) {
@@ -692,7 +686,7 @@ pub fn restore_graph_records(
                 ) else {
                     continue;
                 };
-                if !exists("memories", "id", memory_id)? || !exists("entities", "id", entity_id)? {
+                if !memories.exists(memory_id)? || !entities.exists(entity_id)? {
                     stats.links_skipped_dangling += 1;
                     continue;
                 }
@@ -708,7 +702,7 @@ pub fn restore_graph_records(
                 ) else {
                     continue;
                 };
-                if !exists("entities", "id", subject)? || !exists("entities", "id", object)? {
+                if !entities.exists(subject)? || !entities.exists(object)? {
                     stats.relations_skipped_dangling += 1;
                     continue;
                 }
@@ -1123,16 +1117,12 @@ pub fn import_content(
     stats.memories_created = created;
     stats.raw_entries = raw_entries;
 
-    conn.execute(
-        "INSERT INTO chat_imports (import_id, filename, hash, imported_at, stats)
-         VALUES (?, ?, ?, ?, ?)",
-        params![
-            import_id,
-            filename,
-            hash,
-            now,
-            serde_json::to_string(&stats).unwrap_or_else(|_| "{}".to_string())
-        ],
+    ImportLedger::new(conn).record_chat(
+        &import_id,
+        filename,
+        hash,
+        &now,
+        &serde_json::to_string(&stats).unwrap_or_else(|_| "{}".to_string()),
     )?;
 
     Ok(ImportOutcome::Imported {
@@ -1144,12 +1134,7 @@ pub fn import_content(
 }
 
 fn existing_import(conn: &Connection, hash: &str) -> Result<Option<String>> {
-    conn.query_row(
-        "SELECT import_id FROM chat_imports WHERE hash = ?",
-        params![hash],
-        |r| r.get(0),
-    )
-    .optional()
+    ImportLedger::new(conn).chat_import_with_hash(hash)
 }
 
 /// Reject a kind/suffix pair the importer cannot honour.

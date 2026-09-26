@@ -42,7 +42,7 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
     // Created even with retention off, so the read path never has to tolerate
     // a missing table. See `archive.rs` for why this cannot be a column on
     // `chat_imports`.
-    crate::archive::ensure_schema(conn)?;
+    crate::db::archives::ensure_tables(conn)?;
 
     // Nor is the refinement ladder's provenance table (#208). Same reasoning:
     // `schema_tables.sql` is generated verbatim, so a promoted artifact's

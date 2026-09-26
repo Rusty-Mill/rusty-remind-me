@@ -2,6 +2,17 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-26 — Import bookkeeping goes behind db:: (ADR-0023, phase 1, step 5b)
+
+### Changed
+- **`db::archives::Archives`** now holds every statement against `import_archives` and `import_archive_spans`, and creates them at open. `archive::ensure_schema` is gone.
+- **`db::imports::ImportLedger`** now holds every statement against `chat_imports`, `dbs_imports` and `mempalace_imports` from the importers and `undo_import`, including the undo's per-kind memory queries.
+- Reading the foreign SQLite files the dbs and mempalace importers take in stays with them. Behaviour is unchanged.
+
+### Tests
+- New repository tests: a chat import is forgotten only once nothing of it is left; a dbs rerun replaces the tracked memory; a recorded drawer is not re-recorded; removing an archive takes its spans and leaves a shared blob counted.
+- The core, API, MCP and CLI suites pass unchanged.
+
 ## 2026-09-26 — Promotion's storage goes behind db::promotions (ADR-0023, phase 1, step 5a)
 
 ### Changed
