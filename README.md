@@ -619,6 +619,30 @@ rusty-remind-me stats
 
 ---
 
+### 11. Store Daemon (opt-in)
+With `REMIND_ME_DAEMON=1`, one `rusty-remind-me daemon` process owns the
+store, and every MCP session, CLI command, `api` and `remote` becomes its
+client over loopback. The first client starts it; nothing needs to be run by
+hand. The background loops (reminders, folder watcher, promotion nudge, sync)
+then run once in the daemon instead of in every long-lived process.
+```bash
+REMIND_ME_DAEMON=1 rusty-remind-me list
+rusty-remind-me daemon status    # pid, port, start time; exit 1 if not running
+rusty-remind-me daemon stop      # the next client starts a fresh one
+```
+
+`REMIND_ME_CLIENT`, `REMIND_ME_DEFAULT_RESPONSE_FORMAT` and
+`REMIND_ME_TOOL_PROFILE` stay per client. Every other `REMIND_ME_*` setting
+belongs to the daemon, which takes them from the client that started it. A
+client whose settings differ, or a client from a different build, does not
+use that daemon: it prints why on stderr and opens the store in-process, as
+it would with the daemon off. After upgrading, run `rusty-remind-me daemon
+stop` so the next client starts the new build.
+
+The daemon writes `<db>.daemon.json`, `<db>.daemon.token` (mode 600) and
+`<db>.daemon.log` beside the database (`remind_me.db.daemon.json` and so on),
+and holds `<db>.daemon.lock` while it runs.
+
 ## REST API Endpoints
 
 When running `rusty-remind-me api [port]`, the HTTP server exposes the routes

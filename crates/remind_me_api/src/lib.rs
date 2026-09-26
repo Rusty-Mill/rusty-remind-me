@@ -96,8 +96,14 @@ impl ApiServer {
     /// test using it would write into whatever wiki the machine's user
     /// actually has.
     pub fn with_wiki(db: Database, wiki: Wiki) -> Self {
+        Self::shared(Arc::new(db), wiki)
+    }
+
+    /// Build a server over a database other servers also use: the daemon
+    /// runs this and the MCP server over one store.
+    pub fn shared(db: Arc<Database>, wiki: Wiki) -> Self {
         Self {
-            db: Arc::new(db),
+            db,
             wiki,
             api_key: resolve_api_key(),
         }

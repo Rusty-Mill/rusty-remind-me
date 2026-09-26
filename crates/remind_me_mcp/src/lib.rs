@@ -12,6 +12,7 @@
 #[path = "../../remind_me_core/src/test_env.rs"]
 mod test_env;
 
+pub mod daemon_proxy;
 pub mod render;
 
 /// The response format a call asked for, defaulting to **JSON** (#206).
@@ -46,7 +47,8 @@ fn requested_format(args: &serde_json::Value) -> ResponseFormat {
 
 /// The configured fallback for the [`requested_format`] population.
 fn configured_default_format() -> ResponseFormat {
-    default_format_from(std::env::var(DEFAULT_FORMAT_ENV).ok().as_deref())
+    // Per session: on the daemon, each client keeps its own default.
+    default_format_from(remind_me_core::daemon::session::var(DEFAULT_FORMAT_ENV).as_deref())
 }
 
 /// [`configured_default_format`] with the raw variable injected.
@@ -373,7 +375,12 @@ impl McpServer {
     /// Tests need this: the default root is a real shared directory, so a test
     /// using it would write into whatever wiki the machine's user actually has.
     pub fn with_wiki(db: Database, wiki: Wiki) -> Self {
-        let db = Arc::new(db);
+        Self::shared(Arc::new(db), wiki)
+    }
+
+    /// Build a server over a database other servers also use: the daemon
+    /// runs this and the dashboard API over one store.
+    pub fn shared(db: Arc<Database>, wiki: Wiki) -> Self {
         Self {
             // A no-op without `REMIND_ME_WEBHOOK_SECRET`, which is the ordinary
             // case — nothing binds a port unless someone asked for one.
@@ -3092,23 +3099,42 @@ impl McpServer {
     }
 
     pub fn run_stdio_loop(&self) -> io::Result<()> {
-        let stdin = io::stdin();
-        let mut stdout = io::stdout();
-        let handle = stdin.lock();
-
-        for line in handle.lines() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            if let Some(resp) = dispatch_line_catching_panics(&line, |l| self.handle_request(l)) {
-                let resp_str = serde_json::to_string(&resp)?;
-                writeln!(stdout, "{}", resp_str)?;
-                stdout.flush()?;
-            }
-        }
-        Ok(())
+        run_stdio(self)
     }
+}
+
+/// Something that answers MCP JSON-RPC lines: this process's own
+/// [`McpServer`], or [`daemon_proxy::DaemonProxy`] relaying to the daemon's.
+pub trait Handler: Send + Sync {
+    /// Answer one request line, or `None` for a notification. Never panics:
+    /// a failure is a JSON-RPC error reply.
+    fn handle_line(&self, line: &str) -> Option<Value>;
+}
+
+impl Handler for McpServer {
+    fn handle_line(&self, line: &str) -> Option<Value> {
+        dispatch_line_catching_panics(line, |l| self.handle_request(l))
+    }
+}
+
+/// Serve MCP over stdin and stdout with `handler`.
+pub fn run_stdio(handler: &dyn Handler) -> io::Result<()> {
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+    let handle = stdin.lock();
+
+    for line in handle.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Some(resp) = handler.handle_line(&line) {
+            let resp_str = serde_json::to_string(&resp)?;
+            writeln!(stdout, "{}", resp_str)?;
+            stdout.flush()?;
+        }
+    }
+    Ok(())
 }
 
 /// Runs `handler` against one line of input, converting a panic inside it
@@ -3171,6 +3197,11 @@ fn stamp_result_type(response: &mut Value) {
 /// error to the call it made, the same as every other error reply in
 /// `handle_request` does.
 fn panicked_response(request_json: &str) -> Value {
+    error_response(request_json, "internal error: request handler panicked")
+}
+
+/// A JSON-RPC internal error answering `request_json`.
+fn error_response(request_json: &str, message: &str) -> Value {
     let req_id = serde_json::from_str::<Value>(request_json)
         .ok()
         .and_then(|v| v.get("id").cloned())
@@ -3180,7 +3211,7 @@ fn panicked_response(request_json: &str) -> Value {
         "id": req_id,
         "error": {
             "code": -32603,
-            "message": "internal error: request handler panicked"
+            "message": message
         }
     })
 }

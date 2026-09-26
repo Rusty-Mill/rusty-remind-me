@@ -2,6 +2,20 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-26 — The store daemon, opt-in (ADR-0023, phase 2a)
+
+### Added
+- **`rusty-remind-me daemon`**: one process owns the store, and MCP sessions, CLI commands, `api` and `remote` become its clients over loopback. It is on only with `REMIND_ME_DAEMON=1`; the first client starts it. `daemon status` and `daemon stop` manage it.
+- The reminder scheduler, folder watcher, promotion nudge and sync worker run once in the daemon, not in every long-lived process. When configured, the webhook and sync-peer listeners run once too, where before every MCP session tried to bind the same port.
+
+### Changed
+- `REMIND_ME_CLIENT`, `REMIND_ME_DEFAULT_RESPONSE_FORMAT`, `REMIND_ME_TOOL_PROFILE` and the MCP handshake's client identity are per connection on the daemon, so one client never takes on another's.
+- A client whose other `REMIND_ME_*` settings differ from the running daemon's, or that is a different build, says why on stderr and opens the store in-process as before. Nothing changes silently.
+- With the daemon off (the default), behaviour is unchanged.
+
+### Tests
+- The handshake, refusals, sessions, fingerprint and endpoint files are unit-tested. End-to-end tests run the real binary: CLI output through the daemon is byte-identical to in-process, a mismatched client falls back and names the setting, MCP over stdio records its own session's client, and the dashboard API is relayed.
+
 ## 2026-09-26 — The last store reads move into db:: (ADR-0023, phase 1, step 8a)
 
 ### Changed

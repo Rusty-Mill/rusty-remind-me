@@ -2,11 +2,19 @@
 #[path = "../../remind_me_core/src/test_env.rs"]
 mod test_env;
 
+mod daemon;
+
+use daemon::Store;
 use remind_me_api::ApiServer;
-use remind_me_core::db::queries;
+use remind_me_core::daemon::ops::Op;
+use remind_me_core::entity::Entity;
+use remind_me_core::models::{Memory, MemoryListResult, MemorySearchResult};
+use remind_me_core::stats::Stats;
+use remind_me_core::wiki::WikiPage;
+use remind_me_core::wiki_import::WikiImportReport;
 use remind_me_core::{
-    entity, reminders, stats, updater, wiki, wiki_import, Database, EntityInput, MemoryAddInput,
-    MemoryListInput, MemorySearchInput, ResponseFormat, LIST_LIMIT_MAX, LIST_LIMIT_MIN,
+    reminders, updater, Database, EntityInput, MemoryAddInput, MemoryListInput, MemorySearchInput,
+    ResponseFormat, LIST_LIMIT_MAX, LIST_LIMIT_MIN,
 };
 use remind_me_mcp::McpServer;
 use serde_json::{json, Value};
@@ -554,9 +562,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let db = Database::open(&db_path)?;
-
     if args.len() < 2 || args[1] == "server" || args[1] == "mcp" {
+        // With the daemon on, this process only relays: the daemon owns the
+        // store and runs the background loops below for every client.
+        if let Some(proxy) = daemon::mcp_proxy(&db_path) {
+            updater::start_background_check();
+            remind_me_mcp::run_stdio(&proxy)?;
+            return Ok(());
+        }
+        let db = Database::open(&db_path)?;
         // Non-blocking, and deliberately not inside McpServer::new: that
         // constructor is also what the test suite uses to build a server
         // per-test, and a background `git fetch` on every one of those
@@ -606,6 +620,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         result?;
     } else {
         match args[1].as_str() {
+            "daemon" => daemon::command(&args[2..], &db_path)?,
             "configure" | "setup" => {
                 let configure_args = match parse_configure_args(&args[2..]) {
                     Ok(parsed) => parsed,
@@ -643,17 +658,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // is not an error, it just means this protection is
                 // unavailable, same as an in-memory DB having no backup
                 // directory (`status::server_status`).
-                let pid_path = match remind_me_core::pid::pid_file_path(&db.conn()) {
-                    Ok(path) => Some(path),
-                    Err(remind_me_core::pid::PidError::InMemory) => {
-                        eprintln!(
-                            "Warning: in-memory database has no on-disk location for a PID \
-                             file; double-start protection is unavailable."
-                        );
-                        None
-                    }
-                    Err(e) => return Err(e.into()),
-                };
+                let pid_path = Some(remind_me_core::pid::pid_file_path_for(&db_path));
                 if let Some(path) = &pid_path {
                     let status = remind_me_core::pid::dashboard_status(path);
                     if status.running {
@@ -671,6 +676,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     remind_me_core::pid::write_pid_file(path, &host, port)?;
                 }
 
+                // With the daemon on, each connection is relayed to it, and
+                // the daemon runs the scheduler and sync worker below.
+                let relayed = daemon::serve_api_via_daemon(&db_path, &addr);
+                if !matches!(relayed, Ok(false)) {
+                    if let Some(path) = &pid_path {
+                        remind_me_core::pid::remove_pid_file(path);
+                    }
+                    relayed?;
+                    return Ok(());
+                }
+
+                let db = Database::open(&db_path)?;
                 let scheduler = remind_me_core::scheduler::start_scheduler_for(&db.conn());
                 // A long-lived daemon like "server", so it can carry the sync
                 // worker just as well -- see the comment on "server"'s own
@@ -709,9 +726,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // "server" did. Stopped after `run_blocking` returns, same as
                 // the others; `run_blocking` blocks for the connector's whole
                 // life, so there is nothing to interleave it with.
+                if let Some(proxy) = daemon::mcp_proxy(&db_path) {
+                    remind_me_remote::run_blocking(std::sync::Arc::new(proxy))?;
+                    return Ok(());
+                }
+                let db = Database::open(&db_path)?;
                 let mut sync = remind_me_core::sync::SyncWorker::from_env(db_path.clone());
                 let server = McpServer::new(db);
-                let result = remind_me_remote::run_blocking(server);
+                let result = remind_me_remote::run_blocking(std::sync::Arc::new(server));
                 if let Some(sync) = sync.as_mut() {
                     sync.stop();
                 }
@@ -750,9 +772,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // CLI grows a flag and the call to match.
                     bootstrap: false,
                 };
-                let conn = db.conn();
-                let results = queries::search_memories(&conn, &search_input)?;
-                match search_input.response_format {
+                let response_format = search_input.response_format;
+                let results: Vec<MemorySearchResult> = Store::open(&db_path)?.call(Op::Search {
+                    input: search_input,
+                })?;
+                match response_format {
                     // JSON keeps the whole result -- scores, per-signal
                     // components, the lot -- because that is what a script
                     // piping this wants.
@@ -791,8 +815,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     object: None,
                     entities: vec![],
                 };
-                let conn = db.conn();
-                let mem = queries::add_memory(&conn, add_input)?;
+                let mem: Memory = Store::open(&db_path)?.call(Op::Add { input: add_input })?;
                 println!("Added memory: {}", mem.id);
             }
             "list" => {
@@ -816,9 +839,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     },
                     ..Default::default()
                 };
-                let conn = db.conn();
-                let page = queries::list_memories(&conn, &list_input)?;
-                match list_input.response_format {
+                let response_format = list_input.response_format;
+                let page: MemoryListResult =
+                    Store::open(&db_path)?.call(Op::List { input: list_input })?;
+                match response_format {
                     // The reference's `_fmt_memories` JSON branch carries
                     // `count`/`memories`/`total`; `MemoryListResult` also
                     // carries the pagination cursor, so it is serialized whole
@@ -840,8 +864,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 }
                 let id = &args[2];
-                let conn = db.conn();
-                if let Some(mem) = queries::get_memory_by_id(&conn, id)? {
+                let found: Option<Memory> =
+                    Store::open(&db_path)?.call(Op::Get { id: id.clone() })?;
+                if let Some(mem) = found {
                     println!("{}", serde_json::to_string_pretty(&mem)?);
                 } else {
                     eprintln!("Memory not found: {}", id);
@@ -854,15 +879,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 let name = args[2].clone();
                 let kind = args.get(3).cloned();
-                let conn = db.conn();
-                let ent = entity::upsert_entity(
-                    &conn,
-                    &EntityInput {
+                let ent: Entity = Store::open(&db_path)?.call(Op::UpsertEntity {
+                    input: EntityInput {
                         name,
                         kind,
                         aliases: vec![],
                     },
-                )?;
+                })?;
                 println!("{}", serde_json::to_string_pretty(&ent)?);
             }
             "wiki-write" => {
@@ -873,8 +896,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let slug = &args[2];
                 let title = &args[3];
                 let content = &args[4];
-                let conn = db.conn();
-                let page = wiki::write_wiki_page(&conn, slug, title, content, "")?;
+                let page: WikiPage = Store::open(&db_path)?.call(Op::WikiWrite {
+                    slug: slug.clone(),
+                    title: title.clone(),
+                    content: content.clone(),
+                })?;
                 println!("Saved wiki page: {}", page.slug);
             }
             "wiki-read" => {
@@ -883,8 +909,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 }
                 let slug = &args[2];
-                let conn = db.conn();
-                if let Some(page) = wiki::get_wiki_page(&conn, slug)? {
+                let found: Option<WikiPage> =
+                    Store::open(&db_path)?.call(Op::WikiRead { slug: slug.clone() })?;
+                if let Some(page) = found {
                     println!("{}", serde_json::to_string_pretty(&page)?);
                 } else {
                     eprintln!("Wiki page not found: {}", slug);
@@ -897,9 +924,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("`dbs export-wiki --out-dir <dir>` from daily-backup-system.");
                     std::process::exit(1);
                 }
-                let dir = PathBuf::from(&args[2]);
-                let conn = db.conn();
-                let report = wiki_import::import_wiki_dir(&conn, &dir, true)?;
+                // Absolute, because the daemon does not share this
+                // process's working directory.
+                let dir = std::path::absolute(PathBuf::from(&args[2]))?;
+                let report: WikiImportReport =
+                    Store::open(&db_path)?.call(Op::WikiImport { dir })?;
                 for page in &report.imported {
                     println!("{}  <- {}", page.slug, page.path);
                 }
@@ -913,11 +942,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
             "stats" => {
-                let conn = db.conn();
-                println!("{}", serde_json::to_string_pretty(&stats::collect(&conn)?)?);
+                let stats: Stats = Store::open(&db_path)?.call(Op::Stats)?;
+                println!("{}", serde_json::to_string_pretty(&stats)?);
             }
             cmd => {
-                eprintln!("Unknown subcommand: {}. Available: configure, api, remote, server, search, add, list, get, entity, wiki-write, wiki-read, wiki-import, stats", cmd);
+                eprintln!("Unknown subcommand: {}. Available: configure, daemon, api, remote, server, search, add, list, get, entity, wiki-write, wiki-read, wiki-import, stats", cmd);
                 std::process::exit(1);
             }
         }

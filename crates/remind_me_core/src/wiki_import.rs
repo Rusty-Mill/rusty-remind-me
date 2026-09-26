@@ -44,7 +44,7 @@ use std::path::{Path, PathBuf};
 use crate::wiki::write_wiki_page;
 
 /// One page that was written to `wiki_pages`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ImportedPage {
     pub path: String,
     pub slug: String,
@@ -53,7 +53,7 @@ pub struct ImportedPage {
 }
 
 /// Outcome of an import run.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct WikiImportReport {
     pub imported: Vec<ImportedPage>,
     /// `(path, reason)` for files found but not imported (e.g. unreadable).

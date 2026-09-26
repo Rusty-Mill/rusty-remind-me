@@ -264,7 +264,7 @@ those two importers are gated off or rewritten.
 |---|---|---|
 | 0 | **Retire Python.** Drop the schema-drift CI and scripts. Rewrite Tenet 3. Make the `schema_*.sql` files hand-owned. Mark `CUTOVER.md` and `gap-analysis.md` historical. Fix `configure_mcp.py`'s stale path. | Docs and CI only |
 | 1 | **Finish the seam.** Put every remaining table group behind a repository, then move the triggers and echo suppression into the repositories (FTS, tags, outbox). Re-key vectors on memory id. | Several PRs, one group at a time, SQLite still underneath |
-| 2 | **The daemon.** `rusty-remind-me daemon` on SQLite; MCP, CLI, hooks, `api` and `remote` become clients; auto-start. | Behaviour-preserving |
+| 2 | **The daemon.** `rusty-remind-me daemon` on SQLite; MCP, CLI, hooks, `api` and `remote` become clients; auto-start. Opt-in first (2a), then the default (2b). | Behaviour-preserving |
 | 3 | **Engine additions.** Full-text index, write batches, sequence allocators, directory lock (§3). | Engine PRs, each with its own tests |
 | 4 | **The engine-backed store.** Callers take a `NodeStore` handle instead of `&Connection`. `NodeStore` on the engine, run by the same test suite as the SQLite store, plus the copy tool (§5). | Behind a feature, off by default |
 | 5 | **Switch.** The engine becomes the default and the daemon copies on first start. | Default switch |
@@ -562,6 +562,48 @@ handle would only wrap a `Connection`: an abstraction with one backend.
 Phase 4 introduces the engine-backed store, so the trait is shaped once,
 against two real implementations, and callers change once. With 8a done,
 phase 1 is complete.
+
+### Phase 2: the daemon
+
+**2a, done: the daemon, opt-in.** `rusty-remind-me daemon` owns the
+SQLite store behind `REMIND_ME_DAEMON=1`. MCP over stdio, the CLI's store
+commands, `api` and `remote` become its clients, and the first one starts it.
+Three points §2 left open were decided while building it:
+
+- **Settings are split.** Before the daemon, each MCP client ran its own
+  process under the environment its config gave it, about 85 `REMIND_ME_*`
+  variables. One daemon cannot serve them all under one environment without
+  silently changing some. `REMIND_ME_CLIENT`,
+  `REMIND_ME_DEFAULT_RESPONSE_FORMAT` and `REMIND_ME_TOOL_PROFILE` travel with
+  each connection and apply to it alone (`daemon::session`), as does the MCP
+  handshake's client identity. Every other `REMIND_ME_*` variable belongs to
+  the store: each client sends a SHA-256 fingerprint of its values, and on any
+  difference it announces why and runs in-process as before
+  (`daemon::settings`). The comparison errs wide: a variable compared needlessly
+  costs a fallback, a variable wrongly skipped would be served under another
+  client's value.
+- **A different build is refused.** A daemon outlives the binary that
+  started it, so after an upgrade the old code would keep serving, perhaps
+  against a newer schema. The handshake compares a build id (version plus
+  the executable's size and modification time) and the client falls back on
+  a mismatch; `daemon stop` accepts any build.
+- **The protocol has four modes.** One JSON hello line with the token opens
+  each connection. MCP JSON-RPC then flows one line per request and exactly
+  one line back (`null` for a notification). The CLI sends typed store
+  operations (`daemon::ops`) and gets back the same typed values, so its
+  output is byte-identical. The dashboard API's HTTP bytes are relayed to an
+  `ApiServer` inside the daemon. A control mode carries only `status` and
+  `shutdown`.
+
+On Windows a child inherits every inheritable handle, so a daemon started by
+an MCP client would hold that client's stdout pipe open after the client
+exits. The client clears inheritance on its standard handles before starting
+the daemon. That is a second use of the FFI `windows-sys` dependency ADR-0013
+admitted, not a new dependency.
+
+**2b, next: on by default.** Once 2a has run on real machines, the daemon
+becomes the default with `REMIND_ME_DAEMON=0` as the way out. Phase 5 needs it
+on, since the engine keeps the store in one process.
 
 ## Related
 

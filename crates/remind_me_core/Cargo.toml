@@ -120,6 +120,8 @@ stack-dumps = ["dep:rstack-self"]
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    # The daemon client's `stop_inheriting_std_handles` (daemon/client.rs).
+    "Win32_System_Console",
     "Win32_System_JobObjects",
 ] }
 

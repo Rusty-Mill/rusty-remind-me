@@ -16,6 +16,7 @@ pub mod cloud_backup;
 pub mod code_refs;
 pub mod consolidation;
 pub mod contradictions;
+pub mod daemon;
 pub mod db;
 pub mod dbs_import;
 pub mod digest;

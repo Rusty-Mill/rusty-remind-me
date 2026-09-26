@@ -72,8 +72,14 @@ fn database_path(conn: &Connection) -> rusqlite::Result<Option<PathBuf>> {
 /// The PID file's path, beside the database file.
 pub fn pid_file_path(conn: &Connection) -> Result<PathBuf> {
     let db_path = database_path(conn)?.ok_or(PidError::InMemory)?;
+    Ok(pid_file_path_for(&db_path))
+}
+
+/// [`pid_file_path`] from the database's path, for a process that has not
+/// opened it: `rusty-remind-me api` relaying to the daemon never does.
+pub fn pid_file_path_for(db_path: &Path) -> PathBuf {
     let parent = db_path.parent().unwrap_or_else(|| Path::new("."));
-    Ok(parent.join(PID_FILE_NAME))
+    parent.join(PID_FILE_NAME)
 }
 
 /// What gets written to, and read back from, the PID file.

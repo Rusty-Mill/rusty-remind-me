@@ -128,14 +128,25 @@ static HANDSHAKE_CLIENT: std::sync::RwLock<Option<String>> = std::sync::RwLock::
 ///
 /// Called by the server on handshake. `None` clears it, which is what a fresh
 /// process — or a test — wants.
+///
+/// On a daemon connection it belongs to that connection's session instead:
+/// one daemon serves many clients, and a process-wide slot would record
+/// whichever of them shook hands last.
 pub fn set_handshake_client(identity: Option<String>) {
+    let identity = identity.filter(|s| !s.trim().is_empty());
+    if crate::daemon::session::set_handshake_client(identity.clone()) {
+        return;
+    }
     if let Ok(mut slot) = HANDSHAKE_CLIENT.write() {
-        *slot = identity.filter(|s| !s.trim().is_empty());
+        *slot = identity;
     }
 }
 
 /// The client identity currently in force.
 pub fn handshake_client() -> Option<String> {
+    if let Some(in_session) = crate::daemon::session::handshake_client() {
+        return in_session;
+    }
     HANDSHAKE_CLIENT.read().ok().and_then(|s| s.clone())
 }
 
@@ -155,7 +166,7 @@ pub fn configured_client() -> String {
     if let Some(identity) = handshake_client() {
         return identity;
     }
-    std::env::var(CLIENT_ENV).unwrap_or_else(|_| DEFAULT_CLIENT.to_string())
+    crate::daemon::session::var(CLIENT_ENV).unwrap_or_else(|| DEFAULT_CLIENT.to_string())
 }
 
 /// The `(node_id, client)` pair every newly created memory is stamped with.
