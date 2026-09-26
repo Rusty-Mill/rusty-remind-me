@@ -1642,11 +1642,7 @@ pub fn metrics(
     // Computed per scrape rather than shadowed as counters, so they cannot
     // drift from the tables they describe.
     let mut gauges = Vec::new();
-    if let Ok(total) = conn.query_row(
-        "SELECT COUNT(*) FROM memories WHERE deleted_at IS NULL",
-        [],
-        |r| r.get::<_, i64>(0),
-    ) {
+    if let Ok(total) = remind_me_core::db::stats::StoreStats::new(conn).live_memories() {
         gauges.push(remind_me_core::metrics::GaugeSpec::new(
             "remind_me_memories_total",
             "Total non-deleted memories currently in the store.",
@@ -1654,11 +1650,7 @@ pub fn metrics(
         ));
     }
     if remind_me_core::sync::sync_enabled() {
-        if let Ok(pending) = conn.query_row(
-            "SELECT COUNT(*) FROM sync_outbox WHERE sent_at = ''",
-            [],
-            |r| r.get::<_, i64>(0),
-        ) {
+        if let Ok(pending) = remind_me_core::db::outbox::Outbox::new(conn).unsent_count() {
             gauges.push(remind_me_core::metrics::GaugeSpec::new(
                 "remind_me_sync_outbox_pending",
                 "Sync outbox rows not yet acknowledged by the hub.",

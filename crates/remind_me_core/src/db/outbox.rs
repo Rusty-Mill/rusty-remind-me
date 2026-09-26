@@ -99,6 +99,15 @@ impl<'c> Outbox<'c> {
             .query_row("SELECT COUNT(*) FROM sync_outbox", [], |r| r.get(0))
     }
 
+    /// How many rows are not yet marked sent.
+    pub fn unsent_count(&self) -> Result<i64> {
+        self.conn.query_row(
+            "SELECT COUNT(*) FROM sync_outbox WHERE sent_at = ''",
+            [],
+            |r| r.get(0),
+        )
+    }
+
     /// Whether the outbox is empty.
     pub fn is_empty(&self) -> Result<bool> {
         let any: Option<i64> = self
