@@ -2,6 +2,15 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-26 — The sync outbox goes behind db::outbox (ADR-0023, phase 1, step 6)
+
+### Changed
+- **`db::outbox::Outbox` now holds every statement against `sync_outbox` and `sync_sends`:** push batches, pending counts, pruning, the clear and backfill when sync is toggled, and echo suppression. Echo suppression works as before; it becomes a flag on the write once the triggers move (step 7). Behaviour is unchanged.
+
+### Tests
+- New repository tests: echo suppression touches only the key's rows above the mark; pending counts rows with no send to the remote; pruning drops old and sent rows and their send markers.
+- The core, API, MCP and CLI suites pass unchanged.
+
 ## 2026-09-26 — Curation queue reads go behind db::curation (ADR-0023, phase 1, step 5c)
 
 ### Changed

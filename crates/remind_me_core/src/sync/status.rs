@@ -23,9 +23,10 @@
 //! guessing.
 
 use super::{configured_hub_url, configured_node_id, configured_sync_secret, sync_enabled};
+use crate::db::outbox::Outbox;
 use crate::db::sync_state::{RemoteLog, SyncState};
 use crate::models::{DrainVerdict, OutboxStatus, RemoteStatus, SyncStatus, TombstoneStatus};
-use rusqlite::{params, Connection, OptionalExtension, Result};
+use rusqlite::{params, Connection, Result};
 
 /// What a never-contacted remote's timestamps read as. Not NULL — the columns
 /// are `NOT NULL DEFAULT` this — so "never" has to be recognised by value.
@@ -36,28 +37,7 @@ const EPOCH: &str = "1970-01-01T00:00:00+00:00";
 const DRAIN_FLAG_KEY: &str = "sync_status_last_observation";
 
 fn pending_to_remote(conn: &Connection, remote_id: &str) -> Result<(i64, Option<String>)> {
-    let pending: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM sync_outbox o
-          WHERE NOT EXISTS (
-              SELECT 1 FROM sync_sends s
-               WHERE s.outbox_id = o.id AND s.remote_id = ?
-          )",
-        params![remote_id],
-        |r| r.get(0),
-    )?;
-    let oldest: Option<String> = conn
-        .query_row(
-            "SELECT MIN(created_at) FROM sync_outbox o
-              WHERE NOT EXISTS (
-                  SELECT 1 FROM sync_sends s
-                   WHERE s.outbox_id = o.id AND s.remote_id = ?
-              )",
-            params![remote_id],
-            |r| r.get(0),
-        )
-        .optional()?
-        .flatten();
-    Ok((pending, oldest))
+    Outbox::new(conn).pending_for(remote_id)
 }
 
 /// Read the previous observation, compute a direction, and record the current
@@ -137,7 +117,7 @@ pub fn sync_status(conn: &Connection) -> Result<SyncStatus> {
     }
 
     let (pending, oldest_pending) = pending_to_remote(conn, super::HUB_REMOTE_ID)?;
-    let total: i64 = conn.query_row("SELECT COUNT(*) FROM sync_outbox", [], |r| r.get(0))?;
+    let total = Outbox::new(conn).len()?;
     let (verdict, per_minute) = drain(conn, pending)?;
 
     let tombstones: i64 = conn.query_row(

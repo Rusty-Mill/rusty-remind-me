@@ -352,7 +352,7 @@ unchanged after each.
 | 3 | Wiki pages, links and their index | `db::wiki::WikiIndex` | Done |
 | 4 | Vectors, re-keyed on memory id (§4) | `db::vectors` | |
 | 5 | Promotions, imports, archives and curation queues | `db::promotions::Promotions`, … | In progress |
-| 6 | The outbox, with echo suppression as a flag | `db::outbox` | |
+| 6 | The outbox, with echo suppression as a flag | `db::outbox::Outbox` | Statements moved; the flag waits for step 7 |
 | 7 | Triggers move into the repositories | | |
 | 8 | Callers stop taking `&Connection` | | |
 
@@ -459,6 +459,21 @@ counts keep their own SQL, which is cheaper than the batch queries' and
 must count the same rows (a test holds the two together for the capture
 and import backlogs). Consolidation's candidate read joins the vector
 tables by rowid, so it moves with step 4.
+
+**Step 6.** `db::outbox::Outbox` holds every statement against
+`sync_outbox` and `sync_sends` from the sync modules:
+- the push batch and the per-remote pending count;
+- the outbox's size;
+- pruning;
+- the clear and backfill that follow sync being switched off or on;
+- echo suppression's high-water mark and mark-as-sent.
+
+Echo suppression is still the old technique: take the high-water mark
+before a synced write, then mark that key's rows above it as sent. It can
+only become a flag on the write once the repositories, not triggers, write
+the outbox rows, which is step 7. The peer server's pull pages and the
+sync count endpoints read `memories` and the graph directly; they move in
+step 8 with the other readers.
 
 ## Related
 

@@ -6,6 +6,7 @@ pub mod history;
 pub mod imports;
 pub mod memories;
 pub mod migrations;
+pub mod outbox;
 pub mod promotions;
 pub mod queries;
 pub mod reminders;

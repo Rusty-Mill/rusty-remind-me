@@ -9,9 +9,10 @@
 //! costs nothing but a wasted round-trip.
 
 use super::{http, record_push};
+use crate::db::outbox::Outbox;
 use crate::db::sync_state::SyncState;
 use chrono::Utc;
-use rusqlite::{params, Connection};
+use rusqlite::Connection;
 use serde_json::{json, Value};
 
 /// Outbox rows sent per `POST /sync/push`, bounding request size the same
@@ -82,31 +83,27 @@ fn fetch_batch(
     remote_id: &str,
     after_id: i64,
 ) -> rusqlite::Result<Vec<OutboxRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, memory_id, payload FROM sync_outbox
-          WHERE id > ?1 AND sent_at = ''
-            AND id NOT IN (SELECT outbox_id FROM sync_sends WHERE remote_id = ?2)
-          ORDER BY id ASC LIMIT ?3",
-    )?;
-    let rows = stmt.query_map(params![after_id, remote_id, BATCH_SIZE as i64], |row| {
-        let memory_id_column: String = row.get(1)?;
-        let payload_json: String = row.get(2)?;
-        let payload: Value = serde_json::from_str(&payload_json).unwrap_or_else(|_| json!({}));
-        // `payload["id"]` is the record's real wire id for every type; the
-        // `memory_id` column fallback only matters if a malformed payload
-        // somehow lacks its own "id" key.
-        let wire_id = payload
-            .get("id")
-            .and_then(Value::as_str)
-            .map(String::from)
-            .unwrap_or(memory_id_column);
-        Ok(OutboxRow {
-            id: row.get(0)?,
-            wire_id,
-            payload,
+    let entries = Outbox::new(conn).unsent_to(remote_id, after_id, BATCH_SIZE)?;
+    Ok(entries
+        .into_iter()
+        .map(|entry| {
+            let payload: Value =
+                serde_json::from_str(&entry.payload_json).unwrap_or_else(|_| json!({}));
+            // `payload["id"]` is the record's real wire id for every type; the
+            // `memory_id` column fallback only matters if a malformed payload
+            // somehow lacks its own "id" key.
+            let wire_id = payload
+                .get("id")
+                .and_then(Value::as_str)
+                .map(String::from)
+                .unwrap_or(entry.key);
+            OutboxRow {
+                id: entry.id,
+                wire_id,
+                payload,
+            }
         })
-    })?;
-    rows.collect()
+        .collect())
 }
 
 fn mark_sent(conn: &Connection, remote_id: &str, outbox_ids: &[i64]) -> rusqlite::Result<()> {

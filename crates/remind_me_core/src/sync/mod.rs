@@ -13,9 +13,10 @@
 //! all set — the same default-off posture as the webhook endpoint (`#56`)
 //! and the folder watcher (`#55`).
 
+use crate::db::outbox::Outbox;
 use crate::db::sync_state::SyncState;
 use chrono::{Duration, Utc};
-use rusqlite::{params, Connection, Result};
+use rusqlite::{Connection, Result};
 
 mod graph;
 // Public so `notifications` can reuse the one HTTP client this crate has
@@ -248,8 +249,6 @@ pub fn probe_hub_version() -> Option<String> {
     version
 }
 
-const NOW_ISO_EXPR: &str = "strftime('%Y-%m-%dT%H:%M:%f000', 'now') || '+00:00'";
-
 /// The `sync_flags` key recording whether the outbox is being filled.
 const SYNC_ENABLED_FLAG: &str = "sync_enabled";
 
@@ -285,40 +284,9 @@ pub fn reconcile_sync_enabled_flag(conn: &Connection) -> Result<()> {
     }
 
     if desired == "1" && stored.as_deref() == Some("0") {
-        conn.execute_batch(&format!(
-            "INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
-             SELECT id, 'insert', json_object(
-                 'id', id, 'content', content, 'category', category, 'tags', tags,
-                 'source', source, 'metadata', metadata, 'created_at', created_at,
-                 'updated_at', updated_at, 'capture_id', capture_id, 'node_id', node_id,
-                 'client', client, 'accessed_at', accessed_at, 'access_count', access_count,
-                 'decay_rate', decay_rate, 'vitality', vitality, 'base_weight', base_weight,
-                 'status', status, 'memory_type', memory_type,
-                 'source_capture_id', source_capture_id, 'subject', subject,
-                 'predicate', predicate, 'object', object, 'superseded_by', superseded_by,
-                 'doc_id', doc_id, 'chunk_index', chunk_index, 'deleted_at', deleted_at
-             ), {now}
-             FROM memories;
-
-             INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
-             SELECT id, 'insert', json_object(
-                 'record_type', 'entity', 'id', id, 'name', name, 'kind', kind,
-                 'aliases', aliases, 'created_at', created_at, 'updated_at', updated_at,
-                 'node_id', node_id
-             ), {now}
-             FROM entities;
-
-             INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
-             SELECT memory_id, 'insert', json_object(
-                 'record_type', 'memory_entity',
-                 'id', memory_id || '|' || entity_id,
-                 'memory_id', memory_id, 'entity_id', entity_id, 'created_at', created_at
-             ), {now}
-             FROM memory_entities;",
-            now = NOW_ISO_EXPR
-        ))?;
+        Outbox::new(conn).backfill_everything()?;
     } else if desired == "0" {
-        conn.execute_batch("DELETE FROM sync_outbox; DELETE FROM sync_sends;")?;
+        Outbox::new(conn).clear()?;
     }
 
     state.set_flag(SYNC_ENABLED_FLAG, desired)
@@ -373,15 +341,7 @@ fn outbox_retention_days() -> i64 {
 /// arrangement now that one exists.
 pub fn prune_outbox(conn: &Connection) -> Result<usize> {
     let cutoff = (Utc::now() - Duration::days(outbox_retention_days())).to_rfc3339();
-    let removed = conn.execute(
-        "DELETE FROM sync_outbox WHERE sent_at != '' OR created_at < ?",
-        params![cutoff],
-    )?;
-    conn.execute(
-        "DELETE FROM sync_sends WHERE outbox_id NOT IN (SELECT id FROM sync_outbox)",
-        [],
-    )?;
-    Ok(removed)
+    Outbox::new(conn).prune(&cutoff)
 }
 
 /// Records a real, successful HTTP push round trip with `remote_id` (a push

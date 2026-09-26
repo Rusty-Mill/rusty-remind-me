@@ -7,8 +7,9 @@
 //! key collision. See `docs/adr/0004-sync-protocol-and-conflict-resolution.md`.
 
 use crate::db::memories::{Memories, NewMemory};
+use crate::db::outbox::Outbox;
 use chrono::Utc;
-use rusqlite::{params, Connection};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -268,10 +269,7 @@ pub fn upsert_record(
         Some(local) => updated_at > local.updated_at,
     };
 
-    let before_outbox_id: i64 =
-        conn.query_row("SELECT COALESCE(MAX(id), 0) FROM sync_outbox", [], |r| {
-            r.get(0)
-        })?;
+    let before_outbox_id = Outbox::new(conn).high_water()?;
 
     let outcome = if incoming_wins {
         let local_tags: &[String] = local.as_ref().map(|l| l.tags.as_slice()).unwrap_or(&[]);
@@ -330,11 +328,7 @@ pub fn upsert_record(
         ApplyOutcome::NotApplied
     };
 
-    let now = Utc::now().to_rfc3339();
-    conn.execute(
-        "UPDATE sync_outbox SET sent_at = ? WHERE id > ? AND memory_id = ? AND sent_at = ''",
-        params![now, before_outbox_id, record.id],
-    )?;
+    Outbox::new(conn).suppress_echo(&record.id, before_outbox_id, &Utc::now().to_rfc3339())?;
 
     Ok(outcome)
 }

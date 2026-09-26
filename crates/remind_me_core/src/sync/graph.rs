@@ -29,9 +29,10 @@
 
 use super::record::canon_ts;
 use crate::db::entities::{Entities, RelationRow};
+use crate::db::outbox::Outbox;
 use crate::entity::Entity;
 use chrono::Utc;
-use rusqlite::{params, Connection};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -52,9 +53,7 @@ impl From<rusqlite::Error> for GraphApplyError {
 }
 
 fn before_outbox_id(conn: &Connection) -> rusqlite::Result<i64> {
-    conn.query_row("SELECT COALESCE(MAX(id), 0) FROM sync_outbox", [], |r| {
-        r.get(0)
-    })
+    Outbox::new(conn).high_water()
 }
 
 /// Echo-suppress whatever outbox row(s) this write itself just created for
@@ -62,12 +61,7 @@ fn before_outbox_id(conn: &Connection) -> rusqlite::Result<i64> {
 /// stamps) — identical technique to `record::upsert_record`'s, scoped by an
 /// outbox-id high-water-mark snapshotted before the write.
 fn echo_suppress(conn: &Connection, key: &str, before_id: i64) -> rusqlite::Result<()> {
-    let now = Utc::now().to_rfc3339();
-    conn.execute(
-        "UPDATE sync_outbox SET sent_at = ? WHERE id > ? AND memory_id = ? AND sent_at = ''",
-        params![now, before_id, key],
-    )?;
-    Ok(())
+    Outbox::new(conn).suppress_echo(key, before_id, &Utc::now().to_rfc3339())
 }
 
 fn merge_aliases(local: &[String], incoming: &[String]) -> Vec<String> {
