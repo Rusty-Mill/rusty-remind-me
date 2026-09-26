@@ -2,6 +2,19 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-26 — The Python remind_me is retired (ADR-0023, phase 0)
+
+### Changed
+- **The schema files are hand-owned.** `schema_{tables,indexes,triggers}.sql` were dumps of the Python remind_me's schema, and CI failed when they drifted from it. With Python retired, they are edited by hand, and a change to them is a schema change (`db/migrations.rs`). `SCHEMA_VERSION` stays 29 and is now this crate's own number.
+- **ARCHITECTURE.md Tenet 3 is replaced.** "Data Parity with `remind-me`" (an identical v29 SQLite file the Python server could open) becomes "Wire compatibility, not file sharing": the node keeps the MCP tool signatures and the sync protocol, and no longer promises a file the Python server can read. §5 now says where the schema lives and lists the objects this crate adds.
+- **Docs:** the README's substitution section becomes "Coming from the Python `remind_me`", a one-way move. `docs/CUTOVER.md` and `gap-analysis.md` are marked historical. ADR-0007's regeneration half is superseded.
+
+### Removed
+- The `schema-drift` CI job, its weekly schedule, and `scripts/check_schema_drift.sh`, `scripts/check_schema_regen_drift.sh` and `scripts/regenerate_schema.py`. The plugin-version check stays.
+
+### Fixed
+- **`configure_mcp.py` and `configure_mcp.ps1` pointed clients at an empty database.** Their default path was not the one the server uses; both now default to `~/.remind-me/memory.db`.
+
 ## 2026-09-26 — The hub's Postgres and SQLite stores are removed
 
 ### Breaking

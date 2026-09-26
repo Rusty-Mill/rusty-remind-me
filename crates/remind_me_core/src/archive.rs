@@ -23,12 +23,14 @@
 //! no-op in that state, so an import with archiving off is byte-identical to
 //! one from before this module existed.
 //!
-//! # Why its tables are not in the generated schema
+//! # Why its tables are not in the schema files
 //!
-//! `db/schema_tables.sql` is generated verbatim from a `remind_me` database
-//! and is not this crate's file to extend — see [`crate::db`]'s migrations
-//! module. Adding an `archive_path` column to `chat_imports` would be silently
-//! reverted by the next `scripts/regenerate_schema.py` run.
+//! When this was written, `db/schema_tables.sql` was generated verbatim from
+//! the Python `remind_me` and was not this crate's file to extend (an
+//! `archive_path` column on `chat_imports` would have been reverted by the
+//! next regeneration). Python is retired now (ADR-0023) and the files are
+//! hand-owned, but these tables stay separate until the node's storage moves
+//! off SQLite.
 //!
 //! So the two tables below are **target-only**, created by [`ensure_schema`]
 //! at open time in the same way [`crate::vectors::ensure_schema`] creates

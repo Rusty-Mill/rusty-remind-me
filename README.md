@@ -172,7 +172,7 @@ section — enable only what you need:
 | Semantic/vector search, cross-encoder reranking, HyDE query expansion | [Search Quality](#search-quality-embeddings-reranking--query-expansion) |
 | A network-reachable MCP endpoint (e.g. for `claude.ai`'s custom connector) | [Remote MCP connector](#remote-mcp-connector-remind_me_remote-rusty-remind-me-remote) |
 | The REST API / dashboard | [REST API Endpoints](#rest-api-endpoints) — `rusty-remind-me api [port]` |
-| Sharing a database with the Python `remind_me` reference | [Substituting for the `remind_me` MCP server](#substituting-for-the-remind_me-mcp-server) |
+| Moving over from the Python `remind_me` (retired) | [Coming from the Python `remind_me`](#coming-from-the-python-remind_me) |
 
 ---
 
@@ -187,7 +187,7 @@ rusty_remind_me/
 ├── ARCHITECTURE.md             # Technical design & schema documentation
 ├── CONTRIBUTING.md             # Development & testing guidelines
 ├── docs/
-│   └── CUTOVER.md              # Runbook: migrating clients from the Python reference to this port
+│   └── CUTOVER.md              # Historical: the 2026-08 cutover of clients from the Python reference
 ├── scripts/
 │   ├── configure_mcp.ps1       # PowerShell auto-configuration script for Windows
 │   └── configure_mcp.py        # Cross-platform Python auto-configuration script
@@ -343,44 +343,33 @@ Each setup option safely merges the `"rusty-remind-me"` MCP server configuration
 
 ## Database Location
 
-By default the store is `~/.remind-me/memory.db` — the same path [`remind_me`](https://github.com/baileyrd/remind_me) uses, so an unconfigured install of either one opens the same database.
+By default the store is `~/.remind-me/memory.db`.
 
 Two environment variables override it, most specific first:
 
 | Variable | Names a | Notes |
 | --- | --- | --- |
-| `REMIND_ME_DB_PATH` | database **file** | Wins if both are set. Specific to this implementation. |
-| `REMIND_ME_MCP_DIR` | **directory** holding `memory.db` | Shared with `remind_me`. Set this to point both implementations at one store. |
+| `REMIND_ME_DB_PATH` | database **file** | Wins if both are set. |
+| `REMIND_ME_MCP_DIR` | **directory** holding `memory.db` | Also where the wiki, API keys and connector token live. |
 
 A leading `~` is expanded in either. A variable set to the empty string counts as unset.
 
-To share a database with `remind_me`, set `REMIND_ME_MCP_DIR` only — `REMIND_ME_DB_PATH` has no meaning to `remind_me` and setting it there is silently ignored.
+The store is moving off SQLite (`docs/adr/0023-node-storage-moves-to-rusty-multimodal-db.md`). Until that ships, this is the file the node reads and writes.
 
-## Substituting for the `remind_me` MCP server
+## Coming from the Python `remind_me`
 
-Two settings make this binary a drop-in replacement for [`remind_me`](https://github.com/baileyrd/remind_me)'s MCP server:
-
-```bash
-REMIND_ME_MCP_DIR=~/.remind-me                 # the same database (the default)
-REMIND_ME_DEFAULT_RESPONSE_FORMAT=markdown     # the same output format
-```
-
-Or write both into every MCP client config at once:
+The Python [`remind_me`](https://github.com/baileyrd/remind_me) this project was ported from is **retired** (ADR-0023). Until the storage move above ships, this binary still opens a `memory.db` the Python server wrote, so moving over is a matter of pointing your MCP clients at `rusty-remind-me` instead:
 
 ```bash
-rusty-remind-me configure --default-format markdown
+rusty-remind-me configure                             # JSON output (the default)
+rusty-remind-me configure --default-format markdown   # the Python server's output format
 ```
 
-`REMIND_ME_DEFAULT_RESPONSE_FORMAT` accepts `json` (the default) or `markdown`, and affects **only** the tools where `remind_me` has no `response_format` parameter at all — it returns Markdown from those and offers no JSON, whereas this port offers both and defaults to JSON so existing callers keep working.
+Do not run the Python server against the same `memory.db` afterwards. The two stopped being kept schema-identical when Python was retired, and the storage move will end file-level compatibility altogether.
 
-Tools that mirror a `remind_me` input model already use that model's own default and are deliberately untouched by this setting: Markdown for `search`, `list`, `wiki_list`, `stats`, `history`, `digest` and `list_reminders`, JSON for `vitality_report`. Making `vitality_report` render Markdown because you asked for "markdown defaults" would move this port *away* from the reference.
+`REMIND_ME_DEFAULT_RESPONSE_FORMAT` accepts `json` (the default) or `markdown`, and affects **only** the tools where the Python server had no `response_format` parameter at all — it returned Markdown from those and offered no JSON, whereas this port offers both and defaults to JSON so existing callers keep working. Tools that mirror a Python input model already use that model's own default and are untouched by this setting: Markdown for `search`, `list`, `wiki_list`, `stats`, `history`, `digest` and `list_reminders`, JSON for `vitality_report`. A per-call `"response_format"` argument always wins over the setting, in both directions.
 
-A per-call `"response_format"` argument always wins over the setting, in both directions.
-
-**Migrating an already-running client from `remind_me` to this binary?** A
-stdio client will not pick up a config change until it restarts — see
-`docs/CUTOVER.md` for the full runbook and the lessons learned cutting over
-every consumer on a real machine.
+A stdio client will not pick up a config change until it restarts. `docs/CUTOVER.md` records the 2026-08 cutover of every consumer on a real machine; it is kept as history.
 
 ## Multi-Node Sync, Hub & Remote Connector
 

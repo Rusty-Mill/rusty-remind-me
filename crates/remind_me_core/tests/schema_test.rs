@@ -26,8 +26,7 @@ use std::sync::Mutex;
 /// currently races on it.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-/// The generated schema, as shipped. Comparing against these is comparing
-/// against `remind_me`, because they are dumped from it verbatim.
+/// The schema files, as shipped: what every open must converge on.
 const SCHEMA_TABLES: &str = include_str!("../src/db/schema_tables.sql");
 const SCHEMA_INDEXES: &str = include_str!("../src/db/schema_indexes.sql");
 const SCHEMA_TRIGGERS: &str = include_str!("../src/db/schema_triggers.sql");
@@ -99,10 +98,10 @@ fn objects(conn: &Connection, kind: &str) -> BTreeMap<String, String> {
     .collect()
 }
 
-/// Tables this crate's own code creates, deliberately, beyond the generated
-/// schema — not part of the "generated verbatim from `remind_me`" contract,
-/// so their presence is expected rather than a drift `assert_matches_schema`
-/// should flag.
+/// Tables this crate's own code creates, deliberately, beyond the schema
+/// files, so their presence is expected rather than a drift
+/// `assert_matches_schema` should flag. They were kept out of the files while
+/// those were generated from the Python `remind_me` (retired, ADR-0023).
 ///
 /// `vec_embeddings`: this crate's own vector storage
 /// (`docs/adr/0002-embeddings-ollama-and-brute-force-vectors.md`) — `remind_me`
@@ -113,9 +112,9 @@ fn objects(conn: &Connection, kind: &str) -> BTreeMap<String, String> {
 ///
 /// `import_archives` / `import_archive_spans` / `idx_archive_spans_import`:
 /// raw-transcript retention (#212). The obvious home for the archive path was
-/// a column on `chat_imports`, which is exactly what this list exists to
-/// prevent — `schema_tables.sql` is generated verbatim, so the column would
-/// have been reverted by the next `regenerate_schema.py` run. Target-only
+/// a column on `chat_imports`, which is exactly what this list existed to
+/// prevent — `schema_tables.sql` was generated verbatim then, so the column
+/// would have been reverted by the next regeneration. Target-only
 /// tables created by `archive::ensure_schema` instead, on the
 /// `vec_embeddings` pattern.
 /// `promotions` / `idx_promotions_source`: the refinement ladder's provenance

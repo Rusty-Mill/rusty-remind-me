@@ -30,7 +30,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Cheap and toolchain-independent, same shape as ci.yml's schema-drift
+  # Cheap and toolchain-independent, same shape as ci.yml's plugin-version
   # job: report in seconds whether there is anything to release before any
   # platform build spins up.
   detect-version:

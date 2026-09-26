@@ -1,6 +1,7 @@
 # ADR-0007: Regenerate the schema dump; gate every outbox trigger on `sync_flags`
 
-Status: Accepted
+Status: Accepted; the regeneration half is superseded by ADR-0023 (the
+Python reference is retired and the schema files are hand-owned)
 Date: 2026-07-30
 
 ## Context

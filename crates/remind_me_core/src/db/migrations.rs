@@ -1,24 +1,17 @@
 //! Schema creation and reconciliation.
 //!
-//! # `remind_me`'s current schema is the starting point
+//! # The schema files are the schema
 //!
-//! The three `schema_*.sql` files beside this module are **generated verbatim**
-//! from a `remind_me` database — dumped straight out of its `sqlite_master`.
-//! They are not hand-written and should not be hand-edited; regenerate them
-//! with `scripts/regenerate_schema.py --reference <path-to-remind_me>`, which
-//! is the ADR-0007 method made repeatable.
-//!
-//! An earlier version of this module transcribed the reference's historical
-//! migrations by hand, reconstructing each step. Three of those steps were
-//! written from *this* crate's pre-existing tables rather than from the
-//! reference, and the divergence went unnoticed because the parity check only
-//! compared table names and `memories` columns — the verification was shaped
-//! like the mistake. Generating the schema removes the transcription step that
-//! produced that class of error.
+//! The three `schema_*.sql` files beside this module were dumped verbatim from
+//! the Python `remind_me` at v29, when the two shared one database file
+//! (ADR-0007). That reference is retired (ADR-0023): the files are this
+//! crate's own now, edited by hand, and nothing outside this repository
+//! constrains them. The node's storage is moving off SQLite altogether
+//! (ADR-0023), so they are expected to shrink rather than grow.
 //!
 //! # Reconciliation, not a ladder
 //!
-//! This crate does not replay the reference's version history. It creates the
+//! This crate does not replay a version history. It creates the
 //! current schema and reconciles anything that differs, then stamps the version
 //! the schema actually corresponds to. Concretely, on open:
 //!
@@ -39,13 +32,13 @@
 
 use rusqlite::{Connection, Result};
 
-/// The version the generated schema corresponds to.
+/// The version the schema files correspond to, stamped into
+/// `PRAGMA user_version`.
 ///
-/// This must track whatever `remind_me` reports for the schema the
-/// `schema_*.sql` files were dumped from. It is not a number this crate is free
-/// to choose: `remind_me` reads it on open and skips migrating anything already
-/// at its own target, so claiming a version the schema does not match is what
-/// makes a database silently unreadable to it.
+/// It was the Python `remind_me`'s own number while the two shared a file,
+/// and Python read it on open. With Python retired (ADR-0023) it is this
+/// crate's to choose; bump it with any schema change that an older build of
+/// this crate must not open unawares.
 pub const SCHEMA_VERSION: i32 = 29;
 
 const SCHEMA_TABLES: &str = include_str!("schema_tables.sql");

@@ -1,5 +1,6 @@
--- GENERATED from remind_me's schema. Do not hand-edit.
--- Regenerate with: python3 scripts/regenerate_schema.py --reference <path>
+-- The node's schema. Originally dumped from the Python remind_me at v29;
+-- that reference is retired (ADR-0023), so this file is edited by hand now.
+-- A change here is a schema change: see db/migrations.rs.
 
 CREATE TABLE IF NOT EXISTS analytics_snapshots (
             id               INTEGER PRIMARY KEY,
