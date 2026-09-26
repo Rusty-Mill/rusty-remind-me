@@ -1,3 +1,4 @@
+use crate::db::memories::{Memories, NewMemory};
 use crate::expansion::{self, MemorySearchResponse};
 use crate::fts::sanitize_fts_query;
 use crate::models::{
@@ -104,41 +105,29 @@ pub fn add_memory(conn: &Connection, mut input: MemoryAddInput) -> Result<Memory
     let code_refs = crate::code_refs::detect_code_refs(&input.content);
     crate::code_refs::merge_code_refs(&mut input.metadata, &code_refs);
 
-    let tags_json = serde_json::to_string(&input.tags).unwrap_or_else(|_| "[]".to_string());
-    let metadata_json = serde_json::to_string(&input.metadata).unwrap_or_else(|_| "{}".to_string());
     let decay_rate = get_decay_rate(&input.category);
     let type_prior = get_type_prior(&input.category);
     let source_prior = get_source_prior(&input.source);
     let base_weight = type_prior * source_prior;
     let initial_vitality = calculate_vitality(base_weight, 0, decay_rate, &now_iso, now);
 
-    conn.execute(
-        "INSERT INTO memories (
-            id, content, category, tags, source, metadata, created_at, updated_at,
-            subject, predicate, object, decay_rate, vitality, base_weight, access_count, accessed_at,
-            node_id, client, sensitive
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)",
-        params![
-            id,
-            input.content,
-            input.category,
-            tags_json,
-            input.source,
-            metadata_json,
-            now_iso,
-            now_iso,
-            input.subject,
-            input.predicate,
-            input.object,
-            decay_rate,
-            initial_vitality,
-            base_weight,
-            now_iso,
-            crate::sync::configured_node_id(),
-            crate::sync::configured_client(),
-            input.sensitive,
-        ],
-    )?;
+    Memories::new(conn).insert(&NewMemory {
+        category: input.category.clone(),
+        tags: input.tags.clone(),
+        source: input.source.clone(),
+        metadata: input.metadata.clone(),
+        subject: input.subject.clone(),
+        predicate: input.predicate.clone(),
+        object: input.object.clone(),
+        decay_rate,
+        vitality: initial_vitality,
+        base_weight,
+        accessed_at: Some(now_iso.clone()),
+        sensitive: input.sensitive,
+        node_id: Some(crate::sync::configured_node_id()),
+        client: crate::sync::configured_client(),
+        ..NewMemory::new(id.clone(), input.content.clone(), &now_iso)
+    })?;
 
     // `MemoryAddInput::entities` was previously parsed and then dropped, so a
     // caller supplying entity mentions got a silent no-op. Same path as

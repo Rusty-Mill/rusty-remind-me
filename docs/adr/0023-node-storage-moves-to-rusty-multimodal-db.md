@@ -332,6 +332,56 @@ the reference.
 - **Switch the node in one change.** The hub's move worked because each
   step was proven before the next; the node is ten times larger.
 
+## Progress
+
+### Phase 0: done
+
+The Python reference is retired. The drift CI and its scripts are gone, the
+schema files are hand-owned, and Tenet 3 is replaced.
+
+### Phase 1: the steps
+
+Phase 1 goes one group per change, as ADR-0022 did. Every step keeps the
+schema, the SQL and the public signatures, so the whole suite passes
+unchanged after each.
+
+| Step | Group | Repository | State |
+|---|---|---|---|
+| 1 | Memory row writes | `db::memories::Memories` | Done |
+| 2 | Entities, relations and mentions | `db::entities` | |
+| 3 | Wiki pages, links and their index | `db::wiki` | |
+| 4 | Vectors, re-keyed on memory id (§4) | `db::vectors` | |
+| 5 | Promotions, imports, archives and curation queues | one each | |
+| 6 | The outbox, with echo suppression as a flag | `db::outbox` | |
+| 7 | Triggers move into the repositories | | |
+| 8 | Callers stop taking `&Connection` | | |
+
+Writes go first because the triggers fire on writes. Once each table's
+writes have one home, step 7 moves its triggers there in one place.
+
+**Step 1.** `db::memories` holds every insert, sync upsert and field update
+of `memories` that domain modules used to write inline:
+- `insert` and `insert_or_ignore` take a `NewMemory`, a whole row whose
+  `new()` fills every column with the schema's default. So each writer names
+  only what it sets, and the row matches what its old `INSERT` produced. A
+  test holds `new()` to the schema defaults column by column.
+- `upsert_synced` is the sync apply's `ON CONFLICT` write. It still keeps
+  the local `created_at`, `doc_id` and `chunk_index`.
+- Field updates: superseding (one memory, or every chunk of an import),
+  a merge rewrite, vitality, access tracking, the ingest marker, and the
+  sync merge's tags and metadata.
+
+Eight writers moved: `add_memory`, capture (both halves and decomposed
+facts), skeletons, promotion, normalization, the three importers, and sync
+apply. The rules stay where they were: vitality seeding, provenance, what a
+merge writes, and when `updated_at` is stamped. The only observable change
+is that a normalized memory's copied tags are re-serialized rather than
+copied as text, so `["a", "b"]` becomes `["a","b"]`. Both parse the same.
+
+The remaining writes to `memories` are already in `db::`: `update_memory`,
+deletes, bulk tagging, annotation and reclassification in `queries.rs`, and
+the history, feedback and reminder repositories.
+
 ## Related
 
 - ADR-0021 (the hub's move) and ADR-0022 (the seam this continues).

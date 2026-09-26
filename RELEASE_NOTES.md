@@ -2,6 +2,16 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-26 — Memory writes go through one repository (ADR-0023, phase 1, step 1)
+
+### Changed
+- **Every write to `memories` now lives in `db::`.** `db::memories::Memories` holds the inserts, the sync upsert and the field updates that capture, skeletons, promotion, normalization, consolidation, the importers, the watcher, the webhook, access tracking and sync apply used to write inline. A new row is a `NewMemory`, whose defaults are the schema's. This is the groundwork for moving the FTS, tag and outbox triggers into Rust (step 7).
+- A normalized memory's tags, copied from its source, are re-serialized rather than copied as text. They read the same.
+
+### Tests
+- New repository tests: `NewMemory::new` matches the schema default of every column; `insert` refuses a taken id and `insert_or_ignore` reports it; a synced overwrite keeps `created_at`, `doc_id` and `chunk_index`; tags that are not an array read as none; access inputs skip unknown ids.
+- The core, API, MCP and CLI suites pass unchanged.
+
 ## 2026-09-26 — The Python remind_me is retired (ADR-0023, phase 0)
 
 ### Changed

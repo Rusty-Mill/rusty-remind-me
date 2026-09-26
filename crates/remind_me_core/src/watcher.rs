@@ -38,13 +38,14 @@
 //! with years of churn does not carry one entry forever for every filename
 //! ever seen.
 
+use crate::db::memories::Memories;
 use crate::import_paths::{
     import_roots, is_contained, resolve_lexically, split_path_list, SUPPORTED_SUFFIXES,
 };
 use crate::importer::import_file;
 use crate::models::{ImportKind, ImportOutcome};
 use chrono::Utc;
-use rusqlite::{params, Connection, Result};
+use rusqlite::{Connection, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -196,15 +197,7 @@ pub fn supersede_import(
     old_import_id: &str,
     new_import_id: &str,
 ) -> Result<usize> {
-    let affected = conn.execute(
-        "UPDATE memories
-            SET superseded_by = ?, updated_at = ?
-          WHERE superseded_by IS NULL
-            AND deleted_at IS NULL
-            AND json_extract(metadata, '$.import_id') = ?",
-        params![new_import_id, Utc::now().to_rfc3339(), old_import_id],
-    )?;
-    Ok(affected)
+    Memories::new(conn).supersede_import(old_import_id, new_import_id, &Utc::now().to_rfc3339())
 }
 
 /// A file's identity for change detection.

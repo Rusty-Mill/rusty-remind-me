@@ -37,6 +37,7 @@
 //! stays imported, matching the reference exactly (it has no content-hash
 //! column to compare against).
 
+use crate::db::memories::{Memories, NewMemory};
 use crate::models::{MempalaceImportInput, MEMPALACE_IMPORT_LIMIT_MAX, MEMPALACE_IMPORT_LIMIT_MIN};
 use chrono::Utc;
 use rusqlite::{params, params_from_iter, Connection, OpenFlags, Result};
@@ -443,21 +444,14 @@ pub fn pull_mempalace(
             "room": room_val,
         });
 
-        tx.execute(
-            "INSERT OR IGNORE INTO memories
-                (id, content, category, tags, source, metadata, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            params![
-                memory_id,
-                content,
-                mem_category,
-                serde_json::to_string(&mem_tags).unwrap_or_else(|_| "[]".to_string()),
-                mem_source,
-                metadata.to_string(),
-                created_at,
-                now,
-            ],
-        )?;
+        Memories::new(&tx).insert_or_ignore(&NewMemory {
+            category: mem_category,
+            tags: mem_tags,
+            source: mem_source,
+            metadata,
+            created_at,
+            ..NewMemory::new(memory_id.clone(), content, &now)
+        })?;
         tx.execute(
             "INSERT OR IGNORE INTO mempalace_imports (drawer_id, memory_id, imported_at)
              VALUES (?, ?, ?)",

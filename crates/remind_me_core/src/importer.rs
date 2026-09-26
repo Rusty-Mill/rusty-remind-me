@@ -21,6 +21,7 @@
 //! is checked **before** the file's text is read or parsed, so a re-import
 //! short-circuits without doing the work.
 
+use crate::db::memories::{Memories, NewMemory};
 use crate::entity::{upsert_entity, upsert_entity_relation};
 use crate::import_paths::{
     suffix_of, validate_import_dir, validate_import_file, AUDIO_SUFFIXES, DOCUMENT_SUFFIXES,
@@ -1012,7 +1013,6 @@ pub fn import_content(
 
     let now = Utc::now().to_rfc3339();
     let import_id = format!("imp_{}", uuid::Uuid::new_v4().simple());
-    let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string());
 
     // Raw-transcript retention (#212). A no-op unless REMIND_ME_ARCHIVE_DIR is
     // set. A failure here is swallowed on purpose: the memories below are the
@@ -1062,14 +1062,11 @@ pub fn import_content(
         // a correction. Deduplicated case-insensitively so `#Project` from the
         // note and `project` from the caller do not both land.
         let chunk_extras = extras.get(chunk_index);
-        let chunk_tags_json = match chunk_extras {
-            Some(e) if !e.extra_tags.is_empty() => {
-                let merged = crate::obsidian_import::dedupe_ci(
-                    tags.iter().cloned().chain(e.extra_tags.iter().cloned()),
-                );
-                serde_json::to_string(&merged).unwrap_or_else(|_| tags_json.clone())
-            }
-            _ => tags_json.clone(),
+        let chunk_tags = match chunk_extras {
+            Some(e) if !e.extra_tags.is_empty() => crate::obsidian_import::dedupe_ci(
+                tags.iter().cloned().chain(e.extra_tags.iter().cloned()),
+            ),
+            _ => tags.to_vec(),
         };
 
         let memory_id = format!("mem_{}", uuid::Uuid::new_v4().simple());
@@ -1077,26 +1074,17 @@ pub fn import_content(
         // `doc_id`/`chunk_index` group every chunk of this file in source
         // order, which is what lets neighbour expansion find a hit's siblings
         // without re-parsing anything.
-        conn.execute(
-            "INSERT OR IGNORE INTO memories
-                (id, content, category, tags, source, metadata, created_at, updated_at,
-                 doc_id, chunk_index, node_id, client)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            params![
-                memory_id,
-                content,
-                category,
-                chunk_tags_json,
-                source,
-                metadata.to_string(),
-                now,
-                now,
-                import_id,
-                chunk_index as i64,
-                node_id,
-                client,
-            ],
-        )?;
+        Memories::new(conn).insert_or_ignore(&NewMemory {
+            category: category.to_string(),
+            tags: chunk_tags,
+            source: source.to_string(),
+            metadata,
+            doc_id: Some(import_id.clone()),
+            chunk_index: Some(chunk_index as i64),
+            node_id: Some(node_id.clone()),
+            client: client.clone(),
+            ..NewMemory::new(memory_id.clone(), content.clone(), &now)
+        })?;
         created += 1;
 
         // Point this memory back at the bytes it came from, so a caller can

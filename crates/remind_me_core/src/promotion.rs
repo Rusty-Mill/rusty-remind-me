@@ -47,6 +47,7 @@
 //! `archive::ensure_schema` creates its own. `db/schema_tables.sql` is
 //! generated verbatim from `remind_me` and is not this crate's to extend.
 
+use crate::db::memories::{Memories, NewMemory};
 use crate::models::{
     Memory, PersonaStatement, PromoteInput, PromotionCandidate, PromotionResult, Provenance, Rung,
     FACT_CATEGORY, PERSONA_CATEGORY, PROMOTION_LIMIT_MAX, PROMOTION_LIMIT_MIN, SCENARIO_CATEGORY,
@@ -508,28 +509,18 @@ pub fn promote(conn: &Connection, input: &PromoteInput) -> Result<PromotionResul
     let vitality = calculate_vitality(base_weight, 0, decay_rate, &now_iso, now);
 
     let (node_id, client) = crate::sync::memory_provenance();
-    conn.execute(
-        "INSERT INTO memories (
-            id, content, category, tags, source, metadata,
-            created_at, updated_at, decay_rate, vitality, base_weight,
-            access_count, accessed_at, node_id, client
-         ) VALUES (?, ?, ?, '[]', ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
-        params![
-            promoted_id,
-            input.content,
-            category,
-            PROMOTION_SOURCE,
-            metadata.to_string(),
-            now_iso,
-            now_iso,
-            decay_rate,
-            vitality,
-            base_weight,
-            now_iso,
-            node_id,
-            client,
-        ],
-    )?;
+    Memories::new(conn).insert(&NewMemory {
+        category: category.to_string(),
+        source: PROMOTION_SOURCE.to_string(),
+        metadata,
+        decay_rate,
+        vitality,
+        base_weight,
+        accessed_at: Some(now_iso.clone()),
+        node_id: Some(node_id),
+        client,
+        ..NewMemory::new(promoted_id.clone(), input.content.clone(), &now_iso)
+    })?;
 
     for source_id in &input.source_ids {
         conn.execute(

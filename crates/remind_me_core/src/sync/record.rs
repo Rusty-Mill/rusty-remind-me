@@ -6,8 +6,9 @@
 //! `metadata` merges shallowly per key, the LWW winner's value winning on a
 //! key collision. See `docs/adr/0004-sync-protocol-and-conflict-resolution.md`.
 
+use crate::db::memories::{Memories, NewMemory};
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -229,30 +230,6 @@ fn merge_metadata(local: &Value, incoming: &Value, incoming_wins: bool) -> Value
     Value::Object(merged)
 }
 
-struct LocalRow {
-    tags: Vec<String>,
-    metadata: Value,
-    updated_at: String,
-}
-
-fn fetch_local(conn: &Connection, id: &str) -> rusqlite::Result<Option<LocalRow>> {
-    conn.query_row(
-        "SELECT tags, metadata, updated_at FROM memories WHERE id = ?",
-        params![id],
-        |row| {
-            let tags_json: String = row.get(0)?;
-            let metadata_json: String = row.get(1)?;
-            Ok(LocalRow {
-                tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-                metadata: serde_json::from_str(&metadata_json)
-                    .unwrap_or_else(|_| default_metadata()),
-                updated_at: row.get(2)?,
-            })
-        },
-    )
-    .optional()
-}
-
 /// Apply one incoming sync record: last-write-wins on `updated_at` (a tie
 /// means the incoming side loses -- it must be *strictly* newer to win),
 /// with `tags`/`metadata` merged regardless of the outcome.
@@ -285,7 +262,7 @@ pub fn upsert_record(
         .map(canon_ts)
         .unwrap_or_else(|| created_at.clone());
 
-    let local = fetch_local(conn, &record.id)?;
+    let local = Memories::new(conn).sync_view(&record.id)?;
     let incoming_wins = match &local {
         None => true,
         Some(local) => updated_at > local.updated_at,
@@ -305,73 +282,38 @@ pub fn upsert_record(
         let merged_tags = merge_tags(local_tags, &record.tags);
         let merged_metadata = merge_metadata(&local_metadata, &record.metadata, true);
 
-        conn.execute(
-            "INSERT INTO memories (
-                id, content, category, tags, source, metadata, created_at, updated_at,
-                capture_id, node_id, client, accessed_at, access_count, decay_rate,
-                vitality, base_weight, status, memory_type, source_capture_id,
-                subject, predicate, object, superseded_by, deleted_at, sensitive,
-                remind_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                content = excluded.content,
-                category = excluded.category,
-                tags = excluded.tags,
-                source = excluded.source,
-                metadata = excluded.metadata,
-                updated_at = excluded.updated_at,
-                capture_id = excluded.capture_id,
-                node_id = excluded.node_id,
-                client = excluded.client,
-                accessed_at = excluded.accessed_at,
-                access_count = excluded.access_count,
-                decay_rate = excluded.decay_rate,
-                vitality = excluded.vitality,
-                base_weight = excluded.base_weight,
-                status = excluded.status,
-                memory_type = excluded.memory_type,
-                source_capture_id = excluded.source_capture_id,
-                subject = excluded.subject,
-                predicate = excluded.predicate,
-                object = excluded.object,
-                superseded_by = excluded.superseded_by,
-                deleted_at = excluded.deleted_at,
-                sensitive = excluded.sensitive,
-                remind_at = excluded.remind_at",
-            params![
-                record.id,
-                record.content,
-                record.category,
-                serde_json::to_string(&merged_tags).unwrap_or_else(|_| "[]".to_string()),
-                record.source,
-                merged_metadata.to_string(),
-                created_at,
-                updated_at,
-                record.capture_id,
-                record.node_id,
-                record.client,
-                accessed_at,
-                record.access_count,
-                record.decay_rate,
-                record.vitality,
-                record.base_weight,
-                record.status,
-                record.memory_type,
-                record.source_capture_id,
-                record.subject,
-                record.predicate,
-                record.object,
-                record.superseded_by,
-                record.deleted_at,
-                record.sensitive,
-                record.remind_at,
-            ],
-        )?;
-        let rowid: i64 = conn.query_row(
-            "SELECT rowid FROM memories WHERE id = ?",
-            params![record.id],
-            |r| r.get(0),
-        )?;
+        let memories = Memories::new(conn);
+        memories.upsert_synced(&NewMemory {
+            id: record.id.clone(),
+            content: record.content.clone(),
+            category: record.category.clone(),
+            tags: merged_tags,
+            source: record.source.clone(),
+            metadata: merged_metadata,
+            created_at,
+            updated_at: updated_at.clone(),
+            capture_id: record.capture_id.clone(),
+            subject: record.subject.clone(),
+            predicate: record.predicate.clone(),
+            object: record.object.clone(),
+            superseded_by: record.superseded_by.clone(),
+            decay_rate: record.decay_rate,
+            vitality: record.vitality,
+            base_weight: record.base_weight,
+            access_count: record.access_count,
+            accessed_at: Some(accessed_at),
+            doc_id: None,
+            chunk_index: None,
+            remind_at: record.remind_at.clone(),
+            sensitive: record.sensitive,
+            memory_type: record.memory_type.clone(),
+            status: record.status.clone(),
+            node_id: record.node_id.clone(),
+            client: record.client.clone(),
+            source_capture_id: record.source_capture_id.clone(),
+            deleted_at: record.deleted_at.clone(),
+        })?;
+        let rowid = memories.rowid(&record.id)?;
         ApplyOutcome::Applied { rowid }
     } else {
         let local = local.expect("incoming_wins is false only when a local row was found");
@@ -379,13 +321,10 @@ pub fn upsert_record(
         let merged_metadata = merge_metadata(&local.metadata, &record.metadata, false);
 
         if merged_tags != local.tags || merged_metadata != local.metadata {
-            conn.execute(
-                "UPDATE memories SET tags = ?, metadata = ? WHERE id = ?",
-                params![
-                    serde_json::to_string(&merged_tags).unwrap_or_else(|_| "[]".to_string()),
-                    merged_metadata.to_string(),
-                    record.id,
-                ],
+            Memories::new(conn).set_tags_and_metadata(
+                &record.id,
+                &merged_tags,
+                &merged_metadata,
             )?;
         }
         ApplyOutcome::NotApplied

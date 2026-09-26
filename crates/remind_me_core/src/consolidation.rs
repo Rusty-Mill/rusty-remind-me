@@ -21,6 +21,7 @@
 //!     the rest via the same `superseded_by` mechanism
 //!     [`crate::entity::supersede_contradicting_facts`] already uses.
 
+use crate::db::memories::Memories;
 use crate::models::ConsolidateInput;
 use crate::vitality::calculate_vitality;
 use chrono::Utc;
@@ -484,15 +485,13 @@ fn apply_merges(
             .collect();
         let merged = merge_cluster(canonical, &member_refs, Some(summary.as_str()));
 
-        conn.execute(
-            "UPDATE memories SET content = ?, access_count = ?, tags = ?, updated_at = ? WHERE id = ?",
-            rusqlite::params![
-                merged.merged_content,
-                merged.total_access_count,
-                serde_json::to_string(&merged.merged_tags).unwrap_or_else(|_| "[]".to_string()),
-                now_iso,
-                canonical.id,
-            ],
+        let memories = Memories::new(conn);
+        memories.set_merged(
+            &canonical.id,
+            &merged.merged_content,
+            merged.total_access_count,
+            &merged.merged_tags,
+            &now_iso,
         )?;
 
         // Recompute vitality for the canonical at zero elapsed days, the same
@@ -505,16 +504,10 @@ fn apply_merges(
             &now_iso,
             now,
         );
-        conn.execute(
-            "UPDATE memories SET vitality = ?, status = 'active' WHERE id = ?",
-            rusqlite::params![new_vitality, canonical.id],
-        )?;
+        memories.set_vitality(&canonical.id, new_vitality, "active")?;
 
         for member_id in &merged.superseded_ids {
-            conn.execute(
-                "UPDATE memories SET superseded_by = ?, updated_at = ? WHERE id = ?",
-                rusqlite::params![canonical.id, now_iso, member_id],
-            )?;
+            memories.set_superseded_by(member_id, &canonical.id, Some(&now_iso))?;
         }
 
         total_superseded += merged.superseded_ids.len();

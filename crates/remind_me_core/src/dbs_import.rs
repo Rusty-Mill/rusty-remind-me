@@ -45,6 +45,7 @@
 //! keying on `item_created_at` would miss them. A hash comparison does not
 //! care which timestamp the edit was filed under.
 
+use crate::db::memories::{Memories, NewMemory};
 use crate::entity::{link_memory_entity, upsert_entity};
 use crate::import_paths::{validate_import_database, ImportPathError};
 use crate::models::{DbsImportInput, EntityInput, DBS_IMPORT_LIMIT_MAX, DBS_IMPORT_LIMIT_MIN};
@@ -463,27 +464,22 @@ pub fn pull_dbs(
             "dbs_content_hash": item.content_hash,
         });
 
-        tx.execute(
-            "INSERT OR IGNORE INTO memories
-                (id, content, category, tags, source, metadata, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            params![
-                memory_id,
-                content,
-                item.item_kind
-                    .as_deref()
-                    .filter(|k| !k.is_empty())
-                    .unwrap_or(DEFAULT_CATEGORY),
-                serde_json::to_string(&tags).unwrap_or_else(|_| "[]".to_string()),
-                format!("dbs:{}", item.source_name),
-                metadata.to_string(),
-                // The item's own creation time, so a memory ages from when the
-                // thing happened rather than from when it was imported —
-                // vitality decay reads this column.
-                item.item_created_at.as_deref().unwrap_or(&now),
-                now,
-            ],
-        )?;
+        Memories::new(&tx).insert_or_ignore(&NewMemory {
+            category: item
+                .item_kind
+                .as_deref()
+                .filter(|k| !k.is_empty())
+                .unwrap_or(DEFAULT_CATEGORY)
+                .to_string(),
+            tags: tags.clone(),
+            source: format!("dbs:{}", item.source_name),
+            metadata,
+            // The item's own creation time, so a memory ages from when the
+            // thing happened rather than from when it was imported —
+            // vitality decay reads this column.
+            created_at: item.item_created_at.clone().unwrap_or_else(|| now.clone()),
+            ..NewMemory::new(memory_id.clone(), content, &now)
+        })?;
 
         // The source, then every tag. This is the reason to prefer this over
         // the export route, so it is not conditional on anything.
@@ -513,10 +509,7 @@ pub fn pull_dbs(
                 // pointed at the new. Every read path filters
                 // `superseded_by IS NULL`, so the previous version drops out of
                 // search while staying in the database.
-                tx.execute(
-                    "UPDATE memories SET superseded_by = ? WHERE id = ?",
-                    params![memory_id, prior.memory_id],
-                )?;
+                Memories::new(&tx).set_superseded_by(&prior.memory_id, &memory_id, None)?;
                 result.updated += 1;
             }
             None => result.created += 1,

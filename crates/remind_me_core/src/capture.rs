@@ -5,6 +5,7 @@
 //! keys on — `remind_me_get_capture` to retrieve both halves, and
 //! `remind_me_decompose` to break the capture into atomic facts.
 
+use crate::db::memories::{Memories, NewMemory};
 use crate::db::queries::{parse_memory_row, MEMORY_COLUMNS};
 use crate::entity::{
     apply_entity_mentions, maybe_link_entity_relation, supersede_contradicting_facts,
@@ -66,8 +67,8 @@ fn insert_half(
     id: &str,
     content: &str,
     category: &str,
-    tags_json: &str,
-    metadata: &serde_json::Value,
+    tags: &[String],
+    metadata: serde_json::Value,
     capture_id: &str,
     now_iso: &str,
 ) -> Result<()> {
@@ -77,31 +78,20 @@ fn insert_half(
     let vitality = calculate_vitality(base_weight, 0, decay_rate, now_iso, now);
 
     let (node_id, client) = crate::sync::memory_provenance();
-    conn.execute(
-        "INSERT INTO memories (
-            id, content, category, tags, source, metadata, capture_id,
-            created_at, updated_at, decay_rate, vitality, base_weight,
-            access_count, accessed_at, node_id, client
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
-        params![
-            id,
-            content,
-            category,
-            tags_json,
-            CAPTURE_SOURCE,
-            metadata.to_string(),
-            capture_id,
-            now_iso,
-            now_iso,
-            decay_rate,
-            vitality,
-            base_weight,
-            now_iso,
-            node_id,
-            client,
-        ],
-    )?;
-    Ok(())
+    Memories::new(conn).insert(&NewMemory {
+        category: category.to_string(),
+        tags: tags.to_vec(),
+        source: CAPTURE_SOURCE.to_string(),
+        metadata,
+        capture_id: Some(capture_id.to_string()),
+        decay_rate,
+        vitality,
+        base_weight,
+        accessed_at: Some(now_iso.to_string()),
+        node_id: Some(node_id),
+        client,
+        ..NewMemory::new(id, content, now_iso)
+    })
 }
 
 /// Store a conversation as a linked dialog/summary pair.
@@ -124,8 +114,6 @@ pub fn auto_capture(conn: &Connection, input: &AutoCaptureInput) -> Result<Captu
     let dialog_id = format!("mem_{}", uuid::Uuid::new_v4().simple());
     let summary_id = format!("mem_{}", uuid::Uuid::new_v4().simple());
     let title = derive_title(&input.title, &input.summary);
-    let tags_json = serde_json::to_string(&input.tags).unwrap_or_else(|_| "[]".to_string());
-
     let dialog_meta = capture_metadata(
         &input.metadata,
         &capture_id,
@@ -148,8 +136,8 @@ pub fn auto_capture(conn: &Connection, input: &AutoCaptureInput) -> Result<Captu
         &dialog_id,
         &input.conversation,
         DIALOG_CATEGORY,
-        &tags_json,
-        &dialog_meta,
+        &input.tags,
+        dialog_meta,
         &capture_id,
         &now_iso,
     )?;
@@ -158,8 +146,8 @@ pub fn auto_capture(conn: &Connection, input: &AutoCaptureInput) -> Result<Captu
         &summary_id,
         &input.summary,
         &input.category,
-        &tags_json,
-        &summary_meta,
+        &input.tags,
+        summary_meta,
         &capture_id,
         &now_iso,
     )?;
@@ -306,36 +294,24 @@ pub fn decompose(conn: &Connection, input: &DecomposeInput) -> Result<Option<Dec
         let code_refs = crate::code_refs::detect_code_refs(&fact.content);
         crate::code_refs::merge_code_refs(&mut metadata, &code_refs);
 
-        conn.execute(
-            "INSERT INTO memories (
-                id, content, category, tags, source, metadata,
-                capture_id, source_capture_id, created_at, updated_at,
-                memory_type, decay_rate, vitality, base_weight, status,
-                accessed_at, access_count, subject, predicate, object,
-                node_id, client
-             ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, 'active', ?, 0, ?, ?, ?, ?, ?)",
-            params![
-                fact_id,
-                fact.content,
-                FACT_CATEGORY,
-                serde_json::to_string(&merged_tags).unwrap_or_else(|_| "[]".to_string()),
-                DECOMPOSITION_SOURCE,
-                metadata.to_string(),
-                input.capture_id,
-                now_iso,
-                now_iso,
-                memory_type,
-                decay_rate,
-                base_weight,
-                base_weight,
-                now_iso,
-                fact.subject,
-                fact.predicate,
-                fact.object,
-                node_id,
-                client,
-            ],
-        )?;
+        Memories::new(conn).insert(&NewMemory {
+            category: FACT_CATEGORY.to_string(),
+            tags: merged_tags,
+            source: DECOMPOSITION_SOURCE.to_string(),
+            metadata,
+            source_capture_id: Some(input.capture_id.clone()),
+            memory_type: memory_type.to_string(),
+            decay_rate,
+            vitality: base_weight,
+            base_weight,
+            accessed_at: Some(now_iso.clone()),
+            subject: fact.subject.clone(),
+            predicate: fact.predicate.clone(),
+            object: fact.object.clone(),
+            node_id: Some(node_id),
+            client,
+            ..NewMemory::new(fact_id.clone(), fact.content.clone(), &now_iso)
+        })?;
 
         entities_linked += apply_entity_mentions(conn, &fact_id, &fact.entities)?;
         if maybe_link_entity_relation(

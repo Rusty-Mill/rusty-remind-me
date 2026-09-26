@@ -1,4 +1,5 @@
 use crate::db::feedback::{Feedback, FeedbackEvent};
+use crate::db::memories::Memories;
 use crate::models::{Memory, MemorySearchResult};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, Result};
@@ -505,8 +506,8 @@ pub fn build_vitality_report(conn: &Connection) -> Result<VitalityReport> {
 ///
 /// # Batched deliberately
 ///
-/// One `SELECT` and one prepared `UPDATE` reused across the rows, rather than a
-/// round trip per memory. A twenty-result search is the hot path here.
+/// One `SELECT` and one cached `UPDATE` statement reused across the rows,
+/// rather than a round trip per memory. A twenty-result search is the hot path here.
 ///
 /// The refreshed `vitality` is computed at zero elapsed days, so the decay term
 /// is 1 and it collapses to `base_weight * sqrt(count + 1)` — the value is a
@@ -518,38 +519,22 @@ pub fn record_accesses(conn: &Connection, memory_ids: &[String]) -> Result<usize
         return Ok(0);
     }
 
-    let placeholders = vec!["?"; memory_ids.len()].join(",");
-    let mut select = conn.prepare(&format!(
-        "SELECT id, access_count, decay_rate, base_weight FROM memories WHERE id IN ({})",
-        placeholders
-    ))?;
-    let bindings: Vec<rusqlite::types::Value> = memory_ids
-        .iter()
-        .map(|id| rusqlite::types::Value::Text(id.clone()))
-        .collect();
-    let rows: Vec<(String, i64, f64, f64)> = select
-        .query_map(rusqlite::params_from_iter(bindings), |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-        })?
-        .collect::<Result<_>>()?;
-    drop(select);
+    let memories = Memories::new(conn);
+    let rows = memories.access_inputs(memory_ids)?;
 
     let now = Utc::now();
     let now_iso = now.to_rfc3339();
-    let mut update = conn.prepare(
-        "UPDATE memories SET accessed_at = ?, access_count = ?, vitality = ?, status = ?
-          WHERE id = ?",
-    )?;
     let mut updated = 0;
-    for (id, access_count, decay_rate, base_weight) in rows {
-        let new_count = access_count + 1;
-        let vitality = calculate_vitality(base_weight, new_count, decay_rate, &now_iso, now);
+    for row in rows {
+        let new_count = row.access_count + 1;
+        let vitality =
+            calculate_vitality(row.base_weight, new_count, row.decay_rate, &now_iso, now);
         let status = if is_dormant(vitality) {
             "dormant"
         } else {
             "active"
         };
-        update.execute(rusqlite::params![now_iso, new_count, vitality, status, id])?;
+        memories.record_access(&row.id, &now_iso, new_count, vitality, status)?;
         updated += 1;
     }
 

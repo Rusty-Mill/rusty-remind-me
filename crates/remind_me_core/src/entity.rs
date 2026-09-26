@@ -1,3 +1,4 @@
+use crate::db::memories::Memories;
 use crate::models::EntityInput;
 use chrono::Utc;
 use rusqlite::types::Value;
@@ -898,10 +899,7 @@ pub fn supersede_contradicting_facts(
         if normalize_entity_name(&candidate_object) == want_object {
             continue; // the same fact restated, not a contradiction
         }
-        conn.execute(
-            "UPDATE memories SET superseded_by = ?, updated_at = ? WHERE id = ?",
-            params![memory_id, now, id],
-        )?;
+        Memories::new(conn).set_superseded_by(&id, memory_id, Some(&now))?;
         superseded.push(id);
     }
     Ok(superseded)

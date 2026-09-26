@@ -16,6 +16,7 @@
 //! `remind_me_add` the batch is always empty. That is correct rather than
 //! broken.
 
+use crate::db::memories::{Memories, NewMemory};
 use crate::entity::apply_entity_mentions;
 use crate::models::{
     NormalizationEntry, NormalizationError, NormalizationOutcome, NormalizeApplyInput,
@@ -184,31 +185,23 @@ pub fn apply_normalizations(
         let vitality = calculate_vitality(base_weight, 0, decay_rate, &now_iso, now);
 
         let (node_id, client) = crate::sync::memory_provenance();
-        conn.execute(
-            "INSERT INTO memories (
-                id, content, category, tags, source, metadata, created_at, updated_at,
-                doc_id, chunk_index, decay_rate, vitality, base_weight, access_count, accessed_at,
-                node_id, client
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
-            params![
-                normalized_id,
-                content,
-                NORMALIZED_CATEGORY,
-                tags_json,
-                NORMALIZED_SOURCE,
-                metadata.to_string(),
-                now_iso,
-                now_iso,
-                doc_id,
-                chunk_index,
-                decay_rate,
-                vitality,
-                base_weight,
-                now_iso,
-                node_id,
-                client,
-            ],
-        )?;
+        Memories::new(conn).insert(&NewMemory {
+            category: NORMALIZED_CATEGORY.to_string(),
+            // The source's tags, carried over. Unparseable ones read as none,
+            // as they do everywhere a memory's tags are read.
+            tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+            source: NORMALIZED_SOURCE.to_string(),
+            metadata,
+            doc_id,
+            chunk_index,
+            decay_rate,
+            vitality,
+            base_weight,
+            accessed_at: Some(now_iso.clone()),
+            node_id: Some(node_id),
+            client,
+            ..NewMemory::new(normalized_id.clone(), content, &now_iso)
+        })?;
 
         apply_entity_mentions(conn, &normalized_id, &entry.entities)?;
 

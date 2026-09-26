@@ -58,6 +58,7 @@
 //! ingests the same text-native formats the file importer does, not arbitrary
 //! binary.
 
+use crate::db::memories::Memories;
 use crate::importer::import_bytes;
 use crate::models::{ImportKind, ImportOutcome};
 use crate::Database;
@@ -548,10 +549,7 @@ pub const INGEST_MARKER: &str = "webhook";
 
 /// Stamp `metadata.ingest` on every chunk of an import.
 fn mark_ingest_channel(conn: &Connection, import_id: &str) -> rusqlite::Result<usize> {
-    conn.execute(
-        "UPDATE memories SET metadata = json_set(metadata, '$.ingest', ?) WHERE doc_id = ?",
-        rusqlite::params![INGEST_MARKER, import_id],
-    )
+    Memories::new(conn).set_ingest_marker(import_id, INGEST_MARKER)
 }
 
 /// Import a validated push, and record the outcome in the counters.

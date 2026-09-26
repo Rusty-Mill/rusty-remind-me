@@ -40,12 +40,13 @@
 //! takes it along. A separate table would have needed all three rebuilt.
 
 use crate::capture::get_capture;
+use crate::db::memories::{Memories, NewMemory};
 use crate::models::{
     Skeleton, SkeletonSlice, SkeletonWriteInput, CAPTURE_SOURCE, SKELETON_CATEGORY,
 };
 use crate::vitality::{calculate_vitality, get_decay_rate, get_source_prior, get_type_prior};
 use chrono::Utc;
-use rusqlite::{params, Connection};
+use rusqlite::Connection;
 use std::collections::BTreeMap;
 
 /// Why a skeleton could not be written or read.
@@ -151,10 +152,8 @@ pub fn write_skeleton(
     }
 
     // Any previous skeleton goes first, so a replace cannot briefly leave two.
-    conn.execute(
-        "DELETE FROM memories WHERE capture_id = ? AND category = ?",
-        params![input.capture_id, SKELETON_CATEGORY],
-    )?;
+    let memories = Memories::new(conn);
+    memories.delete_capture_category(&input.capture_id, SKELETON_CATEGORY)?;
 
     let now_iso = Utc::now().to_rfc3339();
     let now = Utc::now();
@@ -179,29 +178,19 @@ pub fn write_skeleton(
     let vitality = calculate_vitality(base_weight, 0, decay_rate, &now_iso, now);
 
     let (node_id, client) = crate::sync::memory_provenance();
-    conn.execute(
-        "INSERT INTO memories (
-            id, content, category, tags, source, metadata, capture_id,
-            created_at, updated_at, decay_rate, vitality, base_weight,
-            access_count, accessed_at, node_id, client
-         ) VALUES (?, ?, ?, '[]', ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
-        params![
-            skeleton_id,
-            input.mermaid,
-            SKELETON_CATEGORY,
-            CAPTURE_SOURCE,
-            metadata.to_string(),
-            input.capture_id,
-            now_iso,
-            now_iso,
-            decay_rate,
-            vitality,
-            base_weight,
-            now_iso,
-            node_id,
-            client,
-        ],
-    )?;
+    memories.insert(&NewMemory {
+        category: SKELETON_CATEGORY.to_string(),
+        source: CAPTURE_SOURCE.to_string(),
+        metadata,
+        capture_id: Some(input.capture_id.clone()),
+        decay_rate,
+        vitality,
+        base_weight,
+        accessed_at: Some(now_iso.clone()),
+        node_id: Some(node_id),
+        client,
+        ..NewMemory::new(skeleton_id.clone(), input.mermaid.clone(), &now_iso)
+    })?;
 
     Ok(Skeleton {
         capture_id: input.capture_id.clone(),
