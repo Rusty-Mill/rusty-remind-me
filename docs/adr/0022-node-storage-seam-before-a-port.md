@@ -1,6 +1,7 @@
 # ADR-0022: A storage seam in the node before any storage port
 
-Status: Accepted (2026-09-25)
+Status: Accepted (2026-09-25); continued by ADR-0023, which retires Python
+and takes the seam through to an engine-backed store
 Date: 2026-09-25
 
 ## Context
