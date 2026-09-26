@@ -326,8 +326,9 @@ the reference.
   value types have no floats or nulls, and its queries are too narrow for
   the node. It would add a network service to run beside every node.
 - **Port the app's journal and MVCC by depending on the app crate.**
-  The monorepo's ADR-0003 forbids an apps-to-apps edge across families. ADR-0021 declined
-  an exception, and the write batch in §3b is smaller than MVCC.
+  The monorepo's ADR-0003 forbids an apps-to-apps edge across families.
+  ADR-0021 declined an exception, and the write batch in §3b is smaller
+  than MVCC.
 - **Switch the node in one change.** The hub's move worked because each
   step was proven before the next; the node is ten times larger.
 
