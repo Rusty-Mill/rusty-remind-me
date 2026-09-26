@@ -103,24 +103,15 @@ fn objects(conn: &Connection, kind: &str) -> BTreeMap<String, String> {
 /// `assert_matches_schema` should flag. They were kept out of the files while
 /// those were generated from the Python `remind_me` (retired, ADR-0023).
 ///
-/// `vec_embeddings`: this crate's own vector storage
-/// (`docs/adr/0002-embeddings-ollama-and-brute-force-vectors.md`) — `remind_me`
-/// stores vectors in a `sqlite-vec` `vec0` virtual table this crate has no way
-/// to load, so it keeps its own plain table instead. `vec_chunks` (the rowid
-/// map back to `memory_rowid`/`chunk_ix`) *is* part of the generated schema
-/// and stays untouched; only the table holding the actual bytes is new.
-///
 /// `import_archives` / `import_archive_spans` / `idx_archive_spans_import`:
 /// raw-transcript retention (#212). The obvious home for the archive path was
 /// a column on `chat_imports`, which is exactly what this list existed to
 /// prevent — `schema_tables.sql` was generated verbatim then, so the column
 /// would have been reverted by the next regeneration. Target-only
-/// tables created by `db::archives::ensure_tables` instead, on the
-/// `vec_embeddings` pattern.
+/// tables created by `db::archives::ensure_tables` instead.
 /// `promotions` / `idx_promotions_source`: the refinement ladder's provenance
 /// (#208), linking a promoted artifact to the memories it was distilled from.
 const OWN_ADDITIONS: &[&str] = &[
-    "vec_embeddings",
     "import_archives",
     "import_archive_spans",
     "idx_archive_spans_import",
@@ -447,22 +438,9 @@ fn plant_stale_vector(conn: &Connection, model: &str, dim: usize) {
         [],
     )
     .unwrap();
-    let rowid: i64 = conn
-        .query_row(
-            "SELECT rowid FROM memories WHERE id = 'mem_versioning'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
     conn.execute(
-        "INSERT INTO vec_chunks (memory_rowid, chunk_ix) VALUES (?, 0)",
-        [rowid],
-    )
-    .unwrap();
-    let vec_rowid = conn.last_insert_rowid();
-    conn.execute(
-        "INSERT INTO vec_embeddings (vec_rowid, embedding) VALUES (?, ?)",
-        rusqlite::params![vec_rowid, vec![0u8; dim * 4]],
+        "INSERT INTO vec_chunks (memory_id, chunk_ix, embedding) VALUES ('mem_versioning', 0, ?)",
+        [vec![0u8; dim * 4]],
     )
     .unwrap();
     for (key, value) in [("backend", "ollama"), ("model", model)] {
@@ -479,14 +457,9 @@ fn plant_stale_vector(conn: &Connection, model: &str, dim: usize) {
     .unwrap();
 }
 
-fn stored_vector_counts(conn: &Connection) -> (i64, i64) {
-    let chunks: i64 = conn
-        .query_row("SELECT count(*) FROM vec_chunks", [], |r| r.get(0))
-        .unwrap();
-    let vecs: i64 = conn
-        .query_row("SELECT count(*) FROM vec_embeddings", [], |r| r.get(0))
-        .unwrap();
-    (chunks, vecs)
+fn stored_vector_counts(conn: &Connection) -> i64 {
+    conn.query_row("SELECT count(*) FROM vec_chunks", [], |r| r.get(0))
+        .unwrap()
 }
 
 #[test]
@@ -504,7 +477,7 @@ fn reopening_with_an_unchanged_ollama_model_leaves_stored_vectors_alone() {
 
     // Reopening under the exact same configuration must not touch anything.
     let db = Database::open(&tmp.0).unwrap();
-    assert_eq!(stored_vector_counts(&db.conn()), (1, 1));
+    assert_eq!(stored_vector_counts(&db.conn()), 1);
 
     crate::test_env::remove_var(EMBEDDING_BACKEND_ENV);
     crate::test_env::remove_var(OLLAMA_MODEL_ENV);
@@ -528,7 +501,7 @@ fn reopening_with_a_changed_ollama_model_clears_stored_vectors() {
     let db = Database::open(&tmp.0).unwrap();
     assert_eq!(
         stored_vector_counts(&db.conn()),
-        (0, 0),
+        0,
         "a changed REMIND_ME_OLLAMA_EMBED_MODEL must clear the stale vector on open"
     );
 
@@ -554,7 +527,7 @@ fn reopening_with_a_changed_embedding_dimension_clears_stored_vectors() {
     let db = Database::open(&tmp.0).unwrap();
     assert_eq!(
         stored_vector_counts(&db.conn()),
-        (0, 0),
+        0,
         "a changed REMIND_ME_EMBEDDING_DIM must clear the stale vector on open"
     );
 
@@ -590,12 +563,12 @@ fn a_first_ever_open_with_no_prior_embedding_meta_does_not_touch_vec_chunks() {
     crate::test_env::set_var(EMBEDDING_BACKEND_ENV, "ollama");
     crate::test_env::set_var(OLLAMA_MODEL_ENV, "nomic-embed-text");
     crate::test_env::set_var(EMBEDDING_DIM_ENV, "4");
-    // This open both creates vec_chunks/vec_embeddings for the first time
+    // This open both creates vec_chunks for the first time
     // (they did not exist in the hand-built database above) and runs the
-    // startup reconcile -- there is nothing in either table to clear, and
+    // startup reconcile -- there is nothing in it to clear, and
     // no embedding_meta row to false-positive against.
     let db = Database::open(&tmp.0).unwrap();
-    assert_eq!(stored_vector_counts(&db.conn()), (0, 0));
+    assert_eq!(stored_vector_counts(&db.conn()), 0);
     let meta_rows: i64 = db
         .conn()
         .query_row("SELECT count(*) FROM embedding_meta", [], |r| r.get(0))
@@ -631,7 +604,7 @@ fn reopening_with_the_embedding_backend_disabled_never_clears_stored_vectors() {
 
     crate::test_env::remove_var(EMBEDDING_BACKEND_ENV);
     let db = Database::open(&tmp.0).unwrap();
-    assert_eq!(stored_vector_counts(&db.conn()), (1, 1));
+    assert_eq!(stored_vector_counts(&db.conn()), 1);
 
     crate::test_env::remove_var(OLLAMA_MODEL_ENV);
     crate::test_env::remove_var(EMBEDDING_DIM_ENV);
@@ -686,17 +659,13 @@ const V27_COLUMNS: &[(&str, &str, &str)] = &[
 ];
 
 #[test]
-fn the_schema_version_is_the_references_current_one() {
-    // Not a tautology against the dump: `remind_me` reports
-    // `_SCHEMA_VERSION = 29` (db.py:462), and a database this crate creates is
-    // only readable by it if the stamp matches the schema actually present.
-    //
-    // 27 -> 29 covers the reference's v28 (`sync_log.last_pull_seq`, the only
-    // DDL change of the pair) and v29 (the `reference` refiling, data-only).
-    // This literal is the guard that catches the port drifting behind: it is
-    // what failed when the schema was regenerated, and it should keep being
-    // updated by hand rather than derived from the dump.
-    assert_eq!(SCHEMA_VERSION, 29);
+fn the_schema_version_is_the_current_one() {
+    // Written by hand, not derived from the schema files, so a schema change
+    // that forgets to bump it fails here. 29 was the Python reference's last
+    // (27 -> 29 covered its `sync_log.last_pull_seq` and the `reference`
+    // refiling); 30 is this crate's own, vector chunks keyed by memory id
+    // (ADR-0023).
+    assert_eq!(SCHEMA_VERSION, 30);
 }
 
 #[test]

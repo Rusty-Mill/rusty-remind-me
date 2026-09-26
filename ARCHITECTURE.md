@@ -205,10 +205,11 @@ The copy that was here had gone stale in exactly that way — it still showed
 ### Objects this crate adds beyond the schema files
 
 A few, deliberately, created by the code that owns them rather than by the
-files: `vec_embeddings` (vector bytes;
-`docs/adr/0002-embeddings-ollama-and-brute-force-vectors.md`), the import
-archive tables (`archive.rs`) and `promotions` (`promotion.rs`). They were kept
-out of the files while those were generated from Python. `schema_test.rs`'s
+files: the import archive tables (`db::archives`) and `promotions`
+(`db::promotions`). They were kept out of the files while those were
+generated from Python. The vector bytes used to live in a third such table,
+`vec_embeddings`; since schema v30 they live in `vec_chunks` itself, keyed by
+memory id (ADR-0023 §4). `schema_test.rs`'s
 `OWN_ADDITIONS` is the allowlist, and anything not on it that appears in a live
 database fails the schema test.
 

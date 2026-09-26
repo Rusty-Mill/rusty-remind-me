@@ -86,6 +86,4 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_reminder_deliveries_memory_remind_at
 CREATE UNIQUE INDEX IF NOT EXISTS idx_saved_search_seen_memories_search_memory
             ON saved_search_seen_memories(saved_search_id, memory_id);
 
-CREATE INDEX IF NOT EXISTS idx_vec_chunks_memory ON vec_chunks(memory_rowid);
-
 CREATE INDEX IF NOT EXISTS idx_wiki_links_dst ON wiki_links(dst_slug);

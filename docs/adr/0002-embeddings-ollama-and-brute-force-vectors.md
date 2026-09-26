@@ -1,7 +1,14 @@
 # ADR-0002: Embeddings via Ollama's HTTP API; vectors stored and scanned in plain SQL, not `sqlite-vec`
 
-Status: Accepted
+Status: Accepted; the storage layout is superseded by ADR-0023 §4
 Date: 2026-07-29
+
+> **Storage update (schema v30, 2026-09-26).** The two tables described below
+> (`vec_chunks` as a rowid map and `vec_embeddings` holding the bytes) are now
+> one: `vec_chunks(memory_id, chunk_ix, embedding)`, keyed by memory id rather
+> than `memories.rowid`. Opening an older database moves it over. Everything
+> else here, the Ollama backend, brute-force scanning and the model-change
+> clear, stands.
 
 ## Context
 

@@ -22,11 +22,12 @@
 //!     [`crate::entity::supersede_contradicting_facts`] already uses.
 
 use crate::db::memories::Memories;
+use crate::db::vectors::Vectors;
 use crate::models::ConsolidateInput;
 use crate::vitality::calculate_vitality;
 use chrono::Utc;
-use rusqlite::types::Value;
-use rusqlite::{params_from_iter, Connection, Result as SqlResult};
+
+use rusqlite::{Connection, Result as SqlResult};
 use serde_json::{json, Value as Json};
 use std::collections::HashMap;
 
@@ -307,54 +308,25 @@ fn fetch_candidates(
     category: Option<&str>,
     limit: usize,
 ) -> SqlResult<Candidates> {
-    let mut sql = String::from(
-        "SELECT m.id, m.content, m.vitality, m.access_count, m.accessed_at, m.tags, \
-         m.decay_rate, m.base_weight, ve.embedding \
-         FROM memories m \
-         JOIN vec_chunks vc ON vc.memory_rowid = m.rowid AND vc.chunk_ix = 0 \
-         JOIN vec_embeddings ve ON ve.vec_rowid = vc.vec_rowid \
-         WHERE m.status = 'active' AND m.superseded_by IS NULL AND m.deleted_at IS NULL",
-    );
-    let mut bindings: Vec<Value> = Vec::new();
-    if let Some(cat) = category {
-        sql.push_str(" AND m.category = ?");
-        bindings.push(Value::Text(cat.to_string()));
-    }
-    sql.push_str(" LIMIT ?");
-    bindings.push(Value::Integer(limit as i64));
+    let rows = Vectors::new(conn).consolidation_candidates(category, limit)?;
 
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(bindings.iter()), |row| {
-        let id: String = row.get(0)?;
-        let content: String = row.get(1)?;
-        let vitality: f64 = row.get(2)?;
-        let access_count: i64 = row.get(3)?;
-        let accessed_at: String = row.get(4)?;
-        let tags_json: String = row.get(5)?;
-        let decay_rate: f64 = row.get(6)?;
-        let base_weight: f64 = row.get(7)?;
-        let embedding: Vec<u8> = row.get(8)?;
-        Ok((
-            ClusterMember {
-                id,
-                content,
-                vitality,
-                access_count,
-                accessed_at,
-                tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-                decay_rate,
-                base_weight,
-            },
-            embedding,
-        ))
-    })?;
-
-    let mut members = Vec::new();
+    let mut members = Vec::with_capacity(rows.len());
     let mut embeddings = HashMap::new();
     for row in rows {
-        let (member, bytes) = row?;
-        embeddings.insert(member.id.clone(), crate::vectors::le_bytes_to_f32(&bytes));
-        members.push(member);
+        embeddings.insert(
+            row.id.clone(),
+            crate::vectors::le_bytes_to_f32(&row.embedding),
+        );
+        members.push(ClusterMember {
+            id: row.id,
+            content: row.content,
+            vitality: row.vitality,
+            access_count: row.access_count,
+            accessed_at: row.accessed_at,
+            tags: row.tags,
+            decay_rate: row.decay_rate,
+            base_weight: row.base_weight,
+        });
     }
     Ok((members, embeddings))
 }

@@ -11,6 +11,7 @@
 mod test_env;
 
 use remind_me_core::db::queries;
+use remind_me_core::db::vectors::Vectors;
 use remind_me_core::embedder::{EmbedError, EmbedRole, Embedder, EmbeddingIdentity};
 use remind_me_core::vectors::{
     delete_chunks_for_memory, dimension_of, embed_and_store, embedding_mismatch_info,
@@ -114,15 +115,8 @@ fn add_with_category(conn: &Connection, content: &str, category: &str) -> String
     .id
 }
 
-fn chunk_count(conn: &Connection, memory_id: &str) -> i64 {
-    conn.query_row(
-        "SELECT count(*) FROM vec_chunks vc
-           JOIN memories m ON m.rowid = vc.memory_rowid
-          WHERE m.id = ?",
-        [memory_id],
-        |r| r.get(0),
-    )
-    .unwrap()
+fn chunk_count(conn: &Connection, memory_id: &str) -> usize {
+    Vectors::new(conn).chunk_count(memory_id).unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -144,10 +138,7 @@ fn embedding_a_memory_stores_one_chunk_and_dimension_infers_correctly() {
 
     let bytes: Vec<u8> = conn
         .query_row(
-            "SELECT ve.embedding FROM vec_chunks vc
-               JOIN vec_embeddings ve ON ve.vec_rowid = vc.vec_rowid
-               JOIN memories m ON m.rowid = vc.memory_rowid
-              WHERE m.id = ?",
+            "SELECT embedding FROM vec_chunks WHERE memory_id = ?",
             [&id],
             |r| r.get(0),
         )
@@ -206,7 +197,7 @@ fn embedding_an_unknown_memory_id_is_a_silent_no_op() {
 }
 
 // ---------------------------------------------------------------------------
-// Deletion cleans up chunks (rowid-reuse safety)
+// Deletion cleans up chunks
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -220,24 +211,14 @@ fn deleting_a_memory_removes_its_chunks_and_embeddings() {
 
     queries::delete_memory(&conn, &id).unwrap();
 
-    let remaining_chunks: i64 = conn
-        .query_row("SELECT count(*) FROM vec_chunks", [], |r| r.get(0))
-        .unwrap();
-    let remaining_vectors: i64 = conn
-        .query_row("SELECT count(*) FROM vec_embeddings", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(
-        remaining_chunks, 0,
-        "a reused rowid must not inherit this memory's chunks"
-    );
-    assert_eq!(remaining_vectors, 0);
+    assert_eq!(Vectors::new(&conn).count().unwrap(), 0);
 }
 
 #[test]
-fn a_deleted_memorys_rowid_does_not_leak_stale_embeddings_to_its_successor() {
-    // The scenario delete_chunks_for_memory exists to prevent: SQLite reuses
-    // freed rowids, so without cleanup, a brand-new memory landing on the
-    // same rowid would silently "own" the deleted memory's vectors.
+fn a_deleted_memorys_embeddings_do_not_leak_to_its_successor() {
+    // Chunks were once keyed on rowid, which SQLite reuses; they are keyed on
+    // the memory id now, and a memory created after a deletion must still
+    // start with nothing.
     let db = Database::open_in_memory().unwrap();
     let conn = db.conn();
     let first = add(&conn, "first memory");
@@ -264,13 +245,7 @@ fn delete_chunks_for_memory_is_a_no_op_on_a_never_embedded_memory() {
     let db = Database::open_in_memory().unwrap();
     let conn = db.conn();
     let id = add(&conn, "never embedded");
-    let rowid: i64 = conn
-        .query_row("SELECT rowid FROM memories WHERE id = ?", [&id], |r| {
-            r.get(0)
-        })
-        .unwrap();
-
-    let removed = delete_chunks_for_memory(&conn, rowid).unwrap();
+    let removed = delete_chunks_for_memory(&conn, &id).unwrap();
 
     assert_eq!(removed, 0);
 }
@@ -401,23 +376,8 @@ fn a_stale_dimension_vector_is_skipped_rather_than_crashing_the_scan() {
     let db = Database::open_in_memory().unwrap();
     let conn = db.conn();
     let id = add(&conn, "old width content");
-    let rowid: i64 = conn
-        .query_row("SELECT rowid FROM memories WHERE id = ?", [&id], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    conn.execute(
-        "INSERT INTO vec_chunks (memory_rowid, chunk_ix) VALUES (?, 0)",
-        [rowid],
-    )
-    .unwrap();
-    let vec_rowid = conn.last_insert_rowid();
     // 3 floats (12 bytes) where the query embedder produces 2.
-    conn.execute(
-        "INSERT INTO vec_embeddings (vec_rowid, embedding) VALUES (?, ?)",
-        rusqlite::params![vec_rowid, vec![0u8; 12]],
-    )
-    .unwrap();
+    Vectors::new(&conn).put(&id, 0, &[0u8; 12]).unwrap();
 
     let embedder = FakeEmbedder::new(2).with("query", vec![1.0, 0.0]);
     let results = semantic_search(&conn, &embedder, "query", 10, None).unwrap();
@@ -629,10 +589,7 @@ fn a_detected_mismatch_clears_every_stored_vector_and_chunk() {
     assert_eq!(cleared.stored.model, "fake-model");
     assert_eq!(cleared.current.model, "a-different-model");
     assert_eq!(chunk_count(&conn, &id), 0, "vec_chunks must be cleared");
-    let remaining_vectors: i64 = conn
-        .query_row("SELECT count(*) FROM vec_embeddings", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(remaining_vectors, 0, "vec_embeddings must be cleared too");
+    assert_eq!(Vectors::new(&conn).count().unwrap(), 0);
 }
 
 #[test]

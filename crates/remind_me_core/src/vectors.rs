@@ -8,39 +8,25 @@
 //!
 //! # Storage
 //!
-//! [`vec_chunks`][crate::db] (already in the generated schema) is only the
-//! rowid map back to `memory_rowid`/`chunk_ix` — that is the reference's own
-//! separation, and it stays untouched: `schema_tables.sql` is generated
-//! verbatim and is not this crate's file to extend. The actual bytes live in
-//! [`ensure_schema`]'s new `vec_embeddings` table, joined to `vec_chunks` by
-//! `vec_rowid`.
+//! `vec_chunks` holds one row per chunk, keyed `(memory_id, chunk_ix)`, with
+//! the vector itself (schema v30, ADR-0023 §4). Up to v29 the chunks were
+//! keyed on `memories.rowid` and the bytes lived in a second table;
+//! [`crate::db::migrations`] moves an older database over. The statements
+//! live in [`crate::db::vectors`].
 //!
 //! Vectors are raw little-endian float32 bytes, dimension inferred from
 //! `len(bytes) / 4` — matching the reference's own convention, which is what
 //! keeps the column backend-agnostic across a 384/768/1024-dimensional model
 //! without a schema change.
 
-use crate::db::queries::{parse_memory_row, MEMORY_COLUMNS};
+use crate::db::memories::Memories;
+use crate::db::vectors::{ChunkVector, Unembedded, Vectors};
 use crate::embedder::{
     chunk_text, EmbedError, EmbedRole, Embedder, EmbeddingIdentity, EMBED_CHUNK_CHARS,
     EMBED_CHUNK_OVERLAP, EMBED_MAX_CHUNKS,
 };
 use crate::models::Memory;
-use rusqlite::{params, params_from_iter, Connection, Result as SqlResult};
-
-/// Create this crate's own vector table, if it does not already exist.
-///
-/// Called from [`crate::db::schema::initialize_schema`], after the generated
-/// schema is applied — the same arrangement as [`crate::sync::prune_outbox`]:
-/// a step this crate adds on top of, not part of, the generated tables.
-pub fn ensure_schema(conn: &Connection) -> SqlResult<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS vec_embeddings (
-            vec_rowid INTEGER PRIMARY KEY REFERENCES vec_chunks(vec_rowid),
-            embedding BLOB NOT NULL
-        );",
-    )
-}
+use rusqlite::{Connection, Result as SqlResult};
 
 /// Why an embedding-touching operation could not complete. Every variant is
 /// something a caller can degrade on — search falls back to keyword-only,
@@ -96,49 +82,18 @@ pub(crate) fn le_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
 
 /// Drop every chunk vector belonging to a memory.
 ///
-/// SQLite reuses freed rowids: without this, a later memory that happens to
-/// land on the same `rowid` would silently inherit the deleted memory's
-/// embeddings through the surviving `vec_chunks` rows. Called from
-/// `delete_memory` for exactly that reason, and from [`embed_and_store`]
-/// before writing fresh chunks so a re-embed replaces rather than
-/// accumulates.
-pub fn delete_chunks_for_memory(conn: &Connection, memory_rowid: i64) -> SqlResult<usize> {
-    let vec_rowids: Vec<i64> = {
-        let mut stmt = conn.prepare("SELECT vec_rowid FROM vec_chunks WHERE memory_rowid = ?")?;
-        let rows = stmt.query_map(params![memory_rowid], |r| r.get(0))?;
-        rows.collect::<SqlResult<_>>()?
-    };
-    for vec_rowid in &vec_rowids {
-        conn.execute(
-            "DELETE FROM vec_embeddings WHERE vec_rowid = ?",
-            params![vec_rowid],
-        )?;
-    }
-    conn.execute(
-        "DELETE FROM vec_chunks WHERE memory_rowid = ?",
-        params![memory_rowid],
-    )?;
-    Ok(vec_rowids.len())
+/// Called from `delete_memory`, so a deleted or tombstoned memory stops
+/// matching searches, and from [`embed_and_store`] before writing fresh
+/// chunks, so a re-embed replaces rather than accumulates.
+pub fn delete_chunks_for_memory(conn: &Connection, memory_id: &str) -> SqlResult<usize> {
+    Vectors::new(conn).delete_for(memory_id)
 }
 
-/// Store freshly computed chunk vectors for a memory.
-///
-/// Does not clear any existing chunks first — callers that are re-embedding
-/// (as opposed to embedding for the first time) call
-/// [`delete_chunks_for_memory`] themselves, so a caller that only ever wants
-/// to append (there is no such caller today) is not forced to pay a delete
-/// it doesn't need.
-fn store_vectors(conn: &Connection, memory_rowid: i64, vectors: &[Vec<f32>]) -> SqlResult<usize> {
+/// Store freshly computed chunk vectors for a memory, one per chunk index.
+fn store_vectors(conn: &Connection, memory_id: &str, vectors: &[Vec<f32>]) -> SqlResult<usize> {
+    let repo = Vectors::new(conn);
     for (chunk_ix, vector) in vectors.iter().enumerate() {
-        conn.execute(
-            "INSERT INTO vec_chunks (memory_rowid, chunk_ix) VALUES (?, ?)",
-            params![memory_rowid, chunk_ix as i64],
-        )?;
-        let vec_rowid = conn.last_insert_rowid();
-        conn.execute(
-            "INSERT INTO vec_embeddings (vec_rowid, embedding) VALUES (?, ?)",
-            params![vec_rowid, f32_to_le_bytes(vector)],
-        )?;
+        repo.put(memory_id, chunk_ix, &f32_to_le_bytes(vector))?;
     }
     Ok(vectors.len())
 }
@@ -157,18 +112,11 @@ pub fn embed_and_store(
     memory_id: &str,
     content: &str,
 ) -> Result<usize, VectorError> {
-    let memory_rowid: Option<i64> = conn
-        .query_row(
-            "SELECT rowid FROM memories WHERE id = ?",
-            params![memory_id],
-            |r| r.get(0),
-        )
-        .ok();
-    let Some(memory_rowid) = memory_rowid else {
+    if !Memories::new(conn).exists(memory_id)? {
         return Ok(0);
-    };
+    }
 
-    delete_chunks_for_memory(conn, memory_rowid)?;
+    delete_chunks_for_memory(conn, memory_id)?;
 
     let chunks = chunk_text(
         content,
@@ -180,7 +128,7 @@ pub fn embed_and_store(
         return Ok(0);
     }
     let vectors = embedder.embed(&chunks, EmbedRole::Passage)?;
-    let stored = store_vectors(conn, memory_rowid, &vectors)?;
+    let stored = store_vectors(conn, memory_id, &vectors)?;
     if stored > 0 {
         // Best-effort, matching the reference's own
         // `_mark_embedding_meta_current`: this is bookkeeping for the next
@@ -189,26 +137,6 @@ pub fn embed_and_store(
         let _ = mark_embedding_meta_current(conn, &embedder.identity());
     }
     Ok(stored)
-}
-
-fn get_memory_by_rowid(conn: &Connection, rowid: i64) -> SqlResult<Option<Memory>> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {} FROM memories WHERE rowid = ?",
-        MEMORY_COLUMNS
-    ))?;
-    let mut rows = stmt.query_map(params![rowid], parse_memory_row)?;
-    rows.next().transpose()
-}
-
-/// Category condition shared by the semantic scan — kept to the same filter
-/// [`crate::db::queries::search_memories`]'s keyword branch applies, so the
-/// two ranked lists [`crate::retrieval::rank_rrf`] fuses are answering the
-/// same question.
-fn category_filter(category: Option<&str>) -> (String, Vec<String>) {
-    match category {
-        Some(cat) if !cat.is_empty() => (" AND m.category = ?".to_string(), vec![cat.to_string()]),
-        _ => (String::new(), Vec::new()),
-    }
 }
 
 /// Brute-force cosine-similarity search over every stored chunk vector.
@@ -327,7 +255,7 @@ pub fn semantic_search_scored(
 
 /// Score every candidate exactly and return the best `limit`.
 ///
-/// `narrowed` restricts which memory rowids are considered; `None` scans all
+/// `narrowed` restricts which memory ids are considered; `None` scans all
 /// of them. Scoring is identical in both cases — that is the whole point of
 /// letting the index propose candidates rather than rank them.
 fn scan_and_score(
@@ -335,38 +263,20 @@ fn scan_and_score(
     query_vector: &[f32],
     limit: usize,
     category: Option<&str>,
-    narrowed: Option<&[i64]>,
+    narrowed: Option<&[String]>,
 ) -> Result<Vec<(Memory, f32)>, VectorError> {
-    let (filter_sql, filter_bindings) = category_filter(category);
-    let narrow_sql = match narrowed {
-        Some(rowids) => format!(
-            " AND vc.memory_rowid IN ({})",
-            rowids
-                .iter()
-                .map(|id| id.to_string())
-                .collect::<Vec<_>>()
-                .join(",")
-        ),
-        None => String::new(),
-    };
-    let sql = format!(
-        "SELECT vc.memory_rowid, ve.embedding
-           FROM vec_chunks vc
-           JOIN vec_embeddings ve ON ve.vec_rowid = vc.vec_rowid
-           JOIN memories m ON m.rowid = vc.memory_rowid
-          WHERE m.superseded_by IS NULL AND m.deleted_at IS NULL{}{}",
-        filter_sql, narrow_sql
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(filter_bindings.iter()), |row| {
-        let memory_rowid: i64 = row.get(0)?;
-        let bytes: Vec<u8> = row.get(1)?;
-        Ok((memory_rowid, bytes))
-    })?;
+    // The same filter the keyword branch of search applies, so the two ranked
+    // lists retrieval fuses answer the same question.
+    let category = category.filter(|c| !c.is_empty());
+    let chunks = Vectors::new(conn).live_chunks(category, narrowed)?;
 
-    let mut best_by_memory: std::collections::HashMap<i64, f32> = std::collections::HashMap::new();
-    for row in rows {
-        let (memory_rowid, bytes) = row?;
+    let mut best_by_memory: std::collections::HashMap<String, f32> =
+        std::collections::HashMap::new();
+    for ChunkVector {
+        memory_id,
+        embedding: bytes,
+    } in chunks
+    {
         let vector = le_bytes_to_f32(&bytes);
         if vector.len() != query_vector.len() {
             // A stale vector from a dimension this store no longer embeds
@@ -380,7 +290,7 @@ fn scan_and_score(
             .map(|(a, b)| a * b)
             .sum();
         best_by_memory
-            .entry(memory_rowid)
+            .entry(memory_id)
             .and_modify(|best| {
                 if similarity > *best {
                     *best = similarity;
@@ -389,13 +299,13 @@ fn scan_and_score(
             .or_insert(similarity);
     }
 
-    let mut ranked: Vec<(i64, f32)> = best_by_memory.into_iter().collect();
+    let mut ranked: Vec<(String, f32)> = best_by_memory.into_iter().collect();
     ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     ranked.truncate(limit);
 
     let mut memories = Vec::with_capacity(ranked.len());
-    for (rowid, similarity) in ranked {
-        if let Some(memory) = get_memory_by_rowid(conn, rowid)? {
+    for (memory_id, similarity) in ranked {
+        if let Some(memory) = crate::db::queries::get_memory_by_id(conn, &memory_id)? {
             memories.push((memory, similarity));
         }
     }
@@ -406,12 +316,6 @@ fn scan_and_score(
 // Reindex
 // ---------------------------------------------------------------------------
 
-/// A memory with no `vec_chunks` row at all — never embedded.
-struct Unembedded {
-    id: String,
-    content: String,
-}
-
 /// Every live memory with no `vec_chunks` row — no cap, matching the
 /// reference's own `remind_me_reindex`, which takes no inputs and processes
 /// everything missing in one call. [`crate::embedder::EMBED_FORWARD_BATCH`]
@@ -419,20 +323,7 @@ struct Unembedded {
 /// same way the reference bounds its ONNX forward pass — this is not a
 /// second, redundant limit on top of that.
 fn unembedded(conn: &Connection) -> SqlResult<Vec<Unembedded>> {
-    let mut stmt = conn.prepare(
-        "SELECT m.id, m.content
-           FROM memories m
-          WHERE m.deleted_at IS NULL
-            AND NOT EXISTS (SELECT 1 FROM vec_chunks vc WHERE vc.memory_rowid = m.rowid)
-          ORDER BY m.rowid",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok(Unembedded {
-            id: row.get(0)?,
-            content: row.get(1)?,
-        })
-    })?;
-    rows.collect()
+    Vectors::new(conn).unembedded()
 }
 
 /// What one `remind_me_reindex` call did.
@@ -509,15 +400,15 @@ pub fn reindex_with(
 // "missing embeddings" path instead of silently serving results computed
 // against the wrong embedding space.
 //
-// This crate's own `vec_embeddings` (ADR-0002) is a plain `BLOB` column, not
-// a `vec0` virtual table, so a dimension change needs no `DROP`/`CREATE` —
-// clearing rows is the whole story. There is also no on-disk ANN index here
-// (ADR-0002 scopes that out entirely): brute-force cosine scan is the only
-// search path, so nothing beyond `vec_embeddings`/`vec_chunks` needs
-// invalidating. See ADR-0002's addendum for the full adaptation writeup.
+// This crate's `vec_chunks.embedding` (ADR-0002) is a plain `BLOB` column,
+// not a `vec0` virtual table, so a dimension change needs no `DROP`/`CREATE`:
+// clearing rows is the whole story. The optional ANN index
+// (`crate::ann_index`) needs no invalidating either, because it records the
+// chunk count and dimension it was built from and ignores itself once they
+// change. See ADR-0002's addendum for the full adaptation writeup.
 
 /// Read the model/dimension/backend recorded for the vectors currently in
-/// `vec_embeddings`, if any.
+/// `vec_chunks`, if any.
 ///
 /// `None` covers both "never recorded" (a fresh store, or one written before
 /// this feature existed) and a partially-written record (only some of the
@@ -525,10 +416,7 @@ pub fn reindex_with(
 /// against, so callers must treat this the same as "nothing recorded" rather
 /// than guess at the missing piece.
 fn read_embedding_meta(conn: &Connection) -> SqlResult<Option<EmbeddingIdentity>> {
-    let mut stmt = conn.prepare("SELECT key, value FROM embedding_meta")?;
-    let rows: Vec<(String, String)> = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<SqlResult<_>>()?;
+    let rows = Vectors::new(conn).meta()?;
     if rows.is_empty() {
         return Ok(None);
     }
@@ -550,7 +438,7 @@ fn read_embedding_meta(conn: &Connection) -> SqlResult<Option<EmbeddingIdentity>
     }))
 }
 
-/// Record that the vectors in `vec_embeddings` were (just) produced by
+/// Record that the vectors in `vec_chunks` were (just) produced by
 /// `identity` — called from [`embed_and_store`] after a batch of vectors is
 /// successfully written, not merely inferred from the running config, so the
 /// mismatch check below stays accurate even mid-reindex (a reindex that dies
@@ -561,16 +449,13 @@ pub fn mark_embedding_meta_current(
     identity: &EmbeddingIdentity,
 ) -> SqlResult<()> {
     let now = chrono::Utc::now().to_rfc3339();
+    let vectors = Vectors::new(conn);
     for (key, value) in [
         ("backend", identity.backend.clone()),
         ("model", identity.model.clone()),
         ("dim", identity.dim.to_string()),
     ] {
-        conn.execute(
-            "INSERT INTO embedding_meta (key, value, updated_at) VALUES (?, ?, ?)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-            params![key, value, now],
-        )?;
+        vectors.set_meta(key, &value, &now)?;
     }
     Ok(())
 }
@@ -608,9 +493,9 @@ pub fn embedding_mismatch_info(
 
 /// Clear stale vectors when the embedding model/dimension/backend recorded
 /// for them no longer matches `current` — the reference's auto-clear
-/// (`_reconcile_embedding_meta`), adapted to this crate's own
-/// `vec_embeddings` table (see the module-level note above for why no table
-/// recreation or ANN invalidation is needed here).
+/// (`_reconcile_embedding_meta`), adapted to this crate's own `vec_chunks`
+/// table (see the note above for why no table recreation or ANN
+/// invalidation is needed here).
 ///
 /// Deliberately does **not** update `embedding_meta` itself: that only
 /// happens once vectors are actually rewritten
@@ -629,11 +514,6 @@ pub fn reconcile_embedding_meta(
     let Some(mismatch) = embedding_mismatch_info(conn, current)? else {
         return Ok(None);
     };
-    // Child before parent: `vec_embeddings.vec_rowid` has a (default
-    // RESTRICT) foreign key onto `vec_chunks.vec_rowid`, so clearing
-    // `vec_chunks` first would fail with `foreign_keys=ON` while
-    // `vec_embeddings` rows still reference it.
-    conn.execute("DELETE FROM vec_embeddings", [])?;
-    conn.execute("DELETE FROM vec_chunks", [])?;
+    Vectors::new(conn).clear()?;
     Ok(Some(mismatch))
 }

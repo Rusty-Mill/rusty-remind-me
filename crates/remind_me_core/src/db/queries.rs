@@ -384,35 +384,24 @@ pub fn update_memory(conn: &Connection, input: &MemoryUpdateInput) -> Result<Upd
 /// and a cascade would reject that. This crate previously relied on a cascade
 /// it had added itself; regenerating the schema from `remind_me` removed it.
 pub fn delete_memory(conn: &Connection, memory_id: &str) -> Result<bool> {
-    // Fetched before either delete path: once a hard delete removes the row
-    // there is no `WHERE id = ?` left to find its rowid by, and that rowid
-    // is exactly what `vec_chunks` is keyed on. Matches the reference's own
-    // `memory_delete` order (fetch rowid, clean up vectors, then delete or
-    // tombstone) rather than only cleaning up vectors on a hard delete —
-    // a tombstoned memory's embeddings are stale the moment it stops being
-    // searchable, same as an incoming sync tombstone's are.
-    // The category comes out with the rowid rather than in a second query: a
-    // hard delete removes the row, so after this point there is nothing left
-    // to read it from, and the event would have to guess.
-    let existing: Option<(i64, String)> = conn
+    // The category is read before either delete path: a hard delete removes
+    // the row, so after this point there is nothing left to read it from, and
+    // the event would have to guess.
+    let category: Option<String> = conn
         .query_row(
-            "SELECT rowid, category FROM memories WHERE id = ? AND deleted_at IS NULL",
+            "SELECT category FROM memories WHERE id = ? AND deleted_at IS NULL",
             params![memory_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| r.get(0),
         )
         .ok();
-    let memory_rowid: Option<i64> = existing.as_ref().map(|(rowid, _)| *rowid);
-    let category: Option<String> = existing.map(|(_, category)| category);
-    if memory_rowid.is_none() {
+    if category.is_none() {
         return Ok(false);
     }
 
-    // SQLite reuses freed rowids: left alone, a later memory landing on this
-    // same rowid would silently inherit these chunk vectors through the
-    // surviving `vec_chunks` rows.
-    if let Some(memory_rowid) = memory_rowid {
-        crate::vectors::delete_chunks_for_memory(conn, memory_rowid)?;
-    }
+    // A tombstoned memory's embeddings are stale the moment it stops being
+    // searchable, same as an incoming sync tombstone's are, so they go on
+    // either path.
+    crate::vectors::delete_chunks_for_memory(conn, memory_id)?;
 
     let affected = if crate::sync::sync_enabled() {
         let now = Utc::now().to_rfc3339();

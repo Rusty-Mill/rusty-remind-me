@@ -182,8 +182,8 @@ pub enum ApplyOutcome {
     /// untouched, and there is nothing to re-embed.
     NotApplied,
     /// The incoming record won: inserted as a new row or fully updated an
-    /// existing one. Carries the memory's rowid so the caller can re-embed.
-    Applied { rowid: i64 },
+    /// existing one.
+    Applied,
 }
 
 /// Canonicalize a timestamp to a fixed-width UTC RFC3339 string, so plain
@@ -311,8 +311,7 @@ pub fn upsert_record(
             source_capture_id: record.source_capture_id.clone(),
             deleted_at: record.deleted_at.clone(),
         })?;
-        let rowid = memories.rowid(&record.id)?;
-        ApplyOutcome::Applied { rowid }
+        ApplyOutcome::Applied
     } else {
         let local = local.expect("incoming_wins is false only when a local row was found");
         let merged_tags = merge_tags(&local.tags, &record.tags);

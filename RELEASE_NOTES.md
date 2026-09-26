@@ -2,6 +2,23 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-26 — Vectors are keyed by memory id; schema v30 (ADR-0023, phase 1, step 4)
+
+### Breaking
+- **Schema version 30.** `vec_chunks` is now `(memory_id, chunk_ix, embedding)`, keyed by memory id rather than `memories.rowid`, and `vec_embeddings` is gone.
+  - Opening a v29 database moves every chunk across, inside one savepoint, after the usual pre-migration backup. Chunks whose memory no longer exists are dropped.
+  - Nothing needs re-embedding.
+- **A database from a newer build is refused.** Before, an older build would have reshaped it back to its own schema; now it names the version and asks for an upgrade. An older build of this crate opening a v30 database fails when it tries to rebuild `vec_chunks`, which leaves the database as it was.
+- **The optional ANN index must be rebuilt** (`--features ann`). Its manifest now keys vectors by memory id. An older manifest reads as unusable, so search uses the exact full scan until the index is rebuilt.
+- `sync::ApplyOutcome::Applied` no longer carries a rowid.
+
+### Changed
+- Every vector statement lives in `db::vectors::Vectors`: storing, deleting, the semantic scan, the reindex list, consolidation's candidates and `embedding_meta`.
+
+### Tests
+- New migration tests build the v29 vector layout by hand, then check that opening it keeps every chunk under its memory id, drops the orphan, runs once, and that a newer stamp is refused and left untouched.
+- The vector, ANN (with and without `--features ann`), consolidation and schema tests now seed the v30 table. The core, API, MCP and CLI suites pass.
+
 ## 2026-09-26 — The sync outbox goes behind db::outbox (ADR-0023, phase 1, step 6)
 
 ### Changed

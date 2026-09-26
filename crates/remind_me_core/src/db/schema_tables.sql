@@ -170,10 +170,11 @@ CREATE TABLE IF NOT EXISTS sync_sends (
         );
 
 CREATE TABLE IF NOT EXISTS vec_chunks (
-               vec_rowid    INTEGER PRIMARY KEY,
-               memory_rowid INTEGER NOT NULL,
-               chunk_ix     INTEGER NOT NULL
-           );
+            memory_id TEXT NOT NULL,
+            chunk_ix  INTEGER NOT NULL,
+            embedding BLOB NOT NULL,  -- little-endian f32
+            PRIMARY KEY (memory_id, chunk_ix)
+        );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS wiki_fts USING fts5(
             title, content,

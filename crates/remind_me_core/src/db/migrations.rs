@@ -39,7 +39,11 @@ use rusqlite::{Connection, Result};
 /// and Python read it on open. With Python retired (ADR-0023) it is this
 /// crate's to choose; bump it with any schema change that an older build of
 /// this crate must not open unawares.
-pub const SCHEMA_VERSION: i32 = 29;
+///
+/// - 29: the Python reference's last schema.
+/// - 30: vector chunks keyed by memory id, not `memories.rowid`
+///   (ADR-0023 §4; see [`rekey_vectors`]).
+pub const SCHEMA_VERSION: i32 = 30;
 
 const SCHEMA_TABLES: &str = include_str!("schema_tables.sql");
 const SCHEMA_INDEXES: &str = include_str!("schema_indexes.sql");
@@ -464,18 +468,91 @@ fn refile_reference_imports(conn: &Connection, version_on_open: i32) -> Result<(
     Ok(())
 }
 
+/// Move vector chunks off `memories.rowid` onto memory ids (ADR-0023 §4).
+///
+/// Up to v29 a chunk lived in two tables: `vec_chunks` mapped a
+/// `vec_rowid` to a `memory_rowid` and chunk index, and `vec_embeddings`
+/// held the bytes under the same `vec_rowid`. v30 has one table keyed
+/// `(memory_id, chunk_ix)` holding the bytes, so nothing depends on a row
+/// number another store would not have.
+///
+/// Detected by shape rather than by version, because the generic rebuild in
+/// [`apply`] would otherwise try to carry the old table into the new shape
+/// and fail on the new `NOT NULL` columns. It runs before that rebuild, in a
+/// savepoint, so a failure leaves the v29 tables exactly as they were.
+///
+/// A chunk whose memory no longer exists is dropped: it could only ever
+/// have been inherited by whichever memory next reused its rowid.
+fn rekey_vectors(conn: &Connection) -> Result<()> {
+    if !table_exists(conn, "vec_chunks")?
+        || !columns_of(conn, "vec_chunks")?
+            .iter()
+            .any(|c| c == "memory_rowid")
+    {
+        return Ok(());
+    }
+
+    conn.execute_batch("SAVEPOINT rekey_vectors;")?;
+    let result = (|| -> Result<()> {
+        conn.execute_batch("ALTER TABLE vec_chunks RENAME TO vec_chunks_v29;")?;
+        // Only the new vec_chunks is missing, so this creates just that.
+        conn.execute_batch(SCHEMA_TABLES)?;
+        if table_exists(conn, "vec_embeddings")? {
+            conn.execute_batch(
+                "INSERT OR IGNORE INTO vec_chunks (memory_id, chunk_ix, embedding)
+                 SELECT m.id, old.chunk_ix, ve.embedding
+                   FROM vec_chunks_v29 old
+                   JOIN vec_embeddings ve ON ve.vec_rowid = old.vec_rowid
+                   JOIN memories m ON m.rowid = old.memory_rowid;
+                 DROP TABLE vec_embeddings;",
+            )?;
+        }
+        conn.execute_batch("DROP TABLE vec_chunks_v29;")
+    })();
+    match result {
+        Ok(()) => conn.execute_batch("RELEASE rekey_vectors;"),
+        Err(e) => {
+            conn.execute_batch("ROLLBACK TO rekey_vectors; RELEASE rekey_vectors;")?;
+            Err(e)
+        }
+    }
+}
+
+/// Refuse a database stamped by a newer build of this crate.
+///
+/// Reconciliation rebuilds any table whose shape differs from this build's
+/// schema, so letting an older build open a newer database would reshape it
+/// backwards, losing whatever the newer shape holds.
+fn refuse_newer(version_on_open: i32) -> Result<()> {
+    if version_on_open <= SCHEMA_VERSION {
+        return Ok(());
+    }
+    Err(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+        Some(format!(
+            "this database is at schema version {version_on_open}, newer than this \
+             build's {SCHEMA_VERSION}: upgrade rusty-remind-me to open it"
+        )),
+    ))
+}
+
 /// Create and reconcile the schema, then stamp the version.
 ///
 /// The version is written last, so a database only ever claims
 /// [`SCHEMA_VERSION`] once it actually has that schema.
 pub fn apply(conn: &Connection) -> Result<()> {
+    // Read before any write, because the refiling step below is gated on it
+    // and the last statement of this function overwrites it.
+    let version_on_open: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    refuse_newer(version_on_open)?;
+
     // Before anything below mutates the database: a snapshot only reflects
     // the pre-migration state if it is taken before the first write.
     snapshot_before_migration(conn)?;
 
-    // Read before any write, because the refiling step below is gated on it
-    // and the last statement of this function overwrites it.
-    let version_on_open: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    // Before the create pass and the generic rebuild, both of which would
+    // otherwise meet the v29 vector tables first.
+    rekey_vectors(conn)?;
 
     conn.execute_batch(SCHEMA_TABLES)?;
 

@@ -350,7 +350,7 @@ unchanged after each.
 | 1 | Memory row writes | `db::memories::Memories` | Done |
 | 2 | Entities, relations and mentions | `db::entities::Entities` | Done |
 | 3 | Wiki pages, links and their index | `db::wiki::WikiIndex` | Done |
-| 4 | Vectors, re-keyed on memory id (§4) | `db::vectors` | |
+| 4 | Vectors, re-keyed on memory id (§4) | `db::vectors::Vectors` | Done (schema v30) |
 | 5 | Promotions, imports, archives and curation queues | `db::promotions::Promotions`, … | In progress |
 | 6 | The outbox, with echo suppression as a flag | `db::outbox::Outbox` | Statements moved; the flag waits for step 7 |
 | 7 | Triggers move into the repositories | | |
@@ -474,6 +474,37 @@ only become a flag on the write once the repositories, not triggers, write
 the outbox rows, which is step 7. The peer server's pull pages and the
 sync count endpoints read `memories` and the graph directly; they move in
 step 8 with the other readers.
+
+**Step 4.** Schema v30 keys vectors by memory id. `vec_chunks` is now
+`(memory_id, chunk_ix, embedding)` with that pair as its primary key.
+`vec_embeddings` and the rowid index are gone.
+
+On open, `migrations::rekey_vectors` moves a v29 database over:
+- it spots the old shape and renames the old table aside;
+- it creates the new one from the schema file;
+- it copies every chunk whose memory still exists;
+- it drops the old tables.
+
+All of that runs inside one savepoint, before the generic rebuild, and
+after the pre-migration backup. A chunk whose memory is gone is dropped:
+under v29 it could only have been inherited by the next memory to reuse
+its rowid.
+
+`db::vectors::Vectors` holds every vector statement: storing, deleting,
+the semantic scan (narrowed by memory ids when the ANN index proposes
+some), the unembedded list, consolidation's candidates, and
+`embedding_meta`.
+
+Three knock-on changes:
+- The ANN sidecar manifest now keys vectors by memory id under a `v2` tag,
+  so an older manifest reads as unusable and search falls back to the full
+  scan until `rebuild`.
+- `ApplyOutcome::Applied` no longer carries a rowid.
+- Opening a database stamped by a newer build is now refused, because
+  reconciliation would reshape it backwards.
+
+Tests build the v29 layout by hand and check the carry-over, the orphan
+drop, idempotence, and the refusal.
 
 ## Related
 

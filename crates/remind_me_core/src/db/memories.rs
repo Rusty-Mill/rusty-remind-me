@@ -266,16 +266,6 @@ impl<'c> Memories<'c> {
             .optional()
     }
 
-    /// SQLite's `rowid` for `id`. The vector index is keyed on it until
-    /// vectors move to memory ids (ADR-0023 §4).
-    pub fn rowid(&self, id: &str) -> Result<i64> {
-        self.conn.query_row(
-            "SELECT rowid FROM memories WHERE id = ?",
-            params![id],
-            |r| r.get(0),
-        )
-    }
-
     /// Replace `id`'s tags and metadata without stamping `updated_at`: a sync
     /// merge that lost last-write-wins still keeps the union, and must not
     /// look like a newer local edit.

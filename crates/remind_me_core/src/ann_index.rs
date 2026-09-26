@@ -12,7 +12,7 @@
 //! # The index narrows candidates; it does not score them
 //!
 //! ANN returns approximate neighbours. Rather than trusting its distances,
-//! this over-fetches candidates and hands the caller their rowids, and the
+//! this over-fetches candidates and hands the caller their memory ids, and the
 //! caller then computes the **exact** dot product over that much smaller set.
 //! Two things fall out, both wanted:
 //!
@@ -45,6 +45,12 @@ use rusqlite::{Connection, Result as SqlResult};
 /// small enough that exact scoring stays cheap.
 pub const OVERFETCH: usize = 8;
 
+/// The first word of the manifest beside a built index. It names the key
+/// format: `v2` keys each vector by memory id. The rowid-keyed manifests
+/// written before schema v30 had no such word, so they read as unusable.
+#[cfg_attr(not(feature = "ann"), allow(dead_code))]
+const MANIFEST_FORMAT: &str = "v2";
+
 /// Whether this build has an index at all.
 pub fn available() -> bool {
     cfg!(feature = "ann")
@@ -66,14 +72,13 @@ pub fn index_path(conn: &Connection) -> Option<std::path::PathBuf> {
 /// The pair is the staleness key: either changing means an index built from
 /// the old state cannot be trusted.
 pub fn live_signature(conn: &Connection) -> SqlResult<(usize, usize)> {
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM vec_embeddings", [], |r| r.get(0))?;
-    let dimension: usize = conn
-        .query_row("SELECT embedding FROM vec_embeddings LIMIT 1", [], |r| {
-            r.get::<_, Vec<u8>>(0)
-        })
+    let vectors = crate::db::vectors::Vectors::new(conn);
+    let count = vectors.count()?;
+    let dimension = vectors
+        .any_embedding()?
         .map(|bytes| crate::vectors::dimension_of(&bytes))
         .unwrap_or(0);
-    Ok((count as usize, dimension))
+    Ok((count, dimension))
 }
 
 #[cfg(feature = "ann")]
@@ -110,15 +115,8 @@ mod backend {
         let index = usearch::new_index(&options(dimension)).map_err(|e| e.to_string())?;
         index.reserve(count).map_err(|e| e.to_string())?;
 
-        let mut stmt = conn
-            .prepare(
-                "SELECT vc.memory_rowid, ve.embedding
-                        FROM vec_chunks vc
-                        JOIN vec_embeddings ve ON ve.vec_rowid = vc.vec_rowid",
-            )
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))
+        let chunks = crate::db::vectors::Vectors::new(conn)
+            .all()
             .map_err(|e| e.to_string())?;
 
         let mut added = 0usize;
@@ -126,30 +124,29 @@ mod backend {
         // would make the index work only in the process that built it and fall
         // back silently everywhere else — a feature that looks enabled and
         // never actually runs.
-        let mut keys: Vec<i64> = Vec::with_capacity(count);
-        for (position, row) in rows.enumerate() {
-            let (memory_rowid, bytes) = row.map_err(|e| e.to_string())?;
-            let vector = crate::vectors::le_bytes_to_f32(&bytes);
+        let mut keys: Vec<String> = Vec::with_capacity(count);
+        for (position, chunk) in chunks.into_iter().enumerate() {
+            let vector = crate::vectors::le_bytes_to_f32(&chunk.embedding);
             if vector.len() != dimension {
                 // A stale vector from a dimension this store no longer embeds
                 // at. Skipped rather than allowed to poison the index.
                 continue;
             }
-            // Keyed by position, not by memory rowid: several chunks share one
+            // Keyed by position, not by memory id: several chunks share one
             // memory, and a keyed-by-memory index would silently keep only the
             // last chunk of each.
             index
                 .add(position as u64, &vector)
                 .map_err(|e| e.to_string())?;
-            keys.push(memory_rowid);
+            keys.push(chunk.memory_id);
             added += 1;
         }
 
         index
             .save(&path.to_string_lossy())
             .map_err(|e| e.to_string())?;
-        let manifest = std::iter::once(format!("{} {}", count, dimension))
-            .chain(keys.iter().map(|id| id.to_string()))
+        let manifest = std::iter::once(format!("{MANIFEST_FORMAT} {count} {dimension}"))
+            .chain(keys.iter().cloned())
             .collect::<Vec<_>>()
             .join("\n");
         std::fs::write(sidecar(&path), manifest).map_err(|e| e.to_string())?;
@@ -160,8 +157,8 @@ mod backend {
         path.with_extension("ann.meta")
     }
 
-    /// Candidate memory rowids for a query, or `None` to fall back.
-    pub fn candidates(conn: &Connection, query: &[f32], want: usize) -> Option<Vec<i64>> {
+    /// Candidate memory ids for a query, or `None` to fall back.
+    pub fn candidates(conn: &Connection, query: &[f32], want: usize) -> Option<Vec<String>> {
         let path = index_path(conn)?;
         if !path.exists() {
             return None;
@@ -171,10 +168,15 @@ mod backend {
         let recorded = std::fs::read_to_string(sidecar(&path)).ok()?;
         let mut lines = recorded.lines();
         let mut header = lines.next()?.split_whitespace();
+        // A manifest from before chunks were keyed by memory id holds rowids.
+        // It reads as unusable, so search falls back until a rebuild.
+        if header.next()? != MANIFEST_FORMAT {
+            return None;
+        }
         let built_count: usize = header.next()?.parse().ok()?;
         let built_dimension: usize = header.next()?.parse().ok()?;
-        // Position → memory rowid, in the order they were added.
-        let keys: Vec<i64> = lines.filter_map(|l| l.trim().parse().ok()).collect();
+        // Position → memory id, in the order they were added.
+        let keys: Vec<&str> = lines.map(str::trim).collect();
 
         // Stale, or built at a dimension this query is not in. Either way the
         // answers would be wrong in a way that still looks plausible.
@@ -191,24 +193,24 @@ mod backend {
         let matches = index
             .search(query, want.saturating_mul(OVERFETCH).max(want))
             .ok()?;
-        let mut rowids: Vec<i64> = Vec::with_capacity(matches.keys.len());
+        let mut ids: Vec<String> = Vec::with_capacity(matches.keys.len());
         for key in matches.keys {
-            // Several chunks map to one memory, so the same rowid can come
-            // back more than once — deduplicated here rather than left for the
-            // SQL `IN` list to absorb.
-            if let Some(rowid) = keys.get(key as usize) {
-                if !rowids.contains(rowid) {
-                    rowids.push(*rowid);
+            // Several chunks map to one memory, so the same id can come back
+            // more than once — deduplicated here rather than left for the SQL
+            // `IN` list to absorb.
+            if let Some(id) = keys.get(key as usize) {
+                if !ids.iter().any(|seen| seen == id) {
+                    ids.push((*id).to_string());
                 }
             }
         }
         // An empty candidate set is indistinguishable from "the index is not
         // usable", and falling back costs one scan rather than silently
         // returning nothing.
-        if rowids.is_empty() {
+        if ids.is_empty() {
             return None;
         }
-        Some(rowids)
+        Some(ids)
     }
 }
 
@@ -224,7 +226,7 @@ mod backend {
         )
     }
 
-    pub fn candidates(_conn: &Connection, _query: &[f32], _want: usize) -> Option<Vec<i64>> {
+    pub fn candidates(_conn: &Connection, _query: &[f32], _want: usize) -> Option<Vec<String>> {
         None
     }
 }
@@ -234,8 +236,8 @@ pub fn build(conn: &Connection) -> Result<usize, String> {
     backend::build(conn)
 }
 
-/// Candidate memory rowids to score exactly, or `None` when the caller should
+/// Candidate memory ids to score exactly, or `None` when the caller should
 /// fall back to a full scan.
-pub fn candidates(conn: &Connection, query: &[f32], want: usize) -> Option<Vec<i64>> {
+pub fn candidates(conn: &Connection, query: &[f32], want: usize) -> Option<Vec<String>> {
     backend::candidates(conn, query, want)
 }

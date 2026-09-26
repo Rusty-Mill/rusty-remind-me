@@ -36,23 +36,10 @@ fn add_with_vector(conn: &Connection, content: &str, category: &str, vector: &[f
     .unwrap()
     .id;
 
-    let rowid: i64 = conn
-        .query_row("SELECT rowid FROM memories WHERE id = ?", [&id], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    conn.execute(
-        "INSERT INTO vec_chunks (memory_rowid, chunk_ix) VALUES (?, 0)",
-        [rowid],
-    )
-    .unwrap();
-    let vec_rowid = conn.last_insert_rowid();
     let bytes: Vec<u8> = vector.iter().flat_map(|f| f.to_le_bytes()).collect();
-    conn.execute(
-        "INSERT INTO vec_embeddings (vec_rowid, embedding) VALUES (?, ?)",
-        rusqlite::params![vec_rowid, bytes],
-    )
-    .unwrap();
+    remind_me_core::db::vectors::Vectors::new(conn)
+        .put(&id, 0, &bytes)
+        .unwrap();
     id
 }
 

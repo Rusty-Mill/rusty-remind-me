@@ -32,13 +32,7 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
 
     migrations::apply(conn)?;
 
-    // Not part of the generated schema: this crate's own vector storage,
-    // added after the generated tables exist. See
-    // docs/adr/0002-embeddings-ollama-and-brute-force-vectors.md for why it
-    // is a plain table rather than `sqlite-vec`'s `vec0`.
-    crate::vectors::ensure_schema(conn)?;
-
-    // Also not part of the generated schema: raw-transcript retention (#212).
+    // Not part of the schema files: raw-transcript retention (#212).
     // Created even with retention off, so the read path never has to tolerate
     // a missing table. See `archive.rs` for why this cannot be a column on
     // `chat_imports`.

@@ -14,6 +14,7 @@ pub mod saved_searches;
 pub mod schema;
 pub mod stats;
 pub mod sync_state;
+pub mod vectors;
 pub mod wiki;
 
 use parking_lot::{Mutex, MutexGuard};

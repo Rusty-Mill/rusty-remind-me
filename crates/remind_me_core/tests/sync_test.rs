@@ -90,7 +90,7 @@ fn a_strictly_newer_incoming_record_wins_and_replaces_content() {
 
     let outcome = upsert_record(&conn, &incoming).unwrap();
 
-    assert!(matches!(outcome, ApplyOutcome::Applied { .. }));
+    assert!(matches!(outcome, ApplyOutcome::Applied));
     let (content, tags, _, _) = memory_row(&conn, &id);
     assert_eq!(content, "remote content");
     assert_eq!(tags, vec!["remote-tag"]);
@@ -223,7 +223,7 @@ fn a_brand_new_remote_id_is_inserted() {
 
     let outcome = upsert_record(&conn, &incoming).unwrap();
 
-    assert!(matches!(outcome, ApplyOutcome::Applied { .. }));
+    assert!(matches!(outcome, ApplyOutcome::Applied));
     assert_eq!(
         memory_row(&conn, "mem_remote_1").0,
         "brand new remote content"
