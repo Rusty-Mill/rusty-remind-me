@@ -14,10 +14,12 @@
 pub(crate) mod analytics;
 pub(crate) mod archives;
 pub(crate) mod core;
+pub(crate) mod curation;
 pub(crate) mod feedback;
 pub(crate) mod graph;
 pub(crate) mod memories;
 pub(crate) mod outbox;
+pub(crate) mod promotions;
 pub(crate) mod related;
 pub(crate) mod reminders;
 pub(crate) mod revisions;

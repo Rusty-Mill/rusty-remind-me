@@ -8,9 +8,13 @@
 //! lengths, batch bounds, which sources count as raw imports, the entity
 //! fan-out ceiling, and the keyset cursor's meaning.
 
+#[cfg(feature = "engine-store")]
+use super::engine::{self, EngineTables};
 use super::{Result, Store};
 use crate::db::queries::{parse_memory_row, MEMORY_COLUMNS};
 use crate::models::{ContradictionSide, Memory};
+#[cfg(feature = "engine-store")]
+use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 
 /// A capture that nothing has been decomposed from yet.
@@ -130,15 +134,21 @@ fn contradiction_pairs(max_fanout: i64) -> String {
     )
 }
 
-/// The curation reads, over one connection.
+/// The curation reads, over one connection, or on the engine's
+/// memories core when the store's tables hold it (`db::engine::curation`).
 pub struct Curation<'c> {
     conn: &'c Connection,
+    #[cfg(feature = "engine-store")]
+    core: Option<&'c Mutex<EngineTables>>,
 }
 
 impl<'c> Curation<'c> {
     pub fn new(store: &'c Store<'_>) -> Self {
-        let conn = store.conn();
-        Self { conn }
+        Self {
+            conn: store.conn(),
+            #[cfg(feature = "engine-store")]
+            core: store.core(),
+        }
     }
 
     fn count(&self, sql: &str) -> Result<i64> {
@@ -147,10 +157,14 @@ impl<'c> Curation<'c> {
 
     // --- captures --------------------------------------------------------
 
-    /// Every memory carrying `capture_id`, by category.
+    /// Every memory carrying `capture_id`, by category (ties by id).
     pub fn capture_rows(&self, capture_id: &str) -> Result<Vec<Memory>> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            return engine::curation::capture_rows(&core.lock(), capture_id);
+        }
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {MEMORY_COLUMNS} FROM memories WHERE capture_id = ? ORDER BY category"
+            "SELECT {MEMORY_COLUMNS} FROM memories WHERE capture_id = ? ORDER BY category, id"
         ))?;
         let rows = stmt
             .query_map(params![capture_id], parse_memory_row)?
@@ -159,13 +173,17 @@ impl<'c> Curation<'c> {
         rows
     }
 
-    /// The tags of one memory carrying `capture_id`, or `None` when none
-    /// does. Unparseable tags read as none.
+    /// The tags of the lowest-id memory carrying `capture_id`, or `None` when
+    /// none does. Unparseable tags read as none.
     pub fn capture_tags(&self, capture_id: &str) -> Result<Option<Vec<String>>> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            return engine::curation::capture_tags(&core.lock(), capture_id);
+        }
         Ok(self
             .conn
             .query_row(
-                "SELECT tags FROM memories WHERE capture_id = ? LIMIT 1",
+                "SELECT tags FROM memories WHERE capture_id = ? ORDER BY id LIMIT 1",
                 params![capture_id],
                 |row| {
                     let tags_json: String = row.get(0)?;
@@ -178,11 +196,15 @@ impl<'c> Curation<'c> {
     /// Captures nothing has been decomposed from, newest first, at most
     /// `limit`.
     pub fn undecomposed(&self, limit: usize) -> Result<Vec<CaptureRow>> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            return engine::curation::undecomposed(&core.lock(), limit);
+        }
         let mut stmt = self.conn.prepare(&format!(
             "SELECT m.id, m.capture_id, m.content, m.category, m.tags
                FROM memories m
               WHERE {UNDECOMPOSED_CAPTURE}
-              ORDER BY m.created_at DESC
+              ORDER BY m.created_at DESC, m.id DESC
               LIMIT ?"
         ))?;
         let rows = stmt
@@ -203,6 +225,10 @@ impl<'c> Curation<'c> {
 
     /// How many captures nothing has been decomposed from.
     pub fn count_undecomposed(&self) -> Result<i64> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            return engine::curation::count_undecomposed(&core.lock());
+        }
         self.count(&format!(
             "SELECT count(*) FROM memories m WHERE {UNDECOMPOSED_CAPTURE}"
         ))
@@ -211,6 +237,10 @@ impl<'c> Curation<'c> {
     /// How many distinct live captures there are, and the newest one's
     /// `created_at`.
     pub fn capture_activity(&self) -> Result<CaptureActivity> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            return engine::curation::capture_activity(&core.lock());
+        }
         Ok(self.conn.query_row(
             "SELECT COUNT(DISTINCT capture_id), MAX(created_at) FROM memories
               WHERE capture_id IS NOT NULL AND deleted_at IS NULL",
@@ -229,11 +259,15 @@ impl<'c> Curation<'c> {
     /// Live raw imports from `sources` nothing has been normalized from,
     /// newest first, at most `limit`. Unparseable metadata reads as `{}`.
     pub fn unnormalized(&self, sources: &[&str], limit: usize) -> Result<Vec<ImportRow>> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            return engine::curation::unnormalized(&core.lock(), sources, limit);
+        }
         let mut stmt = self.conn.prepare(&format!(
             "SELECT m.id, m.content, m.category, m.source, m.tags, m.metadata
                FROM memories m
               WHERE {}
-              ORDER BY m.created_at DESC
+              ORDER BY m.created_at DESC, m.id DESC
               LIMIT ?",
             unnormalized_where(sources)
         ))?;
@@ -259,6 +293,10 @@ impl<'c> Curation<'c> {
     /// How many live raw imports from `sources` nothing has been
     /// normalized from.
     pub fn count_unnormalized(&self, sources: &[&str]) -> Result<i64> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            return engine::curation::count_unnormalized(&core.lock(), sources);
+        }
         self.count(&format!(
             "SELECT count(*) FROM memories m WHERE {}",
             unnormalized_where(sources)
@@ -267,6 +305,10 @@ impl<'c> Curation<'c> {
 
     /// What a normalization of `memory_id` copies from it, if it exists.
     pub fn normalization_source(&self, memory_id: &str) -> Result<Option<NormalizationSource>> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            return engine::curation::normalization_source(&core.lock(), memory_id);
+        }
         Ok(self
             .conn
             .query_row(
@@ -288,6 +330,10 @@ impl<'c> Curation<'c> {
 
     /// How deep `backlog` is.
     pub fn backlog_depth(&self, backlog: Backlog) -> Result<i64> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            return engine::curation::backlog_depth(&core.lock(), backlog);
+        }
         self.count(match backlog {
             Backlog::Undecomposed => {
                 "SELECT COUNT(*) FROM memories m
@@ -333,6 +379,10 @@ impl<'c> Curation<'c> {
 
     /// How many contradiction candidate pairs there are.
     pub fn count_contradiction_pairs(&self, max_fanout: i64) -> Result<i64> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            return engine::curation::count_contradiction_pairs(&core.lock(), max_fanout);
+        }
         self.count(&format!(
             "SELECT COUNT(*) FROM ({}) p",
             contradiction_pairs(max_fanout)
@@ -347,6 +397,10 @@ impl<'c> Curation<'c> {
         cursor: Option<(&str, &str)>,
         limit: usize,
     ) -> Result<Vec<(String, String)>> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            return engine::curation::contradiction_pairs(&core.lock(), max_fanout, cursor, limit);
+        }
         let cursor_clause = if cursor.is_some() {
             "WHERE (id_a > ?1 OR (id_a = ?1 AND id_b > ?2))"
         } else {
@@ -374,6 +428,10 @@ impl<'c> Curation<'c> {
 
     /// The names of the entities both memories mention, by name.
     pub fn shared_entity_names(&self, id_a: &str, id_b: &str) -> Result<Vec<String>> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            return engine::curation::shared_entity_names(&core.lock(), id_a, id_b);
+        }
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT e.name FROM memory_entities me1
                JOIN memory_entities me2 ON me2.entity_id = me1.entity_id
@@ -395,6 +453,10 @@ impl<'c> Curation<'c> {
         memory_id: &str,
         snippet_chars: usize,
     ) -> Result<ContradictionSide> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            return engine::curation::contradiction_side(&core.lock(), memory_id, snippet_chars);
+        }
         Ok(self.conn.query_row(
             &format!(
                 "SELECT id, substr(content, 1, {snippet_chars}) AS content_snippet, category,
@@ -425,6 +487,291 @@ mod tests {
     use crate::db::Database;
 
     const NOW: &str = "2026-09-26T00:00:00+00:00";
+
+    /// Captures, imports, graph links and promotions on `db`, and every
+    /// curation and promotion read over them.
+    fn exercise(db: &Database) -> Vec<String> {
+        use crate::db::derived::Origin;
+        use crate::db::entities::Entities;
+        use crate::db::promotions::Promotions;
+        use crate::entity::Entity;
+        const T2: &str = "2026-09-27T00:00:00+00:00";
+        let store = db.store();
+        let memories = Memories::new(&store);
+        let text = |s: &str| Some(s.to_string());
+        let rows: Vec<NewMemory> = vec![
+            NewMemory {
+                capture_id: text("c1"),
+                category: "dialog".into(),
+                tags: vec!["x".into()],
+                ..NewMemory::new("d1", "dialog one", NOW)
+            },
+            NewMemory {
+                capture_id: text("c1"),
+                category: "summary".into(),
+                ..NewMemory::new("s1", "summary one", NOW)
+            },
+            NewMemory {
+                capture_id: text("c2"),
+                category: "dialog".into(),
+                ..NewMemory::new("d2", "dialog two", T2)
+            },
+            NewMemory {
+                source_capture_id: text("c2"),
+                category: "fact".into(),
+                subject: text(" Rust "),
+                predicate: text("IS"),
+                object: text("fast"),
+                vitality: 0.9,
+                ..NewMemory::new("f1", "fact one ü", T2)
+            },
+            NewMemory {
+                category: "fact".into(),
+                subject: text("rust"),
+                predicate: text("is"),
+                object: text("safe"),
+                vitality: 0.9,
+                ..NewMemory::new("f2", "fact two", NOW)
+            },
+            NewMemory {
+                category: "fact".into(),
+                vitality: 0.4,
+                sensitive: true,
+                ..NewMemory::new("f3", "fact three", NOW)
+            },
+            NewMemory {
+                category: "fact".into(),
+                vitality: 0.7,
+                ..NewMemory::new("f4", "fact four", T2)
+            },
+            NewMemory {
+                source: "chat_import".into(),
+                metadata: serde_json::json!({"k": 1}),
+                ..NewMemory::new("raw1", "raw one", NOW)
+            },
+            NewMemory {
+                source: "document_import".into(),
+                doc_id: text("doc"),
+                chunk_index: Some(2),
+                ..NewMemory::new("raw2", "raw two", T2)
+            },
+            NewMemory {
+                metadata: serde_json::json!({"normalized_from": "raw1"}),
+                ..NewMemory::new("n1", "norm", T2)
+            },
+            NewMemory {
+                category: "scenario".into(),
+                vitality: 0.8,
+                ..NewMemory::new("sc1", "scenario one", NOW)
+            },
+            NewMemory {
+                category: "scenario".into(),
+                vitality: 0.8,
+                ..NewMemory::new("sc2", "scenario two", NOW)
+            },
+            NewMemory {
+                category: "scenario".into(),
+                vitality: 0.2,
+                ..NewMemory::new("sc3", "scenario three", NOW)
+            },
+            NewMemory {
+                category: "persona".into(),
+                vitality: 0.5,
+                sensitive: true,
+                ..NewMemory::new("p1", "persona", T2)
+            },
+        ];
+        for row in &rows {
+            memories.insert(row).unwrap();
+        }
+        let entities = Entities::new(&store);
+        for (id, name) in [("e1", "Rust"), ("e2", "Tokio"), ("e3", "Hub")] {
+            entities
+                .insert(
+                    &Entity {
+                        id: id.into(),
+                        name: name.into(),
+                        kind: None,
+                        aliases: vec![],
+                        created_at: NOW.into(),
+                        updated_at: NOW.into(),
+                    },
+                    None,
+                )
+                .unwrap();
+        }
+        for (m, e) in [
+            ("f1", "e1"),
+            ("f2", "e1"),
+            ("f3", "e1"),
+            ("f4", "e1"),
+            ("f1", "e2"),
+            ("f4", "e2"),
+            ("d1", "e2"),
+            ("f2", "e3"),
+            ("f4", "e3"),
+            ("sc1", "e3"),
+            ("ghost", "e3"),
+        ] {
+            entities.link(m, e, NOW, Origin::Local).unwrap();
+        }
+        let promotions = Promotions::new(&store);
+        for (p, src, rung) in [
+            ("sc1", "f4", "scenario"),
+            ("sc1", "f2", "scenario"),
+            ("sc1", "f2", "scenario"),
+            ("p1", "sc1", "persona"),
+            ("p1", "gone", "persona"),
+        ] {
+            promotions.record(p, src, rung, NOW).unwrap();
+        }
+        memories.set_superseded_by("f2", "f1", None).unwrap();
+
+        let curation = Curation::new(&store);
+        let sources = ["document_import", "chat_import"];
+        let mut seen = vec![
+            format!(
+                "{:?}",
+                curation
+                    .capture_rows("c1")
+                    .unwrap()
+                    .iter()
+                    .map(|m| &m.id)
+                    .collect::<Vec<_>>()
+            ),
+            format!("{:?}", curation.capture_tags("c1").unwrap()),
+            format!("{:?}", curation.capture_tags("none").unwrap()),
+            format!("{:?}", curation.undecomposed(10).unwrap()),
+            format!("{}", curation.count_undecomposed().unwrap()),
+            format!("{:?}", curation.capture_activity().unwrap()),
+            format!("{:?}", curation.unnormalized(&sources, 10).unwrap()),
+            format!("{}", curation.count_unnormalized(&sources).unwrap()),
+            format!("{:?}", curation.normalization_source("raw2").unwrap()),
+            format!("{:?}", curation.normalization_source("missing").unwrap()),
+        ];
+        for backlog in [
+            Backlog::Undecomposed,
+            Backlog::Unannotated,
+            Backlog::Unnormalized,
+            Backlog::Unclassified,
+        ] {
+            seen.push(format!("{}", curation.backlog_depth(backlog).unwrap()));
+        }
+        for fanout in [20, 3] {
+            seen.push(format!(
+                "{}",
+                curation.count_contradiction_pairs(fanout).unwrap()
+            ));
+            seen.push(format!(
+                "{:?}",
+                curation.contradiction_pairs(fanout, None, 2).unwrap()
+            ));
+            seen.push(format!(
+                "{:?}",
+                curation
+                    .contradiction_pairs(fanout, Some(("f1", "f3")), 10)
+                    .unwrap()
+            ));
+        }
+        seen.push(format!(
+            "{:?}",
+            curation.shared_entity_names("f1", "f4").unwrap()
+        ));
+        seen.push(format!(
+            "{:?}",
+            curation.contradiction_side("f1", 5).unwrap()
+        ));
+        seen.push(format!(
+            "{}",
+            curation.contradiction_side("missing", 5).is_err()
+        ));
+
+        seen.push(format!(
+            "{:?}",
+            promotions.undecomposed_dialogs(10).unwrap()
+        ));
+        seen.push(format!(
+            "{}",
+            promotions.count_undecomposed_dialogs().unwrap()
+        ));
+        seen.push(format!(
+            "{:?}",
+            promotions
+                .entity_fact_groups("fact", "scenario", 2, 10)
+                .unwrap()
+        ));
+        seen.push(format!(
+            "{:?}",
+            promotions
+                .entity_fact_groups("fact", "other", 1, 1)
+                .unwrap()
+        ));
+        seen.push(format!(
+            "{}",
+            promotions
+                .count_entity_fact_groups("fact", "other", 1)
+                .unwrap()
+        ));
+        seen.push(format!(
+            "{:?}",
+            promotions
+                .ready_scenarios("scenario", 0.5, "persona", 10)
+                .unwrap()
+        ));
+        seen.push(format!(
+            "{}",
+            promotions
+                .count_ready_scenarios("scenario", 0.5, "persona")
+                .unwrap()
+        ));
+        seen.push(format!(
+            "{:?}",
+            promotions.live_source_sensitivity("f3").unwrap()
+        ));
+        seen.push(format!(
+            "{:?}",
+            promotions.live_source_sensitivity("f2").unwrap()
+        ));
+        seen.push(format!(
+            "{:?}",
+            promotions.promoted_from("f2", "scenario").unwrap()
+        ));
+        seen.push(format!(
+            "{:?}",
+            promotions.sources_at("sc1", "scenario").unwrap()
+        ));
+        seen.push(format!(
+            "{} {}",
+            promotions.is_live("f1").unwrap(),
+            promotions.is_live("f2").unwrap()
+        ));
+        seen.push(format!("{:?}", promotions.sources_of("p1").unwrap()));
+        seen.push(format!("{:?}", promotions.derived_from("sc1").unwrap()));
+        seen.push(format!("{}", promotions.surviving_sources("sc1").unwrap()));
+        seen.push(format!(
+            "{:?}",
+            promotions.statements_by_vitality("fact").unwrap()
+        ));
+        seen.push(format!(
+            "{:?}",
+            promotions.statements_newest_first("fact").unwrap()
+        ));
+        seen
+    }
+
+    #[test]
+    fn the_engine_core_curates_and_promotes_as_sqlite_does() {
+        let mut observed = Vec::new();
+        crate::db::on_each_core_backend(|db| observed.push(exercise(db)));
+        let sqlite = &observed[0];
+        assert_ne!(sqlite[14], "0", "the corpus has contradiction pairs");
+        for other in &observed[1..] {
+            for (theirs, ours) in other.iter().zip(sqlite) {
+                assert_eq!(theirs, ours);
+            }
+            assert_eq!(other.len(), sqlite.len());
+        }
+    }
 
     #[test]
     fn a_capture_leaves_the_backlog_once_a_fact_names_it() {

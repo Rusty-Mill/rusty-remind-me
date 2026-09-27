@@ -829,6 +829,19 @@ pub(crate) fn counts(tables: &EngineTables) -> Result<(i64, i64, i64)> {
     ))
 }
 
+/// Every mention link as (memory id, entity id).
+pub(crate) fn link_pairs(core: &CoreTables) -> Vec<(String, String)> {
+    links(core)
+        .into_iter()
+        .map(|l| (l.memory_id, l.entity_id))
+        .collect()
+}
+
+/// Entity `id`'s name, if it is stored.
+pub(crate) fn entity_name(core: &CoreTables, id: &str) -> Option<String> {
+    entity(core, id).map(|e| e.name)
+}
+
 /// Every entity and link as backfill entries (key and payload), entities
 /// oldest first, then links oldest first.
 pub(crate) fn backfill_entries(core: &CoreTables) -> Vec<(String, String)> {

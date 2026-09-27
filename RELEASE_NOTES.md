@@ -2,6 +2,27 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-27 — Curation and promotions on the engine core, built dark (ADR-0023, core PR 3c)
+
+### Added
+- The engine's memories core gains the promotions provenance table. `Promotions` and `Curation` use the core when it is present, for every read and write. This covers:
+  - capture, normalization and maintenance queues;
+  - contradiction pairs;
+  - fact groups;
+  - ready scenarios;
+  - persona statements.
+
+### Changed
+- Several orders that were unspecified are now fixed, breaking ties by id:
+  - a capture's rows;
+  - the tags taken for a capture;
+  - the undecomposed and unnormalized queues;
+  - the entity fact groups and the ids within each group;
+  - scenarios, statements and provenance lists.
+
+### Tests
+- A differential test runs every curation and promotion method against SQLite and the core, and requires identical answers.
+
 ## 2026-09-27 — Associations and the sync feed on the engine core, built dark (ADR-0023, core PR 3b)
 
 ### Added

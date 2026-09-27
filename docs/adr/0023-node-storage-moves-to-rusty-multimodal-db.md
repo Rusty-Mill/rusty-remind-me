@@ -1042,8 +1042,40 @@ PR 3 ships in three parts: 3a (this), 3b associations and the sync feed,
   every feed page (with cursors, limits and node exclusion) on both
   backends and requires identical answers.
 
-**Next:** core 3c, curation and promotions, which completes core PR 3.
-The copy tool (§5) comes after the switch-on.
+**Core 3c, done: curation and promotions on the core. Core PR 3 is
+complete.**
+
+- The core gains `promotions`, keyed by its (promoted, source) pair and
+  indexed by source. `Promotions` dispatches every statement to the core
+  when it is present: the provenance writes and reads, the undecomposed
+  dialogs, the entity fact groups, the ready scenarios and the persona
+  statements.
+- `Curation` does the same for the capture, normalization, maintenance
+  and contradiction queues. The contradiction pairs keep the SQL's rules:
+  distinct pairs `id_a < id_b` sharing an entity whose mention count
+  (every link, live memory or not) is within the fan-out ceiling, both
+  live and not dialogs, minus same-claim pairs compared with SQLite's
+  `lower(trim())` (spaces only, ASCII only), keyset-paged.
+- `normalized_from` matches only as text, as `json_extract(…) = m.id`
+  does. A missing contradiction side is `StoreError::NotFound`, as the
+  SQL's `query_row` makes it.
+- Orders the SQL left unspecified are now fixed on both backends: a
+  capture's rows by category then id, a capture's tags from its lowest
+  id, the undecomposed and unnormalized queues newest first then id
+  descending, the fact groups by size then entity id with each group's
+  ids sorted, scenarios and statements by vitality or time then id, and
+  the provenance lists sorted.
+- A differential test runs every `Curation` and `Promotions` method over
+  captures, imports, graph links, supersession and promotions on both
+  backends and requires identical answers.
+
+With core PR 3, the graph and everything that reads it are on the core.
+What still reads SQLite beside memories: vectors and the import
+bookkeeping (core PR 4).
+
+**Next:** core PR 4, vectors and the import bookkeeping, with the
+importers' transactions as journal batches. The copy tool (§5) comes
+after the switch-on.
 
 ## Related
 
