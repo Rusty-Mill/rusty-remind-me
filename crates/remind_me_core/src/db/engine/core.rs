@@ -17,11 +17,16 @@ use super::feedback::{FeedbackRecord, FeedbackTable};
 use super::graph::{
     EntityRecord, EntityTable, LinkRecord, LinkTable, RelationRecord, RelationTable,
 };
+use super::imports::{
+    ChatImportRecord, ChatImportTable, DbsImportRecord, DbsImportTable, MempalaceImportRecord,
+    MempalaceImportTable,
+};
 use super::memories::{self, MemoryRecord, MemorySearch, MemoryTable, TagIndex};
 use super::outbox::{FlagRecord, FlagTable, OutboxRecord, OutboxTable, SendRecord, SendTable};
 use super::promotions::{PromotionRecord, PromotionTable};
 use super::related::{AssociationRecord, AssociationTable};
 use super::reminders::{DeliveryRecord, DeliveryTable};
+use super::vectors::{ChunkRecord, ChunkTable, MetaRecord, MetaTable};
 use super::{engine_error, open_core, EngineTables};
 use crate::db::{Result, StoreError};
 use rusty_multimodal_db_engine::generic::mmap_field::MmapFieldValue;
@@ -49,6 +54,11 @@ pub(crate) struct CoreTables {
     pub(crate) relations: RelationTable,
     pub(crate) associations: AssociationTable,
     pub(crate) promotions: PromotionTable,
+    pub(crate) chunks: ChunkTable,
+    pub(crate) embedding_meta: MetaTable,
+    pub(crate) chat_imports: ChatImportTable,
+    pub(crate) dbs_imports: DbsImportTable,
+    pub(crate) mempalace_imports: MempalaceImportTable,
     /// `memories_fts`: derived from `memories` at open, never stored.
     pub(crate) search: MemorySearch,
     /// `memory_tags`: derived from `memories` at open, never stored.
@@ -71,6 +81,11 @@ impl CoreTables {
             relations: open_core(&dir.join("entity_relations.mmap"))?,
             associations: open_core(&dir.join("memory_associations.mmap"))?,
             promotions: open_core(&dir.join("promotions.mmap"))?,
+            chunks: open_core(&dir.join("vec_chunks.mmap"))?,
+            embedding_meta: open_core(&dir.join("embedding_meta.mmap"))?,
+            chat_imports: open_core(&dir.join("chat_imports.mmap"))?,
+            dbs_imports: open_core(&dir.join("dbs_imports.mmap"))?,
+            mempalace_imports: open_core(&dir.join("mempalace_imports.mmap"))?,
             search,
             tags,
         })
@@ -91,6 +106,11 @@ pub(crate) enum Change {
     Relation(Uuid, Option<Box<RelationRecord>>),
     Association(Uuid, Option<AssociationRecord>),
     Promotion(Uuid, Option<PromotionRecord>),
+    Chunk(Uuid, Option<Box<ChunkRecord>>),
+    EmbeddingMeta(Uuid, Option<MetaRecord>),
+    ChatImport(Uuid, Option<Box<ChatImportRecord>>),
+    DbsImport(Uuid, Option<Box<DbsImportRecord>>),
+    MempalaceImport(Uuid, Option<MempalaceImportRecord>),
 }
 
 /// The journal's names for the core stores. Pinned: a journal written by
@@ -106,6 +126,11 @@ const LINKS: &str = "memory_entities";
 const RELATIONS: &str = "entity_relations";
 const ASSOCIATIONS: &str = "memory_associations";
 const PROMOTIONS: &str = "promotions";
+const CHUNKS: &str = "vec_chunks";
+const EMBEDDING_META: &str = "embedding_meta";
+const CHAT_IMPORTS: &str = "chat_imports";
+const DBS_IMPORTS: &str = "dbs_imports";
+const MEMPALACE_IMPORTS: &str = "mempalace_imports";
 
 /// `changes` as a journal batch: each key and record as JSON.
 pub(super) fn encode(changes: &[Change]) -> Result<Batch> {
@@ -123,6 +148,15 @@ pub(super) fn encode(changes: &[Change]) -> Result<Batch> {
             Change::Relation(id, record) => put_or_delete(&mut batch, RELATIONS, id, record)?,
             Change::Association(id, record) => put_or_delete(&mut batch, ASSOCIATIONS, id, record)?,
             Change::Promotion(id, record) => put_or_delete(&mut batch, PROMOTIONS, id, record)?,
+            Change::Chunk(id, record) => put_or_delete(&mut batch, CHUNKS, id, record)?,
+            Change::EmbeddingMeta(id, record) => {
+                put_or_delete(&mut batch, EMBEDDING_META, id, record)?
+            }
+            Change::ChatImport(id, record) => put_or_delete(&mut batch, CHAT_IMPORTS, id, record)?,
+            Change::DbsImport(id, record) => put_or_delete(&mut batch, DBS_IMPORTS, id, record)?,
+            Change::MempalaceImport(id, record) => {
+                put_or_delete(&mut batch, MEMPALACE_IMPORTS, id, record)?
+            }
         }
     }
     Ok(batch)
@@ -167,6 +201,11 @@ pub(super) fn decode(batch: &Batch) -> Result<Vec<Change>> {
                 RELATIONS => Ok(Change::Relation(key(&change.key)?, record(value)?)),
                 ASSOCIATIONS => Ok(Change::Association(key(&change.key)?, record(value)?)),
                 PROMOTIONS => Ok(Change::Promotion(key(&change.key)?, record(value)?)),
+                CHUNKS => Ok(Change::Chunk(key(&change.key)?, record(value)?)),
+                EMBEDDING_META => Ok(Change::EmbeddingMeta(key(&change.key)?, record(value)?)),
+                CHAT_IMPORTS => Ok(Change::ChatImport(key(&change.key)?, record(value)?)),
+                DBS_IMPORTS => Ok(Change::DbsImport(key(&change.key)?, record(value)?)),
+                MEMPALACE_IMPORTS => Ok(Change::MempalaceImport(key(&change.key)?, record(value)?)),
                 other => Err(StoreError::Engine(format!(
                     "the journal holds changes to {other:?}, which this build cannot apply"
                 ))),
@@ -212,6 +251,17 @@ pub(super) fn apply(core: &mut CoreTables, change: Change) -> Result<()> {
         Change::Relation(id, record) => put_or_remove(&mut core.relations, id, record.map(|r| *r)),
         Change::Association(id, record) => put_or_remove(&mut core.associations, id, record),
         Change::Promotion(id, record) => put_or_remove(&mut core.promotions, id, record),
+        Change::Chunk(id, record) => put_or_remove(&mut core.chunks, id, record.map(|r| *r)),
+        Change::EmbeddingMeta(id, record) => put_or_remove(&mut core.embedding_meta, id, record),
+        Change::ChatImport(id, record) => {
+            put_or_remove(&mut core.chat_imports, id, record.map(|r| *r))
+        }
+        Change::DbsImport(id, record) => {
+            put_or_remove(&mut core.dbs_imports, id, record.map(|r| *r))
+        }
+        Change::MempalaceImport(id, record) => {
+            put_or_remove(&mut core.mempalace_imports, id, record)
+        }
     }
 }
 

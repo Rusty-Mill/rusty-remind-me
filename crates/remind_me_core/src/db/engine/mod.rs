@@ -17,6 +17,7 @@ pub(crate) mod core;
 pub(crate) mod curation;
 pub(crate) mod feedback;
 pub(crate) mod graph;
+pub(crate) mod imports;
 pub(crate) mod memories;
 pub(crate) mod outbox;
 pub(crate) mod promotions;
@@ -26,6 +27,7 @@ pub(crate) mod revisions;
 pub(crate) mod saved_searches;
 pub(crate) mod stats;
 pub(crate) mod sync_log;
+pub(crate) mod vectors;
 pub(crate) mod wiki;
 
 use super::StoreError;

@@ -8,8 +8,9 @@
 //! With the `engine-store` feature, a store that carries engine tables keeps
 //! `analytics_snapshots` there (`db::engine::analytics`, ADR-0023 phase 4f),
 //! and a store whose tables hold the memories core counts memories there
-//! (`db::engine::stats`, core PR 2d). The chat-import count and the storage
-//! figures stay on SQLite until their own steps.
+//! (`db::engine::stats`, core PR 2d) and chat imports there
+//! (`db::engine::imports`, core PR 4a). The storage figures stay on SQLite
+//! until the switch-on.
 
 #[cfg(feature = "engine-store")]
 use super::engine::{self, EngineTables};
@@ -97,6 +98,10 @@ impl<'c> StoreStats<'c> {
 
     /// How many chat imports are recorded.
     pub fn imports(&self) -> Result<i64> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            return engine::imports::chat_import_count(&core.lock());
+        }
         Ok(self
             .conn
             .query_row("SELECT count(*) FROM chat_imports", [], |r| r.get(0))?)

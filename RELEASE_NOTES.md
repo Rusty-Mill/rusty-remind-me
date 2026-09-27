@@ -2,6 +2,22 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-27 — Vectors and import bookkeeping on the engine core, built dark (ADR-0023, core PR 4a)
+
+### Added
+- The engine's memories core gains tables for chunk vectors, embedding metadata, and the chat, dbs and mempalace import ledgers. `Vectors` and `ImportLedger` use the core when it is present, for every read and write. The chat-import count in the store stats moves with them.
+
+### Changed
+- Several orders that were unspecified are now fixed:
+  - chunks come back in key order, so "any" embedding is the first by key;
+  - consolidation candidates come oldest first, then by id, which also decides which ones a limit keeps;
+  - embedding metadata comes back by key;
+  - the earliest chat import is returned for a content hash;
+  - every id list from the import ledger comes back sorted.
+
+### Tests
+- A differential test runs every vector and import-ledger method against SQLite and the core, and requires identical answers.
+
 ## 2026-09-27 — Curation and promotions on the engine core, built dark (ADR-0023, core PR 3c)
 
 ### Added

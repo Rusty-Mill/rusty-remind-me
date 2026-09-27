@@ -1,7 +1,7 @@
 //! Store-wide counts over memories on the engine core (ADR-0023, core PR
 //! 2d, built dark). [`crate::db::stats`] calls these when its store carries
-//! the core; the chat-import count and the storage figures stay on SQLite
-//! until their own steps.
+//! the core; the chat-import count is `db::engine::imports`' (core PR 4a),
+//! and the storage figures stay on SQLite until the switch-on.
 
 use super::memories::{self, MemoryRow};
 use super::{core_ref, EngineTables};

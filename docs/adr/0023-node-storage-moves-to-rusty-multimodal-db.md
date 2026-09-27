@@ -1071,11 +1071,38 @@ complete.**
 
 With core PR 3, the graph and everything that reads it are on the core.
 What still reads SQLite beside memories: vectors and the import
-bookkeeping (core PR 4).
+bookkeeping (core PR 4a, below).
 
-**Next:** core PR 4, vectors and the import bookkeeping, with the
-importers' transactions as journal batches. The copy tool (§5) comes
-after the switch-on.
+**Core 4a, done: vectors and the import bookkeeping on the core.** Core
+PR 4 ships in two parts: 4a (this), and 4b, which makes the importers'
+transactions journal batches.
+
+- The core gains `vec_chunks` (keyed by the (memory, chunk index) pair,
+  indexed by memory), `embedding_meta` (keyed by key), `chat_imports`
+  (keyed by import id, indexed by hash), `dbs_imports` (keyed by the
+  (source, external id) pair, indexed by memory) and `mempalace_imports`
+  (keyed by drawer, indexed by memory). `Vectors` and `ImportLedger`
+  dispatch every statement to them when the core is present, and the
+  chat-import count in `StoreStats` moves with them.
+- The SQL's rules carry over: `INSERT OR REPLACE` on chunks, the upserts
+  on `embedding_meta` and `dbs_imports`, `INSERT OR IGNORE` on drawers, a
+  plain `INSERT` that refuses a chat import id already recorded, and the
+  joins that count only live memories. `LIKE` keeps SQLite's rules: `%`
+  and `_` stay wildcards inside a caller's prefix, and case folds for
+  ASCII only. `json_extract` on the drawer id reads a number or boolean
+  as its text, and fails on malformed JSON.
+- Orders the SQL left unspecified are now fixed on both backends: chunks
+  in key order (so "any" embedding is the first by key), consolidation
+  candidates oldest first then id (this also decides which ones a limit
+  keeps), `embedding_meta` by key, the earliest chat import for a hash,
+  and every id list the ledger returns sorted.
+- A differential test on each repository runs every method on both
+  backends, including replaced chunks, deleted, superseded and archived
+  memories, orphan chunks, duplicate ids in the arguments and
+  case-varied prefixes, and requires identical answers.
+
+**Next:** core PR 4b, each importer page as one journal batch. Then the
+switch-on; the copy tool (§5) comes after it.
 
 ## Related
 
