@@ -18,6 +18,7 @@ pub(crate) mod feedback;
 pub(crate) mod graph;
 pub(crate) mod memories;
 pub(crate) mod outbox;
+pub(crate) mod related;
 pub(crate) mod reminders;
 pub(crate) mod revisions;
 pub(crate) mod saved_searches;

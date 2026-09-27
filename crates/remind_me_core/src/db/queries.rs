@@ -21,7 +21,7 @@ use crate::vitality::{
     get_type_prior, VITALITY_FLOOR,
 };
 use chrono::Utc;
-use rusqlite::{params, Row};
+use rusqlite::Row;
 
 /// Columns selected wherever a full [`Memory`] is parsed via [`parse_memory_row`].
 ///
@@ -284,7 +284,6 @@ pub fn update_memory(store: &Store<'_>, input: &MemoryUpdateInput) -> Result<Upd
 /// and a cascade would reject that. This crate previously relied on a cascade
 /// it had added itself; regenerating the schema from `remind_me` removed it.
 pub fn delete_memory(store: &Store<'_>, memory_id: &str) -> Result<bool> {
-    let conn = store.conn();
     let memories = Memories::new(store);
     // The category is read before either delete path: a hard delete removes
     // the row, so after this point there is nothing left to read it from, and
@@ -306,10 +305,7 @@ pub fn delete_memory(store: &Store<'_>, memory_id: &str) -> Result<bool> {
     // Entities themselves survive — other memories may still mention them.
     crate::db::entities::Entities::new(store).unlink_memory(memory_id)?;
     crate::db::feedback::Feedback::new(store).delete_for(memory_id)?;
-    conn.execute(
-        "DELETE FROM memory_associations WHERE memory_id_a = ? OR memory_id_b = ?",
-        params![memory_id, memory_id],
-    )?;
+    crate::db::related::Related::new(store).unlink_memory(memory_id)?;
 
     crate::events::emit(crate::events::Event::Deleted, memory_id, &category);
 

@@ -1020,8 +1020,30 @@ PR 3 ships in three parts: 3a (this), 3b associations and the sync feed,
   unlinking and the unannotated batch. It compares every read and every
   queued and backfilled outbox payload.
 
-**Next:** core 3b, associations and the sync feed. The copy tool (§5)
-comes after the switch-on.
+**Core 3b, done: associations and the sync feed on the core.**
+
+- The core gains `memory_associations`, keyed by its ordered pair.
+  `Related` dispatches to it when the core is present: bumping a pair
+  (a new pair at 1, a known one gaining 1 up to the cap), the relatives
+  through shared entities, the document window, and co-retrieval.
+- The engine reproduces the SQL's row multiplicity where it matters:
+  `via_entities` yields a row per (seed link, neighbour link) pair, and
+  co-retrieval reads a pair from each side it touches, so expansion's
+  own grouping sees what it saw before.
+- `SyncFeed` serves all four pull feeds and the graph counts from the
+  core: memories and entities keyed on `(updated_at, id)` with the
+  `node_id` exclusion, links on `(created_at, memory_id|entity_id)`,
+  relations on `(created_at, id)`, each as the same wire record.
+- Deleting a memory removes its pairs through the new
+  `Related::unlink_memory`.
+- The document window and co-retrieval now break ties by id on both
+  backends.
+- A differential test runs associations, all three expansion reads and
+  every feed page (with cursors, limits and node exclusion) on both
+  backends and requires identical answers.
+
+**Next:** core 3c, curation and promotions, which completes core PR 3.
+The copy tool (§5) comes after the switch-on.
 
 ## Related
 

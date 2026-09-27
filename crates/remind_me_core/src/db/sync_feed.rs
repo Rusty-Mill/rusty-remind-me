@@ -7,7 +7,11 @@
 //! lives here. The server keeps the rules: parameter defaults, the page
 //! limit, and the response shapes.
 
+#[cfg(feature = "engine-store")]
+use super::engine::{self, EngineTables};
 use super::{Result, Store};
+#[cfg(feature = "engine-store")]
+use parking_lot::Mutex;
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 
@@ -71,15 +75,21 @@ fn entity_record(row: &rusqlite::Row) -> rusqlite::Result<Value> {
     }))
 }
 
-/// The pull feeds, over one connection.
+/// The pull feeds, over one connection, or on the engine's memories core
+/// when the store's tables hold it.
 pub struct SyncFeed<'c> {
     conn: &'c Connection,
+    #[cfg(feature = "engine-store")]
+    core: Option<&'c Mutex<EngineTables>>,
 }
 
 impl<'c> SyncFeed<'c> {
     pub fn new(store: &'c Store<'_>) -> Self {
-        let conn = store.conn();
-        Self { conn }
+        Self {
+            conn: store.conn(),
+            #[cfg(feature = "engine-store")]
+            core: store.core(),
+        }
     }
 
     /// Up to `limit` memories after the cursor `(since, since_id)` on
@@ -92,6 +102,16 @@ impl<'c> SyncFeed<'c> {
         exclude_node: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Value>> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            return engine::memories::memories_after(
+                &core.lock(),
+                since,
+                since_id,
+                exclude_node,
+                limit,
+            );
+        }
         let sql = format!(
             "SELECT {SYNC_RECORD_COLUMNS} FROM memories
               WHERE (updated_at > ?1 OR (updated_at = ?1 AND id > ?2))
@@ -113,6 +133,16 @@ impl<'c> SyncFeed<'c> {
         exclude_node: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Value>> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            return engine::graph::entities_after(
+                &core.lock(),
+                since,
+                since_id,
+                exclude_node,
+                limit,
+            );
+        }
         let sql = format!(
             "SELECT id, name, kind, aliases, created_at, updated_at, node_id FROM entities
               WHERE (updated_at > ?1 OR (updated_at = ?1 AND id > ?2))
@@ -128,6 +158,10 @@ impl<'c> SyncFeed<'c> {
     /// `(created_at, memory_id|entity_id)`, oldest first. Links have no
     /// `node_id`, so there is nothing to exclude.
     pub fn links_after(&self, since: &str, since_id: &str, limit: usize) -> Result<Vec<Value>> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            return engine::graph::links_after(&core.lock(), since, since_id, limit);
+        }
         let mut stmt = self.conn.prepare(
             "SELECT memory_id, entity_id, created_at FROM memory_entities
               WHERE (created_at > ?1 OR (created_at = ?1 AND (memory_id || '|' || entity_id) > ?2))
@@ -154,6 +188,10 @@ impl<'c> SyncFeed<'c> {
     /// Up to `limit` relations after the cursor `(since, since_id)` on
     /// `(created_at, id)`, oldest first.
     pub fn relations_after(&self, since: &str, since_id: &str, limit: usize) -> Result<Vec<Value>> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            return engine::graph::relations_after(&core.lock(), since, since_id, limit);
+        }
         let mut stmt = self.conn.prepare(
             "SELECT id, subject_entity_id, relation, object_entity_id, created_at, updated_at, node_id
                FROM entity_relations
@@ -181,16 +219,28 @@ impl<'c> SyncFeed<'c> {
 
     /// How many entities are stored.
     pub fn entity_count(&self) -> Result<i64> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            return Ok(engine::graph::counts(&core.lock())?.0);
+        }
         self.count("entities")
     }
 
     /// How many mention links are stored.
     pub fn link_count(&self) -> Result<i64> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            return Ok(engine::graph::counts(&core.lock())?.1);
+        }
         self.count("memory_entities")
     }
 
     /// How many relations are stored.
     pub fn relation_count(&self) -> Result<i64> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            return Ok(engine::graph::counts(&core.lock())?.2);
+        }
         self.count("entity_relations")
     }
 

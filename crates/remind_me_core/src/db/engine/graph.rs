@@ -681,6 +681,154 @@ pub(crate) fn upsert_synced(
     tables.commit(vec![put_entity(record)])
 }
 
+/// Live memories outside `seed_ids` that mention an entity a seed mentions,
+/// one row per (seed link, neighbour link) pair as the SQL's joins produce
+/// them, newest first, then id, then entity name.
+pub(crate) fn via_entities(
+    tables: &EngineTables,
+    seed_ids: &[String],
+) -> Result<Vec<crate::db::related::EntityRelative>> {
+    let core = core_ref(tables)?;
+    let seeds: HashSet<&str> = seed_ids.iter().map(String::as_str).collect();
+    let mut found: Vec<(MemoryRow, String)> = Vec::new();
+    for seed in links(core)
+        .into_iter()
+        .filter(|l| seeds.contains(l.memory_id.as_str()))
+    {
+        let Some(named) = entity(core, &seed.entity_id) else {
+            continue;
+        };
+        for neighbour in links_to(core, &seed.entity_id) {
+            if seeds.contains(neighbour.memory_id.as_str()) {
+                continue;
+            }
+            let row = memories::row(core, &neighbour.memory_id)
+                .filter(|row| row.deleted_at.is_none() && row.superseded_by.is_none());
+            if let Some(row) = row {
+                found.push((row, named.name.clone()));
+            }
+        }
+    }
+    found.sort_by(|(a, na), (b, nb)| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| a.id.cmp(&b.id))
+            .then_with(|| na.cmp(nb))
+    });
+    Ok(found
+        .into_iter()
+        .map(|(row, entity_name)| crate::db::related::EntityRelative {
+            memory: super::related::relative(&row),
+            entity_name,
+        })
+        .collect())
+}
+
+/// An entity as the sync feed sends it: aliases parsed, or `[]`.
+fn entity_feed_record(e: &EntityRecord) -> serde_json::Value {
+    json!({
+        "record_type": "entity",
+        "id": e.id,
+        "name": e.name,
+        "kind": e.kind,
+        "aliases": serde_json::from_str::<serde_json::Value>(&e.aliases).unwrap_or_else(|_| json!([])),
+        "created_at": e.created_at,
+        "updated_at": e.updated_at,
+        "node_id": e.node_id,
+    })
+}
+
+/// Whether a row written by `node_id` passes the feed's exclusion: `node_id
+/// IS NULL OR node_id != exclude`.
+pub(crate) fn not_excluded(node_id: Option<&str>, exclude_node: Option<&str>) -> bool {
+    match (node_id, exclude_node) {
+        (_, None) | (None, _) => true,
+        (Some(node), Some(excluded)) => node != excluded,
+    }
+}
+
+/// Up to `limit` entities after `(since, since_id)` on `(updated_at, id)`.
+pub(crate) fn entities_after(
+    tables: &EngineTables,
+    since: &str,
+    since_id: &str,
+    exclude_node: Option<&str>,
+    limit: usize,
+) -> Result<Vec<serde_json::Value>> {
+    let mut found: Vec<EntityRecord> = entities(core_ref(tables)?)
+        .into_iter()
+        .filter(|e| (e.updated_at.as_str(), e.id.as_str()) > (since, since_id))
+        .filter(|e| not_excluded(e.node_id.as_deref(), exclude_node))
+        .collect();
+    found.sort_by(|a, b| (&a.updated_at, &a.id).cmp(&(&b.updated_at, &b.id)));
+    Ok(found.iter().take(limit).map(entity_feed_record).collect())
+}
+
+/// Up to `limit` links after `(since, since_id)` on `(created_at,
+/// memory_id|entity_id)`.
+pub(crate) fn links_after(
+    tables: &EngineTables,
+    since: &str,
+    since_id: &str,
+    limit: usize,
+) -> Result<Vec<serde_json::Value>> {
+    let mut found: Vec<(String, String, LinkRecord)> = links(core_ref(tables)?)
+        .into_iter()
+        .map(|l| {
+            (
+                l.created_at.clone(),
+                format!("{}|{}", l.memory_id, l.entity_id),
+                l,
+            )
+        })
+        .filter(|(at, key, _)| (at.as_str(), key.as_str()) > (since, since_id))
+        .collect();
+    found.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    Ok(found
+        .into_iter()
+        .take(limit)
+        .map(|(created_at, key, l)| {
+            json!({
+                "record_type": "memory_entity",
+                "id": key,
+                "memory_id": l.memory_id,
+                "entity_id": l.entity_id,
+                "created_at": created_at,
+            })
+        })
+        .collect())
+}
+
+/// Up to `limit` relations after `(since, since_id)` on `(created_at, id)`.
+pub(crate) fn relations_after(
+    tables: &EngineTables,
+    since: &str,
+    since_id: &str,
+    limit: usize,
+) -> Result<Vec<serde_json::Value>> {
+    let mut found: Vec<RelationRecord> = relations(core_ref(tables)?)
+        .into_iter()
+        .filter(|r| (r.created_at.as_str(), r.id.as_str()) > (since, since_id))
+        .collect();
+    found.sort_by(|a, b| (&a.created_at, &a.id).cmp(&(&b.created_at, &b.id)));
+    Ok(found
+        .into_iter()
+        .take(limit)
+        .map(|r| serde_json::from_str(&r.payload()).unwrap_or(serde_json::Value::Null))
+        .collect())
+}
+
+/// How many entities, links and relations are stored.
+pub(crate) fn counts(tables: &EngineTables) -> Result<(i64, i64, i64)> {
+    let core = core_ref(tables)?;
+    let n = |len: usize| i64::try_from(len).unwrap_or(i64::MAX);
+    Ok((
+        n(core.entities.all_ids().len()),
+        n(core.links.all_ids().len()),
+        n(core.relations.all_ids().len()),
+    ))
+}
+
 /// Every entity and link as backfill entries (key and payload), entities
 /// oldest first, then links oldest first.
 pub(crate) fn backfill_entries(core: &CoreTables) -> Vec<(String, String)> {

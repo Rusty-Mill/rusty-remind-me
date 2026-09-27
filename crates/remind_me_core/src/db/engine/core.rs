@@ -19,6 +19,7 @@ use super::graph::{
 };
 use super::memories::{self, MemoryRecord, MemorySearch, MemoryTable, TagIndex};
 use super::outbox::{FlagRecord, FlagTable, OutboxRecord, OutboxTable, SendRecord, SendTable};
+use super::related::{AssociationRecord, AssociationTable};
 use super::reminders::{DeliveryRecord, DeliveryTable};
 use super::{engine_error, open_core, EngineTables};
 use crate::db::{Result, StoreError};
@@ -45,6 +46,7 @@ pub(crate) struct CoreTables {
     pub(crate) entities: EntityTable,
     pub(crate) links: LinkTable,
     pub(crate) relations: RelationTable,
+    pub(crate) associations: AssociationTable,
     /// `memories_fts`: derived from `memories` at open, never stored.
     pub(crate) search: MemorySearch,
     /// `memory_tags`: derived from `memories` at open, never stored.
@@ -65,6 +67,7 @@ impl CoreTables {
             entities: open_core(&dir.join("entities.mmap"))?,
             links: open_core(&dir.join("memory_entities.mmap"))?,
             relations: open_core(&dir.join("entity_relations.mmap"))?,
+            associations: open_core(&dir.join("memory_associations.mmap"))?,
             search,
             tags,
         })
@@ -83,6 +86,7 @@ pub(crate) enum Change {
     Entity(Uuid, Option<Box<EntityRecord>>),
     Link(Uuid, Option<LinkRecord>),
     Relation(Uuid, Option<Box<RelationRecord>>),
+    Association(Uuid, Option<AssociationRecord>),
 }
 
 /// The journal's names for the core stores. Pinned: a journal written by
@@ -96,6 +100,7 @@ const FEEDBACK: &str = "memory_feedback";
 const ENTITIES: &str = "entities";
 const LINKS: &str = "memory_entities";
 const RELATIONS: &str = "entity_relations";
+const ASSOCIATIONS: &str = "memory_associations";
 
 /// `changes` as a journal batch: each key and record as JSON.
 pub(super) fn encode(changes: &[Change]) -> Result<Batch> {
@@ -111,6 +116,7 @@ pub(super) fn encode(changes: &[Change]) -> Result<Batch> {
             Change::Entity(id, record) => put_or_delete(&mut batch, ENTITIES, id, record)?,
             Change::Link(id, record) => put_or_delete(&mut batch, LINKS, id, record)?,
             Change::Relation(id, record) => put_or_delete(&mut batch, RELATIONS, id, record)?,
+            Change::Association(id, record) => put_or_delete(&mut batch, ASSOCIATIONS, id, record)?,
         }
     }
     Ok(batch)
@@ -153,6 +159,7 @@ pub(super) fn decode(batch: &Batch) -> Result<Vec<Change>> {
                 ENTITIES => Ok(Change::Entity(key(&change.key)?, record(value)?)),
                 LINKS => Ok(Change::Link(key(&change.key)?, record(value)?)),
                 RELATIONS => Ok(Change::Relation(key(&change.key)?, record(value)?)),
+                ASSOCIATIONS => Ok(Change::Association(key(&change.key)?, record(value)?)),
                 other => Err(StoreError::Engine(format!(
                     "the journal holds changes to {other:?}, which this build cannot apply"
                 ))),
@@ -196,6 +203,7 @@ pub(super) fn apply(core: &mut CoreTables, change: Change) -> Result<()> {
         Change::Entity(id, record) => put_or_remove(&mut core.entities, id, record.map(|r| *r)),
         Change::Link(id, record) => put_or_remove(&mut core.links, id, record),
         Change::Relation(id, record) => put_or_remove(&mut core.relations, id, record.map(|r| *r)),
+        Change::Association(id, record) => put_or_remove(&mut core.associations, id, record),
     }
 }
 

@@ -1081,6 +1081,57 @@ pub(crate) fn unannotated_page(
     Ok((total, page))
 }
 
+/// Up to `limit` memories after `(since, since_id)` on `(updated_at, id)`,
+/// oldest first, skipping those `exclude_node` wrote, as the sync feed's
+/// wire records: tags parsed or `[]`, metadata parsed or `{}`.
+pub(crate) fn memories_after(
+    tables: &EngineTables,
+    since: &str,
+    since_id: &str,
+    exclude_node: Option<&str>,
+    limit: usize,
+) -> Result<Vec<Value>> {
+    let mut found: Vec<MemoryRow> = rows(core_ref(tables)?)
+        .filter(|row| (row.updated_at.as_str(), row.id.as_str()) > (since, since_id))
+        .filter(|row| super::graph::not_excluded(row.node_id.as_deref(), exclude_node))
+        .collect();
+    found.sort_by(|a, b| (&a.updated_at, &a.id).cmp(&(&b.updated_at, &b.id)));
+    Ok(found
+        .into_iter()
+        .take(limit)
+        .map(|row| {
+            serde_json::json!({
+                "id": row.id,
+                "content": row.content,
+                "category": row.category,
+                "tags": serde_json::from_str::<Value>(&row.tags).unwrap_or_else(|_| serde_json::json!([])),
+                "source": row.source,
+                "metadata": serde_json::from_str::<Value>(&row.metadata).unwrap_or_else(|_| serde_json::json!({})),
+                "created_at": row.created_at,
+                "updated_at": row.updated_at,
+                "capture_id": row.capture_id,
+                "node_id": row.node_id,
+                "client": row.client,
+                "accessed_at": row.accessed_at,
+                "access_count": row.access_count,
+                "decay_rate": row.decay_rate,
+                "vitality": row.vitality,
+                "base_weight": row.base_weight,
+                "status": row.status,
+                "memory_type": row.memory_type,
+                "source_capture_id": row.source_capture_id,
+                "subject": row.subject,
+                "predicate": row.predicate,
+                "object": row.object,
+                "superseded_by": row.superseded_by,
+                "deleted_at": row.deleted_at,
+                "sensitive": row.sensitive,
+                "remind_at": row.remind_at,
+            })
+        })
+        .collect())
+}
+
 /// Rebuild the derived indexes from the rows.
 pub(crate) fn rebuild(tables: &mut EngineTables) -> Result<()> {
     let core = core_mut(tables)?;

@@ -2,6 +2,19 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-27 — Associations and the sync feed on the engine core, built dark (ADR-0023, core PR 3b)
+
+### Added
+- The engine's memories core now holds memory associations. When the core is present, `Related` uses it for bumping pairs, relatives through shared entities, the document window and co-retrieval.
+- When the core is present, `SyncFeed` serves all four pull feeds and the graph counts from it.
+- `Related::unlink_memory`, which removes a memory's associations when the memory is deleted.
+
+### Changed
+- The document window and co-retrieval now return tied results in id order. Before, the order of ties was unspecified.
+
+### Tests
+- A differential test runs associations, expansion reads and every sync feed page against SQLite and the core, and requires identical results.
+
 ## 2026-09-27 — Entities, relations and mentions on the engine core, built dark (ADR-0023, core PR 3a)
 
 ### Added
