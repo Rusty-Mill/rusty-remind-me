@@ -595,6 +595,7 @@ impl PeerServer {
                 // fix for the identical shape of bug on the outbound side:
                 // opened once and reused across accepted connections,
                 // reopened on the next accept if the attempt itself failed.
+                let source = db.secondary_source();
                 let mut store = db.open_secondary().ok();
                 while !thread_shutdown.load(Ordering::Relaxed) {
                     match listener.accept() {
@@ -605,8 +606,8 @@ impl PeerServer {
                             if store.is_none() {
                                 store = db.open_secondary().ok();
                             }
-                            if let Some(c) = store.as_ref() {
-                                let _ = serve_once(&mut stream, &config, &Store::over_sqlite(c));
+                            if let (Some(c), Some(source)) = (store.as_ref(), source.as_ref()) {
+                                let _ = serve_once(&mut stream, &config, &source.store(c));
                             }
                             let _ = stream.shutdown(std::net::Shutdown::Both);
                         }

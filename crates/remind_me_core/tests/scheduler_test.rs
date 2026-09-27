@@ -317,7 +317,9 @@ fn the_running_loop_delivers_without_anyone_calling_a_tool() {
     // by hand, which would pass just as happily against a loop that never ran.
     let _env = POLL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     crate::test_env::set_var(remind_me_core::scheduler::POLL_INTERVAL_ENV, "1");
-    let scheduler = remind_me_core::scheduler::start_scheduler(path.clone());
+    let scheduler = remind_me_core::scheduler::start_scheduler(
+        Database::open(&path).unwrap().secondary_source().unwrap(),
+    );
 
     let observer = Database::open(&path).unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
@@ -356,7 +358,9 @@ fn stopping_the_loop_does_not_wait_out_the_poll_interval() {
     // stalls on a thread with nothing left to do.
     let _env = POLL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     crate::test_env::set_var(remind_me_core::scheduler::POLL_INTERVAL_ENV, "3600");
-    let scheduler = remind_me_core::scheduler::start_scheduler(path);
+    let scheduler = remind_me_core::scheduler::start_scheduler(
+        Database::open(&path).unwrap().secondary_source().unwrap(),
+    );
     let started = std::time::Instant::now();
     scheduler.stop();
     crate::test_env::remove_var(remind_me_core::scheduler::POLL_INTERVAL_ENV);

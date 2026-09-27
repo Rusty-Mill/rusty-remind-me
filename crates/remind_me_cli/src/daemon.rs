@@ -93,7 +93,9 @@ fn run(db_path: &Path, endpoint: Endpoint) -> Result<()> {
     let scheduler = remind_me_core::scheduler::start_scheduler_for(&db.store());
     let watcher = remind_me_core::watcher::start_watcher_for(&db.store());
     let nudge = remind_me_core::promotion::start_nudge_for(&db.store());
-    let mut sync = remind_me_core::sync::SyncWorker::from_env(db_path.to_path_buf());
+    let mut sync = db
+        .secondary_source()
+        .and_then(remind_me_core::sync::SyncWorker::from_env);
 
     let wiki = Wiki::from_env();
     let service = StoreService {

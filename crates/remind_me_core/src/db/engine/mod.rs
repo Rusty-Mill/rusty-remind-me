@@ -29,6 +29,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use uuid::Uuid;
 
+/// The engine tables, shared by the database, its stores, and the
+/// background threads that open their own SQLite connections beside it.
+pub type EngineHandle = std::sync::Arc<parking_lot::Mutex<EngineTables>>;
+
 /// The environment variable that picks the backend for
 /// [`super::Database::open_in_memory`]: `engine` or unset (SQLite).
 pub const STORE_ENV: &str = "REMIND_ME_STORE";

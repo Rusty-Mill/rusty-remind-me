@@ -599,7 +599,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // `rusty-remind-me api` process, not only ones written over MCP) --
         // started here alongside it instead, and stopped in the same join
         // block below.
-        let mut sync = remind_me_core::sync::SyncWorker::from_env(db_path.clone());
+        let mut sync = db
+            .secondary_source()
+            .and_then(remind_me_core::sync::SyncWorker::from_env);
         let server = McpServer::new(db);
         let result = server.run_stdio_loop();
         // All joined before the database goes out of scope, so an in-flight
@@ -693,7 +695,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // worker just as well -- see the comment on "server"'s own
                 // `SyncWorker::from_env` call for why this no longer lives
                 // inside `McpServer` specifically.
-                let mut sync = remind_me_core::sync::SyncWorker::from_env(db_path.clone());
+                let mut sync = db
+                    .secondary_source()
+                    .and_then(remind_me_core::sync::SyncWorker::from_env);
                 let api_server = ApiServer::new(db);
                 let result = api_server.run(&addr);
                 if let Some(scheduler) = scheduler {
@@ -731,7 +735,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return Ok(());
                 }
                 let db = Database::open(&db_path)?;
-                let mut sync = remind_me_core::sync::SyncWorker::from_env(db_path.clone());
+                let mut sync = db
+                    .secondary_source()
+                    .and_then(remind_me_core::sync::SyncWorker::from_env);
                 let server = McpServer::new(db);
                 let result = remind_me_remote::run_blocking(std::sync::Arc::new(server));
                 if let Some(sync) = sync.as_mut() {

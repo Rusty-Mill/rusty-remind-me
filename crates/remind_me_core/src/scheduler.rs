@@ -35,7 +35,7 @@
 
 use crate::db::reminders::Reminders;
 use crate::db::Result;
-use crate::db::Store;
+use crate::db::{SecondarySource, Store};
 use crate::models::Memory;
 use crate::notifications;
 use crate::reminders;
@@ -284,22 +284,6 @@ impl SchedulerHandle {
     }
 }
 
-/// Start the polling loop against a database at `db_path`.
-///
-/// The thread opens its own connection rather than sharing the caller's:
-/// `rusqlite::Connection` is not `Sync`, and passing one across would trade a
-/// compile error for a runtime serialisation problem.
-///
-/// Unconditional, unlike the folder watcher — reminders have no enable switch,
-/// only an interval.
-/// Where this connection's database lives, or `None` for an in-memory one.
-///
-/// Following the shape `pid`/`backup`/`status` already established — each
-/// keeps its own copy of this one-line `PRAGMA` rather than sharing a helper.
-fn database_path(store: &Store<'_>) -> Option<std::path::PathBuf> {
-    crate::db::database_path(store).ok().flatten()
-}
-
 /// Start the scheduler for the database `store` is attached to.
 ///
 /// Returns `None` for an in-memory database: the loop's thread opens its own
@@ -307,10 +291,20 @@ fn database_path(store: &Store<'_>) -> Option<std::path::PathBuf> {
 /// database rather than this one. Silently polling an empty database forever
 /// would look exactly like a vault with nothing due.
 pub fn start_scheduler_for(store: &Store<'_>) -> Option<SchedulerHandle> {
-    Some(start_scheduler(database_path(store)?))
+    Some(start_scheduler(store.secondary_source()?))
 }
 
-pub fn start_scheduler(db_path: std::path::PathBuf) -> SchedulerHandle {
+/// Start the polling loop against the database `source` reopens.
+///
+/// The thread opens its own connection rather than sharing the caller's:
+/// `rusqlite::Connection` is not `Sync`, and passing one across would trade a
+/// compile error for a runtime serialisation problem. It shares the source's
+/// engine tables, which lock per call.
+///
+/// Unconditional, unlike the folder watcher — reminders have no enable switch,
+/// only an interval.
+pub fn start_scheduler(source: SecondarySource) -> SchedulerHandle {
+    let db_path = source.path().to_path_buf();
     let stop = Arc::new(Stop::new());
     let loop_stop = Arc::clone(&stop);
     let interval = configured_poll_interval();
@@ -332,7 +326,7 @@ pub fn start_scheduler(db_path: std::path::PathBuf) -> SchedulerHandle {
                 // A failed pass is reported and the loop continues. A
                 // transient database error must not silently end reminder
                 // delivery for the rest of the process's life.
-                match poll_once(&Store::over_sqlite(&store)) {
+                match poll_once(&source.store(&store)) {
                     Ok(0) => {}
                     Ok(n) => eprintln!("reminder scheduler: delivered {} reminder(s)", n),
                     Err(e) => eprintln!("reminder scheduler: poll failed: {}", e),

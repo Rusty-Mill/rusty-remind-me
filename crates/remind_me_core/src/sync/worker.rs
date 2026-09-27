@@ -7,10 +7,9 @@
 
 use super::{prune_outbox, pull_remote, push_outbox};
 use crate::db::sync_state::SyncState;
-use crate::db::Store;
+use crate::db::{SecondarySource, Store};
 use crate::Database;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -62,13 +61,12 @@ impl SyncWorker {
     /// `None` when sync isn't enabled — matching the reference's own
     /// `if SYNC_ENABLED: start_sync_thread()` gating exactly.
     ///
-    /// Takes a database path rather than a `Database`/`Arc`, like
-    /// [`crate::scheduler::start_scheduler`]/[`crate::watcher::start_watcher`]:
-    /// the thread reopens its own connection by path on every retry (via
-    /// [`crate::Database::open_secondary_at`]), so nothing here needs a
-    /// caller's `Database` to still be alive, and starting a worker no longer
-    /// requires being the one holding one.
-    pub fn from_env(db_path: PathBuf) -> Option<Self> {
+    /// Takes a [`SecondarySource`] rather than a `Database`/`Arc`, like
+    /// [`crate::scheduler::start_scheduler`]: the thread reopens its own
+    /// connection by path on every retry (via
+    /// [`crate::Database::open_secondary_at`]) and shares the source's engine
+    /// tables, so nothing here needs a caller's `Database` to still be alive.
+    pub fn from_env(source: SecondarySource) -> Option<Self> {
         if !super::sync_enabled() {
             return None;
         }
@@ -108,17 +106,18 @@ impl SyncWorker {
                 // kept for the thread's life; re-opened on the next cycle if
                 // the attempt itself failed (e.g. transient file-permission
                 // trouble).
-                let mut store = Database::open_secondary_at(&db_path).ok();
+                let db_path = source.path();
+                let mut store = Database::open_secondary_at(db_path).ok();
                 while !thread_shutdown.load(Ordering::Relaxed) {
                     // Before the cycle, not after: the tunnel this may start
                     // is what the cycle about to run needs in place.
                     sidecars.ensure();
                     if store.is_none() {
-                        store = Database::open_secondary_at(&db_path).ok();
+                        store = Database::open_secondary_at(db_path).ok();
                     }
                     match store.as_ref() {
                         Some(c) => run_one_cycle(
-                            &Store::over_sqlite(c),
+                            &source.store(c),
                             &hub_url,
                             &secret,
                             &node_id,

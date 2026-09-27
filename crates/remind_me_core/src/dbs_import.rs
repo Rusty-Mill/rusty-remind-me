@@ -421,7 +421,7 @@ pub fn pull_dbs(
     // One SQLite transaction for the page; the engine store makes the page
     // one batch instead (ADR-0023, phase 4).
     let tx = store.conn().unchecked_transaction()?;
-    let page = Store::over_sqlite(&tx);
+    let page = store.sharing_engine(&tx);
 
     for item in to_import {
         let key = (item.source_name.clone(), item.external_id.clone());

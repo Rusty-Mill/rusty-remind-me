@@ -51,7 +51,8 @@ fn a_stuck_hub_never_blocks_an_ordinary_database_read() {
     crate::test_env::set_var(HUB_URL_ENV, format!("http://{hub_addr}"));
     crate::test_env::set_var(SYNC_SECRET_ENV, "lock-test-secret");
 
-    let mut worker = SyncWorker::from_env(db_path.clone()).expect("sync enabled by env");
+    let mut worker =
+        SyncWorker::from_env(db.secondary_source().unwrap()).expect("sync enabled by env");
 
     // Give the freshly spawned cycle time to reach the hub and block on it.
     std::thread::sleep(Duration::from_millis(300));

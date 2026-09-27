@@ -381,7 +381,7 @@ pub fn pull_mempalace(
     // One SQLite transaction for the page; the engine store makes the page
     // one batch instead (ADR-0023, phase 4).
     let tx = store.conn().unchecked_transaction()?;
-    let batch = Store::over_sqlite(&tx);
+    let batch = store.sharing_engine(&tx);
 
     for drawer in &to_import {
         let wing_val = drawer.wing.clone().unwrap_or_default();

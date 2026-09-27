@@ -2,6 +2,16 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-27 — Background threads share the engine tables (ADR-0023, phase 4d)
+
+### Changed
+- The scheduler, folder watcher, promotion nudge, sync worker and sync peer server reopen the store through a `SecondarySource`: their own SQLite connection, as before, plus the database's engine tables, shared rather than dropped. `Database::secondary_source()` and `Store::secondary_source()` provide one. `SyncWorker::from_env`, `scheduler::start_scheduler` and `promotion::start_nudge` take a `SecondarySource` instead of a path.
+- The dbs and mempalace importers keep the engine tables inside their own SQLite transaction (`Store::sharing_engine`).
+- No behaviour changes in default builds: without `engine-store` a `SecondarySource` is just the path.
+
+### Tests
+- A thread's store and an importer's transaction store see the same engine tables as the main store, in both directions.
+
 ## 2026-09-27 — Import archives on the engine (ADR-0023, phase 4c)
 
 ### Added

@@ -760,11 +760,14 @@ impl NudgeHandle {
 /// different, empty one, so it would report an empty backlog forever.
 pub fn start_nudge_for(store: &Store<'_>) -> Option<NudgeHandle> {
     let interval = nudge_interval()?;
-    let path = crate::db::database_path(store).ok().flatten()?;
-    Some(start_nudge(path, interval))
+    Some(start_nudge(store.secondary_source()?, interval))
 }
 
-pub fn start_nudge(db_path: std::path::PathBuf, interval: std::time::Duration) -> NudgeHandle {
+pub fn start_nudge(
+    source: crate::db::SecondarySource,
+    interval: std::time::Duration,
+) -> NudgeHandle {
+    let db_path = source.path().to_path_buf();
     let stop = std::sync::Arc::new(crate::scheduler::Stop::new());
     let loop_stop = std::sync::Arc::clone(&stop);
     let (liveness, liveness_guard) = crate::scheduler::Liveness::new();
@@ -785,7 +788,7 @@ pub fn start_nudge(db_path: std::path::PathBuf, interval: std::time::Duration) -
                 // A failed pass is reported and the loop continues: a
                 // transient database error must not silently end the nudge
                 // for the rest of the process's life.
-                match nudge_once(&Store::over_sqlite(&store)) {
+                match nudge_once(&source.store(&store)) {
                     Ok((backlog, true)) => {
                         eprintln!("promotion nudge: {}", backlog.summary())
                     }

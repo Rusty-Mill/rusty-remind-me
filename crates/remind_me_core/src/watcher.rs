@@ -40,7 +40,7 @@
 
 use crate::db::memories::Memories;
 use crate::db::Result;
-use crate::db::Store;
+use crate::db::{SecondarySource, Store};
 use crate::import_paths::{
     import_roots, is_contained, resolve_lexically, split_path_list, SUPPORTED_SUFFIXES,
 };
@@ -618,11 +618,6 @@ impl WatcherHandle {
     }
 }
 
-/// Where this connection's database lives, or `None` for an in-memory one.
-fn database_path(store: &Store<'_>) -> Option<std::path::PathBuf> {
-    crate::db::database_path(store).ok().flatten()
-}
-
 /// Start the folder-watch loop for the database `store` is attached to.
 ///
 /// Returns `None` when there is nothing to run: no watch directories
@@ -637,11 +632,11 @@ fn database_path(store: &Store<'_>) -> Option<std::path::PathBuf> {
 /// a feature to run.
 pub fn start_watcher_for(store: &Store<'_>) -> Option<WatcherHandle> {
     let watcher = Watcher::from_env()?;
-    let db_path = database_path(store)?;
-    Some(start_watcher(watcher, db_path))
+    Some(start_watcher(watcher, store.secondary_source()?))
 }
 
-fn start_watcher(watcher: Watcher, db_path: PathBuf) -> WatcherHandle {
+fn start_watcher(watcher: Watcher, source: SecondarySource) -> WatcherHandle {
+    let db_path = source.path().to_path_buf();
     let interval = std::time::Duration::from_secs(watcher.interval().max(1));
     let shared = std::sync::Arc::new(std::sync::Mutex::new(watcher));
     let (liveness, liveness_guard) = crate::scheduler::Liveness::new();
@@ -674,7 +669,7 @@ fn start_watcher(watcher: Watcher, db_path: PathBuf) -> WatcherHandle {
                     // Scoped so the lock is released before the sleep — a
                     // status call must not block for a whole interval.
                     let mut guard = loop_shared.lock().unwrap_or_else(|e| e.into_inner());
-                    let counts = guard.scan_once(&Store::over_sqlite(&store));
+                    let counts = guard.scan_once(&source.store(&store));
                     if counts.ingested > 0 || counts.superseded > 0 {
                         eprintln!(
                             "folder watcher: ingested {}, superseded {}",

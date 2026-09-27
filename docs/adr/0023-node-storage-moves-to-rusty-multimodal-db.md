@@ -721,6 +721,34 @@ this is a pure refactor with no change in behaviour.
   the tables with SQL. Those tests now open an in-memory database, so the
   engine CI leg runs them against the engine.
 
+**4d, done: background threads share the engine tables.**
+
+- Every group still on SQLite is written from a background thread too: the
+  sync worker writes `sync_log`, the scheduler `reminder_deliveries`, and
+  the folder watcher and the sync paths write memories. Each thread opened
+  its own SQLite connection and wrapped it with `Store::over_sqlite`, which
+  carries no engine tables, so once a group moved, the thread would have
+  written SQLite while the main store read the engine.
+- The fix keeps each thread's own connection and shares the engine tables
+  with it. `Database` holds its `EngineTables` behind an `Arc`
+  (`EngineHandle`). A `SecondarySource` (the database file plus that
+  handle) comes from `Database::secondary_source()` or
+  `Store::secondary_source()`, and `SecondarySource::store(&conn)` gives a
+  thread a store over its own connection with the shared tables beside
+  it. The engine tables lock per call, so a thread still holds no
+  process-wide lock across network I/O, the reason it has its own
+  connection.
+- The scheduler, folder watcher, promotion nudge, sync worker and sync
+  peer server all take a `SecondarySource`. The dbs and mempalace
+  importers, which run a SQLite transaction of their own inside a store
+  call, use `Store::sharing_engine(&tx)`; engine writes made there are not
+  part of that transaction, which matters only once those importers write
+  a moved group, and the journal (§3b) addresses it then.
+- Chosen over removing the second connections in favour of one store for
+  every thread: that would mean restructuring the sync worker so network
+  I/O runs outside the store lock, a larger change for the same result.
+  Once SQLite goes, a `SecondarySource` is just the engine handle.
+
 **Next:** the remaining groups, one PR each, in order of how few other
 groups they touch. Groups that write together (a memory, its tags, its
 outbox entry) move together and commit through the journal (§3b). The copy

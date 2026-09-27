@@ -23,7 +23,7 @@ pub mod sync_state;
 pub mod vectors;
 pub mod wiki;
 
-pub use store::{Result, Store, StoreError};
+pub use store::{Result, SecondarySource, Store, StoreError};
 
 use parking_lot::Mutex;
 use rusqlite::Connection;
@@ -198,7 +198,7 @@ pub struct Database {
     /// The engine tables for the groups moved so far (ADR-0023, phase 4),
     /// when this database was opened on the engine.
     #[cfg(feature = "engine-store")]
-    engine: Option<Mutex<engine::EngineTables>>,
+    engine: Option<engine::EngineHandle>,
     /// `None` for an in-memory database. Kept so [`Database::open_secondary`]
     /// can reopen the same on-disk file without every caller having to carry
     /// the path around separately.
@@ -225,7 +225,8 @@ impl Database {
     #[cfg(feature = "engine-store")]
     pub fn open_in_memory_on_engine() -> Result<Self> {
         let mut db = Self::open_sqlite_in_memory()?;
-        db.engine = Some(Mutex::new(engine::EngineTables::open_temporary()?));
+        let tables = engine::EngineTables::open_temporary()?;
+        db.engine = Some(std::sync::Arc::new(Mutex::new(tables)));
         Ok(db)
     }
 
@@ -258,8 +259,18 @@ impl Database {
     pub fn store(&self) -> Store<'_> {
         let store = Store::locked(self.conn.lock());
         #[cfg(feature = "engine-store")]
-        let store = store.with_engine(self.engine.as_ref());
+        let store = store.with_engine(self.engine.clone());
         store
+    }
+
+    /// Where a background thread reopens this database: its file and its
+    /// engine tables. `None` for an in-memory database.
+    pub fn secondary_source(&self) -> Option<SecondarySource> {
+        Some(SecondarySource::new(
+            self.path.clone()?,
+            #[cfg(feature = "engine-store")]
+            self.engine.clone(),
+        ))
     }
 
     /// Opens a second, independent connection to the same on-disk file this
