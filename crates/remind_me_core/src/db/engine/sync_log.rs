@@ -183,7 +183,7 @@ mod tests {
             let mut tables = EngineTables::open(&dir).unwrap();
             put(&mut tables, &written).unwrap();
         }
-        let tables = EngineTables::open(&dir).unwrap();
+        let tables = crate::db::engine::reopen(&dir);
         assert_eq!(row(&tables, "hub"), Some(written));
         drop(tables);
         std::fs::remove_dir_all(&dir).unwrap();

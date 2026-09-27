@@ -317,7 +317,7 @@ mod tests {
             )
             .unwrap();
         }
-        let tables = EngineTables::open(&dir).unwrap();
+        let tables = crate::db::engine::reopen(&dir);
         assert_eq!(get(&tables, "ss_1").unwrap(), saved("ss_1", "one"));
         assert_eq!(seen_ids(&tables, "ss_1"), HashSet::from(["m1".to_string()]));
         drop(tables);

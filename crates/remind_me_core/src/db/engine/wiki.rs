@@ -422,7 +422,7 @@ mod tests {
             let mut tables = EngineTables::open(&dir).unwrap();
             upsert(&mut tables, &page("rust", "ownership and borrowing")).unwrap();
         }
-        let tables = EngineTables::open(&dir).unwrap();
+        let tables = crate::db::engine::reopen(&dir);
         let hits = search(&tables, &["borrowing".to_string()], 10);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].slug, "rust");

@@ -268,7 +268,7 @@ mod tests {
             record(&mut tables, &row("a", "2026-09-01T00:00:00+00:00")).unwrap();
             record_span(&mut tables, "m1", "a", 0, 5).unwrap();
         }
-        let tables = EngineTables::open(&dir).unwrap();
+        let tables = crate::db::engine::reopen(&dir);
         assert_eq!(
             oldest_first(&tables),
             vec![row("a", "2026-09-01T00:00:00+00:00")]

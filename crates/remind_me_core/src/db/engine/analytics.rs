@@ -181,7 +181,7 @@ mod tests {
             let mut tables = EngineTables::open(&dir).unwrap();
             insert(&mut tables, &snap("2026-09-25T10:00:00+00:00", 1)).unwrap()
         };
-        let mut tables = EngineTables::open(&dir).unwrap();
+        let mut tables = crate::db::engine::reopen(&dir);
         let second = insert(&mut tables, &snap("2026-09-26T10:00:00+00:00", 2)).unwrap();
         assert!(second > first, "{second} must follow {first}");
         assert_eq!(snapshot_on(&tables, "2026-09-25"), Some(first));

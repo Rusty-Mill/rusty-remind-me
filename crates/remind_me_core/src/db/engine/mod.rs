@@ -246,6 +246,29 @@ impl Drop for TemporaryDir {
     }
 }
 
+/// Open the tables in `dir` again right after a test dropped them.
+///
+/// The directory lock is an `flock`, which lasts while any copy of its file
+/// descriptor is open, and a child another test thread forks holds a copy
+/// until it execs. So the release can take a moment to show: retry while the
+/// lock reads as held, and fail at once on anything else.
+#[cfg(test)]
+pub(crate) fn reopen(dir: &Path) -> EngineTables {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match EngineTables::open(dir) {
+            Ok(tables) => return tables,
+            Err(StoreError::Engine(why))
+                if why.contains("in use by another process")
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => panic!("reopening {}: {e}", dir.display()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

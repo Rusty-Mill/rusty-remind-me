@@ -116,7 +116,7 @@ fn a_copied_sqlite_hub_answers_every_read_as_the_source_did() {
 
     // And the copy survives a reopen as it was written.
     drop(engine);
-    let reopened = MultimodalHubStore::open(&dir.path("engine")).unwrap();
+    let reopened = reopen(&dir.path("engine"));
     assert_eq!(
         last_seq(&reopened),
         recorded::highest_seq(&expected["after_pushes"]) + 1
@@ -230,4 +230,23 @@ fn the_copy_tool_checks_refuses_and_copies() {
         1,
         "everything but the over-long id"
     );
+}
+
+/// Open the engine directory again right after this test dropped its store.
+///
+/// The directory lock is an `flock`, which lasts while any copy of its file
+/// descriptor is open, and a child another test thread spawns (the copy tool,
+/// below) holds a copy until it execs. So retry while the lock reads as held,
+/// and fail at once on anything else.
+fn reopen(dir: &std::path::Path) -> MultimodalHubStore {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match MultimodalHubStore::open(dir) {
+            Ok(store) => return store,
+            Err(e) if e.to_string().contains("in use") && std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => panic!("reopening {}: {e}", dir.display()),
+        }
+    }
 }

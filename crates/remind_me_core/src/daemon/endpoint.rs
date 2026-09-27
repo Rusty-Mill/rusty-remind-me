@@ -165,7 +165,19 @@ mod tests {
         let held = endpoint.try_lock().unwrap().expect("first lock");
         assert!(endpoint.try_lock().unwrap().is_none());
         drop(held);
-        assert!(endpoint.try_lock().unwrap().is_some());
+        // A child another test thread forks holds a copy of the lock file's
+        // descriptor until it execs, and an `flock` lock lasts while any copy
+        // is open: the release can take a moment to show.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut again = endpoint.try_lock().unwrap();
+        while again.is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            again = endpoint.try_lock().unwrap();
+        }
+        assert!(
+            again.is_some(),
+            "the lock is released once its holder drops it"
+        );
     }
 
     #[test]

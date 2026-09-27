@@ -195,7 +195,7 @@ mod tests {
             )
             .unwrap();
         }
-        let mut tables = EngineTables::open(&dir).unwrap();
+        let mut tables = crate::db::engine::reopen(&dir);
         insert(
             &mut tables,
             "m1",
