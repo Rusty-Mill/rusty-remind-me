@@ -465,7 +465,7 @@ pub fn pull_dbs(
             {
                 let before = entity_exists(page, name)?;
                 let entity = upsert_entity(
-                    &page,
+                    page,
                     &EntityInput {
                         name: name.to_string(),
                         kind: Some(kind.to_string()),
