@@ -4,10 +4,18 @@
 //! Every statement behind `stats.rs`, `status.rs` and `analytics.rs` lives
 //! here (ADR-0022). Those modules keep the shapes they report and the rules
 //! (one snapshot per calendar day, oldest-first trends, how sizes round).
+//!
+//! With the `engine-store` feature, a store that carries engine tables keeps
+//! `analytics_snapshots` there (`db::engine::analytics`, ADR-0023 phase 4f).
+//! The counts over memories stay on SQLite until memories move.
 
+#[cfg(feature = "engine-store")]
+use super::engine::{self, EngineTables};
 use super::{Result, Store};
 use crate::models::{AnalyticsSnapshot, DigestRecentMemory};
 use crate::stats::RecentMemory;
+#[cfg(feature = "engine-store")]
+use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -39,15 +47,32 @@ pub struct StorageInfo {
     pub schema_version: i32,
 }
 
-/// The statistics queries, over one connection.
+/// A snapshot map as its column's JSON. Serialising a map of plain values
+/// cannot fail; `{}` is the empty map if it somehow did.
+pub(crate) fn encode_json<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "{}".into())
+}
+
+/// A snapshot map from its column's JSON. A malformed value reads as empty,
+/// so one bad row does not take the whole series down.
+pub(crate) fn decode_json<T: serde::de::DeserializeOwned + Default>(json: &str) -> T {
+    serde_json::from_str(json).unwrap_or_default()
+}
+
+/// The statistics queries, over one store.
 pub struct StoreStats<'c> {
     conn: &'c Connection,
+    #[cfg(feature = "engine-store")]
+    engine: Option<&'c Mutex<EngineTables>>,
 }
 
 impl<'c> StoreStats<'c> {
     pub fn new(store: &'c Store<'_>) -> Self {
-        let conn = store.conn();
-        Self { conn }
+        Self {
+            conn: store.conn(),
+            #[cfg(feature = "engine-store")]
+            engine: store.engine(),
+        }
     }
 
     /// How many memories are not deleted.
@@ -203,6 +228,10 @@ impl<'c> StoreStats<'c> {
 
     /// The id of the snapshot captured on `date` (`YYYY-MM-DD`), if any.
     pub fn snapshot_on(&self, date: &str) -> Result<Option<i64>> {
+        #[cfg(feature = "engine-store")]
+        if let Some(engine) = self.engine {
+            return Ok(engine::analytics::snapshot_on(&engine.lock(), date));
+        }
         Ok(self
             .conn
             .query_row(
@@ -215,6 +244,10 @@ impl<'c> StoreStats<'c> {
 
     /// Store a snapshot and return its id.
     pub fn insert_snapshot(&self, snapshot: &AnalyticsSnapshot) -> Result<i64> {
+        #[cfg(feature = "engine-store")]
+        if let Some(engine) = self.engine {
+            return engine::analytics::insert(&mut engine.lock(), snapshot);
+        }
         self.conn.execute(
             "INSERT INTO analytics_snapshots
                  (captured_at, total_memories, vitality_buckets, category_counts)
@@ -222,8 +255,8 @@ impl<'c> StoreStats<'c> {
             params![
                 snapshot.captured_at,
                 snapshot.total_memories,
-                serde_json::to_string(&snapshot.vitality_buckets).unwrap_or_else(|_| "{}".into()),
-                serde_json::to_string(&snapshot.category_counts).unwrap_or_else(|_| "{}".into()),
+                encode_json(&snapshot.vitality_buckets),
+                encode_json(&snapshot.category_counts),
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -232,6 +265,10 @@ impl<'c> StoreStats<'c> {
     /// Every snapshot, oldest first. A malformed JSON column reads as an
     /// empty map, so one bad row does not take the whole series down.
     pub fn snapshots(&self) -> Result<Vec<AnalyticsSnapshot>> {
+        #[cfg(feature = "engine-store")]
+        if let Some(engine) = self.engine {
+            return Ok(engine::analytics::snapshots(&engine.lock()));
+        }
         let mut stmt = self.conn.prepare(
             "SELECT captured_at, total_memories, vitality_buckets, category_counts
                FROM analytics_snapshots
@@ -244,8 +281,8 @@ impl<'c> StoreStats<'c> {
                 Ok(AnalyticsSnapshot {
                     captured_at: r.get(0)?,
                     total_memories: r.get(1)?,
-                    vitality_buckets: serde_json::from_str(&buckets).unwrap_or_default(),
-                    category_counts: serde_json::from_str(&categories).unwrap_or_default(),
+                    vitality_buckets: decode_json(&buckets),
+                    category_counts: decode_json(&categories),
                 })
             })?
             .collect::<rusqlite::Result<_>>()
@@ -257,7 +294,7 @@ impl<'c> StoreStats<'c> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::Database;
+    use crate::db::{on_each_backend, Database};
 
     #[test]
     fn an_in_memory_database_has_no_path_but_a_size() {
@@ -269,31 +306,58 @@ mod tests {
         assert_eq!(info.schema_version, crate::db::migrations::SCHEMA_VERSION);
     }
 
-    #[test]
-    fn snapshots_round_trip_oldest_first() {
-        let db = Database::open_in_memory().unwrap();
-        let store = db.store();
-        let stats = StoreStats::new(&store);
-        let snap = |at: &str, total| AnalyticsSnapshot {
+    fn snap(at: &str, total: i64) -> AnalyticsSnapshot {
+        AnalyticsSnapshot {
             captured_at: at.to_string(),
             total_memories: total,
             vitality_buckets: BTreeMap::from([("high".to_string(), 1)]),
             category_counts: BTreeMap::from([("fact".to_string(), total)]),
-        };
-        let second = stats
-            .insert_snapshot(&snap("2026-09-25T10:00:00+00:00", 2))
-            .unwrap();
-        stats
-            .insert_snapshot(&snap("2026-09-24T10:00:00+00:00", 1))
-            .unwrap();
-        assert_eq!(stats.snapshot_on("2026-09-25").unwrap(), Some(second));
-        assert_eq!(stats.snapshot_on("2026-09-23").unwrap(), None);
-        assert_eq!(
-            stats.snapshots().unwrap(),
-            vec![
-                snap("2026-09-24T10:00:00+00:00", 1),
-                snap("2026-09-25T10:00:00+00:00", 2)
-            ]
-        );
+        }
+    }
+
+    #[test]
+    fn snapshots_round_trip_oldest_first() {
+        on_each_backend(|db| {
+            let store = db.store();
+            let stats = StoreStats::new(&store);
+            let second = stats
+                .insert_snapshot(&snap("2026-09-25T10:00:00+00:00", 2))
+                .unwrap();
+            let first = stats
+                .insert_snapshot(&snap("2026-09-24T10:00:00+00:00", 1))
+                .unwrap();
+            assert_ne!(first, second, "every snapshot gets its own id");
+            assert_eq!(stats.snapshot_on("2026-09-25").unwrap(), Some(second));
+            assert_eq!(stats.snapshot_on("2026-09-23").unwrap(), None);
+            assert_eq!(
+                stats.snapshots().unwrap(),
+                vec![
+                    snap("2026-09-24T10:00:00+00:00", 1),
+                    snap("2026-09-25T10:00:00+00:00", 2)
+                ]
+            );
+        });
+    }
+
+    /// `date(captured_at)` is the UTC day, so a capture early in the day
+    /// east of UTC belongs to the day before.
+    #[test]
+    fn a_snapshot_belongs_to_its_utc_day() {
+        on_each_backend(|db| {
+            let store = db.store();
+            let stats = StoreStats::new(&store);
+            let id = stats
+                .insert_snapshot(&snap("2026-09-27T01:00:00+05:00", 3))
+                .unwrap();
+            assert_eq!(stats.snapshot_on("2026-09-26").unwrap(), Some(id));
+            assert_eq!(stats.snapshot_on("2026-09-27").unwrap(), None);
+        });
+    }
+
+    #[test]
+    fn a_malformed_map_reads_as_empty() {
+        let buckets: BTreeMap<String, usize> = decode_json("not json");
+        assert!(buckets.is_empty());
+        assert_eq!(encode_json(&BTreeMap::<String, i64>::new()), "{}");
     }
 }

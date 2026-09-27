@@ -11,6 +11,7 @@
 //! UUID v5 of the node's string id, and the string stays on the record so a
 //! collision is refused rather than merged.
 
+pub(crate) mod analytics;
 pub(crate) mod archives;
 pub(crate) mod saved_searches;
 pub(crate) mod sync_log;
@@ -23,6 +24,7 @@ use rusty_multimodal_db_engine::generic::traits::{
     IndexedField, Record, ScannableField, SchemaTag,
 };
 use rusty_multimodal_db_engine::generic::{DeleteError, GenericMmapStore};
+use rusty_multimodal_db_engine::journal::{Batch, Journal};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::fmt;
@@ -41,6 +43,11 @@ pub const STORE_ENV: &str = "REMIND_ME_STORE";
 /// The lock file inside the data directory, held while the tables are open.
 const LOCK_FILE: &str = "node.lock";
 
+/// The redo journal inside the data directory. Today it carries only the
+/// id sequences (ADR-0023 §3c); cross-store batches (§3b) use it when the
+/// groups that write together move.
+const JOURNAL_FILE: &str = "node.journal";
+
 /// The namespace every node engine id is derived in. Pinned: changing it
 /// would orphan every record already written.
 const NODE_NAMESPACE: Uuid = Uuid::from_u128(0x7272_6d6e_6f64_4000_8000_0000_0000_0023);
@@ -55,6 +62,8 @@ pub struct EngineTables {
     pub(crate) archives: archives::ArchiveTable,
     pub(crate) spans: archives::SpanTable,
     pub(crate) sync_log: sync_log::SyncLogTable,
+    pub(crate) snapshots: analytics::SnapshotTable,
+    journal: Journal,
     _lock: DirLock,
     _temporary: Option<TemporaryDir>,
 }
@@ -68,15 +77,34 @@ impl EngineTables {
     /// it cannot be opened.
     pub fn open(dir: &Path) -> super::Result<Self> {
         let lock = DirLock::acquire(dir, LOCK_FILE).map_err(engine_error)?;
-        Ok(Self {
+        let journal = open_journal(&dir.join(JOURNAL_FILE))?;
+        let mut tables = Self {
             saved_searches: open_core(&dir.join("saved_searches.mmap"))?,
             seen: open_core(&dir.join("saved_search_seen.mmap"))?,
             archives: open_core(&dir.join("import_archives.mmap"))?,
             spans: open_core(&dir.join("import_archive_spans.mmap"))?,
             sync_log: open_core(&dir.join("sync_log.mmap"))?,
+            snapshots: open_core(&dir.join("analytics_snapshots.mmap"))?,
+            journal,
             _lock: lock,
             _temporary: None,
-        })
+        };
+        // A table written by something other than this journal (the copy
+        // tool, or an older build) must still never see an id reissued.
+        let floor = analytics::max_id(&tables.snapshots);
+        tables.journal.raise_to(analytics::SEQUENCE, floor);
+        Ok(tables)
+    }
+
+    /// The next id from the journal sequence `name`, durable before it is
+    /// returned: a crash after this leaves a gap, never a reissued id.
+    pub(crate) fn next_id(&mut self, name: &str) -> super::Result<i64> {
+        let id = self.journal.allocate(name);
+        self.journal
+            .commit(&Batch::default())
+            .map_err(engine_error)?;
+        self.journal.checkpoint().map_err(engine_error)?;
+        i64::try_from(id).map_err(|_| StoreError::Engine(format!("sequence {name} overflowed")))
     }
 
     /// Tables in a fresh directory that is removed when they are dropped:
@@ -143,16 +171,31 @@ pub(crate) fn micros(timestamp: &str) -> i64 {
         .unwrap_or(0)
 }
 
+/// Open the journal at `path`. Every batch it could hand back to replay is
+/// empty today, since no cross-store batch is written yet; one that is not
+/// was written by a newer build, and is refused rather than dropped.
+fn open_journal(path: &Path) -> super::Result<Journal> {
+    let opened = Journal::open(path).map_err(engine_error)?;
+    if opened.replay.iter().any(|batch| !batch.is_empty()) {
+        return Err(StoreError::Engine(format!(
+            "{} holds changes this build cannot apply",
+            path.display()
+        )));
+    }
+    Ok(opened.journal)
+}
+
 /// Open the engine store at `path`, or create an empty one there.
 fn open_core<R, Index, Slot>(path: &Path) -> super::Result<GenericMmapStore<R, Index, Slot>>
 where
-    R: Record<Id = Uuid>
+    R: Record
         + IndexedField<Index>
         + ScannableField<Slot>
         + Clone
         + Serialize
         + DeserializeOwned
         + SchemaTag,
+    R::Id: MmapFieldValue + Serialize + DeserializeOwned,
     R::ScanValue: MmapFieldValue,
 {
     let opened: Result<_, DurabilityError> = if path.exists() {
@@ -218,6 +261,29 @@ mod tests {
             EngineTables::open(&dir),
             Err(StoreError::Engine(_))
         ));
+    }
+
+    #[test]
+    fn a_journal_with_changes_this_build_cannot_apply_is_refused() {
+        let dir = std::env::temp_dir().join(format!(
+            "remind_me_engine_foreign_journal_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let mut journal = Journal::open(&dir.join(JOURNAL_FILE)).unwrap().journal;
+            let mut batch = Batch::default();
+            batch.put("from_a_newer_build", vec![1], vec![2]);
+            journal.commit(&batch).unwrap();
+        }
+        let refused = EngineTables::open(&dir);
+        assert!(
+            matches!(&refused, Err(StoreError::Engine(why)) if why.contains("cannot apply")),
+            "{refused:?}"
+        );
+        drop(refused);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

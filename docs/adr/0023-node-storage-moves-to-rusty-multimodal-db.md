@@ -768,6 +768,26 @@ this is a pure refactor with no change in behaviour.
   the sync tests seed states no sync cycle produces; five integration
   test files stop reading and writing `sync_log` in SQL.
 
+**4f, done: the journal's id sequences, and analytics snapshots on them.**
+
+- `EngineTables` opens the redo journal (`node.journal`) beside its
+  stores. For now it carries only the durable id sequences (§3c): no
+  cross-store batch is written yet. A journal whose replay holds changes
+  is refused at open, since only a newer build could have written one.
+- `next_id(sequence)` allocates the next value, commits it, and
+  checkpoints, all before the record that uses it is written. A crash in
+  between leaves a gap in the ids, never a reissued one. At open, each
+  sequence is raised to the highest id its table already holds, so rows
+  written by anything else (the copy tool) are never collided with.
+- `analytics_snapshots` is the first table on it. Its engine id is the
+  snapshot's integer id. The day index holds `date(captured_at)` as SQLite
+  computes it, the UTC calendar day, so `snapshot_on` agrees across
+  backends for captures made east or west of UTC. The two maps stay JSON
+  text, decoded by one shared helper.
+- `reminder_deliveries` was the other candidate. It stays on SQLite: the
+  scheduler's reminder query tests it in a `NOT EXISTS` inside a `LIMIT`ed
+  query on memories, so it moves with memories.
+
 **Next:** the remaining groups, one PR each, in order of how few other
 groups they touch. Groups that write together (a memory, its tags, its
 outbox entry) move together and commit through the journal (§3b). The copy

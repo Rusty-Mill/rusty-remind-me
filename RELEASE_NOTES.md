@@ -2,6 +2,15 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-27 — Analytics snapshots on the engine, with journal-backed ids (ADR-0023, phase 4f)
+
+### Added
+- With the `engine-store` feature, the engine tables open the redo journal (`node.journal`) and use its durable sequences for integer ids. An id is made durable before the record that uses it is written, so a crash leaves a gap rather than a reissued id. A journal holding changes this build cannot apply is refused at open.
+- Analytics snapshots live in the engine when engine tables are present. `snapshot_on` uses the UTC day of `captured_at`, as SQLite's `date()` does.
+
+### Tests
+- Snapshot storage runs on both backends, including a capture east of UTC that belongs to the previous day. Engine tests cover ids rising across a reopen and the refused journal. The analytics integration test plants its series through the repository; the malformed-value test stays on an on-disk (SQLite) database, since only SQL can plant one.
+
 ## 2026-09-27 — Sync cursors on the engine (ADR-0023, phase 4e)
 
 ### Added

@@ -2,8 +2,9 @@
 
 use remind_me_core::analytics::{capture_snapshot, trend};
 use remind_me_core::db::queries;
+use remind_me_core::db::stats::StoreStats;
 use remind_me_core::db::Store;
-use remind_me_core::{CapturedSnapshot, Database, MemoryAddInput};
+use remind_me_core::{AnalyticsSnapshot, CapturedSnapshot, Database, MemoryAddInput};
 
 fn add(store: &Store<'_>, content: &str, category: &str) {
     queries::add_memory(
@@ -76,16 +77,15 @@ fn the_series_is_oldest_first() {
     let store = db.store();
     // Plant history directly: the capture path is deliberately once-per-day,
     // so multi-day series cannot be produced by calling it in a loop.
+    let stats = StoreStats::new(&store);
     for (day, total) in [("2026-01-01", 5), ("2026-01-03", 9), ("2026-01-02", 7)] {
-        store
-            .sqlite()
-            .unwrap()
-            .execute(
-                "INSERT INTO analytics_snapshots
-                 (captured_at, total_memories, vitality_buckets, category_counts)
-             VALUES (?, ?, '{}', '{}')",
-                rusqlite::params![format!("{}T00:00:00+00:00", day), total],
-            )
+        stats
+            .insert_snapshot(&AnalyticsSnapshot {
+                captured_at: format!("{day}T00:00:00+00:00"),
+                total_memories: total,
+                vitality_buckets: Default::default(),
+                category_counts: Default::default(),
+            })
             .unwrap();
     }
 
@@ -101,7 +101,13 @@ fn the_series_is_oldest_first() {
 
 #[test]
 fn a_malformed_stored_value_does_not_take_the_chart_down() {
-    let db = Database::open_in_memory().unwrap();
+    // A malformed value can only be planted with SQL, so this runs on an
+    // on-disk database, which is always SQLite; the decoding it relies on is
+    // shared with the engine and unit-tested in `db::stats`.
+    let dir = std::env::temp_dir().join(format!("rrm_analytics_malformed_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = Database::open(dir.join("memory.db")).unwrap();
     let store = db.store();
     store
         .sqlite()
@@ -122,6 +128,9 @@ fn a_malformed_stored_value_does_not_take_the_chart_down() {
     assert_eq!(series.len(), 1);
     assert_eq!(series[0].total_memories, 5);
     assert!(series[0].vitality_buckets.is_empty());
+    drop(store);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
