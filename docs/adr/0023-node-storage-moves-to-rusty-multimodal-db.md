@@ -971,8 +971,28 @@ stats, reminders, feedback and history.
   revert with raw stored text). Each runs on both backends and requires
   identical answers.
 
-**Next:** core 2d, the stats counts, which completes core PR 2. The copy
-tool (§5) comes after the switch-on.
+**Core 2d, done: the stats counts on the core. Core PR 2 is complete.**
+
+- `StoreStats` counts memories on the core when it is present: live
+  memories, counts by category, source and tag, totals and tombstones,
+  every memory by category, the shareable digest and the recent list.
+- The chat-import count stays on SQLite until the import bookkeeping
+  moves (core PR 4). The storage figures (file, size, schema version)
+  stay on SQLite until the switch-on.
+- The digest's newest-first list now breaks `created_at` ties by id,
+  descending, as the recent list already did.
+- A differential test runs every count on both backends, with tombstones,
+  a sensitive memory, an empty category and multi-byte previews, and
+  requires identical answers.
+
+With 2a–2d, every read and write of memories outside the graph, the
+vectors and the import bookkeeping goes through a repository that serves
+it from the core.
+
+**Next:** core PR 3, the graph: entities, relations, mentions,
+associations, the sync feed, curation and promotions, plus the
+unannotated batch that joins them. The copy tool (§5) comes after the
+switch-on.
 
 ## Related
 

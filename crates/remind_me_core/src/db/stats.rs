@@ -6,8 +6,10 @@
 //! (one snapshot per calendar day, oldest-first trends, how sizes round).
 //!
 //! With the `engine-store` feature, a store that carries engine tables keeps
-//! `analytics_snapshots` there (`db::engine::analytics`, ADR-0023 phase 4f).
-//! The counts over memories stay on SQLite until memories move.
+//! `analytics_snapshots` there (`db::engine::analytics`, ADR-0023 phase 4f),
+//! and a store whose tables hold the memories core counts memories there
+//! (`db::engine::stats`, core PR 2d). The chat-import count and the storage
+//! figures stay on SQLite until their own steps.
 
 #[cfg(feature = "engine-store")]
 use super::engine::{self, EngineTables};
@@ -64,6 +66,9 @@ pub struct StoreStats<'c> {
     conn: &'c Connection,
     #[cfg(feature = "engine-store")]
     engine: Option<&'c Mutex<EngineTables>>,
+    /// The tables again when they hold the memories core.
+    #[cfg(feature = "engine-store")]
+    core: Option<&'c Mutex<EngineTables>>,
 }
 
 impl<'c> StoreStats<'c> {
@@ -72,11 +77,17 @@ impl<'c> StoreStats<'c> {
             conn: store.conn(),
             #[cfg(feature = "engine-store")]
             engine: store.engine(),
+            #[cfg(feature = "engine-store")]
+            core: store.core(),
         }
     }
 
     /// How many memories are not deleted.
     pub fn live_memories(&self) -> Result<i64> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            return engine::stats::live_memories(&core.lock());
+        }
         Ok(self.conn.query_row(
             "SELECT count(*) FROM memories WHERE deleted_at IS NULL",
             [],
@@ -93,6 +104,10 @@ impl<'c> StoreStats<'c> {
 
     /// Live memories counted by `group`.
     pub fn count_by(&self, group: GroupBy) -> Result<BTreeMap<String, i64>> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            return engine::stats::count_by(&core.lock(), group);
+        }
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {0}, count(*) FROM memories WHERE deleted_at IS NULL GROUP BY {0}",
             group.column()
@@ -107,6 +122,10 @@ impl<'c> StoreStats<'c> {
     /// Live memories counted by tag, through the `memory_tags` index every
     /// write keeps in step with each row's JSON `tags`.
     pub fn count_by_tag(&self) -> Result<BTreeMap<String, i64>> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            return engine::stats::count_by_tag(&core.lock());
+        }
         let mut stmt = self.conn.prepare(
             "SELECT mt.tag, count(*) FROM memory_tags mt
              JOIN memories m ON m.id = mt.memory_id
@@ -123,6 +142,10 @@ impl<'c> StoreStats<'c> {
     /// How many memories are stored, tombstones included, and how many of
     /// them are tombstones.
     pub fn memory_totals(&self) -> Result<(i64, i64)> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            return engine::stats::memory_totals(&core.lock());
+        }
         Ok(self.conn.query_row(
             "SELECT COUNT(*),
                     COALESCE(SUM(CASE WHEN deleted_at IS NOT NULL THEN 1 ELSE 0 END), 0)
@@ -134,6 +157,10 @@ impl<'c> StoreStats<'c> {
 
     /// How many tombstones were deleted before `cutoff`.
     pub fn tombstones_before(&self, cutoff: &str) -> Result<i64> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            return engine::stats::tombstones_before(&core.lock(), cutoff);
+        }
         Ok(self.conn.query_row(
             "SELECT COUNT(*) FROM memories WHERE deleted_at IS NOT NULL AND deleted_at < ?",
             params![cutoff],
@@ -144,6 +171,10 @@ impl<'c> StoreStats<'c> {
     /// Every stored memory, tombstones included, counted by category, with
     /// an empty category counted as `(none)`.
     pub fn all_by_category(&self) -> Result<BTreeMap<String, i64>> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            return engine::stats::all_by_category(&core.lock());
+        }
         let mut stmt = self.conn.prepare(
             "SELECT COALESCE(NULLIF(category, ''), '(none)'), COUNT(*)
                FROM memories GROUP BY 1",
@@ -156,13 +187,17 @@ impl<'c> StoreStats<'c> {
     }
 
     /// Live, non-sensitive memories created at or after `cutoff`, newest
-    /// first, at most `limit`.
+    /// first (ties by id, descending), at most `limit`.
     pub fn shareable_since(&self, cutoff: &str, limit: usize) -> Result<Vec<DigestRecentMemory>> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            return engine::stats::shareable_since(&core.lock(), cutoff, limit);
+        }
         let mut stmt = self.conn.prepare(
             "SELECT id, content, category, created_at
                FROM memories
               WHERE deleted_at IS NULL AND sensitive = 0 AND created_at >= ?
-              ORDER BY created_at DESC
+              ORDER BY created_at DESC, id DESC
               LIMIT ?",
         )?;
         let rows = stmt
@@ -182,6 +217,10 @@ impl<'c> StoreStats<'c> {
     /// How many live, non-sensitive memories were created at or after
     /// `cutoff`.
     pub fn count_shareable_since(&self, cutoff: &str) -> Result<i64> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            return engine::stats::count_shareable_since(&core.lock(), cutoff);
+        }
         Ok(self.conn.query_row(
             "SELECT COUNT(*) FROM memories
               WHERE deleted_at IS NULL AND sensitive = 0 AND created_at >= ?",
@@ -192,6 +231,10 @@ impl<'c> StoreStats<'c> {
 
     /// The `limit` newest live memories, content cut to 80 characters.
     pub fn recent(&self, limit: i64) -> Result<Vec<RecentMemory>> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            return engine::stats::recent(&core.lock(), usize::try_from(limit).unwrap_or(0));
+        }
         let mut stmt = self.conn.prepare(
             "SELECT id, category, substr(content, 1, 80), created_at
              FROM memories WHERE deleted_at IS NULL
@@ -295,6 +338,68 @@ impl<'c> StoreStats<'c> {
 mod tests {
     use super::*;
     use crate::db::{on_each_backend, Database};
+
+    /// Memories of every kind on `db`, and every count over them.
+    fn exercise(db: &Database) -> Vec<String> {
+        use crate::db::memories::{Memories, NewMemory};
+        const T1: &str = "2026-09-25T00:00:00+00:00";
+        const T2: &str = "2026-09-26T00:00:00+00:00";
+        const T3: &str = "2026-09-27T00:00:00+00:00";
+        let store = db.store();
+        let memories = Memories::new(&store);
+        for (id, category, source, tags, at, sensitive) in [
+            ("a", "fact", "manual", vec!["red", "blue"], T1, false),
+            ("b", "fact", "import", vec!["red"], T2, false),
+            ("c", "", "manual", vec![], T2, true),
+            ("d", "note", "manual", vec!["red"], T3, false),
+            ("e", "note", "import", vec!["blue"], T3, false),
+            ("f", "note", "manual", vec!["red"], T1, false),
+        ] {
+            memories
+                .insert(&NewMemory {
+                    category: category.into(),
+                    source: source.into(),
+                    tags: tags.into_iter().map(String::from).collect(),
+                    sensitive,
+                    ..NewMemory::new(id, format!("{id} {}", "é".repeat(100)), at)
+                })
+                .unwrap();
+        }
+        memories.delete_live("f", Some(T2)).unwrap();
+        memories.delete_live("e", Some(T3)).unwrap();
+        let stats = StoreStats::new(&store);
+        let recent: Vec<(String, usize)> = stats
+            .recent(3)
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.id, r.preview.chars().count()))
+            .collect();
+        vec![
+            format!("{}", stats.live_memories().unwrap()),
+            format!("{:?}", stats.count_by(GroupBy::Category).unwrap()),
+            format!("{:?}", stats.count_by(GroupBy::Source).unwrap()),
+            format!("{:?}", stats.count_by_tag().unwrap()),
+            format!("{:?}", stats.memory_totals().unwrap()),
+            format!("{}", stats.tombstones_before(T3).unwrap()),
+            format!("{:?}", stats.all_by_category().unwrap()),
+            format!("{:?}", stats.shareable_since(T2, 10).unwrap()),
+            format!("{:?}", stats.shareable_since(T1, 1).unwrap()),
+            format!("{}", stats.count_shareable_since(T2).unwrap()),
+            format!("{recent:?}"),
+        ]
+    }
+
+    #[test]
+    fn the_engine_core_counts_as_sqlite_does() {
+        let mut observed = Vec::new();
+        crate::db::on_each_core_backend(|db| observed.push(exercise(db)));
+        let sqlite = &observed[0];
+        assert_eq!(sqlite[0], "4");
+        assert_eq!(sqlite[4], "(6, 2)");
+        for other in &observed[1..] {
+            assert_eq!(other, sqlite);
+        }
+    }
 
     #[test]
     fn an_in_memory_database_has_no_path_but_a_size() {

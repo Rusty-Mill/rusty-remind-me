@@ -2,6 +2,25 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-27 — Stats counts on the engine core, built dark (ADR-0023, core PR 2d)
+
+### Added
+- `StoreStats` counts memories on the engine's memories core when it is present. This covers:
+  - live memories;
+  - counts by category, source and tag;
+  - totals and tombstones;
+  - all memories by category;
+  - the shareable digest;
+  - the recent list.
+
+  The chat-import count and the storage figures stay on SQLite.
+
+### Changed
+- Memories in the digest's newest-first list that share a creation time now come in descending id order.
+
+### Tests
+- A differential test runs every count against SQLite and the core, and requires identical answers.
+
 ## 2026-09-27 — Reminders, feedback and history on the engine core, built dark (ADR-0023, core PR 2c)
 
 ### Added

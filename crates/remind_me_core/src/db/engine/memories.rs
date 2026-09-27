@@ -283,6 +283,11 @@ impl TagIndex {
         self.0.get(tag).is_some_and(|ids| ids.contains(id))
     }
 
+    /// Every tag, with the ids of the memories carrying it.
+    pub(crate) fn entries(&self) -> impl Iterator<Item = (&String, &HashSet<String>)> {
+        self.0.iter()
+    }
+
     fn add(&mut self, row: &MemoryRow) {
         for tag in row.tag_values() {
             self.0.entry(tag).or_default().insert(row.id.clone());

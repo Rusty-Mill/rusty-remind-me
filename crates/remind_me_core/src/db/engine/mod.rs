@@ -20,6 +20,7 @@ pub(crate) mod outbox;
 pub(crate) mod reminders;
 pub(crate) mod revisions;
 pub(crate) mod saved_searches;
+pub(crate) mod stats;
 pub(crate) mod sync_log;
 pub(crate) mod wiki;
 
