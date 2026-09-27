@@ -629,7 +629,30 @@ in `rusty_multimodal_db_engine`:
   present after reopen; a batch replayed over stores that already hold it;
   outbox ids never reissued across crashes and checkpoints.
 
-**3b, next: the full-text index** (§3a), tested against FTS5.
+**3b, done: the full-text index** (§3a), `fulltext::FullTextIndex`:
+
+- `unicode61` is ported from `fts5_tokenize.c` and `fts5_unicode2.c`, with
+  its category, case-fold and diacritic tables generated from the bundled
+  `sqlite3.c` rather than re-derived from Unicode data. Deriving them from
+  Rust's own Unicode tables would drift whenever the two Unicode versions
+  differ, and a test pins the tables to the SQLite that links.
+- Documents have a fixed number of columns (a const generic, so a wrong
+  count does not compile). Queries are any of several phrases, the only
+  shape the node builds (`fts::sanitize_fts_query`), and a phrase matches
+  consecutive tokens in one column, which is how `memory_tags` matches.
+- `bm25()` is FTS5's to the formula and the order of operations: a row's
+  size is its tokens across all columns, each phrase has its own IDF and
+  frequency (a repeated phrase counts twice), and the IDF floor is `1e-6`.
+- `snippet()` is `fts5SnippetFunction` line for line: window scoring, the
+  sentence-start bonus, coalesced highlights and the ellipses.
+- `tests/fulltext_vs_fts5.rs` runs a seeded corpus (prose, mixed case,
+  underscores, accents, Greek and CJK, JSON tag arrays, edits and deletes)
+  and 600 queries through FTS5 and the index: the same rows in the same
+  order, scores within 1e-9, and identical snippets in five call shapes.
+  Mutating the BM25 `b`, the sentence heuristic, or the snippet window start
+  each fails it.
+
+Phase 3 is complete.
 
 ## Related
 

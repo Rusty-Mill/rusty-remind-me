@@ -2,6 +2,14 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-27 — Engine full-text index matching FTS5 (ADR-0023, phase 3b)
+
+### Added
+- `rusty_multimodal_db_engine::fulltext`: an in-memory full-text index that tokenizes, matches, scores and writes snippets exactly as SQLite FTS5 does for the node's queries, so its keyword search survives the move off SQLite unchanged. The `unicode61` tables are generated from the bundled SQLite (`scripts/gen_unicode61_tables.py`).
+
+### Tests
+- A differential suite runs a seeded corpus and 600 queries through FTS5 and the index: same rows, same order, scores within 1e-9, identical snippets. A test pins the tokenizer tables to the linked SQLite version.
+
 ## 2026-09-27 — Engine journal, sequences and directory lock (ADR-0023, phase 3a)
 
 ### Added
