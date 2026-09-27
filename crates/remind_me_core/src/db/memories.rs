@@ -8,10 +8,14 @@
 //! a consolidation writes, and how vitality is seeded, are decided there and
 //! handed over as a [`NewMemory`] or a field value.
 
+#[cfg(feature = "engine-store")]
+use super::engine::{self, EngineTables};
 use super::{Result, Store};
 use crate::db::derived::{memory_ids, write_memory, Origin};
 use crate::db::queries::{parse_memory_row, MEMORY_COLUMNS};
 use crate::models::Memory;
+#[cfg(feature = "engine-store")]
+use parking_lot::Mutex;
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde_json::Value;
@@ -172,23 +176,42 @@ fn insert_values(row: &NewMemory) -> Vec<SqlValue> {
 }
 
 /// `tags` as the JSON array the `tags` column holds.
-fn tags_json(tags: &[String]) -> String {
+pub(crate) fn tags_json(tags: &[String]) -> String {
     serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string())
 }
 
-/// The `memories` table, over one connection.
+/// The `memories` table, over one connection, or on the engine's memories
+/// core when the store's tables hold it (`db::engine::memories`).
 pub struct Memories<'c> {
     conn: &'c Connection,
+    #[cfg(feature = "engine-store")]
+    core: Option<&'c Mutex<EngineTables>>,
+}
+
+/// Answer from the engine's memories core when the repository has it.
+macro_rules! on_core {
+    ($self:ident, |$tables:ident| $body:expr) => {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = $self.core {
+            #[allow(unused_mut)]
+            let mut $tables = core.lock();
+            return $body;
+        }
+    };
 }
 
 impl<'c> Memories<'c> {
     pub fn new(store: &'c Store<'_>) -> Self {
-        let conn = store.conn();
-        Self { conn }
+        Self {
+            conn: store.conn(),
+            #[cfg(feature = "engine-store")]
+            core: store.core(),
+        }
     }
 
     /// Insert `row`, made on this node. An existing id is an error.
     pub fn insert(&self, row: &NewMemory) -> Result<()> {
+        on_core!(self, |tables| engine::memories::insert(&mut tables, row));
         write_memory(self.conn, &row.id, Origin::Local, || {
             Ok(self.conn.execute(
                 &format!("INSERT INTO memories ({INSERT_COLUMNS}) VALUES ({INSERT_PLACEHOLDERS})"),
@@ -201,6 +224,10 @@ impl<'c> Memories<'c> {
     /// Insert `row` unless its id is already taken. Returns whether it was
     /// inserted.
     pub fn insert_or_ignore(&self, row: &NewMemory) -> Result<bool> {
+        on_core!(self, |tables| engine::memories::insert_or_ignore(
+            &mut tables,
+            row
+        ));
         let inserted = write_memory(self.conn, &row.id, Origin::Local, || {
             Ok(self.conn.execute(
                 &format!(
@@ -218,6 +245,10 @@ impl<'c> Memories<'c> {
     /// a peer's record does not carry the last two, and the first never
     /// changes. Never queued for sync: it came from there.
     pub fn upsert_synced(&self, row: &NewMemory) -> Result<()> {
+        on_core!(self, |tables| engine::memories::upsert_synced(
+            &mut tables,
+            row
+        ));
         write_memory(self.conn, &row.id, Origin::Sync, || self.upsert_row(row))?;
         Ok(())
     }
@@ -259,6 +290,7 @@ impl<'c> Memories<'c> {
     /// The local copy of `id` as a sync merge sees it, if there is one.
     /// Unparseable `tags` read as none and unparseable `metadata` as `{}`.
     pub fn sync_view(&self, id: &str) -> Result<Option<SyncView>> {
+        on_core!(self, |tables| engine::memories::sync_view(&tables, id));
         Ok(self
             .conn
             .query_row(
@@ -282,6 +314,12 @@ impl<'c> Memories<'c> {
     /// merge that lost last-write-wins still keeps the union, and must not
     /// look like a newer local edit.
     pub fn set_tags_and_metadata(&self, id: &str, tags: &[String], metadata: &Value) -> Result<()> {
+        on_core!(self, |tables| engine::memories::set_tags_and_metadata(
+            &mut tables,
+            id,
+            tags,
+            metadata
+        ));
         write_memory(self.conn, id, Origin::Sync, || {
             Ok(self.conn.execute(
                 "UPDATE memories SET tags = ?, metadata = ? WHERE id = ?",
@@ -299,6 +337,12 @@ impl<'c> Memories<'c> {
         superseded_by: &str,
         updated_at: Option<&str>,
     ) -> Result<()> {
+        on_core!(self, |tables| engine::memories::set_superseded_by(
+            &mut tables,
+            id,
+            superseded_by,
+            updated_at
+        ));
         write_memory(self.conn, id, Origin::Local, || match updated_at {
             Some(stamp) => Ok(self.conn.execute(
                 "UPDATE memories SET superseded_by = ?, updated_at = ? WHERE id = ?",
@@ -321,6 +365,12 @@ impl<'c> Memories<'c> {
         new_import_id: &str,
         updated_at: &str,
     ) -> Result<usize> {
+        on_core!(self, |tables| engine::memories::supersede_import(
+            &mut tables,
+            old_import_id,
+            new_import_id,
+            updated_at
+        ));
         let ids = memory_ids(
             self.conn,
             "SELECT id FROM memories
@@ -338,6 +388,11 @@ impl<'c> Memories<'c> {
     /// Hard-delete every memory of `category` belonging to the capture
     /// `capture_id`. Returns how many went.
     pub fn delete_capture_category(&self, capture_id: &str, category: &str) -> Result<usize> {
+        on_core!(self, |tables| engine::memories::delete_capture_category(
+            &mut tables,
+            capture_id,
+            category
+        ));
         let ids = memory_ids(
             self.conn,
             "SELECT id FROM memories WHERE capture_id = ? AND category = ?",
@@ -363,6 +418,14 @@ impl<'c> Memories<'c> {
         tags: &[String],
         updated_at: &str,
     ) -> Result<()> {
+        on_core!(self, |tables| engine::memories::set_merged(
+            &mut tables,
+            id,
+            content,
+            access_count,
+            tags,
+            updated_at
+        ));
         write_memory(self.conn, id, Origin::Local, || {
             Ok(self.conn.execute(
                 "UPDATE memories SET content = ?, access_count = ?, tags = ?, updated_at = ? WHERE id = ?",
@@ -375,6 +438,12 @@ impl<'c> Memories<'c> {
     /// Set `id`'s vitality and status, without stamping `updated_at`: both
     /// are local scores, not edits.
     pub fn set_vitality(&self, id: &str, vitality: f64, status: &str) -> Result<()> {
+        on_core!(self, |tables| engine::memories::set_vitality(
+            &mut tables,
+            id,
+            vitality,
+            status
+        ));
         write_memory(self.conn, id, Origin::Local, || {
             Ok(self.conn.execute(
                 "UPDATE memories SET vitality = ?, status = ? WHERE id = ?",
@@ -387,6 +456,7 @@ impl<'c> Memories<'c> {
     /// The access-tracking inputs of each of `ids` that exists, in no
     /// particular order.
     pub fn access_inputs(&self, ids: &[String]) -> Result<Vec<AccessInputs>> {
+        on_core!(self, |tables| engine::memories::access_inputs(&tables, ids));
         if ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -418,6 +488,14 @@ impl<'c> Memories<'c> {
         vitality: f64,
         status: &str,
     ) -> Result<()> {
+        on_core!(self, |tables| engine::memories::record_access(
+            &mut tables,
+            id,
+            accessed_at,
+            access_count,
+            vitality,
+            status
+        ));
         // Cached: a search records an access for every result it returns.
         write_memory(self.conn, id, Origin::Local, || {
             Ok(self.conn
@@ -433,6 +511,9 @@ impl<'c> Memories<'c> {
     /// The triple of every live, unsuperseded memory other than `except_id`
     /// that has all three parts.
     pub fn live_triples_except(&self, except_id: &str) -> Result<Vec<Triple>> {
+        on_core!(self, |tables| engine::memories::live_triples_except(
+            &tables, except_id
+        ));
         let mut stmt = self.conn.prepare(
             "SELECT id, subject, predicate, object FROM memories
               WHERE id != ?
@@ -456,6 +537,9 @@ impl<'c> Memories<'c> {
     /// Live, unsuperseded memories created after `cutoff`, oldest first, at
     /// most `limit`.
     pub fn live_created_after(&self, cutoff: &str, limit: usize) -> Result<Vec<CreatedMemory>> {
+        on_core!(self, |tables| engine::memories::live_created_after(
+            &tables, cutoff, limit
+        ));
         let mut stmt = self.conn.prepare(
             "SELECT id, category, content, created_at FROM memories
               WHERE superseded_by IS NULL AND deleted_at IS NULL AND created_at > ?
@@ -477,6 +561,9 @@ impl<'c> Memories<'c> {
 
     /// How many live, unsuperseded memories were created after `cutoff`.
     pub fn count_live_created_after(&self, cutoff: &str) -> Result<usize> {
+        on_core!(self, |tables| engine::memories::count_live_created_after(
+            &tables, cutoff
+        ));
         let count: i64 = self.conn.query_row(
             "SELECT count(*) FROM memories
               WHERE superseded_by IS NULL AND deleted_at IS NULL AND created_at > ?",
@@ -488,6 +575,7 @@ impl<'c> Memories<'c> {
 
     /// The memories `ids` names that exist, in no particular order.
     pub fn get_many(&self, ids: &[String]) -> Result<Vec<Memory>> {
+        on_core!(self, |tables| engine::memories::get_many(&tables, ids));
         if ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -504,6 +592,7 @@ impl<'c> Memories<'c> {
 
     /// Whether `id` exists.
     pub fn exists(&self, id: &str) -> Result<bool> {
+        on_core!(self, |tables| engine::memories::exists(&tables, id));
         let found: Option<i64> = self
             .conn
             .query_row("SELECT 1 FROM memories WHERE id = ?", params![id], |r| {
@@ -516,6 +605,7 @@ impl<'c> Memories<'c> {
     /// Whether `id` is marked sensitive, or `None` when there is no such
     /// memory.
     pub fn sensitivity(&self, id: &str) -> Result<Option<bool>> {
+        on_core!(self, |tables| engine::memories::sensitivity(&tables, id));
         Ok(self
             .conn
             .query_row(
@@ -535,6 +625,12 @@ impl<'c> Memories<'c> {
         category: Option<&str>,
         tags: &[String],
     ) -> Result<Vec<Memory>> {
+        on_core!(self, |tables| engine::memories::exportable(
+            &tables,
+            include_deleted,
+            category,
+            tags
+        ));
         let mut conditions: Vec<&str> = Vec::new();
         let mut bindings: Vec<SqlValue> = Vec::new();
         if !include_deleted {
@@ -570,6 +666,7 @@ impl<'c> Memories<'c> {
 
     /// Every live memory, in no particular order.
     pub fn all_live(&self) -> Result<Vec<Memory>> {
+        on_core!(self, |tables| engine::memories::all_live(&tables));
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {MEMORY_COLUMNS} FROM memories WHERE deleted_at IS NULL"
         ))?;
@@ -583,6 +680,7 @@ impl<'c> Memories<'c> {
     /// The id, content and metadata JSON of every live, unsuperseded,
     /// non-sensitive memory that records code references.
     pub fn with_code_refs(&self) -> Result<Vec<(String, String, String)>> {
+        on_core!(self, |tables| engine::memories::with_code_refs(&tables));
         let mut stmt = self.conn.prepare(
             "SELECT id, content, metadata
                FROM memories
@@ -601,6 +699,11 @@ impl<'c> Memories<'c> {
     /// Set `metadata.ingest` to `marker` on every chunk of the import
     /// `doc_id`. Returns how many were stamped.
     pub fn set_ingest_marker(&self, doc_id: &str, marker: &str) -> Result<usize> {
+        on_core!(self, |tables| engine::memories::set_ingest_marker(
+            &mut tables,
+            doc_id,
+            marker
+        ));
         let ids = memory_ids(
             self.conn,
             "SELECT id FROM memories WHERE doc_id = ?",
@@ -621,7 +724,9 @@ impl<'c> Memories<'c> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::Database;
+    use crate::db::outbox::Outbox;
+    use crate::db::sync_state::SyncState;
+    use crate::db::{on_each_core_backend, Database};
 
     const NOW: &str = "2026-09-26T00:00:00+00:00";
 
@@ -656,61 +761,57 @@ mod tests {
         assert_eq!(written, defaulted);
     }
 
+    /// The one memory `id`, which must exist.
+    fn get(memories: &Memories<'_>, id: &str) -> Memory {
+        let mut found = memories.get_many(&[id.to_string()]).unwrap();
+        assert_eq!(found.len(), 1, "memory {id}");
+        found.remove(0)
+    }
+
     #[test]
     fn insert_refuses_a_taken_id_and_insert_or_ignore_reports_it() {
-        let db = Database::open_in_memory().unwrap();
-        let store = db.store();
-        let conn = store.conn();
-        let memories = Memories::new(&store);
-        let row = NewMemory::new("a", "first", NOW);
+        on_each_core_backend(|db| {
+            let store = db.store();
+            let memories = Memories::new(&store);
+            let row = NewMemory::new("a", "first", NOW);
 
-        assert!(memories.insert_or_ignore(&row).unwrap());
-        assert!(memories.insert(&row).is_err());
-        let second = NewMemory::new("a", "second", NOW);
-        assert!(!memories.insert_or_ignore(&second).unwrap());
-        let content: String = conn
-            .query_row("SELECT content FROM memories WHERE id = 'a'", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert_eq!(content, "first");
+            assert!(memories.insert_or_ignore(&row).unwrap());
+            assert!(memories.insert(&row).is_err());
+            let second = NewMemory::new("a", "second", NOW);
+            assert!(!memories.insert_or_ignore(&second).unwrap());
+            assert_eq!(get(&memories, "a").content, "first");
+        });
     }
 
     #[test]
     fn a_synced_overwrite_keeps_created_at_and_the_chunk_position() {
-        let db = Database::open_in_memory().unwrap();
-        let store = db.store();
-        let conn = store.conn();
-        let memories = Memories::new(&store);
-        memories
-            .insert(&NewMemory {
-                doc_id: Some("imp_1".to_string()),
-                chunk_index: Some(3),
-                ..NewMemory::new("a", "local", NOW)
-            })
-            .unwrap();
+        on_each_core_backend(|db| {
+            let store = db.store();
+            let memories = Memories::new(&store);
+            memories
+                .insert(&NewMemory {
+                    doc_id: Some("imp_1".to_string()),
+                    chunk_index: Some(3),
+                    ..NewMemory::new("a", "local", NOW)
+                })
+                .unwrap();
 
-        let later = "2026-09-27T00:00:00+00:00";
-        memories
-            .upsert_synced(&NewMemory {
-                created_at: later.to_string(),
-                tags: vec!["peer".to_string()],
-                ..NewMemory::new("a", "remote", later)
-            })
-            .unwrap();
+            let later = "2026-09-27T00:00:00+00:00";
+            memories
+                .upsert_synced(&NewMemory {
+                    created_at: later.to_string(),
+                    tags: vec!["peer".to_string()],
+                    ..NewMemory::new("a", "remote", later)
+                })
+                .unwrap();
 
-        let (content, created, doc, chunk, tags): (String, String, String, i64, String) = conn
-            .query_row(
-                "SELECT content, created_at, doc_id, chunk_index, tags FROM memories WHERE id = 'a'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-            )
-            .unwrap();
-        assert_eq!(content, "remote");
-        assert_eq!(created, NOW);
-        assert_eq!(doc, "imp_1");
-        assert_eq!(chunk, 3);
-        assert_eq!(tags, r#"["peer"]"#);
+            let a = get(&memories, "a");
+            assert_eq!(a.content, "remote");
+            assert_eq!(a.created_at, NOW);
+            assert_eq!(a.doc_id.as_deref(), Some("imp_1"));
+            assert_eq!(a.chunk_index, Some(3));
+            assert_eq!(a.tags, ["peer"]);
+        });
     }
 
     #[test]
@@ -735,23 +836,172 @@ mod tests {
 
     #[test]
     fn access_inputs_skips_unknown_ids_and_takes_an_empty_list() {
-        let db = Database::open_in_memory().unwrap();
-        let store = db.store();
-        let memories = Memories::new(&store);
-        memories.insert(&NewMemory::new("a", "x", NOW)).unwrap();
+        on_each_core_backend(|db| {
+            let store = db.store();
+            let memories = Memories::new(&store);
+            memories.insert(&NewMemory::new("a", "x", NOW)).unwrap();
 
-        assert!(memories.access_inputs(&[]).unwrap().is_empty());
-        let found = memories
-            .access_inputs(&["a".to_string(), "missing".to_string()])
+            assert!(memories.access_inputs(&[]).unwrap().is_empty());
+            let found = memories
+                .access_inputs(&["a".to_string(), "missing".to_string(), "a".to_string()])
+                .unwrap();
+            assert_eq!(
+                found,
+                vec![AccessInputs {
+                    id: "a".to_string(),
+                    access_count: 0,
+                    decay_rate: 0.1,
+                    base_weight: 1.0,
+                }]
+            );
+        });
+    }
+
+    /// Everything a backend answers after [`exercise`]'s writes, in a form
+    /// two backends can be compared in.
+    #[derive(Debug, PartialEq)]
+    struct Observed {
+        counts: Vec<usize>,
+        exported: Vec<Value>,
+        live: Vec<Value>,
+        red_live: Vec<String>,
+        code_refs: Vec<(String, String, String)>,
+        triples: Vec<Triple>,
+        created: Vec<CreatedMemory>,
+        created_count: usize,
+        sensitivity: Vec<Option<bool>>,
+        views: Vec<Option<SyncView>>,
+        outbox: Vec<(String, Value)>,
+    }
+
+    fn as_values(mut memories: Vec<Memory>) -> Vec<Value> {
+        memories.sort_by(|a, b| a.id.cmp(&b.id));
+        memories
+            .iter()
+            .map(|m| serde_json::to_value(m).unwrap())
+            .collect()
+    }
+
+    /// Every write the repository makes, with sync on, then every read.
+    fn exercise(db: &Database) -> Observed {
+        const T2: &str = "2026-09-27T00:00:00+00:00";
+        const T3: &str = "2026-09-28T00:00:00+00:00";
+        let store = db.store();
+        SyncState::new(&store)
+            .set_flag("sync_enabled", "1")
             .unwrap();
-        assert_eq!(
-            found,
-            vec![AccessInputs {
-                id: "a".to_string(),
-                access_count: 0,
-                decay_rate: 0.1,
-                base_weight: 1.0,
-            }]
-        );
+        let m = Memories::new(&store);
+        let text = |s: &str| Some(s.to_string());
+        let mut counts = Vec::new();
+
+        m.insert(&NewMemory {
+            category: "fact".into(),
+            tags: vec!["red".into(), "blue".into()],
+            capture_id: text("cap"),
+            subject: text("sky"),
+            predicate: text("is"),
+            object: text("blue"),
+            ..NewMemory::new("a", "alpha quokka", NOW)
+        })
+        .unwrap();
+        counts.push(usize::from(
+            m.insert_or_ignore(&NewMemory {
+                tags: vec!["red".into()],
+                metadata: serde_json::json!({"code_refs": ["src/x.rs"]}),
+                ..NewMemory::new("b", "beta", T2)
+            })
+            .unwrap(),
+        ));
+        counts.push(usize::from(
+            m.insert_or_ignore(&NewMemory::new("b", "ignored", T2))
+                .unwrap(),
+        ));
+        m.upsert_synced(&NewMemory {
+            sensitive: true,
+            ..NewMemory::new("c", "gamma", T2)
+        })
+        .unwrap();
+        for (id, chunk) in [("d1", 0), ("d2", 1)] {
+            m.insert(&NewMemory {
+                metadata: serde_json::json!({"import_id": "imp1"}),
+                doc_id: text("doc1"),
+                chunk_index: Some(chunk),
+                capture_id: text("cap"),
+                category: "chunk".into(),
+                ..NewMemory::new(id, "chunk text", T2)
+            })
+            .unwrap();
+        }
+        m.set_tags_and_metadata("c", &["green".into()], &serde_json::json!({"k": "v"}))
+            .unwrap();
+        m.set_superseded_by("b", "c", None).unwrap();
+        m.set_merged("c", "gamma merged", 5, &["green".into(), "red".into()], T3)
+            .unwrap();
+        m.set_vitality("a", 0.25, "fading").unwrap();
+        m.record_access("a", T3, 3, 0.75, "active").unwrap();
+        counts.push(m.set_ingest_marker("doc1", "done").unwrap());
+        counts.push(m.supersede_import("imp1", "imp2", T3).unwrap());
+        m.upsert_synced(&NewMemory {
+            created_at: T3.into(),
+            ..NewMemory::new("a", "alpha remote", T3)
+        })
+        .unwrap();
+        m.insert(&NewMemory {
+            capture_id: text("cap"),
+            category: "chunk".into(),
+            ..NewMemory::new("e", "doomed", T3)
+        })
+        .unwrap();
+        counts.push(m.delete_capture_category("cap", "chunk").unwrap());
+
+        let ids: Vec<String> = ["a", "b", "c", "d1", "e", "missing"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut triples = m.live_triples_except("none").unwrap();
+        triples.sort_by(|a, b| a.id.cmp(&b.id));
+        let mut code_refs = m.with_code_refs().unwrap();
+        code_refs.sort();
+        let outbox = Outbox::new(&store)
+            .unsent_to("hub", 0, 100)
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.key, serde_json::from_str(&e.payload_json).unwrap()))
+            .collect();
+        Observed {
+            counts,
+            exported: m
+                .exportable(true, None, &[])
+                .unwrap()
+                .iter()
+                .map(|m| serde_json::to_value(m).unwrap())
+                .collect(),
+            live: as_values(m.all_live().unwrap()),
+            red_live: m
+                .exportable(false, None, &["red".into()])
+                .unwrap()
+                .into_iter()
+                .map(|m| m.id)
+                .collect(),
+            code_refs,
+            triples,
+            created: m.live_created_after(NOW, 10).unwrap(),
+            created_count: m.count_live_created_after(NOW).unwrap(),
+            sensitivity: ids.iter().map(|id| m.sensitivity(id).unwrap()).collect(),
+            views: ids.iter().map(|id| m.sync_view(id).unwrap()).collect(),
+            outbox,
+        }
+    }
+
+    #[test]
+    fn the_engine_core_matches_sqlite_write_for_write() {
+        let mut observed = Vec::new();
+        on_each_core_backend(|db| observed.push(exercise(db)));
+        let sqlite = &observed[0];
+        assert_eq!(sqlite.counts, [1, 0, 2, 2, 3]);
+        assert!(!sqlite.outbox.is_empty());
+        for other in &observed[1..] {
+            assert_eq!(other, sqlite);
+        }
     }
 }

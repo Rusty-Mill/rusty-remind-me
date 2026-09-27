@@ -96,6 +96,13 @@ impl<'a> Store<'a> {
         self.engine.as_deref()
     }
 
+    /// The engine tables, when they hold the memories core: for the core's
+    /// repositories, which stay on SQLite otherwise.
+    #[cfg(feature = "engine-store")]
+    pub(crate) fn core(&self) -> Option<&Mutex<EngineTables>> {
+        self.engine().filter(|tables| tables.lock().core.is_some())
+    }
+
     /// The SQLite connection underneath, for code that must speak SQL: the
     /// schema and its migrations, and tests that inspect rows directly.
     /// `None` once a store is backed by something else.

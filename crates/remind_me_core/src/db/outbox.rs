@@ -7,7 +7,11 @@
 //! when sync is enabled, the retention window, batch size, and how a payload
 //! decodes.
 
+#[cfg(feature = "engine-store")]
+use super::engine::{self, EngineTables};
 use super::{Result, Store};
+#[cfg(feature = "engine-store")]
+use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 
 /// SQLite's clock as an RFC 3339 timestamp with microseconds, the shape
@@ -24,15 +28,21 @@ pub struct OutboxEntry {
     pub payload_json: String,
 }
 
-/// The outbox, over one connection.
+/// The outbox, over one connection, or on the engine's memories core when
+/// the store's tables hold it (`db::engine::outbox`).
 pub struct Outbox<'c> {
     conn: &'c Connection,
+    #[cfg(feature = "engine-store")]
+    core: Option<&'c Mutex<EngineTables>>,
 }
 
 impl<'c> Outbox<'c> {
     pub fn new(store: &'c Store<'_>) -> Self {
-        let conn = store.conn();
-        Self { conn }
+        Self {
+            conn: store.conn(),
+            #[cfg(feature = "engine-store")]
+            core: store.core(),
+        }
     }
 
     /// Up to `limit` unsent rows above `after_id` not yet sent to
@@ -43,6 +53,10 @@ impl<'c> Outbox<'c> {
         after_id: i64,
         limit: usize,
     ) -> Result<Vec<OutboxEntry>> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            return engine::outbox::unsent_to(&core.lock(), remote_id, after_id, limit);
+        }
         let mut stmt = self.conn.prepare(
             "SELECT id, memory_id, payload FROM sync_outbox
               WHERE id > ?1 AND sent_at = ''
@@ -65,6 +79,10 @@ impl<'c> Outbox<'c> {
     /// How many rows have no send recorded to `remote_id`, and the oldest
     /// one's `created_at`.
     pub fn pending_for(&self, remote_id: &str) -> Result<(i64, Option<String>)> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            return engine::outbox::pending_for(&core.lock(), remote_id);
+        }
         Ok(self.conn.query_row(
             "SELECT COUNT(*), MIN(created_at) FROM sync_outbox o
               WHERE NOT EXISTS (
@@ -78,6 +96,10 @@ impl<'c> Outbox<'c> {
 
     /// How many rows the outbox holds.
     pub fn len(&self) -> Result<i64> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            return engine::outbox::len(&core.lock());
+        }
         Ok(self
             .conn
             .query_row("SELECT COUNT(*) FROM sync_outbox", [], |r| r.get(0))?)
@@ -85,6 +107,10 @@ impl<'c> Outbox<'c> {
 
     /// How many rows are not yet marked sent.
     pub fn unsent_count(&self) -> Result<i64> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            return engine::outbox::unsent_count(&core.lock());
+        }
         Ok(self.conn.query_row(
             "SELECT COUNT(*) FROM sync_outbox WHERE sent_at = ''",
             [],
@@ -94,6 +120,10 @@ impl<'c> Outbox<'c> {
 
     /// Whether the outbox is empty.
     pub fn is_empty(&self) -> Result<bool> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            return Ok(engine::outbox::len(&core.lock())? == 0);
+        }
         let any: Option<i64> = self
             .conn
             .query_row("SELECT 1 FROM sync_outbox LIMIT 1", [], |r| r.get(0))
@@ -104,6 +134,10 @@ impl<'c> Outbox<'c> {
     /// Delete every sent row and every row created before `cutoff`, then
     /// the send markers left pointing at nothing. Returns how many rows went.
     pub fn prune(&self, cutoff: &str) -> Result<usize> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            return engine::outbox::prune(&mut core.lock(), cutoff);
+        }
         let removed = self.conn.execute(
             "DELETE FROM sync_outbox WHERE sent_at != '' OR created_at < ?",
             params![cutoff],
@@ -117,6 +151,10 @@ impl<'c> Outbox<'c> {
 
     /// Empty the outbox and its send markers.
     pub fn clear(&self) -> Result<()> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            return engine::outbox::clear(&mut core.lock());
+        }
         Ok(self
             .conn
             .execute_batch("DELETE FROM sync_outbox; DELETE FROM sync_sends;")?)
@@ -126,6 +164,13 @@ impl<'c> Outbox<'c> {
     /// with SQLite's clock: what a node that just turned sync on owes its
     /// remotes. Payloads have the shape `db::derived` queues.
     pub fn backfill_everything(&self) -> Result<()> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            return {
+                let graph = self.graph_backfill()?;
+                engine::outbox::backfill(&mut core.lock(), graph)
+            };
+        }
         Ok(self.conn.execute_batch(&format!(
             "INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
              SELECT id, 'insert', json_object(
@@ -158,6 +203,31 @@ impl<'c> Outbox<'c> {
              FROM memory_entities;",
             now = NOW_ISO_EXPR
         ))?)
+    }
+
+    /// The backfill's entity and mention-link entries, key and payload, in
+    /// the order SQLite would queue them: the graph stays on SQLite until
+    /// its own core PR, while the outbox it is queued into is on the engine.
+    #[cfg(feature = "engine-store")]
+    fn graph_backfill(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, json_object(
+                 'record_type', 'entity', 'id', id, 'name', name, 'kind', kind,
+                 'aliases', aliases, 'created_at', created_at, 'updated_at', updated_at,
+                 'node_id', node_id)
+               FROM entities
+             UNION ALL
+             SELECT memory_id, json_object(
+                 'record_type', 'memory_entity',
+                 'id', memory_id || '|' || entity_id,
+                 'memory_id', memory_id, 'entity_id', entity_id, 'created_at', created_at)
+               FROM memory_entities",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
+        rows
     }
 }
 
@@ -196,6 +266,78 @@ mod tests {
         assert_eq!(outbox.pending_for("peer").unwrap().0, 2);
         assert_eq!(outbox.unsent_to("hub", 0, 10).unwrap().len(), 1);
         assert_eq!(outbox.len().unwrap(), 2);
+    }
+
+    #[test]
+    fn the_outbox_sends_and_backfill_agree_on_each_backend() {
+        use crate::db::entities::Entities;
+        use crate::db::memories::{Memories, NewMemory};
+        use crate::db::sync_state::SyncState;
+        use crate::entity::Entity;
+        const NOW: &str = "2026-09-26T00:00:00+00:00";
+
+        crate::db::on_each_core_backend(|db| {
+            let store = db.store();
+            let state = SyncState::new(&store);
+            let outbox = Outbox::new(&store);
+            let memories = Memories::new(&store);
+            memories.insert(&NewMemory::new("off", "x", NOW)).unwrap();
+            assert!(
+                outbox.is_empty().unwrap(),
+                "nothing is queued while sync is off"
+            );
+
+            state.set_flag("sync_enabled", "1").unwrap();
+            assert_eq!(state.flag("sync_enabled").unwrap().as_deref(), Some("1"));
+            memories.insert(&NewMemory::new("a", "x", NOW)).unwrap();
+            memories.insert(&NewMemory::new("b", "y", NOW)).unwrap();
+            let queued = outbox.unsent_to("hub", 0, 10).unwrap();
+            let keys: Vec<&str> = queued.iter().map(|e| e.key.as_str()).collect();
+            assert_eq!(keys, ["a", "b"]);
+
+            state.record_sends("hub", &[queued[0].id], "t1").unwrap();
+            assert_eq!(outbox.pending_for("hub").unwrap().0, 1);
+            assert_eq!(outbox.pending_for("peer").unwrap().0, 2);
+            assert_eq!(outbox.unsent_to("hub", 0, 10).unwrap().len(), 1);
+            assert!(outbox
+                .unsent_to("peer", queued[1].id, 10)
+                .unwrap()
+                .is_empty());
+            assert_eq!(outbox.unsent_count().unwrap(), 2);
+
+            // The graph stays on SQLite, but queues into the same outbox.
+            Entities::new(&store)
+                .insert(
+                    &Entity {
+                        id: "ent_1".into(),
+                        name: "Quokka".into(),
+                        kind: None,
+                        aliases: Vec::new(),
+                        created_at: NOW.into(),
+                        updated_at: NOW.into(),
+                    },
+                    None,
+                )
+                .unwrap();
+            assert_eq!(outbox.len().unwrap(), 3);
+
+            outbox.clear().unwrap();
+            assert!(outbox.is_empty().unwrap());
+            assert_eq!(outbox.pending_for("hub").unwrap(), (0, None));
+
+            outbox.backfill_everything().unwrap();
+            // Memories in scan order, which neither backend promises.
+            let mut keys: Vec<String> = outbox
+                .unsent_to("hub", 0, 10)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.key)
+                .collect();
+            keys.sort();
+            assert_eq!(keys, ["a", "b", "ent_1", "off"]);
+            assert_eq!(outbox.prune("9999").unwrap(), 4);
+            assert!(outbox.is_empty().unwrap());
+        });
     }
 
     #[test]

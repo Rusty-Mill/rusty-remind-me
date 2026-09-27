@@ -827,10 +827,71 @@ this is a pure refactor with no change in behaviour.
   alongside `memories`, so the rest of phase 4 is memories and what
   joins them, planned before it starts.
 
-**Next:** the remaining groups, one PR each, in order of how few other
-groups they touch. Groups that write together (a memory, its tags, its
-outbox entry) move together and commit through the journal (§3b). The copy
-tool (§5) comes last.
+**The memories core: built dark, then switched on.** Memories and every
+group that joins them move in five PRs. The first four build the core on
+the engine behind a gate that only the core's own tests open, so nothing
+changes for a running node or for the engine CI leg until the fifth
+switches it on:
+
+1. memory writes, with tags, full-text, the outbox, `sync_flags` and
+   `sync_sends`, as the first real journal batches;
+2. reads: search, list and get (with an FTS5 differential test), stats
+   counts, `reminders` and `reminder_deliveries`, feedback;
+3. the graph: entities, relations, mentions, associations, the sync feed,
+   curation, promotions;
+4. vectors and the import bookkeeping, with the importers' transactions
+   as journal batches;
+5. switch-on.
+
+**Core 1, done: memory writes on the engine, built dark.**
+
+- `EngineTables` gains an optional memories core (`db::engine::core`):
+  `memories`, `sync_outbox`, `sync_sends` and `sync_flags`, plus the
+  full-text index over (content, category, tags) and the tag index, both
+  derived from the rows at open like the wiki's and never stored. Only
+  `EngineTables::open_with_core` opens it, and only tests call that, so
+  `Store::core()` is `None` everywhere else and those repositories stay on
+  SQLite.
+- A row keeps every column as SQLite stores it: tags and metadata stay
+  JSON text, nullable columns stay optional. The tag index holds exactly
+  what `json_each(tags)` yields as text, including an object's values and
+  a lone string.
+- Every memory write is a closure from the stored row to keep, put or
+  delete (`engine::memories::write`), mirroring `derived::write_memory`:
+  the memory and the outbox entry recording it (an `insert` for a new
+  local row, an `update` when a local write moves `updated_at`, only
+  while `sync_enabled` is `'1'`) go into one journal batch (§3b). The
+  payload has the trigger shape's 28 keys, and a test compares it with
+  `json_object`'s as JSON.
+- `EngineTables::commit` makes the batch durable, applies it (a put
+  inserts or replaces, a delete of a missing record is a no-op, so a
+  replay is idempotent), keeps the derived indexes in step, and
+  checkpoints. If applying fails after the batch is durable, the tables
+  refuse every later write until reopened, since a checkpoint would drop
+  the unapplied batch; the reopen replays it. The journal now replays core
+  batches at open instead of refusing every non-empty batch. It still
+  refuses a store it does not know, and tables opened without the core
+  refuse any core batch.
+- Outbox ids come from the journal's `sync_outbox` sequence, allocated
+  into the same batch as their entry, and are raised at open to the
+  highest id stored. Prune, clear, backfill and a batch of sends are each
+  one batch.
+- `Memories`, `Outbox` and `SyncState`'s flags and sends dispatch to the
+  core. The graph's rows stay on SQLite, but `queue_entity`,
+  `queue_relation` and `queue_link` select their payload from SQLite and
+  queue it into the engine's outbox (`derived::GraphOutbox`), and the
+  backfill does the same for entities and links.
+- Not yet on the core: the memory writes made by raw SQL inside
+  `queries.rs`, `feedback.rs`, `history.rs`, `reminders.rs` and the
+  migrations. Each sits in a function that also reads memories in SQL,
+  so it moves with those reads in core PR 2.
+- A differential test runs every write `Memories` makes, with sync on, on
+  both backends. It requires the same rows, reads, counts and outbox
+  payloads. Where SQLite leaves an order unspecified (scan order, ties),
+  the engine sorts by `created_at`, then id.
+
+**Next:** core PR 2, the reads. The copy tool (§5) comes after the
+switch-on.
 
 ## Related
 

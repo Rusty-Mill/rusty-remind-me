@@ -7,7 +7,7 @@
 //! traversal walks, and how sync resolves a conflict.
 
 use super::{Result, Store};
-use crate::db::derived::{queue_entity, queue_link, queue_relation, Origin};
+use crate::db::derived::{queue_entity, queue_link, queue_relation, GraphOutbox, Origin};
 use crate::entity::{Entity, EntityFact, EntityLinkedMemory, EntityListItem, RelationEdge};
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
@@ -64,12 +64,16 @@ pub struct StoredRelation {
 /// The knowledge-graph tables, over one connection.
 pub struct Entities<'c> {
     conn: &'c Connection,
+    /// Where writes queue their outbox entries.
+    outbox: GraphOutbox<'c>,
 }
 
 impl<'c> Entities<'c> {
     pub fn new(store: &'c Store<'_>) -> Self {
-        let conn = store.conn();
-        Self { conn }
+        Self {
+            conn: store.conn(),
+            outbox: GraphOutbox::new(store),
+        }
     }
 
     // --- entities --------------------------------------------------------
@@ -136,7 +140,7 @@ impl<'c> Entities<'c> {
                 node_id,
             ],
         )?;
-        queue_entity(self.conn, &entity.id, "insert")
+        queue_entity(self.outbox, &entity.id, "insert")
     }
 
     /// Set `id`'s kind and aliases, stamping `updated_at`.
@@ -151,7 +155,7 @@ impl<'c> Entities<'c> {
             "UPDATE entities SET kind = ?, aliases = ?, updated_at = ? WHERE id = ?",
             params![kind, aliases_json(aliases), updated_at, id],
         )?;
-        queue_entity(self.conn, id, "update")
+        queue_entity(self.outbox, id, "update")
     }
 
     /// How many entities there are.
@@ -199,7 +203,7 @@ impl<'c> Entities<'c> {
     pub fn rename(&self, from: &str, to: &str) -> Result<()> {
         self.conn
             .execute("UPDATE entities SET id = ? WHERE id = ?", params![to, from])?;
-        queue_entity(self.conn, to, "update")
+        queue_entity(self.outbox, to, "update")
     }
 
     /// Set `id`'s kind, aliases and `created_at`, without stamping
@@ -215,7 +219,7 @@ impl<'c> Entities<'c> {
             "UPDATE entities SET kind = ?, aliases = ?, created_at = ? WHERE id = ?",
             params![kind, aliases_json(aliases), created_at, id],
         )?;
-        queue_entity(self.conn, id, "update")
+        queue_entity(self.outbox, id, "update")
     }
 
     /// Delete the entity `id`. Its links and relations are not touched.
@@ -282,7 +286,7 @@ impl<'c> Entities<'c> {
             params![memory_id, entity_id, created_at],
         )? > 0;
         if inserted && origin == Origin::Local {
-            queue_link(self.conn, memory_id, entity_id)?;
+            queue_link(self.outbox, memory_id, entity_id)?;
         }
         Ok(inserted)
     }
@@ -400,7 +404,7 @@ impl<'c> Entities<'c> {
             ],
         )? > 0;
         if inserted && origin == Origin::Local {
-            queue_relation(self.conn, row.id)?;
+            queue_relation(self.outbox, row.id)?;
         }
         Ok(inserted)
     }

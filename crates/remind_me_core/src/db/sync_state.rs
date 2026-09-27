@@ -11,8 +11,8 @@
 //!
 //! With the `engine-store` feature, a store that carries engine tables keeps
 //! `sync_log` there (`db::engine::sync_log`, ADR-0023 phase 4e). `sync_flags`
-//! and `sync_sends` stay on SQLite until the groups that read them in SQL
-//! (`db::derived`'s outbox gate, `db::outbox`) move.
+//! and `sync_sends` move with the outbox, when the tables hold the memories
+//! core (`db::engine::outbox`).
 
 #[cfg(feature = "engine-store")]
 use super::engine::{self, EngineTables};
@@ -68,6 +68,10 @@ pub struct SyncState<'c> {
     conn: &'c Connection,
     #[cfg(feature = "engine-store")]
     engine: Option<&'c Mutex<EngineTables>>,
+    /// The tables again when they hold the memories core, which keeps
+    /// `sync_flags` and `sync_sends`.
+    #[cfg(feature = "engine-store")]
+    core: Option<&'c Mutex<EngineTables>>,
 }
 
 impl<'c> SyncState<'c> {
@@ -76,6 +80,8 @@ impl<'c> SyncState<'c> {
             conn: store.conn(),
             #[cfg(feature = "engine-store")]
             engine: store.engine(),
+            #[cfg(feature = "engine-store")]
+            core: store.core(),
         }
     }
 
@@ -306,6 +312,10 @@ impl<'c> SyncState<'c> {
 
     /// The `sync_flags` value under `key`, if set.
     pub fn flag(&self, key: &str) -> Result<Option<String>> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            return engine::core_ref(&core.lock()).map(|core| engine::outbox::flag(core, key));
+        }
         Ok(self
             .conn
             .query_row(
@@ -318,6 +328,10 @@ impl<'c> SyncState<'c> {
 
     /// Set the `sync_flags` value under `key`.
     pub fn set_flag(&self, key: &str, value: &str) -> Result<()> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            return engine::outbox::set_flag(&mut core.lock(), key, value);
+        }
         self.conn.execute(
             "INSERT INTO sync_flags (key, value) VALUES (?, ?)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -329,6 +343,10 @@ impl<'c> SyncState<'c> {
     /// Record that `outbox_ids` were sent to `remote_id` at `at`. Sending one
     /// again replaces its earlier record.
     pub fn record_sends(&self, remote_id: &str, outbox_ids: &[i64], at: &str) -> Result<()> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            return engine::outbox::record_sends(&mut core.lock(), remote_id, outbox_ids, at);
+        }
         for id in outbox_ids {
             self.conn.execute(
                 "INSERT OR REPLACE INTO sync_sends (remote_id, outbox_id, sent_at) VALUES (?, ?, ?)",
@@ -425,13 +443,38 @@ mod tests {
     }
 
     #[test]
+    fn flags_overwrite_on_each_backend() {
+        crate::db::on_each_core_backend(|db| {
+            let store = db.store();
+            let state = SyncState::new(&store);
+            assert_eq!(state.flag("k").unwrap(), None);
+            state.set_flag("k", "1").unwrap();
+            state.set_flag("k", "2").unwrap();
+            assert_eq!(state.flag("k").unwrap().as_deref(), Some("2"));
+        });
+    }
+
+    #[cfg(feature = "engine-store")]
+    #[test]
+    fn sends_replace_on_the_engine() {
+        let db = Database::open_in_memory_with_core().unwrap();
+        let store = db.store();
+        let state = SyncState::new(&store);
+        state.record_sends("hub", &[1, 2], "t1").unwrap();
+        state.record_sends("hub", &[2], "t2").unwrap();
+        let tables = store.engine().unwrap().lock();
+        assert_eq!(
+            engine::outbox::sent(&tables),
+            vec![(1, "t1".to_string()), (2, "t2".to_string())]
+        );
+    }
+
+    #[test]
     fn flags_overwrite_and_sends_replace() {
         let db = Database::open_in_memory().unwrap();
         let store = db.store();
         let conn = store.conn();
         let state = SyncState::new(&store);
-        assert_eq!(state.flag("k").unwrap(), None);
-        state.set_flag("k", "1").unwrap();
         state.set_flag("k", "2").unwrap();
         assert_eq!(state.flag("k").unwrap().as_deref(), Some("2"));
 

@@ -13,6 +13,9 @@
 
 pub(crate) mod analytics;
 pub(crate) mod archives;
+pub(crate) mod core;
+pub(crate) mod memories;
+pub(crate) mod outbox;
 pub(crate) mod revisions;
 pub(crate) mod saved_searches;
 pub(crate) mod sync_log;
@@ -45,9 +48,8 @@ pub const STORE_ENV: &str = "REMIND_ME_STORE";
 /// The lock file inside the data directory, held while the tables are open.
 const LOCK_FILE: &str = "node.lock";
 
-/// The redo journal inside the data directory. Today it carries only the
-/// id sequences (ADR-0023 §3c); cross-store batches (§3b) use it when the
-/// groups that write together move.
+/// The redo journal inside the data directory: the id sequences (ADR-0023
+/// §3c), and the memories core's cross-store batches (§3b).
 const JOURNAL_FILE: &str = "node.journal";
 
 /// The namespace every node engine id is derived in. Pinned: changing it
@@ -72,7 +74,13 @@ pub struct EngineTables {
     /// Derived from `wiki_pages` at open, and kept in step by every page
     /// write; never stored.
     pub(crate) wiki_search: wiki::PageSearch,
+    /// The memories core, when these tables were opened with it: built dark
+    /// until the switch-on PR (see [`core`]).
+    pub(crate) core: Option<core::CoreTables>,
     journal: Journal,
+    /// Set when a batch was durable but did not reach every store: the
+    /// tables then refuse writes until reopened, which applies it again.
+    failed: bool,
     _lock: DirLock,
     _temporary: Option<TemporaryDir>,
 }
@@ -85,8 +93,24 @@ impl EngineTables {
     /// [`StoreError::Engine`] if another process holds `dir`, or a store in
     /// it cannot be opened.
     pub fn open(dir: &Path) -> super::Result<Self> {
+        Self::open_with(dir, false)
+    }
+
+    /// Open the tables in `dir` with the memories core. Only the core's own
+    /// tests open it until the switch-on PR.
+    #[cfg(test)]
+    pub(crate) fn open_with_core(dir: &Path) -> super::Result<Self> {
+        Self::open_with(dir, true)
+    }
+
+    fn open_with(dir: &Path, with_core: bool) -> super::Result<Self> {
         let lock = DirLock::acquire(dir, LOCK_FILE).map_err(engine_error)?;
-        let journal = open_journal(&dir.join(JOURNAL_FILE))?;
+        let opened = Journal::open(&dir.join(JOURNAL_FILE)).map_err(engine_error)?;
+        let core = if with_core {
+            Some(core::CoreTables::open(dir)?)
+        } else {
+            None
+        };
         let mut tables = Self {
             saved_searches: open_core(&dir.join("saved_searches.mmap"))?,
             seen: open_core(&dir.join("saved_search_seen.mmap"))?,
@@ -99,16 +123,23 @@ impl EngineTables {
             wiki_links: open_core(&dir.join("wiki_links.mmap"))?,
             wiki_meta: open_core(&dir.join("wiki_meta.mmap"))?,
             wiki_search: wiki::PageSearch::new(),
-            journal,
+            core,
+            journal: opened.journal,
+            failed: false,
             _lock: lock,
             _temporary: None,
         };
+        tables.replay(opened.replay)?;
         // A table written by something other than this journal (the copy
         // tool, or an older build) must still never see an id reissued.
         let floor = analytics::max_id(&tables.snapshots);
         tables.journal.raise_to(analytics::SEQUENCE, floor);
         let floor = revisions::max_id(&tables.revisions);
         tables.journal.raise_to(revisions::SEQUENCE, floor);
+        if let Some(core) = &tables.core {
+            let floor = outbox::max_id(&core.outbox);
+            tables.journal.raise_to(outbox::SEQUENCE, floor);
+        }
         tables.wiki_search = wiki::index_pages(&tables.wiki_pages);
         Ok(tables)
     }
@@ -116,12 +147,30 @@ impl EngineTables {
     /// The next id from the journal sequence `name`, durable before it is
     /// returned: a crash after this leaves a gap, never a reissued id.
     pub(crate) fn next_id(&mut self, name: &str) -> super::Result<i64> {
-        let id = self.journal.allocate(name);
+        self.ensure_writable()?;
+        let id = self.allocate(name)?;
         self.journal
             .commit(&Batch::default())
             .map_err(engine_error)?;
         self.journal.checkpoint().map_err(engine_error)?;
+        Ok(id)
+    }
+
+    /// The next id from the journal sequence `name`, durable with the next
+    /// commit: for a record committed in the same batch.
+    pub(crate) fn allocate(&mut self, name: &str) -> super::Result<i64> {
+        let id = self.journal.allocate(name);
         i64::try_from(id).map_err(|_| StoreError::Engine(format!("sequence {name} overflowed")))
+    }
+
+    /// Refuse writes after a batch failed part-way (see `failed`).
+    fn ensure_writable(&self) -> super::Result<()> {
+        if self.failed {
+            return Err(StoreError::Engine(
+                "a write failed part-way; reopen the tables to recover it".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Tables in a fresh directory that is removed when they are dropped:
@@ -132,12 +181,32 @@ impl EngineTables {
         tables._temporary = Some(dir);
         Ok(tables)
     }
+
+    /// [`Self::open_temporary`], with the memories core.
+    #[cfg(test)]
+    pub(crate) fn open_temporary_with_core() -> super::Result<Self> {
+        let dir = TemporaryDir::fresh();
+        let mut tables = Self::open_with_core(&dir.0)?;
+        tables._temporary = Some(dir);
+        Ok(tables)
+    }
 }
 
 impl fmt::Debug for EngineTables {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EngineTables").finish_non_exhaustive()
     }
+}
+
+/// The memories core of `tables`, or an error when they were opened
+/// without it.
+pub(crate) fn core_ref(tables: &EngineTables) -> super::Result<&core::CoreTables> {
+    tables.core.as_ref().ok_or_else(core::no_core)
+}
+
+/// [`core_ref`], for a write.
+pub(crate) fn core_mut(tables: &mut EngineTables) -> super::Result<&mut core::CoreTables> {
+    tables.core.as_mut().ok_or_else(core::no_core)
 }
 
 /// Whether `REMIND_ME_STORE` asks for the engine.
@@ -186,20 +255,6 @@ pub(crate) fn micros(timestamp: &str) -> i64 {
     chrono::DateTime::parse_from_rfc3339(timestamp)
         .map(|t| t.timestamp_micros())
         .unwrap_or(0)
-}
-
-/// Open the journal at `path`. Every batch it could hand back to replay is
-/// empty today, since no cross-store batch is written yet; one that is not
-/// was written by a newer build, and is refused rather than dropped.
-fn open_journal(path: &Path) -> super::Result<Journal> {
-    let opened = Journal::open(path).map_err(engine_error)?;
-    if opened.replay.iter().any(|batch| !batch.is_empty()) {
-        return Err(StoreError::Engine(format!(
-            "{} holds changes this build cannot apply",
-            path.display()
-        )));
-    }
-    Ok(opened.journal)
 }
 
 /// Open the engine store at `path`, or create an empty one there.
@@ -254,17 +309,33 @@ impl Drop for TemporaryDir {
 /// lock reads as held, and fail at once on anything else.
 #[cfg(test)]
 pub(crate) fn reopen(dir: &Path) -> EngineTables {
+    retry_while_locked(|| EngineTables::open(dir))
+        .unwrap_or_else(|e| panic!("reopening {}: {e}", dir.display()))
+}
+
+/// [`reopen`], with the memories core.
+#[cfg(test)]
+pub(crate) fn reopen_core(dir: &Path) -> EngineTables {
+    retry_while_locked(|| EngineTables::open_with_core(dir))
+        .unwrap_or_else(|e| panic!("reopening {}: {e}", dir.display()))
+}
+
+/// Run `open` until it stops failing on a held lock, for up to five
+/// seconds (see [`reopen`]), and return what it last returned.
+#[cfg(test)]
+pub(crate) fn retry_while_locked(
+    open: impl Fn() -> super::Result<EngineTables>,
+) -> super::Result<EngineTables> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        match EngineTables::open(dir) {
-            Ok(tables) => return tables,
+        match open() {
             Err(StoreError::Engine(why))
                 if why.contains("in use by another process")
                     && std::time::Instant::now() < deadline =>
             {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            Err(e) => panic!("reopening {}: {e}", dir.display()),
+            opened => return opened,
         }
     }
 }

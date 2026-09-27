@@ -1,7 +1,7 @@
 //! `sync_log` on the engine (ADR-0023, phase 4e): each remote's pull
 //! cursors and liveness stamps. [`crate::db::sync_state`] calls these when
-//! its store carries engine tables; `sync_flags` and `sync_sends` stay on
-//! SQLite until the groups that read them in SQL move.
+//! its store carries engine tables; `sync_flags` and `sync_sends` move with
+//! the outbox, in the memories core (`db::engine::outbox`).
 //!
 //! Every write is a read-modify-write of the remote's whole row, which is
 //! what the SQL's `INSERT … ON CONFLICT DO UPDATE` does column by column. A

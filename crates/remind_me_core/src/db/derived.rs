@@ -13,8 +13,12 @@
 //! exactly what it read before: tags and metadata as JSON strings, and
 //! `sensitive` as 0 or 1.
 
+#[cfg(feature = "engine-store")]
+use super::engine::{self, EngineTables};
 use super::{Result, Store};
-use rusqlite::{params, Connection, OptionalExtension};
+#[cfg(feature = "engine-store")]
+use parking_lot::Mutex;
+use rusqlite::{params, Connection, OptionalExtension, ToSql};
 
 /// Where a write came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,56 +177,93 @@ pub(crate) fn memory_ids(
 
 // --- the knowledge graph --------------------------------------------------
 
+/// Where the graph's outbox entries go: SQLite's `sync_outbox`, or the
+/// engine's when the store's tables hold the memories core. The graph's own
+/// rows stay on SQLite either way until they move.
+#[derive(Clone, Copy)]
+pub(crate) struct GraphOutbox<'c> {
+    conn: &'c Connection,
+    #[cfg(feature = "engine-store")]
+    core: Option<&'c Mutex<EngineTables>>,
+}
+
+impl<'c> GraphOutbox<'c> {
+    pub(crate) fn new(store: &'c Store<'_>) -> Self {
+        Self {
+            conn: store.conn(),
+            #[cfg(feature = "engine-store")]
+            core: store.core(),
+        }
+    }
+
+    /// Queue the row `select` picks, as its key `k` and payload `p`, under
+    /// `operation`, when sync is enabled. `select` binds `key` in order.
+    fn queue(&self, operation: &str, select: &str, key: &[&dyn ToSql]) -> Result<()> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            let row: Option<(String, String)> = self
+                .conn
+                .query_row(select, key, |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?;
+            let Some((key, payload)) = row else {
+                return Ok(());
+            };
+            return engine::outbox::queue(&mut core.lock(), &key, operation, payload);
+        }
+        let mut bindings: Vec<&dyn ToSql> = vec![&operation];
+        bindings.extend_from_slice(key);
+        self.conn.execute(
+            &format!(
+                "INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
+                 SELECT q.k, ?, q.p, {NOW_ISO} FROM ({select}) AS q WHERE {SYNC_ENABLED}"
+            ),
+            bindings.as_slice(),
+        )?;
+        Ok(())
+    }
+}
+
 /// Queue entity `id`, as stored now, for sync, when sync is enabled.
-pub(crate) fn queue_entity(conn: &Connection, id: &str, operation: &str) -> Result<()> {
-    conn.execute(
-        &format!(
-            "INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
-             SELECT e.id, ?, json_object('record_type', 'entity', 'id', e.id,
-                    'name', e.name, 'kind', e.kind, 'aliases', e.aliases,
-                    'created_at', e.created_at, 'updated_at', e.updated_at,
-                    'node_id', e.node_id), {NOW_ISO}
-               FROM entities e
-              WHERE e.id = ? AND {SYNC_ENABLED}"
-        ),
-        params![operation, id],
-    )?;
-    Ok(())
+pub(crate) fn queue_entity(outbox: GraphOutbox<'_>, id: &str, operation: &str) -> Result<()> {
+    outbox.queue(
+        operation,
+        "SELECT e.id AS k, json_object('record_type', 'entity', 'id', e.id,
+                'name', e.name, 'kind', e.kind, 'aliases', e.aliases,
+                'created_at', e.created_at, 'updated_at', e.updated_at,
+                'node_id', e.node_id) AS p
+           FROM entities e
+          WHERE e.id = ?",
+        &[&id],
+    )
 }
 
 /// Queue the new relation `id` for sync, when sync is enabled.
-pub(crate) fn queue_relation(conn: &Connection, id: &str) -> Result<()> {
-    conn.execute(
-        &format!(
-            "INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
-             SELECT r.id, 'insert', json_object('record_type', 'entity_relation',
-                    'id', r.id, 'subject_entity_id', r.subject_entity_id,
-                    'relation', r.relation, 'object_entity_id', r.object_entity_id,
-                    'created_at', r.created_at, 'updated_at', r.updated_at,
-                    'node_id', r.node_id), {NOW_ISO}
-               FROM entity_relations r
-              WHERE r.id = ? AND {SYNC_ENABLED}"
-        ),
-        params![id],
-    )?;
-    Ok(())
+pub(crate) fn queue_relation(outbox: GraphOutbox<'_>, id: &str) -> Result<()> {
+    outbox.queue(
+        "insert",
+        "SELECT r.id AS k, json_object('record_type', 'entity_relation',
+                'id', r.id, 'subject_entity_id', r.subject_entity_id,
+                'relation', r.relation, 'object_entity_id', r.object_entity_id,
+                'created_at', r.created_at, 'updated_at', r.updated_at,
+                'node_id', r.node_id) AS p
+           FROM entity_relations r
+          WHERE r.id = ?",
+        &[&id],
+    )
 }
 
 /// Queue the new mention link for sync, when sync is enabled. Keyed on the
 /// memory's id, with `memory_id|entity_id` as the wire id.
-pub(crate) fn queue_link(conn: &Connection, memory_id: &str, entity_id: &str) -> Result<()> {
-    conn.execute(
-        &format!(
-            "INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
-             SELECT l.memory_id, 'insert', json_object('record_type', 'memory_entity',
-                    'id', l.memory_id || '|' || l.entity_id, 'memory_id', l.memory_id,
-                    'entity_id', l.entity_id, 'created_at', l.created_at), {NOW_ISO}
-               FROM memory_entities l
-              WHERE l.memory_id = ? AND l.entity_id = ? AND {SYNC_ENABLED}"
-        ),
-        params![memory_id, entity_id],
-    )?;
-    Ok(())
+pub(crate) fn queue_link(outbox: GraphOutbox<'_>, memory_id: &str, entity_id: &str) -> Result<()> {
+    outbox.queue(
+        "insert",
+        "SELECT l.memory_id AS k, json_object('record_type', 'memory_entity',
+                'id', l.memory_id || '|' || l.entity_id, 'memory_id', l.memory_id,
+                'entity_id', l.entity_id, 'created_at', l.created_at) AS p
+           FROM memory_entities l
+          WHERE l.memory_id = ? AND l.entity_id = ?",
+        &[&memory_id, &entity_id],
+    )
 }
 
 // --- the wiki -------------------------------------------------------------
@@ -257,6 +298,10 @@ pub(crate) fn write_wiki_page<T>(
 /// fixture planted with raw SQL, or a repair after the indexes were lost.
 pub fn rebuild_indexes(store: &Store<'_>) -> Result<()> {
     let conn = store.conn();
+    #[cfg(feature = "engine-store")]
+    if let Some(core) = store.core() {
+        engine::memories::rebuild(&mut core.lock())?;
+    }
     Ok(conn.execute_batch(
         "INSERT INTO memories_fts(memories_fts) VALUES('rebuild');
          INSERT INTO wiki_fts(wiki_fts) VALUES('rebuild');

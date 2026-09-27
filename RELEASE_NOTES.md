@@ -2,6 +2,29 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-27 — Memory writes on the engine, built dark (ADR-0023, core PR 1)
+
+### Added
+- With the `engine-store` feature, the engine tables can hold the memories core: memories, the sync outbox, its send markers and the sync flags, plus a full-text index and a tag index rebuilt from the memories at open. Nothing opens the core yet except its own tests. A running node, and the engine CI leg, keep these tables on SQLite until the switch-on PR.
+- On the core, a memory write and the outbox entry recording it commit as one journal batch, the first cross-store batches. The journal replays an unapplied batch at the next open. After a batch fails part-way, the tables refuse further writes until reopened.
+- `Memories`, `Outbox` and `SyncState`'s flags and sends use the core when it is present. The graph's outbox entries are queued into it from the SQLite rows.
+
+### Changed
+- The engine journal now replays core batches at open instead of refusing every non-empty batch. It still refuses changes to a store it does not know, and tables opened without the core refuse core changes.
+
+### Tests
+- A differential test runs every `Memories` write with sync on, against SQLite and the core. It requires identical rows, reads, counts and outbox payloads. The memories, outbox and sync-flag repository tests also run on both.
+- Engine tests cover:
+  - the derived indexes through update and delete;
+  - the outbox gate;
+  - a failed edit;
+  - `json_each`'s tag semantics;
+  - `json_set`'s ingest marker;
+  - reopening, with outbox ids still rising;
+  - replaying a batch left in the journal;
+  - refusing core batches without the core.
+- Lock re-acquire races with a forked sibling test are fixed: the daemon endpoint lock, the hub copy reopen, and the engine reopen tests now retry while the lock reads as held.
+
 ## 2026-09-27 — The wiki on the engine (ADR-0023, phase 4h)
 
 ### Added
