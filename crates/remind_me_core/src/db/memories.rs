@@ -1263,7 +1263,7 @@ mod tests {
             .unwrap();
         }
         let mut seen = Vec::new();
-        let mut page = |filter: ListFilter, limit, offset| {
+        let page = |filter: ListFilter, limit, offset| {
             let (total, memories) = m.list_page(&filter, limit, offset).unwrap();
             let ids: Vec<String> = memories.into_iter().map(|m| m.id).collect();
             serde_json::json!([total, ids])
