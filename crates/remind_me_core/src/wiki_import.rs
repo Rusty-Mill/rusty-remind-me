@@ -35,7 +35,7 @@
 //! slugs are stable across exports, so re-importing a re-exported directory
 //! updates pages in place instead of duplicating them.
 
-use rusqlite::Connection;
+use crate::db::Store;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
@@ -227,7 +227,7 @@ fn collect_markdown(dir: &Path, recursive: bool, out: &mut Vec<PathBuf>) -> std:
 /// a database error does abort, since that means no further write will work
 /// either.
 pub fn import_wiki_dir(
-    conn: &Connection,
+    store: &Store<'_>,
     dir: &Path,
     recursive: bool,
 ) -> Result<WikiImportReport, Box<dyn Error>> {
@@ -251,7 +251,7 @@ pub fn import_wiki_dir(
             }
         };
         let page = parse_page(&path, &text);
-        write_wiki_page(conn, &page.slug, &page.title, &page.content, &page.summary)?;
+        write_wiki_page(store, &page.slug, &page.title, &page.content, &page.summary)?;
         report.imported.push(ImportedPage {
             path: path.display().to_string(),
             slug: page.slug,

@@ -654,6 +654,37 @@ in `rusty_multimodal_db_engine`:
 
 Phase 3 is complete.
 
+### Phase 4: the engine-backed store
+
+**4a, done: the seam** (`db::store`). Every caller takes `&Store<'_>`
+instead of `&rusqlite::Connection`, and every repository returns
+`db::Result<T>`, whose error is the backend-neutral `StoreError`
+(`NotFound`, `Invalid`, `Sqlite`). SQLite is still the only backend, so
+this is a pure refactor with no change in behaviour.
+
+- The handle is called `Store`, not the `NodeStore` §7 planned. The two
+  backends are a closed, temporary pair (SQLite leaves in phase 6), so
+  `Store` is an enum each repository matches on, not a trait object.
+  Adding the engine is then a variant plus a match arm per repository,
+  and nothing outside `db::` changes.
+- `Database::store()` replaces `Database::conn()`. The store holds the
+  database lock for as long as it lives, as the guard it replaces did.
+  `Store::over_sqlite(&conn)` wraps a connection opened elsewhere: a
+  worker's own connection, an importer's transaction, or a test's.
+- `Store::sqlite()` is the one way back to SQL. The schema and its
+  migrations, backup, and tests that inspect rows directly use it. It
+  returns `None` once a store is backed by something else, so a SQLite-only
+  path fails as a typed error (`BackupError::NotSqlite`), not a panic.
+- Crate-level error enums (archive, export, promotion, skeleton, vectors,
+  sync, pid, backup, and the importers) wrap `StoreError` instead of
+  `rusqlite::Error`. `StoreError::NotFound` keeps SQLite's "Query returned
+  no rows" message, which callers and tests match on.
+
+**Next:** one PR per table group puts the engine behind an `engine-store`
+feature. Each PR rewrites that group's raw-SQL tests through the
+repositories, so the same assertions run on both backends; schema and
+migration tests stay SQLite-only. The copy tool (§5) comes last.
+
 ## Related
 
 - ADR-0021 (the hub's move) and ADR-0022 (the seam this continues).

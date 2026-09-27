@@ -1,6 +1,8 @@
+use super::Result;
 use crate::db::migrations;
+use crate::db::Store;
 use crate::vitality;
-use rusqlite::{Connection, Result};
+use rusqlite::Connection;
 
 pub use crate::db::migrations::SCHEMA_VERSION;
 
@@ -36,12 +38,12 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
     // Created even with retention off, so the read path never has to tolerate
     // a missing table. See `archive.rs` for why this cannot be a column on
     // `chat_imports`.
-    crate::db::archives::ensure_tables(conn)?;
+    crate::db::archives::ensure_tables(&Store::over_sqlite(conn))?;
 
     // Nor is the refinement ladder's provenance table (#208). Same reasoning:
     // `schema_tables.sql` is generated verbatim, so a promoted artifact's
     // links live in a table this crate owns outright.
-    crate::db::promotions::ensure_table(conn)?;
+    crate::db::promotions::ensure_table(&Store::over_sqlite(conn))?;
 
     // Embedding-model versioning (#96): detect a changed
     // REMIND_ME_EMBEDDING_BACKEND/OLLAMA_EMBED_MODEL/EMBEDDING_DIM at every
@@ -51,19 +53,19 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
     // means nothing is configured to embed with, so there is nothing to
     // compare against and nothing was written by this process either.
     if let Some(embedder) = crate::embedder::resolve_embedder() {
-        crate::vectors::reconcile_embedding_meta(conn, &embedder.identity())?;
+        crate::vectors::reconcile_embedding_meta(&Store::over_sqlite(conn), &embedder.identity())?;
     }
 
     // Every outbox write (memories and the graph tables alike) is gated on
     // sync_flags.sync_enabled -- align it with the current configuration on
     // every open, exactly like the reference does, before anything else
     // touches sync_outbox.
-    crate::sync::reconcile_sync_enabled_flag(conn)?;
+    crate::sync::reconcile_sync_enabled_flag(&Store::over_sqlite(conn))?;
 
     // Every local edit is queued while the gate above is on, but nothing here
     // drains the outbox. Applying the reference's own retention rule
     // on open keeps that from growing without bound.
-    crate::sync::prune_outbox(conn)?;
+    crate::sync::prune_outbox(&Store::over_sqlite(conn))?;
 
     Ok(())
 }

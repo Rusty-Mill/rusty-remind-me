@@ -6,6 +6,7 @@
 //! correctly has nothing to normalize.
 
 use remind_me_core::db::queries;
+use remind_me_core::db::Store;
 use remind_me_core::normalize::{
     apply_normalizations, unnormalized_batch, NORMALIZED_CATEGORY, NORMALIZED_SOURCE,
 };
@@ -13,28 +14,30 @@ use remind_me_core::{
     Database, EntityInput, MemoryAddInput, NormalizationEntry, NormalizeApplyInput,
     NormalizeBatchInput, NORMALIZE_APPLY_MAX,
 };
-use rusqlite::Connection;
 
-fn batch(conn: &Connection, size: usize) -> remind_me_core::NormalizeBatchResult {
-    unnormalized_batch(conn, &NormalizeBatchInput { batch_size: size }).unwrap()
+fn batch(store: &Store<'_>, size: usize) -> remind_me_core::NormalizeBatchResult {
+    unnormalized_batch(store, &NormalizeBatchInput { batch_size: size }).unwrap()
 }
 
 /// Insert a raw import the way the (not yet written) importers will.
-fn import(conn: &Connection, id: &str, content: &str, source: &str, created_at: &str) {
-    conn.execute(
-        "INSERT INTO memories (id, content, category, tags, source, metadata,
+fn import(store: &Store<'_>, id: &str, content: &str, source: &str, created_at: &str) {
+    store
+        .sqlite()
+        .unwrap()
+        .execute(
+            "INSERT INTO memories (id, content, category, tags, source, metadata,
                                created_at, updated_at, doc_id, chunk_index)
          VALUES (?, ?, 'general', '[\"raw\"]', ?, ?, ?, ?, 'doc_7', 3)",
-        rusqlite::params![
-            id,
-            content,
-            source,
-            r#"{"filename": "notes.md"}"#,
-            created_at,
-            created_at
-        ],
-    )
-    .unwrap();
+            rusqlite::params![
+                id,
+                content,
+                source,
+                r#"{"filename": "notes.md"}"#,
+                created_at,
+                created_at
+            ],
+        )
+        .unwrap();
 }
 
 fn entry(memory_id: &str) -> NormalizationEntry {
@@ -49,11 +52,11 @@ fn entry(memory_id: &str) -> NormalizationEntry {
 }
 
 fn apply(
-    conn: &Connection,
+    store: &Store<'_>,
     entries: Vec<NormalizationEntry>,
 ) -> remind_me_core::NormalizeApplyResult {
     apply_normalizations(
-        conn,
+        store,
         &NormalizeApplyInput {
             normalizations: entries,
         },
@@ -61,21 +64,24 @@ fn apply(
     .unwrap()
 }
 
-fn column(conn: &Connection, id: &str, name: &str) -> String {
-    conn.query_row(
-        &format!("SELECT {} FROM memories WHERE id = ?", name),
-        rusqlite::params![id],
-        |r| r.get::<_, String>(0),
-    )
-    .unwrap()
+fn column(store: &Store<'_>, id: &str, name: &str) -> String {
+    store
+        .sqlite()
+        .unwrap()
+        .query_row(
+            &format!("SELECT {} FROM memories WHERE id = ?", name),
+            rusqlite::params![id],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap()
 }
 
 #[test]
 fn a_store_without_imports_has_nothing_to_normalize() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     queries::add_memory(
-        &conn,
+        &store,
         MemoryAddInput {
             sensitive: false,
             content: "written by hand".into(),
@@ -91,7 +97,7 @@ fn a_store_without_imports_has_nothing_to_normalize() {
     )
     .unwrap();
 
-    let result = batch(&conn, 20);
+    let result = batch(&store, 20);
 
     // Correct, not broken: only importer-sourced memories are eligible, and
     // this crate has no importers yet.
@@ -102,30 +108,30 @@ fn a_store_without_imports_has_nothing_to_normalize() {
 #[test]
 fn both_import_sources_are_eligible() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     import(
-        &conn,
+        &store,
         "mem_doc",
         "raw doc",
         "document_import",
         "2026-01-01T00:00:00Z",
     );
     import(
-        &conn,
+        &store,
         "mem_chat",
         "raw chat",
         "chat_import",
         "2026-01-02T00:00:00Z",
     );
     import(
-        &conn,
+        &store,
         "mem_hook",
         "raw hook",
         "webhook",
         "2026-01-03T00:00:00Z",
     );
 
-    let result = batch(&conn, 20);
+    let result = batch(&store, 20);
 
     let ids: Vec<String> = result.memories.iter().map(|m| m.id.clone()).collect();
     // Newest first.
@@ -136,10 +142,10 @@ fn both_import_sources_are_eligible() {
 #[test]
 fn the_batch_reports_the_full_backlog_and_caps_the_snippet() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     for i in 0..5 {
         import(
-            &conn,
+            &store,
             &format!("mem_{}", i),
             &"x".repeat(1500),
             "document_import",
@@ -147,7 +153,7 @@ fn the_batch_reports_the_full_backlog_and_caps_the_snippet() {
         );
     }
 
-    let result = batch(&conn, 2);
+    let result = batch(&store, 2);
 
     assert_eq!(result.memories.len(), 2);
     assert_eq!(
@@ -163,10 +169,10 @@ fn the_batch_reports_the_full_backlog_and_caps_the_snippet() {
 #[test]
 fn the_batch_size_is_clamped() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     for i in 0..3 {
         import(
-            &conn,
+            &store,
             &format!("mem_{}", i),
             "raw",
             "chat_import",
@@ -174,17 +180,17 @@ fn the_batch_size_is_clamped() {
         );
     }
 
-    assert_eq!(batch(&conn, 0).memories.len(), 1, "zero clamps up to 1");
-    assert_eq!(batch(&conn, 5_000).memories.len(), 3);
+    assert_eq!(batch(&store, 0).memories.len(), 1, "zero clamps up to 1");
+    assert_eq!(batch(&store, 5_000).memories.len(), 3);
 }
 
 #[test]
 fn a_multibyte_snippet_boundary_does_not_panic() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     // Truncating by bytes would slice through a character here.
     import(
-        &conn,
+        &store,
         "mem_1",
         &"é".repeat(1500),
         "document_import",
@@ -192,7 +198,10 @@ fn a_multibyte_snippet_boundary_does_not_panic() {
     );
 
     assert_eq!(
-        batch(&conn, 20).memories[0].content_snippet.chars().count(),
+        batch(&store, 20).memories[0]
+            .content_snippet
+            .chars()
+            .count(),
         1000
     );
 }
@@ -200,36 +209,36 @@ fn a_multibyte_snippet_boundary_does_not_panic() {
 #[test]
 fn applying_creates_a_new_memory_and_leaves_the_raw_one_alone() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     import(
-        &conn,
+        &store,
         "mem_raw",
         "verbatim junk",
         "chat_import",
         "2026-01-01T00:00:00Z",
     );
 
-    let outcome = apply(&conn, vec![entry("mem_raw")]);
+    let outcome = apply(&store, vec![entry("mem_raw")]);
 
     assert_eq!(outcome.normalized, 1);
     assert!(outcome.errors.is_empty());
     let normalized_id = outcome.results[0].normalized_id.clone();
     assert_ne!(normalized_id, "mem_raw");
 
-    assert_eq!(column(&conn, "mem_raw", "content"), "verbatim junk");
+    assert_eq!(column(&store, "mem_raw", "content"), "verbatim junk");
     assert_eq!(
-        column(&conn, &normalized_id, "category"),
+        column(&store, &normalized_id, "category"),
         NORMALIZED_CATEGORY
     );
-    assert_eq!(column(&conn, &normalized_id, "source"), NORMALIZED_SOURCE);
+    assert_eq!(column(&store, &normalized_id, "source"), NORMALIZED_SOURCE);
 }
 
 #[test]
 fn the_normalized_content_renders_the_distillation() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     import(
-        &conn,
+        &store,
         "mem_raw",
         "raw",
         "chat_import",
@@ -238,12 +247,12 @@ fn the_normalized_content_renders_the_distillation() {
 
     let mut with_resolution = entry("mem_raw");
     with_resolution.resolution = Some("Shipped in v2.".into());
-    let id = apply(&conn, vec![with_resolution]).results[0]
+    let id = apply(&store, vec![with_resolution]).results[0]
         .normalized_id
         .clone();
 
     assert_eq!(
-        column(&conn, &id, "content"),
+        column(&store, &id, "content"),
         "**Q:** What did we decide?\n\nWe went with SQLite.\n\n**Resolution:** Shipped in v2."
     );
 }
@@ -251,34 +260,34 @@ fn the_normalized_content_renders_the_distillation() {
 #[test]
 fn a_missing_resolution_is_omitted_from_content_and_metadata() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     import(
-        &conn,
+        &store,
         "mem_raw",
         "raw",
         "chat_import",
         "2026-01-01T00:00:00Z",
     );
 
-    let id = apply(&conn, vec![entry("mem_raw")]).results[0]
+    let id = apply(&store, vec![entry("mem_raw")]).results[0]
         .normalized_id
         .clone();
 
     assert_eq!(
-        column(&conn, &id, "content"),
+        column(&store, &id, "content"),
         "**Q:** What did we decide?\n\nWe went with SQLite."
     );
     let metadata: serde_json::Value =
-        serde_json::from_str(&column(&conn, &id, "metadata")).unwrap();
+        serde_json::from_str(&column(&store, &id, "metadata")).unwrap();
     assert!(metadata.get("resolution").is_none());
 }
 
 #[test]
 fn the_link_back_lives_in_metadata() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     import(
-        &conn,
+        &store,
         "mem_raw",
         "raw",
         "document_import",
@@ -287,12 +296,12 @@ fn the_link_back_lives_in_metadata() {
 
     let mut with_refs = entry("mem_raw");
     with_refs.refs = vec!["https://example.test/adr-1".into()];
-    let id = apply(&conn, vec![with_refs]).results[0]
+    let id = apply(&store, vec![with_refs]).results[0]
         .normalized_id
         .clone();
 
     let metadata: serde_json::Value =
-        serde_json::from_str(&column(&conn, &id, "metadata")).unwrap();
+        serde_json::from_str(&column(&store, &id, "metadata")).unwrap();
     assert_eq!(metadata["normalized_from"], "mem_raw");
     assert_eq!(metadata["question"], "What did we decide?");
     assert_eq!(metadata["refs"][0], "https://example.test/adr-1");
@@ -301,23 +310,25 @@ fn the_link_back_lives_in_metadata() {
 #[test]
 fn the_normalized_memory_inherits_tags_and_document_position() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     import(
-        &conn,
+        &store,
         "mem_raw",
         "raw",
         "document_import",
         "2026-01-01T00:00:00Z",
     );
 
-    let id = apply(&conn, vec![entry("mem_raw")]).results[0]
+    let id = apply(&store, vec![entry("mem_raw")]).results[0]
         .normalized_id
         .clone();
 
     // doc_id and chunk_index carry over so neighbour-aware retrieval still
     // associates the distillation with the rest of the document.
-    assert_eq!(column(&conn, &id, "doc_id"), "doc_7");
-    let chunk: i64 = conn
+    assert_eq!(column(&store, &id, "doc_id"), "doc_7");
+    let chunk: i64 = store
+        .sqlite()
+        .unwrap()
         .query_row(
             "SELECT chunk_index FROM memories WHERE id = ?",
             rusqlite::params![id],
@@ -325,31 +336,31 @@ fn the_normalized_memory_inherits_tags_and_document_position() {
         )
         .unwrap();
     assert_eq!(chunk, 3);
-    assert_eq!(column(&conn, &id, "tags"), r#"["raw"]"#);
+    assert_eq!(column(&store, &id, "tags"), r#"["raw"]"#);
 }
 
 #[test]
 fn a_normalized_import_drops_out_of_the_next_batch() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     import(
-        &conn,
+        &store,
         "mem_a",
         "raw a",
         "chat_import",
         "2026-01-01T00:00:00Z",
     );
     import(
-        &conn,
+        &store,
         "mem_b",
         "raw b",
         "chat_import",
         "2026-01-02T00:00:00Z",
     );
 
-    apply(&conn, vec![entry("mem_a")]);
+    apply(&store, vec![entry("mem_a")]);
 
-    let result = batch(&conn, 20);
+    let result = batch(&store, 20);
     let ids: Vec<String> = result.memories.iter().map(|m| m.id.clone()).collect();
     // There is no "normalized" flag column — the backlog shrinks purely because
     // something now points back at mem_a.
@@ -360,59 +371,65 @@ fn a_normalized_import_drops_out_of_the_next_batch() {
 #[test]
 fn the_distillation_is_not_itself_offered_for_normalization() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     import(
-        &conn,
+        &store,
         "mem_raw",
         "raw",
         "chat_import",
         "2026-01-01T00:00:00Z",
     );
 
-    apply(&conn, vec![entry("mem_raw")]);
+    apply(&store, vec![entry("mem_raw")]);
 
     // Its source is `normalization`, not an import source, so it is ineligible
     // — otherwise normalizing would generate its own backlog forever.
-    assert_eq!(batch(&conn, 20).total_unnormalized, 0);
+    assert_eq!(batch(&store, 20).total_unnormalized, 0);
 }
 
 #[test]
 fn superseded_and_deleted_imports_are_skipped() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     import(
-        &conn,
+        &store,
         "mem_live",
         "raw",
         "chat_import",
         "2026-01-01T00:00:00Z",
     );
     import(
-        &conn,
+        &store,
         "mem_old",
         "raw",
         "chat_import",
         "2026-01-02T00:00:00Z",
     );
     import(
-        &conn,
+        &store,
         "mem_gone",
         "raw",
         "chat_import",
         "2026-01-03T00:00:00Z",
     );
-    conn.execute(
-        "UPDATE memories SET superseded_by = 'mem_live' WHERE id = 'mem_old'",
-        [],
-    )
-    .unwrap();
-    conn.execute(
-        "UPDATE memories SET deleted_at = '2026-01-04T00:00:00Z' WHERE id = 'mem_gone'",
-        [],
-    )
-    .unwrap();
+    store
+        .sqlite()
+        .unwrap()
+        .execute(
+            "UPDATE memories SET superseded_by = 'mem_live' WHERE id = 'mem_old'",
+            [],
+        )
+        .unwrap();
+    store
+        .sqlite()
+        .unwrap()
+        .execute(
+            "UPDATE memories SET deleted_at = '2026-01-04T00:00:00Z' WHERE id = 'mem_gone'",
+            [],
+        )
+        .unwrap();
 
-    let result = batch(&conn, 20);
+    let result = batch(&store, 20);
 
     let ids: Vec<String> = result.memories.iter().map(|m| m.id.clone()).collect();
     assert_eq!(ids, vec!["mem_live"]);
@@ -422,9 +439,9 @@ fn superseded_and_deleted_imports_are_skipped() {
 #[test]
 fn entities_named_by_the_distillation_are_linked() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     import(
-        &conn,
+        &store,
         "mem_raw",
         "raw",
         "document_import",
@@ -437,13 +454,15 @@ fn entities_named_by_the_distillation_are_linked() {
         kind: Some("technology".into()),
         aliases: vec![],
     }];
-    let id = apply(&conn, vec![with_entities]).results[0]
+    let id = apply(&store, vec![with_entities]).results[0]
         .normalized_id
         .clone();
 
     // The raw import is never entity-linked automatically, so without this the
     // distillation would be invisible to entity lookup and traversal.
-    let linked: i64 = conn
+    let linked: i64 = store
+        .sqlite()
+        .unwrap()
         .query_row(
             "SELECT count(*) FROM memory_entities WHERE memory_id = ?",
             rusqlite::params![id],
@@ -452,7 +471,7 @@ fn entities_named_by_the_distillation_are_linked() {
         .unwrap();
     assert_eq!(linked, 1);
     assert_eq!(
-        remind_me_core::entity::resolve_entity(&conn, "sqlite")
+        remind_me_core::entity::resolve_entity(&store, "sqlite")
             .unwrap()
             .unwrap()
             .name,
@@ -463,9 +482,9 @@ fn entities_named_by_the_distillation_are_linked() {
 #[test]
 fn the_distillation_is_searchable() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     import(
-        &conn,
+        &store,
         "mem_raw",
         "verbatim junk",
         "chat_import",
@@ -474,12 +493,12 @@ fn the_distillation_is_searchable() {
 
     let mut about_sqlite = entry("mem_raw");
     about_sqlite.summary = "We went with quokka storage.".into();
-    let id = apply(&conn, vec![about_sqlite]).results[0]
+    let id = apply(&store, vec![about_sqlite]).results[0]
         .normalized_id
         .clone();
 
     let found = queries::search_memories(
-        &conn,
+        &store,
         &remind_me_core::MemorySearchInput {
             strategy: Default::default(),
             include_sensitive: false,
@@ -514,16 +533,16 @@ fn the_distillation_is_searchable() {
 #[test]
 fn an_unknown_id_is_reported_without_discarding_the_batch() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     import(
-        &conn,
+        &store,
         "mem_real",
         "raw",
         "chat_import",
         "2026-01-01T00:00:00Z",
     );
 
-    let outcome = apply(&conn, vec![entry("mem_ghost"), entry("mem_real")]);
+    let outcome = apply(&store, vec![entry("mem_ghost"), entry("mem_real")]);
 
     assert_eq!(outcome.normalized, 1);
     assert_eq!(outcome.results[0].memory_id, "mem_real");
@@ -535,37 +554,43 @@ fn an_unknown_id_is_reported_without_discarding_the_batch() {
 #[test]
 fn a_full_apply_batch_is_accepted() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let entries: Vec<NormalizationEntry> = (0..NORMALIZE_APPLY_MAX)
         .map(|i| {
             let id = format!("mem_{}", i);
-            import(&conn, &id, "raw", "document_import", "2026-01-01T00:00:00Z");
+            import(
+                &store,
+                &id,
+                "raw",
+                "document_import",
+                "2026-01-01T00:00:00Z",
+            );
             entry(&id)
         })
         .collect();
 
-    let outcome = apply(&conn, entries);
+    let outcome = apply(&store, entries);
 
     assert_eq!(outcome.normalized, NORMALIZE_APPLY_MAX);
-    assert_eq!(batch(&conn, 100).total_unnormalized, 0);
+    assert_eq!(batch(&store, 100).total_unnormalized, 0);
 }
 
 #[test]
 fn normalizing_the_same_import_twice_creates_two_distillations() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     import(
-        &conn,
+        &store,
         "mem_raw",
         "raw",
         "chat_import",
         "2026-01-01T00:00:00Z",
     );
 
-    let first = apply(&conn, vec![entry("mem_raw")]).results[0]
+    let first = apply(&store, vec![entry("mem_raw")]).results[0]
         .normalized_id
         .clone();
-    let second = apply(&conn, vec![entry("mem_raw")]).results[0]
+    let second = apply(&store, vec![entry("mem_raw")]).results[0]
         .normalized_id
         .clone();
 

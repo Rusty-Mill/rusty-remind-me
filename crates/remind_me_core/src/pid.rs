@@ -28,7 +28,7 @@
 //! just with a probe that was always going to happen anyway once the PID
 //! file's mere presence stopped being trusted on its own.
 
-use rusqlite::Connection;
+use crate::db::Store;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -50,7 +50,7 @@ pub enum PidError {
     #[error("this database is in memory and has no on-disk location for a PID file")]
     InMemory,
     #[error(transparent)]
-    Sqlite(#[from] rusqlite::Error),
+    Store(#[from] crate::db::StoreError),
     #[error("{path}: {source}")]
     Io {
         path: PathBuf,
@@ -65,13 +65,13 @@ type Result<T> = std::result::Result<T, PidError>;
 /// each of those already keeps its own private copy of this one-line
 /// `PRAGMA` query rather than a shared helper, and this follows the same
 /// established shape.
-fn database_path(conn: &Connection) -> rusqlite::Result<Option<PathBuf>> {
-    crate::db::database_path(conn)
+fn database_path(store: &Store<'_>) -> crate::db::Result<Option<PathBuf>> {
+    crate::db::database_path(store)
 }
 
 /// The PID file's path, beside the database file.
-pub fn pid_file_path(conn: &Connection) -> Result<PathBuf> {
-    let db_path = database_path(conn)?.ok_or(PidError::InMemory)?;
+pub fn pid_file_path(store: &Store<'_>) -> Result<PathBuf> {
+    let db_path = database_path(store)?.ok_or(PidError::InMemory)?;
     Ok(pid_file_path_for(&db_path))
 }
 

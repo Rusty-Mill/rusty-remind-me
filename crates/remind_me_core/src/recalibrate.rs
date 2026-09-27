@@ -22,8 +22,9 @@
 //! writer here would duplicate both.
 
 use crate::db::feedback::{Feedback, ReviewFilter};
+use crate::db::Result;
+use crate::db::Store;
 use crate::models::{RecalibrateCandidatesInput, RecalibrateCandidatesResult};
-use rusqlite::{Connection, Result};
 
 /// `base_weight` floor for the "looks important" half of the heuristic.
 ///
@@ -64,8 +65,8 @@ fn review_filter() -> ReviewFilter<'static> {
 /// Reuses [`review_filter`] for the same reason as the contradiction count:
 /// a nudge that disagrees with the tool it points at trains the reader to
 /// ignore it.
-pub fn candidate_count(conn: &Connection) -> Result<i64> {
-    Feedback::new(conn).review_count(&review_filter())
+pub fn candidate_count(store: &Store<'_>) -> Result<i64> {
+    Feedback::new(store).review_count(&review_filter())
 }
 
 /// A batch of memories whose importance classification may be stale, plus the
@@ -75,10 +76,10 @@ pub fn candidate_count(conn: &Connection) -> Result<i64> {
 /// the point of the number is to tell the caller how much is left behind the
 /// `limit`, so it has to come from the same predicate without it.
 pub fn candidates(
-    conn: &Connection,
+    store: &Store<'_>,
     input: &RecalibrateCandidatesInput,
 ) -> Result<RecalibrateCandidatesResult> {
-    let feedback = Feedback::new(conn);
+    let feedback = Feedback::new(store);
     let filter = review_filter();
     let total = feedback.review_count(&filter)?;
     // rusqlite 0.32+ has no `ToSql` for `usize`; a limit past `i64::MAX` is

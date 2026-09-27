@@ -8,9 +8,9 @@
 //! [`execute`] is also what the CLI runs in-process, so both paths share one
 //! implementation and one serialization round trip.
 
+use crate::db::Store;
 use crate::models::{EntityInput, MemoryAddInput, MemoryListInput, MemorySearchInput};
 use crate::{db::queries, entity, stats, wiki, wiki_import};
-use rusqlite::Connection;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -72,38 +72,38 @@ impl OpReply {
     }
 }
 
-/// Run a store operation against `conn`.
-pub fn execute(conn: &Connection, op: &Op) -> OpReply {
-    match run(conn, op) {
+/// Run a store operation against `store`.
+pub fn execute(store: &Store<'_>, op: &Op) -> OpReply {
+    match run(store, op) {
         Ok(value) => OpReply::Ok(value),
         Err(message) => OpReply::Err(message),
     }
 }
 
-fn run(conn: &Connection, op: &Op) -> Result<Value, String> {
+fn run(store: &Store<'_>, op: &Op) -> Result<Value, String> {
     match op {
-        Op::Search { input } => to_value(queries::search_memories(conn, input)),
-        Op::Add { input } => to_value(queries::add_memory(conn, input.clone())),
-        Op::List { input } => to_value(queries::list_memories(conn, input)),
-        Op::Get { id } => to_value(queries::get_memory_by_id(conn, id)),
-        Op::UpsertEntity { input } => to_value(entity::upsert_entity(conn, input)),
+        Op::Search { input } => to_value(queries::search_memories(store, input)),
+        Op::Add { input } => to_value(queries::add_memory(store, input.clone())),
+        Op::List { input } => to_value(queries::list_memories(store, input)),
+        Op::Get { id } => to_value(queries::get_memory_by_id(store, id)),
+        Op::UpsertEntity { input } => to_value(entity::upsert_entity(store, input)),
         Op::WikiWrite {
             slug,
             title,
             content,
-        } => to_value(wiki::write_wiki_page(conn, slug, title, content, "")),
-        Op::WikiRead { slug } => to_value(wiki::get_wiki_page(conn, slug)),
+        } => to_value(wiki::write_wiki_page(store, slug, title, content, "")),
+        Op::WikiRead { slug } => to_value(wiki::get_wiki_page(store, slug)),
         Op::WikiImport { dir } => {
             let report =
-                wiki_import::import_wiki_dir(conn, dir, true).map_err(|e| e.to_string())?;
+                wiki_import::import_wiki_dir(store, dir, true).map_err(|e| e.to_string())?;
             serde_json::to_value(report).map_err(|e| e.to_string())
         }
-        Op::Stats => to_value(stats::collect(conn)),
+        Op::Stats => to_value(stats::collect(store)),
         Op::Status | Op::Shutdown => Err("only a daemon answers status and shutdown".into()),
     }
 }
 
-fn to_value<T: Serialize>(result: rusqlite::Result<T>) -> Result<Value, String> {
+fn to_value<T: Serialize>(result: crate::db::Result<T>) -> Result<Value, String> {
     let value = result.map_err(|e| e.to_string())?;
     serde_json::to_value(value).map_err(|e| e.to_string())
 }
@@ -114,7 +114,7 @@ mod tests {
     use crate::models::Memory;
     use crate::Database;
 
-    fn add(conn: &Connection, content: &str) -> Memory {
+    fn add(store: &Store<'_>, content: &str) -> Memory {
         let input = MemoryAddInput {
             sensitive: false,
             content: content.into(),
@@ -127,20 +127,20 @@ mod tests {
             object: None,
             entities: vec![],
         };
-        execute(conn, &Op::Add { input }).into_result().unwrap()
+        execute(store, &Op::Add { input }).into_result().unwrap()
     }
 
     #[test]
     fn ops_survive_the_wire_both_ways() {
         let db = Database::open_in_memory().unwrap();
-        let conn = db.conn();
-        let added = add(&conn, "the wire keeps its shape");
+        let store = db.store();
+        let added = add(&store, "the wire keeps its shape");
 
         let op = Op::Get {
             id: added.id.clone(),
         };
         let op: Op = serde_json::from_str(&serde_json::to_string(&op).unwrap()).unwrap();
-        let reply = execute(&conn, &op);
+        let reply = execute(&store, &op);
         let reply: OpReply = serde_json::from_str(&serde_json::to_string(&reply).unwrap()).unwrap();
         let got: Option<Memory> = reply.into_result().unwrap();
         let got = got.expect("the memory");
@@ -154,11 +154,11 @@ mod tests {
     #[test]
     fn a_missing_row_is_ok_none_and_control_ops_are_refused() {
         let db = Database::open_in_memory().unwrap();
-        let conn = db.conn();
-        let got: Option<Memory> = execute(&conn, &Op::Get { id: "nope".into() })
+        let store = db.store();
+        let got: Option<Memory> = execute(&store, &Op::Get { id: "nope".into() })
             .into_result()
             .unwrap();
         assert!(got.is_none());
-        assert!(matches!(execute(&conn, &Op::Shutdown), OpReply::Err(_)));
+        assert!(matches!(execute(&store, &Op::Shutdown), OpReply::Err(_)));
     }
 }

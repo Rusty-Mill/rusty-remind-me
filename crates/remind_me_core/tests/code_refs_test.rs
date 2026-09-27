@@ -21,8 +21,8 @@ use remind_me_core::code_refs::{
     configured_code_roots, detect_code_refs, stale_candidates, StaleReason, CODE_ROOTS_ENV,
 };
 use remind_me_core::db::queries;
+use remind_me_core::db::Store;
 use remind_me_core::{Database, MemoryAddInput};
-use rusqlite::Connection;
 use std::sync::Mutex;
 
 /// `REMIND_ME_CODE_ROOTS` is process-global.
@@ -70,9 +70,9 @@ impl Drop for EnvGuard {
     }
 }
 
-fn add(conn: &Connection, content: &str) -> String {
+fn add(store: &Store<'_>, content: &str) -> String {
     queries::add_memory(
-        conn,
+        store,
         MemoryAddInput {
             content: content.to_string(),
             category: "fact".to_string(),
@@ -201,17 +201,19 @@ fn add_memory_anchors_when_configured() {
     let _env = EnvGuard;
 
     let db = db("add_on");
-    let conn = db.conn();
+    let store = db.store();
     let content = format!("don't refactor {} yet", fixture.file.display());
-    add(&conn, &content);
+    add(&store, &content);
 
-    let candidates = stale_candidates(&conn, 20).unwrap().candidates;
+    let candidates = stale_candidates(&store, 20).unwrap().candidates;
     // Nothing has changed yet, so nothing is stale -- but this proves the
     // anchor was recorded at all, since an unanchored memory could never
     // appear here regardless of file state.
     assert!(candidates.is_empty(), "unchanged file must not be reported");
 
-    let recorded: String = conn
+    let recorded: String = store
+        .sqlite()
+        .unwrap()
         .query_row("SELECT metadata FROM memories LIMIT 1", [], |r| r.get(0))
         .unwrap();
     assert!(
@@ -227,11 +229,13 @@ fn add_memory_records_nothing_when_unconfigured() {
     let fixture = Fixture::new("add_memory_off");
 
     let db = db("add_off");
-    let conn = db.conn();
+    let store = db.store();
     let content = format!("don't refactor {} yet", fixture.file.display());
-    add(&conn, &content);
+    add(&store, &content);
 
-    let recorded: String = conn
+    let recorded: String = store
+        .sqlite()
+        .unwrap()
         .query_row("SELECT metadata FROM memories LIMIT 1", [], |r| r.get(0))
         .unwrap();
     assert!(
@@ -248,8 +252,8 @@ fn modifying_the_file_surfaces_the_memory_as_modified() {
     let _env = EnvGuard;
 
     let db = db("modified");
-    let conn = db.conn();
-    let memory_id = add(&conn, &format!("see {}", fixture.file.display()));
+    let store = db.store();
+    let memory_id = add(&store, &format!("see {}", fixture.file.display()));
 
     // Deliberately changes the file's *size*, not just its mtime -- the
     // signature is truncated to whole seconds, so a test that only touched
@@ -258,7 +262,7 @@ fn modifying_the_file_surfaces_the_memory_as_modified() {
     // already; changing size makes the outcome timing-independent.
     std::fs::write(&fixture.file, "fn login() {}\nfn logout() {}\n").unwrap();
 
-    let candidates = stale_candidates(&conn, 20).unwrap().candidates;
+    let candidates = stale_candidates(&store, 20).unwrap().candidates;
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].memory_id, memory_id);
     assert_eq!(candidates[0].stale_refs.len(), 1);
@@ -273,12 +277,12 @@ fn deleting_the_file_surfaces_the_memory_as_deleted() {
     let _env = EnvGuard;
 
     let db = db("deleted");
-    let conn = db.conn();
-    add(&conn, &format!("see {}", fixture.file.display()));
+    let store = db.store();
+    add(&store, &format!("see {}", fixture.file.display()));
 
     std::fs::remove_file(&fixture.file).unwrap();
 
-    let candidates = stale_candidates(&conn, 20).unwrap().candidates;
+    let candidates = stale_candidates(&store, 20).unwrap().candidates;
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].stale_refs[0].reason, StaleReason::Deleted);
 }
@@ -291,10 +295,12 @@ fn a_stale_memory_is_flagged_not_touched() {
     let _env = EnvGuard;
 
     let db = db("untouched");
-    let conn = db.conn();
-    let memory_id = add(&conn, &format!("see {}", fixture.file.display()));
+    let store = db.store();
+    let memory_id = add(&store, &format!("see {}", fixture.file.display()));
 
-    let vitality_before: f64 = conn
+    let vitality_before: f64 = store
+        .sqlite()
+        .unwrap()
         .query_row(
             "SELECT vitality FROM memories WHERE id = ?",
             [&memory_id],
@@ -304,7 +310,7 @@ fn a_stale_memory_is_flagged_not_touched() {
 
     std::fs::remove_file(&fixture.file).unwrap();
 
-    let before = stale_candidates(&conn, 20).unwrap().candidates;
+    let before = stale_candidates(&store, 20).unwrap().candidates;
     assert_eq!(before.len(), 1);
 
     // The core design decision: reporting a stale anchor must not supersede,
@@ -314,7 +320,9 @@ fn a_stale_memory_is_flagged_not_touched() {
     // the seed value a fresh `fact`/`manual` memory gets is a property of
     // `vitality.rs`'s priors, not of this feature, and hardcoding it here
     // would make this test wrong the moment those priors are tuned.
-    let row: (Option<String>, Option<String>, f64) = conn
+    let row: (Option<String>, Option<String>, f64) = store
+        .sqlite()
+        .unwrap()
         .query_row(
             "SELECT superseded_by, deleted_at, vitality FROM memories WHERE id = ?",
             [&memory_id],
@@ -329,7 +337,7 @@ fn a_stale_memory_is_flagged_not_touched() {
     );
 
     let found = queries::search_memories_budgeted(
-        &conn,
+        &store,
         &remind_me_core::MemorySearchInput {
             query: "auth".to_string(),
             ..Default::default()
@@ -344,7 +352,7 @@ fn a_stale_memory_is_flagged_not_touched() {
 
     // Calling it again, unchanged, must report the same thing -- read-only
     // means idempotent by construction, not by luck.
-    let after = stale_candidates(&conn, 20).unwrap().candidates;
+    let after = stale_candidates(&store, 20).unwrap().candidates;
     assert_eq!(before.len(), after.len());
 }
 
@@ -356,13 +364,13 @@ fn limit_bounds_candidates_not_paths_checked() {
     let _env = EnvGuard;
 
     let db = db("limit");
-    let conn = db.conn();
+    let store = db.store();
     for i in 0..5 {
-        add(&conn, &format!("memo {i}: see {}", fixture.file.display()));
+        add(&store, &format!("memo {i}: see {}", fixture.file.display()));
     }
     std::fs::remove_file(&fixture.file).unwrap();
 
-    let capped = stale_candidates(&conn, 2).unwrap().candidates;
+    let capped = stale_candidates(&store, 2).unwrap().candidates;
     assert_eq!(capped.len(), 2);
 }
 
@@ -377,13 +385,13 @@ fn total_candidates_reports_the_full_backlog_behind_a_capped_page() {
     let _env = EnvGuard;
 
     let db = db("total_candidates");
-    let conn = db.conn();
+    let store = db.store();
     for i in 0..5 {
-        add(&conn, &format!("memo {i}: see {}", fixture.file.display()));
+        add(&store, &format!("memo {i}: see {}", fixture.file.display()));
     }
     std::fs::remove_file(&fixture.file).unwrap();
 
-    let result = stale_candidates(&conn, 2).unwrap();
+    let result = stale_candidates(&store, 2).unwrap();
     assert_eq!(result.candidates.len(), 2, "page stays capped at limit");
     assert_eq!(
         result.total_candidates, 5,
@@ -399,15 +407,15 @@ fn a_zero_limit_is_clamped_to_a_floor_of_one() {
     let _env = EnvGuard;
 
     let db = db("clamp_floor");
-    let conn = db.conn();
-    add(&conn, &format!("see {}", fixture.file.display()));
+    let store = db.store();
+    add(&store, &format!("see {}", fixture.file.display()));
     std::fs::remove_file(&fixture.file).unwrap();
 
     // A caller-supplied 0 must not be taken literally -- an unclamped 0
     // would silently return no candidates even though a stale one exists,
     // which reads exactly like "nothing is stale" to anyone who doesn't
     // already know the limit was zero.
-    let candidates = stale_candidates(&conn, 0).unwrap().candidates;
+    let candidates = stale_candidates(&store, 0).unwrap().candidates;
     assert_eq!(candidates.len(), 1);
 }
 
@@ -419,13 +427,13 @@ fn an_oversized_limit_is_clamped_to_a_ceiling_of_one_hundred() {
     let _env = EnvGuard;
 
     let db = db("clamp_ceiling");
-    let conn = db.conn();
+    let store = db.store();
     for i in 0..105 {
-        add(&conn, &format!("memo {i}: see {}", fixture.file.display()));
+        add(&store, &format!("memo {i}: see {}", fixture.file.display()));
     }
     std::fs::remove_file(&fixture.file).unwrap();
 
-    let candidates = stale_candidates(&conn, 10_000).unwrap().candidates;
+    let candidates = stale_candidates(&store, 10_000).unwrap().candidates;
     assert_eq!(candidates.len(), 100);
 }
 
@@ -446,8 +454,8 @@ fn a_hand_written_code_ref_outside_the_roots_is_never_stat_against() {
     let _env = EnvGuard;
 
     let db = db("oracle");
-    let conn = db.conn();
-    let memory_id = add(&conn, "not anchored through detect_code_refs at all");
+    let store = db.store();
+    let memory_id = add(&store, "not anchored through detect_code_refs at all");
     let injected = serde_json::json!({
         "code_refs": [{
             "path": outside.file.display().to_string(),
@@ -457,13 +465,16 @@ fn a_hand_written_code_ref_outside_the_roots_is_never_stat_against() {
             "size": 0,
         }]
     });
-    conn.execute(
-        "UPDATE memories SET metadata = ?1 WHERE id = ?2",
-        rusqlite::params![injected.to_string(), memory_id],
-    )
-    .unwrap();
+    store
+        .sqlite()
+        .unwrap()
+        .execute(
+            "UPDATE memories SET metadata = ?1 WHERE id = ?2",
+            rusqlite::params![injected.to_string(), memory_id],
+        )
+        .unwrap();
 
-    let candidates = stale_candidates(&conn, 20).unwrap().candidates;
+    let candidates = stale_candidates(&store, 20).unwrap().candidates;
     assert!(
         candidates.is_empty(),
         "a path outside the configured roots must never be stat'd, \
@@ -479,9 +490,9 @@ fn a_sensitive_memory_never_appears_in_stale_candidates() {
     let _env = EnvGuard;
 
     let db = db("sensitive");
-    let conn = db.conn();
+    let store = db.store();
     queries::add_memory(
-        &conn,
+        &store,
         MemoryAddInput {
             content: format!("sensitive: see {}", fixture.file.display()),
             category: "fact".to_string(),
@@ -498,7 +509,7 @@ fn a_sensitive_memory_never_appears_in_stale_candidates() {
     .unwrap();
     std::fs::remove_file(&fixture.file).unwrap();
 
-    let candidates = stale_candidates(&conn, 20).unwrap().candidates;
+    let candidates = stale_candidates(&store, 20).unwrap().candidates;
     assert!(
         candidates.is_empty(),
         "a sensitive memory's stale anchor must not surface through this ambient read: {candidates:?}"

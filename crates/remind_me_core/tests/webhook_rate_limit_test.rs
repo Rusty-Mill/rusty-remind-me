@@ -15,6 +15,7 @@
 #[path = "../src/test_env.rs"]
 mod test_env;
 
+use remind_me_core::db::Store;
 use remind_me_core::rate_limit::RATE_LIMIT_ENABLED_ENV;
 use remind_me_core::webhook::{self, WebhookConfig, WebhookCounters};
 use remind_me_core::Database;
@@ -77,10 +78,10 @@ fn unauthenticated_request() -> String {
 }
 
 /// Serve one request from `peer` and return `(status, headers)`.
-fn serve_from(conn: &rusqlite::Connection, peer: &str) -> (u16, String) {
+fn serve_from(store: &Store<'_>, peer: &str) -> (u16, String) {
     let counters = WebhookCounters::default();
     let mut stream = FakeStream::new(unauthenticated_request().into_bytes());
-    webhook::serve_once_from(&mut stream, &config(), conn, &counters, peer)
+    webhook::serve_once_from(&mut stream, &config(), store, &counters, peer)
         .expect("no I/O failure");
     let text = String::from_utf8_lossy(&stream.output).to_string();
     let status = text
@@ -97,7 +98,7 @@ fn an_unauthenticated_flood_is_cut_off_before_it_reaches_auth() {
     let _guard = env_lock();
     crate::test_env::set_var(RATE_LIMIT_ENABLED_ENV, "1");
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let peer = "198.51.100.7";
 
     // The limiter sits ahead of the credential check on purpose: an
@@ -110,7 +111,7 @@ fn an_unauthenticated_flood_is_cut_off_before_it_reaches_auth() {
     let mut retry_after_header = String::new();
 
     for _ in 0..80 {
-        let (status, raw) = serve_from(&conn, peer);
+        let (status, raw) = serve_from(&store, peer);
         match status {
             401 => saw_401 = true,
             429 => {
@@ -154,13 +155,13 @@ fn one_floods_peer_does_not_lock_out_another() {
     let _guard = env_lock();
     crate::test_env::set_var(RATE_LIMIT_ENABLED_ENV, "1");
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
     for _ in 0..80 {
-        serve_from(&conn, "198.51.100.8");
+        serve_from(&store, "198.51.100.8");
     }
     assert_eq!(
-        serve_from(&conn, "198.51.100.8").0,
+        serve_from(&store, "198.51.100.8").0,
         429,
         "the flooder is cut off"
     );
@@ -168,7 +169,7 @@ fn one_floods_peer_does_not_lock_out_another() {
     // Per-address buckets. Shared, one abusive caller would be a denial of
     // service against everyone else — worse than having no limiter.
     assert_eq!(
-        serve_from(&conn, "198.51.100.9").0,
+        serve_from(&store, "198.51.100.9").0,
         401,
         "an unrelated caller was locked out by someone else's flood"
     );
@@ -179,12 +180,12 @@ fn the_limiter_can_be_turned_off() {
     let _guard = env_lock();
     crate::test_env::set_var(RATE_LIMIT_ENABLED_ENV, "");
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
     // The opt-out has to actually opt out — an operator who disables it and
     // still gets 429s has no way to tell the feature from a bug.
     for _ in 0..80 {
-        assert_eq!(serve_from(&conn, "198.51.100.10").0, 401);
+        assert_eq!(serve_from(&store, "198.51.100.10").0, 401);
     }
     crate::test_env::set_var(RATE_LIMIT_ENABLED_ENV, "1");
 }

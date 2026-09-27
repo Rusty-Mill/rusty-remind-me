@@ -15,8 +15,9 @@
 
 use crate::db::outbox::Outbox;
 use crate::db::sync_state::SyncState;
+use crate::db::Result;
+use crate::db::Store;
 use chrono::{Duration, Utc};
-use rusqlite::{Connection, Result};
 
 mod graph;
 // Public so `notifications` can reuse the one HTTP client this crate has
@@ -285,9 +286,9 @@ const SYNC_ENABLED_FLAG: &str = "sync_enabled";
 ///   behind one cell of it keeps this one reconciliation function, not two
 ///   diverging ones for "true fresh" vs. "upgraded from an older,
 ///   once-ungated build."
-pub fn reconcile_sync_enabled_flag(conn: &Connection) -> Result<()> {
+pub fn reconcile_sync_enabled_flag(store: &Store<'_>) -> Result<()> {
     let desired = if sync_enabled() { "1" } else { "0" };
-    let state = SyncState::new(conn);
+    let state = SyncState::new(store);
     let stored = state.flag(SYNC_ENABLED_FLAG)?;
 
     if stored.as_deref() == Some(desired) {
@@ -295,9 +296,9 @@ pub fn reconcile_sync_enabled_flag(conn: &Connection) -> Result<()> {
     }
 
     if desired == "1" && stored.as_deref() == Some("0") {
-        Outbox::new(conn).backfill_everything()?;
+        Outbox::new(store).backfill_everything()?;
     } else if desired == "0" {
-        Outbox::new(conn).clear()?;
+        Outbox::new(store).clear()?;
     }
 
     state.set_flag(SYNC_ENABLED_FLAG, desired)
@@ -350,9 +351,9 @@ fn outbox_retention_days() -> i64 {
 /// (bounding a long-lived database even with sync disabled) and, when sync
 /// is enabled, once per [`SyncWorker`] cycle — matching the reference's own
 /// arrangement now that one exists.
-pub fn prune_outbox(conn: &Connection) -> Result<usize> {
+pub fn prune_outbox(store: &Store<'_>) -> Result<usize> {
     let cutoff = (Utc::now() - Duration::days(outbox_retention_days())).to_rfc3339();
-    Outbox::new(conn).prune(&cutoff)
+    Outbox::new(store).prune(&cutoff)
 }
 
 /// Records a real, successful HTTP push round trip with `remote_id` (a push
@@ -370,14 +371,14 @@ pub fn prune_outbox(conn: &Connection) -> Result<usize> {
 /// whatever the last write happened to be, however old). Best-effort: a
 /// write failure here is telemetry, not correctness, and must not turn a
 /// successful sync into a reported failure.
-pub(crate) fn record_push(conn: &Connection, remote_id: &str) {
-    let _ = SyncState::new(conn).stamp_push(remote_id, &Utc::now().to_rfc3339());
+pub(crate) fn record_push(store: &Store<'_>, remote_id: &str) {
+    let _ = SyncState::new(store).stamp_push(remote_id, &Utc::now().to_rfc3339());
 }
 
 /// Same as [`record_push`], but for a successful pull -- sets
 /// `last_attempt_at` and `last_pull_at` instead.
-pub(crate) fn record_pull(conn: &Connection, remote_id: &str) {
-    let _ = SyncState::new(conn).stamp_pull(remote_id, &Utc::now().to_rfc3339());
+pub(crate) fn record_pull(store: &Store<'_>, remote_id: &str) {
+    let _ = SyncState::new(store).stamp_pull(remote_id, &Utc::now().to_rfc3339());
 }
 
 #[cfg(test)]

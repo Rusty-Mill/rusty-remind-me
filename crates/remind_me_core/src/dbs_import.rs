@@ -47,11 +47,12 @@
 
 use crate::db::imports::{DbsTracked as Tracked, ImportLedger};
 use crate::db::memories::{Memories, NewMemory};
+use crate::db::Store;
 use crate::entity::{link_memory_entity, upsert_entity};
 use crate::import_paths::{validate_import_database, ImportPathError};
 use crate::models::{DbsImportInput, EntityInput, DBS_IMPORT_LIMIT_MAX, DBS_IMPORT_LIMIT_MIN};
 use chrono::Utc;
-use rusqlite::{params_from_iter, Connection, OpenFlags, Result};
+use rusqlite::{params_from_iter, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -87,6 +88,8 @@ pub enum DbsImportError {
         detail: String,
     },
     Sqlite(rusqlite::Error),
+    /// The node's own store failed.
+    Store(crate::db::StoreError),
 }
 
 impl std::fmt::Display for DbsImportError {
@@ -102,6 +105,7 @@ impl std::fmt::Display for DbsImportError {
                 path, detail
             ),
             Self::Sqlite(e) => write!(f, "{}", e),
+            Self::Store(e) => write!(f, "{}", e),
         }
     }
 }
@@ -111,6 +115,12 @@ impl std::error::Error for DbsImportError {}
 impl From<ImportPathError> for DbsImportError {
     fn from(e: ImportPathError) -> Self {
         Self::Path(e)
+    }
+}
+
+impl From<crate::db::StoreError> for DbsImportError {
+    fn from(e: crate::db::StoreError) -> Self {
+        Self::Store(e)
     }
 }
 
@@ -306,9 +316,9 @@ fn read_items(
 
 /// What previous imports recorded for the items on this page.
 fn tracked_state(
-    conn: &Connection,
+    store: &Store<'_>,
     items: &[DbsItem],
-) -> Result<HashMap<(String, String), Tracked>> {
+) -> crate::db::Result<HashMap<(String, String), Tracked>> {
     let mut by_source: HashMap<&str, Vec<&str>> = HashMap::new();
     for item in items {
         by_source
@@ -320,7 +330,7 @@ fn tracked_state(
     let mut tracked = HashMap::new();
     for (source, external_ids) in by_source {
         for batch in external_ids.chunks(LOOKUP_BATCH) {
-            tracked.extend(ImportLedger::new(conn).dbs_tracked(source, batch)?);
+            tracked.extend(ImportLedger::new(store).dbs_tracked(source, batch)?);
         }
     }
     Ok(tracked)
@@ -359,7 +369,7 @@ fn item_tags(item: &DbsItem, extra: &[String]) -> Vec<String> {
 /// leave `dbs_imports` claiming items that no memory backs, and the next rerun
 /// would skip them — the archive would look imported when it was not.
 pub fn pull_dbs(
-    conn: &Connection,
+    store: &Store<'_>,
     input: &DbsImportInput,
 ) -> std::result::Result<DbsImportResult, DbsImportError> {
     let path = validate_import_database(&input.db_path)?;
@@ -381,7 +391,7 @@ pub fn pull_dbs(
     };
 
     let fetched = items.len();
-    let tracked = tracked_state(conn, &items)?;
+    let tracked = tracked_state(store, &items)?;
 
     let mut result = DbsImportResult {
         source: Some(input.source.clone()).filter(|s| !s.is_empty()),
@@ -408,7 +418,10 @@ pub fn pull_dbs(
     }
 
     let now = Utc::now().to_rfc3339();
-    let tx = conn.unchecked_transaction()?;
+    // One SQLite transaction for the page; the engine store makes the page
+    // one batch instead (ADR-0023, phase 4).
+    let tx = store.conn().unchecked_transaction()?;
+    let page = Store::over_sqlite(&tx);
 
     for item in to_import {
         let key = (item.source_name.clone(), item.external_id.clone());
@@ -430,7 +443,7 @@ pub fn pull_dbs(
             "dbs_content_hash": item.content_hash,
         });
 
-        Memories::new(&tx).insert_or_ignore(&NewMemory {
+        Memories::new(&page).insert_or_ignore(&NewMemory {
             category: item
                 .item_kind
                 .as_deref()
@@ -452,9 +465,9 @@ pub fn pull_dbs(
         for (name, kind) in std::iter::once((item.source_name.as_str(), SOURCE_ENTITY_KIND))
             .chain(tags.iter().map(|t| (t.as_str(), TAG_ENTITY_KIND)))
         {
-            let before = entity_exists(&tx, name)?;
+            let before = entity_exists(&page, name)?;
             let entity = upsert_entity(
-                &tx,
+                &page,
                 &EntityInput {
                     name: name.to_string(),
                     kind: Some(kind.to_string()),
@@ -464,7 +477,7 @@ pub fn pull_dbs(
             if !before {
                 result.entities_created += 1;
             }
-            if link_memory_entity(&tx, &memory_id, &entity.id)? {
+            if link_memory_entity(&page, &memory_id, &entity.id)? {
                 result.entity_links += 1;
             }
         }
@@ -475,13 +488,13 @@ pub fn pull_dbs(
                 // pointed at the new. Every read path filters
                 // `superseded_by IS NULL`, so the previous version drops out of
                 // search while staying in the database.
-                Memories::new(&tx).set_superseded_by(&prior.memory_id, &memory_id, None)?;
+                Memories::new(&page).set_superseded_by(&prior.memory_id, &memory_id, None)?;
                 result.updated += 1;
             }
             None => result.created += 1,
         }
 
-        ImportLedger::new(&tx).record_dbs(
+        ImportLedger::new(&page).record_dbs(
             &item.source_name,
             &item.external_id,
             &memory_id,
@@ -490,6 +503,7 @@ pub fn pull_dbs(
         )?;
     }
 
+    drop(page);
     tx.commit()?;
 
     result.imported = result.created + result.updated;
@@ -500,6 +514,6 @@ pub fn pull_dbs(
 ///
 /// Checked before the upsert only so the result can report how many entities
 /// are genuinely new; `upsert_entity` merges either way.
-fn entity_exists(conn: &Connection, name: &str) -> Result<bool> {
-    Ok(crate::entity::get_entity_by_id(conn, &crate::entity::entity_id(name))?.is_some())
+fn entity_exists(store: &Store<'_>, name: &str) -> crate::db::Result<bool> {
+    Ok(crate::entity::get_entity_by_id(store, &crate::entity::entity_id(name))?.is_some())
 }

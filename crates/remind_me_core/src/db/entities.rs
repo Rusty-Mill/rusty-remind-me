@@ -6,14 +6,15 @@
 //! name normalises into an id, how aliases merge, which kind wins, how a
 //! traversal walks, and how sync resolves a conflict.
 
+use super::{Result, Store};
 use crate::db::derived::{queue_entity, queue_link, queue_relation, Origin};
 use crate::entity::{Entity, EntityFact, EntityLinkedMemory, EntityListItem, RelationEdge};
 use rusqlite::types::Value as SqlValue;
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Result, Row};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
 
 const ENTITY_SELECT: &str = "SELECT id, name, kind, aliases, created_at, updated_at FROM entities";
 
-fn parse_entity_row(row: &Row) -> Result<Entity> {
+fn parse_entity_row(row: &Row) -> rusqlite::Result<Entity> {
     let aliases_json: String = row.get("aliases")?;
     Ok(Entity {
         id: row.get("id")?,
@@ -66,7 +67,8 @@ pub struct Entities<'c> {
 }
 
 impl<'c> Entities<'c> {
-    pub fn new(conn: &'c Connection) -> Self {
+    pub fn new(store: &'c Store<'_>) -> Self {
+        let conn = store.conn();
         Self { conn }
     }
 
@@ -74,13 +76,14 @@ impl<'c> Entities<'c> {
 
     /// The entity with id `id`, if there is one.
     pub fn get(&self, id: &str) -> Result<Option<Entity>> {
-        self.conn
+        Ok(self
+            .conn
             .query_row(
                 &format!("{ENTITY_SELECT} WHERE id = ?"),
                 params![id],
                 parse_entity_row,
             )
-            .optional()
+            .optional()?)
     }
 
     /// Whether an entity with id `id` exists.
@@ -99,14 +102,20 @@ impl<'c> Entities<'c> {
         let mut stmt = self
             .conn
             .prepare(&format!("{ENTITY_SELECT} ORDER BY created_at, id"))?;
-        let rows = stmt.query_map([], parse_entity_row)?.collect();
+        let rows = stmt
+            .query_map([], parse_entity_row)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
     /// Every entity, in storage order.
     pub fn all(&self) -> Result<Vec<Entity>> {
         let mut stmt = self.conn.prepare(ENTITY_SELECT)?;
-        let rows = stmt.query_map([], parse_entity_row)?.collect();
+        let rows = stmt
+            .query_map([], parse_entity_row)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
@@ -177,7 +186,8 @@ impl<'c> Entities<'c> {
                     mention_count: row.get("mention_count")?,
                 })
             })?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
@@ -252,7 +262,8 @@ impl<'c> Entities<'c> {
         )?;
         let rows = stmt
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
@@ -301,7 +312,8 @@ impl<'c> Entities<'c> {
                     created_at: row.get("created_at")?,
                 })
             })?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
@@ -341,7 +353,8 @@ impl<'c> Entities<'c> {
                     created_at: row.get("created_at")?,
                 })
             })?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
@@ -364,7 +377,8 @@ impl<'c> Entities<'c> {
                     updated_at: r.get(5)?,
                 })
             })?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
@@ -449,7 +463,8 @@ impl<'c> Entities<'c> {
                     },
                 ))
             })?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
@@ -457,7 +472,8 @@ impl<'c> Entities<'c> {
 
     /// The local copy of `id` as a sync merge sees it, if there is one.
     pub fn sync_view(&self, id: &str) -> Result<Option<EntitySyncView>> {
-        self.conn
+        Ok(self
+            .conn
             .query_row(
                 "SELECT aliases, updated_at FROM entities WHERE id = ?",
                 params![id],
@@ -469,7 +485,7 @@ impl<'c> Entities<'c> {
                     })
                 },
             )
-            .optional()
+            .optional()?)
     }
 
     /// Write an entity a peer sent: insert it, or overwrite the local row's
@@ -532,8 +548,8 @@ mod tests {
     #[test]
     fn a_synced_overwrite_keeps_created_at() {
         let db = Database::open_in_memory().unwrap();
-        let conn = db.conn();
-        let entities = Entities::new(&conn);
+        let store = db.store();
+        let entities = Entities::new(&store);
         entities.insert(&entity("e1", "Local", T1), None).unwrap();
         entities
             .upsert_synced(&entity("e1", "Remote", T2), Some("peer"))
@@ -548,8 +564,9 @@ mod tests {
     #[test]
     fn repoint_drops_a_link_the_target_already_has() {
         let db = Database::open_in_memory().unwrap();
-        let conn = db.conn();
-        let entities = Entities::new(&conn);
+        let store = db.store();
+        let conn = store.conn();
+        let entities = Entities::new(&store);
         assert!(entities
             .link("m1", "old", T1, crate::db::derived::Origin::Local)
             .unwrap());
@@ -570,7 +587,7 @@ mod tests {
             .unwrap()
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
             .unwrap()
-            .collect::<Result<_>>()
+            .collect::<rusqlite::Result<_>>()
             .unwrap();
         links.sort();
         assert_eq!(
@@ -585,8 +602,8 @@ mod tests {
     #[test]
     fn relations_touching_nothing_is_empty() {
         let db = Database::open_in_memory().unwrap();
-        let conn = db.conn();
-        assert!(Entities::new(&conn)
+        let store = db.store();
+        assert!(Entities::new(&store)
             .relations_touching(&[], None, 1)
             .unwrap()
             .is_empty());

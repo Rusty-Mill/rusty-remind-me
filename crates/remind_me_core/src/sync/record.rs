@@ -7,8 +7,8 @@
 //! key collision. See `docs/adr/0004-sync-protocol-and-conflict-resolution.md`.
 
 use crate::db::memories::{Memories, NewMemory};
+use crate::db::Store;
 use chrono::Utc;
-use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -167,8 +167,8 @@ impl std::fmt::Display for SyncApplyError {
     }
 }
 impl std::error::Error for SyncApplyError {}
-impl From<rusqlite::Error> for SyncApplyError {
-    fn from(e: rusqlite::Error) -> Self {
+impl From<crate::db::StoreError> for SyncApplyError {
+    fn from(e: crate::db::StoreError) -> Self {
         Self(e.to_string())
     }
 }
@@ -238,7 +238,7 @@ fn merge_metadata(local: &Value, incoming: &Value, incoming_wins: bool) -> Value
 /// push does not hand the remote back the change it just sent us. A
 /// genuinely local edit to the same memory is queued as usual.
 pub fn upsert_record(
-    conn: &Connection,
+    store: &Store<'_>,
     record: &SyncRecord,
 ) -> Result<ApplyOutcome, SyncApplyError> {
     if record.id.trim().is_empty()
@@ -259,7 +259,7 @@ pub fn upsert_record(
         .map(canon_ts)
         .unwrap_or_else(|| created_at.clone());
 
-    let local = Memories::new(conn).sync_view(&record.id)?;
+    let local = Memories::new(store).sync_view(&record.id)?;
     let incoming_wins = match &local {
         None => true,
         Some(local) => updated_at > local.updated_at,
@@ -274,7 +274,7 @@ pub fn upsert_record(
         let merged_tags = merge_tags(local_tags, &record.tags);
         let merged_metadata = merge_metadata(&local_metadata, &record.metadata, true);
 
-        let memories = Memories::new(conn);
+        let memories = Memories::new(store);
         memories.upsert_synced(&NewMemory {
             id: record.id.clone(),
             content: record.content.clone(),
@@ -312,7 +312,7 @@ pub fn upsert_record(
         let merged_metadata = merge_metadata(&local.metadata, &record.metadata, false);
 
         if merged_tags != local.tags || merged_metadata != local.metadata {
-            Memories::new(conn).set_tags_and_metadata(
+            Memories::new(store).set_tags_and_metadata(
                 &record.id,
                 &merged_tags,
                 &merged_metadata,

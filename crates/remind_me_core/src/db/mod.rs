@@ -15,13 +15,16 @@ pub mod reminders;
 pub mod saved_searches;
 pub mod schema;
 pub mod stats;
+pub mod store;
 pub mod sync_feed;
 pub mod sync_state;
 pub mod vectors;
 pub mod wiki;
 
-use parking_lot::{Mutex, MutexGuard};
-use rusqlite::{Connection, Result};
+pub use store::{Result, Store, StoreError};
+
+use parking_lot::Mutex;
+use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
 /// Points directly at a database *file*. This crate's own variable.
@@ -182,7 +185,8 @@ fn expand_tilde(raw: &str, home: &Path) -> PathBuf {
 }
 
 /// The file `conn` has open, or `None` for an in-memory database.
-pub fn database_path(conn: &Connection) -> Result<Option<PathBuf>> {
+pub fn database_path(store: &Store<'_>) -> Result<Option<PathBuf>> {
+    let conn = store.conn();
     let path: String = conn.query_row("PRAGMA database_list", [], |row| row.get(2))?;
     Ok((!path.is_empty()).then(|| PathBuf::from(path)))
 }
@@ -215,8 +219,9 @@ impl Database {
         })
     }
 
-    pub fn conn(&self) -> MutexGuard<'_, Connection> {
-        self.conn.lock()
+    /// The store, locked for as long as the handle lives.
+    pub fn store(&self) -> Store<'_> {
+        Store::locked(self.conn.lock())
     }
 
     /// Opens a second, independent connection to the same on-disk file this

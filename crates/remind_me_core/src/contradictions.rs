@@ -34,8 +34,9 @@
 //! the tool is unusable on exactly the vaults that need it most.
 
 use crate::db::curation::Curation;
+use crate::db::Result;
+use crate::db::Store;
 use crate::models::{ContradictionCandidate, ContradictionCandidatesResult, ContradictionSide};
-use rusqlite::{Connection, Result};
 
 /// Entities mentioned by more memories than this are excluded from the pairing
 /// join.
@@ -49,8 +50,8 @@ pub const MAX_ENTITY_FANOUT: i64 = 20;
 /// returning two whole documents per row.
 const SNIPPET_CHARS: usize = 500;
 
-fn side(conn: &Connection, memory_id: &str) -> Result<ContradictionSide> {
-    Curation::new(conn).contradiction_side(memory_id, SNIPPET_CHARS)
+fn side(store: &Store<'_>, memory_id: &str) -> Result<ContradictionSide> {
+    Curation::new(store).contradiction_side(memory_id, SNIPPET_CHARS)
 }
 
 /// A batch of candidate pairs, plus the full backlog size.
@@ -58,8 +59,8 @@ fn side(conn: &Connection, memory_id: &str) -> Result<ContradictionSide> {
 ///
 /// Reuses [`pairs_sql`] rather than approximating with a second query, so the
 /// maintenance nudge cannot claim a backlog that draining it does not find.
-pub fn candidate_count(conn: &Connection) -> Result<i64> {
-    Curation::new(conn).count_contradiction_pairs(MAX_ENTITY_FANOUT)
+pub fn candidate_count(store: &Store<'_>) -> Result<i64> {
+    Curation::new(store).count_contradiction_pairs(MAX_ENTITY_FANOUT)
 }
 
 /// The entity names both memories mention, in name order.
@@ -71,8 +72,8 @@ pub fn candidate_count(conn: &Connection) -> Result<i64> {
 /// Ordered by name so two calls return the same list in the same order — the
 /// pair itself is stable across pages, and a field that reshuffled between
 /// identical requests would make responses gratuitously un-diffable.
-fn shared_entities(conn: &Connection, id_a: &str, id_b: &str) -> Result<Vec<String>> {
-    Curation::new(conn).shared_entity_names(id_a, id_b)
+fn shared_entities(store: &Store<'_>, id_a: &str, id_b: &str) -> Result<Vec<String>> {
+    Curation::new(store).shared_entity_names(id_a, id_b)
 }
 
 /// A page of candidate pairs, optionally starting after `cursor`.
@@ -95,11 +96,11 @@ fn shared_entities(conn: &Connection, id_a: &str, id_b: &str) -> Result<Vec<Stri
 /// correctly judged *not* to conflict, so reviewing them changes nothing and
 /// they would be re-served forever — the very bug being fixed.
 pub fn candidates(
-    conn: &Connection,
+    store: &Store<'_>,
     limit: usize,
     cursor: Option<(&str, &str)>,
 ) -> Result<ContradictionCandidatesResult> {
-    let curation = Curation::new(conn);
+    let curation = Curation::new(store);
 
     // The whole queue, deliberately not narrowed by the cursor: a caller
     // watching this number shrink as it pages would be watching the backlog
@@ -121,9 +122,9 @@ pub fn candidates(
     let mut candidates = Vec::with_capacity(ids.len());
     for (id_a, id_b) in ids {
         candidates.push(ContradictionCandidate {
-            shared_entities: shared_entities(conn, &id_a, &id_b)?,
-            memory_a: side(conn, &id_a)?,
-            memory_b: side(conn, &id_b)?,
+            shared_entities: shared_entities(store, &id_a, &id_b)?,
+            memory_a: side(store, &id_a)?,
+            memory_b: side(store, &id_b)?,
         });
     }
 

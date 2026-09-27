@@ -2,6 +2,14 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-27 — The store seam (ADR-0023, phase 4a)
+
+### Changed
+- Callers in `remind_me_core`, `remind_me_mcp`, `remind_me_api`, the CLI and `remind_me_remote` take a `db::Store` handle instead of a `rusqlite::Connection`. Repositories return `db::Result`, whose error is the backend-neutral `db::StoreError`. `Database::conn()` is now `Database::store()`, and `Store::sqlite()` is the escape hatch for schema code and tests. SQLite is still the only backend; behaviour is unchanged. This is the seam the engine-backed store plugs into, one table group at a time.
+
+### Tests
+- Existing suites were moved onto `Store` without changing their assertions. New unit tests pin `NotFound` to SQLite's message and check the borrowed-connection path.
+
 ## 2026-09-27 — Engine full-text index matching FTS5 (ADR-0023, phase 3b)
 
 ### Added

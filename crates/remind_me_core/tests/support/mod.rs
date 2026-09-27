@@ -104,7 +104,7 @@ impl Drop for AcceptLoop {
 
 /// A real peer-server node -- see the module doc. `db` is `pub` so a test
 /// can inspect or seed it directly (as every prior `TestHub` usage already
-/// did via `hub.db.conn()`), and `Arc`-wrapped so it outlives the
+/// did via `hub.db.store()`), and `Arc`-wrapped so it outlives the
 /// short-lived per-connection borrows the accept loop takes.
 pub struct MockNode {
     pub url: String,
@@ -121,8 +121,8 @@ impl MockNode {
         let config = PeerServerConfig::new("127.0.0.1", port, secret, node_id);
         let thread_db = Arc::clone(&db);
         let accept = AcceptLoop::spawn(listener, move |mut stream| {
-            let conn = thread_db.conn();
-            let _ = serve_once(&mut stream, &config, &conn);
+            let store = thread_db.store();
+            let _ = serve_once(&mut stream, &config, &store);
         });
         Self {
             url: format!("http://127.0.0.1:{port}"),

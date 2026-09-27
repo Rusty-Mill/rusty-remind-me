@@ -6,8 +6,9 @@
 //! here. The rules stay there: the pair cap, the weight ceiling, the window
 //! size, how relatives are grouped and capped.
 
+use super::{Result, Store};
 use rusqlite::types::Value as SqlValue;
-use rusqlite::{params, params_from_iter, Connection, Result};
+use rusqlite::{params, params_from_iter, Connection};
 
 /// A live memory another one points at, with the fields expansion shows.
 #[derive(Debug, Clone, PartialEq)]
@@ -58,7 +59,8 @@ pub struct Related<'c> {
 }
 
 impl<'c> Related<'c> {
-    pub fn new(conn: &'c Connection) -> Self {
+    pub fn new(store: &'c Store<'_>) -> Self {
+        let conn = store.conn();
         Self { conn }
     }
 
@@ -109,7 +111,8 @@ impl<'c> Related<'c> {
                     entity_name: row.get("entity_name")?,
                 })
             })?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
@@ -137,7 +140,8 @@ impl<'c> Related<'c> {
                     chunk_index: row.get("chunk_index")?,
                 })
             })?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
@@ -173,7 +177,8 @@ impl<'c> Related<'c> {
                     weight: row.get("weight")?,
                 })
             })?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 }
@@ -189,12 +194,12 @@ mod tests {
     #[test]
     fn a_pair_is_read_from_either_side_and_its_weight_is_capped() {
         let db = Database::open_in_memory().unwrap();
-        let conn = db.conn();
-        let memories = Memories::new(&conn);
+        let store = db.store();
+        let memories = Memories::new(&store);
         for id in ["a", "b"] {
             memories.insert(&NewMemory::new(id, id, NOW)).unwrap();
         }
-        let related = Related::new(&conn);
+        let related = Related::new(&store);
         for _ in 0..5 {
             related.bump_pair("a", "b", NOW, 3).unwrap();
         }

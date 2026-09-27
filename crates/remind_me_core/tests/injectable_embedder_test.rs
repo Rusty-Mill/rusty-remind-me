@@ -8,10 +8,10 @@
 //! `impl Embedder` had no way to get it in. These tests cover the seam.
 
 use remind_me_core::db::queries;
+use remind_me_core::db::Store;
 use remind_me_core::embedder::{EmbedError, EmbedRole, Embedder, EmbeddingIdentity};
 use remind_me_core::vectors::embed_and_store;
 use remind_me_core::{Database, MemoryAddInput, MemorySearchInput};
-use rusqlite::Connection;
 
 /// An embedder with no daemon, no network, and no model file.
 ///
@@ -58,9 +58,9 @@ impl Embedder for CharHistogramEmbedder {
     }
 }
 
-fn add(conn: &Connection, content: &str) -> String {
+fn add(store: &Store<'_>, content: &str) -> String {
     queries::add_memory(
-        conn,
+        store,
         MemoryAddInput {
             sensitive: false,
             content: content.to_string(),
@@ -103,14 +103,14 @@ fn input(query: &str) -> MemorySearchInput {
 fn seeded() -> Database {
     let db = Database::open_in_memory().unwrap();
     {
-        let conn = db.conn();
+        let store = db.store();
         for content in [
             "the deploy key rotates every ninety days",
             "staging mirrors production except the cache tier",
             "releases are cut from main on fridays",
         ] {
-            let id = add(&conn, content);
-            embed_and_store(&conn, &CharHistogramEmbedder, &id, content).unwrap();
+            let id = add(&store, content);
+            embed_and_store(&store, &CharHistogramEmbedder, &id, content).unwrap();
         }
     }
     db
@@ -123,10 +123,10 @@ fn a_supplied_embedder_is_used() {
     // FTS would also match would pass whether or not the embedder was ever
     // consulted — which is the whole thing this test exists to rule out.
     let db = seeded();
-    let conn = db.conn();
+    let store = db.store();
     let query = "ydolep yek rotaets";
 
-    let without = queries::search_memories_with_embedder(&conn, &input(query), None).unwrap();
+    let without = queries::search_memories_with_embedder(&store, &input(query), None).unwrap();
     assert!(
         without.is_empty(),
         "the keyword half matched, so this query cannot isolate the embedder: {:?}",
@@ -137,7 +137,7 @@ fn a_supplied_embedder_is_used() {
     );
 
     let with =
-        queries::search_memories_with_embedder(&conn, &input(query), Some(&CharHistogramEmbedder))
+        queries::search_memories_with_embedder(&store, &input(query), Some(&CharHistogramEmbedder))
             .unwrap();
     assert!(
         !with.is_empty(),
@@ -152,10 +152,10 @@ fn none_is_keyword_only_rather_than_an_error() {
     // wants reproducibility asks for it here instead of hoping the daemon is
     // down consistently.
     let db = seeded();
-    let conn = db.conn();
+    let store = db.store();
 
     let results =
-        queries::search_memories_with_embedder(&conn, &input("deploy key"), None).unwrap();
+        queries::search_memories_with_embedder(&store, &input("deploy key"), None).unwrap();
 
     assert!(
         results
@@ -170,10 +170,10 @@ fn the_same_query_returns_the_same_order_every_time() {
     // The property the seam exists for. With a probed backend this can flip
     // between calls depending on whether the daemon answered.
     let db = seeded();
-    let conn = db.conn();
+    let store = db.store();
 
     let ids = |embedder: Option<&dyn Embedder>| -> Vec<String> {
-        queries::search_memories_with_embedder(&conn, &input("cache tier on fridays"), embedder)
+        queries::search_memories_with_embedder(&store, &input("cache tier on fridays"), embedder)
             .unwrap()
             .iter()
             .map(|r| r.memory.id.clone())
@@ -192,11 +192,11 @@ fn search_memories_still_resolves_the_configured_backend() {
     // yields `None` and this is the keyword-only path — the same answer the
     // explicit `None` above gets.
     let db = seeded();
-    let conn = db.conn();
+    let store = db.store();
 
-    let wrapped = queries::search_memories(&conn, &input("deploy key")).unwrap();
+    let wrapped = queries::search_memories(&store, &input("deploy key")).unwrap();
     let explicit =
-        queries::search_memories_with_embedder(&conn, &input("deploy key"), None).unwrap();
+        queries::search_memories_with_embedder(&store, &input("deploy key"), None).unwrap();
 
     let ids = |rows: &[remind_me_core::MemorySearchResult]| -> Vec<String> {
         rows.iter().map(|r| r.memory.id.clone()).collect()

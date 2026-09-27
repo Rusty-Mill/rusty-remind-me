@@ -55,7 +55,8 @@
 
 use crate::db::archives::{ArchiveRow, Archives, SpanSource};
 use crate::db::memories::Memories;
-use rusqlite::{Connection, Result as SqlResult};
+use crate::db::Result as SqlResult;
+use crate::db::Store;
 use std::path::{Path, PathBuf};
 
 /// Directory raw transcripts are retained under. Unset disables retention.
@@ -96,7 +97,7 @@ pub fn is_enabled() -> bool {
 #[derive(Debug)]
 pub enum ArchiveError {
     Io(std::io::Error),
-    Db(rusqlite::Error),
+    Db(crate::db::StoreError),
 }
 
 impl std::fmt::Display for ArchiveError {
@@ -116,8 +117,8 @@ impl From<std::io::Error> for ArchiveError {
     }
 }
 
-impl From<rusqlite::Error> for ArchiveError {
-    fn from(e: rusqlite::Error) -> Self {
+impl From<crate::db::StoreError> for ArchiveError {
+    fn from(e: crate::db::StoreError) -> Self {
         Self::Db(e)
     }
 }
@@ -137,7 +138,7 @@ fn blob_path(root: &Path, hash: &str) -> PathBuf {
 /// off. Writing the blob is idempotent: an existing blob with this hash is
 /// left alone rather than rewritten, since the hash is over these exact bytes.
 pub fn store(
-    conn: &Connection,
+    store: &Store<'_>,
     import_id: &str,
     filename: &str,
     hash: &str,
@@ -155,7 +156,7 @@ pub fn store(
         std::fs::write(&path, raw)?;
     }
 
-    Archives::new(conn).record(&ArchiveRow {
+    Archives::new(store).record(&ArchiveRow {
         import_id: import_id.to_string(),
         hash: hash.to_string(),
         filename: filename.to_string(),
@@ -168,7 +169,7 @@ pub fn store(
     // its ceiling between manual passes. A no-op unless a limit is set, and a
     // failure is swallowed for the same reason the write above is: retention
     // housekeeping must never fail the import it is decorating.
-    let _ = prune(conn, false);
+    let _ = prune(store, false);
 
     Ok(Some(path))
 }
@@ -177,7 +178,7 @@ pub fn store(
 ///
 /// A no-op when retention is off, so callers do not have to check first.
 pub fn record_span(
-    conn: &Connection,
+    store: &Store<'_>,
     memory_id: &str,
     import_id: &str,
     byte_start: usize,
@@ -186,7 +187,7 @@ pub fn record_span(
     if !is_enabled() {
         return Ok(());
     }
-    Archives::new(conn).record_span(memory_id, import_id, byte_start as i64, byte_end as i64)
+    Archives::new(store).record_span(memory_id, import_id, byte_start as i64, byte_end as i64)
 }
 
 /// The raw source behind one memory.
@@ -226,12 +227,12 @@ pub struct ArchiveSource {
 /// scheduled, with no per-call intent to opt back in against; this is a
 /// by-id read, which is a deliberate act by a caller who already has the id.
 pub fn source_for(
-    conn: &Connection,
+    store: &Store<'_>,
     memory_id: &str,
     include_sensitive: bool,
 ) -> SqlResult<Option<ArchiveSource>> {
     if !include_sensitive {
-        let sensitive = Memories::new(conn).sensitivity(memory_id)?;
+        let sensitive = Memories::new(store).sensitivity(memory_id)?;
         if sensitive.unwrap_or(false) {
             return Ok(None);
         }
@@ -243,7 +244,7 @@ pub fn source_for(
         byte_end: end,
         archive_path,
         filename,
-    }) = Archives::new(conn).span_source(memory_id)?
+    }) = Archives::new(store).span_source(memory_id)?
     else {
         return Ok(None);
     };
@@ -287,8 +288,8 @@ pub fn source_for(
 /// content-addressed storage means two imports of the same file share one.
 ///
 /// Returns the number of blobs actually removed.
-pub fn forget_import(conn: &Connection, import_id: &str) -> SqlResult<usize> {
-    let archives = Archives::new(conn);
+pub fn forget_import(store: &Store<'_>, import_id: &str) -> SqlResult<usize> {
+    let archives = Archives::new(store);
     let row = archives.blob_of(import_id)?;
     archives.remove(import_id)?;
 
@@ -367,7 +368,7 @@ struct Retained {
 /// untouched, and [`source_for`] already reads a missing blob as "no source"
 /// rather than an error, so a pruned import degrades exactly like one imported
 /// before retention was switched on.
-pub fn prune(conn: &Connection, dry_run: bool) -> Result<PruneReport, ArchiveError> {
+pub fn prune(store: &Store<'_>, dry_run: bool) -> Result<PruneReport, ArchiveError> {
     let max_age_days = env_u64(ARCHIVE_MAX_AGE_DAYS_ENV);
     let max_bytes = env_u64(ARCHIVE_MAX_BYTES_ENV);
 
@@ -377,7 +378,7 @@ pub fn prune(conn: &Connection, dry_run: bool) -> Result<PruneReport, ArchiveErr
         ..Default::default()
     };
 
-    let rows: Vec<Retained> = Archives::new(conn)
+    let rows: Vec<Retained> = Archives::new(store)
         .oldest_first()?
         .into_iter()
         .map(|row| Retained {
@@ -438,7 +439,7 @@ pub fn prune(conn: &Connection, dry_run: bool) -> Result<PruneReport, ArchiveErr
     }
 
     for row in doomed {
-        forget_import(conn, &row.import_id)?;
+        forget_import(store, &row.import_id)?;
     }
     Ok(report)
 }

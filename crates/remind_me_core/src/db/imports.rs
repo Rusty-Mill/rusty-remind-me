@@ -12,8 +12,9 @@
 //! imported, when a changed dbs item supersedes its memory, and that a chat
 //! import loses its tracking row only once nothing of it is left.
 
+use super::{Result, Store};
 use rusqlite::types::Value as SqlValue;
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Result};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use std::collections::HashMap;
 
 /// What a previous import recorded for one dbs item.
@@ -41,7 +42,8 @@ pub struct ImportLedger<'c> {
 }
 
 impl<'c> ImportLedger<'c> {
-    pub fn new(conn: &'c Connection) -> Self {
+    pub fn new(store: &'c Store<'_>) -> Self {
+        let conn = store.conn();
         Self { conn }
     }
 
@@ -67,13 +69,14 @@ impl<'c> ImportLedger<'c> {
 
     /// The chat import already recorded for content `hash`, if any.
     pub fn chat_import_with_hash(&self, hash: &str) -> Result<Option<String>> {
-        self.conn
+        Ok(self
+            .conn
             .query_row(
                 "SELECT import_id FROM chat_imports WHERE hash = ?",
                 params![hash],
                 |r| r.get(0),
             )
-            .optional()
+            .optional()?)
     }
 
     /// Live memories written by the chat import `import_id`, or by any
@@ -115,7 +118,7 @@ impl<'c> ImportLedger<'c> {
         if import_ids.is_empty() {
             return Ok(0);
         }
-        self.conn.execute(
+        Ok(self.conn.execute(
             &format!(
                 "DELETE FROM chat_imports
                   WHERE import_id IN ({})
@@ -123,7 +126,7 @@ impl<'c> ImportLedger<'c> {
                 placeholders(import_ids.len())
             ),
             params_from_iter(import_ids.iter()),
-        )
+        )?)
     }
 
     // --- dbs imports -----------------------------------------------------
@@ -160,7 +163,8 @@ impl<'c> ImportLedger<'c> {
                     },
                 ))
             })?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
@@ -316,13 +320,13 @@ impl<'c> ImportLedger<'c> {
         if memory_ids.is_empty() {
             return Ok(0);
         }
-        self.conn.execute(
+        Ok(self.conn.execute(
             &format!(
                 "DELETE FROM {table} WHERE memory_id IN ({})",
                 placeholders(memory_ids.len())
             ),
             params_from_iter(memory_ids.iter()),
-        )
+        )?)
     }
 
     /// The first column of every row `sql` returns, bound to `bindings`.
@@ -330,7 +334,8 @@ impl<'c> ImportLedger<'c> {
         let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt
             .query_map(params_from_iter(bindings.iter()), |r| r.get(0))?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 }
@@ -346,15 +351,15 @@ mod tests {
     #[test]
     fn a_chat_import_is_forgotten_only_once_nothing_of_it_is_left() {
         let db = Database::open_in_memory().unwrap();
-        let conn = db.conn();
-        let ledger = ImportLedger::new(&conn);
+        let store = db.store();
+        let ledger = ImportLedger::new(&store);
         ledger
             .record_chat("imp_a", "a.json", "ha", NOW, "{}")
             .unwrap();
         ledger
             .record_chat("imp_b", "b.json", "hb", NOW, "{}")
             .unwrap();
-        Memories::new(&conn)
+        Memories::new(&store)
             .insert(&NewMemory {
                 doc_id: Some("imp_a".to_string()),
                 ..NewMemory::new("m1", "x", NOW)
@@ -380,8 +385,8 @@ mod tests {
     #[test]
     fn a_dbs_rerun_replaces_the_tracked_memory() {
         let db = Database::open_in_memory().unwrap();
-        let conn = db.conn();
-        let ledger = ImportLedger::new(&conn);
+        let store = db.store();
+        let ledger = ImportLedger::new(&store);
         ledger.record_dbs("src", "e1", "m1", "h1", NOW).unwrap();
         ledger.record_dbs("src", "e1", "m2", "h2", NOW).unwrap();
 
@@ -400,8 +405,8 @@ mod tests {
     #[test]
     fn a_recorded_drawer_is_not_rerecorded() {
         let db = Database::open_in_memory().unwrap();
-        let conn = db.conn();
-        let ledger = ImportLedger::new(&conn);
+        let store = db.store();
+        let ledger = ImportLedger::new(&store);
         ledger.record_mempalace("d1", "m1", NOW).unwrap();
         ledger.record_mempalace("d1", "m2", NOW).unwrap();
         assert_eq!(ledger.imported_drawers(&["d1", "d2"]).unwrap(), vec!["d1"]);

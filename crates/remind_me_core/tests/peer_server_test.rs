@@ -12,11 +12,11 @@
 mod test_env;
 
 use remind_me_core::db::queries;
+use remind_me_core::db::Store;
 use remind_me_core::sync::{
     self, serve_once, PeerServerConfig, HUB_URL_ENV, NODE_ID_ENV, SYNC_SECRET_ENV,
 };
 use remind_me_core::{Database, MemoryAddInput};
-use rusqlite::Connection;
 use std::io::{Cursor, Read, Write};
 use std::sync::Mutex;
 
@@ -72,9 +72,9 @@ fn authed(method: &str, path: &str, body: &str) -> String {
     request(method, path, Some(&format!("Bearer {}", SECRET)), body)
 }
 
-fn serve(conn: &Connection, raw: &str) -> (u16, serde_json::Value) {
+fn serve(store: &Store<'_>, raw: &str) -> (u16, serde_json::Value) {
     let mut stream = FakeStream::new(raw.as_bytes().to_vec());
-    serve_once(&mut stream, &config(), conn).expect("no I/O failure");
+    serve_once(&mut stream, &config(), store).expect("no I/O failure");
     parse_response(&stream.output)
 }
 
@@ -92,9 +92,9 @@ fn parse_response(raw: &[u8]) -> (u16, serde_json::Value) {
     (status, serde_json::from_str(body).unwrap_or_default())
 }
 
-fn add(conn: &Connection, content: &str) -> String {
+fn add(store: &Store<'_>, content: &str) -> String {
     queries::add_memory(
-        conn,
+        store,
         MemoryAddInput {
             sensitive: false,
             content: content.to_string(),
@@ -119,7 +119,7 @@ fn add(conn: &Connection, content: &str) -> String {
 #[test]
 fn a_request_without_a_bearer_token_is_unauthorized_even_for_health() {
     let db = Database::open_in_memory().unwrap();
-    let (status, _) = serve(&db.conn(), &request("GET", "/health", None, ""));
+    let (status, _) = serve(&db.store(), &request("GET", "/health", None, ""));
     assert_eq!(status, 401);
 }
 
@@ -127,7 +127,7 @@ fn a_request_without_a_bearer_token_is_unauthorized_even_for_health() {
 fn the_wrong_token_is_unauthorized() {
     let db = Database::open_in_memory().unwrap();
     let (status, _) = serve(
-        &db.conn(),
+        &db.store(),
         &request("GET", "/health", Some("Bearer wrong"), ""),
     );
     assert_eq!(status, 401);
@@ -136,8 +136,8 @@ fn the_wrong_token_is_unauthorized() {
 #[test]
 fn an_unauthenticated_caller_cannot_distinguish_a_real_path_from_a_fake_one() {
     let db = Database::open_in_memory().unwrap();
-    let (real, _) = serve(&db.conn(), &request("GET", "/sync/pull", None, ""));
-    let (fake, _) = serve(&db.conn(), &request("GET", "/nonexistent", None, ""));
+    let (real, _) = serve(&db.store(), &request("GET", "/sync/pull", None, ""));
+    let (fake, _) = serve(&db.store(), &request("GET", "/nonexistent", None, ""));
     assert_eq!(real, 401);
     assert_eq!(fake, 401);
 }
@@ -149,7 +149,7 @@ fn an_unauthenticated_caller_cannot_distinguish_a_real_path_from_a_fake_one() {
 #[test]
 fn health_reports_ok_and_this_nodes_id() {
     let db = Database::open_in_memory().unwrap();
-    let (status, body) = serve(&db.conn(), &authed("GET", "/health", ""));
+    let (status, body) = serve(&db.store(), &authed("GET", "/health", ""));
     assert_eq!(status, 200);
     assert_eq!(body["status"], "ok");
     assert_eq!(body["node_id"], "hub-node");
@@ -159,21 +159,21 @@ fn health_reports_ok_and_this_nodes_id() {
 #[test]
 fn an_unknown_path_is_not_found() {
     let db = Database::open_in_memory().unwrap();
-    let (status, _) = serve(&db.conn(), &authed("GET", "/nonexistent", ""));
+    let (status, _) = serve(&db.store(), &authed("GET", "/nonexistent", ""));
     assert_eq!(status, 404);
 }
 
 #[test]
 fn a_get_on_the_push_path_is_not_allowed() {
     let db = Database::open_in_memory().unwrap();
-    let (status, _) = serve(&db.conn(), &authed("GET", "/sync/push", ""));
+    let (status, _) = serve(&db.store(), &authed("GET", "/sync/push", ""));
     assert_eq!(status, 405);
 }
 
 #[test]
 fn a_post_on_the_health_path_is_not_allowed() {
     let db = Database::open_in_memory().unwrap();
-    let (status, _) = serve(&db.conn(), &authed("POST", "/health", ""));
+    let (status, _) = serve(&db.store(), &authed("POST", "/health", ""));
     assert_eq!(status, 405);
 }
 
@@ -184,7 +184,7 @@ fn a_post_on_the_health_path_is_not_allowed() {
 #[test]
 fn push_with_malformed_json_is_a_bad_request() {
     let db = Database::open_in_memory().unwrap();
-    let (status, _) = serve(&db.conn(), &authed("POST", "/sync/push", "not json"));
+    let (status, _) = serve(&db.store(), &authed("POST", "/sync/push", "not json"));
     assert_eq!(status, 400);
 }
 
@@ -192,7 +192,7 @@ fn push_with_malformed_json_is_a_bad_request() {
 fn push_without_a_records_array_is_a_bad_request() {
     let db = Database::open_in_memory().unwrap();
     let body = serde_json::json!({ "node_id": "peer-1" }).to_string();
-    let (status, response) = serve(&db.conn(), &authed("POST", "/sync/push", &body));
+    let (status, response) = serve(&db.store(), &authed("POST", "/sync/push", &body));
     assert_eq!(status, 400);
     assert!(response["error"].as_str().unwrap().contains("records"));
 }
@@ -211,14 +211,16 @@ fn push_applies_valid_records_and_reports_processed_ids() {
     })
     .to_string();
 
-    let (status, response) = serve(&db.conn(), &authed("POST", "/sync/push", &body));
+    let (status, response) = serve(&db.store(), &authed("POST", "/sync/push", &body));
 
     assert_eq!(status, 200);
     assert_eq!(response["accepted"], 1);
     assert_eq!(response["processed_ids"], serde_json::json!(["mem_pushed"]));
     assert_eq!(response["failed"], 0);
     let stored: String = db
-        .conn()
+        .store()
+        .sqlite()
+        .unwrap()
         .query_row(
             "SELECT content FROM memories WHERE id = 'mem_pushed'",
             [],
@@ -240,7 +242,7 @@ fn push_counts_a_malformed_record_as_failed_without_losing_the_good_ones() {
     })
     .to_string();
 
-    let (status, response) = serve(&db.conn(), &authed("POST", "/sync/push", &body));
+    let (status, response) = serve(&db.store(), &authed("POST", "/sync/push", &body));
 
     assert_eq!(status, 200);
     assert_eq!(response["accepted"], 1);
@@ -255,11 +257,11 @@ fn push_counts_a_malformed_record_as_failed_without_losing_the_good_ones() {
 #[test]
 fn pull_with_no_query_returns_everything_oldest_first() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "first");
-    add(&conn, "second");
+    let store = db.store();
+    add(&store, "first");
+    add(&store, "second");
 
-    let (status, response) = serve(&conn, &authed("GET", "/sync/pull", ""));
+    let (status, response) = serve(&store, &authed("GET", "/sync/pull", ""));
 
     assert_eq!(status, 200);
     let records = response["records"].as_array().unwrap();
@@ -272,15 +274,18 @@ fn pull_with_no_query_returns_everything_oldest_first() {
 #[test]
 fn pull_tags_and_metadata_are_real_json_not_double_encoded() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "content");
-    conn.execute(
-        "UPDATE memories SET tags = '[\"a\",\"b\"]', metadata = '{\"k\":\"v\"}' WHERE id = ?",
-        [&id],
-    )
-    .unwrap();
+    let store = db.store();
+    let id = add(&store, "content");
+    store
+        .sqlite()
+        .unwrap()
+        .execute(
+            "UPDATE memories SET tags = '[\"a\",\"b\"]', metadata = '{\"k\":\"v\"}' WHERE id = ?",
+            [&id],
+        )
+        .unwrap();
 
-    let (_, response) = serve(&conn, &authed("GET", "/sync/pull", ""));
+    let (_, response) = serve(&store, &authed("GET", "/sync/pull", ""));
 
     let record = &response["records"][0];
     assert_eq!(record["tags"], serde_json::json!(["a", "b"]));
@@ -290,22 +295,28 @@ fn pull_tags_and_metadata_are_real_json_not_double_encoded() {
 #[test]
 fn pull_excludes_the_callers_own_node_id() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let mine = add(&conn, "mine");
-    let theirs = add(&conn, "theirs");
-    conn.execute(
-        "UPDATE memories SET node_id = 'caller-node' WHERE id = ?",
-        [&mine],
-    )
-    .unwrap();
-    conn.execute(
-        "UPDATE memories SET node_id = 'someone-else' WHERE id = ?",
-        [&theirs],
-    )
-    .unwrap();
+    let store = db.store();
+    let mine = add(&store, "mine");
+    let theirs = add(&store, "theirs");
+    store
+        .sqlite()
+        .unwrap()
+        .execute(
+            "UPDATE memories SET node_id = 'caller-node' WHERE id = ?",
+            [&mine],
+        )
+        .unwrap();
+    store
+        .sqlite()
+        .unwrap()
+        .execute(
+            "UPDATE memories SET node_id = 'someone-else' WHERE id = ?",
+            [&theirs],
+        )
+        .unwrap();
 
     let (_, response) = serve(
-        &conn,
+        &store,
         &authed("GET", "/sync/pull?exclude_node=caller-node", ""),
     );
 
@@ -317,17 +328,20 @@ fn pull_excludes_the_callers_own_node_id() {
 #[test]
 fn pull_since_excludes_everything_at_or_before_the_cursor() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "old");
-    conn.execute(
-        "UPDATE memories SET updated_at = '2020-01-01T00:00:00+00:00'",
-        [],
-    )
-    .unwrap();
-    add(&conn, "new");
+    let store = db.store();
+    add(&store, "old");
+    store
+        .sqlite()
+        .unwrap()
+        .execute(
+            "UPDATE memories SET updated_at = '2020-01-01T00:00:00+00:00'",
+            [],
+        )
+        .unwrap();
+    add(&store, "new");
 
     let (_, response) = serve(
-        &conn,
+        &store,
         &authed("GET", "/sync/pull?since=2025-01-01T00:00:00+00:00", ""),
     );
 
@@ -339,12 +353,12 @@ fn pull_since_excludes_everything_at_or_before_the_cursor() {
 #[test]
 fn pull_limit_is_clamped_to_the_server_side_maximum() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "one");
+    let store = db.store();
+    add(&store, "one");
 
     // A client-requested limit far above MAX_PULL_LIMIT must not be honored
     // literally -- it is clamped, not trusted.
-    let (status, response) = serve(&conn, &authed("GET", "/sync/pull?limit=999999", ""));
+    let (status, response) = serve(&store, &authed("GET", "/sync/pull?limit=999999", ""));
 
     assert_eq!(status, 200);
     assert_eq!(response["records"].as_array().unwrap().len(), 1);
@@ -353,7 +367,7 @@ fn pull_limit_is_clamped_to_the_server_side_maximum() {
 #[test]
 fn pull_over_an_empty_store_returns_no_records() {
     let db = Database::open_in_memory().unwrap();
-    let (status, response) = serve(&db.conn(), &authed("GET", "/sync/pull", ""));
+    let (status, response) = serve(&db.store(), &authed("GET", "/sync/pull", ""));
     assert_eq!(status, 200);
     assert_eq!(response["records"].as_array().unwrap().len(), 0);
     assert_eq!(response["count"], 0);
@@ -397,11 +411,11 @@ fn sync_enabled_requires_all_three_of_node_id_hub_url_and_secret() {
 #[test]
 fn count_reports_the_hubs_field_shape() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "one");
-    add(&conn, "two");
+    let store = db.store();
+    add(&store, "one");
+    add(&store, "two");
 
-    let (status, body) = serve(&conn, &authed("GET", "/count", ""));
+    let (status, body) = serve(&store, &authed("GET", "/count", ""));
 
     assert_eq!(status, 200);
     // Field-for-field the hub's shape, so one client-side comparator serves
@@ -423,7 +437,7 @@ fn count_reports_the_hubs_field_shape() {
 fn count_always_reports_approximate_false_and_never_omits_it() {
     let db = Database::open_in_memory().unwrap();
 
-    let (_, body) = serve(&db.conn(), &authed("GET", "/count", ""));
+    let (_, body) = serve(&db.store(), &authed("GET", "/count", ""));
 
     // A peer has no planner estimates to offer — the hub's `?approx=1` is a
     // Postgres reltuples read with no SQLite equivalent. The field is still
@@ -439,16 +453,19 @@ fn count_always_reports_approximate_false_and_never_omits_it() {
 #[test]
 fn count_includes_tombstones_in_the_total() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "will be tombstoned");
-    add(&conn, "still live");
-    conn.execute(
-        "UPDATE memories SET deleted_at = '2026-01-01T00:00:00+00:00' WHERE id = ?",
-        [&id],
-    )
-    .unwrap();
+    let store = db.store();
+    let id = add(&store, "will be tombstoned");
+    add(&store, "still live");
+    store
+        .sqlite()
+        .unwrap()
+        .execute(
+            "UPDATE memories SET deleted_at = '2026-01-01T00:00:00+00:00' WHERE id = ?",
+            [&id],
+        )
+        .unwrap();
 
-    let (_, body) = serve(&conn, &authed("GET", "/count", ""));
+    let (_, body) = serve(&store, &authed("GET", "/count", ""));
 
     // Deliberately NOT filtered on deleted_at. Both ends of a reconcile have
     // to count identically: the hub counts every row and reports tombstones
@@ -463,7 +480,7 @@ fn count_includes_tombstones_in_the_total() {
 fn count_requires_authorization() {
     let db = Database::open_in_memory().unwrap();
 
-    let (status, _) = serve(&db.conn(), &request("GET", "/count", None, ""));
+    let (status, _) = serve(&db.store(), &request("GET", "/count", None, ""));
 
     assert_eq!(status, 401);
 }
@@ -474,7 +491,7 @@ fn a_post_on_the_count_path_is_not_allowed() {
 
     // 405 rather than 404: the path exists, the method does not. Registering
     // it in the known-paths list is what makes that distinction possible.
-    let (status, _) = serve(&db.conn(), &authed("POST", "/count", ""));
+    let (status, _) = serve(&db.store(), &authed("POST", "/count", ""));
 
     assert_eq!(status, 405);
 }
@@ -483,7 +500,7 @@ fn a_post_on_the_count_path_is_not_allowed() {
 fn health_also_reports_the_serving_build() {
     let db = Database::open_in_memory().unwrap();
 
-    let (_, body) = serve(&db.conn(), &authed("GET", "/health", ""));
+    let (_, body) = serve(&db.store(), &authed("GET", "/health", ""));
 
     // A reconcile reports which build each side is running, and this is where
     // the other side reads it from.

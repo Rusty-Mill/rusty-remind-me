@@ -12,6 +12,7 @@
 //! rate — silently, in a store both sides are supposed to read identically.
 
 use remind_me_core::db::migrations::SCHEMA_VERSION;
+use remind_me_core::db::Store;
 use remind_me_core::vitality::{get_decay_rate, get_type_prior, REFERENCE_DECAY_RATE};
 use remind_me_core::Database;
 use rusqlite::Connection;
@@ -49,10 +50,11 @@ fn open_with_rows(
     rows: &[(&str, &str, &str, f64)],
 ) -> Database {
     {
-        let conn = Connection::open(path).unwrap();
+        let store = Connection::open(path).unwrap();
         // Minimal shape: the reconciler adds every other column.
-        conn.execute_batch(
-            "CREATE TABLE memories (
+        store
+            .execute_batch(
+                "CREATE TABLE memories (
                  id TEXT PRIMARY KEY,
                  content TEXT NOT NULL,
                  source TEXT NOT NULL DEFAULT 'manual',
@@ -62,30 +64,35 @@ fn open_with_rows(
                  updated_at TEXT NOT NULL,
                  deleted_at TEXT
              );",
-        )
-        .unwrap();
-        for (id, source, memory_type, decay_rate) in rows {
-            conn.execute(
-                "INSERT INTO memories
-                     (id, content, source, memory_type, decay_rate, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
-                rusqlite::params![id, format!("body of {id}"), source, memory_type, decay_rate],
             )
             .unwrap();
+        for (id, source, memory_type, decay_rate) in rows {
+            store
+                .execute(
+                    "INSERT INTO memories
+                     (id, content, source, memory_type, decay_rate, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
+                    rusqlite::params![id, format!("body of {id}"), source, memory_type, decay_rate],
+                )
+                .unwrap();
         }
-        conn.execute_batch(&format!("PRAGMA user_version = {version};"))
+        store
+            .execute_batch(&format!("PRAGMA user_version = {version};"))
             .unwrap();
     }
     Database::open(path).unwrap()
 }
 
-fn row(conn: &Connection, id: &str) -> (String, f64, String) {
-    conn.query_row(
-        "SELECT memory_type, decay_rate, updated_at FROM memories WHERE id = ?",
-        [id],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-    )
-    .unwrap()
+fn row(store: &Store<'_>, id: &str) -> (String, f64, String) {
+    store
+        .sqlite()
+        .unwrap()
+        .query_row(
+            "SELECT memory_type, decay_rate, updated_at FROM memories WHERE id = ?",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -143,10 +150,10 @@ fn v29_refiles_mempalace_facts_as_reference() {
             ("m_prefixed", "mempalace:rusty_lsp", "fact", 0.05),
         ],
     );
-    let conn = db.conn();
+    let store = db.store();
 
     for id in ["m_import", "m_prefixed"] {
-        let (memory_type, decay_rate, updated_at) = row(&conn, id);
+        let (memory_type, decay_rate, updated_at) = row(&store, id);
         assert_eq!(memory_type, "reference", "{id} should have been refiled");
         // decay_rate moves with the type. It is stored per row, so changing
         // memory_type alone would leave these decaying at fact's 0.05 forever
@@ -176,14 +183,14 @@ fn v29_leaves_everything_else_alone() {
             ("keep_lookalike", "not_mempalace_import", "fact", 0.05),
         ],
     );
-    let conn = db.conn();
+    let store = db.store();
 
     for (id, expected_type, expected_rate) in [
         ("keep_decision", "decision", 0.02),
         ("keep_fact", "fact", 0.05),
         ("keep_lookalike", "fact", 0.05),
     ] {
-        let (memory_type, decay_rate, updated_at) = row(&conn, id);
+        let (memory_type, decay_rate, updated_at) = row(&store, id);
         assert_eq!(memory_type, expected_type, "{id} was reclassified");
         assert_eq!(decay_rate, expected_rate, "{id} had its decay rate moved");
         assert_eq!(
@@ -204,19 +211,26 @@ fn v29_does_not_re_run_on_a_database_already_at_29() {
     let path = tmp.db_path();
     {
         let db = open_with_rows(&path, 28, &[("m", "mempalace_import", "fact", 0.05)]);
-        let conn = db.conn();
-        assert_eq!(row(&conn, "m").0, "reference", "precondition: refiled once");
+        let store = db.store();
+        assert_eq!(
+            row(&store, "m").0,
+            "reference",
+            "precondition: refiled once"
+        );
         // The user disagrees and moves it back.
-        conn.execute(
-            "UPDATE memories SET memory_type = 'fact', decay_rate = 0.05 WHERE id = 'm'",
-            [],
-        )
-        .unwrap();
+        store
+            .sqlite()
+            .unwrap()
+            .execute(
+                "UPDATE memories SET memory_type = 'fact', decay_rate = 0.05 WHERE id = 'm'",
+                [],
+            )
+            .unwrap();
     }
 
     let db = Database::open(&path).unwrap();
-    let conn = db.conn();
-    let (memory_type, decay_rate, _) = row(&conn, "m");
+    let store = db.store();
+    let (memory_type, decay_rate, _) = row(&store, "m");
     assert_eq!(
         memory_type, "fact",
         "a deliberate reclassification must survive the next open"
@@ -228,9 +242,11 @@ fn v29_does_not_re_run_on_a_database_already_at_29() {
 fn v29_is_a_no_op_on_a_vault_with_no_such_imports() {
     let tmp = TmpDir::new("noop");
     let db = open_with_rows(&tmp.db_path(), 28, &[("plain", "manual", "fact", 0.05)]);
-    let conn = db.conn();
-    assert_eq!(row(&conn, "plain").0, "fact");
-    let version: i32 = conn
+    let store = db.store();
+    assert_eq!(row(&store, "plain").0, "fact");
+    let version: i32 = store
+        .sqlite()
+        .unwrap()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(version, SCHEMA_VERSION);
@@ -243,9 +259,10 @@ fn a_deleted_row_is_not_refiled() {
     let tmp = TmpDir::new("deleted");
     let path = tmp.db_path();
     {
-        let conn = Connection::open(&path).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE memories (
+        let store = Connection::open(&path).unwrap();
+        store
+            .execute_batch(
+                "CREATE TABLE memories (
                  id TEXT PRIMARY KEY,
                  content TEXT NOT NULL,
                  source TEXT NOT NULL DEFAULT 'manual',
@@ -261,13 +278,13 @@ fn a_deleted_row_is_not_refiled() {
                      '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00',
                      '2026-02-01T00:00:00+00:00');
              PRAGMA user_version = 28;",
-        )
-        .unwrap();
+            )
+            .unwrap();
     }
 
     let db = Database::open(&path).unwrap();
-    let conn = db.conn();
-    let (memory_type, _, updated_at) = row(&conn, "gone");
+    let store = db.store();
+    let (memory_type, _, updated_at) = row(&store, "gone");
     assert_eq!(memory_type, "fact", "a tombstone must not be refiled");
     assert_eq!(updated_at, "2026-01-01T00:00:00+00:00");
 }

@@ -34,10 +34,12 @@
 //! webhook must not silently accumulate undelivered reminders forever.
 
 use crate::db::reminders::Reminders;
+use crate::db::Result;
+use crate::db::Store;
 use crate::models::Memory;
 use crate::notifications;
 use crate::reminders;
-use rusqlite::{Connection, Result};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -77,8 +79,8 @@ fn preview(content: &str) -> String {
 /// deliberately the same definition: the scheduler deciding "due" differently
 /// from what `remind_me_list_reminders` shows would mean a reminder could sit
 /// visibly overdue while the loop never picked it up.
-pub fn due_reminders(conn: &Connection) -> Result<Vec<Memory>> {
-    reminders::list_reminders(conn, crate::models::ReminderWindow::Overdue, i64::MAX)
+pub fn due_reminders(store: &Store<'_>) -> Result<Vec<Memory>> {
+    reminders::list_reminders(store, crate::models::ReminderWindow::Overdue, i64::MAX)
 }
 
 /// Log the reminder, then fan out to any configured channel.
@@ -99,8 +101,8 @@ pub fn deliver(memory: &Memory) {
 }
 
 /// Deliver every due, not-yet-delivered reminder once. Returns how many.
-pub fn poll_once(conn: &Connection) -> Result<usize> {
-    poll_once_with(conn, &mut deliver)
+pub fn poll_once(store: &Store<'_>) -> Result<usize> {
+    poll_once_with(store, &mut deliver)
 }
 
 /// [`poll_once`] with the delivery step injected.
@@ -108,9 +110,9 @@ pub fn poll_once(conn: &Connection) -> Result<usize> {
 /// The seam exists so a test can assert *which* reminders a pass picks up
 /// without a live webhook, and so an embedder can replace delivery wholesale
 /// without touching the due query.
-pub fn poll_once_with(conn: &Connection, deliver: &mut dyn FnMut(&Memory)) -> Result<usize> {
-    let due = due_reminders(conn)?;
-    let repo = Reminders::new(conn);
+pub fn poll_once_with(store: &Store<'_>, deliver: &mut dyn FnMut(&Memory)) -> Result<usize> {
+    let due = due_reminders(store)?;
+    let repo = Reminders::new(store);
     let mut delivered = 0usize;
 
     for memory in &due {
@@ -294,18 +296,18 @@ impl SchedulerHandle {
 ///
 /// Following the shape `pid`/`backup`/`status` already established — each
 /// keeps its own copy of this one-line `PRAGMA` rather than sharing a helper.
-fn database_path(conn: &Connection) -> Option<std::path::PathBuf> {
-    crate::db::database_path(conn).ok().flatten()
+fn database_path(store: &Store<'_>) -> Option<std::path::PathBuf> {
+    crate::db::database_path(store).ok().flatten()
 }
 
-/// Start the scheduler for the database `conn` is attached to.
+/// Start the scheduler for the database `store` is attached to.
 ///
 /// Returns `None` for an in-memory database: the loop's thread opens its own
 /// connection by path, and `:memory:` would give it a *different*, empty
 /// database rather than this one. Silently polling an empty database forever
 /// would look exactly like a vault with nothing due.
-pub fn start_scheduler_for(conn: &Connection) -> Option<SchedulerHandle> {
-    Some(start_scheduler(database_path(conn)?))
+pub fn start_scheduler_for(store: &Store<'_>) -> Option<SchedulerHandle> {
+    Some(start_scheduler(database_path(store)?))
 }
 
 pub fn start_scheduler(db_path: std::path::PathBuf) -> SchedulerHandle {
@@ -319,8 +321,8 @@ pub fn start_scheduler(db_path: std::path::PathBuf) -> SchedulerHandle {
         .name("reminder-scheduler".to_string())
         .spawn(move || {
             let _liveness_guard = liveness_guard;
-            let conn = match Connection::open(&db_path) {
-                Ok(conn) => conn,
+            let store = match Connection::open(&db_path) {
+                Ok(store) => store,
                 Err(e) => {
                     eprintln!("reminder scheduler: cannot open {:?}: {}", db_path, e);
                     return;
@@ -330,7 +332,7 @@ pub fn start_scheduler(db_path: std::path::PathBuf) -> SchedulerHandle {
                 // A failed pass is reported and the loop continues. A
                 // transient database error must not silently end reminder
                 // delivery for the rest of the process's life.
-                match poll_once(&conn) {
+                match poll_once(&Store::over_sqlite(&store)) {
                     Ok(0) => {}
                     Ok(n) => eprintln!("reminder scheduler: delivered {} reminder(s)", n),
                     Err(e) => eprintln!("reminder scheduler: poll failed: {}", e),

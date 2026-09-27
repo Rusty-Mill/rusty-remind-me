@@ -1330,8 +1330,8 @@ impl McpServer {
             }
             "resources/read" => {
                 let req_id = id.unwrap_or(json!(1));
-                let conn = self.db.conn();
-                match stats::collect(&conn) {
+                let store = self.db.store();
+                match stats::collect(&store) {
                     Ok(s) => Some(json!({
                         "jsonrpc": "2.0",
                         "id": req_id,
@@ -1394,7 +1394,7 @@ impl McpServer {
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
                 // Read before `args` is moved into any tool's input model.
                 let format = requested_format(&args);
-                let conn = self.db.conn();
+                let store = self.db.store();
                 // Hidden means gone, not merely undocumented: a model that
                 // guessed the name would otherwise still reach it, and a
                 // caller who trimmed their surface would never know it was
@@ -1435,7 +1435,7 @@ impl McpServer {
                     "remind_me_add" => {
                         let input: Result<MemoryAddInput, _> = serde_json::from_value(args);
                         match input {
-                            Ok(add_input) => match queries::add_memory(&conn, add_input) {
+                            Ok(add_input) => match queries::add_memory(&store, add_input) {
                                 Ok(mem) => {
                                     json!({ "content": [{ "type": "text", "text": match format {
     ResponseFormat::Json => serde_json::to_string_pretty(&mem).unwrap(),
@@ -1461,7 +1461,7 @@ impl McpServer {
                             .and_then(|v| v.as_str())
                             .or_else(|| args.get("id").and_then(|v| v.as_str()))
                             .unwrap_or("");
-                        match queries::get_memory_by_id(&conn, id) {
+                        match queries::get_memory_by_id(&store, id) {
                             Ok(Some(mem)) => {
                                 json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&mem).unwrap() }] })
                             }
@@ -1476,7 +1476,7 @@ impl McpServer {
                     "remind_me_list" => {
                         let input: Result<MemoryListInput, _> = serde_json::from_value(args);
                         match input {
-                            Ok(list_input) => match queries::list_memories(&conn, &list_input) {
+                            Ok(list_input) => match queries::list_memories(&store, &list_input) {
                                 Ok(page) => {
                                     // Same as search above: the field was
                                     // parsed with the reference's Markdown
@@ -1507,7 +1507,7 @@ impl McpServer {
                         let input: Result<MemoryUpdateInput, _> = serde_json::from_value(args);
                         match input {
                             Ok(update_input) => {
-                                match queries::update_memory(&conn, &update_input) {
+                                match queries::update_memory(&store, &update_input) {
                                     Ok(UpdateOutcome::Updated(mem)) => {
                                         json!({ "content": [{ "type": "text", "text": match format {
     ResponseFormat::Json => serde_json::to_string_pretty(&mem).unwrap(),
@@ -1533,7 +1533,7 @@ impl McpServer {
                     "remind_me_delete" => {
                         let memory_id =
                             args.get("memory_id").and_then(|v| v.as_str()).unwrap_or("");
-                        match queries::delete_memory(&conn, memory_id) {
+                        match queries::delete_memory(&store, memory_id) {
                             Ok(true) => {
                                 json!({ "content": [{ "type": "text", "text": format!("Memory `{}` deleted", memory_id) }] })
                             }
@@ -1549,7 +1549,7 @@ impl McpServer {
                         let input: Result<MemorySearchInput, _> = serde_json::from_value(args);
                         match input {
                             Ok(search_input) => {
-                                match queries::search_with_expansions(&conn, &search_input) {
+                                match queries::search_with_expansions(&store, &search_input) {
                                     Ok(res) => {
                                         // `MemorySearchInput` already carries
                                         // `response_format`, already defaulting
@@ -1589,7 +1589,7 @@ impl McpServer {
                                 let limit = lookup
                                     .limit
                                     .clamp(ENTITY_LOOKUP_LIMIT_MIN, ENTITY_LOOKUP_LIMIT_MAX);
-                                match entity::entity_profile(&conn, &lookup.name, limit) {
+                                match entity::entity_profile(&store, &lookup.name, limit) {
                                     Ok(Some(profile)) => {
                                         // `found` alongside the profile's own
                                         // fields, not wrapping them -- the
@@ -1632,7 +1632,7 @@ impl McpServer {
                     "remind_me_entity_upsert" => {
                         let input: Result<EntityInput, _> = serde_json::from_value(args);
                         match input {
-                            Ok(ent_input) => match entity::upsert_entity(&conn, &ent_input) {
+                            Ok(ent_input) => match entity::upsert_entity(&store, &ent_input) {
                                 Ok(ent) => {
                                     json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&ent).unwrap() }] })
                                 }
@@ -1648,7 +1648,7 @@ impl McpServer {
                     "remind_me_extract_batch" => {
                         let input: ExtractBatchInput = serde_json::from_value(args)
                             .unwrap_or(ExtractBatchInput { batch_size: 20 });
-                        match queries::unannotated_batch(&conn, &input) {
+                        match queries::unannotated_batch(&store, &input) {
                             Ok(batch) => {
                                 json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&batch).unwrap() }] })
                             }
@@ -1660,14 +1660,16 @@ impl McpServer {
                     "remind_me_import_chat" => {
                         let input: Result<ChatImportInput, _> = serde_json::from_value(args);
                         match input {
-                            Ok(import_input) => match importer::import_chat(&conn, &import_input) {
-                                Ok(outcome) => {
-                                    json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&outcome).unwrap() }] })
+                            Ok(import_input) => {
+                                match importer::import_chat(&store, &import_input) {
+                                    Ok(outcome) => {
+                                        json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&outcome).unwrap() }] })
+                                    }
+                                    Err(e) => {
+                                        json!({ "isError": true, "content": [{ "type": "text", "text": format!("Import error: {}", e) }] })
+                                    }
                                 }
-                                Err(e) => {
-                                    json!({ "isError": true, "content": [{ "type": "text", "text": format!("Import error: {}", e) }] })
-                                }
-                            },
+                            }
                             Err(e) => {
                                 json!({ "isError": true, "content": [{ "type": "text", "text": format!("Invalid import input: {}", e) }] })
                             }
@@ -1677,7 +1679,7 @@ impl McpServer {
                         let input: Result<BulkImportDirInput, _> = serde_json::from_value(args);
                         match input {
                             Ok(import_input) => {
-                                match importer::import_directory(&conn, &import_input) {
+                                match importer::import_directory(&store, &import_input) {
                                     Ok(result) => {
                                         json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap() }] })
                                     }
@@ -1708,7 +1710,7 @@ impl McpServer {
                         // not of the folder scan, and the watcher has no
                         // connection to ask.
                         report.pending_wiki_compile =
-                            remind_me_core::wiki_fs::pending_compile_count(&conn).unwrap_or(0);
+                            remind_me_core::wiki_fs::pending_compile_count(&store).unwrap_or(0);
                         json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&report).unwrap() }] })
                     }
                     "remind_me_check_update" => {
@@ -1766,7 +1768,7 @@ impl McpServer {
                         };
                         json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&body).unwrap() }] })
                     }
-                    "remind_me_reindex" => match vectors::reindex(&conn) {
+                    "remind_me_reindex" => match vectors::reindex(&store) {
                         Ok(result) => {
                             json!({ "content": [{ "type": "text", "text": match format {
     ResponseFormat::Json => serde_json::to_string_pretty(&result).unwrap(),
@@ -1780,7 +1782,7 @@ impl McpServer {
                     "remind_me_import_dbs" => {
                         let input: Result<DbsImportInput, _> = serde_json::from_value(args);
                         match input {
-                            Ok(import_input) => match dbs_import::pull_dbs(&conn, &import_input) {
+                            Ok(import_input) => match dbs_import::pull_dbs(&store, &import_input) {
                                 Ok(result) => {
                                     json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap() }] })
                                 }
@@ -1797,7 +1799,7 @@ impl McpServer {
                         let input: Result<MempalaceImportInput, _> = serde_json::from_value(args);
                         match input {
                             Ok(import_input) => {
-                                match mempalace_import::pull_mempalace(&conn, &import_input) {
+                                match mempalace_import::pull_mempalace(&store, &import_input) {
                                     Ok(result) => {
                                         json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap() }] })
                                     }
@@ -1822,7 +1824,7 @@ impl McpServer {
                         });
                         json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&body).unwrap() }] })
                     }
-                    "remind_me_server_status" => match status::server_status(&conn) {
+                    "remind_me_server_status" => match status::server_status(&store) {
                         Ok(report) => {
                             // The webhook's/sync peer's state lives on these
                             // structs, not on the connection, so they are
@@ -1841,7 +1843,7 @@ impl McpServer {
                             report["sync_peer"] =
                                 serde_json::to_value(self.sync_peer.status()).unwrap_or(json!({}));
                             report["sync"] = serde_json::to_value(
-                                remind_me_core::sync::sync_live_status(&conn).unwrap_or_else(
+                                remind_me_core::sync::sync_live_status(&store).unwrap_or_else(
                                     remind_me_core::sync::sync_worker_disabled_status,
                                 ),
                             )
@@ -1876,7 +1878,7 @@ impl McpServer {
                             // database has nowhere to put one, which is not
                             // an error: it just means there is no dashboard
                             // to find.
-                            report["dashboard"] = match remind_me_core::pid::pid_file_path(&conn)
+                            report["dashboard"] = match remind_me_core::pid::pid_file_path(&store)
                             {
                                 Ok(path) => serde_json::to_value(
                                     remind_me_core::pid::dashboard_status(&path),
@@ -1903,7 +1905,7 @@ impl McpServer {
                     },
                     "remind_me_export_memories" => {
                         let input: ExportInput = serde_json::from_value(args).unwrap_or_default();
-                        match export::export_memories(&conn, &input) {
+                        match export::export_memories(&store, &input) {
                             Ok(result) => {
                                 json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap() }] })
                             }
@@ -1921,7 +1923,7 @@ impl McpServer {
                                 {
                                     json!({ "isError": true, "content": [{ "type": "text", "text": format!("facts must hold {}..={} entries", DECOMPOSE_FACTS_MIN, DECOMPOSE_FACTS_MAX) }] })
                                 } else {
-                                    match capture::decompose(&conn, &decompose_input) {
+                                    match capture::decompose(&store, &decompose_input) {
                                         Ok(Some(result)) => {
                                             json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap() }] })
                                         }
@@ -1942,7 +1944,7 @@ impl McpServer {
                     "remind_me_decompose_batch" => {
                         let input: DecomposeBatchInput = serde_json::from_value(args)
                             .unwrap_or(DecomposeBatchInput { batch_size: 20 });
-                        match capture::undecomposed_batch(&conn, &input) {
+                        match capture::undecomposed_batch(&store, &input) {
                             Ok(batch) => {
                                 json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&batch).unwrap() }] })
                             }
@@ -1955,7 +1957,7 @@ impl McpServer {
                         let input: Result<AutoCaptureInput, _> = serde_json::from_value(args);
                         match input {
                             Ok(capture_input) => {
-                                match capture::auto_capture(&conn, &capture_input) {
+                                match capture::auto_capture(&store, &capture_input) {
                                     Ok(result) => {
                                         json!({ "content": [{ "type": "text", "text": match format {
     ResponseFormat::Json => serde_json::to_string_pretty(&result).unwrap(),
@@ -1977,7 +1979,7 @@ impl McpServer {
                             .get("capture_id")
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
-                        match capture::get_capture(&conn, capture_id) {
+                        match capture::get_capture(&store, capture_id) {
                             Ok(Some(found)) => {
                                 json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&found).unwrap() }] })
                             }
@@ -1997,7 +1999,7 @@ impl McpServer {
                             .get("dry_run")
                             .and_then(|v| v.as_bool())
                             .unwrap_or(true);
-                        match remind_me_core::archive::prune(&conn, dry_run) {
+                        match remind_me_core::archive::prune(&store, dry_run) {
                             Ok(report) => {
                                 json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&report).unwrap() }] })
                             }
@@ -2019,14 +2021,14 @@ impl McpServer {
                         match rung {
                             Ok(rung) => {
                                 match remind_me_core::promotion::promotion_candidates(
-                                    &conn, rung, limit,
+                                    &store, rung, limit,
                                 ) {
                                     Ok(found) => {
                                         // The whole backlog rides along, not
                                         // just this rung's: a caller working
                                         // one rung has no other way to notice
                                         // the one below it filling up.
-                                        let backlog = remind_me_core::promotion::backlog(&conn)
+                                        let backlog = remind_me_core::promotion::backlog(&store)
                                             .unwrap_or_default();
                                         // Uncapped, unlike `backlog` above (which probes
                                         // only up to BACKLOG_PROBE per rung so it stays
@@ -2035,7 +2037,7 @@ impl McpServer {
                                         // ceiling instead of reading as stuck (#283).
                                         let total_candidates =
                                             remind_me_core::promotion::count_candidates(
-                                                &conn, rung,
+                                                &store, rung,
                                             )
                                             .unwrap_or_default();
                                         json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&json!({
@@ -2069,7 +2071,7 @@ impl McpServer {
                         let parsed: std::result::Result<remind_me_core::PromoteInput, _> =
                             serde_json::from_value(args.clone());
                         match parsed {
-                            Ok(input) => match remind_me_core::promotion::promote(&conn, &input) {
+                            Ok(input) => match remind_me_core::promotion::promote(&store, &input) {
                                 Ok(result) => {
                                     json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap() }] })
                                 }
@@ -2088,7 +2090,7 @@ impl McpServer {
                             .and_then(|v| v.as_u64())
                             .unwrap_or(STALE_CANDIDATES_LIMIT_DEFAULT as u64)
                             as usize;
-                        match remind_me_core::code_refs::stale_candidates(&conn, limit) {
+                        match remind_me_core::code_refs::stale_candidates(&store, limit) {
                             Ok(found) => {
                                 json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&json!({
                                     "count": found.candidates.len(),
@@ -2106,10 +2108,10 @@ impl McpServer {
                             .get("include_demoted")
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
-                        match remind_me_core::promotion::persona(&conn) {
+                        match remind_me_core::promotion::persona(&store) {
                             Ok(statements) => {
                                 let demoted = if include_demoted {
-                                    remind_me_core::promotion::demoted(&conn).unwrap_or_default()
+                                    remind_me_core::promotion::demoted(&store).unwrap_or_default()
                                 } else {
                                     Vec::new()
                                 };
@@ -2130,7 +2132,7 @@ impl McpServer {
                     "remind_me_provenance" => {
                         let memory_id =
                             args.get("memory_id").and_then(|v| v.as_str()).unwrap_or("");
-                        match remind_me_core::promotion::provenance(&conn, memory_id) {
+                        match remind_me_core::promotion::provenance(&store, memory_id) {
                             Ok(found) => {
                                 json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&found).unwrap() }] })
                             }
@@ -2144,7 +2146,7 @@ impl McpServer {
                             serde_json::from_value(args.clone());
                         match parsed {
                             Ok(input) => {
-                                match remind_me_core::skeleton::write_skeleton(&conn, &input) {
+                                match remind_me_core::skeleton::write_skeleton(&store, &input) {
                                     Ok(written) => {
                                         json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&written).unwrap() }] })
                                     }
@@ -2173,7 +2175,7 @@ impl McpServer {
                             .filter(|n| !n.trim().is_empty());
                         match node {
                             Some(node) => {
-                                match remind_me_core::skeleton::node_slice(&conn, capture_id, node)
+                                match remind_me_core::skeleton::node_slice(&store, capture_id, node)
                                 {
                                     Ok(Some(slice)) => {
                                         json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&slice).unwrap() }] })
@@ -2187,7 +2189,7 @@ impl McpServer {
                                 }
                             }
                             None => {
-                                match remind_me_core::skeleton::read_skeleton(&conn, capture_id) {
+                                match remind_me_core::skeleton::read_skeleton(&store, capture_id) {
                                     Ok(Some(skeleton)) => {
                                         json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&skeleton).unwrap() }] })
                                     }
@@ -2209,7 +2211,7 @@ impl McpServer {
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
                         match remind_me_core::archive::source_for(
-                            &conn,
+                            &store,
                             memory_id,
                             include_sensitive,
                         ) {
@@ -2236,7 +2238,7 @@ impl McpServer {
                     "remind_me_normalize_batch" => {
                         let input: NormalizeBatchInput = serde_json::from_value(args)
                             .unwrap_or(NormalizeBatchInput { batch_size: 20 });
-                        match normalize::unnormalized_batch(&conn, &input) {
+                        match normalize::unnormalized_batch(&store, &input) {
                             Ok(batch) => {
                                 json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&batch).unwrap() }] })
                             }
@@ -2246,7 +2248,7 @@ impl McpServer {
                         }
                     }
                     "remind_me_sync_reconcile" => {
-                        match remind_me_core::sync::reconcile_hub(&conn) {
+                        match remind_me_core::sync::reconcile_hub(&store) {
                             Ok(report) => {
                                 json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&report).unwrap() }] })
                             }
@@ -2258,7 +2260,7 @@ impl McpServer {
                     "remind_me_sync_reconcile_peer" => {
                         match serde_json::from_value::<ReconcilePeerInput>(args) {
                             Ok(input) => {
-                                match remind_me_core::sync::reconcile_peer(&conn, &input.node_id) {
+                                match remind_me_core::sync::reconcile_peer(&store, &input.node_id) {
                                     Ok(report) => {
                                         json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&report).unwrap() }] })
                                     }
@@ -2335,7 +2337,7 @@ impl McpServer {
                         // back a URL that silently never resolves.
                         let token = remind_me_core::ics::resolve_ics_token();
                         let feed_path = remind_me_core::ics::feed_path(&token);
-                        let status = remind_me_core::pid::pid_file_path(&conn)
+                        let status = remind_me_core::pid::pid_file_path(&store)
                             .ok()
                             .map(|path| remind_me_core::pid::dashboard_status(&path));
                         let text = match status.filter(|s| s.running).and_then(|s| s.url) {
@@ -2352,7 +2354,7 @@ impl McpServer {
                     "remind_me_set_reminder" => {
                         match serde_json::from_value::<SetReminderInput>(args) {
                             Ok(input) => match remind_me_core::reminders::set_reminder(
-                                &conn,
+                                &store,
                                 &input.memory_id,
                                 input.remind_at.as_deref(),
                             ) {
@@ -2375,7 +2377,7 @@ impl McpServer {
                         let input: ListRemindersInput =
                             serde_json::from_value(args).unwrap_or_default();
                         let limit = input.limit.clamp(REMINDER_LIMIT_MIN, REMINDER_LIMIT_MAX);
-                        match remind_me_core::reminders::list_reminders(&conn, input.when, limit) {
+                        match remind_me_core::reminders::list_reminders(&store, input.when, limit) {
                             Ok(memories) => {
                                 let text = match input.response_format {
                                     ResponseFormat::Json => json!({
@@ -2396,7 +2398,7 @@ impl McpServer {
                             }
                         }
                     }
-                    "remind_me_sync_status" => match remind_me_core::sync::sync_status(&conn) {
+                    "remind_me_sync_status" => match remind_me_core::sync::sync_status(&store) {
                         Ok(status) => {
                             json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&status).unwrap() }] })
                         }
@@ -2409,7 +2411,7 @@ impl McpServer {
                             serde_json::from_value(args).unwrap_or(SyncRepairInput {
                                 remote_id: "hub".to_string(),
                             });
-                        match remind_me_core::sync::sync_repair(&conn, &input.remote_id) {
+                        match remind_me_core::sync::sync_repair(&store, &input.remote_id) {
                             Ok(true) => {
                                 json!({ "content": [{ "type": "text", "text": format!("Reset pull cursors for '{}'. The next sync will re-pull its history.", input.remote_id) }] })
                             }
@@ -2434,7 +2436,7 @@ impl McpServer {
                         input.since_days = input
                             .since_days
                             .clamp(digest::DIGEST_SINCE_DAYS_MIN, digest::DIGEST_SINCE_DAYS_MAX);
-                        match digest::build_digest(&conn, input.since_days) {
+                        match digest::build_digest(&store, input.since_days) {
                             Ok(data) => {
                                 let text = match input.response_format {
                                     ResponseFormat::Json => {
@@ -2468,7 +2470,7 @@ impl McpServer {
                                 json!({ "isError": true, "content": [{ "type": "text", "text": message }] })
                             }
                             Ok(cursor) => {
-                                match contradictions::candidates(&conn, input.limit, cursor) {
+                                match contradictions::candidates(&store, input.limit, cursor) {
                                     Ok(result) => {
                                         json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap() }] })
                                     }
@@ -2482,10 +2484,10 @@ impl McpServer {
                     "remind_me_history" => match serde_json::from_value::<HistoryInput>(args) {
                         Ok(mut input) => {
                             input.limit = input.limit.clamp(HISTORY_LIMIT_MIN, HISTORY_LIMIT_MAX);
-                            if !history::memory_is_live(&conn, &input.memory_id).unwrap_or(false) {
+                            if !history::memory_is_live(&store, &input.memory_id).unwrap_or(false) {
                                 json!({ "content": [{ "type": "text", "text": format!("Memory '{}' not found.", input.memory_id) }] })
                             } else {
-                                match history::history(&conn, &input.memory_id, input.limit) {
+                                match history::history(&store, &input.memory_id, input.limit) {
                                     Ok(revisions) => {
                                         let text = match input.response_format {
                                             // The reference's JSON branch is an
@@ -2522,7 +2524,7 @@ impl McpServer {
                     },
                     "remind_me_revert" => match serde_json::from_value::<RevertInput>(args) {
                         Ok(input) => match history::revert(
-                            &conn,
+                            &store,
                             &input.memory_id,
                             input.revision_id,
                             input.reason.as_deref(),
@@ -2543,7 +2545,7 @@ impl McpServer {
                     },
                     "remind_me_save_search" => {
                         match serde_json::from_value::<SaveSearchInput>(args) {
-                            Ok(input) => match saved_searches::save_search(&conn, &input) {
+                            Ok(input) => match saved_searches::save_search(&store, &input) {
                                 Ok(saved) => {
                                     json!({ "content": [{ "type": "text", "text": match format {
     ResponseFormat::Json => serde_json::to_string_pretty(&saved).unwrap(),
@@ -2560,7 +2562,7 @@ impl McpServer {
                         }
                     }
                     "remind_me_list_saved_searches" => {
-                        match saved_searches::list_saved_searches(&conn) {
+                        match saved_searches::list_saved_searches(&store) {
                             Ok(searches) => {
                                 json!({ "content": [{ "type": "text", "text": match format {
     ResponseFormat::Json => serde_json::to_string_pretty(&searches).unwrap(),
@@ -2574,28 +2576,29 @@ impl McpServer {
                     }
                     "remind_me_run_saved_search" => {
                         match serde_json::from_value::<SavedSearchNameInput>(args) {
-                            Ok(input) => match saved_searches::get_saved_search(&conn, &input.name)
-                            {
-                                Ok(Some(saved)) => {
-                                    match saved_searches::run_saved_search(&conn, &saved) {
-                                        Ok(results) => {
-                                            json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&results).unwrap() }] })
-                                        }
-                                        Err(e) => {
-                                            json!({ "isError": true, "content": [{ "type": "text", "text": format!("Run saved search error: {}", e) }] })
+                            Ok(input) => {
+                                match saved_searches::get_saved_search(&store, &input.name) {
+                                    Ok(Some(saved)) => {
+                                        match saved_searches::run_saved_search(&store, &saved) {
+                                            Ok(results) => {
+                                                json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&results).unwrap() }] })
+                                            }
+                                            Err(e) => {
+                                                json!({ "isError": true, "content": [{ "type": "text", "text": format!("Run saved search error: {}", e) }] })
+                                            }
                                         }
                                     }
+                                    // A missing name is a caller mistake with an
+                                    // obvious remedy, not a server error — same
+                                    // posture the reference takes.
+                                    Ok(None) => {
+                                        json!({ "content": [{ "type": "text", "text": format!("Saved search '{}' not found.", input.name) }] })
+                                    }
+                                    Err(e) => {
+                                        json!({ "isError": true, "content": [{ "type": "text", "text": format!("Run saved search error: {}", e) }] })
+                                    }
                                 }
-                                // A missing name is a caller mistake with an
-                                // obvious remedy, not a server error — same
-                                // posture the reference takes.
-                                Ok(None) => {
-                                    json!({ "content": [{ "type": "text", "text": format!("Saved search '{}' not found.", input.name) }] })
-                                }
-                                Err(e) => {
-                                    json!({ "isError": true, "content": [{ "type": "text", "text": format!("Run saved search error: {}", e) }] })
-                                }
-                            },
+                            }
                             Err(e) => {
                                 json!({ "isError": true, "content": [{ "type": "text", "text": format!("Invalid run_saved_search input: {}", e) }] })
                             }
@@ -2604,7 +2607,7 @@ impl McpServer {
                     "remind_me_delete_saved_search" => {
                         match serde_json::from_value::<SavedSearchNameInput>(args) {
                             Ok(input) => {
-                                match saved_searches::delete_saved_search(&conn, &input.name) {
+                                match saved_searches::delete_saved_search(&store, &input.name) {
                                     Ok(true) => {
                                         json!({ "content": [{ "type": "text", "text": format!("Saved search '{}' deleted.", input.name) }] })
                                     }
@@ -2631,7 +2634,7 @@ impl McpServer {
                                 input.limit = input
                                     .limit
                                     .clamp(UNDO_IMPORT_LIMIT_MIN, UNDO_IMPORT_LIMIT_MAX);
-                                match undo_import::undo_import(&conn, &input) {
+                                match undo_import::undo_import(&store, &input) {
                                     Ok(result) => {
                                         json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap() }] })
                                     }
@@ -2656,7 +2659,7 @@ impl McpServer {
                         input.limit = input
                             .limit
                             .clamp(RECALIBRATE_LIMIT_MIN, RECALIBRATE_LIMIT_MAX);
-                        match recalibrate::candidates(&conn, &input) {
+                        match recalibrate::candidates(&store, &input) {
                             Ok(batch) => {
                                 json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&batch).unwrap() }] })
                             }
@@ -2674,7 +2677,7 @@ impl McpServer {
                                 {
                                     json!({ "isError": true, "content": [{ "type": "text", "text": format!("normalizations must hold {}..={} entries", NORMALIZE_APPLY_MIN, NORMALIZE_APPLY_MAX) }] })
                                 } else {
-                                    match normalize::apply_normalizations(&conn, &apply_input) {
+                                    match normalize::apply_normalizations(&store, &apply_input) {
                                         Ok(result) => {
                                             json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap() }] })
                                         }
@@ -2693,7 +2696,7 @@ impl McpServer {
                         let input: Result<EntityTraverseInput, _> = serde_json::from_value(args);
                         match input {
                             Ok(traverse_input) => {
-                                match entity::traverse_from_name(&conn, &traverse_input) {
+                                match entity::traverse_from_name(&store, &traverse_input) {
                                     Ok(result) => {
                                         json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap() }] })
                                     }
@@ -2718,7 +2721,7 @@ impl McpServer {
                         // `slug` argument is still tolerated as the title when
                         // none is given, so an older caller is not broken.
                         let title = if title.is_empty() { slug } else { title };
-                        match self.wiki.write_page(&conn, title, content, log_note) {
+                        match self.wiki.write_page(&store, title, content, log_note) {
                             Ok(Ok(outcome)) => {
                                 json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&outcome).unwrap() }] })
                             }
@@ -2732,7 +2735,7 @@ impl McpServer {
                     }
                     "remind_me_wiki_read" => {
                         let slug = args.get("slug").and_then(|v| v.as_str()).unwrap_or("");
-                        match self.wiki.read_page(&conn, slug) {
+                        match self.wiki.read_page(&store, slug) {
                             Ok(Some(page)) => {
                                 json!({ "content": [{ "type": "text", "text": match format {
     ResponseFormat::Json => serde_json::to_string_pretty(&page).unwrap(),
@@ -2754,7 +2757,7 @@ impl McpServer {
                             .and_then(|v| v.as_bool())
                             .unwrap_or(true);
                         match wiki_import::import_wiki_dir(
-                            &conn,
+                            &store,
                             std::path::Path::new(dir),
                             recursive,
                         ) {
@@ -2791,7 +2794,7 @@ impl McpServer {
                                 if !(RECLASSIFY_BATCH_MIN..=RECLASSIFY_BATCH_MAX).contains(&count) {
                                     json!({ "isError": true, "content": [{ "type": "text", "text": format!("`classifications` must hold {}..={} items, got {}", RECLASSIFY_BATCH_MIN, RECLASSIFY_BATCH_MAX, count) }] })
                                 } else {
-                                    match queries::reclassify_memories(&conn, &rc) {
+                                    match queries::reclassify_memories(&store, &rc) {
                                         Ok(outcome) => {
                                             json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&outcome).unwrap() }] })
                                         }
@@ -2809,7 +2812,7 @@ impl McpServer {
                     "remind_me_reclassify_batch" => {
                         let input: Result<ReclassifyBatchInput, _> = serde_json::from_value(args);
                         match input {
-                            Ok(batch) => match queries::unclassified_batch(&conn, &batch) {
+                            Ok(batch) => match queries::unclassified_batch(&store, &batch) {
                                 Ok(result) => {
                                     json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap() }] })
                                 }
@@ -2826,7 +2829,7 @@ impl McpServer {
                         let input: Result<FeedbackInput, _> = serde_json::from_value(args);
                         match input {
                             Ok(fb) => match vitality::record_feedback(
-                                &conn,
+                                &store,
                                 &fb.memory_id,
                                 fb.signal,
                                 fb.query.as_deref(),
@@ -2851,7 +2854,7 @@ impl McpServer {
                             }
                         }
                     }
-                    "remind_me_backup" => match backup::create_backup(&conn, "manual") {
+                    "remind_me_backup" => match backup::create_backup(&store, "manual") {
                         Ok(outcome) => {
                             json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&outcome).unwrap() }] })
                         }
@@ -2867,7 +2870,7 @@ impl McpServer {
                                 if !(ANNOTATE_BATCH_MIN..=ANNOTATE_BATCH_MAX).contains(&count) {
                                     json!({ "isError": true, "content": [{ "type": "text", "text": format!("`annotations` must hold {}..={} items, got {}", ANNOTATE_BATCH_MIN, ANNOTATE_BATCH_MAX, count) }] })
                                 } else {
-                                    match queries::annotate_memories(&conn, &annotate_input) {
+                                    match queries::annotate_memories(&store, &annotate_input) {
                                         Ok(outcome) => {
                                             json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&outcome).unwrap() }] })
                                         }
@@ -2882,7 +2885,7 @@ impl McpServer {
                             }
                         }
                     }
-                    "remind_me_vitality_report" => match vitality::build_vitality_report(&conn) {
+                    "remind_me_vitality_report" => match vitality::build_vitality_report(&store) {
                         Ok(report) => {
                             // The one reference model that defaults to JSON
                             // (`VitalityReportInput`, models.py:1653), so the
@@ -2911,7 +2914,7 @@ impl McpServer {
                             .get("include_index")
                             .and_then(|v| v.as_bool())
                             .unwrap_or(true);
-                        match self.wiki.load(&conn, token_budget, include_index) {
+                        match self.wiki.load(&store, token_budget, include_index) {
                             Ok(loaded) if loaded.pages_included == 0 => {
                                 json!({ "content": [{ "type": "text", "text": "_The wiki is empty._ Synthesise pages from raw memories with `remind_me_wiki_compile`." }] })
                             }
@@ -2934,7 +2937,7 @@ impl McpServer {
                             .get("mark_integrated")
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
-                        match self.wiki.compile(&conn, limit, mark_integrated) {
+                        match self.wiki.compile(&store, limit, mark_integrated) {
                             Ok(outcome) => {
                                 json!({ "content": [{ "type": "text", "text": match format {
     ResponseFormat::Json => serde_json::to_string_pretty(&outcome).unwrap(),
@@ -2956,7 +2959,7 @@ impl McpServer {
                         if query.is_empty() {
                             json!({ "isError": true, "content": [{ "type": "text", "text": "`query` is required" }] })
                         } else {
-                            match self.wiki.search_pages(&conn, query, limit) {
+                            match self.wiki.search_pages(&store, query, limit) {
                                 Ok(hits) => {
                                     let body = json!({ "count": hits.len(), "results": hits });
                                     json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&body).unwrap() }] })
@@ -2967,7 +2970,7 @@ impl McpServer {
                             }
                         }
                     }
-                    "remind_me_wiki_list" => match self.wiki.list_pages(&conn) {
+                    "remind_me_wiki_list" => match self.wiki.list_pages(&store) {
                         Ok(pages) => {
                             // The reference's `WikiListInput` defaults to
                             // MARKDOWN (models.py:1547); this had no field at
@@ -2992,7 +2995,7 @@ impl McpServer {
                         if title.is_empty() {
                             json!({ "isError": true, "content": [{ "type": "text", "text": "`title` is required" }] })
                         } else {
-                            match self.wiki.delete_page(&conn, title) {
+                            match self.wiki.delete_page(&store, title) {
                                 Ok(WikiDeleteOutcome::Deleted) => {
                                     json!({ "content": [{ "type": "text", "text": format!("Wiki page '{}' deleted", title) }] })
                                 }
@@ -3014,7 +3017,7 @@ impl McpServer {
                         // malformed body still has one sensible reading.
                         let input: MemoryStatsInput =
                             serde_json::from_value(args).unwrap_or_default();
-                        match stats::collect(&conn) {
+                        match stats::collect(&store) {
                             Ok(s) => {
                                 let text = match input.response_format {
                                     ResponseFormat::Json => {
@@ -3032,14 +3035,16 @@ impl McpServer {
                     "remind_me_consolidate" => {
                         let input: Result<ConsolidateInput, _> = serde_json::from_value(args);
                         match input {
-                            Ok(consolidate_input) => match consolidate(&conn, &consolidate_input) {
-                                Ok(report) => {
-                                    json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&report).unwrap() }] })
+                            Ok(consolidate_input) => {
+                                match consolidate(&store, &consolidate_input) {
+                                    Ok(report) => {
+                                        json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&report).unwrap() }] })
+                                    }
+                                    Err(e) => {
+                                        json!({ "isError": true, "content": [{ "type": "text", "text": format!("Consolidate error: {}", e) }] })
+                                    }
                                 }
-                                Err(e) => {
-                                    json!({ "isError": true, "content": [{ "type": "text", "text": format!("Consolidate error: {}", e) }] })
-                                }
-                            },
+                            }
                             Err(e) => {
                                 json!({ "isError": true, "content": [{ "type": "text", "text": format!("Invalid consolidate input: {}", e) }] })
                             }
@@ -3143,7 +3148,7 @@ pub fn run_stdio(handler: &dyn Handler) -> io::Result<()> {
 /// loop and take every other in-flight and future request down with it. A
 /// panic inside a single tool call (an unwrap on unexpected input, an
 /// out-of-bounds index) used to do exactly that, since `handle_request` ran
-/// on the loop's own unguarded call stack. `db.conn()`'s lock is a
+/// on the loop's own unguarded call stack. `db.store()`'s lock is a
 /// `parking_lot::Mutex`, which does not poison on an unwind through a held
 /// guard, so a caught panic mid-call leaves the database perfectly usable
 /// for the next request.
@@ -3274,7 +3279,7 @@ mod tests {
     #[test]
     fn a_caught_panic_while_holding_the_db_lock_still_leaves_it_usable() {
         // What makes catching the panic here safe rather than merely quiet:
-        // unwinding through a held `db.conn()` guard runs its destructor the
+        // unwinding through a held `db.store()` guard runs its destructor the
         // same as any other scope exit, and `parking_lot::Mutex` (unlike
         // `std::sync::Mutex`) never poisons on that unwind -- so the lock is
         // free again by the time `catch_unwind` returns. A synthetic panic
@@ -3284,7 +3289,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let server = McpServer::new(db);
         let resp = dispatch_line_catching_panics(r#"{"id":1}"#, |_line| {
-            let _guard = server.db.conn();
+            let _guard = server.db.store();
             panic!("simulated panic while a connection guard is live")
         });
         assert_eq!(resp.unwrap()["error"]["code"], -32603);
@@ -4683,7 +4688,7 @@ mod tests {
                 .expect("write response");
         });
 
-        let pid_path = remind_me_core::pid::pid_file_path(&db.conn()).unwrap();
+        let pid_path = remind_me_core::pid::pid_file_path(&db.store()).unwrap();
         let record = remind_me_core::pid::write_pid_file(&pid_path, "127.0.0.1", port).unwrap();
 
         let server = McpServer::new(db);

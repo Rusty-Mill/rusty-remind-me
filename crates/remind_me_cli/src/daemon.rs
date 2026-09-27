@@ -44,7 +44,7 @@ impl Service for StoreService {
     }
 
     fn op(&self, op: &Op) -> OpReply {
-        ops::execute(&self.db.conn(), op)
+        ops::execute(&self.db.store(), op)
     }
 
     fn http(&self, stream: &mut TcpStream) -> io::Result<()> {
@@ -90,9 +90,9 @@ fn run(db_path: &Path, endpoint: Endpoint) -> Result<()> {
     let daemon = locked.listen()?;
     // The background loops every long-lived subcommand used to start for
     // itself now run here once, however many clients there are.
-    let scheduler = remind_me_core::scheduler::start_scheduler_for(&db.conn());
-    let watcher = remind_me_core::watcher::start_watcher_for(&db.conn());
-    let nudge = remind_me_core::promotion::start_nudge_for(&db.conn());
+    let scheduler = remind_me_core::scheduler::start_scheduler_for(&db.store());
+    let watcher = remind_me_core::watcher::start_watcher_for(&db.store());
+    let nudge = remind_me_core::promotion::start_nudge_for(&db.store());
     let mut sync = remind_me_core::sync::SyncWorker::from_env(db_path.to_path_buf());
 
     let wiki = Wiki::from_env();
@@ -211,7 +211,7 @@ impl Store {
     /// Run `op`, wherever the store is.
     pub fn call<T: DeserializeOwned>(&mut self, op: Op) -> Result<T> {
         let reply = match self {
-            Store::Local(db) => ops::execute(&db.conn(), &op),
+            Store::Local(db) => ops::execute(&db.store(), &op),
             Store::Daemon(connection) => connection.call(&op)?,
         };
         Ok(reply.into_result()?)

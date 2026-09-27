@@ -25,8 +25,9 @@
 
 use crate::db::imports::ImportLedger;
 use crate::db::queries::delete_memory;
+use crate::db::Result;
+use crate::db::Store;
 use crate::models::{UndoImportInput, UndoImportKind, UndoImportResult};
-use rusqlite::{Connection, Result};
 
 /// Memory ids belonging to an import, plus a human-readable scope label.
 ///
@@ -35,24 +36,24 @@ use rusqlite::{Connection, Result};
 /// importer stamps onto `memories.doc_id`, so that join runs the other way
 /// round from the other two.
 fn matching_ids(
-    conn: &Connection,
+    store: &Store<'_>,
     kind: UndoImportKind,
     import_id: Option<&str>,
 ) -> Result<(Vec<String>, String)> {
     match kind {
         UndoImportKind::Chat => {
-            let ids = ImportLedger::new(conn).live_chat_memories(import_id)?;
+            let ids = ImportLedger::new(store).live_chat_memories(import_id)?;
             let label = match import_id {
                 Some(id) => format!("chat import {}", id),
                 None => "all chat imports".to_string(),
             };
             Ok((ids, label))
         }
-        UndoImportKind::Mempalace => matching_ids_mempalace(conn, import_id),
+        UndoImportKind::Mempalace => matching_ids_mempalace(store, import_id),
         UndoImportKind::Dbs => {
             // Prefix match so a whole dbs source can be targeted without naming
             // every external id it produced.
-            let ids = ImportLedger::new(conn).live_dbs_memories(import_id)?;
+            let ids = ImportLedger::new(store).live_dbs_memories(import_id)?;
             let label = match import_id {
                 Some(id) => format!("dbs scope '{}'", id),
                 None => "all dbs imports".to_string(),
@@ -75,10 +76,10 @@ fn matching_ids(
 /// regardless of which path wrote it. Trusting the tracking table alone would
 /// silently leave the untracked half behind.
 fn matching_ids_mempalace(
-    conn: &Connection,
+    store: &Store<'_>,
     import_id: Option<&str>,
 ) -> Result<(Vec<String>, String)> {
-    let ledger = ImportLedger::new(conn);
+    let ledger = ImportLedger::new(store);
     let ids: std::collections::BTreeSet<String> = ledger
         .live_tracked_mempalace_memories(import_id)?
         .into_iter()
@@ -97,7 +98,7 @@ fn matching_ids_mempalace(
 /// link lives on `memories.doc_id`, and a hard delete removes those rows,
 /// leaving nothing to read the import id back from afterwards.
 fn forget_tracking(
-    conn: &Connection,
+    store: &Store<'_>,
     kind: UndoImportKind,
     memory_ids: &[String],
     doc_ids: &[String],
@@ -115,7 +116,7 @@ fn forget_tracking(
             // while some of its chunks survive would let a re-import duplicate
             // the surviving half, so an import only loses its tracking row once
             // nothing of it is left.
-            let ledger = ImportLedger::new(conn);
+            let ledger = ImportLedger::new(store);
 
             // Retained raw transcripts (#212) go with the tracking row, and are
             // read out *before* the delete because the archive row is what
@@ -124,12 +125,12 @@ fn forget_tracking(
             // import whose chunks survive would strand memories pointing at a
             // file that is no longer there.
             for import_id in &ledger.chat_imports_with_nothing_left(doc_ids)? {
-                crate::archive::forget_import(conn, import_id)?;
+                crate::archive::forget_import(store, import_id)?;
             }
             ledger.forget_chat_imports_with_nothing_left(doc_ids)
         }
         UndoImportKind::Dbs | UndoImportKind::Mempalace => {
-            let ledger = ImportLedger::new(conn);
+            let ledger = ImportLedger::new(store);
             match kind {
                 UndoImportKind::Dbs => ledger.forget_dbs(memory_ids),
                 _ => ledger.forget_mempalace(memory_ids),
@@ -143,8 +144,8 @@ fn forget_tracking(
 /// Defaults to a dry run, deliberately: this is a bulk destructive operation
 /// and, on a sync-enabled node, one that propagates to every other node. The
 /// work is resumable — call again until `remaining` reaches 0.
-pub fn undo_import(conn: &Connection, input: &UndoImportInput) -> Result<UndoImportResult> {
-    let (memory_ids, scope) = matching_ids(conn, input.import_kind, input.import_id.as_deref())?;
+pub fn undo_import(store: &Store<'_>, input: &UndoImportInput) -> Result<UndoImportResult> {
+    let (memory_ids, scope) = matching_ids(store, input.import_kind, input.import_id.as_deref())?;
     let soft = crate::sync::sync_enabled();
 
     let mode = if soft {
@@ -182,7 +183,7 @@ pub fn undo_import(conn: &Connection, input: &UndoImportInput) -> Result<UndoImp
     // Before the purge, not after: a hard delete removes the rows outright, and
     // `doc_id` is the only place a chat import's id is recorded on the memory.
     let doc_ids: Vec<String> = if input.import_kind == UndoImportKind::Chat {
-        ImportLedger::new(conn).doc_ids_of(&batch)?
+        ImportLedger::new(store).doc_ids_of(&batch)?
     } else {
         Vec::new()
     };
@@ -191,12 +192,12 @@ pub fn undo_import(conn: &Connection, input: &UndoImportInput) -> Result<UndoImp
     for memory_id in &batch {
         // `delete_memory` reports false for an id already gone, which is not an
         // error here: a resumed undo can legitimately re-encounter one.
-        if delete_memory(conn, memory_id)? {
+        if delete_memory(store, memory_id)? {
             removed += 1;
         }
     }
 
-    let tracking_rows_removed = forget_tracking(conn, input.import_kind, &batch, &doc_ids)?;
+    let tracking_rows_removed = forget_tracking(store, input.import_kind, &batch, &doc_ids)?;
 
     let remaining = memory_ids.len().saturating_sub(removed);
     Ok(UndoImportResult {

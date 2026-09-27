@@ -6,8 +6,10 @@
 //! is refused rather than reshaped.
 
 use remind_me_core::db::vectors::Vectors;
+use remind_me_core::db::Store;
 use remind_me_core::Database;
-use rusqlite::{params, Connection};
+use rusqlite::params;
+use rusqlite::Connection;
 
 struct TempDb(std::path::PathBuf);
 
@@ -39,22 +41,31 @@ impl Drop for TempDb {
 
 const NOW: &str = "2026-09-26T00:00:00+00:00";
 
-fn add_memory(conn: &Connection, id: &str) -> i64 {
-    conn.execute(
-        "INSERT INTO memories (id, content, created_at, updated_at) VALUES (?, 'x', ?, ?)",
-        params![id, NOW, NOW],
-    )
-    .unwrap();
-    conn.query_row("SELECT rowid FROM memories WHERE id = ?", [id], |r| {
-        r.get(0)
-    })
-    .unwrap()
+fn add_memory(store: &Store<'_>, id: &str) -> i64 {
+    store
+        .sqlite()
+        .unwrap()
+        .execute(
+            "INSERT INTO memories (id, content, created_at, updated_at) VALUES (?, 'x', ?, ?)",
+            params![id, NOW, NOW],
+        )
+        .unwrap();
+    store
+        .sqlite()
+        .unwrap()
+        .query_row("SELECT rowid FROM memories WHERE id = ?", [id], |r| {
+            r.get(0)
+        })
+        .unwrap()
 }
 
 /// Replace the v30 vector table with the v29 pair, and stamp v29.
-fn downgrade_vectors_to_v29(conn: &Connection) {
-    conn.execute_batch(
-        "DROP TABLE vec_chunks;
+fn downgrade_vectors_to_v29(store: &Store<'_>) {
+    store
+        .sqlite()
+        .unwrap()
+        .execute_batch(
+            "DROP TABLE vec_chunks;
          CREATE TABLE vec_chunks (
              vec_rowid    INTEGER PRIMARY KEY,
              memory_rowid INTEGER NOT NULL,
@@ -66,31 +77,40 @@ fn downgrade_vectors_to_v29(conn: &Connection) {
              embedding BLOB NOT NULL
          );
          PRAGMA user_version = 29;",
-    )
-    .unwrap();
+        )
+        .unwrap();
 }
 
-fn put_v29_chunk(conn: &Connection, memory_rowid: i64, chunk_ix: i64, embedding: &[u8]) {
-    conn.execute(
-        "INSERT INTO vec_chunks (memory_rowid, chunk_ix) VALUES (?, ?)",
-        params![memory_rowid, chunk_ix],
-    )
-    .unwrap();
-    let vec_rowid = conn.last_insert_rowid();
-    conn.execute(
-        "INSERT INTO vec_embeddings (vec_rowid, embedding) VALUES (?, ?)",
-        params![vec_rowid, embedding],
-    )
-    .unwrap();
+fn put_v29_chunk(store: &Store<'_>, memory_rowid: i64, chunk_ix: i64, embedding: &[u8]) {
+    store
+        .sqlite()
+        .unwrap()
+        .execute(
+            "INSERT INTO vec_chunks (memory_rowid, chunk_ix) VALUES (?, ?)",
+            params![memory_rowid, chunk_ix],
+        )
+        .unwrap();
+    let vec_rowid = store.sqlite().unwrap().last_insert_rowid();
+    store
+        .sqlite()
+        .unwrap()
+        .execute(
+            "INSERT INTO vec_embeddings (vec_rowid, embedding) VALUES (?, ?)",
+            params![vec_rowid, embedding],
+        )
+        .unwrap();
 }
 
-fn table_exists(conn: &Connection, name: &str) -> bool {
-    conn.query_row(
-        "SELECT count(*) FROM sqlite_master WHERE name = ?",
-        [name],
-        |r| r.get::<_, i64>(0),
-    )
-    .unwrap()
+fn table_exists(store: &Store<'_>, name: &str) -> bool {
+    store
+        .sqlite()
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name = ?",
+            [name],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
         > 0
 }
 
@@ -99,29 +119,31 @@ fn opening_a_v29_database_rekeys_every_chunk_onto_its_memory_id() {
     let tmp = TempDb::new("carry");
     {
         let db = Database::open(tmp.path()).unwrap();
-        let conn = db.conn();
-        let a = add_memory(&conn, "mem_a");
-        let b = add_memory(&conn, "mem_b");
-        downgrade_vectors_to_v29(&conn);
-        put_v29_chunk(&conn, a, 0, &[1, 0, 0, 0]);
-        put_v29_chunk(&conn, a, 1, &[2, 0, 0, 0]);
-        put_v29_chunk(&conn, b, 0, &[3, 0, 0, 0]);
+        let store = db.store();
+        let a = add_memory(&store, "mem_a");
+        let b = add_memory(&store, "mem_b");
+        downgrade_vectors_to_v29(&store);
+        put_v29_chunk(&store, a, 0, &[1, 0, 0, 0]);
+        put_v29_chunk(&store, a, 1, &[2, 0, 0, 0]);
+        put_v29_chunk(&store, b, 0, &[3, 0, 0, 0]);
         // A chunk left behind by a memory that no longer exists: under v29 the
         // next memory to reuse rowid 999 would have inherited it.
-        put_v29_chunk(&conn, 999, 0, &[4, 0, 0, 0]);
+        put_v29_chunk(&store, 999, 0, &[4, 0, 0, 0]);
     }
 
     let db = Database::open(tmp.path()).unwrap();
-    let conn = db.conn();
-    let version: i32 = conn
+    let store = db.store();
+    let version: i32 = store
+        .sqlite()
+        .unwrap()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(version, remind_me_core::db::schema::SCHEMA_VERSION);
-    assert!(!table_exists(&conn, "vec_embeddings"));
-    assert!(!table_exists(&conn, "vec_chunks_v29"));
-    assert!(!table_exists(&conn, "idx_vec_chunks_memory"));
+    assert!(!table_exists(&store, "vec_embeddings"));
+    assert!(!table_exists(&store, "vec_chunks_v29"));
+    assert!(!table_exists(&store, "idx_vec_chunks_memory"));
 
-    let mut chunks: Vec<(String, Vec<u8>)> = Vectors::new(&conn)
+    let mut chunks: Vec<(String, Vec<u8>)> = Vectors::new(&store)
         .all()
         .unwrap()
         .into_iter()
@@ -136,7 +158,7 @@ fn opening_a_v29_database_rekeys_every_chunk_onto_its_memory_id() {
             ("mem_b".to_string(), vec![3, 0, 0, 0]),
         ]
     );
-    assert_eq!(Vectors::new(&conn).chunk_count("mem_a").unwrap(), 2);
+    assert_eq!(Vectors::new(&store).chunk_count("mem_a").unwrap(), 2);
 }
 
 #[test]
@@ -144,15 +166,15 @@ fn the_rekey_runs_once_and_later_opens_leave_the_chunks_alone() {
     let tmp = TempDb::new("idempotent");
     {
         let db = Database::open(tmp.path()).unwrap();
-        let conn = db.conn();
-        let a = add_memory(&conn, "mem_a");
-        downgrade_vectors_to_v29(&conn);
-        put_v29_chunk(&conn, a, 0, &[1, 0, 0, 0]);
+        let store = db.store();
+        let a = add_memory(&store, "mem_a");
+        downgrade_vectors_to_v29(&store);
+        put_v29_chunk(&store, a, 0, &[1, 0, 0, 0]);
     }
     drop(Database::open(tmp.path()).unwrap());
 
     let db = Database::open(tmp.path()).unwrap();
-    assert_eq!(Vectors::new(&db.conn()).count().unwrap(), 1);
+    assert_eq!(Vectors::new(&db.store()).count().unwrap(), 1);
 }
 
 #[test]
@@ -160,9 +182,13 @@ fn a_database_from_a_newer_build_is_refused_and_left_untouched() {
     let tmp = TempDb::new("newer");
     {
         let db = Database::open(tmp.path()).unwrap();
-        let conn = db.conn();
-        add_memory(&conn, "mem_a");
-        conn.execute_batch("PRAGMA user_version = 9999;").unwrap();
+        let store = db.store();
+        add_memory(&store, "mem_a");
+        store
+            .sqlite()
+            .unwrap()
+            .execute_batch("PRAGMA user_version = 9999;")
+            .unwrap();
     }
 
     let err = Database::open(tmp.path())

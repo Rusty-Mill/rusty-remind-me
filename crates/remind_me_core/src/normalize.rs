@@ -18,6 +18,8 @@
 
 use crate::db::curation::{Curation, NormalizationSource};
 use crate::db::memories::{Memories, NewMemory};
+use crate::db::Result;
+use crate::db::Store;
 use crate::entity::apply_entity_mentions;
 use crate::models::{
     NormalizationEntry, NormalizationError, NormalizationOutcome, NormalizeApplyInput,
@@ -26,7 +28,6 @@ use crate::models::{
 };
 use crate::vitality::{calculate_vitality, get_decay_rate, get_source_prior, get_type_prior};
 use chrono::Utc;
-use rusqlite::{Connection, Result};
 
 /// `category` assigned to memories created by [`apply_normalizations`].
 pub const NORMALIZED_CATEGORY: &str = "normalized";
@@ -48,13 +49,13 @@ const SNIPPET_CHARS: usize = 1000;
 /// `batch_size` is clamped to 1..=100 rather than rejected, matching
 /// `unclassified_batch`.
 pub fn unnormalized_batch(
-    conn: &Connection,
+    store: &Store<'_>,
     input: &NormalizeBatchInput,
 ) -> Result<NormalizeBatchResult> {
     let batch_size = input
         .batch_size
         .clamp(NORMALIZE_BATCH_MIN, NORMALIZE_BATCH_MAX);
-    let curation = Curation::new(conn);
+    let curation = Curation::new(store);
     let total = curation.count_unnormalized(&IMPORT_SOURCES)?;
     let memories: Vec<UnnormalizedMemory> = curation
         .unnormalized(&IMPORT_SOURCES, batch_size)?
@@ -101,7 +102,7 @@ fn normalized_content(entry: &NormalizationEntry) -> String {
 /// An unknown `memory_id` is reported in `errors` rather than failing the
 /// batch, so one bad reference does not discard the other 49.
 pub fn apply_normalizations(
-    conn: &Connection,
+    store: &Store<'_>,
     input: &NormalizeApplyInput,
 ) -> Result<NormalizeApplyResult> {
     let now = Utc::now();
@@ -112,7 +113,7 @@ pub fn apply_normalizations(
     for entry in &input.normalizations {
         // A read that fails reports the memory as not found, as before: one
         // bad reference must not discard the rest of the batch.
-        let raw = Curation::new(conn)
+        let raw = Curation::new(store)
             .normalization_source(&entry.memory_id)
             .ok()
             .flatten();
@@ -152,7 +153,7 @@ pub fn apply_normalizations(
         let vitality = calculate_vitality(base_weight, 0, decay_rate, &now_iso, now);
 
         let (node_id, client) = crate::sync::memory_provenance();
-        Memories::new(conn).insert(&NewMemory {
+        Memories::new(store).insert(&NewMemory {
             category: NORMALIZED_CATEGORY.to_string(),
             // The source's tags, carried over.
             tags,
@@ -169,7 +170,7 @@ pub fn apply_normalizations(
             ..NewMemory::new(normalized_id.clone(), content, &now_iso)
         })?;
 
-        apply_entity_mentions(conn, &normalized_id, &entry.entities)?;
+        apply_entity_mentions(store, &normalized_id, &entry.entities)?;
 
         results.push(NormalizationOutcome {
             memory_id: entry.memory_id.clone(),

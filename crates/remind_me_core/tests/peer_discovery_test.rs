@@ -194,8 +194,8 @@ fn probe_peer_is_true_for_a_healthy_peer() {
     let config = PeerServerConfig::new("127.0.0.1", port, SECRET, "peer-node");
     let handle = std::thread::spawn(move || {
         if let Ok((mut stream, _)) = listener.accept() {
-            let conn = db.conn();
-            let _ = remind_me_core::sync::serve_once(&mut stream, &config, &conn);
+            let store = db.store();
+            let _ = remind_me_core::sync::serve_once(&mut stream, &config, &store);
         }
     });
 
@@ -222,8 +222,8 @@ fn probe_peer_is_false_with_the_wrong_secret() {
     let config = PeerServerConfig::new("127.0.0.1", port, SECRET, "peer-node");
     let handle = std::thread::spawn(move || {
         if let Ok((mut stream, _)) = listener.accept() {
-            let conn = db.conn();
-            let _ = remind_me_core::sync::serve_once(&mut stream, &config, &conn);
+            let store = db.store();
+            let _ = remind_me_core::sync::serve_once(&mut stream, &config, &store);
         }
     });
 

@@ -265,13 +265,13 @@ fn malformed_entries_and_highlights_are_skipped_not_fatal() {
 #[test]
 fn an_explicit_readwise_import_stores_highlights_with_their_metadata() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let raw = export(one_book(
         json!([{ "text": "Stored passage.", "note": "why it matters" }]),
     ));
 
     let outcome = remind_me_core::importer::import_bytes(
-        &conn,
+        &store,
         raw.as_bytes(),
         "readwise.json",
         "",
@@ -289,7 +289,9 @@ fn an_explicit_readwise_import_stores_highlights_with_their_metadata() {
         "got {outcome:?}"
     );
 
-    let (content, category, source, metadata): (String, String, String, String) = conn
+    let (content, category, source, metadata): (String, String, String, String) = store
+        .sqlite()
+        .unwrap()
         .query_row(
             "SELECT content, category, source, metadata FROM memories",
             [],
@@ -309,11 +311,11 @@ fn an_explicit_readwise_import_stores_highlights_with_their_metadata() {
 #[test]
 fn a_json_file_imported_as_auto_is_still_a_chat_import() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let raw = export(one_book(json!([{ "text": "Not reachable from auto." }])));
 
     remind_me_core::importer::import_bytes(
-        &conn,
+        &store,
         raw.as_bytes(),
         "readwise.json",
         "",
@@ -328,7 +330,9 @@ fn a_json_file_imported_as_auto_is_still_a_chat_import() {
     // export and a chat export are both an unadorned `.json`, and sniffing for
     // a `highlights` key would misroute a chat export that merely discusses
     // Readwise — silently corrupting working chat-import behaviour.
-    let source: Option<String> = conn
+    let source: Option<String> = store
+        .sqlite()
+        .unwrap()
         .query_row("SELECT source FROM memories LIMIT 1", [], |r| r.get(0))
         .ok();
     assert_ne!(source.as_deref(), Some("readwise_import"));
@@ -337,10 +341,10 @@ fn a_json_file_imported_as_auto_is_still_a_chat_import() {
 #[test]
 fn readwise_import_refuses_a_non_json_file() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
     let outcome = remind_me_core::importer::import_bytes(
-        &conn,
+        &store,
         b"# Notes",
         "notes.md",
         "",
@@ -362,10 +366,10 @@ fn readwise_import_refuses_a_non_json_file() {
 #[test]
 fn a_wrong_shaped_json_file_fails_the_import_rather_than_succeeding_emptily() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
     let outcome = remind_me_core::importer::import_bytes(
-        &conn,
+        &store,
         br#"{"messages": []}"#,
         "notachat.json",
         "",

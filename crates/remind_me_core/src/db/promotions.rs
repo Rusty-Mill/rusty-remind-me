@@ -7,7 +7,8 @@
 //! threshold, the persona vitality floor, what makes a source unusable, and
 //! that demotion is a read-time judgement.
 
-use rusqlite::{params, Connection, OptionalExtension, Result};
+use super::{Result, Store};
+use rusqlite::{params, Connection, OptionalExtension};
 
 /// Create the `promotions` table and its index, if absent.
 ///
@@ -15,8 +16,9 @@ use rusqlite::{params, Connection, OptionalExtension, Result};
 /// delete path, and a cascade would erase the provenance that says what it
 /// was derived from, which is exactly the record needed to explain why a
 /// persona statement vanished.
-pub fn ensure_table(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
+pub fn ensure_table(store: &Store<'_>) -> Result<()> {
+    let conn = store.conn();
+    Ok(conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS promotions (
             promoted_id TEXT NOT NULL,
             source_id   TEXT NOT NULL,
@@ -26,7 +28,7 @@ pub fn ensure_table(conn: &Connection) -> Result<()> {
          );
          CREATE INDEX IF NOT EXISTS idx_promotions_source
             ON promotions(source_id);",
-    )
+    )?)
 }
 
 /// A memory's id and content.
@@ -103,7 +105,8 @@ pub struct Promotions<'c> {
 }
 
 impl<'c> Promotions<'c> {
-    pub fn new(conn: &'c Connection) -> Self {
+    pub fn new(store: &'c Store<'_>) -> Self {
+        let conn = store.conn();
         Self { conn }
     }
 
@@ -125,7 +128,8 @@ impl<'c> Promotions<'c> {
                     content: r.get(1)?,
                 })
             })?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
@@ -162,7 +166,8 @@ impl<'c> Promotions<'c> {
                     })
                 },
             )?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
@@ -204,7 +209,8 @@ impl<'c> Promotions<'c> {
                     vitality: r.get(2)?,
                 })
             })?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
@@ -224,14 +230,15 @@ impl<'c> Promotions<'c> {
     /// Whether the live, unsuperseded memory `id` is sensitive, or `None`
     /// when `id` is not such a memory.
     pub fn live_source_sensitivity(&self, id: &str) -> Result<Option<bool>> {
-        self.conn
+        Ok(self
+            .conn
             .query_row(
                 "SELECT sensitive FROM memories
                   WHERE id = ? AND deleted_at IS NULL AND superseded_by IS NULL",
                 params![id],
                 |r| r.get(0),
             )
-            .optional()
+            .optional()?)
     }
 
     /// The memories promoted at `rung` from a set including `source_id`.
@@ -241,7 +248,8 @@ impl<'c> Promotions<'c> {
         )?;
         let rows = stmt
             .query_map(params![source_id, rung], |r| r.get(0))?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
@@ -252,7 +260,8 @@ impl<'c> Promotions<'c> {
             .prepare("SELECT source_id FROM promotions WHERE promoted_id = ? AND rung = ?")?;
         let rows = stmt
             .query_map(params![promoted_id, rung], |r| r.get(0))?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
@@ -291,7 +300,10 @@ impl<'c> Promotions<'c> {
         let mut stmt = self
             .conn
             .prepare("SELECT source_id FROM promotions WHERE promoted_id = ?")?;
-        let rows = stmt.query_map(params![memory_id], |r| r.get(0))?.collect();
+        let rows = stmt
+            .query_map(params![memory_id], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
@@ -300,7 +312,10 @@ impl<'c> Promotions<'c> {
         let mut stmt = self
             .conn
             .prepare("SELECT promoted_id FROM promotions WHERE source_id = ?")?;
-        let rows = stmt.query_map(params![memory_id], |r| r.get(0))?.collect();
+        let rows = stmt
+            .query_map(params![memory_id], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
@@ -359,7 +374,8 @@ impl<'c> Promotions<'c> {
                     created_at: r.get(3)?,
                 })
             })?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 }
@@ -375,8 +391,8 @@ mod tests {
     #[test]
     fn surviving_sources_counts_only_live_unsuperseded_sources() {
         let db = Database::open_in_memory().unwrap();
-        let conn = db.conn();
-        let memories = Memories::new(&conn);
+        let store = db.store();
+        let memories = Memories::new(&store);
         memories.insert(&NewMemory::new("live", "x", NOW)).unwrap();
         memories
             .insert(&NewMemory {
@@ -384,7 +400,7 @@ mod tests {
                 ..NewMemory::new("old", "x", NOW)
             })
             .unwrap();
-        let promotions = Promotions::new(&conn);
+        let promotions = Promotions::new(&store);
         for source in ["live", "old", "missing"] {
             promotions.record("p", source, "rung", NOW).unwrap();
         }
@@ -398,8 +414,8 @@ mod tests {
     #[test]
     fn live_source_sensitivity_is_none_for_a_superseded_source() {
         let db = Database::open_in_memory().unwrap();
-        let conn = db.conn();
-        let memories = Memories::new(&conn);
+        let store = db.store();
+        let memories = Memories::new(&store);
         memories
             .insert(&NewMemory {
                 sensitive: true,
@@ -412,7 +428,7 @@ mod tests {
                 ..NewMemory::new("old", "x", NOW)
             })
             .unwrap();
-        let promotions = Promotions::new(&conn);
+        let promotions = Promotions::new(&store);
         assert_eq!(promotions.live_source_sensitivity("s").unwrap(), Some(true));
         assert_eq!(promotions.live_source_sensitivity("old").unwrap(), None);
         assert!(!promotions.is_live("old").unwrap());

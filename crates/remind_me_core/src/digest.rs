@@ -22,9 +22,10 @@
 //! subsystems now exist (issues #116 and #114), so the honest shape is the
 //! real answer.
 
+use crate::db::Result;
+use crate::db::Store;
 use crate::models::{DigestData, DigestReminder, ReminderWindow, SyncStatus};
 use crate::vitality::build_vitality_report;
-use rusqlite::{Connection, Result};
 
 /// Days back that count as "recent" by default.
 pub const DEFAULT_SINCE_DAYS: i64 = 7;
@@ -52,10 +53,10 @@ fn digest_reminder(memory: &crate::models::Memory) -> DigestReminder {
 }
 
 /// Assemble the digest's underlying data.
-pub fn build_digest(conn: &Connection, since_days: i64) -> Result<DigestData> {
+pub fn build_digest(store: &Store<'_>, since_days: i64) -> Result<DigestData> {
     let cutoff = (chrono::Utc::now() - chrono::Duration::days(since_days)).to_rfc3339();
 
-    let stats = crate::db::stats::StoreStats::new(conn);
+    let stats = crate::db::stats::StoreStats::new(store);
     let recent_memories = stats.shareable_since(&cutoff, MAX_RECENT_MEMORIES)?;
 
     // Counted rather than taken from the capped list, so the cap is visible
@@ -67,9 +68,9 @@ pub fn build_digest(conn: &Connection, since_days: i64) -> Result<DigestData> {
         since_days,
         recent_memories,
         recent_total,
-        vitality: build_vitality_report(conn)?,
+        vitality: build_vitality_report(store)?,
         reminders_upcoming: crate::reminders::list_reminders(
-            conn,
+            store,
             ReminderWindow::Upcoming,
             MAX_DIGEST_REMINDERS,
         )?
@@ -77,7 +78,7 @@ pub fn build_digest(conn: &Connection, since_days: i64) -> Result<DigestData> {
         .map(digest_reminder)
         .collect(),
         reminders_overdue: crate::reminders::list_reminders(
-            conn,
+            store,
             ReminderWindow::Overdue,
             MAX_DIGEST_REMINDERS,
         )?
@@ -87,7 +88,7 @@ pub fn build_digest(conn: &Connection, since_days: i64) -> Result<DigestData> {
         // Local-only, no network: the digest has to stay callable from a
         // scheduled path that cannot afford to block on a remote. The
         // hub-reconcile verdict is a network call and stays out.
-        sync: crate::sync::sync_status(conn)?,
+        sync: crate::sync::sync_status(store)?,
     })
 }
 

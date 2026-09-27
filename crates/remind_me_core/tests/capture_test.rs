@@ -2,10 +2,10 @@
 
 use remind_me_core::capture::{auto_capture, get_capture};
 use remind_me_core::db::queries;
+use remind_me_core::db::Store;
 use remind_me_core::{
     AutoCaptureInput, CaptureResult, Database, MemorySearchInput, CAPTURE_SOURCE, DIALOG_CATEGORY,
 };
-use rusqlite::Connection;
 
 fn input(conversation: &str, summary: &str) -> AutoCaptureInput {
     AutoCaptureInput {
@@ -18,45 +18,48 @@ fn input(conversation: &str, summary: &str) -> AutoCaptureInput {
     }
 }
 
-fn capture(conn: &Connection, conversation: &str, summary: &str) -> CaptureResult {
-    auto_capture(conn, &input(conversation, summary)).unwrap()
+fn capture(store: &Store<'_>, conversation: &str, summary: &str) -> CaptureResult {
+    auto_capture(store, &input(conversation, summary)).unwrap()
 }
 
-fn column(conn: &Connection, id: &str, name: &str) -> String {
-    conn.query_row(
-        &format!("SELECT {} FROM memories WHERE id = ?", name),
-        rusqlite::params![id],
-        |r| r.get::<_, String>(0),
-    )
-    .unwrap()
+fn column(store: &Store<'_>, id: &str, name: &str) -> String {
+    store
+        .sqlite()
+        .unwrap()
+        .query_row(
+            &format!("SELECT {} FROM memories WHERE id = ?", name),
+            rusqlite::params![id],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap()
 }
 
-fn metadata(conn: &Connection, id: &str) -> serde_json::Value {
-    serde_json::from_str(&column(conn, id, "metadata")).unwrap()
+fn metadata(store: &Store<'_>, id: &str) -> serde_json::Value {
+    serde_json::from_str(&column(store, id, "metadata")).unwrap()
 }
 
 #[test]
 fn a_capture_writes_two_linked_memories() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
-    let result = capture(&conn, "user: hi\nassistant: hello", "We said hello.");
+    let result = capture(&store, "user: hi\nassistant: hello", "We said hello.");
 
     assert_ne!(result.dialog_id, result.summary_id);
     assert_eq!(
-        column(&conn, &result.dialog_id, "capture_id"),
+        column(&store, &result.dialog_id, "capture_id"),
         result.capture_id
     );
     assert_eq!(
-        column(&conn, &result.summary_id, "capture_id"),
+        column(&store, &result.summary_id, "capture_id"),
         result.capture_id
     );
     assert_eq!(
-        column(&conn, &result.dialog_id, "content"),
+        column(&store, &result.dialog_id, "content"),
         "user: hi\nassistant: hello"
     );
     assert_eq!(
-        column(&conn, &result.summary_id, "content"),
+        column(&store, &result.summary_id, "content"),
         "We said hello."
     );
 }
@@ -64,43 +67,43 @@ fn a_capture_writes_two_linked_memories() {
 #[test]
 fn the_dialog_category_is_not_the_callers_category() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let mut custom = input("the transcript", "the summary");
     custom.category = "meeting".into();
 
-    let result = auto_capture(&conn, &custom).unwrap();
+    let result = auto_capture(&store, &custom).unwrap();
 
     // `category` names the summary. The dialog is always 'dialog', and
     // `extract_batch` excludes that category — storing a transcript under the
     // caller's category would flood the annotation backlog with raw
     // conversations.
     assert_eq!(
-        column(&conn, &result.dialog_id, "category"),
+        column(&store, &result.dialog_id, "category"),
         DIALOG_CATEGORY
     );
-    assert_eq!(column(&conn, &result.summary_id, "category"), "meeting");
+    assert_eq!(column(&store, &result.summary_id, "category"), "meeting");
 }
 
 #[test]
 fn both_halves_are_stored_under_the_capture_source() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
-    let result = capture(&conn, "transcript", "summary");
+    let result = capture(&store, "transcript", "summary");
 
-    assert_eq!(column(&conn, &result.dialog_id, "source"), CAPTURE_SOURCE);
-    assert_eq!(column(&conn, &result.summary_id, "source"), CAPTURE_SOURCE);
+    assert_eq!(column(&store, &result.dialog_id, "source"), CAPTURE_SOURCE);
+    assert_eq!(column(&store, &result.summary_id, "source"), CAPTURE_SOURCE);
 }
 
 #[test]
 fn each_half_points_at_the_other() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
-    let result = capture(&conn, "transcript", "summary");
+    let result = capture(&store, "transcript", "summary");
 
-    let dialog = metadata(&conn, &result.dialog_id);
-    let summary = metadata(&conn, &result.summary_id);
+    let dialog = metadata(&store, &result.dialog_id);
+    let summary = metadata(&store, &result.summary_id);
     assert_eq!(dialog["type"], "dialog");
     assert_eq!(summary["type"], "summary");
     // The dialog's pointer is the interesting one: the summary's id does not
@@ -115,17 +118,17 @@ fn each_half_points_at_the_other() {
 #[test]
 fn the_title_falls_back_to_the_summarys_first_line() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
     let result = capture(
-        &conn,
+        &store,
         "transcript",
         "We chose SQLite.\nMore detail follows.",
     );
 
     assert_eq!(result.title, "We chose SQLite.");
     assert_eq!(
-        metadata(&conn, &result.dialog_id)["title"],
+        metadata(&store, &result.dialog_id)["title"],
         "We chose SQLite."
     );
 }
@@ -133,9 +136,9 @@ fn the_title_falls_back_to_the_summarys_first_line() {
 #[test]
 fn a_long_first_line_is_capped() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
-    let result = capture(&conn, "transcript", &"x".repeat(200));
+    let result = capture(&store, "transcript", &"x".repeat(200));
 
     assert_eq!(result.title.chars().count(), 80);
 }
@@ -143,11 +146,11 @@ fn a_long_first_line_is_capped() {
 #[test]
 fn a_supplied_title_wins() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let mut titled = input("transcript", "the summary");
     titled.title = "Design review".into();
 
-    let result = auto_capture(&conn, &titled).unwrap();
+    let result = auto_capture(&store, &titled).unwrap();
 
     assert_eq!(result.title, "Design review");
 }
@@ -155,13 +158,13 @@ fn a_supplied_title_wins() {
 #[test]
 fn caller_metadata_is_preserved_alongside_the_link_fields() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let mut with_meta = input("transcript", "summary");
     with_meta.metadata = serde_json::json!({ "project": "rusty" });
 
-    let result = auto_capture(&conn, &with_meta).unwrap();
+    let result = auto_capture(&store, &with_meta).unwrap();
 
-    let dialog = metadata(&conn, &result.dialog_id);
+    let dialog = metadata(&store, &result.dialog_id);
     assert_eq!(dialog["project"], "rusty");
     assert_eq!(dialog["type"], "dialog");
 }
@@ -169,29 +172,29 @@ fn caller_metadata_is_preserved_alongside_the_link_fields() {
 #[test]
 fn both_halves_carry_the_tags() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
-    let result = capture(&conn, "transcript", "summary");
+    let result = capture(&store, "transcript", "summary");
 
-    assert_eq!(column(&conn, &result.dialog_id, "tags"), r#"["session"]"#);
-    assert_eq!(column(&conn, &result.summary_id, "tags"), r#"["session"]"#);
+    assert_eq!(column(&store, &result.dialog_id, "tags"), r#"["session"]"#);
+    assert_eq!(column(&store, &result.summary_id, "tags"), r#"["session"]"#);
 }
 
 #[test]
 fn a_capture_is_searchable() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
     // Both halves must contain the term verbatim — the FTS tokenizer does not
     // stem, so "quokkas" would not match a search for "quokka".
     let result = capture(
-        &conn,
+        &store,
         "we discussed the quokka at length",
         "quokka decision",
     );
 
     let found: Vec<String> = queries::search_memories(
-        &conn,
+        &store,
         &MemorySearchInput {
             strategy: Default::default(),
             include_sensitive: false,
@@ -224,10 +227,10 @@ fn a_capture_is_searchable() {
 #[test]
 fn the_pair_comes_back_by_capture_id() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let result = capture(&conn, "the transcript", "the summary");
+    let store = db.store();
+    let result = capture(&store, "the transcript", "the summary");
 
-    let found = get_capture(&conn, &result.capture_id).unwrap().unwrap();
+    let found = get_capture(&store, &result.capture_id).unwrap().unwrap();
 
     assert_eq!(found.capture_id, result.capture_id);
     assert_eq!(found.dialog.as_ref().unwrap().id, result.dialog_id);
@@ -239,31 +242,31 @@ fn the_pair_comes_back_by_capture_id() {
 #[test]
 fn an_unknown_capture_id_is_none() {
     let db = Database::open_in_memory().unwrap();
-    assert!(get_capture(&db.conn(), "cap_nope").unwrap().is_none());
+    assert!(get_capture(&db.store(), "cap_nope").unwrap().is_none());
 }
 
 #[test]
 fn two_captures_do_not_share_an_id() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
-    let first = capture(&conn, "same text", "same summary");
-    let second = capture(&conn, "same text", "same summary");
+    let first = capture(&store, "same text", "same summary");
+    let second = capture(&store, "same text", "same summary");
 
     // Identical content is two captures, not an upsert.
     assert_ne!(first.capture_id, second.capture_id);
-    let found = get_capture(&conn, &first.capture_id).unwrap().unwrap();
+    let found = get_capture(&store, &first.capture_id).unwrap().unwrap();
     assert_eq!(found.dialog.unwrap().id, first.dialog_id);
 }
 
 #[test]
 fn a_half_lost_to_deletion_still_reports_the_other() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let result = capture(&conn, "the transcript", "the summary");
-    queries::delete_memory(&conn, &result.dialog_id).unwrap();
+    let store = db.store();
+    let result = capture(&store, "the transcript", "the summary");
+    queries::delete_memory(&store, &result.dialog_id).unwrap();
 
-    let found = get_capture(&conn, &result.capture_id).unwrap().unwrap();
+    let found = get_capture(&store, &result.capture_id).unwrap().unwrap();
 
     assert!(found.dialog.is_none());
     assert_eq!(found.summary.unwrap().id, result.summary_id);
@@ -272,19 +275,22 @@ fn a_half_lost_to_deletion_still_reports_the_other() {
 #[test]
 fn an_extra_row_sharing_the_id_is_surfaced_not_dropped() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let result = capture(&conn, "the transcript", "the summary");
+    let store = db.store();
+    let result = capture(&store, "the transcript", "the summary");
     // Sync can deliver a third row carrying the same capture_id.
-    conn.execute(
-        "INSERT INTO memories (id, content, category, tags, source, metadata, capture_id,
+    store
+        .sqlite()
+        .unwrap()
+        .execute(
+            "INSERT INTO memories (id, content, category, tags, source, metadata, capture_id,
                                created_at, updated_at)
          VALUES ('mem_extra', 'stray', 'general', '[]', 'manual', '{}', ?,
                  '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
-        rusqlite::params![result.capture_id],
-    )
-    .unwrap();
+            rusqlite::params![result.capture_id],
+        )
+        .unwrap();
 
-    let found = get_capture(&conn, &result.capture_id).unwrap().unwrap();
+    let found = get_capture(&store, &result.capture_id).unwrap().unwrap();
 
     assert!(found.dialog.is_some());
     assert!(found.summary.is_some());

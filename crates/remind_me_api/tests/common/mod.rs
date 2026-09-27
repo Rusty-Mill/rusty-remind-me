@@ -25,6 +25,7 @@
 #![allow(dead_code)]
 
 use remind_me_api::ApiServer;
+use remind_me_core::db::Store;
 use remind_me_core::{wiki_fs::Wiki, Database};
 use serde_json::Value;
 use std::io::{Cursor, Read, Write};
@@ -72,11 +73,8 @@ pub fn server(name: &str) -> (ApiServer, std::path::PathBuf) {
 /// handed to the server — for fixtures the HTTP surface itself has no route
 /// to create (entities and relations have no HTTP write path, matching the
 /// reference).
-pub fn seeded_server(
-    name: &str,
-    seed: impl FnOnce(&rusqlite::Connection),
-) -> (ApiServer, std::path::PathBuf) {
-    seeded_wiki_server(name, |conn, _wiki| seed(conn))
+pub fn seeded_server(name: &str, seed: impl FnOnce(&Store<'_>)) -> (ApiServer, std::path::PathBuf) {
+    seeded_wiki_server(name, |store, _wiki| seed(store))
 }
 
 /// Same as [`seeded_server`], but `seed` also gets the `Wiki` — for wiki-page
@@ -85,14 +83,14 @@ pub fn seeded_server(
 /// this test suite.
 pub fn seeded_wiki_server(
     name: &str,
-    seed: impl FnOnce(&rusqlite::Connection, &Wiki),
+    seed: impl FnOnce(&Store<'_>, &Wiki),
 ) -> (ApiServer, std::path::PathBuf) {
     let root = std::env::temp_dir().join(format!("rrm_api_{}_{}", name, std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     let db = Database::open_in_memory().unwrap();
     let wiki = Wiki::new(&root);
-    seed(&db.conn(), &wiki);
+    seed(&db.store(), &wiki);
     let server = ApiServer::with_wiki(db, wiki);
     (server, root)
 }

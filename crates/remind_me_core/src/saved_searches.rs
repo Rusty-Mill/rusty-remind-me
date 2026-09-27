@@ -30,11 +30,12 @@
 
 use crate::db::queries::search_memories;
 use crate::db::saved_searches::SavedSearches;
+use crate::db::Result;
+use crate::db::Store;
 use crate::models::{
     MemorySearchInput, SaveSearchInput, SavedSearch, SavedSearchFilters, POLL_RESULT_LIMIT,
 };
 use chrono::Utc;
-use rusqlite::{Connection, Result};
 
 /// Stable id for a saved search, derived from its name.
 ///
@@ -53,8 +54,8 @@ fn make_id(name: &str) -> String {
 /// name is how a caller changes a saved search's query, filters or watch flag.
 /// The same "one name is one logical thing" convention `remind_me_wiki_write`
 /// already uses for pages, and what the table's `UNIQUE` on `name` implies.
-pub fn save_search(conn: &Connection, input: &SaveSearchInput) -> Result<SavedSearch> {
-    let repo = SavedSearches::new(conn);
+pub fn save_search(store: &Store<'_>, input: &SaveSearchInput) -> Result<SavedSearch> {
+    let repo = SavedSearches::new(store);
     let now = Utc::now().to_rfc3339();
     let existing = repo.id_for_name(&input.name)?;
     let saved = SavedSearch {
@@ -78,19 +79,19 @@ pub fn save_search(conn: &Connection, input: &SaveSearchInput) -> Result<SavedSe
 }
 
 /// Every saved search, alphabetical by name.
-pub fn list_saved_searches(conn: &Connection) -> Result<Vec<SavedSearch>> {
-    SavedSearches::new(conn).list()
+pub fn list_saved_searches(store: &Store<'_>) -> Result<Vec<SavedSearch>> {
+    SavedSearches::new(store).list()
 }
 
 /// One saved search by name, or `None`.
-pub fn get_saved_search(conn: &Connection, name: &str) -> Result<Option<SavedSearch>> {
-    SavedSearches::new(conn).get_by_name(name)
+pub fn get_saved_search(store: &Store<'_>, name: &str) -> Result<Option<SavedSearch>> {
+    SavedSearches::new(store).get_by_name(name)
 }
 
 /// Delete a saved search and its seen-memory rows. `false` if no saved
 /// search has that name.
-pub fn delete_saved_search(conn: &Connection, name: &str) -> Result<bool> {
-    let repo = SavedSearches::new(conn);
+pub fn delete_saved_search(store: &Store<'_>, name: &str) -> Result<bool> {
+    let repo = SavedSearches::new(store);
     let Some(id) = repo.id_for_name(name)? else {
         return Ok(false);
     };
@@ -126,10 +127,10 @@ pub fn build_search_input(saved: &SavedSearch, limit: Option<usize>) -> MemorySe
 /// Run a saved search and return its matches — **all** of them, watched or
 /// not. See the module docs for why watching does not narrow this.
 pub fn run_saved_search(
-    conn: &Connection,
+    store: &Store<'_>,
     saved: &SavedSearch,
 ) -> Result<Vec<crate::models::MemorySearchResult>> {
-    search_memories(conn, &build_search_input(saved, None))
+    search_memories(store, &build_search_input(saved, None))
 }
 
 /// What one poll of a watched search found.
@@ -152,10 +153,10 @@ pub struct PollOutcome {
 /// Returns the new matches rather than dispatching notifications. The
 /// transport is the scheduler's half (#117); keeping it out of here means the
 /// diff logic is complete and testable without one.
-pub fn poll_saved_search(conn: &Connection, saved: &SavedSearch) -> Result<PollOutcome> {
-    let results = search_memories(conn, &build_search_input(saved, Some(POLL_RESULT_LIMIT)))?;
+pub fn poll_saved_search(store: &Store<'_>, saved: &SavedSearch) -> Result<PollOutcome> {
+    let results = search_memories(store, &build_search_input(saved, Some(POLL_RESULT_LIMIT)))?;
     let current: Vec<String> = results.into_iter().map(|r| r.memory.id).collect();
-    let repo = SavedSearches::new(conn);
+    let repo = SavedSearches::new(store);
     let now = Utc::now().to_rfc3339();
 
     if !repo.has_any_seen(&saved.id)? {
@@ -181,15 +182,15 @@ pub fn poll_saved_search(conn: &Connection, saved: &SavedSearch) -> Result<PollO
 }
 
 /// Poll every watched saved search once.
-pub fn poll_watched_searches(conn: &Connection) -> Result<Vec<(String, PollOutcome)>> {
-    let watched: Vec<SavedSearch> = list_saved_searches(conn)?
+pub fn poll_watched_searches(store: &Store<'_>) -> Result<Vec<(String, PollOutcome)>> {
+    let watched: Vec<SavedSearch> = list_saved_searches(store)?
         .into_iter()
         .filter(|s| s.watch)
         .collect();
 
     let mut outcomes = Vec::with_capacity(watched.len());
     for saved in watched {
-        let outcome = poll_saved_search(conn, &saved)?;
+        let outcome = poll_saved_search(store, &saved)?;
         outcomes.push((saved.name, outcome));
     }
     Ok(outcomes)

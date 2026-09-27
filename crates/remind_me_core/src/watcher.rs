@@ -39,13 +39,15 @@
 //! ever seen.
 
 use crate::db::memories::Memories;
+use crate::db::Result;
+use crate::db::Store;
 use crate::import_paths::{
     import_roots, is_contained, resolve_lexically, split_path_list, SUPPORTED_SUFFIXES,
 };
 use crate::importer::import_file;
 use crate::models::{ImportKind, ImportOutcome};
 use chrono::Utc;
-use rusqlite::{Connection, Result};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -193,11 +195,11 @@ pub fn configured_watch_dirs() -> Vec<PathBuf> {
 /// the `superseded_by IS NULL` filter every read path uses, so stale chunks
 /// drop out of search while staying in the database for audit.
 pub fn supersede_import(
-    conn: &Connection,
+    store: &Store<'_>,
     old_import_id: &str,
     new_import_id: &str,
 ) -> Result<usize> {
-    Memories::new(conn).supersede_import(old_import_id, new_import_id, &Utc::now().to_rfc3339())
+    Memories::new(store).supersede_import(old_import_id, new_import_id, &Utc::now().to_rfc3339())
 }
 
 /// A file's identity for change detection.
@@ -340,7 +342,7 @@ impl Watcher {
     }
 
     /// Run one scan pass.
-    pub fn scan_once(&mut self, conn: &Connection) -> ScanCounts {
+    pub fn scan_once(&mut self, store: &Store<'_>) -> ScanCounts {
         let _span = crate::telemetry::maybe_span("watcher.scan");
         let mut counts = ScanCounts::default();
         let now = now_seconds();
@@ -364,7 +366,7 @@ impl Watcher {
                 continue;
             }
 
-            self.ingest(conn, &path, signature, &mut counts);
+            self.ingest(store, &path, signature, &mut counts);
             self.pending.remove(&path);
         }
 
@@ -403,13 +405,13 @@ impl Watcher {
 
     fn ingest(
         &mut self,
-        conn: &Connection,
+        store: &Store<'_>,
         path: &Path,
         signature: Signature,
         counts: &mut ScanCounts,
     ) {
         let outcome = import_file(
-            conn,
+            store,
             path,
             &self.category,
             &self.tags,
@@ -427,7 +429,7 @@ impl Watcher {
             Ok(ImportOutcome::Imported { import_id, .. }) => {
                 let superseded = match self.imports.get(path) {
                     Some(previous) if *previous != import_id => {
-                        supersede_import(conn, previous, &import_id).unwrap_or(0)
+                        supersede_import(store, previous, &import_id).unwrap_or(0)
                     }
                     _ => 0,
                 };
@@ -617,11 +619,11 @@ impl WatcherHandle {
 }
 
 /// Where this connection's database lives, or `None` for an in-memory one.
-fn database_path(conn: &Connection) -> Option<std::path::PathBuf> {
-    crate::db::database_path(conn).ok().flatten()
+fn database_path(store: &Store<'_>) -> Option<std::path::PathBuf> {
+    crate::db::database_path(store).ok().flatten()
 }
 
-/// Start the folder-watch loop for the database `conn` is attached to.
+/// Start the folder-watch loop for the database `store` is attached to.
 ///
 /// Returns `None` when there is nothing to run: no watch directories
 /// configured (or none usable), or an in-memory database. The in-memory case
@@ -633,9 +635,9 @@ fn database_path(conn: &Connection) -> Option<std::path::PathBuf> {
 /// Conditional, unlike the scheduler: the watcher has an explicit enable
 /// switch in `REMIND_ME_WATCH_DIRS`, and a watcher with no directories is not
 /// a feature to run.
-pub fn start_watcher_for(conn: &Connection) -> Option<WatcherHandle> {
+pub fn start_watcher_for(store: &Store<'_>) -> Option<WatcherHandle> {
     let watcher = Watcher::from_env()?;
-    let db_path = database_path(conn)?;
+    let db_path = database_path(store)?;
     Some(start_watcher(watcher, db_path))
 }
 
@@ -657,8 +659,8 @@ fn start_watcher(watcher: Watcher, db_path: PathBuf) -> WatcherHandle {
             // Its own connection, by path: `rusqlite::Connection` is not
             // `Sync`, so sharing the caller's would trade a compile error for
             // a runtime serialisation problem.
-            let conn = match Connection::open(&db_path) {
-                Ok(conn) => conn,
+            let store = match Connection::open(&db_path) {
+                Ok(store) => store,
                 Err(e) => {
                     eprintln!("folder watcher: cannot open {:?}: {}", db_path, e);
                     // Clear the registration rather than leave a `running:
@@ -672,7 +674,7 @@ fn start_watcher(watcher: Watcher, db_path: PathBuf) -> WatcherHandle {
                     // Scoped so the lock is released before the sleep — a
                     // status call must not block for a whole interval.
                     let mut guard = loop_shared.lock().unwrap_or_else(|e| e.into_inner());
-                    let counts = guard.scan_once(&conn);
+                    let counts = guard.scan_once(&Store::over_sqlite(&store));
                     if counts.ingested > 0 || counts.superseded > 0 {
                         eprintln!(
                             "folder watcher: ingested {}, superseded {}",

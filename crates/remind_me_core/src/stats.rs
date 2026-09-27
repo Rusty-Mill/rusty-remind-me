@@ -2,7 +2,8 @@
 //! HTTP route so the three cannot drift apart.
 
 use crate::db::stats::{GroupBy, StorageInfo, StoreStats};
-use rusqlite::{Connection, Result};
+use crate::db::Result;
+use crate::db::Store;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -90,8 +91,8 @@ fn path_text(info: &StorageInfo) -> String {
 /// each used `.unwrap_or(0)`, which reported an empty store when the database
 /// was actually unreadable — `CONTRIBUTING.md` §2 forbids swallowing failures
 /// that way.
-pub fn collect(conn: &Connection) -> Result<Stats> {
-    let stats = StoreStats::new(conn);
+pub fn collect(store: &Store<'_>) -> Result<Stats> {
+    let stats = StoreStats::new(store);
     let info = stats.storage_info()?;
     Ok(Stats {
         total_memories: stats.live_memories()?,
@@ -108,8 +109,8 @@ pub fn collect(conn: &Connection) -> Result<Stats> {
 /// not the MCP tool's ([`Stats`]) — see that struct's doc for why the two
 /// differ. Reuses the same repository queries and [`path_text`]/[`size_mb`] rather than
 /// re-deriving them, so the counts cannot disagree with [`collect`]'s.
-pub fn collect_dashboard(conn: &Connection) -> Result<DashboardStats> {
-    let stats = StoreStats::new(conn);
+pub fn collect_dashboard(store: &Store<'_>) -> Result<DashboardStats> {
+    let stats = StoreStats::new(store);
     let info = stats.storage_info()?;
     Ok(DashboardStats {
         total: stats.live_memories()?,

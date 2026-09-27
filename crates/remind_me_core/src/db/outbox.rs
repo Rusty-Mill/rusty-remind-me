@@ -7,7 +7,8 @@
 //! when sync is enabled, the retention window, batch size, and how a payload
 //! decodes.
 
-use rusqlite::{params, Connection, OptionalExtension, Result};
+use super::{Result, Store};
+use rusqlite::{params, Connection, OptionalExtension};
 
 /// SQLite's clock as an RFC 3339 timestamp with microseconds, the shape
 /// every stamp in the outbox takes.
@@ -29,7 +30,8 @@ pub struct Outbox<'c> {
 }
 
 impl<'c> Outbox<'c> {
-    pub fn new(conn: &'c Connection) -> Self {
+    pub fn new(store: &'c Store<'_>) -> Self {
+        let conn = store.conn();
         Self { conn }
     }
 
@@ -55,14 +57,15 @@ impl<'c> Outbox<'c> {
                     payload_json: row.get(2)?,
                 })
             })?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
     /// How many rows have no send recorded to `remote_id`, and the oldest
     /// one's `created_at`.
     pub fn pending_for(&self, remote_id: &str) -> Result<(i64, Option<String>)> {
-        self.conn.query_row(
+        Ok(self.conn.query_row(
             "SELECT COUNT(*), MIN(created_at) FROM sync_outbox o
               WHERE NOT EXISTS (
                   SELECT 1 FROM sync_sends s
@@ -70,22 +73,23 @@ impl<'c> Outbox<'c> {
               )",
             params![remote_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
-        )
+        )?)
     }
 
     /// How many rows the outbox holds.
     pub fn len(&self) -> Result<i64> {
-        self.conn
-            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |r| r.get(0))
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |r| r.get(0))?)
     }
 
     /// How many rows are not yet marked sent.
     pub fn unsent_count(&self) -> Result<i64> {
-        self.conn.query_row(
+        Ok(self.conn.query_row(
             "SELECT COUNT(*) FROM sync_outbox WHERE sent_at = ''",
             [],
             |r| r.get(0),
-        )
+        )?)
     }
 
     /// Whether the outbox is empty.
@@ -113,15 +117,16 @@ impl<'c> Outbox<'c> {
 
     /// Empty the outbox and its send markers.
     pub fn clear(&self) -> Result<()> {
-        self.conn
-            .execute_batch("DELETE FROM sync_outbox; DELETE FROM sync_sends;")
+        Ok(self
+            .conn
+            .execute_batch("DELETE FROM sync_outbox; DELETE FROM sync_sends;")?)
     }
 
     /// Queue every memory, entity and mention link as an insert, stamped
     /// with SQLite's clock: what a node that just turned sync on owes its
     /// remotes. Payloads have the shape `db::derived` queues.
     pub fn backfill_everything(&self) -> Result<()> {
-        self.conn.execute_batch(&format!(
+        Ok(self.conn.execute_batch(&format!(
             "INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
              SELECT id, 'insert', json_object(
                  'id', id, 'content', content, 'category', category, 'tags', tags,
@@ -152,7 +157,7 @@ impl<'c> Outbox<'c> {
              ), {now}
              FROM memory_entities;",
             now = NOW_ISO_EXPR
-        ))
+        ))?)
     }
 }
 
@@ -174,12 +179,13 @@ mod tests {
     #[test]
     fn pending_counts_rows_with_no_send_to_the_remote() {
         let db = Database::open_in_memory().unwrap();
-        let conn = db.conn();
-        let outbox = Outbox::new(&conn);
+        let store = db.store();
+        let conn = store.conn();
+        let outbox = Outbox::new(&store);
         assert!(outbox.is_empty().unwrap());
-        let first = queue(&conn, "a", "2026-09-01");
-        queue(&conn, "b", "2026-09-02");
-        crate::db::sync_state::SyncState::new(&conn)
+        let first = queue(conn, "a", "2026-09-01");
+        queue(conn, "b", "2026-09-02");
+        crate::db::sync_state::SyncState::new(&store)
             .record_sends("hub", &[first], "2026-09-03")
             .unwrap();
 
@@ -195,11 +201,12 @@ mod tests {
     #[test]
     fn prune_drops_old_and_sent_rows_and_their_markers() {
         let db = Database::open_in_memory().unwrap();
-        let conn = db.conn();
-        let outbox = Outbox::new(&conn);
-        let old = queue(&conn, "old", "2026-01-01");
-        queue(&conn, "new", "2026-09-26");
-        crate::db::sync_state::SyncState::new(&conn)
+        let store = db.store();
+        let conn = store.conn();
+        let outbox = Outbox::new(&store);
+        let old = queue(conn, "old", "2026-01-01");
+        queue(conn, "new", "2026-09-26");
+        crate::db::sync_state::SyncState::new(&store)
             .record_sends("hub", &[old], "2026-09-26")
             .unwrap();
 

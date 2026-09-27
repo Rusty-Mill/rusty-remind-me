@@ -10,18 +10,18 @@
 //! nothing a client can see, which is the same shape as the bug.
 
 use remind_me_core::db::queries;
+use remind_me_core::db::Store;
 use remind_me_core::models::{
     AnnotateInput, ExportFormat, MemoryAddInput, MemoryAnnotation, MemoryListInput, ReconcileReport,
 };
 use remind_me_core::{watcher, Database};
-use rusqlite::Connection;
 use serde_json::Value;
 
-fn seed(conn: &Connection, n: usize) -> Vec<String> {
+fn seed(store: &Store<'_>, n: usize) -> Vec<String> {
     (0..n)
         .map(|i| {
             queries::add_memory(
-                conn,
+                store,
                 MemoryAddInput {
                     content: format!("seed {i}"),
                     category: "general".into(),
@@ -46,14 +46,14 @@ fn list_reports_count_alongside_total() {
     // `count` is this page; `total` is how many exist behind it. The reference
     // emits both, and a client written against it reads `count`.
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    seed(&conn, 5);
+    let store = db.store();
+    seed(&store, 5);
 
     let input = MemoryListInput {
         limit: 2,
         ..Default::default()
     };
-    let page = queries::list_memories(&conn, &input).unwrap();
+    let page = queries::list_memories(&store, &input).unwrap();
     let json: Value = serde_json::to_value(&page).unwrap();
 
     assert_eq!(json["count"], 2, "count describes this page");
@@ -68,8 +68,8 @@ fn list_reports_count_alongside_total() {
 #[test]
 fn list_count_and_total_agree_when_a_page_holds_everything() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    seed(&conn, 3);
+    let store = db.store();
+    seed(&store, 3);
 
     // Explicit limit: `MemoryListInput::default()` derives `limit: 0`, which
     // `list_memories` clamps to LIST_LIMIT_MIN, while serde's default for an
@@ -79,7 +79,7 @@ fn list_count_and_total_agree_when_a_page_holds_everything() {
         limit: 10,
         ..Default::default()
     };
-    let page = queries::list_memories(&conn, &input).unwrap();
+    let page = queries::list_memories(&store, &input).unwrap();
     let json: Value = serde_json::to_value(&page).unwrap();
 
     assert_eq!(json["count"], 3);
@@ -89,8 +89,8 @@ fn list_count_and_total_agree_when_a_page_holds_everything() {
 #[test]
 fn annotate_reports_how_many_it_applied() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let ids = seed(&conn, 2);
+    let store = db.store();
+    let ids = seed(&store, 2);
 
     let input = AnnotateInput {
         annotations: ids
@@ -104,7 +104,7 @@ fn annotate_reports_how_many_it_applied() {
             })
             .collect(),
     };
-    let result = queries::annotate_memories(&conn, &input).unwrap();
+    let result = queries::annotate_memories(&store, &input).unwrap();
     let json: Value = serde_json::to_value(&result).unwrap();
 
     assert_eq!(json["annotated"], 2);
@@ -120,7 +120,7 @@ fn annotate_reports_zero_when_nothing_applied() {
     // The value has to move with reality. A hardcoded count would pass the
     // test above and fail here.
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
     let input = AnnotateInput {
         annotations: vec![MemoryAnnotation {
@@ -131,7 +131,7 @@ fn annotate_reports_zero_when_nothing_applied() {
             entities: vec![],
         }],
     };
-    let result = queries::annotate_memories(&conn, &input).unwrap();
+    let result = queries::annotate_memories(&store, &input).unwrap();
     let json: Value = serde_json::to_value(&result).unwrap();
 
     assert_eq!(json["annotated"], 0);
@@ -141,14 +141,14 @@ fn annotate_reports_zero_when_nothing_applied() {
 #[test]
 fn export_reports_a_status() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    seed(&conn, 2);
+    let store = db.store();
+    seed(&store, 2);
 
     let input = remind_me_core::models::ExportInput {
         format: ExportFormat::Json,
         ..Default::default()
     };
-    let result = remind_me_core::export::export_memories(&conn, &input).unwrap();
+    let result = remind_me_core::export::export_memories(&store, &input).unwrap();
     let json: Value = serde_json::to_value(&result).unwrap();
 
     assert_eq!(json["status"], "ok");

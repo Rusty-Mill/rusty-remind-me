@@ -14,7 +14,7 @@ use super::http;
 use super::record::{canon_ts, upsert_record, SyncRecord};
 use super::record_pull;
 use crate::db::sync_state::SyncState;
-use rusqlite::Connection;
+use crate::db::Store;
 use serde_json::Value;
 
 pub const PULL_PAGE_SIZE: usize = 500;
@@ -48,8 +48,8 @@ impl std::fmt::Display for PullError {
     }
 }
 impl std::error::Error for PullError {}
-impl From<rusqlite::Error> for PullError {
-    fn from(e: rusqlite::Error) -> Self {
+impl From<crate::db::StoreError> for PullError {
+    fn from(e: crate::db::StoreError) -> Self {
         Self(e.to_string())
     }
 }
@@ -83,20 +83,20 @@ fn urlencode(raw: &str) -> String {
     out
 }
 
-fn read_cursor(conn: &Connection, remote_id: &str) -> rusqlite::Result<(String, String)> {
-    Ok(SyncState::new(conn)
+fn read_cursor(store: &Store<'_>, remote_id: &str) -> crate::db::Result<(String, String)> {
+    Ok(SyncState::new(store)
         .pull_cursor(remote_id)?
         .unwrap_or_else(|| (EPOCH.to_string(), String::new())))
 }
 
-fn read_seq_cursor(conn: &Connection, remote_id: &str) -> rusqlite::Result<i64> {
-    Ok(SyncState::new(conn)
+fn read_seq_cursor(store: &Store<'_>, remote_id: &str) -> crate::db::Result<i64> {
+    Ok(SyncState::new(store)
         .seq_cursor(remote_id)?
         .unwrap_or(SEQ_UNKNOWN))
 }
 
-fn persist_seq_cursor(conn: &Connection, remote_id: &str, seq: i64) -> rusqlite::Result<()> {
-    SyncState::new(conn).set_seq_cursor(remote_id, seq)
+fn persist_seq_cursor(store: &Store<'_>, remote_id: &str, seq: i64) -> crate::db::Result<()> {
+    SyncState::new(store).set_seq_cursor(remote_id, seq)
 }
 
 /// Decide whether `remote_id` supports the `since_seq` cursor.
@@ -125,11 +125,11 @@ fn persist_seq_cursor(conn: &Connection, remote_id: &str, seq: i64) -> rusqlite:
 /// evidence of absence: an empty hub returns no records whichever cursor it
 /// understands.
 fn establish_seq_cursor(
-    conn: &Connection,
+    store: &Store<'_>,
     hub_url: &str,
     secret: &str,
     remote_id: &str,
-) -> rusqlite::Result<i64> {
+) -> crate::db::Result<i64> {
     let url = format!(
         "{}/sync/pull?since_seq=0&limit=1",
         hub_url.trim_end_matches('/')
@@ -156,7 +156,7 @@ fn establish_seq_cursor(
         .iter()
         .any(|rec| rec.get("hub_seq").is_some_and(|v| !v.is_null()));
     let state = if supported { 0 } else { SEQ_UNSUPPORTED };
-    persist_seq_cursor(conn, remote_id, state)?;
+    persist_seq_cursor(store, remote_id, state)?;
     Ok(state)
 }
 
@@ -174,12 +174,12 @@ fn max_hub_seq(records: &[&Value]) -> Option<i64> {
 }
 
 fn persist_cursor(
-    conn: &Connection,
+    store: &Store<'_>,
     remote_id: &str,
     since: &str,
     since_id: &str,
-) -> rusqlite::Result<()> {
-    SyncState::new(conn).set_pull_cursor(remote_id, since, since_id)
+) -> crate::db::Result<()> {
+    SyncState::new(store).set_pull_cursor(remote_id, since, since_id)
 }
 
 /// Pull every change `remote_id` (reached at `hub_url`) has made since the
@@ -187,14 +187,14 @@ fn persist_cursor(
 /// node's own id, sent as `exclude_node` so a hub does not hand this node
 /// back the very rows it originated.
 pub fn pull_remote(
-    conn: &Connection,
+    store: &Store<'_>,
     hub_url: &str,
     secret: &str,
     node_id: &str,
     remote_id: &str,
 ) -> Result<PullReport, PullError> {
-    let (mut since, mut since_id) = read_cursor(conn, remote_id)?;
-    let mut since_seq = read_seq_cursor(conn, remote_id)?;
+    let (mut since, mut since_id) = read_cursor(store, remote_id)?;
+    let mut since_seq = read_seq_cursor(store, remote_id)?;
     let mut report = PullReport::default();
 
     // Establish before pulling, so a node already caught up on the legacy
@@ -202,7 +202,7 @@ pub fn pull_remote(
     // switches over, instead of waiting for traffic that by definition never
     // arrives.
     if since_seq == SEQ_UNKNOWN {
-        since_seq = establish_seq_cursor(conn, hub_url, secret, remote_id)?;
+        since_seq = establish_seq_cursor(store, hub_url, secret, remote_id)?;
     }
 
     for _ in 0..MAX_PULL_PAGES {
@@ -231,7 +231,7 @@ pub fn pull_remote(
                 body.trim()
             )));
         }
-        record_pull(conn, remote_id);
+        record_pull(store, remote_id);
         let parsed: Value = serde_json::from_str(&body)
             .map_err(|e| PullError(format!("pull response from {} was not JSON: {}", url, e)))?;
         let records = parsed
@@ -259,7 +259,7 @@ pub fn pull_remote(
             match serde_json::from_value::<SyncRecord>(record_value.clone()) {
                 Ok(record) => {
                     let record_ts = canon_ts(&record.updated_at);
-                    match upsert_record(conn, &record) {
+                    match upsert_record(store, &record) {
                         Ok(_outcome) => {
                             report.applied += 1;
                             applied_records.push(record_value);
@@ -281,7 +281,7 @@ pub fn pull_remote(
             match max_hub_seq(&applied_records) {
                 Some(page_seq) if page_seq > since_seq => {
                     since_seq = page_seq;
-                    persist_seq_cursor(conn, remote_id, since_seq)?;
+                    persist_seq_cursor(store, remote_id, since_seq)?;
                 }
                 // No progress — stop rather than re-request the same page.
                 _ => break,
@@ -295,7 +295,7 @@ pub fn pull_remote(
             }
             since = page_max.0;
             since_id = page_max.1;
-            persist_cursor(conn, remote_id, &since, &since_id)?;
+            persist_cursor(store, remote_id, &since, &since_id)?;
         }
 
         if records_len < PULL_PAGE_SIZE {
@@ -321,7 +321,7 @@ pub fn pull_remote(
 /// never real.
 #[allow(clippy::too_many_arguments)]
 fn pull_graph_table(
-    conn: &Connection,
+    store: &Store<'_>,
     hub_url: &str,
     secret: &str,
     node_id: &str,
@@ -329,9 +329,9 @@ fn pull_graph_table(
     endpoint: &str,
     ts_field: &str,
     id_field: &str,
-    apply: impl Fn(&Connection, &Value) -> Result<(), String>,
+    apply: impl Fn(&Store<'_>, &Value) -> Result<(), String>,
 ) -> Result<PullReport, PullError> {
-    let (mut since, mut since_id) = read_cursor(conn, cursor_key)?;
+    let (mut since, mut since_id) = read_cursor(store, cursor_key)?;
     let mut report = PullReport::default();
 
     for _ in 0..MAX_PULL_PAGES {
@@ -362,7 +362,7 @@ fn pull_graph_table(
                 body.trim()
             )));
         }
-        record_pull(conn, cursor_key);
+        record_pull(store, cursor_key);
         let parsed: Value = serde_json::from_str(&body)
             .map_err(|e| PullError(format!("pull response from {} was not JSON: {}", url, e)))?;
         let records = parsed
@@ -387,7 +387,7 @@ fn pull_graph_table(
                         .and_then(Value::as_str)
                         .map(String::from),
                 );
-            match apply(conn, record_value) {
+            match apply(store, record_value) {
                 Ok(()) => {
                     report.applied += 1;
                     if let Some(candidate) = cursor_fields {
@@ -406,7 +406,7 @@ fn pull_graph_table(
         }
         since = page_max.0;
         since_id = page_max.1;
-        persist_cursor(conn, cursor_key, &since, &since_id)?;
+        persist_cursor(store, cursor_key, &since, &since_id)?;
 
         if records_len < PULL_PAGE_SIZE {
             break;
@@ -419,7 +419,7 @@ fn pull_graph_table(
 /// Pull `entities` changes, keyset-paged on `(updated_at, id)` like
 /// `memories`.
 pub fn pull_entities(
-    conn: &Connection,
+    store: &Store<'_>,
     hub_url: &str,
     secret: &str,
     node_id: &str,
@@ -427,7 +427,7 @@ pub fn pull_entities(
 ) -> Result<PullReport, PullError> {
     let cursor_key = format!("{remote_id}#entities");
     pull_graph_table(
-        conn,
+        store,
         hub_url,
         secret,
         node_id,
@@ -448,7 +448,7 @@ pub fn pull_entities(
 /// no real single-column id, so the cursor uses the same synthetic
 /// composite key the wire `id` field already carries.
 pub fn pull_links(
-    conn: &Connection,
+    store: &Store<'_>,
     hub_url: &str,
     secret: &str,
     node_id: &str,
@@ -456,7 +456,7 @@ pub fn pull_links(
 ) -> Result<PullReport, PullError> {
     let cursor_key = format!("{remote_id}#links");
     pull_graph_table(
-        conn,
+        store,
         hub_url,
         secret,
         node_id,
@@ -477,7 +477,7 @@ pub fn pull_links(
 /// Pull `entity_relations`, keyset-paged on `(created_at, id)` — relations
 /// already have a real deterministic id, so no synthetic key is needed.
 pub fn pull_entity_relations(
-    conn: &Connection,
+    store: &Store<'_>,
     hub_url: &str,
     secret: &str,
     node_id: &str,
@@ -485,7 +485,7 @@ pub fn pull_entity_relations(
 ) -> Result<PullReport, PullError> {
     let cursor_key = format!("{remote_id}#entity_relations");
     pull_graph_table(
-        conn,
+        store,
         hub_url,
         secret,
         node_id,

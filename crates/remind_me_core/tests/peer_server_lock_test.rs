@@ -1,4 +1,4 @@
-//! Regression coverage: the peer server used to hold `Database::conn()`'s
+//! Regression coverage: the peer server used to hold `Database::store()`'s
 //! process-wide mutex across the whole of `serve_once`, including reading
 //! an incoming request -- so a slow or stuck peer connection blocked every
 //! other database read or write for up to `IO_TIMEOUT`. `PeerServer` now
@@ -51,7 +51,9 @@ fn a_stuck_peer_connection_never_blocks_an_ordinary_database_read() {
     std::thread::sleep(Duration::from_millis(300));
 
     let start = Instant::now();
-    db.conn()
+    db.store()
+        .sqlite()
+        .unwrap()
         .query_row("SELECT 1", [], |_| Ok(()))
         .expect("a plain local read");
     let elapsed = start.elapsed();
@@ -64,6 +66,6 @@ fn a_stuck_peer_connection_never_blocks_an_ordinary_database_read() {
     assert!(
         elapsed < Duration::from_secs(2),
         "a plain read took {elapsed:?} while the peer server was blocked reading a stuck \
-         connection -- Database::conn()'s mutex is being held across peer I/O again"
+         connection -- Database::store()'s mutex is being held across peer I/O again"
     );
 }

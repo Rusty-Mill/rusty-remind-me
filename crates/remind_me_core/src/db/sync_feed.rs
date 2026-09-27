@@ -7,7 +7,8 @@
 //! lives here. The server keeps the rules: parameter defaults, the page
 //! limit, and the response shapes.
 
-use rusqlite::{params, Connection, Result};
+use super::{Result, Store};
+use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 
 const SYNC_RECORD_COLUMNS: &str =
@@ -76,7 +77,8 @@ pub struct SyncFeed<'c> {
 }
 
 impl<'c> SyncFeed<'c> {
-    pub fn new(conn: &'c Connection) -> Self {
+    pub fn new(store: &'c Store<'_>) -> Self {
+        let conn = store.conn();
         Self { conn }
     }
 
@@ -144,7 +146,8 @@ impl<'c> SyncFeed<'c> {
                     "created_at": row.get::<_, String>("created_at")?,
                 }))
             })?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
@@ -171,7 +174,8 @@ impl<'c> SyncFeed<'c> {
                     "node_id": row.get::<_, Option<String>>("node_id")?,
                 }))
             })?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
@@ -191,8 +195,9 @@ impl<'c> SyncFeed<'c> {
     }
 
     fn count(&self, table: &str) -> Result<i64> {
-        self.conn
-            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+        Ok(self
+            .conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?)
     }
 
     fn page(
@@ -202,10 +207,10 @@ impl<'c> SyncFeed<'c> {
         since_id: &str,
         exclude_node: Option<&str>,
         limit: usize,
-        record: fn(&rusqlite::Row) -> Result<Value>,
+        record: fn(&rusqlite::Row) -> rusqlite::Result<Value>,
     ) -> Result<Vec<Value>> {
         let mut stmt = self.conn.prepare(sql)?;
-        let rows = match exclude_node {
+        let rows: rusqlite::Result<Vec<Value>> = match exclude_node {
             Some(node) => stmt
                 .query_map(params![since, since_id, limit as i64, node], record)?
                 .collect(),
@@ -213,7 +218,7 @@ impl<'c> SyncFeed<'c> {
                 .query_map(params![since, since_id, limit as i64], record)?
                 .collect(),
         };
-        rows
+        Ok(rows?)
     }
 }
 

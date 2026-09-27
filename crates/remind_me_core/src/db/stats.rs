@@ -5,9 +5,10 @@
 //! here (ADR-0022). Those modules keep the shapes they report and the rules
 //! (one snapshot per calendar day, oldest-first trends, how sizes round).
 
+use super::{Result, Store};
 use crate::models::{AnalyticsSnapshot, DigestRecentMemory};
 use crate::stats::RecentMemory;
-use rusqlite::{params, Connection, OptionalExtension, Result};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -44,23 +45,25 @@ pub struct StoreStats<'c> {
 }
 
 impl<'c> StoreStats<'c> {
-    pub fn new(conn: &'c Connection) -> Self {
+    pub fn new(store: &'c Store<'_>) -> Self {
+        let conn = store.conn();
         Self { conn }
     }
 
     /// How many memories are not deleted.
     pub fn live_memories(&self) -> Result<i64> {
-        self.conn.query_row(
+        Ok(self.conn.query_row(
             "SELECT count(*) FROM memories WHERE deleted_at IS NULL",
             [],
             |r| r.get(0),
-        )
+        )?)
     }
 
     /// How many chat imports are recorded.
     pub fn imports(&self) -> Result<i64> {
-        self.conn
-            .query_row("SELECT count(*) FROM chat_imports", [], |r| r.get(0))
+        Ok(self
+            .conn
+            .query_row("SELECT count(*) FROM chat_imports", [], |r| r.get(0))?)
     }
 
     /// Live memories counted by `group`.
@@ -71,7 +74,8 @@ impl<'c> StoreStats<'c> {
         ))?;
         let counts = stmt
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         counts
     }
 
@@ -86,29 +90,30 @@ impl<'c> StoreStats<'c> {
         )?;
         let counts = stmt
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         counts
     }
 
     /// How many memories are stored, tombstones included, and how many of
     /// them are tombstones.
     pub fn memory_totals(&self) -> Result<(i64, i64)> {
-        self.conn.query_row(
+        Ok(self.conn.query_row(
             "SELECT COUNT(*),
                     COALESCE(SUM(CASE WHEN deleted_at IS NOT NULL THEN 1 ELSE 0 END), 0)
                FROM memories",
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
-        )
+        )?)
     }
 
     /// How many tombstones were deleted before `cutoff`.
     pub fn tombstones_before(&self, cutoff: &str) -> Result<i64> {
-        self.conn.query_row(
+        Ok(self.conn.query_row(
             "SELECT COUNT(*) FROM memories WHERE deleted_at IS NOT NULL AND deleted_at < ?",
             params![cutoff],
             |r| r.get(0),
-        )
+        )?)
     }
 
     /// Every stored memory, tombstones included, counted by category, with
@@ -120,7 +125,8 @@ impl<'c> StoreStats<'c> {
         )?;
         let rows = stmt
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
@@ -143,19 +149,20 @@ impl<'c> StoreStats<'c> {
                     created_at: r.get(3)?,
                 })
             })?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
     /// How many live, non-sensitive memories were created at or after
     /// `cutoff`.
     pub fn count_shareable_since(&self, cutoff: &str) -> Result<i64> {
-        self.conn.query_row(
+        Ok(self.conn.query_row(
             "SELECT COUNT(*) FROM memories
               WHERE deleted_at IS NULL AND sensitive = 0 AND created_at >= ?",
             params![cutoff],
             |r| r.get(0),
-        )
+        )?)
     }
 
     /// The `limit` newest live memories, content cut to 80 characters.
@@ -174,13 +181,14 @@ impl<'c> StoreStats<'c> {
                     created_at: r.get(3)?,
                 })
             })?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
     /// The database's file, size and schema version.
     pub fn storage_info(&self) -> Result<StorageInfo> {
-        let path = super::database_path(self.conn)?;
+        let path = super::database_path(&Store::over_sqlite(self.conn))?;
         let page_count: i64 = self.conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
         let page_size: i64 = self.conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
         let schema_version: i32 = self
@@ -195,13 +203,14 @@ impl<'c> StoreStats<'c> {
 
     /// The id of the snapshot captured on `date` (`YYYY-MM-DD`), if any.
     pub fn snapshot_on(&self, date: &str) -> Result<Option<i64>> {
-        self.conn
+        Ok(self
+            .conn
             .query_row(
                 "SELECT id FROM analytics_snapshots WHERE date(captured_at) = ?",
                 params![date],
                 |r| r.get(0),
             )
-            .optional()
+            .optional()?)
     }
 
     /// Store a snapshot and return its id.
@@ -239,7 +248,8 @@ impl<'c> StoreStats<'c> {
                     category_counts: serde_json::from_str(&categories).unwrap_or_default(),
                 })
             })?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 }
@@ -252,8 +262,8 @@ mod tests {
     #[test]
     fn an_in_memory_database_has_no_path_but_a_size() {
         let db = Database::open_in_memory().unwrap();
-        let conn = db.conn();
-        let info = StoreStats::new(&conn).storage_info().unwrap();
+        let store = db.store();
+        let info = StoreStats::new(&store).storage_info().unwrap();
         assert_eq!(info.path, None);
         assert!(info.size_bytes > 0);
         assert_eq!(info.schema_version, crate::db::migrations::SCHEMA_VERSION);
@@ -262,8 +272,8 @@ mod tests {
     #[test]
     fn snapshots_round_trip_oldest_first() {
         let db = Database::open_in_memory().unwrap();
-        let conn = db.conn();
-        let stats = StoreStats::new(&conn);
+        let store = db.store();
+        let stats = StoreStats::new(&store);
         let snap = |at: &str, total| AnalyticsSnapshot {
             captured_at: at.to_string(),
             total_memories: total,

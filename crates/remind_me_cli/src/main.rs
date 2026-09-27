@@ -580,18 +580,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // switch, only a poll interval. Without this the scheduler would be
         // code nothing ever runs, and a reminder would only ever fire if
         // someone happened to call a tool.
-        let scheduler = remind_me_core::scheduler::start_scheduler_for(&db.conn());
+        let scheduler = remind_me_core::scheduler::start_scheduler_for(&db.store());
         // Conditional, unlike the scheduler: the watcher has an explicit
         // enable switch, so this is `None` unless REMIND_ME_WATCH_DIRS names a
         // usable directory. Until #203 this call did not exist at all, and
         // `scan_once` ran only when a test invoked it — the status surface
         // reported a configured watcher that was never going to scan anything.
-        let watcher = remind_me_core::watcher::start_watcher_for(&db.conn());
+        let watcher = remind_me_core::watcher::start_watcher_for(&db.store());
         // Conditional like the watcher: `None` unless
         // REMIND_ME_PROMOTION_INTERVAL is set. The refinement ladder's
         // candidate queries are pull-only without this, so a backlog can grow
         // indefinitely with nothing ever mentioning it (#208).
-        let nudge = remind_me_core::promotion::start_nudge_for(&db.conn());
+        let nudge = remind_me_core::promotion::start_nudge_for(&db.store());
         // Conditional like the watcher/nudge: `None` unless node id, hub URL
         // and secret are all configured. A background loop like the three
         // above, not something `McpServer` owns (#316's plugin work needed
@@ -688,7 +688,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 let db = Database::open(&db_path)?;
-                let scheduler = remind_me_core::scheduler::start_scheduler_for(&db.conn());
+                let scheduler = remind_me_core::scheduler::start_scheduler_for(&db.store());
                 // A long-lived daemon like "server", so it can carry the sync
                 // worker just as well -- see the comment on "server"'s own
                 // `SyncWorker::from_env` call for why this no longer lives

@@ -1,8 +1,9 @@
 use crate::db::wiki::WikiIndex;
+use crate::db::Result;
+use crate::db::Store;
 use crate::fts::sanitize_fts_query;
 use crate::wiki_import::slugify;
 use chrono::Utc;
-use rusqlite::{Connection, Result};
 use serde::{Deserialize, Serialize};
 
 /// Generated system pages, refused by delete and excluded from listings.
@@ -41,23 +42,23 @@ pub enum WikiDeleteOutcome {
 /// by the next reconcile. Kept for tests that exercise the index in isolation.
 #[doc(hidden)]
 pub fn write_wiki_page(
-    conn: &Connection,
+    store: &Store<'_>,
     slug: &str,
     title: &str,
     content: &str,
     summary: &str,
 ) -> Result<WikiPage> {
-    let wiki = WikiIndex::new(conn);
+    let wiki = WikiIndex::new(store);
     wiki.upsert_unbacked(slug, title, content, summary, &Utc::now().to_rfc3339())?;
-    wiki.get(slug)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
+    wiki.get(slug)?.ok_or(crate::db::StoreError::NotFound)
 }
 
-pub fn get_wiki_page(conn: &Connection, slug: &str) -> Result<Option<WikiPage>> {
-    WikiIndex::new(conn).get(slug)
+pub fn get_wiki_page(store: &Store<'_>, slug: &str) -> Result<Option<WikiPage>> {
+    WikiIndex::new(store).get(slug)
 }
 
-pub fn list_wiki_pages(conn: &Connection) -> Result<Vec<WikiPage>> {
-    WikiIndex::new(conn).recent_first()
+pub fn list_wiki_pages(store: &Store<'_>) -> Result<Vec<WikiPage>> {
+    WikiIndex::new(store).recent_first()
 }
 
 /// One hit from [`search_wiki_pages`].
@@ -84,7 +85,7 @@ pub const WIKI_SEARCH_LIMIT_DEFAULT: usize = 10;
 /// A query with no searchable tokens returns no hits rather than erroring;
 /// see [`sanitize_fts_query`].
 pub fn search_wiki_pages(
-    conn: &Connection,
+    store: &Store<'_>,
     query: &str,
     limit: usize,
 ) -> Result<Vec<WikiSearchHit>> {
@@ -94,7 +95,7 @@ pub fn search_wiki_pages(
     }
     let limit = limit.clamp(WIKI_SEARCH_LIMIT_MIN, WIKI_SEARCH_LIMIT_MAX);
 
-    WikiIndex::new(conn).search(&match_expr, limit)
+    WikiIndex::new(store).search(&match_expr, limit)
 }
 
 /// Delete a wiki page addressed by either its title or its slug.
@@ -105,14 +106,14 @@ pub fn search_wiki_pages(
 /// reference's `wiki.delete_page` accepts either form.
 ///
 /// Reserved system pages ([`RESERVED_SLUGS`]) are refused rather than deleted.
-pub fn delete_wiki_page(conn: &Connection, title_or_slug: &str) -> Result<WikiDeleteOutcome> {
+pub fn delete_wiki_page(store: &Store<'_>, title_or_slug: &str) -> Result<WikiDeleteOutcome> {
     let slug = slugify(title_or_slug);
 
     if RESERVED_SLUGS.contains(&slug.as_str()) {
         return Ok(WikiDeleteOutcome::Reserved);
     }
 
-    Ok(if WikiIndex::new(conn).remove(&slug)? {
+    Ok(if WikiIndex::new(store).remove(&slug)? {
         WikiDeleteOutcome::Deleted
     } else {
         WikiDeleteOutcome::NotFound

@@ -8,11 +8,12 @@
 //! a consolidation writes, and how vitality is seeded, are decided there and
 //! handed over as a [`NewMemory`] or a field value.
 
+use super::{Result, Store};
 use crate::db::derived::{memory_ids, write_memory, Origin};
 use crate::db::queries::{parse_memory_row, MEMORY_COLUMNS};
 use crate::models::Memory;
 use rusqlite::types::Value as SqlValue;
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Result};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde_json::Value;
 
 /// A whole `memories` row, as a writer supplies it.
@@ -181,17 +182,18 @@ pub struct Memories<'c> {
 }
 
 impl<'c> Memories<'c> {
-    pub fn new(conn: &'c Connection) -> Self {
+    pub fn new(store: &'c Store<'_>) -> Self {
+        let conn = store.conn();
         Self { conn }
     }
 
     /// Insert `row`, made on this node. An existing id is an error.
     pub fn insert(&self, row: &NewMemory) -> Result<()> {
         write_memory(self.conn, &row.id, Origin::Local, || {
-            self.conn.execute(
+            Ok(self.conn.execute(
                 &format!("INSERT INTO memories ({INSERT_COLUMNS}) VALUES ({INSERT_PLACEHOLDERS})"),
                 params_from_iter(insert_values(row)),
-            )
+            )?)
         })?;
         Ok(())
     }
@@ -200,12 +202,12 @@ impl<'c> Memories<'c> {
     /// inserted.
     pub fn insert_or_ignore(&self, row: &NewMemory) -> Result<bool> {
         let inserted = write_memory(self.conn, &row.id, Origin::Local, || {
-            self.conn.execute(
+            Ok(self.conn.execute(
                 &format!(
                     "INSERT OR IGNORE INTO memories ({INSERT_COLUMNS}) VALUES ({INSERT_PLACEHOLDERS})"
                 ),
                 params_from_iter(insert_values(row)),
-            )
+            )?)
         })?;
         Ok(inserted > 0)
     }
@@ -221,7 +223,7 @@ impl<'c> Memories<'c> {
     }
 
     fn upsert_row(&self, row: &NewMemory) -> Result<usize> {
-        self.conn.execute(
+        Ok(self.conn.execute(
             &format!(
                 "INSERT INTO memories ({INSERT_COLUMNS}) VALUES ({INSERT_PLACEHOLDERS})
                  ON CONFLICT(id) DO UPDATE SET
@@ -251,13 +253,14 @@ impl<'c> Memories<'c> {
                     remind_at = excluded.remind_at"
             ),
             params_from_iter(insert_values(row)),
-        )
+        )?)
     }
 
     /// The local copy of `id` as a sync merge sees it, if there is one.
     /// Unparseable `tags` read as none and unparseable `metadata` as `{}`.
     pub fn sync_view(&self, id: &str) -> Result<Option<SyncView>> {
-        self.conn
+        Ok(self
+            .conn
             .query_row(
                 "SELECT tags, metadata, updated_at FROM memories WHERE id = ?",
                 params![id],
@@ -272,7 +275,7 @@ impl<'c> Memories<'c> {
                     })
                 },
             )
-            .optional()
+            .optional()?)
     }
 
     /// Replace `id`'s tags and metadata without stamping `updated_at`: a sync
@@ -280,10 +283,10 @@ impl<'c> Memories<'c> {
     /// look like a newer local edit.
     pub fn set_tags_and_metadata(&self, id: &str, tags: &[String], metadata: &Value) -> Result<()> {
         write_memory(self.conn, id, Origin::Sync, || {
-            self.conn.execute(
+            Ok(self.conn.execute(
                 "UPDATE memories SET tags = ?, metadata = ? WHERE id = ?",
                 params![tags_json(tags), metadata.to_string(), id],
-            )
+            )?)
         })?;
         Ok(())
     }
@@ -297,14 +300,14 @@ impl<'c> Memories<'c> {
         updated_at: Option<&str>,
     ) -> Result<()> {
         write_memory(self.conn, id, Origin::Local, || match updated_at {
-            Some(stamp) => self.conn.execute(
+            Some(stamp) => Ok(self.conn.execute(
                 "UPDATE memories SET superseded_by = ?, updated_at = ? WHERE id = ?",
                 params![superseded_by, stamp, id],
-            ),
-            None => self.conn.execute(
+            )?),
+            None => Ok(self.conn.execute(
                 "UPDATE memories SET superseded_by = ? WHERE id = ?",
                 params![superseded_by, id],
-            ),
+            )?),
         })?;
         Ok(())
     }
@@ -342,8 +345,9 @@ impl<'c> Memories<'c> {
         )?;
         for id in &ids {
             write_memory(self.conn, id, Origin::Local, || {
-                self.conn
-                    .execute("DELETE FROM memories WHERE id = ?", params![id])
+                Ok(self
+                    .conn
+                    .execute("DELETE FROM memories WHERE id = ?", params![id])?)
             })?;
         }
         Ok(ids.len())
@@ -360,10 +364,10 @@ impl<'c> Memories<'c> {
         updated_at: &str,
     ) -> Result<()> {
         write_memory(self.conn, id, Origin::Local, || {
-            self.conn.execute(
+            Ok(self.conn.execute(
                 "UPDATE memories SET content = ?, access_count = ?, tags = ?, updated_at = ? WHERE id = ?",
                 params![content, access_count, tags_json(tags), updated_at, id],
-            )
+            )?)
         })?;
         Ok(())
     }
@@ -372,10 +376,10 @@ impl<'c> Memories<'c> {
     /// are local scores, not edits.
     pub fn set_vitality(&self, id: &str, vitality: f64, status: &str) -> Result<()> {
         write_memory(self.conn, id, Origin::Local, || {
-            self.conn.execute(
+            Ok(self.conn.execute(
                 "UPDATE memories SET vitality = ?, status = ? WHERE id = ?",
                 params![vitality, status, id],
-            )
+            )?)
         })?;
         Ok(())
     }
@@ -399,7 +403,8 @@ impl<'c> Memories<'c> {
                     base_weight: row.get(3)?,
                 })
             })?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
@@ -415,12 +420,12 @@ impl<'c> Memories<'c> {
     ) -> Result<()> {
         // Cached: a search records an access for every result it returns.
         write_memory(self.conn, id, Origin::Local, || {
-            self.conn
+            Ok(self.conn
                 .prepare_cached(
                     "UPDATE memories SET accessed_at = ?, access_count = ?, vitality = ?, status = ?
                       WHERE id = ?",
                 )?
-                .execute(params![accessed_at, access_count, vitality, status, id])
+                .execute(params![accessed_at, access_count, vitality, status, id])?)
         })?;
         Ok(())
     }
@@ -443,7 +448,8 @@ impl<'c> Memories<'c> {
                     object: row.get(3)?,
                 })
             })?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
@@ -464,7 +470,8 @@ impl<'c> Memories<'c> {
                     created_at: r.get(3)?,
                 })
             })?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
@@ -490,7 +497,8 @@ impl<'c> Memories<'c> {
         ))?;
         let rows = stmt
             .query_map(params_from_iter(ids.iter()), parse_memory_row)?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
@@ -508,13 +516,14 @@ impl<'c> Memories<'c> {
     /// Whether `id` is marked sensitive, or `None` when there is no such
     /// memory.
     pub fn sensitivity(&self, id: &str) -> Result<Option<bool>> {
-        self.conn
+        Ok(self
+            .conn
             .query_row(
                 "SELECT sensitive FROM memories WHERE id = ?",
                 params![id],
                 |r| r.get(0),
             )
-            .optional()
+            .optional()?)
     }
 
     /// The memories an export takes, oldest first (ties by id): of
@@ -554,7 +563,8 @@ impl<'c> Memories<'c> {
         ))?;
         let rows = stmt
             .query_map(params_from_iter(bindings), parse_memory_row)?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
@@ -563,7 +573,10 @@ impl<'c> Memories<'c> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {MEMORY_COLUMNS} FROM memories WHERE deleted_at IS NULL"
         ))?;
-        let rows = stmt.query_map([], parse_memory_row)?.collect();
+        let rows = stmt
+            .query_map([], parse_memory_row)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
@@ -580,7 +593,8 @@ impl<'c> Memories<'c> {
         )?;
         let rows = stmt
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
@@ -594,10 +608,10 @@ impl<'c> Memories<'c> {
         )?;
         for id in &ids {
             write_memory(self.conn, id, Origin::Local, || {
-                self.conn.execute(
+                Ok(self.conn.execute(
                     "UPDATE memories SET metadata = json_set(metadata, '$.ingest', ?) WHERE id = ?",
                     params![marker, id],
-                )
+                )?)
             })?;
         }
         Ok(ids.len())
@@ -624,18 +638,19 @@ mod tests {
     #[test]
     fn new_fills_every_column_with_the_schema_default() {
         let db = Database::open_in_memory().unwrap();
-        let conn = db.conn();
+        let store = db.store();
+        let conn = store.conn();
         conn.execute(
             "INSERT INTO memories (id, content, created_at, updated_at) VALUES ('a', 'x', ?, ?)",
             params![NOW, NOW],
         )
         .unwrap();
-        Memories::new(&conn)
+        Memories::new(&store)
             .insert(&NewMemory::new("b", "x", NOW))
             .unwrap();
 
-        let mut defaulted = raw_row(&conn, "a");
-        let mut written = raw_row(&conn, "b");
+        let mut defaulted = raw_row(conn, "a");
+        let mut written = raw_row(conn, "b");
         defaulted.remove(0);
         written.remove(0);
         assert_eq!(written, defaulted);
@@ -644,8 +659,9 @@ mod tests {
     #[test]
     fn insert_refuses_a_taken_id_and_insert_or_ignore_reports_it() {
         let db = Database::open_in_memory().unwrap();
-        let conn = db.conn();
-        let memories = Memories::new(&conn);
+        let store = db.store();
+        let conn = store.conn();
+        let memories = Memories::new(&store);
         let row = NewMemory::new("a", "first", NOW);
 
         assert!(memories.insert_or_ignore(&row).unwrap());
@@ -663,8 +679,9 @@ mod tests {
     #[test]
     fn a_synced_overwrite_keeps_created_at_and_the_chunk_position() {
         let db = Database::open_in_memory().unwrap();
-        let conn = db.conn();
-        let memories = Memories::new(&conn);
+        let store = db.store();
+        let conn = store.conn();
+        let memories = Memories::new(&store);
         memories
             .insert(&NewMemory {
                 doc_id: Some("imp_1".to_string()),
@@ -699,24 +716,28 @@ mod tests {
     #[test]
     fn sync_view_reads_tags_that_are_not_an_array_as_none() {
         let db = Database::open_in_memory().unwrap();
-        let conn = db.conn();
+        let store = db.store();
+        let conn = store.conn();
         conn.execute(
             r#"INSERT INTO memories (id, content, tags, created_at, updated_at)
              VALUES ('a', 'x', '"not an array"', ?, ?)"#,
             params![NOW, NOW],
         )
         .unwrap();
-        let view = Memories::new(&conn).sync_view("a").unwrap().unwrap();
+        let view = Memories::new(&store).sync_view("a").unwrap().unwrap();
         assert!(view.tags.is_empty());
         assert_eq!(view.metadata, serde_json::json!({}));
-        assert!(Memories::new(&conn).sync_view("missing").unwrap().is_none());
+        assert!(Memories::new(&store)
+            .sync_view("missing")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
     fn access_inputs_skips_unknown_ids_and_takes_an_empty_list() {
         let db = Database::open_in_memory().unwrap();
-        let conn = db.conn();
-        let memories = Memories::new(&conn);
+        let store = db.store();
+        let memories = Memories::new(&store);
         memories.insert(&NewMemory::new("a", "x", NOW)).unwrap();
 
         assert!(memories.access_inputs(&[]).unwrap().is_empty());

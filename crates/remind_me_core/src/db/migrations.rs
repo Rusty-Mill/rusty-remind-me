@@ -32,8 +32,10 @@
 //! Every phase is idempotent, so reopening is a no-op and a partially-migrated
 //! database converges.
 
+use super::Result;
 use crate::db::derived::{self, Origin};
-use rusqlite::{Connection, Result};
+use crate::db::Store;
+use rusqlite::Connection;
 
 /// The version the schema files correspond to, stamped into
 /// `PRAGMA user_version`.
@@ -91,7 +93,8 @@ fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
 fn columns_of(conn: &Connection, table: &str) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table))?;
     let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
-    rows.collect()
+    rows.collect::<rusqlite::Result<_>>()
+        .map_err(crate::db::StoreError::from)
 }
 
 /// A pristine database holding exactly the generated schema, used to diff
@@ -157,11 +160,11 @@ fn rebuild_table(conn: &Connection, table: &str) -> Result<()> {
             carry = carry,
             table = table
         ))?;
-        conn.execute_batch(&format!(
+        Ok(conn.execute_batch(&format!(
             "DROP TABLE {table}; ALTER TABLE {scratch} RENAME TO {table};",
             table = table,
             scratch = scratch
-        ))
+        ))?)
     })();
     conn.execute_batch("PRAGMA foreign_keys=ON;")?;
     result
@@ -230,7 +233,9 @@ fn reconcile_columns(conn: &Connection) -> Result<()> {
     let reference = pristine()?;
     let mut stmt = reference
         .prepare("SELECT name FROM sqlite_master WHERE type='table' AND sql IS NOT NULL")?;
-    let tables: Vec<String> = stmt.query_map([], |r| r.get(0))?.collect::<Result<_>>()?;
+    let tables: Vec<String> = stmt
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
 
     for table in tables {
         if !table_exists(conn, &table)? {
@@ -313,7 +318,9 @@ fn migration_pending(conn: &Connection) -> Result<bool> {
 
     let reference = pristine()?;
     let mut names = reference.prepare("SELECT name FROM sqlite_master WHERE type='table'")?;
-    let tables: Vec<String> = names.query_map([], |r| r.get(0))?.collect::<Result<_>>()?;
+    let tables: Vec<String> = names
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
     for table in &tables {
         if differs_from_schema(conn, table)? {
             return Ok(true);
@@ -331,9 +338,11 @@ fn has_existing_data(conn: &Connection) -> Result<bool> {
     if !table_exists(conn, "memories")? {
         return Ok(false);
     }
-    conn.query_row("SELECT EXISTS(SELECT 1 FROM memories LIMIT 1)", [], |r| {
-        r.get(0)
-    })
+    Ok(
+        conn.query_row("SELECT EXISTS(SELECT 1 FROM memories LIMIT 1)", [], |r| {
+            r.get(0)
+        })?,
+    )
 }
 
 /// Snapshot the database before a pending migration runs (issue #95, matching
@@ -350,7 +359,10 @@ fn snapshot_before_migration(conn: &Connection) -> Result<()> {
     }
 
     let current_version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    let _ = crate::backup::create_backup(conn, &format!("pre-migration-v{}", current_version));
+    let _ = crate::backup::create_backup(
+        &Store::over_sqlite(conn),
+        &format!("pre-migration-v{}", current_version),
+    );
     Ok(())
 }
 
@@ -365,7 +377,7 @@ fn snapshot_before_migration(conn: &Connection) -> Result<()> {
 /// not, so this is a no-op on every subsequent open.
 fn backfill_derived(conn: &Connection, force_fts_rebuild: bool) -> Result<()> {
     let count = |table: &str| -> Result<i64> {
-        conn.query_row(&format!("SELECT count(*) FROM {}", table), [], |r| r.get(0))
+        Ok(conn.query_row(&format!("SELECT count(*) FROM {}", table), [], |r| r.get(0))?)
     };
 
     // Tag index. `INSERT OR IGNORE` rather than an emptiness guard, because a
@@ -442,14 +454,14 @@ fn refile_reference_imports(conn: &Connection, version_on_open: i32) -> Result<(
     )?;
     for id in &ids {
         derived::write_memory(conn, id, Origin::Local, || {
-            conn.execute(
+            Ok(conn.execute(
                 "UPDATE memories
                     SET memory_type = 'reference',
                         decay_rate  = ?1,
                         updated_at  = strftime('%Y-%m-%dT%H:%M:%f000', 'now') || '+00:00'
                   WHERE id = ?2",
                 rusqlite::params![crate::vitality::REFERENCE_DECAY_RATE, id],
-            )
+            )?)
         })?;
     }
     Ok(())
@@ -494,10 +506,10 @@ fn rekey_vectors(conn: &Connection) -> Result<()> {
                  DROP TABLE vec_embeddings;",
             )?;
         }
-        conn.execute_batch("DROP TABLE vec_chunks_v29;")
+        Ok(conn.execute_batch("DROP TABLE vec_chunks_v29;")?)
     })();
     match result {
-        Ok(()) => conn.execute_batch("RELEASE rekey_vectors;"),
+        Ok(()) => Ok(conn.execute_batch("RELEASE rekey_vectors;")?),
         Err(e) => {
             conn.execute_batch("ROLLBACK TO rekey_vectors; RELEASE rekey_vectors;")?;
             Err(e)
@@ -520,7 +532,8 @@ fn refuse_newer(version_on_open: i32) -> Result<()> {
             "this database is at schema version {version_on_open}, newer than this \
              build's {SCHEMA_VERSION}: upgrade rusty-remind-me to open it"
         )),
-    ))
+    )
+    .into())
 }
 
 /// Create and reconcile the schema, then stamp the version.
@@ -547,7 +560,9 @@ pub fn apply(conn: &Connection) -> Result<()> {
 
     let reference = pristine()?;
     let mut names = reference.prepare("SELECT name FROM sqlite_master WHERE type='table'")?;
-    let tables: Vec<String> = names.query_map([], |r| r.get(0))?.collect::<Result<_>>()?;
+    let tables: Vec<String> = names
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
     drop(names);
 
     let mut rebuilt_any = false;
@@ -573,7 +588,7 @@ pub fn apply(conn: &Connection) -> Result<()> {
     // content-derived, and this crate used to derive them differently from the
     // reference, so a database written by an earlier build needs rewriting to
     // be readable by `remind_me` at all.
-    crate::entity::renormalize_entity_ids(conn)?;
+    crate::entity::renormalize_entity_ids(&Store::over_sqlite(conn))?;
 
-    conn.execute_batch(&format!("PRAGMA user_version = {};", SCHEMA_VERSION))
+    Ok(conn.execute_batch(&format!("PRAGMA user_version = {};", SCHEMA_VERSION))?)
 }

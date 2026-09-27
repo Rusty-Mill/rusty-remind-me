@@ -35,7 +35,7 @@
 //! configured" a visible state rather than something to infer.
 
 use crate::db::curation::{Backlog, Curation};
-use rusqlite::Connection;
+use crate::db::Store;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -94,8 +94,8 @@ const QUEUES: &[Queue] = &[
 ///
 /// Never fails: a queue whose query errors reports 0 rather than propagating,
 /// because a status helper must not be the thing that breaks a search.
-pub fn pending_counts(conn: &Connection) -> HashMap<String, i64> {
-    let curation = Curation::new(conn);
+pub fn pending_counts(store: &Store<'_>) -> HashMap<String, i64> {
+    let curation = Curation::new(store);
     let mut counts = HashMap::new();
     for queue in QUEUES {
         let count = curation.backlog_depth(queue.backlog).unwrap_or(0);
@@ -106,11 +106,11 @@ pub fn pending_counts(conn: &Connection) -> HashMap<String, i64> {
     // nudge cannot disagree with what draining it actually finds.
     counts.insert(
         "contradiction_candidates".to_string(),
-        crate::contradictions::candidate_count(conn).unwrap_or(0),
+        crate::contradictions::candidate_count(store).unwrap_or(0),
     );
     counts.insert(
         "recalibration_candidates".to_string(),
-        crate::recalibrate::candidate_count(conn).unwrap_or(0),
+        crate::recalibrate::candidate_count(store).unwrap_or(0),
     );
 
     counts
@@ -128,8 +128,8 @@ pub struct CaptureHealth {
     pub ever_captured: bool,
 }
 
-pub fn capture_health(conn: &Connection) -> CaptureHealth {
-    let (captures, last_capture_at) = Curation::new(conn)
+pub fn capture_health(store: &Store<'_>) -> CaptureHealth {
+    let (captures, last_capture_at) = Curation::new(store)
         .capture_activity()
         .map(|a| (a.captures, a.last_capture_at))
         .unwrap_or((0, None));
@@ -234,7 +234,7 @@ pub fn render_notice(counts: &HashMap<String, i64>) -> Option<String> {
 ///
 /// Returns `None` when nudges are disabled, when the throttle slot is not yet
 /// due, or when no queue has crossed the threshold.
-pub fn maybe_notice(conn: &Connection) -> Option<String> {
+pub fn maybe_notice(store: &Store<'_>) -> Option<String> {
     if !nudges_enabled() {
         return None;
     }
@@ -242,5 +242,5 @@ pub fn maybe_notice(conn: &Connection) -> Option<String> {
     if !due("maintenance", NUDGE_INTERVAL_SECONDS) {
         return None;
     }
-    render_notice(&pending_counts(conn))
+    render_notice(&pending_counts(store))
 }

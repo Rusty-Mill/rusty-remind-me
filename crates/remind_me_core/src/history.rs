@@ -29,8 +29,9 @@
 //!   per read.
 
 use crate::db::history::{Revisions, Tracked};
+use crate::db::Result;
+use crate::db::Store;
 use crate::models::{MemoryRevision, RevertOutcome};
-use rusqlite::{Connection, Result};
 
 /// Snapshot a memory's current tracked columns before an update overwrites
 /// them.
@@ -44,7 +45,7 @@ use rusqlite::{Connection, Result};
 /// Returns whether a revision was actually written, which is false when
 /// nothing tracked changed.
 pub fn capture_revision(
-    conn: &Connection,
+    store: &Store<'_>,
     memory_id: &str,
     incoming: &TrackedChanges,
     reason: Option<&str>,
@@ -53,7 +54,7 @@ pub fn capture_revision(
         return Ok(false);
     }
 
-    let revisions = Revisions::new(conn);
+    let revisions = Revisions::new(store);
     let Some(current) = revisions.current(memory_id)? else {
         return Ok(false);
     };
@@ -116,13 +117,13 @@ impl TrackedChanges {
 /// clock tick still come back in the order they were written — otherwise a
 /// burst of edits would list in an arbitrary order and the ids a caller passes
 /// to revert would not mean what the list implied.
-pub fn history(conn: &Connection, memory_id: &str, limit: usize) -> Result<Vec<MemoryRevision>> {
-    Revisions::new(conn).list(memory_id, limit)
+pub fn history(store: &Store<'_>, memory_id: &str, limit: usize) -> Result<Vec<MemoryRevision>> {
+    Revisions::new(store).list(memory_id, limit)
 }
 
 /// Whether a memory exists and is not soft-deleted.
-pub fn memory_is_live(conn: &Connection, memory_id: &str) -> Result<bool> {
-    Revisions::new(conn).is_live(memory_id)
+pub fn memory_is_live(store: &Store<'_>, memory_id: &str) -> Result<bool> {
+    Revisions::new(store).is_live(memory_id)
 }
 
 /// Restore a memory's tracked columns to a prior revision.
@@ -135,16 +136,16 @@ pub fn memory_is_live(conn: &Connection, memory_id: &str) -> Result<bool> {
 /// rather than a silent no-op, because the two are indistinguishable to a
 /// caller who mistyped an id.
 pub fn revert(
-    conn: &Connection,
+    store: &Store<'_>,
     memory_id: &str,
     revision_id: i64,
     reason: Option<&str>,
 ) -> Result<RevertOutcome> {
-    if !memory_is_live(conn, memory_id)? {
+    if !memory_is_live(store, memory_id)? {
         return Ok(RevertOutcome::MemoryNotFound);
     }
 
-    let revisions = Revisions::new(conn);
+    let revisions = Revisions::new(store);
     let Some(mut target) = revisions.revision(memory_id, revision_id)? else {
         return Ok(RevertOutcome::RevisionNotFound);
     };
@@ -164,7 +165,7 @@ pub fn revert(
     let stated = reason
         .map(str::to_string)
         .unwrap_or_else(|| format!("revert to revision {}", revision_id));
-    let captured = capture_revision(conn, memory_id, &changes, Some(&stated))?;
+    let captured = capture_revision(store, memory_id, &changes, Some(&stated))?;
 
     if !captured {
         // Nothing tracked differs, so the memory already holds this revision's
@@ -180,7 +181,7 @@ pub fn revert(
     // embedder leaves the memory keyword-searchable rather than failing an
     // edit that already committed.
     if let Some(embedder) = crate::embedder::available_embedder() {
-        let _ = crate::vectors::embed_and_store(conn, &*embedder, memory_id, &target.content);
+        let _ = crate::vectors::embed_and_store(store, &*embedder, memory_id, &target.content);
     }
 
     Ok(RevertOutcome::Reverted { revision_id })

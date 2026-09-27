@@ -28,9 +28,10 @@
 //! content the user deleted.
 
 use crate::db::reminders::Reminders;
+use crate::db::Result;
+use crate::db::Store;
 use crate::models::{Memory, ReminderWindow, SetReminderOutcome};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
-use rusqlite::{Connection, Result};
 
 /// Parse an ISO-8601 timestamp the way the reference's `datetime.fromisoformat`
 /// does, and canonicalize it to UTC.
@@ -76,11 +77,11 @@ pub fn parse_remind_at(raw: &str) -> Option<DateTime<Utc>> {
 /// vault whose history is half reminder-scheduling noise is harder to read
 /// back than one that only records edits.
 pub fn set_reminder(
-    conn: &Connection,
+    store: &Store<'_>,
     memory_id: &str,
     remind_at: Option<&str>,
 ) -> Result<SetReminderOutcome> {
-    let repo = Reminders::new(conn);
+    let repo = Reminders::new(store);
     if !repo.is_live(memory_id)? {
         return Ok(SetReminderOutcome::NotFound {
             memory_id: memory_id.to_string(),
@@ -126,8 +127,8 @@ pub fn set_reminder(
 ///
 /// Shared with the digest rather than re-derived there, so the two can never
 /// disagree about what is overdue.
-pub fn list_reminders(conn: &Connection, when: ReminderWindow, limit: i64) -> Result<Vec<Memory>> {
-    Reminders::new(conn).in_window(when, &Utc::now().to_rfc3339(), limit)
+pub fn list_reminders(store: &Store<'_>, when: ReminderWindow, limit: i64) -> Result<Vec<Memory>> {
+    Reminders::new(store).in_window(when, &Utc::now().to_rfc3339(), limit)
 }
 
 /// Render memories the way the reference's `_fmt_memory_md` does.

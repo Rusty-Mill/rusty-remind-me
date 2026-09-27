@@ -293,7 +293,7 @@ use remind_me_core::Database;
 #[test]
 fn a_note_imports_with_merged_tags_frontmatter_and_linked_entities() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
     let note = "---\n\
                 title: Island notes\n\
@@ -302,7 +302,7 @@ fn a_note_imports_with_merged_tags_frontmatter_and_linked_entities() {
                 Quokkas live on [[Rottnest]]. #australia\n";
 
     let outcome = remind_me_core::importer::import_bytes(
-        &conn,
+        &store,
         note.as_bytes(),
         "island.md",
         "",
@@ -322,12 +322,15 @@ fn a_note_imports_with_merged_tags_frontmatter_and_linked_entities() {
     );
 
     let (content, category, source, tags_json, metadata): (String, String, String, String, String) =
-        conn.query_row(
-            "SELECT content, category, source, tags, metadata FROM memories",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-        )
-        .unwrap();
+        store
+            .sqlite()
+            .unwrap()
+            .query_row(
+                "SELECT content, category, source, tags, metadata FROM memories",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
 
     assert!(content.contains("Quokkas live on"));
     assert_eq!(
@@ -348,7 +351,9 @@ fn a_note_imports_with_merged_tags_frontmatter_and_linked_entities() {
 
     // The mention became a real, traversable entity link — the whole point of
     // treating a wikilink as more than text.
-    let linked: String = conn
+    let linked: String = store
+        .sqlite()
+        .unwrap()
         .query_row(
             "SELECT e.name FROM entities e
                JOIN memory_entities me ON me.entity_id = e.id",
@@ -362,12 +367,12 @@ fn a_note_imports_with_merged_tags_frontmatter_and_linked_entities() {
 #[test]
 fn a_link_to_a_note_that_does_not_exist_yet_still_resolves() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
     // Entity upsert creates what is missing, so a forward reference into a
     // vault whose other notes have not been imported needs no special case.
     remind_me_core::importer::import_bytes(
-        &conn,
+        &store,
         b"Refers to [[Not Yet Imported]].\n",
         "note.md",
         "",
@@ -378,7 +383,9 @@ fn a_link_to_a_note_that_does_not_exist_yet_still_resolves() {
     )
     .unwrap();
 
-    let count: i64 = conn
+    let count: i64 = store
+        .sqlite()
+        .unwrap()
         .query_row(
             "SELECT COUNT(*) FROM entities WHERE name = 'Not Yet Imported'",
             [],
@@ -391,12 +398,12 @@ fn a_link_to_a_note_that_does_not_exist_yet_still_resolves() {
 #[test]
 fn re_importing_the_same_note_is_a_no_op() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let note = b"Some vault note with [[A Link]].\n";
 
     for _ in 0..2 {
         remind_me_core::importer::import_bytes(
-            &conn,
+            &store,
             note,
             "note.md",
             "",
@@ -408,7 +415,9 @@ fn re_importing_the_same_note_is_a_no_op() {
         .unwrap();
     }
 
-    let memories: i64 = conn
+    let memories: i64 = store
+        .sqlite()
+        .unwrap()
         .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
         .unwrap();
     assert_eq!(
@@ -420,10 +429,10 @@ fn re_importing_the_same_note_is_a_no_op() {
 #[test]
 fn obsidian_import_refuses_a_non_markdown_file() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
     let outcome = remind_me_core::importer::import_bytes(
-        &conn,
+        &store,
         b"plain text",
         "notes.txt",
         "",

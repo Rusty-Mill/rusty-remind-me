@@ -7,14 +7,15 @@
 //! The rules stay with them: slugs, reserved pages, what a reconcile
 //! re-indexes, the load budget and the compile watermark.
 
+use super::{Result, Store};
 use crate::db::derived::write_wiki_page;
 use crate::wiki::{WikiPage, WikiSearchHit};
-use rusqlite::{params, Connection, OptionalExtension, Result, Row};
+use rusqlite::{params, Connection, OptionalExtension, Row};
 use std::collections::HashMap;
 
 const PAGE_COLUMNS: &str = "slug, title, content, summary, mtime, updated_at";
 
-fn parse_page_row(row: &Row) -> Result<WikiPage> {
+fn parse_page_row(row: &Row) -> rusqlite::Result<WikiPage> {
     Ok(WikiPage {
         slug: row.get("slug")?,
         title: row.get("title")?,
@@ -38,7 +39,8 @@ pub struct WikiIndex<'c> {
 }
 
 impl<'c> WikiIndex<'c> {
-    pub fn new(conn: &'c Connection) -> Self {
+    pub fn new(store: &'c Store<'_>) -> Self {
+        let conn = store.conn();
         Self { conn }
     }
 
@@ -51,7 +53,7 @@ impl<'c> WikiIndex<'c> {
     }
 
     fn upsert_row(&self, page: &WikiPage) -> Result<usize> {
-        self.conn.execute(
+        Ok(self.conn.execute(
             "INSERT INTO wiki_pages (slug, title, content, summary, mtime, updated_at)
              VALUES (?, ?, ?, ?, ?, ?)
              ON CONFLICT(slug) DO UPDATE SET
@@ -66,7 +68,7 @@ impl<'c> WikiIndex<'c> {
                 page.mtime,
                 page.updated_at
             ],
-        )
+        )?)
     }
 
     /// Store a page that no file backs: a new row gets mtime 0, and an
@@ -80,7 +82,7 @@ impl<'c> WikiIndex<'c> {
         updated_at: &str,
     ) -> Result<()> {
         write_wiki_page(self.conn, slug, || {
-            self.conn.execute(
+            Ok(self.conn.execute(
                 "INSERT INTO wiki_pages (slug, title, content, summary, mtime, updated_at)
              VALUES (?, ?, ?, ?, 0, ?)
              ON CONFLICT(slug) DO UPDATE SET
@@ -89,20 +91,21 @@ impl<'c> WikiIndex<'c> {
                 summary = excluded.summary,
                 updated_at = excluded.updated_at",
                 params![slug, title, content, summary, updated_at],
-            )
+            )?)
         })?;
         Ok(())
     }
 
     /// The page with slug `slug`, if there is one.
     pub fn get(&self, slug: &str) -> Result<Option<WikiPage>> {
-        self.conn
+        Ok(self
+            .conn
             .query_row(
                 &format!("SELECT {PAGE_COLUMNS} FROM wiki_pages WHERE slug = ?"),
                 params![slug],
                 parse_page_row,
             )
-            .optional()
+            .optional()?)
     }
 
     /// Every page, most recently updated first.
@@ -110,7 +113,10 @@ impl<'c> WikiIndex<'c> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {PAGE_COLUMNS} FROM wiki_pages ORDER BY updated_at DESC"
         ))?;
-        let rows = stmt.query_map([], parse_page_row)?.collect();
+        let rows = stmt
+            .query_map([], parse_page_row)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
@@ -120,7 +126,10 @@ impl<'c> WikiIndex<'c> {
             "SELECT {PAGE_COLUMNS} FROM wiki_pages
               ORDER BY updated_at DESC, title COLLATE NOCASE"
         ))?;
-        let rows = stmt.query_map([], parse_page_row)?.collect();
+        let rows = stmt
+            .query_map([], parse_page_row)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
@@ -136,7 +145,8 @@ impl<'c> WikiIndex<'c> {
                     summary: r.get(1)?,
                 })
             })?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
@@ -145,7 +155,8 @@ impl<'c> WikiIndex<'c> {
         let mut stmt = self.conn.prepare("SELECT slug, mtime FROM wiki_pages")?;
         let rows = stmt
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?)))?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
@@ -153,8 +164,9 @@ impl<'c> WikiIndex<'c> {
     /// page was there.
     pub fn remove(&self, slug: &str) -> Result<bool> {
         let removed = write_wiki_page(self.conn, slug, || {
-            self.conn
-                .execute("DELETE FROM wiki_pages WHERE slug = ?", params![slug])
+            Ok(self
+                .conn
+                .execute("DELETE FROM wiki_pages WHERE slug = ?", params![slug])?)
         })?;
         self.conn
             .execute("DELETE FROM wiki_links WHERE src_slug = ?", params![slug])?;
@@ -202,7 +214,8 @@ impl<'c> WikiIndex<'c> {
                     snippet: row.get("snippet")?,
                 })
             })?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
@@ -210,13 +223,14 @@ impl<'c> WikiIndex<'c> {
 
     /// The `wiki_meta` value under `key`, if set.
     pub fn meta(&self, key: &str) -> Result<Option<String>> {
-        self.conn
+        Ok(self
+            .conn
             .query_row(
                 "SELECT value FROM wiki_meta WHERE key = ?",
                 params![key],
                 |r| r.get(0),
             )
-            .optional()
+            .optional()?)
     }
 
     /// Set the `wiki_meta` value under `key`.
@@ -252,8 +266,8 @@ mod tests {
     #[test]
     fn an_unbacked_write_keeps_the_cached_mtime() {
         let db = Database::open_in_memory().unwrap();
-        let conn = db.conn();
-        let wiki = WikiIndex::new(&conn);
+        let store = db.store();
+        let wiki = WikiIndex::new(&store);
         wiki.upsert(&page("a", 42.0, T1)).unwrap();
         wiki.upsert_unbacked("a", "A", "new", "", T2).unwrap();
         wiki.upsert_unbacked("b", "B", "body", "", T2).unwrap();
@@ -266,8 +280,9 @@ mod tests {
     #[test]
     fn remove_takes_the_links_and_reports_a_missing_page() {
         let db = Database::open_in_memory().unwrap();
-        let conn = db.conn();
-        let wiki = WikiIndex::new(&conn);
+        let store = db.store();
+        let conn = store.conn();
+        let wiki = WikiIndex::new(&store);
         wiki.upsert(&page("a", 1.0, T1)).unwrap();
         wiki.replace_links("a", &[("b".to_string(), "B".to_string())])
             .unwrap();
@@ -283,8 +298,8 @@ mod tests {
     #[test]
     fn meta_round_trips_and_overwrites() {
         let db = Database::open_in_memory().unwrap();
-        let conn = db.conn();
-        let wiki = WikiIndex::new(&conn);
+        let store = db.store();
+        let wiki = WikiIndex::new(&store);
         assert_eq!(wiki.meta("k").unwrap(), None);
         wiki.set_meta("k", "1").unwrap();
         wiki.set_meta("k", "2").unwrap();

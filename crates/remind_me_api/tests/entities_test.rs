@@ -9,12 +9,13 @@
 
 mod common;
 use common::{get, seeded_server, server};
+use remind_me_core::db::Store;
 use remind_me_core::entity::{link_memory_entity, upsert_entity};
 use remind_me_core::{db::queries, EntityInput, MemoryAddInput};
 
-fn add(conn: &rusqlite::Connection, content: &str) -> String {
+fn add(store: &Store<'_>, content: &str) -> String {
     queries::add_memory(
-        conn,
+        store,
         MemoryAddInput {
             sensitive: false,
             content: content.to_string(),
@@ -32,9 +33,9 @@ fn add(conn: &rusqlite::Connection, content: &str) -> String {
     .id
 }
 
-fn entity(conn: &rusqlite::Connection, name: &str) -> String {
+fn entity(store: &Store<'_>, name: &str) -> String {
     upsert_entity(
-        conn,
+        store,
         &EntityInput {
             name: name.to_string(),
             kind: Some("place".into()),
@@ -67,10 +68,10 @@ fn an_unknown_entity_is_404() {
 
 #[test]
 fn a_known_entity_returns_its_profile() {
-    let (server, root) = seeded_server("entity-known", |conn| {
-        let id = entity(conn, "Rottnest Island");
-        let mem_id = add(conn, "quokka sighting");
-        link_memory_entity(conn, &mem_id, &id).unwrap();
+    let (server, root) = seeded_server("entity-known", |store| {
+        let id = entity(store, "Rottnest Island");
+        let mem_id = add(store, "quokka sighting");
+        link_memory_entity(store, &mem_id, &id).unwrap();
     });
 
     let response = get(&server, "/api/entity?name=Rottnest%20Island");
@@ -96,12 +97,12 @@ fn an_empty_store_lists_no_entities() {
 
 #[test]
 fn entities_are_listed_most_mentioned_first() {
-    let (server, root) = seeded_server("entities-ordered", |conn| {
-        let popular = entity(conn, "Rottnest Island");
-        entity(conn, "Albany");
+    let (server, root) = seeded_server("entities-ordered", |store| {
+        let popular = entity(store, "Rottnest Island");
+        entity(store, "Albany");
         for i in 0..2 {
-            let mem_id = add(conn, &format!("memory {}", i));
-            link_memory_entity(conn, &mem_id, &popular).unwrap();
+            let mem_id = add(store, &format!("memory {}", i));
+            link_memory_entity(store, &mem_id, &popular).unwrap();
         }
     });
 
@@ -135,8 +136,8 @@ fn traverse_of_an_unknown_entity_is_404() {
 
 #[test]
 fn traverse_of_a_known_entity_with_no_edges_reports_itself() {
-    let (server, root) = seeded_server("traverse-lonely", |conn| {
-        entity(conn, "Rottnest Island");
+    let (server, root) = seeded_server("traverse-lonely", |store| {
+        entity(store, "Rottnest Island");
     });
 
     let response = get(&server, "/api/entity/traverse?name=Rottnest%20Island");
@@ -151,10 +152,10 @@ fn traverse_of_a_known_entity_with_no_edges_reports_itself() {
 
 #[test]
 fn traverse_follows_a_one_hop_relation() {
-    let (server, root) = seeded_server("traverse-edge", |conn| {
-        let a = entity(conn, "Rottnest Island");
-        let b = entity(conn, "Western Australia");
-        conn.execute(
+    let (server, root) = seeded_server("traverse-edge", |store| {
+        let a = entity(store, "Rottnest Island");
+        let b = entity(store, "Western Australia");
+        store.sqlite().unwrap().execute(
             "INSERT INTO entity_relations (id, subject_entity_id, relation, object_entity_id, created_at, updated_at)
              VALUES ('rel1', ?, 'located_in', ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
             rusqlite::params![a, b],
@@ -174,8 +175,8 @@ fn traverse_follows_a_one_hop_relation() {
 
 #[test]
 fn traverse_hops_and_cap_are_clamped_not_rejected() {
-    let (server, root) = seeded_server("traverse-clamp", |conn| {
-        entity(conn, "Rottnest Island");
+    let (server, root) = seeded_server("traverse-clamp", |store| {
+        entity(store, "Rottnest Island");
     });
 
     let response = get(

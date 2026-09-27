@@ -7,6 +7,8 @@
 
 use crate::db::curation::Curation;
 use crate::db::memories::{Memories, NewMemory};
+use crate::db::Result;
+use crate::db::Store;
 use crate::entity::{
     apply_entity_mentions, maybe_link_entity_relation, supersede_contradicting_facts,
 };
@@ -18,7 +20,6 @@ use crate::models::{
 };
 use crate::vitality::{calculate_vitality, get_decay_rate, get_source_prior, get_type_prior};
 use chrono::Utc;
-use rusqlite::{Connection, Result};
 
 /// Derive a display title from a summary when the caller supplied none.
 ///
@@ -63,7 +64,7 @@ fn capture_metadata(
 
 #[allow(clippy::too_many_arguments)]
 fn insert_half(
-    conn: &Connection,
+    store: &Store<'_>,
     id: &str,
     content: &str,
     category: &str,
@@ -78,7 +79,7 @@ fn insert_half(
     let vitality = calculate_vitality(base_weight, 0, decay_rate, now_iso, now);
 
     let (node_id, client) = crate::sync::memory_provenance();
-    Memories::new(conn).insert(&NewMemory {
+    Memories::new(store).insert(&NewMemory {
         category: category.to_string(),
         tags: tags.to_vec(),
         source: CAPTURE_SOURCE.to_string(),
@@ -108,7 +109,7 @@ fn insert_half(
 /// (`linked_dialog` / `linked_summary`). The dialog's pointer is written in a
 /// second pass, because the summary's id does not exist when the dialog is
 /// inserted.
-pub fn auto_capture(conn: &Connection, input: &AutoCaptureInput) -> Result<CaptureResult> {
+pub fn auto_capture(store: &Store<'_>, input: &AutoCaptureInput) -> Result<CaptureResult> {
     let now_iso = Utc::now().to_rfc3339();
     let capture_id = format!("cap_{}", uuid::Uuid::new_v4().simple());
     let dialog_id = format!("mem_{}", uuid::Uuid::new_v4().simple());
@@ -132,7 +133,7 @@ pub fn auto_capture(conn: &Connection, input: &AutoCaptureInput) -> Result<Captu
     );
 
     insert_half(
-        conn,
+        store,
         &dialog_id,
         &input.conversation,
         DIALOG_CATEGORY,
@@ -142,7 +143,7 @@ pub fn auto_capture(conn: &Connection, input: &AutoCaptureInput) -> Result<Captu
         &now_iso,
     )?;
     insert_half(
-        conn,
+        store,
         &summary_id,
         &input.summary,
         &input.category,
@@ -171,8 +172,8 @@ pub fn auto_capture(conn: &Connection, input: &AutoCaptureInput) -> Result<Captu
 /// but matching neither is returned in `other` rather than dropped — a capture
 /// that has lost a half, or gained a third row through sync, should be visible
 /// rather than silently half-reported.
-pub fn get_capture(conn: &Connection, capture_id: &str) -> Result<Option<Capture>> {
-    let rows = Curation::new(conn).capture_rows(capture_id)?;
+pub fn get_capture(store: &Store<'_>, capture_id: &str) -> Result<Option<Capture>> {
+    let rows = Curation::new(store).capture_rows(capture_id)?;
     if rows.is_empty() {
         return Ok(None);
     }
@@ -231,8 +232,8 @@ pub fn get_capture(conn: &Connection, capture_id: &str) -> Result<Option<Capture
 /// 3. **Contradicted facts are superseded.**
 ///
 /// Returns `None` when no memory carries `capture_id`.
-pub fn decompose(conn: &Connection, input: &DecomposeInput) -> Result<Option<DecomposeResult>> {
-    let parent_tags = Curation::new(conn).capture_tags(&input.capture_id)?;
+pub fn decompose(store: &Store<'_>, input: &DecomposeInput) -> Result<Option<DecomposeResult>> {
+    let parent_tags = Curation::new(store).capture_tags(&input.capture_id)?;
     let Some(parent_tags) = parent_tags else {
         return Ok(None);
     };
@@ -279,7 +280,7 @@ pub fn decompose(conn: &Connection, input: &DecomposeInput) -> Result<Option<Dec
         let code_refs = crate::code_refs::detect_code_refs(&fact.content);
         crate::code_refs::merge_code_refs(&mut metadata, &code_refs);
 
-        Memories::new(conn).insert(&NewMemory {
+        Memories::new(store).insert(&NewMemory {
             category: FACT_CATEGORY.to_string(),
             tags: merged_tags,
             source: DECOMPOSITION_SOURCE.to_string(),
@@ -298,9 +299,9 @@ pub fn decompose(conn: &Connection, input: &DecomposeInput) -> Result<Option<Dec
             ..NewMemory::new(fact_id.clone(), fact.content.clone(), &now_iso)
         })?;
 
-        entities_linked += apply_entity_mentions(conn, &fact_id, &fact.entities)?;
+        entities_linked += apply_entity_mentions(store, &fact_id, &fact.entities)?;
         if maybe_link_entity_relation(
-            conn,
+            store,
             fact.subject.as_deref(),
             fact.predicate.as_deref(),
             fact.object.as_deref(),
@@ -308,7 +309,7 @@ pub fn decompose(conn: &Connection, input: &DecomposeInput) -> Result<Option<Dec
             relations_linked += 1;
         }
         superseded_ids.extend(supersede_contradicting_facts(
-            conn,
+            store,
             &fact_id,
             fact.subject.as_deref(),
             fact.predicate.as_deref(),
@@ -337,13 +338,13 @@ pub fn decompose(conn: &Connection, input: &DecomposeInput) -> Result<Option<Dec
 /// there is no decomposed flag, so a capture leaves the backlog once any fact
 /// points back at it.
 pub fn undecomposed_batch(
-    conn: &Connection,
+    store: &Store<'_>,
     input: &DecomposeBatchInput,
 ) -> Result<DecomposeBatchResult> {
     let batch_size = input
         .batch_size
         .clamp(DECOMPOSE_BATCH_MIN, DECOMPOSE_BATCH_MAX);
-    let curation = Curation::new(conn);
+    let curation = Curation::new(store);
     let total = curation.count_undecomposed()?;
     let memories: Vec<UndecomposedCapture> = curation
         .undecomposed(batch_size)?

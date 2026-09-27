@@ -11,6 +11,7 @@ mod test_env;
 use remind_me_core::backup::list_backups;
 use remind_me_core::db::migrations::SCHEMA_VERSION;
 use remind_me_core::db::queries;
+use remind_me_core::db::Store;
 use remind_me_core::embedder::{EMBEDDING_BACKEND_ENV, EMBEDDING_DIM_ENV, OLLAMA_MODEL_ENV};
 use remind_me_core::sync::{HUB_URL_ENV, NODE_ID_ENV, SYNC_SECRET_ENV};
 use remind_me_core::{Database, MemoryAddInput};
@@ -80,8 +81,10 @@ fn normalise(sql: &str) -> String {
 
 /// Every object of `kind`, keyed by name, with normalised DDL. Excludes the
 /// shadow tables FTS5 manages itself.
-fn objects(conn: &Connection, kind: &str) -> BTreeMap<String, String> {
-    let mut stmt = conn
+fn objects(store: &Store<'_>, kind: &str) -> BTreeMap<String, String> {
+    let mut stmt = store
+        .sqlite()
+        .unwrap()
         .prepare("SELECT name, sql FROM sqlite_master WHERE type = ? AND sql IS NOT NULL")
         .unwrap();
     stmt.query_map([kind], |r| {
@@ -123,9 +126,9 @@ const OWN_ADDITIONS: &[&str] = &[
 /// Compare live objects of `kind` against the shipped schema, reporting only
 /// what differs. A whole-map `assert_eq!` dumps twenty tables of DDL and buries
 /// the one that is wrong.
-fn assert_matches_schema(live: &Connection, kind: &str) {
+fn assert_matches_schema(live: &Store<'_>, kind: &str) {
     let actual = objects(live, kind);
-    let want = objects(&expected(), kind);
+    let want = objects(&Store::over_sqlite(&expected()), kind);
 
     let mut problems = Vec::new();
     for (name, want_sql) in &want {
@@ -154,22 +157,22 @@ fn assert_matches_schema(live: &Connection, kind: &str) {
 /// A database holding exactly the shipped schema, built independently of the
 /// code under test.
 fn expected() -> Connection {
-    let conn = Connection::open_in_memory().unwrap();
-    conn.execute_batch(SCHEMA_TABLES).unwrap();
-    conn.execute_batch(SCHEMA_INDEXES).unwrap();
-    conn
+    let store = Connection::open_in_memory().unwrap();
+    store.execute_batch(SCHEMA_TABLES).unwrap();
+    store.execute_batch(SCHEMA_INDEXES).unwrap();
+    store
 }
 
 #[test]
 fn every_table_matches_the_generated_schema() {
     let db = Database::open_in_memory().unwrap();
-    assert_matches_schema(&db.conn(), "table");
+    assert_matches_schema(&db.store(), "table");
 }
 
 #[test]
 fn every_index_matches_the_generated_schema() {
     let db = Database::open_in_memory().unwrap();
-    assert_matches_schema(&db.conn(), "index");
+    assert_matches_schema(&db.store(), "index");
 }
 
 #[test]
@@ -177,7 +180,7 @@ fn a_database_has_no_triggers() {
     // The repositories keep derived data in step since schema v31; a trigger
     // would do the same work a second time.
     let db = Database::open_in_memory().unwrap();
-    assert!(objects(&db.conn(), "trigger").is_empty());
+    assert!(objects(&db.store(), "trigger").is_empty());
 }
 
 #[test]
@@ -185,10 +188,14 @@ fn the_schema_carries_no_target_only_columns() {
     // The four tables that had drifted. Each assertion names a column that was
     // present here and absent upstream, or vice versa.
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
     let cols = |t: &str| -> Vec<String> {
-        let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", t)).unwrap();
+        let mut stmt = store
+            .sqlite()
+            .unwrap()
+            .prepare(&format!("PRAGMA table_info({})", t))
+            .unwrap();
         stmt.query_map([], |r| r.get::<_, String>(1))
             .unwrap()
             .map(|r| r.unwrap())
@@ -220,8 +227,10 @@ fn memory_entities_has_no_foreign_keys() {
     // The reference omits them deliberately: sync can deliver a mention link
     // before the memory it points at, and a cascade would reject that.
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let mut stmt = conn
+    let store = db.store();
+    let mut stmt = store
+        .sqlite()
+        .unwrap()
         .prepare("PRAGMA foreign_key_list(memory_entities)")
         .unwrap();
     let count = stmt.query_map([], |_| Ok(())).unwrap().count();
@@ -232,7 +241,9 @@ fn memory_entities_has_no_foreign_keys() {
 fn the_version_stamp_matches_the_schema_present() {
     let db = Database::open_in_memory().unwrap();
     let version: i32 = db
-        .conn()
+        .store()
+        .sqlite()
+        .unwrap()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(version, SCHEMA_VERSION);
@@ -243,11 +254,11 @@ fn reopening_changes_nothing() {
     let tmp = TempDb::new("idempotent");
     let snapshot = |path: &PathBuf| {
         let db = Database::open(path).unwrap();
-        let conn = db.conn();
+        let store = db.store();
         (
-            objects(&conn, "table"),
-            objects(&conn, "index"),
-            objects(&conn, "trigger"),
+            objects(&store, "table"),
+            objects(&store, "index"),
+            objects(&store, "trigger"),
         )
     };
     assert_eq!(snapshot(&tmp.0), snapshot(&tmp.0));
@@ -260,9 +271,10 @@ fn a_legacy_database_is_reconciled_to_the_generated_schema() {
     // Exactly what earlier versions of this crate wrote: the old shapes, with
     // last_accessed_at, wiki_pages.topic, cascading memory_entities, stamped 19.
     {
-        let conn = Connection::open(&tmp.0).unwrap();
-        conn.execute_batch(
-            "
+        let store = Connection::open(&tmp.0).unwrap();
+        store
+            .execute_batch(
+                "
             CREATE TABLE memories (
                 id TEXT PRIMARY KEY, content TEXT NOT NULL,
                 category TEXT NOT NULL DEFAULT 'general',
@@ -295,26 +307,30 @@ fn a_legacy_database_is_reconciled_to_the_generated_schema() {
                  '2020-06-15T12:00:00+00:00', '2020-06-15T12:00:00+00:00');
             PRAGMA user_version = 19;
             ",
-        )
-        .unwrap();
+            )
+            .unwrap();
     }
 
     let db = Database::open(&tmp.0).unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
-    assert_matches_schema(&conn, "table");
-    assert_matches_schema(&conn, "index");
-    assert_matches_schema(&conn, "trigger");
+    assert_matches_schema(&store, "table");
+    assert_matches_schema(&store, "index");
+    assert_matches_schema(&store, "trigger");
 
     // Data survives the rebuild.
-    let content: String = conn
+    let content: String = store
+        .sqlite()
+        .unwrap()
         .query_row("SELECT content FROM memories WHERE id='mem_old'", [], |r| {
             r.get(0)
         })
         .unwrap();
     assert_eq!(content, "survivor");
 
-    let title: String = conn
+    let title: String = store
+        .sqlite()
+        .unwrap()
         .query_row("SELECT title FROM wiki_pages WHERE slug='page'", [], |r| {
             r.get(0)
         })
@@ -325,7 +341,9 @@ fn a_legacy_database_is_reconciled_to_the_generated_schema() {
     );
 
     // The rename preserves the value rather than resetting it.
-    let accessed: String = conn
+    let accessed: String = store
+        .sqlite()
+        .unwrap()
         .query_row(
             "SELECT accessed_at FROM memories WHERE id='mem_old'",
             [],
@@ -335,7 +353,9 @@ fn a_legacy_database_is_reconciled_to_the_generated_schema() {
     assert_eq!(accessed, "2020-06-15T12:00:00+00:00");
 
     // Derived tables are backfilled for rows that predate the triggers.
-    let tags: i64 = conn
+    let tags: i64 = store
+        .sqlite()
+        .unwrap()
         .query_row(
             "SELECT count(*) FROM memory_tags WHERE memory_id='mem_old'",
             [],
@@ -353,9 +373,9 @@ fn writes_still_reach_the_sync_outbox() {
     crate::test_env::set_var(SYNC_SECRET_ENV, "shh");
 
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     queries::add_memory(
-        &conn,
+        &store,
         MemoryAddInput {
             sensitive: false,
             content: "syncable".into(),
@@ -371,7 +391,9 @@ fn writes_still_reach_the_sync_outbox() {
     )
     .unwrap();
 
-    let payload: String = conn
+    let payload: String = store
+        .sqlite()
+        .unwrap()
         .query_row(
             "SELECT payload FROM sync_outbox ORDER BY id LIMIT 1",
             [],
@@ -398,9 +420,9 @@ fn writes_do_not_reach_the_outbox_while_sync_is_unconfigured() {
     crate::test_env::remove_var(SYNC_SECRET_ENV);
 
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     queries::add_memory(
-        &conn,
+        &store,
         MemoryAddInput {
             sensitive: false,
             content: "not synced anywhere".into(),
@@ -416,7 +438,9 @@ fn writes_do_not_reach_the_outbox_while_sync_is_unconfigured() {
     )
     .unwrap();
 
-    let count: i64 = conn
+    let count: i64 = store
+        .sqlite()
+        .unwrap()
         .query_row("SELECT count(*) FROM sync_outbox", [], |r| r.get(0))
         .unwrap();
     assert_eq!(count, 0);
@@ -433,34 +457,40 @@ fn writes_do_not_reach_the_outbox_while_sync_is_unconfigured() {
 // actual startup wiring, not just `vectors::reconcile_embedding_meta` in
 // isolation.
 
-fn plant_stale_vector(conn: &Connection, model: &str, dim: usize) {
-    conn.execute(
-        "INSERT INTO memories (id, content, created_at, updated_at) VALUES \
+fn plant_stale_vector(store: &Store<'_>, model: &str, dim: usize) {
+    store
+        .sqlite()
+        .unwrap()
+        .execute(
+            "INSERT INTO memories (id, content, created_at, updated_at) VALUES \
          ('mem_versioning', 'x', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')",
-        [],
-    )
-    .unwrap();
-    conn.execute(
+            [],
+        )
+        .unwrap();
+    store.sqlite().unwrap().execute(
         "INSERT INTO vec_chunks (memory_id, chunk_ix, embedding) VALUES ('mem_versioning', 0, ?)",
         [vec![0u8; dim * 4]],
     )
     .unwrap();
     for (key, value) in [("backend", "ollama"), ("model", model)] {
-        conn.execute(
+        store.sqlite().unwrap().execute(
             "INSERT INTO embedding_meta (key, value, updated_at) VALUES (?, ?, '2020-01-01T00:00:00Z')",
             rusqlite::params![key, value],
         )
         .unwrap();
     }
-    conn.execute(
+    store.sqlite().unwrap().execute(
         "INSERT INTO embedding_meta (key, value, updated_at) VALUES ('dim', ?, '2020-01-01T00:00:00Z')",
         rusqlite::params![dim.to_string()],
     )
     .unwrap();
 }
 
-fn stored_vector_counts(conn: &Connection) -> i64 {
-    conn.query_row("SELECT count(*) FROM vec_chunks", [], |r| r.get(0))
+fn stored_vector_counts(store: &Store<'_>) -> i64 {
+    store
+        .sqlite()
+        .unwrap()
+        .query_row("SELECT count(*) FROM vec_chunks", [], |r| r.get(0))
         .unwrap()
 }
 
@@ -474,12 +504,12 @@ fn reopening_with_an_unchanged_ollama_model_leaves_stored_vectors_alone() {
 
     {
         let db = Database::open(&tmp.0).unwrap();
-        plant_stale_vector(&db.conn(), "nomic-embed-text", 4);
+        plant_stale_vector(&db.store(), "nomic-embed-text", 4);
     }
 
     // Reopening under the exact same configuration must not touch anything.
     let db = Database::open(&tmp.0).unwrap();
-    assert_eq!(stored_vector_counts(&db.conn()), 1);
+    assert_eq!(stored_vector_counts(&db.store()), 1);
 
     crate::test_env::remove_var(EMBEDDING_BACKEND_ENV);
     crate::test_env::remove_var(OLLAMA_MODEL_ENV);
@@ -496,13 +526,13 @@ fn reopening_with_a_changed_ollama_model_clears_stored_vectors() {
 
     {
         let db = Database::open(&tmp.0).unwrap();
-        plant_stale_vector(&db.conn(), "old-model", 4);
+        plant_stale_vector(&db.store(), "old-model", 4);
     }
 
     crate::test_env::set_var(OLLAMA_MODEL_ENV, "new-model");
     let db = Database::open(&tmp.0).unwrap();
     assert_eq!(
-        stored_vector_counts(&db.conn()),
+        stored_vector_counts(&db.store()),
         0,
         "a changed REMIND_ME_OLLAMA_EMBED_MODEL must clear the stale vector on open"
     );
@@ -522,13 +552,13 @@ fn reopening_with_a_changed_embedding_dimension_clears_stored_vectors() {
 
     {
         let db = Database::open(&tmp.0).unwrap();
-        plant_stale_vector(&db.conn(), "nomic-embed-text", 4);
+        plant_stale_vector(&db.store(), "nomic-embed-text", 4);
     }
 
     crate::test_env::set_var(EMBEDDING_DIM_ENV, "8");
     let db = Database::open(&tmp.0).unwrap();
     assert_eq!(
-        stored_vector_counts(&db.conn()),
+        stored_vector_counts(&db.store()),
         0,
         "a changed REMIND_ME_EMBEDDING_DIM must clear the stale vector on open"
     );
@@ -552,8 +582,8 @@ fn a_first_ever_open_with_no_prior_embedding_meta_does_not_touch_vec_chunks() {
     crate::test_env::remove_var(EMBEDDING_DIM_ENV);
 
     {
-        let conn = Connection::open(&tmp.0).unwrap();
-        conn.execute_batch(
+        let store = Connection::open(&tmp.0).unwrap();
+        store.execute_batch(
             "
             CREATE TABLE memories (id TEXT PRIMARY KEY, content TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
             INSERT INTO memories (id, content, created_at, updated_at) VALUES ('mem_x', 'x', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z');
@@ -570,9 +600,11 @@ fn a_first_ever_open_with_no_prior_embedding_meta_does_not_touch_vec_chunks() {
     // startup reconcile -- there is nothing in it to clear, and
     // no embedding_meta row to false-positive against.
     let db = Database::open(&tmp.0).unwrap();
-    assert_eq!(stored_vector_counts(&db.conn()), 0);
+    assert_eq!(stored_vector_counts(&db.store()), 0);
     let meta_rows: i64 = db
-        .conn()
+        .store()
+        .sqlite()
+        .unwrap()
         .query_row("SELECT count(*) FROM embedding_meta", [], |r| r.get(0))
         .unwrap();
     assert_eq!(
@@ -601,12 +633,12 @@ fn reopening_with_the_embedding_backend_disabled_never_clears_stored_vectors() {
 
     {
         let db = Database::open(&tmp.0).unwrap();
-        plant_stale_vector(&db.conn(), "nomic-embed-text", 4);
+        plant_stale_vector(&db.store(), "nomic-embed-text", 4);
     }
 
     crate::test_env::remove_var(EMBEDDING_BACKEND_ENV);
     let db = Database::open(&tmp.0).unwrap();
-    assert_eq!(stored_vector_counts(&db.conn()), 1);
+    assert_eq!(stored_vector_counts(&db.store()), 1);
 
     crate::test_env::remove_var(OLLAMA_MODEL_ENV);
     crate::test_env::remove_var(EMBEDDING_DIM_ENV);
@@ -678,10 +710,10 @@ fn the_generated_schema_carries_every_v27_object() {
     // could list. The column itself is covered by the whole-DDL comparison in
     // `every_table_matches_the_generated_schema`.
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
-    let tables = objects(&conn, "table");
-    let indexes = objects(&conn, "index");
+    let tables = objects(&store, "table");
+    let indexes = objects(&store, "index");
 
     let mut missing = Vec::new();
     for (name, migration) in V27_TABLES {
@@ -695,7 +727,9 @@ fn the_generated_schema_carries_every_v27_object() {
         }
     }
     for (table, column, migration) in V27_COLUMNS {
-        let mut stmt = conn
+        let mut stmt = store
+            .sqlite()
+            .unwrap()
             .prepare(&format!("PRAGMA table_info({})", table))
             .unwrap();
         let cols: Vec<String> = stmt
@@ -724,20 +758,25 @@ fn the_outbox_payloads_carry_the_new_columns() {
     // silently dropped in transit: the failure is invisible locally and only
     // shows up as data loss on the other node.
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    conn.execute(
-        "INSERT OR REPLACE INTO sync_flags (key, value) VALUES ('sync_enabled', '1')",
-        [],
-    )
-    .unwrap();
-    remind_me_core::db::memories::Memories::new(&conn)
+    let store = db.store();
+    store
+        .sqlite()
+        .unwrap()
+        .execute(
+            "INSERT OR REPLACE INTO sync_flags (key, value) VALUES ('sync_enabled', '1')",
+            [],
+        )
+        .unwrap();
+    remind_me_core::db::memories::Memories::new(&store)
         .insert(&remind_me_core::db::memories::NewMemory::new(
             "mem_s10",
             "x",
             "2026-01-01T00:00:00+00:00",
         ))
         .unwrap();
-    let payload: String = conn
+    let payload: String = store
+        .sqlite()
+        .unwrap()
         .query_row("SELECT payload FROM sync_outbox", [], |r| r.get(0))
         .unwrap();
     let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
@@ -758,21 +797,24 @@ fn a_v19_database_with_rows_reconciles_to_the_current_version() {
     // since dropping only the tables would leave `reconcile_columns` with
     // nothing to do and the test would pass without exercising it.
     {
-        let conn = Connection::open(&tmp.0).unwrap();
-        conn.execute_batch(SCHEMA_TABLES).unwrap();
-        conn.execute_batch(SCHEMA_INDEXES).unwrap();
+        let store = Connection::open(&tmp.0).unwrap();
+        store.execute_batch(SCHEMA_TABLES).unwrap();
+        store.execute_batch(SCHEMA_INDEXES).unwrap();
         for (name, _) in V27_TABLES {
-            conn.execute_batch(&format!("DROP TABLE IF EXISTS {};", name))
+            store
+                .execute_batch(&format!("DROP TABLE IF EXISTS {};", name))
                 .unwrap();
         }
         // Indexes before columns: SQLite refuses to drop a column an index
         // still references, and `idx_memories_remind_at` covers one of them.
         for (name, _) in V27_INDEXES {
-            conn.execute_batch(&format!("DROP INDEX IF EXISTS {};", name))
+            store
+                .execute_batch(&format!("DROP INDEX IF EXISTS {};", name))
                 .unwrap();
         }
         for (table, column, _) in V27_COLUMNS {
-            conn.execute_batch(&format!("ALTER TABLE {} DROP COLUMN {};", table, column))
+            store
+                .execute_batch(&format!("ALTER TABLE {} DROP COLUMN {};", table, column))
                 .unwrap();
         }
         // The v19 outbox triggers: the v30 ones with the two payload pairs
@@ -789,23 +831,26 @@ fn a_v19_database_with_rows_reconciles_to_the_current_version() {
             "the payload-stripping replacements no longer match the generated \
              trigger text; update them or this fixture is not a v19 database"
         );
-        conn.execute_batch(&v19_triggers).unwrap();
+        store.execute_batch(&v19_triggers).unwrap();
 
-        conn.execute_batch(
-            "
+        store
+            .execute_batch(
+                "
             INSERT INTO memories (id, content, created_at, updated_at)
             VALUES ('mem_v19', 'survivor', '2020-06-15T12:00:00+00:00',
                     '2020-06-15T12:00:00+00:00');
             PRAGMA user_version = 19;
             ",
-        )
-        .unwrap();
+            )
+            .unwrap();
     }
 
     let db = Database::open(&tmp.0).unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
-    let version: i32 = conn
+    let version: i32 = store
+        .sqlite()
+        .unwrap()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(
@@ -813,7 +858,9 @@ fn a_v19_database_with_rows_reconciles_to_the_current_version() {
         "the stamp must advance with the schema"
     );
 
-    let content: String = conn
+    let content: String = store
+        .sqlite()
+        .unwrap()
         .query_row(
             "SELECT content FROM memories WHERE id = 'mem_v19'",
             [],
@@ -822,15 +869,15 @@ fn a_v19_database_with_rows_reconciles_to_the_current_version() {
         .unwrap();
     assert_eq!(content, "survivor", "reconciliation must not drop rows");
 
-    assert_matches_schema(&conn, "table");
-    assert_matches_schema(&conn, "index");
-    assert_matches_schema(&conn, "trigger");
+    assert_matches_schema(&store, "table");
+    assert_matches_schema(&store, "index");
+    assert_matches_schema(&store, "trigger");
 
     // Explicit rather than leaning on assert_matches_schema above: a stale
     // trigger keeps working, quietly shipping an incomplete payload to every
     // peer, so the damage lands on a different machine.
     assert!(
-        objects(&conn, "trigger").is_empty(),
+        objects(&store, "trigger").is_empty(),
         "the v19 triggers survived reconciliation"
     );
 

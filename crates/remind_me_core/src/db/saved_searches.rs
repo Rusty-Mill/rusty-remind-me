@@ -6,8 +6,9 @@
 //! poll, which matches are new) stay in [`crate::saved_searches`], which
 //! calls this rather than writing SQL.
 
+use super::{Result, Store};
 use crate::models::{SavedSearch, SavedSearchFilters};
-use rusqlite::{params, Connection, OptionalExtension, Result};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashSet;
 
 const SELECT_COLUMNS: &str = "id, name, query, filters, watch, created_at, updated_at";
@@ -18,19 +19,21 @@ pub struct SavedSearches<'c> {
 }
 
 impl<'c> SavedSearches<'c> {
-    pub fn new(conn: &'c Connection) -> Self {
+    pub fn new(store: &'c Store<'_>) -> Self {
+        let conn = store.conn();
         Self { conn }
     }
 
     /// The id of the saved search called `name`, if there is one.
     pub fn id_for_name(&self, name: &str) -> Result<Option<String>> {
-        self.conn
+        Ok(self
+            .conn
             .query_row(
                 "SELECT id FROM saved_searches WHERE name = ?",
                 params![name],
                 |r| r.get(0),
             )
-            .optional()
+            .optional()?)
     }
 
     /// Store a new saved search, every field as given.
@@ -72,22 +75,23 @@ impl<'c> SavedSearches<'c> {
 
     /// One saved search by id. Errors with `QueryReturnedNoRows` if absent.
     pub fn get(&self, id: &str) -> Result<SavedSearch> {
-        self.conn.query_row(
+        Ok(self.conn.query_row(
             &format!("SELECT {SELECT_COLUMNS} FROM saved_searches WHERE id = ?"),
             params![id],
             read_row,
-        )
+        )?)
     }
 
     /// One saved search by name, or `None`.
     pub fn get_by_name(&self, name: &str) -> Result<Option<SavedSearch>> {
-        self.conn
+        Ok(self
+            .conn
             .query_row(
                 &format!("SELECT {SELECT_COLUMNS} FROM saved_searches WHERE name = ?"),
                 params![name],
                 read_row,
             )
-            .optional()
+            .optional()?)
     }
 
     /// Every saved search, alphabetical by name.
@@ -95,7 +99,10 @@ impl<'c> SavedSearches<'c> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {SELECT_COLUMNS} FROM saved_searches ORDER BY name ASC"
         ))?;
-        let rows = stmt.query_map([], read_row)?.collect();
+        let rows = stmt
+            .query_map([], read_row)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
@@ -120,7 +127,8 @@ impl<'c> SavedSearches<'c> {
         )?;
         let ids = stmt
             .query_map(params![saved_search_id], |r| r.get::<_, String>(0))?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         ids
     }
 
@@ -160,7 +168,7 @@ fn encode_filters(filters: &SavedSearchFilters) -> String {
     serde_json::to_string(filters).unwrap_or_else(|_| "{}".to_string())
 }
 
-fn read_row(row: &rusqlite::Row<'_>) -> Result<SavedSearch> {
+fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SavedSearch> {
     let filters_json: String = row.get(3)?;
     let watch: i64 = row.get(4)?;
     Ok(SavedSearch {
@@ -197,8 +205,8 @@ mod tests {
     #[test]
     fn update_keeps_the_stored_name_and_created_at() {
         let db = Database::open_in_memory().unwrap();
-        let conn = db.conn();
-        let repo = SavedSearches::new(&conn);
+        let store = db.store();
+        let repo = SavedSearches::new(&store);
         repo.insert(&saved("ss_1", "one")).unwrap();
 
         let mut changed = saved("ss_1", "renamed");
@@ -219,8 +227,9 @@ mod tests {
     #[test]
     fn malformed_filters_read_as_empty() {
         let db = Database::open_in_memory().unwrap();
-        let conn = db.conn();
-        let repo = SavedSearches::new(&conn);
+        let store = db.store();
+        let conn = store.conn();
+        let repo = SavedSearches::new(&store);
         repo.insert(&saved("ss_1", "one")).unwrap();
         conn.execute(
             "UPDATE saved_searches SET filters = 'not json' WHERE id = 'ss_1'",
@@ -236,8 +245,9 @@ mod tests {
     #[test]
     fn mark_seen_keeps_the_first_sighting() {
         let db = Database::open_in_memory().unwrap();
-        let conn = db.conn();
-        let repo = SavedSearches::new(&conn);
+        let store = db.store();
+        let conn = store.conn();
+        let repo = SavedSearches::new(&store);
         assert!(!repo.has_any_seen("ss_1").unwrap());
         repo.mark_seen("ss_1", &["m1".to_string()], "2026-09-25T00:00:00+00:00")
             .unwrap();

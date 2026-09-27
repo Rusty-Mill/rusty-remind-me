@@ -24,8 +24,9 @@
 
 use crate::db::entities::Entities;
 use crate::db::memories::Memories;
+use crate::db::Result;
+use crate::db::Store;
 use crate::models::{ExportFormat, ExportInput, ExportResult};
-use rusqlite::{Connection, Result};
 use std::path::{Path, PathBuf};
 
 /// Environment variable listing the roots an export may write to, in the
@@ -88,7 +89,7 @@ impl std::error::Error for ExportPathError {}
 /// Anything that can go wrong during an export.
 #[derive(Debug)]
 pub enum ExportError {
-    Db(rusqlite::Error),
+    Db(crate::db::StoreError),
     Path(ExportPathError),
     Io(std::io::Error),
 }
@@ -105,8 +106,8 @@ impl std::fmt::Display for ExportError {
 
 impl std::error::Error for ExportError {}
 
-impl From<rusqlite::Error> for ExportError {
-    fn from(e: rusqlite::Error) -> Self {
+impl From<crate::db::StoreError> for ExportError {
+    fn from(e: crate::db::StoreError) -> Self {
         Self::Db(e)
     }
 }
@@ -185,10 +186,10 @@ fn display_path(path: &Path) -> String {
 /// object are both among those entities. Exporting an edge with one endpoint
 /// outside the set would produce a dangling reference on restore.
 fn collect_graph_records(
-    conn: &Connection,
+    store: &Store<'_>,
     memory_ids: Option<&std::collections::HashSet<String>>,
 ) -> Result<Vec<serde_json::Value>> {
-    let graph = Entities::new(conn);
+    let graph = Entities::new(store);
     let mut links = graph.links_oldest_first()?;
     let mut entities: Vec<serde_json::Value> = graph
         .all_oldest_first()?
@@ -255,14 +256,14 @@ fn collect_graph_records(
 
 /// Collect memory records, and the graph when asked for.
 pub fn collect_export_records(
-    conn: &Connection,
+    store: &Store<'_>,
     input: &ExportInput,
 ) -> Result<Vec<serde_json::Value>> {
     // Deleted and superseded memories go together behind one flag, as the
     // reference gates them (`exporter.py:163`): a superseded memory is just as
     // resurrectable as a tombstoned one, since every exported record carries
     // `role: "assistant"` and the importer reads it back as live content.
-    let memories = Memories::new(conn).exportable(
+    let memories = Memories::new(store).exportable(
         input.include_deleted,
         input.category.as_deref().filter(|c| !c.is_empty()),
         input.tags.as_deref().unwrap_or_default(),
@@ -286,7 +287,7 @@ pub fn collect_export_records(
         let filtered = input.category.is_some() || input.tags.is_some();
         let ids: Option<std::collections::HashSet<String>> =
             filtered.then(|| memories.iter().map(|m| m.id.clone()).collect());
-        records.extend(collect_graph_records(conn, ids.as_ref())?);
+        records.extend(collect_graph_records(store, ids.as_ref())?);
     }
     Ok(records)
 }
@@ -309,10 +310,10 @@ pub fn render_export(records: &[serde_json::Value], format: ExportFormat) -> Str
 /// `file_path` is validated against [`export_roots`] before anything is
 /// written. When omitted the payload is returned inline.
 pub fn export_memories(
-    conn: &Connection,
+    store: &Store<'_>,
     input: &ExportInput,
 ) -> std::result::Result<ExportResult, ExportError> {
-    let records = collect_export_records(conn, input)?;
+    let records = collect_export_records(store, input)?;
     let payload = render_export(&records, input.format);
 
     let count_of = |kind: &str| -> usize {

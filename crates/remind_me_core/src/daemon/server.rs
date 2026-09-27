@@ -268,8 +268,8 @@ mod tests {
     }
 
     fn stop(endpoint: &Endpoint, handle: std::thread::JoinHandle<io::Result<()>>) {
-        let mut conn = client::connect(endpoint, Mode::Control).unwrap();
-        assert_eq!(conn.call(&Op::Shutdown).unwrap(), OpReply::Ok(Value::Null));
+        let mut store = client::connect(endpoint, Mode::Control).unwrap();
+        assert_eq!(store.call(&Op::Shutdown).unwrap(), OpReply::Ok(Value::Null));
         handle.join().unwrap().unwrap();
         assert!(endpoint.read_info().is_none(), "info withdrawn on exit");
     }

@@ -5,12 +5,14 @@
 //! schema with plain SQL, and a mock would only ever agree with whatever this
 //! module already believes that schema to be.
 
+use remind_me_core::db::Store;
 use remind_me_core::dbs_import::{
     dbs_memory_id, memory_content, pull_dbs, DbsImportError, DEFAULT_CATEGORY, SOURCE_ENTITY_KIND,
     TAG_ENTITY_KIND,
 };
 use remind_me_core::{Database, DbsImportInput};
-use rusqlite::{params, Connection};
+use rusqlite::params;
+use rusqlite::Connection;
 
 /// A scratch directory inside the default import root (the home directory).
 fn scratch(name: &str) -> std::path::PathBuf {
@@ -125,23 +127,31 @@ fn input(path: &std::path::Path) -> DbsImportInput {
     }
 }
 
-fn memory_count(conn: &Connection) -> i64 {
-    conn.query_row("SELECT count(*) FROM memories", [], |r| r.get(0))
+fn memory_count(store: &Store<'_>) -> i64 {
+    store
+        .sqlite()
+        .unwrap()
+        .query_row("SELECT count(*) FROM memories", [], |r| r.get(0))
         .unwrap()
 }
 
-fn live_count(conn: &Connection) -> i64 {
-    conn.query_row(
-        "SELECT count(*) FROM memories WHERE superseded_by IS NULL",
-        [],
-        |r| r.get(0),
-    )
-    .unwrap()
+fn live_count(store: &Store<'_>) -> i64 {
+    store
+        .sqlite()
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM memories WHERE superseded_by IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
 }
 
 /// Entity names linked to a memory, with their kinds.
-fn linked_entities(conn: &Connection, memory_id: &str) -> Vec<(String, Option<String>)> {
-    let mut statement = conn
+fn linked_entities(store: &Store<'_>, memory_id: &str) -> Vec<(String, Option<String>)> {
+    let mut statement = store
+        .sqlite()
+        .unwrap()
         .prepare(
             "SELECT e.name, e.kind
                FROM memory_entities me JOIN entities e ON me.entity_id = e.id
@@ -176,9 +186,9 @@ fn a_fresh_import_stores_every_live_item() {
         ],
     );
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
-    let result = pull_dbs(&conn, &input(&path)).unwrap();
+    let result = pull_dbs(&store, &input(&path)).unwrap();
 
     assert_eq!(result.fetched, 2);
     assert_eq!(result.created, 2);
@@ -186,7 +196,7 @@ fn a_fresh_import_stores_every_live_item() {
     assert_eq!(result.imported, 2);
     assert_eq!(result.already_imported, 0);
     assert!(!result.has_more, "a partial page is the last page");
-    assert_eq!(memory_count(&conn), 2);
+    assert_eq!(memory_count(&store), 2);
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -196,9 +206,9 @@ fn an_items_fields_land_where_they_are_useful() {
     let dir = scratch("fields");
     let path = write_archive(&dir, "dbs.sqlite3", &[Item::default()]);
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
-    pull_dbs(&conn, &input(&path)).unwrap();
+    pull_dbs(&store, &input(&path)).unwrap();
 
     let (id, content, category, source, tags, metadata, created_at): (
         String,
@@ -208,7 +218,9 @@ fn an_items_fields_land_where_they_are_useful() {
         String,
         String,
         String,
-    ) = conn
+    ) = store
+        .sqlite()
+        .unwrap()
         .query_row(
             "SELECT id, content, category, source, tags, metadata, created_at FROM memories",
             [],
@@ -264,11 +276,13 @@ fn an_item_with_no_kind_gets_the_fallback_category() {
         }],
     );
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
-    pull_dbs(&conn, &input(&path)).unwrap();
+    pull_dbs(&store, &input(&path)).unwrap();
 
-    let category: String = conn
+    let category: String = store
+        .sqlite()
+        .unwrap()
         .query_row("SELECT category FROM memories", [], |r| r.get(0))
         .unwrap();
     assert_eq!(category, DEFAULT_CATEGORY);
@@ -300,14 +314,16 @@ fn the_source_and_every_tag_become_linked_entities() {
     let dir = scratch("entities");
     let path = write_archive(&dir, "dbs.sqlite3", &[Item::default()]);
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
-    let result = pull_dbs(&conn, &input(&path)).unwrap();
+    let result = pull_dbs(&store, &input(&path)).unwrap();
 
-    let memory_id: String = conn
+    let memory_id: String = store
+        .sqlite()
+        .unwrap()
         .query_row("SELECT id FROM memories", [], |r| r.get(0))
         .unwrap();
-    let linked = linked_entities(&conn, &memory_id);
+    let linked = linked_entities(&store, &memory_id);
 
     // Without these the importer has no reason to exist: `dbs export-notes`
     // plus the folder watcher already covers the content, and only flattens
@@ -331,11 +347,13 @@ fn item_kind_is_not_an_entity() {
     let dir = scratch("kindentity");
     let path = write_archive(&dir, "dbs.sqlite3", &[Item::default()]);
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
-    pull_dbs(&conn, &input(&path)).unwrap();
+    pull_dbs(&store, &input(&path)).unwrap();
 
-    let kinds: i64 = conn
+    let kinds: i64 = store
+        .sqlite()
+        .unwrap()
         .query_row(
             "SELECT count(*) FROM entities WHERE name = 'link'",
             [],
@@ -367,9 +385,9 @@ fn two_items_from_one_source_share_its_entity() {
         ],
     );
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
-    let result = pull_dbs(&conn, &input(&path)).unwrap();
+    let result = pull_dbs(&store, &input(&path)).unwrap();
 
     // raindrop, marsupials, australia — the second item adds none of them.
     assert_eq!(result.entities_created, 3);
@@ -385,22 +403,26 @@ fn extra_tags_are_added_to_every_memory_and_become_entities() {
     let dir = scratch("extratags");
     let path = write_archive(&dir, "dbs.sqlite3", &[Item::default()]);
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let mut params = input(&path);
     params.tags = vec!["archived".to_string(), "  ".to_string()];
 
-    pull_dbs(&conn, &params).unwrap();
+    pull_dbs(&store, &params).unwrap();
 
-    let tags: String = conn
+    let tags: String = store
+        .sqlite()
+        .unwrap()
         .query_row("SELECT tags FROM memories", [], |r| r.get(0))
         .unwrap();
     let tags: Vec<String> = serde_json::from_str(&tags).unwrap();
     assert_eq!(tags, vec!["marsupials", "australia", "archived"]);
 
-    let memory_id: String = conn
+    let memory_id: String = store
+        .sqlite()
+        .unwrap()
         .query_row("SELECT id FROM memories", [], |r| r.get(0))
         .unwrap();
-    let names: Vec<String> = linked_entities(&conn, &memory_id)
+    let names: Vec<String> = linked_entities(&store, &memory_id)
         .into_iter()
         .map(|(name, _)| name)
         .collect();
@@ -420,16 +442,16 @@ fn a_rerun_over_unchanged_items_writes_nothing() {
     let dir = scratch("rerun");
     let path = write_archive(&dir, "dbs.sqlite3", &[Item::default()]);
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    pull_dbs(&conn, &input(&path)).unwrap();
+    let store = db.store();
+    pull_dbs(&store, &input(&path)).unwrap();
 
-    let again = pull_dbs(&conn, &input(&path)).unwrap();
+    let again = pull_dbs(&store, &input(&path)).unwrap();
 
     assert_eq!(again.fetched, 1);
     assert_eq!(again.already_imported, 1);
     assert_eq!(again.to_import, 0);
     assert_eq!(again.imported, 0);
-    assert_eq!(memory_count(&conn), 1);
+    assert_eq!(memory_count(&store), 1);
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -439,8 +461,8 @@ fn a_rerun_picks_up_only_the_new_item() {
     let dir = scratch("newitem");
     let path = write_archive(&dir, "dbs.sqlite3", &[Item::default()]);
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    pull_dbs(&conn, &input(&path)).unwrap();
+    let store = db.store();
+    pull_dbs(&store, &input(&path)).unwrap();
 
     write_archive(
         &dir,
@@ -454,13 +476,13 @@ fn a_rerun_picks_up_only_the_new_item() {
             },
         ],
     );
-    let again = pull_dbs(&conn, &input(&path)).unwrap();
+    let again = pull_dbs(&store, &input(&path)).unwrap();
 
     assert_eq!(again.fetched, 2);
     assert_eq!(again.already_imported, 1);
     assert_eq!(again.created, 1);
     assert_eq!(again.updated, 0);
-    assert_eq!(memory_count(&conn), 2);
+    assert_eq!(memory_count(&store), 2);
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -470,8 +492,8 @@ fn an_edited_item_supersedes_its_previous_version_rather_than_overwriting_it() {
     let dir = scratch("edited");
     let path = write_archive(&dir, "dbs.sqlite3", &[Item::default()]);
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    pull_dbs(&conn, &input(&path)).unwrap();
+    let store = db.store();
+    pull_dbs(&store, &input(&path)).unwrap();
     let original = dbs_memory_id("raindrop", "x1", "hash-1");
 
     // Same identity, different content. The hash is what catches this — dbs
@@ -486,18 +508,20 @@ fn an_edited_item_supersedes_its_previous_version_rather_than_overwriting_it() {
             ..Default::default()
         }],
     );
-    let again = pull_dbs(&conn, &input(&path)).unwrap();
+    let again = pull_dbs(&store, &input(&path)).unwrap();
 
     assert_eq!(again.updated, 1);
     assert_eq!(again.created, 0);
 
     let replacement = dbs_memory_id("raindrop", "x1", "hash-2");
     // Both rows survive: history accumulates.
-    assert_eq!(memory_count(&conn), 2);
+    assert_eq!(memory_count(&store), 2);
     // Only the new one is live, so search and every other read path see one.
-    assert_eq!(live_count(&conn), 1);
+    assert_eq!(live_count(&store), 1);
 
-    let superseded_by: Option<String> = conn
+    let superseded_by: Option<String> = store
+        .sqlite()
+        .unwrap()
         .query_row(
             "SELECT superseded_by FROM memories WHERE id = ?",
             params![original],
@@ -508,7 +532,9 @@ fn an_edited_item_supersedes_its_previous_version_rather_than_overwriting_it() {
 
     // And the tracking row now points at the replacement, so a third rerun
     // over unchanged content is a no-op rather than superseding again.
-    let tracked: (String, String) = conn
+    let tracked: (String, String) = store
+        .sqlite()
+        .unwrap()
         .query_row(
             "SELECT memory_id, content_hash FROM dbs_imports WHERE external_id = 'x1'",
             [],
@@ -517,9 +543,9 @@ fn an_edited_item_supersedes_its_previous_version_rather_than_overwriting_it() {
         .unwrap();
     assert_eq!(tracked, (replacement, "hash-2".to_string()));
 
-    let third = pull_dbs(&conn, &input(&path)).unwrap();
+    let third = pull_dbs(&store, &input(&path)).unwrap();
     assert_eq!(third.imported, 0);
-    assert_eq!(memory_count(&conn), 2);
+    assert_eq!(memory_count(&store), 2);
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -571,12 +597,12 @@ fn deleted_items_are_never_imported() {
         ],
     );
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
-    let result = pull_dbs(&conn, &input(&path)).unwrap();
+    let result = pull_dbs(&store, &input(&path)).unwrap();
 
     assert_eq!(result.fetched, 1, "the deleted row is not even read");
-    assert_eq!(memory_count(&conn), 1);
+    assert_eq!(memory_count(&store), 1);
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -599,22 +625,24 @@ fn the_source_and_item_type_filters_narrow_the_read() {
         ],
     );
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
     let mut by_source = input(&path);
     by_source.source = "reddit".to_string();
-    let result = pull_dbs(&conn, &by_source).unwrap();
+    let result = pull_dbs(&store, &by_source).unwrap();
     assert_eq!(result.fetched, 1);
     assert_eq!(result.source.as_deref(), Some("reddit"));
 
     let db2 = Database::open_in_memory().unwrap();
-    let conn2 = db2.conn();
+    let conn2 = db2.store();
     let mut by_kind = input(&path);
     by_kind.item_type = "link".to_string();
     let result = pull_dbs(&conn2, &by_kind).unwrap();
     assert_eq!(result.fetched, 1);
     assert_eq!(result.item_type.as_deref(), Some("link"));
     let source: String = conn2
+        .sqlite()
+        .unwrap()
         .query_row("SELECT source FROM memories", [], |r| r.get(0))
         .unwrap();
     assert_eq!(source, "dbs:raindrop");
@@ -650,11 +678,11 @@ fn paging_reports_more_while_a_page_comes_back_full() {
         ],
     );
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
     let mut page = input(&path);
     page.limit = 2;
-    let first = pull_dbs(&conn, &page).unwrap();
+    let first = pull_dbs(&store, &page).unwrap();
     assert_eq!(first.fetched, 2);
     assert!(
         first.has_more,
@@ -662,10 +690,10 @@ fn paging_reports_more_while_a_page_comes_back_full() {
     );
 
     page.offset = 2;
-    let second = pull_dbs(&conn, &page).unwrap();
+    let second = pull_dbs(&store, &page).unwrap();
     assert_eq!(second.fetched, 1);
     assert!(!second.has_more);
-    assert_eq!(memory_count(&conn), 3, "the pages did not overlap or skip");
+    assert_eq!(memory_count(&store), 3, "the pages did not overlap or skip");
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -675,11 +703,11 @@ fn an_out_of_range_limit_is_clamped_rather_than_rejected() {
     let dir = scratch("clamp");
     let path = write_archive(&dir, "dbs.sqlite3", &[Item::default()]);
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
     let mut zero = input(&path);
     zero.limit = 0;
-    let result = pull_dbs(&conn, &zero).unwrap();
+    let result = pull_dbs(&store, &zero).unwrap();
 
     // Clamped up to 1 rather than fetching nothing, matching how every other
     // bounded input in this crate behaves. The clamped value is reported so a
@@ -695,25 +723,31 @@ fn a_dry_run_reports_the_work_without_doing_any_of_it() {
     let dir = scratch("dryrun");
     let path = write_archive(&dir, "dbs.sqlite3", &[Item::default()]);
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let mut params = input(&path);
     params.dry_run = true;
 
-    let result = pull_dbs(&conn, &params).unwrap();
+    let result = pull_dbs(&store, &params).unwrap();
 
     assert_eq!(result.fetched, 1);
     assert_eq!(result.to_import, 1);
     assert_eq!(result.imported, 0);
-    assert_eq!(memory_count(&conn), 0);
+    assert_eq!(memory_count(&store), 0);
     assert_eq!(
-        conn.query_row("SELECT count(*) FROM dbs_imports", [], |r| r
-            .get::<_, i64>(0))
+        store
+            .sqlite()
+            .unwrap()
+            .query_row("SELECT count(*) FROM dbs_imports", [], |r| r
+                .get::<_, i64>(0))
             .unwrap(),
         0,
         "a dry run that recorded a tracking row would make the real run a no-op"
     );
     assert_eq!(
-        conn.query_row("SELECT count(*) FROM entities", [], |r| r.get::<_, i64>(0))
+        store
+            .sqlite()
+            .unwrap()
+            .query_row("SELECT count(*) FROM entities", [], |r| r.get::<_, i64>(0))
             .unwrap(),
         0
     );
@@ -728,11 +762,11 @@ fn a_dry_run_reports_the_work_without_doing_any_of_it() {
 #[test]
 fn a_path_outside_the_import_roots_is_refused_without_revealing_whether_it_exists() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let mut params = input(std::path::Path::new("/etc/hosts"));
     params.db_path = "/etc/hosts".to_string();
 
-    let error = pull_dbs(&conn, &params).unwrap_err();
+    let error = pull_dbs(&store, &params).unwrap_err();
 
     // Containment before existence: a check that tested existence first would
     // answer "does this path exist?" for any path on the machine.
@@ -747,10 +781,10 @@ fn a_path_outside_the_import_roots_is_refused_without_revealing_whether_it_exist
 fn a_missing_archive_is_reported_as_missing() {
     let dir = scratch("missing");
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let params = input(&dir.join("nothing-here.sqlite3"));
 
-    let error = pull_dbs(&conn, &params).unwrap_err();
+    let error = pull_dbs(&store, &params).unwrap_err();
 
     assert!(matches!(error, DbsImportError::Path(_)), "got {error}");
     assert!(error.to_string().contains("File not found"));
@@ -764,9 +798,9 @@ fn a_file_that_is_not_a_database_is_reported_as_such() {
     let path = dir.join("archive.sqlite3");
     std::fs::write(&path, "this is not a database, it is a sentence").unwrap();
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
-    let error = pull_dbs(&conn, &input(&path)).unwrap_err();
+    let error = pull_dbs(&store, &input(&path)).unwrap_err();
 
     assert!(
         matches!(error, DbsImportError::NotADatabase { .. }),
@@ -786,9 +820,9 @@ fn a_database_without_the_dbs_tables_says_so() {
         .unwrap();
     drop(other);
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
-    let error = pull_dbs(&conn, &input(&path)).unwrap_err();
+    let error = pull_dbs(&store, &input(&path)).unwrap_err();
 
     // Distinguished from "not a database at all": one is the wrong file, the
     // other is the right kind of file from the wrong tool.
@@ -806,9 +840,9 @@ fn the_archive_is_opened_read_only() {
     let dir = scratch("readonly");
     let path = write_archive(&dir, "dbs.sqlite3", &[Item::default()]);
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
-    pull_dbs(&conn, &input(&path)).unwrap();
+    pull_dbs(&store, &input(&path)).unwrap();
 
     // This is someone's backup archive. The guarantee is not "this module
     // never writes" but "a write would fail", so it is asserted at the SQLite

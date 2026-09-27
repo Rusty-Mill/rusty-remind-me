@@ -8,9 +8,10 @@
 //! lengths, batch bounds, which sources count as raw imports, the entity
 //! fan-out ceiling, and the keyset cursor's meaning.
 
+use super::{Result, Store};
 use crate::db::queries::{parse_memory_row, MEMORY_COLUMNS};
 use crate::models::{ContradictionSide, Memory};
-use rusqlite::{params, Connection, OptionalExtension, Result};
+use rusqlite::{params, Connection, OptionalExtension};
 
 /// A capture that nothing has been decomposed from yet.
 #[derive(Debug, Clone, PartialEq)]
@@ -135,12 +136,13 @@ pub struct Curation<'c> {
 }
 
 impl<'c> Curation<'c> {
-    pub fn new(conn: &'c Connection) -> Self {
+    pub fn new(store: &'c Store<'_>) -> Self {
+        let conn = store.conn();
         Self { conn }
     }
 
     fn count(&self, sql: &str) -> Result<i64> {
-        self.conn.query_row(sql, [], |r| r.get(0))
+        Ok(self.conn.query_row(sql, [], |r| r.get(0))?)
     }
 
     // --- captures --------------------------------------------------------
@@ -152,14 +154,16 @@ impl<'c> Curation<'c> {
         ))?;
         let rows = stmt
             .query_map(params![capture_id], parse_memory_row)?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
     /// The tags of one memory carrying `capture_id`, or `None` when none
     /// does. Unparseable tags read as none.
     pub fn capture_tags(&self, capture_id: &str) -> Result<Option<Vec<String>>> {
-        self.conn
+        Ok(self
+            .conn
             .query_row(
                 "SELECT tags FROM memories WHERE capture_id = ? LIMIT 1",
                 params![capture_id],
@@ -168,7 +172,7 @@ impl<'c> Curation<'c> {
                     Ok(serde_json::from_str(&tags_json).unwrap_or_default())
                 },
             )
-            .optional()
+            .optional()?)
     }
 
     /// Captures nothing has been decomposed from, newest first, at most
@@ -192,7 +196,8 @@ impl<'c> Curation<'c> {
                     tags: serde_json::from_str(&tags_json).unwrap_or_default(),
                 })
             })?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
@@ -206,7 +211,7 @@ impl<'c> Curation<'c> {
     /// How many distinct live captures there are, and the newest one's
     /// `created_at`.
     pub fn capture_activity(&self) -> Result<CaptureActivity> {
-        self.conn.query_row(
+        Ok(self.conn.query_row(
             "SELECT COUNT(DISTINCT capture_id), MAX(created_at) FROM memories
               WHERE capture_id IS NOT NULL AND deleted_at IS NULL",
             [],
@@ -216,7 +221,7 @@ impl<'c> Curation<'c> {
                     last_capture_at: r.get(1)?,
                 })
             },
-        )
+        )?)
     }
 
     // --- normalization ---------------------------------------------------
@@ -246,7 +251,8 @@ impl<'c> Curation<'c> {
                         .unwrap_or_else(|_| serde_json::json!({})),
                 })
             })?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
@@ -261,7 +267,8 @@ impl<'c> Curation<'c> {
 
     /// What a normalization of `memory_id` copies from it, if it exists.
     pub fn normalization_source(&self, memory_id: &str) -> Result<Option<NormalizationSource>> {
-        self.conn
+        Ok(self
+            .conn
             .query_row(
                 "SELECT tags, doc_id, chunk_index FROM memories WHERE id = ?",
                 params![memory_id],
@@ -274,7 +281,7 @@ impl<'c> Curation<'c> {
                     })
                 },
             )
-            .optional()
+            .optional()?)
     }
 
     // --- maintenance -----------------------------------------------------
@@ -360,7 +367,8 @@ impl<'c> Curation<'c> {
             .query_map(params![after_a, after_b, limit as i64], |r| {
                 Ok((r.get(0)?, r.get(1)?))
             })?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
@@ -373,7 +381,10 @@ impl<'c> Curation<'c> {
               WHERE me1.memory_id = ? AND me2.memory_id = ?
               ORDER BY e.name",
         )?;
-        let rows = stmt.query_map(params![id_a, id_b], |r| r.get(0))?.collect();
+        let rows = stmt
+            .query_map(params![id_a, id_b], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
@@ -384,7 +395,7 @@ impl<'c> Curation<'c> {
         memory_id: &str,
         snippet_chars: usize,
     ) -> Result<ContradictionSide> {
-        self.conn.query_row(
+        Ok(self.conn.query_row(
             &format!(
                 "SELECT id, substr(content, 1, {snippet_chars}) AS content_snippet, category,
                         memory_type, subject, predicate, object, created_at
@@ -403,7 +414,7 @@ impl<'c> Curation<'c> {
                     created_at: r.get(7)?,
                 })
             },
-        )
+        )?)
     }
 }
 
@@ -418,15 +429,15 @@ mod tests {
     #[test]
     fn a_capture_leaves_the_backlog_once_a_fact_names_it() {
         let db = Database::open_in_memory().unwrap();
-        let conn = db.conn();
-        let memories = Memories::new(&conn);
+        let store = db.store();
+        let memories = Memories::new(&store);
         memories
             .insert(&NewMemory {
                 capture_id: Some("cap".to_string()),
                 ..NewMemory::new("dialog", "x", NOW)
             })
             .unwrap();
-        let curation = Curation::new(&conn);
+        let curation = Curation::new(&store);
         assert_eq!(curation.count_undecomposed().unwrap(), 1);
         assert_eq!(curation.backlog_depth(Backlog::Undecomposed).unwrap(), 1);
 
@@ -444,15 +455,15 @@ mod tests {
     #[test]
     fn an_import_leaves_the_backlog_once_normalized() {
         let db = Database::open_in_memory().unwrap();
-        let conn = db.conn();
-        let memories = Memories::new(&conn);
+        let store = db.store();
+        let memories = Memories::new(&store);
         memories
             .insert(&NewMemory {
                 source: "chat_import".to_string(),
                 ..NewMemory::new("raw", "x", NOW)
             })
             .unwrap();
-        let curation = Curation::new(&conn);
+        let curation = Curation::new(&store);
         let sources = ["document_import", "chat_import"];
         assert_eq!(curation.count_unnormalized(&sources).unwrap(), 1);
         assert_eq!(curation.backlog_depth(Backlog::Unnormalized).unwrap(), 1);
@@ -470,16 +481,16 @@ mod tests {
     #[test]
     fn contradiction_pairs_page_by_keyset() {
         let db = Database::open_in_memory().unwrap();
-        let conn = db.conn();
-        let memories = Memories::new(&conn);
-        let entities = crate::db::entities::Entities::new(&conn);
+        let store = db.store();
+        let memories = Memories::new(&store);
+        let entities = crate::db::entities::Entities::new(&store);
         for id in ["a", "b", "c"] {
             memories.insert(&NewMemory::new(id, id, NOW)).unwrap();
             entities
                 .link(id, "e", NOW, crate::db::derived::Origin::Local)
                 .unwrap();
         }
-        let curation = Curation::new(&conn);
+        let curation = Curation::new(&store);
         assert_eq!(curation.count_contradiction_pairs(20).unwrap(), 3);
 
         let first = curation.contradiction_pairs(20, None, 2).unwrap();

@@ -222,7 +222,7 @@ fn the_memory_gauge_counts_live_memories_only() {
                 )
                 .unwrap();
             }
-            conn.execute(
+            conn.sqlite().unwrap().execute(
                 "UPDATE memories SET deleted_at = '2020-01-01T00:00:00+00:00' WHERE content = 'three'",
                 [],
             )

@@ -13,7 +13,8 @@
 //! exactly what it read before: tags and metadata as JSON strings, and
 //! `sensitive` as 0 or 1.
 
-use rusqlite::{params, Connection, OptionalExtension, Result};
+use super::{Result, Store};
+use rusqlite::{params, Connection, OptionalExtension};
 
 /// Where a write came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,12 +65,13 @@ fn atomically<T>(conn: &Connection, body: impl FnOnce() -> Result<T>) -> Result<
 // --- memories -------------------------------------------------------------
 
 fn memory_updated_at(conn: &Connection, id: &str) -> Result<Option<String>> {
-    conn.query_row(
-        "SELECT updated_at FROM memories WHERE id = ?",
-        params![id],
-        |r| r.get(0),
-    )
-    .optional()
+    Ok(conn
+        .query_row(
+            "SELECT updated_at FROM memories WHERE id = ?",
+            params![id],
+            |r| r.get(0),
+        )
+        .optional()?)
 }
 
 /// Take memory `id` out of the full-text index, as it is stored now. A
@@ -162,7 +164,10 @@ pub(crate) fn memory_ids(
     bindings: impl rusqlite::Params,
 ) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map(bindings, |r| r.get(0))?.collect();
+    let rows = stmt
+        .query_map(bindings, |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()
+        .map_err(crate::db::StoreError::from);
     rows
 }
 
@@ -250,8 +255,9 @@ pub(crate) fn write_wiki_page<T>(
 /// Everything here is derived, so a rebuild is always safe. It is how rows
 /// written without going through the repositories become searchable: a test
 /// fixture planted with raw SQL, or a repair after the indexes were lost.
-pub fn rebuild_indexes(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
+pub fn rebuild_indexes(store: &Store<'_>) -> Result<()> {
+    let conn = store.conn();
+    Ok(conn.execute_batch(
         "INSERT INTO memories_fts(memories_fts) VALUES('rebuild');
          INSERT INTO wiki_fts(wiki_fts) VALUES('rebuild');
          DELETE FROM memory_tags;
@@ -259,7 +265,7 @@ pub fn rebuild_indexes(conn: &Connection) -> Result<()> {
          SELECT m.id, je.value
            FROM memories m, json_each(m.tags) AS je
           WHERE typeof(je.value) = 'text' AND json_valid(m.tags);",
-    )
+    )?)
 }
 
 #[cfg(test)]
@@ -280,11 +286,11 @@ mod tests {
 
     fn insert(conn: &Connection, id: &str, content: &str, tags: &str, origin: Origin) {
         write_memory(conn, id, origin, || {
-            conn.execute(
+            Ok(conn.execute(
                 "INSERT INTO memories (id, content, tags, created_at, updated_at)
                  VALUES (?, ?, ?, ?, ?)",
                 params![id, content, tags, T1, T1],
-            )
+            )?)
         })
         .unwrap();
     }
@@ -299,7 +305,7 @@ mod tests {
         let rows = stmt
             .query_map([term], |r| r.get(0))
             .unwrap()
-            .collect::<Result<Vec<String>>>()
+            .collect::<rusqlite::Result<Vec<String>>>()
             .unwrap();
         rows
     }
@@ -311,7 +317,7 @@ mod tests {
         let rows = stmt
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
             .unwrap()
-            .collect::<Result<Vec<_>>>()
+            .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         rows
     }
@@ -319,33 +325,34 @@ mod tests {
     #[test]
     fn the_index_and_tags_follow_a_memory_through_update_and_delete() {
         let db = Database::open_in_memory().unwrap();
-        let conn = db.conn();
-        insert(&conn, "a", "quokka", r#"["red"]"#, Origin::Local);
-        assert_eq!(fts_hits(&conn, "quokka"), vec!["a"]);
+        let store = db.store();
+        let conn = store.conn();
+        insert(conn, "a", "quokka", r#"["red"]"#, Origin::Local);
+        assert_eq!(fts_hits(conn, "quokka"), vec!["a"]);
 
-        write_memory(&conn, "a", Origin::Local, || {
-            conn.execute(
+        write_memory(conn, "a", Origin::Local, || {
+            Ok(conn.execute(
                 r#"UPDATE memories SET content = 'wombat', tags = '["blue"]' WHERE id = 'a'"#,
                 [],
-            )
+            )?)
         })
         .unwrap();
-        assert!(fts_hits(&conn, "quokka").is_empty());
-        assert_eq!(fts_hits(&conn, "wombat"), vec!["a"]);
+        assert!(fts_hits(conn, "quokka").is_empty());
+        assert_eq!(fts_hits(conn, "wombat"), vec!["a"]);
         let tags: Vec<String> = conn
             .prepare("SELECT tag FROM memory_tags WHERE memory_id = 'a'")
             .unwrap()
             .query_map([], |r| r.get(0))
             .unwrap()
-            .collect::<Result<_>>()
+            .collect::<rusqlite::Result<_>>()
             .unwrap();
         assert_eq!(tags, vec!["blue"]);
 
-        write_memory(&conn, "a", Origin::Local, || {
-            conn.execute("DELETE FROM memories WHERE id = 'a'", [])
+        write_memory(conn, "a", Origin::Local, || {
+            Ok(conn.execute("DELETE FROM memories WHERE id = 'a'", [])?)
         })
         .unwrap();
-        assert!(fts_hits(&conn, "wombat").is_empty());
+        assert!(fts_hits(conn, "wombat").is_empty());
         let left: i64 = conn
             .query_row("SELECT count(*) FROM memory_tags", [], |r| r.get(0))
             .unwrap();
@@ -355,27 +362,28 @@ mod tests {
     #[test]
     fn only_local_edits_that_move_updated_at_are_queued() {
         let db = Database::open_in_memory().unwrap();
-        let conn = db.conn();
-        enable_sync(&conn);
-        insert(&conn, "local", "x", "[]", Origin::Local);
-        insert(&conn, "synced", "y", "[]", Origin::Sync);
+        let store = db.store();
+        let conn = store.conn();
+        enable_sync(conn);
+        insert(conn, "local", "x", "[]", Origin::Local);
+        insert(conn, "synced", "y", "[]", Origin::Sync);
 
         // A score change is not an edit.
-        write_memory(&conn, "local", Origin::Local, || {
-            conn.execute("UPDATE memories SET vitality = 0.5 WHERE id = 'local'", [])
+        write_memory(conn, "local", Origin::Local, || {
+            Ok(conn.execute("UPDATE memories SET vitality = 0.5 WHERE id = 'local'", [])?)
         })
         .unwrap();
         // An edit is.
-        write_memory(&conn, "local", Origin::Local, || {
-            conn.execute(
+        write_memory(conn, "local", Origin::Local, || {
+            Ok(conn.execute(
                 "UPDATE memories SET content = 'z', updated_at = ? WHERE id = 'local'",
                 [T2],
-            )
+            )?)
         })
         .unwrap();
 
         assert_eq!(
-            outbox(&conn),
+            outbox(conn),
             vec![
                 ("local".to_string(), "insert".to_string()),
                 ("local".to_string(), "update".to_string())
@@ -386,30 +394,33 @@ mod tests {
     #[test]
     fn nothing_is_queued_while_sync_is_off() {
         let db = Database::open_in_memory().unwrap();
-        let conn = db.conn();
-        insert(&conn, "a", "x", "[]", Origin::Local);
-        assert!(outbox(&conn).is_empty());
+        let store = db.store();
+        let conn = store.conn();
+        insert(conn, "a", "x", "[]", Origin::Local);
+        assert!(outbox(conn).is_empty());
     }
 
     #[test]
     fn a_failed_write_leaves_the_index_as_it_was() {
         let db = Database::open_in_memory().unwrap();
-        let conn = db.conn();
-        insert(&conn, "a", "quokka", "[]", Origin::Local);
+        let store = db.store();
+        let conn = store.conn();
+        insert(conn, "a", "quokka", "[]", Origin::Local);
 
-        let failed = write_memory(&conn, "a", Origin::Local, || -> Result<()> {
-            Err(rusqlite::Error::InvalidQuery)
+        let failed = write_memory(conn, "a", Origin::Local, || -> Result<()> {
+            Err(rusqlite::Error::InvalidQuery.into())
         });
         assert!(failed.is_err());
-        assert_eq!(fts_hits(&conn, "quokka"), vec!["a"]);
+        assert_eq!(fts_hits(conn, "quokka"), vec!["a"]);
     }
 
     #[test]
     fn a_queued_memory_payload_keeps_the_trigger_shape() {
         let db = Database::open_in_memory().unwrap();
-        let conn = db.conn();
-        enable_sync(&conn);
-        insert(&conn, "a", "x", r#"["t"]"#, Origin::Local);
+        let store = db.store();
+        let conn = store.conn();
+        enable_sync(conn);
+        insert(conn, "a", "x", r#"["t"]"#, Origin::Local);
 
         let payload: String = conn
             .query_row("SELECT payload FROM sync_outbox", [], |r| r.get(0))

@@ -37,7 +37,8 @@
 //! build; that would turn one slow query into a pathologically slow one at
 //! exactly the moment someone is waiting.
 
-use rusqlite::{Connection, Result as SqlResult};
+use crate::db::Result as SqlResult;
+use crate::db::Store;
 
 /// How many extra candidates to pull before filtering and exact scoring.
 ///
@@ -57,9 +58,9 @@ pub fn available() -> bool {
 }
 
 /// Where the index for a given database lives.
-pub fn index_path(conn: &Connection) -> Option<std::path::PathBuf> {
+pub fn index_path(store: &Store<'_>) -> Option<std::path::PathBuf> {
     // In-memory: nowhere to persist, so no index.
-    let db = crate::db::database_path(conn).ok().flatten()?;
+    let db = crate::db::database_path(store).ok().flatten()?;
     Some(std::path::PathBuf::from(format!("{}.ann", db.display())))
 }
 
@@ -67,8 +68,8 @@ pub fn index_path(conn: &Connection) -> Option<std::path::PathBuf> {
 ///
 /// The pair is the staleness key: either changing means an index built from
 /// the old state cannot be trusted.
-pub fn live_signature(conn: &Connection) -> SqlResult<(usize, usize)> {
-    let vectors = crate::db::vectors::Vectors::new(conn);
+pub fn live_signature(store: &Store<'_>) -> SqlResult<(usize, usize)> {
+    let vectors = crate::db::vectors::Vectors::new(store);
     let count = vectors.count()?;
     let dimension = vectors
         .any_embedding()?
@@ -97,13 +98,13 @@ mod backend {
     /// Build the index from every stored embedding and persist it.
     ///
     /// Explicit: nothing calls this from a search path.
-    pub fn build(conn: &Connection) -> Result<usize, String> {
-        let Some(path) = index_path(conn) else {
+    pub fn build(store: &Store<'_>) -> Result<usize, String> {
+        let Some(path) = index_path(store) else {
             return Err(
                 "this database is in-memory, so there is nowhere to persist an index".into(),
             );
         };
-        let (count, dimension) = live_signature(conn).map_err(|e| e.to_string())?;
+        let (count, dimension) = live_signature(store).map_err(|e| e.to_string())?;
         if count == 0 || dimension == 0 {
             return Err("no embeddings to index yet — run a reindex first".into());
         }
@@ -111,7 +112,7 @@ mod backend {
         let index = usearch::new_index(&options(dimension)).map_err(|e| e.to_string())?;
         index.reserve(count).map_err(|e| e.to_string())?;
 
-        let chunks = crate::db::vectors::Vectors::new(conn)
+        let chunks = crate::db::vectors::Vectors::new(store)
             .all()
             .map_err(|e| e.to_string())?;
 
@@ -154,13 +155,13 @@ mod backend {
     }
 
     /// Candidate memory ids for a query, or `None` to fall back.
-    pub fn candidates(conn: &Connection, query: &[f32], want: usize) -> Option<Vec<String>> {
-        let path = index_path(conn)?;
+    pub fn candidates(store: &Store<'_>, query: &[f32], want: usize) -> Option<Vec<String>> {
+        let path = index_path(store)?;
         if !path.exists() {
             return None;
         }
 
-        let (live_count, live_dimension) = live_signature(conn).ok()?;
+        let (live_count, live_dimension) = live_signature(store).ok()?;
         let recorded = std::fs::read_to_string(sidecar(&path)).ok()?;
         let mut lines = recorded.lines();
         let mut header = lines.next()?.split_whitespace();
@@ -214,7 +215,7 @@ mod backend {
 mod backend {
     use super::*;
 
-    pub fn build(_conn: &Connection) -> Result<usize, String> {
+    pub fn build(_conn: &Store<'_>) -> Result<usize, String> {
         Err(
             "ANN indexing is not available in this build: rebuild with the \
              `ann` feature (cargo build --features ann)."
@@ -222,18 +223,18 @@ mod backend {
         )
     }
 
-    pub fn candidates(_conn: &Connection, _query: &[f32], _want: usize) -> Option<Vec<String>> {
+    pub fn candidates(_conn: &Store<'_>, _query: &[f32], _want: usize) -> Option<Vec<String>> {
         None
     }
 }
 
 /// Build and persist the index. Explicit; never called from a search.
-pub fn build(conn: &Connection) -> Result<usize, String> {
-    backend::build(conn)
+pub fn build(store: &Store<'_>) -> Result<usize, String> {
+    backend::build(store)
 }
 
 /// Candidate memory ids to score exactly, or `None` when the caller should
 /// fall back to a full scan.
-pub fn candidates(conn: &Connection, query: &[f32], want: usize) -> Option<Vec<String>> {
-    backend::candidates(conn, query, want)
+pub fn candidates(store: &Store<'_>, query: &[f32], want: usize) -> Option<Vec<String>> {
+    backend::candidates(store, query, want)
 }

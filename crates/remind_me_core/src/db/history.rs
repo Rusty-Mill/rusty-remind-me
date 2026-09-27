@@ -5,9 +5,10 @@
 //! [`crate::history`]: which columns are tracked, what counts as a change,
 //! and that a revert is itself a revisioned edit.
 
+use super::{Result, Store};
 use crate::db::derived::{write_memory, Origin};
 use crate::models::MemoryRevision;
-use rusqlite::{params, Connection, OptionalExtension, Result};
+use rusqlite::{params, Connection, OptionalExtension};
 
 /// The columns a revision snapshots, in their stored form: tags and metadata
 /// as JSON strings, so comparing them with an update is like for like.
@@ -28,7 +29,8 @@ pub struct Revisions<'c> {
 }
 
 impl<'c> Revisions<'c> {
-    pub fn new(conn: &'c Connection) -> Self {
+    pub fn new(store: &'c Store<'_>) -> Self {
+        let conn = store.conn();
         Self { conn }
     }
 
@@ -48,14 +50,15 @@ impl<'c> Revisions<'c> {
     /// `memory_id`'s tracked columns as stored now, deleted or not, or `None`
     /// if there is no such memory.
     pub fn current(&self, memory_id: &str) -> Result<Option<Tracked>> {
-        self.conn
+        Ok(self
+            .conn
             .query_row(
                 "SELECT content, category, tags, metadata, sensitive
                    FROM memories WHERE id = ?",
                 params![memory_id],
                 read_tracked,
             )
-            .optional()
+            .optional()?)
     }
 
     /// Append a revision of `memory_id` holding `values`, edited at
@@ -115,21 +118,23 @@ impl<'c> Revisions<'c> {
                     revision_reason: r.get(8)?,
                 })
             })?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
     /// The tracked values revision `revision_id` holds, if it belongs to
     /// `memory_id`.
     pub fn revision(&self, memory_id: &str, revision_id: i64) -> Result<Option<Tracked>> {
-        self.conn
+        Ok(self
+            .conn
             .query_row(
                 "SELECT content, category, tags, metadata, sensitive
                    FROM memory_revisions WHERE id = ? AND memory_id = ?",
                 params![revision_id, memory_id],
                 read_tracked,
             )
-            .optional()
+            .optional()?)
     }
 
     /// Write `values` into `memory_id`'s tracked columns, stamping
@@ -142,7 +147,7 @@ impl<'c> Revisions<'c> {
     }
 
     fn write_tracked(&self, memory_id: &str, values: &Tracked, updated_at: &str) -> Result<usize> {
-        self.conn.execute(
+        Ok(self.conn.execute(
             "UPDATE memories
                 SET content = ?, category = ?, tags = ?, metadata = ?,
                     sensitive = ?, updated_at = ?
@@ -156,11 +161,11 @@ impl<'c> Revisions<'c> {
                 updated_at,
                 memory_id
             ],
-        )
+        )?)
     }
 }
 
-fn read_tracked(r: &rusqlite::Row<'_>) -> Result<Tracked> {
+fn read_tracked(r: &rusqlite::Row<'_>) -> rusqlite::Result<Tracked> {
     Ok(Tracked {
         content: r.get(0)?,
         category: r.get(1)?,

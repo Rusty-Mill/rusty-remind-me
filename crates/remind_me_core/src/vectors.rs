@@ -21,12 +21,13 @@
 
 use crate::db::memories::Memories;
 use crate::db::vectors::{ChunkVector, Unembedded, Vectors};
+use crate::db::Result as SqlResult;
+use crate::db::Store;
 use crate::embedder::{
     chunk_text, EmbedError, EmbedRole, Embedder, EmbeddingIdentity, EMBED_CHUNK_CHARS,
     EMBED_CHUNK_OVERLAP, EMBED_MAX_CHUNKS,
 };
 use crate::models::Memory;
-use rusqlite::{Connection, Result as SqlResult};
 
 /// Why an embedding-touching operation could not complete. Every variant is
 /// something a caller can degrade on — search falls back to keyword-only,
@@ -34,7 +35,7 @@ use rusqlite::{Connection, Result as SqlResult};
 /// surrounding operation outright.
 #[derive(Debug)]
 pub enum VectorError {
-    Db(rusqlite::Error),
+    Db(crate::db::StoreError),
     Embed(EmbedError),
 }
 
@@ -49,8 +50,8 @@ impl std::fmt::Display for VectorError {
 
 impl std::error::Error for VectorError {}
 
-impl From<rusqlite::Error> for VectorError {
-    fn from(e: rusqlite::Error) -> Self {
+impl From<crate::db::StoreError> for VectorError {
+    fn from(e: crate::db::StoreError) -> Self {
         Self::Db(e)
     }
 }
@@ -85,13 +86,13 @@ pub(crate) fn le_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
 /// Called from `delete_memory`, so a deleted or tombstoned memory stops
 /// matching searches, and from [`embed_and_store`] before writing fresh
 /// chunks, so a re-embed replaces rather than accumulates.
-pub fn delete_chunks_for_memory(conn: &Connection, memory_id: &str) -> SqlResult<usize> {
-    Vectors::new(conn).delete_for(memory_id)
+pub fn delete_chunks_for_memory(store: &Store<'_>, memory_id: &str) -> SqlResult<usize> {
+    Vectors::new(store).delete_for(memory_id)
 }
 
 /// Store freshly computed chunk vectors for a memory, one per chunk index.
-fn store_vectors(conn: &Connection, memory_id: &str, vectors: &[Vec<f32>]) -> SqlResult<usize> {
-    let repo = Vectors::new(conn);
+fn store_vectors(store: &Store<'_>, memory_id: &str, vectors: &[Vec<f32>]) -> SqlResult<usize> {
+    let repo = Vectors::new(store);
     for (chunk_ix, vector) in vectors.iter().enumerate() {
         repo.put(memory_id, chunk_ix, &f32_to_le_bytes(vector))?;
     }
@@ -107,16 +108,16 @@ fn store_vectors(conn: &Connection, memory_id: &str, vectors: &[Vec<f32>]) -> Sq
 /// caller (an add/update path) already knows whether the write it just made
 /// succeeded — this only has something to do if it did.
 pub fn embed_and_store(
-    conn: &Connection,
+    store: &Store<'_>,
     embedder: &dyn Embedder,
     memory_id: &str,
     content: &str,
 ) -> Result<usize, VectorError> {
-    if !Memories::new(conn).exists(memory_id)? {
+    if !Memories::new(store).exists(memory_id)? {
         return Ok(0);
     }
 
-    delete_chunks_for_memory(conn, memory_id)?;
+    delete_chunks_for_memory(store, memory_id)?;
 
     let chunks = chunk_text(
         content,
@@ -128,13 +129,13 @@ pub fn embed_and_store(
         return Ok(0);
     }
     let vectors = embedder.embed(&chunks, EmbedRole::Passage)?;
-    let stored = store_vectors(conn, memory_id, &vectors)?;
+    let stored = store_vectors(store, memory_id, &vectors)?;
     if stored > 0 {
         // Best-effort, matching the reference's own
         // `_mark_embedding_meta_current`: this is bookkeeping for the next
         // mismatch check, never a reason to fail a write that already
         // succeeded.
-        let _ = mark_embedding_meta_current(conn, &embedder.identity());
+        let _ = mark_embedding_meta_current(store, &embedder.identity());
     }
     Ok(stored)
 }
@@ -153,14 +154,14 @@ pub fn embed_and_store(
 /// changed without a reindex) is the caller's to decide how to treat; this
 /// never partially-guesses.
 pub fn semantic_search(
-    conn: &Connection,
+    store: &Store<'_>,
     embedder: &dyn Embedder,
     query: &str,
     limit: usize,
     category: Option<&str>,
 ) -> Result<Vec<Memory>, VectorError> {
     Ok(
-        semantic_search_scored(conn, embedder, query, &[], limit, category)?
+        semantic_search_scored(store, embedder, query, &[], limit, category)?
             .into_iter()
             .map(|(memory, _similarity)| memory)
             .collect(),
@@ -220,7 +221,7 @@ pub fn fuse_query_embedding(
 /// that magnitude's only source, since nothing else in this crate computes
 /// it.
 pub fn semantic_search_scored(
-    conn: &Connection,
+    store: &Store<'_>,
     embedder: &dyn Embedder,
     query: &str,
     extra_texts: &[String],
@@ -240,8 +241,8 @@ pub fn semantic_search_scored(
     // identical either way and nothing downstream needs to know which path
     // ran. `None` means scan everything — a search must not fail, or change
     // its answers, because an optimisation was unavailable.
-    if let Some(narrowed) = crate::ann_index::candidates(conn, &query_vector, limit) {
-        let scored = scan_and_score(conn, &query_vector, limit, category, Some(&narrowed))?;
+    if let Some(narrowed) = crate::ann_index::candidates(store, &query_vector, limit) {
+        let scored = scan_and_score(store, &query_vector, limit, category, Some(&narrowed))?;
         // A category filter can remove most of what the index proposed.
         // Returning fewer results than a full scan would have is a retrieval
         // regression nobody would notice, so fall back rather than accept a
@@ -250,7 +251,7 @@ pub fn semantic_search_scored(
             return Ok(scored);
         }
     }
-    scan_and_score(conn, &query_vector, limit, category, None)
+    scan_and_score(store, &query_vector, limit, category, None)
 }
 
 /// Score every candidate exactly and return the best `limit`.
@@ -259,7 +260,7 @@ pub fn semantic_search_scored(
 /// of them. Scoring is identical in both cases — that is the whole point of
 /// letting the index propose candidates rather than rank them.
 fn scan_and_score(
-    conn: &Connection,
+    store: &Store<'_>,
     query_vector: &[f32],
     limit: usize,
     category: Option<&str>,
@@ -268,7 +269,7 @@ fn scan_and_score(
     // The same filter the keyword branch of search applies, so the two ranked
     // lists retrieval fuses answer the same question.
     let category = category.filter(|c| !c.is_empty());
-    let chunks = Vectors::new(conn).live_chunks(category, narrowed)?;
+    let chunks = Vectors::new(store).live_chunks(category, narrowed)?;
 
     let mut best_by_memory: std::collections::HashMap<String, f32> =
         std::collections::HashMap::new();
@@ -305,7 +306,7 @@ fn scan_and_score(
 
     let mut memories = Vec::with_capacity(ranked.len());
     for (memory_id, similarity) in ranked {
-        if let Some(memory) = crate::db::queries::get_memory_by_id(conn, &memory_id)? {
+        if let Some(memory) = crate::db::queries::get_memory_by_id(store, &memory_id)? {
             memories.push((memory, similarity));
         }
     }
@@ -322,8 +323,8 @@ fn scan_and_score(
 /// is what actually bounds request size, per HTTP call to the embedder, the
 /// same way the reference bounds its ONNX forward pass — this is not a
 /// second, redundant limit on top of that.
-fn unembedded(conn: &Connection) -> SqlResult<Vec<Unembedded>> {
-    Vectors::new(conn).unembedded()
+fn unembedded(store: &Store<'_>) -> SqlResult<Vec<Unembedded>> {
+    Vectors::new(store).unembedded()
 }
 
 /// What one `remind_me_reindex` call did.
@@ -350,14 +351,14 @@ pub struct ReindexResult {
 /// failure (the daemon dropped mid-batch, say) does not abort the rest —
 /// this simply continues, and that memory stays missing for the next call
 /// to pick back up, the same as any other still-unembedded memory.
-pub fn reindex(conn: &Connection) -> Result<ReindexResult, VectorError> {
+pub fn reindex(store: &Store<'_>) -> Result<ReindexResult, VectorError> {
     let Some(embedder) = crate::embedder::available_embedder() else {
         return Ok(ReindexResult {
             degraded: true,
             ..Default::default()
         });
     };
-    reindex_with(conn, &*embedder)
+    reindex_with(store, &*embedder)
 }
 
 /// Same as [`reindex`], but takes the embedder explicitly instead of
@@ -366,17 +367,17 @@ pub fn reindex(conn: &Connection) -> Result<ReindexResult, VectorError> {
 /// `reindex` itself always goes through the env-configured, TTL-cached
 /// singleton.
 pub fn reindex_with(
-    conn: &Connection,
+    store: &Store<'_>,
     embedder: &dyn Embedder,
 ) -> Result<ReindexResult, VectorError> {
-    let missing = unembedded(conn)?;
+    let missing = unembedded(store)?;
     let mut result = ReindexResult {
         missing: missing.len(),
         ..Default::default()
     };
 
     for memory in missing {
-        if let Ok(chunks) = embed_and_store(conn, embedder, &memory.id, &memory.content) {
+        if let Ok(chunks) = embed_and_store(store, embedder, &memory.id, &memory.content) {
             if chunks > 0 {
                 result.embedded += 1;
                 result.chunks_created += chunks;
@@ -415,8 +416,8 @@ pub fn reindex_with(
 /// three keys present) — either way there is nothing complete to compare
 /// against, so callers must treat this the same as "nothing recorded" rather
 /// than guess at the missing piece.
-fn read_embedding_meta(conn: &Connection) -> SqlResult<Option<EmbeddingIdentity>> {
-    let rows = Vectors::new(conn).meta()?;
+fn read_embedding_meta(store: &Store<'_>) -> SqlResult<Option<EmbeddingIdentity>> {
+    let rows = Vectors::new(store).meta()?;
     if rows.is_empty() {
         return Ok(None);
     }
@@ -445,11 +446,11 @@ fn read_embedding_meta(conn: &Connection) -> SqlResult<Option<EmbeddingIdentity>
 /// partway through has already marked every memory it did finish as
 /// current).
 pub fn mark_embedding_meta_current(
-    conn: &Connection,
+    store: &Store<'_>,
     identity: &EmbeddingIdentity,
 ) -> SqlResult<()> {
     let now = chrono::Utc::now().to_rfc3339();
-    let vectors = Vectors::new(conn);
+    let vectors = Vectors::new(store);
     for (key, value) in [
         ("backend", identity.backend.clone()),
         ("model", identity.model.clone()),
@@ -476,10 +477,10 @@ pub struct EmbeddingMismatch {
 /// from being treated as a mismatch: there is no "old" model to have
 /// changed away from.
 pub fn embedding_mismatch_info(
-    conn: &Connection,
+    store: &Store<'_>,
     current: &EmbeddingIdentity,
 ) -> SqlResult<Option<EmbeddingMismatch>> {
-    let Some(stored) = read_embedding_meta(conn)? else {
+    let Some(stored) = read_embedding_meta(store)? else {
         return Ok(None);
     };
     if &stored == current {
@@ -508,12 +509,12 @@ pub fn embedding_mismatch_info(
 /// nothing is recorded yet (first-ever run) and when the recorded identity
 /// already matches `current`.
 pub fn reconcile_embedding_meta(
-    conn: &Connection,
+    store: &Store<'_>,
     current: &EmbeddingIdentity,
 ) -> SqlResult<Option<EmbeddingMismatch>> {
-    let Some(mismatch) = embedding_mismatch_info(conn, current)? else {
+    let Some(mismatch) = embedding_mismatch_info(store, current)? else {
         return Ok(None);
     };
-    Vectors::new(conn).clear()?;
+    Vectors::new(store).clear()?;
     Ok(Some(mismatch))
 }

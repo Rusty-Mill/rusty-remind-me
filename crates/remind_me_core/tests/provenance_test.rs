@@ -21,12 +21,13 @@
 #[path = "../src/test_env.rs"]
 mod test_env;
 
+use remind_me_core::db::Store;
 use remind_me_core::sync::{
     configured_client, memory_provenance, set_handshake_client, CLIENT_ENV, DEFAULT_CLIENT,
     NODE_ID_ENV,
 };
 use remind_me_core::{db::queries, Database};
-use rusqlite::{params, Connection};
+use rusqlite::params;
 use std::sync::Mutex;
 
 /// `REMIND_ME_CLIENT`, `REMIND_ME_NODE_ID` and the handshake slot are all
@@ -64,8 +65,10 @@ fn db(name: &str) -> Database {
 
 /// Every non-deleted memory's `(node_id, client)`, so a path that writes more
 /// than one row (a capture writes two) cannot pass by having only one right.
-fn stamps(conn: &Connection) -> Vec<(Option<String>, String)> {
-    let mut stmt = conn
+fn stamps(store: &Store<'_>) -> Vec<(Option<String>, String)> {
+    let mut stmt = store
+        .sqlite()
+        .unwrap()
         .prepare("SELECT node_id, client FROM memories ORDER BY rowid")
         .unwrap();
     let rows = stmt
@@ -76,8 +79,8 @@ fn stamps(conn: &Connection) -> Vec<(Option<String>, String)> {
     rows
 }
 
-fn assert_all_stamped(conn: &Connection, path: &str, expected_rows: usize) {
-    let rows = stamps(conn);
+fn assert_all_stamped(store: &Store<'_>, path: &str, expected_rows: usize) {
+    let rows = stamps(store);
     assert_eq!(
         rows.len(),
         expected_rows,
@@ -104,17 +107,17 @@ fn add_memory_stamps_both() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _ident = Ident::set();
     let db = db("add");
-    let conn = db.conn();
+    let store = db.store();
 
     queries::add_memory(
-        &conn,
+        &store,
         serde_json::from_value(serde_json::json!({ "content": "a quokka fact" })).unwrap(),
     )
     .unwrap();
 
     // The one path that was already correct; asserted so a refactor that
     // routes everything through the new helper cannot regress it unnoticed.
-    assert_all_stamped(&conn, "add_memory", 1);
+    assert_all_stamped(&store, "add_memory", 1);
 }
 
 #[test]
@@ -122,10 +125,10 @@ fn auto_capture_stamps_both_halves() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _ident = Ident::set();
     let db = db("capture");
-    let conn = db.conn();
+    let store = db.store();
 
     remind_me_core::capture::auto_capture(
-        &conn,
+        &store,
         &serde_json::from_value(serde_json::json!({
             "conversation": "user: hello\nassistant: hi",
             "summary": "a greeting",
@@ -135,7 +138,7 @@ fn auto_capture_stamps_both_halves() {
     .unwrap();
 
     // Two rows: the verbatim dialog and the summary.
-    assert_all_stamped(&conn, "auto_capture", 2);
+    assert_all_stamped(&store, "auto_capture", 2);
 }
 
 #[test]
@@ -143,10 +146,10 @@ fn decomposed_facts_are_stamped() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _ident = Ident::set();
     let db = db("decompose");
-    let conn = db.conn();
+    let store = db.store();
 
     let capture = remind_me_core::capture::auto_capture(
-        &conn,
+        &store,
         &serde_json::from_value(serde_json::json!({
             "conversation": "user: I prefer Rust\nassistant: noted",
             "summary": "language preference",
@@ -156,7 +159,7 @@ fn decomposed_facts_are_stamped() {
     .unwrap();
 
     remind_me_core::capture::decompose(
-        &conn,
+        &store,
         &serde_json::from_value(serde_json::json!({
             "capture_id": capture.capture_id,
             "facts": [{ "content": "Prefers Rust." }],
@@ -166,7 +169,7 @@ fn decomposed_facts_are_stamped() {
     .unwrap();
 
     // Two capture halves plus the one fact.
-    assert_all_stamped(&conn, "decompose", 3);
+    assert_all_stamped(&store, "decompose", 3);
 }
 
 #[test]
@@ -174,19 +177,22 @@ fn a_promoted_memory_is_stamped() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _ident = Ident::set();
     let db = db("promote");
-    let conn = db.conn();
+    let store = db.store();
 
     let now = chrono::Utc::now().to_rfc3339();
-    conn.execute(
-        "INSERT INTO memories (id, content, category, tags, source, metadata,
+    store
+        .sqlite()
+        .unwrap()
+        .execute(
+            "INSERT INTO memories (id, content, category, tags, source, metadata,
             created_at, updated_at, vitality, node_id, client)
          VALUES ('mem_src', 'scenario source', 'scenario', '[]', 'manual', '{}', ?, ?, 1.0, ?, ?)",
-        params![now, now, TEST_NODE, TEST_CLIENT],
-    )
-    .unwrap();
+            params![now, now, TEST_NODE, TEST_CLIENT],
+        )
+        .unwrap();
 
     remind_me_core::promotion::promote(
-        &conn,
+        &store,
         &serde_json::from_value(serde_json::json!({
             "rung": "scenario_to_persona",
             "source_ids": ["mem_src"],
@@ -196,7 +202,7 @@ fn a_promoted_memory_is_stamped() {
     )
     .unwrap();
 
-    assert_all_stamped(&conn, "promote", 2);
+    assert_all_stamped(&store, "promote", 2);
 }
 
 #[test]
@@ -204,10 +210,10 @@ fn a_skeleton_is_stamped() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _ident = Ident::set();
     let db = db("skeleton");
-    let conn = db.conn();
+    let store = db.store();
 
     let capture = remind_me_core::capture::auto_capture(
-        &conn,
+        &store,
         &serde_json::from_value(serde_json::json!({
             "conversation": "user: one\nassistant: two\nuser: three",
             "summary": "a short exchange",
@@ -217,7 +223,7 @@ fn a_skeleton_is_stamped() {
     .unwrap();
 
     remind_me_core::skeleton::write_skeleton(
-        &conn,
+        &store,
         &serde_json::from_value(serde_json::json!({
             "capture_id": capture.capture_id,
             "mermaid": "graph TD\n  n1[opening]",
@@ -228,7 +234,7 @@ fn a_skeleton_is_stamped() {
     .unwrap();
 
     // Two capture halves plus the skeleton.
-    assert_all_stamped(&conn, "skeleton", 3);
+    assert_all_stamped(&store, "skeleton", 3);
 }
 
 #[test]
@@ -278,10 +284,10 @@ fn a_normalized_memory_is_stamped() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _ident = Ident::set();
     let db = db("normalize");
-    let conn = db.conn();
+    let store = db.store();
 
     let raw = queries::add_memory(
-        &conn,
+        &store,
         serde_json::from_value(serde_json::json!({
             "content": "a long raw import chunk about quokkas",
         }))
@@ -290,7 +296,7 @@ fn a_normalized_memory_is_stamped() {
     .unwrap();
 
     let outcome = remind_me_core::normalize::apply_normalizations(
-        &conn,
+        &store,
         &serde_json::from_value(serde_json::json!({
             "normalizations": [{
                 "memory_id": raw.id,
@@ -308,5 +314,5 @@ fn a_normalized_memory_is_stamped() {
     );
 
     // The raw memory plus its distillation.
-    assert_all_stamped(&conn, "apply_normalizations", 2);
+    assert_all_stamped(&store, "apply_normalizations", 2);
 }

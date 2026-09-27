@@ -26,9 +26,10 @@
 //! expanded search.
 
 use crate::db::related::{CoRetrieved, EntityRelative, Related, Relative};
+use crate::db::Result;
+use crate::db::Store;
 use crate::models::MemorySearchResult;
 use chrono::Utc;
-use rusqlite::{Connection, Result};
 use serde::{Deserialize, Serialize};
 
 /// Maximum items any one expansion returns.
@@ -137,14 +138,14 @@ pub struct MemorySearchResponse {
 /// is the write path's responsibility.
 ///
 /// Returns the number of pairs touched.
-pub fn record_co_retrieval(conn: &Connection, memory_ids: &[String]) -> Result<usize> {
+pub fn record_co_retrieval(store: &Store<'_>, memory_ids: &[String]) -> Result<usize> {
     let ids = &memory_ids[..memory_ids.len().min(CO_RETRIEVAL_PAIR_CAP)];
     if ids.len() < 2 {
         return Ok(0);
     }
 
     let now = Utc::now().to_rfc3339();
-    let related = Related::new(conn);
+    let related = Related::new(store);
     let mut touched = 0;
     for i in 0..ids.len() {
         for j in (i + 1)..ids.len() {
@@ -165,8 +166,8 @@ pub fn record_co_retrieval(conn: &Connection, memory_ids: &[String]) -> Result<u
 /// Inner joins throughout, so a link whose endpoints have not arrived — sync
 /// can deliver them out of order — stays invisible rather than producing a row
 /// with holes in it.
-pub fn expand_via_entities(conn: &Connection, seed_ids: &[String]) -> Result<Vec<RelatedMemory>> {
-    let rows = Related::new(conn).via_entities(seed_ids)?;
+pub fn expand_via_entities(store: &Store<'_>, seed_ids: &[String]) -> Result<Vec<RelatedMemory>> {
+    let rows = Related::new(store).via_entities(seed_ids)?;
 
     // One row per (memory, entity) pair, so the entity names are gathered onto
     // a single item rather than producing the same memory five times.
@@ -213,7 +214,7 @@ pub fn expand_via_entities(conn: &Connection, seed_ids: &[String]) -> Result<Vec
 /// a document, so it has no siblings. On a store with no importers this
 /// returns nothing at all.
 pub fn expand_via_neighbors(
-    conn: &Connection,
+    store: &Store<'_>,
     seeds: &[MemorySearchResult],
 ) -> Result<Vec<RelatedMemory>> {
     let seed_ids: std::collections::HashSet<&str> =
@@ -230,7 +231,7 @@ pub fn expand_via_neighbors(
             _ => continue,
         };
 
-        let rows = Related::new(conn).document_window(
+        let rows = Related::new(store).document_window(
             doc_id,
             chunk_index - NEIGHBOR_WINDOW,
             chunk_index + NEIGHBOR_WINDOW,
@@ -264,10 +265,10 @@ pub fn expand_via_neighbors(
 /// Reads both sides of each association, since a pair is stored once under a
 /// canonical order and either endpoint could be the seed.
 pub fn expand_via_co_retrieval(
-    conn: &Connection,
+    store: &Store<'_>,
     seed_ids: &[String],
 ) -> Result<Vec<RelatedMemory>> {
-    let rows = Related::new(conn).co_retrieved(seed_ids)?;
+    let rows = Related::new(store).co_retrieved(seed_ids)?;
 
     let seeds: std::collections::HashSet<&str> = seed_ids.iter().map(String::as_str).collect();
     let mut seen = std::collections::HashSet::new();

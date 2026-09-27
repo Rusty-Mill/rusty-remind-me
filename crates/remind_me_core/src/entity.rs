@@ -1,9 +1,10 @@
 use crate::db::derived::Origin;
 use crate::db::entities::{Entities, RelationRow};
 use crate::db::memories::Memories;
+use crate::db::Result;
+use crate::db::Store;
 use crate::models::EntityInput;
 use chrono::Utc;
-use rusqlite::{Connection, Result};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,7 +58,7 @@ pub fn entity_id(name: &str) -> String {
 ///
 /// `updated_at` moves only when something actually changed, so a no-op mention
 /// does not churn the row.
-pub fn upsert_entity(conn: &Connection, input: &EntityInput) -> Result<Entity> {
+pub fn upsert_entity(store: &Store<'_>, input: &EntityInput) -> Result<Entity> {
     let now = Utc::now().to_rfc3339();
     let name = input.name.trim();
     let id = entity_id(name);
@@ -75,7 +76,7 @@ pub fn upsert_entity(conn: &Connection, input: &EntityInput) -> Result<Entity> {
     // are one entity. Matching on the `name` column instead is case-sensitive,
     // so a casing variant misses the lookup, tries to insert, and collides on
     // the `entities.id` unique constraint.
-    let entities = Entities::new(conn);
+    let entities = Entities::new(store);
     match entities.get(&id)? {
         None => {
             let entity = Entity {
@@ -105,14 +106,12 @@ pub fn upsert_entity(conn: &Connection, input: &EntityInput) -> Result<Entity> {
         }
     }
 
-    entities
-        .get(&id)?
-        .ok_or(rusqlite::Error::QueryReturnedNoRows)
+    entities.get(&id)?.ok_or(crate::db::StoreError::NotFound)
 }
 
 /// Fetch an entity by its deterministic id.
-pub fn get_entity_by_id(conn: &Connection, id: &str) -> Result<Option<Entity>> {
-    Entities::new(conn).get(id)
+pub fn get_entity_by_id(store: &Store<'_>, id: &str) -> Result<Option<Entity>> {
+    Entities::new(store).get(id)
 }
 
 pub(crate) fn dedup_preserving_order<I: IntoIterator<Item = String>>(items: I) -> Vec<String> {
@@ -127,8 +126,8 @@ pub(crate) fn dedup_preserving_order<I: IntoIterator<Item = String>>(items: I) -
 ///
 /// Insert-or-ignore: mention links are immutable, and re-annotating with the
 /// same entity is a no-op rather than an error.
-pub fn link_memory_entity(conn: &Connection, memory_id: &str, entity_id: &str) -> Result<bool> {
-    Entities::new(conn).link(
+pub fn link_memory_entity(store: &Store<'_>, memory_id: &str, entity_id: &str) -> Result<bool> {
+    Entities::new(store).link(
         memory_id,
         entity_id,
         &Utc::now().to_rfc3339(),
@@ -142,7 +141,7 @@ pub fn link_memory_entity(conn: &Connection, memory_id: &str, entity_id: &str) -
 /// memory are counted as zero. Shared by `add_memory` and `remind_me_annotate`
 /// so both apply mentions identically.
 pub fn apply_entity_mentions(
-    conn: &Connection,
+    store: &Store<'_>,
     memory_id: &str,
     entities: &[EntityInput],
 ) -> Result<usize> {
@@ -151,8 +150,8 @@ pub fn apply_entity_mentions(
         if input.name.trim().is_empty() {
             continue;
         }
-        let entity = upsert_entity(conn, input)?;
-        if link_memory_entity(conn, memory_id, &entity.id)? {
+        let entity = upsert_entity(store, input)?;
+        if link_memory_entity(store, memory_id, &entity.id)? {
             linked += 1;
         }
     }
@@ -164,8 +163,8 @@ pub fn apply_entity_mentions(
 /// Resolves through the derived id rather than matching the `name` column, so
 /// `"tasmania"` finds the entity stored as `"Tasmania"` — the same identity the
 /// id encodes.
-pub fn get_entity_by_name(conn: &Connection, name: &str) -> Result<Option<Entity>> {
-    get_entity_by_id(conn, &entity_id(name))
+pub fn get_entity_by_name(store: &Store<'_>, name: &str) -> Result<Option<Entity>> {
+    get_entity_by_id(store, &entity_id(name))
 }
 
 /// Resolve a name *or alias* to its canonical entity row.
@@ -181,8 +180,8 @@ pub fn get_entity_by_name(conn: &Connection, name: &str) -> Result<Option<Entity
 /// A canonical-name match anywhere in the scan beats an alias match found
 /// earlier, because an alias is a nickname and the canonical name is the thing
 /// itself. That is why the alias hit is held rather than returned immediately.
-pub fn resolve_entity(conn: &Connection, query: &str) -> Result<Option<Entity>> {
-    if let Some(entity) = get_entity_by_id(conn, &entity_id(query))? {
+pub fn resolve_entity(store: &Store<'_>, query: &str) -> Result<Option<Entity>> {
+    if let Some(entity) = get_entity_by_id(store, &entity_id(query))? {
         return Ok(Some(entity));
     }
 
@@ -192,7 +191,7 @@ pub fn resolve_entity(conn: &Connection, query: &str) -> Result<Option<Entity>> 
     }
 
     let mut alias_hit: Option<Entity> = None;
-    for entity in Entities::new(conn).all()? {
+    for entity in Entities::new(store).all()? {
         if normalize_entity_name(&entity.name) == normalized {
             return Ok(Some(entity));
         }
@@ -259,16 +258,16 @@ pub struct EntityProfile {
 /// Returns `None` when the entity is unknown, so a caller can answer with 404
 /// rather than an empty-but-200 profile.
 pub fn entity_profile(
-    conn: &Connection,
+    store: &Store<'_>,
     query: &str,
     limit: usize,
 ) -> Result<Option<EntityProfile>> {
-    let Some(entity) = resolve_entity(conn, query)? else {
+    let Some(entity) = resolve_entity(store, query)? else {
         return Ok(None);
     };
 
     let canonical = normalize_entity_name(&entity.name);
-    let entities = Entities::new(conn);
+    let entities = Entities::new(store);
     let facts = entities.facts_naming(&canonical, limit)?;
     let memories = entities.linked_memories(&entity.id, limit)?;
     let total_linked_memories = entities.linked_memory_count(&entity.id)?;
@@ -309,8 +308,8 @@ pub struct EntityListResult {
 /// There is no MCP-tool equivalent — `remind_me_entity` is lookup-by-name, and
 /// browsing everything by list is specifically a dashboard need — so this is
 /// used only by `GET /api/entities`.
-pub fn list_entities(conn: &Connection, limit: usize, offset: usize) -> Result<EntityListResult> {
-    let repo = Entities::new(conn);
+pub fn list_entities(store: &Store<'_>, limit: usize, offset: usize) -> Result<EntityListResult> {
+    let repo = Entities::new(store);
     let total = repo.count()?;
     let entities = repo.page_by_mentions(limit, offset)?;
 
@@ -366,7 +365,7 @@ pub struct RelationEdge {
 /// returned twice within a single hop when both its endpoints sit in the same
 /// frontier — not to bound the walk.
 pub fn traverse_entities(
-    conn: &Connection,
+    store: &Store<'_>,
     seed_entity_ids: &[String],
     hops: u32,
     relation: Option<&str>,
@@ -383,7 +382,7 @@ pub fn traverse_entities(
             break;
         }
 
-        let found = Entities::new(conn).relations_touching(&frontier, relation, hop)?;
+        let found = Entities::new(store).relations_touching(&frontier, relation, hop)?;
 
         let mut next_frontier = Vec::new();
         for (edge_id, edge) in found {
@@ -425,8 +424,8 @@ pub fn traverse_entities(
 /// whitespace used to be distinct entities. Those are merged rather than left
 /// to collide on the primary key: aliases union, the earliest `created_at`
 /// wins, and a `kind` already set is kept.
-pub fn renormalize_entity_ids(conn: &Connection) -> Result<usize> {
-    let entities = Entities::new(conn);
+pub fn renormalize_entity_ids(store: &Store<'_>) -> Result<usize> {
+    let entities = Entities::new(store);
     let existing = entities.all_oldest_first()?;
 
     let mut rewritten = 0;
@@ -494,10 +493,10 @@ pub struct EntityTraverseResult {
 /// An unresolvable start node is `found: false` with a message, not an error —
 /// "no such entity" is an ordinary answer to this question.
 pub fn traverse_from_name(
-    conn: &Connection,
+    store: &Store<'_>,
     input: &crate::models::EntityTraverseInput,
 ) -> Result<EntityTraverseResult> {
-    let seed = match resolve_entity(conn, &input.name)? {
+    let seed = match resolve_entity(store, &input.name)? {
         Some(entity) => entity,
         None => {
             return Ok(EntityTraverseResult {
@@ -515,7 +514,7 @@ pub fn traverse_from_name(
     let hops = input.hops.clamp(TRAVERSE_HOPS_MIN, TRAVERSE_HOPS_MAX);
     let cap = input.cap.clamp(1, 100);
     let edges = traverse_entities(
-        conn,
+        store,
         std::slice::from_ref(&seed.id),
         hops,
         input.relation.as_deref(),
@@ -588,7 +587,7 @@ pub fn entity_relation_id(
 /// rather than an error. The stored label has its whitespace collapsed, matching
 /// the id's normalisation.
 pub fn upsert_entity_relation(
-    conn: &Connection,
+    store: &Store<'_>,
     subject_entity_id: &str,
     relation: &str,
     object_entity_id: &str,
@@ -596,7 +595,7 @@ pub fn upsert_entity_relation(
     let now = Utc::now().to_rfc3339();
     let id = entity_relation_id(subject_entity_id, relation, object_entity_id);
     let label = relation.split_whitespace().collect::<Vec<_>>().join(" ");
-    Entities::new(conn).insert_relation_or_ignore(
+    Entities::new(store).insert_relation_or_ignore(
         &RelationRow {
             id: &id,
             subject_entity_id,
@@ -622,7 +621,7 @@ pub fn upsert_entity_relation(
 ///
 /// Returns `true` when both sides resolved, whether or not the edge was new.
 pub fn maybe_link_entity_relation(
-    conn: &Connection,
+    store: &Store<'_>,
     subject: Option<&str>,
     predicate: Option<&str>,
     object: Option<&str>,
@@ -635,13 +634,13 @@ pub fn maybe_link_entity_relation(
     }
 
     let (Some(subject_entity), Some(object_entity)) = (
-        resolve_entity(conn, subject)?,
-        resolve_entity(conn, object)?,
+        resolve_entity(store, subject)?,
+        resolve_entity(store, object)?,
     ) else {
         return Ok(false);
     };
 
-    upsert_entity_relation(conn, &subject_entity.id, predicate, &object_entity.id)?;
+    upsert_entity_relation(store, &subject_entity.id, predicate, &object_entity.id)?;
     Ok(true)
 }
 
@@ -672,7 +671,7 @@ pub fn maybe_link_entity_relation(
 /// candidates; the exact comparison happens here, against the same
 /// normalisation the entity graph uses for identity.
 pub fn supersede_contradicting_facts(
-    conn: &Connection,
+    store: &Store<'_>,
     memory_id: &str,
     subject: Option<&str>,
     predicate: Option<&str>,
@@ -689,7 +688,7 @@ pub fn supersede_contradicting_facts(
     let want_predicate = normalize_entity_name(predicate);
     let want_object = normalize_entity_name(object);
 
-    let memories = Memories::new(conn);
+    let memories = Memories::new(store);
     let candidates = memories.live_triples_except(memory_id)?;
 
     let now = Utc::now().to_rfc3339();

@@ -59,10 +59,10 @@
 //! binary.
 
 use crate::db::memories::Memories;
+use crate::db::Store;
 use crate::importer::import_bytes;
 use crate::models::{ImportKind, ImportOutcome};
 use crate::Database;
-use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::VecDeque;
@@ -548,8 +548,8 @@ pub fn validate_payload(payload: &Value) -> std::result::Result<IngestRequest, S
 pub const INGEST_MARKER: &str = "webhook";
 
 /// Stamp `metadata.ingest` on every chunk of an import.
-fn mark_ingest_channel(conn: &Connection, import_id: &str) -> rusqlite::Result<usize> {
-    Memories::new(conn).set_ingest_marker(import_id, INGEST_MARKER)
+fn mark_ingest_channel(store: &Store<'_>, import_id: &str) -> crate::db::Result<usize> {
+    Memories::new(store).set_ingest_marker(import_id, INGEST_MARKER)
 }
 
 /// Import a validated push, and record the outcome in the counters.
@@ -557,10 +557,10 @@ fn mark_ingest_channel(conn: &Connection, import_id: &str) -> rusqlite::Result<u
 /// Returns the HTTP status and the body to send. `422` for a refused import
 /// rather than `400`: the request was well-formed, it was the content that
 /// could not be used.
-fn ingest(conn: &Connection, request: &IngestRequest, counters: &WebhookCounters) -> (u16, Value) {
+fn ingest(store: &Store<'_>, request: &IngestRequest, counters: &WebhookCounters) -> (u16, Value) {
     let mut span = crate::telemetry::maybe_span("webhook.ingest");
     let outcome = import_bytes(
-        conn,
+        store,
         request.content.as_bytes(),
         &request.filename,
         &request.category,
@@ -585,7 +585,7 @@ fn ingest(conn: &Connection, request: &IngestRequest, counters: &WebhookCounters
 
     match &outcome {
         ImportOutcome::Imported { import_id, .. } => {
-            if let Err(e) = mark_ingest_channel(conn, import_id) {
+            if let Err(e) = mark_ingest_channel(store, import_id) {
                 // The memories are already stored and searchable; only the
                 // arrival marker is missing. Recording that as a failed import
                 // would be worse than noting it.
@@ -625,10 +625,10 @@ fn ingest(conn: &Connection, request: &IngestRequest, counters: &WebhookCounters
 pub fn serve_once<S: Read + Write>(
     stream: &mut S,
     config: &WebhookConfig,
-    conn: &Connection,
+    store: &Store<'_>,
     counters: &WebhookCounters,
 ) -> io::Result<()> {
-    serve_once_from(stream, config, conn, counters, "")
+    serve_once_from(stream, config, store, counters, "")
 }
 
 /// [`serve_once`] told who is calling, so the rate limiter can bucket by
@@ -638,7 +638,7 @@ pub fn serve_once<S: Read + Write>(
 pub fn serve_once_from<S: Read + Write>(
     stream: &mut S,
     config: &WebhookConfig,
-    conn: &Connection,
+    store: &Store<'_>,
     counters: &WebhookCounters,
     peer_addr: &str,
 ) -> io::Result<()> {
@@ -742,7 +742,7 @@ pub fn serve_once_from<S: Read + Write>(
         Err(reason) => return write_response(stream, 400, &json!({ "error": reason })),
     };
 
-    let (status, response) = ingest(conn, &request, counters);
+    let (status, response) = ingest(store, &request, counters);
     write_response(stream, status, &response)
 }
 
@@ -789,7 +789,7 @@ impl WebhookServer {
                             let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
                             let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
                             {
-                                let conn = db.conn();
+                                let store = db.store();
                                 // A protocol-level I/O error is the client's
                                 // connection dying, not this server's problem;
                                 // the loop takes the next one.
@@ -800,7 +800,7 @@ impl WebhookServer {
                                 let _ = serve_once_from(
                                     &mut stream,
                                     &config,
-                                    &conn,
+                                    &store,
                                     &thread_counters,
                                     &peer,
                                 );

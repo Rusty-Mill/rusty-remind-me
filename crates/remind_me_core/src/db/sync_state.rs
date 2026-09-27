@@ -9,7 +9,8 @@
 //! Policy stays in [`crate::sync`] too: what a missing cursor means, what the
 //! epoch default means, and when a stamp is best-effort.
 
-use rusqlite::{params, Connection, OptionalExtension, Result};
+use super::{Result, Store};
+use rusqlite::{params, Connection, OptionalExtension};
 
 /// One remote's `sync_log` liveness stamps.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,20 +27,22 @@ pub struct SyncState<'c> {
 }
 
 impl<'c> SyncState<'c> {
-    pub fn new(conn: &'c Connection) -> Self {
+    pub fn new(store: &'c Store<'_>) -> Self {
+        let conn = store.conn();
         Self { conn }
     }
 
     /// `remote_id`'s keyset pull cursor `(last_pull, last_pull_id)`, or `None`
     /// if the remote has no `sync_log` row.
     pub fn pull_cursor(&self, remote_id: &str) -> Result<Option<(String, String)>> {
-        self.conn
+        Ok(self
+            .conn
             .query_row(
                 "SELECT last_pull, last_pull_id FROM sync_log WHERE remote_id = ?",
                 params![remote_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .optional()
+            .optional()?)
     }
 
     /// Store `remote_id`'s keyset pull cursor.
@@ -57,13 +60,14 @@ impl<'c> SyncState<'c> {
     /// `remote_id`'s `hub_seq` pull cursor, or `None` if the remote has no
     /// `sync_log` row.
     pub fn seq_cursor(&self, remote_id: &str) -> Result<Option<i64>> {
-        self.conn
+        Ok(self
+            .conn
             .query_row(
                 "SELECT last_pull_seq FROM sync_log WHERE remote_id = ?",
                 params![remote_id],
                 |row| row.get(0),
             )
-            .optional()
+            .optional()?)
     }
 
     /// Store `remote_id`'s `hub_seq` pull cursor.
@@ -116,13 +120,14 @@ impl<'c> SyncState<'c> {
 
     /// `remote_id`'s `last_pull_at`, or `None` if it has no row.
     pub fn last_pull_at(&self, remote_id: &str) -> Result<Option<String>> {
-        self.conn
+        Ok(self
+            .conn
             .query_row(
                 "SELECT last_pull_at FROM sync_log WHERE remote_id = ?",
                 params![remote_id],
                 |r| r.get(0),
             )
-            .optional()
+            .optional()?)
     }
 
     /// Every remote's liveness stamps, ordered by `remote_id`.
@@ -140,19 +145,21 @@ impl<'c> SyncState<'c> {
                     last_pull_at: r.get(3)?,
                 })
             })?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
     /// The `sync_flags` value under `key`, if set.
     pub fn flag(&self, key: &str) -> Result<Option<String>> {
-        self.conn
+        Ok(self
+            .conn
             .query_row(
                 "SELECT value FROM sync_flags WHERE key = ?",
                 params![key],
                 |r| r.get(0),
             )
-            .optional()
+            .optional()?)
     }
 
     /// Set the `sync_flags` value under `key`.
@@ -186,8 +193,8 @@ mod tests {
     #[test]
     fn cursor_writes_touch_only_their_own_columns() {
         let db = Database::open_in_memory().unwrap();
-        let conn = db.conn();
-        let state = SyncState::new(&conn);
+        let store = db.store();
+        let state = SyncState::new(&store);
         assert_eq!(state.pull_cursor("hub").unwrap(), None);
         assert_eq!(state.seq_cursor("hub").unwrap(), None);
 
@@ -232,8 +239,9 @@ mod tests {
     #[test]
     fn flags_overwrite_and_sends_replace() {
         let db = Database::open_in_memory().unwrap();
-        let conn = db.conn();
-        let state = SyncState::new(&conn);
+        let store = db.store();
+        let conn = store.conn();
+        let state = SyncState::new(&store);
         assert_eq!(state.flag("k").unwrap(), None);
         state.set_flag("k", "1").unwrap();
         state.set_flag("k", "2").unwrap();
@@ -246,7 +254,7 @@ mod tests {
             .unwrap()
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
             .unwrap()
-            .collect::<Result<_>>()
+            .collect::<rusqlite::Result<_>>()
             .unwrap();
         assert_eq!(sent, vec![(1, "t1".into()), (2, "t2".into())]);
     }

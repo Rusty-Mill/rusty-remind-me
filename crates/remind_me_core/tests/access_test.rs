@@ -3,13 +3,13 @@
 
 use chrono::{Duration, Utc};
 use remind_me_core::db::queries;
+use remind_me_core::db::Store;
 use remind_me_core::vitality::{record_accesses, BRIDGE_THRESHOLD};
 use remind_me_core::{Database, MemoryAddInput, MemorySearchInput};
-use rusqlite::Connection;
 
-fn add(conn: &Connection, content: &str, category: &str) -> String {
+fn add(store: &Store<'_>, content: &str, category: &str) -> String {
     queries::add_memory(
-        conn,
+        store,
         MemoryAddInput {
             sensitive: false,
             content: content.to_string(),
@@ -47,8 +47,8 @@ fn input(query: &str) -> MemorySearchInput {
     }
 }
 
-fn search(conn: &Connection, query: &str) -> Vec<String> {
-    queries::search_with_expansions(conn, &input(query))
+fn search(store: &Store<'_>, query: &str) -> Vec<String> {
+    queries::search_with_expansions(store, &input(query))
         .unwrap()
         .memories
         .iter()
@@ -56,74 +56,83 @@ fn search(conn: &Connection, query: &str) -> Vec<String> {
         .collect()
 }
 
-fn access_count(conn: &Connection, id: &str) -> i64 {
-    conn.query_row(
-        "SELECT access_count FROM memories WHERE id = ?",
-        rusqlite::params![id],
-        |r| r.get(0),
-    )
-    .unwrap()
+fn access_count(store: &Store<'_>, id: &str) -> i64 {
+    store
+        .sqlite()
+        .unwrap()
+        .query_row(
+            "SELECT access_count FROM memories WHERE id = ?",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )
+        .unwrap()
 }
 
-fn accessed_at(conn: &Connection, id: &str) -> String {
-    conn.query_row(
-        "SELECT accessed_at FROM memories WHERE id = ?",
-        rusqlite::params![id],
-        |r| r.get(0),
-    )
-    .unwrap()
+fn accessed_at(store: &Store<'_>, id: &str) -> String {
+    store
+        .sqlite()
+        .unwrap()
+        .query_row(
+            "SELECT accessed_at FROM memories WHERE id = ?",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )
+        .unwrap()
 }
 
-fn backdate(conn: &Connection, id: &str, days: i64) {
+fn backdate(store: &Store<'_>, id: &str, days: i64) {
     let when = (Utc::now() - Duration::days(days)).to_rfc3339();
-    conn.execute(
-        "UPDATE memories SET accessed_at = ?, created_at = ? WHERE id = ?",
-        rusqlite::params![when, when, id],
-    )
-    .unwrap();
+    store
+        .sqlite()
+        .unwrap()
+        .execute(
+            "UPDATE memories SET accessed_at = ?, created_at = ? WHERE id = ?",
+            rusqlite::params![when, when, id],
+        )
+        .unwrap();
 }
 
 #[test]
 fn retrieval_increments_the_count_and_moves_the_stamp() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "quokka sighting", "fact");
-    backdate(&conn, &id, 30);
-    let before = accessed_at(&conn, &id);
-    assert_eq!(access_count(&conn, &id), 0);
+    let store = db.store();
+    let id = add(&store, "quokka sighting", "fact");
+    backdate(&store, &id, 30);
+    let before = accessed_at(&store, &id);
+    assert_eq!(access_count(&store, &id), 0);
 
-    search(&conn, "quokka");
+    search(&store, "quokka");
 
-    assert_eq!(access_count(&conn, &id), 1);
-    assert!(accessed_at(&conn, &id) > before);
+    assert_eq!(access_count(&store, &id), 1);
+    assert!(accessed_at(&store, &id) > before);
 }
 
 #[test]
 fn repeated_retrieval_keeps_counting() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "quokka sighting", "fact");
+    let store = db.store();
+    let id = add(&store, "quokka sighting", "fact");
 
     for _ in 0..5 {
-        search(&conn, "quokka");
+        search(&store, "quokka");
     }
 
-    assert_eq!(access_count(&conn, &id), 5);
+    assert_eq!(access_count(&store, &id), 5);
 }
 
 #[test]
 fn a_memory_in_regular_use_outlives_an_abandoned_one() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let used = add(&conn, "quokka in use", "action_item");
-    let abandoned = add(&conn, "quokka abandoned", "action_item");
+    let store = db.store();
+    let used = add(&store, "quokka in use", "action_item");
+    let abandoned = add(&store, "quokka abandoned", "action_item");
     // Both written a month ago; at 0.20 decay that is dormant.
-    backdate(&conn, &used, 30);
-    backdate(&conn, &abandoned, 30);
+    backdate(&store, &used, 30);
+    backdate(&store, &abandoned, 30);
 
     // One of them is retrieved today.
     queries::search_with_expansions(
-        &conn,
+        &store,
         &MemorySearchInput {
             strategy: Default::default(),
             include_sensitive: false,
@@ -135,7 +144,7 @@ fn a_memory_in_regular_use_outlives_an_abandoned_one() {
 
     let mut live = input("quokka");
     live.include_dormant = false;
-    let found: Vec<String> = queries::search_with_expansions(&conn, &live)
+    let found: Vec<String> = queries::search_with_expansions(&store, &live)
         .unwrap()
         .memories
         .iter()
@@ -152,24 +161,26 @@ fn a_memory_in_regular_use_outlives_an_abandoned_one() {
 #[test]
 fn bridge_protection_becomes_reachable() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "quokka sighting", "fact");
+    let store = db.store();
+    let id = add(&store, "quokka sighting", "fact");
 
     for _ in 0..BRIDGE_THRESHOLD {
-        search(&conn, "quokka");
+        search(&store, "quokka");
     }
 
     // Nothing could reach the bridge threshold before — the only test for it
     // set the column by hand.
-    assert_eq!(access_count(&conn, &id), BRIDGE_THRESHOLD);
+    assert_eq!(access_count(&store, &id), BRIDGE_THRESHOLD);
 }
 
 #[test]
 fn the_stored_vitality_reflects_the_new_count() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "quokka sighting", "general");
-    let before: f64 = conn
+    let store = db.store();
+    let id = add(&store, "quokka sighting", "general");
+    let before: f64 = store
+        .sqlite()
+        .unwrap()
         .query_row(
             "SELECT vitality FROM memories WHERE id = ?",
             rusqlite::params![id],
@@ -177,9 +188,11 @@ fn the_stored_vitality_reflects_the_new_count() {
         )
         .unwrap();
 
-    search(&conn, "quokka");
+    search(&store, "quokka");
 
-    let after: f64 = conn
+    let after: f64 = store
+        .sqlite()
+        .unwrap()
         .query_row(
             "SELECT vitality FROM memories WHERE id = ?",
             rusqlite::params![id],
@@ -195,12 +208,14 @@ fn the_stored_vitality_reflects_the_new_count() {
 #[test]
 fn status_is_maintained() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "quokka sighting", "general");
+    let store = db.store();
+    let id = add(&store, "quokka sighting", "general");
 
-    search(&conn, "quokka");
+    search(&store, "quokka");
 
-    let status: String = conn
+    let status: String = store
+        .sqlite()
+        .unwrap()
         .query_row(
             "SELECT status FROM memories WHERE id = ?",
             rusqlite::params![id],
@@ -215,21 +230,21 @@ fn status_is_maintained() {
 #[test]
 fn expansion_results_are_not_recorded() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let seed = add(&conn, "quokka sighting", "fact");
-    let neighbour = add(&conn, "wholly different wording", "fact");
+    let store = db.store();
+    let seed = add(&store, "quokka sighting", "fact");
+    let neighbour = add(&store, "wholly different wording", "fact");
     // Associate them without either being a search hit for the query below.
-    remind_me_core::expansion::record_co_retrieval(&conn, &[seed.clone(), neighbour.clone()])
+    remind_me_core::expansion::record_co_retrieval(&store, &[seed.clone(), neighbour.clone()])
         .unwrap();
 
     let mut expanded = input("quokka");
     expanded.expand_co_retrieval = true;
-    let result = queries::search_with_expansions(&conn, &expanded).unwrap();
+    let result = queries::search_with_expansions(&store, &expanded).unwrap();
     assert_eq!(result.related_via_co_retrieval.unwrap().len(), 1);
 
-    assert_eq!(access_count(&conn, &seed), 1, "a direct hit is recorded");
+    assert_eq!(access_count(&store, &seed), 1, "a direct hit is recorded");
     assert_eq!(
-        access_count(&conn, &neighbour),
+        access_count(&store, &neighbour),
         0,
         "an expansion is a discovery aid, not an answer to the query; \
          recording it would inflate every neighbour on every expanded search"
@@ -239,13 +254,13 @@ fn expansion_results_are_not_recorded() {
 #[test]
 fn a_plain_search_records_nothing() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "quokka sighting", "fact");
+    let store = db.store();
+    let id = add(&store, "quokka sighting", "fact");
 
-    queries::search_memories(&conn, &input("quokka")).unwrap();
+    queries::search_memories(&store, &input("quokka")).unwrap();
 
     assert_eq!(
-        access_count(&conn, &id),
+        access_count(&store, &id),
         0,
         "search_memories is a pure read; the write lives in the wrapper"
     );
@@ -254,28 +269,28 @@ fn a_plain_search_records_nothing() {
 #[test]
 fn unknown_ids_are_skipped() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let real = add(&conn, "quokka sighting", "fact");
+    let store = db.store();
+    let real = add(&store, "quokka sighting", "fact");
 
-    let updated = record_accesses(&conn, &["mem_ghost".to_string(), real.clone()]).unwrap();
+    let updated = record_accesses(&store, &["mem_ghost".to_string(), real.clone()]).unwrap();
 
     assert_eq!(updated, 1);
-    assert_eq!(access_count(&conn, &real), 1);
+    assert_eq!(access_count(&store, &real), 1);
 }
 
 #[test]
 fn recording_nothing_is_a_no_op() {
     let db = Database::open_in_memory().unwrap();
-    assert_eq!(record_accesses(&db.conn(), &[]).unwrap(), 0);
+    assert_eq!(record_accesses(&db.store(), &[]).unwrap(), 0);
 }
 
 #[test]
 fn a_search_that_matches_nothing_records_nothing() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "quokka sighting", "fact");
+    let store = db.store();
+    let id = add(&store, "quokka sighting", "fact");
 
-    assert!(search(&conn, "wombat").is_empty());
+    assert!(search(&store, "wombat").is_empty());
 
-    assert_eq!(access_count(&conn, &id), 0);
+    assert_eq!(access_count(&store, &id), 0);
 }

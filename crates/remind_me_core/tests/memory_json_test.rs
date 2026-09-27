@@ -16,22 +16,26 @@
 //! so it cannot itself drift out of date.
 
 use remind_me_core::db::queries;
+use remind_me_core::db::Store;
 use remind_me_core::{Database, MemoryAddInput};
-use rusqlite::Connection;
 use std::collections::BTreeSet;
 
 /// Every column of `memories`, read from the database the crate actually opens.
-fn schema_columns(conn: &Connection) -> BTreeSet<String> {
-    let mut stmt = conn.prepare("PRAGMA table_info(memories)").unwrap();
+fn schema_columns(store: &Store<'_>) -> BTreeSet<String> {
+    let mut stmt = store
+        .sqlite()
+        .unwrap()
+        .prepare("PRAGMA table_info(memories)")
+        .unwrap();
     stmt.query_map([], |r| r.get::<_, String>(1))
         .unwrap()
         .map(|r| r.unwrap())
         .collect()
 }
 
-fn memory_json_keys(conn: &Connection) -> BTreeSet<String> {
+fn memory_json_keys(store: &Store<'_>) -> BTreeSet<String> {
     let memory = queries::add_memory(
-        conn,
+        store,
         MemoryAddInput {
             content: "a memory to serialise".into(),
             category: "general".into(),
@@ -58,10 +62,10 @@ fn memory_json_keys(conn: &Connection) -> BTreeSet<String> {
 #[test]
 fn the_serialised_memory_covers_every_schema_column() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
-    let columns = schema_columns(&conn);
-    let keys = memory_json_keys(&conn);
+    let columns = schema_columns(&store);
+    let keys = memory_json_keys(&store);
 
     let missing: Vec<_> = columns.difference(&keys).cloned().collect();
     assert!(
@@ -79,10 +83,10 @@ fn the_serialised_memory_invents_no_fields() {
     // could come to depend on that this crate cannot actually populate, and it
     // would put the two implementations out of step just as surely.
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
-    let columns = schema_columns(&conn);
-    let keys = memory_json_keys(&conn);
+    let columns = schema_columns(&store);
+    let keys = memory_json_keys(&store);
 
     let extra: Vec<_> = keys.difference(&columns).cloned().collect();
     assert!(
@@ -97,8 +101,8 @@ fn the_six_fields_that_were_missing_are_present() {
     // someone ever relaxes the schema comparison, this still fails, and the
     // names are what makes the regression legible in a CI log.
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let keys = memory_json_keys(&conn);
+    let store = db.store();
+    let keys = memory_json_keys(&store);
 
     for field in [
         "memory_type",
@@ -121,9 +125,9 @@ fn memory_type_round_trips_through_the_json() {
     // and a client could not see any memory's type at all -- so this asserts
     // the value, not merely the key's presence.
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let memory = queries::add_memory(
-        &conn,
+        &store,
         MemoryAddInput {
             content: "standing reference material".into(),
             category: "general".into(),
@@ -138,13 +142,16 @@ fn memory_type_round_trips_through_the_json() {
         },
     )
     .unwrap();
-    conn.execute(
-        "UPDATE memories SET memory_type = 'reference' WHERE id = ?",
-        [&memory.id],
-    )
-    .unwrap();
+    store
+        .sqlite()
+        .unwrap()
+        .execute(
+            "UPDATE memories SET memory_type = 'reference' WHERE id = ?",
+            [&memory.id],
+        )
+        .unwrap();
 
-    let reread = queries::get_memory_by_id(&conn, &memory.id)
+    let reread = queries::get_memory_by_id(&store, &memory.id)
         .unwrap()
         .unwrap();
     let json = serde_json::to_value(&reread).unwrap();

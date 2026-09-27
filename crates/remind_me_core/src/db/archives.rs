@@ -6,15 +6,17 @@
 //! here. The rules stay there: whether retention is on, where blobs go,
 //! span clamping, the sensitive-memory gate, and pruning by age and size.
 
-use rusqlite::{params, Connection, OptionalExtension, Result};
+use super::{Result, Store};
+use rusqlite::{params, Connection, OptionalExtension};
 
 /// Create both tables and the span index, if absent.
 ///
 /// No foreign key to `chat_imports`. The rows outlive an interrupted import
 /// on purpose, and cleanup needs to read `archive_path` before the row goes:
 /// a cascade would delete the row and orphan the file.
-pub fn ensure_tables(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
+pub fn ensure_tables(store: &Store<'_>) -> Result<()> {
+    let conn = store.conn();
+    Ok(conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS import_archives (
             import_id    TEXT PRIMARY KEY,
             hash         TEXT NOT NULL,
@@ -31,7 +33,7 @@ pub fn ensure_tables(conn: &Connection) -> Result<()> {
          );
          CREATE INDEX IF NOT EXISTS idx_archive_spans_import
             ON import_archive_spans(import_id);",
-    )
+    )?)
 }
 
 /// One archived import.
@@ -61,7 +63,8 @@ pub struct Archives<'c> {
 }
 
 impl<'c> Archives<'c> {
-    pub fn new(conn: &'c Connection) -> Self {
+    pub fn new(store: &'c Store<'_>) -> Self {
+        let conn = store.conn();
         Self { conn }
     }
 
@@ -103,7 +106,8 @@ impl<'c> Archives<'c> {
 
     /// Where `memory_id`'s bytes are, if it has a span in a recorded archive.
     pub fn span_source(&self, memory_id: &str) -> Result<Option<SpanSource>> {
-        self.conn
+        Ok(self
+            .conn
             .query_row(
                 "SELECT s.import_id, s.byte_start, s.byte_end, a.archive_path, a.filename
                    FROM import_archive_spans s
@@ -120,18 +124,19 @@ impl<'c> Archives<'c> {
                     })
                 },
             )
-            .optional()
+            .optional()?)
     }
 
     /// The archive path and content hash recorded for `import_id`.
     pub fn blob_of(&self, import_id: &str) -> Result<Option<(String, String)>> {
-        self.conn
+        Ok(self
+            .conn
             .query_row(
                 "SELECT archive_path, hash FROM import_archives WHERE import_id = ?",
                 params![import_id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
-            .optional()
+            .optional()?)
     }
 
     /// Remove `import_id`'s archive row and spans. The blob is not touched.
@@ -175,7 +180,8 @@ impl<'c> Archives<'c> {
                     archived_at: r.get(5)?,
                 })
             })?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 }
@@ -199,8 +205,8 @@ mod tests {
     #[test]
     fn remove_takes_the_spans_and_leaves_a_shared_blob_counted() {
         let db = Database::open_in_memory().unwrap();
-        let conn = db.conn();
-        let archives = Archives::new(&conn);
+        let store = db.store();
+        let archives = Archives::new(&store);
         archives.record(&row("a", "h", "2026-09-02")).unwrap();
         archives.record(&row("b", "h", "2026-09-01")).unwrap();
         archives.record_span("m1", "a", 0, 5).unwrap();

@@ -10,8 +10,9 @@
 //! against these tables lives here. The rules stay there: chunking,
 //! scoring, the ANN index's staleness test, and the model-change clear.
 
+use super::{Result, Store};
 use rusqlite::types::Value as SqlValue;
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Result};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 
 /// One stored chunk vector.
 #[derive(Debug, Clone, PartialEq)]
@@ -52,7 +53,8 @@ pub struct Vectors<'c> {
 }
 
 impl<'c> Vectors<'c> {
-    pub fn new(conn: &'c Connection) -> Self {
+    pub fn new(store: &'c Store<'_>) -> Self {
+        let conn = store.conn();
         Self { conn }
     }
 
@@ -68,10 +70,10 @@ impl<'c> Vectors<'c> {
 
     /// Delete every chunk of `memory_id`. Returns how many went.
     pub fn delete_for(&self, memory_id: &str) -> Result<usize> {
-        self.conn.execute(
+        Ok(self.conn.execute(
             "DELETE FROM vec_chunks WHERE memory_id = ?",
             params![memory_id],
-        )
+        )?)
     }
 
     /// Delete every chunk of every memory.
@@ -100,9 +102,10 @@ impl<'c> Vectors<'c> {
 
     /// Any one stored embedding, if there is one.
     pub fn any_embedding(&self) -> Result<Option<Vec<u8>>> {
-        self.conn
+        Ok(self
+            .conn
             .query_row("SELECT embedding FROM vec_chunks LIMIT 1", [], |r| r.get(0))
-            .optional()
+            .optional()?)
     }
 
     /// Every stored chunk, in key order.
@@ -117,7 +120,8 @@ impl<'c> Vectors<'c> {
                     embedding: r.get(1)?,
                 })
             })?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
@@ -157,7 +161,8 @@ impl<'c> Vectors<'c> {
                     embedding: r.get(1)?,
                 })
             })?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
@@ -177,7 +182,8 @@ impl<'c> Vectors<'c> {
                     content: row.get(1)?,
                 })
             })?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
@@ -219,7 +225,8 @@ impl<'c> Vectors<'c> {
                     embedding: row.get(8)?,
                 })
             })?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
@@ -230,7 +237,8 @@ impl<'c> Vectors<'c> {
         let mut stmt = self.conn.prepare("SELECT key, value FROM embedding_meta")?;
         let rows = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
@@ -256,8 +264,8 @@ mod tests {
     #[test]
     fn live_chunks_skip_deleted_memories_and_respect_the_narrowing() {
         let db = Database::open_in_memory().unwrap();
-        let conn = db.conn();
-        let memories = Memories::new(&conn);
+        let store = db.store();
+        let memories = Memories::new(&store);
         memories.insert(&NewMemory::new("a", "x", NOW)).unwrap();
         memories
             .insert(&NewMemory {
@@ -265,7 +273,7 @@ mod tests {
                 ..NewMemory::new("gone", "x", NOW)
             })
             .unwrap();
-        let vectors = Vectors::new(&conn);
+        let vectors = Vectors::new(&store);
         vectors.put("a", 0, &[1, 0, 0, 0]).unwrap();
         vectors.put("a", 1, &[2, 0, 0, 0]).unwrap();
         vectors.put("gone", 0, &[3, 0, 0, 0]).unwrap();
@@ -284,11 +292,11 @@ mod tests {
     #[test]
     fn a_memory_with_a_chunk_is_not_unembedded() {
         let db = Database::open_in_memory().unwrap();
-        let conn = db.conn();
-        let memories = Memories::new(&conn);
+        let store = db.store();
+        let memories = Memories::new(&store);
         memories.insert(&NewMemory::new("a", "x", NOW)).unwrap();
         memories.insert(&NewMemory::new("b", "y", NOW)).unwrap();
-        let vectors = Vectors::new(&conn);
+        let vectors = Vectors::new(&store);
         vectors.put("a", 0, &[1, 0, 0, 0]).unwrap();
 
         let missing: Vec<String> = vectors

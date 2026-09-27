@@ -26,8 +26,8 @@
 use super::record::canon_ts;
 use crate::db::derived::Origin;
 use crate::db::entities::{Entities, RelationRow};
+use crate::db::Store;
 use crate::entity::Entity;
-use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -41,8 +41,8 @@ impl std::fmt::Display for GraphApplyError {
     }
 }
 impl std::error::Error for GraphApplyError {}
-impl From<rusqlite::Error> for GraphApplyError {
-    fn from(e: rusqlite::Error) -> Self {
+impl From<crate::db::StoreError> for GraphApplyError {
+    fn from(e: crate::db::StoreError) -> Self {
         Self(e.to_string())
     }
 }
@@ -81,7 +81,7 @@ pub struct EntitySyncRecord {
 /// always union-merges regardless of the winner, and a merge-only change
 /// (the LWW loser's case) does not bump `updated_at`.
 pub fn upsert_entity_record(
-    conn: &Connection,
+    store: &Store<'_>,
     record: &EntitySyncRecord,
 ) -> Result<(), GraphApplyError> {
     if record.id.trim().is_empty()
@@ -95,7 +95,7 @@ pub fn upsert_entity_record(
 
     let updated_at = canon_ts(&record.updated_at);
     let created_at = canon_ts(&record.created_at);
-    let entities = Entities::new(conn);
+    let entities = Entities::new(store);
     let local = entities.sync_view(&record.id)?;
     let incoming_wins = match &local {
         None => true,
@@ -146,7 +146,7 @@ pub struct EntityRelationSyncRecord {
 /// (`entity_relation_id`), so a duplicate arriving twice (any order, from
 /// any node) converges without any conflict resolution needed.
 pub fn upsert_entity_relation_record(
-    conn: &Connection,
+    store: &Store<'_>,
     record: &EntityRelationSyncRecord,
 ) -> Result<(), GraphApplyError> {
     if record.id.trim().is_empty()
@@ -161,7 +161,7 @@ pub fn upsert_entity_relation_record(
 
     let created_at = canon_ts(&record.created_at);
     let updated_at = canon_ts(&record.updated_at);
-    Entities::new(conn).insert_relation_or_ignore(
+    Entities::new(store).insert_relation_or_ignore(
         &RelationRow {
             id: &record.id,
             subject_entity_id: &record.subject_entity_id,
@@ -193,7 +193,7 @@ pub struct LinkSyncRecord {
 /// to every read path's `JOIN` the moment its referent shows up — nothing
 /// here retries or reconciles it later.
 pub fn upsert_link_record(
-    conn: &Connection,
+    store: &Store<'_>,
     record: &LinkSyncRecord,
 ) -> Result<String, GraphApplyError> {
     if record.memory_id.trim().is_empty() || record.entity_id.trim().is_empty() {
@@ -202,7 +202,7 @@ pub fn upsert_link_record(
         ));
     }
 
-    Entities::new(conn).link(
+    Entities::new(store).link(
         &record.memory_id,
         &record.entity_id,
         &canon_ts(&record.created_at),
@@ -220,7 +220,7 @@ pub fn upsert_link_record(
 /// own wire convention exactly (memory payloads carry no discriminator at
 /// all, for backward compatibility with pre-graph-sync peers). Returns the
 /// wire id to report back in `processed_ids`.
-pub fn apply_incoming_record(conn: &Connection, raw: &Value) -> Result<String, GraphApplyError> {
+pub fn apply_incoming_record(store: &Store<'_>, raw: &Value) -> Result<String, GraphApplyError> {
     let record_type = raw
         .get("record_type")
         .and_then(Value::as_str)
@@ -230,27 +230,27 @@ pub fn apply_incoming_record(conn: &Connection, raw: &Value) -> Result<String, G
             let record: super::SyncRecord =
                 serde_json::from_value(raw.clone()).map_err(|e| GraphApplyError(e.to_string()))?;
             let id = record.id.clone();
-            super::upsert_record(conn, &record).map_err(|e| GraphApplyError(e.to_string()))?;
+            super::upsert_record(store, &record).map_err(|e| GraphApplyError(e.to_string()))?;
             Ok(id)
         }
         "entity" => {
             let record: EntitySyncRecord =
                 serde_json::from_value(raw.clone()).map_err(|e| GraphApplyError(e.to_string()))?;
             let id = record.id.clone();
-            upsert_entity_record(conn, &record)?;
+            upsert_entity_record(store, &record)?;
             Ok(id)
         }
         "entity_relation" => {
             let record: EntityRelationSyncRecord =
                 serde_json::from_value(raw.clone()).map_err(|e| GraphApplyError(e.to_string()))?;
             let id = record.id.clone();
-            upsert_entity_relation_record(conn, &record)?;
+            upsert_entity_relation_record(store, &record)?;
             Ok(id)
         }
         "memory_entity" => {
             let record: LinkSyncRecord =
                 serde_json::from_value(raw.clone()).map_err(|e| GraphApplyError(e.to_string()))?;
-            upsert_link_record(conn, &record)
+            upsert_link_record(store, &record)
         }
         other => Err(GraphApplyError(format!("unknown record_type: {other:?}"))),
     }

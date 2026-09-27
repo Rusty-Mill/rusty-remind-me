@@ -39,6 +39,7 @@
 
 use crate::db::imports::ImportLedger;
 use crate::db::memories::{Memories, NewMemory};
+use crate::db::Store;
 use crate::models::{MempalaceImportInput, MEMPALACE_IMPORT_LIMIT_MAX, MEMPALACE_IMPORT_LIMIT_MIN};
 use chrono::Utc;
 use rusqlite::{params, Connection, OpenFlags, Result};
@@ -92,6 +93,8 @@ pub enum MempalaceImportError {
         path: String,
     },
     Sqlite(rusqlite::Error),
+    /// The node's own store failed.
+    Store(crate::db::StoreError),
 }
 
 impl std::fmt::Display for MempalaceImportError {
@@ -107,11 +110,18 @@ impl std::fmt::Display for MempalaceImportError {
                 COLLECTION_NAME, path
             ),
             Self::Sqlite(e) => write!(f, "{}", e),
+            Self::Store(e) => write!(f, "{}", e),
         }
     }
 }
 
 impl std::error::Error for MempalaceImportError {}
+
+impl From<crate::db::StoreError> for MempalaceImportError {
+    fn from(e: crate::db::StoreError) -> Self {
+        Self::Store(e)
+    }
+}
 
 impl From<rusqlite::Error> for MempalaceImportError {
     fn from(e: rusqlite::Error) -> Self {
@@ -294,7 +304,7 @@ pub fn parse_frontmatter(
 /// about reading a flat key/value table requires that, and doing it here avoids
 /// depending on whatever internal query API a given Chroma version exposes.
 pub fn pull_mempalace(
-    conn: &Connection,
+    store: &Store<'_>,
     input: &MempalaceImportInput,
 ) -> std::result::Result<MempalaceImportResult, MempalaceImportError> {
     let store_dir = mempalace_path();
@@ -344,7 +354,7 @@ pub fn pull_mempalace(
 
     let already: std::collections::HashSet<String> = {
         let ids: Vec<&str> = page.iter().map(|d| d.drawer_id.as_str()).collect();
-        ImportLedger::new(conn)
+        ImportLedger::new(store)
             .imported_drawers(&ids)?
             .into_iter()
             .collect()
@@ -368,7 +378,10 @@ pub fn pull_mempalace(
     }
 
     let now = Utc::now().to_rfc3339();
-    let tx = conn.unchecked_transaction()?;
+    // One SQLite transaction for the page; the engine store makes the page
+    // one batch instead (ADR-0023, phase 4).
+    let tx = store.conn().unchecked_transaction()?;
+    let batch = Store::over_sqlite(&tx);
 
     for drawer in &to_import {
         let wing_val = drawer.wing.clone().unwrap_or_default();
@@ -439,7 +452,7 @@ pub fn pull_mempalace(
             "room": room_val,
         });
 
-        Memories::new(&tx).insert_or_ignore(&NewMemory {
+        Memories::new(&batch).insert_or_ignore(&NewMemory {
             category: mem_category,
             tags: mem_tags,
             source: mem_source,
@@ -447,9 +460,10 @@ pub fn pull_mempalace(
             created_at,
             ..NewMemory::new(memory_id.clone(), content, &now)
         })?;
-        ImportLedger::new(&tx).record_mempalace(&drawer.drawer_id, &memory_id, &now)?;
+        ImportLedger::new(&batch).record_mempalace(&drawer.drawer_id, &memory_id, &now)?;
     }
 
+    drop(batch);
     tx.commit()?;
     result.imported = to_import.len();
     Ok(result)

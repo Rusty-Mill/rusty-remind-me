@@ -9,14 +9,14 @@
 //! would read as a confidentiality guarantee.
 
 use remind_me_core::db::queries;
+use remind_me_core::db::Store;
 use remind_me_core::{
     Database, MemoryAddInput, MemoryListInput, MemorySearchInput, MemoryUpdateInput, UpdateOutcome,
 };
-use rusqlite::Connection;
 
-fn add(conn: &Connection, content: &str, sensitive: bool) -> String {
+fn add(store: &Store<'_>, content: &str, sensitive: bool) -> String {
     queries::add_memory(
-        conn,
+        store,
         MemoryAddInput {
             content: content.to_string(),
             category: "general".into(),
@@ -34,9 +34,9 @@ fn add(conn: &Connection, content: &str, sensitive: bool) -> String {
     .id
 }
 
-fn search(conn: &Connection, query: &str, include_sensitive: bool) -> Vec<String> {
+fn search(store: &Store<'_>, query: &str, include_sensitive: bool) -> Vec<String> {
     queries::search_memories(
-        conn,
+        store,
         &MemorySearchInput {
             strategy: Default::default(),
             query: query.to_string(),
@@ -61,9 +61,9 @@ fn search(conn: &Connection, query: &str, include_sensitive: bool) -> Vec<String
     .collect()
 }
 
-fn list(conn: &Connection, include_sensitive: bool) -> (usize, Vec<String>) {
+fn list(store: &Store<'_>, include_sensitive: bool) -> (usize, Vec<String>) {
     let result = queries::list_memories(
-        conn,
+        store,
         &MemoryListInput {
             category: None,
             tags: None,
@@ -81,36 +81,39 @@ fn list(conn: &Connection, include_sensitive: bool) -> (usize, Vec<String>) {
     )
 }
 
-fn stored_flag(conn: &Connection, id: &str) -> i64 {
-    conn.query_row("SELECT sensitive FROM memories WHERE id = ?", [id], |r| {
-        r.get(0)
-    })
-    .unwrap()
+fn stored_flag(store: &Store<'_>, id: &str) -> i64 {
+    store
+        .sqlite()
+        .unwrap()
+        .query_row("SELECT sensitive FROM memories WHERE id = ?", [id], |r| {
+            r.get(0)
+        })
+        .unwrap()
 }
 
 #[test]
 fn a_memory_is_not_sensitive_by_default() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "quokka sighting", false);
+    let store = db.store();
+    let id = add(&store, "quokka sighting", false);
 
     // The whole feature is additive with a false default, so an existing
     // caller that never heard of the flag must see no behaviour change.
-    assert_eq!(stored_flag(&conn, &id), 0);
-    assert_eq!(search(&conn, "quokka", false), vec![id.clone()]);
-    assert_eq!(list(&conn, false).1, vec![id]);
+    assert_eq!(stored_flag(&store, &id), 0);
+    assert_eq!(search(&store, "quokka", false), vec![id.clone()]);
+    assert_eq!(list(&store, false).1, vec![id]);
 }
 
 #[test]
 fn a_sensitive_memory_is_excluded_from_search_by_default() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let ordinary = add(&conn, "quokka sighting at the beach", false);
-    let secret = add(&conn, "quokka sighting, undisclosed location", true);
+    let store = db.store();
+    let ordinary = add(&store, "quokka sighting at the beach", false);
+    let secret = add(&store, "quokka sighting, undisclosed location", true);
 
-    assert_eq!(search(&conn, "quokka", false), vec![ordinary.clone()]);
+    assert_eq!(search(&store, "quokka", false), vec![ordinary.clone()]);
 
-    let mut both = search(&conn, "quokka", true);
+    let mut both = search(&store, "quokka", true);
     both.sort();
     let mut want = vec![ordinary, secret];
     want.sort();
@@ -120,11 +123,11 @@ fn a_sensitive_memory_is_excluded_from_search_by_default() {
 #[test]
 fn a_sensitive_memory_is_excluded_from_list_by_default() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let ordinary = add(&conn, "ordinary", false);
-    add(&conn, "hidden", true);
+    let store = db.store();
+    let ordinary = add(&store, "ordinary", false);
+    add(&store, "hidden", true);
 
-    let (total, ids) = list(&conn, false);
+    let (total, ids) = list(&store, false);
 
     // `total` matters as much as the page: the count is a SQL condition rather
     // than a post-filter precisely so COUNT, LIMIT and OFFSET agree. A total of
@@ -132,18 +135,18 @@ fn a_sensitive_memory_is_excluded_from_list_by_default() {
     assert_eq!(ids, vec![ordinary]);
     assert_eq!(total, 1, "the excluded row must not be counted either");
 
-    assert_eq!(list(&conn, true).0, 2);
+    assert_eq!(list(&store, true).0, 2);
 }
 
 #[test]
 fn the_flag_can_be_set_and_cleared_after_creation() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "quokka sighting", false);
+    let store = db.store();
+    let id = add(&store, "quokka sighting", false);
 
     let update = |sensitive: Option<bool>| {
         queries::update_memory(
-            &conn,
+            &store,
             &MemoryUpdateInput {
                 memory_id: id.clone(),
                 clear_superseded: false,
@@ -158,22 +161,22 @@ fn the_flag_can_be_set_and_cleared_after_creation() {
     };
 
     assert!(matches!(update(Some(true)), UpdateOutcome::Updated(_)));
-    assert_eq!(stored_flag(&conn, &id), 1);
-    assert!(search(&conn, "quokka", false).is_empty());
+    assert_eq!(stored_flag(&store, &id), 1);
+    assert!(search(&store, "quokka", false).is_empty());
 
     assert!(matches!(update(Some(false)), UpdateOutcome::Updated(_)));
-    assert_eq!(stored_flag(&conn, &id), 0);
-    assert_eq!(search(&conn, "quokka", false), vec![id]);
+    assert_eq!(stored_flag(&store, &id), 0);
+    assert_eq!(search(&store, "quokka", false), vec![id]);
 }
 
 #[test]
 fn an_update_that_does_not_mention_the_flag_leaves_it_alone() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "quokka sighting", true);
+    let store = db.store();
+    let id = add(&store, "quokka sighting", true);
 
     queries::update_memory(
-        &conn,
+        &store,
         &MemoryUpdateInput {
             memory_id: id.clone(),
             clear_superseded: false,
@@ -189,18 +192,18 @@ fn an_update_that_does_not_mention_the_flag_leaves_it_alone() {
     // This is why the field is `Option<bool>` and not `bool`. With two states,
     // every content edit would silently unhide the memory — the failure would
     // be invisible until something surfaced that should not have.
-    assert_eq!(stored_flag(&conn, &id), 1);
-    assert!(search(&conn, "quokka", false).is_empty());
+    assert_eq!(stored_flag(&store, &id), 1);
+    assert!(search(&store, "quokka", false).is_empty());
 }
 
 #[test]
 fn an_update_of_only_the_flag_is_not_reported_as_no_fields() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "quokka sighting", false);
+    let store = db.store();
+    let id = add(&store, "quokka sighting", false);
 
     let outcome = queries::update_memory(
-        &conn,
+        &store,
         &MemoryUpdateInput {
             memory_id: id,
             clear_superseded: false,

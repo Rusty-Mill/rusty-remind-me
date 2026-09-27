@@ -5,6 +5,7 @@
 //! anything still in the `-wal` and could capture a torn or partially
 //! checkpointed page while a write is in flight.
 
+use crate::db::Store;
 use chrono::Utc;
 use rusqlite::backup::Backup;
 use rusqlite::Connection;
@@ -26,6 +27,11 @@ pub enum BackupError {
     InMemory,
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
+    #[error(transparent)]
+    Store(#[from] crate::db::StoreError),
+    /// Backups copy the SQLite file, and this store is not one.
+    #[error("this store is not SQLite, so it has no database file to back up")]
+    NotSqlite,
     #[error("{path}: {source}")]
     Io {
         path: PathBuf,
@@ -69,13 +75,13 @@ fn timestamp() -> String {
 }
 
 /// Where the main database lives on disk, or `None` for an in-memory database.
-fn database_path(conn: &Connection) -> rusqlite::Result<Option<PathBuf>> {
-    crate::db::database_path(conn)
+fn database_path(store: &Store<'_>) -> crate::db::Result<Option<PathBuf>> {
+    crate::db::database_path(store)
 }
 
 /// The `backups/` directory beside the database file.
-pub fn backup_dir(conn: &Connection) -> Result<PathBuf> {
-    let db_path = database_path(conn)?.ok_or(BackupError::InMemory)?;
+pub fn backup_dir(store: &Store<'_>) -> Result<PathBuf> {
+    let db_path = database_path(store)?.ok_or(BackupError::InMemory)?;
     let parent = db_path.parent().unwrap_or_else(|| Path::new("."));
     Ok(parent.join(BACKUP_DIR_NAME))
 }
@@ -145,8 +151,8 @@ fn prune_old_backups(dir: &Path, keep: usize) -> Result<usize> {
 /// There is deliberately **no caller-supplied destination**: the reference's
 /// tool takes no parameters, and accepting an arbitrary path would hand callers
 /// a write primitive pointed anywhere on disk.
-pub fn create_backup(conn: &Connection, label: &str) -> Result<BackupOutcome> {
-    let dir = backup_dir(conn)?;
+pub fn create_backup(store: &Store<'_>, label: &str) -> Result<BackupOutcome> {
+    let dir = backup_dir(store)?;
     std::fs::create_dir_all(&dir).map_err(|source| BackupError::Io {
         path: dir.clone(),
         source,
@@ -169,7 +175,8 @@ pub fn create_backup(conn: &Connection, label: &str) -> Result<BackupOutcome> {
 
     {
         let mut dest = Connection::open(&dest_path)?;
-        let backup = Backup::new(conn, &mut dest)?;
+        let source = store.sqlite().ok_or(BackupError::NotSqlite)?;
+        let backup = Backup::new(source, &mut dest)?;
         backup.run_to_completion(100, Duration::from_millis(50), None)?;
     }
 

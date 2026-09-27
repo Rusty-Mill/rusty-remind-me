@@ -25,8 +25,9 @@
 use super::{configured_hub_url, configured_node_id, configured_sync_secret, sync_enabled};
 use crate::db::outbox::Outbox;
 use crate::db::sync_state::{RemoteLog, SyncState};
+use crate::db::Result;
+use crate::db::Store;
 use crate::models::{DrainVerdict, OutboxStatus, RemoteStatus, SyncStatus, TombstoneStatus};
-use rusqlite::{Connection, Result};
 
 /// What a never-contacted remote's timestamps read as. Not NULL — the columns
 /// are `NOT NULL DEFAULT` this — so "never" has to be recognised by value.
@@ -36,15 +37,15 @@ const EPOCH: &str = "1970-01-01T00:00:00+00:00";
 /// computed across calls.
 const DRAIN_FLAG_KEY: &str = "sync_status_last_observation";
 
-fn pending_to_remote(conn: &Connection, remote_id: &str) -> Result<(i64, Option<String>)> {
-    Outbox::new(conn).pending_for(remote_id)
+fn pending_to_remote(store: &Store<'_>, remote_id: &str) -> Result<(i64, Option<String>)> {
+    Outbox::new(store).pending_for(remote_id)
 }
 
 /// Read the previous observation, compute a direction, and record the current
 /// one for next time.
-fn drain(conn: &Connection, pending: i64) -> Result<(DrainVerdict, Option<f64>)> {
+fn drain(store: &Store<'_>, pending: i64) -> Result<(DrainVerdict, Option<f64>)> {
     let now = chrono::Utc::now();
-    let state = SyncState::new(conn);
+    let state = SyncState::new(store);
     let previous = state.flag(DRAIN_FLAG_KEY)?;
     state.set_flag(DRAIN_FLAG_KEY, &format!("{}|{}", now.to_rfc3339(), pending))?;
 
@@ -92,7 +93,7 @@ fn drain(conn: &Connection, pending: i64) -> Result<(DrainVerdict, Option<f64>)>
 }
 
 /// A full sync status snapshot.
-pub fn sync_status(conn: &Connection) -> Result<SyncStatus> {
+pub fn sync_status(store: &Store<'_>) -> Result<SyncStatus> {
     if !sync_enabled() {
         let mut missing = Vec::new();
         if configured_node_id().is_empty() {
@@ -116,18 +117,18 @@ pub fn sync_status(conn: &Connection) -> Result<SyncStatus> {
         });
     }
 
-    let (pending, oldest_pending) = pending_to_remote(conn, super::HUB_REMOTE_ID)?;
-    let total = Outbox::new(conn).len()?;
-    let (verdict, per_minute) = drain(conn, pending)?;
+    let (pending, oldest_pending) = pending_to_remote(store, super::HUB_REMOTE_ID)?;
+    let total = Outbox::new(store).len()?;
+    let (verdict, per_minute) = drain(store, pending)?;
 
-    let stats = crate::db::stats::StoreStats::new(conn);
+    let stats = crate::db::stats::StoreStats::new(store);
     let (_, tombstones) = stats.memory_totals()?;
     let cutoff = (chrono::Utc::now()
         - chrono::Duration::days(super::DEFAULT_OUTBOX_RETENTION_DAYS))
     .to_rfc3339();
     let compactable = stats.tombstones_before(&cutoff)?;
 
-    let rows = SyncState::new(conn).remotes()?;
+    let rows = SyncState::new(store).remotes()?;
 
     // Per-table graph cursors (`"{remote}#entities"`, `"…#links"`,
     // `"…#entity_relations"`) never get their own push -- `sync_with_remote`
@@ -151,9 +152,9 @@ pub fn sync_status(conn: &Connection) -> Result<SyncStatus> {
             None => remote_id.as_str(),
         };
         let (pending, last_push_at) = if base_id == remote_id {
-            (pending_to_remote(conn, remote_id)?.0, last_push_at.clone())
+            (pending_to_remote(store, remote_id)?.0, last_push_at.clone())
         } else {
-            let (pending, _) = pending_to_remote(conn, base_id)?;
+            let (pending, _) = pending_to_remote(store, base_id)?;
             let push_at = rows
                 .iter()
                 .find(|log| log.remote_id == base_id)
@@ -203,12 +204,12 @@ pub fn sync_status(conn: &Connection) -> Result<SyncStatus> {
 ///
 /// Returns whether a row existed to reset. A remote that was never contacted
 /// has nothing to repair, and saying so beats silently reporting success.
-pub fn sync_repair(conn: &Connection, remote_id: &str) -> Result<bool> {
+pub fn sync_repair(store: &Store<'_>, remote_id: &str) -> Result<bool> {
     // Back to SEQ_UNKNOWN, not to 0: this must also undo a stuck
     // SEQ_UNSUPPORTED, which is how a hub upgraded past the `hub_seq`
     // feature gets picked up. Resetting to 0 would instead assert support
     // that was never established, and a remote that genuinely lacks it
     // would then be pulled with a cursor it ignores — silently back on the
     // legacy path with no record of why.
-    SyncState::new(conn).reset_pull_cursors(remote_id, EPOCH, super::pull::SEQ_UNKNOWN)
+    SyncState::new(store).reset_pull_cursors(remote_id, EPOCH, super::pull::SEQ_UNKNOWN)
 }

@@ -5,10 +5,11 @@
 //! [`crate::reminders`] and [`crate::scheduler`]: what a valid `remind_at`
 //! is, that a reminder must be in the future, and when a delivery counts.
 
+use super::{Result, Store};
 use crate::db::derived::{write_memory, Origin};
 use crate::db::queries::{parse_memory_row, prefixed_memory_columns};
 use crate::models::{Memory, ReminderWindow};
-use rusqlite::{params, Connection, OptionalExtension, Result};
+use rusqlite::{params, Connection, OptionalExtension};
 
 /// The reminder columns and tables, over one connection.
 pub struct Reminders<'c> {
@@ -16,7 +17,8 @@ pub struct Reminders<'c> {
 }
 
 impl<'c> Reminders<'c> {
-    pub fn new(conn: &'c Connection) -> Self {
+    pub fn new(store: &'c Store<'_>) -> Self {
+        let conn = store.conn();
         Self { conn }
     }
 
@@ -43,10 +45,10 @@ impl<'c> Reminders<'c> {
         updated_at: &str,
     ) -> Result<()> {
         write_memory(self.conn, memory_id, Origin::Local, || {
-            self.conn.execute(
+            Ok(self.conn.execute(
                 "UPDATE memories SET remind_at = ?, updated_at = ? WHERE id = ?",
                 params![remind_at, updated_at, memory_id],
-            )
+            )?)
         })?;
         Ok(())
     }
@@ -82,7 +84,8 @@ impl<'c> Reminders<'c> {
                 rusqlite::params_from_iter(bindings.iter()),
                 parse_memory_row,
             )?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 

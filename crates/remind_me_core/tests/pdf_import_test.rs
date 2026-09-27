@@ -18,10 +18,10 @@ fn availability_matches_the_compiled_feature() {
 #[test]
 fn a_pdf_import_is_refused_for_a_non_pdf_file() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
     let outcome = remind_me_core::importer::import_bytes(
-        &conn,
+        &store,
         b"# not a pdf",
         "notes.md",
         "",
@@ -60,10 +60,10 @@ mod without_the_feature {
     #[test]
     fn importing_a_pdf_fails_loudly_rather_than_succeeding_with_nothing() {
         let db = Database::open_in_memory().unwrap();
-        let conn = db.conn();
+        let store = db.store();
 
         let outcome = remind_me_core::importer::import_bytes(
-            &conn,
+            &store,
             b"%PDF-1.4 whatever",
             "paper.pdf",
             "",
@@ -82,7 +82,9 @@ mod without_the_feature {
         }
 
         // And nothing was stored, so a later search cannot turn up a phantom.
-        let count: i64 = conn
+        let count: i64 = store
+            .sqlite()
+            .unwrap()
             .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0);
@@ -167,10 +169,10 @@ mod with_the_feature {
     #[test]
     fn a_pdf_imports_end_to_end() {
         let db = Database::open_in_memory().unwrap();
-        let conn = db.conn();
+        let store = db.store();
 
         remind_me_core::importer::import_bytes(
-            &conn,
+            &store,
             &one_page_pdf("Imported through the real path"),
             "paper.pdf",
             "",
@@ -181,7 +183,9 @@ mod with_the_feature {
         )
         .unwrap();
 
-        let (content, category, metadata): (String, String, String) = conn
+        let (content, category, metadata): (String, String, String) = store
+            .sqlite()
+            .unwrap()
             .query_row(
                 "SELECT content, category, metadata FROM memories",
                 [],

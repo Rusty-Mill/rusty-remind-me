@@ -7,9 +7,10 @@
 //! [`crate::vitality`], and what makes a memory due for review in
 //! [`crate::recalibrate`], which passes its thresholds in.
 
+use super::{Result, Store};
 use crate::db::derived::{write_memory, Origin};
 use crate::models::RecalibrateCandidate;
-use rusqlite::{params, params_from_iter, Connection, Result};
+use rusqlite::{params, params_from_iter, Connection};
 
 /// The importance columns of a live memory, as a global judgement reads
 /// them before rewriting.
@@ -48,7 +49,8 @@ pub struct Feedback<'c> {
 }
 
 impl<'c> Feedback<'c> {
-    pub fn new(conn: &'c Connection) -> Self {
+    pub fn new(store: &'c Store<'_>) -> Self {
+        let conn = store.conn();
         Self { conn }
     }
 
@@ -79,10 +81,10 @@ impl<'c> Feedback<'c> {
         status: &str,
     ) -> Result<()> {
         write_memory(self.conn, memory_id, Origin::Local, || {
-            self.conn.execute(
+            Ok(self.conn.execute(
                 "UPDATE memories SET base_weight = ?, vitality = ?, status = ? WHERE id = ?",
                 params![base_weight, vitality, status, memory_id],
-            )
+            )?)
         })?;
         Ok(())
     }
@@ -126,18 +128,19 @@ impl<'c> Feedback<'c> {
                     magnitude: row.get(2)?,
                 })
             })?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 
     /// How many memories `filter` makes due for review.
     pub fn review_count(&self, filter: &ReviewFilter<'_>) -> Result<i64> {
         let (predicate, bindings) = review_where(filter);
-        self.conn.query_row(
+        Ok(self.conn.query_row(
             &format!("SELECT COUNT(*) FROM memories m WHERE {predicate}"),
             params_from_iter(bindings.iter()),
             |r| r.get(0),
-        )
+        )?)
     }
 
     /// Up to `limit` memories `filter` makes due for review, heaviest and
@@ -171,7 +174,8 @@ impl<'c> Feedback<'c> {
                     created_at: r.get(7)?,
                 })
             })?
-            .collect();
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::StoreError::from);
         rows
     }
 }
@@ -209,7 +213,8 @@ mod tests {
     #[test]
     fn review_needs_weight_or_a_durable_type_and_no_feedback() {
         let db = Database::open_in_memory().unwrap();
-        let conn = db.conn();
+        let store = db.store();
+        let conn = store.conn();
         let old = "2020-01-01T00:00:00+00:00";
         for (id, weight, kind) in [
             ("heavy", 2.0, "note"),
@@ -223,7 +228,7 @@ mod tests {
             )
             .unwrap();
         }
-        let feedback = Feedback::new(&conn);
+        let feedback = Feedback::new(&store);
         let filter = ReviewFilter {
             min_base_weight: 1.0,
             durable_types: &["fact"],

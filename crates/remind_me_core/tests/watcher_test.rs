@@ -5,12 +5,12 @@
 //! so a timing loop would only make the tests slow and flaky.
 
 use remind_me_core::db::queries;
+use remind_me_core::db::Store;
 use remind_me_core::importer::connectors;
 use remind_me_core::watcher::{
     disabled_status, supersede_import, validate_watch_dirs, ScanCounts, Watcher,
 };
 use remind_me_core::{Database, MemoryListInput};
-use rusqlite::Connection;
 use std::path::PathBuf;
 
 /// A watch directory inside the default import root (the home directory).
@@ -40,9 +40,9 @@ fn write(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
     path
 }
 
-fn live_memories(conn: &Connection) -> Vec<String> {
+fn live_memories(store: &Store<'_>) -> Vec<String> {
     queries::list_memories(
-        conn,
+        store,
         &MemoryListInput {
             include_sensitive: false,
             limit: 100,
@@ -62,15 +62,15 @@ fn live_memories(conn: &Connection) -> Vec<String> {
 #[test]
 fn a_new_file_is_ingested() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let dir = scratch("new");
     write(&dir, "notes.md", "# Notes\n\nalpha");
     let mut w = watcher(&dir);
 
-    let counts = w.scan_once(&conn);
+    let counts = w.scan_once(&store);
 
     assert_eq!(counts.ingested, 1);
-    assert_eq!(live_memories(&conn).len(), 1);
+    assert_eq!(live_memories(&store).len(), 1);
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -78,13 +78,13 @@ fn a_new_file_is_ingested() {
 #[test]
 fn an_unchanged_file_is_not_work_on_the_next_pass() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let dir = scratch("unchanged");
     write(&dir, "notes.md", "# Notes\n\nalpha");
     let mut w = watcher(&dir);
-    w.scan_once(&conn);
+    w.scan_once(&store);
 
-    let second = w.scan_once(&conn);
+    let second = w.scan_once(&store);
 
     // Not ingested, not skipped, not counted at all — an unchanged signature
     // never reaches the importer.
@@ -96,26 +96,26 @@ fn an_unchanged_file_is_not_work_on_the_next_pass() {
 #[test]
 fn an_edited_file_is_re_ingested_and_supersedes_its_previous_import() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let dir = scratch("edited");
     write(&dir, "notes.md", "# Notes\n\noriginal text");
     let mut w = watcher(&dir);
-    w.scan_once(&conn);
+    w.scan_once(&store);
     assert_eq!(
-        live_memories(&conn),
+        live_memories(&store),
         vec!["Notes\n\noriginal text".to_string()]
     );
 
     std::thread::sleep(std::time::Duration::from_millis(1100));
     write(&dir, "notes.md", "# Notes\n\nrevised text");
-    let counts = w.scan_once(&conn);
+    let counts = w.scan_once(&store);
 
     assert_eq!(counts.ingested, 1);
     assert_eq!(counts.superseded, 1);
     // The old chunk stays in the database for audit but drops out of every
     // read path, so a stale version does not keep matching searches.
     assert_eq!(
-        live_memories(&conn),
+        live_memories(&store),
         vec!["Notes\n\nrevised text".to_string()]
     );
 
@@ -125,24 +125,29 @@ fn an_edited_file_is_re_ingested_and_supersedes_its_previous_import() {
 #[test]
 fn supersession_leaves_a_deleted_memory_alone() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    conn.execute(
-        "INSERT INTO memories (id, content, category, tags, source, metadata,
+    let store = db.store();
+    store
+        .sqlite()
+        .unwrap()
+        .execute(
+            "INSERT INTO memories (id, content, category, tags, source, metadata,
                                created_at, updated_at, deleted_at)
          VALUES ('mem_gone', 'removed on purpose', 'general', '[]', 'document_import',
                  '{\"import_id\": \"imp_old\"}', '2026-01-01T00:00:00Z',
                  '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z')",
-        [],
-    )
-    .unwrap();
+            [],
+        )
+        .unwrap();
 
-    let superseded = supersede_import(&conn, "imp_old", "imp_new").unwrap();
+    let superseded = supersede_import(&store, "imp_old", "imp_new").unwrap();
 
     // Re-importing a changed file must not touch a memory the user explicitly
     // deleted — superseding it would be a silent write to a record they had
     // already decided about.
     assert_eq!(superseded, 0);
-    let still_deleted: Option<String> = conn
+    let still_deleted: Option<String> = store
+        .sqlite()
+        .unwrap()
         .query_row(
             "SELECT superseded_by FROM memories WHERE id = 'mem_gone'",
             [],
@@ -155,23 +160,23 @@ fn supersession_leaves_a_deleted_memory_alone() {
 #[test]
 fn a_file_absent_for_n_scans_is_evicted_from_imports_and_no_longer_supersedes() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let dir = scratch("evicted");
     let path = write(&dir, "notes.md", "# Notes\n\noriginal text");
     // A short threshold so the test does not need a thousand scans.
     let mut w = Watcher::new(vec![dir.clone()], Vec::new())
         .with_grace(0)
         .with_imports_stale_after_scans(3);
-    w.scan_once(&conn);
+    w.scan_once(&store);
     assert_eq!(
-        live_memories(&conn),
+        live_memories(&store),
         vec!["Notes\n\noriginal text".to_string()]
     );
 
     // Delete the file and scan past the eviction threshold.
     std::fs::remove_file(&path).unwrap();
     for _ in 0..3 {
-        let counts = w.scan_once(&conn);
+        let counts = w.scan_once(&store);
         assert_eq!(
             counts,
             ScanCounts::default(),
@@ -183,14 +188,14 @@ fn a_file_absent_for_n_scans_is_evicted_from_imports_and_no_longer_supersedes() 
     // so this is a fresh import rather than a supersession: both versions
     // stay live rather than the old one being marked superseded.
     write(&dir, "notes.md", "# Notes\n\nrevised text after eviction");
-    let counts = w.scan_once(&conn);
+    let counts = w.scan_once(&store);
 
     assert_eq!(counts.ingested, 1);
     assert_eq!(
         counts.superseded, 0,
         "the evicted entry must not still supersede its old import"
     );
-    let mut memories = live_memories(&conn);
+    let mut memories = live_memories(&store);
     memories.sort();
     let mut expected = vec![
         "Notes\n\noriginal text".to_string(),
@@ -205,22 +210,22 @@ fn a_file_absent_for_n_scans_is_evicted_from_imports_and_no_longer_supersedes() 
 #[test]
 fn a_file_absent_for_fewer_than_n_scans_still_supersedes_on_return() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let dir = scratch("not_evicted");
     let path = write(&dir, "notes.md", "# Notes\n\noriginal text");
     let mut w = Watcher::new(vec![dir.clone()], Vec::new())
         .with_grace(0)
         .with_imports_stale_after_scans(3);
-    w.scan_once(&conn);
+    w.scan_once(&store);
 
     // Absent for fewer scans than the threshold.
     std::fs::remove_file(&path).unwrap();
-    w.scan_once(&conn);
-    w.scan_once(&conn);
+    w.scan_once(&store);
+    w.scan_once(&store);
 
     // The file returns changed before eviction: it must still supersede.
     write(&dir, "notes.md", "# Notes\n\nrevised text");
-    let counts = w.scan_once(&conn);
+    let counts = w.scan_once(&store);
 
     assert_eq!(counts.ingested, 1);
     assert_eq!(
@@ -228,7 +233,7 @@ fn a_file_absent_for_fewer_than_n_scans_still_supersedes_on_return() {
         "an entry that has not reached the absence threshold keeps its history"
     );
     assert_eq!(
-        live_memories(&conn),
+        live_memories(&store),
         vec!["Notes\n\nrevised text".to_string()]
     );
 
@@ -238,23 +243,23 @@ fn a_file_absent_for_fewer_than_n_scans_still_supersedes_on_return() {
 #[test]
 fn a_file_watched_continuously_never_ages_out_of_imports() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let dir = scratch("continuous");
     write(&dir, "notes.md", "# Notes\n\noriginal text");
     let mut w = Watcher::new(vec![dir.clone()], Vec::new())
         .with_grace(0)
         .with_imports_stale_after_scans(3);
-    w.scan_once(&conn);
+    w.scan_once(&store);
 
     // Many more scans than the eviction threshold, but the file is present
     // (and unchanged) every time, so its `imports` entry is never absent.
     for _ in 0..10 {
-        w.scan_once(&conn);
+        w.scan_once(&store);
     }
 
     std::thread::sleep(std::time::Duration::from_millis(1100));
     write(&dir, "notes.md", "# Notes\n\nrevised after many scans");
-    let counts = w.scan_once(&conn);
+    let counts = w.scan_once(&store);
 
     assert_eq!(counts.ingested, 1);
     assert_eq!(
@@ -268,12 +273,12 @@ fn a_file_watched_continuously_never_ages_out_of_imports() {
 #[test]
 fn a_file_already_imported_by_hand_is_skipped_and_adopted() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let dir = scratch("adopted");
     let path = write(&dir, "notes.md", "# Notes\n\nalpha");
     // Someone imported it directly first — the restart case.
     remind_me_core::importer::import_chat(
-        &conn,
+        &store,
         &remind_me_core::ChatImportInput {
             file_path: path.display().to_string(),
             category: "chat_import".into(),
@@ -286,7 +291,7 @@ fn a_file_already_imported_by_hand_is_skipped_and_adopted() {
     .unwrap();
     let mut w = watcher(&dir);
 
-    let counts = w.scan_once(&conn);
+    let counts = w.scan_once(&store);
     assert_eq!(counts.skipped, 1);
     assert_eq!(counts.ingested, 0);
 
@@ -294,7 +299,7 @@ fn a_file_already_imported_by_hand_is_skipped_and_adopted() {
     // leaving both versions live.
     std::thread::sleep(std::time::Duration::from_millis(1100));
     write(&dir, "notes.md", "# Notes\n\nrevised");
-    let second = w.scan_once(&conn);
+    let second = w.scan_once(&store);
     assert_eq!(second.superseded, 1);
 
     std::fs::remove_dir_all(&dir).unwrap();
@@ -303,14 +308,14 @@ fn a_file_already_imported_by_hand_is_skipped_and_adopted() {
 #[test]
 fn subdirectories_are_scanned_but_hidden_ones_are_not() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let dir = scratch("nested");
     write(&dir, "top.md", "# Top\n\nalpha");
     write(&dir.join("sub"), "deep.md", "# Deep\n\nbeta");
     write(&dir.join(".git"), "config.md", "# Config\n\ngamma");
     let mut w = watcher(&dir);
 
-    let counts = w.scan_once(&conn);
+    let counts = w.scan_once(&store);
 
     assert_eq!(
         counts.ingested, 2,
@@ -323,7 +328,7 @@ fn subdirectories_are_scanned_but_hidden_ones_are_not() {
 #[test]
 fn a_hidden_watch_directory_still_works() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let dir = scratch("hidden")
         .parent()
         .unwrap()
@@ -335,7 +340,7 @@ fn a_hidden_watch_directory_still_works() {
 
     // Hidden is judged relative to the watch root, so watching `~/.notes`
     // works while `.git` inside a watched folder is still skipped.
-    assert_eq!(w.scan_once(&conn).ingested, 1);
+    assert_eq!(w.scan_once(&store).ingested, 1);
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -343,14 +348,14 @@ fn a_hidden_watch_directory_still_works() {
 #[test]
 fn unsupported_files_are_ignored() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let dir = scratch("suffix");
     // Not `.png`: images became a supported format when OCR landed, so a
     // watcher now *does* pick one up. `.exe` is still nothing this reads.
     write(&dir, "installer.exe", "not markdown");
     let mut w = watcher(&dir);
 
-    assert_eq!(w.scan_once(&conn), ScanCounts::default());
+    assert_eq!(w.scan_once(&store), ScanCounts::default());
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -358,13 +363,13 @@ fn unsupported_files_are_ignored() {
 #[test]
 fn a_missing_watch_directory_is_skipped_rather_than_failing() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let absent = PathBuf::from(remind_me_core::import_paths::home_dir_var().unwrap())
         .join("rrm_watch_absent_99999");
     let mut w = Watcher::new(vec![absent], Vec::new()).with_grace(0);
 
     // It may be created later; a scan should not error on its absence.
-    assert_eq!(w.scan_once(&conn), ScanCounts::default());
+    assert_eq!(w.scan_once(&store), ScanCounts::default());
 }
 
 // --- debounce ----------------------------------------------------------------
@@ -372,19 +377,19 @@ fn a_missing_watch_directory_is_skipped_rather_than_failing() {
 #[test]
 fn a_file_still_being_written_is_deferred() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let dir = scratch("debounce");
     write(&dir, "notes.md", "# Notes\n\npartially written");
     // A long grace window makes the file unambiguously "too fresh".
     let mut w = Watcher::new(vec![dir.clone()], Vec::new()).with_grace(3_600);
 
-    let first = w.scan_once(&conn);
+    let first = w.scan_once(&store);
 
     assert_eq!(first.debounced, 1);
     assert_eq!(first.ingested, 0);
     // Ingesting mid-write would store a truncated memory that dedup then pins
     // in place, because its hash is stable and wrong.
-    assert!(live_memories(&conn).is_empty());
+    assert!(live_memories(&store).is_empty());
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -392,14 +397,14 @@ fn a_file_still_being_written_is_deferred() {
 #[test]
 fn a_deferred_file_is_ingested_once_its_signature_settles() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let dir = scratch("settles");
     write(&dir, "notes.md", "# Notes\n\nfinished writing");
     let mut w = Watcher::new(vec![dir.clone()], Vec::new()).with_grace(3_600);
-    assert_eq!(w.scan_once(&conn).debounced, 1);
+    assert_eq!(w.scan_once(&store).debounced, 1);
 
     // A second scan sees the same (mtime, size): the file has stopped moving.
-    let second = w.scan_once(&conn);
+    let second = w.scan_once(&store);
 
     assert_eq!(second.ingested, 1);
     assert_eq!(second.debounced, 0);
@@ -410,15 +415,15 @@ fn a_deferred_file_is_ingested_once_its_signature_settles() {
 #[test]
 fn a_file_that_keeps_changing_keeps_being_deferred() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let dir = scratch("moving");
     write(&dir, "notes.md", "# Notes\n\nfirst");
     let mut w = Watcher::new(vec![dir.clone()], Vec::new()).with_grace(3_600);
-    assert_eq!(w.scan_once(&conn).debounced, 1);
+    assert_eq!(w.scan_once(&store).debounced, 1);
 
     std::thread::sleep(std::time::Duration::from_millis(1100));
     write(&dir, "notes.md", "# Notes\n\nstill being written to");
-    let second = w.scan_once(&conn);
+    let second = w.scan_once(&store);
 
     assert_eq!(second.debounced, 1, "a new signature restarts the wait");
     assert_eq!(second.ingested, 0);
@@ -429,7 +434,7 @@ fn a_file_that_keeps_changing_keeps_being_deferred() {
 #[test]
 fn a_startup_backlog_ingests_immediately() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let dir = scratch("backlog");
     let path = write(&dir, "notes.md", "# Notes\n\nwritten a while ago");
     // Backdate it well past the grace window — the ordinary case on restart.
@@ -437,7 +442,7 @@ fn a_startup_backlog_ingests_immediately() {
     filetime_set(&path, old);
     let mut w = Watcher::new(vec![dir.clone()], Vec::new()).with_grace(60);
 
-    let counts = w.scan_once(&conn);
+    let counts = w.scan_once(&store);
 
     // Only implementing the delay would give a watcher that waits before
     // touching anything at all on every restart.
@@ -501,12 +506,12 @@ fn an_unconfigured_watcher_says_what_to_configure() {
 #[test]
 fn the_status_reports_what_the_scans_did() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let dir = scratch("status");
     write(&dir, "notes.md", "# Notes\n\nalpha");
     let mut w = watcher(&dir);
-    w.scan_once(&conn);
-    w.scan_once(&conn);
+    w.scan_once(&store);
+    w.scan_once(&store);
 
     let status = w.status();
 

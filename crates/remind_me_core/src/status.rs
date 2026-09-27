@@ -32,7 +32,8 @@
 use crate::backup::{backup_dir, list_backups, BackupInfo};
 use crate::db::migrations::SCHEMA_VERSION;
 use crate::db::stats::StoreStats;
-use rusqlite::{Connection, Result};
+use crate::db::Result;
+use crate::db::Store;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -110,8 +111,8 @@ pub struct ServerStatus {
 /// with a reason rather than reported as stopped — shipping a field that reads
 /// "not running" for something that was never built is the hollow-stub failure
 /// mode, and it makes a real outage indistinguishable from an absent feature.
-pub fn server_status(conn: &Connection) -> Result<ServerStatus> {
-    let stats = StoreStats::new(conn);
+pub fn server_status(store: &Store<'_>) -> Result<ServerStatus> {
+    let stats = StoreStats::new(store);
     let info = stats.storage_info()?;
     let database_path: Option<PathBuf> = info.path;
     let database_exists = database_path.as_ref().map(|p| p.exists()).unwrap_or(true); // in-memory: it exists, it just has no file
@@ -125,7 +126,7 @@ pub fn server_status(conn: &Connection) -> Result<ServerStatus> {
 
     // An in-memory database has no directory to hold backups, so this is
     // absent rather than empty.
-    let dir = backup_dir(conn).ok();
+    let dir = backup_dir(store).ok();
     let backups = dir
         .as_ref()
         .and_then(|d| list_backups(d).ok())

@@ -41,18 +41,18 @@
 
 use crate::capture::get_capture;
 use crate::db::memories::{Memories, NewMemory};
+use crate::db::Store;
 use crate::models::{
     Skeleton, SkeletonSlice, SkeletonWriteInput, CAPTURE_SOURCE, SKELETON_CATEGORY,
 };
 use crate::vitality::{calculate_vitality, get_decay_rate, get_source_prior, get_type_prior};
 use chrono::Utc;
-use rusqlite::Connection;
 use std::collections::BTreeMap;
 
 /// Why a skeleton could not be written or read.
 #[derive(Debug)]
 pub enum SkeletonError {
-    Db(rusqlite::Error),
+    Db(crate::db::StoreError),
     /// No memory carries this `capture_id`.
     NoCapture(String),
     /// The capture has no dialog half, so there is nothing for nodes to
@@ -101,8 +101,8 @@ impl std::fmt::Display for SkeletonError {
 
 impl std::error::Error for SkeletonError {}
 
-impl From<rusqlite::Error> for SkeletonError {
-    fn from(e: rusqlite::Error) -> Self {
+impl From<crate::db::StoreError> for SkeletonError {
+    fn from(e: crate::db::StoreError) -> Self {
         Self::Db(e)
     }
 }
@@ -122,14 +122,14 @@ fn dialog_lines(content: &str) -> Vec<&str> {
 /// Replacing rather than appending: a capture has one shape, and a second
 /// skeleton would leave [`read_skeleton`] picking arbitrarily between them.
 pub fn write_skeleton(
-    conn: &Connection,
+    store: &Store<'_>,
     input: &SkeletonWriteInput,
 ) -> Result<Skeleton, SkeletonError> {
     if input.nodes.is_empty() {
         return Err(SkeletonError::NoNodes);
     }
 
-    let capture = get_capture(conn, &input.capture_id)?
+    let capture = get_capture(store, &input.capture_id)?
         .ok_or_else(|| SkeletonError::NoCapture(input.capture_id.clone()))?;
     let dialog = capture
         .dialog
@@ -152,7 +152,7 @@ pub fn write_skeleton(
     }
 
     // Any previous skeleton goes first, so a replace cannot briefly leave two.
-    let memories = Memories::new(conn);
+    let memories = Memories::new(store);
     memories.delete_capture_category(&input.capture_id, SKELETON_CATEGORY)?;
 
     let now_iso = Utc::now().to_rfc3339();
@@ -222,10 +222,10 @@ fn nodes_from_metadata(metadata: &serde_json::Value) -> BTreeMap<String, (usize,
 
 /// A capture's skeleton, or `None` when it has none.
 pub fn read_skeleton(
-    conn: &Connection,
+    store: &Store<'_>,
     capture_id: &str,
 ) -> Result<Option<Skeleton>, SkeletonError> {
-    let Some(capture) = get_capture(conn, capture_id)? else {
+    let Some(capture) = get_capture(store, capture_id)? else {
         return Ok(None);
     };
 
@@ -256,18 +256,18 @@ pub fn read_skeleton(
 /// the caller asked about something that is not there, which is not an error
 /// so much as an empty answer.
 pub fn node_slice(
-    conn: &Connection,
+    store: &Store<'_>,
     capture_id: &str,
     node: &str,
 ) -> Result<Option<SkeletonSlice>, SkeletonError> {
-    let Some(skeleton) = read_skeleton(conn, capture_id)? else {
+    let Some(skeleton) = read_skeleton(store, capture_id)? else {
         return Ok(None);
     };
     let Some(&(start, end)) = skeleton.nodes.get(node) else {
         return Ok(None);
     };
 
-    let capture = get_capture(conn, capture_id)?
+    let capture = get_capture(store, capture_id)?
         .ok_or_else(|| SkeletonError::NoCapture(capture_id.to_string()))?;
     let dialog = capture
         .dialog

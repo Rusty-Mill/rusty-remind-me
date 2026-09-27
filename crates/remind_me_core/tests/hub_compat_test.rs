@@ -24,18 +24,18 @@ mod test_env;
 mod support;
 
 use remind_me_core::db::queries;
+use remind_me_core::db::Store;
 use remind_me_core::sync::{pull_remote, push_outbox, HUB_URL_ENV, NODE_ID_ENV, SYNC_SECRET_ENV};
 use remind_me_core::{Database, MemoryAddInput};
-use rusqlite::Connection;
 use std::sync::Mutex;
 use support::MockHub;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 const SECRET: &str = "real-hub-secret";
 
-fn add(conn: &Connection, content: &str) -> String {
+fn add(store: &Store<'_>, content: &str) -> String {
     queries::add_memory(
-        conn,
+        store,
         MemoryAddInput {
             sensitive: false,
             content: content.to_string(),
@@ -75,18 +75,20 @@ fn a_memory_pushed_to_a_real_hub_is_pulled_back_by_a_second_node() {
     let hub = MockHub::start(SECRET);
 
     let node_a = Database::open_in_memory().unwrap();
-    let node_a_conn = node_a.conn();
+    let node_a_conn = node_a.store();
     add(&node_a_conn, "pushed to the real hub");
 
     let pushed = push_outbox(&node_a_conn, &hub.url, SECRET, "node-a", "hub").unwrap();
     assert_eq!(pushed.pushed, 1, "the real hub must accept the push");
 
     let node_b = Database::open_in_memory().unwrap();
-    let node_b_conn = node_b.conn();
+    let node_b_conn = node_b.store();
     let pulled = pull_remote(&node_b_conn, &hub.url, SECRET, "node-b", "hub").unwrap();
 
     assert_eq!(pulled.applied, 1, "the real hub must serve it back");
     let count: i64 = node_b_conn
+        .sqlite()
+        .unwrap()
         .query_row(
             "SELECT count(*) FROM memories WHERE content = 'pushed to the real hub'",
             [],
@@ -109,7 +111,7 @@ fn a_sensitive_memory_stays_sensitive_after_a_real_hub_round_trip() {
     let hub = MockHub::start(SECRET);
 
     let node_a = Database::open_in_memory().unwrap();
-    let node_a_conn = node_a.conn();
+    let node_a_conn = node_a.store();
     queries::add_memory(
         &node_a_conn,
         MemoryAddInput {
@@ -130,11 +132,13 @@ fn a_sensitive_memory_stays_sensitive_after_a_real_hub_round_trip() {
     push_outbox(&node_a_conn, &hub.url, SECRET, "node-a", "hub").unwrap();
 
     let node_b = Database::open_in_memory().unwrap();
-    let node_b_conn = node_b.conn();
+    let node_b_conn = node_b.store();
     let pulled = pull_remote(&node_b_conn, &hub.url, SECRET, "node-b", "hub").unwrap();
     assert_eq!(pulled.applied, 1);
 
     let sensitive: bool = node_b_conn
+        .sqlite()
+        .unwrap()
         .query_row(
             "SELECT sensitive FROM memories WHERE content = 'sensitive across a real hub'",
             [],
@@ -155,7 +159,7 @@ fn a_second_push_to_a_real_hub_sends_nothing_already_acknowledged() {
     enable_sync("node-a");
     let hub = MockHub::start(SECRET);
     let node_a = Database::open_in_memory().unwrap();
-    let node_a_conn = node_a.conn();
+    let node_a_conn = node_a.store();
     add(&node_a_conn, "content");
 
     push_outbox(&node_a_conn, &hub.url, SECRET, "node-a", "hub").unwrap();
@@ -174,7 +178,7 @@ fn a_real_hub_refuses_a_push_with_the_wrong_secret() {
     enable_sync("node-a");
     let hub = MockHub::start(SECRET);
     let node_a = Database::open_in_memory().unwrap();
-    let node_a_conn = node_a.conn();
+    let node_a_conn = node_a.store();
     add(&node_a_conn, "content");
 
     let err = push_outbox(&node_a_conn, &hub.url, "wrong-secret", "node-a", "hub").unwrap_err();
@@ -187,7 +191,7 @@ fn a_pull_from_a_real_hub_with_nothing_new_applies_nothing() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let hub = MockHub::start(SECRET);
     let node_b = Database::open_in_memory().unwrap();
-    let node_b_conn = node_b.conn();
+    let node_b_conn = node_b.store();
 
     let report = pull_remote(&node_b_conn, &hub.url, SECRET, "node-b", "hub").unwrap();
 

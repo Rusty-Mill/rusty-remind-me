@@ -1,21 +1,21 @@
 //! Coverage for `remind_me_export_memories`.
 
 use remind_me_core::db::queries;
+use remind_me_core::db::Store;
 use remind_me_core::export::{export_memories, validate_export_path, ExportPathError};
 use remind_me_core::{
     Database, EntityInput, ExportFormat, ExportInput, MemoryAddInput, MemoryAnnotation,
 };
-use rusqlite::Connection;
 
 fn add(
-    conn: &Connection,
+    store: &Store<'_>,
     content: &str,
     category: &str,
     tags: &[&str],
     entities: &[&str],
 ) -> String {
     queries::add_memory(
-        conn,
+        store,
         MemoryAddInput {
             sensitive: false,
             content: content.to_string(),
@@ -41,7 +41,7 @@ fn add(
 }
 
 fn export(
-    conn: &Connection,
+    store: &Store<'_>,
     configure: impl FnOnce(&mut ExportInput),
 ) -> remind_me_core::ExportResult {
     let mut input = ExportInput {
@@ -49,7 +49,7 @@ fn export(
         ..Default::default()
     };
     configure(&mut input);
-    export_memories(conn, &input).unwrap()
+    export_memories(store, &input).unwrap()
 }
 
 fn records(result: &remind_me_core::ExportResult) -> Vec<serde_json::Value> {
@@ -75,7 +75,7 @@ fn scratch(name: &str) -> std::path::PathBuf {
 fn an_empty_store_exports_an_empty_array() {
     let db = Database::open_in_memory().unwrap();
 
-    let result = export(&db.conn(), |_| {});
+    let result = export(&db.store(), |_| {});
 
     assert_eq!(result.exported, 0);
     assert_eq!(records(&result).len(), 0);
@@ -84,10 +84,10 @@ fn an_empty_store_exports_an_empty_array() {
 #[test]
 fn every_memory_column_is_exported() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "a memory", "fact", &["tagged"], &[]);
+    let store = db.store();
+    add(&store, "a memory", "fact", &["tagged"], &[]);
 
-    let result = export(&conn, |i| i.include_graph = false);
+    let result = export(&store, |i| i.include_graph = false);
 
     let all = records(&result);
     let memory = &all[0];
@@ -123,11 +123,11 @@ fn every_memory_column_is_exported() {
 #[test]
 fn jsonl_emits_one_record_per_line() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "first", "fact", &[], &[]);
-    add(&conn, "second", "fact", &[], &[]);
+    let store = db.store();
+    add(&store, "first", "fact", &[], &[]);
+    add(&store, "second", "fact", &[], &[]);
 
-    let result = export(&conn, |i| {
+    let result = export(&store, |i| {
         i.format = ExportFormat::Jsonl;
         i.include_graph = false;
     });
@@ -144,11 +144,11 @@ fn jsonl_emits_one_record_per_line() {
 #[test]
 fn the_category_filter_applies() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "a fact", "fact", &[], &[]);
-    add(&conn, "a decision", "decision", &[], &[]);
+    let store = db.store();
+    add(&store, "a fact", "fact", &[], &[]);
+    add(&store, "a decision", "decision", &[], &[]);
 
-    let result = export(&conn, |i| {
+    let result = export(&store, |i| {
         i.category = Some("fact".into());
         i.include_graph = false;
     });
@@ -160,11 +160,11 @@ fn the_category_filter_applies() {
 #[test]
 fn the_tag_filter_is_all_of_not_any_of() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "both tags", "fact", &["alpha", "beta"], &[]);
-    add(&conn, "one tag", "fact", &["alpha"], &[]);
+    let store = db.store();
+    add(&store, "both tags", "fact", &["alpha", "beta"], &[]);
+    add(&store, "one tag", "fact", &["alpha"], &[]);
 
-    let result = export(&conn, |i| {
+    let result = export(&store, |i| {
         i.tags = Some(vec!["alpha".into(), "beta".into()]);
         i.include_graph = false;
     });
@@ -197,16 +197,19 @@ fn the_tag_filter_is_all_of_not_any_of() {
 #[test]
 fn superseded_and_deleted_memories_are_excluded_by_default_and_available_on_request() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let live = add(&conn, "live", "fact", &[], &[]);
-    let old = add(&conn, "replaced", "fact", &[], &[]);
-    conn.execute(
-        "UPDATE memories SET superseded_by = ? WHERE id = ?",
-        rusqlite::params![live, old],
-    )
-    .unwrap();
+    let store = db.store();
+    let live = add(&store, "live", "fact", &[], &[]);
+    let old = add(&store, "replaced", "fact", &[], &[]);
+    store
+        .sqlite()
+        .unwrap()
+        .execute(
+            "UPDATE memories SET superseded_by = ? WHERE id = ?",
+            rusqlite::params![live, old],
+        )
+        .unwrap();
 
-    let default = export(&conn, |i| i.include_graph = false);
+    let default = export(&store, |i| i.include_graph = false);
     assert_eq!(
         default.exported, 1,
         "the superseded memory must not ride along by default -- re-importing \
@@ -215,7 +218,7 @@ fn superseded_and_deleted_memories_are_excluded_by_default_and_available_on_requ
 
     // The completeness the old assertion wanted, now opt-in rather than
     // unavoidable.
-    let full = export(&conn, |i| {
+    let full = export(&store, |i| {
         i.include_graph = false;
         i.include_deleted = true;
     });
@@ -228,10 +231,10 @@ fn superseded_and_deleted_memories_are_excluded_by_default_and_available_on_requ
 #[test]
 fn the_graph_is_included_by_default_and_tagged() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "about Tasmania", "fact", &[], &["Tasmania"]);
+    let store = db.store();
+    add(&store, "about Tasmania", "fact", &[], &["Tasmania"]);
 
-    let result = export(&conn, |_| {});
+    let result = export(&store, |_| {});
 
     let all = records(&result);
     assert_eq!(of_type(&all, "entity").len(), 1);
@@ -244,10 +247,10 @@ fn the_graph_is_included_by_default_and_tagged() {
 #[test]
 fn entities_are_emitted_before_the_links_that_reference_them() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "about Tasmania", "fact", &[], &["Tasmania"]);
+    let store = db.store();
+    add(&store, "about Tasmania", "fact", &[], &["Tasmania"]);
 
-    let all = records(&export(&conn, |_| {}));
+    let all = records(&export(&store, |_| {}));
 
     let entity_at = all
         .iter()
@@ -264,10 +267,10 @@ fn entities_are_emitted_before_the_links_that_reference_them() {
 #[test]
 fn the_graph_can_be_excluded() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "about Tasmania", "fact", &[], &["Tasmania"]);
+    let store = db.store();
+    add(&store, "about Tasmania", "fact", &[], &["Tasmania"]);
 
-    let result = export(&conn, |i| i.include_graph = false);
+    let result = export(&store, |i| i.include_graph = false);
 
     assert!(records(&result)
         .iter()
@@ -278,16 +281,16 @@ fn the_graph_can_be_excluded() {
 #[test]
 fn relations_are_exported() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let id = add(
-        &conn,
+        &store,
         "Bailey lives in Hobart",
         "fact",
         &[],
         &["Bailey", "Hobart"],
     );
     queries::annotate_memories(
-        &conn,
+        &store,
         &remind_me_core::AnnotateInput {
             annotations: vec![MemoryAnnotation {
                 memory_id: id,
@@ -300,7 +303,7 @@ fn relations_are_exported() {
     )
     .unwrap();
 
-    let result = export(&conn, |_| {});
+    let result = export(&store, |_| {});
 
     assert_eq!(result.relations, Some(1));
     let all = records(&result);
@@ -310,11 +313,11 @@ fn relations_are_exported() {
 #[test]
 fn a_filtered_export_scopes_the_graph_to_what_it_reaches() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "kept", "fact", &[], &["Tasmania"]);
-    add(&conn, "dropped", "decision", &[], &["Fiji"]);
+    let store = db.store();
+    add(&store, "kept", "fact", &[], &["Tasmania"]);
+    add(&store, "dropped", "decision", &[], &["Fiji"]);
 
-    let result = export(&conn, |i| i.category = Some("fact".into()));
+    let result = export(&store, |i| i.category = Some("fact".into()));
 
     let all = records(&result);
     let entities = of_type(&all, "entity");
@@ -328,11 +331,11 @@ fn a_filtered_export_scopes_the_graph_to_what_it_reaches() {
 #[test]
 fn a_filtered_export_drops_relations_with_an_endpoint_outside_it() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let kept = add(&conn, "kept", "fact", &[], &["Bailey"]);
-    add(&conn, "dropped", "decision", &[], &["Hobart"]);
+    let store = db.store();
+    let kept = add(&store, "kept", "fact", &[], &["Bailey"]);
+    add(&store, "dropped", "decision", &[], &["Hobart"]);
     queries::annotate_memories(
-        &conn,
+        &store,
         &remind_me_core::AnnotateInput {
             annotations: vec![MemoryAnnotation {
                 memory_id: kept,
@@ -345,9 +348,9 @@ fn a_filtered_export_drops_relations_with_an_endpoint_outside_it() {
     )
     .unwrap();
     // Unfiltered, the edge is exported.
-    assert_eq!(export(&conn, |_| {}).relations, Some(1));
+    assert_eq!(export(&store, |_| {}).relations, Some(1));
 
-    let filtered = export(&conn, |i| i.category = Some("fact".into()));
+    let filtered = export(&store, |i| i.category = Some("fact".into()));
 
     // Hobart is not reachable from the exported set, so the edge would dangle
     // on restore. Both endpoints have to be in scope.
@@ -359,12 +362,12 @@ fn a_filtered_export_drops_relations_with_an_endpoint_outside_it() {
 #[test]
 fn an_export_writes_to_a_file_and_reports_its_size() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "a memory", "fact", &[], &[]);
+    let store = db.store();
+    add(&store, "a memory", "fact", &[], &[]);
     let dir = scratch("write");
     let path = dir.join("export.json");
 
-    let result = export(&conn, |i| {
+    let result = export(&store, |i| {
         i.file_path = Some(path.display().to_string());
         i.include_graph = false;
     });
