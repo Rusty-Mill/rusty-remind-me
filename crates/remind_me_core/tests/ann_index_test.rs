@@ -85,7 +85,7 @@ mod with_the_feature {
     }
 
     /// Store one embedding against a memory, bypassing the embedder.
-    fn embed(store: &Store<'_>, content: &str, vector: &[f32]) -> String {
+    fn embed(store: &remind_me_core::db::Store<'_>, content: &str, vector: &[f32]) -> String {
         let id = remind_me_core::db::queries::add_memory(
             store,
             remind_me_core::MemoryAddInput {
