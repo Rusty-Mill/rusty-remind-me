@@ -1,6 +1,5 @@
 use super::{Result, Store};
-use crate::db::derived::{write_memory, Origin};
-use crate::db::memories::{Memories, NewMemory};
+use crate::db::memories::{ListFilter, Memories, MemoryEdit, NewMemory};
 use crate::expansion::{self, MemorySearchResponse};
 use crate::fts::sanitize_fts_query;
 use crate::models::{
@@ -8,9 +7,9 @@ use crate::models::{
     BulkTagInput, BulkTagResult, ExtractBatchInput, ExtractBatchResult, Memory, MemoryAddInput,
     MemoryListInput, MemoryListResult, MemorySearchInput, MemorySearchResult, MemoryUpdateInput,
     ReclassifyBatchInput, ReclassifyBatchResult, ReclassifyInput, ReclassifyResult,
-    SearchPageInput, SearchPageResult, TagMode, UnannotatedMemory, UnclassifiedMemory,
-    UpdateOutcome, EXTRACT_BATCH_MAX, EXTRACT_BATCH_MIN, LIST_LIMIT_MAX, LIST_LIMIT_MIN,
-    RECLASSIFY_BATCH_MAX, RECLASSIFY_BATCH_MIN, UNCLASSIFIED,
+    SearchPageInput, SearchPageResult, TagMode, UnannotatedMemory, UpdateOutcome,
+    EXTRACT_BATCH_MAX, EXTRACT_BATCH_MIN, LIST_LIMIT_MAX, LIST_LIMIT_MIN, RECLASSIFY_BATCH_MAX,
+    RECLASSIFY_BATCH_MIN, UNCLASSIFIED,
 };
 use crate::retrieval::{
     choose_rrf_weights, rank_rrf, rrf_k_from_env, trim_by_token_budget, RrfConfig, RrfFusion,
@@ -156,60 +155,7 @@ pub fn add_memory(store: &Store<'_>, mut input: MemoryAddInput) -> Result<Memory
 }
 
 pub fn get_memory_by_id(store: &Store<'_>, id: &str) -> Result<Option<Memory>> {
-    let conn = store.conn();
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {} FROM memories WHERE id = ? AND deleted_at IS NULL",
-        MEMORY_COLUMNS
-    ))?;
-
-    let mut rows = stmt.query_map(params![id], parse_memory_row)?;
-    if let Some(row) = rows.next() {
-        Ok(row.map(Some)?)
-    } else {
-        Ok(None)
-    }
-}
-
-/// Build the shared `WHERE` clause and its bindings for [`list_memories`].
-///
-/// Tag matching is ALL-of, one `EXISTS` per requested tag, against the
-/// normalized `memory_tags` index. That table is kept in step with the JSON
-/// `tags` column by every write (`db::derived`), so the two representations
-/// cannot drift.
-///
-/// The predicate stays in SQL rather than filtering parsed rows in Rust, which
-/// is what lets `COUNT`, `LIMIT` and `OFFSET` stay correct — the reference hit
-/// exactly that pagination bug as `DATA-02`. This previously scanned
-/// `json_each(m.tags)` for the same reason, before `memory_tags` existed;
-/// `idx_memory_tags_tag` now serves it without parsing JSON per row.
-fn list_filters(input: &MemoryListInput) -> (String, Vec<Value>) {
-    let mut conditions = vec!["m.deleted_at IS NULL".to_string()];
-    let mut bindings: Vec<Value> = Vec::new();
-
-    // Applied here rather than after the query so `COUNT`, `LIMIT` and
-    // `OFFSET` all agree — the same reason every other filter in this function
-    // is a SQL condition rather than a post-filter.
-    if !input.include_sensitive {
-        conditions.push("m.sensitive = 0".to_string());
-    }
-
-    if let Some(category) = input.category.as_ref().filter(|c| !c.is_empty()) {
-        conditions.push("m.category = ?".to_string());
-        bindings.push(Value::Text(category.clone()));
-    }
-    if let Some(source) = input.source.as_ref().filter(|s| !s.is_empty()) {
-        conditions.push("m.source = ?".to_string());
-        bindings.push(Value::Text(source.clone()));
-    }
-    for tag in input.tags.iter().flatten() {
-        conditions.push(
-            "EXISTS (SELECT 1 FROM memory_tags mt WHERE mt.memory_id = m.id AND mt.tag = ?)"
-                .to_string(),
-        );
-        bindings.push(Value::Text(tag.clone()));
-    }
-
-    (format!("WHERE {}", conditions.join(" AND ")), bindings)
+    Memories::new(store).get_live(id)
 }
 
 /// List memories newest-first, filtered by category, source and/or tags.
@@ -217,36 +163,21 @@ fn list_filters(input: &MemoryListInput) -> (String, Vec<Value>) {
 /// `limit` is clamped to [`LIST_LIMIT_MIN`]..=[`LIST_LIMIT_MAX`]; the clamped
 /// value is echoed back in the result so callers can tell what was applied.
 pub fn list_memories(store: &Store<'_>, input: &MemoryListInput) -> Result<MemoryListResult> {
-    let conn = store.conn();
     let limit = input.limit.clamp(LIST_LIMIT_MIN, LIST_LIMIT_MAX);
-    let (where_clause, bindings) = list_filters(input);
-
-    let total: i64 = conn.query_row(
-        &format!("SELECT count(*) FROM memories m {}", where_clause),
-        params_from_iter(bindings.iter()),
-        |row| row.get(0),
-    )?;
-
-    let sql = format!(
-        "SELECT {} FROM memories m {} ORDER BY m.created_at DESC, m.id DESC LIMIT ? OFFSET ?",
-        MEMORY_COLUMNS, where_clause
-    );
-    let mut page_bindings = bindings;
-    page_bindings.push(Value::Integer(limit as i64));
-    page_bindings.push(Value::Integer(input.offset as i64));
-
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(page_bindings.iter()), parse_memory_row)?;
-
-    let mut memories = Vec::new();
-    for row in rows {
-        memories.push(row?);
-    }
+    // Filters apply before `COUNT`, `LIMIT` and `OFFSET`, so all three agree:
+    // the reference hit exactly that pagination bug as `DATA-02`.
+    let filter = ListFilter {
+        include_sensitive: input.include_sensitive,
+        category: input.category.clone().filter(|c| !c.is_empty()),
+        source: input.source.clone().filter(|s| !s.is_empty()),
+        tags: input.tags.clone().unwrap_or_default(),
+    };
+    let (total, memories) = Memories::new(store).list_page(&filter, limit, input.offset)?;
 
     Ok(MemoryListResult {
         count: memories.len(),
         memories,
-        total: total.max(0) as usize,
+        total,
         limit,
         offset: input.offset,
     })
@@ -264,50 +195,29 @@ pub fn list_memories(store: &Store<'_>, input: &MemoryListInput) -> Result<Memor
 /// `vitality`, `base_weight` and `access_count` are left alone too: they encode
 /// accrued retrieval history, and resetting them on an edit would discard it.
 pub fn update_memory(store: &Store<'_>, input: &MemoryUpdateInput) -> Result<UpdateOutcome> {
-    let conn = store.conn();
     if get_memory_by_id(store, &input.memory_id)?.is_none() {
         return Ok(UpdateOutcome::NotFound);
     }
 
-    let mut sets: Vec<&str> = Vec::new();
-    let mut bindings: Vec<Value> = Vec::new();
-
-    if let Some(content) = &input.content {
-        sets.push("content = ?");
-        bindings.push(Value::Text(content.clone()));
-    }
-    if let Some(category) = &input.category {
-        sets.push("category = ?");
-        bindings.push(Value::Text(category.clone()));
-    }
-    if let Some(tags) = &input.tags {
-        sets.push("tags = ?");
-        bindings.push(Value::Text(
-            serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string()),
-        ));
-    }
-    if let Some(metadata) = &input.metadata {
-        sets.push("metadata = ?");
-        bindings.push(Value::Text(
-            serde_json::to_string(metadata).unwrap_or_else(|_| "{}".to_string()),
-        ));
-    }
-
-    // `Option<bool>` rather than `bool`: `None` means "leave it alone", so an
-    // update that does not mention the flag cannot silently clear it.
-    if let Some(sensitive) = input.sensitive {
-        sets.push("sensitive = ?");
-        bindings.push(Value::Integer(sensitive as i64));
-    }
-
-    // Unconditional NULL rather than a bound parameter: the flag has only one
-    // direction. Re-superseding is `remind_me_add`'s job, on detecting a
-    // contradiction -- it is never something an update asserts directly.
-    if input.clear_superseded {
-        sets.push("superseded_by = NULL");
-    }
-
-    if sets.is_empty() {
+    // `sensitive` is an `Option<bool>`: `None` leaves the flag alone, so an
+    // update that does not mention it cannot silently clear it.
+    // `clear_superseded` has one direction only: re-superseding is
+    // `remind_me_add`'s job, on detecting a contradiction, never something an
+    // update asserts directly.
+    let edit = MemoryEdit {
+        content: input.content.clone(),
+        category: input.category.clone(),
+        tags: input.tags.clone(),
+        metadata: input.metadata.clone(),
+        sensitive: input.sensitive,
+        clear_superseded: input.clear_superseded,
+        ..MemoryEdit::at(Utc::now().to_rfc3339())
+    };
+    let nothing_to_write = MemoryEdit {
+        updated_at: edit.updated_at.clone(),
+        ..MemoryEdit::default()
+    };
+    if edit == nothing_to_write {
         return Ok(UpdateOutcome::NoFields);
     }
 
@@ -334,16 +244,7 @@ pub fn update_memory(store: &Store<'_>, input: &MemoryUpdateInput) -> Result<Upd
     };
     crate::history::capture_revision(store, &input.memory_id, &tracked, None)?;
 
-    sets.push("updated_at = ?");
-    bindings.push(Value::Text(Utc::now().to_rfc3339()));
-    bindings.push(Value::Text(input.memory_id.clone()));
-
-    write_memory(conn, &input.memory_id, Origin::Local, || {
-        Ok(conn.execute(
-            &format!("UPDATE memories SET {} WHERE id = ?", sets.join(", ")),
-            params_from_iter(bindings.iter()),
-        )?)
-    })?;
+    Memories::new(store).apply_edit(&input.memory_id, &edit)?;
 
     // Only a content change invalidates the stored embeddings — category,
     // tags and metadata don't change what the text means. Best-effort, same
@@ -384,40 +285,21 @@ pub fn update_memory(store: &Store<'_>, input: &MemoryUpdateInput) -> Result<Upd
 /// it had added itself; regenerating the schema from `remind_me` removed it.
 pub fn delete_memory(store: &Store<'_>, memory_id: &str) -> Result<bool> {
     let conn = store.conn();
+    let memories = Memories::new(store);
     // The category is read before either delete path: a hard delete removes
     // the row, so after this point there is nothing left to read it from, and
     // the event would have to guess.
-    let category: Option<String> = conn
-        .query_row(
-            "SELECT category FROM memories WHERE id = ? AND deleted_at IS NULL",
-            params![memory_id],
-            |r| r.get(0),
-        )
-        .ok();
-    if category.is_none() {
+    let Some(category) = memories.live_category(memory_id)? else {
         return Ok(false);
-    }
+    };
 
     // A tombstoned memory's embeddings are stale the moment it stops being
     // searchable, same as an incoming sync tombstone's are, so they go on
     // either path.
     crate::vectors::delete_chunks_for_memory(store, memory_id)?;
 
-    let affected = write_memory(conn, memory_id, Origin::Local, || {
-        if crate::sync::sync_enabled() {
-            let now = Utc::now().to_rfc3339();
-            Ok(conn.execute(
-                "UPDATE memories SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL",
-                params![now, now, memory_id],
-            )?)
-        } else {
-            Ok(conn.execute(
-                "DELETE FROM memories WHERE id = ? AND deleted_at IS NULL",
-                params![memory_id],
-            )?)
-        }
-    })?;
-    if affected == 0 {
+    let tombstone_at = crate::sync::sync_enabled().then(|| Utc::now().to_rfc3339());
+    if !memories.delete_live(memory_id, tombstone_at.as_deref())? {
         return Ok(false);
     }
 
@@ -433,11 +315,7 @@ pub fn delete_memory(store: &Store<'_>, memory_id: &str) -> Result<bool> {
         params![memory_id, memory_id],
     )?;
 
-    crate::events::emit(
-        crate::events::Event::Deleted,
-        memory_id,
-        category.as_deref().unwrap_or(""),
-    );
+    crate::events::emit(crate::events::Event::Deleted, memory_id, &category);
 
     Ok(true)
 }
@@ -464,7 +342,7 @@ pub fn bulk_delete(store: &Store<'_>, ids: &[String]) -> Result<BulkDeleteResult
 /// A missing id is recorded in `not_found` and the rest of the batch still
 /// applies, matching [`bulk_delete`]'s per-item error handling.
 pub fn bulk_tag(store: &Store<'_>, input: &BulkTagInput) -> Result<BulkTagResult> {
-    let conn = store.conn();
+    let memories = Memories::new(store);
     let now = Utc::now().to_rfc3339();
     let mut result = BulkTagResult::default();
 
@@ -486,16 +364,13 @@ pub fn bulk_tag(store: &Store<'_>, input: &BulkTagInput) -> Result<BulkTagResult
             ),
         };
 
-        write_memory(conn, id, Origin::Local, || {
-            Ok(conn.execute(
-                "UPDATE memories SET tags = ?, updated_at = ? WHERE id = ?",
-                params![
-                    serde_json::to_string(&new_tags).unwrap_or_else(|_| "[]".to_string()),
-                    now,
-                    id
-                ],
-            )?)
-        })?;
+        memories.apply_edit(
+            id,
+            &MemoryEdit {
+                tags: Some(new_tags),
+                ..MemoryEdit::at(now.as_str())
+            },
+        )?;
         result.updated.push(id.clone());
     }
 
@@ -513,7 +388,7 @@ pub fn bulk_tag(store: &Store<'_>, input: &BulkTagInput) -> Result<BulkTagResult
 /// current value. `updated_at` moves whenever an annotation is applied, even if
 /// it only added entity mentions.
 pub fn annotate_memories(store: &Store<'_>, input: &AnnotateInput) -> Result<AnnotateResult> {
-    let conn = store.conn();
+    let memories = Memories::new(store);
     let now = Utc::now().to_rfc3339();
     let mut results = Vec::new();
     let mut errors = Vec::new();
@@ -527,29 +402,15 @@ pub fn annotate_memories(store: &Store<'_>, input: &AnnotateInput) -> Result<Ann
             continue;
         }
 
-        let mut sets: Vec<&str> = Vec::new();
-        let mut bindings: Vec<Value> = Vec::new();
-        for (column, value) in [
-            ("subject = ?", &annotation.subject),
-            ("predicate = ?", &annotation.predicate),
-            ("object = ?", &annotation.object),
-        ] {
-            if let Some(v) = value {
-                sets.push(column);
-                bindings.push(Value::Text(v.clone()));
-            }
-        }
-
-        sets.push("updated_at = ?");
-        bindings.push(Value::Text(now.clone()));
-        bindings.push(Value::Text(annotation.memory_id.clone()));
-
-        write_memory(conn, &annotation.memory_id, Origin::Local, || {
-            Ok(conn.execute(
-                &format!("UPDATE memories SET {} WHERE id = ?", sets.join(", ")),
-                params_from_iter(bindings.iter()),
-            )?)
-        })?;
+        memories.apply_edit(
+            &annotation.memory_id,
+            &MemoryEdit {
+                subject: annotation.subject.clone(),
+                predicate: annotation.predicate.clone(),
+                object: annotation.object.clone(),
+                ..MemoryEdit::at(now.as_str())
+            },
+        )?;
 
         let entities_linked = crate::entity::apply_entity_mentions(
             store,
@@ -591,7 +452,7 @@ pub fn annotate_memories(store: &Store<'_>, input: &AnnotateInput) -> Result<Ann
 /// Vitality and `base_weight` are untouched; classification says what a memory
 /// *is*, not how much it has been used.
 pub fn reclassify_memories(store: &Store<'_>, input: &ReclassifyInput) -> Result<ReclassifyResult> {
-    let conn = store.conn();
+    let memories = Memories::new(store);
     let now = Utc::now().to_rfc3339();
     let mut updated = 0;
     let mut not_found = Vec::new();
@@ -602,17 +463,14 @@ pub fn reclassify_memories(store: &Store<'_>, input: &ReclassifyInput) -> Result
             continue;
         }
 
-        write_memory(conn, &classification.memory_id, Origin::Local, || {
-            Ok(conn.execute(
-                "UPDATE memories SET memory_type = ?, decay_rate = ?, updated_at = ? WHERE id = ?",
-                params![
-                    classification.memory_type,
-                    get_decay_rate(&classification.memory_type),
-                    now,
-                    classification.memory_id
-                ],
-            )?)
-        })?;
+        memories.apply_edit(
+            &classification.memory_id,
+            &MemoryEdit {
+                memory_type: Some(classification.memory_type.clone()),
+                decay_rate: Some(get_decay_rate(&classification.memory_type)),
+                ..MemoryEdit::at(now.as_str())
+            },
+        )?;
         updated += 1;
     }
 
@@ -631,42 +489,16 @@ pub fn unclassified_batch(
     store: &Store<'_>,
     input: &ReclassifyBatchInput,
 ) -> Result<ReclassifyBatchResult> {
-    let conn = store.conn();
     let batch_size = input
         .batch_size
         .clamp(RECLASSIFY_BATCH_MIN, RECLASSIFY_BATCH_MAX);
 
-    let total_unclassified: i64 = conn.query_row(
-        "SELECT count(*) FROM memories WHERE memory_type = ? AND deleted_at IS NULL",
-        params![UNCLASSIFIED],
-        |r| r.get(0),
-    )?;
-
-    let mut stmt = conn.prepare(
-        "SELECT id, substr(content, 1, 500), category, tags
-           FROM memories
-          WHERE memory_type = ? AND deleted_at IS NULL
-          ORDER BY created_at, id
-          LIMIT ?",
-    )?;
-    let rows = stmt.query_map(params![UNCLASSIFIED, batch_size as i64], |row| {
-        let tags_json: String = row.get(3)?;
-        Ok(UnclassifiedMemory {
-            id: row.get(0)?,
-            content_snippet: row.get(1)?,
-            category: row.get(2)?,
-            tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-        })
-    })?;
-
-    let mut memories = Vec::new();
-    for row in rows {
-        memories.push(row?);
-    }
+    let (total_unclassified, memories) =
+        Memories::new(store).of_type_page(UNCLASSIFIED, batch_size)?;
 
     Ok(ReclassifyBatchResult {
         memories,
-        total_unclassified: total_unclassified.max(0) as usize,
+        total_unclassified,
     })
 }
 

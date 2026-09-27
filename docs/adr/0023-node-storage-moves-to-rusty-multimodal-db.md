@@ -890,8 +890,31 @@ switches it on:
   payloads. Where SQLite leaves an order unspecified (scan order, ties),
   the engine sorts by `created_at`, then id.
 
-**Next:** core PR 2, the reads. The copy tool (§5) comes after the
-switch-on.
+**Core 2a, done: get, list and the field edits on the core.** Core PR 2
+ships in three parts so each stays reviewable: 2a (this), 2b search, 2c
+stats, reminders, feedback and history.
+
+- `queries.rs` no longer speaks SQL about memories for get, list,
+  update, delete, bulk tag, annotate, reclassify and the unclassified
+  batch. Each goes through a new `Memories` method (`get_live`,
+  `live_category`, `list_page` with a `ListFilter`, `apply_edit`,
+  `delete_live`, `of_type_page`), which dispatches to the core when it
+  is present.
+- One `MemoryEdit` carries every field edit: each `Some` field is
+  written and `updated_at` is always stamped. Update, bulk tag, annotate
+  and reclassify each build one, so their `UPDATE`s cannot drift apart.
+- `list_page` keeps the SQL's order, `created_at` text newest first and
+  ties by id descending, with filters before the count and the page.
+  `of_type_page` takes the content's first 500 characters, as `substr`
+  counts them.
+- `unannotated_batch` stays in SQL: it joins `memory_entities`, so it
+  moves with the graph (core PR 3). `update_memory` still records its
+  revision through `history.rs`, which reads memories in SQL, until 2c.
+- A second differential test runs listings (filters, sensitivity,
+  paging), edits, tombstones, hard deletes and the batch read on both
+  backends and requires identical answers.
+
+**Next:** core 2b, search. The copy tool (§5) comes after the switch-on.
 
 ## Related
 

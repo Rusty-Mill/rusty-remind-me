@@ -2,6 +2,17 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-27 — Get, list and field edits on the engine core, built dark (ADR-0023, core PR 2a)
+
+### Added
+- New `Memories` methods: `get_live`, `live_category`, `list_page` with a `ListFilter`, `apply_edit` with a `MemoryEdit`, `delete_live` and `of_type_page`. Each uses the engine's memories core when it is present, and SQLite otherwise.
+
+### Changed
+- These now go through the repository instead of inline SQL: getting, listing, updating, deleting, bulk tagging, annotating and reclassifying memories, and the unclassified batch. Behaviour on SQLite is unchanged. Update, bulk tag, annotate and reclassify share one `MemoryEdit`, so their writes can't drift apart.
+
+### Tests
+- A differential test runs listings, edits, tombstones, hard deletes and the unclassified batch against SQLite and the core, and requires identical answers. It covers filters, sensitivity, paging, tie order and 500-character snippets of multi-byte text.
+
 ## 2026-09-27 — Memory writes on the engine, built dark (ADR-0023, core PR 1)
 
 ### Added

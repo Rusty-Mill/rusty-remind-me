@@ -13,7 +13,7 @@ use super::engine::{self, EngineTables};
 use super::{Result, Store};
 use crate::db::derived::{memory_ids, write_memory, Origin};
 use crate::db::queries::{parse_memory_row, MEMORY_COLUMNS};
-use crate::models::Memory;
+use crate::models::{Memory, UnclassifiedMemory};
 #[cfg(feature = "engine-store")]
 use parking_lot::Mutex;
 use rusqlite::types::Value as SqlValue;
@@ -127,6 +127,84 @@ pub struct CreatedMemory {
     pub category: String,
     pub content: String,
     pub created_at: String,
+}
+
+/// Which memories a listing takes: live ones, of `category` and `source`
+/// when given, carrying every one of `tags`, and sensitive ones only when
+/// asked.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ListFilter {
+    pub include_sensitive: bool,
+    pub category: Option<String>,
+    pub source: Option<String>,
+    pub tags: Vec<String>,
+}
+
+/// An edit to a memory's fields: each `Some` field is written, the rest keep
+/// their value, and `updated_at` is always stamped.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MemoryEdit {
+    pub content: Option<String>,
+    pub category: Option<String>,
+    pub tags: Option<Vec<String>>,
+    pub metadata: Option<Value>,
+    pub sensitive: Option<bool>,
+    /// Clear `superseded_by`. There is no way to set it here: superseding is
+    /// [`Memories::set_superseded_by`]'s job.
+    pub clear_superseded: bool,
+    pub subject: Option<String>,
+    pub predicate: Option<String>,
+    pub object: Option<String>,
+    pub memory_type: Option<String>,
+    pub decay_rate: Option<f64>,
+    pub updated_at: String,
+}
+
+impl MemoryEdit {
+    /// An edit that only stamps `updated_at`; set the fields to write.
+    pub fn at(updated_at: impl Into<String>) -> Self {
+        Self {
+            updated_at: updated_at.into(),
+            ..Self::default()
+        }
+    }
+
+    /// The `SET` list and its bindings, in the column order the edit names.
+    fn assignments(&self) -> (Vec<&'static str>, Vec<SqlValue>) {
+        let mut sets = Vec::new();
+        let mut bindings = Vec::new();
+        let mut text = |column: &'static str, value: &Option<String>| {
+            if let Some(v) = value {
+                sets.push(column);
+                bindings.push(SqlValue::Text(v.clone()));
+            }
+        };
+        text("content = ?", &self.content);
+        text("category = ?", &self.category);
+        text("tags = ?", &self.tags.as_deref().map(tags_json));
+        text(
+            "metadata = ?",
+            &self.metadata.as_ref().map(Value::to_string),
+        );
+        text("subject = ?", &self.subject);
+        text("predicate = ?", &self.predicate);
+        text("object = ?", &self.object);
+        text("memory_type = ?", &self.memory_type);
+        if let Some(sensitive) = self.sensitive {
+            sets.push("sensitive = ?");
+            bindings.push(SqlValue::Integer(i64::from(sensitive)));
+        }
+        if let Some(rate) = self.decay_rate {
+            sets.push("decay_rate = ?");
+            bindings.push(SqlValue::Real(rate));
+        }
+        if self.clear_superseded {
+            sets.push("superseded_by = NULL");
+        }
+        sets.push("updated_at = ?");
+        bindings.push(SqlValue::Text(self.updated_at.clone()));
+        (sets, bindings)
+    }
 }
 
 /// The columns an insert writes, in [`insert_values`]' order.
@@ -677,6 +755,171 @@ impl<'c> Memories<'c> {
         rows
     }
 
+    /// Memory `id`, unless it is missing or deleted.
+    pub fn get_live(&self, id: &str) -> Result<Option<Memory>> {
+        on_core!(self, |tables| engine::memories::get_live(&tables, id));
+        Ok(self
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT {MEMORY_COLUMNS} FROM memories WHERE id = ? AND deleted_at IS NULL"
+                ),
+                params![id],
+                parse_memory_row,
+            )
+            .optional()?)
+    }
+
+    /// Live memory `id`'s category, or `None` when it is missing or deleted.
+    pub fn live_category(&self, id: &str) -> Result<Option<String>> {
+        on_core!(self, |tables| Ok(
+            engine::memories::get_live(&tables, id)?.map(|m| m.category)
+        ));
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT category FROM memories WHERE id = ? AND deleted_at IS NULL",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// The memories `filter` takes, newest first (ties by id, descending):
+    /// how many there are in all, and the page at `offset` of at most
+    /// `limit`.
+    pub fn list_page(
+        &self,
+        filter: &ListFilter,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(usize, Vec<Memory>)> {
+        on_core!(self, |tables| engine::memories::list_page(
+            &tables, filter, limit, offset
+        ));
+        let mut conditions = vec!["m.deleted_at IS NULL"];
+        let mut bindings: Vec<SqlValue> = Vec::new();
+        if !filter.include_sensitive {
+            conditions.push("m.sensitive = 0");
+        }
+        if let Some(category) = &filter.category {
+            conditions.push("m.category = ?");
+            bindings.push(SqlValue::Text(category.clone()));
+        }
+        if let Some(source) = &filter.source {
+            conditions.push("m.source = ?");
+            bindings.push(SqlValue::Text(source.clone()));
+        }
+        // ALL-of tag semantics, against the tag index.
+        for tag in &filter.tags {
+            conditions.push(
+                "EXISTS (SELECT 1 FROM memory_tags mt WHERE mt.memory_id = m.id AND mt.tag = ?)",
+            );
+            bindings.push(SqlValue::Text(tag.clone()));
+        }
+        let where_clause = conditions.join(" AND ");
+        let total: i64 = self.conn.query_row(
+            &format!("SELECT count(*) FROM memories m WHERE {where_clause}"),
+            params_from_iter(bindings.iter()),
+            |r| r.get(0),
+        )?;
+        bindings.push(SqlValue::Integer(i64::try_from(limit).unwrap_or(i64::MAX)));
+        bindings.push(SqlValue::Integer(i64::try_from(offset).unwrap_or(i64::MAX)));
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {MEMORY_COLUMNS} FROM memories m WHERE {where_clause}
+              ORDER BY m.created_at DESC, m.id DESC LIMIT ? OFFSET ?"
+        ))?;
+        let page = stmt
+            .query_map(params_from_iter(bindings.iter()), parse_memory_row)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok((usize::try_from(total).unwrap_or(0), page))
+    }
+
+    /// Apply `edit` to memory `id`, made on this node. A missing id is a
+    /// no-op.
+    pub fn apply_edit(&self, id: &str, edit: &MemoryEdit) -> Result<()> {
+        on_core!(self, |tables| engine::memories::apply_edit(
+            &mut tables,
+            id,
+            edit
+        ));
+        let (sets, mut bindings) = edit.assignments();
+        bindings.push(SqlValue::Text(id.to_string()));
+        write_memory(self.conn, id, Origin::Local, || {
+            Ok(self.conn.execute(
+                &format!("UPDATE memories SET {} WHERE id = ?", sets.join(", ")),
+                params_from_iter(bindings.iter()),
+            )?)
+        })?;
+        Ok(())
+    }
+
+    /// Delete live memory `id`: tombstone it at `tombstone_at` (stamping
+    /// `deleted_at` and `updated_at`), or remove the row when that is
+    /// `None`. Whether there was a live memory to delete.
+    pub fn delete_live(&self, id: &str, tombstone_at: Option<&str>) -> Result<bool> {
+        on_core!(self, |tables| engine::memories::delete_live(
+            &mut tables,
+            id,
+            tombstone_at
+        ));
+        let affected = write_memory(self.conn, id, Origin::Local, || {
+            match tombstone_at {
+            Some(at) => Ok(self.conn.execute(
+                "UPDATE memories SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL",
+                params![at, at, id],
+            )?),
+            None => Ok(self.conn.execute(
+                "DELETE FROM memories WHERE id = ? AND deleted_at IS NULL",
+                params![id],
+            )?),
+        }
+        })?;
+        Ok(affected > 0)
+    }
+
+    /// Live memories of `memory_type`, oldest first (ties by id): how many
+    /// there are, and the first `limit` with the first 500 characters of
+    /// their content.
+    pub fn of_type_page(
+        &self,
+        memory_type: &str,
+        limit: usize,
+    ) -> Result<(usize, Vec<UnclassifiedMemory>)> {
+        on_core!(self, |tables| engine::memories::of_type_page(
+            &tables,
+            memory_type,
+            limit
+        ));
+        let total: i64 = self.conn.query_row(
+            "SELECT count(*) FROM memories WHERE memory_type = ? AND deleted_at IS NULL",
+            params![memory_type],
+            |r| r.get(0),
+        )?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, substr(content, 1, 500), category, tags
+               FROM memories
+              WHERE memory_type = ? AND deleted_at IS NULL
+              ORDER BY created_at, id
+              LIMIT ?",
+        )?;
+        let page = stmt
+            .query_map(
+                params![memory_type, i64::try_from(limit).unwrap_or(i64::MAX)],
+                |r| {
+                    let tags: String = r.get(3)?;
+                    Ok(UnclassifiedMemory {
+                        id: r.get(0)?,
+                        content_snippet: r.get(1)?,
+                        category: r.get(2)?,
+                        tags: serde_json::from_str(&tags).unwrap_or_default(),
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok((usize::try_from(total).unwrap_or(0), page))
+    }
+
     /// The id, content and metadata JSON of every live, unsuperseded,
     /// non-sensitive memory that records code references.
     pub fn with_code_refs(&self) -> Result<Vec<(String, String, String)>> {
@@ -990,6 +1233,120 @@ mod tests {
             sensitivity: ids.iter().map(|id| m.sensitivity(id).unwrap()).collect(),
             views: ids.iter().map(|id| m.sync_view(id).unwrap()).collect(),
             outbox,
+        }
+    }
+
+    /// Lists, edits and deletes on `db`, and what each read returns after.
+    fn exercise_reads(db: &Database) -> Vec<Value> {
+        const T2: &str = "2026-09-27T00:00:00+00:00";
+        let store = db.store();
+        let m = Memories::new(&store);
+        let text = |s: &str| Some(s.to_string());
+        for (id, at, category, tags, sensitive) in [
+            ("a", NOW, "fact", vec!["red"], false),
+            ("b", T2, "fact", vec!["red", "blue"], false),
+            ("c", T2, "note", vec![], true),
+            ("d", NOW, "note", vec!["blue"], false),
+            ("e", T2, "fact", vec![], false),
+        ] {
+            m.insert(&NewMemory {
+                category: category.into(),
+                tags: tags.into_iter().map(String::from).collect(),
+                sensitive,
+                source: if id == "d" {
+                    "import".into()
+                } else {
+                    "manual".into()
+                },
+                ..NewMemory::new(id, format!("content of {id} {}", "é".repeat(600)), at)
+            })
+            .unwrap();
+        }
+        let mut seen = Vec::new();
+        let mut page = |filter: ListFilter, limit, offset| {
+            let (total, memories) = m.list_page(&filter, limit, offset).unwrap();
+            let ids: Vec<String> = memories.into_iter().map(|m| m.id).collect();
+            serde_json::json!([total, ids])
+        };
+        seen.push(page(ListFilter::default(), 10, 0));
+        seen.push(page(ListFilter::default(), 2, 1));
+        seen.push(page(
+            ListFilter {
+                include_sensitive: true,
+                ..ListFilter::default()
+            },
+            10,
+            0,
+        ));
+        seen.push(page(
+            ListFilter {
+                category: text("fact"),
+                tags: vec!["red".into()],
+                ..ListFilter::default()
+            },
+            10,
+            0,
+        ));
+        seen.push(page(
+            ListFilter {
+                source: text("import"),
+                ..ListFilter::default()
+            },
+            10,
+            0,
+        ));
+
+        m.apply_edit(
+            "a",
+            &MemoryEdit {
+                content: text("edited"),
+                tags: Some(vec!["green".into()]),
+                metadata: Some(serde_json::json!({"k": 1})),
+                sensitive: Some(true),
+                subject: text("s"),
+                memory_type: text("decision"),
+                decay_rate: Some(0.02),
+                ..MemoryEdit::at(T2)
+            },
+        )
+        .unwrap();
+        m.set_superseded_by("b", "a", None).unwrap();
+        m.apply_edit(
+            "b",
+            &MemoryEdit {
+                clear_superseded: true,
+                ..MemoryEdit::at(T2)
+            },
+        )
+        .unwrap();
+        m.apply_edit("missing", &MemoryEdit::at(T2)).unwrap();
+        seen.push(serde_json::json!([
+            m.delete_live("c", Some(T2)).unwrap(),
+            m.delete_live("c", Some(T2)).unwrap(),
+            m.delete_live("d", None).unwrap(),
+            m.delete_live("missing", None).unwrap(),
+        ]));
+        for id in ["a", "b", "c", "d"] {
+            seen.push(serde_json::to_value(m.get_live(id).unwrap()).unwrap());
+            seen.push(serde_json::to_value(m.live_category(id).unwrap()).unwrap());
+        }
+        let (total, page) = m.of_type_page("unclassified", 2).unwrap();
+        seen.push(serde_json::json!([
+            total,
+            serde_json::to_value(page).unwrap()
+        ]));
+        seen.push(serde_json::to_value(as_values(m.exportable(true, None, &[]).unwrap())).unwrap());
+        seen
+    }
+
+    #[test]
+    fn the_engine_core_matches_sqlite_read_for_read() {
+        let mut observed = Vec::new();
+        on_each_core_backend(|db| observed.push(exercise_reads(db)));
+        let sqlite = &observed[0];
+        assert_eq!(sqlite[0], serde_json::json!([4, ["e", "b", "d", "a"]]));
+        for other in &observed[1..] {
+            assert_eq!(other, sqlite);
         }
     }
 

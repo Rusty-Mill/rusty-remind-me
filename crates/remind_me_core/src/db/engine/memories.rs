@@ -14,9 +14,11 @@ use super::core::{Change, CoreTables};
 use super::EngineTables;
 use super::{core_mut, core_ref, engine_error, engine_id, ensure_same_id, micros, outbox};
 use crate::db::derived::Origin;
-use crate::db::memories::{tags_json, AccessInputs, CreatedMemory, NewMemory, SyncView, Triple};
+use crate::db::memories::{
+    tags_json, AccessInputs, CreatedMemory, ListFilter, MemoryEdit, NewMemory, SyncView, Triple,
+};
 use crate::db::Result;
-use crate::models::Memory;
+use crate::models::{Memory, UnclassifiedMemory};
 use rusty_multimodal_db_engine::fulltext::FullTextIndex;
 use rusty_multimodal_db_engine::generic::query::{AllIds, FilterEq, GetById};
 use rusty_multimodal_db_engine::generic::traits::{
@@ -582,6 +584,70 @@ pub(crate) fn set_ingest_marker(
     Ok(ids.len())
 }
 
+/// Apply `edit` to memory `id`, as `Memories::apply_edit`'s `UPDATE`.
+pub(crate) fn apply_edit(tables: &mut EngineTables, id: &str, edit: &MemoryEdit) -> Result<()> {
+    update(tables, id, Origin::Local, |row| {
+        let set = |field: &mut String, value: &Option<String>| {
+            if let Some(v) = value {
+                field.clone_from(v);
+            }
+        };
+        set(&mut row.content, &edit.content);
+        set(&mut row.category, &edit.category);
+        set(&mut row.memory_type, &edit.memory_type);
+        if let Some(tags) = &edit.tags {
+            row.tags = tags_json(tags);
+        }
+        if let Some(metadata) = &edit.metadata {
+            row.metadata = metadata.to_string();
+        }
+        for (field, value) in [
+            (&mut row.subject, &edit.subject),
+            (&mut row.predicate, &edit.predicate),
+            (&mut row.object, &edit.object),
+        ] {
+            if value.is_some() {
+                field.clone_from(value);
+            }
+        }
+        if let Some(sensitive) = edit.sensitive {
+            row.sensitive = sensitive;
+        }
+        if let Some(rate) = edit.decay_rate {
+            row.decay_rate = rate;
+        }
+        if edit.clear_superseded {
+            row.superseded_by = None;
+        }
+        row.updated_at.clone_from(&edit.updated_at);
+        Ok(())
+    })
+}
+
+/// Delete live memory `id`: tombstone it at `tombstone_at`, or remove it.
+/// Whether it was live.
+pub(crate) fn delete_live(
+    tables: &mut EngineTables,
+    id: &str,
+    tombstone_at: Option<&str>,
+) -> Result<bool> {
+    let mut deleted = false;
+    write(tables, id, Origin::Local, |before| {
+        let Some(row) = before.filter(|r| r.deleted_at.is_none()) else {
+            return Ok(Edit::Keep);
+        };
+        deleted = true;
+        let Some(at) = tombstone_at else {
+            return Ok(Edit::Delete);
+        };
+        let mut row = row.clone();
+        row.deleted_at = Some(at.to_string());
+        row.updated_at = at.to_string();
+        Ok(Edit::Put(Box::new(row)))
+    })?;
+    Ok(deleted)
+}
+
 // --- reads ----------------------------------------------------------------
 
 /// Memory `id`'s row as stored, refusing a different id at its engine id.
@@ -746,6 +812,66 @@ fn distinct(ids: &[String]) -> impl Iterator<Item = &str> {
     ids.iter()
         .map(String::as_str)
         .filter(move |id| seen.insert(*id))
+}
+
+/// Memory `id`, unless it is missing or deleted.
+pub(crate) fn get_live(tables: &EngineTables, id: &str) -> Result<Option<Memory>> {
+    Ok(row(core_ref(tables)?, id)
+        .filter(|row| row.deleted_at.is_none())
+        .map(|row| row.to_memory()))
+}
+
+/// What `Memories::list_page` selects: the total, and the page, newest
+/// first by the `created_at` text, ties by id descending.
+pub(crate) fn list_page(
+    tables: &EngineTables,
+    filter: &ListFilter,
+    limit: usize,
+    offset: usize,
+) -> Result<(usize, Vec<Memory>)> {
+    let core = core_ref(tables)?;
+    let mut rows: Vec<MemoryRow> = rows(core)
+        .filter(|row| row.deleted_at.is_none())
+        .filter(|row| filter.include_sensitive || !row.sensitive)
+        .filter(|row| filter.category.as_ref().is_none_or(|c| &row.category == c))
+        .filter(|row| filter.source.as_ref().is_none_or(|s| &row.source == s))
+        .filter(|row| filter.tags.iter().all(|tag| core.tags.has(tag, &row.id)))
+        .collect();
+    rows.sort_by(|a, b| (&b.created_at, &b.id).cmp(&(&a.created_at, &a.id)));
+    let total = rows.len();
+    let page = rows
+        .iter()
+        .skip(offset)
+        .take(limit)
+        .map(MemoryRow::to_memory)
+        .collect();
+    Ok((total, page))
+}
+
+/// What `Memories::of_type_page` selects: live memories of `memory_type`,
+/// oldest first, ties by id, with the first 500 characters of the content
+/// as SQLite's `substr` takes them.
+pub(crate) fn of_type_page(
+    tables: &EngineTables,
+    memory_type: &str,
+    limit: usize,
+) -> Result<(usize, Vec<UnclassifiedMemory>)> {
+    let mut rows: Vec<MemoryRow> = rows(core_ref(tables)?)
+        .filter(|row| row.deleted_at.is_none() && row.memory_type == memory_type)
+        .collect();
+    rows.sort_by(|a, b| (&a.created_at, &a.id).cmp(&(&b.created_at, &b.id)));
+    let total = rows.len();
+    let page = rows
+        .into_iter()
+        .take(limit)
+        .map(|row| UnclassifiedMemory {
+            tags: serde_json::from_str(&row.tags).unwrap_or_default(),
+            content_snippet: row.content.chars().take(500).collect(),
+            id: row.id,
+            category: row.category,
+        })
+        .collect();
+    Ok((total, page))
 }
 
 /// Rebuild the derived indexes from the rows.
