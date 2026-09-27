@@ -605,6 +605,32 @@ admitted, not a new dependency.
 becomes the default with `REMIND_ME_DAEMON=0` as the way out. Phase 5 needs it
 on, since the engine keeps the store in one process.
 
+### Phase 3: engine additions
+
+**3a, done: the journal, sequences and directory lock** (§3b, §3c, §3d),
+in `rusty_multimodal_db_engine`:
+
+- `journal::Journal` commits a batch of whole-value puts and deletes across
+  named stores as one `fsync`'d entry before the caller applies it, replays
+  every batch since the last checkpoint on open, and checkpoints once the
+  caller's stores have synced. Entries carry a CRC-32 as well as a length, so
+  a last entry whose length landed but whose bytes did not is dropped as torn
+  rather than refused as corrupt; a bad entry before the last is refused.
+  Replay needs no record of what already landed: every change is a whole
+  value or a delete by id, so applying it twice is applying it once.
+- Sequences ride on the journal: every entry carries every counter, so a
+  value is durable with the batch that uses it, and a checkpoint keeps them.
+  A value issued but never committed can be issued again after a crash,
+  which is safe because nothing durable holds it.
+- `dir_lock::DirLock` is the hub's directory lock, moved into the engine;
+  the hub now takes it from there.
+- `tests/journal_batches.rs` runs the node's case over two real engine
+  stores: a memory and its outbox entry, crashed between the two, both
+  present after reopen; a batch replayed over stores that already hold it;
+  outbox ids never reissued across crashes and checkpoints.
+
+**3b, next: the full-text index** (§3a), tested against FTS5.
+
 ## Related
 
 - ADR-0021 (the hub's move) and ADR-0022 (the seam this continues).

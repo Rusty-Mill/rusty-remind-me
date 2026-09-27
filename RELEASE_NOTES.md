@@ -2,6 +2,18 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-27 — Engine journal, sequences and directory lock (ADR-0023, phase 3a)
+
+### Added
+- `rusty_multimodal_db_engine::journal`: a redo journal that makes a batch across several engine stores crash-atomic, and durable named sequence counters. The node will write a memory, its tags and its outbox entry through it (phase 4).
+- `rusty_multimodal_db_engine::dir_lock`: the data-directory lock, moved from the hub into the engine so the node daemon takes the same one.
+
+### Changed
+- The hub takes its directory lock from the engine. Same file (`hub.lock`), same error message; behaviour is unchanged.
+
+### Tests
+- Journal unit tests: replay order, checkpoint, sequences across reopen and checkpoint, every torn-tail cut, a zeroed last entry, corruption before the last entry, foreign files and versions. Integration tests over two real engine stores for crash-atomicity, idempotent replay and never-reissued outbox ids.
+
 ## 2026-09-26 — The store daemon, opt-in (ADR-0023, phase 2a)
 
 ### Added

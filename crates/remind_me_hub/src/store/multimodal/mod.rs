@@ -45,6 +45,7 @@ use crate::canon::now_canonical;
 use crate::record::{EntityRecord, LinkRecord, MemoryRecord, Record};
 use keys::{IdKey, LinkKey, MAX_ID_KEY};
 use rows::{ByEngineId, EntityRow, Keyset, LinkRow, MemoryRow, Micros, RelationRow, Seq};
+use rusty_multimodal_db_engine::dir_lock::{DirLock, DirLockError};
 use rusty_multimodal_db_engine::durability::{sync_parent_dir, DurabilityError};
 use rusty_multimodal_db_engine::generic::mmap_field::MmapFieldValue;
 use rusty_multimodal_db_engine::generic::query::{
@@ -150,7 +151,7 @@ pub struct MultimodalHubStore {
     /// Held for the store's lifetime: its OS lock is what keeps a second
     /// hub off the same directory (ADR-0021, Consequences: there is no
     /// separate server to take `rusty_multimodal_db`'s ADR-0092 lock).
-    _dir_lock: File,
+    _dir_lock: DirLock,
 }
 
 fn engine_err(e: impl std::fmt::Display) -> StoreError {
@@ -236,7 +237,7 @@ impl MultimodalHubStore {
     /// `hub_seq` counter above everything issued so far.
     fn assemble(
         dir: &Path,
-        dir_lock: File,
+        dir_lock: DirLock,
         memories: Core<MemoryRow, Seq>,
         entities: Core<EntityRow, Micros>,
         links: Core<LinkRow, Micros>,
@@ -381,22 +382,14 @@ fn ensure_empty_dir(dir: &Path) -> StoreResult<()> {
 }
 
 /// Take the data directory's OS lock without waiting.
-fn take_dir_lock(dir: &Path) -> StoreResult<File> {
-    let path = dir.join(LOCK_FILE);
-    let file = File::options()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&path)
-        .map_err(|e| io_err("could not open", &path, e))?;
-    file.try_lock().map_err(|e| match e {
-        std::fs::TryLockError::WouldBlock => StoreError(format!(
+fn take_dir_lock(dir: &Path) -> StoreResult<DirLock> {
+    DirLock::acquire(dir, LOCK_FILE).map_err(|e| match e {
+        DirLockError::Held(_) => StoreError(format!(
             "{} is in use by another hub process",
             dir.display()
         )),
-        std::fs::TryLockError::Error(e) => io_err("could not lock", &path, e),
-    })?;
-    Ok(file)
+        DirLockError::Io(path, e) => io_err("could not lock", &path, e),
+    })
 }
 
 fn read_seq_floor(dir: &Path) -> StoreResult<i64> {
