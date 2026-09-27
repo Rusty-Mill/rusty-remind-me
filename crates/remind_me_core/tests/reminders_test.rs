@@ -234,15 +234,9 @@ fn setting_a_reminder_writes_no_revision() {
     set_reminder(&store, &id, Some(&future(5))).unwrap();
     set_reminder(&store, &id, None).unwrap();
 
-    let revisions: i64 = store
-        .sqlite()
+    let revisions = remind_me_core::history::history(&store, &id, usize::MAX)
         .unwrap()
-        .query_row(
-            "SELECT COUNT(*) FROM memory_revisions WHERE memory_id = ?",
-            params![&id],
-            |r| r.get(0),
-        )
-        .unwrap();
+        .len();
     // The revision log exists to recover a value a human replaced. A vault
     // whose history is half reminder-scheduling noise is harder to read back
     // than one that only records edits.

@@ -2,6 +2,14 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-27 — Memory revisions on the engine (ADR-0023, phase 4g)
+
+### Added
+- With the `engine-store` feature and engine tables present, memory revisions live in the engine, with ids from the journal's durable sequence. Listing, reverting by id, and the rule that a revision id from another memory is not found all behave as on SQLite.
+
+### Tests
+- A new repository test runs on both backends: revisions list newest first, edits in the same clock tick list in write order, limits apply, and a revision is only found under its own memory. An engine test covers ids and rows across a reopen. The reminders test counts revisions through `history()` instead of SQL.
+
 ## 2026-09-27 — Analytics snapshots on the engine, with journal-backed ids (ADR-0023, phase 4f)
 
 ### Added

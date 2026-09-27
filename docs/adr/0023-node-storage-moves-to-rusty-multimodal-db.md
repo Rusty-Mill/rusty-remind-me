@@ -788,6 +788,22 @@ this is a pure refactor with no change in behaviour.
   scheduler's reminder query tests it in a `NOT EXISTS` inside a `LIMIT`ed
   query on memories, so it moves with memories.
 
+**4g, done: memory revisions on the engine.**
+
+- `memory_revisions` moves to the engine, on the journal's
+  `memory_revisions` sequence: a revision id is what a caller passes back
+  to revert, so it must never be reissued. The table is indexed by
+  memory; `list` orders by the `edited_at` text newest first, then id,
+  as the SQL does, so a burst of edits in one clock tick still lists in
+  write order.
+- `Revisions`' reads and writes of `memories` (is the memory live, its
+  current tracked values, writing a revert back) stay on SQLite.
+- The revision is written before the memory's `UPDATE`, as before. The two
+  were already separate statements, not one transaction, so a crash
+  between them leaves what it always could: a revision equal to the
+  memory's current values, which a revert would report as no change. The
+  journal (§3b) makes the pair atomic once memories move.
+
 **Next:** the remaining groups, one PR each, in order of how few other
 groups they touch. Groups that write together (a memory, its tags, its
 outbox entry) move together and commit through the journal (§3b). The copy

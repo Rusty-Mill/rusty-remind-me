@@ -13,6 +13,7 @@
 
 pub(crate) mod analytics;
 pub(crate) mod archives;
+pub(crate) mod revisions;
 pub(crate) mod saved_searches;
 pub(crate) mod sync_log;
 
@@ -63,6 +64,7 @@ pub struct EngineTables {
     pub(crate) spans: archives::SpanTable,
     pub(crate) sync_log: sync_log::SyncLogTable,
     pub(crate) snapshots: analytics::SnapshotTable,
+    pub(crate) revisions: revisions::RevisionTable,
     journal: Journal,
     _lock: DirLock,
     _temporary: Option<TemporaryDir>,
@@ -85,6 +87,7 @@ impl EngineTables {
             spans: open_core(&dir.join("import_archive_spans.mmap"))?,
             sync_log: open_core(&dir.join("sync_log.mmap"))?,
             snapshots: open_core(&dir.join("analytics_snapshots.mmap"))?,
+            revisions: open_core(&dir.join("memory_revisions.mmap"))?,
             journal,
             _lock: lock,
             _temporary: None,
@@ -93,6 +96,8 @@ impl EngineTables {
         // tool, or an older build) must still never see an id reissued.
         let floor = analytics::max_id(&tables.snapshots);
         tables.journal.raise_to(analytics::SEQUENCE, floor);
+        let floor = revisions::max_id(&tables.revisions);
+        tables.journal.raise_to(revisions::SEQUENCE, floor);
         Ok(tables)
     }
 
