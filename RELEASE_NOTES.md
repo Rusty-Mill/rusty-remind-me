@@ -2,6 +2,18 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-27 — Search on the engine core, built dark (ADR-0023, core PR 2b)
+
+### Added
+- `Memories::keyword_hits` (with a `KeywordFilter`), `Memories::keyword_page` (with a `PageFilter` and an optional `EntityScope`), and `Memories::sensitive_ids`. Each uses the engine's memories core and its full-text index when present, and SQLite otherwise.
+
+### Changed
+- The keyword half of search and paginated search go through the repository instead of building SQL inline.
+- Search results with equal BM25 scores now come in id order, where SQLite left their order unspecified. In a search with no terms, memories created at the same instant come in descending id order.
+
+### Tests
+- A differential test runs one corpus through FTS5 and the engine core. It covers ranked hits and scores, the category, sensitivity and vitality filters, limits, paging, tags, the entity scope, and superseded and deleted memories. It requires identical results.
+
 ## 2026-09-27 — Get, list and field edits on the engine core, built dark (ADR-0023, core PR 2a)
 
 ### Added

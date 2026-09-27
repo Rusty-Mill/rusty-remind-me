@@ -12,13 +12,15 @@
 use super::engine::{self, EngineTables};
 use super::{Result, Store};
 use crate::db::derived::{memory_ids, write_memory, Origin};
-use crate::db::queries::{parse_memory_row, MEMORY_COLUMNS};
+use crate::db::queries::{parse_memory_row, prefixed_memory_columns, MEMORY_COLUMNS};
 use crate::models::{Memory, UnclassifiedMemory};
+use crate::vitality::EFFECTIVE_VITALITY_FN;
 #[cfg(feature = "engine-store")]
 use parking_lot::Mutex;
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde_json::Value;
+use std::collections::HashSet;
 
 /// A whole `memories` row, as a writer supplies it.
 ///
@@ -205,6 +207,35 @@ impl MemoryEdit {
         bindings.push(SqlValue::Text(self.updated_at.clone()));
         (sets, bindings)
     }
+}
+
+/// Which live, unsuperseded memories a ranked keyword search takes.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct KeywordFilter {
+    /// Only memories whose effective vitality, as of now, is at least this.
+    pub min_effective_vitality: Option<f64>,
+    pub category: Option<String>,
+    pub include_sensitive: bool,
+}
+
+/// Which live, unsuperseded memories a paged search takes.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PageFilter {
+    pub category: Option<String>,
+    /// All-of.
+    pub tags: Vec<String>,
+    /// Only memories linked to this entity, or whose subject or object is its
+    /// canonical name.
+    pub entity: Option<EntityScope>,
+}
+
+/// An entity a paged search is narrowed to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntityScope {
+    pub id: String,
+    /// The entity's normalized name, compared with `lower(subject)` and
+    /// `lower(object)`.
+    pub canonical: String,
 }
 
 /// The columns an insert writes, in [`insert_values`]' order.
@@ -920,6 +951,151 @@ impl<'c> Memories<'c> {
         Ok((usize::try_from(total).unwrap_or(0), page))
     }
 
+    /// Live, unsuperseded memories matching any of `phrases` in the full-text
+    /// index, best BM25 first (ties by id), at most `limit`, each with its
+    /// BM25 score. No phrases match nothing.
+    pub fn keyword_hits(
+        &self,
+        phrases: &[String],
+        filter: &KeywordFilter,
+        limit: usize,
+    ) -> Result<Vec<(Memory, f64)>> {
+        if phrases.is_empty() {
+            return Ok(Vec::new());
+        }
+        on_core!(self, |tables| engine::memories::keyword_hits(
+            &tables, phrases, filter, limit
+        ));
+        let mut sql = format!(
+            "SELECT {}, bm25(memories_fts) AS bm25_score
+               FROM memories_fts fts
+               JOIN memories m ON m.rowid = fts.rowid
+              WHERE memories_fts MATCH ? AND m.superseded_by IS NULL AND m.deleted_at IS NULL",
+            prefixed_memory_columns("m")
+        );
+        let mut bindings = vec![SqlValue::Text(crate::fts::match_expression(phrases))];
+        if let Some(floor) = filter.min_effective_vitality {
+            sql.push_str(&format!(
+                " AND {EFFECTIVE_VITALITY_FN}(m.base_weight, m.access_count, m.decay_rate, \
+                 coalesce(m.accessed_at, m.created_at)) >= ?"
+            ));
+            bindings.push(SqlValue::Real(floor));
+        }
+        if let Some(category) = &filter.category {
+            sql.push_str(" AND m.category = ?");
+            bindings.push(SqlValue::Text(category.clone()));
+        }
+        if !filter.include_sensitive {
+            sql.push_str(" AND m.sensitive = 0");
+        }
+        sql.push_str(" ORDER BY bm25(memories_fts), m.id LIMIT ?");
+        bindings.push(SqlValue::Integer(i64::try_from(limit).unwrap_or(i64::MAX)));
+        let mut stmt = self.conn.prepare(&sql)?;
+        let hits = stmt
+            .query_map(params_from_iter(bindings.iter()), |row| {
+                Ok((parse_memory_row(row)?, row.get("bm25_score")?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(hits)
+    }
+
+    /// The ids of every memory marked sensitive.
+    pub fn sensitive_ids(&self) -> Result<HashSet<String>> {
+        on_core!(self, |tables| engine::memories::sensitive_ids(&tables));
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM memories WHERE sensitive = 1")?;
+        let ids = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(ids)
+    }
+
+    /// A page of the live, unsuperseded memories `filter` takes: matching
+    /// any of `phrases`, best BM25 first, or with no phrases newest first
+    /// (ties by id either way). How many there are, and the page.
+    pub fn keyword_page(
+        &self,
+        phrases: &[String],
+        filter: &PageFilter,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(usize, Vec<Memory>)> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            let linked = match &filter.entity {
+                Some(scope) => self.linked_to(&scope.id)?,
+                None => HashSet::new(),
+            };
+            return engine::memories::keyword_page(
+                &core.lock(),
+                phrases,
+                filter,
+                &linked,
+                limit,
+                offset,
+            );
+        }
+        let mut conditions = String::from("m.superseded_by IS NULL AND m.deleted_at IS NULL");
+        let mut bindings: Vec<SqlValue> = Vec::new();
+        let mut from = String::from("memories m");
+        let mut order = "m.created_at DESC, m.id DESC";
+        if !phrases.is_empty() {
+            from.push_str(" JOIN memories_fts fts ON m.rowid = fts.rowid");
+            conditions.push_str(" AND memories_fts MATCH ?");
+            bindings.push(SqlValue::Text(crate::fts::match_expression(phrases)));
+            order = "bm25(memories_fts), m.id";
+        }
+        if let Some(category) = &filter.category {
+            conditions.push_str(" AND m.category = ?");
+            bindings.push(SqlValue::Text(category.clone()));
+        }
+        for tag in &filter.tags {
+            conditions.push_str(
+                " AND EXISTS (SELECT 1 FROM memory_tags mt WHERE mt.memory_id = m.id AND mt.tag = ?)",
+            );
+            bindings.push(SqlValue::Text(tag.clone()));
+        }
+        if let Some(scope) = &filter.entity {
+            conditions.push_str(
+                " AND (EXISTS (SELECT 1 FROM memory_entities me \
+                   WHERE me.memory_id = m.id AND me.entity_id = ?) \
+                   OR lower(m.subject) = ? OR lower(m.object) = ?)",
+            );
+            bindings.push(SqlValue::Text(scope.id.clone()));
+            bindings.push(SqlValue::Text(scope.canonical.clone()));
+            bindings.push(SqlValue::Text(scope.canonical.clone()));
+        }
+        let total: i64 = self.conn.query_row(
+            &format!("SELECT count(*) FROM {from} WHERE {conditions}"),
+            params_from_iter(bindings.iter()),
+            |r| r.get(0),
+        )?;
+        bindings.push(SqlValue::Integer(i64::try_from(limit).unwrap_or(i64::MAX)));
+        bindings.push(SqlValue::Integer(i64::try_from(offset).unwrap_or(i64::MAX)));
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {} FROM {from} WHERE {conditions} ORDER BY {order} LIMIT ? OFFSET ?",
+            prefixed_memory_columns("m")
+        ))?;
+        let page = stmt
+            .query_map(params_from_iter(bindings.iter()), parse_memory_row)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok((usize::try_from(total).unwrap_or(0), page))
+    }
+
+    /// The ids of the memories linked to entity `entity_id`. The links stay
+    /// on SQLite until the graph moves (core PR 3).
+    #[cfg(feature = "engine-store")]
+    fn linked_to(&self, entity_id: &str) -> Result<HashSet<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT memory_id FROM memory_entities WHERE entity_id = ?")?;
+        let ids = stmt
+            .query_map(params![entity_id], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(ids)
+    }
+
     /// The id, content and metadata JSON of every live, unsuperseded,
     /// non-sensitive memory that records code references.
     pub fn with_code_refs(&self) -> Result<Vec<(String, String, String)>> {
@@ -1347,6 +1523,197 @@ mod tests {
         assert_eq!(sqlite[0], serde_json::json!([4, ["e", "b", "d", "a"]]));
         for other in &observed[1..] {
             assert_eq!(other, sqlite);
+        }
+    }
+
+    /// A corpus searched through `db`'s full-text index: every ranked and
+    /// paged answer, scores to ten significant digits so float noise cannot
+    /// fail the comparison but a real difference in ranking does.
+    fn exercise_search(db: &Database) -> Vec<Value> {
+        const T2: &str = "2026-09-27T00:00:00+00:00";
+        let store = db.store();
+        let m = Memories::new(&store);
+        let text = |s: &str| Some(s.to_string());
+        let corpus = [
+            (
+                "a",
+                "the quokka eats leaves at night",
+                "fact",
+                vec!["animal"],
+                NOW,
+            ),
+            (
+                "b",
+                "a quokka and a wombat share a burrow",
+                "fact",
+                vec!["animal", "burrow"],
+                T2,
+            ),
+            (
+                "c",
+                "wombat burrows are deep; quokka burrows are not",
+                "note",
+                vec![],
+                T2,
+            ),
+            (
+                "d",
+                "rust ownership rules and the borrow checker",
+                "note",
+                vec!["rust"],
+                NOW,
+            ),
+            ("e", "quokka quokka quokka everywhere", "fact", vec![], NOW),
+            ("f", "a sensitive quokka secret", "fact", vec![], NOW),
+            ("g", "a dormant quokka nobody reads", "fact", vec![], NOW),
+            ("h", "a superseded quokka note", "fact", vec![], NOW),
+            ("i", "a deleted quokka note", "fact", vec![], NOW),
+            (
+                "j",
+                "the borrow checker loves wombats",
+                "note",
+                vec!["quokka"],
+                T2,
+            ),
+        ];
+        for (id, content, category, tags, at) in corpus {
+            m.insert(&NewMemory {
+                category: category.into(),
+                tags: tags.into_iter().map(String::from).collect(),
+                sensitive: id == "f",
+                base_weight: if id == "g" { 0.001 } else { 1.0 },
+                subject: if id == "d" { text("Rust") } else { None },
+                ..NewMemory::new(id, content, at)
+            })
+            .unwrap();
+        }
+        m.set_superseded_by("h", "a", None).unwrap();
+        m.delete_live("i", Some(T2)).unwrap();
+        crate::db::entities::Entities::new(&store)
+            .insert(
+                &crate::entity::Entity {
+                    id: "ent_w".into(),
+                    name: "Wombat".into(),
+                    kind: None,
+                    aliases: Vec::new(),
+                    created_at: NOW.into(),
+                    updated_at: NOW.into(),
+                },
+                None,
+            )
+            .unwrap();
+        crate::db::entities::Entities::new(&store)
+            .link("c", "ent_w", NOW, Origin::Local)
+            .unwrap();
+
+        let phrases = crate::fts::query_phrases;
+        let mut seen = Vec::new();
+        let queries = [
+            "quokka",
+            "quokka burrow",
+            "\"borrow checker\"",
+            "what's a wombat?",
+            "animal",
+            "note",
+            "nothing matches this",
+        ];
+        let filters = [
+            KeywordFilter::default(),
+            KeywordFilter {
+                include_sensitive: true,
+                ..KeywordFilter::default()
+            },
+            KeywordFilter {
+                min_effective_vitality: Some(crate::vitality::VITALITY_FLOOR),
+                category: text("fact"),
+                include_sensitive: true,
+            },
+        ];
+        for query in queries {
+            for filter in &filters {
+                for limit in [2, 20] {
+                    let hits: Vec<Value> = m
+                        .keyword_hits(&phrases(query), filter, limit)
+                        .unwrap()
+                        .into_iter()
+                        .map(|(memory, score)| {
+                            serde_json::json!([memory.id, format!("{score:.9e}")])
+                        })
+                        .collect();
+                    seen.push(serde_json::json!([query, limit, hits]));
+                }
+            }
+        }
+        let pages = [
+            ("quokka", PageFilter::default(), 3, 0),
+            ("quokka", PageFilter::default(), 3, 3),
+            (
+                "quokka",
+                PageFilter {
+                    category: text("fact"),
+                    tags: vec!["animal".into()],
+                    entity: None,
+                },
+                10,
+                0,
+            ),
+            ("", PageFilter::default(), 4, 1),
+            (
+                "",
+                PageFilter {
+                    entity: Some(EntityScope {
+                        id: "ent_w".into(),
+                        canonical: "rust".into(),
+                    }),
+                    ..PageFilter::default()
+                },
+                10,
+                0,
+            ),
+            (
+                "burrows",
+                PageFilter {
+                    entity: Some(EntityScope {
+                        id: "ent_w".into(),
+                        canonical: "wombat".into(),
+                    }),
+                    ..PageFilter::default()
+                },
+                10,
+                0,
+            ),
+        ];
+        for (query, filter, limit, offset) in pages {
+            let (total, page) = m
+                .keyword_page(&phrases(query), &filter, limit, offset)
+                .unwrap();
+            let ids: Vec<String> = page.into_iter().map(|m| m.id).collect();
+            seen.push(serde_json::json!([query, total, ids]));
+        }
+        let mut sensitive: Vec<String> = m.sensitive_ids().unwrap().into_iter().collect();
+        sensitive.sort();
+        seen.push(serde_json::json!(sensitive));
+        seen
+    }
+
+    #[test]
+    fn the_engine_core_searches_as_fts5_does() {
+        let mut observed = Vec::new();
+        on_each_core_backend(|db| observed.push(exercise_search(db)));
+        #[cfg(feature = "engine-store")]
+        assert_eq!(observed.len(), 2, "both backends ran");
+        let sqlite = &observed[0];
+        assert_eq!(
+            sqlite[0][2].as_array().map(Vec::len),
+            Some(2),
+            "the corpus exercises a real ranking: {:?}",
+            sqlite[0]
+        );
+        for other in &observed[1..] {
+            for (theirs, ours) in other.iter().zip(sqlite) {
+                assert_eq!(theirs, ours);
+            }
+            assert_eq!(other.len(), sqlite.len());
         }
     }
 

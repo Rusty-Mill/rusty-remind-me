@@ -15,11 +15,12 @@ use super::EngineTables;
 use super::{core_mut, core_ref, engine_error, engine_id, ensure_same_id, micros, outbox};
 use crate::db::derived::Origin;
 use crate::db::memories::{
-    tags_json, AccessInputs, CreatedMemory, ListFilter, MemoryEdit, NewMemory, SyncView, Triple,
+    tags_json, AccessInputs, CreatedMemory, KeywordFilter, ListFilter, MemoryEdit, NewMemory,
+    PageFilter, SyncView, Triple,
 };
 use crate::db::Result;
 use crate::models::{Memory, UnclassifiedMemory};
-use rusty_multimodal_db_engine::fulltext::FullTextIndex;
+use rusty_multimodal_db_engine::fulltext::{FullTextIndex, Query};
 use rusty_multimodal_db_engine::generic::query::{AllIds, FilterEq, GetById};
 use rusty_multimodal_db_engine::generic::traits::{
     IndexedField, Record, ScannableField, SchemaTag,
@@ -870,6 +871,102 @@ pub(crate) fn of_type_page(
             id: row.id,
             category: row.category,
         })
+        .collect();
+    Ok((total, page))
+}
+
+/// Every live, unsuperseded row matching any of `phrases`, with its BM25
+/// score, best first, ties by id: `memories_fts MATCH … ORDER BY bm25()`.
+fn ranked(core: &CoreTables, phrases: &[String]) -> Vec<(MemoryRow, f64)> {
+    let query = Query::any_of(phrases.iter().map(String::as_str));
+    let mut hits: Vec<(MemoryRow, f64)> = core
+        .search
+        .search(&query)
+        .into_iter()
+        .filter_map(|hit| Some((row(core, &hit.key)?, hit.score)))
+        .filter(|(row, _)| row.is_live())
+        .collect();
+    hits.sort_by(|(a, x), (b, y)| x.total_cmp(y).then_with(|| a.id.cmp(&b.id)));
+    hits
+}
+
+/// What `Memories::keyword_hits` selects. Effective vitality is computed as
+/// of one instant for the whole search, where SQLite reads the clock per
+/// row.
+pub(crate) fn keyword_hits(
+    tables: &EngineTables,
+    phrases: &[String],
+    filter: &KeywordFilter,
+    limit: usize,
+) -> Result<Vec<(Memory, f64)>> {
+    let now = chrono::Utc::now();
+    Ok(ranked(core_ref(tables)?, phrases)
+        .into_iter()
+        .filter(|(row, _)| filter.include_sensitive || !row.sensitive)
+        .filter(|(row, _)| filter.category.as_ref().is_none_or(|c| &row.category == c))
+        .map(|(row, score)| (row.to_memory(), score))
+        .filter(|(memory, _)| {
+            filter
+                .min_effective_vitality
+                .is_none_or(|floor| crate::vitality::effective_vitality(memory, now) >= floor)
+        })
+        .take(limit)
+        .collect())
+}
+
+pub(crate) fn sensitive_ids(tables: &EngineTables) -> Result<HashSet<String>> {
+    Ok(rows(core_ref(tables)?)
+        .filter(|row| row.sensitive)
+        .map(|row| row.id)
+        .collect())
+}
+
+/// What `Memories::keyword_page` selects. `linked` holds the ids of the
+/// memories linked to the filter's entity, read from SQLite.
+pub(crate) fn keyword_page(
+    tables: &EngineTables,
+    phrases: &[String],
+    filter: &PageFilter,
+    linked: &HashSet<String>,
+    limit: usize,
+    offset: usize,
+) -> Result<(usize, Vec<Memory>)> {
+    let core = core_ref(tables)?;
+    let candidates: Vec<MemoryRow> = if phrases.is_empty() {
+        let mut rows: Vec<MemoryRow> = rows(core).filter(MemoryRow::is_live).collect();
+        rows.sort_by(|a, b| (&b.created_at, &b.id).cmp(&(&a.created_at, &a.id)));
+        rows
+    } else {
+        ranked(core, phrases)
+            .into_iter()
+            .map(|(row, _)| row)
+            .collect()
+    };
+    // `lower()` folds ASCII only, as SQLite's built-in does.
+    let names = |row: &MemoryRow, canonical: &str| {
+        let is = |v: &Option<String>| {
+            v.as_ref()
+                .is_some_and(|v| v.to_ascii_lowercase() == canonical)
+        };
+        is(&row.subject) || is(&row.object)
+    };
+    let matching: Vec<MemoryRow> = candidates
+        .into_iter()
+        .filter(|row| filter.category.as_ref().is_none_or(|c| &row.category == c))
+        .filter(|row| filter.tags.iter().all(|tag| core.tags.has(tag, &row.id)))
+        .filter(|row| {
+            filter
+                .entity
+                .as_ref()
+                .is_none_or(|scope| linked.contains(&row.id) || names(row, &scope.canonical))
+        })
+        .collect();
+    let total = matching.len();
+    let page = matching
+        .iter()
+        .skip(offset)
+        .take(limit)
+        .map(MemoryRow::to_memory)
         .collect();
     Ok((total, page))
 }

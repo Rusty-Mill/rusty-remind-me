@@ -1,7 +1,8 @@
 use super::{Result, Store};
-use crate::db::memories::{ListFilter, Memories, MemoryEdit, NewMemory};
+use crate::db::memories::{
+    EntityScope, KeywordFilter, ListFilter, Memories, MemoryEdit, NewMemory, PageFilter,
+};
 use crate::expansion::{self, MemorySearchResponse};
-use crate::fts::sanitize_fts_query;
 use crate::models::{
     AnnotateInput, AnnotateResult, AnnotationApplied, AnnotationError, BulkDeleteResult,
     BulkTagInput, BulkTagResult, ExtractBatchInput, ExtractBatchResult, Memory, MemoryAddInput,
@@ -17,11 +18,10 @@ use crate::retrieval::{
 };
 use crate::vitality::{
     apply_feedback_adjustment, calculate_vitality, get_decay_rate, get_source_prior,
-    get_type_prior, EFFECTIVE_VITALITY_FN, VITALITY_FLOOR,
+    get_type_prior, VITALITY_FLOOR,
 };
 use chrono::Utc;
-use rusqlite::types::Value;
-use rusqlite::{params, params_from_iter, Connection, Row};
+use rusqlite::{params, Row};
 
 /// Columns selected wherever a full [`Memory`] is parsed via [`parse_memory_row`].
 ///
@@ -502,40 +502,6 @@ pub fn unclassified_batch(
     })
 }
 
-/// Effective vitality as a SQL expression over the alias `m`.
-///
-/// The stored `vitality` column is a write-time snapshot that never decays, so
-/// filtering on it means `include_dormant: false` filters nothing and
-/// `min_vitality` compares against a number unrelated to the memory's current
-/// standing. This calls [`vitality::register_sql_functions`]'s scalar function
-/// instead, which keeps the predicate *before* `LIMIT`.
-///
-/// Doing it in Rust after the fetch would push the filter after the limit, the
-/// shape the reference warns about as `DI-03`: the page would be truncated
-/// first and then thinned, under-filling every result set.
-///
-/// `coalesce`s `accessed_at` to `created_at`, because a memory that has never
-/// been retrieved should age from when it was written.
-fn effective_vitality_sql() -> String {
-    format!(
-        "{}(m.base_weight, m.access_count, m.decay_rate, coalesce(m.accessed_at, m.created_at))",
-        EFFECTIVE_VITALITY_FN
-    )
-}
-
-/// Ids of every memory currently marked sensitive.
-///
-/// One query rather than a per-result check: the set is small by construction
-/// — a flag a user sets deliberately, on a single-user store — and the callers
-/// need membership tests, not rows.
-fn sensitive_ids(conn: &Connection) -> Result<std::collections::HashSet<String>> {
-    let mut stmt = conn.prepare("SELECT id FROM memories WHERE sensitive = 1")?;
-    let ids = stmt
-        .query_map([], |r| r.get::<_, String>(0))?
-        .collect::<rusqlite::Result<std::collections::HashSet<String>>>()?;
-    Ok(ids)
-}
-
 /// Search with the configured embedder, if one is resolvable and answering.
 ///
 /// Thin wrapper over [`search_memories_with_embedder`]. Every existing caller
@@ -619,7 +585,7 @@ pub fn search_memories_deadlined(
     embedder: Option<&dyn crate::embedder::Embedder>,
     deadline: crate::retrieval::Deadline,
 ) -> Result<crate::retrieval::TrimOutcome> {
-    let conn = store.conn();
+    let memories_repo = Memories::new(store);
     let mut timing = crate::retrieval::SearchTiming {
         deadline_ms: deadline.limit_ms(),
         ..Default::default()
@@ -629,61 +595,37 @@ pub fn search_memories_deadlined(
 
     // Raw user text is not a valid FTS5 MATCH expression — ordinary punctuation
     // is operator syntax there, so a question like "what's the plan?" was a
-    // syntax error rather than a search. An empty result means nothing was
-    // searchable; MATCH on an empty string is itself an error.
-    let match_expr = sanitize_fts_query(&input.query);
-    if match_expr.is_empty() {
+    // syntax error rather than a search. No phrases means nothing was
+    // searchable.
+    let phrases = crate::fts::query_phrases(&input.query);
+    if phrases.is_empty() {
         let mut outcome = trim_by_token_budget(Vec::new(), input.token_budget);
         timing.elapsed_ms = deadline.elapsed_ms();
         outcome.timing = timing;
         return Ok(outcome);
     }
 
-    // Derived from MEMORY_COLUMNS rather than spelled out, so adding a column
-    // cannot leave this query selecting a stale subset — which is exactly how
-    // `base_weight` slipped past here once. `bm25_score` rides along as a
-    // trailing extra column -- `parse_memory_row` only ever looks up columns
-    // by name, so it ignores it, and `RrfFusion::Score` mode needs the raw
-    // magnitude alongside the memory it belongs to.
-    let mut sql = format!(
-        "SELECT {}, bm25(memories_fts) AS bm25_score
-         FROM memories_fts fts
-         JOIN memories m ON m.rowid = fts.rowid
-         WHERE memories_fts MATCH ? AND m.superseded_by IS NULL AND m.deleted_at IS NULL",
-        prefixed_memory_columns("m")
-    );
-
-    let mut bindings: Vec<Value> = vec![Value::Text(match_expr.clone())];
-
-    let effective = effective_vitality_sql();
-    if !input.include_dormant {
-        sql.push_str(&format!(" AND {} >= {}", effective, VITALITY_FLOOR));
-    }
+    // Dormancy is filtered on *effective* vitality, inside the query and before
+    // its limit: the stored column never decays, and thinning a page after the
+    // limit under-fills it (the reference's `DI-03`).
+    let mut floor = if input.include_dormant {
+        None
+    } else {
+        Some(VITALITY_FLOOR)
+    };
     if input.min_vitality > 0.0 {
-        sql.push_str(&format!(" AND {} >= {}", effective, input.min_vitality));
+        floor = Some(floor.map_or(input.min_vitality, |f: f64| f.max(input.min_vitality)));
     }
-    if let Some(ref cat) = input.category {
-        sql.push_str(" AND m.category = ?");
-        bindings.push(Value::Text(cat.clone()));
-    }
-    if !input.include_sensitive {
-        sql.push_str(" AND m.sensitive = 0");
-    }
+    let filter = KeywordFilter {
+        min_effective_vitality: floor,
+        category: input.category.clone(),
+        include_sensitive: input.include_sensitive,
+    };
 
-    sql.push_str(" ORDER BY bm25(memories_fts) LIMIT ?");
-    bindings.push(Value::Integer((input.limit * 2) as i64));
-
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(bindings.iter()), |row| {
-        let memory = parse_memory_row(row)?;
-        let bm25_score: f64 = row.get("bm25_score")?;
-        Ok((memory, bm25_score))
-    })?;
-
+    // `RrfFusion::Score` mode needs the raw BM25 magnitude alongside each hit.
     let mut keyword_memories = Vec::new();
     let mut keyword_bm25 = std::collections::HashMap::new();
-    for r in rows {
-        let (memory, bm25_score) = r?;
+    for (memory, bm25_score) in memories_repo.keyword_hits(&phrases, &filter, input.limit * 2)? {
         keyword_bm25.insert(memory.id.clone(), bm25_score);
         keyword_memories.push(memory);
     }
@@ -739,7 +681,7 @@ pub fn search_memories_deadlined(
             // parameter through `semantic_search_scored`, which would change an
             // existing public signature.
             if !input.include_sensitive {
-                let hidden = sensitive_ids(conn)?;
+                let hidden = memories_repo.sensitive_ids()?;
                 memories.retain(|m| !hidden.contains(&m.id));
                 similarity.retain(|id, _| !hidden.contains(id));
             }
@@ -800,29 +742,6 @@ pub fn search_memories_deadlined(
     Ok(outcome)
 }
 
-/// Category/tag conditions shared by both branches of [`search_paginated`].
-///
-/// Deliberately narrower than [`list_filters`]: the reference's `api_search`
-/// supports `category` and `tags`, not `source` — this mirrors that exactly
-/// rather than silently offering a superset.
-fn search_page_filters(input: &SearchPageInput) -> (String, Vec<Value>) {
-    let mut sql = String::new();
-    let mut bindings: Vec<Value> = Vec::new();
-
-    if let Some(category) = input.category.as_ref().filter(|c| !c.is_empty()) {
-        sql.push_str(" AND m.category = ?");
-        bindings.push(Value::Text(category.clone()));
-    }
-    for tag in input.tags.iter().flatten() {
-        sql.push_str(
-            " AND EXISTS (SELECT 1 FROM memory_tags mt WHERE mt.memory_id = m.id AND mt.tag = ?)",
-        );
-        bindings.push(Value::Text(tag.clone()));
-    }
-
-    (sql, bindings)
-}
-
 /// Paginated full-text search behind `GET /api/memories/search`.
 ///
 /// Distinct from [`search_memories`]: that function serves the MCP tool's
@@ -850,13 +769,16 @@ fn search_page_filters(input: &SearchPageInput) -> (String, Vec<Value>) {
 /// inconsistency here would mean two search entry points disagreeing about
 /// whether a stale, superseded chunk is a result.
 pub fn search_paginated(store: &Store<'_>, input: &SearchPageInput) -> Result<SearchPageResult> {
-    let conn = store.conn();
     let limit = input.limit.clamp(LIST_LIMIT_MIN, LIST_LIMIT_MAX);
     let offset = input.offset;
-    let (filter_sql, filter_bindings) = search_page_filters(input);
 
-    let mut entity_sql = String::new();
-    let mut entity_bindings: Vec<Value> = Vec::new();
+    // Deliberately narrower than `list_memories`: the reference's `api_search`
+    // supports `category` and `tags`, not `source`.
+    let mut filter = PageFilter {
+        category: input.category.clone().filter(|c| !c.is_empty()),
+        tags: input.tags.clone().unwrap_or_default(),
+        entity: None,
+    };
     if let Some(entity_query) = &input.entity {
         let Some(entity) = crate::entity::resolve_entity(store, entity_query)? else {
             return Ok(SearchPageResult {
@@ -869,90 +791,14 @@ pub fn search_paginated(store: &Store<'_>, input: &SearchPageInput) -> Result<Se
                 message: Some(format!("No entity found matching {:?}.", entity_query)),
             });
         };
-        let canonical = crate::entity::normalize_entity_name(&entity.name);
-        entity_sql.push_str(
-            " AND (EXISTS (SELECT 1 FROM memory_entities me \
-               WHERE me.memory_id = m.id AND me.entity_id = ?) \
-               OR lower(m.subject) = ? OR lower(m.object) = ?)",
-        );
-        entity_bindings = vec![
-            Value::Text(entity.id),
-            Value::Text(canonical.clone()),
-            Value::Text(canonical),
-        ];
+        filter.entity = Some(EntityScope {
+            canonical: crate::entity::normalize_entity_name(&entity.name),
+            id: entity.id,
+        });
     }
 
-    let match_expr = sanitize_fts_query(&input.query);
-
-    let (total, memories) = if !match_expr.is_empty() {
-        let mut bindings = vec![Value::Text(match_expr)];
-        bindings.extend(filter_bindings.iter().cloned());
-        bindings.extend(entity_bindings.iter().cloned());
-
-        let total: i64 = conn.query_row(
-            &format!(
-                "SELECT count(*) FROM memories m
-                   JOIN memories_fts fts ON m.rowid = fts.rowid
-                  WHERE memories_fts MATCH ? AND m.superseded_by IS NULL
-                    AND m.deleted_at IS NULL{}{}",
-                filter_sql, entity_sql
-            ),
-            params_from_iter(bindings.iter()),
-            |row| row.get(0),
-        )?;
-
-        let mut page_bindings = bindings;
-        page_bindings.push(Value::Integer(limit as i64));
-        page_bindings.push(Value::Integer(offset as i64));
-        let sql = format!(
-            "SELECT {}
-               FROM memories m JOIN memories_fts fts ON m.rowid = fts.rowid
-              WHERE memories_fts MATCH ? AND m.superseded_by IS NULL AND m.deleted_at IS NULL{}{}
-              ORDER BY bm25(memories_fts) LIMIT ? OFFSET ?",
-            prefixed_memory_columns("m"),
-            filter_sql,
-            entity_sql
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params_from_iter(page_bindings.iter()), parse_memory_row)?;
-        let mut memories = Vec::new();
-        for row in rows {
-            memories.push(row?);
-        }
-        (total.max(0) as usize, memories)
-    } else {
-        let mut bindings = filter_bindings;
-        bindings.extend(entity_bindings.iter().cloned());
-
-        let total: i64 = conn.query_row(
-            &format!(
-                "SELECT count(*) FROM memories m
-                  WHERE m.superseded_by IS NULL AND m.deleted_at IS NULL{}{}",
-                filter_sql, entity_sql
-            ),
-            params_from_iter(bindings.iter()),
-            |row| row.get(0),
-        )?;
-
-        let mut page_bindings = bindings;
-        page_bindings.push(Value::Integer(limit as i64));
-        page_bindings.push(Value::Integer(offset as i64));
-        let sql = format!(
-            "SELECT {} FROM memories m
-              WHERE m.superseded_by IS NULL AND m.deleted_at IS NULL{}{}
-              ORDER BY m.created_at DESC LIMIT ? OFFSET ?",
-            prefixed_memory_columns("m"),
-            filter_sql,
-            entity_sql
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params_from_iter(page_bindings.iter()), parse_memory_row)?;
-        let mut memories = Vec::new();
-        for row in rows {
-            memories.push(row?);
-        }
-        (total.max(0) as usize, memories)
-    };
+    let phrases = crate::fts::query_phrases(&input.query);
+    let (total, memories) = Memories::new(store).keyword_page(&phrases, &filter, limit, offset)?;
 
     let count = memories.len();
     Ok(SearchPageResult {

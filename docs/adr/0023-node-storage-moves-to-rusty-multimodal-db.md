@@ -914,7 +914,37 @@ stats, reminders, feedback and history.
   paging), edits, tombstones, hard deletes and the batch read on both
   backends and requires identical answers.
 
-**Next:** core 2b, search. The copy tool (§5) comes after the switch-on.
+**Core 2b, done: search on the core.**
+
+- The keyword half of search and the paged search no longer build SQL in
+  `queries.rs`. They go through `Memories::keyword_hits` (with a
+  `KeywordFilter`), `Memories::keyword_page` (with a `PageFilter` and an
+  optional `EntityScope`) and `Memories::sensitive_ids`, which use the
+  core's full-text index when it is present. Both backends take the
+  query's phrases from `fts::query_phrases`, so they search for the same
+  thing.
+- The engine ranks by the same BM25 FTS5 computes. Ties, which SQLite
+  left unspecified, now break by id on both backends, and the unranked
+  newest-first page breaks `created_at` ties by id descending: the only
+  change on SQLite.
+- The dormancy filter stays inside the query, before the limit: SQLite
+  calls the registered `effective_vitality` function, and the engine
+  calls the same Rust function (`vitality::effective_vitality`), as of
+  one instant for the whole search.
+- The entity scope reads the linked memory ids from SQLite's
+  `memory_entities` while the graph stays there (core PR 3).
+  `lower(subject)` and `lower(object)` fold ASCII only, as SQLite's
+  `lower` does.
+- Vectors stay on SQLite until core PR 4, so on the core the semantic half
+  of a fused search still reads SQLite.
+- A differential test runs one corpus and a set of queries through FTS5
+  and the core: ranked hits with scores, category, sensitivity and
+  vitality filters, limits, paging, tags, the entity scope, and
+  superseded and tombstoned memories. It requires the same hits, in the
+  same order, with the same scores to ten significant digits.
+
+**Next:** core 2c: stats, reminders, feedback and history. The copy tool
+(§5) comes after the switch-on.
 
 ## Related
 
