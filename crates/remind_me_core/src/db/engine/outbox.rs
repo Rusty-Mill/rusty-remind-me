@@ -180,24 +180,10 @@ pub(crate) fn entry(
     ))
 }
 
-/// Queue `payload` under `key` on its own, when sync is enabled: for the
-/// graph's rows, which stay on SQLite for now.
-pub(crate) fn queue(
-    tables: &mut EngineTables,
-    key: &str,
-    operation: &str,
-    payload: String,
-) -> Result<()> {
-    if !sync_enabled(core_ref(tables)?) {
-        return Ok(());
-    }
-    let change = entry(tables, key, operation, payload)?;
-    tables.commit(vec![change])
-}
-
-/// Queue every memory as an insert with the backfill's payload, then each of
-/// `others` (key and payload), in one batch.
-pub(crate) fn backfill(tables: &mut EngineTables, others: Vec<(String, String)>) -> Result<()> {
+/// Queue every memory, then every entity and mention link, as inserts with
+/// the backfill's payloads, in one batch.
+pub(crate) fn backfill(tables: &mut EngineTables) -> Result<()> {
+    let others = super::graph::backfill_entries(core_ref(tables)?);
     let mut rows: Vec<_> = super::memories::rows(core_ref(tables)?).collect();
     rows.sort_by(|a, b| (&a.created_at, &a.id).cmp(&(&b.created_at, &b.id)));
     let queued = rows
@@ -398,8 +384,10 @@ mod tests {
     fn prune_drops_old_and_sent_entries_and_their_markers() {
         let mut tables = EngineTables::open_temporary_with_core().unwrap();
         set_flag(&mut tables, SYNC_ENABLED, "1").unwrap();
-        queue(&mut tables, "old", "insert", "{}".to_string()).unwrap();
-        queue(&mut tables, "new", "insert", "{}".to_string()).unwrap();
+        let change = entry(&mut tables, "old", "insert", "{}".to_string()).unwrap();
+        tables.commit(vec![change]).unwrap();
+        let change = entry(&mut tables, "new", "insert", "{}".to_string()).unwrap();
+        tables.commit(vec![change]).unwrap();
         let first = entries(core_ref(&tables).unwrap())[0].id;
         record_sends(&mut tables, "hub", &[first], "t").unwrap();
 

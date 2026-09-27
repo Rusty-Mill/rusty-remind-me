@@ -2,6 +2,25 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-27 — Entities, relations and mentions on the engine core, built dark (ADR-0023, core PR 3a)
+
+### Added
+- The engine's memories core gains the knowledge graph: entities, mention links and relations. `Entities` uses them when the core is present.
+- On the core, each graph write commits in one journal batch with its sync outbox entry. The backfill takes entities and links from the core.
+- `Entities::unlink_memory`, which removes a memory's mention links when the memory is deleted.
+- `Memories::unannotated_page`, the batch of memories still awaiting extraction.
+
+### Changed
+- Results that tie now come back in id order instead of an unspecified order. This applies to:
+  - the mention-ranked entity page;
+  - memories linked to an entity;
+  - facts naming an entity;
+  - relations touching an entity;
+  - the unannotated batch.
+
+### Tests
+- A differential test runs every graph operation with sync on against SQLite and the core. It requires identical reads, queued outbox payloads and backfill.
+
 ## 2026-09-27 — Stats counts on the engine core, built dark (ADR-0023, core PR 2d)
 
 ### Added

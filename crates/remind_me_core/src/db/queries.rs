@@ -8,9 +8,9 @@ use crate::models::{
     BulkTagInput, BulkTagResult, ExtractBatchInput, ExtractBatchResult, Memory, MemoryAddInput,
     MemoryListInput, MemoryListResult, MemorySearchInput, MemorySearchResult, MemoryUpdateInput,
     ReclassifyBatchInput, ReclassifyBatchResult, ReclassifyInput, ReclassifyResult,
-    SearchPageInput, SearchPageResult, TagMode, UnannotatedMemory, UpdateOutcome,
-    EXTRACT_BATCH_MAX, EXTRACT_BATCH_MIN, LIST_LIMIT_MAX, LIST_LIMIT_MIN, RECLASSIFY_BATCH_MAX,
-    RECLASSIFY_BATCH_MIN, UNCLASSIFIED,
+    SearchPageInput, SearchPageResult, TagMode, UpdateOutcome, EXTRACT_BATCH_MAX,
+    EXTRACT_BATCH_MIN, LIST_LIMIT_MAX, LIST_LIMIT_MIN, RECLASSIFY_BATCH_MAX, RECLASSIFY_BATCH_MIN,
+    UNCLASSIFIED,
 };
 use crate::retrieval::{
     choose_rrf_weights, rank_rrf, rrf_k_from_env, trim_by_token_budget, RrfConfig, RrfFusion,
@@ -304,10 +304,7 @@ pub fn delete_memory(store: &Store<'_>, memory_id: &str) -> Result<bool> {
     }
 
     // Entities themselves survive — other memories may still mention them.
-    conn.execute(
-        "DELETE FROM memory_entities WHERE memory_id = ?",
-        params![memory_id],
-    )?;
+    crate::db::entities::Entities::new(store).unlink_memory(memory_id)?;
     crate::db::feedback::Feedback::new(store).delete_for(memory_id)?;
     conn.execute(
         "DELETE FROM memory_associations WHERE memory_id_a = ? OR memory_id_b = ?",
@@ -916,29 +913,6 @@ pub fn search_with_expansions(
     Ok(response)
 }
 
-/// Which memories still need a triple or entity mentions.
-///
-/// A memory qualifies when it is live, is **not a raw dialog**, has no SPO
-/// triple at all, and has no entity links at all.
-///
-/// Two parts of that are easy to get wrong. The `dialog` exclusion is not
-/// cosmetic: a captured transcript's facts are meant to come out through
-/// `decompose`, so without it every captured conversation would flood this
-/// backlog. And a memory needs to be missing *both* signals — one that has
-/// entities but no triple is already considered annotated, so an `OR` here
-/// would keep re-offering work that is done.
-///
-/// `skeleton` is excluded on the same grounds and then some (#207): it is
-/// Mermaid source describing a conversation's shape, so there is no fact in it
-/// to extract and offering one costs a model call to find that out.
-fn unannotated_where() -> &'static str {
-    "m.superseded_by IS NULL
-     AND m.deleted_at IS NULL
-     AND m.category NOT IN ('dialog', 'skeleton')
-     AND m.subject IS NULL AND m.predicate IS NULL AND m.object IS NULL
-     AND NOT EXISTS (SELECT 1 FROM memory_entities me WHERE me.memory_id = m.id)"
-}
-
 /// A page of memories awaiting extraction, newest first.
 ///
 /// The read half of the annotation loop: `remind_me_annotate` writes triples
@@ -949,42 +923,11 @@ pub fn unannotated_batch(
     store: &Store<'_>,
     input: &ExtractBatchInput,
 ) -> Result<ExtractBatchResult> {
-    let conn = store.conn();
     let batch_size = input.batch_size.clamp(EXTRACT_BATCH_MIN, EXTRACT_BATCH_MAX);
-    let predicate = unannotated_where();
-
-    let total: i64 = conn.query_row(
-        &format!("SELECT count(*) FROM memories m WHERE {}", predicate),
-        [],
-        |r| r.get(0),
-    )?;
-
-    let mut stmt = conn.prepare(&format!(
-        "SELECT m.id, m.content, m.category, m.memory_type, m.tags
-           FROM memories m
-          WHERE {}
-          ORDER BY m.created_at DESC
-          LIMIT ?",
-        predicate
-    ))?;
-    let memories: Vec<UnannotatedMemory> = stmt
-        .query_map(params![batch_size as i64], |row| {
-            let content: String = row.get("content")?;
-            let tags_json: String = row.get("tags")?;
-            Ok(UnannotatedMemory {
-                id: row.get("id")?,
-                // By characters, not bytes — a multi-byte character on the
-                // boundary would panic a byte slice.
-                content_snippet: content.chars().take(500).collect(),
-                category: row.get("category")?,
-                memory_type: row.get("memory_type")?,
-                tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-            })
-        })?
-        .collect::<rusqlite::Result<_>>()?;
+    let (total_unannotated, memories) = Memories::new(store).unannotated_page(batch_size)?;
 
     Ok(ExtractBatchResult {
         memories,
-        total_unannotated: total.max(0) as usize,
+        total_unannotated,
     })
 }

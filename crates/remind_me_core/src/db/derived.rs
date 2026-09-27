@@ -14,10 +14,8 @@
 //! `sensitive` as 0 or 1.
 
 #[cfg(feature = "engine-store")]
-use super::engine::{self, EngineTables};
+use super::engine;
 use super::{Result, Store};
-#[cfg(feature = "engine-store")]
-use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension, ToSql};
 
 /// Where a write came from.
@@ -177,39 +175,21 @@ pub(crate) fn memory_ids(
 
 // --- the knowledge graph --------------------------------------------------
 
-/// Where the graph's outbox entries go: SQLite's `sync_outbox`, or the
-/// engine's when the store's tables hold the memories core. The graph's own
-/// rows stay on SQLite either way until they move.
+/// SQLite's `sync_outbox`, for the graph's writes on SQLite. On the engine
+/// core the graph queues its own entries (`db::engine::graph`).
 #[derive(Clone, Copy)]
 pub(crate) struct GraphOutbox<'c> {
     conn: &'c Connection,
-    #[cfg(feature = "engine-store")]
-    core: Option<&'c Mutex<EngineTables>>,
 }
 
 impl<'c> GraphOutbox<'c> {
     pub(crate) fn new(store: &'c Store<'_>) -> Self {
-        Self {
-            conn: store.conn(),
-            #[cfg(feature = "engine-store")]
-            core: store.core(),
-        }
+        Self { conn: store.conn() }
     }
 
     /// Queue the row `select` picks, as its key `k` and payload `p`, under
     /// `operation`, when sync is enabled. `select` binds `key` in order.
     fn queue(&self, operation: &str, select: &str, key: &[&dyn ToSql]) -> Result<()> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            let row: Option<(String, String)> = self
-                .conn
-                .query_row(select, key, |r| Ok((r.get(0)?, r.get(1)?)))
-                .optional()?;
-            let Some((key, payload)) = row else {
-                return Ok(());
-            };
-            return engine::outbox::queue(&mut core.lock(), &key, operation, payload);
-        }
         let mut bindings: Vec<&dyn ToSql> = vec![&operation];
         bindings.extend_from_slice(key);
         self.conn.execute(

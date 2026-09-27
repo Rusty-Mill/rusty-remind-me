@@ -166,10 +166,7 @@ impl<'c> Outbox<'c> {
     pub fn backfill_everything(&self) -> Result<()> {
         #[cfg(feature = "engine-store")]
         if let Some(core) = self.core {
-            return {
-                let graph = self.graph_backfill()?;
-                engine::outbox::backfill(&mut core.lock(), graph)
-            };
+            return engine::outbox::backfill(&mut core.lock());
         }
         Ok(self.conn.execute_batch(&format!(
             "INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
@@ -203,31 +200,6 @@ impl<'c> Outbox<'c> {
              FROM memory_entities;",
             now = NOW_ISO_EXPR
         ))?)
-    }
-
-    /// The backfill's entity and mention-link entries, key and payload, in
-    /// the order SQLite would queue them: the graph stays on SQLite until
-    /// its own core PR, while the outbox it is queued into is on the engine.
-    #[cfg(feature = "engine-store")]
-    fn graph_backfill(&self) -> Result<Vec<(String, String)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, json_object(
-                 'record_type', 'entity', 'id', id, 'name', name, 'kind', kind,
-                 'aliases', aliases, 'created_at', created_at, 'updated_at', updated_at,
-                 'node_id', node_id)
-               FROM entities
-             UNION ALL
-             SELECT memory_id, json_object(
-                 'record_type', 'memory_entity',
-                 'id', memory_id || '|' || entity_id,
-                 'memory_id', memory_id, 'entity_id', entity_id, 'created_at', created_at)
-               FROM memory_entities",
-        )?;
-        let rows = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<rusqlite::Result<_>>()
-            .map_err(crate::db::StoreError::from);
-        rows
     }
 }
 

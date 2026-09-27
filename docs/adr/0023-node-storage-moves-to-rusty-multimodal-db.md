@@ -989,10 +989,39 @@ With 2a–2d, every read and write of memories outside the graph, the
 vectors and the import bookkeeping goes through a repository that serves
 it from the core.
 
-**Next:** core PR 3, the graph: entities, relations, mentions,
-associations, the sync feed, curation and promotions, plus the
-unannotated batch that joins them. The copy tool (§5) comes after the
-switch-on.
+**Core 3a, done: entities, relations and mentions on the core.** Core
+PR 3 ships in three parts: 3a (this), 3b associations and the sync feed,
+3c curation and promotions.
+
+- The core gains `entities` (keyed by id), `memory_entities` (keyed by
+  the memory/entity pair, indexed by entity) and `entity_relations`
+  (keyed by id, indexed by subject). `Entities` dispatches every
+  statement to them when the core is present.
+- A graph write and its outbox entry commit as one journal batch, with
+  the payloads `db::derived` builds on SQLite: an entity's insert or
+  update, a new local mention link, a new local relation. So the graph
+  no longer needs `GraphOutbox`'s SQLite select on the core, and the
+  backfill takes entities and links from the core too.
+- The SQL's rules carry over: `INSERT OR IGNORE` on links and relations,
+  a taken entity id refused, a rename that keeps the row and re-keys it,
+  `UPDATE OR IGNORE` then `DELETE` when links are repointed, the local
+  `created_at` kept on a synced overwrite, and ASCII-only `lower()` for
+  facts naming an entity.
+- The graph's remaining SQLite callers move with it: the search entity
+  scope reads links from the core, deleting a memory unlinks it through
+  the new `Entities::unlink_memory`, and the unannotated batch becomes
+  `Memories::unannotated_page`.
+- Ties the SQL left unspecified now break by id on both backends: the
+  mention-ranked entity page, linked memories, facts, relations, the
+  unannotated batch. On the engine, `Entities::all`'s "storage order" is
+  id order.
+- A differential test runs every `Entities` method with sync on, on both
+  backends, including repoints, renames, deletes, synced overwrites,
+  unlinking and the unannotated batch. It compares every read and every
+  queued and backfilled outbox payload.
+
+**Next:** core 3b, associations and the sync feed. The copy tool (§5)
+comes after the switch-on.
 
 ## Related
 

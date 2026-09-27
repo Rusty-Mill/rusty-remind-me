@@ -15,6 +15,7 @@ pub(crate) mod analytics;
 pub(crate) mod archives;
 pub(crate) mod core;
 pub(crate) mod feedback;
+pub(crate) mod graph;
 pub(crate) mod memories;
 pub(crate) mod outbox;
 pub(crate) mod reminders;

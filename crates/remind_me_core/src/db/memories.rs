@@ -13,7 +13,7 @@ use super::engine::{self, EngineTables};
 use super::{Result, Store};
 use crate::db::derived::{memory_ids, write_memory, Origin};
 use crate::db::queries::{parse_memory_row, prefixed_memory_columns, MEMORY_COLUMNS};
-use crate::models::{Memory, UnclassifiedMemory};
+use crate::models::{Memory, UnannotatedMemory, UnclassifiedMemory};
 use crate::vitality::EFFECTIVE_VITALITY_FN;
 #[cfg(feature = "engine-store")]
 use parking_lot::Mutex;
@@ -1023,17 +1023,13 @@ impl<'c> Memories<'c> {
     ) -> Result<(usize, Vec<Memory>)> {
         #[cfg(feature = "engine-store")]
         if let Some(core) = self.core {
+            let tables = core.lock();
             let linked = match &filter.entity {
-                Some(scope) => self.linked_to(&scope.id)?,
+                Some(scope) => engine::graph::linked_ids(&tables, &scope.id)?,
                 None => HashSet::new(),
             };
             return engine::memories::keyword_page(
-                &core.lock(),
-                phrases,
-                filter,
-                &linked,
-                limit,
-                offset,
+                &tables, phrases, filter, &linked, limit, offset,
             );
         }
         let mut conditions = String::from("m.superseded_by IS NULL AND m.deleted_at IS NULL");
@@ -1083,17 +1079,42 @@ impl<'c> Memories<'c> {
         Ok((usize::try_from(total).unwrap_or(0), page))
     }
 
-    /// The ids of the memories linked to entity `entity_id`. The links stay
-    /// on SQLite until the graph moves (core PR 3).
-    #[cfg(feature = "engine-store")]
-    fn linked_to(&self, entity_id: &str) -> Result<HashSet<String>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT memory_id FROM memory_entities WHERE entity_id = ?")?;
-        let ids = stmt
-            .query_map(params![entity_id], |r| r.get(0))?
+    /// Memories awaiting extraction, newest first (ties by id, descending):
+    /// how many there are, and the first `limit` with the first 500
+    /// characters of their content. See [`unannotated_where`].
+    pub fn unannotated_page(&self, limit: usize) -> Result<(usize, Vec<UnannotatedMemory>)> {
+        on_core!(self, |tables| engine::memories::unannotated_page(
+            &tables, limit
+        ));
+        let predicate = unannotated_where();
+        let total: i64 = self.conn.query_row(
+            &format!("SELECT count(*) FROM memories m WHERE {predicate}"),
+            [],
+            |r| r.get(0),
+        )?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT m.id, m.content, m.category, m.memory_type, m.tags
+               FROM memories m
+              WHERE {predicate}
+              ORDER BY m.created_at DESC, m.id DESC
+              LIMIT ?"
+        ))?;
+        let page = stmt
+            .query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
+                let content: String = row.get("content")?;
+                let tags_json: String = row.get("tags")?;
+                Ok(UnannotatedMemory {
+                    id: row.get("id")?,
+                    // By characters, not bytes: a multi-byte character on the
+                    // boundary would panic a byte slice.
+                    content_snippet: content.chars().take(500).collect(),
+                    category: row.get("category")?,
+                    memory_type: row.get("memory_type")?,
+                    tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+                })
+            })?
             .collect::<rusqlite::Result<_>>()?;
-        Ok(ids)
+        Ok((usize::try_from(total).unwrap_or(0), page))
     }
 
     /// The id, content and metadata JSON of every live, unsuperseded,
@@ -1138,6 +1159,29 @@ impl<'c> Memories<'c> {
         }
         Ok(ids.len())
     }
+}
+
+/// Which memories still need a triple or entity mentions.
+///
+/// A memory qualifies when it is live, is **not a raw dialog**, has no SPO
+/// triple at all, and has no entity links at all.
+///
+/// Two parts of that are easy to get wrong. The `dialog` exclusion is not
+/// cosmetic: a captured transcript's facts are meant to come out through
+/// `decompose`, so without it every captured conversation would flood this
+/// backlog. And a memory needs to be missing *both* signals — one that has
+/// entities but no triple is already considered annotated, so an `OR` here
+/// would keep re-offering work that is done.
+///
+/// `skeleton` is excluded on the same grounds and then some (#207): it is
+/// Mermaid source describing a conversation's shape, so there is no fact in it
+/// to extract and offering one costs a model call to find that out.
+pub(crate) fn unannotated_where() -> &'static str {
+    "m.superseded_by IS NULL
+     AND m.deleted_at IS NULL
+     AND m.category NOT IN ('dialog', 'skeleton')
+     AND m.subject IS NULL AND m.predicate IS NULL AND m.object IS NULL
+     AND NOT EXISTS (SELECT 1 FROM memory_entities me WHERE me.memory_id = m.id)"
 }
 
 #[cfg(test)]

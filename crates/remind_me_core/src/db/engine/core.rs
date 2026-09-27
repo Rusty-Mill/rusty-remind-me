@@ -14,6 +14,9 @@
 //! inserts or replaces, a delete of a missing record is a no-op.
 
 use super::feedback::{FeedbackRecord, FeedbackTable};
+use super::graph::{
+    EntityRecord, EntityTable, LinkRecord, LinkTable, RelationRecord, RelationTable,
+};
 use super::memories::{self, MemoryRecord, MemorySearch, MemoryTable, TagIndex};
 use super::outbox::{FlagRecord, FlagTable, OutboxRecord, OutboxTable, SendRecord, SendTable};
 use super::reminders::{DeliveryRecord, DeliveryTable};
@@ -39,6 +42,9 @@ pub(crate) struct CoreTables {
     pub(crate) flags: FlagTable,
     pub(crate) deliveries: DeliveryTable,
     pub(crate) feedback: FeedbackTable,
+    pub(crate) entities: EntityTable,
+    pub(crate) links: LinkTable,
+    pub(crate) relations: RelationTable,
     /// `memories_fts`: derived from `memories` at open, never stored.
     pub(crate) search: MemorySearch,
     /// `memory_tags`: derived from `memories` at open, never stored.
@@ -56,6 +62,9 @@ impl CoreTables {
             flags: open_core(&dir.join("sync_flags.mmap"))?,
             deliveries: open_core(&dir.join("reminder_deliveries.mmap"))?,
             feedback: open_core(&dir.join("memory_feedback.mmap"))?,
+            entities: open_core(&dir.join("entities.mmap"))?,
+            links: open_core(&dir.join("memory_entities.mmap"))?,
+            relations: open_core(&dir.join("entity_relations.mmap"))?,
             search,
             tags,
         })
@@ -71,6 +80,9 @@ pub(crate) enum Change {
     Flag(Uuid, Option<FlagRecord>),
     Delivery(Uuid, Option<DeliveryRecord>),
     Feedback(Uuid, Option<FeedbackRecord>),
+    Entity(Uuid, Option<Box<EntityRecord>>),
+    Link(Uuid, Option<LinkRecord>),
+    Relation(Uuid, Option<Box<RelationRecord>>),
 }
 
 /// The journal's names for the core stores. Pinned: a journal written by
@@ -81,6 +93,9 @@ const SENDS: &str = "sync_sends";
 const FLAGS: &str = "sync_flags";
 const DELIVERIES: &str = "reminder_deliveries";
 const FEEDBACK: &str = "memory_feedback";
+const ENTITIES: &str = "entities";
+const LINKS: &str = "memory_entities";
+const RELATIONS: &str = "entity_relations";
 
 /// `changes` as a journal batch: each key and record as JSON.
 pub(super) fn encode(changes: &[Change]) -> Result<Batch> {
@@ -93,6 +108,9 @@ pub(super) fn encode(changes: &[Change]) -> Result<Batch> {
             Change::Flag(id, record) => put_or_delete(&mut batch, FLAGS, id, record)?,
             Change::Delivery(id, record) => put_or_delete(&mut batch, DELIVERIES, id, record)?,
             Change::Feedback(id, record) => put_or_delete(&mut batch, FEEDBACK, id, record)?,
+            Change::Entity(id, record) => put_or_delete(&mut batch, ENTITIES, id, record)?,
+            Change::Link(id, record) => put_or_delete(&mut batch, LINKS, id, record)?,
+            Change::Relation(id, record) => put_or_delete(&mut batch, RELATIONS, id, record)?,
         }
     }
     Ok(batch)
@@ -132,6 +150,9 @@ pub(super) fn decode(batch: &Batch) -> Result<Vec<Change>> {
                 FLAGS => Ok(Change::Flag(key(&change.key)?, record(value)?)),
                 DELIVERIES => Ok(Change::Delivery(key(&change.key)?, record(value)?)),
                 FEEDBACK => Ok(Change::Feedback(key(&change.key)?, record(value)?)),
+                ENTITIES => Ok(Change::Entity(key(&change.key)?, record(value)?)),
+                LINKS => Ok(Change::Link(key(&change.key)?, record(value)?)),
+                RELATIONS => Ok(Change::Relation(key(&change.key)?, record(value)?)),
                 other => Err(StoreError::Engine(format!(
                     "the journal holds changes to {other:?}, which this build cannot apply"
                 ))),
@@ -172,6 +193,9 @@ pub(super) fn apply(core: &mut CoreTables, change: Change) -> Result<()> {
         Change::Flag(id, record) => put_or_remove(&mut core.flags, id, record),
         Change::Delivery(id, record) => put_or_remove(&mut core.deliveries, id, record),
         Change::Feedback(id, record) => put_or_remove(&mut core.feedback, id, record),
+        Change::Entity(id, record) => put_or_remove(&mut core.entities, id, record.map(|r| *r)),
+        Change::Link(id, record) => put_or_remove(&mut core.links, id, record),
+        Change::Relation(id, record) => put_or_remove(&mut core.relations, id, record.map(|r| *r)),
     }
 }
 

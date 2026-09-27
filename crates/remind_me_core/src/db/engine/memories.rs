@@ -21,7 +21,7 @@ use crate::db::memories::{
     PageFilter, SyncView, Triple,
 };
 use crate::db::Result;
-use crate::models::{Memory, UnclassifiedMemory};
+use crate::models::{Memory, UnannotatedMemory, UnclassifiedMemory};
 use rusty_multimodal_db_engine::fulltext::{FullTextIndex, Query};
 use rusty_multimodal_db_engine::generic::query::{AllIds, FilterEq, GetById};
 use rusty_multimodal_db_engine::generic::traits::{
@@ -1047,6 +1047,36 @@ pub(crate) fn keyword_page(
         .skip(offset)
         .take(limit)
         .map(MemoryRow::to_memory)
+        .collect();
+    Ok((total, page))
+}
+
+/// What `Memories::unannotated_page` selects: live, unsuperseded memories
+/// that are not a dialog or a skeleton and have neither a triple part nor an
+/// entity link, newest first, ties by id descending.
+pub(crate) fn unannotated_page(
+    tables: &EngineTables,
+    limit: usize,
+) -> Result<(usize, Vec<UnannotatedMemory>)> {
+    let core = core_ref(tables)?;
+    let mut rows: Vec<MemoryRow> = rows(core)
+        .filter(|row| row.is_live())
+        .filter(|row| !matches!(row.category.as_str(), "dialog" | "skeleton"))
+        .filter(|row| row.subject.is_none() && row.predicate.is_none() && row.object.is_none())
+        .filter(|row| !super::graph::has_links(core, &row.id))
+        .collect();
+    rows.sort_by(|a, b| (&b.created_at, &b.id).cmp(&(&a.created_at, &a.id)));
+    let total = rows.len();
+    let page = rows
+        .into_iter()
+        .take(limit)
+        .map(|row| UnannotatedMemory {
+            content_snippet: row.content.chars().take(500).collect(),
+            tags: serde_json::from_str(&row.tags).unwrap_or_default(),
+            memory_type: row.memory_type,
+            id: row.id,
+            category: row.category,
+        })
         .collect();
     Ok((total, page))
 }
