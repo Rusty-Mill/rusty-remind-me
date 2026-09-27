@@ -37,6 +37,9 @@ pub struct Revisions<'c> {
     conn: &'c Connection,
     #[cfg(feature = "engine-store")]
     engine: Option<&'c Mutex<EngineTables>>,
+    /// The tables again when they hold the memories core.
+    #[cfg(feature = "engine-store")]
+    core: Option<&'c Mutex<EngineTables>>,
 }
 
 impl<'c> Revisions<'c> {
@@ -45,11 +48,17 @@ impl<'c> Revisions<'c> {
             conn: store.conn(),
             #[cfg(feature = "engine-store")]
             engine: store.engine(),
+            #[cfg(feature = "engine-store")]
+            core: store.core(),
         }
     }
 
     /// Whether `memory_id` names a memory that is not deleted.
     pub fn is_live(&self, memory_id: &str) -> Result<bool> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            return Ok(engine::memories::get_live(&core.lock(), memory_id)?.is_some());
+        }
         let found: Option<i64> = self
             .conn
             .query_row(
@@ -64,6 +73,10 @@ impl<'c> Revisions<'c> {
     /// `memory_id`'s tracked columns as stored now, deleted or not, or `None`
     /// if there is no such memory.
     pub fn current(&self, memory_id: &str) -> Result<Option<Tracked>> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            return engine::memories::tracked(&core.lock(), memory_id);
+        }
         Ok(self
             .conn
             .query_row(
@@ -176,6 +189,15 @@ impl<'c> Revisions<'c> {
     /// Write `values` into `memory_id`'s tracked columns, stamping
     /// `updated_at`. A `None` `sensitive` is written as not sensitive.
     pub fn restore(&self, memory_id: &str, values: &Tracked, updated_at: &str) -> Result<()> {
+        #[cfg(feature = "engine-store")]
+        if let Some(core) = self.core {
+            return engine::memories::restore_tracked(
+                &mut core.lock(),
+                memory_id,
+                values,
+                updated_at,
+            );
+        }
         write_memory(self.conn, memory_id, Origin::Local, || {
             self.write_tracked(memory_id, values, updated_at)
         })?;

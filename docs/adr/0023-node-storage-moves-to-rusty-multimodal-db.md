@@ -943,8 +943,36 @@ stats, reminders, feedback and history.
   superseded and tombstoned memories. It requires the same hits, in the
   same order, with the same scores to ten significant digits.
 
-**Next:** core 2c: stats, reminders, feedback and history. The copy tool
-(§5) comes after the switch-on.
+**Core 2c, done: reminders, feedback and history on the core.**
+
+- Two more tables join the core: `reminder_deliveries`, keyed by the
+  (memory, `remind_at`) pair that is its unique index, and
+  `memory_feedback`, keyed by its text id and indexed by memory. Both
+  commit through the journal like the rest of the core.
+- `Reminders`, `Feedback` and `Revisions` dispatch to the core for every
+  statement that reads or writes memories or those two tables: whether a
+  memory is live, setting `remind_at`, the reminder windows (with their
+  `NOT EXISTS` over deliveries), recording a delivery, importance, the
+  feedback log and the review queue (with its `NOT EXISTS` over
+  feedback), and a revert's current and restored columns.
+- The engine keeps the SQL's rules: `INSERT OR IGNORE` on a repeated
+  delivery, the `PRIMARY KEY` and the `signal` `CHECK` on feedback, and
+  `julianday` day counts for staleness. A never-read memory sorts
+  first among equal weights, as SQLite sorts `NULL`.
+- Ties the SQL left unspecified now break by id on both backends:
+  reminders by `remind_at`, the review queue by weight and then last
+  access. Feedback events list oldest first.
+- Deleting a memory removes its feedback through the new
+  `Feedback::delete_for`.
+- With this, `update_memory` and `revert` work end to end on the core.
+- Differential tests cover reminders (windows, limits, delivery,
+  rescheduling, clearing, tombstones) and feedback and history (review
+  queue and batch, events, refused ids and signals, importance, delete,
+  revert with raw stored text). Each runs on both backends and requires
+  identical answers.
+
+**Next:** core 2d, the stats counts, which completes core PR 2. The copy
+tool (§5) comes after the switch-on.
 
 ## Related
 

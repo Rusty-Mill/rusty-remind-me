@@ -14,6 +14,8 @@ use super::core::{Change, CoreTables};
 use super::EngineTables;
 use super::{core_mut, core_ref, engine_error, engine_id, ensure_same_id, micros, outbox};
 use crate::db::derived::Origin;
+use crate::db::feedback::Importance;
+use crate::db::history::Tracked;
 use crate::db::memories::{
     tags_json, AccessInputs, CreatedMemory, KeywordFilter, ListFilter, MemoryEdit, NewMemory,
     PageFilter, SyncView, Triple,
@@ -625,6 +627,57 @@ pub(crate) fn apply_edit(tables: &mut EngineTables, id: &str, edit: &MemoryEdit)
     })
 }
 
+/// Write `values` into memory `id`'s tracked columns as stored text,
+/// stamping `updated_at`: a revert. A `None` `sensitive` writes not
+/// sensitive.
+pub(crate) fn restore_tracked(
+    tables: &mut EngineTables,
+    id: &str,
+    values: &Tracked,
+    updated_at: &str,
+) -> Result<()> {
+    update(tables, id, Origin::Local, |row| {
+        row.content.clone_from(&values.content);
+        row.category.clone_from(&values.category);
+        row.tags.clone_from(&values.tags);
+        row.metadata.clone_from(&values.metadata);
+        row.sensitive = values.sensitive.unwrap_or(false);
+        row.updated_at = updated_at.to_string();
+        Ok(())
+    })
+}
+
+/// Set or clear memory `id`'s reminder, stamping `updated_at`.
+pub(crate) fn set_remind_at(
+    tables: &mut EngineTables,
+    id: &str,
+    remind_at: Option<&str>,
+    updated_at: &str,
+) -> Result<()> {
+    update(tables, id, Origin::Local, |row| {
+        row.remind_at = remind_at.map(str::to_string);
+        row.updated_at = updated_at.to_string();
+        Ok(())
+    })
+}
+
+/// Rewrite memory `id`'s importance after a global judgement, without
+/// stamping `updated_at`: a local score, not an edit.
+pub(crate) fn set_importance(
+    tables: &mut EngineTables,
+    id: &str,
+    base_weight: f64,
+    vitality: f64,
+    status: &str,
+) -> Result<()> {
+    update(tables, id, Origin::Local, |row| {
+        row.base_weight = base_weight;
+        row.vitality = vitality;
+        row.status = status.to_string();
+        Ok(())
+    })
+}
+
 /// Delete live memory `id`: tombstone it at `tombstone_at`, or remove it.
 /// Whether it was live.
 pub(crate) fn delete_live(
@@ -813,6 +866,28 @@ fn distinct(ids: &[String]) -> impl Iterator<Item = &str> {
     ids.iter()
         .map(String::as_str)
         .filter(move |id| seen.insert(*id))
+}
+
+/// Memory `id`'s tracked columns as stored, deleted or not.
+pub(crate) fn tracked(tables: &EngineTables, id: &str) -> Result<Option<Tracked>> {
+    Ok(row(core_ref(tables)?, id).map(|row| Tracked {
+        content: row.content,
+        category: row.category,
+        tags: row.tags,
+        metadata: row.metadata,
+        sensitive: Some(row.sensitive),
+    }))
+}
+
+/// Memory `id`'s importance columns, unless it is missing or deleted.
+pub(crate) fn importance(tables: &EngineTables, id: &str) -> Result<Option<Importance>> {
+    Ok(row(core_ref(tables)?, id)
+        .filter(|row| row.deleted_at.is_none())
+        .map(|row| Importance {
+            access_count: row.access_count,
+            base_weight: row.base_weight,
+            vitality: row.vitality,
+        }))
 }
 
 /// Memory `id`, unless it is missing or deleted.

@@ -14,8 +14,10 @@
 pub(crate) mod analytics;
 pub(crate) mod archives;
 pub(crate) mod core;
+pub(crate) mod feedback;
 pub(crate) mod memories;
 pub(crate) mod outbox;
+pub(crate) mod reminders;
 pub(crate) mod revisions;
 pub(crate) mod saved_searches;
 pub(crate) mod sync_log;

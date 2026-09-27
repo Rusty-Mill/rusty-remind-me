@@ -304,12 +304,11 @@ pub fn delete_memory(store: &Store<'_>, memory_id: &str) -> Result<bool> {
     }
 
     // Entities themselves survive — other memories may still mention them.
-    for table in ["memory_entities", "memory_feedback"] {
-        conn.execute(
-            &format!("DELETE FROM {} WHERE memory_id = ?", table),
-            params![memory_id],
-        )?;
-    }
+    conn.execute(
+        "DELETE FROM memory_entities WHERE memory_id = ?",
+        params![memory_id],
+    )?;
+    crate::db::feedback::Feedback::new(store).delete_for(memory_id)?;
     conn.execute(
         "DELETE FROM memory_associations WHERE memory_id_a = ? OR memory_id_b = ?",
         params![memory_id, memory_id],

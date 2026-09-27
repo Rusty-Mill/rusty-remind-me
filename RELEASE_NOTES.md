@@ -2,6 +2,29 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-27 — Reminders, feedback and history on the engine core, built dark (ADR-0023, core PR 2c)
+
+### Added
+- The engine's memories core gains the `reminder_deliveries` and `memory_feedback` tables.
+- `Reminders`, `Feedback` and `Revisions` use the core when it is present, for every read or write of memories, deliveries or feedback.
+- `Feedback::delete_for` removes a memory's feedback events, which is part of deleting a memory.
+
+### Changed
+- Ties now break by id where the order was unspecified:
+  - reminders with the same `remind_at`;
+  - review candidates with the same weight and last access.
+- A memory's feedback events now list oldest first.
+
+### Tests
+- Differential tests run reminders, feedback and history against SQLite and the core, and require identical answers. They cover:
+  - reminder windows and deliveries;
+  - rescheduled and cleared reminders;
+  - the review queue;
+  - refused feedback ids and signals;
+  - importance;
+  - deleting feedback;
+  - reverts.
+
 ## 2026-09-27 — Search on the engine core, built dark (ADR-0023, core PR 2b)
 
 ### Added

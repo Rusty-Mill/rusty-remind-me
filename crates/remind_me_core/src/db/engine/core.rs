@@ -13,8 +13,10 @@
 //! open, which applies the batch again. Applying is idempotent: a put
 //! inserts or replaces, a delete of a missing record is a no-op.
 
+use super::feedback::{FeedbackRecord, FeedbackTable};
 use super::memories::{self, MemoryRecord, MemorySearch, MemoryTable, TagIndex};
 use super::outbox::{FlagRecord, FlagTable, OutboxRecord, OutboxTable, SendRecord, SendTable};
+use super::reminders::{DeliveryRecord, DeliveryTable};
 use super::{engine_error, open_core, EngineTables};
 use crate::db::{Result, StoreError};
 use rusty_multimodal_db_engine::generic::mmap_field::MmapFieldValue;
@@ -35,6 +37,8 @@ pub(crate) struct CoreTables {
     pub(crate) outbox: OutboxTable,
     pub(crate) sends: SendTable,
     pub(crate) flags: FlagTable,
+    pub(crate) deliveries: DeliveryTable,
+    pub(crate) feedback: FeedbackTable,
     /// `memories_fts`: derived from `memories` at open, never stored.
     pub(crate) search: MemorySearch,
     /// `memory_tags`: derived from `memories` at open, never stored.
@@ -50,6 +54,8 @@ impl CoreTables {
             outbox: open_core(&dir.join("sync_outbox.mmap"))?,
             sends: open_core(&dir.join("sync_sends.mmap"))?,
             flags: open_core(&dir.join("sync_flags.mmap"))?,
+            deliveries: open_core(&dir.join("reminder_deliveries.mmap"))?,
+            feedback: open_core(&dir.join("memory_feedback.mmap"))?,
             search,
             tags,
         })
@@ -63,6 +69,8 @@ pub(crate) enum Change {
     Outbox(i64, Option<OutboxRecord>),
     Send(Uuid, Option<SendRecord>),
     Flag(Uuid, Option<FlagRecord>),
+    Delivery(Uuid, Option<DeliveryRecord>),
+    Feedback(Uuid, Option<FeedbackRecord>),
 }
 
 /// The journal's names for the core stores. Pinned: a journal written by
@@ -71,6 +79,8 @@ const MEMORIES: &str = "memories";
 const OUTBOX: &str = "sync_outbox";
 const SENDS: &str = "sync_sends";
 const FLAGS: &str = "sync_flags";
+const DELIVERIES: &str = "reminder_deliveries";
+const FEEDBACK: &str = "memory_feedback";
 
 /// `changes` as a journal batch: each key and record as JSON.
 pub(super) fn encode(changes: &[Change]) -> Result<Batch> {
@@ -81,6 +91,8 @@ pub(super) fn encode(changes: &[Change]) -> Result<Batch> {
             Change::Outbox(id, record) => put_or_delete(&mut batch, OUTBOX, id, record)?,
             Change::Send(id, record) => put_or_delete(&mut batch, SENDS, id, record)?,
             Change::Flag(id, record) => put_or_delete(&mut batch, FLAGS, id, record)?,
+            Change::Delivery(id, record) => put_or_delete(&mut batch, DELIVERIES, id, record)?,
+            Change::Feedback(id, record) => put_or_delete(&mut batch, FEEDBACK, id, record)?,
         }
     }
     Ok(batch)
@@ -118,6 +130,8 @@ pub(super) fn decode(batch: &Batch) -> Result<Vec<Change>> {
                 OUTBOX => Ok(Change::Outbox(key(&change.key)?, record(value)?)),
                 SENDS => Ok(Change::Send(key(&change.key)?, record(value)?)),
                 FLAGS => Ok(Change::Flag(key(&change.key)?, record(value)?)),
+                DELIVERIES => Ok(Change::Delivery(key(&change.key)?, record(value)?)),
+                FEEDBACK => Ok(Change::Feedback(key(&change.key)?, record(value)?)),
                 other => Err(StoreError::Engine(format!(
                     "the journal holds changes to {other:?}, which this build cannot apply"
                 ))),
@@ -156,6 +170,8 @@ pub(super) fn apply(core: &mut CoreTables, change: Change) -> Result<()> {
         Change::Outbox(id, record) => put_or_remove(&mut core.outbox, id, record),
         Change::Send(id, record) => put_or_remove(&mut core.sends, id, record),
         Change::Flag(id, record) => put_or_remove(&mut core.flags, id, record),
+        Change::Delivery(id, record) => put_or_remove(&mut core.deliveries, id, record),
+        Change::Feedback(id, record) => put_or_remove(&mut core.feedback, id, record),
     }
 }
 
