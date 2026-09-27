@@ -16,6 +16,7 @@ pub(crate) mod archives;
 pub(crate) mod revisions;
 pub(crate) mod saved_searches;
 pub(crate) mod sync_log;
+pub(crate) mod wiki;
 
 use super::StoreError;
 use rusty_multimodal_db_engine::dir_lock::DirLock;
@@ -65,6 +66,12 @@ pub struct EngineTables {
     pub(crate) sync_log: sync_log::SyncLogTable,
     pub(crate) snapshots: analytics::SnapshotTable,
     pub(crate) revisions: revisions::RevisionTable,
+    pub(crate) wiki_pages: wiki::PageTable,
+    pub(crate) wiki_links: wiki::LinkTable,
+    pub(crate) wiki_meta: wiki::MetaTable,
+    /// Derived from `wiki_pages` at open, and kept in step by every page
+    /// write; never stored.
+    pub(crate) wiki_search: wiki::PageSearch,
     journal: Journal,
     _lock: DirLock,
     _temporary: Option<TemporaryDir>,
@@ -88,6 +95,10 @@ impl EngineTables {
             sync_log: open_core(&dir.join("sync_log.mmap"))?,
             snapshots: open_core(&dir.join("analytics_snapshots.mmap"))?,
             revisions: open_core(&dir.join("memory_revisions.mmap"))?,
+            wiki_pages: open_core(&dir.join("wiki_pages.mmap"))?,
+            wiki_links: open_core(&dir.join("wiki_links.mmap"))?,
+            wiki_meta: open_core(&dir.join("wiki_meta.mmap"))?,
+            wiki_search: wiki::PageSearch::new(),
             journal,
             _lock: lock,
             _temporary: None,
@@ -98,6 +109,7 @@ impl EngineTables {
         tables.journal.raise_to(analytics::SEQUENCE, floor);
         let floor = revisions::max_id(&tables.revisions);
         tables.journal.raise_to(revisions::SEQUENCE, floor);
+        tables.wiki_search = wiki::index_pages(&tables.wiki_pages);
         Ok(tables)
     }
 

@@ -1,7 +1,7 @@
 use crate::db::wiki::WikiIndex;
 use crate::db::Result;
 use crate::db::Store;
-use crate::fts::sanitize_fts_query;
+use crate::fts::query_phrases;
 use crate::wiki_import::slugify;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -62,7 +62,7 @@ pub fn list_wiki_pages(store: &Store<'_>) -> Result<Vec<WikiPage>> {
 }
 
 /// One hit from [`search_wiki_pages`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WikiSearchHit {
     pub slug: String,
     pub title: String,
@@ -83,19 +83,19 @@ pub const WIKI_SEARCH_LIMIT_DEFAULT: usize = 10;
 /// BM25 alone.
 ///
 /// A query with no searchable tokens returns no hits rather than erroring;
-/// see [`sanitize_fts_query`].
+/// see [`crate::fts::sanitize_fts_query`].
 pub fn search_wiki_pages(
     store: &Store<'_>,
     query: &str,
     limit: usize,
 ) -> Result<Vec<WikiSearchHit>> {
-    let match_expr = sanitize_fts_query(query);
-    if match_expr.is_empty() {
+    let phrases = query_phrases(query);
+    if phrases.is_empty() {
         return Ok(Vec::new());
     }
     let limit = limit.clamp(WIKI_SEARCH_LIMIT_MIN, WIKI_SEARCH_LIMIT_MAX);
 
-    WikiIndex::new(store).search(&match_expr, limit)
+    WikiIndex::new(store).search(&phrases, limit)
 }
 
 /// Delete a wiki page addressed by either its title or its slug.

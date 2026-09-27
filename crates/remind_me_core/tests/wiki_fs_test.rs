@@ -4,6 +4,7 @@
 mod test_env;
 
 use remind_me_core::db::queries;
+use remind_me_core::db::wiki::WikiIndex;
 use remind_me_core::db::Store;
 use remind_me_core::wiki::WikiDeleteOutcome;
 use remind_me_core::wiki_fs::{
@@ -186,13 +187,8 @@ fn removing_a_link_from_a_page_removes_the_edge() {
     let (w, root) = wiki("links");
     write_file(&root, "page.md", "# Page\n\nsee [[Other]]");
     w.reconcile(&store).unwrap();
-    let edges = |store: &Store<'_>| -> i64 {
-        store
-            .sqlite()
-            .unwrap()
-            .query_row("SELECT count(*) FROM wiki_links", [], |r| r.get(0))
-            .unwrap()
-    };
+    // The page's slug is its file stem, and it is the only page.
+    let edges = |store: &Store<'_>| -> usize { WikiIndex::new(store).link_count("page").unwrap() };
     assert_eq!(edges(&store), 1);
 
     std::thread::sleep(std::time::Duration::from_millis(10));

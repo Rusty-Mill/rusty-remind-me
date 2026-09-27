@@ -804,6 +804,29 @@ this is a pure refactor with no change in behaviour.
   memory's current values, which a revert would report as no change. The
   journal (§3b) makes the pair atomic once memories move.
 
+**4h, done: the wiki on the engine, with the engine's full-text index.**
+
+- `wiki_pages`, `wiki_links` and `wiki_meta` move to the engine, and
+  `wiki_fts` becomes the engine's full-text index (§3a): in memory, built
+  from the page records when the tables open, and updated by every page
+  write in the same call, as `write_wiki_page` keeps `wiki_fts` in step.
+  None of the wiki's statements touch memories, so it moves whole.
+- The search takes phrases, not an FTS5 expression. `fts::query_phrases`
+  splits a query once; SQLite builds its `MATCH` from them
+  (`fts::match_expression`, which `sanitize_fts_query` now wraps) and the
+  engine builds `Query::any_of`, so both search for exactly the same
+  thing. A differential test runs one corpus through both and requires
+  the same pages, order and snippets.
+- Orderings follow the SQL: `updated_at` text newest first, and
+  `COLLATE NOCASE` as ASCII-only case folding. Where SQLite leaves ties
+  unspecified (equal BM25 scores, equal sort keys), the engine breaks
+  them by slug.
+- This is the last group that touches no memories. `promotions`, the
+  import bookkeeping tables, the vectors, `reminder_deliveries`,
+  `memory_feedback`, `sync_flags` and `sync_sends` are each read in SQL
+  alongside `memories`, so the rest of phase 4 is memories and what
+  joins them, planned before it starts.
+
 **Next:** the remaining groups, one PR each, in order of how few other
 groups they touch. Groups that write together (a memory, its tags, its
 outbox entry) move together and commit through the journal (§3b). The copy

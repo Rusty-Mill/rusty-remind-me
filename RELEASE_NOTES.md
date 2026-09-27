@@ -2,6 +2,16 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-27 — The wiki on the engine (ADR-0023, phase 4h)
+
+### Added
+- With the `engine-store` feature and engine tables present, the wiki's pages, links and metadata live in the engine, and wiki search runs on the engine's full-text index, rebuilt from the pages at open. Search results, their order and their snippets match FTS5's.
+- `fts::query_phrases` and `fts::match_expression`: a query's search phrases, and the FTS5 expression built from them. `sanitize_fts_query` is now the two together. `WikiIndex::search` takes phrases rather than an FTS5 expression.
+- `WikiIndex::link_count`.
+
+### Tests
+- The wiki repository's tests run on both backends, including listing orders and duplicate links. A differential test runs one corpus through FTS5 and the engine and requires identical hits and snippets. An engine test covers rebuilding the search index at open.
+
 ## 2026-09-27 — Memory revisions on the engine (ADR-0023, phase 4g)
 
 ### Added
