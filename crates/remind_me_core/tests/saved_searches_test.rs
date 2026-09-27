@@ -6,6 +6,7 @@
 //! because implementing it the other way round is the obvious guess.
 
 use remind_me_core::db::queries;
+use remind_me_core::db::saved_searches::SavedSearches;
 use remind_me_core::db::Store;
 use remind_me_core::saved_searches::{
     delete_saved_search, get_saved_search, list_saved_searches, poll_saved_search,
@@ -48,16 +49,8 @@ fn save(store: &Store<'_>, name: &str, query: &str, watch: bool) -> SavedSearch 
     .unwrap()
 }
 
-fn seen_count(store: &Store<'_>, id: &str) -> i64 {
-    store
-        .sqlite()
-        .unwrap()
-        .query_row(
-            "SELECT count(*) FROM saved_search_seen_memories WHERE saved_search_id = ?",
-            [id],
-            |r| r.get(0),
-        )
-        .unwrap()
+fn seen_count(store: &Store<'_>, id: &str) -> usize {
+    SavedSearches::new(store).seen_ids(id).unwrap().len()
 }
 
 // ---------------------------------------------------------------------------

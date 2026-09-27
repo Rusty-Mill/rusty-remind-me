@@ -2,6 +2,16 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-27 — Saved searches on the engine (ADR-0023, phase 4b)
+
+### Added
+- The `engine-store` feature of `remind_me_core` (off by default): `db::engine::EngineTables`, the engine stores for the table groups moved so far, locked by `node.lock` in their directory. With the feature on, `REMIND_ME_STORE=engine` makes `Database::open_in_memory()` keep those groups on temporary engine tables. On-disk databases stay on SQLite until the copy tool lands.
+- Saved searches and their seen-memory rows are the first group with an engine implementation. The repository behaves identically on both backends: a name in use is refused, the first sighting is kept, and a delete takes the seen rows with it.
+- `StoreError::Engine`, for failures the engine reports.
+
+### Tests
+- The saved-search repository's unit tests run every case on SQLite and, with the feature, on the engine. Engine tests cover reopening, the directory lock, id collisions and temp-dir cleanup. A new CI leg runs the whole core suite with `REMIND_ME_STORE=engine`.
+
 ## 2026-09-27 — The store seam (ADR-0023, phase 4a)
 
 ### Changed

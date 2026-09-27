@@ -1,6 +1,8 @@
 pub mod archives;
 pub mod curation;
 pub mod derived;
+#[cfg(feature = "engine-store")]
+pub mod engine;
 pub mod entities;
 pub mod feedback;
 pub mod history;
@@ -193,6 +195,10 @@ pub fn database_path(store: &Store<'_>) -> Result<Option<PathBuf>> {
 
 pub struct Database {
     conn: Mutex<Connection>,
+    /// The engine tables for the groups moved so far (ADR-0023, phase 4),
+    /// when this database was opened on the engine.
+    #[cfg(feature = "engine-store")]
+    engine: Option<Mutex<engine::EngineTables>>,
     /// `None` for an in-memory database. Kept so [`Database::open_secondary`]
     /// can reopen the same on-disk file without every caller having to carry
     /// the path around separately.
@@ -200,28 +206,60 @@ pub struct Database {
 }
 
 impl Database {
+    /// A database that lives only as long as this value.
+    ///
+    /// With the `engine-store` feature and `REMIND_ME_STORE=engine`, the
+    /// groups moved so far live in temporary engine tables: that is how the
+    /// test suite runs against both backends. Otherwise, and in every
+    /// default build, it is in-memory SQLite.
     pub fn open_in_memory() -> Result<Self> {
+        #[cfg(feature = "engine-store")]
+        if engine::engine_selected() {
+            return Self::open_in_memory_on_engine();
+        }
+        Self::open_sqlite_in_memory()
+    }
+
+    /// An in-memory database with the moved groups on temporary engine
+    /// tables, whatever `REMIND_ME_STORE` says.
+    #[cfg(feature = "engine-store")]
+    pub fn open_in_memory_on_engine() -> Result<Self> {
+        let mut db = Self::open_sqlite_in_memory()?;
+        db.engine = Some(Mutex::new(engine::EngineTables::open_temporary()?));
+        Ok(db)
+    }
+
+    fn open_sqlite_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         schema::initialize_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            #[cfg(feature = "engine-store")]
+            engine: None,
             path: None,
         })
     }
 
+    /// The database in the SQLite file at `path`. The engine does not back
+    /// an on-disk database until the copy tool exists (ADR-0023 §5).
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let conn = Connection::open(&path)?;
         schema::initialize_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            #[cfg(feature = "engine-store")]
+            engine: None,
             path: Some(path),
         })
     }
 
     /// The store, locked for as long as the handle lives.
     pub fn store(&self) -> Store<'_> {
-        Store::locked(self.conn.lock())
+        let store = Store::locked(self.conn.lock());
+        #[cfg(feature = "engine-store")]
+        let store = store.with_engine(self.engine.as_ref());
+        store
     }
 
     /// Opens a second, independent connection to the same on-disk file this

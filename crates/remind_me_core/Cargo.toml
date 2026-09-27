@@ -20,10 +20,13 @@ tokio = { version = "1.0", features = ["full"] }
 # the rusty_mill workspace is on 0.39.
 rusqlite = { version = "0.39", features = ["bundled", "backup", "functions"] }
 chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1.0", features = ["v4"] }
+uuid = { version = "1.0", features = ["v4", "v5"] }
 sha256 = "1.5"
 dirs = "5.0"
 parking_lot = "0.12"
+# The engine the node's store moves to (ADR-0023). Optional until phase 5
+# makes it the default; see the `engine-store` feature.
+rusty_multimodal_db_engine = { workspace = true, optional = true }
 pdf-extract = { version = "0.12", optional = true }
 aws-sdk-s3 = { version = "1", optional = true }
 aws-config = { version = "1", optional = true }
@@ -67,6 +70,11 @@ remind_me_hub = { path = "../remind_me_hub", default-features = false }
 
 [features]
 default = []
+# The engine-backed store, one table group at a time (ADR-0023, phase 4).
+# Off by default until phase 5. With it on, `REMIND_ME_STORE=engine` makes
+# `Database::open_in_memory` keep the groups moved so far in the engine, so
+# the test suite runs against both backends.
+engine-store = ["dep:rusty_multimodal_db_engine"]
 # PDF text extraction. Optional so a build that does not want a PDF parser
 # does not carry one (71 transitive crates), matching the reference's own
 # lazily-imported `pdf` extra. Feature-off, `.pdf` import reports the format

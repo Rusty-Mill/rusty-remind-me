@@ -680,10 +680,36 @@ this is a pure refactor with no change in behaviour.
   `rusqlite::Error`. `StoreError::NotFound` keeps SQLite's "Query returned
   no rows" message, which callers and tests match on.
 
-**Next:** one PR per table group puts the engine behind an `engine-store`
-feature. Each PR rewrites that group's raw-SQL tests through the
-repositories, so the same assertions run on both backends; schema and
-migration tests stay SQLite-only. The copy tool (§5) comes last.
+**4b, done: the engine backend, and saved searches on it.**
+
+- The `engine-store` feature (off by default) adds `db::engine`.
+  `EngineTables` holds one engine store per table moved so far, plus the
+  data-directory lock (`node.lock`). A `Store` carries the tables beside
+  its SQLite connection. Each moved repository answers from the engine when
+  the tables are present, and every other group stays on SQLite until its
+  own step, so a partly moved store is a working store.
+- `Database::open_in_memory()` attaches temporary engine tables when
+  `REMIND_ME_STORE=engine`; their directory is removed on drop. A CI leg
+  (`rusty_remind_me feature engine-store`) runs the whole core suite that
+  way, so every test that touches a moved group runs on the engine.
+  `Database::open(path)` stays on SQLite until the copy tool exists (§5).
+- Record ids follow the hub's layout: a UUID v5 of the node's string id,
+  in a node namespace, with the string kept on the record so a collision is
+  refused rather than merged. JSON columns stay JSON text, since the engine
+  encodes records with bincode.
+- The first group is saved searches (`saved_searches`,
+  `saved_search_seen_memories`). It has one caller module and no
+  cross-group writes. The unique name becomes the equality index, checked
+  before each insert; the seen rows are indexed by saved search; `INSERT OR
+  IGNORE` becomes a check by the pair's derived id. The repository's unit
+  tests run every case on both backends in one pass, and the integration
+  test that counted seen rows in SQL now counts them through the repository.
+- A failure the engine reports is `StoreError::Engine`.
+
+**Next:** the remaining groups, one PR each, in order of how few other
+groups they touch. Groups that write together (a memory, its tags, its
+outbox entry) move together and commit through the journal (§3b). The copy
+tool (§5) comes last.
 
 ## Related
 

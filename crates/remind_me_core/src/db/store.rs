@@ -10,7 +10,15 @@
 //!
 //! A [`Store`] holds the database's lock for as long as it lives, as the
 //! connection guard it replaces did.
+//!
+//! With the `engine-store` feature, a store can also carry the engine tables
+//! (`db::engine`). The groups moved so far read and write there; every
+//! other group stays on the SQLite connection until its own step.
 
+#[cfg(feature = "engine-store")]
+use super::engine::EngineTables;
+#[cfg(feature = "engine-store")]
+use parking_lot::Mutex;
 use parking_lot::MutexGuard;
 use rusqlite::Connection;
 use std::fmt;
@@ -18,6 +26,11 @@ use std::fmt;
 /// A handle on the node's store, holding its lock.
 pub struct Store<'a> {
     backend: Backend<'a>,
+    /// The engine tables, when the database was opened on the engine. Locked
+    /// per call: a repository never nests one call inside another, and the
+    /// SQLite lock this store holds already orders the callers.
+    #[cfg(feature = "engine-store")]
+    engine: Option<&'a Mutex<EngineTables>>,
 }
 
 enum Backend<'a> {
@@ -32,14 +45,31 @@ impl<'a> Store<'a> {
     pub(crate) fn locked(guard: MutexGuard<'a, Connection>) -> Self {
         Self {
             backend: Backend::SqliteLocked(guard),
+            #[cfg(feature = "engine-store")]
+            engine: None,
         }
     }
 
-    /// A store over a SQLite connection opened elsewhere.
+    /// This store, with the engine tables beside its connection.
+    #[cfg(feature = "engine-store")]
+    pub(crate) fn with_engine(self, engine: Option<&'a Mutex<EngineTables>>) -> Self {
+        Self { engine, ..self }
+    }
+
+    /// A store over a SQLite connection opened elsewhere. It has no engine
+    /// tables, so every group reads that connection.
     pub fn over_sqlite(conn: &'a Connection) -> Self {
         Self {
             backend: Backend::SqliteBorrowed(conn),
+            #[cfg(feature = "engine-store")]
+            engine: None,
         }
+    }
+
+    /// The engine tables, for the repositories moved onto them.
+    #[cfg(feature = "engine-store")]
+    pub(crate) fn engine(&self) -> Option<&'a Mutex<EngineTables>> {
+        self.engine
     }
 
     /// The SQLite connection underneath, for code that must speak SQL: the
@@ -68,6 +98,8 @@ pub enum StoreError {
     Invalid(String),
     /// SQLite failed.
     Sqlite(rusqlite::Error),
+    /// The engine failed (`engine-store` builds only).
+    Engine(String),
 }
 
 /// What every repository returns.
@@ -81,6 +113,7 @@ impl fmt::Display for StoreError {
             StoreError::NotFound => write!(f, "Query returned no rows"),
             StoreError::Invalid(why) => write!(f, "{why}"),
             StoreError::Sqlite(e) => e.fmt(f),
+            StoreError::Engine(why) => write!(f, "engine store: {why}"),
         }
     }
 }
