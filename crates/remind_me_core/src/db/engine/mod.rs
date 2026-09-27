@@ -11,6 +11,7 @@
 //! UUID v5 of the node's string id, and the string stays on the record so a
 //! collision is refused rather than merged.
 
+pub(crate) mod archives;
 pub(crate) mod saved_searches;
 
 use super::StoreError;
@@ -20,7 +21,7 @@ use rusty_multimodal_db_engine::generic::mmap_field::MmapFieldValue;
 use rusty_multimodal_db_engine::generic::traits::{
     IndexedField, Record, ScannableField, SchemaTag,
 };
-use rusty_multimodal_db_engine::generic::GenericMmapStore;
+use rusty_multimodal_db_engine::generic::{DeleteError, GenericMmapStore};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::fmt;
@@ -46,6 +47,8 @@ const NODE_NAMESPACE: Uuid = Uuid::from_u128(0x7272_6d6e_6f64_4000_8000_0000_000
 pub struct EngineTables {
     pub(crate) saved_searches: saved_searches::SavedSearchTable,
     pub(crate) seen: saved_searches::SeenTable,
+    pub(crate) archives: archives::ArchiveTable,
+    pub(crate) spans: archives::SpanTable,
     _lock: DirLock,
     _temporary: Option<TemporaryDir>,
 }
@@ -62,6 +65,8 @@ impl EngineTables {
         Ok(Self {
             saved_searches: open_core(&dir.join("saved_searches.mmap"))?,
             seen: open_core(&dir.join("saved_search_seen.mmap"))?,
+            archives: open_core(&dir.join("import_archives.mmap"))?,
+            spans: open_core(&dir.join("import_archive_spans.mmap"))?,
             _lock: lock,
             _temporary: None,
         })
@@ -113,6 +118,22 @@ pub(crate) fn ensure_same_id(stored: &str, incoming: &str) -> super::Result<()> 
 /// Any engine failure, as a [`StoreError`].
 pub(crate) fn engine_error(e: impl fmt::Display) -> StoreError {
     StoreError::Engine(e.to_string())
+}
+
+/// A delete's result, with an already-missing record counted as deleted.
+pub(crate) fn deleted(result: std::result::Result<(), DeleteError<Uuid>>) -> super::Result<()> {
+    match result {
+        Ok(()) | Err(DeleteError::NotFound(_)) => Ok(()),
+        Err(e) => Err(engine_error(e)),
+    }
+}
+
+/// `timestamp` in µs since the epoch, or 0 if it is not RFC 3339. Only an
+/// engine scan slot holds it; records keep the text as given.
+pub(crate) fn micros(timestamp: &str) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|t| t.timestamp_micros())
+        .unwrap_or(0)
 }
 
 /// Open the engine store at `path`, or create an empty one there.

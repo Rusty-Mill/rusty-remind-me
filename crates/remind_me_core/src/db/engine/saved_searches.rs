@@ -3,7 +3,9 @@
 //! these when its store carries engine tables; the behaviour matches its
 //! SQLite statements one for one.
 
-use super::{engine_error, engine_id, ensure_same_id, pair_engine_id, EngineTables};
+use super::{
+    deleted, engine_error, engine_id, ensure_same_id, micros, pair_engine_id, EngineTables,
+};
 use crate::db::saved_searches::{decode_filters, encode_filters};
 use crate::db::{Result, StoreError};
 use crate::models::SavedSearch;
@@ -11,7 +13,7 @@ use rusty_multimodal_db_engine::generic::query::{AllIds, FilterEq, GetById};
 use rusty_multimodal_db_engine::generic::traits::{
     IndexedField, Record, ScannableField, SchemaTag,
 };
-use rusty_multimodal_db_engine::generic::{DeleteError, GenericMmapStore};
+use rusty_multimodal_db_engine::generic::GenericMmapStore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use uuid::Uuid;
@@ -258,22 +260,6 @@ fn by_name(tables: &EngineTables, name: &str) -> Option<SavedSearchRow> {
 
 fn seen_rows(tables: &EngineTables, saved_search_id: &str) -> Vec<Uuid> {
     FilterEq::<SeenRow, BySearch>::filter_eq(&tables.seen, &saved_search_id.to_string())
-}
-
-/// A delete's result, with an already-missing record counted as deleted.
-fn deleted(result: std::result::Result<(), DeleteError<Uuid>>) -> Result<()> {
-    match result {
-        Ok(()) | Err(DeleteError::NotFound(_)) => Ok(()),
-        Err(e) => Err(engine_error(e)),
-    }
-}
-
-/// `timestamp` in µs since the epoch, or 0 if it is not RFC 3339. Only the
-/// engine's scan slot holds it; `first_seen_at` keeps the text as given.
-fn micros(timestamp: &str) -> i64 {
-    chrono::DateTime::parse_from_rfc3339(timestamp)
-        .map(|t| t.timestamp_micros())
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

@@ -12,6 +12,7 @@ mod test_env;
 use remind_me_core::archive::{
     self, ARCHIVE_DIR_ENV, ARCHIVE_MAX_AGE_DAYS_ENV, ARCHIVE_MAX_BYTES_ENV,
 };
+use remind_me_core::db::archives::Archives;
 use remind_me_core::db::Store;
 use remind_me_core::importer::import_chat;
 use remind_me_core::undo_import::undo_import;
@@ -81,8 +82,10 @@ fn memory_ids(store: &Store<'_>) -> Vec<String> {
     rows.collect::<Result<_, _>>().unwrap()
 }
 
-fn open(dir: &std::path::Path) -> Database {
-    Database::open(dir.join("memories.db").display().to_string()).unwrap()
+/// In memory, so `REMIND_ME_STORE=engine` runs these against the engine:
+/// the archive blobs still go to a real directory.
+fn open() -> Database {
+    Database::open_in_memory().unwrap()
 }
 
 #[test]
@@ -103,7 +106,7 @@ fn an_import_with_retention_off_records_no_spans() {
     let path = dir.join("chat.jsonl");
     std::fs::write(&path, transcript_line("a fact", "hmm", "/etc/hosts")).unwrap();
 
-    let db = open(&dir);
+    let db = open();
     let store = db.store();
     import(&store, &path);
 
@@ -111,19 +114,8 @@ fn an_import_with_retention_off_records_no_spans() {
     assert!(!memory_ids(&store).is_empty());
     // ...but nothing was retained, and the tables are present-and-empty rather
     // than missing: the read path must never have to tolerate absent tables.
-    let spans: i64 = store
-        .sqlite()
-        .unwrap()
-        .query_row("SELECT count(*) FROM import_archive_spans", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    let archives: i64 = store
-        .sqlite()
-        .unwrap()
-        .query_row("SELECT count(*) FROM import_archives", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!((spans, archives), (0, 0));
+    let spans = Archives::new(&store).span_count(None).unwrap();
+    assert_eq!((spans, archive_rows(&store)), (0, 0));
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -143,7 +135,7 @@ fn a_memory_can_recover_the_blocks_the_importer_dropped() {
     )
     .unwrap();
 
-    let db = open(&dir);
+    let db = open();
     let store = db.store();
     import(&store, &path);
 
@@ -197,7 +189,7 @@ fn each_memory_points_at_its_own_line_not_the_whole_file() {
     )
     .unwrap();
 
-    let db = open(&dir);
+    let db = open();
     let store = db.store();
     import(&store, &path);
 
@@ -237,7 +229,7 @@ fn undoing_an_import_takes_its_archive_with_it() {
     let path = dir.join("chat.jsonl");
     std::fs::write(&path, transcript_line("a fact", "a thought", "/one")).unwrap();
 
-    let db = open(&dir);
+    let db = open();
     let store = db.store();
     let outcome = import(&store, &path);
     let import_id = match outcome {
@@ -245,15 +237,7 @@ fn undoing_an_import_takes_its_archive_with_it() {
         other => panic!("expected an import, got {:?}", other),
     };
 
-    let blob: String = store
-        .sqlite()
-        .unwrap()
-        .query_row(
-            "SELECT archive_path FROM import_archives WHERE import_id = ?",
-            [&import_id],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let blob = archive_path(&store, &import_id);
     assert!(std::path::Path::new(&blob).exists());
 
     undo_import(
@@ -270,24 +254,9 @@ fn undoing_an_import_takes_its_archive_with_it() {
     // `undo_import` drops the tracking row so the content is re-importable.
     // An archive left behind would be a blob nothing references, and its
     // spans would point at memories that no longer exist.
-    let archives: i64 = store
-        .sqlite()
-        .unwrap()
-        .query_row(
-            "SELECT count(*) FROM import_archives WHERE import_id = ?",
-            [&import_id],
-            |r| r.get(0),
-        )
-        .unwrap();
-    let spans: i64 = store
-        .sqlite()
-        .unwrap()
-        .query_row(
-            "SELECT count(*) FROM import_archive_spans WHERE import_id = ?",
-            [&import_id],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let repo = Archives::new(&store);
+    let archives = usize::from(repo.blob_of(&import_id).unwrap().is_some());
+    let spans = repo.span_count(Some(&import_id)).unwrap();
     assert_eq!((archives, spans), (0, 0), "no orphaned archive rows");
     assert!(
         !std::path::Path::new(&blob).exists(),
@@ -301,23 +270,23 @@ fn undoing_an_import_takes_its_archive_with_it() {
 /// Backdate an archive row so age-based retention has something to bite on.
 /// Faster and more deterministic than waiting a day.
 fn backdate(store: &Store<'_>, import_id: &str, days: i64) {
-    let when = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
-    store
-        .sqlite()
+    let repo = Archives::new(store);
+    let mut row = repo
+        .oldest_first()
         .unwrap()
-        .execute(
-            "UPDATE import_archives SET archived_at = ? WHERE import_id = ?",
-            rusqlite::params![when, import_id],
-        )
-        .unwrap();
+        .into_iter()
+        .find(|r| r.import_id == import_id)
+        .expect("an archive to backdate");
+    row.archived_at = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+    repo.record(&row).unwrap();
 }
 
-fn archive_rows(store: &Store<'_>) -> i64 {
-    store
-        .sqlite()
-        .unwrap()
-        .query_row("SELECT count(*) FROM import_archives", [], |r| r.get(0))
-        .unwrap()
+fn archive_rows(store: &Store<'_>) -> usize {
+    Archives::new(store).oldest_first().unwrap().len()
+}
+
+fn archive_path(store: &Store<'_>, import_id: &str) -> String {
+    Archives::new(store).blob_of(import_id).unwrap().unwrap().0
 }
 
 fn clear_limits() {
@@ -335,7 +304,7 @@ fn with_no_limits_configured_pruning_removes_nothing() {
 
     let path = dir.join("chat.jsonl");
     std::fs::write(&path, transcript_line("a fact", "t", "/one")).unwrap();
-    let db = open(&dir);
+    let db = open();
     let store = db.store();
     let import_id = match import(&store, &path) {
         ImportOutcome::Imported { import_id, .. } => import_id,
@@ -367,22 +336,14 @@ fn an_archive_past_the_age_limit_is_removed_but_its_memories_are_not() {
 
     let path = dir.join("chat.jsonl");
     std::fs::write(&path, transcript_line("a fact", "a thought", "/one")).unwrap();
-    let db = open(&dir);
+    let db = open();
     let store = db.store();
     let import_id = match import(&store, &path) {
         ImportOutcome::Imported { import_id, .. } => import_id,
         other => panic!("expected an import, got {:?}", other),
     };
     let ids = memory_ids(&store);
-    let blob: String = store
-        .sqlite()
-        .unwrap()
-        .query_row(
-            "SELECT archive_path FROM import_archives WHERE import_id = ?",
-            [&import_id],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let blob = archive_path(&store, &import_id);
 
     backdate(&store, &import_id, 40);
     crate::test_env::set_var(ARCHIVE_MAX_AGE_DAYS_ENV, "30");
@@ -418,7 +379,7 @@ fn a_dry_run_reports_without_removing() {
 
     let path = dir.join("chat.jsonl");
     std::fs::write(&path, transcript_line("a fact", "t", "/one")).unwrap();
-    let db = open(&dir);
+    let db = open();
     let store = db.store();
     let import_id = match import(&store, &path) {
         ImportOutcome::Imported { import_id, .. } => import_id,
@@ -445,7 +406,7 @@ fn the_size_ceiling_evicts_oldest_first_and_keeps_the_newest() {
 
     let dir = scratch("size");
     crate::test_env::set_var(ARCHIVE_DIR_ENV, dir.join("archive"));
-    let db = open(&dir);
+    let db = open();
     let store = db.store();
 
     // Three distinct imports, each a few hundred bytes.
@@ -462,20 +423,14 @@ fn the_size_ceiling_evicts_oldest_first_and_keeps_the_newest() {
         backdate(&store, &import_ids[id], age);
     }
 
-    let total: i64 = store
-        .sqlite()
+    let lens: Vec<i64> = Archives::new(&store)
+        .oldest_first()
         .unwrap()
-        .query_row("SELECT sum(byte_len) FROM import_archives", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    let one_row: i64 = store
-        .sqlite()
-        .unwrap()
-        .query_row("SELECT max(byte_len) FROM import_archives", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
+        .iter()
+        .map(|r| r.byte_len)
+        .collect();
+    let total: i64 = lens.iter().sum();
+    let one_row: i64 = lens.iter().copied().max().unwrap();
     assert!(total > one_row, "fixture needs distinct blobs");
 
     // A ceiling that fits roughly one of the three.
@@ -487,12 +442,13 @@ fn the_size_ceiling_evicts_oldest_first_and_keeps_the_newest() {
     assert!(report.bytes_remaining <= (one_row + 8) as u64);
 
     // The newest survives: it is the one most likely to be drilled into.
-    let survivor: String = store
-        .sqlite()
+    let survivors: Vec<String> = Archives::new(&store)
+        .oldest_first()
         .unwrap()
-        .query_row("SELECT import_id FROM import_archives", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(survivor, import_ids[2]);
+        .into_iter()
+        .map(|r| r.import_id)
+        .collect();
+    assert_eq!(survivors, [import_ids[2].clone()]);
 
     clear_limits();
     crate::test_env::remove_var(ARCHIVE_DIR_ENV);
@@ -521,7 +477,7 @@ fn a_malformed_line_does_not_shift_the_spans_after_it() {
     )
     .unwrap();
 
-    let db = open(&dir);
+    let db = open();
     let store = db.store();
     import(&store, &path);
 

@@ -2,12 +2,24 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-27 — Import archives on the engine (ADR-0023, phase 4c)
+
+### Added
+- With the `engine-store` feature and engine tables present, raw-transcript archives and their per-memory spans live in the engine. The repository behaves as on SQLite: recording again replaces, removing an import takes its spans, a span without an archive has no source, and shared blobs are counted by hash.
+- `Archives::span_count`, so callers and tests can count spans without SQL.
+
+### Tests
+- The archive repository's unit tests run on both backends. The archive integration tests use an in-memory database and repository reads, so the engine CI leg covers them.
+
 ## 2026-09-27 — Saved searches on the engine (ADR-0023, phase 4b)
 
 ### Added
 - The `engine-store` feature of `remind_me_core` (off by default): `db::engine::EngineTables`, the engine stores for the table groups moved so far, locked by `node.lock` in their directory. With the feature on, `REMIND_ME_STORE=engine` makes `Database::open_in_memory()` keep those groups on temporary engine tables. On-disk databases stay on SQLite until the copy tool lands.
 - Saved searches and their seen-memory rows are the first group with an engine implementation. The repository behaves identically on both backends: a name in use is refused, the first sighting is kept, and a delete takes the seen rows with it.
 - `StoreError::Engine`, for failures the engine reports.
+
+### Fixed
+- `remind-me-checks.yml` parses again. A half-deleted header comment had broken it since the phase 0 change, so the plugin.json version check had not run.
 
 ### Tests
 - The saved-search repository's unit tests run every case on SQLite and, with the feature, on the engine. Engine tests cover reopening, the directory lock, id collisions and temp-dir cleanup. A new CI leg runs the whole core suite with `REMIND_ME_STORE=engine`.

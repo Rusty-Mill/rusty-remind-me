@@ -257,15 +257,7 @@ fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SavedSearch> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{Database, StoreError};
-
-    /// Run `test` against every backend this build has: SQLite always, the
-    /// engine too with `engine-store`.
-    fn on_each_backend(test: impl Fn(&Database)) {
-        test(&Database::open_sqlite_in_memory().unwrap());
-        #[cfg(feature = "engine-store")]
-        test(&Database::open_in_memory_on_engine().unwrap());
-    }
+    use crate::db::{on_each_backend, Database, StoreError};
 
     fn saved(id: &str, name: &str) -> SavedSearch {
         SavedSearch {

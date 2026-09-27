@@ -706,6 +706,21 @@ this is a pure refactor with no change in behaviour.
   test that counted seen rows in SQL now counts them through the repository.
 - A failure the engine reports is `StoreError::Engine`.
 
+**4c, done: import archives on the engine.**
+
+- `import_archives` and `import_archive_spans` move to the engine. Their
+  one caller is `crate::archive`, and they touch no other group.
+- An archive is keyed by its import id and indexed by blob hash, which
+  `count_with_hash` counts; a span is keyed by its memory id and indexed
+  by import, which `remove` walks. `INSERT OR REPLACE` becomes replace-if-
+  present, and `span_source` keeps the inner join's rule: a span whose
+  import has no archive has no source.
+- `oldest_first` orders by the `archived_at` text as SQLite compares it,
+  with ties in import-id order where SQLite leaves them unspecified.
+- The repository gains `span_count`, so the integration tests stop reading
+  the tables with SQL. Those tests now open an in-memory database, so the
+  engine CI leg runs them against the engine.
+
 **Next:** the remaining groups, one PR each, in order of how few other
 groups they touch. Groups that write together (a memory, its tags, its
 outbox entry) move together and commit through the journal (§3b). The copy

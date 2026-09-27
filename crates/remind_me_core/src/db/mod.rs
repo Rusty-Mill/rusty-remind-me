@@ -301,3 +301,12 @@ impl Database {
         Ok(conn)
     }
 }
+
+/// Run `test` against every backend this build has: SQLite always, the
+/// engine too with `engine-store`.
+#[cfg(test)]
+pub(crate) fn on_each_backend(test: impl Fn(&Database)) {
+    test(&Database::open_sqlite_in_memory().unwrap());
+    #[cfg(feature = "engine-store")]
+    test(&Database::open_in_memory_on_engine().unwrap());
+}
