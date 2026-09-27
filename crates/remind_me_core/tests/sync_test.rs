@@ -14,6 +14,7 @@ mod test_env;
 mod support;
 
 use remind_me_core::db::queries;
+use remind_me_core::db::sync_state::SyncState;
 use remind_me_core::db::Store;
 use remind_me_core::sync::{
     self, pull_remote, push_outbox, upsert_record, ApplyOutcome, SyncRecord, CLIENT_ENV,
@@ -680,14 +681,9 @@ fn pull_remote_applies_the_hubs_changes_and_persists_the_cursor() {
         .unwrap();
     assert_eq!(count, 1);
 
-    let (last_pull, last_pull_id): (String, String) = local_conn
-        .sqlite()
+    let (last_pull, last_pull_id) = SyncState::new(&local_conn)
+        .pull_cursor("hub")
         .unwrap()
-        .query_row(
-            "SELECT last_pull, last_pull_id FROM sync_log WHERE remote_id = 'hub'",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
         .unwrap();
     assert_ne!(last_pull, "1970-01-01T00:00:00+00:00");
     assert!(!last_pull_id.is_empty());
@@ -877,13 +873,12 @@ fn a_successful_push_and_pull_advance_the_remotes_liveness_timestamps() {
     push_outbox(&local_conn, &hub.url, SECRET, "local-node", "hub").unwrap();
     pull_remote(&local_conn, &hub.url, SECRET, "local-node", "hub").unwrap();
 
-    let (last_attempt_at, last_push_at, last_pull_at): (String, String, String) = local_conn
-        .sqlite().unwrap().query_row(
-            "SELECT last_attempt_at, last_push_at, last_pull_at FROM sync_log WHERE remote_id = 'hub'",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
+    let row = SyncState::new(&local_conn)
+        .remote_row("hub")
+        .unwrap()
         .unwrap();
+    let (last_attempt_at, last_push_at, last_pull_at) =
+        (row.last_attempt_at, row.last_push_at, row.last_pull_at);
 
     const EPOCH: &str = "1970-01-01T00:00:00+00:00";
     assert_ne!(

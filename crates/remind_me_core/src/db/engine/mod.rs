@@ -13,6 +13,7 @@
 
 pub(crate) mod archives;
 pub(crate) mod saved_searches;
+pub(crate) mod sync_log;
 
 use super::StoreError;
 use rusty_multimodal_db_engine::dir_lock::DirLock;
@@ -53,6 +54,7 @@ pub struct EngineTables {
     pub(crate) seen: saved_searches::SeenTable,
     pub(crate) archives: archives::ArchiveTable,
     pub(crate) spans: archives::SpanTable,
+    pub(crate) sync_log: sync_log::SyncLogTable,
     _lock: DirLock,
     _temporary: Option<TemporaryDir>,
 }
@@ -71,6 +73,7 @@ impl EngineTables {
             seen: open_core(&dir.join("saved_search_seen.mmap"))?,
             archives: open_core(&dir.join("import_archives.mmap"))?,
             spans: open_core(&dir.join("import_archive_spans.mmap"))?,
+            sync_log: open_core(&dir.join("sync_log.mmap"))?,
             _lock: lock,
             _temporary: None,
         })

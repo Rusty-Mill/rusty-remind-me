@@ -7,6 +7,7 @@ mod test_env;
 
 mod support;
 
+use remind_me_core::db::sync_state::SyncState;
 use remind_me_core::db::Store;
 use remind_me_core::entity::{self, entity_id, entity_relation_id};
 use remind_me_core::sync::{
@@ -576,15 +577,12 @@ fn pull_entities_applies_the_hubs_entities_and_persists_a_namespaced_cursor() {
 
     assert_eq!(report.applied, 1);
     assert!(entity_row(&local_conn, &entity_id("Hub Entity")).is_some());
-    let cursor_rows: i64 = local_conn
-        .sqlite()
-        .unwrap()
-        .query_row(
-            "SELECT count(*) FROM sync_log WHERE remote_id = 'hub#entities'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let cursor_rows = usize::from(
+        SyncState::new(&local_conn)
+            .remote_row("hub#entities")
+            .unwrap()
+            .is_some(),
+    );
     assert_eq!(
         cursor_rows, 1,
         "the entities cursor is namespaced separately from the bare memories cursor"
@@ -703,16 +701,12 @@ fn pull_entities_tolerates_a_404_from_a_peer_that_predates_graph_sync() {
 
     assert_eq!(report.applied, 0);
     assert_eq!(report.pages, 0);
-    let cursor_rows: i64 = db
-        .store()
-        .sqlite()
-        .unwrap()
-        .query_row(
-            "SELECT count(*) FROM sync_log WHERE remote_id = 'old-peer#entities'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let cursor_rows = usize::from(
+        SyncState::new(&db.store())
+            .remote_row("old-peer#entities")
+            .unwrap()
+            .is_some(),
+    );
     assert_eq!(
         cursor_rows, 0,
         "no cursor is written for a 404 -- there was nothing real to record"

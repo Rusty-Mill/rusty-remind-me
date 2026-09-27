@@ -2,6 +2,15 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-27 — Sync cursors on the engine (ADR-0023, phase 4e)
+
+### Added
+- With the `engine-store` feature and engine tables present, `sync_log` (each remote's pull cursors and liveness stamps) lives in the engine. The other sync bookkeeping, `sync_flags` and `sync_sends`, stays on SQLite for now.
+- `SyncState::remote_row` and `SyncState::put_remote_row`, a whole-row read and write over the new `SyncLogRow`, whose `new` holds the schema's defaults.
+
+### Tests
+- The sync-state repository's cursor tests run on both backends, and a new test covers whole-row round trips and default rows. The sync integration tests seed and inspect `sync_log` through the repository, so the engine CI leg covers them.
+
 ## 2026-09-27 — Background threads share the engine tables (ADR-0023, phase 4d)
 
 ### Changed

@@ -13,6 +13,7 @@
 mod test_env;
 
 use remind_me_core::db::queries;
+use remind_me_core::db::sync_state::{SyncLogRow, SyncState};
 use remind_me_core::db::Store;
 use remind_me_core::sync::{sync_repair, sync_status, HUB_URL_ENV, NODE_ID_ENV, SYNC_SECRET_ENV};
 use remind_me_core::{Database, DrainVerdict, MemoryAddInput, SyncStatus};
@@ -58,22 +59,16 @@ fn add(store: &Store<'_>, content: &str) {
 }
 
 fn remote(store: &Store<'_>, id: &str, attempt: &str, push: &str, pull: &str) {
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "INSERT INTO sync_log (remote_id, last_pull, last_push, last_pull_id,
-                               last_attempt_at, last_push_at, last_pull_at)
-         VALUES (?, ?, ?, 'cursor-abc', ?, ?, ?)",
-            rusqlite::params![
-                id,
-                "2026-01-01T00:00:00+00:00",
-                "2026-01-01T00:00:00+00:00",
-                attempt,
-                push,
-                pull
-            ],
-        )
+    SyncState::new(store)
+        .put_remote_row(&SyncLogRow {
+            last_pull: "2026-01-01T00:00:00+00:00".into(),
+            last_push: "2026-01-01T00:00:00+00:00".into(),
+            last_pull_id: "cursor-abc".into(),
+            last_attempt_at: attempt.into(),
+            last_push_at: push.into(),
+            last_pull_at: pull.into(),
+            ..SyncLogRow::new(id)
+        })
         .unwrap();
 }
 
@@ -443,15 +438,8 @@ fn repair_resets_the_cursor_and_leaves_the_contact_clocks_alone() {
 
     assert!(sync_repair(&store, "hub").unwrap());
 
-    let (last_pull, cursor_id, attempt): (String, String, String) = store
-        .sqlite()
-        .unwrap()
-        .query_row(
-            "SELECT last_pull, last_pull_id, last_attempt_at FROM sync_log WHERE remote_id = 'hub'",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .unwrap();
+    let row = SyncState::new(&store).remote_row("hub").unwrap().unwrap();
+    let (last_pull, cursor_id, attempt) = (row.last_pull, row.last_pull_id, row.last_attempt_at);
 
     // The cursor goes back to the epoch so history is re-pulled...
     assert_eq!(last_pull, EPOCH);

@@ -749,6 +749,25 @@ this is a pure refactor with no change in behaviour.
   I/O runs outside the store lock, a larger change for the same result.
   Once SQLite goes, a `SecondarySource` is just the engine handle.
 
+**4e, done: `sync_log` on the engine.**
+
+- Each remote's pull cursors and liveness stamps move to the engine, keyed
+  by remote id. `sync_flags` and `sync_sends`, the other two tables
+  `SyncState` owns, stay on SQLite: `db::derived`'s outbox gate reads
+  `sync_flags` inside its SQL, and `db::outbox`'s batch query joins
+  `sync_sends`. They move with those groups.
+- Every write is a read-modify-write of the remote's whole row, as the
+  SQL's `INSERT … ON CONFLICT DO UPDATE` is column by column; a remote
+  with no row starts from the schema's defaults (epoch timestamps, empty
+  keyset id, `hub_seq` cursor -1). `reset_pull_cursors` stays an
+  `UPDATE`: no row, no write.
+- The sync worker writes these rows from its own thread, which 4d made
+  possible.
+- `SyncState` gains `remote_row` and `put_remote_row`, a whole-row read
+  and write over `SyncLogRow`. The copy tool (§5) writes rows whole, and
+  the sync tests seed states no sync cycle produces; five integration
+  test files stop reading and writing `sync_log` in SQL.
+
 **Next:** the remaining groups, one PR each, in order of how few other
 groups they touch. Groups that write together (a memory, its tags, its
 outbox entry) move together and commit through the journal (§3b). The copy

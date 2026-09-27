@@ -8,8 +8,17 @@
 //!
 //! Policy stays in [`crate::sync`] too: what a missing cursor means, what the
 //! epoch default means, and when a stamp is best-effort.
+//!
+//! With the `engine-store` feature, a store that carries engine tables keeps
+//! `sync_log` there (`db::engine::sync_log`, ADR-0023 phase 4e). `sync_flags`
+//! and `sync_sends` stay on SQLite until the groups that read them in SQL
+//! (`db::derived`'s outbox gate, `db::outbox`) move.
 
+#[cfg(feature = "engine-store")]
+use super::engine::{self, EngineTables};
 use super::{Result, Store};
+#[cfg(feature = "engine-store")]
+use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 
 /// One remote's `sync_log` liveness stamps.
@@ -21,20 +30,118 @@ pub struct RemoteLog {
     pub last_pull_at: String,
 }
 
-/// The sync bookkeeping tables, over one connection.
+/// The epoch every `sync_log` timestamp column defaults to.
+const EPOCH: &str = "1970-01-01T00:00:00+00:00";
+
+/// One whole `sync_log` row: a remote's pull cursors and liveness stamps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncLogRow {
+    pub remote_id: String,
+    pub last_pull: String,
+    pub last_push: String,
+    pub last_pull_id: String,
+    pub last_attempt_at: String,
+    pub last_push_at: String,
+    pub last_pull_at: String,
+    pub last_pull_seq: i64,
+}
+
+impl SyncLogRow {
+    /// A row for `remote_id` holding the schema's defaults: every timestamp
+    /// the epoch, no keyset id, and the `hub_seq` cursor unknown (-1).
+    pub fn new(remote_id: &str) -> Self {
+        Self {
+            remote_id: remote_id.to_string(),
+            last_pull: EPOCH.to_string(),
+            last_push: EPOCH.to_string(),
+            last_pull_id: String::new(),
+            last_attempt_at: EPOCH.to_string(),
+            last_push_at: EPOCH.to_string(),
+            last_pull_at: EPOCH.to_string(),
+            last_pull_seq: -1,
+        }
+    }
+}
+
+/// The sync bookkeeping tables, over one store.
 pub struct SyncState<'c> {
     conn: &'c Connection,
+    #[cfg(feature = "engine-store")]
+    engine: Option<&'c Mutex<EngineTables>>,
 }
 
 impl<'c> SyncState<'c> {
     pub fn new(store: &'c Store<'_>) -> Self {
-        let conn = store.conn();
-        Self { conn }
+        Self {
+            conn: store.conn(),
+            #[cfg(feature = "engine-store")]
+            engine: store.engine(),
+        }
+    }
+
+    /// `remote_id`'s whole `sync_log` row, if it has one.
+    pub fn remote_row(&self, remote_id: &str) -> Result<Option<SyncLogRow>> {
+        #[cfg(feature = "engine-store")]
+        if let Some(engine) = self.engine {
+            return Ok(engine::sync_log::row(&engine.lock(), remote_id));
+        }
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT remote_id, last_pull, last_push, last_pull_id, last_attempt_at,
+                        last_push_at, last_pull_at, last_pull_seq
+                   FROM sync_log WHERE remote_id = ?",
+                params![remote_id],
+                |r| {
+                    Ok(SyncLogRow {
+                        remote_id: r.get(0)?,
+                        last_pull: r.get(1)?,
+                        last_push: r.get(2)?,
+                        last_pull_id: r.get(3)?,
+                        last_attempt_at: r.get(4)?,
+                        last_push_at: r.get(5)?,
+                        last_pull_at: r.get(6)?,
+                        last_pull_seq: r.get(7)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Store `row` whole, replacing any row for its remote: for copying a
+    /// store, and for tests that need a state no sync cycle produces.
+    pub fn put_remote_row(&self, row: &SyncLogRow) -> Result<()> {
+        #[cfg(feature = "engine-store")]
+        if let Some(engine) = self.engine {
+            return engine::sync_log::put(&mut engine.lock(), row);
+        }
+        self.conn.execute(
+            "INSERT OR REPLACE INTO sync_log
+                 (remote_id, last_pull, last_push, last_pull_id, last_attempt_at,
+                  last_push_at, last_pull_at, last_pull_seq)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                row.remote_id,
+                row.last_pull,
+                row.last_push,
+                row.last_pull_id,
+                row.last_attempt_at,
+                row.last_push_at,
+                row.last_pull_at,
+                row.last_pull_seq
+            ],
+        )?;
+        Ok(())
     }
 
     /// `remote_id`'s keyset pull cursor `(last_pull, last_pull_id)`, or `None`
     /// if the remote has no `sync_log` row.
     pub fn pull_cursor(&self, remote_id: &str) -> Result<Option<(String, String)>> {
+        #[cfg(feature = "engine-store")]
+        if let Some(engine) = self.engine {
+            return Ok(engine::sync_log::row(&engine.lock(), remote_id)
+                .map(|r| (r.last_pull, r.last_pull_id)));
+        }
         Ok(self
             .conn
             .query_row(
@@ -47,6 +154,13 @@ impl<'c> SyncState<'c> {
 
     /// Store `remote_id`'s keyset pull cursor.
     pub fn set_pull_cursor(&self, remote_id: &str, since: &str, since_id: &str) -> Result<()> {
+        #[cfg(feature = "engine-store")]
+        if let Some(engine) = self.engine {
+            return engine::sync_log::upsert(&mut engine.lock(), remote_id, |r| {
+                r.last_pull = since.to_string();
+                r.last_pull_id = since_id.to_string();
+            });
+        }
         self.conn.execute(
             "INSERT INTO sync_log (remote_id, last_pull, last_pull_id) VALUES (?, ?, ?)
              ON CONFLICT(remote_id) DO UPDATE SET
@@ -60,6 +174,10 @@ impl<'c> SyncState<'c> {
     /// `remote_id`'s `hub_seq` pull cursor, or `None` if the remote has no
     /// `sync_log` row.
     pub fn seq_cursor(&self, remote_id: &str) -> Result<Option<i64>> {
+        #[cfg(feature = "engine-store")]
+        if let Some(engine) = self.engine {
+            return Ok(engine::sync_log::row(&engine.lock(), remote_id).map(|r| r.last_pull_seq));
+        }
         Ok(self
             .conn
             .query_row(
@@ -72,6 +190,12 @@ impl<'c> SyncState<'c> {
 
     /// Store `remote_id`'s `hub_seq` pull cursor.
     pub fn set_seq_cursor(&self, remote_id: &str, seq: i64) -> Result<()> {
+        #[cfg(feature = "engine-store")]
+        if let Some(engine) = self.engine {
+            return engine::sync_log::upsert(&mut engine.lock(), remote_id, |r| {
+                r.last_pull_seq = seq
+            });
+        }
         self.conn.execute(
             "INSERT INTO sync_log (remote_id, last_pull_seq) VALUES (?, ?)
              ON CONFLICT(remote_id) DO UPDATE SET last_pull_seq = excluded.last_pull_seq",
@@ -83,6 +207,14 @@ impl<'c> SyncState<'c> {
     /// Reset `remote_id`'s pull cursors to `since` (with an empty id) and
     /// `seq`, leaving its liveness stamps alone. `false` if it has no row.
     pub fn reset_pull_cursors(&self, remote_id: &str, since: &str, seq: i64) -> Result<bool> {
+        #[cfg(feature = "engine-store")]
+        if let Some(engine) = self.engine {
+            return engine::sync_log::update(&mut engine.lock(), remote_id, |r| {
+                r.last_pull = since.to_string();
+                r.last_pull_id = String::new();
+                r.last_pull_seq = seq;
+            });
+        }
         let affected = self.conn.execute(
             "UPDATE sync_log
                 SET last_pull = ?, last_pull_id = '', last_pull_seq = ?
@@ -95,6 +227,13 @@ impl<'c> SyncState<'c> {
     /// Stamp a successful push to `remote_id` at `at`: `last_attempt_at` and
     /// `last_push_at`.
     pub fn stamp_push(&self, remote_id: &str, at: &str) -> Result<()> {
+        #[cfg(feature = "engine-store")]
+        if let Some(engine) = self.engine {
+            return engine::sync_log::upsert(&mut engine.lock(), remote_id, |r| {
+                r.last_attempt_at = at.to_string();
+                r.last_push_at = at.to_string();
+            });
+        }
         self.conn.execute(
             "INSERT INTO sync_log (remote_id, last_attempt_at, last_push_at) VALUES (?, ?, ?)
              ON CONFLICT(remote_id) DO UPDATE SET
@@ -108,6 +247,13 @@ impl<'c> SyncState<'c> {
     /// Stamp a successful pull from `remote_id` at `at`: `last_attempt_at`
     /// and `last_pull_at`.
     pub fn stamp_pull(&self, remote_id: &str, at: &str) -> Result<()> {
+        #[cfg(feature = "engine-store")]
+        if let Some(engine) = self.engine {
+            return engine::sync_log::upsert(&mut engine.lock(), remote_id, |r| {
+                r.last_attempt_at = at.to_string();
+                r.last_pull_at = at.to_string();
+            });
+        }
         self.conn.execute(
             "INSERT INTO sync_log (remote_id, last_attempt_at, last_pull_at) VALUES (?, ?, ?)
              ON CONFLICT(remote_id) DO UPDATE SET
@@ -120,6 +266,10 @@ impl<'c> SyncState<'c> {
 
     /// `remote_id`'s `last_pull_at`, or `None` if it has no row.
     pub fn last_pull_at(&self, remote_id: &str) -> Result<Option<String>> {
+        #[cfg(feature = "engine-store")]
+        if let Some(engine) = self.engine {
+            return Ok(engine::sync_log::row(&engine.lock(), remote_id).map(|r| r.last_pull_at));
+        }
         Ok(self
             .conn
             .query_row(
@@ -132,6 +282,10 @@ impl<'c> SyncState<'c> {
 
     /// Every remote's liveness stamps, ordered by `remote_id`.
     pub fn remotes(&self) -> Result<Vec<RemoteLog>> {
+        #[cfg(feature = "engine-store")]
+        if let Some(engine) = self.engine {
+            return Ok(engine::sync_log::remotes(&engine.lock()));
+        }
         let mut stmt = self.conn.prepare(
             "SELECT remote_id, last_attempt_at, last_push_at, last_pull_at
                FROM sync_log ORDER BY remote_id",
@@ -188,11 +342,45 @@ impl<'c> SyncState<'c> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::Database;
+    use crate::db::{on_each_backend, Database};
 
     #[test]
     fn cursor_writes_touch_only_their_own_columns() {
-        let db = Database::open_in_memory().unwrap();
+        on_each_backend(cursor_writes_touch_only_their_own_columns_on);
+    }
+
+    #[test]
+    fn a_whole_row_round_trips_and_new_rows_take_the_defaults() {
+        on_each_backend(|db| {
+            let store = db.store();
+            let state = SyncState::new(&store);
+            state.set_seq_cursor("hub", 3).unwrap();
+            assert_eq!(
+                state.remote_row("hub").unwrap(),
+                Some(SyncLogRow {
+                    last_pull_seq: 3,
+                    ..SyncLogRow::new("hub")
+                }),
+                "an upsert on a new remote starts from the schema's defaults"
+            );
+
+            let row = SyncLogRow {
+                remote_id: "peer".into(),
+                last_pull: "a".into(),
+                last_push: "b".into(),
+                last_pull_id: "c".into(),
+                last_attempt_at: "d".into(),
+                last_push_at: "e".into(),
+                last_pull_at: "f".into(),
+                last_pull_seq: 9,
+            };
+            state.put_remote_row(&row).unwrap();
+            assert_eq!(state.remote_row("peer").unwrap(), Some(row));
+            assert_eq!(state.remote_row("nowhere").unwrap(), None);
+        });
+    }
+
+    fn cursor_writes_touch_only_their_own_columns_on(db: &Database) {
         let store = db.store();
         let state = SyncState::new(&store);
         assert_eq!(state.pull_cursor("hub").unwrap(), None);

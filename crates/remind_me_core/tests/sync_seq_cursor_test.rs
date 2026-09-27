@@ -11,6 +11,7 @@
 //! reacts to what comes back — including responses no real server in this
 //! workspace produces (a hub that omits `hub_seq`, an empty first page).
 
+use remind_me_core::db::sync_state::{SyncLogRow, SyncState};
 use remind_me_core::db::Store;
 use remind_me_core::sync::pull_remote;
 use remind_me_core::Database;
@@ -143,15 +144,10 @@ fn scripted_hub(
 }
 
 fn seq_cursor(store: &Store<'_>, remote_id: &str) -> i64 {
-    store
-        .sqlite()
+    SyncState::new(store)
+        .seq_cursor(remote_id)
         .unwrap()
-        .query_row(
-            "SELECT last_pull_seq FROM sync_log WHERE remote_id = ?",
-            [remote_id],
-            |r| r.get(0),
-        )
-        .unwrap()
+        .expect("a sync_log row")
 }
 
 /// A record carrying a `hub_seq`, as a hub serves it.
@@ -258,15 +254,7 @@ fn an_empty_probe_leaves_the_state_unknown_rather_than_unsupported() {
 
     pull_remote(&store, &url, SECRET, "this-node", "empty-hub").unwrap();
 
-    let stored: Option<i64> = store
-        .sqlite()
-        .unwrap()
-        .query_row(
-            "SELECT last_pull_seq FROM sync_log WHERE remote_id = ?",
-            ["empty-hub"],
-            |r| r.get(0),
-        )
-        .ok();
+    let stored = SyncState::new(&store).seq_cursor("empty-hub").unwrap();
     assert!(
         stored.is_none() || stored == Some(-1),
         "an empty probe must leave the cursor unknown, got {stored:?}"
@@ -287,15 +275,7 @@ fn an_unreachable_remote_is_not_mistaken_for_one_lacking_the_feature() {
 
     let _ = pull_remote(&store, &url, SECRET, "this-node", "down");
 
-    let stored: Option<i64> = store
-        .sqlite()
-        .unwrap()
-        .query_row(
-            "SELECT last_pull_seq FROM sync_log WHERE remote_id = ?",
-            ["down"],
-            |r| r.get(0),
-        )
-        .ok();
+    let stored = SyncState::new(&store).seq_cursor("down").unwrap();
     assert!(
         stored.is_none() || stored == Some(-1),
         "a failed probe must leave the state unknown so the next cycle retries, got {stored:?}"
@@ -315,13 +295,11 @@ fn a_record_stamped_behind_the_legacy_cursor_is_still_pulled() {
     // arrives.
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "INSERT INTO sync_log (remote_id, last_pull, last_pull_id) VALUES (?, ?, '')",
-            rusqlite::params!["hub", "2026-06-01T00:00:00+00:00"],
-        )
+    SyncState::new(&store)
+        .put_remote_row(&SyncLogRow {
+            last_pull: "2026-06-01T00:00:00+00:00".into(),
+            ..SyncLogRow::new("hub")
+        })
         .unwrap();
 
     // The stub behaves like a real hub: the stranded record is reachable
@@ -388,13 +366,11 @@ fn a_page_that_does_not_advance_the_sequence_stops_the_cycle() {
     // responses are scripted; only the probe and one page should be consumed.
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "INSERT INTO sync_log (remote_id, last_pull, last_pull_seq) VALUES (?, ?, ?)",
-            rusqlite::params!["hub", "1970-01-01T00:00:00+00:00", 50],
-        )
+    SyncState::new(&store)
+        .put_remote_row(&SyncLogRow {
+            last_pull_seq: 50,
+            ..SyncLogRow::new("hub")
+        })
         .unwrap();
 
     let stale = json!({"records": [hub_record("old", "2026-01-01T00:00:00+00:00", 50)]});
@@ -429,28 +405,19 @@ fn sync_repair_clears_a_stuck_unsupported_verdict() {
     // that was never established.
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "INSERT INTO sync_log (remote_id, last_pull, last_pull_id, last_pull_seq)
-         VALUES ('hub', '2026-01-01T00:00:00+00:00', 'some-id', -2)",
-            [],
-        )
+    SyncState::new(&store)
+        .put_remote_row(&SyncLogRow {
+            last_pull: "2026-01-01T00:00:00+00:00".into(),
+            last_pull_id: "some-id".into(),
+            last_pull_seq: -2,
+            ..SyncLogRow::new("hub")
+        })
         .unwrap();
 
     assert!(remind_me_core::sync::sync_repair(&store, "hub").unwrap());
 
     assert_eq!(seq_cursor(&store, "hub"), -1, "back to SEQ_UNKNOWN, not 0");
-    let (last_pull, last_pull_id): (String, String) = store
-        .sqlite()
-        .unwrap()
-        .query_row(
-            "SELECT last_pull, last_pull_id FROM sync_log WHERE remote_id = 'hub'",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .unwrap();
+    let (last_pull, last_pull_id) = SyncState::new(&store).pull_cursor("hub").unwrap().unwrap();
     assert_eq!(last_pull, "1970-01-01T00:00:00+00:00");
     assert_eq!(last_pull_id, "");
 }

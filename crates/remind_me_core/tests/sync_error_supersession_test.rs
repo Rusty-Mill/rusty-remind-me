@@ -9,10 +9,10 @@
 //! The classifier is tested directly. It is the whole judgment; the rest of
 //! the path is one struct field move.
 
+use remind_me_core::db::sync_state::{SyncLogRow, SyncState};
 use remind_me_core::db::Store;
 use remind_me_core::sync::sync_error_superseded;
 use remind_me_core::Database;
-use rusqlite::params;
 
 const EPOCH: &str = "1970-01-01T00:00:00+00:00";
 
@@ -21,15 +21,15 @@ fn at(minutes_ago: i64) -> String {
 }
 
 fn remote(store: &Store<'_>, remote_id: &str, push_at: &str, pull_at: &str) {
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "INSERT INTO sync_log (remote_id, last_pull, last_push, last_pull_id,
-                               last_attempt_at, last_push_at, last_pull_at)
-         VALUES (?, '', '', '', ?, ?, ?)",
-            params![remote_id, push_at, push_at, pull_at],
-        )
+    SyncState::new(store)
+        .put_remote_row(&SyncLogRow {
+            last_pull: String::new(),
+            last_push: String::new(),
+            last_attempt_at: push_at.into(),
+            last_push_at: push_at.into(),
+            last_pull_at: pull_at.into(),
+            ..SyncLogRow::new(remote_id)
+        })
         .unwrap();
 }
 
