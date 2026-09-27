@@ -57,9 +57,47 @@ impl<'a> Store<'a> {
         Self { engine, ..self }
     }
 
+    /// Run `work` as one transaction: every write it makes lands, or none
+    /// does. On SQLite that is a transaction on this store's connection;
+    /// when the tables hold the memories core, the core's writes are one
+    /// page there (`db::engine::page`), finished before SQLite commits.
+    ///
+    /// `work` gets a store to write through. An error from it, or a panic,
+    /// rolls both back.
+    ///
+    /// # Errors
+    ///
+    /// Whatever `work` returns, or [`StoreError`] if the transaction cannot
+    /// begin or commit.
+    pub fn transaction<T, E>(
+        &self,
+        work: impl FnOnce(&Store<'_>) -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E>
+    where
+        E: From<StoreError>,
+    {
+        let tx = self
+            .conn()
+            .unchecked_transaction()
+            .map_err(StoreError::from)?;
+        #[cfg(feature = "engine-store")]
+        let page = self
+            .core()
+            .map(super::engine::page::Page::begin)
+            .transpose()?;
+        let done = work(&self.sharing_engine(&tx))?;
+        #[cfg(feature = "engine-store")]
+        if let Some(page) = page {
+            page.finish()?;
+        }
+        tx.commit().map_err(StoreError::from)?;
+        Ok(done)
+    }
+
     /// A store over `conn` that shares this store's engine tables: for code
     /// that runs a SQLite transaction of its own inside a store call. The
-    /// engine writes are not part of that transaction.
+    /// engine writes are not part of that transaction; use
+    /// [`Store::transaction`] for that.
     pub fn sharing_engine<'c>(&self, conn: &'c Connection) -> Store<'c> {
         let store = Store::over_sqlite(conn);
         #[cfg(feature = "engine-store")]
@@ -219,6 +257,60 @@ impl From<rusqlite::Error> for StoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failed transaction, then one that succeeds, as text, on `db`.
+    fn exercise_transactions(db: &super::super::Database) -> Vec<String> {
+        use crate::db::imports::ImportLedger;
+        use crate::db::memories::{Memories, NewMemory};
+        use crate::db::vectors::Vectors;
+        const NOW: &str = "2026-09-27T00:00:00+00:00";
+
+        let store = db.store();
+        Vectors::new(&store).put("m1", 0, &[1]).unwrap();
+        let write = |page: &Store<'_>, fail: bool| -> Result<usize> {
+            Memories::new(page).insert(&NewMemory::new("m1", "quokka", NOW))?;
+            Vectors::new(page).put("m1", 0, &[2])?;
+            ImportLedger::new(page).record_mempalace("d1", "m1", NOW)?;
+            // The page reads its own writes.
+            let seen = ImportLedger::new(page).imported_drawers(&["d1"])?.len();
+            if fail {
+                return Err(StoreError::Invalid("the importer gave up".to_string()));
+            }
+            Ok(seen)
+        };
+        let state = |store: &Store<'_>| {
+            format!(
+                "{:?} {:?} {:?}",
+                Memories::new(store).exists("m1").unwrap(),
+                Vectors::new(store).any_embedding().unwrap(),
+                ImportLedger::new(store).imported_drawers(&["d1"]).unwrap(),
+            )
+        };
+        let failed = store.transaction(|page| write(page, true));
+        let mut seen = vec![format!("{failed:?}"), state(&store)];
+        let kept = store.transaction(|page| write(page, false));
+        seen.push(format!("{kept:?}"));
+        seen.push(state(&store));
+        seen
+    }
+
+    #[test]
+    fn a_transaction_lands_whole_or_not_at_all_on_both_backends() {
+        let mut observed = Vec::new();
+        super::super::on_each_core_backend(|db| observed.push(exercise_transactions(db)));
+        let sqlite = &observed[0];
+        assert_eq!(
+            sqlite[1], "false Some([1]) []",
+            "the failed one left nothing"
+        );
+        assert_eq!(
+            sqlite[3], "true Some([2]) [\"d1\"]",
+            "the other landed whole"
+        );
+        for other in &observed[1..] {
+            assert_eq!(other, sqlite);
+        }
+    }
 
     #[test]
     fn no_rows_becomes_not_found_and_keeps_its_message() {

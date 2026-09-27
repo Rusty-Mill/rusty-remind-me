@@ -20,6 +20,7 @@ pub(crate) mod graph;
 pub(crate) mod imports;
 pub(crate) mod memories;
 pub(crate) mod outbox;
+pub(crate) mod page;
 pub(crate) mod promotions;
 pub(crate) mod related;
 pub(crate) mod reminders;
@@ -87,6 +88,10 @@ pub struct EngineTables {
     /// until the switch-on PR (see [`core`]).
     pub(crate) core: Option<core::CoreTables>,
     journal: Journal,
+    /// The undo log of the open page, if any (see [`page`]).
+    undo: Journal,
+    /// The page open on the core, if any.
+    page: Option<page::OpenPage>,
     /// Set when a batch was durable but did not reach every store: the
     /// tables then refuse writes until reopened, which applies it again.
     failed: bool,
@@ -115,6 +120,7 @@ impl EngineTables {
     fn open_with(dir: &Path, with_core: bool) -> super::Result<Self> {
         let lock = DirLock::acquire(dir, LOCK_FILE).map_err(engine_error)?;
         let opened = Journal::open(&dir.join(JOURNAL_FILE)).map_err(engine_error)?;
+        let undo = Journal::open(&dir.join(page::UNDO_FILE)).map_err(engine_error)?;
         let core = if with_core {
             Some(core::CoreTables::open(dir)?)
         } else {
@@ -134,10 +140,14 @@ impl EngineTables {
             wiki_search: wiki::PageSearch::new(),
             core,
             journal: opened.journal,
+            undo: undo.journal,
+            page: None,
             failed: false,
             _lock: lock,
             _temporary: None,
         };
+        // An unfinished page first, then the batches after it.
+        tables.roll_back(undo.replay)?;
         tables.replay(opened.replay)?;
         // A table written by something other than this journal (the copy
         // tool, or an older build) must still never see an id reissued.

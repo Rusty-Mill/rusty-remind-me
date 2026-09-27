@@ -378,93 +378,90 @@ pub fn pull_mempalace(
     }
 
     let now = Utc::now().to_rfc3339();
-    // One SQLite transaction for the page; the engine store makes the page
-    // one batch instead (ADR-0023, phase 4).
-    let tx = store.conn().unchecked_transaction()?;
-    let batch = store.sharing_engine(&tx);
+    // One transaction for the page: a SQLite transaction, and one journal
+    // batch on the engine's memories core (ADR-0023, core PR 4b).
+    store.transaction(|batch| -> Result<(), MempalaceImportError> {
+        for drawer in &to_import {
+            let wing_val = drawer.wing.clone().unwrap_or_default();
+            let room_val = drawer.room.clone().unwrap_or_default();
 
-    for drawer in &to_import {
-        let wing_val = drawer.wing.clone().unwrap_or_default();
-        let room_val = drawer.room.clone().unwrap_or_default();
+            let (mem_category, mem_tags, mem_source, created_at, content) =
+                match parse_frontmatter(&drawer.document) {
+                    Some((fields, body)) => {
+                        let category = fields
+                            .get("category")
+                            .filter(|c| !c.is_empty())
+                            .cloned()
+                            .or_else(|| Some(input.category.clone()).filter(|c| !c.is_empty()))
+                            .unwrap_or_else(|| DEFAULT_CATEGORY.to_string());
+                        let native_tags: Vec<String> = fields
+                            .get("tags")
+                            .map(|t| {
+                                t.split(',')
+                                    .map(str::trim)
+                                    .filter(|t| !t.is_empty())
+                                    .map(str::to_string)
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let tags: Vec<String> = native_tags
+                            .into_iter()
+                            .chain(input.tags.iter().cloned())
+                            .collect();
+                        let source = format!(
+                            "mempalace:{}",
+                            fields
+                                .get("source")
+                                .map(String::as_str)
+                                .unwrap_or("unknown")
+                        );
+                        let created = fields
+                            .get("created")
+                            .cloned()
+                            .unwrap_or_else(|| now.clone());
+                        (category, tags, source, created, body)
+                    }
+                    None => {
+                        let category = if input.category.is_empty() {
+                            DEFAULT_CATEGORY.to_string()
+                        } else {
+                            input.category.clone()
+                        };
+                        let tags: Vec<String> = [wing_val.as_str(), room_val.as_str()]
+                            .into_iter()
+                            .filter(|t| !t.is_empty())
+                            .map(str::to_string)
+                            .chain(input.tags.iter().cloned())
+                            .collect();
+                        (
+                            category,
+                            tags,
+                            OPAQUE_SOURCE.to_string(),
+                            now.clone(),
+                            drawer.document.clone(),
+                        )
+                    }
+                };
 
-        let (mem_category, mem_tags, mem_source, created_at, content) =
-            match parse_frontmatter(&drawer.document) {
-                Some((fields, body)) => {
-                    let category = fields
-                        .get("category")
-                        .filter(|c| !c.is_empty())
-                        .cloned()
-                        .or_else(|| Some(input.category.clone()).filter(|c| !c.is_empty()))
-                        .unwrap_or_else(|| DEFAULT_CATEGORY.to_string());
-                    let native_tags: Vec<String> = fields
-                        .get("tags")
-                        .map(|t| {
-                            t.split(',')
-                                .map(str::trim)
-                                .filter(|t| !t.is_empty())
-                                .map(str::to_string)
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    let tags: Vec<String> = native_tags
-                        .into_iter()
-                        .chain(input.tags.iter().cloned())
-                        .collect();
-                    let source = format!(
-                        "mempalace:{}",
-                        fields
-                            .get("source")
-                            .map(String::as_str)
-                            .unwrap_or("unknown")
-                    );
-                    let created = fields
-                        .get("created")
-                        .cloned()
-                        .unwrap_or_else(|| now.clone());
-                    (category, tags, source, created, body)
-                }
-                None => {
-                    let category = if input.category.is_empty() {
-                        DEFAULT_CATEGORY.to_string()
-                    } else {
-                        input.category.clone()
-                    };
-                    let tags: Vec<String> = [wing_val.as_str(), room_val.as_str()]
-                        .into_iter()
-                        .filter(|t| !t.is_empty())
-                        .map(str::to_string)
-                        .chain(input.tags.iter().cloned())
-                        .collect();
-                    (
-                        category,
-                        tags,
-                        OPAQUE_SOURCE.to_string(),
-                        now.clone(),
-                        drawer.document.clone(),
-                    )
-                }
-            };
+            let memory_id = format!("mem_{}", uuid::Uuid::new_v4().simple());
+            let metadata = serde_json::json!({
+                "mempalace_drawer_id": drawer.drawer_id,
+                "wing": wing_val,
+                "room": room_val,
+            });
 
-        let memory_id = format!("mem_{}", uuid::Uuid::new_v4().simple());
-        let metadata = serde_json::json!({
-            "mempalace_drawer_id": drawer.drawer_id,
-            "wing": wing_val,
-            "room": room_val,
-        });
-
-        Memories::new(&batch).insert_or_ignore(&NewMemory {
-            category: mem_category,
-            tags: mem_tags,
-            source: mem_source,
-            metadata,
-            created_at,
-            ..NewMemory::new(memory_id.clone(), content, &now)
-        })?;
-        ImportLedger::new(&batch).record_mempalace(&drawer.drawer_id, &memory_id, &now)?;
-    }
-
-    drop(batch);
-    tx.commit()?;
+            Memories::new(batch).insert_or_ignore(&NewMemory {
+                category: mem_category,
+                tags: mem_tags,
+                source: mem_source,
+                metadata,
+                created_at,
+                ..NewMemory::new(memory_id.clone(), content, &now)
+            })?;
+            ImportLedger::new(batch).record_mempalace(&drawer.drawer_id, &memory_id, &now)?;
+        }
+        Ok(())
+    })?;
     result.imported = to_import.len();
     Ok(result)
 }

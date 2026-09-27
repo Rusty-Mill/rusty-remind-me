@@ -2,6 +2,19 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-27 — Import pages as one journal batch on the engine core (ADR-0023, core PR 4b)
+
+### Added
+- `Store::transaction`, which makes a unit of work land whole or not at all. It uses a SQLite transaction, plus one page on the engine's memories core when the core is present. An error or a panic rolls both back.
+- Pages on the engine core. A page's writes are readable as it goes, and an undo log beside the redo journal makes a crash leave either all of the page or none of it.
+
+### Changed
+- The dbs and mempalace importers write each page through `Store::transaction`.
+
+### Tests
+- Page tests: finishing, abandoning, a crash inside a page, a crash after its redo commit, and another thread's write during a page.
+- Differential tests on both backends: a failed transaction and a successful one, and a dbs import followed by a rerun that supersedes an item.
+
 ## 2026-09-27 — Vectors and import bookkeeping on the engine core, built dark (ADR-0023, core PR 4a)
 
 ### Added

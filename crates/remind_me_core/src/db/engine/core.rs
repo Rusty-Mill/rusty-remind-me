@@ -321,7 +321,8 @@ where
 
 impl EngineTables {
     /// Make `changes` durable as one journal batch, apply them, and
-    /// checkpoint.
+    /// checkpoint; inside an open page, add them to it instead (see
+    /// [`super::page`]).
     ///
     /// # Errors
     ///
@@ -331,12 +332,18 @@ impl EngineTables {
     /// applies the batch again: checkpointing past it would lose it.
     pub(crate) fn commit(&mut self, changes: Vec<Change>) -> Result<()> {
         self.ensure_writable()?;
-        let Some(core) = self.core.as_mut() else {
+        if self.core.is_none() {
             return Err(no_core());
-        };
+        }
         if changes.is_empty() {
             return Ok(());
         }
+        if self.in_page()? {
+            return self.commit_in_page(changes);
+        }
+        let Some(core) = self.core.as_mut() else {
+            return Err(no_core());
+        };
         let batch = encode(&changes)?;
         self.journal.commit(&batch).map_err(engine_error)?;
         for change in changes {

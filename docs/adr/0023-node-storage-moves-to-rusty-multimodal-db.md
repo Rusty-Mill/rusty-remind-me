@@ -1101,8 +1101,41 @@ transactions journal batches.
   memories, orphan chunks, duplicate ids in the arguments and
   case-varied prefixes, and requires identical answers.
 
-**Next:** core PR 4b, each importer page as one journal batch. Then the
-switch-on; the copy tool (§5) comes after it.
+**Core 4b, done: an importer page is one journal batch. Core PR 4 is
+complete.**
+
+- `Store::transaction(work)` runs `work` as one transaction: a SQLite
+  transaction, and when the core is present, one *page* on it. An error
+  or panic in `work` rolls both back. The dbs and mempalace importers use
+  it for each page in place of their own `unchecked_transaction`.
+- A page's writes reach the stores as they are made, because the
+  importer reads its own writes (an entity upserted two items earlier).
+  An undo log (`node.undo`, a second journal) makes that safe. Before
+  each write, the records it replaces go to the undo log, synced.
+  Finishing the page commits all its writes as one redo batch, then
+  empties the undo log, then checkpoints. Abandoning it puts the replaced
+  records back, newest first.
+- At open, the tables first undo whatever the undo log holds, then
+  replay the redo journal. A crash before the redo commit leaves no trace
+  of the page; a crash after it leaves all of it. Sequence values a page
+  allocates become durable with its redo batch.
+- While a page is open, only the thread that opened it may write to the
+  core. Another thread's write is refused, not folded into a page it did
+  not ask for. A write that fails part-way leaves the page able only to
+  be abandoned. Another thread's reads see the page's writes before it
+  finishes; SQLite's WAL hid them. The switch-on must decide how
+  background writers wait for a page, since today their writes would be
+  refused.
+- Tests: finishing, abandoning, dropping an unfinished page, a crash
+  inside a page, a crash between the redo commit and the undo
+  checkpoint, and another thread's write during a page. A differential
+  test runs a failed transaction and a successful one on both backends.
+  Another runs a dbs import and a rerun that supersedes an item on both,
+  with items that share a tag entity within one page.
+
+With core PR 4, every table the memories core replaces is on it.
+
+**Next:** core PR 5, the switch-on. The copy tool (§5) comes after it.
 
 ## Related
 
