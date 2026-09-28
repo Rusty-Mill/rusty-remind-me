@@ -1,7 +1,7 @@
 //! End-to-end coverage for the store daemon (ADR-0023 phase 2).
 //!
-//! These run the real binary with `REMIND_ME_DAEMON=1`, so the first client
-//! starts a real detached daemon and every later one talks to it over
+//! These run the real binary with `REMIND_ME_DAEMON=1` (and `0` for the
+//! in-process comparison), so the first client starts a real detached daemon and every later one talks to it over
 //! loopback. Each test has its own database directory, so its own daemon,
 //! and stops it on the way out, pass or fail.
 
@@ -43,7 +43,7 @@ impl Scratch {
         if daemon {
             command.env("REMIND_ME_DAEMON", "1");
         } else {
-            command.env_remove("REMIND_ME_DAEMON");
+            command.env("REMIND_ME_DAEMON", "0");
         }
         command
     }

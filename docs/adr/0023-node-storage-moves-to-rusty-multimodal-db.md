@@ -601,9 +601,19 @@ exits. The client clears inheritance on its standard handles before starting
 the daemon. That is a second use of the FFI `windows-sys` dependency ADR-0013
 admitted, not a new dependency.
 
-**2b, next: on by default.** Once 2a has run on real machines, the daemon
-becomes the default with `REMIND_ME_DAEMON=0` as the way out. Phase 5 needs it
-on, since the engine keeps the store in one process.
+**2b, done: on by default.** The daemon is on unless `REMIND_ME_DAEMON` is
+`0`, `false`, `no` or `off`. Phase 5 needs it on, since the engine keeps the
+store in one process. It came after 2a had run since the phase 2 merge, with
+phase 5 waiting on it (see 5.4a). Nothing else changes: every client still
+falls back to opening the store in-process, with the reason on stderr,
+whenever it cannot use the daemon. The CLI tests that run the binary
+without a daemon now say `REMIND_ME_DAEMON=0`, so none leaves a daemon
+running behind it.
+
+On the engine, that fallback meets the directory lock: a client that
+cannot use a running daemon (a different build, different settings) finds
+the store held and fails with "in use by another process" instead of
+opening it beside the daemon. 5.4b has to make that case say what to do.
 
 ### Phase 3: engine additions
 
@@ -1331,7 +1341,8 @@ Phase 5 ships in four PRs:
 
 **Next:** phase 2b, the daemon on by default (`REMIND_ME_DAEMON=0` the way
 out), which the engine needs: its directory has one opener, and without the
-daemon every Claude session's MCP server opens the store itself. Then 5.4b,
+daemon every Claude session's MCP server opens the store itself (done; see
+phase 2). Then 5.4b,
 the engine as the default: `engine-store` on by default and the engine the
 default store, so the daemon's first start with the new build copies the
 node through `Database::open`.

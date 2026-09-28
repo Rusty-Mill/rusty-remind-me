@@ -2,6 +2,11 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-28 — The store daemon is on by default (ADR-0023, phase 2b)
+
+### Changed
+- The store daemon is now on by default: the first MCP session, CLI command, `api` or `remote` starts `rusty-remind-me daemon`, and every other one talks to it. Set `REMIND_ME_DAEMON=0` (or `false`, `no`, `off`) to open the store in each process as before. A client that cannot use the daemon still falls back to opening the store itself and says why on stderr.
+
 ## 2026-09-28 — Backups of a store on the engine (ADR-0023, phase 5.4a)
 
 ### Added

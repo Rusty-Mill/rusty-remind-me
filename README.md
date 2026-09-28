@@ -619,14 +619,14 @@ rusty-remind-me stats
 
 ---
 
-### 11. Store Daemon (opt-in)
-With `REMIND_ME_DAEMON=1`, one `rusty-remind-me daemon` process owns the
-store, and every MCP session, CLI command, `api` and `remote` becomes its
-client over loopback. The first client starts it; nothing needs to be run by
+### 11. Store Daemon
+One `rusty-remind-me daemon` process owns the store, and every MCP session,
+CLI command, `api` and `remote` becomes its client over loopback. Set
+`REMIND_ME_DAEMON=0` to open the store in each process instead. The first client starts it; nothing needs to be run by
 hand. The background loops (reminders, folder watcher, promotion nudge, sync)
 then run once in the daemon instead of in every long-lived process.
 ```bash
-REMIND_ME_DAEMON=1 rusty-remind-me list
+rusty-remind-me list                  # starts the daemon if it is not running
 rusty-remind-me daemon status    # pid, port, start time; exit 1 if not running
 rusty-remind-me daemon stop      # the next client starts a fresh one
 ```

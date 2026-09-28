@@ -1,8 +1,8 @@
 //! The store daemon: one process owns the data and every other process is its
 //! client (ADR-0023 §2).
 //!
-//! Opt-in while the process model beds in: [`enabled`] is off unless
-//! `REMIND_ME_DAEMON` says otherwise, and every client falls back to opening
+//! On by default (ADR-0023, phase 2b): [`enabled`] is on unless
+//! `REMIND_ME_DAEMON` turns it off, and every client falls back to opening
 //! the store in-process, as before, whenever it cannot use the daemon.
 
 pub mod client;
@@ -13,7 +13,8 @@ pub mod session;
 pub mod settings;
 pub mod wire;
 
-/// Set to `1` (or `true`, `yes`, `on`) to route this client through the daemon.
+/// Set to `0` (or `false`, `no`, `off`) to open the store in this process
+/// rather than through the daemon.
 pub const ENABLE_ENV: &str = "REMIND_ME_DAEMON";
 
 /// Whether this process should use the daemon.
@@ -23,9 +24,9 @@ pub fn enabled() -> bool {
 
 /// [`enabled`] with the value injected, for tests.
 pub fn enabled_from(value: Option<&str>) -> bool {
-    matches!(
+    !matches!(
         value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
-        Some("1" | "true" | "yes" | "on")
+        Some("0" | "false" | "no" | "off")
     )
 }
 
@@ -34,12 +35,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_an_explicit_yes_enables_it() {
-        for on in ["1", "true", "YES", " on "] {
-            assert!(enabled_from(Some(on)), "{on}");
+    fn only_an_explicit_no_disables_it() {
+        for on in [None, Some(""), Some("1"), Some("true"), Some("daemon")] {
+            assert!(enabled_from(on), "{on:?}");
         }
-        for off in [None, Some(""), Some("0"), Some("false"), Some("daemon")] {
-            assert!(!enabled_from(off), "{off:?}");
+        for off in ["0", "false", "NO", " off "] {
+            assert!(!enabled_from(Some(off)), "{off}");
         }
     }
 }
