@@ -1400,8 +1400,8 @@ open at 2.55 s with 273 MB resident, under the 3 s bar. But the one-time
 copy on the first start took 112 s, peaked at 591 MB, and printed nothing.
 Clients also wait only 60 s for a daemon they started, so the first client
 after an upgrade gave up partway and then failed on the held store. The copy
-now logs each table, and a client waits up to 30 minutes while
-`memory.engine.partial` shows a copy under way. Running `copy-store` ahead of
+now logs each table, and a client that sees `memory.engine.partial` waits
+up to 30 minutes, which covers the copy and the open that follows it. Running `copy-store` ahead of
 the upgrade is not a safe shortcut: the node keeps writing to SQLite after
 it, and the new build would skip its own copy.
 

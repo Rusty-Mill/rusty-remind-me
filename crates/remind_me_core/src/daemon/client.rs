@@ -151,7 +151,7 @@ pub fn connect_or_start(
     }
     let mut child = start(endpoint, exe).map_err(ConnectError::Start)?;
     let started = Instant::now();
-    let mut told = false;
+    let mut copy_seen = false;
     let outcome = loop {
         match connect(endpoint, mode) {
             Err(ConnectError::NotRunning) => {}
@@ -168,17 +168,22 @@ pub fn connect_or_start(
             }
         }
         // The one-time copy onto the engine outlasts the usual start, so a
-        // daemon that is visibly copying gets the longer allowance.
-        let copying = endpoint.copying_onto_engine();
-        if copying && !told {
+        // daemon seen copying gets the longer allowance for the rest of the
+        // wait: once the copy is renamed into place it still opens the new
+        // store before it listens, 12 s for 150,000 memories.
+        if !copy_seen && endpoint.copying_onto_engine() {
             eprintln!(
                 "rusty-remind-me: the daemon is copying the store onto the engine, once, on \
                  the first start with this build; waiting for it (progress in {})",
                 endpoint.log_path().display()
             );
-            told = true;
+            copy_seen = true;
         }
-        let allowance = if copying { COPY_TIMEOUT } else { START_TIMEOUT };
+        let allowance = if copy_seen {
+            COPY_TIMEOUT
+        } else {
+            START_TIMEOUT
+        };
         if started.elapsed() >= allowance {
             break Err(ConnectError::StartTimedOut);
         }

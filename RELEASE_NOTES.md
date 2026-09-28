@@ -6,7 +6,7 @@ Dated entries, newest first. One entry per merged pull request.
 
 ### Changed
 - The first start with an engine build copies `memory.db` into `memory.engine`, once. On a real 15,000-memory node that took about two minutes, and the node printed nothing while it ran. It now logs each table as it finishes and the total time, to stderr: in `memory.db.daemon.log` when a client started the daemon.
-- A client waiting for the daemon it started now waits up to 30 minutes, not 60 seconds, while that copy is visibly under way (`memory.engine.partial` exists). It says once on stderr why it is waiting and where the progress is. Before, the first client after the upgrade gave up after a minute and then failed, because the daemon held the store.
+- A client waiting for the daemon it started now waits up to 30 minutes, not 60 seconds, once it sees that copy under way (`memory.engine.partial` exists), including the open that follows it. It says once on stderr why it is waiting and where the progress is. Before, the first client after the upgrade gave up after a minute and then failed, because the daemon held the store.
 - `rusty-remind-me copy-store` prints each table as it finishes, with its time.
 
 ### Upgrading
