@@ -2,6 +2,14 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-28 — The engine opens faster in a fifth of the memory (ADR-0023)
+
+### Changed
+- The engine's full-text index is laid out compactly: each term and each memory is numbered once, instead of the memory's id and the term's text being copied into every entry. At 15,000 memories a node on the engine now opens in about 1.2 s with 110 MB resident, where it took 4.5 s and 622 MB. Keyword search returns the same results, scores and snippets.
+
+### Tests
+- A document slot freed by a delete is reused without leaking the old document's terms, and a phrase with a word no document holds matches nothing.
+
 ## 2026-09-28 — The copy onto the engine keeps every float exactly (ADR-0023)
 
 ### Fixed

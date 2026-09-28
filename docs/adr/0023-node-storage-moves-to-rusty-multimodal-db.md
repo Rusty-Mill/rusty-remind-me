@@ -1380,6 +1380,20 @@ as designed, but it would have stopped a real node's first start. The
 remind_me crates declared `serde_json` without the workspace's
 `float_roundtrip`; `remind_me_core` now enables it.
 
+**After 5.4b: the full-text index is compact.** A benchmark of both stores
+(`remind_me_core/examples/store_bench.rs`) found the engine opening a
+15,000-memory store in 4.5 s with 622 MB resident, against SQLite's 0.16 s
+and 13 MB, and growing linearly: 16 s and 2.3 GB at 50,000. Skipping the
+full-text rebuild in a probe dropped the open to 0.3 s and 71 MB, so the
+index was nearly all of it: about 220 bytes per (term, memory) pair, from
+nested hash maps that copied the memory's id and the term's text into every
+posting. The index now numbers each term and each document once, keeps
+postings as sorted lists of document numbers, and keeps a document's
+positions in one block. The same open takes 1.1 to 1.3 s with 110 MB
+resident. Rankings, scores and snippets are unchanged; the differential
+tests against FTS5 still pin them. The index is still rebuilt at open, so
+the open still grows with the store.
+
 ## Related
 
 - ADR-0021 (the hub's move) and ADR-0022 (the seam this continues).
