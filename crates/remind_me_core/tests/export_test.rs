@@ -200,13 +200,7 @@ fn superseded_and_deleted_memories_are_excluded_by_default_and_available_on_requ
     let store = db.store();
     let live = add(&store, "live", "fact", &[], &[]);
     let old = add(&store, "replaced", "fact", &[], &[]);
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET superseded_by = ? WHERE id = ?",
-            rusqlite::params![live, old],
-        )
+    remind_me_core::testing::set_memory_column(&store, &old, "superseded_by", live.as_str())
         .unwrap();
 
     let default = export(&store, |i| i.include_graph = false);

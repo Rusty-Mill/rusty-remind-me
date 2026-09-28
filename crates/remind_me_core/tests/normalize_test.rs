@@ -5,11 +5,14 @@
 //! empty-batch case below pins that a store built only through `remind_me_add`
 //! correctly has nothing to normalize.
 
+use remind_me_core::db::entities::Entities;
+use remind_me_core::db::memories::{Memories, NewMemory};
 use remind_me_core::db::queries;
 use remind_me_core::db::Store;
 use remind_me_core::normalize::{
     apply_normalizations, unnormalized_batch, NORMALIZED_CATEGORY, NORMALIZED_SOURCE,
 };
+use remind_me_core::testing;
 use remind_me_core::{
     Database, EntityInput, MemoryAddInput, NormalizationEntry, NormalizeApplyInput,
     NormalizeBatchInput, NORMALIZE_APPLY_MAX,
@@ -21,22 +24,15 @@ fn batch(store: &Store<'_>, size: usize) -> remind_me_core::NormalizeBatchResult
 
 /// Insert a raw import the way the (not yet written) importers will.
 fn import(store: &Store<'_>, id: &str, content: &str, source: &str, created_at: &str) {
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "INSERT INTO memories (id, content, category, tags, source, metadata,
-                               created_at, updated_at, doc_id, chunk_index)
-         VALUES (?, ?, 'general', '[\"raw\"]', ?, ?, ?, ?, 'doc_7', 3)",
-            rusqlite::params![
-                id,
-                content,
-                source,
-                r#"{"filename": "notes.md"}"#,
-                created_at,
-                created_at
-            ],
-        )
+    Memories::new(store)
+        .insert(&NewMemory {
+            tags: vec!["raw".into()],
+            source: source.into(),
+            metadata: serde_json::json!({"filename": "notes.md"}),
+            doc_id: Some("doc_7".into()),
+            chunk_index: Some(3),
+            ..NewMemory::new(id, content, created_at)
+        })
         .unwrap();
 }
 
@@ -65,15 +61,7 @@ fn apply(
 }
 
 fn column(store: &Store<'_>, id: &str, name: &str) -> String {
-    store
-        .sqlite()
-        .unwrap()
-        .query_row(
-            &format!("SELECT {} FROM memories WHERE id = ?", name),
-            rusqlite::params![id],
-            |r| r.get::<_, String>(0),
-        )
-        .unwrap()
+    testing::memory_text(store, id, name).unwrap().unwrap()
 }
 
 #[test]
@@ -326,14 +314,8 @@ fn the_normalized_memory_inherits_tags_and_document_position() {
     // doc_id and chunk_index carry over so neighbour-aware retrieval still
     // associates the distillation with the rest of the document.
     assert_eq!(column(&store, &id, "doc_id"), "doc_7");
-    let chunk: i64 = store
-        .sqlite()
+    let chunk = testing::memory_i64(&store, &id, "chunk_index")
         .unwrap()
-        .query_row(
-            "SELECT chunk_index FROM memories WHERE id = ?",
-            rusqlite::params![id],
-            |r| r.get(0),
-        )
         .unwrap();
     assert_eq!(chunk, 3);
     assert_eq!(column(&store, &id, "tags"), r#"["raw"]"#);
@@ -412,22 +394,8 @@ fn superseded_and_deleted_imports_are_skipped() {
         "chat_import",
         "2026-01-03T00:00:00Z",
     );
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET superseded_by = 'mem_live' WHERE id = 'mem_old'",
-            [],
-        )
-        .unwrap();
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET deleted_at = '2026-01-04T00:00:00Z' WHERE id = 'mem_gone'",
-            [],
-        )
-        .unwrap();
+    testing::set_memory_column(&store, "mem_old", "superseded_by", "mem_live").unwrap();
+    testing::set_memory_column(&store, "mem_gone", "deleted_at", "2026-01-04T00:00:00Z").unwrap();
 
     let result = batch(&store, 20);
 
@@ -460,15 +428,12 @@ fn entities_named_by_the_distillation_are_linked() {
 
     // The raw import is never entity-linked automatically, so without this the
     // distillation would be invisible to entity lookup and traversal.
-    let linked: i64 = store
-        .sqlite()
+    let linked = Entities::new(&store)
+        .links_oldest_first()
         .unwrap()
-        .query_row(
-            "SELECT count(*) FROM memory_entities WHERE memory_id = ?",
-            rusqlite::params![id],
-            |r| r.get(0),
-        )
-        .unwrap();
+        .into_iter()
+        .filter(|(memory_id, _, _)| *memory_id == id)
+        .count();
     assert_eq!(linked, 1);
     assert_eq!(
         remind_me_core::entity::resolve_entity(&store, "sqlite")

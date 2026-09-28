@@ -5,6 +5,7 @@ use remind_me_core::capture::{auto_capture, decompose, undecomposed_batch};
 use remind_me_core::db::queries;
 use remind_me_core::db::Store;
 use remind_me_core::entity::{entity_id, traverse_entities, upsert_entity};
+use remind_me_core::testing::{self, Table};
 use remind_me_core::vitality::get_decay_rate;
 use remind_me_core::{
     AtomicFact, AutoCaptureInput, CaptureResult, Database, DecomposeBatchInput, DecomposeInput,
@@ -61,15 +62,7 @@ fn run(store: &Store<'_>, capture_id: &str, facts: Vec<AtomicFact>) -> Decompose
 }
 
 fn column(store: &Store<'_>, id: &str, name: &str) -> String {
-    store
-        .sqlite()
-        .unwrap()
-        .query_row(
-            &format!("SELECT {} FROM memories WHERE id = ?", name),
-            rusqlite::params![id],
-            |r| r.get::<_, String>(0),
-        )
-        .unwrap()
+    testing::memory_text(store, id, name).unwrap().unwrap()
 }
 
 fn known(store: &Store<'_>, name: &str) {
@@ -108,15 +101,8 @@ fn a_fact_is_not_itself_a_capture() {
 
     let result = run(&store, &parent.capture_id, vec![fact("a fact")]);
 
-    let capture_id: Option<String> = store
-        .sqlite()
-        .unwrap()
-        .query_row(
-            "SELECT capture_id FROM memories WHERE id = ?",
-            rusqlite::params![result.fact_ids[0]],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let capture_id: Option<String> =
+        testing::memory_text(&store, &result.fact_ids[0], "capture_id").unwrap();
     // A fact carrying a capture_id would re-enter the decomposition backlog,
     // so decomposition would generate its own work forever.
     assert!(capture_id.is_none());
@@ -151,15 +137,8 @@ fn the_memory_type_drives_the_decay_rate_and_weight() {
 
     let id = &result.fact_ids[0];
     assert_eq!(column(&store, id, "memory_type"), "decision");
-    let (decay, weight, vitality): (f64, f64, f64) = store
-        .sqlite()
-        .unwrap()
-        .query_row(
-            "SELECT decay_rate, base_weight, vitality FROM memories WHERE id = ?",
-            rusqlite::params![id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .unwrap();
+    let real = |name: &str| testing::memory_f64(&store, id, name).unwrap().unwrap();
+    let (decay, weight, vitality) = (real("decay_rate"), real("base_weight"), real("vitality"));
     assert!((decay - get_decay_rate("decision")).abs() < 1e-9);
     // A decision outranks an unclassified aside before any feedback exists. At
     // zero elapsed days vitality equals base_weight exactly.
@@ -452,11 +431,7 @@ fn repeating_an_edge_does_not_duplicate_it() {
         );
     }
 
-    let edges: i64 = store
-        .sqlite()
-        .unwrap()
-        .query_row("SELECT count(*) FROM entity_relations", [], |r| r.get(0))
-        .unwrap();
+    let edges = testing::count(&store, Table::EntityRelations).unwrap();
     assert_eq!(
         edges, 1,
         "the edge id is derived, so re-recording is a no-op"

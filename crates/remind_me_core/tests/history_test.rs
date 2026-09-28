@@ -10,6 +10,7 @@
 use remind_me_core::db::queries;
 use remind_me_core::db::Store;
 use remind_me_core::history::{history, revert};
+use remind_me_core::testing;
 use remind_me_core::{
     Database, MemoryAddInput, MemoryClassification, MemorySearchInput, MemoryUpdateInput,
     ReclassifyInput, RevertOutcome,
@@ -190,12 +191,8 @@ fn reverting_restores_every_tracked_field_together() {
     assert_eq!(memory.category, "general");
     assert_eq!(memory.tags, vec!["original".to_string()]);
     assert_eq!(memory.metadata, serde_json::json!({"seed": true}));
-    let sensitive: i64 = store
-        .sqlite()
+    let sensitive = testing::memory_i64(&store, &id, "sensitive")
         .unwrap()
-        .query_row("SELECT sensitive FROM memories WHERE id = ?", [&id], |r| {
-            r.get(0)
-        })
         .unwrap();
     assert_eq!(sensitive, 0);
 }

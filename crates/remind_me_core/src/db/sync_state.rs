@@ -473,20 +473,17 @@ mod tests {
     fn flags_overwrite_and_sends_replace() {
         let db = Database::open_in_memory().unwrap();
         let store = db.store();
-        let conn = store.conn();
         let state = SyncState::new(&store);
         state.set_flag("k", "2").unwrap();
         assert_eq!(state.flag("k").unwrap().as_deref(), Some("2"));
 
         state.record_sends("hub", &[1, 2], "t1").unwrap();
         state.record_sends("hub", &[2], "t2").unwrap();
-        let sent: Vec<(i64, String)> = conn
-            .prepare("SELECT outbox_id, sent_at FROM sync_sends ORDER BY outbox_id")
+        let sent: Vec<(i64, String)> = crate::testing::sends(&store)
             .unwrap()
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
+            .into_iter()
+            .map(|(_, outbox_id, sent_at)| (outbox_id, sent_at))
+            .collect();
         assert_eq!(sent, vec![(1, "t1".into()), (2, "t2".into())]);
     }
 }

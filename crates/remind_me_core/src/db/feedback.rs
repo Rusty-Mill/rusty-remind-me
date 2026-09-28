@@ -395,19 +395,19 @@ mod tests {
     fn review_needs_weight_or_a_durable_type_and_no_feedback() {
         let db = Database::open_in_memory().unwrap();
         let store = db.store();
-        let conn = store.conn();
         let old = "2020-01-01T00:00:00+00:00";
         for (id, weight, kind) in [
             ("heavy", 2.0, "note"),
             ("fact", 0.5, "fact"),
             ("light", 0.5, "note"),
         ] {
-            conn.execute(
-                "INSERT INTO memories (id, content, base_weight, memory_type, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?)",
-                params![id, format!("content {id}"), weight, kind, old, old],
-            )
-            .unwrap();
+            crate::db::memories::Memories::new(&store)
+                .insert(&crate::db::memories::NewMemory {
+                    base_weight: weight,
+                    memory_type: kind.to_string(),
+                    ..crate::db::memories::NewMemory::new(id, format!("content {id}"), old)
+                })
+                .unwrap();
         }
         let feedback = Feedback::new(&store);
         let filter = ReviewFilter {

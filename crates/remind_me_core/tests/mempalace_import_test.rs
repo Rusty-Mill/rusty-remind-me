@@ -21,6 +21,7 @@ use remind_me_core::mempalace_import::{
     parse_frontmatter, pull_mempalace, MempalaceImportError, COLLECTION_NAME, DEFAULT_CATEGORY,
     OPAQUE_SOURCE,
 };
+use remind_me_core::testing::{self, Table};
 use remind_me_core::{Database, MempalaceImportInput};
 use rusqlite::params;
 use rusqlite::Connection;
@@ -121,11 +122,30 @@ fn input() -> MempalaceImportInput {
 }
 
 fn memory_count(store: &Store<'_>) -> i64 {
-    store
-        .sqlite()
+    testing::count(store, Table::Memories).unwrap()
+}
+
+/// The one stored memory's `column`, as text.
+fn only_memory_text(store: &Store<'_>, column: &str) -> String {
+    let ids = testing::memory_ids(store).unwrap();
+    assert_eq!(ids.len(), 1, "expected exactly one memory");
+    testing::memory_text(store, &ids[0], column)
         .unwrap()
-        .query_row("SELECT count(*) FROM memories", [], |r| r.get(0))
         .unwrap()
+}
+
+/// `columns` of every stored memory, ordered by content.
+fn memory_rows(store: &Store<'_>, columns: &[&str]) -> Vec<Vec<String>> {
+    let mut rows: Vec<(String, Vec<String>)> = testing::memory_ids(store)
+        .unwrap()
+        .iter()
+        .map(|id| {
+            let text = |c: &str| testing::memory_text(store, id, c).unwrap().unwrap();
+            (text("content"), columns.iter().map(|c| text(c)).collect())
+        })
+        .collect();
+    rows.sort();
+    rows.into_iter().map(|(_, row)| row).collect()
 }
 
 const NATIVE_DOCUMENT: &str = "---\ncategory: fact\nsource: remind_me/manual\ntags: work, deadline\ncreated: 2025-06-01T00:00:00Z\n---\n\nThe deploy window is Tuesdays.";
@@ -253,16 +273,13 @@ fn a_native_drawer_restores_category_tags_source_and_created() {
     assert_eq!(result.opaque_format, 0);
     assert_eq!(result.imported, 1);
 
-    let (content, category, source, tags, created_at): (String, String, String, String, String) =
-        store
-            .sqlite()
-            .unwrap()
-            .query_row(
-                "SELECT content, category, source, tags, created_at FROM memories",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-            )
-            .unwrap();
+    let (content, category, source, tags, created_at) = (
+        only_memory_text(&store, "content"),
+        only_memory_text(&store, "category"),
+        only_memory_text(&store, "source"),
+        only_memory_text(&store, "tags"),
+        only_memory_text(&store, "created_at"),
+    );
 
     assert_eq!(content, "The deploy window is Tuesdays.");
     assert_eq!(category, "fact");
@@ -290,11 +307,7 @@ fn a_native_drawers_frontmatter_id_is_not_restored() {
 
     with_store_at(&dir, || pull_mempalace(&store, &input()).unwrap());
 
-    let id: String = store
-        .sqlite()
-        .unwrap()
-        .query_row("SELECT id FROM memories", [], |r| r.get(0))
-        .unwrap();
+    let id: String = only_memory_text(&store, "id");
     assert_ne!(id, "original-frontmatter-id");
     assert!(id.starts_with("mem_"));
 
@@ -321,15 +334,12 @@ fn an_opaque_drawer_is_stored_as_is_tagged_with_wing_and_room() {
     assert_eq!(result.opaque_format, 1);
     assert_eq!(result.native_format, 0);
 
-    let (content, category, source, tags): (String, String, String, String) = store
-        .sqlite()
-        .unwrap()
-        .query_row(
-            "SELECT content, category, source, tags FROM memories",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-        )
-        .unwrap();
+    let (content, category, source, tags) = (
+        only_memory_text(&store, "content"),
+        only_memory_text(&store, "category"),
+        only_memory_text(&store, "source"),
+        only_memory_text(&store, "tags"),
+    );
     assert_eq!(content, "just plain drawer text");
     assert_eq!(category, DEFAULT_CATEGORY);
     assert_eq!(source, OPAQUE_SOURCE);
@@ -356,19 +366,10 @@ fn extra_tags_are_appended_to_both_native_and_opaque_drawers() {
 
     with_store_at(&dir, || pull_mempalace(&store, &params).unwrap());
 
-    let mut stmt = store
-        .sqlite()
-        .unwrap()
-        .prepare("SELECT tags FROM memories ORDER BY content")
-        .unwrap();
-    let all_tags: Vec<Vec<String>> = stmt
-        .query_map([], |r| {
-            let raw: String = r.get(0)?;
-            Ok(serde_json::from_str(&raw).unwrap())
-        })
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
+    let all_tags: Vec<Vec<String>> = memory_rows(&store, &["tags"])
+        .into_iter()
+        .map(|row| serde_json::from_str(&row[0]).unwrap())
+        .collect();
     for tags in &all_tags {
         assert!(tags.contains(&"archived".to_string()), "{:?}", tags);
     }
@@ -394,16 +395,10 @@ fn a_caller_supplied_category_only_applies_to_drawers_without_one() {
 
     with_store_at(&dir, || pull_mempalace(&store, &params).unwrap());
 
-    let mut stmt = store
-        .sqlite()
-        .unwrap()
-        .prepare("SELECT content, category FROM memories ORDER BY content")
-        .unwrap();
-    let rows: Vec<(String, String)> = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
+    let rows: Vec<(String, String)> = memory_rows(&store, &["content", "category"])
+        .into_iter()
+        .map(|row| (row[0].clone(), row[1].clone()))
+        .collect();
     let by_content: std::collections::HashMap<_, _> = rows.into_iter().collect();
     assert_eq!(by_content["The deploy window is Tuesdays."], "fact");
     assert_eq!(by_content["opaque text"], "caller_category");
@@ -458,11 +453,7 @@ fn room_filters_within_a_wing() {
     let result = with_store_at(&dir, || pull_mempalace(&store, &params).unwrap());
 
     assert_eq!(result.fetched, 1);
-    let content: String = store
-        .sqlite()
-        .unwrap()
-        .query_row("SELECT content FROM memories", [], |r| r.get(0))
-        .unwrap();
+    let content: String = only_memory_text(&store, "content");
     assert_eq!(content, "two");
 
     std::fs::remove_dir_all(&dir).unwrap();
@@ -596,11 +587,7 @@ fn an_edited_drawer_keeping_its_id_is_not_reimported() {
     let result = with_store_at(&dir, || pull_mempalace(&store, &input()).unwrap());
 
     assert_eq!(result.to_import, 0);
-    let content: String = store
-        .sqlite()
-        .unwrap()
-        .query_row("SELECT content FROM memories", [], |r| r.get(0))
-        .unwrap();
+    let content: String = only_memory_text(&store, "content");
     assert_eq!(content, "original content");
 
     std::fs::remove_dir_all(&dir).unwrap();
@@ -626,12 +613,7 @@ fn a_dry_run_reports_the_work_without_doing_any_of_it() {
     assert_eq!(result.imported, 0);
     assert_eq!(memory_count(&store), 0);
     assert_eq!(
-        store
-            .sqlite()
-            .unwrap()
-            .query_row("SELECT count(*) FROM mempalace_imports", [], |r| r
-                .get::<_, i64>(0))
-            .unwrap(),
+        testing::count(&store, Table::MempalaceImports).unwrap(),
         0,
         "a dry run that recorded a tracking row would make the real run a no-op"
     );

@@ -4,6 +4,7 @@
 use remind_me_core::db::queries::{self, search_paginated};
 use remind_me_core::db::Store;
 use remind_me_core::entity::{link_memory_entity, upsert_entity};
+use remind_me_core::testing;
 use remind_me_core::{Database, EntityInput, MemoryAddInput, SearchPageInput};
 
 fn add(store: &Store<'_>, content: &str) -> String {
@@ -131,23 +132,9 @@ fn superseded_and_deleted_memories_never_surface() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
     let stale = add(&store, "quokka census 2025");
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET superseded_by = 'mem_new' WHERE id = ?",
-            [&stale],
-        )
-        .unwrap();
+    testing::set_memory_column(&store, &stale, "superseded_by", "mem_new").unwrap();
     let removed = add(&store, "quokka census deleted");
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET deleted_at = '2026-01-01T00:00:00Z' WHERE id = ?",
-            [&removed],
-        )
-        .unwrap();
+    testing::set_memory_column(&store, &removed, "deleted_at", "2026-01-01T00:00:00Z").unwrap();
     add(&store, "quokka census 2026");
 
     let result = search_paginated(&store, &page("quokka census")).unwrap();
@@ -246,14 +233,7 @@ fn an_entity_scoped_search_still_excludes_superseded_memories() {
     .id;
     let stale = add(&store, "old note");
     link_memory_entity(&store, &stale, &entity_id).unwrap();
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET superseded_by = 'mem_new' WHERE id = ?",
-            [&stale],
-        )
-        .unwrap();
+    testing::set_memory_column(&store, &stale, "superseded_by", "mem_new").unwrap();
 
     let mut input = page("");
     input.entity = Some("Rottnest Island".to_string());

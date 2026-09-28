@@ -16,6 +16,7 @@ use remind_me_core::db::Store;
 use remind_me_core::sync::{
     self, serve_once, PeerServerConfig, HUB_URL_ENV, NODE_ID_ENV, SYNC_SECRET_ENV,
 };
+use remind_me_core::testing;
 use remind_me_core::{Database, MemoryAddInput};
 use std::io::{Cursor, Read, Write};
 use std::sync::Mutex;
@@ -217,15 +218,8 @@ fn push_applies_valid_records_and_reports_processed_ids() {
     assert_eq!(response["accepted"], 1);
     assert_eq!(response["processed_ids"], serde_json::json!(["mem_pushed"]));
     assert_eq!(response["failed"], 0);
-    let stored: String = db
-        .store()
-        .sqlite()
+    let stored = testing::memory_text(&db.store(), "mem_pushed", "content")
         .unwrap()
-        .query_row(
-            "SELECT content FROM memories WHERE id = 'mem_pushed'",
-            [],
-            |r| r.get(0),
-        )
         .unwrap();
     assert_eq!(stored, "pushed content");
 }
@@ -276,14 +270,8 @@ fn pull_tags_and_metadata_are_real_json_not_double_encoded() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
     let id = add(&store, "content");
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET tags = '[\"a\",\"b\"]', metadata = '{\"k\":\"v\"}' WHERE id = ?",
-            [&id],
-        )
-        .unwrap();
+    testing::set_memory_column(&store, &id, "tags", r#"["a","b"]"#).unwrap();
+    testing::set_memory_column(&store, &id, "metadata", r#"{"k":"v"}"#).unwrap();
 
     let (_, response) = serve(&store, &authed("GET", "/sync/pull", ""));
 
@@ -298,22 +286,8 @@ fn pull_excludes_the_callers_own_node_id() {
     let store = db.store();
     let mine = add(&store, "mine");
     let theirs = add(&store, "theirs");
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET node_id = 'caller-node' WHERE id = ?",
-            [&mine],
-        )
-        .unwrap();
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET node_id = 'someone-else' WHERE id = ?",
-            [&theirs],
-        )
-        .unwrap();
+    testing::set_memory_column(&store, &mine, "node_id", "caller-node").unwrap();
+    testing::set_memory_column(&store, &theirs, "node_id", "someone-else").unwrap();
 
     let (_, response) = serve(
         &store,
@@ -330,14 +304,9 @@ fn pull_since_excludes_everything_at_or_before_the_cursor() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
     add(&store, "old");
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET updated_at = '2020-01-01T00:00:00+00:00'",
-            [],
-        )
-        .unwrap();
+    for id in testing::memory_ids(&store).unwrap() {
+        testing::set_memory_column(&store, &id, "updated_at", "2020-01-01T00:00:00+00:00").unwrap();
+    }
     add(&store, "new");
 
     let (_, response) = serve(
@@ -456,14 +425,7 @@ fn count_includes_tombstones_in_the_total() {
     let store = db.store();
     let id = add(&store, "will be tombstoned");
     add(&store, "still live");
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET deleted_at = '2026-01-01T00:00:00+00:00' WHERE id = ?",
-            [&id],
-        )
-        .unwrap();
+    testing::set_memory_column(&store, &id, "deleted_at", "2026-01-01T00:00:00+00:00").unwrap();
 
     let (_, body) = serve(&store, &authed("GET", "/count", ""));
 

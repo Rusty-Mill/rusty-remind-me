@@ -1,9 +1,12 @@
 //! Coverage for `entity::entity_profile` and `entity::list_entities`, the
 //! shared implementations behind `GET /api/entity` and `GET /api/entities`.
 
+use remind_me_core::db::derived::Origin;
+use remind_me_core::db::entities::Entities;
 use remind_me_core::db::queries;
 use remind_me_core::db::Store;
 use remind_me_core::entity::{entity_profile, link_memory_entity, list_entities, upsert_entity};
+use remind_me_core::testing;
 use remind_me_core::{Database, EntityInput, MemoryAddInput};
 
 fn add(store: &Store<'_>, content: &str) -> String {
@@ -130,11 +133,14 @@ fn linked_memories_come_from_memory_entities_and_dangling_links_are_invisible() 
     link_memory_entity(&store, &mem_id, &entity_id).unwrap();
     // A dangling link: an entity id with no matching row, as sync might
     // deliver before its endpoint arrives.
-    store.sqlite().unwrap().execute(
-        "INSERT INTO memory_entities (memory_id, entity_id, created_at) VALUES ('mem_ghost', ?, '2026-01-01T00:00:00Z')",
-        rusqlite::params![entity_id],
-    )
-    .unwrap();
+    Entities::new(&store)
+        .link(
+            "mem_ghost",
+            &entity_id,
+            "2026-01-01T00:00:00Z",
+            Origin::Sync,
+        )
+        .unwrap();
 
     let profile = entity_profile(&store, "Rottnest Island", 20)
         .unwrap()
@@ -152,33 +158,12 @@ fn superseded_and_deleted_memories_are_excluded_from_both_facts_and_links() {
     let entity_id = entity(&store, "Rottnest Island");
 
     let fact_id = add(&store, "a fact");
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET subject = 'Rottnest Island' WHERE id = ?",
-            rusqlite::params![fact_id],
-        )
-        .unwrap();
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET superseded_by = 'mem_newer' WHERE id = ?",
-            rusqlite::params![fact_id],
-        )
-        .unwrap();
+    testing::set_memory_column(&store, &fact_id, "subject", "Rottnest Island").unwrap();
+    testing::set_memory_column(&store, &fact_id, "superseded_by", "mem_newer").unwrap();
 
     let linked_id = add(&store, "a linked memory");
     link_memory_entity(&store, &linked_id, &entity_id).unwrap();
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET deleted_at = '2026-01-02T00:00:00Z' WHERE id = ?",
-            rusqlite::params![linked_id],
-        )
-        .unwrap();
+    testing::set_memory_column(&store, &linked_id, "deleted_at", "2026-01-02T00:00:00Z").unwrap();
 
     let profile = entity_profile(&store, "Rottnest Island", 20)
         .unwrap()

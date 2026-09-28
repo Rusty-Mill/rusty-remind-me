@@ -2,6 +2,7 @@
 
 use remind_me_core::db::queries;
 use remind_me_core::db::Store;
+use remind_me_core::testing;
 use remind_me_core::vitality::get_decay_rate;
 use remind_me_core::{
     Database, MemoryAddInput, MemoryClassification, MemoryUpdateInput, ReclassifyBatchInput,
@@ -42,26 +43,12 @@ fn classify(store: &Store<'_>, id: &str, memory_type: &str) -> remind_me_core::R
 }
 
 fn column(store: &Store<'_>, id: &str, name: &str) -> String {
-    store
-        .sqlite()
-        .unwrap()
-        .query_row(
-            &format!("SELECT {} FROM memories WHERE id = ?", name),
-            rusqlite::params![id],
-            |r| r.get::<_, String>(0),
-        )
-        .unwrap()
+    testing::memory_text(store, id, name).unwrap().unwrap()
 }
 
 fn decay_rate(store: &Store<'_>, id: &str) -> f64 {
-    store
-        .sqlite()
+    testing::memory_f64(store, id, "decay_rate")
         .unwrap()
-        .query_row(
-            "SELECT decay_rate FROM memories WHERE id = ?",
-            rusqlite::params![id],
-            |r| r.get(0),
-        )
         .unwrap()
 }
 

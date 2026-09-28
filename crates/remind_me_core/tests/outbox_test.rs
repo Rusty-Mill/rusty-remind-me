@@ -19,10 +19,12 @@ mod test_env;
 
 use chrono::{Duration, Utc};
 use remind_me_core::db::queries;
+use remind_me_core::db::sync_state::SyncState;
 use remind_me_core::db::Store;
 use remind_me_core::sync::{
     prune_outbox, DEFAULT_OUTBOX_RETENTION_DAYS, HUB_URL_ENV, NODE_ID_ENV, SYNC_SECRET_ENV,
 };
+use remind_me_core::testing::{self, Table};
 use remind_me_core::{
     Database, MemoryAddInput, MemorySearchInput, MemoryUpdateInput, UpdateOutcome,
 };
@@ -82,23 +84,14 @@ fn search(store: &Store<'_>, query: &str) {
 }
 
 fn outbox_rows(store: &Store<'_>) -> i64 {
-    store
-        .sqlite()
-        .unwrap()
-        .query_row("SELECT count(*) FROM sync_outbox", [], |r| r.get(0))
-        .unwrap()
+    testing::count(store, Table::SyncOutbox).unwrap()
 }
 
 fn backdate_outbox(store: &Store<'_>, days: i64) {
     let when = (Utc::now() - Duration::days(days)).to_rfc3339();
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE sync_outbox SET created_at = ?",
-            rusqlite::params![when],
-        )
-        .unwrap();
+    for row in testing::outbox_rows(store).unwrap() {
+        testing::set_outbox_column(store, row.id, "created_at", &when).unwrap();
+    }
 }
 
 #[test]
@@ -168,15 +161,11 @@ fn a_real_content_change_still_reaches_the_outbox() {
         after_write + 1,
         "a content edit must still enqueue exactly one outbox row"
     );
-    let operation: String = store
-        .sqlite()
+    let operation = testing::outbox_rows(&store)
         .unwrap()
-        .query_row(
-            "SELECT operation FROM sync_outbox ORDER BY id DESC LIMIT 1",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
+        .pop()
+        .unwrap()
+        .operation;
     assert_eq!(operation, "update");
 }
 
@@ -191,6 +180,7 @@ fn an_older_databases_triggers_are_dropped_on_open() {
     let path = dir.join("memories.db");
     let _ = std::fs::remove_file(&path);
 
+    // Raw SQL below: this is about SQLite triggers in an on-disk file.
     let id = {
         let db = Database::open(&path).unwrap();
         let store = db.store();
@@ -278,14 +268,8 @@ fn already_sent_rows_are_pruned_immediately() {
     let store = db.store();
     add(&store, "memory one");
     add(&store, "memory two");
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE sync_outbox SET sent_at = ? WHERE id = (SELECT MIN(id) FROM sync_outbox)",
-            rusqlite::params![Utc::now().to_rfc3339()],
-        )
-        .unwrap();
+    let oldest = testing::outbox_rows(&store).unwrap()[0].id;
+    testing::set_outbox_column(&store, oldest, "sent_at", &Utc::now().to_rfc3339()).unwrap();
 
     let removed = prune_outbox(&store).unwrap();
 
@@ -329,28 +313,15 @@ fn pruning_drops_orphaned_send_markers() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
     add(&store, "memory one");
-    let outbox_id: i64 = store
-        .sqlite()
-        .unwrap()
-        .query_row("SELECT id FROM sync_outbox", [], |r| r.get(0))
-        .unwrap();
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "INSERT INTO sync_sends (remote_id, outbox_id, sent_at) VALUES ('peer_1', ?, ?)",
-            rusqlite::params![outbox_id, Utc::now().to_rfc3339()],
-        )
+    let outbox_id = testing::outbox_rows(&store).unwrap()[0].id;
+    SyncState::new(&store)
+        .record_sends("peer_1", &[outbox_id], &Utc::now().to_rfc3339())
         .unwrap();
     backdate_outbox(&store, DEFAULT_OUTBOX_RETENTION_DAYS + 1);
 
     prune_outbox(&store).unwrap();
 
-    let sends: i64 = store
-        .sqlite()
-        .unwrap()
-        .query_row("SELECT count(*) FROM sync_sends", [], |r| r.get(0))
-        .unwrap();
+    let sends = testing::count(&store, Table::SyncSends).unwrap();
     assert_eq!(
         sends, 0,
         "a send marker for a pruned row has nothing to mark"

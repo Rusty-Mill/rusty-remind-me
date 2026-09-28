@@ -287,7 +287,9 @@ fn dedupe_ci_keeps_order_and_first_casing() {
 // separately is exactly how the `sensitive` sync bug got through once, so the
 // join is asserted here too.
 
+use remind_me_core::db::entities::Entities;
 use remind_me_core::models::ImportKind;
+use remind_me_core::testing::{self, Table};
 use remind_me_core::Database;
 
 #[test]
@@ -321,16 +323,19 @@ fn a_note_imports_with_merged_tags_frontmatter_and_linked_entities() {
         "got {outcome:?}"
     );
 
-    let (content, category, source, tags_json, metadata): (String, String, String, String, String) =
-        store
-            .sqlite()
+    let ids = testing::memory_ids(&store).unwrap();
+    let column = |name: &str| {
+        testing::memory_text(&store, &ids[0], name)
             .unwrap()
-            .query_row(
-                "SELECT content, category, source, tags, metadata FROM memories",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-            )
-            .unwrap();
+            .unwrap()
+    };
+    let (content, category, source, tags_json, metadata) = (
+        column("content"),
+        column("category"),
+        column("source"),
+        column("tags"),
+        column("metadata"),
+    );
 
     assert!(content.contains("Quokkas live on"));
     assert_eq!(
@@ -351,16 +356,9 @@ fn a_note_imports_with_merged_tags_frontmatter_and_linked_entities() {
 
     // The mention became a real, traversable entity link — the whole point of
     // treating a wikilink as more than text.
-    let linked: String = store
-        .sqlite()
-        .unwrap()
-        .query_row(
-            "SELECT e.name FROM entities e
-               JOIN memory_entities me ON me.entity_id = e.id",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let entities = Entities::new(&store);
+    let (_, entity_id, _) = entities.links_oldest_first().unwrap().remove(0);
+    let linked = entities.get(&entity_id).unwrap().unwrap().name;
     assert_eq!(linked, "Rottnest");
 }
 
@@ -383,15 +381,12 @@ fn a_link_to_a_note_that_does_not_exist_yet_still_resolves() {
     )
     .unwrap();
 
-    let count: i64 = store
-        .sqlite()
+    let count = Entities::new(&store)
+        .all()
         .unwrap()
-        .query_row(
-            "SELECT COUNT(*) FROM entities WHERE name = 'Not Yet Imported'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
+        .into_iter()
+        .filter(|e| e.name == "Not Yet Imported")
+        .count();
     assert_eq!(count, 1);
 }
 
@@ -415,11 +410,7 @@ fn re_importing_the_same_note_is_a_no_op() {
         .unwrap();
     }
 
-    let memories: i64 = store
-        .sqlite()
-        .unwrap()
-        .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
-        .unwrap();
+    let memories = testing::count(&store, Table::Memories).unwrap();
     assert_eq!(
         memories, 1,
         "the content hash short-circuits the second run"

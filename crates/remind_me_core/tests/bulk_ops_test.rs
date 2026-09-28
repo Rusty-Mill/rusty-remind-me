@@ -1,8 +1,10 @@
 //! Coverage for `queries::bulk_delete` and `queries::bulk_tag`, the shared
 //! implementations behind the HTTP-only `/api/memories/bulk/*` routes.
 
+use remind_me_core::db::feedback::{Feedback, FeedbackEvent};
 use remind_me_core::db::queries::{self, bulk_delete, bulk_tag};
 use remind_me_core::db::Store;
+use remind_me_core::testing::{self, Table};
 use remind_me_core::{BulkTagInput, Database, MemoryAddInput, TagMode};
 
 fn add(store: &Store<'_>, content: &str, tags: &[&str]) -> String {
@@ -26,11 +28,7 @@ fn add(store: &Store<'_>, content: &str, tags: &[&str]) -> String {
 }
 
 fn tags_of(store: &Store<'_>, id: &str) -> Vec<String> {
-    let raw: String = store
-        .sqlite()
-        .unwrap()
-        .query_row("SELECT tags FROM memories WHERE id = ?", [id], |r| r.get(0))
-        .unwrap();
+    let raw = testing::memory_text(store, id, "tags").unwrap().unwrap();
     serde_json::from_str(&raw).unwrap()
 }
 
@@ -49,14 +47,7 @@ fn bulk_delete_removes_every_live_id() {
 
     assert_eq!(result.deleted, vec![a.clone(), b.clone()]);
     assert!(result.not_found.is_empty());
-    assert_eq!(
-        store
-            .sqlite()
-            .unwrap()
-            .query_row("SELECT count(*) FROM memories", [], |r| r.get::<_, i64>(0))
-            .unwrap(),
-        0
-    );
+    assert_eq!(testing::count(&store, Table::Memories).unwrap(), 0);
 }
 
 #[test]
@@ -76,14 +67,17 @@ fn bulk_delete_applies_the_same_per_memory_cleanup_as_delete_memory() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
     let a = add(&store, "alpha", &[]);
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "INSERT INTO memory_feedback
-            (id, memory_id, query, query_tokens, signal, magnitude, created_at)
-         VALUES ('fb1', ?, 'query', '[]', 'helpful', 0.1, '2026-01-01T00:00:00Z')",
-            [&a],
+    Feedback::new(&store)
+        .log_event(
+            "fb1",
+            &a,
+            "query",
+            &FeedbackEvent {
+                query_tokens: "[]".into(),
+                signal: "helpful".into(),
+                magnitude: 0.1,
+            },
+            "2026-01-01T00:00:00Z",
         )
         .unwrap();
 
@@ -91,18 +85,7 @@ fn bulk_delete_applies_the_same_per_memory_cleanup_as_delete_memory() {
 
     // Reused delete_memory, not reimplemented — so its cleanup of
     // memory_feedback comes along for free.
-    assert_eq!(
-        store
-            .sqlite()
-            .unwrap()
-            .query_row(
-                "SELECT count(*) FROM memory_feedback WHERE memory_id = ?",
-                [&a],
-                |r| r.get::<_, i64>(0)
-            )
-            .unwrap(),
-        0
-    );
+    assert_eq!(Feedback::new(&store).events(&a).unwrap().len(), 0);
 }
 
 // ---------------------------------------------------------------------------

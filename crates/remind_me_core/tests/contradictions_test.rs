@@ -8,6 +8,7 @@
 use remind_me_core::contradictions::{candidates, MAX_ENTITY_FANOUT};
 use remind_me_core::db::queries;
 use remind_me_core::db::Store;
+use remind_me_core::testing;
 use remind_me_core::{Database, EntityInput, MemoryAddInput};
 
 fn add(
@@ -111,29 +112,11 @@ fn deleted_and_superseded_memories_are_excluded() {
     let b = add(&store, "I live in Seattle", "general", &["Boston"], None);
     assert_eq!(total(&store), 1);
 
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET deleted_at = '2026-01-01T00:00:00+00:00' WHERE id = ?",
-            [&a],
-        )
-        .unwrap();
+    testing::set_memory_column(&store, &a, "deleted_at", "2026-01-01T00:00:00+00:00").unwrap();
     assert_eq!(total(&store), 0, "a tombstoned memory asserts nothing");
 
-    store
-        .sqlite()
-        .unwrap()
-        .execute("UPDATE memories SET deleted_at = NULL WHERE id = ?", [&a])
-        .unwrap();
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET superseded_by = ? WHERE id = ?",
-            [&a, &b],
-        )
-        .unwrap();
+    testing::set_memory_column(&store, &a, "deleted_at", testing::Value::Null).unwrap();
+    testing::set_memory_column(&store, &b, "superseded_by", a.as_str()).unwrap();
     assert_eq!(
         total(&store),
         0,

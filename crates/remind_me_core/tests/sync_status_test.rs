@@ -16,6 +16,7 @@ use remind_me_core::db::queries;
 use remind_me_core::db::sync_state::{SyncLogRow, SyncState};
 use remind_me_core::db::Store;
 use remind_me_core::sync::{sync_repair, sync_status, HUB_URL_ENV, NODE_ID_ENV, SYNC_SECRET_ENV};
+use remind_me_core::testing;
 use remind_me_core::{Database, DrainVerdict, MemoryAddInput, SyncStatus};
 use std::sync::Mutex;
 
@@ -75,6 +76,18 @@ fn remote(store: &Store<'_>, id: &str, attempt: &str, push: &str, pull: &str) {
 // ---------------------------------------------------------------------------
 // Disabled
 // ---------------------------------------------------------------------------
+
+/// Record the first `limit` outbox rows (all of them for `None`), oldest
+/// first, as sent to "hub" at `at`: the `sync_sends` rows a push leaves.
+fn mark_sent(store: &Store<'_>, limit: Option<usize>, at: &str) {
+    let ids: Vec<i64> = testing::outbox_rows(store)
+        .unwrap()
+        .into_iter()
+        .take(limit.unwrap_or(usize::MAX))
+        .map(|row| row.id)
+        .collect();
+    SyncState::new(store).record_sends("hub", &ids, at).unwrap();
+}
 
 #[test]
 fn a_disabled_node_names_the_missing_variables() {
@@ -176,15 +189,7 @@ fn a_namespaced_pull_cursor_reports_the_same_pending_as_its_base_remote() {
 
     // Mark the outbox row delivered to the base remote "hub" -- the same
     // sync_sends row a real push_outbox cycle would leave behind.
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "INSERT INTO sync_sends (remote_id, outbox_id, sent_at)
-         SELECT 'hub', id, '2026-08-09T00:00:00+00:00' FROM sync_outbox",
-            [],
-        )
-        .unwrap();
+    mark_sent(&store, None, "2026-08-09T00:00:00+00:00");
 
     // A namespaced pull-only cursor for the same destination: entities never
     // get an independent sync_sends row keyed to "hub#entities" -- the
@@ -228,15 +233,7 @@ fn a_graph_cursor_row_reports_the_base_remotes_push_state_not_its_own() {
     add(&store, "m1");
     // Mark the one outbox row sent to the base remote, "hub" -- as a real
     // push cycle would.
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "INSERT INTO sync_sends (remote_id, outbox_id, sent_at)
-         SELECT 'hub', id, '2026-08-03T04:00:00+00:00' FROM sync_outbox",
-            [],
-        )
-        .unwrap();
+    mark_sent(&store, None, "2026-08-03T04:00:00+00:00");
     remote(
         &store,
         "hub",
@@ -362,15 +359,7 @@ fn a_shrinking_backlog_is_reported_as_draining() {
     add(&store, "first");
     add(&store, "second");
     sync_status(&store).unwrap();
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "INSERT INTO sync_sends (remote_id, outbox_id, sent_at)
-         SELECT 'hub', id, '2026-08-03T04:00:00+00:00' FROM sync_outbox LIMIT 1",
-            [],
-        )
-        .unwrap();
+    mark_sent(&store, Some(1), "2026-08-03T04:00:00+00:00");
 
     let SyncStatus::Enabled { outbox, .. } = sync_status(&store).unwrap() else {
         panic!("expected enabled");
@@ -389,23 +378,18 @@ fn tombstones_are_counted_and_split_by_compactability() {
     let store = db.store();
     add(&store, "recent tombstone");
     add(&store, "old tombstone");
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET deleted_at = ? WHERE content = 'recent tombstone'",
-            [chrono::Utc::now().to_rfc3339()],
-        )
-        .unwrap();
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET deleted_at = '2020-01-01T00:00:00+00:00'
-          WHERE content = 'old tombstone'",
-            [],
-        )
-        .unwrap();
+    let recent = chrono::Utc::now().to_rfc3339();
+    for id in testing::memory_ids(&store).unwrap() {
+        let deleted_at = match testing::memory_text(&store, &id, "content")
+            .unwrap()
+            .as_deref()
+        {
+            Some("recent tombstone") => recent.as_str(),
+            Some("old tombstone") => "2020-01-01T00:00:00+00:00",
+            _ => continue,
+        };
+        testing::set_memory_column(&store, &id, "deleted_at", deleted_at).unwrap();
+    }
 
     let SyncStatus::Enabled { tombstones, .. } = sync_status(&store).unwrap() else {
         panic!("expected enabled");

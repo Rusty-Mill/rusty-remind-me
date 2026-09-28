@@ -9,8 +9,12 @@
 #[path = "../src/test_env.rs"]
 mod test_env;
 
+use remind_me_core::db::imports::ImportLedger;
+use remind_me_core::db::memories::{Memories, NewMemory};
+use remind_me_core::db::outbox::Outbox;
 use remind_me_core::db::Store;
 use remind_me_core::sync::{HUB_URL_ENV, NODE_ID_ENV, SYNC_SECRET_ENV};
+use remind_me_core::testing::{self, Table};
 use remind_me_core::undo_import::undo_import;
 use remind_me_core::{Database, UndoImportInput, UndoImportKind};
 
@@ -22,38 +26,37 @@ fn enable_sync() {
 
 fn plant_chat_import(store: &Store<'_>, ids: &[&str], import_id: &str) {
     for id in ids {
-        store
-            .sqlite()
-            .unwrap()
-            .execute(
-                "INSERT INTO memories (id, content, category, tags, source, metadata,
-                                   created_at, updated_at, doc_id, chunk_index)
-             VALUES (?, ?, 'general', '[]', 'chat_import', '{}',
-                     '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00', ?, 0)",
-                rusqlite::params![id, format!("content {}", id), import_id],
-            )
+        Memories::new(store)
+            .insert(&NewMemory {
+                source: "chat_import".into(),
+                doc_id: Some(import_id.to_string()),
+                chunk_index: Some(0),
+                ..NewMemory::new(*id, format!("content {}", id), PLANTED_AT)
+            })
             .unwrap();
     }
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "INSERT INTO chat_imports (import_id, filename, hash, imported_at)
-         VALUES (?, 'chat.json', 'h', '2026-01-01T00:00:00+00:00')",
-            rusqlite::params![import_id],
-        )
+    ImportLedger::new(store)
+        .record_chat(import_id, "chat.json", "h", PLANTED_AT, "{}")
         .unwrap();
-    // Planted with raw SQL, so it needs indexing to be searchable, and to be
-    // deletable without the full-text index losing track of it.
+    // Planted beside the importer, so make sure it is indexed: searchable,
+    // and deletable without the full-text index losing track of it.
     remind_me_core::db::derived::rebuild_indexes(store).unwrap();
 }
 
-fn scalar(store: &Store<'_>, sql: &str) -> i64 {
-    store
-        .sqlite()
+const PLANTED_AT: &str = "2026-01-01T00:00:00+00:00";
+
+/// How many memories are tombstoned (`true`) or live (`false`).
+fn tombstoned(store: &Store<'_>, deleted: bool) -> usize {
+    testing::memory_ids(store)
         .unwrap()
-        .query_row(sql, [], |r| r.get(0))
-        .unwrap()
+        .iter()
+        .filter(|id| {
+            testing::memory_text(store, id, "deleted_at")
+                .unwrap()
+                .is_some()
+                == deleted
+        })
+        .count()
 }
 
 #[test]
@@ -62,11 +65,7 @@ fn undo_tombstones_rather_than_deleting_when_sync_is_on() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
     plant_chat_import(&store, &["mem_a", "mem_b"], "imp_1");
-    store
-        .sqlite()
-        .unwrap()
-        .execute("DELETE FROM sync_outbox", [])
-        .unwrap();
+    Outbox::new(&store).clear().unwrap();
 
     let result = undo_import(
         &store,
@@ -90,36 +89,30 @@ fn undo_tombstones_rather_than_deleting_when_sync_is_on() {
     // on INSERT/UPDATE — so the removal would never propagate and the memories
     // would resurrect on the next pull from any peer that still has them.
     assert_eq!(
-        scalar(
-            &store,
-            "SELECT count(*) FROM memories WHERE deleted_at IS NOT NULL"
-        ),
+        tombstoned(&store, true),
         2,
         "rows must be tombstoned, not removed"
     );
-    assert_eq!(
-        scalar(
-            &store,
-            "SELECT count(*) FROM memories WHERE deleted_at IS NULL"
-        ),
-        0
-    );
+    assert_eq!(tombstoned(&store, false), 0);
 
+    let outbox = testing::outbox_rows(&store).unwrap();
     // The tombstone is an UPDATE that bumps updated_at, so it passes issue
     // #100's outbox guard and reaches peers.
     assert_eq!(
-        scalar(
-            &store,
-            "SELECT count(*) FROM sync_outbox WHERE operation = 'update'"
-        ),
+        outbox
+            .iter()
+            .filter(|row| row.operation == "update")
+            .count(),
         2,
         "each tombstone must enqueue exactly one outbox row"
     );
-    let payload_has_deleted_at = scalar(
-        &store,
-        "SELECT count(*) FROM sync_outbox
-          WHERE json_extract(payload, '$.deleted_at') IS NOT NULL",
-    );
+    let payload_has_deleted_at = outbox
+        .iter()
+        .filter(|row| {
+            let payload: serde_json::Value = serde_json::from_str(&row.payload).unwrap();
+            !payload["deleted_at"].is_null()
+        })
+        .count();
     assert_eq!(
         payload_has_deleted_at, 2,
         "without deleted_at on the wire the peer cannot tell this was a deletion"
@@ -149,5 +142,5 @@ fn a_tombstoned_import_still_loses_its_tracking_row() {
     // forever on a sync-enabled node and the file could never be re-imported —
     // a bug that would only ever appear on synced installs.
     assert_eq!(result.tracking_rows_removed, 1);
-    assert_eq!(scalar(&store, "SELECT count(*) FROM chat_imports"), 0);
+    assert_eq!(testing::count(&store, Table::ChatImports).unwrap(), 0);
 }

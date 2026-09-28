@@ -3,6 +3,7 @@
 use remind_me_core::capture::auto_capture;
 use remind_me_core::db::queries;
 use remind_me_core::db::Store;
+use remind_me_core::testing;
 use remind_me_core::{
     AnnotateInput, AutoCaptureInput, Database, EntityInput, ExtractBatchInput, MemoryAddInput,
     MemoryAnnotation, EXTRACT_BATCH_MAX,
@@ -167,14 +168,7 @@ fn superseded_and_deleted_memories_are_excluded() {
     let live = add(&store, "still here");
     let old = add(&store, "replaced");
     let gone = add(&store, "deleted");
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET superseded_by = ? WHERE id = ?",
-            rusqlite::params![live, old],
-        )
-        .unwrap();
+    testing::set_memory_column(&store, &old, "superseded_by", live.as_str()).unwrap();
     queries::delete_memory(&store, &gone).unwrap();
 
     let result = batch(&store, 20);

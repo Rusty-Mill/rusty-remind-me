@@ -7,6 +7,7 @@ mod test_env;
 
 mod support;
 
+use remind_me_core::db::entities::Entities;
 use remind_me_core::db::sync_state::SyncState;
 use remind_me_core::db::Store;
 use remind_me_core::entity::{self, entity_id, entity_relation_id};
@@ -15,6 +16,7 @@ use remind_me_core::sync::{
     upsert_entity_record, upsert_entity_relation_record, upsert_link_record,
     EntityRelationSyncRecord, EntitySyncRecord, LinkSyncRecord,
 };
+use remind_me_core::testing::{self, Table};
 use remind_me_core::{Database, EntityInput};
 use serde_json::json;
 use std::net::TcpListener;
@@ -45,23 +47,10 @@ fn entity_row(
     store: &Store<'_>,
     id: &str,
 ) -> Option<(String, Option<String>, Vec<String>, String)> {
-    store
-        .sqlite()
+    Entities::new(store)
+        .get(id)
         .unwrap()
-        .query_row(
-            "SELECT name, kind, aliases, updated_at FROM entities WHERE id = ?",
-            [id],
-            |row| {
-                let aliases: String = row.get(2)?;
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    serde_json::from_str(&aliases).unwrap(),
-                    row.get(3)?,
-                ))
-            },
-        )
-        .ok()
+        .map(|e| (e.name, e.kind, e.aliases, e.updated_at))
 }
 
 fn entity_record(
@@ -131,12 +120,16 @@ fn an_older_incoming_entity_loses_the_rename_but_still_merges_its_alias() {
         },
     )
     .unwrap();
-    store
-        .sqlite()
+    let local = Entities::new(&store)
+        .get(&entity_id("Bailey"))
         .unwrap()
-        .execute(
-            "UPDATE entities SET updated_at = '2030-03-01T00:00:00+00:00' WHERE id = ?",
-            [&entity_id("Bailey")],
+        .unwrap();
+    Entities::new(&store)
+        .set_kind_and_aliases(
+            &local.id,
+            local.kind.as_deref(),
+            &local.aliases,
+            "2030-03-01T00:00:00+00:00",
         )
         .unwrap();
     let (_, _, _, updated_before) = entity_row(&store, &entity_id("Bailey")).unwrap();
@@ -213,29 +206,21 @@ fn winning_an_existing_entity_does_not_touch_created_at() {
         },
     )
     .unwrap();
-    let original_created_at: String = store
-        .sqlite()
+    let original_created_at: String = Entities::new(&store)
+        .get(&entity_id("Bailey"))
         .unwrap()
-        .query_row(
-            "SELECT created_at FROM entities WHERE id = ?",
-            [&entity_id("Bailey")],
-            |r| r.get(0),
-        )
-        .unwrap();
+        .unwrap()
+        .created_at;
 
     let mut incoming = entity_record("bailey", None, &[], "2030-01-01T00:00:00+00:00");
     incoming.created_at = "1999-01-01T00:00:00+00:00".to_string();
     upsert_entity_record(&store, &incoming).unwrap();
 
-    let created_at_after: String = store
-        .sqlite()
+    let created_at_after: String = Entities::new(&store)
+        .get(&entity_id("Bailey"))
         .unwrap()
-        .query_row(
-            "SELECT created_at FROM entities WHERE id = ?",
-            [&entity_id("Bailey")],
-            |r| r.get(0),
-        )
-        .unwrap();
+        .unwrap()
+        .created_at;
     assert_eq!(created_at_after, original_created_at);
 }
 
@@ -260,11 +245,7 @@ fn entity_relation_insert_or_ignore_is_idempotent() {
     upsert_entity_relation_record(&store, &record).unwrap();
     upsert_entity_relation_record(&store, &record).unwrap();
 
-    let count: i64 = store
-        .sqlite()
-        .unwrap()
-        .query_row("SELECT count(*) FROM entity_relations", [], |r| r.get(0))
-        .unwrap();
+    let count: i64 = testing::count(&store, Table::EntityRelations).unwrap();
     assert_eq!(count, 1);
 }
 
@@ -284,11 +265,7 @@ fn entity_relation_referencing_unknown_entities_is_inserted_anyway() {
     .unwrap();
 
     assert!(upsert_entity_relation_record(&store, &record).is_ok());
-    let count: i64 = store
-        .sqlite()
-        .unwrap()
-        .query_row("SELECT count(*) FROM entity_relations", [], |r| r.get(0))
-        .unwrap();
+    let count: i64 = testing::count(&store, Table::EntityRelations).unwrap();
     assert_eq!(count, 1, "the dangling relation is stored, not rejected");
 }
 
@@ -307,11 +284,7 @@ fn link_insert_or_ignore_is_idempotent_and_returns_the_composite_wire_id() {
 
     assert_eq!(wire_id_1, "mem-1|ent-1");
     assert_eq!(wire_id_2, "mem-1|ent-1");
-    let count: i64 = store
-        .sqlite()
-        .unwrap()
-        .query_row("SELECT count(*) FROM memory_entities", [], |r| r.get(0))
-        .unwrap();
+    let count: i64 = testing::count(&store, Table::MemoryEntities).unwrap();
     assert_eq!(count, 1);
 }
 
@@ -326,11 +299,7 @@ fn a_link_referencing_an_unknown_memory_or_entity_is_inserted_anyway() {
     };
 
     assert!(upsert_link_record(&store, &record).is_ok());
-    let count: i64 = store
-        .sqlite()
-        .unwrap()
-        .query_row("SELECT count(*) FROM memory_entities", [], |r| r.get(0))
-        .unwrap();
+    let count: i64 = testing::count(&store, Table::MemoryEntities).unwrap();
     assert_eq!(
         count, 1,
         "no FK -- the dangling link waits, it does not error"
@@ -355,14 +324,8 @@ fn apply_incoming_record_dispatches_a_memory_record_when_record_type_is_absent()
     let wire_id = apply_incoming_record(&store, &raw).unwrap();
 
     assert_eq!(wire_id, "mem_absent_type");
-    let content: String = store
-        .sqlite()
+    let content = testing::memory_text(&store, "mem_absent_type", "content")
         .unwrap()
-        .query_row(
-            "SELECT content FROM memories WHERE id = 'mem_absent_type'",
-            [],
-            |r| r.get(0),
-        )
         .unwrap();
     assert_eq!(content, "no record_type key at all");
 }
@@ -385,11 +348,7 @@ fn apply_incoming_record_dispatches_each_graph_record_type() {
         "created_at": "2026-01-01T00:00:00+00:00", "updated_at": "2026-01-01T00:00:00+00:00",
     });
     apply_incoming_record(&store, &relation_raw).unwrap();
-    let relation_count: i64 = store
-        .sqlite()
-        .unwrap()
-        .query_row("SELECT count(*) FROM entity_relations", [], |r| r.get(0))
-        .unwrap();
+    let relation_count: i64 = testing::count(&store, Table::EntityRelations).unwrap();
     assert_eq!(relation_count, 1);
 
     let link_raw = json!({ "record_type": "memory_entity", "memory_id": "m1", "entity_id": "e1", "created_at": "2026-01-01T00:00:00+00:00" });
@@ -411,14 +370,10 @@ fn apply_incoming_record_refuses_an_unknown_record_type() {
 // ---------------------------------------------------------------------------
 
 fn outbox_record_types(store: &Store<'_>) -> Vec<String> {
-    let mut stmt = store
-        .sqlite()
+    testing::outbox_rows(store)
         .unwrap()
-        .prepare("SELECT payload FROM sync_outbox ORDER BY id")
-        .unwrap();
-    stmt.query_map([], |r| r.get::<_, String>(0))
-        .unwrap()
-        .map(|r| r.unwrap())
+        .into_iter()
+        .map(|row| row.payload)
         .map(|payload| {
             let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
             parsed
@@ -525,21 +480,9 @@ fn push_outbox_delivers_entities_relations_and_links_to_a_real_hub_in_one_pass()
     );
 
     let hub_conn = hub.db.store();
-    let hub_entities: i64 = hub_conn
-        .sqlite()
-        .unwrap()
-        .query_row("SELECT count(*) FROM entities", [], |r| r.get(0))
-        .unwrap();
-    let hub_relations: i64 = hub_conn
-        .sqlite()
-        .unwrap()
-        .query_row("SELECT count(*) FROM entity_relations", [], |r| r.get(0))
-        .unwrap();
-    let hub_links: i64 = hub_conn
-        .sqlite()
-        .unwrap()
-        .query_row("SELECT count(*) FROM memory_entities", [], |r| r.get(0))
-        .unwrap();
+    let hub_entities: i64 = testing::count(&hub_conn, Table::Entities).unwrap();
+    let hub_relations: i64 = testing::count(&hub_conn, Table::EntityRelations).unwrap();
+    let hub_links: i64 = testing::count(&hub_conn, Table::MemoryEntities).unwrap();
     assert_eq!(hub_entities, 2);
     assert_eq!(hub_relations, 1);
     assert_eq!(hub_links, 1);
@@ -610,16 +553,8 @@ fn pull_links_and_pull_entity_relations_apply_the_hubs_graph_rows() {
 
     assert_eq!(relations_report.applied, 1);
     assert_eq!(links_report.applied, 1);
-    let relations: i64 = local_conn
-        .sqlite()
-        .unwrap()
-        .query_row("SELECT count(*) FROM entity_relations", [], |r| r.get(0))
-        .unwrap();
-    let links: i64 = local_conn
-        .sqlite()
-        .unwrap()
-        .query_row("SELECT count(*) FROM memory_entities", [], |r| r.get(0))
-        .unwrap();
+    let relations: i64 = testing::count(&local_conn, Table::EntityRelations).unwrap();
+    let links: i64 = testing::count(&local_conn, Table::MemoryEntities).unwrap();
     assert_eq!(relations, 1);
     assert_eq!(links, 1);
 }

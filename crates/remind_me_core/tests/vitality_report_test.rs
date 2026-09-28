@@ -6,6 +6,7 @@
 use chrono::{Duration, Utc};
 use remind_me_core::db::queries;
 use remind_me_core::db::Store;
+use remind_me_core::testing;
 use remind_me_core::vitality::{
     build_vitality_report, effective_vitality, is_dormant, VITALITY_FLOOR,
 };
@@ -30,25 +31,12 @@ fn add(store: &Store<'_>, content: &str, category: &str) -> String {
 /// Backdate a memory's last access so elapsed-days decay has something to bite.
 fn age_by_days(store: &Store<'_>, id: &str, days: i64) {
     let when = (Utc::now() - Duration::days(days)).to_rfc3339();
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET accessed_at = ?, created_at = ? WHERE id = ?",
-            rusqlite::params![when, when, id],
-        )
-        .unwrap();
+    testing::set_memory_column(store, id, "accessed_at", when.as_str()).unwrap();
+    testing::set_memory_column(store, id, "created_at", when).unwrap();
 }
 
 fn set_access_count(store: &Store<'_>, id: &str, count: i64) {
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET access_count = ? WHERE id = ?",
-            rusqlite::params![count, id],
-        )
-        .unwrap();
+    testing::set_memory_column(store, id, "access_count", count).unwrap();
 }
 
 #[test]

@@ -9,12 +9,13 @@
 #[path = "../src/test_env.rs"]
 mod test_env;
 
+use remind_me_core::db::reminders::Reminders;
 use remind_me_core::db::Store;
 use remind_me_core::models::ReminderWindow;
 use remind_me_core::reminders::{list_reminders, set_reminder};
 use remind_me_core::scheduler::{due_reminders, poll_once_with};
+use remind_me_core::testing::{self, Table};
 use remind_me_core::{Database, MemoryAddInput};
-use rusqlite::params;
 
 fn add(store: &Store<'_>, content: &str) -> String {
     remind_me_core::db::queries::add_memory(
@@ -48,14 +49,7 @@ fn future(hours: i64) -> String {
 /// purpose, so a reminder that is already due can only be reached this way —
 /// which in production means one that came due while nothing was running.
 fn force_due(store: &Store<'_>, memory_id: &str, when: &str) {
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET remind_at = ? WHERE id = ?",
-            params![when, memory_id],
-        )
-        .unwrap();
+    testing::set_memory_column(store, memory_id, "remind_at", when).unwrap();
 }
 
 /// Run a pass, returning the ids it delivered.
@@ -163,14 +157,7 @@ fn a_deleted_memorys_reminder_is_never_delivered() {
     let store = db.store();
     let id = add(&store, "deleted before it fired");
     force_due(&store, &id, &past(1));
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET deleted_at = ? WHERE id = ?",
-            params![chrono::Utc::now().to_rfc3339(), &id],
-        )
-        .unwrap();
+    testing::set_memory_column(&store, &id, "deleted_at", chrono::Utc::now().to_rfc3339()).unwrap();
 
     // Delivering this would surface content the user deleted, through a
     // channel they may not control.
@@ -241,14 +228,8 @@ fn a_second_poller_racing_the_first_does_not_error_the_pass() {
     // duplicate must not strand every later reminder in the same batch.
     let mut delivered = Vec::new();
     poll_once_with(&store, &mut |m| {
-        store
-            .sqlite()
-            .unwrap()
-            .execute(
-                "INSERT INTO reminder_deliveries (memory_id, remind_at, delivered_at)
-             VALUES (?, ?, ?)",
-                params![m.id, when, chrono::Utc::now().to_rfc3339()],
-            )
+        Reminders::new(&store)
+            .record_delivery(&m.id, &when, &chrono::Utc::now().to_rfc3339())
             .unwrap();
         delivered.push(m.id.clone());
     })
@@ -325,16 +306,9 @@ fn the_running_loop_delivers_without_anyone_calling_a_tool() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     let mut delivered = 0i64;
     while std::time::Instant::now() < deadline {
-        delivered = observer
-            .store()
-            .sqlite()
-            .unwrap()
-            .query_row(
-                "SELECT COUNT(*) FROM reminder_deliveries WHERE memory_id = ?",
-                params![&id],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
+        // The only memory in this database is `id`, so every delivery row
+        // is one of its deliveries.
+        delivered = testing::count(&observer.store(), Table::ReminderDeliveries).unwrap_or(0);
         if delivered > 0 {
             break;
         }

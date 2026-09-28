@@ -1135,7 +1135,34 @@ complete.**
 
 With core PR 4, every table the memories core replaces is on it.
 
-**Next:** core PR 5, the switch-on. The copy tool (§5) comes after it.
+**Core 5a, done: the tests stop reaching around the repositories.**
+Switching the core on locally broke about 330 tests in 52 suites, almost
+all because they seeded or read memories and the tables that join them
+with SQL, which the core never sees. So the switch-on is two PRs: this
+one, then the flip.
+
+- `remind_me_core::testing` (public, hidden from the docs) gives tests
+  raw access that works on both backends:
+  - one memory column, read or overwritten as an `UPDATE` would, with no
+    outbox entry and no revision;
+  - memory ids and row counts;
+  - raw outbox entries and send markers;
+  - feedback queries and association weights;
+  - relabelling a memory's id.
+
+  A differential test runs every helper on both backends.
+- Every other seed and read goes through the repositories. Tests of what
+  only SQLite has (its schema, its migrations, its triggers in an on-disk
+  file) open SQLite explicitly with `Database::open_sqlite_in_memory`,
+  now public.
+- One production fix: an in-memory database on the engine now reconciles
+  the `sync_enabled` gate after attaching the engine tables, as every
+  open already did for SQLite's flags. Without it, the core's own
+  `sync_flags` never had the gate set, and with sync configured nothing
+  was queued.
+- No test or assertion was removed.
+
+**Next:** core PR 5b, the flip. The copy tool (§5) comes after it.
 
 ## Related
 

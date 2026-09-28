@@ -28,6 +28,7 @@ pub(crate) mod revisions;
 pub(crate) mod saved_searches;
 pub(crate) mod stats;
 pub(crate) mod sync_log;
+pub(crate) mod testing;
 pub(crate) mod vectors;
 pub(crate) mod wiki;
 

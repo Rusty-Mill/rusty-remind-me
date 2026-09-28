@@ -17,6 +17,7 @@
 
 use remind_me_core::db::queries;
 use remind_me_core::db::Store;
+use remind_me_core::testing;
 use remind_me_core::{Database, MemoryAddInput, MemoryListInput, MemoryUpdateInput};
 
 /// Ids in the reference's shape, as it would actually write them.
@@ -48,52 +49,16 @@ fn add(store: &Store<'_>, content: &str) -> String {
 /// Rewrite a row's id to a reference-shaped one, simulating a row this
 /// implementation received from `remind_me` through the shared database.
 ///
-/// Done with raw SQL because there is no API for it — which is the point: a
-/// row with a foreign id shape arrives by the other process writing it, not by
-/// anything here choosing it.
+/// Done with a raw write because there is no API for it — which is the
+/// point: a row with a foreign id shape arrives by the other process writing
+/// it, not by anything here choosing it. Its tags move with it, not dropped:
+/// a row that arrived from `remind_me` has its tags, and a guard that only
+/// ever sees tagless rows would not be testing the shape a shared database
+/// holds.
 fn relabel(store: &Store<'_>, from: &str, to: &str) {
-    // `memory_tags.memory_id` carries a foreign key to `memories.id`, so
-    // whichever of the two updates lands first orphans the other. The check is
-    // suspended across the pair rather than the tags being dropped: a row that
-    // arrived from `remind_me` has its tags, and a guard that only ever sees
-    // tagless rows would not be testing the shape a shared database holds.
-    store
-        .sqlite()
-        .unwrap()
-        .execute_batch("PRAGMA foreign_keys = OFF")
-        .unwrap();
-    store
-        .sqlite()
-        .unwrap()
-        .execute("UPDATE memories SET id = ?1 WHERE id = ?2", [to, from])
-        .unwrap();
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memory_tags SET memory_id = ?1 WHERE memory_id = ?2",
-            [to, from],
-        )
-        .unwrap();
-    store
-        .sqlite()
-        .unwrap()
-        .execute_batch("PRAGMA foreign_keys = ON")
-        .unwrap();
-
-    // Left inconsistent, the tests below would pass for the wrong reason.
-    let orphans: i64 = store
-        .sqlite()
-        .unwrap()
-        .query_row(
-            "SELECT count(*) FROM memory_tags t
-              LEFT JOIN memories m ON m.id = t.memory_id
-              WHERE m.id IS NULL",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(orphans, 0, "relabel left orphaned tag rows");
+    // Left inconsistent, the tests below would pass for the wrong reason:
+    // the helper refuses a move that leaves tag rows behind.
+    assert_eq!(testing::relabel_memory(store, from, to).unwrap(), 1);
 }
 
 /// `list` with a real limit.

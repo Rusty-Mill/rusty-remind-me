@@ -4,6 +4,8 @@
 //! (`decompose`, the relation half of `annotate`) are still to come — so the
 //! edges are inserted directly.
 
+use remind_me_core::db::derived::Origin;
+use remind_me_core::db::entities::{Entities, RelationRow};
 use remind_me_core::db::Store;
 use remind_me_core::entity::{entity_id, resolve_entity, traverse_from_name, upsert_entity};
 use remind_me_core::{Database, EntityInput, EntityTraverseInput};
@@ -25,21 +27,19 @@ fn entity(store: &Store<'_>, name: &str, aliases: &[&str]) -> String {
 /// breadth-first order deterministic.
 fn relate(store: &Store<'_>, seq: u32, subject: &str, relation: &str, object: &str) {
     let created = format!("2026-01-01T00:00:{:02}Z", seq);
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "INSERT INTO entity_relations (id, subject_entity_id, relation, object_entity_id,
-                                       created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?)",
-            rusqlite::params![
-                format!("rel_{}", seq),
-                subject,
+    let id = format!("rel_{}", seq);
+    Entities::new(store)
+        .insert_relation_or_ignore(
+            &RelationRow {
+                id: &id,
+                subject_entity_id: subject,
                 relation,
-                object,
-                created,
-                created
-            ],
+                object_entity_id: object,
+                created_at: &created,
+                updated_at: &created,
+                node_id: None,
+            },
+            Origin::Sync,
         )
         .unwrap();
 }

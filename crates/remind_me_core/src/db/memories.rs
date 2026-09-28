@@ -1205,7 +1205,8 @@ mod tests {
 
     #[test]
     fn new_fills_every_column_with_the_schema_default() {
-        let db = Database::open_in_memory().unwrap();
+        // The schema's defaults are SQLite's; the engine has no schema.
+        let db = Database::open_sqlite_in_memory().unwrap();
         let store = db.store();
         let conn = store.conn();
         conn.execute(
@@ -1279,22 +1280,20 @@ mod tests {
 
     #[test]
     fn sync_view_reads_tags_that_are_not_an_array_as_none() {
-        let db = Database::open_in_memory().unwrap();
-        let store = db.store();
-        let conn = store.conn();
-        conn.execute(
-            r#"INSERT INTO memories (id, content, tags, created_at, updated_at)
-             VALUES ('a', 'x', '"not an array"', ?, ?)"#,
-            params![NOW, NOW],
-        )
-        .unwrap();
-        let view = Memories::new(&store).sync_view("a").unwrap().unwrap();
-        assert!(view.tags.is_empty());
-        assert_eq!(view.metadata, serde_json::json!({}));
-        assert!(Memories::new(&store)
-            .sync_view("missing")
-            .unwrap()
-            .is_none());
+        on_each_core_backend(|db| {
+            let store = db.store();
+            Memories::new(&store)
+                .insert(&NewMemory::new("a", "x", NOW))
+                .unwrap();
+            crate::testing::set_memory_column(&store, "a", "tags", r#""not an array""#).unwrap();
+            let view = Memories::new(&store).sync_view("a").unwrap().unwrap();
+            assert!(view.tags.is_empty());
+            assert_eq!(view.metadata, serde_json::json!({}));
+            assert!(Memories::new(&store)
+                .sync_view("missing")
+                .unwrap()
+                .is_none());
+        });
     }
 
     #[test]

@@ -14,6 +14,7 @@
 use remind_me_core::consolidation::consolidate;
 use remind_me_core::db::queries;
 use remind_me_core::db::Store;
+use remind_me_core::testing;
 use remind_me_core::{ConsolidateInput, Database, MemoryAddInput};
 use std::collections::HashMap;
 
@@ -44,38 +45,16 @@ fn add_with_vector(store: &Store<'_>, content: &str, category: &str, vector: &[f
 }
 
 fn set_vitality_and_access(store: &Store<'_>, id: &str, vitality: f64, access_count: i64) {
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET vitality = ?, access_count = ? WHERE id = ?",
-            rusqlite::params![vitality, access_count, id],
-        )
-        .unwrap();
+    testing::set_memory_column(store, id, "vitality", vitality).unwrap();
+    testing::set_memory_column(store, id, "access_count", access_count).unwrap();
 }
 
 fn column_opt(store: &Store<'_>, id: &str, name: &str) -> Option<String> {
-    store
-        .sqlite()
-        .unwrap()
-        .query_row(
-            &format!("SELECT {} FROM memories WHERE id = ?", name),
-            rusqlite::params![id],
-            |r| r.get::<_, Option<String>>(0),
-        )
-        .unwrap()
+    testing::memory_text(store, id, name).unwrap()
 }
 
 fn column(store: &Store<'_>, id: &str, name: &str) -> String {
-    store
-        .sqlite()
-        .unwrap()
-        .query_row(
-            &format!("SELECT {} FROM memories WHERE id = ?", name),
-            rusqlite::params![id],
-            |r| r.get::<_, String>(0),
-        )
-        .unwrap()
+    testing::memory_text(store, id, name).unwrap().unwrap()
 }
 
 fn default_input() -> ConsolidateInput {
@@ -289,14 +268,8 @@ fn merging_combines_content_sums_access_counts_and_supersedes_members() {
         "the meeting is at 3pm"
     );
 
-    let access_count: i64 = store
-        .sqlite()
+    let access_count = testing::memory_i64(&store, &canonical, "access_count")
         .unwrap()
-        .query_row(
-            "SELECT access_count FROM memories WHERE id = ?",
-            [&canonical],
-            |r| r.get(0),
-        )
         .unwrap();
     assert_eq!(access_count, 8, "5 (canonical) + 3 (member)");
 

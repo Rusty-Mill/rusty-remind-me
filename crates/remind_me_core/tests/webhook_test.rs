@@ -12,6 +12,7 @@ mod test_env;
 
 use remind_me_core::db::Store;
 use remind_me_core::sync::{CLIENT_ENV, NODE_ID_ENV};
+use remind_me_core::testing::{self, Table};
 use remind_me_core::webhook::{
     self, constant_time_eq, validate_payload, Webhook, WebhookConfig, WebhookCounters,
     MAX_BODY_BYTES, MAX_HEAD_BYTES,
@@ -459,12 +460,14 @@ fn the_defaults_match_a_file_import() {
 // Ingestion
 // ---------------------------------------------------------------------------
 
+/// `column` of one stored memory (the lowest id), as text.
+fn first_memory_text(store: &Store<'_>, column: &str) -> String {
+    let first = &testing::memory_ids(store).unwrap()[0];
+    testing::memory_text(store, first, column).unwrap().unwrap()
+}
+
 fn stored(store: &Store<'_>) -> i64 {
-    store
-        .sqlite()
-        .unwrap()
-        .query_row("SELECT count(*) FROM memories", [], |r| r.get(0))
-        .unwrap()
+    testing::count(store, Table::Memories).unwrap()
 }
 
 #[test]
@@ -476,11 +479,7 @@ fn a_valid_push_becomes_memories() {
 
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["status"], "imported");
-    let content: String = store
-        .sqlite()
-        .unwrap()
-        .query_row("SELECT content FROM memories", [], |r| r.get(0))
-        .unwrap();
+    let content = first_memory_text(&store, "content");
     assert!(
         content.contains("marsupial"),
         "the assistant message landed, got {content}"
@@ -508,12 +507,10 @@ fn a_pushed_memory_is_stamped_with_the_configured_node_and_client() {
     let (status, body) = serve(&store, &authed(&push_body("chat.json", CHAT)));
     assert_eq!(status, 200, "{body}");
 
-    let (node_id, client): (Option<String>, String) = store
-        .sqlite()
+    let first = &testing::memory_ids(&store).unwrap()[0];
+    let node_id = testing::memory_text(&store, first, "node_id").unwrap();
+    let client = testing::memory_text(&store, first, "client")
         .unwrap()
-        .query_row("SELECT node_id, client FROM memories LIMIT 1", [], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })
         .unwrap();
 
     crate::test_env::remove_var(NODE_ID_ENV);
@@ -530,22 +527,14 @@ fn a_pushed_memory_keeps_the_source_a_file_import_would_have_given_it() {
 
     serve(&store, &authed(&push_body("chat.json", CHAT)));
 
-    let source: String = store
-        .sqlite()
-        .unwrap()
-        .query_row("SELECT source FROM memories", [], |r| r.get(0))
-        .unwrap();
+    let source = first_memory_text(&store, "source");
     // Not "webhook". `source` feeds dedup, the normalize_batch selection and
     // the vitality source prior, and a database is meant to be readable by
     // `remind_me`, which stores pushed content under exactly these values. The
     // arrival channel is recorded in metadata instead, where it costs nothing.
     assert_eq!(source, "chat_import");
 
-    let metadata: String = store
-        .sqlite()
-        .unwrap()
-        .query_row("SELECT metadata FROM memories", [], |r| r.get(0))
-        .unwrap();
+    let metadata = first_memory_text(&store, "metadata");
     let metadata: serde_json::Value = serde_json::from_str(&metadata).unwrap();
     assert_eq!(metadata["ingest"], "webhook");
     assert_eq!(metadata["filename"], "chat.json");
@@ -560,11 +549,7 @@ fn a_pushed_document_is_chunked_as_a_document() {
     let (status, _) = serve(&store, &authed(&push_body("notes.md", doc)));
 
     assert_eq!(status, 200);
-    let source: String = store
-        .sqlite()
-        .unwrap()
-        .query_row("SELECT source FROM memories LIMIT 1", [], |r| r.get(0))
-        .unwrap();
+    let source = first_memory_text(&store, "source");
     assert_eq!(source, "document_import");
     assert!(stored(&store) >= 2, "one memory per section");
 }

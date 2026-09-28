@@ -6,6 +6,7 @@
 use chrono::{Duration, Utc};
 use remind_me_core::db::queries;
 use remind_me_core::db::Store;
+use remind_me_core::testing;
 use remind_me_core::{Database, MemoryAddInput, MemorySearchInput};
 
 fn add(store: &Store<'_>, content: &str, category: &str) -> String {
@@ -30,14 +31,8 @@ fn add(store: &Store<'_>, content: &str, category: &str) -> String {
 
 fn age_by_days(store: &Store<'_>, id: &str, days: i64) {
     let when = (Utc::now() - Duration::days(days)).to_rfc3339();
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET accessed_at = ?, created_at = ? WHERE id = ?",
-            rusqlite::params![when, when, id],
-        )
-        .unwrap();
+    testing::set_memory_column(store, id, "accessed_at", when.as_str()).unwrap();
+    testing::set_memory_column(store, id, "created_at", when).unwrap();
 }
 
 fn search(store: &Store<'_>, query: &str, include_dormant: bool, min_vitality: f64) -> Vec<String> {
@@ -161,14 +156,7 @@ fn bridge_protection_keeps_a_heavily_used_memory_searchable() {
     age_by_days(&store, &plain, 30);
     age_by_days(&store, &bridge, 30);
     // At or above BRIDGE_THRESHOLD accesses, decay is halved.
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET access_count = 10 WHERE id = ?",
-            rusqlite::params![bridge],
-        )
-        .unwrap();
+    testing::set_memory_column(&store, &bridge, "access_count", 10).unwrap();
 
     let found = search(&store, "quokka", false, 0.0);
     assert!(
@@ -186,14 +174,7 @@ fn a_null_accessed_at_falls_back_to_created_at() {
     // A row written by `remind_me` can leave the column unset — its schema
     // default is NULL. Without a fallback the vitality expression would be NULL
     // and the row would silently vanish from every search.
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET accessed_at = NULL WHERE id = ?",
-            rusqlite::params![id],
-        )
-        .unwrap();
+    testing::set_memory_column(&store, &id, "accessed_at", testing::Value::Null).unwrap();
 
     assert_eq!(search(&store, "quokka", false, 0.0), vec![id.clone()]);
     // Parsing the row must not fail either.

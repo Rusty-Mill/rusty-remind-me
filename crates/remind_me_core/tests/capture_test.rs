@@ -1,8 +1,10 @@
 //! Coverage for `remind_me_auto_capture` / `remind_me_get_capture`.
 
 use remind_me_core::capture::{auto_capture, get_capture};
+use remind_me_core::db::memories::{Memories, NewMemory};
 use remind_me_core::db::queries;
 use remind_me_core::db::Store;
+use remind_me_core::testing;
 use remind_me_core::{
     AutoCaptureInput, CaptureResult, Database, MemorySearchInput, CAPTURE_SOURCE, DIALOG_CATEGORY,
 };
@@ -23,15 +25,7 @@ fn capture(store: &Store<'_>, conversation: &str, summary: &str) -> CaptureResul
 }
 
 fn column(store: &Store<'_>, id: &str, name: &str) -> String {
-    store
-        .sqlite()
-        .unwrap()
-        .query_row(
-            &format!("SELECT {} FROM memories WHERE id = ?", name),
-            rusqlite::params![id],
-            |r| r.get::<_, String>(0),
-        )
-        .unwrap()
+    testing::memory_text(store, id, name).unwrap().unwrap()
 }
 
 fn metadata(store: &Store<'_>, id: &str) -> serde_json::Value {
@@ -278,16 +272,11 @@ fn an_extra_row_sharing_the_id_is_surfaced_not_dropped() {
     let store = db.store();
     let result = capture(&store, "the transcript", "the summary");
     // Sync can deliver a third row carrying the same capture_id.
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "INSERT INTO memories (id, content, category, tags, source, metadata, capture_id,
-                               created_at, updated_at)
-         VALUES ('mem_extra', 'stray', 'general', '[]', 'manual', '{}', ?,
-                 '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
-            rusqlite::params![result.capture_id],
-        )
+    Memories::new(&store)
+        .insert(&NewMemory {
+            capture_id: Some(result.capture_id.clone()),
+            ..NewMemory::new("mem_extra", "stray", "2026-01-01T00:00:00Z")
+        })
         .unwrap();
 
     let found = get_capture(&store, &result.capture_id).unwrap().unwrap();

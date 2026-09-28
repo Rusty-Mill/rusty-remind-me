@@ -4,6 +4,7 @@
 use chrono::{Duration, Utc};
 use remind_me_core::db::queries;
 use remind_me_core::db::Store;
+use remind_me_core::testing;
 use remind_me_core::vitality::{record_accesses, BRIDGE_THRESHOLD};
 use remind_me_core::{Database, MemoryAddInput, MemorySearchInput};
 
@@ -57,39 +58,21 @@ fn search(store: &Store<'_>, query: &str) -> Vec<String> {
 }
 
 fn access_count(store: &Store<'_>, id: &str) -> i64 {
-    store
-        .sqlite()
+    testing::memory_i64(&store, &id, "access_count")
         .unwrap()
-        .query_row(
-            "SELECT access_count FROM memories WHERE id = ?",
-            rusqlite::params![id],
-            |r| r.get(0),
-        )
         .unwrap()
 }
 
 fn accessed_at(store: &Store<'_>, id: &str) -> String {
-    store
-        .sqlite()
+    testing::memory_text(&store, &id, "accessed_at")
         .unwrap()
-        .query_row(
-            "SELECT accessed_at FROM memories WHERE id = ?",
-            rusqlite::params![id],
-            |r| r.get(0),
-        )
         .unwrap()
 }
 
 fn backdate(store: &Store<'_>, id: &str, days: i64) {
     let when = (Utc::now() - Duration::days(days)).to_rfc3339();
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET accessed_at = ?, created_at = ? WHERE id = ?",
-            rusqlite::params![when, when, id],
-        )
-        .unwrap();
+    testing::set_memory_column(store, id, "accessed_at", when.clone()).unwrap();
+    testing::set_memory_column(store, id, "created_at", when).unwrap();
 }
 
 #[test]
@@ -178,26 +161,14 @@ fn the_stored_vitality_reflects_the_new_count() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
     let id = add(&store, "quokka sighting", "general");
-    let before: f64 = store
-        .sqlite()
+    let before: f64 = testing::memory_f64(&store, &id, "vitality")
         .unwrap()
-        .query_row(
-            "SELECT vitality FROM memories WHERE id = ?",
-            rusqlite::params![id],
-            |r| r.get(0),
-        )
         .unwrap();
 
     search(&store, "quokka");
 
-    let after: f64 = store
-        .sqlite()
+    let after: f64 = testing::memory_f64(&store, &id, "vitality")
         .unwrap()
-        .query_row(
-            "SELECT vitality FROM memories WHERE id = ?",
-            rusqlite::params![id],
-            |r| r.get(0),
-        )
         .unwrap();
     // Recomputed at zero elapsed days, so it collapses to
     // base_weight * sqrt(count + 1): 1.0 * sqrt(2).
@@ -213,14 +184,8 @@ fn status_is_maintained() {
 
     search(&store, "quokka");
 
-    let status: String = store
-        .sqlite()
+    let status: String = testing::memory_text(&store, &id, "status")
         .unwrap()
-        .query_row(
-            "SELECT status FROM memories WHERE id = ?",
-            rusqlite::params![id],
-            |r| r.get(0),
-        )
         .unwrap();
     // Nothing wrote this column before; the earlier tests pinned it at
     // "active" by observation rather than because anything maintained it.

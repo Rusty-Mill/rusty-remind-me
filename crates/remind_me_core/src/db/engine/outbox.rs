@@ -180,6 +180,41 @@ pub(crate) fn entry(
     ))
 }
 
+/// Every send marker as `(remote, outbox id, sent at)`, sorted: for
+/// [`crate::testing`].
+pub(crate) fn send_markers(tables: &EngineTables) -> Result<Vec<(String, i64, String)>> {
+    let core = core_ref(tables)?;
+    let mut all: Vec<(String, i64, String)> = core
+        .sends
+        .all_ids()
+        .into_iter()
+        .filter_map(|id| core.sends.get(id))
+        .map(|s| (s.remote_id, s.outbox_id, s.sent_at))
+        .collect();
+    all.sort();
+    Ok(all)
+}
+
+/// Queue one entry for `key` created at `created_at`, alone: a raw insert,
+/// for [`crate::testing`]. Returns its id.
+pub(crate) fn queue_at(
+    tables: &mut EngineTables,
+    key: &str,
+    operation: &str,
+    payload: &str,
+    created_at: &str,
+) -> Result<i64> {
+    let Change::Outbox(id, Some(mut record)) = entry(tables, key, operation, payload.to_string())?
+    else {
+        return Err(crate::db::StoreError::Engine(
+            "an outbox entry was not built".to_string(),
+        ));
+    };
+    record.created_at = created_at.to_string();
+    tables.commit(vec![Change::Outbox(id, Some(record))])?;
+    Ok(id)
+}
+
 /// Queue every memory, then every entity and mention link, as inserts with
 /// the backfill's payloads, in one batch.
 pub(crate) fn backfill(tables: &mut EngineTables) -> Result<()> {

@@ -1,5 +1,6 @@
 //! Coverage for `remind_me_annotate` and the shared entity-mention path.
 
+use remind_me_core::db::entities::Entities;
 use remind_me_core::db::queries;
 use remind_me_core::db::Store;
 use remind_me_core::entity;
@@ -46,15 +47,15 @@ fn ent(name: &str) -> EntityInput {
 }
 
 fn linked_entity_ids(store: &Store<'_>, memory_id: &str) -> Vec<String> {
-    let mut stmt = store
-        .sqlite()
+    let mut ids: Vec<String> = Entities::new(store)
+        .links_oldest_first()
         .unwrap()
-        .prepare("SELECT entity_id FROM memory_entities WHERE memory_id = ? ORDER BY entity_id")
-        .unwrap();
-    let rows = stmt
-        .query_map(rusqlite::params![memory_id], |r| r.get::<_, String>(0))
-        .unwrap();
-    rows.map(|r| r.unwrap()).collect()
+        .into_iter()
+        .filter(|(memory, _, _)| memory == memory_id)
+        .map(|(_, entity, _)| entity)
+        .collect();
+    ids.sort();
+    ids
 }
 
 #[test]

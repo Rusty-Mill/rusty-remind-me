@@ -1,7 +1,10 @@
 //! Coverage for `remind_me_list` / `remind_me_update` / `remind_me_delete`.
 
+use remind_me_core::db::feedback::{Feedback, FeedbackEvent};
 use remind_me_core::db::queries;
+use remind_me_core::db::related::Related;
 use remind_me_core::db::Store;
+use remind_me_core::testing::{self, Table};
 use remind_me_core::{
     Database, MemoryAddInput, MemoryListInput, MemorySearchInput, MemoryUpdateInput, UpdateOutcome,
 };
@@ -448,24 +451,21 @@ fn delete_cleans_up_dependent_rows_explicitly() {
     let id = queries::add_memory(&store, input).unwrap().id;
 
     // Rows in the two tables that have no foreign key back to `memories`.
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "INSERT INTO memory_feedback
-            (id, memory_id, query, query_tokens, signal, magnitude, created_at)
-         VALUES ('fb_1', ?, 'q', '[]', 'helpful', 1.0, '2026-01-01T00:00:00+00:00')",
-            rusqlite::params![id],
+    Feedback::new(&store)
+        .log_event(
+            "fb_1",
+            &id,
+            "q",
+            &FeedbackEvent {
+                query_tokens: String::new(),
+                signal: "helpful".into(),
+                magnitude: 1.0,
+            },
+            "2026-01-01T00:00:00+00:00",
         )
         .unwrap();
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "INSERT INTO memory_associations (memory_id_a, memory_id_b, weight, updated_at)
-         VALUES (?, 'mem_other', 1, '2026-01-01T00:00:00+00:00')",
-            rusqlite::params![id],
-        )
+    Related::new(&store)
+        .bump_pair(&id, "mem_other", "2026-01-01T00:00:00+00:00", 10)
         .unwrap();
 
     queries::delete_memory(&store, &id).unwrap();
@@ -473,28 +473,19 @@ fn delete_cleans_up_dependent_rows_explicitly() {
     // The schema carries no foreign keys on these — the reference omits them so
     // sync can deliver a link before the memory it points at — so cleanup is
     // `delete_memory`'s job, not the database's.
-    for (table, column) in [
-        ("memory_entities", "memory_id"),
-        ("memory_feedback", "memory_id"),
-        ("memory_associations", "memory_id_a"),
+    //
+    // Every row in these tables was written for `id`, so a whole-table count
+    // is its count.
+    for table in [
+        Table::MemoryEntities,
+        Table::MemoryFeedback,
+        Table::MemoryAssociations,
     ] {
-        let left: i64 = store
-            .sqlite()
-            .unwrap()
-            .query_row(
-                &format!("SELECT count(*) FROM {} WHERE {} = ?", table, column),
-                rusqlite::params![id],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(left, 0, "{} rows must be cleaned up on delete", table);
+        let left = testing::count(&store, table).unwrap();
+        assert_eq!(left, 0, "{:?} rows must be cleaned up on delete", table);
     }
 
-    let entities: i64 = store
-        .sqlite()
-        .unwrap()
-        .query_row("SELECT count(*) FROM entities", [], |r| r.get(0))
-        .unwrap();
+    let entities = testing::count(&store, Table::Entities).unwrap();
     assert_eq!(
         entities, 1,
         "the entity itself survives; others may cite it"

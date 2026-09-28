@@ -10,6 +10,7 @@ use remind_me_core::importer::{
     split_markdown_sections, CHAT_SOURCE, DOCUMENT_CATEGORY, DOCUMENT_SOURCE,
 };
 use remind_me_core::sync::{CLIENT_ENV, NODE_ID_ENV};
+use remind_me_core::testing;
 use remind_me_core::{
     BulkImportDirInput, ChatImportInput, Database, ImportKind, ImportOutcome, NormalizeBatchInput,
 };
@@ -48,23 +49,25 @@ fn import(
 }
 
 fn contents(store: &Store<'_>) -> Vec<String> {
-    let mut stmt = store
-        .sqlite()
+    let mut rows: Vec<(Option<i64>, String, String)> = testing::memory_ids(store)
         .unwrap()
-        .prepare("SELECT content FROM memories ORDER BY chunk_index, id")
-        .unwrap();
-    let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
-    rows.map(|r| r.unwrap()).collect()
+        .into_iter()
+        .map(|id| {
+            let index = testing::memory_i64(store, &id, "chunk_index").unwrap();
+            let content = testing::memory_text(store, &id, "content")
+                .unwrap()
+                .unwrap();
+            (index, id, content)
+        })
+        .collect();
+    rows.sort();
+    rows.into_iter().map(|(_, _, content)| content).collect()
 }
 
+/// `name` of the first stored memory.
 fn column(store: &Store<'_>, name: &str) -> String {
-    store
-        .sqlite()
-        .unwrap()
-        .query_row(&format!("SELECT {} FROM memories LIMIT 1", name), [], |r| {
-            r.get::<_, String>(0)
-        })
-        .unwrap()
+    let ids = testing::memory_ids(store).unwrap();
+    testing::memory_text(store, &ids[0], name).unwrap().unwrap()
 }
 
 const CHAT_JSON: &str = r#"[
@@ -160,13 +163,9 @@ fn a_chat_import_is_stamped_with_the_configured_node_and_client() {
     let outcome = import(&store, &path, |_| {});
     assert!(matches!(outcome, ImportOutcome::Imported { .. }));
 
-    let (node_id, client): (Option<String>, String) = store
-        .sqlite()
-        .unwrap()
-        .query_row("SELECT node_id, client FROM memories LIMIT 1", [], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })
-        .unwrap();
+    let node_id =
+        testing::memory_text(&store, &testing::memory_ids(&store).unwrap()[0], "node_id").unwrap();
+    let client = column(&store, "client");
 
     crate::test_env::remove_var(NODE_ID_ENV);
     crate::test_env::remove_var(CLIENT_ENV);
@@ -397,16 +396,22 @@ fn chunks_share_a_doc_id_and_are_indexed_in_source_order() {
 
     import(&store, &path, |_| {});
 
-    let mut stmt = store
-        .sqlite()
+    let mut rows: Vec<(String, i64, String)> = testing::memory_ids(&store)
         .unwrap()
-        .prepare("SELECT doc_id, chunk_index, content FROM memories ORDER BY chunk_index")
-        .unwrap();
-    let rows: Vec<(String, i64, String)> = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-        .unwrap()
-        .map(|r| r.unwrap())
+        .iter()
+        .map(|id| {
+            (
+                testing::memory_text(&store, id, "doc_id").unwrap().unwrap(),
+                testing::memory_i64(&store, id, "chunk_index")
+                    .unwrap()
+                    .unwrap(),
+                testing::memory_text(&store, id, "content")
+                    .unwrap()
+                    .unwrap(),
+            )
+        })
         .collect();
+    rows.sort_by_key(|(_, index, _)| *index);
 
     assert_eq!(rows.len(), 3);
     assert!(rows.iter().all(|(doc, _, _)| *doc == rows[0].0));

@@ -850,7 +850,6 @@ mod tests {
     fn repoint_drops_a_link_the_target_already_has() {
         let db = Database::open_in_memory().unwrap();
         let store = db.store();
-        let conn = store.conn();
         let entities = Entities::new(&store);
         assert!(entities
             .link("m1", "old", T1, crate::db::derived::Origin::Local)
@@ -867,13 +866,12 @@ mod tests {
 
         entities.repoint("old", "new").unwrap();
 
-        let mut links: Vec<(String, String)> = conn
-            .prepare("SELECT memory_id, entity_id FROM memory_entities ORDER BY memory_id")
+        let mut links: Vec<(String, String)> = entities
+            .links_oldest_first()
             .unwrap()
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
+            .into_iter()
+            .map(|(memory_id, entity_id, _)| (memory_id, entity_id))
+            .collect();
         links.sort();
         assert_eq!(
             links,

@@ -1,5 +1,6 @@
 //! Coverage for `remind_me_stats`.
 
+use remind_me_core::db::imports::ImportLedger;
 use remind_me_core::db::queries;
 use remind_me_core::db::Store;
 use remind_me_core::{stats, Database, MemoryAddInput};
@@ -102,14 +103,8 @@ fn import_ledger_is_counted_separately_from_memories() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
     add(&store, "a memory", "general", "manual");
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "INSERT INTO chat_imports (import_id, filename, hash, imported_at)
-         VALUES ('imp_1', 'chat.json', 'abc', '2026-01-01T00:00:00Z')",
-            [],
-        )
+    ImportLedger::new(&store)
+        .record_chat("imp_1", "chat.json", "abc", "2026-01-01T00:00:00Z", "{}")
         .unwrap();
 
     let s = stats::collect(&store).unwrap();

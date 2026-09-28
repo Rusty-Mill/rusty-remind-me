@@ -14,9 +14,11 @@
 #[path = "../src/test_env.rs"]
 mod test_env;
 
+use remind_me_core::db::outbox::Outbox;
 use remind_me_core::db::queries;
 use remind_me_core::db::Store;
 use remind_me_core::sync::{upsert_record, SyncRecord, HUB_URL_ENV, NODE_ID_ENV, SYNC_SECRET_ENV};
+use remind_me_core::testing;
 use remind_me_core::{Database, MemoryAddInput, MemorySearchInput};
 
 fn enable_sync() {
@@ -77,24 +79,21 @@ fn the_outbox_payload_carries_the_flag() {
     enable_sync();
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
-    store
-        .sqlite()
-        .unwrap()
-        .execute("DELETE FROM sync_outbox", [])
-        .unwrap();
+    Outbox::new(&store).clear().unwrap();
 
     let id = add(&store, "quokka sighting", true);
 
-    let payload_flag: i64 = store
-        .sqlite()
+    let row = testing::outbox_rows(&store)
         .unwrap()
-        .query_row(
-            "SELECT json_extract(payload, '$.sensitive') FROM sync_outbox
-              WHERE memory_id = ?",
-            [&id],
-            |r| r.get(0),
-        )
+        .into_iter()
+        .find(|row| row.memory_id == id)
         .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&row.payload).unwrap();
+    // As `json_extract` reads it: a JSON `true` is 1.
+    let payload_flag = match &payload["sensitive"] {
+        serde_json::Value::Bool(flag) => i64::from(*flag),
+        other => other.as_i64().unwrap(),
+    };
     assert_eq!(
         payload_flag, 1,
         "a peer rebuilds the memory from this payload alone"
@@ -138,14 +137,8 @@ fn an_incoming_sensitive_record_stays_hidden_on_this_node() {
 
     upsert_record(&store, &record).unwrap();
 
-    let stored: i64 = store
-        .sqlite()
+    let stored = testing::memory_i64(&store, "mem_remote", "sensitive")
         .unwrap()
-        .query_row(
-            "SELECT sensitive FROM memories WHERE id = 'mem_remote'",
-            [],
-            |r| r.get(0),
-        )
         .unwrap();
     assert_eq!(stored, 1, "the flag must survive the crossing");
     assert!(

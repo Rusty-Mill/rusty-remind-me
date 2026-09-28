@@ -2,6 +2,18 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-28 — Tests reach stored rows through the repositories (ADR-0023, core PR 5a)
+
+### Added
+- `remind_me_core::testing`, a hidden public module for tests. Its raw reads and writes of memory columns, row counts, outbox entries and send markers work on SQLite and on the engine's memories core alike.
+- `Database::open_sqlite_in_memory`, for tests of what only SQLite has.
+
+### Fixed
+- An in-memory database on the engine now sets the `sync_enabled` gate in the engine's own sync flags. Before this, with sync configured, writes on the engine were never queued.
+
+### Tests
+- About 330 tests in 52 suites no longer seed or read memories with SQL, so they are ready for the core to be switched on. No test or assertion was removed.
+
 ## 2026-09-27 — Import pages as one journal batch on the engine core (ADR-0023, core PR 4b)
 
 ### Added

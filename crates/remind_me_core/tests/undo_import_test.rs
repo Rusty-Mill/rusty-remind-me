@@ -9,45 +9,55 @@
 //! against, since a hard delete genuinely removes the row a soft delete would
 //! leave behind for the tracking query to trip over.
 
+use remind_me_core::db::derived::Origin;
+use remind_me_core::db::entities::Entities;
+use remind_me_core::db::feedback::{Feedback, FeedbackEvent};
+use remind_me_core::db::imports::ImportLedger;
+use remind_me_core::db::memories::{Memories, NewMemory};
 use remind_me_core::db::Store;
+use remind_me_core::entity::Entity;
+use remind_me_core::testing::{self, Table};
 use remind_me_core::undo_import::undo_import;
 use remind_me_core::{Database, UndoImportInput, UndoImportKind, UndoImportResult};
 
+const PLANTED_AT: &str = "2026-01-01T00:00:00+00:00";
+
 fn plant_memory(store: &Store<'_>, id: &str, source: &str, doc_id: Option<&str>, metadata: &str) {
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "INSERT INTO memories (id, content, category, tags, source, metadata,
-                               created_at, updated_at, doc_id, chunk_index)
-         VALUES (?, ?, 'general', '[]', ?, ?, '2026-01-01T00:00:00+00:00',
-                 '2026-01-01T00:00:00+00:00', ?, 0)",
-            rusqlite::params![id, format!("content {}", id), source, metadata, doc_id],
-        )
+    Memories::new(store)
+        .insert(&NewMemory {
+            source: source.to_string(),
+            metadata: serde_json::from_str(metadata).unwrap(),
+            doc_id: doc_id.map(str::to_string),
+            chunk_index: Some(0),
+            ..NewMemory::new(id, format!("content {}", id), PLANTED_AT)
+        })
         .unwrap();
-    // Planted with raw SQL, so it needs indexing to be searchable, and to be
-    // deletable without the full-text index losing track of it.
+    // Planted beside the importers, so index it the way a rebuild would, to
+    // be searchable and deletable without the full-text index losing track.
     remind_me_core::db::derived::rebuild_indexes(store).unwrap();
 }
 
-fn live_ids(store: &Store<'_>) -> Vec<String> {
-    let mut stmt = store
-        .sqlite()
-        .unwrap()
-        .prepare("SELECT id FROM memories WHERE deleted_at IS NULL ORDER BY id")
+/// Record chat import `import_id` in the ledger, as `import_chat` does.
+fn plant_chat_import(store: &Store<'_>, import_id: &str) {
+    ImportLedger::new(store)
+        .record_chat(import_id, "chat.json", "h", PLANTED_AT, "{}")
         .unwrap();
-    stmt.query_map([], |r| r.get(0))
+}
+
+fn live_ids(store: &Store<'_>) -> Vec<String> {
+    testing::memory_ids(store)
         .unwrap()
-        .map(|r| r.unwrap())
+        .into_iter()
+        .filter(|id| {
+            testing::memory_text(store, id, "deleted_at")
+                .unwrap()
+                .is_none()
+        })
         .collect()
 }
 
-fn count(store: &Store<'_>, table: &str) -> i64 {
-    store
-        .sqlite()
-        .unwrap()
-        .query_row(&format!("SELECT count(*) FROM {}", table), [], |r| r.get(0))
-        .unwrap()
+fn count(store: &Store<'_>, table: Table) -> i64 {
+    testing::count(store, table).unwrap()
 }
 
 fn run(store: &Store<'_>, kind: UndoImportKind, id: Option<&str>, dry: bool) -> UndoImportResult {
@@ -73,15 +83,7 @@ fn a_dry_run_reports_without_removing_anything() {
     let store = db.store();
     plant_memory(&store, "mem_a", "chat_import", Some("imp_1"), "{}");
     plant_memory(&store, "mem_b", "chat_import", Some("imp_1"), "{}");
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "INSERT INTO chat_imports (import_id, filename, hash, imported_at)
-         VALUES ('imp_1', 'chat.json', 'h', '2026-01-01T00:00:00+00:00')",
-            [],
-        )
-        .unwrap();
+    plant_chat_import(&store, "imp_1");
 
     let result = run(&store, UndoImportKind::Chat, Some("imp_1"), true);
 
@@ -91,7 +93,7 @@ fn a_dry_run_reports_without_removing_anything() {
     assert_eq!(result.remaining, 2);
     assert!(result.hint.is_some(), "a dry run must say how to commit it");
     assert_eq!(live_ids(&store).len(), 2, "a dry run must change nothing");
-    assert_eq!(count(&store, "chat_imports"), 1);
+    assert_eq!(count(&store, Table::ChatImports), 1);
 }
 
 #[test]
@@ -118,15 +120,7 @@ fn a_chat_import_round_trips() {
     plant_memory(&store, "mem_a", "chat_import", Some("imp_1"), "{}");
     plant_memory(&store, "mem_b", "chat_import", Some("imp_1"), "{}");
     plant_memory(&store, "mem_other", "manual", None, "{}");
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "INSERT INTO chat_imports (import_id, filename, hash, imported_at)
-         VALUES ('imp_1', 'chat.json', 'h', '2026-01-01T00:00:00+00:00')",
-            [],
-        )
-        .unwrap();
+    plant_chat_import(&store, "imp_1");
 
     let result = run(&store, UndoImportKind::Chat, Some("imp_1"), false);
 
@@ -140,7 +134,7 @@ fn a_chat_import_round_trips() {
     );
     // The tracking row has to go, or the same file can never be imported again:
     // every import path treats a tracked id as already done.
-    assert_eq!(count(&store, "chat_imports"), 0);
+    assert_eq!(count(&store, Table::ChatImports), 0);
 }
 
 #[test]
@@ -153,12 +147,9 @@ fn a_dbs_import_round_trips_and_scopes_by_source_prefix() {
         ("mem_z", "linear"),
     ] {
         plant_memory(&store, id, "dbs_import", None, "{}");
-        store.sqlite().unwrap().execute(
-            "INSERT INTO dbs_imports (dbs_source, external_id, memory_id, content_hash, imported_at)
-             VALUES (?, ?, ?, 'h', '2026-01-01T00:00:00+00:00')",
-            rusqlite::params![source, id, id],
-        )
-        .unwrap();
+        ImportLedger::new(&store)
+            .record_dbs(source, id, id, "h", PLANTED_AT)
+            .unwrap();
     }
 
     let result = run(&store, UndoImportKind::Dbs, Some("notion"), false);
@@ -166,7 +157,7 @@ fn a_dbs_import_round_trips_and_scopes_by_source_prefix() {
     assert_eq!(result.removed, 2);
     assert_eq!(result.tracking_rows_removed, 2);
     assert_eq!(live_ids(&store), vec!["mem_z"]);
-    assert_eq!(count(&store, "dbs_imports"), 1);
+    assert_eq!(count(&store, Table::DbsImports), 1);
 }
 
 #[test]
@@ -181,14 +172,8 @@ fn a_mempalace_undo_covers_untracked_content_too() {
         None,
         r#"{"mempalace_drawer_id": "wing_a/drawer_1"}"#,
     );
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "INSERT INTO mempalace_imports (drawer_id, memory_id, imported_at)
-         VALUES ('wing_a/drawer_1', 'mem_tracked', '2026-01-01T00:00:00+00:00')",
-            [],
-        )
+    ImportLedger::new(&store)
+        .record_mempalace("wing_a/drawer_1", "mem_tracked", PLANTED_AT)
         .unwrap();
     // Mempalace content that never got a tracking row — a bulk load predating
     // the ledger. Unambiguously mempalace by source and metadata.
@@ -216,12 +201,9 @@ fn an_unscoped_undo_takes_every_record_of_that_kind() {
     let store = db.store();
     for (id, source) in [("mem_x", "notion"), ("mem_y", "linear")] {
         plant_memory(&store, id, "dbs_import", None, "{}");
-        store.sqlite().unwrap().execute(
-            "INSERT INTO dbs_imports (dbs_source, external_id, memory_id, content_hash, imported_at)
-             VALUES (?, ?, ?, 'h', '2026-01-01T00:00:00+00:00')",
-            rusqlite::params![source, id, id],
-        )
-        .unwrap();
+        ImportLedger::new(&store)
+            .record_dbs(source, id, id, "h", PLANTED_AT)
+            .unwrap();
     }
     plant_memory(&store, "mem_manual", "manual", None, "{}");
 
@@ -243,15 +225,7 @@ fn a_partially_drained_chat_import_keeps_its_tracking_row() {
     for id in ["mem_a", "mem_b", "mem_c"] {
         plant_memory(&store, id, "chat_import", Some("imp_1"), "{}");
     }
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "INSERT INTO chat_imports (import_id, filename, hash, imported_at)
-         VALUES ('imp_1', 'chat.json', 'h', '2026-01-01T00:00:00+00:00')",
-            [],
-        )
-        .unwrap();
+    plant_chat_import(&store, "imp_1");
 
     let first = undo_import(
         &store,
@@ -273,14 +247,14 @@ fn a_partially_drained_chat_import_keeps_its_tracking_row() {
         first.tracking_rows_removed, 0,
         "a partially-drained import keeps its tracking row"
     );
-    assert_eq!(count(&store, "chat_imports"), 1);
+    assert_eq!(count(&store, Table::ChatImports), 1);
 
     let second = run(&store, UndoImportKind::Chat, Some("imp_1"), false);
 
     assert_eq!(second.removed, 1);
     assert_eq!(second.remaining, 0);
     assert_eq!(second.tracking_rows_removed, 1);
-    assert_eq!(count(&store, "chat_imports"), 0);
+    assert_eq!(count(&store, Table::ChatImports), 0);
 }
 
 #[test]
@@ -293,15 +267,7 @@ fn an_edited_imported_memory_is_still_removed() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
     plant_memory(&store, "mem_edited", "chat_import", Some("imp_1"), "{}");
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "INSERT INTO chat_imports (import_id, filename, hash, imported_at)
-         VALUES ('imp_1', 'chat.json', 'h', '2026-01-01T00:00:00+00:00')",
-            [],
-        )
-        .unwrap();
+    plant_chat_import(&store, "imp_1");
     remind_me_core::db::queries::update_memory(
         &store,
         &remind_me_core::MemoryUpdateInput {
@@ -345,15 +311,7 @@ fn undoing_twice_is_harmless() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
     plant_memory(&store, "mem_a", "chat_import", Some("imp_1"), "{}");
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "INSERT INTO chat_imports (import_id, filename, hash, imported_at)
-         VALUES ('imp_1', 'chat.json', 'h', '2026-01-01T00:00:00+00:00')",
-            [],
-        )
-        .unwrap();
+    plant_chat_import(&store, "imp_1");
 
     assert_eq!(
         run(&store, UndoImportKind::Chat, Some("imp_1"), false).removed,
@@ -372,34 +330,34 @@ fn related_rows_go_with_the_memory() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
     plant_memory(&store, "mem_a", "chat_import", Some("imp_1"), "{}");
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "INSERT INTO entities (id, name, kind, aliases, created_at, updated_at)
-         VALUES ('ent_1', 'thing', 'concept', '[]', '2026-01-01T00:00:00+00:00',
-                 '2026-01-01T00:00:00+00:00')",
-            [],
+    let entities = Entities::new(&store);
+    entities
+        .insert(
+            &Entity {
+                id: "ent_1".into(),
+                name: "thing".into(),
+                kind: Some("concept".into()),
+                aliases: Vec::new(),
+                created_at: PLANTED_AT.into(),
+                updated_at: PLANTED_AT.into(),
+            },
+            None,
         )
         .unwrap();
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "INSERT INTO memory_entities (memory_id, entity_id, created_at)
-         VALUES ('mem_a', 'ent_1', '2026-01-01T00:00:00+00:00')",
-            [],
-        )
+    entities
+        .link("mem_a", "ent_1", PLANTED_AT, Origin::Local)
         .unwrap();
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "INSERT INTO memory_feedback
-             (id, memory_id, query, query_tokens, signal, magnitude, created_at)
-         VALUES ('fb_1', 'mem_a', 'q', '[\"q\"]', 'helpful', 0.1,
-                 '2026-01-01T00:00:00+00:00')",
-            [],
+    Feedback::new(&store)
+        .log_event(
+            "fb_1",
+            "mem_a",
+            "q",
+            &FeedbackEvent {
+                query_tokens: "[\"q\"]".into(),
+                signal: "helpful".into(),
+                magnitude: 0.1,
+            },
+            PLANTED_AT,
         )
         .unwrap();
 
@@ -408,8 +366,8 @@ fn related_rows_go_with_the_memory() {
     // Routing through delete_memory rather than a bulk DELETE is what buys
     // this. Orphaned vec_chunks in particular are actively dangerous: SQLite
     // reuses freed rowids, so a later memory could inherit these vectors.
-    assert_eq!(count(&store, "memory_entities"), 0);
-    assert_eq!(count(&store, "memory_feedback"), 0);
+    assert_eq!(count(&store, Table::MemoryEntities), 0);
+    assert_eq!(count(&store, Table::MemoryFeedback), 0);
     // The entity itself survives — other memories may still mention it.
-    assert_eq!(count(&store, "entities"), 1);
+    assert_eq!(count(&store, Table::Entities), 1);
 }

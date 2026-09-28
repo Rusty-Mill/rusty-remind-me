@@ -142,13 +142,7 @@ fn memory_type_round_trips_through_the_json() {
         },
     )
     .unwrap();
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET memory_type = 'reference' WHERE id = ?",
-            [&memory.id],
-        )
+    remind_me_core::testing::set_memory_column(&store, &memory.id, "memory_type", "reference")
         .unwrap();
 
     let reread = queries::get_memory_by_id(&store, &memory.id)

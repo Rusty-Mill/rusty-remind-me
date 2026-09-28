@@ -10,8 +10,8 @@ use remind_me_core::maintenance::{
     capture_health, due, pending_counts, render_notice, reset_throttle, NUDGE_MAX_QUEUES,
     NUDGE_THRESHOLD,
 };
+use remind_me_core::testing;
 use remind_me_core::{Database, MemoryAddInput};
-use rusqlite::params;
 use std::collections::HashMap;
 
 /// Serialises the throttle tests: the timer map is process-wide, so two of
@@ -74,14 +74,7 @@ fn a_deleted_memory_is_in_no_queue() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
     let id = add(&store, "about to be deleted");
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET deleted_at = ? WHERE id = ?",
-            params![chrono::Utc::now().to_rfc3339(), &id],
-        )
-        .unwrap();
+    testing::set_memory_column(&store, &id, "deleted_at", chrono::Utc::now().to_rfc3339()).unwrap();
 
     // Nudging someone to classify a memory they deleted is work that cannot
     // be done and would never clear.
@@ -92,7 +85,8 @@ fn a_deleted_memory_is_in_no_queue() {
 
 #[test]
 fn a_broken_queue_reports_zero_rather_than_breaking_the_caller() {
-    let db = Database::open_in_memory().unwrap();
+    // SQLite-only: a partially-migrated SQLite file is what this simulates.
+    let db = Database::open_sqlite_in_memory().unwrap();
     let store = db.store();
     // Simulates a partially-migrated database: the table a queue needs is
     // gone. A status helper must not be the thing that breaks a search.
@@ -135,14 +129,7 @@ fn one_capture_counts_once_even_though_it_writes_two_rows() {
     let store = db.store();
     for content in ["the dialog", "the summary"] {
         let id = add(&store, content);
-        store
-            .sqlite()
-            .unwrap()
-            .execute(
-                "UPDATE memories SET capture_id = 'cap_1' WHERE id = ?",
-                params![&id],
-            )
-            .unwrap();
+        testing::set_memory_column(&store, &id, "capture_id", "cap_1").unwrap();
     }
 
     let health = capture_health(&store);

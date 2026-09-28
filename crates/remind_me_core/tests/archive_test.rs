@@ -15,6 +15,7 @@ use remind_me_core::archive::{
 use remind_me_core::db::archives::Archives;
 use remind_me_core::db::Store;
 use remind_me_core::importer::import_chat;
+use remind_me_core::testing;
 use remind_me_core::undo_import::undo_import;
 use remind_me_core::{
     ChatImportInput, Database, ImportKind, ImportOutcome, UndoImportInput, UndoImportKind,
@@ -72,14 +73,11 @@ fn import(store: &Store<'_>, path: &std::path::Path) -> ImportOutcome {
     .unwrap()
 }
 
+/// Every memory id, in chunk order.
 fn memory_ids(store: &Store<'_>) -> Vec<String> {
-    let mut stmt = store
-        .sqlite()
-        .unwrap()
-        .prepare("SELECT id FROM memories ORDER BY chunk_index")
-        .unwrap();
-    let rows = stmt.query_map([], |r| r.get(0)).unwrap();
-    rows.collect::<Result<_, _>>().unwrap()
+    let mut ids = testing::memory_ids(store).unwrap();
+    ids.sort_by_key(|id| testing::memory_i64(store, id, "chunk_index").unwrap());
+    ids
 }
 
 /// In memory, so `REMIND_ME_STORE=engine` runs these against the engine:
@@ -143,14 +141,8 @@ fn a_memory_can_recover_the_blocks_the_importer_dropped() {
     assert_eq!(ids.len(), 1, "one text block, so one memory");
 
     // What the memory itself holds: the flattened text, nothing else.
-    let stored: String = store
-        .sqlite()
+    let stored: String = testing::memory_text(&store, &ids[0], "content")
         .unwrap()
-        .query_row(
-            "SELECT content FROM memories WHERE id = ?",
-            [&ids[0]],
-            |r| r.get(0),
-        )
         .unwrap();
     assert_eq!(stored, "the table is called memories");
     assert!(!stored.contains("let me check"));

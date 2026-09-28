@@ -208,25 +208,18 @@ mod tests {
     use super::*;
     use crate::db::Database;
 
-    fn queue(conn: &Connection, key: &str, created_at: &str) -> i64 {
-        conn.execute(
-            "INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
-             VALUES (?, 'insert', '{}', ?)",
-            params![key, created_at],
-        )
-        .unwrap();
-        conn.last_insert_rowid()
+    fn queue(store: &Store<'_>, key: &str, created_at: &str) -> i64 {
+        crate::testing::queue_outbox(store, key, "insert", "{}", created_at).unwrap()
     }
 
     #[test]
     fn pending_counts_rows_with_no_send_to_the_remote() {
         let db = Database::open_in_memory().unwrap();
         let store = db.store();
-        let conn = store.conn();
         let outbox = Outbox::new(&store);
         assert!(outbox.is_empty().unwrap());
-        let first = queue(conn, "a", "2026-09-01");
-        queue(conn, "b", "2026-09-02");
+        let first = queue(&store, "a", "2026-09-01");
+        queue(&store, "b", "2026-09-02");
         crate::db::sync_state::SyncState::new(&store)
             .record_sends("hub", &[first], "2026-09-03")
             .unwrap();
@@ -316,19 +309,16 @@ mod tests {
     fn prune_drops_old_and_sent_rows_and_their_markers() {
         let db = Database::open_in_memory().unwrap();
         let store = db.store();
-        let conn = store.conn();
         let outbox = Outbox::new(&store);
-        let old = queue(conn, "old", "2026-01-01");
-        queue(conn, "new", "2026-09-26");
+        let old = queue(&store, "old", "2026-01-01");
+        queue(&store, "new", "2026-09-26");
         crate::db::sync_state::SyncState::new(&store)
             .record_sends("hub", &[old], "2026-09-26")
             .unwrap();
 
         assert_eq!(outbox.prune("2026-06-01").unwrap(), 1);
         assert_eq!(outbox.len().unwrap(), 1);
-        let markers: i64 = conn
-            .query_row("SELECT COUNT(*) FROM sync_sends", [], |r| r.get(0))
-            .unwrap();
+        let markers = crate::testing::count(&store, crate::testing::Table::SyncSends).unwrap();
         assert_eq!(markers, 0);
     }
 }

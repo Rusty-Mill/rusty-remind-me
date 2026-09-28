@@ -12,11 +12,13 @@
 #[path = "../src/test_env.rs"]
 mod test_env;
 
+use remind_me_core::db::outbox::Outbox;
 use remind_me_core::db::queries;
 use remind_me_core::db::Store;
 use remind_me_core::models::ReminderWindow;
 use remind_me_core::reminders::{list_reminders, set_reminder};
 use remind_me_core::sync::{upsert_record, SyncRecord, HUB_URL_ENV, NODE_ID_ENV, SYNC_SECRET_ENV};
+use remind_me_core::testing;
 use remind_me_core::{Database, MemoryAddInput};
 
 fn enable_sync() {
@@ -55,25 +57,20 @@ fn the_outbox_payload_carries_the_reminder() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
     let id = add(&store, "renew the registration");
-    store
-        .sqlite()
-        .unwrap()
-        .execute("DELETE FROM sync_outbox", [])
-        .unwrap();
+    Outbox::new(&store).clear().unwrap();
 
     let when = future(30);
     set_reminder(&store, &id, Some(&when)).unwrap();
 
-    let payload: Option<String> = store
-        .sqlite()
+    let payload: Option<String> = testing::outbox_rows(&store)
         .unwrap()
-        .query_row(
-            "SELECT json_extract(payload, '$.remind_at') FROM sync_outbox
-              WHERE memory_id = ? ORDER BY id DESC LIMIT 1",
-            [&id],
-            |r| r.get(0),
-        )
-        .unwrap();
+        .into_iter()
+        .filter(|row| row.memory_id == id)
+        .next_back()
+        .and_then(|row| {
+            let payload: serde_json::Value = serde_json::from_str(&row.payload).unwrap();
+            payload["remind_at"].as_str().map(str::to_string)
+        });
 
     // Setting a reminder has to produce an outbox row at all: the trigger only
     // fires when `updated_at` actually moves, which is why `set_reminder`

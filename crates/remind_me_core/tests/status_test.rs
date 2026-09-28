@@ -9,6 +9,7 @@ use remind_me_core::db::schema::SCHEMA_VERSION;
 use remind_me_core::db::Store;
 use remind_me_core::embedder::EMBEDDING_BACKEND_ENV;
 use remind_me_core::status::{server_status, SubsystemStatus};
+use remind_me_core::testing;
 use remind_me_core::{Database, MemoryAddInput};
 use std::sync::Mutex;
 
@@ -98,11 +99,14 @@ fn deleted_memories_are_not_counted() {
     let store = db.store();
     add(&store, "kept");
     add(&store, "going");
-    let doomed: String = store
-        .sqlite()
+    let doomed = testing::memory_ids(&store)
         .unwrap()
-        .query_row("SELECT id FROM memories WHERE content = 'going'", [], |r| {
-            r.get(0)
+        .into_iter()
+        .find(|id| {
+            testing::memory_text(&store, id, "content")
+                .unwrap()
+                .as_deref()
+                == Some("going")
         })
         .unwrap();
     queries::delete_memory(&store, &doomed).unwrap();

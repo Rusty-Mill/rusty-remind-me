@@ -82,12 +82,8 @@ fn list(store: &Store<'_>, include_sensitive: bool) -> (usize, Vec<String>) {
 }
 
 fn stored_flag(store: &Store<'_>, id: &str) -> i64 {
-    store
-        .sqlite()
+    remind_me_core::testing::memory_i64(store, id, "sensitive")
         .unwrap()
-        .query_row("SELECT sensitive FROM memories WHERE id = ?", [id], |r| {
-            r.get(0)
-        })
         .unwrap()
 }
 

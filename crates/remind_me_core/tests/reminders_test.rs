@@ -6,11 +6,12 @@
 //! and every one of those mistakes is silent, because a listing that quietly
 //! omits a due reminder looks exactly like a vault with nothing due.
 
+use remind_me_core::db::reminders::Reminders;
 use remind_me_core::db::Store;
 use remind_me_core::models::{ReminderWindow, SetReminderOutcome};
 use remind_me_core::reminders::{list_reminders, parse_remind_at, set_reminder};
+use remind_me_core::testing;
 use remind_me_core::{Database, MemoryAddInput};
-use rusqlite::params;
 
 fn add(store: &Store<'_>, content: &str) -> String {
     remind_me_core::db::queries::add_memory(
@@ -40,14 +41,7 @@ fn future(hours: i64) -> String {
 /// window can be tested at all — `set_reminder` exists precisely to make this
 /// state unreachable through the tool.
 fn force_remind_at(store: &Store<'_>, memory_id: &str, when: &str) {
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET remind_at = ? WHERE id = ?",
-            params![when, memory_id],
-        )
-        .unwrap();
+    testing::set_memory_column(store, memory_id, "remind_at", when).unwrap();
 }
 
 fn past(hours: i64) -> String {
@@ -64,28 +58,17 @@ fn setting_a_future_reminder_stores_it_and_bumps_updated_at() {
     let store = db.store();
     let id = add(&store, "renew the passport");
 
-    let before: String = store
-        .sqlite()
+    let before = testing::memory_text(&store, &id, "updated_at")
         .unwrap()
-        .query_row(
-            "SELECT updated_at FROM memories WHERE id = ?",
-            params![&id],
-            |r| r.get(0),
-        )
         .unwrap();
 
     let outcome = set_reminder(&store, &id, Some(&future(24))).unwrap();
 
     assert!(matches!(outcome, SetReminderOutcome::Set { .. }));
 
-    let (stored, after): (Option<String>, String) = store
-        .sqlite()
+    let stored = testing::memory_text(&store, &id, "remind_at").unwrap();
+    let after = testing::memory_text(&store, &id, "updated_at")
         .unwrap()
-        .query_row(
-            "SELECT remind_at, updated_at FROM memories WHERE id = ?",
-            params![&id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
         .unwrap();
     assert!(stored.is_some());
     // The bump is not cosmetic: it is what puts the change in the sync outbox
@@ -106,14 +89,8 @@ fn a_reminder_is_stored_canonicalized_to_utc() {
         .to_rfc3339();
     set_reminder(&store, &id, Some(&when)).unwrap();
 
-    let stored: String = store
-        .sqlite()
+    let stored = testing::memory_text(&store, &id, "remind_at")
         .unwrap()
-        .query_row(
-            "SELECT remind_at FROM memories WHERE id = ?",
-            params![&id],
-            |r| r.get(0),
-        )
         .unwrap();
 
     // Stored as UTC, because `remind_at` is compared as a *string* against a
@@ -145,15 +122,7 @@ fn clearing_removes_the_reminder() {
     let outcome = set_reminder(&store, &id, None).unwrap();
 
     assert!(matches!(outcome, SetReminderOutcome::Cleared { .. }));
-    let stored: Option<String> = store
-        .sqlite()
-        .unwrap()
-        .query_row(
-            "SELECT remind_at FROM memories WHERE id = ?",
-            params![&id],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let stored = testing::memory_text(&store, &id, "remind_at").unwrap();
     assert!(stored.is_none());
     assert!(list_reminders(&store, ReminderWindow::All, 20)
         .unwrap()
@@ -191,15 +160,7 @@ fn a_past_timestamp_is_rejected_rather_than_stored() {
         }
         other => panic!("expected rejection, got {other:?}"),
     }
-    let stored: Option<String> = store
-        .sqlite()
-        .unwrap()
-        .query_row(
-            "SELECT remind_at FROM memories WHERE id = ?",
-            params![&id],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let stored = testing::memory_text(&store, &id, "remind_at").unwrap();
     assert!(stored.is_none(), "a rejected reminder must not be written");
 }
 
@@ -281,14 +242,8 @@ fn a_delivered_reminder_drops_out_of_every_window() {
     let id = add(&store, "already told you");
     let when = past(2);
     force_remind_at(&store, &id, &when);
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "INSERT INTO reminder_deliveries (memory_id, remind_at, delivered_at)
-         VALUES (?, ?, ?)",
-            params![&id, &when, chrono::Utc::now().to_rfc3339()],
-        )
+    Reminders::new(&store)
+        .record_delivery(&id, &when, &chrono::Utc::now().to_rfc3339())
         .unwrap();
 
     // Overdue means "came due and nothing told you" — not "came due". Without
@@ -308,14 +263,8 @@ fn rescheduling_a_delivered_reminder_makes_it_pending_again() {
     let id = add(&store, "recurring chore");
     let fired = past(2);
     force_remind_at(&store, &id, &fired);
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "INSERT INTO reminder_deliveries (memory_id, remind_at, delivered_at)
-         VALUES (?, ?, ?)",
-            params![&id, &fired, chrono::Utc::now().to_rfc3339()],
-        )
+    Reminders::new(&store)
+        .record_delivery(&id, &fired, &chrono::Utc::now().to_rfc3339())
         .unwrap();
 
     set_reminder(&store, &id, Some(&future(6))).unwrap();
@@ -333,14 +282,7 @@ fn a_deleted_memorys_reminder_is_in_no_window() {
     let store = db.store();
     let id = add(&store, "deleted but scheduled");
     set_reminder(&store, &id, Some(&future(4))).unwrap();
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET deleted_at = ? WHERE id = ?",
-            params![chrono::Utc::now().to_rfc3339(), &id],
-        )
-        .unwrap();
+    testing::set_memory_column(&store, &id, "deleted_at", chrono::Utc::now().to_rfc3339()).unwrap();
 
     // Firing this would surface content the user deleted.
     assert!(list_reminders(&store, ReminderWindow::All, 20)

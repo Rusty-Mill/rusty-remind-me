@@ -8,10 +8,13 @@
 //! Rows are inserted directly rather than through `add_memory`, because the
 //! conditions are all about *age* and a memory added now is 0 days old.
 
+use remind_me_core::db::feedback::{Feedback, FeedbackEvent};
+use remind_me_core::db::memories::{Memories, NewMemory};
 use remind_me_core::db::Store;
 use remind_me_core::recalibrate::{
     candidates, RECALIBRATION_MIN_BASE_WEIGHT, RECALIBRATION_STALE_DAYS,
 };
+use remind_me_core::testing;
 use remind_me_core::{Database, RecalibrateCandidatesInput, RecalibrateCandidatesResult};
 
 /// A timestamp `days` in the past, in the schema's canonical format.
@@ -39,24 +42,14 @@ fn plant(
     base_weight: f64,
     accessed_at: Option<&str>,
 ) {
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "INSERT INTO memories (id, content, category, tags, source, metadata,
-                               created_at, updated_at, memory_type, base_weight,
-                               accessed_at, access_count)
-         VALUES (?, ?, 'general', '[]', 'manual', '{}', ?, ?, ?, ?, ?, 0)",
-            rusqlite::params![
-                id,
-                format!("content of {}", id),
-                days_ago(400),
-                days_ago(400),
-                memory_type,
-                base_weight,
-                accessed_at,
-            ],
-        )
+    let created = days_ago(400);
+    Memories::new(store)
+        .insert(&NewMemory {
+            memory_type: memory_type.to_string(),
+            base_weight,
+            accessed_at: accessed_at.map(str::to_string),
+            ..NewMemory::new(id, format!("content of {}", id), &created)
+        })
         .unwrap();
 }
 
@@ -135,14 +128,17 @@ fn a_memory_that_received_feedback_is_not_a_candidate() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
     plant(&store, "mem_reviewed", "fact", 1.3, Some(&days_ago(300)));
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "INSERT INTO memory_feedback
-             (id, memory_id, query, query_tokens, signal, magnitude, created_at)
-         VALUES ('fb_1', 'mem_reviewed', 'anything', '[\"anything\"]', 'helpful', 0.1, ?)",
-            rusqlite::params![days_ago(250)],
+    Feedback::new(&store)
+        .log_event(
+            "fb_1",
+            "mem_reviewed",
+            "anything",
+            &FeedbackEvent {
+                query_tokens: "anything".into(),
+                signal: "helpful".into(),
+                magnitude: 0.1,
+            },
+            &days_ago(250),
         )
         .unwrap();
 
@@ -176,22 +172,8 @@ fn a_deleted_or_superseded_memory_is_not_a_candidate() {
     plant(&store, "mem_gone", "fact", 1.3, Some(&days_ago(300)));
     plant(&store, "mem_replaced", "fact", 1.3, Some(&days_ago(300)));
     plant(&store, "mem_live", "fact", 1.3, Some(&days_ago(300)));
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET deleted_at = ? WHERE id = 'mem_gone'",
-            rusqlite::params![days_ago(10)],
-        )
-        .unwrap();
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET superseded_by = 'mem_live' WHERE id = 'mem_replaced'",
-            [],
-        )
-        .unwrap();
+    testing::set_memory_column(&store, "mem_gone", "deleted_at", days_ago(10)).unwrap();
+    testing::set_memory_column(&store, "mem_replaced", "superseded_by", "mem_live").unwrap();
 
     let result = run(&store, 20);
 

@@ -20,8 +20,8 @@ use remind_me_core::sync::{
     self, pull_remote, push_outbox, upsert_record, ApplyOutcome, SyncRecord, CLIENT_ENV,
     HUB_URL_ENV, NODE_ID_ENV, SYNC_SECRET_ENV,
 };
+use remind_me_core::testing;
 use remind_me_core::{Database, MemoryAddInput};
-use rusqlite::params;
 use serde_json::json;
 use std::net::TcpListener;
 use std::sync::Mutex;
@@ -50,24 +50,27 @@ fn add(store: &Store<'_>, content: &str) -> String {
 }
 
 fn memory_row(store: &Store<'_>, id: &str) -> (String, Vec<String>, serde_json::Value, String) {
-    store
-        .sqlite()
+    let text = |column| testing::memory_text(store, id, column).unwrap().unwrap();
+    (
+        text("content"),
+        serde_json::from_str(&text("tags")).unwrap(),
+        serde_json::from_str(&text("metadata")).unwrap(),
+        text("updated_at"),
+    )
+}
+
+/// The ids of every memory, deleted or not, whose content is `content`.
+fn with_content(store: &Store<'_>, content: &str) -> Vec<String> {
+    testing::memory_ids(store)
         .unwrap()
-        .query_row(
-            "SELECT content, tags, metadata, updated_at FROM memories WHERE id = ?",
-            [id],
-            |row| {
-                let tags: String = row.get(1)?;
-                let metadata: String = row.get(2)?;
-                Ok((
-                    row.get::<_, String>(0)?,
-                    serde_json::from_str(&tags).unwrap(),
-                    serde_json::from_str(&metadata).unwrap(),
-                    row.get::<_, String>(3)?,
-                ))
-            },
-        )
-        .unwrap()
+        .into_iter()
+        .filter(|id| {
+            testing::memory_text(store, id, "content")
+                .unwrap()
+                .as_deref()
+                == Some(content)
+        })
+        .collect()
 }
 
 fn record(id: &str, content: &str, updated_at: &str) -> SyncRecord {
@@ -137,14 +140,7 @@ fn an_older_incoming_record_loses_but_its_tag_still_merges_in() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
     let id = add(&store, "local content");
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET updated_at = '2030-01-01T00:00:00+00:00' WHERE id = ?",
-            [&id],
-        )
-        .unwrap();
+    testing::set_memory_column(&store, &id, "updated_at", "2030-01-01T00:00:00+00:00").unwrap();
     let (_, _, _, updated_before) = memory_row(&store, &id);
 
     let mut incoming = record(&id, "older remote content", "2020-01-01T00:00:00+00:00");
@@ -192,9 +188,11 @@ fn metadata_shallow_merge_the_winner_takes_a_conflicting_key() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
     let id = add(&store, "local content");
-    store.sqlite().unwrap().execute(
-        "UPDATE memories SET metadata = '{\"shared\":\"local-value\",\"local_only\":\"kept\"}' WHERE id = ?",
-        [&id],
+    testing::set_memory_column(
+        &store,
+        &id,
+        "metadata",
+        r#"{"shared":"local-value","local_only":"kept"}"#,
     )
     .unwrap();
 
@@ -214,7 +212,8 @@ fn metadata_merge_when_incoming_loses_keeps_the_local_value_on_the_shared_key() 
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
     let id = add(&store, "local content");
-    store.sqlite().unwrap().execute("UPDATE memories SET updated_at = '2030-01-01T00:00:00+00:00', metadata = '{\"shared\":\"local-value\"}' WHERE id = ?", [&id]).unwrap();
+    testing::set_memory_column(&store, &id, "updated_at", "2030-01-01T00:00:00+00:00").unwrap();
+    testing::set_memory_column(&store, &id, "metadata", r#"{"shared":"local-value"}"#).unwrap();
 
     let mut incoming = record(&id, "older remote content", "2020-01-01T00:00:00+00:00");
     incoming.metadata = json!({"shared": "remote-value", "remote_only": "kept"});
@@ -261,24 +260,16 @@ fn winning_an_existing_row_does_not_touch_created_at() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
     let id = add(&store, "local content");
-    let original_created_at: String = store
-        .sqlite()
+    let original_created_at: String = testing::memory_text(&store, &id, "created_at")
         .unwrap()
-        .query_row("SELECT created_at FROM memories WHERE id = ?", [&id], |r| {
-            r.get(0)
-        })
         .unwrap();
 
     let mut incoming = record(&id, "remote content", "2030-01-01T00:00:00+00:00");
     incoming.created_at = "1999-01-01T00:00:00+00:00".to_string();
     upsert_record(&store, &incoming).unwrap();
 
-    let created_at_after: String = store
-        .sqlite()
+    let created_at_after: String = testing::memory_text(&store, &id, "created_at")
         .unwrap()
-        .query_row("SELECT created_at FROM memories WHERE id = ?", [&id], |r| {
-            r.get(0)
-        })
         .unwrap();
     assert_eq!(
         created_at_after, original_created_at,
@@ -291,20 +282,11 @@ fn winning_an_existing_row_does_not_touch_created_at() {
 // ---------------------------------------------------------------------------
 
 fn outbox_row_count(store: &Store<'_>, memory_id: &str, sent: bool) -> i64 {
-    let clause = if sent {
-        "sent_at != ''"
-    } else {
-        "sent_at = ''"
-    };
-    store
-        .sqlite()
+    testing::outbox_rows(store)
         .unwrap()
-        .query_row(
-            &format!("SELECT count(*) FROM sync_outbox WHERE memory_id = ? AND {clause}"),
-            [memory_id],
-            |r| r.get(0),
-        )
-        .unwrap()
+        .into_iter()
+        .filter(|r| r.memory_id == memory_id && r.sent_at.is_empty() != sent)
+        .count() as i64
 }
 
 #[test]
@@ -370,14 +352,11 @@ fn add_memory_stamps_the_configured_node_id_and_client() {
     let store = db.store();
     let id = add(&store, "stamped content");
 
-    let (node_id, client): (String, String) = store
-        .sqlite()
+    let node_id = testing::memory_text(&store, &id, "node_id")
         .unwrap()
-        .query_row(
-            "SELECT node_id, client FROM memories WHERE id = ?",
-            [&id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
+        .unwrap();
+    let client = testing::memory_text(&store, &id, "client")
+        .unwrap()
         .unwrap();
 
     crate::test_env::remove_var(NODE_ID_ENV);
@@ -396,14 +375,11 @@ fn add_memory_stamps_empty_node_id_and_unknown_client_by_default() {
     let store = db.store();
     let id = add(&store, "unstamped content");
 
-    let (node_id, client): (String, String) = store
-        .sqlite()
+    let node_id = testing::memory_text(&store, &id, "node_id")
         .unwrap()
-        .query_row(
-            "SELECT node_id, client FROM memories WHERE id = ?",
-            [&id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
+        .unwrap();
+    let client = testing::memory_text(&store, &id, "client")
+        .unwrap()
         .unwrap();
     assert_eq!(node_id, "");
     assert_eq!(client, "unknown");
@@ -423,13 +399,7 @@ fn delete_is_a_hard_delete_when_sync_is_not_configured() {
 
     assert!(queries::delete_memory(&store, &id).unwrap());
 
-    let remaining: i64 = store
-        .sqlite()
-        .unwrap()
-        .query_row("SELECT count(*) FROM memories WHERE id = ?", [&id], |r| {
-            r.get(0)
-        })
-        .unwrap();
+    let remaining = i64::from(testing::memory_column(&store, &id, "id").unwrap().is_some());
     assert_eq!(
         remaining, 0,
         "no row at all -- a real DELETE, not a tombstone"
@@ -455,14 +425,9 @@ fn delete_tombstones_instead_of_hard_deleting_when_sync_is_configured() {
     crate::test_env::remove_var(SYNC_SECRET_ENV);
 
     assert!(deleted);
-    let (deleted_at, updated_at): (Option<String>, String) = store
-        .sqlite()
+    let deleted_at = testing::memory_text(&store, &id, "deleted_at").unwrap();
+    let updated_at = testing::memory_text(&store, &id, "updated_at")
         .unwrap()
-        .query_row(
-            "SELECT deleted_at, updated_at FROM memories WHERE id = ?",
-            [&id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
         .unwrap();
     assert!(deleted_at.is_some(), "the row survives, tombstoned");
     assert!(!updated_at.is_empty());
@@ -533,12 +498,8 @@ fn push_outbox_delivers_local_writes_to_a_real_hub() {
 
     assert_eq!(report.pushed, 1);
     let hub_conn = hub.db.store();
-    let hub_content: String = hub_conn
-        .sqlite()
+    let hub_content = testing::memory_text(&hub_conn, &id, "content")
         .unwrap()
-        .query_row("SELECT content FROM memories WHERE id = ?", [&id], |r| {
-            r.get(0)
-        })
         .unwrap();
     assert_eq!(hub_content, "pushed content");
 
@@ -610,14 +571,8 @@ fn a_sensitive_memory_pushes_with_its_flag_intact() {
     let report = push_outbox(&local_conn, &hub.url, SECRET, "local-node", "hub").unwrap();
 
     assert_eq!(report.pushed, 1, "the record must reach the hub at all");
-    let stored: i64 = hub
-        .db
-        .store()
-        .sqlite()
+    let stored = testing::memory_i64(&hub.db.store(), &id, "sensitive")
         .unwrap()
-        .query_row("SELECT sensitive FROM memories WHERE id = ?", [&id], |r| {
-            r.get(0)
-        })
         .unwrap();
     assert_eq!(stored, 1, "and arrive still marked");
 }
@@ -655,14 +610,7 @@ fn pull_remote_applies_the_hubs_changes_and_persists_the_cursor() {
         // outcome. Setting it explicitly here makes both tests say what they
         // mean instead of one of them depending on which tests happen to be
         // running alongside it.
-        hub_conn
-            .sqlite()
-            .unwrap()
-            .execute(
-                "UPDATE memories SET node_id = 'hub-node' WHERE id = ?",
-                [&id],
-            )
-            .unwrap();
+        testing::set_memory_column(&hub_conn, &id, "node_id", "hub-node").unwrap();
     }
     let local_db = Database::open_in_memory().unwrap();
     let local_conn = local_db.store();
@@ -670,15 +618,7 @@ fn pull_remote_applies_the_hubs_changes_and_persists_the_cursor() {
     let report = pull_remote(&local_conn, &hub.url, SECRET, "local-node", "hub").unwrap();
 
     assert_eq!(report.applied, 1);
-    let count: i64 = local_conn
-        .sqlite()
-        .unwrap()
-        .query_row(
-            "SELECT count(*) FROM memories WHERE content = 'hub content'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let count = with_content(&local_conn, "hub content").len();
     assert_eq!(count, 1);
 
     let (last_pull, last_pull_id) = SyncState::new(&local_conn)
@@ -720,14 +660,7 @@ fn a_sensitive_memory_stays_sensitive_when_pulled_directly_from_a_peer() {
         )
         .unwrap()
         .id;
-        hub_conn
-            .sqlite()
-            .unwrap()
-            .execute(
-                "UPDATE memories SET node_id = 'hub-node' WHERE id = ?",
-                [&id],
-            )
-            .unwrap();
+        testing::set_memory_column(&hub_conn, &id, "node_id", "hub-node").unwrap();
     }
     let local_db = Database::open_in_memory().unwrap();
     let local_conn = local_db.store();
@@ -735,13 +668,8 @@ fn a_sensitive_memory_stays_sensitive_when_pulled_directly_from_a_peer() {
     let report = pull_remote(&local_conn, &hub.url, SECRET, "local-node", "hub").unwrap();
     assert_eq!(report.applied, 1);
 
-    let sensitive: bool = local_conn
-        .sqlite().unwrap().query_row(
-            "SELECT sensitive FROM memories WHERE content = 'sensitive, pulled directly from a peer'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let id = &with_content(&local_conn, "sensitive, pulled directly from a peer")[0];
+    let sensitive = testing::memory_i64(&local_conn, id, "sensitive").unwrap() == Some(1);
     assert!(
         sensitive,
         "a memory marked sensitive on the peer must still be sensitive after a direct pull"
@@ -762,21 +690,10 @@ fn a_tombstone_propagates_when_pulled_directly_from_a_peer() {
     {
         let hub_conn = hub.db.store();
         id = add(&hub_conn, "deleted on the peer, must tombstone on pull");
-        hub_conn
-            .sqlite()
-            .unwrap()
-            .execute(
-                "UPDATE memories SET node_id = 'hub-node' WHERE id = ?",
-                [&id],
-            )
+        testing::set_memory_column(&hub_conn, &id, "node_id", "hub-node").unwrap();
+        testing::set_memory_column(&hub_conn, &id, "deleted_at", "2026-08-11T00:00:00+00:00")
             .unwrap();
-        hub_conn
-            .sqlite()
-            .unwrap()
-            .execute(
-                "UPDATE memories SET deleted_at = ?, updated_at = ? WHERE id = ?",
-                params!["2026-08-11T00:00:00+00:00", "2026-08-11T00:00:00+00:00", id],
-            )
+        testing::set_memory_column(&hub_conn, &id, "updated_at", "2026-08-11T00:00:00+00:00")
             .unwrap();
     }
     let local_db = Database::open_in_memory().unwrap();
@@ -785,16 +702,8 @@ fn a_tombstone_propagates_when_pulled_directly_from_a_peer() {
     let report = pull_remote(&local_conn, &hub.url, SECRET, "local-node", "hub").unwrap();
     assert_eq!(report.applied, 1);
 
-    let deleted_at: Option<String> = local_conn
-        .sqlite()
-        .unwrap()
-        .query_row(
-            "SELECT deleted_at FROM memories \
-             WHERE content = 'deleted on the peer, must tombstone on pull'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let pulled = &with_content(&local_conn, "deleted on the peer, must tombstone on pull")[0];
+    let deleted_at = testing::memory_text(&local_conn, pulled, "deleted_at").unwrap();
     assert!(
         deleted_at.is_some(),
         "a tombstone on the peer must arrive as a tombstone after a direct pull, \
@@ -808,14 +717,7 @@ fn pull_remote_excludes_records_this_node_originated() {
     {
         let hub_conn = hub.db.store();
         let id = add(&hub_conn, "originated locally then pushed to hub");
-        hub_conn
-            .sqlite()
-            .unwrap()
-            .execute(
-                "UPDATE memories SET node_id = 'local-node' WHERE id = ?",
-                [&id],
-            )
-            .unwrap();
+        testing::set_memory_column(&hub_conn, &id, "node_id", "local-node").unwrap();
     }
     let local_db = Database::open_in_memory().unwrap();
     let local_conn = local_db.store();
@@ -844,15 +746,7 @@ fn a_full_push_then_pull_round_trip_between_two_nodes_converges() {
     let report = pull_remote(&node_b_conn, &hub.url, SECRET, "node-b", "hub").unwrap();
 
     assert_eq!(report.applied, 1);
-    let count: i64 = node_b_conn
-        .sqlite()
-        .unwrap()
-        .query_row(
-            "SELECT count(*) FROM memories WHERE content = 'from node a'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let count = with_content(&node_b_conn, "from node a").len();
     assert_eq!(count, 1);
     disable_sync();
 }

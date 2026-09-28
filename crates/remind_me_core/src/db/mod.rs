@@ -227,6 +227,10 @@ impl Database {
         let mut db = Self::open_sqlite_in_memory()?;
         let tables = engine::EngineTables::open_temporary()?;
         db.engine = Some(std::sync::Arc::new(Mutex::new(tables)));
+        // Opening the schema aligned the gate in SQLite's `sync_flags`; the
+        // engine holds its own `sync_flags` now, so align that one too, as
+        // every open does, before anything touches the outbox.
+        crate::sync::reconcile_sync_enabled_flag(&db.store())?;
         Ok(db)
     }
 
@@ -241,7 +245,9 @@ impl Database {
         Ok(db)
     }
 
-    fn open_sqlite_in_memory() -> Result<Self> {
+    /// An in-memory SQLite database whatever `REMIND_ME_STORE` says: for
+    /// tests of what only SQLite has, such as the schema and its migrations.
+    pub fn open_sqlite_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         schema::initialize_schema(&conn)?;
         Ok(Self {

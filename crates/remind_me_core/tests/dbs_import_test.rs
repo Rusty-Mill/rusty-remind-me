@@ -5,11 +5,14 @@
 //! schema with plain SQL, and a mock would only ever agree with whatever this
 //! module already believes that schema to be.
 
+use remind_me_core::db::entities::Entities;
+use remind_me_core::db::imports::ImportLedger;
 use remind_me_core::db::Store;
 use remind_me_core::dbs_import::{
     dbs_memory_id, memory_content, pull_dbs, DbsImportError, DEFAULT_CATEGORY, SOURCE_ENTITY_KIND,
     TAG_ENTITY_KIND,
 };
+use remind_me_core::testing::{self, Table};
 use remind_me_core::{Database, DbsImportInput};
 use rusqlite::params;
 use rusqlite::Connection;
@@ -128,41 +131,45 @@ fn input(path: &std::path::Path) -> DbsImportInput {
 }
 
 fn memory_count(store: &Store<'_>) -> i64 {
-    store
-        .sqlite()
-        .unwrap()
-        .query_row("SELECT count(*) FROM memories", [], |r| r.get(0))
-        .unwrap()
+    testing::count(store, Table::Memories).unwrap()
 }
 
 fn live_count(store: &Store<'_>) -> i64 {
-    store
-        .sqlite()
+    testing::memory_ids(store)
         .unwrap()
-        .query_row(
-            "SELECT count(*) FROM memories WHERE superseded_by IS NULL",
-            [],
-            |r| r.get(0),
-        )
+        .iter()
+        .filter(|id| {
+            testing::memory_text(store, id, "superseded_by")
+                .unwrap()
+                .is_none()
+        })
+        .count() as i64
+}
+
+/// The one stored memory's `column`, as text.
+fn only_memory_text(store: &Store<'_>, column: &str) -> String {
+    let ids = testing::memory_ids(store).unwrap();
+    assert_eq!(ids.len(), 1, "expected exactly one memory");
+    testing::memory_text(store, &ids[0], column)
+        .unwrap()
         .unwrap()
 }
 
 /// Entity names linked to a memory, with their kinds.
 fn linked_entities(store: &Store<'_>, memory_id: &str) -> Vec<(String, Option<String>)> {
-    let mut statement = store
-        .sqlite()
+    let entities = Entities::new(store);
+    let mut rows: Vec<(String, Option<String>)> = entities
+        .links_oldest_first()
         .unwrap()
-        .prepare(
-            "SELECT e.name, e.kind
-               FROM memory_entities me JOIN entities e ON me.entity_id = e.id
-              WHERE me.memory_id = ?
-              ORDER BY e.name",
-        )
-        .unwrap();
-    let rows = statement
-        .query_map(params![memory_id], |r| Ok((r.get(0)?, r.get(1)?)))
-        .unwrap();
-    rows.map(|r| r.unwrap()).collect()
+        .into_iter()
+        .filter(|(memory, _, _)| memory == memory_id)
+        .map(|(_, entity_id, _)| {
+            let entity = entities.get(&entity_id).unwrap().unwrap();
+            (entity.name, entity.kind)
+        })
+        .collect();
+    rows.sort();
+    rows
 }
 
 // ---------------------------------------------------------------------------
@@ -218,25 +225,15 @@ fn an_items_fields_land_where_they_are_useful() {
         String,
         String,
         String,
-    ) = store
-        .sqlite()
-        .unwrap()
-        .query_row(
-            "SELECT id, content, category, source, tags, metadata, created_at FROM memories",
-            [],
-            |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                    r.get(6)?,
-                ))
-            },
-        )
-        .unwrap();
+    ) = (
+        only_memory_text(&store, "id"),
+        only_memory_text(&store, "content"),
+        only_memory_text(&store, "category"),
+        only_memory_text(&store, "source"),
+        only_memory_text(&store, "tags"),
+        only_memory_text(&store, "metadata"),
+        only_memory_text(&store, "created_at"),
+    );
 
     assert_eq!(id, dbs_memory_id("raindrop", "x1", "hash-1"));
     assert_eq!(
@@ -280,11 +277,7 @@ fn an_item_with_no_kind_gets_the_fallback_category() {
 
     pull_dbs(&store, &input(&path)).unwrap();
 
-    let category: String = store
-        .sqlite()
-        .unwrap()
-        .query_row("SELECT category FROM memories", [], |r| r.get(0))
-        .unwrap();
+    let category: String = only_memory_text(&store, "category");
     assert_eq!(category, DEFAULT_CATEGORY);
 
     std::fs::remove_dir_all(&dir).unwrap();
@@ -318,11 +311,7 @@ fn the_source_and_every_tag_become_linked_entities() {
 
     let result = pull_dbs(&store, &input(&path)).unwrap();
 
-    let memory_id: String = store
-        .sqlite()
-        .unwrap()
-        .query_row("SELECT id FROM memories", [], |r| r.get(0))
-        .unwrap();
+    let memory_id: String = only_memory_text(&store, "id");
     let linked = linked_entities(&store, &memory_id);
 
     // Without these the importer has no reason to exist: `dbs export-notes`
@@ -351,15 +340,12 @@ fn item_kind_is_not_an_entity() {
 
     pull_dbs(&store, &input(&path)).unwrap();
 
-    let kinds: i64 = store
-        .sqlite()
+    let kinds = Entities::new(&store)
+        .all()
         .unwrap()
-        .query_row(
-            "SELECT count(*) FROM entities WHERE name = 'link'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
+        .into_iter()
+        .filter(|e| e.name == "link")
+        .count();
     assert_eq!(
         kinds, 0,
         "inventing a 'kind' entity type is the thing to avoid"
@@ -409,19 +395,11 @@ fn extra_tags_are_added_to_every_memory_and_become_entities() {
 
     pull_dbs(&store, &params).unwrap();
 
-    let tags: String = store
-        .sqlite()
-        .unwrap()
-        .query_row("SELECT tags FROM memories", [], |r| r.get(0))
-        .unwrap();
+    let tags: String = only_memory_text(&store, "tags");
     let tags: Vec<String> = serde_json::from_str(&tags).unwrap();
     assert_eq!(tags, vec!["marsupials", "australia", "archived"]);
 
-    let memory_id: String = store
-        .sqlite()
-        .unwrap()
-        .query_row("SELECT id FROM memories", [], |r| r.get(0))
-        .unwrap();
+    let memory_id: String = only_memory_text(&store, "id");
     let names: Vec<String> = linked_entities(&store, &memory_id)
         .into_iter()
         .map(|(name, _)| name)
@@ -519,28 +497,17 @@ fn an_edited_item_supersedes_its_previous_version_rather_than_overwriting_it() {
     // Only the new one is live, so search and every other read path see one.
     assert_eq!(live_count(&store), 1);
 
-    let superseded_by: Option<String> = store
-        .sqlite()
-        .unwrap()
-        .query_row(
-            "SELECT superseded_by FROM memories WHERE id = ?",
-            params![original],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let superseded_by = testing::memory_text(&store, &original, "superseded_by").unwrap();
     assert_eq!(superseded_by.as_deref(), Some(replacement.as_str()));
 
     // And the tracking row now points at the replacement, so a third rerun
     // over unchanged content is a no-op rather than superseding again.
-    let tracked: (String, String) = store
-        .sqlite()
-        .unwrap()
-        .query_row(
-            "SELECT memory_id, content_hash FROM dbs_imports WHERE external_id = 'x1'",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
+    let ledger = ImportLedger::new(&store)
+        .dbs_tracked("raindrop", &["x1"])
         .unwrap();
+    assert_eq!(ledger.len(), 1);
+    let row = ledger.values().next().unwrap();
+    let tracked = (row.memory_id.clone(), row.content_hash.clone());
     assert_eq!(tracked, (replacement, "hash-2".to_string()));
 
     let third = pull_dbs(&store, &input(&path)).unwrap();
@@ -640,11 +607,7 @@ fn the_source_and_item_type_filters_narrow_the_read() {
     let result = pull_dbs(&conn2, &by_kind).unwrap();
     assert_eq!(result.fetched, 1);
     assert_eq!(result.item_type.as_deref(), Some("link"));
-    let source: String = conn2
-        .sqlite()
-        .unwrap()
-        .query_row("SELECT source FROM memories", [], |r| r.get(0))
-        .unwrap();
+    let source: String = only_memory_text(&conn2, "source");
     assert_eq!(source, "dbs:raindrop");
 
     std::fs::remove_dir_all(&dir).unwrap();
@@ -734,23 +697,11 @@ fn a_dry_run_reports_the_work_without_doing_any_of_it() {
     assert_eq!(result.imported, 0);
     assert_eq!(memory_count(&store), 0);
     assert_eq!(
-        store
-            .sqlite()
-            .unwrap()
-            .query_row("SELECT count(*) FROM dbs_imports", [], |r| r
-                .get::<_, i64>(0))
-            .unwrap(),
+        testing::count(&store, Table::DbsImports).unwrap(),
         0,
         "a dry run that recorded a tracking row would make the real run a no-op"
     );
-    assert_eq!(
-        store
-            .sqlite()
-            .unwrap()
-            .query_row("SELECT count(*) FROM entities", [], |r| r.get::<_, i64>(0))
-            .unwrap(),
-        0
-    );
+    assert_eq!(testing::count(&store, Table::Entities).unwrap(), 0);
 
     std::fs::remove_dir_all(&dir).unwrap();
 }

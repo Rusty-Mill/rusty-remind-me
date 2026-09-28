@@ -14,6 +14,7 @@ use remind_me_core::db::queries;
 use remind_me_core::db::vectors::Vectors;
 use remind_me_core::db::Store;
 use remind_me_core::embedder::{EmbedError, EmbedRole, Embedder, EmbeddingIdentity};
+use remind_me_core::testing;
 use remind_me_core::vectors::{
     delete_chunks_for_memory, dimension_of, embed_and_store, embedding_mismatch_info,
     fuse_query_embedding, mark_embedding_meta_current, reconcile_embedding_meta, reindex,
@@ -137,15 +138,13 @@ fn embedding_a_memory_stores_one_chunk_and_dimension_infers_correctly() {
     assert_eq!(chunks, 1);
     assert_eq!(chunk_count(&store, &id), 1);
 
-    let bytes: Vec<u8> = store
-        .sqlite()
+    let bytes: Vec<u8> = Vectors::new(&store)
+        .all()
         .unwrap()
-        .query_row(
-            "SELECT embedding FROM vec_chunks WHERE memory_id = ?",
-            [&id],
-            |r| r.get(0),
-        )
-        .unwrap();
+        .into_iter()
+        .find(|c| c.memory_id == id)
+        .unwrap()
+        .embedding;
     assert_eq!(
         dimension_of(&bytes),
         4,
@@ -323,25 +322,11 @@ fn semantic_search_excludes_superseded_and_deleted_memories() {
         .with("removed content", vec![1.0, 0.0])
         .with("query", vec![1.0, 0.0]);
     embed_and_store(&store, &embedder, &stale, "stale content").unwrap();
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET superseded_by = 'mem_new' WHERE id = ?",
-            [&stale],
-        )
-        .unwrap();
+    testing::set_memory_column(&store, &stale, "superseded_by", "mem_new").unwrap();
 
     let removed = add(&store, "removed content");
     embed_and_store(&store, &embedder, &removed, "removed content").unwrap();
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET deleted_at = '2026-01-01T00:00:00Z' WHERE id = ?",
-            [&removed],
-        )
-        .unwrap();
+    testing::set_memory_column(&store, &removed, "deleted_at", "2026-01-01T00:00:00Z").unwrap();
 
     let results = semantic_search(&store, &embedder, "query", 10, None).unwrap();
     assert!(results.is_empty());
@@ -653,17 +638,7 @@ fn embedding_a_memory_records_the_embedders_identity_in_embedding_meta() {
 
     embed_and_store(&store, &embedder, &id, "quokkas").unwrap();
 
-    let recorded: Vec<(String, String)> = {
-        let mut stmt = store
-            .sqlite()
-            .unwrap()
-            .prepare("SELECT key, value FROM embedding_meta ORDER BY key")
-            .unwrap();
-        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect()
-    };
+    let recorded = Vectors::new(&store).meta().unwrap();
     assert_eq!(
         recorded,
         vec![
@@ -685,11 +660,7 @@ fn embedding_blank_content_does_not_record_embedding_meta() {
 
     embed_and_store(&store, &embedder, &id, "   ").unwrap();
 
-    let count: i64 = store
-        .sqlite()
-        .unwrap()
-        .query_row("SELECT count(*) FROM embedding_meta", [], |r| r.get(0))
-        .unwrap();
+    let count = Vectors::new(&store).meta().unwrap().len();
     assert_eq!(count, 0);
 }
 

@@ -3,6 +3,7 @@
 use remind_me_core::db::queries;
 use remind_me_core::db::Store;
 use remind_me_core::digest::{build_digest, render_markdown, MAX_RECENT_MEMORIES};
+use remind_me_core::testing;
 use remind_me_core::{Database, MemoryAddInput};
 
 fn add(store: &Store<'_>, content: &str, sensitive: bool) -> String {
@@ -27,14 +28,7 @@ fn add(store: &Store<'_>, content: &str, sensitive: bool) -> String {
 
 fn backdate(store: &Store<'_>, id: &str, days: i64) {
     let when = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET created_at = ? WHERE id = ?",
-            rusqlite::params![when, id],
-        )
-        .unwrap();
+    testing::set_memory_column(store, id, "created_at", when).unwrap();
 }
 
 #[test]
@@ -161,14 +155,7 @@ fn a_deleted_memory_is_excluded() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
     let id = add(&store, "removed", false);
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET deleted_at = '2026-01-01T00:00:00+00:00' WHERE id = ?",
-            [&id],
-        )
-        .unwrap();
+    testing::set_memory_column(&store, &id, "deleted_at", "2026-01-01T00:00:00+00:00").unwrap();
 
     assert_eq!(build_digest(&store, 7).unwrap().recent_total, 0);
 }

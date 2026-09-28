@@ -1,7 +1,9 @@
 //! Coverage for `remind_me_feedback`.
 
+use remind_me_core::db::feedback::Feedback;
 use remind_me_core::db::queries;
 use remind_me_core::db::Store;
+use remind_me_core::testing;
 use remind_me_core::vitality::{
     apply_feedback_adjustment, contextual_feedback_adjustment, record_feedback, tokenize_query,
     FeedbackSignal, BASE_WEIGHT_MAX, BASE_WEIGHT_MIN, FEEDBACK_ADJUSTMENT_CAP, FEEDBACK_MAGNITUDE,
@@ -31,27 +33,13 @@ fn add(store: &Store<'_>) -> String {
 }
 
 fn base_weight(store: &Store<'_>, id: &str) -> f64 {
-    store
-        .sqlite()
+    testing::memory_f64(&store, &id, "base_weight")
         .unwrap()
-        .query_row(
-            "SELECT base_weight FROM memories WHERE id = ?",
-            rusqlite::params![id],
-            |r| r.get(0),
-        )
         .unwrap()
 }
 
 fn feedback_rows(store: &Store<'_>, id: &str) -> i64 {
-    store
-        .sqlite()
-        .unwrap()
-        .query_row(
-            "SELECT count(*) FROM memory_feedback WHERE memory_id = ?",
-            rusqlite::params![id],
-            |r| r.get(0),
-        )
-        .unwrap()
+    Feedback::new(store).events(id).unwrap().len() as i64
 }
 
 #[test]
@@ -132,15 +120,12 @@ fn contextual_feedback_stores_normalised_query_tokens() {
     )
     .unwrap();
 
-    let (query, tokens): (String, String) = store
-        .sqlite()
+    let query = testing::feedback_queries(&store, &id).unwrap().remove(0);
+    let tokens = Feedback::new(&store)
+        .events(&id)
         .unwrap()
-        .query_row(
-            "SELECT query, query_tokens FROM memory_feedback WHERE memory_id = ?",
-            rusqlite::params![id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .unwrap();
+        .remove(0)
+        .query_tokens;
 
     assert_eq!(
         query, "What IS my Editor?",
@@ -226,14 +211,8 @@ fn the_weight_floor_keeps_a_downvoted_memory_above_dormancy() {
         record_feedback(&store, &id, FeedbackSignal::Unhelpful, None).unwrap();
     }
 
-    let status: String = store
-        .sqlite()
+    let status: String = testing::memory_text(&store, &id, "status")
         .unwrap()
-        .query_row(
-            "SELECT status FROM memories WHERE id = ?",
-            rusqlite::params![id],
-            |r| r.get(0),
-        )
         .unwrap();
     // base_weight floors at 0.1, which is above VITALITY_FLOOR of 0.05, so it
     // stays active — pinning that rather than assuming it flips.
@@ -249,14 +228,8 @@ fn feedback_never_touches_access_count() {
     record_feedback(&store, &id, FeedbackSignal::Helpful, None).unwrap();
     record_feedback(&store, &id, FeedbackSignal::Unhelpful, Some("a query")).unwrap();
 
-    let count: i64 = store
-        .sqlite()
+    let count: i64 = testing::memory_i64(&store, &id, "access_count")
         .unwrap()
-        .query_row(
-            "SELECT access_count FROM memories WHERE id = ?",
-            rusqlite::params![id],
-            |r| r.get(0),
-        )
         .unwrap();
     assert_eq!(
         count, 0,

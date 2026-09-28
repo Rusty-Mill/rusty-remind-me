@@ -26,6 +26,7 @@ mod support;
 use remind_me_core::db::queries;
 use remind_me_core::db::Store;
 use remind_me_core::sync::{pull_remote, push_outbox, HUB_URL_ENV, NODE_ID_ENV, SYNC_SECRET_ENV};
+use remind_me_core::testing;
 use remind_me_core::{Database, MemoryAddInput};
 use std::sync::Mutex;
 use support::MockHub;
@@ -68,6 +69,20 @@ fn disable_sync() {
     crate::test_env::remove_var(SYNC_SECRET_ENV);
 }
 
+/// The ids of every memory, deleted or not, whose content is `content`.
+fn with_content(store: &Store<'_>, content: &str) -> Vec<String> {
+    testing::memory_ids(store)
+        .unwrap()
+        .into_iter()
+        .filter(|id| {
+            testing::memory_text(store, id, "content")
+                .unwrap()
+                .as_deref()
+                == Some(content)
+        })
+        .collect()
+}
+
 #[test]
 fn a_memory_pushed_to_a_real_hub_is_pulled_back_by_a_second_node() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -86,15 +101,7 @@ fn a_memory_pushed_to_a_real_hub_is_pulled_back_by_a_second_node() {
     let pulled = pull_remote(&node_b_conn, &hub.url, SECRET, "node-b", "hub").unwrap();
 
     assert_eq!(pulled.applied, 1, "the real hub must serve it back");
-    let count: i64 = node_b_conn
-        .sqlite()
-        .unwrap()
-        .query_row(
-            "SELECT count(*) FROM memories WHERE content = 'pushed to the real hub'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let count = with_content(&node_b_conn, "pushed to the real hub").len();
     assert_eq!(count, 1);
     disable_sync();
 }
@@ -136,15 +143,8 @@ fn a_sensitive_memory_stays_sensitive_after_a_real_hub_round_trip() {
     let pulled = pull_remote(&node_b_conn, &hub.url, SECRET, "node-b", "hub").unwrap();
     assert_eq!(pulled.applied, 1);
 
-    let sensitive: bool = node_b_conn
-        .sqlite()
-        .unwrap()
-        .query_row(
-            "SELECT sensitive FROM memories WHERE content = 'sensitive across a real hub'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let id = &with_content(&node_b_conn, "sensitive across a real hub")[0];
+    let sensitive = testing::memory_i64(&node_b_conn, id, "sensitive").unwrap() == Some(1);
     assert!(
         sensitive,
         "a memory marked sensitive on node A must still be sensitive on node B \

@@ -14,6 +14,7 @@
 use remind_me_core::db::sync_state::{SyncLogRow, SyncState};
 use remind_me_core::db::Store;
 use remind_me_core::sync::pull_remote;
+use remind_me_core::testing;
 use remind_me_core::Database;
 use serde_json::json;
 use std::io::{BufRead, BufReader, Write};
@@ -323,14 +324,8 @@ fn a_record_stamped_behind_the_legacy_cursor_is_still_pulled() {
     let report = pull_remote(&store, &url, SECRET, "this-node", "hub").unwrap();
 
     assert_eq!(report.applied, 1, "the stranded record must be applied");
-    let content: String = store
-        .sqlite()
+    let content = testing::memory_text(&store, "stranded", "content")
         .unwrap()
-        .query_row(
-            "SELECT content FROM memories WHERE id = 'stranded'",
-            [],
-            |r| r.get(0),
-        )
         .unwrap();
     assert_eq!(content, "content for stranded");
     assert_eq!(

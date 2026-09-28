@@ -1,11 +1,13 @@
 //! Coverage for the three search expansions and the co-retrieval write path.
 
+use remind_me_core::db::memories::{Memories, NewMemory};
 use remind_me_core::db::queries;
 use remind_me_core::db::Store;
 use remind_me_core::expansion::{
     record_co_retrieval, RelatedMemory, CO_RETRIEVAL_MAX_WEIGHT, CO_RETRIEVAL_PAIR_CAP,
     EXPANSION_CAP, SNIPPET_CHARS,
 };
+use remind_me_core::testing::{self, Table};
 use remind_me_core::{Database, EntityInput, MemoryAddInput, MemorySearchInput};
 
 fn add(store: &Store<'_>, content: &str, entities: &[&str]) -> String {
@@ -37,20 +39,16 @@ fn add(store: &Store<'_>, content: &str, entities: &[&str]) -> String {
 
 /// A memory carrying document position, the way an importer will write one.
 fn chunk(store: &Store<'_>, id: &str, content: &str, doc: &str, index: i64) {
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "INSERT INTO memories (id, content, category, tags, source, metadata,
-                               created_at, updated_at, doc_id, chunk_index)
-         VALUES (?, ?, 'general', '[]', 'document_import', '{}',
-                 '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', ?, ?)",
-            rusqlite::params![id, content, doc, index],
-        )
-        .unwrap();
-    // Planted with raw SQL, so it needs indexing to be searchable, and to be
+    // Written through the repository, which indexes it: searchable, and
     // deletable without the full-text index losing track of it.
-    remind_me_core::db::derived::rebuild_indexes(store).unwrap();
+    Memories::new(store)
+        .insert(&NewMemory {
+            source: "document_import".into(),
+            doc_id: Some(doc.into()),
+            chunk_index: Some(index),
+            ..NewMemory::new(id, content, "2026-01-01T00:00:00Z")
+        })
+        .unwrap();
 }
 
 fn search(
@@ -87,15 +85,7 @@ fn ids(items: &[RelatedMemory]) -> Vec<String> {
 
 fn weight(store: &Store<'_>, a: &str, b: &str) -> Option<i64> {
     let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-    store
-        .sqlite()
-        .unwrap()
-        .query_row(
-            "SELECT weight FROM memory_associations WHERE memory_id_a = ? AND memory_id_b = ?",
-            rusqlite::params![lo, hi],
-            |r| r.get(0),
-        )
-        .ok()
+    testing::association_weight(store, lo, hi).unwrap()
 }
 
 // --- co-retrieval write path -------------------------------------------------
@@ -108,11 +98,7 @@ fn pairs_are_stored_under_one_canonical_order() {
     record_co_retrieval(&store, &["mem_b".into(), "mem_a".into()]).unwrap();
     record_co_retrieval(&store, &["mem_a".into(), "mem_b".into()]).unwrap();
 
-    let rows: i64 = store
-        .sqlite()
-        .unwrap()
-        .query_row("SELECT count(*) FROM memory_associations", [], |r| r.get(0))
-        .unwrap();
+    let rows = testing::count(&store, Table::MemoryAssociations).unwrap();
     // Without sorting, the two orderings would be two rows and each weight
     // would read back at half strength.
     assert_eq!(rows, 1);
@@ -142,11 +128,7 @@ fn fewer_than_two_results_record_nothing() {
     assert_eq!(record_co_retrieval(&store, &[]).unwrap(), 0);
     assert_eq!(record_co_retrieval(&store, &["mem_a".into()]).unwrap(), 0);
 
-    let rows: i64 = store
-        .sqlite()
-        .unwrap()
-        .query_row("SELECT count(*) FROM memory_associations", [], |r| r.get(0))
-        .unwrap();
+    let rows = testing::count(&store, Table::MemoryAssociations).unwrap();
     assert_eq!(rows, 0, "a single result has nothing to associate with");
 }
 
@@ -277,14 +259,7 @@ fn entity_expansion_skips_deleted_and_superseded_memories() {
     add(&store, "quokka sighting", &["Tasmania"]);
     let live = add(&store, "still around", &["Tasmania"]);
     let superseded = add(&store, "replaced note", &["Tasmania"]);
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET superseded_by = ? WHERE id = ?",
-            rusqlite::params![live, superseded],
-        )
-        .unwrap();
+    testing::set_memory_column(&store, &superseded, "superseded_by", live.as_str()).unwrap();
 
     let result = search(&store, "quokka", |i| i.expand_entities = true);
 

@@ -10,10 +10,13 @@ mod test_env;
 
 use remind_me_core::backup::list_backups;
 use remind_me_core::db::migrations::SCHEMA_VERSION;
+use remind_me_core::db::outbox::Outbox;
 use remind_me_core::db::queries;
+use remind_me_core::db::sync_state::SyncState;
 use remind_me_core::db::Store;
 use remind_me_core::embedder::{EMBEDDING_BACKEND_ENV, EMBEDDING_DIM_ENV, OLLAMA_MODEL_ENV};
 use remind_me_core::sync::{HUB_URL_ENV, NODE_ID_ENV, SYNC_SECRET_ENV};
+use remind_me_core::testing::{self, Table};
 use remind_me_core::{Database, MemoryAddInput};
 use rusqlite::Connection;
 use std::collections::BTreeMap;
@@ -165,13 +168,15 @@ fn expected() -> Connection {
 
 #[test]
 fn every_table_matches_the_generated_schema() {
-    let db = Database::open_in_memory().unwrap();
+    // SQLite-only: this inspects the SQLite file's schema.
+    let db = Database::open_sqlite_in_memory().unwrap();
     assert_matches_schema(&db.store(), "table");
 }
 
 #[test]
 fn every_index_matches_the_generated_schema() {
-    let db = Database::open_in_memory().unwrap();
+    // SQLite-only: this inspects the SQLite file's schema.
+    let db = Database::open_sqlite_in_memory().unwrap();
     assert_matches_schema(&db.store(), "index");
 }
 
@@ -179,7 +184,8 @@ fn every_index_matches_the_generated_schema() {
 fn a_database_has_no_triggers() {
     // The repositories keep derived data in step since schema v31; a trigger
     // would do the same work a second time.
-    let db = Database::open_in_memory().unwrap();
+    // SQLite-only: this inspects the SQLite file's schema.
+    let db = Database::open_sqlite_in_memory().unwrap();
     assert!(objects(&db.store(), "trigger").is_empty());
 }
 
@@ -187,7 +193,8 @@ fn a_database_has_no_triggers() {
 fn the_schema_carries_no_target_only_columns() {
     // The four tables that had drifted. Each assertion names a column that was
     // present here and absent upstream, or vice versa.
-    let db = Database::open_in_memory().unwrap();
+    // SQLite-only: this inspects the SQLite file's schema.
+    let db = Database::open_sqlite_in_memory().unwrap();
     let store = db.store();
 
     let cols = |t: &str| -> Vec<String> {
@@ -226,7 +233,8 @@ fn the_schema_carries_no_target_only_columns() {
 fn memory_entities_has_no_foreign_keys() {
     // The reference omits them deliberately: sync can deliver a mention link
     // before the memory it points at, and a cascade would reject that.
-    let db = Database::open_in_memory().unwrap();
+    // SQLite-only: this inspects the SQLite file's schema.
+    let db = Database::open_sqlite_in_memory().unwrap();
     let store = db.store();
     let mut stmt = store
         .sqlite()
@@ -239,7 +247,8 @@ fn memory_entities_has_no_foreign_keys() {
 
 #[test]
 fn the_version_stamp_matches_the_schema_present() {
-    let db = Database::open_in_memory().unwrap();
+    // SQLite-only: this inspects the SQLite file's schema.
+    let db = Database::open_sqlite_in_memory().unwrap();
     let version: i32 = db
         .store()
         .sqlite()
@@ -365,6 +374,16 @@ fn a_legacy_database_is_reconciled_to_the_generated_schema() {
     assert_eq!(tags, 1, "pre-existing JSON tags must be backfilled");
 }
 
+/// The oldest queued outbox row's payload JSON. No send is recorded to any
+/// remote in these tests, so every row is unsent to this one.
+fn first_outbox_payload(store: &Store<'_>) -> String {
+    Outbox::new(store)
+        .unsent_to("any-remote", 0, 1)
+        .unwrap()
+        .remove(0)
+        .payload_json
+}
+
 #[test]
 fn writes_still_reach_the_sync_outbox() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -391,15 +410,7 @@ fn writes_still_reach_the_sync_outbox() {
     )
     .unwrap();
 
-    let payload: String = store
-        .sqlite()
-        .unwrap()
-        .query_row(
-            "SELECT payload FROM sync_outbox ORDER BY id LIMIT 1",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let payload = first_outbox_payload(&store);
     let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
     assert_eq!(parsed["content"], "syncable");
     assert!(parsed.get("base_weight").is_some());
@@ -438,11 +449,7 @@ fn writes_do_not_reach_the_outbox_while_sync_is_unconfigured() {
     )
     .unwrap();
 
-    let count: i64 = store
-        .sqlite()
-        .unwrap()
-        .query_row("SELECT count(*) FROM sync_outbox", [], |r| r.get(0))
-        .unwrap();
+    let count = testing::count(&store, Table::SyncOutbox).unwrap();
     assert_eq!(count, 0);
 }
 
@@ -709,7 +716,8 @@ fn the_generated_schema_carries_every_v27_object() {
     // is data-only, so neither contributes a table or index this inventory
     // could list. The column itself is covered by the whole-DDL comparison in
     // `every_table_matches_the_generated_schema`.
-    let db = Database::open_in_memory().unwrap();
+    // SQLite-only: this inspects the SQLite file's schema.
+    let db = Database::open_sqlite_in_memory().unwrap();
     let store = db.store();
 
     let tables = objects(&store, "table");
@@ -759,13 +767,8 @@ fn the_outbox_payloads_carry_the_new_columns() {
     // shows up as data loss on the other node.
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "INSERT OR REPLACE INTO sync_flags (key, value) VALUES ('sync_enabled', '1')",
-            [],
-        )
+    SyncState::new(&store)
+        .set_flag("sync_enabled", "1")
         .unwrap();
     remind_me_core::db::memories::Memories::new(&store)
         .insert(&remind_me_core::db::memories::NewMemory::new(
@@ -774,11 +777,7 @@ fn the_outbox_payloads_carry_the_new_columns() {
             "2026-01-01T00:00:00+00:00",
         ))
         .unwrap();
-    let payload: String = store
-        .sqlite()
-        .unwrap()
-        .query_row("SELECT payload FROM sync_outbox", [], |r| r.get(0))
-        .unwrap();
+    let payload = first_outbox_payload(&store);
     let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
     for column in ["remind_at", "sensitive"] {
         assert!(
