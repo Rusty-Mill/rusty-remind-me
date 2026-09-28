@@ -227,6 +227,31 @@ fn read_back(db: &Database) -> Vec<String> {
     seen
 }
 
+/// A value decay leaves behind whose shortest decimal form a fast float
+/// parser reads back one bit off (as 0.9775).
+const INEXACT: f64 = 0.9774999999999999;
+
+#[test]
+fn a_float_that_parses_inexactly_is_copied_and_read_back_exactly() {
+    let source = Database::open_sqlite_in_memory().unwrap();
+    Memories::new(&source.store())
+        .insert(&NewMemory {
+            vitality: INEXACT,
+            base_weight: INEXACT,
+            ..NewMemory::new("m1", "decayed", T1)
+        })
+        .unwrap();
+
+    let (target, report) = copied(&source);
+
+    assert!(report.refused.is_empty(), "{:?}", report.refused);
+    let copied = Memories::new(&target.store())
+        .get_many(&["m1".to_string()])
+        .unwrap();
+    assert_eq!(copied[0].vitality.to_bits(), INEXACT.to_bits());
+    assert_eq!(copied[0].base_weight.to_bits(), INEXACT.to_bits());
+}
+
 #[test]
 fn a_copied_core_reads_back_as_the_source_does() {
     let source = seeded_source();

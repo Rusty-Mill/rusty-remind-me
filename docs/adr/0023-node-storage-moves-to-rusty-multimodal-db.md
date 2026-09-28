@@ -1372,6 +1372,14 @@ session's MCP server would open the store itself.
 
 Phase 5 is complete: the node's store is the engine. Phase 6, removing the SQLite store, is its own decision, after the engine has run on real nodes.
 
+**After 5.4b: floats round-trip exactly.** A benchmark of the copy on
+synthetic data had 92 of 1,000 memories refused: the engine stores records
+as JSON, and `serde_json`'s default parser reads some floats back one bit
+off (`0.9774999999999999` as `0.9775`). The copy's verification caught it,
+as designed, but it would have stopped a real node's first start. The
+remind_me crates declared `serde_json` without the workspace's
+`float_roundtrip`; `remind_me_core` now enables it.
+
 ## Related
 
 - ADR-0021 (the hub's move) and ADR-0022 (the seam this continues).

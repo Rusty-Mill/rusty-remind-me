@@ -11,7 +11,10 @@ layer = "apps"
 [dependencies]
 
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+# `float_roundtrip`: the engine stores records as JSON, and the default
+# parser reads some floats back one bit off (0.9774999999999999 as 0.9775).
+# Decay leaves such values, which the copy onto the engine then refused.
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
 async-trait = "0.1"
 thiserror = "2.0"
 tokio = { version = "1.0", features = ["full"] }

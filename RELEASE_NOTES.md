@@ -2,6 +2,14 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-28 — The copy onto the engine keeps every float exactly (ADR-0023)
+
+### Fixed
+- The first open on the engine refused memories whose `vitality` or `base_weight` did not survive `serde_json`'s default float parser, which reads some values back one bit off (`0.9774999999999999` as `0.9775`). Decay produces such values, so an ordinary node could refuse to start after upgrading. `remind_me_core` now enables `serde_json`'s `float_roundtrip`, as the rest of the workspace already does, so the engine reads back exactly what it stored.
+
+### Tests
+- A memory with such a value copies onto the engine and reads back bit for bit.
+
 ## 2026-09-28 — The engine is the default store (ADR-0023, phase 5.4b)
 
 ### Changed
