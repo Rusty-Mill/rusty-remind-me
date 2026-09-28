@@ -58,13 +58,13 @@ fn search(store: &Store<'_>, query: &str) -> Vec<String> {
 }
 
 fn access_count(store: &Store<'_>, id: &str) -> i64 {
-    testing::memory_i64(&store, &id, "access_count")
+    testing::memory_i64(store, id, "access_count")
         .unwrap()
         .unwrap()
 }
 
 fn accessed_at(store: &Store<'_>, id: &str) -> String {
-    testing::memory_text(&store, &id, "accessed_at")
+    testing::memory_text(store, id, "accessed_at")
         .unwrap()
         .unwrap()
 }

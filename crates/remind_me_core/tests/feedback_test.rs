@@ -33,7 +33,7 @@ fn add(store: &Store<'_>) -> String {
 }
 
 fn base_weight(store: &Store<'_>, id: &str) -> f64 {
-    testing::memory_f64(&store, &id, "base_weight")
+    testing::memory_f64(store, id, "base_weight")
         .unwrap()
         .unwrap()
 }

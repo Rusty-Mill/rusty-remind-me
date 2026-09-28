@@ -65,8 +65,7 @@ fn the_outbox_payload_carries_the_reminder() {
     let payload: Option<String> = testing::outbox_rows(&store)
         .unwrap()
         .into_iter()
-        .filter(|row| row.memory_id == id)
-        .next_back()
+        .rfind(|row| row.memory_id == id)
         .and_then(|row| {
             let payload: serde_json::Value = serde_json::from_str(&row.payload).unwrap();
             payload["remind_at"].as_str().map(str::to_string)
