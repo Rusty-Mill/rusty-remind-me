@@ -2,6 +2,14 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-28 — Copy the memories core from SQLite to the engine (ADR-0023, phase 5.1)
+
+### Added
+- `db::engine::copy::copy_core`, which copies the sixteen memories-core tables from a node's SQLite store into an empty engine core, keeping every id. It never writes to its source, and it refuses a source at another schema version. A row the engine cannot keep is refused and reported, never dropped silently. Every row is verified after it is written.
+
+### Tests
+- A differential test copies a store with a row in every core table and requires every repository read to answer the same on SQLite and on the copy. Further tests cover refusals, a non-empty target, an old source, the outbox sequence, and a source that is left untouched.
+
 ## 2026-09-28 — The memories core is switched on (ADR-0023, core PR 5b)
 
 ### Changed

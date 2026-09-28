@@ -13,6 +13,7 @@
 
 pub(crate) mod analytics;
 pub(crate) mod archives;
+pub mod copy;
 pub(crate) mod core;
 pub(crate) mod curation;
 pub(crate) mod feedback;

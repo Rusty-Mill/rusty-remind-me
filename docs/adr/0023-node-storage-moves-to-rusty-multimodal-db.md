@@ -1185,8 +1185,49 @@ complete.**
   schema and its migrations, and `Promotions::ensure_table`, all until
   the copy tool.
 
-**Next:** phase 5: the copy tool (§5), `Database::open` on the engine,
-and the engine as the default.
+### Phase 5: the switch
+
+Phase 5 ships in four PRs:
+
+1. The copy of the memories core (this).
+2. The copy of the other groups, and the `rusty-remind-me copy-store`
+   command.
+3. `Database::open` on the engine for an on-disk node, copying on first
+   open, and background writers waiting on a page.
+4. The engine as the default.
+
+**5.1, done: the copy of the memories core.**
+
+- `db::engine::copy::copy_core(source, target)` copies the core's sixteen
+  tables from a SQLite store into an empty core, keeping every id. Each
+  row is keyed exactly as the write paths key it: memories and the
+  outbox by their ids, pairs by `pair_engine_id`, a delivery by
+  (memory, remind_at).
+- It follows §5's three rules:
+  - **It never writes to the source.** It reads `SELECT *` and nothing
+    else. A source that is not at this build's schema version is refused
+    rather than migrated.
+  - **It refuses what the engine cannot keep, and reports it.** A row
+    whose columns do not fit the engine record (a NULL where the engine
+    keeps text, a value of the wrong type) is left out and reported in
+    `CopyReport::refused`, as is a row that would land on a key an
+    earlier row already took. The only source column the engine drops on
+    purpose is a delivery's rowid, which nothing reads.
+  - **It verifies every row.** Each record's columns are compared with
+    the source row's before it is written, and each stored record is read
+    back and compared with what was written.
+- The target must be empty. The sync flags are the exception: opening the
+  tables sets the `sync_enabled` gate, and the source's flags replace it.
+  The outbox sequence is raised past the highest copied id.
+- Tests:
+  - A differential test seeds a SQLite store with a row in every core
+    table, copies it, and requires every repository read to answer the
+    same on both. Removing one table from the copy makes it fail.
+  - Further tests cover refusals, a filled target, an old source, the
+    sequence, and that the source's `total_changes()` does not move.
+
+**Next:** 5.2, the copy of the other groups and the `copy-store`
+command.
 
 ## Related
 

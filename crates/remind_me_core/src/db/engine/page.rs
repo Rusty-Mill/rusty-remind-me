@@ -46,7 +46,7 @@ pub(super) struct OpenPage {
 }
 
 /// The change that puts back what `change` is about to replace.
-fn before_image(core: &CoreTables, change: &Change) -> Change {
+pub(super) fn before_image(core: &CoreTables, change: &Change) -> Change {
     match change {
         Change::Memory(id, _) => Change::Memory(*id, core.memories.get(*id).map(Box::new)),
         Change::Outbox(id, _) => Change::Outbox(*id, core.outbox.get(*id)),
