@@ -183,19 +183,15 @@ mod with_the_feature {
         )
         .unwrap();
 
-        let (content, category, metadata): (String, String, String) = store
-            .sqlite()
-            .unwrap()
-            .query_row(
-                "SELECT content, category, metadata FROM memories",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
+        // Through the repository, so this runs on whichever store is open.
+        let memories = remind_me_core::db::memories::Memories::new(&store)
+            .all_live()
             .unwrap();
+        assert_eq!(memories.len(), 1);
+        let memory = &memories[0];
 
-        assert!(content.contains("Imported through the real path"));
-        assert_eq!(category, "pdf");
-        let metadata: serde_json::Value = serde_json::from_str(&metadata).unwrap();
-        assert_eq!(metadata["page"], 1);
+        assert!(memory.content.contains("Imported through the real path"));
+        assert_eq!(memory.category, "pdf");
+        assert_eq!(memory.metadata["page"], 1);
     }
 }
