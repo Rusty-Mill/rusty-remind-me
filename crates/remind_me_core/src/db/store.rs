@@ -16,9 +16,7 @@
 //! other group stays on the SQLite connection until its own step.
 
 #[cfg(feature = "engine-store")]
-use super::engine::{EngineHandle, EngineTables};
-#[cfg(feature = "engine-store")]
-use parking_lot::Mutex;
+use super::engine::{EngineHandle, EngineLock};
 use parking_lot::MutexGuard;
 use rusqlite::Connection;
 use std::fmt;
@@ -130,14 +128,14 @@ impl<'a> Store<'a> {
 
     /// The engine tables, for the repositories moved onto them.
     #[cfg(feature = "engine-store")]
-    pub(crate) fn engine(&self) -> Option<&Mutex<EngineTables>> {
+    pub(crate) fn engine(&self) -> Option<&EngineLock> {
         self.engine.as_deref()
     }
 
     /// The engine tables, for the memories core's repositories: every store
     /// on the engine holds the core since the switch-on (core PR 5b).
     #[cfg(feature = "engine-store")]
-    pub(crate) fn core(&self) -> Option<&Mutex<EngineTables>> {
+    pub(crate) fn core(&self) -> Option<&EngineLock> {
         self.engine()
     }
 

@@ -6,13 +6,11 @@
 //! is, that a reminder must be in the future, and when a delivery counts.
 
 #[cfg(feature = "engine-store")]
-use super::engine::{self, EngineTables};
+use super::engine::{self, EngineLock};
 use super::{Result, Store};
 use crate::db::derived::{write_memory, Origin};
 use crate::db::queries::{parse_memory_row, prefixed_memory_columns};
 use crate::models::{Memory, ReminderWindow};
-#[cfg(feature = "engine-store")]
-use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 
 /// The reminder columns and tables, over one connection, or on the
@@ -21,7 +19,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 pub struct Reminders<'c> {
     conn: &'c Connection,
     #[cfg(feature = "engine-store")]
-    core: Option<&'c Mutex<EngineTables>>,
+    core: Option<&'c EngineLock>,
 }
 
 impl<'c> Reminders<'c> {

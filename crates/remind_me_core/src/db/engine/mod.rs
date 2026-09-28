@@ -51,7 +51,67 @@ use uuid::Uuid;
 
 /// The engine tables, shared by the database, its stores, and the
 /// background threads that open their own SQLite connections beside it.
-pub type EngineHandle = std::sync::Arc<parking_lot::Mutex<EngineTables>>;
+pub type EngineHandle = std::sync::Arc<EngineLock>;
+
+/// The engine tables behind their lock, shared by every thread that uses
+/// them, and the page gate in front of it (see [`page`]).
+///
+/// While one thread holds a page open, every other thread's [`Self::lock`]
+/// waits until the page is finished or abandoned, as a second SQLite writer
+/// waits for a write transaction: its reads and writes then see the page
+/// whole or not at all. The page's own thread passes straight through.
+pub struct EngineLock {
+    tables: parking_lot::Mutex<EngineTables>,
+    /// The thread holding a page open, if any.
+    page_owner: parking_lot::Mutex<Option<std::thread::ThreadId>>,
+    /// Signalled when a page closes.
+    page_closed: parking_lot::Condvar,
+}
+
+impl EngineLock {
+    pub fn new(tables: EngineTables) -> Self {
+        Self {
+            tables: parking_lot::Mutex::new(tables),
+            page_owner: parking_lot::Mutex::new(None),
+            page_closed: parking_lot::Condvar::new(),
+        }
+    }
+
+    /// The tables, once no other thread holds a page open.
+    pub fn lock(&self) -> parking_lot::MutexGuard<'_, EngineTables> {
+        let me = std::thread::current().id();
+        let mut owner = self.page_owner.lock();
+        while owner.is_some_and(|o| o != me) {
+            self.page_closed.wait(&mut owner);
+        }
+        // Taken while still holding the gate, so no page can open between
+        // the check and the lock.
+        self.tables.lock()
+    }
+
+    /// Claim the gate for the calling thread, once no other thread holds
+    /// it.
+    fn claim_page(&self) {
+        let me = std::thread::current().id();
+        let mut owner = self.page_owner.lock();
+        while owner.is_some_and(|o| o != me) {
+            self.page_closed.wait(&mut owner);
+        }
+        *owner = Some(me);
+    }
+
+    /// Release the gate and wake every waiting thread.
+    fn release_page(&self) {
+        *self.page_owner.lock() = None;
+        self.page_closed.notify_all();
+    }
+}
+
+impl fmt::Debug for EngineLock {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EngineLock").finish_non_exhaustive()
+    }
+}
 
 /// The environment variable that picks the backend for
 /// [`super::Database::open_in_memory`]: `engine` or unset (SQLite).
@@ -275,10 +335,10 @@ where
 }
 
 /// A directory under the system temp dir, removed on drop.
-struct TemporaryDir(PathBuf);
+pub(crate) struct TemporaryDir(PathBuf);
 
 impl TemporaryDir {
-    fn fresh() -> Self {
+    pub(crate) fn fresh() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
             "remind_me_engine_{}_{}",
@@ -286,6 +346,14 @@ impl TemporaryDir {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         Self(dir)
+    }
+}
+
+impl TemporaryDir {
+    /// The directory, which does not exist until something creates it.
+    #[cfg(test)]
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
     }
 }
 
@@ -312,9 +380,7 @@ pub(crate) fn reopen(dir: &Path) -> EngineTables {
 /// Run `open` until it stops failing on a held lock, for up to five
 /// seconds (see [`reopen`]), and return what it last returned.
 #[cfg(test)]
-pub(crate) fn retry_while_locked(
-    open: impl Fn() -> super::Result<EngineTables>,
-) -> super::Result<EngineTables> {
+pub(crate) fn retry_while_locked<T>(open: impl Fn() -> super::Result<T>) -> super::Result<T> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         match open() {
@@ -328,6 +394,9 @@ pub(crate) fn retry_while_locked(
         }
     }
 }
+
+#[cfg(test)]
+mod open_tests;
 
 #[cfg(test)]
 mod tests {

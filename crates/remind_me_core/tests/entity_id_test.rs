@@ -266,13 +266,13 @@ fn opening_an_existing_database_migrates_it() {
     let _ = std::fs::remove_file(&path);
 
     let legacy = {
-        let db = Database::open(&path).unwrap();
+        let db = Database::open_on_sqlite(&path).unwrap();
         let store = db.store();
         insert_legacy(&store, "Tasmania", "[]", "2026-01-01T00:00:00Z")
     };
 
     // Reopening runs the reconciler, which is where the rewrite lives.
-    let db = Database::open(&path).unwrap();
+    let db = Database::open_on_sqlite(&path).unwrap();
     let store = db.store();
     assert!(get_entity_by_id(&store, &legacy).unwrap().is_none());
     assert!(get_entity_by_name(&store, "tasmania").unwrap().is_some());

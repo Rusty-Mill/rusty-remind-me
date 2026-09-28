@@ -96,7 +96,7 @@ fn start(dir: &std::path::Path, db_path: &std::path::Path) -> Option<WatcherHand
     crate::test_env::set_var(WATCH_DIRS_ENV, dir.display().to_string());
     crate::test_env::set_var("REMIND_ME_WATCH_INTERVAL", "1");
     crate::test_env::set_var("REMIND_ME_WATCH_GRACE", "0");
-    let db = Database::open(db_path).unwrap();
+    let db = Database::open_on_sqlite(db_path).unwrap();
     // Bound rather than passed inline: `db.store()` borrows `db`, and the
     // handle does not, so the connection has to be dropped before `db` goes
     // out of scope at the end of this function.
@@ -193,7 +193,7 @@ fn no_watch_dirs_means_no_loop() {
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_env();
     let db = TempDb::new("nodirs");
-    let database = Database::open(&db.0).unwrap();
+    let database = Database::open_on_sqlite(&db.0).unwrap();
 
     assert!(
         start_watcher_for(&database.store()).is_none(),

@@ -18,7 +18,7 @@ fn db(name: &str) -> Database {
     let dir = std::env::temp_dir().join(format!("rrm_skel_{}_{}", name, std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    Database::open(dir.join("memories.db").display().to_string()).unwrap()
+    Database::open_on_sqlite(dir.join("memories.db").display().to_string()).unwrap()
 }
 
 /// A transcript long enough that reading it is a real cost — 120 turns, each

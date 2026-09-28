@@ -11,12 +11,10 @@
 //! move.
 
 #[cfg(feature = "engine-store")]
-use super::engine::{self, EngineTables};
+use super::engine::{self, EngineLock};
 use super::{Result, Store};
 use crate::db::derived::{write_memory, Origin};
 use crate::models::MemoryRevision;
-#[cfg(feature = "engine-store")]
-use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 
 /// The columns a revision snapshots, in their stored form: tags and metadata
@@ -36,10 +34,10 @@ pub struct Tracked {
 pub struct Revisions<'c> {
     conn: &'c Connection,
     #[cfg(feature = "engine-store")]
-    engine: Option<&'c Mutex<EngineTables>>,
+    engine: Option<&'c EngineLock>,
     /// The tables again when they hold the memories core.
     #[cfg(feature = "engine-store")]
-    core: Option<&'c Mutex<EngineTables>>,
+    core: Option<&'c EngineLock>,
 }
 
 impl<'c> Revisions<'c> {

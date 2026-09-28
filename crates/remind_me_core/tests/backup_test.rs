@@ -81,7 +81,7 @@ fn backup_of_an_in_memory_database_is_refused_clearly() {
 #[test]
 fn backup_lands_beside_the_database_and_round_trips() {
     let tmp = TempDir::new("roundtrip");
-    let db = Database::open(tmp.db_path()).unwrap();
+    let db = Database::open_on_sqlite(tmp.db_path()).unwrap();
     let store = db.store();
     add(&store, "first");
     add(&store, "second");
@@ -108,7 +108,7 @@ fn backup_lands_beside_the_database_and_round_trips() {
 #[test]
 fn a_backup_taken_before_a_write_does_not_contain_it() {
     let tmp = TempDir::new("snapshot");
-    let db = Database::open(tmp.db_path()).unwrap();
+    let db = Database::open_on_sqlite(tmp.db_path()).unwrap();
     let store = db.store();
     add(&store, "before");
 
@@ -126,7 +126,7 @@ fn a_backup_taken_before_a_write_does_not_contain_it() {
 #[test]
 fn successive_backups_do_not_collide_on_filename() {
     let tmp = TempDir::new("collide");
-    let db = Database::open(tmp.db_path()).unwrap();
+    let db = Database::open_on_sqlite(tmp.db_path()).unwrap();
     let store = db.store();
     add(&store, "content");
 
@@ -141,7 +141,7 @@ fn successive_backups_do_not_collide_on_filename() {
 #[test]
 fn retention_prunes_the_oldest_backups() {
     let tmp = TempDir::new("retention");
-    let db = Database::open(tmp.db_path()).unwrap();
+    let db = Database::open_on_sqlite(tmp.db_path()).unwrap();
     let store = db.store();
     add(&store, "content");
 
@@ -170,7 +170,7 @@ fn retention_prunes_the_oldest_backups() {
 #[test]
 fn listing_a_missing_backup_directory_is_empty_not_an_error() {
     let tmp = TempDir::new("missing");
-    let db = Database::open(tmp.db_path()).unwrap();
+    let db = Database::open_on_sqlite(tmp.db_path()).unwrap();
 
     let dir = backup_dir(&db.store()).unwrap();
     assert!(!dir.exists());
@@ -180,7 +180,7 @@ fn listing_a_missing_backup_directory_is_empty_not_an_error() {
 #[test]
 fn a_label_cannot_escape_the_backup_directory() {
     let tmp = TempDir::new("traversal");
-    let db = Database::open(tmp.db_path()).unwrap();
+    let db = Database::open_on_sqlite(tmp.db_path()).unwrap();
     let store = db.store();
     add(&store, "content");
 
@@ -200,7 +200,7 @@ fn a_label_cannot_escape_the_backup_directory() {
 #[test]
 fn an_empty_label_falls_back_rather_than_producing_a_bare_timestamp() {
     let tmp = TempDir::new("emptylabel");
-    let db = Database::open(tmp.db_path()).unwrap();
+    let db = Database::open_on_sqlite(tmp.db_path()).unwrap();
     let store = db.store();
     add(&store, "content");
 
@@ -211,4 +211,20 @@ fn an_empty_label_falls_back_rather_than_producing_a_bare_timestamp() {
         .to_string_lossy()
         .to_string();
     assert!(filename.starts_with("manual-"), "got {}", filename);
+}
+
+#[cfg(feature = "engine-store")]
+#[test]
+fn a_backup_of_a_store_on_the_engine_is_refused_rather_than_stale() {
+    let tmp = TempDir::new("engine_refused");
+    let db = Database::open_on_engine(tmp.db_path()).unwrap();
+    add(&db.store(), "written on the engine");
+
+    let err = create_backup(&db.store(), "manual").unwrap_err();
+
+    assert!(matches!(err, BackupError::NotSqlite), "{err:?}");
+    assert!(err.to_string().contains("on the engine"));
+    assert!(list_backups(&backup_dir(&db.store()).unwrap())
+        .unwrap()
+        .is_empty());
 }

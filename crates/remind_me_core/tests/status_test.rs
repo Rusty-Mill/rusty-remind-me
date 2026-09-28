@@ -159,7 +159,7 @@ fn an_on_disk_database_reports_its_path_and_size() {
 fn backups_are_inventoried_newest_first() {
     let dir = scratch("backups");
     let path = dir.join("memories.db");
-    let db = Database::open(&path).unwrap();
+    let db = Database::open_on_sqlite(&path).unwrap();
     let store = db.store();
     add(&store, "a memory");
 

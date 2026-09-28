@@ -449,6 +449,62 @@ pub fn copy_file(source: &std::path::Path, target_dir: &std::path::Path) -> Resu
     copy_store(&source, &mut target)
 }
 
+/// Copy the SQLite file `source` into the engine directory `dir`, which
+/// must not exist yet. The copy goes into a sibling `.partial` directory
+/// that is renamed to `dir` only once every row copied, so a crash or a
+/// refused row never leaves a half-copied directory where an open would
+/// take it for the store. A `.partial` left by an earlier attempt is
+/// removed first.
+///
+/// # Errors
+///
+/// [`StoreError::Invalid`] when the copy refused a row; the partial copy
+/// is left for inspection and removed by the next attempt.
+pub fn copy_into_place(source: &std::path::Path, dir: &std::path::Path) -> Result<CopyReport> {
+    let mut partial = dir.as_os_str().to_owned();
+    partial.push(".partial");
+    let partial = std::path::PathBuf::from(partial);
+    if partial.exists() {
+        std::fs::remove_dir_all(&partial).map_err(|e| io_error(&partial, &e))?;
+    }
+    let report = copy_file(source, &partial)?;
+    if let Some(first) = report.refused.first() {
+        return Err(StoreError::Invalid(format!(
+            "{} row(s) could not be copied onto the engine, the first from {} [{}]: {}; \
+             {} was left as it was",
+            report.refused.len(),
+            first.table,
+            first.key,
+            first.reason,
+            source.display()
+        )));
+    }
+    std::fs::rename(&partial, dir).map_err(|e| io_error(dir, &e))?;
+    sync_parent(dir)?;
+    Ok(report)
+}
+
+fn io_error(path: &std::path::Path, e: &std::io::Error) -> StoreError {
+    StoreError::Engine(format!("{}: {e}", path.display()))
+}
+
+/// Make the rename of `dir` durable: on Unix a directory entry is only on
+/// disk once its parent directory is synced.
+#[cfg(unix)]
+fn sync_parent(dir: &std::path::Path) -> Result<()> {
+    let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return Ok(());
+    };
+    std::fs::File::open(parent)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| io_error(parent, &e))
+}
+
+#[cfg(not(unix))]
+fn sync_parent(_dir: &std::path::Path) -> Result<()> {
+    Ok(())
+}
+
 /// Refuse a source that is not at this build's schema version: the copy
 /// never migrates it.
 fn check_source(source: &Connection) -> Result<()> {

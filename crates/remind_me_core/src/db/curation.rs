@@ -9,12 +9,10 @@
 //! fan-out ceiling, and the keyset cursor's meaning.
 
 #[cfg(feature = "engine-store")]
-use super::engine::{self, EngineTables};
+use super::engine::{self, EngineLock};
 use super::{Result, Store};
 use crate::db::queries::{parse_memory_row, MEMORY_COLUMNS};
 use crate::models::{ContradictionSide, Memory};
-#[cfg(feature = "engine-store")]
-use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 
 /// A capture that nothing has been decomposed from yet.
@@ -139,7 +137,7 @@ fn contradiction_pairs(max_fanout: i64) -> String {
 pub struct Curation<'c> {
     conn: &'c Connection,
     #[cfg(feature = "engine-store")]
-    core: Option<&'c Mutex<EngineTables>>,
+    core: Option<&'c EngineLock>,
 }
 
 impl<'c> Curation<'c> {

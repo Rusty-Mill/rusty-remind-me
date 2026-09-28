@@ -13,12 +13,10 @@
 //! until the copy tool (ADR-0023 §5).
 
 #[cfg(feature = "engine-store")]
-use super::engine::{self, EngineTables};
+use super::engine::{self, EngineLock};
 use super::{Result, Store};
 use crate::models::{AnalyticsSnapshot, DigestRecentMemory};
 use crate::stats::RecentMemory;
-#[cfg(feature = "engine-store")]
-use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -66,10 +64,10 @@ pub(crate) fn decode_json<T: serde::de::DeserializeOwned + Default>(json: &str) 
 pub struct StoreStats<'c> {
     conn: &'c Connection,
     #[cfg(feature = "engine-store")]
-    engine: Option<&'c Mutex<EngineTables>>,
+    engine: Option<&'c EngineLock>,
     /// The tables again when they hold the memories core.
     #[cfg(feature = "engine-store")]
-    core: Option<&'c Mutex<EngineTables>>,
+    core: Option<&'c EngineLock>,
 }
 
 impl<'c> StoreStats<'c> {

@@ -10,10 +10,8 @@
 //! answered from `db::engine::archives` instead (ADR-0023, phase 4c).
 
 #[cfg(feature = "engine-store")]
-use super::engine::{self, EngineTables};
+use super::engine::{self, EngineLock};
 use super::{Result, Store};
-#[cfg(feature = "engine-store")]
-use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 
 /// Create both tables and the span index, if absent.
@@ -68,7 +66,7 @@ pub struct SpanSource {
 pub struct Archives<'c> {
     conn: &'c Connection,
     #[cfg(feature = "engine-store")]
-    engine: Option<&'c Mutex<EngineTables>>,
+    engine: Option<&'c EngineLock>,
 }
 
 impl<'c> Archives<'c> {

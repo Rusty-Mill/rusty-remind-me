@@ -24,9 +24,8 @@
 //! it did not ask for.
 
 use super::core::{apply, decode, encode, Change, CoreTables};
-use super::{engine_error, EngineTables};
+use super::{engine_error, EngineLock, EngineTables};
 use crate::db::{Result, StoreError};
-use parking_lot::Mutex;
 use rusty_multimodal_db_engine::generic::query::GetById;
 use rusty_multimodal_db_engine::journal::Batch;
 use std::thread::ThreadId;
@@ -207,20 +206,27 @@ impl EngineTables {
 
 /// An open page on shared tables: finished by [`Page::finish`], abandoned
 /// when dropped unfinished (an error or a panic in the work it wraps).
+/// While it is open, every other thread waits at the tables' lock.
 pub(crate) struct Page<'t> {
-    tables: &'t Mutex<EngineTables>,
+    tables: &'t EngineLock,
     open: bool,
 }
 
 impl<'t> Page<'t> {
-    pub(crate) fn begin(tables: &'t Mutex<EngineTables>) -> Result<Self> {
-        tables.lock().begin_page()?;
+    pub(crate) fn begin(tables: &'t EngineLock) -> Result<Self> {
+        tables.claim_page();
+        if let Err(e) = tables.lock().begin_page() {
+            tables.release_page();
+            return Err(e);
+        }
         Ok(Self { tables, open: true })
     }
 
     pub(crate) fn finish(mut self) -> Result<()> {
         self.open = false;
-        self.tables.lock().finish_page()
+        let finished = self.tables.lock().finish_page();
+        self.tables.release_page();
+        finished
     }
 }
 
@@ -234,6 +240,7 @@ impl Drop for Page<'_> {
             // reopening them finishes the rollback from the undo log.
             eprintln!("memories core: abandoning a page failed: {e}");
         }
+        self.tables.release_page();
     }
 }
 
@@ -335,29 +342,33 @@ mod tests {
     }
 
     #[test]
-    fn another_thread_cannot_write_into_a_page() {
-        let tables = Mutex::new(EngineTables::open_temporary().unwrap());
+    fn another_thread_waits_for_the_page_and_then_sees_it_whole() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let tables = EngineLock::new(EngineTables::open_temporary().unwrap());
         let page = Page::begin(&tables).unwrap();
+        vectors::put(&mut tables.lock(), "a", 0, &[1]).unwrap();
+        let wrote = AtomicBool::new(false);
         std::thread::scope(|scope| {
-            scope
-                .spawn(|| {
-                    let refused = vectors::put(&mut tables.lock(), "x", 0, &[1]);
-                    assert!(
-                        matches!(&refused, Err(StoreError::Engine(why)) if why.contains("another thread")),
-                        "{refused:?}"
-                    );
-                })
-                .join()
-                .unwrap();
+            let other = scope.spawn(|| {
+                // Waits at the lock until the page is finished, then sees
+                // both of its writes.
+                let seen = vectors::count(&tables.lock()).unwrap();
+                vectors::put(&mut tables.lock(), "x", 0, &[1]).unwrap();
+                wrote.store(true, Ordering::SeqCst);
+                seen
+            });
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(!wrote.load(Ordering::SeqCst), "the other thread waited");
+            vectors::put(&mut tables.lock(), "b", 0, &[1]).unwrap();
+            page.finish().unwrap();
+            assert_eq!(other.join().unwrap(), 2, "it saw the page whole");
         });
-        vectors::put(&mut tables.lock(), "y", 0, &[1]).unwrap();
-        page.finish().unwrap();
-        assert_eq!(vectors::count(&tables.lock()).unwrap(), 1);
+        assert_eq!(vectors::count(&tables.lock()).unwrap(), 3);
     }
 
     #[test]
     fn a_page_dropped_unfinished_is_abandoned() {
-        let tables = Mutex::new(EngineTables::open_temporary().unwrap());
+        let tables = EngineLock::new(EngineTables::open_temporary().unwrap());
         {
             let _page = Page::begin(&tables).unwrap();
             vectors::put(&mut tables.lock(), "y", 0, &[1]).unwrap();

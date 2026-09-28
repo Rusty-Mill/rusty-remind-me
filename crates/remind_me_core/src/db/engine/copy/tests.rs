@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::db::derived::Origin;
+use crate::db::engine::EngineLock;
 use crate::db::entities::{Entities, RelationRow};
 use crate::db::feedback::{Feedback, FeedbackEvent};
 use crate::db::imports::ImportLedger;
@@ -16,7 +17,6 @@ use crate::db::vectors::Vectors;
 use crate::db::Database;
 use crate::entity::Entity;
 use crate::testing::{self, Table};
-use parking_lot::Mutex;
 
 const T1: &str = "2026-01-01T00:00:00+00:00";
 const T2: &str = "2026-02-01T00:00:00+00:00";
@@ -129,7 +129,7 @@ fn copied(source: &Database) -> (Database, CopyReport) {
     let report = {
         let source = source.store();
         let target = target.store();
-        let tables: &Mutex<EngineTables> = target.core().unwrap();
+        let tables: &EngineLock = target.core().unwrap();
         let report = copy_core(source.sqlite().unwrap(), &mut tables.lock()).unwrap();
         report
     };
@@ -464,7 +464,7 @@ fn copied_store(source: &Database) -> (Database, CopyReport) {
     let report = {
         let source = source.store();
         let target = target.store();
-        let tables: &Mutex<EngineTables> = target.engine().unwrap();
+        let tables: &EngineLock = target.engine().unwrap();
         let report = copy_store(source.sqlite().unwrap(), &mut tables.lock()).unwrap();
         report
     };

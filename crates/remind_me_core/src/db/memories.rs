@@ -9,14 +9,12 @@
 //! handed over as a [`NewMemory`] or a field value.
 
 #[cfg(feature = "engine-store")]
-use super::engine::{self, EngineTables};
+use super::engine::{self, EngineLock};
 use super::{Result, Store};
 use crate::db::derived::{memory_ids, write_memory, Origin};
 use crate::db::queries::{parse_memory_row, prefixed_memory_columns, MEMORY_COLUMNS};
 use crate::models::{Memory, UnannotatedMemory, UnclassifiedMemory};
 use crate::vitality::EFFECTIVE_VITALITY_FN;
-#[cfg(feature = "engine-store")]
-use parking_lot::Mutex;
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde_json::Value;
@@ -294,7 +292,7 @@ pub(crate) fn tags_json(tags: &[String]) -> String {
 pub struct Memories<'c> {
     conn: &'c Connection,
     #[cfg(feature = "engine-store")]
-    core: Option<&'c Mutex<EngineTables>>,
+    core: Option<&'c EngineLock>,
 }
 
 /// Answer from the engine's memories core when the repository has it.

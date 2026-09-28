@@ -102,12 +102,12 @@ fn the_series_is_oldest_first() {
 #[test]
 fn a_malformed_stored_value_does_not_take_the_chart_down() {
     // A malformed value can only be planted with SQL, so this runs on an
-    // on-disk database, which is always SQLite; the decoding it relies on is
-    // shared with the engine and unit-tested in `db::stats`.
+    // on-disk SQLite database; the decoding it relies on is shared with the
+    // engine and unit-tested in `db::stats`.
     let dir = std::env::temp_dir().join(format!("rrm_analytics_malformed_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let db = Database::open(dir.join("memory.db")).unwrap();
+    let db = Database::open_on_sqlite(dir.join("memory.db")).unwrap();
     let store = db.store();
     store
         .sqlite()

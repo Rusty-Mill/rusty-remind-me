@@ -12,10 +12,8 @@
 //! integration tests beside it.
 
 #[cfg(feature = "engine-store")]
-use crate::db::engine::{self, EngineTables};
+use crate::db::engine::{self, EngineLock};
 use crate::db::{Result, Store, StoreError};
-#[cfg(feature = "engine-store")]
-use parking_lot::Mutex;
 use rusqlite::types::Value as SqlValue;
 use rusqlite::OptionalExtension;
 pub use serde_json::Value;
@@ -101,7 +99,7 @@ fn memory_column_name(column: &str) -> Result<&str> {
 }
 
 #[cfg(feature = "engine-store")]
-fn core<'s>(store: &'s Store<'_>) -> Option<&'s Mutex<EngineTables>> {
+fn core<'s>(store: &'s Store<'_>) -> Option<&'s EngineLock> {
     store.core()
 }
 

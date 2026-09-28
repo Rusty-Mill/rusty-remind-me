@@ -7,10 +7,8 @@
 //! size, how relatives are grouped and capped.
 
 #[cfg(feature = "engine-store")]
-use super::engine::{self, EngineTables};
+use super::engine::{self, EngineLock};
 use super::{Result, Store};
-#[cfg(feature = "engine-store")]
-use parking_lot::Mutex;
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{params, params_from_iter, Connection};
 
@@ -62,7 +60,7 @@ fn twice(ids: &[String]) -> Vec<SqlValue> {
 pub struct Related<'c> {
     conn: &'c Connection,
     #[cfg(feature = "engine-store")]
-    core: Option<&'c Mutex<EngineTables>>,
+    core: Option<&'c EngineLock>,
 }
 
 impl<'c> Related<'c> {

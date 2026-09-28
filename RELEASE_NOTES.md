@@ -2,6 +2,17 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-28 — An on-disk node opens on the engine (ADR-0023, phase 5.3)
+
+### Added
+- With `engine-store` and `REMIND_ME_STORE=engine`, `Database::open` keeps the node's store in the engine directory beside its file (`memory.db` has `memory.engine`). The first open copies the SQLite file there, into a `.partial` directory that is renamed into place only once every row copied. A refused row stops the open and leaves the file as it was.
+- `Database::open_on_sqlite` and `Database::open_on_engine`, which pick a backend whatever `REMIND_ME_STORE` says.
+
+### Changed
+- A background thread that writes while an import holds a page open now waits for the page to finish instead of being refused.
+- Without the engine, `Database::open` refuses a file whose store has been copied onto the engine, since that file stopped changing at the copy.
+- `remind_me_backup` refuses a store on the engine instead of backing up its SQLite file, which stopped changing at the copy. Engine backups follow in the next step.
+
 ## 2026-09-28 — Copy a whole node store onto the engine, and `copy-store` (ADR-0023, phase 5.2)
 
 ### Added

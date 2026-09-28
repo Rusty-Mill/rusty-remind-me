@@ -8,10 +8,8 @@
 //! limit, and the response shapes.
 
 #[cfg(feature = "engine-store")]
-use super::engine::{self, EngineTables};
+use super::engine::{self, EngineLock};
 use super::{Result, Store};
-#[cfg(feature = "engine-store")]
-use parking_lot::Mutex;
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 
@@ -80,7 +78,7 @@ fn entity_record(row: &rusqlite::Row) -> rusqlite::Result<Value> {
 pub struct SyncFeed<'c> {
     conn: &'c Connection,
     #[cfg(feature = "engine-store")]
-    core: Option<&'c Mutex<EngineTables>>,
+    core: Option<&'c EngineLock>,
 }
 
 impl<'c> SyncFeed<'c> {

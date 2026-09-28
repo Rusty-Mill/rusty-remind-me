@@ -8,10 +8,8 @@
 //! that demotion is a read-time judgement.
 
 #[cfg(feature = "engine-store")]
-use super::engine::{self, EngineTables};
+use super::engine::{self, EngineLock};
 use super::{Result, Store};
-#[cfg(feature = "engine-store")]
-use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 
 /// Create the `promotions` table and its index, if absent.
@@ -108,7 +106,7 @@ const READY_SCENARIOS: &str = "FROM memories m
 pub struct Promotions<'c> {
     conn: &'c Connection,
     #[cfg(feature = "engine-store")]
-    core: Option<&'c Mutex<EngineTables>>,
+    core: Option<&'c EngineLock>,
 }
 
 impl<'c> Promotions<'c> {

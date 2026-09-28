@@ -653,8 +653,11 @@ cargo build --release -p rusty-remind-me --features engine-store
 rusty-remind-me copy-store --to ~/.remind-me/engine            # from the configured database
 rusty-remind-me copy-store --from old.db --to ./engine-copy    # from another file
 ```
-The node does not run on the copy yet; that is the next step of ADR-0023's
-phase 5.
+A node can also run on the engine directly: with `REMIND_ME_STORE=engine`
+set for a build with the feature, the first open copies `memory.db` into
+`memory.engine` beside it and every later open uses that directory. Once
+copied, the SQLite file is kept as it was but refused by a node without
+the engine, since it no longer changes.
 
 ## REST API Endpoints
 

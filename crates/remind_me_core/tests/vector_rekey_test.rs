@@ -118,7 +118,7 @@ fn table_exists(store: &Store<'_>, name: &str) -> bool {
 fn opening_a_v29_database_rekeys_every_chunk_onto_its_memory_id() {
     let tmp = TempDb::new("carry");
     {
-        let db = Database::open(tmp.path()).unwrap();
+        let db = Database::open_on_sqlite(tmp.path()).unwrap();
         let store = db.store();
         let a = add_memory(&store, "mem_a");
         let b = add_memory(&store, "mem_b");
@@ -131,7 +131,7 @@ fn opening_a_v29_database_rekeys_every_chunk_onto_its_memory_id() {
         put_v29_chunk(&store, 999, 0, &[4, 0, 0, 0]);
     }
 
-    let db = Database::open(tmp.path()).unwrap();
+    let db = Database::open_on_sqlite(tmp.path()).unwrap();
     let store = db.store();
     let version: i32 = store
         .sqlite()
@@ -165,15 +165,15 @@ fn opening_a_v29_database_rekeys_every_chunk_onto_its_memory_id() {
 fn the_rekey_runs_once_and_later_opens_leave_the_chunks_alone() {
     let tmp = TempDb::new("idempotent");
     {
-        let db = Database::open(tmp.path()).unwrap();
+        let db = Database::open_on_sqlite(tmp.path()).unwrap();
         let store = db.store();
         let a = add_memory(&store, "mem_a");
         downgrade_vectors_to_v29(&store);
         put_v29_chunk(&store, a, 0, &[1, 0, 0, 0]);
     }
-    drop(Database::open(tmp.path()).unwrap());
+    drop(Database::open_on_sqlite(tmp.path()).unwrap());
 
-    let db = Database::open(tmp.path()).unwrap();
+    let db = Database::open_on_sqlite(tmp.path()).unwrap();
     assert_eq!(Vectors::new(&db.store()).count().unwrap(), 1);
 }
 
@@ -181,7 +181,7 @@ fn the_rekey_runs_once_and_later_opens_leave_the_chunks_alone() {
 fn a_database_from_a_newer_build_is_refused_and_left_untouched() {
     let tmp = TempDb::new("newer");
     {
-        let db = Database::open(tmp.path()).unwrap();
+        let db = Database::open_on_sqlite(tmp.path()).unwrap();
         let store = db.store();
         add_memory(&store, "mem_a");
         store
@@ -191,7 +191,7 @@ fn a_database_from_a_newer_build_is_refused_and_left_untouched() {
             .unwrap();
     }
 
-    let err = Database::open(tmp.path())
+    let err = Database::open_on_sqlite(tmp.path())
         .err()
         .expect("a newer database must be refused");
     assert!(err.to_string().contains("9999"), "{err}");

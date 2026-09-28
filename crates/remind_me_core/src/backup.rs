@@ -29,8 +29,12 @@ pub enum BackupError {
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
     Store(#[from] crate::db::StoreError),
-    /// Backups copy the SQLite file, and this store is not one.
-    #[error("this store is not SQLite, so it has no database file to back up")]
+    /// Backups copy the SQLite file, and this store is not one: it is on
+    /// the engine, whose backups are not built yet (ADR-0023, phase 5).
+    #[error(
+        "this store is on the engine, and backups only copy a SQLite store so far; \
+         its SQLite file stopped changing when it was copied onto the engine"
+    )]
     NotSqlite,
     #[error("{path}: {source}")]
     Io {
@@ -153,6 +157,12 @@ fn prune_old_backups(dir: &Path, keep: usize) -> Result<usize> {
 /// a write primitive pointed anywhere on disk.
 pub fn create_backup(store: &Store<'_>, label: &str) -> Result<BackupOutcome> {
     let dir = backup_dir(store)?;
+    // The SQLite file of a store on the engine stopped changing when it was
+    // copied there, so a backup of it would silently miss every later write.
+    #[cfg(feature = "engine-store")]
+    if store.engine().is_some() {
+        return Err(BackupError::NotSqlite);
+    }
     std::fs::create_dir_all(&dir).map_err(|source| BackupError::Io {
         path: dir.clone(),
         source,

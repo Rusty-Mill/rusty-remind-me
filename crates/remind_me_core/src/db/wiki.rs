@@ -12,12 +12,10 @@
 //! index being the engine's own, rebuilt from the pages at open.
 
 #[cfg(feature = "engine-store")]
-use super::engine::{self, EngineTables};
+use super::engine::{self, EngineLock};
 use super::{Result, Store};
 use crate::db::derived::write_wiki_page;
 use crate::wiki::{WikiPage, WikiSearchHit};
-#[cfg(feature = "engine-store")]
-use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use std::collections::HashMap;
 
@@ -45,7 +43,7 @@ pub struct PageSummary {
 pub struct WikiIndex<'c> {
     conn: &'c Connection,
     #[cfg(feature = "engine-store")]
-    engine: Option<&'c Mutex<EngineTables>>,
+    engine: Option<&'c EngineLock>,
 }
 
 impl<'c> WikiIndex<'c> {

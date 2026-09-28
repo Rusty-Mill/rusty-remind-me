@@ -182,7 +182,7 @@ fn an_older_databases_triggers_are_dropped_on_open() {
 
     // Raw SQL below: this is about SQLite triggers in an on-disk file.
     let id = {
-        let db = Database::open(&path).unwrap();
+        let db = Database::open_on_sqlite(&path).unwrap();
         let store = db.store();
         let id = add(&store, "quokka sighting");
 
@@ -217,7 +217,7 @@ fn an_older_databases_triggers_are_dropped_on_open() {
         id
     };
 
-    let db = Database::open(&path).unwrap();
+    let db = Database::open_on_sqlite(&path).unwrap();
     let store = db.store();
     store
         .sqlite()
@@ -349,7 +349,7 @@ fn opening_a_database_prunes_it() {
     let _ = std::fs::remove_file(&path);
 
     {
-        let db = Database::open(&path).unwrap();
+        let db = Database::open_on_sqlite(&path).unwrap();
         let store = db.store();
         add(&store, "old memory");
         backdate_outbox(&store, DEFAULT_OUTBOX_RETENTION_DAYS + 1);
@@ -357,7 +357,7 @@ fn opening_a_database_prunes_it() {
     }
 
     // Open is the only cycle this crate has, so it is where the rule runs.
-    let db = Database::open(&path).unwrap();
+    let db = Database::open_on_sqlite(&path).unwrap();
     assert_eq!(outbox_rows(&db.store()), 0);
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -372,7 +372,7 @@ fn a_realistic_mix_of_traffic_stays_bounded() {
     let _ = std::fs::remove_file(&path);
 
     {
-        let db = Database::open(&path).unwrap();
+        let db = Database::open_on_sqlite(&path).unwrap();
         let store = db.store();
         for i in 0..10 {
             add(&store, &format!("quokka memory {}", i));
@@ -391,7 +391,7 @@ fn a_realistic_mix_of_traffic_stays_bounded() {
         );
     }
 
-    let db = Database::open(&path).unwrap();
+    let db = Database::open_on_sqlite(&path).unwrap();
     assert_eq!(
         outbox_rows(&db.store()),
         0,

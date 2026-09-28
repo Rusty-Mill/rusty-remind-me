@@ -8,12 +8,10 @@
 //! [`crate::recalibrate`], which passes its thresholds in.
 
 #[cfg(feature = "engine-store")]
-use super::engine::{self, EngineTables};
+use super::engine::{self, EngineLock};
 use super::{Result, Store};
 use crate::db::derived::{write_memory, Origin};
 use crate::models::RecalibrateCandidate;
-#[cfg(feature = "engine-store")]
-use parking_lot::Mutex;
 use rusqlite::{params, params_from_iter, Connection};
 
 /// The importance columns of a live memory, as a global judgement reads
@@ -52,7 +50,7 @@ pub struct ReviewFilter<'a> {
 pub struct Feedback<'c> {
     conn: &'c Connection,
     #[cfg(feature = "engine-store")]
-    core: Option<&'c Mutex<EngineTables>>,
+    core: Option<&'c EngineLock>,
 }
 
 impl<'c> Feedback<'c> {

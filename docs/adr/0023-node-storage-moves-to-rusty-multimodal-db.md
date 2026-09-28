@@ -1262,8 +1262,57 @@ Phase 5 ships in four PRs:
     of the CLI copied a store it had written, then refused a second copy
     into the filled target.
 
-**Next:** 5.3, `Database::open` on the engine for an on-disk node:
-copying on first open, and background writers waiting on a page.
+**5.3, done: `Database::open` on the engine, and writers wait on a page.**
+
+- A page now makes other threads wait rather than refusing them. The
+  engine handle is an `EngineLock`: the tables' mutex behind a page gate.
+  A thread that locks the tables first waits while another thread holds a
+  page open, as a second SQLite writer waits on a transaction, and then
+  sees the page whole or not at all. The lock order is the gate, then the
+  tables, and nothing that holds the tables waits on the gate.
+- With `engine-store` and `REMIND_ME_STORE=engine`, `Database::open(path)`
+  keeps the store in the engine directory beside the file, `memory.db`
+  having `memory.engine` (`db::engine_dir`).
+  - The first open copies the file there with `copy_into_place`. The copy
+    fills `memory.engine.partial` and renames it into place only once
+    every row copied, then syncs the parent directory. A partial copy left
+    by a crash is removed and the copy redone. A refused row stops the
+    open with the first refusal named, and the file is left as it was.
+  - The copy runs under SQLite's write lock (`BEGIN IMMEDIATE`, rolled
+    back after), so no other process writes a row the copy has already
+    passed, and a second process opening the same file waits, then finds
+    the copy done.
+  - Later opens use the directory as it is. Background threads already
+    reach the engine through `SecondarySource`.
+- Without the engine, `Database::open` refuses a file whose store has
+  moved: its rows stopped changing at the copy. `open_on_sqlite` and
+  `open_on_engine` pick a backend whatever `REMIND_ME_STORE` says.
+  `Database::open(":memory:")` on the engine is the in-memory engine
+  database, as `:memory:` is in-memory SQLite.
+- Backups copy the SQLite file, which on the engine stopped changing at
+  the copy. So `create_backup` refuses a store on the engine
+  (`BackupError::NotSqlite`) rather than write a stale backup. Backups of
+  the engine directory come before 5.4 makes the engine the default.
+- The engine directory's lock is held by one process. The CLI already
+  reaches the store through the daemon and opens it directly only as a
+  fallback; on the engine, a second direct opener gets "in use by another
+  process" where SQLite let both in. 5.4 has to keep every opener behind
+  the daemon.
+- Tests:
+  - A second thread waits for a page and then sees it whole.
+  - The first open copies and later opens keep the engine's writes while
+    the file stays as copied; the file is refused without the engine; a
+    stale partial copy is redone; a refused row leaves no engine store;
+    and a background thread's store writes to the engine.
+  - The engine test leg now opens on-disk test databases on the engine
+    too. Tests that plant or inspect rows with SQL, or open one file twice
+    in one process (a loop's handle and an observer's), assumed that an
+    on-disk database was SQLite; they now say so with `open_on_sqlite`,
+    which keeps exactly the coverage they had.
+
+**Next:** 5.4, the engine as the default: backups of the engine
+directory, `engine-store` on by default and the engine the default store,
+so a node copies itself on its first start with the new build.
 
 ## Related
 

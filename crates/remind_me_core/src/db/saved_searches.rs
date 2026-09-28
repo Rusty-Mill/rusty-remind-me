@@ -11,11 +11,9 @@
 //! from `db::engine::saved_searches` instead of these statements.
 
 #[cfg(feature = "engine-store")]
-use super::engine::{self, EngineTables};
+use super::engine::{self, EngineLock};
 use super::{Result, Store};
 use crate::models::{SavedSearch, SavedSearchFilters};
-#[cfg(feature = "engine-store")]
-use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashSet;
 
@@ -25,7 +23,7 @@ const SELECT_COLUMNS: &str = "id, name, query, filters, watch, created_at, updat
 pub struct SavedSearches<'c> {
     conn: &'c Connection,
     #[cfg(feature = "engine-store")]
-    engine: Option<&'c Mutex<EngineTables>>,
+    engine: Option<&'c EngineLock>,
 }
 
 impl<'c> SavedSearches<'c> {

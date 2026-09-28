@@ -8,10 +8,8 @@
 //! decodes.
 
 #[cfg(feature = "engine-store")]
-use super::engine::{self, EngineTables};
+use super::engine::{self, EngineLock};
 use super::{Result, Store};
-#[cfg(feature = "engine-store")]
-use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 
 /// SQLite's clock as an RFC 3339 timestamp with microseconds, the shape
@@ -33,7 +31,7 @@ pub struct OutboxEntry {
 pub struct Outbox<'c> {
     conn: &'c Connection,
     #[cfg(feature = "engine-store")]
-    core: Option<&'c Mutex<EngineTables>>,
+    core: Option<&'c EngineLock>,
 }
 
 impl<'c> Outbox<'c> {

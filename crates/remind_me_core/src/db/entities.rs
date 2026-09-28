@@ -10,12 +10,10 @@
 //! core keeps the graph there (`db::engine::graph`, ADR-0023 core PR 3a).
 
 #[cfg(feature = "engine-store")]
-use super::engine::{self, EngineTables};
+use super::engine::{self, EngineLock};
 use super::{Result, Store};
 use crate::db::derived::{queue_entity, queue_link, queue_relation, GraphOutbox, Origin};
 use crate::entity::{Entity, EntityFact, EntityLinkedMemory, EntityListItem, RelationEdge};
-#[cfg(feature = "engine-store")]
-use parking_lot::Mutex;
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
 
@@ -75,7 +73,7 @@ pub struct Entities<'c> {
     /// Where writes queue their outbox entries on SQLite.
     outbox: GraphOutbox<'c>,
     #[cfg(feature = "engine-store")]
-    core: Option<&'c Mutex<EngineTables>>,
+    core: Option<&'c EngineLock>,
 }
 
 impl<'c> Entities<'c> {

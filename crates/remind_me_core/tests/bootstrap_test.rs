@@ -29,7 +29,7 @@ fn db(name: &str) -> Database {
     let dir = std::env::temp_dir().join(format!("rrm_boot_{}_{}", name, std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    Database::open(dir.join("memories.db").display().to_string()).unwrap()
+    Database::open_on_sqlite(dir.join("memories.db").display().to_string()).unwrap()
 }
 
 fn seed(store: &Store<'_>, id: &str, content: &str, category: &str, sensitive: bool) {
