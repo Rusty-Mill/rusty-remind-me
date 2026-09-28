@@ -643,21 +643,30 @@ The daemon writes `<db>.daemon.json`, `<db>.daemon.token` (mode 600) and
 `<db>.daemon.log` beside the database (`remind_me.db.daemon.json` and so on),
 and holds `<db>.daemon.lock` while it runs.
 
-### 12. Copy the Store onto the Engine (preview)
-A build with the `engine-store` feature can copy the SQLite store into an
-engine data directory (ADR-0023). The source is only read, every id is
-kept, and every row is verified after it is written. If any row cannot be
-copied, the command lists it and exits non-zero rather than dropping it.
+### 12. The Engine Store
+The node's store is the engine (ADR-0023). On the first start with a build
+that has it, `memory.db` is copied into `memory.engine` beside it: every id
+is kept, every row is verified after it is written, and if any row cannot
+be copied the node refuses to start and says which, leaving `memory.db` as
+it was. Every later start uses `memory.engine`. The SQLite file is kept as
+it was at the copy; a node on SQLite refuses it rather than serve stale
+data.
+
+- `REMIND_ME_STORE=sqlite` keeps a node on SQLite. To go back after the
+  copy, move `memory.engine` aside first: the node then runs on
+  `memory.db` as it was at the copy.
+- Only one process opens the engine store, so the store daemon (§11)
+  serves every client. A client that cannot use a running daemon says why
+  and that `rusty-remind-me daemon stop` releases the store.
+- Backups of an engine store are `backups/*.engine` directories holding
+  both halves; restoring is putting them back.
+
+`copy-store` copies a SQLite store into a separate engine directory without
+touching the node, for trying the engine on a copy first:
 ```bash
-cargo build --release -p rusty-remind-me --features engine-store
-rusty-remind-me copy-store --to ~/.remind-me/engine            # from the configured database
+rusty-remind-me copy-store --to ./engine-copy                  # from the configured database
 rusty-remind-me copy-store --from old.db --to ./engine-copy    # from another file
 ```
-A node can also run on the engine directly: with `REMIND_ME_STORE=engine`
-set for a build with the feature, the first open copies `memory.db` into
-`memory.engine` beside it and every later open uses that directory. Once
-copied, the SQLite file is kept as it was but refused by a node without
-the engine, since it no longer changes.
 
 ## REST API Endpoints
 

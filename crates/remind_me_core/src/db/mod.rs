@@ -214,10 +214,10 @@ pub struct Database {
 impl Database {
     /// A database that lives only as long as this value.
     ///
-    /// With the `engine-store` feature and `REMIND_ME_STORE=engine`, the
-    /// groups moved so far live in temporary engine tables: that is how the
-    /// test suite runs against both backends. Otherwise, and in every
-    /// default build, it is in-memory SQLite.
+    /// On the engine (the default with the `engine-store` feature), the
+    /// store lives in temporary engine tables; with `REMIND_ME_STORE=sqlite`,
+    /// or in a build without the feature, it is in-memory SQLite. That
+    /// variable is how the test suite runs against both backends.
     pub fn open_in_memory() -> Result<Self> {
         #[cfg(feature = "engine-store")]
         if engine::engine_selected() {
@@ -255,9 +255,10 @@ impl Database {
 
     /// The database in the SQLite file at `path`.
     ///
-    /// With the `engine-store` feature and `REMIND_ME_STORE=engine`, the
-    /// store lives in the engine directory beside the file (see
-    /// [`engine_dir`]), copied from the file on the first such open. A file
+    /// On the engine (the default with the `engine-store` feature, unless
+    /// `REMIND_ME_STORE=sqlite`), the store lives in the engine directory
+    /// beside the file (see [`engine_dir`]), copied from the file on the
+    /// first such open. A file
     /// whose store has moved there is refused without the engine: its rows
     /// stopped changing at the copy.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
@@ -286,9 +287,12 @@ impl Database {
         let dir = engine_dir(path);
         if dir.exists() {
             return Err(StoreError::Invalid(format!(
-                "the store in {} was copied onto the engine in {}; open it \
-                 with a build that has the engine store and REMIND_ME_STORE=engine",
+                "the store in {} was copied onto the engine in {}, and the file has not \
+                 changed since. Open it on the engine (a build with the engine store, \
+                 without REMIND_ME_STORE=sqlite); to go back to SQLite as of the copy, \
+                 move {} aside first",
                 path.display(),
+                dir.display(),
                 dir.display()
             )));
         }

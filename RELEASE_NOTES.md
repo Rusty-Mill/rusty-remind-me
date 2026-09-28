@@ -2,6 +2,13 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-28 — The engine is the default store (ADR-0023, phase 5.4b)
+
+### Changed
+- The node's store is now the engine. On the first start with this build, `memory.db` is copied into `memory.engine` beside it, keeping every id and verifying every row; if any row cannot be copied the start fails, names it, and leaves `memory.db` untouched. `engine-store` is now a default feature.
+- `REMIND_ME_STORE=sqlite` keeps a node on SQLite. After the copy, move `memory.engine` aside first to go back to `memory.db` as it was at the copy.
+- A client that cannot use a running daemon now says that the daemon holds the store and that `rusty-remind-me daemon stop` releases it, instead of a bare "in use by another process".
+
 ## 2026-09-28 — The store daemon is on by default (ADR-0023, phase 2b)
 
 ### Changed

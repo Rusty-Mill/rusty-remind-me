@@ -69,11 +69,11 @@ symphonia = { version = "0.6", optional = true, default-features = false, featur
 remind_me_hub = { path = "../remind_me_hub", default-features = false }
 
 [features]
-default = []
-# The engine-backed store, one table group at a time (ADR-0023, phase 4).
-# Off by default until phase 5. With it on, `REMIND_ME_STORE=engine` makes
-# `Database::open_in_memory` keep the groups moved so far in the engine, so
-# the test suite runs against both backends.
+default = ["engine-store"]
+# The engine-backed store (ADR-0023). On by default since phase 5.4b: the
+# node's store is the engine unless `REMIND_ME_STORE=sqlite`, and the first
+# open copies an existing SQLite store onto it. Built without it, a node
+# runs on SQLite as before.
 engine-store = ["dep:rusty_multimodal_db_engine"]
 # PDF text extraction. Optional so a build that does not want a PDF parser
 # does not carry one (71 transitive crates), matching the reference's own

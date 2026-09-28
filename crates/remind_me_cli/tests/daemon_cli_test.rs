@@ -87,6 +87,12 @@ impl Drop for Scratch {
     }
 }
 
+/// Whether the binary under test keeps its store on the engine: its
+/// default, unless `REMIND_ME_STORE=sqlite` (which it inherits).
+fn on_engine() -> bool {
+    !std::env::var("REMIND_ME_STORE").is_ok_and(|v| v.trim().eq_ignore_ascii_case("sqlite"))
+}
+
 #[test]
 fn cli_commands_through_the_daemon_print_what_they_print_in_process() {
     let store = Scratch::new("cli");
@@ -105,16 +111,20 @@ fn cli_commands_through_the_daemon_print_what_they_print_in_process() {
         .expect("the first client started a daemon");
     assert_ne!(status["pid"], std::process::id());
 
-    // The same bytes either way; in-process still works beside the daemon.
-    for args in [
+    // The same bytes either way. The engine store has one opener, so the
+    // daemon lets go of it before the in-process runs.
+    let commands = [
         &["list", "--json"][..],
         &["list"][..],
         &["search", "store", "--json"][..],
         &["get", added.trim().trim_start_matches("Added memory: ")][..],
-    ] {
+    ];
+    let through_daemon: Vec<String> = commands.iter().map(|a| store.run_ok(true, a)).collect();
+    assert_eq!(store.run_ok(false, &["daemon", "stop"]).trim(), "stopped");
+    for (args, via_daemon) in commands.iter().zip(&through_daemon) {
         assert_eq!(
-            store.run_ok(true, args),
-            store.run_ok(false, args),
+            via_daemon,
+            &store.run_ok(false, args),
             "{args:?} differs through the daemon"
         );
     }
@@ -140,15 +150,22 @@ fn a_client_with_other_settings_falls_back_and_says_why() {
         .args(["list", "--json"])
         .output()
         .unwrap();
-    assert!(out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("not using the store daemon"), "{stderr}");
     assert!(
         stderr.contains("REMIND_ME_OUTBOX_RETENTION_DAYS"),
         "{stderr}"
     );
-    let listed: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(listed["total"], 1, "the fallback still sees the store");
+    if on_engine() {
+        // The daemon holds the engine store, so the fallback cannot open
+        // it beside the daemon: it fails, and says how to release it.
+        assert!(!out.status.success());
+        assert!(stderr.contains("rusty-remind-me daemon stop"), "{stderr}");
+    } else {
+        assert!(out.status.success(), "{stderr}");
+        let listed: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(listed["total"], 1, "the fallback still sees the store");
+    }
 
     // A per-session setting is not a mismatch.
     let out = store
@@ -202,7 +219,7 @@ fn mcp_over_stdio_relays_to_the_daemon_with_its_own_session() {
     drop(stdin);
     assert!(server.wait().unwrap().success());
 
-    let listed: Value = serde_json::from_str(&store.run_ok(false, &["list", "--json"])).unwrap();
+    let listed: Value = serde_json::from_str(&store.run_ok(true, &["list", "--json"])).unwrap();
     let memory = &listed["memories"][0];
     assert_eq!(memory["content"], "written over MCP through the daemon");
     // The handshake identity of this session, not the daemon's environment

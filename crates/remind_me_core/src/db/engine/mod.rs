@@ -34,7 +34,7 @@ pub(crate) mod vectors;
 pub(crate) mod wiki;
 
 use super::StoreError;
-use rusty_multimodal_db_engine::dir_lock::DirLock;
+use rusty_multimodal_db_engine::dir_lock::{DirLock, DirLockError};
 use rusty_multimodal_db_engine::durability::DurabilityError;
 use rusty_multimodal_db_engine::generic::mmap_field::MmapFieldValue;
 use rusty_multimodal_db_engine::generic::traits::{
@@ -113,8 +113,8 @@ impl fmt::Debug for EngineLock {
     }
 }
 
-/// The environment variable that picks the backend for
-/// [`super::Database::open_in_memory`]: `engine` or unset (SQLite).
+/// The environment variable that picks the node's store: `sqlite`, or
+/// anything else for the engine (the default).
 pub const STORE_ENV: &str = "REMIND_ME_STORE";
 
 /// The lock file inside the data directory, held while the tables are open.
@@ -170,7 +170,7 @@ impl EngineTables {
     /// [`StoreError::Engine`] if another process holds `dir`, or a store in
     /// it cannot be opened.
     pub fn open(dir: &Path) -> super::Result<Self> {
-        let lock = DirLock::acquire(dir, LOCK_FILE).map_err(engine_error)?;
+        let lock = DirLock::acquire(dir, LOCK_FILE).map_err(lock_error)?;
         let opened = Journal::open(&dir.join(JOURNAL_FILE)).map_err(engine_error)?;
         let undo = Journal::open(&dir.join(page::UNDO_FILE)).map_err(engine_error)?;
         let core = core::CoreTables::open(dir)?;
@@ -292,9 +292,29 @@ pub(crate) fn core_mut(tables: &mut EngineTables) -> super::Result<&mut core::Co
     Ok(&mut tables.core)
 }
 
-/// Whether `REMIND_ME_STORE` asks for the engine.
+/// The error for a directory lock that could not be taken. When another
+/// process holds it, name the usual holder and how to release it: on the
+/// engine a node has one opener, and a client that could not use the
+/// daemon lands here.
+fn lock_error(e: DirLockError) -> StoreError {
+    match e {
+        DirLockError::Held(_) => StoreError::Engine(format!(
+            "{e}. Another rusty-remind-me process holds this node's store, usually the \
+             store daemon; `rusty-remind-me daemon stop` releases it"
+        )),
+        other => engine_error(other),
+    }
+}
+
+/// Whether the node's store is the engine: always, unless `REMIND_ME_STORE`
+/// asks for SQLite.
 pub(crate) fn engine_selected() -> bool {
-    std::env::var(STORE_ENV).is_ok_and(|v| v.trim().eq_ignore_ascii_case("engine"))
+    engine_selected_from(std::env::var(STORE_ENV).ok().as_deref())
+}
+
+/// [`engine_selected`] with the value injected, for tests.
+fn engine_selected_from(value: Option<&str>) -> bool {
+    !value.is_some_and(|v| v.trim().eq_ignore_ascii_case("sqlite"))
 }
 
 /// The engine id for the node's string id `id`.
@@ -428,6 +448,16 @@ mod open_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_engine_is_the_store_unless_sqlite_is_asked_for() {
+        for engine in [None, Some(""), Some("engine"), Some("ENGINE")] {
+            assert!(engine_selected_from(engine), "{engine:?}");
+        }
+        for sqlite in ["sqlite", " SQLite "] {
+            assert!(!engine_selected_from(Some(sqlite)), "{sqlite}");
+        }
+    }
 
     #[test]
     fn engine_ids_are_stable() {

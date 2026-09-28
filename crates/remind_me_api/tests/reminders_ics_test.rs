@@ -51,13 +51,8 @@ fn seed_reminder(store: &Store<'_>, content: &str, remind_at: &str) -> String {
         },
     )
     .unwrap();
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET remind_at = ? WHERE id = ?",
-            rusqlite::params![remind_at, &memory.id],
-        )
+    remind_me_core::db::reminders::Reminders::new(store)
+        .set_remind_at(&memory.id, Some(remind_at), &memory.updated_at)
         .unwrap();
     memory.id
 }
@@ -230,13 +225,8 @@ fn a_deleted_memorys_reminder_never_reaches_the_feed() {
     with_token(|| {
         let (srv, root) = seeded_server("ics-deleted", |store| {
             let id = seed_reminder(store, "deleted but scheduled", &future());
-            store
-                .sqlite()
-                .unwrap()
-                .execute(
-                    "UPDATE memories SET deleted_at = ? WHERE id = ?",
-                    rusqlite::params![offset_hours(-1), &id],
-                )
+            remind_me_core::db::memories::Memories::new(store)
+                .delete_live(&id, Some(&offset_hours(-1)))
                 .unwrap();
         });
 

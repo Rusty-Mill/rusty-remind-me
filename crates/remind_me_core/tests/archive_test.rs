@@ -80,7 +80,7 @@ fn memory_ids(store: &Store<'_>) -> Vec<String> {
     ids
 }
 
-/// In memory, so `REMIND_ME_STORE=engine` runs these against the engine:
+/// In memory, so these run on whichever backend `REMIND_ME_STORE` picks:
 /// the archive blobs still go to a real directory.
 fn open() -> Database {
     Database::open_in_memory().unwrap()

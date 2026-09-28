@@ -1,6 +1,6 @@
 # ADR-0023: The node's storage moves to rusty_multimodal_db
 
-Status: Proposed
+Status: Accepted. Phases 0–5 done (2026-09-28); phase 6, removing the SQLite store, not started
 Date: 2026-09-26
 
 ## Context
@@ -1339,13 +1339,38 @@ Phase 5 ships in four PRs:
 - Tests: a backup restores to the store as it was when taken, not after,
   and retention prunes engine backups.
 
-**Next:** phase 2b, the daemon on by default (`REMIND_ME_DAEMON=0` the way
-out), which the engine needs: its directory has one opener, and without the
-daemon every Claude session's MCP server opens the store itself (done; see
-phase 2). Then 5.4b,
-the engine as the default: `engine-store` on by default and the engine the
-default store, so the daemon's first start with the new build copies the
-node through `Database::open`.
+Then phase 2b, the daemon on by default (see phase 2), which the engine
+needs: its directory has one opener, and without the daemon every Claude
+session's MCP server would open the store itself.
+
+**5.4b, done: the engine is the default store.**
+
+- `engine-store` is a default feature of `remind_me_core` and the CLI, and
+  the engine is the store unless `REMIND_ME_STORE=sqlite`. A build without
+  the feature runs on SQLite as before.
+- The first start with the new build copies the node: the daemon opens
+  the store through `Database::open`, which copies `memory.db` into
+  `memory.engine` (5.3). A refused row stops that start, names the row and
+  leaves the file as it was.
+- Going back: `REMIND_ME_STORE=sqlite` with `memory.engine` moved aside
+  runs the node on `memory.db` as it was at the copy. Without moving it,
+  the node refuses the file and says both of those things.
+- A client that cannot use a running daemon (other settings, another
+  build) falls back in-process and finds the engine held. The lock error
+  now says that another rusty-remind-me process, usually the daemon, holds
+  the store and that `rusty-remind-me daemon stop` releases it.
+- CI: every leg runs on the engine now, including the MCP, API, CLI and
+  remote suites, which had never run on it. The engine leg of the feature
+  matrix became the SQLite leg (`REMIND_ME_STORE=sqlite`).
+- Tests that assumed SQLite outside `remind_me_core` are fixed:
+  - the API suite planted rows with SQL; it now writes them through the
+    repositories, so it runs on both backends;
+  - the daemon CLI tests compared the daemon with an in-process run beside
+    it; they now stop the daemon first, and on the engine the settings
+    mismatch test expects the fallback's clear failure instead of a
+    second opener.
+
+Phase 5 is complete: the node's store is the engine. Phase 6, removing the SQLite store, is its own decision, after the engine has run on real nodes.
 
 ## Related
 

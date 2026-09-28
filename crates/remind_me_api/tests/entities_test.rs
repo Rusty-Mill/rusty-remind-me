@@ -155,12 +155,20 @@ fn traverse_follows_a_one_hop_relation() {
     let (server, root) = seeded_server("traverse-edge", |store| {
         let a = entity(store, "Rottnest Island");
         let b = entity(store, "Western Australia");
-        store.sqlite().unwrap().execute(
-            "INSERT INTO entity_relations (id, subject_entity_id, relation, object_entity_id, created_at, updated_at)
-             VALUES ('rel1', ?, 'located_in', ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
-            rusqlite::params![a, b],
-        )
-        .unwrap();
+        remind_me_core::db::entities::Entities::new(store)
+            .insert_relation_or_ignore(
+                &remind_me_core::db::entities::RelationRow {
+                    id: "rel1",
+                    subject_entity_id: &a,
+                    relation: "located_in",
+                    object_entity_id: &b,
+                    created_at: "2026-01-01T00:00:00Z",
+                    updated_at: "2026-01-01T00:00:00Z",
+                    node_id: None,
+                },
+                remind_me_core::db::derived::Origin::Local,
+            )
+            .unwrap();
     });
 
     let response = get(
