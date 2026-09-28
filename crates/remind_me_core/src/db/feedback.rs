@@ -279,7 +279,7 @@ mod tests {
     use super::*;
     use crate::db::history::{Revisions, Tracked};
     use crate::db::memories::{Memories, NewMemory};
-    use crate::db::{on_each_core_backend, Database};
+    use crate::db::{on_each_backend, Database};
 
     /// Feedback, importance and revert writes on `db`, and every read after.
     fn exercise(db: &Database) -> Vec<String> {
@@ -383,7 +383,7 @@ mod tests {
     #[test]
     fn the_engine_core_keeps_feedback_and_history_as_sqlite_does() {
         let mut observed = Vec::new();
-        on_each_core_backend(|db| observed.push(exercise(db)));
+        on_each_backend(|db| observed.push(exercise(db)));
         let sqlite = &observed[0];
         assert!(sqlite[0].starts_with("3 "), "{}", sqlite[0]);
         for other in &observed[1..] {

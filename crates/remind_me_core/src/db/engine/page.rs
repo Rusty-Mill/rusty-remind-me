@@ -23,7 +23,7 @@
 //! core; another thread's write is refused rather than folded into a page
 //! it did not ask for.
 
-use super::core::{apply, decode, encode, no_core, Change, CoreTables};
+use super::core::{apply, decode, encode, Change, CoreTables};
 use super::{engine_error, EngineTables};
 use crate::db::{Result, StoreError};
 use parking_lot::Mutex;
@@ -76,13 +76,10 @@ impl EngineTables {
     ///
     /// # Errors
     ///
-    /// [`StoreError::Engine`] if the tables have no core, refuse writes, or
-    /// already have a page open.
+    /// [`StoreError::Engine`] if the tables refuse writes or already have a
+    /// page open.
     pub(crate) fn begin_page(&mut self) -> Result<()> {
         self.ensure_writable()?;
-        if self.core.is_none() {
-            return Err(no_core());
-        }
         if self.page.is_some() {
             return Err(StoreError::Engine(
                 "a page is already open on these tables".to_string(),
@@ -112,8 +109,9 @@ impl EngineTables {
     /// Write `changes` into the open page: their before-images to the undo
     /// log, synced, then the changes to the stores.
     pub(super) fn commit_in_page(&mut self, changes: Vec<Change>) -> Result<()> {
-        let (Some(core), Some(page)) = (self.core.as_mut(), self.page.as_mut()) else {
-            return Err(no_core());
+        let core = &mut self.core;
+        let Some(page) = self.page.as_mut() else {
+            return Err(StoreError::Engine("no page is open".to_string()));
         };
         let before: Vec<Change> = changes.iter().map(|c| before_image(core, c)).collect();
         self.undo.commit(&encode(&before)?).map_err(engine_error)?;
@@ -184,7 +182,7 @@ impl EngineTables {
     }
 
     fn put_back(&mut self, before: Vec<Change>) -> Result<()> {
-        let core = self.core.as_mut().ok_or_else(no_core)?;
+        let core = &mut self.core;
         for change in before.into_iter().rev() {
             apply(core, change)?;
         }
@@ -198,15 +196,9 @@ impl EngineTables {
         if undo.is_empty() {
             return Ok(());
         }
-        let Some(core) = self.core.as_mut() else {
-            return Err(StoreError::Engine(
-                "the undo log holds changes this build cannot apply without the memories core"
-                    .to_string(),
-            ));
-        };
         for batch in undo.iter().rev() {
             for change in decode(batch)?.into_iter().rev() {
-                apply(core, change)?;
+                apply(&mut self.core, change)?;
             }
         }
         self.undo.checkpoint().map_err(engine_error)
@@ -248,7 +240,7 @@ impl Drop for Page<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::engine::{memories, reopen_core, vectors};
+    use crate::db::engine::{memories, reopen, vectors};
     use crate::db::memories::NewMemory;
     use rusty_multimodal_db_engine::fulltext::Query;
     use std::path::PathBuf;
@@ -272,7 +264,7 @@ mod tests {
     }
 
     fn landed(tables: &EngineTables) -> (Option<Vec<u8>>, bool, usize) {
-        let core = tables.core.as_ref().unwrap();
+        let core = &tables.core;
         (
             vectors::any_embedding(tables).unwrap(),
             memories::row(core, "m").is_some(),
@@ -284,12 +276,12 @@ mod tests {
     fn a_page_is_readable_as_it_goes_and_lands_when_finished() {
         let dir = fresh_dir("finished");
         {
-            let mut tables = EngineTables::open_with_core(&dir).unwrap();
+            let mut tables = EngineTables::open(&dir).unwrap();
             write_a_page(&mut tables);
             assert_eq!(landed(&tables), (Some(vec![2]), true, 1));
             tables.finish_page().unwrap();
         }
-        let tables = reopen_core(&dir);
+        let tables = reopen(&dir);
         assert_eq!(landed(&tables), (Some(vec![2]), true, 1));
         drop(tables);
         std::fs::remove_dir_all(&dir).unwrap();
@@ -299,14 +291,14 @@ mod tests {
     fn an_abandoned_page_puts_back_what_it_replaced() {
         let dir = fresh_dir("abandoned");
         {
-            let mut tables = EngineTables::open_with_core(&dir).unwrap();
+            let mut tables = EngineTables::open(&dir).unwrap();
             write_a_page(&mut tables);
             tables.abandon_page().unwrap();
             assert_eq!(landed(&tables), (Some(vec![1]), false, 0));
             // The tables take writes again.
             vectors::put(&mut tables, "b", 0, &[3]).unwrap();
         }
-        let tables = reopen_core(&dir);
+        let tables = reopen(&dir);
         assert_eq!(landed(&tables), (Some(vec![1]), false, 0));
         drop(tables);
         std::fs::remove_dir_all(&dir).unwrap();
@@ -316,11 +308,11 @@ mod tests {
     fn a_crash_inside_a_page_leaves_no_trace_of_it() {
         let dir = fresh_dir("crash_inside");
         {
-            let mut tables = EngineTables::open_with_core(&dir).unwrap();
+            let mut tables = EngineTables::open(&dir).unwrap();
             write_a_page(&mut tables);
             // Dropped with the page open: the process died here.
         }
-        let tables = reopen_core(&dir);
+        let tables = reopen(&dir);
         assert_eq!(landed(&tables), (Some(vec![1]), false, 0));
         drop(tables);
         std::fs::remove_dir_all(&dir).unwrap();
@@ -330,13 +322,13 @@ mod tests {
     fn a_crash_after_the_redo_commit_keeps_the_whole_page() {
         let dir = fresh_dir("crash_after_commit");
         {
-            let mut tables = EngineTables::open_with_core(&dir).unwrap();
+            let mut tables = EngineTables::open(&dir).unwrap();
             write_a_page(&mut tables);
             // The redo batch is durable; the undo log was never emptied.
             let changes = tables.page.as_ref().unwrap().changes.clone();
             tables.journal.commit(&encode(&changes).unwrap()).unwrap();
         }
-        let tables = reopen_core(&dir);
+        let tables = reopen(&dir);
         assert_eq!(landed(&tables), (Some(vec![2]), true, 1));
         drop(tables);
         std::fs::remove_dir_all(&dir).unwrap();
@@ -344,7 +336,7 @@ mod tests {
 
     #[test]
     fn another_thread_cannot_write_into_a_page() {
-        let tables = Mutex::new(EngineTables::open_temporary_with_core().unwrap());
+        let tables = Mutex::new(EngineTables::open_temporary().unwrap());
         let page = Page::begin(&tables).unwrap();
         std::thread::scope(|scope| {
             scope
@@ -365,7 +357,7 @@ mod tests {
 
     #[test]
     fn a_page_dropped_unfinished_is_abandoned() {
-        let tables = Mutex::new(EngineTables::open_temporary_with_core().unwrap());
+        let tables = Mutex::new(EngineTables::open_temporary().unwrap());
         {
             let _page = Page::begin(&tables).unwrap();
             vectors::put(&mut tables.lock(), "y", 0, &[1]).unwrap();

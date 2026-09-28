@@ -2,9 +2,9 @@
 //! sync outbox, its send markers and the sync flags, and the indexes derived
 //! from the memories.
 //!
-//! Built dark: only [`EngineTables::open_with_core`] opens these, and only
-//! the core's own tests call it, until the switch-on PR. A store whose
-//! tables have no core keeps every one of these groups on SQLite.
+//! Every [`EngineTables`] opens the core (switched on in core PR 5b): a
+//! store on the engine keeps memories and every group that joins them here,
+//! and a store on SQLite keeps them there.
 //!
 //! Writes that must land together travel as one journal batch (ADR-0023
 //! §3b): a memory and the outbox entry recording it, a prune's entries and
@@ -326,28 +326,21 @@ impl EngineTables {
     ///
     /// # Errors
     ///
-    /// [`StoreError::Engine`] if the tables have no core, or the journal or
-    /// a store fails. A failure after the batch is durable leaves the
+    /// [`StoreError::Engine`] if the journal or a store fails. A failure after the batch is durable leaves the
     /// tables refusing every later write until they are reopened, which
     /// applies the batch again: checkpointing past it would lose it.
     pub(crate) fn commit(&mut self, changes: Vec<Change>) -> Result<()> {
         self.ensure_writable()?;
-        if self.core.is_none() {
-            return Err(no_core());
-        }
         if changes.is_empty() {
             return Ok(());
         }
         if self.in_page()? {
             return self.commit_in_page(changes);
         }
-        let Some(core) = self.core.as_mut() else {
-            return Err(no_core());
-        };
         let batch = encode(&changes)?;
         self.journal.commit(&batch).map_err(engine_error)?;
         for change in changes {
-            if let Err(e) = apply(core, change) {
+            if let Err(e) = apply(&mut self.core, change) {
                 self.failed = true;
                 return Err(e);
             }
@@ -361,24 +354,13 @@ impl EngineTables {
         if batches.is_empty() {
             return Ok(());
         }
-        let Some(core) = self.core.as_mut() else {
-            return Err(StoreError::Engine(
-                "the journal holds changes this build cannot apply without the memories core"
-                    .to_string(),
-            ));
-        };
         for batch in &batches {
             for change in decode(batch)? {
-                apply(core, change)?;
+                apply(&mut self.core, change)?;
             }
         }
         self.journal.checkpoint().map_err(engine_error)
     }
-}
-
-/// The error for a core read or write on tables opened without the core.
-pub(super) fn no_core() -> StoreError {
-    StoreError::Engine("the memories core is not open on these tables".to_string())
 }
 
 #[cfg(test)]
@@ -414,7 +396,7 @@ mod tests {
         {
             // A crash after the batch was durable and before it reached the
             // stores: commit to the journal alone.
-            let mut tables = EngineTables::open_with_core(&dir).unwrap();
+            let mut tables = EngineTables::open(&dir).unwrap();
             let batch = encode(&[Change::Memory(
                 super::super::engine_id("a"),
                 Some(Box::new(memory("a"))),
@@ -422,8 +404,8 @@ mod tests {
             .unwrap();
             tables.journal.commit(&batch).unwrap();
         }
-        let tables = crate::db::engine::reopen_core(&dir);
-        let core = tables.core.as_ref().unwrap();
+        let tables = crate::db::engine::reopen(&dir);
+        let core = &tables.core;
         assert!(memories::row(core, "a").is_some());
         assert_eq!(
             core.search
@@ -436,30 +418,5 @@ mod tests {
         );
         drop(tables);
         std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn tables_without_the_core_refuse_a_journal_holding_core_changes() {
-        let dir =
-            std::env::temp_dir().join(format!("remind_me_engine_core_dark_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        {
-            let mut tables = EngineTables::open_with_core(&dir).unwrap();
-            let batch = encode(&[Change::Outbox(1, None)]).unwrap();
-            tables.journal.commit(&batch).unwrap();
-        }
-        let refused = crate::db::engine::retry_while_locked(|| EngineTables::open(&dir));
-        assert!(
-            matches!(&refused, Err(StoreError::Engine(why)) if why.contains("cannot apply")),
-            "{refused:?}"
-        );
-        drop(refused);
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn writes_without_the_core_are_refused() {
-        let mut tables = EngineTables::open_temporary().unwrap();
-        assert!(tables.commit(vec![Change::Outbox(1, None)]).is_err());
     }
 }

@@ -356,7 +356,7 @@ mod tests {
     #[test]
     fn the_engine_core_expands_and_feeds_as_sqlite_does() {
         let mut observed = Vec::new();
-        crate::db::on_each_core_backend(|db| observed.push(exercise(db)));
+        crate::db::on_each_backend(|db| observed.push(exercise(db)));
         let sqlite = &observed[0];
         assert!(
             sqlite[1].matches("EntityRelative").count() > 2,

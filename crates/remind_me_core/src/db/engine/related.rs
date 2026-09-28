@@ -1,4 +1,4 @@
-//! Search expansion on the engine core (ADR-0023, core PR 3b, built dark):
+//! Search expansion on the engine core (ADR-0023, core PR 3b):
 //! `memory_associations` and the reads that find a result's relatives.
 //! [`crate::db::related`] calls these when its store carries the core.
 

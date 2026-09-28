@@ -444,7 +444,7 @@ mod tests {
 
     #[test]
     fn flags_overwrite_on_each_backend() {
-        crate::db::on_each_core_backend(|db| {
+        crate::db::on_each_backend(|db| {
             let store = db.store();
             let state = SyncState::new(&store);
             assert_eq!(state.flag("k").unwrap(), None);
@@ -457,7 +457,7 @@ mod tests {
     #[cfg(feature = "engine-store")]
     #[test]
     fn sends_replace_on_the_engine() {
-        let db = Database::open_in_memory_with_core().unwrap();
+        let db = Database::open_in_memory_on_engine().unwrap();
         let store = db.store();
         let state = SyncState::new(&store);
         state.record_sends("hub", &[1, 2], "t1").unwrap();

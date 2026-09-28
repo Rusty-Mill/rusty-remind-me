@@ -1,4 +1,4 @@
-//! Reminders on the engine core (ADR-0023, core PR 2c, built dark): the
+//! Reminders on the engine core (ADR-0023, core PR 2c): the
 //! reminder reads over memories and the `reminder_deliveries` log.
 //! [`crate::db::reminders`] calls these when its store carries the core.
 

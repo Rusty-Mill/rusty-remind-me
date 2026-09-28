@@ -85,9 +85,8 @@ pub struct EngineTables {
     /// Derived from `wiki_pages` at open, and kept in step by every page
     /// write; never stored.
     pub(crate) wiki_search: wiki::PageSearch,
-    /// The memories core, when these tables were opened with it: built dark
-    /// until the switch-on PR (see [`core`]).
-    pub(crate) core: Option<core::CoreTables>,
+    /// The memories core (see [`core`]).
+    pub(crate) core: core::CoreTables,
     journal: Journal,
     /// The undo log of the open page, if any (see [`page`]).
     undo: Journal,
@@ -108,25 +107,10 @@ impl EngineTables {
     /// [`StoreError::Engine`] if another process holds `dir`, or a store in
     /// it cannot be opened.
     pub fn open(dir: &Path) -> super::Result<Self> {
-        Self::open_with(dir, false)
-    }
-
-    /// Open the tables in `dir` with the memories core. Only the core's own
-    /// tests open it until the switch-on PR.
-    #[cfg(test)]
-    pub(crate) fn open_with_core(dir: &Path) -> super::Result<Self> {
-        Self::open_with(dir, true)
-    }
-
-    fn open_with(dir: &Path, with_core: bool) -> super::Result<Self> {
         let lock = DirLock::acquire(dir, LOCK_FILE).map_err(engine_error)?;
         let opened = Journal::open(&dir.join(JOURNAL_FILE)).map_err(engine_error)?;
         let undo = Journal::open(&dir.join(page::UNDO_FILE)).map_err(engine_error)?;
-        let core = if with_core {
-            Some(core::CoreTables::open(dir)?)
-        } else {
-            None
-        };
+        let core = core::CoreTables::open(dir)?;
         let mut tables = Self {
             saved_searches: open_core(&dir.join("saved_searches.mmap"))?,
             seen: open_core(&dir.join("saved_search_seen.mmap"))?,
@@ -156,10 +140,8 @@ impl EngineTables {
         tables.journal.raise_to(analytics::SEQUENCE, floor);
         let floor = revisions::max_id(&tables.revisions);
         tables.journal.raise_to(revisions::SEQUENCE, floor);
-        if let Some(core) = &tables.core {
-            let floor = outbox::max_id(&core.outbox);
-            tables.journal.raise_to(outbox::SEQUENCE, floor);
-        }
+        let floor = outbox::max_id(&tables.core.outbox);
+        tables.journal.raise_to(outbox::SEQUENCE, floor);
         tables.wiki_search = wiki::index_pages(&tables.wiki_pages);
         Ok(tables)
     }
@@ -201,15 +183,6 @@ impl EngineTables {
         tables._temporary = Some(dir);
         Ok(tables)
     }
-
-    /// [`Self::open_temporary`], with the memories core.
-    #[cfg(test)]
-    pub(crate) fn open_temporary_with_core() -> super::Result<Self> {
-        let dir = TemporaryDir::fresh();
-        let mut tables = Self::open_with_core(&dir.0)?;
-        tables._temporary = Some(dir);
-        Ok(tables)
-    }
 }
 
 impl fmt::Debug for EngineTables {
@@ -218,15 +191,17 @@ impl fmt::Debug for EngineTables {
     }
 }
 
-/// The memories core of `tables`, or an error when they were opened
-/// without it.
+/// The memories core of `tables`. It cannot fail since the switch-on (core
+/// PR 5b); the `Result` stays until the repositories stop threading it.
+#[allow(clippy::unnecessary_wraps)]
 pub(crate) fn core_ref(tables: &EngineTables) -> super::Result<&core::CoreTables> {
-    tables.core.as_ref().ok_or_else(core::no_core)
+    Ok(&tables.core)
 }
 
 /// [`core_ref`], for a write.
+#[allow(clippy::unnecessary_wraps)]
 pub(crate) fn core_mut(tables: &mut EngineTables) -> super::Result<&mut core::CoreTables> {
-    tables.core.as_mut().ok_or_else(core::no_core)
+    Ok(&mut tables.core)
 }
 
 /// Whether `REMIND_ME_STORE` asks for the engine.
@@ -330,13 +305,6 @@ impl Drop for TemporaryDir {
 #[cfg(test)]
 pub(crate) fn reopen(dir: &Path) -> EngineTables {
     retry_while_locked(|| EngineTables::open(dir))
-        .unwrap_or_else(|e| panic!("reopening {}: {e}", dir.display()))
-}
-
-/// [`reopen`], with the memories core.
-#[cfg(test)]
-pub(crate) fn reopen_core(dir: &Path) -> EngineTables {
-    retry_while_locked(|| EngineTables::open_with_core(dir))
         .unwrap_or_else(|e| panic!("reopening {}: {e}", dir.display()))
 }
 

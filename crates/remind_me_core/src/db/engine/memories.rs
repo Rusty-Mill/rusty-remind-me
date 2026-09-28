@@ -1,4 +1,4 @@
-//! Memories on the engine (ADR-0023, core PR 1, built dark): the rows, the
+//! Memories on the engine (ADR-0023, core PR 1): the rows, the
 //! full-text and tag indexes derived from them, and every write
 //! [`crate::db::memories`] makes, with its outbox entry committed in the
 //! same journal batch.
@@ -1170,7 +1170,7 @@ mod tests {
 
     #[test]
     fn the_indexes_follow_a_memory_through_update_and_delete() {
-        let mut tables = EngineTables::open_temporary_with_core().unwrap();
+        let mut tables = EngineTables::open_temporary().unwrap();
         let mut new = NewMemory::new("a", "quokka", T1);
         new.tags = vec!["red".to_string()];
         insert(&mut tables, &new).unwrap();
@@ -1203,7 +1203,7 @@ mod tests {
 
     #[test]
     fn only_local_edits_that_move_updated_at_are_queued() {
-        let mut tables = EngineTables::open_temporary_with_core().unwrap();
+        let mut tables = EngineTables::open_temporary().unwrap();
         outbox::set_flag(&mut tables, "sync_enabled", "1").unwrap();
         insert(&mut tables, &NewMemory::new("local", "x", T1)).unwrap();
         upsert_synced(&mut tables, &NewMemory::new("synced", "y", T1)).unwrap();
@@ -1220,14 +1220,14 @@ mod tests {
 
     #[test]
     fn nothing_is_queued_while_sync_is_off() {
-        let mut tables = EngineTables::open_temporary_with_core().unwrap();
+        let mut tables = EngineTables::open_temporary().unwrap();
         insert(&mut tables, &NewMemory::new("a", "x", T1)).unwrap();
         assert!(outbox_ops(&tables).is_empty());
     }
 
     #[test]
     fn a_failed_edit_writes_nothing() {
-        let mut tables = EngineTables::open_temporary_with_core().unwrap();
+        let mut tables = EngineTables::open_temporary().unwrap();
         insert(&mut tables, &NewMemory::new("a", "quokka", T1)).unwrap();
         let failed = update(&mut tables, "a", Origin::Local, |row| {
             row.content = "wombat".to_string();
@@ -1243,7 +1243,7 @@ mod tests {
 
     #[test]
     fn the_ingest_marker_is_set_only_on_a_metadata_object() {
-        let mut tables = EngineTables::open_temporary_with_core().unwrap();
+        let mut tables = EngineTables::open_temporary().unwrap();
         for (id, metadata) in [
             ("a", serde_json::json!({"k": 1})),
             ("b", serde_json::json!([1])),
@@ -1268,13 +1268,13 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         {
-            let mut tables = EngineTables::open_with_core(&dir).unwrap();
+            let mut tables = EngineTables::open(&dir).unwrap();
             outbox::set_flag(&mut tables, "sync_enabled", "1").unwrap();
             let mut new = NewMemory::new("a", "quokka", T1);
             new.tags = vec!["red".to_string()];
             insert(&mut tables, &new).unwrap();
         }
-        let mut tables = crate::db::engine::reopen_core(&dir);
+        let mut tables = crate::db::engine::reopen(&dir);
         assert_eq!(hits(&tables, "quokka"), ["a"]);
         assert!(core_ref(&tables).unwrap().tags.has("red", "a"));
         insert(&mut tables, &NewMemory::new("b", "x", T1)).unwrap();

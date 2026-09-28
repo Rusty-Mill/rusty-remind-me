@@ -1,4 +1,4 @@
-//! Embeddings on the engine core (ADR-0023, core PR 4a, built dark):
+//! Embeddings on the engine core (ADR-0023, core PR 4a):
 //! `vec_chunks`, keyed by (memory id, chunk index), and `embedding_meta`.
 //! [`crate::db::vectors`] calls these when its store carries the core.
 

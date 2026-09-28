@@ -629,7 +629,7 @@ mod tests {
             ],
         );
         let mut observed = Vec::new();
-        crate::db::on_each_core_backend(|db| observed.push(exercise(db, &first, &second)));
+        crate::db::on_each_backend(|db| observed.push(exercise(db, &first, &second)));
         let sqlite = &observed[0];
         assert!(sqlite[0].contains("created: 3"), "{}", sqlite[0]);
         assert!(sqlite[3].contains("updated: 1"), "{}", sqlite[3]);

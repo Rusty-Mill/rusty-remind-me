@@ -819,7 +819,7 @@ mod tests {
     #[test]
     fn the_engine_core_keeps_the_graph_as_sqlite_does() {
         let mut observed = Vec::new();
-        crate::db::on_each_core_backend(|db| observed.push(exercise(db)));
+        crate::db::on_each_backend(|db| observed.push(exercise(db)));
         let sqlite = &observed[0];
         assert_eq!(sqlite[0], "true", "a taken entity id is refused");
         for other in &observed[1..] {

@@ -134,11 +134,11 @@ impl<'a> Store<'a> {
         self.engine.as_deref()
     }
 
-    /// The engine tables, when they hold the memories core: for the core's
-    /// repositories, which stay on SQLite otherwise.
+    /// The engine tables, for the memories core's repositories: every store
+    /// on the engine holds the core since the switch-on (core PR 5b).
     #[cfg(feature = "engine-store")]
     pub(crate) fn core(&self) -> Option<&Mutex<EngineTables>> {
-        self.engine().filter(|tables| tables.lock().core.is_some())
+        self.engine()
     }
 
     /// The SQLite connection underneath, for code that must speak SQL: the
@@ -297,7 +297,7 @@ mod tests {
     #[test]
     fn a_transaction_lands_whole_or_not_at_all_on_both_backends() {
         let mut observed = Vec::new();
-        super::super::on_each_core_backend(|db| observed.push(exercise_transactions(db)));
+        super::super::on_each_backend(|db| observed.push(exercise_transactions(db)));
         let sqlite = &observed[0];
         assert_eq!(
             sqlite[1], "false Some([1]) []",

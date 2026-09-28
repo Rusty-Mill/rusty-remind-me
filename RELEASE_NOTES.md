@@ -2,6 +2,14 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-28 — The memories core is switched on (ADR-0023, core PR 5b)
+
+### Changed
+- The engine's memories core is now always open. With `engine-store` and `REMIND_ME_STORE=engine`, memories and every group that joins them live on the engine, so the whole engine test leg runs on the core.
+
+### Removed
+- The test-only "no core" mode of the engine tables, its constructors and its two tests.
+
 ## 2026-09-28 — Tests reach stored rows through the repositories (ADR-0023, core PR 5a)
 
 ### Added

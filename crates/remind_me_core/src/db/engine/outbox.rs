@@ -1,5 +1,5 @@
 //! The sync outbox, its send markers and the sync flags on the engine
-//! (ADR-0023, core PR 1, built dark). [`crate::db::outbox`] and
+//! (ADR-0023, core PR 1). [`crate::db::outbox`] and
 //! [`crate::db::sync_state`] call these when their store carries the core
 //! tables.
 //!
@@ -417,7 +417,7 @@ mod tests {
 
     #[test]
     fn prune_drops_old_and_sent_entries_and_their_markers() {
-        let mut tables = EngineTables::open_temporary_with_core().unwrap();
+        let mut tables = EngineTables::open_temporary().unwrap();
         set_flag(&mut tables, SYNC_ENABLED, "1").unwrap();
         let change = entry(&mut tables, "old", "insert", "{}".to_string()).unwrap();
         tables.commit(vec![change]).unwrap();

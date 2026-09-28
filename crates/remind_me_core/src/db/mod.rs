@@ -234,17 +234,6 @@ impl Database {
         Ok(db)
     }
 
-    /// [`Self::open_in_memory_on_engine`], with the memories core on the
-    /// engine too. Built dark: only the core's own tests open it until the
-    /// switch-on PR.
-    #[cfg(all(test, feature = "engine-store"))]
-    pub(crate) fn open_in_memory_with_core() -> Result<Self> {
-        let mut db = Self::open_sqlite_in_memory()?;
-        let tables = engine::EngineTables::open_temporary_with_core()?;
-        db.engine = Some(std::sync::Arc::new(Mutex::new(tables)));
-        Ok(db)
-    }
-
     /// An in-memory SQLite database whatever `REMIND_ME_STORE` says: for
     /// tests of what only SQLite has, such as the schema and its migrations.
     pub fn open_sqlite_in_memory() -> Result<Self> {
@@ -333,17 +322,8 @@ impl Database {
 /// Run `test` against every backend this build has: SQLite always, the
 /// engine too with `engine-store`.
 #[cfg(test)]
-pub(crate) fn on_each_backend(test: impl Fn(&Database)) {
+pub(crate) fn on_each_backend(mut test: impl FnMut(&Database)) {
     test(&Database::open_sqlite_in_memory().unwrap());
     #[cfg(feature = "engine-store")]
     test(&Database::open_in_memory_on_engine().unwrap());
-}
-
-/// Run `test` on SQLite, and with the feature on the engine with the
-/// memories core, which nothing else opens until the switch-on PR.
-#[cfg(test)]
-pub(crate) fn on_each_core_backend(mut test: impl FnMut(&Database)) {
-    test(&Database::open_sqlite_in_memory().unwrap());
-    #[cfg(feature = "engine-store")]
-    test(&Database::open_in_memory_with_core().unwrap());
 }

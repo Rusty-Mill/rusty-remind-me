@@ -762,7 +762,7 @@ mod tests {
     #[test]
     fn the_engine_core_curates_and_promotes_as_sqlite_does() {
         let mut observed = Vec::new();
-        crate::db::on_each_core_backend(|db| observed.push(exercise(db)));
+        crate::db::on_each_backend(|db| observed.push(exercise(db)));
         let sqlite = &observed[0];
         assert_ne!(sqlite[14], "0", "the corpus has contradiction pairs");
         for other in &observed[1..] {

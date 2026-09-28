@@ -1,4 +1,4 @@
-//! Feedback on the engine core (ADR-0023, core PR 2c, built dark): the
+//! Feedback on the engine core (ADR-0023, core PR 2c): the
 //! `memory_feedback` event log and the review reads over memories.
 //! [`crate::db::feedback`] calls these when its store carries the core.
 

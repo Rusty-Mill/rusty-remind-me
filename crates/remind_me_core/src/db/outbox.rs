@@ -241,7 +241,7 @@ mod tests {
         use crate::entity::Entity;
         const NOW: &str = "2026-09-26T00:00:00+00:00";
 
-        crate::db::on_each_core_backend(|db| {
+        crate::db::on_each_backend(|db| {
             let store = db.store();
             let state = SyncState::new(&store);
             let outbox = Outbox::new(&store);

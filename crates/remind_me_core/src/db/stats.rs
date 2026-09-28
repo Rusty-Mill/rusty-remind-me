@@ -10,7 +10,7 @@
 //! and a store whose tables hold the memories core counts memories there
 //! (`db::engine::stats`, core PR 2d) and chat imports there
 //! (`db::engine::imports`, core PR 4a). The storage figures stay on SQLite
-//! until the switch-on.
+//! until the copy tool (ADR-0023 §5).
 
 #[cfg(feature = "engine-store")]
 use super::engine::{self, EngineTables};
@@ -397,7 +397,7 @@ mod tests {
     #[test]
     fn the_engine_core_counts_as_sqlite_does() {
         let mut observed = Vec::new();
-        crate::db::on_each_core_backend(|db| observed.push(exercise(db)));
+        crate::db::on_each_backend(|db| observed.push(exercise(db)));
         let sqlite = &observed[0];
         assert_eq!(sqlite[0], "4");
         assert_eq!(sqlite[4], "(6, 2)");

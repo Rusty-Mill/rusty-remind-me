@@ -1189,7 +1189,7 @@ mod tests {
     use super::*;
     use crate::db::outbox::Outbox;
     use crate::db::sync_state::SyncState;
-    use crate::db::{on_each_core_backend, Database};
+    use crate::db::{on_each_backend, Database};
 
     const NOW: &str = "2026-09-26T00:00:00+00:00";
 
@@ -1234,7 +1234,7 @@ mod tests {
 
     #[test]
     fn insert_refuses_a_taken_id_and_insert_or_ignore_reports_it() {
-        on_each_core_backend(|db| {
+        on_each_backend(|db| {
             let store = db.store();
             let memories = Memories::new(&store);
             let row = NewMemory::new("a", "first", NOW);
@@ -1249,7 +1249,7 @@ mod tests {
 
     #[test]
     fn a_synced_overwrite_keeps_created_at_and_the_chunk_position() {
-        on_each_core_backend(|db| {
+        on_each_backend(|db| {
             let store = db.store();
             let memories = Memories::new(&store);
             memories
@@ -1280,7 +1280,7 @@ mod tests {
 
     #[test]
     fn sync_view_reads_tags_that_are_not_an_array_as_none() {
-        on_each_core_backend(|db| {
+        on_each_backend(|db| {
             let store = db.store();
             Memories::new(&store)
                 .insert(&NewMemory::new("a", "x", NOW))
@@ -1298,7 +1298,7 @@ mod tests {
 
     #[test]
     fn access_inputs_skips_unknown_ids_and_takes_an_empty_list() {
-        on_each_core_backend(|db| {
+        on_each_backend(|db| {
             let store = db.store();
             let memories = Memories::new(&store);
             memories.insert(&NewMemory::new("a", "x", NOW)).unwrap();
@@ -1561,7 +1561,7 @@ mod tests {
     #[test]
     fn the_engine_core_matches_sqlite_read_for_read() {
         let mut observed = Vec::new();
-        on_each_core_backend(|db| observed.push(exercise_reads(db)));
+        on_each_backend(|db| observed.push(exercise_reads(db)));
         let sqlite = &observed[0];
         assert_eq!(sqlite[0], serde_json::json!([4, ["e", "b", "d", "a"]]));
         for other in &observed[1..] {
@@ -1742,7 +1742,7 @@ mod tests {
     #[test]
     fn the_engine_core_searches_as_fts5_does() {
         let mut observed = Vec::new();
-        on_each_core_backend(|db| observed.push(exercise_search(db)));
+        on_each_backend(|db| observed.push(exercise_search(db)));
         #[cfg(feature = "engine-store")]
         assert_eq!(observed.len(), 2, "both backends ran");
         let sqlite = &observed[0];
@@ -1763,7 +1763,7 @@ mod tests {
     #[test]
     fn the_engine_core_matches_sqlite_write_for_write() {
         let mut observed = Vec::new();
-        on_each_core_backend(|db| observed.push(exercise(db)));
+        on_each_backend(|db| observed.push(exercise(db)));
         let sqlite = &observed[0];
         assert_eq!(sqlite.counts, [1, 0, 2, 2, 3]);
         assert!(!sqlite.outbox.is_empty());

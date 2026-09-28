@@ -1,5 +1,5 @@
 //! Promotion provenance and the promotion reads on the engine core
-//! (ADR-0023, core PR 3c, built dark). [`crate::db::promotions`] calls
+//! (ADR-0023, core PR 3c). [`crate::db::promotions`] calls
 //! these when its store carries the core.
 
 use super::core::{Change, CoreTables};

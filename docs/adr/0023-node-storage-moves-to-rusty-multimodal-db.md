@@ -1162,7 +1162,31 @@ one, then the flip.
   was queued.
 - No test or assertion was removed.
 
-**Next:** core PR 5b, the flip. The copy tool (§5) comes after it.
+**Core 5b, done: the memories core is switched on. The core is
+complete.**
+
+- `EngineTables::open` always opens the core, and `core` is no longer
+  optional. Every store on the engine (today, the in-memory databases
+  that `REMIND_ME_STORE=engine` selects, so the whole engine CI leg) keeps
+  memories and every group that joins them on the core. A store on SQLite
+  keeps them on SQLite.
+- The "no core" mode is gone, and so are its constructors
+  (`open_with_core`, `open_temporary_with_core`,
+  `open_in_memory_with_core`), `on_each_core_backend` and `reopen_core`.
+  The two tests of that mode went with it. `core_ref` and `core_mut` still
+  return a `Result` that cannot fail, to keep this PR small; dropping it
+  is a mechanical follow-up.
+- Background writers during a page (see 4b) stay refused. The engine
+  still backs only in-memory databases, which have no background threads
+  (`Database::secondary_source` is `None` for them), so the question only
+  arises once the copy tool puts an on-disk node on the engine. It is
+  decided there.
+- What still reads SQLite beside the core: the storage figures, the
+  schema and its migrations, and `Promotions::ensure_table`, all until
+  the copy tool.
+
+**Next:** phase 5: the copy tool (§5), `Database::open` on the engine,
+and the engine as the default.
 
 ## Related
 

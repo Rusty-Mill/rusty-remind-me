@@ -395,7 +395,7 @@ pub fn queue_outbox(
 mod tests {
     use super::*;
     use crate::db::memories::{Memories, NewMemory};
-    use crate::db::on_each_core_backend;
+    use crate::db::on_each_backend;
 
     const NOW: &str = "2026-09-27T00:00:00+00:00";
 
@@ -499,7 +499,7 @@ mod tests {
     #[test]
     fn raw_access_reads_and_writes_alike_on_every_backend() {
         let mut observed = Vec::new();
-        on_each_core_backend(|db| observed.push(exercise(db)));
+        on_each_backend(|db| observed.push(exercise(db)));
         let sqlite = &observed[0];
         assert_eq!(sqlite[0], "Some(Number(1))");
         for other in &observed[1..] {

@@ -456,7 +456,7 @@ mod tests {
     #[test]
     fn the_engine_core_stores_vectors_as_sqlite_does() {
         let mut observed = Vec::new();
-        crate::db::on_each_core_backend(|db| observed.push(exercise(db)));
+        crate::db::on_each_backend(|db| observed.push(exercise(db)));
         let sqlite = &observed[0];
         assert_eq!(sqlite[0], "10", "the corpus stores its chunks");
         for other in &observed[1..] {
