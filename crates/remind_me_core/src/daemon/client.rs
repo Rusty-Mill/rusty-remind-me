@@ -18,6 +18,10 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a client waits for a daemon it started. Opening the database runs
 /// any pending migration first, which can take a while on a large store.
 const START_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a client waits for a daemon that is copying the store onto the
+/// engine: the one-time copy on the first start with an engine build takes
+/// minutes on a large store, two for a real 15,000-memory node.
+const COPY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const START_POLL: Duration = Duration::from_millis(50);
 
 /// Why a client is not talking to a daemon.
@@ -51,8 +55,10 @@ impl fmt::Display for ConnectError {
             ),
             ConnectError::StartTimedOut => write!(
                 f,
-                "the daemon did not become ready within {}s",
-                START_TIMEOUT.as_secs()
+                "the daemon did not become ready within {}s ({}s while it copies the store \
+                 onto the engine)",
+                START_TIMEOUT.as_secs(),
+                COPY_TIMEOUT.as_secs()
             ),
         }
     }
@@ -144,7 +150,8 @@ pub fn connect_or_start(
         other => return other,
     }
     let mut child = start(endpoint, exe).map_err(ConnectError::Start)?;
-    let deadline = Instant::now() + START_TIMEOUT;
+    let started = Instant::now();
+    let mut told = false;
     let outcome = loop {
         match connect(endpoint, mode) {
             Err(ConnectError::NotRunning) => {}
@@ -160,7 +167,19 @@ pub fn connect_or_start(
                 });
             }
         }
-        if Instant::now() >= deadline {
+        // The one-time copy onto the engine outlasts the usual start, so a
+        // daemon that is visibly copying gets the longer allowance.
+        let copying = endpoint.copying_onto_engine();
+        if copying && !told {
+            eprintln!(
+                "rusty-remind-me: the daemon is copying the store onto the engine, once, on \
+                 the first start with this build; waiting for it (progress in {})",
+                endpoint.log_path().display()
+            );
+            told = true;
+        }
+        let allowance = if copying { COPY_TIMEOUT } else { START_TIMEOUT };
+        if started.elapsed() >= allowance {
             break Err(ConnectError::StartTimedOut);
         }
         std::thread::sleep(START_POLL);

@@ -2,6 +2,20 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-28 — The first start on the engine says what it is doing, and clients wait for it (ADR-0023)
+
+### Changed
+- The first start with an engine build copies `memory.db` into `memory.engine`, once. On a real 15,000-memory node that took about two minutes, and the node printed nothing while it ran. It now logs each table as it finishes and the total time, to stderr: in `memory.db.daemon.log` when a client started the daemon.
+- A client waiting for the daemon it started now waits up to 30 minutes, not 60 seconds, while that copy is visibly under way (`memory.engine.partial` exists). It says once on stderr why it is waiting and where the progress is. Before, the first client after the upgrade gave up after a minute and then failed, because the daemon held the store.
+- `rusty-remind-me copy-store` prints each table as it finishes, with its time.
+
+### Upgrading
+- Expect the first start after upgrading to take a while on a large store: minutes, not seconds. Leave it running; the copy verifies every row and happens once. Don't run `copy-store` into `memory.engine` while the node is still running on SQLite. Rows written after the copy would be missing, because the new build finds `memory.engine` and does not copy again.
+
+### Tests
+- The copy reports every table it copied, once each and with the report's counts.
+- Whether a copy is under way follows the partial and engine directories.
+
 ## 2026-09-28 — The engine opens faster in a fifth of the memory (ADR-0023)
 
 ### Changed

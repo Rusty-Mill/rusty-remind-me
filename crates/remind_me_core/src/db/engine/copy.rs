@@ -45,6 +45,19 @@ use uuid::Uuid;
 /// How many records one journal batch carries while copying.
 const BATCH: usize = 500;
 
+/// One table the copy finished: reported as the copy goes, so a copy that
+/// takes minutes on a large store shows it is moving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableDone {
+    pub table: &'static str,
+    /// Rows copied into the engine, refused ones not counted.
+    pub rows: usize,
+    pub elapsed: std::time::Duration,
+}
+
+/// What the copy calls after each table.
+pub type Progress<'a> = &'a mut dyn FnMut(TableDone);
+
 /// A source row the copy left out, and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Refused {
@@ -407,7 +420,7 @@ pub fn copy_core(source: &Connection, target: &mut EngineTables) -> Result<CopyR
         ));
     }
     let mut report = CopyReport::default();
-    copy_core_tables(source, target, &mut report)?;
+    copy_core_tables(source, target, &mut report, &mut |_| {})?;
     Ok(report)
 }
 
@@ -419,7 +432,11 @@ pub fn copy_core(source: &Connection, target: &mut EngineTables) -> Result<CopyR
 ///
 /// As [`copy_core`], and [`StoreError::Invalid`] if any table is not
 /// empty.
-pub fn copy_store(source: &Connection, target: &mut EngineTables) -> Result<CopyReport> {
+pub fn copy_store(
+    source: &Connection,
+    target: &mut EngineTables,
+    progress: Progress<'_>,
+) -> Result<CopyReport> {
     check_source(source)?;
     if has_rows(&target.core) || groups_have_rows(target) {
         return Err(StoreError::Invalid(
@@ -427,8 +444,8 @@ pub fn copy_store(source: &Connection, target: &mut EngineTables) -> Result<Copy
         ));
     }
     let mut report = CopyReport::default();
-    copy_core_tables(source, target, &mut report)?;
-    copy_groups(source, target, &mut report)?;
+    copy_core_tables(source, target, &mut report, progress)?;
+    copy_groups(source, target, &mut report, progress)?;
     Ok(report)
 }
 
@@ -440,13 +457,17 @@ pub fn copy_store(source: &Connection, target: &mut EngineTables) -> Result<Copy
 ///
 /// As [`copy_store`], and the source's or the engine's error if either
 /// cannot be opened.
-pub fn copy_file(source: &std::path::Path, target_dir: &std::path::Path) -> Result<CopyReport> {
+pub fn copy_file(
+    source: &std::path::Path,
+    target_dir: &std::path::Path,
+    progress: Progress<'_>,
+) -> Result<CopyReport> {
     let source = Connection::open_with_flags(
         source,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
     let mut target = EngineTables::open(target_dir)?;
-    copy_store(&source, &mut target)
+    copy_store(&source, &mut target, progress)
 }
 
 /// Copy the SQLite file `source` into the engine directory `dir`, which
@@ -460,14 +481,16 @@ pub fn copy_file(source: &std::path::Path, target_dir: &std::path::Path) -> Resu
 ///
 /// [`StoreError::Invalid`] when the copy refused a row; the partial copy
 /// is left for inspection and removed by the next attempt.
-pub fn copy_into_place(source: &std::path::Path, dir: &std::path::Path) -> Result<CopyReport> {
-    let mut partial = dir.as_os_str().to_owned();
-    partial.push(".partial");
-    let partial = std::path::PathBuf::from(partial);
+pub fn copy_into_place(
+    source: &std::path::Path,
+    dir: &std::path::Path,
+    progress: Progress<'_>,
+) -> Result<CopyReport> {
+    let partial = crate::db::partial_dir(dir);
     if partial.exists() {
         std::fs::remove_dir_all(&partial).map_err(|e| io_error(&partial, &e))?;
     }
-    let report = copy_file(source, &partial)?;
+    let report = copy_file(source, &partial, progress)?;
     if let Some(first) = report.refused.first() {
         return Err(StoreError::Invalid(format!(
             "{} row(s) could not be copied onto the engine, the first from {} [{}]: {}; \
@@ -522,10 +545,17 @@ fn copy_core_tables(
     source: &Connection,
     target: &mut EngineTables,
     report: &mut CopyReport,
+    progress: Progress<'_>,
 ) -> Result<()> {
     for copy in TABLES {
+        let started = std::time::Instant::now();
         let copied = copy_table(source, target, copy, &mut report.refused)?;
         report.copied.insert(copy.table, copied);
+        progress(TableDone {
+            table: copy.table,
+            rows: copied,
+            elapsed: started.elapsed(),
+        });
     }
     let floor = outbox::max_id(&target.core.outbox);
     target.journal.raise_to(outbox::SEQUENCE, floor);
@@ -629,8 +659,13 @@ fn copy_groups(
     source: &Connection,
     target: &mut EngineTables,
     report: &mut CopyReport,
+    progress: Progress<'_>,
 ) -> Result<()> {
-    let mut group = Group { source, report };
+    let mut group = Group {
+        source,
+        report,
+        progress,
+    };
     group.copy(
         "saved_searches",
         "",
@@ -755,6 +790,7 @@ fn copy_groups(
 struct Group<'a> {
     source: &'a Connection,
     report: &'a mut CopyReport,
+    progress: Progress<'a>,
 }
 
 impl Group<'_> {
@@ -781,6 +817,7 @@ impl Group<'_> {
         R::Id: MmapFieldValue + Serialize + DeserializeOwned + std::fmt::Debug + Eq + Hash,
         R::ScanValue: MmapFieldValue,
     {
+        let started = std::time::Instant::now();
         let mut taken: HashMap<R::Id, String> = HashMap::new();
         let mut copied = 0;
         for row in rows_ordered(self.source, table, order_by)? {
@@ -820,6 +857,11 @@ impl Group<'_> {
             copied += 1;
         }
         self.report.copied.insert(table, copied);
+        (self.progress)(TableDone {
+            table,
+            rows: copied,
+            elapsed: started.elapsed(),
+        });
         Ok(())
     }
 }

@@ -95,7 +95,7 @@ fn a_refused_row_leaves_no_engine_store() {
         .unwrap();
     }
     let engine = engine_dir(&file);
-    let refused = copy_into_place(&file, &engine);
+    let refused = copy_into_place(&file, &engine, &mut |_| {});
     assert!(
         matches!(refused, Err(StoreError::Invalid(ref why)) if why.contains("could not be copied")),
         "{refused:?}"

@@ -490,7 +490,18 @@ fn copied_store(source: &Database) -> (Database, CopyReport) {
         let source = source.store();
         let target = target.store();
         let tables: &EngineLock = target.engine().unwrap();
-        let report = copy_store(source.sqlite().unwrap(), &mut tables.lock()).unwrap();
+        let mut done = Vec::new();
+        let report = copy_store(source.sqlite().unwrap(), &mut tables.lock(), &mut |table| {
+            done.push(table)
+        })
+        .unwrap();
+        // Progress names every table the report does, once each and with
+        // the same count, as the copy finishes it.
+        let reported: Vec<(&str, usize)> = done.iter().map(|d| (d.table, d.rows)).collect();
+        let mut sorted = reported.clone();
+        sorted.sort_unstable();
+        let expected: Vec<(&str, usize)> = report.copied.iter().map(|(t, n)| (*t, *n)).collect();
+        assert_eq!(sorted, expected, "progress {reported:?}");
         report
     };
     (target, report)
@@ -623,6 +634,7 @@ fn the_whole_copy_refuses_a_target_with_any_group_filled() {
     let refused = copy_store(
         source.sqlite().unwrap(),
         &mut target.engine().unwrap().lock(),
+        &mut |_| {},
     );
     assert!(matches!(refused, Err(StoreError::Invalid(ref why)) if why.contains("not empty")));
 }

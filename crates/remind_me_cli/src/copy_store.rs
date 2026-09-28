@@ -44,10 +44,17 @@ pub fn parse(args: &[String], default_from: &Path) -> Result<CopyArgs, String> {
 /// Run the copy and print what it did. Fails when any row was refused.
 #[cfg(feature = "engine-store")]
 pub fn run(args: &CopyArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let report = remind_me_core::db::engine::copy::copy_file(&args.from, &args.to)?;
-    for (table, copied) in &report.copied {
-        println!("{table}: {copied} copied");
-    }
+    // Each table as it finishes: the copy takes minutes on a large store.
+    let mut print_table = |done: remind_me_core::db::engine::copy::TableDone| {
+        println!(
+            "{}: {} copied in {:.1}s",
+            done.table,
+            done.rows,
+            done.elapsed.as_secs_f64()
+        );
+    };
+    let report =
+        remind_me_core::db::engine::copy::copy_file(&args.from, &args.to, &mut print_table)?;
     if report.refused.is_empty() {
         println!("copied {} into {}", args.from.display(), args.to.display());
         return Ok(());
