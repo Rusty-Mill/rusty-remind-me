@@ -285,13 +285,12 @@ fn an_in_memory_database_gets_no_scheduler() {
 fn the_running_loop_delivers_without_anyone_calling_a_tool() {
     let dir = TempDir::new("loop");
     let path = dir.db_path();
-    let id = {
+    {
         let db = Database::open(&path).unwrap();
         let store = db.store();
         let id = add(&store, "fires on its own");
         force_due(&store, &id, &past(1));
-        id
-    };
+    }
 
     // The point of the whole issue: a reminder fires because time passed, not
     // because something asked. Everything above this test drives `poll_once`
@@ -306,8 +305,8 @@ fn the_running_loop_delivers_without_anyone_calling_a_tool() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     let mut delivered = 0i64;
     while std::time::Instant::now() < deadline {
-        // The only memory in this database is `id`, so every delivery row
-        // is one of its deliveries.
+        // The only memory in this database is the one added above, so every
+        // delivery row is one of its deliveries.
         delivered = testing::count(&observer.store(), Table::ReminderDeliveries).unwrap_or(0);
         if delivered > 0 {
             break;
