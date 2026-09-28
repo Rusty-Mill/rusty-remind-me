@@ -2,6 +2,7 @@
 #[path = "../../remind_me_core/src/test_env.rs"]
 mod test_env;
 
+mod copy_store;
 mod daemon;
 
 use daemon::Store;
@@ -622,6 +623,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         result?;
     } else {
         match args[1].as_str() {
+            "copy-store" => match copy_store::parse(&args[2..], &db_path) {
+                Ok(parsed) => copy_store::run(&parsed)?,
+                Err(message) => {
+                    eprintln!("{}", message);
+                    std::process::exit(1);
+                }
+            },
             "daemon" => daemon::command(&args[2..], &db_path)?,
             "configure" | "setup" => {
                 let configure_args = match parse_configure_args(&args[2..]) {

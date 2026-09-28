@@ -643,6 +643,19 @@ The daemon writes `<db>.daemon.json`, `<db>.daemon.token` (mode 600) and
 `<db>.daemon.log` beside the database (`remind_me.db.daemon.json` and so on),
 and holds `<db>.daemon.lock` while it runs.
 
+### 12. Copy the Store onto the Engine (preview)
+A build with the `engine-store` feature can copy the SQLite store into an
+engine data directory (ADR-0023). The source is only read, every id is
+kept, and every row is verified after it is written. If any row cannot be
+copied, the command lists it and exits non-zero rather than dropping it.
+```bash
+cargo build --release -p rusty-remind-me --features engine-store
+rusty-remind-me copy-store --to ~/.remind-me/engine            # from the configured database
+rusty-remind-me copy-store --from old.db --to ./engine-copy    # from another file
+```
+The node does not run on the copy yet; that is the next step of ADR-0023's
+phase 5.
+
 ## REST API Endpoints
 
 When running `rusty-remind-me api [port]`, the HTTP server exposes the routes

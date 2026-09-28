@@ -1226,8 +1226,44 @@ Phase 5 ships in four PRs:
   - Further tests cover refusals, a filled target, an old source, the
     sequence, and that the source's `total_changes()` does not move.
 
-**Next:** 5.2, the copy of the other groups and the `copy-store`
-command.
+**5.2, done: the copy of the other groups, and `copy-store`.**
+
+- `copy_store(source, target)` copies the whole store: the core as in 5.1,
+  then saved searches and their seen memories, import archives and spans,
+  the sync log, analytics snapshots, memory revisions, and the wiki's
+  pages, links and meta. These groups write straight to their stores, as
+  their own write paths do, so each record is inserted and read back
+  directly, under the same refusal and verification rules.
+- Each record is built as its write path builds it:
+  - the µs slots come from their timestamps;
+  - a snapshot's day is `date(captured_at)` as SQLite computes it;
+  - a revision's flag stays nullable;
+  - a wiki link's position is its place among its page's links, in
+    SQLite's insertion order.
+
+  The wiki's full-text index is rebuilt, and the snapshot and revision
+  sequences are raised past the copied ids. The whole copy refuses a
+  target where any table holds rows.
+- `copy_file(source, target_dir)` opens the source read-only and the
+  target's tables, then runs `copy_store`.
+- `rusty-remind-me copy-store --to <engine-dir> [--from <memory.db>]`
+  runs it and prints each table's count. It exits non-zero, listing each
+  refused row, if anything was refused. The CLI gains an `engine-store`
+  feature for it; without the feature the command says so.
+- The differential test for the core copy compared `Memories::all_live`
+  in order, but that call promises no order (SQLite's is rowid order, the
+  engine's is not), so it only passed by luck. It now compares by id.
+- Tests:
+  - A differential test for the whole copy reads every group back through
+    its repository on both sides, and the core too.
+  - Further tests cover new snapshot and revision ids, and a target with
+    any group filled.
+  - The command's argument parsing has unit tests, and an end-to-end run
+    of the CLI copied a store it had written, then refused a second copy
+    into the filled target.
+
+**Next:** 5.3, `Database::open` on the engine for an on-disk node:
+copying on first open, and background writers waiting on a page.
 
 ## Related
 

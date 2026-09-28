@@ -142,7 +142,12 @@ fn read_back(db: &Database) -> Vec<String> {
     let ids: Vec<String> = ["m1", "m2", "m3"].map(String::from).to_vec();
     let mut seen = vec![
         format!("{:?}", Memories::new(&store).get_many(&ids).unwrap()),
-        format!("{:?}", Memories::new(&store).all_live().unwrap()),
+        // `all_live` promises no order, so compare it by id.
+        format!("{:?}", {
+            let mut live = Memories::new(&store).all_live().unwrap();
+            live.sort_by(|a, b| a.id.cmp(&b.id));
+            live
+        }),
         format!("{:?}", testing::memory_ids(&store).unwrap()),
         format!("{:?}", Entities::new(&store).all().unwrap()),
         format!("{:?}", Entities::new(&store).links_oldest_first().unwrap()),
@@ -342,4 +347,257 @@ fn the_copy_never_writes_to_its_source() {
         .unwrap();
     assert_eq!(changes_after, changes_before);
     assert_eq!(read_back(&source), before);
+}
+
+// --- the other groups -------------------------------------------------------
+
+use crate::db::archives::{self, ArchiveRow, Archives};
+use crate::db::history::{Revisions, Tracked};
+use crate::db::saved_searches::SavedSearches;
+use crate::db::stats::StoreStats;
+use crate::db::sync_state::SyncLogRow;
+use crate::db::wiki::WikiIndex;
+use crate::models::{AnalyticsSnapshot, SavedSearch, SavedSearchFilters};
+use crate::wiki::WikiPage;
+
+/// [`seeded_source`], plus a row in every group outside the core.
+fn seeded_store() -> Database {
+    let db = seeded_source();
+    let store = db.store();
+    let searches = SavedSearches::new(&store);
+    searches
+        .insert(&SavedSearch {
+            id: "ss1".into(),
+            name: "watched".into(),
+            query: "memory".into(),
+            filters: SavedSearchFilters {
+                category: Some("general".into()),
+                tags: Some(vec!["a".into()]),
+                include_sensitive: true,
+            },
+            watch: true,
+            created_at: T1.into(),
+            updated_at: T2.into(),
+        })
+        .unwrap();
+    searches
+        .mark_seen("ss1", &["m1".into(), "m2".into()], T2)
+        .unwrap();
+    archives::ensure_tables(&store).unwrap();
+    let archive = Archives::new(&store);
+    archive
+        .record(&ArchiveRow {
+            import_id: "imp".into(),
+            hash: "h".into(),
+            filename: "a.json".into(),
+            archive_path: "archives/h.json".into(),
+            byte_len: 42,
+            archived_at: T1.into(),
+        })
+        .unwrap();
+    archive.record_span("m1", "imp", 0, 10).unwrap();
+    archive.record_span("m2", "imp", 10, 42).unwrap();
+    SyncState::new(&store)
+        .put_remote_row(&SyncLogRow {
+            last_pull: T1.into(),
+            last_pull_id: "m1".into(),
+            last_pull_seq: 7,
+            ..SyncLogRow::new("hub")
+        })
+        .unwrap();
+    let stats = StoreStats::new(&store);
+    for (day, total) in [(T1, 3), (T2, 5)] {
+        stats
+            .insert_snapshot(&AnalyticsSnapshot {
+                captured_at: day.into(),
+                total_memories: total,
+                vitality_buckets: [("high".to_string(), 2)].into(),
+                category_counts: [("general".to_string(), total)].into(),
+            })
+            .unwrap();
+    }
+    let revisions = Revisions::new(&store);
+    for (at, sensitive) in [(T1, Some(true)), (T2, None)] {
+        revisions
+            .insert(
+                "m1",
+                &Tracked {
+                    content: format!("before {at}"),
+                    category: "general".into(),
+                    tags: "[]".into(),
+                    metadata: "{}".into(),
+                    sensitive,
+                },
+                at,
+                Some("edit"),
+            )
+            .unwrap();
+    }
+    let wiki = WikiIndex::new(&store);
+    for (slug, title) in [("alpha", "Alpha page"), ("beta", "Beta page")] {
+        wiki.upsert(&WikiPage {
+            slug: slug.into(),
+            title: title.into(),
+            content: format!("{title} mentions quokkas"),
+            summary: format!("about {slug}"),
+            mtime: 12.5,
+            updated_at: T2.into(),
+        })
+        .unwrap();
+    }
+    wiki.replace_links(
+        "alpha",
+        &[
+            ("beta".into(), "Beta page".into()),
+            ("gamma".into(), "Gamma".into()),
+        ],
+    )
+    .unwrap();
+    wiki.set_meta("compiled_at", T2).unwrap();
+    drop(store);
+    db
+}
+
+/// A database on the engine holding a copy of the whole of `source`.
+fn copied_store(source: &Database) -> (Database, CopyReport) {
+    let target = Database::open_in_memory_on_engine().unwrap();
+    let report = {
+        let source = source.store();
+        let target = target.store();
+        let tables: &Mutex<EngineTables> = target.engine().unwrap();
+        let report = copy_store(source.sqlite().unwrap(), &mut tables.lock()).unwrap();
+        report
+    };
+    (target, report)
+}
+
+/// Every group outside the core, read back through its repository.
+fn read_back_groups(db: &Database) -> Vec<String> {
+    let store = db.store();
+    let searches = SavedSearches::new(&store);
+    let mut seen: Vec<String> = searches.seen_ids("ss1").unwrap().into_iter().collect();
+    seen.sort();
+    let revisions = Revisions::new(&store);
+    let listed = revisions.list("m1", 10).unwrap();
+    vec![
+        format!("{:?}", searches.list().unwrap()),
+        format!("{seen:?}"),
+        format!("{:?}", Archives::new(&store).oldest_first().unwrap()),
+        format!("{:?}", Archives::new(&store).span_source("m2").unwrap()),
+        format!("{:?}", Archives::new(&store).span_count(None).unwrap()),
+        format!("{:?}", SyncState::new(&store).remote_row("hub").unwrap()),
+        format!("{:?}", StoreStats::new(&store).snapshots().unwrap()),
+        format!(
+            "{:?}",
+            StoreStats::new(&store).snapshot_on("2026-02-01").unwrap()
+        ),
+        format!("{listed:?}"),
+        format!(
+            "{:?}",
+            listed
+                .iter()
+                .map(|r| revisions.revision("m1", r.id).unwrap())
+                .collect::<Vec<_>>()
+        ),
+        format!(
+            "{:?}",
+            WikiIndex::new(&store).recent_first_then_title().unwrap()
+        ),
+        format!("{:?}", WikiIndex::new(&store).link_count("alpha").unwrap()),
+        format!(
+            "{:?}",
+            WikiIndex::new(&store)
+                .search(&["quokkas".to_string()], 10)
+                .unwrap()
+        ),
+        format!("{:?}", WikiIndex::new(&store).meta("compiled_at").unwrap()),
+    ]
+}
+
+#[test]
+fn a_copied_store_reads_back_as_the_source_does() {
+    let source = seeded_store();
+    let (target, report) = copied_store(&source);
+    assert!(report.refused.is_empty(), "{:?}", report.refused);
+    for (table, n) in [
+        ("saved_searches", 1),
+        ("saved_search_seen_memories", 2),
+        ("import_archives", 1),
+        ("import_archive_spans", 2),
+        ("sync_log", 1),
+        ("analytics_snapshots", 2),
+        ("memory_revisions", 2),
+        ("wiki_pages", 2),
+        ("wiki_links", 2),
+        ("wiki_meta", 1),
+    ] {
+        assert_eq!(report.copied[table], n, "{table}");
+    }
+    let ours = read_back_groups(&source);
+    let theirs = read_back_groups(&target);
+    for (a, b) in ours.iter().zip(&theirs) {
+        assert_eq!(b, a);
+    }
+    assert_eq!(theirs.len(), ours.len());
+    // The core arrived too.
+    assert_eq!(read_back(&target), read_back(&source));
+}
+
+#[test]
+fn new_ids_continue_past_the_copied_ones() {
+    let source = seeded_store();
+    let (target, _) = copied_store(&source);
+    let store = target.store();
+    let snapshot = StoreStats::new(&store)
+        .insert_snapshot(&AnalyticsSnapshot {
+            captured_at: "2026-03-01T00:00:00+00:00".into(),
+            total_memories: 1,
+            vitality_buckets: Default::default(),
+            category_counts: Default::default(),
+        })
+        .unwrap();
+    assert!(snapshot > 2, "snapshot id {snapshot}");
+    Revisions::new(&store)
+        .insert(
+            "m1",
+            &Tracked {
+                content: "later".into(),
+                category: "general".into(),
+                tags: "[]".into(),
+                metadata: "{}".into(),
+                sensitive: None,
+            },
+            "2026-03-01T00:00:00+00:00",
+            None,
+        )
+        .unwrap();
+    let ids: Vec<i64> = Revisions::new(&store)
+        .list("m1", 10)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(ids.len(), 3);
+    assert!(ids.iter().all(|id| *id >= 1));
+    let mut unique = ids.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), 3, "no revision id was reissued: {ids:?}");
+}
+
+#[test]
+fn the_whole_copy_refuses_a_target_with_any_group_filled() {
+    let source = seeded_store();
+    let target = Database::open_in_memory_on_engine().unwrap();
+    {
+        let store = target.store();
+        WikiIndex::new(&store).set_meta("k", "v").unwrap();
+    }
+    let source = source.store();
+    let target = target.store();
+    let refused = copy_store(
+        source.sqlite().unwrap(),
+        &mut target.engine().unwrap().lock(),
+    );
+    assert!(matches!(refused, Err(StoreError::Invalid(ref why)) if why.contains("not empty")));
 }

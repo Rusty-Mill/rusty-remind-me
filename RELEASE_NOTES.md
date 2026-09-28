@@ -2,6 +2,15 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-28 — Copy a whole node store onto the engine, and `copy-store` (ADR-0023, phase 5.2)
+
+### Added
+- `db::engine::copy::copy_store`, which copies a node's whole SQLite store onto the engine: the memories core, saved searches, import archives, the sync log, analytics snapshots, memory revisions and the wiki. Every id is kept, every row is verified, and refused rows are reported, never dropped silently.
+- `rusty-remind-me copy-store --to <engine-dir> [--from <memory.db>]`, behind the CLI's new `engine-store` feature. It never writes to its source, and it exits non-zero, listing each refused row, if anything could not be copied.
+
+### Fixed
+- The core copy's differential test no longer depends on the unspecified order of `Memories::all_live`.
+
 ## 2026-09-28 — Copy the memories core from SQLite to the engine (ADR-0023, phase 5.1)
 
 ### Added

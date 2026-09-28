@@ -133,7 +133,7 @@ pub(crate) fn max_id(table: &SnapshotTable) -> u64 {
 /// 3339 timestamp, or of a plain `YYYY-MM-DD[ T]HH:MM:SS` or `YYYY-MM-DD`
 /// one taken as UTC. Empty when it is none of those, as SQLite's is `NULL`,
 /// which no day matches.
-fn utc_day(timestamp: &str) -> String {
+pub(super) fn utc_day(timestamp: &str) -> String {
     use chrono::{NaiveDate, NaiveDateTime};
     if let Ok(t) = chrono::DateTime::parse_from_rfc3339(timestamp) {
         return t.naive_utc().date().to_string();
