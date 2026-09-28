@@ -137,6 +137,21 @@ pub fn plaintext_gate() -> Result<(), String> {
     Err(PLAINTEXT_REFUSED.to_string())
 }
 
+/// What uploading the engine backup directory `path` does: nothing yet.
+/// The upload sends one file, and an engine backup is a directory, so a
+/// configured bucket gets an honest `Unavailable` rather than a silent skip.
+pub fn upload_backup_dir(path: &std::path::Path) -> UploadOutcome {
+    if configured_bucket().is_empty() {
+        return UploadOutcome::NotConfigured;
+    }
+    UploadOutcome::Unavailable {
+        reason: format!(
+            "{} is a backup of a store on the engine, a directory; uploading those is not built yet",
+            path.display()
+        ),
+    }
+}
+
 /// Upload a finished backup file.
 ///
 /// Never returns an error: the caller is `create_backup`, which has already

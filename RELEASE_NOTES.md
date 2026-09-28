@@ -2,6 +2,14 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-28 — Backups of a store on the engine (ADR-0023, phase 5.4a)
+
+### Added
+- `remind_me_backup` backs up a store on the engine to `backups/{label}-{timestamp}.engine`: a directory holding the SQLite file and the engine directory, copied while the engine is held so no write lands half-copied. Restoring is putting both back beside each other. Listing and retention count these backups alongside `.db` ones.
+
+### Changed
+- A store on the engine is no longer refused a backup. With a cloud bucket configured, the upload of an engine backup reports that it is not available yet rather than skipping silently.
+
 ## 2026-09-28 — An on-disk node opens on the engine (ADR-0023, phase 5.3)
 
 ### Added

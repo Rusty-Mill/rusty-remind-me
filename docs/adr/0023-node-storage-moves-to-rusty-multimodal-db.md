@@ -1310,9 +1310,31 @@ Phase 5 ships in four PRs:
     on-disk database was SQLite; they now say so with `open_on_sqlite`,
     which keeps exactly the coverage they had.
 
-**Next:** 5.4, the engine as the default: backups of the engine
-directory, `engine-store` on by default and the engine the default store,
-so a node copies itself on its first start with the new build.
+**5.4a, done: backups of a store on the engine.**
+
+- `create_backup` on the engine writes `backups/{label}-{timestamp}.engine`,
+  a directory holding the SQLite file and the engine directory under
+  their own names, as `Database::open` looks for them. Restoring is putting
+  both back.
+- The engine tables are held for the whole copy, so a page open on another
+  thread finishes first and no write lands half-copied. The SQLite half is
+  SQLite's online backup, as before. `EngineTables::copy_files_to` copies
+  every file but the directory lock.
+- The backup is written into a `.partial` directory and renamed when
+  complete, so a crash never leaves something that lists as a backup.
+- Listing counts `.engine` directories (their size is the sum of their
+  files) and retention prunes them like `.db` files, one count across both.
+- The cloud upload sends one file, so for an engine backup with a bucket
+  configured it reports `Unavailable` with the reason, never a silent skip.
+- Tests: a backup restores to the store as it was when taken, not after,
+  and retention prunes engine backups.
+
+**Next:** phase 2b, the daemon on by default (`REMIND_ME_DAEMON=0` the way
+out), which the engine needs: its directory has one opener, and without the
+daemon every Claude session's MCP server opens the store itself. Then 5.4b,
+the engine as the default: `engine-store` on by default and the engine the
+default store, so the daemon's first start with the new build copies the
+node through `Database::open`.
 
 ## Related
 

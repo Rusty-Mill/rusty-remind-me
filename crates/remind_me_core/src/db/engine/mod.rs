@@ -156,6 +156,8 @@ pub struct EngineTables {
     /// Set when a batch was durable but did not reach every store: the
     /// tables then refuse writes until reopened, which applies it again.
     failed: bool,
+    /// The directory the tables live in, for [`EngineTables::copy_files_to`].
+    dir: PathBuf,
     _lock: DirLock,
     _temporary: Option<TemporaryDir>,
 }
@@ -189,6 +191,7 @@ impl EngineTables {
             undo: undo.journal,
             page: None,
             failed: false,
+            dir: dir.to_path_buf(),
             _lock: lock,
             _temporary: None,
         };
@@ -232,6 +235,30 @@ impl EngineTables {
             return Err(StoreError::Engine(
                 "a write failed part-way; reopen the tables to recover it".to_string(),
             ));
+        }
+        Ok(())
+    }
+
+    /// Copy every file of the tables into `dest`, which must not exist: a
+    /// backup. The caller holds the tables, so no write lands mid-copy and
+    /// no page is open on another thread; the copy opens as the tables
+    /// would after a clean shutdown. The directory lock is not copied.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Engine`] naming the file that could not be copied.
+    pub(crate) fn copy_files_to(&self, dest: &Path) -> super::Result<()> {
+        let io =
+            |path: &Path, e: std::io::Error| StoreError::Engine(format!("{}: {e}", path.display()));
+        std::fs::create_dir(dest).map_err(|e| io(dest, e))?;
+        for entry in std::fs::read_dir(&self.dir).map_err(|e| io(&self.dir, e))? {
+            let entry = entry.map_err(|e| io(&self.dir, e))?;
+            let from = entry.path();
+            if entry.file_name() == LOCK_FILE || !from.is_file() {
+                continue;
+            }
+            let to = dest.join(entry.file_name());
+            std::fs::copy(&from, &to).map_err(|e| io(&from, e))?;
         }
         Ok(())
     }

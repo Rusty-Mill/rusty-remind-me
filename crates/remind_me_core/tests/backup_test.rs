@@ -213,18 +213,67 @@ fn an_empty_label_falls_back_rather_than_producing_a_bare_timestamp() {
     assert!(filename.starts_with("manual-"), "got {}", filename);
 }
 
+/// The memories in the store at `db_path`, opened on the engine.
+#[cfg(feature = "engine-store")]
+fn engine_memories(db_path: &Path) -> i64 {
+    let db = Database::open_on_engine(db_path).unwrap();
+    let store = db.store();
+    remind_me_core::testing::count(&store, remind_me_core::testing::Table::Memories).unwrap()
+}
+
 #[cfg(feature = "engine-store")]
 #[test]
-fn a_backup_of_a_store_on_the_engine_is_refused_rather_than_stale() {
-    let tmp = TempDir::new("engine_refused");
+fn a_store_on_the_engine_backs_up_both_halves_and_restores() {
+    let tmp = TempDir::new("engine_round_trip");
+    let backup = {
+        let db = Database::open_on_engine(tmp.db_path()).unwrap();
+        let store = db.store();
+        add(&store, "before the backup");
+        let outcome = create_backup(&store, "manual").unwrap();
+        add(&store, "after the backup");
+
+        assert!(outcome.path.ends_with(".engine"), "{}", outcome.path);
+        let listed = list_backups(&backup_dir(&store).unwrap()).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].size_bytes > 0);
+        PathBuf::from(outcome.path)
+    };
+
+    // Restoring is putting both halves back where the node looks for them.
+    let restored = TempDir::new("engine_restored");
+    std::fs::copy(backup.join("remind_me.db"), restored.db_path()).unwrap();
+    let engine = restored.0.join("remind_me.engine");
+    std::fs::create_dir(&engine).unwrap();
+    for entry in std::fs::read_dir(backup.join("remind_me.engine")).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::copy(entry.path(), engine.join(entry.file_name())).unwrap();
+    }
+
+    assert_eq!(engine_memories(&restored.db_path()), 1);
+    assert_eq!(engine_memories(&tmp.db_path()), 2);
+}
+
+#[cfg(feature = "engine-store")]
+#[test]
+fn retention_prunes_engine_backups_too() {
+    let tmp = TempDir::new("engine_retention");
     let db = Database::open_on_engine(tmp.db_path()).unwrap();
-    add(&db.store(), "written on the engine");
+    let store = db.store();
+    add(&store, "content");
 
-    let err = create_backup(&db.store(), "manual").unwrap_err();
-
-    assert!(matches!(err, BackupError::NotSqlite), "{err:?}");
-    assert!(err.to_string().contains("on the engine"));
-    assert!(list_backups(&backup_dir(&db.store()).unwrap())
+    for _ in 0..BACKUP_RETENTION_COUNT {
+        create_backup(&store, "manual").unwrap();
+    }
+    let oldest = list_backups(&backup_dir(&store).unwrap())
         .unwrap()
-        .is_empty());
+        .last()
+        .unwrap()
+        .path
+        .clone();
+
+    let outcome = create_backup(&store, "manual").unwrap();
+
+    assert_eq!(outcome.total_backups, BACKUP_RETENTION_COUNT);
+    assert_eq!(outcome.pruned, 1);
+    assert!(!Path::new(&oldest).exists(), "{oldest} should be gone");
 }
