@@ -59,7 +59,8 @@ pub(crate) struct CoreTables {
     pub(crate) chat_imports: ChatImportTable,
     pub(crate) dbs_imports: DbsImportTable,
     pub(crate) mempalace_imports: MempalaceImportTable,
-    /// `memories_fts`: derived from `memories` at open, never stored.
+    /// `memories_fts` over the live rows: derived from `memories` at open,
+    /// never stored.
     pub(crate) search: MemorySearch,
     /// `memory_tags`: derived from `memories` at open, never stored.
     pub(crate) tags: TagIndex,

@@ -1570,7 +1570,11 @@ mod tests {
     /// A corpus searched through `db`'s full-text index: every ranked and
     /// paged answer, scores to ten significant digits so float noise cannot
     /// fail the comparison but a real difference in ranking does.
-    fn exercise_search(db: &Database) -> Vec<Value> {
+    /// Every search the node makes, on a fixed corpus, as comparable values.
+    /// With `tombstones`, one row is superseded and one deleted, and hits
+    /// are compared as sets of ids: FTS5's BM25 counts those rows, the
+    /// engine's does not, so only the matches must agree.
+    fn exercise_search(db: &Database, tombstones: bool) -> Vec<Value> {
         const T2: &str = "2026-09-27T00:00:00+00:00";
         let store = db.store();
         let m = Memories::new(&store);
@@ -1628,8 +1632,10 @@ mod tests {
             })
             .unwrap();
         }
-        m.set_superseded_by("h", "a", None).unwrap();
-        m.delete_live("i", Some(T2)).unwrap();
+        if tombstones {
+            m.set_superseded_by("h", "a", None).unwrap();
+            m.delete_live("i", Some(T2)).unwrap();
+        }
         crate::db::entities::Entities::new(&store)
             .insert(
                 &crate::entity::Entity {
@@ -1673,15 +1679,21 @@ mod tests {
         for query in queries {
             for filter in &filters {
                 for limit in [2, 20] {
-                    let hits: Vec<Value> = m
-                        .keyword_hits(&phrases(query), filter, limit)
-                        .unwrap()
-                        .into_iter()
-                        .map(|(memory, score)| {
-                            serde_json::json!([memory.id, format!("{score:.9e}")])
-                        })
-                        .collect();
-                    seen.push(serde_json::json!([query, limit, hits]));
+                    let hits = m.keyword_hits(&phrases(query), filter, limit).unwrap();
+                    if !tombstones {
+                        let hits: Vec<Value> = hits
+                            .into_iter()
+                            .map(|(memory, score)| {
+                                serde_json::json!([memory.id, format!("{score:.9e}")])
+                            })
+                            .collect();
+                        seen.push(serde_json::json!([query, limit, hits]));
+                    } else if limit == 20 {
+                        let mut ids: Vec<String> =
+                            hits.into_iter().map(|(memory, _)| memory.id).collect();
+                        ids.sort();
+                        seen.push(serde_json::json!([query, ids]));
+                    }
                 }
             }
         }
@@ -1729,7 +1741,11 @@ mod tests {
                 .keyword_page(&phrases(query), &filter, limit, offset)
                 .unwrap();
             let ids: Vec<String> = page.into_iter().map(|m| m.id).collect();
-            seen.push(serde_json::json!([query, total, ids]));
+            if tombstones {
+                seen.push(serde_json::json!([query, total]));
+            } else {
+                seen.push(serde_json::json!([query, total, ids]));
+            }
         }
         let mut sensitive: Vec<String> = m.sensitive_ids().unwrap().into_iter().collect();
         sensitive.sort();
@@ -1740,7 +1756,7 @@ mod tests {
     #[test]
     fn the_engine_core_searches_as_fts5_does() {
         let mut observed = Vec::new();
-        on_each_backend(|db| observed.push(exercise_search(db)));
+        on_each_backend(|db| observed.push(exercise_search(db, false)));
         #[cfg(feature = "engine-store")]
         assert_eq!(observed.len(), 2, "both backends ran");
         let sqlite = &observed[0];
@@ -1755,6 +1771,27 @@ mod tests {
                 assert_eq!(theirs, ours);
             }
             assert_eq!(other.len(), sqlite.len());
+        }
+    }
+
+    /// FTS5 keeps superseded and deleted rows in its index and counts them
+    /// in BM25; the engine indexes live rows only. Search keeps live rows
+    /// alone either way, so both find the same memories.
+    #[test]
+    fn with_tombstones_the_engine_core_finds_what_fts5_finds() {
+        let mut observed = Vec::new();
+        on_each_backend(|db| observed.push(exercise_search(db, true)));
+        #[cfg(feature = "engine-store")]
+        assert_eq!(observed.len(), 2, "both backends ran");
+        let sqlite = &observed[0];
+        assert!(
+            sqlite
+                .iter()
+                .any(|v| v[1].as_array().is_some_and(|ids| ids.len() > 2)),
+            "the corpus gives some query several hits: {sqlite:?}"
+        );
+        for other in &observed[1..] {
+            assert_eq!(other, sqlite);
         }
     }
 

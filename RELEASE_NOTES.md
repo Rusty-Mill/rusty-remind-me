@@ -2,6 +2,16 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-28 — The engine's search index holds live memories only (ADR-0023)
+
+### Changed
+- A node keeps deleted and superseded memories as sync tombstones: on a real node, 47,008 of 62,060 rows. The engine indexed all of them for full-text search, though every search keeps live memories only. Now only live memories are indexed. On 60,000 synthetic memories with three quarters deleted, the steady open went from 5.2–5.5 s and 419 MB resident to 2.1–2.2 s and 275 MB.
+- Keyword search finds the same memories as before. Its BM25 scores now count live memories only, where SQLite's FTS5 counted tombstones too, so scores and near-tie ordering can differ slightly from a node on SQLite.
+
+### Tests
+- A superseded or deleted memory leaves the index, and one brought back is searchable again, including after a rebuild.
+- The comparison with FTS5 runs twice: with no tombstones, the scores must match exactly; with tombstones, the matches and totals must.
+
 ## 2026-09-28 — The first start on the engine says what it is doing, and clients wait for it (ADR-0023)
 
 ### Changed

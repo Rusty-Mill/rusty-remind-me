@@ -1405,6 +1405,16 @@ up to 30 minutes, which covers the copy and the open that follows it. Running `c
 the upgrade is not a safe shortcut: the node keeps writing to SQLite after
 it, and the new build would skip its own copy.
 
+**After 5.4b: the search index holds live memories only.** A per-table
+breakdown of the same node found 62,060 memory rows, 47,008 of them deleted:
+tombstones kept for sync, loaded and indexed at every open though no search
+returns them. The engine's full-text index now takes live rows only. That
+drops the exact BM25 match with FTS5, which counts every row it holds; the
+matches themselves are unchanged. On a synthetic store shaped like the node,
+the steady open fell from about 5.3 s to 2.2 s. Tombstones themselves still
+load at open. Purging them needs a rule for when every remote has seen a
+delete, which is a sync decision, not a storage one.
+
 ## Related
 
 - ADR-0021 (the hub's move) and ADR-0022 (the seam this continues).

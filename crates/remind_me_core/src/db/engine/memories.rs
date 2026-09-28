@@ -307,8 +307,18 @@ impl TagIndex {
 }
 
 /// Put `row` into the derived indexes.
+///
+/// Only a live row goes into the full-text index: every search keeps live
+/// rows alone, and a node keeps its deleted and superseded rows as sync
+/// tombstones, which were 76% of a real node's 62,060 rows. Leaving them out
+/// shrinks the index and its rebuild at open by as much. BM25 then counts
+/// live rows only, where FTS5 counts every row it holds, so scores differ
+/// from SQLite's when tombstones exist; matches do not. A row that comes
+/// back to life is indexed on the write that revives it.
 pub(crate) fn index(search: &mut MemorySearch, tags: &mut TagIndex, row: &MemoryRow) {
-    search.upsert(row.id.clone(), [&row.content, &row.category, &row.tags]);
+    if row.is_live() {
+        search.upsert(row.id.clone(), [&row.content, &row.category, &row.tags]);
+    }
     tags.add(row);
 }
 
@@ -1187,6 +1197,31 @@ mod tests {
         write(&mut tables, "a", Origin::Local, |_| Ok(Edit::Delete)).unwrap();
         assert!(hits(&tables, "wombat").is_empty());
         assert!(!core_ref(&tables).unwrap().tags.has("blue", "a"));
+    }
+
+    #[test]
+    fn only_live_rows_are_in_the_full_text_index() {
+        let mut tables = EngineTables::open_temporary().unwrap();
+        for id in ["live", "superseded", "deleted"] {
+            insert(&mut tables, &NewMemory::new(id, "quokka", T1)).unwrap();
+        }
+        set_superseded_by(&mut tables, "superseded", "live", Some(T2)).unwrap();
+        assert!(delete_live(&mut tables, "deleted", Some(T2)).unwrap());
+        assert_eq!(hits(&tables, "quokka"), ["live"]);
+        assert_eq!(core_ref(&tables).unwrap().search.len(), 1);
+
+        // A superseded row brought back is searchable again.
+        let revive = MemoryEdit {
+            clear_superseded: true,
+            updated_at: T2.to_string(),
+            ..MemoryEdit::default()
+        };
+        apply_edit(&mut tables, "superseded", &revive).unwrap();
+        assert_eq!(hits(&tables, "quokka"), ["live", "superseded"]);
+
+        // The rebuild at open indexes the same rows as the writes did.
+        rebuild(&mut tables).unwrap();
+        assert_eq!(hits(&tables, "quokka"), ["live", "superseded"]);
     }
 
     #[test]
