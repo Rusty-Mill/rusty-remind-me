@@ -187,7 +187,9 @@ pub trait HubStore: Send + Sync {
     /// category-by-category drift check against `/count?by=category`.
     fn count_by_category(&self, since: Option<&str>) -> StoreResult<Vec<(String, i64)>>;
 
-    /// Hard-delete memories tombstoned before `cutoff`. Returns how many.
+    /// Empty memories tombstoned before `cutoff` that still hold text
+    /// (ADR-0024). Returns how many. No row is deleted, and `updated_at` and
+    /// `hub_seq` stay as they were.
     fn compact_tombstones(&self, cutoff: &str) -> StoreResult<usize>;
 
     fn pull_memories(&self, query: &PullQuery) -> StoreResult<Vec<serde_json::Value>>;

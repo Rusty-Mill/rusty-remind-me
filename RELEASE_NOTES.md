@@ -2,6 +2,18 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-29 — The hub stores tombstones without their text and never deletes them (ADR-0024)
+
+### Changed
+- A pushed tombstone is stored emptied: `content` becomes `(deleted)`, `tags` becomes `[]`, and `subject`, `predicate` and `object` become null. Its id, timestamps, `deleted_at`, `category`, `source` and `metadata` stay. Last-write-wins compares `updated_at` only, so no push applies or loses differently.
+- `POST /admin/compact_tombstones` no longer deletes anything. It empties tombstones older than `REMIND_ME_HUB_TOMBSTONE_RETENTION_DAYS` that still hold text, such as those a copy brought over from an older hub, leaving each row's `updated_at` and `hub_seq` as they were. It answers `{"emptied": n, "retention_days": d}`; the `purged` key is gone. Links to deleted memories are kept.
+
+### Fixed
+- Compaction could bring a deleted memory back. It hard-deleted tombstones by age, so a node offline for longer than the retention never saw the delete, and its next push of the memory found no row on the hub, was inserted as live, and reached every node. The tombstone now stays to lose against.
+
+### Tests
+- A pushed tombstone pulls back emptied, with its `source` and `metadata`; a stale live push loses to it after compaction, and a newer edit still wins; compaction deletes no tombstone and no link, and renumbers nothing; a copied hub's text-holding tombstone is emptied in place by compaction.
+
 ## 2026-09-29 — The hub's Quadlet unit keeps retrying until its address exists
 
 ### Fixed

@@ -21,11 +21,12 @@
 //!   chunk it covered is applied in memory but may not be on disk, so
 //!   carrying on could acknowledge writes built on ones a crash loses.
 //!   [`HubStore::ping`] then fails, so `/health` reports it.
-//! - **`hub_seq` never goes backwards,** even across a compaction that
-//!   deletes the row holding the highest one. The counter lives in memory
-//!   and restarts from the highest `hub_seq` stored, so before deleting any
-//!   memory, [`HubStore::compact_tombstones`] records the counter in a
-//!   floor file the next open starts above.
+//! - **`hub_seq` never goes backwards.** The counter lives in memory and
+//!   restarts from the highest `hub_seq` stored, or from the floor file a
+//!   copy writes, whichever is higher. Nothing deletes a memory row:
+//!   [`HubStore::compact_tombstones`] empties tombstones in place
+//!   (ADR-0024). A hub that purged tombstones before then keeps its floor
+//!   file.
 //! - **The insert logs grow until compaction.** [`MultimodalHubStore::compact`]
 //!   folds them; the binary runs it on a schedule, and the tombstone
 //!   compaction route runs it too.
@@ -49,7 +50,7 @@ use rusty_multimodal_db_engine::dir_lock::{DirLock, DirLockError};
 use rusty_multimodal_db_engine::durability::{sync_parent_dir, DurabilityError};
 use rusty_multimodal_db_engine::generic::mmap_field::MmapFieldValue;
 use rusty_multimodal_db_engine::generic::query::{
-    AllIds, Compact, Delete, GetById, Insert, PageBy, RangeBy, Replace,
+    AllIds, Compact, GetById, Insert, PageBy, RangeBy, Replace,
 };
 use rusty_multimodal_db_engine::generic::store::{GroupCommit, Ordered};
 use rusty_multimodal_db_engine::generic::traits::{
@@ -59,7 +60,7 @@ use rusty_multimodal_db_engine::generic::GenericMmapStore;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Write;
 use std::ops::Bound;
@@ -140,7 +141,6 @@ impl Tables {
 
 /// A hub store in one data directory.
 pub struct MultimodalHubStore {
-    dir: PathBuf,
     tables: RwLock<Tables>,
     /// Writers queue here before asking for the write lock, so at most one
     /// writer ever waits on `tables`. `std`'s `RwLock` lets a waiting writer
@@ -251,7 +251,6 @@ impl MultimodalHubStore {
         let next_seq = stored_max.max(read_seq_floor(dir)?) + 1;
 
         Ok(Self {
-            dir: dir.to_path_buf(),
             tables: RwLock::new(Tables {
                 memories,
                 entities: Ordered::new(entities),
@@ -530,6 +529,9 @@ fn count(n: usize) -> i64 {
 fn apply_memory(t: &mut Tables, m: &MemoryRecord, origin: Option<&str>) -> StoreResult<bool> {
     keys::check_id("memory id", &m.id)?;
     let mut row = MemoryRow::new(m, origin, t.next_seq)?;
+    // A tombstone is stored without its text (ADR-0024). LWW below compares
+    // `updated_at` only, so this changes no outcome.
+    row.empty_if_tombstone();
     match t.memories.get(row.engine_id) {
         None => t.memories.insert(row).map_err(engine_err)?,
         Some(local) => {
@@ -801,32 +803,21 @@ impl HubStore for MultimodalHubStore {
 
     fn compact_tombstones(&self, cutoff: &str) -> StoreResult<usize> {
         let mut t = self.write()?;
-        let doomed: Vec<MemoryRow> = all_rows::<_, MemoryRow>(&t.memories)
+        let emptied: Vec<MemoryRow> = all_rows::<_, MemoryRow>(&t.memories)
             .into_iter()
             .filter(|m| m.deleted_at.as_deref().is_some_and(|d| d < cutoff))
+            .filter_map(|mut m| m.empty_if_tombstone().then_some(m))
             .collect();
-        if !doomed.is_empty() {
-            // Before any delete: the row holding the highest `hub_seq` may be
-            // among these, and the next open must not issue it again.
-            write_seq_floor(&self.dir, t.next_seq - 1)?;
-            let doomed_ids: HashSet<&str> = doomed.iter().map(|m| m.id.as_str()).collect();
-            let orphaned: Vec<Uuid> = all_rows::<_, LinkRow>(&t.links)
-                .into_iter()
-                .filter(|l| doomed_ids.contains(l.memory_id.as_str()))
-                .map(|l| l.engine_id)
-                .collect();
-            for m in &doomed {
-                t.memories.delete(m.engine_id).map_err(engine_err)?;
-            }
-            for id in orphaned {
-                t.links.delete(id).map_err(engine_err)?;
-            }
+        for row in &emptied {
+            t.memories.replace(row.clone()).map_err(engine_err)?;
+        }
+        if !emptied.is_empty() {
             t.writes_since_compact += 1;
         }
         // The admin route is where an operator reclaims space, so it folds
         // the insert logs too.
         compact_tables(&mut t)?;
-        Ok(doomed.len())
+        Ok(emptied.len())
     }
 
     fn pull_memories(&self, query: &PullQuery) -> StoreResult<Vec<Value>> {

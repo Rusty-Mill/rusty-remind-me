@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::record;
+use crate::record::TOMBSTONE_CONTENT;
 use serde_json::json;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -101,35 +102,82 @@ fn every_table_survives_a_reopen_and_hub_seq_carries_on_above_it() {
     assert_eq!(seqs(&store).last(), Some(&("m3".to_string(), 3)));
 }
 
+/// Every memory row, sorted by id.
+fn rows(store: &MultimodalHubStore) -> Vec<MemoryRow> {
+    let mut rows = all_rows::<_, MemoryRow>(&store.read().memories);
+    rows.sort_by(|a, b| a.id.cmp(&b.id));
+    rows
+}
+
+/// Store a tombstone with its text, as a copy of an older hub leaves one,
+/// bypassing the emptying a push does.
+fn store_unemptied_tombstone(store: &MultimodalHubStore, id: &str, deleted: &str) {
+    let Record::Memory(m) = tombstone(id, deleted, deleted) else {
+        unreachable!("tombstone() builds a memory")
+    };
+    let mut t = store.write().unwrap();
+    let row = MemoryRow::new(&m, Some("node-a"), t.next_seq).unwrap();
+    t.memories.insert(row).unwrap();
+    t.next_seq += 1;
+}
+
 #[test]
-fn compacting_away_the_highest_hub_seq_never_lets_it_be_issued_again() {
-    // A node whose cursor sits at the deleted row's hub_seq would skip a
-    // new row that reused it, for good.
-    let dir = TempDir::new("seq_floor");
+fn a_pushed_tombstone_is_stored_without_its_text() {
+    let dir = TempDir::new("emptied_on_apply");
+    let store = MultimodalHubStore::open(&dir.0).unwrap();
+    store
+        .apply_record(
+            &tombstone("m1", "2026-08-02T00:00:00Z", "2026-08-02T00:00:00Z"),
+            None,
+        )
+        .unwrap();
+    let row = &rows(&store)[0];
+    assert_eq!(row.content, TOMBSTONE_CONTENT);
+    assert_eq!(row.tags, "[]");
+    assert!(row.deleted_at.is_some(), "it is still a tombstone");
+    assert_eq!(row.hub_seq, 1);
+}
+
+#[test]
+fn compaction_empties_old_tombstones_in_place_and_deletes_nothing() {
+    let dir = TempDir::new("compaction_empties");
     {
         let store = MultimodalHubStore::open(&dir.0).unwrap();
         store
-            .apply_record(&memory("m1", "2026-08-02T00:00:00Z"), None)
+            .apply_record(&memory("live", "2026-08-01T00:00:00Z"), None)
             .unwrap();
-        store
-            .apply_record(
-                &tombstone("m2", "2026-08-02T00:00:00Z", "2026-08-02T00:00:00Z"),
-                None,
-            )
-            .unwrap();
+        store_unemptied_tombstone(&store, "old", "2026-08-02T00:00:00Z");
+        store_unemptied_tombstone(&store, "recent", "2026-09-10T00:00:00Z");
+        let before = rows(&store);
+
+        let cutoff = "2026-09-01T00:00:00+00:00";
+        assert_eq!(store.compact_tombstones(cutoff).unwrap(), 1);
         assert_eq!(
-            store
-                .compact_tombstones("2026-09-01T00:00:00+00:00")
-                .unwrap(),
-            1
+            store.compact_tombstones(cutoff).unwrap(),
+            0,
+            "an emptied tombstone is not counted again"
         );
+
+        let after = rows(&store);
+        assert_eq!(after.len(), 3, "no row is deleted");
+        let old = &after[1];
+        assert_eq!(old.id, "old");
+        assert_eq!(old.content, TOMBSTONE_CONTENT);
+        assert_eq!(old.hub_seq, before[1].hub_seq, "hub_seq stays");
+        assert_eq!(old.updated_at, before[1].updated_at, "updated_at stays");
+        assert_eq!(
+            after[2].content, "gone",
+            "a recent tombstone keeps its text"
+        );
+        assert_eq!(after[0], before[0], "a live memory is untouched");
     }
+    // The emptied row survives a reopen, and the next write numbers on.
     let store = MultimodalHubStore::open(&dir.0).unwrap();
-    assert_eq!(seqs(&store), vec![("m1".into(), 1)]);
+    assert_eq!(rows(&store)[1].content, TOMBSTONE_CONTENT);
     store
-        .apply_record(&memory("m3", "2026-08-03T00:00:00Z"), None)
+        .apply_record(&memory("next", "2026-08-03T00:00:00Z"), None)
         .unwrap();
-    assert_eq!(seqs(&store).last(), Some(&("m3".to_string(), 3)));
+    assert_eq!(seqs(&store).last(), Some(&("next".to_string(), 4)));
 }
 
 #[test]

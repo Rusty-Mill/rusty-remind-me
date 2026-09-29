@@ -323,3 +323,29 @@ pub fn highest_seq(answers: &Value) -> i64 {
         .max()
         .unwrap_or(0)
 }
+
+/// `answers` as they read once tombstones are stored emptied (ADR-0024):
+/// the recorded SQL stores kept a tombstone's text, and the engine drops it
+/// on push. Every other field, and every count, is as recorded.
+pub fn with_tombstones_emptied(mut answers: Value) -> Value {
+    fn walk(value: &mut Value) {
+        match value {
+            Value::Array(items) => items.iter_mut().for_each(walk),
+            Value::Object(fields) => {
+                let is_tombstone = fields.get("deleted_at").is_some_and(Value::is_string)
+                    && fields.contains_key("content");
+                if is_tombstone {
+                    fields.insert("content".into(), json!(record::TOMBSTONE_CONTENT));
+                    fields.insert("tags".into(), json!([]));
+                    for key in ["subject", "predicate", "object"] {
+                        fields.insert(key.into(), Value::Null);
+                    }
+                }
+                fields.values_mut().for_each(walk);
+            }
+            _ => {}
+        }
+    }
+    walk(&mut answers);
+    answers
+}

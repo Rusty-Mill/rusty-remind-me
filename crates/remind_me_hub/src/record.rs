@@ -15,6 +15,14 @@
 use crate::canon::{canon_ts, coerce_json_field};
 use serde_json::Value;
 
+/// The `content` an emptied tombstone carries (ADR-0024).
+///
+/// Not `""`: a node rejects a pulled record whose `content` is empty, and its
+/// pull cursor stops at a record that did not apply, so an empty tombstone
+/// would stall every node on it. Nodes hold the same value; it is part of
+/// the wire format.
+pub const TOMBSTONE_CONTENT: &str = "(deleted)";
+
 /// A record that failed validation. Counted as `failed` in a push response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordError(pub String);

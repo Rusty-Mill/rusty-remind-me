@@ -4,6 +4,7 @@
 //! Everything here is about the *protocol*: what a node sees on the wire.
 
 use remind_me_hub::http::Head;
+use remind_me_hub::record::TOMBSTONE_CONTENT;
 use remind_me_hub::store::HubStore;
 use remind_me_hub::{dispatch, Config};
 use serde_json::{json, Value};
@@ -751,14 +752,50 @@ fn metrics_are_prometheus_text_and_404_when_disabled() {
     );
 }
 
+/// A tombstone as a node pushes it: the whole row, text included.
+fn tombstone(id: &str, deleted: &str) -> Value {
+    let mut record = memory(id, deleted);
+    record["deleted_at"] = json!(deleted);
+    record["tags"] = json!(["private"]);
+    record["subject"] = json!("someone");
+    record["source"] = json!("chat_import");
+    record["metadata"] = json!({ "chat_id": id });
+    record
+}
+
 #[test]
-fn compaction_removes_expired_tombstones_and_their_links() {
+fn a_pushed_tombstone_is_stored_without_its_text() {
     let store = store();
-    let mut old = memory("old", "2026-01-01T00:00:00Z");
-    old["deleted_at"] = json!("2026-01-01T00:00:00Z");
-    let mut recent = memory("recent", "2026-08-05T00:00:00Z");
-    recent["deleted_at"] = json!("2026-08-05T00:00:00Z");
-    push(&store, "node-a", vec![old, recent]);
+    let body = push(
+        &store,
+        "node-a",
+        vec![tombstone("t1", "2026-08-05T00:00:00Z")],
+    );
+    assert_eq!(body["accepted"], 1);
+
+    let (_, body) = get(&store, "/sync/pull", "");
+    let pulled = &body["records"][0];
+    assert_eq!(pulled["content"], TOMBSTONE_CONTENT);
+    assert_eq!(pulled["tags"], json!([]));
+    assert_eq!(pulled["subject"], Value::Null);
+    assert!(pulled["deleted_at"].is_string(), "still a tombstone");
+    // What LWW and a node's re-import checks read is kept.
+    assert_eq!(pulled["updated_at"], "2026-08-05T00:00:00+00:00");
+    assert_eq!(pulled["source"], "chat_import");
+    assert_eq!(pulled["metadata"], json!({ "chat_id": "t1" }));
+}
+
+#[test]
+fn compaction_deletes_no_tombstone_and_no_link() {
+    let store = store();
+    push(
+        &store,
+        "node-a",
+        vec![
+            tombstone("old", "2026-01-01T00:00:00Z"),
+            tombstone("recent", "2026-08-05T00:00:00Z"),
+        ],
+    );
     push(
         &store,
         "node-a",
@@ -778,18 +815,48 @@ fn compaction_removes_expired_tombstones_and_their_links() {
         &json!(null),
     );
     assert_eq!(status, 200);
-    assert_eq!(body["purged"], 1, "only the expired tombstone");
+    assert_eq!(
+        body["emptied"], 0,
+        "tombstones pushed through the route are emptied already"
+    );
     assert_eq!(body["retention_days"], 90);
 
     let (_, body) = get(&store, "/sync/pull", "");
-    assert_eq!(body["count"], 1);
-    assert_eq!(body["records"][0]["id"], "recent");
-
+    assert_eq!(body["count"], 2, "both tombstones stay");
     let (_, links) = get(&store, "/sync/pull_links", "");
-    assert_eq!(
-        links["count"], 0,
-        "the purged memory's links must go with it"
+    assert_eq!(links["count"], 1, "and so does the link");
+}
+
+#[test]
+fn a_stale_push_never_brings_a_deleted_memory_back() {
+    // The resurrection ADR-0024 closes: a node that missed the delete pushes
+    // the memory as it last saw it. The tombstone is still there to lose to.
+    let store = store();
+    push(
+        &store,
+        "node-a",
+        vec![tombstone("m1", "2026-08-05T00:00:00Z")],
     );
+    let (status, _) = call(
+        &store,
+        "POST",
+        "/admin/compact_tombstones",
+        "",
+        &json!(null),
+    );
+    assert_eq!(status, 200);
+
+    let body = push(&store, "node-b", vec![memory("m1", "2026-08-01T00:00:00Z")]);
+    assert_eq!(body["accepted"], 0, "the older live copy loses LWW");
+    let (_, body) = get(&store, "/sync/pull", "");
+    assert_eq!(body["count"], 1);
+    assert!(body["records"][0]["deleted_at"].is_string());
+
+    // A genuinely newer edit still wins, text and all.
+    push(&store, "node-b", vec![memory("m1", "2026-08-06T00:00:00Z")]);
+    let (_, body) = get(&store, "/sync/pull", "");
+    assert_eq!(body["records"][0]["content"], "content of m1");
+    assert_eq!(body["records"][0]["deleted_at"], Value::Null);
 }
 
 #[test]
@@ -807,43 +874,55 @@ fn a_live_memory_is_never_compacted_however_old() {
         "",
         &json!(null),
     );
-    assert_eq!(body["purged"], 0);
+    assert_eq!(body["emptied"], 0);
     let (_, body) = get(&store, "/sync/pull", "");
     assert_eq!(body["count"], 1);
+    assert_eq!(body["records"][0]["content"], "content of ancient");
 }
 
 #[test]
-fn compacting_the_newest_tombstone_never_reissues_its_hub_seq() {
+fn compaction_leaves_every_hub_seq_in_place() {
     // A node's since_seq cursor resumes strictly after the last hub_seq it
-    // saw. If compaction purged the row holding the highest seq and the next
-    // write reused that number, a node already at that cursor would never
-    // pull the new row.
+    // saw, so a compaction must neither remove nor renumber a row.
     let store = store();
     push(&store, "node-a", vec![memory("m1", "2026-08-01T00:00:00Z")]);
-    let mut m2 = memory("m2", "2026-01-01T00:00:00Z");
-    m2["deleted_at"] = json!("2026-01-01T00:00:00Z");
-    push(&store, "node-a", vec![m2]);
+    push(
+        &store,
+        "node-a",
+        vec![tombstone("m2", "2026-01-01T00:00:00Z")],
+    );
 
     let (_, body) = get(&store, "/sync/pull", "since_seq=0");
     assert_eq!(body["records"][1]["id"], "m2");
     let cursor = body["records"][1]["hub_seq"].as_i64().unwrap();
     assert_eq!(cursor, 2);
 
-    let (_, body) = call(
+    call(
         &store,
         "POST",
         "/admin/compact_tombstones",
         "",
         &json!(null),
     );
-    assert_eq!(body["purged"], 1, "m2 is the expired tombstone");
-
     push(&store, "node-a", vec![memory("m3", "2026-08-02T00:00:00Z")]);
 
+    let (_, body) = get(&store, "/sync/pull", "since_seq=0");
+    let seqs: Vec<(Value, Value)> = body["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r["id"].clone(), r["hub_seq"].clone()))
+        .collect();
+    assert_eq!(
+        seqs,
+        vec![
+            (json!("m1"), json!(1)),
+            (json!("m2"), json!(2)),
+            (json!("m3"), json!(3)),
+        ]
+    );
     let (_, body) = get(&store, "/sync/pull", &format!("since_seq={cursor}"));
-    assert_eq!(body["count"], 1, "a node at the old cursor must see m3");
-    assert_eq!(body["records"][0]["id"], "m3");
-    assert_eq!(body["records"][0]["hub_seq"], 3);
+    assert_eq!(body["count"], 1, "a node at the old cursor sees m3");
 }
 
 /// Minimal percent-encoding for the query values these tests build.

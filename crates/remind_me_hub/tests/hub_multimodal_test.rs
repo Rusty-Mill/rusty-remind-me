@@ -33,29 +33,28 @@ fn scratch(label: &str) -> PathBuf {
 fn the_engine_answers_every_read_as_the_sql_stores_did() {
     let dir = scratch("recorded");
     let expected = recorded::recorded();
+    let after_pushes = recorded::with_tombstones_emptied(expected["after_pushes"].clone());
     let engine = MultimodalHubStore::open(&dir).expect("open the engine store");
 
     let applied = recorded::apply_script(&engine);
     assert_eq!(json!(applied), expected["applied"], "which pushes applied");
-    recorded::assert_answers(&engine, &expected["after_pushes"], "after the pushes");
+    recorded::assert_answers(&engine, &after_pushes, "after the pushes");
 
+    // The recorded `after_compaction` is the retired purge. Compaction now
+    // only empties, and every tombstone was emptied on push.
     assert_eq!(
         engine
             .compact_tombstones(recorded::COMPACT_CUTOFF)
             .expect("compact"),
-        1,
-        "the script holds one expired tombstone"
+        0,
+        "the script's tombstones were emptied on push"
     );
-    recorded::assert_answers(
-        &engine,
-        &expected["after_compaction"],
-        "after compacting tombstones",
-    );
+    recorded::assert_answers(&engine, &after_pushes, "after compacting tombstones");
 
     // And the same after a reopen, which rebuilds the sort indexes from disk.
     drop(engine);
     let reopened = MultimodalHubStore::open(&dir).expect("reopen");
-    recorded::assert_answers(&reopened, &expected["after_compaction"], "after a reopen");
+    recorded::assert_answers(&reopened, &after_pushes, "after a reopen");
     drop(reopened);
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -249,7 +249,12 @@ pub fn metrics(store: &dyn HubStore, config: &Config) -> Response {
     Response::text(200, "text/plain; version=0.0.4", body)
 }
 
-/// Hard-delete memories tombstoned longer than the retention window ago.
+/// Empty tombstones older than the retention window that still hold text.
+///
+/// Nothing is deleted (ADR-0024): a deleted row is what makes a stale push
+/// of the same memory lose, so purging one let a node that missed the
+/// delete bring the memory back. Tombstones pushed since are stored emptied
+/// already; this reaches the ones stored before that.
 ///
 /// Operator-triggered rather than an automatic background loop: the hub has no
 /// periodic-task infrastructure to hang one off, and a cron hitting this is
@@ -257,15 +262,15 @@ pub fn metrics(store: &dyn HubStore, config: &Config) -> Response {
 pub fn compact_tombstones(store: &dyn HubStore, config: &Config) -> Response {
     let cutoff = chrono::Utc::now() - chrono::Duration::days(config.tombstone_retention_days);
     match store.compact_tombstones(&crate::canon::format_canonical(cutoff)) {
-        Ok(purged) => {
+        Ok(emptied) => {
             eprintln!(
-                "hub: compacted {purged} tombstoned memories older than {} days",
+                "hub: emptied {emptied} tombstoned memories older than {} days",
                 config.tombstone_retention_days
             );
             Response::json(
                 200,
                 &json!({
-                    "purged": purged,
+                    "emptied": emptied,
                     "retention_days": config.tombstone_retention_days,
                 }),
             )

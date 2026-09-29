@@ -12,7 +12,7 @@ behaviour changes, and say why in the commit.
 
 | File | What it is |
 | --- | --- |
-| `script_answers.json` | The SQLite store's answers to the script in `../suite/recorded.rs`: whether each push applied, every read after the pushes, and every read after compacting tombstones at `COMPACT_CUTOFF`. The engine agreed with it exactly, and Postgres agreed up to `hub_seq` gaps. |
+| `script_answers.json` | The SQLite store's answers to the script in `../suite/recorded.rs`: whether each push applied, every read after the pushes, and every read after compacting tombstones at `COMPACT_CUTOFF`. The engine agreed with it exactly, and Postgres agreed up to `hub_seq` gaps. Since ADR-0024 the engine stores tombstones emptied and never purges them, so the tests compare against `after_pushes` with tombstones emptied, and `after_compaction` records the retired purge. |
 | `sqlite_hub.sql` | The SQLite hub database after that script, before compaction, as SQL. |
 | `sqlite_hub_compacted.sql` | A SQLite hub whose newest memory was compacted away: `hub_meta` holds 2, the one remaining row holds 1. |
 | `sqlite_hub_invalid.sql` | A SQLite hub holding a memory with a 65-byte id and a link to it, which the engine cannot store. |

@@ -22,7 +22,7 @@
 //! | `GET /stats` | bearer | the full aggregate, once per reconcile |
 //! | `GET /count` | bearer | scalar counts, cheap enough to poll |
 //! | `GET /metrics` | bearer | Prometheus text, off by default |
-//! | `POST /admin/compact_tombstones` | bearer | hard-delete expired tombstones |
+//! | `POST /admin/compact_tombstones` | bearer | empty expired tombstones' text |
 //! | `POST /sync/push` | bearer | upsert a batch, LWW on `updated_at` |
 //! | `GET /sync/pull` | bearer | memory records since a cursor |
 //! | `GET /sync/pull_entities` | bearer | entity records |

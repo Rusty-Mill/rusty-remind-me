@@ -58,7 +58,7 @@ REMIND_ME_HUB_DATA_DIR=./hub-data \
 | `REMIND_ME_HUB_BIND` | `127.0.0.1` | Listen address. The image sets `0.0.0.0`. |
 | `REMIND_ME_HUB_PORT` | `8765` | Listen port. |
 | `REMIND_ME_HUB_METRICS_ENABLED` | off | Serve `GET /metrics`. Off returns 404. |
-| `REMIND_ME_HUB_TOMBSTONE_RETENTION_DAYS` | `90` | Age past which `/admin/compact_tombstones` hard-deletes. |
+| `REMIND_ME_HUB_TOMBSTONE_RETENTION_DAYS` | `90` | Age past which `/admin/compact_tombstones` empties a tombstone that still holds its text. |
 
 An unset `REMIND_ME_HUB_DATA_DIR` is an error rather than a default: a hub that
 quietly created an empty store would look healthy while serving nothing.
@@ -148,7 +148,7 @@ The readers stay in later releases (the Postgres one behind the default
 | `GET /stats` | bearer | Full aggregate — once per reconcile. |
 | `GET /count` | bearer | Scalar counts, cheap enough to poll. `?table=`, `?since=`, `?by=origin_node\|category`, `?approx=1`. |
 | `GET /metrics` | bearer | Prometheus text. 404 when disabled. |
-| `POST /admin/compact_tombstones` | bearer | Hard-delete expired tombstones. |
+| `POST /admin/compact_tombstones` | bearer | Empty expired tombstones that still hold text. Deletes nothing. |
 | `POST /sync/push` | bearer | Upsert a batch. LWW on `updated_at`. |
 | `GET /sync/pull` | bearer | Memory records since a cursor. |
 | `GET /sync/pull_entities` | bearer | Entity records. |
@@ -224,11 +224,15 @@ throwaway Postgres container, copies it onto the engine with the copy tool,
 and swaps it in. A hub that already holds memories needs `--force`, and the
 data it replaces is moved aside rather than deleted.
 
-Tombstone compaction is operator-triggered (a cron hitting
-`/admin/compact_tombstones`) rather than a background loop, since the hub has
-no periodic-task infrastructure to hang one off. It is purely time-based, with
-no per-node cursor tracking — a node offline longer than the retention window
-can miss a delete, the same accepted gap the client-side compaction lives with.
+A tombstone is stored without its text (ADR-0024): a pushed tombstone keeps
+its id, timestamps, `deleted_at`, `category`, `source` and `metadata`, and its
+`content` becomes `(deleted)`. No tombstone is ever deleted, because the row
+is what makes a stale push of the same memory lose last-write-wins; a hub that
+purged tombstones let a node that missed a delete bring the memory back.
+`/admin/compact_tombstones` empties the tombstones older than the retention
+that still hold text, such as those copied from an older hub, and answers
+`{"emptied": n, "retention_days": d}`. It is operator-triggered, since the hub
+has no periodic-task infrastructure to hang one off.
 
 ## Security posture
 

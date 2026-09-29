@@ -124,6 +124,28 @@ fn a_copied_sqlite_hub_answers_every_read_as_the_source_did() {
 }
 
 #[test]
+fn compacting_a_copied_hub_empties_its_old_tombstones_in_place() {
+    // A hub copied from an older one holds tombstones with their text, as
+    // the source stored them. Compaction empties them (ADR-0024); every
+    // row, hub_seq and count stays as the source had it.
+    let dir = Scratch::new("compact_copy");
+    sqlite_hub(&dir.path("hub.db"), SCRIPT_HUB);
+    let expected = recorded::recorded();
+    let engine = copy(&dir.path("hub.db"), &dir.path("engine"));
+
+    assert_eq!(
+        engine.compact_tombstones(recorded::COMPACT_CUTOFF).unwrap(),
+        1,
+        "the script holds one expired tombstone"
+    );
+    recorded::assert_answers(
+        &engine,
+        &recorded::with_tombstones_emptied(expected["after_pushes"].clone()),
+        "after compacting the copy",
+    );
+}
+
+#[test]
 fn a_copy_never_reissues_a_hub_seq_the_source_compacted_away() {
     // The SQLite store remembered the highest hub_seq it issued in
     // `hub_meta`, above every remaining row once compaction purged the

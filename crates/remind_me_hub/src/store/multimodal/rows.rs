@@ -29,7 +29,9 @@
 //! conversion (ADR-0021, Consequences).
 
 use super::keys::{self, IdKey, LinkKey};
-use crate::record::{EntityRecord, EntityRelationRecord, LinkRecord, MemoryRecord};
+use crate::record::{
+    EntityRecord, EntityRelationRecord, LinkRecord, MemoryRecord, TOMBSTONE_CONTENT,
+};
 use crate::store::StoreResult;
 use rusty_multimodal_db_engine::generic::traits::{
     IndexedField, OrderedField, Record, ScannableField, SchemaTag,
@@ -96,6 +98,9 @@ macro_rules! timestamp_ordered {
 fn json_text(raw: &str, default: Value) -> Value {
     serde_json::from_str(raw).unwrap_or(default)
 }
+
+/// An emptied tombstone's `tags`, as stored.
+const EMPTY_TAGS: &str = "[]";
 
 fn to_json_text(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "null".to_string())
@@ -202,6 +207,32 @@ impl MemoryRow {
             sensitive: m.sensitive,
             remind_at: m.remind_at.clone(),
         })
+    }
+
+    /// Drop a tombstone's text, keeping what last-write-wins and re-imports
+    /// need (ADR-0024). Returns whether anything changed: `false` for a
+    /// live memory or a tombstone already emptied.
+    ///
+    /// `updated_at` and `hub_seq` stay as they are: this is storage, not an
+    /// edit, so a node that already pulled the row has nothing new to pull.
+    pub fn empty_if_tombstone(&mut self) -> bool {
+        if self.deleted_at.is_none() || self.is_emptied() {
+            return false;
+        }
+        self.content = TOMBSTONE_CONTENT.to_string();
+        self.tags = EMPTY_TAGS.to_string();
+        self.subject = None;
+        self.predicate = None;
+        self.object = None;
+        true
+    }
+
+    fn is_emptied(&self) -> bool {
+        self.content == TOMBSTONE_CONTENT
+            && self.tags == EMPTY_TAGS
+            && self.subject.is_none()
+            && self.predicate.is_none()
+            && self.object.is_none()
     }
 
     /// The wire form, key for key what the retired SQLite store's pull
