@@ -229,7 +229,7 @@ impl MemoryRow {
         true
     }
 
-    fn is_emptied(&self) -> bool {
+    pub(crate) fn is_emptied(&self) -> bool {
         self.content == TOMBSTONE_CONTENT
             && self.tags == EMPTY_TAGS
             && self.subject.is_none()

@@ -158,15 +158,18 @@ impl<'c> StoreStats<'c> {
         )?)
     }
 
-    /// How many tombstones were deleted before `cutoff`.
-    pub fn tombstones_before(&self, cutoff: &str) -> Result<i64> {
+    /// How many tombstones still hold their text: any not yet emptied as
+    /// ADR-0024 says.
+    pub fn tombstones_holding_text(&self) -> Result<i64> {
         #[cfg(feature = "engine-store")]
         if let Some(core) = self.core {
-            return engine::stats::tombstones_before(&core.lock(), cutoff);
+            return engine::stats::tombstones_holding_text(&core.lock());
         }
         Ok(self.conn.query_row(
-            "SELECT COUNT(*) FROM memories WHERE deleted_at IS NOT NULL AND deleted_at < ?",
-            params![cutoff],
+            "SELECT COUNT(*) FROM memories WHERE deleted_at IS NOT NULL \
+             AND NOT (content = ? AND tags = '[]' AND subject IS NULL \
+                      AND predicate IS NULL AND object IS NULL)",
+            params![crate::sync::TOMBSTONE_CONTENT],
             |r| r.get(0),
         )?)
     }
@@ -383,7 +386,7 @@ mod tests {
             format!("{:?}", stats.count_by(GroupBy::Source).unwrap()),
             format!("{:?}", stats.count_by_tag().unwrap()),
             format!("{:?}", stats.memory_totals().unwrap()),
-            format!("{}", stats.tombstones_before(T3).unwrap()),
+            format!("{}", stats.tombstones_holding_text().unwrap()),
             format!("{:?}", stats.all_by_category().unwrap()),
             format!("{:?}", stats.shareable_since(T2, 10).unwrap()),
             format!("{:?}", stats.shareable_since(T1, 1).unwrap()),

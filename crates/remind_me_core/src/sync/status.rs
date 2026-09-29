@@ -123,10 +123,7 @@ pub fn sync_status(store: &Store<'_>) -> Result<SyncStatus> {
 
     let stats = crate::db::stats::StoreStats::new(store);
     let (_, tombstones) = stats.memory_totals()?;
-    let cutoff = (chrono::Utc::now()
-        - chrono::Duration::days(super::DEFAULT_OUTBOX_RETENTION_DAYS))
-    .to_rfc3339();
-    let compactable = stats.tombstones_before(&cutoff)?;
+    let holding_text = stats.tombstones_holding_text()?;
 
     let rows = SyncState::new(store).remotes()?;
 
@@ -189,7 +186,7 @@ pub fn sync_status(store: &Store<'_>) -> Result<SyncStatus> {
         },
         tombstones: TombstoneStatus {
             total: tombstones,
-            compactable_now: compactable,
+            holding_text,
         },
         remotes,
     })

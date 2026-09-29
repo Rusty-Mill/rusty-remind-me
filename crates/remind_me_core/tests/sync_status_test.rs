@@ -371,34 +371,37 @@ fn a_shrinking_backlog_is_reported_as_draining() {
 }
 
 #[test]
-fn tombstones_are_counted_and_split_by_compactability() {
+fn tombstones_are_counted_and_those_holding_text_flagged() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     enable_sync();
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
-    add(&store, "recent tombstone");
-    add(&store, "old tombstone");
-    let recent = chrono::Utc::now().to_rfc3339();
+    add(&store, "deleted the usual way");
+    add(&store, "tombstone written some other way");
     for id in testing::memory_ids(&store).unwrap() {
-        let deleted_at = match testing::memory_text(&store, &id, "content")
+        match testing::memory_text(&store, &id, "content")
             .unwrap()
             .as_deref()
         {
-            Some("recent tombstone") => recent.as_str(),
-            Some("old tombstone") => "2020-01-01T00:00:00+00:00",
-            _ => continue,
-        };
-        testing::set_memory_column(&store, &id, "deleted_at", deleted_at).unwrap();
+            // A delete empties the tombstone (ADR-0024).
+            Some("deleted the usual way") => {
+                assert!(queries::delete_memory(&store, &id).unwrap());
+            }
+            // Stamped directly, so its text stays: what the count flags.
+            Some("tombstone written some other way") => {
+                testing::set_memory_column(&store, &id, "deleted_at", "2020-01-01T00:00:00+00:00")
+                    .unwrap();
+            }
+            _ => {}
+        }
     }
 
     let SyncStatus::Enabled { tombstones, .. } = sync_status(&store).unwrap() else {
         panic!("expected enabled");
     };
 
-    // Both numbers matter: total is disk you will not get back yet,
-    // compactable is disk you could get back now.
     assert_eq!(tombstones.total, 2);
-    assert_eq!(tombstones.compactable_now, 1);
+    assert_eq!(tombstones.holding_text, 1);
     disable_sync();
 }
 

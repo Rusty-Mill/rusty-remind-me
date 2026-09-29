@@ -2,6 +2,15 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-29 — Sync status reports tombstones still holding text
+
+### Changed
+- `remind_me_sync_status`'s `tombstones.compactable_now` is replaced by `tombstones.holding_text`. The old field counted tombstones older than the 30-day outbox retention, from when compaction was expected to purge them. Tombstones are never purged now (ADR-0024), so it measured nothing.
+- `holding_text` counts tombstones that still hold their text. Every open, delete and sync apply empties them, so it should read 0. Any other number means a tombstone was written some other way.
+
+### Tests
+- `sync_status_test.rs`: a delete leaves a tombstone that is not counted; one stamped directly, keeping its text, is.
+
 ## 2026-09-29 — The store daemon compacts its tables every hour
 
 ### Added

@@ -1830,8 +1830,13 @@ pub struct OutboxStatus {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TombstoneStatus {
+    /// Deleted memories this store keeps as tombstones, for last-write-wins.
+    /// They are never purged (ADR-0024).
     pub total: i64,
-    pub compactable_now: i64,
+    /// Tombstones that still hold their text. Every open empties them, as
+    /// does every delete and sync apply, so anything but 0 means a
+    /// tombstone arrived or was written some other way.
+    pub holding_text: i64,
 }
 
 /// One remote's contact state.
