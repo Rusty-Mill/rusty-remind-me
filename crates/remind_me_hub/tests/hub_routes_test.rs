@@ -49,8 +49,8 @@ impl HubStore for TestStore {
     fn count_by_category(&self, since: Option<&str>) -> StoreResult<Vec<(String, i64)>> {
         self.store.count_by_category(since)
     }
-    fn compact_tombstones(&self, cutoff: &str) -> StoreResult<usize> {
-        self.store.compact_tombstones(cutoff)
+    fn compact_tombstones(&self) -> StoreResult<usize> {
+        self.store.compact_tombstones()
     }
     fn pull_memories(&self, query: &PullQuery) -> StoreResult<Vec<Value>> {
         self.store.pull_memories(query)

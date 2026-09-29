@@ -58,7 +58,6 @@ REMIND_ME_HUB_DATA_DIR=./hub-data \
 | `REMIND_ME_HUB_BIND` | `127.0.0.1` | Listen address. The image sets `0.0.0.0`. |
 | `REMIND_ME_HUB_PORT` | `8765` | Listen port. |
 | `REMIND_ME_HUB_METRICS_ENABLED` | off | Serve `GET /metrics`. Off returns 404. |
-| `REMIND_ME_HUB_TOMBSTONE_RETENTION_DAYS` | `90` | Age past which `/admin/compact_tombstones` empties a tombstone that still holds its text. |
 
 An unset `REMIND_ME_HUB_DATA_DIR` is an error rather than a default: a hub that
 quietly created an empty store would look healthy while serving nothing.
@@ -148,7 +147,7 @@ The readers stay in later releases (the Postgres one behind the default
 | `GET /stats` | bearer | Full aggregate — once per reconcile. |
 | `GET /count` | bearer | Scalar counts, cheap enough to poll. `?table=`, `?since=`, `?by=origin_node\|category`, `?approx=1`. |
 | `GET /metrics` | bearer | Prometheus text. 404 when disabled. |
-| `POST /admin/compact_tombstones` | bearer | Empty expired tombstones that still hold text. Deletes nothing. |
+| `POST /admin/compact_tombstones` | bearer | Empty tombstones that still hold text. Deletes nothing. |
 | `POST /sync/push` | bearer | Upsert a batch. LWW on `updated_at`. |
 | `GET /sync/pull` | bearer | Memory records since a cursor. |
 | `GET /sync/pull_entities` | bearer | Entity records. |
@@ -229,9 +228,9 @@ its id, timestamps, `deleted_at`, `category`, `source` and `metadata`, and its
 `content` becomes `(deleted)`. No tombstone is ever deleted, because the row
 is what makes a stale push of the same memory lose last-write-wins; a hub that
 purged tombstones let a node that missed a delete bring the memory back.
-`/admin/compact_tombstones` empties the tombstones older than the retention
-that still hold text, such as those copied from an older hub, and answers
-`{"emptied": n, "retention_days": d}`. It is operator-triggered, since the hub
+`/admin/compact_tombstones` empties every tombstone that still holds text,
+such as those copied from an older hub, and answers `{"emptied": n}`. Age
+plays no part, since emptying never changes which write wins. It is operator-triggered, since the hub
 has no periodic-task infrastructure to hang one off.
 
 ## Security posture

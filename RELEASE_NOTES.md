@@ -2,6 +2,15 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-29 — Hub compaction empties every tombstone that holds text (ADR-0024)
+
+### Changed
+- `POST /admin/compact_tombstones` empties every tombstone that still holds its text, whatever its age, and answers `{"emptied": n}`; the `retention_days` key is gone. `REMIND_ME_HUB_TOMBSTONE_RETENTION_DAYS` is removed, and a hub that still sets it ignores it.
+- On the real hub the 90-day default emptied nothing: the 47,008 tombstones copied from Postgres were all younger than that, so they kept their text. Emptying never changes which write wins, so there was nothing to wait for.
+
+### Tests
+- Compaction empties a recent tombstone as well as an old one.
+
 ## 2026-09-29 — The outbox drops what the hub has taken
 
 ### Fixed

@@ -123,6 +123,16 @@ tombstone row is ever deleted.
   safe default. If it proves large for some sources, it can be narrowed to
   the keys the importers read, with a test for each importer.
 
+## Amendment (2026-09-29): compaction ignores age
+
+Decision 4 kept `/admin/compact_tombstones`'s retention setting. On the real
+hub that meant it emptied nothing: every tombstone copied from Postgres was
+between 30 and 90 days old, so none passed the 90-day default, and each kept
+its text. Emptying never changes which write wins, so waiting protects
+nothing. The route now empties every tombstone that still holds text, and
+`REMIND_ME_HUB_TOMBSTONE_RETENTION_DAYS` is gone; a hub that still sets it
+ignores it.
+
 ## Related
 
 - ADR-0004 (sync protocol: deletes as soft deletes) and ADR-0007 (tombstones

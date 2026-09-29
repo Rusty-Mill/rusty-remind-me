@@ -43,9 +43,7 @@ fn the_engine_answers_every_read_as_the_sql_stores_did() {
     // The recorded `after_compaction` is the retired purge. Compaction now
     // only empties, and every tombstone was emptied on push.
     assert_eq!(
-        engine
-            .compact_tombstones(recorded::COMPACT_CUTOFF)
-            .expect("compact"),
+        engine.compact_tombstones().expect("compact"),
         0,
         "the script's tombstones were emptied on push"
     );

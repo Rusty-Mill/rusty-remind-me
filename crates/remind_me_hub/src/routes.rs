@@ -249,31 +249,23 @@ pub fn metrics(store: &dyn HubStore, config: &Config) -> Response {
     Response::text(200, "text/plain; version=0.0.4", body)
 }
 
-/// Empty tombstones older than the retention window that still hold text.
+/// Empty every tombstone that still holds text.
 ///
 /// Nothing is deleted (ADR-0024): a deleted row is what makes a stale push
 /// of the same memory lose, so purging one let a node that missed the
 /// delete bring the memory back. Tombstones pushed since are stored emptied
-/// already; this reaches the ones stored before that.
+/// already; this reaches the ones stored before that, such as those a copy
+/// brought over. Age plays no part: emptying never changes which write
+/// wins, so there is nothing to wait for.
 ///
 /// Operator-triggered rather than an automatic background loop: the hub has no
 /// periodic-task infrastructure to hang one off, and a cron hitting this is
 /// both simpler and visible.
-pub fn compact_tombstones(store: &dyn HubStore, config: &Config) -> Response {
-    let cutoff = chrono::Utc::now() - chrono::Duration::days(config.tombstone_retention_days);
-    match store.compact_tombstones(&crate::canon::format_canonical(cutoff)) {
+pub fn compact_tombstones(store: &dyn HubStore) -> Response {
+    match store.compact_tombstones() {
         Ok(emptied) => {
-            eprintln!(
-                "hub: emptied {emptied} tombstoned memories older than {} days",
-                config.tombstone_retention_days
-            );
-            Response::json(
-                200,
-                &json!({
-                    "emptied": emptied,
-                    "retention_days": config.tombstone_retention_days,
-                }),
-            )
+            eprintln!("hub: emptied {emptied} tombstoned memories");
+            Response::json(200, &json!({ "emptied": emptied }))
         }
         Err(e) => storage_error("compact_tombstones", &e.0),
     }

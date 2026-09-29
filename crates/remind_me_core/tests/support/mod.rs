@@ -183,7 +183,6 @@ impl MockHub {
         let config = Arc::new(HubConfig {
             secret: secret.to_string(),
             metrics_enabled: false,
-            tombstone_retention_days: 90,
         });
         let thread_store = Arc::clone(&store);
         let accept = AcceptLoop::spawn(listener, move |mut stream| {

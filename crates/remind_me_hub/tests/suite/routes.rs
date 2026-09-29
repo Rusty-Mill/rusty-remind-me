@@ -17,7 +17,6 @@ fn config() -> Config {
     Config {
         secret: SECRET.to_string(),
         metrics_enabled: true,
-        tombstone_retention_days: 90,
     }
 }
 
@@ -819,7 +818,6 @@ fn compaction_deletes_no_tombstone_and_no_link() {
         body["emptied"], 0,
         "tombstones pushed through the route are emptied already"
     );
-    assert_eq!(body["retention_days"], 90);
 
     let (_, body) = get(&store, "/sync/pull", "");
     assert_eq!(body["count"], 2, "both tombstones stay");

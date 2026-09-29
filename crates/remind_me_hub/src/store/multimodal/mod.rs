@@ -801,11 +801,10 @@ impl HubStore for MultimodalHubStore {
         ))
     }
 
-    fn compact_tombstones(&self, cutoff: &str) -> StoreResult<usize> {
+    fn compact_tombstones(&self) -> StoreResult<usize> {
         let mut t = self.write()?;
         let emptied: Vec<MemoryRow> = all_rows::<_, MemoryRow>(&t.memories)
             .into_iter()
-            .filter(|m| m.deleted_at.as_deref().is_some_and(|d| d < cutoff))
             .filter_map(|mut m| m.empty_if_tombstone().then_some(m))
             .collect();
         for row in &emptied {

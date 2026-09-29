@@ -134,7 +134,7 @@ fn compacting_a_copied_hub_empties_its_old_tombstones_in_place() {
     let engine = copy(&dir.path("hub.db"), &dir.path("engine"));
 
     assert_eq!(
-        engine.compact_tombstones(recorded::COMPACT_CUTOFF).unwrap(),
+        engine.compact_tombstones().unwrap(),
         1,
         "the script holds one expired tombstone"
     );

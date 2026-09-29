@@ -139,7 +139,7 @@ fn a_pushed_tombstone_is_stored_without_its_text() {
 }
 
 #[test]
-fn compaction_empties_old_tombstones_in_place_and_deletes_nothing() {
+fn compaction_empties_every_tombstone_in_place_and_deletes_nothing() {
     let dir = TempDir::new("compaction_empties");
     {
         let store = MultimodalHubStore::open(&dir.0).unwrap();
@@ -150,10 +150,9 @@ fn compaction_empties_old_tombstones_in_place_and_deletes_nothing() {
         store_unemptied_tombstone(&store, "recent", "2026-09-10T00:00:00Z");
         let before = rows(&store);
 
-        let cutoff = "2026-09-01T00:00:00+00:00";
-        assert_eq!(store.compact_tombstones(cutoff).unwrap(), 1);
+        assert_eq!(store.compact_tombstones().unwrap(), 2, "whatever their age");
         assert_eq!(
-            store.compact_tombstones(cutoff).unwrap(),
+            store.compact_tombstones().unwrap(),
             0,
             "an emptied tombstone is not counted again"
         );
@@ -166,8 +165,8 @@ fn compaction_empties_old_tombstones_in_place_and_deletes_nothing() {
         assert_eq!(old.hub_seq, before[1].hub_seq, "hub_seq stays");
         assert_eq!(old.updated_at, before[1].updated_at, "updated_at stays");
         assert_eq!(
-            after[2].content, "gone",
-            "a recent tombstone keeps its text"
+            after[2].content, TOMBSTONE_CONTENT,
+            "a recent tombstone is emptied too"
         );
         assert_eq!(after[0], before[0], "a live memory is untouched");
     }
@@ -395,7 +394,7 @@ fn after_a_failed_sync_every_write_is_refused_and_ping_fails() {
         vec![Err(StoreError("disk gone".into())); 2]
     );
     assert!(store.compact().is_err());
-    assert!(store.compact_tombstones("2026-09-01T00:00:00Z").is_err());
+    assert!(store.compact_tombstones().is_err());
     // Reads carry on.
     assert_eq!(seqs(&store), vec![("m1".into(), 1)]);
 }
