@@ -7,7 +7,7 @@
 //! sequence, as SQLite's `INTEGER PRIMARY KEY` gives it: a caller passes it
 //! back to revert, so it must never be issued twice.
 
-use super::{engine_error, micros, EngineTables};
+use super::{core_ref, deleted, engine_error, memories, micros, EngineTables};
 use crate::db::history::Tracked;
 use crate::db::Result;
 use crate::models::MemoryRevision;
@@ -154,6 +154,31 @@ pub(crate) fn max_id(table: &RevisionTable) -> u64 {
         .into_iter()
         .max()
         .map_or(0, |id| u64::try_from(id).unwrap_or(0))
+}
+
+/// Remove every revision of `memory_id`. None is not an error.
+pub(crate) fn delete_for(tables: &mut EngineTables, memory_id: &str) -> Result<()> {
+    for record in of_memory(tables, memory_id) {
+        deleted(tables.revisions.delete(record.id))?;
+    }
+    Ok(())
+}
+
+/// Remove the revisions of every tombstoned memory. How many went.
+pub(crate) fn delete_of_tombstones(tables: &mut EngineTables) -> Result<usize> {
+    let core = core_ref(tables)?;
+    let doomed: Vec<i64> = tables
+        .revisions
+        .all_ids()
+        .into_iter()
+        .filter_map(|id| tables.revisions.get(id))
+        .filter(|r| memories::is_tombstone(core, &r.memory_id))
+        .map(|r| r.id)
+        .collect();
+    for id in &doomed {
+        deleted(tables.revisions.delete(*id))?;
+    }
+    Ok(doomed.len())
 }
 
 fn of_memory(tables: &EngineTables, memory_id: &str) -> Vec<RevisionRecord> {

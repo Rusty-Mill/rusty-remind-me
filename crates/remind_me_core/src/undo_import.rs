@@ -20,8 +20,8 @@
 //! then silently refuse to let you redo it.
 //!
 //! On a sync-enabled node this is a soft delete, so the removal propagates
-//! rather than resurrecting on the next pull. That also means the space is not
-//! reclaimed until tombstones are compacted.
+//! rather than resurrecting on the next pull. The tombstone keeps no text
+//! (ADR-0024), only the row itself.
 
 use crate::db::imports::ImportLedger;
 use crate::db::queries::delete_memory;
@@ -167,8 +167,8 @@ pub fn undo_import(store: &Store<'_>, input: &UndoImportInput) -> Result<UndoImp
             hint: Some(
                 if soft {
                     "dry run — nothing changed. Re-run with dry_run=false to remove. \
-                     Tombstoned rows keep their content until compaction, so disk use \
-                     will not drop immediately."
+                     Removed memories stay as tombstones without their text, so \
+                     the removal reaches every other node."
                 } else {
                     "dry run — nothing changed. Re-run with dry_run=false to remove. \
                      Rows are removed outright; run VACUUM to reclaim the file."

@@ -273,9 +273,11 @@ pub fn update_memory(store: &Store<'_>, input: &MemoryUpdateInput) -> Result<Upd
 /// and, on a node with sync disabled, there is nothing to propagate to, so
 /// this is a plain, immediate delete exactly as before.
 ///
-/// The queued payload carries `deleted_at`, so the tombstone travels. There
-/// is no background compaction of old tombstones on the node yet (the
-/// reference's own `TOMBSTONE_RETENTION_DAYS`).
+/// The queued payload carries `deleted_at`, so the tombstone travels. The
+/// tombstone keeps no text (ADR-0024): its content becomes
+/// [`crate::sync::TOMBSTONE_CONTENT`] and its tags and triple go, and its
+/// revision history is deleted on either path. It is never purged, since the
+/// row is what a stale copy of the memory loses to.
 ///
 /// The FTS row and `memory_tags` go with the write (`db::derived`). Everything else is
 /// cleaned up explicitly, because the reference's schema carries **no foreign
@@ -306,10 +308,28 @@ pub fn delete_memory(store: &Store<'_>, memory_id: &str) -> Result<bool> {
     crate::db::entities::Entities::new(store).unlink_memory(memory_id)?;
     crate::db::feedback::Feedback::new(store).delete_for(memory_id)?;
     crate::db::related::Related::new(store).unlink_memory(memory_id)?;
+    // Its history would keep the text the delete removes (ADR-0024).
+    crate::db::history::Revisions::new(store).delete_for(memory_id)?;
 
     crate::events::emit(crate::events::Event::Deleted, memory_id, &category);
 
     Ok(true)
+}
+
+/// Drop what ADR-0024 says a tombstone must not keep, for the memories
+/// deleted before a delete did it: their text, and their revision history.
+/// Run at every open; after the first it finds nothing. Returns how many
+/// tombstones were emptied and how many revisions went.
+pub fn empty_tombstones(store: &Store<'_>) -> Result<(usize, usize)> {
+    let emptied = Memories::new(store).empty_tombstones()?;
+    let revisions = crate::db::history::Revisions::new(store).delete_of_tombstones()?;
+    if emptied > 0 || revisions > 0 {
+        eprintln!(
+            "rusty-remind-me: dropped the text of {emptied} deleted memories \
+             and {revisions} of their revisions (ADR-0024)"
+        );
+    }
+    Ok((emptied, revisions))
 }
 
 /// Delete several memories by id in one request.

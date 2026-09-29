@@ -1,6 +1,6 @@
 # ADR-0024: Tombstones are emptied, not purged
 
-Status: Accepted (2026-09-29); the hub side is implemented, the node side is next
+Status: Accepted (2026-09-29); implemented on the hub and the node
 Date: 2026-09-29
 
 ## Context

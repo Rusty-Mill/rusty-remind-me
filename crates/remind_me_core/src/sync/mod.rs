@@ -69,6 +69,12 @@ pub const SYNC_SECRET_ENV: &str = "REMIND_ME_SYNC_SECRET";
 /// the flag goes off and the outbox is emptied. Without it, a process that
 /// lacks the sync settings above leaves a syncing store syncing.
 pub const SYNC_DISABLE_ENV: &str = "REMIND_ME_SYNC_DISABLE";
+/// The `content` a deleted memory keeps once its text is dropped
+/// (ADR-0024). Not `""`: `sync::record::upsert_record` rejects a record with
+/// empty content, and a pull stops at a record that did not apply, so an
+/// empty tombstone would stall every node on it. The hub stores the same
+/// value; it is part of the wire format.
+pub const TOMBSTONE_CONTENT: &str = "(deleted)";
 /// Seconds between background sync cycles.
 pub const SYNC_INTERVAL_ENV: &str = "REMIND_ME_SYNC_INTERVAL";
 pub const DEFAULT_SYNC_INTERVAL_SECS: u64 = 60;

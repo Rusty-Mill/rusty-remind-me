@@ -86,6 +86,34 @@ impl<'c> Revisions<'c> {
             .optional()?)
     }
 
+    /// Remove every revision of `memory_id`: a deleted memory's text must
+    /// not stay readable in its history (ADR-0024).
+    pub fn delete_for(&self, memory_id: &str) -> Result<()> {
+        #[cfg(feature = "engine-store")]
+        if let Some(engine) = self.engine {
+            return engine::revisions::delete_for(&mut engine.lock(), memory_id);
+        }
+        self.conn.execute(
+            "DELETE FROM memory_revisions WHERE memory_id = ?",
+            params![memory_id],
+        )?;
+        Ok(())
+    }
+
+    /// Remove the revisions of every tombstoned memory, as a delete now
+    /// does, for the memories deleted before it did. How many went.
+    pub fn delete_of_tombstones(&self) -> Result<usize> {
+        #[cfg(feature = "engine-store")]
+        if let Some(engine) = self.engine {
+            return engine::revisions::delete_of_tombstones(&mut engine.lock());
+        }
+        Ok(self.conn.execute(
+            "DELETE FROM memory_revisions WHERE memory_id IN \
+             (SELECT id FROM memories WHERE deleted_at IS NOT NULL)",
+            [],
+        )?)
+    }
+
     /// Append a revision of `memory_id` holding `values`, edited at
     /// `edited_at`.
     pub fn insert(

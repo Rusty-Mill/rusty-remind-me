@@ -280,6 +280,7 @@ impl Database {
         // engine holds its own `sync_flags` now, so align that one too, as
         // every open does, before anything touches the outbox.
         crate::sync::reconcile_sync_enabled_flag(&db.store())?;
+        queries::empty_tombstones(&db.store())?;
         Ok(db)
     }
 
@@ -339,7 +340,11 @@ impl Database {
                 dir.display()
             )));
         }
-        Self::open_sqlite_file(path)
+        let db = Self::open_sqlite_file(path)?;
+        // Only when SQLite is the store: on the engine the file stopped
+        // changing at the copy, and the engine open empties its own.
+        queries::empty_tombstones(&db.store())?;
+        Ok(db)
     }
 
     /// The database at `path` with its store on the engine, whatever
@@ -359,6 +364,7 @@ impl Database {
         let tables = engine::EngineTables::open(&dir)?;
         db.engine = Some(std::sync::Arc::new(engine::EngineLock::new(tables)));
         crate::sync::reconcile_sync_enabled_flag(&db.store())?;
+        queries::empty_tombstones(&db.store())?;
         Ok(db)
     }
 

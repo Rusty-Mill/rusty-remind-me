@@ -2,6 +2,18 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-29 — A node keeps no text of a deleted memory (ADR-0024)
+
+### Changed
+- A delete now keeps the tombstone without its text: `content` becomes `(deleted)`, `tags` becomes `[]`, and `subject`, `predicate` and `object` become null. The id, timestamps, `deleted_at`, `category`, `source` and `metadata` stay, so last-write-wins and re-import checks work as before. The copy queued for sync carries no text either.
+- A deleted memory's revision history is deleted with it, whether the delete tombstones or removes the row.
+- A tombstone arriving by sync is stored the same way, whatever the sender kept. A live copy that loses to a local tombstone no longer adds its tags to it.
+- The first open after the upgrade empties every tombstone that still holds text and deletes the revisions of every deleted memory, on whichever store the node runs. It logs what it dropped. It is storage, not an edit: nothing is queued and `updated_at` stays, since every node empties its own copy. Later opens find nothing to do.
+- `remind_me_export_memories` with `include_deleted` exports tombstones with the placeholder text, not their old text.
+
+### Tests
+- `tombstone_empty_test.rs`, on both stores: a delete drops the text, the history and the queued text; a hard delete drops the history; a tombstone arriving by sync is stored empty, a losing live copy adds no tags, and a newer edit still wins; an open empties tombstones an earlier build left, queues nothing and is idempotent; an open drops the history of deleted memories only.
+
 ## 2026-09-29 — The hub stores tombstones without their text and never deletes them (ADR-0024)
 
 ### Changed

@@ -1064,7 +1064,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_undo_import",
-                                "description": "Roll back a previous import, removing its memories and its tracking rows. Defaults to a dry run — pass dry_run=false to actually delete. On a sync-enabled node this soft-deletes (tombstones), so the removal propagates to every other node and disk is not reclaimed until compaction. Resumable: call again until 'remaining' is 0.",
+                                "description": "Roll back a previous import, removing its memories and its tracking rows. Defaults to a dry run — pass dry_run=false to actually delete. On a sync-enabled node this soft-deletes: a tombstone without the memory's text stays, so the removal propagates to every other node. Resumable: call again until 'remaining' is 0.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {

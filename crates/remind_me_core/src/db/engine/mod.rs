@@ -345,7 +345,10 @@ pub(crate) fn engine_error(e: impl fmt::Display) -> StoreError {
 }
 
 /// A delete's result, with an already-missing record counted as deleted.
-pub(crate) fn deleted(result: std::result::Result<(), DeleteError<Uuid>>) -> super::Result<()> {
+pub(crate) fn deleted<I>(result: std::result::Result<(), DeleteError<I>>) -> super::Result<()>
+where
+    DeleteError<I>: fmt::Display,
+{
     match result {
         Ok(()) | Err(DeleteError::NotFound(_)) => Ok(()),
         Err(e) => Err(engine_error(e)),

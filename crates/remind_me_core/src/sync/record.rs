@@ -274,8 +274,7 @@ pub fn upsert_record(
         let merged_tags = merge_tags(local_tags, &record.tags);
         let merged_metadata = merge_metadata(&local_metadata, &record.metadata, true);
 
-        let memories = Memories::new(store);
-        memories.upsert_synced(&NewMemory {
+        let mut incoming = NewMemory {
             id: record.id.clone(),
             content: record.content.clone(),
             category: record.category.clone(),
@@ -304,11 +303,20 @@ pub fn upsert_record(
             client: record.client.clone(),
             source_capture_id: record.source_capture_id.clone(),
             deleted_at: record.deleted_at.clone(),
-        })?;
+        };
+        // A tombstone is stored without its text (ADR-0024), whatever the
+        // sender kept, and without the local tags the merge above added.
+        incoming.empty_if_tombstone();
+        Memories::new(store).upsert_synced(&incoming)?;
         ApplyOutcome::Applied
     } else {
         let local = local.expect("incoming_wins is false only when a local row was found");
-        let merged_tags = merge_tags(&local.tags, &record.tags);
+        // A losing live copy must not add its tags back to a tombstone.
+        let merged_tags = if local.deleted {
+            local.tags.clone()
+        } else {
+            merge_tags(&local.tags, &record.tags)
+        };
         let merged_metadata = merge_metadata(&local.metadata, &record.metadata, false);
 
         if merged_tags != local.tags || merged_metadata != local.metadata {

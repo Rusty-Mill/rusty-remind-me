@@ -22,6 +22,7 @@ use crate::db::memories::{
 };
 use crate::db::Result;
 use crate::models::{Memory, UnannotatedMemory, UnclassifiedMemory};
+use crate::sync::TOMBSTONE_CONTENT;
 use rusty_multimodal_db_engine::fulltext::{FullTextIndex, Query};
 use rusty_multimodal_db_engine::generic::query::{AllIds, FilterEq, GetById};
 use rusty_multimodal_db_engine::generic::traits::{
@@ -44,6 +45,9 @@ pub(crate) type MemoryTable = GenericMmapStore<MemoryRecord, ByDoc, CreatedAt>;
 /// The full-text index over (content, category, tags), as `memories_fts`
 /// indexes them; keyed by memory id.
 pub(crate) type MemorySearch = FullTextIndex<String, 3>;
+
+/// An emptied tombstone's `tags` column.
+const EMPTY_TAGS: &str = "[]";
 
 /// One `memories` row, every column as SQLite stores it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -209,6 +213,28 @@ impl MemoryRow {
             Ok(Value::String(tag)) => vec![tag],
             _ => Vec::new(),
         }
+    }
+
+    /// Drop a tombstone's text (ADR-0024). Whether anything changed: `false`
+    /// for a live memory or a tombstone already emptied.
+    pub(crate) fn empty_if_tombstone(&mut self) -> bool {
+        if self.deleted_at.is_none() || self.is_emptied() {
+            return false;
+        }
+        self.content = TOMBSTONE_CONTENT.to_string();
+        self.tags = EMPTY_TAGS.to_string();
+        self.subject = None;
+        self.predicate = None;
+        self.object = None;
+        true
+    }
+
+    fn is_emptied(&self) -> bool {
+        self.content == TOMBSTONE_CONTENT
+            && self.tags == EMPTY_TAGS
+            && self.subject.is_none()
+            && self.predicate.is_none()
+            && self.object.is_none()
     }
 
     fn is_live(&self) -> bool {
@@ -712,9 +738,24 @@ pub(crate) fn delete_live(
         let mut row = row.clone();
         row.deleted_at = Some(at.to_string());
         row.updated_at = at.to_string();
+        row.empty_if_tombstone();
         Ok(Edit::Put(Box::new(row)))
     })?;
     Ok(deleted)
+}
+
+/// Drop the text of every tombstone that still holds it, in one journal
+/// batch and without queueing anything. How many changed.
+pub(crate) fn empty_tombstones(tables: &mut EngineTables) -> Result<usize> {
+    let changes: Vec<Change> = rows(core_ref(tables)?)
+        .filter_map(|mut row| row.empty_if_tombstone().then_some(row))
+        .map(|row| Change::Memory(engine_id(&row.id), Some(Box::new(MemoryRecord::new(row)))))
+        .collect();
+    let emptied = changes.len();
+    if emptied > 0 {
+        tables.commit(changes)?;
+    }
+    Ok(emptied)
 }
 
 // --- reads ----------------------------------------------------------------
@@ -726,6 +767,11 @@ fn stored(core: &CoreTables, id: &str) -> Result<Option<MemoryRow>> {
     };
     ensure_same_id(&record.row.id, id)?;
     Ok(Some(record.row))
+}
+
+/// Whether memory `id` is a tombstone.
+pub(crate) fn is_tombstone(core: &CoreTables, id: &str) -> bool {
+    row(core, id).is_some_and(|row| row.deleted_at.is_some())
 }
 
 /// Memory `id`'s row, if there is one.
@@ -757,6 +803,7 @@ pub(crate) fn sync_view(tables: &EngineTables, id: &str) -> Result<Option<SyncVi
         tags: serde_json::from_str(&row.tags).unwrap_or_default(),
         metadata: serde_json::from_str(&row.metadata)
             .unwrap_or_else(|_| Value::Object(serde_json::Map::new())),
+        deleted: row.deleted_at.is_some(),
         updated_at: row.updated_at,
     }))
 }

@@ -702,12 +702,18 @@ fn a_tombstone_propagates_when_pulled_directly_from_a_peer() {
     let report = pull_remote(&local_conn, &hub.url, SECRET, "local-node", "hub").unwrap();
     assert_eq!(report.applied, 1);
 
-    let pulled = &with_content(&local_conn, "deleted on the peer, must tombstone on pull")[0];
-    let deleted_at = testing::memory_text(&local_conn, pulled, "deleted_at").unwrap();
+    // By id: a pulled tombstone is stored without its text (ADR-0024).
+    let deleted_at = testing::memory_text(&local_conn, &id, "deleted_at").unwrap();
     assert!(
         deleted_at.is_some(),
         "a tombstone on the peer must arrive as a tombstone after a direct pull, \
          not as an ordinary live row"
+    );
+    assert_eq!(
+        testing::memory_text(&local_conn, &id, "content")
+            .unwrap()
+            .as_deref(),
+        Some(remind_me_core::sync::TOMBSTONE_CONTENT)
     );
 }
 
