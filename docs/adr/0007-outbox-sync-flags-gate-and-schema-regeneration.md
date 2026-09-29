@@ -227,3 +227,27 @@ precisely the way this ADR exists to prevent — still showing
 tests assert are wrong. A hand-maintained copy of a generated artifact is the
 same failure as a hand-transcribed migration ladder, so it was replaced with
 pointers to the generated files and the tests that police them.
+
+**Addendum (2026-09-29): a process without the settings no longer switches
+sync off.** The gate was aligned with the *opening process's* environment on
+every open, and a node's store is shared by several processes. A real node ran
+its claude.ai connector with the sync settings and its dashboard without: each
+dashboard open set `sync_enabled` to 0 and emptied the outbox, each connector
+open set it back and backfilled all 66,669 rows, and edits made while the
+dashboard had opened last were never queued. Its deletes, decided by the same
+per-process check, were hard deletes that no other node ever saw.
+
+Now:
+- A process without the settings leaves a store whose flag is `"1"` as it is,
+  and says so on stderr. Its edits are queued for the process that pushes.
+- `REMIND_ME_SYNC_DISABLE` is the explicit way off: it clears the flag and the
+  outbox, as unsetting the settings used to, and wins over the settings.
+- Whether a delete tombstones (`delete_memory`, `undo_import`) follows the
+  store's flag (`sync::store_syncs`), not the process, so every process on a
+  node deletes the same way.
+
+This departs from the reference's `_reconcile_sync_enabled_flag`, which the
+gate was built to match cell for cell. The reference is retired (ADR-0023), and
+its matrix assumed one process per store. `tests/sync_gate_test.rs` reopens one
+store under changing settings, as those processes did.
+

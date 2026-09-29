@@ -297,7 +297,7 @@ pub fn delete_memory(store: &Store<'_>, memory_id: &str) -> Result<bool> {
     // either path.
     crate::vectors::delete_chunks_for_memory(store, memory_id)?;
 
-    let tombstone_at = crate::sync::sync_enabled().then(|| Utc::now().to_rfc3339());
+    let tombstone_at = crate::sync::store_syncs(store)?.then(|| Utc::now().to_rfc3339());
     if !memories.delete_live(memory_id, tombstone_at.as_deref())? {
         return Ok(false);
     }

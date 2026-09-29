@@ -2,6 +2,19 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-29 — A process without the sync settings no longer switches sync off (ADR-0007)
+
+### Fixed
+- Every open aligned the store's sync switch with the opening process's own settings. On a node whose processes differ (a claude.ai connector with `REMIND_ME_NODE_ID`, `REMIND_ME_HUB_URL` and `REMIND_ME_SYNC_SECRET`, a dashboard without), each dashboard open switched sync off and emptied the outbox, and each connector open switched it on and queued the whole store again. Edits made in between were never queued, and the dashboard's deletes were hard deletes no other node saw. A real node's sync was broken this way for six days.
+- A process without the settings now leaves a syncing store syncing, and warns on stderr. Its edits are queued, and its deletes are tombstones.
+- Whether a delete (including `undo_import`) leaves a tombstone now follows the store's sync switch, not the process's settings.
+
+### Changed
+- Turning sync off takes `REMIND_ME_SYNC_DISABLE=1` (or `true`, `yes`, `on`). It empties the outbox and wins over the sync settings. Unsetting the settings in one process no longer turns sync off.
+
+### Tests
+- `sync_gate_test.rs` reopens one store under changing settings. Against the previous behaviour it fails as the node did: the switch off and the outbox empty.
+
 ## 2026-09-28 — The engine's search index holds live memories only (ADR-0023)
 
 ### Changed

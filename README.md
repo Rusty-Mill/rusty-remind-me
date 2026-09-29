@@ -397,7 +397,14 @@ A write from one of those one-shot commands still lands in the shared SQLite
 outbox — it isn't lost — but nothing pushes it to the hub until a process
 that *is* running a sync worker picks it up on its next cycle. Concretely:
 one of `rusty-remind-me server`/`api`/`remote` has to be running somewhere
-for sync to actually move data. Status is process-global, not tied to
+for sync to actually move data.
+
+**Sync is a property of the store, not of each process.** Every process that
+opens a node's store must agree on it, but they need not all carry the
+settings: a dashboard started without them leaves a syncing store syncing (it
+warns on stderr), queues its edits for the process that pushes, and deletes by
+tombstone. Turning sync off takes `REMIND_ME_SYNC_DISABLE=1`; unsetting the
+settings in one process no longer does it. Status is process-global, not tied to
 whichever instance started the worker:
 `remind_me_server_status` reports on whatever sync worker is live in *that*
 process, the same way it already reports on the folder watcher.
@@ -408,6 +415,7 @@ process, the same way it already reports on the folder watcher.
 | `REMIND_ME_CLIENT` | Human-readable label for this install, alongside `node_id` | `unknown` |
 | `REMIND_ME_HUB_URL` | Hub this node pushes to / pulls from | unset (sync off) |
 | `REMIND_ME_SYNC_SECRET` | Bearer token for `/sync/push` and `/sync/pull`, sent and required | unset (sync off) |
+| `REMIND_ME_SYNC_DISABLE` | `1`/`true`/`yes`/`on`: turn sync off for this store and empty its outbox. Without it, a process that lacks the three settings above leaves a syncing store syncing | unset |
 | `REMIND_ME_SYNC_INTERVAL` | Seconds between background sync cycles | `60` |
 | `REMIND_ME_PEER_BIND` | Bind address for this node's own peer server (accepts another node's push/pull) | `0.0.0.0` — all interfaces; narrow to `127.0.0.1` behind a tunnel-only setup |
 | `REMIND_ME_PEER_PORT` | Port for the peer server above, and the port every discovered peer is assumed to listen on | `8766` |

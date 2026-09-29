@@ -65,6 +65,10 @@ pub const HUB_URL_ENV: &str = "REMIND_ME_HUB_URL";
 /// both sent (to the hub) and required (of callers of this node's own peer
 /// server). Sync is off without one.
 pub const SYNC_SECRET_ENV: &str = "REMIND_ME_SYNC_SECRET";
+/// Set (`1`, `true`, `yes`, `on`) to turn sync off for this node's store:
+/// the flag goes off and the outbox is emptied. Without it, a process that
+/// lacks the sync settings above leaves a syncing store syncing.
+pub const SYNC_DISABLE_ENV: &str = "REMIND_ME_SYNC_DISABLE";
 /// Seconds between background sync cycles.
 pub const SYNC_INTERVAL_ENV: &str = "REMIND_ME_SYNC_INTERVAL";
 pub const DEFAULT_SYNC_INTERVAL_SECS: u64 = 60;
@@ -276,8 +280,14 @@ const SYNC_ENABLED_FLAG: &str = "sync_enabled";
 ///   `entity_relations` either — preserved rather than "fixed," since
 ///   covering more tables than the reference does would make the two diverge
 ///   on what a first sync actually sends.
-/// - now disabled (from any prior state): `sync_outbox`/`sync_sends` are
-///   cleared — nothing is left to drain.
+/// - stored `"1"`, but this process has no sync settings: left as it is,
+///   with a warning. A store is shared by every process on a node, and
+///   one started without the settings (a dashboard, a one-off CLI) must
+///   not switch sync off for the rest: it used to clear the outbox and
+///   stop queueing their edits, which is how a real node lost six days of
+///   sync. [`SYNC_DISABLE_ENV`] is the explicit way to turn it off.
+/// - now disabled, from any other state or with [`SYNC_DISABLE_ENV`] set:
+///   `sync_outbox`/`sync_sends` are cleared — nothing is left to drain.
 /// - unset (a fresh database) and now enabled: no backfill, matching the
 ///   reference's own reasoning verbatim even though the reference's stated
 ///   justification ("pre-gate triggers were unconditional, so the outbox is
@@ -287,11 +297,20 @@ const SYNC_ENABLED_FLAG: &str = "sync_enabled";
 ///   diverging ones for "true fresh" vs. "upgraded from an older,
 ///   once-ungated build."
 pub fn reconcile_sync_enabled_flag(store: &Store<'_>) -> Result<()> {
-    let desired = if sync_enabled() { "1" } else { "0" };
     let state = SyncState::new(store);
     let stored = state.flag(SYNC_ENABLED_FLAG)?;
+    let disable = sync_disable_requested();
+    let desired = if sync_enabled() && !disable { "1" } else { "0" };
 
     if stored.as_deref() == Some(desired) {
+        return Ok(());
+    }
+    if desired == "0" && stored.as_deref() == Some("1") && !disable {
+        eprintln!(
+            "rusty-remind-me: this store syncs, but this process has no sync settings \
+             ({NODE_ID_ENV}, {HUB_URL_ENV}, {SYNC_SECRET_ENV}); leaving sync on. Set \
+             {SYNC_DISABLE_ENV}=1 to turn it off and empty the outbox."
+        );
         return Ok(());
     }
 
@@ -302,6 +321,26 @@ pub fn reconcile_sync_enabled_flag(store: &Store<'_>) -> Result<()> {
     }
 
     state.set_flag(SYNC_ENABLED_FLAG, desired)
+}
+
+/// Whether this store syncs: its `sync_enabled` flag, which
+/// [`reconcile_sync_enabled_flag`] keeps. What decides whether a delete
+/// leaves a tombstone, so every process writing one store deletes the same
+/// way, whatever its own settings. A process without them used to hard
+/// delete, and the delete never reached any other node.
+pub fn store_syncs(store: &Store<'_>) -> Result<bool> {
+    Ok(SyncState::new(store).flag(SYNC_ENABLED_FLAG)?.as_deref() == Some("1"))
+}
+
+/// Whether [`SYNC_DISABLE_ENV`] asks for sync off: `1`, `true`, `yes` or
+/// `on`, any case.
+fn sync_disable_requested() -> bool {
+    matches!(
+        configured_env(SYNC_DISABLE_ENV)
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 /// Days an unsent outbox row is kept before being pruned.

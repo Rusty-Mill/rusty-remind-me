@@ -146,7 +146,7 @@ fn forget_tracking(
 /// work is resumable — call again until `remaining` reaches 0.
 pub fn undo_import(store: &Store<'_>, input: &UndoImportInput) -> Result<UndoImportResult> {
     let (memory_ids, scope) = matching_ids(store, input.import_kind, input.import_id.as_deref())?;
-    let soft = crate::sync::sync_enabled();
+    let soft = crate::sync::store_syncs(store)?;
 
     let mode = if soft {
         "soft-delete (tombstone, propagates over sync)"
