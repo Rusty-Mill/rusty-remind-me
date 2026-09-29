@@ -2,6 +2,11 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-29 — The hub's Quadlet unit keeps retrying until its address exists
+
+### Fixed
+- `deploy/remind-me-hub.container` publishes the hub on one address. At boot the unit can start before that address is assigned: `network-online.target` does not wait for it unless the host enables a wait-online service. Every attempt failed with `bind: cannot assign requested address`, and systemd's default start limit marked the unit failed after five tries in about a second. A real hub stayed down for six days that way. The unit now sets `StartLimitIntervalSec=0` and `RestartSec=5`, so it retries every 5 s until the address exists. `setup.sh install` and `setup.sh migrate` install the fixed unit. An already-installed hub picks it up on the next `setup.sh update`, or by adding the two lines by hand.
+
 ## 2026-09-29 — A process without the sync settings no longer switches sync off (ADR-0007)
 
 ### Fixed

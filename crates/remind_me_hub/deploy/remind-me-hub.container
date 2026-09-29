@@ -8,6 +8,14 @@
 Description=Remind Me Sync Hub
 After=network-online.target
 Wants=network-online.target
+# Never give up restarting. PublishPort binds one address, and at boot the
+# unit can start before that address exists: network-online.target does not
+# wait for it unless the host enables a wait-online service. Each attempt then
+# fails with "bind: cannot assign requested address", and systemd's default
+# start limit (5 starts in 10 s) marks the unit failed for good. A real hub
+# stayed down for six days that way. With no limit it retries every
+# RestartSec until the address arrives.
+StartLimitIntervalSec=0
 
 [Container]
 ContainerName=remind-me-hub
@@ -23,6 +31,7 @@ Volume=%h/remind-me-hub/data:/data:Z,U
 
 [Service]
 Restart=always
+RestartSec=5
 
 [Install]
 WantedBy=default.target
