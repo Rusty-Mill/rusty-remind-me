@@ -400,6 +400,17 @@ impl Database {
         })
     }
 
+    /// Compact the engine tables that have something to reclaim (see
+    /// [`engine::EngineTables::compact_needed`]). How many were compacted;
+    /// always 0 on SQLite, which reclaims space on its own terms.
+    pub fn compact_store(&self) -> Result<usize> {
+        #[cfg(feature = "engine-store")]
+        if let Some(engine) = &self.engine {
+            return engine.lock().compact_needed();
+        }
+        Ok(0)
+    }
+
     /// The store, locked for as long as the handle lives.
     pub fn store(&self) -> Store<'_> {
         let store = Store::locked(self.conn.lock());

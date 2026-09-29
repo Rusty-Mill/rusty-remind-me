@@ -239,6 +239,66 @@ impl EngineTables {
         Ok(())
     }
 
+    /// Compact every table whose insert log or slot file holds something
+    /// to reclaim, and leave the rest alone: a compaction rewrites a
+    /// table's files whole, so running one on every table on a timer
+    /// would rewrite the store each time. How many tables were compacted.
+    ///
+    /// Opening a table already folds its log into a fresh blob, so a store
+    /// that restarts often gains little; this bounds what a long-running
+    /// daemon's tables hold between restarts (the hub does the same).
+    /// Skipped while a page is open or after a failed write, when the
+    /// stores may not agree with the journal yet.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Engine`] if a table cannot be rewritten. Compaction is
+    /// crash-safe step by step, so an error leaves every table readable.
+    pub(crate) fn compact_needed(&mut self) -> super::Result<usize> {
+        if self.page.is_some() || self.failed {
+            return Ok(0);
+        }
+        let mut compacted = 0;
+        macro_rules! compact_each {
+            ($($table:expr),+ $(,)?) => {$(
+                if $table.needs_compaction() {
+                    $table.compact().map_err(engine_error)?;
+                    compacted += 1;
+                }
+            )+};
+        }
+        let core = &mut self.core;
+        compact_each!(
+            self.saved_searches,
+            self.seen,
+            self.archives,
+            self.spans,
+            self.sync_log,
+            self.snapshots,
+            self.revisions,
+            self.wiki_pages,
+            self.wiki_links,
+            self.wiki_meta,
+            core.memories,
+            core.outbox,
+            core.sends,
+            core.flags,
+            core.deliveries,
+            core.feedback,
+            core.entities,
+            core.links,
+            core.relations,
+            core.associations,
+            core.promotions,
+            core.chunks,
+            core.embedding_meta,
+            core.chat_imports,
+            core.dbs_imports,
+            core.mempalace_imports,
+        );
+        Ok(compacted)
+    }
+
     /// Copy every file of the tables into `dest`, which must not exist: a
     /// backup. The caller holds the tables, so no write lands mid-copy and
     /// no page is open on another thread; the copy opens as the tables

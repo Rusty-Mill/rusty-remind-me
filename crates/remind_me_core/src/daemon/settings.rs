@@ -26,6 +26,9 @@ const EXCLUDED: &[&str] = &[
     "REMIND_ME_MCP_DIR",
     // Set only in the watchdog's own tracer child.
     "REMIND_ME_WATCHDOG_STACK_CHILD",
+    // Read only by the daemon, to time its own compaction: no client
+    // behaves differently for it.
+    crate::compaction::COMPACT_INTERVAL_ENV,
 ];
 
 /// Prefixes of variables that configure the client process itself: `remote`

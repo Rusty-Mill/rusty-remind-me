@@ -419,6 +419,7 @@ process, the same way it already reports on the folder watcher.
 | `REMIND_ME_SYNC_INTERVAL` | Seconds between background sync cycles | `60` |
 | `REMIND_ME_PEER_BIND` | Bind address for this node's own peer server (accepts another node's push/pull) | `0.0.0.0` — all interfaces; narrow to `127.0.0.1` behind a tunnel-only setup |
 | `REMIND_ME_PEER_PORT` | Port for the peer server above, and the port every discovered peer is assumed to listen on | `8766` |
+| `REMIND_ME_COMPACT_INTERVAL_SECS` | Seconds between the store daemon's compactions of the engine tables it has written to since the last one; `0` turns them off. Read by the daemon only | `3600` |
 
 `rusty-remind-me configure --node-id ID --hub-url URL [--peer-port N] [--sync-interval SECS]`
 writes both the MCP entry and this sync environment for every configured

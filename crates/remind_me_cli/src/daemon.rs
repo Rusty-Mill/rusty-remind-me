@@ -93,6 +93,11 @@ fn run(db_path: &Path, endpoint: Endpoint) -> Result<()> {
     let scheduler = remind_me_core::scheduler::start_scheduler_for(&db.store());
     let watcher = remind_me_core::watcher::start_watcher_for(&db.store());
     let nudge = remind_me_core::promotion::start_nudge_for(&db.store());
+    let compactor =
+        remind_me_core::compaction::start_compactor(Arc::clone(&db)).unwrap_or_else(|e| {
+            eprintln!("rusty-remind-me daemon: {e}");
+            None
+        });
     let mut sync = db
         .secondary_source()
         .and_then(remind_me_core::sync::SyncWorker::from_env);
@@ -119,6 +124,9 @@ fn run(db_path: &Path, endpoint: Endpoint) -> Result<()> {
     }
     if let Some(nudge) = nudge {
         nudge.stop();
+    }
+    if let Some(compactor) = compactor {
+        compactor.stop();
     }
     if let Some(sync) = sync.as_mut() {
         sync.stop();

@@ -2,6 +2,17 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-29 — The store daemon compacts its tables every hour
+
+### Added
+- The store daemon compacts the engine tables every hour (`REMIND_ME_COMPACT_INTERVAL_SECS`, default `3600`, `0` for off), as the hub already does. Only tables with something to reclaim are rewritten: an insert log holding entries, or slots left by deleted rows. Each pass that compacts anything logs how many tables it did.
+- Opening the store already folds each table's log into a fresh file, so this matters for a daemon that runs a long time between restarts. On a real node the pruned outbox left `sync_outbox.mmap.records` at 102.7 MB until the next restart or compaction.
+- The engine gains `GenericMmapStore::needs_compaction`, a cheap check, since `compact` always rewrites a table whole.
+- `REMIND_ME_COMPACT_INTERVAL_SECS` is left out of the settings clients compare with the daemon's, since only the daemon reads it.
+
+### Tests
+- On an on-disk store, compaction after writes and a delete compacts some tables, a second pass compacts none, and a reopen reads every row as before. An engine test covers `needs_compaction` before and after a replace, a delete and a compaction.
+
 ## 2026-09-29 — Hub compaction empties every tombstone that holds text (ADR-0024)
 
 ### Changed
