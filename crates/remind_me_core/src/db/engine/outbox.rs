@@ -304,14 +304,20 @@ fn count(n: usize) -> i64 {
 
 // --- removal --------------------------------------------------------------
 
-/// Remove every sent entry and every one created before `cutoff`, and the
-/// send markers left pointing at nothing, in one batch. How many entries
-/// went.
-pub(crate) fn prune(tables: &mut EngineTables, cutoff: &str) -> Result<usize> {
+/// Remove every sent entry, every one `done_by` has taken, and every one
+/// created before `cutoff`, and the send markers left pointing at nothing,
+/// in one batch. How many entries went.
+pub(crate) fn prune(tables: &mut EngineTables, cutoff: &str, done_by: &str) -> Result<usize> {
     let core = core_ref(tables)?;
-    let (gone, kept): (Vec<OutboxRecord>, Vec<OutboxRecord>) = entries(core)
+    let taken: HashSet<i64> = sends(core)
         .into_iter()
-        .partition(|e| !e.sent_at.is_empty() || e.created_at.as_str() < cutoff);
+        .filter(|s| s.remote_id == done_by)
+        .map(|s| s.outbox_id)
+        .collect();
+    let (gone, kept): (Vec<OutboxRecord>, Vec<OutboxRecord>) =
+        entries(core).into_iter().partition(|e| {
+            !e.sent_at.is_empty() || e.created_at.as_str() < cutoff || taken.contains(&e.id)
+        });
     let kept: HashSet<i64> = kept.iter().map(|e| e.id).collect();
     let mut changes: Vec<Change> = gone.iter().map(|e| Change::Outbox(e.id, None)).collect();
     changes.extend(
@@ -427,7 +433,7 @@ mod tests {
         record_sends(&mut tables, "hub", &[first], "t").unwrap();
 
         // Everything is older than a cutoff in the far future.
-        assert_eq!(prune(&mut tables, "9999").unwrap(), 2);
+        assert_eq!(prune(&mut tables, "9999", "hub").unwrap(), 2);
         assert_eq!(len(&tables).unwrap(), 0);
         assert!(sent(&tables).is_empty());
     }

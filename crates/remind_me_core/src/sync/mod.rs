@@ -379,10 +379,15 @@ fn outbox_retention_days() -> i64 {
 ///
 /// # Why this policy and not another
 ///
-/// This is the reference's own rule, verbatim: rows already marked sent are
-/// echo-suppressed and never pushed, so they go immediately; the rest are kept
-/// for the retention window so an intermittently-reachable remote can still
-/// catch up, then dropped along with their per-remote send markers.
+/// Rows already marked sent are echo-suppressed and never pushed, so they go
+/// immediately, as in the reference. So do rows the hub has taken: every
+/// node pulls them from the hub, and a peer can also pull them from this
+/// node's feed, which reads the memories themselves, not the outbox. Keeping
+/// them only held a second full copy of every change, including the text
+/// of memories deleted since (ADR-0024). The rest are kept for the retention
+/// window so an intermittently reachable remote can still catch up, then
+/// dropped along with their per-remote send markers. A node without a hub
+/// never records a hub send, so for it only the window applies.
 ///
 /// Copying the policy rather than inventing one matters because a database can
 /// be shared with `remind_me` — it opens the same file and prunes on the same
@@ -398,7 +403,7 @@ fn outbox_retention_days() -> i64 {
 /// arrangement now that one exists.
 pub fn prune_outbox(store: &Store<'_>) -> Result<usize> {
     let cutoff = (Utc::now() - Duration::days(outbox_retention_days())).to_rfc3339();
-    Outbox::new(store).prune(&cutoff)
+    Outbox::new(store).prune(&cutoff, HUB_REMOTE_ID)
 }
 
 /// Records a real, successful HTTP push round trip with `remote_id` (a push

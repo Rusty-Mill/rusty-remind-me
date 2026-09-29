@@ -22,7 +22,8 @@ use remind_me_core::db::queries;
 use remind_me_core::db::sync_state::SyncState;
 use remind_me_core::db::Store;
 use remind_me_core::sync::{
-    prune_outbox, DEFAULT_OUTBOX_RETENTION_DAYS, HUB_URL_ENV, NODE_ID_ENV, SYNC_SECRET_ENV,
+    prune_outbox, DEFAULT_OUTBOX_RETENTION_DAYS, HUB_REMOTE_ID, HUB_URL_ENV, NODE_ID_ENV,
+    SYNC_SECRET_ENV,
 };
 use remind_me_core::testing::{self, Table};
 use remind_me_core::{
@@ -276,6 +277,48 @@ fn already_sent_rows_are_pruned_immediately() {
     // A sent row is echo-suppressed and never pushed again, so it needs no
     // retention window.
     assert_eq!(removed, 1);
+    assert_eq!(outbox_rows(&store), 1);
+}
+
+#[test]
+fn rows_the_hub_has_taken_are_pruned_immediately() {
+    // Every node pulls them from the hub, and a peer can pull them from
+    // this node's feed, so keeping them only held a second copy of every
+    // change, deleted memories' text included (ADR-0024).
+    ensure_sync_enabled();
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    add(&store, "taken by the hub");
+    add(&store, "not yet pushed");
+    let taken = testing::outbox_rows(&store).unwrap()[0].id;
+    SyncState::new(&store)
+        .record_sends(HUB_REMOTE_ID, &[taken], &Utc::now().to_rfc3339())
+        .unwrap();
+
+    assert_eq!(prune_outbox(&store).unwrap(), 1);
+    let left = testing::outbox_rows(&store).unwrap();
+    assert_eq!(left.len(), 1);
+    assert_ne!(left[0].id, taken);
+    assert_eq!(
+        testing::count(&store, Table::SyncSends).unwrap(),
+        0,
+        "its send marker goes with it"
+    );
+}
+
+#[test]
+fn a_row_only_a_peer_has_taken_waits_for_the_window() {
+    // Without the hub's marker, a row is still owed to the hub.
+    ensure_sync_enabled();
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    add(&store, "taken by a peer only");
+    let row = testing::outbox_rows(&store).unwrap()[0].id;
+    SyncState::new(&store)
+        .record_sends("peer_1", &[row], &Utc::now().to_rfc3339())
+        .unwrap();
+
+    assert_eq!(prune_outbox(&store).unwrap(), 0);
     assert_eq!(outbox_rows(&store), 1);
 }
 

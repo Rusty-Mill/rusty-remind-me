@@ -129,16 +129,18 @@ impl<'c> Outbox<'c> {
         Ok(any.is_none())
     }
 
-    /// Delete every sent row and every row created before `cutoff`, then
-    /// the send markers left pointing at nothing. Returns how many rows went.
-    pub fn prune(&self, cutoff: &str) -> Result<usize> {
+    /// Delete every sent row, every row `done_by` has taken, and every row
+    /// created before `cutoff`, then the send markers left pointing at
+    /// nothing. Returns how many rows went.
+    pub fn prune(&self, cutoff: &str, done_by: &str) -> Result<usize> {
         #[cfg(feature = "engine-store")]
         if let Some(core) = self.core {
-            return engine::outbox::prune(&mut core.lock(), cutoff);
+            return engine::outbox::prune(&mut core.lock(), cutoff, done_by);
         }
         let removed = self.conn.execute(
-            "DELETE FROM sync_outbox WHERE sent_at != '' OR created_at < ?",
-            params![cutoff],
+            "DELETE FROM sync_outbox WHERE sent_at != '' OR created_at < ?1 \
+             OR id IN (SELECT outbox_id FROM sync_sends WHERE remote_id = ?2)",
+            params![cutoff, done_by],
         )?;
         self.conn.execute(
             "DELETE FROM sync_sends WHERE outbox_id NOT IN (SELECT id FROM sync_outbox)",
@@ -298,7 +300,7 @@ mod tests {
                 .collect();
             keys.sort();
             assert_eq!(keys, ["a", "b", "ent_1", "off"]);
-            assert_eq!(outbox.prune("9999").unwrap(), 4);
+            assert_eq!(outbox.prune("9999", "hub").unwrap(), 4);
             assert!(outbox.is_empty().unwrap());
         });
     }
@@ -311,10 +313,10 @@ mod tests {
         let old = queue(&store, "old", "2026-01-01");
         queue(&store, "new", "2026-09-26");
         crate::db::sync_state::SyncState::new(&store)
-            .record_sends("hub", &[old], "2026-09-26")
+            .record_sends("peer", &[old], "2026-09-26")
             .unwrap();
 
-        assert_eq!(outbox.prune("2026-06-01").unwrap(), 1);
+        assert_eq!(outbox.prune("2026-06-01", "hub").unwrap(), 1);
         assert_eq!(outbox.len().unwrap(), 1);
         let markers = crate::testing::count(&store, crate::testing::Table::SyncSends).unwrap();
         assert_eq!(markers, 0);

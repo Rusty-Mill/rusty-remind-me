@@ -2,6 +2,15 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-09-29 — The outbox drops what the hub has taken
+
+### Fixed
+- Since sends became per remote, a sent outbox row was only pruned once it was 30 days old: the prune dropped rows with `sent_at` set, and per-remote sends never set it. On a real node the outbox was the largest thing in the store, 102.7 MB of 185 MB for 66,678 rows, every one already at the hub. Each row is a full copy of a memory as it was when queued, so it also kept the text of memories deleted since (ADR-0024).
+- A row the hub has taken is now pruned on the next sync cycle or open. Every node pulls it from the hub, and a peer can also pull it from this node's feed, which reads the memories themselves, not the outbox. A row not yet taken by the hub is kept for the retention window as before, whatever peers have taken, and a node without a hub is unaffected.
+
+### Tests
+- A row the hub has taken is pruned at once, with its send marker; a row only a peer has taken waits for the window.
+
 ## 2026-09-29 — A node keeps no text of a deleted memory (ADR-0024)
 
 ### Changed
