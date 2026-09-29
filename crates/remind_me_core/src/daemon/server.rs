@@ -12,12 +12,15 @@ use serde_json::{json, Value};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 /// A client has this long to say hello.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How many connections may be waiting on their hello at once.
+const MAX_PENDING_HELLOS: usize = 64;
 
 /// What the daemon does with each request.
 pub trait Service: Send + Sync + 'static {
@@ -109,15 +112,22 @@ impl Daemon {
             settings: self.settings,
             stopping: Arc::clone(&self.stopping),
         });
+        let pending_hellos = Arc::new(AtomicUsize::new(0));
         for stream in self.listener.incoming() {
             if self.stopping.load(Ordering::SeqCst) {
                 break;
             }
             let Ok(stream) = stream else { continue };
+            // Connections that have not yet said hello cost a thread and are
+            // open to any local process, so only so many are let in at once.
+            // Past hello, connections are not counted.
+            let Some(pending) = PendingHello::admit(&pending_hellos) else {
+                continue;
+            };
             let shared = Arc::clone(&shared);
             let service = Arc::clone(&service);
             std::thread::spawn(move || {
-                if let Err(e) = serve_connection(stream, &shared, service.as_ref()) {
+                if let Err(e) = serve_connection(stream, pending, &shared, service.as_ref()) {
                     if e.kind() != io::ErrorKind::UnexpectedEof {
                         eprintln!("rusty-remind-me daemon: connection ended: {e}");
                     }
@@ -129,17 +139,45 @@ impl Daemon {
     }
 }
 
-fn serve_connection(stream: TcpStream, shared: &Shared, service: &dyn Service) -> io::Result<()> {
+/// One connection that has not yet finished its hello.
+///
+/// Releases its slot on drop, so every way out of the hello frees it.
+struct PendingHello(Arc<AtomicUsize>);
+
+impl PendingHello {
+    /// A slot, or `None` while [`MAX_PENDING_HELLOS`] are already taken.
+    fn admit(count: &Arc<AtomicUsize>) -> Option<Self> {
+        if count.fetch_add(1, Ordering::SeqCst) >= MAX_PENDING_HELLOS {
+            count.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(Self(Arc::clone(count)))
+    }
+}
+
+impl Drop for PendingHello {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn serve_connection(
+    stream: TcpStream,
+    pending: PendingHello,
+    shared: &Shared,
+    service: &dyn Service,
+) -> io::Result<()> {
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(HELLO_TIMEOUT))?;
     let mut writer = stream.try_clone()?;
     let mut reader = BufReader::new(stream);
-    let Some(hello) = wire::read_line::<Hello>(&mut reader)? else {
+    let Some(hello) = wire::read_line_max::<Hello>(&mut reader, wire::MAX_HELLO_LINE)? else {
         return Ok(());
     };
     if let Some(refusal) = refuse(&hello, shared) {
         return wire::write_line(&mut writer, &Reply::Refused(refusal));
     }
+    drop(pending);
     wire::write_line(&mut writer, &Reply::Welcome)?;
     reader.get_ref().set_read_timeout(None)?;
     super::session::enter(hello.session);
@@ -225,6 +263,19 @@ mod tests {
     use super::super::client::{self, ConnectError};
     use super::*;
     use std::io::Read;
+
+    #[test]
+    fn pending_hellos_are_capped_and_a_dropped_slot_is_reusable() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let held: Vec<_> = (0..MAX_PENDING_HELLOS)
+            .map(|_| PendingHello::admit(&count).expect("under the cap"))
+            .collect();
+        assert!(PendingHello::admit(&count).is_none());
+        assert_eq!(count.load(Ordering::SeqCst), MAX_PENDING_HELLOS);
+        drop(held);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert!(PendingHello::admit(&count).is_some());
+    }
 
     /// Echoes what it is given, and reports the calling session's client.
     struct Echo;

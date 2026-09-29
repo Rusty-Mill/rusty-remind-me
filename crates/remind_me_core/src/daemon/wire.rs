@@ -18,7 +18,7 @@ use super::session::Session;
 use super::settings::Fingerprint;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 
 /// Bumped whenever a message changes shape.
 pub const PROTOCOL: u32 = 1;
@@ -118,11 +118,37 @@ pub fn write_line<T: Serialize + ?Sized>(out: &mut impl Write, message: &T) -> i
     out.flush()
 }
 
+/// The longest [`Hello`] line the daemon will buffer.
+///
+/// A hello arrives before the token is checked, so any local process can send
+/// one; without a cap, a peer that never sends a newline grows the buffer
+/// without bound.
+pub const MAX_HELLO_LINE: u64 = 64 * 1024;
+
 /// Read one JSON line, or `None` at end of stream.
 pub fn read_line<T: DeserializeOwned>(input: &mut impl BufRead) -> io::Result<Option<T>> {
+    read_line_max(input, u64::MAX)
+}
+
+/// Like [`read_line`], but fails with `InvalidData` once the line passes
+/// `max` bytes, without buffering the rest.
+pub fn read_line_max<T: DeserializeOwned>(
+    input: &mut impl BufRead,
+    max: u64,
+) -> io::Result<Option<T>> {
     let mut line = String::new();
-    if input.read_line(&mut line)? == 0 {
+    if (&mut *input)
+        .take(max.saturating_add(1))
+        .read_line(&mut line)?
+        == 0
+    {
         return Ok(None);
+    }
+    if line.len() as u64 > max {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("line longer than {max} bytes"),
+        ));
     }
     serde_json::from_str(line.trim_end())
         .map(Some)
@@ -155,6 +181,25 @@ mod tests {
         assert!(read_line::<Reply>(&mut &b""[..]).unwrap().is_none());
         let err = read_line::<Reply>(&mut &b"nope\n"[..]).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn a_line_past_the_cap_is_refused_without_reading_on() {
+        let mut input = std::io::Cursor::new(vec![b'a'; 1000]);
+        let err = read_line_max::<Reply>(&mut input, 100).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        // Only the cap plus one byte was consumed.
+        assert_eq!(input.position(), 101);
+    }
+
+    #[test]
+    fn a_line_within_the_cap_still_parses() {
+        let mut buf = Vec::new();
+        write_line(&mut buf, &Reply::Welcome).unwrap();
+        let back: Reply = read_line_max(&mut buf.as_slice(), buf.len() as u64)
+            .unwrap()
+            .unwrap();
+        assert_eq!(back, Reply::Welcome);
     }
 
     #[test]
