@@ -380,9 +380,6 @@ fn hash_token(token: &str) -> String {
 pub struct OAuthStateStore {
     path: PathBuf,
     lock: Mutex<()>,
-    /// Distinguishes this store's temp files from any other process's when
-    /// several share a directory. See [`Self::temp_path`].
-    temp_counter: std::sync::atomic::AtomicU64,
 }
 
 impl OAuthStateStore {
@@ -390,7 +387,6 @@ impl OAuthStateStore {
         Self {
             path: path.into(),
             lock: Mutex::new(()),
-            temp_counter: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -420,29 +416,6 @@ impl OAuthStateStore {
         self.read_once().unwrap_or_default()
     }
 
-    /// A sibling temp path in the same directory as the state file.
-    ///
-    /// Same directory, not the system temp dir: `rename` is only atomic
-    /// within one filesystem, and `/tmp` is frequently a different one.
-    /// The name carries the pid and a per-store counter so two processes
-    /// (or two stores in one process) writing concurrently cannot collide
-    /// on it and corrupt each other's in-progress write.
-    fn temp_path(&self) -> PathBuf {
-        let n = self
-            .temp_counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let stem = self
-            .path
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "oauth-state.json".to_string());
-        let name = format!(".{stem}.{}.{n}.tmp", std::process::id());
-        match self.path.parent() {
-            Some(parent) => parent.join(name),
-            None => PathBuf::from(name),
-        }
-    }
-
     /// Persist `state` atomically, creating the parent directory if needed
     /// and setting `0600` permissions on unix.
     ///
@@ -454,10 +427,10 @@ impl OAuthStateStore {
     /// at all, and what the retry-and-verify loop here was really working
     /// around.
     ///
-    /// Permissions are set on the temp file *before* the rename, so the
-    /// state file never exists at its real path with default permissions,
-    /// not even briefly. The old order — write, then chmod — left exactly
-    /// that window on every single write.
+    /// The temp file is created `0600` (`rusty_atomic_file::write_private`),
+    /// so the state is never readable by others, not even briefly. The old
+    /// order — write, then chmod — left exactly that window on every
+    /// single write.
     ///
     /// **Failures propagate.** They used to be swallowed after a few
     /// retries, on the reasoning that a caller holding the token in memory
@@ -475,37 +448,7 @@ impl OAuthStateStore {
             fs::create_dir_all(parent)?;
         }
 
-        let tmp = self.temp_path();
-        // Scoped so the handle is closed before the rename: Windows refuses
-        // to rename over a path while a handle to the source is open.
-        let written = (|| -> io::Result<()> {
-            use std::io::Write;
-            let mut file = fs::File::create(&tmp)?;
-            file.write_all(body.as_bytes())?;
-            file.sync_all()?;
-            Ok(())
-        })();
-        if let Err(e) = written {
-            let _ = fs::remove_file(&tmp);
-            return Err(e);
-        }
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Err(e) = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600)) {
-                let _ = fs::remove_file(&tmp);
-                return Err(e);
-            }
-        }
-
-        if let Err(e) = fs::rename(&tmp, &self.path) {
-            // Leaving a stray temp file behind would be a slow leak in the
-            // directory the state file lives in.
-            let _ = fs::remove_file(&tmp);
-            return Err(e);
-        }
-        Ok(())
+        rusty_atomic_file::write_private(&self.path, body.as_bytes())
     }
 
     // -- clients --------------------------------------------------------

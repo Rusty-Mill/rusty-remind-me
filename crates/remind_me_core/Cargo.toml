@@ -9,6 +9,7 @@ repository = "https://github.com/Rusty-Mill/rusty_mill"
 layer = "apps"
 
 [dependencies]
+rusty_atomic_file = { workspace = true }
 
 serde = { version = "1.0", features = ["derive"] }
 # `float_roundtrip`: the engine stores records as JSON, and the default

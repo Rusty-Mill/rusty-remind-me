@@ -56,11 +56,11 @@ pub(crate) fn memory_totals(tables: &EngineTables) -> Result<(i64, i64)> {
     Ok((count(rows.len()), count(tombstones)))
 }
 
-/// Tombstones whose `deleted_at` text sorts before `cutoff`.
-pub(crate) fn tombstones_before(tables: &EngineTables, cutoff: &str) -> Result<i64> {
+/// Tombstones that still hold their text.
+pub(crate) fn tombstones_holding_text(tables: &EngineTables) -> Result<i64> {
     Ok(count(
         memories::rows(core_ref(tables)?)
-            .filter(|row| row.deleted_at.as_deref().is_some_and(|at| at < cutoff))
+            .filter(|row| row.deleted_at.is_some() && !row.is_emptied())
             .count(),
     ))
 }
