@@ -12,12 +12,14 @@ mod test_env;
 use remind_me_core::archive::{
     self, ARCHIVE_DIR_ENV, ARCHIVE_MAX_AGE_DAYS_ENV, ARCHIVE_MAX_BYTES_ENV,
 };
+use remind_me_core::db::archives::Archives;
+use remind_me_core::db::Store;
 use remind_me_core::importer::import_chat;
+use remind_me_core::testing;
 use remind_me_core::undo_import::undo_import;
 use remind_me_core::{
     ChatImportInput, Database, ImportKind, ImportOutcome, UndoImportInput, UndoImportKind,
 };
-use rusqlite::Connection;
 
 /// `REMIND_ME_ARCHIVE_DIR` is process-global, so every test that sets it runs
 /// serialized behind this. Poisoning is ignored: a panicking test has already
@@ -56,9 +58,9 @@ fn transcript_line(text: &str, thinking: &str, tool_input: &str) -> String {
     .to_string()
 }
 
-fn import(conn: &Connection, path: &std::path::Path) -> ImportOutcome {
+fn import(store: &Store<'_>, path: &std::path::Path) -> ImportOutcome {
     import_chat(
-        conn,
+        store,
         &ChatImportInput {
             file_path: path.display().to_string(),
             category: "chat_import".into(),
@@ -71,16 +73,17 @@ fn import(conn: &Connection, path: &std::path::Path) -> ImportOutcome {
     .unwrap()
 }
 
-fn memory_ids(conn: &Connection) -> Vec<String> {
-    let mut stmt = conn
-        .prepare("SELECT id FROM memories ORDER BY chunk_index")
-        .unwrap();
-    let rows = stmt.query_map([], |r| r.get(0)).unwrap();
-    rows.collect::<Result<_, _>>().unwrap()
+/// Every memory id, in chunk order.
+fn memory_ids(store: &Store<'_>) -> Vec<String> {
+    let mut ids = testing::memory_ids(store).unwrap();
+    ids.sort_by_key(|id| testing::memory_i64(store, id, "chunk_index").unwrap());
+    ids
 }
 
-fn open(dir: &std::path::Path) -> Database {
-    Database::open(dir.join("memories.db").display().to_string()).unwrap()
+/// In memory, so these run on whichever backend `REMIND_ME_STORE` picks:
+/// the archive blobs still go to a real directory.
+fn open() -> Database {
+    Database::open_in_memory().unwrap()
 }
 
 #[test]
@@ -101,23 +104,16 @@ fn an_import_with_retention_off_records_no_spans() {
     let path = dir.join("chat.jsonl");
     std::fs::write(&path, transcript_line("a fact", "hmm", "/etc/hosts")).unwrap();
 
-    let db = open(&dir);
-    let conn = db.conn();
-    import(&conn, &path);
+    let db = open();
+    let store = db.store();
+    import(&store, &path);
 
     // The import still happened...
-    assert!(!memory_ids(&conn).is_empty());
+    assert!(!memory_ids(&store).is_empty());
     // ...but nothing was retained, and the tables are present-and-empty rather
     // than missing: the read path must never have to tolerate absent tables.
-    let spans: i64 = conn
-        .query_row("SELECT count(*) FROM import_archive_spans", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    let archives: i64 = conn
-        .query_row("SELECT count(*) FROM import_archives", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!((spans, archives), (0, 0));
+    let spans = Archives::new(&store).span_count(None).unwrap();
+    assert_eq!((spans, archive_rows(&store)), (0, 0));
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -137,27 +133,25 @@ fn a_memory_can_recover_the_blocks_the_importer_dropped() {
     )
     .unwrap();
 
-    let db = open(&dir);
-    let conn = db.conn();
-    import(&conn, &path);
+    let db = open();
+    let store = db.store();
+    import(&store, &path);
 
-    let ids = memory_ids(&conn);
+    let ids = memory_ids(&store);
     assert_eq!(ids.len(), 1, "one text block, so one memory");
 
     // What the memory itself holds: the flattened text, nothing else.
-    let stored: String = conn
-        .query_row(
-            "SELECT content FROM memories WHERE id = ?",
-            [&ids[0]],
-            |r| r.get(0),
-        )
+    let stored: String = testing::memory_text(&store, &ids[0], "content")
+        .unwrap()
         .unwrap();
     assert_eq!(stored, "the table is called memories");
     assert!(!stored.contains("let me check"));
 
     // What the archive hands back: the whole envelope, including everything
     // `text_of` dropped and every field the importer never read.
-    let source = archive::source_for(&conn, &ids[0], false).unwrap().unwrap();
+    let source = archive::source_for(&store, &ids[0], false)
+        .unwrap()
+        .unwrap();
     assert!(source.content.contains("let me check"), "thinking block");
     assert!(source.content.contains("tool_use"), "tool call");
     assert!(source.content.contains("sessionId"), "envelope metadata");
@@ -187,15 +181,19 @@ fn each_memory_points_at_its_own_line_not_the_whole_file() {
     )
     .unwrap();
 
-    let db = open(&dir);
-    let conn = db.conn();
-    import(&conn, &path);
+    let db = open();
+    let store = db.store();
+    import(&store, &path);
 
-    let ids = memory_ids(&conn);
+    let ids = memory_ids(&store);
     assert_eq!(ids.len(), 2);
 
-    let first = archive::source_for(&conn, &ids[0], false).unwrap().unwrap();
-    let second = archive::source_for(&conn, &ids[1], false).unwrap().unwrap();
+    let first = archive::source_for(&store, &ids[0], false)
+        .unwrap()
+        .unwrap();
+    let second = archive::source_for(&store, &ids[1], false)
+        .unwrap()
+        .unwrap();
 
     // The whole point: a span is one envelope, not the file. Returning the
     // entire transcript for every memory would satisfy "content contains the
@@ -223,25 +221,19 @@ fn undoing_an_import_takes_its_archive_with_it() {
     let path = dir.join("chat.jsonl");
     std::fs::write(&path, transcript_line("a fact", "a thought", "/one")).unwrap();
 
-    let db = open(&dir);
-    let conn = db.conn();
-    let outcome = import(&conn, &path);
+    let db = open();
+    let store = db.store();
+    let outcome = import(&store, &path);
     let import_id = match outcome {
         ImportOutcome::Imported { import_id, .. } => import_id,
         other => panic!("expected an import, got {:?}", other),
     };
 
-    let blob: String = conn
-        .query_row(
-            "SELECT archive_path FROM import_archives WHERE import_id = ?",
-            [&import_id],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let blob = archive_path(&store, &import_id);
     assert!(std::path::Path::new(&blob).exists());
 
     undo_import(
-        &conn,
+        &store,
         &UndoImportInput {
             import_kind: UndoImportKind::Chat,
             import_id: Some(import_id.clone()),
@@ -254,20 +246,9 @@ fn undoing_an_import_takes_its_archive_with_it() {
     // `undo_import` drops the tracking row so the content is re-importable.
     // An archive left behind would be a blob nothing references, and its
     // spans would point at memories that no longer exist.
-    let archives: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM import_archives WHERE import_id = ?",
-            [&import_id],
-            |r| r.get(0),
-        )
-        .unwrap();
-    let spans: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM import_archive_spans WHERE import_id = ?",
-            [&import_id],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let repo = Archives::new(&store);
+    let archives = usize::from(repo.blob_of(&import_id).unwrap().is_some());
+    let spans = repo.span_count(Some(&import_id)).unwrap();
     assert_eq!((archives, spans), (0, 0), "no orphaned archive rows");
     assert!(
         !std::path::Path::new(&blob).exists(),
@@ -280,18 +261,24 @@ fn undoing_an_import_takes_its_archive_with_it() {
 
 /// Backdate an archive row so age-based retention has something to bite on.
 /// Faster and more deterministic than waiting a day.
-fn backdate(conn: &Connection, import_id: &str, days: i64) {
-    let when = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
-    conn.execute(
-        "UPDATE import_archives SET archived_at = ? WHERE import_id = ?",
-        rusqlite::params![when, import_id],
-    )
-    .unwrap();
+fn backdate(store: &Store<'_>, import_id: &str, days: i64) {
+    let repo = Archives::new(store);
+    let mut row = repo
+        .oldest_first()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.import_id == import_id)
+        .expect("an archive to backdate");
+    row.archived_at = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+    repo.record(&row).unwrap();
 }
 
-fn archive_rows(conn: &Connection) -> i64 {
-    conn.query_row("SELECT count(*) FROM import_archives", [], |r| r.get(0))
-        .unwrap()
+fn archive_rows(store: &Store<'_>) -> usize {
+    Archives::new(store).oldest_first().unwrap().len()
+}
+
+fn archive_path(store: &Store<'_>, import_id: &str) -> String {
+    Archives::new(store).blob_of(import_id).unwrap().unwrap().0
 }
 
 fn clear_limits() {
@@ -309,15 +296,15 @@ fn with_no_limits_configured_pruning_removes_nothing() {
 
     let path = dir.join("chat.jsonl");
     std::fs::write(&path, transcript_line("a fact", "t", "/one")).unwrap();
-    let db = open(&dir);
-    let conn = db.conn();
-    let import_id = match import(&conn, &path) {
+    let db = open();
+    let store = db.store();
+    let import_id = match import(&store, &path) {
         ImportOutcome::Imported { import_id, .. } => import_id,
         other => panic!("expected an import, got {:?}", other),
     };
-    backdate(&conn, &import_id, 4000);
+    backdate(&store, &import_id, 4000);
 
-    let report = archive::prune(&conn, false).unwrap();
+    let report = archive::prune(&store, false).unwrap();
 
     // Someone already running with an archive chose to keep it. Turning on
     // silent deletion underneath them during an upgrade is the wrong way
@@ -325,7 +312,7 @@ fn with_no_limits_configured_pruning_removes_nothing() {
     // removals otherwise reads as "nothing was old enough".
     assert!(!report.limits_configured);
     assert_eq!(report.removed_for_age, 0);
-    assert_eq!(archive_rows(&conn), 1);
+    assert_eq!(archive_rows(&store), 1);
 
     crate::test_env::remove_var(ARCHIVE_DIR_ENV);
     let _ = std::fs::remove_dir_all(&dir);
@@ -341,37 +328,31 @@ fn an_archive_past_the_age_limit_is_removed_but_its_memories_are_not() {
 
     let path = dir.join("chat.jsonl");
     std::fs::write(&path, transcript_line("a fact", "a thought", "/one")).unwrap();
-    let db = open(&dir);
-    let conn = db.conn();
-    let import_id = match import(&conn, &path) {
+    let db = open();
+    let store = db.store();
+    let import_id = match import(&store, &path) {
         ImportOutcome::Imported { import_id, .. } => import_id,
         other => panic!("expected an import, got {:?}", other),
     };
-    let ids = memory_ids(&conn);
-    let blob: String = conn
-        .query_row(
-            "SELECT archive_path FROM import_archives WHERE import_id = ?",
-            [&import_id],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let ids = memory_ids(&store);
+    let blob = archive_path(&store, &import_id);
 
-    backdate(&conn, &import_id, 40);
+    backdate(&store, &import_id, 40);
     crate::test_env::set_var(ARCHIVE_MAX_AGE_DAYS_ENV, "30");
 
-    let report = archive::prune(&conn, false).unwrap();
+    let report = archive::prune(&store, false).unwrap();
 
     assert!(report.limits_configured);
     assert_eq!(report.removed_for_age, 1);
     assert!(report.bytes_reclaimed > 0);
-    assert_eq!(archive_rows(&conn), 0);
+    assert_eq!(archive_rows(&store), 0);
     assert!(!std::path::Path::new(&blob).exists());
 
     // Pruning drops the archive, never the memories derived from it, and the
     // read path degrades to "no source" exactly as it does for an import made
     // before retention was switched on.
-    assert_eq!(memory_ids(&conn).len(), ids.len());
-    assert!(archive::source_for(&conn, &ids[0], false)
+    assert_eq!(memory_ids(&store).len(), ids.len());
+    assert!(archive::source_for(&store, &ids[0], false)
         .unwrap()
         .is_none());
 
@@ -390,20 +371,20 @@ fn a_dry_run_reports_without_removing() {
 
     let path = dir.join("chat.jsonl");
     std::fs::write(&path, transcript_line("a fact", "t", "/one")).unwrap();
-    let db = open(&dir);
-    let conn = db.conn();
-    let import_id = match import(&conn, &path) {
+    let db = open();
+    let store = db.store();
+    let import_id = match import(&store, &path) {
         ImportOutcome::Imported { import_id, .. } => import_id,
         other => panic!("expected an import, got {:?}", other),
     };
-    backdate(&conn, &import_id, 40);
+    backdate(&store, &import_id, 40);
     crate::test_env::set_var(ARCHIVE_MAX_AGE_DAYS_ENV, "30");
 
-    let report = archive::prune(&conn, true).unwrap();
+    let report = archive::prune(&store, true).unwrap();
 
     assert!(report.dry_run);
     assert_eq!(report.removed_for_age, 1, "should say what it would remove");
-    assert_eq!(archive_rows(&conn), 1, "and then not remove it");
+    assert_eq!(archive_rows(&store), 1, "and then not remove it");
 
     clear_limits();
     crate::test_env::remove_var(ARCHIVE_DIR_ENV);
@@ -417,48 +398,49 @@ fn the_size_ceiling_evicts_oldest_first_and_keeps_the_newest() {
 
     let dir = scratch("size");
     crate::test_env::set_var(ARCHIVE_DIR_ENV, dir.join("archive"));
-    let db = open(&dir);
-    let conn = db.conn();
+    let db = open();
+    let store = db.store();
 
     // Three distinct imports, each a few hundred bytes.
     let mut import_ids = Vec::new();
     for n in 0..3 {
         let path = dir.join(format!("chat{}.jsonl", n));
         std::fs::write(&path, transcript_line(&format!("fact {}", n), "t", "/x")).unwrap();
-        match import(&conn, &path) {
+        match import(&store, &path) {
             ImportOutcome::Imported { import_id, .. } => import_ids.push(import_id),
             other => panic!("expected an import, got {:?}", other),
         }
     }
     for (age, id) in [(30, 0), (20, 1), (10, 2)] {
-        backdate(&conn, &import_ids[id], age);
+        backdate(&store, &import_ids[id], age);
     }
 
-    let total: i64 = conn
-        .query_row("SELECT sum(byte_len) FROM import_archives", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    let one_row: i64 = conn
-        .query_row("SELECT max(byte_len) FROM import_archives", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
+    let lens: Vec<i64> = Archives::new(&store)
+        .oldest_first()
+        .unwrap()
+        .iter()
+        .map(|r| r.byte_len)
+        .collect();
+    let total: i64 = lens.iter().sum();
+    let one_row: i64 = lens.iter().copied().max().unwrap();
     assert!(total > one_row, "fixture needs distinct blobs");
 
     // A ceiling that fits roughly one of the three.
     crate::test_env::set_var(ARCHIVE_MAX_BYTES_ENV, (one_row + 8).to_string());
-    let report = archive::prune(&conn, false).unwrap();
+    let report = archive::prune(&store, false).unwrap();
 
     assert_eq!(report.removed_for_size, 2);
     assert_eq!(report.removed_for_age, 0);
     assert!(report.bytes_remaining <= (one_row + 8) as u64);
 
     // The newest survives: it is the one most likely to be drilled into.
-    let survivor: String = conn
-        .query_row("SELECT import_id FROM import_archives", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(survivor, import_ids[2]);
+    let survivors: Vec<String> = Archives::new(&store)
+        .oldest_first()
+        .unwrap()
+        .into_iter()
+        .map(|r| r.import_id)
+        .collect();
+    assert_eq!(survivors, [import_ids[2].clone()]);
 
     clear_limits();
     crate::test_env::remove_var(ARCHIVE_DIR_ENV);
@@ -487,14 +469,16 @@ fn a_malformed_line_does_not_shift_the_spans_after_it() {
     )
     .unwrap();
 
-    let db = open(&dir);
-    let conn = db.conn();
-    import(&conn, &path);
+    let db = open();
+    let store = db.store();
+    import(&store, &path);
 
-    let ids = memory_ids(&conn);
+    let ids = memory_ids(&store);
     assert_eq!(ids.len(), 2, "the bad line is skipped, the rest survive");
 
-    let second = archive::source_for(&conn, &ids[1], false).unwrap().unwrap();
+    let second = archive::source_for(&store, &ids[1], false)
+        .unwrap()
+        .unwrap();
     assert!(second.content.contains("after the break"));
     assert!(!second.content.contains("not json at all"));
     assert!(!second.content.contains("before the break"));

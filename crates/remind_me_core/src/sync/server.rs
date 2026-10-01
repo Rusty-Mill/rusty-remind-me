@@ -12,8 +12,10 @@
 //! `webhook.rs`'s single fixed-path endpoint never had to do.
 
 use super::graph::apply_incoming_record;
+use crate::db::stats::StoreStats;
+use crate::db::sync_feed::SyncFeed;
+use crate::db::Store;
 use crate::Database;
-use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 use std::io::{self, Read, Write};
 use std::net::TcpListener;
@@ -305,18 +307,12 @@ fn handle_health(config: &PeerServerConfig) -> Value {
 /// comparison have to count identically: the hub counts every row and reports
 /// tombstones separately, so filtering here would make a healthy peer look
 /// permanently behind by its own tombstone count.
-fn handle_count(conn: &Connection, config: &PeerServerConfig) -> Result<Value, rusqlite::Error> {
-    let (total, tombstones): (i64, i64) = conn.query_row(
-        "SELECT COUNT(*),
-                COALESCE(SUM(CASE WHEN deleted_at IS NOT NULL THEN 1 ELSE 0 END), 0)
-           FROM memories",
-        [],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
-
-    let count_of = |table: &str| -> Result<i64, rusqlite::Error> {
-        conn.query_row(&format!("SELECT COUNT(*) FROM {}", table), [], |r| r.get(0))
-    };
+fn handle_count(
+    store: &Store<'_>,
+    config: &PeerServerConfig,
+) -> Result<Value, crate::db::StoreError> {
+    let feed = SyncFeed::new(store);
+    let (total, tombstones) = StoreStats::new(store).memory_totals()?;
 
     Ok(json!({
         "role": "peer",
@@ -328,9 +324,9 @@ fn handle_count(conn: &Connection, config: &PeerServerConfig) -> Result<Value, r
             "live": total - tombstones,
             "tombstones": tombstones,
         },
-        "entities": count_of("entities")?,
-        "memory_entities": count_of("memory_entities")?,
-        "entity_relations": count_of("entity_relations")?,
+        "entities": feed.entity_count()?,
+        "memory_entities": feed.link_count()?,
+        "entity_relations": feed.relation_count()?,
         "time": chrono::Utc::now().to_rfc3339(),
     }))
 }
@@ -339,7 +335,7 @@ fn handle_count(conn: &Connection, config: &PeerServerConfig) -> Result<Value, r
 /// funnels into the same `sync_outbox`, so one page can carry `memory`,
 /// `entity`, `entity_relation`, and `memory_entity` records together.
 /// [`apply_incoming_record`] dispatches each on its own `record_type`.
-fn handle_push(conn: &Connection, body: &[u8]) -> (u16, Value) {
+fn handle_push(store: &Store<'_>, body: &[u8]) -> (u16, Value) {
     let Ok(payload) = serde_json::from_slice::<Value>(body) else {
         return (400, json!({ "error": "malformed JSON" }));
     };
@@ -350,7 +346,7 @@ fn handle_push(conn: &Connection, body: &[u8]) -> (u16, Value) {
     let mut processed_ids = Vec::new();
     let mut failed = 0usize;
     for record_value in records {
-        match apply_incoming_record(conn, record_value) {
+        match apply_incoming_record(store, record_value) {
             Ok(wire_id) => processed_ids.push(wire_id),
             Err(_) => failed += 1,
         }
@@ -362,53 +358,7 @@ fn handle_push(conn: &Connection, body: &[u8]) -> (u16, Value) {
     )
 }
 
-const SYNC_RECORD_COLUMNS: &str =
-    "id, content, category, tags, source, metadata, created_at, updated_at, \
-     capture_id, node_id, client, accessed_at, access_count, decay_rate, vitality, base_weight, \
-     status, memory_type, source_capture_id, subject, predicate, object, superseded_by, \
-     deleted_at, sensitive, remind_at";
-
-fn parse_sync_record_row(row: &rusqlite::Row) -> rusqlite::Result<Value> {
-    let tags_json: String = row.get("tags")?;
-    let metadata_json: String = row.get("metadata")?;
-    Ok(json!({
-        "id": row.get::<_, String>("id")?,
-        "content": row.get::<_, String>("content")?,
-        "category": row.get::<_, String>("category")?,
-        "tags": serde_json::from_str::<Value>(&tags_json).unwrap_or_else(|_| json!([])),
-        "source": row.get::<_, String>("source")?,
-        "metadata": serde_json::from_str::<Value>(&metadata_json).unwrap_or_else(|_| json!({})),
-        "created_at": row.get::<_, String>("created_at")?,
-        "updated_at": row.get::<_, String>("updated_at")?,
-        "capture_id": row.get::<_, Option<String>>("capture_id")?,
-        "node_id": row.get::<_, Option<String>>("node_id")?,
-        "client": row.get::<_, String>("client")?,
-        "accessed_at": row.get::<_, Option<String>>("accessed_at")?,
-        "access_count": row.get::<_, i64>("access_count")?,
-        "decay_rate": row.get::<_, f64>("decay_rate")?,
-        "vitality": row.get::<_, f64>("vitality")?,
-        "base_weight": row.get::<_, f64>("base_weight")?,
-        "status": row.get::<_, String>("status")?,
-        "memory_type": row.get::<_, String>("memory_type")?,
-        "source_capture_id": row.get::<_, Option<String>>("source_capture_id")?,
-        "subject": row.get::<_, Option<String>>("subject")?,
-        "predicate": row.get::<_, Option<String>>("predicate")?,
-        "object": row.get::<_, Option<String>>("object")?,
-        "superseded_by": row.get::<_, Option<String>>("superseded_by")?,
-        // Three columns this function never read (#265). `deleted_at` is the
-        // most serious of the three found while fixing `sensitive`/
-        // `remind_at`: without it, a tombstone never propagates over direct
-        // peer sync at all, so a memory deleted on one node and pulled by a
-        // peer stays live there forever. `sync/record.rs`'s `SyncRecord`
-        // already expects all three on the wire; this function just never
-        // supplied them.
-        "deleted_at": row.get::<_, Option<String>>("deleted_at")?,
-        "sensitive": row.get::<_, bool>("sensitive")?,
-        "remind_at": row.get::<_, Option<String>>("remind_at")?,
-    }))
-}
-
-fn handle_pull(conn: &Connection, query: &str) -> (u16, Value) {
+fn handle_pull(store: &Store<'_>, query: &str) -> (u16, Value) {
     let since = query_param(query, "since")
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "1970-01-01T00:00:00+00:00".to_string());
@@ -419,37 +369,8 @@ fn handle_pull(conn: &Connection, query: &str) -> (u16, Value) {
         .unwrap_or(MAX_PULL_LIMIT)
         .clamp(1, MAX_PULL_LIMIT);
 
-    let sql = format!(
-        "SELECT {cols} FROM memories
-          WHERE (updated_at > ?1 OR (updated_at = ?1 AND id > ?2))
-            {exclude_clause}
-          ORDER BY updated_at ASC, id ASC
-          LIMIT ?3",
-        cols = SYNC_RECORD_COLUMNS,
-        exclude_clause = if exclude_node.is_some() {
-            "AND (node_id IS NULL OR node_id != ?4)"
-        } else {
-            ""
-        },
-    );
-
-    let result = if let Some(exclude_node) = &exclude_node {
-        conn.prepare(&sql).and_then(|mut stmt| {
-            stmt.query_map(
-                params![since, since_id, limit as i64, exclude_node],
-                parse_sync_record_row,
-            )?
-            .collect::<rusqlite::Result<Vec<Value>>>()
-        })
-    } else {
-        conn.prepare(&sql).and_then(|mut stmt| {
-            stmt.query_map(
-                params![since, since_id, limit as i64],
-                parse_sync_record_row,
-            )?
-            .collect::<rusqlite::Result<Vec<Value>>>()
-        })
-    };
+    let result =
+        SyncFeed::new(store).memories_after(&since, &since_id, exclude_node.as_deref(), limit);
 
     match result {
         Ok(records) => (200, json!({ "records": records, "count": records.len() })),
@@ -470,53 +391,14 @@ fn cursor_params(query: &str) -> (String, String, usize) {
     (since, since_id, limit)
 }
 
-fn parse_entity_row(row: &rusqlite::Row) -> rusqlite::Result<Value> {
-    let aliases_json: String = row.get("aliases")?;
-    Ok(json!({
-        "record_type": "entity",
-        "id": row.get::<_, String>("id")?,
-        "name": row.get::<_, String>("name")?,
-        "kind": row.get::<_, Option<String>>("kind")?,
-        "aliases": serde_json::from_str::<Value>(&aliases_json).unwrap_or_else(|_| json!([])),
-        "created_at": row.get::<_, String>("created_at")?,
-        "updated_at": row.get::<_, String>("updated_at")?,
-        "node_id": row.get::<_, Option<String>>("node_id")?,
-    }))
-}
-
 /// `entities` pulls keyset-paged on `(updated_at, id)`, exactly like
 /// `memories` — `exclude_node` is honored the same way.
-fn handle_pull_entities(conn: &Connection, query: &str) -> (u16, Value) {
+fn handle_pull_entities(store: &Store<'_>, query: &str) -> (u16, Value) {
     let (since, since_id, limit) = cursor_params(query);
     let exclude_node = query_param(query, "exclude_node").filter(|s| !s.is_empty());
 
-    let sql = format!(
-        "SELECT id, name, kind, aliases, created_at, updated_at, node_id FROM entities
-          WHERE (updated_at > ?1 OR (updated_at = ?1 AND id > ?2))
-            {exclude_clause}
-          ORDER BY updated_at ASC, id ASC
-          LIMIT ?3",
-        exclude_clause = if exclude_node.is_some() {
-            "AND (node_id IS NULL OR node_id != ?4)"
-        } else {
-            ""
-        },
-    );
-    let result = if let Some(exclude_node) = &exclude_node {
-        conn.prepare(&sql).and_then(|mut stmt| {
-            stmt.query_map(
-                params![since, since_id, limit as i64, exclude_node],
-                parse_entity_row,
-            )?
-            .collect::<rusqlite::Result<Vec<Value>>>()
-        })
-    } else {
-        conn.prepare(&sql).and_then(|mut stmt| {
-            stmt.query_map(params![since, since_id, limit as i64], parse_entity_row)?
-                .collect::<rusqlite::Result<Vec<Value>>>()
-        })
-    };
-
+    let result =
+        SyncFeed::new(store).entities_after(&since, &since_id, exclude_node.as_deref(), limit);
     match result {
         Ok(records) => (200, json!({ "records": records, "count": records.len() })),
         Err(e) => (500, json!({ "error": e.to_string() })),
@@ -529,30 +411,10 @@ fn handle_pull_entities(conn: &Connection, query: &str) -> (u16, Value) {
 /// `exclude_node` is accepted (so an older client's query string doesn't 400)
 /// but not applied — `memory_entities` has no `node_id` column at all,
 /// matching the reference's own tolerated-but-unused parameter exactly.
-fn handle_pull_links(conn: &Connection, query: &str) -> (u16, Value) {
+fn handle_pull_links(store: &Store<'_>, query: &str) -> (u16, Value) {
     let (since, since_id, limit) = cursor_params(query);
 
-    let result = conn
-        .prepare(
-            "SELECT memory_id, entity_id, created_at FROM memory_entities
-              WHERE (created_at > ?1 OR (created_at = ?1 AND (memory_id || '|' || entity_id) > ?2))
-              ORDER BY created_at ASC, (memory_id || '|' || entity_id) ASC
-              LIMIT ?3",
-        )
-        .and_then(|mut stmt| {
-            stmt.query_map(params![since, since_id, limit as i64], |row| {
-                let memory_id: String = row.get("memory_id")?;
-                let entity_id: String = row.get("entity_id")?;
-                Ok(json!({
-                    "record_type": "memory_entity",
-                    "id": format!("{memory_id}|{entity_id}"),
-                    "memory_id": memory_id,
-                    "entity_id": entity_id,
-                    "created_at": row.get::<_, String>("created_at")?,
-                }))
-            })?
-            .collect::<rusqlite::Result<Vec<Value>>>()
-        });
+    let result = SyncFeed::new(store).links_after(&since, &since_id, limit);
 
     match result {
         Ok(records) => (200, json!({ "records": records, "count": records.len() })),
@@ -563,32 +425,10 @@ fn handle_pull_links(conn: &Connection, query: &str) -> (u16, Value) {
 /// `entity_relations` pulls keyset-paged on `(created_at, id)` — relations
 /// already carry a real deterministic id, no synthetic key needed.
 /// `exclude_node` is likewise accepted but unused, matching the reference.
-fn handle_pull_entity_relations(conn: &Connection, query: &str) -> (u16, Value) {
+fn handle_pull_entity_relations(store: &Store<'_>, query: &str) -> (u16, Value) {
     let (since, since_id, limit) = cursor_params(query);
 
-    let result = conn
-        .prepare(
-            "SELECT id, subject_entity_id, relation, object_entity_id, created_at, updated_at, node_id
-               FROM entity_relations
-              WHERE (created_at > ?1 OR (created_at = ?1 AND id > ?2))
-              ORDER BY created_at ASC, id ASC
-              LIMIT ?3",
-        )
-        .and_then(|mut stmt| {
-            stmt.query_map(params![since, since_id, limit as i64], |row| {
-                Ok(json!({
-                    "record_type": "entity_relation",
-                    "id": row.get::<_, String>("id")?,
-                    "subject_entity_id": row.get::<_, String>("subject_entity_id")?,
-                    "relation": row.get::<_, String>("relation")?,
-                    "object_entity_id": row.get::<_, String>("object_entity_id")?,
-                    "created_at": row.get::<_, String>("created_at")?,
-                    "updated_at": row.get::<_, String>("updated_at")?,
-                    "node_id": row.get::<_, Option<String>>("node_id")?,
-                }))
-            })?
-            .collect::<rusqlite::Result<Vec<Value>>>()
-        });
+    let result = SyncFeed::new(store).relations_after(&since, &since_id, limit);
 
     match result {
         Ok(records) => (200, json!({ "records": records, "count": records.len() })),
@@ -603,7 +443,7 @@ fn handle_pull_entity_relations(conn: &Connection, query: &str) -> (u16, Value) 
 pub fn serve_once<S: Read + Write>(
     stream: &mut S,
     config: &PeerServerConfig,
-    conn: &Connection,
+    store: &Store<'_>,
 ) -> io::Result<()> {
     let (head, body_prefix) = match read_head(stream)? {
         HeadOutcome::Complete(head, prefix) => (head, prefix),
@@ -632,7 +472,7 @@ pub fn serve_once<S: Read + Write>(
         }
         ("GET", COUNT_PATH) => {
             drain_body(stream, &head.content_length, body_prefix.len());
-            match handle_count(conn, config) {
+            match handle_count(store, config) {
                 Ok(response) => write_response(stream, 200, &response),
                 Err(e) => write_response(
                     stream,
@@ -643,22 +483,22 @@ pub fn serve_once<S: Read + Write>(
         }
         ("GET", PULL_PATH) => {
             drain_body(stream, &head.content_length, body_prefix.len());
-            let (status, response) = handle_pull(conn, &head.query);
+            let (status, response) = handle_pull(store, &head.query);
             write_response(stream, status, &response)
         }
         ("GET", PULL_ENTITIES_PATH) => {
             drain_body(stream, &head.content_length, body_prefix.len());
-            let (status, response) = handle_pull_entities(conn, &head.query);
+            let (status, response) = handle_pull_entities(store, &head.query);
             write_response(stream, status, &response)
         }
         ("GET", PULL_LINKS_PATH) => {
             drain_body(stream, &head.content_length, body_prefix.len());
-            let (status, response) = handle_pull_links(conn, &head.query);
+            let (status, response) = handle_pull_links(store, &head.query);
             write_response(stream, status, &response)
         }
         ("GET", PULL_ENTITY_RELATIONS_PATH) => {
             drain_body(stream, &head.content_length, body_prefix.len());
-            let (status, response) = handle_pull_entity_relations(conn, &head.query);
+            let (status, response) = handle_pull_entity_relations(store, &head.query);
             write_response(stream, status, &response)
         }
         ("POST", PUSH_PATH) => {
@@ -697,7 +537,7 @@ pub fn serve_once<S: Read + Write>(
             if body.len() < length {
                 return write_response(stream, 400, &json!({ "error": "truncated request body" }));
             }
-            let (status, response) = handle_push(conn, &body);
+            let (status, response) = handle_push(store, &body);
             write_response(stream, status, &response)
         }
         (method, path)
@@ -746,7 +586,7 @@ impl PeerServer {
         let handle = std::thread::Builder::new()
             .name("sync-peer-server".to_string())
             .spawn(move || {
-                // A connection of its own, not `db.conn()`'s shared `Mutex`:
+                // A connection of its own, not `db.store()`'s shared `Mutex`:
                 // `serve_once` can block for up to `IO_TIMEOUT` reading a
                 // slow or hostile peer's request, and holding the
                 // process-wide mutex for that span used to block every other
@@ -755,18 +595,19 @@ impl PeerServer {
                 // fix for the identical shape of bug on the outbound side:
                 // opened once and reused across accepted connections,
                 // reopened on the next accept if the attempt itself failed.
-                let mut conn = db.open_secondary().ok();
+                let source = db.secondary_source();
+                let mut store = db.open_secondary().ok();
                 while !thread_shutdown.load(Ordering::Relaxed) {
                     match listener.accept() {
                         Ok((mut stream, _peer)) => {
                             let _ = stream.set_nonblocking(false);
                             let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
                             let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
-                            if conn.is_none() {
-                                conn = db.open_secondary().ok();
+                            if store.is_none() {
+                                store = db.open_secondary().ok();
                             }
-                            if let Some(c) = conn.as_ref() {
-                                let _ = serve_once(&mut stream, &config, c);
+                            if let (Some(c), Some(source)) = (store.as_ref(), source.as_ref()) {
+                                let _ = serve_once(&mut stream, &config, &source.store(c));
                             }
                             let _ = stream.shutdown(std::net::Shutdown::Both);
                         }

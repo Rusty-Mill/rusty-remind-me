@@ -9,7 +9,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use remind_me_core::remote::RemoteConfig;
-use remind_me_mcp::McpServer;
+use remind_me_mcp::Handler;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use serde_json::json;
@@ -92,7 +92,7 @@ async fn health() -> impl IntoResponse {
 /// fragment) — mirrors the reference's `build_remote_app`, which raises
 /// `ValueError` synchronously at the same point for the same reason.
 pub fn build_router(
-    mcp: Arc<McpServer>,
+    mcp: Arc<dyn Handler>,
     token: String,
     issuer: Option<String>,
 ) -> Result<Router, IssuerError> {
@@ -161,7 +161,11 @@ pub fn build_router(
 ///
 /// This is the crate's sole public async entry point; [`run_blocking`]
 /// (below) is what a synchronous caller like `remind_me_cli` actually uses.
-pub async fn run(mcp: Arc<McpServer>, config: RemoteConfig, token: String) -> std::io::Result<()> {
+pub async fn run(
+    mcp: Arc<dyn Handler>,
+    config: RemoteConfig,
+    token: String,
+) -> std::io::Result<()> {
     warn_if_widened(&config.host, config.port);
     let addr: SocketAddr = format!("{}:{}", config.host, config.port)
         .parse()
@@ -199,13 +203,13 @@ pub async fn run(mcp: Arc<McpServer>, config: RemoteConfig, token: String) -> st
 /// that — one crate — instead of leaking an `async fn` or a tokio
 /// dependency into `remind_me_cli`, which stays synchronous like every
 /// other crate in this workspace.
-pub fn run_blocking(mcp: McpServer) -> std::io::Result<()> {
+pub fn run_blocking(mcp: Arc<dyn Handler>) -> std::io::Result<()> {
     let config = RemoteConfig::from_env();
     let token = remind_me_core::remote::resolve_connector_token();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(run(Arc::new(mcp), config, token))
+    runtime.block_on(run(mcp, config, token))
 }
 
 #[cfg(test)]

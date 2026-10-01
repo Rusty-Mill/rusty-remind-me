@@ -11,9 +11,11 @@
 //! reacts to what comes back — including responses no real server in this
 //! workspace produces (a hub that omits `hub_seq`, an empty first page).
 
+use remind_me_core::db::sync_state::{SyncLogRow, SyncState};
+use remind_me_core::db::Store;
 use remind_me_core::sync::pull_remote;
+use remind_me_core::testing;
 use remind_me_core::Database;
-use rusqlite::Connection;
 use serde_json::json;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
@@ -142,13 +144,11 @@ fn scripted_hub(
     (format!("http://127.0.0.1:{}", port), rx, handle)
 }
 
-fn seq_cursor(conn: &Connection, remote_id: &str) -> i64 {
-    conn.query_row(
-        "SELECT last_pull_seq FROM sync_log WHERE remote_id = ?",
-        [remote_id],
-        |r| r.get(0),
-    )
-    .unwrap()
+fn seq_cursor(store: &Store<'_>, remote_id: &str) -> i64 {
+    SyncState::new(store)
+        .seq_cursor(remote_id)
+        .unwrap()
+        .expect("a sync_log row")
 }
 
 /// A record carrying a `hub_seq`, as a hub serves it.
@@ -179,7 +179,7 @@ fn peer_record(id: &str, updated_at: &str) -> serde_json::Value {
 #[test]
 fn a_record_carrying_hub_seq_establishes_the_sequence_cursor() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let (url, seen, _handle) = stub_hub(vec![
         // The probe.
         records(json!({"records": [hub_record("m1", "2026-01-01T00:00:00+00:00", 7)]})),
@@ -187,7 +187,7 @@ fn a_record_carrying_hub_seq_establishes_the_sequence_cursor() {
         records(json!({"records": [hub_record("m1", "2026-01-01T00:00:00+00:00", 7)]})),
     ]);
 
-    pull_remote(&conn, &url, SECRET, "this-node", "hub").unwrap();
+    pull_remote(&store, &url, SECRET, "this-node", "hub").unwrap();
 
     let probe = next_request(&seen, "the hub_seq probe");
     assert!(
@@ -204,7 +204,7 @@ fn a_record_carrying_hub_seq_establishes_the_sequence_cursor() {
         "the legacy cursor must not be sent once the sequence cursor is live, got {first_page}"
     );
     assert_eq!(
-        seq_cursor(&conn, "hub"),
+        seq_cursor(&store, "hub"),
         7,
         "cursor advances to the greatest hub_seq applied"
     );
@@ -216,17 +216,21 @@ fn a_200_without_hub_seq_marks_the_remote_unsupported() {
     // unknown `since_seq` parameter and answers happily from its legacy
     // cursor. A 200 therefore proves nothing — only the field's presence does.
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let (url, seen, _handle) = stub_hub(vec![
         records(json!({"records": [peer_record("m1", "2026-01-01T00:00:00+00:00")]})),
         records(json!({"records": [peer_record("m1", "2026-01-01T00:00:00+00:00")]})),
     ]);
 
-    pull_remote(&conn, &url, SECRET, "this-node", "peer").unwrap();
+    pull_remote(&store, &url, SECRET, "this-node", "peer").unwrap();
 
     let _probe = next_request(&seen, "the hub_seq probe");
     let first_page = next_request(&seen, "the first page request");
-    assert_eq!(seq_cursor(&conn, "peer"), -2, "SEQ_UNSUPPORTED, and sticky");
+    assert_eq!(
+        seq_cursor(&store, "peer"),
+        -2,
+        "SEQ_UNSUPPORTED, and sticky"
+    );
     assert!(
         first_page.contains("since=") && first_page.contains("since_id="),
         "an unsupported remote must stay on the legacy cursor, got {first_page}"
@@ -243,21 +247,15 @@ fn an_empty_probe_leaves_the_state_unknown_rather_than_unsupported() {
     // empty result is not evidence of absence. Marking it unsupported here
     // would be sticky and wrong, and only `sync_repair` would clear it.
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let (url, _seen, _handle) = stub_hub(vec![
         records(json!({"records": []})),
         records(json!({"records": []})),
     ]);
 
-    pull_remote(&conn, &url, SECRET, "this-node", "empty-hub").unwrap();
+    pull_remote(&store, &url, SECRET, "this-node", "empty-hub").unwrap();
 
-    let stored: Option<i64> = conn
-        .query_row(
-            "SELECT last_pull_seq FROM sync_log WHERE remote_id = ?",
-            ["empty-hub"],
-            |r| r.get(0),
-        )
-        .ok();
+    let stored = SyncState::new(&store).seq_cursor("empty-hub").unwrap();
     assert!(
         stored.is_none() || stored == Some(-1),
         "an empty probe must leave the cursor unknown, got {stored:?}"
@@ -273,18 +271,12 @@ fn an_unreachable_remote_is_not_mistaken_for_one_lacking_the_feature() {
         listener.local_addr().unwrap().port()
     };
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let url = format!("http://127.0.0.1:{port}");
 
-    let _ = pull_remote(&conn, &url, SECRET, "this-node", "down");
+    let _ = pull_remote(&store, &url, SECRET, "this-node", "down");
 
-    let stored: Option<i64> = conn
-        .query_row(
-            "SELECT last_pull_seq FROM sync_log WHERE remote_id = ?",
-            ["down"],
-            |r| r.get(0),
-        )
-        .ok();
+    let stored = SyncState::new(&store).seq_cursor("down").unwrap();
     assert!(
         stored.is_none() || stored == Some(-1),
         "a failed probe must leave the state unknown so the next cycle retries, got {stored:?}"
@@ -303,12 +295,13 @@ fn a_record_stamped_behind_the_legacy_cursor_is_still_pulled() {
     // sorts behind and is invisible forever. Under the sequence cursor it
     // arrives.
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    conn.execute(
-        "INSERT INTO sync_log (remote_id, last_pull, last_pull_id) VALUES (?, ?, '')",
-        rusqlite::params!["hub", "2026-06-01T00:00:00+00:00"],
-    )
-    .unwrap();
+    let store = db.store();
+    SyncState::new(&store)
+        .put_remote_row(&SyncLogRow {
+            last_pull: "2026-06-01T00:00:00+00:00".into(),
+            ..SyncLogRow::new("hub")
+        })
+        .unwrap();
 
     // The stub behaves like a real hub: the stranded record is reachable
     // *only* by sequence. Ask by the legacy cursor and it sorts behind
@@ -328,19 +321,15 @@ fn a_record_stamped_behind_the_legacy_cursor_is_still_pulled() {
         4,
     );
 
-    let report = pull_remote(&conn, &url, SECRET, "this-node", "hub").unwrap();
+    let report = pull_remote(&store, &url, SECRET, "this-node", "hub").unwrap();
 
     assert_eq!(report.applied, 1, "the stranded record must be applied");
-    let content: String = conn
-        .query_row(
-            "SELECT content FROM memories WHERE id = 'stranded'",
-            [],
-            |r| r.get(0),
-        )
+    let content = testing::memory_text(&store, "stranded", "content")
+        .unwrap()
         .unwrap();
     assert_eq!(content, "content for stranded");
     assert_eq!(
-        seq_cursor(&conn, "hub"),
+        seq_cursor(&store, "hub"),
         900,
         "and the sequence cursor advances past it"
     );
@@ -349,7 +338,7 @@ fn a_record_stamped_behind_the_legacy_cursor_is_still_pulled() {
 #[test]
 fn the_cursor_advances_to_the_greatest_hub_seq_in_a_page() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let page = json!({"records": [
         hub_record("a", "2026-01-01T00:00:00+00:00", 11),
         hub_record("b", "2026-01-02T00:00:00+00:00", 44),
@@ -361,9 +350,9 @@ fn the_cursor_advances_to_the_greatest_hub_seq_in_a_page() {
         records(json!({"records": []})),
     ]);
 
-    pull_remote(&conn, &url, SECRET, "this-node", "hub").unwrap();
+    pull_remote(&store, &url, SECRET, "this-node", "hub").unwrap();
 
-    assert_eq!(seq_cursor(&conn, "hub"), 44, "greatest, not last or first");
+    assert_eq!(seq_cursor(&store, "hub"), 44, "greatest, not last or first");
 }
 
 #[test]
@@ -371,12 +360,13 @@ fn a_page_that_does_not_advance_the_sequence_stops_the_cycle() {
     // A remote replaying the same page must not trap a pull cycle. Three
     // responses are scripted; only the probe and one page should be consumed.
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    conn.execute(
-        "INSERT INTO sync_log (remote_id, last_pull, last_pull_seq) VALUES (?, ?, ?)",
-        rusqlite::params!["hub", "1970-01-01T00:00:00+00:00", 50],
-    )
-    .unwrap();
+    let store = db.store();
+    SyncState::new(&store)
+        .put_remote_row(&SyncLogRow {
+            last_pull_seq: 50,
+            ..SyncLogRow::new("hub")
+        })
+        .unwrap();
 
     let stale = json!({"records": [hub_record("old", "2026-01-01T00:00:00+00:00", 50)]});
     let (url, seen, _handle) = stub_hub(vec![
@@ -385,7 +375,7 @@ fn a_page_that_does_not_advance_the_sequence_stops_the_cycle() {
         records(stale),
     ]);
 
-    pull_remote(&conn, &url, SECRET, "this-node", "hub").unwrap();
+    pull_remote(&store, &url, SECRET, "this-node", "hub").unwrap();
 
     // No probe: the cursor was already established at 50.
     let first = next_request(&seen, "the first page request");
@@ -395,7 +385,7 @@ fn a_page_that_does_not_advance_the_sequence_stops_the_cycle() {
             .is_err(),
         "a page that does not advance the cursor must end the cycle, not re-request"
     );
-    assert_eq!(seq_cursor(&conn, "hub"), 50, "and the cursor stays put");
+    assert_eq!(seq_cursor(&store, "hub"), 50, "and the cursor stays put");
 }
 
 // ---------------------------------------------------------------------------
@@ -409,24 +399,20 @@ fn sync_repair_clears_a_stuck_unsupported_verdict() {
     // re-probed. Back to unknown rather than to 0, which would assert support
     // that was never established.
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    conn.execute(
-        "INSERT INTO sync_log (remote_id, last_pull, last_pull_id, last_pull_seq)
-         VALUES ('hub', '2026-01-01T00:00:00+00:00', 'some-id', -2)",
-        [],
-    )
-    .unwrap();
-
-    assert!(remind_me_core::sync::sync_repair(&conn, "hub").unwrap());
-
-    assert_eq!(seq_cursor(&conn, "hub"), -1, "back to SEQ_UNKNOWN, not 0");
-    let (last_pull, last_pull_id): (String, String) = conn
-        .query_row(
-            "SELECT last_pull, last_pull_id FROM sync_log WHERE remote_id = 'hub'",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
+    let store = db.store();
+    SyncState::new(&store)
+        .put_remote_row(&SyncLogRow {
+            last_pull: "2026-01-01T00:00:00+00:00".into(),
+            last_pull_id: "some-id".into(),
+            last_pull_seq: -2,
+            ..SyncLogRow::new("hub")
+        })
         .unwrap();
+
+    assert!(remind_me_core::sync::sync_repair(&store, "hub").unwrap());
+
+    assert_eq!(seq_cursor(&store, "hub"), -1, "back to SEQ_UNKNOWN, not 0");
+    let (last_pull, last_pull_id) = SyncState::new(&store).pull_cursor("hub").unwrap().unwrap();
     assert_eq!(last_pull, "1970-01-01T00:00:00+00:00");
     assert_eq!(last_pull_id, "");
 }

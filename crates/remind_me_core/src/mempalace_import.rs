@@ -37,9 +37,12 @@
 //! stays imported, matching the reference exactly (it has no content-hash
 //! column to compare against).
 
+use crate::db::imports::ImportLedger;
+use crate::db::memories::{Memories, NewMemory};
+use crate::db::Store;
 use crate::models::{MempalaceImportInput, MEMPALACE_IMPORT_LIMIT_MAX, MEMPALACE_IMPORT_LIMIT_MIN};
 use chrono::Utc;
-use rusqlite::{params, params_from_iter, Connection, OpenFlags, Result};
+use rusqlite::{params, Connection, OpenFlags, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -90,6 +93,8 @@ pub enum MempalaceImportError {
         path: String,
     },
     Sqlite(rusqlite::Error),
+    /// The node's own store failed.
+    Store(crate::db::StoreError),
 }
 
 impl std::fmt::Display for MempalaceImportError {
@@ -105,11 +110,18 @@ impl std::fmt::Display for MempalaceImportError {
                 COLLECTION_NAME, path
             ),
             Self::Sqlite(e) => write!(f, "{}", e),
+            Self::Store(e) => write!(f, "{}", e),
         }
     }
 }
 
 impl std::error::Error for MempalaceImportError {}
+
+impl From<crate::db::StoreError> for MempalaceImportError {
+    fn from(e: crate::db::StoreError) -> Self {
+        Self::Store(e)
+    }
+}
 
 impl From<rusqlite::Error> for MempalaceImportError {
     fn from(e: rusqlite::Error) -> Self {
@@ -292,7 +304,7 @@ pub fn parse_frontmatter(
 /// about reading a flat key/value table requires that, and doing it here avoids
 /// depending on whatever internal query API a given Chroma version exposes.
 pub fn pull_mempalace(
-    conn: &Connection,
+    store: &Store<'_>,
     input: &MempalaceImportInput,
 ) -> std::result::Result<MempalaceImportResult, MempalaceImportError> {
     let store_dir = mempalace_path();
@@ -341,17 +353,11 @@ pub fn pull_mempalace(
     }
 
     let already: std::collections::HashSet<String> = {
-        let placeholders = std::iter::repeat_n("?", page.len())
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql = format!(
-            "SELECT drawer_id FROM mempalace_imports WHERE drawer_id IN ({})",
-            placeholders
-        );
         let ids: Vec<&str> = page.iter().map(|d| d.drawer_id.as_str()).collect();
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params_from_iter(ids.iter()), |row| row.get::<_, String>(0))?;
-        rows.collect::<Result<_>>()?
+        ImportLedger::new(store)
+            .imported_drawers(&ids)?
+            .into_iter()
+            .collect()
     };
 
     let to_import: Vec<&Drawer> = page
@@ -372,100 +378,90 @@ pub fn pull_mempalace(
     }
 
     let now = Utc::now().to_rfc3339();
-    let tx = conn.unchecked_transaction()?;
+    // One transaction for the page: a SQLite transaction, and one journal
+    // batch on the engine's memories core (ADR-0023, core PR 4b).
+    store.transaction(|batch| -> Result<(), MempalaceImportError> {
+        for drawer in &to_import {
+            let wing_val = drawer.wing.clone().unwrap_or_default();
+            let room_val = drawer.room.clone().unwrap_or_default();
 
-    for drawer in &to_import {
-        let wing_val = drawer.wing.clone().unwrap_or_default();
-        let room_val = drawer.room.clone().unwrap_or_default();
+            let (mem_category, mem_tags, mem_source, created_at, content) =
+                match parse_frontmatter(&drawer.document) {
+                    Some((fields, body)) => {
+                        let category = fields
+                            .get("category")
+                            .filter(|c| !c.is_empty())
+                            .cloned()
+                            .or_else(|| Some(input.category.clone()).filter(|c| !c.is_empty()))
+                            .unwrap_or_else(|| DEFAULT_CATEGORY.to_string());
+                        let native_tags: Vec<String> = fields
+                            .get("tags")
+                            .map(|t| {
+                                t.split(',')
+                                    .map(str::trim)
+                                    .filter(|t| !t.is_empty())
+                                    .map(str::to_string)
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let tags: Vec<String> = native_tags
+                            .into_iter()
+                            .chain(input.tags.iter().cloned())
+                            .collect();
+                        let source = format!(
+                            "mempalace:{}",
+                            fields
+                                .get("source")
+                                .map(String::as_str)
+                                .unwrap_or("unknown")
+                        );
+                        let created = fields
+                            .get("created")
+                            .cloned()
+                            .unwrap_or_else(|| now.clone());
+                        (category, tags, source, created, body)
+                    }
+                    None => {
+                        let category = if input.category.is_empty() {
+                            DEFAULT_CATEGORY.to_string()
+                        } else {
+                            input.category.clone()
+                        };
+                        let tags: Vec<String> = [wing_val.as_str(), room_val.as_str()]
+                            .into_iter()
+                            .filter(|t| !t.is_empty())
+                            .map(str::to_string)
+                            .chain(input.tags.iter().cloned())
+                            .collect();
+                        (
+                            category,
+                            tags,
+                            OPAQUE_SOURCE.to_string(),
+                            now.clone(),
+                            drawer.document.clone(),
+                        )
+                    }
+                };
 
-        let (mem_category, mem_tags, mem_source, created_at, content) =
-            match parse_frontmatter(&drawer.document) {
-                Some((fields, body)) => {
-                    let category = fields
-                        .get("category")
-                        .filter(|c| !c.is_empty())
-                        .cloned()
-                        .or_else(|| Some(input.category.clone()).filter(|c| !c.is_empty()))
-                        .unwrap_or_else(|| DEFAULT_CATEGORY.to_string());
-                    let native_tags: Vec<String> = fields
-                        .get("tags")
-                        .map(|t| {
-                            t.split(',')
-                                .map(str::trim)
-                                .filter(|t| !t.is_empty())
-                                .map(str::to_string)
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    let tags: Vec<String> = native_tags
-                        .into_iter()
-                        .chain(input.tags.iter().cloned())
-                        .collect();
-                    let source = format!(
-                        "mempalace:{}",
-                        fields
-                            .get("source")
-                            .map(String::as_str)
-                            .unwrap_or("unknown")
-                    );
-                    let created = fields
-                        .get("created")
-                        .cloned()
-                        .unwrap_or_else(|| now.clone());
-                    (category, tags, source, created, body)
-                }
-                None => {
-                    let category = if input.category.is_empty() {
-                        DEFAULT_CATEGORY.to_string()
-                    } else {
-                        input.category.clone()
-                    };
-                    let tags: Vec<String> = [wing_val.as_str(), room_val.as_str()]
-                        .into_iter()
-                        .filter(|t| !t.is_empty())
-                        .map(str::to_string)
-                        .chain(input.tags.iter().cloned())
-                        .collect();
-                    (
-                        category,
-                        tags,
-                        OPAQUE_SOURCE.to_string(),
-                        now.clone(),
-                        drawer.document.clone(),
-                    )
-                }
-            };
+            let memory_id = format!("mem_{}", uuid::Uuid::new_v4().simple());
+            let metadata = serde_json::json!({
+                "mempalace_drawer_id": drawer.drawer_id,
+                "wing": wing_val,
+                "room": room_val,
+            });
 
-        let memory_id = format!("mem_{}", uuid::Uuid::new_v4().simple());
-        let metadata = serde_json::json!({
-            "mempalace_drawer_id": drawer.drawer_id,
-            "wing": wing_val,
-            "room": room_val,
-        });
-
-        tx.execute(
-            "INSERT OR IGNORE INTO memories
-                (id, content, category, tags, source, metadata, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            params![
-                memory_id,
-                content,
-                mem_category,
-                serde_json::to_string(&mem_tags).unwrap_or_else(|_| "[]".to_string()),
-                mem_source,
-                metadata.to_string(),
+            Memories::new(batch).insert_or_ignore(&NewMemory {
+                category: mem_category,
+                tags: mem_tags,
+                source: mem_source,
+                metadata,
                 created_at,
-                now,
-            ],
-        )?;
-        tx.execute(
-            "INSERT OR IGNORE INTO mempalace_imports (drawer_id, memory_id, imported_at)
-             VALUES (?, ?, ?)",
-            params![drawer.drawer_id, memory_id, now],
-        )?;
-    }
-
-    tx.commit()?;
+                ..NewMemory::new(memory_id.clone(), content, &now)
+            })?;
+            ImportLedger::new(batch).record_mempalace(&drawer.drawer_id, &memory_id, &now)?;
+        }
+        Ok(())
+    })?;
     result.imported = to_import.len();
     Ok(result)
 }

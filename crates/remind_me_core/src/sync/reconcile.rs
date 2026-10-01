@@ -29,8 +29,10 @@
 //! eventually disagree about what drift means.
 
 use super::{configured_hub_url, configured_sync_secret, sync_enabled};
+use crate::db::sync_state::SyncState;
+use crate::db::Result;
+use crate::db::Store;
 use crate::models::{CategoryDrift, ReconcileReport, ReconcileVerdict, RemoteCounts};
-use rusqlite::{params, Connection, OptionalExtension, Result};
 
 /// How stale a successful pull may be before hub-ahead drift stops reading as
 /// ordinary lag. Generous relative to the sync interval, because a single
@@ -98,34 +100,16 @@ pub fn classify(
 }
 
 /// This node's counts, in the shape a remote's `/count` returns.
-fn local_counts(conn: &Connection) -> Result<(i64, i64, std::collections::BTreeMap<String, i64>)> {
-    let (total, tombstones): (i64, i64) = conn.query_row(
-        "SELECT COUNT(*),
-                COALESCE(SUM(CASE WHEN deleted_at IS NOT NULL THEN 1 ELSE 0 END), 0)
-           FROM memories",
-        [],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
-    let mut stmt = conn.prepare(
-        "SELECT COALESCE(NULLIF(category, ''), '(none)'), COUNT(*)
-           FROM memories GROUP BY 1",
-    )?;
-    let by_category = stmt
-        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
-        .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
-    Ok((total, tombstones, by_category))
+fn local_counts(store: &Store<'_>) -> Result<(i64, i64, std::collections::BTreeMap<String, i64>)> {
+    let stats = crate::db::stats::StoreStats::new(store);
+    let (total, tombstones) = stats.memory_totals()?;
+    Ok((total, tombstones, stats.all_by_category()?))
 }
 
 /// Seconds since the last successful pull from `remote_id`, or `None` when it
 /// has never been pulled from.
-fn last_pull_age(conn: &Connection, remote_id: &str) -> Result<Option<i64>> {
-    let at: Option<String> = conn
-        .query_row(
-            "SELECT last_pull_at FROM sync_log WHERE remote_id = ?",
-            params![remote_id],
-            |r| r.get(0),
-        )
-        .optional()?;
+fn last_pull_age(store: &Store<'_>, remote_id: &str) -> Result<Option<i64>> {
+    let at = SyncState::new(store).last_pull_at(remote_id)?;
 
     let Some(at) = at else { return Ok(None) };
     // The epoch default means "never", not "56 years stale".
@@ -144,7 +128,7 @@ fn last_pull_age(conn: &Connection, remote_id: &str) -> Result<Option<i64>> {
 /// every category read as "remote has 0", so `classify` reported every
 /// nonempty local category as drift and the verdict was `NodeAhead` on every
 /// call, whether or not sync was actually keeping up.
-fn fetch_counts(base_url: &str) -> Result<RemoteCounts, String> {
+fn fetch_counts(base_url: &str) -> std::result::Result<RemoteCounts, String> {
     let url = format!("{}/count?by=category", base_url.trim_end_matches('/'));
     let (status, body) = super::http::get(&url, &configured_sync_secret())
         .map_err(|e| format!("could not reach {}: {}", url, e))?;
@@ -159,7 +143,7 @@ fn fetch_counts(base_url: &str) -> Result<RemoteCounts, String> {
 ///
 /// `remote_id` names the `sync_log` row whose pull age is consulted, so the
 /// same function serves the hub and any peer.
-pub fn reconcile(conn: &Connection, base_url: &str, remote_id: &str) -> Result<ReconcileReport> {
+pub fn reconcile(store: &Store<'_>, base_url: &str, remote_id: &str) -> Result<ReconcileReport> {
     if !sync_enabled() {
         return Ok(ReconcileReport::Unavailable {
             reason: "sync is not configured on this node".to_string(),
@@ -173,7 +157,7 @@ pub fn reconcile(conn: &Connection, base_url: &str, remote_id: &str) -> Result<R
         Err(reason) => return Ok(ReconcileReport::Unavailable { reason }),
     };
 
-    let (local_total, local_tombstones, local_categories) = local_counts(conn)?;
+    let (local_total, local_tombstones, local_categories) = local_counts(store)?;
 
     // Only categories that actually disagree are listed; the rest are counted.
     // A hundred agreeing rows would bury the two that matter.
@@ -204,7 +188,7 @@ pub fn reconcile(conn: &Connection, base_url: &str, remote_id: &str) -> Result<R
     }
     drift.sort_by(|a, b| a.category.cmp(&b.category));
 
-    let age = last_pull_age(conn, remote_id)?;
+    let age = last_pull_age(store, remote_id)?;
     let (verdict, hints) = classify(&drift, age);
 
     Ok(ReconcileReport::Compared {
@@ -224,12 +208,12 @@ pub fn reconcile(conn: &Connection, base_url: &str, remote_id: &str) -> Result<R
 }
 
 /// Reconcile against the configured hub.
-pub fn reconcile_hub(conn: &Connection) -> Result<ReconcileReport> {
-    reconcile(conn, &configured_hub_url(), super::HUB_REMOTE_ID)
+pub fn reconcile_hub(store: &Store<'_>) -> Result<ReconcileReport> {
+    reconcile(store, &configured_hub_url(), super::HUB_REMOTE_ID)
 }
 
 /// Reconcile against one discovered peer, by node id.
-pub fn reconcile_peer(conn: &Connection, node_id: &str) -> Result<ReconcileReport> {
+pub fn reconcile_peer(store: &Store<'_>, node_id: &str) -> Result<ReconcileReport> {
     let peers = super::discover_peers();
     let Some(peer) = peers.into_iter().find(|p| p.node_id == node_id) else {
         return Ok(ReconcileReport::Unavailable {
@@ -240,5 +224,5 @@ pub fn reconcile_peer(conn: &Connection, node_id: &str) -> Result<ReconcileRepor
             ),
         });
     };
-    reconcile(conn, &peer.url, node_id)
+    reconcile(store, &peer.url, node_id)
 }

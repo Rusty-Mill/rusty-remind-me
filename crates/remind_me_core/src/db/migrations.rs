@@ -1,24 +1,19 @@
 //! Schema creation and reconciliation.
 //!
-//! # `remind_me`'s current schema is the starting point
+//! # The schema files are the schema
 //!
-//! The three `schema_*.sql` files beside this module are **generated verbatim**
-//! from a `remind_me` database — dumped straight out of its `sqlite_master`.
-//! They are not hand-written and should not be hand-edited; regenerate them
-//! with `scripts/regenerate_schema.py --reference <path-to-remind_me>`, which
-//! is the ADR-0007 method made repeatable.
-//!
-//! An earlier version of this module transcribed the reference's historical
-//! migrations by hand, reconstructing each step. Three of those steps were
-//! written from *this* crate's pre-existing tables rather than from the
-//! reference, and the divergence went unnoticed because the parity check only
-//! compared table names and `memories` columns — the verification was shaped
-//! like the mistake. Generating the schema removes the transcription step that
-//! produced that class of error.
+//! The `schema_*.sql` files beside this module were dumped verbatim from the
+//! Python `remind_me` at v29, when the two shared one database file
+//! (ADR-0007). That reference is retired (ADR-0023): the files are this
+//! crate's own now, edited by hand, and nothing outside this repository
+//! constrains them. The triggers file went at v31, when the repositories
+//! took over its work (`db::derived`). The node's storage is moving off
+//! SQLite altogether (ADR-0023), so the files are expected to shrink rather
+//! than grow.
 //!
 //! # Reconciliation, not a ladder
 //!
-//! This crate does not replay the reference's version history. It creates the
+//! This crate does not replay a version history. It creates the
 //! current schema and reconciles anything that differs, then stamps the version
 //! the schema actually corresponds to. Concretely, on open:
 //!
@@ -27,9 +22,9 @@
 //!    crate — are rebuilt, preserving their rows;
 //! 3. any column still missing from any table is added, diffed against a
 //!    pristine schema built in memory from the same SQL;
-//! 4. indexes are created and triggers reconciled, after the columns they
-//!    reference exist — a trigger whose stored body no longer matches the
-//!    generated one is dropped so the create pass can replace it;
+//! 4. indexes are created, after the columns they reference exist, and the
+//!    triggers of schema v30 and earlier are dropped (the repositories keep
+//!    derived data in step now);
 //! 5. derived data is backfilled, and entity ids written by earlier builds of
 //!    this crate are rewritten to the reference's derivation;
 //! 6. `PRAGMA user_version` is stamped.
@@ -37,20 +32,29 @@
 //! Every phase is idempotent, so reopening is a no-op and a partially-migrated
 //! database converges.
 
-use rusqlite::{Connection, Result};
+use super::Result;
+use crate::db::derived::{self, Origin};
+use crate::db::Store;
+use rusqlite::Connection;
 
-/// The version the generated schema corresponds to.
+/// The version the schema files correspond to, stamped into
+/// `PRAGMA user_version`.
 ///
-/// This must track whatever `remind_me` reports for the schema the
-/// `schema_*.sql` files were dumped from. It is not a number this crate is free
-/// to choose: `remind_me` reads it on open and skips migrating anything already
-/// at its own target, so claiming a version the schema does not match is what
-/// makes a database silently unreadable to it.
-pub const SCHEMA_VERSION: i32 = 29;
+/// It was the Python `remind_me`'s own number while the two shared a file,
+/// and Python read it on open. With Python retired (ADR-0023) it is this
+/// crate's to choose; bump it with any schema change that an older build of
+/// this crate must not open unawares.
+///
+/// - 29: the Python reference's last schema.
+/// - 30: vector chunks keyed by memory id, not `memories.rowid`
+///   (ADR-0023 §4; see [`rekey_vectors`]).
+/// - 31: no triggers; the repositories keep the full-text indexes, the tag
+///   index and the outbox in step (ADR-0023 phase 1, step 7; see
+///   [`drop_retired_triggers`]).
+pub const SCHEMA_VERSION: i32 = 31;
 
 const SCHEMA_TABLES: &str = include_str!("schema_tables.sql");
 const SCHEMA_INDEXES: &str = include_str!("schema_indexes.sql");
-const SCHEMA_TRIGGERS: &str = include_str!("schema_triggers.sql");
 
 /// Collapse a DDL string so two spellings of the same object compare equal.
 fn normalise_ddl(sql: &str) -> String {
@@ -77,16 +81,6 @@ fn table_ddl(conn: &Connection, table: &str) -> Result<Option<String>> {
     })
 }
 
-fn trigger_ddl(conn: &Connection, name: &str) -> Result<Option<String>> {
-    let mut stmt =
-        conn.prepare("SELECT sql FROM sqlite_master WHERE type='trigger' AND name = ?")?;
-    let mut rows = stmt.query([name])?;
-    Ok(match rows.next()? {
-        Some(row) => Some(normalise_ddl(&row.get::<_, String>(0)?)),
-        None => None,
-    })
-}
-
 fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
     let count: i64 = conn.query_row(
         "SELECT count(*) FROM sqlite_master WHERE type IN ('table','view') AND name = ?",
@@ -99,7 +93,8 @@ fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
 fn columns_of(conn: &Connection, table: &str) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table))?;
     let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
-    rows.collect()
+    rows.collect::<rusqlite::Result<_>>()
+        .map_err(crate::db::StoreError::from)
 }
 
 /// A pristine database holding exactly the generated schema, used to diff
@@ -107,18 +102,6 @@ fn columns_of(conn: &Connection, table: &str) -> Result<Vec<String>> {
 fn pristine() -> Result<Connection> {
     let conn = Connection::open_in_memory()?;
     conn.execute_batch(SCHEMA_TABLES)?;
-    Ok(conn)
-}
-
-/// [`pristine`] plus the generated triggers, for diffing trigger DDL.
-///
-/// Separate from [`pristine`] because the trigger bodies reference columns that
-/// only exist once [`reconcile_columns`] has run against a live database —
-/// building them unconditionally into every `pristine()` call would make the
-/// column diff depend on the triggers it is a prerequisite for.
-fn pristine_with_triggers() -> Result<Connection> {
-    let conn = pristine()?;
-    conn.execute_batch(SCHEMA_TRIGGERS)?;
     Ok(conn)
 }
 
@@ -177,11 +160,11 @@ fn rebuild_table(conn: &Connection, table: &str) -> Result<()> {
             carry = carry,
             table = table
         ))?;
-        conn.execute_batch(&format!(
+        Ok(conn.execute_batch(&format!(
             "DROP TABLE {table}; ALTER TABLE {scratch} RENAME TO {table};",
             table = table,
             scratch = scratch
-        ))
+        ))?)
     })();
     conn.execute_batch("PRAGMA foreign_keys=ON;")?;
     result
@@ -209,37 +192,34 @@ fn differs_from_schema(conn: &Connection, table: &str) -> Result<bool> {
     }
 }
 
-/// Drop any trigger whose stored definition differs from the generated schema,
-/// so the `CREATE TRIGGER` pass that follows can put the current one in place.
-///
-/// Without this, a changed trigger body never reaches an existing database.
-/// Every statement in `schema_triggers.sql` is `CREATE TRIGGER IF NOT EXISTS`,
-/// and the reconciliation loop in [`apply`] compares `type='table'` rows only —
-/// so a database that already carries the old trigger keeps it forever, and the
-/// fix only ever appears on databases created after it. That is how the
-/// `memories_outbox_au` read-amplification bug (issue #100) could have been
-/// "fixed" while every existing vault went on flooding its own outbox.
-///
-/// Dropping rather than `CREATE OR REPLACE` because SQLite has no such form for
-/// triggers. Dropping is safe here in a way it would not be for a table: a
-/// trigger holds no rows, so the drop-and-recreate loses nothing, and it is
-/// immediately recreated in the same [`apply`] call.
-fn reconcile_triggers(conn: &Connection) -> Result<()> {
-    let reference = pristine_with_triggers()?;
-    let mut stmt = reference.prepare("SELECT name FROM sqlite_master WHERE type='trigger'")?;
-    let names: Vec<String> = stmt.query_map([], |r| r.get(0))?.collect::<Result<_>>()?;
-    drop(stmt);
+/// The triggers schema v30 and earlier carried. The repositories do their
+/// work now (`db::derived`), so a trigger left in place would do it twice:
+/// index a memory twice, or queue every edit twice.
+const RETIRED_TRIGGERS: [&str; 15] = [
+    "entities_outbox_ai",
+    "entities_outbox_au",
+    "entity_relations_outbox_ai",
+    "memories_ad",
+    "memories_ai",
+    "memories_au",
+    "memories_outbox_ai",
+    "memories_outbox_au",
+    "memories_tags_ad",
+    "memories_tags_ai",
+    "memories_tags_au",
+    "memory_entities_outbox_ai",
+    "wiki_pages_ad",
+    "wiki_pages_ai",
+    "wiki_pages_au",
+];
 
-    for name in &names {
-        // A trigger absent on either side is not a difference to act on: absent
-        // live means the create pass below adds it, and absent in the reference
-        // cannot happen since `names` came from there.
-        if let (Some(live), Some(want)) = (trigger_ddl(conn, name)?, trigger_ddl(&reference, name)?)
-        {
-            if live != want {
-                conn.execute_batch(&format!("DROP TRIGGER IF EXISTS {};", name))?;
-            }
-        }
+/// Drop the triggers of schema v30 and earlier, if present.
+///
+/// Dropping is safe here in a way it would not be for a table: a trigger
+/// holds no rows.
+fn drop_retired_triggers(conn: &Connection) -> Result<()> {
+    for name in RETIRED_TRIGGERS {
+        conn.execute_batch(&format!("DROP TRIGGER IF EXISTS {name};"))?;
     }
     Ok(())
 }
@@ -253,7 +233,9 @@ fn reconcile_columns(conn: &Connection) -> Result<()> {
     let reference = pristine()?;
     let mut stmt = reference
         .prepare("SELECT name FROM sqlite_master WHERE type='table' AND sql IS NOT NULL")?;
-    let tables: Vec<String> = stmt.query_map([], |r| r.get(0))?.collect::<Result<_>>()?;
+    let tables: Vec<String> = stmt
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
 
     for table in tables {
         if !table_exists(conn, &table)? {
@@ -336,7 +318,9 @@ fn migration_pending(conn: &Connection) -> Result<bool> {
 
     let reference = pristine()?;
     let mut names = reference.prepare("SELECT name FROM sqlite_master WHERE type='table'")?;
-    let tables: Vec<String> = names.query_map([], |r| r.get(0))?.collect::<Result<_>>()?;
+    let tables: Vec<String> = names
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
     for table in &tables {
         if differs_from_schema(conn, table)? {
             return Ok(true);
@@ -354,9 +338,11 @@ fn has_existing_data(conn: &Connection) -> Result<bool> {
     if !table_exists(conn, "memories")? {
         return Ok(false);
     }
-    conn.query_row("SELECT EXISTS(SELECT 1 FROM memories LIMIT 1)", [], |r| {
-        r.get(0)
-    })
+    Ok(
+        conn.query_row("SELECT EXISTS(SELECT 1 FROM memories LIMIT 1)", [], |r| {
+            r.get(0)
+        })?,
+    )
 }
 
 /// Snapshot the database before a pending migration runs (issue #95, matching
@@ -373,23 +359,25 @@ fn snapshot_before_migration(conn: &Connection) -> Result<()> {
     }
 
     let current_version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    let _ = crate::backup::create_backup(conn, &format!("pre-migration-v{}", current_version));
+    let _ = crate::backup::create_backup(
+        &Store::over_sqlite(conn),
+        &format!("pre-migration-v{}", current_version),
+    );
     Ok(())
 }
 
-/// Populate derived tables for rows that predate the triggers maintaining them.
+/// Populate derived tables for rows written before anything maintained them.
 ///
-/// Triggers only fire on writes that happen *after* they exist. A database
-/// carrying rows from before — one written by an earlier version of this crate,
-/// or by a `remind_me` at a lower schema version — would otherwise have an empty
-/// `memory_tags` and empty FTS indexes, which silently returns no results rather
-/// than failing.
+/// A database carrying rows from before the tag and full-text indexes were
+/// kept in step (by triggers up to schema v30, by the repositories since)
+/// would otherwise have an empty `memory_tags` and empty FTS indexes, which
+/// silently returns no results rather than failing.
 ///
 /// Each backfill is guarded on the derived table being empty while its source is
 /// not, so this is a no-op on every subsequent open.
 fn backfill_derived(conn: &Connection, force_fts_rebuild: bool) -> Result<()> {
     let count = |table: &str| -> Result<i64> {
-        conn.query_row(&format!("SELECT count(*) FROM {}", table), [], |r| r.get(0))
+        Ok(conn.query_row(&format!("SELECT count(*) FROM {}", table), [], |r| r.get(0))?)
     };
 
     // Tag index. `INSERT OR IGNORE` rather than an emptiness guard, because a
@@ -445,30 +433,107 @@ fn backfill_derived(conn: &Connection, force_fts_rebuild: bool) -> Result<()> {
 /// the new type would be cosmetic. `updated_at` moves too, so the change
 /// reaches other nodes: `memory_type` is a synced column, and a node upgrading
 /// later would otherwise push its stale `fact` back over an upgraded node's
-/// `reference` under last-write-wins. Writing `updated_at` is also exactly
-/// what fires `memories_outbox_au`, so propagation needs nothing else.
+/// `reference` under last-write-wins. Moving `updated_at` is also what
+/// queues the change in the outbox, so propagation needs nothing else.
 ///
 /// The timestamp is SQLite's own `strftime`, the same expression the outbox
-/// triggers use, rather than a Rust-formatted `Utc::now()`. The two agree
-/// today; using the one the schema already commits to means they cannot
-/// disagree tomorrow.
+/// stamps use, rather than a Rust-formatted `Utc::now()`.
 const REFERENCE_REFILE_VERSION: i32 = 29;
 
 fn refile_reference_imports(conn: &Connection, version_on_open: i32) -> Result<()> {
     if version_on_open >= REFERENCE_REFILE_VERSION {
         return Ok(());
     }
-    conn.execute(
-        "UPDATE memories
-            SET memory_type = 'reference',
-                decay_rate  = ?1,
-                updated_at  = strftime('%Y-%m-%dT%H:%M:%f000', 'now') || '+00:00'
+    let ids = derived::memory_ids(
+        conn,
+        "SELECT id FROM memories
           WHERE memory_type = 'fact'
             AND deleted_at IS NULL
             AND (source = 'mempalace_import' OR source LIKE 'mempalace:%')",
-        rusqlite::params![crate::vitality::REFERENCE_DECAY_RATE],
+        [],
     )?;
+    for id in &ids {
+        derived::write_memory(conn, id, Origin::Local, || {
+            Ok(conn.execute(
+                "UPDATE memories
+                    SET memory_type = 'reference',
+                        decay_rate  = ?1,
+                        updated_at  = strftime('%Y-%m-%dT%H:%M:%f000', 'now') || '+00:00'
+                  WHERE id = ?2",
+                rusqlite::params![crate::vitality::REFERENCE_DECAY_RATE, id],
+            )?)
+        })?;
+    }
     Ok(())
+}
+
+/// Move vector chunks off `memories.rowid` onto memory ids (ADR-0023 §4).
+///
+/// Up to v29 a chunk lived in two tables: `vec_chunks` mapped a
+/// `vec_rowid` to a `memory_rowid` and chunk index, and `vec_embeddings`
+/// held the bytes under the same `vec_rowid`. v30 has one table keyed
+/// `(memory_id, chunk_ix)` holding the bytes, so nothing depends on a row
+/// number another store would not have.
+///
+/// Detected by shape rather than by version, because the generic rebuild in
+/// [`apply`] would otherwise try to carry the old table into the new shape
+/// and fail on the new `NOT NULL` columns. It runs before that rebuild, in a
+/// savepoint, so a failure leaves the v29 tables exactly as they were.
+///
+/// A chunk whose memory no longer exists is dropped: it could only ever
+/// have been inherited by whichever memory next reused its rowid.
+fn rekey_vectors(conn: &Connection) -> Result<()> {
+    if !table_exists(conn, "vec_chunks")?
+        || !columns_of(conn, "vec_chunks")?
+            .iter()
+            .any(|c| c == "memory_rowid")
+    {
+        return Ok(());
+    }
+
+    conn.execute_batch("SAVEPOINT rekey_vectors;")?;
+    let result = (|| -> Result<()> {
+        conn.execute_batch("ALTER TABLE vec_chunks RENAME TO vec_chunks_v29;")?;
+        // Only the new vec_chunks is missing, so this creates just that.
+        conn.execute_batch(SCHEMA_TABLES)?;
+        if table_exists(conn, "vec_embeddings")? {
+            conn.execute_batch(
+                "INSERT OR IGNORE INTO vec_chunks (memory_id, chunk_ix, embedding)
+                 SELECT m.id, old.chunk_ix, ve.embedding
+                   FROM vec_chunks_v29 old
+                   JOIN vec_embeddings ve ON ve.vec_rowid = old.vec_rowid
+                   JOIN memories m ON m.rowid = old.memory_rowid;
+                 DROP TABLE vec_embeddings;",
+            )?;
+        }
+        Ok(conn.execute_batch("DROP TABLE vec_chunks_v29;")?)
+    })();
+    match result {
+        Ok(()) => Ok(conn.execute_batch("RELEASE rekey_vectors;")?),
+        Err(e) => {
+            conn.execute_batch("ROLLBACK TO rekey_vectors; RELEASE rekey_vectors;")?;
+            Err(e)
+        }
+    }
+}
+
+/// Refuse a database stamped by a newer build of this crate.
+///
+/// Reconciliation rebuilds any table whose shape differs from this build's
+/// schema, so letting an older build open a newer database would reshape it
+/// backwards, losing whatever the newer shape holds.
+fn refuse_newer(version_on_open: i32) -> Result<()> {
+    if version_on_open <= SCHEMA_VERSION {
+        return Ok(());
+    }
+    Err(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+        Some(format!(
+            "this database is at schema version {version_on_open}, newer than this \
+             build's {SCHEMA_VERSION}: upgrade rusty-remind-me to open it"
+        )),
+    )
+    .into())
 }
 
 /// Create and reconcile the schema, then stamp the version.
@@ -476,13 +541,18 @@ fn refile_reference_imports(conn: &Connection, version_on_open: i32) -> Result<(
 /// The version is written last, so a database only ever claims
 /// [`SCHEMA_VERSION`] once it actually has that schema.
 pub fn apply(conn: &Connection) -> Result<()> {
+    // Read before any write, because the refiling step below is gated on it
+    // and the last statement of this function overwrites it.
+    let version_on_open: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    refuse_newer(version_on_open)?;
+
     // Before anything below mutates the database: a snapshot only reflects
     // the pre-migration state if it is taken before the first write.
     snapshot_before_migration(conn)?;
 
-    // Read before any write, because the refiling step below is gated on it
-    // and the last statement of this function overwrites it.
-    let version_on_open: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    // Before the create pass and the generic rebuild, both of which would
+    // otherwise meet the v29 vector tables first.
+    rekey_vectors(conn)?;
 
     conn.execute_batch(SCHEMA_TABLES)?;
 
@@ -490,7 +560,9 @@ pub fn apply(conn: &Connection) -> Result<()> {
 
     let reference = pristine()?;
     let mut names = reference.prepare("SELECT name FROM sqlite_master WHERE type='table'")?;
-    let tables: Vec<String> = names.query_map([], |r| r.get(0))?.collect::<Result<_>>()?;
+    let tables: Vec<String> = names
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
     drop(names);
 
     let mut rebuilt_any = false;
@@ -503,25 +575,20 @@ pub fn apply(conn: &Connection) -> Result<()> {
 
     reconcile_columns(conn)?;
 
-    // After columns: the outbox triggers name 23 columns of `memories`, and
-    // several indexes cover columns added above.
+    // After columns: several indexes cover columns added above.
     conn.execute_batch(SCHEMA_INDEXES)?;
-    // Before the create pass, not after — every statement in SCHEMA_TRIGGERS is
-    // `IF NOT EXISTS`, so a stale trigger has to be dropped first or the create
-    // silently does nothing.
-    reconcile_triggers(conn)?;
-    conn.execute_batch(SCHEMA_TRIGGERS)?;
+    drop_retired_triggers(conn)?;
 
     backfill_derived(conn, rebuilt_any)?;
 
-    // After the triggers exist, so the refiling reaches the outbox.
+    // After the tables and columns exist; it queues its own outbox rows.
     refile_reference_imports(conn, version_on_open)?;
 
     // After the tables exist and before the version is stamped: entity ids are
     // content-derived, and this crate used to derive them differently from the
     // reference, so a database written by an earlier build needs rewriting to
     // be readable by `remind_me` at all.
-    crate::entity::renormalize_entity_ids(conn)?;
+    crate::entity::renormalize_entity_ids(&Store::over_sqlite(conn))?;
 
-    conn.execute_batch(&format!("PRAGMA user_version = {};", SCHEMA_VERSION))
+    Ok(conn.execute_batch(&format!("PRAGMA user_version = {};", SCHEMA_VERSION))?)
 }

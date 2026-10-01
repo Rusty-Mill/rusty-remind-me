@@ -9,8 +9,10 @@
 //! costs nothing but a wasted round-trip.
 
 use super::{http, record_push};
+use crate::db::outbox::Outbox;
+use crate::db::sync_state::SyncState;
+use crate::db::Store;
 use chrono::Utc;
-use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 
 /// Outbox rows sent per `POST /sync/push`, bounding request size the same
@@ -26,8 +28,8 @@ impl std::fmt::Display for PushError {
     }
 }
 impl std::error::Error for PushError {}
-impl From<rusqlite::Error> for PushError {
-    fn from(e: rusqlite::Error) -> Self {
+impl From<crate::db::StoreError> for PushError {
+    fn from(e: crate::db::StoreError) -> Self {
         Self(e.to_string())
     }
 }
@@ -77,52 +79,41 @@ fn decode_payload(mut payload: Value) -> Value {
 }
 
 fn fetch_batch(
-    conn: &Connection,
+    store: &Store<'_>,
     remote_id: &str,
     after_id: i64,
-) -> rusqlite::Result<Vec<OutboxRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, memory_id, payload FROM sync_outbox
-          WHERE id > ?1 AND sent_at = ''
-            AND id NOT IN (SELECT outbox_id FROM sync_sends WHERE remote_id = ?2)
-          ORDER BY id ASC LIMIT ?3",
-    )?;
-    let rows = stmt.query_map(params![after_id, remote_id, BATCH_SIZE as i64], |row| {
-        let memory_id_column: String = row.get(1)?;
-        let payload_json: String = row.get(2)?;
-        let payload: Value = serde_json::from_str(&payload_json).unwrap_or_else(|_| json!({}));
-        // `payload["id"]` is the record's real wire id for every type; the
-        // `memory_id` column fallback only matters if a malformed payload
-        // somehow lacks its own "id" key.
-        let wire_id = payload
-            .get("id")
-            .and_then(Value::as_str)
-            .map(String::from)
-            .unwrap_or(memory_id_column);
-        Ok(OutboxRow {
-            id: row.get(0)?,
-            wire_id,
-            payload,
+) -> crate::db::Result<Vec<OutboxRow>> {
+    let entries = Outbox::new(store).unsent_to(remote_id, after_id, BATCH_SIZE)?;
+    Ok(entries
+        .into_iter()
+        .map(|entry| {
+            let payload: Value =
+                serde_json::from_str(&entry.payload_json).unwrap_or_else(|_| json!({}));
+            // `payload["id"]` is the record's real wire id for every type; the
+            // `memory_id` column fallback only matters if a malformed payload
+            // somehow lacks its own "id" key.
+            let wire_id = payload
+                .get("id")
+                .and_then(Value::as_str)
+                .map(String::from)
+                .unwrap_or(entry.key);
+            OutboxRow {
+                id: entry.id,
+                wire_id,
+                payload,
+            }
         })
-    })?;
-    rows.collect()
+        .collect())
 }
 
-fn mark_sent(conn: &Connection, remote_id: &str, outbox_ids: &[i64]) -> rusqlite::Result<()> {
-    let now = Utc::now().to_rfc3339();
-    for id in outbox_ids {
-        conn.execute(
-            "INSERT OR REPLACE INTO sync_sends (remote_id, outbox_id, sent_at) VALUES (?, ?, ?)",
-            params![remote_id, id, now],
-        )?;
-    }
-    Ok(())
+fn mark_sent(store: &Store<'_>, remote_id: &str, outbox_ids: &[i64]) -> crate::db::Result<()> {
+    SyncState::new(store).record_sends(remote_id, outbox_ids, &Utc::now().to_rfc3339())
 }
 
 /// Push every not-yet-sent-to-`remote_id` outbox row to `{hub_url}/sync/push`,
 /// paging until a short page confirms the outbox is drained for this remote.
 pub fn push_outbox(
-    conn: &Connection,
+    store: &Store<'_>,
     hub_url: &str,
     secret: &str,
     node_id: &str,
@@ -133,7 +124,7 @@ pub fn push_outbox(
     let mut after_id = 0i64;
 
     loop {
-        let batch = fetch_batch(conn, remote_id, after_id)?;
+        let batch = fetch_batch(store, remote_id, after_id)?;
         if batch.is_empty() {
             break;
         }
@@ -155,7 +146,7 @@ pub fn push_outbox(
                 response_body.trim()
             )));
         }
-        record_push(conn, remote_id);
+        record_push(store, remote_id);
         let response: Value = serde_json::from_str(&response_body)
             .map_err(|e| PushError(format!("push response from {} was not JSON: {}", url, e)))?;
 
@@ -174,7 +165,7 @@ pub fn push_outbox(
             // re-sending it next cycle costs nothing but a wasted round-trip.
             None => batch.iter().map(|r| r.id).collect(),
         };
-        mark_sent(conn, remote_id, &sent_ids)?;
+        mark_sent(store, remote_id, &sent_ids)?;
 
         report.pushed += sent_ids.len();
         report.batches += 1;

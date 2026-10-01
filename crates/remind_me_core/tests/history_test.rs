@@ -8,16 +8,17 @@
 //! are indistinguishable from the outside.
 
 use remind_me_core::db::queries;
+use remind_me_core::db::Store;
 use remind_me_core::history::{history, revert};
+use remind_me_core::testing;
 use remind_me_core::{
     Database, MemoryAddInput, MemoryClassification, MemorySearchInput, MemoryUpdateInput,
     ReclassifyInput, RevertOutcome,
 };
-use rusqlite::Connection;
 
-fn add(conn: &Connection, content: &str) -> String {
+fn add(store: &Store<'_>, content: &str) -> String {
     queries::add_memory(
-        conn,
+        store,
         MemoryAddInput {
             content: content.to_string(),
             category: "general".into(),
@@ -35,9 +36,9 @@ fn add(conn: &Connection, content: &str) -> String {
     .id
 }
 
-fn update(conn: &Connection, id: &str, content: Option<&str>, category: Option<&str>) {
+fn update(store: &Store<'_>, id: &str, content: Option<&str>, category: Option<&str>) {
     queries::update_memory(
-        conn,
+        store,
         &MemoryUpdateInput {
             memory_id: id.to_string(),
             clear_superseded: false,
@@ -51,8 +52,8 @@ fn update(conn: &Connection, id: &str, content: Option<&str>, category: Option<&
     .unwrap();
 }
 
-fn revisions(conn: &Connection, id: &str) -> Vec<remind_me_core::MemoryRevision> {
-    history(conn, id, 100).unwrap()
+fn revisions(store: &Store<'_>, id: &str) -> Vec<remind_me_core::MemoryRevision> {
+    history(store, id, 100).unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -62,12 +63,12 @@ fn revisions(conn: &Connection, id: &str) -> Vec<remind_me_core::MemoryRevision>
 #[test]
 fn an_update_records_the_value_it_replaced() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "first version");
+    let store = db.store();
+    let id = add(&store, "first version");
 
-    update(&conn, &id, Some("second version"), None);
+    update(&store, &id, Some("second version"), None);
 
-    let revs = revisions(&conn, &id);
+    let revs = revisions(&store, &id);
     assert_eq!(revs.len(), 1);
     // The snapshot holds the OLD value — a revision that stored the new one
     // would be useless for recovering anything.
@@ -79,12 +80,12 @@ fn an_update_records_the_value_it_replaced() {
 #[test]
 fn each_edit_adds_a_revision_newest_first() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "v1");
-    update(&conn, &id, Some("v2"), None);
-    update(&conn, &id, Some("v3"), None);
+    let store = db.store();
+    let id = add(&store, "v1");
+    update(&store, &id, Some("v2"), None);
+    update(&store, &id, Some("v3"), None);
 
-    let revs = revisions(&conn, &id);
+    let revs = revisions(&store, &id);
 
     assert_eq!(revs.len(), 2);
     // Ordered by edited_at then id, so a burst of edits within one clock tick
@@ -96,24 +97,24 @@ fn each_edit_adds_a_revision_newest_first() {
 #[test]
 fn a_same_value_update_records_nothing() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "unchanged");
+    let store = db.store();
+    let id = add(&store, "unchanged");
 
-    update(&conn, &id, Some("unchanged"), None);
+    update(&store, &id, Some("unchanged"), None);
 
     // Mirrors the outbox trigger's "only on genuine change" discipline. A
     // revision per no-op write would bury the real edits.
-    assert!(revisions(&conn, &id).is_empty());
+    assert!(revisions(&store, &id).is_empty());
 }
 
 #[test]
 fn reading_a_memory_records_nothing() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "quokka sighting");
+    let store = db.store();
+    let id = add(&store, "quokka sighting");
 
     queries::search_memories(
-        &conn,
+        &store,
         &MemorySearchInput {
             query: "quokka".into(),
             ..Default::default()
@@ -124,17 +125,17 @@ fn reading_a_memory_records_nothing() {
     // Access tracking is an UPDATE against `memories`. If revisions keyed off
     // "any write" rather than the tracked columns, every read would leave one
     // — the same shape of bug issue #100 fixed in the sync outbox.
-    assert!(revisions(&conn, &id).is_empty());
+    assert!(revisions(&store, &id).is_empty());
 }
 
 #[test]
 fn reclassifying_records_nothing() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "a decision was made");
+    let store = db.store();
+    let id = add(&store, "a decision was made");
 
     queries::reclassify_memories(
-        &conn,
+        &store,
         &ReclassifyInput {
             classifications: vec![MemoryClassification {
                 memory_id: id.clone(),
@@ -149,7 +150,7 @@ fn reclassifying_records_nothing() {
     // recomputable metadata, and recording it would bury the human edits worth
     // reverting under machine-generated noise.
     assert!(
-        revisions(&conn, &id).is_empty(),
+        revisions(&store, &id).is_empty(),
         "the reference does not record reclassification; see history.rs's module docs"
     );
 }
@@ -161,11 +162,11 @@ fn reclassifying_records_nothing() {
 #[test]
 fn reverting_restores_every_tracked_field_together() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "original text");
+    let store = db.store();
+    let id = add(&store, "original text");
 
     queries::update_memory(
-        &conn,
+        &store,
         &MemoryUpdateInput {
             memory_id: id.clone(),
             clear_superseded: false,
@@ -178,11 +179,11 @@ fn reverting_restores_every_tracked_field_together() {
     )
     .unwrap();
 
-    let revision_id = revisions(&conn, &id)[0].id;
-    let outcome = revert(&conn, &id, revision_id, None).unwrap();
+    let revision_id = revisions(&store, &id)[0].id;
+    let outcome = revert(&store, &id, revision_id, None).unwrap();
 
     assert_eq!(outcome, RevertOutcome::Reverted { revision_id });
-    let memory = queries::get_memory_by_id(&conn, &id).unwrap().unwrap();
+    let memory = queries::get_memory_by_id(&store, &id).unwrap().unwrap();
     // All five together — a revert that restored content but left the category
     // and tags from the edit would leave the memory in a state that never
     // existed.
@@ -190,10 +191,8 @@ fn reverting_restores_every_tracked_field_together() {
     assert_eq!(memory.category, "general");
     assert_eq!(memory.tags, vec!["original".to_string()]);
     assert_eq!(memory.metadata, serde_json::json!({"seed": true}));
-    let sensitive: i64 = conn
-        .query_row("SELECT sensitive FROM memories WHERE id = ?", [&id], |r| {
-            r.get(0)
-        })
+    let sensitive = testing::memory_i64(&store, &id, "sensitive")
+        .unwrap()
         .unwrap();
     assert_eq!(sensitive, 0);
 }
@@ -201,14 +200,14 @@ fn reverting_restores_every_tracked_field_together() {
 #[test]
 fn a_revert_is_itself_revertable() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "v1");
-    update(&conn, &id, Some("v2"), None);
+    let store = db.store();
+    let id = add(&store, "v1");
+    update(&store, &id, Some("v2"), None);
 
-    let first_revision = revisions(&conn, &id)[0].id;
-    revert(&conn, &id, first_revision, None).unwrap();
+    let first_revision = revisions(&store, &id)[0].id;
+    revert(&store, &id, first_revision, None).unwrap();
     assert_eq!(
-        queries::get_memory_by_id(&conn, &id)
+        queries::get_memory_by_id(&store, &id)
             .unwrap()
             .unwrap()
             .content,
@@ -217,12 +216,12 @@ fn a_revert_is_itself_revertable() {
 
     // The revert recorded the state just before it ran, so undoing it gets v2
     // back. Without that, a mistaken revert would be unrecoverable.
-    let revert_revision = revisions(&conn, &id)[0].id;
+    let revert_revision = revisions(&store, &id)[0].id;
     assert_ne!(revert_revision, first_revision);
-    revert(&conn, &id, revert_revision, None).unwrap();
+    revert(&store, &id, revert_revision, None).unwrap();
 
     assert_eq!(
-        queries::get_memory_by_id(&conn, &id)
+        queries::get_memory_by_id(&store, &id)
             .unwrap()
             .unwrap()
             .content,
@@ -233,14 +232,14 @@ fn a_revert_is_itself_revertable() {
 #[test]
 fn a_revert_records_why() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "v1");
-    update(&conn, &id, Some("v2"), None);
-    let revision_id = revisions(&conn, &id)[0].id;
+    let store = db.store();
+    let id = add(&store, "v1");
+    update(&store, &id, Some("v2"), None);
+    let revision_id = revisions(&store, &id)[0].id;
 
-    revert(&conn, &id, revision_id, None).unwrap();
+    revert(&store, &id, revision_id, None).unwrap();
 
-    let reason = revisions(&conn, &id)[0].revision_reason.clone().unwrap();
+    let reason = revisions(&store, &id)[0].revision_reason.clone().unwrap();
     assert!(
         reason.contains(&revision_id.to_string()),
         "the default reason should name what was reverted to, got {:?}",
@@ -251,15 +250,15 @@ fn a_revert_records_why() {
 #[test]
 fn an_explicit_reason_is_kept() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "v1");
-    update(&conn, &id, Some("v2"), None);
-    let revision_id = revisions(&conn, &id)[0].id;
+    let store = db.store();
+    let id = add(&store, "v1");
+    update(&store, &id, Some("v2"), None);
+    let revision_id = revisions(&store, &id)[0].id;
 
-    revert(&conn, &id, revision_id, Some("bad edit from the importer")).unwrap();
+    revert(&store, &id, revision_id, Some("bad edit from the importer")).unwrap();
 
     assert_eq!(
-        revisions(&conn, &id)[0].revision_reason.as_deref(),
+        revisions(&store, &id)[0].revision_reason.as_deref(),
         Some("bad edit from the importer")
     );
 }
@@ -267,38 +266,38 @@ fn an_explicit_reason_is_kept() {
 #[test]
 fn reverting_to_the_current_state_changes_nothing() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "v1");
-    update(&conn, &id, Some("v2"), None);
-    let revision_id = revisions(&conn, &id)[0].id;
-    revert(&conn, &id, revision_id, None).unwrap();
-    let before = revisions(&conn, &id).len();
+    let store = db.store();
+    let id = add(&store, "v1");
+    update(&store, &id, Some("v2"), None);
+    let revision_id = revisions(&store, &id)[0].id;
+    revert(&store, &id, revision_id, None).unwrap();
+    let before = revisions(&store, &id).len();
 
-    let outcome = revert(&conn, &id, revision_id, None).unwrap();
+    let outcome = revert(&store, &id, revision_id, None).unwrap();
 
     // Reporting it beats writing a no-op revision and an outbox row that says
     // nothing changed.
     assert_eq!(outcome, RevertOutcome::NoChange);
-    assert_eq!(revisions(&conn, &id).len(), before);
+    assert_eq!(revisions(&store, &id).len(), before);
 }
 
 #[test]
 fn the_two_not_found_cases_are_distinguished() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "v1");
-    update(&conn, &id, Some("v2"), None);
-    let revision_id = revisions(&conn, &id)[0].id;
+    let store = db.store();
+    let id = add(&store, "v1");
+    update(&store, &id, Some("v2"), None);
+    let revision_id = revisions(&store, &id)[0].id;
 
     // They need different fixes — a wrong memory id versus a wrong revision id
     // — so collapsing them into one message would send a caller looking in the
     // wrong place.
     assert_eq!(
-        revert(&conn, "mem_nonexistent", revision_id, None).unwrap(),
+        revert(&store, "mem_nonexistent", revision_id, None).unwrap(),
         RevertOutcome::MemoryNotFound
     );
     assert_eq!(
-        revert(&conn, &id, 999_999, None).unwrap(),
+        revert(&store, &id, 999_999, None).unwrap(),
         RevertOutcome::RevisionNotFound
     );
 }
@@ -306,18 +305,18 @@ fn the_two_not_found_cases_are_distinguished() {
 #[test]
 fn a_revision_belonging_to_another_memory_is_refused() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let mine = add(&conn, "mine v1");
-    let theirs = add(&conn, "theirs v1");
-    update(&conn, &theirs, Some("theirs v2"), None);
-    let their_revision = revisions(&conn, &theirs)[0].id;
+    let store = db.store();
+    let mine = add(&store, "mine v1");
+    let theirs = add(&store, "theirs v1");
+    update(&store, &theirs, Some("theirs v2"), None);
+    let their_revision = revisions(&store, &theirs)[0].id;
 
-    let outcome = revert(&conn, &mine, their_revision, None).unwrap();
+    let outcome = revert(&store, &mine, their_revision, None).unwrap();
 
     // Otherwise one memory's content could be silently pasted over another's.
     assert_eq!(outcome, RevertOutcome::RevisionNotFound);
     assert_eq!(
-        queries::get_memory_by_id(&conn, &mine)
+        queries::get_memory_by_id(&store, &mine)
             .unwrap()
             .unwrap()
             .content,
@@ -328,25 +327,25 @@ fn a_revision_belonging_to_another_memory_is_refused() {
 #[test]
 fn history_is_scoped_to_one_memory() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let a = add(&conn, "a v1");
-    let b = add(&conn, "b v1");
-    update(&conn, &a, Some("a v2"), None);
-    update(&conn, &b, Some("b v2"), None);
+    let store = db.store();
+    let a = add(&store, "a v1");
+    let b = add(&store, "b v1");
+    update(&store, &a, Some("a v2"), None);
+    update(&store, &b, Some("b v2"), None);
 
-    assert_eq!(revisions(&conn, &a).len(), 1);
-    assert_eq!(revisions(&conn, &a)[0].content, "a v1");
+    assert_eq!(revisions(&store, &a).len(), 1);
+    assert_eq!(revisions(&store, &a)[0].content, "a v1");
 }
 
 #[test]
 fn history_respects_its_limit() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "v0");
+    let store = db.store();
+    let id = add(&store, "v0");
     for i in 1..=5 {
-        update(&conn, &id, Some(&format!("v{}", i)), None);
+        update(&store, &id, Some(&format!("v{}", i)), None);
     }
 
-    assert_eq!(history(&conn, &id, 2).unwrap().len(), 2);
-    assert_eq!(history(&conn, &id, 100).unwrap().len(), 5);
+    assert_eq!(history(&store, &id, 2).unwrap().len(), 2);
+    assert_eq!(history(&store, &id, 100).unwrap().len(), 5);
 }

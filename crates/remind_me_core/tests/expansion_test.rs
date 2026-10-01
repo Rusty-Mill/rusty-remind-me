@@ -1,16 +1,18 @@
 //! Coverage for the three search expansions and the co-retrieval write path.
 
+use remind_me_core::db::memories::{Memories, NewMemory};
 use remind_me_core::db::queries;
+use remind_me_core::db::Store;
 use remind_me_core::expansion::{
     record_co_retrieval, RelatedMemory, CO_RETRIEVAL_MAX_WEIGHT, CO_RETRIEVAL_PAIR_CAP,
     EXPANSION_CAP, SNIPPET_CHARS,
 };
+use remind_me_core::testing::{self, Table};
 use remind_me_core::{Database, EntityInput, MemoryAddInput, MemorySearchInput};
-use rusqlite::Connection;
 
-fn add(conn: &Connection, content: &str, entities: &[&str]) -> String {
+fn add(store: &Store<'_>, content: &str, entities: &[&str]) -> String {
     queries::add_memory(
-        conn,
+        store,
         MemoryAddInput {
             sensitive: false,
             content: content.to_string(),
@@ -36,19 +38,21 @@ fn add(conn: &Connection, content: &str, entities: &[&str]) -> String {
 }
 
 /// A memory carrying document position, the way an importer will write one.
-fn chunk(conn: &Connection, id: &str, content: &str, doc: &str, index: i64) {
-    conn.execute(
-        "INSERT INTO memories (id, content, category, tags, source, metadata,
-                               created_at, updated_at, doc_id, chunk_index)
-         VALUES (?, ?, 'general', '[]', 'document_import', '{}',
-                 '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', ?, ?)",
-        rusqlite::params![id, content, doc, index],
-    )
-    .unwrap();
+fn chunk(store: &Store<'_>, id: &str, content: &str, doc: &str, index: i64) {
+    // Written through the repository, which indexes it: searchable, and
+    // deletable without the full-text index losing track of it.
+    Memories::new(store)
+        .insert(&NewMemory {
+            source: "document_import".into(),
+            doc_id: Some(doc.into()),
+            chunk_index: Some(index),
+            ..NewMemory::new(id, content, "2026-01-01T00:00:00Z")
+        })
+        .unwrap();
 }
 
 fn search(
-    conn: &Connection,
+    store: &Store<'_>,
     query: &str,
     configure: impl FnOnce(&mut MemorySearchInput),
 ) -> remind_me_core::expansion::MemorySearchResponse {
@@ -70,7 +74,7 @@ fn search(
         bootstrap: false,
     };
     configure(&mut input);
-    queries::search_with_expansions(conn, &input).unwrap()
+    queries::search_with_expansions(store, &input).unwrap()
 }
 
 fn ids(items: &[RelatedMemory]) -> Vec<String> {
@@ -79,14 +83,9 @@ fn ids(items: &[RelatedMemory]) -> Vec<String> {
     out
 }
 
-fn weight(conn: &Connection, a: &str, b: &str) -> Option<i64> {
+fn weight(store: &Store<'_>, a: &str, b: &str) -> Option<i64> {
     let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-    conn.query_row(
-        "SELECT weight FROM memory_associations WHERE memory_id_a = ? AND memory_id_b = ?",
-        rusqlite::params![lo, hi],
-        |r| r.get(0),
-    )
-    .ok()
+    testing::association_weight(store, lo, hi).unwrap()
 }
 
 // --- co-retrieval write path -------------------------------------------------
@@ -94,31 +93,29 @@ fn weight(conn: &Connection, a: &str, b: &str) -> Option<i64> {
 #[test]
 fn pairs_are_stored_under_one_canonical_order() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
-    record_co_retrieval(&conn, &["mem_b".into(), "mem_a".into()]).unwrap();
-    record_co_retrieval(&conn, &["mem_a".into(), "mem_b".into()]).unwrap();
+    record_co_retrieval(&store, &["mem_b".into(), "mem_a".into()]).unwrap();
+    record_co_retrieval(&store, &["mem_a".into(), "mem_b".into()]).unwrap();
 
-    let rows: i64 = conn
-        .query_row("SELECT count(*) FROM memory_associations", [], |r| r.get(0))
-        .unwrap();
+    let rows = testing::count(&store, Table::MemoryAssociations).unwrap();
     // Without sorting, the two orderings would be two rows and each weight
     // would read back at half strength.
     assert_eq!(rows, 1);
-    assert_eq!(weight(&conn, "mem_a", "mem_b"), Some(2));
+    assert_eq!(weight(&store, "mem_a", "mem_b"), Some(2));
 }
 
 #[test]
 fn repeated_co_retrieval_accumulates_and_clamps() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
     for _ in 0..(CO_RETRIEVAL_MAX_WEIGHT + 20) {
-        record_co_retrieval(&conn, &["mem_a".into(), "mem_b".into()]).unwrap();
+        record_co_retrieval(&store, &["mem_a".into(), "mem_b".into()]).unwrap();
     }
 
     assert_eq!(
-        weight(&conn, "mem_a", "mem_b"),
+        weight(&store, "mem_a", "mem_b"),
         Some(CO_RETRIEVAL_MAX_WEIGHT)
     );
 }
@@ -126,32 +123,30 @@ fn repeated_co_retrieval_accumulates_and_clamps() {
 #[test]
 fn fewer_than_two_results_record_nothing() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
-    assert_eq!(record_co_retrieval(&conn, &[]).unwrap(), 0);
-    assert_eq!(record_co_retrieval(&conn, &["mem_a".into()]).unwrap(), 0);
+    assert_eq!(record_co_retrieval(&store, &[]).unwrap(), 0);
+    assert_eq!(record_co_retrieval(&store, &["mem_a".into()]).unwrap(), 0);
 
-    let rows: i64 = conn
-        .query_row("SELECT count(*) FROM memory_associations", [], |r| r.get(0))
-        .unwrap();
+    let rows = testing::count(&store, Table::MemoryAssociations).unwrap();
     assert_eq!(rows, 0, "a single result has nothing to associate with");
 }
 
 #[test]
 fn only_the_first_ten_results_participate_in_pairing() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let many: Vec<String> = (0..20).map(|i| format!("mem_{:02}", i)).collect();
 
-    let touched = record_co_retrieval(&conn, &many).unwrap();
+    let touched = record_co_retrieval(&store, &many).unwrap();
 
     // Pairing is quadratic, so the cap is what bounds the writes one search
     // can produce: 10 * 9 / 2.
     let expected = CO_RETRIEVAL_PAIR_CAP * (CO_RETRIEVAL_PAIR_CAP - 1) / 2;
     assert_eq!(touched, expected);
-    assert!(weight(&conn, "mem_00", "mem_09").is_some());
+    assert!(weight(&store, "mem_00", "mem_09").is_some());
     assert!(
-        weight(&conn, "mem_00", "mem_10").is_none(),
+        weight(&store, "mem_00", "mem_10").is_none(),
         "the eleventh result is outside the pairing cap"
     );
 }
@@ -159,36 +154,36 @@ fn only_the_first_ten_results_participate_in_pairing() {
 #[test]
 fn searching_reinforces_associations_without_being_asked() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let a = add(&conn, "quokka one", &[]);
-    let b = add(&conn, "quokka two", &[]);
+    let store = db.store();
+    let a = add(&store, "quokka one", &[]);
+    let b = add(&store, "quokka two", &[]);
 
     // expand_co_retrieval is false: surfacing is opt-in, recording is not. A
     // graph that only filled when someone was looking would never have
     // anything to show.
-    search(&conn, "quokka", |_| {});
+    search(&store, "quokka", |_| {});
 
-    assert_eq!(weight(&conn, &a, &b), Some(1));
+    assert_eq!(weight(&store, &a, &b), Some(1));
 }
 
 #[test]
 fn deleting_a_memory_clears_associations_on_either_side() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let a = add(&conn, "quokka one", &[]);
-    let b = add(&conn, "quokka two", &[]);
-    let c = add(&conn, "quokka three", &[]);
-    search(&conn, "quokka", |_| {});
-    assert!(weight(&conn, &a, &b).is_some());
+    let store = db.store();
+    let a = add(&store, "quokka one", &[]);
+    let b = add(&store, "quokka two", &[]);
+    let c = add(&store, "quokka three", &[]);
+    search(&store, "quokka", |_| {});
+    assert!(weight(&store, &a, &b).is_some());
 
-    queries::delete_memory(&conn, &b).unwrap();
+    queries::delete_memory(&store, &b).unwrap();
 
     // There is no foreign key here — the reference omits it so sync can deliver
     // rows out of order — so this relies on delete_memory cleaning up, and it
     // must cover the pair whichever side b sorted onto.
-    assert!(weight(&conn, &a, &b).is_none());
-    assert!(weight(&conn, &b, &c).is_none());
-    assert!(weight(&conn, &a, &c).is_some(), "unrelated pairs survive");
+    assert!(weight(&store, &a, &b).is_none());
+    assert!(weight(&store, &b, &c).is_none());
+    assert!(weight(&store, &a, &c).is_some(), "unrelated pairs survive");
 }
 
 // --- expansions are opt-in ---------------------------------------------------
@@ -196,11 +191,11 @@ fn deleting_a_memory_clears_associations_on_either_side() {
 #[test]
 fn every_expansion_is_absent_unless_requested() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "quokka one", &["Tasmania"]);
-    add(&conn, "quokka two", &["Tasmania"]);
+    let store = db.store();
+    add(&store, "quokka one", &["Tasmania"]);
+    add(&store, "quokka two", &["Tasmania"]);
 
-    let result = search(&conn, "quokka", |_| {});
+    let result = search(&store, "quokka", |_| {});
 
     assert!(result.related_via_entities.is_none());
     assert!(result.related_via_neighbors.is_none());
@@ -212,12 +207,12 @@ fn every_expansion_is_absent_unless_requested() {
 #[test]
 fn entity_expansion_finds_memories_sharing_an_entity() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "quokka sighting", &["Tasmania"]);
-    let neighbour = add(&conn, "unrelated wording entirely", &["Tasmania"]);
-    add(&conn, "nothing in common", &["Fiji"]);
+    let store = db.store();
+    add(&store, "quokka sighting", &["Tasmania"]);
+    let neighbour = add(&store, "unrelated wording entirely", &["Tasmania"]);
+    add(&store, "nothing in common", &["Fiji"]);
 
-    let result = search(&conn, "quokka", |i| i.expand_entities = true);
+    let result = search(&store, "quokka", |i| i.expand_entities = true);
 
     let related = result.related_via_entities.unwrap();
     assert_eq!(ids(&related), vec![neighbour]);
@@ -227,11 +222,11 @@ fn entity_expansion_finds_memories_sharing_an_entity() {
 #[test]
 fn entity_expansion_excludes_the_seeds_themselves() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "quokka one", &["Tasmania"]);
-    add(&conn, "quokka two", &["Tasmania"]);
+    let store = db.store();
+    add(&store, "quokka one", &["Tasmania"]);
+    add(&store, "quokka two", &["Tasmania"]);
 
-    let result = search(&conn, "quokka", |i| i.expand_entities = true);
+    let result = search(&store, "quokka", |i| i.expand_entities = true);
 
     // Both memories match the query, so both are seeds — there is no third
     // memory to expand to.
@@ -241,11 +236,11 @@ fn entity_expansion_excludes_the_seeds_themselves() {
 #[test]
 fn entity_expansion_gathers_multiple_links_onto_one_item() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "quokka sighting", &["Tasmania", "Hobart"]);
-    let neighbour = add(&conn, "unrelated wording", &["Tasmania", "Hobart"]);
+    let store = db.store();
+    add(&store, "quokka sighting", &["Tasmania", "Hobart"]);
+    let neighbour = add(&store, "unrelated wording", &["Tasmania", "Hobart"]);
 
-    let result = search(&conn, "quokka", |i| i.expand_entities = true);
+    let result = search(&store, "quokka", |i| i.expand_entities = true);
 
     let related = result.related_via_entities.unwrap();
     // One row per (memory, entity) pair comes back from SQL; the memory must
@@ -260,17 +255,13 @@ fn entity_expansion_gathers_multiple_links_onto_one_item() {
 #[test]
 fn entity_expansion_skips_deleted_and_superseded_memories() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "quokka sighting", &["Tasmania"]);
-    let live = add(&conn, "still around", &["Tasmania"]);
-    let superseded = add(&conn, "replaced note", &["Tasmania"]);
-    conn.execute(
-        "UPDATE memories SET superseded_by = ? WHERE id = ?",
-        rusqlite::params![live, superseded],
-    )
-    .unwrap();
+    let store = db.store();
+    add(&store, "quokka sighting", &["Tasmania"]);
+    let live = add(&store, "still around", &["Tasmania"]);
+    let superseded = add(&store, "replaced note", &["Tasmania"]);
+    testing::set_memory_column(&store, &superseded, "superseded_by", live.as_str()).unwrap();
 
-    let result = search(&conn, "quokka", |i| i.expand_entities = true);
+    let result = search(&store, "quokka", |i| i.expand_entities = true);
 
     assert_eq!(ids(&result.related_via_entities.unwrap()), vec![live]);
 }
@@ -278,13 +269,13 @@ fn entity_expansion_skips_deleted_and_superseded_memories() {
 #[test]
 fn entity_expansion_is_capped() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "quokka sighting", &["Tasmania"]);
+    let store = db.store();
+    add(&store, "quokka sighting", &["Tasmania"]);
     for i in 0..(EXPANSION_CAP + 4) {
-        add(&conn, &format!("unrelated wording {}", i), &["Tasmania"]);
+        add(&store, &format!("unrelated wording {}", i), &["Tasmania"]);
     }
 
-    let result = search(&conn, "quokka", |i| i.expand_entities = true);
+    let result = search(&store, "quokka", |i| i.expand_entities = true);
 
     assert_eq!(result.related_via_entities.unwrap().len(), EXPANSION_CAP);
 }
@@ -294,14 +285,14 @@ fn entity_expansion_is_capped() {
 #[test]
 fn neighbor_expansion_finds_adjacent_chunks() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    chunk(&conn, "mem_0", "opening paragraph", "doc_1", 0);
-    chunk(&conn, "mem_1", "quokka paragraph", "doc_1", 1);
-    chunk(&conn, "mem_2", "closing paragraph", "doc_1", 2);
-    chunk(&conn, "mem_3", "far away paragraph", "doc_1", 9);
-    chunk(&conn, "mem_x", "other document", "doc_2", 1);
+    let store = db.store();
+    chunk(&store, "mem_0", "opening paragraph", "doc_1", 0);
+    chunk(&store, "mem_1", "quokka paragraph", "doc_1", 1);
+    chunk(&store, "mem_2", "closing paragraph", "doc_1", 2);
+    chunk(&store, "mem_3", "far away paragraph", "doc_1", 9);
+    chunk(&store, "mem_x", "other document", "doc_2", 1);
 
-    let result = search(&conn, "quokka", |i| i.include_neighbors = true);
+    let result = search(&store, "quokka", |i| i.include_neighbors = true);
 
     // Window is one position either side, same document only.
     assert_eq!(
@@ -313,11 +304,11 @@ fn neighbor_expansion_finds_adjacent_chunks() {
 #[test]
 fn neighbor_expansion_carries_the_document_position() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    chunk(&conn, "mem_0", "opening paragraph", "doc_1", 0);
-    chunk(&conn, "mem_1", "quokka paragraph", "doc_1", 1);
+    let store = db.store();
+    chunk(&store, "mem_0", "opening paragraph", "doc_1", 0);
+    chunk(&store, "mem_1", "quokka paragraph", "doc_1", 1);
 
-    let result = search(&conn, "quokka", |i| i.include_neighbors = true);
+    let result = search(&store, "quokka", |i| i.include_neighbors = true);
 
     let related = result.related_via_neighbors.unwrap();
     assert_eq!(related[0].doc_id.as_deref(), Some("doc_1"));
@@ -327,11 +318,11 @@ fn neighbor_expansion_carries_the_document_position() {
 #[test]
 fn neighbor_expansion_is_empty_without_a_document() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "quokka sighting", &[]);
-    add(&conn, "quokka again", &[]);
+    let store = db.store();
+    add(&store, "quokka sighting", &[]);
+    add(&store, "quokka again", &[]);
 
-    let result = search(&conn, "quokka", |i| i.include_neighbors = true);
+    let result = search(&store, "quokka", |i| i.include_neighbors = true);
 
     // A manually added memory is not part of a document, so it has no
     // siblings. On a store with no importers this always comes back empty.
@@ -343,15 +334,15 @@ fn neighbor_expansion_is_empty_without_a_document() {
 #[test]
 fn co_retrieval_expansion_surfaces_past_companions() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let quokka = add(&conn, "quokka sighting", &[]);
-    let companion = add(&conn, "quokka companion note", &[]);
+    let store = db.store();
+    let quokka = add(&store, "quokka sighting", &[]);
+    let companion = add(&store, "quokka companion note", &[]);
     // Both come back for "quokka", so searching once associates them.
-    search(&conn, "quokka", |_| {});
+    search(&store, "quokka", |_| {});
 
     // Now search for something only the first matches: the companion should be
     // surfaced by association rather than by the query.
-    let result = search(&conn, "sighting", |i| i.expand_co_retrieval = true);
+    let result = search(&store, "sighting", |i| i.expand_co_retrieval = true);
 
     assert_eq!(
         result
@@ -369,16 +360,16 @@ fn co_retrieval_expansion_surfaces_past_companions() {
 #[test]
 fn co_retrieval_expansion_orders_by_weight() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let seed = add(&conn, "quokka sighting", &[]);
-    let often = add(&conn, "often together", &[]);
-    let once = add(&conn, "once together", &[]);
-    record_co_retrieval(&conn, &[seed.clone(), once.clone()]).unwrap();
+    let store = db.store();
+    let seed = add(&store, "quokka sighting", &[]);
+    let often = add(&store, "often together", &[]);
+    let once = add(&store, "once together", &[]);
+    record_co_retrieval(&store, &[seed.clone(), once.clone()]).unwrap();
     for _ in 0..5 {
-        record_co_retrieval(&conn, &[seed.clone(), often.clone()]).unwrap();
+        record_co_retrieval(&store, &[seed.clone(), often.clone()]).unwrap();
     }
 
-    let result = search(&conn, "sighting", |i| i.expand_co_retrieval = true);
+    let result = search(&store, "sighting", |i| i.expand_co_retrieval = true);
 
     let related = result.related_via_co_retrieval.unwrap();
     assert_eq!(
@@ -391,12 +382,12 @@ fn co_retrieval_expansion_orders_by_weight() {
 #[test]
 fn co_retrieval_expansion_reads_both_sides_of_a_pair() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let seed = add(&conn, "quokka sighting", &[]);
-    let other = add(&conn, "the companion", &[]);
-    record_co_retrieval(&conn, &[seed.clone(), other.clone()]).unwrap();
+    let store = db.store();
+    let seed = add(&store, "quokka sighting", &[]);
+    let other = add(&store, "the companion", &[]);
+    record_co_retrieval(&store, &[seed.clone(), other.clone()]).unwrap();
 
-    let result = search(&conn, "sighting", |i| i.expand_co_retrieval = true);
+    let result = search(&store, "sighting", |i| i.expand_co_retrieval = true);
 
     // A pair is stored once under a canonical order, so the seed may sit on
     // either side and the read has to cover both.
@@ -406,14 +397,14 @@ fn co_retrieval_expansion_reads_both_sides_of_a_pair() {
 #[test]
 fn co_retrieval_expansion_is_capped_and_snippets_are_trimmed() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let seed = add(&conn, "quokka sighting", &[]);
+    let store = db.store();
+    let seed = add(&store, "quokka sighting", &[]);
     for i in 0..(EXPANSION_CAP + 4) {
-        let other = add(&conn, &format!("{} companion {}", "x".repeat(500), i), &[]);
-        record_co_retrieval(&conn, &[seed.clone(), other]).unwrap();
+        let other = add(&store, &format!("{} companion {}", "x".repeat(500), i), &[]);
+        record_co_retrieval(&store, &[seed.clone(), other]).unwrap();
     }
 
-    let result = search(&conn, "sighting", |i| i.expand_co_retrieval = true);
+    let result = search(&store, "sighting", |i| i.expand_co_retrieval = true);
 
     let related = result.related_via_co_retrieval.unwrap();
     assert_eq!(related.len(), EXPANSION_CAP);
@@ -425,13 +416,13 @@ fn co_retrieval_expansion_is_capped_and_snippets_are_trimmed() {
 #[test]
 fn expansions_do_not_consume_the_limit() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "quokka sighting", &["Tasmania"]);
+    let store = db.store();
+    add(&store, "quokka sighting", &["Tasmania"]);
     for i in 0..4 {
-        add(&conn, &format!("unrelated wording {}", i), &["Tasmania"]);
+        add(&store, &format!("unrelated wording {}", i), &["Tasmania"]);
     }
 
-    let result = search(&conn, "quokka", |i| {
+    let result = search(&store, "quokka", |i| {
         i.limit = 1;
         i.expand_entities = true;
     });
@@ -445,20 +436,20 @@ fn expansions_do_not_consume_the_limit() {
 #[test]
 fn co_retrieval_weight_never_reaches_the_ranking() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let first = add(&conn, "quokka alpha", &[]);
-    let second = add(&conn, "quokka beta", &[]);
-    let before: Vec<String> = search(&conn, "quokka", |_| {})
+    let store = db.store();
+    let first = add(&store, "quokka alpha", &[]);
+    let second = add(&store, "quokka beta", &[]);
+    let before: Vec<String> = search(&store, "quokka", |_| {})
         .memories
         .iter()
         .map(|r| r.memory.id.clone())
         .collect();
 
     for _ in 0..CO_RETRIEVAL_MAX_WEIGHT {
-        record_co_retrieval(&conn, &[first.clone(), second.clone()]).unwrap();
+        record_co_retrieval(&store, &[first.clone(), second.clone()]).unwrap();
     }
 
-    let after: Vec<String> = search(&conn, "quokka", |i| i.expand_co_retrieval = true)
+    let after: Vec<String> = search(&store, "quokka", |i| i.expand_co_retrieval = true)
         .memories
         .iter()
         .map(|r| r.memory.id.clone())

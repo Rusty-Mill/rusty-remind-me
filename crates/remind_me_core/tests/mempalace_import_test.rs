@@ -16,12 +16,15 @@
 #[path = "../src/test_env.rs"]
 mod test_env;
 
+use remind_me_core::db::Store;
 use remind_me_core::mempalace_import::{
     parse_frontmatter, pull_mempalace, MempalaceImportError, COLLECTION_NAME, DEFAULT_CATEGORY,
     OPAQUE_SOURCE,
 };
+use remind_me_core::testing::{self, Table};
 use remind_me_core::{Database, MempalaceImportInput};
-use rusqlite::{params, Connection};
+use rusqlite::params;
+use rusqlite::Connection;
 use std::sync::Mutex;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -118,9 +121,31 @@ fn input() -> MempalaceImportInput {
     }
 }
 
-fn memory_count(conn: &Connection) -> i64 {
-    conn.query_row("SELECT count(*) FROM memories", [], |r| r.get(0))
+fn memory_count(store: &Store<'_>) -> i64 {
+    testing::count(store, Table::Memories).unwrap()
+}
+
+/// The one stored memory's `column`, as text.
+fn only_memory_text(store: &Store<'_>, column: &str) -> String {
+    let ids = testing::memory_ids(store).unwrap();
+    assert_eq!(ids.len(), 1, "expected exactly one memory");
+    testing::memory_text(store, &ids[0], column)
         .unwrap()
+        .unwrap()
+}
+
+/// `columns` of every stored memory, ordered by content.
+fn memory_rows(store: &Store<'_>, columns: &[&str]) -> Vec<Vec<String>> {
+    let mut rows: Vec<(String, Vec<String>)> = testing::memory_ids(store)
+        .unwrap()
+        .iter()
+        .map(|id| {
+            let text = |c: &str| testing::memory_text(store, id, c).unwrap().unwrap();
+            (text("content"), columns.iter().map(|c| text(c)).collect())
+        })
+        .collect();
+    rows.sort();
+    rows.into_iter().map(|(_, row)| row).collect()
 }
 
 const NATIVE_DOCUMENT: &str = "---\ncategory: fact\nsource: remind_me/manual\ntags: work, deadline\ncreated: 2025-06-01T00:00:00Z\n---\n\nThe deploy window is Tuesdays.";
@@ -180,9 +205,9 @@ fn a_key_with_digits_does_not_match_the_reserved_charset() {
 fn a_missing_store_is_reported_as_missing() {
     let dir = scratch("missing");
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
-    let error = with_store_at(&dir, || pull_mempalace(&conn, &input()).unwrap_err());
+    let error = with_store_at(&dir, || pull_mempalace(&store, &input()).unwrap_err());
 
     assert!(
         matches!(error, MempalaceImportError::NotFound { .. }),
@@ -196,9 +221,9 @@ fn a_file_that_is_not_a_database_is_reported_as_such() {
     let dir = scratch("notadb");
     std::fs::write(dir.join("chroma.sqlite3"), "not a sqlite file").unwrap();
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
-    let error = with_store_at(&dir, || pull_mempalace(&conn, &input()).unwrap_err());
+    let error = with_store_at(&dir, || pull_mempalace(&store, &input()).unwrap_err());
 
     assert!(
         matches!(error, MempalaceImportError::NotADatabase { .. }),
@@ -216,9 +241,9 @@ fn a_database_with_no_mempalace_drawers_collection_says_so() {
         .unwrap();
     drop(chroma);
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
-    let error = with_store_at(&dir, || pull_mempalace(&conn, &input()).unwrap_err());
+    let error = with_store_at(&dir, || pull_mempalace(&store, &input()).unwrap_err());
 
     assert!(
         matches!(error, MempalaceImportError::NoCollection { .. }),
@@ -240,21 +265,21 @@ fn a_native_drawer_restores_category_tags_source_and_created() {
         &[("drawer-1", NATIVE_DOCUMENT, Some("acme"), Some("ops"))],
     );
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
-    let result = with_store_at(&dir, || pull_mempalace(&conn, &input()).unwrap());
+    let result = with_store_at(&dir, || pull_mempalace(&store, &input()).unwrap());
 
     assert_eq!(result.native_format, 1);
     assert_eq!(result.opaque_format, 0);
     assert_eq!(result.imported, 1);
 
-    let (content, category, source, tags, created_at): (String, String, String, String, String) =
-        conn.query_row(
-            "SELECT content, category, source, tags, created_at FROM memories",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-        )
-        .unwrap();
+    let (content, category, source, tags, created_at) = (
+        only_memory_text(&store, "content"),
+        only_memory_text(&store, "category"),
+        only_memory_text(&store, "source"),
+        only_memory_text(&store, "tags"),
+        only_memory_text(&store, "created_at"),
+    );
 
     assert_eq!(content, "The deploy window is Tuesdays.");
     assert_eq!(category, "fact");
@@ -278,13 +303,11 @@ fn a_native_drawers_frontmatter_id_is_not_restored() {
     let doc = "---\nid: original-frontmatter-id\ncategory: fact\n---\n\nbody text";
     write_store(&dir, &[("drawer-1", doc, None, None)]);
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
-    with_store_at(&dir, || pull_mempalace(&conn, &input()).unwrap());
+    with_store_at(&dir, || pull_mempalace(&store, &input()).unwrap());
 
-    let id: String = conn
-        .query_row("SELECT id FROM memories", [], |r| r.get(0))
-        .unwrap();
+    let id: String = only_memory_text(&store, "id");
     assert_ne!(id, "original-frontmatter-id");
     assert!(id.starts_with("mem_"));
 
@@ -304,20 +327,19 @@ fn an_opaque_drawer_is_stored_as_is_tagged_with_wing_and_room() {
         )],
     );
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
-    let result = with_store_at(&dir, || pull_mempalace(&conn, &input()).unwrap());
+    let result = with_store_at(&dir, || pull_mempalace(&store, &input()).unwrap());
 
     assert_eq!(result.opaque_format, 1);
     assert_eq!(result.native_format, 0);
 
-    let (content, category, source, tags): (String, String, String, String) = conn
-        .query_row(
-            "SELECT content, category, source, tags FROM memories",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-        )
-        .unwrap();
+    let (content, category, source, tags) = (
+        only_memory_text(&store, "content"),
+        only_memory_text(&store, "category"),
+        only_memory_text(&store, "source"),
+        only_memory_text(&store, "tags"),
+    );
     assert_eq!(content, "just plain drawer text");
     assert_eq!(category, DEFAULT_CATEGORY);
     assert_eq!(source, OPAQUE_SOURCE);
@@ -338,23 +360,16 @@ fn extra_tags_are_appended_to_both_native_and_opaque_drawers() {
         ],
     );
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let mut params = input();
     params.tags = vec!["archived".to_string()];
 
-    with_store_at(&dir, || pull_mempalace(&conn, &params).unwrap());
+    with_store_at(&dir, || pull_mempalace(&store, &params).unwrap());
 
-    let mut stmt = conn
-        .prepare("SELECT tags FROM memories ORDER BY content")
-        .unwrap();
-    let all_tags: Vec<Vec<String>> = stmt
-        .query_map([], |r| {
-            let raw: String = r.get(0)?;
-            Ok(serde_json::from_str(&raw).unwrap())
-        })
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
+    let all_tags: Vec<Vec<String>> = memory_rows(&store, &["tags"])
+        .into_iter()
+        .map(|row| serde_json::from_str(&row[0]).unwrap())
+        .collect();
     for tags in &all_tags {
         assert!(tags.contains(&"archived".to_string()), "{:?}", tags);
     }
@@ -374,20 +389,16 @@ fn a_caller_supplied_category_only_applies_to_drawers_without_one() {
         ],
     );
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let mut params = input();
     params.category = "caller_category".to_string();
 
-    with_store_at(&dir, || pull_mempalace(&conn, &params).unwrap());
+    with_store_at(&dir, || pull_mempalace(&store, &params).unwrap());
 
-    let mut stmt = conn
-        .prepare("SELECT content, category FROM memories ORDER BY content")
-        .unwrap();
-    let rows: Vec<(String, String)> = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
+    let rows: Vec<(String, String)> = memory_rows(&store, &["content", "category"])
+        .into_iter()
+        .map(|row| (row[0].clone(), row[1].clone()))
+        .collect();
     let by_content: std::collections::HashMap<_, _> = rows.into_iter().collect();
     assert_eq!(by_content["The deploy window is Tuesdays."], "fact");
     assert_eq!(by_content["opaque text"], "caller_category");
@@ -410,15 +421,15 @@ fn wing_filters_to_matching_drawers_only() {
         ],
     );
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let mut params = input();
     params.wing = "acme".to_string();
 
-    let result = with_store_at(&dir, || pull_mempalace(&conn, &params).unwrap());
+    let result = with_store_at(&dir, || pull_mempalace(&store, &params).unwrap());
 
     assert_eq!(result.fetched, 1);
     assert_eq!(result.wing.as_deref(), Some("acme"));
-    assert_eq!(memory_count(&conn), 1);
+    assert_eq!(memory_count(&store), 1);
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -434,17 +445,15 @@ fn room_filters_within_a_wing() {
         ],
     );
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let mut params = input();
     params.wing = "acme".to_string();
     params.room = "eng".to_string();
 
-    let result = with_store_at(&dir, || pull_mempalace(&conn, &params).unwrap());
+    let result = with_store_at(&dir, || pull_mempalace(&store, &params).unwrap());
 
     assert_eq!(result.fetched, 1);
-    let content: String = conn
-        .query_row("SELECT content FROM memories", [], |r| r.get(0))
-        .unwrap();
+    let content: String = only_memory_text(&store, "content");
     assert_eq!(content, "two");
 
     std::fs::remove_dir_all(&dir).unwrap();
@@ -455,11 +464,11 @@ fn a_drawer_with_no_wing_metadata_does_not_match_a_wing_filter() {
     let dir = scratch("no-wing");
     write_store(&dir, &[("d1", "one", None, None)]);
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let mut params = input();
     params.wing = "acme".to_string();
 
-    let result = with_store_at(&dir, || pull_mempalace(&conn, &params).unwrap());
+    let result = with_store_at(&dir, || pull_mempalace(&store, &params).unwrap());
 
     assert_eq!(result.fetched, 0);
     std::fs::remove_dir_all(&dir).unwrap();
@@ -481,20 +490,20 @@ fn paging_reports_more_while_a_page_comes_back_full() {
         ],
     );
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let mut page = input();
     page.limit = 2;
 
-    let first = with_store_at(&dir, || pull_mempalace(&conn, &page).unwrap());
+    let first = with_store_at(&dir, || pull_mempalace(&store, &page).unwrap());
     assert_eq!(first.fetched, 2);
     assert!(first.has_more);
 
     page.offset = 2;
-    let second = with_store_at(&dir, || pull_mempalace(&conn, &page).unwrap());
+    let second = with_store_at(&dir, || pull_mempalace(&store, &page).unwrap());
     assert_eq!(second.fetched, 1);
     assert!(!second.has_more);
 
-    assert_eq!(memory_count(&conn), 3, "the pages did not overlap or skip");
+    assert_eq!(memory_count(&store), 3, "the pages did not overlap or skip");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -503,11 +512,11 @@ fn an_out_of_range_limit_is_clamped_rather_than_rejected() {
     let dir = scratch("clamp");
     write_store(&dir, &[("d1", "content", None, None)]);
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let mut params = input();
     params.limit = 0;
 
-    let result = with_store_at(&dir, || pull_mempalace(&conn, &params).unwrap());
+    let result = with_store_at(&dir, || pull_mempalace(&store, &params).unwrap());
 
     assert_eq!(result.limit, 1);
     assert_eq!(result.fetched, 1);
@@ -523,16 +532,16 @@ fn a_rerun_over_the_same_drawers_imports_nothing_new() {
     let dir = scratch("rerun");
     write_store(&dir, &[("d1", "content one", None, None)]);
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    with_store_at(&dir, || pull_mempalace(&conn, &input()).unwrap());
+    let store = db.store();
+    with_store_at(&dir, || pull_mempalace(&store, &input()).unwrap());
 
-    let again = with_store_at(&dir, || pull_mempalace(&conn, &input()).unwrap());
+    let again = with_store_at(&dir, || pull_mempalace(&store, &input()).unwrap());
 
     assert_eq!(again.fetched, 1);
     assert_eq!(again.already_imported, 1);
     assert_eq!(again.to_import, 0);
     assert_eq!(again.imported, 0);
-    assert_eq!(memory_count(&conn), 1);
+    assert_eq!(memory_count(&store), 1);
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -542,8 +551,8 @@ fn a_rerun_after_adding_a_drawer_imports_only_the_new_one() {
     let dir = scratch("rerun-new");
     write_store(&dir, &[("d1", "content one", None, None)]);
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    with_store_at(&dir, || pull_mempalace(&conn, &input()).unwrap());
+    let store = db.store();
+    with_store_at(&dir, || pull_mempalace(&store, &input()).unwrap());
 
     write_store(
         &dir,
@@ -552,11 +561,11 @@ fn a_rerun_after_adding_a_drawer_imports_only_the_new_one() {
             ("d2", "content two", None, None),
         ],
     );
-    let result = with_store_at(&dir, || pull_mempalace(&conn, &input()).unwrap());
+    let result = with_store_at(&dir, || pull_mempalace(&store, &input()).unwrap());
 
     assert_eq!(result.already_imported, 1);
     assert_eq!(result.to_import, 1);
-    assert_eq!(memory_count(&conn), 2);
+    assert_eq!(memory_count(&store), 2);
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -571,16 +580,14 @@ fn an_edited_drawer_keeping_its_id_is_not_reimported() {
     let dir = scratch("edited");
     write_store(&dir, &[("d1", "original content", None, None)]);
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    with_store_at(&dir, || pull_mempalace(&conn, &input()).unwrap());
+    let store = db.store();
+    with_store_at(&dir, || pull_mempalace(&store, &input()).unwrap());
 
     write_store(&dir, &[("d1", "edited content", None, None)]);
-    let result = with_store_at(&dir, || pull_mempalace(&conn, &input()).unwrap());
+    let result = with_store_at(&dir, || pull_mempalace(&store, &input()).unwrap());
 
     assert_eq!(result.to_import, 0);
-    let content: String = conn
-        .query_row("SELECT content FROM memories", [], |r| r.get(0))
-        .unwrap();
+    let content: String = only_memory_text(&store, "content");
     assert_eq!(content, "original content");
 
     std::fs::remove_dir_all(&dir).unwrap();
@@ -595,20 +602,18 @@ fn a_dry_run_reports_the_work_without_doing_any_of_it() {
     let dir = scratch("dryrun");
     write_store(&dir, &[("d1", NATIVE_DOCUMENT, None, None)]);
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let mut params = input();
     params.dry_run = true;
 
-    let result = with_store_at(&dir, || pull_mempalace(&conn, &params).unwrap());
+    let result = with_store_at(&dir, || pull_mempalace(&store, &params).unwrap());
 
     assert_eq!(result.to_import, 1);
     assert_eq!(result.native_format, 1);
     assert_eq!(result.imported, 0);
-    assert_eq!(memory_count(&conn), 0);
+    assert_eq!(memory_count(&store), 0);
     assert_eq!(
-        conn.query_row("SELECT count(*) FROM mempalace_imports", [], |r| r
-            .get::<_, i64>(0))
-            .unwrap(),
+        testing::count(&store, Table::MempalaceImports).unwrap(),
         0,
         "a dry run that recorded a tracking row would make the real run a no-op"
     );

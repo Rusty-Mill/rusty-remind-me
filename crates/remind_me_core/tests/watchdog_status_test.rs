@@ -10,7 +10,7 @@ use remind_me_core::{status, watchdog, Database};
 #[test]
 fn server_status_reports_the_watchdog() {
     let db = Database::open(":memory:").expect("in-memory database");
-    let report = status::server_status(&db.conn()).expect("status snapshot");
+    let report = status::server_status(&db.store()).expect("status snapshot");
 
     // Unset `REMIND_ME_SLOW_CALL_SECONDS` means the 30s default, so the
     // watchdog is enabled in an ordinary test process.
@@ -28,13 +28,13 @@ fn server_status_reports_the_watchdog() {
 fn an_in_flight_call_shows_up_in_server_status() {
     let db = Database::open(":memory:").expect("in-memory database");
 
-    let before = status::server_status(&db.conn())
+    let before = status::server_status(&db.store())
         .expect("status snapshot")
         .watchdog
         .calls_in_flight;
 
     let guard = watchdog::arm("remind_me_search");
-    let during = status::server_status(&db.conn())
+    let during = status::server_status(&db.store())
         .expect("status snapshot")
         .watchdog
         .calls_in_flight;
@@ -45,7 +45,7 @@ fn an_in_flight_call_shows_up_in_server_status() {
     );
 
     drop(guard);
-    let after = status::server_status(&db.conn())
+    let after = status::server_status(&db.store())
         .expect("status snapshot")
         .watchdog
         .calls_in_flight;
@@ -55,7 +55,7 @@ fn an_in_flight_call_shows_up_in_server_status() {
 #[test]
 fn the_status_payload_serializes_with_the_watchdog_field() {
     let db = Database::open(":memory:").expect("in-memory database");
-    let report = status::server_status(&db.conn()).expect("status snapshot");
+    let report = status::server_status(&db.store()).expect("status snapshot");
     let payload = serde_json::to_value(&report).expect("ServerStatus should serialize");
 
     // This is the shape `remind_me_server_status` hands a caller, so the field

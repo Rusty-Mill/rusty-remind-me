@@ -1,6 +1,7 @@
 # ADR-0015: Port the hub, with storage behind a trait
 
-Status: Accepted
+Status: Superseded by ADR-0021 (the Postgres and SQLite stores were removed
+on 2026-09-26; the hub stores its data in the embedded engine)
 Date: 2026-08-05
 
 ## Context

@@ -40,18 +40,19 @@
 //! takes it along. A separate table would have needed all three rebuilt.
 
 use crate::capture::get_capture;
+use crate::db::memories::{Memories, NewMemory};
+use crate::db::Store;
 use crate::models::{
     Skeleton, SkeletonSlice, SkeletonWriteInput, CAPTURE_SOURCE, SKELETON_CATEGORY,
 };
 use crate::vitality::{calculate_vitality, get_decay_rate, get_source_prior, get_type_prior};
 use chrono::Utc;
-use rusqlite::{params, Connection};
 use std::collections::BTreeMap;
 
 /// Why a skeleton could not be written or read.
 #[derive(Debug)]
 pub enum SkeletonError {
-    Db(rusqlite::Error),
+    Db(crate::db::StoreError),
     /// No memory carries this `capture_id`.
     NoCapture(String),
     /// The capture has no dialog half, so there is nothing for nodes to
@@ -100,8 +101,8 @@ impl std::fmt::Display for SkeletonError {
 
 impl std::error::Error for SkeletonError {}
 
-impl From<rusqlite::Error> for SkeletonError {
-    fn from(e: rusqlite::Error) -> Self {
+impl From<crate::db::StoreError> for SkeletonError {
+    fn from(e: crate::db::StoreError) -> Self {
         Self::Db(e)
     }
 }
@@ -121,14 +122,14 @@ fn dialog_lines(content: &str) -> Vec<&str> {
 /// Replacing rather than appending: a capture has one shape, and a second
 /// skeleton would leave [`read_skeleton`] picking arbitrarily between them.
 pub fn write_skeleton(
-    conn: &Connection,
+    store: &Store<'_>,
     input: &SkeletonWriteInput,
 ) -> Result<Skeleton, SkeletonError> {
     if input.nodes.is_empty() {
         return Err(SkeletonError::NoNodes);
     }
 
-    let capture = get_capture(conn, &input.capture_id)?
+    let capture = get_capture(store, &input.capture_id)?
         .ok_or_else(|| SkeletonError::NoCapture(input.capture_id.clone()))?;
     let dialog = capture
         .dialog
@@ -151,10 +152,8 @@ pub fn write_skeleton(
     }
 
     // Any previous skeleton goes first, so a replace cannot briefly leave two.
-    conn.execute(
-        "DELETE FROM memories WHERE capture_id = ? AND category = ?",
-        params![input.capture_id, SKELETON_CATEGORY],
-    )?;
+    let memories = Memories::new(store);
+    memories.delete_capture_category(&input.capture_id, SKELETON_CATEGORY)?;
 
     let now_iso = Utc::now().to_rfc3339();
     let now = Utc::now();
@@ -179,29 +178,19 @@ pub fn write_skeleton(
     let vitality = calculate_vitality(base_weight, 0, decay_rate, &now_iso, now);
 
     let (node_id, client) = crate::sync::memory_provenance();
-    conn.execute(
-        "INSERT INTO memories (
-            id, content, category, tags, source, metadata, capture_id,
-            created_at, updated_at, decay_rate, vitality, base_weight,
-            access_count, accessed_at, node_id, client
-         ) VALUES (?, ?, ?, '[]', ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
-        params![
-            skeleton_id,
-            input.mermaid,
-            SKELETON_CATEGORY,
-            CAPTURE_SOURCE,
-            metadata.to_string(),
-            input.capture_id,
-            now_iso,
-            now_iso,
-            decay_rate,
-            vitality,
-            base_weight,
-            now_iso,
-            node_id,
-            client,
-        ],
-    )?;
+    memories.insert(&NewMemory {
+        category: SKELETON_CATEGORY.to_string(),
+        source: CAPTURE_SOURCE.to_string(),
+        metadata,
+        capture_id: Some(input.capture_id.clone()),
+        decay_rate,
+        vitality,
+        base_weight,
+        accessed_at: Some(now_iso.clone()),
+        node_id: Some(node_id),
+        client,
+        ..NewMemory::new(skeleton_id.clone(), input.mermaid.clone(), &now_iso)
+    })?;
 
     Ok(Skeleton {
         capture_id: input.capture_id.clone(),
@@ -233,10 +222,10 @@ fn nodes_from_metadata(metadata: &serde_json::Value) -> BTreeMap<String, (usize,
 
 /// A capture's skeleton, or `None` when it has none.
 pub fn read_skeleton(
-    conn: &Connection,
+    store: &Store<'_>,
     capture_id: &str,
 ) -> Result<Option<Skeleton>, SkeletonError> {
-    let Some(capture) = get_capture(conn, capture_id)? else {
+    let Some(capture) = get_capture(store, capture_id)? else {
         return Ok(None);
     };
 
@@ -267,18 +256,18 @@ pub fn read_skeleton(
 /// the caller asked about something that is not there, which is not an error
 /// so much as an empty answer.
 pub fn node_slice(
-    conn: &Connection,
+    store: &Store<'_>,
     capture_id: &str,
     node: &str,
 ) -> Result<Option<SkeletonSlice>, SkeletonError> {
-    let Some(skeleton) = read_skeleton(conn, capture_id)? else {
+    let Some(skeleton) = read_skeleton(store, capture_id)? else {
         return Ok(None);
     };
     let Some(&(start, end)) = skeleton.nodes.get(node) else {
         return Ok(None);
     };
 
-    let capture = get_capture(conn, capture_id)?
+    let capture = get_capture(store, capture_id)?
         .ok_or_else(|| SkeletonError::NoCapture(capture_id.to_string()))?;
     let dialog = capture
         .dialog

@@ -7,14 +7,17 @@ mod test_env;
 
 mod support;
 
+use remind_me_core::db::entities::Entities;
+use remind_me_core::db::sync_state::SyncState;
+use remind_me_core::db::Store;
 use remind_me_core::entity::{self, entity_id, entity_relation_id};
 use remind_me_core::sync::{
     apply_incoming_record, pull_entities, pull_entity_relations, pull_links, push_outbox,
     upsert_entity_record, upsert_entity_relation_record, upsert_link_record,
     EntityRelationSyncRecord, EntitySyncRecord, LinkSyncRecord,
 };
+use remind_me_core::testing::{self, Table};
 use remind_me_core::{Database, EntityInput};
-use rusqlite::Connection;
 use serde_json::json;
 use std::net::TcpListener;
 use std::sync::Mutex;
@@ -41,23 +44,13 @@ fn disable_sync() {
 }
 
 fn entity_row(
-    conn: &Connection,
+    store: &Store<'_>,
     id: &str,
 ) -> Option<(String, Option<String>, Vec<String>, String)> {
-    conn.query_row(
-        "SELECT name, kind, aliases, updated_at FROM entities WHERE id = ?",
-        [id],
-        |row| {
-            let aliases: String = row.get(2)?;
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                serde_json::from_str(&aliases).unwrap(),
-                row.get(3)?,
-            ))
-        },
-    )
-    .ok()
+    Entities::new(store)
+        .get(id)
+        .unwrap()
+        .map(|e| (e.name, e.kind, e.aliases, e.updated_at))
 }
 
 fn entity_record(
@@ -85,9 +78,9 @@ fn entity_record(
 #[test]
 fn a_newer_incoming_entity_wins_and_aliases_still_union_merge() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     entity::upsert_entity(
-        &conn,
+        &store,
         &EntityInput {
             name: "Bailey".to_string(),
             kind: None,
@@ -102,9 +95,9 @@ fn a_newer_incoming_entity_wins_and_aliases_still_union_merge() {
         &["Bails"],
         "2030-01-01T00:00:00+00:00",
     );
-    upsert_entity_record(&conn, &incoming).unwrap();
+    upsert_entity_record(&store, &incoming).unwrap();
 
-    let (name, kind, aliases, _) = entity_row(&conn, &entity_id("Bailey")).unwrap();
+    let (name, kind, aliases, _) = entity_row(&store, &entity_id("Bailey")).unwrap();
     assert_eq!(name, "bailey", "the newer incoming name wins LWW");
     assert_eq!(kind.as_deref(), Some("person"));
     assert_eq!(
@@ -117,9 +110,9 @@ fn a_newer_incoming_entity_wins_and_aliases_still_union_merge() {
 #[test]
 fn an_older_incoming_entity_loses_the_rename_but_still_merges_its_alias() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     entity::upsert_entity(
-        &conn,
+        &store,
         &EntityInput {
             name: "Bailey".to_string(),
             kind: Some("person".to_string()),
@@ -127,12 +120,19 @@ fn an_older_incoming_entity_loses_the_rename_but_still_merges_its_alias() {
         },
     )
     .unwrap();
-    conn.execute(
-        "UPDATE entities SET updated_at = '2030-03-01T00:00:00+00:00' WHERE id = ?",
-        [&entity_id("Bailey")],
-    )
-    .unwrap();
-    let (_, _, _, updated_before) = entity_row(&conn, &entity_id("Bailey")).unwrap();
+    let local = Entities::new(&store)
+        .get(&entity_id("Bailey"))
+        .unwrap()
+        .unwrap();
+    Entities::new(&store)
+        .set_kind_and_aliases(
+            &local.id,
+            local.kind.as_deref(),
+            &local.aliases,
+            "2030-03-01T00:00:00+00:00",
+        )
+        .unwrap();
+    let (_, _, _, updated_before) = entity_row(&store, &entity_id("Bailey")).unwrap();
 
     let incoming = entity_record(
         "STALE NAME",
@@ -142,9 +142,9 @@ fn an_older_incoming_entity_loses_the_rename_but_still_merges_its_alias() {
     );
     let mut incoming = incoming;
     incoming.id = entity_id("Bailey"); // same identity, stale timestamp
-    upsert_entity_record(&conn, &incoming).unwrap();
+    upsert_entity_record(&store, &incoming).unwrap();
 
-    let (name, kind, aliases, updated_after) = entity_row(&conn, &entity_id("Bailey")).unwrap();
+    let (name, kind, aliases, updated_after) = entity_row(&store, &entity_id("Bailey")).unwrap();
     assert_eq!(
         name, "Bailey",
         "the rename is rejected -- incoming lost LWW"
@@ -168,7 +168,7 @@ fn an_older_incoming_entity_loses_the_rename_but_still_merges_its_alias() {
 #[test]
 fn a_brand_new_entity_id_is_inserted() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let incoming = entity_record(
         "Nova Scotia",
         Some("place"),
@@ -176,9 +176,9 @@ fn a_brand_new_entity_id_is_inserted() {
         "2026-01-01T00:00:00+00:00",
     );
 
-    upsert_entity_record(&conn, &incoming).unwrap();
+    upsert_entity_record(&store, &incoming).unwrap();
 
-    let (name, kind, ..) = entity_row(&conn, &entity_id("Nova Scotia")).unwrap();
+    let (name, kind, ..) = entity_row(&store, &entity_id("Nova Scotia")).unwrap();
     assert_eq!(name, "Nova Scotia");
     assert_eq!(kind.as_deref(), Some("place"));
 }
@@ -186,19 +186,19 @@ fn a_brand_new_entity_id_is_inserted() {
 #[test]
 fn an_entity_record_missing_a_required_field_is_refused() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let mut incoming = entity_record("X", None, &[], "2026-01-01T00:00:00+00:00");
     incoming.name = String::new();
 
-    assert!(upsert_entity_record(&conn, &incoming).is_err());
+    assert!(upsert_entity_record(&store, &incoming).is_err());
 }
 
 #[test]
 fn winning_an_existing_entity_does_not_touch_created_at() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     entity::upsert_entity(
-        &conn,
+        &store,
         &EntityInput {
             name: "Bailey".to_string(),
             kind: None,
@@ -206,25 +206,21 @@ fn winning_an_existing_entity_does_not_touch_created_at() {
         },
     )
     .unwrap();
-    let original_created_at: String = conn
-        .query_row(
-            "SELECT created_at FROM entities WHERE id = ?",
-            [&entity_id("Bailey")],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let original_created_at: String = Entities::new(&store)
+        .get(&entity_id("Bailey"))
+        .unwrap()
+        .unwrap()
+        .created_at;
 
     let mut incoming = entity_record("bailey", None, &[], "2030-01-01T00:00:00+00:00");
     incoming.created_at = "1999-01-01T00:00:00+00:00".to_string();
-    upsert_entity_record(&conn, &incoming).unwrap();
+    upsert_entity_record(&store, &incoming).unwrap();
 
-    let created_at_after: String = conn
-        .query_row(
-            "SELECT created_at FROM entities WHERE id = ?",
-            [&entity_id("Bailey")],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let created_at_after: String = Entities::new(&store)
+        .get(&entity_id("Bailey"))
+        .unwrap()
+        .unwrap()
+        .created_at;
     assert_eq!(created_at_after, original_created_at);
 }
 
@@ -235,7 +231,7 @@ fn winning_an_existing_entity_does_not_touch_created_at() {
 #[test]
 fn entity_relation_insert_or_ignore_is_idempotent() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let record: EntityRelationSyncRecord = serde_json::from_value(json!({
         "id": entity_relation_id("subj-1", "works_with", "obj-1"),
         "subject_entity_id": "subj-1",
@@ -246,12 +242,10 @@ fn entity_relation_insert_or_ignore_is_idempotent() {
     }))
     .unwrap();
 
-    upsert_entity_relation_record(&conn, &record).unwrap();
-    upsert_entity_relation_record(&conn, &record).unwrap();
+    upsert_entity_relation_record(&store, &record).unwrap();
+    upsert_entity_relation_record(&store, &record).unwrap();
 
-    let count: i64 = conn
-        .query_row("SELECT count(*) FROM entity_relations", [], |r| r.get(0))
-        .unwrap();
+    let count: i64 = testing::count(&store, Table::EntityRelations).unwrap();
     assert_eq!(count, 1);
 }
 
@@ -259,7 +253,7 @@ fn entity_relation_insert_or_ignore_is_idempotent() {
 fn entity_relation_referencing_unknown_entities_is_inserted_anyway() {
     // No foreign key: a relation may arrive before either entity it names.
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let record: EntityRelationSyncRecord = serde_json::from_value(json!({
         "id": entity_relation_id("ghost-subject", "knows", "ghost-object"),
         "subject_entity_id": "ghost-subject",
@@ -270,48 +264,42 @@ fn entity_relation_referencing_unknown_entities_is_inserted_anyway() {
     }))
     .unwrap();
 
-    assert!(upsert_entity_relation_record(&conn, &record).is_ok());
-    let count: i64 = conn
-        .query_row("SELECT count(*) FROM entity_relations", [], |r| r.get(0))
-        .unwrap();
+    assert!(upsert_entity_relation_record(&store, &record).is_ok());
+    let count: i64 = testing::count(&store, Table::EntityRelations).unwrap();
     assert_eq!(count, 1, "the dangling relation is stored, not rejected");
 }
 
 #[test]
 fn link_insert_or_ignore_is_idempotent_and_returns_the_composite_wire_id() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let record = LinkSyncRecord {
         memory_id: "mem-1".to_string(),
         entity_id: "ent-1".to_string(),
         created_at: "2026-01-01T00:00:00+00:00".to_string(),
     };
 
-    let wire_id_1 = upsert_link_record(&conn, &record).unwrap();
-    let wire_id_2 = upsert_link_record(&conn, &record).unwrap();
+    let wire_id_1 = upsert_link_record(&store, &record).unwrap();
+    let wire_id_2 = upsert_link_record(&store, &record).unwrap();
 
     assert_eq!(wire_id_1, "mem-1|ent-1");
     assert_eq!(wire_id_2, "mem-1|ent-1");
-    let count: i64 = conn
-        .query_row("SELECT count(*) FROM memory_entities", [], |r| r.get(0))
-        .unwrap();
+    let count: i64 = testing::count(&store, Table::MemoryEntities).unwrap();
     assert_eq!(count, 1);
 }
 
 #[test]
 fn a_link_referencing_an_unknown_memory_or_entity_is_inserted_anyway() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let record = LinkSyncRecord {
         memory_id: "mem-ghost".to_string(),
         entity_id: "ent-ghost".to_string(),
         created_at: "2026-01-01T00:00:00+00:00".to_string(),
     };
 
-    assert!(upsert_link_record(&conn, &record).is_ok());
-    let count: i64 = conn
-        .query_row("SELECT count(*) FROM memory_entities", [], |r| r.get(0))
-        .unwrap();
+    assert!(upsert_link_record(&store, &record).is_ok());
+    let count: i64 = testing::count(&store, Table::MemoryEntities).unwrap();
     assert_eq!(
         count, 1,
         "no FK -- the dangling link waits, it does not error"
@@ -325,7 +313,7 @@ fn a_link_referencing_an_unknown_memory_or_entity_is_inserted_anyway() {
 #[test]
 fn apply_incoming_record_dispatches_a_memory_record_when_record_type_is_absent() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let raw = json!({
         "id": "mem_absent_type",
         "content": "no record_type key at all",
@@ -333,15 +321,11 @@ fn apply_incoming_record_dispatches_a_memory_record_when_record_type_is_absent()
         "updated_at": "2026-01-01T00:00:00+00:00",
     });
 
-    let wire_id = apply_incoming_record(&conn, &raw).unwrap();
+    let wire_id = apply_incoming_record(&store, &raw).unwrap();
 
     assert_eq!(wire_id, "mem_absent_type");
-    let content: String = conn
-        .query_row(
-            "SELECT content FROM memories WHERE id = 'mem_absent_type'",
-            [],
-            |r| r.get(0),
-        )
+    let content = testing::memory_text(&store, "mem_absent_type", "content")
+        .unwrap()
         .unwrap();
     assert_eq!(content, "no record_type key at all");
 }
@@ -349,51 +333,47 @@ fn apply_incoming_record_dispatches_a_memory_record_when_record_type_is_absent()
 #[test]
 fn apply_incoming_record_dispatches_each_graph_record_type() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
     let entity_raw = json!({
         "record_type": "entity", "id": entity_id("Dispatch Test"), "name": "Dispatch Test",
         "created_at": "2026-01-01T00:00:00+00:00", "updated_at": "2026-01-01T00:00:00+00:00",
     });
-    apply_incoming_record(&conn, &entity_raw).unwrap();
-    assert!(entity_row(&conn, &entity_id("Dispatch Test")).is_some());
+    apply_incoming_record(&store, &entity_raw).unwrap();
+    assert!(entity_row(&store, &entity_id("Dispatch Test")).is_some());
 
     let relation_raw = json!({
         "record_type": "entity_relation", "id": entity_relation_id("s", "r", "o"),
         "subject_entity_id": "s", "relation": "r", "object_entity_id": "o",
         "created_at": "2026-01-01T00:00:00+00:00", "updated_at": "2026-01-01T00:00:00+00:00",
     });
-    apply_incoming_record(&conn, &relation_raw).unwrap();
-    let relation_count: i64 = conn
-        .query_row("SELECT count(*) FROM entity_relations", [], |r| r.get(0))
-        .unwrap();
+    apply_incoming_record(&store, &relation_raw).unwrap();
+    let relation_count: i64 = testing::count(&store, Table::EntityRelations).unwrap();
     assert_eq!(relation_count, 1);
 
     let link_raw = json!({ "record_type": "memory_entity", "memory_id": "m1", "entity_id": "e1", "created_at": "2026-01-01T00:00:00+00:00" });
-    let wire_id = apply_incoming_record(&conn, &link_raw).unwrap();
+    let wire_id = apply_incoming_record(&store, &link_raw).unwrap();
     assert_eq!(wire_id, "m1|e1");
 }
 
 #[test]
 fn apply_incoming_record_refuses_an_unknown_record_type() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let raw = json!({ "record_type": "something_new", "id": "x" });
 
-    assert!(apply_incoming_record(&conn, &raw).is_err());
+    assert!(apply_incoming_record(&store, &raw).is_err());
 }
 
 // ---------------------------------------------------------------------------
 // Outbox triggers actually fire for the graph tables
 // ---------------------------------------------------------------------------
 
-fn outbox_record_types(conn: &Connection) -> Vec<String> {
-    let mut stmt = conn
-        .prepare("SELECT payload FROM sync_outbox ORDER BY id")
-        .unwrap();
-    stmt.query_map([], |r| r.get::<_, String>(0))
+fn outbox_record_types(store: &Store<'_>) -> Vec<String> {
+    testing::outbox_rows(store)
         .unwrap()
-        .map(|r| r.unwrap())
+        .into_iter()
+        .map(|row| row.payload)
         .map(|payload| {
             let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
             parsed
@@ -410,9 +390,9 @@ fn creating_an_entity_queues_a_tagged_outbox_row() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     enable_sync("node-a");
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     entity::upsert_entity(
-        &conn,
+        &store,
         &EntityInput {
             name: "Quokka".to_string(),
             kind: None,
@@ -421,7 +401,7 @@ fn creating_an_entity_queues_a_tagged_outbox_row() {
     )
     .unwrap();
 
-    assert_eq!(outbox_record_types(&conn), vec!["entity"]);
+    assert_eq!(outbox_record_types(&store), vec!["entity"]);
     disable_sync();
 }
 
@@ -430,9 +410,9 @@ fn creating_a_relation_and_a_link_each_queue_their_own_tagged_outbox_row() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     enable_sync("node-a");
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     entity::upsert_entity(
-        &conn,
+        &store,
         &EntityInput {
             name: "A".to_string(),
             kind: None,
@@ -441,7 +421,7 @@ fn creating_a_relation_and_a_link_each_queue_their_own_tagged_outbox_row() {
     )
     .unwrap();
     entity::upsert_entity(
-        &conn,
+        &store,
         &EntityInput {
             name: "B".to_string(),
             kind: None,
@@ -449,10 +429,10 @@ fn creating_a_relation_and_a_link_each_queue_their_own_tagged_outbox_row() {
         },
     )
     .unwrap();
-    entity::upsert_entity_relation(&conn, &entity_id("A"), "knows", &entity_id("B")).unwrap();
-    entity::link_memory_entity(&conn, "mem_x", &entity_id("A")).unwrap();
+    entity::upsert_entity_relation(&store, &entity_id("A"), "knows", &entity_id("B")).unwrap();
+    entity::link_memory_entity(&store, "mem_x", &entity_id("A")).unwrap();
 
-    let types = outbox_record_types(&conn);
+    let types = outbox_record_types(&store);
     assert!(types.contains(&"entity_relation".to_string()));
     assert!(types.contains(&"memory_entity".to_string()));
     disable_sync();
@@ -470,7 +450,7 @@ fn push_outbox_delivers_entities_relations_and_links_to_a_real_hub_in_one_pass()
     enable_sync("local-node");
     let hub = MockNode::start("hub-node", SECRET);
     let local_db = Database::open_in_memory().unwrap();
-    let local_conn = local_db.conn();
+    let local_conn = local_db.store();
 
     let a = entity::upsert_entity(
         &local_conn,
@@ -499,16 +479,10 @@ fn push_outbox_delivers_entities_relations_and_links_to_a_real_hub_in_one_pass()
         "one entity insert x2, one relation, one link -- pushed together"
     );
 
-    let hub_conn = hub.db.conn();
-    let hub_entities: i64 = hub_conn
-        .query_row("SELECT count(*) FROM entities", [], |r| r.get(0))
-        .unwrap();
-    let hub_relations: i64 = hub_conn
-        .query_row("SELECT count(*) FROM entity_relations", [], |r| r.get(0))
-        .unwrap();
-    let hub_links: i64 = hub_conn
-        .query_row("SELECT count(*) FROM memory_entities", [], |r| r.get(0))
-        .unwrap();
+    let hub_conn = hub.db.store();
+    let hub_entities: i64 = testing::count(&hub_conn, Table::Entities).unwrap();
+    let hub_relations: i64 = testing::count(&hub_conn, Table::EntityRelations).unwrap();
+    let hub_links: i64 = testing::count(&hub_conn, Table::MemoryEntities).unwrap();
     assert_eq!(hub_entities, 2);
     assert_eq!(hub_relations, 1);
     assert_eq!(hub_links, 1);
@@ -528,7 +502,7 @@ fn pull_entities_applies_the_hubs_entities_and_persists_a_namespaced_cursor() {
     disable_sync();
     let hub = MockNode::start("hub-node", SECRET);
     {
-        let hub_conn = hub.db.conn();
+        let hub_conn = hub.db.store();
         entity::upsert_entity(
             &hub_conn,
             &EntityInput {
@@ -540,19 +514,18 @@ fn pull_entities_applies_the_hubs_entities_and_persists_a_namespaced_cursor() {
         .unwrap();
     }
     let local_db = Database::open_in_memory().unwrap();
-    let local_conn = local_db.conn();
+    let local_conn = local_db.store();
 
     let report = pull_entities(&local_conn, &hub.url, SECRET, "local-node", "hub").unwrap();
 
     assert_eq!(report.applied, 1);
     assert!(entity_row(&local_conn, &entity_id("Hub Entity")).is_some());
-    let cursor_rows: i64 = local_conn
-        .query_row(
-            "SELECT count(*) FROM sync_log WHERE remote_id = 'hub#entities'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let cursor_rows = usize::from(
+        SyncState::new(&local_conn)
+            .remote_row("hub#entities")
+            .unwrap()
+            .is_some(),
+    );
     assert_eq!(
         cursor_rows, 1,
         "the entities cursor is namespaced separately from the bare memories cursor"
@@ -567,12 +540,12 @@ fn pull_links_and_pull_entity_relations_apply_the_hubs_graph_rows() {
     disable_sync();
     let hub = MockNode::start("hub-node", SECRET);
     {
-        let hub_conn = hub.db.conn();
+        let hub_conn = hub.db.store();
         entity::upsert_entity_relation(&hub_conn, "s1", "works_with", "o1").unwrap();
         entity::link_memory_entity(&hub_conn, "mem_hub", "ent_hub").unwrap();
     }
     let local_db = Database::open_in_memory().unwrap();
-    let local_conn = local_db.conn();
+    let local_conn = local_db.store();
 
     let relations_report =
         pull_entity_relations(&local_conn, &hub.url, SECRET, "local-node", "hub").unwrap();
@@ -580,12 +553,8 @@ fn pull_links_and_pull_entity_relations_apply_the_hubs_graph_rows() {
 
     assert_eq!(relations_report.applied, 1);
     assert_eq!(links_report.applied, 1);
-    let relations: i64 = local_conn
-        .query_row("SELECT count(*) FROM entity_relations", [], |r| r.get(0))
-        .unwrap();
-    let links: i64 = local_conn
-        .query_row("SELECT count(*) FROM memory_entities", [], |r| r.get(0))
-        .unwrap();
+    let relations: i64 = testing::count(&local_conn, Table::EntityRelations).unwrap();
+    let links: i64 = testing::count(&local_conn, Table::MemoryEntities).unwrap();
     assert_eq!(relations, 1);
     assert_eq!(links, 1);
 }
@@ -596,7 +565,7 @@ fn a_two_node_entity_round_trip_converges_on_the_union_of_aliases() {
     enable_sync("node-a");
     let hub = MockNode::start("hub-node", SECRET);
     let node_a = Database::open_in_memory().unwrap();
-    let node_a_conn = node_a.conn();
+    let node_a_conn = node_a.store();
     entity::upsert_entity(
         &node_a_conn,
         &EntityInput {
@@ -609,7 +578,7 @@ fn a_two_node_entity_round_trip_converges_on_the_union_of_aliases() {
     push_outbox(&node_a_conn, &hub.url, SECRET, "node-a", "hub").unwrap();
 
     let node_b = Database::open_in_memory().unwrap();
-    let node_b_conn = node_b.conn();
+    let node_b_conn = node_b.store();
     entity::upsert_entity(
         &node_b_conn,
         &EntityInput {
@@ -657,7 +626,7 @@ fn pull_entities_tolerates_a_404_from_a_peer_that_predates_graph_sync() {
 
     let db = Database::open_in_memory().unwrap();
     let report = pull_entities(
-        &db.conn(),
+        &db.store(),
         &format!("http://127.0.0.1:{port}"),
         SECRET,
         "local-node",
@@ -667,14 +636,12 @@ fn pull_entities_tolerates_a_404_from_a_peer_that_predates_graph_sync() {
 
     assert_eq!(report.applied, 0);
     assert_eq!(report.pages, 0);
-    let cursor_rows: i64 = db
-        .conn()
-        .query_row(
-            "SELECT count(*) FROM sync_log WHERE remote_id = 'old-peer#entities'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let cursor_rows = usize::from(
+        SyncState::new(&db.store())
+            .remote_row("old-peer#entities")
+            .unwrap()
+            .is_some(),
+    );
     assert_eq!(
         cursor_rows, 0,
         "no cursor is written for a 404 -- there was nothing real to record"

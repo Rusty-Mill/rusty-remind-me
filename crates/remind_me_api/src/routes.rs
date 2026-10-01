@@ -11,6 +11,7 @@
 
 use crate::http::{Body, Request};
 use remind_me_core::db::queries;
+use remind_me_core::db::Store;
 use remind_me_core::entity::{entity_profile, list_entities, traverse_from_name};
 use remind_me_core::import_paths::{self, ImportPathError};
 use remind_me_core::status::SubsystemStatus;
@@ -23,13 +24,12 @@ use remind_me_core::{
     SearchPageInput, SetReminderInput, SetReminderOutcome, UpdateOutcome, BULK_IDS_MAX,
     LIST_LIMIT_MAX, LIST_LIMIT_MIN, REMINDER_LIMIT_MAX, REMINDER_LIMIT_MIN,
 };
-use rusqlite::Connection;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::Path;
 
 pub type Params = HashMap<String, String>;
-pub type Handler = fn(&Connection, &Wiki, &Request, &Params) -> (u16, Body);
+pub type Handler = fn(&Store<'_>, &Wiki, &Request, &Params) -> (u16, Body);
 
 pub struct Route {
     pub methods: &'static [&'static str],
@@ -73,7 +73,7 @@ fn int_query(request: &Request, name: &str, default: usize) -> Result<usize, (u1
 /// Unauthenticated liveness probe. Reveals no data — always public, even when
 /// `REMIND_ME_API_KEY` is set, matching the reference's own rationale: a
 /// health check has to work whether or not auth is configured.
-pub fn health(_conn: &Connection, _wiki: &Wiki, _req: &Request, _params: &Params) -> (u16, Body) {
+pub fn health(_conn: &Store<'_>, _wiki: &Wiki, _req: &Request, _params: &Params) -> (u16, Body) {
     // The version rides on `/health` rather than only on `/api/versions`
     // because this route is unauthenticated, and the reference is explicit
     // about why that matters: a wrong or missing API key is exactly the
@@ -92,7 +92,7 @@ pub fn health(_conn: &Connection, _wiki: &Wiki, _req: &Request, _params: &Params
 /// a chart plots directly. Empty until the first capture — a new install has
 /// no history, which is different from a flat one.
 pub fn api_analytics_trend(
-    conn: &Connection,
+    store: &Store<'_>,
     _wiki: &Wiki,
     _req: &Request,
     _params: &Params,
@@ -102,9 +102,9 @@ pub fn api_analytics_trend(
     // background task happens to be running would be empty on exactly the
     // installs most likely to look at it. Idempotent per day, so a page
     // refresh costs one indexed lookup.
-    let _ = remind_me_core::analytics::capture_snapshot(conn);
+    let _ = remind_me_core::analytics::capture_snapshot(store);
 
-    match remind_me_core::analytics::trend(conn) {
+    match remind_me_core::analytics::trend(store) {
         Ok(snapshots) => ok(json!({ "snapshots": snapshots })),
         Err(e) => err(500, format!("analytics trend failed: {}", e)),
     }
@@ -122,7 +122,7 @@ pub fn api_analytics_trend(
 /// error, so the dashboard omits a line instead of rendering a failure into
 /// its own chrome.
 pub fn api_versions(
-    _conn: &Connection,
+    _conn: &Store<'_>,
     _wiki: &Wiki,
     _req: &Request,
     _params: &Params,
@@ -227,12 +227,7 @@ fn dashboard_html() -> String {
 /// Serve the dashboard as a single-page app — the reference's own
 /// `Route("/", index)`, part of the same routes/middleware set as `/api/*`
 /// (this crate's `ROUTES` table and CORS policy, not a separate server).
-pub fn dashboard(
-    _conn: &Connection,
-    _wiki: &Wiki,
-    _req: &Request,
-    _params: &Params,
-) -> (u16, Body) {
+pub fn dashboard(_conn: &Store<'_>, _wiki: &Wiki, _req: &Request, _params: &Params) -> (u16, Body) {
     (
         200,
         Body::Raw {
@@ -251,8 +246,8 @@ pub fn dashboard(
 /// the dashboard header, sidebar total, and "Unique Tags" card reading `0`
 /// via their JS `||0` fallbacks (`stats.total`/`stats.tags` were absent, not
 /// wrong), with nothing erroring to surface it.
-pub fn api_stats(conn: &Connection, _wiki: &Wiki, _req: &Request, _params: &Params) -> (u16, Body) {
-    match stats::collect_dashboard(conn) {
+pub fn api_stats(store: &Store<'_>, _wiki: &Wiki, _req: &Request, _params: &Params) -> (u16, Body) {
+    match stats::collect_dashboard(store) {
         Ok(s) => ok(s),
         Err(e) => internal_err(e),
     }
@@ -260,12 +255,12 @@ pub fn api_stats(conn: &Connection, _wiki: &Wiki, _req: &Request, _params: &Para
 
 /// `vitality::build_vitality_report`, shared with `remind_me_vitality_report`.
 pub fn api_vitality(
-    conn: &Connection,
+    store: &Store<'_>,
     _wiki: &Wiki,
     _req: &Request,
     _params: &Params,
 ) -> (u16, Body) {
-    match vitality::build_vitality_report(conn) {
+    match vitality::build_vitality_report(store) {
         Ok(report) => ok(report),
         Err(e) => internal_err(e),
     }
@@ -278,7 +273,7 @@ pub fn api_vitality(
 /// `queries::list_memories`, reused verbatim — so this route's `limit` cap is
 /// this crate's existing [`LIST_LIMIT_MAX`] (100), not the reference's 200:
 /// one core function, one bound, across MCP and HTTP.
-pub fn api_list(conn: &Connection, _wiki: &Wiki, req: &Request, _params: &Params) -> (u16, Body) {
+pub fn api_list(store: &Store<'_>, _wiki: &Wiki, req: &Request, _params: &Params) -> (u16, Body) {
     let limit = match int_query(req, "limit", 20) {
         Ok(v) => v,
         Err(e) => return e,
@@ -301,7 +296,7 @@ pub fn api_list(conn: &Connection, _wiki: &Wiki, req: &Request, _params: &Params
         offset,
         response_format: Default::default(),
     };
-    match queries::list_memories(conn, &input) {
+    match queries::list_memories(store, &input) {
         Ok(result) => {
             let has_more = result.total > result.offset + result.memories.len();
             ok(json!({
@@ -318,7 +313,7 @@ pub fn api_list(conn: &Connection, _wiki: &Wiki, req: &Request, _params: &Params
 }
 
 /// `queries::add_memory`, reused verbatim.
-pub fn api_add(conn: &Connection, _wiki: &Wiki, req: &Request, _params: &Params) -> (u16, Body) {
+pub fn api_add(store: &Store<'_>, _wiki: &Wiki, req: &Request, _params: &Params) -> (u16, Body) {
     let body = match json_body(req) {
         Ok(b) => b,
         Err(e) => return e,
@@ -361,7 +356,7 @@ pub fn api_add(conn: &Connection, _wiki: &Wiki, req: &Request, _params: &Params)
         object: None,
         entities: Vec::new(),
     };
-    match queries::add_memory(conn, input) {
+    match queries::add_memory(store, input) {
         Ok(memory) => (
             201,
             Body::Json(serde_json::to_value(memory).unwrap_or(json!({}))),
@@ -376,7 +371,7 @@ pub fn api_add(conn: &Connection, _wiki: &Wiki, req: &Request, _params: &Params)
 /// separate, still-open gap; the extraction itself,
 /// [`remind_me_core::fts::extract_entity_token`], is written to be shared
 /// once that lands, rather than reimplemented a second time here).
-pub fn api_search(conn: &Connection, _wiki: &Wiki, req: &Request, _params: &Params) -> (u16, Body) {
+pub fn api_search(store: &Store<'_>, _wiki: &Wiki, req: &Request, _params: &Params) -> (u16, Body) {
     let raw_query = req.query_str("q").unwrap_or("").trim();
     if raw_query.is_empty() {
         return err(400, "Missing 'q' parameter");
@@ -399,15 +394,15 @@ pub fn api_search(conn: &Connection, _wiki: &Wiki, req: &Request, _params: &Para
         limit,
         offset,
     };
-    match queries::search_paginated(conn, &input) {
+    match queries::search_paginated(store, &input) {
         Ok(result) => ok(result),
         Err(e) => internal_err(e),
     }
 }
 
-pub fn api_get(conn: &Connection, _wiki: &Wiki, _req: &Request, params: &Params) -> (u16, Body) {
+pub fn api_get(store: &Store<'_>, _wiki: &Wiki, _req: &Request, params: &Params) -> (u16, Body) {
     let id = &params["memory_id"];
-    match queries::get_memory_by_id(conn, id) {
+    match queries::get_memory_by_id(store, id) {
         Ok(Some(memory)) => ok(memory),
         Ok(None) => err(404, "Not found"),
         Err(e) => internal_err(e),
@@ -415,7 +410,7 @@ pub fn api_get(conn: &Connection, _wiki: &Wiki, _req: &Request, params: &Params)
 }
 
 /// `queries::update_memory`, reused verbatim.
-pub fn api_update(conn: &Connection, _wiki: &Wiki, req: &Request, params: &Params) -> (u16, Body) {
+pub fn api_update(store: &Store<'_>, _wiki: &Wiki, req: &Request, params: &Params) -> (u16, Body) {
     let id = params["memory_id"].clone();
     let body = match json_body(req) {
         Ok(b) => b,
@@ -447,7 +442,7 @@ pub fn api_update(conn: &Connection, _wiki: &Wiki, req: &Request, params: &Param
         }),
         metadata: body.get("metadata").cloned(),
     };
-    match queries::update_memory(conn, &input) {
+    match queries::update_memory(store, &input) {
         Ok(UpdateOutcome::Updated(memory)) => ok(*memory),
         Ok(UpdateOutcome::NotFound) => err(404, "Not found"),
         Ok(UpdateOutcome::NoFields) => err(400, "No fields to update"),
@@ -458,9 +453,9 @@ pub fn api_update(conn: &Connection, _wiki: &Wiki, req: &Request, params: &Param
 /// `queries::delete_memory`, reused verbatim. A hard delete — this crate has
 /// no sync layer to tombstone for, matching how `delete_memory` already
 /// behaves for the MCP tool.
-pub fn api_delete(conn: &Connection, _wiki: &Wiki, _req: &Request, params: &Params) -> (u16, Body) {
+pub fn api_delete(store: &Store<'_>, _wiki: &Wiki, _req: &Request, params: &Params) -> (u16, Body) {
     let id = &params["memory_id"];
-    match queries::delete_memory(conn, id) {
+    match queries::delete_memory(store, id) {
         Ok(true) => ok(json!({ "deleted": id })),
         Ok(false) => err(404, "Not found"),
         Err(e) => internal_err(e),
@@ -497,7 +492,7 @@ fn bulk_ids(body: &Value) -> Result<Vec<String>, (u16, Body)> {
 }
 
 pub fn api_bulk_delete(
-    conn: &Connection,
+    store: &Store<'_>,
     _wiki: &Wiki,
     req: &Request,
     _params: &Params,
@@ -510,14 +505,14 @@ pub fn api_bulk_delete(
         Ok(ids) => ids,
         Err(e) => return e,
     };
-    match queries::bulk_delete(conn, &ids) {
+    match queries::bulk_delete(store, &ids) {
         Ok(result) => ok(result),
         Err(e) => internal_err(e),
     }
 }
 
 pub fn api_bulk_tag(
-    conn: &Connection,
+    store: &Store<'_>,
     _wiki: &Wiki,
     req: &Request,
     _params: &Params,
@@ -552,7 +547,7 @@ pub fn api_bulk_tag(
     };
 
     match queries::bulk_tag(
-        conn,
+        store,
         &BulkTagInput {
             ids,
             tags: tag_strings,
@@ -570,7 +565,7 @@ pub fn api_bulk_tag(
 /// (`_MAX_BULK_IDS`), and this mirrors that rather than reusing the
 /// MCP-specific constant for an unrelated surface.
 pub fn api_bulk_reclassify(
-    conn: &Connection,
+    store: &Store<'_>,
     _wiki: &Wiki,
     req: &Request,
     _params: &Params,
@@ -600,7 +595,7 @@ pub fn api_bulk_reclassify(
             );
         }
     }
-    match queries::reclassify_memories(conn, &input) {
+    match queries::reclassify_memories(store, &input) {
         Ok(result) => ok(result),
         Err(e) => internal_err(e),
     }
@@ -610,7 +605,7 @@ pub fn api_bulk_reclassify(
 // Entities
 // ---------------------------------------------------------------------------
 
-pub fn api_entity(conn: &Connection, _wiki: &Wiki, req: &Request, _params: &Params) -> (u16, Body) {
+pub fn api_entity(store: &Store<'_>, _wiki: &Wiki, req: &Request, _params: &Params) -> (u16, Body) {
     let name = req.query_str("name").unwrap_or("").trim();
     if name.is_empty() {
         return err(400, "Missing 'name' parameter");
@@ -619,7 +614,7 @@ pub fn api_entity(conn: &Connection, _wiki: &Wiki, req: &Request, _params: &Para
         Ok(v) => v.min(100),
         Err(e) => return e,
     };
-    match entity_profile(conn, name, limit) {
+    match entity_profile(store, name, limit) {
         Ok(Some(profile)) => ok(profile),
         Ok(None) => err(404, format!("No entity found matching {:?}", name)),
         Err(e) => internal_err(e),
@@ -627,7 +622,7 @@ pub fn api_entity(conn: &Connection, _wiki: &Wiki, req: &Request, _params: &Para
 }
 
 pub fn api_entities(
-    conn: &Connection,
+    store: &Store<'_>,
     _wiki: &Wiki,
     req: &Request,
     _params: &Params,
@@ -640,7 +635,7 @@ pub fn api_entities(
         Ok(v) => v,
         Err(e) => return e,
     };
-    match list_entities(conn, limit, offset) {
+    match list_entities(store, limit, offset) {
         Ok(page) => ok(page),
         Err(e) => internal_err(e),
     }
@@ -650,7 +645,7 @@ pub fn api_entities(
 /// the reference explicitly notes its own traversal helper is shared the
 /// same way, and this crate has had one function for both since #16.
 pub fn api_entity_traverse(
-    conn: &Connection,
+    store: &Store<'_>,
     _wiki: &Wiki,
     req: &Request,
     _params: &Params,
@@ -675,7 +670,7 @@ pub fn api_entity_traverse(
         relation,
         cap,
     };
-    match traverse_from_name(conn, &input) {
+    match traverse_from_name(store, &input) {
         Ok(result) if !result.found => err(404, result.message.unwrap_or_default()),
         Ok(result) => ok(result),
         Err(e) => internal_err(e),
@@ -691,7 +686,7 @@ pub fn api_entity_traverse(
 /// probes the path only to decide which of [`importer::import_chat`] /
 /// [`importer::import_directory`] to call, and both of those run the real,
 /// authoritative containment check themselves before touching anything.
-pub fn api_import(conn: &Connection, _wiki: &Wiki, req: &Request, _params: &Params) -> (u16, Body) {
+pub fn api_import(store: &Store<'_>, _wiki: &Wiki, req: &Request, _params: &Params) -> (u16, Body) {
     let chat_input: ChatImportInput = match parsed_body(req) {
         Ok(i) => i,
         Err(e) => return e,
@@ -719,12 +714,12 @@ pub fn api_import(conn: &Connection, _wiki: &Wiki, req: &Request, _params: &Para
             recursive: true,
             kind: chat_input.kind,
         };
-        match importer::import_directory(conn, &dir_input) {
+        match importer::import_directory(store, &dir_input) {
             Ok(summary) => ok(summary),
             Err(e) => internal_err(e),
         }
     } else {
-        match importer::import_chat(conn, &chat_input) {
+        match importer::import_chat(store, &chat_input) {
             Ok(outcome) => ok(outcome),
             Err(e) => internal_err(e),
         }
@@ -738,7 +733,7 @@ pub fn api_import(conn: &Connection, _wiki: &Wiki, req: &Request, _params: &Para
 /// matching the reference exactly, which does the same for the same reason:
 /// the inline case returns the export's own bytes as the response body, not
 /// a JSON-wrapped summary.
-pub fn api_export(conn: &Connection, _wiki: &Wiki, req: &Request, _params: &Params) -> (u16, Body) {
+pub fn api_export(store: &Store<'_>, _wiki: &Wiki, req: &Request, _params: &Params) -> (u16, Body) {
     let format = match req.query_str("format").unwrap_or("json") {
         "json" => ExportFormat::Json,
         "jsonl" => ExportFormat::Jsonl,
@@ -768,12 +763,12 @@ pub fn api_export(conn: &Connection, _wiki: &Wiki, req: &Request, _params: &Para
     };
 
     if file_path.is_some() {
-        match export::export_memories(conn, &input) {
+        match export::export_memories(store, &input) {
             Ok(result) => ok(result),
             Err(e) => err(400, e.to_string()),
         }
     } else {
-        match export::collect_export_records(conn, &input) {
+        match export::collect_export_records(store, &input) {
             Ok(records) => {
                 let payload = export::render_export(&records, format);
                 let content_type = match format {
@@ -824,35 +819,35 @@ pub fn api_export(conn: &Connection, _wiki: &Wiki, req: &Request, _params: &Para
 // odds with the pages it claims to list.
 
 pub fn api_wiki_pages(
-    conn: &Connection,
+    store: &Store<'_>,
     wiki: &Wiki,
     _req: &Request,
     _params: &Params,
 ) -> (u16, Body) {
-    match wiki.list_pages(conn) {
+    match wiki.list_pages(store) {
         Ok(pages) => ok(json!({ "count": pages.len(), "pages": pages })),
         Err(e) => internal_err(e),
     }
 }
 
 pub fn api_wiki_status(
-    conn: &Connection,
+    store: &Store<'_>,
     wiki: &Wiki,
     _req: &Request,
     _params: &Params,
 ) -> (u16, Body) {
-    let pages = match wiki.list_pages(conn) {
+    let pages = match wiki.list_pages(store) {
         Ok(pages) => pages.len(),
         Err(e) => return internal_err(e),
     };
-    match pending_compile_count(conn) {
+    match pending_compile_count(store) {
         Ok(pending) => ok(json!({ "pages": pages, "pending_compile": pending })),
         Err(e) => internal_err(e),
     }
 }
 
 pub fn api_wiki_search(
-    conn: &Connection,
+    store: &Store<'_>,
     wiki: &Wiki,
     req: &Request,
     _params: &Params,
@@ -872,14 +867,14 @@ pub fn api_wiki_search(
         ),
         Err(e) => return e,
     };
-    match wiki.search_pages(conn, query, limit) {
+    match wiki.search_pages(store, query, limit) {
         Ok(results) => ok(json!({ "count": results.len(), "results": results })),
         Err(e) => internal_err(e),
     }
 }
 
 pub fn api_wiki_load(
-    conn: &Connection,
+    store: &Store<'_>,
     wiki: &Wiki,
     req: &Request,
     _params: &Params,
@@ -889,20 +884,20 @@ pub fn api_wiki_load(
         Err(e) => return e,
     };
     let include_index = req.query_bool_default_true("include_index");
-    match wiki.load(conn, token_budget, include_index) {
+    match wiki.load(store, token_budget, include_index) {
         Ok(loaded) => ok(loaded),
         Err(e) => internal_err(e),
     }
 }
 
 pub fn api_wiki_page(
-    conn: &Connection,
+    store: &Store<'_>,
     wiki: &Wiki,
     _req: &Request,
     params: &Params,
 ) -> (u16, Body) {
     let slug = &params["slug"];
-    match wiki.read_page(conn, slug) {
+    match wiki.read_page(store, slug) {
         Ok(Some(page)) => ok(page),
         Ok(None) => err(404, format!("Wiki page not found: {:?}", slug)),
         Err(e) => internal_err(e),
@@ -938,7 +933,7 @@ const WIKI_LOG_NOTE_MAX: usize = 500;
 /// place when the slug already exists, so the status cannot promise creation.
 /// The `created` flag in the body says which happened.
 pub fn api_wiki_write(
-    conn: &Connection,
+    store: &Store<'_>,
     wiki: &Wiki,
     req: &Request,
     _params: &Params,
@@ -986,7 +981,7 @@ pub fn api_wiki_write(
         );
     }
 
-    match wiki.write_page(conn, title, content, log_note) {
+    match wiki.write_page(store, title, content, log_note) {
         Ok(Ok(outcome)) => ok(outcome),
         // 403, not 400: the request is well-formed and the page is real, it is
         // simply not the caller's to write. `index`/`log`/`schema` are
@@ -1009,13 +1004,13 @@ pub fn api_wiki_write(
 /// puts a confirmation in front of it. Addressed by title *or* slug, since
 /// `slugify` is idempotent over a slug.
 pub fn api_wiki_delete(
-    conn: &Connection,
+    store: &Store<'_>,
     wiki: &Wiki,
     _req: &Request,
     params: &Params,
 ) -> (u16, Body) {
     let slug = &params["slug"];
-    match wiki.delete_page(conn, slug) {
+    match wiki.delete_page(store, slug) {
         Ok(core::WikiDeleteOutcome::Deleted) => ok(json!({ "deleted": slug })),
         Ok(core::WikiDeleteOutcome::NotFound) => {
             err(404, format!("Wiki page not found: {:?}", slug))
@@ -1052,7 +1047,7 @@ pub fn api_wiki_delete(
 /// which is the correct side to err on for something that quotes raw memory
 /// content back.
 pub fn api_wiki_compile(
-    conn: &Connection,
+    store: &Store<'_>,
     wiki: &Wiki,
     req: &Request,
     _params: &Params,
@@ -1082,7 +1077,7 @@ pub fn api_wiki_compile(
         },
     };
 
-    match wiki.compile(conn, limit, mark_integrated) {
+    match wiki.compile(store, limit, mark_integrated) {
         Ok(outcome) => ok(outcome),
         Err(e) => internal_err(e),
     }
@@ -1094,7 +1089,7 @@ pub fn api_wiki_compile(
 /// is the document that says how pages are supposed to be written, so an
 /// editor wants it next to the editor, not buried in a status payload.
 pub fn api_wiki_schema(
-    _conn: &Connection,
+    _conn: &Store<'_>,
     wiki: &Wiki,
     _req: &Request,
     _params: &Params,
@@ -1132,7 +1127,7 @@ pub fn api_wiki_schema(
 /// is refused rather than silently defaulted: a typo'd window that quietly
 /// answered "upcoming" would read as "no overdue reminders".
 pub fn api_reminders(
-    conn: &Connection,
+    store: &Store<'_>,
     _wiki: &Wiki,
     req: &Request,
     _params: &Params,
@@ -1155,7 +1150,7 @@ pub fn api_reminders(
         Ok(v) => (v as i64).clamp(REMINDER_LIMIT_MIN, REMINDER_LIMIT_MAX),
         Err(e) => return e,
     };
-    match remind_me_core::reminders::list_reminders(conn, when, limit) {
+    match remind_me_core::reminders::list_reminders(store, when, limit) {
         Ok(memories) => ok(json!({
             "count": memories.len(),
             "memories": memories,
@@ -1174,7 +1169,7 @@ pub fn api_reminders(
 /// timestamp that is unparseable or already past is 400. The body still
 /// carries the full `SetReminderOutcome`, so the reason survives.
 pub fn api_set_reminder(
-    conn: &Connection,
+    store: &Store<'_>,
     _wiki: &Wiki,
     req: &Request,
     _params: &Params,
@@ -1187,7 +1182,7 @@ pub fn api_set_reminder(
         return err(400, "'memory_id' is required");
     }
     match remind_me_core::reminders::set_reminder(
-        conn,
+        store,
         &input.memory_id,
         input.remind_at.as_deref(),
     ) {
@@ -1213,12 +1208,12 @@ pub fn api_set_reminder(
 /// this route deliberately adds none: a digest is the ambient surface that
 /// flag exists to keep things off, and a dashboard panel is more ambient than
 /// a tool call, not less.
-pub fn api_digest(conn: &Connection, _wiki: &Wiki, req: &Request, _params: &Params) -> (u16, Body) {
+pub fn api_digest(store: &Store<'_>, _wiki: &Wiki, req: &Request, _params: &Params) -> (u16, Body) {
     let since_days = match int_query(req, "since_days", digest::DEFAULT_SINCE_DAYS as usize) {
         Ok(v) => (v as i64).clamp(digest::DIGEST_SINCE_DAYS_MIN, digest::DIGEST_SINCE_DAYS_MAX),
         Err(e) => return e,
     };
-    match digest::build_digest(conn, since_days) {
+    match digest::build_digest(store, since_days) {
         Ok(data) => ok(data),
         Err(e) => internal_err(e),
     }
@@ -1242,12 +1237,12 @@ pub fn api_digest(conn: &Connection, _wiki: &Wiki, req: &Request, _params: &Para
 /// the probe would block until it timed out. The MCP tool is a different
 /// process and has no such problem.
 pub fn api_status(
-    conn: &Connection,
+    store: &Store<'_>,
     _wiki: &Wiki,
     _req: &Request,
     _params: &Params,
 ) -> (u16, Body) {
-    match remind_me_core::status::server_status(conn) {
+    match remind_me_core::status::server_status(store) {
         Ok(status) => {
             let mut report = serde_json::to_value(&status).unwrap_or(json!({}));
             report["dashboard"] =
@@ -1260,12 +1255,12 @@ pub fn api_status(
 
 /// `saved_searches::list_saved_searches`, reused verbatim.
 pub fn api_saved_searches(
-    conn: &Connection,
+    store: &Store<'_>,
     _wiki: &Wiki,
     _req: &Request,
     _params: &Params,
 ) -> (u16, Body) {
-    match saved_searches::list_saved_searches(conn) {
+    match saved_searches::list_saved_searches(store) {
         Ok(searches) => ok(json!({ "count": searches.len(), "saved_searches": searches })),
         Err(e) => internal_err(e),
     }
@@ -1278,7 +1273,7 @@ pub fn api_saved_searches(
 /// caller it created something when the same request may well have updated a
 /// row that was already there.
 pub fn api_save_search(
-    conn: &Connection,
+    store: &Store<'_>,
     _wiki: &Wiki,
     req: &Request,
     _params: &Params,
@@ -1290,7 +1285,7 @@ pub fn api_save_search(
     if input.name.trim().is_empty() || input.query.trim().is_empty() {
         return err(400, "'name' and 'query' are required");
     }
-    match saved_searches::save_search(conn, &input) {
+    match saved_searches::save_search(store, &input) {
         Ok(saved) => ok(saved),
         Err(e) => internal_err(e),
     }
@@ -1303,14 +1298,14 @@ pub fn api_save_search(
 /// query is a shorthand for that same search, and gating one but not the other
 /// would be a distinction without a difference.
 pub fn api_run_saved_search(
-    conn: &Connection,
+    store: &Store<'_>,
     _wiki: &Wiki,
     _req: &Request,
     params: &Params,
 ) -> (u16, Body) {
     let name = &params["name"];
-    match saved_searches::get_saved_search(conn, name) {
-        Ok(Some(saved)) => match saved_searches::run_saved_search(conn, &saved) {
+    match saved_searches::get_saved_search(store, name) {
+        Ok(Some(saved)) => match saved_searches::run_saved_search(store, &saved) {
             Ok(results) => ok(json!({
                 "name": saved.name,
                 "query": saved.query,
@@ -1327,13 +1322,13 @@ pub fn api_run_saved_search(
 /// `saved_searches::delete_saved_search`, reused verbatim — the stored search
 /// and the seen-memory rows its watch tracking accumulated.
 pub fn api_delete_saved_search(
-    conn: &Connection,
+    store: &Store<'_>,
     _wiki: &Wiki,
     _req: &Request,
     params: &Params,
 ) -> (u16, Body) {
     let name = &params["name"];
-    match saved_searches::delete_saved_search(conn, name) {
+    match saved_searches::delete_saved_search(store, name) {
         Ok(true) => ok(json!({ "deleted": name })),
         Ok(false) => err(404, format!("Saved search {:?} not found", name)),
         Err(e) => internal_err(e),
@@ -1576,7 +1571,7 @@ pub const ROUTES: &[Route] = &[
 /// Compared with [`constant_time_eq`] rather than `==`. The token is long and
 /// guessed a byte at a time by a timing oracle otherwise — the same reason
 /// this crate already compares the API key that way.
-pub fn api_reminders_ics(conn: &Connection, token: &str) -> (u16, Body) {
+pub fn api_reminders_ics(store: &Store<'_>, token: &str) -> (u16, Body) {
     let expected = remind_me_core::ics::resolve_ics_token();
     if !constant_time_eq(token.as_bytes(), expected.as_bytes()) {
         // Never log the supplied token: a rejected value is still a secret
@@ -1590,7 +1585,7 @@ pub fn api_reminders_ics(conn: &Connection, token: &str) -> (u16, Body) {
     // is on the calendar. Uncapped: a subscriber wants every reminder, not the
     // first page of them.
     match remind_me_core::reminders::list_reminders(
-        conn,
+        store,
         remind_me_core::models::ReminderWindow::All,
         i64::MAX,
     ) {
@@ -1630,7 +1625,7 @@ pub fn api_reminders_ics(conn: &Connection, token: &str) -> (u16, Body) {
 /// place the port accordingly, which is how self-hosted exporters are
 /// generally run.
 pub fn metrics(
-    conn: &Connection,
+    store: &Store<'_>,
     _: &Wiki,
     _: &Request,
     _: &HashMap<String, String>,
@@ -1642,11 +1637,7 @@ pub fn metrics(
     // Computed per scrape rather than shadowed as counters, so they cannot
     // drift from the tables they describe.
     let mut gauges = Vec::new();
-    if let Ok(total) = conn.query_row(
-        "SELECT COUNT(*) FROM memories WHERE deleted_at IS NULL",
-        [],
-        |r| r.get::<_, i64>(0),
-    ) {
+    if let Ok(total) = remind_me_core::db::stats::StoreStats::new(store).live_memories() {
         gauges.push(remind_me_core::metrics::GaugeSpec::new(
             "remind_me_memories_total",
             "Total non-deleted memories currently in the store.",
@@ -1654,11 +1645,7 @@ pub fn metrics(
         ));
     }
     if remind_me_core::sync::sync_enabled() {
-        if let Ok(pending) = conn.query_row(
-            "SELECT COUNT(*) FROM sync_outbox WHERE sent_at = ''",
-            [],
-            |r| r.get::<_, i64>(0),
-        ) {
+        if let Ok(pending) = remind_me_core::db::outbox::Outbox::new(store).unsent_count() {
             gauges.push(remind_me_core::metrics::GaugeSpec::new(
                 "remind_me_sync_outbox_pending",
                 "Sync outbox rows not yet acknowledged by the hub.",
@@ -1681,7 +1668,7 @@ pub fn metrics(
 /// Unauthenticated like `/` and `/health`: a browser fetches a `<link
 /// rel="manifest">` with no `Authorization` header, so requiring one would
 /// simply mean the manifest never loads. It carries no user data.
-pub fn manifest(_: &Connection, _: &Wiki, _: &Request, _: &HashMap<String, String>) -> (u16, Body) {
+pub fn manifest(_: &Store<'_>, _: &Wiki, _: &Request, _: &HashMap<String, String>) -> (u16, Body) {
     (
         200,
         Body::Raw {

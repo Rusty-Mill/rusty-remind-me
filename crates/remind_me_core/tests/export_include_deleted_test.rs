@@ -7,10 +7,10 @@
 //! these assertions exist to prevent.
 
 use remind_me_core::db::queries;
+use remind_me_core::db::Store;
 use remind_me_core::{entity, export, Database, ExportInput, MemoryAddInput};
-use rusqlite::Connection;
 
-fn add(conn: &Connection, content: &str, triple: Option<(&str, &str, &str)>) -> String {
+fn add(store: &Store<'_>, content: &str, triple: Option<(&str, &str, &str)>) -> String {
     let (subject, predicate, object) = match triple {
         Some((s, p, o)) => (
             Some(s.to_string()),
@@ -20,7 +20,7 @@ fn add(conn: &Connection, content: &str, triple: Option<(&str, &str, &str)>) -> 
         None => (None, None, None),
     };
     queries::add_memory(
-        conn,
+        store,
         MemoryAddInput {
             content: content.to_string(),
             category: "general".to_string(),
@@ -49,8 +49,8 @@ fn export_input(include_deleted: bool) -> ExportInput {
     }
 }
 
-fn exported_contents(conn: &Connection, include_deleted: bool) -> Vec<String> {
-    export::collect_export_records(conn, &export_input(include_deleted))
+fn exported_contents(store: &Store<'_>, include_deleted: bool) -> Vec<String> {
+    export::collect_export_records(store, &export_input(include_deleted))
         .expect("export")
         .iter()
         .filter_map(|r| {
@@ -62,19 +62,19 @@ fn exported_contents(conn: &Connection, include_deleted: bool) -> Vec<String> {
 }
 
 /// Supersede an older fact, returning the superseded memory's content.
-fn supersede(conn: &Connection) -> &'static str {
+fn supersede(store: &Store<'_>) -> &'static str {
     add(
-        conn,
+        store,
         "deploy target is staging",
         Some(("deploy", "target", "staging")),
     );
     let newer = add(
-        conn,
+        store,
         "deploy target is production",
         Some(("deploy", "target", "production")),
     );
     let hit = entity::supersede_contradicting_facts(
-        conn,
+        store,
         &newer,
         Some("deploy"),
         Some("target"),
@@ -91,11 +91,11 @@ fn supersede(conn: &Connection) -> &'static str {
 
 #[test]
 fn a_superseded_memory_is_excluded_by_default() {
-    let db = Database::open(":memory:").expect("db");
-    let conn = db.conn();
-    let stale = supersede(&conn);
+    let db = Database::open_on_sqlite(":memory:").expect("db");
+    let store = db.store();
+    let stale = supersede(&store);
 
-    let contents = exported_contents(&conn, false);
+    let contents = exported_contents(&store, false);
     assert!(
         !contents.iter().any(|c| c == stale),
         "a superseded memory must not be exported by default -- re-importing \
@@ -110,11 +110,11 @@ fn a_superseded_memory_is_excluded_by_default() {
 
 #[test]
 fn include_deleted_brings_the_superseded_memory_back() {
-    let db = Database::open(":memory:").expect("db");
-    let conn = db.conn();
-    let stale = supersede(&conn);
+    let db = Database::open_on_sqlite(":memory:").expect("db");
+    let store = db.store();
+    let stale = supersede(&store);
 
-    let contents = exported_contents(&conn, true);
+    let contents = exported_contents(&store, true);
     assert!(
         contents.iter().any(|c| c == stale),
         "include_deleted is the audit/full-backup escape hatch and must \
@@ -129,20 +129,23 @@ fn include_deleted_brings_the_superseded_memory_back() {
 /// hard-deletes otherwise.
 #[test]
 fn a_tombstoned_memory_is_excluded_by_default() {
-    let db = Database::open(":memory:").expect("db");
-    let conn = db.conn();
-    let id = add(&conn, "a note that gets deleted", None);
-    add(&conn, "a note that survives", None);
+    let db = Database::open_on_sqlite(":memory:").expect("db");
+    let store = db.store();
+    let id = add(&store, "a note that gets deleted", None);
+    add(&store, "a note that survives", None);
 
     // Tombstone directly rather than via `delete_memory`, so this test does not
     // depend on sync being configured in the test environment.
-    conn.execute(
-        "UPDATE memories SET deleted_at = ? WHERE id = ?",
-        rusqlite::params!["2026-01-01T00:00:00Z", id],
-    )
-    .expect("tombstone");
+    store
+        .sqlite()
+        .unwrap()
+        .execute(
+            "UPDATE memories SET deleted_at = ? WHERE id = ?",
+            rusqlite::params!["2026-01-01T00:00:00Z", id],
+        )
+        .expect("tombstone");
 
-    let contents = exported_contents(&conn, false);
+    let contents = exported_contents(&store, false);
     assert!(
         !contents.iter().any(|c| c == "a note that gets deleted"),
         "a tombstoned memory must not be exported by default. Got: {:?}",
@@ -150,7 +153,7 @@ fn a_tombstoned_memory_is_excluded_by_default() {
     );
     assert_eq!(contents, vec!["a note that survives".to_string()]);
 
-    let with = exported_contents(&conn, true);
+    let with = exported_contents(&store, true);
     assert_eq!(
         with.len(),
         2,
@@ -163,17 +166,20 @@ fn a_tombstoned_memory_is_excluded_by_default() {
 /// used a tombstone alone.
 #[test]
 fn both_exclusions_apply_together() {
-    let db = Database::open(":memory:").expect("db");
-    let conn = db.conn();
-    let stale = supersede(&conn);
-    let doomed = add(&conn, "a note that gets deleted", None);
-    conn.execute(
-        "UPDATE memories SET deleted_at = ? WHERE id = ?",
-        rusqlite::params!["2026-01-01T00:00:00Z", doomed],
-    )
-    .expect("tombstone");
+    let db = Database::open_on_sqlite(":memory:").expect("db");
+    let store = db.store();
+    let stale = supersede(&store);
+    let doomed = add(&store, "a note that gets deleted", None);
+    store
+        .sqlite()
+        .unwrap()
+        .execute(
+            "UPDATE memories SET deleted_at = ? WHERE id = ?",
+            rusqlite::params!["2026-01-01T00:00:00Z", doomed],
+        )
+        .expect("tombstone");
 
-    let contents = exported_contents(&conn, false);
+    let contents = exported_contents(&store, false);
     assert_eq!(
         contents,
         vec!["deploy target is production".to_string()],
@@ -182,7 +188,7 @@ fn both_exclusions_apply_together() {
     assert!(!contents.iter().any(|c| c == stale));
 
     assert_eq!(
-        exported_contents(&conn, true).len(),
+        exported_contents(&store, true).len(),
         3,
         "include_deleted should return all three"
     );
@@ -191,13 +197,13 @@ fn both_exclusions_apply_together() {
 /// The default must not quietly drop live memories along with the dead ones.
 #[test]
 fn ordinary_memories_are_unaffected() {
-    let db = Database::open(":memory:").expect("db");
-    let conn = db.conn();
+    let db = Database::open_on_sqlite(":memory:").expect("db");
+    let store = db.store();
     for note in ["first", "second", "third"] {
-        add(&conn, note, None);
+        add(&store, note, None);
     }
-    assert_eq!(exported_contents(&conn, false).len(), 3);
-    assert_eq!(exported_contents(&conn, true).len(), 3);
+    assert_eq!(exported_contents(&store, false).len(), 3);
+    assert_eq!(exported_contents(&store, true).len(), 3);
 }
 
 /// Deserialization contract: absent means false, which is what makes the safe

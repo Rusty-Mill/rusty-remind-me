@@ -47,7 +47,7 @@
 
 use std::sync::Arc;
 
-use remind_me_mcp::McpServer;
+use remind_me_mcp::Handler;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, Implementation, InitializeResult,
     ListPromptsResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
@@ -59,17 +59,19 @@ use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 
-/// Adapts a synchronous [`McpServer`] to rmcp's async, typed `ServerHandler`.
+/// Adapts a synchronous MCP [`Handler`] (this process's own
+/// [`remind_me_mcp::McpServer`], or a relay to the daemon's) to rmcp's async,
+/// typed `ServerHandler`.
 ///
 /// Cheap to clone: `rmcp` builds one `S` per session via a service factory
 /// closure, so this only wraps an `Arc`.
 #[derive(Clone)]
 pub struct RemindMeHandler {
-    mcp: Arc<McpServer>,
+    mcp: Arc<dyn Handler>,
 }
 
 impl RemindMeHandler {
-    pub fn new(mcp: Arc<McpServer>) -> Self {
+    pub fn new(mcp: Arc<dyn Handler>) -> Self {
         Self { mcp }
     }
 
@@ -89,7 +91,7 @@ impl RemindMeHandler {
         })
         .to_string();
 
-        let response = tokio::task::spawn_blocking(move || mcp.handle_request(&envelope))
+        let response = tokio::task::spawn_blocking(move || mcp.handle_line(&envelope))
             .await
             .map_err(|e| McpError::internal_error(format!("{method} task panicked: {e}"), None))?
             .ok_or_else(|| {
@@ -202,6 +204,7 @@ impl ServerHandler for RemindMeHandler {
 mod tests {
     use super::*;
     use remind_me_core::Database;
+    use remind_me_mcp::McpServer;
 
     fn handler() -> RemindMeHandler {
         let db = Database::open_in_memory().unwrap();

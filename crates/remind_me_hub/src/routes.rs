@@ -1,13 +1,12 @@
-//! The ten routes, written against [`HubStore`] rather than any backend.
+//! The ten routes, written against [`HubStore`].
 //!
 //! Every handler here is a pure function of a request and a store, which is
-//! what lets the whole surface be tested against SQLite in-process while the
-//! Postgres backend satisfies the same trait.
+//! what lets the whole surface be tested in-process against the engine.
 //!
 //! # Auth posture, which is not uniform and should not be
 //!
 //! `/health` is deliberately unauthenticated: it is what a deploy healthcheck
-//! polls, and it must keep answering when the database is down. Everything
+//! polls, and it must keep answering when the store is down. Everything
 //! else is bearer-gated, including `/metrics` — the reference argues that one
 //! out explicitly, and the argument is that anyone scraping the hub is already
 //! the operator who provisioned the secret, so the credential is in hand
@@ -250,26 +249,23 @@ pub fn metrics(store: &dyn HubStore, config: &Config) -> Response {
     Response::text(200, "text/plain; version=0.0.4", body)
 }
 
-/// Hard-delete memories tombstoned longer than the retention window ago.
+/// Empty every tombstone that still holds text.
+///
+/// Nothing is deleted (ADR-0024): a deleted row is what makes a stale push
+/// of the same memory lose, so purging one let a node that missed the
+/// delete bring the memory back. Tombstones pushed since are stored emptied
+/// already; this reaches the ones stored before that, such as those a copy
+/// brought over. Age plays no part: emptying never changes which write
+/// wins, so there is nothing to wait for.
 ///
 /// Operator-triggered rather than an automatic background loop: the hub has no
 /// periodic-task infrastructure to hang one off, and a cron hitting this is
 /// both simpler and visible.
-pub fn compact_tombstones(store: &dyn HubStore, config: &Config) -> Response {
-    let cutoff = chrono::Utc::now() - chrono::Duration::days(config.tombstone_retention_days);
-    match store.compact_tombstones(&crate::canon::format_canonical(cutoff)) {
-        Ok(purged) => {
-            eprintln!(
-                "hub: compacted {purged} tombstoned memories older than {} days",
-                config.tombstone_retention_days
-            );
-            Response::json(
-                200,
-                &json!({
-                    "purged": purged,
-                    "retention_days": config.tombstone_retention_days,
-                }),
-            )
+pub fn compact_tombstones(store: &dyn HubStore) -> Response {
+    match store.compact_tombstones() {
+        Ok(emptied) => {
+            eprintln!("hub: emptied {emptied} tombstoned memories");
+            Response::json(200, &json!({ "emptied": emptied }))
         }
         Err(e) => storage_error("compact_tombstones", &e.0),
     }
@@ -310,16 +306,19 @@ pub fn push(store: &dyn HubStore, body: &[u8]) -> Response {
     let mut failed = 0usize;
     let mut processed_ids: Vec<String> = Vec::new();
 
+    let mut valid = Vec::with_capacity(records.len());
     for raw in records {
-        let record = match record::parse(raw) {
-            Ok(r) => r,
+        match record::parse(raw) {
+            Ok(record) => valid.push(record),
             Err(e) => {
                 failed += 1;
                 eprintln!("hub: skipping malformed sync record: {e}");
-                continue;
             }
-        };
-        match store.apply_record(&record, origin.as_deref()) {
+        }
+    }
+    let outcomes = store.apply_records(&valid, origin.as_deref());
+    for (record, outcome) in valid.iter().zip(outcomes) {
+        match outcome {
             Ok(applied) => {
                 processed_ids.push(record.wire_id());
                 if applied {

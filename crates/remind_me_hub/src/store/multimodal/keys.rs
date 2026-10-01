@@ -13,8 +13,8 @@
 //!   second sorts before any fraction of it);
 //! - an id becomes its bytes zero-padded to a fixed width, which orders
 //!   exactly as byte-order string comparison does *provided* no id holds a
-//!   NUL byte (`"m"` and `"m\0"` would pad alike). Postgres TEXT cannot
-//!   hold NUL either, so refusing it costs nothing a hub accepts today;
+//!   NUL byte (`"m"` and `"m\0"` would pad alike). Postgres TEXT could not
+//!   hold NUL either, so refusing it cost the Postgres hubs nothing;
 //! - an id becomes an engine id through UUID v5, with the string kept on
 //!   the record so a (practically impossible) collision is refused rather
 //!   than merged.
@@ -117,7 +117,7 @@ pub const MAX_ID_KEY: IdKey = [0xFF; ID_CAP];
 ///
 /// Stored timestamps are canonical already. A cursor is canonicalised
 /// first, so a client that sends `Z` rather than `+00:00` gets the instant
-/// it meant; SQLite compares the raw bytes instead and would not.
+/// it meant (the retired SQL stores compared the raw bytes and did not).
 pub fn micros(ts: &str) -> StoreResult<i64> {
     let canonical = canon_ts(ts).map_err(StoreError)?;
     chrono::DateTime::parse_from_rfc3339(&canonical)

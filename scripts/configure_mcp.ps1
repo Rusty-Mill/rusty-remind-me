@@ -12,7 +12,7 @@
 [CmdletBinding()]
 param (
     [string]$ExecutablePath = "",
-    [string]$DbPath = "$env:USERPROFILE\.remind_me\remind_me.db"
+    [string]$DbPath = "$env:USERPROFILE\.remind-me\memory.db"
 )
 
 # 1. Resolve Executable Path

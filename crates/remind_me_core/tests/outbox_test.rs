@@ -1,15 +1,15 @@
 //! Coverage for outbox growth and its pruning.
 //!
-//! The outbox triggers arrived with the generated schema and fire on every
-//! write while sync is configured (`#76`'s `sync_flags` gate — every test
+//! The repositories queue an outbox row for every local write while sync is
+//! configured (triggers did this up to schema v30) (`#76`'s `sync_flags` gate — every test
 //! here runs with the three sync env vars set, via [`ensure_sync_enabled`],
 //! since this file is entirely about what accumulates once they do). Nothing
 //! in this crate drains the outbox on its own, so without a retention rule
 //! the table grows without bound — carrying a full JSON copy of the memory
 //! each time.
 //!
-//! Since issue #100 "every write" excludes access tracking: `memories_outbox_au`
-//! also requires `updated_at` to have moved, so a read no longer queues a row.
+//! Since issue #100 "every write" excludes access tracking: an update is
+//! queued only when `updated_at` moved, so a read no longer queues a row.
 //! Two tests here previously asserted the opposite and now pin the new
 //! behavior from both sides — a read queues nothing, a real edit still queues
 //! exactly one.
@@ -19,13 +19,16 @@ mod test_env;
 
 use chrono::{Duration, Utc};
 use remind_me_core::db::queries;
+use remind_me_core::db::sync_state::SyncState;
+use remind_me_core::db::Store;
 use remind_me_core::sync::{
-    prune_outbox, DEFAULT_OUTBOX_RETENTION_DAYS, HUB_URL_ENV, NODE_ID_ENV, SYNC_SECRET_ENV,
+    prune_outbox, DEFAULT_OUTBOX_RETENTION_DAYS, HUB_REMOTE_ID, HUB_URL_ENV, NODE_ID_ENV,
+    SYNC_SECRET_ENV,
 };
+use remind_me_core::testing::{self, Table};
 use remind_me_core::{
     Database, MemoryAddInput, MemorySearchInput, MemoryUpdateInput, UpdateOutcome,
 };
-use rusqlite::Connection;
 
 /// Every test in this file wants sync on and never off, so setting these
 /// process-wide env vars needs no `ENV_LOCK`-style guard against other tests
@@ -37,9 +40,9 @@ fn ensure_sync_enabled() {
     crate::test_env::set_var(SYNC_SECRET_ENV, "shh");
 }
 
-fn add(conn: &Connection, content: &str) -> String {
+fn add(store: &Store<'_>, content: &str) -> String {
     queries::add_memory(
-        conn,
+        store,
         MemoryAddInput {
             sensitive: false,
             content: content.to_string(),
@@ -57,9 +60,9 @@ fn add(conn: &Connection, content: &str) -> String {
     .id
 }
 
-fn search(conn: &Connection, query: &str) {
+fn search(store: &Store<'_>, query: &str) {
     queries::search_with_expansions(
-        conn,
+        store,
         &MemorySearchInput {
             strategy: Default::default(),
             include_sensitive: false,
@@ -81,43 +84,40 @@ fn search(conn: &Connection, query: &str) {
     .unwrap();
 }
 
-fn outbox_rows(conn: &Connection) -> i64 {
-    conn.query_row("SELECT count(*) FROM sync_outbox", [], |r| r.get(0))
-        .unwrap()
+fn outbox_rows(store: &Store<'_>) -> i64 {
+    testing::count(store, Table::SyncOutbox).unwrap()
 }
 
-fn backdate_outbox(conn: &Connection, days: i64) {
+fn backdate_outbox(store: &Store<'_>, days: i64) {
     let when = (Utc::now() - Duration::days(days)).to_rfc3339();
-    conn.execute(
-        "UPDATE sync_outbox SET created_at = ?",
-        rusqlite::params![when],
-    )
-    .unwrap();
+    for row in testing::outbox_rows(store).unwrap() {
+        testing::set_outbox_column(store, row.id, "created_at", &when).unwrap();
+    }
 }
 
 #[test]
 fn writes_still_reach_the_outbox() {
     ensure_sync_enabled();
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     for i in 0..5 {
-        add(&conn, &format!("memory {}", i));
+        add(&store, &format!("memory {}", i));
     }
 
     // Pruning must not amount to disabling the outbox: an unsent, in-window row
     // is exactly what a sync engine would push.
-    assert_eq!(outbox_rows(&conn), 5);
+    assert_eq!(outbox_rows(&store), 5);
 }
 
 #[test]
 fn reads_no_longer_grow_the_outbox() {
     ensure_sync_enabled();
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "quokka sighting");
-    let after_write = outbox_rows(&conn);
+    let store = db.store();
+    add(&store, "quokka sighting");
+    let after_write = outbox_rows(&store);
 
-    search(&conn, "quokka");
+    search(&store, "quokka");
 
     // Recording access is an UPDATE, so before issue #100 the update trigger
     // fired on it and every read enqueued a full-payload row. The trigger now
@@ -126,7 +126,7 @@ fn reads_no_longer_grow_the_outbox() {
     // always have been: a row whose `updated_at` did not advance loses LWW
     // against the peer's own copy on arrival anyway.
     assert_eq!(
-        outbox_rows(&conn),
+        outbox_rows(&store),
         after_write,
         "recording access on read must not enqueue an outbox row"
     );
@@ -136,12 +136,12 @@ fn reads_no_longer_grow_the_outbox() {
 fn a_real_content_change_still_reaches_the_outbox() {
     ensure_sync_enabled();
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "quokka sighting");
-    let after_write = outbox_rows(&conn);
+    let store = db.store();
+    let id = add(&store, "quokka sighting");
+    let after_write = outbox_rows(&store);
 
     let outcome = queries::update_memory(
-        &conn,
+        &store,
         &MemoryUpdateInput {
             sensitive: None,
             memory_id: id,
@@ -158,73 +158,94 @@ fn a_real_content_change_still_reaches_the_outbox() {
     // The other half of the guard: scoping reads out must not scope genuine
     // edits out with them. Exactly one row, not zero and not two.
     assert_eq!(
-        outbox_rows(&conn),
+        outbox_rows(&store),
         after_write + 1,
         "a content edit must still enqueue exactly one outbox row"
     );
-    let operation: String = conn
-        .query_row(
-            "SELECT operation FROM sync_outbox ORDER BY id DESC LIMIT 1",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let operation = testing::outbox_rows(&store)
+        .unwrap()
+        .pop()
+        .unwrap()
+        .operation;
     assert_eq!(operation, "update");
 }
 
+/// The triggers schema v30 and earlier carried.
+const V30_TRIGGERS: &str = include_str!("fixtures/schema_v30_triggers.sql");
+
 #[test]
-fn an_existing_database_has_its_stale_trigger_rebuilt_on_open() {
+fn an_older_databases_triggers_are_dropped_on_open() {
     ensure_sync_enabled();
     let dir = std::env::temp_dir().join(format!("rrm_outbox_trigger_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("memories.db");
     let _ = std::fs::remove_file(&path);
 
+    // Raw SQL below: this is about SQLite triggers in an on-disk file.
     let id = {
-        let db = Database::open(&path).unwrap();
-        let conn = db.conn();
-        let id = add(&conn, "quokka sighting");
+        let db = Database::open_on_sqlite(&path).unwrap();
+        let store = db.store();
+        let id = add(&store, "quokka sighting");
 
-        // Put the pre-#100 trigger back, exactly as a database created by an
-        // earlier build carries it: same body, no `updated_at` guard. Every
-        // statement in schema_triggers.sql is `CREATE TRIGGER IF NOT EXISTS`,
-        // so without reconciliation the next open would leave this in place.
-        let stale = conn
-            .query_row(
-                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='memories_outbox_au'",
-                [],
-                |r| r.get::<_, String>(0),
-            )
-            .unwrap()
+        // Put the triggers of schema v30 back, as an older build left them,
+        // with the pre-#100 `memories_outbox_au` that has no `updated_at`
+        // guard. Left in place, they would do the repositories' work a second
+        // time: every edit queued twice, and every read queued at all.
+        // Only the outbox triggers: with the index triggers as well, the
+        // full-text index would be written twice and corrupt before the
+        // reopen this test is about.
+        let stale: String = V30_TRIGGERS
+            .split("CREATE TRIGGER")
+            .filter(|statement| statement.contains("_outbox_"))
+            .map(|statement| format!("CREATE TRIGGER{statement}"))
+            .collect::<Vec<_>>()
+            .join("\n")
             .replace("AND NEW.updated_at IS NOT OLD.updated_at", "");
-        conn.execute_batch(&format!("DROP TRIGGER memories_outbox_au; {};", stale))
+        store.sqlite().unwrap().execute_batch(&stale).unwrap();
+        store
+            .sqlite()
+            .unwrap()
+            .execute_batch("DELETE FROM sync_outbox;")
             .unwrap();
-        conn.execute_batch("DELETE FROM sync_outbox;").unwrap();
 
         // Guard the guard: if this read did not amplify, the rest of the test
         // would pass whether or not reconciliation actually did anything.
-        search(&conn, "quokka");
+        search(&store, "quokka");
         assert!(
-            outbox_rows(&conn) > 0,
-            "the restored pre-#100 trigger should amplify reads"
+            outbox_rows(&store) > 0,
+            "the restored pre-#100 trigger should queue reads"
         );
         id
     };
 
-    let db = Database::open(&path).unwrap();
-    let conn = db.conn();
-    conn.execute_batch("DELETE FROM sync_outbox;").unwrap();
-    search(&conn, "quokka");
+    let db = Database::open_on_sqlite(&path).unwrap();
+    let store = db.store();
+    store
+        .sqlite()
+        .unwrap()
+        .execute_batch("DELETE FROM sync_outbox;")
+        .unwrap();
+    search(&store, "quokka");
 
     assert_eq!(
-        outbox_rows(&conn),
+        outbox_rows(&store),
         0,
-        "reopening must have replaced the stale trigger, not skipped it"
+        "reopening must have dropped the old triggers"
     );
+    let triggers: i64 = store
+        .sqlite()
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'trigger'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(triggers, 0);
 
-    // And the replacement is the real one, not merely a dropped trigger.
+    // And an edit is still queued, once: by the repository, not a trigger.
     queries::update_memory(
-        &conn,
+        &store,
         &MemoryUpdateInput {
             sensitive: None,
             memory_id: id,
@@ -236,7 +257,7 @@ fn an_existing_database_has_its_stale_trigger_rebuilt_on_open() {
         },
     )
     .unwrap();
-    assert_eq!(outbox_rows(&conn), 1);
+    assert_eq!(outbox_rows(&store), 1);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -245,34 +266,73 @@ fn an_existing_database_has_its_stale_trigger_rebuilt_on_open() {
 fn already_sent_rows_are_pruned_immediately() {
     ensure_sync_enabled();
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "memory one");
-    add(&conn, "memory two");
-    conn.execute(
-        "UPDATE sync_outbox SET sent_at = ? WHERE id = (SELECT MIN(id) FROM sync_outbox)",
-        rusqlite::params![Utc::now().to_rfc3339()],
-    )
-    .unwrap();
+    let store = db.store();
+    add(&store, "memory one");
+    add(&store, "memory two");
+    let oldest = testing::outbox_rows(&store).unwrap()[0].id;
+    testing::set_outbox_column(&store, oldest, "sent_at", &Utc::now().to_rfc3339()).unwrap();
 
-    let removed = prune_outbox(&conn).unwrap();
+    let removed = prune_outbox(&store).unwrap();
 
     // A sent row is echo-suppressed and never pushed again, so it needs no
     // retention window.
     assert_eq!(removed, 1);
-    assert_eq!(outbox_rows(&conn), 1);
+    assert_eq!(outbox_rows(&store), 1);
+}
+
+#[test]
+fn rows_the_hub_has_taken_are_pruned_immediately() {
+    // Every node pulls them from the hub, and a peer can pull them from
+    // this node's feed, so keeping them only held a second copy of every
+    // change, deleted memories' text included (ADR-0024).
+    ensure_sync_enabled();
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    add(&store, "taken by the hub");
+    add(&store, "not yet pushed");
+    let taken = testing::outbox_rows(&store).unwrap()[0].id;
+    SyncState::new(&store)
+        .record_sends(HUB_REMOTE_ID, &[taken], &Utc::now().to_rfc3339())
+        .unwrap();
+
+    assert_eq!(prune_outbox(&store).unwrap(), 1);
+    let left = testing::outbox_rows(&store).unwrap();
+    assert_eq!(left.len(), 1);
+    assert_ne!(left[0].id, taken);
+    assert_eq!(
+        testing::count(&store, Table::SyncSends).unwrap(),
+        0,
+        "its send marker goes with it"
+    );
+}
+
+#[test]
+fn a_row_only_a_peer_has_taken_waits_for_the_window() {
+    // Without the hub's marker, a row is still owed to the hub.
+    ensure_sync_enabled();
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    add(&store, "taken by a peer only");
+    let row = testing::outbox_rows(&store).unwrap()[0].id;
+    SyncState::new(&store)
+        .record_sends("peer_1", &[row], &Utc::now().to_rfc3339())
+        .unwrap();
+
+    assert_eq!(prune_outbox(&store).unwrap(), 0);
+    assert_eq!(outbox_rows(&store), 1);
 }
 
 #[test]
 fn rows_inside_the_retention_window_survive() {
     ensure_sync_enabled();
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "recent memory");
-    backdate_outbox(&conn, DEFAULT_OUTBOX_RETENTION_DAYS - 1);
+    let store = db.store();
+    add(&store, "recent memory");
+    backdate_outbox(&store, DEFAULT_OUTBOX_RETENTION_DAYS - 1);
 
-    assert_eq!(prune_outbox(&conn).unwrap(), 0);
+    assert_eq!(prune_outbox(&store).unwrap(), 0);
     assert_eq!(
-        outbox_rows(&conn),
+        outbox_rows(&store),
         1,
         "an intermittently-reachable remote must still be able to catch up"
     );
@@ -282,35 +342,29 @@ fn rows_inside_the_retention_window_survive() {
 fn rows_past_the_retention_window_are_pruned() {
     ensure_sync_enabled();
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "stale memory");
-    backdate_outbox(&conn, DEFAULT_OUTBOX_RETENTION_DAYS + 1);
+    let store = db.store();
+    add(&store, "stale memory");
+    backdate_outbox(&store, DEFAULT_OUTBOX_RETENTION_DAYS + 1);
 
-    assert_eq!(prune_outbox(&conn).unwrap(), 1);
-    assert_eq!(outbox_rows(&conn), 0);
+    assert_eq!(prune_outbox(&store).unwrap(), 1);
+    assert_eq!(outbox_rows(&store), 0);
 }
 
 #[test]
 fn pruning_drops_orphaned_send_markers() {
     ensure_sync_enabled();
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "memory one");
-    let outbox_id: i64 = conn
-        .query_row("SELECT id FROM sync_outbox", [], |r| r.get(0))
+    let store = db.store();
+    add(&store, "memory one");
+    let outbox_id = testing::outbox_rows(&store).unwrap()[0].id;
+    SyncState::new(&store)
+        .record_sends("peer_1", &[outbox_id], &Utc::now().to_rfc3339())
         .unwrap();
-    conn.execute(
-        "INSERT INTO sync_sends (remote_id, outbox_id, sent_at) VALUES ('peer_1', ?, ?)",
-        rusqlite::params![outbox_id, Utc::now().to_rfc3339()],
-    )
-    .unwrap();
-    backdate_outbox(&conn, DEFAULT_OUTBOX_RETENTION_DAYS + 1);
+    backdate_outbox(&store, DEFAULT_OUTBOX_RETENTION_DAYS + 1);
 
-    prune_outbox(&conn).unwrap();
+    prune_outbox(&store).unwrap();
 
-    let sends: i64 = conn
-        .query_row("SELECT count(*) FROM sync_sends", [], |r| r.get(0))
-        .unwrap();
+    let sends = testing::count(&store, Table::SyncSends).unwrap();
     assert_eq!(
         sends, 0,
         "a send marker for a pruned row has nothing to mark"
@@ -321,12 +375,12 @@ fn pruning_drops_orphaned_send_markers() {
 fn pruning_is_idempotent() {
     ensure_sync_enabled();
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "memory one");
+    let store = db.store();
+    add(&store, "memory one");
 
-    assert_eq!(prune_outbox(&conn).unwrap(), 0);
-    assert_eq!(prune_outbox(&conn).unwrap(), 0);
-    assert_eq!(outbox_rows(&conn), 1);
+    assert_eq!(prune_outbox(&store).unwrap(), 0);
+    assert_eq!(prune_outbox(&store).unwrap(), 0);
+    assert_eq!(outbox_rows(&store), 1);
 }
 
 #[test]
@@ -338,16 +392,16 @@ fn opening_a_database_prunes_it() {
     let _ = std::fs::remove_file(&path);
 
     {
-        let db = Database::open(&path).unwrap();
-        let conn = db.conn();
-        add(&conn, "old memory");
-        backdate_outbox(&conn, DEFAULT_OUTBOX_RETENTION_DAYS + 1);
-        assert_eq!(outbox_rows(&conn), 1);
+        let db = Database::open_on_sqlite(&path).unwrap();
+        let store = db.store();
+        add(&store, "old memory");
+        backdate_outbox(&store, DEFAULT_OUTBOX_RETENTION_DAYS + 1);
+        assert_eq!(outbox_rows(&store), 1);
     }
 
     // Open is the only cycle this crate has, so it is where the rule runs.
-    let db = Database::open(&path).unwrap();
-    assert_eq!(outbox_rows(&db.conn()), 0);
+    let db = Database::open_on_sqlite(&path).unwrap();
+    assert_eq!(outbox_rows(&db.store()), 0);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -361,28 +415,28 @@ fn a_realistic_mix_of_traffic_stays_bounded() {
     let _ = std::fs::remove_file(&path);
 
     {
-        let db = Database::open(&path).unwrap();
-        let conn = db.conn();
+        let db = Database::open_on_sqlite(&path).unwrap();
+        let store = db.store();
         for i in 0..10 {
-            add(&conn, &format!("quokka memory {}", i));
+            add(&store, &format!("quokka memory {}", i));
         }
-        let after_writes = outbox_rows(&conn);
+        let after_writes = outbox_rows(&store);
         for _ in 0..20 {
-            search(&conn, "quokka");
+            search(&store, "quokka");
         }
         // Everything so far is older than the window by the time we reopen.
-        backdate_outbox(&conn, DEFAULT_OUTBOX_RETENTION_DAYS + 1);
+        backdate_outbox(&store, DEFAULT_OUTBOX_RETENTION_DAYS + 1);
         assert!(after_writes > 0, "10 writes should have produced rows");
         assert_eq!(
-            outbox_rows(&conn),
+            outbox_rows(&store),
             after_writes,
             "20 searches over 10 memories must add nothing (issue #100)"
         );
     }
 
-    let db = Database::open(&path).unwrap();
+    let db = Database::open_on_sqlite(&path).unwrap();
     assert_eq!(
-        outbox_rows(&db.conn()),
+        outbox_rows(&db.store()),
         0,
         "read and write traffic past the window must not accumulate"
     );

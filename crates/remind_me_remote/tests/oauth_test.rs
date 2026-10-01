@@ -762,7 +762,7 @@ async fn build_router_rejects_an_issuer_with_a_path_or_plain_http_on_a_non_local
     let db = Database::open_in_memory().unwrap();
     let mcp = Arc::new(McpServer::new(db));
     assert!(remind_me_remote::build_router(
-        Arc::clone(&mcp),
+        mcp,
         OWNER_TOKEN.to_string(),
         Some("https://machine.example/path".to_string()),
     )

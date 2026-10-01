@@ -96,8 +96,14 @@ impl ApiServer {
     /// test using it would write into whatever wiki the machine's user
     /// actually has.
     pub fn with_wiki(db: Database, wiki: Wiki) -> Self {
+        Self::shared(Arc::new(db), wiki)
+    }
+
+    /// Build a server over a database other servers also use: the daemon
+    /// runs this and the MCP server over one store.
+    pub fn shared(db: Arc<Database>, wiki: Wiki) -> Self {
         Self {
-            db: Arc::new(db),
+            db,
             wiki,
             api_key: resolve_api_key(),
         }
@@ -152,7 +158,7 @@ impl ApiServer {
 
         if request.path == "/health" {
             let (status, body) =
-                routes::health(&self.db.conn(), &self.wiki, &request, &Default::default());
+                routes::health(&self.db.store(), &self.wiki, &request, &Default::default());
             return http::write_response_cors(stream, status, body, cors);
         }
 
@@ -166,7 +172,7 @@ impl ApiServer {
                 .strip_prefix("/api/reminders/")
                 .and_then(|rest| rest.strip_suffix(".ics"))
             {
-                let (status, body) = routes::api_reminders_ics(&self.db.conn(), token);
+                let (status, body) = routes::api_reminders_ics(&self.db.store(), token);
                 return http::write_response_cors(stream, status, body, cors);
             }
         }
@@ -253,8 +259,8 @@ impl ApiServer {
             };
             path_matched = true;
             if route.methods.contains(&request.method.as_str()) {
-                let conn = self.db.conn();
-                return (route.handler)(&conn, &self.wiki, request, &params);
+                let store = self.db.store();
+                return (route.handler)(&store, &self.wiki, request, &params);
             }
         }
         if path_matched {

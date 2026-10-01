@@ -60,7 +60,7 @@ fn a_started_scheduler_reports_running_and_stopping_it_clears_that() {
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let db = TempDb::new("scheduler");
     let database = Database::open(&db.0).unwrap();
-    let handle = remind_me_core::scheduler::start_scheduler_for(&database.conn())
+    let handle = remind_me_core::scheduler::start_scheduler_for(&database.store())
         .expect("scheduler always starts against a file-backed database");
 
     wait_for("the scheduler to report itself running", || {
@@ -84,7 +84,7 @@ fn a_started_nudge_loop_reports_running_and_stopping_it_clears_that() {
     crate::test_env::set_var(remind_me_core::promotion::NUDGE_INTERVAL_ENV, "1");
     let db = TempDb::new("nudge");
     let database = Database::open(&db.0).unwrap();
-    let handle = remind_me_core::promotion::start_nudge_for(&database.conn())
+    let handle = remind_me_core::promotion::start_nudge_for(&database.store())
         .expect("nudge starts once an interval is configured against a file-backed database");
 
     wait_for("the nudge loop to report itself running", || {

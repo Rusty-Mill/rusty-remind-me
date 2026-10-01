@@ -1,5 +1,11 @@
 # Client Cutover Runbook
 
+> **Historical (2026-09-26).** The Python `remind_me` is retired
+> (ADR-0023), so there is nothing left to cut over from. This runbook and its
+> record of the 2026-08 cutover are kept as history; hosts still running a
+> Python process should switch to `rusty-remind-me` as the README's "Coming
+> from the Python `remind_me`" describes.
+
 **What this is.** A runbook plus a dated record of the first real one: migrating
 every process on a machine that talks to `remind_me`/`rusty_remind_me` from the
 Python reference to this port, without downtime and without losing sync state.

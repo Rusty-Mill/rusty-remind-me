@@ -7,11 +7,12 @@
 
 use remind_me_core::contradictions::{candidates, MAX_ENTITY_FANOUT};
 use remind_me_core::db::queries;
+use remind_me_core::db::Store;
+use remind_me_core::testing;
 use remind_me_core::{Database, EntityInput, MemoryAddInput};
-use rusqlite::Connection;
 
 fn add(
-    conn: &Connection,
+    store: &Store<'_>,
     content: &str,
     category: &str,
     entities: &[&str],
@@ -26,7 +27,7 @@ fn add(
         None => (None, None, None),
     };
     queries::add_memory(
-        conn,
+        store,
         MemoryAddInput {
             content: content.to_string(),
             category: category.to_string(),
@@ -51,18 +52,24 @@ fn add(
     .id
 }
 
-fn total(conn: &Connection) -> i64 {
-    candidates(conn, 100, None).unwrap().total_candidates
+fn total(store: &Store<'_>) -> i64 {
+    candidates(store, 100, None).unwrap().total_candidates
 }
 
 #[test]
 fn two_memories_sharing_an_entity_are_a_candidate_pair() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "I moved to Boston", "general", &["Boston"], None);
-    add(&conn, "I live in Seattle now", "general", &["Boston"], None);
+    let store = db.store();
+    add(&store, "I moved to Boston", "general", &["Boston"], None);
+    add(
+        &store,
+        "I live in Seattle now",
+        "general",
+        &["Boston"],
+        None,
+    );
 
-    let result = candidates(&conn, 20, None).unwrap();
+    let result = candidates(&store, 20, None).unwrap();
 
     assert_eq!(result.total_candidates, 1);
     assert_eq!(result.candidates.len(), 1);
@@ -75,52 +82,43 @@ fn two_memories_sharing_an_entity_are_a_candidate_pair() {
 #[test]
 fn memories_sharing_no_entity_are_not_compared() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "I moved to Boston", "general", &["Boston"], None);
-    add(&conn, "the build is green", "general", &["CI"], None);
+    let store = db.store();
+    add(&store, "I moved to Boston", "general", &["Boston"], None);
+    add(&store, "the build is green", "general", &["CI"], None);
 
     // All-pairs over a whole vault would be quadratic and mostly noise. The
     // entity graph is what bounds the comparison space.
-    assert_eq!(total(&conn), 0);
+    assert_eq!(total(&store), 0);
 }
 
 #[test]
 fn dialog_memories_are_excluded() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "I moved to Boston", "dialog", &["Boston"], None);
-    add(&conn, "I live in Seattle", "dialog", &["Boston"], None);
+    let store = db.store();
+    add(&store, "I moved to Boston", "dialog", &["Boston"], None);
+    add(&store, "I live in Seattle", "dialog", &["Boston"], None);
 
     // A captured transcript's facts are meant to come out through decompose;
     // pairing raw dialog would flood the queue with conversational back-and-
     // forth that was never asserting anything.
-    assert_eq!(total(&conn), 0);
+    assert_eq!(total(&store), 0);
 }
 
 #[test]
 fn deleted_and_superseded_memories_are_excluded() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let a = add(&conn, "I moved to Boston", "general", &["Boston"], None);
-    let b = add(&conn, "I live in Seattle", "general", &["Boston"], None);
-    assert_eq!(total(&conn), 1);
+    let store = db.store();
+    let a = add(&store, "I moved to Boston", "general", &["Boston"], None);
+    let b = add(&store, "I live in Seattle", "general", &["Boston"], None);
+    assert_eq!(total(&store), 1);
 
-    conn.execute(
-        "UPDATE memories SET deleted_at = '2026-01-01T00:00:00+00:00' WHERE id = ?",
-        [&a],
-    )
-    .unwrap();
-    assert_eq!(total(&conn), 0, "a tombstoned memory asserts nothing");
+    testing::set_memory_column(&store, &a, "deleted_at", "2026-01-01T00:00:00+00:00").unwrap();
+    assert_eq!(total(&store), 0, "a tombstoned memory asserts nothing");
 
-    conn.execute("UPDATE memories SET deleted_at = NULL WHERE id = ?", [&a])
-        .unwrap();
-    conn.execute(
-        "UPDATE memories SET superseded_by = ? WHERE id = ?",
-        [&a, &b],
-    )
-    .unwrap();
+    testing::set_memory_column(&store, &a, "deleted_at", testing::Value::Null).unwrap();
+    testing::set_memory_column(&store, &b, "superseded_by", a.as_str()).unwrap();
     assert_eq!(
-        total(&conn),
+        total(&store),
         0,
         "a superseded memory has already been resolved"
     );
@@ -129,20 +127,20 @@ fn deleted_and_superseded_memories_are_excluded() {
 #[test]
 fn a_pair_the_triple_mechanism_covers_is_excluded() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     // Same normalised subject and predicate. A *differing* object cannot be
     // observed here — the write path would have superseded the first the
     // moment the second landed — so this exclusion filters out same-object
     // verbatim restatements, which are not a contradiction worth flagging.
     add(
-        &conn,
+        &store,
         "Bailey lives in Boston",
         "general",
         &["Bailey"],
         Some(("Bailey", "lives_in", "Boston")),
     );
     add(
-        &conn,
+        &store,
         "  bailey   LIVES_IN Boston  ",
         "general",
         &["Bailey"],
@@ -151,22 +149,22 @@ fn a_pair_the_triple_mechanism_covers_is_excluded() {
 
     // Case- and whitespace-insensitive, so a restatement that differs only in
     // formatting is still recognised as covered.
-    assert_eq!(total(&conn), 0);
+    assert_eq!(total(&store), 0);
 }
 
 #[test]
 fn a_pair_with_only_one_side_carrying_a_triple_still_counts() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     add(
-        &conn,
+        &store,
         "Bailey lives in Boston",
         "general",
         &["Bailey"],
         Some(("Bailey", "lives_in", "Boston")),
     );
     add(
-        &conn,
+        &store,
         "Bailey moved to Seattle",
         "general",
         &["Bailey"],
@@ -176,7 +174,7 @@ fn a_pair_with_only_one_side_carrying_a_triple_still_counts() {
     // The exclusion needs BOTH sides to carry a matching triple. This is
     // exactly the gap the tool exists for: structured on one side, prose on
     // the other, so the exact-triple mechanism never fires.
-    assert_eq!(total(&conn), 1);
+    assert_eq!(total(&store), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -186,7 +184,7 @@ fn a_pair_with_only_one_side_carrying_a_triple_still_counts() {
 #[test]
 fn a_broadly_mentioned_entity_is_excluded_entirely() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
     // One entity mentioned past the cap. Without the cap this alone would
     // contribute (n choose 2) pairs — on the reference author's vault, a
@@ -194,7 +192,7 @@ fn a_broadly_mentioned_entity_is_excluded_entirely() {
     let over = MAX_ENTITY_FANOUT + 1;
     for i in 0..over {
         add(
-            &conn,
+            &store,
             &format!("note {} about the big project", i),
             "general",
             &["BigProject"],
@@ -203,7 +201,7 @@ fn a_broadly_mentioned_entity_is_excluded_entirely() {
     }
 
     assert_eq!(
-        total(&conn),
+        total(&store),
         0,
         "past the cap, 'shares an entity' stops meaning anything"
     );
@@ -212,10 +210,10 @@ fn a_broadly_mentioned_entity_is_excluded_entirely() {
 #[test]
 fn an_entity_exactly_at_the_cap_still_pairs() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     for i in 0..MAX_ENTITY_FANOUT {
         add(
-            &conn,
+            &store,
             &format!("note {} about the project", i),
             "general",
             &["Project"],
@@ -226,35 +224,41 @@ fn an_entity_exactly_at_the_cap_still_pairs() {
     // The predicate is `<=`. Pinning the boundary means a later `<` fails here
     // rather than silently shrinking every vault's queue by one entity's worth.
     let n = MAX_ENTITY_FANOUT;
-    assert_eq!(total(&conn), n * (n - 1) / 2);
+    assert_eq!(total(&store), n * (n - 1) / 2);
 }
 
 #[test]
 fn the_cap_applies_to_both_sides_of_the_join() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     // A hub entity over the cap, plus a narrow entity shared by two of the
     // same memories. The narrow pair must survive; nothing may come through on
     // the hub. Capping only one side of the self-join would let pairs in
     // whichever way round the ids happened to sort.
     for i in 0..(MAX_ENTITY_FANOUT + 1) {
-        add(&conn, &format!("hub note {}", i), "general", &["Hub"], None);
+        add(
+            &store,
+            &format!("hub note {}", i),
+            "general",
+            &["Hub"],
+            None,
+        );
     }
-    add(&conn, "narrow one", "general", &["Narrow"], None);
-    add(&conn, "narrow two", "general", &["Narrow"], None);
+    add(&store, "narrow one", "general", &["Narrow"], None);
+    add(&store, "narrow two", "general", &["Narrow"], None);
 
-    assert_eq!(total(&conn), 1, "only the narrow pair");
+    assert_eq!(total(&store), 1, "only the narrow pair");
 }
 
 #[test]
 fn total_counts_past_the_limit() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     for i in 0..5 {
-        add(&conn, &format!("note {}", i), "general", &["Topic"], None);
+        add(&store, &format!("note {}", i), "general", &["Topic"], None);
     }
 
-    let result = candidates(&conn, 3, None).unwrap();
+    let result = candidates(&store, 3, None).unwrap();
 
     // 5 memories on one entity is 10 pairs. The count tells a caller how much
     // is behind the page, so it must not be derived from the page.
@@ -266,7 +270,7 @@ fn total_counts_past_the_limit() {
 fn an_empty_store_is_an_empty_batch() {
     let db = Database::open_in_memory().unwrap();
 
-    let result = candidates(&db.conn(), 20, None).unwrap();
+    let result = candidates(&db.store(), 20, None).unwrap();
 
     assert!(result.candidates.is_empty());
     assert_eq!(result.total_candidates, 0);
@@ -284,11 +288,17 @@ fn a_pair_reports_the_entity_that_connects_it() {
     // candidate query joins on memory_entities, so without it the caller has
     // to re-derive the join the producer already did.
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "I moved to Boston", "general", &["Boston"], None);
-    add(&conn, "I live in Seattle now", "general", &["Boston"], None);
+    let store = db.store();
+    add(&store, "I moved to Boston", "general", &["Boston"], None);
+    add(
+        &store,
+        "I live in Seattle now",
+        "general",
+        &["Boston"],
+        None,
+    );
 
-    let result = candidates(&conn, 20, None).unwrap();
+    let result = candidates(&store, 20, None).unwrap();
 
     assert_eq!(result.candidates.len(), 1);
     assert_eq!(result.candidates[0].shared_entities, vec!["Boston"]);
@@ -297,25 +307,25 @@ fn a_pair_reports_the_entity_that_connects_it() {
 #[test]
 fn every_shared_entity_is_reported_in_name_order() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     // Deliberately inserted out of alphabetical order, so a test that passes
     // is testing the ORDER BY rather than the insertion order.
     add(
-        &conn,
+        &store,
         "the Zebra project runs on Postgres",
         "general",
         &["Zebra", "Postgres", "Anvil"],
         None,
     );
     add(
-        &conn,
+        &store,
         "the Zebra project runs on SQLite",
         "general",
         &["Zebra", "Postgres", "Anvil"],
         None,
     );
 
-    let result = candidates(&conn, 20, None).unwrap();
+    let result = candidates(&store, 20, None).unwrap();
 
     assert_eq!(result.candidates.len(), 1);
     assert_eq!(
@@ -328,23 +338,23 @@ fn every_shared_entity_is_reported_in_name_order() {
 #[test]
 fn an_entity_only_one_side_mentions_is_not_reported_as_shared() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     add(
-        &conn,
+        &store,
         "Bailey works on Zebra",
         "general",
         &["Bailey", "Zebra"],
         None,
     );
     add(
-        &conn,
+        &store,
         "Bailey is on holiday",
         "general",
         &["Bailey", "Holiday"],
         None,
     );
 
-    let result = candidates(&conn, 20, None).unwrap();
+    let result = candidates(&store, 20, None).unwrap();
 
     assert_eq!(result.candidates.len(), 1);
     assert_eq!(
@@ -360,11 +370,17 @@ fn shared_entities_survives_serialisation() {
     // field that never serialises would pass every test above and change
     // nothing observable.
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "I moved to Boston", "general", &["Boston"], None);
-    add(&conn, "I live in Seattle now", "general", &["Boston"], None);
+    let store = db.store();
+    add(&store, "I moved to Boston", "general", &["Boston"], None);
+    add(
+        &store,
+        "I live in Seattle now",
+        "general",
+        &["Boston"],
+        None,
+    );
 
-    let result = candidates(&conn, 20, None).unwrap();
+    let result = candidates(&store, 20, None).unwrap();
     let json = serde_json::to_value(&result.candidates[0]).unwrap();
 
     assert_eq!(
@@ -395,12 +411,12 @@ fn a_second_page_returns_different_pairs_than_the_first() {
     // identical first page, so only `limit` rows of the queue were ever
     // reachable.
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     for i in 0..5 {
-        add(&conn, &format!("note {}", i), "general", &["Topic"], None);
+        add(&store, &format!("note {}", i), "general", &["Topic"], None);
     }
 
-    let first = candidates(&conn, 3, None).unwrap();
+    let first = candidates(&store, 3, None).unwrap();
     assert_eq!(first.candidates.len(), 3);
     assert!(first.has_more);
 
@@ -408,7 +424,7 @@ fn a_second_page_returns_different_pairs_than_the_first() {
         first.next_after_a.clone().unwrap(),
         first.next_after_b.clone().unwrap(),
     );
-    let second = candidates(&conn, 3, Some((&cursor.0, &cursor.1))).unwrap();
+    let second = candidates(&store, 3, Some((&cursor.0, &cursor.1))).unwrap();
 
     assert!(!second.candidates.is_empty(), "the second page must exist");
     let overlap: Vec<_> = pair_keys(&second)
@@ -424,11 +440,11 @@ fn a_second_page_returns_different_pairs_than_the_first() {
 #[test]
 fn paging_reaches_every_pair_exactly_once() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     for i in 0..5 {
-        add(&conn, &format!("note {}", i), "general", &["Topic"], None);
+        add(&store, &format!("note {}", i), "general", &["Topic"], None);
     }
-    let total = candidates(&conn, 100, None).unwrap().total_candidates as usize;
+    let total = candidates(&store, 100, None).unwrap().total_candidates as usize;
     assert_eq!(total, 10, "5 memories on one entity is 10 pairs");
 
     let mut seen: Vec<(String, String)> = Vec::new();
@@ -440,8 +456,8 @@ fn paging_reaches_every_pair_exactly_once() {
     let mut pages = 0;
     for _ in 0..(total + 5) {
         let page = match &cursor {
-            Some((a, b)) => candidates(&conn, 3, Some((a, b))).unwrap(),
-            None => candidates(&conn, 3, None).unwrap(),
+            Some((a, b)) => candidates(&store, 3, Some((a, b))).unwrap(),
+            None => candidates(&store, 3, None).unwrap(),
         };
         pages += 1;
         seen.extend(pair_keys(&page));
@@ -469,11 +485,17 @@ fn paging_reaches_every_pair_exactly_once() {
 #[test]
 fn a_short_page_reports_no_more_and_carries_no_cursor() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "I moved to Boston", "general", &["Boston"], None);
-    add(&conn, "I live in Seattle now", "general", &["Boston"], None);
+    let store = db.store();
+    add(&store, "I moved to Boston", "general", &["Boston"], None);
+    add(
+        &store,
+        "I live in Seattle now",
+        "general",
+        &["Boston"],
+        None,
+    );
 
-    let result = candidates(&conn, 20, None).unwrap();
+    let result = candidates(&store, 20, None).unwrap();
 
     assert_eq!(result.candidates.len(), 1);
     assert!(!result.has_more);
@@ -483,12 +505,18 @@ fn a_short_page_reports_no_more_and_carries_no_cursor() {
 #[test]
 fn a_cursor_past_the_end_returns_an_empty_page_not_the_first_one() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "I moved to Boston", "general", &["Boston"], None);
-    add(&conn, "I live in Seattle now", "general", &["Boston"], None);
+    let store = db.store();
+    add(&store, "I moved to Boston", "general", &["Boston"], None);
+    add(
+        &store,
+        "I live in Seattle now",
+        "general",
+        &["Boston"],
+        None,
+    );
 
     // A cursor sorting after every real pair.
-    let result = candidates(&conn, 20, Some(("zzzz", "zzzz"))).unwrap();
+    let result = candidates(&store, 20, Some(("zzzz", "zzzz"))).unwrap();
 
     assert!(
         result.candidates.is_empty(),

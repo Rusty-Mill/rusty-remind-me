@@ -4,13 +4,15 @@
 //! (`decompose`, the relation half of `annotate`) are still to come — so the
 //! edges are inserted directly.
 
+use remind_me_core::db::derived::Origin;
+use remind_me_core::db::entities::{Entities, RelationRow};
+use remind_me_core::db::Store;
 use remind_me_core::entity::{entity_id, resolve_entity, traverse_from_name, upsert_entity};
 use remind_me_core::{Database, EntityInput, EntityTraverseInput};
-use rusqlite::Connection;
 
-fn entity(conn: &Connection, name: &str, aliases: &[&str]) -> String {
+fn entity(store: &Store<'_>, name: &str, aliases: &[&str]) -> String {
     upsert_entity(
-        conn,
+        store,
         &EntityInput {
             name: name.to_string(),
             kind: Some("person".into()),
@@ -23,31 +25,32 @@ fn entity(conn: &Connection, name: &str, aliases: &[&str]) -> String {
 
 /// Edges are ordered by `created_at`, so the sequence number keeps the
 /// breadth-first order deterministic.
-fn relate(conn: &Connection, seq: u32, subject: &str, relation: &str, object: &str) {
+fn relate(store: &Store<'_>, seq: u32, subject: &str, relation: &str, object: &str) {
     let created = format!("2026-01-01T00:00:{:02}Z", seq);
-    conn.execute(
-        "INSERT INTO entity_relations (id, subject_entity_id, relation, object_entity_id,
-                                       created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?)",
-        rusqlite::params![
-            format!("rel_{}", seq),
-            subject,
-            relation,
-            object,
-            created,
-            created
-        ],
-    )
-    .unwrap();
+    let id = format!("rel_{}", seq);
+    Entities::new(store)
+        .insert_relation_or_ignore(
+            &RelationRow {
+                id: &id,
+                subject_entity_id: subject,
+                relation,
+                object_entity_id: object,
+                created_at: &created,
+                updated_at: &created,
+                node_id: None,
+            },
+            Origin::Sync,
+        )
+        .unwrap();
 }
 
 fn traverse(
-    conn: &Connection,
+    store: &Store<'_>,
     name: &str,
     hops: u32,
 ) -> remind_me_core::entity::EntityTraverseResult {
     traverse_from_name(
-        conn,
+        store,
         &EntityTraverseInput {
             name: name.to_string(),
             hops,
@@ -65,24 +68,24 @@ fn names(result: &remind_me_core::entity::EntityTraverseResult) -> Vec<String> {
 }
 
 /// A → B → C → D, so each extra hop reaches exactly one more entity.
-fn chain(conn: &Connection) -> Vec<String> {
+fn chain(store: &Store<'_>) -> Vec<String> {
     let ids: Vec<String> = ["Ada", "Bailey", "Cleo", "Dana"]
         .iter()
-        .map(|n| entity(conn, n, &[]))
+        .map(|n| entity(store, n, &[]))
         .collect();
-    relate(conn, 1, &ids[0], "knows", &ids[1]);
-    relate(conn, 2, &ids[1], "knows", &ids[2]);
-    relate(conn, 3, &ids[2], "knows", &ids[3]);
+    relate(store, 1, &ids[0], "knows", &ids[1]);
+    relate(store, 2, &ids[1], "knows", &ids[2]);
+    relate(store, 3, &ids[2], "knows", &ids[3]);
     ids
 }
 
 #[test]
 fn one_hop_returns_direct_relations_only() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    chain(&conn);
+    let store = db.store();
+    chain(&store);
 
-    let result = traverse(&conn, "Ada", 1);
+    let result = traverse(&store, "Ada", 1);
 
     assert!(result.found);
     assert_eq!(result.hops, Some(1));
@@ -95,15 +98,15 @@ fn one_hop_returns_direct_relations_only() {
 #[test]
 fn two_and_three_hops_reach_further() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    chain(&conn);
+    let store = db.store();
+    chain(&store);
 
-    let two = traverse(&conn, "Ada", 2);
+    let two = traverse(&store, "Ada", 2);
     assert_eq!(two.edges.len(), 2);
     assert_eq!(names(&two), vec!["Ada", "Bailey", "Cleo"]);
     assert_eq!(two.edges.iter().filter(|e| e.hop == 2).count(), 1);
 
-    let three = traverse(&conn, "Ada", 3);
+    let three = traverse(&store, "Ada", 3);
     assert_eq!(three.edges.len(), 3);
     assert_eq!(names(&three), vec!["Ada", "Bailey", "Cleo", "Dana"]);
 }
@@ -111,13 +114,13 @@ fn two_and_three_hops_reach_further() {
 #[test]
 fn traversal_follows_edges_in_both_directions() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let ada = entity(&conn, "Ada", &[]);
-    let bailey = entity(&conn, "Bailey", &[]);
+    let store = db.store();
+    let ada = entity(&store, "Ada", &[]);
+    let bailey = entity(&store, "Bailey", &[]);
     // Ada is the *object*; a subject-only walk would find nothing from her.
-    relate(&conn, 1, &bailey, "introduced", &ada);
+    relate(&store, 1, &bailey, "introduced", &ada);
 
-    let result = traverse(&conn, "Ada", 1);
+    let result = traverse(&store, "Ada", 1);
 
     assert_eq!(result.edges.len(), 1);
     assert_eq!(result.edges[0].subject_name, "Bailey");
@@ -127,16 +130,16 @@ fn traversal_follows_edges_in_both_directions() {
 #[test]
 fn hops_are_clamped_rather_than_rejected() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    chain(&conn);
+    let store = db.store();
+    chain(&store);
 
     // The schema bounds hops to 1..=3; a caller that ignores it gets a bounded
     // walk rather than an error.
-    let high = traverse(&conn, "Ada", 99);
+    let high = traverse(&store, "Ada", 99);
     assert_eq!(high.hops, Some(3));
     assert_eq!(high.edges.len(), 3);
 
-    let low = traverse(&conn, "Ada", 0);
+    let low = traverse(&store, "Ada", 0);
     assert_eq!(low.hops, Some(1));
     assert_eq!(low.edges.len(), 1);
 }
@@ -144,16 +147,16 @@ fn hops_are_clamped_rather_than_rejected() {
 #[test]
 fn a_cycle_terminates() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let a = entity(&conn, "Ada", &[]);
-    let b = entity(&conn, "Bailey", &[]);
-    relate(&conn, 1, &a, "knows", &b);
-    relate(&conn, 2, &b, "knows", &a);
+    let store = db.store();
+    let a = entity(&store, "Ada", &[]);
+    let b = entity(&store, "Bailey", &[]);
+    relate(&store, 1, &a, "knows", &b);
+    relate(&store, 2, &b, "knows", &a);
 
     // Three hops around a two-node cycle. Both edges are found at hop 1 —
     // both endpoints are already in the frontier — leaving nothing new to
     // expand, so hops 2 and 3 have an empty frontier and stop.
-    let result = traverse(&conn, "Ada", 3);
+    let result = traverse(&store, "Ada", 3);
 
     assert_eq!(result.edges.len(), 2);
     assert!(result.edges.iter().all(|e| e.hop == 1));
@@ -163,11 +166,11 @@ fn a_cycle_terminates() {
 #[test]
 fn a_self_relation_terminates() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let a = entity(&conn, "Ada", &[]);
-    relate(&conn, 1, &a, "knows", &a);
+    let store = db.store();
+    let a = entity(&store, "Ada", &[]);
+    relate(&store, 1, &a, "knows", &a);
 
-    let result = traverse(&conn, "Ada", 3);
+    let result = traverse(&store, "Ada", 3);
 
     assert_eq!(result.edges.len(), 1, "the edge is returned exactly once");
     assert_eq!(names(&result), vec!["Ada"]);
@@ -176,12 +179,12 @@ fn a_self_relation_terminates() {
 #[test]
 fn the_start_node_resolves_by_alias() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let bailey = entity(&conn, "Bailey Robertson", &["Bailey", "BR"]);
-    let ada = entity(&conn, "Ada", &[]);
-    relate(&conn, 1, &bailey, "knows", &ada);
+    let store = db.store();
+    let bailey = entity(&store, "Bailey Robertson", &["Bailey", "BR"]);
+    let ada = entity(&store, "Ada", &[]);
+    relate(&store, 1, &bailey, "knows", &ada);
 
-    let result = traverse(&conn, "  br  ", 1);
+    let result = traverse(&store, "  br  ", 1);
 
     assert!(
         result.found,
@@ -194,13 +197,13 @@ fn the_start_node_resolves_by_alias() {
 #[test]
 fn a_canonical_name_beats_an_alias_on_another_entity() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     // "Ada" is one entity's canonical name and another's alias. The canonical
     // name is the thing itself; the alias is a nickname for something else.
-    entity(&conn, "Ada", &[]);
-    entity(&conn, "Adelaide", &["Ada"]);
+    entity(&store, "Ada", &[]);
+    entity(&store, "Adelaide", &["Ada"]);
 
-    let resolved = resolve_entity(&conn, "Ada").unwrap().unwrap();
+    let resolved = resolve_entity(&store, "Ada").unwrap().unwrap();
 
     assert_eq!(resolved.name, "Ada");
     assert_eq!(resolved.id, entity_id("Ada"));
@@ -209,10 +212,10 @@ fn a_canonical_name_beats_an_alias_on_another_entity() {
 #[test]
 fn an_unknown_entity_reports_not_found_rather_than_erroring() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    entity(&conn, "Ada", &[]);
+    let store = db.store();
+    entity(&store, "Ada", &[]);
 
-    let result = traverse(&conn, "Nobody", 2);
+    let result = traverse(&store, "Nobody", 2);
 
     assert!(!result.found);
     assert_eq!(result.query.as_deref(), Some("Nobody"));
@@ -224,19 +227,19 @@ fn an_unknown_entity_reports_not_found_rather_than_erroring() {
 #[test]
 fn a_blank_name_resolves_to_nothing() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    entity(&conn, "Ada", &[]);
+    let store = db.store();
+    entity(&store, "Ada", &[]);
 
-    assert!(resolve_entity(&conn, "   ").unwrap().is_none());
+    assert!(resolve_entity(&store, "   ").unwrap().is_none());
 }
 
 #[test]
 fn an_isolated_entity_returns_itself_and_no_edges() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    entity(&conn, "Ada", &[]);
+    let store = db.store();
+    entity(&store, "Ada", &[]);
 
-    let result = traverse(&conn, "Ada", 3);
+    let result = traverse(&store, "Ada", 3);
 
     assert!(result.found);
     assert!(result.edges.is_empty());
@@ -246,15 +249,15 @@ fn an_isolated_entity_returns_itself_and_no_edges() {
 #[test]
 fn the_relation_filter_matches_exactly() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let a = entity(&conn, "Ada", &[]);
-    let b = entity(&conn, "Bailey", &[]);
-    let c = entity(&conn, "Cleo", &[]);
-    relate(&conn, 1, &a, "knows", &b);
-    relate(&conn, 2, &a, "works_with", &c);
+    let store = db.store();
+    let a = entity(&store, "Ada", &[]);
+    let b = entity(&store, "Bailey", &[]);
+    let c = entity(&store, "Cleo", &[]);
+    relate(&store, 1, &a, "knows", &b);
+    relate(&store, 2, &a, "works_with", &c);
 
     let filtered = traverse_from_name(
-        &conn,
+        &store,
         &EntityTraverseInput {
             name: "Ada".into(),
             hops: 1,
@@ -268,7 +271,7 @@ fn the_relation_filter_matches_exactly() {
     assert_eq!(filtered.edges[0].object_name, "Bailey");
 
     let unmatched = traverse_from_name(
-        &conn,
+        &store,
         &EntityTraverseInput {
             name: "Ada".into(),
             hops: 1,
@@ -286,15 +289,15 @@ fn the_relation_filter_matches_exactly() {
 #[test]
 fn the_cap_bounds_the_edges_returned() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let hub = entity(&conn, "Ada", &[]);
+    let store = db.store();
+    let hub = entity(&store, "Ada", &[]);
     for i in 0..10 {
-        let other = entity(&conn, &format!("Person {}", i), &[]);
-        relate(&conn, i + 1, &hub, "knows", &other);
+        let other = entity(&store, &format!("Person {}", i), &[]);
+        relate(&store, i + 1, &hub, "knows", &other);
     }
 
     let capped = traverse_from_name(
-        &conn,
+        &store,
         &EntityTraverseInput {
             name: "Ada".into(),
             hops: 3,
@@ -313,14 +316,14 @@ fn the_cap_bounds_the_edges_returned() {
 #[test]
 fn the_seed_is_first_and_entities_are_unique() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let a = entity(&conn, "Ada", &[]);
-    let b = entity(&conn, "Bailey", &[]);
+    let store = db.store();
+    let a = entity(&store, "Ada", &[]);
+    let b = entity(&store, "Bailey", &[]);
     // Two edges between the same pair: Bailey must still appear once.
-    relate(&conn, 1, &a, "knows", &b);
-    relate(&conn, 2, &a, "works_with", &b);
+    relate(&store, 1, &a, "knows", &b);
+    relate(&store, 2, &a, "works_with", &b);
 
-    let result = traverse(&conn, "Ada", 2);
+    let result = traverse(&store, "Ada", 2);
 
     assert_eq!(result.edges.len(), 2);
     assert_eq!(result.entities.len(), 2);

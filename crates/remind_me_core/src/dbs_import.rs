@@ -45,11 +45,14 @@
 //! keying on `item_created_at` would miss them. A hash comparison does not
 //! care which timestamp the edit was filed under.
 
+use crate::db::imports::{DbsTracked as Tracked, ImportLedger};
+use crate::db::memories::{Memories, NewMemory};
+use crate::db::Store;
 use crate::entity::{link_memory_entity, upsert_entity};
 use crate::import_paths::{validate_import_database, ImportPathError};
 use crate::models::{DbsImportInput, EntityInput, DBS_IMPORT_LIMIT_MAX, DBS_IMPORT_LIMIT_MIN};
 use chrono::Utc;
-use rusqlite::{params, params_from_iter, Connection, OpenFlags, Result};
+use rusqlite::{params_from_iter, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -85,6 +88,8 @@ pub enum DbsImportError {
         detail: String,
     },
     Sqlite(rusqlite::Error),
+    /// The node's own store failed.
+    Store(crate::db::StoreError),
 }
 
 impl std::fmt::Display for DbsImportError {
@@ -100,6 +105,7 @@ impl std::fmt::Display for DbsImportError {
                 path, detail
             ),
             Self::Sqlite(e) => write!(f, "{}", e),
+            Self::Store(e) => write!(f, "{}", e),
         }
     }
 }
@@ -109,6 +115,12 @@ impl std::error::Error for DbsImportError {}
 impl From<ImportPathError> for DbsImportError {
     fn from(e: ImportPathError) -> Self {
         Self::Path(e)
+    }
+}
+
+impl From<crate::db::StoreError> for DbsImportError {
+    fn from(e: crate::db::StoreError) -> Self {
+        Self::Store(e)
     }
 }
 
@@ -158,12 +170,6 @@ struct DbsItem {
     item_created_at: Option<String>,
     content_hash: String,
     source_name: String,
-}
-
-/// What a previous import recorded for one item.
-struct Tracked {
-    memory_id: String,
-    content_hash: String,
 }
 
 /// Open a `dbs` archive read-only.
@@ -310,9 +316,9 @@ fn read_items(
 
 /// What previous imports recorded for the items on this page.
 fn tracked_state(
-    conn: &Connection,
+    store: &Store<'_>,
     items: &[DbsItem],
-) -> Result<HashMap<(String, String), Tracked>> {
+) -> crate::db::Result<HashMap<(String, String), Tracked>> {
     let mut by_source: HashMap<&str, Vec<&str>> = HashMap::new();
     for item in items {
         by_source
@@ -324,36 +330,7 @@ fn tracked_state(
     let mut tracked = HashMap::new();
     for (source, external_ids) in by_source {
         for batch in external_ids.chunks(LOOKUP_BATCH) {
-            let placeholders = std::iter::repeat_n("?", batch.len())
-                .collect::<Vec<_>>()
-                .join(",");
-            let sql = format!(
-                "SELECT dbs_source, external_id, memory_id, content_hash
-                   FROM dbs_imports
-                  WHERE dbs_source = ? AND external_id IN ({})",
-                placeholders
-            );
-            let mut values = vec![rusqlite::types::Value::Text(source.to_string())];
-            values.extend(
-                batch
-                    .iter()
-                    .map(|id| rusqlite::types::Value::Text((*id).to_string())),
-            );
-
-            let mut statement = conn.prepare(&sql)?;
-            let rows = statement.query_map(params_from_iter(values), |row| {
-                Ok((
-                    (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
-                    Tracked {
-                        memory_id: row.get(2)?,
-                        content_hash: row.get(3)?,
-                    },
-                ))
-            })?;
-            for row in rows {
-                let (key, value) = row?;
-                tracked.insert(key, value);
-            }
+            tracked.extend(ImportLedger::new(store).dbs_tracked(source, batch)?);
         }
     }
     Ok(tracked)
@@ -392,7 +369,7 @@ fn item_tags(item: &DbsItem, extra: &[String]) -> Vec<String> {
 /// leave `dbs_imports` claiming items that no memory backs, and the next rerun
 /// would skip them — the archive would look imported when it was not.
 pub fn pull_dbs(
-    conn: &Connection,
+    store: &Store<'_>,
     input: &DbsImportInput,
 ) -> std::result::Result<DbsImportResult, DbsImportError> {
     let path = validate_import_database(&input.db_path)?;
@@ -414,7 +391,7 @@ pub fn pull_dbs(
     };
 
     let fetched = items.len();
-    let tracked = tracked_state(conn, &items)?;
+    let tracked = tracked_state(store, &items)?;
 
     let mut result = DbsImportResult {
         source: Some(input.source.clone()).filter(|s| !s.is_empty()),
@@ -441,105 +418,90 @@ pub fn pull_dbs(
     }
 
     let now = Utc::now().to_rfc3339();
-    let tx = conn.unchecked_transaction()?;
+    // One transaction for the page: a SQLite transaction, and one journal
+    // batch on the engine's memories core (ADR-0023, core PR 4b).
+    store.transaction(|page| -> Result<(), DbsImportError> {
+        for item in to_import {
+            let key = (item.source_name.clone(), item.external_id.clone());
+            let prior = tracked.get(&key);
+            let tags = item_tags(item, &input.tags);
+            let content = memory_content(
+                item.title.as_deref(),
+                item.body.as_deref(),
+                item.url.as_deref(),
+                &item.external_id,
+            );
+            let memory_id = dbs_memory_id(&item.source_name, &item.external_id, &item.content_hash);
 
-    for item in to_import {
-        let key = (item.source_name.clone(), item.external_id.clone());
-        let prior = tracked.get(&key);
-        let tags = item_tags(item, &input.tags);
-        let content = memory_content(
-            item.title.as_deref(),
-            item.body.as_deref(),
-            item.url.as_deref(),
-            &item.external_id,
-        );
-        let memory_id = dbs_memory_id(&item.source_name, &item.external_id, &item.content_hash);
+            let metadata = serde_json::json!({
+                "dbs_source": item.source_name,
+                "dbs_external_id": item.external_id,
+                "dbs_item_kind": item.item_kind,
+                "dbs_url": item.url,
+                "dbs_content_hash": item.content_hash,
+            });
 
-        let metadata = serde_json::json!({
-            "dbs_source": item.source_name,
-            "dbs_external_id": item.external_id,
-            "dbs_item_kind": item.item_kind,
-            "dbs_url": item.url,
-            "dbs_content_hash": item.content_hash,
-        });
-
-        tx.execute(
-            "INSERT OR IGNORE INTO memories
-                (id, content, category, tags, source, metadata, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            params![
-                memory_id,
-                content,
-                item.item_kind
+            Memories::new(page).insert_or_ignore(&NewMemory {
+                category: item
+                    .item_kind
                     .as_deref()
                     .filter(|k| !k.is_empty())
-                    .unwrap_or(DEFAULT_CATEGORY),
-                serde_json::to_string(&tags).unwrap_or_else(|_| "[]".to_string()),
-                format!("dbs:{}", item.source_name),
-                metadata.to_string(),
+                    .unwrap_or(DEFAULT_CATEGORY)
+                    .to_string(),
+                tags: tags.clone(),
+                source: format!("dbs:{}", item.source_name),
+                metadata,
                 // The item's own creation time, so a memory ages from when the
                 // thing happened rather than from when it was imported —
                 // vitality decay reads this column.
-                item.item_created_at.as_deref().unwrap_or(&now),
-                now,
-            ],
-        )?;
+                created_at: item.item_created_at.clone().unwrap_or_else(|| now.clone()),
+                ..NewMemory::new(memory_id.clone(), content, &now)
+            })?;
 
-        // The source, then every tag. This is the reason to prefer this over
-        // the export route, so it is not conditional on anything.
-        for (name, kind) in std::iter::once((item.source_name.as_str(), SOURCE_ENTITY_KIND))
-            .chain(tags.iter().map(|t| (t.as_str(), TAG_ENTITY_KIND)))
-        {
-            let before = entity_exists(&tx, name)?;
-            let entity = upsert_entity(
-                &tx,
-                &EntityInput {
-                    name: name.to_string(),
-                    kind: Some(kind.to_string()),
-                    aliases: Vec::new(),
-                },
-            )?;
-            if !before {
-                result.entities_created += 1;
-            }
-            if link_memory_entity(&tx, &memory_id, &entity.id)? {
-                result.entity_links += 1;
-            }
-        }
-
-        match prior {
-            Some(prior) => {
-                // A fresh memory rather than an in-place edit, with the old one
-                // pointed at the new. Every read path filters
-                // `superseded_by IS NULL`, so the previous version drops out of
-                // search while staying in the database.
-                tx.execute(
-                    "UPDATE memories SET superseded_by = ? WHERE id = ?",
-                    params![memory_id, prior.memory_id],
+            // The source, then every tag. This is the reason to prefer this over
+            // the export route, so it is not conditional on anything.
+            for (name, kind) in std::iter::once((item.source_name.as_str(), SOURCE_ENTITY_KIND))
+                .chain(tags.iter().map(|t| (t.as_str(), TAG_ENTITY_KIND)))
+            {
+                let before = entity_exists(page, name)?;
+                let entity = upsert_entity(
+                    page,
+                    &EntityInput {
+                        name: name.to_string(),
+                        kind: Some(kind.to_string()),
+                        aliases: Vec::new(),
+                    },
                 )?;
-                result.updated += 1;
+                if !before {
+                    result.entities_created += 1;
+                }
+                if link_memory_entity(page, &memory_id, &entity.id)? {
+                    result.entity_links += 1;
+                }
             }
-            None => result.created += 1,
+
+            match prior {
+                Some(prior) => {
+                    // A fresh memory rather than an in-place edit, with the old one
+                    // pointed at the new. Every read path filters
+                    // `superseded_by IS NULL`, so the previous version drops out of
+                    // search while staying in the database.
+                    Memories::new(page).set_superseded_by(&prior.memory_id, &memory_id, None)?;
+                    result.updated += 1;
+                }
+                None => result.created += 1,
+            }
+
+            ImportLedger::new(page).record_dbs(
+                &item.source_name,
+                &item.external_id,
+                &memory_id,
+                &item.content_hash,
+                &now,
+            )?;
         }
-
-        tx.execute(
-            "INSERT INTO dbs_imports (dbs_source, external_id, memory_id, content_hash, imported_at)
-             VALUES (?, ?, ?, ?, ?)
-             ON CONFLICT(dbs_source, external_id)
-             DO UPDATE SET memory_id = excluded.memory_id,
-                           content_hash = excluded.content_hash,
-                           imported_at = excluded.imported_at",
-            params![
-                item.source_name,
-                item.external_id,
-                memory_id,
-                item.content_hash,
-                now
-            ],
-        )?;
-    }
-
-    tx.commit()?;
+        Ok(())
+    })?;
 
     result.imported = result.created + result.updated;
     Ok(result)
@@ -549,6 +511,133 @@ pub fn pull_dbs(
 ///
 /// Checked before the upsert only so the result can report how many entities
 /// are genuinely new; `upsert_entity` merges either way.
-fn entity_exists(conn: &Connection, name: &str) -> Result<bool> {
-    Ok(crate::entity::get_entity_by_id(conn, &crate::entity::entity_id(name))?.is_some())
+fn entity_exists(store: &Store<'_>, name: &str) -> crate::db::Result<bool> {
+    Ok(crate::entity::get_entity_by_id(store, &crate::entity::entity_id(name))?.is_some())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::imports::ImportLedger;
+    use crate::db::Database;
+    use rusqlite::params;
+
+    /// A `dbs`-shaped archive of `(external_id, content_hash, tags)` items,
+    /// all from one source, in a scratch directory under the import root.
+    fn archive(name: &str, items: &[(&str, &str, &[&str])]) -> std::path::PathBuf {
+        let dir = std::path::PathBuf::from(crate::import_paths::home_dir_var().unwrap())
+            .join(format!("rrm_dbs_unit_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dbs.db");
+        let dbs = Connection::open(&path).unwrap();
+        dbs.execute_batch(
+            "CREATE TABLE sources (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
+             INSERT INTO sources (id, name) VALUES (1, 'raindrop');
+             CREATE TABLE items (
+                 id INTEGER PRIMARY KEY, source_id INTEGER NOT NULL,
+                 external_id TEXT NOT NULL, item_kind TEXT, title TEXT, url TEXT,
+                 body TEXT, tags_json TEXT, item_created_at TEXT,
+                 item_updated_at TEXT, content_hash TEXT NOT NULL,
+                 deleted INTEGER NOT NULL DEFAULT 0
+             );",
+        )
+        .unwrap();
+        for (external_id, hash, tags) in items {
+            dbs.execute(
+                "INSERT INTO items (source_id, external_id, item_kind, title, body,
+                     tags_json, item_created_at, item_updated_at, content_hash)
+                 VALUES (1, ?, 'link', ?, 'body', ?, '2026-01-01T00:00:00+00:00',
+                     '2026-01-01T00:00:00+00:00', ?)",
+                params![
+                    external_id,
+                    format!("title {external_id}"),
+                    serde_json::to_string(tags).unwrap(),
+                    hash
+                ],
+            )
+            .unwrap();
+        }
+        path
+    }
+
+    fn input(path: &std::path::Path) -> DbsImportInput {
+        DbsImportInput {
+            db_path: path.display().to_string(),
+            source: String::new(),
+            item_type: String::new(),
+            limit: 500,
+            offset: 0,
+            tags: Vec::new(),
+            dry_run: false,
+        }
+    }
+
+    /// An import, then a rerun where one item changed, as text, on `db`.
+    fn exercise(db: &Database, first: &std::path::Path, second: &std::path::Path) -> Vec<String> {
+        let store = db.store();
+        let ledger = |store: &Store<'_>| {
+            let mut tracked: Vec<String> = ImportLedger::new(store)
+                .dbs_tracked("raindrop", &["x1", "x2", "x3"])
+                .unwrap()
+                .into_iter()
+                .map(|(k, v)| format!("{k:?}={v:?}"))
+                .collect();
+            tracked.sort();
+            format!(
+                "{tracked:?} {:?}",
+                ImportLedger::new(store).live_dbs_memories(None).unwrap()
+            )
+        };
+        let entities = |store: &Store<'_>| {
+            ["raindrop", "shared", "only-x3"]
+                .map(|name| {
+                    crate::entity::get_entity_by_id(store, &crate::entity::entity_id(name))
+                        .unwrap()
+                        .is_some()
+                })
+                .to_vec()
+        };
+        vec![
+            format!("{:?}", pull_dbs(&store, &input(first)).unwrap()),
+            ledger(&store),
+            format!("{:?}", entities(&store)),
+            format!("{:?}", pull_dbs(&store, &input(second)).unwrap()),
+            ledger(&store),
+            format!("{:?}", entities(&store)),
+        ]
+    }
+
+    #[test]
+    fn a_dbs_page_imports_alike_on_both_backends() {
+        // Every item shares a tag, so each one after the first finds the
+        // entity an earlier item in the same page created.
+        let first = archive(
+            "first",
+            &[
+                ("x1", "h1", &["shared"]),
+                ("x2", "h2", &["shared"]),
+                ("x3", "h3", &["shared", "only-x3"]),
+            ],
+        );
+        let second = archive(
+            "second",
+            &[
+                ("x1", "h1", &["shared"]),
+                ("x2", "h2-changed", &["shared"]),
+                ("x3", "h3", &["shared", "only-x3"]),
+            ],
+        );
+        let mut observed = Vec::new();
+        crate::db::on_each_backend(|db| observed.push(exercise(db, &first, &second)));
+        let sqlite = &observed[0];
+        assert!(sqlite[0].contains("created: 3"), "{}", sqlite[0]);
+        assert!(sqlite[3].contains("updated: 1"), "{}", sqlite[3]);
+        for other in &observed[1..] {
+            assert_eq!(other, sqlite);
+        }
+        for path in [first, second] {
+            let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        }
+    }
 }

@@ -20,12 +20,14 @@
 //! then silently refuse to let you redo it.
 //!
 //! On a sync-enabled node this is a soft delete, so the removal propagates
-//! rather than resurrecting on the next pull. That also means the space is not
-//! reclaimed until tombstones are compacted.
+//! rather than resurrecting on the next pull. The tombstone keeps no text
+//! (ADR-0024), only the row itself.
 
+use crate::db::imports::ImportLedger;
 use crate::db::queries::delete_memory;
+use crate::db::Result;
+use crate::db::Store;
 use crate::models::{UndoImportInput, UndoImportKind, UndoImportResult};
-use rusqlite::{params_from_iter, Connection, Result};
 
 /// Memory ids belonging to an import, plus a human-readable scope label.
 ///
@@ -34,59 +36,28 @@ use rusqlite::{params_from_iter, Connection, Result};
 /// importer stamps onto `memories.doc_id`, so that join runs the other way
 /// round from the other two.
 fn matching_ids(
-    conn: &Connection,
+    store: &Store<'_>,
     kind: UndoImportKind,
     import_id: Option<&str>,
 ) -> Result<(Vec<String>, String)> {
     match kind {
-        UndoImportKind::Chat => match import_id {
-            Some(id) => {
-                let mut stmt = conn
-                    .prepare("SELECT id FROM memories WHERE doc_id = ? AND deleted_at IS NULL")?;
-                let ids = stmt
-                    .query_map([id], |r| r.get(0))?
-                    .collect::<Result<Vec<String>>>()?;
-                Ok((ids, format!("chat import {}", id)))
-            }
-            None => {
-                let mut stmt = conn.prepare(
-                    "SELECT id FROM memories
-                      WHERE deleted_at IS NULL
-                        AND doc_id IN (SELECT import_id FROM chat_imports)",
-                )?;
-                let ids = stmt
-                    .query_map([], |r| r.get(0))?
-                    .collect::<Result<Vec<String>>>()?;
-                Ok((ids, "all chat imports".to_string()))
-            }
-        },
-        UndoImportKind::Mempalace => matching_ids_mempalace(conn, import_id),
+        UndoImportKind::Chat => {
+            let ids = ImportLedger::new(store).live_chat_memories(import_id)?;
+            let label = match import_id {
+                Some(id) => format!("chat import {}", id),
+                None => "all chat imports".to_string(),
+            };
+            Ok((ids, label))
+        }
+        UndoImportKind::Mempalace => matching_ids_mempalace(store, import_id),
         UndoImportKind::Dbs => {
             // Prefix match so a whole dbs source can be targeted without naming
             // every external id it produced.
-            let (sql, label) = match import_id {
-                Some(id) => (
-                    "SELECT t.memory_id FROM dbs_imports t
-                       JOIN memories m ON m.id = t.memory_id
-                      WHERE m.deleted_at IS NULL AND t.dbs_source LIKE ?",
-                    format!("dbs scope '{}'", id),
-                ),
-                None => (
-                    "SELECT t.memory_id FROM dbs_imports t
-                       JOIN memories m ON m.id = t.memory_id
-                      WHERE m.deleted_at IS NULL",
-                    "all dbs imports".to_string(),
-                ),
+            let ids = ImportLedger::new(store).live_dbs_memories(import_id)?;
+            let label = match import_id {
+                Some(id) => format!("dbs scope '{}'", id),
+                None => "all dbs imports".to_string(),
             };
-            // One binding rather than a `match` returning two `query_map`s:
-            // no two closures share a type, even identical ones, so the arms
-            // would not unify.
-            let bindings: Vec<String> =
-                import_id.map(|id| format!("{}%", id)).into_iter().collect();
-            let mut stmt = conn.prepare(sql)?;
-            let ids = stmt
-                .query_map(params_from_iter(bindings.iter()), |r| r.get(0))?
-                .collect::<Result<Vec<String>>>()?;
             Ok((ids, label))
         }
     }
@@ -105,42 +76,19 @@ fn matching_ids(
 /// regardless of which path wrote it. Trusting the tracking table alone would
 /// silently leave the untracked half behind.
 fn matching_ids_mempalace(
-    conn: &Connection,
+    store: &Store<'_>,
     import_id: Option<&str>,
 ) -> Result<(Vec<String>, String)> {
-    let mut ids: std::collections::BTreeSet<String> = Default::default();
-
-    let (tracked_sql, untracked_sql, label) = match import_id {
-        Some(id) => (
-            "SELECT t.memory_id FROM mempalace_imports t
-               JOIN memories m ON m.id = t.memory_id
-              WHERE m.deleted_at IS NULL AND t.drawer_id LIKE ?",
-            "SELECT id FROM memories
-              WHERE deleted_at IS NULL
-                AND (source = 'mempalace_import' OR source LIKE 'mempalace:%')
-                AND json_extract(metadata, '$.mempalace_drawer_id') LIKE ?",
-            format!("mempalace scope '{}'", id),
-        ),
-        None => (
-            "SELECT t.memory_id FROM mempalace_imports t
-               JOIN memories m ON m.id = t.memory_id
-              WHERE m.deleted_at IS NULL",
-            "SELECT id FROM memories
-              WHERE deleted_at IS NULL
-                AND (source = 'mempalace_import' OR source LIKE 'mempalace:%')",
-            "all mempalace imports".to_string(),
-        ),
+    let ledger = ImportLedger::new(store);
+    let ids: std::collections::BTreeSet<String> = ledger
+        .live_tracked_mempalace_memories(import_id)?
+        .into_iter()
+        .chain(ledger.live_mempalace_shaped_memories(import_id)?)
+        .collect();
+    let label = match import_id {
+        Some(id) => format!("mempalace scope '{}'", id),
+        None => "all mempalace imports".to_string(),
     };
-
-    let bindings: Vec<String> = import_id.map(|id| format!("{}%", id)).into_iter().collect();
-    for sql in [tracked_sql, untracked_sql] {
-        let mut stmt = conn.prepare(sql)?;
-        let rows = stmt.query_map(params_from_iter(bindings.iter()), |r| r.get::<_, String>(0))?;
-        for row in rows {
-            ids.insert(row?);
-        }
-    }
-
     Ok((ids.into_iter().collect(), label))
 }
 
@@ -150,7 +98,7 @@ fn matching_ids_mempalace(
 /// link lives on `memories.doc_id`, and a hard delete removes those rows,
 /// leaving nothing to read the import id back from afterwards.
 fn forget_tracking(
-    conn: &Connection,
+    store: &Store<'_>,
     kind: UndoImportKind,
     memory_ids: &[String],
     doc_ids: &[String],
@@ -168,62 +116,25 @@ fn forget_tracking(
             // while some of its chunks survive would let a re-import duplicate
             // the surviving half, so an import only loses its tracking row once
             // nothing of it is left.
-            let marks = vec!["?"; doc_ids.len()].join(",");
-            const SURVIVORS: &str = "SELECT doc_id FROM memories
-                             WHERE doc_id IS NOT NULL AND deleted_at IS NULL";
+            let ledger = ImportLedger::new(store);
 
             // Retained raw transcripts (#212) go with the tracking row, and are
             // read out *before* the delete because the archive row is what
-            // holds the blob's path. Selected with the same NOT IN clause the
-            // delete uses rather than a looser one: forgetting the archive of
-            // an import whose chunks survive would strand memories pointing at
-            // a file that is no longer there.
-            let doomed: Vec<String> = {
-                let mut stmt = conn.prepare(&format!(
-                    "SELECT import_id FROM chat_imports
-                      WHERE import_id IN ({marks})
-                        AND import_id NOT IN ({SURVIVORS})",
-                    marks = marks,
-                    SURVIVORS = SURVIVORS
-                ))?;
-                // Bound rather than returned directly: as the block's tail
-                // expression the iterator's temporary outlives `stmt`.
-                let rows = stmt
-                    .query_map(params_from_iter(doc_ids.iter()), |r| r.get(0))?
-                    .collect::<Result<Vec<String>>>()?;
-                rows
-            };
-            for import_id in &doomed {
-                crate::archive::forget_import(conn, import_id)?;
+            // holds the blob's path. Selected with the same test the delete
+            // uses rather than a looser one: forgetting the archive of an
+            // import whose chunks survive would strand memories pointing at a
+            // file that is no longer there.
+            for import_id in &ledger.chat_imports_with_nothing_left(doc_ids)? {
+                crate::archive::forget_import(store, import_id)?;
             }
-
-            let affected = conn.execute(
-                &format!(
-                    "DELETE FROM chat_imports
-                      WHERE import_id IN ({marks})
-                        AND import_id NOT IN ({SURVIVORS})",
-                    marks = marks,
-                    SURVIVORS = SURVIVORS
-                ),
-                params_from_iter(doc_ids.iter()),
-            )?;
-            Ok(affected)
+            ledger.forget_chat_imports_with_nothing_left(doc_ids)
         }
         UndoImportKind::Dbs | UndoImportKind::Mempalace => {
-            let table = match kind {
-                UndoImportKind::Dbs => "dbs_imports",
-                _ => "mempalace_imports",
-            };
-            let marks = vec!["?"; memory_ids.len()].join(",");
-            let affected = conn.execute(
-                &format!(
-                    "DELETE FROM {table} WHERE memory_id IN ({marks})",
-                    table = table,
-                    marks = marks
-                ),
-                params_from_iter(memory_ids.iter()),
-            )?;
-            Ok(affected)
+            let ledger = ImportLedger::new(store);
+            match kind {
+                UndoImportKind::Dbs => ledger.forget_dbs(memory_ids),
+                _ => ledger.forget_mempalace(memory_ids),
+            }
         }
     }
 }
@@ -233,9 +144,9 @@ fn forget_tracking(
 /// Defaults to a dry run, deliberately: this is a bulk destructive operation
 /// and, on a sync-enabled node, one that propagates to every other node. The
 /// work is resumable — call again until `remaining` reaches 0.
-pub fn undo_import(conn: &Connection, input: &UndoImportInput) -> Result<UndoImportResult> {
-    let (memory_ids, scope) = matching_ids(conn, input.import_kind, input.import_id.as_deref())?;
-    let soft = crate::sync::sync_enabled();
+pub fn undo_import(store: &Store<'_>, input: &UndoImportInput) -> Result<UndoImportResult> {
+    let (memory_ids, scope) = matching_ids(store, input.import_kind, input.import_id.as_deref())?;
+    let soft = crate::sync::store_syncs(store)?;
 
     let mode = if soft {
         "soft-delete (tombstone, propagates over sync)"
@@ -256,8 +167,8 @@ pub fn undo_import(conn: &Connection, input: &UndoImportInput) -> Result<UndoImp
             hint: Some(
                 if soft {
                     "dry run — nothing changed. Re-run with dry_run=false to remove. \
-                     Tombstoned rows keep their content until compaction, so disk use \
-                     will not drop immediately."
+                     Removed memories stay as tombstones without their text, so \
+                     the removal reaches every other node."
                 } else {
                     "dry run — nothing changed. Re-run with dry_run=false to remove. \
                      Rows are removed outright; run VACUUM to reclaim the file."
@@ -271,17 +182,8 @@ pub fn undo_import(conn: &Connection, input: &UndoImportInput) -> Result<UndoImp
 
     // Before the purge, not after: a hard delete removes the rows outright, and
     // `doc_id` is the only place a chat import's id is recorded on the memory.
-    let doc_ids: Vec<String> = if input.import_kind == UndoImportKind::Chat && !batch.is_empty() {
-        let marks = vec!["?"; batch.len()].join(",");
-        let mut stmt = conn.prepare(&format!(
-            "SELECT DISTINCT doc_id FROM memories
-              WHERE doc_id IS NOT NULL AND id IN ({})",
-            marks
-        ))?;
-        let ids = stmt
-            .query_map(params_from_iter(batch.iter()), |r| r.get(0))?
-            .collect::<Result<Vec<String>>>()?;
-        ids
+    let doc_ids: Vec<String> = if input.import_kind == UndoImportKind::Chat {
+        ImportLedger::new(store).doc_ids_of(&batch)?
     } else {
         Vec::new()
     };
@@ -290,12 +192,12 @@ pub fn undo_import(conn: &Connection, input: &UndoImportInput) -> Result<UndoImp
     for memory_id in &batch {
         // `delete_memory` reports false for an id already gone, which is not an
         // error here: a resumed undo can legitimately re-encounter one.
-        if delete_memory(conn, memory_id)? {
+        if delete_memory(store, memory_id)? {
             removed += 1;
         }
     }
 
-    let tracking_rows_removed = forget_tracking(conn, input.import_kind, &batch, &doc_ids)?;
+    let tracking_rows_removed = forget_tracking(store, input.import_kind, &batch, &doc_ids)?;
 
     let remaining = memory_ids.len().saturating_sub(removed);
     Ok(UndoImportResult {

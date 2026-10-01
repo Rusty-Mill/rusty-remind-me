@@ -48,7 +48,7 @@ fn pid_file_path_sits_beside_the_database_file() {
     let db_path = dir.join("memories.db");
     let db = Database::open(&db_path).unwrap();
 
-    let path = pid_file_path(&db.conn()).unwrap();
+    let path = pid_file_path(&db.store()).unwrap();
 
     assert_eq!(path, dir.join("server.pid"));
     std::fs::remove_dir_all(&dir).ok();
@@ -58,7 +58,7 @@ fn pid_file_path_sits_beside_the_database_file() {
 fn pid_file_path_errors_for_an_in_memory_database() {
     let db = Database::open_in_memory().unwrap();
 
-    let err = pid_file_path(&db.conn()).unwrap_err();
+    let err = pid_file_path(&db.store()).unwrap_err();
 
     assert!(matches!(err, PidError::InMemory));
 }

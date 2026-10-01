@@ -13,8 +13,11 @@
 //! all set — the same default-off posture as the webhook endpoint (`#56`)
 //! and the folder watcher (`#55`).
 
+use crate::db::outbox::Outbox;
+use crate::db::sync_state::SyncState;
+use crate::db::Result;
+use crate::db::Store;
 use chrono::{Duration, Utc};
-use rusqlite::{params, Connection, Result};
 
 mod graph;
 // Public so `notifications` can reuse the one HTTP client this crate has
@@ -62,6 +65,16 @@ pub const HUB_URL_ENV: &str = "REMIND_ME_HUB_URL";
 /// both sent (to the hub) and required (of callers of this node's own peer
 /// server). Sync is off without one.
 pub const SYNC_SECRET_ENV: &str = "REMIND_ME_SYNC_SECRET";
+/// Set (`1`, `true`, `yes`, `on`) to turn sync off for this node's store:
+/// the flag goes off and the outbox is emptied. Without it, a process that
+/// lacks the sync settings above leaves a syncing store syncing.
+pub const SYNC_DISABLE_ENV: &str = "REMIND_ME_SYNC_DISABLE";
+/// The `content` a deleted memory keeps once its text is dropped
+/// (ADR-0024). Not `""`: `sync::record::upsert_record` rejects a record with
+/// empty content, and a pull stops at a record that did not apply, so an
+/// empty tombstone would stall every node on it. The hub stores the same
+/// value; it is part of the wire format.
+pub const TOMBSTONE_CONTENT: &str = "(deleted)";
 /// Seconds between background sync cycles.
 pub const SYNC_INTERVAL_ENV: &str = "REMIND_ME_SYNC_INTERVAL";
 pub const DEFAULT_SYNC_INTERVAL_SECS: u64 = 60;
@@ -126,14 +139,25 @@ static HANDSHAKE_CLIENT: std::sync::RwLock<Option<String>> = std::sync::RwLock::
 ///
 /// Called by the server on handshake. `None` clears it, which is what a fresh
 /// process — or a test — wants.
+///
+/// On a daemon connection it belongs to that connection's session instead:
+/// one daemon serves many clients, and a process-wide slot would record
+/// whichever of them shook hands last.
 pub fn set_handshake_client(identity: Option<String>) {
+    let identity = identity.filter(|s| !s.trim().is_empty());
+    if crate::daemon::session::set_handshake_client(identity.clone()) {
+        return;
+    }
     if let Ok(mut slot) = HANDSHAKE_CLIENT.write() {
-        *slot = identity.filter(|s| !s.trim().is_empty());
+        *slot = identity;
     }
 }
 
 /// The client identity currently in force.
 pub fn handshake_client() -> Option<String> {
+    if let Some(in_session) = crate::daemon::session::handshake_client() {
+        return in_session;
+    }
     HANDSHAKE_CLIENT.read().ok().and_then(|s| s.clone())
 }
 
@@ -153,7 +177,7 @@ pub fn configured_client() -> String {
     if let Some(identity) = handshake_client() {
         return identity;
     }
-    std::env::var(CLIENT_ENV).unwrap_or_else(|_| DEFAULT_CLIENT.to_string())
+    crate::daemon::session::var(CLIENT_ENV).unwrap_or_else(|| DEFAULT_CLIENT.to_string())
 }
 
 /// The `(node_id, client)` pair every newly created memory is stamped with.
@@ -168,7 +192,7 @@ pub fn configured_client() -> String {
 /// That is worse than not having the columns. A reader of `client` could not
 /// tell "unknown because nobody configured one" from "unknown because this
 /// write path forgot", and `node_id` rides the outbox payload
-/// (`schema_triggers.sql`), so per-node attribution on the hub silently saw
+/// (`db::derived`), so per-node attribution on the hub silently saw
 /// only manually-added memories.
 pub fn memory_provenance() -> (String, String) {
     (configured_node_id(), configured_client())
@@ -247,7 +271,8 @@ pub fn probe_hub_version() -> Option<String> {
     version
 }
 
-const NOW_ISO_EXPR: &str = "strftime('%Y-%m-%dT%H:%M:%f000', 'now') || '+00:00'";
+/// The `sync_flags` key recording whether the outbox is being filled.
+const SYNC_ENABLED_FLAG: &str = "sync_enabled";
 
 /// Align `sync_flags.sync_enabled` with [`sync_enabled`], every time the
 /// schema is opened — matching the reference's own `_reconcile_sync_enabled_flag`,
@@ -261,8 +286,14 @@ const NOW_ISO_EXPR: &str = "strftime('%Y-%m-%dT%H:%M:%f000', 'now') || '+00:00'"
 ///   `entity_relations` either — preserved rather than "fixed," since
 ///   covering more tables than the reference does would make the two diverge
 ///   on what a first sync actually sends.
-/// - now disabled (from any prior state): `sync_outbox`/`sync_sends` are
-///   cleared — nothing is left to drain.
+/// - stored `"1"`, but this process has no sync settings: left as it is,
+///   with a warning. A store is shared by every process on a node, and
+///   one started without the settings (a dashboard, a one-off CLI) must
+///   not switch sync off for the rest: it used to clear the outbox and
+///   stop queueing their edits, which is how a real node lost six days of
+///   sync. [`SYNC_DISABLE_ENV`] is the explicit way to turn it off.
+/// - now disabled, from any other state or with [`SYNC_DISABLE_ENV`] set:
+///   `sync_outbox`/`sync_sends` are cleared — nothing is left to drain.
 /// - unset (a fresh database) and now enabled: no backfill, matching the
 ///   reference's own reasoning verbatim even though the reference's stated
 ///   justification ("pre-gate triggers were unconditional, so the outbox is
@@ -271,66 +302,51 @@ const NOW_ISO_EXPR: &str = "strftime('%Y-%m-%dT%H:%M:%f000', 'now') || '+00:00'"
 ///   behind one cell of it keeps this one reconciliation function, not two
 ///   diverging ones for "true fresh" vs. "upgraded from an older,
 ///   once-ungated build."
-pub fn reconcile_sync_enabled_flag(conn: &Connection) -> Result<()> {
-    use rusqlite::OptionalExtension;
-
-    let desired = if sync_enabled() { "1" } else { "0" };
-    let stored: Option<String> = conn
-        .query_row(
-            "SELECT value FROM sync_flags WHERE key = 'sync_enabled'",
-            [],
-            |r| r.get(0),
-        )
-        .optional()?;
+pub fn reconcile_sync_enabled_flag(store: &Store<'_>) -> Result<()> {
+    let state = SyncState::new(store);
+    let stored = state.flag(SYNC_ENABLED_FLAG)?;
+    let disable = sync_disable_requested();
+    let desired = if sync_enabled() && !disable { "1" } else { "0" };
 
     if stored.as_deref() == Some(desired) {
         return Ok(());
     }
-
-    if desired == "1" && stored.as_deref() == Some("0") {
-        conn.execute_batch(&format!(
-            "INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
-             SELECT id, 'insert', json_object(
-                 'id', id, 'content', content, 'category', category, 'tags', tags,
-                 'source', source, 'metadata', metadata, 'created_at', created_at,
-                 'updated_at', updated_at, 'capture_id', capture_id, 'node_id', node_id,
-                 'client', client, 'accessed_at', accessed_at, 'access_count', access_count,
-                 'decay_rate', decay_rate, 'vitality', vitality, 'base_weight', base_weight,
-                 'status', status, 'memory_type', memory_type,
-                 'source_capture_id', source_capture_id, 'subject', subject,
-                 'predicate', predicate, 'object', object, 'superseded_by', superseded_by,
-                 'doc_id', doc_id, 'chunk_index', chunk_index, 'deleted_at', deleted_at
-             ), {now}
-             FROM memories;
-
-             INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
-             SELECT id, 'insert', json_object(
-                 'record_type', 'entity', 'id', id, 'name', name, 'kind', kind,
-                 'aliases', aliases, 'created_at', created_at, 'updated_at', updated_at,
-                 'node_id', node_id
-             ), {now}
-             FROM entities;
-
-             INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
-             SELECT memory_id, 'insert', json_object(
-                 'record_type', 'memory_entity',
-                 'id', memory_id || '|' || entity_id,
-                 'memory_id', memory_id, 'entity_id', entity_id, 'created_at', created_at
-             ), {now}
-             FROM memory_entities;",
-            now = NOW_ISO_EXPR
-        ))?;
-    } else if desired == "0" {
-        conn.execute_batch("DELETE FROM sync_outbox; DELETE FROM sync_sends;")?;
+    if desired == "0" && stored.as_deref() == Some("1") && !disable {
+        eprintln!(
+            "rusty-remind-me: this store syncs, but this process has no sync settings \
+             ({NODE_ID_ENV}, {HUB_URL_ENV}, {SYNC_SECRET_ENV}); leaving sync on. Set \
+             {SYNC_DISABLE_ENV}=1 to turn it off and empty the outbox."
+        );
+        return Ok(());
     }
 
-    conn.execute(
-        "INSERT INTO sync_flags (key, value) VALUES ('sync_enabled', ?)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        params![desired],
-    )?;
+    if desired == "1" && stored.as_deref() == Some("0") {
+        Outbox::new(store).backfill_everything()?;
+    } else if desired == "0" {
+        Outbox::new(store).clear()?;
+    }
 
-    Ok(())
+    state.set_flag(SYNC_ENABLED_FLAG, desired)
+}
+
+/// Whether this store syncs: its `sync_enabled` flag, which
+/// [`reconcile_sync_enabled_flag`] keeps. What decides whether a delete
+/// leaves a tombstone, so every process writing one store deletes the same
+/// way, whatever its own settings. A process without them used to hard
+/// delete, and the delete never reached any other node.
+pub fn store_syncs(store: &Store<'_>) -> Result<bool> {
+    Ok(SyncState::new(store).flag(SYNC_ENABLED_FLAG)?.as_deref() == Some("1"))
+}
+
+/// Whether [`SYNC_DISABLE_ENV`] asks for sync off: `1`, `true`, `yes` or
+/// `on`, any case.
+fn sync_disable_requested() -> bool {
+    matches!(
+        configured_env(SYNC_DISABLE_ENV)
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 /// Days an unsent outbox row is kept before being pruned.
@@ -363,10 +379,15 @@ fn outbox_retention_days() -> i64 {
 ///
 /// # Why this policy and not another
 ///
-/// This is the reference's own rule, verbatim: rows already marked sent are
-/// echo-suppressed and never pushed, so they go immediately; the rest are kept
-/// for the retention window so an intermittently-reachable remote can still
-/// catch up, then dropped along with their per-remote send markers.
+/// Rows already marked sent are echo-suppressed and never pushed, so they go
+/// immediately, as in the reference. So do rows the hub has taken: every
+/// node pulls them from the hub, and a peer can also pull them from this
+/// node's feed, which reads the memories themselves, not the outbox. Keeping
+/// them only held a second full copy of every change, including the text
+/// of memories deleted since (ADR-0024). The rest are kept for the retention
+/// window so an intermittently reachable remote can still catch up, then
+/// dropped along with their per-remote send markers. A node without a hub
+/// never records a hub send, so for it only the window applies.
 ///
 /// Copying the policy rather than inventing one matters because a database can
 /// be shared with `remind_me` — it opens the same file and prunes on the same
@@ -380,17 +401,9 @@ fn outbox_retention_days() -> i64 {
 /// (bounding a long-lived database even with sync disabled) and, when sync
 /// is enabled, once per [`SyncWorker`] cycle — matching the reference's own
 /// arrangement now that one exists.
-pub fn prune_outbox(conn: &Connection) -> Result<usize> {
+pub fn prune_outbox(store: &Store<'_>) -> Result<usize> {
     let cutoff = (Utc::now() - Duration::days(outbox_retention_days())).to_rfc3339();
-    let removed = conn.execute(
-        "DELETE FROM sync_outbox WHERE sent_at != '' OR created_at < ?",
-        params![cutoff],
-    )?;
-    conn.execute(
-        "DELETE FROM sync_sends WHERE outbox_id NOT IN (SELECT id FROM sync_outbox)",
-        [],
-    )?;
-    Ok(removed)
+    Outbox::new(store).prune(&cutoff, HUB_REMOTE_ID)
 }
 
 /// Records a real, successful HTTP push round trip with `remote_id` (a push
@@ -408,28 +421,14 @@ pub fn prune_outbox(conn: &Connection) -> Result<usize> {
 /// whatever the last write happened to be, however old). Best-effort: a
 /// write failure here is telemetry, not correctness, and must not turn a
 /// successful sync into a reported failure.
-pub(crate) fn record_push(conn: &Connection, remote_id: &str) {
-    let now = Utc::now().to_rfc3339();
-    let _ = conn.execute(
-        "INSERT INTO sync_log (remote_id, last_attempt_at, last_push_at) VALUES (?, ?, ?)
-         ON CONFLICT(remote_id) DO UPDATE SET
-             last_attempt_at = excluded.last_attempt_at,
-             last_push_at = excluded.last_push_at",
-        params![remote_id, now, now],
-    );
+pub(crate) fn record_push(store: &Store<'_>, remote_id: &str) {
+    let _ = SyncState::new(store).stamp_push(remote_id, &Utc::now().to_rfc3339());
 }
 
 /// Same as [`record_push`], but for a successful pull -- sets
 /// `last_attempt_at` and `last_pull_at` instead.
-pub(crate) fn record_pull(conn: &Connection, remote_id: &str) {
-    let now = Utc::now().to_rfc3339();
-    let _ = conn.execute(
-        "INSERT INTO sync_log (remote_id, last_attempt_at, last_pull_at) VALUES (?, ?, ?)
-         ON CONFLICT(remote_id) DO UPDATE SET
-             last_attempt_at = excluded.last_attempt_at,
-             last_pull_at = excluded.last_pull_at",
-        params![remote_id, now, now],
-    );
+pub(crate) fn record_pull(store: &Store<'_>, remote_id: &str) {
+    let _ = SyncState::new(store).stamp_pull(remote_id, &Utc::now().to_rfc3339());
 }
 
 #[cfg(test)]

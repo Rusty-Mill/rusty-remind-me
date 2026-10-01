@@ -9,16 +9,16 @@
 //! not about a row existing.
 
 use remind_me_core::capture::auto_capture;
+use remind_me_core::db::Store;
 use remind_me_core::skeleton::{node_slice, read_skeleton, write_skeleton, SkeletonError};
 use remind_me_core::{AutoCaptureInput, Database, SkeletonWriteInput, SKELETON_CATEGORY};
-use rusqlite::Connection;
 use std::collections::BTreeMap;
 
 fn db(name: &str) -> Database {
     let dir = std::env::temp_dir().join(format!("rrm_skel_{}_{}", name, std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    Database::open(dir.join("memories.db").display().to_string()).unwrap()
+    Database::open_on_sqlite(dir.join("memories.db").display().to_string()).unwrap()
 }
 
 /// A transcript long enough that reading it is a real cost — 120 turns, each
@@ -36,9 +36,9 @@ fn long_transcript() -> String {
         .join("")
 }
 
-fn capture(conn: &Connection, conversation: &str) -> String {
+fn capture(store: &Store<'_>, conversation: &str) -> String {
     auto_capture(
-        conn,
+        store,
         &AutoCaptureInput {
             conversation: conversation.to_string(),
             summary: "A long conversation about the schema".into(),
@@ -64,11 +64,11 @@ const DIAGRAM: &str = "graph TD\n  n1[Opening] --> n2[Middle]\n  n2 --> n3[Close
 #[test]
 fn a_skeleton_round_trips_with_its_node_map() {
     let db = db("roundtrip");
-    let conn = db.conn();
-    let capture_id = capture(&conn, &long_transcript());
+    let store = db.store();
+    let capture_id = capture(&store, &long_transcript());
 
     write_skeleton(
-        &conn,
+        &store,
         &SkeletonWriteInput {
             capture_id: capture_id.clone(),
             mermaid: DIAGRAM.into(),
@@ -77,7 +77,7 @@ fn a_skeleton_round_trips_with_its_node_map() {
     )
     .unwrap();
 
-    let read = read_skeleton(&conn, &capture_id).unwrap().unwrap();
+    let read = read_skeleton(&store, &capture_id).unwrap().unwrap();
     assert_eq!(read.mermaid, DIAGRAM);
     assert_eq!(read.nodes.get("n2"), Some(&(31, 300)));
     assert_eq!(read.nodes.len(), 3);
@@ -86,13 +86,13 @@ fn a_skeleton_round_trips_with_its_node_map() {
 #[test]
 fn a_node_resolves_to_exactly_its_lines() {
     let db = db("slice");
-    let conn = db.conn();
+    let store = db.store();
     let transcript = long_transcript();
-    let capture_id = capture(&conn, &transcript);
+    let capture_id = capture(&store, &transcript);
 
     // Turn 2 occupies lines 4..=6: three lines per turn, 1-based.
     write_skeleton(
-        &conn,
+        &store,
         &SkeletonWriteInput {
             capture_id: capture_id.clone(),
             mermaid: DIAGRAM.into(),
@@ -101,7 +101,7 @@ fn a_node_resolves_to_exactly_its_lines() {
     )
     .unwrap();
 
-    let slice = node_slice(&conn, &capture_id, "turn2").unwrap().unwrap();
+    let slice = node_slice(&store, &capture_id, "turn2").unwrap().unwrap();
 
     assert_eq!((slice.start_line, slice.end_line), (4, 6));
     assert_eq!(slice.content.lines().count(), 3);
@@ -114,12 +114,12 @@ fn a_node_resolves_to_exactly_its_lines() {
 #[test]
 fn reading_the_skeleton_costs_a_fraction_of_reading_the_dialog() {
     let db = db("cost");
-    let conn = db.conn();
+    let store = db.store();
     let transcript = long_transcript();
-    let capture_id = capture(&conn, &transcript);
+    let capture_id = capture(&store, &transcript);
 
     write_skeleton(
-        &conn,
+        &store,
         &SkeletonWriteInput {
             capture_id: capture_id.clone(),
             mermaid: DIAGRAM.into(),
@@ -128,7 +128,7 @@ fn reading_the_skeleton_costs_a_fraction_of_reading_the_dialog() {
     )
     .unwrap();
 
-    let skeleton = read_skeleton(&conn, &capture_id).unwrap().unwrap();
+    let skeleton = read_skeleton(&store, &capture_id).unwrap().unwrap();
     let skeleton_cost = serde_json::to_string(&skeleton).unwrap().len();
     let dialog_cost = transcript.len();
 
@@ -145,18 +145,18 @@ fn reading_the_skeleton_costs_a_fraction_of_reading_the_dialog() {
 
     // And one drill-down is still far cheaper than the transcript, which is
     // what makes the two-step read worth doing rather than just fetching it.
-    let slice = node_slice(&conn, &capture_id, "n2").unwrap().unwrap();
+    let slice = node_slice(&store, &capture_id, "n2").unwrap().unwrap();
     assert!(slice.content.len() * 2 < dialog_cost);
 }
 
 #[test]
 fn a_range_past_the_end_of_the_dialog_is_refused_at_write_time() {
     let db = db("badrange");
-    let conn = db.conn();
-    let capture_id = capture(&conn, "one\ntwo\nthree");
+    let store = db.store();
+    let capture_id = capture(&store, "one\ntwo\nthree");
 
     let err = write_skeleton(
-        &conn,
+        &store,
         &SkeletonWriteInput {
             capture_id: capture_id.clone(),
             mermaid: DIAGRAM.into(),
@@ -175,19 +175,19 @@ fn a_range_past_the_end_of_the_dialog_is_refused_at_write_time() {
 
     // Refused means nothing was stored — a rejected write must not leave a
     // half-skeleton that later reads as authoritative.
-    assert!(read_skeleton(&conn, &capture_id).unwrap().is_none());
+    assert!(read_skeleton(&store, &capture_id).unwrap().is_none());
 }
 
 #[test]
 fn zero_based_ranges_fail_loudly_rather_than_sliding_by_one() {
     let db = db("zerobased");
-    let conn = db.conn();
-    let capture_id = capture(&conn, "one\ntwo\nthree");
+    let store = db.store();
+    let capture_id = capture(&store, "one\ntwo\nthree");
 
     // A model that emitted 0-based offsets would otherwise return one line too
     // many, forever, and look plausible doing it.
     let err = write_skeleton(
-        &conn,
+        &store,
         &SkeletonWriteInput {
             capture_id,
             mermaid: DIAGRAM.into(),
@@ -202,12 +202,12 @@ fn zero_based_ranges_fail_loudly_rather_than_sliding_by_one() {
 #[test]
 fn writing_again_replaces_rather_than_accumulates() {
     let db = db("replace");
-    let conn = db.conn();
-    let capture_id = capture(&conn, "one\ntwo\nthree\nfour");
+    let store = db.store();
+    let capture_id = capture(&store, "one\ntwo\nthree\nfour");
 
     for mermaid in ["graph TD\n  a[First]", "graph TD\n  b[Second]"] {
         write_skeleton(
-            &conn,
+            &store,
             &SkeletonWriteInput {
                 capture_id: capture_id.clone(),
                 mermaid: mermaid.into(),
@@ -217,7 +217,9 @@ fn writing_again_replaces_rather_than_accumulates() {
         .unwrap();
     }
 
-    let stored: i64 = conn
+    let stored: i64 = store
+        .sqlite()
+        .unwrap()
         .query_row(
             "SELECT count(*) FROM memories WHERE capture_id = ? AND category = ?",
             rusqlite::params![capture_id, SKELETON_CATEGORY],
@@ -226,7 +228,7 @@ fn writing_again_replaces_rather_than_accumulates() {
         .unwrap();
     assert_eq!(stored, 1, "a capture has one shape, not a history of them");
     assert_eq!(
-        read_skeleton(&conn, &capture_id).unwrap().unwrap().mermaid,
+        read_skeleton(&store, &capture_id).unwrap().unwrap().mermaid,
         "graph TD\n  b[Second]"
     );
 }
@@ -234,11 +236,11 @@ fn writing_again_replaces_rather_than_accumulates() {
 #[test]
 fn an_unknown_node_is_an_empty_answer_not_an_error() {
     let db = db("unknown");
-    let conn = db.conn();
-    let capture_id = capture(&conn, "one\ntwo\nthree");
+    let store = db.store();
+    let capture_id = capture(&store, "one\ntwo\nthree");
 
     write_skeleton(
-        &conn,
+        &store,
         &SkeletonWriteInput {
             capture_id: capture_id.clone(),
             mermaid: DIAGRAM.into(),
@@ -247,17 +249,17 @@ fn an_unknown_node_is_an_empty_answer_not_an_error() {
     )
     .unwrap();
 
-    assert!(node_slice(&conn, &capture_id, "nope").unwrap().is_none());
-    assert!(read_skeleton(&conn, "cap_nonexistent").unwrap().is_none());
+    assert!(node_slice(&store, &capture_id, "nope").unwrap().is_none());
+    assert!(read_skeleton(&store, "cap_nonexistent").unwrap().is_none());
 }
 
 #[test]
 fn a_skeleton_is_not_offered_to_the_annotation_backlog() {
     let db = db("extract");
-    let conn = db.conn();
-    let capture_id = capture(&conn, "one\ntwo\nthree");
+    let store = db.store();
+    let capture_id = capture(&store, "one\ntwo\nthree");
     write_skeleton(
-        &conn,
+        &store,
         &SkeletonWriteInput {
             capture_id,
             mermaid: DIAGRAM.into(),
@@ -269,7 +271,7 @@ fn a_skeleton_is_not_offered_to_the_annotation_backlog() {
     // Mermaid source has no triple in it. Offering it would spend a model call
     // to discover that, the same reason `dialog` is excluded.
     let batch = remind_me_core::db::queries::unannotated_batch(
-        &conn,
+        &store,
         &remind_me_core::ExtractBatchInput { batch_size: 50 },
     )
     .unwrap();
@@ -285,11 +287,11 @@ fn a_skeleton_is_not_offered_to_the_annotation_backlog() {
 #[test]
 fn a_skeleton_needs_at_least_one_node() {
     let db = db("nonodes");
-    let conn = db.conn();
-    let capture_id = capture(&conn, "one\ntwo");
+    let store = db.store();
+    let capture_id = capture(&store, "one\ntwo");
 
     let err = write_skeleton(
-        &conn,
+        &store,
         &SkeletonWriteInput {
             capture_id,
             mermaid: DIAGRAM.into(),

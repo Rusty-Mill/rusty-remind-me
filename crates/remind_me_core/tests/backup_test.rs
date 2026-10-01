@@ -4,6 +4,7 @@ use remind_me_core::backup::{
     backup_dir, create_backup, list_backups, BackupError, BACKUP_RETENTION_COUNT,
 };
 use remind_me_core::db::queries;
+use remind_me_core::db::Store;
 use remind_me_core::{Database, MemoryAddInput};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
@@ -37,9 +38,9 @@ impl Drop for TempDir {
     }
 }
 
-fn add(conn: &Connection, content: &str) {
+fn add(store: &Store<'_>, content: &str) {
     queries::add_memory(
-        conn,
+        store,
         MemoryAddInput {
             sensitive: false,
             content: content.to_string(),
@@ -57,15 +58,16 @@ fn add(conn: &Connection, content: &str) {
 }
 
 fn count_memories(path: &Path) -> i64 {
-    let conn = Connection::open(path).unwrap();
-    conn.query_row("SELECT count(*) FROM memories", [], |r| r.get(0))
+    let store = Connection::open(path).unwrap();
+    store
+        .query_row("SELECT count(*) FROM memories", [], |r| r.get(0))
         .unwrap()
 }
 
 #[test]
 fn backup_of_an_in_memory_database_is_refused_clearly() {
     let db = Database::open_in_memory().unwrap();
-    let err = create_backup(&db.conn(), "manual").unwrap_err();
+    let err = create_backup(&db.store(), "manual").unwrap_err();
 
     assert!(
         matches!(err, BackupError::InMemory),
@@ -79,12 +81,12 @@ fn backup_of_an_in_memory_database_is_refused_clearly() {
 #[test]
 fn backup_lands_beside_the_database_and_round_trips() {
     let tmp = TempDir::new("roundtrip");
-    let db = Database::open(tmp.db_path()).unwrap();
-    let conn = db.conn();
-    add(&conn, "first");
-    add(&conn, "second");
+    let db = Database::open_on_sqlite(tmp.db_path()).unwrap();
+    let store = db.store();
+    add(&store, "first");
+    add(&store, "second");
 
-    let outcome = create_backup(&conn, "manual").unwrap();
+    let outcome = create_backup(&store, "manual").unwrap();
 
     let backup_path = PathBuf::from(&outcome.path);
     assert!(backup_path.exists(), "backup file should exist");
@@ -106,12 +108,12 @@ fn backup_lands_beside_the_database_and_round_trips() {
 #[test]
 fn a_backup_taken_before_a_write_does_not_contain_it() {
     let tmp = TempDir::new("snapshot");
-    let db = Database::open(tmp.db_path()).unwrap();
-    let conn = db.conn();
-    add(&conn, "before");
+    let db = Database::open_on_sqlite(tmp.db_path()).unwrap();
+    let store = db.store();
+    add(&store, "before");
 
-    let outcome = create_backup(&conn, "manual").unwrap();
-    add(&conn, "after");
+    let outcome = create_backup(&store, "manual").unwrap();
+    add(&store, "after");
 
     assert_eq!(
         count_memories(&PathBuf::from(&outcome.path)),
@@ -124,13 +126,13 @@ fn a_backup_taken_before_a_write_does_not_contain_it() {
 #[test]
 fn successive_backups_do_not_collide_on_filename() {
     let tmp = TempDir::new("collide");
-    let db = Database::open(tmp.db_path()).unwrap();
-    let conn = db.conn();
-    add(&conn, "content");
+    let db = Database::open_on_sqlite(tmp.db_path()).unwrap();
+    let store = db.store();
+    add(&store, "content");
 
     // Microsecond precision is what keeps two backups in the same second apart.
-    let first = create_backup(&conn, "manual").unwrap();
-    let second = create_backup(&conn, "manual").unwrap();
+    let first = create_backup(&store, "manual").unwrap();
+    let second = create_backup(&store, "manual").unwrap();
 
     assert_ne!(first.path, second.path);
     assert_eq!(second.total_backups, 2);
@@ -139,18 +141,18 @@ fn successive_backups_do_not_collide_on_filename() {
 #[test]
 fn retention_prunes_the_oldest_backups() {
     let tmp = TempDir::new("retention");
-    let db = Database::open(tmp.db_path()).unwrap();
-    let conn = db.conn();
-    add(&conn, "content");
+    let db = Database::open_on_sqlite(tmp.db_path()).unwrap();
+    let store = db.store();
+    add(&store, "content");
 
     for _ in 0..BACKUP_RETENTION_COUNT {
-        create_backup(&conn, "manual").unwrap();
+        create_backup(&store, "manual").unwrap();
     }
-    let at_limit = list_backups(&backup_dir(&conn).unwrap()).unwrap();
+    let at_limit = list_backups(&backup_dir(&store).unwrap()).unwrap();
     assert_eq!(at_limit.len(), BACKUP_RETENTION_COUNT);
     let oldest = at_limit.last().unwrap().filename.clone();
 
-    let outcome = create_backup(&conn, "manual").unwrap();
+    let outcome = create_backup(&store, "manual").unwrap();
 
     assert_eq!(
         outcome.total_backups, BACKUP_RETENTION_COUNT,
@@ -158,7 +160,7 @@ fn retention_prunes_the_oldest_backups() {
     );
     assert_eq!(outcome.pruned, 1);
 
-    let remaining = list_backups(&backup_dir(&conn).unwrap()).unwrap();
+    let remaining = list_backups(&backup_dir(&store).unwrap()).unwrap();
     assert!(
         !remaining.iter().any(|b| b.filename == oldest),
         "the oldest backup should be the one pruned"
@@ -168,9 +170,9 @@ fn retention_prunes_the_oldest_backups() {
 #[test]
 fn listing_a_missing_backup_directory_is_empty_not_an_error() {
     let tmp = TempDir::new("missing");
-    let db = Database::open(tmp.db_path()).unwrap();
+    let db = Database::open_on_sqlite(tmp.db_path()).unwrap();
 
-    let dir = backup_dir(&db.conn()).unwrap();
+    let dir = backup_dir(&db.store()).unwrap();
     assert!(!dir.exists());
     assert!(list_backups(&dir).unwrap().is_empty());
 }
@@ -178,13 +180,13 @@ fn listing_a_missing_backup_directory_is_empty_not_an_error() {
 #[test]
 fn a_label_cannot_escape_the_backup_directory() {
     let tmp = TempDir::new("traversal");
-    let db = Database::open(tmp.db_path()).unwrap();
-    let conn = db.conn();
-    add(&conn, "content");
+    let db = Database::open_on_sqlite(tmp.db_path()).unwrap();
+    let store = db.store();
+    add(&store, "content");
 
     // The tool never takes a caller-supplied label today, but the slugging is
     // what guarantees that stays true if one is ever plumbed through.
-    let outcome = create_backup(&conn, "../../etc/passwd").unwrap();
+    let outcome = create_backup(&store, "../../etc/passwd").unwrap();
 
     let path = PathBuf::from(&outcome.path);
     assert_eq!(
@@ -198,15 +200,80 @@ fn a_label_cannot_escape_the_backup_directory() {
 #[test]
 fn an_empty_label_falls_back_rather_than_producing_a_bare_timestamp() {
     let tmp = TempDir::new("emptylabel");
-    let db = Database::open(tmp.db_path()).unwrap();
-    let conn = db.conn();
-    add(&conn, "content");
+    let db = Database::open_on_sqlite(tmp.db_path()).unwrap();
+    let store = db.store();
+    add(&store, "content");
 
-    let outcome = create_backup(&conn, "---").unwrap();
+    let outcome = create_backup(&store, "---").unwrap();
     let filename = PathBuf::from(&outcome.path)
         .file_name()
         .unwrap()
         .to_string_lossy()
         .to_string();
     assert!(filename.starts_with("manual-"), "got {}", filename);
+}
+
+/// The memories in the store at `db_path`, opened on the engine.
+#[cfg(feature = "engine-store")]
+fn engine_memories(db_path: &Path) -> i64 {
+    let db = Database::open_on_engine(db_path).unwrap();
+    let store = db.store();
+    remind_me_core::testing::count(&store, remind_me_core::testing::Table::Memories).unwrap()
+}
+
+#[cfg(feature = "engine-store")]
+#[test]
+fn a_store_on_the_engine_backs_up_both_halves_and_restores() {
+    let tmp = TempDir::new("engine_round_trip");
+    let backup = {
+        let db = Database::open_on_engine(tmp.db_path()).unwrap();
+        let store = db.store();
+        add(&store, "before the backup");
+        let outcome = create_backup(&store, "manual").unwrap();
+        add(&store, "after the backup");
+
+        assert!(outcome.path.ends_with(".engine"), "{}", outcome.path);
+        let listed = list_backups(&backup_dir(&store).unwrap()).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].size_bytes > 0);
+        PathBuf::from(outcome.path)
+    };
+
+    // Restoring is putting both halves back where the node looks for them.
+    let restored = TempDir::new("engine_restored");
+    std::fs::copy(backup.join("remind_me.db"), restored.db_path()).unwrap();
+    let engine = restored.0.join("remind_me.engine");
+    std::fs::create_dir(&engine).unwrap();
+    for entry in std::fs::read_dir(backup.join("remind_me.engine")).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::copy(entry.path(), engine.join(entry.file_name())).unwrap();
+    }
+
+    assert_eq!(engine_memories(&restored.db_path()), 1);
+    assert_eq!(engine_memories(&tmp.db_path()), 2);
+}
+
+#[cfg(feature = "engine-store")]
+#[test]
+fn retention_prunes_engine_backups_too() {
+    let tmp = TempDir::new("engine_retention");
+    let db = Database::open_on_engine(tmp.db_path()).unwrap();
+    let store = db.store();
+    add(&store, "content");
+
+    for _ in 0..BACKUP_RETENTION_COUNT {
+        create_backup(&store, "manual").unwrap();
+    }
+    let oldest = list_backups(&backup_dir(&store).unwrap())
+        .unwrap()
+        .last()
+        .unwrap()
+        .path
+        .clone();
+
+    let outcome = create_backup(&store, "manual").unwrap();
+
+    assert_eq!(outcome.total_backups, BACKUP_RETENTION_COUNT);
+    assert_eq!(outcome.pruned, 1);
+    assert!(!Path::new(&oldest).exists(), "{oldest} should be gone");
 }

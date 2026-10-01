@@ -6,10 +6,11 @@ mod test_env;
 use remind_me_core::backup::create_backup;
 use remind_me_core::db::queries;
 use remind_me_core::db::schema::SCHEMA_VERSION;
+use remind_me_core::db::Store;
 use remind_me_core::embedder::EMBEDDING_BACKEND_ENV;
 use remind_me_core::status::{server_status, SubsystemStatus};
+use remind_me_core::testing;
 use remind_me_core::{Database, MemoryAddInput};
-use rusqlite::Connection;
 use std::sync::Mutex;
 
 /// Held by every test in this file that reads `report.embeddings`: that
@@ -19,9 +20,9 @@ use std::sync::Mutex;
 /// `ENV_LOCK`.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-fn add(conn: &Connection, content: &str) {
+fn add(store: &Store<'_>, content: &str) {
     queries::add_memory(
-        conn,
+        store,
         MemoryAddInput {
             sensitive: false,
             content: content.to_string(),
@@ -52,7 +53,7 @@ fn is_missing(status: &SubsystemStatus) -> bool {
 fn a_fresh_store_reports_a_current_schema() {
     let db = Database::open_in_memory().unwrap();
 
-    let report = server_status(&db.conn()).unwrap();
+    let report = server_status(&db.store()).unwrap();
 
     assert_eq!(report.schema_version, SCHEMA_VERSION);
     assert_eq!(report.expected_schema_version, SCHEMA_VERSION);
@@ -68,7 +69,7 @@ fn a_fresh_store_reports_a_current_schema() {
 fn a_fresh_process_reports_the_scheduler_as_not_running() {
     let db = Database::open_in_memory().unwrap();
 
-    let report = server_status(&db.conn()).unwrap();
+    let report = server_status(&db.store()).unwrap();
 
     assert!(!report.scheduler.running);
     assert!(report.scheduler.poll_interval_seconds > 0);
@@ -77,10 +78,14 @@ fn a_fresh_process_reports_the_scheduler_as_not_running() {
 #[test]
 fn a_stale_schema_version_is_reported_as_not_current() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    conn.execute_batch("PRAGMA user_version = 3;").unwrap();
+    let store = db.store();
+    store
+        .sqlite()
+        .unwrap()
+        .execute_batch("PRAGMA user_version = 3;")
+        .unwrap();
 
-    let report = server_status(&conn).unwrap();
+    let report = server_status(&store).unwrap();
 
     // A version mismatch is what makes a database unreadable to `remind_me`,
     // so it is surfaced rather than left for a caller to infer.
@@ -91,24 +96,29 @@ fn a_stale_schema_version_is_reported_as_not_current() {
 #[test]
 fn deleted_memories_are_not_counted() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "kept");
-    add(&conn, "going");
-    let doomed: String = conn
-        .query_row("SELECT id FROM memories WHERE content = 'going'", [], |r| {
-            r.get(0)
+    let store = db.store();
+    add(&store, "kept");
+    add(&store, "going");
+    let doomed = testing::memory_ids(&store)
+        .unwrap()
+        .into_iter()
+        .find(|id| {
+            testing::memory_text(&store, id, "content")
+                .unwrap()
+                .as_deref()
+                == Some("going")
         })
         .unwrap();
-    queries::delete_memory(&conn, &doomed).unwrap();
+    queries::delete_memory(&store, &doomed).unwrap();
 
-    assert_eq!(server_status(&conn).unwrap().memory_count, 1);
+    assert_eq!(server_status(&store).unwrap().memory_count, 1);
 }
 
 #[test]
 fn an_in_memory_database_has_no_path_or_backup_directory() {
     let db = Database::open_in_memory().unwrap();
 
-    let report = server_status(&db.conn()).unwrap();
+    let report = server_status(&db.store()).unwrap();
 
     assert!(report.database_path.is_none());
     assert!(report.database_exists, "it exists, it just has no file");
@@ -123,10 +133,10 @@ fn an_on_disk_database_reports_its_path_and_size() {
     let dir = scratch("ondisk");
     let path = dir.join("memories.db");
     let db = Database::open(&path).unwrap();
-    let conn = db.conn();
-    add(&conn, "a memory");
+    let store = db.store();
+    add(&store, "a memory");
 
-    let report = server_status(&conn).unwrap();
+    let report = server_status(&store).unwrap();
 
     assert_eq!(
         report.database_path.as_deref(),
@@ -136,11 +146,11 @@ fn an_on_disk_database_reports_its_path_and_size() {
     assert!(report.database_bytes.unwrap() > 0);
     assert!(report.backup_dir.is_some());
 
-    // `conn` is a `MutexGuard` borrowed from `db` -- dropping it only
+    // `store` is a `MutexGuard` borrowed from `db` -- dropping it only
     // releases the lock. The actual `rusqlite::Connection` (and its open
     // handle on `path`) lives inside `db` itself, so `db` has to go too
     // before Windows will allow deleting the directory that holds it.
-    drop(conn);
+    drop(store);
     drop(db);
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -149,15 +159,15 @@ fn an_on_disk_database_reports_its_path_and_size() {
 fn backups_are_inventoried_newest_first() {
     let dir = scratch("backups");
     let path = dir.join("memories.db");
-    let db = Database::open(&path).unwrap();
-    let conn = db.conn();
-    add(&conn, "a memory");
+    let db = Database::open_on_sqlite(&path).unwrap();
+    let store = db.store();
+    add(&store, "a memory");
 
-    assert_eq!(server_status(&conn).unwrap().backup_count, 0);
-    create_backup(&conn, "first").unwrap();
-    create_backup(&conn, "second").unwrap();
+    assert_eq!(server_status(&store).unwrap().backup_count, 0);
+    create_backup(&store, "first").unwrap();
+    create_backup(&store, "second").unwrap();
 
-    let report = server_status(&conn).unwrap();
+    let report = server_status(&store).unwrap();
     assert_eq!(report.backup_count, 2);
     let latest = report.latest_backup.unwrap();
     assert!(
@@ -167,7 +177,7 @@ fn backups_are_inventoried_newest_first() {
     );
 
     // See the matching comment in `an_on_disk_database_reports_its_path_and_size`.
-    drop(conn);
+    drop(store);
     drop(db);
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -178,7 +188,7 @@ fn absent_subsystems_are_named_with_a_reason() {
     crate::test_env::remove_var(EMBEDDING_BACKEND_ENV);
     let db = Database::open_in_memory().unwrap();
 
-    let report = server_status(&db.conn()).unwrap();
+    let report = server_status(&db.store()).unwrap();
 
     assert!(matches!(report.mcp, SubsystemStatus::Active));
     // `dashboard` and `sync` are genuinely cross-process (a separate
@@ -205,7 +215,7 @@ fn embeddings_status_is_active_when_a_backend_is_configured() {
     crate::test_env::set_var(EMBEDDING_BACKEND_ENV, "ollama");
     let db = Database::open_in_memory().unwrap();
 
-    let report = server_status(&db.conn()).unwrap();
+    let report = server_status(&db.store()).unwrap();
 
     crate::test_env::remove_var(EMBEDDING_BACKEND_ENV);
     assert!(
@@ -221,7 +231,7 @@ fn embeddings_status_is_not_implemented_without_a_configured_backend() {
     crate::test_env::remove_var(EMBEDDING_BACKEND_ENV);
     let db = Database::open_in_memory().unwrap();
 
-    let report = server_status(&db.conn()).unwrap();
+    let report = server_status(&db.store()).unwrap();
 
     assert!(is_missing(&report.embeddings));
     if let SubsystemStatus::NotImplemented { reason } = &report.embeddings {
@@ -235,7 +245,7 @@ fn the_report_serialises_with_the_subsystem_state_tagged() {
     crate::test_env::remove_var(EMBEDDING_BACKEND_ENV);
     let db = Database::open_in_memory().unwrap();
 
-    let report = server_status(&db.conn()).unwrap();
+    let report = server_status(&db.store()).unwrap();
     let json = serde_json::to_value(&report).unwrap();
 
     assert_eq!(json["mcp"]["state"], "active");
@@ -258,7 +268,7 @@ fn the_report_names_the_build_that_produced_it() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let db = Database::open_in_memory().unwrap();
 
-    let report = server_status(&db.conn()).unwrap();
+    let report = server_status(&db.store()).unwrap();
 
     assert_eq!(report.version, env!("CARGO_PKG_VERSION"));
     assert!(

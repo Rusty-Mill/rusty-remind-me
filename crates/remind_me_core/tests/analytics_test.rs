@@ -2,12 +2,13 @@
 
 use remind_me_core::analytics::{capture_snapshot, trend};
 use remind_me_core::db::queries;
-use remind_me_core::{CapturedSnapshot, Database, MemoryAddInput};
-use rusqlite::Connection;
+use remind_me_core::db::stats::StoreStats;
+use remind_me_core::db::Store;
+use remind_me_core::{AnalyticsSnapshot, CapturedSnapshot, Database, MemoryAddInput};
 
-fn add(conn: &Connection, content: &str, category: &str) {
+fn add(store: &Store<'_>, content: &str, category: &str) {
     queries::add_memory(
-        conn,
+        store,
         MemoryAddInput {
             content: content.to_string(),
             category: category.to_string(),
@@ -27,17 +28,17 @@ fn add(conn: &Connection, content: &str, category: &str) {
 #[test]
 fn a_snapshot_records_the_vaults_current_shape() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "one", "general");
-    add(&conn, "two", "engineering");
-    add(&conn, "three", "engineering");
+    let store = db.store();
+    add(&store, "one", "general");
+    add(&store, "two", "engineering");
+    add(&store, "three", "engineering");
 
     assert!(matches!(
-        capture_snapshot(&conn).unwrap(),
+        capture_snapshot(&store).unwrap(),
         CapturedSnapshot::Captured { .. }
     ));
 
-    let series = trend(&conn).unwrap();
+    let series = trend(&store).unwrap();
     assert_eq!(series.len(), 1);
     assert_eq!(series[0].total_memories, 3);
     assert_eq!(series[0].category_counts.get("engineering"), Some(&2));
@@ -48,12 +49,12 @@ fn a_snapshot_records_the_vaults_current_shape() {
 #[test]
 fn a_second_capture_on_the_same_day_is_a_no_op() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "one", "general");
+    let store = db.store();
+    add(&store, "one", "general");
 
-    let first = capture_snapshot(&conn).unwrap();
-    add(&conn, "two", "general");
-    let second = capture_snapshot(&conn).unwrap();
+    let first = capture_snapshot(&store).unwrap();
+    add(&store, "two", "general");
+    let second = capture_snapshot(&store).unwrap();
 
     // Idempotent per calendar *day*, not per timestamp. A server restarted
     // three times in a day would otherwise show three data points and the
@@ -62,9 +63,9 @@ fn a_second_capture_on_the_same_day_is_a_no_op() {
         panic!("first capture should have inserted");
     };
     assert_eq!(second, CapturedSnapshot::AlreadyToday { id: first_id });
-    assert_eq!(trend(&conn).unwrap().len(), 1);
+    assert_eq!(trend(&store).unwrap().len(), 1);
     assert_eq!(
-        trend(&conn).unwrap()[0].total_memories,
+        trend(&store).unwrap()[0].total_memories,
         1,
         "the existing row must not be rewritten either"
     );
@@ -73,20 +74,22 @@ fn a_second_capture_on_the_same_day_is_a_no_op() {
 #[test]
 fn the_series_is_oldest_first() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     // Plant history directly: the capture path is deliberately once-per-day,
     // so multi-day series cannot be produced by calling it in a loop.
+    let stats = StoreStats::new(&store);
     for (day, total) in [("2026-01-01", 5), ("2026-01-03", 9), ("2026-01-02", 7)] {
-        conn.execute(
-            "INSERT INTO analytics_snapshots
-                 (captured_at, total_memories, vitality_buckets, category_counts)
-             VALUES (?, ?, '{}', '{}')",
-            rusqlite::params![format!("{}T00:00:00+00:00", day), total],
-        )
-        .unwrap();
+        stats
+            .insert_snapshot(&AnalyticsSnapshot {
+                captured_at: format!("{day}T00:00:00+00:00"),
+                total_memories: total,
+                vitality_buckets: Default::default(),
+                category_counts: Default::default(),
+            })
+            .unwrap();
     }
 
-    let series = trend(&conn).unwrap();
+    let series = trend(&store).unwrap();
 
     // Oldest first, because the only consumer is a chart — a series that has
     // to be reversed before plotting is a trap the first caller falls into.
@@ -98,17 +101,26 @@ fn the_series_is_oldest_first() {
 
 #[test]
 fn a_malformed_stored_value_does_not_take_the_chart_down() {
-    let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    conn.execute(
-        "INSERT INTO analytics_snapshots
+    // A malformed value can only be planted with SQL, so this runs on an
+    // on-disk SQLite database; the decoding it relies on is shared with the
+    // engine and unit-tested in `db::stats`.
+    let dir = std::env::temp_dir().join(format!("rrm_analytics_malformed_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = Database::open_on_sqlite(dir.join("memory.db")).unwrap();
+    let store = db.store();
+    store
+        .sqlite()
+        .unwrap()
+        .execute(
+            "INSERT INTO analytics_snapshots
              (captured_at, total_memories, vitality_buckets, category_counts)
          VALUES ('2026-01-01T00:00:00+00:00', 5, 'not json', '{}')",
-        [],
-    )
-    .unwrap();
+            [],
+        )
+        .unwrap();
 
-    let series = trend(&conn).unwrap();
+    let series = trend(&store).unwrap();
 
     // One bad row degrades to empty maps rather than failing the whole read.
     // The alternative is a chart that goes blank because of a single row
@@ -116,6 +128,9 @@ fn a_malformed_stored_value_does_not_take_the_chart_down() {
     assert_eq!(series.len(), 1);
     assert_eq!(series[0].total_memories, 5);
     assert!(series[0].vitality_buckets.is_empty());
+    drop(store);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -124,5 +139,5 @@ fn a_new_install_has_an_empty_series_not_an_error() {
 
     // Empty is meaningfully different from flat: no history yet, rather than
     // history showing no change.
-    assert!(trend(&db.conn()).unwrap().is_empty());
+    assert!(trend(&db.store()).unwrap().is_empty());
 }

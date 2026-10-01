@@ -9,15 +9,17 @@
 #[path = "../src/test_env.rs"]
 mod test_env;
 
+use remind_me_core::db::reminders::Reminders;
+use remind_me_core::db::Store;
 use remind_me_core::models::ReminderWindow;
 use remind_me_core::reminders::{list_reminders, set_reminder};
 use remind_me_core::scheduler::{due_reminders, poll_once_with};
+use remind_me_core::testing::{self, Table};
 use remind_me_core::{Database, MemoryAddInput};
-use rusqlite::{params, Connection};
 
-fn add(conn: &Connection, content: &str) -> String {
+fn add(store: &Store<'_>, content: &str) -> String {
     remind_me_core::db::queries::add_memory(
-        conn,
+        store,
         MemoryAddInput {
             content: content.to_string(),
             category: "general".into(),
@@ -46,18 +48,14 @@ fn future(hours: i64) -> String {
 /// Write `remind_at` directly. `set_reminder` refuses a past timestamp on
 /// purpose, so a reminder that is already due can only be reached this way —
 /// which in production means one that came due while nothing was running.
-fn force_due(conn: &Connection, memory_id: &str, when: &str) {
-    conn.execute(
-        "UPDATE memories SET remind_at = ? WHERE id = ?",
-        params![when, memory_id],
-    )
-    .unwrap();
+fn force_due(store: &Store<'_>, memory_id: &str, when: &str) {
+    testing::set_memory_column(store, memory_id, "remind_at", when).unwrap();
 }
 
 /// Run a pass, returning the ids it delivered.
-fn pass(conn: &Connection) -> Vec<String> {
+fn pass(store: &Store<'_>) -> Vec<String> {
     let mut delivered = Vec::new();
-    poll_once_with(conn, &mut |m| delivered.push(m.id.clone())).unwrap();
+    poll_once_with(store, &mut |m| delivered.push(m.id.clone())).unwrap();
     delivered
 }
 
@@ -70,16 +68,16 @@ static POLL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[test]
 fn a_due_reminder_is_delivered_once_and_never_again() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "the thing you asked to be reminded of");
-    force_due(&conn, &id, &past(1));
+    let store = db.store();
+    let id = add(&store, "the thing you asked to be reminded of");
+    force_due(&store, &id, &past(1));
 
-    assert_eq!(pass(&conn), vec![id.clone()]);
+    assert_eq!(pass(&store), vec![id.clone()]);
 
     // The second pass is the whole test. A scheduler that re-delivers looks
     // identical to a working one until you are the person being told.
     assert!(
-        pass(&conn).is_empty(),
+        pass(&store).is_empty(),
         "a delivered reminder must not fire again"
     );
 }
@@ -87,13 +85,13 @@ fn a_due_reminder_is_delivered_once_and_never_again() {
 #[test]
 fn a_reminder_that_is_not_yet_due_is_left_alone() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "later");
-    set_reminder(&conn, &id, Some(&future(6))).unwrap();
+    let store = db.store();
+    let id = add(&store, "later");
+    set_reminder(&store, &id, Some(&future(6))).unwrap();
 
-    assert!(pass(&conn).is_empty());
+    assert!(pass(&store).is_empty());
     assert!(
-        due_reminders(&conn).unwrap().is_empty(),
+        due_reminders(&store).unwrap().is_empty(),
         "nothing is due yet"
     );
 }
@@ -101,42 +99,42 @@ fn a_reminder_that_is_not_yet_due_is_left_alone() {
 #[test]
 fn a_reminder_that_came_due_while_nothing_was_running_is_delivered_on_the_next_pass() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "came due overnight");
+    let store = db.store();
+    let id = add(&store, "came due overnight");
     // Long past, as if the process had been down for days.
-    force_due(&conn, &id, &past(72));
+    force_due(&store, &id, &past(72));
 
     // Confirmed against the reference rather than assumed: its due query has
     // no lower bound, so a late reminder is delivered rather than skipped.
     // Skipping would lose exactly the reminders a scheduler exists to catch.
-    assert_eq!(pass(&conn), vec![id]);
+    assert_eq!(pass(&store), vec![id]);
 }
 
 #[test]
 fn a_restart_does_not_re_deliver() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "survives a restart");
-    force_due(&conn, &id, &past(2));
-    assert_eq!(pass(&conn).len(), 1);
+    let store = db.store();
+    let id = add(&store, "survives a restart");
+    force_due(&store, &id, &past(2));
+    assert_eq!(pass(&store).len(), 1);
 
     // The delivery record lives in the database, not in the loop's memory, so
     // a fresh process reaches the same conclusion.
-    let restarted = pass(&conn);
+    let restarted = pass(&store);
     assert!(restarted.is_empty(), "restart must not re-deliver");
 }
 
 #[test]
 fn a_delivery_hook_that_panics_leaves_the_reminder_pending() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "delivery blew up");
-    force_due(&conn, &id, &past(1));
+    let store = db.store();
+    let id = add(&store, "delivery blew up");
+    force_due(&store, &id, &past(1));
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let inner = Database::open_in_memory();
         drop(inner);
-        poll_once_with(&conn, &mut |_| panic!("channel exploded")).unwrap()
+        poll_once_with(&store, &mut |_| panic!("channel exploded")).unwrap()
     }));
     assert!(
         result.is_err(),
@@ -147,7 +145,7 @@ fn a_delivery_hook_that_panics_leaves_the_reminder_pending() {
     // outright leaves the reminder to be tried again. Marked first, a crash
     // mid-delivery would silently consume the reminder.
     assert_eq!(
-        pass(&conn),
+        pass(&store),
         vec![id],
         "a reminder whose delivery died must still be pending"
     );
@@ -156,66 +154,62 @@ fn a_delivery_hook_that_panics_leaves_the_reminder_pending() {
 #[test]
 fn a_deleted_memorys_reminder_is_never_delivered() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "deleted before it fired");
-    force_due(&conn, &id, &past(1));
-    conn.execute(
-        "UPDATE memories SET deleted_at = ? WHERE id = ?",
-        params![chrono::Utc::now().to_rfc3339(), &id],
-    )
-    .unwrap();
+    let store = db.store();
+    let id = add(&store, "deleted before it fired");
+    force_due(&store, &id, &past(1));
+    testing::set_memory_column(&store, &id, "deleted_at", chrono::Utc::now().to_rfc3339()).unwrap();
 
     // Delivering this would surface content the user deleted, through a
     // channel they may not control.
-    assert!(pass(&conn).is_empty());
+    assert!(pass(&store).is_empty());
 }
 
 #[test]
 fn several_due_reminders_are_delivered_soonest_first() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let older = add(&conn, "due first");
-    let newer = add(&conn, "due second");
-    force_due(&conn, &older, &past(10));
-    force_due(&conn, &newer, &past(1));
+    let store = db.store();
+    let older = add(&store, "due first");
+    let newer = add(&store, "due second");
+    force_due(&store, &older, &past(10));
+    force_due(&store, &newer, &past(1));
 
-    assert_eq!(pass(&conn), vec![older, newer]);
+    assert_eq!(pass(&store), vec![older, newer]);
 }
 
 #[test]
 fn rescheduling_a_delivered_reminder_makes_it_deliverable_again() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "recurring chore");
-    force_due(&conn, &id, &past(2));
-    assert_eq!(pass(&conn).len(), 1);
+    let store = db.store();
+    let id = add(&store, "recurring chore");
+    force_due(&store, &id, &past(2));
+    assert_eq!(pass(&store).len(), 1);
 
     // Delivery is keyed on `(memory_id, remind_at)`. Keyed on the memory
     // alone, a chore could be reminded about exactly once, ever.
-    force_due(&conn, &id, &past(1));
-    assert_eq!(pass(&conn), vec![id]);
+    force_due(&store, &id, &past(1));
+    assert_eq!(pass(&store), vec![id]);
 }
 
 #[test]
 fn a_delivered_reminder_drops_out_of_the_listing_too() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "handled");
-    force_due(&conn, &id, &past(1));
+    let store = db.store();
+    let id = add(&store, "handled");
+    force_due(&store, &id, &past(1));
 
     assert_eq!(
-        list_reminders(&conn, ReminderWindow::Overdue, 20)
+        list_reminders(&store, ReminderWindow::Overdue, 20)
             .unwrap()
             .len(),
         1,
         "overdue before delivery"
     );
-    pass(&conn);
+    pass(&store);
 
     // The scheduler and `remind_me_list_reminders` read the same window, so a
     // reminder cannot sit visibly overdue in the tool while the loop considers
     // it handled.
-    assert!(list_reminders(&conn, ReminderWindow::Overdue, 20)
+    assert!(list_reminders(&store, ReminderWindow::Overdue, 20)
         .unwrap()
         .is_empty());
 }
@@ -223,23 +217,20 @@ fn a_delivered_reminder_drops_out_of_the_listing_too() {
 #[test]
 fn a_second_poller_racing_the_first_does_not_error_the_pass() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "contended");
+    let store = db.store();
+    let id = add(&store, "contended");
     let when = past(1);
-    force_due(&conn, &id, &when);
+    force_due(&store, &id, &when);
 
     // Simulate the loser of the race: the delivery row already exists when
     // this pass tries to write it. `INSERT OR IGNORE` keeps the unique index
     // as the guarantee rather than letting it abort the whole pass — one
     // duplicate must not strand every later reminder in the same batch.
     let mut delivered = Vec::new();
-    poll_once_with(&conn, &mut |m| {
-        conn.execute(
-            "INSERT INTO reminder_deliveries (memory_id, remind_at, delivered_at)
-             VALUES (?, ?, ?)",
-            params![m.id, when, chrono::Utc::now().to_rfc3339()],
-        )
-        .unwrap();
+    poll_once_with(&store, &mut |m| {
+        Reminders::new(&store)
+            .record_delivery(&m.id, &when, &chrono::Utc::now().to_rfc3339())
+            .unwrap();
         delivered.push(m.id.clone());
     })
     .expect("a duplicate delivery row must not fail the pass");
@@ -287,40 +278,39 @@ fn an_in_memory_database_gets_no_scheduler() {
     // would hand it a different, empty database. Started anyway, it would
     // poll that empty database forever and look exactly like a vault with
     // nothing due.
-    assert!(remind_me_core::scheduler::start_scheduler_for(&db.conn()).is_none());
+    assert!(remind_me_core::scheduler::start_scheduler_for(&db.store()).is_none());
 }
 
 #[test]
 fn the_running_loop_delivers_without_anyone_calling_a_tool() {
     let dir = TempDir::new("loop");
     let path = dir.db_path();
-    let id = {
-        let db = Database::open(&path).unwrap();
-        let conn = db.conn();
-        let id = add(&conn, "fires on its own");
-        force_due(&conn, &id, &past(1));
-        id
-    };
+    {
+        let db = Database::open_on_sqlite(&path).unwrap();
+        let store = db.store();
+        let id = add(&store, "fires on its own");
+        force_due(&store, &id, &past(1));
+    }
 
     // The point of the whole issue: a reminder fires because time passed, not
     // because something asked. Everything above this test drives `poll_once`
     // by hand, which would pass just as happily against a loop that never ran.
     let _env = POLL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     crate::test_env::set_var(remind_me_core::scheduler::POLL_INTERVAL_ENV, "1");
-    let scheduler = remind_me_core::scheduler::start_scheduler(path.clone());
+    let scheduler = remind_me_core::scheduler::start_scheduler(
+        Database::open_on_sqlite(&path)
+            .unwrap()
+            .secondary_source()
+            .unwrap(),
+    );
 
-    let observer = Database::open(&path).unwrap();
+    let observer = Database::open_on_sqlite(&path).unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     let mut delivered = 0i64;
     while std::time::Instant::now() < deadline {
-        delivered = observer
-            .conn()
-            .query_row(
-                "SELECT COUNT(*) FROM reminder_deliveries WHERE memory_id = ?",
-                params![&id],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
+        // The only memory in this database is the one added above, so every
+        // delivery row is one of its deliveries.
+        delivered = testing::count(&observer.store(), Table::ReminderDeliveries).unwrap_or(0);
         if delivered > 0 {
             break;
         }
@@ -337,14 +327,19 @@ fn the_running_loop_delivers_without_anyone_calling_a_tool() {
 fn stopping_the_loop_does_not_wait_out_the_poll_interval() {
     let dir = TempDir::new("stop");
     let path = dir.db_path();
-    drop(Database::open(&path).unwrap());
+    drop(Database::open_on_sqlite(&path).unwrap());
 
     // A long interval, so a `thread::sleep` loop would block shutdown for
     // most of it. Shutdown has to interrupt the wait, or stopping a server
     // stalls on a thread with nothing left to do.
     let _env = POLL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     crate::test_env::set_var(remind_me_core::scheduler::POLL_INTERVAL_ENV, "3600");
-    let scheduler = remind_me_core::scheduler::start_scheduler(path);
+    let scheduler = remind_me_core::scheduler::start_scheduler(
+        Database::open_on_sqlite(&path)
+            .unwrap()
+            .secondary_source()
+            .unwrap(),
+    );
     let started = std::time::Instant::now();
     scheduler.stop();
     crate::test_env::remove_var(remind_me_core::scheduler::POLL_INTERVAL_ENV);

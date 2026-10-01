@@ -16,6 +16,10 @@
 //! `remind_me_add` the batch is always empty. That is correct rather than
 //! broken.
 
+use crate::db::curation::{Curation, NormalizationSource};
+use crate::db::memories::{Memories, NewMemory};
+use crate::db::Result;
+use crate::db::Store;
 use crate::entity::apply_entity_mentions;
 use crate::models::{
     NormalizationEntry, NormalizationError, NormalizationOutcome, NormalizeApplyInput,
@@ -24,7 +28,6 @@ use crate::models::{
 };
 use crate::vitality::{calculate_vitality, get_decay_rate, get_source_prior, get_type_prior};
 use chrono::Utc;
-use rusqlite::{params, Connection, Result};
 
 /// `category` assigned to memories created by [`apply_normalizations`].
 pub const NORMALIZED_CATEGORY: &str = "normalized";
@@ -36,79 +39,42 @@ pub const IMPORT_SOURCES: [&str; 2] = ["document_import", "chat_import"];
 /// Characters of raw content returned for review.
 const SNIPPET_CHARS: usize = 1000;
 
-/// Which raw memories still need normalizing.
+/// A page of raw imports awaiting normalization, newest first.
 ///
 /// A row qualifies when it is live, came from an importer, and **nothing points
 /// back at it**. That last clause is the "already done" test: there is no
 /// normalized flag on the row, so a raw import drops out of the backlog once any
 /// distillation names it in `normalized_from`.
-fn unnormalized_where() -> String {
-    let sources = IMPORT_SOURCES
-        .iter()
-        .map(|s| format!("'{}'", s))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        "m.superseded_by IS NULL
-         AND m.deleted_at IS NULL
-         AND m.source IN ({sources})
-         AND NOT EXISTS (
-             SELECT 1 FROM memories n
-              WHERE json_extract(n.metadata, '$.normalized_from') = m.id
-         )",
-        sources = sources
-    )
-}
-
-/// A page of raw imports awaiting normalization, newest first.
 ///
 /// `batch_size` is clamped to 1..=100 rather than rejected, matching
 /// `unclassified_batch`.
 pub fn unnormalized_batch(
-    conn: &Connection,
+    store: &Store<'_>,
     input: &NormalizeBatchInput,
 ) -> Result<NormalizeBatchResult> {
     let batch_size = input
         .batch_size
         .clamp(NORMALIZE_BATCH_MIN, NORMALIZE_BATCH_MAX);
-    let predicate = unnormalized_where();
-
-    let total: i64 = conn.query_row(
-        &format!("SELECT count(*) FROM memories m WHERE {}", predicate),
-        [],
-        |r| r.get(0),
-    )?;
-
-    let mut stmt = conn.prepare(&format!(
-        "SELECT m.id, m.content, m.category, m.source, m.tags, m.metadata
-           FROM memories m
-          WHERE {}
-          ORDER BY m.created_at DESC
-          LIMIT ?",
-        predicate
-    ))?;
-    let memories: Vec<UnnormalizedMemory> = stmt
-        .query_map(params![batch_size as i64], |row| {
-            let content: String = row.get("content")?;
-            let tags_json: String = row.get("tags")?;
-            let metadata_json: String = row.get("metadata")?;
-            let metadata: serde_json::Value =
-                serde_json::from_str(&metadata_json).unwrap_or_else(|_| serde_json::json!({}));
-            Ok(UnnormalizedMemory {
-                id: row.get("id")?,
-                // Truncated by characters, not bytes, so a multi-byte character
-                // straddling the boundary cannot panic the slice.
-                content_snippet: content.chars().take(SNIPPET_CHARS).collect(),
-                category: row.get("category")?,
-                source: row.get("source")?,
-                tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-                filename: metadata
-                    .get("filename")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string),
-            })
-        })?
-        .collect::<Result<_>>()?;
+    let curation = Curation::new(store);
+    let total = curation.count_unnormalized(&IMPORT_SOURCES)?;
+    let memories: Vec<UnnormalizedMemory> = curation
+        .unnormalized(&IMPORT_SOURCES, batch_size)?
+        .into_iter()
+        .map(|row| UnnormalizedMemory {
+            // Truncated by characters, not bytes, so a multi-byte character
+            // straddling the boundary cannot panic the slice.
+            content_snippet: row.content.chars().take(SNIPPET_CHARS).collect(),
+            filename: row
+                .metadata
+                .get("filename")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            id: row.id,
+            category: row.category,
+            source: row.source,
+            tags: row.tags,
+        })
+        .collect();
 
     Ok(NormalizeBatchResult {
         memories,
@@ -136,7 +102,7 @@ fn normalized_content(entry: &NormalizationEntry) -> String {
 /// An unknown `memory_id` is reported in `errors` rather than failing the
 /// batch, so one bad reference does not discard the other 49.
 pub fn apply_normalizations(
-    conn: &Connection,
+    store: &Store<'_>,
     input: &NormalizeApplyInput,
 ) -> Result<NormalizeApplyResult> {
     let now = Utc::now();
@@ -145,15 +111,18 @@ pub fn apply_normalizations(
     let mut errors = Vec::new();
 
     for entry in &input.normalizations {
-        let raw: Option<(String, Option<String>, Option<i64>)> = conn
-            .query_row(
-                "SELECT tags, doc_id, chunk_index FROM memories WHERE id = ?",
-                params![entry.memory_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .ok();
+        // A read that fails reports the memory as not found, as before: one
+        // bad reference must not discard the rest of the batch.
+        let raw = Curation::new(store)
+            .normalization_source(&entry.memory_id)
+            .ok()
+            .flatten();
 
-        let (tags_json, doc_id, chunk_index) = match raw {
+        let NormalizationSource {
+            tags,
+            doc_id,
+            chunk_index,
+        } = match raw {
             Some(row) => row,
             None => {
                 errors.push(NormalizationError {
@@ -184,33 +153,24 @@ pub fn apply_normalizations(
         let vitality = calculate_vitality(base_weight, 0, decay_rate, &now_iso, now);
 
         let (node_id, client) = crate::sync::memory_provenance();
-        conn.execute(
-            "INSERT INTO memories (
-                id, content, category, tags, source, metadata, created_at, updated_at,
-                doc_id, chunk_index, decay_rate, vitality, base_weight, access_count, accessed_at,
-                node_id, client
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
-            params![
-                normalized_id,
-                content,
-                NORMALIZED_CATEGORY,
-                tags_json,
-                NORMALIZED_SOURCE,
-                metadata.to_string(),
-                now_iso,
-                now_iso,
-                doc_id,
-                chunk_index,
-                decay_rate,
-                vitality,
-                base_weight,
-                now_iso,
-                node_id,
-                client,
-            ],
-        )?;
+        Memories::new(store).insert(&NewMemory {
+            category: NORMALIZED_CATEGORY.to_string(),
+            // The source's tags, carried over.
+            tags,
+            source: NORMALIZED_SOURCE.to_string(),
+            metadata,
+            doc_id,
+            chunk_index,
+            decay_rate,
+            vitality,
+            base_weight,
+            accessed_at: Some(now_iso.clone()),
+            node_id: Some(node_id),
+            client,
+            ..NewMemory::new(normalized_id.clone(), content, &now_iso)
+        })?;
 
-        apply_entity_mentions(conn, &normalized_id, &entry.entities)?;
+        apply_entity_mentions(store, &normalized_id, &entry.entities)?;
 
         results.push(NormalizationOutcome {
             memory_id: entry.memory_id.clone(),

@@ -23,16 +23,18 @@
 //! no-op in that state, so an import with archiving off is byte-identical to
 //! one from before this module existed.
 //!
-//! # Why its tables are not in the generated schema
+//! # Why its tables are not in the schema files
 //!
-//! `db/schema_tables.sql` is generated verbatim from a `remind_me` database
-//! and is not this crate's file to extend — see [`crate::db`]'s migrations
-//! module. Adding an `archive_path` column to `chat_imports` would be silently
-//! reverted by the next `scripts/regenerate_schema.py` run.
+//! When this was written, `db/schema_tables.sql` was generated verbatim from
+//! the Python `remind_me` and was not this crate's file to extend (an
+//! `archive_path` column on `chat_imports` would have been reverted by the
+//! next regeneration). Python is retired now (ADR-0023) and the files are
+//! hand-owned, but these tables stay separate until the node's storage moves
+//! off SQLite.
 //!
-//! So the two tables below are **target-only**, created by [`ensure_schema`]
-//! at open time in the same way [`crate::vectors::ensure_schema`] creates
-//! `vec_embeddings`. `migration_pending` only iterates tables present in the
+//! So the two tables are **target-only**, created by
+//! [`crate::db::archives::ensure_tables`] at open time in the same way
+//! [`crate::vectors::ensure_schema`] creates `vec_embeddings`. `migration_pending` only iterates tables present in the
 //! pristine reference schema, so a table the reference has never heard of is
 //! invisible to reconciliation rather than repeatedly rebuilt. A `remind_me`
 //! sharing the database ignores them for the same reason.
@@ -51,7 +53,10 @@
 //! outbox — these tables carry no triggers, and `sync/` enumerates the
 //! reference's tables, not this one's.
 
-use rusqlite::{params, Connection, OptionalExtension, Result as SqlResult};
+use crate::db::archives::{ArchiveRow, Archives, SpanSource};
+use crate::db::memories::Memories;
+use crate::db::Result as SqlResult;
+use crate::db::Store;
 use std::path::{Path, PathBuf};
 
 /// Directory raw transcripts are retained under. Unset disables retention.
@@ -85,40 +90,6 @@ pub fn is_enabled() -> bool {
     archive_root().is_some()
 }
 
-/// Create this crate's own archive tables, if they do not already exist.
-///
-/// Called from [`crate::db::schema::initialize_schema`] after the generated
-/// schema is applied — the same arrangement as [`crate::vectors::ensure_schema`].
-///
-/// Created unconditionally, even with retention off. An empty table costs
-/// nothing, and creating it lazily on first write would mean the read path had
-/// to tolerate a missing table forever.
-///
-/// No foreign key to `chat_imports`. The rows outlive an interrupted import on
-/// purpose, and cleanup needs to read `archive_path` *before* the row goes —
-/// a cascade would delete the row and orphan the file, which is the failure
-/// this table exists to make impossible. See [`forget_import`].
-pub fn ensure_schema(conn: &Connection) -> SqlResult<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS import_archives (
-            import_id    TEXT PRIMARY KEY,
-            hash         TEXT NOT NULL,
-            filename     TEXT NOT NULL,
-            archive_path TEXT NOT NULL,
-            byte_len     INTEGER NOT NULL,
-            archived_at  TEXT NOT NULL
-         );
-         CREATE TABLE IF NOT EXISTS import_archive_spans (
-            memory_id  TEXT PRIMARY KEY,
-            import_id  TEXT NOT NULL,
-            byte_start INTEGER NOT NULL,
-            byte_end   INTEGER NOT NULL
-         );
-         CREATE INDEX IF NOT EXISTS idx_archive_spans_import
-            ON import_archive_spans(import_id);",
-    )
-}
-
 /// Why a retention operation could not complete.
 ///
 /// Every variant is something a caller degrades on rather than fails for: an
@@ -126,7 +97,7 @@ pub fn ensure_schema(conn: &Connection) -> SqlResult<()> {
 #[derive(Debug)]
 pub enum ArchiveError {
     Io(std::io::Error),
-    Db(rusqlite::Error),
+    Db(crate::db::StoreError),
 }
 
 impl std::fmt::Display for ArchiveError {
@@ -146,8 +117,8 @@ impl From<std::io::Error> for ArchiveError {
     }
 }
 
-impl From<rusqlite::Error> for ArchiveError {
-    fn from(e: rusqlite::Error) -> Self {
+impl From<crate::db::StoreError> for ArchiveError {
+    fn from(e: crate::db::StoreError) -> Self {
         Self::Db(e)
     }
 }
@@ -167,7 +138,7 @@ fn blob_path(root: &Path, hash: &str) -> PathBuf {
 /// off. Writing the blob is idempotent: an existing blob with this hash is
 /// left alone rather than rewritten, since the hash is over these exact bytes.
 pub fn store(
-    conn: &Connection,
+    store: &Store<'_>,
     import_id: &str,
     filename: &str,
     hash: &str,
@@ -185,25 +156,20 @@ pub fn store(
         std::fs::write(&path, raw)?;
     }
 
-    conn.execute(
-        "INSERT OR REPLACE INTO import_archives
-            (import_id, hash, filename, archive_path, byte_len, archived_at)
-         VALUES (?, ?, ?, ?, ?, ?)",
-        params![
-            import_id,
-            hash,
-            filename,
-            path.to_string_lossy(),
-            raw.len() as i64,
-            chrono::Utc::now().to_rfc3339(),
-        ],
-    )?;
+    Archives::new(store).record(&ArchiveRow {
+        import_id: import_id.to_string(),
+        hash: hash.to_string(),
+        filename: filename.to_string(),
+        archive_path: path.to_string_lossy().into_owned(),
+        byte_len: raw.len() as i64,
+        archived_at: chrono::Utc::now().to_rfc3339(),
+    })?;
 
     // Enforce retention at the point of growth, so an archive cannot outrun
     // its ceiling between manual passes. A no-op unless a limit is set, and a
     // failure is swallowed for the same reason the write above is: retention
     // housekeeping must never fail the import it is decorating.
-    let _ = prune(conn, false);
+    let _ = prune(store, false);
 
     Ok(Some(path))
 }
@@ -212,7 +178,7 @@ pub fn store(
 ///
 /// A no-op when retention is off, so callers do not have to check first.
 pub fn record_span(
-    conn: &Connection,
+    store: &Store<'_>,
     memory_id: &str,
     import_id: &str,
     byte_start: usize,
@@ -221,13 +187,7 @@ pub fn record_span(
     if !is_enabled() {
         return Ok(());
     }
-    conn.execute(
-        "INSERT OR REPLACE INTO import_archive_spans
-            (memory_id, import_id, byte_start, byte_end)
-         VALUES (?, ?, ?, ?)",
-        params![memory_id, import_id, byte_start as i64, byte_end as i64],
-    )?;
-    Ok(())
+    Archives::new(store).record_span(memory_id, import_id, byte_start as i64, byte_end as i64)
 }
 
 /// The raw source behind one memory.
@@ -267,35 +227,25 @@ pub struct ArchiveSource {
 /// scheduled, with no per-call intent to opt back in against; this is a
 /// by-id read, which is a deliberate act by a caller who already has the id.
 pub fn source_for(
-    conn: &Connection,
+    store: &Store<'_>,
     memory_id: &str,
     include_sensitive: bool,
 ) -> SqlResult<Option<ArchiveSource>> {
     if !include_sensitive {
-        let sensitive: Option<bool> = conn
-            .query_row(
-                "SELECT sensitive FROM memories WHERE id = ?",
-                params![memory_id],
-                |r| r.get(0),
-            )
-            .optional()?;
+        let sensitive = Memories::new(store).sensitivity(memory_id)?;
         if sensitive.unwrap_or(false) {
             return Ok(None);
         }
     }
 
-    let row: Option<(String, i64, i64, String, String)> = conn
-        .query_row(
-            "SELECT s.import_id, s.byte_start, s.byte_end, a.archive_path, a.filename
-               FROM import_archive_spans s
-               JOIN import_archives a ON a.import_id = s.import_id
-              WHERE s.memory_id = ?",
-            params![memory_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-        )
-        .optional()?;
-
-    let Some((import_id, start, end, archive_path, filename)) = row else {
+    let Some(SpanSource {
+        import_id,
+        byte_start: start,
+        byte_end: end,
+        archive_path,
+        filename,
+    }) = Archives::new(store).span_source(memory_id)?
+    else {
         return Ok(None);
     };
 
@@ -338,34 +288,16 @@ pub fn source_for(
 /// content-addressed storage means two imports of the same file share one.
 ///
 /// Returns the number of blobs actually removed.
-pub fn forget_import(conn: &Connection, import_id: &str) -> SqlResult<usize> {
-    let row: Option<(String, String)> = conn
-        .query_row(
-            "SELECT archive_path, hash FROM import_archives WHERE import_id = ?",
-            params![import_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
-
-    conn.execute(
-        "DELETE FROM import_archive_spans WHERE import_id = ?",
-        params![import_id],
-    )?;
-    conn.execute(
-        "DELETE FROM import_archives WHERE import_id = ?",
-        params![import_id],
-    )?;
+pub fn forget_import(store: &Store<'_>, import_id: &str) -> SqlResult<usize> {
+    let archives = Archives::new(store);
+    let row = archives.blob_of(import_id)?;
+    archives.remove(import_id)?;
 
     let Some((archive_path, hash)) = row else {
         return Ok(0);
     };
 
-    let still_referenced: i64 = conn.query_row(
-        "SELECT count(*) FROM import_archives WHERE hash = ?",
-        params![hash],
-        |r| r.get(0),
-    )?;
-    if still_referenced > 0 {
+    if archives.count_with_hash(&hash)? > 0 {
         return Ok(0);
     }
 
@@ -436,7 +368,7 @@ struct Retained {
 /// untouched, and [`source_for`] already reads a missing blob as "no source"
 /// rather than an error, so a pruned import degrades exactly like one imported
 /// before retention was switched on.
-pub fn prune(conn: &Connection, dry_run: bool) -> Result<PruneReport, ArchiveError> {
+pub fn prune(store: &Store<'_>, dry_run: bool) -> Result<PruneReport, ArchiveError> {
     let max_age_days = env_u64(ARCHIVE_MAX_AGE_DAYS_ENV);
     let max_bytes = env_u64(ARCHIVE_MAX_BYTES_ENV);
 
@@ -446,30 +378,23 @@ pub fn prune(conn: &Connection, dry_run: bool) -> Result<PruneReport, ArchiveErr
         ..Default::default()
     };
 
-    let mut stmt = conn.prepare(
-        "SELECT import_id, hash, byte_len, archived_at
-           FROM import_archives
-          ORDER BY archived_at ASC",
-    )?;
-    let rows: Vec<Retained> = stmt
-        .query_map([], |r| {
-            let archived_at: String = r.get(3)?;
-            Ok(Retained {
-                import_id: r.get(0)?,
-                hash: r.get(1)?,
-                byte_len: r.get::<_, i64>(2)?.max(0) as u64,
-                // An unparseable timestamp is treated as epoch, so it sorts
-                // oldest and is the first thing an age limit removes. A row
-                // whose date cannot be read is exactly the row least worth
-                // keeping, and skipping it would make it permanently
-                // unprunable.
-                archived_at: chrono::DateTime::parse_from_rfc3339(&archived_at)
-                    .map(|t| t.with_timezone(&chrono::Utc))
-                    .unwrap_or(chrono::DateTime::UNIX_EPOCH),
-            })
-        })?
-        .collect::<SqlResult<_>>()?;
-    drop(stmt);
+    let rows: Vec<Retained> = Archives::new(store)
+        .oldest_first()?
+        .into_iter()
+        .map(|row| Retained {
+            // An unparseable timestamp is treated as epoch, so it sorts
+            // oldest and is the first thing an age limit removes. A row
+            // whose date cannot be read is exactly the row least worth
+            // keeping, and skipping it would make it permanently
+            // unprunable.
+            archived_at: chrono::DateTime::parse_from_rfc3339(&row.archived_at)
+                .map(|t| t.with_timezone(&chrono::Utc))
+                .unwrap_or(chrono::DateTime::UNIX_EPOCH),
+            import_id: row.import_id,
+            hash: row.hash,
+            byte_len: row.byte_len.max(0) as u64,
+        })
+        .collect();
 
     report.examined = rows.len();
     if !report.limits_configured {
@@ -514,7 +439,7 @@ pub fn prune(conn: &Connection, dry_run: bool) -> Result<PruneReport, ArchiveErr
     }
 
     for row in doomed {
-        forget_import(conn, &row.import_id)?;
+        forget_import(store, &row.import_id)?;
     }
     Ok(report)
 }

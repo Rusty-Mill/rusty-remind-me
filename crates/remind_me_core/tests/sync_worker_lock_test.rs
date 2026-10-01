@@ -1,4 +1,4 @@
-//! Regression coverage: the sync worker used to hold `Database::conn()`'s
+//! Regression coverage: the sync worker used to hold `Database::store()`'s
 //! process-wide mutex across its whole network cycle (push + pull against
 //! the hub and every discovered peer), so a hub that accepted a connection
 //! but never answered blocked every other database read or write for up to
@@ -51,13 +51,16 @@ fn a_stuck_hub_never_blocks_an_ordinary_database_read() {
     crate::test_env::set_var(HUB_URL_ENV, format!("http://{hub_addr}"));
     crate::test_env::set_var(SYNC_SECRET_ENV, "lock-test-secret");
 
-    let mut worker = SyncWorker::from_env(db_path.clone()).expect("sync enabled by env");
+    let mut worker =
+        SyncWorker::from_env(db.secondary_source().unwrap()).expect("sync enabled by env");
 
     // Give the freshly spawned cycle time to reach the hub and block on it.
     std::thread::sleep(Duration::from_millis(300));
 
     let start = Instant::now();
-    db.conn()
+    db.store()
+        .sqlite()
+        .unwrap()
         .query_row("SELECT 1", [], |_| Ok(()))
         .expect("a plain local read");
     let elapsed = start.elapsed();
@@ -71,6 +74,6 @@ fn a_stuck_hub_never_blocks_an_ordinary_database_read() {
     assert!(
         elapsed < Duration::from_secs(2),
         "a plain read took {elapsed:?} while the sync worker was talking to a stuck hub \
-         -- Database::conn()'s mutex is being held across network I/O again"
+         -- Database::store()'s mutex is being held across network I/O again"
     );
 }

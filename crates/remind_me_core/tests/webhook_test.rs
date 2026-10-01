@@ -10,13 +10,14 @@
 #[path = "../src/test_env.rs"]
 mod test_env;
 
+use remind_me_core::db::Store;
 use remind_me_core::sync::{CLIENT_ENV, NODE_ID_ENV};
+use remind_me_core::testing::{self, Table};
 use remind_me_core::webhook::{
     self, constant_time_eq, validate_payload, Webhook, WebhookConfig, WebhookCounters,
     MAX_BODY_BYTES, MAX_HEAD_BYTES,
 };
 use remind_me_core::Database;
-use rusqlite::Connection;
 use std::io::{Cursor, Read, Write};
 use std::sync::{Arc, Mutex};
 
@@ -72,9 +73,9 @@ fn authed(body: &str) -> String {
 }
 
 /// Run one request against a fresh store, returning (status, parsed body).
-fn serve(conn: &Connection, raw: &str) -> (u16, serde_json::Value) {
+fn serve(store: &Store<'_>, raw: &str) -> (u16, serde_json::Value) {
     let counters = WebhookCounters::default();
-    serve_with(conn, raw, &counters)
+    serve_with(store, raw, &counters)
 }
 
 /// Turn the rate limiter off for this binary.
@@ -93,13 +94,13 @@ fn disable_rate_limit() {
 }
 
 fn serve_with(
-    conn: &Connection,
+    store: &Store<'_>,
     raw: &str,
     counters: &WebhookCounters,
 ) -> (u16, serde_json::Value) {
     disable_rate_limit();
     let mut stream = FakeStream::new(raw.as_bytes().to_vec());
-    webhook::serve_once(&mut stream, &config(), conn, counters).expect("no I/O failure");
+    webhook::serve_once(&mut stream, &config(), store, counters).expect("no I/O failure");
     parse_response(&stream.output)
 }
 
@@ -197,13 +198,13 @@ fn constant_time_comparison_still_compares() {
 fn a_push_without_a_token_is_refused() {
     let db = Database::open_in_memory().unwrap();
     let (status, body) = serve(
-        &db.conn(),
+        &db.store(),
         &request("POST", "/ingest", None, &push_body("chat.json", CHAT)),
     );
 
     assert_eq!(status, 401);
     assert_eq!(body["error"], "unauthorized");
-    assert_eq!(stored(&db.conn()), 0, "nothing is written on a refusal");
+    assert_eq!(stored(&db.store()), 0, "nothing is written on a refusal");
 }
 
 #[test]
@@ -216,10 +217,10 @@ fn a_push_with_the_wrong_token_is_refused() {
         &push_body("chat.json", CHAT),
     );
 
-    let (status, _) = serve(&db.conn(), &raw);
+    let (status, _) = serve(&db.store(), &raw);
 
     assert_eq!(status, 401);
-    assert_eq!(stored(&db.conn()), 0);
+    assert_eq!(stored(&db.store()), 0);
 }
 
 #[test]
@@ -232,19 +233,19 @@ fn a_token_missing_the_bearer_prefix_is_refused() {
         &push_body("chat.json", CHAT),
     );
 
-    assert_eq!(serve(&db.conn(), &raw).0, 401);
+    assert_eq!(serve(&db.store(), &raw).0, 401);
 }
 
 #[test]
 fn an_unauthenticated_caller_cannot_map_the_routes() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
     // Auth is checked before routing, so a wrong path and a right one look
     // identical to someone without the token. If routing came first, the
     // difference between 404 and 401 would enumerate the endpoint.
-    let ingest = serve(&conn, &request("POST", "/ingest", None, "{}"));
-    let elsewhere = serve(&conn, &request("POST", "/admin", None, "{}"));
+    let ingest = serve(&store, &request("POST", "/ingest", None, "{}"));
+    let elsewhere = serve(&store, &request("POST", "/admin", None, "{}"));
 
     assert_eq!(ingest, elsewhere);
     assert_eq!(ingest.0, 401);
@@ -264,21 +265,21 @@ fn an_authenticated_request_to_another_path_is_not_found() {
         "{}",
     );
 
-    assert_eq!(serve(&db.conn(), &raw).0, 404);
+    assert_eq!(serve(&db.store(), &raw).0, 404);
 }
 
 #[test]
 fn a_get_is_not_found_and_a_put_is_not_allowed() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let bearer = format!("Bearer {}", SECRET);
 
     assert_eq!(
-        serve(&conn, &request("GET", "/ingest", Some(&bearer), "")).0,
+        serve(&store, &request("GET", "/ingest", Some(&bearer), "")).0,
         404
     );
     assert_eq!(
-        serve(&conn, &request("PUT", "/ingest", Some(&bearer), "{}")).0,
+        serve(&store, &request("PUT", "/ingest", Some(&bearer), "{}")).0,
         405
     );
 }
@@ -293,7 +294,7 @@ fn a_query_string_does_not_change_the_route() {
         &push_body("chat.json", CHAT),
     );
 
-    assert_eq!(serve(&db.conn(), &raw).0, 200);
+    assert_eq!(serve(&db.store(), &raw).0, 200);
 }
 
 // ---------------------------------------------------------------------------
@@ -312,7 +313,7 @@ fn an_oversized_body_is_refused_without_being_read() {
         MAX_BODY_BYTES + 1
     );
 
-    let (status, body) = serve(&db.conn(), &raw);
+    let (status, body) = serve(&db.store(), &raw);
 
     assert_eq!(status, 413);
     assert_eq!(body["error"], "request body too large");
@@ -328,7 +329,7 @@ fn a_body_exactly_at_the_cap_is_not_refused_for_size() {
         SECRET, MAX_BODY_BYTES
     );
 
-    let (status, body) = serve(&db.conn(), &raw);
+    let (status, body) = serve(&db.store(), &raw);
 
     assert_eq!(status, 400, "truncated, not oversized: {body}");
 }
@@ -343,7 +344,7 @@ fn an_oversized_header_block_is_refused() {
         "a".repeat(MAX_HEAD_BYTES + 1024)
     );
 
-    let (status, _) = serve(&db.conn(), &raw);
+    let (status, _) = serve(&db.store(), &raw);
 
     assert_eq!(status, 431);
 }
@@ -351,11 +352,11 @@ fn an_oversized_header_block_is_refused() {
 #[test]
 fn a_missing_or_unparseable_content_length_is_refused() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let bearer = format!("Bearer {}", SECRET);
 
     let none = format!("POST /ingest HTTP/1.1\r\nAuthorization: {}\r\n\r\n", bearer);
-    let (status, body) = serve(&conn, &none);
+    let (status, body) = serve(&store, &none);
     assert_eq!(status, 400);
     assert_eq!(body["error"], "missing request body");
 
@@ -363,7 +364,7 @@ fn a_missing_or_unparseable_content_length_is_refused() {
         "POST /ingest HTTP/1.1\r\nAuthorization: {}\r\nContent-Length: banana\r\n\r\n",
         bearer
     );
-    let (status, body) = serve(&conn, &junk);
+    let (status, body) = serve(&store, &junk);
     assert_eq!(status, 400);
     // Distinguished from an absent header: one is a client that sent no body,
     // the other is a client sending something malformed.
@@ -373,7 +374,7 @@ fn a_missing_or_unparseable_content_length_is_refused() {
         "POST /ingest HTTP/1.1\r\nAuthorization: {}\r\nContent-Length: 0\r\n\r\n",
         bearer
     );
-    assert_eq!(serve(&conn, &empty).0, 400);
+    assert_eq!(serve(&store, &empty).0, 400);
 }
 
 // ---------------------------------------------------------------------------
@@ -383,7 +384,7 @@ fn a_missing_or_unparseable_content_length_is_refused() {
 #[test]
 fn malformed_json_is_refused() {
     let db = Database::open_in_memory().unwrap();
-    let (status, body) = serve(&db.conn(), &authed("{not json"));
+    let (status, body) = serve(&db.store(), &authed("{not json"));
 
     assert_eq!(status, 400);
     assert_eq!(body["error"], "malformed JSON");
@@ -459,23 +460,26 @@ fn the_defaults_match_a_file_import() {
 // Ingestion
 // ---------------------------------------------------------------------------
 
-fn stored(conn: &Connection) -> i64 {
-    conn.query_row("SELECT count(*) FROM memories", [], |r| r.get(0))
-        .unwrap()
+/// `column` of one stored memory (the lowest id), as text.
+fn first_memory_text(store: &Store<'_>, column: &str) -> String {
+    let first = &testing::memory_ids(store).unwrap()[0];
+    testing::memory_text(store, first, column).unwrap().unwrap()
+}
+
+fn stored(store: &Store<'_>) -> i64 {
+    testing::count(store, Table::Memories).unwrap()
 }
 
 #[test]
 fn a_valid_push_becomes_memories() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
-    let (status, body) = serve(&conn, &authed(&push_body("chat.json", CHAT)));
+    let (status, body) = serve(&store, &authed(&push_body("chat.json", CHAT)));
 
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["status"], "imported");
-    let content: String = conn
-        .query_row("SELECT content FROM memories", [], |r| r.get(0))
-        .unwrap();
+    let content = first_memory_text(&store, "content");
     assert!(
         content.contains("marsupial"),
         "the assistant message landed, got {content}"
@@ -499,14 +503,14 @@ fn a_pushed_memory_is_stamped_with_the_configured_node_and_client() {
     crate::test_env::set_var(CLIENT_ENV, "webhook-test-client");
 
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let (status, body) = serve(&conn, &authed(&push_body("chat.json", CHAT)));
+    let store = db.store();
+    let (status, body) = serve(&store, &authed(&push_body("chat.json", CHAT)));
     assert_eq!(status, 200, "{body}");
 
-    let (node_id, client): (Option<String>, String) = conn
-        .query_row("SELECT node_id, client FROM memories LIMIT 1", [], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })
+    let first = &testing::memory_ids(&store).unwrap()[0];
+    let node_id = testing::memory_text(&store, first, "node_id").unwrap();
+    let client = testing::memory_text(&store, first, "client")
+        .unwrap()
         .unwrap();
 
     crate::test_env::remove_var(NODE_ID_ENV);
@@ -519,22 +523,18 @@ fn a_pushed_memory_is_stamped_with_the_configured_node_and_client() {
 #[test]
 fn a_pushed_memory_keeps_the_source_a_file_import_would_have_given_it() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
-    serve(&conn, &authed(&push_body("chat.json", CHAT)));
+    serve(&store, &authed(&push_body("chat.json", CHAT)));
 
-    let source: String = conn
-        .query_row("SELECT source FROM memories", [], |r| r.get(0))
-        .unwrap();
+    let source = first_memory_text(&store, "source");
     // Not "webhook". `source` feeds dedup, the normalize_batch selection and
     // the vitality source prior, and a database is meant to be readable by
     // `remind_me`, which stores pushed content under exactly these values. The
     // arrival channel is recorded in metadata instead, where it costs nothing.
     assert_eq!(source, "chat_import");
 
-    let metadata: String = conn
-        .query_row("SELECT metadata FROM memories", [], |r| r.get(0))
-        .unwrap();
+    let metadata = first_memory_text(&store, "metadata");
     let metadata: serde_json::Value = serde_json::from_str(&metadata).unwrap();
     assert_eq!(metadata["ingest"], "webhook");
     assert_eq!(metadata["filename"], "chat.json");
@@ -543,42 +543,40 @@ fn a_pushed_memory_keeps_the_source_a_file_import_would_have_given_it() {
 #[test]
 fn a_pushed_document_is_chunked_as_a_document() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let doc = "# Rottnest\n\nA small island.\n\n# Quokkas\n\nThey live there.\n";
 
-    let (status, _) = serve(&conn, &authed(&push_body("notes.md", doc)));
+    let (status, _) = serve(&store, &authed(&push_body("notes.md", doc)));
 
     assert_eq!(status, 200);
-    let source: String = conn
-        .query_row("SELECT source FROM memories LIMIT 1", [], |r| r.get(0))
-        .unwrap();
+    let source = first_memory_text(&store, "source");
     assert_eq!(source, "document_import");
-    assert!(stored(&conn) >= 2, "one memory per section");
+    assert!(stored(&store) >= 2, "one memory per section");
 }
 
 #[test]
 fn pushing_the_same_content_twice_is_a_no_op() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let counters = WebhookCounters::default();
 
-    let (first, _) = serve_with(&conn, &authed(&push_body("chat.json", CHAT)), &counters);
-    let after_first = stored(&conn);
+    let (first, _) = serve_with(&store, &authed(&push_body("chat.json", CHAT)), &counters);
+    let after_first = stored(&store);
     // A different display name, byte-identical content: dedup is on the
     // content hash, so the rename must not smuggle a second copy in.
-    let (second, body) = serve_with(&conn, &authed(&push_body("renamed.json", CHAT)), &counters);
+    let (second, body) = serve_with(&store, &authed(&push_body("renamed.json", CHAT)), &counters);
 
     assert_eq!(first, 200);
     assert_eq!(second, 200);
     assert_eq!(body["status"], "skipped");
     assert_eq!(body["reason"], "already_imported");
-    assert_eq!(stored(&conn), after_first);
+    assert_eq!(stored(&store), after_first);
 }
 
 #[test]
 fn an_unsupported_format_is_refused_as_content_not_as_a_bad_request() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
     // A pushed filename names nothing on disk, so it gets held to the same
     // format rule a real file would be — otherwise the extension would be a
@@ -588,7 +586,7 @@ fn an_unsupported_format_is_refused_as_content_not_as_a_bad_request() {
     // supported format, which quietly turned this into a test of the PDF
     // parser instead of the format gate. The extension only has to be one
     // nothing will ever import.
-    let (status, body) = serve(&conn, &authed(&push_body("payload.exe", "MZ")));
+    let (status, body) = serve(&store, &authed(&push_body("payload.exe", "MZ")));
 
     // 422, not 400: the request was well-formed, the content was not usable.
     assert_eq!(status, 422);
@@ -597,19 +595,19 @@ fn an_unsupported_format_is_refused_as_content_not_as_a_bad_request() {
         body["reason"].as_str().unwrap().contains("unsupported"),
         "got {body}"
     );
-    assert_eq!(stored(&conn), 0);
+    assert_eq!(stored(&store), 0);
 }
 
 #[test]
 fn a_document_import_of_a_chat_export_is_refused() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let body = serde_json::json!({
         "filename": "chat.json", "content": CHAT, "kind": "document"
     })
     .to_string();
 
-    let (status, body) = serve(&conn, &authed(&body));
+    let (status, body) = serve(&store, &authed(&body));
 
     assert_eq!(status, 422);
     assert!(body["reason"]
@@ -621,17 +619,17 @@ fn a_document_import_of_a_chat_export_is_refused() {
 #[test]
 fn the_counters_tally_each_outcome_separately() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let counters = WebhookCounters::default();
 
-    serve_with(&conn, &authed(&push_body("chat.json", CHAT)), &counters);
-    serve_with(&conn, &authed(&push_body("again.json", CHAT)), &counters);
+    serve_with(&store, &authed(&push_body("chat.json", CHAT)), &counters);
+    serve_with(&store, &authed(&push_body("again.json", CHAT)), &counters);
     // See the note in the unsupported-format test above for why this is not
     // a `.pdf` any more.
-    serve_with(&conn, &authed(&push_body("bad.exe", "x")), &counters);
+    serve_with(&store, &authed(&push_body("bad.exe", "x")), &counters);
     // A rejection that never reaches the importer is not an ingestion
     // outcome, so it moves none of these.
-    serve_with(&conn, &request("POST", "/ingest", None, "{}"), &counters);
+    serve_with(&store, &request("POST", "/ingest", None, "{}"), &counters);
 
     let (ingested, skipped, errored, errors) = counters.snapshot();
 
@@ -643,14 +641,14 @@ fn the_counters_tally_each_outcome_separately() {
 #[test]
 fn only_the_most_recent_errors_are_kept() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let counters = WebhookCounters::default();
 
     // Unbounded error history on a network-facing endpoint is a way for a
     // hostile client to grow this process's memory one bad push at a time.
     for i in 0..40 {
         serve_with(
-            &conn,
+            &store,
             &authed(&push_body(&format!("bad{i}.pdf"), "x")),
             &counters,
         );
@@ -712,7 +710,7 @@ fn a_running_endpoint_accepts_a_push_over_the_network() {
 
     let after = webhook.status();
     assert_eq!(after.requests_ingested, 1);
-    assert_eq!(stored(&db.conn()), 1);
+    assert_eq!(stored(&db.store()), 1);
 }
 
 #[test]

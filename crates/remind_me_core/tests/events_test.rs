@@ -9,6 +9,7 @@
 #[path = "../src/test_env.rs"]
 mod test_env;
 
+use remind_me_core::db::Store;
 use remind_me_core::events::{self, Event};
 use remind_me_core::{Database, MemoryAddInput};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -53,9 +54,9 @@ fn capture(count: usize) -> (String, mpsc::Receiver<String>) {
     (url, rx)
 }
 
-fn add(conn: &rusqlite::Connection, content: &str, category: &str) -> String {
+fn add(store: &Store<'_>, content: &str, category: &str) -> String {
     remind_me_core::db::queries::add_memory(
-        conn,
+        store,
         MemoryAddInput {
             content: content.to_string(),
             category: category.to_string(),
@@ -91,8 +92,8 @@ fn the_payload_carries_no_memory_content() {
     crate::test_env::set_var(events::EVENT_WEBHOOK_URL_ENV, &url);
 
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "the nuclear launch codes are 0000", "general");
+    let store = db.store();
+    let id = add(&store, "the nuclear launch codes are 0000", "general");
     events::drain();
 
     let event = received(&rx);
@@ -121,10 +122,10 @@ fn each_mutation_kind_emits_its_own_event() {
     crate::test_env::set_var(events::EVENT_WEBHOOK_URL_ENV, &url);
 
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "something", "general");
+    let store = db.store();
+    let id = add(&store, "something", "general");
     remind_me_core::db::queries::update_memory(
-        &conn,
+        &store,
         &remind_me_core::models::MemoryUpdateInput {
             memory_id: id.clone(),
             clear_superseded: false,
@@ -136,7 +137,7 @@ fn each_mutation_kind_emits_its_own_event() {
         },
     )
     .unwrap();
-    remind_me_core::db::queries::delete_memory(&conn, &id).unwrap();
+    remind_me_core::db::queries::delete_memory(&store, &id).unwrap();
     events::drain();
 
     let mut kinds: Vec<String> = (0..3)
@@ -166,10 +167,10 @@ fn a_delete_still_reports_the_category_it_had() {
     crate::test_env::set_var(events::EVENT_WEBHOOK_URL_ENV, &url);
 
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "doomed", "engineering");
+    let store = db.store();
+    let id = add(&store, "doomed", "engineering");
     let _created = received(&rx);
-    remind_me_core::db::queries::delete_memory(&conn, &id).unwrap();
+    remind_me_core::db::queries::delete_memory(&store, &id).unwrap();
     events::drain();
 
     // A hard delete removes the row, so the category has to be captured before
@@ -195,8 +196,8 @@ fn an_unconfigured_stream_is_a_true_no_op() {
     // No thread is started at all, rather than one that discovers it has
     // nowhere to go — this runs on every single write.
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "no consumer configured", "general");
+    let store = db.store();
+    add(&store, "no consumer configured", "general");
     events::drain();
 }
 
@@ -221,7 +222,7 @@ fn a_sync_applied_write_emits_nothing() {
     crate::test_env::set_var(remind_me_core::sync::SYNC_SECRET_ENV, "shh");
 
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
     let record = remind_me_core::sync::SyncRecord {
         id: "mem_from_peer".into(),
@@ -251,7 +252,7 @@ fn a_sync_applied_write_emits_nothing() {
         sensitive: false,
         remind_at: None,
     };
-    remind_me_core::sync::upsert_record(&conn, &record).unwrap();
+    remind_me_core::sync::upsert_record(&store, &record).unwrap();
     events::drain();
 
     // Emitting on a sync-applied write is how two synced nodes would echo each
@@ -283,14 +284,14 @@ fn a_dead_endpoint_does_not_fail_the_write() {
     crate::test_env::set_var(events::EVENT_WEBHOOK_URL_ENV, &dead);
 
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
     // A write is the user's data; a webhook is someone's convenience, and the
     // second must never be able to cost the first.
-    let id = add(&conn, "the write must survive", "general");
+    let id = add(&store, "the write must survive", "general");
     events::drain();
 
-    assert!(remind_me_core::db::queries::get_memory_by_id(&conn, &id)
+    assert!(remind_me_core::db::queries::get_memory_by_id(&store, &id)
         .unwrap()
         .is_some());
 
@@ -304,9 +305,9 @@ fn there_is_no_throttle() {
     crate::test_env::set_var(events::EVENT_WEBHOOK_URL_ENV, &url);
 
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     for i in 0..5 {
-        add(&conn, &format!("memory {i}"), "general");
+        add(&store, &format!("memory {i}"), "general");
     }
     events::drain();
 

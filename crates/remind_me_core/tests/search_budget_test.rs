@@ -10,16 +10,16 @@
 //! is precisely the shape of bug being fixed.
 
 use remind_me_core::db::queries;
+use remind_me_core::db::Store;
 use remind_me_core::models::MemorySearchInput;
 use remind_me_core::{Database, MemoryAddInput};
-use rusqlite::Connection;
 
 /// Add a memory whose content is `chars` long, so token estimates
 /// (`len / 4`) are predictable.
-fn add_sized(conn: &Connection, tag: &str, chars: usize) -> String {
+fn add_sized(store: &Store<'_>, tag: &str, chars: usize) -> String {
     let body = format!("quokka {tag} {}", "x".repeat(chars.saturating_sub(20)));
     queries::add_memory(
-        conn,
+        store,
         MemoryAddInput {
             content: body,
             category: "general".into(),
@@ -37,26 +37,26 @@ fn add_sized(conn: &Connection, tag: &str, chars: usize) -> String {
     .id
 }
 
-fn search(conn: &Connection, budget: usize) -> remind_me_core::expansion::MemorySearchResponse {
+fn search(store: &Store<'_>, budget: usize) -> remind_me_core::expansion::MemorySearchResponse {
     let input = MemorySearchInput {
         query: "quokka".into(),
         limit: 50,
         token_budget: budget,
         ..Default::default()
     };
-    queries::search_with_expansions(conn, &input).unwrap()
+    queries::search_with_expansions(store, &input).unwrap()
 }
 
 #[test]
 fn an_untrimmed_search_reports_nothing_trimmed() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     for i in 0..3 {
-        add_sized(&conn, &format!("m{i}"), 40);
+        add_sized(&store, &format!("m{i}"), 40);
     }
 
     // Generous budget: everything fits.
-    let res = search(&conn, 100_000);
+    let res = search(&store, 100_000);
 
     assert_eq!(res.returned, 3);
     assert_eq!(res.total_candidates, 3);
@@ -79,18 +79,18 @@ fn a_trimmed_search_says_how_many_it_dropped() {
     // responses apart from the length of `memories`, which a caller has no
     // baseline to compare against.
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     for i in 0..8 {
-        add_sized(&conn, &format!("m{i}"), 400);
+        add_sized(&store, &format!("m{i}"), 400);
     }
 
-    let untrimmed = search(&conn, 0);
+    let untrimmed = search(&store, 0);
     assert_eq!(untrimmed.trimmed, 0);
     let all = untrimmed.total_candidates;
     assert!(all >= 4, "need several candidates to trim, got {all}");
 
     // A budget that fits roughly one 400-char memory (~100 tokens).
-    let res = search(&conn, 120);
+    let res = search(&store, 120);
 
     assert!(
         res.returned < all,
@@ -118,12 +118,12 @@ fn a_trimmed_search_says_how_many_it_dropped() {
 #[test]
 fn a_budget_of_zero_means_unlimited_and_still_counts_tokens() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     for i in 0..5 {
-        add_sized(&conn, &format!("m{i}"), 200);
+        add_sized(&store, &format!("m{i}"), 200);
     }
 
-    let res = search(&conn, 0);
+    let res = search(&store, 0);
 
     assert_eq!(res.returned, res.total_candidates);
     assert_eq!(res.trimmed, 0);
@@ -138,15 +138,15 @@ fn a_budget_of_zero_means_unlimited_and_still_counts_tokens() {
 #[test]
 fn an_empty_result_set_reports_zeroes_rather_than_omitting_the_envelope() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add_sized(&conn, "unrelated", 40);
+    let store = db.store();
+    add_sized(&store, "unrelated", 40);
 
     let input = MemorySearchInput {
         query: "nothingmatchesthis".into(),
         token_budget: 500,
         ..Default::default()
     };
-    let res = queries::search_with_expansions(&conn, &input).unwrap();
+    let res = queries::search_with_expansions(&store, &input).unwrap();
 
     assert!(res.memories.is_empty());
     assert_eq!(res.returned, 0);
@@ -161,10 +161,10 @@ fn the_envelope_reaches_the_serialised_response() {
     // The fields only matter if they reach a client. A struct field that
     // never serialised would satisfy every assertion above.
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add_sized(&conn, "m", 40);
+    let store = db.store();
+    add_sized(&store, "m", 40);
 
-    let res = search(&conn, 900);
+    let res = search(&store, 900);
     let json = serde_json::to_value(&res).unwrap();
 
     for key in [

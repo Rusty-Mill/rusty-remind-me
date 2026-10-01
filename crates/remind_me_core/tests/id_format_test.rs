@@ -16,6 +16,8 @@
 //! started assuming a `mem_` prefix.
 
 use remind_me_core::db::queries;
+use remind_me_core::db::Store;
+use remind_me_core::testing;
 use remind_me_core::{Database, MemoryAddInput, MemoryListInput, MemoryUpdateInput};
 
 /// Ids in the reference's shape, as it would actually write them.
@@ -24,9 +26,9 @@ use remind_me_core::{Database, MemoryAddInput, MemoryListInput, MemoryUpdateInpu
 /// `remind_me`-created database rather than invented.
 const REFERENCE_SHAPED: [&str; 3] = ["b14392f2f0aa", "60a83dd9662f", "c38fed0e0bb5"];
 
-fn add(conn: &rusqlite::Connection, content: &str) -> String {
+fn add(store: &Store<'_>, content: &str) -> String {
     queries::add_memory(
-        conn,
+        store,
         MemoryAddInput {
             content: content.to_string(),
             category: "general".into(),
@@ -47,36 +49,16 @@ fn add(conn: &rusqlite::Connection, content: &str) -> String {
 /// Rewrite a row's id to a reference-shaped one, simulating a row this
 /// implementation received from `remind_me` through the shared database.
 ///
-/// Done with raw SQL because there is no API for it — which is the point: a
-/// row with a foreign id shape arrives by the other process writing it, not by
-/// anything here choosing it.
-fn relabel(conn: &rusqlite::Connection, from: &str, to: &str) {
-    // `memory_tags.memory_id` carries a foreign key to `memories.id`, so
-    // whichever of the two updates lands first orphans the other. The check is
-    // suspended across the pair rather than the tags being dropped: a row that
-    // arrived from `remind_me` has its tags, and a guard that only ever sees
-    // tagless rows would not be testing the shape a shared database holds.
-    conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
-    conn.execute("UPDATE memories SET id = ?1 WHERE id = ?2", [to, from])
-        .unwrap();
-    conn.execute(
-        "UPDATE memory_tags SET memory_id = ?1 WHERE memory_id = ?2",
-        [to, from],
-    )
-    .unwrap();
-    conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
-
-    // Left inconsistent, the tests below would pass for the wrong reason.
-    let orphans: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM memory_tags t
-              LEFT JOIN memories m ON m.id = t.memory_id
-              WHERE m.id IS NULL",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(orphans, 0, "relabel left orphaned tag rows");
+/// Done with a raw write because there is no API for it — which is the
+/// point: a row with a foreign id shape arrives by the other process writing
+/// it, not by anything here choosing it. Its tags move with it, not dropped:
+/// a row that arrived from `remind_me` has its tags, and a guard that only
+/// ever sees tagless rows would not be testing the shape a shared database
+/// holds.
+fn relabel(store: &Store<'_>, from: &str, to: &str) {
+    // Left inconsistent, the tests below would pass for the wrong reason:
+    // the helper refuses a move that leaves tag rows behind.
+    assert_eq!(testing::relabel_memory(store, from, to).unwrap(), 1);
 }
 
 /// `list` with a real limit.
@@ -85,12 +67,12 @@ fn relabel(conn: &rusqlite::Connection, from: &str, to: &str) {
 /// `limit: 0` — the `#[serde(default = "default_list_limit")]` attribute only
 /// applies when deserializing. A test that used the derived default would list
 /// nothing and every assertion below would be vacuous.
-fn list_all(conn: &rusqlite::Connection) -> Vec<String> {
+fn list_all(store: &Store<'_>) -> Vec<String> {
     let input = MemoryListInput {
         limit: 100,
         ..Default::default()
     };
-    queries::list_memories(conn, &input)
+    queries::list_memories(store, &input)
         .unwrap()
         .memories
         .into_iter()
@@ -105,13 +87,13 @@ fn list_all(conn: &rusqlite::Connection) -> Vec<String> {
 #[test]
 fn a_reference_shaped_id_reads_back() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
     for id in REFERENCE_SHAPED {
-        let ours = add(&conn, &format!("row {id}"));
-        relabel(&conn, &ours, id);
+        let ours = add(&store, &format!("row {id}"));
+        relabel(&store, &ours, id);
 
-        let found = queries::get_memory_by_id(&conn, id)
+        let found = queries::get_memory_by_id(&store, id)
             .unwrap()
             .unwrap_or_else(|| panic!("a {id:?} id must be readable"));
         assert_eq!(found.id, id);
@@ -122,12 +104,12 @@ fn a_reference_shaped_id_reads_back() {
 #[test]
 fn a_reference_shaped_id_updates() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let ours = add(&conn, "before");
-    relabel(&conn, &ours, REFERENCE_SHAPED[0]);
+    let store = db.store();
+    let ours = add(&store, "before");
+    relabel(&store, &ours, REFERENCE_SHAPED[0]);
 
     queries::update_memory(
-        &conn,
+        &store,
         &MemoryUpdateInput {
             memory_id: REFERENCE_SHAPED[0].to_string(),
             clear_superseded: false,
@@ -140,7 +122,7 @@ fn a_reference_shaped_id_updates() {
     )
     .expect("an update must not care what shape the id is");
 
-    let found = queries::get_memory_by_id(&conn, REFERENCE_SHAPED[0])
+    let found = queries::get_memory_by_id(&store, REFERENCE_SHAPED[0])
         .unwrap()
         .unwrap();
     assert_eq!(found.content, "after");
@@ -149,12 +131,12 @@ fn a_reference_shaped_id_updates() {
 #[test]
 fn a_reference_shaped_id_deletes() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let ours = add(&conn, "doomed");
-    relabel(&conn, &ours, REFERENCE_SHAPED[1]);
+    let store = db.store();
+    let ours = add(&store, "doomed");
+    relabel(&store, &ours, REFERENCE_SHAPED[1]);
 
-    assert!(queries::delete_memory(&conn, REFERENCE_SHAPED[1]).unwrap());
-    assert!(queries::get_memory_by_id(&conn, REFERENCE_SHAPED[1])
+    assert!(queries::delete_memory(&store, REFERENCE_SHAPED[1]).unwrap());
+    assert!(queries::get_memory_by_id(&store, REFERENCE_SHAPED[1])
         .unwrap()
         .is_none());
 }
@@ -164,13 +146,13 @@ fn both_formats_coexist_and_list_together() {
     // The actual shared-database state: some rows written here, some written by
     // `remind_me`. A read path that filtered on shape would return half.
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
-    let ours = add(&conn, "written here");
-    let theirs_src = add(&conn, "written by the reference");
-    relabel(&conn, &theirs_src, REFERENCE_SHAPED[2]);
+    let ours = add(&store, "written here");
+    let theirs_src = add(&store, "written by the reference");
+    relabel(&store, &theirs_src, REFERENCE_SHAPED[2]);
 
-    let ids = list_all(&conn);
+    let ids = list_all(&store);
 
     assert!(ids.contains(&ours), "ours missing from {ids:?}");
     assert!(
@@ -192,15 +174,15 @@ fn nothing_in_the_crate_dispatches_on_the_mem_prefix() {
     // A row with a *deliberately unlike* id: no prefix, not hex, not 12 chars.
     // If any path pattern-matched, this is what would break first.
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let ours = add(&conn, "oddly named");
-    relabel(&conn, &ours, "not-a-mem-id-at-all-☃");
+    let store = db.store();
+    let ours = add(&store, "oddly named");
+    relabel(&store, &ours, "not-a-mem-id-at-all-☃");
 
-    let found = queries::get_memory_by_id(&conn, "not-a-mem-id-at-all-☃")
+    let found = queries::get_memory_by_id(&store, "not-a-mem-id-at-all-☃")
         .unwrap()
         .expect("ids are opaque, so even this must round-trip");
     assert_eq!(found.content, "oddly named");
-    assert!(queries::delete_memory(&conn, "not-a-mem-id-at-all-☃").unwrap());
+    assert!(queries::delete_memory(&store, "not-a-mem-id-at-all-☃").unwrap());
 }
 
 #[test]
@@ -210,13 +192,13 @@ fn our_own_ids_are_unique_rather_than_derived_from_content() {
     // reference's `sha256(content + ts)[:12]` is a function of exactly the
     // inputs a duplicate shares.
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
-    let a = add(&conn, "exactly the same text");
-    let b = add(&conn, "exactly the same text");
+    let a = add(&store, "exactly the same text");
+    let b = add(&store, "exactly the same text");
 
     assert_ne!(a, b, "identical content must not collide on id");
-    assert_eq!(list_all(&conn).len(), 2, "both rows must survive");
+    assert_eq!(list_all(&store).len(), 2, "both rows must survive");
 }
 
 // ---------------------------------------------------------------------------

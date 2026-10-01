@@ -5,12 +5,12 @@
 //! without this there is no way to un-hide it.
 
 use remind_me_core::db::queries;
+use remind_me_core::db::Store;
 use remind_me_core::{
     Database, MemoryAddInput, MemorySearchInput, MemoryUpdateInput, UpdateOutcome,
 };
-use rusqlite::Connection;
 
-fn add(conn: &Connection, content: &str, triple: Option<(&str, &str, &str)>) -> String {
+fn add(store: &Store<'_>, content: &str, triple: Option<(&str, &str, &str)>) -> String {
     let (subject, predicate, object) = match triple {
         Some((s, p, o)) => (
             Some(s.to_string()),
@@ -20,7 +20,7 @@ fn add(conn: &Connection, content: &str, triple: Option<(&str, &str, &str)>) -> 
         None => (None, None, None),
     };
     queries::add_memory(
-        conn,
+        store,
         MemoryAddInput {
             content: content.to_string(),
             category: "general".to_string(),
@@ -38,9 +38,9 @@ fn add(conn: &Connection, content: &str, triple: Option<(&str, &str, &str)>) -> 
     .id
 }
 
-fn update(conn: &Connection, id: &str, clear_superseded: bool) -> UpdateOutcome {
+fn update(store: &Store<'_>, id: &str, clear_superseded: bool) -> UpdateOutcome {
     queries::update_memory(
-        conn,
+        store,
         &MemoryUpdateInput {
             memory_id: id.to_string(),
             content: None,
@@ -54,13 +54,16 @@ fn update(conn: &Connection, id: &str, clear_superseded: bool) -> UpdateOutcome 
     .expect("update")
 }
 
-fn superseded_by(conn: &Connection, id: &str) -> Option<String> {
-    conn.query_row(
-        "SELECT superseded_by FROM memories WHERE id = ?",
-        [id],
-        |r| r.get(0),
-    )
-    .expect("row")
+fn superseded_by(store: &Store<'_>, id: &str) -> Option<String> {
+    store
+        .sqlite()
+        .unwrap()
+        .query_row(
+            "SELECT superseded_by FROM memories WHERE id = ?",
+            [id],
+            |r| r.get(0),
+        )
+        .expect("row")
 }
 
 /// Build the situation this flag exists to recover from: two memories sharing
@@ -69,19 +72,19 @@ fn superseded_by(conn: &Connection, id: &str) -> Option<String> {
 /// Supersession is driven explicitly by `entity::supersede_contradicting_facts`
 /// rather than as a side effect of `add_memory`, so the fixture calls it the
 /// same way the real add path does. Returns `(superseded, superseding)`.
-fn supersede(conn: &Connection) -> (String, String) {
+fn supersede(store: &Store<'_>) -> (String, String) {
     let first = add(
-        conn,
+        store,
         "the deploy target is staging",
         Some(("deploy", "target", "staging")),
     );
     let second = add(
-        conn,
+        store,
         "the deploy target is production",
         Some(("deploy", "target", "production")),
     );
     let hit = remind_me_core::entity::supersede_contradicting_facts(
-        conn,
+        store,
         &second,
         Some("deploy"),
         Some("target"),
@@ -98,16 +101,16 @@ fn supersede(conn: &Connection) -> (String, String) {
 
 #[test]
 fn clearing_unhides_a_superseded_memory() {
-    let db = Database::open(":memory:").expect("db");
-    let conn = db.conn();
-    let (first, _) = supersede(&conn);
+    let db = Database::open_on_sqlite(":memory:").expect("db");
+    let store = db.store();
+    let (first, _) = supersede(&store);
 
     assert!(matches!(
-        update(&conn, &first, true),
+        update(&store, &first, true),
         UpdateOutcome::Updated(_)
     ));
     assert_eq!(
-        superseded_by(&conn, &first),
+        superseded_by(&store, &first),
         None,
         "clear_superseded should null the pointer"
     );
@@ -115,13 +118,13 @@ fn clearing_unhides_a_superseded_memory() {
 
 #[test]
 fn omitting_the_flag_leaves_the_pointer_alone() {
-    let db = Database::open(":memory:").expect("db");
-    let conn = db.conn();
-    let (first, second) = supersede(&conn);
+    let db = Database::open_on_sqlite(":memory:").expect("db");
+    let store = db.store();
+    let (first, second) = supersede(&store);
 
     // A content edit that says nothing about supersession must not un-hide it.
     queries::update_memory(
-        &conn,
+        &store,
         &MemoryUpdateInput {
             memory_id: first.clone(),
             content: Some("the deploy target is staging (revised)".to_string()),
@@ -135,7 +138,7 @@ fn omitting_the_flag_leaves_the_pointer_alone() {
     .expect("update");
 
     assert_eq!(
-        superseded_by(&conn, &first),
+        superseded_by(&store, &first),
         Some(second),
         "an unrelated edit must not clear the supersession"
     );
@@ -145,19 +148,19 @@ fn omitting_the_flag_leaves_the_pointer_alone() {
 /// the superseding" — clearing must not cascade.
 #[test]
 fn clearing_does_not_touch_the_superseding_memory() {
-    let db = Database::open(":memory:").expect("db");
-    let conn = db.conn();
-    let (first, second) = supersede(&conn);
+    let db = Database::open_on_sqlite(":memory:").expect("db");
+    let store = db.store();
+    let (first, second) = supersede(&store);
 
-    update(&conn, &first, true);
+    update(&store, &first, true);
 
     assert_eq!(
-        superseded_by(&conn, &second),
+        superseded_by(&store, &second),
         None,
         "the superseding memory was never superseded itself"
     );
     // And it is still present and readable.
-    assert!(queries::get_memory_by_id(&conn, &second)
+    assert!(queries::get_memory_by_id(&store, &second)
         .expect("get")
         .is_some());
 }
@@ -166,13 +169,13 @@ fn clearing_does_not_touch_the_superseding_memory() {
 /// clearing it is what actually brings the memory back.
 #[test]
 fn a_cleared_memory_is_searchable_again() {
-    let db = Database::open(":memory:").expect("db");
-    let conn = db.conn();
-    let (first, _) = supersede(&conn);
+    let db = Database::open_on_sqlite(":memory:").expect("db");
+    let store = db.store();
+    let (first, _) = supersede(&store);
 
-    let search = |conn: &Connection| {
+    let search = |store: &Store<'_>| {
         queries::search_memories(
-            conn,
+            store,
             &MemorySearchInput {
                 query: "staging".to_string(),
                 limit: 20,
@@ -184,20 +187,20 @@ fn a_cleared_memory_is_searchable_again() {
         .any(|r| r.memory.id == first)
     };
 
-    assert!(!search(&conn), "a superseded memory should not surface");
-    update(&conn, &first, true);
-    assert!(search(&conn), "clearing should bring it back to search");
+    assert!(!search(&store), "a superseded memory should not surface");
+    update(&store, &first, true);
+    assert!(search(&store), "clearing should bring it back to search");
 }
 
 /// `clear_superseded` alone is a real update, not "no fields provided".
 #[test]
 fn the_flag_alone_counts_as_an_update() {
-    let db = Database::open(":memory:").expect("db");
-    let conn = db.conn();
-    let (first, _) = supersede(&conn);
+    let db = Database::open_on_sqlite(":memory:").expect("db");
+    let store = db.store();
+    let (first, _) = supersede(&store);
 
     assert!(
-        matches!(update(&conn, &first, true), UpdateOutcome::Updated(_)),
+        matches!(update(&store, &first, true), UpdateOutcome::Updated(_)),
         "the flag on its own must not be reported as NoFields"
     );
 }
@@ -206,25 +209,28 @@ fn the_flag_alone_counts_as_an_update() {
 /// to false must not turn every empty update into a write.
 #[test]
 fn an_empty_update_is_still_no_fields() {
-    let db = Database::open(":memory:").expect("db");
-    let conn = db.conn();
-    let id = add(&conn, "a standalone note", None);
+    let db = Database::open_on_sqlite(":memory:").expect("db");
+    let store = db.store();
+    let id = add(&store, "a standalone note", None);
 
-    assert!(matches!(update(&conn, &id, false), UpdateOutcome::NoFields));
+    assert!(matches!(
+        update(&store, &id, false),
+        UpdateOutcome::NoFields
+    ));
 }
 
 /// Clearing a memory that was never superseded is a no-op, not an error.
 #[test]
 fn clearing_an_unsuperseded_memory_is_harmless() {
-    let db = Database::open(":memory:").expect("db");
-    let conn = db.conn();
-    let id = add(&conn, "a standalone note", None);
+    let db = Database::open_on_sqlite(":memory:").expect("db");
+    let store = db.store();
+    let id = add(&store, "a standalone note", None);
 
     assert!(matches!(
-        update(&conn, &id, true),
+        update(&store, &id, true),
         UpdateOutcome::Updated(_)
     ));
-    assert_eq!(superseded_by(&conn, &id), None);
+    assert_eq!(superseded_by(&store, &id), None);
 }
 
 /// Deserialization contract: a caller that omits the field gets `false`, and

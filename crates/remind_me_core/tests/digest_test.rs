@@ -1,13 +1,14 @@
 //! Coverage for `remind_me_digest` (gap T5, issue #111).
 
 use remind_me_core::db::queries;
+use remind_me_core::db::Store;
 use remind_me_core::digest::{build_digest, render_markdown, MAX_RECENT_MEMORIES};
+use remind_me_core::testing;
 use remind_me_core::{Database, MemoryAddInput};
-use rusqlite::Connection;
 
-fn add(conn: &Connection, content: &str, sensitive: bool) -> String {
+fn add(store: &Store<'_>, content: &str, sensitive: bool) -> String {
     queries::add_memory(
-        conn,
+        store,
         MemoryAddInput {
             content: content.to_string(),
             category: "general".into(),
@@ -25,24 +26,20 @@ fn add(conn: &Connection, content: &str, sensitive: bool) -> String {
     .id
 }
 
-fn backdate(conn: &Connection, id: &str, days: i64) {
+fn backdate(store: &Store<'_>, id: &str, days: i64) {
     let when = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
-    conn.execute(
-        "UPDATE memories SET created_at = ? WHERE id = ?",
-        rusqlite::params![when, id],
-    )
-    .unwrap();
+    testing::set_memory_column(store, id, "created_at", when).unwrap();
 }
 
 #[test]
 fn the_digest_lists_memories_from_the_window() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "this week", false);
-    let old = add(&conn, "last month", false);
-    backdate(&conn, &old, 30);
+    let store = db.store();
+    add(&store, "this week", false);
+    let old = add(&store, "last month", false);
+    backdate(&store, &old, 30);
 
-    let data = build_digest(&conn, 7).unwrap();
+    let data = build_digest(&store, 7).unwrap();
 
     assert_eq!(data.recent_memories.len(), 1);
     assert_eq!(data.recent_memories[0].content, "this week");
@@ -52,11 +49,11 @@ fn the_digest_lists_memories_from_the_window() {
 #[test]
 fn sensitive_memories_never_appear_and_there_is_no_override() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "ordinary", false);
-    add(&conn, "private", true);
+    let store = db.store();
+    add(&store, "ordinary", false);
+    add(&store, "private", true);
 
-    let data = build_digest(&conn, 7).unwrap();
+    let data = build_digest(&store, 7).unwrap();
 
     // Unlike search and list, a digest has no `include_sensitive`. It is the
     // ambient, often-scheduled surface the flag exists to protect, with no
@@ -71,12 +68,12 @@ fn sensitive_memories_never_appear_and_there_is_no_override() {
 #[test]
 fn the_cap_is_visible_rather_than_silent() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     for i in 0..(MAX_RECENT_MEMORIES + 5) {
-        add(&conn, &format!("memory {}", i), false);
+        add(&store, &format!("memory {}", i), false);
     }
 
-    let data = build_digest(&conn, 7).unwrap();
+    let data = build_digest(&store, 7).unwrap();
 
     // The true count is carried separately, so a busy week reads as "20 of 25"
     // rather than silently looking like a quiet one.
@@ -88,11 +85,11 @@ fn the_cap_is_visible_rather_than_silent() {
 #[test]
 fn an_empty_window_says_so_rather_than_rendering_nothing() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let old = add(&conn, "ancient", false);
-    backdate(&conn, &old, 400);
+    let store = db.store();
+    let old = add(&store, "ancient", false);
+    backdate(&store, &old, 400);
 
-    let data = build_digest(&conn, 7).unwrap();
+    let data = build_digest(&store, 7).unwrap();
     let markdown = render_markdown(&data);
 
     // "Nothing new this week" is information; a blank section reads as a bug.
@@ -103,10 +100,10 @@ fn an_empty_window_says_so_rather_than_rendering_nothing() {
 #[test]
 fn the_reminder_and_sync_sections_report_emptiness_rather_than_vanishing() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "something", false);
+    let store = db.store();
+    add(&store, "something", false);
 
-    let data = build_digest(&conn, 7).unwrap();
+    let data = build_digest(&store, 7).unwrap();
     let markdown = render_markdown(&data);
 
     // Both sections were omitted while their subsystems did not exist, because
@@ -131,10 +128,10 @@ fn the_reminder_and_sync_sections_report_emptiness_rather_than_vanishing() {
 #[test]
 fn the_vitality_section_is_always_present() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "something", false);
+    let store = db.store();
+    add(&store, "something", false);
 
-    let markdown = render_markdown(&build_digest(&conn, 7).unwrap());
+    let markdown = render_markdown(&build_digest(&store, 7).unwrap());
 
     // Vitality reads from a subsystem that does exist, so unlike reminders it
     // is reported even when the numbers are unremarkable.
@@ -145,24 +142,20 @@ fn the_vitality_section_is_always_present() {
 #[test]
 fn the_window_is_configurable() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let old = add(&conn, "three weeks ago", false);
-    backdate(&conn, &old, 21);
+    let store = db.store();
+    let old = add(&store, "three weeks ago", false);
+    backdate(&store, &old, 21);
 
-    assert_eq!(build_digest(&conn, 7).unwrap().recent_total, 0);
-    assert_eq!(build_digest(&conn, 30).unwrap().recent_total, 1);
+    assert_eq!(build_digest(&store, 7).unwrap().recent_total, 0);
+    assert_eq!(build_digest(&store, 30).unwrap().recent_total, 1);
 }
 
 #[test]
 fn a_deleted_memory_is_excluded() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "removed", false);
-    conn.execute(
-        "UPDATE memories SET deleted_at = '2026-01-01T00:00:00+00:00' WHERE id = ?",
-        [&id],
-    )
-    .unwrap();
+    let store = db.store();
+    let id = add(&store, "removed", false);
+    testing::set_memory_column(&store, &id, "deleted_at", "2026-01-01T00:00:00+00:00").unwrap();
 
-    assert_eq!(build_digest(&conn, 7).unwrap().recent_total, 0);
+    assert_eq!(build_digest(&store, 7).unwrap().recent_total, 0);
 }

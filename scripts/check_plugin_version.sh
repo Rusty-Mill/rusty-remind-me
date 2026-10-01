@@ -6,9 +6,9 @@
 # The two are independent, hand-maintained fields — nothing in Cargo itself
 # ties a plugin manifest's version to a crate version — so a
 # PR that bumps one and forgets the other would otherwise ship a release
-# whose attached plugin archive still claims the previous version. This is
-# the schema-drift check's shape applied to that gap: catch it in CI, in
-# seconds, rather than after a mismatched release is already published.
+# whose attached plugin archive still claims the previous version. This
+# catches it in CI, in seconds, rather than after a mismatched release is
+# already published.
 #
 # Exit codes: 0 versions agree, 1 they differ, 2 the check could not run.
 set -euo pipefail

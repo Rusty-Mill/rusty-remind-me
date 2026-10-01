@@ -17,10 +17,10 @@
 mod test_env;
 
 use remind_me_core::db::queries;
+use remind_me_core::db::Store;
 use remind_me_core::embedder::{EmbedError, EmbedRole, Embedder, EmbeddingIdentity};
 use remind_me_core::retrieval::{Deadline, SEARCH_DEADLINE_ENV};
 use remind_me_core::{Database, MemoryAddInput, MemorySearchInput};
-use rusqlite::Connection;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
@@ -74,9 +74,9 @@ fn db(name: &str) -> Database {
     Database::open(dir.join("memories.db").display().to_string()).unwrap()
 }
 
-fn add(conn: &Connection, content: &str) {
+fn add(store: &Store<'_>, content: &str) {
     queries::add_memory(
-        conn,
+        store,
         MemoryAddInput {
             content: content.to_string(),
             category: "fact".to_string(),
@@ -121,12 +121,12 @@ fn without_a_deadline_nothing_is_reported_and_nothing_is_skipped() {
     crate::test_env::remove_var(SEARCH_DEADLINE_ENV);
 
     let db = db("unset");
-    let conn = db.conn();
-    add(&conn, "quokka sightings on the island");
+    let store = db.store();
+    add(&store, "quokka sightings on the island");
 
     let embedder = CountingEmbedder::new();
     let outcome =
-        queries::search_memories_budgeted(&conn, &query("quokka"), Some(&embedder)).unwrap();
+        queries::search_memories_budgeted(&store, &query("quokka"), Some(&embedder)).unwrap();
 
     assert!(!outcome.timing.degraded());
     assert!(outcome.timing.skipped.is_empty());
@@ -140,8 +140,8 @@ fn without_a_deadline_nothing_is_reported_and_nothing_is_skipped() {
 #[test]
 fn an_already_expired_deadline_skips_the_semantic_stage() {
     let db = db("expired");
-    let conn = db.conn();
-    add(&conn, "quokka sightings on the island");
+    let store = db.store();
+    add(&store, "quokka sightings on the island");
 
     // Passed in rather than set in the environment. The env clock starts when
     // the search starts, so an env-configured 1ms deadline expires only if the
@@ -149,7 +149,7 @@ fn an_already_expired_deadline_skips_the_semantic_stage() {
     // was flaky in exactly that way before this seam existed.
     let embedder = CountingEmbedder::new();
     let outcome = queries::search_memories_deadlined(
-        &conn,
+        &store,
         &query("quokka"),
         Some(&embedder),
         Deadline::already_passed(),
@@ -189,13 +189,13 @@ fn an_already_expired_deadline_skips_the_semantic_stage() {
 #[test]
 fn the_deadline_gates_entry_it_does_not_interrupt() {
     let db = db("gate_only");
-    let conn = db.conn();
-    add(&conn, "quokka sightings on the island");
+    let store = db.store();
+    add(&store, "quokka sightings on the island");
 
     // Generous enough that it cannot have passed by the semantic stage.
     let embedder = CountingEmbedder::new();
     let outcome = queries::search_memories_deadlined(
-        &conn,
+        &store,
         &query("quokka"),
         Some(&embedder),
         Deadline::starting_now(Some(std::time::Duration::from_secs(60))),
@@ -238,10 +238,10 @@ fn elapsed_time_is_reported_even_on_a_clean_run() {
     crate::test_env::remove_var(SEARCH_DEADLINE_ENV);
 
     let db = db("elapsed");
-    let conn = db.conn();
-    add(&conn, "quokka sightings on the island");
+    let store = db.store();
+    add(&store, "quokka sightings on the island");
 
-    let outcome = queries::search_memories_budgeted(&conn, &query("quokka"), None).unwrap();
+    let outcome = queries::search_memories_budgeted(&store, &query("quokka"), None).unwrap();
     // "How long did that take" is a fair question whether or not anything was
     // cut -- the same reasoning that has `trim_by_token_budget` count tokens
     // under an unlimited budget.
@@ -258,12 +258,12 @@ fn an_empty_query_still_reports_its_timing() {
     crate::test_env::remove_var(SEARCH_DEADLINE_ENV);
 
     let db = db("empty_query");
-    let conn = db.conn();
-    add(&conn, "quokka sightings on the island");
+    let store = db.store();
+    add(&store, "quokka sightings on the island");
 
     // Punctuation only: sanitizes to an empty FTS expression and takes the
     // early return, which is easy to forget when adding a field.
-    let outcome = queries::search_memories_budgeted(&conn, &query("???"), None).unwrap();
+    let outcome = queries::search_memories_budgeted(&store, &query("???"), None).unwrap();
     assert!(outcome.results.is_empty());
     assert!(!outcome.timing.degraded());
     assert_eq!(outcome.timing.deadline_ms, None);
@@ -281,9 +281,9 @@ fn a_category_containing_a_single_quote_is_matched_via_bound_parameter() {
     crate::test_env::remove_var(SEARCH_DEADLINE_ENV);
 
     let db = db("quote_category");
-    let conn = db.conn();
+    let store = db.store();
     queries::add_memory(
-        &conn,
+        &store,
         MemoryAddInput {
             content: "quokka sightings on the island".to_string(),
             category: "foo's bar".to_string(),
@@ -299,12 +299,12 @@ fn a_category_containing_a_single_quote_is_matched_via_bound_parameter() {
     )
     .unwrap();
     // A memory in a different category must not leak through the filter.
-    add(&conn, "quokka but in the wrong category");
+    add(&store, "quokka but in the wrong category");
 
     let mut input = query("quokka");
     input.category = Some("foo's bar".to_string());
 
-    let outcome = queries::search_memories_budgeted(&conn, &input, None).unwrap();
+    let outcome = queries::search_memories_budgeted(&store, &input, None).unwrap();
 
     assert_eq!(
         outcome.results.len(),
@@ -321,15 +321,15 @@ fn the_configured_deadline_reaches_the_search_response() {
     let _env = EnvGuard::set("2500");
 
     let db = db("response");
-    let conn = db.conn();
-    add(&conn, "quokka sightings on the island");
+    let store = db.store();
+    add(&store, "quokka sightings on the island");
 
     // The full path an MCP caller takes, not just the inner function: this is
     // the only test that proves the env var is actually consulted on the real
     // entry point and that the timing survives being copied onto the response.
     // It deliberately asserts the deadline was *carried*, not that it expired
     // -- expiry is covered above, deterministically, through the seam.
-    let res = queries::search_with_expansions(&conn, &query("quokka")).unwrap();
+    let res = queries::search_with_expansions(&store, &query("quokka")).unwrap();
     assert_eq!(res.timing.deadline_ms, Some(2500));
     assert!(!res.timing.degraded(), "2.5s is not a tight budget");
     assert!(!res.memories.is_empty());

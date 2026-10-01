@@ -204,8 +204,9 @@ fn the_search_tiers_are_zero_filled_rather_than_omitted() {
 fn the_memory_gauge_counts_live_memories_only() {
     with_metrics(true, || {
         let (srv, root) = common::seeded_server("metrics-gauge", |conn| {
+            let mut ids = Vec::new();
             for content in ["one", "two", "three"] {
-                remind_me_core::db::queries::add_memory(
+                let memory = remind_me_core::db::queries::add_memory(
                     conn,
                     remind_me_core::MemoryAddInput {
                         content: content.to_string(),
@@ -221,12 +222,11 @@ fn the_memory_gauge_counts_live_memories_only() {
                     },
                 )
                 .unwrap();
+                ids.push(memory.id);
             }
-            conn.execute(
-                "UPDATE memories SET deleted_at = '2020-01-01T00:00:00+00:00' WHERE content = 'three'",
-                [],
-            )
-            .unwrap();
+            remind_me_core::db::memories::Memories::new(conn)
+                .delete_live(&ids[2], Some("2020-01-01T00:00:00+00:00"))
+                .unwrap();
         });
 
         let body = get(&srv, "/metrics").body;

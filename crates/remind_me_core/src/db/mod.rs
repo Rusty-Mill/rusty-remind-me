@@ -1,9 +1,32 @@
+pub mod archives;
+pub mod curation;
+pub mod derived;
+#[cfg(feature = "engine-store")]
+pub mod engine;
+pub mod entities;
+pub mod feedback;
+pub mod history;
+pub mod imports;
+pub mod memories;
 pub mod migrations;
+pub mod outbox;
+pub mod promotions;
 pub mod queries;
+pub mod related;
+pub mod reminders;
+pub mod saved_searches;
 pub mod schema;
+pub mod stats;
+pub mod store;
+pub mod sync_feed;
+pub mod sync_state;
+pub mod vectors;
+pub mod wiki;
 
-use parking_lot::{Mutex, MutexGuard};
-use rusqlite::{Connection, Result};
+pub use store::{Result, SecondarySource, Store, StoreError};
+
+use parking_lot::Mutex;
+use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
 /// Points directly at a database *file*. This crate's own variable.
@@ -163,8 +186,68 @@ fn expand_tilde(raw: &str, home: &Path) -> PathBuf {
     }
 }
 
+/// The file `conn` has open, or `None` for an in-memory database.
+pub fn database_path(store: &Store<'_>) -> Result<Option<PathBuf>> {
+    let conn = store.conn();
+    let path: String = conn.query_row("PRAGMA database_list", [], |row| row.get(2))?;
+    Ok((!path.is_empty()).then(|| PathBuf::from(path)))
+}
+
+/// The engine directory that holds the store of the SQLite file at `path`
+/// once it has been copied there: `memory.db` has `memory.engine`.
+pub fn engine_dir(path: &Path) -> PathBuf {
+    path.with_extension("engine")
+}
+
+/// Where a copy into the engine directory `dir` is built before it is
+/// renamed to `dir`: `memory.engine` has `memory.engine.partial`. While it
+/// exists without `dir`, a copy is under way, or one failed and was left
+/// for inspection.
+pub fn partial_dir(dir: &Path) -> PathBuf {
+    let mut partial = dir.as_os_str().to_owned();
+    partial.push(".partial");
+    PathBuf::from(partial)
+}
+
+/// Copy the SQLite file `file` into the engine directory `dir` on a store's
+/// first open, saying on stderr what it is doing. The copy runs once, on the
+/// first start with an engine build, and takes minutes on a large store (two
+/// for a real 15,000-memory node), so a node that went quiet for that long
+/// would look hung. A daemon's stderr is its `.daemon.log`.
+#[cfg(feature = "engine-store")]
+fn copy_logging_progress(file: &Path, dir: &Path) -> Result<()> {
+    let started = std::time::Instant::now();
+    eprintln!(
+        "rusty-remind-me: copying {} onto the engine at {}. This happens once, on the \
+         first start with this build, and can take a few minutes on a large store; \
+         clients wait for it.",
+        file.display(),
+        dir.display()
+    );
+    let mut log_table = |done: engine::copy::TableDone| {
+        if done.rows > 0 {
+            eprintln!(
+                "rusty-remind-me: copied {} rows of {} in {:.1}s",
+                done.rows,
+                done.table,
+                done.elapsed.as_secs_f64()
+            );
+        }
+    };
+    engine::copy::copy_into_place(file, dir, &mut log_table)?;
+    eprintln!(
+        "rusty-remind-me: copy finished in {:.1}s",
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
 pub struct Database {
     conn: Mutex<Connection>,
+    /// The engine tables for the groups moved so far (ADR-0023, phase 4),
+    /// when this database was opened on the engine.
+    #[cfg(feature = "engine-store")]
+    engine: Option<engine::EngineHandle>,
     /// `None` for an in-memory database. Kept so [`Database::open_secondary`]
     /// can reopen the same on-disk file without every caller having to carry
     /// the path around separately.
@@ -172,27 +255,178 @@ pub struct Database {
 }
 
 impl Database {
+    /// A database that lives only as long as this value.
+    ///
+    /// On the engine (the default with the `engine-store` feature), the
+    /// store lives in temporary engine tables; with `REMIND_ME_STORE=sqlite`,
+    /// or in a build without the feature, it is in-memory SQLite. That
+    /// variable is how the test suite runs against both backends.
     pub fn open_in_memory() -> Result<Self> {
+        #[cfg(feature = "engine-store")]
+        if engine::engine_selected() {
+            return Self::open_in_memory_on_engine();
+        }
+        Self::open_sqlite_in_memory()
+    }
+
+    /// An in-memory database with the moved groups on temporary engine
+    /// tables, whatever `REMIND_ME_STORE` says.
+    #[cfg(feature = "engine-store")]
+    pub fn open_in_memory_on_engine() -> Result<Self> {
+        let mut db = Self::open_sqlite_in_memory()?;
+        let tables = engine::EngineTables::open_temporary()?;
+        db.engine = Some(std::sync::Arc::new(engine::EngineLock::new(tables)));
+        // Opening the schema aligned the gate in SQLite's `sync_flags`; the
+        // engine holds its own `sync_flags` now, so align that one too, as
+        // every open does, before anything touches the outbox.
+        crate::sync::reconcile_sync_enabled_flag(&db.store())?;
+        queries::empty_tombstones(&db.store())?;
+        Ok(db)
+    }
+
+    /// An in-memory SQLite database whatever `REMIND_ME_STORE` says: for
+    /// tests of what only SQLite has, such as the schema and its migrations.
+    pub fn open_sqlite_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         schema::initialize_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            #[cfg(feature = "engine-store")]
+            engine: None,
             path: None,
         })
     }
 
+    /// The database in the SQLite file at `path`.
+    ///
+    /// On the engine (the default with the `engine-store` feature, unless
+    /// `REMIND_ME_STORE=sqlite`), the store lives in the engine directory
+    /// beside the file (see [`engine_dir`]), copied from the file on the
+    /// first such open. A file
+    /// whose store has moved there is refused without the engine: its rows
+    /// stopped changing at the copy.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let path = path.as_ref().to_path_buf();
-        let conn = Connection::open(&path)?;
+        let path = path.as_ref();
+        #[cfg(feature = "engine-store")]
+        if engine::engine_selected() {
+            // SQLite's name for a database with no file: there is nothing
+            // to copy, and nowhere beside it to keep engine tables.
+            if path == Path::new(":memory:") {
+                return Self::open_in_memory_on_engine();
+            }
+            return Self::open_on_engine(path);
+        }
+        Self::open_on_sqlite(path)
+    }
+
+    /// The database in the SQLite file at `path`, whatever
+    /// `REMIND_ME_STORE` says.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Invalid`] when the file's store was copied onto the
+    /// engine: its rows stopped changing at the copy.
+    pub fn open_on_sqlite<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path = path.as_ref();
+        let dir = engine_dir(path);
+        if dir.exists() {
+            return Err(StoreError::Invalid(format!(
+                "the store in {} was copied onto the engine in {}, and the file has not \
+                 changed since. Open it on the engine (a build with the engine store, \
+                 without REMIND_ME_STORE=sqlite); to go back to SQLite as of the copy, \
+                 move {} aside first",
+                path.display(),
+                dir.display(),
+                dir.display()
+            )));
+        }
+        let db = Self::open_sqlite_file(path)?;
+        // Only when SQLite is the store: on the engine the file stopped
+        // changing at the copy, and the engine open empties its own.
+        queries::empty_tombstones(&db.store())?;
+        Ok(db)
+    }
+
+    /// The database at `path` with its store on the engine, whatever
+    /// `REMIND_ME_STORE` says. The first open copies the SQLite file into
+    /// the engine directory; later opens use that directory as it is.
+    ///
+    /// # Errors
+    ///
+    /// Besides the errors of opening either store: [`StoreError::Invalid`]
+    /// when the copy refused a row, leaving the SQLite file as it was.
+    #[cfg(feature = "engine-store")]
+    pub fn open_on_engine<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path = path.as_ref();
+        let mut db = Self::open_sqlite_file(path)?;
+        let dir = engine_dir(path);
+        db.copy_on_first_open(&dir)?;
+        let tables = engine::EngineTables::open(&dir)?;
+        db.engine = Some(std::sync::Arc::new(engine::EngineLock::new(tables)));
+        crate::sync::reconcile_sync_enabled_flag(&db.store())?;
+        queries::empty_tombstones(&db.store())?;
+        Ok(db)
+    }
+
+    /// Copy the SQLite file into `dir` unless that exists already.
+    ///
+    /// Holds SQLite's write lock across the copy, so no other process
+    /// writes a row after the copy read its table, and a second process
+    /// opening the same file waits and then finds the copy done.
+    #[cfg(feature = "engine-store")]
+    fn copy_on_first_open(&self, dir: &Path) -> Result<()> {
+        if dir.exists() {
+            return Ok(());
+        }
+        let conn = self.conn.lock();
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let copied = match self.path.as_deref() {
+            Some(file) if !dir.exists() => copy_logging_progress(file, dir),
+            _ => Ok(()),
+        };
+        conn.execute_batch("ROLLBACK")?;
+        copied
+    }
+
+    /// The SQLite file at `path`, migrated to this build's schema.
+    fn open_sqlite_file(path: &Path) -> Result<Self> {
+        let conn = Connection::open(path)?;
         schema::initialize_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
-            path: Some(path),
+            #[cfg(feature = "engine-store")]
+            engine: None,
+            path: Some(path.to_path_buf()),
         })
     }
 
-    pub fn conn(&self) -> MutexGuard<'_, Connection> {
-        self.conn.lock()
+    /// Compact the engine tables that have something to reclaim (see
+    /// [`engine::EngineTables::compact_needed`]). How many were compacted;
+    /// always 0 on SQLite, which reclaims space on its own terms.
+    pub fn compact_store(&self) -> Result<usize> {
+        #[cfg(feature = "engine-store")]
+        if let Some(engine) = &self.engine {
+            return engine.lock().compact_needed();
+        }
+        Ok(0)
+    }
+
+    /// The store, locked for as long as the handle lives.
+    pub fn store(&self) -> Store<'_> {
+        let store = Store::locked(self.conn.lock());
+        #[cfg(feature = "engine-store")]
+        let store = store.with_engine(self.engine.clone());
+        store
+    }
+
+    /// Where a background thread reopens this database: its file and its
+    /// engine tables. `None` for an in-memory database.
+    pub fn secondary_source(&self) -> Option<SecondarySource> {
+        Some(SecondarySource::new(
+            self.path.clone()?,
+            #[cfg(feature = "engine-store")]
+            self.engine.clone(),
+        ))
     }
 
     /// Opens a second, independent connection to the same on-disk file this
@@ -233,4 +467,13 @@ impl Database {
         schema::initialize_schema(&conn).map_err(|e| e.to_string())?;
         Ok(conn)
     }
+}
+
+/// Run `test` against every backend this build has: SQLite always, the
+/// engine too with `engine-store`.
+#[cfg(test)]
+pub(crate) fn on_each_backend(mut test: impl FnMut(&Database)) {
+    test(&Database::open_sqlite_in_memory().unwrap());
+    #[cfg(feature = "engine-store")]
+    test(&Database::open_in_memory_on_engine().unwrap());
 }

@@ -6,8 +6,9 @@
 //! `metadata` merges shallowly per key, the LWW winner's value winning on a
 //! key collision. See `docs/adr/0004-sync-protocol-and-conflict-resolution.md`.
 
+use crate::db::memories::{Memories, NewMemory};
+use crate::db::Store;
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -61,9 +62,9 @@ where
     }
 }
 
-/// One `memories` row as it travels the wire, matching the column set this
-/// crate's `memories_outbox_ai`/`memories_outbox_au` triggers snapshot into
-/// `sync_outbox.payload` — see `crates/remind_me_core/src/db/schema_triggers.sql`.
+/// One `memories` row as it travels the wire, matching the column set
+/// `db::derived` snapshots into `sync_outbox.payload` (the triggers' column
+/// set up to schema v30).
 ///
 /// Deliberately does **not** include `doc_id`/`chunk_index`: the reference's
 /// own outbox payload carries them (for wire column-list parity across every
@@ -166,8 +167,8 @@ impl std::fmt::Display for SyncApplyError {
     }
 }
 impl std::error::Error for SyncApplyError {}
-impl From<rusqlite::Error> for SyncApplyError {
-    fn from(e: rusqlite::Error) -> Self {
+impl From<crate::db::StoreError> for SyncApplyError {
+    fn from(e: crate::db::StoreError) -> Self {
         Self(e.to_string())
     }
 }
@@ -180,8 +181,8 @@ pub enum ApplyOutcome {
     /// untouched, and there is nothing to re-embed.
     NotApplied,
     /// The incoming record won: inserted as a new row or fully updated an
-    /// existing one. Carries the memory's rowid so the caller can re-embed.
-    Applied { rowid: i64 },
+    /// existing one.
+    Applied,
 }
 
 /// Canonicalize a timestamp to a fixed-width UTC RFC3339 string, so plain
@@ -229,42 +230,15 @@ fn merge_metadata(local: &Value, incoming: &Value, incoming_wins: bool) -> Value
     Value::Object(merged)
 }
 
-struct LocalRow {
-    tags: Vec<String>,
-    metadata: Value,
-    updated_at: String,
-}
-
-fn fetch_local(conn: &Connection, id: &str) -> rusqlite::Result<Option<LocalRow>> {
-    conn.query_row(
-        "SELECT tags, metadata, updated_at FROM memories WHERE id = ?",
-        params![id],
-        |row| {
-            let tags_json: String = row.get(0)?;
-            let metadata_json: String = row.get(1)?;
-            Ok(LocalRow {
-                tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-                metadata: serde_json::from_str(&metadata_json)
-                    .unwrap_or_else(|_| default_metadata()),
-                updated_at: row.get(2)?,
-            })
-        },
-    )
-    .optional()
-}
-
 /// Apply one incoming sync record: last-write-wins on `updated_at` (a tie
 /// means the incoming side loses -- it must be *strictly* newer to win),
 /// with `tags`/`metadata` merged regardless of the outcome.
 ///
-/// Any `sync_outbox` row this write itself creates (for this memory) is
-/// immediately marked sent -- echo suppression, so the next push cycle
-/// does not hand the remote back the very change it just sent us. A
-/// concurrent, genuinely local edit to the same memory is untouched: it
-/// can only have created outbox rows *before* this call's snapshot, which
-/// is exactly what scopes the suppression to this write's own echo.
+/// The write is never queued in the outbox (`Origin::Sync`), so the next
+/// push does not hand the remote back the change it just sent us. A
+/// genuinely local edit to the same memory is queued as usual.
 pub fn upsert_record(
-    conn: &Connection,
+    store: &Store<'_>,
     record: &SyncRecord,
 ) -> Result<ApplyOutcome, SyncApplyError> {
     if record.id.trim().is_empty()
@@ -285,16 +259,11 @@ pub fn upsert_record(
         .map(canon_ts)
         .unwrap_or_else(|| created_at.clone());
 
-    let local = fetch_local(conn, &record.id)?;
+    let local = Memories::new(store).sync_view(&record.id)?;
     let incoming_wins = match &local {
         None => true,
         Some(local) => updated_at > local.updated_at,
     };
-
-    let before_outbox_id: i64 =
-        conn.query_row("SELECT COALESCE(MAX(id), 0) FROM sync_outbox", [], |r| {
-            r.get(0)
-        })?;
 
     let outcome = if incoming_wins {
         let local_tags: &[String] = local.as_ref().map(|l| l.tags.as_slice()).unwrap_or(&[]);
@@ -305,97 +274,60 @@ pub fn upsert_record(
         let merged_tags = merge_tags(local_tags, &record.tags);
         let merged_metadata = merge_metadata(&local_metadata, &record.metadata, true);
 
-        conn.execute(
-            "INSERT INTO memories (
-                id, content, category, tags, source, metadata, created_at, updated_at,
-                capture_id, node_id, client, accessed_at, access_count, decay_rate,
-                vitality, base_weight, status, memory_type, source_capture_id,
-                subject, predicate, object, superseded_by, deleted_at, sensitive,
-                remind_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                content = excluded.content,
-                category = excluded.category,
-                tags = excluded.tags,
-                source = excluded.source,
-                metadata = excluded.metadata,
-                updated_at = excluded.updated_at,
-                capture_id = excluded.capture_id,
-                node_id = excluded.node_id,
-                client = excluded.client,
-                accessed_at = excluded.accessed_at,
-                access_count = excluded.access_count,
-                decay_rate = excluded.decay_rate,
-                vitality = excluded.vitality,
-                base_weight = excluded.base_weight,
-                status = excluded.status,
-                memory_type = excluded.memory_type,
-                source_capture_id = excluded.source_capture_id,
-                subject = excluded.subject,
-                predicate = excluded.predicate,
-                object = excluded.object,
-                superseded_by = excluded.superseded_by,
-                deleted_at = excluded.deleted_at,
-                sensitive = excluded.sensitive,
-                remind_at = excluded.remind_at",
-            params![
-                record.id,
-                record.content,
-                record.category,
-                serde_json::to_string(&merged_tags).unwrap_or_else(|_| "[]".to_string()),
-                record.source,
-                merged_metadata.to_string(),
-                created_at,
-                updated_at,
-                record.capture_id,
-                record.node_id,
-                record.client,
-                accessed_at,
-                record.access_count,
-                record.decay_rate,
-                record.vitality,
-                record.base_weight,
-                record.status,
-                record.memory_type,
-                record.source_capture_id,
-                record.subject,
-                record.predicate,
-                record.object,
-                record.superseded_by,
-                record.deleted_at,
-                record.sensitive,
-                record.remind_at,
-            ],
-        )?;
-        let rowid: i64 = conn.query_row(
-            "SELECT rowid FROM memories WHERE id = ?",
-            params![record.id],
-            |r| r.get(0),
-        )?;
-        ApplyOutcome::Applied { rowid }
+        let mut incoming = NewMemory {
+            id: record.id.clone(),
+            content: record.content.clone(),
+            category: record.category.clone(),
+            tags: merged_tags,
+            source: record.source.clone(),
+            metadata: merged_metadata,
+            created_at,
+            updated_at: updated_at.clone(),
+            capture_id: record.capture_id.clone(),
+            subject: record.subject.clone(),
+            predicate: record.predicate.clone(),
+            object: record.object.clone(),
+            superseded_by: record.superseded_by.clone(),
+            decay_rate: record.decay_rate,
+            vitality: record.vitality,
+            base_weight: record.base_weight,
+            access_count: record.access_count,
+            accessed_at: Some(accessed_at),
+            doc_id: None,
+            chunk_index: None,
+            remind_at: record.remind_at.clone(),
+            sensitive: record.sensitive,
+            memory_type: record.memory_type.clone(),
+            status: record.status.clone(),
+            node_id: record.node_id.clone(),
+            client: record.client.clone(),
+            source_capture_id: record.source_capture_id.clone(),
+            deleted_at: record.deleted_at.clone(),
+        };
+        // A tombstone is stored without its text (ADR-0024), whatever the
+        // sender kept, and without the local tags the merge above added.
+        incoming.empty_if_tombstone();
+        Memories::new(store).upsert_synced(&incoming)?;
+        ApplyOutcome::Applied
     } else {
         let local = local.expect("incoming_wins is false only when a local row was found");
-        let merged_tags = merge_tags(&local.tags, &record.tags);
+        // A losing live copy must not add its tags back to a tombstone.
+        let merged_tags = if local.deleted {
+            local.tags.clone()
+        } else {
+            merge_tags(&local.tags, &record.tags)
+        };
         let merged_metadata = merge_metadata(&local.metadata, &record.metadata, false);
 
         if merged_tags != local.tags || merged_metadata != local.metadata {
-            conn.execute(
-                "UPDATE memories SET tags = ?, metadata = ? WHERE id = ?",
-                params![
-                    serde_json::to_string(&merged_tags).unwrap_or_else(|_| "[]".to_string()),
-                    merged_metadata.to_string(),
-                    record.id,
-                ],
+            Memories::new(store).set_tags_and_metadata(
+                &record.id,
+                &merged_tags,
+                &merged_metadata,
             )?;
         }
         ApplyOutcome::NotApplied
     };
-
-    let now = Utc::now().to_rfc3339();
-    conn.execute(
-        "UPDATE sync_outbox SET sent_at = ? WHERE id > ? AND memory_id = ? AND sent_at = ''",
-        params![now, before_outbox_id, record.id],
-    )?;
 
     Ok(outcome)
 }

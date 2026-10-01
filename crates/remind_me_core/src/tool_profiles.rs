@@ -101,7 +101,8 @@ pub const MAINTENANCE_PROMPTS: [&str; 8] = [
 /// failing to start over a misspelled optimisation would be worse than the
 /// misspelling, and an empty surface would look like a broken server.
 pub fn configured_profile() -> String {
-    let raw = std::env::var(TOOL_PROFILE_ENV)
+    // Per session: on the daemon, each client keeps its own profile.
+    let raw = crate::daemon::session::var(TOOL_PROFILE_ENV)
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase();

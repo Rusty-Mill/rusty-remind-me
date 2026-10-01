@@ -18,12 +18,12 @@ fn test_database_creation_and_add_memory() {
         entities: vec![],
     };
 
-    let conn = db.conn();
-    let mem = queries::add_memory(&conn, add_input).expect("Failed to add memory");
+    let store = db.store();
+    let mem = queries::add_memory(&store, add_input).expect("Failed to add memory");
     assert!(!mem.id.is_empty());
     assert_eq!(mem.category, "project");
 
-    let fetched = queries::get_memory_by_id(&conn, &mem.id)
+    let fetched = queries::get_memory_by_id(&store, &mem.id)
         .expect("Failed to fetch memory")
         .expect("Memory not found");
     assert_eq!(fetched.content, mem.content);
@@ -46,7 +46,7 @@ fn test_database_creation_and_add_memory() {
         bootstrap: false,
     };
 
-    let search_results = queries::search_memories(&conn, &search_input).expect("Search failed");
+    let search_results = queries::search_memories(&store, &search_input).expect("Search failed");
     assert!(!search_results.is_empty());
     assert_eq!(search_results[0].memory.id, mem.id);
 }

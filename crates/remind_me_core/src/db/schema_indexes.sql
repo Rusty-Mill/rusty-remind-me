@@ -1,5 +1,6 @@
--- GENERATED from remind_me's schema. Do not hand-edit.
--- Regenerate with: python3 scripts/regenerate_schema.py --reference <path>
+-- The node's schema. Originally dumped from the Python remind_me at v29;
+-- that reference is retired (ADR-0023), so this file is edited by hand now.
+-- A change here is a schema change: see db/migrations.rs.
 
 CREATE INDEX IF NOT EXISTS idx_analytics_snapshots_captured_at
             ON analytics_snapshots(captured_at);
@@ -84,7 +85,5 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_reminder_deliveries_memory_remind_at
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_saved_search_seen_memories_search_memory
             ON saved_search_seen_memories(saved_search_id, memory_id);
-
-CREATE INDEX IF NOT EXISTS idx_vec_chunks_memory ON vec_chunks(memory_rowid);
 
 CREATE INDEX IF NOT EXISTS idx_wiki_links_dst ON wiki_links(dst_slug);

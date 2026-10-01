@@ -8,6 +8,7 @@
 
 use remind_me_core::backup::list_backups;
 use remind_me_core::db::queries;
+use remind_me_core::db::Store;
 use remind_me_core::{Database, MemoryAddInput};
 use rusqlite::Connection;
 use std::path::PathBuf;
@@ -45,9 +46,9 @@ impl Drop for TempDb {
     }
 }
 
-fn add(conn: &Connection, content: &str) {
+fn add(store: &Store<'_>, content: &str) {
     queries::add_memory(
-        conn,
+        store,
         MemoryAddInput {
             sensitive: false,
             content: content.to_string(),
@@ -96,7 +97,7 @@ fn reopening_an_up_to_date_database_with_data_takes_no_snapshot() {
     let tmp = TempDb::new("current");
     {
         let db = Database::open(&tmp.0).unwrap();
-        add(&db.conn(), "already on the current schema");
+        add(&db.store(), "already on the current schema");
     }
 
     let _db = Database::open(&tmp.0).unwrap();
@@ -111,17 +112,18 @@ fn reopening_an_up_to_date_database_with_data_takes_no_snapshot() {
 fn a_legacy_database_with_data_is_snapshotted_before_reconciliation() {
     let tmp = TempDb::new("legacy-data");
     {
-        let conn = Connection::open(&tmp.0).unwrap();
-        conn.execute_batch(LEGACY_MEMORIES_TABLE).unwrap();
-        conn.execute_batch(
-            "
+        let store = Connection::open(&tmp.0).unwrap();
+        store.execute_batch(LEGACY_MEMORIES_TABLE).unwrap();
+        store
+            .execute_batch(
+                "
             INSERT INTO memories (id, content, created_at, updated_at, last_accessed_at)
             VALUES ('mem_old', 'protect me', '2020-06-15T12:00:00+00:00',
                     '2020-06-15T12:00:00+00:00', '2020-06-15T12:00:00+00:00');
             PRAGMA user_version = 19;
             ",
-        )
-        .unwrap();
+            )
+            .unwrap();
     }
 
     let _db = Database::open(&tmp.0).unwrap();
@@ -143,9 +145,9 @@ fn a_legacy_database_with_data_is_snapshotted_before_reconciliation() {
 fn a_legacy_database_with_no_rows_is_not_snapshotted() {
     let tmp = TempDb::new("legacy-empty");
     {
-        let conn = Connection::open(&tmp.0).unwrap();
-        conn.execute_batch(LEGACY_MEMORIES_TABLE).unwrap();
-        conn.execute_batch("PRAGMA user_version = 19;").unwrap();
+        let store = Connection::open(&tmp.0).unwrap();
+        store.execute_batch(LEGACY_MEMORIES_TABLE).unwrap();
+        store.execute_batch("PRAGMA user_version = 19;").unwrap();
     }
 
     let _db = Database::open(&tmp.0).unwrap();
@@ -160,9 +162,9 @@ fn a_legacy_database_with_no_rows_is_not_snapshotted() {
 fn an_old_version_stamp_is_snapshotted_under_its_own_label() {
     let tmp = TempDb::new("old-version");
     {
-        let conn = Connection::open(&tmp.0).unwrap();
-        conn.execute_batch(SCHEMA_TABLES).unwrap();
-        conn.execute_batch(
+        let store = Connection::open(&tmp.0).unwrap();
+        store.execute_batch(SCHEMA_TABLES).unwrap();
+        store.execute_batch(
             "
             INSERT INTO memories (id, content, created_at, updated_at)
             VALUES ('mem_old', 'protect me', '2020-06-15T12:00:00+00:00', '2020-06-15T12:00:00+00:00');
@@ -187,17 +189,18 @@ fn an_old_version_stamp_is_snapshotted_under_its_own_label() {
 fn a_snapshot_failure_does_not_block_the_migration() {
     let tmp = TempDb::new("blocked-backups-dir");
     {
-        let conn = Connection::open(&tmp.0).unwrap();
-        conn.execute_batch(LEGACY_MEMORIES_TABLE).unwrap();
-        conn.execute_batch(
-            "
+        let store = Connection::open(&tmp.0).unwrap();
+        store.execute_batch(LEGACY_MEMORIES_TABLE).unwrap();
+        store
+            .execute_batch(
+                "
             INSERT INTO memories (id, content, created_at, updated_at, last_accessed_at)
             VALUES ('mem_old', 'protect me', '2020-06-15T12:00:00+00:00',
                     '2020-06-15T12:00:00+00:00', '2020-06-15T12:00:00+00:00');
             PRAGMA user_version = 19;
             ",
-        )
-        .unwrap();
+            )
+            .unwrap();
     }
 
     // Put a plain file where the backups directory would go, so

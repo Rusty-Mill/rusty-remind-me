@@ -14,10 +14,12 @@
 #[path = "../src/test_env.rs"]
 mod test_env;
 
+use remind_me_core::db::outbox::Outbox;
 use remind_me_core::db::queries;
+use remind_me_core::db::Store;
 use remind_me_core::sync::{upsert_record, SyncRecord, HUB_URL_ENV, NODE_ID_ENV, SYNC_SECRET_ENV};
+use remind_me_core::testing;
 use remind_me_core::{Database, MemoryAddInput, MemorySearchInput};
-use rusqlite::Connection;
 
 fn enable_sync() {
     crate::test_env::set_var(NODE_ID_ENV, "node-sensitive-test");
@@ -25,9 +27,9 @@ fn enable_sync() {
     crate::test_env::set_var(SYNC_SECRET_ENV, "shh");
 }
 
-fn add(conn: &Connection, content: &str, sensitive: bool) -> String {
+fn add(store: &Store<'_>, content: &str, sensitive: bool) -> String {
     queries::add_memory(
-        conn,
+        store,
         MemoryAddInput {
             content: content.to_string(),
             category: "general".into(),
@@ -45,9 +47,9 @@ fn add(conn: &Connection, content: &str, sensitive: bool) -> String {
     .id
 }
 
-fn search_ids(conn: &Connection, query: &str, include_sensitive: bool) -> Vec<String> {
+fn search_ids(store: &Store<'_>, query: &str, include_sensitive: bool) -> Vec<String> {
     queries::search_memories(
-        conn,
+        store,
         &MemorySearchInput {
             strategy: Default::default(),
             query: query.to_string(),
@@ -76,19 +78,22 @@ fn search_ids(conn: &Connection, query: &str, include_sensitive: bool) -> Vec<St
 fn the_outbox_payload_carries_the_flag() {
     enable_sync();
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    conn.execute("DELETE FROM sync_outbox", []).unwrap();
+    let store = db.store();
+    Outbox::new(&store).clear().unwrap();
 
-    let id = add(&conn, "quokka sighting", true);
+    let id = add(&store, "quokka sighting", true);
 
-    let payload_flag: i64 = conn
-        .query_row(
-            "SELECT json_extract(payload, '$.sensitive') FROM sync_outbox
-              WHERE memory_id = ?",
-            [&id],
-            |r| r.get(0),
-        )
+    let row = testing::outbox_rows(&store)
+        .unwrap()
+        .into_iter()
+        .find(|row| row.memory_id == id)
         .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&row.payload).unwrap();
+    // As `json_extract` reads it: a JSON `true` is 1.
+    let payload_flag = match &payload["sensitive"] {
+        serde_json::Value::Bool(flag) => i64::from(*flag),
+        other => other.as_i64().unwrap(),
+    };
     assert_eq!(
         payload_flag, 1,
         "a peer rebuilds the memory from this payload alone"
@@ -99,7 +104,7 @@ fn the_outbox_payload_carries_the_flag() {
 fn an_incoming_sensitive_record_stays_hidden_on_this_node() {
     enable_sync();
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
     let record = SyncRecord {
         id: "mem_remote".into(),
@@ -130,21 +135,17 @@ fn an_incoming_sensitive_record_stays_hidden_on_this_node() {
         remind_at: None,
     };
 
-    upsert_record(&conn, &record).unwrap();
+    upsert_record(&store, &record).unwrap();
 
-    let stored: i64 = conn
-        .query_row(
-            "SELECT sensitive FROM memories WHERE id = 'mem_remote'",
-            [],
-            |r| r.get(0),
-        )
+    let stored = testing::memory_i64(&store, "mem_remote", "sensitive")
+        .unwrap()
         .unwrap();
     assert_eq!(stored, 1, "the flag must survive the crossing");
     assert!(
-        search_ids(&conn, "quokka", false).is_empty(),
+        search_ids(&store, "quokka", false).is_empty(),
         "an incoming sensitive memory must not surface in ordinary search here"
     );
-    assert_eq!(search_ids(&conn, "quokka", true), vec!["mem_remote"]);
+    assert_eq!(search_ids(&store, "quokka", true), vec!["mem_remote"]);
 }
 
 #[test]

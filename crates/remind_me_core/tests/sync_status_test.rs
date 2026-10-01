@@ -13,9 +13,11 @@
 mod test_env;
 
 use remind_me_core::db::queries;
+use remind_me_core::db::sync_state::{SyncLogRow, SyncState};
+use remind_me_core::db::Store;
 use remind_me_core::sync::{sync_repair, sync_status, HUB_URL_ENV, NODE_ID_ENV, SYNC_SECRET_ENV};
+use remind_me_core::testing;
 use remind_me_core::{Database, DrainVerdict, MemoryAddInput, SyncStatus};
-use rusqlite::Connection;
 use std::sync::Mutex;
 
 /// The sync switch is three process-wide env vars and half these tests need it
@@ -38,9 +40,9 @@ fn disable_sync() {
     crate::test_env::remove_var(SYNC_SECRET_ENV);
 }
 
-fn add(conn: &Connection, content: &str) {
+fn add(store: &Store<'_>, content: &str) {
     queries::add_memory(
-        conn,
+        store,
         MemoryAddInput {
             content: content.to_string(),
             category: "general".into(),
@@ -57,26 +59,35 @@ fn add(conn: &Connection, content: &str) {
     .unwrap();
 }
 
-fn remote(conn: &Connection, id: &str, attempt: &str, push: &str, pull: &str) {
-    conn.execute(
-        "INSERT INTO sync_log (remote_id, last_pull, last_push, last_pull_id,
-                               last_attempt_at, last_push_at, last_pull_at)
-         VALUES (?, ?, ?, 'cursor-abc', ?, ?, ?)",
-        rusqlite::params![
-            id,
-            "2026-01-01T00:00:00+00:00",
-            "2026-01-01T00:00:00+00:00",
-            attempt,
-            push,
-            pull
-        ],
-    )
-    .unwrap();
+fn remote(store: &Store<'_>, id: &str, attempt: &str, push: &str, pull: &str) {
+    SyncState::new(store)
+        .put_remote_row(&SyncLogRow {
+            last_pull: "2026-01-01T00:00:00+00:00".into(),
+            last_push: "2026-01-01T00:00:00+00:00".into(),
+            last_pull_id: "cursor-abc".into(),
+            last_attempt_at: attempt.into(),
+            last_push_at: push.into(),
+            last_pull_at: pull.into(),
+            ..SyncLogRow::new(id)
+        })
+        .unwrap();
 }
 
 // ---------------------------------------------------------------------------
 // Disabled
 // ---------------------------------------------------------------------------
+
+/// Record the first `limit` outbox rows (all of them for `None`), oldest
+/// first, as sent to "hub" at `at`: the `sync_sends` rows a push leaves.
+fn mark_sent(store: &Store<'_>, limit: Option<usize>, at: &str) {
+    let ids: Vec<i64> = testing::outbox_rows(store)
+        .unwrap()
+        .into_iter()
+        .take(limit.unwrap_or(usize::MAX))
+        .map(|row| row.id)
+        .collect();
+    SyncState::new(store).record_sends("hub", &ids, at).unwrap();
+}
 
 #[test]
 fn a_disabled_node_names_the_missing_variables() {
@@ -84,7 +95,7 @@ fn a_disabled_node_names_the_missing_variables() {
     disable_sync();
     let db = Database::open_in_memory().unwrap();
 
-    let status = sync_status(&db.conn()).unwrap();
+    let status = sync_status(&db.store()).unwrap();
 
     // The caller is asking because they expected sync to be on. "Sync is off"
     // sends them looking; naming the variables answers the question.
@@ -105,20 +116,20 @@ fn a_never_contacted_remote_is_distinguishable_from_a_failing_one() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     enable_sync();
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     // Never contacted: every timestamp still at the epoch default.
-    remote(&conn, "peer-never", EPOCH, EPOCH, EPOCH);
+    remote(&store, "peer-never", EPOCH, EPOCH, EPOCH);
     // Contacted recently, but nothing has succeeded since — attempt advanced,
     // push and pull did not. This is a wedged remote.
     remote(
-        &conn,
+        &store,
         "peer-failing",
         "2026-08-03T04:00:00+00:00",
         "2026-07-01T00:00:00+00:00",
         "2026-07-01T00:00:00+00:00",
     );
 
-    let SyncStatus::Enabled { remotes, .. } = sync_status(&conn).unwrap() else {
+    let SyncStatus::Enabled { remotes, .. } = sync_status(&store).unwrap() else {
         panic!("expected enabled");
     };
 
@@ -144,18 +155,18 @@ fn liveness_comes_from_the_at_columns_not_the_cursors() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     enable_sync();
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     // A quiet but perfectly healthy remote: contacted moments ago, but its
     // content cursors have not moved because there was nothing new to send.
     remote(
-        &conn,
+        &store,
         "peer-quiet",
         "2026-08-03T04:00:00+00:00",
         "2026-08-03T04:00:00+00:00",
         "2026-08-03T04:00:00+00:00",
     );
 
-    let SyncStatus::Enabled { remotes, .. } = sync_status(&conn).unwrap() else {
+    let SyncStatus::Enabled { remotes, .. } = sync_status(&store).unwrap() else {
         panic!("expected enabled");
     };
     let quiet = &remotes[0];
@@ -173,30 +184,25 @@ fn a_namespaced_pull_cursor_reports_the_same_pending_as_its_base_remote() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     enable_sync();
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "queued for hub");
+    let store = db.store();
+    add(&store, "queued for hub");
 
     // Mark the outbox row delivered to the base remote "hub" -- the same
     // sync_sends row a real push_outbox cycle would leave behind.
-    conn.execute(
-        "INSERT INTO sync_sends (remote_id, outbox_id, sent_at)
-         SELECT 'hub', id, '2026-08-09T00:00:00+00:00' FROM sync_outbox",
-        [],
-    )
-    .unwrap();
+    mark_sent(&store, None, "2026-08-09T00:00:00+00:00");
 
     // A namespaced pull-only cursor for the same destination: entities never
     // get an independent sync_sends row keyed to "hub#entities" -- the
     // memories/entities/links outbox is one queue, pushed once under "hub".
     remote(
-        &conn,
+        &store,
         "hub#entities",
         "2026-08-09T00:00:00+00:00",
         EPOCH,
         "2026-08-09T00:00:00+00:00",
     );
 
-    let SyncStatus::Enabled { remotes, .. } = sync_status(&conn).unwrap() else {
+    let SyncStatus::Enabled { remotes, .. } = sync_status(&store).unwrap() else {
         panic!("expected enabled");
     };
     let entities = remotes
@@ -223,18 +229,13 @@ fn a_graph_cursor_row_reports_the_base_remotes_push_state_not_its_own() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     enable_sync();
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "m1");
+    let store = db.store();
+    add(&store, "m1");
     // Mark the one outbox row sent to the base remote, "hub" -- as a real
     // push cycle would.
-    conn.execute(
-        "INSERT INTO sync_sends (remote_id, outbox_id, sent_at)
-         SELECT 'hub', id, '2026-08-03T04:00:00+00:00' FROM sync_outbox",
-        [],
-    )
-    .unwrap();
+    mark_sent(&store, None, "2026-08-03T04:00:00+00:00");
     remote(
-        &conn,
+        &store,
         "hub",
         "2026-08-03T04:00:00+00:00",
         "2026-08-03T04:00:00+00:00",
@@ -244,14 +245,14 @@ fn a_graph_cursor_row_reports_the_base_remotes_push_state_not_its_own() {
     // `last_push_at` sits at the epoch default forever, since nothing ever
     // writes it.
     remote(
-        &conn,
+        &store,
         "hub#entities",
         "2026-08-03T05:00:00+00:00",
         EPOCH,
         "2026-08-03T05:00:00+00:00",
     );
 
-    let SyncStatus::Enabled { remotes, .. } = sync_status(&conn).unwrap() else {
+    let SyncStatus::Enabled { remotes, .. } = sync_status(&store).unwrap() else {
         panic!("expected enabled");
     };
     let hub = remotes.iter().find(|r| r.remote_id == "hub").unwrap();
@@ -282,7 +283,7 @@ fn an_empty_outbox_is_idle_not_unknown() {
     enable_sync();
     let db = Database::open_in_memory().unwrap();
 
-    let SyncStatus::Enabled { outbox, .. } = sync_status(&db.conn()).unwrap() else {
+    let SyncStatus::Enabled { outbox, .. } = sync_status(&db.store()).unwrap() else {
         panic!("expected enabled");
     };
 
@@ -297,10 +298,10 @@ fn the_first_call_with_a_backlog_admits_it_cannot_tell_yet() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     enable_sync();
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "queued");
+    let store = db.store();
+    add(&store, "queued");
 
-    let SyncStatus::Enabled { outbox, .. } = sync_status(&conn).unwrap() else {
+    let SyncStatus::Enabled { outbox, .. } = sync_status(&store).unwrap() else {
         panic!("expected enabled");
     };
 
@@ -317,11 +318,11 @@ fn a_second_call_with_an_unchanged_backlog_reports_stalled() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     enable_sync();
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "queued");
+    let store = db.store();
+    add(&store, "queued");
 
-    sync_status(&conn).unwrap();
-    let SyncStatus::Enabled { outbox, .. } = sync_status(&conn).unwrap() else {
+    sync_status(&store).unwrap();
+    let SyncStatus::Enabled { outbox, .. } = sync_status(&store).unwrap() else {
         panic!("expected enabled");
     };
 
@@ -336,12 +337,12 @@ fn a_growing_backlog_is_reported_as_growing() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     enable_sync();
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "first");
-    sync_status(&conn).unwrap();
-    add(&conn, "second");
+    let store = db.store();
+    add(&store, "first");
+    sync_status(&store).unwrap();
+    add(&store, "second");
 
-    let SyncStatus::Enabled { outbox, .. } = sync_status(&conn).unwrap() else {
+    let SyncStatus::Enabled { outbox, .. } = sync_status(&store).unwrap() else {
         panic!("expected enabled");
     };
 
@@ -354,18 +355,13 @@ fn a_shrinking_backlog_is_reported_as_draining() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     enable_sync();
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "first");
-    add(&conn, "second");
-    sync_status(&conn).unwrap();
-    conn.execute(
-        "INSERT INTO sync_sends (remote_id, outbox_id, sent_at)
-         SELECT 'hub', id, '2026-08-03T04:00:00+00:00' FROM sync_outbox LIMIT 1",
-        [],
-    )
-    .unwrap();
+    let store = db.store();
+    add(&store, "first");
+    add(&store, "second");
+    sync_status(&store).unwrap();
+    mark_sent(&store, Some(1), "2026-08-03T04:00:00+00:00");
 
-    let SyncStatus::Enabled { outbox, .. } = sync_status(&conn).unwrap() else {
+    let SyncStatus::Enabled { outbox, .. } = sync_status(&store).unwrap() else {
         panic!("expected enabled");
     };
 
@@ -375,33 +371,37 @@ fn a_shrinking_backlog_is_reported_as_draining() {
 }
 
 #[test]
-fn tombstones_are_counted_and_split_by_compactability() {
+fn tombstones_are_counted_and_those_holding_text_flagged() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     enable_sync();
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "recent tombstone");
-    add(&conn, "old tombstone");
-    conn.execute(
-        "UPDATE memories SET deleted_at = ? WHERE content = 'recent tombstone'",
-        [chrono::Utc::now().to_rfc3339()],
-    )
-    .unwrap();
-    conn.execute(
-        "UPDATE memories SET deleted_at = '2020-01-01T00:00:00+00:00'
-          WHERE content = 'old tombstone'",
-        [],
-    )
-    .unwrap();
+    let store = db.store();
+    add(&store, "deleted the usual way");
+    add(&store, "tombstone written some other way");
+    for id in testing::memory_ids(&store).unwrap() {
+        match testing::memory_text(&store, &id, "content")
+            .unwrap()
+            .as_deref()
+        {
+            // A delete empties the tombstone (ADR-0024).
+            Some("deleted the usual way") => {
+                assert!(queries::delete_memory(&store, &id).unwrap());
+            }
+            // Stamped directly, so its text stays: what the count flags.
+            Some("tombstone written some other way") => {
+                testing::set_memory_column(&store, &id, "deleted_at", "2020-01-01T00:00:00+00:00")
+                    .unwrap();
+            }
+            _ => {}
+        }
+    }
 
-    let SyncStatus::Enabled { tombstones, .. } = sync_status(&conn).unwrap() else {
+    let SyncStatus::Enabled { tombstones, .. } = sync_status(&store).unwrap() else {
         panic!("expected enabled");
     };
 
-    // Both numbers matter: total is disk you will not get back yet,
-    // compactable is disk you could get back now.
     assert_eq!(tombstones.total, 2);
-    assert_eq!(tombstones.compactable_now, 1);
+    assert_eq!(tombstones.holding_text, 1);
     disable_sync();
 }
 
@@ -414,24 +414,19 @@ fn repair_resets_the_cursor_and_leaves_the_contact_clocks_alone() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     enable_sync();
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     remote(
-        &conn,
+        &store,
         "hub",
         "2026-08-03T04:00:00+00:00",
         "2026-08-03T04:00:00+00:00",
         "2026-08-03T04:00:00+00:00",
     );
 
-    assert!(sync_repair(&conn, "hub").unwrap());
+    assert!(sync_repair(&store, "hub").unwrap());
 
-    let (last_pull, cursor_id, attempt): (String, String, String) = conn
-        .query_row(
-            "SELECT last_pull, last_pull_id, last_attempt_at FROM sync_log WHERE remote_id = 'hub'",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .unwrap();
+    let row = SyncState::new(&store).remote_row("hub").unwrap().unwrap();
+    let (last_pull, cursor_id, attempt) = (row.last_pull, row.last_pull_id, row.last_attempt_at);
 
     // The cursor goes back to the epoch so history is re-pulled...
     assert_eq!(last_pull, EPOCH);
@@ -451,6 +446,6 @@ fn repairing_an_unknown_remote_reports_that_rather_than_succeeding() {
 
     // A remote never contacted has nothing to repair. Reporting success would
     // send the caller waiting for a re-pull that is not coming.
-    assert!(!sync_repair(&db.conn(), "never-seen").unwrap());
+    assert!(!sync_repair(&db.store(), "never-seen").unwrap());
     disable_sync();
 }

@@ -137,8 +137,8 @@ sync is entirely opt-in. To share memories across machines, stand up a hub
 once and point every node at it:
 
 ```bash
-# On the hub machine — SQLite backend, no separate database server:
-crates/remind_me_hub/setup.sh --sqlite install
+# On the hub machine — one container, no separate database server:
+crates/remind_me_hub/setup.sh install
 # Prints the generated SYNC_SECRET every client below needs.
 
 # On each client machine:
@@ -146,12 +146,13 @@ REMIND_ME_SYNC_SECRET=<printed secret> rusty-remind-me configure \
     --node-id my-laptop --hub-url http://<hub-host>:8765
 ```
 
-`crates/remind_me_hub/setup.sh install` (without `--sqlite`) instead brings
-up Postgres in a rootless Podman container, and `crates/remind_me_hub/client-setup.sh
+That runs the hub on its embedded storage engine. A hub still on the
+Postgres or SQLite store it used to offer moves over with
+`crates/remind_me_hub/setup.sh migrate`, and `crates/remind_me_hub/client-setup.sh
 --node-id my-laptop --tunnel me@hub-host` automates the SSH-tunnel case.
 Docker Compose, Fly.io, and Railway deployments are under
 `crates/remind_me_hub/deploy/`. See [`crates/remind_me_hub/README.md`](crates/remind_me_hub/README.md)
-for the full reference (routes, security posture, backends) and [Multi-Node
+for the full reference (routes, security posture, the store) and [Multi-Node
 Sync, Hub & Remote Connector](#multi-node-sync-hub--remote-connector) below
 for every client-side environment variable this `configure` call sets.
 
@@ -171,7 +172,7 @@ section — enable only what you need:
 | Semantic/vector search, cross-encoder reranking, HyDE query expansion | [Search Quality](#search-quality-embeddings-reranking--query-expansion) |
 | A network-reachable MCP endpoint (e.g. for `claude.ai`'s custom connector) | [Remote MCP connector](#remote-mcp-connector-remind_me_remote-rusty-remind-me-remote) |
 | The REST API / dashboard | [REST API Endpoints](#rest-api-endpoints) — `rusty-remind-me api [port]` |
-| Sharing a database with the Python `remind_me` reference | [Substituting for the `remind_me` MCP server](#substituting-for-the-remind_me-mcp-server) |
+| Moving over from the Python `remind_me` (retired) | [Coming from the Python `remind_me`](#coming-from-the-python-remind_me) |
 
 ---
 
@@ -186,7 +187,7 @@ rusty_remind_me/
 ├── ARCHITECTURE.md             # Technical design & schema documentation
 ├── CONTRIBUTING.md             # Development & testing guidelines
 ├── docs/
-│   └── CUTOVER.md              # Runbook: migrating clients from the Python reference to this port
+│   └── CUTOVER.md              # Historical: the 2026-08 cutover of clients from the Python reference
 ├── scripts/
 │   ├── configure_mcp.ps1       # PowerShell auto-configuration script for Windows
 │   └── configure_mcp.py        # Cross-platform Python auto-configuration script
@@ -342,44 +343,33 @@ Each setup option safely merges the `"rusty-remind-me"` MCP server configuration
 
 ## Database Location
 
-By default the store is `~/.remind-me/memory.db` — the same path [`remind_me`](https://github.com/baileyrd/remind_me) uses, so an unconfigured install of either one opens the same database.
+By default the store is `~/.remind-me/memory.db`.
 
 Two environment variables override it, most specific first:
 
 | Variable | Names a | Notes |
 | --- | --- | --- |
-| `REMIND_ME_DB_PATH` | database **file** | Wins if both are set. Specific to this implementation. |
-| `REMIND_ME_MCP_DIR` | **directory** holding `memory.db` | Shared with `remind_me`. Set this to point both implementations at one store. |
+| `REMIND_ME_DB_PATH` | database **file** | Wins if both are set. |
+| `REMIND_ME_MCP_DIR` | **directory** holding `memory.db` | Also where the wiki, API keys and connector token live. |
 
 A leading `~` is expanded in either. A variable set to the empty string counts as unset.
 
-To share a database with `remind_me`, set `REMIND_ME_MCP_DIR` only — `REMIND_ME_DB_PATH` has no meaning to `remind_me` and setting it there is silently ignored.
+The store is moving off SQLite (`docs/adr/0023-node-storage-moves-to-rusty-multimodal-db.md`). Until that ships, this is the file the node reads and writes.
 
-## Substituting for the `remind_me` MCP server
+## Coming from the Python `remind_me`
 
-Two settings make this binary a drop-in replacement for [`remind_me`](https://github.com/baileyrd/remind_me)'s MCP server:
-
-```bash
-REMIND_ME_MCP_DIR=~/.remind-me                 # the same database (the default)
-REMIND_ME_DEFAULT_RESPONSE_FORMAT=markdown     # the same output format
-```
-
-Or write both into every MCP client config at once:
+The Python [`remind_me`](https://github.com/baileyrd/remind_me) this project was ported from is **retired** (ADR-0023). Until the storage move above ships, this binary still opens a `memory.db` the Python server wrote, so moving over is a matter of pointing your MCP clients at `rusty-remind-me` instead:
 
 ```bash
-rusty-remind-me configure --default-format markdown
+rusty-remind-me configure                             # JSON output (the default)
+rusty-remind-me configure --default-format markdown   # the Python server's output format
 ```
 
-`REMIND_ME_DEFAULT_RESPONSE_FORMAT` accepts `json` (the default) or `markdown`, and affects **only** the tools where `remind_me` has no `response_format` parameter at all — it returns Markdown from those and offers no JSON, whereas this port offers both and defaults to JSON so existing callers keep working.
+Do not run the Python server against the same `memory.db` afterwards. The two stopped being kept schema-identical when Python was retired, and the storage move will end file-level compatibility altogether.
 
-Tools that mirror a `remind_me` input model already use that model's own default and are deliberately untouched by this setting: Markdown for `search`, `list`, `wiki_list`, `stats`, `history`, `digest` and `list_reminders`, JSON for `vitality_report`. Making `vitality_report` render Markdown because you asked for "markdown defaults" would move this port *away* from the reference.
+`REMIND_ME_DEFAULT_RESPONSE_FORMAT` accepts `json` (the default) or `markdown`, and affects **only** the tools where the Python server had no `response_format` parameter at all — it returned Markdown from those and offered no JSON, whereas this port offers both and defaults to JSON so existing callers keep working. Tools that mirror a Python input model already use that model's own default and are untouched by this setting: Markdown for `search`, `list`, `wiki_list`, `stats`, `history`, `digest` and `list_reminders`, JSON for `vitality_report`. A per-call `"response_format"` argument always wins over the setting, in both directions.
 
-A per-call `"response_format"` argument always wins over the setting, in both directions.
-
-**Migrating an already-running client from `remind_me` to this binary?** A
-stdio client will not pick up a config change until it restarts — see
-`docs/CUTOVER.md` for the full runbook and the lessons learned cutting over
-every consumer on a real machine.
+A stdio client will not pick up a config change until it restarts. `docs/CUTOVER.md` records the 2026-08 cutover of every consumer on a real machine; it is kept as history.
 
 ## Multi-Node Sync, Hub & Remote Connector
 
@@ -407,7 +397,14 @@ A write from one of those one-shot commands still lands in the shared SQLite
 outbox — it isn't lost — but nothing pushes it to the hub until a process
 that *is* running a sync worker picks it up on its next cycle. Concretely:
 one of `rusty-remind-me server`/`api`/`remote` has to be running somewhere
-for sync to actually move data. Status is process-global, not tied to
+for sync to actually move data.
+
+**Sync is a property of the store, not of each process.** Every process that
+opens a node's store must agree on it, but they need not all carry the
+settings: a dashboard started without them leaves a syncing store syncing (it
+warns on stderr), queues its edits for the process that pushes, and deletes by
+tombstone. Turning sync off takes `REMIND_ME_SYNC_DISABLE=1`; unsetting the
+settings in one process no longer does it. Status is process-global, not tied to
 whichever instance started the worker:
 `remind_me_server_status` reports on whatever sync worker is live in *that*
 process, the same way it already reports on the folder watcher.
@@ -418,9 +415,11 @@ process, the same way it already reports on the folder watcher.
 | `REMIND_ME_CLIENT` | Human-readable label for this install, alongside `node_id` | `unknown` |
 | `REMIND_ME_HUB_URL` | Hub this node pushes to / pulls from | unset (sync off) |
 | `REMIND_ME_SYNC_SECRET` | Bearer token for `/sync/push` and `/sync/pull`, sent and required | unset (sync off) |
+| `REMIND_ME_SYNC_DISABLE` | `1`/`true`/`yes`/`on`: turn sync off for this store and empty its outbox. Without it, a process that lacks the three settings above leaves a syncing store syncing | unset |
 | `REMIND_ME_SYNC_INTERVAL` | Seconds between background sync cycles | `60` |
 | `REMIND_ME_PEER_BIND` | Bind address for this node's own peer server (accepts another node's push/pull) | `0.0.0.0` — all interfaces; narrow to `127.0.0.1` behind a tunnel-only setup |
 | `REMIND_ME_PEER_PORT` | Port for the peer server above, and the port every discovered peer is assumed to listen on | `8766` |
+| `REMIND_ME_COMPACT_INTERVAL_SECS` | Seconds between the store daemon's compactions of the engine tables it has written to since the last one; `0` turns them off. Read by the daemon only | `3600` |
 
 `rusty-remind-me configure --node-id ID --hub-url URL [--peer-port N] [--sync-interval SECS]`
 writes both the MCP entry and this sync environment for every configured
@@ -628,6 +627,55 @@ rusty-remind-me stats
 ```
 
 ---
+
+### 11. Store Daemon
+One `rusty-remind-me daemon` process owns the store, and every MCP session,
+CLI command, `api` and `remote` becomes its client over loopback. Set
+`REMIND_ME_DAEMON=0` to open the store in each process instead. The first client starts it; nothing needs to be run by
+hand. The background loops (reminders, folder watcher, promotion nudge, sync)
+then run once in the daemon instead of in every long-lived process.
+```bash
+rusty-remind-me list                  # starts the daemon if it is not running
+rusty-remind-me daemon status    # pid, port, start time; exit 1 if not running
+rusty-remind-me daemon stop      # the next client starts a fresh one
+```
+
+`REMIND_ME_CLIENT`, `REMIND_ME_DEFAULT_RESPONSE_FORMAT` and
+`REMIND_ME_TOOL_PROFILE` stay per client. Every other `REMIND_ME_*` setting
+belongs to the daemon, which takes them from the client that started it. A
+client whose settings differ, or a client from a different build, does not
+use that daemon: it prints why on stderr and opens the store in-process, as
+it would with the daemon off. After upgrading, run `rusty-remind-me daemon
+stop` so the next client starts the new build.
+
+The daemon writes `<db>.daemon.json`, `<db>.daemon.token` (mode 600) and
+`<db>.daemon.log` beside the database (`remind_me.db.daemon.json` and so on),
+and holds `<db>.daemon.lock` while it runs.
+
+### 12. The Engine Store
+The node's store is the engine (ADR-0023). On the first start with a build
+that has it, `memory.db` is copied into `memory.engine` beside it: every id
+is kept, every row is verified after it is written, and if any row cannot
+be copied the node refuses to start and says which, leaving `memory.db` as
+it was. Every later start uses `memory.engine`. The SQLite file is kept as
+it was at the copy; a node on SQLite refuses it rather than serve stale
+data.
+
+- `REMIND_ME_STORE=sqlite` keeps a node on SQLite. To go back after the
+  copy, move `memory.engine` aside first: the node then runs on
+  `memory.db` as it was at the copy.
+- Only one process opens the engine store, so the store daemon (§11)
+  serves every client. A client that cannot use a running daemon says why
+  and that `rusty-remind-me daemon stop` releases the store.
+- Backups of an engine store are `backups/*.engine` directories holding
+  both halves; restoring is putting them back.
+
+`copy-store` copies a SQLite store into a separate engine directory without
+touching the node, for trying the engine on a copy first:
+```bash
+rusty-remind-me copy-store --to ./engine-copy                  # from the configured database
+rusty-remind-me copy-store --from old.db --to ./engine-copy    # from another file
+```
 
 ## REST API Endpoints
 

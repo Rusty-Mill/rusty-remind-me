@@ -40,20 +40,24 @@
 //! persona built on it, with no background job and no second opinion about
 //! what "still true" means.
 //!
-//! # Not in the generated schema
+//! # Not in the schema files
 //!
-//! `promotions` is target-only, created by [`ensure_schema`] the way
-//! `vectors::ensure_schema` creates `vec_embeddings` and
-//! `archive::ensure_schema` creates its own. `db/schema_tables.sql` is
-//! generated verbatim from `remind_me` and is not this crate's to extend.
+//! `promotions` is this crate's own table, created at open by
+//! [`crate::db::promotions::ensure_table`] the way `vectors::ensure_schema`
+//! creates `vec_embeddings` and `db::archives::ensure_tables` creates its own
+//! (ARCHITECTURE.md §5).
 
+use crate::db::memories::{Memories, NewMemory};
+use crate::db::promotions::{Promotions, StatementRow};
+use crate::db::Result as SqlResult;
+use crate::db::Store;
 use crate::models::{
     Memory, PersonaStatement, PromoteInput, PromotionCandidate, PromotionResult, Provenance, Rung,
     FACT_CATEGORY, PERSONA_CATEGORY, PROMOTION_LIMIT_MAX, PROMOTION_LIMIT_MIN, SCENARIO_CATEGORY,
 };
 use crate::vitality::{calculate_vitality, get_decay_rate, get_source_prior, get_type_prior};
 use chrono::Utc;
-use rusqlite::{params, params_from_iter, Connection, Result as SqlResult};
+use rusqlite::Connection;
 
 /// `source` promoted artifacts are stored under.
 pub const PROMOTION_SOURCE: &str = "promotion";
@@ -75,34 +79,10 @@ pub const PERSONA_VITALITY_FLOOR: f64 = 0.5;
 /// Longest snippet carried in a candidate listing.
 const SNIPPET_CHARS: usize = 200;
 
-/// Create this crate's own promotion-provenance table, if absent.
-///
-/// Called from [`crate::db::schema::initialize_schema`] after the generated
-/// schema is applied. Created unconditionally: an empty table costs nothing,
-/// and a lazily-created one would make every read path tolerate its absence.
-///
-/// No foreign keys. A promoted memory can be deleted through the ordinary
-/// delete path, and a cascade would erase the provenance that says what it
-/// *was* derived from — which is exactly the record needed to explain why a
-/// persona statement vanished.
-pub fn ensure_schema(conn: &Connection) -> SqlResult<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS promotions (
-            promoted_id TEXT NOT NULL,
-            source_id   TEXT NOT NULL,
-            rung        TEXT NOT NULL,
-            promoted_at TEXT NOT NULL,
-            PRIMARY KEY (promoted_id, source_id)
-         );
-         CREATE INDEX IF NOT EXISTS idx_promotions_source
-            ON promotions(source_id);",
-    )
-}
-
 /// Why a promotion could not be made.
 #[derive(Debug)]
 pub enum PromotionError {
-    Db(rusqlite::Error),
+    Db(crate::db::StoreError),
     /// Rung 1 is `remind_me_decompose`'s job.
     UseDecompose,
     /// A promotion with no sources has no provenance, so it could never be
@@ -159,8 +139,8 @@ impl std::fmt::Display for PromotionError {
 
 impl std::error::Error for PromotionError {}
 
-impl From<rusqlite::Error> for PromotionError {
-    fn from(e: rusqlite::Error) -> Self {
+impl From<crate::db::StoreError> for PromotionError {
+    fn from(e: crate::db::StoreError) -> Self {
         Self::Db(e)
     }
 }
@@ -174,32 +154,18 @@ fn snippet(content: &str) -> String {
 /// The predicate is `capture::undecomposed_batch`'s, deliberately: one
 /// definition of "not yet decomposed", so this listing and that tool cannot
 /// disagree about whether a capture is done.
-fn capture_candidates(conn: &Connection, limit: usize) -> SqlResult<Vec<PromotionCandidate>> {
-    let mut stmt = conn.prepare(
-        "SELECT m.id, m.content
-           FROM memories m
-          WHERE m.capture_id IS NOT NULL
-            AND m.source_capture_id IS NULL
-            AND m.deleted_at IS NULL
-            AND m.category = 'dialog'
-            AND NOT EXISTS (
-                SELECT 1 FROM memories c WHERE c.source_capture_id = m.capture_id
-            )
-          ORDER BY m.created_at DESC
-          LIMIT ?",
-    )?;
-    let rows = stmt.query_map(params![limit as i64], |r| {
-        let id: String = r.get(0)?;
-        let content: String = r.get(1)?;
-        Ok(PromotionCandidate {
+fn capture_candidates(store: &Store<'_>, limit: usize) -> SqlResult<Vec<PromotionCandidate>> {
+    let rows = Promotions::new(store).undecomposed_dialogs(limit)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| PromotionCandidate {
             rung: Rung::CaptureToFact,
-            source_ids: vec![id],
-            snippet: snippet(&content),
+            source_ids: vec![row.id],
+            snippet: snippet(&row.content),
             reason: "captured but never decomposed into facts".to_string(),
             grouped_by: None,
         })
-    })?;
-    rows.collect()
+        .collect())
 }
 
 /// Facts clustered by a shared entity, where no scenario has been built from
@@ -209,36 +175,19 @@ fn capture_candidates(conn: &Connection, limit: usize) -> SqlResult<Vec<Promotio
 /// `consolidation.rs` already clusters on cosine distance to find things that
 /// are *the same*, and this rung wants things that are *related but distinct*.
 /// The entity graph is the existing structure that expresses that.
-fn scenario_candidates(conn: &Connection, limit: usize) -> SqlResult<Vec<PromotionCandidate>> {
-    let mut stmt = conn.prepare(
-        "SELECT e.id, e.name, group_concat(m.id), count(*) AS n
-           FROM memories m
-           JOIN memory_entities me ON me.memory_id = m.id
-           JOIN entities e ON e.id = me.entity_id
-          WHERE m.category = ?
-            AND m.deleted_at IS NULL
-            AND m.superseded_by IS NULL
-            AND NOT EXISTS (
-                SELECT 1 FROM promotions p WHERE p.source_id = m.id AND p.rung = ?
-            )
-          GROUP BY e.id
-         HAVING n >= ?
-          ORDER BY n DESC
-          LIMIT ?",
+fn scenario_candidates(store: &Store<'_>, limit: usize) -> SqlResult<Vec<PromotionCandidate>> {
+    let groups = Promotions::new(store).entity_fact_groups(
+        FACT_CATEGORY,
+        Rung::FactToScenario.as_str(),
+        MIN_SCENARIO_FACTS,
+        limit,
     )?;
-    let rows = stmt.query_map(
-        params![
-            FACT_CATEGORY,
-            Rung::FactToScenario.as_str(),
-            MIN_SCENARIO_FACTS as i64,
-            limit as i64
-        ],
-        |r| {
-            let name: String = r.get(1)?;
-            let ids: String = r.get(2)?;
-            let count: i64 = r.get(3)?;
-            let source_ids: Vec<String> = ids.split(',').map(str::to_string).collect();
-            Ok(PromotionCandidate {
+    Ok(groups
+        .into_iter()
+        .map(|group| {
+            let count = group.memory_ids.len();
+            let name = group.entity_name;
+            PromotionCandidate {
                 rung: Rung::FactToScenario,
                 snippet: format!("{} facts mentioning {}", count, name),
                 reason: format!(
@@ -246,53 +195,33 @@ fn scenario_candidates(conn: &Connection, limit: usize) -> SqlResult<Vec<Promoti
                     count, name
                 ),
                 grouped_by: Some(name),
-                source_ids,
-            })
-        },
-    )?;
-    rows.collect()
+                source_ids: group.memory_ids,
+            }
+        })
+        .collect())
 }
 
 /// Scenarios stable enough to say something durable, not yet in a persona.
-fn persona_candidates(conn: &Connection, limit: usize) -> SqlResult<Vec<PromotionCandidate>> {
-    let mut stmt = conn.prepare(
-        "SELECT m.id, m.content, m.vitality
-           FROM memories m
-          WHERE m.category = ?
-            AND m.deleted_at IS NULL
-            AND m.superseded_by IS NULL
-            AND m.sensitive = 0
-            AND m.vitality >= ?
-            AND NOT EXISTS (
-                SELECT 1 FROM promotions p WHERE p.source_id = m.id AND p.rung = ?
-            )
-          ORDER BY m.vitality DESC
-          LIMIT ?",
+fn persona_candidates(store: &Store<'_>, limit: usize) -> SqlResult<Vec<PromotionCandidate>> {
+    let rows = Promotions::new(store).ready_scenarios(
+        SCENARIO_CATEGORY,
+        PERSONA_VITALITY_FLOOR,
+        Rung::ScenarioToPersona.as_str(),
+        limit,
     )?;
-    let rows = stmt.query_map(
-        params![
-            SCENARIO_CATEGORY,
-            PERSONA_VITALITY_FLOOR,
-            Rung::ScenarioToPersona.as_str(),
-            limit as i64
-        ],
-        |r| {
-            let id: String = r.get(0)?;
-            let content: String = r.get(1)?;
-            let vitality: f64 = r.get(2)?;
-            Ok(PromotionCandidate {
-                rung: Rung::ScenarioToPersona,
-                source_ids: vec![id],
-                snippet: snippet(&content),
-                reason: format!(
-                    "scenario still at vitality {:.2}, above the {:.2} persona floor",
-                    vitality, PERSONA_VITALITY_FLOOR
-                ),
-                grouped_by: None,
-            })
-        },
-    )?;
-    rows.collect()
+    Ok(rows
+        .into_iter()
+        .map(|row| PromotionCandidate {
+            rung: Rung::ScenarioToPersona,
+            source_ids: vec![row.id],
+            snippet: snippet(&row.content),
+            reason: format!(
+                "scenario still at vitality {:.2}, above the {:.2} persona floor",
+                row.vitality, PERSONA_VITALITY_FLOOR
+            ),
+            grouped_by: None,
+        })
+        .collect())
 }
 
 /// What is ready to move up a rung.
@@ -302,15 +231,15 @@ fn persona_candidates(conn: &Connection, limit: usize) -> SqlResult<Vec<Promotio
 /// twice is impossible — idempotency comes from the candidate query, not from
 /// the caller remembering.
 pub fn promotion_candidates(
-    conn: &Connection,
+    store: &Store<'_>,
     rung: Rung,
     limit: usize,
 ) -> SqlResult<Vec<PromotionCandidate>> {
     let limit = limit.clamp(PROMOTION_LIMIT_MIN, PROMOTION_LIMIT_MAX);
     match rung {
-        Rung::CaptureToFact => capture_candidates(conn, limit),
-        Rung::FactToScenario => scenario_candidates(conn, limit),
-        Rung::ScenarioToPersona => persona_candidates(conn, limit),
+        Rung::CaptureToFact => capture_candidates(store, limit),
+        Rung::FactToScenario => scenario_candidates(store, limit),
+        Rung::ScenarioToPersona => persona_candidates(store, limit),
     }
 }
 
@@ -322,86 +251,21 @@ pub fn promotion_candidates(
 /// filters by. It exists so a caller reading one rung's candidate page can
 /// tell whether the page is the whole backlog or just the front of it (#283),
 /// the way `recalibrate::candidate_count` already does for recalibration.
-pub fn count_candidates(conn: &Connection, rung: Rung) -> SqlResult<usize> {
-    let count: i64 = match rung {
-        Rung::CaptureToFact => conn.query_row(
-            "SELECT COUNT(*)
-               FROM memories m
-              WHERE m.capture_id IS NOT NULL
-                AND m.source_capture_id IS NULL
-                AND m.deleted_at IS NULL
-                AND m.category = 'dialog'
-                AND NOT EXISTS (
-                    SELECT 1 FROM memories c WHERE c.source_capture_id = m.capture_id
-                )",
-            [],
-            |r| r.get(0),
-        )?,
-        Rung::FactToScenario => conn.query_row(
-            "SELECT COUNT(*) FROM (
-                SELECT e.id
-                   FROM memories m
-                   JOIN memory_entities me ON me.memory_id = m.id
-                   JOIN entities e ON e.id = me.entity_id
-                  WHERE m.category = ?
-                    AND m.deleted_at IS NULL
-                    AND m.superseded_by IS NULL
-                    AND NOT EXISTS (
-                        SELECT 1 FROM promotions p WHERE p.source_id = m.id AND p.rung = ?
-                    )
-                  GROUP BY e.id
-                 HAVING count(*) >= ?
-             )",
-            params![
-                FACT_CATEGORY,
-                Rung::FactToScenario.as_str(),
-                MIN_SCENARIO_FACTS as i64
-            ],
-            |r| r.get(0),
-        )?,
-        Rung::ScenarioToPersona => conn.query_row(
-            "SELECT COUNT(*)
-               FROM memories m
-              WHERE m.category = ?
-                AND m.deleted_at IS NULL
-                AND m.superseded_by IS NULL
-                AND m.sensitive = 0
-                AND m.vitality >= ?
-                AND NOT EXISTS (
-                    SELECT 1 FROM promotions p WHERE p.source_id = m.id AND p.rung = ?
-                )",
-            params![
-                SCENARIO_CATEGORY,
-                PERSONA_VITALITY_FLOOR,
-                Rung::ScenarioToPersona.as_str()
-            ],
-            |r| r.get(0),
-        )?,
-    };
-    Ok(count as usize)
-}
-
-/// One source memory, as far as promotion cares.
-struct SourceRow {
-    sensitive: bool,
-}
-
-fn load_source(conn: &Connection, id: &str) -> SqlResult<Option<SourceRow>> {
-    conn.query_row(
-        "SELECT sensitive FROM memories
-          WHERE id = ? AND deleted_at IS NULL AND superseded_by IS NULL",
-        params![id],
-        |r| {
-            Ok(SourceRow {
-                sensitive: r.get(0)?,
-            })
-        },
-    )
-    .map(Some)
-    .or_else(|e| match e {
-        rusqlite::Error::QueryReturnedNoRows => Ok(None),
-        other => Err(other),
-    })
+pub fn count_candidates(store: &Store<'_>, rung: Rung) -> SqlResult<usize> {
+    let promotions = Promotions::new(store);
+    match rung {
+        Rung::CaptureToFact => promotions.count_undecomposed_dialogs(),
+        Rung::FactToScenario => promotions.count_entity_fact_groups(
+            FACT_CATEGORY,
+            Rung::FactToScenario.as_str(),
+            MIN_SCENARIO_FACTS,
+        ),
+        Rung::ScenarioToPersona => promotions.count_ready_scenarios(
+            SCENARIO_CATEGORY,
+            PERSONA_VITALITY_FLOOR,
+            Rung::ScenarioToPersona.as_str(),
+        ),
+    }
 }
 
 /// The already-promoted memory whose source set exactly matches `source_ids`
@@ -417,7 +281,7 @@ fn load_source(conn: &Connection, id: &str) -> SqlResult<Option<SourceRow>> {
 /// still be live — a superseded or deleted promoted memory no longer counts,
 /// so re-promoting the same sources after that is a fresh, legitimate call.
 fn existing_live_promotion(
-    conn: &Connection,
+    store: &Store<'_>,
     rung: Rung,
     source_ids: &[String],
 ) -> SqlResult<Option<String>> {
@@ -429,30 +293,15 @@ fn existing_live_promotion(
     // candidate; each is then checked for an exact set match and liveness.
     // Cheap in practice: fan-out per source is small, and this only runs on
     // the write path, not the hot read path.
-    let mut candidates_stmt = conn
-        .prepare("SELECT DISTINCT promoted_id FROM promotions WHERE source_id = ? AND rung = ?")?;
-    let mut sources_stmt =
-        conn.prepare("SELECT source_id FROM promotions WHERE promoted_id = ? AND rung = ?")?;
-    let mut live_stmt = conn.prepare(
-        "SELECT count(*) FROM memories
-          WHERE id = ? AND deleted_at IS NULL AND superseded_by IS NULL",
-    )?;
-
-    let candidate_ids: Vec<String> = candidates_stmt
-        .query_map(params![wanted[0], rung.as_str()], |r| r.get(0))?
-        .collect::<SqlResult<_>>()?;
-
-    for promoted_id in candidate_ids {
-        let mut existing: Vec<String> = sources_stmt
-            .query_map(params![promoted_id, rung.as_str()], |r| r.get(0))?
-            .collect::<SqlResult<_>>()?;
+    let promotions = Promotions::new(store);
+    for promoted_id in promotions.promoted_from(&wanted[0], rung.as_str())? {
+        let mut existing = promotions.sources_at(&promoted_id, rung.as_str())?;
         existing.sort_unstable();
         existing.dedup();
         if existing != wanted {
             continue;
         }
-        let live: i64 = live_stmt.query_row(params![promoted_id], |r| r.get(0))?;
-        if live > 0 {
+        if promotions.is_live(&promoted_id)? {
             return Ok(Some(promoted_id));
         }
     }
@@ -460,7 +309,7 @@ fn existing_live_promotion(
 }
 
 /// Accept a distillation and record what it was built from.
-pub fn promote(conn: &Connection, input: &PromoteInput) -> Result<PromotionResult, PromotionError> {
+pub fn promote(store: &Store<'_>, input: &PromoteInput) -> Result<PromotionResult, PromotionError> {
     if input.rung == Rung::CaptureToFact {
         return Err(PromotionError::UseDecompose);
     }
@@ -480,9 +329,10 @@ pub fn promote(conn: &Connection, input: &PromoteInput) -> Result<PromotionResul
     // Validated before anything is written, so a promotion naming one bad
     // source does not leave a partially-linked artifact behind.
     for id in &input.source_ids {
-        let source =
-            load_source(conn, id)?.ok_or_else(|| PromotionError::UnusableSource(id.clone()))?;
-        if source.sensitive && input.rung == Rung::ScenarioToPersona {
+        let sensitive = Promotions::new(store)
+            .live_source_sensitivity(id)?
+            .ok_or_else(|| PromotionError::UnusableSource(id.clone()))?;
+        if sensitive && input.rung == Rung::ScenarioToPersona {
             return Err(PromotionError::SensitiveSource(id.clone()));
         }
     }
@@ -490,7 +340,7 @@ pub fn promote(conn: &Connection, input: &PromoteInput) -> Result<PromotionResul
     // Same evidence, promoted twice, is not a new promotion — see
     // `existing_live_promotion` for why "live" is the bar rather than "ever
     // promoted".
-    if let Some(promoted_id) = existing_live_promotion(conn, input.rung, &input.source_ids)? {
+    if let Some(promoted_id) = existing_live_promotion(store, input.rung, &input.source_ids)? {
         return Err(PromotionError::DuplicateSources(promoted_id));
     }
 
@@ -508,35 +358,22 @@ pub fn promote(conn: &Connection, input: &PromoteInput) -> Result<PromotionResul
     let vitality = calculate_vitality(base_weight, 0, decay_rate, &now_iso, now);
 
     let (node_id, client) = crate::sync::memory_provenance();
-    conn.execute(
-        "INSERT INTO memories (
-            id, content, category, tags, source, metadata,
-            created_at, updated_at, decay_rate, vitality, base_weight,
-            access_count, accessed_at, node_id, client
-         ) VALUES (?, ?, ?, '[]', ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
-        params![
-            promoted_id,
-            input.content,
-            category,
-            PROMOTION_SOURCE,
-            metadata.to_string(),
-            now_iso,
-            now_iso,
-            decay_rate,
-            vitality,
-            base_weight,
-            now_iso,
-            node_id,
-            client,
-        ],
-    )?;
+    Memories::new(store).insert(&NewMemory {
+        category: category.to_string(),
+        source: PROMOTION_SOURCE.to_string(),
+        metadata,
+        decay_rate,
+        vitality,
+        base_weight,
+        accessed_at: Some(now_iso.clone()),
+        node_id: Some(node_id),
+        client,
+        ..NewMemory::new(promoted_id.clone(), input.content.clone(), &now_iso)
+    })?;
 
+    let promotions = Promotions::new(store);
     for source_id in &input.source_ids {
-        conn.execute(
-            "INSERT OR IGNORE INTO promotions (promoted_id, source_id, rung, promoted_at)
-             VALUES (?, ?, ?, ?)",
-            params![promoted_id, source_id, input.rung.as_str(), now_iso],
-        )?;
+        promotions.record(&promoted_id, source_id, input.rung.as_str(), &now_iso)?;
     }
 
     Ok(PromotionResult {
@@ -551,16 +388,10 @@ pub fn promote(conn: &Connection, input: &PromoteInput) -> Result<PromotionResul
 ///
 /// Both directions from one indexed table, so "explain this persona statement"
 /// and "what does this fact still support" cost the same.
-pub fn provenance(conn: &Connection, memory_id: &str) -> SqlResult<Provenance> {
-    let mut up = conn.prepare("SELECT source_id FROM promotions WHERE promoted_id = ?")?;
-    let sources: Vec<String> = up
-        .query_map(params![memory_id], |r| r.get(0))?
-        .collect::<SqlResult<_>>()?;
-
-    let mut down = conn.prepare("SELECT promoted_id FROM promotions WHERE source_id = ?")?;
-    let derived: Vec<String> = down
-        .query_map(params![memory_id], |r| r.get(0))?
-        .collect::<SqlResult<_>>()?;
+pub fn provenance(store: &Store<'_>, memory_id: &str) -> SqlResult<Provenance> {
+    let promotions = Promotions::new(store);
+    let sources = promotions.sources_of(memory_id)?;
+    let derived = promotions.derived_from(memory_id)?;
 
     Ok(Provenance {
         memory_id: memory_id.to_string(),
@@ -570,18 +401,8 @@ pub fn provenance(conn: &Connection, memory_id: &str) -> SqlResult<Provenance> {
 }
 
 /// How many of a promoted artifact's sources are still standing.
-fn surviving_sources(conn: &Connection, promoted_id: &str) -> SqlResult<usize> {
-    let count: i64 = conn.query_row(
-        "SELECT count(*)
-           FROM promotions p
-           JOIN memories m ON m.id = p.source_id
-          WHERE p.promoted_id = ?
-            AND m.deleted_at IS NULL
-            AND m.superseded_by IS NULL",
-        params![promoted_id],
-        |r| r.get(0),
-    )?;
-    Ok(count as usize)
+fn surviving_sources(store: &Store<'_>, promoted_id: &str) -> SqlResult<usize> {
+    Promotions::new(store).surviving_sources(promoted_id)
 }
 
 /// The current persona: durable statements whose grounds still hold.
@@ -597,25 +418,18 @@ fn surviving_sources(conn: &Connection, promoted_id: &str) -> SqlResult<usize> {
 /// [`crate::digest`]: a persona is an ambient surface, assembled to be
 /// injected rather than asked for, so there is no per-call intent to opt back
 /// in against.
-pub fn persona(conn: &Connection) -> SqlResult<Vec<PersonaStatement>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, content, vitality, created_at
-           FROM memories
-          WHERE category = ?
-            AND deleted_at IS NULL
-            AND superseded_by IS NULL
-            AND sensitive = 0
-          ORDER BY vitality DESC",
-    )?;
-    let rows: Vec<(String, String, f64, String)> = stmt
-        .query_map(params![PERSONA_CATEGORY], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-        })?
-        .collect::<SqlResult<_>>()?;
+pub fn persona(store: &Store<'_>) -> SqlResult<Vec<PersonaStatement>> {
+    let rows = Promotions::new(store).statements_by_vitality(PERSONA_CATEGORY)?;
 
     let mut out = Vec::new();
-    for (id, content, vitality, created_at) in rows {
-        let surviving = surviving_sources(conn, &id)?;
+    for StatementRow {
+        id,
+        content,
+        vitality,
+        created_at,
+    } in rows
+    {
+        let surviving = surviving_sources(store, &id)?;
         if surviving == 0 {
             continue;
         }
@@ -636,24 +450,18 @@ pub fn persona(conn: &Connection) -> SqlResult<Vec<PersonaStatement>> {
 /// Without this, a statement that quietly stopped appearing is indistinguishable
 /// from one that was never written. A caller asking "why did the assistant stop
 /// believing that" has somewhere to look.
-pub fn demoted(conn: &Connection) -> SqlResult<Vec<PersonaStatement>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, content, vitality, created_at
-           FROM memories
-          WHERE category = ?
-            AND deleted_at IS NULL
-            AND superseded_by IS NULL
-          ORDER BY created_at DESC",
-    )?;
-    let rows: Vec<(String, String, f64, String)> = stmt
-        .query_map(params![PERSONA_CATEGORY], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-        })?
-        .collect::<SqlResult<_>>()?;
+pub fn demoted(store: &Store<'_>) -> SqlResult<Vec<PersonaStatement>> {
+    let rows = Promotions::new(store).statements_newest_first(PERSONA_CATEGORY)?;
 
     let mut out = Vec::new();
-    for (id, content, vitality, created_at) in rows {
-        if surviving_sources(conn, &id)? == 0 {
+    for StatementRow {
+        id,
+        content,
+        vitality,
+        created_at,
+    } in rows
+    {
+        if surviving_sources(store, &id)? == 0 {
             out.push(PersonaStatement {
                 id,
                 content,
@@ -747,8 +555,8 @@ impl Bootstrap {
 /// Statements are taken in `persona`'s order (most vital first), so what
 /// survives a tight reserve is the most durable part of the persona rather
 /// than whichever rows happened to sort first.
-pub fn bootstrap(conn: &Connection, token_budget: usize) -> SqlResult<Bootstrap> {
-    let statements = persona(conn)?;
+pub fn bootstrap(store: &Store<'_>, token_budget: usize) -> SqlResult<Bootstrap> {
+    let statements = persona(store)?;
     let total = statements.len();
 
     if token_budget == 0 {
@@ -837,11 +645,11 @@ impl Backlog {
 }
 
 /// Count what is ready at every rung.
-pub fn backlog(conn: &Connection) -> SqlResult<Backlog> {
+pub fn backlog(store: &Store<'_>) -> SqlResult<Backlog> {
     Ok(Backlog {
-        capture_to_fact: promotion_candidates(conn, Rung::CaptureToFact, BACKLOG_PROBE)?.len(),
-        fact_to_scenario: promotion_candidates(conn, Rung::FactToScenario, BACKLOG_PROBE)?.len(),
-        scenario_to_persona: promotion_candidates(conn, Rung::ScenarioToPersona, BACKLOG_PROBE)?
+        capture_to_fact: promotion_candidates(store, Rung::CaptureToFact, BACKLOG_PROBE)?.len(),
+        fact_to_scenario: promotion_candidates(store, Rung::FactToScenario, BACKLOG_PROBE)?.len(),
+        scenario_to_persona: promotion_candidates(store, Rung::ScenarioToPersona, BACKLOG_PROBE)?
             .len(),
     })
 }
@@ -873,8 +681,8 @@ static LAST_NUDGED_TOTAL: std::sync::Mutex<Option<usize>> = std::sync::Mutex::ne
 /// to zero says so once and then goes quiet.
 ///
 /// Returns the backlog it observed, and whether it notified.
-pub fn nudge_once(conn: &Connection) -> SqlResult<(Backlog, bool)> {
-    let backlog = backlog(conn)?;
+pub fn nudge_once(store: &Store<'_>) -> SqlResult<(Backlog, bool)> {
+    let backlog = backlog(store)?;
     let total = backlog.total();
 
     let mut last = LAST_NUDGED_TOTAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -943,25 +751,23 @@ impl NudgeHandle {
     }
 }
 
-/// Start the backlog nudge for the database `conn` is attached to.
+/// Start the backlog nudge for the database `store` is attached to.
 ///
 /// `None` when no interval is configured — unlike the reminder scheduler,
 /// which always runs, this is opt-in, matching the folder watcher (#55) and
 /// webhook (#56) convention. Also `None` for an in-memory database: the
 /// thread opens its own connection by path, and `:memory:` would give it a
 /// different, empty one, so it would report an empty backlog forever.
-pub fn start_nudge_for(conn: &Connection) -> Option<NudgeHandle> {
+pub fn start_nudge_for(store: &Store<'_>) -> Option<NudgeHandle> {
     let interval = nudge_interval()?;
-    let path: String = conn
-        .query_row("PRAGMA database_list", [], |row| row.get(2))
-        .ok()?;
-    if path.is_empty() {
-        return None;
-    }
-    Some(start_nudge(std::path::PathBuf::from(path), interval))
+    Some(start_nudge(store.secondary_source()?, interval))
 }
 
-pub fn start_nudge(db_path: std::path::PathBuf, interval: std::time::Duration) -> NudgeHandle {
+pub fn start_nudge(
+    source: crate::db::SecondarySource,
+    interval: std::time::Duration,
+) -> NudgeHandle {
+    let db_path = source.path().to_path_buf();
     let stop = std::sync::Arc::new(crate::scheduler::Stop::new());
     let loop_stop = std::sync::Arc::clone(&stop);
     let (liveness, liveness_guard) = crate::scheduler::Liveness::new();
@@ -971,8 +777,8 @@ pub fn start_nudge(db_path: std::path::PathBuf, interval: std::time::Duration) -
         .name("promotion-nudge".to_string())
         .spawn(move || {
             let _liveness_guard = liveness_guard;
-            let conn = match Connection::open(&db_path) {
-                Ok(conn) => conn,
+            let store = match Connection::open(&db_path) {
+                Ok(store) => store,
                 Err(e) => {
                     eprintln!("promotion nudge: cannot open {:?}: {}", db_path, e);
                     return;
@@ -982,7 +788,7 @@ pub fn start_nudge(db_path: std::path::PathBuf, interval: std::time::Duration) -
                 // A failed pass is reported and the loop continues: a
                 // transient database error must not silently end the nudge
                 // for the rest of the process's life.
-                match nudge_once(&conn) {
+                match nudge_once(&source.store(&store)) {
                     Ok((backlog, true)) => {
                         eprintln!("promotion nudge: {}", backlog.summary())
                     }
@@ -1002,19 +808,9 @@ pub fn start_nudge(db_path: std::path::PathBuf, interval: std::time::Duration) -
 
 /// Load the memories a set of ids names, in the order given, skipping any that
 /// no longer resolve. Used by the tool layer to show a candidate's sources.
-pub fn load_memories(conn: &Connection, ids: &[String]) -> SqlResult<Vec<Memory>> {
+pub fn load_memories(store: &Store<'_>, ids: &[String]) -> SqlResult<Vec<Memory>> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let marks = vec!["?"; ids.len()].join(",");
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {} FROM memories WHERE id IN ({})",
-        crate::db::queries::MEMORY_COLUMNS,
-        marks
-    ))?;
-    let rows = stmt.query_map(
-        params_from_iter(ids.iter()),
-        crate::db::queries::parse_memory_row,
-    )?;
-    rows.collect()
+    Memories::new(store).get_many(ids)
 }

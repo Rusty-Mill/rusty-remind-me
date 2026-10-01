@@ -1,5 +1,6 @@
--- GENERATED from remind_me's schema. Do not hand-edit.
--- Regenerate with: python3 scripts/regenerate_schema.py --reference <path>
+-- The node's schema. Originally dumped from the Python remind_me at v29;
+-- that reference is retired (ADR-0023), so this file is edited by hand now.
+-- A change here is a schema change: see db/migrations.rs.
 
 CREATE TABLE IF NOT EXISTS analytics_snapshots (
             id               INTEGER PRIMARY KEY,
@@ -169,10 +170,11 @@ CREATE TABLE IF NOT EXISTS sync_sends (
         );
 
 CREATE TABLE IF NOT EXISTS vec_chunks (
-               vec_rowid    INTEGER PRIMARY KEY,
-               memory_rowid INTEGER NOT NULL,
-               chunk_ix     INTEGER NOT NULL
-           );
+            memory_id TEXT NOT NULL,
+            chunk_ix  INTEGER NOT NULL,
+            embedding BLOB NOT NULL,  -- little-endian f32
+            PRIMARY KEY (memory_id, chunk_ix)
+        );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS wiki_fts USING fts5(
             title, content,

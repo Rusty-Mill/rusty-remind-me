@@ -1,6 +1,6 @@
 //! The hub's own record types for the engine (ADR-0021, decision 2), one
-//! per table, each carrying every column the SQLite and Postgres stores
-//! hold.
+//! per table, each carrying every column the retired SQLite and Postgres
+//! stores held.
 //!
 //! # The shape the engine asks for
 //!
@@ -23,14 +23,15 @@
 //! # Encoding
 //!
 //! Records are bincode on disk, which cannot decode a `serde_json::Value`,
-//! so JSON columns (`tags`, `metadata`, `aliases`) are kept as JSON text,
-//! as the SQLite store keeps them. Each schema tag carries a layout
+//! so JSON columns (`tags`, `metadata`, `aliases`) are kept as JSON text. Each schema tag carries a layout
 //! version: the engine refuses a blob written under another tag, so a
 //! change to any of these structs needs a new tag and a hand-written
 //! conversion (ADR-0021, Consequences).
 
 use super::keys::{self, IdKey, LinkKey};
-use crate::record::{EntityRecord, EntityRelationRecord, LinkRecord, MemoryRecord};
+use crate::record::{
+    EntityRecord, EntityRelationRecord, LinkRecord, MemoryRecord, TOMBSTONE_CONTENT,
+};
 use crate::store::StoreResult;
 use rusty_multimodal_db_engine::generic::traits::{
     IndexedField, OrderedField, Record, ScannableField, SchemaTag,
@@ -93,11 +94,13 @@ macro_rules! timestamp_ordered {
     };
 }
 
-/// Parse a JSON text column, degrading to `default` as the SQLite store's
-/// `json_column` does.
+/// Parse a JSON text column, degrading to `default` if it is not JSON.
 fn json_text(raw: &str, default: Value) -> Value {
     serde_json::from_str(raw).unwrap_or(default)
 }
+
+/// An emptied tombstone's `tags`, as stored.
+const EMPTY_TAGS: &str = "[]";
 
 fn to_json_text(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "null".to_string())
@@ -107,7 +110,7 @@ fn to_json_text(value: &Value) -> String {
 // Memories
 // ---------------------------------------------------------------------------
 
-/// One `memories` row: all 28 columns of the SQL stores' table, the
+/// One `memories` row: all 28 columns of the retired SQL stores' table, the
 /// engine id, and `updated_at` in µs for the keyset order.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryRow {
@@ -206,7 +209,34 @@ impl MemoryRow {
         })
     }
 
-    /// The wire form, key for key what the SQLite store's pull returns.
+    /// Drop a tombstone's text, keeping what last-write-wins and re-imports
+    /// need (ADR-0024). Returns whether anything changed: `false` for a
+    /// live memory or a tombstone already emptied.
+    ///
+    /// `updated_at` and `hub_seq` stay as they are: this is storage, not an
+    /// edit, so a node that already pulled the row has nothing new to pull.
+    pub fn empty_if_tombstone(&mut self) -> bool {
+        if self.deleted_at.is_none() || self.is_emptied() {
+            return false;
+        }
+        self.content = TOMBSTONE_CONTENT.to_string();
+        self.tags = EMPTY_TAGS.to_string();
+        self.subject = None;
+        self.predicate = None;
+        self.object = None;
+        true
+    }
+
+    fn is_emptied(&self) -> bool {
+        self.content == TOMBSTONE_CONTENT
+            && self.tags == EMPTY_TAGS
+            && self.subject.is_none()
+            && self.predicate.is_none()
+            && self.object.is_none()
+    }
+
+    /// The wire form, key for key what the retired SQLite store's pull
+    /// returned.
     pub fn to_wire(&self) -> Value {
         json!({
             "id": self.id,

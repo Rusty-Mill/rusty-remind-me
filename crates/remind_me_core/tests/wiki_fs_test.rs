@@ -4,13 +4,14 @@
 mod test_env;
 
 use remind_me_core::db::queries;
+use remind_me_core::db::wiki::WikiIndex;
+use remind_me_core::db::Store;
 use remind_me_core::wiki::WikiDeleteOutcome;
 use remind_me_core::wiki_fs::{
     extract_summary, extract_title, get_meta, parse_wikilinks, pending_compile_count, Wiki,
     WikiCompile, COMPILE_WATERMARK_KEY, INDEX_FILE, LOG_FILE, SCHEMA_FILE, WIKI_DIR_ENV,
 };
 use remind_me_core::{Database, MemoryAddInput};
-use rusqlite::Connection;
 use std::sync::Mutex;
 
 /// `WIKI_DIR_ENV` is process-global; only one test in this file touches it
@@ -31,9 +32,9 @@ fn write_file(root: &std::path::Path, name: &str, body: &str) {
     std::fs::write(root.join(name), body).unwrap();
 }
 
-fn add(conn: &Connection, content: &str) {
+fn add(store: &Store<'_>, content: &str) {
     queries::add_memory(
-        conn,
+        store,
         MemoryAddInput {
             sensitive: false,
             content: content.to_string(),
@@ -87,15 +88,15 @@ fn wikilinks_resolve_by_target_and_display_by_alias() {
 #[test]
 fn reconcile_indexes_files_on_disk() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let (w, root) = wiki("index");
     write_file(&root, "vlan-setup.md", "# VLAN Setup\n\nTag port 3.");
 
-    let stats = w.reconcile(&conn).unwrap();
+    let stats = w.reconcile(&store).unwrap();
 
     assert_eq!(stats.indexed, 1);
     assert_eq!(stats.pages, 1);
-    let page = w.read_page(&conn, "VLAN Setup").unwrap().unwrap();
+    let page = w.read_page(&store, "VLAN Setup").unwrap().unwrap();
     assert_eq!(page.title, "VLAN Setup");
     assert_eq!(page.summary, "Tag port 3.");
 
@@ -105,12 +106,12 @@ fn reconcile_indexes_files_on_disk() {
 #[test]
 fn reconcile_is_a_no_op_when_nothing_changed() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let (w, root) = wiki("noop");
     write_file(&root, "page.md", "# Page\n\nbody");
-    w.reconcile(&conn).unwrap();
+    w.reconcile(&store).unwrap();
 
-    let second = w.reconcile(&conn).unwrap();
+    let second = w.reconcile(&store).unwrap();
 
     // Every read path reconciles, so a no-op pass has to actually be cheap.
     assert_eq!(second.indexed, 0);
@@ -122,20 +123,20 @@ fn reconcile_is_a_no_op_when_nothing_changed() {
 #[test]
 fn an_edit_made_outside_the_server_is_picked_up() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let (w, root) = wiki("edited");
     write_file(&root, "page.md", "# Page\n\noriginal");
-    w.reconcile(&conn).unwrap();
+    w.reconcile(&store).unwrap();
 
     // Someone edits the file in their editor. Files are the source of truth,
     // so the index has to follow without being told.
     std::thread::sleep(std::time::Duration::from_millis(10));
     write_file(&root, "page.md", "# Page\n\nrevised");
-    let stats = w.reconcile(&conn).unwrap();
+    let stats = w.reconcile(&store).unwrap();
 
     assert_eq!(stats.indexed, 1);
     assert!(w
-        .read_page(&conn, "page")
+        .read_page(&store, "page")
         .unwrap()
         .unwrap()
         .content
@@ -147,16 +148,16 @@ fn an_edit_made_outside_the_server_is_picked_up() {
 #[test]
 fn a_file_deleted_outside_the_server_drops_out_of_the_index() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let (w, root) = wiki("gone");
     write_file(&root, "page.md", "# Page\n\nbody");
-    w.reconcile(&conn).unwrap();
+    w.reconcile(&store).unwrap();
 
     std::fs::remove_file(root.join("page.md")).unwrap();
-    let stats = w.reconcile(&conn).unwrap();
+    let stats = w.reconcile(&store).unwrap();
 
     assert_eq!(stats.removed, 1);
-    assert!(w.read_page(&conn, "page").unwrap().is_none());
+    assert!(w.read_page(&store, "page").unwrap().is_none());
 
     std::fs::remove_dir_all(&root).unwrap();
 }
@@ -164,17 +165,17 @@ fn a_file_deleted_outside_the_server_drops_out_of_the_index() {
 #[test]
 fn generated_pages_are_not_content_pages() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let (w, root) = wiki("generated");
     write_file(&root, INDEX_FILE, "# Wiki Index\n\ngenerated");
     write_file(&root, LOG_FILE, "# Wiki Change Log\n");
     write_file(&root, SCHEMA_FILE, "# Schema\n");
     write_file(&root, "real.md", "# Real\n\nbody");
 
-    let stats = w.reconcile(&conn).unwrap();
+    let stats = w.reconcile(&store).unwrap();
 
     assert_eq!(stats.pages, 1, "only the real page counts");
-    assert_eq!(w.list_pages(&conn).unwrap().len(), 1);
+    assert_eq!(w.list_pages(&store).unwrap().len(), 1);
 
     std::fs::remove_dir_all(&root).unwrap();
 }
@@ -182,23 +183,21 @@ fn generated_pages_are_not_content_pages() {
 #[test]
 fn removing_a_link_from_a_page_removes_the_edge() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let (w, root) = wiki("links");
     write_file(&root, "page.md", "# Page\n\nsee [[Other]]");
-    w.reconcile(&conn).unwrap();
-    let edges = |conn: &Connection| -> i64 {
-        conn.query_row("SELECT count(*) FROM wiki_links", [], |r| r.get(0))
-            .unwrap()
-    };
-    assert_eq!(edges(&conn), 1);
+    w.reconcile(&store).unwrap();
+    // The page's slug is its file stem, and it is the only page.
+    let edges = |store: &Store<'_>| -> usize { WikiIndex::new(store).link_count("page").unwrap() };
+    assert_eq!(edges(&store), 1);
 
     std::thread::sleep(std::time::Duration::from_millis(10));
     write_file(&root, "page.md", "# Page\n\nno links now");
-    w.reconcile(&conn).unwrap();
+    w.reconcile(&store).unwrap();
 
     // Links are replaced wholesale; an insert-only pass would leave the stale
     // edge behind.
-    assert_eq!(edges(&conn), 0);
+    assert_eq!(edges(&store), 0);
 
     std::fs::remove_dir_all(&root).unwrap();
 }
@@ -208,11 +207,11 @@ fn removing_a_link_from_a_page_removes_the_edge() {
 #[test]
 fn writing_a_page_creates_a_file_and_indexes_it() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let (w, root) = wiki("write");
 
     let outcome = w
-        .write_page(&conn, "VLAN Setup", "Tag port 3 for the lab.", None)
+        .write_page(&store, "VLAN Setup", "Tag port 3 for the lab.", None)
         .unwrap()
         .unwrap();
 
@@ -222,7 +221,7 @@ fn writing_a_page_creates_a_file_and_indexes_it() {
     // Self-describing: someone opening the file in an editor sees what it is.
     assert!(on_disk.starts_with("# VLAN Setup\n"));
     assert_eq!(
-        w.read_page(&conn, "vlan-setup").unwrap().unwrap().title,
+        w.read_page(&store, "vlan-setup").unwrap().unwrap().title,
         "VLAN Setup"
     );
 
@@ -232,18 +231,20 @@ fn writing_a_page_creates_a_file_and_indexes_it() {
 #[test]
 fn rewriting_a_page_reports_it_as_an_update() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let (w, root) = wiki("update");
-    w.write_page(&conn, "Page", "first", None).unwrap().unwrap();
+    w.write_page(&store, "Page", "first", None)
+        .unwrap()
+        .unwrap();
 
     let second = w
-        .write_page(&conn, "Page", "second", None)
+        .write_page(&store, "Page", "second", None)
         .unwrap()
         .unwrap();
 
     assert!(!second.created);
     assert!(w
-        .read_page(&conn, "page")
+        .read_page(&store, "page")
         .unwrap()
         .unwrap()
         .content
@@ -255,10 +256,10 @@ fn rewriting_a_page_reports_it_as_an_update() {
 #[test]
 fn a_disagreeing_h1_is_replaced_not_duplicated() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let (w, root) = wiki("heading");
 
-    w.write_page(&conn, "Correct Title", "# Wrong Title\n\nbody", None)
+    w.write_page(&store, "Correct Title", "# Wrong Title\n\nbody", None)
         .unwrap()
         .unwrap();
 
@@ -274,10 +275,10 @@ fn a_disagreeing_h1_is_replaced_not_duplicated() {
 #[test]
 fn writing_refuses_a_reserved_page() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let (w, root) = wiki("reserved");
 
-    let outcome = w.write_page(&conn, "index", "hand-written", None).unwrap();
+    let outcome = w.write_page(&store, "index", "hand-written", None).unwrap();
 
     assert_eq!(outcome.unwrap_err(), WikiDeleteOutcome::Reserved);
 
@@ -287,13 +288,13 @@ fn writing_refuses_a_reserved_page() {
 #[test]
 fn the_index_is_regenerated_on_every_write() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let (w, root) = wiki("regen");
 
-    w.write_page(&conn, "Alpha", "first page", None)
+    w.write_page(&store, "Alpha", "first page", None)
         .unwrap()
         .unwrap();
-    w.write_page(&conn, "Beta", "second page", None)
+    w.write_page(&store, "Beta", "second page", None)
         .unwrap()
         .unwrap();
 
@@ -308,10 +309,10 @@ fn the_index_is_regenerated_on_every_write() {
 #[test]
 fn the_log_records_writes_and_deletes() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let (w, root) = wiki("log");
-    w.write_page(&conn, "Page", "body", None).unwrap().unwrap();
-    w.delete_page(&conn, "Page").unwrap();
+    w.write_page(&store, "Page", "body", None).unwrap().unwrap();
+    w.delete_page(&store, "Page").unwrap();
 
     let log = std::fs::read_to_string(root.join(LOG_FILE)).unwrap();
     assert!(log.contains("created [[Page]]"));
@@ -323,19 +324,19 @@ fn the_log_records_writes_and_deletes() {
 #[test]
 fn deleting_removes_the_file_as_well_as_the_row() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let (w, root) = wiki("delete");
-    w.write_page(&conn, "Page", "body", None).unwrap().unwrap();
+    w.write_page(&store, "Page", "body", None).unwrap().unwrap();
 
     assert_eq!(
-        w.delete_page(&conn, "Page").unwrap(),
+        w.delete_page(&store, "Page").unwrap(),
         WikiDeleteOutcome::Deleted
     );
 
     // A row-only delete would be undone by the next reconcile, since the file
     // is still there.
     assert!(!root.join("page.md").exists());
-    assert!(w.read_page(&conn, "page").unwrap().is_none());
+    assert!(w.read_page(&store, "page").unwrap().is_none());
 
     std::fs::remove_dir_all(&root).unwrap();
 }
@@ -343,22 +344,22 @@ fn deleting_removes_the_file_as_well_as_the_row() {
 #[test]
 fn deleting_resolves_by_title_or_slug_and_refuses_reserved_pages() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let (w, root) = wiki("resolve");
-    w.write_page(&conn, "VLAN Setup!", "body", None)
+    w.write_page(&store, "VLAN Setup!", "body", None)
         .unwrap()
         .unwrap();
 
     assert_eq!(
-        w.delete_page(&conn, "vlan-setup").unwrap(),
+        w.delete_page(&store, "vlan-setup").unwrap(),
         WikiDeleteOutcome::Deleted
     );
     assert_eq!(
-        w.delete_page(&conn, "missing").unwrap(),
+        w.delete_page(&store, "missing").unwrap(),
         WikiDeleteOutcome::NotFound
     );
     assert_eq!(
-        w.delete_page(&conn, "index").unwrap(),
+        w.delete_page(&store, "index").unwrap(),
         WikiDeleteOutcome::Reserved
     );
 
@@ -370,10 +371,10 @@ fn deleting_resolves_by_title_or_slug_and_refuses_reserved_pages() {
 #[test]
 fn loading_an_empty_wiki_returns_nothing() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let (w, root) = wiki("empty");
 
-    let loaded = w.load(&conn, 0, true).unwrap();
+    let loaded = w.load(&store, 0, true).unwrap();
 
     assert_eq!(loaded.pages_included, 0);
 
@@ -383,16 +384,16 @@ fn loading_an_empty_wiki_returns_nothing() {
 #[test]
 fn loading_concatenates_every_page_with_an_index() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let (w, root) = wiki("load");
-    w.write_page(&conn, "Alpha", "the alpha body", None)
+    w.write_page(&store, "Alpha", "the alpha body", None)
         .unwrap()
         .unwrap();
-    w.write_page(&conn, "Beta", "the beta body", None)
+    w.write_page(&store, "Beta", "the beta body", None)
         .unwrap()
         .unwrap();
 
-    let loaded = w.load(&conn, 0, true).unwrap();
+    let loaded = w.load(&store, 0, true).unwrap();
 
     assert_eq!(loaded.pages_included, 2);
     assert_eq!(loaded.pages_omitted, 0);
@@ -406,11 +407,13 @@ fn loading_concatenates_every_page_with_an_index() {
 #[test]
 fn the_index_can_be_left_out() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let (w, root) = wiki("noindex");
-    w.write_page(&conn, "Alpha", "body", None).unwrap().unwrap();
+    w.write_page(&store, "Alpha", "body", None)
+        .unwrap()
+        .unwrap();
 
-    let loaded = w.load(&conn, 0, false).unwrap();
+    let loaded = w.load(&store, 0, false).unwrap();
 
     assert!(!loaded.content.contains("# Wiki Index"));
 
@@ -420,19 +423,19 @@ fn the_index_can_be_left_out() {
 #[test]
 fn overflow_is_listed_by_title_rather_than_silently_dropped() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let (w, root) = wiki("budget");
-    w.write_page(&conn, "Alpha", &"a".repeat(400), None)
+    w.write_page(&store, "Alpha", &"a".repeat(400), None)
         .unwrap()
         .unwrap();
-    w.write_page(&conn, "Beta", &"b".repeat(400), None)
+    w.write_page(&store, "Beta", &"b".repeat(400), None)
         .unwrap()
         .unwrap();
-    w.write_page(&conn, "Gamma", &"c".repeat(400), None)
+    w.write_page(&store, "Gamma", &"c".repeat(400), None)
         .unwrap()
         .unwrap();
 
-    let loaded = w.load(&conn, 120, false).unwrap();
+    let loaded = w.load(&store, 120, false).unwrap();
 
     assert!(loaded.pages_omitted > 0);
     // A caller has to be able to tell it got part of the wiki, and what to
@@ -446,13 +449,13 @@ fn overflow_is_listed_by_title_rather_than_silently_dropped() {
 #[test]
 fn one_page_always_comes_back_even_when_it_busts_the_budget() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let (w, root) = wiki("oversize");
-    w.write_page(&conn, "Huge", &"x".repeat(4_000), None)
+    w.write_page(&store, "Huge", &"x".repeat(4_000), None)
         .unwrap()
         .unwrap();
 
-    let loaded = w.load(&conn, 10, false).unwrap();
+    let loaded = w.load(&store, 10, false).unwrap();
 
     // Returning an index and nothing else would be useless.
     assert_eq!(loaded.pages_included, 1);
@@ -465,10 +468,10 @@ fn one_page_always_comes_back_even_when_it_busts_the_budget() {
 #[test]
 fn compiling_an_empty_store_reports_nothing_pending() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let (w, root) = wiki("nothing");
 
-    match w.compile(&conn, 20, false).unwrap() {
+    match w.compile(&store, 20, false).unwrap() {
         WikiCompile::Noop { .. } => {}
         other => panic!("expected a no-op, got {:?}", other),
     }
@@ -479,11 +482,11 @@ fn compiling_an_empty_store_reports_nothing_pending() {
 #[test]
 fn the_brief_surfaces_pending_sources_and_the_schema() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let (w, root) = wiki("brief");
-    add(&conn, "a raw memory about quokkas");
+    add(&store, "a raw memory about quokkas");
 
-    match w.compile(&conn, 20, false).unwrap() {
+    match w.compile(&store, 20, false).unwrap() {
         WikiCompile::Brief { pending, brief, .. } => {
             assert_eq!(pending, 1);
             assert!(brief.contains("quokkas"));
@@ -501,19 +504,19 @@ fn the_brief_surfaces_pending_sources_and_the_schema() {
 #[test]
 fn the_brief_never_advances_the_watermark() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let (w, root) = wiki("idempotent");
-    add(&conn, "a raw memory");
+    add(&store, "a raw memory");
 
     for _ in 0..3 {
-        match w.compile(&conn, 20, false).unwrap() {
+        match w.compile(&store, 20, false).unwrap() {
             WikiCompile::Brief { pending, .. } => assert_eq!(pending, 1),
             other => panic!("expected a brief, got {:?}", other),
         }
     }
 
     // Phase one being idempotent is what makes it safe to re-read.
-    assert_eq!(get_meta(&conn, COMPILE_WATERMARK_KEY).unwrap(), None);
+    assert_eq!(get_meta(&store, COMPILE_WATERMARK_KEY).unwrap(), None);
 
     std::fs::remove_dir_all(&root).unwrap();
 }
@@ -521,12 +524,12 @@ fn the_brief_never_advances_the_watermark() {
 #[test]
 fn marking_integrated_advances_the_watermark_past_the_batch() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let (w, root) = wiki("mark");
-    add(&conn, "first");
-    add(&conn, "second");
+    add(&store, "first");
+    add(&store, "second");
 
-    let marked = w.compile(&conn, 20, true).unwrap();
+    let marked = w.compile(&store, 20, true).unwrap();
 
     match marked {
         WikiCompile::Integrated {
@@ -538,7 +541,7 @@ fn marking_integrated_advances_the_watermark_past_the_batch() {
         }
         other => panic!("expected an integration, got {:?}", other),
     }
-    match w.compile(&conn, 20, false).unwrap() {
+    match w.compile(&store, 20, false).unwrap() {
         WikiCompile::Noop { .. } => {}
         other => panic!("expected nothing pending, got {:?}", other),
     }
@@ -549,20 +552,20 @@ fn marking_integrated_advances_the_watermark_past_the_batch() {
 #[test]
 fn a_memory_written_during_synthesis_is_not_skipped() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let (w, root) = wiki("during");
-    add(&conn, "surfaced in the brief");
+    add(&store, "surfaced in the brief");
     // Only the first is surfaced.
-    let brief = w.compile(&conn, 1, false).unwrap();
+    let brief = w.compile(&store, 1, false).unwrap();
     assert!(matches!(brief, WikiCompile::Brief { pending: 1, .. }));
 
     // Something is written while the caller synthesises.
-    add(&conn, "written during synthesis");
-    w.compile(&conn, 1, true).unwrap();
+    add(&store, "written during synthesis");
+    w.compile(&store, 1, true).unwrap();
 
     // The watermark is the last *surfaced* row's created_at, not the wall
     // clock — a clock-based watermark would swallow this memory unseen.
-    match w.compile(&conn, 20, false).unwrap() {
+    match w.compile(&store, 20, false).unwrap() {
         WikiCompile::Brief { pending, brief, .. } => {
             assert_eq!(pending, 1);
             assert!(brief.contains("written during synthesis"));
@@ -579,10 +582,10 @@ fn a_memory_written_during_synthesis_is_not_skipped() {
 #[test]
 fn marking_with_nothing_pending_is_a_reported_no_op() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let (w, root) = wiki("emptymark");
 
-    match w.compile(&conn, 20, true).unwrap() {
+    match w.compile(&store, 20, true).unwrap() {
         WikiCompile::Noop { reason, .. } => assert!(reason.contains("no pending")),
         other => panic!("expected a no-op, got {:?}", other),
     }
@@ -593,14 +596,14 @@ fn marking_with_nothing_pending_is_a_reported_no_op() {
 #[test]
 fn the_brief_lists_pages_that_already_exist() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let (w, root) = wiki("existing");
-    w.write_page(&conn, "Networking", "existing knowledge", None)
+    w.write_page(&store, "Networking", "existing knowledge", None)
         .unwrap()
         .unwrap();
-    add(&conn, "a new raw memory");
+    add(&store, "a new raw memory");
 
-    match w.compile(&conn, 20, false).unwrap() {
+    match w.compile(&store, 20, false).unwrap() {
         WikiCompile::Brief { brief, .. } => {
             assert!(brief.contains("[[Networking]]"));
             assert!(!brief.contains("bootstrapping"));
@@ -618,30 +621,30 @@ fn the_brief_lists_pages_that_already_exist() {
 #[test]
 fn a_fresh_store_has_nothing_pending() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
-    assert_eq!(pending_compile_count(&conn).unwrap(), 0);
+    assert_eq!(pending_compile_count(&store).unwrap(), 0);
 }
 
 #[test]
 fn pending_count_is_not_capped_by_a_brief_limit() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let (w, root) = wiki("uncapped");
     for i in 0..5 {
-        add(&conn, &format!("memory {}", i));
+        add(&store, &format!("memory {}", i));
     }
     // A reconcile (triggered by any Wiki call) does not itself advance the
     // watermark — only compile(mark_integrated: true) does.
-    w.list_pages(&conn).unwrap();
+    w.list_pages(&store).unwrap();
 
     // compile() truncates its own `pending` count to the brief's limit...
-    match w.compile(&conn, 2, false).unwrap() {
+    match w.compile(&store, 2, false).unwrap() {
         WikiCompile::Brief { pending, .. } => assert_eq!(pending, 2),
         other => panic!("expected a brief, got {:?}", other),
     }
     // ...but the true count, which the status route needs, is not.
-    assert_eq!(pending_compile_count(&conn).unwrap(), 5);
+    assert_eq!(pending_compile_count(&store).unwrap(), 5);
 
     std::fs::remove_dir_all(&root).unwrap();
 }
@@ -649,18 +652,18 @@ fn pending_count_is_not_capped_by_a_brief_limit() {
 #[test]
 fn marking_integrated_moves_the_watermark_and_drops_the_pending_count() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let (w, root) = wiki("watermark");
-    add(&conn, "a raw memory");
-    assert_eq!(pending_compile_count(&conn).unwrap(), 1);
+    add(&store, "a raw memory");
+    assert_eq!(pending_compile_count(&store).unwrap(), 1);
 
-    w.compile(&conn, 20, true).unwrap();
+    w.compile(&store, 20, true).unwrap();
 
-    assert_eq!(pending_compile_count(&conn).unwrap(), 0);
+    assert_eq!(pending_compile_count(&store).unwrap(), 0);
 
     // A memory written after the watermark is pending again.
-    add(&conn, "a later memory");
-    assert_eq!(pending_compile_count(&conn).unwrap(), 1);
+    add(&store, "a later memory");
+    assert_eq!(pending_compile_count(&store).unwrap(), 1);
 
     std::fs::remove_dir_all(&root).unwrap();
 }

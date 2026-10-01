@@ -13,6 +13,9 @@ fn run(db: &Path, args: &[&str]) -> (String, String, bool) {
     let out = Command::new(env!("CARGO_BIN_EXE_rusty-remind-me"))
         .args(args)
         .env("REMIND_ME_DB_PATH", db)
+        // In this process: the daemon is on by default, and one started here
+        // would outlive the test.
+        .env("REMIND_ME_DAEMON", "0")
         // No update-check suppression needed: `updater::start_background_check`
         // is inside `main`'s server branch, so `list`/`add` never reach it and
         // these tests do not touch the network.

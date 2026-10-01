@@ -2,15 +2,16 @@
 
 use remind_me_core::capture::auto_capture;
 use remind_me_core::db::queries;
+use remind_me_core::db::Store;
+use remind_me_core::testing;
 use remind_me_core::{
     AnnotateInput, AutoCaptureInput, Database, EntityInput, ExtractBatchInput, MemoryAddInput,
     MemoryAnnotation, EXTRACT_BATCH_MAX,
 };
-use rusqlite::Connection;
 
-fn add(conn: &Connection, content: &str) -> String {
+fn add(store: &Store<'_>, content: &str) -> String {
     queries::add_memory(
-        conn,
+        store,
         MemoryAddInput {
             sensitive: false,
             content: content.to_string(),
@@ -28,17 +29,17 @@ fn add(conn: &Connection, content: &str) -> String {
     .id
 }
 
-fn batch(conn: &Connection, size: usize) -> remind_me_core::ExtractBatchResult {
-    queries::unannotated_batch(conn, &ExtractBatchInput { batch_size: size }).unwrap()
+fn batch(store: &Store<'_>, size: usize) -> remind_me_core::ExtractBatchResult {
+    queries::unannotated_batch(store, &ExtractBatchInput { batch_size: size }).unwrap()
 }
 
 fn ids(result: &remind_me_core::ExtractBatchResult) -> Vec<String> {
     result.memories.iter().map(|m| m.id.clone()).collect()
 }
 
-fn annotate(conn: &Connection, annotation: MemoryAnnotation) {
+fn annotate(store: &Store<'_>, annotation: MemoryAnnotation) {
     queries::annotate_memories(
-        conn,
+        store,
         &AnnotateInput {
             annotations: vec![annotation],
         },
@@ -49,10 +50,10 @@ fn annotate(conn: &Connection, annotation: MemoryAnnotation) {
 #[test]
 fn a_bare_memory_needs_extraction() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "something unannotated");
+    let store = db.store();
+    let id = add(&store, "something unannotated");
 
-    let result = batch(&conn, 20);
+    let result = batch(&store, 20);
 
     assert_eq!(ids(&result), vec![id]);
     assert_eq!(result.total_unannotated, 1);
@@ -61,12 +62,12 @@ fn a_bare_memory_needs_extraction() {
 #[test]
 fn a_memory_with_a_triple_is_done() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "has a triple");
-    add(&conn, "has nothing");
+    let store = db.store();
+    let id = add(&store, "has a triple");
+    add(&store, "has nothing");
 
     annotate(
-        &conn,
+        &store,
         MemoryAnnotation {
             memory_id: id.clone(),
             subject: Some("Bailey".into()),
@@ -76,18 +77,18 @@ fn a_memory_with_a_triple_is_done() {
         },
     );
 
-    assert!(!ids(&batch(&conn, 20)).contains(&id));
-    assert_eq!(batch(&conn, 20).total_unannotated, 1);
+    assert!(!ids(&batch(&store, 20)).contains(&id));
+    assert_eq!(batch(&store, 20).total_unannotated, 1);
 }
 
 #[test]
 fn a_memory_with_only_entities_is_also_done() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "has an entity");
+    let store = db.store();
+    let id = add(&store, "has an entity");
 
     annotate(
-        &conn,
+        &store,
         MemoryAnnotation {
             memory_id: id.clone(),
             subject: None,
@@ -103,18 +104,18 @@ fn a_memory_with_only_entities_is_also_done() {
 
     // Missing *both* signals is what qualifies. An OR here would keep
     // re-offering work that has already been done.
-    assert!(batch(&conn, 20).memories.is_empty());
-    assert_eq!(batch(&conn, 20).total_unannotated, 0);
+    assert!(batch(&store, 20).memories.is_empty());
+    assert_eq!(batch(&store, 20).total_unannotated, 0);
 }
 
 #[test]
 fn a_partial_triple_still_counts_as_annotated() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "half a triple");
+    let store = db.store();
+    let id = add(&store, "half a triple");
 
     annotate(
-        &conn,
+        &store,
         MemoryAnnotation {
             memory_id: id.clone(),
             subject: Some("Bailey".into()),
@@ -126,15 +127,15 @@ fn a_partial_triple_still_counts_as_annotated() {
 
     // The predicate requires all three to be NULL, so any one of them being
     // set takes the memory out of the backlog.
-    assert!(batch(&conn, 20).memories.is_empty());
+    assert!(batch(&store, 20).memories.is_empty());
 }
 
 #[test]
 fn raw_dialogs_are_excluded() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let capture = auto_capture(
-        &conn,
+        &store,
         &AutoCaptureInput {
             conversation: "user: hi\nassistant: hello".into(),
             summary: "we said hello".into(),
@@ -146,7 +147,7 @@ fn raw_dialogs_are_excluded() {
     )
     .unwrap();
 
-    let result = batch(&conn, 20);
+    let result = batch(&store, 20);
 
     // A raw transcript's facts come out through decompose, not annotation.
     // Without this exclusion every captured conversation would flood the
@@ -163,18 +164,14 @@ fn raw_dialogs_are_excluded() {
 #[test]
 fn superseded_and_deleted_memories_are_excluded() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let live = add(&conn, "still here");
-    let old = add(&conn, "replaced");
-    let gone = add(&conn, "deleted");
-    conn.execute(
-        "UPDATE memories SET superseded_by = ? WHERE id = ?",
-        rusqlite::params![live, old],
-    )
-    .unwrap();
-    queries::delete_memory(&conn, &gone).unwrap();
+    let store = db.store();
+    let live = add(&store, "still here");
+    let old = add(&store, "replaced");
+    let gone = add(&store, "deleted");
+    testing::set_memory_column(&store, &old, "superseded_by", live.as_str()).unwrap();
+    queries::delete_memory(&store, &gone).unwrap();
 
-    let result = batch(&conn, 20);
+    let result = batch(&store, 20);
 
     assert_eq!(ids(&result), vec![live]);
     assert_eq!(result.total_unannotated, 1);
@@ -183,12 +180,12 @@ fn superseded_and_deleted_memories_are_excluded() {
 #[test]
 fn the_batch_reports_the_full_backlog_not_just_the_page() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     for i in 0..7 {
-        add(&conn, &format!("memory {}", i));
+        add(&store, &format!("memory {}", i));
     }
 
-    let result = batch(&conn, 3);
+    let result = batch(&store, 3);
 
     assert_eq!(result.memories.len(), 3);
     assert_eq!(result.total_unannotated, 7);
@@ -197,22 +194,22 @@ fn the_batch_reports_the_full_backlog_not_just_the_page() {
 #[test]
 fn the_batch_size_is_clamped() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     for i in 0..3 {
-        add(&conn, &format!("memory {}", i));
+        add(&store, &format!("memory {}", i));
     }
 
-    assert_eq!(batch(&conn, 0).memories.len(), 1, "zero clamps up to 1");
-    assert_eq!(batch(&conn, EXTRACT_BATCH_MAX * 10).memories.len(), 3);
+    assert_eq!(batch(&store, 0).memories.len(), 1, "zero clamps up to 1");
+    assert_eq!(batch(&store, EXTRACT_BATCH_MAX * 10).memories.len(), 3);
 }
 
 #[test]
 fn the_snippet_is_capped_and_the_fields_come_through() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, &"x".repeat(900));
+    let store = db.store();
+    add(&store, &"x".repeat(900));
 
-    let result = batch(&conn, 20);
+    let result = batch(&store, 20);
 
     assert_eq!(result.memories[0].content_snippet.chars().count(), 500);
     assert_eq!(result.memories[0].category, "general");
@@ -225,11 +222,14 @@ fn the_snippet_is_capped_and_the_fields_come_through() {
 #[test]
 fn a_multibyte_snippet_boundary_does_not_panic() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, &"é".repeat(900));
+    let store = db.store();
+    add(&store, &"é".repeat(900));
 
     assert_eq!(
-        batch(&conn, 20).memories[0].content_snippet.chars().count(),
+        batch(&store, 20).memories[0]
+            .content_snippet
+            .chars()
+            .count(),
         500
     );
 }
@@ -237,12 +237,12 @@ fn a_multibyte_snippet_boundary_does_not_panic() {
 #[test]
 fn annotating_removes_a_memory_from_the_backlog() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "pending");
-    assert_eq!(batch(&conn, 20).total_unannotated, 1);
+    let store = db.store();
+    let id = add(&store, "pending");
+    assert_eq!(batch(&store, 20).total_unannotated, 1);
 
     annotate(
-        &conn,
+        &store,
         MemoryAnnotation {
             memory_id: id,
             subject: Some("Bailey".into()),
@@ -253,5 +253,5 @@ fn annotating_removes_a_memory_from_the_backlog() {
     );
 
     // The loop has to converge: work done must stop being offered.
-    assert_eq!(batch(&conn, 20).total_unannotated, 0);
+    assert_eq!(batch(&store, 20).total_unannotated, 0);
 }

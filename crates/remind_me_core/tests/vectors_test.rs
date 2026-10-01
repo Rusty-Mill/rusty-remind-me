@@ -11,14 +11,16 @@
 mod test_env;
 
 use remind_me_core::db::queries;
+use remind_me_core::db::vectors::Vectors;
+use remind_me_core::db::Store;
 use remind_me_core::embedder::{EmbedError, EmbedRole, Embedder, EmbeddingIdentity};
+use remind_me_core::testing;
 use remind_me_core::vectors::{
     delete_chunks_for_memory, dimension_of, embed_and_store, embedding_mismatch_info,
     fuse_query_embedding, mark_embedding_meta_current, reconcile_embedding_meta, reindex,
     reindex_with, semantic_search, semantic_search_scored,
 };
 use remind_me_core::{Database, MemoryAddInput};
-use rusqlite::Connection;
 use std::collections::HashMap;
 
 /// Returns a pre-defined vector for each known input string, verbatim (no
@@ -74,9 +76,9 @@ impl Embedder for FakeEmbedder {
     }
 }
 
-fn add(conn: &Connection, content: &str) -> String {
+fn add(store: &Store<'_>, content: &str) -> String {
     queries::add_memory(
-        conn,
+        store,
         MemoryAddInput {
             sensitive: false,
             content: content.to_string(),
@@ -94,9 +96,9 @@ fn add(conn: &Connection, content: &str) -> String {
     .id
 }
 
-fn add_with_category(conn: &Connection, content: &str, category: &str) -> String {
+fn add_with_category(store: &Store<'_>, content: &str, category: &str) -> String {
     queries::add_memory(
-        conn,
+        store,
         MemoryAddInput {
             sensitive: false,
             content: content.to_string(),
@@ -114,15 +116,8 @@ fn add_with_category(conn: &Connection, content: &str, category: &str) -> String
     .id
 }
 
-fn chunk_count(conn: &Connection, memory_id: &str) -> i64 {
-    conn.query_row(
-        "SELECT count(*) FROM vec_chunks vc
-           JOIN memories m ON m.rowid = vc.memory_rowid
-          WHERE m.id = ?",
-        [memory_id],
-        |r| r.get(0),
-    )
-    .unwrap()
+fn chunk_count(store: &Store<'_>, memory_id: &str) -> usize {
+    Vectors::new(store).chunk_count(memory_id).unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -132,26 +127,24 @@ fn chunk_count(conn: &Connection, memory_id: &str) -> i64 {
 #[test]
 fn embedding_a_memory_stores_one_chunk_and_dimension_infers_correctly() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "quokkas live on Rottnest Island");
+    let store = db.store();
+    let id = add(&store, "quokkas live on Rottnest Island");
     let embedder =
         FakeEmbedder::new(4).with("quokkas live on Rottnest Island", vec![1.0, 0.0, 0.0, 0.0]);
 
-    let chunks = embed_and_store(&conn, &embedder, &id, "quokkas live on Rottnest Island").unwrap();
+    let chunks =
+        embed_and_store(&store, &embedder, &id, "quokkas live on Rottnest Island").unwrap();
 
     assert_eq!(chunks, 1);
-    assert_eq!(chunk_count(&conn, &id), 1);
+    assert_eq!(chunk_count(&store, &id), 1);
 
-    let bytes: Vec<u8> = conn
-        .query_row(
-            "SELECT ve.embedding FROM vec_chunks vc
-               JOIN vec_embeddings ve ON ve.vec_rowid = vc.vec_rowid
-               JOIN memories m ON m.rowid = vc.memory_rowid
-              WHERE m.id = ?",
-            [&id],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let bytes: Vec<u8> = Vectors::new(&store)
+        .all()
+        .unwrap()
+        .into_iter()
+        .find(|c| c.memory_id == id)
+        .unwrap()
+        .embedding;
     assert_eq!(
         dimension_of(&bytes),
         4,
@@ -163,19 +156,19 @@ fn embedding_a_memory_stores_one_chunk_and_dimension_infers_correctly() {
 #[test]
 fn re_embedding_replaces_rather_than_accumulates_chunks() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "original text");
+    let store = db.store();
+    let id = add(&store, "original text");
     let embedder = FakeEmbedder::new(2)
         .with("original text", vec![1.0, 0.0])
         .with("revised text", vec![0.0, 1.0]);
 
-    embed_and_store(&conn, &embedder, &id, "original text").unwrap();
-    assert_eq!(chunk_count(&conn, &id), 1);
+    embed_and_store(&store, &embedder, &id, "original text").unwrap();
+    assert_eq!(chunk_count(&store, &id), 1);
 
-    embed_and_store(&conn, &embedder, &id, "revised text").unwrap();
+    embed_and_store(&store, &embedder, &id, "revised text").unwrap();
 
     assert_eq!(
-        chunk_count(&conn, &id),
+        chunk_count(&store, &id),
         1,
         "not 2 -- the old chunk was replaced"
     );
@@ -184,75 +177,65 @@ fn re_embedding_replaces_rather_than_accumulates_chunks() {
 #[test]
 fn embedding_blank_content_stores_nothing() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "placeholder");
+    let store = db.store();
+    let id = add(&store, "placeholder");
     let embedder = FakeEmbedder::new(2);
 
-    let chunks = embed_and_store(&conn, &embedder, &id, "   ").unwrap();
+    let chunks = embed_and_store(&store, &embedder, &id, "   ").unwrap();
 
     assert_eq!(chunks, 0);
-    assert_eq!(chunk_count(&conn, &id), 0);
+    assert_eq!(chunk_count(&store, &id), 0);
 }
 
 #[test]
 fn embedding_an_unknown_memory_id_is_a_silent_no_op() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let embedder = FakeEmbedder::new(2).with("text", vec![1.0, 0.0]);
 
-    let chunks = embed_and_store(&conn, &embedder, "mem_ghost", "text").unwrap();
+    let chunks = embed_and_store(&store, &embedder, "mem_ghost", "text").unwrap();
 
     assert_eq!(chunks, 0);
 }
 
 // ---------------------------------------------------------------------------
-// Deletion cleans up chunks (rowid-reuse safety)
+// Deletion cleans up chunks
 // ---------------------------------------------------------------------------
 
 #[test]
 fn deleting_a_memory_removes_its_chunks_and_embeddings() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "doomed content");
+    let store = db.store();
+    let id = add(&store, "doomed content");
     let embedder = FakeEmbedder::new(2).with("doomed content", vec![1.0, 0.0]);
-    embed_and_store(&conn, &embedder, &id, "doomed content").unwrap();
-    assert_eq!(chunk_count(&conn, &id), 1);
+    embed_and_store(&store, &embedder, &id, "doomed content").unwrap();
+    assert_eq!(chunk_count(&store, &id), 1);
 
-    queries::delete_memory(&conn, &id).unwrap();
+    queries::delete_memory(&store, &id).unwrap();
 
-    let remaining_chunks: i64 = conn
-        .query_row("SELECT count(*) FROM vec_chunks", [], |r| r.get(0))
-        .unwrap();
-    let remaining_vectors: i64 = conn
-        .query_row("SELECT count(*) FROM vec_embeddings", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(
-        remaining_chunks, 0,
-        "a reused rowid must not inherit this memory's chunks"
-    );
-    assert_eq!(remaining_vectors, 0);
+    assert_eq!(Vectors::new(&store).count().unwrap(), 0);
 }
 
 #[test]
-fn a_deleted_memorys_rowid_does_not_leak_stale_embeddings_to_its_successor() {
-    // The scenario delete_chunks_for_memory exists to prevent: SQLite reuses
-    // freed rowids, so without cleanup, a brand-new memory landing on the
-    // same rowid would silently "own" the deleted memory's vectors.
+fn a_deleted_memorys_embeddings_do_not_leak_to_its_successor() {
+    // Chunks were once keyed on rowid, which SQLite reuses; they are keyed on
+    // the memory id now, and a memory created after a deletion must still
+    // start with nothing.
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let first = add(&conn, "first memory");
+    let store = db.store();
+    let first = add(&store, "first memory");
     let embedder = FakeEmbedder::new(2)
         .with("first memory", vec![1.0, 0.0])
         .with("second memory", vec![0.0, 1.0]);
-    embed_and_store(&conn, &embedder, &first, "first memory").unwrap();
-    queries::delete_memory(&conn, &first).unwrap();
+    embed_and_store(&store, &embedder, &first, "first memory").unwrap();
+    queries::delete_memory(&store, &first).unwrap();
 
-    let second = add(&conn, "second memory");
+    let second = add(&store, "second memory");
     // The new memory is not embedded yet -- confirm it inherited nothing.
-    assert_eq!(chunk_count(&conn, &second), 0);
+    assert_eq!(chunk_count(&store, &second), 0);
 
-    embed_and_store(&conn, &embedder, &second, "second memory").unwrap();
-    assert_eq!(chunk_count(&conn, &second), 1);
+    embed_and_store(&store, &embedder, &second, "second memory").unwrap();
+    assert_eq!(chunk_count(&store, &second), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -262,15 +245,9 @@ fn a_deleted_memorys_rowid_does_not_leak_stale_embeddings_to_its_successor() {
 #[test]
 fn delete_chunks_for_memory_is_a_no_op_on_a_never_embedded_memory() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "never embedded");
-    let rowid: i64 = conn
-        .query_row("SELECT rowid FROM memories WHERE id = ?", [&id], |r| {
-            r.get(0)
-        })
-        .unwrap();
-
-    let removed = delete_chunks_for_memory(&conn, rowid).unwrap();
+    let store = db.store();
+    let id = add(&store, "never embedded");
+    let removed = delete_chunks_for_memory(&store, &id).unwrap();
 
     assert_eq!(removed, 0);
 }
@@ -282,9 +259,9 @@ fn delete_chunks_for_memory_is_a_no_op_on_a_never_embedded_memory() {
 #[test]
 fn semantic_search_ranks_by_similarity_to_the_query() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let close = add(&conn, "quokkas are marsupials found on Rottnest Island");
-    let far = add(&conn, "the deploy window is Tuesdays at 2pm");
+    let store = db.store();
+    let close = add(&store, "quokkas are marsupials found on Rottnest Island");
+    let far = add(&store, "the deploy window is Tuesdays at 2pm");
 
     let embedder = FakeEmbedder::new(3)
         .with(
@@ -294,21 +271,21 @@ fn semantic_search_ranks_by_similarity_to_the_query() {
         .with("the deploy window is Tuesdays at 2pm", vec![0.0, 1.0, 0.0])
         .with("tell me about quokkas", vec![0.9, 0.1, 0.0]);
     embed_and_store(
-        &conn,
+        &store,
         &embedder,
         &close,
         "quokkas are marsupials found on Rottnest Island",
     )
     .unwrap();
     embed_and_store(
-        &conn,
+        &store,
         &embedder,
         &far,
         "the deploy window is Tuesdays at 2pm",
     )
     .unwrap();
 
-    let results = semantic_search(&conn, &embedder, "tell me about quokkas", 10, None).unwrap();
+    let results = semantic_search(&store, &embedder, "tell me about quokkas", 10, None).unwrap();
 
     assert_eq!(results.len(), 2);
     assert_eq!(results[0].id, close, "the near-parallel vector ranks first");
@@ -320,17 +297,17 @@ fn semantic_search_keeps_only_a_memorys_single_best_chunk() {
     // A memory that happens to own several chunks must not out-rank one
     // with a single chunk purely for having more shots at matching.
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let multi = add(&conn, "multi chunk memory");
-    let single = add(&conn, "single chunk memory");
+    let store = db.store();
+    let multi = add(&store, "multi chunk memory");
+    let single = add(&store, "single chunk memory");
     let embedder = FakeEmbedder::new(2)
         .with("multi chunk memory", vec![0.1, 0.0])
         .with("single chunk memory", vec![0.9, 0.0])
         .with("query text", vec![1.0, 0.0]);
-    embed_and_store(&conn, &embedder, &multi, "multi chunk memory").unwrap();
-    embed_and_store(&conn, &embedder, &single, "single chunk memory").unwrap();
+    embed_and_store(&store, &embedder, &multi, "multi chunk memory").unwrap();
+    embed_and_store(&store, &embedder, &single, "single chunk memory").unwrap();
 
-    let results = semantic_search(&conn, &embedder, "query text", 10, None).unwrap();
+    let results = semantic_search(&store, &embedder, "query text", 10, None).unwrap();
 
     assert_eq!(results[0].id, single, "0.9 similarity beats 0.1");
 }
@@ -338,45 +315,37 @@ fn semantic_search_keeps_only_a_memorys_single_best_chunk() {
 #[test]
 fn semantic_search_excludes_superseded_and_deleted_memories() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let stale = add(&conn, "stale content");
+    let store = db.store();
+    let stale = add(&store, "stale content");
     let embedder = FakeEmbedder::new(2)
         .with("stale content", vec![1.0, 0.0])
         .with("removed content", vec![1.0, 0.0])
         .with("query", vec![1.0, 0.0]);
-    embed_and_store(&conn, &embedder, &stale, "stale content").unwrap();
-    conn.execute(
-        "UPDATE memories SET superseded_by = 'mem_new' WHERE id = ?",
-        [&stale],
-    )
-    .unwrap();
+    embed_and_store(&store, &embedder, &stale, "stale content").unwrap();
+    testing::set_memory_column(&store, &stale, "superseded_by", "mem_new").unwrap();
 
-    let removed = add(&conn, "removed content");
-    embed_and_store(&conn, &embedder, &removed, "removed content").unwrap();
-    conn.execute(
-        "UPDATE memories SET deleted_at = '2026-01-01T00:00:00Z' WHERE id = ?",
-        [&removed],
-    )
-    .unwrap();
+    let removed = add(&store, "removed content");
+    embed_and_store(&store, &embedder, &removed, "removed content").unwrap();
+    testing::set_memory_column(&store, &removed, "deleted_at", "2026-01-01T00:00:00Z").unwrap();
 
-    let results = semantic_search(&conn, &embedder, "query", 10, None).unwrap();
+    let results = semantic_search(&store, &embedder, "query", 10, None).unwrap();
     assert!(results.is_empty());
 }
 
 #[test]
 fn semantic_search_filters_by_category() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let wildlife = add_with_category(&conn, "quokka content", "wildlife");
-    let general = add_with_category(&conn, "general content", "general");
+    let store = db.store();
+    let wildlife = add_with_category(&store, "quokka content", "wildlife");
+    let general = add_with_category(&store, "general content", "general");
     let embedder = FakeEmbedder::new(2)
         .with("quokka content", vec![1.0, 0.0])
         .with("general content", vec![1.0, 0.0])
         .with("query", vec![1.0, 0.0]);
-    embed_and_store(&conn, &embedder, &wildlife, "quokka content").unwrap();
-    embed_and_store(&conn, &embedder, &general, "general content").unwrap();
+    embed_and_store(&store, &embedder, &wildlife, "quokka content").unwrap();
+    embed_and_store(&store, &embedder, &general, "general content").unwrap();
 
-    let results = semantic_search(&conn, &embedder, "query", 10, Some("wildlife")).unwrap();
+    let results = semantic_search(&store, &embedder, "query", 10, Some("wildlife")).unwrap();
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].id, wildlife);
@@ -385,10 +354,10 @@ fn semantic_search_filters_by_category() {
 #[test]
 fn semantic_search_over_an_empty_store_returns_nothing() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let embedder = FakeEmbedder::new(2).with("query", vec![1.0, 0.0]);
 
-    let results = semantic_search(&conn, &embedder, "query", 10, None).unwrap();
+    let results = semantic_search(&store, &embedder, "query", 10, None).unwrap();
 
     assert!(results.is_empty());
 }
@@ -399,28 +368,13 @@ fn a_stale_dimension_vector_is_skipped_rather_than_crashing_the_scan() {
     // reindexed: a leftover vector at the wrong width must not panic the
     // dot product, and must not be treated as a match either.
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "old width content");
-    let rowid: i64 = conn
-        .query_row("SELECT rowid FROM memories WHERE id = ?", [&id], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    conn.execute(
-        "INSERT INTO vec_chunks (memory_rowid, chunk_ix) VALUES (?, 0)",
-        [rowid],
-    )
-    .unwrap();
-    let vec_rowid = conn.last_insert_rowid();
+    let store = db.store();
+    let id = add(&store, "old width content");
     // 3 floats (12 bytes) where the query embedder produces 2.
-    conn.execute(
-        "INSERT INTO vec_embeddings (vec_rowid, embedding) VALUES (?, ?)",
-        rusqlite::params![vec_rowid, vec![0u8; 12]],
-    )
-    .unwrap();
+    Vectors::new(&store).put(&id, 0, &[0u8; 12]).unwrap();
 
     let embedder = FakeEmbedder::new(2).with("query", vec![1.0, 0.0]);
-    let results = semantic_search(&conn, &embedder, "query", 10, None).unwrap();
+    let results = semantic_search(&store, &embedder, "query", 10, None).unwrap();
 
     assert!(
         results.is_empty(),
@@ -439,10 +393,10 @@ fn reindex_reports_degraded_with_no_embedder_configured() {
     // suite already relies on being the ambient state.
     crate::test_env::remove_var(remind_me_core::embedder::EMBEDDING_BACKEND_ENV);
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "never embedded");
+    let store = db.store();
+    add(&store, "never embedded");
 
-    let result = reindex(&conn).unwrap();
+    let result = reindex(&store).unwrap();
 
     assert!(result.degraded);
     assert_eq!(result.embedded, 0);
@@ -451,15 +405,15 @@ fn reindex_reports_degraded_with_no_embedder_configured() {
 #[test]
 fn reindex_with_embeds_only_memories_missing_a_vector() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let already_embedded = add(&conn, "already embedded");
-    let missing = add(&conn, "missing content");
+    let store = db.store();
+    let already_embedded = add(&store, "already embedded");
+    let missing = add(&store, "missing content");
     let embedder = FakeEmbedder::new(2)
         .with("already embedded", vec![1.0, 0.0])
         .with("missing content", vec![0.0, 1.0]);
-    embed_and_store(&conn, &embedder, &already_embedded, "already embedded").unwrap();
+    embed_and_store(&store, &embedder, &already_embedded, "already embedded").unwrap();
 
-    let result = reindex_with(&conn, &embedder).unwrap();
+    let result = reindex_with(&store, &embedder).unwrap();
 
     assert!(!result.degraded);
     assert_eq!(
@@ -468,20 +422,20 @@ fn reindex_with_embeds_only_memories_missing_a_vector() {
     );
     assert_eq!(result.embedded, 1);
     assert_eq!(result.chunks_created, 1);
-    assert_eq!(chunk_count(&conn, &missing), 1);
+    assert_eq!(chunk_count(&store, &missing), 1);
 }
 
 #[test]
 fn reindex_with_is_idempotent_and_preserves_existing_embeddings() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "some content");
+    let store = db.store();
+    let id = add(&store, "some content");
     let embedder = FakeEmbedder::new(2).with("some content", vec![1.0, 0.0]);
 
-    let first = reindex_with(&conn, &embedder).unwrap();
+    let first = reindex_with(&store, &embedder).unwrap();
     assert_eq!(first.embedded, 1);
 
-    let second = reindex_with(&conn, &embedder).unwrap();
+    let second = reindex_with(&store, &embedder).unwrap();
 
     assert_eq!(
         second.missing, 0,
@@ -490,7 +444,7 @@ fn reindex_with_is_idempotent_and_preserves_existing_embeddings() {
     assert_eq!(second.embedded, 0);
     assert_eq!(second.chunks_created, 0);
     assert_eq!(
-        chunk_count(&conn, &id),
+        chunk_count(&store, &id),
         1,
         "the original chunk was left alone, not duplicated"
     );
@@ -499,10 +453,10 @@ fn reindex_with_is_idempotent_and_preserves_existing_embeddings() {
 #[test]
 fn reindex_with_over_an_empty_store_does_nothing() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let embedder = FakeEmbedder::new(2);
 
-    let result = reindex_with(&conn, &embedder).unwrap();
+    let result = reindex_with(&store, &embedder).unwrap();
 
     assert!(!result.degraded);
     assert_eq!(result.missing, 0);
@@ -527,10 +481,10 @@ fn a_fresh_store_with_no_recorded_meta_reports_no_mismatch() {
     // The "first-ever run" case: nothing has been recorded yet, so there is
     // no old model to have changed away from.
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
     let info =
-        embedding_mismatch_info(&conn, &identity("ollama", "nomic-embed-text", 384)).unwrap();
+        embedding_mismatch_info(&store, &identity("ollama", "nomic-embed-text", 384)).unwrap();
 
     assert!(info.is_none());
 }
@@ -541,42 +495,42 @@ fn reconciling_a_fresh_store_does_not_clear_anything() {
     // not spuriously wipe vectors that were only just written under the
     // current config.
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "quokkas live on Rottnest Island");
+    let store = db.store();
+    let id = add(&store, "quokkas live on Rottnest Island");
     let embedder = FakeEmbedder::new(2).with("quokkas live on Rottnest Island", vec![1.0, 0.0]);
-    embed_and_store(&conn, &embedder, &id, "quokkas live on Rottnest Island").unwrap();
+    embed_and_store(&store, &embedder, &id, "quokkas live on Rottnest Island").unwrap();
 
-    let cleared = reconcile_embedding_meta(&conn, &embedder.identity()).unwrap();
+    let cleared = reconcile_embedding_meta(&store, &embedder.identity()).unwrap();
 
     assert!(cleared.is_none());
-    assert_eq!(chunk_count(&conn, &id), 1, "the fresh vector must survive");
+    assert_eq!(chunk_count(&store, &id), 1, "the fresh vector must survive");
 }
 
 #[test]
 fn the_same_model_across_runs_is_a_no_op() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "same model content");
+    let store = db.store();
+    let id = add(&store, "same model content");
     let embedder = FakeEmbedder::new(2).with("same model content", vec![1.0, 0.0]);
-    embed_and_store(&conn, &embedder, &id, "same model content").unwrap();
+    embed_and_store(&store, &embedder, &id, "same model content").unwrap();
 
     // embed_and_store already recorded the fake embedder's identity; asking
     // again with the exact same identity must report no mismatch.
-    let info = embedding_mismatch_info(&conn, &embedder.identity()).unwrap();
+    let info = embedding_mismatch_info(&store, &embedder.identity()).unwrap();
     assert!(info.is_none());
 
-    let cleared = reconcile_embedding_meta(&conn, &embedder.identity()).unwrap();
+    let cleared = reconcile_embedding_meta(&store, &embedder.identity()).unwrap();
     assert!(cleared.is_none());
-    assert_eq!(chunk_count(&conn, &id), 1, "nothing was cleared");
+    assert_eq!(chunk_count(&store, &id), 1, "nothing was cleared");
 }
 
 #[test]
 fn a_changed_model_name_is_detected() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    mark_embedding_meta_current(&conn, &identity("ollama", "old-model", 384)).unwrap();
+    let store = db.store();
+    mark_embedding_meta_current(&store, &identity("ollama", "old-model", 384)).unwrap();
 
-    let info = embedding_mismatch_info(&conn, &identity("ollama", "new-model", 384))
+    let info = embedding_mismatch_info(&store, &identity("ollama", "new-model", 384))
         .unwrap()
         .expect("a different model name must be reported as a mismatch");
 
@@ -587,10 +541,10 @@ fn a_changed_model_name_is_detected() {
 #[test]
 fn a_changed_dimension_is_detected() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    mark_embedding_meta_current(&conn, &identity("ollama", "nomic-embed-text", 384)).unwrap();
+    let store = db.store();
+    mark_embedding_meta_current(&store, &identity("ollama", "nomic-embed-text", 384)).unwrap();
 
-    let info = embedding_mismatch_info(&conn, &identity("ollama", "nomic-embed-text", 768))
+    let info = embedding_mismatch_info(&store, &identity("ollama", "nomic-embed-text", 768))
         .unwrap()
         .expect("a different dimension must be reported as a mismatch");
 
@@ -601,10 +555,10 @@ fn a_changed_dimension_is_detected() {
 #[test]
 fn a_changed_backend_is_detected() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    mark_embedding_meta_current(&conn, &identity("ollama", "nomic-embed-text", 384)).unwrap();
+    let store = db.store();
+    mark_embedding_meta_current(&store, &identity("ollama", "nomic-embed-text", 384)).unwrap();
 
-    let info = embedding_mismatch_info(&conn, &identity("onnx", "nomic-embed-text", 384))
+    let info = embedding_mismatch_info(&store, &identity("onnx", "nomic-embed-text", 384))
         .unwrap()
         .expect("a different backend must be reported as a mismatch");
 
@@ -615,24 +569,21 @@ fn a_changed_backend_is_detected() {
 #[test]
 fn a_detected_mismatch_clears_every_stored_vector_and_chunk() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "stale model content");
+    let store = db.store();
+    let id = add(&store, "stale model content");
     let old_embedder = FakeEmbedder::new(2).with("stale model content", vec![1.0, 0.0]);
-    embed_and_store(&conn, &old_embedder, &id, "stale model content").unwrap();
-    assert_eq!(chunk_count(&conn, &id), 1);
+    embed_and_store(&store, &old_embedder, &id, "stale model content").unwrap();
+    assert_eq!(chunk_count(&store, &id), 1);
 
     let new_identity = identity("ollama", "a-different-model", 2);
-    let cleared = reconcile_embedding_meta(&conn, &new_identity)
+    let cleared = reconcile_embedding_meta(&store, &new_identity)
         .unwrap()
         .expect("the fake embedder's identity no longer matches new_identity");
 
     assert_eq!(cleared.stored.model, "fake-model");
     assert_eq!(cleared.current.model, "a-different-model");
-    assert_eq!(chunk_count(&conn, &id), 0, "vec_chunks must be cleared");
-    let remaining_vectors: i64 = conn
-        .query_row("SELECT count(*) FROM vec_embeddings", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(remaining_vectors, 0, "vec_embeddings must be cleared too");
+    assert_eq!(chunk_count(&store, &id), 0, "vec_chunks must be cleared");
+    assert_eq!(Vectors::new(&store).count().unwrap(), 0);
 }
 
 #[test]
@@ -641,13 +592,13 @@ fn reconcile_leaves_the_meta_record_stale_until_a_real_reembed() {
     // (re-)embed clears the flag, so the mismatch stays visible across
     // every open/connection until that happens, matching the reference.
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    mark_embedding_meta_current(&conn, &identity("ollama", "old-model", 384)).unwrap();
+    let store = db.store();
+    mark_embedding_meta_current(&store, &identity("ollama", "old-model", 384)).unwrap();
 
     let current = identity("ollama", "new-model", 384);
-    reconcile_embedding_meta(&conn, &current).unwrap();
+    reconcile_embedding_meta(&store, &current).unwrap();
 
-    let info = embedding_mismatch_info(&conn, &current).unwrap();
+    let info = embedding_mismatch_info(&store, &current).unwrap();
     assert!(
         info.is_some(),
         "the mismatch must still be flagged after reconciling"
@@ -658,20 +609,20 @@ fn reconcile_leaves_the_meta_record_stale_until_a_real_reembed() {
 #[test]
 fn a_real_reembed_after_a_mismatch_clears_the_flag() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "content to re-embed");
-    mark_embedding_meta_current(&conn, &identity("ollama", "old-model", 2)).unwrap();
+    let store = db.store();
+    let id = add(&store, "content to re-embed");
+    mark_embedding_meta_current(&store, &identity("ollama", "old-model", 2)).unwrap();
 
     let embedder = FakeEmbedder::new(2).with("content to re-embed", vec![1.0, 0.0]);
-    reconcile_embedding_meta(&conn, &embedder.identity()).unwrap();
-    assert!(embedding_mismatch_info(&conn, &embedder.identity())
+    reconcile_embedding_meta(&store, &embedder.identity()).unwrap();
+    assert!(embedding_mismatch_info(&store, &embedder.identity())
         .unwrap()
         .is_some());
 
-    embed_and_store(&conn, &embedder, &id, "content to re-embed").unwrap();
+    embed_and_store(&store, &embedder, &id, "content to re-embed").unwrap();
 
     assert!(
-        embedding_mismatch_info(&conn, &embedder.identity())
+        embedding_mismatch_info(&store, &embedder.identity())
             .unwrap()
             .is_none(),
         "re-embedding under the fake embedder's own identity clears the mismatch"
@@ -681,21 +632,13 @@ fn a_real_reembed_after_a_mismatch_clears_the_flag() {
 #[test]
 fn embedding_a_memory_records_the_embedders_identity_in_embedding_meta() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "quokkas");
+    let store = db.store();
+    let id = add(&store, "quokkas");
     let embedder = FakeEmbedder::new(3).with("quokkas", vec![1.0, 0.0, 0.0]);
 
-    embed_and_store(&conn, &embedder, &id, "quokkas").unwrap();
+    embed_and_store(&store, &embedder, &id, "quokkas").unwrap();
 
-    let recorded: Vec<(String, String)> = {
-        let mut stmt = conn
-            .prepare("SELECT key, value FROM embedding_meta ORDER BY key")
-            .unwrap();
-        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect()
-    };
+    let recorded = Vectors::new(&store).meta().unwrap();
     assert_eq!(
         recorded,
         vec![
@@ -711,15 +654,13 @@ fn embedding_blank_content_does_not_record_embedding_meta() {
     // No chunks were actually stored, so there is nothing to claim
     // responsibility for.
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "placeholder");
+    let store = db.store();
+    let id = add(&store, "placeholder");
     let embedder = FakeEmbedder::new(2);
 
-    embed_and_store(&conn, &embedder, &id, "   ").unwrap();
+    embed_and_store(&store, &embedder, &id, "   ").unwrap();
 
-    let count: i64 = conn
-        .query_row("SELECT count(*) FROM embedding_meta", [], |r| r.get(0))
-        .unwrap();
+    let count = Vectors::new(&store).meta().unwrap().len();
     assert_eq!(count, 0);
 }
 
@@ -851,20 +792,20 @@ fn semantic_search_scored_with_extra_texts_can_change_the_winner_vs_the_plain_qu
     // proving `extra_texts` is actually wired into the search vector, not
     // silently ignored.
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let off_topic = add(&conn, "off topic memory");
-    let on_topic = add(&conn, "on topic memory");
+    let store = db.store();
+    let off_topic = add(&store, "off topic memory");
+    let on_topic = add(&store, "on topic memory");
     let embedder = FakeEmbedder::new(2)
         .with("query", vec![1.0, 0.05])
         .with("expansion", vec![0.0, 1.0])
         .with("off topic memory", vec![1.0, 0.0])
         .with("on topic memory", vec![0.0, 1.0]);
-    embed_and_store(&conn, &embedder, &off_topic, "off topic memory").unwrap();
-    embed_and_store(&conn, &embedder, &on_topic, "on topic memory").unwrap();
+    embed_and_store(&store, &embedder, &off_topic, "off topic memory").unwrap();
+    embed_and_store(&store, &embedder, &on_topic, "on topic memory").unwrap();
 
-    let plain = semantic_search_scored(&conn, &embedder, "query", &[], 10, None).unwrap();
+    let plain = semantic_search_scored(&store, &embedder, "query", &[], 10, None).unwrap();
     let expanded = semantic_search_scored(
-        &conn,
+        &store,
         &embedder,
         "query",
         &["expansion".to_string()],

@@ -1,10 +1,11 @@
 //! Coverage for `remind_me_stats`.
 
+use remind_me_core::db::imports::ImportLedger;
 use remind_me_core::db::queries;
+use remind_me_core::db::Store;
 use remind_me_core::{stats, Database, MemoryAddInput};
-use rusqlite::Connection;
 
-fn add(conn: &Connection, content: &str, category: &str, source: &str) -> String {
+fn add(store: &Store<'_>, content: &str, category: &str, source: &str) -> String {
     let input = MemoryAddInput {
         sensitive: false,
         content: content.to_string(),
@@ -17,13 +18,13 @@ fn add(conn: &Connection, content: &str, category: &str, source: &str) -> String
         object: None,
         entities: vec![],
     };
-    queries::add_memory(conn, input).expect("add failed").id
+    queries::add_memory(store, input).expect("add failed").id
 }
 
 #[test]
 fn empty_store_reports_zeros_not_an_error() {
     let db = Database::open_in_memory().unwrap();
-    let s = stats::collect(&db.conn()).unwrap();
+    let s = stats::collect(&db.store()).unwrap();
 
     assert_eq!(s.total_memories, 0);
     assert_eq!(s.total_imports, 0);
@@ -35,12 +36,12 @@ fn empty_store_reports_zeros_not_an_error() {
 #[test]
 fn counts_group_by_category_and_source() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "a", "fact", "manual");
-    add(&conn, "b", "fact", "manual");
-    add(&conn, "c", "decision", "chat_import");
+    let store = db.store();
+    add(&store, "a", "fact", "manual");
+    add(&store, "b", "fact", "manual");
+    add(&store, "c", "decision", "chat_import");
 
-    let s = stats::collect(&conn).unwrap();
+    let s = stats::collect(&store).unwrap();
     assert_eq!(s.total_memories, 3);
     assert_eq!(s.categories.get("fact"), Some(&2));
     assert_eq!(s.categories.get("decision"), Some(&1));
@@ -51,13 +52,13 @@ fn counts_group_by_category_and_source() {
 #[test]
 fn deleted_memories_leave_every_count() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let doomed = add(&conn, "going away", "fact", "manual");
-    add(&conn, "staying", "fact", "manual");
+    let store = db.store();
+    let doomed = add(&store, "going away", "fact", "manual");
+    add(&store, "staying", "fact", "manual");
 
-    queries::delete_memory(&conn, &doomed).unwrap();
+    queries::delete_memory(&store, &doomed).unwrap();
 
-    let s = stats::collect(&conn).unwrap();
+    let s = stats::collect(&store).unwrap();
     assert_eq!(s.total_memories, 1);
     assert_eq!(s.categories.get("fact"), Some(&1));
     assert_eq!(s.recent.len(), 1);
@@ -66,12 +67,12 @@ fn deleted_memories_leave_every_count() {
 #[test]
 fn recent_is_capped_at_five_newest_first() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     for i in 0..8 {
-        add(&conn, &format!("memory {}", i), "general", "manual");
+        add(&store, &format!("memory {}", i), "general", "manual");
     }
 
-    let s = stats::collect(&conn).unwrap();
+    let s = stats::collect(&store).unwrap();
     assert_eq!(s.total_memories, 8);
     assert_eq!(s.recent.len(), 5, "reference caps recent at 5");
 }
@@ -79,37 +80,34 @@ fn recent_is_capped_at_five_newest_first() {
 #[test]
 fn recent_preview_is_truncated_to_eighty_characters() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let long = "x".repeat(200);
-    add(&conn, &long, "general", "manual");
+    add(&store, &long, "general", "manual");
 
-    let s = stats::collect(&conn).unwrap();
+    let s = stats::collect(&store).unwrap();
     assert_eq!(s.recent[0].preview.chars().count(), 80);
 }
 
 #[test]
 fn short_content_is_not_padded_or_truncated() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "brief", "general", "manual");
+    let store = db.store();
+    add(&store, "brief", "general", "manual");
 
-    let s = stats::collect(&conn).unwrap();
+    let s = stats::collect(&store).unwrap();
     assert_eq!(s.recent[0].preview, "brief");
 }
 
 #[test]
 fn import_ledger_is_counted_separately_from_memories() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "a memory", "general", "manual");
-    conn.execute(
-        "INSERT INTO chat_imports (import_id, filename, hash, imported_at)
-         VALUES ('imp_1', 'chat.json', 'abc', '2026-01-01T00:00:00Z')",
-        [],
-    )
-    .unwrap();
+    let store = db.store();
+    add(&store, "a memory", "general", "manual");
+    ImportLedger::new(&store)
+        .record_chat("imp_1", "chat.json", "abc", "2026-01-01T00:00:00Z", "{}")
+        .unwrap();
 
-    let s = stats::collect(&conn).unwrap();
+    let s = stats::collect(&store).unwrap();
     assert_eq!(s.total_memories, 1);
     assert_eq!(s.total_imports, 1);
 }
@@ -117,7 +115,7 @@ fn import_ledger_is_counted_separately_from_memories() {
 #[test]
 fn db_size_is_reported_for_an_in_memory_database() {
     let db = Database::open_in_memory().unwrap();
-    let s = stats::collect(&db.conn()).unwrap();
+    let s = stats::collect(&db.store()).unwrap();
 
     // Page accounting works without a file on disk, where a filesystem stat
     // would have to report 0.
@@ -138,7 +136,7 @@ fn db_path_is_reported_for_a_file_backed_database() {
 
     {
         let db = Database::open(&path).unwrap();
-        let s = stats::collect(&db.conn()).unwrap();
+        let s = stats::collect(&db.store()).unwrap();
         assert!(
             s.db_path.ends_with("stats_test.db"),
             "expected a real path, got {:?}",
@@ -152,10 +150,10 @@ fn db_path_is_reported_for_a_file_backed_database() {
 #[test]
 fn stats_serialize_with_the_reference_field_names() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "a", "fact", "manual");
+    let store = db.store();
+    add(&store, "a", "fact", "manual");
 
-    let value = serde_json::to_value(stats::collect(&conn).unwrap()).unwrap();
+    let value = serde_json::to_value(stats::collect(&store).unwrap()).unwrap();
     for field in [
         "total_memories",
         "total_imports",

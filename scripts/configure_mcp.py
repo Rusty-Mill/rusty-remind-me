@@ -85,7 +85,10 @@ def update_mcp_config(config_path: Path, exe_path: str, db_path: str, target_nam
 def main():
     home = Path.home()
     appdata = Path(os.environ.get("APPDATA", home / "AppData" / "Roaming")) if os.name == "nt" else home / ".config"
-    db_path = str(home / ".remind_me" / "remind_me.db")
+    # The binary's own default (remind_me_core::db::resolve_db_path). This
+    # used to say ~/.remind_me/remind_me.db, which pointed every configured
+    # client at an empty database beside the real one.
+    db_path = str(home / ".remind-me" / "memory.db")
 
     exe_path = find_executable()
     print(f"Using executable: {exe_path}")

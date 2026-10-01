@@ -9,9 +9,13 @@ repository = "https://github.com/Rusty-Mill/rusty_mill"
 layer = "apps"
 
 [dependencies]
+rusty_atomic_file = { workspace = true }
 
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+# `float_roundtrip`: the engine stores records as JSON, and the default
+# parser reads some floats back one bit off (0.9774999999999999 as 0.9775).
+# Decay leaves such values, which the copy onto the engine then refused.
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
 async-trait = "0.1"
 thiserror = "2.0"
 tokio = { version = "1.0", features = ["full"] }
@@ -20,10 +24,13 @@ tokio = { version = "1.0", features = ["full"] }
 # the rusty_mill workspace is on 0.39.
 rusqlite = { version = "0.39", features = ["bundled", "backup", "functions"] }
 chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1.0", features = ["v4"] }
+uuid = { version = "1.0", features = ["v4", "v5"] }
 sha256 = "1.5"
 dirs = "5.0"
 parking_lot = "0.12"
+# The engine the node's store moves to (ADR-0023). Optional until phase 5
+# makes it the default; see the `engine-store` feature.
+rusty_multimodal_db_engine = { workspace = true, optional = true }
 pdf-extract = { version = "0.12", optional = true }
 aws-sdk-s3 = { version = "1", optional = true }
 aws-config = { version = "1", optional = true }
@@ -51,8 +58,8 @@ symphonia = { version = "0.6", optional = true, default-features = false, featur
 ] }
 
 [dev-dependencies]
-# The real remind_me_hub binary's library, SQLite-only (no `postgres-store`:
-# tests need an in-memory store, not a Postgres connection) -- used by
+# The real remind_me_hub binary's library, without the copy tool's Postgres
+# reader (tests need no Postgres connection) -- used by
 # `tests/support`'s `MockHub` to run actual remind_me_hub request handling
 # against this crate's sync client, not just another copy of this crate's
 # own peer server (which `tests/support`'s `MockNode` already covers).
@@ -66,7 +73,12 @@ symphonia = { version = "0.6", optional = true, default-features = false, featur
 remind_me_hub = { path = "../remind_me_hub", default-features = false }
 
 [features]
-default = []
+default = ["engine-store"]
+# The engine-backed store (ADR-0023). On by default since phase 5.4b: the
+# node's store is the engine unless `REMIND_ME_STORE=sqlite`, and the first
+# open copies an existing SQLite store onto it. Built without it, a node
+# runs on SQLite as before.
+engine-store = ["dep:rusty_multimodal_db_engine"]
 # PDF text extraction. Optional so a build that does not want a PDF parser
 # does not carry one (71 transitive crates), matching the reference's own
 # lazily-imported `pdf` extra. Feature-off, `.pdf` import reports the format
@@ -120,6 +132,8 @@ stack-dumps = ["dep:rstack-self"]
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    # The daemon client's `stop_inheriting_std_handles` (daemon/client.rs).
+    "Win32_System_Console",
     "Win32_System_JobObjects",
 ] }
 

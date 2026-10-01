@@ -19,9 +19,9 @@ static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn import(bytes: &[u8], filename: &str, kind: ImportKind) -> ImportOutcome {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     remind_me_core::importer::import_bytes(
-        &conn,
+        &store,
         bytes,
         filename,
         "",

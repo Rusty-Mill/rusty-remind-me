@@ -5,11 +5,6 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-  # The schema-drift job compares this repo against another one, so it can go
-  # from green to red with nothing here changing. A daily run is what turns
-  # that from "discovered by hand, a day late" into a notification.
-  schedule:
-    - cron: "17 6 * * *"
   workflow_dispatch:
 
 concurrency:
@@ -40,32 +35,6 @@ env:
   CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
 jobs:
-  # Cheap and independent of the Rust toolchain, so it reports in seconds
-  # rather than behind a 15-minute build.
-  schema-drift:
-    name: schema version vs. remind_me
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      # `remind_me` is public, so this needs no token. It clones inside the
-      # script rather than using a second actions/checkout so the same command
-      # works locally, where there is no Actions context to borrow.
-      - name: Compare SCHEMA_VERSION against the reference
-        run: scripts/check_schema_drift.sh
-
-      # A passing check above only means the version *number* hasn't fallen
-      # behind -- it says nothing about whether schema_tables.sql,
-      # schema_indexes.sql and schema_triggers.sql (generated verbatim by
-      # regenerate_schema.py; their headers say "do not hand-edit") actually
-      # match what the generator produces. A hand-edit to one of those files
-      # that didn't match the generator's output passed CI silently as long
-      # as SCHEMA_VERSION itself was untouched (#277). This regenerates them
-      # into a scratch dir and diffs against what's committed, same
-      # clone-inside-the-script convention as the step above.
-      - name: Regenerate schema_*.sql and diff against committed files
-        run: scripts/check_schema_regen_drift.sh
-
   # Also cheap and toolchain-independent -- catches a version bump that
   # updated Cargo.toml but forgot .claude-plugin/plugin.json (or vice versa)
   # before it ever reaches the release workflow, which tags and packages
@@ -347,14 +316,14 @@ jobs:
       - name: cargo clippy -p remind_me_hub
         run: cargo clippy -p remind_me_hub --all-targets --locked -- -D warnings
 
-      # No DATABASE_URL: the Postgres tests skip themselves, which is the path
-      # a contributor without a database takes. Running it here proves that
-      # path stays green rather than only ever being claimed.
-      - name: cargo test -p remind_me_hub (sqlite only)
+      # No database URL: the Postgres copy tests skip themselves, which is the
+      # path a contributor without a database takes. Running it here proves
+      # that path stays green rather than only ever being claimed.
+      - name: cargo test -p remind_me_hub (no Postgres server)
         run: cargo test -p remind_me_hub --locked
 
-      # The run that matters: the legacy-schema migration and the
-      # both-backends-agree differential only execute with a real server.
+      # The copy tool's Postgres reader, legacy schema included, only runs
+      # against a real server.
       - name: cargo test -p remind_me_hub (with postgres)
         env:
           REMIND_ME_HUB_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/hubtest
@@ -364,9 +333,9 @@ jobs:
           REMIND_ME_HUB_REQUIRE_POSTGRES: "1"
         run: cargo test -p remind_me_hub --locked -- --test-threads=1
 
-      # The SQLite-only build must keep working: it is what a self-hosted hub
-      # that wants no Postgres driver actually compiles, and a `postgres::`
-      # reference leaking outside the feature gate would only show up here.
+      # The build without the copy tool's Postgres reader must keep working: a
+      # `postgres::` reference leaking outside the feature gate would only
+      # show up here.
       - name: cargo test -p remind_me_hub --no-default-features
         run: cargo test -p remind_me_hub --no-default-features --locked
 

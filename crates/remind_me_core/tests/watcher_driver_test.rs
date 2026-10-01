@@ -81,13 +81,14 @@ fn wait_for(what: &str, mut check: impl FnMut() -> bool) {
 }
 
 fn memory_count(path: &std::path::Path) -> usize {
-    let conn = rusqlite::Connection::open(path).unwrap();
-    conn.query_row(
-        "SELECT COUNT(*) FROM memories WHERE deleted_at IS NULL",
-        [],
-        |r| r.get::<_, i64>(0),
-    )
-    .unwrap_or(0) as usize
+    let store = rusqlite::Connection::open(path).unwrap();
+    store
+        .query_row(
+            "SELECT COUNT(*) FROM memories WHERE deleted_at IS NULL",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0) as usize
 }
 
 /// Start a watcher over `dir` against `db_path`, with a 1-second interval.
@@ -95,13 +96,13 @@ fn start(dir: &std::path::Path, db_path: &std::path::Path) -> Option<WatcherHand
     crate::test_env::set_var(WATCH_DIRS_ENV, dir.display().to_string());
     crate::test_env::set_var("REMIND_ME_WATCH_INTERVAL", "1");
     crate::test_env::set_var("REMIND_ME_WATCH_GRACE", "0");
-    let db = Database::open(db_path).unwrap();
-    // Bound rather than passed inline: `db.conn()` borrows `db`, and the
+    let db = Database::open_on_sqlite(db_path).unwrap();
+    // Bound rather than passed inline: `db.store()` borrows `db`, and the
     // handle does not, so the connection has to be dropped before `db` goes
     // out of scope at the end of this function.
-    let conn = db.conn();
-    let handle = start_watcher_for(&conn);
-    drop(conn);
+    let store = db.store();
+    let handle = start_watcher_for(&store);
+    drop(store);
     handle
 }
 
@@ -192,10 +193,10 @@ fn no_watch_dirs_means_no_loop() {
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_env();
     let db = TempDb::new("nodirs");
-    let database = Database::open(&db.0).unwrap();
+    let database = Database::open_on_sqlite(&db.0).unwrap();
 
     assert!(
-        start_watcher_for(&database.conn()).is_none(),
+        start_watcher_for(&database.store()).is_none(),
         "nothing configured, so nothing to run"
     );
     assert!(remind_me_core::watcher::live_status().is_none());
@@ -212,7 +213,7 @@ fn an_in_memory_database_does_not_start_a_loop() {
 
     let db = Database::open_in_memory().unwrap();
     assert!(
-        start_watcher_for(&db.conn()).is_none(),
+        start_watcher_for(&db.store()).is_none(),
         "an in-memory database has no path for the loop's own connection"
     );
 

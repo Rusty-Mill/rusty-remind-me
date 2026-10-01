@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::record;
+use crate::record::TOMBSTONE_CONTENT;
 use serde_json::json;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -101,35 +102,81 @@ fn every_table_survives_a_reopen_and_hub_seq_carries_on_above_it() {
     assert_eq!(seqs(&store).last(), Some(&("m3".to_string(), 3)));
 }
 
+/// Every memory row, sorted by id.
+fn rows(store: &MultimodalHubStore) -> Vec<MemoryRow> {
+    let mut rows = all_rows::<_, MemoryRow>(&store.read().memories);
+    rows.sort_by(|a, b| a.id.cmp(&b.id));
+    rows
+}
+
+/// Store a tombstone with its text, as a copy of an older hub leaves one,
+/// bypassing the emptying a push does.
+fn store_unemptied_tombstone(store: &MultimodalHubStore, id: &str, deleted: &str) {
+    let Record::Memory(m) = tombstone(id, deleted, deleted) else {
+        unreachable!("tombstone() builds a memory")
+    };
+    let mut t = store.write().unwrap();
+    let row = MemoryRow::new(&m, Some("node-a"), t.next_seq).unwrap();
+    t.memories.insert(row).unwrap();
+    t.next_seq += 1;
+}
+
 #[test]
-fn compacting_away_the_highest_hub_seq_never_lets_it_be_issued_again() {
-    // A node whose cursor sits at the deleted row's hub_seq would skip a
-    // new row that reused it, for good.
-    let dir = TempDir::new("seq_floor");
+fn a_pushed_tombstone_is_stored_without_its_text() {
+    let dir = TempDir::new("emptied_on_apply");
+    let store = MultimodalHubStore::open(&dir.0).unwrap();
+    store
+        .apply_record(
+            &tombstone("m1", "2026-08-02T00:00:00Z", "2026-08-02T00:00:00Z"),
+            None,
+        )
+        .unwrap();
+    let row = &rows(&store)[0];
+    assert_eq!(row.content, TOMBSTONE_CONTENT);
+    assert_eq!(row.tags, "[]");
+    assert!(row.deleted_at.is_some(), "it is still a tombstone");
+    assert_eq!(row.hub_seq, 1);
+}
+
+#[test]
+fn compaction_empties_every_tombstone_in_place_and_deletes_nothing() {
+    let dir = TempDir::new("compaction_empties");
     {
         let store = MultimodalHubStore::open(&dir.0).unwrap();
         store
-            .apply_record(&memory("m1", "2026-08-02T00:00:00Z"), None)
+            .apply_record(&memory("live", "2026-08-01T00:00:00Z"), None)
             .unwrap();
-        store
-            .apply_record(
-                &tombstone("m2", "2026-08-02T00:00:00Z", "2026-08-02T00:00:00Z"),
-                None,
-            )
-            .unwrap();
+        store_unemptied_tombstone(&store, "old", "2026-08-02T00:00:00Z");
+        store_unemptied_tombstone(&store, "recent", "2026-09-10T00:00:00Z");
+        let before = rows(&store);
+
+        assert_eq!(store.compact_tombstones().unwrap(), 2, "whatever their age");
         assert_eq!(
-            store
-                .compact_tombstones("2026-09-01T00:00:00+00:00")
-                .unwrap(),
-            1
+            store.compact_tombstones().unwrap(),
+            0,
+            "an emptied tombstone is not counted again"
         );
+
+        let after = rows(&store);
+        assert_eq!(after.len(), 3, "no row is deleted");
+        let old = &after[1];
+        assert_eq!(old.id, "old");
+        assert_eq!(old.content, TOMBSTONE_CONTENT);
+        assert_eq!(old.hub_seq, before[1].hub_seq, "hub_seq stays");
+        assert_eq!(old.updated_at, before[1].updated_at, "updated_at stays");
+        assert_eq!(
+            after[2].content, TOMBSTONE_CONTENT,
+            "a recent tombstone is emptied too"
+        );
+        assert_eq!(after[0], before[0], "a live memory is untouched");
     }
+    // The emptied row survives a reopen, and the next write numbers on.
     let store = MultimodalHubStore::open(&dir.0).unwrap();
-    assert_eq!(seqs(&store), vec![("m1".into(), 1)]);
+    assert_eq!(rows(&store)[1].content, TOMBSTONE_CONTENT);
     store
-        .apply_record(&memory("m3", "2026-08-03T00:00:00Z"), None)
+        .apply_record(&memory("next", "2026-08-03T00:00:00Z"), None)
         .unwrap();
-    assert_eq!(seqs(&store).last(), Some(&("m3".to_string(), 3)));
+    assert_eq!(seqs(&store).last(), Some(&("next".to_string(), 4)));
 }
 
 #[test]
@@ -166,6 +213,25 @@ fn a_panic_under_the_lock_does_not_take_later_requests_down() {
         .apply_record(&memory("m1", "2026-08-02T00:00:00Z"), None)
         .unwrap());
     assert_eq!(store.stats().unwrap().total, 1);
+}
+
+#[test]
+fn a_panic_inside_a_group_commit_does_not_leave_later_writes_unsynced() {
+    let dir = TempDir::new("panic_in_batch");
+    let store = MultimodalHubStore::open(&dir.0).unwrap();
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut t = store.write().unwrap();
+        t.defer_sync();
+        apply_one(&mut t, &memory("m1", "2026-08-02T00:00:00Z"), None).unwrap();
+        panic!("a request panics before its commit");
+    }));
+    assert!(panicked.is_err());
+
+    let t = store.write().unwrap();
+    assert!(
+        !t.memories.inner().inner().is_sync_deferred(),
+        "the next writer starts with each write synced"
+    );
 }
 
 #[test]
@@ -258,4 +324,77 @@ fn a_malformed_cursor_timestamp_is_an_error_not_an_empty_page() {
         })
         .unwrap_err();
     assert!(err.0.contains("yesterday"), "{}", err.0);
+}
+
+#[test]
+fn a_batch_over_several_chunks_keeps_each_record_isolated_and_in_order() {
+    let dir = TempDir::new("batch");
+    let long = "x".repeat(ID_CAP + 1);
+    let mut batch: Vec<Record> = (0..GROUP_COMMIT * 2 + 5)
+        .map(|n| memory(&format!("m{n:03}"), "2026-08-02T00:00:00Z"))
+        .collect();
+    // A refused id in the first chunk, an LWW loss against a record earlier
+    // in the same chunk, and one straddling into the next chunk.
+    batch[3] = memory(&long, "2026-08-02T00:00:00Z");
+    batch[10] = memory("m005", "2026-08-01T00:00:00Z");
+    batch[GROUP_COMMIT] = memory("m001", "2026-08-03T00:00:00Z");
+    let expected_ids: Vec<String> = {
+        let mut ids: Vec<String> = (0..batch.len())
+            .filter(|n| ![3, 10, GROUP_COMMIT].contains(n))
+            .map(|n| format!("m{n:03}"))
+            .collect();
+        // m001 won LWW in the second chunk, so it moved to the next hub_seq.
+        ids.retain(|id| id != "m001");
+        ids.insert(GROUP_COMMIT - 3, "m001".to_string());
+        ids
+    };
+    {
+        let store = MultimodalHubStore::open(&dir.0).unwrap();
+        let results = store.apply_records(&batch, Some("n1"));
+        assert_eq!(results.len(), batch.len());
+        for (n, result) in results.iter().enumerate() {
+            match n {
+                3 => assert!(result.is_err(), "record {n}: {result:?}"),
+                10 => assert_eq!(result, &Ok(false), "record {n}"),
+                _ => assert_eq!(result, &Ok(true), "record {n}"),
+            }
+        }
+    }
+    let store = MultimodalHubStore::open(&dir.0).unwrap();
+    let after = seqs(&store);
+    let ids: Vec<String> = after.iter().map(|(id, _)| id.clone()).collect();
+    assert_eq!(
+        ids, expected_ids,
+        "the reopened hub holds the batch, in hub_seq order"
+    );
+    let issued: Vec<i64> = after.iter().map(|(_, seq)| *seq).collect();
+    assert!(issued.windows(2).all(|w| w[0] < w[1]), "{issued:?}");
+    assert_eq!(
+        issued.last().copied(),
+        Some(i64::try_from(batch.len() - 2).unwrap()),
+        "one hub_seq per applied memory write, none for the refused id or the LWW loss"
+    );
+}
+
+#[test]
+fn after_a_failed_sync_every_write_is_refused_and_ping_fails() {
+    let dir = TempDir::new("sync_failure");
+    let store = MultimodalHubStore::open(&dir.0).unwrap();
+    store
+        .apply_record(&memory("m1", "2026-08-02T00:00:00Z"), None)
+        .unwrap();
+    // No portable way to make `fsync` fail, so set what a failed commit
+    // leaves behind.
+    store.tables.write().unwrap().sync_failure = Some(StoreError("disk gone".into()));
+
+    assert_eq!(store.ping(), Err(StoreError("disk gone".into())));
+    let batch = [memory("m2", "2026-08-02T00:00:00Z"), link("m1", "e1")];
+    assert_eq!(
+        store.apply_records(&batch, None),
+        vec![Err(StoreError("disk gone".into())); 2]
+    );
+    assert!(store.compact().is_err());
+    assert!(store.compact_tombstones().is_err());
+    // Reads carry on.
+    assert_eq!(seqs(&store), vec![("m1".into(), 1)]);
 }

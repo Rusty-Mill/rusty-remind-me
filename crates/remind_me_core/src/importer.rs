@@ -21,6 +21,11 @@
 //! is checked **before** the file's text is read or parsed, so a re-import
 //! short-circuits without doing the work.
 
+use crate::db::entities::Entities;
+use crate::db::imports::ImportLedger;
+use crate::db::memories::{Memories, NewMemory};
+use crate::db::Result;
+use crate::db::Store;
 use crate::entity::{upsert_entity, upsert_entity_relation};
 use crate::import_paths::{
     suffix_of, validate_import_dir, validate_import_file, AUDIO_SUFFIXES, DOCUMENT_SUFFIXES,
@@ -31,7 +36,6 @@ use crate::models::{
     ImportStats, IMPORT_MAX_LENGTH_MAX, IMPORT_MAX_LENGTH_MIN,
 };
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension, Result};
 use serde::{Deserialize, Serialize};
 
 /// `source` assigned to memories from a chat export.
@@ -630,7 +634,7 @@ fn extract_graph_records(raw: &str, suffix: &str) -> Vec<serde_json::Value> {
 /// forced — a restore that quietly invented endpoints would be worse than one
 /// that reports what it could not do.
 pub fn restore_graph_records(
-    conn: &Connection,
+    store: &Store<'_>,
     records: &[serde_json::Value],
 ) -> Result<ImportStats> {
     let mut stats = ImportStats::default();
@@ -657,7 +661,7 @@ pub fn restore_graph_records(
             _ => Vec::new(),
         };
         upsert_entity(
-            conn,
+            store,
             &EntityInput {
                 name: name.to_string(),
                 kind: record
@@ -671,16 +675,8 @@ pub fn restore_graph_records(
         stats.entities_restored += 1;
     }
 
-    let exists = |table: &str, column: &str, id: &str| -> Result<bool> {
-        let found: Option<i64> = conn
-            .query_row(
-                &format!("SELECT 1 FROM {} WHERE {} = ?", table, column),
-                params![id],
-                |r| r.get(0),
-            )
-            .optional()?;
-        Ok(found.is_some())
-    };
+    let memories = Memories::new(store);
+    let entities = Entities::new(store);
 
     for record in records {
         match record.get("record_type").and_then(|v| v.as_str()) {
@@ -691,11 +687,11 @@ pub fn restore_graph_records(
                 ) else {
                     continue;
                 };
-                if !exists("memories", "id", memory_id)? || !exists("entities", "id", entity_id)? {
+                if !memories.exists(memory_id)? || !entities.exists(entity_id)? {
                     stats.links_skipped_dangling += 1;
                     continue;
                 }
-                if crate::entity::link_memory_entity(conn, memory_id, entity_id)? {
+                if crate::entity::link_memory_entity(store, memory_id, entity_id)? {
                     stats.links_restored += 1;
                 }
             }
@@ -707,11 +703,11 @@ pub fn restore_graph_records(
                 ) else {
                     continue;
                 };
-                if !exists("entities", "id", subject)? || !exists("entities", "id", object)? {
+                if !entities.exists(subject)? || !entities.exists(object)? {
                     stats.relations_skipped_dangling += 1;
                     continue;
                 }
-                if upsert_entity_relation(conn, subject, relation, object)? {
+                if upsert_entity_relation(store, subject, relation, object)? {
                     stats.relations_restored += 1;
                 }
             }
@@ -728,7 +724,7 @@ pub fn restore_graph_records(
 /// `hash` computed, and the destination validated by the caller.
 #[allow(clippy::too_many_arguments)]
 pub fn import_content(
-    conn: &Connection,
+    store: &Store<'_>,
     raw: &str,
     // The file's original bytes. A text connector reads `raw`; a binary one
     // (PDF) must have these, because `raw` is a lossy UTF-8 decode that has
@@ -745,7 +741,7 @@ pub fn import_content(
 ) -> Result<ImportOutcome> {
     // Another caller may have imported the same content since the caller's
     // early check.
-    if let Some(import_id) = existing_import(conn, hash)? {
+    if let Some(import_id) = existing_import(store, hash)? {
         return Ok(ImportOutcome::Skipped {
             reason: "already_imported".to_string(),
             file: filename.to_string(),
@@ -1012,13 +1008,12 @@ pub fn import_content(
 
     let now = Utc::now().to_rfc3339();
     let import_id = format!("imp_{}", uuid::Uuid::new_v4().simple());
-    let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string());
 
     // Raw-transcript retention (#212). A no-op unless REMIND_ME_ARCHIVE_DIR is
     // set. A failure here is swallowed on purpose: the memories below are the
     // import, and an unwritable archive directory must not turn a working
     // import into a failing one.
-    let archived = crate::archive::store(conn, &import_id, filename, hash, raw_bytes)
+    let archived = crate::archive::store(store, &import_id, filename, hash, raw_bytes)
         .unwrap_or(None)
         .is_some();
 
@@ -1062,14 +1057,11 @@ pub fn import_content(
         // a correction. Deduplicated case-insensitively so `#Project` from the
         // note and `project` from the caller do not both land.
         let chunk_extras = extras.get(chunk_index);
-        let chunk_tags_json = match chunk_extras {
-            Some(e) if !e.extra_tags.is_empty() => {
-                let merged = crate::obsidian_import::dedupe_ci(
-                    tags.iter().cloned().chain(e.extra_tags.iter().cloned()),
-                );
-                serde_json::to_string(&merged).unwrap_or_else(|_| tags_json.clone())
-            }
-            _ => tags_json.clone(),
+        let chunk_tags = match chunk_extras {
+            Some(e) if !e.extra_tags.is_empty() => crate::obsidian_import::dedupe_ci(
+                tags.iter().cloned().chain(e.extra_tags.iter().cloned()),
+            ),
+            _ => tags.to_vec(),
         };
 
         let memory_id = format!("mem_{}", uuid::Uuid::new_v4().simple());
@@ -1077,33 +1069,24 @@ pub fn import_content(
         // `doc_id`/`chunk_index` group every chunk of this file in source
         // order, which is what lets neighbour expansion find a hit's siblings
         // without re-parsing anything.
-        conn.execute(
-            "INSERT OR IGNORE INTO memories
-                (id, content, category, tags, source, metadata, created_at, updated_at,
-                 doc_id, chunk_index, node_id, client)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            params![
-                memory_id,
-                content,
-                category,
-                chunk_tags_json,
-                source,
-                metadata.to_string(),
-                now,
-                now,
-                import_id,
-                chunk_index as i64,
-                node_id,
-                client,
-            ],
-        )?;
+        Memories::new(store).insert_or_ignore(&NewMemory {
+            category: category.to_string(),
+            tags: chunk_tags,
+            source: source.to_string(),
+            metadata,
+            doc_id: Some(import_id.clone()),
+            chunk_index: Some(chunk_index as i64),
+            node_id: Some(node_id.clone()),
+            client: client.clone(),
+            ..NewMemory::new(memory_id.clone(), content.clone(), &now)
+        })?;
         created += 1;
 
         // Point this memory back at the bytes it came from, so a caller can
         // recover the tool_use/thinking blocks `text_of` dropped.
         if spans_addressable {
             if let Some(Some((start, end))) = spans.get(chunk_index) {
-                crate::archive::record_span(conn, &memory_id, &import_id, *start, *end)?;
+                crate::archive::record_span(store, &memory_id, &import_id, *start, *end)?;
             }
         }
 
@@ -1115,14 +1098,14 @@ pub fn import_content(
         if let Some(mentions) = chunk_extras.map(|e| &e.mention_entities) {
             for title in mentions {
                 let entity = upsert_entity(
-                    conn,
+                    store,
                     &EntityInput {
                         name: title.clone(),
                         kind: None,
                         aliases: Vec::new(),
                     },
                 )?;
-                crate::entity::link_memory_entity(conn, &memory_id, &entity.id)?;
+                crate::entity::link_memory_entity(store, &memory_id, &entity.id)?;
             }
         }
     }
@@ -1130,21 +1113,17 @@ pub fn import_content(
     let mut stats = if graph_records.is_empty() {
         ImportStats::default()
     } else {
-        restore_graph_records(conn, &graph_records)?
+        restore_graph_records(store, &graph_records)?
     };
     stats.memories_created = created;
     stats.raw_entries = raw_entries;
 
-    conn.execute(
-        "INSERT INTO chat_imports (import_id, filename, hash, imported_at, stats)
-         VALUES (?, ?, ?, ?, ?)",
-        params![
-            import_id,
-            filename,
-            hash,
-            now,
-            serde_json::to_string(&stats).unwrap_or_else(|_| "{}".to_string())
-        ],
+    ImportLedger::new(store).record_chat(
+        &import_id,
+        filename,
+        hash,
+        &now,
+        &serde_json::to_string(&stats).unwrap_or_else(|_| "{}".to_string()),
     )?;
 
     Ok(ImportOutcome::Imported {
@@ -1155,13 +1134,8 @@ pub fn import_content(
     })
 }
 
-fn existing_import(conn: &Connection, hash: &str) -> Result<Option<String>> {
-    conn.query_row(
-        "SELECT import_id FROM chat_imports WHERE hash = ?",
-        params![hash],
-        |r| r.get(0),
-    )
-    .optional()
+fn existing_import(store: &Store<'_>, hash: &str) -> Result<Option<String>> {
+    ImportLedger::new(store).chat_import_with_hash(hash)
 }
 
 /// Reject a kind/suffix pair the importer cannot honour.
@@ -1268,7 +1242,7 @@ pub fn validate_kind_and_suffix(
 /// content twice is a no-op.
 #[allow(clippy::too_many_arguments)]
 pub fn import_bytes(
-    conn: &Connection,
+    store: &Store<'_>,
     content: &[u8],
     filename: &str,
     category: &str,
@@ -1284,7 +1258,7 @@ pub fn import_bytes(
     }
 
     let hash = hash_bytes(content);
-    if let Some(import_id) = existing_import(conn, &hash)? {
+    if let Some(import_id) = existing_import(store, &hash)? {
         return Ok(ImportOutcome::Skipped {
             reason: "already_imported".to_string(),
             file: filename.to_string(),
@@ -1294,7 +1268,7 @@ pub fn import_bytes(
 
     let raw = String::from_utf8_lossy(content).to_string();
     import_content(
-        conn,
+        store,
         &raw,
         content,
         &suffix,
@@ -1315,7 +1289,7 @@ pub fn import_bytes(
 /// a lookup rather than a full parse.
 #[allow(clippy::too_many_arguments)]
 pub fn import_file(
-    conn: &Connection,
+    store: &Store<'_>,
     path: &std::path::Path,
     category: &str,
     tags: &[String],
@@ -1345,7 +1319,7 @@ pub fn import_file(
     };
     let hash = hash_bytes(&bytes);
 
-    if let Some(import_id) = existing_import(conn, &hash)? {
+    if let Some(import_id) = existing_import(store, &hash)? {
         return Ok(ImportOutcome::Skipped {
             reason: "already_imported".to_string(),
             file: filename,
@@ -1355,7 +1329,7 @@ pub fn import_file(
 
     let raw = String::from_utf8_lossy(&bytes).to_string();
     import_content(
-        conn,
+        store,
         &raw,
         &bytes,
         &suffix,
@@ -1373,7 +1347,7 @@ pub fn import_file(
 ///
 /// Validates the path against the import roots — containment before existence
 /// — then delegates to [`import_file`].
-pub fn import_chat(conn: &Connection, input: &ChatImportInput) -> Result<ImportOutcome> {
+pub fn import_chat(store: &Store<'_>, input: &ChatImportInput) -> Result<ImportOutcome> {
     let path = match validate_import_file(&input.file_path) {
         Ok(path) => path,
         Err(e) => {
@@ -1384,7 +1358,7 @@ pub fn import_chat(conn: &Connection, input: &ChatImportInput) -> Result<ImportO
         }
     };
     import_file(
-        conn,
+        store,
         &path,
         &input.category,
         &input.tags,
@@ -1402,7 +1376,7 @@ pub fn import_chat(conn: &Connection, input: &ChatImportInput) -> Result<ImportO
 /// unsupported extension is not an error — a notes folder holding a stray
 /// `.png` should import the markdown beside it rather than refusing the lot —
 /// so those are skipped silently and never counted as seen.
-pub fn import_directory(conn: &Connection, input: &BulkImportDirInput) -> Result<BulkImportResult> {
+pub fn import_directory(store: &Store<'_>, input: &BulkImportDirInput) -> Result<BulkImportResult> {
     let root = match validate_import_dir(&input.directory) {
         Ok(root) => root,
         Err(e) => {
@@ -1428,7 +1402,7 @@ pub fn import_directory(conn: &Connection, input: &BulkImportDirInput) -> Result
     for path in files {
         result.files_seen += 1;
         let outcome = import_file(
-            conn,
+            store,
             &path,
             &input.category,
             &input.tags,

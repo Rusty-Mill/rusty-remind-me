@@ -1,25 +1,32 @@
 //! Hub storage on the embedded `rusty_multimodal_db` engine (ADR-0021).
 //!
-//! The hub's third backend: no database server and no SQL. Four engine
+//! The hub's only store: no database server and no SQL. Four engine
 //! stores, one per table, live in one data directory, with every record
 //! in memory and each write logged and `fsync`'d before it returns. The
-//! wire behaviour is the SQLite store's, method for method; the route
-//! suite runs against both.
+//! wire behaviour is the retired SQLite store's, method for method: the
+//! tests hold it to that store's recorded answers (`tests/fixtures`).
 //!
-//! # Where it differs from the SQL stores
+//! # Where it differs from the SQL stores it replaced
 //!
 //! - **Ids are capped at 64 bytes and may not contain NUL** (ADR-0021,
 //!   decision 3). A longer id fails the record as a storage error, so it
 //!   counts as `failed` and stays in the sender's outbox.
 //! - **One lock, owned here** (decision 5). Every write holds it through
 //!   its `fsync`, and pulls wait on it; SQLite in WAL mode let reads run
-//!   alongside a write. A panic while it is held does not take the hub
-//!   down with it: the lock recovers, as the SQLite store's mutex does.
-//! - **`hub_seq` never goes backwards,** even across a compaction that
-//!   deletes the row holding the highest one. The counter lives in memory
-//!   and restarts from the highest `hub_seq` stored, so before deleting any
-//!   memory, [`HubStore::compact_tombstones`] records the counter in a
-//!   floor file the next open starts above.
+//!   alongside a write. A push is applied in chunks of [`GROUP_COMMIT`]
+//!   records, each under one hold of the lock and one sync per table, so a
+//!   pull waits for at most one chunk. A panic while it is held does not
+//!   take the hub down with it: the lock recovers.
+//! - **A failed sync stops every later write** until the hub restarts. The
+//!   chunk it covered is applied in memory but may not be on disk, so
+//!   carrying on could acknowledge writes built on ones a crash loses.
+//!   [`HubStore::ping`] then fails, so `/health` reports it.
+//! - **`hub_seq` never goes backwards.** The counter lives in memory and
+//!   restarts from the highest `hub_seq` stored, or from the floor file a
+//!   copy writes, whichever is higher. Nothing deletes a memory row:
+//!   [`HubStore::compact_tombstones`] empties tombstones in place
+//!   (ADR-0024). A hub that purged tombstones before then keeps its floor
+//!   file.
 //! - **The insert logs grow until compaction.** [`MultimodalHubStore::compact`]
 //!   folds them; the binary runs it on a schedule, and the tombstone
 //!   compaction route runs it too.
@@ -29,6 +36,7 @@
 
 mod keys;
 mod rows;
+pub mod snapshot;
 
 use super::{
     stable_group_order, Counts, GraphPullQuery, HubStore, MemoryCounts, PullCursor, PullQuery,
@@ -38,12 +46,13 @@ use crate::canon::now_canonical;
 use crate::record::{EntityRecord, LinkRecord, MemoryRecord, Record};
 use keys::{IdKey, LinkKey, MAX_ID_KEY};
 use rows::{ByEngineId, EntityRow, Keyset, LinkRow, MemoryRow, Micros, RelationRow, Seq};
+use rusty_multimodal_db_engine::dir_lock::{DirLock, DirLockError};
 use rusty_multimodal_db_engine::durability::{sync_parent_dir, DurabilityError};
 use rusty_multimodal_db_engine::generic::mmap_field::MmapFieldValue;
 use rusty_multimodal_db_engine::generic::query::{
-    AllIds, Compact, Delete, GetById, Insert, PageBy, RangeBy, Replace,
+    AllIds, Compact, GetById, Insert, PageBy, RangeBy, Replace,
 };
-use rusty_multimodal_db_engine::generic::store::Ordered;
+use rusty_multimodal_db_engine::generic::store::{GroupCommit, Ordered};
 use rusty_multimodal_db_engine::generic::traits::{
     IndexedField, OrderedField, ScannableField, SchemaTag,
 };
@@ -51,12 +60,12 @@ use rusty_multimodal_db_engine::generic::GenericMmapStore;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Write;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use uuid::Uuid;
 
 pub use keys::ID_CAP;
@@ -78,6 +87,11 @@ const LOCK_FILE: &str = "hub.lock";
 /// The file holding the highest `hub_seq` ever issued before a deletion.
 const SEQ_FLOOR_FILE: &str = "hub_seq.floor";
 
+/// Records applied per group commit. Large enough that a push's syncs stop
+/// dominating it, small enough that a pull waiting on the lock is not held
+/// up for a whole 1000-record push (`examples/pull_latency.rs`).
+pub const GROUP_COMMIT: usize = 64;
+
 /// Everything behind the lock.
 struct Tables {
     memories: MemoryTable,
@@ -89,16 +103,55 @@ struct Tables {
     /// Writes since the last compaction, so a scheduled compaction with
     /// nothing to fold is free.
     writes_since_compact: u64,
+    /// Why a group commit's sync failed, once one has: every later write
+    /// is refused with it (see the module docs).
+    sync_failure: Option<StoreError>,
+}
+
+impl Tables {
+    fn defer_sync(&mut self) {
+        self.memories.defer_sync();
+        self.entities.defer_sync();
+        self.links.defer_sync();
+        self.relations.defer_sync();
+    }
+
+    /// Sync all four tables, each tried even if an earlier one failed, so
+    /// none is left deferring its syncs.
+    fn commit(&mut self) -> Result<(), DurabilityError> {
+        let results = [
+            self.memories.commit(),
+            self.entities.commit(),
+            self.links.commit(),
+            self.relations.commit(),
+        ];
+        results.into_iter().collect()
+    }
+
+    /// Record a failed sync, which refuses every later write, and return
+    /// the error each write gets.
+    fn sync_failed(&mut self, e: DurabilityError) -> StoreError {
+        let failure = StoreError(format!(
+            "could not sync the engine store, so it refuses writes until the hub restarts: {e}"
+        ));
+        self.sync_failure = Some(failure.clone());
+        failure
+    }
 }
 
 /// A hub store in one data directory.
 pub struct MultimodalHubStore {
-    dir: PathBuf,
     tables: RwLock<Tables>,
+    /// Writers queue here before asking for the write lock, so at most one
+    /// writer ever waits on `tables`. `std`'s `RwLock` lets a waiting writer
+    /// go ahead of waiting readers; with several pushes queued on it, a
+    /// pull would wait for every one of them, and under steady pushes it
+    /// never got in (a pull p50 of 10 s in `examples/pull_latency.rs`).
+    writers: Mutex<()>,
     /// Held for the store's lifetime: its OS lock is what keeps a second
     /// hub off the same directory (ADR-0021, Consequences: there is no
     /// separate server to take `rusty_multimodal_db`'s ADR-0092 lock).
-    _dir_lock: File,
+    _dir_lock: DirLock,
 }
 
 fn engine_err(e: impl std::fmt::Display) -> StoreError {
@@ -139,14 +192,58 @@ impl MultimodalHubStore {
         std::fs::create_dir_all(dir).map_err(|e| io_err("could not create", dir, e))?;
         let dir_lock = take_dir_lock(dir)?;
 
-        let open = |name: &str| dir.join(format!("{name}.mmap"));
-        let memories = Ordered::new(Ordered::new(
-            open_core(&open("memories")).map_err(engine_err)?,
-        ));
-        let entities = Ordered::new(open_core(&open("entities")).map_err(engine_err)?);
-        let links = Ordered::new(open_core(&open("memory_entities")).map_err(engine_err)?);
-        let relations = Ordered::new(open_core(&open("entity_relations")).map_err(engine_err)?);
+        let path = |name: &str| table_path(dir, name);
+        let memories = open_core(&path(MEMORIES)).map_err(engine_err)?;
+        let entities = open_core(&path(ENTITIES)).map_err(engine_err)?;
+        let links = open_core(&path(LINKS)).map_err(engine_err)?;
+        let relations = open_core(&path(RELATIONS)).map_err(engine_err)?;
+        Self::assemble(dir, dir_lock, memories, entities, links, relations)
+    }
 
+    /// Create a hub in `dir` holding `snapshot`, every row written in one
+    /// pass with its `hub_seq` and `origin_node` kept exactly (ADR-0021,
+    /// decision 7). The next `hub_seq` issued is above both the highest
+    /// copied and the source's own high-water mark.
+    ///
+    /// `dir` must not exist or must be empty: this is how a hub moves onto
+    /// the engine, never a merge into one.
+    ///
+    /// # Errors
+    ///
+    /// Fails if `dir` holds anything, if the snapshot has a row
+    /// [`snapshot::Snapshot::validate`] rejects (the copy tool drops those
+    /// first, or refuses), or on any I/O error.
+    pub fn create_from_snapshot(dir: &Path, snapshot: &snapshot::Snapshot) -> StoreResult<Self> {
+        if let Some(rejected) = snapshot.validate().first() {
+            return Err(StoreError(format!(
+                "the snapshot holds a row the engine cannot store: {rejected}"
+            )));
+        }
+        ensure_empty_dir(dir)?;
+        std::fs::create_dir_all(dir).map_err(|e| io_err("could not create", dir, e))?;
+        let dir_lock = take_dir_lock(dir)?;
+        write_seq_floor(dir, snapshot.seq_floor())?;
+
+        let rows = snapshot.rows()?;
+        let path = |name: &str| table_path(dir, name);
+        let memories = Core::create(rows.memories, &path(MEMORIES)).map_err(engine_err)?;
+        let entities = Core::create(rows.entities, &path(ENTITIES)).map_err(engine_err)?;
+        let links = Core::create(rows.links, &path(LINKS)).map_err(engine_err)?;
+        let relations = Core::create(rows.relations, &path(RELATIONS)).map_err(engine_err)?;
+        Self::assemble(dir, dir_lock, memories, entities, links, relations)
+    }
+
+    /// Wrap the four open engine stores in their sort orders and start the
+    /// `hub_seq` counter above everything issued so far.
+    fn assemble(
+        dir: &Path,
+        dir_lock: DirLock,
+        memories: Core<MemoryRow, Seq>,
+        entities: Core<EntityRow, Micros>,
+        links: Core<LinkRow, Micros>,
+        relations: Core<RelationRow, Micros>,
+    ) -> StoreResult<Self> {
+        let memories: MemoryTable = Ordered::new(Ordered::new(memories));
         let stored_max = PageBy::<MemoryRow, Seq>::page_by_desc(&memories, None, 1)
             .first()
             .and_then(|id| memories.get(*id))
@@ -154,15 +251,16 @@ impl MultimodalHubStore {
         let next_seq = stored_max.max(read_seq_floor(dir)?) + 1;
 
         Ok(Self {
-            dir: dir.to_path_buf(),
             tables: RwLock::new(Tables {
                 memories,
-                entities,
-                links,
-                relations,
+                entities: Ordered::new(entities),
+                links: Ordered::new(links),
+                relations: Ordered::new(relations),
                 next_seq,
                 writes_since_compact: 0,
+                sync_failure: None,
             }),
+            writers: Mutex::new(()),
             _dir_lock: dir_lock,
         })
     }
@@ -174,7 +272,7 @@ impl MultimodalHubStore {
     /// it. Safe to interrupt: the engine's compaction is crash-safe step by
     /// step.
     pub fn compact(&self) -> StoreResult<bool> {
-        let mut tables = self.write();
+        let mut tables = self.write()?;
         compact_tables(&mut tables)
     }
 
@@ -184,28 +282,113 @@ impl MultimodalHubStore {
 
     /// The write lock, recovered after a panic (ADR-0021, decision 5): one
     /// panicking request must not make every later request panic too.
-    fn write(&self) -> RwLockWriteGuard<'_, Tables> {
-        self.tables.write().unwrap_or_else(PoisonError::into_inner)
+    ///
+    /// Taken behind the writer queue: see [`Self::writers`]. Refused after
+    /// a failed sync (see the module docs).
+    fn write(&self) -> StoreResult<WriteGuard<'_>> {
+        let queued = self.writers.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut guard = WriteGuard {
+            tables: self.tables.write().unwrap_or_else(PoisonError::into_inner),
+            _queued: queued,
+        };
+        if let Some(failure) = &guard.sync_failure {
+            return Err(failure.clone());
+        }
+        // A writer that panicked inside a group commit left it open. Close
+        // it, syncing what that writer wrote, so every writer starts with
+        // each write synced. With nothing pending this syncs nothing.
+        if let Err(e) = guard.commit() {
+            return Err(guard.sync_failed(e));
+        }
+        Ok(guard)
+    }
+
+    /// Apply `chunk` under one hold of the write lock and one sync per
+    /// table.
+    fn apply_chunk(&self, chunk: &[Record], origin: Option<&str>) -> Vec<StoreResult<bool>> {
+        let mut t = match self.write() {
+            Ok(t) => t,
+            Err(e) => return vec![Err(e); chunk.len()],
+        };
+        t.defer_sync();
+        let results = chunk
+            .iter()
+            .map(|record| apply_one(&mut t, record, origin))
+            .collect();
+        match t.commit() {
+            Ok(()) => results,
+            Err(e) => vec![Err(t.sync_failed(e)); chunk.len()],
+        }
+    }
+}
+
+/// The write lock and the writer-queue place it was taken behind. Fields
+/// drop in order, so the write lock goes first and a pull waiting on it
+/// gets in before the next writer can ask for it.
+struct WriteGuard<'a> {
+    tables: RwLockWriteGuard<'a, Tables>,
+    _queued: MutexGuard<'a, ()>,
+}
+
+impl std::ops::Deref for WriteGuard<'_> {
+    type Target = Tables;
+    fn deref(&self) -> &Tables {
+        &self.tables
+    }
+}
+
+impl std::ops::DerefMut for WriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Tables {
+        &mut self.tables
+    }
+}
+
+const MEMORIES: &str = "memories";
+const ENTITIES: &str = "entities";
+const LINKS: &str = "memory_entities";
+const RELATIONS: &str = "entity_relations";
+
+fn table_path(dir: &Path, table: &str) -> PathBuf {
+    dir.join(format!("{table}.mmap"))
+}
+
+impl MultimodalHubStore {
+    /// Refuse a copy target that already holds anything, before anything
+    /// is read: [`Self::create_from_snapshot`] refuses it too, but only
+    /// after the whole source has been read.
+    ///
+    /// # Errors
+    ///
+    /// Fails if `dir` holds anything or cannot be read.
+    pub fn check_copy_target(dir: &Path) -> StoreResult<()> {
+        ensure_empty_dir(dir)
+    }
+}
+
+/// Refuse a target directory that already holds anything.
+fn ensure_empty_dir(dir: &Path) -> StoreResult<()> {
+    match std::fs::read_dir(dir) {
+        Ok(mut entries) => match entries.next() {
+            None => Ok(()),
+            Some(_) => Err(StoreError(format!(
+                "{} is not empty; a hub is only ever copied into an empty directory",
+                dir.display()
+            ))),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(io_err("could not read", dir, e)),
     }
 }
 
 /// Take the data directory's OS lock without waiting.
-fn take_dir_lock(dir: &Path) -> StoreResult<File> {
-    let path = dir.join(LOCK_FILE);
-    let file = File::options()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&path)
-        .map_err(|e| io_err("could not open", &path, e))?;
-    file.try_lock().map_err(|e| match e {
-        std::fs::TryLockError::WouldBlock => StoreError(format!(
+fn take_dir_lock(dir: &Path) -> StoreResult<DirLock> {
+    DirLock::acquire(dir, LOCK_FILE).map_err(|e| match e {
+        DirLockError::Held(_) => StoreError(format!(
             "{} is in use by another hub process",
             dir.display()
         )),
-        std::fs::TryLockError::Error(e) => io_err("could not lock", &path, e),
-    })?;
-    Ok(file)
+        DirLockError::Io(path, e) => io_err("could not lock", &path, e),
+    })
 }
 
 fn read_seq_floor(dir: &Path) -> StoreResult<i64> {
@@ -346,16 +529,20 @@ fn count(n: usize) -> i64 {
 fn apply_memory(t: &mut Tables, m: &MemoryRecord, origin: Option<&str>) -> StoreResult<bool> {
     keys::check_id("memory id", &m.id)?;
     let mut row = MemoryRow::new(m, origin, t.next_seq)?;
+    // A tombstone is stored without its text (ADR-0024). LWW below compares
+    // `updated_at` only, so this changes no outcome.
+    row.empty_if_tombstone();
     match t.memories.get(row.engine_id) {
         None => t.memories.insert(row).map_err(engine_err)?,
         Some(local) => {
             keys::ensure_same_id(&local.id, &m.id)?;
-            // LWW, exactly the SQL upsert's `WHERE excluded.updated_at >
-            // memories.updated_at`: canonical timestamps compare as bytes.
+            // LWW, as the SQL stores' upsert did (`WHERE
+            // excluded.updated_at > memories.updated_at`): canonical
+            // timestamps compare as bytes.
             if m.updated_at <= local.updated_at {
                 return Ok(false);
             }
-            // The SQL upsert's SET list leaves `created_at` alone.
+            // A win keeps the first `created_at`, as the SQL upsert did.
             row.created_at = local.created_at;
             t.memories.replace(row).map_err(engine_err)?;
         }
@@ -364,9 +551,18 @@ fn apply_memory(t: &mut Tables, m: &MemoryRecord, origin: Option<&str>) -> Store
     Ok(true)
 }
 
-/// Entity upsert: LWW on `updated_at`, aliases always union-merged. The
-/// SQLite store's `apply_entity`, rule for rule; see it for why an
-/// LWW-losing enrichment bumps `updated_at`.
+/// Entity upsert: LWW on `updated_at`, aliases always union-merged.
+///
+/// The union merge happens regardless of which side wins, because union is
+/// commutative and idempotent, so every node converges on the same alias set
+/// without needing to agree on an order.
+///
+/// An LWW-losing enrichment (new aliases, or a `kind` where there was none)
+/// bumps `updated_at`. The peer protocol leaves `updated_at` alone, but the
+/// hub is pull-only: without a bump, nodes whose cursor has already passed
+/// this entity would never see the merged aliases. Bumping is safe because
+/// the merge is idempotent: a re-pulled merge that changes nothing does not
+/// bump again, so the cycle terminates.
 fn apply_entity(t: &mut Tables, e: &EntityRecord, origin: Option<&str>) -> StoreResult<bool> {
     keys::check_id("entity id", &e.id)?;
     let incoming = EntityRow::new(e, origin)?;
@@ -411,6 +607,34 @@ fn apply_entity(t: &mut Tables, e: &EntityRecord, origin: Option<&str>) -> Store
     Ok(true)
 }
 
+/// Apply one record, counting it towards the next compaction if it
+/// changed anything.
+fn apply_one(t: &mut Tables, record: &Record, origin: Option<&str>) -> StoreResult<bool> {
+    let applied = match record {
+        Record::Memory(m) => apply_memory(t, m, origin)?,
+        Record::Entity(e) => apply_entity(t, e, origin)?,
+        Record::Link(l) => apply_link(t, l)?,
+        Record::EntityRelation(r) => {
+            keys::check_id("entity_relation id", &r.id)?;
+            let row = RelationRow::new(r, origin)?;
+            match t.relations.get(row.engine_id) {
+                Some(local) => {
+                    keys::ensure_same_id(&local.id, &r.id)?;
+                    false
+                }
+                None => {
+                    t.relations.insert(row).map_err(engine_err)?;
+                    true
+                }
+            }
+        }
+    };
+    if applied {
+        t.writes_since_compact += 1;
+    }
+    Ok(applied)
+}
+
 fn apply_link(t: &mut Tables, l: &LinkRecord) -> StoreResult<bool> {
     keys::check_id("link memory_id", &l.memory_id)?;
     keys::check_id("link entity_id", &l.entity_id)?;
@@ -428,40 +652,28 @@ fn apply_link(t: &mut Tables, l: &LinkRecord) -> StoreResult<bool> {
 impl HubStore for MultimodalHubStore {
     /// Nothing to do: the store opens ready. A change to a record layout is
     /// a conversion under a new schema tag, not a migration (ADR-0021).
-    fn migrate(&self) -> StoreResult<()> {
-        Ok(())
-    }
-
-    /// The store is in-process, so it is reachable whenever the hub is.
+    /// The store is in-process, so it is reachable whenever the hub is,
+    /// unless a sync has failed (see the module docs).
     fn ping(&self) -> StoreResult<()> {
-        Ok(())
+        match &self.read().sync_failure {
+            Some(failure) => Err(failure.clone()),
+            None => Ok(()),
+        }
     }
 
     fn apply_record(&self, record: &Record, origin: Option<&str>) -> StoreResult<bool> {
-        let mut t = self.write();
-        let applied = match record {
-            Record::Memory(m) => apply_memory(&mut t, m, origin)?,
-            Record::Entity(e) => apply_entity(&mut t, e, origin)?,
-            Record::Link(l) => apply_link(&mut t, l)?,
-            Record::EntityRelation(r) => {
-                keys::check_id("entity_relation id", &r.id)?;
-                let row = RelationRow::new(r, origin)?;
-                match t.relations.get(row.engine_id) {
-                    Some(local) => {
-                        keys::ensure_same_id(&local.id, &r.id)?;
-                        false
-                    }
-                    None => {
-                        t.relations.insert(row).map_err(engine_err)?;
-                        true
-                    }
-                }
-            }
-        };
-        if applied {
-            t.writes_since_compact += 1;
-        }
-        Ok(applied)
+        self.apply_chunk(std::slice::from_ref(record), origin)
+            .pop()
+            .unwrap_or_else(|| Err(StoreError("a one-record chunk gave no result".into())))
+    }
+
+    /// In chunks of [`GROUP_COMMIT`], releasing the write lock between
+    /// them so pulls get in.
+    fn apply_records(&self, records: &[Record], origin: Option<&str>) -> Vec<StoreResult<bool>> {
+        records
+            .chunks(GROUP_COMMIT)
+            .flat_map(|chunk| self.apply_chunk(chunk, origin))
+            .collect()
     }
 
     fn stats(&self) -> StoreResult<Stats> {
@@ -542,7 +754,7 @@ impl HubStore for MultimodalHubStore {
                         past((since_us, MAX_ID_KEY)),
                         Bound::Unbounded,
                     );
-                    // No live/tombstone split, as on the SQL stores.
+                    // No live/tombstone split for a `since` count.
                     counts.memories = Some(MemoryCounts {
                         total: count(n),
                         live: None,
@@ -589,34 +801,22 @@ impl HubStore for MultimodalHubStore {
         ))
     }
 
-    fn compact_tombstones(&self, cutoff: &str) -> StoreResult<usize> {
-        let mut t = self.write();
-        let doomed: Vec<MemoryRow> = all_rows::<_, MemoryRow>(&t.memories)
+    fn compact_tombstones(&self) -> StoreResult<usize> {
+        let mut t = self.write()?;
+        let emptied: Vec<MemoryRow> = all_rows::<_, MemoryRow>(&t.memories)
             .into_iter()
-            .filter(|m| m.deleted_at.as_deref().is_some_and(|d| d < cutoff))
+            .filter_map(|mut m| m.empty_if_tombstone().then_some(m))
             .collect();
-        if !doomed.is_empty() {
-            // Before any delete: the row holding the highest `hub_seq` may be
-            // among these, and the next open must not issue it again.
-            write_seq_floor(&self.dir, t.next_seq - 1)?;
-            let doomed_ids: HashSet<&str> = doomed.iter().map(|m| m.id.as_str()).collect();
-            let orphaned: Vec<Uuid> = all_rows::<_, LinkRow>(&t.links)
-                .into_iter()
-                .filter(|l| doomed_ids.contains(l.memory_id.as_str()))
-                .map(|l| l.engine_id)
-                .collect();
-            for m in &doomed {
-                t.memories.delete(m.engine_id).map_err(engine_err)?;
-            }
-            for id in orphaned {
-                t.links.delete(id).map_err(engine_err)?;
-            }
+        for row in &emptied {
+            t.memories.replace(row.clone()).map_err(engine_err)?;
+        }
+        if !emptied.is_empty() {
             t.writes_since_compact += 1;
         }
         // The admin route is where an operator reclaims space, so it folds
         // the insert logs too.
         compact_tables(&mut t)?;
-        Ok(doomed.len())
+        Ok(emptied.len())
     }
 
     fn pull_memories(&self, query: &PullQuery) -> StoreResult<Vec<Value>> {
@@ -640,6 +840,8 @@ impl HubStore for MultimodalHubStore {
                 keep,
             )?,
         };
+        // The rows are copies: serialise them after letting writers in.
+        drop(t);
         Ok(rows.iter().map(MemoryRow::to_wire).collect())
     }
 
@@ -648,8 +850,8 @@ impl HubStore for MultimodalHubStore {
         let cursor = match &query.cursor {
             PullCursor::Keyset { since, since_id } => id_cursor(since, since_id)?,
             PullCursor::Since(since) => id_cursor(since, "")?,
-            // Entities have no hub_seq; as on the SQL stores, a seq cursor
-            // degrades to the epoch rather than returning nothing.
+            // Entities have no hub_seq; a seq cursor degrades to the epoch
+            // rather than returning nothing.
             PullCursor::Seq(_) => id_cursor(crate::EPOCH, "")?,
         };
         let keep = not_excluded(query);
@@ -657,6 +859,7 @@ impl HubStore for MultimodalHubStore {
             page_where::<_, _, Keyset>(&t.entities, Some(cursor), query.limit, |e: &EntityRow| {
                 keep(e.origin_node.as_deref())
             })?;
+        drop(t);
         Ok(rows.iter().map(EntityRow::to_wire).collect())
     }
 
@@ -668,6 +871,7 @@ impl HubStore for MultimodalHubStore {
         );
         let rows =
             page_where::<_, _, Keyset>(&t.links, Some(cursor), query.limit, |_: &LinkRow| true)?;
+        drop(t);
         Ok(rows.iter().map(LinkRow::to_wire).collect())
     }
 
@@ -680,6 +884,7 @@ impl HubStore for MultimodalHubStore {
             query.limit,
             |_: &RelationRow| true,
         )?;
+        drop(t);
         Ok(rows.iter().map(RelationRow::to_wire).collect())
     }
 }

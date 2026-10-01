@@ -5,21 +5,22 @@
 //! backlog nobody sees — and both look identical from inside the code that
 //! produces them.
 
+use remind_me_core::db::Store;
 use remind_me_core::maintenance::{
     capture_health, due, pending_counts, render_notice, reset_throttle, NUDGE_MAX_QUEUES,
     NUDGE_THRESHOLD,
 };
+use remind_me_core::testing;
 use remind_me_core::{Database, MemoryAddInput};
-use rusqlite::{params, Connection};
 use std::collections::HashMap;
 
 /// Serialises the throttle tests: the timer map is process-wide, so two of
 /// them running concurrently would each see the other's claim.
 static THROTTLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn add(conn: &Connection, content: &str) -> String {
+fn add(store: &Store<'_>, content: &str) -> String {
     remind_me_core::db::queries::add_memory(
-        conn,
+        store,
         MemoryAddInput {
             content: content.to_string(),
             category: "general".into(),
@@ -48,9 +49,9 @@ fn counts(pairs: &[(&str, i64)]) -> HashMap<String, i64> {
 #[test]
 fn an_empty_vault_has_every_queue_at_zero() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
-    let counts = pending_counts(&conn);
+    let counts = pending_counts(&store);
 
     assert!(!counts.is_empty(), "every queue should be reported");
     assert!(
@@ -62,39 +63,40 @@ fn an_empty_vault_has_every_queue_at_zero() {
 #[test]
 fn an_unclassified_memory_lands_in_that_queue() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "a memory with no classification");
+    let store = db.store();
+    add(&store, "a memory with no classification");
 
-    assert_eq!(pending_counts(&conn)["unclassified_memories"], 1);
+    assert_eq!(pending_counts(&store)["unclassified_memories"], 1);
 }
 
 #[test]
 fn a_deleted_memory_is_in_no_queue() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "about to be deleted");
-    conn.execute(
-        "UPDATE memories SET deleted_at = ? WHERE id = ?",
-        params![chrono::Utc::now().to_rfc3339(), &id],
-    )
-    .unwrap();
+    let store = db.store();
+    let id = add(&store, "about to be deleted");
+    testing::set_memory_column(&store, &id, "deleted_at", chrono::Utc::now().to_rfc3339()).unwrap();
 
     // Nudging someone to classify a memory they deleted is work that cannot
     // be done and would never clear.
-    let counts = pending_counts(&conn);
+    let counts = pending_counts(&store);
     assert_eq!(counts["unclassified_memories"], 0);
     assert_eq!(counts["unannotated_memories"], 0);
 }
 
 #[test]
 fn a_broken_queue_reports_zero_rather_than_breaking_the_caller() {
-    let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    // SQLite-only: a partially-migrated SQLite file is what this simulates.
+    let db = Database::open_sqlite_in_memory().unwrap();
+    let store = db.store();
     // Simulates a partially-migrated database: the table a queue needs is
     // gone. A status helper must not be the thing that breaks a search.
-    conn.execute("DROP TABLE memory_entities", []).unwrap();
+    store
+        .sqlite()
+        .unwrap()
+        .execute("DROP TABLE memory_entities", [])
+        .unwrap();
 
-    let counts = pending_counts(&conn);
+    let counts = pending_counts(&store);
 
     assert_eq!(counts["unannotated_memories"], 0);
     // The rest still report honestly rather than the whole call failing.
@@ -108,10 +110,10 @@ fn a_broken_queue_reports_zero_rather_than_breaking_the_caller() {
 #[test]
 fn never_configured_is_visible_rather_than_inferred() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "an ordinary memory, not a capture");
+    let store = db.store();
+    add(&store, "an ordinary memory, not a capture");
 
-    let health = capture_health(&conn);
+    let health = capture_health(&store);
 
     // A client where auto-capture was never set up is indistinguishable from
     // one where it was but nothing was worth capturing — both are silent.
@@ -124,17 +126,13 @@ fn never_configured_is_visible_rather_than_inferred() {
 #[test]
 fn one_capture_counts_once_even_though_it_writes_two_rows() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     for content in ["the dialog", "the summary"] {
-        let id = add(&conn, content);
-        conn.execute(
-            "UPDATE memories SET capture_id = 'cap_1' WHERE id = ?",
-            params![&id],
-        )
-        .unwrap();
+        let id = add(&store, content);
+        testing::set_memory_column(&store, &id, "capture_id", "cap_1").unwrap();
     }
 
-    let health = capture_health(&conn);
+    let health = capture_health(&store);
 
     // Counted by row, a single capture would read as two and the number would
     // silently overstate how much is being captured.
@@ -269,13 +267,13 @@ fn separate_timers_do_not_silence_each_other() {
 #[test]
 fn the_slot_is_claimed_even_when_nothing_is_reported() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let _guard = THROTTLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     reset_throttle();
 
     // An empty vault produces no notice — but the check must still have cost
     // its slot, or a quiet vault would re-run every count on every search.
-    assert!(remind_me_core::maintenance::maybe_notice(&conn).is_none());
+    assert!(remind_me_core::maintenance::maybe_notice(&store).is_none());
     assert!(
         !due("maintenance", 3600),
         "the slot was not claimed, so the counts would re-run on the next call"

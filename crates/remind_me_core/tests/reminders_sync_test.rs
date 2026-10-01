@@ -12,12 +12,14 @@
 #[path = "../src/test_env.rs"]
 mod test_env;
 
+use remind_me_core::db::outbox::Outbox;
 use remind_me_core::db::queries;
+use remind_me_core::db::Store;
 use remind_me_core::models::ReminderWindow;
 use remind_me_core::reminders::{list_reminders, set_reminder};
 use remind_me_core::sync::{upsert_record, SyncRecord, HUB_URL_ENV, NODE_ID_ENV, SYNC_SECRET_ENV};
+use remind_me_core::testing;
 use remind_me_core::{Database, MemoryAddInput};
-use rusqlite::Connection;
 
 fn enable_sync() {
     crate::test_env::set_var(NODE_ID_ENV, "node-reminders-test");
@@ -25,9 +27,9 @@ fn enable_sync() {
     crate::test_env::set_var(SYNC_SECRET_ENV, "shh");
 }
 
-fn add(conn: &Connection, content: &str) -> String {
+fn add(store: &Store<'_>, content: &str) -> String {
     queries::add_memory(
-        conn,
+        store,
         MemoryAddInput {
             content: content.to_string(),
             category: "general".into(),
@@ -53,21 +55,21 @@ fn future(hours: i64) -> String {
 fn the_outbox_payload_carries_the_reminder() {
     enable_sync();
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "renew the registration");
-    conn.execute("DELETE FROM sync_outbox", []).unwrap();
+    let store = db.store();
+    let id = add(&store, "renew the registration");
+    Outbox::new(&store).clear().unwrap();
 
     let when = future(30);
-    set_reminder(&conn, &id, Some(&when)).unwrap();
+    set_reminder(&store, &id, Some(&when)).unwrap();
 
-    let payload: Option<String> = conn
-        .query_row(
-            "SELECT json_extract(payload, '$.remind_at') FROM sync_outbox
-              WHERE memory_id = ? ORDER BY id DESC LIMIT 1",
-            [&id],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let payload: Option<String> = testing::outbox_rows(&store)
+        .unwrap()
+        .into_iter()
+        .rfind(|row| row.memory_id == id)
+        .and_then(|row| {
+            let payload: serde_json::Value = serde_json::from_str(&row.payload).unwrap();
+            payload["remind_at"].as_str().map(str::to_string)
+        });
 
     // Setting a reminder has to produce an outbox row at all: the trigger only
     // fires when `updated_at` actually moves, which is why `set_reminder`
@@ -82,7 +84,7 @@ fn the_outbox_payload_carries_the_reminder() {
 fn an_incoming_reminder_is_applied_and_shows_up_in_the_window() {
     enable_sync();
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
     let when = future(12);
     let record = SyncRecord {
@@ -114,12 +116,12 @@ fn an_incoming_reminder_is_applied_and_shows_up_in_the_window() {
         remind_at: Some(when.clone()),
     };
 
-    upsert_record(&conn, &record).unwrap();
+    upsert_record(&store, &record).unwrap();
 
     // Dropped on receipt, a reminder set on your laptop would be invisible on
     // your desktop while every other property of the same memory arrived
     // intact — the kind of half-wiring nobody finds until they miss something.
-    let upcoming = list_reminders(&conn, ReminderWindow::Upcoming, 20).unwrap();
+    let upcoming = list_reminders(&store, ReminderWindow::Upcoming, 20).unwrap();
     assert_eq!(upcoming.len(), 1);
     assert_eq!(upcoming[0].id, "mem_from_laptop");
     assert_eq!(upcoming[0].remind_at.as_deref(), Some(when.as_str()));
@@ -129,7 +131,7 @@ fn an_incoming_reminder_is_applied_and_shows_up_in_the_window() {
 fn a_record_with_no_remind_at_key_still_applies() {
     enable_sync();
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
     // A node predating the v27 schema sends no `remind_at` key at all. It has
     // to read as "no reminder" rather than failing the whole pull — the
@@ -144,8 +146,8 @@ fn a_record_with_no_remind_at_key_still_applies() {
     let record: SyncRecord = serde_json::from_value(raw).expect("an older record still parses");
 
     assert!(record.remind_at.is_none());
-    upsert_record(&conn, &record).unwrap();
-    assert!(list_reminders(&conn, ReminderWindow::All, 20)
+    upsert_record(&store, &record).unwrap();
+    assert!(list_reminders(&store, ReminderWindow::All, 20)
         .unwrap()
         .is_empty());
 }
@@ -154,11 +156,11 @@ fn a_record_with_no_remind_at_key_still_applies() {
 fn a_cleared_reminder_propagates_as_a_clear_rather_than_being_ignored() {
     enable_sync();
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "cancelled appointment");
-    set_reminder(&conn, &id, Some(&future(20))).unwrap();
+    let store = db.store();
+    let id = add(&store, "cancelled appointment");
+    set_reminder(&store, &id, Some(&future(20))).unwrap();
     assert_eq!(
-        list_reminders(&conn, ReminderWindow::All, 20)
+        list_reminders(&store, ReminderWindow::All, 20)
             .unwrap()
             .len(),
         1
@@ -197,9 +199,9 @@ fn a_cleared_reminder_propagates_as_a_clear_rather_than_being_ignored() {
         remind_at: None,
     };
 
-    upsert_record(&conn, &record).unwrap();
+    upsert_record(&store, &record).unwrap();
 
-    assert!(list_reminders(&conn, ReminderWindow::All, 20)
+    assert!(list_reminders(&store, ReminderWindow::All, 20)
         .unwrap()
         .is_empty());
 }
@@ -208,9 +210,9 @@ fn a_cleared_reminder_propagates_as_a_clear_rather_than_being_ignored() {
 fn a_losing_record_does_not_clear_a_locally_set_reminder() {
     enable_sync();
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "still scheduled");
-    set_reminder(&conn, &id, Some(&future(20))).unwrap();
+    let store = db.store();
+    let id = add(&store, "still scheduled");
+    set_reminder(&store, &id, Some(&future(20))).unwrap();
 
     let record = SyncRecord {
         id: id.clone(),
@@ -242,13 +244,13 @@ fn a_losing_record_does_not_clear_a_locally_set_reminder() {
         remind_at: None,
     };
 
-    upsert_record(&conn, &record).unwrap();
+    upsert_record(&store, &record).unwrap();
 
     // LWW protects the reminder exactly as it protects content: a stale copy
     // of the memory arriving from a node that never knew about the reminder
     // must not silently cancel it.
     assert_eq!(
-        list_reminders(&conn, ReminderWindow::All, 20)
+        list_reminders(&store, ReminderWindow::All, 20)
             .unwrap()
             .len(),
         1

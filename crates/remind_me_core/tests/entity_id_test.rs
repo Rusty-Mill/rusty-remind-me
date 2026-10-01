@@ -1,12 +1,15 @@
 //! Coverage for entity identity: the derivation itself, and the migration that
 //! rewrites ids written by earlier builds.
 
+use remind_me_core::db::derived::Origin;
+use remind_me_core::db::entities::{Entities, RelationRow, StoredRelation};
+use remind_me_core::db::Store;
 use remind_me_core::entity::{
     entity_id, get_entity_by_id, get_entity_by_name, normalize_entity_name, renormalize_entity_ids,
-    upsert_entity,
+    upsert_entity, Entity,
 };
+use remind_me_core::testing::{self, Table};
 use remind_me_core::{Database, EntityInput};
-use rusqlite::Connection;
 
 fn input(name: &str, aliases: &[&str]) -> EntityInput {
     EntityInput {
@@ -18,15 +21,68 @@ fn input(name: &str, aliases: &[&str]) -> EntityInput {
 
 /// Insert a row the way an earlier build of this crate did: `ent_` plus the
 /// full digest of a merely-trimmed name.
-fn insert_legacy(conn: &Connection, name: &str, aliases: &str, created_at: &str) -> String {
+fn insert_legacy(store: &Store<'_>, name: &str, aliases: &str, created_at: &str) -> String {
     let id = format!("ent_{}", sha256::digest(name.trim().to_lowercase()));
-    conn.execute(
-        "INSERT INTO entities (id, name, kind, aliases, created_at, updated_at)
-         VALUES (?, ?, NULL, ?, ?, ?)",
-        rusqlite::params![id, name.trim(), aliases, created_at, created_at],
-    )
-    .unwrap();
+    Entities::new(store)
+        .insert(
+            &Entity {
+                id: id.clone(),
+                name: name.trim().to_string(),
+                kind: None,
+                aliases: serde_json::from_str(aliases).unwrap(),
+                created_at: created_at.to_string(),
+                updated_at: created_at.to_string(),
+            },
+            None,
+        )
+        .unwrap();
     id
+}
+
+/// Link `memory_id` to `entity_id` as a raw `INSERT INTO memory_entities`
+/// did: no memory row needed, nothing queued.
+fn link(store: &Store<'_>, memory_id: &str, entity_id: &str) {
+    Entities::new(store)
+        .link(memory_id, entity_id, "2026-01-01T00:00:00Z", Origin::Sync)
+        .unwrap();
+}
+
+/// Insert relation `rel_1` between two entity ids, nothing queued.
+fn relate(store: &Store<'_>, subject: &str, relation: &str, object: &str) {
+    let at = "2026-01-01T00:00:00Z";
+    Entities::new(store)
+        .insert_relation_or_ignore(
+            &RelationRow {
+                id: "rel_1",
+                subject_entity_id: subject,
+                relation,
+                object_entity_id: object,
+                created_at: at,
+                updated_at: at,
+                node_id: None,
+            },
+            Origin::Sync,
+        )
+        .unwrap();
+}
+
+/// Every mention link as `(memory_id, entity_id)`.
+fn links(store: &Store<'_>) -> Vec<(String, String)> {
+    Entities::new(store)
+        .links_oldest_first()
+        .unwrap()
+        .into_iter()
+        .map(|(memory, entity, _)| (memory, entity))
+        .collect()
+}
+
+fn relation(store: &Store<'_>, id: &str) -> StoredRelation {
+    Entities::new(store)
+        .relations_oldest_first()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.id == id)
+        .unwrap()
 }
 
 #[test]
@@ -57,15 +113,13 @@ fn normalisation_collapses_internal_whitespace() {
 #[test]
 fn internal_whitespace_variants_are_one_entity() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
-    let first = upsert_entity(&conn, &input("Bailey  Robertson", &["Bailey"])).unwrap();
-    let second = upsert_entity(&conn, &input("Bailey Robertson", &["BR"])).unwrap();
+    let first = upsert_entity(&store, &input("Bailey  Robertson", &["Bailey"])).unwrap();
+    let second = upsert_entity(&store, &input("Bailey Robertson", &["BR"])).unwrap();
 
     assert_eq!(first.id, second.id);
-    let count: i64 = conn
-        .query_row("SELECT count(*) FROM entities", [], |r| r.get(0))
-        .unwrap();
+    let count = testing::count(&store, Table::Entities).unwrap();
     assert_eq!(count, 1, "the two spellings must not create two rows");
     assert_eq!(second.aliases, vec!["Bailey".to_string(), "BR".to_string()]);
 }
@@ -73,119 +127,81 @@ fn internal_whitespace_variants_are_one_entity() {
 #[test]
 fn lookup_by_name_tolerates_casing_and_spacing() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    upsert_entity(&conn, &input("Tasmania", &[])).unwrap();
+    let store = db.store();
+    upsert_entity(&store, &input("Tasmania", &[])).unwrap();
 
-    assert!(get_entity_by_name(&conn, "  TASMANIA ").unwrap().is_some());
+    assert!(get_entity_by_name(&store, "  TASMANIA ").unwrap().is_some());
 }
 
 #[test]
 fn the_migration_rewrites_a_legacy_id_and_its_links() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let legacy = insert_legacy(&conn, "Tasmania", "[]", "2026-01-01T00:00:00Z");
-    conn.execute(
-        "INSERT INTO memory_entities (memory_id, entity_id, created_at)
-         VALUES ('mem_1', ?, '2026-01-01T00:00:00Z')",
-        rusqlite::params![legacy],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO entity_relations (id, subject_entity_id, relation, object_entity_id,
-                                       created_at, updated_at)
-         VALUES ('rel_1', ?, 'located_in', 'other', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
-        rusqlite::params![legacy],
-    )
-    .unwrap();
+    let store = db.store();
+    let legacy = insert_legacy(&store, "Tasmania", "[]", "2026-01-01T00:00:00Z");
+    link(&store, "mem_1", &legacy);
+    relate(&store, &legacy, "located_in", "other");
 
-    assert_eq!(renormalize_entity_ids(&conn).unwrap(), 1);
+    assert_eq!(renormalize_entity_ids(&store).unwrap(), 1);
 
     let want = entity_id("Tasmania");
-    assert!(get_entity_by_id(&conn, &want).unwrap().is_some());
-    assert!(get_entity_by_id(&conn, &legacy).unwrap().is_none());
+    assert!(get_entity_by_id(&store, &want).unwrap().is_some());
+    assert!(get_entity_by_id(&store, &legacy).unwrap().is_none());
 
     // Nothing cascades — there is no foreign key — so a link left pointing at
     // the old id would simply dangle, silently.
-    let linked: String = conn
-        .query_row(
-            "SELECT entity_id FROM memory_entities WHERE memory_id = 'mem_1'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let linked = links(&store)
+        .into_iter()
+        .find(|(memory, _)| memory == "mem_1")
+        .unwrap()
+        .1;
     assert_eq!(linked, want);
-    let subject: String = conn
-        .query_row(
-            "SELECT subject_entity_id FROM entity_relations WHERE id = 'rel_1'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let subject = relation(&store, "rel_1").subject_entity_id;
     assert_eq!(subject, want);
 }
 
 #[test]
 fn the_migration_rewrites_object_side_relations_too() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let legacy = insert_legacy(&conn, "Hobart", "[]", "2026-01-01T00:00:00Z");
-    conn.execute(
-        "INSERT INTO entity_relations (id, subject_entity_id, relation, object_entity_id,
-                                       created_at, updated_at)
-         VALUES ('rel_1', 'other', 'capital_of', ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
-        rusqlite::params![legacy],
-    )
-    .unwrap();
+    let store = db.store();
+    let legacy = insert_legacy(&store, "Hobart", "[]", "2026-01-01T00:00:00Z");
+    relate(&store, "other", "capital_of", &legacy);
 
-    renormalize_entity_ids(&conn).unwrap();
+    renormalize_entity_ids(&store).unwrap();
 
-    let object: String = conn
-        .query_row(
-            "SELECT object_entity_id FROM entity_relations WHERE id = 'rel_1'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let object = relation(&store, "rel_1").object_entity_id;
     assert_eq!(object, entity_id("Hobart"));
 }
 
 #[test]
 fn the_migration_merges_rows_that_normalise_together() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     // Two rows only because the old derivation did not collapse internal runs.
     let spaced = insert_legacy(
-        &conn,
+        &store,
         "Bailey  Robertson",
         r#"["Bailey"]"#,
         "2026-01-02T00:00:00Z",
     );
     let single = insert_legacy(
-        &conn,
+        &store,
         "Bailey Robertson",
         r#"["BR"]"#,
         "2026-01-01T00:00:00Z",
     );
     for (memory, id) in [("mem_1", &spaced), ("mem_2", &single)] {
-        conn.execute(
-            "INSERT INTO memory_entities (memory_id, entity_id, created_at)
-             VALUES (?, ?, '2026-01-01T00:00:00Z')",
-            rusqlite::params![memory, id],
-        )
-        .unwrap();
+        link(&store, memory, id);
     }
 
-    renormalize_entity_ids(&conn).unwrap();
+    renormalize_entity_ids(&store).unwrap();
 
-    let count: i64 = conn
-        .query_row("SELECT count(*) FROM entities", [], |r| r.get(0))
-        .unwrap();
+    let count = testing::count(&store, Table::Entities).unwrap();
     assert_eq!(
         count, 1,
         "colliding rows must merge, not fail the migration"
     );
 
-    let merged = get_entity_by_id(&conn, &entity_id("Bailey Robertson"))
+    let merged = get_entity_by_id(&store, &entity_id("Bailey Robertson"))
         .unwrap()
         .unwrap();
     let mut aliases = merged.aliases.clone();
@@ -197,61 +213,49 @@ fn the_migration_merges_rows_that_normalise_together() {
     );
 
     // Both memories keep their link, repointed at the survivor.
-    let links: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM memory_entities WHERE entity_id = ?",
-            rusqlite::params![merged.id],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(links, 2);
-    let orphans: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM memory_entities WHERE entity_id != ?",
-            rusqlite::params![merged.id],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let all = links(&store);
+    let linked = all
+        .iter()
+        .filter(|(_, entity)| *entity == merged.id)
+        .count();
+    assert_eq!(linked, 2);
+    let orphans = all
+        .iter()
+        .filter(|(_, entity)| *entity != merged.id)
+        .count();
     assert_eq!(orphans, 0, "no link may be left pointing at a dead id");
 }
 
 #[test]
 fn a_duplicate_link_across_a_merge_collapses_rather_than_erroring() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let spaced = insert_legacy(&conn, "Bailey  Robertson", "[]", "2026-01-02T00:00:00Z");
-    let single = insert_legacy(&conn, "Bailey Robertson", "[]", "2026-01-01T00:00:00Z");
+    let store = db.store();
+    let spaced = insert_legacy(&store, "Bailey  Robertson", "[]", "2026-01-02T00:00:00Z");
+    let single = insert_legacy(&store, "Bailey Robertson", "[]", "2026-01-01T00:00:00Z");
     // The same memory mentions both — after the merge that is one link, and
     // `memory_entities` is keyed (memory_id, entity_id).
     for id in [&spaced, &single] {
-        conn.execute(
-            "INSERT INTO memory_entities (memory_id, entity_id, created_at)
-             VALUES ('mem_1', ?, '2026-01-01T00:00:00Z')",
-            rusqlite::params![id],
-        )
-        .unwrap();
+        link(&store, "mem_1", id);
     }
 
-    renormalize_entity_ids(&conn).unwrap();
+    renormalize_entity_ids(&store).unwrap();
 
-    let links: i64 = conn
-        .query_row("SELECT count(*) FROM memory_entities", [], |r| r.get(0))
-        .unwrap();
+    let links = testing::count(&store, Table::MemoryEntities).unwrap();
     assert_eq!(links, 1);
 }
 
 #[test]
 fn the_migration_is_idempotent() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    upsert_entity(&conn, &input("Tasmania", &["Tas"])).unwrap();
+    let store = db.store();
+    upsert_entity(&store, &input("Tasmania", &["Tas"])).unwrap();
 
     assert_eq!(
-        renormalize_entity_ids(&conn).unwrap(),
+        renormalize_entity_ids(&store).unwrap(),
         0,
         "rows already on the current derivation must not be touched"
     );
-    assert_eq!(renormalize_entity_ids(&conn).unwrap(), 0);
+    assert_eq!(renormalize_entity_ids(&store).unwrap(), 0);
 }
 
 #[test]
@@ -262,17 +266,17 @@ fn opening_an_existing_database_migrates_it() {
     let _ = std::fs::remove_file(&path);
 
     let legacy = {
-        let db = Database::open(&path).unwrap();
-        let conn = db.conn();
-        insert_legacy(&conn, "Tasmania", "[]", "2026-01-01T00:00:00Z")
+        let db = Database::open_on_sqlite(&path).unwrap();
+        let store = db.store();
+        insert_legacy(&store, "Tasmania", "[]", "2026-01-01T00:00:00Z")
     };
 
     // Reopening runs the reconciler, which is where the rewrite lives.
-    let db = Database::open(&path).unwrap();
-    let conn = db.conn();
-    assert!(get_entity_by_id(&conn, &legacy).unwrap().is_none());
-    assert!(get_entity_by_name(&conn, "tasmania").unwrap().is_some());
+    let db = Database::open_on_sqlite(&path).unwrap();
+    let store = db.store();
+    assert!(get_entity_by_id(&store, &legacy).unwrap().is_none());
+    assert!(get_entity_by_name(&store, "tasmania").unwrap().is_some());
 
-    drop(conn);
+    drop(store);
     let _ = std::fs::remove_dir_all(&dir);
 }

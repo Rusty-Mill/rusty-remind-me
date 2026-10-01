@@ -21,11 +21,14 @@
 //!     the rest via the same `superseded_by` mechanism
 //!     [`crate::entity::supersede_contradicting_facts`] already uses.
 
+use crate::db::memories::Memories;
+use crate::db::vectors::Vectors;
+use crate::db::Store;
 use crate::models::ConsolidateInput;
 use crate::vitality::calculate_vitality;
 use chrono::Utc;
-use rusqlite::types::Value;
-use rusqlite::{params_from_iter, Connection, Result as SqlResult};
+
+use crate::db::Result as SqlResult;
 use serde_json::{json, Value as Json};
 use std::collections::HashMap;
 
@@ -302,58 +305,29 @@ type Candidates = (Vec<ClusterMember>, HashMap<String, Vec<f32>>);
 /// the same candidate set the reference's SQL join selects — optionally
 /// scoped to `category`, capped at `limit`.
 fn fetch_candidates(
-    conn: &Connection,
+    store: &Store<'_>,
     category: Option<&str>,
     limit: usize,
 ) -> SqlResult<Candidates> {
-    let mut sql = String::from(
-        "SELECT m.id, m.content, m.vitality, m.access_count, m.accessed_at, m.tags, \
-         m.decay_rate, m.base_weight, ve.embedding \
-         FROM memories m \
-         JOIN vec_chunks vc ON vc.memory_rowid = m.rowid AND vc.chunk_ix = 0 \
-         JOIN vec_embeddings ve ON ve.vec_rowid = vc.vec_rowid \
-         WHERE m.status = 'active' AND m.superseded_by IS NULL AND m.deleted_at IS NULL",
-    );
-    let mut bindings: Vec<Value> = Vec::new();
-    if let Some(cat) = category {
-        sql.push_str(" AND m.category = ?");
-        bindings.push(Value::Text(cat.to_string()));
-    }
-    sql.push_str(" LIMIT ?");
-    bindings.push(Value::Integer(limit as i64));
+    let rows = Vectors::new(store).consolidation_candidates(category, limit)?;
 
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(bindings.iter()), |row| {
-        let id: String = row.get(0)?;
-        let content: String = row.get(1)?;
-        let vitality: f64 = row.get(2)?;
-        let access_count: i64 = row.get(3)?;
-        let accessed_at: String = row.get(4)?;
-        let tags_json: String = row.get(5)?;
-        let decay_rate: f64 = row.get(6)?;
-        let base_weight: f64 = row.get(7)?;
-        let embedding: Vec<u8> = row.get(8)?;
-        Ok((
-            ClusterMember {
-                id,
-                content,
-                vitality,
-                access_count,
-                accessed_at,
-                tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-                decay_rate,
-                base_weight,
-            },
-            embedding,
-        ))
-    })?;
-
-    let mut members = Vec::new();
+    let mut members = Vec::with_capacity(rows.len());
     let mut embeddings = HashMap::new();
     for row in rows {
-        let (member, bytes) = row?;
-        embeddings.insert(member.id.clone(), crate::vectors::le_bytes_to_f32(&bytes));
-        members.push(member);
+        embeddings.insert(
+            row.id.clone(),
+            crate::vectors::le_bytes_to_f32(&row.embedding),
+        );
+        members.push(ClusterMember {
+            id: row.id,
+            content: row.content,
+            vitality: row.vitality,
+            access_count: row.access_count,
+            accessed_at: row.accessed_at,
+            tags: row.tags,
+            decay_rate: row.decay_rate,
+            base_weight: row.base_weight,
+        });
     }
     Ok((members, embeddings))
 }
@@ -372,7 +346,7 @@ fn fetch_candidates(
 /// re-embeds the canonical with its merged content.
 ///
 /// Only active, non-superseded memories are considered.
-pub fn consolidate(conn: &Connection, input: &ConsolidateInput) -> SqlResult<Json> {
+pub fn consolidate(store: &Store<'_>, input: &ConsolidateInput) -> SqlResult<Json> {
     let similarity_threshold = input.similarity_threshold.clamp(
         crate::CONSOLIDATE_SIMILARITY_MIN,
         crate::CONSOLIDATE_SIMILARITY_MAX,
@@ -381,7 +355,7 @@ pub fn consolidate(conn: &Connection, input: &ConsolidateInput) -> SqlResult<Jso
         .limit
         .clamp(crate::CONSOLIDATE_LIMIT_MIN, crate::CONSOLIDATE_LIMIT_MAX);
 
-    let (members, embeddings) = fetch_candidates(conn, input.category.as_deref(), limit)?;
+    let (members, embeddings) = fetch_candidates(store, input.category.as_deref(), limit)?;
     if members.is_empty() {
         return Ok(json!({ "clusters_found": 0, "message": "No eligible memories found" }));
     }
@@ -403,7 +377,7 @@ pub fn consolidate(conn: &Connection, input: &ConsolidateInput) -> SqlResult<Jso
         return Ok(dry_run_report(&clusters, &embeddings));
     }
 
-    apply_merges(conn, &clusters, input.summaries.as_ref())
+    apply_merges(store, &clusters, input.summaries.as_ref())
 }
 
 fn dry_run_report(clusters: &[Vec<ClusterMember>], embeddings: &HashMap<String, Vec<f32>>) -> Json {
@@ -452,7 +426,7 @@ fn dry_run_report(clusters: &[Vec<ClusterMember>], embeddings: &HashMap<String, 
 }
 
 fn apply_merges(
-    conn: &Connection,
+    store: &Store<'_>,
     clusters: &[Vec<ClusterMember>],
     summaries: Option<&HashMap<String, String>>,
 ) -> SqlResult<Json> {
@@ -484,15 +458,13 @@ fn apply_merges(
             .collect();
         let merged = merge_cluster(canonical, &member_refs, Some(summary.as_str()));
 
-        conn.execute(
-            "UPDATE memories SET content = ?, access_count = ?, tags = ?, updated_at = ? WHERE id = ?",
-            rusqlite::params![
-                merged.merged_content,
-                merged.total_access_count,
-                serde_json::to_string(&merged.merged_tags).unwrap_or_else(|_| "[]".to_string()),
-                now_iso,
-                canonical.id,
-            ],
+        let memories = Memories::new(store);
+        memories.set_merged(
+            &canonical.id,
+            &merged.merged_content,
+            merged.total_access_count,
+            &merged.merged_tags,
+            &now_iso,
         )?;
 
         // Recompute vitality for the canonical at zero elapsed days, the same
@@ -505,16 +477,10 @@ fn apply_merges(
             &now_iso,
             now,
         );
-        conn.execute(
-            "UPDATE memories SET vitality = ?, status = 'active' WHERE id = ?",
-            rusqlite::params![new_vitality, canonical.id],
-        )?;
+        memories.set_vitality(&canonical.id, new_vitality, "active")?;
 
         for member_id in &merged.superseded_ids {
-            conn.execute(
-                "UPDATE memories SET superseded_by = ?, updated_at = ? WHERE id = ?",
-                rusqlite::params![canonical.id, now_iso, member_id],
-            )?;
+            memories.set_superseded_by(member_id, &canonical.id, Some(&now_iso))?;
         }
 
         total_superseded += merged.superseded_ids.len();
@@ -528,7 +494,7 @@ fn apply_merges(
         // background task: this crate has no async runtime to spawn one on.
         if let Some(embedder) = embedder.as_ref() {
             let _ = crate::vectors::embed_and_store(
-                conn,
+                store,
                 &**embedder,
                 &canonical.id,
                 &merged.merged_content,
