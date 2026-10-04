@@ -371,6 +371,49 @@ const LIST_USAGE: &str = "Usage: rusty-remind-me list [--limit N] [--category CA
 
 const ADD_USAGE: &str = "Usage: rusty-remind-me add <content> [--category CATEGORY] [--tags a,b,c]";
 
+const RESOLVE_USAGE: &str =
+    "Usage: rusty-remind-me resolve <id> <done|abandoned|reverted|superseded> [--note TEXT]";
+
+/// Parsed form of `rusty-remind-me resolve <id> <outcome> [--note TEXT]`.
+#[derive(Debug, PartialEq, Eq)]
+struct ResolveArgs {
+    memory_id: String,
+    outcome: String,
+    note: Option<String>,
+}
+
+fn parse_resolve_args(args: &[String]) -> Result<ResolveArgs, String> {
+    let mut words: Vec<&String> = Vec::new();
+    let mut note = None;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--note" {
+            note = Some(flag_value(args, i, "--note", RESOLVE_USAGE)?);
+            i += 2;
+        } else if args[i].starts_with("--") {
+            return Err(format!("Error: unknown flag {:?}.\n{}", args[i], RESOLVE_USAGE));
+        } else {
+            words.push(&args[i]);
+            i += 1;
+        }
+    }
+    let [memory_id, outcome] = words[..] else {
+        return Err(RESOLVE_USAGE.to_string());
+    };
+    if !remind_me_core::kinds::OUTCOMES.contains(&outcome.as_str()) {
+        return Err(format!(
+            "Error: outcome must be one of {}.\n{}",
+            remind_me_core::kinds::OUTCOMES.join(", "),
+            RESOLVE_USAGE
+        ));
+    }
+    Ok(ResolveArgs {
+        memory_id: memory_id.clone(),
+        outcome: outcome.clone(),
+        note,
+    })
+}
+
 const SEARCH_USAGE: &str = "Usage: rusty-remind-me search <query> [--limit N] [--json]";
 
 /// Parsed form of `rusty-remind-me add <content> [--category C] [--tags a,b]`.
@@ -957,12 +1000,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     report.skipped.len()
                 );
             }
+            "resolve" => {
+                let resolve = match parse_resolve_args(&args[2..]) {
+                    Ok(parsed) => parsed,
+                    Err(message) => {
+                        eprintln!("{}", message);
+                        std::process::exit(1);
+                    }
+                };
+                let found: Option<Memory> = Store::open(&db_path)?.call(Op::Resolve {
+                    memory_id: resolve.memory_id.clone(),
+                    outcome: resolve.outcome,
+                    note: resolve.note,
+                })?;
+                match found {
+                    Some(mem) => println!("{}", serde_json::to_string_pretty(&mem)?),
+                    None => {
+                        eprintln!("Memory not found: {}", resolve.memory_id);
+                        std::process::exit(1);
+                    }
+                }
+            }
             "stats" => {
                 let stats: Stats = Store::open(&db_path)?.call(Op::Stats)?;
                 println!("{}", serde_json::to_string_pretty(&stats)?);
             }
             cmd => {
-                eprintln!("Unknown subcommand: {}. Available: configure, daemon, api, remote, server, search, add, list, get, entity, wiki-write, wiki-read, wiki-import, stats", cmd);
+                eprintln!("Unknown subcommand: {}. Available: configure, daemon, api, remote, server, search, add, list, get, entity, wiki-write, wiki-read, wiki-import, stats, resolve", cmd);
                 std::process::exit(1);
             }
         }
@@ -977,6 +1041,29 @@ mod tests {
 
     fn args(raw: &[&str]) -> Vec<String> {
         raw.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn resolve_takes_an_id_an_outcome_and_an_optional_note() {
+        let parsed = parse_resolve_args(&args(&["mem_1", "reverted", "--note", "broke CI"])).unwrap();
+        assert_eq!(parsed.memory_id, "mem_1");
+        assert_eq!(parsed.outcome, "reverted");
+        assert_eq!(parsed.note.as_deref(), Some("broke CI"));
+        assert_eq!(parse_resolve_args(&args(&["mem_1", "done"])).unwrap().note, None);
+    }
+
+    #[test]
+    fn resolve_rejects_a_bad_outcome_missing_words_and_unknown_flags() {
+        for bad in [
+            args(&["mem_1", "maybe"]),
+            args(&["mem_1"]),
+            args(&["a", "b", "done"]),
+            args(&["mem_1", "done", "--note"]),
+            args(&["mem_1", "done", "--force"]),
+        ] {
+            let err = parse_resolve_args(&bad).unwrap_err();
+            assert!(err.contains("Usage"), "{bad:?}: {err}");
+        }
     }
 
     #[test]
