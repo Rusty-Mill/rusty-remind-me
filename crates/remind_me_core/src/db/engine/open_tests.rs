@@ -138,3 +138,48 @@ fn background_threads_share_the_engine_store() {
     assert_eq!(memories(&db), 4);
     assert_eq!(sqlite_memories(&file), 3);
 }
+
+#[test]
+fn a_store_written_under_another_layout_is_refused_in_plain_words() {
+    use rusty_multimodal_db_engine::generic::record_blob::TAG_OFFSET;
+
+    let dir = TemporaryDir::fresh();
+    let file = dir.path().join("memory.db");
+    std::fs::create_dir_all(dir.path()).unwrap();
+    {
+        let db = open(&file);
+        Memories::new(&db.store())
+            .insert(&NewMemory::new("m1", "written by this build", T1))
+            .unwrap();
+    }
+
+    // What an older build leaves behind, or a newer one: the same table under
+    // a different record layout, which the file records as a different tag.
+    let blob = engine_dir(&file).join("memories.mmap.records");
+    let mut bytes = std::fs::read(&blob).unwrap();
+    bytes[TAG_OFFSET] ^= 0xff;
+    std::fs::write(&blob, &bytes).unwrap();
+
+    let refused = match retry_while_locked(|| Database::open(&file)) {
+        Err(e) => e,
+        Ok(_) => panic!("a store under another layout opened"),
+    };
+    let StoreError::Invalid(message) = &refused else {
+        panic!("expected a plain refusal, got {refused:?}");
+    };
+    assert!(
+        message.contains("different version of rusty-remind-me"),
+        "{message}"
+    );
+    assert!(message.contains(env!("CARGO_PKG_VERSION")), "{message}");
+    assert!(message.contains("restore a backup"), "{message}");
+    assert!(
+        message.contains("schema tag mismatch"),
+        "keeps the engine's detail: {message}"
+    );
+
+    // Nothing was rewritten: put the byte back and the store opens as before.
+    bytes[TAG_OFFSET] ^= 0xff;
+    std::fs::write(&blob, &bytes).unwrap();
+    assert_eq!(memories(&open(&file)), 1);
+}

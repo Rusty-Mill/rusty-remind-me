@@ -409,9 +409,29 @@ pub(crate) fn ensure_same_id(stored: &str, incoming: &str) -> super::Result<()> 
     )))
 }
 
+/// The engine's words for a table written under another record layout.
+const TAG_MISMATCH: &str = "schema tag mismatch";
+
 /// Any engine failure, as a [`StoreError`].
+///
+/// A table whose record layout this build does not know is not an engine
+/// fault: the store was written by another build of this program. It is
+/// told apart, and refused with a message that says what to do, because the
+/// engine's own words are a hash comparison. The engine reports it as text,
+/// so it is recognised by that text; `a_store_written_under_another_layout_
+/// is_refused_in_plain_words` provokes the real error to keep this honest.
 pub(crate) fn engine_error(e: impl fmt::Display) -> StoreError {
-    StoreError::Engine(e.to_string())
+    let detail = e.to_string();
+    if detail.contains(TAG_MISMATCH) {
+        return StoreError::Invalid(format!(
+            "this store was written by a different version of rusty-remind-me (this build is {}) \
+             and its record layout is not one this build reads. The store is unchanged. Open it \
+             with the version that wrote it, or restore a backup from before the upgrade. \
+             Engine detail: {detail}",
+            env!("CARGO_PKG_VERSION")
+        ));
+    }
+    StoreError::Engine(detail)
 }
 
 /// A delete's result, with an already-missing record counted as deleted.

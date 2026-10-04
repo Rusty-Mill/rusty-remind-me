@@ -62,7 +62,12 @@ project. References to issues, commits and paths lived inside free text.
   session can be replayed with `remind_me_session_timeline`.
 - A session that ends without anyone calling a memory tool still leaves a
   capture and, when the repository changed, a work log.
-- Every memory row is larger. Existing engine stores upgrade on first open.
+- Every memory row is larger. Existing engine stores upgrade on first open,
+  and the upgrade is one way: an older build refuses the store, for every
+  read and write, and leaves it unchanged (checked by hand against the
+  previous build). The refusal says which version to use or to restore a
+  backup. The engine crate itself carries no format version; compatibility is
+  the per-table schema tag.
 - A session's memories are found by scanning live memories and filtering in
   Rust, since the engine has no `session_id` index. Fine at hook cadence; add
   an index if it shows up in a profile.

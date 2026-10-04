@@ -2,6 +2,15 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-10-04 — A store written by another version is refused in plain words
+
+### Changed
+- Opening a store whose tables were written under a record layout this build does not read now fails with a message that names both versions and says what to do: open it with the version that wrote it, or restore a backup from before the upgrade. It used to fail with the engine's hash comparison. The store is not changed by the refusal.
+- Checked by hand against a real rollback: a store written by 0.3.0 was opened with the build before it. Every command, read or write, was refused, nothing in the store changed, and 0.3.0 read it normally afterwards.
+
+### Tests
+- A store with its `memories` layout tag altered is refused with that message and keeps the engine's detail; putting the tag back opens it unchanged. The test fails if the recognition is removed.
+
 ## 2026-10-04 — Plugin hooks capture and recall without being asked (ADR-0026)
 
 ### Added
