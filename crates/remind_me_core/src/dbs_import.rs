@@ -415,6 +415,7 @@ pub fn pull_dbs(
                 "dbs_content_hash": item.content_hash,
             });
 
+            let provenance = crate::context::importer_provenance("dbs");
             Memories::new(page).insert_or_ignore(&NewMemory {
                 category: item
                     .item_kind
@@ -429,7 +430,7 @@ pub fn pull_dbs(
                 // thing happened rather than from when it was imported —
                 // vitality decay reads this column.
                 created_at: item.item_created_at.clone().unwrap_or_else(|| now.clone()),
-                ..NewMemory::new(memory_id.clone(), content, &now)
+                ..provenance.stamp(NewMemory::new(memory_id.clone(), content, &now))
             })?;
 
             // The source, then every tag. This is the reason to prefer this over

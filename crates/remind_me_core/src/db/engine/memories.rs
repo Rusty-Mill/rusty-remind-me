@@ -114,6 +114,17 @@ pub struct MemoryRow {
 }
 
 impl MemoryRow {
+    /// Whether this row passes a search or list's project/branch/session/
+    /// writer scope.
+    pub(crate) fn in_scope(&self, scope: &crate::context::ScopeFilter) -> bool {
+        scope.matches(
+            self.project.as_deref(),
+            self.git_branch.as_deref(),
+            self.session_id.as_deref(),
+            &self.written_by,
+        )
+    }
+
     /// `row` as an `INSERT` of it stores it.
     pub(crate) fn from_new(row: &NewMemory) -> Self {
         Self {
@@ -689,6 +700,9 @@ pub(crate) fn set_ingest_marker(
         update(tables, id, Origin::Local, |row| {
             let mut metadata: Value = serde_json::from_str(&row.metadata)
                 .map_err(|e| engine_error(format!("memory {:?} metadata: {e}", row.id)))?;
+            // The marker is the webhook's own stamp, so it credits the writer
+            // too: a pushed import is `importer:webhook`, not the connector.
+            row.written_by = "importer:webhook".to_string();
             if let Value::Object(fields) = &mut metadata {
                 fields.insert("ingest".to_string(), Value::String(marker.to_string()));
                 row.metadata = metadata.to_string();
@@ -1059,6 +1073,7 @@ pub(crate) fn list_page(
         .filter(|row| filter.include_sensitive || !row.sensitive)
         .filter(|row| filter.category.as_ref().is_none_or(|c| &row.category == c))
         .filter(|row| filter.source.as_ref().is_none_or(|s| &row.source == s))
+        .filter(|row| row.in_scope(&filter.scope))
         .filter(|row| filter.tags.iter().all(|tag| core.tags.has(tag, &row.id)))
         .collect();
     rows.sort_by(|a, b| (&b.created_at, &b.id).cmp(&(&a.created_at, &a.id)));
@@ -1127,6 +1142,7 @@ pub(crate) fn keyword_hits(
         .into_iter()
         .filter(|(row, _)| filter.include_sensitive || !row.sensitive)
         .filter(|(row, _)| filter.category.as_ref().is_none_or(|c| &row.category == c))
+        .filter(|(row, _)| row.in_scope(&filter.scope))
         .map(|(row, score)| (row.to_memory(), score))
         .filter(|(memory, _)| {
             filter
@@ -1426,6 +1442,8 @@ mod tests {
         let a: Value = serde_json::from_str(&row(core, "a").unwrap().metadata).unwrap();
         assert_eq!(a, serde_json::json!({"k": 1, "ingest": "done"}));
         assert_eq!(row(core, "b").unwrap().metadata, "[1]");
+        // The marker is the webhook's stamp, so it credits the writer too.
+        assert_eq!(row(core, "a").unwrap().written_by, "importer:webhook");
     }
 
     #[test]

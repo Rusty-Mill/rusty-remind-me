@@ -440,6 +440,7 @@ fn neighbour_expansion_finally_finds_something() {
     let response = remind_me_core::db::queries::search_with_expansions(
         &store,
         &remind_me_core::MemorySearchInput {
+            scope: Default::default(),
             strategy: Default::default(),
             include_sensitive: false,
             query: "quokka".into(),
@@ -821,9 +822,11 @@ fn an_export_round_trips_the_v32_columns_and_a_plain_chat_defaults_them() {
     let path = write(&dir, "chat.json", CHAT_JSON);
     import(&store, &path, |_| {});
     let ids = testing::memory_ids(&store).unwrap();
-    assert_eq!(testing::memory_text(&store, &ids[0], "project").unwrap(), None);
+    // Not an export of ours, so nothing is restored: the importer stamps
+    // itself, and keeps only the project (the directory it ran in).
+    assert_eq!(testing::memory_text(&store, &ids[0], "git_sha").unwrap(), None);
     assert_eq!(testing::memory_f64(&store, &ids[0], "confidence").unwrap(), Some(1.0));
-    assert_eq!(column(&store, "written_by"), "unknown");
-    assert_eq!(column(&store, "capture_method"), "manual");
+    assert_eq!(column(&store, "written_by"), "importer:chat_import");
+    assert_eq!(column(&store, "capture_method"), "auto");
     std::fs::remove_dir_all(&dir).unwrap();
 }

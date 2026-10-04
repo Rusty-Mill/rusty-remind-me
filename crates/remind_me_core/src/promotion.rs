@@ -352,7 +352,7 @@ pub fn promote(store: &Store<'_>, input: &PromoteInput) -> Result<PromotionResul
     let base_weight = get_type_prior(category) * get_source_prior(PROMOTION_SOURCE);
     let vitality = calculate_vitality(base_weight, 0, decay_rate, &now_iso, now);
 
-    let (node_id, client) = crate::sync::memory_provenance();
+    let provenance = crate::context::default_provenance().auto();
     Memories::new(store).insert(&NewMemory {
         category: category.to_string(),
         source: PROMOTION_SOURCE.to_string(),
@@ -361,9 +361,11 @@ pub fn promote(store: &Store<'_>, input: &PromoteInput) -> Result<PromotionResul
         vitality,
         base_weight,
         accessed_at: Some(now_iso.clone()),
-        node_id: Some(node_id),
-        client,
-        ..NewMemory::new(promoted_id.clone(), input.content.clone(), &now_iso)
+        ..provenance.stamp(NewMemory::new(
+            promoted_id.clone(),
+            input.content.clone(),
+            &now_iso,
+        ))
     })?;
 
     let promotions = Promotions::new(store);

@@ -174,6 +174,7 @@ pub struct ListFilter {
     pub category: Option<String>,
     pub source: Option<String>,
     pub tags: Vec<String>,
+    pub scope: crate::context::ScopeFilter,
 }
 
 /// An edit to a memory's fields: each `Some` field is written, the rest keep
@@ -228,6 +229,7 @@ pub struct KeywordFilter {
     pub min_effective_vitality: Option<f64>,
     pub category: Option<String>,
     pub include_sensitive: bool,
+    pub scope: crate::context::ScopeFilter,
 }
 
 /// Which live, unsuperseded memories a paged search takes.
@@ -1170,6 +1172,7 @@ mod tests {
                 ..KeywordFilter::default()
             },
             KeywordFilter {
+                scope: Default::default(),
                 min_effective_vitality: Some(crate::vitality::VITALITY_FLOOR),
                 category: text("fact"),
                 include_sensitive: true,

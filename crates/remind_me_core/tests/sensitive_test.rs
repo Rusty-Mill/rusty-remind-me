@@ -39,6 +39,7 @@ fn search(store: &Store<'_>, query: &str, include_sensitive: bool) -> Vec<String
     queries::search_memories(
         store,
         &MemorySearchInput {
+            scope: Default::default(),
             strategy: Default::default(),
             query: query.to_string(),
             category: None,
@@ -66,6 +67,7 @@ fn list(store: &Store<'_>, include_sensitive: bool) -> (usize, Vec<String>) {
     let result = queries::list_memories(
         store,
         &MemoryListInput {
+            scope: Default::default(),
             category: None,
             tags: None,
             source: None,

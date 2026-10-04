@@ -33,8 +33,32 @@ pub struct Stats {
     pub categories: BTreeMap<String, i64>,
     pub sources: BTreeMap<String, i64>,
     pub recent: Vec<RecentMemory>,
+    /// The projects with the most memories, busiest first.
+    #[serde(default)]
+    pub by_project: Vec<ProjectCount>,
     pub db_path: String,
     pub db_size_mb: f64,
+}
+
+/// How many memories one project holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectCount {
+    pub project: String,
+    pub count: i64,
+}
+
+/// How many projects [`Stats::by_project`] lists.
+pub const TOP_PROJECTS: usize = 10;
+
+/// The `limit` biggest entries of `counts`, biggest first, ties by name.
+pub fn top_projects(counts: BTreeMap<String, i64>, limit: usize) -> Vec<ProjectCount> {
+    let mut all: Vec<ProjectCount> = counts
+        .into_iter()
+        .map(|(project, count)| ProjectCount { project, count })
+        .collect();
+    all.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.project.cmp(&b.project)));
+    all.truncate(limit);
+    all
 }
 
 /// Dashboard-facing statistics — `GET /api/stats`, matching the reference's
@@ -100,6 +124,7 @@ pub fn collect(store: &Store<'_>) -> Result<Stats> {
         categories: stats.count_by(GroupBy::Category)?,
         sources: stats.count_by(GroupBy::Source)?,
         recent: stats.recent(RECENT_LIMIT as i64)?,
+        by_project: top_projects(stats.count_by(GroupBy::Project)?, TOP_PROJECTS),
         db_path: path_text(&info),
         db_size_mb: size_mb(&info),
     })
@@ -152,6 +177,13 @@ pub fn render_markdown(stats: &Stats) -> String {
     lines.push("### Sources".to_string());
     for (source, count) in &stats.sources {
         lines.push(format!("- **{}**: {}", source, count));
+    }
+    if !stats.by_project.is_empty() {
+        lines.push(String::new());
+        lines.push("### Projects".to_string());
+        for entry in &stats.by_project {
+            lines.push(format!("- **{}**: {}", entry.project, entry.count));
+        }
     }
     lines.push(String::new());
     lines.push("### Recent Memories".to_string());

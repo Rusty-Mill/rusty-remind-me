@@ -109,6 +109,20 @@ pub const FEEDBACK_ADJUSTMENT_CAP: f64 = 0.4;
 pub const BASE_WEIGHT_MAX: f64 = 3.0;
 pub const BASE_WEIGHT_MIN: f64 = 0.1;
 
+/// Factor applied to [`FEEDBACK_MAGNITUDE`] when the memory was written by
+/// a hook or an importer: a verbatim capture is noisier than something a
+/// person or model chose to say, so one thumbs-up or down says less about it.
+pub const MACHINE_FEEDBACK_SCALE: f64 = 0.5;
+
+/// The magnitude of one feedback signal on a memory written by `written_by`.
+pub fn feedback_magnitude(written_by: &str) -> f64 {
+    if written_by.starts_with("hook") || written_by.starts_with("importer:") {
+        FEEDBACK_MAGNITUDE * MACHINE_FEEDBACK_SCALE
+    } else {
+        FEEDBACK_MAGNITUDE
+    }
+}
+
 /// A signed retrieval-quality signal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -166,6 +180,10 @@ pub fn record_feedback(
     };
     let access_count = importance.access_count;
     let base_weight = importance.base_weight;
+    let magnitude = match crate::db::memories::Memories::new(store).get_live(memory_id)? {
+        Some(memory) => feedback_magnitude(&memory.written_by),
+        None => FEEDBACK_MAGNITUDE,
+    };
 
     if let Some(query) = query.filter(|q| !q.trim().is_empty()) {
         let event = FeedbackEvent {
@@ -175,7 +193,7 @@ pub fn record_feedback(
                 FeedbackSignal::Unhelpful => "unhelpful",
             }
             .to_string(),
-            magnitude: FEEDBACK_MAGNITUDE,
+            magnitude,
         };
         feedback.log_event(
             &format!("fb_{}", uuid::Uuid::new_v4().simple()),
@@ -188,10 +206,8 @@ pub fn record_feedback(
     }
 
     let new_base_weight = match signal {
-        FeedbackSignal::Helpful => (base_weight * (1.0 + FEEDBACK_MAGNITUDE)).min(BASE_WEIGHT_MAX),
-        FeedbackSignal::Unhelpful => {
-            (base_weight * (1.0 - FEEDBACK_MAGNITUDE)).max(BASE_WEIGHT_MIN)
-        }
+        FeedbackSignal::Helpful => (base_weight * (1.0 + magnitude)).min(BASE_WEIGHT_MAX),
+        FeedbackSignal::Unhelpful => (base_weight * (1.0 - magnitude)).max(BASE_WEIGHT_MIN),
     };
 
     // Snapshot recompute with zero elapsed days, matching how `add_memory` seeds

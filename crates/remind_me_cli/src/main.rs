@@ -312,6 +312,7 @@ fn configure_mcp_clients(parsed: &ConfigureArgs) -> Result<(), Box<dyn std::erro
 struct ListArgs {
     limit: usize,
     category: Option<String>,
+    scope: remind_me_core::context::ScopeFilter,
     as_json: bool,
 }
 
@@ -324,6 +325,7 @@ fn parse_list_args(args: &[String]) -> Result<ListArgs, String> {
         // Matches `list_p.add_argument("--limit", type=int, default=20)`.
         limit: 20,
         category: None,
+        scope: Default::default(),
         as_json: false,
     };
     let mut i = 0;
@@ -359,6 +361,13 @@ fn parse_list_args(args: &[String]) -> Result<ListArgs, String> {
                 }
                 i += 2;
             }
+            flag @ ("--project" | "--branch" | "--session" | "--written-by") => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| format!("Error: {} expects a value.\n{}", flag, LIST_USAGE))?;
+                parsed.scope.set_from_flag(flag, value);
+                i += 2;
+            }
             other => {
                 return Err(format!("Error: unknown flag {:?}.\n{}", other, LIST_USAGE));
             }
@@ -367,12 +376,12 @@ fn parse_list_args(args: &[String]) -> Result<ListArgs, String> {
     Ok(parsed)
 }
 
-const LIST_USAGE: &str = "Usage: rusty-remind-me list [--limit N] [--category CATEGORY] [--json]";
+const LIST_USAGE: &str = "Usage: rusty-remind-me list [--limit N] [--category CATEGORY] [--project P] [--branch B] [--session ID] [--json]";
 
 const ADD_USAGE: &str =
     "Usage: rusty-remind-me add <content> [--category CATEGORY] [--tags a,b,c] [--attach PATH]...";
 
-const SEARCH_USAGE: &str = "Usage: rusty-remind-me search <query> [--limit N] [--json]";
+const SEARCH_USAGE: &str = "Usage: rusty-remind-me search <query> [--limit N] [--project P] [--branch B] [--session ID] [--json]";
 
 /// Parsed form of `rusty-remind-me add <content> [--category C] [--tags a,b]`.
 ///
@@ -395,6 +404,7 @@ struct AddArgs {
 struct SearchArgs {
     query: String,
     limit: usize,
+    scope: remind_me_core::context::ScopeFilter,
     as_json: bool,
 }
 
@@ -513,8 +523,14 @@ fn parse_search_args(args: &[String]) -> Result<SearchArgs, String> {
     // `search_p.add_argument("--limit", type=int, default=20)`.
     let mut limit = 20usize;
     let mut as_json = false;
+    let mut scope = remind_me_core::context::ScopeFilter::default();
 
     let query = collect_positional(args, SEARCH_USAGE, |flag, args, i| match flag {
+        "--project" | "--branch" | "--session" | "--written-by" => {
+            scope.set_from_flag(flag, &flag_value(args, *i, flag, SEARCH_USAGE)?);
+            *i += 2;
+            Ok(true)
+        }
         "--json" => {
             as_json = true;
             *i += 1;
@@ -545,6 +561,7 @@ fn parse_search_args(args: &[String]) -> Result<SearchArgs, String> {
     Ok(SearchArgs {
         query,
         limit,
+        scope,
         as_json,
     })
 }
@@ -795,6 +812,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // would be silently ignored, so it stays false until the
                     // CLI grows a flag and the call to match.
                     bootstrap: false,
+                    scope: search_args.scope,
                 };
                 let response_format = search_input.response_format;
                 let results: Vec<MemorySearchResult> = Store::open(&db_path)?.call(Op::Search {
@@ -820,6 +838,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             "add" => {
+                // A person typing `add`, not a model: see `context`'s rule.
+                remind_me_core::context::set_default_writer(remind_me_core::context::Writer::Human);
                 let add_args = match parse_add_args(&args[2..]) {
                     Ok(parsed) => parsed,
                     Err(message) => {
@@ -864,6 +884,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 let list_input = MemoryListInput {
                     category: list_args.category,
+                    scope: list_args.scope,
                     limit: list_args.limit,
                     response_format: if list_args.as_json {
                         ResponseFormat::Json

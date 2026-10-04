@@ -38,6 +38,7 @@ fn age_by_days(store: &Store<'_>, id: &str, days: i64) {
 
 fn search(store: &Store<'_>, query: &str, include_dormant: bool, min_vitality: f64) -> Vec<String> {
     let input = MemorySearchInput {
+        scope: Default::default(),
         strategy: Default::default(),
         include_sensitive: false,
         query: query.to_string(),

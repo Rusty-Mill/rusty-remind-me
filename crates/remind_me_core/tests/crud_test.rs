@@ -28,6 +28,7 @@ fn add(store: &Store<'_>, content: &str, category: &str, source: &str, tags: &[&
 
 fn search(store: &Store<'_>, query: &str) -> Vec<String> {
     let input = MemorySearchInput {
+        scope: Default::default(),
         strategy: Default::default(),
         include_sensitive: false,
         query: query.to_string(),

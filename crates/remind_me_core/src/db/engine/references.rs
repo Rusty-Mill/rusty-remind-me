@@ -98,7 +98,9 @@ fn rows(core: &CoreTables, keep: impl Fn(&ReferenceRecord) -> bool) -> Vec<Memor
         .filter_map(|id| core.references.get(id))
         .filter(|r| keep(r))
         .collect();
-    found.sort_by(|a, b| (&a.created_at, &a.id).cmp(&(&b.created_at, &b.id)));
+    found.sort_by(|a, b| {
+        (&a.created_at, &a.kind, &a.value, &a.id).cmp(&(&b.created_at, &b.kind, &b.value, &b.id))
+    });
     found.iter().map(ReferenceRecord::to_row).collect()
 }
 
@@ -128,12 +130,14 @@ pub(crate) fn insert(tables: &mut EngineTables, row: &NewReference) -> Result<()
 pub(crate) fn for_memory(tables: &EngineTables, memory_id: &str) -> Result<Vec<MemoryReference>> {
     let core = core_ref(tables)?;
     let mut found = of_memory(core, memory_id);
-    found.sort_by(|a, b| (&a.created_at, &a.id).cmp(&(&b.created_at, &b.id)));
+    found.sort_by(|a, b| {
+        (&a.created_at, &a.kind, &a.value, &a.id).cmp(&(&b.created_at, &b.kind, &b.value, &b.id))
+    });
     Ok(found.iter().map(ReferenceRecord::to_row).collect())
 }
 
 /// The references of every id in `memory_ids`, grouped by neither: one
-/// ordered list (oldest first, ties by id), so a caller regroups by `memory_id`.
+/// ordered list (oldest first, ties by kind, value, then id), so a caller regroups by `memory_id`.
 pub(crate) fn for_memories(
     tables: &EngineTables,
     memory_ids: &[String],
@@ -143,7 +147,9 @@ pub(crate) fn for_memories(
         .iter()
         .flat_map(|id| of_memory(core, id))
         .collect();
-    found.sort_by(|a, b| (&a.created_at, &a.id).cmp(&(&b.created_at, &b.id)));
+    found.sort_by(|a, b| {
+        (&a.created_at, &a.kind, &a.value, &a.id).cmp(&(&b.created_at, &b.kind, &b.value, &b.id))
+    });
     Ok(found.iter().map(ReferenceRecord::to_row).collect())
 }
 

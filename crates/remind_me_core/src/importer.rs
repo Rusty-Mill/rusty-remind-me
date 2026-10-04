@@ -1160,7 +1160,7 @@ pub fn import_content(
     // default 'unknown' regardless of what was actually configured. Hoisted
     // above the loop rather than called per chunk -- the identity cannot
     // change mid-import.
-    let (node_id, client) = crate::sync::memory_provenance();
+    let provenance = crate::context::importer_provenance(source);
 
     let mut created = 0;
     for (chunk_index, (content, section)) in chunks.iter().enumerate() {
@@ -1208,9 +1208,7 @@ pub fn import_content(
             metadata,
             doc_id: Some(import_id.clone()),
             chunk_index: Some(chunk_index as i64),
-            node_id: Some(node_id.clone()),
-            client: client.clone(),
-            ..NewMemory::new(memory_id.clone(), content.clone(), &now)
+            ..provenance.stamp(NewMemory::new(memory_id.clone(), content.clone(), &now))
         };
         if let Some(exported) = chunk_extras.and_then(|e| e.exported.as_ref()) {
             exported.apply(&mut row);

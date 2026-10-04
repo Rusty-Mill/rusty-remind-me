@@ -543,6 +543,10 @@ impl McpServer {
                                             "description": "Memory must have ALL of these tags"
                                         },
                                         "source": { "type": "string" },
+                                        "project": { "type": "string", "description": "Only memories written in this project (case-insensitive)" },
+                                        "branch": { "type": "string", "description": "Only memories written on this git branch" },
+                                        "session_id": { "type": "string", "description": "Only memories written in this client session" },
+                                        "written_by": { "type": "string", "description": "Only memories by this writer: human, hook, model, model:<id> or importer:<name>" },
                                         "limit": { "type": "integer", "default": 20, "minimum": 1, "maximum": 100 },
                                         "offset": { "type": "integer", "default": 0, "minimum": 0 },
                                         "include_sensitive": { "type": "boolean", "default": false, "description": "Include memories marked sensitive. Off by default, so sensitive content never surfaces in an ordinary request." }
@@ -588,6 +592,10 @@ impl McpServer {
                                         "query": { "type": "string" },
                                         "limit": { "type": "integer", "default": 20 },
                                         "category": { "type": "string" },
+                                        "project": { "type": "string", "description": "Only memories written in this project (case-insensitive)" },
+                                        "branch": { "type": "string", "description": "Only memories written on this git branch" },
+                                        "session_id": { "type": "string", "description": "Only memories written in this client session" },
+                                        "written_by": { "type": "string", "description": "Only memories by this writer: human, hook, model, model:<id> or importer:<name>" },
                                         "include_dormant": { "type": "boolean", "default": false, "description": "Include memories that have decayed below the vitality floor" },
                                         "min_vitality": { "type": "number", "default": 0, "description": "Only return memories at or above this current vitality" },
                                         "expand_entities": { "type": "boolean", "default": false, "description": "Also surface memories mentioning the same entities" },
@@ -3489,7 +3497,7 @@ mod tests {
         );
         let md = call(&server, "remind_me_search", json!({ "query": "Shipped" }));
         assert!(
-            text_of(&md).contains("refs: issue:o/r#321"),
+            text_of(&md).contains("refs: commit:3ac9f797, issue:o/r#321"),
             "{}",
             text_of(&md)
         );

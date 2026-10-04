@@ -56,9 +56,11 @@ pub fn add_memory(store: &Store<'_>, mut input: MemoryAddInput) -> Result<Memory
         base_weight,
         accessed_at: Some(now_iso.clone()),
         sensitive: input.sensitive,
-        node_id: Some(crate::sync::configured_node_id()),
-        client: crate::sync::configured_client(),
-        ..NewMemory::new(id.clone(), content.clone(), &now_iso)
+        ..crate::context::default_provenance().stamp(NewMemory::new(
+            id.clone(),
+            content.clone(),
+            &now_iso,
+        ))
     })?;
 
     // `MemoryAddInput::entities` was previously parsed and then dropped, so a
@@ -110,6 +112,7 @@ pub fn list_memories(store: &Store<'_>, input: &MemoryListInput) -> Result<Memor
         category: input.category.clone().filter(|c| !c.is_empty()),
         source: input.source.clone().filter(|s| !s.is_empty()),
         tags: input.tags.clone().unwrap_or_default(),
+        scope: input.scope.clone(),
     };
     let (total, memories) = Memories::new(store).list_page(&filter, limit, input.offset)?;
 
@@ -570,6 +573,7 @@ pub fn search_memories_deadlined(
         min_effective_vitality: floor,
         category: input.category.clone(),
         include_sensitive: input.include_sensitive,
+        scope: input.scope.clone(),
     };
 
     // `RrfFusion::Score` mode needs the raw BM25 magnitude alongside each hit.
@@ -630,6 +634,11 @@ pub fn search_memories_deadlined(
             // rank into the output. Done here rather than by threading a
             // parameter through `semantic_search_scored`, which would change an
             // existing public signature.
+            // Same reason for the project/branch/session/writer scope.
+            if !input.scope.is_empty() {
+                memories.retain(|m| input.scope.matches_memory(m));
+                similarity.retain(|id, _| memories.iter().any(|m| &m.id == id));
+            }
             if !input.include_sensitive {
                 let hidden = memories_repo.sensitive_ids()?;
                 memories.retain(|m| !hidden.contains(&m.id));
