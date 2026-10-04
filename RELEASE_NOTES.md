@@ -2,6 +2,146 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-10-04 — Plugin hooks capture and recall without being asked (ADR-0026)
+
+### Added
+- `UserPromptSubmit` injects only the memories that match the prompt, under a 3,000-character budget. `rusty-remind-me context --hits-only` returns just that section. Prompts under 12 characters and slash commands are skipped.
+- `Stop`, `PreCompact` and `SessionEnd` run `capture-transcript`, so a session no one remembered to save still leaves a capture. There is one capture per session, and each run replaces its dialog. `Stop` is throttled to once a minute and skipped when re-entrant. `SessionEnd` also closes the session and records a work log from git.
+- `REMIND_ME_HOOKS=0` turns every hook off. `REMIND_ME_PROMPT_CONTEXT=0` turns off only the per-prompt injection.
+- `scripts/test_hooks.sh` drives each hook end to end with real hook JSON against the built binary and a temporary store and git repo: 18 checks.
+
+### Changed
+- `SessionStart` opens the session row and injects a brief scoped to the project and branch (persona, reminders due within 7 days, open action items, recent memories), where it used to list the eight newest memories whatever the project.
+- A memory written with a session id leaves a `sessions` row, and the dashboard stamps its writes as `human`.
+
+### Tests
+- `context_brief`: a hits-only request returns just the prompt matches under its own heading, and nothing without a prompt.
+
+## 2026-10-04 — Sessions: transcript capture, episodes, work log and the context brief
+
+### Added
+- `rusty-remind-me session start --session-id ID [--cwd DIR] [--client NAME]` records a session and the repository's HEAD as its `start_sha`. A second start with the same id keeps the first `started_at` and `start_sha`. Prints `{"session_id","started_at","start_sha"}`.
+- `rusty-remind-me session end --session-id ID [--cwd DIR] [--reason R]` sets `ended_at` and `end_sha` and writes a `work_log` memory (category and `memory_type` `work_log`, tags `[work_log, <project>]`, `written_by` `hook`, `capture_method` `auto`) from the repository's diff since `start_sha` plus the working tree: files, insertions, deletions, untracked count, at most 40 file lines then "+N more". Prints `{"session_id","ended_at","end_sha","work_log"}`; `work_log` is the memory id, or `null` when nothing changed (no memory is written). Ending twice refreshes the same memory. A session never started is created at its end, without a `start_sha`.
+- `rusty-remind-me capture-transcript PATH.jsonl --session-id ID [--cwd DIR] [--reason stop|precompact|end]` stores a Claude Code transcript as ONE capture per session id. The first call creates the dialog and summary pair (`written_by` `hook`, `capture_method` `auto`, with the session, project, cwd and branch); later calls replace both halves' text in place and record a `recapture` revision. The summary's title is the first user message cut to 120 characters; its body is "First ask / Last reply / Messages / Tools used". The dialog keeps the last 200,000 characters. Prints `{"capture_id","dialog_id","summary_id","messages"}`.
+- `rusty-remind-me context [--cwd DIR] [--project P] [--branch B] [--prompt TEXT] [--budget CHARS] [--json]` renders the brief a session starts with: persona, reminders due within 7 days, open action items, the project's 8 most recent memories (the branch's first), and with `--prompt` the top 5 matches. Sections that do not fit `--budget` (default 8000, `0` for none) are dropped whole and named. `--json` prints `{"context","sections","dropped"}`. Project and branch default to those of `--cwd`.
+- `rusty-remind-me session timeline --session-id ID [--json]` and the MCP tool `remind_me_session_timeline {session_id?, project?, limit?, response_format?}`: one session with its memories oldest first, or without an id the most recent sessions with how many memories each wrote.
+- `--session-id` falls back to `REMIND_ME_SESSION_ID` and `--cwd` to `REMIND_ME_CWD`, then the current directory. The commands run through the store daemon when it is on, like `add` and `search`; paths are made absolute first.
+- A write that carries a `session_id` and finds no `sessions` row creates a minimal one: captures and chat imports do now.
+- `REMIND_ME_WATCH_CLAUDE_PROJECTS=1` makes the folder watcher watch the Claude Code transcripts directory (`.claude/projects` under the home directory) when `REMIND_ME_WATCH_DIRS` is unset. Off by default.
+
+### Changed
+- A chat import keeps what the transcript envelopes say. `ChatMessage` gains `timestamp`, `session_id`, `uuid`, `cwd`, `git_branch` and `tool_use` (one summary per call: tool name, the first 200 characters of its main argument, whether it failed). A memory from a chat import now carries `session_id`, `cwd`, `git_branch` and `project` (the last part of the cwd), `created_at` set to the message's own time (`updated_at` stays the import time), `written_by` `importer:chat` and `capture_method` `auto`. Tool calls are summarised as `tool: Bash — cargo test -p …`, one line each, in the `conversations` extract mode only.
+- `importer::extract_messages_with_tools` also returns a message that is only tool calls; `extract_messages` still drops it.
+- Every chat import is stamped `written_by` `importer:chat`, `capture_method` `auto`; the v32 round-trip test now expects that for a plain chat (it expected `unknown` and `manual`).
+
+### Tests
+- Importer: a JSONL fixture with timestamps, session id, cwd and tool calls gives the stamped fields; a re-import adds nothing; tool lines appear in `conversations` mode only; a plain chat is still written by the importer.
+- Transcript: parsing (ask, reply, tools, bad lines, meta lines, truncation) and one capture per session on the engine, with a recapture revision and separate captures for separate sessions.
+- Work log against a temporary git repository: a commit plus an unstaged edit give the expected counts, no change and no repository give nothing, and the file list is capped.
+- Episodes: start is idempotent, end writes and links one work log, an end with no change writes none, a stamped write creates its session. The context brief: project and branch scoping, hidden sensitive, expired and closed items, budget trimming, due reminders and prompt hits. The CLI argument parsing, the daemon op shapes and the MCP tool on an empty store.
+
+## 2026-10-04 — Boundary passes: reference extraction, secret redaction, attachment references
+
+### Added
+- Rule-based extraction at write time (`extract.rs`, no new dependency). `owner/repo#123` and GitHub issue/pull URLs become `issue`/`pull` references (`o/r#5`); other URLs, commit shas (7-40 lowercase hex with a digit and a letter), `@handles` and file paths (`src/foo.rs`, `file.rs:123` with the line kept in the label) become references too. A bare `#123`, plain numbers and emails are never extracted. Capitalised two-to-four-word runs and `snake_case`/`PascalCase` identifiers that appear twice become entity mentions; the caller's entities win on kind. At most 50 references and 20 entities per memory.
+- Extraction runs in `remind_me_add`, the summary half of `remind_me_auto_capture` (not the raw dialog), decompose facts and the importers' chunk insert (which also covers the webhook). `MemoryAddInput.extract` (default true) or `REMIND_ME_EXTRACT=0` turns it off.
+- `remind_me_get` and `remind_me_search` (JSON) carry `references` on each memory, fetched in one pass by the new `References::for_memories`. Markdown search appends a `refs:` line (up to five) per memory that has any.
+- New MCP tool `remind_me_references { kind?, value?, memory_id? }`: the reverse lookup ("everything about rusty_mill/x#321"), with a short view of each memory the references point from. Also `References::of_kind`.
+- Secret redaction (`redact.rs`): AWS access key ids, GitHub tokens, Slack tokens, `api_key`/`secret`/`token`/`password` `:`/`=` values of eight characters or more (the value only), PEM private key blocks, JWTs and the password in `https://user:pass@host`. Each is replaced by `[REDACTED:<kind>]`; the memory gains the `redacted` tag and `metadata.redactions`. Applied in add, both capture halves, decompose and the importers, before the insert. `REMIND_ME_REDACT=0` opts out.
+- Attachment references: `MemoryAddInput.attachments` (`{path?, url?, label?}`). A path is hashed with SHA-256 and stored as a `kind=attachment` reference `sha256:<hex>` labelled with the given label or the file name, plus `metadata.attachments[]` with path, size, mime (by extension) and hash. The bytes are never stored. A URL is stored as given. A missing path fails the add and names the path. `rusty-remind-me add --attach <path>` is repeatable. The `sha256` crate was already a dependency.
+
+### Tests
+- Table-driven unit tests for every extraction rule and its negatives, every redaction kind plus false-positive guards, attachment hashing, and the merge of caller and extracted entities. Integration tests on the engine store check the reference rows after `remind_me_add`, the `redacted` tag on the stored row, attachment references and the reverse lookup tool.
+
+## 2026-10-04 — Every memory records where and by whom it was written; search and list filter on it
+
+### Added
+- A `context` module fills the schema v32 context columns on every new memory: `project`, `git_remote`, `git_branch`, `git_sha`, `cwd` and `session_id`. The directory is `REMIND_ME_CWD`, else the process's own. `project` is the git top-level directory's name, else the directory's. Each `git` call has a 2-second timeout and a failure leaves only that field empty. The result is cached per directory for 30 seconds, so a burst of writes forks `git` once while a long-running server still notices a branch switch.
+- `git_remote` is stored as `host/owner/repo`: no scheme, credentials, port or `.git`. `https://user:token@github.com/o/r.git`, `ssh://git@github.com:22/o/r` and `git@github.com:o/r.git` all become `github.com/o/r`, so a token in `origin` never reaches the store and one repository is one value.
+- `written_by` and `capture_method` are filled on every write path. `REMIND_ME_WRITTEN_BY` wins when set to `human`, `hook`, `unknown`, `model`, `model:<id>` or `importer:<name>`; an unrecognised value is ignored. Otherwise `rusty-remind-me add` is `human`, an MCP tool call is `model` (`model:<id>` when `REMIND_ME_MODEL` is set), and an importer is `importer:<source>`. The webhook marks what it ingests `importer:webhook`. An importer is never overridden by the environment.
+- `capture_method` is `auto` for captures, promotions and importers, `manual` otherwise. An importer keeps only the project from the context: the branch and sha of wherever the tool ran say nothing about the files it read.
+- `REMIND_ME_CWD`, `REMIND_ME_SESSION_ID`, `REMIND_ME_WRITTEN_BY` and `REMIND_ME_MODEL` travel with each daemon connection like `REMIND_ME_CLIENT`, so the daemon stamps the caller's directory and session, not its own. A client that sets no `REMIND_ME_CWD` sends its own current directory, and the CLI's `add` declares itself `human`. These four are left out of the settings clients compare with the daemon's.
+- `remind_me_search` and `remind_me_list` take `project` (case-insensitive), `branch`, `session_id` and `written_by` (exact match). `rusty-remind-me search` and `list` take `--project`, `--branch`, `--session` and `--written-by`. They narrow inside the ranked query, so `limit` and `total` count only matching memories; the semantic half of a search is narrowed the same way.
+- Markdown rendering shows `project@branch` on a memory's header line when it has a project. The session id appears only in JSON.
+- `remind_me_stats` adds `by_project`, the ten projects with the most memories, busiest first, and a `### Projects` section in its markdown.
+
+### Changed
+- Feedback on a memory written by a hook or an importer counts half: a helpful or unhelpful signal moves `base_weight`, or is logged as a contextual event, at `0.075` instead of `0.15`. A verbatim capture is noisier than something a person or model chose to write.
+- The dashboard-database and MemPalace importers, which stamped neither `node_id` nor `client`, now stamp both along with the rest.
+
+### Tests
+- `tests/context_test.rs`: list and search filtered by each field and by all four, project case-insensitivity, `total` after filtering, flat tool arguments deserialising into the filters, `add_memory` stamping the context and writer from the environment (and ignoring a bogus override), an importer stamping itself despite `REMIND_ME_WRITTEN_BY`, feedback at half weight for `hook` and `importer:*`, `by_project` capped at ten, and the markdown header.
+- `context.rs` unit tests: remote normalisation, the `written_by` rule, `detect` against a real temporary git repository (skipped without `git`), a non-repository directory and a missing one.
+- An engine test checks the webhook marker credits `importer:webhook`.
+
+## 2026-10-04 — Typed memory kinds, outcome tracking, and validity-aware ranking
+
+### Added
+- Typed memory kinds. `MemoryKind` is a closed set (`decision`, `action_item`, `preference`, `fact`, `reference`, `insight`, `learning`, `blocker`, `work_log`, `unclassified`) in the new `kinds` module, with per-kind metadata checks: a decision needs `rationale` (a non-empty string) and may hold `alternatives` (strings) and `adr`; an action item may hold `due` (RFC 3339), `owner` and `status` (`open`, `done`, `dropped`). Other keys are allowed.
+- `remind_me_add` and `remind_me_update` take `memory_type`, `confidence` (0 to 1), `valid_from`, `valid_until` (RFC 3339, not before `valid_from`) and `outcome` (only for decisions and action items). A malformed value is refused with an error naming the field, and nothing is stored. `remind_me_decompose` checks each fact's kind and takes a per-fact `metadata`; `remind_me_reclassify` checks the kind against the memory's stored metadata, so a decision without a rationale cannot be reclassified into one. A stated `memory_type` also sets the decay rate and weight.
+- `remind_me_resolve { memory_id, outcome, note? }` and `rusty-remind-me resolve <id> <outcome> [--note]` close a decision or action item as `done`, `abandoned`, `reverted` or `superseded`. The state it replaces is kept in history with reason `resolve`. A reverted or abandoned memory loses half its `base_weight` (vitality is recomputed); `done` and `superseded` leave it. The note is stored as `metadata.outcome_note`. The tool is in the `core` profile.
+- A scenario built on a reverted or abandoned decision is no longer offered as a persona candidate, and such a source stops counting as grounds for a persona statement.
+- `remind_me_search` takes `include_expired` (default true, so nothing disappears) and `min_confidence` (default 0). A memory whose `valid_until` has passed ranks after everything in window (score times 0.25), and every memory's score is multiplied by its `confidence`. A future `valid_from` is treated like an expired window.
+- Markdown output: a decision shows its rationale and alternatives, an action item its due date and status, and the header line shows `confidence` below 1, a `valid until` date or `expired`, and an `outcome`. Memories with none of these render as before.
+- `remind_me_stale_candidates` also lists memories whose `valid_until` has passed, as `expired_at`, even when `REMIND_ME_CODE_ROOTS` is unset.
+- `remind_me_contradiction_candidates` recommends which side of a same-subject, same-predicate pair to keep (higher confidence, then newer `verified_at`, then newer `updated_at`) in `recommended_keep`, and lists that side as `memory_a`.
+- `remind_me_annotate` supersedes memories its triple contradicts, as `decompose` does, and reports `superseded_ids`.
+- `remind_me_provenance` follows `source_capture_id`: the capture a fact was decomposed from appears in `sources`, and a capture's decomposed facts in `derived`.
+- The MCP `initialize` reply carries an `instructions` string (under 600 characters) on when to search, add, auto-capture and resolve.
+
+### Fixed
+- `remind_me_add`'s schema advertised only five of the fields it accepts. It now lists `metadata`, `subject`, `predicate`, `object` and `entities` as well.
+
+### Changed
+- `remind_me_contradiction_candidates` now also pairs memories that state the same subject and predicate with different objects, which supersession should have settled and did not (a sync merge, an import). A restatement with the same object is still excluded.
+
+### Tests
+- `structure_test.rs` (16 tests): stored fields, rejection of each malformed kind with nothing written, update against the stored kind, resolve with weight and history, reclassify and decompose guards, provenance through a capture, expired and low-confidence ranking and filters, contradiction preference and its tie-breaks, expired stale candidates, annotate supersession, persona withholding.
+- `kinds` and `retrieval` unit tests, including `validity_factor` at exactly `valid_until`, with no window, and at confidence 0 and 1.
+- MCP tests over JSON-RPC for the schema, the `initialize` instructions, validation errors, `remind_me_resolve` and the Markdown extras; CLI parser and `Op::Resolve` tests.
+
+## 2026-10-04 — The SQLite runtime store is removed (ADR-0025)
+
+### Changed
+- The node's only store is the `rusty_multimodal_db` engine. The `engine-store` feature, `REMIND_ME_STORE`, `Database::open_on_sqlite`, `Database::open_on_engine`, `Database::open_in_memory_on_engine`, `Store::sqlite()`, `Store::over_sqlite` and every SQLite arm of every repository under `db/` are gone; `Database::open` always opens the engine directory beside the configured path, and `Database::open_in_memory` always opens temporary engine tables. The SQLite schema files, their migrations and the open-time schema checks went with them (about 12,500 lines).
+- Each repository under `db/` (`Memories`, `Entities`, `Outbox`, `WikiIndex`, …) is a thin layer over the `db/engine/<group>.rs` module that owns its records. Callers' names are unchanged.
+- `rusqlite` is linked in one module, read-only: `db::legacy_sqlite`. It copies an old `memory.db` onto the engine on the first open (the file is then never opened again), reads the `dbs` and MemPalace importers' SQLite files, and writes test fixtures. `grep -rn rusqlite crates/*/src | grep -v legacy_sqlite` is empty.
+- The copy reads a `memory.db` at schema version 30, 31 or 32 (v31's missing columns take the engine record's defaults). An older file is refused with the remedy: open it once with rusty-remind-me 0.2.x first. After a copy, entity ids an earlier build derived differently are rewritten once.
+- `StoreError::Sqlite(rusqlite::Error)` is `StoreError::Legacy(String)`; `BackupError::Sqlite` and `BackupError::NotSqlite` are gone. The importers' `Sqlite` error variants are folded into `Store`.
+- Backups are a copy of the engine directory (`backups/<label>-<timestamp>.engine`), taken while the tables are held and renamed into place from a `.partial` directory. Older `backups/*.db` files still list and are pruned in turn. A cloud upload of an engine backup checks the plaintext gate first, then reports `Unavailable`, as before.
+- Background threads (scheduler, watcher, promotion nudge, sync worker, peer server) work on a `SecondarySource::store()` over the shared engine tables, which lock per call, instead of a SQLite connection of their own; `Database::open_secondary` and `open_secondary_at` are gone.
+- Two things the SQLite open did on every open now happen on the engine's: the outbox is pruned by the retention rule, and a changed embedding model clears the stored vectors.
+- `remind_me_server_status` reports `database_exists` as whether the engine directory exists and `database_bytes` as the engine directory's size; `schema_version` is the version the engine's records mirror (`db::SCHEMA_VERSION`, 32).
+- `rusty-remind-me copy-store` is no longer behind a feature. The `store_bench` example runs `engine` and `open` modes only.
+- `remind_me_hub`'s SQLite reader for the hub copy tool is renamed `import::legacy_sqlite` (from `import::sqlite`); its behaviour is unchanged.
+- CI: the `store: sqlite` matrix leg is gone, and no leg passes `--features engine-store`.
+
+### Tests
+- The differential tests (`on_each_backend`, "the engine ... as SQLite does") are direct engine tests with the SQLite results written down as expectations. `schema_test.rs`, `migration_snapshot_test.rs` and `vector_rekey_test.rs` (SQLite schema, migrations and the v29 vector rekey) are deleted; the outbox gate and embedding-model checks at open moved from `schema_test.rs` to `open_reconcile_test.rs`, which also covers the outbox prune at open.
+- The copy on first open is tested against two checked-in SQLite files written by the last SQLite-storing build, `tests/fixtures/legacy_store/legacy_v32.db` and `legacy_v31.db`, with a row in every table: both copy onto the engine and read back through every repository, refused rows are reported, a filled target and an unreadable version are refused, the source is byte-for-byte untouched, and a fresh node with no file starts empty.
+- `backup_test.rs` round-trips an engine backup by restoring it and opening the restore, and checks a leftover SQLite backup still lists and prunes.
+- Before: 2182 passed, 0 failed, 0 ignored across 151 test binaries. After: see the report.
+
+## 2026-10-04 — Schema v32: where a memory was written, how far to trust it, and the tables for references and sessions
+
+### Added
+- `memories` gains thirteen columns, every one defaulted so existing rows need nothing: where the row was written (`project`, `session_id`, `git_remote`, `git_branch`, `git_sha`, `cwd`), how far to trust it (`valid_from`, `valid_until`, `confidence` at 1.0, `verified_at`, `outcome`) and who wrote it (`written_by` at `unknown`, `capture_method` at `manual`). `SCHEMA_VERSION` is 32. The entries above fill them.
+- The columns travel everywhere a memory row does: `Memory`, `NewMemory`, `MemoryEdit` (one optional setter per column, so `remind_me_update` can set them), the engine's `MemoryRow`, the outbox payload (41 keys now) and `SyncRecord` (defaulted on the way in, so a peer on an older build still syncs), the hub's `MemoryRecord`, row and wire form, and `remind_me_export_memories`. Importing one of this crate's own exports reads them back; a chat someone else exported leaves them at the defaults.
+- `models::WriteContext`: the six context columns a writer learns once per process, with `apply` to stamp a `NewMemory`.
+- Two tables on the engine store, with their repositories: `memory_references` (`db::references::References`: `insert`, `for_memory`, `find`, `delete_for_memory`) for the URLs, issues, commits, paths, handles and attachments a memory names, and `sessions` (`db::sessions::Sessions`: `upsert_start`, `end`, `get`, `recent`) for each client session's start and end. A repeated start keeps the first beginning and fills in what the first did not know. Both are part of the memories core, so a `Store::transaction` covers them and the engine copy's emptiness check counts them.
+- `SyncRecord::from_memory`, the wire record for a stored memory.
+
+### Changed
+- The engine's `memories` table moved to the `@2` layout. A table written before (`@1`) is read under its own layout and rewritten at the next open, every new column at its default; the journal and undo log need no upgrade. The hub's `MemoryRow` does the same.
+- The engine is the only store for them (ADR-0025). An older `memory.db` is copied onto the engine on first open with every new column at its default.
+
+### Tests
+- A row with every new column set reads back as written, one with none reads the defaults, and the edit's setters write each column, across insert, synced upsert and edit.
+- References inserted, listed by memory, found by kind and value, deleted; a session's repeated start, end and `recent` by project; a `@1` memories table (blob and insert log) upgrades at open and the garbage case names both failures; a journal batch from before v32 replays with defaults; a v31 SQLite file opens on the engine with every copied row's new columns defaulted.
+- Sync: a record without the columns reads the defaults; the columns round-trip through the outbox, apply on another node and read back as the same record.
+- Export: an export carries the columns and importing it reads them back; a plain chat import defaults them.
+- Hub: the columns default on parse and reach the wire; a `@1` memories table is upgraded at open and new writes follow it. The recorded route answers carry the new keys.
+
 ## 2026-09-29 — Sync status reports tombstones still holding text
 
 ### Changed

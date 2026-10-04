@@ -238,12 +238,31 @@ behind the binaries it ships alongside.
 
 ---
 
+## What a memory records
+
+Besides its text, category and tags, each memory carries the context it was written in, so it can be found by where it came from and trusted accordingly.
+
+| Group | Fields |
+| --- | --- |
+| Where | `project`, `git_remote`, `git_branch`, `git_sha`, `cwd`, `session_id`, taken from the working directory (`REMIND_ME_CWD`, else the process's own) and `REMIND_ME_SESSION_ID` |
+| Who | `written_by` (`human`, `model`, `model:<id>`, `hook`, `importer:<name>`) and `capture_method` (`manual`, `auto`) |
+| How far to trust it | `confidence` (0 to 1, scales ranking), `valid_from`, `valid_until` (an expired memory ranks last and is marked), `verified_at` |
+| What it is | `memory_type`: `decision` (needs `metadata.rationale`), `action_item` (`due`, `owner`, `status`), `preference`, `fact`, `reference`, `insight`, `learning`, `blocker`, `work_log`; and `outcome` (`done`, `abandoned`, `reverted`, `superseded`) for decisions and action items |
+| What it points at | `memory_references`: issues, pull requests, commits, URLs, file paths, @handles and attachments, extracted at write time by rules (`REMIND_ME_EXTRACT=0` turns that off). An attachment keeps a SHA-256 and a label, never the bytes |
+
+Two things happen to content before it is stored. Secrets (cloud and GitHub tokens, private keys, JWTs, passwords in URLs, `key=value` credentials) are replaced with `[REDACTED:<kind>]` and the memory is tagged `redacted` (`REMIND_ME_REDACT=0` turns that off). And a `sessions` table records each session's project, branch, start and end commit.
+
+New surfaces: MCP tools `remind_me_resolve`, `remind_me_references` and `remind_me_session_timeline` (the last two are in the `full` tool profile only; `core` is capped below 20 tools); CLI `resolve`, `session start|end|timeline`, `capture-transcript` and `context`; `--project`, `--branch`, `--session` and `--written-by` filters on `search` and `list`. With `REMIND_ME_WATCH_CLAUDE_PROJECTS=1` and `REMIND_ME_WATCH_DIRS` unset, the folder watcher ingests `~/.claude/projects/` transcripts. Design: ADR-0026.
+
 ## Claude Code Plugin
 
 `rusty_remind_me` also ships as a [Claude Code plugin](https://code.claude.com/docs/en/plugins) — `.claude-plugin/plugin.json` in this directory (the plugin root), bundling:
 
 - **`.mcp.json`** — the same stdio MCP server (`rusty-remind-me server`) described above, registered automatically instead of via the `configure` command or a manual client config edit.
-- **`hooks/hooks.json`** — a `SessionStart` hook (`hooks/scripts/session-start.sh`) that runs `rusty-remind-me list --limit 8` directly (no MCP round-trip, no model decision required) and injects the most recently written memories as context at the start of every session.
+- **`hooks/hooks.json`** — five hooks that run the CLI directly (no MCP round-trip, no model decision required):
+  - `SessionStart` (`session-start.sh`) opens the session and injects a brief scoped to the current project and branch: persona, reminders due within 7 days, open action items, recent memories.
+  - `UserPromptSubmit` (`prompt-submit.sh`) injects only the few memories that match the prompt, under a 3,000-character budget. Prompts under 12 characters and slash commands are skipped.
+  - `Stop`, `PreCompact` and `SessionEnd` (`capture.sh`) save the conversation, so a session no one remembered to save still leaves a record. There is one capture per session and each run replaces its dialog. `Stop` fires every turn, so it is throttled to once a minute; `PreCompact` and `SessionEnd` always run. `SessionEnd` also closes the session and records a work log from `git diff` since the session began.
 - **`commands/remember.md`, `commands/recall.md`** — `/rusty-remind-me:remember <text> [--category NAME] [--tags a,b]` and `/rusty-remind-me:recall <query> [--limit N]`, each running `rusty-remind-me add`/`search` directly (via the command body's `` !`...` `` bash-execution syntax) before the model ever sees the prompt. `allowed-tools` scopes each command to exactly one CLI invocation shape (`Bash(rusty-remind-me add *)` / `Bash(rusty-remind-me search *)`). Plugin-provided commands are namespaced as `/plugin-name:command-name` — the bare `/remember` is not registered, only `/rusty-remind-me:remember`.
 
 Three different connections, each with a different trigger:
@@ -251,10 +270,11 @@ Three different connections, each with a different trigger:
 | Surface | Fires when | Model's role |
 | --- | --- | --- |
 | MCP tools | Model issues a `tools/call` | Decides whether and when to call |
-| `SessionStart` hook | Every session start, unconditionally | None — output is injected before the model sees the prompt |
+| `SessionStart`, `UserPromptSubmit` hooks | Every session start and every prompt, unconditionally | None — output is injected before the model sees the prompt |
+| `Stop`, `PreCompact`, `SessionEnd` hooks | Every turn end, before compaction, at session end | None — the transcript is saved without the model |
 | `/rusty-remind-me:remember`, `/rusty-remind-me:recall` | User types the command | None for the CLI call itself; model only sees/summarizes the result |
 
-The hook and the slash commands both bypass MCP entirely — they invoke the plain CLI binary as a subprocess and never speak the MCP JSON-RPC protocol. The hook degrades safely: if `rusty-remind-me` isn't on `PATH` yet, or the store is empty, it emits `{"continue": true}` (optionally with a one-line `systemMessage` nudge to build the binary) rather than failing the session. The slash commands surface the same "not on PATH" condition as plain shell output for the model to relay, rather than silently retrying some other way.
+The hooks and the slash commands both bypass MCP entirely — they invoke the plain CLI binary as a subprocess and never speak the MCP JSON-RPC protocol. The hooks degrade safely: if `rusty-remind-me` isn't on `PATH` yet, or the store is empty, they emit `{"continue": true}` (optionally with a one-line `systemMessage` nudge to build the binary) and always exit 0, so they cannot fail a session. They write with `written_by = hook`. `REMIND_ME_HOOKS=0` turns every hook off and `REMIND_ME_PROMPT_CONTEXT=0` turns off only the per-prompt injection. `scripts/test_hooks.sh` drives each hook end to end against a built binary. The slash commands surface the same "not on PATH" condition as plain shell output for the model to relay, rather than silently retrying some other way.
 
 To use it, `rusty-remind-me` must be on `PATH` (`cargo build --release -p rusty-remind-me` then add `target/release` to `PATH`, or `cargo install --path crates/apps/rusty_remind_me/crates/remind_me_cli` from the monorepo root), then add the monorepo as a plugin marketplace in Claude Code (see [Connect it to a client](#2-connect-it-to-a-client)).
 
