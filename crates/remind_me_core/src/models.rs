@@ -364,6 +364,17 @@ pub struct MemorySearchInput {
     /// Narrow to a project, branch, session or writer (schema v32).
     #[serde(default, flatten)]
     pub scope: crate::context::ScopeFilter,
+    /// Keep memories whose `valid_until` has passed. On by default so nothing
+    /// disappears: an expired memory is ranked last and marked, not hidden.
+    #[serde(default = "default_include_expired")]
+    pub include_expired: bool,
+    /// Drop memories below this `confidence`. `0.0` keeps everything.
+    #[serde(default)]
+    pub min_confidence: f64,
+}
+
+fn default_include_expired() -> bool {
+    true
 }
 
 impl Default for MemorySearchInput {
@@ -388,6 +399,8 @@ impl Default for MemorySearchInput {
             expand_co_retrieval: false,
             bootstrap: false,
             scope: Default::default(),
+            include_expired: true,
+            min_confidence: 0.0,
         }
     }
 }
@@ -531,6 +544,10 @@ pub struct AnnotationApplied {
     pub memory_id: String,
     /// Number of *new* mention links created for this memory.
     pub entities_linked: usize,
+    /// Memories this annotation superseded because its triple contradicts
+    /// theirs, as `decompose` does.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub superseded_ids: Vec<String>,
 }
 
 /// Why one annotation in the batch could not be applied.
@@ -979,6 +996,10 @@ pub struct AtomicFact {
     pub object: Option<String>,
     #[serde(default)]
     pub entities: Vec<EntityInput>,
+    /// Kind-specific metadata (a decision's `rationale`, say), merged into
+    /// the fact's own.
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
 }
 
 /// A batch of facts to write against one capture.
@@ -1808,6 +1829,12 @@ pub struct ContradictionCandidate {
     /// the conflict reads, and re-deriving the join caller-side is work the
     /// producer has already done.
     pub shared_entities: Vec<String>,
+    /// When both sides state the same subject and predicate with different
+    /// objects, the one to keep: higher confidence, then newer
+    /// `verified_at`, then newer `updated_at`. `memory_a` is then that side.
+    /// Absent for pairs that are not a triple conflict, or are a dead heat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommended_keep: Option<String>,
 }
 
 /// A page of candidate pairs.
@@ -2215,6 +2242,8 @@ pub const STALE_CANDIDATES_LIMIT_MIN: usize = 1;
 pub const STALE_CANDIDATES_LIMIT_MAX: usize = 100;
 pub const STALE_CANDIDATES_LIMIT_DEFAULT: usize = 20;
 
+pub use crate::kinds::MemoryKind;
+
 #[cfg(test)]
 mod write_context_tests {
     use super::WriteContext;
@@ -2251,3 +2280,4 @@ mod write_context_tests {
         assert_eq!(row.written_by, "unknown", "not a context column");
     }
 }
+

@@ -546,6 +546,19 @@ impl<'c> Memories<'c> {
         engine::memories::with_code_refs(&self.core.lock())
     }
 
+    /// The id, content and `valid_until` of every live, unsuperseded,
+    /// non-sensitive memory that has one.
+    pub fn with_valid_until(&self) -> Result<Vec<(String, String, String)>> {
+        engine::memories::with_valid_until(&self.core.lock())
+    }
+
+    /// `(sources, derived)` of `id` through the capture it was decomposed
+    /// from, or the facts decomposed from it. Both empty for a memory with
+    /// neither link.
+    pub fn capture_links(&self, id: &str) -> Result<(Vec<String>, Vec<String>)> {
+        engine::memories::capture_links(&self.core.lock(), id)
+    }
+
     /// Set `metadata.ingest` to `marker` on every chunk of the import
     /// `doc_id`. Returns how many were stamped.
     pub fn set_ingest_marker(&self, doc_id: &str, marker: &str) -> Result<usize> {

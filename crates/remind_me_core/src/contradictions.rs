@@ -36,7 +36,11 @@
 use crate::db::curation::Curation;
 use crate::db::Result;
 use crate::db::Store;
-use crate::models::{ContradictionCandidate, ContradictionCandidatesResult, ContradictionSide};
+use crate::db::memories::Memories;
+use crate::models::{
+    ContradictionCandidate, ContradictionCandidatesResult, ContradictionSide, Memory,
+};
+use std::cmp::Ordering;
 
 /// Entities mentioned by more memories than this are excluded from the pairing
 /// join.
@@ -52,6 +56,38 @@ const SNIPPET_CHARS: usize = 500;
 
 fn side(store: &Store<'_>, memory_id: &str) -> Result<ContradictionSide> {
     Curation::new(store).contradiction_side(memory_id, SNIPPET_CHARS)
+}
+
+/// Whether two memories state the same subject and predicate with different
+/// objects (case and surrounding space ignored): a conflict worth ranking,
+/// not merely two memories on one topic.
+fn conflicting_triples(a: &Memory, b: &Memory) -> bool {
+    let norm = |s: &Option<String>| s.as_deref().map(|s| s.trim().to_lowercase());
+    let (sa, sb) = (norm(&a.subject), norm(&b.subject));
+    let (pa, pb) = (norm(&a.predicate), norm(&b.predicate));
+    let (oa, ob) = (norm(&a.object), norm(&b.object));
+    sa.is_some() && sa == sb && pa.is_some() && pa == pb && oa.is_some() && ob.is_some() && oa != ob
+}
+
+/// Which of two conflicting memories to keep: higher confidence, then newer
+/// `verified_at`, then newer `updated_at`. `None` for a pair that is not a
+/// triple conflict, or ties on all three. RFC 3339 strings are compared as
+/// text, as everywhere else in this crate.
+pub fn preferred<'a>(a: &'a Memory, b: &'a Memory) -> Option<&'a Memory> {
+    if !conflicting_triples(a, b) {
+        return None;
+    }
+    let order = a
+        .confidence
+        .partial_cmp(&b.confidence)
+        .unwrap_or(Ordering::Equal)
+        .then_with(|| a.verified_at.cmp(&b.verified_at))
+        .then_with(|| a.updated_at.cmp(&b.updated_at));
+    match order {
+        Ordering::Greater => Some(a),
+        Ordering::Less => Some(b),
+        Ordering::Equal => None,
+    }
 }
 
 /// A batch of candidate pairs, plus the full backlog size.
@@ -120,11 +156,23 @@ pub fn candidates(
     };
 
     let mut candidates = Vec::with_capacity(ids.len());
+    let memories = Memories::new(store);
     for (id_a, id_b) in ids {
+        // Only the sides swap; the cursor above came from `ids` and is
+        // unaffected.
+        let keep = match (memories.get_live(&id_a)?, memories.get_live(&id_b)?) {
+            (Some(a), Some(b)) => preferred(&a, &b).map(|m| m.id.clone()),
+            _ => None,
+        };
+        let (first, second) = match &keep {
+            Some(k) if *k == id_b => (&id_b, &id_a),
+            _ => (&id_a, &id_b),
+        };
         candidates.push(ContradictionCandidate {
             shared_entities: shared_entities(store, &id_a, &id_b)?,
-            memory_a: side(store, &id_a)?,
-            memory_b: side(store, &id_b)?,
+            memory_a: side(store, first)?,
+            memory_b: side(store, second)?,
+            recommended_keep: keep,
         });
     }
 

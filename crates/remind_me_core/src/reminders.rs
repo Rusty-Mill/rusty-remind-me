@@ -182,18 +182,26 @@ fn render_memory_markdown(m: &Memory) -> String {
     } else {
         m.tags.join(", ")
     };
+    let marks = crate::kinds::header_marks(m, Utc::now());
+    let marks = if marks.is_empty() {
+        String::new()
+    } else {
+        format!(" _({})_", marks.join(", "))
+    };
     let mut lines = vec![
         format!(
-            "### Memory `{}`{}{}",
+            "### Memory `{}`{}{}{}",
             m.id,
             if m.sensitive { " 🔒 _sensitive_" } else { "" },
-            project_label(m)
+            project_label(m),
+            marks
         ),
         format!(
             "**Category:** {}  |  **Tags:** {}  |  **Source:** {}",
             m.category, tags, m.source
         ),
     ];
+    lines.extend(crate::kinds::kind_lines(m));
 
     if let Some(object) = m.metadata.as_object() {
         if !object.is_empty() {

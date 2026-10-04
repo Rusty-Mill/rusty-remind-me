@@ -456,6 +456,8 @@ fn neighbour_expansion_finally_finds_something() {
             include_neighbors: true,
             expand_co_retrieval: false,
             bootstrap: false,
+            include_expired: true,
+            min_confidence: 0.0,
         },
     )
     .unwrap();

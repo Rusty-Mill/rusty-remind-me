@@ -37,7 +37,7 @@ pub const VALID_PROFILES: [&str; 3] = ["full", "standard", "core"];
 /// `remind_me_server_status` is here deliberately despite otherwise being an
 /// ops tool — it is what *reports which profile is active*, and a profile you
 /// cannot diagnose from inside a session is a trap.
-pub const CORE: [&str; 18] = [
+pub const CORE: [&str; 19] = [
     "remind_me_search",
     "remind_me_add",
     "remind_me_get",
@@ -59,6 +59,7 @@ pub const CORE: [&str; 18] = [
     "remind_me_wiki_read",
     "remind_me_wiki_search",
     "remind_me_wiki_list",
+    "remind_me_resolve",
 ];
 
 /// The LLM-driven maintenance loops, each fronted by a prompt.

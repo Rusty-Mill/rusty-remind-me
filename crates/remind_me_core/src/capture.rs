@@ -284,7 +284,12 @@ pub fn decompose(store: &Store<'_>, input: &DecomposeInput) -> Result<Option<Dec
         // #260: a no-op unless REMIND_ME_CODE_ROOTS is configured. Merged
         // into the metadata object already built for `source_capture_id`
         // rather than a separate write, so one INSERT still carries both.
-        let mut metadata = serde_json::json!({ "source_capture_id": input.capture_id });
+        let mut metadata = fact
+            .metadata
+            .clone()
+            .filter(serde_json::Value::is_object)
+            .unwrap_or_else(|| serde_json::json!({}));
+        metadata["source_capture_id"] = serde_json::json!(input.capture_id);
         let code_refs = crate::code_refs::detect_code_refs(&fact.content);
         crate::code_refs::merge_code_refs(&mut metadata, &code_refs);
 

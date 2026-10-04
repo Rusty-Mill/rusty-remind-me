@@ -74,6 +74,21 @@ fn live(row: &MemoryRow) -> bool {
     row.deleted_at.is_none() && row.superseded_by.is_none()
 }
 
+/// A decision that was reverted or abandoned: no longer grounds for
+/// anything built on it.
+fn discredited(row: &MemoryRow) -> bool {
+    row.memory_type == "decision" && matches!(row.outcome.as_deref(), Some("reverted" | "abandoned"))
+}
+
+/// Ids of promoted memories with at least one discredited source.
+fn built_on_discredited(core: &CoreTables) -> HashSet<String> {
+    promotions(core)
+        .into_iter()
+        .filter(|p| memories::row(core, &p.source_id).is_some_and(|row| discredited(&row)))
+        .map(|p| p.promoted_id)
+        .collect()
+}
+
 fn promoted_at_rung(core: &CoreTables, rung: &str) -> HashSet<String> {
     promotions(core)
         .into_iter()
@@ -176,7 +191,9 @@ pub(crate) fn surviving_sources(tables: &EngineTables, promoted_id: &str) -> Res
     Ok(promotions(core)
         .into_iter()
         .filter(|p| p.promoted_id == promoted_id)
-        .filter(|p| memories::row(core, &p.source_id).is_some_and(|row| live(&row)))
+        .filter(|p| {
+            memories::row(core, &p.source_id).is_some_and(|row| live(&row) && !discredited(&row))
+        })
         .count())
 }
 
@@ -281,9 +298,13 @@ pub(crate) fn count_entity_fact_groups(
 /// vitality, not promoted at `rung`: most vital first, ties by id.
 fn scenarios(core: &CoreTables, category: &str, floor: f64, rung: &str) -> Vec<MemoryRow> {
     let promoted = promoted_at_rung(core, rung);
+    // A scenario resting on a reverted or abandoned decision is not a
+    // durable statement about the user; withheld, not deleted.
+    let withheld = built_on_discredited(core);
     let mut rows: Vec<MemoryRow> = memories::rows(core)
         .filter(|row| live(row) && !row.sensitive && row.category == category)
         .filter(|row| row.vitality >= floor && !promoted.contains(&row.id))
+        .filter(|row| !withheld.contains(&row.id))
         .collect();
     rows.sort_by(|a, b| {
         b.vitality

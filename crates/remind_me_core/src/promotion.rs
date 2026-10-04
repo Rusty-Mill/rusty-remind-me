@@ -387,8 +387,19 @@ pub fn promote(store: &Store<'_>, input: &PromoteInput) -> Result<PromotionResul
 /// and "what does this fact still support" cost the same.
 pub fn provenance(store: &Store<'_>, memory_id: &str) -> SqlResult<Provenance> {
     let promotions = Promotions::new(store);
-    let sources = promotions.sources_of(memory_id)?;
-    let derived = promotions.derived_from(memory_id)?;
+    let mut sources = promotions.sources_of(memory_id)?;
+    let mut derived = promotions.derived_from(memory_id)?;
+
+    // The capture a fact was decomposed from is its source; a capture's
+    // decomposed facts are what was derived from it.
+    let (capture_sources, capture_derived) = Memories::new(store).capture_links(memory_id)?;
+    for (list, extra) in [(&mut sources, capture_sources), (&mut derived, capture_derived)] {
+        for id in extra {
+            if !list.contains(&id) {
+                list.push(id);
+            }
+        }
+    }
 
     Ok(Provenance {
         memory_id: memory_id.to_string(),

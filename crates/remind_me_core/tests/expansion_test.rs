@@ -74,6 +74,8 @@ fn search(
         include_neighbors: false,
         expand_co_retrieval: false,
         bootstrap: false,
+        include_expired: true,
+        min_confidence: 0.0,
     };
     configure(&mut input);
     queries::search_with_expansions(store, &input).unwrap()
