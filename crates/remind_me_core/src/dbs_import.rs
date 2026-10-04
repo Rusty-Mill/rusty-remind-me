@@ -52,7 +52,7 @@ use crate::entity::{link_memory_entity, upsert_entity};
 use crate::import_paths::{validate_import_database, ImportPathError};
 use crate::models::{DbsImportInput, EntityInput, DBS_IMPORT_LIMIT_MAX, DBS_IMPORT_LIMIT_MIN};
 use chrono::Utc;
-use rusqlite::{params_from_iter, Connection, OpenFlags};
+use crate::db::legacy_sqlite::LegacyDb;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -87,8 +87,7 @@ pub enum DbsImportError {
         path: String,
         detail: String,
     },
-    Sqlite(rusqlite::Error),
-    /// The node's own store failed.
+    /// The node's own store failed, or the archive could not be read.
     Store(crate::db::StoreError),
 }
 
@@ -104,7 +103,6 @@ impl std::fmt::Display for DbsImportError {
                 "Not a dbs archive: {} has no items/sources tables ({})",
                 path, detail
             ),
-            Self::Sqlite(e) => write!(f, "{}", e),
             Self::Store(e) => write!(f, "{}", e),
         }
     }
@@ -121,12 +119,6 @@ impl From<ImportPathError> for DbsImportError {
 impl From<crate::db::StoreError> for DbsImportError {
     fn from(e: crate::db::StoreError) -> Self {
         Self::Store(e)
-    }
-}
-
-impl From<rusqlite::Error> for DbsImportError {
-    fn from(e: rusqlite::Error) -> Self {
-        Self::Sqlite(e)
     }
 }
 
@@ -174,31 +166,13 @@ struct DbsItem {
 
 /// Open a `dbs` archive read-only.
 ///
-/// `rusqlite` does not touch the file until a statement runs, so this issues
-/// one immediately: a caller that passes a JPEG should learn that here, not
-/// several layers into the import.
-fn open_dbs(path: &Path) -> std::result::Result<Connection, DbsImportError> {
-    let conn = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-    )
-    .map_err(|e| DbsImportError::NotADatabase {
+/// The reader touches the file at once: a caller that passes a JPEG should
+/// learn that here, not several layers into the import.
+fn open_dbs(path: &Path) -> std::result::Result<LegacyDb, DbsImportError> {
+    LegacyDb::open(path).map_err(|e| DbsImportError::NotADatabase {
         path: path.display().to_string(),
         detail: e.to_string(),
-    })?;
-
-    conn.query_row("SELECT 1 FROM sqlite_master LIMIT 1", [], |_| Ok(()))
-        .or_else(|e| match e {
-            // An empty database is a valid one; it just has no tables yet, and
-            // the missing-tables check below gives a better message for it.
-            rusqlite::Error::QueryReturnedNoRows => Ok(()),
-            other => Err(DbsImportError::NotADatabase {
-                path: path.display().to_string(),
-                detail: other.to_string(),
-            }),
-        })?;
-
-    Ok(conn)
+    })
 }
 
 /// The deterministic id for one version of one `dbs` item.
@@ -252,19 +226,19 @@ pub fn memory_content(
 
 /// Read one page of live items from the archive.
 fn read_items(
-    dbs: &Connection,
+    dbs: &LegacyDb,
     input: &DbsImportInput,
     limit: usize,
 ) -> std::result::Result<Vec<DbsItem>, DbsImportError> {
     let mut where_sql = String::from("i.deleted = 0");
-    let mut binds: Vec<String> = Vec::new();
+    let mut binds: Vec<serde_json::Value> = Vec::new();
     if !input.source.is_empty() {
         where_sql.push_str(" AND s.name = ?");
-        binds.push(input.source.clone());
+        binds.push(input.source.clone().into());
     }
     if !input.item_type.is_empty() {
         where_sql.push_str(" AND i.item_kind = ?");
-        binds.push(input.item_type.clone());
+        binds.push(input.item_type.clone().into());
     }
 
     // Ordered by creation then id so paging is stable: without a total order,
@@ -278,38 +252,38 @@ fn read_items(
           LIMIT ? OFFSET ?",
         where_sql
     );
+    binds.push((limit as i64).into());
+    binds.push((input.offset as i64).into());
 
-    let mut statement = dbs
-        .prepare(&sql)
+    // A query that fails to prepare is a database without these tables.
+    let rows = dbs
+        .query(&sql, &binds)
         .map_err(|e| DbsImportError::NotADbsArchive {
             path: String::new(),
             detail: e.to_string(),
         })?;
-
-    let mut values: Vec<rusqlite::types::Value> = binds
-        .into_iter()
-        .map(rusqlite::types::Value::Text)
-        .collect();
-    values.push(rusqlite::types::Value::Integer(limit as i64));
-    values.push(rusqlite::types::Value::Integer(input.offset as i64));
-
-    let rows = statement.query_map(params_from_iter(values), |row| {
-        Ok(DbsItem {
-            external_id: row.get("external_id")?,
-            item_kind: row.get("item_kind")?,
-            title: row.get("title")?,
-            url: row.get("url")?,
-            body: row.get("body")?,
-            tags_json: row.get("tags_json")?,
-            item_created_at: row.get("item_created_at")?,
-            content_hash: row.get("content_hash")?,
-            source_name: row.get("source_name")?,
+    let text = |row: &crate::db::legacy_sqlite::Row, column: &str| -> Option<String> {
+        row.get(column).and_then(|v| v.as_str()).map(str::to_string)
+    };
+    let required = |row: &crate::db::legacy_sqlite::Row, column: &str| {
+        text(row, column).ok_or_else(|| DbsImportError::NotADbsArchive {
+            path: String::new(),
+            detail: format!("items.{column} is missing or not text"),
         })
-    })?;
-
-    let mut items = Vec::new();
-    for row in rows {
-        items.push(row?);
+    };
+    let mut items = Vec::with_capacity(rows.len());
+    for row in &rows {
+        items.push(DbsItem {
+            external_id: required(row, "external_id")?,
+            item_kind: text(row, "item_kind"),
+            title: text(row, "title"),
+            url: text(row, "url"),
+            body: text(row, "body"),
+            tags_json: text(row, "tags_json"),
+            item_created_at: text(row, "item_created_at"),
+            content_hash: required(row, "content_hash")?,
+            source_name: required(row, "source_name")?,
+        });
     }
     Ok(items)
 }
@@ -520,7 +494,6 @@ mod tests {
     use super::*;
     use crate::db::imports::ImportLedger;
     use crate::db::Database;
-    use rusqlite::params;
 
     /// A `dbs`-shaped archive of `(external_id, content_hash, tags)` items,
     /// all from one source, in a scratch directory under the import root.
@@ -530,8 +503,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("dbs.db");
-        let dbs = Connection::open(&path).unwrap();
-        dbs.execute_batch(
+        let mut sql = String::from(
             "CREATE TABLE sources (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
              INSERT INTO sources (id, name) VALUES (1, 'raindrop');
              CREATE TABLE items (
@@ -541,23 +513,17 @@ mod tests {
                  item_updated_at TEXT, content_hash TEXT NOT NULL,
                  deleted INTEGER NOT NULL DEFAULT 0
              );",
-        )
-        .unwrap();
+        );
         for (external_id, hash, tags) in items {
-            dbs.execute(
+            let tags = serde_json::to_string(tags).unwrap().replace('\'', "''");
+            sql.push_str(&format!(
                 "INSERT INTO items (source_id, external_id, item_kind, title, body,
                      tags_json, item_created_at, item_updated_at, content_hash)
-                 VALUES (1, ?, 'link', ?, 'body', ?, '2026-01-01T00:00:00+00:00',
-                     '2026-01-01T00:00:00+00:00', ?)",
-                params![
-                    external_id,
-                    format!("title {external_id}"),
-                    serde_json::to_string(tags).unwrap(),
-                    hash
-                ],
-            )
-            .unwrap();
+                 VALUES (1, '{external_id}', 'link', 'title {external_id}', 'body', '{tags}',
+                     '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00', '{hash}');"
+            ));
         }
+        crate::db::legacy_sqlite::fixture(&path, &sql).unwrap();
         path
     }
 
@@ -609,7 +575,7 @@ mod tests {
     }
 
     #[test]
-    fn a_dbs_page_imports_alike_on_both_backends() {
+    fn a_dbs_page_imports_and_a_rerun_updates_what_changed() {
         // Every item shares a tag, so each one after the first finds the
         // entity an earlier item in the same page created.
         let first = archive(
@@ -628,14 +594,13 @@ mod tests {
                 ("x3", "h3", &["shared", "only-x3"]),
             ],
         );
-        let mut observed = Vec::new();
-        crate::db::on_each_backend(|db| observed.push(exercise(db, &first, &second)));
-        let sqlite = &observed[0];
-        assert!(sqlite[0].contains("created: 3"), "{}", sqlite[0]);
-        assert!(sqlite[3].contains("updated: 1"), "{}", sqlite[3]);
-        for other in &observed[1..] {
-            assert_eq!(other, sqlite);
-        }
+        let db = Database::open_in_memory().unwrap();
+        let seen = exercise(&db, &first, &second);
+        assert!(seen[0].contains("created: 3"), "{}", seen[0]);
+        assert!(seen[1].contains("x1") && seen[1].contains("x3"), "{}", seen[1]);
+        assert!(seen[3].contains("updated: 1"), "{}", seen[3]);
+        assert!(seen[4].contains("h2-changed"), "{}", seen[4]);
+        assert_eq!(seen[2], seen[5], "a rerun creates no new entities");
         for path in [first, second] {
             let _ = std::fs::remove_dir_all(path.parent().unwrap());
         }

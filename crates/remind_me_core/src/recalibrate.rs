@@ -82,8 +82,8 @@ pub fn candidates(
     let feedback = Feedback::new(store);
     let filter = review_filter();
     let total = feedback.review_count(&filter)?;
-    // rusqlite 0.32+ has no `ToSql` for `usize`; a limit past `i64::MAX` is
-    // unbounded either way, so saturating is exact rather than a truncation.
+    // The repository takes an `i64`; a limit past `i64::MAX` is unbounded
+    // either way, so saturating is exact rather than a truncation.
     let limit = i64::try_from(input.limit).unwrap_or(i64::MAX);
     let candidates = feedback.review_batch(&filter, SNIPPET_CHARS, limit)?;
 

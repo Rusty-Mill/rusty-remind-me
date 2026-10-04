@@ -39,7 +39,6 @@ use crate::db::{SecondarySource, Store};
 use crate::models::Memory;
 use crate::notifications;
 use crate::reminders;
-use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -286,25 +285,20 @@ impl SchedulerHandle {
 
 /// Start the scheduler for the database `store` is attached to.
 ///
-/// Returns `None` for an in-memory database: the loop's thread opens its own
-/// connection by path, and `:memory:` would give it a *different*, empty
-/// database rather than this one. Silently polling an empty database forever
-/// would look exactly like a vault with nothing due.
+/// Returns `None` for an in-memory database: it lives only as long as its
+/// `Database`, so there is nothing a background thread could outlive it on.
 pub fn start_scheduler_for(store: &Store<'_>) -> Option<SchedulerHandle> {
     Some(start_scheduler(store.secondary_source()?))
 }
 
-/// Start the polling loop against the database `source` reopens.
+/// Start the polling loop against the database `source` reaches.
 ///
-/// The thread opens its own connection rather than sharing the caller's:
-/// `rusqlite::Connection` is not `Sync`, and passing one across would trade a
-/// compile error for a runtime serialisation problem. It shares the source's
-/// engine tables, which lock per call.
+/// The thread works on the source's shared engine tables without the
+/// database's lock; the tables lock per call.
 ///
 /// Unconditional, unlike the folder watcher — reminders have no enable switch,
 /// only an interval.
 pub fn start_scheduler(source: SecondarySource) -> SchedulerHandle {
-    let db_path = source.path().to_path_buf();
     let stop = Arc::new(Stop::new());
     let loop_stop = Arc::clone(&stop);
     let interval = configured_poll_interval();
@@ -315,18 +309,12 @@ pub fn start_scheduler(source: SecondarySource) -> SchedulerHandle {
         .name("reminder-scheduler".to_string())
         .spawn(move || {
             let _liveness_guard = liveness_guard;
-            let store = match Connection::open(&db_path) {
-                Ok(store) => store,
-                Err(e) => {
-                    eprintln!("reminder scheduler: cannot open {:?}: {}", db_path, e);
-                    return;
-                }
-            };
+            let store = source.store();
             while !loop_stop.is_stopped() {
                 // A failed pass is reported and the loop continues. A
                 // transient database error must not silently end reminder
                 // delivery for the rest of the process's life.
-                match poll_once(&source.store(&store)) {
+                match poll_once(&store) {
                     Ok(0) => {}
                     Ok(n) => eprintln!("reminder scheduler: delivered {} reminder(s)", n),
                     Err(e) => eprintln!("reminder scheduler: poll failed: {}", e),

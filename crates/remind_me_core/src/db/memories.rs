@@ -1,31 +1,23 @@
 //! Storage for memory rows: every insert, sync upsert and field update of
-//! `memories` that used to be written inline by a domain module.
+//! `memories`, on the engine's memories core (`db::engine::memories`).
 //!
-//! This is ADR-0023's phase 1, step 1. Every write goes through
-//! `db::derived::write_memory`, which keeps the derived data (the FTS index,
-//! the tag index and the sync outbox) in step, as triggers did up to schema
-//! v30 (step 7). The rules stay with their modules: what a capture, a promotion or
-//! a consolidation writes, and how vitality is seeded, are decided there and
-//! handed over as a [`NewMemory`] or a field value.
+//! Every write keeps the derived data (the full-text index, the tag index
+//! and the sync outbox) in step, as triggers did up to schema v30. The rules
+//! stay with their modules: what a capture, a promotion or a consolidation
+//! writes, and how vitality is seeded, are decided there and handed over as
+//! a [`NewMemory`] or a field value.
 
-#[cfg(feature = "engine-store")]
 use super::engine::{self, EngineLock};
 use super::{Result, Store};
-use crate::db::derived::{memory_ids, write_memory, Origin};
-use crate::db::queries::{parse_memory_row, prefixed_memory_columns, MEMORY_COLUMNS};
 use crate::models::{Memory, UnannotatedMemory, UnclassifiedMemory};
 use crate::sync::TOMBSTONE_CONTENT;
-use crate::vitality::EFFECTIVE_VITALITY_FN;
-use rusqlite::types::Value as SqlValue;
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde_json::Value;
 use std::collections::HashSet;
 
 /// A whole `memories` row, as a writer supplies it.
 ///
 /// [`NewMemory::new`] fills every column with the schema's own default, so a
-/// writer names only the columns it sets, and the row matches what an
-/// `INSERT` naming just those columns used to produce.
+/// writer names only the columns it sets.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewMemory {
     pub id: String,
@@ -87,7 +79,8 @@ impl NewMemory {
     }
 
     /// A row holding `content` under `id`, created and updated at `now`, with
-    /// every other column at the schema's default (`schema_tables.sql`).
+    /// every other column at the schema's default (what the SQLite store's
+    /// `DEFAULT` clauses gave a row; the engine record keeps them).
     pub fn new(id: impl Into<String>, content: impl Into<String>, now: &str) -> Self {
         Self {
             id: id.into(),
@@ -226,59 +219,6 @@ impl MemoryEdit {
             ..Self::default()
         }
     }
-
-    /// The `SET` list and its bindings, in the column order the edit names.
-    fn assignments(&self) -> (Vec<&'static str>, Vec<SqlValue>) {
-        let mut sets = Vec::new();
-        let mut bindings = Vec::new();
-        let mut text = |column: &'static str, value: &Option<String>| {
-            if let Some(v) = value {
-                sets.push(column);
-                bindings.push(SqlValue::Text(v.clone()));
-            }
-        };
-        text("content = ?", &self.content);
-        text("category = ?", &self.category);
-        text("tags = ?", &self.tags.as_deref().map(tags_json));
-        text(
-            "metadata = ?",
-            &self.metadata.as_ref().map(Value::to_string),
-        );
-        text("subject = ?", &self.subject);
-        text("predicate = ?", &self.predicate);
-        text("object = ?", &self.object);
-        text("memory_type = ?", &self.memory_type);
-        text("project = ?", &self.project);
-        text("session_id = ?", &self.session_id);
-        text("git_remote = ?", &self.git_remote);
-        text("git_branch = ?", &self.git_branch);
-        text("git_sha = ?", &self.git_sha);
-        text("cwd = ?", &self.cwd);
-        text("valid_from = ?", &self.valid_from);
-        text("valid_until = ?", &self.valid_until);
-        text("verified_at = ?", &self.verified_at);
-        text("outcome = ?", &self.outcome);
-        text("written_by = ?", &self.written_by);
-        text("capture_method = ?", &self.capture_method);
-        if let Some(confidence) = self.confidence {
-            sets.push("confidence = ?");
-            bindings.push(SqlValue::Real(confidence));
-        }
-        if let Some(sensitive) = self.sensitive {
-            sets.push("sensitive = ?");
-            bindings.push(SqlValue::Integer(i64::from(sensitive)));
-        }
-        if let Some(rate) = self.decay_rate {
-            sets.push("decay_rate = ?");
-            bindings.push(SqlValue::Real(rate));
-        }
-        if self.clear_superseded {
-            sets.push("superseded_by = NULL");
-        }
-        sets.push("updated_at = ?");
-        bindings.push(SqlValue::Text(self.updated_at.clone()));
-        (sets, bindings)
-    }
 }
 
 /// Which live, unsuperseded memories a ranked keyword search takes.
@@ -310,129 +250,30 @@ pub struct EntityScope {
     pub canonical: String,
 }
 
-/// The columns an insert writes, in [`insert_values`]' order.
-const INSERT_COLUMNS: &str = "id, content, category, tags, source, metadata, created_at, \
-     updated_at, capture_id, subject, predicate, object, superseded_by, decay_rate, vitality, \
-     base_weight, access_count, accessed_at, doc_id, chunk_index, remind_at, sensitive, \
-     memory_type, status, node_id, client, source_capture_id, deleted_at, \
-     project, session_id, git_remote, git_branch, git_sha, cwd, valid_from, valid_until, \
-     confidence, verified_at, outcome, written_by, capture_method";
-
-/// One placeholder per entry of [`INSERT_COLUMNS`].
-const INSERT_PLACEHOLDERS: &str = "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?";
-
-/// `row`'s values in [`INSERT_COLUMNS`]' order.
-fn insert_values(row: &NewMemory) -> Vec<SqlValue> {
-    let text = |s: &str| SqlValue::Text(s.to_string());
-    let opt_text = |s: &Option<String>| s.as_deref().map_or(SqlValue::Null, text);
-    vec![
-        text(&row.id),
-        text(&row.content),
-        text(&row.category),
-        SqlValue::Text(tags_json(&row.tags)),
-        text(&row.source),
-        SqlValue::Text(row.metadata.to_string()),
-        text(&row.created_at),
-        text(&row.updated_at),
-        opt_text(&row.capture_id),
-        opt_text(&row.subject),
-        opt_text(&row.predicate),
-        opt_text(&row.object),
-        opt_text(&row.superseded_by),
-        SqlValue::Real(row.decay_rate),
-        SqlValue::Real(row.vitality),
-        SqlValue::Real(row.base_weight),
-        SqlValue::Integer(row.access_count),
-        opt_text(&row.accessed_at),
-        opt_text(&row.doc_id),
-        row.chunk_index.map_or(SqlValue::Null, SqlValue::Integer),
-        opt_text(&row.remind_at),
-        SqlValue::Integer(i64::from(row.sensitive)),
-        text(&row.memory_type),
-        text(&row.status),
-        opt_text(&row.node_id),
-        text(&row.client),
-        opt_text(&row.source_capture_id),
-        opt_text(&row.deleted_at),
-        opt_text(&row.project),
-        opt_text(&row.session_id),
-        opt_text(&row.git_remote),
-        opt_text(&row.git_branch),
-        opt_text(&row.git_sha),
-        opt_text(&row.cwd),
-        opt_text(&row.valid_from),
-        opt_text(&row.valid_until),
-        SqlValue::Real(row.confidence),
-        opt_text(&row.verified_at),
-        opt_text(&row.outcome),
-        text(&row.written_by),
-        text(&row.capture_method),
-    ]
-}
-
 /// `tags` as the JSON array the `tags` column holds.
 pub(crate) fn tags_json(tags: &[String]) -> String {
     serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string())
 }
 
-/// The `memories` table, over one connection, or on the engine's memories
-/// core when the store's tables hold it (`db::engine::memories`).
+/// The `memories` table, on the engine's memories core.
 pub struct Memories<'c> {
-    conn: &'c Connection,
-    #[cfg(feature = "engine-store")]
-    core: Option<&'c EngineLock>,
-}
-
-/// Answer from the engine's memories core when the repository has it.
-macro_rules! on_core {
-    ($self:ident, |$tables:ident| $body:expr) => {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = $self.core {
-            #[allow(unused_mut)]
-            let mut $tables = core.lock();
-            return $body;
-        }
-    };
+    core: &'c EngineLock,
 }
 
 impl<'c> Memories<'c> {
     pub fn new(store: &'c Store<'_>) -> Self {
-        Self {
-            conn: store.conn(),
-            #[cfg(feature = "engine-store")]
-            core: store.core(),
-        }
+        Self { core: store.core() }
     }
 
     /// Insert `row`, made on this node. An existing id is an error.
     pub fn insert(&self, row: &NewMemory) -> Result<()> {
-        on_core!(self, |tables| engine::memories::insert(&mut tables, row));
-        write_memory(self.conn, &row.id, Origin::Local, || {
-            Ok(self.conn.execute(
-                &format!("INSERT INTO memories ({INSERT_COLUMNS}) VALUES ({INSERT_PLACEHOLDERS})"),
-                params_from_iter(insert_values(row)),
-            )?)
-        })?;
-        Ok(())
+        engine::memories::insert(&mut self.core.lock(), row)
     }
 
     /// Insert `row` unless its id is already taken. Returns whether it was
     /// inserted.
     pub fn insert_or_ignore(&self, row: &NewMemory) -> Result<bool> {
-        on_core!(self, |tables| engine::memories::insert_or_ignore(
-            &mut tables,
-            row
-        ));
-        let inserted = write_memory(self.conn, &row.id, Origin::Local, || {
-            Ok(self.conn.execute(
-                &format!(
-                    "INSERT OR IGNORE INTO memories ({INSERT_COLUMNS}) VALUES ({INSERT_PLACEHOLDERS})"
-                ),
-                params_from_iter(insert_values(row)),
-            )?)
-        })?;
-        Ok(inserted > 0)
+        engine::memories::insert_or_ignore(&mut self.core.lock(), row)
     }
 
     /// Write a record a peer sent: insert it, or overwrite the local row.
@@ -441,103 +282,20 @@ impl<'c> Memories<'c> {
     /// a peer's record does not carry the last two, and the first never
     /// changes. Never queued for sync: it came from there.
     pub fn upsert_synced(&self, row: &NewMemory) -> Result<()> {
-        on_core!(self, |tables| engine::memories::upsert_synced(
-            &mut tables,
-            row
-        ));
-        write_memory(self.conn, &row.id, Origin::Sync, || self.upsert_row(row))?;
-        Ok(())
-    }
-
-    fn upsert_row(&self, row: &NewMemory) -> Result<usize> {
-        Ok(self.conn.execute(
-            &format!(
-                "INSERT INTO memories ({INSERT_COLUMNS}) VALUES ({INSERT_PLACEHOLDERS})
-                 ON CONFLICT(id) DO UPDATE SET
-                    content = excluded.content,
-                    category = excluded.category,
-                    tags = excluded.tags,
-                    source = excluded.source,
-                    metadata = excluded.metadata,
-                    updated_at = excluded.updated_at,
-                    capture_id = excluded.capture_id,
-                    node_id = excluded.node_id,
-                    client = excluded.client,
-                    accessed_at = excluded.accessed_at,
-                    access_count = excluded.access_count,
-                    decay_rate = excluded.decay_rate,
-                    vitality = excluded.vitality,
-                    base_weight = excluded.base_weight,
-                    status = excluded.status,
-                    memory_type = excluded.memory_type,
-                    source_capture_id = excluded.source_capture_id,
-                    subject = excluded.subject,
-                    predicate = excluded.predicate,
-                    object = excluded.object,
-                    superseded_by = excluded.superseded_by,
-                    deleted_at = excluded.deleted_at,
-                    sensitive = excluded.sensitive,
-                    remind_at = excluded.remind_at,
-                    project = excluded.project,
-                    session_id = excluded.session_id,
-                    git_remote = excluded.git_remote,
-                    git_branch = excluded.git_branch,
-                    git_sha = excluded.git_sha,
-                    cwd = excluded.cwd,
-                    valid_from = excluded.valid_from,
-                    valid_until = excluded.valid_until,
-                    confidence = excluded.confidence,
-                    verified_at = excluded.verified_at,
-                    outcome = excluded.outcome,
-                    written_by = excluded.written_by,
-                    capture_method = excluded.capture_method"
-            ),
-            params_from_iter(insert_values(row)),
-        )?)
+        engine::memories::upsert_synced(&mut self.core.lock(), row)
     }
 
     /// The local copy of `id` as a sync merge sees it, if there is one.
     /// Unparseable `tags` read as none and unparseable `metadata` as `{}`.
     pub fn sync_view(&self, id: &str) -> Result<Option<SyncView>> {
-        on_core!(self, |tables| engine::memories::sync_view(&tables, id));
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT tags, metadata, updated_at, deleted_at IS NOT NULL \
-                 FROM memories WHERE id = ?",
-                params![id],
-                |row| {
-                    let tags_json: String = row.get(0)?;
-                    let metadata_json: String = row.get(1)?;
-                    Ok(SyncView {
-                        tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-                        metadata: serde_json::from_str(&metadata_json)
-                            .unwrap_or_else(|_| Value::Object(serde_json::Map::new())),
-                        updated_at: row.get(2)?,
-                        deleted: row.get(3)?,
-                    })
-                },
-            )
-            .optional()?)
+        engine::memories::sync_view(&self.core.lock(), id)
     }
 
     /// Replace `id`'s tags and metadata without stamping `updated_at`: a sync
     /// merge that lost last-write-wins still keeps the union, and must not
     /// look like a newer local edit.
     pub fn set_tags_and_metadata(&self, id: &str, tags: &[String], metadata: &Value) -> Result<()> {
-        on_core!(self, |tables| engine::memories::set_tags_and_metadata(
-            &mut tables,
-            id,
-            tags,
-            metadata
-        ));
-        write_memory(self.conn, id, Origin::Sync, || {
-            Ok(self.conn.execute(
-                "UPDATE memories SET tags = ?, metadata = ? WHERE id = ?",
-                params![tags_json(tags), metadata.to_string(), id],
-            )?)
-        })?;
-        Ok(())
+        engine::memories::set_tags_and_metadata(&mut self.core.lock(), id, tags, metadata)
     }
 
     /// Point `id` at the memory that replaces it. `updated_at`, when given,
@@ -548,23 +306,7 @@ impl<'c> Memories<'c> {
         superseded_by: &str,
         updated_at: Option<&str>,
     ) -> Result<()> {
-        on_core!(self, |tables| engine::memories::set_superseded_by(
-            &mut tables,
-            id,
-            superseded_by,
-            updated_at
-        ));
-        write_memory(self.conn, id, Origin::Local, || match updated_at {
-            Some(stamp) => Ok(self.conn.execute(
-                "UPDATE memories SET superseded_by = ?, updated_at = ? WHERE id = ?",
-                params![superseded_by, stamp, id],
-            )?),
-            None => Ok(self.conn.execute(
-                "UPDATE memories SET superseded_by = ? WHERE id = ?",
-                params![superseded_by, id],
-            )?),
-        })?;
-        Ok(())
+        engine::memories::set_superseded_by(&mut self.core.lock(), id, superseded_by, updated_at)
     }
 
     /// Supersede every live, not yet superseded chunk of the import
@@ -576,47 +318,18 @@ impl<'c> Memories<'c> {
         new_import_id: &str,
         updated_at: &str,
     ) -> Result<usize> {
-        on_core!(self, |tables| engine::memories::supersede_import(
-            &mut tables,
+        engine::memories::supersede_import(
+            &mut self.core.lock(),
             old_import_id,
             new_import_id,
-            updated_at
-        ));
-        let ids = memory_ids(
-            self.conn,
-            "SELECT id FROM memories
-              WHERE superseded_by IS NULL
-                AND deleted_at IS NULL
-                AND json_extract(metadata, '$.import_id') = ?",
-            params![old_import_id],
-        )?;
-        for id in &ids {
-            self.set_superseded_by(id, new_import_id, Some(updated_at))?;
-        }
-        Ok(ids.len())
+            updated_at,
+        )
     }
 
     /// Hard-delete every memory of `category` belonging to the capture
     /// `capture_id`. Returns how many went.
     pub fn delete_capture_category(&self, capture_id: &str, category: &str) -> Result<usize> {
-        on_core!(self, |tables| engine::memories::delete_capture_category(
-            &mut tables,
-            capture_id,
-            category
-        ));
-        let ids = memory_ids(
-            self.conn,
-            "SELECT id FROM memories WHERE capture_id = ? AND category = ?",
-            params![capture_id, category],
-        )?;
-        for id in &ids {
-            write_memory(self.conn, id, Origin::Local, || {
-                Ok(self
-                    .conn
-                    .execute("DELETE FROM memories WHERE id = ?", params![id])?)
-            })?;
-        }
-        Ok(ids.len())
+        engine::memories::delete_capture_category(&mut self.core.lock(), capture_id, category)
     }
 
     /// Rewrite `id` as the merge of its cluster: content, summed access
@@ -629,64 +342,26 @@ impl<'c> Memories<'c> {
         tags: &[String],
         updated_at: &str,
     ) -> Result<()> {
-        on_core!(self, |tables| engine::memories::set_merged(
-            &mut tables,
+        engine::memories::set_merged(
+            &mut self.core.lock(),
             id,
             content,
             access_count,
             tags,
-            updated_at
-        ));
-        write_memory(self.conn, id, Origin::Local, || {
-            Ok(self.conn.execute(
-                "UPDATE memories SET content = ?, access_count = ?, tags = ?, updated_at = ? WHERE id = ?",
-                params![content, access_count, tags_json(tags), updated_at, id],
-            )?)
-        })?;
-        Ok(())
+            updated_at,
+        )
     }
 
     /// Set `id`'s vitality and status, without stamping `updated_at`: both
     /// are local scores, not edits.
     pub fn set_vitality(&self, id: &str, vitality: f64, status: &str) -> Result<()> {
-        on_core!(self, |tables| engine::memories::set_vitality(
-            &mut tables,
-            id,
-            vitality,
-            status
-        ));
-        write_memory(self.conn, id, Origin::Local, || {
-            Ok(self.conn.execute(
-                "UPDATE memories SET vitality = ?, status = ? WHERE id = ?",
-                params![vitality, status, id],
-            )?)
-        })?;
-        Ok(())
+        engine::memories::set_vitality(&mut self.core.lock(), id, vitality, status)
     }
 
     /// The access-tracking inputs of each of `ids` that exists, in no
     /// particular order.
     pub fn access_inputs(&self, ids: &[String]) -> Result<Vec<AccessInputs>> {
-        on_core!(self, |tables| engine::memories::access_inputs(&tables, ids));
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let placeholders = vec!["?"; ids.len()].join(",");
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT id, access_count, decay_rate, base_weight FROM memories WHERE id IN ({placeholders})"
-        ))?;
-        let rows = stmt
-            .query_map(params_from_iter(ids.iter()), |row| {
-                Ok(AccessInputs {
-                    id: row.get(0)?,
-                    access_count: row.get(1)?,
-                    decay_rate: row.get(2)?,
-                    base_weight: row.get(3)?,
-                })
-            })?
-            .collect::<rusqlite::Result<_>>()
-            .map_err(crate::db::StoreError::from);
-        rows
+        engine::memories::access_inputs(&self.core.lock(), ids)
     }
 
     /// Record an access to `id`: when, the new count, and the vitality and
@@ -699,132 +374,47 @@ impl<'c> Memories<'c> {
         vitality: f64,
         status: &str,
     ) -> Result<()> {
-        on_core!(self, |tables| engine::memories::record_access(
-            &mut tables,
+        engine::memories::record_access(
+            &mut self.core.lock(),
             id,
             accessed_at,
             access_count,
             vitality,
-            status
-        ));
-        // Cached: a search records an access for every result it returns.
-        write_memory(self.conn, id, Origin::Local, || {
-            Ok(self.conn
-                .prepare_cached(
-                    "UPDATE memories SET accessed_at = ?, access_count = ?, vitality = ?, status = ?
-                      WHERE id = ?",
-                )?
-                .execute(params![accessed_at, access_count, vitality, status, id])?)
-        })?;
-        Ok(())
+            status,
+        )
     }
 
     /// The triple of every live, unsuperseded memory other than `except_id`
     /// that has all three parts.
     pub fn live_triples_except(&self, except_id: &str) -> Result<Vec<Triple>> {
-        on_core!(self, |tables| engine::memories::live_triples_except(
-            &tables, except_id
-        ));
-        let mut stmt = self.conn.prepare(
-            "SELECT id, subject, predicate, object FROM memories
-              WHERE id != ?
-                AND superseded_by IS NULL AND deleted_at IS NULL
-                AND subject IS NOT NULL AND predicate IS NOT NULL AND object IS NOT NULL",
-        )?;
-        let rows = stmt
-            .query_map(params![except_id], |row| {
-                Ok(Triple {
-                    id: row.get(0)?,
-                    subject: row.get(1)?,
-                    predicate: row.get(2)?,
-                    object: row.get(3)?,
-                })
-            })?
-            .collect::<rusqlite::Result<_>>()
-            .map_err(crate::db::StoreError::from);
-        rows
+        engine::memories::live_triples_except(&self.core.lock(), except_id)
     }
 
     /// Live, unsuperseded memories created after `cutoff`, oldest first, at
     /// most `limit`.
     pub fn live_created_after(&self, cutoff: &str, limit: usize) -> Result<Vec<CreatedMemory>> {
-        on_core!(self, |tables| engine::memories::live_created_after(
-            &tables, cutoff, limit
-        ));
-        let mut stmt = self.conn.prepare(
-            "SELECT id, category, content, created_at FROM memories
-              WHERE superseded_by IS NULL AND deleted_at IS NULL AND created_at > ?
-              ORDER BY created_at ASC LIMIT ?",
-        )?;
-        let rows = stmt
-            .query_map(params![cutoff, limit as i64], |r| {
-                Ok(CreatedMemory {
-                    id: r.get(0)?,
-                    category: r.get(1)?,
-                    content: r.get(2)?,
-                    created_at: r.get(3)?,
-                })
-            })?
-            .collect::<rusqlite::Result<_>>()
-            .map_err(crate::db::StoreError::from);
-        rows
+        engine::memories::live_created_after(&self.core.lock(), cutoff, limit)
     }
 
     /// How many live, unsuperseded memories were created after `cutoff`.
     pub fn count_live_created_after(&self, cutoff: &str) -> Result<usize> {
-        on_core!(self, |tables| engine::memories::count_live_created_after(
-            &tables, cutoff
-        ));
-        let count: i64 = self.conn.query_row(
-            "SELECT count(*) FROM memories
-              WHERE superseded_by IS NULL AND deleted_at IS NULL AND created_at > ?",
-            params![cutoff],
-            |row| row.get(0),
-        )?;
-        Ok(count.max(0) as usize)
+        engine::memories::count_live_created_after(&self.core.lock(), cutoff)
     }
 
     /// The memories `ids` names that exist, in no particular order.
     pub fn get_many(&self, ids: &[String]) -> Result<Vec<Memory>> {
-        on_core!(self, |tables| engine::memories::get_many(&tables, ids));
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let marks = vec!["?"; ids.len()].join(",");
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT {MEMORY_COLUMNS} FROM memories WHERE id IN ({marks})"
-        ))?;
-        let rows = stmt
-            .query_map(params_from_iter(ids.iter()), parse_memory_row)?
-            .collect::<rusqlite::Result<_>>()
-            .map_err(crate::db::StoreError::from);
-        rows
+        engine::memories::get_many(&self.core.lock(), ids)
     }
 
     /// Whether `id` exists.
     pub fn exists(&self, id: &str) -> Result<bool> {
-        on_core!(self, |tables| engine::memories::exists(&tables, id));
-        let found: Option<i64> = self
-            .conn
-            .query_row("SELECT 1 FROM memories WHERE id = ?", params![id], |r| {
-                r.get(0)
-            })
-            .optional()?;
-        Ok(found.is_some())
+        engine::memories::exists(&self.core.lock(), id)
     }
 
     /// Whether `id` is marked sensitive, or `None` when there is no such
     /// memory.
     pub fn sensitivity(&self, id: &str) -> Result<Option<bool>> {
-        on_core!(self, |tables| engine::memories::sensitivity(&tables, id));
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT sensitive FROM memories WHERE id = ?",
-                params![id],
-                |r| r.get(0),
-            )
-            .optional()?)
+        engine::memories::sensitivity(&self.core.lock(), id)
     }
 
     /// The memories an export takes, oldest first (ties by id): of
@@ -836,86 +426,22 @@ impl<'c> Memories<'c> {
         category: Option<&str>,
         tags: &[String],
     ) -> Result<Vec<Memory>> {
-        on_core!(self, |tables| engine::memories::exportable(
-            &tables,
-            include_deleted,
-            category,
-            tags
-        ));
-        let mut conditions: Vec<&str> = Vec::new();
-        let mut bindings: Vec<SqlValue> = Vec::new();
-        if !include_deleted {
-            conditions.push("m.deleted_at IS NULL");
-            conditions.push("m.superseded_by IS NULL");
-        }
-        if let Some(category) = category {
-            conditions.push("m.category = ?");
-            bindings.push(SqlValue::Text(category.to_string()));
-        }
-        // ALL-of tag semantics, against the tag index.
-        for tag in tags {
-            conditions.push(
-                "EXISTS (SELECT 1 FROM memory_tags mt WHERE mt.memory_id = m.id AND mt.tag = ?)",
-            );
-            bindings.push(SqlValue::Text(tag.clone()));
-        }
-        let where_clause = if conditions.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {}", conditions.join(" AND "))
-        };
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT {} FROM memories m {where_clause} ORDER BY m.created_at, m.id",
-            crate::db::queries::prefixed_memory_columns("m")
-        ))?;
-        let rows = stmt
-            .query_map(params_from_iter(bindings), parse_memory_row)?
-            .collect::<rusqlite::Result<_>>()
-            .map_err(crate::db::StoreError::from);
-        rows
+        engine::memories::exportable(&self.core.lock(), include_deleted, category, tags)
     }
 
     /// Every live memory, in no particular order.
     pub fn all_live(&self) -> Result<Vec<Memory>> {
-        on_core!(self, |tables| engine::memories::all_live(&tables));
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT {MEMORY_COLUMNS} FROM memories WHERE deleted_at IS NULL"
-        ))?;
-        let rows = stmt
-            .query_map([], parse_memory_row)?
-            .collect::<rusqlite::Result<_>>()
-            .map_err(crate::db::StoreError::from);
-        rows
+        engine::memories::all_live(&self.core.lock())
     }
 
     /// Memory `id`, unless it is missing or deleted.
     pub fn get_live(&self, id: &str) -> Result<Option<Memory>> {
-        on_core!(self, |tables| engine::memories::get_live(&tables, id));
-        Ok(self
-            .conn
-            .query_row(
-                &format!(
-                    "SELECT {MEMORY_COLUMNS} FROM memories WHERE id = ? AND deleted_at IS NULL"
-                ),
-                params![id],
-                parse_memory_row,
-            )
-            .optional()?)
+        engine::memories::get_live(&self.core.lock(), id)
     }
 
     /// Live memory `id`'s category, or `None` when it is missing or deleted.
     pub fn live_category(&self, id: &str) -> Result<Option<String>> {
-        on_core!(self, |tables| Ok(
-            engine::memories::get_live(&tables, id)?.map(|m| m.category)
-        ));
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT category FROM memories WHERE id = ? AND deleted_at IS NULL",
-                params![id],
-                |r| r.get(0),
-            )
-            .optional()?)
+        Ok(engine::memories::get_live(&self.core.lock(), id)?.map(|m| m.category))
     }
 
     /// The memories `filter` takes, newest first (ties by id, descending):
@@ -927,64 +453,13 @@ impl<'c> Memories<'c> {
         limit: usize,
         offset: usize,
     ) -> Result<(usize, Vec<Memory>)> {
-        on_core!(self, |tables| engine::memories::list_page(
-            &tables, filter, limit, offset
-        ));
-        let mut conditions = vec!["m.deleted_at IS NULL"];
-        let mut bindings: Vec<SqlValue> = Vec::new();
-        if !filter.include_sensitive {
-            conditions.push("m.sensitive = 0");
-        }
-        if let Some(category) = &filter.category {
-            conditions.push("m.category = ?");
-            bindings.push(SqlValue::Text(category.clone()));
-        }
-        if let Some(source) = &filter.source {
-            conditions.push("m.source = ?");
-            bindings.push(SqlValue::Text(source.clone()));
-        }
-        // ALL-of tag semantics, against the tag index.
-        for tag in &filter.tags {
-            conditions.push(
-                "EXISTS (SELECT 1 FROM memory_tags mt WHERE mt.memory_id = m.id AND mt.tag = ?)",
-            );
-            bindings.push(SqlValue::Text(tag.clone()));
-        }
-        let where_clause = conditions.join(" AND ");
-        let total: i64 = self.conn.query_row(
-            &format!("SELECT count(*) FROM memories m WHERE {where_clause}"),
-            params_from_iter(bindings.iter()),
-            |r| r.get(0),
-        )?;
-        bindings.push(SqlValue::Integer(i64::try_from(limit).unwrap_or(i64::MAX)));
-        bindings.push(SqlValue::Integer(i64::try_from(offset).unwrap_or(i64::MAX)));
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT {MEMORY_COLUMNS} FROM memories m WHERE {where_clause}
-              ORDER BY m.created_at DESC, m.id DESC LIMIT ? OFFSET ?"
-        ))?;
-        let page = stmt
-            .query_map(params_from_iter(bindings.iter()), parse_memory_row)?
-            .collect::<rusqlite::Result<_>>()?;
-        Ok((usize::try_from(total).unwrap_or(0), page))
+        engine::memories::list_page(&self.core.lock(), filter, limit, offset)
     }
 
     /// Apply `edit` to memory `id`, made on this node. A missing id is a
     /// no-op.
     pub fn apply_edit(&self, id: &str, edit: &MemoryEdit) -> Result<()> {
-        on_core!(self, |tables| engine::memories::apply_edit(
-            &mut tables,
-            id,
-            edit
-        ));
-        let (sets, mut bindings) = edit.assignments();
-        bindings.push(SqlValue::Text(id.to_string()));
-        write_memory(self.conn, id, Origin::Local, || {
-            Ok(self.conn.execute(
-                &format!("UPDATE memories SET {} WHERE id = ?", sets.join(", ")),
-                params_from_iter(bindings.iter()),
-            )?)
-        })?;
-        Ok(())
+        engine::memories::apply_edit(&mut self.core.lock(), id, edit)
     }
 
     /// Drop the text of every tombstone that still holds it (ADR-0024), as
@@ -992,65 +467,15 @@ impl<'c> Memories<'c> {
     /// queued, since every node empties its own copy. How many changed; 0
     /// once they all have, so it is cheap to run at every open.
     pub fn empty_tombstones(&self) -> Result<usize> {
-        on_core!(self, |tables| engine::memories::empty_tombstones(
-            &mut tables
-        ));
-        let ids = memory_ids(
-            self.conn,
-            "SELECT id FROM memories WHERE deleted_at IS NOT NULL \
-             AND NOT (content = ? AND tags = '[]' AND subject IS NULL \
-                      AND predicate IS NULL AND object IS NULL)",
-            params![TOMBSTONE_CONTENT],
-        )?;
-        if ids.is_empty() {
-            return Ok(0);
-        }
-        // One transaction for them all: a savepoint per memory alone would
-        // sync the file once per tombstone.
-        self.conn.execute_batch("SAVEPOINT empty_tombstones;")?;
-        let emptied = ids.iter().try_for_each(|id| {
-            write_memory(self.conn, id, Origin::Sync, || {
-                Ok(self.conn.execute(
-                    "UPDATE memories SET content = ?, tags = '[]', subject = NULL, \
-                     predicate = NULL, object = NULL WHERE id = ?",
-                    params![TOMBSTONE_CONTENT, id],
-                )?)
-            })
-            .map(drop)
-        });
-        match emptied {
-            Ok(()) => self.conn.execute_batch("RELEASE empty_tombstones;")?,
-            Err(e) => {
-                self.conn
-                    .execute_batch("ROLLBACK TO empty_tombstones; RELEASE empty_tombstones;")?;
-                return Err(e);
-            }
-        }
-        Ok(ids.len())
+        engine::memories::empty_tombstones(&mut self.core.lock())
     }
 
     /// Delete live memory `id`: tombstone it at `tombstone_at` (stamping
     /// `deleted_at` and `updated_at`, and dropping its text as ADR-0024
-    /// says), or remove the row when that is `None`. Whether there was a live memory to delete.
+    /// says), or remove the row when that is `None`. Whether there was a
+    /// live memory to delete.
     pub fn delete_live(&self, id: &str, tombstone_at: Option<&str>) -> Result<bool> {
-        on_core!(self, |tables| engine::memories::delete_live(
-            &mut tables,
-            id,
-            tombstone_at
-        ));
-        let affected = write_memory(self.conn, id, Origin::Local, || match tombstone_at {
-            Some(at) => Ok(self.conn.execute(
-                "UPDATE memories SET deleted_at = ?, updated_at = ?, content = ?, tags = '[]', \
-                 subject = NULL, predicate = NULL, object = NULL \
-                 WHERE id = ? AND deleted_at IS NULL",
-                params![at, at, TOMBSTONE_CONTENT, id],
-            )?),
-            None => Ok(self.conn.execute(
-                "DELETE FROM memories WHERE id = ? AND deleted_at IS NULL",
-                params![id],
-            )?),
-        })?;
-        Ok(affected > 0)
+        engine::memories::delete_live(&mut self.core.lock(), id, tombstone_at)
     }
 
     /// Live memories of `memory_type`, oldest first (ties by id): how many
@@ -1061,38 +486,7 @@ impl<'c> Memories<'c> {
         memory_type: &str,
         limit: usize,
     ) -> Result<(usize, Vec<UnclassifiedMemory>)> {
-        on_core!(self, |tables| engine::memories::of_type_page(
-            &tables,
-            memory_type,
-            limit
-        ));
-        let total: i64 = self.conn.query_row(
-            "SELECT count(*) FROM memories WHERE memory_type = ? AND deleted_at IS NULL",
-            params![memory_type],
-            |r| r.get(0),
-        )?;
-        let mut stmt = self.conn.prepare(
-            "SELECT id, substr(content, 1, 500), category, tags
-               FROM memories
-              WHERE memory_type = ? AND deleted_at IS NULL
-              ORDER BY created_at, id
-              LIMIT ?",
-        )?;
-        let page = stmt
-            .query_map(
-                params![memory_type, i64::try_from(limit).unwrap_or(i64::MAX)],
-                |r| {
-                    let tags: String = r.get(3)?;
-                    Ok(UnclassifiedMemory {
-                        id: r.get(0)?,
-                        content_snippet: r.get(1)?,
-                        category: r.get(2)?,
-                        tags: serde_json::from_str(&tags).unwrap_or_default(),
-                    })
-                },
-            )?
-            .collect::<rusqlite::Result<_>>()?;
-        Ok((usize::try_from(total).unwrap_or(0), page))
+        engine::memories::of_type_page(&self.core.lock(), memory_type, limit)
     }
 
     /// Live, unsuperseded memories matching any of `phrases` in the full-text
@@ -1107,52 +501,12 @@ impl<'c> Memories<'c> {
         if phrases.is_empty() {
             return Ok(Vec::new());
         }
-        on_core!(self, |tables| engine::memories::keyword_hits(
-            &tables, phrases, filter, limit
-        ));
-        let mut sql = format!(
-            "SELECT {}, bm25(memories_fts) AS bm25_score
-               FROM memories_fts fts
-               JOIN memories m ON m.rowid = fts.rowid
-              WHERE memories_fts MATCH ? AND m.superseded_by IS NULL AND m.deleted_at IS NULL",
-            prefixed_memory_columns("m")
-        );
-        let mut bindings = vec![SqlValue::Text(crate::fts::match_expression(phrases))];
-        if let Some(floor) = filter.min_effective_vitality {
-            sql.push_str(&format!(
-                " AND {EFFECTIVE_VITALITY_FN}(m.base_weight, m.access_count, m.decay_rate, \
-                 coalesce(m.accessed_at, m.created_at)) >= ?"
-            ));
-            bindings.push(SqlValue::Real(floor));
-        }
-        if let Some(category) = &filter.category {
-            sql.push_str(" AND m.category = ?");
-            bindings.push(SqlValue::Text(category.clone()));
-        }
-        if !filter.include_sensitive {
-            sql.push_str(" AND m.sensitive = 0");
-        }
-        sql.push_str(" ORDER BY bm25(memories_fts), m.id LIMIT ?");
-        bindings.push(SqlValue::Integer(i64::try_from(limit).unwrap_or(i64::MAX)));
-        let mut stmt = self.conn.prepare(&sql)?;
-        let hits = stmt
-            .query_map(params_from_iter(bindings.iter()), |row| {
-                Ok((parse_memory_row(row)?, row.get("bm25_score")?))
-            })?
-            .collect::<rusqlite::Result<_>>()?;
-        Ok(hits)
+        engine::memories::keyword_hits(&self.core.lock(), phrases, filter, limit)
     }
 
     /// The ids of every memory marked sensitive.
     pub fn sensitive_ids(&self) -> Result<HashSet<String>> {
-        on_core!(self, |tables| engine::memories::sensitive_ids(&tables));
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id FROM memories WHERE sensitive = 1")?;
-        let ids = stmt
-            .query_map([], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
-        Ok(ids)
+        engine::memories::sensitive_ids(&self.core.lock())
     }
 
     /// A page of the live, unsuperseded memories `filter` takes: matching
@@ -1165,167 +519,36 @@ impl<'c> Memories<'c> {
         limit: usize,
         offset: usize,
     ) -> Result<(usize, Vec<Memory>)> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            let tables = core.lock();
-            let linked = match &filter.entity {
-                Some(scope) => engine::graph::linked_ids(&tables, &scope.id)?,
-                None => HashSet::new(),
-            };
-            return engine::memories::keyword_page(
-                &tables, phrases, filter, &linked, limit, offset,
-            );
-        }
-        let mut conditions = String::from("m.superseded_by IS NULL AND m.deleted_at IS NULL");
-        let mut bindings: Vec<SqlValue> = Vec::new();
-        let mut from = String::from("memories m");
-        let mut order = "m.created_at DESC, m.id DESC";
-        if !phrases.is_empty() {
-            from.push_str(" JOIN memories_fts fts ON m.rowid = fts.rowid");
-            conditions.push_str(" AND memories_fts MATCH ?");
-            bindings.push(SqlValue::Text(crate::fts::match_expression(phrases)));
-            order = "bm25(memories_fts), m.id";
-        }
-        if let Some(category) = &filter.category {
-            conditions.push_str(" AND m.category = ?");
-            bindings.push(SqlValue::Text(category.clone()));
-        }
-        for tag in &filter.tags {
-            conditions.push_str(
-                " AND EXISTS (SELECT 1 FROM memory_tags mt WHERE mt.memory_id = m.id AND mt.tag = ?)",
-            );
-            bindings.push(SqlValue::Text(tag.clone()));
-        }
-        if let Some(scope) = &filter.entity {
-            conditions.push_str(
-                " AND (EXISTS (SELECT 1 FROM memory_entities me \
-                   WHERE me.memory_id = m.id AND me.entity_id = ?) \
-                   OR lower(m.subject) = ? OR lower(m.object) = ?)",
-            );
-            bindings.push(SqlValue::Text(scope.id.clone()));
-            bindings.push(SqlValue::Text(scope.canonical.clone()));
-            bindings.push(SqlValue::Text(scope.canonical.clone()));
-        }
-        let total: i64 = self.conn.query_row(
-            &format!("SELECT count(*) FROM {from} WHERE {conditions}"),
-            params_from_iter(bindings.iter()),
-            |r| r.get(0),
-        )?;
-        bindings.push(SqlValue::Integer(i64::try_from(limit).unwrap_or(i64::MAX)));
-        bindings.push(SqlValue::Integer(i64::try_from(offset).unwrap_or(i64::MAX)));
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT {} FROM {from} WHERE {conditions} ORDER BY {order} LIMIT ? OFFSET ?",
-            prefixed_memory_columns("m")
-        ))?;
-        let page = stmt
-            .query_map(params_from_iter(bindings.iter()), parse_memory_row)?
-            .collect::<rusqlite::Result<_>>()?;
-        Ok((usize::try_from(total).unwrap_or(0), page))
+        let tables = self.core.lock();
+        let linked = match &filter.entity {
+            Some(scope) => engine::graph::linked_ids(&tables, &scope.id)?,
+            None => HashSet::new(),
+        };
+        engine::memories::keyword_page(&tables, phrases, filter, &linked, limit, offset)
     }
 
     /// Memories awaiting extraction, newest first (ties by id, descending):
     /// how many there are, and the first `limit` with the first 500
-    /// characters of their content. See [`unannotated_where`].
+    /// characters of their content. A memory qualifies when it is live, is
+    /// **not a raw dialog or skeleton**, has no SPO triple at all, and has
+    /// no entity links at all: one that has entities but no triple is
+    /// already annotated, and a captured transcript's facts come out through
+    /// `decompose`, so dialogs would otherwise flood this backlog.
     pub fn unannotated_page(&self, limit: usize) -> Result<(usize, Vec<UnannotatedMemory>)> {
-        on_core!(self, |tables| engine::memories::unannotated_page(
-            &tables, limit
-        ));
-        let predicate = unannotated_where();
-        let total: i64 = self.conn.query_row(
-            &format!("SELECT count(*) FROM memories m WHERE {predicate}"),
-            [],
-            |r| r.get(0),
-        )?;
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT m.id, m.content, m.category, m.memory_type, m.tags
-               FROM memories m
-              WHERE {predicate}
-              ORDER BY m.created_at DESC, m.id DESC
-              LIMIT ?"
-        ))?;
-        let page = stmt
-            .query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
-                let content: String = row.get("content")?;
-                let tags_json: String = row.get("tags")?;
-                Ok(UnannotatedMemory {
-                    id: row.get("id")?,
-                    // By characters, not bytes: a multi-byte character on the
-                    // boundary would panic a byte slice.
-                    content_snippet: content.chars().take(500).collect(),
-                    category: row.get("category")?,
-                    memory_type: row.get("memory_type")?,
-                    tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-                })
-            })?
-            .collect::<rusqlite::Result<_>>()?;
-        Ok((usize::try_from(total).unwrap_or(0), page))
+        engine::memories::unannotated_page(&self.core.lock(), limit)
     }
 
     /// The id, content and metadata JSON of every live, unsuperseded,
     /// non-sensitive memory that records code references.
     pub fn with_code_refs(&self) -> Result<Vec<(String, String, String)>> {
-        on_core!(self, |tables| engine::memories::with_code_refs(&tables));
-        let mut stmt = self.conn.prepare(
-            "SELECT id, content, metadata
-               FROM memories
-              WHERE deleted_at IS NULL
-                AND superseded_by IS NULL
-                AND sensitive = 0
-                AND json_extract(metadata, '$.code_refs') IS NOT NULL",
-        )?;
-        let rows = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-            .collect::<rusqlite::Result<_>>()
-            .map_err(crate::db::StoreError::from);
-        rows
+        engine::memories::with_code_refs(&self.core.lock())
     }
 
     /// Set `metadata.ingest` to `marker` on every chunk of the import
     /// `doc_id`. Returns how many were stamped.
     pub fn set_ingest_marker(&self, doc_id: &str, marker: &str) -> Result<usize> {
-        on_core!(self, |tables| engine::memories::set_ingest_marker(
-            &mut tables,
-            doc_id,
-            marker
-        ));
-        let ids = memory_ids(
-            self.conn,
-            "SELECT id FROM memories WHERE doc_id = ?",
-            params![doc_id],
-        )?;
-        for id in &ids {
-            write_memory(self.conn, id, Origin::Local, || {
-                Ok(self.conn.execute(
-                    "UPDATE memories SET metadata = json_set(metadata, '$.ingest', ?) WHERE id = ?",
-                    params![marker, id],
-                )?)
-            })?;
-        }
-        Ok(ids.len())
+        engine::memories::set_ingest_marker(&mut self.core.lock(), doc_id, marker)
     }
-}
-
-/// Which memories still need a triple or entity mentions.
-///
-/// A memory qualifies when it is live, is **not a raw dialog**, has no SPO
-/// triple at all, and has no entity links at all.
-///
-/// Two parts of that are easy to get wrong. The `dialog` exclusion is not
-/// cosmetic: a captured transcript's facts are meant to come out through
-/// `decompose`, so without it every captured conversation would flood this
-/// backlog. And a memory needs to be missing *both* signals — one that has
-/// entities but no triple is already considered annotated, so an `OR` here
-/// would keep re-offering work that is done.
-///
-/// `skeleton` is excluded on the same grounds and then some (#207): it is
-/// Mermaid source describing a conversation's shape, so there is no fact in it
-/// to extract and offering one costs a model call to find that out.
-pub(crate) fn unannotated_where() -> &'static str {
-    "m.superseded_by IS NULL
-     AND m.deleted_at IS NULL
-     AND m.category NOT IN ('dialog', 'skeleton')
-     AND m.subject IS NULL AND m.predicate IS NULL AND m.object IS NULL
-     AND NOT EXISTS (SELECT 1 FROM memory_entities me WHERE me.memory_id = m.id)"
 }
 
 #[cfg(test)]
@@ -1333,40 +556,14 @@ mod tests {
     use super::*;
     use crate::db::outbox::Outbox;
     use crate::db::sync_state::SyncState;
-    use crate::db::{on_each_backend, Database};
+    use crate::db::derived::Origin;
+    use crate::db::Database;
 
     const NOW: &str = "2026-09-26T00:00:00+00:00";
 
-    /// Every column of `id`'s row, as SQLite values, in table order.
-    fn raw_row(conn: &Connection, id: &str) -> Vec<SqlValue> {
-        let mut stmt = conn.prepare("SELECT * FROM memories WHERE id = ?").unwrap();
-        let width = stmt.column_count();
-        stmt.query_row(params![id], |row| {
-            (0..width).map(|i| row.get::<_, SqlValue>(i)).collect()
-        })
-        .unwrap()
-    }
-
-    #[test]
-    fn new_fills_every_column_with_the_schema_default() {
-        // The schema's defaults are SQLite's; the engine has no schema.
-        let db = Database::open_sqlite_in_memory().unwrap();
-        let store = db.store();
-        let conn = store.conn();
-        conn.execute(
-            "INSERT INTO memories (id, content, created_at, updated_at) VALUES ('a', 'x', ?, ?)",
-            params![NOW, NOW],
-        )
-        .unwrap();
-        Memories::new(&store)
-            .insert(&NewMemory::new("b", "x", NOW))
-            .unwrap();
-
-        let mut defaulted = raw_row(conn, "a");
-        let mut written = raw_row(conn, "b");
-        defaulted.remove(0);
-        written.remove(0);
-        assert_eq!(written, defaulted);
+    /// Run `test` on a fresh in-memory database.
+    fn on_engine(mut test: impl FnMut(&Database)) {
+        test(&Database::open_in_memory().unwrap());
     }
 
     /// The one memory `id`, which must exist.
@@ -1378,7 +575,7 @@ mod tests {
 
     #[test]
     fn insert_refuses_a_taken_id_and_insert_or_ignore_reports_it() {
-        on_each_backend(|db| {
+        on_engine(|db| {
             let store = db.store();
             let memories = Memories::new(&store);
             let row = NewMemory::new("a", "first", NOW);
@@ -1393,7 +590,7 @@ mod tests {
 
     #[test]
     fn a_synced_overwrite_keeps_created_at_and_the_chunk_position() {
-        on_each_backend(|db| {
+        on_engine(|db| {
             let store = db.store();
             let memories = Memories::new(&store);
             memories
@@ -1424,7 +621,7 @@ mod tests {
 
     #[test]
     fn sync_view_reads_tags_that_are_not_an_array_as_none() {
-        on_each_backend(|db| {
+        on_engine(|db| {
             let store = db.store();
             Memories::new(&store)
                 .insert(&NewMemory::new("a", "x", NOW))
@@ -1442,7 +639,7 @@ mod tests {
 
     #[test]
     fn access_inputs_skips_unknown_ids_and_takes_an_empty_list() {
-        on_each_backend(|db| {
+        on_engine(|db| {
             let store = db.store();
             let memories = Memories::new(&store);
             memories.insert(&NewMemory::new("a", "x", NOW)).unwrap();
@@ -1650,7 +847,7 @@ mod tests {
     /// written, and one with none set reads back the schema's defaults.
     #[test]
     fn every_v32_column_reads_back_as_written_on_both_stores() {
-        on_each_backend(|db| {
+        on_engine(|db| {
             let store = db.store();
             let m = Memories::new(&store);
             let written = with_every_v32_column(NewMemory::new("ctx", "x", NOW));
@@ -1824,14 +1021,49 @@ mod tests {
     }
 
     #[test]
-    fn the_engine_core_matches_sqlite_read_for_read() {
+    fn lists_edits_and_deletes_read_back_as_the_rules_say() {
         let mut observed = Vec::new();
-        on_each_backend(|db| observed.push(exercise_reads(db)));
-        let sqlite = &observed[0];
-        assert_eq!(sqlite[0], serde_json::json!([4, ["e", "b", "d", "a"]]));
-        for other in &observed[1..] {
-            assert_eq!(other, sqlite);
-        }
+        on_engine(|db| observed.push(exercise_reads(db)));
+        let seen = &observed[0];
+        assert_eq!(seen[0], serde_json::json!([4, ["e", "b", "d", "a"]]));
+        assert_eq!(seen[1], serde_json::json!([4, ["b", "d"]]), "a page at an offset");
+        assert_eq!(
+            seen[2],
+            serde_json::json!([5, ["e", "c", "b", "d", "a"]]),
+            "sensitive rows show only when asked"
+        );
+        assert_eq!(seen[3], serde_json::json!([2, ["b", "a"]]), "category and all-of tags");
+        assert_eq!(seen[4], serde_json::json!([1, ["d"]]), "by source");
+        assert_eq!(
+            seen[5],
+            serde_json::json!([true, false, true, false]),
+            "a delete reports whether there was a live memory"
+        );
+        let a = &seen[6];
+        assert_eq!(a["content"], "edited");
+        assert_eq!(a["tags"], serde_json::json!(["green"]));
+        assert_eq!(a["sensitive"], true);
+        assert_eq!(a["memory_type"], "decision");
+        assert_eq!(a["decay_rate"], 0.02);
+        assert_eq!(a["project"], "p");
+        assert_eq!(a["confidence"], 0.25);
+        assert_eq!(a["written_by"], "hook");
+        assert_eq!(seen[7], "fact");
+        assert_eq!(seen[8]["superseded_by"], serde_json::Value::Null, "cleared");
+        assert_eq!(seen[10], serde_json::Value::Null, "c is deleted");
+        assert_eq!(seen[11], serde_json::Value::Null);
+        assert_eq!(seen[12], serde_json::Value::Null, "d was removed outright");
+        let (total, page) = (&seen[14][0], &seen[14][1]);
+        assert_eq!(total, 2, "b and e are live and unclassified; a became a decision");
+        assert_eq!(page.as_array().map(Vec::len), Some(2));
+        assert_eq!(
+            page[0]["content_snippet"].as_str().map(|s| s.chars().count()),
+            Some(500),
+            "snippets are cut by character"
+        );
+        let exported = seen[15].as_array().unwrap();
+        let ids: Vec<&str> = exported.iter().map(|m| m["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["a", "b", "c", "e"], "an export with deleted rows keeps the tombstone");
     }
 
     /// A corpus searched through `db`'s full-text index: every ranked and
@@ -2021,56 +1253,105 @@ mod tests {
     }
 
     #[test]
-    fn the_engine_core_searches_as_fts5_does() {
+    fn keyword_search_ranks_filters_and_pages_the_corpus() {
         let mut observed = Vec::new();
-        on_each_backend(|db| observed.push(exercise_search(db, false)));
-        #[cfg(feature = "engine-store")]
-        assert_eq!(observed.len(), 2, "both backends ran");
-        let sqlite = &observed[0];
-        assert_eq!(
-            sqlite[0][2].as_array().map(Vec::len),
-            Some(2),
-            "the corpus exercises a real ranking: {:?}",
-            sqlite[0]
-        );
-        for other in &observed[1..] {
-            for (theirs, ours) in other.iter().zip(sqlite) {
-                assert_eq!(theirs, ours);
-            }
-            assert_eq!(other.len(), sqlite.len());
-        }
-    }
-
-    /// FTS5 keeps superseded and deleted rows in its index and counts them
-    /// in BM25; the engine indexes live rows only. Search keeps live rows
-    /// alone either way, so both find the same memories.
-    #[test]
-    fn with_tombstones_the_engine_core_finds_what_fts5_finds() {
-        let mut observed = Vec::new();
-        on_each_backend(|db| observed.push(exercise_search(db, true)));
-        #[cfg(feature = "engine-store")]
-        assert_eq!(observed.len(), 2, "both backends ran");
-        let sqlite = &observed[0];
-        assert!(
-            sqlite
+        on_engine(|db| observed.push(exercise_search(db, false)));
+        let seen = &observed[0];
+        // [query, limit, [[id, score], ...]] per (query, filter, limit).
+        let hits = |i: usize| -> Vec<String> {
+            seen[i][2]
+                .as_array()
+                .unwrap()
                 .iter()
-                .any(|v| v[1].as_array().is_some_and(|ids| ids.len() > 2)),
-            "the corpus gives some query several hits: {sqlite:?}"
-        );
-        for other in &observed[1..] {
-            assert_eq!(other, sqlite);
+                .map(|h| h[0].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(seen[0][0], "quokka");
+        assert_eq!(hits(0).len(), 2, "the limit caps the ranking: {:?}", seen[0]);
+        assert_eq!(hits(0)[0], "e", "the memory that says it most ranks first");
+        let all_quokka = hits(1);
+        assert!(!all_quokka.contains(&"f".to_string()), "sensitive rows are out by default");
+        assert!(all_quokka.contains(&"j".to_string()), "a tag is indexed too");
+        assert!(all_quokka.contains(&"g".to_string()), "no vitality floor by default");
+        assert!(hits(3).contains(&"f".to_string()), "include_sensitive lets f through");
+        let faded = hits(5);
+        assert!(faded.contains(&"f".to_string()) && !faded.contains(&"g".to_string()));
+        assert!(!faded.contains(&"c".to_string()), "the category filter holds");
+        let scores: Vec<f64> = seen[1][2]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h[1].as_str().unwrap().parse().unwrap())
+            .collect();
+        assert!(scores.windows(2).all(|w| w[0] <= w[1]), "best (lowest) BM25 first: {scores:?}");
+        let last_query = seen.iter().rposition(|v| v[0] == "nothing matches this").unwrap();
+        assert!(hits(last_query).is_empty());
+        // The pages come after the ranked hits.
+        let pages: Vec<&Value> = seen.iter().filter(|v| v.as_array().is_some_and(|a| a.len() == 3 && a[1].is_u64() && a[2].is_array() && a[2][0].is_string())).collect();
+        assert_eq!(pages.len(), 6, "{pages:?}");
+        assert_eq!(pages[0][1], pages[1][1], "two pages of one query share a total");
+        assert_eq!(pages[0][2].as_array().map(Vec::len), Some(3));
+        assert_eq!(pages[3][2], serde_json::json!(["c", "b", "i", "h"]), "no phrases: newest first, by id");
+        assert_eq!(pages[4][2], serde_json::json!(["c", "d"]), "linked to the entity, or naming it");
+        assert_eq!(pages[5][2], serde_json::json!(["c"]));
+        let sensitive = seen.last().unwrap();
+        assert_eq!(sensitive, &serde_json::json!(["f"]));
+    }
+
+    /// Superseded and deleted rows are out of the index: no search finds
+    /// them, and the totals do not count them.
+    #[test]
+    fn with_tombstones_search_finds_only_live_rows() {
+        let mut observed = Vec::new();
+        on_engine(|db| observed.push(exercise_search(db, true)));
+        let seen = &observed[0];
+        let mut any_several = false;
+        for entry in seen {
+            let Some(ids) = entry.get(1).and_then(Value::as_array) else {
+                continue;
+            };
+            any_several |= ids.len() > 2;
+            for gone in ["h", "i"] {
+                assert!(!ids.contains(&Value::from(gone)), "{entry:?}");
+            }
         }
+        assert!(any_several, "the corpus gives some query several hits: {seen:?}");
+        let quokka_page = seen.iter().find(|v| v[0] == "quokka" && v[1].is_u64()).unwrap();
+        assert_eq!(quokka_page[1], 7, "a, b, c, e, f, g and j; not the superseded h or deleted i");
     }
 
     #[test]
-    fn the_engine_core_matches_sqlite_write_for_write() {
+    fn every_write_lands_as_the_rules_say() {
         let mut observed = Vec::new();
-        on_each_backend(|db| observed.push(exercise(db)));
-        let sqlite = &observed[0];
-        assert_eq!(sqlite.counts, [1, 0, 2, 2, 3]);
-        assert!(!sqlite.outbox.is_empty());
-        for other in &observed[1..] {
-            assert_eq!(other, sqlite);
+        on_engine(|db| observed.push(exercise(db)));
+        let seen = &observed[0];
+        assert_eq!(seen.counts, [1, 0, 2, 2, 3]);
+        let live: Vec<&str> = seen.live.iter().map(|m| m["id"].as_str().unwrap()).collect();
+        assert_eq!(live, ["a", "b", "c", "ctx"], "the capture's chunks were removed outright");
+        assert_eq!(seen.red_live, ["c"], "red-tagged, live and unsuperseded: only the merged c");
+        assert_eq!(seen.code_refs.len(), 0, "b's refs went with its synced overwrite");
+        assert_eq!(seen.triples.len(), 0, "a's triple went with its synced overwrite");
+        let created: Vec<&str> = seen.created.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(created, ["b", "c", "ctx"], "a kept its first created_at");
+        assert_eq!(seen.created_count, 3);
+        assert_eq!(
+            seen.sensitivity,
+            [Some(false), Some(false), Some(true), None, None, None]
+        );
+        assert_eq!(seen.views[5], None);
+        assert_eq!(
+            seen.views[2].as_ref().map(|v| v.tags.clone()),
+            Some(vec!["green".to_string(), "red".to_string()])
+        );
+        let queued_keys: Vec<&str> = seen.outbox.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(
+            queued_keys.contains(&"a") && queued_keys.contains(&"ctx"),
+            "local writes queue: {queued_keys:?}"
+        );
+        for (key, payload) in &seen.outbox {
+            assert_eq!(&payload["id"], key, "a payload names its row");
         }
+        let exported: Vec<&str> = seen.exported.iter().map(|m| m["id"].as_str().unwrap()).collect();
+        assert_eq!(exported, ["a", "b", "c", "ctx"], "oldest first, ties by id");
     }
 }

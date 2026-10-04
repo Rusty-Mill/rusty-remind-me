@@ -60,7 +60,7 @@ pub fn available() -> bool {
 /// Where the index for a given database lives.
 pub fn index_path(store: &Store<'_>) -> Option<std::path::PathBuf> {
     // In-memory: nowhere to persist, so no index.
-    let db = crate::db::database_path(store).ok().flatten()?;
+    let db = store.path()?;
     Some(std::path::PathBuf::from(format!("{}.ann", db.display())))
 }
 

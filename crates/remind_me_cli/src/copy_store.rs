@@ -1,7 +1,8 @@
-//! `rusty-remind-me copy-store`: copy a node's SQLite store onto the
-//! engine (ADR-0023 §5). The source is read-only; every row keeps its id,
-//! is verified after it is written, and a row the engine cannot keep is
-//! reported and makes the command fail rather than vanish.
+//! `rusty-remind-me copy-store`: copy an old SQLite `memory.db` onto the
+//! engine (ADR-0023 §5, ADR-0025), without touching the node. The source is
+//! read-only; every row keeps its id, is verified after it is written, and a
+//! row the engine cannot keep is reported and makes the command fail rather
+//! than vanish.
 
 use std::path::{Path, PathBuf};
 
@@ -42,7 +43,6 @@ pub fn parse(args: &[String], default_from: &Path) -> Result<CopyArgs, String> {
 }
 
 /// Run the copy and print what it did. Fails when any row was refused.
-#[cfg(feature = "engine-store")]
 pub fn run(args: &CopyArgs) -> Result<(), Box<dyn std::error::Error>> {
     // Each table as it finishes: the copy takes minutes on a large store.
     let mut print_table = |done: remind_me_core::db::engine::copy::TableDone| {
@@ -73,12 +73,6 @@ pub fn run(args: &CopyArgs) -> Result<(), Box<dyn std::error::Error>> {
         args.to.display()
     )
     .into())
-}
-
-/// Without the engine store there is nothing to copy into.
-#[cfg(not(feature = "engine-store"))]
-pub fn run(_args: &CopyArgs) -> Result<(), Box<dyn std::error::Error>> {
-    Err("this build has no engine store; rebuild with --features engine-store".into())
 }
 
 #[cfg(test)]

@@ -586,29 +586,26 @@ impl PeerServer {
         let handle = std::thread::Builder::new()
             .name("sync-peer-server".to_string())
             .spawn(move || {
-                // A connection of its own, not `db.store()`'s shared `Mutex`:
+                // A store of its own, not `db.store()`'s locked one:
                 // `serve_once` can block for up to `IO_TIMEOUT` reading a
                 // slow or hostile peer's request, and holding the
-                // process-wide mutex for that span used to block every other
+                // process-wide lock for that span used to block every other
                 // MCP tool call -- reads and writes alike -- until that peer
                 // either finished or timed out. Mirrors `SyncWorker`'s own
-                // fix for the identical shape of bug on the outbound side:
-                // opened once and reused across accepted connections,
-                // reopened on the next accept if the attempt itself failed.
-                let source = db.secondary_source();
-                let mut store = db.open_secondary().ok();
+                // fix for the identical shape of bug on the outbound side.
+                // An in-memory database has no secondary source, and is
+                // served under the lock as it always was.
+                let secondary = db.secondary_source().map(|source| source.store());
                 while !thread_shutdown.load(Ordering::Relaxed) {
                     match listener.accept() {
                         Ok((mut stream, _peer)) => {
                             let _ = stream.set_nonblocking(false);
                             let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
                             let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
-                            if store.is_none() {
-                                store = db.open_secondary().ok();
-                            }
-                            if let (Some(c), Some(source)) = (store.as_ref(), source.as_ref()) {
-                                let _ = serve_once(&mut stream, &config, &source.store(c));
-                            }
+                            let _ = match &secondary {
+                                Some(store) => serve_once(&mut stream, &config, store),
+                                None => serve_once(&mut stream, &config, &db.store()),
+                            };
                             let _ = stream.shutdown(std::net::Shutdown::Both);
                         }
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {

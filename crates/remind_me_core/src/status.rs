@@ -30,7 +30,7 @@
 //! is worse than one that omits a field.
 
 use crate::backup::{backup_dir, list_backups, BackupInfo};
-use crate::db::migrations::SCHEMA_VERSION;
+use crate::db::SCHEMA_VERSION;
 use crate::db::stats::StoreStats;
 use crate::db::Result;
 use crate::db::Store;
@@ -72,7 +72,8 @@ pub struct ServerStatus {
     pub database_path: Option<String>,
     pub database_exists: bool,
     pub database_bytes: Option<u64>,
-    /// What `PRAGMA user_version` reports.
+    /// The schema version the store's records mirror (see
+    /// `db::stats::StorageInfo::schema_version`).
     pub schema_version: i32,
     /// What this build's generated schema corresponds to.
     pub expected_schema_version: i32,
@@ -115,11 +116,16 @@ pub fn server_status(store: &Store<'_>) -> Result<ServerStatus> {
     let stats = StoreStats::new(store);
     let info = stats.storage_info()?;
     let database_path: Option<PathBuf> = info.path;
-    let database_exists = database_path.as_ref().map(|p| p.exists()).unwrap_or(true); // in-memory: it exists, it just has no file
+    // The store is the engine directory beside the configured path; the
+    // path itself is the old SQLite file, which need not exist. In memory:
+    // it exists, it just has no directory.
+    let database_exists = database_path
+        .as_ref()
+        .map(|p| crate::db::engine_dir(p).is_dir())
+        .unwrap_or(true);
     let database_bytes = database_path
         .as_ref()
-        .and_then(|p| std::fs::metadata(p).ok())
-        .map(|m| m.len());
+        .map(|_| u64::try_from(info.size_bytes).unwrap_or(0));
 
     let schema_version = info.schema_version;
     let memory_count = stats.live_memories()?;

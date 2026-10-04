@@ -63,10 +63,10 @@
 //! crate. `handler::RemindMeHandler::dispatch` is the one place sync and
 //! async meet: it hands `handle_request` calls to
 //! `tokio::task::spawn_blocking` rather than calling them inline, so a slow
-//! tool call (holding `Database`'s connection mutex) cannot stall the tokio
-//! runtime's other async work. `Database`'s `Mutex<rusqlite::Connection>`
-//! (already `Send + Sync` before this crate existed — `remind_me_api`
-//! already serves it from its own thread) is what makes sharing one
+//! tool call (holding `Database`'s store lock) cannot stall the tokio
+//! runtime's other async work. `Database` being `Send + Sync` (it was
+//! before this crate existed — `remind_me_api` already serves it from its
+//! own thread) is what makes sharing one
 //! `Arc<McpServer>` across concurrent connector sessions sound at all; see
 //! `handler.rs`'s `remind_me_handler_is_send_and_sync` test, which asserts
 //! that compile-time property directly rather than assuming it holds.

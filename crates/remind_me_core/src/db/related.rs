@@ -1,16 +1,15 @@
 //! Storage for search expansion: `memory_associations` (how often two
 //! memories were retrieved together) and the reads that find a result's
-//! relatives through shared entities, document position and co-retrieval.
+//! relatives through shared entities, document position and co-retrieval,
+//! on the engine's memories core (`db::engine::related`,
+//! `db::engine::graph`).
 //!
-//! ADR-0023 phase 1, step 8. Every statement [`crate::expansion`] ran lives
-//! here. The rules stay there: the pair cap, the weight ceiling, the window
-//! size, how relatives are grouped and capped.
+//! Every read and write [`crate::expansion`] makes goes through here. The
+//! rules stay there: the pair cap, the weight ceiling, the window size, how
+//! relatives are grouped and capped.
 
-#[cfg(feature = "engine-store")]
 use super::engine::{self, EngineLock};
 use super::{Result, Store};
-use rusqlite::types::Value as SqlValue;
-use rusqlite::{params, params_from_iter, Connection};
 
 /// A live memory another one points at, with the fields expansion shows.
 #[derive(Debug, Clone, PartialEq)]
@@ -43,52 +42,21 @@ pub struct CoRetrieved {
     pub weight: i64,
 }
 
-fn placeholders(n: usize) -> String {
-    vec!["?"; n].join(",")
-}
-
-/// `ids` twice over, for a query that binds the list on both sides.
-fn twice(ids: &[String]) -> Vec<SqlValue> {
-    ids.iter()
-        .chain(ids.iter())
-        .map(|id| SqlValue::Text(id.clone()))
-        .collect()
-}
-
-/// The expansion tables and reads, over one connection, or on the engine's
-/// memories core when the store's tables hold it (`db::engine::related`).
+/// The expansion table and reads, on the engine's memories core.
 pub struct Related<'c> {
-    conn: &'c Connection,
-    #[cfg(feature = "engine-store")]
-    core: Option<&'c EngineLock>,
+    core: &'c EngineLock,
 }
 
 impl<'c> Related<'c> {
     pub fn new(store: &'c Store<'_>) -> Self {
-        Self {
-            conn: store.conn(),
-            #[cfg(feature = "engine-store")]
-            core: store.core(),
-        }
+        Self { core: store.core() }
     }
 
     /// Record that `a` and `b` were retrieved together at `now`: a new pair
     /// starts at weight 1, and a known one gains 1 up to `max_weight`. The
     /// caller orders the pair, so `(a, b)` and `(b, a)` are one row.
     pub fn bump_pair(&self, a: &str, b: &str, now: &str, max_weight: i64) -> Result<()> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::related::bump_pair(&mut core.lock(), a, b, now, max_weight);
-        }
-        self.conn.execute(
-            "INSERT INTO memory_associations (memory_id_a, memory_id_b, weight, updated_at)
-             VALUES (?, ?, 1, ?)
-             ON CONFLICT(memory_id_a, memory_id_b) DO UPDATE SET
-                 weight = MIN(weight + 1, ?),
-                 updated_at = excluded.updated_at",
-            params![a, b, now, max_weight],
-        )?;
-        Ok(())
+        engine::related::bump_pair(&mut self.core.lock(), a, b, now, max_weight)
     }
 
     /// Live memories outside `seed_ids` that mention an entity a seed
@@ -98,86 +66,18 @@ impl<'c> Related<'c> {
         if seed_ids.is_empty() {
             return Ok(Vec::new());
         }
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::graph::via_entities(&core.lock(), seed_ids);
-        }
-        let ph = placeholders(seed_ids.len());
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT m.id, m.content, m.category, m.created_at, e.name AS entity_name
-               FROM memory_entities seed
-               JOIN memory_entities nbr ON nbr.entity_id = seed.entity_id
-               JOIN entities e ON e.id = seed.entity_id
-               JOIN memories m ON m.id = nbr.memory_id
-              WHERE seed.memory_id IN ({ph})
-                AND nbr.memory_id NOT IN ({ph})
-                AND m.superseded_by IS NULL
-                AND m.deleted_at IS NULL
-              ORDER BY m.created_at DESC, m.id, e.name"
-        ))?;
-        let rows = stmt
-            .query_map(params_from_iter(twice(seed_ids)), |row| {
-                Ok(EntityRelative {
-                    memory: Relative {
-                        id: row.get("id")?,
-                        content: row.get("content")?,
-                        category: row.get("category")?,
-                        created_at: row.get("created_at")?,
-                    },
-                    entity_name: row.get("entity_name")?,
-                })
-            })?
-            .collect::<rusqlite::Result<_>>()
-            .map_err(crate::db::StoreError::from);
-        rows
+        engine::graph::via_entities(&self.core.lock(), seed_ids)
     }
 
-    /// Remove every pair `memory_id` is part of: part of deleting a memory,
-    /// since the table has no foreign key to cascade.
+    /// Remove every pair `memory_id` is part of: part of deleting a memory.
     pub fn unlink_memory(&self, memory_id: &str) -> Result<()> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::related::unlink_memory(&mut core.lock(), memory_id);
-        }
-        self.conn.execute(
-            "DELETE FROM memory_associations WHERE memory_id_a = ? OR memory_id_b = ?",
-            params![memory_id, memory_id],
-        )?;
-        Ok(())
+        engine::related::unlink_memory(&mut self.core.lock(), memory_id)
     }
 
     /// Live chunks of `doc_id` from position `from` to `to`, in order (ties by
     /// id).
     pub fn document_window(&self, doc_id: &str, from: i64, to: i64) -> Result<Vec<DocumentChunk>> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::related::document_window(&core.lock(), doc_id, from, to);
-        }
-        let mut stmt = self.conn.prepare(
-            "SELECT id, content, category, created_at, doc_id, chunk_index
-               FROM memories
-              WHERE doc_id = ?
-                AND chunk_index BETWEEN ? AND ?
-                AND superseded_by IS NULL
-                AND deleted_at IS NULL
-              ORDER BY chunk_index, id",
-        )?;
-        let rows = stmt
-            .query_map(params![doc_id, from, to], |row| {
-                Ok(DocumentChunk {
-                    memory: Relative {
-                        id: row.get("id")?,
-                        content: row.get("content")?,
-                        category: row.get("category")?,
-                        created_at: row.get("created_at")?,
-                    },
-                    doc_id: row.get("doc_id")?,
-                    chunk_index: row.get("chunk_index")?,
-                })
-            })?
-            .collect::<rusqlite::Result<_>>()
-            .map_err(crate::db::StoreError::from);
-        rows
+        engine::related::document_window(&self.core.lock(), doc_id, from, to)
     }
 
     /// Live memories paired with any of `seed_ids`, strongest pair first,
@@ -187,39 +87,7 @@ impl<'c> Related<'c> {
         if seed_ids.is_empty() {
             return Ok(Vec::new());
         }
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::related::co_retrieved(&core.lock(), seed_ids);
-        }
-        let ph = placeholders(seed_ids.len());
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT assoc.other_id, assoc.weight, m.content, m.category, m.created_at
-               FROM (
-                    SELECT memory_id_b AS other_id, weight FROM memory_associations
-                     WHERE memory_id_a IN ({ph})
-                    UNION ALL
-                    SELECT memory_id_a AS other_id, weight FROM memory_associations
-                     WHERE memory_id_b IN ({ph})
-               ) assoc
-               JOIN memories m ON m.id = assoc.other_id
-              WHERE m.superseded_by IS NULL AND m.deleted_at IS NULL
-              ORDER BY assoc.weight DESC, m.created_at DESC, m.id"
-        ))?;
-        let rows = stmt
-            .query_map(params_from_iter(twice(seed_ids)), |row| {
-                Ok(CoRetrieved {
-                    memory: Relative {
-                        id: row.get("other_id")?,
-                        content: row.get("content")?,
-                        category: row.get("category")?,
-                        created_at: row.get("created_at")?,
-                    },
-                    weight: row.get("weight")?,
-                })
-            })?
-            .collect::<rusqlite::Result<_>>()
-            .map_err(crate::db::StoreError::from);
-        rows
+        engine::related::co_retrieved(&self.core.lock(), seed_ids)
     }
 }
 
@@ -231,14 +99,16 @@ mod tests {
 
     const NOW: &str = "2026-09-26T00:00:00+00:00";
 
-    /// Associations, links and chunks on `db`, and every expansion read and
-    /// sync feed page over them.
-    fn exercise(db: &Database) -> Vec<String> {
+    /// Associations, links and chunks, and every expansion read and sync
+    /// feed page over them.
+    #[test]
+    fn expansion_reads_and_feeds_follow_the_graph() {
         use crate::db::derived::Origin;
         use crate::db::entities::{Entities, RelationRow};
         use crate::db::sync_feed::SyncFeed;
         use crate::entity::Entity;
         const T2: &str = "2026-09-27T00:00:00+00:00";
+        let db = Database::open_in_memory().unwrap();
         let store = db.store();
         let memories = Memories::new(&store);
         for (id, at, doc, chunk, node) in [
@@ -312,61 +182,104 @@ mod tests {
         memories.delete_live("z", Some(T2)).unwrap();
 
         let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        let mut seen = vec![
-            format!("{:?}", related.via_entities(&ids(&["a"])).unwrap()),
-            format!("{:?}", related.via_entities(&ids(&["a", "c"])).unwrap()),
-            format!("{:?}", related.document_window("d", 1, 3).unwrap()),
-            format!("{:?}", related.co_retrieved(&ids(&["a"])).unwrap()),
-            format!("{:?}", related.co_retrieved(&ids(&["a", "c"])).unwrap()),
-        ];
+        let via: Vec<(String, String)> = related
+            .via_entities(&ids(&["a"]))
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.memory.id, r.entity_name))
+            .collect();
+        assert_eq!(
+            via,
+            [
+                ("b".to_string(), "E1".to_string()),
+                ("c".to_string(), "E1".to_string()),
+                ("c".to_string(), "E2".to_string()),
+                ("d1".to_string(), "E1".to_string()),
+            ],
+            "newest first, one row per shared entity, no deleted z"
+        );
+        assert!(
+            related.via_entities(&ids(&["a", "c"])).unwrap().len() > 2,
+            "a second seed widens the set"
+        );
+        let window: Vec<(String, Option<i64>)> = related
+            .document_window("d", 1, 3)
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.memory.id, c.chunk_index))
+            .collect();
+        assert_eq!(
+            window,
+            [("d1".to_string(), Some(1)), ("d2".to_string(), Some(2))],
+            "the superseded d3 is out"
+        );
+        let co: Vec<(String, i64)> = related
+            .co_retrieved(&ids(&["a"]))
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.memory.id, c.weight))
+            .collect();
+        assert_eq!(
+            co,
+            [("c".to_string(), 3), ("b".to_string(), 2)],
+            "capped at 3, strongest first, deleted z gone"
+        );
+        assert_eq!(related.co_retrieved(&ids(&["a", "c"])).unwrap().len(), 4);
         related.unlink_memory("c").unwrap();
-        seen.push(format!("{:?}", related.co_retrieved(&ids(&["a"])).unwrap()));
+        let co: Vec<String> = related
+            .co_retrieved(&ids(&["a"]))
+            .unwrap()
+            .into_iter()
+            .map(|c| c.memory.id)
+            .collect();
+        assert_eq!(co, ["b"]);
 
         let feed = SyncFeed::new(&store);
-        for (since, since_id, exclude, limit) in [
-            ("", "", None, 100),
-            (NOW, "a", None, 3),
-            (NOW, "d2", Some("n1"), 100),
-        ] {
-            seen.push(format!(
-                "{:?}",
-                feed.memories_after(since, since_id, exclude, limit)
-                    .unwrap()
-            ));
-            seen.push(format!(
-                "{:?}",
-                feed.entities_after(since, since_id, exclude, limit)
-                    .unwrap()
-            ));
-        }
-        seen.push(format!("{:?}", feed.links_after("", "", 100).unwrap()));
-        seen.push(format!("{:?}", feed.links_after(NOW, "b|e1", 2).unwrap()));
-        seen.push(format!("{:?}", feed.relations_after("", "", 10).unwrap()));
-        seen.push(format!(
-            "{} {} {}",
-            feed.entity_count().unwrap(),
-            feed.link_count().unwrap(),
-            feed.relation_count().unwrap()
-        ));
-        seen
-    }
-
-    #[test]
-    fn the_engine_core_expands_and_feeds_as_sqlite_does() {
-        let mut observed = Vec::new();
-        crate::db::on_each_backend(|db| observed.push(exercise(db)));
-        let sqlite = &observed[0];
-        assert!(
-            sqlite[1].matches("EntityRelative").count() > 2,
-            "{}",
-            sqlite[1]
+        let ids_of = |page: Vec<serde_json::Value>| -> Vec<String> {
+            page.into_iter()
+                .map(|v| v["id"].as_str().unwrap_or_default().to_string())
+                .collect()
+        };
+        assert_eq!(
+            ids_of(feed.memories_after("", "", None, 100).unwrap()),
+            ["a", "d1", "d2", "b", "c", "d3", "z"],
+            "by (updated_at, id)"
         );
-        for other in &observed[1..] {
-            for (theirs, ours) in other.iter().zip(sqlite) {
-                assert_eq!(theirs, ours);
-            }
-            assert_eq!(other.len(), sqlite.len());
-        }
+        assert_eq!(
+            ids_of(feed.memories_after(NOW, "a", None, 3).unwrap()),
+            ["d1", "d2", "b"]
+        );
+        assert_eq!(
+            ids_of(feed.memories_after(NOW, "d2", Some("n1"), 100).unwrap()),
+            ["b", "c", "d3", "z"]
+        );
+        assert_eq!(
+            ids_of(feed.memories_after("", "", Some("n1"), 100).unwrap()),
+            ["d2", "b", "c", "d3", "z"],
+            "n1's own a and d1 are excluded"
+        );
+        assert_eq!(
+            ids_of(feed.entities_after("", "", Some("n1"), 100).unwrap()),
+            ["e2"]
+        );
+        let links = feed.links_after("", "", 100).unwrap();
+        assert_eq!(links.len(), 7);
+        assert_eq!(links[0]["record_type"], "memory_entity");
+        assert_eq!(
+            ids_of(feed.links_after(NOW, "b|e1", 2).unwrap()),
+            ["c|e2", "d1|e1"]
+        );
+        let relations = feed.relations_after("", "", 10).unwrap();
+        assert_eq!(relations.len(), 1);
+        assert_eq!(relations[0]["node_id"], "n1");
+        assert_eq!(
+            (
+                feed.entity_count().unwrap(),
+                feed.link_count().unwrap(),
+                feed.relation_count().unwrap()
+            ),
+            (2, 7, 1)
+        );
     }
 
     #[test]

@@ -1,10 +1,11 @@
-//! Copying a node's SQLite store onto the engine (ADR-0023 §5): the
-//! memories core's sixteen tables (phase 5.1; `memory_references` and
-//! `sessions`, added at schema v32, live on the engine only) and the other groups the
-//! engine holds: saved searches, import archives, the sync log, analytics
-//! snapshots, memory revisions and the wiki (phase 5.2).
+//! Copying a node's old SQLite store onto the engine (ADR-0023 §5,
+//! ADR-0025): the memories core's sixteen tables (`memory_references` and
+//! `sessions`, added at schema v32, never lived in SQLite) and the other
+//! groups the engine holds: saved searches, import archives, the sync log,
+//! analytics snapshots, memory revisions and the wiki.
 //!
-//! The copy follows the hub copy's three rules:
+//! The source is read through `db::legacy_sqlite`, the one module that
+//! still links SQLite. The copy follows the hub copy's three rules:
 //! - it never writes to the source: it reads `SELECT *` from each table and
 //!   nothing else;
 //! - it refuses rows the engine cannot store rather than dropping them
@@ -26,10 +27,8 @@ use super::{
     analytics, archives, engine_error, engine_id, micros, outbox, pair_engine_id, revisions,
     saved_searches, sync_log, wiki, EngineTables,
 };
-use crate::db::migrations::SCHEMA_VERSION;
+use crate::db::legacy_sqlite::{self, LegacyDb, Row};
 use crate::db::{Result, StoreError};
-use rusqlite::types::Value as SqlValue;
-use rusqlite::{Connection, OptionalExtension};
 use rusty_multimodal_db_engine::generic::mmap_field::MmapFieldValue;
 use rusty_multimodal_db_engine::generic::query::{AllIds, GetById};
 use rusty_multimodal_db_engine::generic::traits::{
@@ -38,7 +37,7 @@ use rusty_multimodal_db_engine::generic::traits::{
 use rusty_multimodal_db_engine::generic::GenericMmapStore;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-use serde_json::{Map, Value};
+use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
 use uuid::Uuid;
@@ -74,9 +73,6 @@ pub struct CopyReport {
     pub copied: BTreeMap<&'static str, usize>,
     pub refused: Vec<Refused>,
 }
-
-/// One source row, column name to value.
-type Row = Map<String, Value>;
 
 /// How one source table becomes engine records.
 struct TableCopy {
@@ -283,50 +279,6 @@ fn memory(mut row: Row) -> std::result::Result<Change, String> {
     Ok(Change::Memory(id, Some(Box::new(record))))
 }
 
-/// A SQLite value as JSON.
-fn json(value: SqlValue) -> Value {
-    match value {
-        SqlValue::Null => Value::Null,
-        SqlValue::Integer(i) => Value::from(i),
-        SqlValue::Real(f) => Value::from(f),
-        SqlValue::Text(s) => Value::String(s),
-        SqlValue::Blob(b) => Value::from(b),
-    }
-}
-
-/// Every row of `table`, or none when the source has no such table (the
-/// `promotions` table is created on first use).
-fn rows(source: &Connection, table: &str) -> Result<Vec<Row>> {
-    rows_ordered(source, table, "")
-}
-
-/// [`rows`], in the order `order_by` gives (an SQL `ORDER BY` clause, or
-/// empty).
-fn rows_ordered(source: &Connection, table: &str, order_by: &str) -> Result<Vec<Row>> {
-    let exists: Option<String> = source
-        .query_row(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
-            [table],
-            |r| r.get(0),
-        )
-        .optional()?;
-    if exists.is_none() {
-        return Ok(Vec::new());
-    }
-    let mut stmt = source.prepare(&format!("SELECT * FROM {table} {order_by}"))?;
-    let names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
-    let rows = stmt
-        .query_map([], |r| {
-            let mut row = Row::new();
-            for (i, name) in names.iter().enumerate() {
-                row.insert(name.clone(), json(r.get::<_, SqlValue>(i)?));
-            }
-            Ok(row)
-        })?
-        .collect::<rusqlite::Result<_>>()?;
-    Ok(rows)
-}
-
 fn describe(key_columns: &[&str], row: &Row) -> String {
     key_columns
         .iter()
@@ -413,12 +365,12 @@ fn has_rows(core: &CoreTables) -> bool {
 ///
 /// # Errors
 ///
-/// [`StoreError::Invalid`] if the source is not at this build's schema
-/// version (the copy never migrates it) or the target core is not empty;
+/// [`StoreError::Invalid`] if the source is at a schema version the copy
+/// does not read or the target core is not empty;
 /// [`StoreError::Engine`] if a written record does not read back as it was
 /// written; the source's or the engine's own error otherwise. A refused row
 /// is not an error: it is in the report.
-pub fn copy_core(source: &Connection, target: &mut EngineTables) -> Result<CopyReport> {
+pub fn copy_core(source: &LegacyDb, target: &mut EngineTables) -> Result<CopyReport> {
     check_source(source)?;
     if has_rows(&target.core) {
         return Err(StoreError::Invalid(
@@ -432,14 +384,14 @@ pub fn copy_core(source: &Connection, target: &mut EngineTables) -> Result<CopyR
 
 /// Copy a whole SQLite store into empty engine tables, keeping every id:
 /// the memories core, then every other group the engine holds. What the
-/// copy tool and the first open of an engine store run.
+/// copy tool and the first open of a node with a `memory.db` run.
 ///
 /// # Errors
 ///
 /// As [`copy_core`], and [`StoreError::Invalid`] if any table is not
 /// empty.
 pub fn copy_store(
-    source: &Connection,
+    source: &LegacyDb,
     target: &mut EngineTables,
     progress: Progress<'_>,
 ) -> Result<CopyReport> {
@@ -468,10 +420,7 @@ pub fn copy_file(
     target_dir: &std::path::Path,
     progress: Progress<'_>,
 ) -> Result<CopyReport> {
-    let source = Connection::open_with_flags(
-        source,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
+    let source = LegacyDb::open(source)?;
     let mut target = EngineTables::open(target_dir)?;
     copy_store(&source, &mut target, progress)
 }
@@ -534,21 +483,15 @@ fn sync_parent(_dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Refuse a source that is not at this build's schema version: the copy
-/// never migrates it.
-fn check_source(source: &Connection) -> Result<()> {
-    let version: i32 = source.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if version != SCHEMA_VERSION {
-        return Err(StoreError::Invalid(format!(
-            "the source store is at schema version {version}, not {SCHEMA_VERSION}; \
-             open it with this build first"
-        )));
-    }
-    Ok(())
+/// Refuse a source at a schema version the copy does not read (see
+/// [`legacy_sqlite::check_version`]): the copy never migrates it, but a
+/// column the engine record defaults may be missing.
+fn check_source(source: &LegacyDb) -> Result<()> {
+    legacy_sqlite::check_version(source.user_version()?)
 }
 
 fn copy_core_tables(
-    source: &Connection,
+    source: &LegacyDb,
     target: &mut EngineTables,
     report: &mut CopyReport,
     progress: Progress<'_>,
@@ -570,14 +513,14 @@ fn copy_core_tables(
 
 /// Copy one table, verify it, and return how many rows it copied.
 fn copy_table(
-    source: &Connection,
+    source: &LegacyDb,
     target: &mut EngineTables,
     copy: &TableCopy,
     refused: &mut Vec<Refused>,
 ) -> Result<usize> {
     let mut changes = Vec::new();
     let mut taken: HashMap<(String, Vec<u8>), String> = HashMap::new();
-    for row in rows(source, copy.table)? {
+    for row in source.rows(copy.table)? {
         let key = describe(copy.key_columns, &row);
         let mut refuse = |reason: String| {
             refused.push(Refused {
@@ -662,7 +605,7 @@ fn nullable_flag(row: &mut Row, column: &str) {
 /// Copy every group outside the core, then rebuild what is derived from
 /// them and raise their sequences.
 fn copy_groups(
-    source: &Connection,
+    source: &LegacyDb,
     target: &mut EngineTables,
     report: &mut CopyReport,
     progress: Progress<'_>,
@@ -794,7 +737,7 @@ fn copy_groups(
 /// The copy of the groups outside the core, which write straight to their
 /// stores as their own write paths do.
 struct Group<'a> {
-    source: &'a Connection,
+    source: &'a LegacyDb,
     report: &'a mut CopyReport,
     progress: Progress<'a>,
 }
@@ -826,7 +769,7 @@ impl Group<'_> {
         let started = std::time::Instant::now();
         let mut taken: HashMap<R::Id, String> = HashMap::new();
         let mut copied = 0;
-        for row in rows_ordered(self.source, table, order_by)? {
+        for row in self.source.rows_ordered(table, order_by)? {
             let key = describe(key_columns, &row);
             let mut refuse = |reason: String| {
                 self.report.refused.push(Refused {

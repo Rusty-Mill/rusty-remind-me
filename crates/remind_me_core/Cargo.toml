@@ -19,18 +19,20 @@ serde_json = { version = "1.0", features = ["float_roundtrip"] }
 async-trait = "0.1"
 thiserror = "2.0"
 tokio = { version = "1.0", features = ["full"] }
+# Read-only, in one module: `db::legacy_sqlite` copies an old `memory.db`
+# onto the engine on first open and reads the two foreign-file importers'
+# SQLite databases (ADR-0025). Nothing is stored in SQLite any more.
 # 0.39 rather than the 0.31 this crate used standalone: rusqlite declares
 # `links = "sqlite3"`, so Cargo allows one version per graph, and the rest of
 # the rusty_mill workspace is on 0.39.
-rusqlite = { version = "0.39", features = ["bundled", "backup", "functions"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.0", features = ["v4", "v5"] }
 sha256 = "1.5"
 dirs = "5.0"
 parking_lot = "0.12"
-# The engine the node's store moves to (ADR-0023). Optional until phase 5
-# makes it the default; see the `engine-store` feature.
-rusty_multimodal_db_engine = { workspace = true, optional = true }
+# The node's store (ADR-0023, ADR-0025).
+rusty_multimodal_db_engine = { workspace = true }
 pdf-extract = { version = "0.12", optional = true }
 aws-sdk-s3 = { version = "1", optional = true }
 aws-config = { version = "1", optional = true }
@@ -73,12 +75,7 @@ symphonia = { version = "0.6", optional = true, default-features = false, featur
 remind_me_hub = { path = "../remind_me_hub", default-features = false }
 
 [features]
-default = ["engine-store"]
-# The engine-backed store (ADR-0023). On by default since phase 5.4b: the
-# node's store is the engine unless `REMIND_ME_STORE=sqlite`, and the first
-# open copies an existing SQLite store onto it. Built without it, a node
-# runs on SQLite as before.
-engine-store = ["dep:rusty_multimodal_db_engine"]
+default = []
 # PDF text extraction. Optional so a build that does not want a PDF parser
 # does not carry one (71 transitive crates), matching the reference's own
 # lazily-imported `pdf` extra. Feature-off, `.pdf` import reports the format

@@ -1,25 +1,21 @@
 //! Storage for import bookkeeping: `chat_imports` (one row per imported
 //! file), `dbs_imports` (one row per daily-backup-system item) and
 //! `mempalace_imports` (one row per drawer), plus the reads that find what
-//! an import wrote so it can be undone.
+//! an import wrote so it can be undone, on the engine's memories core
+//! (`db::engine::imports`).
 //!
-//! ADR-0023 phase 1, step 5b. Every statement against these tables from
-//! [`crate::importer`], [`crate::dbs_import`], [`crate::mempalace_import`]
-//! and [`crate::undo_import`] lives here. Reading the foreign SQLite files
-//! those importers take in is not storage, so it stays with them.
+//! Every read and write against these tables from [`crate::importer`],
+//! [`crate::dbs_import`], [`crate::mempalace_import`] and
+//! [`crate::undo_import`] goes through here. Reading the foreign SQLite
+//! files those importers take in is not storage, so it stays with them
+//! (through `db::legacy_sqlite`).
 //!
 //! The rules stay with the modules: when content counts as already
 //! imported, when a changed dbs item supersedes its memory, and that a chat
 //! import loses its tracking row only once nothing of it is left.
-//!
-//! With the `engine-store` feature, a store whose tables hold the memories
-//! core keeps all three tables there (`db::engine::imports`, core PR 4a).
 
-#[cfg(feature = "engine-store")]
 use super::engine::{self, EngineLock};
 use super::{Result, Store};
-use rusqlite::types::Value as SqlValue;
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use std::collections::HashMap;
 
 /// What a previous import recorded for one dbs item.
@@ -32,30 +28,14 @@ pub struct DbsTracked {
 /// A dbs item's key: its source and its id there.
 pub type DbsKey = (String, String);
 
-/// Live memories whose `doc_id` is a chat import's id, not yet deleted.
-const LIVE_CHAT_DOC_IDS: &str = "SELECT doc_id FROM memories
-                 WHERE doc_id IS NOT NULL AND deleted_at IS NULL";
-
-/// One placeholder per item, comma-separated.
-fn placeholders(n: usize) -> String {
-    vec!["?"; n].join(",")
-}
-
-/// The import bookkeeping tables, over one connection, or on the engine's
-/// memories core when the store's tables hold it (`db::engine::imports`).
+/// The import bookkeeping tables, on the engine's memories core.
 pub struct ImportLedger<'c> {
-    conn: &'c Connection,
-    #[cfg(feature = "engine-store")]
-    core: Option<&'c EngineLock>,
+    core: &'c EngineLock,
 }
 
 impl<'c> ImportLedger<'c> {
     pub fn new(store: &'c Store<'_>) -> Self {
-        Self {
-            conn: store.conn(),
-            #[cfg(feature = "engine-store")]
-            core: store.core(),
-        }
+        Self { core: store.core() }
     }
 
     // --- chat imports ----------------------------------------------------
@@ -70,109 +50,38 @@ impl<'c> ImportLedger<'c> {
         imported_at: &str,
         stats_json: &str,
     ) -> Result<()> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::imports::record_chat(
-                &mut core.lock(),
-                import_id,
-                filename,
-                hash,
-                imported_at,
-                stats_json,
-            );
-        }
-        self.conn.execute(
-            "INSERT INTO chat_imports (import_id, filename, hash, imported_at, stats)
-             VALUES (?, ?, ?, ?, ?)",
-            params![import_id, filename, hash, imported_at, stats_json],
-        )?;
-        Ok(())
+        engine::imports::record_chat(
+            &mut self.core.lock(),
+            import_id,
+            filename,
+            hash,
+            imported_at,
+            stats_json,
+        )
     }
 
     /// The earliest chat import recorded for content `hash` (ties by id), if
     /// any.
     pub fn chat_import_with_hash(&self, hash: &str) -> Result<Option<String>> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::imports::chat_import_with_hash(&core.lock(), hash);
-        }
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT import_id FROM chat_imports WHERE hash = ?
-                  ORDER BY imported_at, import_id LIMIT 1",
-                params![hash],
-                |r| r.get(0),
-            )
-            .optional()?)
+        engine::imports::chat_import_with_hash(&self.core.lock(), hash)
     }
 
     /// Live memories written by the chat import `import_id`, or by any
     /// recorded chat import when `None`, by id.
     pub fn live_chat_memories(&self, import_id: Option<&str>) -> Result<Vec<String>> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::imports::live_chat_memories(&core.lock(), import_id);
-        }
-        match import_id {
-            Some(id) => self.ids(
-                "SELECT id FROM memories WHERE doc_id = ? AND deleted_at IS NULL ORDER BY id",
-                &[id.to_string()],
-            ),
-            None => self.ids(
-                "SELECT id FROM memories
-                  WHERE deleted_at IS NULL
-                    AND doc_id IN (SELECT import_id FROM chat_imports)
-                  ORDER BY id",
-                &[],
-            ),
-        }
+        engine::imports::live_chat_memories(&self.core.lock(), import_id)
     }
 
     /// Of the chat imports `import_ids`, those with no live memory left, by
     /// id.
     pub fn chat_imports_with_nothing_left(&self, import_ids: &[String]) -> Result<Vec<String>> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::imports::chat_imports_with_nothing_left(&core.lock(), import_ids);
-        }
-        if import_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        self.ids(
-            &format!(
-                "SELECT import_id FROM chat_imports
-                  WHERE import_id IN ({})
-                    AND import_id NOT IN ({LIVE_CHAT_DOC_IDS})
-                  ORDER BY import_id",
-                placeholders(import_ids.len())
-            ),
-            import_ids,
-        )
+        engine::imports::chat_imports_with_nothing_left(&self.core.lock(), import_ids)
     }
 
     /// Drop the tracking rows of those chat imports `import_ids` with no
     /// live memory left. Returns how many went.
     pub fn forget_chat_imports_with_nothing_left(&self, import_ids: &[String]) -> Result<usize> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::imports::forget_chat_imports_with_nothing_left(
-                &mut core.lock(),
-                import_ids,
-            );
-        }
-        if import_ids.is_empty() {
-            return Ok(0);
-        }
-        Ok(self.conn.execute(
-            &format!(
-                "DELETE FROM chat_imports
-                  WHERE import_id IN ({})
-                    AND import_id NOT IN ({LIVE_CHAT_DOC_IDS})",
-                placeholders(import_ids.len())
-            ),
-            params_from_iter(import_ids.iter()),
-        )?)
+        engine::imports::forget_chat_imports_with_nothing_left(&mut self.core.lock(), import_ids)
     }
 
     // --- dbs imports -----------------------------------------------------
@@ -183,39 +92,7 @@ impl<'c> ImportLedger<'c> {
         source: &str,
         external_ids: &[&str],
     ) -> Result<HashMap<DbsKey, DbsTracked>> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::imports::dbs_tracked(&core.lock(), source, external_ids);
-        }
-        if external_ids.is_empty() {
-            return Ok(HashMap::new());
-        }
-        let sql = format!(
-            "SELECT dbs_source, external_id, memory_id, content_hash
-               FROM dbs_imports
-              WHERE dbs_source = ? AND external_id IN ({})",
-            placeholders(external_ids.len())
-        );
-        let mut values = vec![SqlValue::Text(source.to_string())];
-        values.extend(
-            external_ids
-                .iter()
-                .map(|id| SqlValue::Text((*id).to_string())),
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt
-            .query_map(params_from_iter(values), |row| {
-                Ok((
-                    (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
-                    DbsTracked {
-                        memory_id: row.get(2)?,
-                        content_hash: row.get(3)?,
-                    },
-                ))
-            })?
-            .collect::<rusqlite::Result<_>>()
-            .map_err(crate::db::StoreError::from);
-        rows
+        engine::imports::dbs_tracked(&self.core.lock(), source, external_ids)
     }
 
     /// Record that `external_id` of `source` is now `memory_id` at
@@ -228,73 +105,27 @@ impl<'c> ImportLedger<'c> {
         content_hash: &str,
         imported_at: &str,
     ) -> Result<()> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::imports::record_dbs(
-                &mut core.lock(),
-                source,
-                external_id,
-                memory_id,
-                content_hash,
-                imported_at,
-            );
-        }
-        self.conn.execute(
-            "INSERT INTO dbs_imports (dbs_source, external_id, memory_id, content_hash, imported_at)
-             VALUES (?, ?, ?, ?, ?)
-             ON CONFLICT(dbs_source, external_id)
-             DO UPDATE SET memory_id = excluded.memory_id,
-                           content_hash = excluded.content_hash,
-                           imported_at = excluded.imported_at",
-            params![source, external_id, memory_id, content_hash, imported_at],
-        )?;
-        Ok(())
+        engine::imports::record_dbs(
+            &mut self.core.lock(),
+            source,
+            external_id,
+            memory_id,
+            content_hash,
+            imported_at,
+        )
     }
 
     /// Live memories a dbs import recorded, from sources starting with
     /// `source_prefix`, or from any source when `None`, by memory id.
     pub fn live_dbs_memories(&self, source_prefix: Option<&str>) -> Result<Vec<String>> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::imports::live_dbs_memories(&core.lock(), source_prefix);
-        }
-        match source_prefix {
-            Some(prefix) => self.ids(
-                "SELECT t.memory_id FROM dbs_imports t
-                   JOIN memories m ON m.id = t.memory_id
-                  WHERE m.deleted_at IS NULL AND t.dbs_source LIKE ?
-                  ORDER BY t.memory_id",
-                &[format!("{prefix}%")],
-            ),
-            None => self.ids(
-                "SELECT t.memory_id FROM dbs_imports t
-                   JOIN memories m ON m.id = t.memory_id
-                  WHERE m.deleted_at IS NULL
-                  ORDER BY t.memory_id",
-                &[],
-            ),
-        }
+        engine::imports::live_dbs_memories(&self.core.lock(), source_prefix)
     }
 
     // --- mempalace imports -----------------------------------------------
 
     /// Of `drawer_ids`, those already imported, sorted.
     pub fn imported_drawers(&self, drawer_ids: &[&str]) -> Result<Vec<String>> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::imports::imported_drawers(&core.lock(), drawer_ids);
-        }
-        if drawer_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let owned: Vec<String> = drawer_ids.iter().map(|d| (*d).to_string()).collect();
-        self.ids(
-            &format!(
-                "SELECT drawer_id FROM mempalace_imports WHERE drawer_id IN ({}) ORDER BY drawer_id",
-                placeholders(drawer_ids.len())
-            ),
-            &owned,
-        )
+        engine::imports::imported_drawers(&self.core.lock(), drawer_ids)
     }
 
     /// Record that `drawer_id` was imported as `memory_id`. A drawer already
@@ -305,21 +136,7 @@ impl<'c> ImportLedger<'c> {
         memory_id: &str,
         imported_at: &str,
     ) -> Result<()> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::imports::record_mempalace(
-                &mut core.lock(),
-                drawer_id,
-                memory_id,
-                imported_at,
-            );
-        }
-        self.conn.execute(
-            "INSERT OR IGNORE INTO mempalace_imports (drawer_id, memory_id, imported_at)
-             VALUES (?, ?, ?)",
-            params![drawer_id, memory_id, imported_at],
-        )?;
-        Ok(())
+        engine::imports::record_mempalace(&mut self.core.lock(), drawer_id, memory_id, imported_at)
     }
 
     /// Live memories a mempalace import recorded, from drawers starting with
@@ -328,26 +145,7 @@ impl<'c> ImportLedger<'c> {
         &self,
         drawer_prefix: Option<&str>,
     ) -> Result<Vec<String>> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::imports::live_tracked_mempalace_memories(&core.lock(), drawer_prefix);
-        }
-        match drawer_prefix {
-            Some(prefix) => self.ids(
-                "SELECT t.memory_id FROM mempalace_imports t
-                   JOIN memories m ON m.id = t.memory_id
-                  WHERE m.deleted_at IS NULL AND t.drawer_id LIKE ?
-                  ORDER BY t.memory_id",
-                &[format!("{prefix}%")],
-            ),
-            None => self.ids(
-                "SELECT t.memory_id FROM mempalace_imports t
-                   JOIN memories m ON m.id = t.memory_id
-                  WHERE m.deleted_at IS NULL
-                  ORDER BY t.memory_id",
-                &[],
-            ),
-        }
+        engine::imports::live_tracked_mempalace_memories(&self.core.lock(), drawer_prefix)
     }
 
     /// Live memories that carry a mempalace source whether or not a
@@ -357,91 +155,25 @@ impl<'c> ImportLedger<'c> {
         &self,
         drawer_prefix: Option<&str>,
     ) -> Result<Vec<String>> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::imports::live_mempalace_shaped_memories(&core.lock(), drawer_prefix);
-        }
-        match drawer_prefix {
-            Some(prefix) => self.ids(
-                "SELECT id FROM memories
-                  WHERE deleted_at IS NULL
-                    AND (source = 'mempalace_import' OR source LIKE 'mempalace:%')
-                    AND json_extract(metadata, '$.mempalace_drawer_id') LIKE ?
-                  ORDER BY id",
-                &[format!("{prefix}%")],
-            ),
-            None => self.ids(
-                "SELECT id FROM memories
-                  WHERE deleted_at IS NULL
-                    AND (source = 'mempalace_import' OR source LIKE 'mempalace:%')
-                  ORDER BY id",
-                &[],
-            ),
-        }
+        engine::imports::live_mempalace_shaped_memories(&self.core.lock(), drawer_prefix)
     }
 
     // --- undo ------------------------------------------------------------
 
     /// The distinct `doc_id`s of `memory_ids`, sorted.
     pub fn doc_ids_of(&self, memory_ids: &[String]) -> Result<Vec<String>> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::imports::doc_ids_of(&core.lock(), memory_ids);
-        }
-        if memory_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        self.ids(
-            &format!(
-                "SELECT DISTINCT doc_id FROM memories
-                  WHERE doc_id IS NOT NULL AND id IN ({})
-                  ORDER BY doc_id",
-                placeholders(memory_ids.len())
-            ),
-            memory_ids,
-        )
+        engine::imports::doc_ids_of(&self.core.lock(), memory_ids)
     }
 
     /// Drop the dbs tracking rows for `memory_ids`. Returns how many went.
     pub fn forget_dbs(&self, memory_ids: &[String]) -> Result<usize> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::imports::forget_dbs(&mut core.lock(), memory_ids);
-        }
-        self.forget_by_memory("dbs_imports", memory_ids)
+        engine::imports::forget_dbs(&mut self.core.lock(), memory_ids)
     }
 
     /// Drop the mempalace tracking rows for `memory_ids`. Returns how many
     /// went.
     pub fn forget_mempalace(&self, memory_ids: &[String]) -> Result<usize> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::imports::forget_mempalace(&mut core.lock(), memory_ids);
-        }
-        self.forget_by_memory("mempalace_imports", memory_ids)
-    }
-
-    fn forget_by_memory(&self, table: &str, memory_ids: &[String]) -> Result<usize> {
-        if memory_ids.is_empty() {
-            return Ok(0);
-        }
-        Ok(self.conn.execute(
-            &format!(
-                "DELETE FROM {table} WHERE memory_id IN ({})",
-                placeholders(memory_ids.len())
-            ),
-            params_from_iter(memory_ids.iter()),
-        )?)
-    }
-
-    /// The first column of every row `sql` returns, bound to `bindings`.
-    fn ids(&self, sql: &str, bindings: &[String]) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare(sql)?;
-        let rows = stmt
-            .query_map(params_from_iter(bindings.iter()), |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()
-            .map_err(crate::db::StoreError::from);
-        rows
+        engine::imports::forget_mempalace(&mut self.core.lock(), memory_ids)
     }
 }
 
@@ -454,8 +186,10 @@ mod tests {
 
     const NOW: &str = "2026-09-26T00:00:00+00:00";
 
-    /// Every read and write of the import ledger, as text, on `db`.
-    fn exercise(db: &Database) -> Vec<String> {
+    /// Every read and write of the import ledger on a fixed corpus.
+    #[test]
+    fn the_ledger_tracks_chat_dbs_and_mempalace_imports() {
+        let db = Database::open_in_memory().unwrap();
         let store = db.store();
         let memories = Memories::new(&store);
         let doc = |id: &str, doc: &str| NewMemory {
@@ -517,7 +251,12 @@ mod tests {
         ledger
             .record_chat("imp_d", "d.json", "h3", NOW, "{}")
             .unwrap();
-        let duplicate = ledger.record_chat("imp_a", "again.json", "h9", NOW, "{}");
+        assert!(
+            ledger
+                .record_chat("imp_a", "again.json", "h9", NOW, "{}")
+                .is_err(),
+            "a recorded chat import is refused"
+        );
 
         ledger.record_dbs("Src_1", "e1", "d1", "h1", NOW).unwrap();
         ledger.record_dbs("src-2", "e1", "d2", "h1", NOW).unwrap();
@@ -534,95 +273,103 @@ mod tests {
             .map(String::from)
             .to_vec();
         let owned = |ids: &[&str]| ids.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            ledger.chat_import_with_hash("h1").unwrap().as_deref(),
+            Some("imp_c"),
+            "the earliest import of the hash"
+        );
+        assert_eq!(ledger.chat_import_with_hash("h9").unwrap(), None);
+        assert_eq!(
+            ledger.live_chat_memories(Some("imp_a")).unwrap(),
+            ["m1", "m2"]
+        );
+        assert_eq!(
+            ledger.live_chat_memories(None).unwrap(),
+            ["m1", "m2", "m3"],
+            "m4 is deleted and m9's doc is no chat import"
+        );
+        assert_eq!(
+            ledger.chat_imports_with_nothing_left(&chats).unwrap(),
+            ["imp_b", "imp_d"]
+        );
         let mut tracked: Vec<String> = ledger
             .dbs_tracked("Src_1", &["e1", "e3", "e9"])
             .unwrap()
             .into_iter()
-            .map(|(k, v)| format!("{k:?}={v:?}"))
+            .map(|(k, v)| format!("{}/{}={}@{}", k.0, k.1, v.memory_id, v.content_hash))
             .collect();
         tracked.sort();
-        let mut seen = vec![
-            format!("{}", duplicate.is_err()),
-            format!("{:?}", ledger.chat_import_with_hash("h1").unwrap()),
-            format!("{:?}", ledger.chat_import_with_hash("h9").unwrap()),
-            format!("{:?}", ledger.live_chat_memories(Some("imp_a")).unwrap()),
-            format!("{:?}", ledger.live_chat_memories(None).unwrap()),
-            format!(
-                "{:?}",
-                ledger.chat_imports_with_nothing_left(&chats).unwrap()
-            ),
-            format!("{:?}", tracked),
-            format!("{:?}", ledger.live_dbs_memories(None).unwrap()),
-            format!("{:?}", ledger.live_dbs_memories(Some("src_")).unwrap()),
-            format!(
-                "{:?}",
-                ledger.imported_drawers(&["wing_2", "Wing_1", "x"]).unwrap()
-            ),
-            format!(
-                "{:?}",
-                ledger.live_tracked_mempalace_memories(None).unwrap()
-            ),
-            format!(
-                "{:?}",
-                ledger
-                    .live_tracked_mempalace_memories(Some("WING_"))
-                    .unwrap()
-            ),
-            format!("{:?}", ledger.live_mempalace_shaped_memories(None).unwrap()),
-            format!(
-                "{:?}",
-                ledger
-                    .live_mempalace_shaped_memories(Some("wing_"))
-                    .unwrap()
-            ),
-            format!(
-                "{:?}",
-                ledger.live_mempalace_shaped_memories(Some("1")).unwrap()
-            ),
-            format!(
-                "{:?}",
-                ledger
-                    .doc_ids_of(&owned(&["m1", "m2", "m4", "d1", "zz"]))
-                    .unwrap()
-            ),
-            format!("{}", StoreStats::new(&store).imports().unwrap()),
-        ];
-        seen.push(format!(
-            "{}",
+        assert_eq!(
+            tracked,
+            ["Src_1/e1=d2@h2", "Src_1/e3=gone@h1"],
+            "a rerun replaces the tracked memory"
+        );
+        assert_eq!(ledger.live_dbs_memories(None).unwrap(), ["d2", "d2"]);
+        assert_eq!(
+            ledger.live_dbs_memories(Some("src_")).unwrap(),
+            ["d2", "d2"],
+            "the prefix is a LIKE pattern: case-insensitive, `_` any one character"
+        );
+        assert_eq!(ledger.live_dbs_memories(Some("src-")).unwrap(), ["d2"]);
+        assert_eq!(
+            ledger.imported_drawers(&["wing_2", "Wing_1", "x"]).unwrap(),
+            ["Wing_1", "wing_2"]
+        );
+        assert_eq!(
+            ledger.live_tracked_mempalace_memories(None).unwrap(),
+            ["p1", "p4"],
+            "wing_2's second record was ignored, wingZ's memory is deleted"
+        );
+        assert_eq!(
+            ledger
+                .live_tracked_mempalace_memories(Some("WING_"))
+                .unwrap(),
+            ["p1", "p4"]
+        );
+        assert_eq!(
+            ledger.live_mempalace_shaped_memories(None).unwrap(),
+            ["p1", "p2", "p3", "p5"],
+            "`mempalace:` sources match case-insensitively; `mempalace_import` exactly"
+        );
+        assert_eq!(
+            ledger
+                .live_mempalace_shaped_memories(Some("wing_"))
+                .unwrap(),
+            ["p1", "p2"]
+        );
+        assert_eq!(
+            ledger.live_mempalace_shaped_memories(Some("1")).unwrap(),
+            ["p3"],
+            "a numeric drawer id is matched as text"
+        );
+        assert_eq!(
+            ledger
+                .doc_ids_of(&owned(&["m1", "m2", "m4", "d1", "zz"]))
+                .unwrap(),
+            ["imp_a", "imp_b"]
+        );
+        assert_eq!(StoreStats::new(&store).imports().unwrap(), 4);
+        assert_eq!(
             ledger
                 .forget_chat_imports_with_nothing_left(&chats)
-                .unwrap()
-        ));
-        seen.push(format!(
-            "{}",
-            ledger.forget_dbs(&owned(&["d2", "d2", "d1"])).unwrap()
-        ));
-        seen.push(format!(
-            "{}",
-            ledger.forget_mempalace(&owned(&["p4", "p9"])).unwrap()
-        ));
-        seen.push(format!("{:?}", ledger.live_chat_memories(None).unwrap()));
-        seen.push(format!("{:?}", ledger.live_dbs_memories(None).unwrap()));
-        seen.push(format!(
-            "{:?}",
-            ledger.imported_drawers(&["wing_2", "Wing_1"]).unwrap()
-        ));
-        seen.push(format!("{}", StoreStats::new(&store).imports().unwrap()));
-        seen
-    }
-
-    #[test]
-    fn the_engine_core_keeps_the_import_ledger_as_sqlite_does() {
-        let mut observed = Vec::new();
-        crate::db::on_each_backend(|db| observed.push(exercise(db)));
-        let sqlite = &observed[0];
-        assert_eq!(sqlite[0], "true", "a recorded chat import is refused");
-        for other in &observed[1..] {
-            for (theirs, ours) in other.iter().zip(sqlite) {
-                assert_eq!(theirs, ours);
-            }
-            assert_eq!(other.len(), sqlite.len());
-        }
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            ledger.forget_dbs(&owned(&["d2", "d2", "d1"])).unwrap(),
+            2
+        );
+        assert_eq!(
+            ledger.forget_mempalace(&owned(&["p4", "p9"])).unwrap(),
+            1
+        );
+        assert_eq!(ledger.live_chat_memories(None).unwrap(), ["m1", "m2", "m3"]);
+        assert!(ledger.live_dbs_memories(None).unwrap().is_empty());
+        assert_eq!(
+            ledger.imported_drawers(&["wing_2", "Wing_1"]).unwrap(),
+            ["Wing_1"]
+        );
+        assert_eq!(StoreStats::new(&store).imports().unwrap(), 2);
     }
 
     #[test]

@@ -94,7 +94,7 @@ fn set_once(slot: &mut Option<Source>, source: Source) -> Result<(), String> {
 
 fn read(source: &Source) -> Result<Snapshot, String> {
     match source {
-        Source::Sqlite(path) => import::sqlite::read(path).map_err(|e| e.0),
+        Source::Sqlite(path) => import::legacy_sqlite::read(path).map_err(|e| e.0),
         Source::Postgres => read_postgres(),
     }
 }

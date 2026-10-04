@@ -1,18 +1,17 @@
-//! The same node workload on SQLite and on the engine (ADR-0023).
+//! A node workload on the engine (ADR-0023).
 //!
-//! Run each backend in its own process, in release, so peak memory is its
-//! own:
+//! Run in release, in its own process, so peak memory is its own:
 //!
 //! ```text
-//! cargo run --release -p remind_me_core --example store_bench -- sqlite 15000 /tmp/bench
 //! cargo run --release -p remind_me_core --example store_bench -- engine 15000 /tmp/bench
-//! cargo run --release -p remind_me_core --example store_bench -- copy   15000 /tmp/bench
+//! cargo run --release -p remind_me_core --example store_bench -- open   15000 /tmp/bench
 //! ```
 //!
-//! `sqlite` and `engine` fill a fresh store with `n` synthetic memories and
-//! time each operation a node serves. `copy` fills a SQLite store and times
-//! the first open on the engine, which copies it: the one-time cost of the
-//! upgrade. Each run prints one JSON line.
+//! `engine` fills a fresh store with `n` synthetic memories and times each
+//! operation a node serves. `open` fills a store and times reopening it,
+//! which rebuilds the derived indexes. Each run prints one JSON line. The
+//! SQLite workload and the copy timing went with the SQLite store
+//! (ADR-0025); `tests/fixtures/legacy_store` keeps a copy source.
 //!
 //! The data is synthetic and deterministic: a Zipf-skewed vocabulary, so
 //! full-text posting lists look like prose, and a mix of categories, tags
@@ -37,7 +36,7 @@ const SAMPLES: usize = 500;
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let [mode, n, dir] = args.as_slice() else {
-        return Err("usage: store_bench <sqlite|engine|copy> <n> <dir>".into());
+        return Err("usage: store_bench <engine|open> <n> <dir>".into());
     };
     let n: usize = n.parse()?;
     let dir = PathBuf::from(dir).join(format!("{mode}-{n}"));
@@ -51,8 +50,8 @@ fn main() -> Result<()> {
     report.insert("backend".into(), json!(mode));
     report.insert("n".into(), json!(n));
     match mode.as_str() {
-        "sqlite" | "engine" => workload(mode == "engine", &file, n, &mut report)?,
-        "copy" => copy(&file, n, &mut report)?,
+        "engine" => workload(&file, n, &mut report)?,
+        "open" => reopen(&file, n, &mut report)?,
         other => return Err(format!("unknown mode {other:?}").into()),
     }
     report.insert("disk_mb".into(), json!(megabytes(dir_size(&dir)?)));
@@ -61,21 +60,17 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn open(on_engine: bool, file: &Path) -> Result<Database> {
-    Ok(if on_engine {
-        Database::open_on_engine(file)?
-    } else {
-        Database::open_on_sqlite(file)?
-    })
+fn open(file: &Path) -> Result<Database> {
+    Ok(Database::open(file)?)
 }
 
 /// Fill a store with `n` memories, reopen it, then time each operation.
-fn workload(on_engine: bool, file: &Path, n: usize, report: &mut Map<String, Value>) -> Result<()> {
+fn workload(file: &Path, n: usize, report: &mut Map<String, Value>) -> Result<()> {
     let corpus = Corpus::new();
     let mut rng = Rng(0x5eed);
     let mut ids = Vec::with_capacity(n);
     {
-        let db = open(on_engine, file)?;
+        let db = open(file)?;
         let store = db.store();
         let mut adds = Vec::with_capacity(n);
         let started = Instant::now();
@@ -90,7 +85,7 @@ fn workload(on_engine: bool, file: &Path, n: usize, report: &mut Map<String, Val
     }
 
     let started = Instant::now();
-    let db = open(on_engine, file)?;
+    let db = open(file)?;
     report.insert("reopen_ms".into(), json!(millis(started.elapsed())));
     let store = db.store();
 
@@ -169,32 +164,21 @@ fn workload(on_engine: bool, file: &Path, n: usize, report: &mut Map<String, Val
     Ok(())
 }
 
-/// Fill a SQLite store, then time the first open on the engine, which
-/// copies it.
-fn copy(file: &Path, n: usize, report: &mut Map<String, Value>) -> Result<()> {
+/// Fill a store, then time reopening it: the cost of rebuilding the
+/// derived indexes at open.
+fn reopen(file: &Path, n: usize, report: &mut Map<String, Value>) -> Result<()> {
     let corpus = Corpus::new();
     let mut rng = Rng(0x5eed);
     {
-        let db = Database::open_on_sqlite(file)?;
+        let db = open(file)?;
         let store = db.store();
         for _ in 0..n {
             queries::add_memory(&store, corpus.memory(&mut rng))?;
         }
     }
-    report.insert(
-        "sqlite_mb".into(),
-        json!(megabytes(std::fs::metadata(file)?.len())),
-    );
     let started = Instant::now();
-    let db = Database::open_on_engine(file)?;
-    report.insert(
-        "first_open_s".into(),
-        json!(started.elapsed().as_secs_f64()),
-    );
-    drop(db);
-    let started = Instant::now();
-    let _db = Database::open_on_engine(file)?;
-    report.insert("second_open_ms".into(), json!(millis(started.elapsed())));
+    let _db = open(file)?;
+    report.insert("reopen_ms".into(), json!(millis(started.elapsed())));
     Ok(())
 }
 

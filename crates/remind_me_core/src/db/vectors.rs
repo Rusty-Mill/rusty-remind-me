@@ -1,23 +1,17 @@
 //! Storage for embeddings: `vec_chunks`, one row per chunk of a memory,
 //! keyed `(memory_id, chunk_ix)` and holding the vector as little-endian
 //! f32 bytes, plus `embedding_meta`, which records the model that wrote
-//! them.
+//! them. Both on the engine's memories core (`db::engine::vectors`).
 //!
-//! ADR-0023 phase 1, step 4. Chunks were keyed on `memories.rowid` up to
-//! schema v29; they are keyed on the memory id now, so nothing depends on
-//! a row number another store would not have. Every statement
-//! [`crate::vectors`], [`crate::ann_index`] and [`crate::consolidation`] ran
-//! against these tables lives here. The rules stay there: chunking,
-//! scoring, the ANN index's staleness test, and the model-change clear.
-//!
-//! With the `engine-store` feature, a store whose tables hold the memories
-//! core keeps both tables there (`db::engine::vectors`, core PR 4a).
+//! Chunks were keyed on `memories.rowid` up to schema v29; they are keyed
+//! on the memory id now, so nothing depends on a row number (ADR-0023 §4).
+//! Every read and write [`crate::vectors`], [`crate::ann_index`] and
+//! [`crate::consolidation`] make goes through here. The rules stay there:
+//! chunking, scoring, the ANN index's staleness test, and the model-change
+//! clear.
 
-#[cfg(feature = "engine-store")]
 use super::engine::{self, EngineLock};
 use super::{Result, Store};
-use rusqlite::types::Value as SqlValue;
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 
 /// One stored chunk vector.
 #[derive(Debug, Clone, PartialEq)]
@@ -47,125 +41,50 @@ pub struct ConsolidationCandidate {
     pub embedding: Vec<u8>,
 }
 
-/// One placeholder per item, comma-separated.
-fn placeholders(n: usize) -> String {
-    vec!["?"; n].join(",")
-}
-
-/// The vector tables, over one connection, or on the engine's memories
-/// core when the store's tables hold it (`db::engine::vectors`).
+/// The vector tables, on the engine's memories core.
 pub struct Vectors<'c> {
-    conn: &'c Connection,
-    #[cfg(feature = "engine-store")]
-    core: Option<&'c EngineLock>,
+    core: &'c EngineLock,
 }
 
 impl<'c> Vectors<'c> {
     pub fn new(store: &'c Store<'_>) -> Self {
-        Self {
-            conn: store.conn(),
-            #[cfg(feature = "engine-store")]
-            core: store.core(),
-        }
+        Self { core: store.core() }
     }
 
     /// Store `embedding` as chunk `chunk_ix` of `memory_id`, replacing any
     /// chunk already there.
     pub fn put(&self, memory_id: &str, chunk_ix: usize, embedding: &[u8]) -> Result<()> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::vectors::put(&mut core.lock(), memory_id, chunk_ix as i64, embedding);
-        }
-        self.conn.execute(
-            "INSERT OR REPLACE INTO vec_chunks (memory_id, chunk_ix, embedding) VALUES (?, ?, ?)",
-            params![memory_id, chunk_ix as i64, embedding],
-        )?;
-        Ok(())
+        engine::vectors::put(&mut self.core.lock(), memory_id, chunk_ix as i64, embedding)
     }
 
     /// Delete every chunk of `memory_id`. Returns how many went.
     pub fn delete_for(&self, memory_id: &str) -> Result<usize> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::vectors::delete_for(&mut core.lock(), memory_id);
-        }
-        Ok(self.conn.execute(
-            "DELETE FROM vec_chunks WHERE memory_id = ?",
-            params![memory_id],
-        )?)
+        engine::vectors::delete_for(&mut self.core.lock(), memory_id)
     }
 
     /// Delete every chunk of every memory.
     pub fn clear(&self) -> Result<()> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::vectors::clear(&mut core.lock());
-        }
-        self.conn.execute("DELETE FROM vec_chunks", [])?;
-        Ok(())
+        engine::vectors::clear(&mut self.core.lock())
     }
 
     /// How many chunks `memory_id` has.
     pub fn chunk_count(&self, memory_id: &str) -> Result<usize> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::vectors::chunk_count(&core.lock(), memory_id);
-        }
-        let count: i64 = self.conn.query_row(
-            "SELECT count(*) FROM vec_chunks WHERE memory_id = ?",
-            params![memory_id],
-            |r| r.get(0),
-        )?;
-        Ok(count.max(0) as usize)
+        engine::vectors::chunk_count(&self.core.lock(), memory_id)
     }
 
     /// How many chunks are stored in all.
     pub fn count(&self) -> Result<usize> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::vectors::count(&core.lock());
-        }
-        let count: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))?;
-        Ok(count.max(0) as usize)
+        engine::vectors::count(&self.core.lock())
     }
 
     /// The first stored embedding in key order, if there is one.
     pub fn any_embedding(&self) -> Result<Option<Vec<u8>>> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::vectors::any_embedding(&core.lock());
-        }
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT embedding FROM vec_chunks ORDER BY memory_id, chunk_ix LIMIT 1",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?)
+        engine::vectors::any_embedding(&self.core.lock())
     }
 
     /// Every stored chunk, in key order.
     pub fn all(&self) -> Result<Vec<ChunkVector>> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::vectors::all(&core.lock());
-        }
-        let mut stmt = self
-            .conn
-            .prepare("SELECT memory_id, embedding FROM vec_chunks ORDER BY memory_id, chunk_ix")?;
-        let rows = stmt
-            .query_map([], |r| {
-                Ok(ChunkVector {
-                    memory_id: r.get(0)?,
-                    embedding: r.get(1)?,
-                })
-            })?
-            .collect::<rusqlite::Result<_>>()
-            .map_err(crate::db::StoreError::from);
-        rows
+        engine::vectors::all(&self.core.lock())
     }
 
     /// The chunks of live, unsuperseded memories, of `category` when given,
@@ -175,68 +94,12 @@ impl<'c> Vectors<'c> {
         category: Option<&str>,
         among: Option<&[String]>,
     ) -> Result<Vec<ChunkVector>> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::vectors::live_chunks(&core.lock(), category, among);
-        }
-        let mut sql = String::from(
-            "SELECT vc.memory_id, vc.embedding
-               FROM vec_chunks vc
-               JOIN memories m ON m.id = vc.memory_id
-              WHERE m.superseded_by IS NULL AND m.deleted_at IS NULL",
-        );
-        let mut bindings: Vec<SqlValue> = Vec::new();
-        if let Some(category) = category {
-            sql.push_str(" AND m.category = ?");
-            bindings.push(SqlValue::Text(category.to_string()));
-        }
-        if let Some(ids) = among {
-            if ids.is_empty() {
-                return Ok(Vec::new());
-            }
-            sql.push_str(&format!(
-                " AND vc.memory_id IN ({})",
-                placeholders(ids.len())
-            ));
-            bindings.extend(ids.iter().map(|id| SqlValue::Text(id.clone())));
-        }
-        sql.push_str(" ORDER BY vc.memory_id, vc.chunk_ix");
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt
-            .query_map(params_from_iter(bindings), |r| {
-                Ok(ChunkVector {
-                    memory_id: r.get(0)?,
-                    embedding: r.get(1)?,
-                })
-            })?
-            .collect::<rusqlite::Result<_>>()
-            .map_err(crate::db::StoreError::from);
-        rows
+        engine::vectors::live_chunks(&self.core.lock(), category, among)
     }
 
     /// Every live memory with no chunk vectors, oldest first.
     pub fn unembedded(&self) -> Result<Vec<Unembedded>> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::vectors::unembedded(&core.lock());
-        }
-        let mut stmt = self.conn.prepare(
-            "SELECT m.id, m.content
-               FROM memories m
-              WHERE m.deleted_at IS NULL
-                AND NOT EXISTS (SELECT 1 FROM vec_chunks vc WHERE vc.memory_id = m.id)
-              ORDER BY m.created_at, m.id",
-        )?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok(Unembedded {
-                    id: row.get(0)?,
-                    content: row.get(1)?,
-                })
-            })?
-            .collect::<rusqlite::Result<_>>()
-            .map_err(crate::db::StoreError::from);
-        rows
+        engine::vectors::unembedded(&self.core.lock())
     }
 
     /// Active, unsuperseded, live memories with a first chunk vector, of
@@ -246,76 +109,19 @@ impl<'c> Vectors<'c> {
         category: Option<&str>,
         limit: usize,
     ) -> Result<Vec<ConsolidationCandidate>> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::vectors::consolidation_candidates(&core.lock(), category, limit);
-        }
-        let mut sql = String::from(
-            "SELECT m.id, m.content, m.vitality, m.access_count, m.accessed_at, m.tags,
-                    m.decay_rate, m.base_weight, vc.embedding
-               FROM memories m
-               JOIN vec_chunks vc ON vc.memory_id = m.id AND vc.chunk_ix = 0
-              WHERE m.status = 'active' AND m.superseded_by IS NULL AND m.deleted_at IS NULL",
-        );
-        let mut bindings: Vec<SqlValue> = Vec::new();
-        if let Some(category) = category {
-            sql.push_str(" AND m.category = ?");
-            bindings.push(SqlValue::Text(category.to_string()));
-        }
-        sql.push_str(" ORDER BY m.created_at, m.id LIMIT ?");
-        bindings.push(SqlValue::Integer(limit as i64));
-
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt
-            .query_map(params_from_iter(bindings), |row| {
-                let tags_json: String = row.get(5)?;
-                Ok(ConsolidationCandidate {
-                    id: row.get(0)?,
-                    content: row.get(1)?,
-                    vitality: row.get(2)?,
-                    access_count: row.get(3)?,
-                    accessed_at: row.get(4)?,
-                    tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-                    decay_rate: row.get(6)?,
-                    base_weight: row.get(7)?,
-                    embedding: row.get(8)?,
-                })
-            })?
-            .collect::<rusqlite::Result<_>>()
-            .map_err(crate::db::StoreError::from);
-        rows
+        engine::vectors::consolidation_candidates(&self.core.lock(), category, limit)
     }
 
     // --- embedding_meta --------------------------------------------------
 
     /// Every `embedding_meta` key and value, by key.
     pub fn meta(&self) -> Result<Vec<(String, String)>> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::vectors::meta(&core.lock());
-        }
-        let mut stmt = self
-            .conn
-            .prepare("SELECT key, value FROM embedding_meta ORDER BY key")?;
-        let rows = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<rusqlite::Result<_>>()
-            .map_err(crate::db::StoreError::from);
-        rows
+        engine::vectors::meta(&self.core.lock())
     }
 
     /// Set the `embedding_meta` value under `key`, stamped `updated_at`.
     pub fn set_meta(&self, key: &str, value: &str, updated_at: &str) -> Result<()> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::vectors::set_meta(&mut core.lock(), key, value, updated_at);
-        }
-        self.conn.execute(
-            "INSERT INTO embedding_meta (key, value, updated_at) VALUES (?, ?, ?)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-            params![key, value, updated_at],
-        )?;
-        Ok(())
+        engine::vectors::set_meta(&mut self.core.lock(), key, value, updated_at)
     }
 }
 
@@ -355,8 +161,10 @@ mod tests {
         assert_eq!(vectors.chunk_count("a").unwrap(), 0);
     }
 
-    /// Every read and write of the vector tables, as text, on `db`.
-    fn exercise(db: &Database) -> Vec<String> {
+    /// Every read and write of the vector tables on a fixed corpus.
+    #[test]
+    fn the_vector_tables_read_back_what_was_written() {
+        let db = Database::open_in_memory().unwrap();
         let store = db.store();
         let memories = Memories::new(&store);
         let memory = |id: &str, created: &str| NewMemory {
@@ -423,46 +231,95 @@ mod tests {
         vectors.set_meta("dim", "4", NOW).unwrap();
         vectors.set_meta("model", "m2", NOW).unwrap();
 
+        let ids = |chunks: Vec<ChunkVector>| -> Vec<(String, u8)> {
+            chunks
+                .into_iter()
+                .map(|c| (c.memory_id, c.embedding[0]))
+                .collect()
+        };
+        assert_eq!(vectors.count().unwrap(), 10, "the corpus stores its chunks");
+        assert_eq!(vectors.chunk_count("a").unwrap(), 2);
+        assert_eq!(vectors.any_embedding().unwrap(), Some(vec![30, 0, 0, 0]));
+        assert_eq!(
+            ids(vectors.all().unwrap()),
+            [
+                ("a".to_string(), 30),
+                ("a".to_string(), 2),
+                ("b".to_string(), 1),
+                ("c".to_string(), 4),
+                ("d".to_string(), 5),
+                ("e".to_string(), 6),
+                ("f".to_string(), 7),
+                ("g".to_string(), 8),
+                ("h".to_string(), 10),
+                ("orphan".to_string(), 9),
+            ],
+            "key order"
+        );
+        let live = ids(vectors.live_chunks(None, None).unwrap());
+        let live_ids: Vec<&str> = live.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            live_ids,
+            ["a", "a", "b", "c", "d", "e", "h"],
+            "superseded, deleted and orphaned chunks are not live"
+        );
+        assert_eq!(
+            ids(vectors.live_chunks(Some("note"), None).unwrap()),
+            [("d".to_string(), 5)]
+        );
         let among = ["a".to_string(), "d".to_string(), "g".to_string()];
-        let mut seen = vec![
-            format!("{}", vectors.count().unwrap()),
-            format!("{}", vectors.chunk_count("a").unwrap()),
-            format!("{:?}", vectors.any_embedding().unwrap()),
-            format!("{:?}", vectors.all().unwrap()),
-            format!("{:?}", vectors.live_chunks(None, None).unwrap()),
-            format!("{:?}", vectors.live_chunks(Some("note"), None).unwrap()),
-            format!("{:?}", vectors.live_chunks(None, Some(&among)).unwrap()),
-            format!("{:?}", vectors.live_chunks(None, Some(&[])).unwrap()),
-            format!("{:?}", vectors.unembedded().unwrap()),
-            format!("{:?}", vectors.consolidation_candidates(None, 10).unwrap()),
-            format!("{:?}", vectors.consolidation_candidates(None, 2).unwrap()),
-            format!(
-                "{:?}",
-                vectors.consolidation_candidates(Some("note"), 10).unwrap()
-            ),
-            format!("{:?}", vectors.meta().unwrap()),
-            format!("{}", vectors.delete_for("a").unwrap()),
-            format!("{}", vectors.delete_for("missing").unwrap()),
-            format!("{:?}", vectors.unembedded().unwrap()),
-        ];
-        vectors.clear().unwrap();
-        seen.push(format!("{}", vectors.count().unwrap()));
-        seen.push(format!("{:?}", vectors.any_embedding().unwrap()));
-        seen
-    }
+        assert_eq!(
+            ids(vectors.live_chunks(None, Some(&among)).unwrap()),
+            [("a".to_string(), 30), ("a".to_string(), 2), ("d".to_string(), 5)]
+        );
+        let unembedded: Vec<String> = vectors
+            .unembedded()
+            .unwrap()
+            .into_iter()
+            .map(|u| u.id)
+            .collect();
+        assert!(unembedded.is_empty(), "{unembedded:?}");
 
-    #[test]
-    fn the_engine_core_stores_vectors_as_sqlite_does() {
-        let mut observed = Vec::new();
-        crate::db::on_each_backend(|db| observed.push(exercise(db)));
-        let sqlite = &observed[0];
-        assert_eq!(sqlite[0], "10", "the corpus stores its chunks");
-        for other in &observed[1..] {
-            for (theirs, ours) in other.iter().zip(sqlite) {
-                assert_eq!(theirs, ours);
-            }
-            assert_eq!(other.len(), sqlite.len());
-        }
+        let candidates: Vec<(String, f64)> = vectors
+            .consolidation_candidates(None, 10)
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.id, c.vitality))
+            .collect();
+        assert_eq!(
+            candidates,
+            [
+                ("c".to_string(), 1.0),
+                ("a".to_string(), 1.0),
+                ("b".to_string(), 1.0),
+                ("d".to_string(), 1.0)
+            ],
+            "active, live, unsuperseded, with a first chunk; oldest first"
+        );
+        assert_eq!(vectors.consolidation_candidates(None, 2).unwrap().len(), 2);
+        let notes = vectors.consolidation_candidates(Some("note"), 10).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].tags, ["t-d"]);
+        assert_eq!(notes[0].embedding, [5, 0, 0, 0]);
+        assert_eq!(
+            vectors.meta().unwrap(),
+            [
+                ("dim".to_string(), "4".to_string()),
+                ("model".to_string(), "m2".to_string())
+            ]
+        );
+        assert_eq!(vectors.delete_for("a").unwrap(), 2);
+        assert_eq!(vectors.delete_for("missing").unwrap(), 0);
+        let unembedded: Vec<String> = vectors
+            .unembedded()
+            .unwrap()
+            .into_iter()
+            .map(|u| u.id)
+            .collect();
+        assert_eq!(unembedded, ["a"]);
+        vectors.clear().unwrap();
+        assert_eq!(vectors.count().unwrap(), 0);
+        assert_eq!(vectors.any_embedding().unwrap(), None);
     }
 
     #[test]

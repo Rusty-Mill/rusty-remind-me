@@ -40,12 +40,8 @@
 //! persona built on it, with no background job and no second opinion about
 //! what "still true" means.
 //!
-//! # Not in the schema files
-//!
-//! `promotions` is this crate's own table, created at open by
-//! [`crate::db::promotions::ensure_table`] the way `vectors::ensure_schema`
-//! creates `vec_embeddings` and `db::archives::ensure_tables` creates its own
-//! (ARCHITECTURE.md §5).
+//! `promotions` is its own table on the engine (`db::engine::promotions`),
+//! keyed by the promoted and source ids.
 
 use crate::db::memories::{Memories, NewMemory};
 use crate::db::promotions::{Promotions, StatementRow};
@@ -57,7 +53,6 @@ use crate::models::{
 };
 use crate::vitality::{calculate_vitality, get_decay_rate, get_source_prior, get_type_prior};
 use chrono::Utc;
-use rusqlite::Connection;
 
 /// `source` promoted artifacts are stored under.
 pub const PROMOTION_SOURCE: &str = "promotion";
@@ -755,9 +750,8 @@ impl NudgeHandle {
 ///
 /// `None` when no interval is configured — unlike the reminder scheduler,
 /// which always runs, this is opt-in, matching the folder watcher (#55) and
-/// webhook (#56) convention. Also `None` for an in-memory database: the
-/// thread opens its own connection by path, and `:memory:` would give it a
-/// different, empty one, so it would report an empty backlog forever.
+/// webhook (#56) convention. Also `None` for an in-memory database, which
+/// lives only as long as its `Database`.
 pub fn start_nudge_for(store: &Store<'_>) -> Option<NudgeHandle> {
     let interval = nudge_interval()?;
     Some(start_nudge(store.secondary_source()?, interval))
@@ -767,7 +761,6 @@ pub fn start_nudge(
     source: crate::db::SecondarySource,
     interval: std::time::Duration,
 ) -> NudgeHandle {
-    let db_path = source.path().to_path_buf();
     let stop = std::sync::Arc::new(crate::scheduler::Stop::new());
     let loop_stop = std::sync::Arc::clone(&stop);
     let (liveness, liveness_guard) = crate::scheduler::Liveness::new();
@@ -777,18 +770,12 @@ pub fn start_nudge(
         .name("promotion-nudge".to_string())
         .spawn(move || {
             let _liveness_guard = liveness_guard;
-            let store = match Connection::open(&db_path) {
-                Ok(store) => store,
-                Err(e) => {
-                    eprintln!("promotion nudge: cannot open {:?}: {}", db_path, e);
-                    return;
-                }
-            };
+            let store = source.store();
             while !loop_stop.is_stopped() {
                 // A failed pass is reported and the loop continues: a
                 // transient database error must not silently end the nudge
                 // for the rest of the process's life.
-                match nudge_once(&source.store(&store)) {
+                match nudge_once(&store) {
                     Ok((backlog, true)) => {
                         eprintln!("promotion nudge: {}", backlog.summary())
                     }

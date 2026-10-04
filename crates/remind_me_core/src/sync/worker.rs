@@ -8,7 +8,6 @@
 use super::{prune_outbox, pull_remote, push_outbox};
 use crate::db::sync_state::SyncState;
 use crate::db::{SecondarySource, Store};
-use crate::Database;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -62,10 +61,9 @@ impl SyncWorker {
     /// `if SYNC_ENABLED: start_sync_thread()` gating exactly.
     ///
     /// Takes a [`SecondarySource`] rather than a `Database`/`Arc`, like
-    /// [`crate::scheduler::start_scheduler`]: the thread reopens its own
-    /// connection by path on every retry (via
-    /// [`crate::Database::open_secondary_at`]) and shares the source's engine
-    /// tables, so nothing here needs a caller's `Database` to still be alive.
+    /// [`crate::scheduler::start_scheduler`]: the thread works on the
+    /// source's shared engine tables without the database's lock, so
+    /// nothing here needs a caller's `Database` to still be alive.
     pub fn from_env(source: SecondarySource) -> Option<Self> {
         if !super::sync_enabled() {
             return None;
@@ -97,40 +95,19 @@ impl SyncWorker {
                 // reason: a tunnel is only wanted while something is syncing
                 // through it.
                 let mut sidecars = crate::sidecars::Sidecars::new();
-                // A connection of its own, not `Database::store()`'s shared
-                // `Mutex`: a cycle below pushes/pulls every remote over the
-                // network, which can run for many multiples of any one HTTP
-                // timeout. Holding the process-wide mutex for that whole span
-                // used to block every other MCP tool call -- reads and
-                // writes alike -- until the cycle finished. Opened once and
-                // kept for the thread's life; re-opened on the next cycle if
-                // the attempt itself failed (e.g. transient file-permission
-                // trouble).
-                let db_path = source.path();
-                let mut store = Database::open_secondary_at(db_path).ok();
+                // A store of its own, not `Database::store()`'s locked one: a
+                // cycle below pushes/pulls every remote over the network,
+                // which can run for many multiples of any one HTTP timeout.
+                // Holding the process-wide lock for that whole span used to
+                // block every other MCP tool call -- reads and writes alike
+                // -- until the cycle finished. The engine tables lock per
+                // call instead.
+                let store = source.store();
                 while !thread_shutdown.load(Ordering::Relaxed) {
                     // Before the cycle, not after: the tunnel this may start
                     // is what the cycle about to run needs in place.
                     sidecars.ensure();
-                    if store.is_none() {
-                        store = Database::open_secondary_at(db_path).ok();
-                    }
-                    match store.as_ref() {
-                        Some(c) => run_one_cycle(
-                            &source.store(c),
-                            &hub_url,
-                            &secret,
-                            &node_id,
-                            &thread_state,
-                        ),
-                        None => {
-                            let mut guard = thread_state.lock().unwrap_or_else(|e| e.into_inner());
-                            guard.last_error = Some(
-                                "sync worker could not open its own database connection"
-                                    .to_string(),
-                            );
-                        }
-                    }
+                    run_one_cycle(&store, &hub_url, &secret, &node_id, &thread_state);
 
                     let mut waited = Duration::ZERO;
                     while waited < interval && !thread_shutdown.load(Ordering::Relaxed) {

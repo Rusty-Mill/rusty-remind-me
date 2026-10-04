@@ -1,11 +1,11 @@
-//! The engine-backed store (ADR-0023, phase 4), built one table group at a
-//! time behind the `engine-store` feature.
+//! The engine-backed store (ADR-0023), the node's only store since phase 6
+//! (ADR-0025).
 //!
-//! [`EngineTables`] holds the engine stores for the groups moved so far. A
-//! [`super::Store`] carries it beside the SQLite connection, and each moved
-//! repository reads and writes here instead of SQLite; every other group
-//! stays on SQLite until its own step. Phase 5 makes the engine the default
-//! and phase 6 removes SQLite.
+//! [`EngineTables`] holds the engine stores for every table group. A
+//! [`super::Store`] carries them, and each repository under `db` is a thin
+//! layer over the module here that owns its group. The groups were moved
+//! one at a time beside the SQLite store (phase 4), proven against it, and
+//! the SQLite store then removed.
 //!
 //! Ids follow the hub's layout (its ADR-0021): each record's engine id is a
 //! UUID v5 of the node's string id, and the string stays on the record so a
@@ -53,7 +53,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use uuid::Uuid;
 
 /// The engine tables, shared by the database, its stores, and the
-/// background threads that open their own SQLite connections beside it.
+/// background threads that work beside it.
 pub type EngineHandle = std::sync::Arc<EngineLock>;
 
 /// The engine tables behind their lock, shared by every thread that uses
@@ -115,10 +115,6 @@ impl fmt::Debug for EngineLock {
         f.debug_struct("EngineLock").finish_non_exhaustive()
     }
 }
-
-/// The environment variable that picks the node's store: `sqlite`, or
-/// anything else for the engine (the default).
-pub const STORE_ENV: &str = "REMIND_ME_STORE";
 
 /// The lock file inside the data directory, held while the tables are open.
 const LOCK_FILE: &str = "node.lock";
@@ -305,7 +301,7 @@ impl EngineTables {
     }
 
     /// Copy every file of the tables into `dest`, which must not exist: a
-    /// backup. The caller holds the tables, so no write lands mid-copy and
+    /// backup (`crate::backup`). The caller holds the tables, so no write lands mid-copy and
     /// no page is open on another thread; the copy opens as the tables
     /// would after a clean shutdown. The directory lock is not copied.
     ///
@@ -328,8 +324,28 @@ impl EngineTables {
         Ok(())
     }
 
+    /// The bytes of every file in the directory the tables live in, the
+    /// lock file included: what `storage_info` reports as the store's size.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Engine`] naming the entry that could not be read.
+    pub(crate) fn size_on_disk(&self) -> super::Result<u64> {
+        let io =
+            |path: &Path, e: std::io::Error| StoreError::Engine(format!("{}: {e}", path.display()));
+        let mut total = 0;
+        for entry in std::fs::read_dir(&self.dir).map_err(|e| io(&self.dir, e))? {
+            let entry = entry.map_err(|e| io(&self.dir, e))?;
+            let meta = entry.metadata().map_err(|e| io(&entry.path(), e))?;
+            if meta.is_file() {
+                total += meta.len();
+            }
+        }
+        Ok(total)
+    }
+
     /// Tables in a fresh directory that is removed when they are dropped:
-    /// the engine's counterpart of an in-memory SQLite database.
+    /// an in-memory database.
     pub fn open_temporary() -> super::Result<Self> {
         let dir = TemporaryDir::fresh();
         let mut tables = Self::open(&dir.0)?;
@@ -369,17 +385,6 @@ fn lock_error(e: DirLockError) -> StoreError {
         )),
         other => engine_error(other),
     }
-}
-
-/// Whether the node's store is the engine: always, unless `REMIND_ME_STORE`
-/// asks for SQLite.
-pub(crate) fn engine_selected() -> bool {
-    engine_selected_from(std::env::var(STORE_ENV).ok().as_deref())
-}
-
-/// [`engine_selected`] with the value injected, for tests.
-fn engine_selected_from(value: Option<&str>) -> bool {
-    !value.is_some_and(|v| v.trim().eq_ignore_ascii_case("sqlite"))
 }
 
 /// The engine id for the node's string id `id`.
@@ -516,16 +521,6 @@ mod open_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_engine_is_the_store_unless_sqlite_is_asked_for() {
-        for engine in [None, Some(""), Some("engine"), Some("ENGINE")] {
-            assert!(engine_selected_from(engine), "{engine:?}");
-        }
-        for sqlite in ["sqlite", " SQLite "] {
-            assert!(!engine_selected_from(Some(sqlite)), "{sqlite}");
-        }
-    }
 
     #[test]
     fn engine_ids_are_stable() {

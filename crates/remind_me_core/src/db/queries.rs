@@ -1,4 +1,4 @@
-use super::{Result, Store};
+use super::{Result, Store, StoreError};
 use crate::db::memories::{
     EntityScope, KeywordFilter, ListFilter, Memories, MemoryEdit, NewMemory, PageFilter,
 };
@@ -21,105 +21,6 @@ use crate::vitality::{
     get_type_prior, VITALITY_FLOOR,
 };
 use chrono::Utc;
-use rusqlite::Row;
-
-/// Columns selected wherever a full [`Memory`] is parsed via [`parse_memory_row`].
-///
-/// This list must stay a superset of what [`parse_memory_row`] reads, and the
-/// serialised [`Memory`] must in turn cover every column of `memories` — see
-/// `memory_json_test.rs`, which asserts exactly that against the live schema.
-/// A column added to the schema but not here silently vanished from every
-/// tool response before #198.
-pub const MEMORY_COLUMNS: &str = "id, content, category, tags, source, metadata, created_at, \
-     updated_at, capture_id, subject, predicate, object, superseded_by, decay_rate, vitality, \
-     base_weight, access_count, accessed_at, doc_id, chunk_index, remind_at, sensitive, \
-     memory_type, status, node_id, client, source_capture_id, deleted_at, \
-     project, session_id, git_remote, git_branch, git_sha, cwd, valid_from, valid_until, \
-     confidence, verified_at, outcome, written_by, capture_method";
-
-/// [`MEMORY_COLUMNS`] with each name qualified by `alias`, for queries that join.
-pub fn prefixed_memory_columns(alias: &str) -> String {
-    MEMORY_COLUMNS
-        .split(',')
-        .map(|c| format!("{}.{}", alias, c.trim()))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-pub fn parse_memory_row(row: &Row) -> rusqlite::Result<Memory> {
-    let tags_json: String = row.get("tags")?;
-    let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
-
-    let meta_json: String = row.get("metadata")?;
-    let metadata: serde_json::Value =
-        serde_json::from_str(&meta_json).unwrap_or(serde_json::Value::Null);
-
-    let created_at: String = row.get("created_at")?;
-
-    Ok(Memory {
-        id: row.get("id")?,
-        content: row.get("content")?,
-        category: row.get("category")?,
-        tags,
-        source: row.get("source")?,
-        metadata,
-        created_at: created_at.clone(),
-        updated_at: row.get("updated_at")?,
-        capture_id: row.get("capture_id")?,
-        subject: row.get("subject")?,
-        predicate: row.get("predicate")?,
-        object: row.get("object")?,
-        superseded_by: row.get("superseded_by")?,
-        decay_rate: row.get("decay_rate")?,
-        vitality: row.get("vitality")?,
-        base_weight: row.get("base_weight")?,
-        access_count: row.get("access_count")?,
-        // The column is nullable and a row written by `remind_me` may leave it
-        // unset. Falling back to `created_at` matches the reference, and keeps
-        // `get::<String>` from failing on NULL.
-        accessed_at: row
-            .get::<_, Option<String>>("accessed_at")?
-            .unwrap_or_else(|| created_at.clone()),
-        doc_id: row.get("doc_id")?,
-        chunk_index: row.get("chunk_index")?,
-        remind_at: row.get("remind_at")?,
-        // SQLite has no boolean type and the column is nullable, so this
-        // arrives as 0/1/NULL. Same shape trap as `SyncRecord::sensitive`.
-        sensitive: row.get::<_, Option<i64>>("sensitive")?.unwrap_or(0) != 0,
-        // Read as Option even where the column is NOT NULL: this database is
-        // shared with `remind_me`, and a row written before a column gained
-        // its default arrives as NULL. A non-optional get would fail the whole
-        // read rather than report a missing value.
-        memory_type: row.get("memory_type")?,
-        status: row.get("status")?,
-        node_id: row.get("node_id")?,
-        client: row.get("client")?,
-        source_capture_id: row.get("source_capture_id")?,
-        deleted_at: row.get("deleted_at")?,
-        project: row.get("project")?,
-        session_id: row.get("session_id")?,
-        git_remote: row.get("git_remote")?,
-        git_branch: row.get("git_branch")?,
-        git_sha: row.get("git_sha")?,
-        cwd: row.get("cwd")?,
-        valid_from: row.get("valid_from")?,
-        valid_until: row.get("valid_until")?,
-        // NOT NULL with a default, but read as Option like the columns
-        // above: a row from before the column's default must not fail
-        // the whole read.
-        confidence: row
-            .get::<_, Option<f64>>("confidence")?
-            .unwrap_or_else(crate::models::default_confidence),
-        verified_at: row.get("verified_at")?,
-        outcome: row.get("outcome")?,
-        written_by: row
-            .get::<_, Option<String>>("written_by")?
-            .unwrap_or_else(crate::models::default_written_by),
-        capture_method: row
-            .get::<_, Option<String>>("capture_method")?
-            .unwrap_or_else(crate::models::default_capture_method),
-    })
-}
 
 pub fn add_memory(store: &Store<'_>, mut input: MemoryAddInput) -> Result<Memory> {
     let now = Utc::now();
@@ -167,7 +68,7 @@ pub fn add_memory(store: &Store<'_>, mut input: MemoryAddInput) -> Result<Memory
         let _ = crate::vectors::embed_and_store(store, &*embedder, &id, &input.content);
     }
 
-    let memory = get_memory_by_id(store, &id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+    let memory = get_memory_by_id(store, &id)?.ok_or(StoreError::NotFound)?;
 
     // Local mutation, so automation hears about it. A record arriving from a
     // peer goes through `sync::upsert_record` instead, which deliberately
@@ -281,7 +182,7 @@ pub fn update_memory(store: &Store<'_>, input: &MemoryUpdateInput) -> Result<Upd
     }
 
     let memory =
-        get_memory_by_id(store, &input.memory_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        get_memory_by_id(store, &input.memory_id)?.ok_or(StoreError::NotFound)?;
     crate::events::emit(crate::events::Event::Updated, &memory.id, &memory.category);
 
     Ok(UpdateOutcome::Updated(Box::new(memory)))

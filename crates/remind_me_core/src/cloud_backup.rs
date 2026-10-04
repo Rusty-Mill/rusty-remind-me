@@ -140,9 +140,14 @@ pub fn plaintext_gate() -> Result<(), String> {
 /// What uploading the engine backup directory `path` does: nothing yet.
 /// The upload sends one file, and an engine backup is a directory, so a
 /// configured bucket gets an honest `Unavailable` rather than a silent skip.
+/// The plaintext gate is checked first, as it is for a file: a bucket that
+/// may not receive plaintext is told that, whatever the upload could do.
 pub fn upload_backup_dir(path: &std::path::Path) -> UploadOutcome {
     if configured_bucket().is_empty() {
         return UploadOutcome::NotConfigured;
+    }
+    if let Err(reason) = plaintext_gate() {
+        return UploadOutcome::Refused { reason };
     }
     UploadOutcome::Unavailable {
         reason: format!(

@@ -66,7 +66,7 @@ type Result<T> = std::result::Result<T, PidError>;
 /// `PRAGMA` query rather than a shared helper, and this follows the same
 /// established shape.
 fn database_path(store: &Store<'_>) -> crate::db::Result<Option<PathBuf>> {
-    crate::db::database_path(store)
+    Ok(store.path().map(Path::to_path_buf))
 }
 
 /// The PID file's path, beside the database file.

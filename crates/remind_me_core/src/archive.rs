@@ -23,21 +23,12 @@
 //! no-op in that state, so an import with archiving off is byte-identical to
 //! one from before this module existed.
 //!
-//! # Why its tables are not in the schema files
+//! # Its own tables
 //!
-//! When this was written, `db/schema_tables.sql` was generated verbatim from
-//! the Python `remind_me` and was not this crate's file to extend (an
-//! `archive_path` column on `chat_imports` would have been reverted by the
-//! next regeneration). Python is retired now (ADR-0023) and the files are
-//! hand-owned, but these tables stay separate until the node's storage moves
-//! off SQLite.
-//!
-//! So the two tables are **target-only**, created by
-//! [`crate::db::archives::ensure_tables`] at open time in the same way
-//! [`crate::vectors::ensure_schema`] creates `vec_embeddings`. `migration_pending` only iterates tables present in the
-//! pristine reference schema, so a table the reference has never heard of is
-//! invisible to reconciliation rather than repeatedly rebuilt. A `remind_me`
-//! sharing the database ignores them for the same reason.
+//! `import_archives` and `import_archive_spans` are this crate's own, on the
+//! engine (`db::archives`, `db::engine::archives`). They were kept apart
+//! from the Python reference's tables while the schema was generated from
+//! it, and stayed their own group when the store moved (ADR-0023).
 //!
 //! # Content-addressed, so a re-import costs nothing
 //!

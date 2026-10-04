@@ -7,14 +7,12 @@
 //! (`owner/repo#123`, a full sha, `sha256:<hex>` for an attachment) is the
 //! detector's business, and nothing here is queued for sync.
 //!
-//! Engine only: the table was added once the engine was the node's store,
-//! and SQLite stays only to open and copy an older database onto it
-//! (ADR-0023). A store on SQLite answers every call here with
-//! [`StoreError::Invalid`].
+//! Added at schema v32, once the engine was the node's store (ADR-0023),
+//! so the table never lived in SQLite and the copy of an old `memory.db`
+//! has nothing to read for it.
 
-#[cfg(feature = "engine-store")]
 use super::engine::{self, EngineLock};
-use super::{Result, Store, StoreError};
+use super::{Result, Store};
 use serde::{Deserialize, Serialize};
 
 /// A reference to store.
@@ -62,79 +60,36 @@ pub struct MemoryReference {
     pub created_at: String,
 }
 
-/// The error every call answers with on a store without the engine tables.
-pub(crate) fn not_on_sqlite(table: &str) -> StoreError {
-    StoreError::Invalid(format!(
-        "{table} is not supported on the legacy SQLite store; open the node on the engine"
-    ))
-}
-
 /// The `memory_references` table on the engine's memories core
 /// (`db::engine::references`).
 pub struct References<'c> {
-    #[cfg(feature = "engine-store")]
-    core: Option<&'c EngineLock>,
-    #[cfg(not(feature = "engine-store"))]
-    _store: std::marker::PhantomData<&'c ()>,
+    core: &'c EngineLock,
 }
 
 impl<'c> References<'c> {
     pub fn new(store: &'c Store<'_>) -> Self {
-        #[cfg(not(feature = "engine-store"))]
-        let _ = store;
-        Self {
-            #[cfg(feature = "engine-store")]
-            core: store.core(),
-            #[cfg(not(feature = "engine-store"))]
-            _store: std::marker::PhantomData,
-        }
-    }
-
-    #[cfg(feature = "engine-store")]
-    fn core(&self) -> Result<&'c EngineLock> {
-        self.core.ok_or_else(|| not_on_sqlite("memory_references"))
-    }
-
-    #[cfg(not(feature = "engine-store"))]
-    fn core(&self) -> Result<std::convert::Infallible> {
-        Err(not_on_sqlite("memory_references"))
+        Self { core: store.core() }
     }
 
     /// Insert `row`. An existing id is an error.
     pub fn insert(&self, row: &NewReference) -> Result<()> {
-        let core = self.core()?;
-        #[cfg(feature = "engine-store")]
-        return engine::references::insert(&mut core.lock(), row);
-        #[cfg(not(feature = "engine-store"))]
-        match core {}
+        engine::references::insert(&mut self.core.lock(), row)
     }
 
     /// Every reference of memory `memory_id`, oldest first (ties by id).
     pub fn for_memory(&self, memory_id: &str) -> Result<Vec<MemoryReference>> {
-        let core = self.core()?;
-        #[cfg(feature = "engine-store")]
-        return engine::references::for_memory(&core.lock(), memory_id);
-        #[cfg(not(feature = "engine-store"))]
-        match core {}
+        engine::references::for_memory(&self.core.lock(), memory_id)
     }
 
     /// Every reference with exactly this `kind` and `value`, oldest first
     /// (ties by id): the memories that name one thing.
     pub fn find(&self, kind: &str, value: &str) -> Result<Vec<MemoryReference>> {
-        let core = self.core()?;
-        #[cfg(feature = "engine-store")]
-        return engine::references::find(&core.lock(), kind, value);
-        #[cfg(not(feature = "engine-store"))]
-        match core {}
+        engine::references::find(&self.core.lock(), kind, value)
     }
 
     /// Remove every reference of memory `memory_id`. How many went.
     pub fn delete_for_memory(&self, memory_id: &str) -> Result<usize> {
-        let core = self.core()?;
-        #[cfg(feature = "engine-store")]
-        return engine::references::delete_for_memory(&mut core.lock(), memory_id);
-        #[cfg(not(feature = "engine-store"))]
-        match core {}
+        engine::references::delete_for_memory(&mut self.core.lock(), memory_id)
     }
 }
 
@@ -164,21 +119,9 @@ mod tests {
     }
 
     #[test]
-    fn the_sqlite_store_refuses_references() {
-        let db = Database::open_sqlite_in_memory().unwrap();
-        let store = db.store();
-        let refused = References::new(&store).for_memory("m1");
-        assert!(
-            matches!(&refused, Err(StoreError::Invalid(why)) if why.contains("legacy SQLite")),
-            "{refused:?}"
-        );
-    }
-
-    #[cfg(feature = "engine-store")]
-    #[test]
     fn references_are_stored_found_and_deleted() {
         {
-            let db = Database::open_in_memory_on_engine().unwrap();
+            let db = Database::open_in_memory().unwrap();
             let store = db.store();
             let refs = References::new(&store);
             // Inserted out of time order, to check the read orders them.

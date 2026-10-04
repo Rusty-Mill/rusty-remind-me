@@ -1,40 +1,17 @@
 //! Storage for the knowledge graph: `entities`, `entity_relations` and the
-//! `memory_entities` mention links.
+//! `memory_entities` mention links, on the engine's memories core
+//! (`db::engine::graph`).
 //!
-//! ADR-0023 phase 1, step 2. Every statement [`crate::entity`] and
-//! [`crate::sync::graph`] ran lives here. The rules stay with them: how a
-//! name normalises into an id, how aliases merge, which kind wins, how a
-//! traversal walks, and how sync resolves a conflict.
-//!
-//! With the `engine-store` feature, a store whose tables hold the memories
-//! core keeps the graph there (`db::engine::graph`, ADR-0023 core PR 3a).
+//! Every read and write [`crate::entity`] and [`crate::sync::graph`] make
+//! goes through here. The rules stay with them: how a name normalises into
+//! an id, how aliases merge, which kind wins, how a traversal walks, and how
+//! sync resolves a conflict. A local write queues its outbox entry as it
+//! lands; a synced one never does (see [`Origin`]).
 
-#[cfg(feature = "engine-store")]
+use super::derived::Origin;
 use super::engine::{self, EngineLock};
 use super::{Result, Store};
-use crate::db::derived::{queue_entity, queue_link, queue_relation, GraphOutbox, Origin};
 use crate::entity::{Entity, EntityFact, EntityLinkedMemory, EntityListItem, RelationEdge};
-use rusqlite::types::Value as SqlValue;
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
-
-const ENTITY_SELECT: &str = "SELECT id, name, kind, aliases, created_at, updated_at FROM entities";
-
-fn parse_entity_row(row: &Row) -> rusqlite::Result<Entity> {
-    let aliases_json: String = row.get("aliases")?;
-    Ok(Entity {
-        id: row.get("id")?,
-        name: row.get("name")?,
-        kind: row.get("kind")?,
-        aliases: serde_json::from_str(&aliases_json).unwrap_or_default(),
-        created_at: row.get("created_at")?,
-        updated_at: row.get("updated_at")?,
-    })
-}
-
-/// `aliases` as the JSON array the column holds.
-fn aliases_json(aliases: &[String]) -> String {
-    serde_json::to_string(aliases).unwrap_or_else(|_| "[]".to_string())
-}
 
 /// What a sync merge needs of the local copy of an entity.
 #[derive(Debug, Clone, PartialEq)]
@@ -66,111 +43,43 @@ pub struct StoredRelation {
     pub updated_at: String,
 }
 
-/// The knowledge-graph tables, over one connection, or on the engine's
-/// memories core when the store's tables hold it (`db::engine::graph`).
+/// The knowledge-graph tables, on the engine's memories core.
 pub struct Entities<'c> {
-    conn: &'c Connection,
-    /// Where writes queue their outbox entries on SQLite.
-    outbox: GraphOutbox<'c>,
-    #[cfg(feature = "engine-store")]
-    core: Option<&'c EngineLock>,
+    core: &'c EngineLock,
 }
 
 impl<'c> Entities<'c> {
     pub fn new(store: &'c Store<'_>) -> Self {
-        Self {
-            conn: store.conn(),
-            outbox: GraphOutbox::new(store),
-            #[cfg(feature = "engine-store")]
-            core: store.core(),
-        }
+        Self { core: store.core() }
     }
 
     // --- entities --------------------------------------------------------
 
     /// The entity with id `id`, if there is one.
     pub fn get(&self, id: &str) -> Result<Option<Entity>> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::graph::get(&core.lock(), id);
-        }
-        Ok(self
-            .conn
-            .query_row(
-                &format!("{ENTITY_SELECT} WHERE id = ?"),
-                params![id],
-                parse_entity_row,
-            )
-            .optional()?)
+        engine::graph::get(&self.core.lock(), id)
     }
 
     /// Whether an entity with id `id` exists.
     pub fn exists(&self, id: &str) -> Result<bool> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::graph::exists(&core.lock(), id);
-        }
-        let found: Option<i64> = self
-            .conn
-            .query_row("SELECT 1 FROM entities WHERE id = ?", params![id], |r| {
-                r.get(0)
-            })
-            .optional()?;
-        Ok(found.is_some())
+        engine::graph::exists(&self.core.lock(), id)
     }
 
     /// Every entity, oldest first (ties by id).
     pub fn all_oldest_first(&self) -> Result<Vec<Entity>> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::graph::all_oldest_first(&core.lock());
-        }
-        let mut stmt = self
-            .conn
-            .prepare(&format!("{ENTITY_SELECT} ORDER BY created_at, id"))?;
-        let rows = stmt
-            .query_map([], parse_entity_row)?
-            .collect::<rusqlite::Result<_>>()
-            .map_err(crate::db::StoreError::from);
-        rows
+        engine::graph::all_oldest_first(&self.core.lock())
     }
 
-    /// Every entity, in storage order (on the engine, by id).
+    /// Every entity, by id.
     pub fn all(&self) -> Result<Vec<Entity>> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::graph::all(&core.lock());
-        }
-        let mut stmt = self.conn.prepare(ENTITY_SELECT)?;
-        let rows = stmt
-            .query_map([], parse_entity_row)?
-            .collect::<rusqlite::Result<_>>()
-            .map_err(crate::db::StoreError::from);
-        rows
+        engine::graph::all(&self.core.lock())
     }
 
     /// Insert `entity`, made on this node, created and updated at its own
     /// stamps, recording `node_id` as where it was made. An existing id is an
     /// error.
     pub fn insert(&self, entity: &Entity, node_id: Option<&str>) -> Result<()> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::graph::insert(&mut core.lock(), entity, node_id);
-        }
-        self.conn.execute(
-            "INSERT INTO entities (id, name, kind, aliases, created_at, updated_at, node_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
-            params![
-                entity.id,
-                entity.name,
-                entity.kind,
-                aliases_json(&entity.aliases),
-                entity.created_at,
-                entity.updated_at,
-                node_id,
-            ],
-        )?;
-        queue_entity(self.outbox, &entity.id, "insert")
+        engine::graph::insert(&mut self.core.lock(), entity, node_id)
     }
 
     /// Set `id`'s kind and aliases, stamping `updated_at`.
@@ -181,66 +90,18 @@ impl<'c> Entities<'c> {
         aliases: &[String],
         updated_at: &str,
     ) -> Result<()> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::graph::set_kind_and_aliases(
-                &mut core.lock(),
-                id,
-                kind,
-                aliases,
-                updated_at,
-            );
-        }
-        self.conn.execute(
-            "UPDATE entities SET kind = ?, aliases = ?, updated_at = ? WHERE id = ?",
-            params![kind, aliases_json(aliases), updated_at, id],
-        )?;
-        queue_entity(self.outbox, id, "update")
+        engine::graph::set_kind_and_aliases(&mut self.core.lock(), id, kind, aliases, updated_at)
     }
 
     /// How many entities there are.
     pub fn count(&self) -> Result<usize> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::graph::count(&core.lock());
-        }
-        let total: i64 = self
-            .conn
-            .query_row("SELECT count(*) FROM entities", [], |row| row.get(0))?;
-        Ok(total.max(0) as usize)
+        engine::graph::count(&self.core.lock())
     }
 
     /// A page of entities with their mention counts, most-mentioned first,
     /// then by name, then id.
     pub fn page_by_mentions(&self, limit: usize, offset: usize) -> Result<Vec<EntityListItem>> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::graph::page_by_mentions(&core.lock(), limit, offset);
-        }
-        let mut stmt = self.conn.prepare(
-            "SELECT e.id, e.name, e.kind, e.aliases, e.updated_at,
-                    count(me.memory_id) AS mention_count
-               FROM entities e
-          LEFT JOIN memory_entities me ON me.entity_id = e.id
-           GROUP BY e.id
-           ORDER BY mention_count DESC, e.name ASC, e.id
-              LIMIT ? OFFSET ?",
-        )?;
-        let rows = stmt
-            .query_map(params![limit as i64, offset as i64], |row| {
-                let aliases_json: String = row.get("aliases")?;
-                Ok(EntityListItem {
-                    id: row.get("id")?,
-                    name: row.get("name")?,
-                    kind: row.get("kind")?,
-                    aliases: serde_json::from_str(&aliases_json).unwrap_or_default(),
-                    updated_at: row.get("updated_at")?,
-                    mention_count: row.get("mention_count")?,
-                })
-            })?
-            .collect::<rusqlite::Result<_>>()
-            .map_err(crate::db::StoreError::from);
-        rows
+        engine::graph::page_by_mentions(&self.core.lock(), limit, offset)
     }
 
     // --- id renormalisation ----------------------------------------------
@@ -249,13 +110,7 @@ impl<'c> Entities<'c> {
     /// relations are repointed separately. Queued for sync as an update of
     /// `to`.
     pub fn rename(&self, from: &str, to: &str) -> Result<()> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::graph::rename(&mut core.lock(), from, to);
-        }
-        self.conn
-            .execute("UPDATE entities SET id = ? WHERE id = ?", params![to, from])?;
-        queue_entity(self.outbox, to, "update")
+        engine::graph::rename(&mut self.core.lock(), from, to)
     }
 
     /// Set `id`'s kind, aliases and `created_at`, without stamping
@@ -267,56 +122,18 @@ impl<'c> Entities<'c> {
         aliases: &[String],
         created_at: &str,
     ) -> Result<()> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::graph::set_merged(&mut core.lock(), id, kind, aliases, created_at);
-        }
-        self.conn.execute(
-            "UPDATE entities SET kind = ?, aliases = ?, created_at = ? WHERE id = ?",
-            params![kind, aliases_json(aliases), created_at, id],
-        )?;
-        queue_entity(self.outbox, id, "update")
+        engine::graph::set_merged(&mut self.core.lock(), id, kind, aliases, created_at)
     }
 
     /// Delete the entity `id`. Its links and relations are not touched.
     pub fn delete(&self, id: &str) -> Result<()> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::graph::delete(&mut core.lock(), id);
-        }
-        self.conn
-            .execute("DELETE FROM entities WHERE id = ?", params![id])?;
-        Ok(())
+        engine::graph::delete(&mut self.core.lock(), id)
     }
 
     /// Repoint every mention link and relation end from the entity `from` to
     /// `to`. A link `to` already has is dropped rather than duplicated.
     pub fn repoint(&self, from: &str, to: &str) -> Result<()> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::graph::repoint(&mut core.lock(), from, to);
-        }
-        // `memory_entities` is keyed `(memory_id, entity_id)`, so repointing
-        // can collide with a link `to` already has. Ignore those, then drop
-        // whatever the ignore left behind.
-        self.conn.execute(
-            "UPDATE OR IGNORE memory_entities SET entity_id = ? WHERE entity_id = ?",
-            params![to, from],
-        )?;
-        self.conn.execute(
-            "DELETE FROM memory_entities WHERE entity_id = ?",
-            params![from],
-        )?;
-        // Relations are keyed on their own id, so these cannot collide.
-        self.conn.execute(
-            "UPDATE entity_relations SET subject_entity_id = ? WHERE subject_entity_id = ?",
-            params![to, from],
-        )?;
-        self.conn.execute(
-            "UPDATE entity_relations SET object_entity_id = ? WHERE object_entity_id = ?",
-            params![to, from],
-        )?;
-        Ok(())
+        engine::graph::repoint(&mut self.core.lock(), from, to)
     }
 
     // --- mention links ---------------------------------------------------
@@ -324,19 +141,7 @@ impl<'c> Entities<'c> {
     /// Every mention link as `(memory_id, entity_id, created_at)`, oldest
     /// first.
     pub fn links_oldest_first(&self) -> Result<Vec<(String, String, String)>> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::graph::links_oldest_first(&core.lock());
-        }
-        let mut stmt = self.conn.prepare(
-            "SELECT memory_id, entity_id, created_at FROM memory_entities
-              ORDER BY created_at, memory_id, entity_id",
-        )?;
-        let rows = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-            .collect::<rusqlite::Result<_>>()
-            .map_err(crate::db::StoreError::from);
-        rows
+        engine::graph::links_oldest_first(&self.core.lock())
     }
 
     /// Record that `memory_id` mentions `entity_id`. Returns whether the
@@ -348,178 +153,54 @@ impl<'c> Entities<'c> {
         created_at: &str,
         origin: Origin,
     ) -> Result<bool> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::graph::link(&mut core.lock(), memory_id, entity_id, created_at, origin);
-        }
-        let inserted = self.conn.execute(
-            "INSERT OR IGNORE INTO memory_entities (memory_id, entity_id, created_at)
-             VALUES (?, ?, ?)",
-            params![memory_id, entity_id, created_at],
-        )? > 0;
-        if inserted && origin == Origin::Local {
-            queue_link(self.outbox, memory_id, entity_id)?;
-        }
-        Ok(inserted)
+        engine::graph::link(&mut self.core.lock(), memory_id, entity_id, created_at, origin)
     }
 
     /// Remove every mention link from `memory_id`: part of deleting a
-    /// memory, since the table has no foreign key to cascade.
+    /// memory.
     pub fn unlink_memory(&self, memory_id: &str) -> Result<()> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::graph::unlink_memory(&mut core.lock(), memory_id);
-        }
-        self.conn.execute(
-            "DELETE FROM memory_entities WHERE memory_id = ?",
-            params![memory_id],
-        )?;
-        Ok(())
+        engine::graph::unlink_memory(&mut self.core.lock(), memory_id)
     }
 
     /// Live memories linked to `entity_id`, newest first (ties by id,
-    /// descending), at most `limit`,
-    /// with the first 300 characters of their content. A link to a memory
-    /// not stored here is skipped.
+    /// descending), at most `limit`, with the first 300 characters of their
+    /// content. A link to a memory not stored here is skipped.
     pub fn linked_memories(
         &self,
         entity_id: &str,
         limit: usize,
     ) -> Result<Vec<EntityLinkedMemory>> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::graph::linked_memories(&core.lock(), entity_id, limit);
-        }
-        let mut stmt = self.conn.prepare(
-            "SELECT m.id, substr(m.content, 1, 300) AS content_snippet, m.category, m.created_at
-               FROM memory_entities me
-               JOIN memories m ON m.id = me.memory_id
-              WHERE me.entity_id = ? AND m.superseded_by IS NULL AND m.deleted_at IS NULL
-              ORDER BY m.created_at DESC, m.id DESC
-              LIMIT ?",
-        )?;
-        let rows = stmt
-            .query_map(params![entity_id, limit as i64], |row| {
-                Ok(EntityLinkedMemory {
-                    id: row.get("id")?,
-                    content_snippet: row.get("content_snippet")?,
-                    category: row.get("category")?,
-                    created_at: row.get("created_at")?,
-                })
-            })?
-            .collect::<rusqlite::Result<_>>()
-            .map_err(crate::db::StoreError::from);
-        rows
+        engine::graph::linked_memories(&self.core.lock(), entity_id, limit)
     }
 
     /// How many live memories are linked to `entity_id`.
     pub fn linked_memory_count(&self, entity_id: &str) -> Result<usize> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::graph::linked_memory_count(&core.lock(), entity_id);
-        }
-        let count: i64 = self.conn.query_row(
-            "SELECT count(*)
-               FROM memory_entities me
-               JOIN memories m ON m.id = me.memory_id
-              WHERE me.entity_id = ? AND m.superseded_by IS NULL AND m.deleted_at IS NULL",
-            params![entity_id],
-            |row| row.get(0),
-        )?;
-        Ok(count.max(0) as usize)
+        engine::graph::linked_memory_count(&self.core.lock(), entity_id)
     }
 
     /// Live memories whose subject or object, lowercased, is `canonical`,
     /// newest first (ties by id, descending), at most `limit`.
     pub fn facts_naming(&self, canonical: &str, limit: usize) -> Result<Vec<EntityFact>> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::graph::facts_naming(&core.lock(), canonical, limit);
-        }
-        let mut stmt = self.conn.prepare(
-            "SELECT id, content, subject, predicate, object, category, created_at
-               FROM memories
-              WHERE superseded_by IS NULL AND deleted_at IS NULL
-                AND (lower(subject) = ? OR lower(object) = ?)
-              ORDER BY created_at DESC, id DESC
-              LIMIT ?",
-        )?;
-        let rows = stmt
-            .query_map(params![canonical, canonical, limit as i64], |row| {
-                Ok(EntityFact {
-                    id: row.get("id")?,
-                    content: row.get("content")?,
-                    subject: row.get("subject")?,
-                    predicate: row.get("predicate")?,
-                    object: row.get("object")?,
-                    category: row.get("category")?,
-                    created_at: row.get("created_at")?,
-                })
-            })?
-            .collect::<rusqlite::Result<_>>()
-            .map_err(crate::db::StoreError::from);
-        rows
+        engine::graph::facts_naming(&self.core.lock(), canonical, limit)
     }
 
     // --- relations -------------------------------------------------------
 
     /// Every relation, oldest first (ties by id).
     pub fn relations_oldest_first(&self) -> Result<Vec<StoredRelation>> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::graph::relations_oldest_first(&core.lock());
-        }
-        let mut stmt = self.conn.prepare(
-            "SELECT id, subject_entity_id, relation, object_entity_id, created_at, updated_at
-               FROM entity_relations ORDER BY created_at, id",
-        )?;
-        let rows = stmt
-            .query_map([], |r| {
-                Ok(StoredRelation {
-                    id: r.get(0)?,
-                    subject_entity_id: r.get(1)?,
-                    relation: r.get(2)?,
-                    object_entity_id: r.get(3)?,
-                    created_at: r.get(4)?,
-                    updated_at: r.get(5)?,
-                })
-            })?
-            .collect::<rusqlite::Result<_>>()
-            .map_err(crate::db::StoreError::from);
-        rows
+        engine::graph::relations_oldest_first(&self.core.lock())
     }
 
     /// Insert `row` unless its id is already taken. Returns whether it was
     /// inserted: relations are immutable.
     pub fn insert_relation_or_ignore(&self, row: &RelationRow<'_>, origin: Origin) -> Result<bool> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::graph::insert_relation_or_ignore(&mut core.lock(), row, origin);
-        }
-        let inserted = self.conn.execute(
-            "INSERT OR IGNORE INTO entity_relations
-                 (id, subject_entity_id, relation, object_entity_id, created_at, updated_at, node_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
-            params![
-                row.id,
-                row.subject_entity_id,
-                row.relation,
-                row.object_entity_id,
-                row.created_at,
-                row.updated_at,
-                row.node_id,
-            ],
-        )? > 0;
-        if inserted && origin == Origin::Local {
-            queue_relation(self.outbox, row.id)?;
-        }
-        Ok(inserted)
+        engine::graph::insert_relation_or_ignore(&mut self.core.lock(), row, origin)
     }
 
     /// Every relation with either end in `entity_ids`, and `relation` as its
-    /// label when one is given, oldest first (ties by id). Each comes with its id, and a
-    /// relation whose ends are not both stored here is skipped. `hop` is
-    /// copied onto each edge.
+    /// label when one is given, oldest first (ties by id). Each comes with
+    /// its id, and a relation whose ends are not both stored here is
+    /// skipped. `hop` is copied onto each edge.
     pub fn relations_touching(
         &self,
         entity_ids: &[String],
@@ -529,127 +210,28 @@ impl<'c> Entities<'c> {
         if entity_ids.is_empty() {
             return Ok(Vec::new());
         }
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::graph::relations_touching(&core.lock(), entity_ids, relation, hop);
-        }
-        let placeholders = vec!["?"; entity_ids.len()].join(",");
-        let relation_clause = if relation.is_some() {
-            " AND r.relation = ?"
-        } else {
-            ""
-        };
-        let sql = format!(
-            "SELECT r.id, r.subject_entity_id, r.relation, r.object_entity_id,
-                    s.name AS subject_name, s.kind AS subject_kind,
-                    o.name AS object_name, o.kind AS object_kind
-               FROM entity_relations r
-               JOIN entities s ON s.id = r.subject_entity_id
-               JOIN entities o ON o.id = r.object_entity_id
-              WHERE (r.subject_entity_id IN ({placeholders})
-                     OR r.object_entity_id IN ({placeholders})){relation_clause}
-              ORDER BY r.created_at, r.id"
-        );
-
-        // The ids are bound twice, once per side of the OR.
-        let mut bindings: Vec<SqlValue> = entity_ids
-            .iter()
-            .chain(entity_ids.iter())
-            .map(|id| SqlValue::Text(id.clone()))
-            .collect();
-        if let Some(label) = relation {
-            bindings.push(SqlValue::Text(label.to_string()));
-        }
-
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt
-            .query_map(params_from_iter(bindings), |row| {
-                Ok((
-                    row.get::<_, String>("id")?,
-                    RelationEdge {
-                        subject_entity_id: row.get("subject_entity_id")?,
-                        subject_name: row.get("subject_name")?,
-                        subject_kind: row.get("subject_kind")?,
-                        relation: row.get("relation")?,
-                        object_entity_id: row.get("object_entity_id")?,
-                        object_name: row.get("object_name")?,
-                        object_kind: row.get("object_kind")?,
-                        hop,
-                    },
-                ))
-            })?
-            .collect::<rusqlite::Result<_>>()
-            .map_err(crate::db::StoreError::from);
-        rows
+        engine::graph::relations_touching(&self.core.lock(), entity_ids, relation, hop)
     }
 
     // --- sync ------------------------------------------------------------
 
     /// The local copy of `id` as a sync merge sees it, if there is one.
     pub fn sync_view(&self, id: &str) -> Result<Option<EntitySyncView>> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::graph::sync_view(&core.lock(), id);
-        }
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT aliases, updated_at FROM entities WHERE id = ?",
-                params![id],
-                |row| {
-                    let aliases_json: String = row.get(0)?;
-                    Ok(EntitySyncView {
-                        aliases: serde_json::from_str(&aliases_json).unwrap_or_default(),
-                        updated_at: row.get(1)?,
-                    })
-                },
-            )
-            .optional()?)
+        engine::graph::sync_view(&self.core.lock(), id)
     }
 
     /// Write an entity a peer sent: insert it, or overwrite the local row's
     /// name, kind, aliases, `updated_at` and `node_id`. The local
     /// `created_at` is kept. Never queued for sync: it came from there.
     pub fn upsert_synced(&self, entity: &Entity, node_id: Option<&str>) -> Result<()> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::graph::upsert_synced(&mut core.lock(), entity, node_id);
-        }
-        self.conn.execute(
-            "INSERT INTO entities (id, name, kind, aliases, created_at, updated_at, node_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(id) DO UPDATE SET
-                 name = excluded.name,
-                 kind = excluded.kind,
-                 aliases = excluded.aliases,
-                 updated_at = excluded.updated_at,
-                 node_id = excluded.node_id",
-            params![
-                entity.id,
-                entity.name,
-                entity.kind,
-                aliases_json(&entity.aliases),
-                entity.created_at,
-                entity.updated_at,
-                node_id,
-            ],
-        )?;
-        Ok(())
+        engine::graph::upsert_synced(&mut self.core.lock(), entity, node_id)
     }
 
     /// Replace `id`'s aliases without stamping `updated_at`: a sync merge
     /// that lost last-write-wins still keeps the union. Never queued for
     /// sync.
     pub fn set_aliases(&self, id: &str, aliases: &[String]) -> Result<()> {
-        #[cfg(feature = "engine-store")]
-        if let Some(core) = self.core {
-            return engine::graph::set_aliases(&mut core.lock(), id, aliases);
-        }
-        self.conn.execute(
-            "UPDATE entities SET aliases = ? WHERE id = ?",
-            params![aliases_json(aliases), id],
-        )?;
-        Ok(())
+        engine::graph::set_aliases(&mut self.core.lock(), id, aliases)
     }
 }
 
@@ -672,13 +254,15 @@ mod tests {
         }
     }
 
-    /// Every graph write on `db` with sync on, and every read after, with the
+    /// Every graph write with sync on, and every read after, with the
     /// outbox it queued.
-    fn exercise(db: &Database) -> Vec<String> {
+    #[test]
+    fn the_graph_keeps_entities_links_and_relations_and_queues_local_writes() {
         use crate::db::derived::Origin::{Local, Sync};
         use crate::db::memories::{Memories, NewMemory};
         use crate::db::outbox::Outbox;
         use crate::db::sync_state::SyncState;
+        let db = Database::open_in_memory().unwrap();
         let store = db.store();
         SyncState::new(&store)
             .set_flag("sync_enabled", "1")
@@ -700,41 +284,44 @@ mod tests {
         }
         memories.set_superseded_by("m4", "m1", None).unwrap();
         let entities = Entities::new(&store);
-        let mut seen = Vec::new();
         entities.insert(&entity("rust", "Rust", T1), None).unwrap();
         entities
             .insert(&entity("tokio", "Tokio", T2), Some("n1"))
             .unwrap();
         entities.insert(&entity("old", "Old", T1), None).unwrap();
-        seen.push(format!(
-            "{}",
-            entities.insert(&entity("rust", "Again", T2), None).is_err()
-        ));
+        assert!(
+            entities.insert(&entity("rust", "Again", T2), None).is_err(),
+            "a taken entity id is refused"
+        );
         entities
             .set_kind_and_aliases("tokio", Some("lib"), &["tk".into()], T2)
             .unwrap();
         entities
             .set_merged("old", Some("x"), &["o".into()], T2)
             .unwrap();
-        for (m, e, origin) in [
+        let linked: Vec<bool> = [
             ("m1", "rust", Local),
             ("m2", "rust", Sync),
             ("m4", "rust", Local),
             ("m1", "old", Local),
             ("m3", "old", Local),
             ("gone", "old", Local),
-        ] {
-            seen.push(format!("{}", entities.link(m, e, T1, origin).unwrap()));
-        }
-        seen.push(format!(
-            "{}",
-            entities.link("m1", "rust", T2, Local).unwrap()
-        ));
-        for (id, s, o, origin) in [
+        ]
+        .into_iter()
+        .map(|(m, e, origin)| entities.link(m, e, T1, origin).unwrap())
+        .collect();
+        assert_eq!(linked, [true; 6]);
+        assert!(
+            !entities.link("m1", "rust", T2, Local).unwrap(),
+            "a link already there is left as it is"
+        );
+        let inserted: Vec<bool> = [
             ("r1", "rust", "tokio", Local),
             ("r2", "tokio", "old", Sync),
             ("r3", "old", "nowhere", Local),
-        ] {
+        ]
+        .into_iter()
+        .map(|(id, s, o, origin)| {
             let row = RelationRow {
                 id,
                 subject_entity_id: s,
@@ -744,12 +331,25 @@ mod tests {
                 updated_at: T1,
                 node_id: None,
             };
-            seen.push(format!(
-                "{}",
-                entities.insert_relation_or_ignore(&row, origin).unwrap()
-            ));
-        }
-        seen.push(format!("{:?}", entities.page_by_mentions(10, 0).unwrap()));
+            entities.insert_relation_or_ignore(&row, origin).unwrap()
+        })
+        .collect();
+        assert_eq!(inserted, [true; 3]);
+        let page: Vec<(String, i64)> = entities
+            .page_by_mentions(10, 0)
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.id, e.mention_count))
+            .collect();
+        assert_eq!(
+            page,
+            [
+                ("old".to_string(), 3),
+                ("rust".to_string(), 3),
+                ("tokio".to_string(), 0)
+            ],
+            "most mentioned first, ties by name"
+        );
         entities.repoint("old", "rust").unwrap();
         entities.rename("tokio", "tokio2").unwrap();
         entities.delete("old").unwrap();
@@ -764,34 +364,122 @@ mod tests {
             .unwrap();
         Entities::new(&store).unlink_memory("m3").unwrap();
 
-        seen.push(format!("{:?}", entities.get("rust").unwrap()));
-        seen.push(format!("{:?}", entities.get("tokio").unwrap()));
-        seen.push(format!("{}", entities.exists("tokio2").unwrap()));
-        seen.push(format!("{}", entities.count().unwrap()));
-        seen.push(format!("{:?}", entities.all_oldest_first().unwrap()));
-        seen.push(format!("{:?}", entities.page_by_mentions(2, 1).unwrap()));
-        seen.push(format!("{:?}", entities.links_oldest_first().unwrap()));
-        seen.push(format!(
-            "{:?}",
-            entities.linked_memories("rust", 10).unwrap()
-        ));
-        seen.push(format!("{}", entities.linked_memory_count("rust").unwrap()));
-        seen.push(format!("{:?}", entities.facts_naming("rust", 10).unwrap()));
-        seen.push(format!("{:?}", entities.relations_oldest_first().unwrap()));
-        seen.push(format!(
-            "{:?}",
+        let rust = entities.get("rust").unwrap().unwrap();
+        assert_eq!((rust.name.as_str(), rust.created_at.as_str()), ("Rust!", T1));
+        assert!(entities.get("tokio").unwrap().is_none(), "renamed away");
+        assert!(entities.exists("tokio2").unwrap());
+        assert_eq!(entities.count().unwrap(), 3);
+        let oldest: Vec<String> = entities
+            .all_oldest_first()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(oldest, ["rust", "new", "tokio2"]);
+        let second_page: Vec<String> = entities
+            .page_by_mentions(2, 1)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(second_page, ["new", "tokio2"]);
+        let mut links: Vec<(String, String)> = entities
+            .links_oldest_first()
+            .unwrap()
+            .into_iter()
+            .map(|(m, e, _)| (m, e))
+            .collect();
+        links.sort();
+        assert_eq!(
+            links,
+            [
+                ("gone".to_string(), "rust".to_string()),
+                ("m1".to_string(), "rust".to_string()),
+                ("m2".to_string(), "rust".to_string()),
+                ("m4".to_string(), "rust".to_string()),
+            ],
+            "old's links moved to rust, m1's duplicate dropped, m3 unlinked"
+        );
+        let linked: Vec<(String, usize)> = entities
+            .linked_memories("rust", 10)
+            .unwrap()
+            .into_iter()
+            .map(|m| (m.id, m.content_snippet.chars().count()))
+            .collect();
+        assert_eq!(
+            linked,
+            [("m2".to_string(), 300), ("m1".to_string(), 300)],
+            "live and unsuperseded, newest first, snippets cut by character"
+        );
+        assert_eq!(entities.linked_memory_count("rust").unwrap(), 2);
+        let facts: Vec<String> = entities
+            .facts_naming("rust", 10)
+            .unwrap()
+            .into_iter()
+            .map(|f| f.id)
+            .collect();
+        assert_eq!(facts, ["m3", "m1"], "subject matched case-insensitively, newest first");
+        let relations: Vec<(String, String, String)> = entities
+            .relations_oldest_first()
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.id, r.subject_entity_id, r.object_entity_id))
+            .collect();
+        assert_eq!(
+            relations,
+            [
+                ("r1".to_string(), "rust".to_string(), "tokio".to_string()),
+                ("r2".to_string(), "tokio".to_string(), "rust".to_string()),
+                ("r3".to_string(), "rust".to_string(), "nowhere".to_string()),
+            ],
+            "a repoint follows the ends; a rename does not"
+        );
+        assert!(
             entities
                 .relations_touching(&["rust".into(), "tokio2".into()], None, 2)
                 .unwrap()
-        ));
-        seen.push(format!(
-            "{:?}",
-            entities
-                .relations_touching(&["rust".into()], Some("owns"), 1)
-                .unwrap()
-        ));
-        seen.push(format!("{:?}", entities.sync_view("new").unwrap()));
-        seen.push(format!("{:?}", memories.unannotated_page(10).unwrap()));
+                .is_empty(),
+            "a relation whose other end is not stored is skipped"
+        );
+        entities
+            .insert_relation_or_ignore(
+                &RelationRow {
+                    id: "r4",
+                    subject_entity_id: "tokio2",
+                    relation: "owns",
+                    object_entity_id: "rust",
+                    created_at: T2,
+                    updated_at: T2,
+                    node_id: None,
+                },
+                Sync,
+            )
+            .unwrap();
+        let touching: Vec<String> = entities
+            .relations_touching(&["rust".into()], None, 2)
+            .unwrap()
+            .into_iter()
+            .map(|(id, edge)| format!("{id}:{}:{}:{}", edge.subject_name, edge.object_name, edge.hop))
+            .collect();
+        assert_eq!(touching, ["r4:Tokio:Rust!:2"]);
+        assert!(entities
+            .relations_touching(&["rust".into()], Some("uses"), 1)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            entities.sync_view("new").unwrap(),
+            Some(EntitySyncView {
+                aliases: vec!["n".into(), "nn".into()],
+                updated_at: T2.into(),
+            })
+        );
+        let (unannotated_total, unannotated) = memories.unannotated_page(10).unwrap();
+        let unannotated: Vec<String> = unannotated.into_iter().map(|m| m.id).collect();
+        assert_eq!(
+            (unannotated_total, unannotated),
+            (1, vec!["m5".to_string()]),
+            "m1 and m3 have subjects, m4 is superseded, m2 keeps a link"
+        );
         let queued = |outbox: &Outbox<'_>| -> Vec<(String, serde_json::Value)> {
             outbox
                 .unsent_to("hub", 0, 1000)
@@ -802,30 +490,50 @@ mod tests {
                 .collect()
         };
         let outbox = Outbox::new(&store);
-        seen.push(format!("{:?}", queued(&outbox)));
+        let graph_entries = queued(&outbox);
+        let kinds: Vec<String> = graph_entries
+            .iter()
+            .map(|(key, payload)| format!("{key}:{}", payload["record_type"]))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "rust:\"entity\"",
+                "tokio:\"entity\"",
+                "old:\"entity\"",
+                "tokio:\"entity\"",
+                "old:\"entity\"",
+                "m1:\"memory_entity\"",
+                "m4:\"memory_entity\"",
+                "m1:\"memory_entity\"",
+                "m3:\"memory_entity\"",
+                "gone:\"memory_entity\"",
+                "r1:\"entity_relation\"",
+                "r3:\"entity_relation\"",
+                "tokio2:\"entity\"",
+            ],
+            "local writes queue in order; synced links, relations and upserts do not"
+        );
         outbox.clear().unwrap();
         outbox.backfill_everything().unwrap();
         let mut backfilled: Vec<String> = queued(&outbox)
             .into_iter()
-            .map(|(key, payload)| format!("{key} {payload}"))
+            .map(|(key, payload)| format!("{key}:{}", payload["record_type"]))
             .collect();
         backfilled.sort();
-        seen.push(format!("{backfilled:?}"));
-        seen
-    }
-
-    #[test]
-    fn the_engine_core_keeps_the_graph_as_sqlite_does() {
-        let mut observed = Vec::new();
-        crate::db::on_each_backend(|db| observed.push(exercise(db)));
-        let sqlite = &observed[0];
-        assert_eq!(sqlite[0], "true", "a taken entity id is refused");
-        for other in &observed[1..] {
-            for (theirs, ours) in other.iter().zip(sqlite) {
-                assert_eq!(theirs, ours);
-            }
-            assert_eq!(other.len(), sqlite.len());
-        }
+        assert_eq!(
+            backfilled,
+            [
+                "gone:\"memory_entity\"",
+                "m1:\"memory_entity\"",
+                "m2:\"memory_entity\"",
+                "m4:\"memory_entity\"",
+                "new:\"entity\"",
+                "rust:\"entity\"",
+                "tokio2:\"entity\"",
+            ],
+            "a backfill queues every entity and link as stored now"
+        );
     }
 
     #[test]
@@ -849,18 +557,10 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let store = db.store();
         let entities = Entities::new(&store);
-        assert!(entities
-            .link("m1", "old", T1, crate::db::derived::Origin::Local)
-            .unwrap());
-        assert!(entities
-            .link("m1", "new", T1, crate::db::derived::Origin::Local)
-            .unwrap());
-        assert!(entities
-            .link("m2", "old", T1, crate::db::derived::Origin::Local)
-            .unwrap());
-        assert!(!entities
-            .link("m2", "old", T2, crate::db::derived::Origin::Local)
-            .unwrap());
+        assert!(entities.link("m1", "old", T1, Origin::Local).unwrap());
+        assert!(entities.link("m1", "new", T1, Origin::Local).unwrap());
+        assert!(entities.link("m2", "old", T1, Origin::Local).unwrap());
+        assert!(!entities.link("m2", "old", T2, Origin::Local).unwrap());
 
         entities.repoint("old", "new").unwrap();
 

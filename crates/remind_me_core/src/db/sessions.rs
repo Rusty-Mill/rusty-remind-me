@@ -6,12 +6,10 @@
 //! at its end, are later steps. The merge rules sit on [`SessionRecord`],
 //! beside the row they describe, so the engine repository is a thin layer.
 //!
-//! Engine only, as [`super::references`] is: a store on SQLite answers
-//! every call with [`super::StoreError::Invalid`].
+//! Added at schema v32, once the engine was the node's store (ADR-0023),
+//! as [`super::references`] was: the table never lived in SQLite.
 
-#[cfg(feature = "engine-store")]
 use super::engine::{self, EngineLock};
-use super::references::not_on_sqlite;
 use super::{Result, Store};
 use serde::{Deserialize, Serialize};
 
@@ -111,43 +109,19 @@ impl SessionRecord {
 /// The `sessions` table on the engine's memories core
 /// (`db::engine::sessions`).
 pub struct Sessions<'c> {
-    #[cfg(feature = "engine-store")]
-    core: Option<&'c EngineLock>,
-    #[cfg(not(feature = "engine-store"))]
-    _store: std::marker::PhantomData<&'c ()>,
+    core: &'c EngineLock,
 }
 
 impl<'c> Sessions<'c> {
     pub fn new(store: &'c Store<'_>) -> Self {
-        #[cfg(not(feature = "engine-store"))]
-        let _ = store;
-        Self {
-            #[cfg(feature = "engine-store")]
-            core: store.core(),
-            #[cfg(not(feature = "engine-store"))]
-            _store: std::marker::PhantomData,
-        }
-    }
-
-    #[cfg(feature = "engine-store")]
-    fn core(&self) -> Result<&'c EngineLock> {
-        self.core.ok_or_else(|| not_on_sqlite("sessions"))
-    }
-
-    #[cfg(not(feature = "engine-store"))]
-    fn core(&self) -> Result<std::convert::Infallible> {
-        Err(not_on_sqlite("sessions"))
+        Self { core: store.core() }
     }
 
     /// Record that a session started, as [`SessionRecord::started`] says.
     /// Idempotent: a repeated start leaves the row as the first left it,
     /// apart from columns the first did not know.
     pub fn upsert_start(&self, start: &SessionStart) -> Result<()> {
-        let core = self.core()?;
-        #[cfg(feature = "engine-store")]
-        return engine::sessions::upsert_start(&mut core.lock(), start);
-        #[cfg(not(feature = "engine-store"))]
-        match core {}
+        engine::sessions::upsert_start(&mut self.core.lock(), start)
     }
 
     /// Record that `session_id` ended, as [`SessionRecord::ended`] says.
@@ -159,36 +133,24 @@ impl<'c> Sessions<'c> {
         end_sha: Option<&str>,
         work_log_memory_id: Option<&str>,
     ) -> Result<bool> {
-        let core = self.core()?;
-        #[cfg(feature = "engine-store")]
-        return engine::sessions::end(
-            &mut core.lock(),
+        engine::sessions::end(
+            &mut self.core.lock(),
             session_id,
             ended_at,
             end_sha,
             work_log_memory_id,
-        );
-        #[cfg(not(feature = "engine-store"))]
-        match core {}
+        )
     }
 
     /// Session `session_id`, if recorded.
     pub fn get(&self, session_id: &str) -> Result<Option<SessionRecord>> {
-        let core = self.core()?;
-        #[cfg(feature = "engine-store")]
-        return engine::sessions::get(&core.lock(), session_id);
-        #[cfg(not(feature = "engine-store"))]
-        match core {}
+        engine::sessions::get(&self.core.lock(), session_id)
     }
 
     /// The most recently started sessions, of `project` when given, newest
     /// first (ties by id, descending), at most `limit`.
     pub fn recent(&self, limit: usize, project: Option<&str>) -> Result<Vec<SessionRecord>> {
-        let core = self.core()?;
-        #[cfg(feature = "engine-store")]
-        return engine::sessions::recent(&core.lock(), limit, project);
-        #[cfg(not(feature = "engine-store"))]
-        match core {}
+        engine::sessions::recent(&self.core.lock(), limit, project)
     }
 }
 
@@ -197,23 +159,8 @@ mod tests {
     use super::*;
     use crate::db::Database;
 
-    /// The engine store every test here runs on.
     fn on_engine(test: impl FnOnce(&Database)) {
-        #[cfg(feature = "engine-store")]
-        test(&Database::open_in_memory_on_engine().unwrap());
-        #[cfg(not(feature = "engine-store"))]
-        let _ = test;
-    }
-
-    #[test]
-    fn the_sqlite_store_refuses_sessions() {
-        let db = Database::open_sqlite_in_memory().unwrap();
-        let store = db.store();
-        let refused = Sessions::new(&store).get("s1");
-        assert!(
-            matches!(&refused, Err(crate::db::StoreError::Invalid(why)) if why.contains("legacy SQLite")),
-            "{refused:?}"
-        );
+        test(&Database::open_in_memory().unwrap());
     }
 
     const T1: &str = "2026-09-26T00:00:00+00:00";

@@ -93,45 +93,6 @@ pub fn calculate_vitality(
     base_weight * frequency_boost * decay_factor
 }
 
-/// Name of the SQL scalar function registered by [`register_sql_functions`].
-pub const EFFECTIVE_VITALITY_FN: &str = "effective_vitality";
-
-/// Expose [`calculate_vitality`] to SQL as `effective_vitality(base_weight,
-/// access_count, decay_rate, accessed_at)`.
-///
-/// Dormancy has to be filtered inside the query, before `LIMIT`, or a page gets
-/// truncated first and thinned afterwards — the `DI-03` shape. Spelling the
-/// ACT-R formula out as a SQL expression would do that, but the bundled SQLite
-/// is built without `SQLITE_ENABLE_MATH_FUNCTIONS`, so `exp` and `sqrt` do not
-/// exist. Registering the Rust function instead keeps the filter in the query
-/// *and* leaves one implementation of the maths rather than two that can drift.
-///
-/// Not marked deterministic: it reads the clock, so SQLite must not cache it.
-pub fn register_sql_functions(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
-    conn.create_scalar_function(
-        EFFECTIVE_VITALITY_FN,
-        4,
-        rusqlite::functions::FunctionFlags::SQLITE_UTF8,
-        |ctx| {
-            let base_weight: f64 = ctx.get(0)?;
-            let access_count: i64 = ctx.get(1)?;
-            let decay_rate: f64 = ctx.get(2)?;
-            // NULL is normal here: `remind_me` leaves `accessed_at` unset until
-            // a memory is first retrieved. Treating it as "just now" matches
-            // `calculate_vitality`'s own fallback for an unparseable stamp.
-            let accessed_at: Option<String> = ctx.get(3)?;
-            let now = Utc::now();
-            Ok(calculate_vitality(
-                base_weight,
-                access_count,
-                decay_rate,
-                accessed_at.as_deref().unwrap_or_default(),
-                now,
-            ))
-        },
-    )
-}
-
 /// Fractional adjustment one feedback event applies to `base_weight`.
 pub const FEEDBACK_MAGNITUDE: f64 = 0.15;
 /// Minimum Jaccard similarity a stored feedback query must have with the

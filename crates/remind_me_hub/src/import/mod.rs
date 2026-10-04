@@ -12,7 +12,7 @@
 //! The two columns the wire never carries, `origin_node` and `hub_seq`,
 //! are read beside the record and carried over exactly.
 
-pub mod sqlite;
+pub mod legacy_sqlite;
 
 #[cfg(feature = "postgres-import")]
 pub mod postgres;
