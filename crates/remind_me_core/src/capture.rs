@@ -12,7 +12,7 @@ use crate::db::Store;
 use crate::entity::{maybe_link_entity_relation, supersede_contradicting_facts};
 use crate::models::{
     AutoCaptureInput, Capture, CaptureResult, DecomposeBatchInput, DecomposeBatchResult,
-    DecomposeInput, DecomposeResult, Memory, UndecomposedCapture, CAPTURE_SOURCE,
+    DecomposeInput, DecomposeResult, Memory, UndecomposedCapture, WriteContext, CAPTURE_SOURCE,
     CAPTURE_TITLE_CHARS, DECOMPOSE_BATCH_MAX, DECOMPOSE_BATCH_MIN, DECOMPOSITION_SOURCE,
     DIALOG_CATEGORY, FACT_CATEGORY, UNCLASSIFIED,
 };
@@ -60,6 +60,29 @@ fn capture_metadata(
     metadata
 }
 
+/// Where and by whom a capture was written, for the callers that know
+/// (the transcript hook); a plain [`auto_capture`] stamps none of it.
+#[derive(Debug, Clone, Default)]
+pub struct CaptureStamp {
+    pub context: WriteContext,
+    /// Overrides the schema default `unknown` when set.
+    pub written_by: Option<String>,
+    /// Overrides the schema default `manual` when set.
+    pub capture_method: Option<String>,
+}
+
+impl CaptureStamp {
+    fn apply(&self, row: &mut NewMemory) {
+        self.context.apply(row);
+        if let Some(by) = &self.written_by {
+            row.written_by.clone_from(by);
+        }
+        if let Some(method) = &self.capture_method {
+            row.capture_method.clone_from(method);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn insert_half(
     store: &Store<'_>,
@@ -71,6 +94,7 @@ fn insert_half(
     capture_id: &str,
     now_iso: &str,
     extract: bool,
+    stamp: &CaptureStamp,
 ) -> Result<()> {
     let (mut tags, mut metadata) = (tags.to_vec(), metadata);
     let content = crate::boundary::scrub(content, &mut tags, &mut metadata);
@@ -81,7 +105,7 @@ fn insert_half(
     let vitality = calculate_vitality(base_weight, 0, decay_rate, now_iso, now);
 
     let provenance = crate::context::default_provenance().auto();
-    Memories::new(store).insert(&NewMemory {
+    let mut row = NewMemory {
         category: category.to_string(),
         tags,
         source: CAPTURE_SOURCE.to_string(),
@@ -92,7 +116,22 @@ fn insert_half(
         base_weight,
         accessed_at: Some(now_iso.to_string()),
         ..provenance.stamp(NewMemory::new(id, content, now_iso))
-    })?;
+    };
+    // The hook's explicit session/project/branch win over what the
+    // environment supplied.
+    stamp.apply(&mut row);
+    // A session this store has not heard of (written outside the hook)
+    // still appears in `sessions`.
+    let session = WriteContext {
+        project: row.project.clone(),
+        session_id: row.session_id.clone(),
+        git_remote: row.git_remote.clone(),
+        git_branch: row.git_branch.clone(),
+        git_sha: row.git_sha.clone(),
+        cwd: row.cwd.clone(),
+    };
+    crate::episodes::ensure_session(store, &session)?;
+    Memories::new(store).insert(&row)?;
     // The summary half only: a raw dialog is too long and too noisy for
     // the rules to mean anything.
     if extract {
@@ -116,6 +155,16 @@ fn insert_half(
 /// second pass, because the summary's id does not exist when the dialog is
 /// inserted.
 pub fn auto_capture(store: &Store<'_>, input: &AutoCaptureInput) -> Result<CaptureResult> {
+    auto_capture_stamped(store, input, &CaptureStamp::default())
+}
+
+/// [`auto_capture`] with the provenance columns a hook knows: session,
+/// project, cwd, branch, who wrote it and how.
+pub fn auto_capture_stamped(
+    store: &Store<'_>,
+    input: &AutoCaptureInput,
+    stamp: &CaptureStamp,
+) -> Result<CaptureResult> {
     let now_iso = Utc::now().to_rfc3339();
     let capture_id = format!("cap_{}", uuid::Uuid::new_v4().simple());
     let dialog_id = format!("mem_{}", uuid::Uuid::new_v4().simple());
@@ -148,6 +197,7 @@ pub fn auto_capture(store: &Store<'_>, input: &AutoCaptureInput) -> Result<Captu
         &capture_id,
         &now_iso,
         false,
+        stamp,
     )?;
     insert_half(
         store,
@@ -159,6 +209,7 @@ pub fn auto_capture(store: &Store<'_>, input: &AutoCaptureInput) -> Result<Captu
         &capture_id,
         &now_iso,
         true,
+        stamp,
     )?;
 
     Ok(CaptureResult {

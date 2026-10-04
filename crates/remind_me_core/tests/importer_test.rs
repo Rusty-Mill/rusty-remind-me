@@ -828,7 +828,8 @@ fn an_export_round_trips_the_v32_columns_and_a_plain_chat_defaults_them() {
     // itself, and keeps only the project (the directory it ran in).
     assert_eq!(testing::memory_text(&store, &ids[0], "git_sha").unwrap(), None);
     assert_eq!(testing::memory_f64(&store, &ids[0], "confidence").unwrap(), Some(1.0));
-    assert_eq!(column(&store, "written_by"), "importer:chat_import");
+    // Wave 1D: any chat import is written by the importer, automatically.
+    assert_eq!(column(&store, "written_by"), "importer:chat");
     assert_eq!(column(&store, "capture_method"), "auto");
     std::fs::remove_dir_all(&dir).unwrap();
 }

@@ -4,6 +4,7 @@ mod test_env;
 
 mod copy_store;
 mod daemon;
+mod session;
 
 use daemon::Store;
 use remind_me_api::ApiServer;
@@ -701,6 +702,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             },
             "daemon" => daemon::command(&args[2..], &db_path)?,
+            // The hook-facing session commands (`session.rs`).
+            "session" | "capture-transcript" | "context" => {
+                session::command(&args[1], &args[2..], &db_path)?
+            }
             "configure" | "setup" => {
                 let configure_args = match parse_configure_args(&args[2..]) {
                     Ok(parsed) => parsed,
@@ -1066,7 +1071,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", serde_json::to_string_pretty(&stats)?);
             }
             cmd => {
-                eprintln!("Unknown subcommand: {}. Available: configure, daemon, api, remote, server, search, add, list, get, entity, wiki-write, wiki-read, wiki-import, stats, resolve", cmd);
+                eprintln!("Unknown subcommand: {}. Available: configure, daemon, api, remote, server, search, add, list, get, entity, wiki-write, wiki-read, wiki-import, stats, resolve, session, capture-transcript, context", cmd);
                 std::process::exit(1);
             }
         }
