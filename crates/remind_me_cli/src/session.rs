@@ -21,7 +21,7 @@ Usage:
   rusty-remind-me capture-transcript PATH.jsonl --session-id ID [--cwd DIR]
                   [--reason stop|precompact|end] [--json]
   rusty-remind-me context [--cwd DIR] [--project P] [--branch B] [--prompt TEXT]
-                  [--budget CHARS] [--json]
+                  [--budget CHARS] [--hits-only] [--json]
 
 --session-id defaults to $REMIND_ME_SESSION_ID and --cwd to $REMIND_ME_CWD,
 then the current directory. Every subcommand prints one JSON object, except
@@ -43,6 +43,7 @@ struct Flags {
     prompt: Option<String>,
     budget: Option<usize>,
     json: bool,
+    hits_only: bool,
 }
 
 fn parse_flags(args: &[String]) -> Result<Flags, String> {
@@ -50,8 +51,12 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
     let mut i = 0;
     while i < args.len() {
         let arg = args[i].as_str();
-        if arg == "--json" {
-            flags.json = true;
+        if arg == "--json" || arg == "--hits-only" {
+            if arg == "--json" {
+                flags.json = true;
+            } else {
+                flags.hits_only = true;
+            }
             i += 1;
             continue;
         }
@@ -155,6 +160,7 @@ fn plan(command: &str, rest: &[String]) -> Result<Plan, String> {
                     branch: flags.branch.clone(),
                     prompt: flags.prompt.clone(),
                     budget: flags.budget.unwrap_or(DEFAULT_BUDGET),
+                    hits_only: flags.hits_only,
                 },
                 flags.json,
             ))
@@ -366,6 +372,7 @@ mod tests {
             branch: None,
             prompt: None,
             budget: 1,
+            hits_only: false,
         };
         assert_eq!(
             render(&Plan::Context(op.clone(), false), reply.clone()),

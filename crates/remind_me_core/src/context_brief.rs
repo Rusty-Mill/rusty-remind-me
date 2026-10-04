@@ -40,6 +40,9 @@ pub struct ContextRequest<'a> {
     pub prompt: Option<&'a str>,
     /// Characters; `0` means unlimited.
     pub budget: usize,
+    /// Only the memories related to `prompt`, none of the standing sections:
+    /// for a per-prompt hook that must not repeat the session's brief.
+    pub hits_only: bool,
 }
 
 /// How many items each section held (0 when it was empty or dropped).
@@ -202,6 +205,14 @@ fn hits_section(store: &Store<'_>, prompt: &str, now: &str) -> Result<Section> {
 /// Build the brief for `request`.
 pub fn build(store: &Store<'_>, request: &ContextRequest<'_>) -> Result<ContextBrief> {
     let now = Utc::now().to_rfc3339();
+    let prompt = request.prompt.map(str::trim).filter(|p| !p.is_empty());
+    if request.hits_only {
+        let sections = match prompt {
+            Some(prompt) => vec![hits_section(store, prompt, &now)?],
+            None => Vec::new(),
+        };
+        return Ok(assemble(sections, request));
+    }
     let memories = Memories::new(store).all_live()?;
     let mut sections = vec![
         persona_section(store)?,
@@ -209,13 +220,16 @@ pub fn build(store: &Store<'_>, request: &ContextRequest<'_>) -> Result<ContextB
         action_section(&memories, request.project, &now),
         recent_section(&memories, request.project, request.branch, &now),
     ];
-    if let Some(prompt) = request.prompt.map(str::trim).filter(|p| !p.is_empty()) {
+    if let Some(prompt) = prompt {
         sections.push(hits_section(store, prompt, &now)?);
     }
     Ok(assemble(sections, request))
 }
 
 fn header(request: &ContextRequest<'_>) -> String {
+    if request.hits_only {
+        return "# Possibly relevant memories\n".to_string();
+    }
     let scope = [
         request.project.map(|p| format!("project: {p}")),
         request.branch.map(|b| format!("branch: {b}")),
@@ -406,5 +420,38 @@ mod tests {
         assert!(brief.context.contains("renew the certificate"));
         assert!(brief.sections.hits >= 1, "{}", brief.context);
         assert!(brief.context.contains("Related to this prompt"));
+    }
+
+    #[test]
+    fn hits_only_returns_just_the_prompt_matches_and_nothing_without_one() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        seed(&store);
+        add(&store, "mem_flaky", |r| {
+            r.content = "the flaky scheduler test is a race".into();
+            r.project = Some("quokka".into());
+        });
+        let req = ContextRequest {
+            project: Some("quokka"),
+            prompt: Some("flaky scheduler"),
+            hits_only: true,
+            ..ContextRequest::default()
+        };
+        let brief = build(&store, &req).unwrap();
+        assert!(brief.context.starts_with("# Possibly relevant memories"));
+        assert!(brief.sections.hits >= 1, "{}", brief.context);
+        assert_eq!(brief.sections.recent, 0, "no standing sections");
+        assert_eq!(brief.sections.persona + brief.sections.action_items, 0);
+
+        let none = build(
+            &store,
+            &ContextRequest {
+                hits_only: true,
+                ..ContextRequest::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(none.sections, SectionCounts::default());
+        assert!(none.context.is_empty(), "{}", none.context);
     }
 }

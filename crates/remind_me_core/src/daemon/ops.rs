@@ -77,6 +77,8 @@ pub enum Op {
         branch: Option<String>,
         prompt: Option<String>,
         budget: usize,
+        #[serde(default)]
+        hits_only: bool,
     },
     SessionTimeline {
         session_id: String,
@@ -173,6 +175,7 @@ fn run(store: &Store<'_>, op: &Op) -> Result<Value, String> {
             branch,
             prompt,
             budget,
+            hits_only,
         } => session_ops::context(
             store,
             &session_ops::ContextArgs {
@@ -181,6 +184,7 @@ fn run(store: &Store<'_>, op: &Op) -> Result<Value, String> {
                 branch: branch.as_deref(),
                 prompt: prompt.as_deref(),
                 budget: *budget,
+                hits_only: *hits_only,
             },
         )
         .map_err(|e| e.to_string()),

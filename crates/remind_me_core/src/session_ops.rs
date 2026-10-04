@@ -92,6 +92,7 @@ pub struct ContextArgs<'a> {
     pub branch: Option<&'a str>,
     pub prompt: Option<&'a str>,
     pub budget: usize,
+    pub hits_only: bool,
 }
 
 /// `{"context", "sections", "dropped"}`. The project and branch default to
@@ -116,6 +117,7 @@ pub fn context(store: &Store<'_>, args: &ContextArgs<'_>) -> Result<Value> {
             branch: branch.as_deref(),
             prompt: args.prompt,
             budget: args.budget,
+            hits_only: args.hits_only,
         },
     )?;
     serde_json::to_value(brief).map_err(|e| StoreError::Invalid(e.to_string()))
