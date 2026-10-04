@@ -45,6 +45,8 @@ fn input(query: &str) -> MemorySearchInput {
         include_neighbors: false,
         expand_co_retrieval: false,
         bootstrap: false,
+        include_expired: true,
+        min_confidence: 0.0,
     }
 }
 

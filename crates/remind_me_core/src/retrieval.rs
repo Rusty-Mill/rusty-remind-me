@@ -1290,3 +1290,130 @@ mod tests {
         assert_eq!(find(&ranked, "b").idf_score, Some(0.0));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Validity window and confidence
+// ---------------------------------------------------------------------------
+
+/// What an out-of-window memory's fused score is multiplied by: low enough
+/// to rank after everything in-window, not zero, so it is still found.
+pub const OUT_OF_WINDOW_FACTOR: f64 = 0.25;
+
+fn parse_ts(ts: Option<&str>) -> Option<chrono::DateTime<chrono::Utc>> {
+    ts.and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        .map(|t| t.with_timezone(&chrono::Utc))
+}
+
+/// Whether `valid_until` has passed at `now`. Exactly at `valid_until` the
+/// memory still holds; an unset or unparseable value never expires.
+pub fn is_expired(now: chrono::DateTime<chrono::Utc>, valid_until: Option<&str>) -> bool {
+    parse_ts(valid_until).is_some_and(|until| until < now)
+}
+
+/// The multiplier a memory's fused score takes for its validity window and
+/// confidence: [`OUT_OF_WINDOW_FACTOR`] when it has expired or is not yet
+/// valid, times `confidence` clamped to 0..=1. A memory with no window and
+/// full confidence is 1.0, so existing rankings are untouched.
+pub fn validity_factor(
+    now: chrono::DateTime<chrono::Utc>,
+    valid_from: Option<&str>,
+    valid_until: Option<&str>,
+    confidence: f64,
+) -> f64 {
+    let not_yet = parse_ts(valid_from).is_some_and(|from| from > now);
+    let window = if not_yet || is_expired(now, valid_until) {
+        OUT_OF_WINDOW_FACTOR
+    } else {
+        1.0
+    };
+    let confidence = if confidence.is_nan() {
+        1.0
+    } else {
+        confidence.clamp(0.0, 1.0)
+    };
+    window * confidence
+}
+
+/// Apply [`validity_factor`] to every result's score and re-sort. Drops
+/// expired results when `include_expired` is false, and any below
+/// `min_confidence`.
+pub fn apply_validity(
+    results: Vec<MemorySearchResult>,
+    now: chrono::DateTime<chrono::Utc>,
+    include_expired: bool,
+    min_confidence: f64,
+) -> Vec<MemorySearchResult> {
+    let mut kept: Vec<MemorySearchResult> = results
+        .into_iter()
+        .filter(|r| include_expired || !is_expired(now, r.memory.valid_until.as_deref()))
+        .filter(|r| r.memory.confidence >= min_confidence)
+        .collect();
+    for r in &mut kept {
+        r.score *= validity_factor(
+            now,
+            r.memory.valid_from.as_deref(),
+            r.memory.valid_until.as_deref(),
+            r.memory.confidence,
+        );
+    }
+    kept.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    kept
+}
+
+#[cfg(test)]
+mod validity_tests {
+    use super::*;
+    use chrono::{Duration, Utc};
+
+    fn at(now: chrono::DateTime<Utc>, d: i64) -> String {
+        (now + Duration::seconds(d)).to_rfc3339()
+    }
+
+    #[test]
+    fn no_window_and_full_confidence_changes_nothing() {
+        assert_eq!(validity_factor(Utc::now(), None, None, 1.0), 1.0);
+    }
+
+    #[test]
+    fn expiry_is_strictly_after_valid_until() {
+        let now = Utc::now();
+        let f = |d: i64| validity_factor(now, None, Some(&at(now, d)), 1.0);
+        assert_eq!(f(60), 1.0, "still in window");
+        assert_eq!(f(0), 1.0, "exactly at valid_until still holds");
+        assert_eq!(f(-1), OUT_OF_WINDOW_FACTOR);
+        assert!(!is_expired(now, None));
+        assert!(!is_expired(now, Some("not a date")));
+    }
+
+    #[test]
+    fn a_future_valid_from_is_out_of_window() {
+        let now = Utc::now();
+        assert_eq!(
+            validity_factor(now, Some(&at(now, 60)), None, 1.0),
+            OUT_OF_WINDOW_FACTOR
+        );
+        assert_eq!(validity_factor(now, Some(&at(now, -60)), None, 1.0), 1.0);
+    }
+
+    #[test]
+    fn confidence_scales_the_score_and_is_clamped() {
+        let now = Utc::now();
+        assert_eq!(validity_factor(now, None, None, 0.5), 0.5);
+        assert_eq!(validity_factor(now, None, None, 0.0), 0.0);
+        assert_eq!(validity_factor(now, None, None, 1.0), 1.0);
+        assert_eq!(validity_factor(now, None, None, 7.0), 1.0);
+        assert_eq!(validity_factor(now, None, None, -1.0), 0.0);
+        assert_eq!(validity_factor(now, None, None, f64::NAN), 1.0);
+    }
+
+    #[test]
+    fn expiry_and_confidence_compose() {
+        let now = Utc::now();
+        let f = validity_factor(now, None, Some(&at(now, -1)), 0.5);
+        assert_eq!(f, OUT_OF_WINDOW_FACTOR * 0.5);
+    }
+}

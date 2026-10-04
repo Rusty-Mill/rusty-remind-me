@@ -315,6 +315,17 @@ pub struct MemorySearchInput {
     /// ([`crate::promotion::BOOTSTRAP_RESERVE_MAX`]).
     #[serde(default)]
     pub bootstrap: bool,
+    /// Keep memories whose `valid_until` has passed. On by default so nothing
+    /// disappears: an expired memory is ranked last and marked, not hidden.
+    #[serde(default = "default_include_expired")]
+    pub include_expired: bool,
+    /// Drop memories below this `confidence`. `0.0` keeps everything.
+    #[serde(default)]
+    pub min_confidence: f64,
+}
+
+fn default_include_expired() -> bool {
+    true
 }
 
 impl Default for MemorySearchInput {
@@ -338,6 +349,8 @@ impl Default for MemorySearchInput {
             strategy: RetrievalStrategy::default(),
             expand_co_retrieval: false,
             bootstrap: false,
+            include_expired: true,
+            min_confidence: 0.0,
         }
     }
 }
@@ -926,6 +939,10 @@ pub struct AtomicFact {
     pub object: Option<String>,
     #[serde(default)]
     pub entities: Vec<EntityInput>,
+    /// Kind-specific metadata (a decision's `rationale`, say), merged into
+    /// the fact's own.
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
 }
 
 /// A batch of facts to write against one capture.

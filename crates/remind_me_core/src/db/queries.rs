@@ -3,6 +3,7 @@ use crate::db::memories::{
     EntityScope, KeywordFilter, ListFilter, Memories, MemoryEdit, NewMemory, PageFilter,
 };
 use crate::expansion::{self, MemorySearchResponse};
+use crate::kinds::StructuredFields;
 use crate::models::{
     AnnotateInput, AnnotateResult, AnnotationApplied, AnnotationError, BulkDeleteResult,
     BulkTagInput, BulkTagResult, ExtractBatchInput, ExtractBatchResult, Memory, MemoryAddInput,
@@ -22,7 +23,19 @@ use crate::vitality::{
 };
 use chrono::Utc;
 
-pub fn add_memory(store: &Store<'_>, mut input: MemoryAddInput) -> Result<Memory> {
+pub fn add_memory(store: &Store<'_>, input: MemoryAddInput) -> Result<Memory> {
+    add_memory_with(store, input, &StructuredFields::default())
+}
+
+/// [`add_memory`] with the structured fields (`memory_type`, `confidence`,
+/// the validity window, `outcome`) a writer may set. Validated first: a
+/// malformed kind is refused with an error naming the field, nothing stored.
+pub fn add_memory_with(
+    store: &Store<'_>,
+    mut input: MemoryAddInput,
+    fields: &StructuredFields,
+) -> Result<Memory> {
+    fields.validate(&input.metadata, None)?;
     let now = Utc::now();
     let now_iso = now.to_rfc3339();
     let id = format!("mem_{}", uuid::Uuid::new_v4().simple());
@@ -31,8 +44,11 @@ pub fn add_memory(store: &Store<'_>, mut input: MemoryAddInput) -> Result<Memory
     let code_refs = crate::code_refs::detect_code_refs(&input.content);
     crate::code_refs::merge_code_refs(&mut input.metadata, &code_refs);
 
-    let decay_rate = get_decay_rate(&input.category);
-    let type_prior = get_type_prior(&input.category);
+    // A stated kind drives decay and weight; otherwise the category does, as
+    // it always has.
+    let kind = fields.memory_type.as_deref().unwrap_or(&input.category);
+    let decay_rate = get_decay_rate(kind);
+    let type_prior = get_type_prior(kind);
     let source_prior = get_source_prior(&input.source);
     let base_weight = type_prior * source_prior;
     let initial_vitality = calculate_vitality(base_weight, 0, decay_rate, &now_iso, now);
@@ -52,6 +68,17 @@ pub fn add_memory(store: &Store<'_>, mut input: MemoryAddInput) -> Result<Memory
         sensitive: input.sensitive,
         node_id: Some(crate::sync::configured_node_id()),
         client: crate::sync::configured_client(),
+        memory_type: fields
+            .memory_type
+            .clone()
+            .unwrap_or_else(|| UNCLASSIFIED.to_string()),
+        confidence: fields
+            .confidence
+            .unwrap_or_else(crate::models::default_confidence),
+        valid_from: fields.valid_from.clone(),
+        valid_until: fields.valid_until.clone(),
+        verified_at: fields.verified_at.clone(),
+        outcome: fields.outcome.clone(),
         ..NewMemory::new(id.clone(), input.content.clone(), &now_iso)
     })?;
 
@@ -120,9 +147,26 @@ pub fn list_memories(store: &Store<'_>, input: &MemoryListInput) -> Result<Memor
 /// `vitality`, `base_weight` and `access_count` are left alone too: they encode
 /// accrued retrieval history, and resetting them on an edit would discard it.
 pub fn update_memory(store: &Store<'_>, input: &MemoryUpdateInput) -> Result<UpdateOutcome> {
-    if get_memory_by_id(store, &input.memory_id)?.is_none() {
+    update_memory_with(store, input, &StructuredFields::default())
+}
+
+/// [`update_memory`] with the structured fields a writer may set. Validated
+/// against the metadata the memory will hold after this edit and the kind it
+/// will have, so `outcome` on a `fact`, or a `decision` with no rationale, is
+/// refused before anything is written.
+///
+/// A new `memory_type` also rewrites `decay_rate`, as `reclassify` does:
+/// the type owns the rate.
+pub fn update_memory_with(
+    store: &Store<'_>,
+    input: &MemoryUpdateInput,
+    fields: &StructuredFields,
+) -> Result<UpdateOutcome> {
+    let Some(stored) = get_memory_by_id(store, &input.memory_id)? else {
         return Ok(UpdateOutcome::NotFound);
-    }
+    };
+    let metadata = input.metadata.as_ref().unwrap_or(&stored.metadata);
+    fields.validate(metadata, stored.memory_type.as_deref())?;
 
     // `sensitive` is an `Option<bool>`: `None` leaves the flag alone, so an
     // update that does not mention it cannot silently clear it.
@@ -136,6 +180,13 @@ pub fn update_memory(store: &Store<'_>, input: &MemoryUpdateInput) -> Result<Upd
         metadata: input.metadata.clone(),
         sensitive: input.sensitive,
         clear_superseded: input.clear_superseded,
+        memory_type: fields.memory_type.clone(),
+        decay_rate: fields.memory_type.as_deref().map(get_decay_rate),
+        confidence: fields.confidence,
+        valid_from: fields.valid_from.clone(),
+        valid_until: fields.valid_until.clone(),
+        verified_at: fields.verified_at.clone(),
+        outcome: fields.outcome.clone(),
         ..MemoryEdit::at(Utc::now().to_rfc3339())
     };
     let nothing_to_write = MemoryEdit {
@@ -642,7 +693,17 @@ pub fn search_memories_deadlined(
     // Query-contextual feedback adjustment (issue #94): nudges `score` by
     // any similarly-worded past feedback before truncating to `limit`, so a
     // memory boosted from just past the cutoff can still make the page.
-    let mut ranked = apply_feedback_adjustment(store, &input.query, ranked)?;
+    let ranked = apply_feedback_adjustment(store, &input.query, ranked)?;
+
+    // Validity and confidence scale the fused score; expired and
+    // low-confidence rows can be dropped on request. Before truncation, so
+    // a demoted row gives its place to one that is in window.
+    let mut ranked = crate::retrieval::apply_validity(
+        ranked,
+        Utc::now(),
+        input.include_expired,
+        input.min_confidence,
+    );
 
     // Optional cross-encoder rerank of the head, before truncation. The pool
     // is deliberately wider than `limit`: rescoring only what was already

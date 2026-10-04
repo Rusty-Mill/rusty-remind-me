@@ -785,6 +785,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // would be silently ignored, so it stays false until the
                     // CLI grows a flag and the call to match.
                     bootstrap: false,
+                    include_expired: true,
+                    min_confidence: 0.0,
                 };
                 let response_format = search_input.response_format;
                 let results: Vec<MemorySearchResult> = Store::open(&db_path)?.call(Op::Search {

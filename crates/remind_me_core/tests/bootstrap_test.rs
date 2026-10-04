@@ -83,6 +83,8 @@ fn search(
         query: query.to_string(),
         token_budget: budget,
         bootstrap: want_bootstrap,
+        include_expired: true,
+        min_confidence: 0.0,
         ..Default::default()
     }
 }
