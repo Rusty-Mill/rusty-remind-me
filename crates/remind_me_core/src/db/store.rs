@@ -219,16 +219,15 @@ mod tests {
         assert!(seen[0].contains("the importer gave up"), "{}", seen[0]);
         assert_eq!(seen[1], "false Some([1]) []", "the failed one left nothing");
         assert_eq!(seen[2], "Ok(1)");
-        assert_eq!(
-            seen[3], "true Some([2]) [\"d1\"]",
-            "the other landed whole"
-        );
+        assert_eq!(seen[3], "true Some([2]) [\"d1\"]", "the other landed whole");
     }
 
     #[test]
     fn not_found_keeps_the_message_callers_match_on() {
         assert_eq!(StoreError::NotFound.to_string(), "Query returned no rows");
-        assert!(StoreError::Legacy("x".into()).to_string().contains("legacy"));
+        assert!(StoreError::Legacy("x".into())
+            .to_string()
+            .contains("legacy"));
     }
 
     #[test]

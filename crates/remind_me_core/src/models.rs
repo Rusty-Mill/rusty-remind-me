@@ -2280,4 +2280,3 @@ mod write_context_tests {
         assert_eq!(row.written_by, "unknown", "not a context column");
     }
 }
-

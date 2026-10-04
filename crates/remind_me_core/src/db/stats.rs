@@ -189,7 +189,11 @@ mod tests {
         assert_eq!(stats.live_memories().unwrap(), 4);
         assert_eq!(
             stats.count_by(GroupBy::Category).unwrap(),
-            BTreeMap::from([("".to_string(), 1), ("fact".to_string(), 2), ("note".to_string(), 1)])
+            BTreeMap::from([
+                ("".to_string(), 1),
+                ("fact".to_string(), 2),
+                ("note".to_string(), 1)
+            ])
         );
         assert_eq!(
             stats.count_by(GroupBy::Source).unwrap(),
@@ -203,7 +207,11 @@ mod tests {
         assert_eq!(stats.tombstones_holding_text().unwrap(), 0);
         assert_eq!(
             stats.all_by_category().unwrap(),
-            BTreeMap::from([("(none)".to_string(), 1), ("fact".to_string(), 2), ("note".to_string(), 3)])
+            BTreeMap::from([
+                ("(none)".to_string(), 1),
+                ("fact".to_string(), 2),
+                ("note".to_string(), 3)
+            ])
         );
         let shareable: Vec<String> = stats
             .shareable_since(T2, 10)
@@ -211,7 +219,11 @@ mod tests {
             .into_iter()
             .map(|m| m.id)
             .collect();
-        assert_eq!(shareable, ["d", "b"], "newest first, no sensitive, no tombstones");
+        assert_eq!(
+            shareable,
+            ["d", "b"],
+            "newest first, no sensitive, no tombstones"
+        );
         assert_eq!(stats.shareable_since(T1, 1).unwrap().len(), 1);
         assert_eq!(stats.count_shareable_since(T2).unwrap(), 2);
         let recent: Vec<(String, usize)> = stats
@@ -222,7 +234,11 @@ mod tests {
             .collect();
         assert_eq!(
             recent,
-            [("d".to_string(), 80), ("c".to_string(), 80), ("b".to_string(), 80)],
+            [
+                ("d".to_string(), 80),
+                ("c".to_string(), 80),
+                ("b".to_string(), 80)
+            ],
             "previews are cut by character"
         );
     }

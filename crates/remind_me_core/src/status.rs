@@ -30,10 +30,10 @@
 //! is worse than one that omits a field.
 
 use crate::backup::{backup_dir, list_backups, BackupInfo};
-use crate::db::SCHEMA_VERSION;
 use crate::db::stats::StoreStats;
 use crate::db::Result;
 use crate::db::Store;
+use crate::db::SCHEMA_VERSION;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 

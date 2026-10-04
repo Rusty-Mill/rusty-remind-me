@@ -138,7 +138,13 @@ impl<'c> Promotions<'c> {
         rung: &str,
         promoted_at: &str,
     ) -> Result<()> {
-        engine::promotions::record(&mut self.core.lock(), promoted_id, source_id, rung, promoted_at)
+        engine::promotions::record(
+            &mut self.core.lock(),
+            promoted_id,
+            source_id,
+            rung,
+            promoted_at,
+        )
     }
 
     // --- provenance ------------------------------------------------------

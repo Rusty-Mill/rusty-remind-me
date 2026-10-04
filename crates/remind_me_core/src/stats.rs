@@ -56,7 +56,11 @@ pub fn top_projects(counts: BTreeMap<String, i64>, limit: usize) -> Vec<ProjectC
         .into_iter()
         .map(|(project, count)| ProjectCount { project, count })
         .collect();
-    all.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.project.cmp(&b.project)));
+    all.sort_by(|a, b| {
+        b.count
+            .cmp(&a.count)
+            .then_with(|| a.project.cmp(&b.project))
+    });
     all.truncate(limit);
     all
 }

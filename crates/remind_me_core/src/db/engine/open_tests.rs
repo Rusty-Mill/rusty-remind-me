@@ -31,7 +31,11 @@ fn memories(db: &Database) -> i64 {
 
 /// The memory rows in the SQLite file itself, bypassing the engine.
 fn sqlite_memories(file: &Path) -> usize {
-    LegacyDb::open(file).unwrap().rows("memories").unwrap().len()
+    LegacyDb::open(file)
+        .unwrap()
+        .rows("memories")
+        .unwrap()
+        .len()
 }
 
 fn open(file: &Path) -> Database {
@@ -114,7 +118,10 @@ fn a_file_the_copy_cannot_read_is_refused_with_the_remedy() {
     fixture(&file, "PRAGMA user_version = 29;").unwrap();
     let opened = Database::open(&file);
     let why = opened.err().map(|e| e.to_string()).unwrap_or_default();
-    assert!(why.contains("schema version 29") && why.contains("0.2.x"), "{why}");
+    assert!(
+        why.contains("schema version 29") && why.contains("0.2.x"),
+        "{why}"
+    );
     assert!(!engine_dir(&file).exists());
 }
 

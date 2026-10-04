@@ -10,8 +10,8 @@
 #[path = "../src/test_env.rs"]
 mod test_env;
 
-use remind_me_core::db::queries::search_with_expansions;
 use remind_me_core::db::memories::{Memories, NewMemory};
+use remind_me_core::db::queries::search_with_expansions;
 use remind_me_core::db::Store;
 use remind_me_core::models::MemorySearchInput;
 use remind_me_core::promotion::{

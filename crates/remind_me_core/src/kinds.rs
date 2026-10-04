@@ -328,7 +328,10 @@ pub fn header_marks(m: &crate::models::Memory, now: chrono::DateTime<chrono::Utc
 /// The kind-specific lines of a memory, one per extra: a decision's
 /// rationale and alternatives, an action item's due date and status.
 pub fn kind_lines(m: &crate::models::Memory) -> Vec<String> {
-    let kind = m.memory_type.as_deref().and_then(|t| t.parse::<MemoryKind>().ok());
+    let kind = m
+        .memory_type
+        .as_deref()
+        .and_then(|t| t.parse::<MemoryKind>().ok());
     let text = |key: &str| m.metadata.get(key).and_then(Value::as_str);
     let mut lines = Vec::new();
     match kind {
@@ -429,8 +432,12 @@ mod tests {
     #[test]
     fn confidence_and_timestamps_are_range_checked() {
         let m = json!({});
-        assert!(fields(json!({"confidence": 0.0})).validate(&m, None).is_ok());
-        assert!(fields(json!({"confidence": 1.0})).validate(&m, None).is_ok());
+        assert!(fields(json!({"confidence": 0.0}))
+            .validate(&m, None)
+            .is_ok());
+        assert!(fields(json!({"confidence": 1.0}))
+            .validate(&m, None)
+            .is_ok());
         for c in [-0.1, 1.01] {
             let e = fields(json!({ "confidence": c }))
                 .validate(&m, None)
@@ -441,7 +448,8 @@ mod tests {
             .validate(&m, None)
             .unwrap_err();
         assert!(e.to_string().contains("valid_until"));
-        let w = json!({"valid_from": "2026-02-01T00:00:00Z", "valid_until": "2026-01-01T00:00:00Z"});
+        let w =
+            json!({"valid_from": "2026-02-01T00:00:00Z", "valid_until": "2026-01-01T00:00:00Z"});
         assert!(fields(w).validate(&m, None).is_err());
     }
 

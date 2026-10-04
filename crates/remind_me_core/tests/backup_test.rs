@@ -186,7 +186,11 @@ fn retention_prunes_the_oldest_backups() {
         !remaining.iter().any(|b| b.filename == oldest.filename),
         "the oldest backup should be the one pruned"
     );
-    assert!(!Path::new(&oldest.path).exists(), "{} should be gone", oldest.path);
+    assert!(
+        !Path::new(&oldest.path).exists(),
+        "{} should be gone",
+        oldest.path
+    );
 }
 
 #[test]
@@ -206,7 +210,10 @@ fn backups_from_the_sqlite_days_still_list_and_are_pruned_in_turn() {
     for _ in 0..BACKUP_RETENTION_COUNT {
         create_backup(&store, "manual").unwrap();
     }
-    assert!(!old.exists(), "the SQLite backup was the oldest, so it went");
+    assert!(
+        !old.exists(),
+        "the SQLite backup was the oldest, so it went"
+    );
     assert_eq!(list_backups(&dir).unwrap().len(), BACKUP_RETENTION_COUNT);
 }
 

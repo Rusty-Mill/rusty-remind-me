@@ -270,7 +270,11 @@ mod tests {
         let among = ["a".to_string(), "d".to_string(), "g".to_string()];
         assert_eq!(
             ids(vectors.live_chunks(None, Some(&among)).unwrap()),
-            [("a".to_string(), 30), ("a".to_string(), 2), ("d".to_string(), 5)]
+            [
+                ("a".to_string(), 30),
+                ("a".to_string(), 2),
+                ("d".to_string(), 5)
+            ]
         );
         let unembedded: Vec<String> = vectors
             .unembedded()

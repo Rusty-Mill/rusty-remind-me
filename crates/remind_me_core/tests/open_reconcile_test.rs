@@ -107,7 +107,10 @@ fn writes_reach_the_sync_outbox_when_sync_is_configured() {
     // A synced peer reconstructs a memory from the payload alone, so a column
     // missing here is data loss on the other node.
     for column in ["remind_at", "sensitive", "project", "written_by"] {
-        assert!(parsed.get(column).is_some(), "the payload does not carry {column}");
+        assert!(
+            parsed.get(column).is_some(),
+            "the payload does not carry {column}"
+        );
     }
 
     clear_sync_env();
@@ -127,7 +130,10 @@ fn writes_do_not_reach_the_outbox_while_sync_is_unconfigured() {
 
     assert_eq!(testing::count(&store, Table::SyncOutbox).unwrap(), 0);
     assert_eq!(
-        SyncState::new(&store).flag("sync_enabled").unwrap().as_deref(),
+        SyncState::new(&store)
+            .flag("sync_enabled")
+            .unwrap()
+            .as_deref(),
         Some("0"),
         "the gate is aligned with the configuration at open"
     );
@@ -146,8 +152,13 @@ fn a_sent_outbox_row_past_the_retention_window_is_pruned_at_open() {
         add(&store, "old");
         let rows = testing::outbox_rows(&store).unwrap();
         assert_eq!(rows.len(), 1);
-        testing::set_outbox_column(&store, rows[0].id, "created_at", "2000-01-01T00:00:00+00:00")
-            .unwrap();
+        testing::set_outbox_column(
+            &store,
+            rows[0].id,
+            "created_at",
+            "2000-01-01T00:00:00+00:00",
+        )
+        .unwrap();
     }
     let db = Database::open(&tmp.0).unwrap();
     assert_eq!(testing::count(&db.store(), Table::SyncOutbox).unwrap(), 0);

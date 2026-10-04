@@ -26,7 +26,10 @@ impl<'c> SavedSearches<'c> {
 
     /// The id of the saved search called `name`, if there is one.
     pub fn id_for_name(&self, name: &str) -> Result<Option<String>> {
-        Ok(engine::saved_searches::id_for_name(&self.engine.lock(), name))
+        Ok(engine::saved_searches::id_for_name(
+            &self.engine.lock(),
+            name,
+        ))
     }
 
     /// Store a new saved search, every field as given.
@@ -47,7 +50,10 @@ impl<'c> SavedSearches<'c> {
 
     /// One saved search by name, or `None`.
     pub fn get_by_name(&self, name: &str) -> Result<Option<SavedSearch>> {
-        Ok(engine::saved_searches::get_by_name(&self.engine.lock(), name))
+        Ok(engine::saved_searches::get_by_name(
+            &self.engine.lock(),
+            name,
+        ))
     }
 
     /// Every saved search, alphabetical by name.
@@ -197,7 +203,12 @@ mod tests {
     #[test]
     fn malformed_filters_read_as_empty() {
         assert_eq!(decode_filters("not json"), SavedSearchFilters::default());
-        assert_eq!(encode_filters(&SavedSearchFilters::default()).chars().next(), Some('{'));
+        assert_eq!(
+            encode_filters(&SavedSearchFilters::default())
+                .chars()
+                .next(),
+            Some('{')
+        );
     }
 
     #[test]

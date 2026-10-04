@@ -333,10 +333,7 @@ fn stopping_the_loop_does_not_wait_out_the_poll_interval() {
     let _env = POLL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     crate::test_env::set_var(remind_me_core::scheduler::POLL_INTERVAL_ENV, "3600");
     let scheduler = remind_me_core::scheduler::start_scheduler(
-        Database::open(&path)
-            .unwrap()
-            .secondary_source()
-            .unwrap(),
+        Database::open(&path).unwrap().secondary_source().unwrap(),
     );
     let started = std::time::Instant::now();
     scheduler.stop();

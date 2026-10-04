@@ -34,9 +34,9 @@
 //! the tool is unusable on exactly the vaults that need it most.
 
 use crate::db::curation::Curation;
+use crate::db::memories::Memories;
 use crate::db::Result;
 use crate::db::Store;
-use crate::db::memories::Memories;
 use crate::models::{
     ContradictionCandidate, ContradictionCandidatesResult, ContradictionSide, Memory,
 };

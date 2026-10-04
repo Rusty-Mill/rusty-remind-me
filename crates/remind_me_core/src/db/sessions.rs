@@ -95,7 +95,12 @@ impl SessionRecord {
     }
 
     /// Record the end: `ended_at` always, the sha and work log when given.
-    pub fn ended(&mut self, ended_at: &str, end_sha: Option<&str>, work_log_memory_id: Option<&str>) {
+    pub fn ended(
+        &mut self,
+        ended_at: &str,
+        end_sha: Option<&str>,
+        work_log_memory_id: Option<&str>,
+    ) {
         self.ended_at = Some(ended_at.to_string());
         if end_sha.is_some() {
             self.end_sha = end_sha.map(str::to_string);
@@ -268,7 +273,10 @@ mod tests {
             let ids = |rows: Vec<SessionRecord>| -> Vec<String> {
                 rows.into_iter().map(|r| r.session_id).collect()
             };
-            assert_eq!(ids(sessions.recent(10, None).unwrap()), ["b", "d", "c", "a"]);
+            assert_eq!(
+                ids(sessions.recent(10, None).unwrap()),
+                ["b", "d", "c", "a"]
+            );
             assert_eq!(ids(sessions.recent(2, None).unwrap()), ["b", "d"]);
             assert_eq!(ids(sessions.recent(10, Some("p1")).unwrap()), ["c", "a"]);
             assert!(sessions.recent(10, Some("p9")).unwrap().is_empty());

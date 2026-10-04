@@ -165,8 +165,13 @@ fn both_exclusions_apply_together() {
     let store = db.store();
     let stale = supersede(&store);
     let doomed = add(&store, "a note that gets deleted", None);
-    remind_me_core::testing::set_memory_column(&store, &doomed, "deleted_at", "2026-01-01T00:00:00Z")
-        .expect("tombstone");
+    remind_me_core::testing::set_memory_column(
+        &store,
+        &doomed,
+        "deleted_at",
+        "2026-01-01T00:00:00Z",
+    )
+    .expect("tombstone");
 
     let contents = exported_contents(&store, false);
     assert_eq!(

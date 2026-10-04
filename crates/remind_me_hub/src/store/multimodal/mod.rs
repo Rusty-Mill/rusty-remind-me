@@ -45,10 +45,12 @@ use super::{
 use crate::canon::now_canonical;
 use crate::record::{EntityRecord, LinkRecord, MemoryRecord, Record};
 use keys::{IdKey, LinkKey, MAX_ID_KEY};
-use rows::{ByEngineId, EntityRow, Keyset, LinkRow, MemoryRow, MemoryRowV1, Micros, RelationRow, Seq};
-use rusty_multimodal_db_engine::generic::insert_log;
+use rows::{
+    ByEngineId, EntityRow, Keyset, LinkRow, MemoryRow, MemoryRowV1, Micros, RelationRow, Seq,
+};
 use rusty_multimodal_db_engine::dir_lock::{DirLock, DirLockError};
 use rusty_multimodal_db_engine::durability::{sync_parent_dir, DurabilityError};
+use rusty_multimodal_db_engine::generic::insert_log;
 use rusty_multimodal_db_engine::generic::mmap_field::MmapFieldValue;
 use rusty_multimodal_db_engine::generic::query::{
     AllIds, Compact, GetById, Insert, PageBy, RangeBy, Replace,

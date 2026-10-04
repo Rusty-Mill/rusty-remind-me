@@ -218,7 +218,13 @@ pub fn queue_outbox(
     payload: &str,
     created_at: &str,
 ) -> Result<i64> {
-    engine::outbox::queue_at(&mut store.core().lock(), key, operation, payload, created_at)
+    engine::outbox::queue_at(
+        &mut store.core().lock(),
+        key,
+        operation,
+        payload,
+        created_at,
+    )
 }
 
 #[cfg(test)]
@@ -275,7 +281,9 @@ mod tests {
         );
         assert_eq!(memory_i64(&store, "b", "sensitive").unwrap(), Some(0));
         assert_eq!(
-            memory_text(&store, "b", "superseded_by").unwrap().as_deref(),
+            memory_text(&store, "b", "superseded_by")
+                .unwrap()
+                .as_deref(),
             Some("a")
         );
         assert_eq!(memory_i64(&store, "b", "access_count").unwrap(), Some(7));
@@ -286,7 +294,10 @@ mod tests {
         assert_eq!(count(&store, Table::Entities).unwrap(), 0);
 
         let queued = queue_outbox(&store, "a", "insert", "{}", NOW).unwrap();
-        assert_eq!(set_outbox_column(&store, queued, "sent_at", NOW).unwrap(), 1);
+        assert_eq!(
+            set_outbox_column(&store, queued, "sent_at", NOW).unwrap(),
+            1
+        );
         assert_eq!(
             set_outbox_column(&store, queued + 1000, "created_at", NOW).unwrap(),
             0

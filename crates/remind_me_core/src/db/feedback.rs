@@ -86,7 +86,14 @@ impl<'c> Feedback<'c> {
         event: &FeedbackEvent,
         created_at: &str,
     ) -> Result<()> {
-        engine::feedback::log_event(&mut self.core.lock(), id, memory_id, query, event, created_at)
+        engine::feedback::log_event(
+            &mut self.core.lock(),
+            id,
+            memory_id,
+            query,
+            event,
+            created_at,
+        )
     }
 
     /// Every feedback event logged for `memory_id`, oldest first (ties by
@@ -175,7 +182,10 @@ mod tests {
             (feedback.review_count(&filter).unwrap(), batch)
         };
         let (count, batch) = look(&feedback);
-        assert_eq!(count, 3, "heavy, heavier and fact; light is light, fresh is fresh");
+        assert_eq!(
+            count, 3,
+            "heavy, heavier and fact; light is light, fresh is fresh"
+        );
         assert_eq!(
             batch,
             [
@@ -224,10 +234,18 @@ mod tests {
             })
         );
         assert_eq!(feedback.importance("missing").unwrap(), None);
-        assert_eq!(look(&feedback).1[0], "fact:content of f:None", "heaviest first");
+        assert_eq!(
+            look(&feedback).1[0],
+            "fact:content of f:None",
+            "heaviest first"
+        );
         feedback.delete_for("heavy").unwrap();
         assert!(feedback.events("heavy").unwrap().is_empty());
-        assert_eq!(look(&feedback).0, 3, "with its feedback gone, heavy is due again");
+        assert_eq!(
+            look(&feedback).0,
+            3,
+            "with its feedback gone, heavy is due again"
+        );
 
         let revisions = Revisions::new(&store);
         let before = revisions.current("light").unwrap().unwrap();
@@ -249,7 +267,11 @@ mod tests {
         let after = revisions.current("light").unwrap().unwrap();
         assert_eq!(after.content, "restored");
         assert_eq!(after.category, "c");
-        assert_eq!(after.sensitive, Some(false), "None is written as not sensitive");
+        assert_eq!(
+            after.sensitive,
+            Some(false),
+            "None is written as not sensitive"
+        );
         memories.delete_live("light", Some(old)).unwrap();
         assert!(!revisions.is_live("light").unwrap());
         assert!(revisions.is_live("fact").unwrap());

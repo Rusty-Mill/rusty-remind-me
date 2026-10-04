@@ -405,7 +405,9 @@ fn after_a_failed_sync_every_write_is_refused_and_ping_fails() {
 fn the_v32_columns_default_on_parse_and_reach_the_wire() {
     let dir = TempDir::new("v32_wire");
     let store = MultimodalHubStore::open(&dir.0).unwrap();
-    store.apply_record(&memory("m1", "2026-08-02T00:00:00Z"), Some("node-a")).unwrap();
+    store
+        .apply_record(&memory("m1", "2026-08-02T00:00:00Z"), Some("node-a"))
+        .unwrap();
     let with_columns = record::parse(&json!({
         "id": "m2",
         "content": "in context",
@@ -503,7 +505,10 @@ fn a_memories_table_under_the_v1_layout_is_upgraded_at_open() {
     assert!(Core::<MemoryRow, Seq>::open_portable(&path).is_err());
 
     let store = MultimodalHubStore::open(&dir.0).unwrap();
-    assert_eq!(seqs(&store), [("old".to_string(), 7), ("newer".to_string(), 8)]);
+    assert_eq!(
+        seqs(&store),
+        [("old".to_string(), 7), ("newer".to_string(), 8)]
+    );
     let pulled = store
         .pull_memories(&PullQuery {
             cursor: PullCursor::Seq(0),
@@ -519,7 +524,9 @@ fn a_memories_table_under_the_v1_layout_is_upgraded_at_open() {
     assert_eq!(pulled[1]["id"], "newer");
     // A new write lands beside the upgraded rows, and the next `hub_seq`
     // follows the copied ones.
-    store.apply_record(&memory("m3", "2026-08-03T00:00:00Z"), None).unwrap();
+    store
+        .apply_record(&memory("m3", "2026-08-03T00:00:00Z"), None)
+        .unwrap();
     drop(store);
     let again = MultimodalHubStore::open(&dir.0).unwrap();
     assert_eq!(seqs(&again).len(), 3);

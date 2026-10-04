@@ -82,8 +82,9 @@ mod without_the_feature {
         }
 
         // And nothing was stored, so a later search cannot turn up a phantom.
-        let count = remind_me_core::testing::count(&store, remind_me_core::testing::Table::Memories)
-            .unwrap();
+        let count =
+            remind_me_core::testing::count(&store, remind_me_core::testing::Table::Memories)
+                .unwrap();
         assert_eq!(count, 0);
     }
 }

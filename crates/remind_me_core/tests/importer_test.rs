@@ -816,8 +816,14 @@ fn an_export_round_trips_the_v32_columns_and_a_plain_chat_defaults_them() {
     assert_eq!(column(&store, "written_by"), "model:test");
     assert_eq!(column(&store, "capture_method"), "auto");
     let ids = testing::memory_ids(&store).unwrap();
-    assert_eq!(testing::memory_f64(&store, &ids[0], "confidence").unwrap(), Some(0.5));
-    assert_eq!(testing::memory_text(&store, &ids[0], "git_sha").unwrap(), None);
+    assert_eq!(
+        testing::memory_f64(&store, &ids[0], "confidence").unwrap(),
+        Some(0.5)
+    );
+    assert_eq!(
+        testing::memory_text(&store, &ids[0], "git_sha").unwrap(),
+        None
+    );
 
     let plain = Database::open_in_memory().unwrap();
     let store = plain.store();
@@ -826,8 +832,14 @@ fn an_export_round_trips_the_v32_columns_and_a_plain_chat_defaults_them() {
     let ids = testing::memory_ids(&store).unwrap();
     // Not an export of ours, so nothing is restored: the importer stamps
     // itself, and keeps only the project (the directory it ran in).
-    assert_eq!(testing::memory_text(&store, &ids[0], "git_sha").unwrap(), None);
-    assert_eq!(testing::memory_f64(&store, &ids[0], "confidence").unwrap(), Some(1.0));
+    assert_eq!(
+        testing::memory_text(&store, &ids[0], "git_sha").unwrap(),
+        None
+    );
+    assert_eq!(
+        testing::memory_f64(&store, &ids[0], "confidence").unwrap(),
+        Some(1.0)
+    );
     // Wave 1D: any chat import is written by the importer, automatically.
     assert_eq!(column(&store, "written_by"), "importer:chat");
     assert_eq!(column(&store, "capture_method"), "auto");

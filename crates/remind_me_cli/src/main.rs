@@ -402,7 +402,10 @@ fn parse_resolve_args(args: &[String]) -> Result<ResolveArgs, String> {
             note = Some(flag_value(args, i, "--note", RESOLVE_USAGE)?);
             i += 2;
         } else if args[i].starts_with("--") {
-            return Err(format!("Error: unknown flag {:?}.\n{}", args[i], RESOLVE_USAGE));
+            return Err(format!(
+                "Error: unknown flag {:?}.\n{}",
+                args[i], RESOLVE_USAGE
+            ));
         } else {
             words.push(&args[i]);
             i += 1;
@@ -1090,11 +1093,15 @@ mod tests {
 
     #[test]
     fn resolve_takes_an_id_an_outcome_and_an_optional_note() {
-        let parsed = parse_resolve_args(&args(&["mem_1", "reverted", "--note", "broke CI"])).unwrap();
+        let parsed =
+            parse_resolve_args(&args(&["mem_1", "reverted", "--note", "broke CI"])).unwrap();
         assert_eq!(parsed.memory_id, "mem_1");
         assert_eq!(parsed.outcome, "reverted");
         assert_eq!(parsed.note.as_deref(), Some("broke CI"));
-        assert_eq!(parse_resolve_args(&args(&["mem_1", "done"])).unwrap().note, None);
+        assert_eq!(
+            parse_resolve_args(&args(&["mem_1", "done"])).unwrap().note,
+            None
+        );
     }
 
     #[test]

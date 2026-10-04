@@ -50,7 +50,6 @@ pub fn add_memory_with(
     let attachments = crate::attachments::resolve(&input.attachments)?;
     crate::attachments::merge_metadata(&mut input.metadata, &attachments);
 
-
     // A stated kind drives decay and weight; otherwise the category does, as
     // it always has.
     let kind = fields.memory_type.as_deref().unwrap_or(&input.category);

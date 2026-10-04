@@ -5,8 +5,8 @@ mod test_env;
 
 use remind_me_core::backup::create_backup;
 use remind_me_core::db::queries;
-use remind_me_core::db::SCHEMA_VERSION;
 use remind_me_core::db::Store;
+use remind_me_core::db::SCHEMA_VERSION;
 use remind_me_core::embedder::EMBEDDING_BACKEND_ENV;
 use remind_me_core::status::{server_status, SubsystemStatus};
 use remind_me_core::testing;

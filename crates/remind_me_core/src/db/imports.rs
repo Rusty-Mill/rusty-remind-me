@@ -355,14 +355,8 @@ mod tests {
                 .unwrap(),
             2
         );
-        assert_eq!(
-            ledger.forget_dbs(&owned(&["d2", "d2", "d1"])).unwrap(),
-            2
-        );
-        assert_eq!(
-            ledger.forget_mempalace(&owned(&["p4", "p9"])).unwrap(),
-            1
-        );
+        assert_eq!(ledger.forget_dbs(&owned(&["d2", "d2", "d1"])).unwrap(), 2);
+        assert_eq!(ledger.forget_mempalace(&owned(&["p4", "p9"])).unwrap(), 1);
         assert_eq!(ledger.live_chat_memories(None).unwrap(), ["m1", "m2", "m3"]);
         assert!(ledger.live_dbs_memories(None).unwrap().is_empty());
         assert_eq!(

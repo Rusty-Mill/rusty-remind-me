@@ -346,7 +346,8 @@ fn a_promotion_with_an_unusable_source_is_refused_whole() {
         )
         .unwrap();
     assert_eq!(rows, 0);
-    let links = remind_me_core::testing::count(&store, remind_me_core::testing::Table::Promotions).unwrap();
+    let links =
+        remind_me_core::testing::count(&store, remind_me_core::testing::Table::Promotions).unwrap();
     assert_eq!(links, 0);
 }
 

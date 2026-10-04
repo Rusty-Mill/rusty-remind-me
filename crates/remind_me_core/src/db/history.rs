@@ -67,7 +67,13 @@ impl<'c> Revisions<'c> {
         edited_at: &str,
         reason: Option<&str>,
     ) -> Result<()> {
-        engine::revisions::insert(&mut self.engine.lock(), memory_id, values, edited_at, reason)
+        engine::revisions::insert(
+            &mut self.engine.lock(),
+            memory_id,
+            values,
+            edited_at,
+            reason,
+        )
     }
 
     /// `memory_id`'s revisions, newest first, at most `limit`.
@@ -75,7 +81,11 @@ impl<'c> Revisions<'c> {
     /// Ordered by `edited_at` then `id`, so revisions captured within the
     /// same clock tick still list in the order they were written.
     pub fn list(&self, memory_id: &str, limit: usize) -> Result<Vec<MemoryRevision>> {
-        Ok(engine::revisions::list(&self.engine.lock(), memory_id, limit))
+        Ok(engine::revisions::list(
+            &self.engine.lock(),
+            memory_id,
+            limit,
+        ))
     }
 
     /// The tracked values revision `revision_id` holds, if it belongs to

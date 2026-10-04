@@ -316,11 +316,13 @@ mod tests {
 
         let curation = Curation::new(&store);
         let sources = ["document_import", "chat_import"];
-        let ids = |memories: Vec<Memory>| -> Vec<String> {
-            memories.into_iter().map(|m| m.id).collect()
-        };
+        let ids =
+            |memories: Vec<Memory>| -> Vec<String> { memories.into_iter().map(|m| m.id).collect() };
         assert_eq!(ids(curation.capture_rows("c1").unwrap()), ["d1", "s1"]);
-        assert_eq!(curation.capture_tags("c1").unwrap(), Some(vec!["x".to_string()]));
+        assert_eq!(
+            curation.capture_tags("c1").unwrap(),
+            Some(vec!["x".to_string()])
+        );
         assert_eq!(curation.capture_tags("none").unwrap(), None);
         let undecomposed: Vec<String> = curation
             .undecomposed(10)
@@ -369,13 +371,18 @@ mod tests {
         assert!(pairs_at_20 > 0, "the corpus has contradiction pairs");
         assert_eq!(
             curation.contradiction_pairs(20, None, 2).unwrap(),
-            [("f1".to_string(), "f3".to_string()), ("f1".to_string(), "f4".to_string())]
+            [
+                ("f1".to_string(), "f3".to_string()),
+                ("f1".to_string(), "f4".to_string())
+            ]
         );
         let after = curation
             .contradiction_pairs(20, Some(("f1", "f3")), 10)
             .unwrap();
         assert_eq!(after.len() as i64, pairs_at_20 - 1);
-        assert!(after.iter().all(|(a, b)| (a.as_str(), b.as_str()) > ("f1", "f3")));
+        assert!(after
+            .iter()
+            .all(|(a, b)| (a.as_str(), b.as_str()) > ("f1", "f3")));
         assert!(
             curation.count_contradiction_pairs(3).unwrap() < pairs_at_20,
             "a lower fan-out ceiling drops e1's pairs"
@@ -433,10 +440,16 @@ mod tests {
                 .unwrap(),
             1
         );
-        assert_eq!(promotions.live_source_sensitivity("f3").unwrap(), Some(true));
+        assert_eq!(
+            promotions.live_source_sensitivity("f3").unwrap(),
+            Some(true)
+        );
         assert_eq!(promotions.live_source_sensitivity("f2").unwrap(), None);
         assert_eq!(promotions.promoted_from("f2", "scenario").unwrap(), ["sc1"]);
-        assert_eq!(promotions.sources_at("sc1", "scenario").unwrap(), ["f2", "f4"]);
+        assert_eq!(
+            promotions.sources_at("sc1", "scenario").unwrap(),
+            ["f2", "f4"]
+        );
         assert!(promotions.is_live("f1").unwrap());
         assert!(!promotions.is_live("f2").unwrap());
         assert_eq!(promotions.sources_of("p1").unwrap(), ["gone", "sc1"]);
@@ -448,7 +461,11 @@ mod tests {
             .into_iter()
             .map(|s| s.id)
             .collect();
-        assert_eq!(by_vitality, ["f1", "f4"], "non-sensitive, live, unsuperseded");
+        assert_eq!(
+            by_vitality,
+            ["f1", "f4"],
+            "non-sensitive, live, unsuperseded"
+        );
         let newest: Vec<String> = promotions
             .statements_newest_first("fact")
             .unwrap()

@@ -38,11 +38,11 @@
 //! column to compare against).
 
 use crate::db::imports::ImportLedger;
+use crate::db::legacy_sqlite::LegacyDb;
 use crate::db::memories::{Memories, NewMemory};
 use crate::db::Store;
 use crate::models::{MempalaceImportInput, MEMPALACE_IMPORT_LIMIT_MAX, MEMPALACE_IMPORT_LIMIT_MIN};
 use chrono::Utc;
-use crate::db::legacy_sqlite::LegacyDb;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -79,19 +79,12 @@ pub fn mempalace_path() -> PathBuf {
 #[derive(Debug)]
 pub enum MempalaceImportError {
     /// No store at the configured path.
-    NotFound {
-        path: String,
-    },
+    NotFound { path: String },
     /// A file exists there, but is not a readable SQLite database.
-    NotADatabase {
-        path: String,
-        detail: String,
-    },
+    NotADatabase { path: String, detail: String },
     /// A readable database, but no `mempalace_drawers` collection in it —
     /// wrong path, an empty palace, or not a Chroma store at all.
-    NoCollection {
-        path: String,
-    },
+    NoCollection { path: String },
     /// The node's own store failed, or the Chroma store could not be read.
     Store(crate::db::StoreError),
 }

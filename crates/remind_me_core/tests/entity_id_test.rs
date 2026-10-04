@@ -257,4 +257,3 @@ fn the_migration_is_idempotent() {
     );
     assert_eq!(renormalize_entity_ids(&store).unwrap(), 0);
 }
-

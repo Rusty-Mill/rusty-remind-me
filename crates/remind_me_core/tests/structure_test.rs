@@ -110,7 +110,11 @@ fn a_malformed_kind_is_rejected_and_not_stored() {
         (json!({"memory_type": "bogus"}), json!({}), "bogus"),
         (json!({"confidence": 1.5}), json!({}), "confidence"),
         (json!({"valid_until": "soon"}), json!({}), "valid_until"),
-        (json!({"memory_type": "fact", "outcome": "done"}), json!({}), "outcome"),
+        (
+            json!({"memory_type": "fact", "outcome": "done"}),
+            json!({}),
+            "outcome",
+        ),
         (
             json!({"memory_type": "action_item"}),
             json!({"due": "tomorrow"}),
@@ -129,8 +133,9 @@ fn update_validates_against_the_stored_kind_and_metadata() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
     let fact = add(&store, "a fact", json!({"memory_type": "fact"}), json!({}));
-    let err = queries::update_memory_with(&store, &update(&fact), &fields(json!({"outcome": "done"})))
-        .unwrap_err();
+    let err =
+        queries::update_memory_with(&store, &update(&fact), &fields(json!({"outcome": "done"})))
+            .unwrap_err();
     assert!(invalid(err).contains("outcome"));
 
     // Becoming a decision needs a rationale, from this edit or the stored one.
@@ -177,7 +182,9 @@ fn reverted_halves_the_weight_and_leaves_a_resolve_revision() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
     let id = decision(&store, "adopt tool X");
-    let before = testing::memory_f64(&store, &id, "base_weight").unwrap().unwrap();
+    let before = testing::memory_f64(&store, &id, "base_weight")
+        .unwrap()
+        .unwrap();
 
     let m = resolve_memory(&store, &id, "reverted", Some("it broke CI"))
         .unwrap()
@@ -185,7 +192,9 @@ fn reverted_halves_the_weight_and_leaves_a_resolve_revision() {
     assert_eq!(m.outcome.as_deref(), Some("reverted"));
     assert_eq!(m.metadata["outcome_note"], "it broke CI");
     assert_eq!(m.metadata["rationale"], "because", "existing metadata kept");
-    let after = testing::memory_f64(&store, &id, "base_weight").unwrap().unwrap();
+    let after = testing::memory_f64(&store, &id, "base_weight")
+        .unwrap()
+        .unwrap();
     assert!((after - before * 0.5).abs() < 1e-9);
     assert!(m.vitality < before);
 
@@ -199,7 +208,11 @@ fn done_leaves_the_weight_and_abandoned_demotes() {
     let store = db.store();
     let done = decision(&store, "ship it");
     let dropped = decision(&store, "rewrite it");
-    let w = |id: &str| testing::memory_f64(&store, id, "base_weight").unwrap().unwrap();
+    let w = |id: &str| {
+        testing::memory_f64(&store, id, "base_weight")
+            .unwrap()
+            .unwrap()
+    };
     let (w_done, w_dropped) = (w(&done), w(&dropped));
 
     resolve_memory(&store, &done, "done", None).unwrap();
@@ -215,13 +228,20 @@ fn done_leaves_the_weight_and_abandoned_demotes() {
 fn resolve_refuses_the_wrong_kind_or_outcome_and_misses_cleanly() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
-    let fact = add(&store, "just a fact", json!({"memory_type": "fact"}), json!({}));
+    let fact = add(
+        &store,
+        "just a fact",
+        json!({"memory_type": "fact"}),
+        json!({}),
+    );
     let err = resolve_memory(&store, &fact, "done", None).unwrap_err();
     assert!(invalid(err).contains("outcome"));
     let d = decision(&store, "d");
     let err = resolve_memory(&store, &d, "maybe", None).unwrap_err();
     assert!(invalid(err).contains("outcome"));
-    assert!(resolve_memory(&store, "mem_ghost", "done", None).unwrap().is_none());
+    assert!(resolve_memory(&store, "mem_ghost", "done", None)
+        .unwrap()
+        .is_none());
 }
 
 #[test]
@@ -229,7 +249,12 @@ fn reclassify_and_decompose_guards_name_the_field() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
     let plain = add(&store, "no rationale", json!({}), json!({}));
-    let rich = add(&store, "has rationale", json!({}), json!({"rationale": "r"}));
+    let rich = add(
+        &store,
+        "has rationale",
+        json!({}),
+        json!({"rationale": "r"}),
+    );
     let class = |id: &str, t: &str| MemoryClassification {
         memory_id: id.to_string(),
         memory_type: t.to_string(),
@@ -255,7 +280,10 @@ fn reclassify_and_decompose_guards_name_the_field() {
     assert!(validate_facts(&[fact(None, None), fact(Some("fact"), None)]).is_ok());
     let err = validate_facts(&[fact(Some("decision"), None)]).unwrap_err();
     let why = invalid(err);
-    assert!(why.contains("facts[0]") && why.contains("rationale"), "{why}");
+    assert!(
+        why.contains("facts[0]") && why.contains("rationale"),
+        "{why}"
+    );
     assert!(validate_facts(&[fact(Some("decision"), Some(json!({"rationale": "r"})))]).is_ok());
 }
 
@@ -308,7 +336,11 @@ fn a_decomposed_fact_keeps_its_kind_metadata() {
     assert!(provenance(&store, "mem_ghost").unwrap().sources.is_empty());
 }
 
-fn search(store: &Store<'_>, query: &str, tweak: impl FnOnce(&mut MemorySearchInput)) -> Vec<String> {
+fn search(
+    store: &Store<'_>,
+    query: &str,
+    tweak: impl FnOnce(&mut MemorySearchInput),
+) -> Vec<String> {
     let mut s = MemorySearchInput {
         query: query.to_string(),
         ..MemorySearchInput::default()
@@ -346,7 +378,12 @@ fn an_expired_memory_ranks_last_and_can_be_excluded() {
 fn confidence_scales_ranking_and_min_confidence_filters() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
-    add(&store, "numbat diet shaky", json!({"confidence": 0.1}), json!({}));
+    add(
+        &store,
+        "numbat diet shaky",
+        json!({"confidence": 0.1}),
+        json!({}),
+    );
     add(&store, "numbat diet solid", json!({}), json!({}));
 
     let ranked = search(&store, "numbat diet", |_| {});
@@ -372,8 +409,18 @@ fn triple_memory(store: &Store<'_>, content: &str, object: &str, f: Value) -> St
 fn contradiction_candidates_put_the_more_trusted_side_first() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
-    let weak = triple_memory(&store, "service runs on aws", "aws", json!({"confidence": 0.4}));
-    let strong = triple_memory(&store, "service runs on gcp", "gcp", json!({"confidence": 0.9}));
+    let weak = triple_memory(
+        &store,
+        "service runs on aws",
+        "aws",
+        json!({"confidence": 0.4}),
+    );
+    let strong = triple_memory(
+        &store,
+        "service runs on gcp",
+        "gcp",
+        json!({"confidence": 0.9}),
+    );
 
     let page = candidates(&store, 10, None).unwrap();
     assert_eq!(page.candidates.len(), 1);
@@ -410,8 +457,18 @@ fn contradiction_ties_fall_through_to_verified_then_updated() {
 fn stale_candidates_report_expired_memories() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
-    let old = add(&store, "old promo", json!({"valid_until": "2020-01-01T00:00:00Z"}), json!({}));
-    add(&store, "far future", json!({"valid_until": "2099-01-01T00:00:00Z"}), json!({}));
+    let old = add(
+        &store,
+        "old promo",
+        json!({"valid_until": "2020-01-01T00:00:00Z"}),
+        json!({}),
+    );
+    add(
+        &store,
+        "far future",
+        json!({"valid_until": "2099-01-01T00:00:00Z"}),
+        json!({}),
+    );
     add(&store, "no window", json!({}), json!({}));
 
     let found = remind_me_core::code_refs::stale_candidates(&store, 20).unwrap();
@@ -444,7 +501,9 @@ fn annotate_supersedes_a_contradicted_triple() {
         )
         .unwrap()
     };
-    assert!(annotate(&old, "Seattle").results[0].superseded_ids.is_empty());
+    assert!(annotate(&old, "Seattle").results[0]
+        .superseded_ids
+        .is_empty());
     let result = annotate(&new, "Boston");
     assert_eq!(result.results[0].superseded_ids, vec![old.clone()]);
     let m = Memories::new(&store).get_live(&old).unwrap().unwrap();
@@ -470,9 +529,15 @@ fn a_scenario_built_on_a_reverted_decision_is_not_a_persona_candidate() {
     seed("scn_ok", SCENARIO_CATEGORY, "unclassified");
     seed("scn_bad", SCENARIO_CATEGORY, "unclassified");
     let promotions = Promotions::new(&store);
-    promotions.record("scn_ok", "fact_ok", "fact_to_scenario", &now).unwrap();
-    promotions.record("scn_bad", "fact_ok", "fact_to_scenario", &now).unwrap();
-    promotions.record("scn_bad", "fact_dec", "fact_to_scenario", &now).unwrap();
+    promotions
+        .record("scn_ok", "fact_ok", "fact_to_scenario", &now)
+        .unwrap();
+    promotions
+        .record("scn_bad", "fact_ok", "fact_to_scenario", &now)
+        .unwrap();
+    promotions
+        .record("scn_bad", "fact_dec", "fact_to_scenario", &now)
+        .unwrap();
 
     let ids = |store: &Store<'_>| -> Vec<String> {
         promotion_candidates(store, Rung::ScenarioToPersona, 20)

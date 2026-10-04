@@ -1538,17 +1538,19 @@ impl McpServer {
                                 serde_json::from_value::<StructuredFields>(args).map(|f| (i, f))
                             });
                         match input {
-                            Ok((add_input, fields)) => match queries::add_memory_with(&store, add_input, &fields) {
-                                Ok(mem) => {
-                                    json!({ "content": [{ "type": "text", "text": match format {
+                            Ok((add_input, fields)) => {
+                                match queries::add_memory_with(&store, add_input, &fields) {
+                                    Ok(mem) => {
+                                        json!({ "content": [{ "type": "text", "text": match format {
     ResponseFormat::Json => serde_json::to_string_pretty(&mem).unwrap(),
     ResponseFormat::Markdown => render::memory_stored(&mem),
 } }] })
+                                    }
+                                    Err(e) => {
+                                        json!({ "isError": true, "content": [{ "type": "text", "text": store_error_text("Database error", &e) }] })
+                                    }
                                 }
-                                Err(e) => {
-                                    json!({ "isError": true, "content": [{ "type": "text", "text": store_error_text("Database error", &e) }] })
-                                }
-                            },
+                            }
                             Err(e) => {
                                 json!({ "isError": true, "content": [{ "type": "text", "text": format!("Invalid input: {}", e) }] })
                             }
@@ -3207,7 +3209,9 @@ impl McpServer {
                         let memory_id = args.get("memory_id").and_then(Value::as_str).unwrap_or("");
                         let outcome = args.get("outcome").and_then(Value::as_str).unwrap_or("");
                         let note = args.get("note").and_then(Value::as_str);
-                        match remind_me_core::resolve::resolve_memory(&store, memory_id, outcome, note) {
+                        match remind_me_core::resolve::resolve_memory(
+                            &store, memory_id, outcome, note,
+                        ) {
                             Ok(Some(mem)) => {
                                 json!({ "content": [{ "type": "text", "text": match format {
                                     ResponseFormat::Json => serde_json::to_string_pretty(&mem).unwrap(),

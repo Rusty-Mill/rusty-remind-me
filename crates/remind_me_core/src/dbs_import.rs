@@ -46,13 +46,13 @@
 //! care which timestamp the edit was filed under.
 
 use crate::db::imports::{DbsTracked as Tracked, ImportLedger};
+use crate::db::legacy_sqlite::LegacyDb;
 use crate::db::memories::{Memories, NewMemory};
 use crate::db::Store;
 use crate::entity::{link_memory_entity, upsert_entity};
 use crate::import_paths::{validate_import_database, ImportPathError};
 use crate::models::{DbsImportInput, EntityInput, DBS_IMPORT_LIMIT_MAX, DBS_IMPORT_LIMIT_MIN};
 use chrono::Utc;
-use crate::db::legacy_sqlite::LegacyDb;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -78,15 +78,9 @@ pub enum DbsImportError {
     /// The path was refused before anything was opened.
     Path(ImportPathError),
     /// The file is not a readable SQLite database.
-    NotADatabase {
-        path: String,
-        detail: String,
-    },
+    NotADatabase { path: String, detail: String },
     /// It is a database, but not a `dbs` one.
-    NotADbsArchive {
-        path: String,
-        detail: String,
-    },
+    NotADbsArchive { path: String, detail: String },
     /// The node's own store failed, or the archive could not be read.
     Store(crate::db::StoreError),
 }
@@ -598,7 +592,11 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let seen = exercise(&db, &first, &second);
         assert!(seen[0].contains("created: 3"), "{}", seen[0]);
-        assert!(seen[1].contains("x1") && seen[1].contains("x3"), "{}", seen[1]);
+        assert!(
+            seen[1].contains("x1") && seen[1].contains("x3"),
+            "{}",
+            seen[1]
+        );
         assert!(seen[3].contains("updated: 1"), "{}", seen[3]);
         assert!(seen[4].contains("h2-changed"), "{}", seen[4]);
         assert_eq!(seen[2], seen[5], "a rerun creates no new entities");

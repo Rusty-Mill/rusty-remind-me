@@ -569,9 +569,9 @@ impl<'c> Memories<'c> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::derived::Origin;
     use crate::db::outbox::Outbox;
     use crate::db::sync_state::SyncState;
-    use crate::db::derived::Origin;
     use crate::db::Database;
 
     const NOW: &str = "2026-09-26T00:00:00+00:00";
@@ -771,8 +771,12 @@ mod tests {
         })
         .unwrap();
         counts.push(m.delete_capture_category("cap", "chunk").unwrap());
-        m.insert(&with_every_v32_column(NewMemory::new("ctx", "in context", T3)))
-            .unwrap();
+        m.insert(&with_every_v32_column(NewMemory::new(
+            "ctx",
+            "in context",
+            T3,
+        )))
+        .unwrap();
         m.upsert_synced(&NewMemory {
             created_at: T3.into(),
             ..with_every_v32_column(NewMemory::new("b", "beta remote", T3))
@@ -1041,13 +1045,21 @@ mod tests {
         on_engine(|db| observed.push(exercise_reads(db)));
         let seen = &observed[0];
         assert_eq!(seen[0], serde_json::json!([4, ["e", "b", "d", "a"]]));
-        assert_eq!(seen[1], serde_json::json!([4, ["b", "d"]]), "a page at an offset");
+        assert_eq!(
+            seen[1],
+            serde_json::json!([4, ["b", "d"]]),
+            "a page at an offset"
+        );
         assert_eq!(
             seen[2],
             serde_json::json!([5, ["e", "c", "b", "d", "a"]]),
             "sensitive rows show only when asked"
         );
-        assert_eq!(seen[3], serde_json::json!([2, ["b", "a"]]), "category and all-of tags");
+        assert_eq!(
+            seen[3],
+            serde_json::json!([2, ["b", "a"]]),
+            "category and all-of tags"
+        );
         assert_eq!(seen[4], serde_json::json!([1, ["d"]]), "by source");
         assert_eq!(
             seen[5],
@@ -1069,16 +1081,25 @@ mod tests {
         assert_eq!(seen[11], serde_json::Value::Null);
         assert_eq!(seen[12], serde_json::Value::Null, "d was removed outright");
         let (total, page) = (&seen[14][0], &seen[14][1]);
-        assert_eq!(total, 2, "b and e are live and unclassified; a became a decision");
+        assert_eq!(
+            total, 2,
+            "b and e are live and unclassified; a became a decision"
+        );
         assert_eq!(page.as_array().map(Vec::len), Some(2));
         assert_eq!(
-            page[0]["content_snippet"].as_str().map(|s| s.chars().count()),
+            page[0]["content_snippet"]
+                .as_str()
+                .map(|s| s.chars().count()),
             Some(500),
             "snippets are cut by character"
         );
         let exported = seen[15].as_array().unwrap();
         let ids: Vec<&str> = exported.iter().map(|m| m["id"].as_str().unwrap()).collect();
-        assert_eq!(ids, ["a", "b", "c", "e"], "an export with deleted rows keeps the tombstone");
+        assert_eq!(
+            ids,
+            ["a", "b", "c", "e"],
+            "an export with deleted rows keeps the tombstone"
+        );
     }
 
     /// A corpus searched through `db`'s full-text index: every ranked and
@@ -1283,32 +1304,76 @@ mod tests {
                 .collect()
         };
         assert_eq!(seen[0][0], "quokka");
-        assert_eq!(hits(0).len(), 2, "the limit caps the ranking: {:?}", seen[0]);
+        assert_eq!(
+            hits(0).len(),
+            2,
+            "the limit caps the ranking: {:?}",
+            seen[0]
+        );
         assert_eq!(hits(0)[0], "e", "the memory that says it most ranks first");
         let all_quokka = hits(1);
-        assert!(!all_quokka.contains(&"f".to_string()), "sensitive rows are out by default");
-        assert!(all_quokka.contains(&"j".to_string()), "a tag is indexed too");
-        assert!(all_quokka.contains(&"g".to_string()), "no vitality floor by default");
-        assert!(hits(3).contains(&"f".to_string()), "include_sensitive lets f through");
+        assert!(
+            !all_quokka.contains(&"f".to_string()),
+            "sensitive rows are out by default"
+        );
+        assert!(
+            all_quokka.contains(&"j".to_string()),
+            "a tag is indexed too"
+        );
+        assert!(
+            all_quokka.contains(&"g".to_string()),
+            "no vitality floor by default"
+        );
+        assert!(
+            hits(3).contains(&"f".to_string()),
+            "include_sensitive lets f through"
+        );
         let faded = hits(5);
         assert!(faded.contains(&"f".to_string()) && !faded.contains(&"g".to_string()));
-        assert!(!faded.contains(&"c".to_string()), "the category filter holds");
+        assert!(
+            !faded.contains(&"c".to_string()),
+            "the category filter holds"
+        );
         let scores: Vec<f64> = seen[1][2]
             .as_array()
             .unwrap()
             .iter()
             .map(|h| h[1].as_str().unwrap().parse().unwrap())
             .collect();
-        assert!(scores.windows(2).all(|w| w[0] <= w[1]), "best (lowest) BM25 first: {scores:?}");
-        let last_query = seen.iter().rposition(|v| v[0] == "nothing matches this").unwrap();
+        assert!(
+            scores.windows(2).all(|w| w[0] <= w[1]),
+            "best (lowest) BM25 first: {scores:?}"
+        );
+        let last_query = seen
+            .iter()
+            .rposition(|v| v[0] == "nothing matches this")
+            .unwrap();
         assert!(hits(last_query).is_empty());
         // The pages come after the ranked hits.
-        let pages: Vec<&Value> = seen.iter().filter(|v| v.as_array().is_some_and(|a| a.len() == 3 && a[1].is_u64() && a[2].is_array() && a[2][0].is_string())).collect();
+        let pages: Vec<&Value> = seen
+            .iter()
+            .filter(|v| {
+                v.as_array().is_some_and(|a| {
+                    a.len() == 3 && a[1].is_u64() && a[2].is_array() && a[2][0].is_string()
+                })
+            })
+            .collect();
         assert_eq!(pages.len(), 6, "{pages:?}");
-        assert_eq!(pages[0][1], pages[1][1], "two pages of one query share a total");
+        assert_eq!(
+            pages[0][1], pages[1][1],
+            "two pages of one query share a total"
+        );
         assert_eq!(pages[0][2].as_array().map(Vec::len), Some(3));
-        assert_eq!(pages[3][2], serde_json::json!(["c", "b", "i", "h"]), "no phrases: newest first, by id");
-        assert_eq!(pages[4][2], serde_json::json!(["c", "d"]), "linked to the entity, or naming it");
+        assert_eq!(
+            pages[3][2],
+            serde_json::json!(["c", "b", "i", "h"]),
+            "no phrases: newest first, by id"
+        );
+        assert_eq!(
+            pages[4][2],
+            serde_json::json!(["c", "d"]),
+            "linked to the entity, or naming it"
+        );
         assert_eq!(pages[5][2], serde_json::json!(["c"]));
         let sensitive = seen.last().unwrap();
         assert_eq!(sensitive, &serde_json::json!(["f"]));
@@ -1331,9 +1396,18 @@ mod tests {
                 assert!(!ids.contains(&Value::from(gone)), "{entry:?}");
             }
         }
-        assert!(any_several, "the corpus gives some query several hits: {seen:?}");
-        let quokka_page = seen.iter().find(|v| v[0] == "quokka" && v[1].is_u64()).unwrap();
-        assert_eq!(quokka_page[1], 7, "a, b, c, e, f, g and j; not the superseded h or deleted i");
+        assert!(
+            any_several,
+            "the corpus gives some query several hits: {seen:?}"
+        );
+        let quokka_page = seen
+            .iter()
+            .find(|v| v[0] == "quokka" && v[1].is_u64())
+            .unwrap();
+        assert_eq!(
+            quokka_page[1], 7,
+            "a, b, c, e, f, g and j; not the superseded h or deleted i"
+        );
     }
 
     #[test]
@@ -1342,11 +1416,31 @@ mod tests {
         on_engine(|db| observed.push(exercise(db)));
         let seen = &observed[0];
         assert_eq!(seen.counts, [1, 0, 2, 2, 3]);
-        let live: Vec<&str> = seen.live.iter().map(|m| m["id"].as_str().unwrap()).collect();
-        assert_eq!(live, ["a", "b", "c", "ctx"], "the capture's chunks were removed outright");
-        assert_eq!(seen.red_live, ["c"], "red-tagged, live and unsuperseded: only the merged c");
-        assert_eq!(seen.code_refs.len(), 0, "b's refs went with its synced overwrite");
-        assert_eq!(seen.triples.len(), 0, "a's triple went with its synced overwrite");
+        let live: Vec<&str> = seen
+            .live
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            live,
+            ["a", "b", "c", "ctx"],
+            "the capture's chunks were removed outright"
+        );
+        assert_eq!(
+            seen.red_live,
+            ["c"],
+            "red-tagged, live and unsuperseded: only the merged c"
+        );
+        assert_eq!(
+            seen.code_refs.len(),
+            0,
+            "b's refs went with its synced overwrite"
+        );
+        assert_eq!(
+            seen.triples.len(),
+            0,
+            "a's triple went with its synced overwrite"
+        );
         let created: Vec<&str> = seen.created.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(created, ["b", "c", "ctx"], "a kept its first created_at");
         assert_eq!(seen.created_count, 3);
@@ -1367,7 +1461,11 @@ mod tests {
         for (key, payload) in &seen.outbox {
             assert_eq!(&payload["id"], key, "a payload names its row");
         }
-        let exported: Vec<&str> = seen.exported.iter().map(|m| m["id"].as_str().unwrap()).collect();
+        let exported: Vec<&str> = seen
+            .exported
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
         assert_eq!(exported, ["a", "b", "c", "ctx"], "oldest first, ties by id");
     }
 }

@@ -153,7 +153,13 @@ impl<'c> Entities<'c> {
         created_at: &str,
         origin: Origin,
     ) -> Result<bool> {
-        engine::graph::link(&mut self.core.lock(), memory_id, entity_id, created_at, origin)
+        engine::graph::link(
+            &mut self.core.lock(),
+            memory_id,
+            entity_id,
+            created_at,
+            origin,
+        )
     }
 
     /// Remove every mention link from `memory_id`: part of deleting a
@@ -365,7 +371,10 @@ mod tests {
         Entities::new(&store).unlink_memory("m3").unwrap();
 
         let rust = entities.get("rust").unwrap().unwrap();
-        assert_eq!((rust.name.as_str(), rust.created_at.as_str()), ("Rust!", T1));
+        assert_eq!(
+            (rust.name.as_str(), rust.created_at.as_str()),
+            ("Rust!", T1)
+        );
         assert!(entities.get("tokio").unwrap().is_none(), "renamed away");
         assert!(entities.exists("tokio2").unwrap());
         assert_eq!(entities.count().unwrap(), 3);
@@ -418,7 +427,11 @@ mod tests {
             .into_iter()
             .map(|f| f.id)
             .collect();
-        assert_eq!(facts, ["m3", "m1"], "subject matched case-insensitively, newest first");
+        assert_eq!(
+            facts,
+            ["m3", "m1"],
+            "subject matched case-insensitively, newest first"
+        );
         let relations: Vec<(String, String, String)> = entities
             .relations_oldest_first()
             .unwrap()
@@ -459,7 +472,12 @@ mod tests {
             .relations_touching(&["rust".into()], None, 2)
             .unwrap()
             .into_iter()
-            .map(|(id, edge)| format!("{id}:{}:{}:{}", edge.subject_name, edge.object_name, edge.hop))
+            .map(|(id, edge)| {
+                format!(
+                    "{id}:{}:{}:{}",
+                    edge.subject_name, edge.object_name, edge.hop
+                )
+            })
             .collect();
         assert_eq!(touching, ["r4:Tokio:Rust!:2"]);
         assert!(entities

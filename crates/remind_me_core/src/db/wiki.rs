@@ -210,9 +210,8 @@ mod tests {
         wiki.upsert(&titled("y", "Alpha", T2)).unwrap();
         wiki.upsert(&titled("z", "alpha2", T2)).unwrap();
 
-        let slugs = |pages: Vec<WikiPage>| -> Vec<String> {
-            pages.into_iter().map(|p| p.slug).collect()
-        };
+        let slugs =
+            |pages: Vec<WikiPage>| -> Vec<String> { pages.into_iter().map(|p| p.slug).collect() };
         assert_eq!(
             slugs(wiki.recent_first_then_title().unwrap()),
             ["y", "z", "x"]
@@ -260,13 +259,30 @@ mod tests {
             .unwrap();
         let slugs: Vec<&str> = hits.iter().map(|h| h.slug.as_str()).collect();
         assert_eq!(slugs.len(), 3, "{slugs:?}");
-        assert!(!slugs.contains(&"unrelated"), "the rewrite took 'borrowing' out");
-        assert_eq!(slugs[0], "ownership", "the page matching both terms ranks first");
         assert!(
-            hits.iter().all(|h| h.snippet.contains('[') && h.snippet.contains(']')),
+            !slugs.contains(&"unrelated"),
+            "the rewrite took 'borrowing' out"
+        );
+        assert_eq!(
+            slugs[0], "ownership",
+            "the page matching both terms ranks first"
+        );
+        assert!(
+            hits.iter()
+                .all(|h| h.snippet.contains('[') && h.snippet.contains(']')),
             "every hit brackets a matched term: {hits:?}"
         );
-        assert_eq!(wiki.search(&crate::fts::query_phrases("nothing here"), 10).unwrap().len(), 0);
-        assert_eq!(wiki.search(&crate::fts::query_phrases("borrowing"), 1).unwrap().len(), 1);
+        assert_eq!(
+            wiki.search(&crate::fts::query_phrases("nothing here"), 10)
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            wiki.search(&crate::fts::query_phrases("borrowing"), 1)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

@@ -113,7 +113,11 @@ fn check_core(db: &Database) {
     let m3 = &got[2];
     assert_eq!(m3.deleted_at.as_deref(), Some(T2));
     assert_eq!(
-        (m3.subject.as_deref(), m3.predicate.as_deref(), m3.object.as_deref()),
+        (
+            m3.subject.as_deref(),
+            m3.predicate.as_deref(),
+            m3.object.as_deref()
+        ),
         (Some("s"), Some("p"), Some("o"))
     );
     let mut live: Vec<String> = memories
@@ -130,7 +134,9 @@ fn check_core(db: &Database) {
         Some(serde_json::Value::from(1))
     );
     assert_eq!(
-        testing::memory_text(&store, "m1", "tags").unwrap().as_deref(),
+        testing::memory_text(&store, "m1", "tags")
+            .unwrap()
+            .as_deref(),
         Some(r#"["a","b"]"#)
     );
 
@@ -144,8 +150,16 @@ fn check_core(db: &Database) {
     assert_eq!(
         names,
         [
-            ("e1".to_string(), "Ada".to_string(), vec!["Ada!".to_string()]),
-            ("e2".to_string(), "Babbage".to_string(), vec!["Babbage!".to_string()]),
+            (
+                "e1".to_string(),
+                "Ada".to_string(),
+                vec!["Ada!".to_string()]
+            ),
+            (
+                "e2".to_string(),
+                "Babbage".to_string(),
+                vec!["Babbage!".to_string()]
+            ),
         ]
     );
     assert_eq!(
@@ -157,7 +171,10 @@ fn check_core(db: &Database) {
     );
     let relations = entities.relations_oldest_first().unwrap();
     assert_eq!(relations.len(), 1);
-    assert_eq!((relations[0].id.as_str(), relations[0].relation.as_str()), ("r1", "knew"));
+    assert_eq!(
+        (relations[0].id.as_str(), relations[0].relation.as_str()),
+        ("r1", "knew")
+    );
 
     // Sync was on while the fixture was written, so every write queued.
     let outbox = Outbox::new(&store);
@@ -180,13 +197,19 @@ fn check_core(db: &Database) {
         [("hub".to_string(), 1, T2.to_string())]
     );
     assert_eq!(
-        SyncState::new(&store).flag("sync_enabled").unwrap().as_deref(),
+        SyncState::new(&store)
+            .flag("sync_enabled")
+            .unwrap()
+            .as_deref(),
         Some("1")
     );
 
     let events = Feedback::new(&store).events("m1").unwrap();
     assert_eq!(events.len(), 1);
-    assert_eq!((events[0].signal.as_str(), events[0].magnitude), ("helpful", 0.5));
+    assert_eq!(
+        (events[0].signal.as_str(), events[0].magnitude),
+        ("helpful", 0.5)
+    );
     assert_eq!(testing::feedback_queries(&store, "m1").unwrap(), ["Q T"]);
     let co = Related::new(&store).co_retrieved(&ids).unwrap();
     assert_eq!(co.len(), 1);
@@ -204,9 +227,15 @@ fn check_core(db: &Database) {
         [("model".to_string(), "tiny".to_string())]
     );
     let ledger = ImportLedger::new(&store);
-    assert_eq!(ledger.chat_import_with_hash("h").unwrap().as_deref(), Some("imp"));
+    assert_eq!(
+        ledger.chat_import_with_hash("h").unwrap().as_deref(),
+        Some("imp")
+    );
     let tracked = ledger.dbs_tracked("src", &["x1"]).unwrap();
-    assert_eq!(tracked[&("src".to_string(), "x1".to_string())].memory_id, "m1");
+    assert_eq!(
+        tracked[&("src".to_string(), "x1".to_string())].memory_id,
+        "m1"
+    );
     assert_eq!(ledger.imported_drawers(&["d1"]).unwrap(), ["d1"]);
 
     for (table, n) in [
@@ -235,7 +264,10 @@ fn check_groups(db: &Database) {
     let searches = SavedSearches::new(&store);
     let listed = searches.list().unwrap();
     assert_eq!(listed.len(), 1);
-    assert_eq!((listed[0].id.as_str(), listed[0].name.as_str()), ("ss1", "watched"));
+    assert_eq!(
+        (listed[0].id.as_str(), listed[0].name.as_str()),
+        ("ss1", "watched")
+    );
     assert!(listed[0].watch);
     assert_eq!(listed[0].filters.category.as_deref(), Some("general"));
     assert!(listed[0].filters.include_sensitive);
@@ -250,11 +282,21 @@ fn check_groups(db: &Database) {
     assert_eq!((span.byte_start, span.byte_end), (10, 42));
     assert_eq!(archives.span_count(None).unwrap(), 2);
     let hub = SyncState::new(&store).remote_row("hub").unwrap().unwrap();
-    assert_eq!((hub.last_pull.as_str(), hub.last_pull_id.as_str(), hub.last_pull_seq), (T1, "m1", 7));
+    assert_eq!(
+        (
+            hub.last_pull.as_str(),
+            hub.last_pull_id.as_str(),
+            hub.last_pull_seq
+        ),
+        (T1, "m1", 7)
+    );
     let stats = StoreStats::new(&store);
     let snapshots = stats.snapshots().unwrap();
     assert_eq!(snapshots.len(), 2);
-    assert_eq!((snapshots[0].total_memories, snapshots[1].total_memories), (3, 5));
+    assert_eq!(
+        (snapshots[0].total_memories, snapshots[1].total_memories),
+        (3, 5)
+    );
     assert_eq!(stats.snapshot_on("2026-02-01").unwrap(), Some(2));
     let revisions = Revisions::new(&store);
     let listed = revisions.list("m1", 10).unwrap();
@@ -263,7 +305,10 @@ fn check_groups(db: &Database) {
     assert_eq!(listed[0].sensitive, None);
     assert_eq!(listed[1].sensitive, Some(true));
     assert_eq!(
-        revisions.revision("m1", listed[1].id).unwrap().map(|t| t.content),
+        revisions
+            .revision("m1", listed[1].id)
+            .unwrap()
+            .map(|t| t.content),
         Some(format!("before {T1}"))
     );
     let wiki = WikiIndex::new(&store);
@@ -273,7 +318,10 @@ fn check_groups(db: &Database) {
         .into_iter()
         .map(|p| (p.slug, p.mtime))
         .collect();
-    assert_eq!(pages, [("alpha".to_string(), 12.5), ("beta".to_string(), 12.5)]);
+    assert_eq!(
+        pages,
+        [("alpha".to_string(), 12.5), ("beta".to_string(), 12.5)]
+    );
     assert_eq!(wiki.link_count("alpha").unwrap(), 2);
     let hits: Vec<String> = wiki
         .search(&["quokkas".to_string()], 10)
@@ -281,7 +329,13 @@ fn check_groups(db: &Database) {
         .into_iter()
         .map(|h| h.snippet)
         .collect();
-    assert_eq!(hits, ["Alpha page mentions [quokkas]", "Beta page mentions [quokkas]"]);
+    assert_eq!(
+        hits,
+        [
+            "Alpha page mentions [quokkas]",
+            "Beta page mentions [quokkas]"
+        ]
+    );
     assert_eq!(wiki.meta("compiled_at").unwrap().as_deref(), Some(T2));
 }
 

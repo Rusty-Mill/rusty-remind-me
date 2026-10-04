@@ -62,7 +62,12 @@ impl<'c> Reminders<'c> {
         remind_at: &str,
         delivered_at: &str,
     ) -> Result<()> {
-        engine::reminders::record_delivery(&mut self.core.lock(), memory_id, remind_at, delivered_at)
+        engine::reminders::record_delivery(
+            &mut self.core.lock(),
+            memory_id,
+            remind_at,
+            delivered_at,
+        )
     }
 }
 
@@ -138,6 +143,9 @@ mod tests {
             .iter()
             .map(|id| format!("{id}:{}", reminders.is_live(id).unwrap()))
             .collect();
-        assert_eq!(live, ["past:true", "none:true", "gone:false", "missing:false"]);
+        assert_eq!(
+            live,
+            ["past:true", "none:true", "gone:false", "missing:false"]
+        );
     }
 }

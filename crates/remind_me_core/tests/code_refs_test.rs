@@ -454,8 +454,13 @@ fn a_hand_written_code_ref_outside_the_roots_is_never_stat_against() {
             "size": 0,
         }]
     });
-    remind_me_core::testing::set_memory_column(&store, &memory_id, "metadata", injected.to_string())
-        .unwrap();
+    remind_me_core::testing::set_memory_column(
+        &store,
+        &memory_id,
+        "metadata",
+        injected.to_string(),
+    )
+    .unwrap();
 
     let candidates = stale_candidates(&store, 20).unwrap().candidates;
     assert!(

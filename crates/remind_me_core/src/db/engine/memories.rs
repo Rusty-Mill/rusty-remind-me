@@ -1037,10 +1037,7 @@ pub(crate) fn with_valid_until(tables: &EngineTables) -> Result<Vec<(String, Str
 /// the not-deleted memories carrying the capture id its `source_capture_id`
 /// names; a capture's `derived` are the not-deleted memories whose
 /// `source_capture_id` is its capture id.
-pub(crate) fn capture_links(
-    tables: &EngineTables,
-    id: &str,
-) -> Result<(Vec<String>, Vec<String>)> {
+pub(crate) fn capture_links(tables: &EngineTables, id: &str) -> Result<(Vec<String>, Vec<String>)> {
     let core = core_ref(tables)?;
     let Some(row) = row(core, id) else {
         return Ok((Vec::new(), Vec::new()));

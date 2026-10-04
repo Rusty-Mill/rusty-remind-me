@@ -237,7 +237,10 @@ mod tests {
         assert_eq!(rows[1]["gone"], Value::Null);
 
         let one = db
-            .query_one("SELECT name FROM t WHERE flag = ? AND score > ?", &[Value::from(0), Value::from(1.0)])
+            .query_one(
+                "SELECT name FROM t WHERE flag = ? AND score > ?",
+                &[Value::from(0), Value::from(1.0)],
+            )
             .unwrap()
             .unwrap();
         assert_eq!(one["name"], Value::from("b"));

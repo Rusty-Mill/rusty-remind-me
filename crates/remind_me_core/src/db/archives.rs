@@ -67,7 +67,10 @@ impl<'c> Archives<'c> {
 
     /// Where `memory_id`'s bytes are, if it has a span in a recorded archive.
     pub fn span_source(&self, memory_id: &str) -> Result<Option<SpanSource>> {
-        Ok(engine::archives::span_source(&self.engine.lock(), memory_id))
+        Ok(engine::archives::span_source(
+            &self.engine.lock(),
+            memory_id,
+        ))
     }
 
     /// The archive path and content hash recorded for `import_id`.

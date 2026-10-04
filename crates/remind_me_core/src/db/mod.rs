@@ -334,7 +334,10 @@ impl Database {
     /// Where a background thread reaches this database's tables without
     /// its lock. `None` for an in-memory database.
     pub fn secondary_source(&self) -> Option<SecondarySource> {
-        Some(SecondarySource::new(self.path.clone()?, self.engine.clone()))
+        Some(SecondarySource::new(
+            self.path.clone()?,
+            self.engine.clone(),
+        ))
     }
 
     /// The shared engine tables, for a test that builds its own

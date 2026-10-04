@@ -77,7 +77,8 @@ fn live(row: &MemoryRow) -> bool {
 /// A decision that was reverted or abandoned: no longer grounds for
 /// anything built on it.
 fn discredited(row: &MemoryRow) -> bool {
-    row.memory_type == "decision" && matches!(row.outcome.as_deref(), Some("reverted" | "abandoned"))
+    row.memory_type == "decision"
+        && matches!(row.outcome.as_deref(), Some("reverted" | "abandoned"))
 }
 
 /// Ids of promoted memories with at least one discredited source.
