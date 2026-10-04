@@ -7,14 +7,14 @@
 //! it replaced), so a long session is one capture, not one per turn.
 //!
 //! Parsing reuses the chat importer's envelope reader
-//! ([`crate::importer::extract_messages`]), so the transcript's text, times
+//! ([`crate::importer::extract_messages_with_tools`]), so the transcript's text, times
 //! and tool calls are read the same way an import reads them.
 
 use crate::capture::{auto_capture_stamped, get_capture, CaptureStamp};
 use crate::db::memories::{Memories, MemoryEdit};
 use crate::db::{Result, Store, StoreError};
 use crate::history::{capture_revision, TrackedChanges};
-use crate::importer::{extract_messages, ChatMessage};
+use crate::importer::{extract_messages_with_tools, ChatMessage};
 use crate::models::AutoCaptureInput;
 use chrono::Utc;
 use std::collections::BTreeMap;
@@ -63,7 +63,7 @@ pub fn parse(raw: &str) -> TranscriptSummary {
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
         // Hook-injected context, not something the user or model said.
         .filter(|v| v.get("isMeta").and_then(|m| m.as_bool()) != Some(true))
-        .flat_map(|v| extract_messages(&v))
+        .flat_map(|v| extract_messages_with_tools(&v))
         .collect();
 
     let mut tool_counts: BTreeMap<String, usize> = BTreeMap::new();

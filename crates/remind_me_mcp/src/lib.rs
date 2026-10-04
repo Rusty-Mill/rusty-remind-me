@@ -3438,7 +3438,11 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let server = McpServer::new(db);
 
-        let listed = call(&server, "remind_me_session_timeline", json!({}));
+        let listed = call(
+            &server,
+            "remind_me_session_timeline",
+            json!({ "response_format": "markdown" }),
+        );
         assert!(listed.get("isError").is_none(), "{listed}");
         assert!(text_of(&listed).contains("No sessions recorded"));
 

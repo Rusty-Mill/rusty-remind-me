@@ -324,6 +324,15 @@ fn push_envelope(
     out.push(message);
 }
 
+/// The messages of [`extract_messages_with_tools`] that have text: a message
+/// of nothing but tool calls yields no entry here.
+pub fn extract_messages(data: &serde_json::Value) -> Vec<ChatMessage> {
+    extract_messages_with_tools(data)
+        .into_iter()
+        .filter(|m| !m.content.is_empty())
+        .collect()
+}
+
 /// Pull messages out of whatever JSON shape the export uses.
 ///
 /// Handles a bare `{role, content}`, a list of them, a `{messages: [...]}`
@@ -331,10 +340,14 @@ fn push_envelope(
 /// transcripts (one `{"type": …, "message": {…}}` envelope per JSONL line),
 /// and a list of conversations containing either.
 ///
+/// This variant also keeps a message that is only tool calls, with its
+/// [`ChatMessage::tool_use`] summaries, which is how the `conversations`
+/// mode and the transcript capture see them. [`extract_messages`] drops it.
+///
 /// Records carrying a `record_type` are **entity-graph records from an
 /// export**, not messages, and are skipped here — they are restored
 /// separately by [`restore_graph_records`].
-pub fn extract_messages(data: &serde_json::Value) -> Vec<ChatMessage> {
+pub fn extract_messages_with_tools(data: &serde_json::Value) -> Vec<ChatMessage> {
     let mut messages = Vec::new();
 
     if let Some(object) = data.as_object() {
@@ -380,10 +393,10 @@ pub fn extract_messages(data: &serde_json::Value) -> Vec<ChatMessage> {
             }
         }
         if let Some(inner) = object.get("messages") {
-            return extract_messages(inner);
+            return extract_messages_with_tools(inner);
         }
         if object.contains_key("role") || object.contains_key("sender") {
-            return extract_messages(&serde_json::Value::Array(vec![data.clone()]));
+            return extract_messages_with_tools(&serde_json::Value::Array(vec![data.clone()]));
         }
     }
 
@@ -396,7 +409,7 @@ pub fn extract_messages(data: &serde_json::Value) -> Vec<ChatMessage> {
                 continue;
             }
             if object.contains_key("messages") || object.contains_key("chat_messages") {
-                messages.extend(extract_messages(item));
+                messages.extend(extract_messages_with_tools(item));
             } else if object.contains_key("role") || object.contains_key("sender") {
                 let role = object
                     .get("role")
@@ -794,7 +807,7 @@ fn parse_chat(
                 });
                 if conversations {
                     for conversation in data.as_array().unwrap() {
-                        let messages = extract_messages(conversation);
+                        let messages = extract_messages_with_tools(conversation);
                         let columns = Some(ExportedColumns::from_messages(&messages));
                         contents.extend(
                             filter_messages(&messages, extract_mode)
@@ -814,13 +827,13 @@ fn parse_chat(
                     for record in records.iter().filter(|r| r.get("record_type").is_none()) {
                         let exported = ExportedColumns::from_record(record);
                         contents.extend(
-                            filter_messages(&extract_messages(record), extract_mode)
+                            filter_messages(&extract_messages_with_tools(record), extract_mode)
                                 .into_iter()
                                 .map(|c| (c, None, exported.clone())),
                         );
                     }
                 } else {
-                    let messages = extract_messages(&data);
+                    let messages = extract_messages_with_tools(&data);
                     let columns = Some(ExportedColumns::from_messages(&messages));
                     contents.extend(
                         filter_messages(&messages, extract_mode)
@@ -853,7 +866,7 @@ fn parse_chat(
                 // The span covers the whole line, including the blocks
                 // `text_of` dropped — recovering those is the entire point.
                 let span = Some((start, offset));
-                let messages = extract_messages(&value);
+                let messages = extract_messages_with_tools(&value);
                 // A session envelope also carries `cwd`, which is one of the
                 // exported columns, so it must not be read as an export.
                 let is_envelope = value.get("message").is_some_and(|m| m.is_object());

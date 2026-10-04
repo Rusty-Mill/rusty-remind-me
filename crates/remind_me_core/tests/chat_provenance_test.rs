@@ -3,7 +3,7 @@
 
 use remind_me_core::db::memories::Memories;
 use remind_me_core::db::sessions::Sessions;
-use remind_me_core::importer::{extract_messages, import_chat};
+use remind_me_core::importer::{extract_messages_with_tools, import_chat};
 use remind_me_core::{ChatImportInput, Database, ImportKind, ImportOutcome, Memory};
 
 fn scratch(name: &str) -> std::path::PathBuf {
@@ -79,7 +79,7 @@ fn messages_carry_time_session_place_and_tool_summaries() {
             {"type": "tool_result", "tool_use_id": "t1", "is_error": true, "content": "boom"}
         ]),
     );
-    let messages = extract_messages(&serde_json::from_str(&line).unwrap());
+    let messages = extract_messages_with_tools(&serde_json::from_str(&line).unwrap());
     assert_eq!(messages.len(), 1, "a tool-only message is kept");
     let m = &messages[0];
     assert_eq!(m.timestamp.as_deref(), Some("2026-10-04T09:00:05.000Z"));
