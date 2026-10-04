@@ -300,6 +300,65 @@ impl StructuredFields {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Markdown extras
+// ---------------------------------------------------------------------------
+
+/// What a memory's header line says beyond its id: reduced confidence, a
+/// validity window (`expired` once it has passed) and an outcome. Empty for
+/// an ordinary memory, so the reference layout is untouched for those.
+pub fn header_marks(m: &crate::models::Memory, now: chrono::DateTime<chrono::Utc>) -> Vec<String> {
+    let mut marks = Vec::new();
+    if m.confidence < 1.0 {
+        marks.push(format!("confidence {:.2}", m.confidence));
+    }
+    if let Some(until) = &m.valid_until {
+        if crate::retrieval::is_expired(now, Some(until)) {
+            marks.push("expired".to_string());
+        } else {
+            marks.push(format!("valid until {until}"));
+        }
+    }
+    if let Some(outcome) = &m.outcome {
+        marks.push(format!("outcome: {outcome}"));
+    }
+    marks
+}
+
+/// The kind-specific lines of a memory, one per extra: a decision's
+/// rationale and alternatives, an action item's due date and status.
+pub fn kind_lines(m: &crate::models::Memory) -> Vec<String> {
+    let kind = m.memory_type.as_deref().and_then(|t| t.parse::<MemoryKind>().ok());
+    let text = |key: &str| m.metadata.get(key).and_then(Value::as_str);
+    let mut lines = Vec::new();
+    match kind {
+        Some(MemoryKind::Decision) => {
+            if let Some(r) = text("rationale") {
+                lines.push(format!("**Rationale:** {r}"));
+            }
+            let alternatives: Vec<&str> = m
+                .metadata
+                .get("alternatives")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            if !alternatives.is_empty() {
+                lines.push(format!("**Alternatives:** {}", alternatives.join("; ")));
+            }
+        }
+        Some(MemoryKind::ActionItem) => {
+            let mut parts = Vec::new();
+            if let Some(due) = text("due") {
+                parts.push(format!("**Due:** {due}"));
+            }
+            parts.push(format!("**Status:** {}", text("status").unwrap_or("open")));
+            lines.push(parts.join("  |  "));
+        }
+        _ => {}
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,6 +460,64 @@ mod tests {
             .validate(&m, None)
             .unwrap_err();
         assert!(e.to_string().contains("outcome"));
+    }
+
+    fn memory(kind: &str, metadata: Value) -> crate::models::Memory {
+        let mut row = crate::db::memories::NewMemory::new("m", "c", "2026-01-01T00:00:00Z");
+        row.memory_type = kind.to_string();
+        row.metadata = metadata;
+        serde_json::from_value(json!({
+            "id": "m", "content": "c", "category": "general", "tags": [], "source": "manual",
+            "metadata": row.metadata, "created_at": "t", "updated_at": "t",
+            "capture_id": null, "subject": null, "predicate": null, "object": null,
+            "superseded_by": null, "decay_rate": 0.1, "vitality": 1.0, "base_weight": 1.0,
+            "access_count": 0, "accessed_at": "t", "doc_id": null, "chunk_index": null,
+            "remind_at": null, "sensitive": false, "memory_type": row.memory_type,
+            "status": null, "node_id": null, "client": null, "source_capture_id": null,
+            "deleted_at": null
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn an_ordinary_memory_renders_no_extras() {
+        let m = memory("fact", json!({}));
+        assert!(header_marks(&m, chrono::Utc::now()).is_empty());
+        assert!(kind_lines(&m).is_empty());
+    }
+
+    #[test]
+    fn header_marks_show_confidence_window_and_outcome() {
+        let now = chrono::Utc::now();
+        let mut m = memory("decision", json!({}));
+        m.confidence = 0.5;
+        m.valid_until = Some("2020-01-01T00:00:00Z".into());
+        m.outcome = Some("reverted".into());
+        assert_eq!(
+            header_marks(&m, now),
+            vec!["confidence 0.50", "expired", "outcome: reverted"]
+        );
+        m.valid_until = Some("2099-01-01T00:00:00Z".into());
+        assert!(header_marks(&m, now)[1].starts_with("valid until 2099"));
+    }
+
+    #[test]
+    fn decision_and_action_item_lines_are_one_per_extra() {
+        let d = memory(
+            "decision",
+            json!({"rationale": "one store", "alternatives": ["sqlite", "pg"]}),
+        );
+        assert_eq!(
+            kind_lines(&d),
+            vec!["**Rationale:** one store", "**Alternatives:** sqlite; pg"]
+        );
+        let a = memory("action_item", json!({"due": "2026-10-05T09:00:00Z"}));
+        assert_eq!(
+            kind_lines(&a),
+            vec!["**Due:** 2026-10-05T09:00:00Z  |  **Status:** open"]
+        );
+        let a = memory("action_item", json!({"status": "done"}));
+        assert_eq!(kind_lines(&a), vec!["**Status:** done"]);
     }
 
     #[test]
