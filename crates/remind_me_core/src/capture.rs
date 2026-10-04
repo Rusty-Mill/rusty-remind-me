@@ -14,9 +14,9 @@ use crate::entity::{
 };
 use crate::models::{
     AutoCaptureInput, Capture, CaptureResult, DecomposeBatchInput, DecomposeBatchResult,
-    DecomposeInput, DecomposeResult, Memory, UndecomposedCapture, CAPTURE_SOURCE,
+    DecomposeInput, DecomposeResult, Memory, UndecomposedCapture, WriteContext, CAPTURE_SOURCE,
     CAPTURE_TITLE_CHARS, DECOMPOSE_BATCH_MAX, DECOMPOSE_BATCH_MIN, DECOMPOSITION_SOURCE,
-    DIALOG_CATEGORY, FACT_CATEGORY, UNCLASSIFIED, WriteContext,
+    DIALOG_CATEGORY, FACT_CATEGORY, UNCLASSIFIED,
 };
 use crate::vitality::{calculate_vitality, get_decay_rate, get_source_prior, get_type_prior};
 use chrono::Utc;

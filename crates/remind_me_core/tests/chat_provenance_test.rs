@@ -29,7 +29,11 @@ fn envelope(role: &str, ts: &str, content: serde_json::Value) -> String {
 
 fn fixture() -> String {
     [
-        envelope("user", "2026-10-04T09:00:00.000Z", serde_json::json!("fix the flaky test")),
+        envelope(
+            "user",
+            "2026-10-04T09:00:00.000Z",
+            serde_json::json!("fix the flaky test"),
+        ),
         envelope(
             "assistant",
             "2026-10-04T09:00:05.000Z",
@@ -104,9 +108,15 @@ fn an_import_stamps_each_memory_and_is_idempotent() {
     assert_eq!(first.project.as_deref(), Some("quokka"));
     assert_eq!(first.written_by, "importer:chat");
     assert_eq!(first.capture_method, "auto");
-    assert_eq!(first.created_at, "2026-10-04T09:00:00.000Z", "the message's own time");
+    assert_eq!(
+        first.created_at, "2026-10-04T09:00:00.000Z",
+        "the message's own time"
+    );
     assert_ne!(first.updated_at, first.created_at);
-    assert!(!rows[1].content.contains("cargo test"), "tool blocks are not stored in this mode");
+    assert!(
+        !rows[1].content.contains("cargo test"),
+        "tool blocks are not stored in this mode"
+    );
     assert!(Sessions::new(&db.store()).get("sess-1").unwrap().is_some());
 
     let again = run(&db, &path, "all_messages");
@@ -123,7 +133,11 @@ fn tool_calls_are_summarised_in_the_conversations_mode_only() {
         .lines()
         .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["message"].clone())
         .collect();
-    std::fs::write(&path, serde_json::json!([{ "messages": messages }]).to_string()).unwrap();
+    std::fs::write(
+        &path,
+        serde_json::json!([{ "messages": messages }]).to_string(),
+    )
+    .unwrap();
     let db = Database::open_in_memory().unwrap();
 
     run(&db, &path, "conversations");

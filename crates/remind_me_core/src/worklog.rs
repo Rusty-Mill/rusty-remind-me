@@ -111,7 +111,11 @@ pub fn build(cwd: &Path, start_sha: Option<&str>) -> Option<WorkLog> {
             deleted,
         })
         .collect();
-    files.sort_by(|a, b| (b.added + b.deleted).cmp(&(a.added + a.deleted)).then(a.path.cmp(&b.path)));
+    files.sort_by(|a, b| {
+        (b.added + b.deleted)
+            .cmp(&(a.added + a.deleted))
+            .then(a.path.cmp(&b.path))
+    });
     Some(WorkLog {
         files_changed: files.len(),
         insertions: files.iter().map(|f| f.added).sum(),
@@ -126,7 +130,10 @@ pub fn build(cwd: &Path, start_sha: Option<&str>) -> Option<WorkLog> {
 /// A compact Markdown body: a summary line, then at most
 /// [`MAX_FILE_LINES`] file lines and "+N more".
 pub fn render_markdown(log: &WorkLog) -> String {
-    let short = |sha: &Option<String>| sha.as_deref().map(|s| s.chars().take(7).collect::<String>());
+    let short = |sha: &Option<String>| {
+        sha.as_deref()
+            .map(|s| s.chars().take(7).collect::<String>())
+    };
     let at = match (&log.branch, short(&log.head)) {
         (Some(b), Some(h)) => format!("{b} @ {h}"),
         (Some(b), None) => b.clone(),
@@ -153,7 +160,8 @@ mod tests {
 
     /// A fresh repository with one commit, or `None` when git is missing.
     fn repo() -> Option<PathBuf> {
-        let dir = std::env::temp_dir().join(format!("rrm_worklog_{}", uuid::Uuid::new_v4().simple()));
+        let dir =
+            std::env::temp_dir().join(format!("rrm_worklog_{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).ok()?;
         git(&dir, &["init", "-q"])?;
         std::fs::write(dir.join("a.txt"), "one\ntwo\n").ok()?;
@@ -192,7 +200,10 @@ mod tests {
 
         let log = build(&dir, Some(&start)).unwrap();
         assert_eq!(log.files_changed, 2);
-        assert_eq!(log.insertions, 4, "3 committed in b.txt + 1 unstaged in a.txt");
+        assert_eq!(
+            log.insertions, 4,
+            "3 committed in b.txt + 1 unstaged in a.txt"
+        );
         assert_eq!(log.deletions, 0);
         assert_eq!(log.untracked, 1);
         assert_eq!(log.files[0].path, "b.txt", "largest change first");
@@ -208,7 +219,8 @@ mod tests {
         assert_eq!(build(&dir, None), None);
         let _ = std::fs::remove_dir_all(&dir);
 
-        let bare = std::env::temp_dir().join(format!("rrm_notrepo_{}", uuid::Uuid::new_v4().simple()));
+        let bare =
+            std::env::temp_dir().join(format!("rrm_notrepo_{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&bare).unwrap();
         assert_eq!(build(&bare, None), None);
         let _ = std::fs::remove_dir_all(&bare);
@@ -233,7 +245,10 @@ mod tests {
             branch: Some("main".into()),
         };
         let text = render_markdown(&log);
-        assert_eq!(text.lines().filter(|l| l.starts_with("- ")).count(), MAX_FILE_LINES);
+        assert_eq!(
+            text.lines().filter(|l| l.starts_with("- ")).count(),
+            MAX_FILE_LINES
+        );
         assert!(text.ends_with("+5 more"));
         assert!(text.contains("main @ abcdef0"));
     }

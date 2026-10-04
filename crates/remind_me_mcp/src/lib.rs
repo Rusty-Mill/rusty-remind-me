@@ -849,6 +849,19 @@ impl McpServer {
                                 }
                             },
                             {
+                                "name": "remind_me_session_timeline",
+                                "description": "A client session as an episode. With session_id: the session's start and end, branch and shas, then every memory written under it (captures, facts, the work log) oldest first. Without: the most recent sessions, newest first, each with how many memories it wrote.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "session_id": { "type": "string", "description": "One session to read in full. Omit to list recent sessions." },
+                                        "project": { "type": "string", "description": "When listing, only sessions of this project." },
+                                        "limit": { "type": "integer", "minimum": 1, "default": 10, "description": "When listing, how many sessions." },
+                                        "response_format": { "type": "string", "enum": ["markdown", "json"] }
+                                    }
+                                }
+                            },
+                            {
                                 "name": "remind_me_skeleton_write",
                                 "description": "Attach a Mermaid diagram of a capture's structure, so the conversation's shape can be read without reading the transcript. Each node maps to an inclusive, 1-based line range in the capture's dialog; remind_me_skeleton_read then drills into one node at a time. Ranges are validated against the dialog and the write is refused if any is out of bounds.",
                                 "inputSchema": {
@@ -2141,6 +2154,26 @@ impl McpServer {
                             }
                         }
                     }
+                    "remind_me_session_timeline" => {
+                        let text_arg = |key: &str| args.get(key).and_then(|v| v.as_str());
+                        let limit = args
+                            .get("limit")
+                            .and_then(|v| v.as_u64())
+                            .map(|n| n as usize)
+                            .unwrap_or(remind_me_core::session_ops::DEFAULT_TIMELINE_LIMIT);
+                        match remind_me_core::session_ops::timeline_text(
+                            &store,
+                            text_arg("session_id"),
+                            text_arg("project"),
+                            limit,
+                            matches!(format, ResponseFormat::Markdown),
+                        ) {
+                            Ok(text) => json!({ "content": [{ "type": "text", "text": text }] }),
+                            Err(e) => {
+                                json!({ "isError": true, "content": [{ "type": "text", "text": format!("Session timeline error: {}", e) }] })
+                            }
+                        }
+                    }
                     "remind_me_skeleton_write" => {
                         let parsed: std::result::Result<remind_me_core::SkeletonWriteInput, _> =
                             serde_json::from_value(args.clone());
@@ -3390,9 +3423,39 @@ mod tests {
             .map(|t| t["name"].as_str().unwrap())
             .collect();
 
-        for expected in ["remind_me_list", "remind_me_update", "remind_me_delete"] {
+        for expected in [
+            "remind_me_list",
+            "remind_me_update",
+            "remind_me_delete",
+            "remind_me_session_timeline",
+        ] {
             assert!(names.contains(&expected), "{} not in tools/list", expected);
         }
+    }
+
+    #[test]
+    fn test_session_timeline_answers_for_an_empty_store_and_an_unknown_session() {
+        let db = Database::open_in_memory().unwrap();
+        let server = McpServer::new(db);
+
+        let listed = call(&server, "remind_me_session_timeline", json!({}));
+        assert!(listed.get("isError").is_none(), "{listed}");
+        assert!(text_of(&listed).contains("No sessions recorded"));
+
+        let as_json = call(
+            &server,
+            "remind_me_session_timeline",
+            json!({ "response_format": "json", "limit": 3 }),
+        );
+        let parsed: Value = serde_json::from_str(&text_of(&as_json)).unwrap();
+        assert_eq!(parsed["count"], 0);
+
+        let unknown = call(
+            &server,
+            "remind_me_session_timeline",
+            json!({ "session_id": "nope" }),
+        );
+        assert!(text_of(&unknown).contains("No session found"));
     }
 
     #[test]

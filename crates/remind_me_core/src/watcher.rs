@@ -193,11 +193,15 @@ pub fn configured_watch_dirs() -> Vec<PathBuf> {
 /// The transcripts directory when [`WATCH_CLAUDE_PROJECTS_ENV`] is `1` and a
 /// home directory is known, else empty.
 fn claude_projects_dir() -> Vec<PathBuf> {
-    if std::env::var(WATCH_CLAUDE_PROJECTS_ENV).as_deref() != Ok("1") {
+    let flag = std::env::var(WATCH_CLAUDE_PROJECTS_ENV).ok();
+    claude_projects_in(flag.as_deref(), dirs::home_dir())
+}
+
+fn claude_projects_in(flag: Option<&str>, home: Option<PathBuf>) -> Vec<PathBuf> {
+    if flag != Some("1") {
         return Vec::new();
     }
-    dirs::home_dir()
-        .map(|home| home.join(".claude").join("projects"))
+    home.map(|home| home.join(".claude").join("projects"))
         .into_iter()
         .collect()
 }
@@ -716,4 +720,21 @@ pub fn live_status() -> Option<WatchStatus> {
     let mut status = guard.status();
     status.running = alive;
     Some(status)
+}
+
+#[cfg(test)]
+mod claude_projects_tests {
+    use super::*;
+
+    #[test]
+    fn transcripts_are_watched_only_when_switched_on_and_home_is_known() {
+        let home = Some(PathBuf::from("/home/u"));
+        assert_eq!(
+            claude_projects_in(Some("1"), home.clone()),
+            vec![PathBuf::from("/home/u/.claude/projects")]
+        );
+        assert!(claude_projects_in(None, home.clone()).is_empty());
+        assert!(claude_projects_in(Some("0"), home).is_empty());
+        assert!(claude_projects_in(Some("1"), None).is_empty());
+    }
 }

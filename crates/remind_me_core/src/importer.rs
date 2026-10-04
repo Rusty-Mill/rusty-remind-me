@@ -316,8 +316,7 @@ fn push_envelope(
     }
     let mut message = ChatMessage::plain(role, text);
     message.timestamp = str_field(source, "timestamp").or_else(|| str_field(source, "created_at"));
-    message.session_id =
-        str_field(source, "sessionId").or_else(|| str_field(source, "session_id"));
+    message.session_id = str_field(source, "sessionId").or_else(|| str_field(source, "session_id"));
     message.uuid = str_field(source, "uuid");
     message.cwd = str_field(source, "cwd");
     message.git_branch = str_field(source, "gitBranch");
@@ -803,10 +802,11 @@ fn parse_chat(
                                 .map(|c| (c, None, columns.clone())),
                         );
                     }
-                } else if let Some(records) = data
-                    .as_array()
-                    .filter(|items| items.iter().any(|r| ExportedColumns::from_record(r).is_some()))
-                {
+                } else if let Some(records) = data.as_array().filter(|items| {
+                    items
+                        .iter()
+                        .any(|r| ExportedColumns::from_record(r).is_some())
+                }) {
                     // This crate's own export: one record per memory, each
                     // carrying the columns it was exported with. An array
                     // of plain messages, or an export from before v32, is

@@ -290,7 +290,10 @@ pub fn render_timeline(session: &SessionRecord, memories: &[Memory]) -> String {
     for m in memories {
         let first = m.content.lines().next().unwrap_or("");
         let head: String = first.chars().take(100).collect();
-        out.push_str(&format!("\n- {} [{}] {} ({})", m.created_at, m.category, head, m.id));
+        out.push_str(&format!(
+            "\n- {} [{}] {} ({})",
+            m.created_at, m.category, head, m.id
+        ));
     }
     out
 }
@@ -302,14 +305,26 @@ mod tests {
     use std::path::PathBuf;
 
     fn temp_repo() -> Option<PathBuf> {
-        let dir = std::env::temp_dir().join(format!("rrm_episode_{}", uuid::Uuid::new_v4().simple()));
+        let dir =
+            std::env::temp_dir().join(format!("rrm_episode_{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).ok()?;
         worklog::git(&dir, &["init", "-q"])?;
         std::fs::write(dir.join("a.txt"), "one\n").ok()?;
         worklog::git(&dir, &["add", "-A"])?;
         worklog::git(
             &dir,
-            &["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "c"],
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "c",
+            ],
         )?;
         Some(dir)
     }
@@ -322,7 +337,10 @@ mod tests {
         let first = start_session(&store, "s1", &dir, Some("claude-code")).unwrap();
         let again = start_session(&store, "s1", &dir, Some("claude-code")).unwrap();
         assert_eq!(first.started_at, again.started_at);
-        assert_eq!(first.start_sha.as_deref(), worklog::git(&dir, &["rev-parse", "HEAD"]).as_deref());
+        assert_eq!(
+            first.start_sha.as_deref(),
+            worklog::git(&dir, &["rev-parse", "HEAD"]).as_deref()
+        );
         assert_eq!(first.client, "claude-code");
         assert!(first.project.is_some());
         let _ = std::fs::remove_dir_all(&dir);
@@ -330,7 +348,8 @@ mod tests {
 
     #[test]
     fn start_outside_a_repository_has_no_sha() {
-        let dir = std::env::temp_dir().join(format!("rrm_norepo_{}", uuid::Uuid::new_v4().simple()));
+        let dir =
+            std::env::temp_dir().join(format!("rrm_norepo_{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         let db = Database::open_in_memory().unwrap();
         let record = start_session(&db.store(), "s1", &dir, None).unwrap();
@@ -349,7 +368,10 @@ mod tests {
 
         let ended = end_session(&store, "s1", &dir, Some("end")).unwrap();
         let id = ended.work_log_id.clone().unwrap();
-        assert_eq!(ended.session.work_log_memory_id.as_deref(), Some(id.as_str()));
+        assert_eq!(
+            ended.session.work_log_memory_id.as_deref(),
+            Some(id.as_str())
+        );
         assert!(ended.session.ended_at.is_some());
 
         let memories = session_memories(&store, "s1").unwrap();
@@ -377,7 +399,9 @@ mod tests {
         let ended = end_session(&store, "never-started", &dir, None).unwrap();
         assert!(ended.work_log_id.is_none() && ended.work_log.is_none());
         assert!(ended.session.ended_at.is_some());
-        assert!(session_memories(&store, "never-started").unwrap().is_empty());
+        assert!(session_memories(&store, "never-started")
+            .unwrap()
+            .is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -399,7 +423,9 @@ mod tests {
         let overview = recent_sessions(&store, 10, Some("quokka")).unwrap();
         assert_eq!(overview.len(), 1);
         assert_eq!(overview[0].memory_count, 1);
-        assert!(recent_sessions(&store, 10, Some("other")).unwrap().is_empty());
+        assert!(recent_sessions(&store, 10, Some("other"))
+            .unwrap()
+            .is_empty());
 
         let (session, memories) = timeline(&store, "s9").unwrap().unwrap();
         assert_eq!(memories.len(), 1);

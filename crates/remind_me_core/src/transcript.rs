@@ -138,8 +138,14 @@ impl TranscriptSummary {
         };
         format!(
             "First ask: {}\nLast reply: {}\nMessages: {}\nTools used: {}",
-            cut(self.first_user.as_deref().unwrap_or("(none)"), SUMMARY_PART_CHARS),
-            cut(self.last_assistant.as_deref().unwrap_or("(none)"), SUMMARY_PART_CHARS),
+            cut(
+                self.first_user.as_deref().unwrap_or("(none)"),
+                SUMMARY_PART_CHARS
+            ),
+            cut(
+                self.last_assistant.as_deref().unwrap_or("(none)"),
+                SUMMARY_PART_CHARS
+            ),
             self.messages,
             tools
         )
@@ -189,7 +195,10 @@ pub fn capture_transcript(
     if parsed.messages == 0 {
         return Err(StoreError::Invalid("transcript has no messages".into()));
     }
-    let cwd = request.cwd.map(Path::to_path_buf).or_else(|| parsed.cwd.as_deref().map(Into::into));
+    let cwd = request
+        .cwd
+        .map(Path::to_path_buf)
+        .or_else(|| parsed.cwd.as_deref().map(Into::into));
     let context = match &cwd {
         Some(dir) => crate::episodes::write_context(dir, Some(session_id)),
         None => crate::models::WriteContext {
@@ -258,8 +267,18 @@ fn recapture(
         ("messages", serde_json::json!(parsed.messages)),
         ("reason", serde_json::json!(reason)),
     ];
-    replace_text(store, dialog, &parsed.dialog, &with_keys(&dialog.metadata, &pairs))?;
-    replace_text(store, &summary, &parsed.summary(), &with_keys(&summary.metadata, &pairs))?;
+    replace_text(
+        store,
+        dialog,
+        &parsed.dialog,
+        &with_keys(&dialog.metadata, &pairs),
+    )?;
+    replace_text(
+        store,
+        &summary,
+        &parsed.summary(),
+        &with_keys(&summary.metadata, &pairs),
+    )?;
     Ok(TranscriptOutcome {
         capture_id,
         dialog_id: dialog.id.clone(),
@@ -342,7 +361,9 @@ mod tests {
         assert_eq!(p.tools, vec![("Bash".to_string(), 1)]);
         assert_eq!(p.session_id.as_deref(), Some("s1"));
         assert_eq!(p.cwd.as_deref(), Some("/work/quokka"));
-        assert!(p.dialog.contains("tool: Bash — cargo test -p remind_me_core"));
+        assert!(p
+            .dialog
+            .contains("tool: Bash — cargo test -p remind_me_core"));
         let summary = p.summary();
         assert!(summary.starts_with("First ask: fix the flaky test please\nLast reply: done"));
         assert!(summary.ends_with("Messages: 3\nTools used: Bash x1"));
@@ -351,14 +372,18 @@ mod tests {
     #[test]
     fn parse_truncates_title_and_dialog_and_skips_meta() {
         let long = "x".repeat(300);
-        let meta = serde_json::json!({"isMeta": true, "message": {"role": "user", "content": "injected"}});
+        let meta =
+            serde_json::json!({"isMeta": true, "message": {"role": "user", "content": "injected"}});
         let p = parse(&format!("{}\n{}", line("user", "s", &long), meta));
         assert_eq!(p.messages, 1);
         assert_eq!(p.title().chars().count(), TITLE_CHARS);
         let big = "y".repeat(MAX_DIALOG_CHARS + 50);
         let p = parse(&line("user", "s", &big));
         assert!(p.dialog.starts_with(TRUNCATION_MARKER));
-        assert_eq!(p.dialog.chars().count(), TRUNCATION_MARKER.chars().count() + MAX_DIALOG_CHARS);
+        assert_eq!(
+            p.dialog.chars().count(),
+            TRUNCATION_MARKER.chars().count() + MAX_DIALOG_CHARS
+        );
         assert_eq!(parse("").messages, 0);
     }
 
@@ -402,7 +427,10 @@ mod tests {
             .unwrap();
         assert_eq!(revisions.len(), 1);
         assert_eq!(revisions[0].revision_reason.as_deref(), Some("recapture"));
-        assert!(crate::db::sessions::Sessions::new(&store).get("s1").unwrap().is_some());
+        assert!(crate::db::sessions::Sessions::new(&store)
+            .get("s1")
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -410,12 +438,18 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let store = db.store();
         let a = capture_transcript(&store, &transcript(""), &request("stop")).unwrap();
-        let other = TranscriptRequest { session_id: "s2", ..request("stop") };
+        let other = TranscriptRequest {
+            session_id: "s2",
+            ..request("stop")
+        };
         let b = capture_transcript(&store, &transcript(""), &other).unwrap();
         assert_ne!(a.capture_id, b.capture_id);
 
         assert!(capture_transcript(&store, "", &request("stop")).is_err());
-        let blank = TranscriptRequest { session_id: " ", ..request("stop") };
+        let blank = TranscriptRequest {
+            session_id: " ",
+            ..request("stop")
+        };
         assert!(capture_transcript(&store, &transcript(""), &blank).is_err());
     }
 }

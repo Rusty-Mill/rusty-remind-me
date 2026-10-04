@@ -74,7 +74,11 @@ impl Section {
 }
 
 fn line_of(memory: &Memory) -> String {
-    let first = memory.content.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    let first = memory
+        .content
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("");
     let text: String = first.trim().chars().take(LINE_CHARS).collect();
     format!("- [{}] {} ({})", memory.category, text, memory.id)
 }
@@ -85,7 +89,10 @@ fn injectable(memory: &Memory, now: &str) -> bool {
     memory.superseded_by.is_none()
         && !memory.sensitive
         && memory.category != crate::models::DIALOG_CATEGORY
-        && memory.valid_until.as_deref().is_none_or(|until| until > now)
+        && memory
+            .valid_until
+            .as_deref()
+            .is_none_or(|until| until > now)
 }
 
 /// Filter on `project` in Rust over the memories.
@@ -111,7 +118,11 @@ fn reminders_section(store: &Store<'_>) -> Result<Section> {
     let horizon = (Utc::now() + Duration::days(REMINDER_DAYS)).to_rfc3339();
     let lines = crate::reminders::list_reminders(store, ReminderWindow::All, 50)?
         .iter()
-        .filter(|m| m.remind_at.as_deref().is_some_and(|at| at <= horizon.as_str()))
+        .filter(|m| {
+            m.remind_at
+                .as_deref()
+                .is_some_and(|at| at <= horizon.as_str())
+        })
         .map(|m| format!("- {}: {}", m.remind_at.as_deref().unwrap_or(""), line_of(m)))
         .collect();
     Ok(Section {
@@ -286,7 +297,9 @@ mod tests {
             r.git_branch = Some("feat".into());
             r.created_at = day(5);
         });
-        add(store, "mem_other_project", |r| r.project = Some("elsewhere".into()));
+        add(store, "mem_other_project", |r| {
+            r.project = Some("elsewhere".into())
+        });
         add(store, "mem_secret", |r| {
             r.project = Some("quokka".into());
             r.sensitive = true;
@@ -336,8 +349,14 @@ mod tests {
         assert!(!brief.context.contains("mem_expired"));
         let feature = brief.context.find("mem_feature").unwrap();
         let newest = brief.context.find("mem_new_main").unwrap();
-        assert!(feature < newest, "the branch's memory leads: {}", brief.context);
-        assert!(brief.context.starts_with("# Memory context (project: quokka, branch: feat)"));
+        assert!(
+            feature < newest,
+            "the branch's memory leads: {}",
+            brief.context
+        );
+        assert!(brief
+            .context
+            .starts_with("# Memory context (project: quokka, branch: feat)"));
         assert!(brief.dropped.is_empty());
     }
 

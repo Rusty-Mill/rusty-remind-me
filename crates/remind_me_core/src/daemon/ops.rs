@@ -10,7 +10,7 @@
 
 use crate::db::Store;
 use crate::models::{EntityInput, MemoryAddInput, MemoryListInput, MemorySearchInput};
-use crate::{db::queries, entity, stats, wiki, wiki_import};
+use crate::{db::queries, entity, session_ops, stats, wiki, wiki_import};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -48,6 +48,33 @@ pub enum Op {
         dir: PathBuf,
     },
     Stats,
+    /// The session subcommands (`crate::session_ops`). Paths are absolute.
+    SessionStart {
+        session_id: String,
+        cwd: PathBuf,
+        client: Option<String>,
+    },
+    SessionEnd {
+        session_id: String,
+        cwd: PathBuf,
+        reason: Option<String>,
+    },
+    CaptureTranscript {
+        path: PathBuf,
+        session_id: String,
+        cwd: Option<PathBuf>,
+        reason: Option<String>,
+    },
+    Context {
+        cwd: Option<PathBuf>,
+        project: Option<String>,
+        branch: Option<String>,
+        prompt: Option<String>,
+        budget: usize,
+    },
+    SessionTimeline {
+        session_id: String,
+    },
     /// The daemon's own state. Answered by the daemon, not [`execute`].
     Status,
     /// Stop the daemon. Answered by the daemon, not [`execute`].
@@ -99,6 +126,51 @@ fn run(store: &Store<'_>, op: &Op) -> Result<Value, String> {
             serde_json::to_value(report).map_err(|e| e.to_string())
         }
         Op::Stats => to_value(stats::collect(store)),
+        Op::SessionStart {
+            session_id,
+            cwd,
+            client,
+        } => session_ops::session_start(store, session_id, cwd, client.as_deref())
+            .map_err(|e| e.to_string()),
+        Op::SessionEnd {
+            session_id,
+            cwd,
+            reason,
+        } => session_ops::session_end(store, session_id, cwd, reason.as_deref())
+            .map_err(|e| e.to_string()),
+        Op::CaptureTranscript {
+            path,
+            session_id,
+            cwd,
+            reason,
+        } => session_ops::capture_transcript(
+            store,
+            path,
+            session_id,
+            cwd.as_deref(),
+            reason.as_deref(),
+        )
+        .map_err(|e| e.to_string()),
+        Op::Context {
+            cwd,
+            project,
+            branch,
+            prompt,
+            budget,
+        } => session_ops::context(
+            store,
+            &session_ops::ContextArgs {
+                cwd: cwd.as_deref(),
+                project: project.as_deref(),
+                branch: branch.as_deref(),
+                prompt: prompt.as_deref(),
+                budget: *budget,
+            },
+        )
+        .map_err(|e| e.to_string()),
+        Op::SessionTimeline { session_id } => {
+            session_ops::session_timeline(store, session_id).map_err(|e| e.to_string())
+        }
         Op::Status | Op::Shutdown => Err("only a daemon answers status and shutdown".into()),
     }
 }
