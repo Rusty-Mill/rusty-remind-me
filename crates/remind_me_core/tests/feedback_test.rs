@@ -571,6 +571,7 @@ fn apply_feedback_adjustment_ignores_a_dissimilar_past_query_end_to_end() {
 
 fn search_input(query: &str) -> MemorySearchInput {
     MemorySearchInput {
+        scope: Default::default(),
         strategy: Default::default(),
         include_sensitive: false,
         query: query.to_string(),

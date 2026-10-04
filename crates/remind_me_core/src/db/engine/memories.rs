@@ -1442,6 +1442,8 @@ mod tests {
         let a: Value = serde_json::from_str(&row(core, "a").unwrap().metadata).unwrap();
         assert_eq!(a, serde_json::json!({"k": 1, "ingest": "done"}));
         assert_eq!(row(core, "b").unwrap().metadata, "[1]");
+        // The marker is the webhook's stamp, so it credits the writer too.
+        assert_eq!(row(core, "a").unwrap().written_by, "importer:webhook");
     }
 
     #[test]

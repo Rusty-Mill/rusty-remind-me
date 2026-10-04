@@ -51,6 +51,7 @@ fn search_ids(store: &Store<'_>, query: &str, include_sensitive: bool) -> Vec<St
     queries::search_memories(
         store,
         &MemorySearchInput {
+            scope: Default::default(),
             strategy: Default::default(),
             query: query.to_string(),
             category: None,

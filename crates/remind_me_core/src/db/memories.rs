@@ -1172,6 +1172,7 @@ mod tests {
                 ..KeywordFilter::default()
             },
             KeywordFilter {
+                scope: Default::default(),
                 min_effective_vitality: Some(crate::vitality::VITALITY_FLOOR),
                 category: text("fact"),
                 include_sensitive: true,

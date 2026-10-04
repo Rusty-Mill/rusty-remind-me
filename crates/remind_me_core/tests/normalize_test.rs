@@ -465,6 +465,7 @@ fn the_distillation_is_searchable() {
     let found = queries::search_memories(
         &store,
         &remind_me_core::MemorySearchInput {
+            scope: Default::default(),
             strategy: Default::default(),
             include_sensitive: false,
             query: "quokka".into(),

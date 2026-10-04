@@ -44,7 +44,9 @@ pub struct Session {
 impl Session {
     /// The calling process's own values of [`SESSION_VARS`].
     pub fn from_env() -> Self {
-        Self::from_lookup(|name| std::env::var(name).ok())
+        let mut session = Self::from_lookup(|name| std::env::var(name).ok());
+        crate::context::fill_client_defaults(&mut session.vars);
+        session
     }
 
     /// [`Session::from_env`] with the environment injected, for tests.

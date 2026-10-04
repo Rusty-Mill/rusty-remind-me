@@ -80,6 +80,7 @@ fn add(store: &Store<'_>, content: &str) -> String {
 
 fn input(query: &str) -> MemorySearchInput {
     MemorySearchInput {
+        scope: Default::default(),
         strategy: Default::default(),
         include_sensitive: false,
         query: query.to_string(),

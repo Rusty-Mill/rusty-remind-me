@@ -259,6 +259,21 @@ pub fn default_writer() -> Writer {
     DEFAULT_WRITER.get().cloned().unwrap_or(Writer::Model)
 }
 
+/// Fill what a daemon cannot know about its client: the client's directory,
+/// and `human` when this process declared itself a person's CLI. Called when
+/// a client builds the session it sends, so the daemon stamps the caller's
+/// context, not its own.
+pub fn fill_client_defaults(vars: &mut std::collections::BTreeMap<String, String>) {
+    if !vars.contains_key(CWD_ENV) {
+        if let Ok(cwd) = std::env::current_dir() {
+            vars.insert(CWD_ENV.to_string(), cwd.to_string_lossy().into_owned());
+        }
+    }
+    if !vars.contains_key(WRITTEN_BY_ENV) && default_writer() == Writer::Human {
+        vars.insert(WRITTEN_BY_ENV.to_string(), "human".to_string());
+    }
+}
+
 /// Whether `value` is a `written_by` this product defines.
 pub fn is_valid_written_by(value: &str) -> bool {
     matches!(value, "human" | "hook" | "unknown" | "model")
@@ -391,6 +406,20 @@ pub struct ScopeFilter {
 }
 
 impl ScopeFilter {
+    /// Set the field a CLI flag names (`--project`, `--branch`, `--session`,
+    /// `--written-by`) to `value`. `false` when `flag` is not one of them.
+    pub fn set_from_flag(&mut self, flag: &str, value: &str) -> bool {
+        let slot = match flag {
+            "--project" => &mut self.project,
+            "--branch" => &mut self.branch,
+            "--session" => &mut self.session_id,
+            "--written-by" => &mut self.written_by,
+            _ => return false,
+        };
+        *slot = Some(value.trim().to_string()).filter(|v| !v.is_empty());
+        true
+    }
+
     /// Build from raw inputs, dropping blanks.
     pub fn new(
         project: Option<String>,
@@ -522,6 +551,37 @@ mod tests {
         assert!(by.matches(None, None, Some("s1"), "hook"));
         assert!(!by.matches(None, None, Some("s1"), "human"));
         assert!(!by.matches(None, None, None, "hook"));
+    }
+
+    #[test]
+    fn scope_flags_set_their_fields() {
+        let mut f = ScopeFilter::default();
+        assert!(f.set_from_flag("--project", " rusty "));
+        assert!(f.set_from_flag("--branch", "main"));
+        assert!(f.set_from_flag("--session", "s9"));
+        assert!(f.set_from_flag("--written-by", "hook"));
+        assert!(!f.set_from_flag("--category", "x"));
+        assert_eq!(
+            f,
+            ScopeFilter::new(
+                Some("rusty".into()),
+                Some("main".into()),
+                Some("s9".into()),
+                Some("hook".into())
+            )
+        );
+        assert!(f.set_from_flag("--project", " "));
+        assert_eq!(f.project, None);
+    }
+
+    #[test]
+    fn client_defaults_add_the_directory_but_never_overwrite() {
+        let mut vars = std::collections::BTreeMap::new();
+        fill_client_defaults(&mut vars);
+        assert!(vars.contains_key(CWD_ENV));
+        let mut set = std::collections::BTreeMap::from([(CWD_ENV.to_string(), "/x".to_string())]);
+        fill_client_defaults(&mut set);
+        assert_eq!(set[CWD_ENV], "/x");
     }
 
     #[test]

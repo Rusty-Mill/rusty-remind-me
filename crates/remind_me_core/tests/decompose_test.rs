@@ -310,6 +310,7 @@ fn a_superseded_fact_drops_out_of_search() {
     let found: Vec<String> = queries::search_memories(
         &store,
         &remind_me_core::MemorySearchInput {
+            scope: Default::default(),
             strategy: Default::default(),
             include_sensitive: false,
             query: "quokka".into(),

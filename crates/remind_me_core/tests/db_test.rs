@@ -29,6 +29,7 @@ fn test_database_creation_and_add_memory() {
     assert_eq!(fetched.content, mem.content);
 
     let search_input = MemorySearchInput {
+        scope: Default::default(),
         strategy: Default::default(),
         include_sensitive: false,
         query: "FTS5".to_string(),

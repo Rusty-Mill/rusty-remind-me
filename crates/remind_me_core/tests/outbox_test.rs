@@ -64,6 +64,7 @@ fn search(store: &Store<'_>, query: &str) {
     queries::search_with_expansions(
         store,
         &MemorySearchInput {
+            scope: Default::default(),
             strategy: Default::default(),
             include_sensitive: false,
             query: query.to_string(),
