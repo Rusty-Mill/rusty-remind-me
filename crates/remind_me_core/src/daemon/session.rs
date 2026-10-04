@@ -2,7 +2,8 @@
 //!
 //! Before the daemon, every MCP client ran its own process and read its own
 //! environment, so `REMIND_ME_CLIENT`, `REMIND_ME_DEFAULT_RESPONSE_FORMAT` and
-//! `REMIND_ME_TOOL_PROFILE` were per-client by construction. One daemon serves
+//! `REMIND_ME_TOOL_PROFILE` (and, since schema v32, the four write-context
+//! variables of `context`) were per-client by construction. One daemon serves
 //! every client, so those three travel with each connection instead
 //! (ADR-0023 §2) and are read through [`var`], which prefers the calling
 //! connection's value to the daemon's own environment.
@@ -17,10 +18,17 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 
 /// The variables a client's session carries to the daemon.
-pub const SESSION_VARS: [&str; 3] = [
+///
+/// The four from [`crate::context`] say where and by whom a write is made,
+/// which is the connection's business, not the daemon's.
+pub const SESSION_VARS: [&str; 7] = [
     crate::sync::CLIENT_ENV,
     "REMIND_ME_DEFAULT_RESPONSE_FORMAT",
     crate::tool_profiles::TOOL_PROFILE_ENV,
+    crate::context::CWD_ENV,
+    crate::context::SESSION_ID_ENV,
+    crate::context::WRITTEN_BY_ENV,
+    crate::context::MODEL_ENV,
 ];
 
 /// One connection's session: its values of [`SESSION_VARS`], plus the client

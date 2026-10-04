@@ -114,6 +114,17 @@ pub struct MemoryRow {
 }
 
 impl MemoryRow {
+    /// Whether this row passes a search or list's project/branch/session/
+    /// writer scope.
+    pub(crate) fn in_scope(&self, scope: &crate::context::ScopeFilter) -> bool {
+        scope.matches(
+            self.project.as_deref(),
+            self.git_branch.as_deref(),
+            self.session_id.as_deref(),
+            &self.written_by,
+        )
+    }
+
     /// `row` as an `INSERT` of it stores it.
     pub(crate) fn from_new(row: &NewMemory) -> Self {
         Self {
@@ -1059,6 +1070,7 @@ pub(crate) fn list_page(
         .filter(|row| filter.include_sensitive || !row.sensitive)
         .filter(|row| filter.category.as_ref().is_none_or(|c| &row.category == c))
         .filter(|row| filter.source.as_ref().is_none_or(|s| &row.source == s))
+        .filter(|row| row.in_scope(&filter.scope))
         .filter(|row| filter.tags.iter().all(|tag| core.tags.has(tag, &row.id)))
         .collect();
     rows.sort_by(|a, b| (&b.created_at, &b.id).cmp(&(&a.created_at, &a.id)));
@@ -1127,6 +1139,7 @@ pub(crate) fn keyword_hits(
         .into_iter()
         .filter(|(row, _)| filter.include_sensitive || !row.sensitive)
         .filter(|(row, _)| filter.category.as_ref().is_none_or(|c| &row.category == c))
+        .filter(|(row, _)| row.in_scope(&filter.scope))
         .map(|(row, score)| (row.to_memory(), score))
         .filter(|(memory, _)| {
             filter

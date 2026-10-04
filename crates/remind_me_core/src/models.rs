@@ -315,6 +315,9 @@ pub struct MemorySearchInput {
     /// ([`crate::promotion::BOOTSTRAP_RESERVE_MAX`]).
     #[serde(default)]
     pub bootstrap: bool,
+    /// Narrow to a project, branch, session or writer (schema v32).
+    #[serde(default, flatten)]
+    pub scope: crate::context::ScopeFilter,
 }
 
 impl Default for MemorySearchInput {
@@ -338,6 +341,7 @@ impl Default for MemorySearchInput {
             strategy: RetrievalStrategy::default(),
             expand_co_retrieval: false,
             bootstrap: false,
+            scope: Default::default(),
         }
     }
 }
@@ -368,6 +372,9 @@ pub struct MemoryListInput {
     /// [`MemoryAddInput::sensitive`] for why this is not access control.
     #[serde(default)]
     pub include_sensitive: bool,
+    /// Narrow to a project, branch, session or writer (schema v32).
+    #[serde(default, flatten)]
+    pub scope: crate::context::ScopeFilter,
 }
 
 fn default_list_limit() -> usize {
