@@ -153,7 +153,9 @@ pub(crate) fn of_kind(tables: &EngineTables, kind: &str) -> Result<Vec<MemoryRef
 }
 
 pub(crate) fn find(tables: &EngineTables, kind: &str, value: &str) -> Result<Vec<MemoryReference>> {
-    Ok(rows(core_ref(tables)?, |r| r.kind == kind && r.value == value))
+    Ok(rows(core_ref(tables)?, |r| {
+        r.kind == kind && r.value == value
+    }))
 }
 
 /// Remove every reference of `memory_id`. How many went.

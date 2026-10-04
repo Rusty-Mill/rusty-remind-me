@@ -234,8 +234,6 @@ impl Corpus {
     }
 
     fn memory(&self, rng: &mut Rng) -> MemoryAddInput {
-        extract: true,
-        attachments: vec![],
         let category = match rng.below(100) {
             0..=76 => "dialog",
             77..=84 => "fact",

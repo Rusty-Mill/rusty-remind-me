@@ -56,7 +56,8 @@ fn resolve_path(path: &str, label: Option<&str>) -> Result<ResolvedAttachment> {
     if !meta.is_file() {
         return Err(invalid(format!("attachment path {path} is not a file")));
     }
-    let hash = sha256::try_digest(p).map_err(|e| invalid(format!("attachment path {path}: {e}")))?;
+    let hash =
+        sha256::try_digest(p).map_err(|e| invalid(format!("attachment path {path}: {e}")))?;
     let value = format!("sha256:{hash}");
     let name = p
         .file_name()
@@ -162,7 +163,10 @@ mod tests {
             url: Some("https://example.org/a.pdf".into()),
             ..Default::default()
         };
-        assert_eq!(resolve(&[ok]).unwrap()[0].value, "https://example.org/a.pdf");
+        assert_eq!(
+            resolve(&[ok]).unwrap()[0].value,
+            "https://example.org/a.pdf"
+        );
         let bad = AttachmentInput {
             url: Some("ftp://x".into()),
             ..Default::default()

@@ -292,14 +292,42 @@ mod tests {
         let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abc-DEF_123";
         let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIE\nabc\n-----END RSA PRIVATE KEY-----";
         let cases: Vec<(String, &str, &str)> = vec![
-            ("key AKIAIOSFODNN7EXAMPLE end".into(), "aws_access_key", "key [REDACTED:aws_access_key] end"),
-            (format!("t {github}."), "github_token", "t [REDACTED:github_token]."),
-            ("xoxb-123456789012-abcdef".into(), "slack_token", "[REDACTED:slack_token]"),
-            ("API_KEY=sk-live-12345678 x".into(), "secret", "API_KEY=[REDACTED:secret] x"),
-            ("password: hunter2hunter2".into(), "secret", "password: [REDACTED:secret]"),
+            (
+                "key AKIAIOSFODNN7EXAMPLE end".into(),
+                "aws_access_key",
+                "key [REDACTED:aws_access_key] end",
+            ),
+            (
+                format!("t {github}."),
+                "github_token",
+                "t [REDACTED:github_token].",
+            ),
+            (
+                "xoxb-123456789012-abcdef".into(),
+                "slack_token",
+                "[REDACTED:slack_token]",
+            ),
+            (
+                "API_KEY=sk-live-12345678 x".into(),
+                "secret",
+                "API_KEY=[REDACTED:secret] x",
+            ),
+            (
+                "password: hunter2hunter2".into(),
+                "secret",
+                "password: [REDACTED:secret]",
+            ),
             (format!("jwt {jwt} end"), "jwt", "jwt [REDACTED:jwt] end"),
-            (format!("a\n{pem}\nb"), "private_key", "a\n[REDACTED:private_key]\nb"),
-            ("clone https://bob:s3cretpw@host.example/r.git".into(), "url_credentials", "clone https://bob:[REDACTED:url_credentials]@host.example/r.git"),
+            (
+                format!("a\n{pem}\nb"),
+                "private_key",
+                "a\n[REDACTED:private_key]\nb",
+            ),
+            (
+                "clone https://bob:s3cretpw@host.example/r.git".into(),
+                "url_credentials",
+                "clone https://bob:[REDACTED:url_credentials]@host.example/r.git",
+            ),
         ];
         for (input, kind, want) in cases {
             let r = redact(&input);

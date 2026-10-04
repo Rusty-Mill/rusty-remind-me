@@ -290,8 +290,7 @@ pub fn decompose(store: &Store<'_>, input: &DecomposeInput) -> Result<Option<Dec
         let code_refs = crate::code_refs::detect_code_refs(&fact.content);
         crate::code_refs::merge_code_refs(&mut metadata, &code_refs);
 
-        let fact_content =
-            crate::boundary::scrub(&fact.content, &mut merged_tags, &mut metadata);
+        let fact_content = crate::boundary::scrub(&fact.content, &mut merged_tags, &mut metadata);
 
         Memories::new(store).insert(&NewMemory {
             category: FACT_CATEGORY.to_string(),

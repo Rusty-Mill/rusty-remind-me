@@ -195,8 +195,7 @@ pub fn update_memory(store: &Store<'_>, input: &MemoryUpdateInput) -> Result<Upd
         }
     }
 
-    let memory =
-        get_memory_by_id(store, &input.memory_id)?.ok_or(StoreError::NotFound)?;
+    let memory = get_memory_by_id(store, &input.memory_id)?.ok_or(StoreError::NotFound)?;
     crate::events::emit(crate::events::Event::Updated, &memory.id, &memory.category);
 
     Ok(UpdateOutcome::Updated(Box::new(memory)))

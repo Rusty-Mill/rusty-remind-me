@@ -614,10 +614,11 @@ fn parse_chat(
                                 .map(|c| (c, None, None)),
                         );
                     }
-                } else if let Some(records) = data
-                    .as_array()
-                    .filter(|items| items.iter().any(|r| ExportedColumns::from_record(r).is_some()))
-                {
+                } else if let Some(records) = data.as_array().filter(|items| {
+                    items
+                        .iter()
+                        .any(|r| ExportedColumns::from_record(r).is_some())
+                }) {
                     // This crate's own export: one record per memory, each
                     // carrying the columns it was exported with. An array
                     // of plain messages, or an export from before v32, is

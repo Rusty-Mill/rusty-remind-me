@@ -2206,9 +2206,17 @@ mod write_context_tests {
         };
         context.apply(&mut row);
         assert_eq!(row.project.as_deref(), Some("quokka"));
-        assert_eq!(row.git_branch.as_deref(), Some("main"), "a known value wins");
+        assert_eq!(
+            row.git_branch.as_deref(),
+            Some("main"),
+            "a known value wins"
+        );
         assert_eq!(row.cwd.as_deref(), Some("/work"));
-        assert_eq!(row.session_id.as_deref(), Some("explicit"), "an unknown leaves it");
+        assert_eq!(
+            row.session_id.as_deref(),
+            Some("explicit"),
+            "an unknown leaves it"
+        );
         assert_eq!(row.git_remote, None);
         assert_eq!(row.git_sha, None);
         assert_eq!(row.written_by, "unknown", "not a context column");
