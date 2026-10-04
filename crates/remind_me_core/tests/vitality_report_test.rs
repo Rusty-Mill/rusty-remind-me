@@ -14,8 +14,6 @@ use remind_me_core::{Database, MemoryAddInput};
 
 fn add(store: &Store<'_>, content: &str, category: &str) -> String {
     let input = MemoryAddInput {
-        extract: true,
-        attachments: vec![],
         sensitive: false,
         content: content.to_string(),
         category: category.to_string(),
@@ -26,6 +24,7 @@ fn add(store: &Store<'_>, content: &str, category: &str) -> String {
         predicate: None,
         object: None,
         entities: vec![],
+        ..Default::default()
     };
     queries::add_memory(store, input).expect("add failed").id
 }

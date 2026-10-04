@@ -13,8 +13,6 @@ fn add(store: &Store<'_>, content: &str) -> String {
     queries::add_memory(
         store,
         MemoryAddInput {
-            extract: true,
-            attachments: vec![],
             sensitive: false,
             content: content.to_string(),
             category: "general".into(),
@@ -25,6 +23,7 @@ fn add(store: &Store<'_>, content: &str) -> String {
             predicate: None,
             object: None,
             entities: vec![],
+            ..Default::default()
         },
     )
     .unwrap()
@@ -87,8 +86,6 @@ fn facts_are_memories_whose_spo_matches_the_canonical_name() {
     queries::add_memory(
         &store,
         MemoryAddInput {
-            extract: true,
-            attachments: vec![],
             sensitive: false,
             content: "Rottnest Island has quokkas".into(),
             category: "general".into(),
@@ -99,6 +96,7 @@ fn facts_are_memories_whose_spo_matches_the_canonical_name() {
             predicate: Some("has".into()),
             object: Some("quokkas".into()),
             entities: vec![],
+            ..Default::default()
         },
     )
     .unwrap();
@@ -106,8 +104,6 @@ fn facts_are_memories_whose_spo_matches_the_canonical_name() {
     queries::add_memory(
         &store,
         MemoryAddInput {
-            extract: true,
-            attachments: vec![],
             sensitive: false,
             content: "you can visit rottnest island by ferry".into(),
             category: "general".into(),
@@ -118,6 +114,7 @@ fn facts_are_memories_whose_spo_matches_the_canonical_name() {
             predicate: Some("reachable_by".into()),
             object: Some("ferry".into()),
             entities: vec![],
+            ..Default::default()
         },
     )
     .unwrap();

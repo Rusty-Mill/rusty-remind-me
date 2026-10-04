@@ -261,6 +261,28 @@ fn default_true() -> bool {
     true
 }
 
+impl Default for MemoryAddInput {
+    /// An empty-content add with every optional field at its serde default, so
+    /// callers and tests name only what they set (`..Default::default()`),
+    /// and a field added here does not touch every call site.
+    fn default() -> Self {
+        Self {
+            content: String::new(),
+            category: default_category(),
+            tags: Vec::new(),
+            source: default_source(),
+            metadata: serde_json::Value::Null,
+            subject: None,
+            predicate: None,
+            object: None,
+            entities: Vec::new(),
+            sensitive: false,
+            extract: true,
+            attachments: Vec::new(),
+        }
+    }
+}
+
 fn default_category() -> String {
     "general".to_string()
 }

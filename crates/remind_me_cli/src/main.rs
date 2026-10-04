@@ -828,7 +828,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 };
                 let add_input = MemoryAddInput {
-                    extract: true,
                     attachments: add_args
                         .attach
                         .into_iter()
@@ -847,6 +846,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     predicate: None,
                     object: None,
                     entities: vec![],
+                    ..Default::default()
                 };
                 let mem: Memory = Store::open(&db_path)?.call(Op::Add { input: add_input })?;
                 println!("Added memory: {}", mem.id);

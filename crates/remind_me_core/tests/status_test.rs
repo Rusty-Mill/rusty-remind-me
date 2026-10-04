@@ -24,8 +24,6 @@ fn add(store: &Store<'_>, content: &str) {
     queries::add_memory(
         store,
         MemoryAddInput {
-            extract: true,
-            attachments: vec![],
             sensitive: false,
             content: content.to_string(),
             category: "general".into(),
@@ -36,6 +34,7 @@ fn add(store: &Store<'_>, content: &str) {
             predicate: None,
             object: None,
             entities: vec![],
+            ..Default::default()
         },
     )
     .unwrap();

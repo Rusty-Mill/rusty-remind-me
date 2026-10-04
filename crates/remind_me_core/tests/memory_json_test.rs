@@ -33,8 +33,6 @@ fn memory_json_keys(store: &Store<'_>) -> BTreeSet<String> {
     let memory = queries::add_memory(
         store,
         MemoryAddInput {
-            extract: true,
-            attachments: vec![],
             content: "a memory to serialise".into(),
             category: "general".into(),
             tags: vec!["t".into()],
@@ -45,6 +43,7 @@ fn memory_json_keys(store: &Store<'_>) -> BTreeSet<String> {
             object: None,
             entities: vec![],
             sensitive: false,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -127,8 +126,6 @@ fn memory_type_round_trips_through_the_json() {
     let memory = queries::add_memory(
         &store,
         MemoryAddInput {
-            extract: true,
-            attachments: vec![],
             content: "standing reference material".into(),
             category: "general".into(),
             tags: vec![],
@@ -139,6 +136,7 @@ fn memory_type_round_trips_through_the_json() {
             object: None,
             entities: vec![],
             sensitive: false,
+            ..Default::default()
         },
     )
     .unwrap();

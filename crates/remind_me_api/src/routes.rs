@@ -326,8 +326,6 @@ pub fn api_add(store: &Store<'_>, _wiki: &Wiki, req: &Request, _params: &Params)
     }
 
     let input = MemoryAddInput {
-        extract: true,
-        attachments: vec![],
         sensitive: body
             .get("sensitive")
             .and_then(Value::as_bool)
@@ -357,6 +355,7 @@ pub fn api_add(store: &Store<'_>, _wiki: &Wiki, req: &Request, _params: &Params)
         predicate: None,
         object: None,
         entities: Vec::new(),
+        ..Default::default()
     };
     match queries::add_memory(store, input) {
         Ok(memory) => (

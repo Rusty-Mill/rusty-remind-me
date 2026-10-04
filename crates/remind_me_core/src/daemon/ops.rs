@@ -116,8 +116,6 @@ mod tests {
 
     fn add(store: &Store<'_>, content: &str) -> Memory {
         let input = MemoryAddInput {
-            extract: true,
-            attachments: vec![],
             sensitive: false,
             content: content.into(),
             category: "note".into(),
@@ -128,6 +126,7 @@ mod tests {
             predicate: None,
             object: None,
             entities: vec![],
+            ..Default::default()
         };
         execute(store, &Op::Add { input }).into_result().unwrap()
     }

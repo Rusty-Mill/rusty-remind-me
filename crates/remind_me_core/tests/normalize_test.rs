@@ -71,8 +71,6 @@ fn a_store_without_imports_has_nothing_to_normalize() {
     queries::add_memory(
         &store,
         MemoryAddInput {
-            extract: true,
-            attachments: vec![],
             sensitive: false,
             content: "written by hand".into(),
             category: "general".into(),
@@ -83,6 +81,7 @@ fn a_store_without_imports_has_nothing_to_normalize() {
             predicate: None,
             object: None,
             entities: vec![],
+            ..Default::default()
         },
     )
     .unwrap();

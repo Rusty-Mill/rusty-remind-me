@@ -185,8 +185,6 @@ fn wiki_status_reports_pages_and_pending_compile() {
         remind_me_core::db::queries::add_memory(
             conn,
             remind_me_core::MemoryAddInput {
-                extract: true,
-                attachments: vec![],
                 sensitive: false,
                 content: "a fact awaiting synthesis".into(),
                 category: "general".into(),
@@ -197,6 +195,7 @@ fn wiki_status_reports_pages_and_pending_compile() {
                 predicate: None,
                 object: None,
                 entities: vec![],
+                ..Default::default()
             },
         )
         .unwrap();

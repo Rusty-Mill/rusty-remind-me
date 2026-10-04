@@ -78,8 +78,6 @@ fn add(store: &Store<'_>, content: &str) {
     queries::add_memory(
         store,
         MemoryAddInput {
-            extract: true,
-            attachments: vec![],
             content: content.to_string(),
             category: "fact".to_string(),
             tags: Vec::new(),
@@ -90,6 +88,7 @@ fn add(store: &Store<'_>, content: &str) {
             object: None,
             entities: Vec::new(),
             sensitive: false,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -287,8 +286,6 @@ fn a_category_containing_a_single_quote_is_matched_via_bound_parameter() {
     queries::add_memory(
         &store,
         MemoryAddInput {
-            extract: true,
-            attachments: vec![],
             content: "quokka sightings on the island".to_string(),
             category: "foo's bar".to_string(),
             tags: Vec::new(),
@@ -299,6 +296,7 @@ fn a_category_containing_a_single_quote_is_matched_via_bound_parameter() {
             object: None,
             entities: Vec::new(),
             sensitive: false,
+            ..Default::default()
         },
     )
     .unwrap();

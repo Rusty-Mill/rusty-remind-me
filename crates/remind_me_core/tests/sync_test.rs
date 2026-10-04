@@ -33,8 +33,6 @@ fn add(store: &Store<'_>, content: &str) -> String {
     queries::add_memory(
         store,
         MemoryAddInput {
-            extract: true,
-            attachments: vec![],
             sensitive: false,
             content: content.to_string(),
             category: "general".into(),
@@ -45,6 +43,7 @@ fn add(store: &Store<'_>, content: &str) -> String {
             predicate: None,
             object: None,
             entities: vec![],
+            ..Default::default()
         },
     )
     .unwrap()
@@ -555,8 +554,6 @@ fn a_sensitive_memory_pushes_with_its_flag_intact() {
     let id = queries::add_memory(
         &local_conn,
         MemoryAddInput {
-            extract: true,
-            attachments: vec![],
             content: "sensitive content".into(),
             category: "general".into(),
             tags: vec![],
@@ -567,6 +564,7 @@ fn a_sensitive_memory_pushes_with_its_flag_intact() {
             object: None,
             entities: vec![],
             sensitive: true,
+            ..Default::default()
         },
     )
     .unwrap()
@@ -650,8 +648,6 @@ fn a_sensitive_memory_stays_sensitive_when_pulled_directly_from_a_peer() {
         let id = queries::add_memory(
             &hub_conn,
             MemoryAddInput {
-                extract: true,
-                attachments: vec![],
                 sensitive: true,
                 content: "sensitive, pulled directly from a peer".to_string(),
                 category: "general".into(),
@@ -662,6 +658,7 @@ fn a_sensitive_memory_stays_sensitive_when_pulled_directly_from_a_peer() {
                 predicate: None,
                 object: None,
                 entities: vec![],
+                ..Default::default()
             },
         )
         .unwrap()

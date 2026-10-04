@@ -65,8 +65,6 @@ fn add_with_history(store: &Store<'_>) -> String {
     let id = queries::add_memory(
         store,
         MemoryAddInput {
-            extract: true,
-            attachments: vec![],
             sensitive: false,
             content: "the secret plan".to_string(),
             category: "general".into(),
@@ -77,6 +75,7 @@ fn add_with_history(store: &Store<'_>) -> String {
             predicate: Some("plans".into()),
             object: Some("a secret".into()),
             entities: vec![],
+            ..Default::default()
         },
     )
     .unwrap()

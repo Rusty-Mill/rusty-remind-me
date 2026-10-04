@@ -9,8 +9,6 @@ use remind_me_core::{AttachmentInput, Database, EntityInput, Memory, MemoryAddIn
 
 fn input(content: &str) -> MemoryAddInput {
     MemoryAddInput {
-        extract: true,
-        attachments: vec![],
         content: content.to_string(),
         category: "general".into(),
         tags: vec![],
@@ -21,6 +19,7 @@ fn input(content: &str) -> MemoryAddInput {
         object: None,
         entities: vec![],
         sensitive: false,
+        ..Default::default()
     }
 }
 

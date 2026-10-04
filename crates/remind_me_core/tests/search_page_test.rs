@@ -11,8 +11,6 @@ fn add(store: &Store<'_>, content: &str) -> String {
     queries::add_memory(
         store,
         MemoryAddInput {
-            extract: true,
-            attachments: vec![],
             sensitive: false,
             content: content.to_string(),
             category: "general".into(),
@@ -23,6 +21,7 @@ fn add(store: &Store<'_>, content: &str) -> String {
             predicate: None,
             object: None,
             entities: vec![],
+            ..Default::default()
         },
     )
     .unwrap()
@@ -86,8 +85,6 @@ fn category_and_tags_filter_before_the_limit() {
     queries::add_memory(
         &store,
         MemoryAddInput {
-            extract: true,
-            attachments: vec![],
             sensitive: false,
             content: "quokka in general".into(),
             category: "general".into(),
@@ -98,14 +95,13 @@ fn category_and_tags_filter_before_the_limit() {
             predicate: None,
             object: None,
             entities: vec![],
+            ..Default::default()
         },
     )
     .unwrap();
     queries::add_memory(
         &store,
         MemoryAddInput {
-            extract: true,
-            attachments: vec![],
             sensitive: false,
             content: "quokka in wildlife".into(),
             category: "wildlife".into(),
@@ -116,6 +112,7 @@ fn category_and_tags_filter_before_the_limit() {
             predicate: None,
             object: None,
             entities: vec![],
+            ..Default::default()
         },
     )
     .unwrap();

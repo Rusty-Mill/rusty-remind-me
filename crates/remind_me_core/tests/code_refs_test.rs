@@ -74,8 +74,6 @@ fn add(store: &Store<'_>, content: &str) -> String {
     queries::add_memory(
         store,
         MemoryAddInput {
-            extract: true,
-            attachments: vec![],
             content: content.to_string(),
             category: "fact".to_string(),
             tags: Vec::new(),
@@ -86,6 +84,7 @@ fn add(store: &Store<'_>, content: &str) -> String {
             object: None,
             entities: Vec::new(),
             sensitive: false,
+            ..Default::default()
         },
     )
     .unwrap()
@@ -478,8 +477,6 @@ fn a_sensitive_memory_never_appears_in_stale_candidates() {
     queries::add_memory(
         &store,
         MemoryAddInput {
-            extract: true,
-            attachments: vec![],
             content: format!("sensitive: see {}", fixture.file.display()),
             category: "fact".to_string(),
             tags: Vec::new(),
@@ -490,6 +487,7 @@ fn a_sensitive_memory_never_appears_in_stale_candidates() {
             object: None,
             entities: Vec::new(),
             sensitive: true,
+            ..Default::default()
         },
     )
     .unwrap();

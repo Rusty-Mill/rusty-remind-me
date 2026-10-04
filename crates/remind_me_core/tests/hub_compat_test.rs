@@ -38,8 +38,6 @@ fn add(store: &Store<'_>, content: &str) -> String {
     queries::add_memory(
         store,
         MemoryAddInput {
-            extract: true,
-            attachments: vec![],
             sensitive: false,
             content: content.to_string(),
             category: "general".into(),
@@ -50,6 +48,7 @@ fn add(store: &Store<'_>, content: &str) -> String {
             predicate: None,
             object: None,
             entities: vec![],
+            ..Default::default()
         },
     )
     .unwrap()
@@ -124,8 +123,6 @@ fn a_sensitive_memory_stays_sensitive_after_a_real_hub_round_trip() {
     queries::add_memory(
         &node_a_conn,
         MemoryAddInput {
-            extract: true,
-            attachments: vec![],
             sensitive: true,
             content: "sensitive across a real hub".to_string(),
             category: "general".into(),
@@ -136,6 +133,7 @@ fn a_sensitive_memory_stays_sensitive_after_a_real_hub_round_trip() {
             predicate: None,
             object: None,
             entities: vec![],
+            ..Default::default()
         },
     )
     .unwrap();

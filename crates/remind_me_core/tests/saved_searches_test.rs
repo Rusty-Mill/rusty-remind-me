@@ -18,8 +18,6 @@ fn add(store: &Store<'_>, content: &str, category: &str, tags: &[&str]) -> Strin
     queries::add_memory(
         store,
         MemoryAddInput {
-            extract: true,
-            attachments: vec![],
             content: content.to_string(),
             category: category.to_string(),
             tags: tags.iter().map(|t| t.to_string()).collect(),
@@ -30,6 +28,7 @@ fn add(store: &Store<'_>, content: &str, category: &str, tags: &[&str]) -> Strin
             object: None,
             entities: vec![],
             sensitive: false,
+            ..Default::default()
         },
     )
     .unwrap()

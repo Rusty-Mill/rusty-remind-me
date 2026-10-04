@@ -22,8 +22,6 @@ fn add(store: &Store<'_>, content: &str) -> String {
     remind_me_core::db::queries::add_memory(
         store,
         MemoryAddInput {
-            extract: true,
-            attachments: vec![],
             content: content.to_string(),
             category: "general".into(),
             tags: vec![],
@@ -34,6 +32,7 @@ fn add(store: &Store<'_>, content: &str) -> String {
             object: None,
             entities: vec![],
             sensitive: false,
+            ..Default::default()
         },
     )
     .unwrap()

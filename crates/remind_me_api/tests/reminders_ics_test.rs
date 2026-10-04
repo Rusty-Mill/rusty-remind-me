@@ -38,8 +38,6 @@ fn seed_reminder(store: &Store<'_>, content: &str, remind_at: &str) -> String {
     let memory = remind_me_core::db::queries::add_memory(
         store,
         remind_me_core::MemoryAddInput {
-            extract: true,
-            attachments: vec![],
             content: content.to_string(),
             category: "general".into(),
             tags: vec![],
@@ -50,6 +48,7 @@ fn seed_reminder(store: &Store<'_>, content: &str, remind_at: &str) -> String {
             object: None,
             entities: vec![],
             sensitive: false,
+            ..Default::default()
         },
     )
     .unwrap();
