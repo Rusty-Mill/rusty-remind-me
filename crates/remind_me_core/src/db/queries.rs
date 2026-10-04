@@ -50,9 +50,11 @@ pub fn add_memory(store: &Store<'_>, mut input: MemoryAddInput) -> Result<Memory
         base_weight,
         accessed_at: Some(now_iso.clone()),
         sensitive: input.sensitive,
-        node_id: Some(crate::sync::configured_node_id()),
-        client: crate::sync::configured_client(),
-        ..NewMemory::new(id.clone(), input.content.clone(), &now_iso)
+        ..crate::context::default_provenance().stamp(NewMemory::new(
+            id.clone(),
+            input.content.clone(),
+            &now_iso,
+        ))
     })?;
 
     // `MemoryAddInput::entities` was previously parsed and then dropped, so a

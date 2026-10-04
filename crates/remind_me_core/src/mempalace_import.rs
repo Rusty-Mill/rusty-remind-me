@@ -429,13 +429,14 @@ pub fn pull_mempalace(
                 "room": room_val,
             });
 
+            let provenance = crate::context::importer_provenance("mempalace");
             Memories::new(batch).insert_or_ignore(&NewMemory {
                 category: mem_category,
                 tags: mem_tags,
                 source: mem_source,
                 metadata,
                 created_at,
-                ..NewMemory::new(memory_id.clone(), content, &now)
+                ..provenance.stamp(NewMemory::new(memory_id.clone(), content, &now))
             })?;
             ImportLedger::new(batch).record_mempalace(&drawer.drawer_id, &memory_id, &now)?;
         }

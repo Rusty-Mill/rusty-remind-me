@@ -165,6 +165,17 @@ pub fn render_memory_page_markdown(memories: &[Memory], total: usize) -> String 
         .join("\n---\n")
 }
 
+/// ` — project@branch` for a memory that knows its project, else nothing.
+/// The session id is deliberately left to the JSON form: it is a key for
+/// tools, not something for a reader to take in.
+fn project_label(m: &Memory) -> String {
+    match (&m.project, &m.git_branch) {
+        (Some(project), Some(branch)) => format!(" — {project}@{branch}"),
+        (Some(project), None) => format!(" — {project}"),
+        _ => String::new(),
+    }
+}
+
 fn render_memory_markdown(m: &Memory) -> String {
     let tags = if m.tags.is_empty() {
         "none".to_string()
@@ -173,9 +184,10 @@ fn render_memory_markdown(m: &Memory) -> String {
     };
     let mut lines = vec![
         format!(
-            "### Memory `{}`{}",
+            "### Memory `{}`{}{}",
             m.id,
-            if m.sensitive { " 🔒 _sensitive_" } else { "" }
+            if m.sensitive { " 🔒 _sensitive_" } else { "" },
+            project_label(m)
         ),
         format!(
             "**Category:** {}  |  **Tags:** {}  |  **Source:** {}",

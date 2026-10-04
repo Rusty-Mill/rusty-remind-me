@@ -177,7 +177,7 @@ pub fn write_skeleton(
     let base_weight = get_type_prior(SKELETON_CATEGORY) * get_source_prior(CAPTURE_SOURCE);
     let vitality = calculate_vitality(base_weight, 0, decay_rate, &now_iso, now);
 
-    let (node_id, client) = crate::sync::memory_provenance();
+    let provenance = crate::context::default_provenance();
     memories.insert(&NewMemory {
         category: SKELETON_CATEGORY.to_string(),
         source: CAPTURE_SOURCE.to_string(),
@@ -187,9 +187,11 @@ pub fn write_skeleton(
         vitality,
         base_weight,
         accessed_at: Some(now_iso.clone()),
-        node_id: Some(node_id),
-        client,
-        ..NewMemory::new(skeleton_id.clone(), input.mermaid.clone(), &now_iso)
+        ..provenance.stamp(NewMemory::new(
+            skeleton_id.clone(),
+            input.mermaid.clone(),
+            &now_iso,
+        ))
     })?;
 
     Ok(Skeleton {

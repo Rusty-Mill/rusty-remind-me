@@ -19,6 +19,8 @@ use std::path::PathBuf;
 pub enum GroupBy {
     Category,
     Source,
+    /// Memories with no project are left out of the counts.
+    Project,
 }
 
 /// Where the store lives and how big it is.

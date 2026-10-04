@@ -152,7 +152,7 @@ pub fn apply_normalizations(
         let base_weight = get_type_prior(NORMALIZED_CATEGORY) * get_source_prior(NORMALIZED_SOURCE);
         let vitality = calculate_vitality(base_weight, 0, decay_rate, &now_iso, now);
 
-        let (node_id, client) = crate::sync::memory_provenance();
+        let provenance = crate::context::default_provenance();
         Memories::new(store).insert(&NewMemory {
             category: NORMALIZED_CATEGORY.to_string(),
             // The source's tags, carried over.
@@ -165,9 +165,7 @@ pub fn apply_normalizations(
             vitality,
             base_weight,
             accessed_at: Some(now_iso.clone()),
-            node_id: Some(node_id),
-            client,
-            ..NewMemory::new(normalized_id.clone(), content, &now_iso)
+            ..provenance.stamp(NewMemory::new(normalized_id.clone(), content, &now_iso))
         })?;
 
         apply_entity_mentions(store, &normalized_id, &entry.entities)?;

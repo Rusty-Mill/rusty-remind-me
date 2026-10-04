@@ -78,7 +78,7 @@ fn insert_half(
     let base_weight = get_type_prior(category) * get_source_prior(CAPTURE_SOURCE);
     let vitality = calculate_vitality(base_weight, 0, decay_rate, now_iso, now);
 
-    let (node_id, client) = crate::sync::memory_provenance();
+    let provenance = crate::context::default_provenance().auto();
     Memories::new(store).insert(&NewMemory {
         category: category.to_string(),
         tags: tags.to_vec(),
@@ -89,9 +89,7 @@ fn insert_half(
         vitality,
         base_weight,
         accessed_at: Some(now_iso.to_string()),
-        node_id: Some(node_id),
-        client,
-        ..NewMemory::new(id, content, now_iso)
+        ..provenance.stamp(NewMemory::new(id, content, now_iso))
     })
 }
 
@@ -271,7 +269,7 @@ pub fn decompose(store: &Store<'_>, input: &DecomposeInput) -> Result<Option<Dec
         let decay_rate = get_decay_rate(memory_type);
         let base_weight = get_type_prior(memory_type);
 
-        let (node_id, client) = crate::sync::memory_provenance();
+        let provenance = crate::context::default_provenance();
 
         // #260: a no-op unless REMIND_ME_CODE_ROOTS is configured. Merged
         // into the metadata object already built for `source_capture_id`
@@ -294,9 +292,11 @@ pub fn decompose(store: &Store<'_>, input: &DecomposeInput) -> Result<Option<Dec
             subject: fact.subject.clone(),
             predicate: fact.predicate.clone(),
             object: fact.object.clone(),
-            node_id: Some(node_id),
-            client,
-            ..NewMemory::new(fact_id.clone(), fact.content.clone(), &now_iso)
+            ..provenance.stamp(NewMemory::new(
+                fact_id.clone(),
+                fact.content.clone(),
+                &now_iso,
+            ))
         })?;
 
         entities_linked += apply_entity_mentions(store, &fact_id, &fact.entities)?;

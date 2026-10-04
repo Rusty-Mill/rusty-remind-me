@@ -700,6 +700,9 @@ pub(crate) fn set_ingest_marker(
         update(tables, id, Origin::Local, |row| {
             let mut metadata: Value = serde_json::from_str(&row.metadata)
                 .map_err(|e| engine_error(format!("memory {:?} metadata: {e}", row.id)))?;
+            // The marker is the webhook's own stamp, so it credits the writer
+            // too: a pushed import is `importer:webhook`, not the connector.
+            row.written_by = "importer:webhook".to_string();
             if let Value::Object(fields) = &mut metadata {
                 fields.insert("ingest".to_string(), Value::String(marker.to_string()));
                 row.metadata = metadata.to_string();

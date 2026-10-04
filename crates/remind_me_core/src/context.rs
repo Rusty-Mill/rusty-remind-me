@@ -321,6 +321,14 @@ impl Provenance {
         self.context.apply(row);
     }
 
+    /// The same, marked as captured by a machine (`capture_method = auto`):
+    /// for the paths that record a conversation or promote one, whoever
+    /// triggered them.
+    pub fn auto(mut self) -> Self {
+        self.capture_method = "auto".to_string();
+        self
+    }
+
     /// `row` stamped, for use as a struct-update base:
     /// `NewMemory { category, ..prov.stamp(NewMemory::new(id, text, now)) }`.
     pub fn stamp(&self, mut row: NewMemory) -> NewMemory {

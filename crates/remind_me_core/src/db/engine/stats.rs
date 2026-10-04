@@ -31,6 +31,10 @@ pub(crate) fn count_by(tables: &EngineTables, group: GroupBy) -> Result<BTreeMap
         let key = match group {
             GroupBy::Category => row.category,
             GroupBy::Source => row.source,
+            GroupBy::Project => match row.project {
+                Some(project) => project,
+                None => continue,
+            },
         };
         *counts.entry(key).or_insert(0) += 1;
     }
