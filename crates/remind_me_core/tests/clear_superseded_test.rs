@@ -22,6 +22,8 @@ fn add(store: &Store<'_>, content: &str, triple: Option<(&str, &str, &str)>) -> 
     queries::add_memory(
         store,
         MemoryAddInput {
+            extract: true,
+            attachments: vec![],
             content: content.to_string(),
             category: "general".to_string(),
             tags: vec![],

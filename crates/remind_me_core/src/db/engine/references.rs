@@ -132,6 +132,26 @@ pub(crate) fn for_memory(tables: &EngineTables, memory_id: &str) -> Result<Vec<M
     Ok(found.iter().map(ReferenceRecord::to_row).collect())
 }
 
+/// The references of every id in `memory_ids`, grouped by neither: one
+/// ordered list (oldest first, ties by id), so a caller regroups by `memory_id`.
+pub(crate) fn for_memories(
+    tables: &EngineTables,
+    memory_ids: &[String],
+) -> Result<Vec<MemoryReference>> {
+    let core = core_ref(tables)?;
+    let mut found: Vec<ReferenceRecord> = memory_ids
+        .iter()
+        .flat_map(|id| of_memory(core, id))
+        .collect();
+    found.sort_by(|a, b| (&a.created_at, &a.id).cmp(&(&b.created_at, &b.id)));
+    Ok(found.iter().map(ReferenceRecord::to_row).collect())
+}
+
+/// Every reference of this `kind`, oldest first.
+pub(crate) fn of_kind(tables: &EngineTables, kind: &str) -> Result<Vec<MemoryReference>> {
+    Ok(rows(core_ref(tables)?, |r| r.kind == kind))
+}
+
 pub(crate) fn find(tables: &EngineTables, kind: &str, value: &str) -> Result<Vec<MemoryReference>> {
     Ok(rows(core_ref(tables)?, |r| r.kind == kind && r.value == value))
 }

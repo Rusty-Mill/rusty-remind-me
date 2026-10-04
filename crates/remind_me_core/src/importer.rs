@@ -1194,6 +1194,9 @@ pub fn import_content(
 
         let memory_id = format!("mem_{}", uuid::Uuid::new_v4().simple());
 
+        let (mut chunk_tags, mut metadata) = (chunk_tags, metadata);
+        let content = &crate::boundary::scrub(content, &mut chunk_tags, &mut metadata);
+
         // `doc_id`/`chunk_index` group every chunk of this file in source
         // order, which is what lets neighbour expansion find a hit's siblings
         // without re-parsing anything.
@@ -1213,6 +1216,7 @@ pub fn import_content(
         }
         Memories::new(store).insert_or_ignore(&row)?;
         created += 1;
+        crate::boundary::index(store, &memory_id, content, &[], true, &[], &now)?;
 
         // Point this memory back at the bytes it came from, so a caller can
         // recover the tool_use/thinking blocks `text_of` dropped.

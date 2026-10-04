@@ -13,6 +13,8 @@ fn add(store: &Store<'_>, content: &str) -> String {
     queries::add_memory(
         store,
         MemoryAddInput {
+            extract: true,
+            attachments: vec![],
             sensitive: false,
             content: content.to_string(),
             category: "general".into(),
@@ -85,6 +87,8 @@ fn facts_are_memories_whose_spo_matches_the_canonical_name() {
     queries::add_memory(
         &store,
         MemoryAddInput {
+            extract: true,
+            attachments: vec![],
             sensitive: false,
             content: "Rottnest Island has quokkas".into(),
             category: "general".into(),
@@ -102,6 +106,8 @@ fn facts_are_memories_whose_spo_matches_the_canonical_name() {
     queries::add_memory(
         &store,
         MemoryAddInput {
+            extract: true,
+            attachments: vec![],
             sensitive: false,
             content: "you can visit rottnest island by ferry".into(),
             category: "general".into(),

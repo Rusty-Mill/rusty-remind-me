@@ -57,6 +57,8 @@ fn add(store: &Store<'_>, content: &str) {
     queries::add_memory(
         store,
         MemoryAddInput {
+            extract: true,
+            attachments: vec![],
             sensitive: false,
             content: content.into(),
             category: "general".into(),

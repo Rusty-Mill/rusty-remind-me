@@ -818,6 +818,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 };
                 let add_input = MemoryAddInput {
+                    extract: true,
+                    attachments: vec![],
                     sensitive: false,
                     content: add_args.content,
                     category: add_args.category,

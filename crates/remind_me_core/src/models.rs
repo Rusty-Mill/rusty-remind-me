@@ -235,6 +235,30 @@ pub struct MemoryAddInput {
     /// memory out of ordinary search and list results unless asked for.
     #[serde(default)]
     pub sensitive: bool,
+    /// Run the rule-based reference/entity extraction (`extract.rs`) on the
+    /// content. On by default; `REMIND_ME_EXTRACT=0` turns it off globally.
+    #[serde(default = "default_true")]
+    pub extract: bool,
+    /// Files or URLs this memory points at. Only a fingerprint and a label
+    /// are stored, never the bytes.
+    #[serde(default)]
+    pub attachments: Vec<AttachmentInput>,
+}
+
+/// One attachment of a [`MemoryAddInput`]: a local `path` (hashed, never
+/// stored) or a `url`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachmentInput {
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_category() -> String {

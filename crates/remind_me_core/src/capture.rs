@@ -9,9 +9,7 @@ use crate::db::curation::Curation;
 use crate::db::memories::{Memories, NewMemory};
 use crate::db::Result;
 use crate::db::Store;
-use crate::entity::{
-    apply_entity_mentions, maybe_link_entity_relation, supersede_contradicting_facts,
-};
+use crate::entity::{maybe_link_entity_relation, supersede_contradicting_facts};
 use crate::models::{
     AutoCaptureInput, Capture, CaptureResult, DecomposeBatchInput, DecomposeBatchResult,
     DecomposeInput, DecomposeResult, Memory, UndecomposedCapture, CAPTURE_SOURCE,
@@ -72,7 +70,11 @@ fn insert_half(
     metadata: serde_json::Value,
     capture_id: &str,
     now_iso: &str,
+    extract: bool,
 ) -> Result<()> {
+    let (mut tags, mut metadata) = (tags.to_vec(), metadata);
+    let content = crate::boundary::scrub(content, &mut tags, &mut metadata);
+    let content = content.as_str();
     let now = Utc::now();
     let decay_rate = get_decay_rate(category);
     let base_weight = get_type_prior(category) * get_source_prior(CAPTURE_SOURCE);
@@ -81,7 +83,7 @@ fn insert_half(
     let (node_id, client) = crate::sync::memory_provenance();
     Memories::new(store).insert(&NewMemory {
         category: category.to_string(),
-        tags: tags.to_vec(),
+        tags,
         source: CAPTURE_SOURCE.to_string(),
         metadata,
         capture_id: Some(capture_id.to_string()),
@@ -92,7 +94,13 @@ fn insert_half(
         node_id: Some(node_id),
         client,
         ..NewMemory::new(id, content, now_iso)
-    })
+    })?;
+    // The summary half only: a raw dialog is too long and too noisy for
+    // the rules to mean anything.
+    if extract {
+        crate::boundary::index(store, id, content, &[], true, &[], now_iso)?;
+    }
+    Ok(())
 }
 
 /// Store a conversation as a linked dialog/summary pair.
@@ -141,6 +149,7 @@ pub fn auto_capture(store: &Store<'_>, input: &AutoCaptureInput) -> Result<Captu
         dialog_meta,
         &capture_id,
         &now_iso,
+        false,
     )?;
     insert_half(
         store,
@@ -151,6 +160,7 @@ pub fn auto_capture(store: &Store<'_>, input: &AutoCaptureInput) -> Result<Captu
         summary_meta,
         &capture_id,
         &now_iso,
+        true,
     )?;
 
     Ok(CaptureResult {
@@ -280,6 +290,9 @@ pub fn decompose(store: &Store<'_>, input: &DecomposeInput) -> Result<Option<Dec
         let code_refs = crate::code_refs::detect_code_refs(&fact.content);
         crate::code_refs::merge_code_refs(&mut metadata, &code_refs);
 
+        let fact_content =
+            crate::boundary::scrub(&fact.content, &mut merged_tags, &mut metadata);
+
         Memories::new(store).insert(&NewMemory {
             category: FACT_CATEGORY.to_string(),
             tags: merged_tags,
@@ -296,10 +309,18 @@ pub fn decompose(store: &Store<'_>, input: &DecomposeInput) -> Result<Option<Dec
             object: fact.object.clone(),
             node_id: Some(node_id),
             client,
-            ..NewMemory::new(fact_id.clone(), fact.content.clone(), &now_iso)
+            ..NewMemory::new(fact_id.clone(), fact_content.clone(), &now_iso)
         })?;
 
-        entities_linked += apply_entity_mentions(store, &fact_id, &fact.entities)?;
+        entities_linked += crate::boundary::index(
+            store,
+            &fact_id,
+            &fact_content,
+            &fact.entities,
+            true,
+            &[],
+            &now_iso,
+        )?;
         if maybe_link_entity_relation(
             store,
             fact.subject.as_deref(),

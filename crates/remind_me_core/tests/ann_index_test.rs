@@ -89,6 +89,8 @@ mod with_the_feature {
         let id = remind_me_core::db::queries::add_memory(
             store,
             remind_me_core::MemoryAddInput {
+                extract: true,
+                attachments: vec![],
                 content: content.to_string(),
                 category: "general".into(),
                 tags: vec![],

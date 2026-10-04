@@ -326,6 +326,8 @@ pub fn api_add(store: &Store<'_>, _wiki: &Wiki, req: &Request, _params: &Params)
     }
 
     let input = MemoryAddInput {
+        extract: true,
+        attachments: vec![],
         sensitive: body
             .get("sensitive")
             .and_then(Value::as_bool)

@@ -29,6 +29,8 @@ fn add(
     queries::add_memory(
         store,
         MemoryAddInput {
+            extract: true,
+            attachments: vec![],
             content: content.to_string(),
             category: category.to_string(),
             tags: vec![],
