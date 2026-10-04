@@ -854,8 +854,15 @@ fn parse_chat(
                 // `text_of` dropped — recovering those is the entire point.
                 let span = Some((start, offset));
                 let messages = extract_messages(&value);
-                let exported = ExportedColumns::from_record(&value)
-                    .or_else(|| Some(ExportedColumns::from_messages(&messages)));
+                // A session envelope also carries `cwd`, which is one of the
+                // exported columns, so it must not be read as an export.
+                let is_envelope = value.get("message").is_some_and(|m| m.is_object());
+                let from_envelope = Some(ExportedColumns::from_messages(&messages));
+                let exported = if is_envelope {
+                    from_envelope
+                } else {
+                    ExportedColumns::from_record(&value).or(from_envelope)
+                };
                 contents.extend(
                     filter_messages(&messages, extract_mode)
                         .into_iter()

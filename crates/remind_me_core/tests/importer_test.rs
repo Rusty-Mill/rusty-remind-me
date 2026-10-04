@@ -823,7 +823,8 @@ fn an_export_round_trips_the_v32_columns_and_a_plain_chat_defaults_them() {
     let ids = testing::memory_ids(&store).unwrap();
     assert_eq!(testing::memory_text(&store, &ids[0], "project").unwrap(), None);
     assert_eq!(testing::memory_f64(&store, &ids[0], "confidence").unwrap(), Some(1.0));
-    assert_eq!(column(&store, "written_by"), "unknown");
-    assert_eq!(column(&store, "capture_method"), "manual");
+    // Wave 1D: any chat import is written by the importer, automatically.
+    assert_eq!(column(&store, "written_by"), "importer:chat");
+    assert_eq!(column(&store, "capture_method"), "auto");
     std::fs::remove_dir_all(&dir).unwrap();
 }

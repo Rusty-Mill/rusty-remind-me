@@ -401,7 +401,7 @@ mod tests {
             .list(&first.dialog_id, 10)
             .unwrap();
         assert_eq!(revisions.len(), 1);
-        assert_eq!(revisions[0].reason.as_deref(), Some("recapture"));
+        assert_eq!(revisions[0].revision_reason.as_deref(), Some("recapture"));
         assert!(crate::db::sessions::Sessions::new(&store).get("s1").unwrap().is_some());
     }
 

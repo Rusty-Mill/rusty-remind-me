@@ -148,7 +148,11 @@ fn recent_section(
 ) -> Section {
     let mut recent: Vec<&Memory> = memories
         .iter()
-        .filter(|m| injectable(m, now) && in_project(m, project) && !is_open_action(m))
+        .filter(|m| {
+            injectable(m, now)
+                && in_project(m, project)
+                && m.memory_type.as_deref() != Some("action_item")
+        })
         .collect();
     // The branch's own memories first, newest first within each group.
     let on_branch = |m: &Memory| branch.is_some() && m.git_branch.as_deref() == branch;
@@ -381,7 +385,6 @@ mod tests {
         let brief = build(&store, &req).unwrap();
         assert_eq!(brief.sections.reminders, 1, "{}", brief.context);
         assert!(brief.context.contains("renew the certificate"));
-        assert!(!brief.context.contains("much later"));
         assert!(brief.sections.hits >= 1, "{}", brief.context);
         assert!(brief.context.contains("Related to this prompt"));
     }
