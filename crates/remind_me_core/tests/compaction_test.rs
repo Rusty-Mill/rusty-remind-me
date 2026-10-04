@@ -62,11 +62,6 @@ fn compaction_reclaims_the_logs_once_and_keeps_every_row() {
         assert!(queries::delete_memory(&db.store(), &gone).unwrap());
 
         let compacted = db.compact_store().unwrap();
-        // `REMIND_ME_STORE=sqlite` is how the suite runs on SQLite.
-        if std::env::var("REMIND_ME_STORE").as_deref() == Ok("sqlite") {
-            assert_eq!(compacted, 0, "SQLite reclaims space on its own terms");
-            return;
-        }
         assert!(compacted > 0, "the writes above left logs to fold");
         assert_eq!(
             db.compact_store().unwrap(),

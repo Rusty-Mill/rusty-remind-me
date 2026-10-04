@@ -84,30 +84,6 @@ fn a_deleted_memory_is_in_no_queue() {
 }
 
 #[test]
-fn a_broken_queue_reports_zero_rather_than_breaking_the_caller() {
-    // SQLite-only: a partially-migrated SQLite file is what this simulates.
-    let db = Database::open_sqlite_in_memory().unwrap();
-    let store = db.store();
-    // Simulates a partially-migrated database: the table a queue needs is
-    // gone. A status helper must not be the thing that breaks a search.
-    store
-        .sqlite()
-        .unwrap()
-        .execute("DROP TABLE memory_entities", [])
-        .unwrap();
-
-    let counts = pending_counts(&store);
-
-    assert_eq!(counts["unannotated_memories"], 0);
-    // The rest still report honestly rather than the whole call failing.
-    assert!(counts.contains_key("unclassified_memories"));
-}
-
-// ---------------------------------------------------------------------------
-// Capture health
-// ---------------------------------------------------------------------------
-
-#[test]
 fn never_configured_is_visible_rather_than_inferred() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();

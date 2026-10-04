@@ -258,25 +258,3 @@ fn the_migration_is_idempotent() {
     assert_eq!(renormalize_entity_ids(&store).unwrap(), 0);
 }
 
-#[test]
-fn opening_an_existing_database_migrates_it() {
-    let dir = std::env::temp_dir().join(format!("rrm_entity_id_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("memories.db");
-    let _ = std::fs::remove_file(&path);
-
-    let legacy = {
-        let db = Database::open_on_sqlite(&path).unwrap();
-        let store = db.store();
-        insert_legacy(&store, "Tasmania", "[]", "2026-01-01T00:00:00Z")
-    };
-
-    // Reopening runs the reconciler, which is where the rewrite lives.
-    let db = Database::open_on_sqlite(&path).unwrap();
-    let store = db.store();
-    assert!(get_entity_by_id(&store, &legacy).unwrap().is_none());
-    assert!(get_entity_by_name(&store, "tasmania").unwrap().is_some());
-
-    drop(store);
-    let _ = std::fs::remove_dir_all(&dir);
-}

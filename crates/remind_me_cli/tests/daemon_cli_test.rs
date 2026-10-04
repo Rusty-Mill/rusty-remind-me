@@ -87,12 +87,6 @@ impl Drop for Scratch {
     }
 }
 
-/// Whether the binary under test keeps its store on the engine: its
-/// default, unless `REMIND_ME_STORE=sqlite` (which it inherits).
-fn on_engine() -> bool {
-    !std::env::var("REMIND_ME_STORE").is_ok_and(|v| v.trim().eq_ignore_ascii_case("sqlite"))
-}
-
 #[test]
 fn cli_commands_through_the_daemon_print_what_they_print_in_process() {
     let store = Scratch::new("cli");
@@ -156,16 +150,10 @@ fn a_client_with_other_settings_falls_back_and_says_why() {
         stderr.contains("REMIND_ME_OUTBOX_RETENTION_DAYS"),
         "{stderr}"
     );
-    if on_engine() {
-        // The daemon holds the engine store, so the fallback cannot open
-        // it beside the daemon: it fails, and says how to release it.
-        assert!(!out.status.success());
-        assert!(stderr.contains("rusty-remind-me daemon stop"), "{stderr}");
-    } else {
-        assert!(out.status.success(), "{stderr}");
-        let listed: Value = serde_json::from_slice(&out.stdout).unwrap();
-        assert_eq!(listed["total"], 1, "the fallback still sees the store");
-    }
+    // The daemon holds the engine store, so the fallback cannot open it
+    // beside the daemon: it fails, and says how to release it.
+    assert!(!out.status.success());
+    assert!(stderr.contains("rusty-remind-me daemon stop"), "{stderr}");
 
     // A per-session setting is not a mismatch.
     let out = store

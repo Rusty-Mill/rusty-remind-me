@@ -5,7 +5,7 @@ mod test_env;
 
 use remind_me_core::backup::create_backup;
 use remind_me_core::db::queries;
-use remind_me_core::db::schema::SCHEMA_VERSION;
+use remind_me_core::db::SCHEMA_VERSION;
 use remind_me_core::db::Store;
 use remind_me_core::embedder::EMBEDDING_BACKEND_ENV;
 use remind_me_core::status::{server_status, SubsystemStatus};
@@ -76,24 +76,6 @@ fn a_fresh_process_reports_the_scheduler_as_not_running() {
 }
 
 #[test]
-fn a_stale_schema_version_is_reported_as_not_current() {
-    let db = Database::open_in_memory().unwrap();
-    let store = db.store();
-    store
-        .sqlite()
-        .unwrap()
-        .execute_batch("PRAGMA user_version = 3;")
-        .unwrap();
-
-    let report = server_status(&store).unwrap();
-
-    // A version mismatch is what makes a database unreadable to `remind_me`,
-    // so it is surfaced rather than left for a caller to infer.
-    assert_eq!(report.schema_version, 3);
-    assert!(!report.schema_current);
-}
-
-#[test]
 fn deleted_memories_are_not_counted() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
@@ -146,10 +128,10 @@ fn an_on_disk_database_reports_its_path_and_size() {
     assert!(report.database_bytes.unwrap() > 0);
     assert!(report.backup_dir.is_some());
 
-    // `store` is a `MutexGuard` borrowed from `db` -- dropping it only
-    // releases the lock. The actual `rusqlite::Connection` (and its open
-    // handle on `path`) lives inside `db` itself, so `db` has to go too
-    // before Windows will allow deleting the directory that holds it.
+    // `store` holds the database's lock -- dropping it only releases that.
+    // The engine tables (and their open handles under `path`) live inside
+    // `db` itself, so `db` has to go too before Windows will allow deleting
+    // the directory that holds them.
     drop(store);
     drop(db);
     std::fs::remove_dir_all(&dir).unwrap();
@@ -159,7 +141,7 @@ fn an_on_disk_database_reports_its_path_and_size() {
 fn backups_are_inventoried_newest_first() {
     let dir = scratch("backups");
     let path = dir.join("memories.db");
-    let db = Database::open_on_sqlite(&path).unwrap();
+    let db = Database::open(&path).unwrap();
     let store = db.store();
     add(&store, "a memory");
 

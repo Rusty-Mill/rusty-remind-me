@@ -32,7 +32,7 @@ fn db(name: &str) -> Database {
     let dir = std::env::temp_dir().join(format!("rrm_coderefs_db_{}_{}", name, std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    Database::open_on_sqlite(dir.join("memories.db").display().to_string()).unwrap()
+    Database::open(dir.join("memories.db").display().to_string()).unwrap()
 }
 
 /// A fresh directory to act as a code root, with one real file in it.
@@ -203,7 +203,7 @@ fn add_memory_anchors_when_configured() {
     let db = db("add_on");
     let store = db.store();
     let content = format!("don't refactor {} yet", fixture.file.display());
-    add(&store, &content);
+    let id = add(&store, &content);
 
     let candidates = stale_candidates(&store, 20).unwrap().candidates;
     // Nothing has changed yet, so nothing is stale -- but this proves the
@@ -211,10 +211,8 @@ fn add_memory_anchors_when_configured() {
     // appear here regardless of file state.
     assert!(candidates.is_empty(), "unchanged file must not be reported");
 
-    let recorded: String = store
-        .sqlite()
+    let recorded = remind_me_core::testing::memory_text(&store, &id, "metadata")
         .unwrap()
-        .query_row("SELECT metadata FROM memories LIMIT 1", [], |r| r.get(0))
         .unwrap();
     assert!(
         recorded.contains("code_refs"),
@@ -231,12 +229,10 @@ fn add_memory_records_nothing_when_unconfigured() {
     let db = db("add_off");
     let store = db.store();
     let content = format!("don't refactor {} yet", fixture.file.display());
-    add(&store, &content);
+    let id = add(&store, &content);
 
-    let recorded: String = store
-        .sqlite()
+    let recorded = remind_me_core::testing::memory_text(&store, &id, "metadata")
         .unwrap()
-        .query_row("SELECT metadata FROM memories LIMIT 1", [], |r| r.get(0))
         .unwrap();
     assert!(
         !recorded.contains("code_refs"),
@@ -298,14 +294,8 @@ fn a_stale_memory_is_flagged_not_touched() {
     let store = db.store();
     let memory_id = add(&store, &format!("see {}", fixture.file.display()));
 
-    let vitality_before: f64 = store
-        .sqlite()
+    let vitality_before = remind_me_core::testing::memory_f64(&store, &memory_id, "vitality")
         .unwrap()
-        .query_row(
-            "SELECT vitality FROM memories WHERE id = ?",
-            [&memory_id],
-            |r| r.get(0),
-        )
         .unwrap();
 
     std::fs::remove_file(&fixture.file).unwrap();
@@ -320,15 +310,13 @@ fn a_stale_memory_is_flagged_not_touched() {
     // the seed value a fresh `fact`/`manual` memory gets is a property of
     // `vitality.rs`'s priors, not of this feature, and hardcoding it here
     // would make this test wrong the moment those priors are tuned.
-    let row: (Option<String>, Option<String>, f64) = store
-        .sqlite()
-        .unwrap()
-        .query_row(
-            "SELECT superseded_by, deleted_at, vitality FROM memories WHERE id = ?",
-            [&memory_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .unwrap();
+    let row = (
+        remind_me_core::testing::memory_text(&store, &memory_id, "superseded_by").unwrap(),
+        remind_me_core::testing::memory_text(&store, &memory_id, "deleted_at").unwrap(),
+        remind_me_core::testing::memory_f64(&store, &memory_id, "vitality")
+            .unwrap()
+            .unwrap(),
+    );
     assert_eq!(row.0, None, "stale_candidates must not supersede");
     assert_eq!(row.1, None, "stale_candidates must not delete");
     assert_eq!(
@@ -465,13 +453,7 @@ fn a_hand_written_code_ref_outside_the_roots_is_never_stat_against() {
             "size": 0,
         }]
     });
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET metadata = ?1 WHERE id = ?2",
-            rusqlite::params![injected.to_string(), memory_id],
-        )
+    remind_me_core::testing::set_memory_column(&store, &memory_id, "metadata", injected.to_string())
         .unwrap();
 
     let candidates = stale_candidates(&store, 20).unwrap().candidates;

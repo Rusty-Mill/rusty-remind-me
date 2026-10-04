@@ -91,7 +91,7 @@ fn supersede(store: &Store<'_>) -> &'static str {
 
 #[test]
 fn a_superseded_memory_is_excluded_by_default() {
-    let db = Database::open_on_sqlite(":memory:").expect("db");
+    let db = Database::open_in_memory().expect("db");
     let store = db.store();
     let stale = supersede(&store);
 
@@ -110,7 +110,7 @@ fn a_superseded_memory_is_excluded_by_default() {
 
 #[test]
 fn include_deleted_brings_the_superseded_memory_back() {
-    let db = Database::open_on_sqlite(":memory:").expect("db");
+    let db = Database::open_in_memory().expect("db");
     let store = db.store();
     let stale = supersede(&store);
 
@@ -129,20 +129,14 @@ fn include_deleted_brings_the_superseded_memory_back() {
 /// hard-deletes otherwise.
 #[test]
 fn a_tombstoned_memory_is_excluded_by_default() {
-    let db = Database::open_on_sqlite(":memory:").expect("db");
+    let db = Database::open_in_memory().expect("db");
     let store = db.store();
     let id = add(&store, "a note that gets deleted", None);
     add(&store, "a note that survives", None);
 
     // Tombstone directly rather than via `delete_memory`, so this test does not
     // depend on sync being configured in the test environment.
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET deleted_at = ? WHERE id = ?",
-            rusqlite::params!["2026-01-01T00:00:00Z", id],
-        )
+    remind_me_core::testing::set_memory_column(&store, &id, "deleted_at", "2026-01-01T00:00:00Z")
         .expect("tombstone");
 
     let contents = exported_contents(&store, false);
@@ -166,17 +160,11 @@ fn a_tombstoned_memory_is_excluded_by_default() {
 /// used a tombstone alone.
 #[test]
 fn both_exclusions_apply_together() {
-    let db = Database::open_on_sqlite(":memory:").expect("db");
+    let db = Database::open_in_memory().expect("db");
     let store = db.store();
     let stale = supersede(&store);
     let doomed = add(&store, "a note that gets deleted", None);
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET deleted_at = ? WHERE id = ?",
-            rusqlite::params!["2026-01-01T00:00:00Z", doomed],
-        )
+    remind_me_core::testing::set_memory_column(&store, &doomed, "deleted_at", "2026-01-01T00:00:00Z")
         .expect("tombstone");
 
     let contents = exported_contents(&store, false);
@@ -197,7 +185,7 @@ fn both_exclusions_apply_together() {
 /// The default must not quietly drop live memories along with the dead ones.
 #[test]
 fn ordinary_memories_are_unaffected() {
-    let db = Database::open_on_sqlite(":memory:").expect("db");
+    let db = Database::open_in_memory().expect("db");
     let store = db.store();
     for note in ["first", "second", "third"] {
         add(&store, note, None);

@@ -87,7 +87,7 @@ fn last_seq(store: &dyn HubStore) -> i64 {
 }
 
 fn copy(source: &Path, target: &Path) -> MultimodalHubStore {
-    let snapshot = import::sqlite::read(source).expect("read the source");
+    let snapshot = import::legacy_sqlite::read(source).expect("read the source");
     assert!(snapshot.validate().is_empty(), "{:?}", snapshot.validate());
     let store = MultimodalHubStore::create_from_snapshot(target, &snapshot).expect("copy");
     import::verify(&snapshot, &store).expect("the copy verifies");
@@ -166,7 +166,7 @@ fn ids_the_engine_cannot_store_are_listed_and_never_copied_silently() {
     let dir = Scratch::new("invalid");
     sqlite_hub(&dir.path("hub.db"), INVALID_HUB);
 
-    let snapshot = import::sqlite::read(&dir.path("hub.db")).unwrap();
+    let snapshot = import::legacy_sqlite::read(&dir.path("hub.db")).unwrap();
     let rejected = snapshot.validate();
     let tables: Vec<&str> = rejected.iter().map(|r| r.table).collect();
     assert_eq!(tables, ["memories", "memory_entities"], "{rejected:?}");
@@ -192,7 +192,7 @@ fn reading_the_source_writes_nothing_to_it() {
     let path = dir.path("hub.db");
     sqlite_hub(&path, SCRIPT_HUB);
     let before = std::fs::read(&path).unwrap();
-    import::sqlite::read(&path).unwrap();
+    import::legacy_sqlite::read(&path).unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), before);
 }
 
@@ -206,7 +206,7 @@ fn a_copy_never_lands_in_a_directory_that_holds_anything() {
 
     let err = MultimodalHubStore::check_copy_target(&target).unwrap_err();
     assert!(err.0.contains("not empty"), "{}", err.0);
-    let snapshot = import::sqlite::read(&dir.path("hub.db")).unwrap();
+    let snapshot = import::legacy_sqlite::read(&dir.path("hub.db")).unwrap();
     assert!(MultimodalHubStore::create_from_snapshot(&target, &snapshot).is_err());
 }
 

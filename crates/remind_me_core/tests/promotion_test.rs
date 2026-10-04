@@ -12,6 +12,7 @@
 #[path = "../src/test_env.rs"]
 mod test_env;
 
+use remind_me_core::db::memories::{ListFilter, Memories, NewMemory};
 use remind_me_core::db::Store;
 use remind_me_core::entity::link_memory_entity;
 use remind_me_core::promotion::{
@@ -20,28 +21,24 @@ use remind_me_core::promotion::{
 use remind_me_core::{
     Database, EntityInput, PromoteInput, Rung, FACT_CATEGORY, PERSONA_CATEGORY, SCENARIO_CATEGORY,
 };
-use rusqlite::params;
 
 fn db(name: &str) -> Database {
     let dir = std::env::temp_dir().join(format!("rrm_promo_{}_{}", name, std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    Database::open_on_sqlite(dir.join("memories.db").display().to_string()).unwrap()
+    Database::open(dir.join("memories.db").display().to_string()).unwrap()
 }
 
 /// Insert a memory directly. Promotion reads categories and flags, not the
 /// path a memory arrived by, so seeding beats driving six tools per fixture.
 fn seed(store: &Store<'_>, id: &str, content: &str, category: &str, sensitive: bool) {
     let now = chrono::Utc::now().to_rfc3339();
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "INSERT INTO memories (id, content, category, tags, source, metadata,
-            created_at, updated_at, vitality, sensitive)
-         VALUES (?, ?, ?, '[]', 'manual', '{}', ?, ?, 1.0, ?)",
-            params![id, content, category, now, now, sensitive as i64],
-        )
+    Memories::new(store)
+        .insert(&NewMemory {
+            category: category.to_string(),
+            sensitive,
+            ..NewMemory::new(id, content, &now)
+        })
         .unwrap();
 }
 
@@ -74,14 +71,7 @@ fn facts_about(store: &Store<'_>, entity_name: &str, count: usize) -> Vec<String
 }
 
 fn supersede(store: &Store<'_>, id: &str) {
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET superseded_by = 'mem_newer' WHERE id = ?",
-            params![id],
-        )
-        .unwrap();
+    remind_me_core::testing::set_memory_column(store, id, "superseded_by", "mem_newer").unwrap();
 }
 
 #[test]
@@ -270,13 +260,15 @@ fn a_sensitive_source_cannot_become_persona() {
 
     assert!(matches!(err, PromotionError::SensitiveSource(_)));
     // A refused promotion writes nothing at all.
-    let rows: i64 = store
-        .sqlite()
-        .unwrap()
-        .query_row(
-            "SELECT count(*) FROM memories WHERE category = ?",
-            params![PERSONA_CATEGORY],
-            |r| r.get(0),
+    let (rows, _) = Memories::new(&store)
+        .list_page(
+            &ListFilter {
+                include_sensitive: true,
+                category: Some(PERSONA_CATEGORY.to_string()),
+                ..ListFilter::default()
+            },
+            1,
+            0,
         )
         .unwrap();
     assert_eq!(rows, 0);
@@ -342,21 +334,19 @@ fn a_promotion_with_an_unusable_source_is_refused_whole() {
 
     assert!(matches!(err, PromotionError::UnusableSource(ref id) if id == "mem_missing"));
     // Validated before the insert, so no partially-linked artifact is left.
-    let rows: i64 = store
-        .sqlite()
-        .unwrap()
-        .query_row(
-            "SELECT count(*) FROM memories WHERE category = ?",
-            params![PERSONA_CATEGORY],
-            |r| r.get(0),
+    let (rows, _) = Memories::new(&store)
+        .list_page(
+            &ListFilter {
+                include_sensitive: true,
+                category: Some(PERSONA_CATEGORY.to_string()),
+                ..ListFilter::default()
+            },
+            1,
+            0,
         )
         .unwrap();
     assert_eq!(rows, 0);
-    let links: i64 = store
-        .sqlite()
-        .unwrap()
-        .query_row("SELECT count(*) FROM promotions", [], |r| r.get(0))
-        .unwrap();
+    let links = remind_me_core::testing::count(&store, remind_me_core::testing::Table::Promotions).unwrap();
     assert_eq!(links, 0);
 }
 
@@ -400,13 +390,15 @@ fn promoting_the_same_sources_twice_is_rejected() {
     }
 
     // Exactly one scenario memory exists for this evidence, not two.
-    let rows: i64 = store
-        .sqlite()
-        .unwrap()
-        .query_row(
-            "SELECT count(*) FROM memories WHERE category = ?",
-            params![SCENARIO_CATEGORY],
-            |r| r.get(0),
+    let (rows, _) = Memories::new(&store)
+        .list_page(
+            &ListFilter {
+                include_sensitive: true,
+                category: Some(SCENARIO_CATEGORY.to_string()),
+                ..ListFilter::default()
+            },
+            1,
+            0,
         )
         .unwrap();
     assert_eq!(rows, 1);

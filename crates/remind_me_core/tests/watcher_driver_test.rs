@@ -43,8 +43,7 @@ impl Drop for Scratch {
     }
 }
 
-/// A database on disk. The loop opens its own connection by path, so an
-/// in-memory database would give it a different, empty store.
+/// A database on disk: the loop runs only against one with a path.
 struct TempDb(PathBuf);
 
 impl TempDb {
@@ -80,30 +79,23 @@ fn wait_for(what: &str, mut check: impl FnMut() -> bool) {
     panic!("timed out waiting for {what}");
 }
 
-fn memory_count(path: &std::path::Path) -> usize {
-    let store = rusqlite::Connection::open(path).unwrap();
-    store
-        .query_row(
-            "SELECT COUNT(*) FROM memories WHERE deleted_at IS NULL",
-            [],
-            |r| r.get::<_, i64>(0),
-        )
-        .unwrap_or(0) as usize
+/// The live memories in `db`.
+fn memory_count(db: &Database) -> i64 {
+    remind_me_core::db::stats::StoreStats::new(&db.store())
+        .live_memories()
+        .unwrap_or(0)
 }
 
-/// Start a watcher over `dir` against `db_path`, with a 1-second interval.
-fn start(dir: &std::path::Path, db_path: &std::path::Path) -> Option<WatcherHandle> {
+/// Start a watcher over `dir` against the database at `db_path`, with a
+/// 1-second interval. The database comes back too: the engine directory
+/// has one opener, so the test reads through the same one the loop shares.
+fn start(dir: &std::path::Path, db_path: &std::path::Path) -> (Database, Option<WatcherHandle>) {
     crate::test_env::set_var(WATCH_DIRS_ENV, dir.display().to_string());
     crate::test_env::set_var("REMIND_ME_WATCH_INTERVAL", "1");
     crate::test_env::set_var("REMIND_ME_WATCH_GRACE", "0");
-    let db = Database::open_on_sqlite(db_path).unwrap();
-    // Bound rather than passed inline: `db.store()` borrows `db`, and the
-    // handle does not, so the connection has to be dropped before `db` goes
-    // out of scope at the end of this function.
-    let store = db.store();
-    let handle = start_watcher_for(&store);
-    drop(store);
-    handle
+    let db = Database::open(db_path).unwrap();
+    let handle = start_watcher_for(&db.store());
+    (db, handle)
 }
 
 fn clear_env() {
@@ -125,10 +117,11 @@ fn the_loop_ingests_a_file_without_anyone_calling_scan_once() {
     )
     .unwrap();
 
-    let handle = start(&scratch.0, &db.0).expect("watcher should start");
+    let (database, handle) = start(&scratch.0, &db.0);
+    let handle = handle.expect("watcher should start");
 
     wait_for("the watched file to be ingested", || {
-        memory_count(&db.0) > 0
+        memory_count(&database) > 0
     });
 
     handle.stop();
@@ -142,7 +135,8 @@ fn status_reports_the_running_loop_rather_than_a_fresh_watcher() {
     let db = TempDb::new("status");
     std::fs::write(scratch.0.join("note.md"), "# Note\n\nBody text here.\n").unwrap();
 
-    let handle = start(&scratch.0, &db.0).expect("watcher should start");
+    let (_database, handle) = start(&scratch.0, &db.0);
+    let handle = handle.expect("watcher should start");
 
     // `running` is the field that had no honest value before this.
     wait_for("the loop to report itself running", || {
@@ -172,7 +166,8 @@ fn stopping_the_watcher_clears_the_running_status() {
     let scratch = Scratch::new("stop");
     let db = TempDb::new("stop");
 
-    let handle = start(&scratch.0, &db.0).expect("watcher should start");
+    let (_database, handle) = start(&scratch.0, &db.0);
+    let handle = handle.expect("watcher should start");
     wait_for("the loop to register itself", || {
         remind_me_core::watcher::live_status().is_some()
     });
@@ -193,7 +188,7 @@ fn no_watch_dirs_means_no_loop() {
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_env();
     let db = TempDb::new("nodirs");
-    let database = Database::open_on_sqlite(&db.0).unwrap();
+    let database = Database::open(&db.0).unwrap();
 
     assert!(
         start_watcher_for(&database.store()).is_none(),
@@ -204,9 +199,9 @@ fn no_watch_dirs_means_no_loop() {
 
 #[test]
 fn an_in_memory_database_does_not_start_a_loop() {
-    // The loop opens its own connection by path, so `:memory:` would give it a
-    // different, empty database and it would ingest into a store nobody can
-    // read. Same reason the scheduler refuses.
+    // An in-memory database lives only as long as its `Database`, so there
+    // is nothing a background thread could outlive it on. Same reason the
+    // scheduler refuses.
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let scratch = Scratch::new("inmem");
     crate::test_env::set_var(WATCH_DIRS_ENV, scratch.0.display().to_string());
@@ -214,7 +209,7 @@ fn an_in_memory_database_does_not_start_a_loop() {
     let db = Database::open_in_memory().unwrap();
     assert!(
         start_watcher_for(&db.store()).is_none(),
-        "an in-memory database has no path for the loop's own connection"
+        "an in-memory database has nothing a background loop can hold"
     );
 
     clear_env();

@@ -3,7 +3,7 @@
 //! the hub and every discovered peer), so a hub that accepted a connection
 //! but never answered blocked every other database read or write for up to
 //! that call's full I/O timeout. `SyncWorker` now works its own
-//! `Database::open_secondary()` connection instead, so an ordinary read
+//! store over the shared engine tables instead, so an ordinary read
 //! made while a cycle is stuck talking to a dead remote stays fast.
 //!
 //! `REMIND_ME_NODE_ID`/`REMIND_ME_HUB_URL`/`REMIND_ME_SYNC_SECRET` are
@@ -58,10 +58,7 @@ fn a_stuck_hub_never_blocks_an_ordinary_database_read() {
     std::thread::sleep(Duration::from_millis(300));
 
     let start = Instant::now();
-    db.store()
-        .sqlite()
-        .unwrap()
-        .query_row("SELECT 1", [], |_| Ok(()))
+    remind_me_core::testing::count(&db.store(), remind_me_core::testing::Table::Memories)
         .expect("a plain local read");
     let elapsed = start.elapsed();
 

@@ -100,40 +100,6 @@ fn the_series_is_oldest_first() {
 }
 
 #[test]
-fn a_malformed_stored_value_does_not_take_the_chart_down() {
-    // A malformed value can only be planted with SQL, so this runs on an
-    // on-disk SQLite database; the decoding it relies on is shared with the
-    // engine and unit-tested in `db::stats`.
-    let dir = std::env::temp_dir().join(format!("rrm_analytics_malformed_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let db = Database::open_on_sqlite(dir.join("memory.db")).unwrap();
-    let store = db.store();
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "INSERT INTO analytics_snapshots
-             (captured_at, total_memories, vitality_buckets, category_counts)
-         VALUES ('2026-01-01T00:00:00+00:00', 5, 'not json', '{}')",
-            [],
-        )
-        .unwrap();
-
-    let series = trend(&store).unwrap();
-
-    // One bad row degrades to empty maps rather than failing the whole read.
-    // The alternative is a chart that goes blank because of a single row
-    // nobody can see.
-    assert_eq!(series.len(), 1);
-    assert_eq!(series[0].total_memories, 5);
-    assert!(series[0].vitality_buckets.is_empty());
-    drop(store);
-    drop(db);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
 fn a_new_install_has_an_empty_series_not_an_error() {
     let db = Database::open_in_memory().unwrap();
 

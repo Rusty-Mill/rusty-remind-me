@@ -126,17 +126,17 @@ fn an_edited_file_is_re_ingested_and_supersedes_its_previous_import() {
 fn supersession_leaves_a_deleted_memory_alone() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "INSERT INTO memories (id, content, category, tags, source, metadata,
-                               created_at, updated_at, deleted_at)
-         VALUES ('mem_gone', 'removed on purpose', 'general', '[]', 'document_import',
-                 '{\"import_id\": \"imp_old\"}', '2026-01-01T00:00:00Z',
-                 '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z')",
-            [],
-        )
+    remind_me_core::db::memories::Memories::new(&store)
+        .insert(&remind_me_core::db::memories::NewMemory {
+            source: "document_import".to_string(),
+            metadata: serde_json::json!({"import_id": "imp_old"}),
+            deleted_at: Some("2026-01-02T00:00:00Z".to_string()),
+            ..remind_me_core::db::memories::NewMemory::new(
+                "mem_gone",
+                "removed on purpose",
+                "2026-01-01T00:00:00Z",
+            )
+        })
         .unwrap();
 
     let superseded = supersede_import(&store, "imp_old", "imp_new").unwrap();
@@ -145,15 +145,8 @@ fn supersession_leaves_a_deleted_memory_alone() {
     // deleted — superseding it would be a silent write to a record they had
     // already decided about.
     assert_eq!(superseded, 0);
-    let still_deleted: Option<String> = store
-        .sqlite()
-        .unwrap()
-        .query_row(
-            "SELECT superseded_by FROM memories WHERE id = 'mem_gone'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let still_deleted =
+        remind_me_core::testing::memory_text(&store, "mem_gone", "superseded_by").unwrap();
     assert!(still_deleted.is_none());
 }
 

@@ -27,7 +27,6 @@ use remind_me_core::sync::{
     NODE_ID_ENV,
 };
 use remind_me_core::{db::queries, Database};
-use rusqlite::params;
 use std::sync::Mutex;
 
 /// `REMIND_ME_CLIENT`, `REMIND_ME_NODE_ID` and the handshake slot are all
@@ -60,23 +59,24 @@ fn db(name: &str) -> Database {
     let dir = std::env::temp_dir().join(format!("rrm_prov_{}_{}", name, std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    Database::open_on_sqlite(dir.join("memories.db").display().to_string()).unwrap()
+    Database::open(dir.join("memories.db").display().to_string()).unwrap()
 }
 
 /// Every non-deleted memory's `(node_id, client)`, so a path that writes more
 /// than one row (a capture writes two) cannot pass by having only one right.
 fn stamps(store: &Store<'_>) -> Vec<(Option<String>, String)> {
-    let mut stmt = store
-        .sqlite()
+    remind_me_core::testing::memory_ids(store)
         .unwrap()
-        .prepare("SELECT node_id, client FROM memories ORDER BY rowid")
-        .unwrap();
-    let rows = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-    rows
+        .iter()
+        .map(|id| {
+            (
+                remind_me_core::testing::memory_text(store, id, "node_id").unwrap(),
+                remind_me_core::testing::memory_text(store, id, "client")
+                    .unwrap()
+                    .unwrap_or_default(),
+            )
+        })
+        .collect()
 }
 
 fn assert_all_stamped(store: &Store<'_>, path: &str, expected_rows: usize) {
@@ -180,15 +180,13 @@ fn a_promoted_memory_is_stamped() {
     let store = db.store();
 
     let now = chrono::Utc::now().to_rfc3339();
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "INSERT INTO memories (id, content, category, tags, source, metadata,
-            created_at, updated_at, vitality, node_id, client)
-         VALUES ('mem_src', 'scenario source', 'scenario', '[]', 'manual', '{}', ?, ?, 1.0, ?, ?)",
-            params![now, now, TEST_NODE, TEST_CLIENT],
-        )
+    remind_me_core::db::memories::Memories::new(&store)
+        .insert(&remind_me_core::db::memories::NewMemory {
+            category: "scenario".to_string(),
+            node_id: Some(TEST_NODE.to_string()),
+            client: TEST_CLIENT.to_string(),
+            ..remind_me_core::db::memories::NewMemory::new("mem_src", "scenario source", &now)
+        })
         .unwrap();
 
     remind_me_core::promotion::promote(

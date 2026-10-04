@@ -286,7 +286,7 @@ fn the_running_loop_delivers_without_anyone_calling_a_tool() {
     let dir = TempDir::new("loop");
     let path = dir.db_path();
     {
-        let db = Database::open_on_sqlite(&path).unwrap();
+        let db = Database::open(&path).unwrap();
         let store = db.store();
         let id = add(&store, "fires on its own");
         force_due(&store, &id, &past(1));
@@ -297,14 +297,11 @@ fn the_running_loop_delivers_without_anyone_calling_a_tool() {
     // by hand, which would pass just as happily against a loop that never ran.
     let _env = POLL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     crate::test_env::set_var(remind_me_core::scheduler::POLL_INTERVAL_ENV, "1");
-    let scheduler = remind_me_core::scheduler::start_scheduler(
-        Database::open_on_sqlite(&path)
-            .unwrap()
-            .secondary_source()
-            .unwrap(),
-    );
-
-    let observer = Database::open_on_sqlite(&path).unwrap();
+    // One open: the engine directory has one opener, so the observer is the
+    // same database the loop's source came from.
+    let observer = Database::open(&path).unwrap();
+    let scheduler =
+        remind_me_core::scheduler::start_scheduler(observer.secondary_source().unwrap());
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     let mut delivered = 0i64;
     while std::time::Instant::now() < deadline {
@@ -327,7 +324,7 @@ fn the_running_loop_delivers_without_anyone_calling_a_tool() {
 fn stopping_the_loop_does_not_wait_out_the_poll_interval() {
     let dir = TempDir::new("stop");
     let path = dir.db_path();
-    drop(Database::open_on_sqlite(&path).unwrap());
+    drop(Database::open(&path).unwrap());
 
     // A long interval, so a `thread::sleep` loop would block shutdown for
     // most of it. Shutdown has to interrupt the wait, or stopping a server
@@ -335,7 +332,7 @@ fn stopping_the_loop_does_not_wait_out_the_poll_interval() {
     let _env = POLL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     crate::test_env::set_var(remind_me_core::scheduler::POLL_INTERVAL_ENV, "3600");
     let scheduler = remind_me_core::scheduler::start_scheduler(
-        Database::open_on_sqlite(&path)
+        Database::open(&path)
             .unwrap()
             .secondary_source()
             .unwrap(),

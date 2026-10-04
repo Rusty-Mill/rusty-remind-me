@@ -11,6 +11,7 @@
 mod test_env;
 
 use remind_me_core::db::queries::search_with_expansions;
+use remind_me_core::db::memories::{Memories, NewMemory};
 use remind_me_core::db::Store;
 use remind_me_core::models::MemorySearchInput;
 use remind_me_core::promotion::{
@@ -18,7 +19,6 @@ use remind_me_core::promotion::{
     BOOTSTRAP_RESERVE_MAX,
 };
 use remind_me_core::{Database, PromoteInput, Rung, FACT_CATEGORY, PERSONA_CATEGORY};
-use rusqlite::params;
 use std::sync::Mutex;
 
 /// `REMIND_ME_BOOTSTRAP_RESERVE` is process-global; serialize the tests that
@@ -29,20 +29,17 @@ fn db(name: &str) -> Database {
     let dir = std::env::temp_dir().join(format!("rrm_boot_{}_{}", name, std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    Database::open_on_sqlite(dir.join("memories.db").display().to_string()).unwrap()
+    Database::open(dir.join("memories.db").display().to_string()).unwrap()
 }
 
 fn seed(store: &Store<'_>, id: &str, content: &str, category: &str, sensitive: bool) {
     let now = chrono::Utc::now().to_rfc3339();
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "INSERT INTO memories (id, content, category, tags, source, metadata,
-            created_at, updated_at, vitality, sensitive)
-         VALUES (?, ?, ?, '[]', 'manual', '{}', ?, ?, 1.0, ?)",
-            params![id, content, category, now, now, sensitive as i64],
-        )
+    Memories::new(store)
+        .insert(&NewMemory {
+            category: category.to_string(),
+            sensitive,
+            ..NewMemory::new(id, content, &now)
+        })
         .unwrap();
     // Planted with raw SQL, so it needs indexing to be searchable, and to be
     // deletable without the full-text index losing track of it.
@@ -72,14 +69,7 @@ fn persona_from(store: &Store<'_>, source_id: &str, content: &str) -> String {
 }
 
 fn supersede(store: &Store<'_>, id: &str) {
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "UPDATE memories SET superseded_by = 'mem_newer' WHERE id = ?",
-            params![id],
-        )
-        .unwrap();
+    remind_me_core::testing::set_memory_column(store, id, "superseded_by", "mem_newer").unwrap();
 }
 
 fn search(
@@ -306,13 +296,12 @@ fn sensitive_statements_never_enter_the_bootstrap() {
         PERSONA_CATEGORY,
         true,
     );
-    store
-        .sqlite()
-        .unwrap()
-        .execute(
-            "INSERT INTO promotions (promoted_id, source_id, rung, promoted_at)
-         VALUES ('mem_sens_persona', 'mem_sens_src', 'scenario_to_persona', ?)",
-            params![chrono::Utc::now().to_rfc3339()],
+    remind_me_core::db::promotions::Promotions::new(&store)
+        .record(
+            "mem_sens_persona",
+            "mem_sens_src",
+            "scenario_to_persona",
+            &chrono::Utc::now().to_rfc3339(),
         )
         .unwrap();
 
@@ -320,15 +309,10 @@ fn sensitive_statements_never_enter_the_bootstrap() {
     // than for having lost its grounds -- otherwise this would pass for the
     // wrong reason.
     assert_eq!(
-        store
-            .sqlite()
+        remind_me_core::db::promotions::Promotions::new(&store)
+            .sources_of("mem_sens_persona")
             .unwrap()
-            .query_row(
-                "SELECT count(*) FROM promotions WHERE promoted_id = 'mem_sens_persona'",
-                [],
-                |r| r.get::<_, i64>(0)
-            )
-            .unwrap(),
+            .len(),
         1
     );
     assert!(bootstrap(&store, 800).unwrap().is_empty());

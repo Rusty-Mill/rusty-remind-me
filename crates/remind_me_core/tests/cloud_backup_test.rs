@@ -186,7 +186,7 @@ fn a_refused_upload_does_not_stop_the_local_backup() {
     // the env var was inert. Now that the variable is genuinely honoured for
     // database resolution (#218), leaving a decorative set_var here would be
     // actively misleading rather than merely unused.
-    let db = remind_me_core::Database::open_on_sqlite(dir.join("memories.db")).unwrap();
+    let db = remind_me_core::Database::open(dir.join("memories.db")).unwrap();
     let outcome = remind_me_core::backup::create_backup(&db.store(), "test").unwrap();
 
     // The local copy is the one that has to survive. A refused upload is

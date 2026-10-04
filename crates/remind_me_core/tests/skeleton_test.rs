@@ -18,7 +18,7 @@ fn db(name: &str) -> Database {
     let dir = std::env::temp_dir().join(format!("rrm_skel_{}_{}", name, std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    Database::open_on_sqlite(dir.join("memories.db").display().to_string()).unwrap()
+    Database::open(dir.join("memories.db").display().to_string()).unwrap()
 }
 
 /// A transcript long enough that reading it is a real cost — 120 turns, each
@@ -217,15 +217,12 @@ fn writing_again_replaces_rather_than_accumulates() {
         .unwrap();
     }
 
-    let stored: i64 = store
-        .sqlite()
+    let stored = remind_me_core::db::curation::Curation::new(&store)
+        .capture_rows(&capture_id)
         .unwrap()
-        .query_row(
-            "SELECT count(*) FROM memories WHERE capture_id = ? AND category = ?",
-            rusqlite::params![capture_id, SKELETON_CATEGORY],
-            |r| r.get(0),
-        )
-        .unwrap();
+        .iter()
+        .filter(|m| m.category == SKELETON_CATEGORY)
+        .count();
     assert_eq!(stored, 1, "a capture has one shape, not a history of them");
     assert_eq!(
         read_skeleton(&store, &capture_id).unwrap().unwrap().mermaid,

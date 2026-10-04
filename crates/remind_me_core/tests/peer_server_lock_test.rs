@@ -2,7 +2,7 @@
 //! process-wide mutex across the whole of `serve_once`, including reading
 //! an incoming request -- so a slow or stuck peer connection blocked every
 //! other database read or write for up to `IO_TIMEOUT`. `PeerServer` now
-//! works its own `Database::open_secondary()` connection instead, mirroring
+//! works on its own store over the shared engine tables instead, mirroring
 //! `SyncWorker`'s own fix for the identical shape of bug on the outbound
 //! side (see `sync_worker_lock_test.rs`).
 //!
@@ -51,10 +51,7 @@ fn a_stuck_peer_connection_never_blocks_an_ordinary_database_read() {
     std::thread::sleep(Duration::from_millis(300));
 
     let start = Instant::now();
-    db.store()
-        .sqlite()
-        .unwrap()
-        .query_row("SELECT 1", [], |_| Ok(()))
+    remind_me_core::testing::count(&db.store(), remind_me_core::testing::Table::Memories)
         .expect("a plain local read");
     let elapsed = start.elapsed();
 

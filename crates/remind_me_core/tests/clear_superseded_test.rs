@@ -55,15 +55,7 @@ fn update(store: &Store<'_>, id: &str, clear_superseded: bool) -> UpdateOutcome 
 }
 
 fn superseded_by(store: &Store<'_>, id: &str) -> Option<String> {
-    store
-        .sqlite()
-        .unwrap()
-        .query_row(
-            "SELECT superseded_by FROM memories WHERE id = ?",
-            [id],
-            |r| r.get(0),
-        )
-        .expect("row")
+    remind_me_core::testing::memory_text(store, id, "superseded_by").expect("row")
 }
 
 /// Build the situation this flag exists to recover from: two memories sharing
@@ -101,7 +93,7 @@ fn supersede(store: &Store<'_>) -> (String, String) {
 
 #[test]
 fn clearing_unhides_a_superseded_memory() {
-    let db = Database::open_on_sqlite(":memory:").expect("db");
+    let db = Database::open_in_memory().expect("db");
     let store = db.store();
     let (first, _) = supersede(&store);
 
@@ -118,7 +110,7 @@ fn clearing_unhides_a_superseded_memory() {
 
 #[test]
 fn omitting_the_flag_leaves_the_pointer_alone() {
-    let db = Database::open_on_sqlite(":memory:").expect("db");
+    let db = Database::open_in_memory().expect("db");
     let store = db.store();
     let (first, second) = supersede(&store);
 
@@ -148,7 +140,7 @@ fn omitting_the_flag_leaves_the_pointer_alone() {
 /// the superseding" — clearing must not cascade.
 #[test]
 fn clearing_does_not_touch_the_superseding_memory() {
-    let db = Database::open_on_sqlite(":memory:").expect("db");
+    let db = Database::open_in_memory().expect("db");
     let store = db.store();
     let (first, second) = supersede(&store);
 
@@ -169,7 +161,7 @@ fn clearing_does_not_touch_the_superseding_memory() {
 /// clearing it is what actually brings the memory back.
 #[test]
 fn a_cleared_memory_is_searchable_again() {
-    let db = Database::open_on_sqlite(":memory:").expect("db");
+    let db = Database::open_in_memory().expect("db");
     let store = db.store();
     let (first, _) = supersede(&store);
 
@@ -195,7 +187,7 @@ fn a_cleared_memory_is_searchable_again() {
 /// `clear_superseded` alone is a real update, not "no fields provided".
 #[test]
 fn the_flag_alone_counts_as_an_update() {
-    let db = Database::open_on_sqlite(":memory:").expect("db");
+    let db = Database::open_in_memory().expect("db");
     let store = db.store();
     let (first, _) = supersede(&store);
 
@@ -209,7 +201,7 @@ fn the_flag_alone_counts_as_an_update() {
 /// to false must not turn every empty update into a write.
 #[test]
 fn an_empty_update_is_still_no_fields() {
-    let db = Database::open_on_sqlite(":memory:").expect("db");
+    let db = Database::open_in_memory().expect("db");
     let store = db.store();
     let id = add(&store, "a standalone note", None);
 
@@ -222,7 +214,7 @@ fn an_empty_update_is_still_no_fields() {
 /// Clearing a memory that was never superseded is a no-op, not an error.
 #[test]
 fn clearing_an_unsuperseded_memory_is_harmless() {
-    let db = Database::open_on_sqlite(":memory:").expect("db");
+    let db = Database::open_in_memory().expect("db");
     let store = db.store();
     let id = add(&store, "a standalone note", None);
 

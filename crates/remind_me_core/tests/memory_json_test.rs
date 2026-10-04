@@ -20,16 +20,12 @@ use remind_me_core::db::Store;
 use remind_me_core::{Database, MemoryAddInput};
 use std::collections::BTreeSet;
 
-/// Every column of `memories`, read from the database the crate actually opens.
-fn schema_columns(store: &Store<'_>) -> BTreeSet<String> {
-    let mut stmt = store
-        .sqlite()
-        .unwrap()
-        .prepare("PRAGMA table_info(memories)")
-        .unwrap();
-    stmt.query_map([], |r| r.get::<_, String>(1))
-        .unwrap()
-        .map(|r| r.unwrap())
+/// Every column of `memories`, as the store names them (the schema the
+/// engine's records mirror).
+fn schema_columns(_store: &Store<'_>) -> BTreeSet<String> {
+    remind_me_core::testing::MEMORY_COLUMNS
+        .iter()
+        .map(|c| c.to_string())
         .collect()
 }
 
@@ -72,8 +68,8 @@ fn the_serialised_memory_covers_every_schema_column() {
         missing.is_empty(),
         "these `memories` columns are stored but never serialised, so no client \
          can see them: {missing:?}\n\
-         Add them to `Memory` (models.rs), to MEMORY_COLUMNS and to \
-         parse_memory_row (db/queries.rs)."
+         Add them to `Memory` (models.rs), to `testing::MEMORY_COLUMNS` and to \
+         the engine's `MemoryRow` (db/engine/memories.rs)."
     );
 }
 

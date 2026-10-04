@@ -170,98 +170,6 @@ fn a_real_content_change_still_reaches_the_outbox() {
     assert_eq!(operation, "update");
 }
 
-/// The triggers schema v30 and earlier carried.
-const V30_TRIGGERS: &str = include_str!("fixtures/schema_v30_triggers.sql");
-
-#[test]
-fn an_older_databases_triggers_are_dropped_on_open() {
-    ensure_sync_enabled();
-    let dir = std::env::temp_dir().join(format!("rrm_outbox_trigger_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("memories.db");
-    let _ = std::fs::remove_file(&path);
-
-    // Raw SQL below: this is about SQLite triggers in an on-disk file.
-    let id = {
-        let db = Database::open_on_sqlite(&path).unwrap();
-        let store = db.store();
-        let id = add(&store, "quokka sighting");
-
-        // Put the triggers of schema v30 back, as an older build left them,
-        // with the pre-#100 `memories_outbox_au` that has no `updated_at`
-        // guard. Left in place, they would do the repositories' work a second
-        // time: every edit queued twice, and every read queued at all.
-        // Only the outbox triggers: with the index triggers as well, the
-        // full-text index would be written twice and corrupt before the
-        // reopen this test is about.
-        let stale: String = V30_TRIGGERS
-            .split("CREATE TRIGGER")
-            .filter(|statement| statement.contains("_outbox_"))
-            .map(|statement| format!("CREATE TRIGGER{statement}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-            .replace("AND NEW.updated_at IS NOT OLD.updated_at", "");
-        store.sqlite().unwrap().execute_batch(&stale).unwrap();
-        store
-            .sqlite()
-            .unwrap()
-            .execute_batch("DELETE FROM sync_outbox;")
-            .unwrap();
-
-        // Guard the guard: if this read did not amplify, the rest of the test
-        // would pass whether or not reconciliation actually did anything.
-        search(&store, "quokka");
-        assert!(
-            outbox_rows(&store) > 0,
-            "the restored pre-#100 trigger should queue reads"
-        );
-        id
-    };
-
-    let db = Database::open_on_sqlite(&path).unwrap();
-    let store = db.store();
-    store
-        .sqlite()
-        .unwrap()
-        .execute_batch("DELETE FROM sync_outbox;")
-        .unwrap();
-    search(&store, "quokka");
-
-    assert_eq!(
-        outbox_rows(&store),
-        0,
-        "reopening must have dropped the old triggers"
-    );
-    let triggers: i64 = store
-        .sqlite()
-        .unwrap()
-        .query_row(
-            "SELECT count(*) FROM sqlite_master WHERE type = 'trigger'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(triggers, 0);
-
-    // And an edit is still queued, once: by the repository, not a trigger.
-    queries::update_memory(
-        &store,
-        &MemoryUpdateInput {
-            sensitive: None,
-            memory_id: id,
-            content: Some("quokka sighting, confirmed".into()),
-            category: None,
-            tags: None,
-            metadata: None,
-            clear_superseded: false,
-        },
-    )
-    .unwrap();
-    assert_eq!(outbox_rows(&store), 1);
-
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 #[test]
 fn already_sent_rows_are_pruned_immediately() {
     ensure_sync_enabled();
@@ -392,7 +300,7 @@ fn opening_a_database_prunes_it() {
     let _ = std::fs::remove_file(&path);
 
     {
-        let db = Database::open_on_sqlite(&path).unwrap();
+        let db = Database::open(&path).unwrap();
         let store = db.store();
         add(&store, "old memory");
         backdate_outbox(&store, DEFAULT_OUTBOX_RETENTION_DAYS + 1);
@@ -400,7 +308,7 @@ fn opening_a_database_prunes_it() {
     }
 
     // Open is the only cycle this crate has, so it is where the rule runs.
-    let db = Database::open_on_sqlite(&path).unwrap();
+    let db = Database::open(&path).unwrap();
     assert_eq!(outbox_rows(&db.store()), 0);
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -415,7 +323,7 @@ fn a_realistic_mix_of_traffic_stays_bounded() {
     let _ = std::fs::remove_file(&path);
 
     {
-        let db = Database::open_on_sqlite(&path).unwrap();
+        let db = Database::open(&path).unwrap();
         let store = db.store();
         for i in 0..10 {
             add(&store, &format!("quokka memory {}", i));
@@ -434,7 +342,7 @@ fn a_realistic_mix_of_traffic_stays_bounded() {
         );
     }
 
-    let db = Database::open_on_sqlite(&path).unwrap();
+    let db = Database::open(&path).unwrap();
     assert_eq!(
         outbox_rows(&db.store()),
         0,
