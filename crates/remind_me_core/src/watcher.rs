@@ -59,6 +59,12 @@ pub const WATCH_INTERVAL_ENV: &str = "REMIND_ME_WATCH_INTERVAL";
 /// Seconds a file must be untouched before it is considered stable.
 pub const WATCH_GRACE_ENV: &str = "REMIND_ME_WATCH_GRACE";
 
+/// `1` makes Claude Code's session-transcript directory (`.claude/projects`
+/// under the home directory) the watch root when [`WATCH_DIRS_ENV`] is unset.
+/// Off by default: transcripts hold everything said in a session, so reading
+/// them is an explicit choice.
+pub const WATCH_CLAUDE_PROJECTS_ENV: &str = "REMIND_ME_WATCH_CLAUDE_PROJECTS";
+
 pub const DEFAULT_INTERVAL_SECONDS: u64 = 60;
 pub const DEFAULT_GRACE_SECONDS: u64 = 5;
 
@@ -168,18 +174,32 @@ pub fn validate_watch_dirs(dirs: &[PathBuf]) -> (Vec<PathBuf>, Vec<RejectedDir>)
     (accepted, rejected)
 }
 
-/// Watch directories from the environment.
+/// Watch directories from the environment: [`WATCH_DIRS_ENV`] when set,
+/// else the Claude Code transcripts directory when
+/// [`WATCH_CLAUDE_PROJECTS_ENV`] is `1`, else none.
 pub fn configured_watch_dirs() -> Vec<PathBuf> {
-    std::env::var(WATCH_DIRS_ENV)
+    let explicit = std::env::var(WATCH_DIRS_ENV)
         .ok()
         .filter(|v| !v.trim().is_empty())
         .map(|raw| {
             split_path_list(&raw)
                 .into_iter()
                 .map(PathBuf::from)
-                .collect()
-        })
-        .unwrap_or_default()
+                .collect::<Vec<_>>()
+        });
+    explicit.unwrap_or_else(claude_projects_dir)
+}
+
+/// The transcripts directory when [`WATCH_CLAUDE_PROJECTS_ENV`] is `1` and a
+/// home directory is known, else empty.
+fn claude_projects_dir() -> Vec<PathBuf> {
+    if std::env::var(WATCH_CLAUDE_PROJECTS_ENV).as_deref() != Ok("1") {
+        return Vec::new();
+    }
+    dirs::home_dir()
+        .map(|home| home.join(".claude").join("projects"))
+        .into_iter()
+        .collect()
 }
 
 /// Mark a previous import's memories superseded by a newer one.
