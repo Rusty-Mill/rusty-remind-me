@@ -95,10 +95,10 @@ fn injectable(memory: &Memory, now: &str) -> bool {
             .is_none_or(|until| until > now)
 }
 
-/// Filter on `project` in Rust over the memories.
-// TODO(wave1B): replace with the store's `project` filter once it lands.
+/// Filter on `project` with the same rule search and list use (case-insensitive).
 fn in_project(memory: &Memory, project: Option<&str>) -> bool {
-    project.is_none_or(|p| memory.project.as_deref() == Some(p))
+    crate::context::ScopeFilter::new(project.map(str::to_string), None, None, None)
+        .matches_memory(memory)
 }
 
 fn persona_section(store: &Store<'_>) -> Result<Section> {

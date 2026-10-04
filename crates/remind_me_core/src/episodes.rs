@@ -49,9 +49,25 @@ pub fn write_context(cwd: &Path, session_id: Option<&str>) -> WriteContext {
     }
 }
 
-/// A minimal `sessions` row for `context.session_id`, if it names a session
-/// the store has no row for: so a session written to outside the hook still
-/// shows up. A no-op without a session id or when the row exists.
+/// [`ensure_session`] for the session `memory` was written in: so a memory
+/// written outside the hook (an `add`, a tool call) still shows up in the
+/// session's timeline.
+pub fn ensure_session_for(store: &Store<'_>, memory: &crate::models::Memory) -> Result<()> {
+    ensure_session(
+        store,
+        &WriteContext {
+            project: memory.project.clone(),
+            session_id: memory.session_id.clone(),
+            git_remote: memory.git_remote.clone(),
+            git_branch: memory.git_branch.clone(),
+            git_sha: memory.git_sha.clone(),
+            cwd: memory.cwd.clone(),
+        },
+    )
+}
+
+/// Make sure the session `context` names has a `sessions` row. A no-op when it
+/// names none or the row exists.
 pub fn ensure_session(store: &Store<'_>, context: &WriteContext) -> Result<()> {
     let Some(session_id) = context.session_id.as_deref() else {
         return Ok(());

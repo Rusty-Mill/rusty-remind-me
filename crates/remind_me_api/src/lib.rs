@@ -126,6 +126,8 @@ impl ApiServer {
 
     /// Bind `addr` and serve forever, one connection at a time.
     pub fn run(&self, addr: &str) -> io::Result<()> {
+        // The dashboard is a person at a browser, not a model.
+        remind_me_core::context::set_default_writer(remind_me_core::context::Writer::Human);
         let listener = TcpListener::bind(addr)?;
         println!("REST API server listening on http://{}", addr);
         loop {

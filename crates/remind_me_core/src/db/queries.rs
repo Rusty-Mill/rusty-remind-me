@@ -113,6 +113,7 @@ pub fn add_memory_with(
     }
 
     let memory = get_memory_by_id(store, &id)?.ok_or(StoreError::NotFound)?;
+    crate::episodes::ensure_session_for(store, &memory)?;
 
     // Local mutation, so automation hears about it. A record arriving from a
     // peer goes through `sync::upsert_record` instead, which deliberately
