@@ -9,13 +9,13 @@
 > repository is frozen at v0.2.0. Paths below are relative to this directory
 > unless they say otherwise; `cargo` commands run from the monorepo root.
 
-`rusty_remind_me` is a native Rust port of `remind-me`. It equips AI assistants (such as Claude Desktop, Antigravity, Cursor, OpenAI Codex, and custom LLM agents) with persistent, searchable memory using SQLite FTS5 full-text search, ACT-R inspired memory vitality decay, Reciprocal Rank Fusion (RRF) search ranking, a structured Knowledge Graph entity system, and automated markdown wiki compilation.
+`rusty_remind_me` is a native Rust port of `remind-me`. It equips AI assistants (such as Claude Desktop, Antigravity, Cursor, OpenAI Codex, and custom LLM agents) with persistent, searchable memory using full-text search on the embedded `rusty_multimodal_db` engine, ACT-R inspired memory vitality decay, Reciprocal Rank Fusion (RRF) search ranking, a structured Knowledge Graph entity system, and automated markdown wiki compilation.
 
 ---
 
 ## Key Features
 
-- **Hybrid Search Engine**: FTS5 BM25 keyword matching combined with Reciprocal Rank Fusion (RRF) rank scoring.
+- **Hybrid Search Engine**: BM25 keyword matching (the engine's own full-text index, FTS5-compatible ranking) combined with Reciprocal Rank Fusion (RRF) rank scoring.
 - **Semantic Search, Reranking & Query Expansion**: Optional vector search (Ollama or an in-process ONNX bi-encoder), cross-encoder reranking, and HyDE query expansion — each off by default, each degrading to keyword-only on any failure.
 - **ACT-R Memory Vitality Model**: Time-based exponential decay, write-time priors by category/source, and bridge protection (decay rate halved for frequently accessed memories).
 - **Forward-Compatible Model Context Protocol (MCP) Server**: Stdio JSON-RPC MCP server with dynamic protocol version negotiation (supporting `2024-11-05` through upcoming 2026 releases), resources, prompts, dynamic tool change notifications (`listChanged`), and tool execution.
@@ -26,7 +26,7 @@
 - **Markdown Wiki Synthesis**: Topic-based wiki page compilation, queryable topic search, and
   bulk import of Markdown directories (`wiki-import`) — the ingestion path for
   [`dbs export-wiki`](https://github.com/baileyrd/Daily-Backup-System).
-- **Rusty Mill Ecosystem**: Part of the `Rusty Mill` project family; no `rusty_*` crates are wired in as dependencies yet — current dependencies are ordinary crates.io crates (`serde`, `tokio`, `rusqlite`, `chrono`, `uuid`).
+- **Rusty Mill Ecosystem**: Part of the `Rusty Mill` project family; no `rusty_*` crates are wired in as dependencies yet — current dependencies are ordinary crates.io crates (`serde`, `tokio`, `chrono`, `uuid`), plus the workspace's own `rusty_multimodal_db_engine` for the store.
 
 ---
 
@@ -192,7 +192,7 @@ rusty_remind_me/
 │   ├── configure_mcp.ps1       # PowerShell auto-configuration script for Windows
 │   └── configure_mcp.py        # Cross-platform Python auto-configuration script
 └── crates/
-    ├── remind_me_core/         # Domain models, SQLite/FTS5 database, ACT-R decay, RRF ranking
+    ├── remind_me_core/         # Domain models, the engine store (rusty_multimodal_db), ACT-R decay, RRF ranking
     ├── remind_me_mcp/          # Stdio JSON-RPC MCP protocol engine & tool handlers
     ├── remind_me_api/          # Async REST HTTP server daemon (`rusty_http` + `tokio`)
     ├── remind_me_remote/       # Remote MCP connector over Streamable HTTP (claude.ai, OAuth 2.1)
@@ -343,29 +343,31 @@ Each setup option safely merges the `"rusty-remind-me"` MCP server configuration
 
 ## Database Location
 
-By default the store is `~/.remind-me/memory.db`.
+By default the store is `~/.remind-me/memory.engine`, a directory of engine
+tables (ADR-0023, ADR-0025). It is still located by the path of the old
+SQLite file, `~/.remind-me/memory.db`: the engine directory stands beside
+that path, and the file itself is only read once, to copy an existing store
+onto the engine (see [The Engine Store](#12-the-engine-store)).
 
-Two environment variables override it, most specific first:
+Two environment variables override the path, most specific first:
 
 | Variable | Names a | Notes |
 | --- | --- | --- |
-| `REMIND_ME_DB_PATH` | database **file** | Wins if both are set. |
-| `REMIND_ME_MCP_DIR` | **directory** holding `memory.db` | Also where the wiki, API keys and connector token live. |
+| `REMIND_ME_DB_PATH` | the database **file** path (`.../memory.db`); the store is `.../memory.engine` beside it | Wins if both are set. |
+| `REMIND_ME_MCP_DIR` | **directory** holding `memory.engine` | Also where the wiki, API keys and connector token live. |
 
 A leading `~` is expanded in either. A variable set to the empty string counts as unset.
 
-The store is moving off SQLite (`docs/adr/0023-node-storage-moves-to-rusty-multimodal-db.md`). Until that ships, this is the file the node reads and writes.
-
 ## Coming from the Python `remind_me`
 
-The Python [`remind_me`](https://github.com/baileyrd/remind_me) this project was ported from is **retired** (ADR-0023). Until the storage move above ships, this binary still opens a `memory.db` the Python server wrote, so moving over is a matter of pointing your MCP clients at `rusty-remind-me` instead:
+The Python [`remind_me`](https://github.com/baileyrd/remind_me) this project was ported from is **retired** (ADR-0023). A `memory.db` the Python server wrote at its last schema (v29) has to be opened once with rusty-remind-me 0.2.x, which brings it to v32; this build then copies it onto the engine on its first start (ADR-0025). After that, moving over is a matter of pointing your MCP clients at `rusty-remind-me` instead:
 
 ```bash
 rusty-remind-me configure                             # JSON output (the default)
 rusty-remind-me configure --default-format markdown   # the Python server's output format
 ```
 
-Do not run the Python server against the same `memory.db` afterwards. The two stopped being kept schema-identical when Python was retired, and the storage move will end file-level compatibility altogether.
+Do not run the Python server against the same `memory.db` afterwards. The node's store is the engine directory beside it; the file is never read again after the copy, so anything Python writes there is not seen.
 
 `REMIND_ME_DEFAULT_RESPONSE_FORMAT` accepts `json` (the default) or `markdown`, and affects **only** the tools where the Python server had no `response_format` parameter at all — it returned Markdown from those and offered no JSON, whereas this port offers both and defaults to JSON so existing callers keep working. Tools that mirror a Python input model already use that model's own default and are untouched by this setting: Markdown for `search`, `list`, `wiki_list`, `stats`, `history`, `digest` and `list_reminders`, JSON for `vitality_report`. A per-call `"response_format"` argument always wins over the setting, in both directions.
 
@@ -393,7 +395,7 @@ something any single binary owns. `rusty-remind-me server`, `api`, and
 `remote` each start one alongside their own work
 (`crates/remind_me_cli/src/main.rs`); the one-shot CLI subcommands (`add`,
 `search`, `list`, ...) don't, since they exit before a cycle could ever run.
-A write from one of those one-shot commands still lands in the shared SQLite
+A write from one of those one-shot commands still lands in the shared
 outbox — it isn't lost — but nothing pushes it to the hub until a process
 that *is* running a sync worker picks it up on its next cycle. Concretely:
 one of `rusty-remind-me server`/`api`/`remote` has to be running somewhere
@@ -456,7 +458,7 @@ Funnel) rather than widening the bind address directly.
 
 ## Search Quality: Embeddings, Reranking & Query Expansion
 
-Three independent, optional layers on top of FTS5 keyword search. Each is
+Three independent, optional layers on top of BM25 keyword search. Each is
 **off by default** and degrades to keyword-only (or its next-cheapest
 fallback) on any failure — a missing daemon, an unconfigured model, or a
 disabled build feature is never a reason a search should fail.
@@ -559,7 +561,7 @@ Connector](#multi-node-sync-hub--remote-connector) above for the full
 environment variable reference.
 
 ### 5. Adding Memories
-Stores a new memory note, fact, or preference in SQLite with automatic FTS5 indexing:
+Stores a new memory note, fact, or preference, indexed for full-text search as it lands:
 ```bash
 rusty-remind-me add "User prefers dark mode and Rust for low-level server development"
 rusty-remind-me add "Deploy runbook lives in the ops wiki" --category engineering --tags ops,runbook
@@ -568,7 +570,7 @@ rusty-remind-me add "Deploy runbook lives in the ops wiki" --category engineerin
 `--category` defaults to `general`; `--tags` is comma-separated and drops blanks. Use `--` before content that starts with dashes.
 
 ### 6. Searching Memories
-Executes an FTS5 BM25 search with RRF rank fusion and ACT-R vitality scoring:
+Executes a BM25 keyword search with RRF rank fusion and ACT-R vitality scoring:
 ```bash
 rusty-remind-me search "dark mode Rust"
 rusty-remind-me search "dark mode Rust" --limit 5 --json
@@ -653,27 +655,32 @@ The daemon writes `<db>.daemon.json`, `<db>.daemon.token` (mode 600) and
 and holds `<db>.daemon.lock` while it runs.
 
 ### 12. The Engine Store
-The node's store is the engine (ADR-0023). On the first start with a build
-that has it, `memory.db` is copied into `memory.engine` beside it: every id
-is kept, every row is verified after it is written, and if any row cannot
-be copied the node refuses to start and says which, leaving `memory.db` as
-it was. Every later start uses `memory.engine`. The SQLite file is kept as
-it was at the copy; a node on SQLite refuses it rather than serve stale
-data.
+The node's only store is the `rusty_multimodal_db` engine (ADR-0023,
+ADR-0025): a directory of tables, `memory.engine`, beside the path the
+store is configured at. A node that still has a SQLite `memory.db` from an
+earlier build and no `memory.engine` copies the file onto the engine on its
+first start: every id is kept, every row is verified after it is written,
+and if any row cannot be copied the node refuses to start and says which,
+leaving `memory.db` as it was. Every later start uses `memory.engine` and
+never opens the file again; it can be archived or deleted.
 
-- `REMIND_ME_STORE=sqlite` keeps a node on SQLite. To go back after the
-  copy, move `memory.engine` aside first: the node then runs on
-  `memory.db` as it was at the copy.
+- The copy reads a `memory.db` at schema version 30, 31 or 32. An older
+  file (the Python reference's v29 or earlier) has to be opened once with
+  rusty-remind-me 0.2.x first, which brings it to v32.
+- There is no SQLite store any more: `REMIND_ME_STORE` is gone, and
+  `sqlite3 memory.db` no longer shows the node's data.
 - Only one process opens the engine store, so the store daemon (§11)
   serves every client. A client that cannot use a running daemon says why
   and that `rusty-remind-me daemon stop` releases the store.
-- Backups of an engine store are `backups/*.engine` directories holding
-  both halves; restoring is putting them back.
+- Backups are `backups/*.engine` directories, each a copy of the engine
+  directory taken while the tables are held; restoring is putting one back
+  as `memory.engine`. Backups taken while the node stored in SQLite
+  (`backups/*.db`) still list and are pruned in turn.
 
-`copy-store` copies a SQLite store into a separate engine directory without
-touching the node, for trying the engine on a copy first:
+`copy-store` copies an old SQLite file into a separate engine directory
+without touching the node:
 ```bash
-rusty-remind-me copy-store --to ./engine-copy                  # from the configured database
+rusty-remind-me copy-store --to ./engine-copy                  # from the configured database path
 rusty-remind-me copy-store --from old.db --to ./engine-copy    # from another file
 ```
 

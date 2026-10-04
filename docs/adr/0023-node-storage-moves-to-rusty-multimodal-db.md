@@ -1,6 +1,6 @@
 # ADR-0023: The node's storage moves to rusty_multimodal_db
 
-Status: Accepted. Phases 0–5 done (2026-09-28); phase 6, removing the SQLite store, not started
+Status: Accepted. Phases 0–5 done (2026-09-28); phase 6 done (2026-10-04), see ADR-0025
 Date: 2026-09-26
 
 ## Context
