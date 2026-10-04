@@ -398,3 +398,130 @@ fn after_a_failed_sync_every_write_is_refused_and_ping_fails() {
     // Reads carry on.
     assert_eq!(seqs(&store), vec![("m1".into(), 1)]);
 }
+
+/// A wire record without the node's v32 columns parses to their defaults,
+/// and the stored row emits every one of them.
+#[test]
+fn the_v32_columns_default_on_parse_and_reach_the_wire() {
+    let dir = TempDir::new("v32_wire");
+    let store = MultimodalHubStore::open(&dir.0).unwrap();
+    store.apply_record(&memory("m1", "2026-08-02T00:00:00Z"), Some("node-a")).unwrap();
+    let with_columns = record::parse(&json!({
+        "id": "m2",
+        "content": "in context",
+        "created_at": "2026-08-01T00:00:00Z",
+        "updated_at": "2026-08-02T00:00:00Z",
+        "project": "quokka",
+        "git_branch": "main",
+        "confidence": 0.5,
+        "written_by": "hook",
+        "capture_method": "auto",
+        "outcome": "done",
+    }))
+    .expect("a valid memory");
+    store.apply_record(&with_columns, Some("node-a")).unwrap();
+
+    let pulled = store
+        .pull_memories(&PullQuery {
+            cursor: PullCursor::Seq(0),
+            exclude_node: None,
+            full: false,
+            limit: 500,
+        })
+        .unwrap();
+    assert_eq!(pulled.len(), 2);
+    let m1 = &pulled[0];
+    assert_eq!(m1["id"], "m1");
+    assert_eq!(m1["project"], Value::Null);
+    assert_eq!(m1["confidence"], 1.0);
+    assert_eq!(m1["written_by"], "unknown");
+    assert_eq!(m1["capture_method"], "manual");
+    let m2 = &pulled[1];
+    assert_eq!(m2["project"], "quokka");
+    assert_eq!(m2["git_branch"], "main");
+    assert_eq!(m2["confidence"], 0.5);
+    assert_eq!(m2["written_by"], "hook");
+    assert_eq!(m2["capture_method"], "auto");
+    assert_eq!(m2["outcome"], "done");
+    assert_eq!(m2["git_sha"], Value::Null);
+}
+
+/// A hub written before the node's v32 columns holds its memories under
+/// the `@1` layout. Opening it reads them under that layout and rewrites
+/// them, every new column at its default.
+#[test]
+fn a_memories_table_under_the_v1_layout_is_upgraded_at_open() {
+    let dir = TempDir::new("v1_layout");
+    std::fs::create_dir_all(&dir.0).unwrap();
+    let path = table_path(&dir.0, MEMORIES);
+    let Record::Memory(m) = memory("old", "2026-08-02T00:00:00Z") else {
+        unreachable!("memory() builds a memory record")
+    };
+    let current = MemoryRow::new(&m, Some("node-a"), 7).unwrap();
+    let legacy = MemoryRowV1 {
+        engine_id: current.engine_id,
+        id: current.id.clone(),
+        content: current.content.clone(),
+        category: current.category.clone(),
+        tags: current.tags.clone(),
+        source: current.source.clone(),
+        metadata: current.metadata.clone(),
+        created_at: current.created_at.clone(),
+        updated_at: current.updated_at.clone(),
+        updated_at_us: current.updated_at_us,
+        capture_id: None,
+        node_id: None,
+        client: current.client.clone(),
+        accessed_at: current.accessed_at.clone(),
+        access_count: 0,
+        decay_rate: 0.1,
+        vitality: 1.0,
+        base_weight: 1.0,
+        status: "active".into(),
+        memory_type: "unclassified".into(),
+        source_capture_id: None,
+        subject: None,
+        predicate: None,
+        object: None,
+        superseded_by: None,
+        deleted_at: None,
+        origin_node: Some("node-a".into()),
+        hub_seq: 7,
+        sensitive: true,
+        remind_at: None,
+    };
+    {
+        let mut second = legacy.clone();
+        let mut table = Core::<MemoryRowV1, Seq>::create(vec![legacy], &path).unwrap();
+        // One more through the insert log, which the upgrade must fold in.
+        second.id = "newer".into();
+        second.engine_id = keys::engine_id("newer");
+        second.hub_seq = 8;
+        second.origin_node = Some("node-b".into());
+        table.insert(second).unwrap();
+    }
+    assert!(Core::<MemoryRow, Seq>::open_portable(&path).is_err());
+
+    let store = MultimodalHubStore::open(&dir.0).unwrap();
+    assert_eq!(seqs(&store), [("old".to_string(), 7), ("newer".to_string(), 8)]);
+    let pulled = store
+        .pull_memories(&PullQuery {
+            cursor: PullCursor::Seq(0),
+            exclude_node: None,
+            full: false,
+            limit: 500,
+        })
+        .unwrap();
+    assert_eq!(pulled[0]["sensitive"], true);
+    assert_eq!(pulled[0]["project"], Value::Null);
+    assert_eq!(pulled[0]["confidence"], 1.0);
+    assert_eq!(pulled[0]["written_by"], "unknown");
+    assert_eq!(pulled[1]["id"], "newer");
+    // A new write lands beside the upgraded rows, and the next `hub_seq`
+    // follows the copied ones.
+    store.apply_record(&memory("m3", "2026-08-03T00:00:00Z"), None).unwrap();
+    drop(store);
+    let again = MultimodalHubStore::open(&dir.0).unwrap();
+    assert_eq!(seqs(&again).len(), 3);
+    assert_eq!(seqs(&again)[2], ("m3".to_string(), 9));
+}

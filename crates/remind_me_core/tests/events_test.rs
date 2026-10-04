@@ -251,6 +251,19 @@ fn a_sync_applied_write_emits_nothing() {
         deleted_at: None,
         sensitive: false,
         remind_at: None,
+        project: None,
+        session_id: None,
+        git_remote: None,
+        git_branch: None,
+        git_sha: None,
+        cwd: None,
+        valid_from: None,
+        valid_until: None,
+        confidence: 1.0,
+        verified_at: None,
+        outcome: None,
+        written_by: "unknown".into(),
+        capture_method: "manual".into(),
     };
     remind_me_core::sync::upsert_record(&store, &record).unwrap();
     events::drain();

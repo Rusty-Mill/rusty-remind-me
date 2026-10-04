@@ -24,8 +24,10 @@ use super::imports::{
 use super::memories::{self, MemoryRecord, MemorySearch, MemoryTable, TagIndex};
 use super::outbox::{FlagRecord, FlagTable, OutboxRecord, OutboxTable, SendRecord, SendTable};
 use super::promotions::{PromotionRecord, PromotionTable};
+use super::references::{ReferenceRecord, ReferenceTable};
 use super::related::{AssociationRecord, AssociationTable};
 use super::reminders::{DeliveryRecord, DeliveryTable};
+use super::sessions::{SessionRow, SessionTable};
 use super::vectors::{ChunkRecord, ChunkTable, MetaRecord, MetaTable};
 use super::{engine_error, open_core, EngineTables};
 use crate::db::{Result, StoreError};
@@ -59,6 +61,10 @@ pub(crate) struct CoreTables {
     pub(crate) chat_imports: ChatImportTable,
     pub(crate) dbs_imports: DbsImportTable,
     pub(crate) mempalace_imports: MempalaceImportTable,
+    /// `memory_references` (schema v32).
+    pub(crate) references: ReferenceTable,
+    /// `sessions` (schema v32).
+    pub(crate) sessions: SessionTable,
     /// `memories_fts` over the live rows: derived from `memories` at open,
     /// never stored.
     pub(crate) search: MemorySearch,
@@ -68,7 +74,9 @@ pub(crate) struct CoreTables {
 
 impl CoreTables {
     pub(super) fn open(dir: &Path) -> Result<Self> {
-        let memories: MemoryTable = open_core(&dir.join("memories.mmap"))?;
+        // Through the layout upgrade: a `memories` table written before
+        // schema v32 is rewritten under the current layout first.
+        let memories: MemoryTable = super::memories_v31::open_memories(&dir.join("memories.mmap"))?;
         let (search, tags) = memories::index_all(&memories);
         Ok(Self {
             memories,
@@ -87,6 +95,8 @@ impl CoreTables {
             chat_imports: open_core(&dir.join("chat_imports.mmap"))?,
             dbs_imports: open_core(&dir.join("dbs_imports.mmap"))?,
             mempalace_imports: open_core(&dir.join("mempalace_imports.mmap"))?,
+            references: open_core(&dir.join("memory_references.mmap"))?,
+            sessions: open_core(&dir.join("sessions.mmap"))?,
             search,
             tags,
         })
@@ -112,6 +122,8 @@ pub(crate) enum Change {
     ChatImport(Uuid, Option<Box<ChatImportRecord>>),
     DbsImport(Uuid, Option<Box<DbsImportRecord>>),
     MempalaceImport(Uuid, Option<MempalaceImportRecord>),
+    Reference(Uuid, Option<Box<ReferenceRecord>>),
+    Session(Uuid, Option<Box<SessionRow>>),
 }
 
 /// The journal's names for the core stores. Pinned: a journal written by
@@ -132,6 +144,8 @@ const EMBEDDING_META: &str = "embedding_meta";
 const CHAT_IMPORTS: &str = "chat_imports";
 const DBS_IMPORTS: &str = "dbs_imports";
 const MEMPALACE_IMPORTS: &str = "mempalace_imports";
+const REFERENCES: &str = "memory_references";
+const SESSIONS: &str = "sessions";
 
 /// `changes` as a journal batch: each key and record as JSON.
 pub(super) fn encode(changes: &[Change]) -> Result<Batch> {
@@ -158,6 +172,8 @@ pub(super) fn encode(changes: &[Change]) -> Result<Batch> {
             Change::MempalaceImport(id, record) => {
                 put_or_delete(&mut batch, MEMPALACE_IMPORTS, id, record)?
             }
+            Change::Reference(id, record) => put_or_delete(&mut batch, REFERENCES, id, record)?,
+            Change::Session(id, record) => put_or_delete(&mut batch, SESSIONS, id, record)?,
         }
     }
     Ok(batch)
@@ -207,6 +223,8 @@ pub(super) fn decode(batch: &Batch) -> Result<Vec<Change>> {
                 CHAT_IMPORTS => Ok(Change::ChatImport(key(&change.key)?, record(value)?)),
                 DBS_IMPORTS => Ok(Change::DbsImport(key(&change.key)?, record(value)?)),
                 MEMPALACE_IMPORTS => Ok(Change::MempalaceImport(key(&change.key)?, record(value)?)),
+                REFERENCES => Ok(Change::Reference(key(&change.key)?, record(value)?)),
+                SESSIONS => Ok(Change::Session(key(&change.key)?, record(value)?)),
                 other => Err(StoreError::Engine(format!(
                     "the journal holds changes to {other:?}, which this build cannot apply"
                 ))),
@@ -263,6 +281,10 @@ pub(super) fn apply(core: &mut CoreTables, change: Change) -> Result<()> {
         Change::MempalaceImport(id, record) => {
             put_or_remove(&mut core.mempalace_imports, id, record)
         }
+        Change::Reference(id, record) => {
+            put_or_remove(&mut core.references, id, record.map(|r| *r))
+        }
+        Change::Session(id, record) => put_or_remove(&mut core.sessions, id, record.map(|r| *r)),
     }
 }
 
@@ -369,6 +391,7 @@ mod tests {
     use super::*;
     use crate::db::engine::memories::MemoryRow;
     use crate::db::memories::NewMemory;
+    use rusty_multimodal_db_engine::journal::Batch;
 
     fn memory(id: &str) -> MemoryRecord {
         MemoryRecord::new(MemoryRow::from_new(&NewMemory::new(
@@ -385,6 +408,56 @@ mod tests {
             Change::Outbox(7, None),
         ];
         assert_eq!(decode(&encode(&changes).unwrap()).unwrap(), changes);
+    }
+
+    /// A build before v32 wrote memory rows to the journal without the
+    /// thirteen columns. Such a batch, left unapplied by a crash, must
+    /// still replay at the next open, each column at its default.
+    #[test]
+    fn a_journal_batch_from_before_v32_replays_with_defaults() {
+        let dir = std::env::temp_dir().join(format!(
+            "remind_me_engine_core_replay_v31_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let mut tables = EngineTables::open(&dir).unwrap();
+            let mut record = serde_json::to_value(memory("old")).unwrap();
+            let row = record["row"].as_object_mut().unwrap();
+            for column in [
+                "project",
+                "session_id",
+                "git_remote",
+                "git_branch",
+                "git_sha",
+                "cwd",
+                "valid_from",
+                "valid_until",
+                "confidence",
+                "verified_at",
+                "outcome",
+                "written_by",
+                "capture_method",
+            ] {
+                assert!(row.remove(column).is_some(), "{column}");
+            }
+            let mut batch = Batch::default();
+            batch.put(
+                MEMORIES,
+                serde_json::to_vec(&super::super::engine_id("old")).unwrap(),
+                serde_json::to_vec(&record).unwrap(),
+            );
+            tables.journal.commit(&batch).unwrap();
+        }
+        let tables = crate::db::engine::reopen(&dir);
+        let row = memories::row(&tables.core, "old").expect("replayed");
+        assert_eq!(row.content, "quokka");
+        assert_eq!(row.project, None);
+        assert_eq!(row.confidence, 1.0);
+        assert_eq!(row.written_by, "unknown");
+        assert_eq!(row.capture_method, "manual");
+        drop(tables);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

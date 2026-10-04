@@ -48,6 +48,19 @@ const MEMORY_COLUMNS: &[&str] = &[
     "client",
     "source_capture_id",
     "deleted_at",
+    "project",
+    "session_id",
+    "git_remote",
+    "git_branch",
+    "git_sha",
+    "cwd",
+    "valid_from",
+    "valid_until",
+    "confidence",
+    "verified_at",
+    "outcome",
+    "written_by",
+    "capture_method",
 ];
 
 /// A table whose rows [`count`] can count.

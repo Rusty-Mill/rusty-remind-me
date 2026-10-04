@@ -82,6 +82,35 @@ pub struct MemoryRow {
     pub(crate) client: String,
     pub(crate) source_capture_id: Option<String>,
     pub(crate) deleted_at: Option<String>,
+    // Schema v32. Defaulted when absent, so a journal batch or undo entry
+    // written by a build before v32 still replays; the stored blob is
+    // positional and takes the layout upgrade in [`super::memories_v31`].
+    #[serde(default)]
+    pub(crate) project: Option<String>,
+    #[serde(default)]
+    pub(crate) session_id: Option<String>,
+    #[serde(default)]
+    pub(crate) git_remote: Option<String>,
+    #[serde(default)]
+    pub(crate) git_branch: Option<String>,
+    #[serde(default)]
+    pub(crate) git_sha: Option<String>,
+    #[serde(default)]
+    pub(crate) cwd: Option<String>,
+    #[serde(default)]
+    pub(crate) valid_from: Option<String>,
+    #[serde(default)]
+    pub(crate) valid_until: Option<String>,
+    #[serde(default = "crate::models::default_confidence")]
+    pub(crate) confidence: f64,
+    #[serde(default)]
+    pub(crate) verified_at: Option<String>,
+    #[serde(default)]
+    pub(crate) outcome: Option<String>,
+    #[serde(default = "crate::models::default_written_by")]
+    pub(crate) written_by: String,
+    #[serde(default = "crate::models::default_capture_method")]
+    pub(crate) capture_method: String,
 }
 
 impl MemoryRow {
@@ -116,6 +145,19 @@ impl MemoryRow {
             client: row.client.clone(),
             source_capture_id: row.source_capture_id.clone(),
             deleted_at: row.deleted_at.clone(),
+            project: row.project.clone(),
+            session_id: row.session_id.clone(),
+            git_remote: row.git_remote.clone(),
+            git_branch: row.git_branch.clone(),
+            git_sha: row.git_sha.clone(),
+            cwd: row.cwd.clone(),
+            valid_from: row.valid_from.clone(),
+            valid_until: row.valid_until.clone(),
+            confidence: row.confidence,
+            verified_at: row.verified_at.clone(),
+            outcome: row.outcome.clone(),
+            written_by: row.written_by.clone(),
+            capture_method: row.capture_method.clone(),
         }
     }
 
@@ -155,16 +197,42 @@ impl MemoryRow {
             client: Some(self.client.clone()),
             source_capture_id: self.source_capture_id.clone(),
             deleted_at: self.deleted_at.clone(),
+            project: self.project.clone(),
+            session_id: self.session_id.clone(),
+            git_remote: self.git_remote.clone(),
+            git_branch: self.git_branch.clone(),
+            git_sha: self.git_sha.clone(),
+            cwd: self.cwd.clone(),
+            valid_from: self.valid_from.clone(),
+            valid_until: self.valid_until.clone(),
+            confidence: self.confidence,
+            verified_at: self.verified_at.clone(),
+            outcome: self.outcome.clone(),
+            written_by: self.written_by.clone(),
+            capture_method: self.capture_method.clone(),
         }
     }
 
     /// The outbox payload `db::derived` builds with `json_object`: the same
-    /// 28 keys, tags and metadata as their JSON text, `sensitive` as 0 or 1.
+    /// 41 keys, tags and metadata as their JSON text, `sensitive` as 0 or 1.
     pub(crate) fn payload(&self) -> Value {
         let mut payload = self.backfill_payload();
         if let Value::Object(fields) = &mut payload {
             fields.insert("remind_at".into(), self.remind_at.clone().into());
             fields.insert("sensitive".into(), i64::from(self.sensitive).into());
+            fields.insert("project".into(), self.project.clone().into());
+            fields.insert("session_id".into(), self.session_id.clone().into());
+            fields.insert("git_remote".into(), self.git_remote.clone().into());
+            fields.insert("git_branch".into(), self.git_branch.clone().into());
+            fields.insert("git_sha".into(), self.git_sha.clone().into());
+            fields.insert("cwd".into(), self.cwd.clone().into());
+            fields.insert("valid_from".into(), self.valid_from.clone().into());
+            fields.insert("valid_until".into(), self.valid_until.clone().into());
+            fields.insert("confidence".into(), self.confidence.into());
+            fields.insert("verified_at".into(), self.verified_at.clone().into());
+            fields.insert("outcome".into(), self.outcome.clone().into());
+            fields.insert("written_by".into(), self.written_by.clone().into());
+            fields.insert("capture_method".into(), self.capture_method.clone().into());
         }
         payload
     }
@@ -277,7 +345,10 @@ impl Record for MemoryRecord {
 }
 
 impl SchemaTag for MemoryRecord {
-    const SCHEMA_TAG: &'static str = "rusty_remind_me::node::MemoryRecord@1";
+    /// `@2` since schema v32: the stored layout is positional, so the
+    /// thirteen columns v32 added changed it. A `@1` table is read with the
+    /// old layout and rewritten at open (`super::memories_v31`).
+    const SCHEMA_TAG: &'static str = "rusty_remind_me::node::MemoryRecord@2";
 }
 
 impl IndexedField<ByDoc> for MemoryRecord {
@@ -639,6 +710,8 @@ pub(crate) fn apply_edit(tables: &mut EngineTables, id: &str, edit: &MemoryEdit)
         set(&mut row.content, &edit.content);
         set(&mut row.category, &edit.category);
         set(&mut row.memory_type, &edit.memory_type);
+        set(&mut row.written_by, &edit.written_by);
+        set(&mut row.capture_method, &edit.capture_method);
         if let Some(tags) = &edit.tags {
             row.tags = tags_json(tags);
         }
@@ -649,6 +722,16 @@ pub(crate) fn apply_edit(tables: &mut EngineTables, id: &str, edit: &MemoryEdit)
             (&mut row.subject, &edit.subject),
             (&mut row.predicate, &edit.predicate),
             (&mut row.object, &edit.object),
+            (&mut row.project, &edit.project),
+            (&mut row.session_id, &edit.session_id),
+            (&mut row.git_remote, &edit.git_remote),
+            (&mut row.git_branch, &edit.git_branch),
+            (&mut row.git_sha, &edit.git_sha),
+            (&mut row.cwd, &edit.cwd),
+            (&mut row.valid_from, &edit.valid_from),
+            (&mut row.valid_until, &edit.valid_until),
+            (&mut row.verified_at, &edit.verified_at),
+            (&mut row.outcome, &edit.outcome),
         ] {
             if value.is_some() {
                 field.clone_from(value);
@@ -659,6 +742,9 @@ pub(crate) fn apply_edit(tables: &mut EngineTables, id: &str, edit: &MemoryEdit)
         }
         if let Some(rate) = edit.decay_rate {
             row.decay_rate = rate;
+        }
+        if let Some(confidence) = edit.confidence {
+            row.confidence = confidence;
         }
         if edit.clear_superseded {
             row.superseded_by = None;

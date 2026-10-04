@@ -33,7 +33,9 @@ use rusqlite::Row;
 pub const MEMORY_COLUMNS: &str = "id, content, category, tags, source, metadata, created_at, \
      updated_at, capture_id, subject, predicate, object, superseded_by, decay_rate, vitality, \
      base_weight, access_count, accessed_at, doc_id, chunk_index, remind_at, sensitive, \
-     memory_type, status, node_id, client, source_capture_id, deleted_at";
+     memory_type, status, node_id, client, source_capture_id, deleted_at, \
+     project, session_id, git_remote, git_branch, git_sha, cwd, valid_from, valid_until, \
+     confidence, verified_at, outcome, written_by, capture_method";
 
 /// [`MEMORY_COLUMNS`] with each name qualified by `alias`, for queries that join.
 pub fn prefixed_memory_columns(alias: &str) -> String {
@@ -94,6 +96,28 @@ pub fn parse_memory_row(row: &Row) -> rusqlite::Result<Memory> {
         client: row.get("client")?,
         source_capture_id: row.get("source_capture_id")?,
         deleted_at: row.get("deleted_at")?,
+        project: row.get("project")?,
+        session_id: row.get("session_id")?,
+        git_remote: row.get("git_remote")?,
+        git_branch: row.get("git_branch")?,
+        git_sha: row.get("git_sha")?,
+        cwd: row.get("cwd")?,
+        valid_from: row.get("valid_from")?,
+        valid_until: row.get("valid_until")?,
+        // NOT NULL with a default, but read as Option like the columns
+        // above: a row from before the column's default must not fail
+        // the whole read.
+        confidence: row
+            .get::<_, Option<f64>>("confidence")?
+            .unwrap_or_else(crate::models::default_confidence),
+        verified_at: row.get("verified_at")?,
+        outcome: row.get("outcome")?,
+        written_by: row
+            .get::<_, Option<String>>("written_by")?
+            .unwrap_or_else(crate::models::default_written_by),
+        capture_method: row
+            .get::<_, Option<String>>("capture_method")?
+            .unwrap_or_else(crate::models::default_capture_method),
     })
 }
 

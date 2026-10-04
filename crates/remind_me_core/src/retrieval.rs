@@ -981,6 +981,19 @@ mod tests {
             client: None,
             source_capture_id: None,
             deleted_at: None,
+            project: None,
+            session_id: None,
+            git_remote: None,
+            git_branch: None,
+            git_sha: None,
+            cwd: None,
+            valid_from: None,
+            valid_until: None,
+            confidence: 1.0,
+            verified_at: None,
+            outcome: None,
+            written_by: "unknown".to_string(),
+            capture_method: "manual".to_string(),
         }
     }
 

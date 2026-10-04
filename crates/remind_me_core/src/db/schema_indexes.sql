@@ -36,9 +36,13 @@ CREATE INDEX IF NOT EXISTS idx_memories_memory_type ON memories(memory_type);
 
 CREATE INDEX IF NOT EXISTS idx_memories_normalized_from ON memories(json_extract(metadata, '$.normalized_from'));
 
+CREATE INDEX IF NOT EXISTS idx_memories_project ON memories(project);
+
 CREATE INDEX IF NOT EXISTS idx_memories_remind_at ON memories(remind_at) WHERE remind_at IS NOT NULL AND deleted_at IS NULL;
 
 CREATE INDEX IF NOT EXISTS idx_memories_source ON memories(source);
+
+CREATE INDEX IF NOT EXISTS idx_memories_session_id ON memories(session_id);
 
 CREATE INDEX IF NOT EXISTS idx_memories_source_capture_id ON memories(source_capture_id);
 

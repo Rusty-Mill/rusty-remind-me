@@ -133,6 +133,19 @@ fn an_incoming_sensitive_record_stays_hidden_on_this_node() {
         deleted_at: None,
         sensitive: true,
         remind_at: None,
+        project: None,
+        session_id: None,
+        git_remote: None,
+        git_branch: None,
+        git_sha: None,
+        cwd: None,
+        valid_from: None,
+        valid_until: None,
+        confidence: 1.0,
+        verified_at: None,
+        outcome: None,
+        written_by: "unknown".into(),
+        capture_method: "manual".into(),
     };
 
     upsert_record(&store, &record).unwrap();

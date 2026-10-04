@@ -56,6 +56,20 @@ pub struct NewMemory {
     pub client: String,
     pub source_capture_id: Option<String>,
     pub deleted_at: Option<String>,
+    // Schema v32 (see `models::Memory` for what each holds).
+    pub project: Option<String>,
+    pub session_id: Option<String>,
+    pub git_remote: Option<String>,
+    pub git_branch: Option<String>,
+    pub git_sha: Option<String>,
+    pub cwd: Option<String>,
+    pub valid_from: Option<String>,
+    pub valid_until: Option<String>,
+    pub confidence: f64,
+    pub verified_at: Option<String>,
+    pub outcome: Option<String>,
+    pub written_by: String,
+    pub capture_method: String,
 }
 
 impl NewMemory {
@@ -104,6 +118,19 @@ impl NewMemory {
             client: "unknown".to_string(),
             source_capture_id: None,
             deleted_at: None,
+            project: None,
+            session_id: None,
+            git_remote: None,
+            git_branch: None,
+            git_sha: None,
+            cwd: None,
+            valid_from: None,
+            valid_until: None,
+            confidence: crate::models::default_confidence(),
+            verified_at: None,
+            outcome: None,
+            written_by: crate::models::default_written_by(),
+            capture_method: crate::models::default_capture_method(),
         }
     }
 }
@@ -173,6 +200,21 @@ pub struct MemoryEdit {
     pub object: Option<String>,
     pub memory_type: Option<String>,
     pub decay_rate: Option<f64>,
+    // Schema v32. Each sets its column; none clears one to NULL, which no
+    // caller needs yet.
+    pub project: Option<String>,
+    pub session_id: Option<String>,
+    pub git_remote: Option<String>,
+    pub git_branch: Option<String>,
+    pub git_sha: Option<String>,
+    pub cwd: Option<String>,
+    pub valid_from: Option<String>,
+    pub valid_until: Option<String>,
+    pub confidence: Option<f64>,
+    pub verified_at: Option<String>,
+    pub outcome: Option<String>,
+    pub written_by: Option<String>,
+    pub capture_method: Option<String>,
     pub updated_at: String,
 }
 
@@ -206,6 +248,22 @@ impl MemoryEdit {
         text("predicate = ?", &self.predicate);
         text("object = ?", &self.object);
         text("memory_type = ?", &self.memory_type);
+        text("project = ?", &self.project);
+        text("session_id = ?", &self.session_id);
+        text("git_remote = ?", &self.git_remote);
+        text("git_branch = ?", &self.git_branch);
+        text("git_sha = ?", &self.git_sha);
+        text("cwd = ?", &self.cwd);
+        text("valid_from = ?", &self.valid_from);
+        text("valid_until = ?", &self.valid_until);
+        text("verified_at = ?", &self.verified_at);
+        text("outcome = ?", &self.outcome);
+        text("written_by = ?", &self.written_by);
+        text("capture_method = ?", &self.capture_method);
+        if let Some(confidence) = self.confidence {
+            sets.push("confidence = ?");
+            bindings.push(SqlValue::Real(confidence));
+        }
         if let Some(sensitive) = self.sensitive {
             sets.push("sensitive = ?");
             bindings.push(SqlValue::Integer(i64::from(sensitive)));
@@ -256,11 +314,13 @@ pub struct EntityScope {
 const INSERT_COLUMNS: &str = "id, content, category, tags, source, metadata, created_at, \
      updated_at, capture_id, subject, predicate, object, superseded_by, decay_rate, vitality, \
      base_weight, access_count, accessed_at, doc_id, chunk_index, remind_at, sensitive, \
-     memory_type, status, node_id, client, source_capture_id, deleted_at";
+     memory_type, status, node_id, client, source_capture_id, deleted_at, \
+     project, session_id, git_remote, git_branch, git_sha, cwd, valid_from, valid_until, \
+     confidence, verified_at, outcome, written_by, capture_method";
 
 /// One placeholder per entry of [`INSERT_COLUMNS`].
-const INSERT_PLACEHOLDERS: &str =
-    "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?";
+const INSERT_PLACEHOLDERS: &str = "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
+     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?";
 
 /// `row`'s values in [`INSERT_COLUMNS`]' order.
 fn insert_values(row: &NewMemory) -> Vec<SqlValue> {
@@ -295,6 +355,19 @@ fn insert_values(row: &NewMemory) -> Vec<SqlValue> {
         text(&row.client),
         opt_text(&row.source_capture_id),
         opt_text(&row.deleted_at),
+        opt_text(&row.project),
+        opt_text(&row.session_id),
+        opt_text(&row.git_remote),
+        opt_text(&row.git_branch),
+        opt_text(&row.git_sha),
+        opt_text(&row.cwd),
+        opt_text(&row.valid_from),
+        opt_text(&row.valid_until),
+        SqlValue::Real(row.confidence),
+        opt_text(&row.verified_at),
+        opt_text(&row.outcome),
+        text(&row.written_by),
+        text(&row.capture_method),
     ]
 }
 
@@ -404,7 +477,20 @@ impl<'c> Memories<'c> {
                     superseded_by = excluded.superseded_by,
                     deleted_at = excluded.deleted_at,
                     sensitive = excluded.sensitive,
-                    remind_at = excluded.remind_at"
+                    remind_at = excluded.remind_at,
+                    project = excluded.project,
+                    session_id = excluded.session_id,
+                    git_remote = excluded.git_remote,
+                    git_branch = excluded.git_branch,
+                    git_sha = excluded.git_sha,
+                    cwd = excluded.cwd,
+                    valid_from = excluded.valid_from,
+                    valid_until = excluded.valid_until,
+                    confidence = excluded.confidence,
+                    verified_at = excluded.verified_at,
+                    outcome = excluded.outcome,
+                    written_by = excluded.written_by,
+                    capture_method = excluded.capture_method"
             ),
             params_from_iter(insert_values(row)),
         )?)
@@ -1473,6 +1559,13 @@ mod tests {
         })
         .unwrap();
         counts.push(m.delete_capture_category("cap", "chunk").unwrap());
+        m.insert(&with_every_v32_column(NewMemory::new("ctx", "in context", T3)))
+            .unwrap();
+        m.upsert_synced(&NewMemory {
+            created_at: T3.into(),
+            ..with_every_v32_column(NewMemory::new("b", "beta remote", T3))
+        })
+        .unwrap();
 
         let ids: Vec<String> = ["a", "b", "c", "d1", "e", "missing"]
             .iter()
@@ -1511,6 +1604,107 @@ mod tests {
             views: ids.iter().map(|id| m.sync_view(id).unwrap()).collect(),
             outbox,
         }
+    }
+
+    /// `row` with every schema v32 column set to a value no default has.
+    fn with_every_v32_column(row: NewMemory) -> NewMemory {
+        let text = |s: &str| Some(s.to_string());
+        NewMemory {
+            project: text("quokka"),
+            session_id: text("sess-1"),
+            git_remote: text("github.com/o/r"),
+            git_branch: text("feature/x"),
+            git_sha: text("0123abcd"),
+            cwd: text("/work/quokka"),
+            valid_from: text("2026-09-01T00:00:00+00:00"),
+            valid_until: text("2026-12-01T00:00:00+00:00"),
+            confidence: 0.75,
+            verified_at: text("2026-09-27T00:00:00+00:00"),
+            outcome: text("done"),
+            written_by: "model:test".into(),
+            capture_method: "auto".into(),
+            ..row
+        }
+    }
+
+    /// Every schema v32 column of `memory`, as JSON, in a fixed order.
+    fn v32_columns(memory: &Memory) -> Value {
+        serde_json::json!([
+            memory.project,
+            memory.session_id,
+            memory.git_remote,
+            memory.git_branch,
+            memory.git_sha,
+            memory.cwd,
+            memory.valid_from,
+            memory.valid_until,
+            memory.confidence,
+            memory.verified_at,
+            memory.outcome,
+            memory.written_by,
+            memory.capture_method,
+        ])
+    }
+
+    /// A row with every v32 column set reads back with every one as
+    /// written, and one with none set reads back the schema's defaults.
+    #[test]
+    fn every_v32_column_reads_back_as_written_on_both_stores() {
+        on_each_backend(|db| {
+            let store = db.store();
+            let m = Memories::new(&store);
+            let written = with_every_v32_column(NewMemory::new("ctx", "x", NOW));
+            m.insert(&written).unwrap();
+            m.insert(&NewMemory::new("plain", "y", NOW)).unwrap();
+
+            let read = get(&m, "ctx");
+            assert_eq!(
+                v32_columns(&read),
+                serde_json::json!([
+                    "quokka",
+                    "sess-1",
+                    "github.com/o/r",
+                    "feature/x",
+                    "0123abcd",
+                    "/work/quokka",
+                    "2026-09-01T00:00:00+00:00",
+                    "2026-12-01T00:00:00+00:00",
+                    0.75,
+                    "2026-09-27T00:00:00+00:00",
+                    "done",
+                    "model:test",
+                    "auto",
+                ])
+            );
+            let plain = get(&m, "plain");
+            assert_eq!(
+                v32_columns(&plain),
+                serde_json::json!([
+                    null, null, null, null, null, null, null, null, 1.0, null, null, "unknown",
+                    "manual"
+                ])
+            );
+
+            // The edit's setters write each column; the rest stay.
+            m.apply_edit(
+                "plain",
+                &MemoryEdit {
+                    project: Some("edited".into()),
+                    confidence: Some(0.5),
+                    outcome: Some("abandoned".into()),
+                    written_by: Some("human".into()),
+                    ..MemoryEdit::at(NOW)
+                },
+            )
+            .unwrap();
+            let edited = get(&m, "plain");
+            assert_eq!(edited.project.as_deref(), Some("edited"));
+            assert_eq!(edited.confidence, 0.5);
+            assert_eq!(edited.outcome.as_deref(), Some("abandoned"));
+            assert_eq!(edited.written_by, "human");
+            assert_eq!(edited.capture_method, "manual");
+            assert_eq!(edited.session_id, None);
+        });
     }
 
     /// Lists, edits and deletes on `db`, and what each read returns after.
@@ -1583,6 +1777,19 @@ mod tests {
                 subject: text("s"),
                 memory_type: text("decision"),
                 decay_rate: Some(0.02),
+                project: text("p"),
+                session_id: text("s1"),
+                git_remote: text("r"),
+                git_branch: text("b"),
+                git_sha: text("sha"),
+                cwd: text("/w"),
+                valid_from: text(T2),
+                valid_until: text(T2),
+                confidence: Some(0.25),
+                verified_at: text(T2),
+                outcome: text("done"),
+                written_by: text("hook"),
+                capture_method: text("auto"),
                 ..MemoryEdit::at(T2)
             },
         )

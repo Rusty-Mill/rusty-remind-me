@@ -110,8 +110,13 @@ fn to_json_text(value: &Value) -> String {
 // Memories
 // ---------------------------------------------------------------------------
 
-/// One `memories` row: all 28 columns of the retired SQL stores' table, the
-/// engine id, and `updated_at` in µs for the keyset order.
+/// One `memories` row: the 28 columns of the retired SQL stores' table,
+/// the thirteen the node added at its schema v32, the engine id, and
+/// `updated_at` in µs for the keyset order.
+///
+/// The record is positional on disk, so the v32 columns changed its layout
+/// and the tag moved to `@2`; [`MemoryRowV1`] is the layout before them,
+/// read and rewritten at open by [`super::open_memories`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryRow {
     pub engine_id: Uuid,
@@ -144,9 +149,122 @@ pub struct MemoryRow {
     pub hub_seq: i64,
     pub sensitive: bool,
     pub remind_at: Option<String>,
+    pub project: Option<String>,
+    pub session_id: Option<String>,
+    pub git_remote: Option<String>,
+    pub git_branch: Option<String>,
+    pub git_sha: Option<String>,
+    pub cwd: Option<String>,
+    pub valid_from: Option<String>,
+    pub valid_until: Option<String>,
+    pub confidence: f64,
+    pub verified_at: Option<String>,
+    pub outcome: Option<String>,
+    pub written_by: String,
+    pub capture_method: String,
 }
 
-engine_row!(MemoryRow, "rusty_remind_me::hub::MemoryRow@1");
+engine_row!(MemoryRow, "rusty_remind_me::hub::MemoryRow@2");
+
+/// [`MemoryRow`] as every hub before the node's schema v32 wrote it: the
+/// 28 SQL columns, the engine id, the µs stamp, the origin and `hub_seq`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryRowV1 {
+    pub engine_id: Uuid,
+    pub id: String,
+    pub content: String,
+    pub category: String,
+    pub tags: String,
+    pub source: String,
+    pub metadata: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub updated_at_us: i64,
+    pub capture_id: Option<String>,
+    pub node_id: Option<String>,
+    pub client: String,
+    pub accessed_at: Option<String>,
+    pub access_count: i64,
+    pub decay_rate: f64,
+    pub vitality: f64,
+    pub base_weight: f64,
+    pub status: String,
+    pub memory_type: String,
+    pub source_capture_id: Option<String>,
+    pub subject: Option<String>,
+    pub predicate: Option<String>,
+    pub object: Option<String>,
+    pub superseded_by: Option<String>,
+    pub deleted_at: Option<String>,
+    pub origin_node: Option<String>,
+    pub hub_seq: i64,
+    pub sensitive: bool,
+    pub remind_at: Option<String>,
+}
+
+engine_row!(MemoryRowV1, "rusty_remind_me::hub::MemoryRow@1");
+
+impl ScannableField<Seq> for MemoryRowV1 {
+    type ScanValue = i64;
+    fn scannable_value(&self) -> i64 {
+        self.hub_seq
+    }
+    fn set_scannable_value(&mut self, value: i64) {
+        self.hub_seq = value;
+    }
+}
+
+impl MemoryRowV1 {
+    /// The row under the current layout, every v32 column at the node
+    /// schema's default.
+    pub fn into_current(self) -> MemoryRow {
+        MemoryRow {
+            engine_id: self.engine_id,
+            id: self.id,
+            content: self.content,
+            category: self.category,
+            tags: self.tags,
+            source: self.source,
+            metadata: self.metadata,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            updated_at_us: self.updated_at_us,
+            capture_id: self.capture_id,
+            node_id: self.node_id,
+            client: self.client,
+            accessed_at: self.accessed_at,
+            access_count: self.access_count,
+            decay_rate: self.decay_rate,
+            vitality: self.vitality,
+            base_weight: self.base_weight,
+            status: self.status,
+            memory_type: self.memory_type,
+            source_capture_id: self.source_capture_id,
+            subject: self.subject,
+            predicate: self.predicate,
+            object: self.object,
+            superseded_by: self.superseded_by,
+            deleted_at: self.deleted_at,
+            origin_node: self.origin_node,
+            hub_seq: self.hub_seq,
+            sensitive: self.sensitive,
+            remind_at: self.remind_at,
+            project: None,
+            session_id: None,
+            git_remote: None,
+            git_branch: None,
+            git_sha: None,
+            cwd: None,
+            valid_from: None,
+            valid_until: None,
+            confidence: 1.0,
+            verified_at: None,
+            outcome: None,
+            written_by: "unknown".to_string(),
+            capture_method: "manual".to_string(),
+        }
+    }
+}
 
 impl ScannableField<Seq> for MemoryRow {
     type ScanValue = i64;
@@ -206,6 +324,19 @@ impl MemoryRow {
             hub_seq,
             sensitive: m.sensitive,
             remind_at: m.remind_at.clone(),
+            project: m.project.clone(),
+            session_id: m.session_id.clone(),
+            git_remote: m.git_remote.clone(),
+            git_branch: m.git_branch.clone(),
+            git_sha: m.git_sha.clone(),
+            cwd: m.cwd.clone(),
+            valid_from: m.valid_from.clone(),
+            valid_until: m.valid_until.clone(),
+            confidence: m.confidence,
+            verified_at: m.verified_at.clone(),
+            outcome: m.outcome.clone(),
+            written_by: m.written_by.clone(),
+            capture_method: m.capture_method.clone(),
         })
     }
 
@@ -266,6 +397,19 @@ impl MemoryRow {
             "hub_seq": self.hub_seq,
             "sensitive": self.sensitive,
             "remind_at": self.remind_at,
+            "project": self.project,
+            "session_id": self.session_id,
+            "git_remote": self.git_remote,
+            "git_branch": self.git_branch,
+            "git_sha": self.git_sha,
+            "cwd": self.cwd,
+            "valid_from": self.valid_from,
+            "valid_until": self.valid_until,
+            "confidence": self.confidence,
+            "verified_at": self.verified_at,
+            "outcome": self.outcome,
+            "written_by": self.written_by,
+            "capture_method": self.capture_method,
         })
     }
 }

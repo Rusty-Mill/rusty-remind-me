@@ -156,6 +156,88 @@ pub struct SyncRecord {
     /// neither because the machine that fired it was the one you weren't at.
     #[serde(default)]
     pub remind_at: Option<String>,
+    // Schema v32. Every one defaults, so a record from a node that has not
+    // upgraded reads as a row with the schema's defaults, and a node that
+    // has upgraded pushes them to peers that ignore what they do not know.
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub git_remote: Option<String>,
+    #[serde(default)]
+    pub git_branch: Option<String>,
+    #[serde(default)]
+    pub git_sha: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub valid_from: Option<String>,
+    #[serde(default)]
+    pub valid_until: Option<String>,
+    #[serde(default = "crate::models::default_confidence")]
+    pub confidence: f64,
+    #[serde(default)]
+    pub verified_at: Option<String>,
+    #[serde(default)]
+    pub outcome: Option<String>,
+    #[serde(default = "crate::models::default_written_by")]
+    pub written_by: String,
+    #[serde(default = "crate::models::default_capture_method")]
+    pub capture_method: String,
+}
+
+impl SyncRecord {
+    /// The record a node queues and pushes for `memory`: every column the
+    /// outbox payload carries, read back off a [`crate::models::Memory`].
+    /// `doc_id` and `chunk_index` are not on the wire (see the struct
+    /// docs), and `accessed_at` travels as given.
+    pub fn from_memory(memory: &crate::models::Memory) -> Self {
+        Self {
+            id: memory.id.clone(),
+            content: memory.content.clone(),
+            category: memory.category.clone(),
+            tags: memory.tags.clone(),
+            source: memory.source.clone(),
+            metadata: memory.metadata.clone(),
+            created_at: memory.created_at.clone(),
+            updated_at: memory.updated_at.clone(),
+            capture_id: memory.capture_id.clone(),
+            node_id: memory.node_id.clone(),
+            client: memory.client.clone().unwrap_or_else(default_client),
+            accessed_at: Some(memory.accessed_at.clone()),
+            access_count: memory.access_count,
+            decay_rate: memory.decay_rate,
+            vitality: memory.vitality,
+            base_weight: memory.base_weight,
+            status: memory.status.clone().unwrap_or_else(default_status),
+            memory_type: memory
+                .memory_type
+                .clone()
+                .unwrap_or_else(default_memory_type),
+            source_capture_id: memory.source_capture_id.clone(),
+            subject: memory.subject.clone(),
+            predicate: memory.predicate.clone(),
+            object: memory.object.clone(),
+            superseded_by: memory.superseded_by.clone(),
+            deleted_at: memory.deleted_at.clone(),
+            sensitive: memory.sensitive,
+            remind_at: memory.remind_at.clone(),
+            project: memory.project.clone(),
+            session_id: memory.session_id.clone(),
+            git_remote: memory.git_remote.clone(),
+            git_branch: memory.git_branch.clone(),
+            git_sha: memory.git_sha.clone(),
+            cwd: memory.cwd.clone(),
+            valid_from: memory.valid_from.clone(),
+            valid_until: memory.valid_until.clone(),
+            confidence: memory.confidence,
+            verified_at: memory.verified_at.clone(),
+            outcome: memory.outcome.clone(),
+            written_by: memory.written_by.clone(),
+            capture_method: memory.capture_method.clone(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -303,6 +385,19 @@ pub fn upsert_record(
             client: record.client.clone(),
             source_capture_id: record.source_capture_id.clone(),
             deleted_at: record.deleted_at.clone(),
+            project: record.project.clone(),
+            session_id: record.session_id.clone(),
+            git_remote: record.git_remote.clone(),
+            git_branch: record.git_branch.clone(),
+            git_sha: record.git_sha.clone(),
+            cwd: record.cwd.clone(),
+            valid_from: record.valid_from.clone(),
+            valid_until: record.valid_until.clone(),
+            confidence: record.confidence,
+            verified_at: record.verified_at.clone(),
+            outcome: record.outcome.clone(),
+            written_by: record.written_by.clone(),
+            capture_method: record.capture_method.clone(),
         };
         // A tombstone is stored without its text (ADR-0024), whatever the
         // sender kept, and without the local tags the merge above added.
@@ -389,5 +484,113 @@ mod tests {
     #[test]
     fn canon_ts_leaves_an_unparseable_timestamp_as_is() {
         assert_eq!(canon_ts("not-a-timestamp"), "not-a-timestamp");
+    }
+
+    #[test]
+    fn a_record_without_the_v32_columns_reads_the_schema_defaults() {
+        let record: SyncRecord = serde_json::from_value(serde_json::json!({
+            "id": "m", "content": "x",
+            "created_at": "2026-09-26T00:00:00+00:00",
+            "updated_at": "2026-09-26T00:00:00+00:00",
+        }))
+        .unwrap();
+        assert_eq!(record.project, None);
+        assert_eq!(record.confidence, 1.0);
+        assert_eq!(record.written_by, "unknown");
+        assert_eq!(record.capture_method, "manual");
+    }
+
+    /// What a node queues for a memory with every v32 column set reads as
+    /// a record carrying them, applies on another node with them, and
+    /// comes back off that node's row as the same record.
+    #[test]
+    fn the_v32_columns_round_trip_through_the_outbox_and_apply() {
+        use crate::db::memories::{Memories, NewMemory};
+        use crate::db::outbox::Outbox;
+        use crate::db::sync_state::SyncState;
+        use crate::db::Database;
+        const NOW: &str = "2026-09-26T00:00:00+00:00";
+
+        let sender = Database::open_in_memory().unwrap();
+        let store = sender.store();
+        SyncState::new(&store)
+            .set_flag("sync_enabled", "1")
+            .unwrap();
+        let text = |s: &str| Some(s.to_string());
+        Memories::new(&store)
+            .insert(&NewMemory {
+                project: text("quokka"),
+                session_id: text("sess"),
+                git_remote: text("github.com/o/r"),
+                git_branch: text("main"),
+                git_sha: text("abc"),
+                cwd: text("/w"),
+                valid_from: text(NOW),
+                valid_until: None,
+                confidence: 0.5,
+                verified_at: text(NOW),
+                outcome: text("done"),
+                written_by: "hook".into(),
+                capture_method: "auto".into(),
+                ..NewMemory::new("m", "x", NOW)
+            })
+            .unwrap();
+        let queued = Outbox::new(&store).unsent_to("hub", 0, 10).unwrap();
+        assert_eq!(queued.len(), 1);
+        // The payload keeps `tags` as the column's JSON text; the hub
+        // hands it back parsed, which is the shape a record arrives in.
+        let mut payload: Value = serde_json::from_str(&queued[0].payload_json).unwrap();
+        let tags: Value = serde_json::from_str(payload["tags"].as_str().unwrap()).unwrap();
+        payload["tags"] = tags;
+        let record: SyncRecord = serde_json::from_value(payload).unwrap();
+        assert_eq!(record.project.as_deref(), Some("quokka"));
+        assert_eq!(record.confidence, 0.5);
+        assert_eq!(record.written_by, "hook");
+        assert_eq!(record.capture_method, "auto");
+
+        let receiver = Database::open_in_memory().unwrap();
+        let store = receiver.store();
+        assert_eq!(
+            upsert_record(&store, &record).unwrap(),
+            ApplyOutcome::Applied
+        );
+        let applied = Memories::new(&store)
+            .get_live("m")
+            .unwrap()
+            .expect("the record applied");
+        assert_eq!(applied.session_id.as_deref(), Some("sess"));
+        assert_eq!(applied.git_remote.as_deref(), Some("github.com/o/r"));
+        assert_eq!(applied.git_sha.as_deref(), Some("abc"));
+        assert_eq!(applied.cwd.as_deref(), Some("/w"));
+        assert_eq!(applied.valid_from.as_deref(), Some(NOW));
+        assert_eq!(applied.valid_until, None);
+        assert_eq!(applied.verified_at.as_deref(), Some(NOW));
+        assert_eq!(applied.outcome.as_deref(), Some("done"));
+        assert_eq!(applied.confidence, 0.5);
+        assert_eq!(applied.written_by, "hook");
+        assert_eq!(applied.capture_method, "auto");
+
+        // The row as a record again carries the same thirteen columns.
+        // (`metadata` and `accessed_at` differ in shape between the raw
+        // payload and a stored row, and are not what this checks.)
+        let back = serde_json::to_value(SyncRecord::from_memory(&applied)).unwrap();
+        let sent = serde_json::to_value(&record).unwrap();
+        for column in [
+            "project",
+            "session_id",
+            "git_remote",
+            "git_branch",
+            "git_sha",
+            "cwd",
+            "valid_from",
+            "valid_until",
+            "confidence",
+            "verified_at",
+            "outcome",
+            "written_by",
+            "capture_method",
+        ] {
+            assert_eq!(back[column], sent[column], "{column}");
+        }
     }
 }

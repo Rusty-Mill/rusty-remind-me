@@ -114,6 +114,19 @@ fn an_incoming_reminder_is_applied_and_shows_up_in_the_window() {
         deleted_at: None,
         sensitive: false,
         remind_at: Some(when.clone()),
+        project: None,
+        session_id: None,
+        git_remote: None,
+        git_branch: None,
+        git_sha: None,
+        cwd: None,
+        valid_from: None,
+        valid_until: None,
+        confidence: 1.0,
+        verified_at: None,
+        outcome: None,
+        written_by: "unknown".into(),
+        capture_method: "manual".into(),
     };
 
     upsert_record(&store, &record).unwrap();
@@ -197,6 +210,19 @@ fn a_cleared_reminder_propagates_as_a_clear_rather_than_being_ignored() {
         deleted_at: None,
         sensitive: false,
         remind_at: None,
+        project: None,
+        session_id: None,
+        git_remote: None,
+        git_branch: None,
+        git_sha: None,
+        cwd: None,
+        valid_from: None,
+        valid_until: None,
+        confidence: 1.0,
+        verified_at: None,
+        outcome: None,
+        written_by: "unknown".into(),
+        capture_method: "manual".into(),
     };
 
     upsert_record(&store, &record).unwrap();
@@ -242,6 +268,19 @@ fn a_losing_record_does_not_clear_a_locally_set_reminder() {
         deleted_at: None,
         sensitive: false,
         remind_at: None,
+        project: None,
+        session_id: None,
+        git_remote: None,
+        git_branch: None,
+        git_sha: None,
+        cwd: None,
+        valid_from: None,
+        valid_until: None,
+        confidence: 1.0,
+        verified_at: None,
+        outcome: None,
+        written_by: "unknown".into(),
+        capture_method: "manual".into(),
     };
 
     upsert_record(&store, &record).unwrap();

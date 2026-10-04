@@ -295,6 +295,6 @@ fn the_schema_version_is_past_the_refile() {
     // stamp written afterwards must be at least the refile's own version or
     // every open would refile again. The number has been this crate's own
     // since the Python reference was retired (ADR-0023); 30 is vector chunks
-    // keyed by memory id.
-    assert_eq!(SCHEMA_VERSION, 31);
+    // keyed by memory id; 32 the context-capture columns.
+    assert_eq!(SCHEMA_VERSION, 32);
 }

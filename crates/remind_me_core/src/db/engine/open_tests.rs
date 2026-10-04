@@ -118,3 +118,75 @@ fn background_threads_share_the_engine_store() {
     assert_eq!(memories(&db), 2);
     assert_eq!(sqlite_memories(&file), 1);
 }
+
+/// The schema v32 columns, in table order.
+const V32_COLUMNS: [&str; 13] = [
+    "project",
+    "session_id",
+    "git_remote",
+    "git_branch",
+    "git_sha",
+    "cwd",
+    "valid_from",
+    "valid_until",
+    "confidence",
+    "verified_at",
+    "outcome",
+    "written_by",
+    "capture_method",
+];
+
+/// Put the SQLite file at `file` back to schema v31: no v32 columns, and
+/// stamped as such.
+fn downgrade_to_v31(file: &Path) {
+    let conn = Connection::open(file).unwrap();
+    conn.execute_batch(
+        "DROP INDEX IF EXISTS idx_memories_project;
+         DROP INDEX IF EXISTS idx_memories_session_id;",
+    )
+    .unwrap();
+    for column in V32_COLUMNS {
+        conn.execute_batch(&format!("ALTER TABLE memories DROP COLUMN {column};"))
+            .unwrap();
+    }
+    conn.execute_batch("PRAGMA user_version = 31;").unwrap();
+}
+
+/// A node's SQLite file at schema v31 opens on the engine: the open brings
+/// the file to v32, and the copy lands every row with the new columns at
+/// their defaults.
+#[test]
+fn a_v31_file_is_copied_onto_the_engine_with_the_new_columns_defaulted() {
+    let dir = TemporaryDir::fresh();
+    let file = sqlite_node(&dir);
+    downgrade_to_v31(&file);
+    {
+        let conn = Connection::open(&file).unwrap();
+        let columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(memories)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(!columns.iter().any(|c| c == "project"), "{columns:?}");
+    }
+
+    let db = open_on_engine(&file);
+    let store = db.store();
+    let copied = Memories::new(&store)
+        .get_live("m1")
+        .unwrap()
+        .expect("the row was copied");
+    assert_eq!(copied.content, "copied from SQLite");
+    assert_eq!(copied.project, None);
+    assert_eq!(copied.session_id, None);
+    assert_eq!(copied.git_remote, None);
+    assert_eq!(copied.valid_until, None);
+    assert_eq!(copied.outcome, None);
+    assert_eq!(copied.confidence, 1.0);
+    assert_eq!(copied.written_by, "unknown");
+    assert_eq!(copied.capture_method, "manual");
+    drop(store);
+    assert_eq!(memories(&db), 1);
+}

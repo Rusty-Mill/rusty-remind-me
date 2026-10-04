@@ -705,8 +705,8 @@ fn the_schema_version_is_the_current_one() {
     // that forgets to bump it fails here. 29 was the Python reference's last
     // (27 -> 29 covered its `sync_log.last_pull_seq` and the `reference`
     // refiling); 30 is this crate's own, vector chunks keyed by memory id
-    // (ADR-0023).
-    assert_eq!(SCHEMA_VERSION, 31);
+    // (ADR-0023); 32 the context-capture columns.
+    assert_eq!(SCHEMA_VERSION, 32);
 }
 
 #[test]

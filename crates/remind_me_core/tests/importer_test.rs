@@ -770,3 +770,60 @@ fn graph_records_are_not_imported_as_chat_messages() {
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// An export carries the schema v32 columns, and importing it reads them
+/// back; a chat someone else exported leaves them at the schema's defaults.
+#[test]
+fn an_export_round_trips_the_v32_columns_and_a_plain_chat_defaults_them() {
+    use remind_me_core::db::memories::{Memories, NewMemory};
+    use remind_me_core::export::export_memories;
+    use remind_me_core::ExportInput;
+
+    let source = Database::open_in_memory().unwrap();
+    let store = source.store();
+    Memories::new(&store)
+        .insert(&NewMemory {
+            project: Some("quokka".into()),
+            git_branch: Some("main".into()),
+            cwd: Some("/work".into()),
+            confidence: 0.5,
+            outcome: Some("done".into()),
+            written_by: "model:test".into(),
+            capture_method: "auto".into(),
+            ..NewMemory::new("m1", "a small marsupial", "2026-09-26T00:00:00+00:00")
+        })
+        .unwrap();
+    let exported = export_memories(&store, &ExportInput::default()).unwrap();
+    let body = exported.content.expect("inline export");
+    let records: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+    assert_eq!(records[0]["project"], "quokka");
+    assert_eq!(records[0]["confidence"], 0.5);
+    assert_eq!(records[0]["written_by"], "model:test");
+
+    let dir = scratch("v32_round_trip");
+    let path = write(&dir, "export.json", &body);
+    let target = Database::open_in_memory().unwrap();
+    let store = target.store();
+    import(&store, &path, |_| {});
+    assert_eq!(contents(&store), ["a small marsupial"]);
+    assert_eq!(column(&store, "project"), "quokka");
+    assert_eq!(column(&store, "git_branch"), "main");
+    assert_eq!(column(&store, "cwd"), "/work");
+    assert_eq!(column(&store, "outcome"), "done");
+    assert_eq!(column(&store, "written_by"), "model:test");
+    assert_eq!(column(&store, "capture_method"), "auto");
+    let ids = testing::memory_ids(&store).unwrap();
+    assert_eq!(testing::memory_f64(&store, &ids[0], "confidence").unwrap(), Some(0.5));
+    assert_eq!(testing::memory_text(&store, &ids[0], "git_sha").unwrap(), None);
+
+    let plain = Database::open_in_memory().unwrap();
+    let store = plain.store();
+    let path = write(&dir, "chat.json", CHAT_JSON);
+    import(&store, &path, |_| {});
+    let ids = testing::memory_ids(&store).unwrap();
+    assert_eq!(testing::memory_text(&store, &ids[0], "project").unwrap(), None);
+    assert_eq!(testing::memory_f64(&store, &ids[0], "confidence").unwrap(), Some(1.0));
+    assert_eq!(column(&store, "written_by"), "unknown");
+    assert_eq!(column(&store, "capture_method"), "manual");
+    std::fs::remove_dir_all(&dir).unwrap();
+}

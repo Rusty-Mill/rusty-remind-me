@@ -1,5 +1,6 @@
 //! Copying a node's SQLite store onto the engine (ADR-0023 §5): the
-//! memories core's sixteen tables (phase 5.1) and the other groups the
+//! memories core's sixteen tables (phase 5.1; `memory_references` and
+//! `sessions`, added at schema v32, live on the engine only) and the other groups the
 //! engine holds: saved searches, import archives, the sync log, analytics
 //! snapshots, memory revisions and the wiki (phase 5.2).
 //!
@@ -240,6 +241,9 @@ const TABLES: &[TableCopy] = &[
     },
 ];
 
+// `memory_references` and `sessions` (schema v32) exist on the engine only,
+// so the copy has nothing to read for them.
+
 fn text(row: &Row, column: &str) -> std::result::Result<String, String> {
     match row.get(column) {
         Some(Value::String(s)) => Ok(s.clone()),
@@ -399,7 +403,9 @@ fn has_rows(core: &CoreTables) -> bool {
         && core.embedding_meta.all_ids().is_empty()
         && core.chat_imports.all_ids().is_empty()
         && core.dbs_imports.all_ids().is_empty()
-        && core.mempalace_imports.all_ids().is_empty())
+        && core.mempalace_imports.all_ids().is_empty()
+        && core.references.all_ids().is_empty()
+        && core.sessions.all_ids().is_empty())
 }
 
 /// Copy the memories core of the SQLite store `source` into the empty core

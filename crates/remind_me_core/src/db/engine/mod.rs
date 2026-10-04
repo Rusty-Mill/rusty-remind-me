@@ -20,13 +20,16 @@ pub(crate) mod feedback;
 pub(crate) mod graph;
 pub(crate) mod imports;
 pub(crate) mod memories;
+pub(crate) mod memories_v31;
 pub(crate) mod outbox;
 pub(crate) mod page;
 pub(crate) mod promotions;
+pub(crate) mod references;
 pub(crate) mod related;
 pub(crate) mod reminders;
 pub(crate) mod revisions;
 pub(crate) mod saved_searches;
+pub(crate) mod sessions;
 pub(crate) mod stats;
 pub(crate) mod sync_log;
 pub(crate) mod testing;
@@ -295,6 +298,8 @@ impl EngineTables {
             core.chat_imports,
             core.dbs_imports,
             core.mempalace_imports,
+            core.references,
+            core.sessions,
         );
         Ok(compacted)
     }

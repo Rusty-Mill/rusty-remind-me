@@ -46,7 +46,12 @@ const MEMORY_PAYLOAD: &str = "json_object('id', m.id, 'content', m.content, \
      'source_capture_id', m.source_capture_id, 'subject', m.subject, \
      'predicate', m.predicate, 'object', m.object, 'superseded_by', m.superseded_by, \
      'doc_id', m.doc_id, 'chunk_index', m.chunk_index, 'deleted_at', m.deleted_at, \
-     'remind_at', m.remind_at, 'sensitive', m.sensitive)";
+     'remind_at', m.remind_at, 'sensitive', m.sensitive, \
+     'project', m.project, 'session_id', m.session_id, 'git_remote', m.git_remote, \
+     'git_branch', m.git_branch, 'git_sha', m.git_sha, 'cwd', m.cwd, \
+     'valid_from', m.valid_from, 'valid_until', m.valid_until, 'confidence', m.confidence, \
+     'verified_at', m.verified_at, 'outcome', m.outcome, 'written_by', m.written_by, \
+     'capture_method', m.capture_method)";
 
 /// Run `body` inside a savepoint: all of it lands, or none of it does, as a
 /// statement and its triggers did.
@@ -454,6 +459,6 @@ mod tests {
         // Tags travel as the column's JSON text, and `sensitive` as an integer.
         assert_eq!(payload["tags"], serde_json::json!(r#"["t"]"#));
         assert_eq!(payload["sensitive"], serde_json::json!(0));
-        assert_eq!(payload.as_object().unwrap().len(), 28);
+        assert_eq!(payload.as_object().unwrap().len(), 41);
     }
 }

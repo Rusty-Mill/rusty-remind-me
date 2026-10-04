@@ -67,6 +67,8 @@ pub(super) fn before_image(core: &CoreTables, change: &Change) -> Change {
         Change::MempalaceImport(id, _) => {
             Change::MempalaceImport(*id, core.mempalace_imports.get(*id))
         }
+        Change::Reference(id, _) => Change::Reference(*id, core.references.get(*id).map(Box::new)),
+        Change::Session(id, _) => Change::Session(*id, core.sessions.get(*id).map(Box::new)),
     }
 }
 

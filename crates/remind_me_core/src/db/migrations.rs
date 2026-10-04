@@ -51,7 +51,15 @@ use rusqlite::Connection;
 /// - 31: no triggers; the repositories keep the full-text indexes, the tag
 ///   index and the outbox in step (ADR-0023 phase 1, step 7; see
 ///   [`drop_retired_triggers`]).
-pub const SCHEMA_VERSION: i32 = 31;
+/// - 32: context capture. `memories` gains where and when a row was
+///   written (`project`, `session_id`, `git_remote`, `git_branch`,
+///   `git_sha`, `cwd`), how far to trust it (`valid_from`, `valid_until`,
+///   `confidence`, `verified_at`, `outcome`) and who wrote it (`written_by`,
+///   `capture_method`). The same step adds `memory_references` and
+///   `sessions` on the engine store only (`db::references`,
+///   `db::sessions`); SQLite, kept to open and copy an older database onto
+///   the engine (ADR-0023), never holds them.
+pub const SCHEMA_VERSION: i32 = 32;
 
 const SCHEMA_TABLES: &str = include_str!("schema_tables.sql");
 const SCHEMA_INDEXES: &str = include_str!("schema_indexes.sql");

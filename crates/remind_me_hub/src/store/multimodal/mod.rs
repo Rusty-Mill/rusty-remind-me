@@ -45,7 +45,8 @@ use super::{
 use crate::canon::now_canonical;
 use crate::record::{EntityRecord, LinkRecord, MemoryRecord, Record};
 use keys::{IdKey, LinkKey, MAX_ID_KEY};
-use rows::{ByEngineId, EntityRow, Keyset, LinkRow, MemoryRow, Micros, RelationRow, Seq};
+use rows::{ByEngineId, EntityRow, Keyset, LinkRow, MemoryRow, MemoryRowV1, Micros, RelationRow, Seq};
+use rusty_multimodal_db_engine::generic::insert_log;
 use rusty_multimodal_db_engine::dir_lock::{DirLock, DirLockError};
 use rusty_multimodal_db_engine::durability::{sync_parent_dir, DurabilityError};
 use rusty_multimodal_db_engine::generic::mmap_field::MmapFieldValue;
@@ -180,6 +181,30 @@ where
     }
 }
 
+/// Open the `memories` table at `path`, or create it; a table written under
+/// the `@1` layout (before the node's schema v32) is read as
+/// [`MemoryRowV1`] and rewritten under the current one first. The insert
+/// log is folded into what is read, so it is cleared before the reopen
+/// would meet it under the current tag.
+///
+/// A table under neither layout fails with both reasons.
+fn open_memories(path: &Path) -> Result<Core<MemoryRow, Seq>, DurabilityError> {
+    if !path.exists() {
+        return Core::create(Vec::new(), path);
+    }
+    let current = match Core::<MemoryRow, Seq>::open_portable(path) {
+        Ok(table) => return Ok(table),
+        Err(e) => e,
+    };
+    let legacy = match Core::<MemoryRowV1, Seq>::read_portable_records(path) {
+        Ok(rows) => rows,
+        Err(_) => return Err(current),
+    };
+    let rows: Vec<MemoryRow> = legacy.into_iter().map(MemoryRowV1::into_current).collect();
+    insert_log::clear(&insert_log::log_path(path))?;
+    Core::open(rows, path)
+}
+
 impl MultimodalHubStore {
     /// Open (or create) a hub in `dir`.
     ///
@@ -193,7 +218,7 @@ impl MultimodalHubStore {
         let dir_lock = take_dir_lock(dir)?;
 
         let path = |name: &str| table_path(dir, name);
-        let memories = open_core(&path(MEMORIES)).map_err(engine_err)?;
+        let memories = open_memories(&path(MEMORIES)).map_err(engine_err)?;
         let entities = open_core(&path(ENTITIES)).map_err(engine_err)?;
         let links = open_core(&path(LINKS)).map_err(engine_err)?;
         let relations = open_core(&path(RELATIONS)).map_err(engine_err)?;
