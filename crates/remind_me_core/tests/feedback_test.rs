@@ -14,6 +14,8 @@ fn add(store: &Store<'_>) -> String {
     queries::add_memory(
         store,
         MemoryAddInput {
+            extract: true,
+            attachments: vec![],
             sensitive: false,
             content: "a memory".into(),
             // "general" gives a type prior of 1.0 and manual a source prior of
@@ -596,6 +598,8 @@ fn search_memories_demotes_a_result_with_similar_unhelpful_feedback() {
     let id = queries::add_memory(
         &store,
         MemoryAddInput {
+            extract: true,
+            attachments: vec![],
             sensitive: false,
             content: "the vpn configuration settings are in the ops wiki".to_string(),
             category: "general".to_string(),

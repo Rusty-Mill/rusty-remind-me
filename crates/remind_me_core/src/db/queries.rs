@@ -31,6 +31,12 @@ pub fn add_memory(store: &Store<'_>, mut input: MemoryAddInput) -> Result<Memory
     let code_refs = crate::code_refs::detect_code_refs(&input.content);
     crate::code_refs::merge_code_refs(&mut input.metadata, &code_refs);
 
+    // Write boundary: scrub secrets first (so nothing downstream sees them),
+    // and resolve attachments before the insert so a bad path fails the add.
+    let content = crate::boundary::scrub(&input.content, &mut input.tags, &mut input.metadata);
+    let attachments = crate::attachments::resolve(&input.attachments)?;
+    crate::attachments::merge_metadata(&mut input.metadata, &attachments);
+
     let decay_rate = get_decay_rate(&input.category);
     let type_prior = get_type_prior(&input.category);
     let source_prior = get_source_prior(&input.source);
@@ -52,20 +58,28 @@ pub fn add_memory(store: &Store<'_>, mut input: MemoryAddInput) -> Result<Memory
         sensitive: input.sensitive,
         node_id: Some(crate::sync::configured_node_id()),
         client: crate::sync::configured_client(),
-        ..NewMemory::new(id.clone(), input.content.clone(), &now_iso)
+        ..NewMemory::new(id.clone(), content.clone(), &now_iso)
     })?;
 
     // `MemoryAddInput::entities` was previously parsed and then dropped, so a
     // caller supplying entity mentions got a silent no-op. Same path as
     // `annotate_memories` so both behave identically.
-    crate::entity::apply_entity_mentions(store, &id, &input.entities)?;
+    crate::boundary::index(
+        store,
+        &id,
+        &content,
+        &input.entities,
+        input.extract,
+        &attachments,
+        &now_iso,
+    )?;
 
     // Best-effort: no embedder configured, or one that fails mid-request,
     // leaves this memory keyword-searchable only — never a reason to fail
     // the write that already succeeded. `remind_me_reindex` is the backstop
     // for anything that lands here without an embedder available.
     if let Some(embedder) = crate::embedder::available_embedder() {
-        let _ = crate::vectors::embed_and_store(store, &*embedder, &id, &input.content);
+        let _ = crate::vectors::embed_and_store(store, &*embedder, &id, &content);
     }
 
     let memory = get_memory_by_id(store, &id)?.ok_or(StoreError::NotFound)?;
@@ -181,8 +195,7 @@ pub fn update_memory(store: &Store<'_>, input: &MemoryUpdateInput) -> Result<Upd
         }
     }
 
-    let memory =
-        get_memory_by_id(store, &input.memory_id)?.ok_or(StoreError::NotFound)?;
+    let memory = get_memory_by_id(store, &input.memory_id)?.ok_or(StoreError::NotFound)?;
     crate::events::emit(crate::events::Event::Updated, &memory.id, &memory.category);
 
     Ok(UpdateOutcome::Updated(Box::new(memory)))

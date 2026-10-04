@@ -14,8 +14,8 @@ use remind_me_core::stats::Stats;
 use remind_me_core::wiki::WikiPage;
 use remind_me_core::wiki_import::WikiImportReport;
 use remind_me_core::{
-    reminders, updater, Database, EntityInput, MemoryAddInput, MemoryListInput, MemorySearchInput,
-    ResponseFormat, LIST_LIMIT_MAX, LIST_LIMIT_MIN,
+    reminders, updater, AttachmentInput, Database, EntityInput, MemoryAddInput, MemoryListInput,
+    MemorySearchInput, ResponseFormat, LIST_LIMIT_MAX, LIST_LIMIT_MIN,
 };
 use remind_me_mcp::McpServer;
 use serde_json::{json, Value};
@@ -369,7 +369,8 @@ fn parse_list_args(args: &[String]) -> Result<ListArgs, String> {
 
 const LIST_USAGE: &str = "Usage: rusty-remind-me list [--limit N] [--category CATEGORY] [--json]";
 
-const ADD_USAGE: &str = "Usage: rusty-remind-me add <content> [--category CATEGORY] [--tags a,b,c]";
+const ADD_USAGE: &str =
+    "Usage: rusty-remind-me add <content> [--category CATEGORY] [--tags a,b,c] [--attach PATH]...";
 
 const SEARCH_USAGE: &str = "Usage: rusty-remind-me search <query> [--limit N] [--json]";
 
@@ -385,6 +386,8 @@ struct AddArgs {
     content: String,
     category: String,
     tags: Vec<String>,
+    /// `--attach <path>`, repeatable: files recorded by fingerprint.
+    attach: Vec<String>,
 }
 
 /// Parsed form of `rusty-remind-me search <query> [--limit N] [--json]`.
@@ -477,6 +480,7 @@ fn parse_add_args(args: &[String]) -> Result<AddArgs, String> {
     // `--tags` defaulting to "" -> [].
     let mut category = "general".to_string();
     let mut tags: Vec<String> = Vec::new();
+    let mut attach: Vec<String> = Vec::new();
 
     let content = collect_positional(args, ADD_USAGE, |flag, args, i| match flag {
         "--category" => {
@@ -489,6 +493,11 @@ fn parse_add_args(args: &[String]) -> Result<AddArgs, String> {
             *i += 2;
             Ok(true)
         }
+        "--attach" => {
+            attach.push(flag_value(args, *i, flag, ADD_USAGE)?);
+            *i += 2;
+            Ok(true)
+        }
         _ => Ok(false),
     })?;
 
@@ -496,6 +505,7 @@ fn parse_add_args(args: &[String]) -> Result<AddArgs, String> {
         content,
         category,
         tags,
+        attach,
     })
 }
 
@@ -818,6 +828,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 };
                 let add_input = MemoryAddInput {
+                    extract: true,
+                    attachments: add_args
+                        .attach
+                        .into_iter()
+                        .map(|path| AttachmentInput {
+                            path: Some(path),
+                            ..Default::default()
+                        })
+                        .collect(),
                     sensitive: false,
                     content: add_args.content,
                     category: add_args.category,
@@ -1063,6 +1082,15 @@ mod tests {
         // `add_p.add_argument("--category", default="general")`.
         assert_eq!(parsed.category, "general");
         assert!(parsed.tags.is_empty());
+        assert!(parsed.attach.is_empty());
+    }
+
+    #[test]
+    fn add_attach_is_repeatable() {
+        let parsed =
+            parse_add_args(&args(&["note", "--attach", "a.txt", "--attach", "b.pdf"])).unwrap();
+        assert_eq!(parsed.attach, vec!["a.txt", "b.pdf"]);
+        assert!(parse_add_args(&args(&["note", "--attach"])).is_err());
     }
 
     #[test]

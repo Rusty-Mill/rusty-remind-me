@@ -14,6 +14,8 @@ fn add(store: &Store<'_>, content: &str) -> String {
 
 fn add_with_entities(store: &Store<'_>, content: &str, entities: Vec<EntityInput>) -> String {
     let input = MemoryAddInput {
+        extract: true,
+        attachments: vec![],
         sensitive: false,
         content: content.to_string(),
         category: "general".to_string(),

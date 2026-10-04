@@ -81,6 +81,17 @@ impl<'c> References<'c> {
         engine::references::for_memory(&self.core.lock(), memory_id)
     }
 
+    /// The references of all of `memory_ids` in one pass (no N+1), oldest
+    /// first; regroup by `memory_id`.
+    pub fn for_memories(&self, memory_ids: &[String]) -> Result<Vec<MemoryReference>> {
+        engine::references::for_memories(&self.core.lock(), memory_ids)
+    }
+
+    /// Every reference of this `kind`, oldest first.
+    pub fn of_kind(&self, kind: &str) -> Result<Vec<MemoryReference>> {
+        engine::references::of_kind(&self.core.lock(), kind)
+    }
+
     /// Every reference with exactly this `kind` and `value`, oldest first
     /// (ties by id): the memories that name one thing.
     pub fn find(&self, kind: &str, value: &str) -> Result<Vec<MemoryReference>> {

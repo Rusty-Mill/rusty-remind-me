@@ -246,6 +246,8 @@ impl Corpus {
             .map(|_| format!("tag{}", rng.below(40)))
             .collect();
         MemoryAddInput {
+            extract: true,
+            attachments: vec![],
             content: self.content(rng),
             category: category.to_string(),
             tags,

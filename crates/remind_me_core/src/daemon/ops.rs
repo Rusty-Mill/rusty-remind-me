@@ -116,6 +116,8 @@ mod tests {
 
     fn add(store: &Store<'_>, content: &str) -> Memory {
         let input = MemoryAddInput {
+            extract: true,
+            attachments: vec![],
             sensitive: false,
             content: content.into(),
             category: "note".into(),

@@ -6,6 +6,8 @@ fn test_database_creation_and_add_memory() {
     let db = Database::open_in_memory().expect("Failed to open in-memory database");
 
     let add_input = MemoryAddInput {
+        extract: true,
+        attachments: vec![],
         sensitive: false,
         content: "Rust implementation of remind_me with FTS5 search".to_string(),
         category: "project".to_string(),

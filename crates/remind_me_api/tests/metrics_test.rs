@@ -209,6 +209,8 @@ fn the_memory_gauge_counts_live_memories_only() {
                 let memory = remind_me_core::db::queries::add_memory(
                     conn,
                     remind_me_core::MemoryAddInput {
+                        extract: true,
+                        attachments: vec![],
                         content: content.to_string(),
                         category: "general".into(),
                         tags: vec![],

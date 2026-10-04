@@ -486,6 +486,8 @@ fn ordinary_memories_never_enter_the_batch() {
     queries::add_memory(
         &store,
         remind_me_core::MemoryAddInput {
+            extract: true,
+            attachments: vec![],
             sensitive: false,
             content: "written by hand".into(),
             category: "general".into(),

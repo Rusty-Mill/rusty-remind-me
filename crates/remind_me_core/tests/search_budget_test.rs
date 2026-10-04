@@ -21,6 +21,8 @@ fn add_sized(store: &Store<'_>, tag: &str, chars: usize) -> String {
     queries::add_memory(
         store,
         MemoryAddInput {
+            extract: true,
+            attachments: vec![],
             content: body,
             category: "general".into(),
             tags: vec![],

@@ -11,6 +11,8 @@ use remind_me_core::{
 
 fn add(store: &Store<'_>, content: &str, category: &str, source: &str, tags: &[&str]) -> String {
     let input = MemoryAddInput {
+        extract: true,
+        attachments: vec![],
         sensitive: false,
         content: content.to_string(),
         category: category.to_string(),
@@ -433,6 +435,8 @@ fn delete_cleans_up_dependent_rows_explicitly() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
     let input = MemoryAddInput {
+        extract: true,
+        attachments: vec![],
         sensitive: false,
         content: "linked to an entity".to_string(),
         category: "general".to_string(),

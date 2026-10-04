@@ -23,6 +23,8 @@ fn seed(store: &Store<'_>, n: usize) -> Vec<String> {
             queries::add_memory(
                 store,
                 MemoryAddInput {
+                    extract: true,
+                    attachments: vec![],
                     content: format!("seed {i}"),
                     category: "general".into(),
                     tags: vec![],

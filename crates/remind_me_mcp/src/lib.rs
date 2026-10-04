@@ -13,6 +13,7 @@
 mod test_env;
 
 pub mod daemon_proxy;
+pub mod references;
 pub mod render;
 
 /// The response format a call asked for, defaulting to **JSON** (#206).
@@ -498,7 +499,20 @@ impl McpServer {
                                         "category": { "type": "string", "default": "general" },
                                         "tags": { "type": "array", "items": { "type": "string" } },
                                         "source": { "type": "string", "default": "manual" },
-                                        "sensitive": { "type": "boolean", "default": false, "description": "Mark this memory sensitive: kept out of ordinary search and list results unless include_sensitive is set. A convenience flag, NOT access control — this is a single-user store and anyone with the database reads everything regardless." }
+                                        "sensitive": { "type": "boolean", "default": false, "description": "Mark this memory sensitive: kept out of ordinary search and list results unless include_sensitive is set. A convenience flag, NOT access control — this is a single-user store and anyone with the database reads everything regardless." },
+                                        "extract": { "type": "boolean", "default": true, "description": "Extract references (issues, commits, URLs, paths, handles) and entities from the content. REMIND_ME_EXTRACT=0 disables it globally." },
+                                        "attachments": {
+                                            "type": "array",
+                                            "description": "Files or URLs this memory points at. A path is hashed (sha256) and only the fingerprint, size and mime type are stored, never the bytes.",
+                                            "items": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "path": { "type": "string" },
+                                                    "url": { "type": "string" },
+                                                    "label": { "type": "string" }
+                                                }
+                                            }
+                                        }
                                     },
                                     "required": ["content"]
                                 }
@@ -848,6 +862,7 @@ impl McpServer {
                                     "required": ["memory_id"]
                                 }
                             },
+                            references::tool_schema(),
                             {
                                 "name": "remind_me_skeleton_write",
                                 "description": "Attach a Mermaid diagram of a capture's structure, so the conversation's shape can be read without reading the transcript. Each node maps to an inclusive, 1-based line range in the capture's dialog; remind_me_skeleton_read then drills into one node at a time. Ranges are validated against the dialog and the write is refused if any is out of bounds.",
@@ -1462,9 +1477,14 @@ impl McpServer {
                             .or_else(|| args.get("id").and_then(|v| v.as_str()))
                             .unwrap_or("");
                         match queries::get_memory_by_id(&store, id) {
-                            Ok(Some(mem)) => {
-                                json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&mem).unwrap() }] })
-                            }
+                            Ok(Some(mem)) => match references::memory_json(&store, &mem) {
+                                Ok(with_refs) => {
+                                    json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&with_refs).unwrap() }] })
+                                }
+                                Err(e) => {
+                                    json!({ "isError": true, "content": [{ "type": "text", "text": format!("Error: {}", e) }] })
+                                }
+                            },
                             Ok(None) => {
                                 json!({ "isError": true, "content": [{ "type": "text", "text": "Memory not found" }] })
                             }
@@ -1559,11 +1579,16 @@ impl McpServer {
                                         // away here, so a markdown request got
                                         // a successful JSON response (#224).
                                         let text = match search_input.response_format {
-                                            ResponseFormat::Json => {
-                                                serde_json::to_string_pretty(&res).unwrap()
-                                            }
+                                            ResponseFormat::Json => serde_json::to_string_pretty(
+                                                &references::search_json(&store, &res)
+                                                    .unwrap_or_else(|_| json!(res)),
+                                            )
+                                            .unwrap(),
                                             ResponseFormat::Markdown => {
                                                 render::search_response(&res)
+                                                    + &references::search_markdown_footer(
+                                                        &store, &res,
+                                                    )
                                             }
                                         };
                                         json!({ "content": [{ "type": "text", "text": text }] })
@@ -2141,6 +2166,14 @@ impl McpServer {
                             }
                         }
                     }
+                    "remind_me_references" => match references::run(&store, &args) {
+                        Ok(found) => {
+                            json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&found).unwrap() }] })
+                        }
+                        Err(e) => {
+                            json!({ "isError": true, "content": [{ "type": "text", "text": format!("References error: {}", e) }] })
+                        }
+                    },
                     "remind_me_skeleton_write" => {
                         let parsed: std::result::Result<remind_me_core::SkeletonWriteInput, _> =
                             serde_json::from_value(args.clone());
@@ -3393,6 +3426,73 @@ mod tests {
         for expected in ["remind_me_list", "remind_me_update", "remind_me_delete"] {
             assert!(names.contains(&expected), "{} not in tools/list", expected);
         }
+    }
+
+    #[test]
+    fn references_tool_is_registered_and_reverse_lookup_works() {
+        let db = Database::open_in_memory().unwrap();
+        let server = McpServer::new(db);
+        let req = json!({ "jsonrpc": "2.0", "id": 4, "method": "tools/list" });
+        let resp = server.handle_request(&req.to_string()).unwrap();
+        let names: Vec<&str> = resp["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"remind_me_references"));
+
+        let added = call(
+            &server,
+            "remind_me_add",
+            json!({ "content": "Shipped o/r#321 in 3ac9f797" }),
+        );
+        let id = serde_json::from_str::<Value>(&text_of(&added)).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let by_value = call(
+            &server,
+            "remind_me_references",
+            json!({ "value": "o/r#321" }),
+        );
+        let found: Value = serde_json::from_str(&text_of(&by_value)).unwrap();
+        assert_eq!(found["count"], 1, "{found}");
+        assert_eq!(found["references"][0]["memory_id"], id.as_str());
+        assert_eq!(found["references"][0]["memory"]["id"], id.as_str());
+
+        let by_memory = call(&server, "remind_me_references", json!({ "memory_id": id }));
+        let found: Value = serde_json::from_str(&text_of(&by_memory)).unwrap();
+        assert_eq!(found["count"], 2, "{found}");
+
+        let none = call(&server, "remind_me_references", json!({}));
+        assert_eq!(none["isError"], true);
+
+        let got = call(&server, "remind_me_get", json!({ "memory_id": id }));
+        let got: Value = serde_json::from_str(&text_of(&got)).unwrap();
+        assert_eq!(got["references"].as_array().unwrap().len(), 2);
+
+        let searched = call(
+            &server,
+            "remind_me_search",
+            json!({ "query": "Shipped", "response_format": "json" }),
+        );
+        let searched: Value = serde_json::from_str(&text_of(&searched)).unwrap();
+        assert_eq!(
+            searched["memories"][0]["memory"]["references"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2,
+            "{searched}"
+        );
+        let md = call(&server, "remind_me_search", json!({ "query": "Shipped" }));
+        assert!(
+            text_of(&md).contains("refs: issue:o/r#321"),
+            "{}",
+            text_of(&md)
+        );
     }
 
     #[test]

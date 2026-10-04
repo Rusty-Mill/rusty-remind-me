@@ -13,6 +13,8 @@ fn add(store: &Store<'_>, content: &str, category: &str) -> String {
     queries::add_memory(
         store,
         MemoryAddInput {
+            extract: true,
+            attachments: vec![],
             sensitive: false,
             content: content.to_string(),
             category: category.to_string(),

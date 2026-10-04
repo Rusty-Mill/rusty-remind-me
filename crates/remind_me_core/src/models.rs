@@ -235,6 +235,30 @@ pub struct MemoryAddInput {
     /// memory out of ordinary search and list results unless asked for.
     #[serde(default)]
     pub sensitive: bool,
+    /// Run the rule-based reference/entity extraction (`extract.rs`) on the
+    /// content. On by default; `REMIND_ME_EXTRACT=0` turns it off globally.
+    #[serde(default = "default_true")]
+    pub extract: bool,
+    /// Files or URLs this memory points at. Only a fingerprint and a label
+    /// are stored, never the bytes.
+    #[serde(default)]
+    pub attachments: Vec<AttachmentInput>,
+}
+
+/// One attachment of a [`MemoryAddInput`]: a local `path` (hashed, never
+/// stored) or a `url`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachmentInput {
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_category() -> String {
@@ -2182,9 +2206,17 @@ mod write_context_tests {
         };
         context.apply(&mut row);
         assert_eq!(row.project.as_deref(), Some("quokka"));
-        assert_eq!(row.git_branch.as_deref(), Some("main"), "a known value wins");
+        assert_eq!(
+            row.git_branch.as_deref(),
+            Some("main"),
+            "a known value wins"
+        );
         assert_eq!(row.cwd.as_deref(), Some("/work"));
-        assert_eq!(row.session_id.as_deref(), Some("explicit"), "an unknown leaves it");
+        assert_eq!(
+            row.session_id.as_deref(),
+            Some("explicit"),
+            "an unknown leaves it"
+        );
         assert_eq!(row.git_remote, None);
         assert_eq!(row.git_sha, None);
         assert_eq!(row.written_by, "unknown", "not a context column");
