@@ -491,6 +491,10 @@ pub struct AnnotationApplied {
     pub memory_id: String,
     /// Number of *new* mention links created for this memory.
     pub entities_linked: usize,
+    /// Memories this annotation superseded because its triple contradicts
+    /// theirs, as `decompose` does.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub superseded_ids: Vec<String>,
 }
 
 /// Why one annotation in the batch could not be applied.
@@ -1772,6 +1776,12 @@ pub struct ContradictionCandidate {
     /// the conflict reads, and re-deriving the join caller-side is work the
     /// producer has already done.
     pub shared_entities: Vec<String>,
+    /// When both sides state the same subject and predicate with different
+    /// objects, the one to keep: higher confidence, then newer
+    /// `verified_at`, then newer `updated_at`. `memory_a` is then that side.
+    /// Absent for pairs that are not a triple conflict, or are a dead heat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommended_keep: Option<String>,
 }
 
 /// A page of candidate pairs.

@@ -1007,6 +1007,49 @@ pub(crate) fn with_code_refs(tables: &EngineTables) -> Result<Vec<(String, Strin
     Ok(found)
 }
 
+/// Live, unsuperseded, non-sensitive memories with a `valid_until`: id,
+/// content and that timestamp. The caller decides which have passed.
+pub(crate) fn with_valid_until(tables: &EngineTables) -> Result<Vec<(String, String, String)>> {
+    let mut found: Vec<(String, String, String)> = rows(core_ref(tables)?)
+        .filter(|row| row.is_live() && !row.sensitive)
+        .filter_map(|row| row.valid_until.map(|until| (row.id, row.content, until)))
+        .collect();
+    found.sort();
+    Ok(found)
+}
+
+/// How memory `id` ties to the capture it came from or the facts decomposed
+/// from it: `(sources, derived)`, each sorted by id. A fact's `sources` are
+/// the not-deleted memories carrying the capture id its `source_capture_id`
+/// names; a capture's `derived` are the not-deleted memories whose
+/// `source_capture_id` is its capture id.
+pub(crate) fn capture_links(
+    tables: &EngineTables,
+    id: &str,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let core = core_ref(tables)?;
+    let Some(row) = row(core, id) else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let ids_where = |keep: &dyn Fn(&MemoryRow) -> bool| {
+        let mut ids: Vec<String> = rows(core)
+            .filter(|r| r.deleted_at.is_none() && r.id != id && keep(r))
+            .map(|r| r.id)
+            .collect();
+        ids.sort();
+        ids
+    };
+    let sources = match &row.source_capture_id {
+        Some(c) => ids_where(&|r| r.capture_id.as_ref() == Some(c)),
+        None => Vec::new(),
+    };
+    let derived = match &row.capture_id {
+        Some(c) => ids_where(&|r| r.source_capture_id.as_ref() == Some(c)),
+        None => Vec::new(),
+    };
+    Ok((sources, derived))
+}
+
 /// `ids` without repeats, first occurrence first: an `IN (…)` list matches
 /// each row once however often it is named.
 fn distinct(ids: &[String]) -> impl Iterator<Item = &str> {

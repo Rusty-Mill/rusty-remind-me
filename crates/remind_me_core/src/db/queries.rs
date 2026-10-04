@@ -416,9 +416,23 @@ pub fn annotate_memories(store: &Store<'_>, input: &AnnotateInput) -> Result<Ann
             annotation.object.as_deref(),
         )?;
 
+        // Against the triple the memory holds now, which an annotation that
+        // set only some of the three completes. Same rule `decompose` applies.
+        let superseded_ids = match get_memory_by_id(store, &annotation.memory_id)? {
+            Some(m) => crate::entity::supersede_contradicting_facts(
+                store,
+                &m.id,
+                m.subject.as_deref(),
+                m.predicate.as_deref(),
+                m.object.as_deref(),
+            )?,
+            None => Vec::new(),
+        };
+
         results.push(AnnotationApplied {
             memory_id: annotation.memory_id.clone(),
             entities_linked,
+            superseded_ids,
         });
     }
 

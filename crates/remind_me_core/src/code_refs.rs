@@ -201,6 +201,8 @@ pub enum StaleReason {
     Modified,
     /// No longer exists at all.
     Deleted,
+    /// The memory's own `valid_until` has passed.
+    Expired,
 }
 
 /// One anchored path that no longer matches what a memory recorded.
@@ -216,6 +218,10 @@ pub struct StaleCandidate {
     pub memory_id: String,
     pub content_snippet: String,
     pub stale_refs: Vec<StaleRef>,
+    /// The `valid_until` that has passed: set, with an empty `stale_refs`,
+    /// for a memory reported as [`StaleReason::Expired`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expired_at: Option<String>,
 }
 
 /// A page of stale-anchor candidates, plus the true backlog behind it.
@@ -228,6 +234,24 @@ pub struct StaleCandidate {
 pub struct StaleCandidatesResult {
     pub candidates: Vec<StaleCandidate>,
     pub total_candidates: usize,
+}
+
+/// Live memories whose `valid_until` has passed, reported as
+/// [`StaleReason::Expired`]. The caller merges these with the anchor
+/// candidates so a memory with both is reported once.
+fn expired_candidates(store: &Store<'_>) -> SqlResult<Vec<StaleCandidate>> {
+    let now = chrono::Utc::now();
+    let rows = crate::db::memories::Memories::new(store).with_valid_until()?;
+    Ok(rows
+        .into_iter()
+        .filter(|(_, _, until)| crate::retrieval::is_expired(now, Some(until)))
+        .map(|(id, content, until)| StaleCandidate {
+            memory_id: id,
+            content_snippet: content.chars().take(SNIPPET_CHARS).collect(),
+            stale_refs: Vec::new(),
+            expired_at: Some(until),
+        })
+        .collect())
 }
 
 /// Re-check every anchored path and report memories where at least one no
@@ -321,7 +345,14 @@ pub fn stale_candidates(store: &Store<'_>, limit: usize) -> SqlResult<StaleCandi
                 memory_id: id,
                 content_snippet,
                 stale_refs,
+                expired_at: None,
             });
+        }
+    }
+    for expired in expired_candidates(store)? {
+        match out.iter_mut().find(|c| c.memory_id == expired.memory_id) {
+            Some(existing) => existing.expired_at = expired.expired_at,
+            None => out.push(expired),
         }
     }
 
