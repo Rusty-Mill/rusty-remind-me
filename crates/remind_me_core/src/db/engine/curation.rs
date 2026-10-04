@@ -197,6 +197,16 @@ fn same_claim(a: &MemoryRow, b: &MemoryRow) -> bool {
     }
 }
 
+/// Whether both rows state an object and the two differ folded: the same
+/// claim made twice with different answers, which supersession should have
+/// settled and did not (a sync merge, an import). A restatement is not one.
+fn conflicting_objects(a: &MemoryRow, b: &MemoryRow) -> bool {
+    match (&a.object, &b.object) {
+        (Some(oa), Some(ob)) => folded(oa) != folded(ob),
+        _ => false,
+    }
+}
+
 /// Every candidate pair `(id_a, id_b)` with `id_a < id_b`, in order.
 fn pairs(core: &CoreTables, max_fanout: i64) -> BTreeSet<(String, String)> {
     let mut by_entity: HashMap<String, Vec<String>> = HashMap::new();
@@ -215,7 +225,7 @@ fn pairs(core: &CoreTables, max_fanout: i64) -> BTreeSet<(String, String)> {
                 let (Some(ra), Some(rb)) = (eligible(a), eligible(b)) else {
                     continue;
                 };
-                if !same_claim(&ra, &rb) {
+                if !same_claim(&ra, &rb) || conflicting_objects(&ra, &rb) {
                     found.insert((a.clone(), b.clone()));
                 }
             }
