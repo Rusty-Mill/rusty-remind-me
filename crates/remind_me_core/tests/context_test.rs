@@ -90,10 +90,42 @@ fn search(store: &Store<'_>, scope: ScopeFilter) -> Vec<String> {
 }
 
 fn fixture(store: &Store<'_>) {
-    put(store, "a", "quokka alpha", Some("Rusty"), Some("main"), Some("s1"), "human");
-    put(store, "b", "quokka beta", Some("rusty"), Some("dev"), Some("s2"), "hook");
-    put(store, "c", "quokka gamma", Some("other"), Some("main"), Some("s1"), "model");
-    put(store, "d", "quokka delta", None, None, None, "importer:chat_import");
+    put(
+        store,
+        "a",
+        "quokka alpha",
+        Some("Rusty"),
+        Some("main"),
+        Some("s1"),
+        "human",
+    );
+    put(
+        store,
+        "b",
+        "quokka beta",
+        Some("rusty"),
+        Some("dev"),
+        Some("s2"),
+        "hook",
+    );
+    put(
+        store,
+        "c",
+        "quokka gamma",
+        Some("other"),
+        Some("main"),
+        Some("s1"),
+        "model",
+    );
+    put(
+        store,
+        "d",
+        "quokka delta",
+        None,
+        None,
+        None,
+        "importer:chat_import",
+    );
 }
 
 fn scope(p: Option<&str>, b: Option<&str>, s: Option<&str>, w: Option<&str>) -> ScopeFilter {
@@ -109,15 +141,30 @@ fn list_filters_by_each_scope_field() {
 
     assert_eq!(list(&store, ScopeFilter::default()), ["a", "b", "c", "d"]);
     // Project is case-insensitive: "Rusty" and "rusty" both match.
-    assert_eq!(list(&store, scope(Some("RUSTY"), None, None, None)), ["a", "b"]);
+    assert_eq!(
+        list(&store, scope(Some("RUSTY"), None, None, None)),
+        ["a", "b"]
+    );
     // Branch is exact.
-    assert_eq!(list(&store, scope(None, Some("main"), None, None)), ["a", "c"]);
-    assert_eq!(list(&store, scope(None, Some("Main"), None, None)), Vec::<String>::new());
-    assert_eq!(list(&store, scope(None, None, Some("s1"), None)), ["a", "c"]);
+    assert_eq!(
+        list(&store, scope(None, Some("main"), None, None)),
+        ["a", "c"]
+    );
+    assert_eq!(
+        list(&store, scope(None, Some("Main"), None, None)),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        list(&store, scope(None, None, Some("s1"), None)),
+        ["a", "c"]
+    );
     assert_eq!(list(&store, scope(None, None, None, Some("hook"))), ["b"]);
     // Filters combine.
     assert_eq!(
-        list(&store, scope(Some("rusty"), Some("main"), Some("s1"), Some("human"))),
+        list(
+            &store,
+            scope(Some("rusty"), Some("main"), Some("s1"), Some("human"))
+        ),
         ["a"]
     );
     assert!(list(&store, scope(Some("nope"), None, None, None)).is_empty());
@@ -144,11 +191,20 @@ fn search_filters_by_each_scope_field() {
     fixture(&store);
 
     assert_eq!(search(&store, ScopeFilter::default()), ["a", "b", "c", "d"]);
-    assert_eq!(search(&store, scope(Some("rusty"), None, None, None)), ["a", "b"]);
-    assert_eq!(search(&store, scope(None, Some("dev"), None, None)), ["b"]);
-    assert_eq!(search(&store, scope(None, None, Some("s1"), None)), ["a", "c"]);
     assert_eq!(
-        search(&store, scope(None, None, None, Some("importer:chat_import"))),
+        search(&store, scope(Some("rusty"), None, None, None)),
+        ["a", "b"]
+    );
+    assert_eq!(search(&store, scope(None, Some("dev"), None, None)), ["b"]);
+    assert_eq!(
+        search(&store, scope(None, None, Some("s1"), None)),
+        ["a", "c"]
+    );
+    assert_eq!(
+        search(
+            &store,
+            scope(None, None, None, Some("importer:chat_import"))
+        ),
         ["d"]
     );
     assert!(search(&store, scope(None, Some("zzz"), None, None)).is_empty());
@@ -161,9 +217,10 @@ fn scope_filters_deserialise_from_flat_tool_arguments() {
             .unwrap();
     assert_eq!(input.scope.project.as_deref(), Some("x"));
     assert_eq!(input.scope.branch.as_deref(), Some("b"));
-    let search: MemorySearchInput =
-        serde_json::from_value(serde_json::json!({"query": "q", "session_id": "s", "written_by": "hook"}))
-            .unwrap();
+    let search: MemorySearchInput = serde_json::from_value(
+        serde_json::json!({"query": "q", "session_id": "s", "written_by": "hook"}),
+    )
+    .unwrap();
     assert_eq!(search.scope.session_id.as_deref(), Some("s"));
     assert_eq!(search.scope.written_by.as_deref(), Some("hook"));
 }
@@ -225,7 +282,10 @@ fn an_importer_stamps_itself_and_keeps_only_the_project() {
     .unwrap();
     test_env::remove_var(SESSION_ID_ENV);
     test_env::remove_var(WRITTEN_BY_ENV);
-    assert!(matches!(outcome, ImportOutcome::Imported { .. }), "{outcome:?}");
+    assert!(
+        matches!(outcome, ImportOutcome::Imported { .. }),
+        "{outcome:?}"
+    );
 
     let page = queries::list_memories(
         &store,
@@ -315,7 +375,15 @@ fn stats_without_projects_have_an_empty_list() {
 fn markdown_header_shows_project_at_branch_and_never_the_session() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
-    put(&store, "a", "quokka", Some("rusty"), Some("main"), Some("secret-session"), "human");
+    put(
+        &store,
+        "a",
+        "quokka",
+        Some("rusty"),
+        Some("main"),
+        Some("secret-session"),
+        "human",
+    );
     put(&store, "b", "quokka", Some("rusty"), None, None, "human");
     put(&store, "c", "quokka", None, Some("main"), None, "human");
     let page = queries::list_memories(

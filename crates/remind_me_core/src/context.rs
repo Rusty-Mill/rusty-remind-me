@@ -277,9 +277,11 @@ pub fn fill_client_defaults(vars: &mut std::collections::BTreeMap<String, String
 /// Whether `value` is a `written_by` this product defines.
 pub fn is_valid_written_by(value: &str) -> bool {
     matches!(value, "human" | "hook" | "unknown" | "model")
-        || ["model:", "importer:"]
-            .iter()
-            .any(|prefix| value.strip_prefix(prefix).is_some_and(|rest| !rest.is_empty()))
+        || ["model:", "importer:"].iter().any(|prefix| {
+            value
+                .strip_prefix(prefix)
+                .is_some_and(|rest| !rest.is_empty())
+        })
 }
 
 /// `written_by` for `writer` given the override and model, both optional.
@@ -625,7 +627,12 @@ mod tests {
         run(&repo, &["config", "commit.gpgsign", "false"]);
         run(
             &repo,
-            &["remote", "add", "origin", "https://u:tok@github.com/acme/widgets.git"],
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://u:tok@github.com/acme/widgets.git",
+            ],
         );
         std::fs::write(repo.join("a.txt"), "x").unwrap();
         run(&repo, &["add", "."]);
@@ -636,7 +643,10 @@ mod tests {
         assert_eq!(ctx.git_branch.as_deref(), Some("trunk"));
         assert_eq!(ctx.git_remote.as_deref(), Some("github.com/acme/widgets"));
         assert_eq!(ctx.git_sha.as_ref().map(String::len), Some(40));
-        assert_eq!(ctx.cwd, Some(repo.join("sub").to_string_lossy().into_owned()));
+        assert_eq!(
+            ctx.cwd,
+            Some(repo.join("sub").to_string_lossy().into_owned())
+        );
         std::fs::remove_dir_all(root).ok();
     }
 
