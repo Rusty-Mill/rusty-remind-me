@@ -20,6 +20,44 @@ use remind_me_hub::record;
 use remind_me_hub::store::{GraphPullQuery, HubStore, PullCursor, PullQuery, COUNTABLE};
 use serde_json::{json, Value};
 
+/// Adapt frozen pre-v32 memory answers to today's wire schema. Only expected
+/// answers pass through here: extra or incorrect fields in actual engine output
+/// must still fail exact equality. Do not recurse into memory metadata.
+pub fn with_v32_memory_defaults(mut answers: Value) -> Value {
+    fn walk(value: &mut Value) {
+        match value {
+            Value::Array(items) => items.iter_mut().for_each(walk),
+            Value::Object(fields)
+                if fields.contains_key("id")
+                    && fields.contains_key("content")
+                    && fields.contains_key("hub_seq") =>
+            {
+                for key in [
+                    "project",
+                    "session_id",
+                    "git_remote",
+                    "git_branch",
+                    "git_sha",
+                    "cwd",
+                    "valid_from",
+                    "valid_until",
+                    "verified_at",
+                    "outcome",
+                ] {
+                    fields.entry(key).or_insert(Value::Null);
+                }
+                fields.entry("confidence").or_insert(json!(1.0));
+                fields.entry("written_by").or_insert(json!("unknown"));
+                fields.entry("capture_method").or_insert(json!("manual"));
+            }
+            Value::Object(fields) => fields.values_mut().for_each(walk),
+            _ => {}
+        }
+    }
+    walk(&mut answers);
+    answers
+}
+
 fn memory(id: &str, created: &str, updated: &str) -> Value {
     json!({
         "id": id,

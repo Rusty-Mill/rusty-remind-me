@@ -250,9 +250,13 @@ has no periodic-task infrastructure to hang one off.
 ## Testing
 
 ```sh
-cargo test -p remind_me_hub                       # Postgres copy tests skip
-REMIND_ME_HUB_TEST_DATABASE_URL=postgresql://… \
-  cargo test -p remind_me_hub -- --test-threads=1 # with a real Postgres
+cargo test -p remind_me_hub --no-default-features # engine + SQLite copy; no server
+# Only use a disposable test database: these tests replace its hub tables.
+# Example: the disposable local Postgres service used by CI, never a user database.
+REMIND_ME_HUB_TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/hubtest \
+REMIND_ME_HUB_REQUIRE_POSTGRES=1 \
+  cargo test -p remind_me_hub --no-default-features --features postgres-import \
+    --test hub_postgres_copy_test -- --test-threads=1
 ```
 
 The route suite (`tests/suite/routes.rs`) covers the protocol request by
@@ -269,5 +273,16 @@ fine. For CI it is not, so `REMIND_ME_HUB_REQUIRE_POSTGRES=1` turns the skip
 into a hard failure and CI sets it; the environment cannot lose its database
 and stay green.
 
-CI runs all of these, plus a `--no-default-features` build, so a
-`postgres::` reference leaking outside its feature gate cannot go unnoticed.
+CI runs the engine and SQLite copy suite with `--no-default-features`, independently
+of any Postgres service. A separate legacy-import job enables `postgres-import`
+and requires a disposable server when hub code, contracts, fixtures, affected
+dependencies or Cargo.lock change, and on full sweeps. Node sync, database and
+model changes also select it: node and hub wire records are separate Rust types,
+so Cargo dependencies alone cannot capture that contract. Other node-only changes
+do not start Postgres. Both configurations are linted with warnings denied.
+
+Release archives and container images still include the recovery tool with the
+default `postgres-import` feature. Feature selection does not select a runtime
+backend: the hub is always engine-only. Historical Postgres fixtures remain
+unchanged; test expectations add explicit v32 defaults for fields absent from
+those sources, while still comparing every returned field.

@@ -101,7 +101,9 @@ fn a_postgres_hub_copies_onto_the_engine_with_every_hub_seq_kept() {
     };
     let _guard = DB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     load(&url, include_str!("fixtures/postgres_hub.sql"));
-    let expected = recorded_json(include_str!("fixtures/postgres_answers.json"));
+    let expected = recorded::with_v32_memory_defaults(recorded_json(include_str!(
+        "fixtures/postgres_answers.json"
+    )));
 
     let dir = scratch("gaps");
     let snapshot = remind_me_hub::import::postgres::read(&url).expect("read the Postgres hub");
@@ -159,7 +161,9 @@ fn a_legacy_postgres_hub_copies_without_being_migrated() {
 
     let dir = scratch("legacy");
     let engine = MultimodalHubStore::create_from_snapshot(&dir, &snapshot).expect("copy");
-    let migrated = recorded_json(include_str!("fixtures/legacy_postgres_migrated.json"));
+    let migrated = recorded::with_v32_memory_defaults(recorded_json(include_str!(
+        "fixtures/legacy_postgres_migrated.json"
+    )));
     assert_eq!(json!(pull_all(&engine)), migrated);
 
     drop(engine);
