@@ -272,7 +272,7 @@ mod tests {
                 client,
             }) => {
                 assert_eq!(session_id, "s1");
-                assert_eq!(cwd, PathBuf::from("/work"));
+                assert_eq!(cwd, std::path::absolute("/work").unwrap());
                 assert_eq!(client.as_deref(), Some("claude-code"));
             }
             _ => panic!("expected SessionStart"),
@@ -302,9 +302,9 @@ mod tests {
                 cwd,
                 reason,
             }) => {
-                assert_eq!(path, PathBuf::from("/t/x.jsonl"));
+                assert_eq!(path, std::path::absolute("/t/x.jsonl").unwrap());
                 assert_eq!(session_id, "s1");
-                assert_eq!(cwd, Some(PathBuf::from("/w")));
+                assert_eq!(cwd, Some(std::path::absolute("/w").unwrap()));
                 assert_eq!(reason.as_deref(), Some("precompact"));
             }
             _ => panic!("expected CaptureTranscript"),
