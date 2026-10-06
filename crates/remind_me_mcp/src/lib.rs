@@ -3413,31 +3413,45 @@ mod tests {
     /// failed probe in the cache under the same fingerprint, and make the
     /// other test's "active" assertion fail. Same convention as
     /// `remind_me_core`'s own `sync_test.rs`/`status_test.rs` `ENV_LOCK`.
+    ///
+    /// The lock alone cannot isolate a test that *installs* a backend:
+    /// `remind_me_add` and `remind_me_search` reach the same probe and are
+    /// called by tests that have no reason to take it. The one test that
+    /// installs a live configuration therefore runs in a child process
+    /// instead (`run_in_child`), and the parent never sets those variables.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// A fake Ollama daemon for exactly one embedding probe: accepts one
-    /// connection within `deadline`, reads the whole request (head and
-    /// `Content-Length` body), answers with a two-dimensional embedding and
-    /// closes. Bounded on every path, so a probe that never arrives fails
-    /// the test with a reason instead of hanging it on `join`.
+    /// connection, reads the whole request (head and `Content-Length`
+    /// body), answers with a two-dimensional embedding and closes. One
+    /// overall `deadline` bounds every step: the accept loop, each read
+    /// (its timeout is the time remaining) and the write. A probe that
+    /// never arrives or stalls fails with a reason instead of hanging the
+    /// thread; the caller's own deadline bounds the `join`.
     fn fake_ollama_once(
         listener: std::net::TcpListener,
         deadline: std::time::Duration,
     ) -> std::thread::JoinHandle<Result<(), String>> {
         use std::io::{Read, Write};
+        use std::time::{Duration, Instant};
         std::thread::spawn(move || {
+            let started = Instant::now();
+            let remaining = |what: &str| -> Result<Duration, String> {
+                deadline
+                    .checked_sub(started.elapsed())
+                    .filter(|d| !d.is_zero())
+                    .ok_or_else(|| format!("deadline {deadline:?} passed before {what}"))
+            };
+
             listener
                 .set_nonblocking(true)
                 .map_err(|e| format!("set_nonblocking: {e}"))?;
-            let started = std::time::Instant::now();
             let mut stream = loop {
                 match listener.accept() {
                     Ok((stream, _)) => break stream,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        if started.elapsed() > deadline {
-                            return Err(format!("no probe connected within {deadline:?}"));
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        remaining("a probe connected")?;
+                        std::thread::sleep(Duration::from_millis(5));
                     }
                     Err(e) => return Err(format!("accept: {e}")),
                 }
@@ -3445,25 +3459,30 @@ mod tests {
             stream
                 .set_nonblocking(false)
                 .map_err(|e| format!("set_blocking: {e}"))?;
-            stream
-                .set_read_timeout(Some(deadline))
-                .map_err(|e| format!("set_read_timeout: {e}"))?;
 
             // Read the head, then exactly the declared body, so the response
-            // never races the client's own write.
+            // never races the client's own write. Every read is bounded by
+            // the time left on the overall deadline.
             let mut raw = Vec::new();
             let mut chunk = [0u8; 4096];
+            let mut read_some = |raw: &mut Vec<u8>, what: &str| -> Result<(), String> {
+                stream
+                    .set_read_timeout(Some(remaining(what)?))
+                    .map_err(|e| format!("set_read_timeout: {e}"))?;
+                let n = stream
+                    .read(&mut chunk)
+                    .map_err(|e| format!("reading {what}: {e}"))?;
+                if n == 0 {
+                    return Err(format!("client closed before {what} completed"));
+                }
+                raw.extend_from_slice(&chunk[..n]);
+                Ok(())
+            };
             let head_end = loop {
                 if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
                     break pos + 4;
                 }
-                let n = stream
-                    .read(&mut chunk)
-                    .map_err(|e| format!("reading request head: {e}"))?;
-                if n == 0 {
-                    return Err("client closed before the request head completed".into());
-                }
-                raw.extend_from_slice(&chunk[..n]);
+                read_some(&mut raw, "the request head")?;
             };
             let head = String::from_utf8_lossy(&raw[..head_end]).to_string();
             let content_length: usize = head
@@ -3477,13 +3496,7 @@ mod tests {
                 })
                 .unwrap_or(0);
             while raw.len() - head_end < content_length {
-                let n = stream
-                    .read(&mut chunk)
-                    .map_err(|e| format!("reading request body: {e}"))?;
-                if n == 0 {
-                    return Err("client closed before the request body completed".into());
-                }
-                raw.extend_from_slice(&chunk[..n]);
+                read_some(&mut raw, "the request body")?;
             }
 
             let body = serde_json::json!({ "embeddings": [[1.0, 0.0]] }).to_string();
@@ -3493,10 +3506,104 @@ mod tests {
                 body
             );
             stream
+                .set_write_timeout(Some(remaining("the response write")?))
+                .map_err(|e| format!("set_write_timeout: {e}"))?;
+            stream
                 .write_all(response.as_bytes())
                 .map_err(|e| format!("writing response: {e}"))?;
             Ok(())
         })
+    }
+
+    /// Selects the one scenario this test binary runs in child mode: the
+    /// environment-mutating active-embeddings fixture below.
+    const CHILD_SCENARIO_VAR: &str = "REMIND_ME_MCP_TEST_CHILD_SCENARIO";
+
+    /// Attempts to terminate `child` and reap it within `deadline`, polling
+    /// rather than blocking so a hung child cannot hang the parent, and
+    /// returns a description that says plainly when cleanup did not succeed.
+    fn terminate_child(child: &mut std::process::Child, deadline: std::time::Duration) -> String {
+        let kill = child.kill();
+        let started = std::time::Instant::now();
+        let reaped = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(Some(status)),
+                Ok(None) if started.elapsed() >= deadline => break Ok(None),
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                Err(e) => break Err(e),
+            }
+        };
+        match (kill, reaped) {
+            (Ok(()), Ok(Some(status))) => format!("child killed and reaped ({status})"),
+            (Ok(()), Ok(None)) => {
+                format!("child killed but NOT reaped within {deadline:?}; it may still be running")
+            }
+            (Ok(()), Err(e)) => {
+                format!("child killed but polling failed: {e}; it may still be running")
+            }
+            (Err(k), Ok(Some(status))) => {
+                format!("kill failed ({k}) but the child exited ({status})")
+            }
+            (Err(k), Ok(None)) => {
+                format!("kill FAILED ({k}) and the child is still running after {deadline:?}")
+            }
+            (Err(k), Err(w)) => {
+                format!(
+                    "kill FAILED ({k}) and polling failed ({w}); the child may still be running"
+                )
+            }
+        }
+    }
+
+    /// Runs `test_name`'s body in a child process (this same test binary,
+    /// re-executed with `CHILD_SCENARIO_VAR` set) and asserts it exits
+    /// cleanly within `deadline`. The parent process never installs the
+    /// scenario's environment, so no other test in this binary, however it
+    /// reaches the embedding probe, can observe it or consume its fixture.
+    /// Returns `true` in the child, after running `body`.
+    fn run_in_child(test_name: &str, deadline: std::time::Duration, body: fn()) -> bool {
+        use std::process::{Command, Stdio};
+        if std::env::var(CHILD_SCENARIO_VAR).as_deref() == Ok(test_name) {
+            body();
+            return true;
+        }
+        let exe = std::env::current_exe().expect("locate the running test binary");
+        let mut child = Command::new(exe)
+            .args([
+                "--exact",
+                &format!("tests::{test_name}"),
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_SCENARIO_VAR, test_name)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn child test process");
+        let started = std::time::Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let output = child.wait_with_output().expect("collect child output");
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    assert!(
+                        status.success(),
+                        "child `{test_name}` failed ({status}):\n{stderr}"
+                    );
+                    return false;
+                }
+                Ok(None) => {}
+                Err(poll_error) => {
+                    let cleanup = terminate_child(&mut child, std::time::Duration::from_secs(5));
+                    panic!("polling child `{test_name}` failed: {poll_error}; {cleanup}");
+                }
+            }
+            if started.elapsed() > deadline {
+                let cleanup = terminate_child(&mut child, std::time::Duration::from_secs(5));
+                panic!("child `{test_name}` exceeded {deadline:?}; {cleanup}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 
     #[test]
@@ -4968,46 +5075,55 @@ mod tests {
 
     #[test]
     fn test_server_status_reports_embeddings_active_when_the_backend_is_configured_and_reachable() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        use std::net::TcpListener;
+        // The only test that installs a live Ollama configuration. It runs
+        // in a child process: `remind_me_add`, `remind_me_search` and every
+        // status call reach `available_embedder`, so any test in this
+        // binary could otherwise probe the fake daemon (or cache a failed
+        // verdict) while these variables are set, whether or not it takes
+        // `ENV_LOCK`. The parent never installs the variables; the child's
+        // whole run, fake daemon join included, is bounded by the deadline.
+        run_in_child(
+            "test_server_status_reports_embeddings_active_when_the_backend_is_configured_and_reachable",
+            std::time::Duration::from_secs(60),
+            || {
+                use std::net::TcpListener;
+                let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-        // A fake Ollama daemon answering the one "ping" probe
-        // `available_embedder` makes. The lock above is what guarantees it
-        // is this test's probe that reaches it: every other status test in
-        // this binary holds the same lock, so none can run the live
-        // embedding probe against this env (and this one-shot daemon) in
-        // the meantime.
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let handle = fake_ollama_once(listener, std::time::Duration::from_secs(10));
+                // A fake Ollama daemon answering the one "ping" probe
+                // `available_embedder` makes.
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let port = listener.local_addr().unwrap().port();
+                let handle = fake_ollama_once(listener, std::time::Duration::from_secs(20));
 
-        crate::test_env::set_var(remind_me_core::embedder::EMBEDDING_BACKEND_ENV, "ollama");
-        crate::test_env::set_var(
-            remind_me_core::embedder::OLLAMA_URL_ENV,
-            format!("http://127.0.0.1:{port}"),
+                crate::test_env::set_var(remind_me_core::embedder::EMBEDDING_BACKEND_ENV, "ollama");
+                crate::test_env::set_var(
+                    remind_me_core::embedder::OLLAMA_URL_ENV,
+                    format!("http://127.0.0.1:{port}"),
+                );
+                crate::test_env::set_var(remind_me_core::embedder::EMBEDDING_DIM_ENV, "2");
+
+                let db = Database::open_in_memory().unwrap();
+                let server = McpServer::new(db);
+                let report: Value = serde_json::from_str(&text_of(&call(
+                    &server,
+                    "remind_me_server_status",
+                    json!({}),
+                )))
+                .unwrap();
+
+                crate::test_env::remove_var(remind_me_core::embedder::EMBEDDING_BACKEND_ENV);
+                crate::test_env::remove_var(remind_me_core::embedder::OLLAMA_URL_ENV);
+                crate::test_env::remove_var(remind_me_core::embedder::EMBEDDING_DIM_ENV);
+                let served = handle.join().expect("fake daemon thread panicked");
+
+                assert_eq!(
+                    report["embeddings"]["state"], "active",
+                    "expected active, got {:?}; fake daemon: {served:?}",
+                    report["embeddings"]
+                );
+                assert_eq!(served, Ok(()), "the fake daemon must have served the probe");
+            },
         );
-        crate::test_env::set_var(remind_me_core::embedder::EMBEDDING_DIM_ENV, "2");
-
-        let db = Database::open_in_memory().unwrap();
-        let server = McpServer::new(db);
-        let report: Value = serde_json::from_str(&text_of(&call(
-            &server,
-            "remind_me_server_status",
-            json!({}),
-        )))
-        .unwrap();
-
-        crate::test_env::remove_var(remind_me_core::embedder::EMBEDDING_BACKEND_ENV);
-        crate::test_env::remove_var(remind_me_core::embedder::OLLAMA_URL_ENV);
-        crate::test_env::remove_var(remind_me_core::embedder::EMBEDDING_DIM_ENV);
-        let served = handle.join().expect("fake daemon thread panicked");
-
-        assert_eq!(
-            report["embeddings"]["state"], "active",
-            "expected active, got {:?}; fake daemon: {served:?}",
-            report["embeddings"]
-        );
-        assert_eq!(served, Ok(()), "the fake daemon must have served the probe");
     }
 
     #[test]
