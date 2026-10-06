@@ -3403,11 +3403,101 @@ mod tests {
     use std::sync::Mutex;
 
     /// Held by every test that reads or sets `REMIND_ME_EMBEDDING_BACKEND`
-    /// (a process-global env var): `remind_me_server_status`'s `embeddings`
-    /// override (`#90`) now reflects it, so a test asserting the unset
-    /// default must not race one that configures a backend. Same convention
-    /// as `remind_me_core`'s own `sync_test.rs`/`status_test.rs` `ENV_LOCK`.
+    /// (a process-global env var), **and by every test that calls
+    /// `remind_me_server_status`**: that tool's `embeddings` override
+    /// (`#90`) runs `embedder::embedding_status`, a live probe of whatever
+    /// backend the env names, through a process-global availability cache
+    /// whose lock is released during the network round trip. A status call
+    /// racing a test that has pointed the env at a one-shot fake daemon can
+    /// therefore consume that daemon's single connection, or record a
+    /// failed probe in the cache under the same fingerprint, and make the
+    /// other test's "active" assertion fail. Same convention as
+    /// `remind_me_core`'s own `sync_test.rs`/`status_test.rs` `ENV_LOCK`.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// A fake Ollama daemon for exactly one embedding probe: accepts one
+    /// connection within `deadline`, reads the whole request (head and
+    /// `Content-Length` body), answers with a two-dimensional embedding and
+    /// closes. Bounded on every path, so a probe that never arrives fails
+    /// the test with a reason instead of hanging it on `join`.
+    fn fake_ollama_once(
+        listener: std::net::TcpListener,
+        deadline: std::time::Duration,
+    ) -> std::thread::JoinHandle<Result<(), String>> {
+        use std::io::{Read, Write};
+        std::thread::spawn(move || {
+            listener
+                .set_nonblocking(true)
+                .map_err(|e| format!("set_nonblocking: {e}"))?;
+            let started = std::time::Instant::now();
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if started.elapsed() > deadline {
+                            return Err(format!("no probe connected within {deadline:?}"));
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(e) => return Err(format!("accept: {e}")),
+                }
+            };
+            stream
+                .set_nonblocking(false)
+                .map_err(|e| format!("set_blocking: {e}"))?;
+            stream
+                .set_read_timeout(Some(deadline))
+                .map_err(|e| format!("set_read_timeout: {e}"))?;
+
+            // Read the head, then exactly the declared body, so the response
+            // never races the client's own write.
+            let mut raw = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let head_end = loop {
+                if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+                let n = stream
+                    .read(&mut chunk)
+                    .map_err(|e| format!("reading request head: {e}"))?;
+                if n == 0 {
+                    return Err("client closed before the request head completed".into());
+                }
+                raw.extend_from_slice(&chunk[..n]);
+            };
+            let head = String::from_utf8_lossy(&raw[..head_end]).to_string();
+            let content_length: usize = head
+                .lines()
+                .find_map(|l| {
+                    let (name, value) = l.split_once(':')?;
+                    name.trim()
+                        .eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            while raw.len() - head_end < content_length {
+                let n = stream
+                    .read(&mut chunk)
+                    .map_err(|e| format!("reading request body: {e}"))?;
+                if n == 0 {
+                    return Err("client closed before the request body completed".into());
+                }
+                raw.extend_from_slice(&chunk[..n]);
+            }
+
+            let body = serde_json::json!({ "embeddings": [[1.0, 0.0]] }).to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .map_err(|e| format!("writing response: {e}"))?;
+            Ok(())
+        })
+    }
 
     #[test]
     fn a_panicking_handler_produces_an_internal_error_response_instead_of_unwinding() {
@@ -4879,27 +4969,17 @@ mod tests {
     #[test]
     fn test_server_status_reports_embeddings_active_when_the_backend_is_configured_and_reachable() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        use std::io::{Read, Write};
         use std::net::TcpListener;
 
-        // A fake Ollama daemon answering the "ping" probe `available_embedder`
-        // makes -- same shape as `ollama_embedder_test.rs`'s `fake_server`.
+        // A fake Ollama daemon answering the one "ping" probe
+        // `available_embedder` makes. The lock above is what guarantees it
+        // is this test's probe that reaches it: every other status test in
+        // this binary holds the same lock, so none can run the live
+        // embedding probe against this env (and this one-shot daemon) in
+        // the meantime.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept");
-            let mut buf = [0u8; 4096];
-            let _ = stream.read(&mut buf);
-            let body = serde_json::json!({ "embeddings": [[1.0, 0.0]] }).to_string();
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            stream
-                .write_all(response.as_bytes())
-                .expect("write response");
-        });
+        let handle = fake_ollama_once(listener, std::time::Duration::from_secs(10));
 
         crate::test_env::set_var(remind_me_core::embedder::EMBEDDING_BACKEND_ENV, "ollama");
         crate::test_env::set_var(
@@ -4920,17 +5000,21 @@ mod tests {
         crate::test_env::remove_var(remind_me_core::embedder::EMBEDDING_BACKEND_ENV);
         crate::test_env::remove_var(remind_me_core::embedder::OLLAMA_URL_ENV);
         crate::test_env::remove_var(remind_me_core::embedder::EMBEDDING_DIM_ENV);
-        handle.join().unwrap();
+        let served = handle.join().expect("fake daemon thread panicked");
 
         assert_eq!(
             report["embeddings"]["state"], "active",
-            "expected active, got {:?}",
+            "expected active, got {:?}; fake daemon: {served:?}",
             report["embeddings"]
         );
+        assert_eq!(served, Ok(()), "the fake daemon must have served the probe");
     }
 
     #[test]
     fn test_server_status_reports_dashboard_running_from_a_live_pid_file() {
+        // Calls `remind_me_server_status`, which runs the live embedding
+        // probe -- see `ENV_LOCK`.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
@@ -4993,6 +5077,9 @@ mod tests {
     /// response for the same call carried the truth.
     #[test]
     fn test_server_status_markdown_reports_dashboard_state_instead_of_a_bare_question_mark() {
+        // Calls `remind_me_server_status`, which runs the live embedding
+        // probe -- see `ENV_LOCK`.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let db = Database::open_in_memory().unwrap();
         let server = McpServer::new(db);
 
