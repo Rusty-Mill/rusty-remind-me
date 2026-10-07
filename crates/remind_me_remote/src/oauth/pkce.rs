@@ -1,16 +1,9 @@
 //! PKCE (RFC 7636) S256 verification.
 //!
-//! No new crypto/base64 dependency: the workspace's existing `sha256`
-//! dependency already gives a hex digest, and base64url is small enough to
-//! hand-roll for one 32-byte encode rather than pull in a whole `base64`
-//! crate for it — the same "don't add a dependency for one call site"
-//! reasoning `remind_me_core::remote`'s token-generation doc already
-//! records for this workspace.
+//! The workspace's existing `sha256` dependency gives a hex digest, and
+//! `rusty_base64` does the base64url encode of its 32 bytes.
 
 use remind_me_core::webhook::constant_time_eq;
-
-const B64URL_ALPHABET: &[u8; 64] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 /// Decode a lowercase hex string (as produced by `sha256::digest`) into raw
 /// bytes. `None` on malformed input — not expected in practice, since the
@@ -31,32 +24,11 @@ fn hex_decode(hex: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-/// Base64url-encode (RFC 4648 §5), no padding — what RFC 7636's
-/// `code_challenge` is: `BASE64URL-ENCODE(SHA256(code_verifier))`.
-fn base64url_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
-        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(B64URL_ALPHABET[((n >> 18) & 0x3f) as usize] as char);
-        out.push(B64URL_ALPHABET[((n >> 12) & 0x3f) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(B64URL_ALPHABET[((n >> 6) & 0x3f) as usize] as char);
-        }
-        if chunk.len() > 2 {
-            out.push(B64URL_ALPHABET[(n & 0x3f) as usize] as char);
-        }
-    }
-    out
-}
-
 /// Compute RFC 7636's S256 `code_challenge` for a given `code_verifier`.
 pub fn code_challenge_s256(code_verifier: &str) -> String {
     let hex = sha256::digest(code_verifier);
     let bytes = hex_decode(&hex).unwrap_or_default();
-    base64url_encode(&bytes)
+    rusty_base64::encode_url_safe_no_pad(&bytes)
 }
 
 /// Verify a presented `code_verifier` against the `code_challenge` recorded
