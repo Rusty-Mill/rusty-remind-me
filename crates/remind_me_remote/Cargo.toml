@@ -9,6 +9,7 @@ repository = "https://github.com/Rusty-Mill/rusty_mill"
 layer = "apps"
 
 [dependencies]
+rusty_percent = { workspace = true }
 rusty_hex = { workspace = true }
 rusty_base64 = { workspace = true }
 rusty_oauth = { workspace = true }

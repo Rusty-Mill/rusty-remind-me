@@ -71,16 +71,7 @@ pub struct PullReport {
 /// timestamp, an id, or an operator-configured node id, so a conservative
 /// unreserved-characters allowlist is all this needs.
 fn urlencode(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    for byte in raw.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(byte as char)
-            }
-            _ => out.push_str(&format!("%{:02X}", byte)),
-        }
-    }
-    out
+    rusty_percent::encode(raw)
 }
 
 fn read_cursor(store: &Store<'_>, remote_id: &str) -> crate::db::Result<(String, String)> {

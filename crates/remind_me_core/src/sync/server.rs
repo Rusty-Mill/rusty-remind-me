@@ -210,21 +210,7 @@ fn read_head<R: Read>(stream: &mut R) -> io::Result<HeadOutcome> {
 /// `urlencode` -- tolerant of a raw (un-encoded) byte too, since this only
 /// ever needs to decode what this crate's own client sent.
 fn urldecode(raw: &str) -> String {
-    let bytes = raw.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(&raw[i + 1..i + 3], 16) {
-                out.push(byte);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).to_string()
+    rusty_percent::decode(raw).into_owned()
 }
 
 fn query_param(query: &str, key: &str) -> Option<String> {
