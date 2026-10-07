@@ -647,8 +647,7 @@ pub fn serve_once_from<S: Read + Write>(
     // engages after a valid credential would leave an unauthenticated flood
     // entirely unbounded — which is the flood that matters.
     let bucket = crate::rate_limit::resolve_key(
-        head.authorization
-            .strip_prefix("Bearer ")
+        rusty_oauth::bearer::token_from_authorization(&head.authorization)
             .unwrap_or(&head.authorization),
         peer_addr,
         Some(config.secret.as_str()),

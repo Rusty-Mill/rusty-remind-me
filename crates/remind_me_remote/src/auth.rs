@@ -135,7 +135,7 @@ fn presented_credential(request: &Request<Body>, path: &str) -> String {
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
+        .and_then(rusty_oauth::bearer::token_from_authorization)
         .unwrap_or("")
         .to_string()
 }

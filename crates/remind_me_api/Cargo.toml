@@ -9,6 +9,7 @@ repository = "https://github.com/Rusty-Mill/rusty_mill"
 layer = "apps"
 
 [dependencies]
+rusty_oauth = { workspace = true }
 remind_me_core.workspace = true
 
 serde = { version = "1.0", features = ["derive"] }

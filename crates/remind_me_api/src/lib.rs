@@ -216,7 +216,9 @@ impl ApiServer {
 
                 // A named, scope-limited key (issue #120). Checked only after
                 // the flat key misses, so the common path is one comparison.
-                if let Some(presented) = request.authorization.strip_prefix("Bearer ") {
+                if let Some(presented) =
+                    rusty_oauth::bearer::token_from_authorization(&request.authorization)
+                {
                     if let Some(verified) = remind_me_core::api_keys::verify(presented) {
                         if verified.may_use(&request.method) {
                             return None;

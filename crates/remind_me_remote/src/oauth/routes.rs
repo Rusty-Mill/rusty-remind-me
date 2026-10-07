@@ -907,7 +907,7 @@ pub async fn require_bearer(
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let Some(token) = header_value.strip_prefix("Bearer ") else {
+    let Some(token) = rusty_oauth::bearer::token_from_authorization(header_value) else {
         return unauthorized_bearer(&state);
     };
 
