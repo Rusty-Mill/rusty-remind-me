@@ -5,29 +5,10 @@
 
 use remind_me_core::webhook::constant_time_eq;
 
-/// Decode a lowercase hex string (as produced by `sha256::digest`) into raw
-/// bytes. `None` on malformed input — not expected in practice, since the
-/// only caller feeds it `sha256::digest`'s own output, but this avoids a
-/// panic if that ever stops being true.
-fn hex_decode(hex: &str) -> Option<Vec<u8>> {
-    if !hex.len().is_multiple_of(2) {
-        return None;
-    }
-    let chars: Vec<char> = hex.chars().collect();
-    chars
-        .chunks(2)
-        .map(|pair| {
-            let hi = pair[0].to_digit(16)?;
-            let lo = pair[1].to_digit(16)?;
-            Some(((hi << 4) | lo) as u8)
-        })
-        .collect()
-}
-
 /// Compute RFC 7636's S256 `code_challenge` for a given `code_verifier`.
 pub fn code_challenge_s256(code_verifier: &str) -> String {
     let hex = sha256::digest(code_verifier);
-    let bytes = hex_decode(&hex).unwrap_or_default();
+    let bytes = rusty_hex::decode(&hex).unwrap_or_default();
     rusty_base64::encode_url_safe_no_pad(&bytes)
 }
 

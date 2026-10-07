@@ -205,10 +205,6 @@ impl Drop for Span {
     }
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
-}
-
 fn unix_nanos(t: SystemTime) -> u128 {
     t.duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -231,8 +227,8 @@ fn span_payload(service_name: &str, span: &FinishedSpan) -> serde_json::Value {
             "scopeSpans": [{
                 "scope": { "name": "rusty_remind_me" },
                 "spans": [{
-                    "traceId": hex_encode(&span.trace_id),
-                    "spanId": hex_encode(&span.span_id),
+                    "traceId": rusty_hex::encode(&span.trace_id),
+                    "spanId": rusty_hex::encode(&span.span_id),
                     "name": span.name,
                     "kind": 1, // SPAN_KIND_INTERNAL -- matches the reference's own untyped default
                     "startTimeUnixNano": unix_nanos(span.start).to_string(),
@@ -348,7 +344,7 @@ mod tests {
 
     #[test]
     fn hex_encode_matches_the_otlp_spec_shape() {
-        assert_eq!(hex_encode(&[0x5b, 0x8e, 0xff, 0xf7]), "5b8efff7");
+        assert_eq!(rusty_hex::encode(&[0x5b, 0x8e, 0xff, 0xf7]), "5b8efff7");
     }
 
     #[test]
@@ -388,9 +384,9 @@ mod tests {
         );
         let s = &rs["scopeSpans"][0]["spans"][0];
         // 16 trace-id bytes hex-encode to 32 chars; 8 span-id bytes to 16.
-        assert_eq!(s["traceId"], hex_encode(&[0u8; 16]));
+        assert_eq!(s["traceId"], rusty_hex::encode(&[0u8; 16]));
         assert_eq!(s["traceId"].as_str().unwrap().len(), 32);
-        assert_eq!(s["spanId"], hex_encode(&[1u8; 8]));
+        assert_eq!(s["spanId"], rusty_hex::encode(&[1u8; 8]));
         assert_eq!(s["spanId"].as_str().unwrap().len(), 16);
         assert_eq!(s["name"], "tool.remind_me_search");
         assert_eq!(s["kind"], 1);

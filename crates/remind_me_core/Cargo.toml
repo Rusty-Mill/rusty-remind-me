@@ -9,6 +9,7 @@ repository = "https://github.com/Rusty-Mill/rusty_mill"
 layer = "apps"
 
 [dependencies]
+rusty_hex = { workspace = true }
 rusty_oauth = { workspace = true }
 rusty_crypto_key = { workspace = true }
 rusty_atomic_file = { workspace = true }
