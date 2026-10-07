@@ -171,22 +171,9 @@ impl WebhookConfig {
 
 /// Compare two byte strings in time independent of where they first differ.
 ///
-/// The whole point is the absence of an early return. A `==` on the token
-/// would leak, through response latency, how many leading bytes a guess got
-/// right — which turns recovering the secret from an exhaustive search into a
-/// linear one. Lengths are compared into the same accumulator rather than
-/// short-circuiting; the length itself is not secret, and treating it as such
-/// would mean padding to a fixed size for no gain.
-///
-/// `black_box` keeps the optimiser from reintroducing an early exit it could
-/// prove equivalent for a pure boolean result.
-pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    let mut diff = a.len() ^ b.len();
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= (x ^ y) as usize;
-    }
-    std::hint::black_box(diff) == 0
-}
+/// Re-exported from `rusty_crypto_key`, the one copy in the workspace; the
+/// other remind_me crates keep importing it from here.
+pub use rusty_crypto_key::constant_time_eq;
 
 // ---------------------------------------------------------------------------
 // Counters

@@ -46,6 +46,7 @@ pub mod routes;
 pub mod store;
 
 use http::{Head, Response};
+use rusty_crypto_key::constant_time_eq;
 use store::HubStore;
 
 /// Version of the hub server, reported by `/health`, `/count`, `/stats`,
@@ -111,22 +112,6 @@ pub fn authorized(config: &Config, header: &str) -> bool {
     }
     let expected = format!("Bearer {}", config.secret);
     constant_time_eq(header.as_bytes(), expected.as_bytes())
-}
-
-/// Length-independent, data-independent byte comparison.
-///
-/// The length check is intentionally *not* an early return on mismatch: it
-/// folds into the same accumulator, so a wrong-length header costs the same
-/// time as a wrong-value one.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    let mut diff = (a.len() ^ b.len()) as u8;
-    let n = a.len().max(b.len());
-    for i in 0..n {
-        let x = a.get(i).copied().unwrap_or(0);
-        let y = b.get(i).copied().unwrap_or(0);
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 /// Whether a route requires the bearer secret.

@@ -8,6 +8,7 @@ use super::endpoint::{DaemonInfo, Endpoint};
 use super::ops::{Op, OpReply};
 use super::settings::{self, Fingerprint};
 use super::wire::{self, Hello, Mode, Refusal, Reply};
+use rusty_crypto_key::constant_time_eq;
 use serde_json::{json, Value};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
@@ -213,10 +214,6 @@ fn refuse(hello: &Hello, shared: &Shared) -> Option<Refusal> {
     }
     let differing = settings::differences(&hello.settings, &shared.settings);
     (!differing.is_empty()).then_some(Refusal::Settings { differing })
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 fn serve_mcp(reader: impl BufRead, mut writer: TcpStream, service: &dyn Service) -> io::Result<()> {
