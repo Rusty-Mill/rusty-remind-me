@@ -38,7 +38,9 @@ parking_lot = "0.12"
 # The node's store (ADR-0023, ADR-0025).
 rusty_multimodal_db_engine = { workspace = true }
 pdf-extract = { version = "0.12", optional = true }
-aws-sdk-s3 = { version = "1", optional = true }
+# default-features off: the default `rustls` feature is the legacy hyper-0.14 /
+# rustls-0.21 client (RUSTSEC-2026-0098/-0099/-0104, -0258); keep the rest.
+aws-sdk-s3 = { version = "1", optional = true, default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
 aws-config = { version = "1", optional = true }
 usearch = { version = "2", optional = true }
 ocrs = { version = "0.12", optional = true }
