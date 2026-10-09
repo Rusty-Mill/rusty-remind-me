@@ -13,14 +13,14 @@ rusty_percent = { workspace = true }
 rusty_hex = { workspace = true }
 rusty_base64 = { workspace = true }
 rusty_oauth = { workspace = true }
-async-trait = "0.1"
+async-trait = { workspace = true }
 axum = "0.8"
-futures = "0.3"
+futures = { workspace = true }
 remind_me_core.workspace = true
 remind_me_mcp.workspace = true
 rmcp = { workspace = true, features = ["server", "transport-streamable-http-server", "transport-streamable-http-server-session"] }
 
-serde = { version = "1.0", features = ["derive"] }
+serde = { workspace = true }
 serde_json = "1.0"
 sha256 = "1.5"
 tokio = { version = "1.0", features = ["full"] }
