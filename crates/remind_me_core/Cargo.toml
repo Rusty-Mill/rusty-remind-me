@@ -20,7 +20,6 @@ serde = { version = "1.0", features = ["derive"] }
 # parser reads some floats back one bit off (0.9774999999999999 as 0.9775).
 # Decay leaves such values, which the copy onto the engine then refused.
 serde_json = { version = "1.0", features = ["float_roundtrip"] }
-async-trait = "0.1"
 thiserror = "2.0"
 tokio = { version = "1.0", features = ["full"] }
 # Read-only, in one module: `db::legacy_sqlite` copies an old `memory.db`
