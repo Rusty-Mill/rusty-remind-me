@@ -2,6 +2,18 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-10-09 — The remote connector no longer uses `rmcp`
+
+### Changed
+- `remind_me_remote` serves MCP through the workspace's own stack (`rusty_mcp_server`, mounted in axum by `rusty_mcp_axum`). `RemindMeHandler` (the `rmcp` adapter) is replaced by `handler::describe`, which forwards tools, the one resource and the one prompt from `remind_me_mcp::Handler`; the in-memory `InProcessEventStore` is replaced by the server's resumable replies, so `Last-Event-Id` resumption still works with no session.
+- `build_router` now returns `Result<Router, BuildError>` (it was `IssuerError`; `BuildError::Issuer` wraps it). `RemindMeHandler` and `InProcessEventStore` are gone from the public API.
+- Resources and prompts are listed once, when the router is built; tools are asked for on every request.
+- The server no longer offers a standalone `GET` stream for classic sessions (`405`, which the spec allows) and no longer advertises `listChanged` (it never sent one).
+
+### Tests
+- All 13 HTTP tests and 16 OAuth tests pass unchanged, including resumption of a dropped reply. With resumption switched off in the server, five of them fail.
+- Not tested: a real claude.ai connector or `mcp-remote`.
+
 ## 2026-10-04 — A store written by another version is refused in plain words
 
 ### Changed

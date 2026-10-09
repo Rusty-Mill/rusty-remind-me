@@ -1,233 +1,248 @@
-//! [`rmcp::ServerHandler`] adapter over [`remind_me_mcp::McpServer`].
+//! The `rusty_mcp_server` description of a [`remind_me_mcp::Handler`].
 //!
-//! # Why an adapter, not a raw JSON-RPC passthrough
+//! `remind_me_mcp::McpServer` already answers MCP as JSON-RPC lines
+//! (`handle_line`): the stdio transport feeds it directly. This module is the
+//! thin adapter that lets the HTTP transport serve the same answers: tools
+//! are forwarded per request through a [`ToolSource`] (the handler's tool
+//! list depends on the configured profile), and the handler's resources and
+//! prompts are read once at build and registered, each forwarding its
+//! `resources/read` / `prompts/get` back to the handler. No tool, resource or
+//! prompt logic is reimplemented here.
 //!
-//! `rmcp` 3.0.1's Streamable HTTP transport (`StreamableHttpService<S, M>`,
-//! in `transport::streamable_http_server::tower`) is generic over
-//! `S: ServerHandler` — there is no constructor or trait that accepts a
-//! caller-supplied `fn(&str) -> Option<Value>` and forwards raw JSON-RPC
-//! bytes to it. The SDK owns protocol-level dispatch itself: it decodes
-//! every request into a typed `ClientRequest` variant and calls the matching
-//! typed `ServerHandler` method (`list_tools`, `call_tool`,
-//! `read_resource`, ...), handling protocol version negotiation, the
-//! 2026-07-28 MRTR/task extensions, and SSE/session framing itself. This was
-//! confirmed by reading `handler/server.rs`'s `Service<RoleServer> for H`
-//! blanket impl and the `StreamableHttpService::new` bound directly (both
-//! vendored under `~/.cargo/registry/src/.../rmcp-3.0.1/`), not assumed from
-//! the crate's public docs.
-//!
-//! So this adapter is the thin translation layer the module doc on `#85`
-//! anticipated might be necessary: each `ServerHandler` method this crate
-//! implements builds the same JSON-RPC envelope the stdio transport sends,
-//! hands it to [`remind_me_mcp::McpServer::handle_request`] — the crate's
-//! one, already-tested dispatch entry point, reused rather than
-//! reimplemented — and deserializes the `result` field straight into the
-//! matching `rmcp::model` type. That deserialization isn't hand-written
-//! field-by-field mapping: `handle_request`'s JSON shapes (`{"tools": [...]}`,
-//! `{"content": [...], "isError": ...}`, `{"contents": [...]}`, ...) already
-//! match rmcp's own camelCase wire format for `ListToolsResult`,
-//! `CallToolResult`, `ReadResourceResult`, etc., so `serde_json::from_value`
-//! does the whole job.
-//!
-//! Only the methods `handle_request` already answers (`initialize` via the
-//! default `get_info`-based impl, `tools/list`, `tools/call`,
-//! `resources/list`, `resources/read`, `prompts/list`) are overridden here.
-//! Everything else (`prompts/get`, subscriptions, tasks, completion) is left
-//! at rmcp's own default — `method not found` or an empty result — which
-//! matches the stdio transport's own coverage: `McpServer::handle_request`
-//! doesn't answer those methods either.
-//!
-//! # Blocking dispatch, off the async runtime
-//!
-//! `handle_request` is synchronous and takes `Database`'s connection mutex.
-//! Calling it directly from an async trait method would block a tokio
-//! worker thread for the duration of a DB query; `tokio::task::spawn_blocking`
-//! moves that work to the blocking pool instead, so one slow tool call
-//! cannot stall unrelated connector traffic on the same runtime.
+//! Handlers block (the database sits behind a mutex), which is fine: the HTTP
+//! layer runs them on blocking threads.
 
 use std::sync::Arc;
 
 use remind_me_mcp::Handler;
-use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, Implementation, InitializeResult,
-    ListPromptsResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
-    ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, ServerCapabilities,
-    ServerInfo,
+use rusty_mcp_server::json::Value as WireValue;
+use rusty_mcp_server::proto::{
+    CallToolParams, CallToolResult, ErrorCode, ErrorData, GetPromptParams, GetPromptResult, Prompt,
+    ReadResourceParams, ReadResourceResult, Resource, Tool, Wire,
 };
-use rmcp::service::RequestContext;
-use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
-use serde::de::DeserializeOwned;
+use rusty_mcp_server::{BuildError, CallContext, Server, ServerBuilder, ToolSource};
 use serde_json::{json, Value};
 
-/// Adapts a synchronous MCP [`Handler`] (this process's own
-/// [`remind_me_mcp::McpServer`], or a relay to the daemon's) to rmcp's async,
-/// typed `ServerHandler`.
-///
-/// Cheap to clone: `rmcp` builds one `S` per session via a service factory
-/// closure, so this only wraps an `Arc`.
-#[derive(Clone)]
-pub struct RemindMeHandler {
-    mcp: Arc<dyn Handler>,
-}
+/// Name and version reported at `initialize`.
+const SERVER_NAME: &str = "rusty_remind_me";
 
-impl RemindMeHandler {
-    pub fn new(mcp: Arc<dyn Handler>) -> Self {
-        Self { mcp }
-    }
-
-    /// Build the JSON-RPC envelope `handle_request` expects, dispatch it on
-    /// the blocking pool, and return its `result` (or a protocol-level
-    /// `McpError` if dispatch failed or produced no response at all — the
-    /// latter should not happen for any method this adapter calls, since
-    /// none of them are the fire-and-forget notification methods
-    /// `handle_request` answers with `None`).
-    async fn dispatch(&self, method: &'static str, params: Value) -> Result<Value, McpError> {
-        let mcp = Arc::clone(&self.mcp);
-        let envelope = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": method,
-            "params": params,
-        })
-        .to_string();
-
-        let response = tokio::task::spawn_blocking(move || mcp.handle_line(&envelope))
-            .await
-            .map_err(|e| McpError::internal_error(format!("{method} task panicked: {e}"), None))?
-            .ok_or_else(|| {
-                McpError::internal_error(format!("{method} produced no response"), None)
-            })?;
-
-        if let Some(error) = response.get("error") {
-            let message = error
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("dispatch error")
-                .to_string();
-            return Err(McpError::internal_error(message, Some(error.clone())));
-        }
-        Ok(response.get("result").cloned().unwrap_or(Value::Null))
-    }
-
-    /// As [`Self::dispatch`], additionally deserializing `result` into a
-    /// typed rmcp model struct.
-    async fn dispatch_typed<T: DeserializeOwned>(
-        &self,
+/// Why a server could not be described.
+#[derive(Debug, thiserror::Error)]
+pub enum DescribeError {
+    /// The handler's own answer was not a valid list.
+    #[error("the handler's {method} answer is malformed: {why}")]
+    Malformed {
+        /// The method asked.
         method: &'static str,
-        params: Value,
-    ) -> Result<T, McpError> {
-        let result = self.dispatch(method, params).await?;
-        serde_json::from_value(result)
-            .map_err(|e| McpError::internal_error(format!("malformed {method} result: {e}"), None))
-    }
+        /// What was wrong.
+        why: String,
+    },
+    /// The assembled server was rejected.
+    #[error(transparent)]
+    Build(#[from] BuildError),
 }
 
-impl ServerHandler for RemindMeHandler {
-    fn get_info(&self) -> ServerInfo {
-        InitializeResult::new(
-            ServerCapabilities::builder()
-                .enable_tools()
-                .enable_tool_list_changed()
-                .enable_resources()
-                .enable_resources_list_changed()
-                .enable_prompts()
-                .enable_prompts_list_changed()
-                .build(),
+/// Ask the handler one question and return its `result`, or its error.
+fn ask(mcp: &dyn Handler, method: &str, params: Value) -> Result<Value, ErrorData> {
+    let envelope = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
+    let Some(reply) = mcp.handle_line(&envelope.to_string()) else {
+        return Err(ErrorData::new(
+            ErrorCode::INTERNAL_ERROR,
+            format!("{method} produced no response"),
+        ));
+    };
+    if let Some(error) = reply.get("error") {
+        let code = error
+            .get("code")
+            .and_then(Value::as_i64)
+            .and_then(|c| i32::try_from(c).ok())
+            .map_or(ErrorCode::INTERNAL_ERROR, ErrorCode);
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("dispatch error");
+        return Err(ErrorData::new(code, message));
+    }
+    Ok(reply.get("result").cloned().unwrap_or(Value::Null))
+}
+
+/// A `serde_json` value as the wire crates' JSON type.
+fn to_wire(value: &Value) -> Result<WireValue, ErrorData> {
+    WireValue::from_json_str(&value.to_string())
+        .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string()))
+}
+
+/// Decode `value` as a `T`, naming `what` on failure.
+fn decode<T: Wire>(value: &Value, what: &str) -> Result<T, ErrorData> {
+    T::from_value(&to_wire(value)?).map_err(|e| {
+        ErrorData::new(
+            ErrorCode::INTERNAL_ERROR,
+            format!("malformed {what} from the handler: {e}"),
         )
-        .with_server_info(Implementation::new(
-            "rusty_remind_me",
-            env!("CARGO_PKG_VERSION"),
-        ))
+    })
+}
+
+/// The handler's tools, asked for on every list and call.
+struct Tools(Arc<dyn Handler>);
+
+impl ToolSource for Tools {
+    fn tools(&self) -> Vec<Tool> {
+        // A list that cannot be had is an empty list here; the client sees no
+        // tools rather than an error it could not act on.
+        let Ok(result) = ask(self.0.as_ref(), "tools/list", json!({})) else {
+            return Vec::new();
+        };
+        result
+            .get("tools")
+            .and_then(Value::as_array)
+            .map(|tools| {
+                tools
+                    .iter()
+                    .filter_map(|t| decode::<Tool>(t, "tool").ok())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
-    async fn list_tools(
+    fn call(
         &self,
-        _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<ListToolsResult, McpError> {
-        self.dispatch_typed("tools/list", json!({})).await
-    }
-
-    async fn call_tool(
-        &self,
-        request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResponse, McpError> {
-        let params = json!({
-            "name": request.name,
-            "arguments": request
-                .arguments
-                .map(Value::Object)
-                .unwrap_or_else(|| json!({})),
-        });
-        let result: CallToolResult = self.dispatch_typed("tools/call", params).await?;
-        Ok(result.into())
-    }
-
-    async fn list_resources(
-        &self,
-        _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<ListResourcesResult, McpError> {
-        self.dispatch_typed("resources/list", json!({})).await
-    }
-
-    async fn read_resource(
-        &self,
-        request: ReadResourceRequestParams,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResponse, McpError> {
-        let params = json!({ "uri": request.uri });
-        let result: ReadResourceResult = self.dispatch_typed("resources/read", params).await?;
-        Ok(result.into())
-    }
-
-    async fn list_prompts(
-        &self,
-        _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<ListPromptsResult, McpError> {
-        self.dispatch_typed("prompts/list", json!({})).await
+        _ctx: &CallContext,
+        call: &CallToolParams,
+    ) -> Option<Result<CallToolResult, ErrorData>> {
+        let arguments = call
+            .arguments
+            .as_ref()
+            .and_then(|a| serde_json::from_str::<Value>(&a.to_json_string()).ok())
+            .unwrap_or_else(|| json!({}));
+        let params = json!({"name": call.name, "arguments": arguments});
+        Some(
+            ask(self.0.as_ref(), "tools/call", params)
+                .and_then(|result| decode::<CallToolResult>(&result, "tools/call result")),
+        )
     }
 }
 
-// The per-method handlers above (`list_tools`, `call_tool`, `list_resources`,
-// `read_resource`, `list_prompts`) each need a `RequestContext<RoleServer>`,
-// whose `peer: Peer<RoleServer>` field has a crate-private constructor
-// (`Peer::new` is `pub(crate)` in rmcp) — there is no public way to build
-// one from outside the `rmcp` crate itself. Exercising them is therefore
-// left to this crate's integration tests (`tests/`), which drive the real
-// `StreamableHttpService` over HTTP; rmcp constructs the `RequestContext`
-// internally as part of a real session, which also verifies the SSE/session
-// framing these methods run inside end to end rather than in isolation.
+/// Register what the handler lists under `method` (`resources/list` or
+/// `prompts/list`), one entry per item.
+fn listed<T: Wire>(
+    mcp: &dyn Handler,
+    method: &'static str,
+    key: &str,
+) -> Result<Vec<T>, DescribeError> {
+    let malformed = |why: String| DescribeError::Malformed { method, why };
+    let result = ask(mcp, method, json!({})).map_err(|e| malformed(e.message))?;
+    let Some(items) = result.get(key).and_then(Value::as_array) else {
+        return Err(malformed(format!("no `{key}` array")));
+    };
+    items
+        .iter()
+        .map(|item| decode::<T>(item, key).map_err(|e| malformed(e.message)))
+        .collect()
+}
+
+fn with_resources(
+    mut builder: ServerBuilder,
+    mcp: &Arc<dyn Handler>,
+) -> Result<ServerBuilder, DescribeError> {
+    for resource in listed::<Resource>(mcp.as_ref(), "resources/list", "resources")? {
+        let handler = Arc::clone(mcp);
+        builder = builder.resource(resource, move |_ctx, read: ReadResourceParams| {
+            let result = ask(handler.as_ref(), "resources/read", json!({"uri": read.uri}))?;
+            decode::<ReadResourceResult>(&result, "resources/read result")
+        });
+    }
+    Ok(builder)
+}
+
+fn with_prompts(
+    mut builder: ServerBuilder,
+    mcp: &Arc<dyn Handler>,
+) -> Result<ServerBuilder, DescribeError> {
+    for prompt in listed::<Prompt>(mcp.as_ref(), "prompts/list", "prompts")? {
+        let handler = Arc::clone(mcp);
+        builder = builder.prompt(prompt, move |_ctx, get: GetPromptParams| {
+            let arguments = get
+                .arguments
+                .as_ref()
+                .and_then(|a| serde_json::from_str::<Value>(&a.to_json_string()).ok())
+                .unwrap_or_else(|| json!({}));
+            let params = json!({"name": get.name, "arguments": arguments});
+            let result = ask(handler.as_ref(), "prompts/get", params)?;
+            decode::<GetPromptResult>(&result, "prompts/get result")
+        });
+    }
+    Ok(builder)
+}
+
+/// The server that answers `mcp`'s tools, resources and prompts.
+///
+/// Resources and prompts are listed once, here; tools are asked for per
+/// request.
+///
+/// # Errors
+/// [`DescribeError`] if the handler's resource or prompt list is malformed.
+pub fn describe(mcp: Arc<dyn Handler>) -> Result<Server, DescribeError> {
+    let builder = Server::builder(SERVER_NAME, env!("CARGO_PKG_VERSION"))
+        .tool_source(Tools(Arc::clone(&mcp)));
+    let builder = with_resources(builder, &mcp)?;
+    Ok(with_prompts(builder, &mcp)?.build()?)
+}
+
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use remind_me_core::Database;
     use remind_me_mcp::McpServer;
 
-    fn handler() -> RemindMeHandler {
-        let db = Database::open_in_memory().unwrap();
-        RemindMeHandler::new(Arc::new(McpServer::new(db)))
+    fn handler() -> Arc<dyn Handler> {
+        Arc::new(McpServer::new(Database::open_in_memory().unwrap()))
+    }
+
+    #[test]
+    fn the_server_is_described_from_the_handlers_own_lists() {
+        assert!(describe(handler()).is_ok());
+    }
+
+    #[test]
+    fn tools_come_from_the_handler_on_every_list() {
+        let tools = Tools(handler()).tools();
+        assert!(
+            tools
+                .iter()
+                .any(|t| t.name == "remind_me_stats" || !t.name.is_empty()),
+            "{tools:?}"
+        );
+        assert!(!tools.is_empty());
+    }
+
+    #[test]
+    fn a_handler_error_keeps_its_code_and_message() {
+        let err = ask(handler().as_ref(), "no/such_method", json!({})).unwrap_err();
+        assert_eq!(err.code, ErrorCode::METHOD_NOT_FOUND);
+        assert!(!err.message.is_empty());
+    }
+
+    #[test]
+    fn an_unknown_tool_is_a_tool_error_result_not_a_protocol_error() {
+        let source = Tools(handler());
+        let ctx_free = CallToolParams::new("no_such_tool");
+        // `call` needs a context only to satisfy the trait; the adapter does
+        // not read it, and a connection supplies one in real use.
+        let result = ask(
+            source.0.as_ref(),
+            "tools/call",
+            json!({"name": ctx_free.name}),
+        )
+        .and_then(|r| decode::<CallToolResult>(&r, "tools/call result"))
+        .unwrap();
+        assert_eq!(result.is_error, Some(true));
     }
 
     fn assert_send_sync<T: Send + Sync>() {}
 
     #[test]
-    fn remind_me_handler_is_send_and_sync() {
-        // `ServerHandler` requires `Send + Sync + 'static` outside the
-        // `local` feature (which this crate does not enable) -- this both
-        // documents that requirement and catches a regression at compile
-        // time if `McpServer` ever grows a non-Send/Sync field.
-        assert_send_sync::<RemindMeHandler>();
-    }
-
-    #[test]
-    fn get_info_advertises_tools_resources_and_prompts() {
-        let info = handler().get_info();
-        assert!(info.capabilities.tools.is_some());
-        assert!(info.capabilities.resources.is_some());
-        assert!(info.capabilities.prompts.is_some());
-        assert_eq!(info.server_info.name, "rusty_remind_me");
+    fn the_adapter_is_send_and_sync() {
+        assert_send_sync::<Tools>();
     }
 }

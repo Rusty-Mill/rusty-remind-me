@@ -10,14 +10,51 @@ use axum::routing::get;
 use axum::{Json, Router};
 use remind_me_core::remote::RemoteConfig;
 use remind_me_mcp::Handler;
-use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
-use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
+use rusty_mcp_server::{HttpConfig, HttpHandler};
 use serde_json::json;
 
 use crate::auth::{secret_gate, GateConfig, HEALTH_PATH, MCP_PATH};
-use crate::event_store::InProcessEventStore;
-use crate::handler::RemindMeHandler;
+use crate::handler;
 use crate::oauth::{self, IssuerError, OAuthAppState};
+
+/// Bytes of reply kept so a dropped connection can resume (see
+/// `rusty_mcp_server::HttpConfig::resume_buffer`).
+const RESUME_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+
+/// The largest MCP request body accepted.
+const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
+
+/// Why [`build_router`] failed.
+#[derive(Debug, thiserror::Error)]
+pub enum BuildError {
+    /// The configured OAuth issuer is not acceptable.
+    #[error(transparent)]
+    Issuer(IssuerError),
+    /// The MCP server could not be described from the handler.
+    #[error(transparent)]
+    Describe(#[from] handler::DescribeError),
+}
+
+/// The MCP endpoint as an axum service.
+fn mcp_service(mcp: &Arc<dyn Handler>) -> Result<Router, BuildError> {
+    let server = handler::describe(Arc::clone(mcp))?;
+    let http = Arc::new(HttpHandler::new(
+        Arc::new(server),
+        HttpConfig {
+            path: MCP_PATH.to_owned(),
+            // Any `Host`: behind a tunnel the public name is not knowable, and
+            // the credential is the secret path / bearer token, not `Host`.
+            allowed_hosts: Vec::new(),
+            resume_buffer: RESUME_BUFFER_BYTES,
+            ..HttpConfig::default()
+        },
+    ));
+    Ok(
+        // The gate has rewritten `/mcp/<token>` to `/mcp` (or a deeper path), so
+        // every request is pinned to the one path the handler serves.
+        rusty_mcp_axum::router_at(http, MAX_BODY_BYTES, MCP_PATH),
+    )
+}
 
 const LOOPBACK_HOSTS: [&str; 3] = ["127.0.0.1", "localhost", "::1"];
 
@@ -87,7 +124,7 @@ async fn health() -> impl IntoResponse {
 ///
 /// # Errors
 ///
-/// Returns [`IssuerError`] if `issuer` is `Some` and fails
+/// Returns [`BuildError::Issuer`] if `issuer` is `Some` and fails
 /// [`oauth::validate_issuer`] (not an https origin, or has a path/query/
 /// fragment) — mirrors the reference's `build_remote_app`, which raises
 /// `ValueError` synchronously at the same point for the same reason.
@@ -95,17 +132,8 @@ pub fn build_router(
     mcp: Arc<dyn Handler>,
     token: String,
     issuer: Option<String>,
-) -> Result<Router, IssuerError> {
-    let config = StreamableHttpServerConfig::default().disable_allowed_hosts();
-    let session_manager = Arc::new(
-        LocalSessionManager::default().with_event_store(Arc::new(InProcessEventStore::new())),
-    );
-    let service: StreamableHttpService<RemindMeHandler, LocalSessionManager> =
-        StreamableHttpService::new(
-            move || Ok(RemindMeHandler::new(Arc::clone(&mcp))),
-            session_manager,
-            config,
-        );
+) -> Result<Router, BuildError> {
+    let service = mcp_service(&mcp)?;
 
     let Some(raw_issuer) = issuer else {
         let gate = Arc::new(GateConfig::legacy(token));
@@ -115,7 +143,7 @@ pub fn build_router(
             .layer(middleware::from_fn_with_state(gate, secret_gate)));
     };
 
-    let issuer = oauth::validate_issuer(&raw_issuer)?;
+    let issuer = oauth::validate_issuer(&raw_issuer).map_err(BuildError::Issuer)?;
     let store = remind_me_core::remote::OAuthStateStore::new(
         remind_me_core::remote::oauth_state_file_path(),
     );
