@@ -15,12 +15,11 @@ rusty_oauth = { workspace = true }
 rusty_crypto_key = { workspace = true }
 rusty_atomic_file = { workspace = true }
 
-serde = { version = "1.0", features = ["derive"] }
+serde = { workspace = true }
 # `float_roundtrip`: the engine stores records as JSON, and the default
 # parser reads some floats back one bit off (0.9774999999999999 as 0.9775).
 # Decay leaves such values, which the copy onto the engine then refused.
 serde_json = { version = "1.0", features = ["float_roundtrip"] }
-async-trait = "0.1"
 thiserror = "2.0"
 tokio = { version = "1.0", features = ["full"] }
 # Read-only, in one module: `db::legacy_sqlite` copies an old `memory.db`
@@ -30,7 +29,7 @@ tokio = { version = "1.0", features = ["full"] }
 # `links = "sqlite3"`, so Cargo allows one version per graph, and the rest of
 # the rusty_mill workspace is on 0.39.
 rusqlite = { version = "0.39", features = ["bundled"] }
-chrono = { version = "0.4", features = ["serde"] }
+chrono = { workspace = true }
 uuid = { version = "1.0", features = ["v4", "v5"] }
 sha256 = "1.5"
 dirs = "5.0"
@@ -38,7 +37,9 @@ parking_lot = "0.12"
 # The node's store (ADR-0023, ADR-0025).
 rusty_multimodal_db_engine = { workspace = true }
 pdf-extract = { version = "0.12", optional = true }
-aws-sdk-s3 = { version = "1", optional = true }
+# default-features off: the default `rustls` feature is the legacy hyper-0.14 /
+# rustls-0.21 client (RUSTSEC-2026-0098/-0099/-0104, -0258); keep the rest.
+aws-sdk-s3 = { version = "1", optional = true, default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
 aws-config = { version = "1", optional = true }
 usearch = { version = "2", optional = true }
 ocrs = { version = "0.12", optional = true }

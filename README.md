@@ -231,8 +231,9 @@ The six crates each carry their own literal `version` (the monorepo's
 with `.claude-plugin/plugin.json`'s `"version"`.
 `scripts/get_workspace_version.sh` fails if the six disagree, and
 `scripts/check_plugin_version.sh` fails if the plugin manifest differs from
-them; both run on every PR touching this directory (the `plugin-version` job
-in the monorepo's `.github/workflows/remind-me-checks.yml`), so a bump that
+them; both run on every PR touching this directory (the
+`remind-me-plugin-version` job in the monorepo's `.github/workflows/ci.yml`,
+covered by its `required-gate`), so a bump that
 misses one never merges — the release's plugin archive is never a version
 behind the binaries it ships alongside.
 
