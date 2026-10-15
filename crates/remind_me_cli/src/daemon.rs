@@ -29,6 +29,8 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 /// The dashboard API's own per-connection timeout.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Includes draining sessions, joining background workers and releasing storage.
+const STOP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What the daemon does with each request: the MCP server, the store
 /// operations and the dashboard API, all over one database.
@@ -114,23 +116,24 @@ fn run(db_path: &Path, endpoint: Endpoint) -> Result<()> {
         daemon.info().port,
         daemon.info().pid
     );
-    let served = daemon.serve(Arc::new(service));
-
-    if let Some(scheduler) = scheduler {
-        scheduler.stop();
-    }
-    if let Some(watcher) = watcher {
-        watcher.stop();
-    }
-    if let Some(nudge) = nudge {
-        nudge.stop();
-    }
-    if let Some(compactor) = compactor {
-        compactor.stop();
-    }
-    if let Some(sync) = sync.as_mut() {
-        sync.stop();
-    }
+    let served = daemon.serve_with_cleanup(Arc::new(service), move || {
+        if let Some(scheduler) = scheduler {
+            scheduler.stop();
+        }
+        if let Some(watcher) = watcher {
+            watcher.stop();
+        }
+        if let Some(nudge) = nudge {
+            nudge.stop();
+        }
+        if let Some(compactor) = compactor {
+            compactor.stop();
+        }
+        if let Some(sync) = sync.as_mut() {
+            sync.stop();
+        }
+        drop(sync);
+    });
     Ok(served?)
 }
 
@@ -151,12 +154,15 @@ fn status(endpoint: &Endpoint) -> Result<()> {
 
 fn stop(endpoint: &Endpoint) -> Result<()> {
     match client::connect(endpoint, Mode::Control) {
-        Ok(mut control) => {
-            control.call(&Op::Shutdown)?.into_result::<Value>()?;
+        Ok(control) => {
+            control.shutdown(STOP_TIMEOUT)?;
             println!("stopped");
             Ok(())
         }
         Err(ConnectError::NotRunning) => {
+            if endpoint.try_lock()?.is_none() {
+                return Err("the daemon is not accepting connections but still holds its lock; shutdown is not confirmed".into());
+            }
             println!("not running");
             Ok(())
         }

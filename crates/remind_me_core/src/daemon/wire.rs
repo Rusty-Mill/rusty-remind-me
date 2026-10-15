@@ -13,6 +13,11 @@
 //! - [`Mode::Control`]: only `status` and `shutdown`. Checked for the token
 //!   alone, so `rusty-remind-me daemon stop` still reaches a daemon from
 //!   another build or started under other settings.
+//!
+//! Shutdown success carries `{"shutdown_complete": true}` only after all
+//! connection workers and the owner's cleanup have released the store. Older
+//! daemons replied with `null` before cleanup; clients must not treat that as
+//! proof that a local store reopen is safe.
 
 use super::session::Session;
 use super::settings::Fingerprint;

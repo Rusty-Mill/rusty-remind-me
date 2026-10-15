@@ -11,11 +11,11 @@ use super::wire::{self, Hello, Mode, Refusal, Reply};
 use rusty_crypto_key::constant_time_eq;
 use serde_json::{json, Value};
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::io::{self, BufRead, BufReader, Read};
+use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// A client has this long to say hello.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
@@ -67,6 +67,7 @@ struct Shared {
     token: String,
     settings: Fingerprint,
     stopping: Arc<AtomicBool>,
+    shutdown_replies: Mutex<Vec<TcpStream>>,
 }
 
 impl Locked {
@@ -107,13 +108,26 @@ impl Daemon {
 
     /// Serve until a client sends [`Op::Shutdown`].
     pub fn serve(self, service: Arc<dyn Service>) -> io::Result<()> {
+        self.serve_with_cleanup(service, || {})
+    }
+
+    /// Serve, drain connection workers and run `cleanup` before acknowledging
+    /// shutdown. `cleanup` must stop and drop any background owners of the store.
+    pub fn serve_with_cleanup(
+        self,
+        service: Arc<dyn Service>,
+        cleanup: impl FnOnce(),
+    ) -> io::Result<()> {
         let shared = Arc::new(Shared {
             info: self.info.clone(),
             token: self.token,
             settings: self.settings,
             stopping: Arc::clone(&self.stopping),
+            shutdown_replies: Mutex::new(Vec::new()),
         });
         let pending_hellos = Arc::new(AtomicUsize::new(0));
+        let mut workers: Vec<(Arc<TcpStream>, std::thread::JoinHandle<()>)> = Vec::new();
+        let mut worker_failed = false;
         for stream in self.listener.incoming() {
             if self.stopping.load(Ordering::SeqCst) {
                 break;
@@ -125,17 +139,83 @@ impl Daemon {
             let Some(pending) = PendingHello::admit(&pending_hellos) else {
                 continue;
             };
+            // Reap completed sessions during normal operation, rather than
+            // retaining every connection for the lifetime of the daemon.
+            let mut index = 0;
+            while index < workers.len() {
+                if workers[index].1.is_finished() {
+                    worker_failed |= workers.swap_remove(index).1.join().is_err();
+                } else {
+                    index += 1;
+                }
+            }
+            let socket = match stream.try_clone() {
+                Ok(socket) => Arc::new(socket),
+                Err(e) => {
+                    eprintln!("rusty-remind-me daemon: could not track connection: {e}");
+                    continue;
+                }
+            };
             let shared = Arc::clone(&shared);
             let service = Arc::clone(&service);
-            std::thread::spawn(move || {
+            let worker_socket = Arc::clone(&socket);
+            let worker = std::thread::spawn(move || {
                 if let Err(e) = serve_connection(stream, pending, &shared, service.as_ref()) {
                     if e.kind() != io::ErrorKind::UnexpectedEof {
                         eprintln!("rusty-remind-me daemon: connection ended: {e}");
                     }
                 }
+                // The tracked socket must not keep a completed HTTP response
+                // open until the next accept reaps this worker.
+                if !shared.stopping.load(Ordering::SeqCst) {
+                    let _ = worker_socket.shutdown(Shutdown::Both);
+                }
             });
+            workers.push((socket, worker));
         }
+        drop(self.listener);
+        // Interrupt idle sessions on both platforms. Shutdown requesters have
+        // already left their read loop and need their socket for the final reply.
+        {
+            let replies = shared
+                .shutdown_replies
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for (socket, _) in &workers {
+                if !replies
+                    .iter()
+                    .any(|reply| reply.peer_addr().ok() == socket.peer_addr().ok())
+                {
+                    let _ = socket.shutdown(Shutdown::Both);
+                }
+            }
+        }
+        for (_, worker) in workers {
+            worker_failed |= worker.join().is_err();
+        }
+        drop(service);
+        cleanup();
         self.endpoint.withdraw(self.info.pid);
+        drop(self._lock);
+        let reply = if worker_failed {
+            OpReply::Err("a daemon connection worker panicked during its lifetime".into())
+        } else {
+            OpReply::Ok(json!({"shutdown_complete": true}))
+        };
+        for mut writer in shared
+            .shutdown_replies
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+        {
+            // A client may have timed out; still notify the other requesters.
+            if let Err(e) = wire::write_line(&mut writer, &reply) {
+                eprintln!("rusty-remind-me daemon: shutdown reply failed: {e}");
+            }
+        }
+        if worker_failed {
+            return Err(io::Error::other("a daemon connection worker panicked"));
+        }
         Ok(())
     }
 }
@@ -162,6 +242,42 @@ impl Drop for PendingHello {
     }
 }
 
+// Windows does not reliably interrupt a synchronous read on another thread
+// when a cloned socket is shut down. Retry read timeouts without discarding a
+// partially received line, checking cancellation between reads instead.
+struct ConnectionReader {
+    stream: TcpStream,
+    stopping: Arc<AtomicBool>,
+    hello_deadline: Option<Instant>,
+}
+
+impl Read for ConnectionReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            if self.stopping.load(Ordering::SeqCst) {
+                return Ok(0);
+            }
+            if self
+                .hello_deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            match self.stream.read(buf) {
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    continue
+                }
+                result => return result,
+            }
+        }
+    }
+}
+
 fn serve_connection(
     stream: TcpStream,
     pending: PendingHello,
@@ -169,9 +285,14 @@ fn serve_connection(
     service: &dyn Service,
 ) -> io::Result<()> {
     stream.set_nodelay(true)?;
-    stream.set_read_timeout(Some(HELLO_TIMEOUT))?;
+    stream.set_read_timeout(Some(Duration::from_millis(100)))?;
+    stream.set_write_timeout(Some(HELLO_TIMEOUT))?;
     let mut writer = stream.try_clone()?;
-    let mut reader = BufReader::new(stream);
+    let mut reader = BufReader::new(ConnectionReader {
+        stream,
+        stopping: Arc::clone(&shared.stopping),
+        hello_deadline: Some(Instant::now() + HELLO_TIMEOUT),
+    });
     let Some(hello) = wire::read_line_max::<Hello>(&mut reader, wire::MAX_HELLO_LINE)? else {
         return Ok(());
     };
@@ -180,7 +301,7 @@ fn serve_connection(
     }
     drop(pending);
     wire::write_line(&mut writer, &Reply::Welcome)?;
-    reader.get_ref().set_read_timeout(None)?;
+    reader.get_mut().hello_deadline = None;
     super::session::enter(hello.session);
 
     match hello.mode {
@@ -239,11 +360,15 @@ fn serve_ops(
                 "started_at": shared.info.started_at,
             })),
             Op::Shutdown => {
+                shared
+                    .shutdown_replies
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(writer);
                 shared.stopping.store(true, Ordering::SeqCst);
-                wire::write_line(&mut writer, &OpReply::Ok(Value::Null))?;
                 // Wake the accept loop so it sees the flag.
-                let _ = TcpStream::connect((Ipv4Addr::LOCALHOST, shared.info.port));
-                return writer.flush();
+                TcpStream::connect((Ipv4Addr::LOCALHOST, shared.info.port))?;
+                return Ok(());
             }
             op => match service {
                 Some(service) => service.op(&op),
@@ -259,7 +384,7 @@ fn serve_ops(
 mod tests {
     use super::super::client::{self, ConnectError};
     use super::*;
-    use std::io::Read;
+    use std::io::Write;
 
     #[test]
     fn pending_hellos_are_capped_and_a_dropped_slot_is_reusable() {
@@ -272,6 +397,82 @@ mod tests {
         drop(held);
         assert_eq!(count.load(Ordering::SeqCst), 0);
         assert!(PendingHello::admit(&count).is_some());
+    }
+
+    #[test]
+    fn shutdown_waits_for_cleanup_and_releases_the_store_with_idle_sessions() {
+        let dir = std::env::temp_dir().join(format!("rrm_shutdown_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("memory.db");
+        let endpoint = Endpoint::for_db(&db_path);
+        let Start::Started(locked) = Daemon::start(endpoint.clone()).unwrap() else {
+            panic!("fresh endpoint");
+        };
+        let db = crate::Database::open(&db_path).unwrap();
+        let daemon = locked.listen().unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            daemon.serve_with_cleanup(Arc::new(Echo), move || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                drop(db);
+            })
+        });
+        let _idle = client::connect(&endpoint, Mode::Mcp).unwrap();
+        let control = client::connect(&endpoint, Mode::Control).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let client = std::thread::spawn(move || {
+            done_tx
+                .send(control.shutdown(Duration::from_secs(5)))
+                .unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(
+            done_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert!(
+            endpoint.try_lock().unwrap().is_none(),
+            "cleanup still owns the daemon lock"
+        );
+        assert!(
+            crate::Database::open(&db_path).is_err(),
+            "store remains held during cleanup"
+        );
+        release_tx.send(()).unwrap();
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        // No join or retry before reopening: success itself is the barrier.
+        let reopened = crate::Database::open(&db_path).unwrap();
+        drop(reopened);
+        client.join().unwrap();
+        server.join().unwrap().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn stalled_cleanup_times_out_without_reporting_success() {
+        let endpoint = temp_endpoint();
+        let Start::Started(locked) = Daemon::start(endpoint.clone()).unwrap() else {
+            panic!("fresh endpoint");
+        };
+        let daemon = locked.listen().unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            daemon.serve_with_cleanup(Arc::new(Echo), move || {
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            })
+        });
+        let control = client::connect(&endpoint, Mode::Control).unwrap();
+        let err = control.shutdown(Duration::from_millis(50)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(err.to_string().contains("store may still be in use"));
+        assert!(endpoint.try_lock().unwrap().is_none());
+        release_tx.send(()).unwrap();
+        server.join().unwrap().unwrap();
     }
 
     /// Echoes what it is given, and reports the calling session's client.
@@ -316,8 +517,8 @@ mod tests {
     }
 
     fn stop(endpoint: &Endpoint, handle: std::thread::JoinHandle<io::Result<()>>) {
-        let mut store = client::connect(endpoint, Mode::Control).unwrap();
-        assert_eq!(store.call(&Op::Shutdown).unwrap(), OpReply::Ok(Value::Null));
+        let store = client::connect(endpoint, Mode::Control).unwrap();
+        store.shutdown(Duration::from_secs(5)).unwrap();
         handle.join().unwrap().unwrap();
         assert!(endpoint.read_info().is_none(), "info withdrawn on exit");
     }
@@ -417,6 +618,7 @@ mod tests {
             token: "tok".into(),
             settings: settings::fingerprint_of([("REMIND_ME_SYNC_SECRET".into(), "a".into())]),
             stopping: Arc::new(AtomicBool::new(false)),
+            shutdown_replies: Mutex::new(Vec::new()),
         };
         let hello = |token: &str, build: &str, secret: &str| Hello {
             protocol: wire::PROTOCOL,

@@ -6,7 +6,7 @@ use super::session::Session;
 use super::wire::{self, Hello, Mode, Refusal, Reply};
 use serde_json::Value;
 use std::fmt;
-use std::io::{self, BufReader, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -73,6 +73,51 @@ pub struct DaemonConnection {
 }
 
 impl DaemonConnection {
+    /// Request shutdown and wait at most `timeout` for completion. The daemon
+    /// acknowledges only after its sessions and background store owners stop.
+    /// Consumes the connection, so its shutdown timeout cannot affect later RPCs.
+    pub fn shutdown(mut self, timeout: Duration) -> io::Result<()> {
+        let deadline = Instant::now() + timeout;
+        self.writer.set_write_timeout(Some(timeout))?;
+        let reply = (|| {
+            wire::write_line(&mut self.writer, &Op::Shutdown)?;
+            let mut line = Vec::new();
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(io::ErrorKind::TimedOut.into());
+                }
+                self.reader.get_ref().set_read_timeout(Some(remaining))?;
+                let mut byte = [0];
+                self.reader.read_exact(&mut byte)?;
+                if byte[0] == b'\n' {
+                    return serde_json::from_slice::<OpReply>(&line).map_err(io::Error::other);
+                }
+                line.push(byte[0]);
+                if line.len() as u64 > wire::MAX_HELLO_LINE {
+                    return Err(io::Error::other("daemon shutdown reply is too large"));
+                }
+            }
+        })()
+            .map_err(|e| {
+                if matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock) {
+                    io::Error::new(io::ErrorKind::TimedOut, format!(
+                        "daemon shutdown did not complete within {timeout:?}; the store may still be in use"
+                    ))
+                } else {
+                    io::Error::new(e.kind(), format!("could not confirm daemon shutdown: {e}"))
+                }
+            })?
+            .into_result::<Value>()
+            .map_err(io::Error::other)?;
+        if reply.get("shutdown_complete") != Some(&Value::Bool(true)) {
+            return Err(io::Error::other(
+                "the daemon accepted shutdown but did not confirm completion (older daemon); retry stop before opening the store",
+            ));
+        }
+        Ok(())
+    }
+
     /// Send one MCP JSON-RPC line; `None` is the answer to a notification.
     pub fn call_mcp(&mut self, line: &str) -> io::Result<Option<Value>> {
         let line = line.trim_end_matches(['\r', '\n']);
@@ -286,6 +331,38 @@ pub fn relay(browser: TcpStream, daemon: TcpStream) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shutdown_rejects_failure_legacy_ack_and_disconnect() {
+        for (reply, expected) in [
+            (
+                Some(OpReply::Err("cleanup failed".into())),
+                "cleanup failed",
+            ),
+            (Some(OpReply::Ok(Value::Null)), "did not confirm completion"),
+            (None, "could not confirm daemon shutdown"),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let op: Op = wire::read_line(&mut BufReader::new(socket.try_clone().unwrap()))
+                    .unwrap()
+                    .unwrap();
+                assert!(matches!(op, Op::Shutdown));
+                if let Some(reply) = reply {
+                    wire::write_line(&mut socket, &reply).unwrap();
+                }
+            });
+            let connection = DaemonConnection {
+                writer: stream.try_clone().unwrap(),
+                reader: BufReader::new(stream),
+            };
+            let err = connection.shutdown(Duration::from_secs(5)).unwrap_err();
+            assert!(err.to_string().contains(expected), "{err}");
+            server.join().unwrap();
+        }
+    }
 
     fn temp_endpoint() -> Endpoint {
         let dir = std::env::temp_dir().join(format!(

@@ -88,6 +88,22 @@ impl Drop for Scratch {
 }
 
 #[test]
+fn stop_does_not_report_not_running_while_the_daemon_lock_is_held() {
+    let store = Scratch::new("stopping");
+    let endpoint = remind_me_core::daemon::endpoint::Endpoint::for_db(&store.db);
+    let lock = endpoint.try_lock().unwrap().unwrap();
+    let out = store.run(false, &["daemon", "stop"]);
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("shutdown is not confirmed"));
+    drop(lock);
+    assert_eq!(
+        store.run_ok(false, &["daemon", "stop"]).trim(),
+        "not running"
+    );
+}
+
+#[test]
 fn cli_commands_through_the_daemon_print_what_they_print_in_process() {
     let store = Scratch::new("cli");
     assert!(
