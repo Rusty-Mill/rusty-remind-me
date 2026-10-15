@@ -14,7 +14,7 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 /// A client has this long to say hello.
@@ -126,7 +126,7 @@ impl Daemon {
             shutdown_replies: Mutex::new(Vec::new()),
         });
         let pending_hellos = Arc::new(AtomicUsize::new(0));
-        let mut workers: Vec<(Arc<TcpStream>, std::thread::JoinHandle<()>)> = Vec::new();
+        let mut workers: Vec<(Weak<TcpStream>, std::thread::JoinHandle<()>)> = Vec::new();
         let mut worker_failed = false;
         for stream in self.listener.incoming() {
             if self.stopping.load(Ordering::SeqCst) {
@@ -158,20 +158,18 @@ impl Daemon {
             };
             let shared = Arc::clone(&shared);
             let service = Arc::clone(&service);
-            let worker_socket = Arc::clone(&socket);
+            let tracked_socket = Arc::downgrade(&socket);
             let worker = std::thread::spawn(move || {
+                // Only the worker owns this socket. Tracking must not keep an
+                // HTTP response or a panicked connection open after it ends.
+                let _socket = socket;
                 if let Err(e) = serve_connection(stream, pending, &shared, service.as_ref()) {
                     if e.kind() != io::ErrorKind::UnexpectedEof {
                         eprintln!("rusty-remind-me daemon: connection ended: {e}");
                     }
                 }
-                // The tracked socket must not keep a completed HTTP response
-                // open until the next accept reaps this worker.
-                if !shared.stopping.load(Ordering::SeqCst) {
-                    let _ = worker_socket.shutdown(Shutdown::Both);
-                }
             });
-            workers.push((socket, worker));
+            workers.push((tracked_socket, worker));
         }
         drop(self.listener);
         // Interrupt idle sessions on both platforms. Shutdown requesters have
@@ -182,6 +180,9 @@ impl Daemon {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             for (socket, _) in &workers {
+                let Some(socket) = socket.upgrade() else {
+                    continue;
+                };
                 if !replies
                     .iter()
                     .any(|reply| reply.peer_addr().ok() == socket.peer_addr().ok())
@@ -420,6 +421,8 @@ mod tests {
             })
         });
         let _idle = client::connect(&endpoint, Mode::Mcp).unwrap();
+        let _pending_hello =
+            TcpStream::connect((Ipv4Addr::LOCALHOST, endpoint.read_info().unwrap().port)).unwrap();
         let control = client::connect(&endpoint, Mode::Control).unwrap();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let client = std::thread::spawn(move || {
@@ -473,6 +476,42 @@ mod tests {
         assert!(endpoint.try_lock().unwrap().is_none());
         release_tx.send(()).unwrap();
         server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn a_panicked_worker_closes_its_session_and_shutdown_reports_failure() {
+        struct Panics;
+        impl Service for Panics {
+            fn mcp(&self, _: &str) -> Option<Value> {
+                panic!("injected worker failure");
+            }
+            fn op(&self, op: &Op) -> OpReply {
+                Echo.op(op)
+            }
+            fn http(&self, stream: &mut TcpStream) -> io::Result<()> {
+                Echo.http(stream)
+            }
+        }
+        let endpoint = temp_endpoint();
+        let Start::Started(locked) = Daemon::start(endpoint.clone()).unwrap() else {
+            panic!("fresh endpoint");
+        };
+        let daemon = locked.listen().unwrap();
+        let server = std::thread::spawn(move || daemon.serve(Arc::new(Panics)));
+        let mut stream = client::connect(&endpoint, Mode::Mcp).unwrap().into_stream();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream.write_all(b"panic\n").unwrap();
+        assert_eq!(
+            stream.read(&mut [0]).unwrap(),
+            0,
+            "panic closes the session"
+        );
+        let control = client::connect(&endpoint, Mode::Control).unwrap();
+        let err = control.shutdown(Duration::from_secs(5)).unwrap_err();
+        assert!(err.to_string().contains("worker panicked"), "{err}");
+        assert!(server.join().unwrap().is_err());
     }
 
     /// Echoes what it is given, and reports the calling session's client.
