@@ -697,6 +697,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         result?;
     } else {
         match args[1].as_str() {
+            "impact-export" => {
+                if args.len() > 3 {
+                    return Err("usage: rusty-remind-me impact-export [QUERY]".into());
+                }
+                let snapshot: serde_json::Value =
+                    Store::open(&db_path)?.call(Op::ImpactExport {
+                        query: args.get(2).cloned(),
+                    })?;
+                println!("{}", serde_json::to_string_pretty(&snapshot)?);
+            }
             "copy-store" => match copy_store::parse(&args[2..], &db_path) {
                 Ok(parsed) => copy_store::run(&parsed)?,
                 Err(message) => {
@@ -1074,7 +1084,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", serde_json::to_string_pretty(&stats)?);
             }
             cmd => {
-                eprintln!("Unknown subcommand: {}. Available: configure, daemon, api, remote, server, search, add, list, get, entity, wiki-write, wiki-read, wiki-import, stats, resolve, session, capture-transcript, context", cmd);
+                eprintln!("Unknown subcommand: {}. Available: configure, daemon, api, remote, server, search, add, list, get, entity, wiki-write, wiki-read, wiki-import, stats, resolve, session, capture-transcript, context, impact-export", cmd);
                 std::process::exit(1);
             }
         }

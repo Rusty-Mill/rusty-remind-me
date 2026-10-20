@@ -777,3 +777,9 @@ future brief whether they were written up or not.
 ## License
 
 MIT License. See [LICENSE](LICENSE) for details.
+
+For Orch proposed-change reports, `rusty-remind-me impact-export [QUERY]` exports
+a complete engine-backed inventory through the existing daemon/store path, with
+optional supplemental retrieval. This explicit export includes sensitive and
+inactive records; keep it private like a backup. See the
+[impact snapshot contract](../rusty_orch/docs/change-impact.md).

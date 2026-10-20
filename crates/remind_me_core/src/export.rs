@@ -29,6 +29,46 @@ use crate::db::Store;
 use crate::models::{ExportFormat, ExportInput, ExportResult};
 use std::path::{Path, PathBuf};
 
+/// Export the full durable inventory for revision-bound impact analysis.
+///
+/// Reuses the engine-backed exporter without category, project, lifecycle or
+/// ranking filters. Ranked retrieval is supplemental and cannot truncate the
+/// inventory. Like ordinary search, requesting a query records access signals.
+/// This explicit export may include sensitive records, just like a full backup.
+pub fn impact_snapshot(
+    store: &Store<'_>,
+    query: Option<&str>,
+) -> std::result::Result<serde_json::Value, String> {
+    let retrieved = match query {
+        Some(query) => serde_json::to_value(
+            crate::db::queries::search_memories(
+                store,
+                &crate::models::MemorySearchInput {
+                    query: query.to_owned(),
+                    ..Default::default()
+                },
+            )
+            .map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?,
+        None => serde_json::json!([]),
+    };
+    let mut records = collect_export_records(
+        store,
+        &ExportInput {
+            include_deleted: true,
+            include_graph: false,
+            ..Default::default()
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    records.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+    Ok(
+        serde_json::json!({"schema_version": 1, "source": "remind_me", "complete": true,
+                          "records": records, "retrieved_context": retrieved}),
+    )
+}
+
 /// Environment variable listing the roots an export may write to, in the
 /// platform's own `PATH`-list syntax (see
 /// [`crate::import_paths::split_path_list`]).
