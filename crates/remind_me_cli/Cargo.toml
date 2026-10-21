@@ -2,6 +2,7 @@
 name = "rusty-remind-me"
 version = "0.4.0"
 edition = "2021"
+rust-version = "1.89"
 license = "MIT"
 repository = "https://github.com/Rusty-Mill/rusty_mill"
 
