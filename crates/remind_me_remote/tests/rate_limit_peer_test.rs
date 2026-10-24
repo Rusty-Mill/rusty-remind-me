@@ -9,12 +9,21 @@
 //! Linux routes by default and macOS does not.
 #![cfg(target_os = "linux")]
 
+#[path = "../../remind_me_core/src/test_env.rs"]
+mod test_env;
+
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
+use remind_me_core::rate_limit::{
+    RATE_LIMIT_ENABLED_ENV, RATE_LIMIT_REQUESTS_ENV, RATE_LIMIT_WINDOW_ENV,
+};
 use remind_me_core::Database;
 use remind_me_mcp::McpServer;
 use reqwest::StatusCode;
+
+/// Small enough to exhaust quickly; the window outlasts the test.
+const LIMIT: u32 = 3;
 
 async fn spawn_server() -> SocketAddr {
     let db = Database::open_in_memory().unwrap();
@@ -33,8 +42,9 @@ fn client_from(source: Ipv4Addr) -> reqwest::Client {
         .unwrap()
 }
 
-/// An unauthenticated `/mcp` request from the given client; it is limited
-/// before any credential is checked, so it still counts against the bucket.
+/// An unauthenticated `/mcp` request from the given client: 401 when
+/// admitted, 429 when limited. The limit applies before any credential is
+/// checked, so a refused credential still counts against the bucket.
 async fn status(client: &reqwest::Client, addr: SocketAddr) -> StatusCode {
     client
         .get(format!("http://{addr}/mcp"))
@@ -46,19 +56,20 @@ async fn status(client: &reqwest::Client, addr: SocketAddr) -> StatusCode {
 
 #[tokio::test]
 async fn two_peers_get_separate_rate_limit_buckets() {
-    assert!(
-        remind_me_core::rate_limit::rate_limit_enabled(),
-        "rate limiting must be enabled for this test"
-    );
+    // Pinned rather than inherited, before the process-global limiter is
+    // first built, so an operator's REMIND_ME_RATE_LIMIT_* cannot skew it.
+    test_env::set_var(RATE_LIMIT_ENABLED_ENV, "1");
+    test_env::set_var(RATE_LIMIT_REQUESTS_ENV, LIMIT.to_string());
+    test_env::set_var(RATE_LIMIT_WINDOW_ENV, "3600");
     let addr = spawn_server().await;
     let noisy = client_from(Ipv4Addr::new(127, 0, 0, 1));
     let quiet = client_from(Ipv4Addr::new(127, 0, 0, 2));
 
-    for i in 0..remind_me_core::rate_limit::configured_requests() {
-        assert_ne!(
+    for i in 0..LIMIT {
+        assert_eq!(
             status(&noisy, addr).await,
-            StatusCode::TOO_MANY_REQUESTS,
-            "request {i} limited while under the limit"
+            StatusCode::UNAUTHORIZED,
+            "request {i} not admitted as an unauthenticated 401 while under the limit"
         );
     }
     assert_eq!(
@@ -67,9 +78,9 @@ async fn two_peers_get_separate_rate_limit_buckets() {
         "the noisy peer's own bucket should be exhausted"
     );
 
-    assert_ne!(
+    assert_eq!(
         status(&quiet, addr).await,
-        StatusCode::TOO_MANY_REQUESTS,
+        StatusCode::UNAUTHORIZED,
         "a second peer must not share the first peer's bucket"
     );
 }
