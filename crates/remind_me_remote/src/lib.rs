@@ -47,4 +47,6 @@ pub mod handler;
 pub mod oauth;
 pub mod server;
 
-pub use server::{build_router, is_loopback_host, run, run_blocking, warn_if_widened, BuildError};
+pub use server::{
+    build_router, is_loopback_host, run, run_blocking, serve, warn_if_widened, BuildError,
+};

@@ -217,7 +217,19 @@ pub async fn run(
     }
     let router = build_router(mcp, token, config.issuer.clone())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
-    axum::serve(listener, router).await
+    serve(listener, router).await
+}
+
+/// Serve `router` on `listener` with each connection's peer address attached
+/// as [`axum::extract::ConnectInfo`]. The secret gate keys its rate-limit
+/// bucket on that address; served without it, every caller not presenting
+/// the connector secret shares one `ip:unknown` bucket (issue #920).
+pub async fn serve(listener: tokio::net::TcpListener, router: Router) -> std::io::Result<()> {
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
 }
 
 /// Synchronous entry point for `remind_me_cli`: owns spinning up a
