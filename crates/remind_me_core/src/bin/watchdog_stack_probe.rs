@@ -28,7 +28,12 @@ use std::time::Duration;
 ///
 /// So the hot loop is float arithmetic and a raw counter: both compile to
 /// inline instructions with no call, even unoptimised, which keeps the sampled
-/// PC inside this frame. `stop` is checked only between long stretches. That
+/// PC inside this frame. The counter is also floating point: a checked integer
+/// increment emits compiler-generated, line-0 instruction spans in a debug
+/// build. A sample there can name this function and file without a source line.
+/// Every integer through 20,000,000 is exactly representable in `f64`, so this
+/// still performs the same bounded number of iterations without overflow code.
+/// `stop` is checked only between long stretches. That
 /// is also a truer model of the incident this feature exists for — a runaway
 /// query pegging a core, not a spin on a flag.
 #[inline(never)]
@@ -36,10 +41,10 @@ use std::time::Duration;
 pub extern "C" fn remind_me_probe_stuck_frame(stop: &AtomicBool) {
     let mut x = 1.0f64;
     while !stop.load(Ordering::Relaxed) {
-        let mut i = 0u32;
-        while i < 20_000_000 {
+        let mut i = 0.0f64;
+        while i < 20_000_000.0 {
             x = x * 1.000_000_1 + 1.0;
-            i += 1;
+            i += 1.0;
         }
         std::hint::black_box(x);
     }

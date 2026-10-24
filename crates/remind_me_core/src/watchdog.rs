@@ -186,32 +186,108 @@ mod stacks {
         let mut out = String::from("watchdog: thread stacks follow\n");
         for thread in trace.threads() {
             let _ = writeln!(out, "  thread {} ({:?})", thread.id(), thread.name());
-            for frame in thread.frames() {
+            for (index, frame) in thread.frames().iter().enumerate() {
                 // A frame can resolve to several symbols when it is inlined,
                 // and to none at all when the binary is stripped -- both are
                 // normal, and neither is worth failing the whole dump over.
-                let mut named = false;
-                for symbol in frame.symbols() {
-                    named = true;
-                    let _ = write!(out, "    {}", symbol.name().unwrap_or("<unknown>"));
-                    match (symbol.file(), symbol.line()) {
-                        (Some(file), Some(line)) => {
-                            let _ = writeln!(out, " ({}:{})", file.display(), line);
-                        }
-                        (Some(file), None) => {
-                            let _ = writeln!(out, " ({})", file.display());
-                        }
-                        _ => {
-                            let _ = writeln!(out);
-                        }
+                // rstack-self 0.3 subtracts one from non-signal PCs. The
+                // initial libunwind ptrace cursor is not a signal frame, but
+                // its PC is the sampled instruction, not a return address.
+                // backtrace subtracts once again internally. This can cross
+                // into an unrelated/line-0 DWARF row.
+                let named = if index == 0 {
+                    write_sampled_frame(&mut out, frame.ip())
+                } else {
+                    for symbol in frame.symbols() {
+                        write_symbol(
+                            &mut out,
+                            frame.ip(),
+                            symbol.name(),
+                            symbol.file(),
+                            symbol.line(),
+                        );
                     }
-                }
+                    !frame.symbols().is_empty()
+                };
                 if !named {
                     let _ = writeln!(out, "    <no symbol> (ip {:#x})", frame.ip());
                 }
             }
         }
         Ok(out)
+    }
+
+    #[cfg(all(target_os = "linux", feature = "stack-dumps"))]
+    fn write_sampled_frame(out: &mut String, ip: usize) -> bool {
+        // backtrace 0.3.76 also subtracts one internally, including for its
+        // address-based API. Compensate so it looks up the sampled PC itself.
+        // The function-entry regression below pins this dependency behavior.
+        if ip == 0 {
+            return false;
+        }
+        let Some(lookup) = ip.checked_add(1) else {
+            return false;
+        };
+        let mut named = false;
+        backtrace::resolve(lookup as *mut _, |symbol| {
+            named = true;
+            let name = symbol.name().map(|name| name.to_string());
+            write_symbol(out, ip, name.as_deref(), symbol.filename(), symbol.lineno());
+        });
+        named
+    }
+
+    #[cfg(all(target_os = "linux", feature = "stack-dumps"))]
+    fn write_symbol(
+        out: &mut String,
+        ip: usize,
+        name: Option<&str>,
+        file: Option<&std::path::Path>,
+        line: Option<u32>,
+    ) {
+        use std::fmt::Write as _;
+        let _ = write!(out, "    {} (ip {ip:#x})", name.unwrap_or("<unknown>"));
+        match (file, line) {
+            (Some(file), Some(line)) => {
+                let _ = writeln!(out, " ({}:{line})", file.display());
+            }
+            (Some(file), None) => {
+                let _ = writeln!(out, " ({})", file.display());
+            }
+            _ => {
+                let _ = writeln!(out);
+            }
+        }
+    }
+
+    #[cfg(all(test, target_os = "linux", feature = "stack-dumps"))]
+    mod tests {
+        use super::write_sampled_frame;
+
+        #[inline(never)]
+        fn source_location_probe() -> usize {
+            std::hint::black_box(42)
+        }
+
+        #[test]
+        fn sampled_pc_at_function_entry_belongs_to_that_function() {
+            // Deterministic boundary case: PC - 1 belongs to a different
+            // function. A sampled PC must be looked up without that offset.
+            let ip = source_location_probe as *const () as usize;
+            let mut out = String::new();
+            assert!(write_sampled_frame(&mut out, ip));
+            assert!(out.contains("source_location_probe"), "{out}");
+            assert!(out.contains("watchdog.rs:"), "{out}");
+            assert!(out.contains(&format!("ip {ip:#x}")), "{out}");
+        }
+
+        #[test]
+        fn an_unknown_sample_has_no_invented_source_location() {
+            let mut out = String::new();
+            assert!(!write_sampled_frame(&mut out, 0));
+            assert!(!write_sampled_frame(&mut out, usize::MAX));
+            assert!(out.is_empty());
+        }
     }
 
     #[cfg(not(all(target_os = "linux", feature = "stack-dumps")))]
