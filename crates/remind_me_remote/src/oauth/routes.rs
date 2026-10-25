@@ -5,7 +5,7 @@
 //!
 //! Every handler that touches [`Provider`] (and therefore
 //! [`remind_me_core::remote::OAuthStateStore`]'s small JSON file) runs that
-//! call through [`run_blocking`] — `tokio::task::spawn_blocking`, mirroring
+//! call through [`run_blocking`] — `rusty_tokio::spawn_blocking`, mirroring
 //! the reference's own `asyncio.to_thread` (PF-06 conventions) and this
 //! crate's established precedent in `handler.rs`.
 //!
@@ -42,13 +42,10 @@
 
 use std::sync::Arc;
 
-use axum::body::Body;
-use axum::extract::{Form, Query, Request, State};
-use axum::http::{header, StatusCode};
-use axum::middleware::Next;
-use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post};
-use axum::{Json, Router};
+use rusty_axum::response::Html;
+use rusty_axum::routing::{get, post};
+use rusty_axum::{Form, IntoResponse, Json, Query, Request, Response, Router, State, StatusCode};
+use rusty_mcp_server::Mount;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -107,10 +104,23 @@ where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
-    tokio::task::spawn_blocking(f)
+    rusty_tokio::spawn_blocking(f)
         .await
         .map_err(|_| BlockingTaskPanicked)
 }
+
+/// `response` with each of `headers` set.
+fn with_headers(response: impl IntoResponse, headers: &[(&str, &str)]) -> Response {
+    headers
+        .iter()
+        .fold(response.into_response(), |r, (name, value)| {
+            r.with_header(name, value)
+        })
+}
+
+const NO_STORE: (&str, &str) = ("cache-control", "no-store");
+const NO_CACHE: (&str, &str) = ("pragma", "no-cache");
+const PUBLIC_HOUR: (&str, &str) = ("cache-control", "public, max-age=3600");
 
 // ---------------------------------------------------------------------------
 // Metadata (RFC 8414 / RFC 9728)
@@ -129,12 +139,7 @@ async fn as_metadata(State(state): State<OAuthAppState>) -> Response {
         "revocation_endpoint_auth_methods_supported": ["client_secret_post", "client_secret_basic"],
         "code_challenge_methods_supported": ["S256"],
     });
-    (
-        StatusCode::OK,
-        [(header::CACHE_CONTROL, "public, max-age=3600")],
-        Json(body),
-    )
-        .into_response()
+    with_headers(Json(body), &[PUBLIC_HOUR])
 }
 
 async fn protected_resource_metadata(State(state): State<OAuthAppState>) -> Response {
@@ -145,12 +150,7 @@ async fn protected_resource_metadata(State(state): State<OAuthAppState>) -> Resp
         "bearer_methods_supported": ["header"],
         "resource_name": "remind_me",
     });
-    (
-        StatusCode::OK,
-        [(header::CACHE_CONTROL, "public, max-age=3600")],
-        Json(body),
-    )
-        .into_response()
+    with_headers(Json(body), &[PUBLIC_HOUR])
 }
 
 // ---------------------------------------------------------------------------
@@ -197,14 +197,7 @@ fn construct_redirect_uri(base: &str, params: &[(&str, Option<&str>)]) -> String
 }
 
 fn redirect_to(location: &str) -> Response {
-    (
-        StatusCode::FOUND,
-        [
-            (header::LOCATION, location),
-            (header::CACHE_CONTROL, "no-store"),
-        ],
-    )
-        .into_response()
+    with_headers(StatusCode::FOUND, &[("location", location), NO_STORE])
 }
 
 // ---------------------------------------------------------------------------
@@ -242,12 +235,7 @@ fn authorize_json_error(error: &str, description: &str, request_state: Option<St
     if let Some(s) = request_state {
         body["state"] = json!(s);
     }
-    (
-        StatusCode::BAD_REQUEST,
-        [(header::CACHE_CONTROL, "no-store")],
-        Json(body),
-    )
-        .into_response()
+    with_headers((StatusCode::BAD_REQUEST, Json(body)), &[NO_STORE])
 }
 
 fn authorize_redirect_error(
@@ -449,12 +437,10 @@ async fn consent_get(
         return (StatusCode::BAD_REQUEST, Html(EXPIRED_HTML)).into_response();
     };
     let name = view.client_name.unwrap_or(view.client_id);
-    (
-        StatusCode::OK,
-        [(header::CACHE_CONTROL, "no-store")],
+    with_headers(
         Html(consent_html(&name, &view.redirect_uri, &txn)),
+        &[NO_STORE],
     )
-        .into_response()
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -519,27 +505,17 @@ struct TokenForm {
 }
 
 fn token_error(status: StatusCode, error: &str, description: &str) -> Response {
-    (
-        status,
-        [
-            (header::CACHE_CONTROL, "no-store"),
-            (header::PRAGMA, "no-cache"),
-        ],
-        Json(json!({ "error": error, "error_description": description })),
+    with_headers(
+        (
+            status,
+            Json(json!({ "error": error, "error_description": description })),
+        ),
+        &[NO_STORE, NO_CACHE],
     )
-        .into_response()
 }
 
 fn token_success(tokens: super::types::TokenResponse) -> Response {
-    (
-        StatusCode::OK,
-        [
-            (header::CACHE_CONTROL, "no-store"),
-            (header::PRAGMA, "no-cache"),
-        ],
-        Json(tokens),
-    )
-        .into_response()
+    with_headers(Json(tokens), &[NO_STORE, NO_CACHE])
 }
 
 async fn token(State(state): State<OAuthAppState>, Form(form): Form<TokenForm>) -> Response {
@@ -855,14 +831,7 @@ async fn revoke(State(state): State<OAuthAppState>, Form(form): Form<RevokeForm>
         }
     }
 
-    (
-        StatusCode::OK,
-        [
-            (header::CACHE_CONTROL, "no-store"),
-            (header::PRAGMA, "no-cache"),
-        ],
-    )
-        .into_response()
+    with_headers(StatusCode::OK, &[NO_STORE, NO_CACHE])
 }
 
 // ---------------------------------------------------------------------------
@@ -874,29 +843,24 @@ fn unauthorized_bearer(state: &OAuthAppState) -> Response {
     let www_authenticate = format!(
         "Bearer error=\"invalid_token\", error_description=\"Authentication required\", resource_metadata=\"{resource_metadata}\""
     );
-    (
-        StatusCode::UNAUTHORIZED,
-        [(header::WWW_AUTHENTICATE, www_authenticate.as_str())],
-        Json(json!({ "error": "invalid_token", "error_description": "Authentication required" })),
+    with_headers(
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(
+                json!({ "error": "invalid_token", "error_description": "Authentication required" }),
+            ),
+        ),
+        &[("www-authenticate", &www_authenticate)],
     )
-        .into_response()
 }
 
 /// Require a valid bearer token (an issued OAuth access token, or the
-/// legacy connector token) before letting a request reach `/mcp`. Layered
-/// only onto the `/mcp` route by `server::build_router` — every other OAuth
-/// route authenticates itself differently (owner-credential consent,
-/// client_id lookup, ...).
-pub async fn require_bearer(
-    State(state): State<OAuthAppState>,
-    request: Request<Body>,
-    next: Next,
-) -> Response {
-    let header_value = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+/// legacy connector token) before letting a request reach `mcp`. Wraps only
+/// the `/mcp` handler in `server::build_router` — every other OAuth route
+/// authenticates itself differently (owner-credential consent, client_id
+/// lookup, ...).
+pub async fn require_bearer(state: OAuthAppState, mcp: Mount, request: Request) -> Response {
+    let header_value = request.headers().get("authorization").unwrap_or("");
     let Some(token) = rusty_oauth::bearer::token_from_authorization(header_value) else {
         return unauthorized_bearer(&state);
     };
@@ -911,7 +875,7 @@ pub async fn require_bearer(
     if verified.is_none() {
         return unauthorized_bearer(&state);
     }
-    next.run(request).await
+    mcp.call(request).await
 }
 
 // ---------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-//! Integration tests driving the real axum/rmcp server over HTTP.
+//! Integration tests driving the real `rusty_axum` server over HTTP.
 //!
 //! These exercise `remind_me_remote::build_router` exactly as production
 //! uses it (default `StreamableHttpServerConfig`, so real session-managed
@@ -8,6 +8,8 @@
 //! tests alone can't cover `ServerHandler` dispatch (its `RequestContext`
 //! has no public constructor outside `rmcp`): this file is where that
 //! coverage lives instead.
+
+mod common;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -25,12 +27,7 @@ async fn spawn_server() -> SocketAddr {
     let db = Database::open_in_memory().unwrap();
     let mcp = Arc::new(McpServer::new(db));
     let router = remind_me_remote::build_router(mcp, TOKEN.to_string(), None).unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, router).await;
-    });
-    addr
+    common::serve(router)
 }
 
 /// Extract every JSON payload carried by an SSE response body's `data:`
@@ -172,6 +169,30 @@ async fn a_wrong_secret_path_token_404s_identically_to_an_unrelated_path() {
         wrong_token.text().await.unwrap(),
         unrelated.text().await.unwrap()
     );
+}
+
+#[tokio::test]
+async fn a_body_over_four_mib_is_refused_with_413() {
+    use std::io::{Read, Write};
+
+    let addr = spawn_server().await;
+    // Only the head: the server refuses on the declared length, before any
+    // of the body is sent.
+    let head = format!(
+        "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {TOKEN}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        4 * 1024 * 1024 + 1
+    );
+    let reply = tokio::task::spawn_blocking(move || {
+        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        stream.write_all(head.as_bytes()).unwrap();
+        let mut reply = Vec::new();
+        let _ = stream.read_to_end(&mut reply);
+        String::from_utf8_lossy(&reply).into_owned()
+    })
+    .await
+    .unwrap();
+    assert!(reply.starts_with("HTTP/1.1 413"), "{reply}");
 }
 
 #[tokio::test]

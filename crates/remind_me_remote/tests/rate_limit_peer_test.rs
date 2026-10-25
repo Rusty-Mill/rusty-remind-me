@@ -9,6 +9,7 @@
 //! Linux routes by default and macOS does not.
 #![cfg(target_os = "linux")]
 
+mod common;
 #[path = "../../remind_me_core/src/test_env.rs"]
 mod test_env;
 
@@ -29,10 +30,7 @@ async fn spawn_server() -> SocketAddr {
     let db = Database::open_in_memory().unwrap();
     let mcp = Arc::new(McpServer::new(db));
     let router = remind_me_remote::build_router(mcp, "test-token".to_string(), None).unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(remind_me_remote::serve(listener, router));
-    addr
+    common::serve(router)
 }
 
 fn client_from(source: Ipv4Addr) -> reqwest::Client {

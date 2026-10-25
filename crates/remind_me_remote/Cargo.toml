@@ -14,17 +14,19 @@ rusty_percent = { workspace = true }
 rusty_hex = { workspace = true }
 rusty_base64 = { workspace = true }
 rusty_oauth = { workspace = true }
-axum = "0.8"
 remind_me_core.workspace = true
 remind_me_mcp.workspace = true
-rusty_mcp_server = { workspace = true, features = ["http"] }
-rusty_mcp_axum = { workspace = true }
+rusty_axum = { workspace = true }
+rusty_mcp_server = { workspace = true, features = ["http", "rusty-axum"] }
+rusty_tokio = { workspace = true }
 thiserror = "2"
 
 serde = { workspace = true }
 serde_json = "1.0"
 sha256 = "1.5"
-tokio = { version = "1.0", features = ["full"] }
 
 [dev-dependencies]
+# The tests' HTTP client (reqwest) runs on tokio; the server under test runs
+# on its own rusty_tokio runtime.
+tokio = { version = "1.0", features = ["full"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "form", "query"] }

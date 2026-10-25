@@ -7,6 +7,7 @@
 //! (`_register`, `_authorize`, `_pkce_pair`, ...) so this file's coverage
 //! maps onto that one test-for-test where the scenario applies.
 
+mod common;
 #[path = "../../remind_me_core/src/test_env.rs"]
 mod test_env;
 
@@ -98,12 +99,7 @@ async fn spawn_oauth_server() -> SocketAddr {
     let router =
         remind_me_remote::build_router(mcp, OWNER_TOKEN.to_string(), Some(ISSUER.to_string()))
             .expect("a plain http://localhost issuer must validate");
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, router).await;
-    });
-    addr
+    common::serve(router)
 }
 
 /// RFC 7636 PKCE pair: a random verifier and its S256 challenge, using the
@@ -745,6 +741,15 @@ async fn probes_still_fail_closed_in_oauth_mode() {
         .unwrap();
     assert_eq!(unrelated.status(), 404);
 
+    // The gate passes every `/.well-known/` path through; one no route
+    // serves is still 404, not the MCP endpoint's 401.
+    let unknown_metadata = client
+        .get(format!("http://{addr}/.well-known/not-a-document"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown_metadata.status(), 404);
+
     let health = client
         .get(format!("http://{addr}/health"))
         .send()
@@ -783,11 +788,7 @@ async fn build_router_without_an_issuer_serves_the_plain_ft05_app_with_no_oauth_
     let db = Database::open_in_memory().unwrap();
     let mcp = Arc::new(McpServer::new(db));
     let router = remind_me_remote::build_router(mcp, OWNER_TOKEN.to_string(), None).unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, router).await;
-    });
+    let addr = common::serve(router);
 
     for path in [
         "/authorize",

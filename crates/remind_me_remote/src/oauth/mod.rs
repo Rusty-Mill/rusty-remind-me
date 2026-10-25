@@ -35,7 +35,7 @@
 //!   RFC 6749 §5.1 token response.
 //! - [`provider`] — the policy layer: consent, issuance, refresh rotation,
 //!   revocation, over [`remind_me_core::remote::OAuthStateStore`].
-//! - [`routes`] — the axum routes and the bearer-auth gate in front of
+//! - [`routes`] — the `rusty_axum` routes and the bearer-auth gate in front of
 //!   `/mcp`.
 //!
 //! # No new dependency

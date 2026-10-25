@@ -97,9 +97,9 @@ without a spawned process.
     happens once a key *is* set, the `/health` carve-out, and read-scoped
     keys — and is not restated here.
 - **`remind_me_cli`**: The unified CLI binary executable (`rusty-remind-me`) handling command line flags and subcommand dispatch (`server`, `api`, `remote`, `configure`, `add`, `search`, `get`, `entity`, `wiki-write`, `wiki-read`, `wiki-import`, `stats`).
-- **`remind_me_remote`**: The Streamable HTTP MCP connector, on `tokio` + `axum` + `rmcp` (the one place this workspace takes on that async stack — every other crate stays synchronous, a deliberate boundary; see `crates/remind_me_remote/src/lib.rs`'s module doc):
+- **`remind_me_remote`**: The Streamable HTTP MCP connector, on `rusty_tokio` + `rusty_axum` + `rusty_mcp_server` (the one place this workspace takes on an async stack — every other crate stays synchronous, a deliberate boundary; see `crates/remind_me_remote/src/lib.rs`'s module doc):
   - Secret-path/bearer auth (FT-05) and, when an issuer is configured, a hand-rolled OAuth 2.1 authorization server (FT-07, `docs/adr/0011`).
-  - `RemindMeHandler` adapts `remind_me_mcp::McpServer::handle_request` (synchronous) to `rmcp`'s async `ServerHandler` trait via `spawn_blocking`, rather than reimplementing tool/resource/prompt dispatch.
+  - `handler::describe` turns `remind_me_mcp::Handler` (synchronous) into a `rusty_mcp_server` server, whose HTTP handler runs each request on a blocking thread, rather than reimplementing tool/resource/prompt dispatch.
 - **`remind_me_hub`**: The central multi-node sync server (`rusty-remind-me-hub` binary) speaking the same push/pull peer protocol `remind_me_core::sync` serves node-to-node, storing its data in the embedded `rusty_multimodal_db` engine (`docs/adr/0021`); its Postgres and SQLite stores (`docs/adr/0015`) are retired, and `rusty-remind-me-hub-copy` moves an old hub onto the engine. A hub never pulls; nodes push to and pull from it.
 
 ---
