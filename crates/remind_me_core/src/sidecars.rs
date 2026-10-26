@@ -581,17 +581,15 @@ mod tests {
     /// nothing, forever.
     #[test]
     fn a_closed_port_reads_as_closed() {
-        // Bind and immediately drop, so the port is real but unbound. A test
-        // running alongside (`a_listening_port_reads_as_open`, the daemon's)
-        // can bind the same freed port before the probe, so a port that reads
-        // open is tried again with a fresh one: one must read closed.
-        let closed_once = (0..5).any(|_| {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let port = listener.local_addr().unwrap().port();
-            drop(listener);
-            !port_open("127.0.0.1", port)
-        });
-        assert!(closed_once);
+        // A real port this test owns and nothing listens on: the local end of
+        // a live connection. While `client` is open no other socket can bind
+        // the port, so the probe is refused. A port freed by dropping a
+        // listener is not owned: a parallel test that binds port 0 can be
+        // handed it before the probe runs, and the probe then finds it open.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let port = client.local_addr().unwrap().port();
+        assert!(!port_open("127.0.0.1", port));
     }
 
     #[test]
