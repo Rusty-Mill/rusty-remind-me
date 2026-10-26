@@ -1,12 +1,13 @@
 //! The brief a session starts with: what is worth knowing before the first
 //! prompt, within a character budget.
 //!
-//! Five sections, in this order, each omitted when empty:
+//! Six sections, in this order, each omitted when empty:
 //! 1. persona (the durable statements the refinement ladder promoted),
 //! 2. reminders due within a week (overdue ones included),
-//! 3. open action items for the project,
-//! 4. the project's most recent memories, the current branch's first,
-//! 5. the best matches for the user's prompt, when one is given.
+//! 3. the project's decisions due for a follow-up review (`crate::review`),
+//! 4. open action items for the project,
+//! 5. the project's most recent memories, the current branch's first,
+//! 6. the best matches for the user's prompt, when one is given.
 //!
 //! Trimming happens at section boundaries: a section that does not fit the
 //! remaining budget is dropped whole and named in `dropped`, never cut
@@ -23,6 +24,8 @@ use serde::Serialize;
 pub const RECENT_LIMIT: usize = 8;
 /// Open action items listed.
 pub const ACTION_LIMIT: usize = 8;
+/// Decisions due for review listed.
+pub const REVIEW_LIMIT: usize = 5;
 /// Prompt hits listed.
 pub const HIT_LIMIT: usize = 5;
 /// Persona statements listed.
@@ -50,6 +53,7 @@ pub struct ContextRequest<'a> {
 pub struct SectionCounts {
     pub persona: usize,
     pub reminders: usize,
+    pub reviews: usize,
     pub action_items: usize,
     pub recent: usize,
     pub hits: usize,
@@ -87,15 +91,28 @@ fn line_of(memory: &Memory) -> String {
 }
 
 /// Not superseded, not expired, not sensitive, not a raw dialog: what is fit
-/// to inject unasked.
-fn injectable(memory: &Memory, now: &str) -> bool {
+/// to inject unasked. Shared with [`crate::review::due_among`].
+pub(crate) fn injectable(memory: &Memory, now: &str) -> bool {
     memory.superseded_by.is_none()
         && !memory.sensitive
         && memory.category != crate::models::DIALOG_CATEGORY
         && memory
             .valid_until
             .as_deref()
-            .is_none_or(|until| until > now)
+            .is_none_or(|until| not_yet(until, now))
+}
+
+/// Whether `until` is after `now`, both RFC 3339. Compared as instants: as
+/// text, `13:00+02:00` (11:00Z) sorts after `12:00Z`. Text order is the
+/// fallback only for a value that does not parse.
+fn not_yet(until: &str, now: &str) -> bool {
+    match (
+        chrono::DateTime::parse_from_rfc3339(until),
+        chrono::DateTime::parse_from_rfc3339(now),
+    ) {
+        (Ok(until), Ok(now)) => until > now,
+        _ => until > now,
+    }
 }
 
 /// Filter on `project` with the same rule search and list use (case-insensitive).
@@ -133,6 +150,22 @@ fn reminders_section(store: &Store<'_>) -> Result<Section> {
         heading: "Reminders due within 7 days",
         lines,
     })
+}
+
+fn reviews_section(memories: &[Memory], project: Option<&str>) -> Section {
+    let lines = crate::review::due_among(memories, Utc::now(), project)
+        .into_iter()
+        .take(REVIEW_LIMIT)
+        .map(|m| {
+            let due = crate::review::review_due(m).unwrap_or("");
+            format!("- due {due}: {}", line_of(m))
+        })
+        .collect();
+    Section {
+        name: "reviews",
+        heading: "Decisions to review: did they hold up?",
+        lines,
+    }
 }
 
 fn is_open_action(memory: &Memory) -> bool {
@@ -217,6 +250,7 @@ pub fn build(store: &Store<'_>, request: &ContextRequest<'_>) -> Result<ContextB
     let mut sections = vec![
         persona_section(store)?,
         reminders_section(store)?,
+        reviews_section(&memories, request.project),
         action_section(&memories, request.project, &now),
         recent_section(&memories, request.project, request.branch, &now),
     ];
@@ -264,6 +298,7 @@ fn assemble(sections: Vec<Section>, request: &ContextRequest<'_>) -> ContextBrie
         match section.name {
             "persona" => counts.persona = n,
             "reminders" => counts.reminders = n,
+            "reviews" => counts.reviews = n,
             "action_items" => counts.action_items = n,
             "recent" => counts.recent = n,
             _ => counts.hits = n,
@@ -284,6 +319,14 @@ fn assemble(sections: Vec<Section>, request: &ContextRequest<'_>) -> ContextBrie
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expiry_compares_instants_not_text() {
+        let now = "2026-10-26T12:00:00+00:00";
+        assert!(!not_yet("2026-10-26T13:00:00+02:00", now));
+        assert!(not_yet("2026-10-26T15:00:00+02:00", now));
+        assert!(!not_yet("2026-10-26T12:00:00Z", now));
+    }
     use crate::db::memories::NewMemory;
     use crate::db::Database;
 

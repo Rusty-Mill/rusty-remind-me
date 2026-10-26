@@ -23,7 +23,7 @@ before answering anything about the user, their projects or past decisions. Call
 for each durable fact, decision or preference the user states, passing memory_type (a decision \
 needs metadata.rationale) and confidence when known. Call remind_me_auto_capture at the end of \
 any substantive conversation. Close decisions and action items with remind_me_resolve when they \
-are done, abandoned or reverted.";
+are done, abandoned or reverted, and with its `review` once a due decision held up or not.";
 
 /// A tool error's text: a rejected input reads as such, anything else is
 /// the store's failure, under `prefix`.
@@ -1535,15 +1535,16 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_resolve",
-                                "description": "Close a decision or action item as done, abandoned, reverted or superseded. A reverted or abandoned one loses half its weight so it stops outranking what replaced it; the prior state is kept in history.",
+                                "description": "Close a decision or action item as done, abandoned, reverted or superseded (`outcome`), or record a decision's follow-up review (`review`): whether it held up, which is separate from whether it was carried out. Pass exactly one. A reverted or abandoned one loses half its weight so it stops outranking what replaced it; the prior state is kept in history.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
                                         "memory_id": { "type": "string" },
                                         "outcome": { "type": "string", "enum": ["done", "abandoned", "reverted", "superseded"] },
-                                        "note": { "type": "string", "description": "Why; stored as metadata.outcome_note." }
+                                        "review": { "type": "string", "enum": ["held", "revised", "reverted"], "description": "Decisions only. `reverted` also sets outcome to reverted." },
+                                        "note": { "type": "string", "description": "Why; stored as metadata.outcome_note, or metadata.review.note for a review." }
                                     },
-                                    "required": ["memory_id", "outcome"]
+                                    "required": ["memory_id"]
                                 }
                             },
                             {
@@ -3424,15 +3425,27 @@ impl McpServer {
                     }
                     "remind_me_resolve" => {
                         let memory_id = args.get("memory_id").and_then(Value::as_str).unwrap_or("");
-                        let outcome = args.get("outcome").and_then(Value::as_str).unwrap_or("");
+                        let outcome = args.get("outcome").and_then(Value::as_str);
+                        let review = args.get("review").and_then(Value::as_str);
                         let note = args.get("note").and_then(Value::as_str);
-                        match remind_me_core::resolve::resolve_memory(
-                            &store, memory_id, outcome, note,
-                        ) {
-                            Ok(Some(mem)) => {
+                        let resolved = match (outcome, review) {
+                            (Some(outcome), None) => remind_me_core::resolve::resolve_memory(
+                                &store, memory_id, outcome, note,
+                            )
+                            .map(|m| m.map(|m| (m, format!("resolved as {outcome}")))),
+                            (None, Some(review)) => remind_me_core::review::record_review(
+                                &store, memory_id, review, note,
+                            )
+                            .map(|m| m.map(|m| (m, format!("reviewed: {review}")))),
+                            _ => Err(remind_me_core::db::StoreError::Invalid(
+                                "pass exactly one of `outcome` and `review`".to_string(),
+                            )),
+                        };
+                        match resolved {
+                            Ok(Some((mem, done))) => {
                                 json!({ "content": [{ "type": "text", "text": match format {
                                     ResponseFormat::Json => serde_json::to_string_pretty(&mem).unwrap(),
-                                    ResponseFormat::Markdown => format!("✓ Memory `{}` resolved as {}.", mem.id, outcome),
+                                    ResponseFormat::Markdown => format!("✓ Memory `{}` {}.", mem.id, done),
                                 } }] })
                             }
                             Ok(None) => {
@@ -6242,10 +6255,12 @@ mod structure_tests {
     #[test]
     fn resolve_is_listed_and_demotes_a_reverted_decision() {
         let s = server();
-        assert!(tool(&s, "remind_me_resolve")["inputSchema"]["required"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("outcome")));
+        let schema = &tool(&s, "remind_me_resolve")["inputSchema"];
+        assert_eq!(schema["required"], json!(["memory_id"]));
+        assert_eq!(
+            schema["properties"]["review"]["enum"],
+            json!(["held", "revised", "reverted"])
+        );
         let id = stored_id(&call(
             &s,
             "remind_me_add",
@@ -6274,6 +6289,54 @@ mod structure_tests {
             json!({ "memory_id": id, "outcome": "meh" }),
         );
         assert!(is_error(&bad) && text(&bad).contains("outcome"));
+    }
+
+    #[test]
+    fn resolve_records_a_review_separately_from_the_outcome() {
+        let s = server();
+        let id = stored_id(&call(
+            &s,
+            "remind_me_add",
+            json!({ "content": "adopt Y", "memory_type": "decision",
+                    "metadata": { "rationale": "r" } }),
+        ));
+        call(
+            &s,
+            "remind_me_resolve",
+            json!({ "memory_id": id, "outcome": "done" }),
+        );
+        let reviewed = call(
+            &s,
+            "remind_me_resolve",
+            json!({ "memory_id": id, "review": "held", "note": "fewer pages" }),
+        );
+        assert!(!is_error(&reviewed), "{}", text(&reviewed));
+        let m: Value = serde_json::from_str(&text(&reviewed)).unwrap();
+        assert_eq!(m["outcome"], "done");
+        assert_eq!(m["metadata"]["review"]["outcome"], "held");
+        assert_eq!(m["metadata"]["review"]["note"], "fewer pages");
+
+        for args in [
+            json!({ "memory_id": id }),
+            json!({ "memory_id": id, "outcome": "done", "review": "held" }),
+        ] {
+            let both = call(&s, "remind_me_resolve", args);
+            assert!(
+                is_error(&both) && text(&both).contains("exactly one"),
+                "{}",
+                text(&both)
+            );
+        }
+        let bad = call(
+            &s,
+            "remind_me_resolve",
+            json!({ "memory_id": id, "review": "fine" }),
+        );
+        assert!(
+            is_error(&bad) && text(&bad).contains("review"),
+            "{}",
+            text(&bad)
+        );
     }
 
     #[test]

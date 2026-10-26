@@ -57,6 +57,12 @@ pub enum Op {
         outcome: String,
         note: Option<String>,
     },
+    /// Record a decision's follow-up review; see [`crate::review`].
+    Review {
+        memory_id: String,
+        outcome: String,
+        note: Option<String>,
+    },
     Stats,
     /// The session subcommands (`crate::session_ops`). Paths are absolute.
     SessionStart {
@@ -143,6 +149,16 @@ fn run(store: &Store<'_>, op: &Op) -> Result<Value, String> {
             outcome,
             note,
         } => to_value(crate::resolve::resolve_memory(
+            store,
+            memory_id,
+            outcome,
+            note.as_deref(),
+        )),
+        Op::Review {
+            memory_id,
+            outcome,
+            note,
+        } => to_value(crate::review::record_review(
             store,
             memory_id,
             outcome,
@@ -284,6 +300,25 @@ mod tests {
         .unwrap();
         let done: Option<Memory> = resolve(&decision.id, "done").into_result().unwrap();
         assert_eq!(done.unwrap().outcome.as_deref(), Some("done"));
+
+        // Executed is not the same as held up: the review is its own call.
+        let review = |id: &str, outcome: &str| {
+            execute(
+                &store,
+                &Op::Review {
+                    memory_id: id.into(),
+                    outcome: outcome.into(),
+                    note: Some("still right".into()),
+                },
+            )
+        };
+        assert!(decision.metadata["review"]["due"].is_string());
+        let held: Option<Memory> = review(&decision.id, "held").into_result().unwrap();
+        let held = held.unwrap();
+        assert_eq!(held.metadata["review"]["outcome"], "held");
+        assert_eq!(held.outcome.as_deref(), Some("done"));
+        assert!(matches!(review(&note.id, "held"), OpReply::Err(_)));
+        assert!(matches!(review(&decision.id, "fine"), OpReply::Err(_)));
     }
 
     #[test]

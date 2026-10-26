@@ -24,7 +24,7 @@
 
 use crate::db::Result;
 use crate::db::Store;
-use crate::models::{DigestData, DigestReminder, ReminderWindow, SyncStatus};
+use crate::models::{DigestData, DigestReminder, DigestReview, ReminderWindow, SyncStatus};
 use crate::vitality::build_vitality_report;
 
 /// Days back that count as "recent" by default.
@@ -39,16 +39,30 @@ pub const DIGEST_SINCE_DAYS_MAX: i64 = 365;
 /// Cap on the reminders listed per section.
 pub const MAX_DIGEST_REMINDERS: i64 = 10;
 
-/// Project a memory down to what the digest shows for a reminder.
-fn digest_reminder(memory: &crate::models::Memory) -> DigestReminder {
+/// A memory's content cut to the digest's 120 characters.
+fn snippet(memory: &crate::models::Memory) -> String {
     let mut content: String = memory.content.chars().take(120).collect();
     if memory.content.chars().count() > 120 {
         content.push('…');
     }
+    content
+}
+
+/// Project a memory down to what the digest shows for a reminder.
+fn digest_reminder(memory: &crate::models::Memory) -> DigestReminder {
     DigestReminder {
         id: memory.id.clone(),
         remind_at: memory.remind_at.clone(),
-        content,
+        content: snippet(memory),
+    }
+}
+
+/// Project a decision down to what the digest shows for a due review.
+fn digest_review(memory: &crate::models::Memory) -> DigestReview {
+    DigestReview {
+        id: memory.id.clone(),
+        due: crate::review::review_due(memory).unwrap_or("").to_string(),
+        content: snippet(memory),
     }
 }
 
@@ -85,6 +99,11 @@ pub fn build_digest(store: &Store<'_>, since_days: i64) -> Result<DigestData> {
         .iter()
         .map(digest_reminder)
         .collect(),
+        // Shared with the session brief, so the two agree on what is due.
+        reviews_due: crate::review::list_due(store, None, MAX_DIGEST_REMINDERS as usize)?
+            .iter()
+            .map(digest_review)
+            .collect(),
         // Local-only, no network: the digest has to stay callable from a
         // scheduled path that cannot afford to block on a remote. The
         // hub-reconcile verdict is a network call and stays out.
@@ -170,6 +189,21 @@ pub fn render_markdown(data: &DigestData) -> String {
             }
         }
         out.push('\n');
+    }
+
+    out.push_str("## Decisions to review\n\n");
+    if data.reviews_due.is_empty() {
+        out.push_str("_None due._\n\n");
+    } else {
+        for review in &data.reviews_due {
+            out.push_str(&format!(
+                "- `{}` due {}: {}\n",
+                review.id, review.due, review.content
+            ));
+        }
+        out.push_str(
+            "\n_Record each with `remind_me_resolve` and `review`: held, revised or reverted._\n\n",
+        );
     }
 
     out.push_str("## Sync health\n\n");

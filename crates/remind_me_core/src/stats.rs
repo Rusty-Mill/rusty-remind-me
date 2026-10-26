@@ -36,6 +36,9 @@ pub struct Stats {
     /// The projects with the most memories, busiest first.
     #[serde(default)]
     pub by_project: Vec<ProjectCount>,
+    /// Decisions by follow-up review state ([`crate::review`]).
+    #[serde(default)]
+    pub decisions: crate::review::DecisionReport,
     pub db_path: String,
     pub db_size_mb: f64,
 }
@@ -129,6 +132,7 @@ pub fn collect(store: &Store<'_>) -> Result<Stats> {
         sources: stats.count_by(GroupBy::Source)?,
         recent: stats.recent(RECENT_LIMIT as i64)?,
         by_project: top_projects(stats.count_by(GroupBy::Project)?, TOP_PROJECTS),
+        decisions: crate::review::report(store)?,
         db_path: path_text(&info),
         db_size_mb: size_mb(&info),
     })
@@ -189,6 +193,8 @@ pub fn render_markdown(stats: &Stats) -> String {
             lines.push(format!("- **{}**: {}", entry.project, entry.count));
         }
     }
+    lines.push(String::new());
+    lines.push(crate::review::render_markdown(&stats.decisions));
     lines.push(String::new());
     lines.push("### Recent Memories".to_string());
     for recent in &stats.recent {
