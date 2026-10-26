@@ -1,6 +1,6 @@
 # ADR-0027: Projects are entities with evidenced claims
 
-Status: Proposed (2026-10-26); awaiting owner approval, not implemented
+Status: Accepted (2026-10-26, owner approval); not yet implemented
 Date: 2026-10-26
 Board: Mill Board #57
 
