@@ -125,6 +125,16 @@ impl MemoryRow {
         )
     }
 
+    /// Whether this row passes a search's sensitivity, category, scope and
+    /// time-window filters. Vitality needs the converted memory, so it is not
+    /// checked here.
+    pub(crate) fn admits(&self, filter: &KeywordFilter) -> bool {
+        (filter.include_sensitive || !self.sensitive)
+            && filter.category.as_ref().is_none_or(|c| &self.category == c)
+            && self.in_scope(&filter.scope)
+            && filter.window.contains(&self.created_at, &self.updated_at)
+    }
+
     /// `row` as an `INSERT` of it stores it.
     pub(crate) fn from_new(row: &NewMemory) -> Self {
         Self {
@@ -1198,17 +1208,40 @@ pub(crate) fn keyword_hits(
     let now = chrono::Utc::now();
     Ok(ranked(core_ref(tables)?, phrases)
         .into_iter()
-        .filter(|(row, _)| filter.include_sensitive || !row.sensitive)
-        .filter(|(row, _)| filter.category.as_ref().is_none_or(|c| &row.category == c))
-        .filter(|(row, _)| row.in_scope(&filter.scope))
+        .filter(|(row, _)| row.admits(filter))
         .map(|(row, score)| (row.to_memory(), score))
-        .filter(|(memory, _)| {
-            filter
-                .min_effective_vitality
-                .is_none_or(|floor| crate::vitality::effective_vitality(memory, now) >= floor)
-        })
+        .filter(|(memory, _)| vital_enough(filter, memory, now))
         .take(limit)
         .collect())
+}
+
+/// What `Memories::window_hits` selects: every live, unsuperseded row
+/// `filter` admits, newest first on the window's timestamp (ties by id).
+pub(crate) fn window_hits(tables: &EngineTables, filter: &KeywordFilter) -> Result<Vec<Memory>> {
+    let now = chrono::Utc::now();
+    let field = |row: &MemoryRow| {
+        crate::time_window::parse_rfc3339(filter.window.pick(&row.created_at, &row.updated_at))
+    };
+    let mut hits: Vec<MemoryRow> = rows(core_ref(tables)?)
+        .filter(|row| row.is_live() && row.admits(filter))
+        .collect();
+    hits.sort_by(|a, b| field(b).cmp(&field(a)).then_with(|| a.id.cmp(&b.id)));
+    Ok(hits
+        .into_iter()
+        .map(|row| row.to_memory())
+        .filter(|memory| vital_enough(filter, memory, now))
+        .collect())
+}
+
+/// `filter`'s effective-vitality floor, as of `now`.
+fn vital_enough(
+    filter: &KeywordFilter,
+    memory: &Memory,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    filter
+        .min_effective_vitality
+        .is_none_or(|floor| crate::vitality::effective_vitality(memory, now) >= floor)
 }
 
 pub(crate) fn sensitive_ids(tables: &EngineTables) -> Result<HashSet<String>> {

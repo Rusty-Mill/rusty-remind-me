@@ -10,7 +10,7 @@ use crate::db::curation::{Backlog, CaptureActivity, CaptureRow, ImportRow, Norma
 use crate::db::{Result, StoreError};
 use crate::models::{ContradictionSide, Memory};
 use serde_json::Value;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 fn live(row: &MemoryRow) -> bool {
     row.deleted_at.is_none() && row.superseded_by.is_none()
@@ -248,6 +248,78 @@ pub(crate) fn contradiction_pairs(
         .into_iter()
         .filter(|(a, b)| cursor.is_none_or(|(ca, cb)| (a.as_str(), b.as_str()) > (ca, cb)))
         .take(limit)
+        .collect())
+}
+
+/// Whether `row` is a decision still in force: live, not sensitive, and not
+/// resolved as reverted, abandoned or superseded. Sensitive rows are left
+/// out because the result rides an ordinary write's response, which must not
+/// surface them unasked.
+fn standing_decision(row: &MemoryRow) -> bool {
+    live(row)
+        && !row.sensitive
+        && row.memory_type == "decision"
+        && !matches!(
+            row.outcome.as_deref(),
+            Some("reverted" | "abandoned" | "superseded")
+        )
+}
+
+/// Whether two rows were written in the same project, ignoring ASCII case.
+/// Two rows with no project are in the same (unnamed) one; a row with a
+/// project and one without are not, so a claim in one repository is never
+/// matched against a same-named claim in another.
+fn same_project(a: &MemoryRow, b: &MemoryRow) -> bool {
+    match (&a.project, &b.project) {
+        (Some(pa), Some(pb)) => pa.eq_ignore_ascii_case(pb),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// The standing decisions other than `memory_id`, in its project, that make
+/// the same claim as it, or mention an entity it mentions that at most
+/// `max_fanout` memories mention, in id order, each with the names of those
+/// shared entities (by name). Empty when `memory_id` is missing.
+///
+/// One pass over the links finds the saved memory's entities; each entity's
+/// memories then come from the link index, and the claim scan runs only when
+/// the saved memory states a subject and predicate.
+pub(crate) fn decision_neighbours(
+    tables: &EngineTables,
+    memory_id: &str,
+    max_fanout: i64,
+) -> Result<Vec<(String, Vec<String>)>> {
+    let core = core_ref(tables)?;
+    let Some(saved) = memories::row(core, memory_id) else {
+        return Ok(Vec::new());
+    };
+    let mut found: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for entity_id in super::graph::entities_of(core, memory_id) {
+        let ids = super::graph::linked_memory_ids(core, &entity_id);
+        if i64::try_from(ids.len()).unwrap_or(i64::MAX) > max_fanout {
+            continue;
+        }
+        let Some(name) = super::graph::entity_name(core, &entity_id) else {
+            continue;
+        };
+        for id in ids {
+            found.entry(id).or_default().insert(name.clone());
+        }
+    }
+    if saved.subject.is_some() && saved.predicate.is_some() {
+        for row in memories::rows(core).filter(|row| same_claim(row, &saved)) {
+            found.entry(row.id).or_default();
+        }
+    }
+    found.remove(memory_id);
+    Ok(found
+        .into_iter()
+        .filter(|(id, _)| {
+            memories::row(core, id)
+                .is_some_and(|row| standing_decision(&row) && same_project(&row, &saved))
+        })
+        .map(|(id, names)| (id, names.into_iter().collect()))
         .collect())
 }
 

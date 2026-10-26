@@ -60,49 +60,66 @@ pub fn add_memory_with(
     let base_weight = type_prior * source_prior;
     let initial_vitality = calculate_vitality(base_weight, 0, decay_rate, &now_iso, now);
 
-    Memories::new(store).insert(&NewMemory {
-        category: input.category.clone(),
-        tags: input.tags.clone(),
-        source: input.source.clone(),
-        metadata: input.metadata.clone(),
-        subject: input.subject.clone(),
-        predicate: input.predicate.clone(),
-        object: input.object.clone(),
-        decay_rate,
-        vitality: initial_vitality,
-        base_weight,
-        accessed_at: Some(now_iso.clone()),
-        sensitive: input.sensitive,
-        memory_type: fields
-            .memory_type
-            .clone()
-            .unwrap_or_else(|| UNCLASSIFIED.to_string()),
-        confidence: fields
-            .confidence
-            .unwrap_or_else(crate::models::default_confidence),
-        valid_from: fields.valid_from.clone(),
-        valid_until: fields.valid_until.clone(),
-        verified_at: fields.verified_at.clone(),
-        outcome: fields.outcome.clone(),
-        ..crate::context::default_provenance().stamp(NewMemory::new(
-            id.clone(),
-            content.clone(),
-            &now_iso,
-        ))
-    })?;
+    let write = |tx: &Store<'_>| -> Result<()> {
+        Memories::new(tx).insert(&NewMemory {
+            category: input.category.clone(),
+            tags: input.tags.clone(),
+            source: input.source.clone(),
+            metadata: input.metadata.clone(),
+            subject: input.subject.clone(),
+            predicate: input.predicate.clone(),
+            object: input.object.clone(),
+            decay_rate,
+            vitality: initial_vitality,
+            base_weight,
+            accessed_at: Some(now_iso.clone()),
+            sensitive: input.sensitive,
+            memory_type: fields
+                .memory_type
+                .clone()
+                .unwrap_or_else(|| UNCLASSIFIED.to_string()),
+            confidence: fields
+                .confidence
+                .unwrap_or_else(crate::models::default_confidence),
+            valid_from: fields.valid_from.clone(),
+            valid_until: fields.valid_until.clone(),
+            verified_at: fields.verified_at.clone(),
+            outcome: fields.outcome.clone(),
+            ..crate::context::default_provenance().stamp(NewMemory::new(
+                id.clone(),
+                content.clone(),
+                &now_iso,
+            ))
+        })?;
 
-    // `MemoryAddInput::entities` was previously parsed and then dropped, so a
-    // caller supplying entity mentions got a silent no-op. Same path as
-    // `annotate_memories` so both behave identically.
-    crate::boundary::index(
-        store,
-        &id,
-        &content,
-        &input.entities,
-        input.extract,
-        &attachments,
-        &now_iso,
-    )?;
+        // `MemoryAddInput::entities` was previously parsed and then dropped, so a
+        // caller supplying entity mentions got a silent no-op. Same path as
+        // `annotate_memories` so both behave identically.
+        crate::boundary::index(
+            tx,
+            &id,
+            &content,
+            &input.entities,
+            input.extract,
+            &attachments,
+            &now_iso,
+        )?;
+
+        // Stamped, so the change reaches the sync outbox.
+        for old in &input.supersedes {
+            retire(tx, old, &id, &now_iso)?;
+        }
+        Ok(())
+    };
+    // With `supersedes`, one transaction: the insert, its index and every
+    // retirement land together or not at all, and each target is checked
+    // inside it, so no other writer can change it between check and write.
+    // Without, the add stays the plain write it always was.
+    if input.supersedes.is_empty() {
+        write(store)?;
+    } else {
+        store.transaction(write)?;
+    }
 
     // Best-effort: no embedder configured, or one that fails mid-request,
     // leaves this memory keyword-searchable only — never a reason to fail
@@ -122,6 +139,19 @@ pub fn add_memory_with(
     crate::events::emit(crate::events::Event::Created, &memory.id, &memory.category);
 
     Ok(memory)
+}
+
+/// Mark live memory `old` superseded by `new`, refusing one that is missing,
+/// deleted, already superseded or a project claim (claims are append-only).
+fn retire(store: &Store<'_>, old: &str, new: &str, now_iso: &str) -> Result<()> {
+    let target = get_memory_by_id(store, old)?.filter(|m| m.superseded_by.is_none());
+    let Some(target) = target else {
+        return Err(StoreError::Invalid(format!(
+            "supersedes: {old:?} is not a live memory (missing, deleted or already superseded)"
+        )));
+    };
+    crate::project::refuse_claim_edit(&target)?;
+    Memories::new(store).set_superseded_by(old, new, Some(now_iso))
 }
 
 pub fn get_memory_by_id(store: &Store<'_>, id: &str) -> Result<Option<Memory>> {
@@ -641,15 +671,9 @@ pub fn search_memories_deadlined(
 
     // Raw user text is not a valid FTS5 MATCH expression — ordinary punctuation
     // is operator syntax there, so a question like "what's the plan?" was a
-    // syntax error rather than a search. No phrases means nothing was
-    // searchable.
+    // syntax error rather than a search. No phrases leaves nothing to rank —
+    // handled below, once the filter exists.
     let phrases = crate::fts::query_phrases(&input.query);
-    if phrases.is_empty() {
-        let mut outcome = trim_by_token_budget(Vec::new(), input.token_budget, input.detail);
-        timing.elapsed_ms = deadline.elapsed_ms();
-        outcome.timing = timing;
-        return Ok(outcome);
-    }
 
     // Dormancy is filtered on *effective* vitality, inside the query and before
     // its limit: the stored column never decays, and thinning a page after the
@@ -667,7 +691,33 @@ pub fn search_memories_deadlined(
         category: input.category.clone(),
         include_sensitive: input.include_sensitive,
         scope: input.scope.clone(),
+        window: input.window,
     };
+
+    // Nothing to rank. A bounded window still asks a question — "what
+    // happened in the last two days" — so answer it as a newest-first listing;
+    // with no window either, nothing was searchable.
+    // `limit` applies after `apply_validity`, so a dropped or demoted row
+    // gives its place to an eligible one, as in the ranked path.
+    if phrases.is_empty() {
+        let listed = if input.window.is_unbounded() {
+            Vec::new()
+        } else {
+            let hits = memories_repo.window_hits(&filter)?;
+            let mut listed = crate::retrieval::apply_validity(
+                hits.into_iter().map(listed_result).collect(),
+                Utc::now(),
+                input.include_expired,
+                input.min_confidence,
+            );
+            listed.truncate(input.limit);
+            listed
+        };
+        let mut outcome = trim_by_token_budget(listed, input.token_budget, input.detail);
+        timing.elapsed_ms = deadline.elapsed_ms();
+        outcome.timing = timing;
+        return Ok(outcome);
+    }
 
     // `RrfFusion::Score` mode needs the raw BM25 magnitude alongside each hit.
     let mut keyword_memories = Vec::new();
@@ -727,9 +777,11 @@ pub fn search_memories_deadlined(
             // rank into the output. Done here rather than by threading a
             // parameter through `semantic_search_scored`, which would change an
             // existing public signature.
-            // Same reason for the project/branch/session/writer scope.
-            if !input.scope.is_empty() {
-                memories.retain(|m| input.scope.matches_memory(m));
+            // Same reason for the project/branch/session/writer scope and
+            // the time window.
+            if !input.scope.is_empty() || !input.window.is_unbounded() {
+                memories
+                    .retain(|m| input.scope.matches_memory(m) && input.window.contains_memory(m));
                 similarity.retain(|id, _| memories.iter().any(|m| &m.id == id));
             }
             if !input.include_sensitive {
@@ -802,6 +854,24 @@ pub fn search_memories_deadlined(
     timing.elapsed_ms = deadline.elapsed_ms();
     outcome.timing = timing;
     Ok(outcome)
+}
+
+/// A window listing's row. There is no relevance to score, so every row gets
+/// the same 1.0: the newest-first order survives `apply_validity`'s stable
+/// sort, and its validity and confidence factors still push expired and
+/// low-confidence rows down, as they do in a ranked search.
+fn listed_result(memory: Memory) -> MemorySearchResult {
+    MemorySearchResult {
+        memory,
+        score: 1.0,
+        fts_score: None,
+        vec_score: None,
+        recency_score: None,
+        vitality_score: None,
+        idf_score: None,
+        feedback_adjustment: None,
+        rerank_score: None,
+    }
 }
 
 /// Paginated full-text search behind `GET /api/memories/search`.

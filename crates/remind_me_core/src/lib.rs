@@ -74,6 +74,7 @@ pub mod sync;
 pub mod telemetry;
 #[doc(hidden)]
 pub mod testing;
+pub mod time_window;
 pub mod tool_profiles;
 pub mod transcript;
 pub mod undo_import;

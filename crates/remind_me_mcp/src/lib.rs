@@ -183,7 +183,7 @@ use remind_me_core::{
     ExtractBatchInput, FeedbackInput, HistoryInput, ListRemindersInput, MemoryAddInput,
     MemoryListInput, MemorySearchInput, MemoryStatsInput, MemoryUpdateInput, MempalaceImportInput,
     NormalizeApplyInput, NormalizeBatchInput, RecalibrateCandidatesInput, ReclassifyBatchInput,
-    ReclassifyInput, ReconcilePeerInput, ResponseFormat, RevertInput, SaveSearchInput,
+    ReclassifyInput, ReconcilePeerInput, ResponseFormat, RevertInput, SaveSearchInput, SavedMemory,
     SavedSearchNameInput, SearchDetail, SetReminderInput, SyncRepairInput, UndoImportInput,
     UpdateOutcome, WikiDeleteOutcome, ANNOTATE_BATCH_MAX, ANNOTATE_BATCH_MIN,
     CONSOLIDATE_LIMIT_MAX, CONSOLIDATE_LIMIT_MIN, CONSOLIDATE_SIMILARITY_MAX,
@@ -640,7 +640,7 @@ impl McpServer {
                         "tools": [
                             {
                                 "name": "remind_me_add",
-                                "description": "Store a new memory fact, preference, or note.",
+                                "description": "Store a new memory fact, preference, or note. Saving a decision checks it against the standing, non-sensitive decisions in the same project on the same claim or a shared entity and returns likely conflicts as contradiction_candidates; nothing is blocked or superseded automatically. Pass supersedes to retire the old decision in the same call.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -664,7 +664,7 @@ impl McpServer {
                                             }
                                         },
                                         "metadata": { "type": "object", "description": "Free-form JSON stored with the memory; a decision requires a `rationale` string here, an action_item may hold due, owner and status." },
-                                        "subject": { "type": "string", "description": "Subject of a subject-predicate-object fact; a new triple supersedes a live one with the same subject and predicate." },
+                                        "subject": { "type": "string", "description": "Subject of a subject-predicate-object fact. remind_me_add does not supersede a live triple with the same subject and predicate; name it in supersedes to do so." },
                                         "predicate": { "type": "string", "description": "Predicate of the fact triple." },
                                         "object": { "type": "string", "description": "Object of the fact triple." },
                                         "entities": {
@@ -684,7 +684,8 @@ impl McpServer {
                                         "confidence": { "type": "number", "minimum": 0, "maximum": 1, "default": 1, "description": "How far to trust this memory; scales its search ranking." },
                                         "valid_from": { "type": "string", "description": "RFC 3339 time the memory starts to hold; omit for always." },
                                         "valid_until": { "type": "string", "description": "RFC 3339 time it stops holding; after it the memory ranks last and is marked expired." },
-                                        "outcome": { "type": "string", "enum": ["done", "abandoned", "reverted", "superseded"], "description": "Only for decision and action_item memories; prefer remind_me_resolve for an existing one." }
+                                        "outcome": { "type": "string", "enum": ["done", "abandoned", "reverted", "superseded"], "description": "Only for decision and action_item memories; prefer remind_me_resolve for an existing one." },
+                                        "supersedes": { "type": "array", "items": { "type": "string" }, "description": "IDs of live memories this one replaces, e.g. a contradiction_candidates id. Each is marked superseded by the new memory, in one transaction with the add; an id that is missing, deleted, already superseded or a project claim refuses the whole add." }
                                     },
                                     "required": ["content"]
                                 }
@@ -727,7 +728,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_update",
-                                "description": "Update an existing memory's content, category, tags, or metadata.",
+                                "description": "Update an existing memory's content, category, tags, or metadata. A content or type change that leaves a decision returns likely conflicting standing decisions as contradiction_candidates.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -761,12 +762,12 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_search",
-                                "description": "Search memories using FTS5 keyword & hybrid ranking. Returns compact hits by default (id, category, date, tags, score, snippet); fetch full text with remind_me_get memory_ids, or pass detail=full. Hits cut by token_budget are listed by id. The three expansion flags surface adjacent memories in their own sections, outside the ranked results, so they never consume `limit`.",
+                                "description": "Search memories using FTS5 keyword & hybrid ranking. Returns compact hits by default (id, category, date, tags, score, snippet); fetch full text with remind_me_get memory_ids, or pass detail=full. Hits cut by token_budget are listed by id. The three expansion flags surface adjacent memories in their own sections, outside the ranked results, so they never consume `limit`. `since`/`until` narrow to a time window; with an empty `query` they list that window newest-first, e.g. { \"query\": \"\", \"since\": \"2d\" } for the last two days.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
                                         "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "markdown", "description": "markdown (default, as the reference) renders the results; json returns the full envelope including scores." },
-                                        "query": { "type": "string" },
+                                        "query": { "type": "string", "description": "Search text. May be empty when since or until is set, to list that window newest-first." },
                                         "limit": { "type": "integer", "default": 20 },
                                         "detail": { "type": "string", "enum": ["compact", "full"], "default": "compact", "description": "compact (default): one short line per hit, so more hits fit the budget. full: whole memories with metadata and references." },
                                         "token_budget": { "type": "integer", "default": 800, "minimum": 0, "description": "Estimated tokens the hits may use; 0 is unlimited. Hits that do not fit are listed by id." },
@@ -784,6 +785,9 @@ impl McpServer {
                                         "bootstrap": { "type": "boolean", "default": false, "description": "Prepend the durable persona (L3) as context, whether or not it matches the query. Spends up to a quarter of token_budget; the rest still goes to the ranked results." },
                                         "include_expired": { "type": "boolean", "default": true, "description": "Include memories whose valid_until has passed. They always rank after in-window ones; set false to drop them." },
                                         "min_confidence": { "type": "number", "default": 0, "description": "Only return memories at or above this confidence (0 to 1)." },
+                                        "since": { "type": "string", "description": "Only memories at or after this time (inclusive): RFC 3339, or an age back from now like 30m, 12h, 2d, 1w." },
+                                        "until": { "type": "string", "description": "Only memories before this time (exclusive): RFC 3339, or an age back from now like 30m, 12h, 2d, 1w. Must be after since." },
+                                        "time_field": { "type": "string", "enum": ["created", "updated"], "default": "created", "description": "Which timestamp since/until apply to." },
                                         "strategy": { "type": "string", "enum": ["auto", "balanced", "keyword_favored", "semantic_favored"], "default": "auto", "description": "RRF weight profile. Leave at auto (routes by query shape: quoted phrases, prefix* wildcards and very short queries favour keyword relevance; long or question-shaped queries favour semantic similarity) unless deliberately A/B testing a pinned preset." }
                                     },
                                     "required": ["query"]
@@ -1711,9 +1715,10 @@ impl McpServer {
                             Ok((add_input, fields)) => {
                                 match queries::add_memory_with(&store, add_input, &fields) {
                                     Ok(mem) => {
+                                        let check = contradictions::check_on_save(&store, &mem.id);
                                         json!({ "content": [{ "type": "text", "text": match format {
-    ResponseFormat::Json => serde_json::to_string_pretty(&mem).unwrap(),
-    ResponseFormat::Markdown => render::memory_stored(&mem),
+    ResponseFormat::Json => serde_json::to_string_pretty(&SavedMemory { memory: &mem, check }).unwrap(),
+    ResponseFormat::Markdown => render::memory_stored(&mem) + &render::save_check(&check),
 } }] })
                                     }
                                     Err(e) => {
@@ -1799,9 +1804,14 @@ impl McpServer {
                             Ok((update_input, fields)) => {
                                 match queries::update_memory_with(&store, &update_input, &fields) {
                                     Ok(UpdateOutcome::Updated(mem)) => {
+                                        let check = contradictions::check_on_update(
+                                            &store,
+                                            &update_input,
+                                            &fields,
+                                        );
                                         json!({ "content": [{ "type": "text", "text": match format {
-    ResponseFormat::Json => serde_json::to_string_pretty(&mem).unwrap(),
-    ResponseFormat::Markdown => render::memory_updated(&mem),
+    ResponseFormat::Json => serde_json::to_string_pretty(&SavedMemory { memory: &mem, check }).unwrap(),
+    ResponseFormat::Markdown => render::memory_updated(&mem) + &render::save_check(&check),
 } }] })
                                     }
                                     Ok(UpdateOutcome::NotFound) => {
@@ -5914,6 +5924,104 @@ mod tests {
             "total_candidates must be present in the response: {body}"
         );
     }
+
+    /// `remind_me_add` of a decision mentioning `Postgres` that claims the
+    /// session store uses `object`, with `extra` arguments merged in.
+    fn add_decision(server: &McpServer, content: &str, object: &str, extra: Value) -> Value {
+        let mut args = json!({
+            "content": content,
+            "memory_type": "decision",
+            "metadata": { "rationale": "r" },
+            "subject": "session store",
+            "predicate": "uses",
+            "object": object,
+            "entities": [{ "name": "Postgres" }],
+            "extract": false,
+        });
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().cloned().unwrap_or_default());
+        call(server, "remind_me_add", args)
+    }
+
+    #[test]
+    fn add_of_a_decision_returns_its_conflicts_in_json_and_markdown() {
+        let server = McpServer::new(Database::open_in_memory().unwrap());
+        let old: Value = serde_json::from_str(&text_of(&add_decision(
+            &server,
+            "Use Postgres for the session store",
+            "Postgres",
+            json!({}),
+        )))
+        .unwrap();
+        assert!(old.get("contradiction_candidates").is_none(), "{old}");
+
+        let json_reply: Value = serde_json::from_str(&text_of(&add_decision(
+            &server,
+            "Use Redis for the session store",
+            "Redis",
+            json!({}),
+        )))
+        .unwrap();
+        let found = &json_reply["contradiction_candidates"];
+        assert_eq!(found.as_array().map(Vec::len), Some(1), "{json_reply}");
+        assert_eq!(found[0]["memory"]["id"], old["id"]);
+        assert_eq!(found[0]["reason"], "same_claim");
+
+        let markdown = text_of(&add_decision(
+            &server,
+            "Use Memcached for the session store",
+            "Memcached",
+            json!({ "response_format": "markdown" }),
+        ));
+        assert!(markdown.contains("May contradict"), "{markdown}");
+        assert!(markdown.contains(old["id"].as_str().unwrap()), "{markdown}");
+    }
+
+    #[test]
+    fn sensitive_decisions_never_surface_as_conflicts() {
+        let server = McpServer::new(Database::open_in_memory().unwrap());
+        // One sensitive decision on the same claim, one sharing the entity
+        // and the topic: both would be conflicts if they were not sensitive.
+        add_decision(
+            &server,
+            "Use Postgres for the session store SECRETMARK",
+            "Postgres",
+            json!({ "sensitive": true }),
+        );
+        call(
+            &server,
+            "remind_me_add",
+            json!({
+                "content": "Use Valkey for the session store SECRETMARK",
+                "memory_type": "decision",
+                "metadata": { "rationale": "r" },
+                "entities": [{ "name": "Postgres" }],
+                "extract": false,
+                "sensitive": true,
+            }),
+        );
+
+        let json_text = text_of(&add_decision(
+            &server,
+            "Use Redis for the session store",
+            "Redis",
+            json!({}),
+        ));
+        let markdown = text_of(&add_decision(
+            &server,
+            "Use Memcached for the session store",
+            "Memcached",
+            json!({ "response_format": "markdown" }),
+        ));
+
+        let reply: Value = serde_json::from_str(&json_text).unwrap();
+        // Only the sensitive decisions preceded it, so it has no conflicts;
+        // the markdown add then conflicts with this one alone.
+        assert!(reply.get("contradiction_candidates").is_none(), "{reply}");
+        assert!(!json_text.contains("SECRETMARK"), "{json_text}");
+        assert!(!markdown.contains("SECRETMARK"), "{markdown}");
+    }
 }
 
 #[cfg(test)]
@@ -6262,5 +6370,58 @@ mod structure_tests {
             json!({ "query": "quokka policy", "include_expired": false }),
         );
         assert!(text(&hidden).contains("No memories"), "{}", text(&hidden));
+    }
+
+    #[test]
+    fn search_takes_a_time_window_and_lists_it_without_a_query() {
+        let s = server();
+        let search = tool(&s, "remind_me_search");
+        for field in ["since", "until", "time_field"] {
+            assert!(
+                search["inputSchema"]["properties"][field].is_object(),
+                "{field}"
+            );
+        }
+        call(
+            &s,
+            "remind_me_add",
+            json!({ "content": "wombat burrow note" }),
+        );
+
+        let listed = call(
+            &s,
+            "remind_me_search",
+            json!({ "query": "", "since": "1h", "response_format": "json" }),
+        );
+        assert!(!is_error(&listed), "{}", text(&listed));
+        assert!(
+            text(&listed).contains("wombat burrow note"),
+            "{}",
+            text(&listed)
+        );
+
+        let future = call(
+            &s,
+            "remind_me_search",
+            json!({ "query": "wombat", "since": "2999-01-01T00:00:00Z" }),
+        );
+        assert!(text(&future).contains("No memories"), "{}", text(&future));
+
+        let bad = call(
+            &s,
+            "remind_me_search",
+            json!({ "query": "", "since": "soon" }),
+        );
+        assert!(
+            is_error(&bad) && text(&bad).contains("`since`"),
+            "{}",
+            text(&bad)
+        );
+        let backwards = call(
+            &s,
+            "remind_me_search",
+            json!({ "query": "", "since": "1d", "until": "2d" }),
+        );
+        assert!(is_error(&backwards) && text(&backwards).contains("must be after"));
     }
 }
