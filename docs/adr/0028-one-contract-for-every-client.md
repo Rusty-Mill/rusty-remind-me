@@ -101,9 +101,11 @@ Checked in CI by a test over the tool table, so a regression fails the build:
 
 - Name `remind_me_<verb>` (#52). Description at most 160 characters, leading
   with a verb phrase that says "remind-me" and the noun.
-- Input schema strict: `additionalProperties: false`, closed sets as `enum`,
-  at most one required field in `minimal` (`query`, `text` or `id`), no nested
-  objects in `minimal`.
+- Input schema strict: `additionalProperties: false`, closed sets as `enum`.
+  In `minimal`, required fields are top-level strings, at most two
+  (`auto_capture` needs `conversation` and `summary`; the rest need one of
+  `query`, `text` or `id`), and nested objects are never required. The one
+  optional object today, `auto_capture`'s `metadata`, stays and is allowed.
 - Results are JSON: `{"items":[{"id","type","text","at","score"}],"next"}`
   with `text` cut to a budget and full text through `get` (#51). Markdown
   stays available as a rendering, chosen per client by `format`; JSON is the
@@ -133,19 +135,29 @@ global `CLAUDE.md`, claude.ai preferences, Hermes persona files. This repo's
 
 ### 5. Capture has one input and a path per client
 
-One neutral input, the one `remind_me_auto_capture` already takes:
-`{session_id, dialog: [{role, text}], summary?}`, stamped with the resolved
-client.
+The contract is the input `remind_me_auto_capture` already takes, unchanged:
+`conversation` (the transcript as one string) and `summary` (one string),
+both required, plus optional `title`, `tags`, `category` and `metadata`
+(`AutoCaptureInput` in `remind_me_core::models`). It is flat, so it already
+meets section 3. The writer, client and session are not fields: they come
+from the caller's provenance (section 1 and ADR-0026), as for every other
+write.
+
+A client whose transcript is a list of messages turns it into the
+`conversation` string on its own side. The tool input does not change, so
+this ADR needs no migration or deprecation for capture.
 
 | Client | Path |
 | --- | --- |
 | Claude Code | plugin hooks, unchanged |
 | claude.ai chat, voice | the model calls `remind_me_auto_capture`, told to by the guide in `initialize` (today it is told nothing) |
-| Hermes and the local models it hosts | Hermes's session-end runs `rusty-remind-me capture-transcript --format messages`, which reads the neutral input on stdin |
+| Hermes and the local models it hosts | Hermes's session-end runs `rusty-remind-me capture-transcript --format messages`, which reads `[{role, text}]` on stdin, joins it into `conversation` and stores it through the same path as `auto_capture` |
 | Multi-model env | its orchestrator calls `remind_me_auto_capture` (MCP) or `POST /api/capture` (REST) at the end of a run |
 
 `--format messages` and `POST /api/capture` are built only when Hermes or the
-multi-model env is wired, so each has a real caller.
+multi-model env is wired, so each has a real caller. Both are adapters that
+take the `AutoCaptureInput` shape (the CLI one after joining the messages)
+and not a second contract.
 
 ### 6. A conformance check every client can run
 
