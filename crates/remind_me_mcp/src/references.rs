@@ -17,7 +17,7 @@ const MARKDOWN_REFS: usize = 5;
 /// Rows the reverse lookup returns at most.
 const LOOKUP_LIMIT: usize = 100;
 /// Reference kinds, for a lookup that names a value but no kind.
-const KINDS: [&str; 7] = [
+pub const KINDS: [&str; 7] = [
     "url",
     "issue",
     "pull",

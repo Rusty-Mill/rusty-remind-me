@@ -1,17 +1,16 @@
-//! Coverage for tool profiles (gap E3, issue #122).
+//! Coverage for tool groups and profiles (gap E3, issue #122; ADR-0027).
 //!
-//! The tier tables are asserted against the names this crate actually
-//! advertises, not just for internal consistency: a tier listing a tool that
-//! does not exist silently shrinks the profile, and neither the table nor the
-//! server would complain.
+//! That every grouped name is a tool the server actually advertises is
+//! asserted at the protocol surface, in `remind_me_mcp`'s own tests.
 
 #[path = "../src/test_env.rs"]
 mod test_env;
 
 use remind_me_core::tool_profiles::{
-    allowed_tools, configured_profile, prompt_allowed, tool_allowed, CORE, MAINTENANCE,
-    MAINTENANCE_PROMPTS, TOOL_PROFILE_ENV, VALID_PROFILES,
+    allowed_groups, allowed_tools, configured_profile, group_of, prompt_allowed, replacement,
+    tool_allowed, ALIASES, CORE, GROUPS, MAINTENANCE_PROMPTS, PIPELINE, TOOL_PROFILE_ENV, WIKI,
 };
+use std::collections::BTreeSet;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 fn env_lock() -> MutexGuard<'static, ()> {
@@ -21,12 +20,20 @@ fn env_lock() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|p| p.into_inner())
 }
 
+fn profile_for(raw: &str) -> String {
+    crate::test_env::set_var(TOOL_PROFILE_ENV, raw);
+    let profile = configured_profile();
+    crate::test_env::remove_var(TOOL_PROFILE_ENV);
+    profile
+}
+
 #[test]
 fn the_default_profile_is_full() {
     let _guard = env_lock();
     crate::test_env::remove_var(TOOL_PROFILE_ENV);
 
-    // Upgrading must change nothing for an existing install.
+    // Upgrading must change nothing for an existing install (ADR-0027 flips
+    // this in its second step, not this one).
     assert_eq!(configured_profile(), "full");
     assert!(allowed_tools("full").is_none(), "full allows everything");
 }
@@ -34,142 +41,122 @@ fn the_default_profile_is_full() {
 #[test]
 fn an_unknown_profile_falls_back_to_full_rather_than_failing() {
     let _guard = env_lock();
-    crate::test_env::set_var(TOOL_PROFILE_ENV, "minimal");
-
     // A typo yields the widest surface. Refusing to start over a misspelled
     // optimisation would be worse than the misspelling, and an empty surface
     // would look like a broken server.
-    assert_eq!(configured_profile(), "full");
-    crate::test_env::remove_var(TOOL_PROFILE_ENV);
+    assert_eq!(profile_for("minimal"), "full");
+    assert_eq!(
+        profile_for("core,wikki"),
+        "full",
+        "one bad part spoils the list"
+    );
 }
 
 #[test]
-fn profile_names_are_case_and_whitespace_insensitive() {
+fn profiles_are_normalised_for_case_blanks_and_spacing() {
     let _guard = env_lock();
-    crate::test_env::set_var(TOOL_PROFILE_ENV, "  Core \n");
-    assert_eq!(configured_profile(), "core");
-    crate::test_env::remove_var(TOOL_PROFILE_ENV);
+    assert_eq!(profile_for("  Core \n"), "core");
+    assert_eq!(profile_for(" core , WIKI ,"), "core,wiki");
+    assert_eq!(profile_for("   "), "full");
 }
 
 #[test]
-fn standard_is_core_plus_maintenance_and_core_is_neither_more_nor_less() {
+fn core_is_ten_tools_and_always_on() {
+    assert_eq!(CORE.len(), 10);
     let core = allowed_tools("core").expect("core narrows");
-    let standard = allowed_tools("standard").expect("standard narrows");
-
-    assert_eq!(core.len(), CORE.len());
-    assert_eq!(standard.len(), CORE.len() + MAINTENANCE.len());
-    for name in CORE {
-        assert!(core.contains(name), "{name} missing from core");
-        assert!(standard.contains(name), "{name} missing from standard");
-    }
-    for name in MAINTENANCE {
-        assert!(!core.contains(name), "{name} leaked into core");
-        assert!(standard.contains(name), "{name} missing from standard");
-    }
+    assert_eq!(core, CORE.into_iter().collect());
+    // Naming another group never drops core.
+    let wiki = allowed_tools("wiki").expect("wiki narrows");
+    assert!(CORE.iter().chain(WIKI.iter()).all(|t| wiki.contains(t)));
+    assert_eq!(wiki.len(), CORE.len() + WIKI.len());
 }
 
 #[test]
-fn the_tiers_do_not_overlap() {
-    // A name in both tables is a table nobody has read carefully, and the
-    // overlap decides nothing — it just hides which tier was intended.
-    for name in MAINTENANCE {
-        assert!(!CORE.contains(&name), "{name} is in both tiers");
-    }
+fn standard_is_core_pipeline_and_wiki() {
+    assert_eq!(
+        allowed_groups("standard"),
+        Some(BTreeSet::from(["core", "pipeline", "wiki"]))
+    );
+    assert_eq!(
+        allowed_groups("core,pipeline,wiki"),
+        allowed_groups("standard")
+    );
+    assert!(
+        allowed_groups("core,full").is_none(),
+        "full anywhere is everything"
+    );
 }
 
 #[test]
-fn an_unlisted_tool_is_treated_as_admin_and_hidden_when_narrowed() {
-    // The default matters more than any individual assignment: a tool added
-    // later must start hidden under a narrowed profile rather than smuggling
-    // itself onto a surface someone deliberately trimmed.
+fn every_public_tool_is_in_exactly_one_group() {
+    let mut seen = BTreeSet::new();
+    for (group, tools) in GROUPS {
+        for tool in tools {
+            assert!(seen.insert(*tool), "{tool} is in more than one group");
+            assert_eq!(group_of(tool), Some(group));
+        }
+    }
+    assert_eq!(seen.len(), 43);
+}
+
+#[test]
+fn every_alias_points_at_a_public_tool_and_is_not_one_itself() {
+    let public: BTreeSet<&str> = GROUPS.iter().flat_map(|(_, t)| t.iter().copied()).collect();
+    let mut seen = BTreeSet::new();
+    for (old, new) in ALIASES {
+        assert!(seen.insert(old), "{old} aliased twice");
+        assert!(
+            public.contains(new),
+            "{old} points at {new}, which is not public"
+        );
+        assert!(!public.contains(old), "{old} is both public and an alias");
+        assert_eq!(replacement(old), Some(new));
+    }
+    // 75 tools before ADR-0027: 43 public names, 4 of them new, plus 36 aliases.
+    assert_eq!(public.len() - 4 + ALIASES.len(), 75);
+}
+
+#[test]
+fn an_alias_is_allowed_exactly_when_its_replacement_is() {
+    // stats merged into digest (core); import_chat into import (import).
+    assert!(tool_allowed("core", "remind_me_stats"));
+    assert!(!tool_allowed("core", "remind_me_import_chat"));
+    assert!(tool_allowed("core,import", "remind_me_import_chat"));
+    assert!(!tool_allowed("standard", "remind_me_sync_reconcile"));
+    assert!(tool_allowed("full", "remind_me_sync_reconcile"));
+}
+
+#[test]
+fn a_name_in_no_group_is_hidden_whenever_the_profile_narrows() {
     assert!(!tool_allowed("core", "remind_me_some_future_tool"));
     assert!(!tool_allowed("standard", "remind_me_some_future_tool"));
     assert!(tool_allowed("full", "remind_me_some_future_tool"));
 }
 
-/// Ops tools sampled by the hiding test. Checked for existence, because
-/// "an unlisted tool is hidden" is already true of a typo.
-const OPS_SAMPLES: [&str; 4] = [
-    "remind_me_import_chat",
-    "remind_me_sync_status",
-    "remind_me_backup",
-    "remind_me_api_key",
-];
-
-#[test]
-fn ops_tools_are_hidden_under_standard_and_core() {
-    // Real advertised names, asserted below to still exist — naming a tool
-    // that does not exist would make this test pass for the wrong reason,
-    // since anything unlisted is hidden by default anyway.
-    for name in OPS_SAMPLES {
-        assert!(!tool_allowed("core", name), "{name} visible under core");
-        assert!(
-            !tool_allowed("standard", name),
-            "{name} visible under standard"
-        );
-        assert!(tool_allowed("full", name));
-    }
-}
-
 #[test]
 fn server_status_stays_visible_in_every_profile() {
-    // It is otherwise an ops tool, but it is what reports which profile is
-    // active — and a profile you cannot diagnose from inside a session is a
-    // trap.
-    for profile in VALID_PROFILES {
+    // It reports which profile is active, and a profile you cannot diagnose
+    // from inside a session is a trap.
+    for profile in ["core", "wiki", "standard", "full", "admin"] {
         assert!(
             tool_allowed(profile, "remind_me_server_status"),
-            "server_status hidden under {profile}"
+            "{profile}"
         );
     }
 }
 
 #[test]
-fn core_hides_the_maintenance_prompts_and_the_others_do_not() {
+fn maintenance_prompts_follow_the_pipeline_group() {
+    assert!(PIPELINE.contains(&"remind_me_queue"));
     for prompt in MAINTENANCE_PROMPTS {
         assert!(
             !prompt_allowed("core", prompt),
             "{prompt} offered under core"
         );
+        assert!(!prompt_allowed("core,wiki", prompt));
+        assert!(prompt_allowed("core,pipeline", prompt));
         assert!(prompt_allowed("standard", prompt));
         assert!(prompt_allowed("full", prompt));
     }
-}
-
-#[test]
-fn a_non_maintenance_prompt_survives_every_profile() {
-    for profile in VALID_PROFILES {
-        assert!(prompt_allowed(profile, "recall_context"));
-    }
-}
-
-#[test]
-fn every_tiered_name_is_a_tool_this_crate_actually_advertises() {
-    // A tier naming a tool that does not exist silently shrinks the profile
-    // by one and nothing complains — not the table, not the server, not a
-    // consistency check that only compares the two tiers against each other.
-    let source = include_str!("../../remind_me_mcp/src/lib.rs");
-    let advertised: Vec<&str> = source
-        .match_indices("\"name\": \"remind_me_")
-        .filter_map(|(at, _)| {
-            let rest = &source[at + "\"name\": \"".len()..];
-            rest.find('"').map(|end| &rest[..end])
-        })
-        .collect();
-
-    for name in CORE.into_iter().chain(MAINTENANCE) {
-        assert!(
-            advertised.contains(&name),
-            "{name} is tiered but not advertised — the profile is one tool smaller than it looks"
-        );
-    }
-
-    // And the ops names the hiding test samples: a typo there passes for the
-    // wrong reason, because anything unlisted is hidden by default.
-    for name in OPS_SAMPLES {
-        assert!(
-            advertised.contains(&name),
-            "{name} is sampled as an ops tool but is not advertised at all"
-        );
-    }
+    assert!(prompt_allowed("core", "recall_context"));
 }

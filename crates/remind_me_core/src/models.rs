@@ -149,7 +149,7 @@ pub struct Memory {
     /// RFC 3339 when a human or tool last confirmed it.
     #[serde(default)]
     pub verified_at: Option<String>,
-    /// `done`, `abandoned`, `reverted` or `superseded`; `None` while open
+    /// `done`, `abandoned`, `reverted`, `superseded` or `carded`; `None` while open
     /// or where an outcome does not apply.
     #[serde(default)]
     pub outcome: Option<String>,

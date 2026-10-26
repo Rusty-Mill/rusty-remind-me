@@ -225,6 +225,29 @@ fn done_leaves_the_weight_and_abandoned_demotes() {
 }
 
 #[test]
+fn carded_closes_a_decision_without_demoting_it() {
+    // Moved to a board card: no longer open, not done, and still worth its
+    // full weight, since the work is live on the card (ADR-0027).
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let id = decision(&store, "split the repo");
+    let before = testing::memory_f64(&store, &id, "base_weight")
+        .unwrap()
+        .unwrap();
+
+    let m = resolve_memory(&store, &id, "carded", Some("Mill Board #61"))
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(m.outcome.as_deref(), Some("carded"));
+    assert_eq!(m.metadata["outcome_note"], "Mill Board #61");
+    let after = testing::memory_f64(&store, &id, "base_weight")
+        .unwrap()
+        .unwrap();
+    assert_eq!(after, before);
+}
+
+#[test]
 fn resolve_refuses_the_wrong_kind_or_outcome_and_misses_cleanly() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();

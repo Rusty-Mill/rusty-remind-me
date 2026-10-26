@@ -1,5 +1,5 @@
 //! Outcome tracking: close a decision or action item as done, abandoned,
-//! reverted or superseded.
+//! reverted, superseded or carded (moved to a board card).
 //!
 //! A memory that says "we will use X" is dangerous once X was backed out and
 //! nothing recorded it. Resolving sets `outcome`, keeps the prior state in
@@ -23,8 +23,9 @@ pub const RESOLVE_REASON: &str = "resolve";
 pub const DEMOTION_FACTOR: f64 = 0.5;
 
 /// Whether this outcome means the memory was wrong or dropped, and so loses
-/// weight. `done` and `superseded` leave it alone: the work happened, or a
-/// newer memory already outranks it.
+/// weight. `done`, `superseded` and `carded` leave it alone: the work happened,
+/// a newer memory already outranks it, or it moved to a board card and is
+/// still live there.
 pub fn demotes(outcome: &str) -> bool {
     matches!(outcome, "reverted" | "abandoned")
 }

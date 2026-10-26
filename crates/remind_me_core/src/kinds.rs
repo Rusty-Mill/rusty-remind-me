@@ -83,7 +83,7 @@ impl FromStr for MemoryKind {
 }
 
 /// The outcomes a memory can be resolved to.
-pub const OUTCOMES: [&str; 4] = ["done", "abandoned", "reverted", "superseded"];
+pub const OUTCOMES: [&str; 5] = ["done", "abandoned", "reverted", "superseded", "carded"];
 
 /// The `status` values an action item's metadata may hold.
 pub const ACTION_STATUSES: [&str; 3] = ["open", "done", "dropped"];
@@ -282,7 +282,7 @@ impl StructuredFields {
             return Err(bad(
                 "memory",
                 "outcome",
-                "must be one of done, abandoned, reverted, superseded",
+                "must be one of done, abandoned, reverted, superseded, carded",
             ));
         }
         let kind: MemoryKind = self
