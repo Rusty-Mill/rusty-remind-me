@@ -581,15 +581,18 @@ mod tests {
     /// nothing, forever.
     #[test]
     fn a_closed_port_reads_as_closed() {
-        // A real port this test owns and nothing listens on: the local end of
-        // a live connection. While `client` is open no other socket can bind
-        // the port, so the probe is refused. A port freed by dropping a
-        // listener is not owned: a parallel test that binds port 0 can be
-        // handed it before the probe runs, and the probe then finds it open.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let port = client.local_addr().unwrap().port();
+        // A real port this test holds and nothing listens on: a socket bound
+        // without SO_REUSEADDR and never listened on or connected. While it
+        // is bound, no other socket can bind the port, so the probe is
+        // refused. A port freed by dropping a listener is not held: a
+        // parallel test that binds port 0 can be handed it first.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_reuseaddr(false).unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let port = socket.local_addr().unwrap().port();
+        assert_ne!(port, 0);
         assert!(!port_open("127.0.0.1", port));
+        drop(socket);
     }
 
     #[test]
