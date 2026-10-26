@@ -280,6 +280,10 @@ The hooks and the slash commands both bypass MCP entirely — they invoke the pl
 
 To use it, `rusty-remind-me` must be on `PATH` (`cargo build --release -p rusty-remind-me` then add `target/release` to `PATH`, or `cargo install --path crates/apps/rusty_remind_me/crates/remind_me_cli` from the monorepo root), then add the monorepo as a plugin marketplace in Claude Code (see [Connect it to a client](#2-connect-it-to-a-client)).
 
+### Cloud sessions (claude.ai Projects)
+
+A cloud session runs in a fresh container that has no plugin, no binary, and a transcript that is deleted along with the container. The monorepo's own `.claude/settings.json` registers `.claude/hooks/remind-me-capture.py` on `Stop` and `PreCompact`. The hook sends the transcript to the remote connector's `remind_me_capture_transcript` tool, which keeps one capture per session, as the plugin does (ADR-0029). It runs only when `CLAUDE_CODE_REMOTE=true` and both `REMIND_ME_URL` (the connector's `/mcp` endpoint) and `REMIND_ME_TOKEN` are set, so a local session is left to the plugin. To turn it on, set both variables in the cloud environment and keep the token as a secret. Add the connector's host to the environment's network allowlist, and run the connector with the `full` tool profile. The hook always exits 0, and it reports failures on stderr.
+
 ### Multi-node sync through the plugin
 
 `.mcp.json` sets no `env` — Claude Code spawns a plugin's MCP server with
