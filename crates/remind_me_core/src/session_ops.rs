@@ -84,6 +84,87 @@ pub fn capture_transcript(
     serde_json::to_value(outcome).map_err(|e| StoreError::Invalid(e.to_string()))
 }
 
+/// `{"imported", "skipped", "empty", "failed": [{"path", "error"}]}` after a
+/// one-time backfill of a Claude Code `projects` folder: every
+/// `dir/*/*.jsonl` session not captured yet is captured, stamped with the
+/// session id (else the file stem) and cwd the transcript itself carries.
+/// A session already captured, by the hook or an earlier run, is left as it
+/// is, so a re-run imports nothing twice. A file that cannot be read or
+/// stored is reported in `failed` and the walk goes on.
+pub fn import_sessions(store: &Store<'_>, dir: &Path) -> Result<Value> {
+    absolute(dir, "sessions directory")?;
+    let (mut imported, mut skipped, mut empty) = (0, 0, 0);
+    let mut failed = Vec::new();
+    for path in session_files(dir)? {
+        match backfill(store, &path) {
+            Ok(Backfill::Imported) => imported += 1,
+            Ok(Backfill::Skipped) => skipped += 1,
+            Ok(Backfill::Empty) => empty += 1,
+            Err(e) => {
+                failed.push(json!({"path": path.display().to_string(), "error": e.to_string()}))
+            }
+        }
+    }
+    Ok(json!({"imported": imported, "skipped": skipped, "empty": empty, "failed": failed}))
+}
+
+enum Backfill {
+    Imported,
+    Skipped,
+    Empty,
+}
+
+fn backfill(store: &Store<'_>, path: &Path) -> Result<Backfill> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| StoreError::Invalid(format!("cannot read {}: {e}", path.display())))?;
+    let parsed = transcript::parse(&raw);
+    if parsed.messages == 0 {
+        return Ok(Backfill::Empty);
+    }
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    let session_id = parsed
+        .session_id
+        .clone()
+        .unwrap_or_else(|| stem.to_string());
+    if transcript::is_captured(store, &session_id)? {
+        return Ok(Backfill::Skipped);
+    }
+    let request = TranscriptRequest {
+        session_id: &session_id,
+        cwd: None,
+        reason: Some("backfill"),
+    };
+    transcript::capture_parsed(store, &parsed, &request)?;
+    Ok(Backfill::Imported)
+}
+
+/// `dir/*/*.jsonl`, sorted: one folder per project, one file per session.
+/// Deeper files (a session's subagent transcripts) are not sessions.
+fn session_files(dir: &Path) -> Result<Vec<std::path::PathBuf>> {
+    let read = |d: &Path| {
+        std::fs::read_dir(d)
+            .map_err(|e| StoreError::Invalid(format!("cannot read {}: {e}", d.display())))
+    };
+    let mut files = Vec::new();
+    for project in read(dir)?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+    {
+        files.extend(
+            read(&project)?
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "jsonl")),
+        );
+    }
+    files.sort();
+    Ok(files)
+}
+
 /// What the `context` subcommand was asked for.
 #[derive(Debug, Clone, Default)]
 pub struct ContextArgs<'a> {
@@ -193,6 +274,78 @@ pub fn timeline_text(
 mod tests {
     use super::*;
     use crate::db::Database;
+
+    #[test]
+    fn import_sessions_backfills_once_and_reports_every_file() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        assert!(import_sessions(&store, Path::new("rel")).is_err());
+        let root =
+            std::env::temp_dir().join(format!("rrm_backfill_{}", uuid::Uuid::new_v4().simple()));
+        let project = root.join("C--Users-nano-code-quokka");
+        std::fs::create_dir_all(project.join("s-win").join("subagents")).unwrap();
+        // A Windows transcript: CRLF lines, a `C:\` cwd, a meta line, a tool result.
+        let envelope = |v: Value| format!("{v}\r\n");
+        let windows = [
+            json!({"type": "user", "sessionId": "s-win", "cwd": r"C:\Users\nano\code\quokka",
+                "isMeta": true, "message": {"role": "user", "content": "hook context"}}),
+            json!({"type": "user", "sessionId": "s-win", "cwd": r"C:\Users\nano\code\quokka",
+                "message": {"role": "user", "content": "fix the build"}}),
+            json!({"type": "assistant", "sessionId": "s-win", "message": {"role": "assistant",
+                "content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "cargo b"}}]}}),
+            json!({"type": "user", "sessionId": "s-win", "message": {"role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}}),
+            json!({"type": "assistant", "sessionId": "s-win",
+                "message": {"role": "assistant", "content": "Fixed."}}),
+        ]
+        .map(envelope)
+        .concat();
+        std::fs::write(project.join("s-win.jsonl"), windows).unwrap();
+        // No sessionId: the file stem names it.
+        let bare = json!({"type": "user", "message": {"role": "user", "content": "hi"}});
+        std::fs::write(project.join("s-bare.jsonl"), bare.to_string()).unwrap();
+        std::fs::write(project.join("s-empty.jsonl"), "{\"type\":\"summary\"}\n").unwrap();
+        std::fs::write(project.join("s-bad.jsonl"), [0xff, 0xfe]).unwrap();
+        std::fs::write(
+            project.join("s-win").join("subagents").join("a.jsonl"),
+            bare.to_string(),
+        )
+        .unwrap();
+        std::fs::write(project.join("notes.txt"), "not a session").unwrap();
+
+        let first = import_sessions(&store, &root).unwrap();
+        assert_eq!(
+            (&first["imported"], &first["skipped"], &first["empty"]),
+            (&json!(2), &json!(0), &json!(1))
+        );
+        let failed = first["failed"].as_array().unwrap();
+        assert_eq!(failed.len(), 1);
+        assert!(failed[0]["path"].as_str().unwrap().ends_with("s-bad.jsonl"));
+
+        let memories = episodes::session_memories(&store, "s-win").unwrap();
+        assert_eq!(memories.len(), 2, "one dialog and summary pair");
+        assert!(memories
+            .iter()
+            .all(|m| m.project.as_deref() == Some("quokka")));
+        assert!(memories.iter().all(|m| m.git_branch.is_none()));
+        let dialog = memories
+            .iter()
+            .find(|m| m.metadata["type"] == "dialog")
+            .unwrap();
+        assert!(!dialog.content.contains("hook context") && dialog.content.contains("Bash"));
+        assert_eq!(dialog.metadata["reason"], "backfill");
+        assert_eq!(
+            episodes::session_memories(&store, "s-bare").unwrap().len(),
+            2
+        );
+
+        let again = import_sessions(&store, &root).unwrap();
+        assert_eq!(
+            (&again["imported"], &again["skipped"]),
+            (&json!(0), &json!(2))
+        );
+        assert!(import_sessions(&store, &root.join("missing")).is_err());
+    }
 
     #[test]
     fn relative_paths_are_refused_and_the_shapes_are_stable() {

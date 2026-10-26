@@ -1,5 +1,6 @@
 //! `session start|end|timeline`, `capture-transcript` and `context`: the
-//! subcommands a client's hooks call. The flags and the JSON they print are
+//! subcommands a client's hooks call; and `import-sessions`, the one-time
+//! backfill of the transcripts captured before the hooks were installed. The flags and the JSON they print are
 //! the contract the hook scripts are written against; the work is
 //! `remind_me_core::session_ops`, run wherever the store is (the daemon or
 //! this process).
@@ -20,6 +21,7 @@ Usage:
   rusty-remind-me session timeline --session-id ID [--json]
   rusty-remind-me capture-transcript PATH.jsonl --session-id ID [--cwd DIR]
                   [--reason stop|precompact|end] [--json]
+  rusty-remind-me import-sessions DIR   (a Claude Code `projects` folder)
   rusty-remind-me context [--cwd DIR] [--project P] [--branch B] [--prompt TEXT]
                   [--budget CHARS] [--hits-only] [--json]
 
@@ -151,6 +153,15 @@ fn plan(command: &str, rest: &[String]) -> Result<Plan, String> {
                 reason: flags.reason,
             }))
         }
+        "import-sessions" => {
+            let flags = parse_flags(rest)?;
+            let dir = flags
+                .positional
+                .ok_or_else(|| format!("Error: import-sessions expects a directory.\n{USAGE}"))?;
+            Ok(Plan::Json(Op::ImportSessions {
+                dir: absolute(&dir)?,
+            }))
+        }
         "context" => {
             let flags = parse_flags(rest)?;
             Ok(Plan::Context(
@@ -222,7 +233,7 @@ fn op_of(plan: Plan) -> (Op, Plan) {
     }
 }
 
-/// Run `command` (`session`, `capture-transcript` or `context`) with its
+/// Run `command` (`session`, `capture-transcript`, `import-sessions` or `context`) with its
 /// arguments, printing the result. Exits 1 with a message on bad arguments.
 pub fn command(
     command: &str,
@@ -309,6 +320,18 @@ mod tests {
             }
             _ => panic!("expected CaptureTranscript"),
         }
+    }
+
+    #[test]
+    fn import_sessions_takes_one_directory() {
+        match plan("import-sessions", &args(&["/h/.claude/projects"])).unwrap() {
+            Plan::Json(Op::ImportSessions { dir }) => {
+                assert_eq!(dir, std::path::absolute("/h/.claude/projects").unwrap());
+            }
+            _ => panic!("expected ImportSessions"),
+        }
+        assert!(plan("import-sessions", &args(&[])).is_err());
+        assert!(plan("import-sessions", &args(&["a", "b"])).is_err());
     }
 
     #[test]

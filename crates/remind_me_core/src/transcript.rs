@@ -187,11 +187,19 @@ pub fn capture_transcript(
     raw: &str,
     request: &TranscriptRequest<'_>,
 ) -> Result<TranscriptOutcome> {
+    capture_parsed(store, &parse(raw), request)
+}
+
+/// [`capture_transcript`] for a transcript already [`parse`]d.
+pub fn capture_parsed(
+    store: &Store<'_>,
+    parsed: &TranscriptSummary,
+    request: &TranscriptRequest<'_>,
+) -> Result<TranscriptOutcome> {
     let session_id = request.session_id.trim();
     if session_id.is_empty() {
         return Err(StoreError::Invalid("session id must not be empty".into()));
     }
-    let parsed = parse(raw);
     if parsed.messages == 0 {
         return Err(StoreError::Invalid("transcript has no messages".into()));
     }
@@ -208,7 +216,7 @@ pub fn capture_transcript(
     };
 
     if let Some(existing) = existing_dialog(store, session_id)? {
-        return recapture(store, &existing, &parsed, request.reason);
+        return recapture(store, &existing, parsed, request.reason);
     }
 
     let mut tags = vec!["transcript".to_string()];
@@ -231,6 +239,7 @@ pub fn capture_transcript(
         context,
         written_by: Some("hook".into()),
         capture_method: Some("auto".into()),
+        foreign: cwd.as_deref().is_some_and(|dir| !dir.is_dir()),
     };
     let made = auto_capture_stamped(store, &input, &stamp)?;
     Ok(TranscriptOutcome {
@@ -239,6 +248,11 @@ pub fn capture_transcript(
         summary_id: made.summary_id,
         messages: parsed.messages,
     })
+}
+
+/// Whether `session_id` already has a capture.
+pub fn is_captured(store: &Store<'_>, session_id: &str) -> Result<bool> {
+    Ok(existing_dialog(store, session_id)?.is_some())
 }
 
 /// The dialog half already captured for `session_id`, if any.
