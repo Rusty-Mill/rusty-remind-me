@@ -28,7 +28,7 @@
 
 use remind_me_core::expansion::{MemorySearchResponse, RelatedMemory};
 use remind_me_core::models::{
-    CaptureResult, Memory, RevertOutcome, SavedSearch, SetReminderOutcome,
+    CaptureResult, Memory, RevertOutcome, SaveCheck, SavedSearch, SetReminderOutcome,
 };
 use remind_me_core::updater::UpdateStatus;
 use remind_me_core::vectors::ReindexResult;
@@ -49,6 +49,31 @@ pub fn memory_stored(memory: &Memory) -> String {
         "✓ Memory stored with id `{}` in category '{}'.",
         memory.id, memory.category
     )
+}
+
+/// The contradiction check's findings, to append to a write's summary;
+/// empty when it found nothing.
+pub fn save_check(check: &SaveCheck) -> String {
+    let mut out = String::new();
+    if let Some(e) = &check.contradiction_check_error {
+        out.push_str(&format!("\n\n⚠ Contradiction check failed: {e}"));
+    }
+    if !check.contradiction_candidates.is_empty() {
+        out.push_str(
+            "\n\n⚠ May contradict these standing decisions. Supersede one \
+             (`remind_me_add` with `supersedes`, or `remind_me_resolve`), or keep both:",
+        );
+        for c in &check.contradiction_candidates {
+            out.push_str(&format!(
+                "\n- `{}` ({:?}, {:.2}): {}",
+                c.memory.id,
+                c.reason,
+                c.score,
+                preview(&c.memory.content_snippet, 120)
+            ));
+        }
+    }
+    out
 }
 
 pub fn memory_updated(memory: &Memory) -> String {

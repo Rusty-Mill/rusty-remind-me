@@ -328,6 +328,26 @@ pub(crate) fn linked_ids(tables: &EngineTables, entity_id: &str) -> Result<HashS
         .collect())
 }
 
+/// The ids of the memories linked to `entity_id`, through the link index.
+pub(crate) fn linked_memory_ids(core: &CoreTables, entity_id: &str) -> Vec<String> {
+    links_to(core, entity_id)
+        .into_iter()
+        .map(|l| l.memory_id)
+        .collect()
+}
+
+/// The ids of the entities memory `memory_id` is linked to: a scan, as links
+/// are indexed by entity only.
+pub(crate) fn entities_of(core: &CoreTables, memory_id: &str) -> Vec<String> {
+    core.links
+        .all_ids()
+        .into_iter()
+        .filter_map(|id| core.links.get(id))
+        .filter(|l| l.memory_id == memory_id)
+        .map(|l| l.entity_id)
+        .collect()
+}
+
 /// Whether memory `memory_id` has any entity link.
 pub(crate) fn has_links(core: &CoreTables, memory_id: &str) -> bool {
     links(core).iter().any(|l| l.memory_id == memory_id)

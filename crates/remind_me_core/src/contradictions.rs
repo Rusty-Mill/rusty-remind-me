@@ -32,15 +32,31 @@
 //! This is not an optimisation to add later. Without it the queue is
 //! dominated by pairs whose only relationship is naming the same project, and
 //! the tool is unusable on exactly the vaults that need it most.
+//!
+//! # On save, for decisions
+//!
+//! The queue above only runs when asked, so a stale decision can sit beside
+//! its replacement indefinitely. [`check_on_save`] runs a narrow version of
+//! it when a decision is written: only against standing decisions, only
+//! those sharing the claim or a non-hub entity, and a shared entity alone is
+//! not enough — the content must also overlap by [`ON_SAVE_MIN_OVERLAP`], so
+//! two decisions that merely name the same project are not flagged. At most
+//! [`ON_SAVE_LIMIT`] come back with the write. It never blocks the write and
+//! never supersedes: the writer decides, and can do it in the same call with
+//! `remind_me_add`'s `supersedes`.
 
 use crate::db::curation::Curation;
 use crate::db::memories::Memories;
 use crate::db::Result;
 use crate::db::Store;
+use crate::kinds::StructuredFields;
 use crate::models::{
-    ContradictionCandidate, ContradictionCandidatesResult, ContradictionSide, Memory,
+    ConflictReason, ContradictionCandidate, ContradictionCandidatesResult, ContradictionSide,
+    DecisionConflict, Memory, MemoryUpdateInput, SaveCheck,
 };
+use crate::vitality::{jaccard, tokenize_query};
 use std::cmp::Ordering;
+use std::collections::HashSet;
 
 /// Entities mentioned by more memories than this are excluded from the pairing
 /// join.
@@ -183,4 +199,122 @@ pub fn candidates(
         next_after_a,
         next_after_b,
     })
+}
+
+/// At most this many conflicts come back with a saved decision.
+pub const ON_SAVE_LIMIT: usize = 5;
+
+/// The word overlap (Jaccard) a decision sharing only an entity needs to be
+/// returned: the threshold feedback matching already uses for "the same
+/// topic" ([`crate::vitality::FEEDBACK_SIMILARITY_THRESHOLD`]).
+pub const ON_SAVE_MIN_OVERLAP: f64 = crate::vitality::FEEDBACK_SIMILARITY_THRESHOLD;
+
+/// Whether two memories state the same subject and predicate with the same
+/// object: a restatement, which is no conflict.
+fn same_triple(a: &Memory, b: &Memory) -> bool {
+    let norm = |s: &Option<String>| s.as_deref().map(|s| s.trim().to_lowercase());
+    norm(&a.subject).is_some()
+        && norm(&a.subject) == norm(&b.subject)
+        && norm(&a.predicate) == norm(&b.predicate)
+        && norm(&a.object) == norm(&b.object)
+}
+
+fn token_set(tokens: &[String]) -> HashSet<&str> {
+    tokens.iter().map(String::as_str).collect()
+}
+
+/// Word overlap (Jaccard) of two texts, tokenized as search queries are.
+fn overlap(a: &str, b: &str) -> f64 {
+    let (ta, tb) = (tokenize_query(a), tokenize_query(b));
+    jaccard(&token_set(&ta), &token_set(&tb))
+}
+
+/// How `other` conflicts with `saved`, if it does.
+fn conflict(saved: &Memory, other: &Memory, shared: &[String]) -> Option<(f64, ConflictReason)> {
+    if conflicting_triples(saved, other) {
+        return Some((1.0, ConflictReason::SameClaim));
+    }
+    if shared.is_empty() || same_triple(saved, other) {
+        return None;
+    }
+    let score = overlap(&saved.content, &other.content);
+    (score >= ON_SAVE_MIN_OVERLAP).then_some((score, ConflictReason::SharedEntity))
+}
+
+/// The standing decisions that `memory_id`, if it is a live decision, may
+/// contradict: highest score first, then newest, at most [`ON_SAVE_LIMIT`].
+/// Empty for any other memory.
+pub fn decision_conflicts(store: &Store<'_>, memory_id: &str) -> Result<Vec<DecisionConflict>> {
+    let memories = Memories::new(store);
+    let Some(saved) = memories.get_live(memory_id)? else {
+        return Ok(Vec::new());
+    };
+    if saved.memory_type.as_deref() != Some("decision") || saved.superseded_by.is_some() {
+        return Ok(Vec::new());
+    }
+    let curation = Curation::new(store);
+    let mut found = Vec::new();
+    for (id, shared) in curation.decision_neighbours(memory_id, MAX_ENTITY_FANOUT)? {
+        let Some(other) = memories.get_live(&id)? else {
+            continue;
+        };
+        if let Some((score, reason)) = conflict(&saved, &other, &shared) {
+            found.push((other.created_at.clone(), score, reason, shared, id));
+        }
+    }
+    found.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| b.0.cmp(&a.0))
+    });
+    found
+        .into_iter()
+        .take(ON_SAVE_LIMIT)
+        .map(|(_, score, reason, shared_entities, id)| {
+            Ok(DecisionConflict {
+                memory: side(store, &id)?,
+                score,
+                reason,
+                shared_entities,
+            })
+        })
+        .collect()
+}
+
+/// A check's outcome as a write reports it. A failure is logged with the
+/// memory it concerns and carried in the result, never dropped: the write
+/// it followed has already committed and stands.
+pub fn save_check(memory_id: &str, outcome: Result<Vec<DecisionConflict>>) -> SaveCheck {
+    match outcome {
+        Ok(contradiction_candidates) => SaveCheck {
+            contradiction_candidates,
+            contradiction_check_error: None,
+        },
+        Err(e) => {
+            eprintln!("rusty-remind-me: contradiction check on save of {memory_id} failed: {e}");
+            SaveCheck {
+                contradiction_candidates: Vec::new(),
+                contradiction_check_error: Some(e.to_string()),
+            }
+        }
+    }
+}
+
+/// Run the contradiction check for a just-written memory. Never fails: see
+/// [`save_check`].
+pub fn check_on_save(store: &Store<'_>, memory_id: &str) -> SaveCheck {
+    save_check(memory_id, decision_conflicts(store, memory_id))
+}
+
+/// [`check_on_save`] after an update, run only when the edit could change the
+/// answer: new content or a new type. A tag or metadata edit reports nothing.
+pub fn check_on_update(
+    store: &Store<'_>,
+    input: &MemoryUpdateInput,
+    fields: &StructuredFields,
+) -> SaveCheck {
+    if input.content.is_none() && fields.memory_type.is_none() {
+        return SaveCheck::default();
+    }
+    check_on_save(store, &input.memory_id)
 }

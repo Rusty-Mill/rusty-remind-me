@@ -144,20 +144,20 @@ use remind_me_core::{
     HistoryInput, ListRemindersInput, MemoryAddInput, MemoryListInput, MemorySearchInput,
     MemoryStatsInput, MemoryUpdateInput, MempalaceImportInput, NormalizeApplyInput,
     NormalizeBatchInput, RecalibrateCandidatesInput, ReclassifyBatchInput, ReclassifyInput,
-    ReconcilePeerInput, ResponseFormat, RevertInput, SaveSearchInput, SavedSearchNameInput,
-    SetReminderInput, SyncRepairInput, UndoImportInput, UpdateOutcome, WikiDeleteOutcome,
-    ANNOTATE_BATCH_MAX, ANNOTATE_BATCH_MIN, CONSOLIDATE_LIMIT_MAX, CONSOLIDATE_LIMIT_MIN,
-    CONSOLIDATE_SIMILARITY_MAX, CONSOLIDATE_SIMILARITY_MIN, CONTRADICTION_LIMIT_MAX,
-    CONTRADICTION_LIMIT_MIN, DBS_IMPORT_LIMIT_MAX, DBS_IMPORT_LIMIT_MIN, DECOMPOSE_BATCH_MAX,
-    DECOMPOSE_BATCH_MIN, DECOMPOSE_FACTS_MAX, DECOMPOSE_FACTS_MIN, ENTITY_LOOKUP_LIMIT_MAX,
-    ENTITY_LOOKUP_LIMIT_MIN, EXTRACT_BATCH_MAX, EXTRACT_BATCH_MIN, EXTRACT_MODES,
-    HISTORY_LIMIT_MAX, HISTORY_LIMIT_MIN, IMPORT_MAX_LENGTH_MAX, IMPORT_MAX_LENGTH_MIN,
-    MEMPALACE_IMPORT_LIMIT_MAX, MEMPALACE_IMPORT_LIMIT_MIN, NORMALIZE_APPLY_MAX,
-    NORMALIZE_APPLY_MIN, NORMALIZE_BATCH_MAX, NORMALIZE_BATCH_MIN, PROMOTION_LIMIT_DEFAULT,
-    PROMOTION_LIMIT_MAX, PROMOTION_LIMIT_MIN, RECALIBRATE_LIMIT_MAX, RECALIBRATE_LIMIT_MIN,
-    RECLASSIFY_BATCH_MAX, RECLASSIFY_BATCH_MIN, REMINDER_LIMIT_MAX, REMINDER_LIMIT_MIN,
-    STALE_CANDIDATES_LIMIT_DEFAULT, STALE_CANDIDATES_LIMIT_MAX, STALE_CANDIDATES_LIMIT_MIN,
-    UNDO_IMPORT_LIMIT_MAX, UNDO_IMPORT_LIMIT_MIN,
+    ReconcilePeerInput, ResponseFormat, RevertInput, SaveSearchInput, SavedMemory,
+    SavedSearchNameInput, SetReminderInput, SyncRepairInput, UndoImportInput, UpdateOutcome,
+    WikiDeleteOutcome, ANNOTATE_BATCH_MAX, ANNOTATE_BATCH_MIN, CONSOLIDATE_LIMIT_MAX,
+    CONSOLIDATE_LIMIT_MIN, CONSOLIDATE_SIMILARITY_MAX, CONSOLIDATE_SIMILARITY_MIN,
+    CONTRADICTION_LIMIT_MAX, CONTRADICTION_LIMIT_MIN, DBS_IMPORT_LIMIT_MAX, DBS_IMPORT_LIMIT_MIN,
+    DECOMPOSE_BATCH_MAX, DECOMPOSE_BATCH_MIN, DECOMPOSE_FACTS_MAX, DECOMPOSE_FACTS_MIN,
+    ENTITY_LOOKUP_LIMIT_MAX, ENTITY_LOOKUP_LIMIT_MIN, EXTRACT_BATCH_MAX, EXTRACT_BATCH_MIN,
+    EXTRACT_MODES, HISTORY_LIMIT_MAX, HISTORY_LIMIT_MIN, IMPORT_MAX_LENGTH_MAX,
+    IMPORT_MAX_LENGTH_MIN, MEMPALACE_IMPORT_LIMIT_MAX, MEMPALACE_IMPORT_LIMIT_MIN,
+    NORMALIZE_APPLY_MAX, NORMALIZE_APPLY_MIN, NORMALIZE_BATCH_MAX, NORMALIZE_BATCH_MIN,
+    PROMOTION_LIMIT_DEFAULT, PROMOTION_LIMIT_MAX, PROMOTION_LIMIT_MIN, RECALIBRATE_LIMIT_MAX,
+    RECALIBRATE_LIMIT_MIN, RECLASSIFY_BATCH_MAX, RECLASSIFY_BATCH_MIN, REMINDER_LIMIT_MAX,
+    REMINDER_LIMIT_MIN, STALE_CANDIDATES_LIMIT_DEFAULT, STALE_CANDIDATES_LIMIT_MAX,
+    STALE_CANDIDATES_LIMIT_MIN, UNDO_IMPORT_LIMIT_MAX, UNDO_IMPORT_LIMIT_MIN,
 };
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
@@ -510,7 +510,7 @@ impl McpServer {
                         "tools": [
                             {
                                 "name": "remind_me_add",
-                                "description": "Store a new memory fact, preference, or note.",
+                                "description": "Store a new memory fact, preference, or note. Saving a decision checks it against the standing decisions on the same claim or a shared entity and returns likely conflicts as contradiction_candidates; nothing is blocked or superseded automatically. Pass supersedes to retire the old decision in the same call.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -534,7 +534,7 @@ impl McpServer {
                                             }
                                         },
                                         "metadata": { "type": "object", "description": "Free-form JSON stored with the memory; a decision requires a `rationale` string here, an action_item may hold due, owner and status." },
-                                        "subject": { "type": "string", "description": "Subject of a subject-predicate-object fact; a new triple supersedes a live one with the same subject and predicate." },
+                                        "subject": { "type": "string", "description": "Subject of a subject-predicate-object fact. remind_me_add does not supersede a live triple with the same subject and predicate; name it in supersedes to do so." },
                                         "predicate": { "type": "string", "description": "Predicate of the fact triple." },
                                         "object": { "type": "string", "description": "Object of the fact triple." },
                                         "entities": {
@@ -554,7 +554,8 @@ impl McpServer {
                                         "confidence": { "type": "number", "minimum": 0, "maximum": 1, "default": 1, "description": "How far to trust this memory; scales its search ranking." },
                                         "valid_from": { "type": "string", "description": "RFC 3339 time the memory starts to hold; omit for always." },
                                         "valid_until": { "type": "string", "description": "RFC 3339 time it stops holding; after it the memory ranks last and is marked expired." },
-                                        "outcome": { "type": "string", "enum": ["done", "abandoned", "reverted", "superseded"], "description": "Only for decision and action_item memories; prefer remind_me_resolve for an existing one." }
+                                        "outcome": { "type": "string", "enum": ["done", "abandoned", "reverted", "superseded"], "description": "Only for decision and action_item memories; prefer remind_me_resolve for an existing one." },
+                                        "supersedes": { "type": "array", "items": { "type": "string" }, "description": "IDs of live memories this one replaces, e.g. a contradiction_candidates id. Each is marked superseded by the new memory; an id that is missing, deleted or already superseded refuses the add." }
                                     },
                                     "required": ["content"]
                                 }
@@ -597,7 +598,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_update",
-                                "description": "Update an existing memory's content, category, tags, or metadata.",
+                                "description": "Update an existing memory's content, category, tags, or metadata. A content or type change that leaves a decision returns likely conflicting standing decisions as contradiction_candidates.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -1541,9 +1542,10 @@ impl McpServer {
                             Ok((add_input, fields)) => {
                                 match queries::add_memory_with(&store, add_input, &fields) {
                                     Ok(mem) => {
+                                        let check = contradictions::check_on_save(&store, &mem.id);
                                         json!({ "content": [{ "type": "text", "text": match format {
-    ResponseFormat::Json => serde_json::to_string_pretty(&mem).unwrap(),
-    ResponseFormat::Markdown => render::memory_stored(&mem),
+    ResponseFormat::Json => serde_json::to_string_pretty(&SavedMemory { memory: &mem, check }).unwrap(),
+    ResponseFormat::Markdown => render::memory_stored(&mem) + &render::save_check(&check),
 } }] })
                                     }
                                     Err(e) => {
@@ -1622,9 +1624,14 @@ impl McpServer {
                             Ok((update_input, fields)) => {
                                 match queries::update_memory_with(&store, &update_input, &fields) {
                                     Ok(UpdateOutcome::Updated(mem)) => {
+                                        let check = contradictions::check_on_update(
+                                            &store,
+                                            &update_input,
+                                            &fields,
+                                        );
                                         json!({ "content": [{ "type": "text", "text": match format {
-    ResponseFormat::Json => serde_json::to_string_pretty(&mem).unwrap(),
-    ResponseFormat::Markdown => render::memory_updated(&mem),
+    ResponseFormat::Json => serde_json::to_string_pretty(&SavedMemory { memory: &mem, check }).unwrap(),
+    ResponseFormat::Markdown => render::memory_updated(&mem) + &render::save_check(&check),
 } }] })
                                     }
                                     Ok(UpdateOutcome::NotFound) => {

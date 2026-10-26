@@ -36,6 +36,7 @@ pub fn add_memory_with(
     fields: &StructuredFields,
 ) -> Result<Memory> {
     fields.validate(&input.metadata, None)?;
+    check_supersedable(store, &input.supersedes)?;
     let now = Utc::now();
     let now_iso = now.to_rfc3339();
     let id = format!("mem_{}", uuid::Uuid::new_v4().simple());
@@ -111,6 +112,11 @@ pub fn add_memory_with(
         let _ = crate::vectors::embed_and_store(store, &*embedder, &id, &content);
     }
 
+    // Stamped, so the change reaches the sync outbox.
+    for old in &input.supersedes {
+        Memories::new(store).set_superseded_by(old, &id, Some(&now_iso))?;
+    }
+
     let memory = get_memory_by_id(store, &id)?.ok_or(StoreError::NotFound)?;
     crate::episodes::ensure_session_for(store, &memory)?;
 
@@ -121,6 +127,20 @@ pub fn add_memory_with(
     crate::events::emit(crate::events::Event::Created, &memory.id, &memory.category);
 
     Ok(memory)
+}
+
+/// Refuse an add whose `supersedes` names a memory that is missing, deleted
+/// or already superseded, before anything is written.
+fn check_supersedable(store: &Store<'_>, ids: &[String]) -> Result<()> {
+    for id in ids {
+        let live = get_memory_by_id(store, id)?.is_some_and(|m| m.superseded_by.is_none());
+        if !live {
+            return Err(StoreError::Invalid(format!(
+                "supersedes: {id:?} is not a live memory (missing, deleted or already superseded)"
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub fn get_memory_by_id(store: &Store<'_>, id: &str) -> Result<Option<Memory>> {
