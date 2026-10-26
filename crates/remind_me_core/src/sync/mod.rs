@@ -153,8 +153,43 @@ pub fn set_handshake_client(identity: Option<String>) {
     }
 }
 
+thread_local! {
+    /// The caller of the call running on this thread, while [`with_call_client`]
+    /// runs it: `Some(None)` is a caller that did not say who it is.
+    static CALL_CLIENT: std::cell::RefCell<Option<Option<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Restores the enclosing [`CALL_CLIENT`] when a call ends, even by panic.
+struct CallClientGuard(Option<Option<String>>);
+
+impl Drop for CallClientGuard {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        CALL_CLIENT.with(|slot| *slot.borrow_mut() = previous);
+    }
+}
+
+/// Run `f` as one call made by `identity`.
+///
+/// For a transport that serves many callers from one handler, such as the
+/// remote connector: it knows each call's caller, and neither a process-wide
+/// slot nor a thread's session would keep two concurrent callers apart.
+/// Inside `f` the identity wins over both; `None` reads as a caller that
+/// named nobody, falling through to [`CLIENT_ENV`] rather than to whoever
+/// shook hands last.
+pub fn with_call_client<R>(identity: Option<String>, f: impl FnOnce() -> R) -> R {
+    let identity = identity.filter(|s| !s.trim().is_empty());
+    let previous = CALL_CLIENT.with(|slot| slot.borrow_mut().replace(identity));
+    let _restore = CallClientGuard(previous);
+    f()
+}
+
 /// The client identity currently in force.
 pub fn handshake_client() -> Option<String> {
+    if let Some(in_call) = CALL_CLIENT.with(|slot| slot.borrow().clone()) {
+        return in_call;
+    }
     if let Some(in_session) = crate::daemon::session::handshake_client() {
         return in_session;
     }

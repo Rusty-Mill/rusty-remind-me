@@ -16,9 +16,9 @@ pub mod daemon_proxy;
 pub mod references;
 pub mod render;
 
-/// What an MCP client is told about the server on `initialize`: when to
-/// reach for which tool. Kept short; it is paid for in every session.
-const SERVER_INSTRUCTIONS: &str = "Long-term memory for the user. Search (remind_me_search) \
+/// What an MCP client is told about the server on `initialize`, over every
+/// transport: when to reach for which tool. Kept short; it is paid for in every session.
+pub const SERVER_INSTRUCTIONS: &str = "Long-term memory for the user. Search (remind_me_search) \
 before answering anything about the user, their projects or past decisions. Call remind_me_add \
 for each durable fact, decision or preference the user states, passing memory_type (a decision \
 needs metadata.rationale) and confidence when known. Call remind_me_auto_capture at the end of \
@@ -375,11 +375,19 @@ pub struct McpServer {
 /// recording a client called "".
 fn client_identity(req: &serde_json::Value) -> Option<String> {
     let info = req.get("params")?.get("clientInfo")?;
-    let name = info.get("name")?.as_str()?.trim();
+    let name = info.get("name")?.as_str()?;
+    identity(name, info.get("version").and_then(|v| v.as_str()))
+}
+
+/// `"name/version"` for a client's reported `name` and `version`, or `None`
+/// for a blank name: the identity [`client_identity`] reads from a stdio
+/// handshake, for transports that receive the handshake already parsed.
+pub fn identity(name: &str, version: Option<&str>) -> Option<String> {
+    let name = name.trim();
     if name.is_empty() {
         return None;
     }
-    match info.get("version").and_then(|v| v.as_str()).map(str::trim) {
+    match version.map(str::trim) {
         Some(version) if !version.is_empty() => Some(format!("{name}/{version}")),
         _ => Some(name.to_string()),
     }

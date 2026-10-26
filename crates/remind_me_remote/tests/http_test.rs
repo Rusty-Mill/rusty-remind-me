@@ -618,3 +618,100 @@ async fn a_2026_07_28_client_resumes_a_dropped_response_stream_via_last_event_id
         "expected the real tools/list result to be replayed, got: {result}"
     );
 }
+
+/// Open a legacy session as `client_name`, returning its id and the
+/// `initialize` result.
+async fn open_session(
+    client: &reqwest::Client,
+    addr: SocketAddr,
+    client_name: &str,
+) -> (String, Value) {
+    let init = client
+        .post(format!("http://{addr}/mcp/{TOKEN}"))
+        .headers(mcp_headers())
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": { "name": client_name, "version": "1.0" }
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    let session_id = init.headers()["mcp-session-id"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    let payloads = sse_json_payloads(&init.text().await.unwrap());
+    let result = payloads
+        .into_iter()
+        .find(|p| p.get("id") == Some(&json!(1)))
+        .expect("the initialize response must be among the SSE payloads");
+    client
+        .post(format!("http://{addr}/mcp/{TOKEN}"))
+        .headers(mcp_headers())
+        .header("Mcp-Session-Id", &session_id)
+        .json(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }))
+        .send()
+        .await
+        .unwrap();
+    (session_id, result["result"].clone())
+}
+
+/// Add `content` over `session_id` and return the stored memory.
+async fn add_over(
+    client: &reqwest::Client,
+    addr: SocketAddr,
+    session_id: &str,
+    content: &str,
+) -> Value {
+    let call = client
+        .post(format!("http://{addr}/mcp/{TOKEN}"))
+        .headers(mcp_headers())
+        .header("Mcp-Session-Id", session_id)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": "remind_me_add", "arguments": { "content": content } }
+        }))
+        .send()
+        .await
+        .unwrap();
+    let payloads = sse_json_payloads(&call.text().await.unwrap());
+    let result = payloads
+        .iter()
+        .find(|p| p.get("id") == Some(&json!(2)))
+        .expect("the tools/call response must be among the SSE payloads");
+    let text = result["result"]["content"][0]["text"].as_str().unwrap();
+    serde_json::from_str(text).unwrap()
+}
+
+#[tokio::test]
+async fn initialize_tells_a_remote_client_how_to_use_the_memory() {
+    let addr = spawn_server().await;
+    let (_, init) = open_session(&reqwest::Client::new(), addr, "claude-ai").await;
+    assert_eq!(init["instructions"], remind_me_mcp::SERVER_INSTRUCTIONS);
+}
+
+#[tokio::test]
+async fn each_remote_caller_stamps_its_own_writes() {
+    // One server, two connected clients: each memory names the client that
+    // wrote it, not "unknown" and not whichever client shook hands last.
+    let addr = spawn_server().await;
+    let client = reqwest::Client::new();
+    let (claude, _) = open_session(&client, addr, "claude-ai").await;
+    let (chatgpt, _) = open_session(&client, addr, "chatgpt").await;
+
+    let first = add_over(&client, addr, &claude, "written by claude.ai").await;
+    let second = add_over(&client, addr, &chatgpt, "written by chatgpt").await;
+    let third = add_over(&client, addr, &claude, "claude.ai again").await;
+
+    assert_eq!(first["client"], "claude-ai/1.0", "{first}");
+    assert_eq!(second["client"], "chatgpt/1.0", "{second}");
+    assert_eq!(third["client"], "claude-ai/1.0", "{third}");
+}
