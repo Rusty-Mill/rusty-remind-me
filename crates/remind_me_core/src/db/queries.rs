@@ -36,6 +36,7 @@ pub fn add_memory_with(
     fields: &StructuredFields,
 ) -> Result<Memory> {
     fields.validate(&input.metadata, None)?;
+    crate::project::refuse_reserved_predicate(input.predicate.as_deref())?;
     let now = Utc::now();
     let now_iso = now.to_rfc3339();
     let id = format!("mem_{}", uuid::Uuid::new_v4().simple());
@@ -183,6 +184,7 @@ pub fn update_memory_with(
     let Some(stored) = get_memory_by_id(store, &input.memory_id)? else {
         return Ok(UpdateOutcome::NotFound);
     };
+    crate::project::refuse_claim_edit(&stored)?;
     let metadata = input.metadata.as_ref().unwrap_or(&stored.metadata);
     fields.validate(metadata, stored.memory_type.as_deref())?;
 
@@ -399,10 +401,19 @@ pub fn annotate_memories(store: &Store<'_>, input: &AnnotateInput) -> Result<Ann
     let mut errors = Vec::new();
 
     for annotation in &input.annotations {
-        if get_memory_by_id(store, &annotation.memory_id)?.is_none() {
+        let Some(stored) = get_memory_by_id(store, &annotation.memory_id)? else {
             errors.push(AnnotationError {
                 memory_id: annotation.memory_id.clone(),
                 error: "memory not found".to_string(),
+            });
+            continue;
+        };
+        let guarded = crate::project::refuse_reserved_predicate(annotation.predicate.as_deref())
+            .and_then(|()| crate::project::refuse_claim_edit(&stored));
+        if let Err(refused) = guarded {
+            errors.push(AnnotationError {
+                memory_id: annotation.memory_id.clone(),
+                error: refused.to_string(),
             });
             continue;
         }

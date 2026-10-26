@@ -48,6 +48,7 @@ pub mod notifications;
 pub mod obsidian_import;
 pub mod pdf_import;
 pub mod pid;
+pub mod project;
 pub mod promotion;
 pub mod query_expansion;
 pub mod rate_limit;
