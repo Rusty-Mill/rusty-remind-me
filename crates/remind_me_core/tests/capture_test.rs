@@ -208,6 +208,7 @@ fn a_capture_is_searchable() {
             bootstrap: false,
             include_expired: true,
             min_confidence: 0.0,
+            window: Default::default(),
         },
     )
     .unwrap()

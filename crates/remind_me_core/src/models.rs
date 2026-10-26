@@ -371,6 +371,10 @@ pub struct MemorySearchInput {
     /// Drop memories below this `confidence`. `0.0` keeps everything.
     #[serde(default)]
     pub min_confidence: f64,
+    /// Narrow to a `since`/`until` window over `created_at` or `updated_at`.
+    /// Bounded with an empty `query`, the search lists the window newest-first.
+    #[serde(default, flatten)]
+    pub window: crate::time_window::TimeWindow,
 }
 
 fn default_include_expired() -> bool {
@@ -401,6 +405,7 @@ impl Default for MemorySearchInput {
             scope: Default::default(),
             include_expired: true,
             min_confidence: 0.0,
+            window: Default::default(),
         }
     }
 }

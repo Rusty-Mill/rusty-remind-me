@@ -876,6 +876,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     scope: search_args.scope,
                     include_expired: true,
                     min_confidence: 0.0,
+                    window: Default::default(),
                 };
                 let response_format = search_input.response_format;
                 let results: Vec<MemorySearchResult> = Store::open(&db_path)?.call(Op::Search {

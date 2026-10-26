@@ -230,6 +230,7 @@ pub struct KeywordFilter {
     pub category: Option<String>,
     pub include_sensitive: bool,
     pub scope: crate::context::ScopeFilter,
+    pub window: crate::time_window::TimeWindow,
 }
 
 /// Which live, unsuperseded memories a paged search takes.
@@ -504,6 +505,13 @@ impl<'c> Memories<'c> {
             return Ok(Vec::new());
         }
         engine::memories::keyword_hits(&self.core.lock(), phrases, filter, limit)
+    }
+
+    /// Live, unsuperseded memories `filter` admits, newest first on its
+    /// window's timestamp (ties by id), at most `limit`. Serves a search with
+    /// a time window and no query text, where there is nothing to rank.
+    pub fn window_hits(&self, filter: &KeywordFilter, limit: usize) -> Result<Vec<Memory>> {
+        engine::memories::window_hits(&self.core.lock(), filter, limit)
     }
 
     /// The ids of every memory marked sensitive.
@@ -1214,6 +1222,7 @@ mod tests {
                 min_effective_vitality: Some(crate::vitality::VITALITY_FLOOR),
                 category: text("fact"),
                 include_sensitive: true,
+                window: Default::default(),
             },
         ];
         for query in queries {
