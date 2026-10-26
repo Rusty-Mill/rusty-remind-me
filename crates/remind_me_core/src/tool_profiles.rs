@@ -5,7 +5,7 @@
 //! **Context and selection.** Every advertised tool's name, description and
 //! input schema is sent to the model on every session, and clients that defer
 //! tools find them by keyword search over that text. Ten tools a model can tell
-//! apart beat seventy-five it has to search through (ADR-0027).
+//! apart beat seventy-seven it has to search through (ADR-0030).
 //!
 //! # Every tool is in exactly one group
 //!
@@ -53,7 +53,7 @@ pub const CORE: [&str; 10] = [
 ];
 
 /// The LLM-driven refinement loops: `queue` hands out work, the rest apply it.
-pub const PIPELINE: [&str; 15] = [
+pub const PIPELINE: [&str; 16] = [
     "remind_me_queue",
     "remind_me_decompose",
     "remind_me_annotate",
@@ -69,6 +69,9 @@ pub const PIPELINE: [&str; 15] = [
     "remind_me_skeleton_read",
     "remind_me_skeleton_write",
     "remind_me_revert",
+    // ADR-0027 (projects) suggests `core`; it stays here so core holds the
+    // ten tools ADR-0030 settled on. An ordinary session can add `pipeline`.
+    "remind_me_project",
 ];
 
 pub const WIKI: [&str; 4] = [
@@ -85,7 +88,7 @@ pub const IMPORT: [&str; 3] = [
 ];
 
 /// Operations a person runs, not a conversation. `self_update` leaves MCP for
-/// the CLI in the next step of ADR-0027.
+/// the CLI in the next step of ADR-0030.
 pub const ADMIN: [&str; 9] = [
     "remind_me_backup",
     "remind_me_reindex",

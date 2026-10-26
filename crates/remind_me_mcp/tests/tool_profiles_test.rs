@@ -1,5 +1,5 @@
 //! Profile enforcement at the MCP protocol surface (gap E3, issue #122;
-//! ADR-0027).
+//! ADR-0030).
 //!
 //! Its own binary: the profile is a process-wide env var, and the inline unit
 //! tests in `lib.rs` assume the default `full` surface. Setting it there would

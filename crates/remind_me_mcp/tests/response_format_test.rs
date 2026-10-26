@@ -173,7 +173,7 @@ fn the_four_schemas_advertise_the_parameter() {
     let tools = listed["result"]["tools"].as_array().unwrap();
     for (tool, _, markdown_default) in MIRRORED {
         // A merged handler is advertised through the tool it merged into
-        // (ADR-0027).
+        // (ADR-0030).
         let public = remind_me_core::tool_profiles::replacement(tool).unwrap_or(tool);
         let entry = tools
             .iter()

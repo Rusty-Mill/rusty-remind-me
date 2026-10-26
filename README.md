@@ -121,12 +121,12 @@ this touches. Restart the client afterward — a running MCP client does not
 pick up a new stdio server until it restarts.
 
 **Choosing which tools a client sees.** Tools come in six groups, and
-`REMIND_ME_TOOL_PROFILE` picks them per client (ADR-0027):
+`REMIND_ME_TOOL_PROFILE` picks them per client (ADR-0030):
 
 | Group | Tools |
 | --- | --- |
 | `core` (always on) | search, get, add, update, delete, auto_capture, resolve, entity, digest, server_status |
-| `pipeline` | queue and the refinement steps it feeds: decompose, annotate, normalize_apply, reclassify, promote, consolidate, feedback, entity_upsert, entity_traverse, persona, provenance, skeleton_read, skeleton_write, revert |
+| `pipeline` | queue and the refinement steps it feeds: decompose, annotate, normalize_apply, reclassify, promote, consolidate, feedback, entity_upsert, entity_traverse, persona, provenance, skeleton_read, skeleton_write, revert, project |
 | `wiki` | wiki_read, wiki_write, wiki_delete, wiki_compile |
 | `import` | import, undo_import, capture_transcript |
 | `admin` | backup, reindex, archive_prune, export_memories, revoke_clients, api_key, sync_status, sync_repair, self_update |
@@ -270,7 +270,7 @@ Besides its text, category and tags, each memory carries the context it was writ
 
 Two things happen to content before it is stored. Secrets (cloud and GitHub tokens, private keys, JWTs, passwords in URLs, `key=value` credentials) are replaced with `[REDACTED:<kind>]` and the memory is tagged `redacted` (`REMIND_ME_REDACT=0` turns that off). And a `sessions` table records each session's project, branch, start and end commit.
 
-New surfaces: MCP tools `remind_me_resolve`, `remind_me_references` and `remind_me_session_timeline` (`references` has since merged into `remind_me_search`, ADR-0027); CLI `resolve`, `session start|end|timeline`, `capture-transcript` and `context`; `--project`, `--branch`, `--session` and `--written-by` filters on `search` and `list`. With `REMIND_ME_WATCH_CLAUDE_PROJECTS=1` and `REMIND_ME_WATCH_DIRS` unset, the folder watcher ingests `~/.claude/projects/` transcripts. Design: ADR-0026.
+New surfaces: MCP tools `remind_me_resolve`, `remind_me_references` and `remind_me_session_timeline` (`references` has since merged into `remind_me_search`, ADR-0030); CLI `resolve`, `session start|end|timeline`, `capture-transcript` and `context`; `--project`, `--branch`, `--session` and `--written-by` filters on `search` and `list`. With `REMIND_ME_WATCH_CLAUDE_PROJECTS=1` and `REMIND_ME_WATCH_DIRS` unset, the folder watcher ingests `~/.claude/projects/` transcripts. Design: ADR-0026.
 
 ## Claude Code Plugin
 

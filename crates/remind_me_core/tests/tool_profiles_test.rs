@@ -1,4 +1,4 @@
-//! Coverage for tool groups and profiles (gap E3, issue #122; ADR-0027).
+//! Coverage for tool groups and profiles (gap E3, issue #122; ADR-0030).
 //!
 //! That every grouped name is a tool the server actually advertises is
 //! asserted at the protocol surface, in `remind_me_mcp`'s own tests.
@@ -32,7 +32,7 @@ fn the_default_profile_is_full() {
     let _guard = env_lock();
     crate::test_env::remove_var(TOOL_PROFILE_ENV);
 
-    // Upgrading must change nothing for an existing install (ADR-0027 flips
+    // Upgrading must change nothing for an existing install (ADR-0030 flips
     // this in its second step, not this one).
     assert_eq!(configured_profile(), "full");
     assert!(allowed_tools("full").is_none(), "full allows everything");
@@ -96,7 +96,7 @@ fn every_public_tool_is_in_exactly_one_group() {
             assert_eq!(group_of(tool), Some(group));
         }
     }
-    assert_eq!(seen.len(), 44);
+    assert_eq!(seen.len(), 45);
 }
 
 #[test]
@@ -112,8 +112,8 @@ fn every_alias_points_at_a_public_tool_and_is_not_one_itself() {
         assert!(!public.contains(old), "{old} is both public and an alias");
         assert_eq!(replacement(old), Some(new));
     }
-    // 76 tools before ADR-0027: 44 public names, 4 of them new, plus 36 aliases.
-    assert_eq!(public.len() - 4 + ALIASES.len(), 76);
+    // 77 tools before ADR-0030: 45 public names, 4 of them new, plus 36 aliases.
+    assert_eq!(public.len() - 4 + ALIASES.len(), 77);
 }
 
 #[test]

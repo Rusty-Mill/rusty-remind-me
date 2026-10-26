@@ -1,4 +1,4 @@
-//! The public tool surface (ADR-0027): what `tools/list` advertises, and
+//! The public tool surface (ADR-0030): what `tools/list` advertises, and
 //! which handler a public call reaches.
 //!
 //! Handlers keep their pre-0.5 names in [`crate::handler_catalog`] and the

@@ -227,7 +227,7 @@ fn done_leaves_the_weight_and_abandoned_demotes() {
 #[test]
 fn carded_closes_a_decision_without_demoting_it() {
     // Moved to a board card: no longer open, not done, and still worth its
-    // full weight, since the work is live on the card (ADR-0027).
+    // full weight, since the work is live on the card (ADR-0030).
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
     let id = decision(&store, "split the repo");
