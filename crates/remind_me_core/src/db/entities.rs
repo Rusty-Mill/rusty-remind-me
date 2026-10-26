@@ -179,6 +179,13 @@ impl<'c> Entities<'c> {
         engine::graph::linked_memories(&self.core.lock(), entity_id, limit)
     }
 
+    /// Every live memory linked to `entity_id`, whole rows, newest first
+    /// (ties by id, descending). What a rule needs: a snippet cannot carry
+    /// `git_remote`, `cwd`, tags or kind.
+    pub fn linked_memories_full(&self, entity_id: &str) -> Result<Vec<crate::models::Memory>> {
+        engine::graph::linked_memories_full(&self.core.lock(), entity_id)
+    }
+
     /// How many live memories are linked to `entity_id`.
     pub fn linked_memory_count(&self, entity_id: &str) -> Result<usize> {
         engine::graph::linked_memory_count(&self.core.lock(), entity_id)

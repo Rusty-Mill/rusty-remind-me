@@ -801,6 +801,11 @@ impl McpServer {
                                 }
                             },
                             {
+                                "name": "remind_me_project",
+                                "description": remind_me_core::project_tool::DESCRIPTION,
+                                "inputSchema": remind_me_core::project_tool::input_schema()
+                            },
+                            {
                                 "name": "remind_me_entity_upsert",
                                 "description": "Create a knowledge-graph entity, or update its kind. Not present in remind_me — remind_me_entity is read-only there, and is here too, so writing is a separate, explicit call.",
                                 "inputSchema": {
@@ -1874,6 +1879,19 @@ impl McpServer {
                     // `found: false` rather than creating the entity -- see
                     // `EntityLookupInput`'s docs for why that distinction is
                     // load-bearing rather than cosmetic.
+                    // One tool, one entry point: `project_tool::call` is
+                    // what `/api/projects` calls too, so a model and the
+                    // dashboard cannot be told different things.
+                    "remind_me_project" => {
+                        match remind_me_core::project_tool::call(&store, &args) {
+                            Ok(payload) => {
+                                json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&payload).unwrap() }] })
+                            }
+                            Err(e) => {
+                                json!({ "isError": true, "content": [{ "type": "text", "text": store_error_text("Project error", &e) }] })
+                            }
+                        }
+                    }
                     "remind_me_entity" => {
                         let input: Result<EntityLookupInput, _> = serde_json::from_value(args);
                         match input {
