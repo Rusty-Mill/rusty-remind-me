@@ -79,6 +79,7 @@ pub fn capture_transcript(
             session_id,
             cwd,
             reason,
+            context: None,
         },
     )?;
     serde_json::to_value(outcome).map_err(|e| StoreError::Invalid(e.to_string()))
