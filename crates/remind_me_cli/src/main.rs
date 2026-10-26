@@ -877,6 +877,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     scope: search_args.scope,
                     include_expired: true,
                     min_confidence: 0.0,
+                    filters: Default::default(),
                     window: Default::default(),
                 };
                 let response_format = search_input.response_format;

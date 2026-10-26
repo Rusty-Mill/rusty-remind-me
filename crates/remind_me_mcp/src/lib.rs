@@ -763,7 +763,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_search",
-                                "description": "Search memories using FTS5 keyword & hybrid ranking. Returns compact hits by default (id, category, date, tags, score, snippet); fetch full text with remind_me_get memory_ids, or pass detail=full. Hits cut by token_budget are listed by id. The three expansion flags surface adjacent memories in their own sections, outside the ranked results, so they never consume `limit`. `since`/`until` narrow to a time window; with an empty `query` they list that window newest-first, e.g. { \"query\": \"\", \"since\": \"2d\" } for the last two days.",
+                                "description": "Search memories using FTS5 keyword & hybrid ranking. tags, entity, repo and the project/branch/session/writer filters narrow the ranked results before the limit applies. Returns compact hits by default (id, category, date, tags, score, snippet); fetch full text with remind_me_get memory_ids, or pass detail=full. Hits cut by token_budget are listed by id. The three expansion flags surface adjacent memories in their own sections, outside the ranked results, so they never consume `limit`.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -773,6 +773,10 @@ impl McpServer {
                                         "detail": { "type": "string", "enum": ["compact", "full"], "default": "compact", "description": "compact (default): one short line per hit, so more hits fit the budget. full: whole memories with metadata and references." },
                                         "token_budget": { "type": "integer", "default": 800, "minimum": 0, "description": "Estimated tokens the hits may use; 0 is unlimited. Hits that do not fit are listed by id." },
                                         "category": { "type": "string" },
+                                        "tags": { "type": "array", "items": { "type": "string" }, "description": "Only memories carrying these tags (see tag_mode)" },
+                                        "tag_mode": { "type": "string", "enum": ["all", "any"], "default": "all", "description": "all: every tag must be present; any: at least one" },
+                                        "entity": { "type": "string", "description": "Only memories about this entity, by name or alias: linked to it, or naming it as subject or object. An unknown entity matches nothing." },
+                                        "repo": { "type": "string", "description": "Only memories written in this git repository (origin remote, any URL form, e.g. github.com/owner/repo)" },
                                         "project": { "type": "string", "description": "Only memories written in this project (case-insensitive)" },
                                         "branch": { "type": "string", "description": "Only memories written on this git branch" },
                                         "session_id": { "type": "string", "description": "Only memories written in this client session" },
@@ -4129,27 +4133,32 @@ mod tests {
     #[test]
     fn a_window_narrows_by_what_it_applies_and_refuses_what_it_does_not() {
         let server = McpServer::new(Database::open_in_memory().unwrap());
-        for (content, category) in [("Alpha window", "fact"), ("Beta window", "note")] {
+        for (content, category, tag) in [
+            ("Alpha window", "fact", "wanted"),
+            ("Beta window", "note", "other"),
+        ] {
             call(
                 &server,
                 "remind_me_add",
-                json!({ "content": content, "category": category, "tags": ["wanted"] }),
+                json!({ "content": content, "category": category, "tags": [tag] }),
             );
         }
 
-        let narrowed = text_of(&call(
-            &server,
-            "remind_me_search",
+        for narrowing in [
             json!({ "since": "1h", "category": "fact" }),
-        ));
-        assert!(narrowed.contains("Alpha window"), "{narrowed}");
-        assert!(
-            !narrowed.contains("Beta window"),
-            "category was dropped: {narrowed}"
-        );
+            json!({ "query": "", "since": "1h", "tags": ["wanted"] }),
+        ] {
+            let narrowed = call(&server, "remind_me_search", narrowing.clone());
+            let text = text_of(&narrowed);
+            assert!(narrowed.get("isError").is_none(), "{narrowing}: {text}");
+            assert!(text.contains("Alpha window"), "{narrowing}: {text}");
+            assert!(
+                !text.contains("Beta window"),
+                "{narrowing} was dropped: {text}"
+            );
+        }
 
         for unapplied in [
-            json!({ "query": "", "since": "1h", "tags": ["wanted"] }),
             json!({ "since": "1h", "source": "chat" }),
             json!({ "since": "1h", "offset": 1 }),
         ] {
@@ -6392,6 +6401,41 @@ mod structure_tests {
     }
 
     #[test]
+    fn search_narrows_by_tags_and_advertises_its_filters() {
+        let s = server();
+        let props = &tool(&s, "remind_me_search")["inputSchema"]["properties"];
+        for field in ["tags", "tag_mode", "entity", "repo"] {
+            assert!(props[field].is_object(), "search should advertise {field}");
+        }
+        call(
+            &s,
+            "remind_me_add",
+            json!({ "content": "mux pane layout", "tags": ["mux"] }),
+        );
+        call(
+            &s,
+            "remind_me_add",
+            json!({ "content": "mux in the terminal", "tags": ["term"] }),
+        );
+
+        let found = call(
+            &s,
+            "remind_me_search",
+            json!({ "query": "mux", "tags": ["mux"], "response_format": "json" }),
+        );
+        let md = text(&found);
+        assert!(md.contains("mux pane layout"), "{md}");
+        assert!(!md.contains("mux in the terminal"), "{md}");
+
+        let bad = call(
+            &s,
+            "remind_me_search",
+            json!({ "query": "mux", "tag_mode": "some" }),
+        );
+        assert!(is_error(&bad), "{bad}");
+    }
+
+    #[test]
     fn a_decision_without_a_rationale_is_rejected_with_the_field_named() {
         let s = server();
         let bad = call(
@@ -6567,6 +6611,45 @@ mod structure_tests {
             json!({ "query": "quokka policy", "include_expired": false }),
         );
         assert!(text(&hidden).contains("No memories"), "{}", text(&hidden));
+    }
+
+    #[test]
+    fn a_queryless_window_search_is_narrowed_ranked_by_validity_and_limited() {
+        let s = server();
+        call(
+            &s,
+            "remind_me_add",
+            json!({ "content": "solid mux note", "tags": ["mux"] }),
+        );
+        call(
+            &s,
+            "remind_me_add",
+            json!({ "content": "shaky mux note", "tags": ["mux"], "confidence": 0.2 }),
+        );
+        call(
+            &s,
+            "remind_me_add",
+            json!({ "content": "term pane note", "tags": ["term"] }),
+        );
+
+        let search = |args: Value| text(&call(&s, "remind_me_search", args));
+        // Newest first would put the shaky note on top; low confidence
+        // demotes it, and the limit keeps one.
+        let top = search(json!({ "query": "", "since": "1h", "tags": ["mux"], "limit": 1 }));
+        assert!(top.contains("solid mux note"), "{top}");
+        assert!(
+            !top.contains("shaky mux note") && !top.contains("term pane note"),
+            "{top}"
+        );
+
+        let both = search(json!({ "query": "", "since": "1h", "tags": ["mux"], "limit": 5 }));
+        assert!(
+            both.contains("shaky mux note") && !both.contains("term pane note"),
+            "{both}"
+        );
+
+        let none = search(json!({ "query": "", "since": "1h", "repo": "github.com/acme/none" }));
+        assert!(none.contains("No memories"), "{none}");
     }
 
     #[test]

@@ -185,14 +185,18 @@ const FOR_LISTING: [&str; 12] = [
 
 /// The only arguments a blank-query search over a `since`/`until` window
 /// honours: the filters its newest-first listing applies, and the shaping of
-/// its output. `tags`, `source`, `offset`, the expansion flags and the
-/// ranking options do nothing there, so they are refused.
-const FOR_WINDOW: [&str; 18] = [
+/// its output. `source`, `offset`, the expansion flags and the ranking options
+/// do nothing there, so they are refused.
+const FOR_WINDOW: [&str; 22] = [
     "query",
     "since",
     "until",
     "time_field",
     "category",
+    "tags",
+    "tag_mode",
+    "entity",
+    "repo",
     "include_sensitive",
     "project",
     "branch",
@@ -617,13 +621,13 @@ mod tests {
             json!({"query": "", "since": "2d", "detail": "full", "token_budget": 50}),
             json!({"until": "2030-01-01T00:00:00Z", "min_confidence": 0.5}),
             json!({"query": null, "since": "1h"}),
+            json!({"since": "1h", "tags": ["a"], "tag_mode": "any", "entity": "e", "repo": "r"}),
         ] {
             let (handler, args) = routed("remind_me_search", windowed);
             assert_eq!(handler, "remind_me_search");
             assert_eq!(args["query"], "", "{args}");
         }
         for unapplied in [
-            json!({"query": "", "since": "1h", "tags": ["wanted"]}),
             json!({"since": "1h", "source": "chat"}),
             json!({"until": "2030-01-01T00:00:00Z", "offset": 5}),
             json!({"since": "1h", "expand_entities": true}),
