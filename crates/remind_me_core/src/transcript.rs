@@ -15,7 +15,7 @@ use crate::db::memories::{Memories, MemoryEdit};
 use crate::db::{Result, Store, StoreError};
 use crate::history::{capture_revision, TrackedChanges};
 use crate::importer::{extract_messages_with_tools, ChatMessage};
-use crate::models::AutoCaptureInput;
+use crate::models::{AutoCaptureInput, WriteContext};
 use chrono::Utc;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -28,6 +28,11 @@ pub const SUMMARY_PART_CHARS: usize = 500;
 /// transcript can run to megabytes, and what was said last is what a later
 /// session needs.
 pub const MAX_DIALOG_CHARS: usize = 200_000;
+/// Largest transcript a remote caller may send in one capture. A longer
+/// session sends its tail: the dialog keeps only the newest
+/// [`MAX_DIALOG_CHARS`] anyway. Sized so the transcript, escaped into a JSON
+/// string, still fits the remote server's 4 MiB request body.
+pub const MAX_TRANSCRIPT_BYTES: usize = 3 * 1024 * 1024;
 const TRUNCATION_MARKER: &str = "[earlier messages truncated]\n\n";
 
 /// What a transcript says, ready to store.
@@ -159,6 +164,10 @@ pub struct TranscriptRequest<'a> {
     pub cwd: Option<&'a Path>,
     /// `stop`, `precompact` or `end`; kept in metadata.
     pub reason: Option<&'a str>,
+    /// Where the session ran, as its caller saw it. Set by a remote caller,
+    /// whose cwd and git state are on another machine; `None` probes `cwd`
+    /// here.
+    pub context: Option<&'a WriteContext>,
 }
 
 /// The ids the CLI prints.
@@ -195,21 +204,54 @@ pub fn capture_transcript(
     if parsed.messages == 0 {
         return Err(StoreError::Invalid("transcript has no messages".into()));
     }
+    let outcome = match existing_dialog(store, session_id)? {
+        Some(existing) => recapture(store, &existing, &parsed, request.reason)?,
+        None => first_capture(store, session_id, &parsed, request)?,
+    };
+    // The raw transcript decorates the capture; failing to keep it must not
+    // fail the capture, so it is reported and the capture stands.
+    if let Err(e) =
+        crate::archive::store_session(store, session_id, raw.as_bytes(), &outcome.dialog_id)
+    {
+        eprintln!("rusty-remind-me: transcript of session {session_id} not archived: {e}");
+    }
+    Ok(outcome)
+}
+
+/// Where the session ran: the caller's own context when given, else what
+/// probing its cwd here finds.
+fn session_context(
+    session_id: &str,
+    parsed: &TranscriptSummary,
+    request: &TranscriptRequest<'_>,
+) -> WriteContext {
+    if let Some(given) = request.context {
+        return WriteContext {
+            session_id: Some(session_id.to_string()),
+            ..given.clone()
+        };
+    }
     let cwd = request
         .cwd
         .map(Path::to_path_buf)
         .or_else(|| parsed.cwd.as_deref().map(Into::into));
-    let context = match &cwd {
+    match &cwd {
         Some(dir) => crate::episodes::write_context(dir, Some(session_id)),
-        None => crate::models::WriteContext {
+        None => WriteContext {
             session_id: Some(session_id.to_string()),
             ..Default::default()
         },
-    };
-
-    if let Some(existing) = existing_dialog(store, session_id)? {
-        return recapture(store, &existing, &parsed, request.reason);
     }
+}
+
+/// Create the session's dialog and summary pair.
+fn first_capture(
+    store: &Store<'_>,
+    session_id: &str,
+    parsed: &TranscriptSummary,
+    request: &TranscriptRequest<'_>,
+) -> Result<TranscriptOutcome> {
+    let context = session_context(session_id, parsed, request);
 
     let mut tags = vec!["transcript".to_string()];
     tags.extend(context.project.clone());
@@ -392,6 +434,7 @@ mod tests {
             session_id: "s1",
             cwd: Some(Path::new("/work/quokka")),
             reason: Some(reason),
+            context: None,
         }
     }
 
@@ -451,5 +494,32 @@ mod tests {
             ..request("stop")
         };
         assert!(capture_transcript(&store, &transcript(""), &blank).is_err());
+    }
+
+    #[test]
+    fn a_callers_context_is_stamped_instead_of_probing_its_cwd() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        let given = WriteContext {
+            project: Some("rusty_mill".into()),
+            git_branch: Some("main".into()),
+            git_sha: Some("abc123".into()),
+            cwd: Some("/home/user/rusty_mill".into()),
+            session_id: Some("ignored".into()),
+            ..WriteContext::default()
+        };
+        let remote = TranscriptRequest {
+            cwd: None,
+            context: Some(&given),
+            ..request("stop")
+        };
+        let made = capture_transcript(&store, &transcript(""), &remote).unwrap();
+        let memories = crate::episodes::session_memories(&store, "s1").unwrap();
+        let dialog = memories.iter().find(|m| m.id == made.dialog_id).unwrap();
+        assert_eq!(dialog.session_id.as_deref(), Some("s1"));
+        assert_eq!(dialog.project.as_deref(), Some("rusty_mill"));
+        assert_eq!(dialog.git_branch.as_deref(), Some("main"));
+        assert_eq!(dialog.git_sha.as_deref(), Some("abc123"));
+        assert_eq!(dialog.cwd.as_deref(), Some("/home/user/rusty_mill"));
     }
 }

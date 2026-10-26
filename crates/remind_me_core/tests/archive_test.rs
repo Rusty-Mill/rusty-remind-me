@@ -485,3 +485,51 @@ fn a_malformed_line_does_not_shift_the_spans_after_it() {
     crate::test_env::remove_var(ARCHIVE_DIR_ENV);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A session captured twice keeps one archive: the latest transcript, with
+/// the first copy's blob unlinked, and the dialog pointing at the whole file.
+#[test]
+fn a_recaptured_session_keeps_only_its_latest_transcript() {
+    use remind_me_core::transcript::{capture_transcript, TranscriptRequest};
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_limits();
+
+    let dir = scratch("session");
+    crate::test_env::set_var(ARCHIVE_DIR_ENV, dir.join("archive"));
+    let db = open();
+    let store = db.store();
+    let request = TranscriptRequest {
+        session_id: "sess_abc",
+        cwd: None,
+        reason: Some("stop"),
+        context: None,
+    };
+
+    let first = transcript_line("first answer", "thinking one", "/one");
+    let made = capture_transcript(&store, &first, &request).unwrap();
+    let import_id = archive::session_import_id("sess_abc");
+    let first_blob = archive_path(&store, &import_id);
+
+    let grown = format!(
+        "{first}\n{}",
+        transcript_line("second", "thinking two", "/two")
+    );
+    capture_transcript(&store, &grown, &request).unwrap();
+
+    assert_eq!(archive_rows(&store), 1, "one archive per session");
+    assert!(
+        !std::path::Path::new(&first_blob).exists(),
+        "old copy unlinked"
+    );
+    let source = archive::source_for(&store, &made.dialog_id, false)
+        .unwrap()
+        .expect("the dialog has a source");
+    assert_eq!(source.content, grown);
+    assert!(
+        source.content.contains("thinking two"),
+        "what the dialog drops is kept"
+    );
+
+    crate::test_env::remove_var(ARCHIVE_DIR_ENV);
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -385,6 +385,56 @@ fn client_identity(req: &serde_json::Value) -> Option<String> {
     }
 }
 
+/// `remind_me_capture_transcript`: the hook-facing capture, for a caller with
+/// no CLI on its machine. The caller's context is taken as given: its cwd is
+/// on another machine, so nothing here probes it.
+fn capture_transcript_tool(
+    store: &remind_me_core::db::Store<'_>,
+    args: &Value,
+) -> Result<remind_me_core::transcript::TranscriptOutcome, String> {
+    use remind_me_core::models::WriteContext;
+    use remind_me_core::transcript::{capture_transcript, TranscriptRequest, MAX_TRANSCRIPT_BYTES};
+    let text = |key: &str| {
+        args.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    let session_id = text("session_id").ok_or("session_id is required")?;
+    let transcript = args
+        .get("transcript")
+        .and_then(Value::as_str)
+        .ok_or("transcript is required")?;
+    if transcript.len() > MAX_TRANSCRIPT_BYTES {
+        return Err(format!(
+            "transcript is {} bytes; send at most {MAX_TRANSCRIPT_BYTES}, its tail cut at a line",
+            transcript.len()
+        ));
+    }
+    let reason = text("reason");
+    if let Some(r) = reason.as_deref() {
+        if !matches!(r, "stop" | "precompact" | "end") {
+            return Err(format!("reason must be stop, precompact or end, not {r:?}"));
+        }
+    }
+    let context = WriteContext {
+        project: text("project"),
+        session_id: Some(session_id.clone()),
+        git_remote: text("git_remote"),
+        git_branch: text("git_branch"),
+        git_sha: text("git_sha"),
+        cwd: text("cwd"),
+    };
+    let request = TranscriptRequest {
+        session_id: &session_id,
+        cwd: None,
+        reason: reason.as_deref(),
+        context: Some(&context),
+    };
+    capture_transcript(store, transcript, &request).map_err(|e| e.to_string())
+}
+
 impl McpServer {
     pub fn new(db: Database) -> Self {
         Self::with_wiki(db, Wiki::from_env())
@@ -840,6 +890,24 @@ impl McpServer {
                                         "metadata": { "type": "object" }
                                     },
                                     "required": ["conversation", "summary"]
+                                }
+                            },
+                            {
+                                "name": "remind_me_capture_transcript",
+                                "description": "Store or refresh a Claude Code session's capture from its raw JSONL transcript: one dialog and summary pair per session_id, replaced in place on every call. For hooks on machines without the CLI (cloud sessions); a model should use remind_me_auto_capture. The raw transcript is also archived when REMIND_ME_ARCHIVE_DIR is set.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "session_id": { "type": "string", "minLength": 1, "maxLength": 200 },
+                                        "transcript": { "type": "string", "minLength": 1, "maxLength": 3145728, "description": "The session's JSONL transcript so far; a caller over the limit sends its tail, cut at a line" },
+                                        "reason": { "type": "string", "enum": ["stop", "precompact", "end"] },
+                                        "project": { "type": "string", "maxLength": 200 },
+                                        "git_remote": { "type": "string", "maxLength": 500 },
+                                        "git_branch": { "type": "string", "maxLength": 200 },
+                                        "git_sha": { "type": "string", "maxLength": 64 },
+                                        "cwd": { "type": "string", "maxLength": 1000, "description": "Recorded as given; never read on this machine" }
+                                    },
+                                    "required": ["session_id", "transcript"]
                                 }
                             },
                             {
@@ -2093,6 +2161,16 @@ impl McpServer {
                             }
                             Err(e) => {
                                 json!({ "isError": true, "content": [{ "type": "text", "text": format!("Invalid auto capture input: {}", e) }] })
+                            }
+                        }
+                    }
+                    "remind_me_capture_transcript" => {
+                        match capture_transcript_tool(&store, &args) {
+                            Ok(outcome) => {
+                                json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&outcome).unwrap() }] })
+                            }
+                            Err(e) => {
+                                json!({ "isError": true, "content": [{ "type": "text", "text": format!("Capture transcript error: {}", e) }] })
                             }
                         }
                     }
@@ -3838,6 +3916,59 @@ mod tests {
             "{}",
             text_of(&md)
         );
+    }
+
+    #[test]
+    fn capture_transcript_stores_one_capture_per_session_with_the_callers_context() {
+        let db = Database::open_in_memory().unwrap();
+        let server = McpServer::new(db);
+        let line = |text: &str| {
+            json!({"type": "user", "sessionId": "cloud-1", "cwd": "/nowhere/here",
+                   "message": {"role": "user", "content": text}})
+            .to_string()
+        };
+        let args = |transcript: String| {
+            json!({ "session_id": "cloud-1", "transcript": transcript, "reason": "stop",
+                    "project": "rusty_mill", "git_branch": "main", "cwd": "/home/user/rusty_mill" })
+        };
+
+        let first = call(
+            &server,
+            "remind_me_capture_transcript",
+            args(line("ship it")),
+        );
+        assert!(first.get("isError").is_none(), "{first}");
+        let first: Value = serde_json::from_str(&text_of(&first)).unwrap();
+        let grown = format!("{}\n{}", line("ship it"), line("and test it"));
+        let second = call(&server, "remind_me_capture_transcript", args(grown));
+        let second: Value = serde_json::from_str(&text_of(&second)).unwrap();
+        assert_eq!(first["capture_id"], second["capture_id"]);
+        assert_eq!(second["messages"], 2);
+
+        let got = call(
+            &server,
+            "remind_me_get",
+            json!({ "memory_id": second["dialog_id"], "response_format": "json" }),
+        );
+        let dialog: Value = serde_json::from_str(&text_of(&got)).unwrap();
+        assert_eq!(dialog["project"], "rusty_mill");
+        assert_eq!(dialog["git_branch"], "main");
+        assert_eq!(dialog["cwd"], "/home/user/rusty_mill");
+    }
+
+    #[test]
+    fn capture_transcript_refuses_bad_input() {
+        let db = Database::open_in_memory().unwrap();
+        let server = McpServer::new(db);
+        for args in [
+            json!({ "transcript": "{}" }),
+            json!({ "session_id": "s", "transcript": "" }),
+            json!({ "session_id": "s", "transcript": "{}", "reason": "later" }),
+            json!({ "session_id": "s", "transcript": "x".repeat(remind_me_core::transcript::MAX_TRANSCRIPT_BYTES + 1) }),
+        ] {
+            let result = call(&server, "remind_me_capture_transcript", args);
+            assert_eq!(result["isError"], true, "{result}");
+        }
     }
 
     #[test]
