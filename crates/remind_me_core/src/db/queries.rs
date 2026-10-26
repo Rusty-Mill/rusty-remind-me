@@ -668,25 +668,32 @@ pub fn search_memories_deadlined(
     // Degrading to keyword-only rather than erroring is the same choice the
     // `None` arm below already makes for an unconfigured embedder: partial
     // results with an honest label beat a killed query.
-    let embedder = match embedder {
-        Some(e) if deadline.expired() => {
+    let semantic_embedder = match embedder {
+        Some(_) if deadline.expired() => {
             timing.skipped.push("semantic".to_string());
-            let _ = e;
             None
         }
         other => other,
     };
 
-    let (semantic_memories, semantic_similarity) = match embedder {
-        Some(embedder) => {
+    let (semantic_memories, semantic_similarity) = match semantic_embedder {
+        Some(semantic) => {
             let extra_texts = crate::query_expansion::expand_query(&input.query);
-            let scored = crate::vectors::semantic_search_scored(
+            // Raw rows are left out before the best `limit * 2` are chosen:
+            // filtering after would let stronger raw hits take every slot.
+            let excluded = if filter.exclude_raw {
+                memories_repo.raw_ids()?
+            } else {
+                std::collections::HashSet::new()
+            };
+            let scored = crate::vectors::semantic_search_excluding(
                 store,
-                embedder,
+                semantic,
                 &input.query,
                 &extra_texts,
                 input.limit * 2,
                 input.category.as_deref(),
+                &excluded,
             )
             .unwrap_or_default();
             let mut memories = Vec::with_capacity(scored.len());
@@ -710,10 +717,6 @@ pub fn search_memories_deadlined(
                 let hidden = memories_repo.sensitive_ids()?;
                 memories.retain(|m| !hidden.contains(&m.id));
                 similarity.retain(|id, _| !hidden.contains(id));
-            }
-            if filter.exclude_raw {
-                memories.retain(|m| !crate::db::memories::is_raw_category(&m.category));
-                similarity.retain(|id, _| memories.iter().any(|m| &m.id == id));
             }
             (memories, similarity)
         }
@@ -783,8 +786,15 @@ pub fn search_memories_deadlined(
             include_raw: true,
             ..input.clone()
         };
+        // Same embedder and deadline: the second pass skips what the first
+        // skipped, and both passes' skipped stages are reported.
         let mut outcome = search_memories_deadlined(store, &raw, embedder, deadline)?;
         outcome.raw_fallback = !outcome.results.is_empty();
+        for stage in timing.skipped {
+            if !outcome.timing.skipped.contains(&stage) {
+                outcome.timing.skipped.push(stage);
+            }
+        }
         return Ok(outcome);
     }
 

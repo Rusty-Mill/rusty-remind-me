@@ -1203,6 +1203,13 @@ pub(crate) fn sensitive_ids(tables: &EngineTables) -> Result<HashSet<String>> {
         .collect())
 }
 
+pub(crate) fn raw_ids(tables: &EngineTables) -> Result<HashSet<String>> {
+    Ok(rows(core_ref(tables)?)
+        .filter(|row| crate::db::memories::is_raw_category(&row.category))
+        .map(|row| row.id)
+        .collect())
+}
+
 /// What `Memories::keyword_page` selects. `linked` holds the ids of the
 /// memories linked to the filter's entity, read from SQLite.
 pub(crate) fn keyword_page(

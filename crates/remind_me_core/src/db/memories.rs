@@ -523,6 +523,11 @@ impl<'c> Memories<'c> {
         engine::memories::sensitive_ids(&self.core.lock())
     }
 
+    /// Ids of every memory in a [`RAW_CATEGORIES`] category.
+    pub fn raw_ids(&self) -> Result<HashSet<String>> {
+        engine::memories::raw_ids(&self.core.lock())
+    }
+
     /// A page of the live, unsuperseded memories `filter` takes: matching
     /// any of `phrases`, best BM25 first, or with no phrases newest first
     /// (ties by id either way). How many there are, and the page.

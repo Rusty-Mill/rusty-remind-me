@@ -228,6 +228,21 @@ pub fn semantic_search_scored(
     limit: usize,
     category: Option<&str>,
 ) -> Result<Vec<(Memory, f32)>, VectorError> {
+    let none = std::collections::HashSet::new();
+    semantic_search_excluding(store, embedder, query, extra_texts, limit, category, &none)
+}
+
+/// [`semantic_search_scored`] with `excluded` ids left out before the best
+/// `limit` are chosen, so a filtered-out row never takes a candidate's place.
+pub fn semantic_search_excluding(
+    store: &Store<'_>,
+    embedder: &dyn Embedder,
+    query: &str,
+    extra_texts: &[String],
+    limit: usize,
+    category: Option<&str>,
+    excluded: &std::collections::HashSet<String>,
+) -> Result<Vec<(Memory, f32)>, VectorError> {
     let mut fuse_texts = Vec::with_capacity(1 + extra_texts.len());
     fuse_texts.push(query.to_string());
     fuse_texts.extend(extra_texts.iter().cloned());
@@ -242,7 +257,14 @@ pub fn semantic_search_scored(
     // ran. `None` means scan everything — a search must not fail, or change
     // its answers, because an optimisation was unavailable.
     if let Some(narrowed) = crate::ann_index::candidates(store, &query_vector, limit) {
-        let scored = scan_and_score(store, &query_vector, limit, category, Some(&narrowed))?;
+        let scored = scan_and_score(
+            store,
+            &query_vector,
+            limit,
+            category,
+            Some(&narrowed),
+            excluded,
+        )?;
         // A category filter can remove most of what the index proposed.
         // Returning fewer results than a full scan would have is a retrieval
         // regression nobody would notice, so fall back rather than accept a
@@ -251,7 +273,7 @@ pub fn semantic_search_scored(
             return Ok(scored);
         }
     }
-    scan_and_score(store, &query_vector, limit, category, None)
+    scan_and_score(store, &query_vector, limit, category, None, excluded)
 }
 
 /// Score every candidate exactly and return the best `limit`.
@@ -265,6 +287,7 @@ fn scan_and_score(
     limit: usize,
     category: Option<&str>,
     narrowed: Option<&[String]>,
+    excluded: &std::collections::HashSet<String>,
 ) -> Result<Vec<(Memory, f32)>, VectorError> {
     // The same filter the keyword branch of search applies, so the two ranked
     // lists retrieval fuses answer the same question.
@@ -278,6 +301,9 @@ fn scan_and_score(
         embedding: bytes,
     } in chunks
     {
+        if excluded.contains(&memory_id) {
+            continue;
+        }
         let vector = le_bytes_to_f32(&bytes);
         if vector.len() != query_vector.len() {
             // A stale vector from a dimension this store no longer embeds
