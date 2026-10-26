@@ -76,6 +76,7 @@ fn search(store: &Store<'_>, query: &str) {
             response_format: Default::default(),
             include_dormant: true,
             min_vitality: 0.0,
+            detail: Default::default(),
             verbose: false,
             expand_entities: false,
             include_neighbors: false,

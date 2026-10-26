@@ -49,6 +49,7 @@ fn search(store: &Store<'_>, query: &str, include_dormant: bool, min_vitality: f
         response_format: Default::default(),
         include_dormant,
         min_vitality,
+        detail: Default::default(),
         verbose: false,
         expand_entities: false,
         include_neighbors: false,

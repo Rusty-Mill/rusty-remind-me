@@ -286,3 +286,59 @@ fn filters_apply_to_semantic_hits_too() {
             .collect();
     assert_eq!(got, ["kept"]);
 }
+
+/// Texts naming "term" embed to one point and everything else nearby, so
+/// "term" rows always outrank the rest semantically.
+struct TermFirst;
+
+impl Embedder for TermFirst {
+    fn embed(&self, texts: &[String], _role: EmbedRole) -> Result<Vec<Vec<f32>>, EmbedError> {
+        Ok(texts
+            .iter()
+            .map(|t| {
+                if t.contains("term") {
+                    vec![1.0, 0.0]
+                } else {
+                    vec![0.6, 0.8]
+                }
+            })
+            .collect())
+    }
+
+    fn dim(&self) -> usize {
+        2
+    }
+
+    fn identity(&self) -> EmbeddingIdentity {
+        EmbeddingIdentity {
+            backend: "term-first".into(),
+            model: "test".into(),
+            dim: 2,
+        }
+    }
+}
+
+#[test]
+fn semantic_filters_refill_past_out_of_scope_neighbours() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    // Five better semantic matches outside the filter, more than the
+    // semantic pool (2 x limit) holds, and one worse match inside it.
+    for i in 0..5 {
+        let id = format!("t{i}");
+        put(&store, &id, "term note", &["term"], None);
+        embed_and_store(&store, &TermFirst, &id, "term note").unwrap();
+    }
+    put(&store, "kept", "pane layout", &["mux"], None);
+    embed_and_store(&store, &TermFirst, "kept", "pane layout").unwrap();
+
+    let mut narrowed = input("term", &["mux"], SearchFilters::default());
+    narrowed.limit = 1;
+    let got: Vec<String> =
+        queries::search_memories_with_embedder(&store, &narrowed, Some(&TermFirst))
+            .unwrap()
+            .into_iter()
+            .map(|r| r.memory.id)
+            .collect();
+    assert_eq!(got, ["kept"]);
+}

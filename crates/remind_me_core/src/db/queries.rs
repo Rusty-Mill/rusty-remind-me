@@ -623,7 +623,7 @@ pub fn search_memories_deadlined(
     let narrowing = match resolve_narrowing(store, input)? {
         Some(narrowing) if !phrases.is_empty() => narrowing,
         _ => {
-            let mut outcome = trim_by_token_budget(Vec::new(), input.token_budget);
+            let mut outcome = trim_by_token_budget(Vec::new(), input.token_budget, input.detail);
             timing.elapsed_ms = deadline.elapsed_ms();
             outcome.timing = timing;
             return Ok(outcome);
@@ -686,13 +686,27 @@ pub fn search_memories_deadlined(
     let (semantic_memories, semantic_similarity) = match embedder {
         Some(embedder) => {
             let extra_texts = crate::query_expansion::expand_query(&input.query);
-            let scored = crate::vectors::semantic_search_scored(
+            // Filtering the keyword half alone would not be enough: RRF fuses
+            // two independent result sets, so a sensitive or out-of-scope
+            // memory excluded there could still arrive through the semantic
+            // half. Admitted inside the scan, before its limit, so the filters
+            // never starve the semantic list.
+            let hidden = if input.include_sensitive {
+                std::collections::HashSet::new()
+            } else {
+                memories_repo.sensitive_ids()?
+            };
+            let admit = |m: &Memory| {
+                !hidden.contains(&m.id) && input.scope.matches_memory(m) && narrowing.admits(m)
+            };
+            let scored = crate::vectors::semantic_search_admitted(
                 store,
                 embedder,
                 &input.query,
                 &extra_texts,
                 input.limit * 2,
                 input.category.as_deref(),
+                &admit,
             )
             .unwrap_or_default();
             let mut memories = Vec::with_capacity(scored.len());
@@ -700,21 +714,6 @@ pub fn search_memories_deadlined(
             for (memory, sim) in scored {
                 similarity.insert(memory.id.clone(), sim as f64);
                 memories.push(memory);
-            }
-            // Filtering the keyword SQL alone would not be enough: RRF fuses
-            // two independent result sets, so a sensitive memory excluded from
-            // the keyword half could still arrive through the semantic half and
-            // rank into the output. Done here rather than by threading a
-            // parameter through `semantic_search_scored`, which would change an
-            // existing public signature.
-            // Same reason for the project/branch/session/writer scope and
-            // the tag/entity/repo narrowing.
-            memories.retain(|m| input.scope.matches_memory(m) && narrowing.admits(m));
-            similarity.retain(|id, _| memories.iter().any(|m| &m.id == id));
-            if !input.include_sensitive {
-                let hidden = memories_repo.sensitive_ids()?;
-                memories.retain(|m| !hidden.contains(&m.id));
-                similarity.retain(|id, _| !hidden.contains(id));
             }
             (memories, similarity)
         }
@@ -777,7 +776,7 @@ pub fn search_memories_deadlined(
     };
     ranked.truncate(input.limit);
 
-    let mut outcome = trim_by_token_budget(ranked, input.token_budget);
+    let mut outcome = trim_by_token_budget(ranked, input.token_budget, input.detail);
     timing.elapsed_ms = deadline.elapsed_ms();
     outcome.timing = timing;
     Ok(outcome)
@@ -979,6 +978,7 @@ pub fn search_with_expansions(
         total_candidates: outcome.total_candidates,
         returned: outcome.returned,
         trimmed: outcome.trimmed,
+        trimmed_ids: outcome.trimmed_ids,
         // Hits only, matching this field's documented meaning. The bootstrap
         // carries its own `tokens_used`, so the response total is the sum of
         // the two rather than either one restated — see the renderer, which

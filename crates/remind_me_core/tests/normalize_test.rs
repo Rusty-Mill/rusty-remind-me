@@ -477,6 +477,7 @@ fn the_distillation_is_searchable() {
             response_format: Default::default(),
             include_dormant: false,
             min_vitality: 0.0,
+            detail: Default::default(),
             verbose: false,
             expand_entities: false,
             include_neighbors: false,
