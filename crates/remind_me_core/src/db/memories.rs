@@ -436,6 +436,11 @@ impl<'c> Memories<'c> {
         engine::memories::all_live(&self.core.lock())
     }
 
+    /// Every live memory of `memory_type`, oldest first.
+    pub fn live_of_type(&self, memory_type: &str) -> Result<Vec<Memory>> {
+        engine::memories::live_of_type(&self.core.lock(), memory_type)
+    }
+
     /// Memory `id`, unless it is missing or deleted.
     pub fn get_live(&self, id: &str) -> Result<Option<Memory>> {
         engine::memories::get_live(&self.core.lock(), id)

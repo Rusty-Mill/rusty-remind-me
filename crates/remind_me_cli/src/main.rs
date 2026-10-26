@@ -382,24 +382,36 @@ const LIST_USAGE: &str = "Usage: rusty-remind-me list [--limit N] [--category CA
 const ADD_USAGE: &str =
     "Usage: rusty-remind-me add <content> [--category CATEGORY] [--tags a,b,c] [--attach PATH]...";
 
-const RESOLVE_USAGE: &str =
-    "Usage: rusty-remind-me resolve <id> <done|abandoned|reverted|superseded> [--note TEXT]";
+const RESOLVE_USAGE: &str = "Usage: rusty-remind-me resolve <id> \
+(<done|abandoned|reverted|superseded> | --review <held|revised|reverted>) [--note TEXT]";
 
-/// Parsed form of `rusty-remind-me resolve <id> <outcome> [--note TEXT]`.
+/// What a `resolve` records: whether it was carried out, or whether a
+/// decision held up at its follow-up review.
+#[derive(Debug, PartialEq, Eq)]
+enum Resolution {
+    Outcome(String),
+    Review(String),
+}
+
+/// Parsed form of `rusty-remind-me resolve <id> (<outcome> | --review R) [--note TEXT]`.
 #[derive(Debug, PartialEq, Eq)]
 struct ResolveArgs {
     memory_id: String,
-    outcome: String,
+    resolution: Resolution,
     note: Option<String>,
 }
 
 fn parse_resolve_args(args: &[String]) -> Result<ResolveArgs, String> {
     let mut words: Vec<&String> = Vec::new();
     let mut note = None;
+    let mut review = None;
     let mut i = 0;
     while i < args.len() {
         if args[i] == "--note" {
             note = Some(flag_value(args, i, "--note", RESOLVE_USAGE)?);
+            i += 2;
+        } else if args[i] == "--review" {
+            review = Some(flag_value(args, i, "--review", RESOLVE_USAGE)?);
             i += 2;
         } else if args[i].starts_with("--") {
             return Err(format!(
@@ -411,21 +423,33 @@ fn parse_resolve_args(args: &[String]) -> Result<ResolveArgs, String> {
             i += 1;
         }
     }
-    let [memory_id, outcome] = words[..] else {
-        return Err(RESOLVE_USAGE.to_string());
+    let resolution = match (&words[..], review) {
+        ([_, outcome], None) => {
+            check_one_of("outcome", outcome, &remind_me_core::kinds::OUTCOMES)?;
+            Resolution::Outcome(outcome.to_string())
+        }
+        ([_], Some(review)) => {
+            check_one_of("--review", &review, &remind_me_core::kinds::REVIEW_OUTCOMES)?;
+            Resolution::Review(review)
+        }
+        _ => return Err(RESOLVE_USAGE.to_string()),
     };
-    if !remind_me_core::kinds::OUTCOMES.contains(&outcome.as_str()) {
-        return Err(format!(
-            "Error: outcome must be one of {}.\n{}",
-            remind_me_core::kinds::OUTCOMES.join(", "),
-            RESOLVE_USAGE
-        ));
-    }
     Ok(ResolveArgs {
-        memory_id: memory_id.clone(),
-        outcome: outcome.clone(),
+        memory_id: words[0].clone(),
+        resolution,
         note,
     })
+}
+
+fn check_one_of(name: &str, value: &str, allowed: &[&str]) -> Result<(), String> {
+    if allowed.contains(&value) {
+        return Ok(());
+    }
+    Err(format!(
+        "Error: {name} must be one of {}.\n{}",
+        allowed.join(", "),
+        RESOLVE_USAGE
+    ))
 }
 
 const SEARCH_USAGE: &str = "Usage: rusty-remind-me search <query> [--limit N] [--project P] [--branch B] [--session ID] [--json]";
@@ -1066,11 +1090,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         std::process::exit(1);
                     }
                 };
-                let found: Option<Memory> = Store::open(&db_path)?.call(Op::Resolve {
-                    memory_id: resolve.memory_id.clone(),
-                    outcome: resolve.outcome,
-                    note: resolve.note,
-                })?;
+                let memory_id = resolve.memory_id.clone();
+                let note = resolve.note;
+                let op = match resolve.resolution {
+                    Resolution::Outcome(outcome) => Op::Resolve {
+                        memory_id,
+                        outcome,
+                        note,
+                    },
+                    Resolution::Review(outcome) => Op::Review {
+                        memory_id,
+                        outcome,
+                        note,
+                    },
+                };
+                let found: Option<Memory> = Store::open(&db_path)?.call(op)?;
                 match found {
                     Some(mem) => println!("{}", serde_json::to_string_pretty(&mem)?),
                     None => {
@@ -1106,7 +1140,7 @@ mod tests {
         let parsed =
             parse_resolve_args(&args(&["mem_1", "reverted", "--note", "broke CI"])).unwrap();
         assert_eq!(parsed.memory_id, "mem_1");
-        assert_eq!(parsed.outcome, "reverted");
+        assert_eq!(parsed.resolution, Resolution::Outcome("reverted".into()));
         assert_eq!(parsed.note.as_deref(), Some("broke CI"));
         assert_eq!(
             parse_resolve_args(&args(&["mem_1", "done"])).unwrap().note,
@@ -1115,8 +1149,20 @@ mod tests {
     }
 
     #[test]
+    fn resolve_takes_a_review_instead_of_an_outcome() {
+        let parsed =
+            parse_resolve_args(&args(&["mem_1", "--review", "held", "--note", "ok"])).unwrap();
+        assert_eq!(parsed.memory_id, "mem_1");
+        assert_eq!(parsed.resolution, Resolution::Review("held".into()));
+        assert_eq!(parsed.note.as_deref(), Some("ok"));
+    }
+
+    #[test]
     fn resolve_rejects_a_bad_outcome_missing_words_and_unknown_flags() {
         for bad in [
+            args(&["mem_1", "--review", "fine"]),
+            args(&["mem_1", "done", "--review", "held"]),
+            args(&["mem_1", "--review"]),
             args(&["mem_1", "maybe"]),
             args(&["mem_1"]),
             args(&["a", "b", "done"]),

@@ -85,6 +85,14 @@ impl FromStr for MemoryKind {
 /// The outcomes a memory can be resolved to.
 pub const OUTCOMES: [&str; 4] = ["done", "abandoned", "reverted", "superseded"];
 
+/// What a decision's follow-up review may find (`metadata.review.outcome`).
+/// Distinct from [`OUTCOMES`]: those say whether it was carried out, these
+/// whether it held up.
+pub const REVIEW_OUTCOMES: [&str; 3] = ["held", "revised", "reverted"];
+
+/// A decision's `metadata.stakes`. `low` is never scheduled for review.
+pub const STAKES: [&str; 2] = ["low", "normal"];
+
 /// The `status` values an action item's metadata may hold.
 pub const ACTION_STATUSES: [&str; 3] = ["open", "done", "dropped"];
 
@@ -190,6 +198,45 @@ fn validate_decision(meta: &Value) -> Result<(), KindError> {
         }
     }
     str_field(meta, K, "adr")?;
+    if let Some(stakes) = str_field(meta, K, "stakes")? {
+        if !STAKES.contains(&stakes) {
+            return Err(bad(K, "stakes", "must be one of low, normal"));
+        }
+    }
+    validate_review(meta.get("review"))
+}
+
+/// `metadata.review`: `{due, outcome?, note?, reviewed_at?}`, or absent.
+fn validate_review(review: Option<&Value>) -> Result<(), KindError> {
+    const K: &str = "decision";
+    let review = match review {
+        None | Some(Value::Null) => return Ok(()),
+        Some(review @ Value::Object(_)) => review,
+        Some(_) => return Err(bad(K, "review", "must be an object")),
+    };
+    // Named `review.<key>` in errors, looked up as `<key>` in the object.
+    let field = |key: &str, label: &'static str| match review.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.as_str())),
+        Some(_) => Err(bad(K, label, "must be a string")),
+    };
+    let Some(due) = field("due", "review.due")? else {
+        return Err(bad(K, "review.due", "is required: an RFC 3339 timestamp"));
+    };
+    check_rfc3339(K, "review.due", due)?;
+    if let Some(outcome) = field("outcome", "review.outcome")? {
+        if !REVIEW_OUTCOMES.contains(&outcome) {
+            return Err(bad(
+                K,
+                "review.outcome",
+                "must be one of held, revised, reverted",
+            ));
+        }
+    }
+    if let Some(at) = field("reviewed_at", "review.reviewed_at")? {
+        check_rfc3339(K, "review.reviewed_at", at)?;
+    }
+    field("note", "review.note")?;
     Ok(())
 }
 

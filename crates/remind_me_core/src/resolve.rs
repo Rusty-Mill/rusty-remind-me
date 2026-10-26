@@ -59,7 +59,7 @@ pub fn resolve_memory(
     }
 
     let now = Utc::now().to_rfc3339();
-    record_revision(store, memory_id, &now)?;
+    record_revision(store, memory_id, &now, RESOLVE_REASON)?;
 
     let metadata = note
         .filter(|n| !n.trim().is_empty())
@@ -81,13 +81,19 @@ pub fn resolve_memory(
 /// Keep the state being replaced in history. Written directly rather than
 /// through `history::capture_revision`, which skips an edit that changes no
 /// tracked column: a resolve without a note changes none, and is still an
-/// event worth a row.
-fn record_revision(store: &Store<'_>, memory_id: &str, now: &str) -> Result<()> {
+/// event worth a row. Shared with [`crate::review`], whose reviews are the
+/// same kind of event.
+pub(crate) fn record_revision(
+    store: &Store<'_>,
+    memory_id: &str,
+    now: &str,
+    reason: &str,
+) -> Result<()> {
     let revisions = Revisions::new(store);
     let Some(current) = revisions.current(memory_id)? else {
         return Ok(());
     };
-    revisions.insert(memory_id, &current, now, Some(RESOLVE_REASON))
+    revisions.insert(memory_id, &current, now, Some(reason))
 }
 
 fn with_note(metadata: &Value, note: &str) -> Value {
@@ -101,7 +107,7 @@ fn with_note(metadata: &Value, note: &str) -> Value {
 
 /// Halve `base_weight` and recompute the vitality snapshot the way
 /// `record_feedback` does, so the memory sinks in ranking.
-fn demote(store: &Store<'_>, memory_id: &str) -> Result<()> {
+pub(crate) fn demote(store: &Store<'_>, memory_id: &str) -> Result<()> {
     let feedback = Feedback::new(store);
     let Some(importance) = feedback.importance(memory_id)? else {
         return Ok(());

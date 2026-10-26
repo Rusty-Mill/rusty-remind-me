@@ -1,12 +1,13 @@
 //! The brief a session starts with: what is worth knowing before the first
 //! prompt, within a character budget.
 //!
-//! Five sections, in this order, each omitted when empty:
+//! Six sections, in this order, each omitted when empty:
 //! 1. persona (the durable statements the refinement ladder promoted),
 //! 2. reminders due within a week (overdue ones included),
-//! 3. open action items for the project,
-//! 4. the project's most recent memories, the current branch's first,
-//! 5. the best matches for the user's prompt, when one is given.
+//! 3. the project's decisions due for a follow-up review (`crate::review`),
+//! 4. open action items for the project,
+//! 5. the project's most recent memories, the current branch's first,
+//! 6. the best matches for the user's prompt, when one is given.
 //!
 //! Trimming happens at section boundaries: a section that does not fit the
 //! remaining budget is dropped whole and named in `dropped`, never cut
@@ -23,6 +24,8 @@ use serde::Serialize;
 pub const RECENT_LIMIT: usize = 8;
 /// Open action items listed.
 pub const ACTION_LIMIT: usize = 8;
+/// Decisions due for review listed.
+pub const REVIEW_LIMIT: usize = 5;
 /// Prompt hits listed.
 pub const HIT_LIMIT: usize = 5;
 /// Persona statements listed.
@@ -50,6 +53,7 @@ pub struct ContextRequest<'a> {
 pub struct SectionCounts {
     pub persona: usize,
     pub reminders: usize,
+    pub reviews: usize,
     pub action_items: usize,
     pub recent: usize,
     pub hits: usize,
@@ -135,6 +139,22 @@ fn reminders_section(store: &Store<'_>) -> Result<Section> {
     })
 }
 
+fn reviews_section(memories: &[Memory], project: Option<&str>) -> Section {
+    let lines = crate::review::due_among(memories, Utc::now(), project)
+        .into_iter()
+        .take(REVIEW_LIMIT)
+        .map(|m| {
+            let due = crate::review::review_due(m).unwrap_or("");
+            format!("- due {due}: {}", line_of(m))
+        })
+        .collect();
+    Section {
+        name: "reviews",
+        heading: "Decisions to review: did they hold up?",
+        lines,
+    }
+}
+
 fn is_open_action(memory: &Memory) -> bool {
     memory.memory_type.as_deref() == Some("action_item")
         && memory.outcome.is_none()
@@ -217,6 +237,7 @@ pub fn build(store: &Store<'_>, request: &ContextRequest<'_>) -> Result<ContextB
     let mut sections = vec![
         persona_section(store)?,
         reminders_section(store)?,
+        reviews_section(&memories, request.project),
         action_section(&memories, request.project, &now),
         recent_section(&memories, request.project, request.branch, &now),
     ];
@@ -264,6 +285,7 @@ fn assemble(sections: Vec<Section>, request: &ContextRequest<'_>) -> ContextBrie
         match section.name {
             "persona" => counts.persona = n,
             "reminders" => counts.reminders = n,
+            "reviews" => counts.reviews = n,
             "action_items" => counts.action_items = n,
             "recent" => counts.recent = n,
             _ => counts.hits = n,
