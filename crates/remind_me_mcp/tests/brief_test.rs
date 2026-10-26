@@ -132,3 +132,46 @@ fn the_tool_is_listed_with_a_strict_schema() {
     assert_eq!(tool["inputSchema"]["required"], json!(["project"]));
     assert!(tool["description"].as_str().unwrap().len() <= 160);
 }
+
+#[test]
+fn long_aliases_never_push_the_returned_text_past_the_budget() {
+    let s = server();
+    let aliases: Vec<String> = (0..300).map(|i| format!("quokka-alias-{i:03}")).collect();
+    let (failed, _) = call(
+        &s,
+        "remind_me_entity_upsert",
+        json!({"name": "quokka", "aliases": aliases}),
+    );
+    assert!(!failed);
+    call(
+        &s,
+        "remind_me_add",
+        json!({"content": "quokka note", "category": "general", "tags": ["quokka"]}),
+    );
+    for format in ["json", "markdown"] {
+        let (failed, text) = call(
+            &s,
+            "remind_me_brief",
+            json!({"project": "quokka", "token_budget": 200, "response_format": format}),
+        );
+        assert!(!failed, "{text}");
+        let tokens = remind_me_core::retrieval::estimated_content_tokens(&text);
+        assert!(tokens <= 200, "{format}: {tokens} tokens");
+    }
+}
+
+#[test]
+fn the_merged_project_tool_is_still_listed_and_callable() {
+    let s = server();
+    let req = json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}).to_string();
+    let r = s.handle_request(&req).unwrap();
+    let names: Vec<&str> = r["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    assert!(names.contains(&"remind_me_project") && names.contains(&"remind_me_brief"));
+    let (failed, text) = call(&s, "remind_me_project", json!({"action": "list"}));
+    assert!(!failed, "{text}");
+}

@@ -97,14 +97,14 @@ pub struct ContextArgs<'a> {
     pub hits_only: bool,
 }
 
-/// The brief as JSON, with its Markdown rendering in `context`.
+/// `{"brief", "context"}`: the brief's JSON and its Markdown, each within
+/// the budget on its own. A caller prints one of them, never both.
 fn brief_json(brief: &Brief) -> Result<Value> {
-    let mut value = serde_json::to_value(brief).map_err(|e| StoreError::Invalid(e.to_string()))?;
-    value["context"] = Value::String(context_brief::render_markdown(brief));
-    Ok(value)
+    let data = serde_json::to_value(brief).map_err(|e| StoreError::Invalid(e.to_string()))?;
+    Ok(json!({ "brief": data, "context": context_brief::render_markdown(brief) }))
 }
 
-/// A session brief (see [`context_brief`]) with its Markdown in `context`.
+/// A session brief (see [`context_brief`]), as [`brief_json`].
 /// The project and branch default to the ones `cwd` is in.
 pub fn context(store: &Store<'_>, args: &ContextArgs<'_>) -> Result<Value> {
     if let Some(cwd) = args.cwd {
@@ -140,8 +140,8 @@ pub fn context(store: &Store<'_>, args: &ContextArgs<'_>) -> Result<Value> {
     }
 }
 
-/// A project brief (`rusty-remind-me brief`), with its Markdown in
-/// `context`. An unknown project is an error naming the closest known ones.
+/// A project brief (`rusty-remind-me brief`), as [`brief_json`]. An
+/// unknown project is an error naming the closest known ones.
 pub fn brief(
     store: &Store<'_>,
     project: &str,
@@ -288,7 +288,7 @@ mod tests {
             },
         )
         .unwrap();
-        let shown: usize = brief["sections"]
+        let shown: usize = brief["brief"]["sections"]
             .as_array()
             .unwrap()
             .iter()
@@ -303,6 +303,24 @@ mod tests {
         let unknown = super::brief(&store, "nowhere", None, 1500).unwrap_err();
         assert!(unknown.to_string().contains("no project"), "{unknown}");
         assert!(super::brief(&store, "nowhere", None, 1).is_err());
+        // The CLI prints `brief` or `context`, each within the budget.
+        let tight = context(
+            &store,
+            &ContextArgs {
+                budget: 200,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for printed in [
+            tight["brief"].to_string(),
+            tight["context"].as_str().unwrap().to_string(),
+        ] {
+            assert!(
+                crate::retrieval::estimated_content_tokens(&printed) <= 200,
+                "{printed}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

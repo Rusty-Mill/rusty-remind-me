@@ -37,8 +37,10 @@
 //! section's heading are reserved first, then each section is allotted a
 //! share of what is left by weight, so what one section leaves unused rolls
 //! forward. Items are dropped whole, never cut, and counted in `omitted`.
-//! `used` exceeds `limit` only when the envelope alone does (a very long
-//! alias list); then no items are shown.
+//! The returned text never exceeds the budget: when the envelope and headings
+//! alone do not fit, aliases are cut from the end (`aliases_omitted` counts
+//! them), and if that is not enough the brief is refused with the budget it
+//! needs.
 
 use crate::db::entities::Entities;
 use crate::db::memories::Memories;
@@ -119,6 +121,8 @@ pub struct ProjectMatch {
     pub name: String,
     pub entity_id: Option<String>,
     pub aliases: Vec<String>,
+    /// Aliases cut to fit the budget.
+    pub aliases_omitted: usize,
     /// Sorted: `alias`, `entity`, `git_remote`, `project`, `tag`.
     pub matched_by: Vec<&'static str>,
 }
@@ -230,7 +234,7 @@ pub fn build(store: &Store<'_>, request: &ContextRequest<'_>) -> Result<Outcome>
             Some(prompt) => vec![hits_draft(store, prompt, now)?],
             None => Vec::new(),
         };
-        fit(&mut brief, drafts);
+        fit(&mut brief, drafts)?;
         return Ok(Outcome::Brief(brief));
     }
 
@@ -275,7 +279,7 @@ pub fn build(store: &Store<'_>, request: &ContextRequest<'_>) -> Result<Outcome>
             drafts.push(hits_draft(store, prompt, now)?);
         }
     }
-    fit(&mut brief, drafts);
+    fit(&mut brief, drafts)?;
     Ok(Outcome::Brief(brief))
 }
 
@@ -367,6 +371,7 @@ fn resolve_scope(store: &Store<'_>, name: &str, memories: &[Memory]) -> Result<O
                 name: entity.name.clone(),
                 entity_id: Some(entity.id.clone()),
                 aliases: entity.aliases.clone(),
+                aliases_omitted: 0,
                 matched_by,
             }
         }
@@ -374,6 +379,7 @@ fn resolve_scope(store: &Store<'_>, name: &str, memories: &[Memory]) -> Result<O
             name: name.to_string(),
             entity_id: None,
             aliases: Vec::new(),
+            aliases_omitted: 0,
             matched_by,
         },
     };
@@ -682,16 +688,39 @@ fn envelope_cost(brief: &Brief) -> usize {
     tokens(json_len(&sized).max(title(brief).len()))
 }
 
-/// Reserve the envelope and every section's heading, then allot what is
-/// left across `drafts` in order, each a share of the remainder by its
-/// weight, and keep the items that fit.
-fn fit(brief: &mut Brief, drafts: Vec<Draft>) {
-    let limit = brief.budget.limit;
-    let overhead = envelope_cost(brief)
+/// The envelope and every section's heading.
+fn overhead(brief: &Brief, drafts: &[Draft]) -> usize {
+    envelope_cost(brief)
         + drafts
             .iter()
             .map(|d| section_cost(d.name, d.items.len()))
-            .sum::<usize>();
+            .sum::<usize>()
+}
+
+/// Cut aliases from the end until the overhead fits `limit`, or refuse.
+fn fit_overhead(brief: &mut Brief, drafts: &[Draft]) -> Result<usize> {
+    let limit = brief.budget.limit;
+    loop {
+        let cost = overhead(brief, drafts);
+        if limit == 0 || cost <= limit {
+            return Ok(cost);
+        }
+        let Some(project) = brief.project.as_mut().filter(|p| !p.aliases.is_empty()) else {
+            return Err(StoreError::Invalid(format!(
+                "`token_budget` {limit} is too small for this brief; it needs at least {cost}"
+            )));
+        };
+        project.aliases.pop();
+        project.aliases_omitted += 1;
+    }
+}
+
+/// Reserve the envelope and every section's heading, then allot what is
+/// left across `drafts` in order, each a share of the remainder by its
+/// weight, and keep the items that fit.
+fn fit(brief: &mut Brief, drafts: Vec<Draft>) -> Result<()> {
+    let limit = brief.budget.limit;
+    let overhead = fit_overhead(brief, &drafts)?;
     let available = limit.saturating_sub(overhead);
     let mut weight_left: usize = drafts.iter().map(|d| d.weight).sum();
     let mut spent_total = 0;
@@ -721,6 +750,7 @@ fn fit(brief: &mut Brief, drafts: Vec<Draft>) {
         });
     }
     brief.budget.used = overhead + spent_total;
+    Ok(())
 }
 
 // -- rendering ----------------------------------------------------------------
@@ -1221,6 +1251,47 @@ mod tests {
                 brief.budget
             );
         }
+    }
+
+    #[test]
+    fn long_aliases_are_cut_to_fit_and_an_impossible_budget_is_refused() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        let aliases: Vec<String> = (0..300).map(|i| format!("quokka-alias-{i:03}")).collect();
+        crate::entity::upsert_entity(
+            &store,
+            &EntityInput {
+                name: "quokka".into(),
+                kind: Some("project".into()),
+                aliases,
+            },
+        )
+        .unwrap();
+        add(&store, "mem_q", |r| r.project = Some("quokka".into()));
+        let tight = brief(
+            &store,
+            &ContextRequest {
+                budget: MIN_TOKEN_BUDGET,
+                ..project("quokka")
+            },
+        );
+        let matched = tight.project.as_ref().unwrap();
+        assert!(matched.aliases_omitted > 0);
+        assert_eq!(matched.aliases.len() + matched.aliases_omitted, 300);
+        assert!(tight.budget.used <= MIN_TOKEN_BUDGET);
+        let json = estimated_content_tokens(&serde_json::to_string(&tight).unwrap());
+        assert!(json <= MIN_TOKEN_BUDGET, "{json}");
+
+        let long_name = "q".repeat(2000);
+        add(&store, "mem_long", |r| r.project = Some(long_name.clone()));
+        let req = ContextRequest {
+            mode: Mode::Project,
+            project: Some(&long_name),
+            budget: MIN_TOKEN_BUDGET,
+            ..ContextRequest::default()
+        };
+        let refused = build(&store, &req).unwrap_err();
+        assert!(refused.to_string().contains("too small"), "{refused}");
     }
 
     #[test]

@@ -12,5 +12,5 @@ have_bin || { missing_bin_message; exit 0; }
 if [ -n "$SESSION_ID" ]; then
   "$BIN" session start --session-id "$SESSION_ID" --cwd "$CWD" >/dev/null 2>&1 || true
 fi
-"$BIN" context --cwd "$CWD" --budget 2000 --json 2>/dev/null | brief_text | emit_context SessionStart
+"$BIN" context --cwd "$CWD" --budget 2000 2>/dev/null | emit_context SessionStart
 exit 0

@@ -48,3 +48,22 @@ fn bad_input_is_a_400_and_an_unknown_project_a_404() {
     assert!(unknown.json()["suggestions"].is_array());
     std::fs::remove_dir_all(&root).unwrap();
 }
+
+#[test]
+fn the_response_body_stays_within_a_minimal_budget() {
+    let (server, root) = authed_server("brief-budget");
+    for i in 0..20 {
+        authed_json(
+            &server,
+            "POST",
+            "/api/memories",
+            &json!({ "content": format!("quokka {i} {}", "word ".repeat(30)), "tags": ["quokka"] })
+                .to_string(),
+        );
+    }
+    let body = authed_get(&server, "/api/brief?project=quokka&token_budget=200").json();
+    let tokens = remind_me_core::retrieval::estimated_content_tokens(&body.to_string());
+    assert!(tokens <= 200, "{tokens} tokens");
+    assert!(body["sections"][2]["omitted"].as_u64().unwrap() > 0);
+    std::fs::remove_dir_all(&root).unwrap();
+}

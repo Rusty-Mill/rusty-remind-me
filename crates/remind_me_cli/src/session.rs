@@ -135,7 +135,7 @@ enum Plan {
     Json(Op),
     /// `session timeline`: `{"markdown", ..}` or null.
     Timeline(Op, bool),
-    /// `context` and `brief`: `{"context", ..}`.
+    /// `context` and `brief`: `{"brief", "context"}`.
     Context(Op, bool),
 }
 
@@ -223,7 +223,9 @@ fn render(plan: &Plan, reply: Value) -> String {
     match plan {
         Plan::Json(_) => pretty(&reply),
         Plan::Timeline(_, true) => pretty(&reply),
-        Plan::Context(_, true) => pretty(&reply),
+        // The brief's JSON alone: the Markdown beside it would double the
+        // output past the budget.
+        Plan::Context(_, true) => pretty(reply.get("brief").unwrap_or(&Value::Null)),
         Plan::Timeline(_, false) => match reply.get("markdown").and_then(Value::as_str) {
             Some(text) => text.to_string(),
             None => "No session found.".to_string(),
@@ -413,7 +415,7 @@ mod tests {
 
     #[test]
     fn markdown_is_unwrapped_unless_json_is_asked_for() {
-        let reply = serde_json::json!({"context": "# Hi", "sections": {}});
+        let reply = serde_json::json!({"brief": {"sections": []}, "context": "# Hi"});
         let op = Op::Context {
             cwd: None,
             project: None,
@@ -426,6 +428,10 @@ mod tests {
             render(&Plan::Context(op.clone(), false), reply.clone()),
             "# Hi"
         );
-        assert!(render(&Plan::Context(op, true), reply).contains("\"sections\""));
+        let json = render(&Plan::Context(op, true), reply);
+        assert!(
+            json.contains("\"sections\"") && !json.contains("# Hi"),
+            "{json}"
+        );
     }
 }
