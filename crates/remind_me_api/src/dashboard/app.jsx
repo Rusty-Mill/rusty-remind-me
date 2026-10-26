@@ -382,7 +382,11 @@ function App() {
               projectStore.proposals.map(p=>React.createElement("div",{key:p.key,style:{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:12,flexWrap:"wrap",padding:"10px 12px",background:theme.surfaceActive,borderRadius:6}},
                 React.createElement("div",{style:{minWidth:0}},
                   React.createElement("div",{style:{fontFamily:mono,fontSize:13,color:theme.text}},
-                    React.createElement("b",null,p.project)," ",p.predicate," → ",React.createElement("b",null,p.value)),
+                    React.createElement("b",null,p.project),
+                    proposalClaims(p).map(([pred,val],i)=>React.createElement("span",{key:pred},
+                      i===0?" ":" · ",pred," → ",React.createElement("b",null,val)))),
+                  proposalClaims(p).length>1 && React.createElement("div",{style:{fontSize:12,color:theme.textSecondary,fontFamily:sans,marginTop:3}},
+                    "New project: confirming sets every claim shown"),
                   React.createElement("div",{style:{fontSize:12,color:theme.textMuted,fontFamily:sans,marginTop:3}},
                     p.why+" · "+p.evidence.length+" memor"+(p.evidence.length===1?"y":"ies"))
                 ),

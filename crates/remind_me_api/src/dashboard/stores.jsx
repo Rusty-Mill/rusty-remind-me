@@ -317,6 +317,16 @@ function useOpsStore() {
 // Proposals are suggestions computed from captured session context. They are
 // kept in the store beside the projects because the Pending lane is the point
 // of the view: nothing changes a project's stage until someone answers one.
+// Every claim a confirm writes: the proposal's own, then the stage and
+// status bundled with it when the project does not exist yet. The pending
+// lane shows all of them, so a confirm never declares more than it showed.
+function proposalClaims(p) {
+  const claims = [[p.predicate, p.value]];
+  if (p.with_stage) claims.push(["stage", p.with_stage]);
+  if (p.with_status) claims.push(["status", p.with_status]);
+  return claims;
+}
+
 function useProjectStore() {
   const [byStage, setByStage] = useState({});
   const [count, setCount] = useState(0);

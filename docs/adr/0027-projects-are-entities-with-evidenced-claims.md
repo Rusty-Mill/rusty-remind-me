@@ -69,8 +69,10 @@ like any memory. They are never edited or deleted after they are written:
 generic update, annotate, delete, bulk delete and bulk tag refuse them, and
 consolidation never takes one as a candidate. Text this module saves (the
 `because` sentence, the claim's content) passes the same secret scrubber as
-any capture; a project or parent name that looks like a secret is refused,
-since subject and object are not redacted.
+any capture; a project name or claim value that looks like a secret is
+refused, since subject and object are not redacted. The check sits at the one
+claim write, so a `revert` that would restore a synced or older value crosses
+it too, and is refused with nothing written.
 
 **History and reversal are new work, not existing tools.** `remind_me_history`
 and `remind_me_revert` (`history.rs`) record and roll back edits *within* one
@@ -183,7 +185,10 @@ Version 1 rules, all deterministic and with no LLM call:
 | `status = active` and no linked memory for 60 days (configurable) | `status = dormant` | the last linked memory |
 
 Two different remotes, or two different paths, propose nothing for that
-anchor: a contradiction is for a person. A remote or `cwd` that looks like a
+anchor: a contradiction is for a person. A project whose claims do not form a
+valid record (reported under `invalid`) gets no proposals at all, so a rule
+never replaces a stage it could not read. The dashboard's pending lane shows
+every claim a confirm writes, bundled stage and status included. A remote or `cwd` that looks like a
 secret is never evidence, and an entity whose name does is never proposed,
 because those values are stored verbatim. A repo or path proposal for an
 entity with no stage yet carries `stage = built, status = active`, so it can

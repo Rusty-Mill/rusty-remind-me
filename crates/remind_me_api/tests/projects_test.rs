@@ -144,3 +144,38 @@ fn an_invalid_request_is_a_400_not_a_500() {
     );
     assert_eq!(post(&server, "/api/projects", "not json").status, 400);
 }
+
+#[test]
+fn a_new_project_anchor_proposal_names_every_claim_and_the_dashboard_shows_them() {
+    let (server, _dir) = seeded_server("projects_bundle", |store: &Store<'_>| {
+        let entity = upsert_entity(
+            store,
+            &EntityInput {
+                name: "rusty_tick".into(),
+                kind: None,
+                aliases: vec![],
+            },
+        )
+        .unwrap();
+        let mut row = NewMemory::new("mem_cwd", "worked on tick", "2026-10-26T12:00:00+00:00");
+        row.cwd = Some("/src/rusty_mill/crates/apps/rusty_tick".into());
+        Memories::new(store).insert(&row).unwrap();
+        link_memory_entity(store, &row.id, &entity.id).unwrap();
+    });
+
+    let open = get(&server, "/api/projects?action=proposals").json();
+    let path = open["proposals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["predicate"] == "path")
+        .unwrap()
+        .clone();
+    assert_eq!(path["with_stage"], "built");
+    assert_eq!(path["with_status"], "active");
+
+    // The pending lane renders the bundled claims, not only the anchor.
+    let page = get(&server, "/").body;
+    assert!(page.contains("p.with_stage") && page.contains("p.with_status"));
+    assert!(page.contains("proposalClaims(p).map"));
+}

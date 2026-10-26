@@ -768,9 +768,7 @@ fn set_in(store: &Store<'_>, input: &SetInput) -> Result<WriteOutcome> {
         return Err(StoreError::Invalid("no claims given".into()));
     }
     for claim in &input.claims {
-        // Secret first, so a refusal never echoes the value back.
-        refuse_secret(&claim.object(), &claim.predicate().qualified())?;
-        claim.validated()?;
+        check_value(claim)?;
     }
     let mut seen = HashSet::new();
     if let Some(dup) = input.claims.iter().find(|c| !seen.insert(c.predicate())) {
@@ -911,6 +909,10 @@ fn revert_in(store: &Store<'_>, input: &RevertInput) -> Result<WriteOutcome> {
         .filter(|(_, v)| current.as_ref().is_none_or(|c| !c.same_as(v)))
         .last()
         .ok_or_else(|| StoreError::Invalid(format!("no earlier {key} to restore")))?;
+    // A synced or older claim was never checked here: the restored value
+    // crosses the same boundary as a new one before anything is written.
+    refuse_secret(&subject, "project name")?;
+    check_value(&restored)?;
     let earlier_meta = ClaimMeta::from_metadata(&earlier.metadata).map_err(StoreError::Invalid)?;
 
     let entity = upsert_entity(
@@ -961,6 +963,13 @@ pub(crate) fn looks_secret(text: &str) -> bool {
     let mut tags = Vec::new();
     let mut metadata = Value::Null;
     crate::boundary::scrub(text, &mut tags, &mut metadata) != text
+}
+
+/// The boundary every written claim value crosses: not secret-shaped
+/// (checked first, so a refusal never echoes the value) and canonical.
+fn check_value(claim: &ClaimValue) -> Result<()> {
+    refuse_secret(&claim.object(), &claim.predicate().qualified())?;
+    claim.validated()
 }
 
 /// Refuse a value that [`looks_secret`], naming only what it was.
@@ -1044,6 +1053,9 @@ fn write_claim(
     }) {
         return Err(StoreError::Engine("injected claim write failure".into()));
     }
+    // Callers check first; this is the backstop for every claim written.
+    refuse_secret(subject, "project name")?;
+    check_value(claim)?;
     let predicate = claim.predicate().qualified();
     let object = claim.object();
     let metadata = serde_json::json!({ META_KEY: meta });
@@ -1694,5 +1706,49 @@ mod tests {
             .invalid
             .iter()
             .any(|r| r.claim_id.as_deref() == Some(miscased.as_str())));
+    }
+
+    #[test]
+    fn revert_refuses_to_restore_a_secret_shaped_synced_value() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        let fact = seed(&store, "seen");
+        create(&store, "mill", Stage::Idea, &fact);
+        // An older claim from a peer that never ran these checks.
+        let meta = serde_json::json!({ META_KEY: { "evidence": [fact], "confirmed_by": "peer" } });
+        let mut row = new_fact("synced", vec![CLAIM_TAG.into()], meta);
+        row.subject = Some("mill".into());
+        row.predicate = Some(Predicate::Path.qualified());
+        row.object = Some(format!("crates/apps/{SECRET}"));
+        Memories::new(&store).insert(&row).unwrap();
+        let path = ClaimValue::Path(RepoPath::parse("crates/apps/mill").unwrap());
+        let current = set_one(&store, "mill", path, "moved").unwrap();
+
+        // Every live memory and what supersedes it: no evidence, claim or
+        // supersession may change.
+        let snapshot = || {
+            let mut rows: Vec<(String, Option<String>)> = Memories::new(&store)
+                .all_live()
+                .unwrap()
+                .into_iter()
+                .map(|m| (m.id, m.superseded_by))
+                .collect();
+            rows.sort();
+            rows
+        };
+        let before = snapshot();
+        let refused = revert(
+            &store,
+            &RevertInput {
+                project: "mill".into(),
+                claim_id: current.written[0].clone(),
+                because: "undo".into(),
+                confirmed_by: "human".into(),
+            },
+        );
+        assert!(refused.is_err_and(|e| !e.to_string().contains(SECRET)));
+        assert_eq!(snapshot(), before);
+        let anchors = get(&store, "mill").unwrap().unwrap().anchors;
+        assert_eq!(anchors.path.unwrap().claim_id, current.written[0]);
     }
 }

@@ -145,8 +145,15 @@ pub fn proposals(store: &Store<'_>) -> Result<Vec<Proposal>> {
         if project::looks_secret(&entity.name) {
             continue;
         }
+        let live = match project::get(store, &entity.name) {
+            Ok(live) => live,
+            // Claims that do not form a valid project are reported by
+            // `project::list`; a rule guessing over them could replace a
+            // real stage, so the project gets no proposals until fixed.
+            Err(StoreError::Invalid(_)) => continue,
+            Err(e) => return Err(e),
+        };
         let linked = entities.linked_memories_full(&entity.id)?;
-        let live = project::get(store, &entity.name).ok().flatten();
         let stage = live.as_ref().map(|p| p.stage.value);
         let status = live.as_ref().map(|p| p.status.value);
         let anchored_repo = live.as_ref().and_then(|p| p.anchors.repo.clone());
@@ -873,5 +880,44 @@ mod tests {
         linked(&store, &named.id, "mem_n", |_| {});
         let all = proposals(&store).unwrap();
         assert!(all.is_empty(), "{all:?}");
+    }
+
+    #[test]
+    fn an_invalid_existing_project_gets_no_proposals() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        let e = entity(&store, "rusty_mux", None);
+        let fact = linked(&store, &e.id, "mem_seen", |row| {
+            row.cwd = Some("/src/crates/apps/rusty_mux".into());
+        });
+        project::set(
+            &store,
+            &SetInput {
+                project: "rusty_mux".into(),
+                claims: vec![
+                    ClaimValue::Stage(Stage::Idea),
+                    ClaimValue::Status(Status::Dormant),
+                ],
+                evidence: vec![fact.clone()],
+                because: None,
+                confirmed_by: "human".into(),
+                proposal: None,
+            },
+        )
+        .unwrap();
+        // A malformed anchor from a peer makes the project invalid.
+        let now = Utc::now().to_rfc3339();
+        let mut bad = NewMemory::new("mem_bad", "synced", &now);
+        bad.subject = Some("rusty_mux".into());
+        bad.predicate = Some(Predicate::Repo.qualified());
+        bad.object = Some("not a url".into());
+        bad.metadata =
+            serde_json::json!({ "project_claim": { "evidence": [fact], "confirmed_by": "peer" } });
+        Memories::new(&store).insert(&bad).unwrap();
+        assert!(project::get(&store, "rusty_mux").is_err());
+
+        assert!(keys(&store).is_empty());
+        let claims = project::history(&store, "rusty_mux", Some(Predicate::Stage)).unwrap();
+        assert_eq!(claims.len(), 1, "the idea stage was not replaced");
     }
 }
