@@ -55,10 +55,31 @@ scheme. ADR-0012 gives tasks `tick:<task uuid>`; a list here is
 `tick:list:<list uuid>`, so the reference detector's task rule never takes a
 list for a task.
 
-Writing a claim supersedes the previous one through the existing SPO rule, so
-history, `remind_me_history` and `remind_me_revert` work unchanged. Claim
-memories are `memory_type: fact`, tagged `project-record`, and synced like any
-memory.
+Writing a claim supersedes the previous one through the existing SPO rule.
+Claim memories are `memory_type: fact`, tagged `project-record`, and synced
+like any memory. Claim memories are never edited after they are written.
+
+**History and reversal are new work, not existing tools.** `remind_me_history`
+and `remind_me_revert` (`history.rs`) record and roll back edits *within* one
+memory: content, category, tags, metadata and sensitive. They do not track
+SPO values or `superseded_by`, and `supersede_contradicting_facts` writes no
+revision. So they cannot show or undo a stage change. This ADR defines its
+own history and reversal:
+
+- **Claim history** is the chain of claim memories for one
+  `(project, predicate)`, superseded ones included, ordered by `created_at`
+  then id. `project::history(store, name, predicate?)` returns it with each
+  claim's value, evidence, `confirmed_by` and which claim superseded it. No
+  new storage is needed: superseded memories are kept, not deleted.
+- **Reversal is a compensating claim.** Undoing a claim writes a *new* claim
+  that restores an earlier claim's value. Its metadata names the claim it
+  reverts (`"reverts": "<claim id>"`), and it cites that earlier claim's
+  evidence plus the reverting caller's `because` memory. Nothing is
+  un-superseded, edited or deleted, so the history stays append-only, every
+  node converges by the newest-live-claim rule (section 3), and the reversal
+  is itself evidenced. Reverting the first claim of a project (no earlier
+  value) is refused for `stage` and `status`. A project leaves the list by a
+  `status = abandoned` claim, never by deletion.
 
 `metadata` carries what makes a claim trustworthy:
 
@@ -67,13 +88,14 @@ memory.
   "project_claim": {
     "evidence": ["<memory or capture id>", "..."],
     "confirmed_by": "human",
-    "proposal": "<proposal key, if it came from one>"
+    "proposal": "<proposal key, if it came from one>",
+    "reverts": "<claim id, only on a compensating claim>"
   }
 }
 ```
 
-Why memories rather than a `projects` table: sync, supersession, history,
-revert and search come for free; there is no migration and no
+Why memories rather than a `projects` table: sync, supersession, retention of
+superseded values and search come for free; there is no migration and no
 sync-contract change. The cost is that the typed guarantee lives at the
 boundary and in the projection, not in a column type. That is the same
 trade ADR-0026 made for per-kind data.
@@ -162,12 +184,14 @@ Nothing promotes automatically, including in the backfill.
   and `project::get(store, name)`. Shared by MCP and HTTP, the way
   `entity_profile` is, so the dashboard and every model see the same data.
 - MCP: one tool, `remind_me_project`, with `action`:
-  `list` (default) | `get` | `proposals` | `confirm` | `reject` | `set`.
+  `list` (default) | `get` | `history` | `proposals` | `confirm` | `reject` |
+  `set` | `revert`.
   `list` returns compact JSON grouped by stage, for example
   `{"built":[{"name","status","repo","path","evidence_count"}]}`, with an
   optional text rendering for small models (#65). It goes in the core tier
   under #54. The writes go in the curation tier.
-- HTTP: `GET /api/projects` and `POST /api/projects/{confirm,reject,set}`.
+- HTTP: `GET /api/projects`, `GET /api/projects/{name}/history` and
+  `POST /api/projects/{confirm,reject,set,revert}`.
 - Dashboard: a Projects view with columns Idea, Designed and Built, a status
   chip, links for each anchor, an evidence count that expands to the memories
   behind it, and a "Pending" lane with confirm and reject buttons.
@@ -185,12 +209,14 @@ Nothing promotes automatically, including in the backfill.
    as evidence, which turns into a `built` and `path` proposal.
 3. Nano confirms the results in bulk from the dashboard's Pending lane.
 
-The only writes are the reference memories in step 2, which are ordinary,
-revertible memories. Nothing is migrated.
+The only writes are the reference memories in step 2. They are ordinary
+memories and can be deleted like any other. Nothing is migrated.
 
 ## Consequences
 
-- Project state is auditable and reversible with tools that already exist.
+- Project state is auditable and reversible through `project::history` and
+  compensating claims (section 2). Both are new code, about the size of the
+  projection, and they need no new storage.
 - No schema, sync-contract or migration work, so the board robot can build
   it.
 - Claim memories show up in search. They are short and tagged, and #51's
@@ -222,7 +248,8 @@ revertible memories. Nothing is migrated.
 ## Implementation slices (after approval)
 
 1. `project` module: enums, newtypes, `Evidence`, projection, guarded writes,
-   and refusing `project.*` predicates on the generic write paths. Unit tests
+   claim history, compensating-claim revert, and refusing `project.*`
+   predicates on the generic write paths. Unit tests
    for every rule and invalid state.
 2. Proposal rules, rejection keys, and the backfill command (dry run plus
    `--seed-repo`).
