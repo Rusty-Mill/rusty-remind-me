@@ -134,15 +134,14 @@ fn render_dialog(messages: &[ChatMessage]) -> String {
 }
 
 impl TranscriptSummary {
-    /// The summary half's title: the first user message, one line, cut.
+    /// The summary half's title: the first user message, redacted, one
+    /// line, cut. Redacted first: the title is stored as metadata, which the
+    /// content's redaction does not reach.
     pub fn title(&self) -> String {
-        let one_line = self
-            .first_user
-            .as_deref()
-            .unwrap_or("Session transcript")
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
+        let source = crate::boundary::scrub_field(
+            self.first_user.as_deref().unwrap_or("Session transcript"),
+        );
+        let one_line = source.split_whitespace().collect::<Vec<_>>().join(" ");
         cut(&one_line, TITLE_CHARS)
     }
 
@@ -575,6 +574,43 @@ mod tests {
         assert_eq!(
             dialog.metadata["redactions"],
             serde_json::json!(["github_token"])
+        );
+    }
+
+    #[test]
+    fn a_secret_in_the_first_prompt_reaches_no_title_on_either_path() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        let token = format!("ghp_{}", "d".repeat(36));
+        let clean = |title: &str| !title.contains("ghp_") && !title.contains("dddddddd");
+        let titles = |store: &Store<'_>| -> Vec<String> {
+            crate::episodes::session_memories(store, "s1")
+                .unwrap()
+                .iter()
+                .map(|m| m.metadata["title"].as_str().unwrap_or_default().to_string())
+                .collect()
+        };
+        // The token starts before the title's cut and ends after it.
+        let ask = format!("{} {token} please", "x".repeat(TITLE_CHARS - 10));
+        let leaky = [line("user", "s1", &ask), line("assistant", "s1", "ok")].join("\n");
+        assert!(clean(&parse(&leaky).title()), "{}", parse(&leaky).title());
+
+        // First capture.
+        capture_transcript(&store, &leaky, &request("stop")).unwrap();
+        let first = titles(&store);
+        assert_eq!(first.len(), 2);
+        assert!(first.iter().all(|t| clean(t) && !t.is_empty()), "{first:?}");
+
+        // Recapture over a session first captured clean.
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        capture_transcript(&store, &transcript(""), &request("stop")).unwrap();
+        capture_transcript(&store, &leaky, &request("stop")).unwrap();
+        let again = titles(&store);
+        assert_eq!(again.len(), 2);
+        assert!(
+            again.iter().all(|t| clean(t) && t.starts_with("xxx")),
+            "{again:?}"
         );
     }
 

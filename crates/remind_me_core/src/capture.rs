@@ -22,13 +22,14 @@ use chrono::Utc;
 /// Derive a display title from a summary when the caller supplied none.
 ///
 /// First line, capped — a summary's opening line is the closest thing to a
-/// headline it has.
+/// headline it has. Either source is redacted whole first: the title is
+/// metadata, which the halves' own redaction does not reach.
 fn derive_title(title: &str, summary: &str) -> String {
     let supplied = title.trim();
     if !supplied.is_empty() {
-        return supplied.to_string();
+        return crate::boundary::scrub_field(supplied);
     }
-    summary
+    crate::boundary::scrub_field(summary)
         .lines()
         .next()
         .unwrap_or("")

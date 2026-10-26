@@ -20,6 +20,17 @@ pub fn scrub(content: &str, tags: &mut Vec<String>, metadata: &mut Value) -> Str
     crate::redact::guard(content, tags, metadata)
 }
 
+/// Redact secrets in a field kept beside the content, such as a title,
+/// with no tags or metadata of its own to mark: the content's own [`scrub`]
+/// marks the memory. Redact the whole source before it is cut, or a secret
+/// split by the cut keeps a prefix no rule matches.
+pub fn scrub_field(text: &str) -> String {
+    if !crate::redact::enabled_by_env() {
+        return text.to_string();
+    }
+    crate::redact::redact(text).content
+}
+
 /// Redact secrets in raw JSONL before it is kept verbatim (the session
 /// archive). Each string inside a line is redacted as [`scrub`] would
 /// redact it, so a line stays valid JSON; a line that does not parse is
