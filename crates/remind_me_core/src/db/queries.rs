@@ -60,49 +60,66 @@ pub fn add_memory_with(
     let base_weight = type_prior * source_prior;
     let initial_vitality = calculate_vitality(base_weight, 0, decay_rate, &now_iso, now);
 
-    Memories::new(store).insert(&NewMemory {
-        category: input.category.clone(),
-        tags: input.tags.clone(),
-        source: input.source.clone(),
-        metadata: input.metadata.clone(),
-        subject: input.subject.clone(),
-        predicate: input.predicate.clone(),
-        object: input.object.clone(),
-        decay_rate,
-        vitality: initial_vitality,
-        base_weight,
-        accessed_at: Some(now_iso.clone()),
-        sensitive: input.sensitive,
-        memory_type: fields
-            .memory_type
-            .clone()
-            .unwrap_or_else(|| UNCLASSIFIED.to_string()),
-        confidence: fields
-            .confidence
-            .unwrap_or_else(crate::models::default_confidence),
-        valid_from: fields.valid_from.clone(),
-        valid_until: fields.valid_until.clone(),
-        verified_at: fields.verified_at.clone(),
-        outcome: fields.outcome.clone(),
-        ..crate::context::default_provenance().stamp(NewMemory::new(
-            id.clone(),
-            content.clone(),
-            &now_iso,
-        ))
-    })?;
+    let write = |tx: &Store<'_>| -> Result<()> {
+        Memories::new(tx).insert(&NewMemory {
+            category: input.category.clone(),
+            tags: input.tags.clone(),
+            source: input.source.clone(),
+            metadata: input.metadata.clone(),
+            subject: input.subject.clone(),
+            predicate: input.predicate.clone(),
+            object: input.object.clone(),
+            decay_rate,
+            vitality: initial_vitality,
+            base_weight,
+            accessed_at: Some(now_iso.clone()),
+            sensitive: input.sensitive,
+            memory_type: fields
+                .memory_type
+                .clone()
+                .unwrap_or_else(|| UNCLASSIFIED.to_string()),
+            confidence: fields
+                .confidence
+                .unwrap_or_else(crate::models::default_confidence),
+            valid_from: fields.valid_from.clone(),
+            valid_until: fields.valid_until.clone(),
+            verified_at: fields.verified_at.clone(),
+            outcome: fields.outcome.clone(),
+            ..crate::context::default_provenance().stamp(NewMemory::new(
+                id.clone(),
+                content.clone(),
+                &now_iso,
+            ))
+        })?;
 
-    // `MemoryAddInput::entities` was previously parsed and then dropped, so a
-    // caller supplying entity mentions got a silent no-op. Same path as
-    // `annotate_memories` so both behave identically.
-    crate::boundary::index(
-        store,
-        &id,
-        &content,
-        &input.entities,
-        input.extract,
-        &attachments,
-        &now_iso,
-    )?;
+        // `MemoryAddInput::entities` was previously parsed and then dropped, so a
+        // caller supplying entity mentions got a silent no-op. Same path as
+        // `annotate_memories` so both behave identically.
+        crate::boundary::index(
+            tx,
+            &id,
+            &content,
+            &input.entities,
+            input.extract,
+            &attachments,
+            &now_iso,
+        )?;
+
+        // Stamped, so the change reaches the sync outbox.
+        for old in &input.supersedes {
+            retire(tx, old, &id, &now_iso)?;
+        }
+        Ok(())
+    };
+    // With `supersedes`, one transaction: the insert, its index and every
+    // retirement land together or not at all, and each target is checked
+    // inside it, so no other writer can change it between check and write.
+    // Without, the add stays the plain write it always was.
+    if input.supersedes.is_empty() {
+        write(store)?;
+    } else {
+        store.transaction(write)?;
+    }
 
     // Best-effort: no embedder configured, or one that fails mid-request,
     // leaves this memory keyword-searchable only — never a reason to fail
@@ -122,6 +139,19 @@ pub fn add_memory_with(
     crate::events::emit(crate::events::Event::Created, &memory.id, &memory.category);
 
     Ok(memory)
+}
+
+/// Mark live memory `old` superseded by `new`, refusing one that is missing,
+/// deleted, already superseded or a project claim (claims are append-only).
+fn retire(store: &Store<'_>, old: &str, new: &str, now_iso: &str) -> Result<()> {
+    let target = get_memory_by_id(store, old)?.filter(|m| m.superseded_by.is_none());
+    let Some(target) = target else {
+        return Err(StoreError::Invalid(format!(
+            "supersedes: {old:?} is not a live memory (missing, deleted or already superseded)"
+        )));
+    };
+    crate::project::refuse_claim_edit(&target)?;
+    Memories::new(store).set_superseded_by(old, new, Some(now_iso))
 }
 
 pub fn get_memory_by_id(store: &Store<'_>, id: &str) -> Result<Option<Memory>> {

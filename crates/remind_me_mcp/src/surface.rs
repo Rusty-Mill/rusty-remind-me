@@ -409,8 +409,10 @@ fn definition(name: &str, catalog: &[Value]) -> Option<Value> {
             }),
         ),
         "remind_me_update" => merged(
-            "Edit a remind-me memory's content, category, tags, metadata or type. Pass \
-             `remind_at` on its own to set a reminder, or null to clear one.",
+            "Edit a remind-me memory's content, category, tags, metadata or type. A content or \
+             type change that leaves a decision returns likely conflicting standing decisions as \
+             contradiction_candidates. Pass `remind_at` on its own to set a reminder, or null to \
+             clear one.",
             &["remind_me_update", "remind_me_set_reminder"],
             &[],
             json!({}),

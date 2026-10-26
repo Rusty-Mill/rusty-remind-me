@@ -149,6 +149,16 @@ impl<'c> Curation<'c> {
         engine::curation::contradiction_pairs(&self.core.lock(), max_fanout, cursor, limit)
     }
 
+    /// The standing decisions that share a claim, or a non-hub entity, with
+    /// `memory_id`, in id order, each with the shared entities' names.
+    pub fn decision_neighbours(
+        &self,
+        memory_id: &str,
+        max_fanout: i64,
+    ) -> Result<Vec<(String, Vec<String>)>> {
+        engine::curation::decision_neighbours(&self.core.lock(), memory_id, max_fanout)
+    }
+
     /// The names of the entities both memories mention, by name.
     pub fn shared_entity_names(&self, id_a: &str, id_b: &str) -> Result<Vec<String>> {
         engine::curation::shared_entity_names(&self.core.lock(), id_a, id_b)
