@@ -1,6 +1,7 @@
 use super::{Result, Store, StoreError};
 use crate::db::memories::{
-    EntityScope, KeywordFilter, ListFilter, Memories, MemoryEdit, NewMemory, PageFilter,
+    EntityMembers, EntityScope, KeywordFilter, ListFilter, Memories, MemoryEdit, Narrowing,
+    NewMemory, PageFilter,
 };
 use crate::expansion::{self, MemorySearchResponse};
 use crate::kinds::StructuredFields;
@@ -674,6 +675,14 @@ pub fn search_memories_deadlined(
     // syntax error rather than a search. No phrases leaves nothing to rank —
     // handled below, once the filter exists.
     let phrases = crate::fts::query_phrases(&input.query);
+    // An entity the store has never seen matches nothing: an empty result,
+    // not an error, as `search_paginated` answers it.
+    let Some(narrowing) = resolve_narrowing(store, input)? else {
+        let mut outcome = trim_by_token_budget(Vec::new(), input.token_budget, input.detail);
+        timing.elapsed_ms = deadline.elapsed_ms();
+        outcome.timing = timing;
+        return Ok(outcome);
+    };
 
     // Dormancy is filtered on *effective* vitality, inside the query and before
     // its limit: the stored column never decays, and thinning a page after the
@@ -691,6 +700,7 @@ pub fn search_memories_deadlined(
         category: input.category.clone(),
         include_sensitive: input.include_sensitive,
         scope: input.scope.clone(),
+        narrowing: narrowing.clone(),
         window: input.window,
     };
 
@@ -756,13 +766,30 @@ pub fn search_memories_deadlined(
     let (semantic_memories, semantic_similarity) = match embedder {
         Some(embedder) => {
             let extra_texts = crate::query_expansion::expand_query(&input.query);
-            let scored = crate::vectors::semantic_search_scored(
+            // Filtering the keyword half alone would not be enough: RRF fuses
+            // two independent result sets, so a sensitive, out-of-scope or
+            // out-of-window memory excluded there could still arrive through
+            // the semantic half. Admitted inside the scan, before its limit,
+            // so the filters never starve the semantic list.
+            let hidden = if input.include_sensitive {
+                std::collections::HashSet::new()
+            } else {
+                memories_repo.sensitive_ids()?
+            };
+            let admit = |m: &Memory| {
+                !hidden.contains(&m.id)
+                    && input.scope.matches_memory(m)
+                    && input.window.contains_memory(m)
+                    && narrowing.admits(m)
+            };
+            let scored = crate::vectors::semantic_search_admitted(
                 store,
                 embedder,
                 &input.query,
                 &extra_texts,
                 input.limit * 2,
                 input.category.as_deref(),
+                &admit,
             )
             .unwrap_or_default();
             let mut memories = Vec::with_capacity(scored.len());
@@ -770,24 +797,6 @@ pub fn search_memories_deadlined(
             for (memory, sim) in scored {
                 similarity.insert(memory.id.clone(), sim as f64);
                 memories.push(memory);
-            }
-            // Filtering the keyword SQL alone would not be enough: RRF fuses
-            // two independent result sets, so a sensitive memory excluded from
-            // the keyword half could still arrive through the semantic half and
-            // rank into the output. Done here rather than by threading a
-            // parameter through `semantic_search_scored`, which would change an
-            // existing public signature.
-            // Same reason for the project/branch/session/writer scope and
-            // the time window.
-            if !input.scope.is_empty() || !input.window.is_unbounded() {
-                memories
-                    .retain(|m| input.scope.matches_memory(m) && input.window.contains_memory(m));
-                similarity.retain(|id, _| memories.iter().any(|m| &m.id == id));
-            }
-            if !input.include_sensitive {
-                let hidden = memories_repo.sensitive_ids()?;
-                memories.retain(|m| !hidden.contains(&m.id));
-                similarity.retain(|id, _| !hidden.contains(id));
             }
             (memories, similarity)
         }
@@ -854,6 +863,41 @@ pub fn search_memories_deadlined(
     timing.elapsed_ms = deadline.elapsed_ms();
     outcome.timing = timing;
     Ok(outcome)
+}
+
+/// `input`'s tag, entity and repo filters, resolved against the store.
+/// `None` when the entity names nothing this store knows, so no memory can
+/// match. Blank values are unset.
+fn resolve_narrowing(store: &Store<'_>, input: &MemorySearchInput) -> Result<Option<Narrowing>> {
+    fn clean(v: &Option<String>) -> Option<&str> {
+        v.as_deref().map(str::trim).filter(|v| !v.is_empty())
+    }
+    let entity = match clean(&input.filters.entity) {
+        None => None,
+        Some(name) => {
+            let Some(entity) = crate::entity::resolve_entity(store, name)? else {
+                return Ok(None);
+            };
+            Some(EntityMembers {
+                canonical: crate::entity::normalize_entity_name(&entity.name),
+                linked: Memories::new(store).linked_ids(&entity.id)?,
+            })
+        }
+    };
+    let tags = input
+        .tags
+        .iter()
+        .flatten()
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect();
+    Ok(Some(Narrowing {
+        tags,
+        tag_match: input.filters.tag_mode,
+        entity,
+        repo: clean(&input.filters.repo).and_then(crate::context::normalize_remote),
+    }))
 }
 
 /// A window listing's row. There is no relevance to score, so every row gets

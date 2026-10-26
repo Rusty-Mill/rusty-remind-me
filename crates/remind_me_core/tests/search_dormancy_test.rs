@@ -57,6 +57,7 @@ fn search(store: &Store<'_>, query: &str, include_dormant: bool, min_vitality: f
         bootstrap: false,
         include_expired: true,
         min_confidence: 0.0,
+        filters: Default::default(),
         window: Default::default(),
     };
     queries::search_memories(store, &input)
