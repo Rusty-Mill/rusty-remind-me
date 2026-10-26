@@ -666,7 +666,7 @@ mod tests {
         assert_eq!(project.status.value, Status::Active);
         assert_eq!(project.stage.evidence.ids(), [evidence.as_str()]);
         assert!(
-            !keys(&store).iter().any(|k| *k == built),
+            !keys(&store).contains(&built),
             "confirmed, so no longer open"
         );
         assert!(

@@ -1576,7 +1576,7 @@ mod tests {
             .into_iter()
             .map(|c| c.id)
             .collect();
-        assert_eq!(candidates, [fact.clone()]);
+        assert_eq!(candidates, [fact.as_str()]);
 
         assert!(
             delete_memory(&store, &fact).unwrap(),
