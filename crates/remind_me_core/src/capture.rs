@@ -349,6 +349,9 @@ pub fn decompose(store: &Store<'_>, input: &DecomposeInput) -> Result<Option<Dec
         crate::code_refs::merge_code_refs(&mut metadata, &code_refs);
 
         let fact_content = crate::boundary::scrub(&fact.content, &mut merged_tags, &mut metadata);
+        if let Some(scheduled) = crate::review::schedule_if_decision(Some(memory_type), &metadata) {
+            metadata = scheduled;
+        }
 
         Memories::new(store).insert(&NewMemory {
             category: FACT_CATEGORY.to_string(),

@@ -23,7 +23,7 @@ before answering anything about the user, their projects or past decisions. Call
 for each durable fact, decision or preference the user states, passing memory_type (a decision \
 needs metadata.rationale) and confidence when known. Call remind_me_auto_capture at the end of \
 any substantive conversation. Close decisions and action items with remind_me_resolve when they \
-are done, abandoned or reverted.";
+are done, abandoned or reverted, and with its `review` once a due decision held up or not.";
 
 /// A tool error's text: a rejected input reads as such, anything else is
 /// the store's failure, under `prefix`.
@@ -762,7 +762,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_search",
-                                "description": "Search memories using FTS5 keyword & hybrid ranking. Returns compact hits by default (id, category, date, tags, score, snippet); fetch full text with remind_me_get memory_ids, or pass detail=full. Hits cut by token_budget are listed by id. The three expansion flags surface adjacent memories in their own sections, outside the ranked results, so they never consume `limit`. `since`/`until` narrow to a time window; with an empty `query` they list that window newest-first, e.g. { \"query\": \"\", \"since\": \"2d\" } for the last two days.",
+                                "description": "Search memories using FTS5 keyword & hybrid ranking. tags, entity, repo and the project/branch/session/writer filters narrow the ranked results before the limit applies. Returns compact hits by default (id, category, date, tags, score, snippet); fetch full text with remind_me_get memory_ids, or pass detail=full. Hits cut by token_budget are listed by id. The three expansion flags surface adjacent memories in their own sections, outside the ranked results, so they never consume `limit`.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -772,6 +772,10 @@ impl McpServer {
                                         "detail": { "type": "string", "enum": ["compact", "full"], "default": "compact", "description": "compact (default): one short line per hit, so more hits fit the budget. full: whole memories with metadata and references." },
                                         "token_budget": { "type": "integer", "default": 800, "minimum": 0, "description": "Estimated tokens the hits may use; 0 is unlimited. Hits that do not fit are listed by id." },
                                         "category": { "type": "string" },
+                                        "tags": { "type": "array", "items": { "type": "string" }, "description": "Only memories carrying these tags (see tag_mode)" },
+                                        "tag_mode": { "type": "string", "enum": ["all", "any"], "default": "all", "description": "all: every tag must be present; any: at least one" },
+                                        "entity": { "type": "string", "description": "Only memories about this entity, by name or alias: linked to it, or naming it as subject or object. An unknown entity matches nothing." },
+                                        "repo": { "type": "string", "description": "Only memories written in this git repository (origin remote, any URL form, e.g. github.com/owner/repo)" },
                                         "project": { "type": "string", "description": "Only memories written in this project (case-insensitive)" },
                                         "branch": { "type": "string", "description": "Only memories written on this git branch" },
                                         "session_id": { "type": "string", "description": "Only memories written in this client session" },
@@ -1546,15 +1550,16 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_resolve",
-                                "description": "Close a decision or action item as done, abandoned, reverted or superseded. A reverted or abandoned one loses half its weight so it stops outranking what replaced it; the prior state is kept in history.",
+                                "description": "Close a decision or action item as done, abandoned, reverted or superseded (`outcome`), or record a decision's follow-up review (`review`): whether it held up, which is separate from whether it was carried out. Pass exactly one. A reverted or abandoned one loses half its weight so it stops outranking what replaced it; the prior state is kept in history.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
                                         "memory_id": { "type": "string" },
                                         "outcome": { "type": "string", "enum": ["done", "abandoned", "reverted", "superseded"] },
-                                        "note": { "type": "string", "description": "Why; stored as metadata.outcome_note." }
+                                        "review": { "type": "string", "enum": ["held", "revised", "reverted"], "description": "Decisions only. `reverted` also sets outcome to reverted." },
+                                        "note": { "type": "string", "description": "Why; stored as metadata.outcome_note, or metadata.review.note for a review." }
                                     },
-                                    "required": ["memory_id", "outcome"]
+                                    "required": ["memory_id"]
                                 }
                             },
                             {
@@ -3436,15 +3441,27 @@ impl McpServer {
                     }
                     "remind_me_resolve" => {
                         let memory_id = args.get("memory_id").and_then(Value::as_str).unwrap_or("");
-                        let outcome = args.get("outcome").and_then(Value::as_str).unwrap_or("");
+                        let outcome = args.get("outcome").and_then(Value::as_str);
+                        let review = args.get("review").and_then(Value::as_str);
                         let note = args.get("note").and_then(Value::as_str);
-                        match remind_me_core::resolve::resolve_memory(
-                            &store, memory_id, outcome, note,
-                        ) {
-                            Ok(Some(mem)) => {
+                        let resolved = match (outcome, review) {
+                            (Some(outcome), None) => remind_me_core::resolve::resolve_memory(
+                                &store, memory_id, outcome, note,
+                            )
+                            .map(|m| m.map(|m| (m, format!("resolved as {outcome}")))),
+                            (None, Some(review)) => remind_me_core::review::record_review(
+                                &store, memory_id, review, note,
+                            )
+                            .map(|m| m.map(|m| (m, format!("reviewed: {review}")))),
+                            _ => Err(remind_me_core::db::StoreError::Invalid(
+                                "pass exactly one of `outcome` and `review`".to_string(),
+                            )),
+                        };
+                        match resolved {
+                            Ok(Some((mem, done))) => {
                                 json!({ "content": [{ "type": "text", "text": match format {
                                     ResponseFormat::Json => serde_json::to_string_pretty(&mem).unwrap(),
-                                    ResponseFormat::Markdown => format!("✓ Memory `{}` resolved as {}.", mem.id, outcome),
+                                    ResponseFormat::Markdown => format!("✓ Memory `{}` {}.", mem.id, done),
                                 } }] })
                             }
                             Ok(None) => {
@@ -6195,6 +6212,41 @@ mod structure_tests {
     }
 
     #[test]
+    fn search_narrows_by_tags_and_advertises_its_filters() {
+        let s = server();
+        let props = &tool(&s, "remind_me_search")["inputSchema"]["properties"];
+        for field in ["tags", "tag_mode", "entity", "repo"] {
+            assert!(props[field].is_object(), "search should advertise {field}");
+        }
+        call(
+            &s,
+            "remind_me_add",
+            json!({ "content": "mux pane layout", "tags": ["mux"] }),
+        );
+        call(
+            &s,
+            "remind_me_add",
+            json!({ "content": "mux in the terminal", "tags": ["term"] }),
+        );
+
+        let found = call(
+            &s,
+            "remind_me_search",
+            json!({ "query": "mux", "tags": ["mux"], "response_format": "json" }),
+        );
+        let md = text(&found);
+        assert!(md.contains("mux pane layout"), "{md}");
+        assert!(!md.contains("mux in the terminal"), "{md}");
+
+        let bad = call(
+            &s,
+            "remind_me_search",
+            json!({ "query": "mux", "tag_mode": "some" }),
+        );
+        assert!(is_error(&bad), "{bad}");
+    }
+
+    #[test]
     fn a_decision_without_a_rationale_is_rejected_with_the_field_named() {
         let s = server();
         let bad = call(
@@ -6289,10 +6341,12 @@ mod structure_tests {
     #[test]
     fn resolve_is_listed_and_demotes_a_reverted_decision() {
         let s = server();
-        assert!(tool(&s, "remind_me_resolve")["inputSchema"]["required"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("outcome")));
+        let schema = &tool(&s, "remind_me_resolve")["inputSchema"];
+        assert_eq!(schema["required"], json!(["memory_id"]));
+        assert_eq!(
+            schema["properties"]["review"]["enum"],
+            json!(["held", "revised", "reverted"])
+        );
         let id = stored_id(&call(
             &s,
             "remind_me_add",
@@ -6321,6 +6375,54 @@ mod structure_tests {
             json!({ "memory_id": id, "outcome": "meh" }),
         );
         assert!(is_error(&bad) && text(&bad).contains("outcome"));
+    }
+
+    #[test]
+    fn resolve_records_a_review_separately_from_the_outcome() {
+        let s = server();
+        let id = stored_id(&call(
+            &s,
+            "remind_me_add",
+            json!({ "content": "adopt Y", "memory_type": "decision",
+                    "metadata": { "rationale": "r" } }),
+        ));
+        call(
+            &s,
+            "remind_me_resolve",
+            json!({ "memory_id": id, "outcome": "done" }),
+        );
+        let reviewed = call(
+            &s,
+            "remind_me_resolve",
+            json!({ "memory_id": id, "review": "held", "note": "fewer pages" }),
+        );
+        assert!(!is_error(&reviewed), "{}", text(&reviewed));
+        let m: Value = serde_json::from_str(&text(&reviewed)).unwrap();
+        assert_eq!(m["outcome"], "done");
+        assert_eq!(m["metadata"]["review"]["outcome"], "held");
+        assert_eq!(m["metadata"]["review"]["note"], "fewer pages");
+
+        for args in [
+            json!({ "memory_id": id }),
+            json!({ "memory_id": id, "outcome": "done", "review": "held" }),
+        ] {
+            let both = call(&s, "remind_me_resolve", args);
+            assert!(
+                is_error(&both) && text(&both).contains("exactly one"),
+                "{}",
+                text(&both)
+            );
+        }
+        let bad = call(
+            &s,
+            "remind_me_resolve",
+            json!({ "memory_id": id, "review": "fine" }),
+        );
+        assert!(
+            is_error(&bad) && text(&bad).contains("review"),
+            "{}",
+            text(&bad)
+        );
     }
 
     #[test]
@@ -6370,6 +6472,45 @@ mod structure_tests {
             json!({ "query": "quokka policy", "include_expired": false }),
         );
         assert!(text(&hidden).contains("No memories"), "{}", text(&hidden));
+    }
+
+    #[test]
+    fn a_queryless_window_search_is_narrowed_ranked_by_validity_and_limited() {
+        let s = server();
+        call(
+            &s,
+            "remind_me_add",
+            json!({ "content": "solid mux note", "tags": ["mux"] }),
+        );
+        call(
+            &s,
+            "remind_me_add",
+            json!({ "content": "shaky mux note", "tags": ["mux"], "confidence": 0.2 }),
+        );
+        call(
+            &s,
+            "remind_me_add",
+            json!({ "content": "term pane note", "tags": ["term"] }),
+        );
+
+        let search = |args: Value| text(&call(&s, "remind_me_search", args));
+        // Newest first would put the shaky note on top; low confidence
+        // demotes it, and the limit keeps one.
+        let top = search(json!({ "query": "", "since": "1h", "tags": ["mux"], "limit": 1 }));
+        assert!(top.contains("solid mux note"), "{top}");
+        assert!(
+            !top.contains("shaky mux note") && !top.contains("term pane note"),
+            "{top}"
+        );
+
+        let both = search(json!({ "query": "", "since": "1h", "tags": ["mux"], "limit": 5 }));
+        assert!(
+            both.contains("shaky mux note") && !both.contains("term pane note"),
+            "{both}"
+        );
+
+        let none = search(json!({ "query": "", "since": "1h", "repo": "github.com/acme/none" }));
+        assert!(none.contains("No memories"), "{none}");
     }
 
     #[test]

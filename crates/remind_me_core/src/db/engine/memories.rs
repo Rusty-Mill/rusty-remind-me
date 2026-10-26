@@ -1034,6 +1034,15 @@ pub(crate) fn all_live(tables: &EngineTables) -> Result<Vec<Memory>> {
         .collect())
 }
 
+/// Every live memory of `memory_type`, oldest first (ties by id).
+pub(crate) fn live_of_type(tables: &EngineTables, memory_type: &str) -> Result<Vec<Memory>> {
+    let mut rows: Vec<MemoryRow> = rows(core_ref(tables)?)
+        .filter(|row| row.deleted_at.is_none() && row.memory_type == memory_type)
+        .collect();
+    rows.sort_by(|a, b| (&a.created_at, &a.id).cmp(&(&b.created_at, &b.id)));
+    Ok(rows.iter().map(MemoryRow::to_memory).collect())
+}
+
 /// Live, unsuperseded, non-sensitive memories whose metadata has a non-null
 /// `code_refs`: id, content and metadata text.
 pub(crate) fn with_code_refs(tables: &EngineTables) -> Result<Vec<(String, String, String)>> {
@@ -1210,6 +1219,7 @@ pub(crate) fn keyword_hits(
         .into_iter()
         .filter(|(row, _)| row.admits(filter))
         .map(|(row, score)| (row.to_memory(), score))
+        .filter(|(memory, _)| filter.narrowing.admits(memory))
         .filter(|(memory, _)| vital_enough(filter, memory, now))
         .take(limit)
         .collect())
@@ -1229,6 +1239,7 @@ pub(crate) fn window_hits(tables: &EngineTables, filter: &KeywordFilter) -> Resu
     Ok(hits
         .into_iter()
         .map(|row| row.to_memory())
+        .filter(|memory| filter.narrowing.admits(memory))
         .filter(|memory| vital_enough(filter, memory, now))
         .collect())
 }

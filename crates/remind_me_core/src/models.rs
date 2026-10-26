@@ -395,10 +395,42 @@ pub struct MemorySearchInput {
     /// Drop memories below this `confidence`. `0.0` keeps everything.
     #[serde(default)]
     pub min_confidence: f64,
+    /// How `tags` combine, and narrowing by entity or repository.
+    #[serde(default, flatten)]
+    pub filters: SearchFilters,
     /// Narrow to a `since`/`until` window over `created_at` or `updated_at`.
     /// Bounded with an empty `query`, the search lists the window newest-first.
     #[serde(default, flatten)]
     pub window: crate::time_window::TimeWindow,
+}
+
+/// How a search's `tags` combine.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TagMatch {
+    /// A memory must carry every tag, as `remind_me_list` requires.
+    #[default]
+    All,
+    /// A memory must carry at least one tag.
+    Any,
+}
+
+/// Content filters on a ranked search, beside [`MemorySearchInput::tags`].
+///
+/// Blank strings are treated as unset, as [`crate::context::ScopeFilter`]
+/// treats them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchFilters {
+    #[serde(default)]
+    pub tag_mode: TagMatch,
+    /// Only memories linked to this entity, named or aliased, or whose
+    /// subject or object is it. An unknown entity matches nothing.
+    #[serde(default)]
+    pub entity: Option<String>,
+    /// Only memories written in this repository: a `git_remote` in any form
+    /// `git` accepts, compared after [`crate::context::normalize_remote`].
+    #[serde(default)]
+    pub repo: Option<String>,
 }
 
 fn default_include_expired() -> bool {
@@ -430,6 +462,7 @@ impl Default for MemorySearchInput {
             scope: Default::default(),
             include_expired: true,
             min_confidence: 0.0,
+            filters: SearchFilters::default(),
             window: Default::default(),
         }
     }
@@ -1995,7 +2028,19 @@ pub struct DigestData {
     pub vitality: crate::vitality::VitalityReport,
     pub reminders_upcoming: Vec<DigestReminder>,
     pub reminders_overdue: Vec<DigestReminder>,
+    /// Decisions whose follow-up review is due (`crate::review`). Defaulted
+    /// so a digest serialised before follow-ups existed still reads.
+    #[serde(default)]
+    pub reviews_due: Vec<DigestReview>,
     pub sync: SyncStatus,
+}
+
+/// One decision due for review, as the digest lists it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DigestReview {
+    pub id: String,
+    pub due: String,
+    pub content: String,
 }
 
 /// One reminder as the digest lists it.

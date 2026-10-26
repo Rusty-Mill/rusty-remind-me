@@ -228,6 +228,29 @@ pub fn semantic_search_scored(
     limit: usize,
     category: Option<&str>,
 ) -> Result<Vec<(Memory, f32)>, VectorError> {
+    semantic_search_admitted(
+        store,
+        embedder,
+        query,
+        extra_texts,
+        limit,
+        category,
+        &|_| true,
+    )
+}
+
+/// [`semantic_search_scored`], keeping only memories `admit` accepts, and
+/// applying it before `limit`: a filter applied to the top `limit` afterwards
+/// would return a short list while admissible memories ranked just below.
+pub fn semantic_search_admitted(
+    store: &Store<'_>,
+    embedder: &dyn Embedder,
+    query: &str,
+    extra_texts: &[String],
+    limit: usize,
+    category: Option<&str>,
+    admit: &dyn Fn(&Memory) -> bool,
+) -> Result<Vec<(Memory, f32)>, VectorError> {
     let mut fuse_texts = Vec::with_capacity(1 + extra_texts.len());
     fuse_texts.push(query.to_string());
     fuse_texts.extend(extra_texts.iter().cloned());
@@ -242,7 +265,14 @@ pub fn semantic_search_scored(
     // ran. `None` means scan everything — a search must not fail, or change
     // its answers, because an optimisation was unavailable.
     if let Some(narrowed) = crate::ann_index::candidates(store, &query_vector, limit) {
-        let scored = scan_and_score(store, &query_vector, limit, category, Some(&narrowed))?;
+        let scored = scan_and_score(
+            store,
+            &query_vector,
+            limit,
+            category,
+            Some(&narrowed),
+            admit,
+        )?;
         // A category filter can remove most of what the index proposed.
         // Returning fewer results than a full scan would have is a retrieval
         // regression nobody would notice, so fall back rather than accept a
@@ -251,7 +281,7 @@ pub fn semantic_search_scored(
             return Ok(scored);
         }
     }
-    scan_and_score(store, &query_vector, limit, category, None)
+    scan_and_score(store, &query_vector, limit, category, None, admit)
 }
 
 /// Score every candidate exactly and return the best `limit`.
@@ -265,6 +295,7 @@ fn scan_and_score(
     limit: usize,
     category: Option<&str>,
     narrowed: Option<&[String]>,
+    admit: &dyn Fn(&Memory) -> bool,
 ) -> Result<Vec<(Memory, f32)>, VectorError> {
     // The same filter the keyword branch of search applies, so the two ranked
     // lists retrieval fuses answer the same question.
@@ -302,12 +333,18 @@ fn scan_and_score(
 
     let mut ranked: Vec<(String, f32)> = best_by_memory.into_iter().collect();
     ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    ranked.truncate(limit);
 
-    let mut memories = Vec::with_capacity(ranked.len());
+    // Rows are read best first until `limit` pass `admit`, so a filter
+    // never short-fills the list while admissible rows remain.
+    let mut memories = Vec::with_capacity(limit.min(ranked.len()));
     for (memory_id, similarity) in ranked {
+        if memories.len() >= limit {
+            break;
+        }
         if let Some(memory) = crate::db::queries::get_memory_by_id(store, &memory_id)? {
-            memories.push((memory, similarity));
+            if admit(&memory) {
+                memories.push((memory, similarity));
+            }
         }
     }
     Ok(memories)

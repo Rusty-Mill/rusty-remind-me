@@ -2,8 +2,10 @@
 //!
 //! One builder, three callers, one [`Mode`] each:
 //!
-//! - [`Mode::Session`]: the SessionStart hook. Persona and reminders due
-//!   within a week, then the project's sections. An unknown project leaves
+//! - [`Mode::Session`]: the SessionStart hook. Persona, reminders due within
+//!   a week and the project's decisions due for a follow-up review
+//!   ([`crate::review`]; listed there, not again below), then the project's
+//!   sections. An unknown project leaves
 //!   the project sections empty: the hook names whatever directory it is in.
 //! - [`Mode::Project`]: `remind_me_brief`, `GET /api/brief` and
 //!   `rusty-remind-me brief`. The project's sections only. An unknown project
@@ -67,6 +69,7 @@ const STATE_LIMIT: usize = 3;
 const OPEN_LIMIT: usize = 15;
 const ACTIVITY_LIMIT: usize = 20;
 const HIT_LIMIT: usize = 5;
+const REVIEW_LIMIT: usize = 5;
 const SUGGESTION_LIMIT: usize = 5;
 /// An item's text is its first line, cut to this many characters.
 const TEXT_CHARS: usize = 240;
@@ -268,11 +271,16 @@ pub fn build(store: &Store<'_>, request: &ContextRequest<'_>) -> Result<Outcome>
     brief.project = scope.project_match(&in_scope);
 
     let mut drafts = Vec::new();
+    let mut rest = in_scope;
     if request.mode == Mode::Session {
         drafts.push(persona_draft(store)?);
         drafts.push(reminders_draft(store, now)?);
+        let reviews = reviews_draft(&memories, &scope, now);
+        let listed: HashSet<&str> = reviews.items.iter().map(|i| i.id.as_str()).collect();
+        rest.retain(|m| !listed.contains(m.id.as_str()));
+        drafts.push(reviews);
     }
-    drafts.extend(project_drafts(&in_scope, since, request.branch));
+    drafts.extend(project_drafts(&rest, since, request.branch));
     if request.mode == Mode::Session {
         if let Some(prompt) = prompt {
             drafts.push(hits_draft(store, prompt, now)?);
@@ -495,8 +503,10 @@ fn after(timestamp: &str, start: DateTime<Utc>) -> bool {
 }
 
 /// Not superseded, not expired, not sensitive, not a raw dialog: what is fit
-/// to show unasked.
-fn injectable(memory: &Memory, now: DateTime<Utc>) -> bool {
+/// to show unasked. Expiry compares parsed instants, never text: as text,
+/// `13:00+02:00` (11:00Z) sorts after `12:00Z`. Shared with
+/// [`crate::review::due_among`].
+pub(crate) fn injectable(memory: &Memory, now: DateTime<Utc>) -> bool {
     memory.superseded_by.is_none()
         && !memory.sensitive
         && memory.category != crate::models::DIALOG_CATEGORY
@@ -625,6 +635,25 @@ fn reminders_draft(store: &Store<'_>, now: DateTime<Utc>) -> Result<Draft> {
         weight: 10,
         items,
     })
+}
+
+/// Decisions in scope due for a follow-up review (`crate::review`), oldest
+/// due date first. Listed here, they are left out of the project sections.
+fn reviews_draft(memories: &[Memory], scope: &Scope, now: DateTime<Utc>) -> Draft {
+    let items = crate::review::due_among(memories, now, None)
+        .into_iter()
+        .filter(|m| scope.admits(m))
+        .take(REVIEW_LIMIT)
+        .map(|m| Item {
+            at: crate::review::review_due(m).unwrap_or_default().to_string(),
+            ..item(m)
+        })
+        .collect();
+    Draft {
+        name: "reviews",
+        weight: 15,
+        items,
+    }
 }
 
 fn hits_draft(store: &Store<'_>, prompt: &str, now: DateTime<Utc>) -> Result<Draft> {
@@ -758,6 +787,7 @@ fn heading(name: &str) -> &'static str {
     match name {
         "persona" => "Persona",
         "reminders" => "Reminders due within 7 days",
+        "reviews" => "Decisions to review: did they hold up?",
         "state" => "Current state",
         "open" => "Open: blockers, decisions, action items",
         "activity" => "Recent activity",
@@ -768,7 +798,7 @@ fn heading(name: &str) -> &'static str {
 fn line(section: &str, item: &Item) -> String {
     match section {
         "persona" => format!("- {}", item.text),
-        "reminders" => format!("- due {}: {} ({})", item.at, item.text, item.id),
+        "reminders" | "reviews" => format!("- due {}: {} ({})", item.at, item.text, item.id),
         _ => format!("- [{}] {} ({})", item.kind, item.text, item.id),
     }
 }
@@ -848,6 +878,25 @@ mod tests {
     use crate::db::Database;
     use crate::models::EntityInput;
     use crate::retrieval::estimated_content_tokens;
+
+    #[test]
+    fn expiry_compares_instants_not_text() {
+        let now: DateTime<Utc> = "2026-10-26T12:00:00Z".parse().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        let cases = [
+            ("mem_a", "2026-10-26T13:00:00+02:00", false),
+            ("mem_b", "2026-10-26T15:00:00+02:00", true),
+            ("mem_c", "2026-10-26T12:00:00Z", false),
+        ];
+        for (id, until, _) in cases {
+            add(&store, id, |r| r.valid_until = Some(until.into()));
+        }
+        for (id, until, shown) in cases {
+            let memory = Memories::new(&store).get_live(id).unwrap().unwrap();
+            assert_eq!(injectable(&memory, now), shown, "{until}");
+        }
+    }
 
     fn add(store: &Store<'_>, id: &str, f: impl FnOnce(&mut NewMemory)) {
         let mut row = NewMemory::new(id, format!("content of {id}"), &Utc::now().to_rfc3339());
