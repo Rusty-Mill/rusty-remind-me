@@ -1199,11 +1199,7 @@ pub(crate) fn keyword_hits(
 
 /// What `Memories::window_hits` selects: every live, unsuperseded row
 /// `filter` admits, newest first on the window's timestamp (ties by id).
-pub(crate) fn window_hits(
-    tables: &EngineTables,
-    filter: &KeywordFilter,
-    limit: usize,
-) -> Result<Vec<Memory>> {
+pub(crate) fn window_hits(tables: &EngineTables, filter: &KeywordFilter) -> Result<Vec<Memory>> {
     let now = chrono::Utc::now();
     let field = |row: &MemoryRow| {
         crate::time_window::parse_rfc3339(filter.window.pick(&row.created_at, &row.updated_at))
@@ -1216,7 +1212,6 @@ pub(crate) fn window_hits(
         .into_iter()
         .map(|row| row.to_memory())
         .filter(|memory| vital_enough(filter, memory, now))
-        .take(limit)
         .collect())
 }
 

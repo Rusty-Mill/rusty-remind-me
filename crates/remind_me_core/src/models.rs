@@ -9,6 +9,22 @@ pub enum ResponseFormat {
     Json,
 }
 
+/// How much of each hit a search carries, and is charged for (card #51).
+///
+/// The token budget is spent per hit, so this decides how many hits fit, not
+/// just how they look. `Full` is the library default and keeps every existing
+/// caller unchanged; the MCP tool defaults to `Compact` so a budgeted search
+/// returns ids and snippets, with full bodies fetched by id on demand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchDetail {
+    /// Id, category, date, tags, score and a short snippet.
+    Compact,
+    /// The whole memory.
+    #[default]
+    Full,
+}
+
 /// RRF retrieval strategy profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -310,6 +326,9 @@ pub struct MemorySearchInput {
     pub token_budget: usize,
     #[serde(default)]
     pub response_format: ResponseFormat,
+    /// What each hit carries and costs against `token_budget`.
+    #[serde(default)]
+    pub detail: SearchDetail,
     #[serde(default)]
     pub include_dormant: bool,
     #[serde(default)]
@@ -393,6 +412,7 @@ impl Default for MemorySearchInput {
             limit: default_limit(),
             token_budget: default_token_budget(),
             response_format: ResponseFormat::default(),
+            detail: SearchDetail::default(),
             include_dormant: false,
             min_vitality: 0.0,
             verbose: false,

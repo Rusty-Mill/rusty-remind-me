@@ -640,19 +640,23 @@ pub fn search_memories_deadlined(
     // Nothing to rank. A bounded window still asks a question — "what
     // happened in the last two days" — so answer it as a newest-first listing;
     // with no window either, nothing was searchable.
+    // `limit` applies after `apply_validity`, so a dropped or demoted row
+    // gives its place to an eligible one, as in the ranked path.
     if phrases.is_empty() {
         let listed = if input.window.is_unbounded() {
             Vec::new()
         } else {
-            let hits = memories_repo.window_hits(&filter, input.limit)?;
-            crate::retrieval::apply_validity(
+            let hits = memories_repo.window_hits(&filter)?;
+            let mut listed = crate::retrieval::apply_validity(
                 hits.into_iter().map(listed_result).collect(),
                 Utc::now(),
                 input.include_expired,
                 input.min_confidence,
-            )
+            );
+            listed.truncate(input.limit);
+            listed
         };
-        let mut outcome = trim_by_token_budget(listed, input.token_budget);
+        let mut outcome = trim_by_token_budget(listed, input.token_budget, input.detail);
         timing.elapsed_ms = deadline.elapsed_ms();
         outcome.timing = timing;
         return Ok(outcome);
@@ -789,7 +793,7 @@ pub fn search_memories_deadlined(
     };
     ranked.truncate(input.limit);
 
-    let mut outcome = trim_by_token_budget(ranked, input.token_budget);
+    let mut outcome = trim_by_token_budget(ranked, input.token_budget, input.detail);
     timing.elapsed_ms = deadline.elapsed_ms();
     outcome.timing = timing;
     Ok(outcome)
@@ -974,6 +978,7 @@ pub fn search_with_expansions(
         total_candidates: outcome.total_candidates,
         returned: outcome.returned,
         trimmed: outcome.trimmed,
+        trimmed_ids: outcome.trimmed_ids,
         // Hits only, matching this field's documented meaning. The bootstrap
         // carries its own `tokens_used`, so the response total is the sum of
         // the two rather than either one restated — see the renderer, which

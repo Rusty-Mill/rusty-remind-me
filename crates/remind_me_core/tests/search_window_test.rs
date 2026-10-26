@@ -180,3 +180,46 @@ fn the_window_is_independent_of_include_expired() {
         .collect();
     assert_eq!(ids, vec![middle]);
 }
+
+/// One-slot listing over `[recent, middle, _]` with `recent` made ineligible.
+fn first_listed(store: &Store<'_>, include_expired: bool, min_confidence: f64) -> Vec<String> {
+    let input = MemorySearchInput {
+        query: String::new(),
+        limit: 1,
+        include_dormant: true,
+        include_expired,
+        min_confidence,
+        window: window(Some("2d"), None, TimeField::Created),
+        ..Default::default()
+    };
+    queries::search_memories(store, &input)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.memory.id)
+        .collect()
+}
+
+#[test]
+fn limit_applies_after_expiry_so_a_valid_row_takes_the_slot() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let [recent, middle, _] = seeded(&store);
+    testing::set_memory_column(&store, &recent, "valid_until", "2020-01-01T00:00:00Z").unwrap();
+
+    assert_eq!(first_listed(&store, false, 0.0), vec![middle.clone()]);
+    assert_eq!(
+        first_listed(&store, true, 0.0),
+        vec![middle],
+        "expired is demoted below the valid row before the cut"
+    );
+}
+
+#[test]
+fn limit_applies_after_min_confidence() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let [recent, middle, _] = seeded(&store);
+    testing::set_memory_column(&store, &recent, "confidence", 0.2).unwrap();
+
+    assert_eq!(first_listed(&store, true, 0.5), vec![middle]);
+}

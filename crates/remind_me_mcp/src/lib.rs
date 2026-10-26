@@ -16,9 +16,9 @@ pub mod daemon_proxy;
 pub mod references;
 pub mod render;
 
-/// What an MCP client is told about the server on `initialize`: when to
-/// reach for which tool. Kept short; it is paid for in every session.
-const SERVER_INSTRUCTIONS: &str = "Long-term memory for the user. Search (remind_me_search) \
+/// What an MCP client is told about the server on `initialize`, over every
+/// transport: when to reach for which tool. Kept short; it is paid for in every session.
+pub const SERVER_INSTRUCTIONS: &str = "Long-term memory for the user. Search (remind_me_search) \
 before answering anything about the user, their projects or past decisions. Call remind_me_add \
 for each durable fact, decision or preference the user states, passing memory_type (a decision \
 needs metadata.rationale) and confidence when known. Call remind_me_auto_capture at the end of \
@@ -32,6 +32,45 @@ fn store_error_text(prefix: &str, e: &remind_me_core::db::StoreError) -> String 
         remind_me_core::db::StoreError::Invalid(why) => format!("Invalid input: {why}"),
         other => format!("{prefix}: {other}"),
     }
+}
+
+/// Most ids one `remind_me_get` call fetches (card #51): enough for a page of
+/// search hits, small enough that a stray call cannot dump the store.
+const GET_IDS_MAX: usize = 20;
+
+/// `remind_me_get` with `memory_ids`: every memory found, plus the ids that
+/// were not, so one stale id does not fail the whole fetch.
+fn get_memories(store: &remind_me_core::db::Store<'_>, raw: &Value) -> Value {
+    let ids: Option<Vec<&str>> = raw
+        .as_array()
+        .map(|items| items.iter().map(Value::as_str).collect::<Option<Vec<_>>>())
+        .unwrap_or(None);
+    let ids = match ids {
+        Some(ids) if !ids.is_empty() && ids.len() <= GET_IDS_MAX => ids,
+        _ => {
+            return json!({ "isError": true, "content": [{ "type": "text", "text": format!(
+                "Invalid input: memory_ids must be an array of 1 to {GET_IDS_MAX} id strings"
+            ) }] })
+        }
+    };
+    let mut memories = Vec::new();
+    let mut missing = Vec::new();
+    for id in ids {
+        match queries::get_memory_by_id(store, id) {
+            Ok(Some(mem)) => match references::memory_json(store, &mem) {
+                Ok(value) => memories.push(value),
+                Err(e) => {
+                    return json!({ "isError": true, "content": [{ "type": "text", "text": format!("Error: {e}") }] })
+                }
+            },
+            Ok(None) => missing.push(id),
+            Err(e) => {
+                return json!({ "isError": true, "content": [{ "type": "text", "text": format!("Error: {e}") }] })
+            }
+        }
+    }
+    let payload = json!({ "memories": memories, "missing": missing });
+    json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&payload).unwrap_or_default() }] })
 }
 
 /// The response format a call asked for, defaulting to **JSON** (#206).
@@ -145,19 +184,19 @@ use remind_me_core::{
     MemoryStatsInput, MemoryUpdateInput, MempalaceImportInput, NormalizeApplyInput,
     NormalizeBatchInput, RecalibrateCandidatesInput, ReclassifyBatchInput, ReclassifyInput,
     ReconcilePeerInput, ResponseFormat, RevertInput, SaveSearchInput, SavedSearchNameInput,
-    SetReminderInput, SyncRepairInput, UndoImportInput, UpdateOutcome, WikiDeleteOutcome,
-    ANNOTATE_BATCH_MAX, ANNOTATE_BATCH_MIN, CONSOLIDATE_LIMIT_MAX, CONSOLIDATE_LIMIT_MIN,
-    CONSOLIDATE_SIMILARITY_MAX, CONSOLIDATE_SIMILARITY_MIN, CONTRADICTION_LIMIT_MAX,
-    CONTRADICTION_LIMIT_MIN, DBS_IMPORT_LIMIT_MAX, DBS_IMPORT_LIMIT_MIN, DECOMPOSE_BATCH_MAX,
-    DECOMPOSE_BATCH_MIN, DECOMPOSE_FACTS_MAX, DECOMPOSE_FACTS_MIN, ENTITY_LOOKUP_LIMIT_MAX,
-    ENTITY_LOOKUP_LIMIT_MIN, EXTRACT_BATCH_MAX, EXTRACT_BATCH_MIN, EXTRACT_MODES,
-    HISTORY_LIMIT_MAX, HISTORY_LIMIT_MIN, IMPORT_MAX_LENGTH_MAX, IMPORT_MAX_LENGTH_MIN,
-    MEMPALACE_IMPORT_LIMIT_MAX, MEMPALACE_IMPORT_LIMIT_MIN, NORMALIZE_APPLY_MAX,
-    NORMALIZE_APPLY_MIN, NORMALIZE_BATCH_MAX, NORMALIZE_BATCH_MIN, PROMOTION_LIMIT_DEFAULT,
-    PROMOTION_LIMIT_MAX, PROMOTION_LIMIT_MIN, RECALIBRATE_LIMIT_MAX, RECALIBRATE_LIMIT_MIN,
-    RECLASSIFY_BATCH_MAX, RECLASSIFY_BATCH_MIN, REMINDER_LIMIT_MAX, REMINDER_LIMIT_MIN,
-    STALE_CANDIDATES_LIMIT_DEFAULT, STALE_CANDIDATES_LIMIT_MAX, STALE_CANDIDATES_LIMIT_MIN,
-    UNDO_IMPORT_LIMIT_MAX, UNDO_IMPORT_LIMIT_MIN,
+    SearchDetail, SetReminderInput, SyncRepairInput, UndoImportInput, UpdateOutcome,
+    WikiDeleteOutcome, ANNOTATE_BATCH_MAX, ANNOTATE_BATCH_MIN, CONSOLIDATE_LIMIT_MAX,
+    CONSOLIDATE_LIMIT_MIN, CONSOLIDATE_SIMILARITY_MAX, CONSOLIDATE_SIMILARITY_MIN,
+    CONTRADICTION_LIMIT_MAX, CONTRADICTION_LIMIT_MIN, DBS_IMPORT_LIMIT_MAX, DBS_IMPORT_LIMIT_MIN,
+    DECOMPOSE_BATCH_MAX, DECOMPOSE_BATCH_MIN, DECOMPOSE_FACTS_MAX, DECOMPOSE_FACTS_MIN,
+    ENTITY_LOOKUP_LIMIT_MAX, ENTITY_LOOKUP_LIMIT_MIN, EXTRACT_BATCH_MAX, EXTRACT_BATCH_MIN,
+    EXTRACT_MODES, HISTORY_LIMIT_MAX, HISTORY_LIMIT_MIN, IMPORT_MAX_LENGTH_MAX,
+    IMPORT_MAX_LENGTH_MIN, MEMPALACE_IMPORT_LIMIT_MAX, MEMPALACE_IMPORT_LIMIT_MIN,
+    NORMALIZE_APPLY_MAX, NORMALIZE_APPLY_MIN, NORMALIZE_BATCH_MAX, NORMALIZE_BATCH_MIN,
+    PROMOTION_LIMIT_DEFAULT, PROMOTION_LIMIT_MAX, PROMOTION_LIMIT_MIN, RECALIBRATE_LIMIT_MAX,
+    RECALIBRATE_LIMIT_MIN, RECLASSIFY_BATCH_MAX, RECLASSIFY_BATCH_MIN, REMINDER_LIMIT_MAX,
+    REMINDER_LIMIT_MIN, STALE_CANDIDATES_LIMIT_DEFAULT, STALE_CANDIDATES_LIMIT_MAX,
+    STALE_CANDIDATES_LIMIT_MIN, UNDO_IMPORT_LIMIT_MAX, UNDO_IMPORT_LIMIT_MIN,
 };
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
@@ -375,11 +414,44 @@ pub struct McpServer {
 /// recording a client called "".
 fn client_identity(req: &serde_json::Value) -> Option<String> {
     let info = req.get("params")?.get("clientInfo")?;
-    let name = info.get("name")?.as_str()?.trim();
+    let name = info.get("name")?.as_str()?;
+    identity(name, info.get("version").and_then(|v| v.as_str()))
+}
+
+/// The request `_meta` key a transport serving many callers from one handler
+/// puts each call's caller under: a `"name/version"` string, or `null` for a
+/// caller that named nobody.
+///
+/// The caller travels in the request itself because the request is all that
+/// crosses to the daemon. The remote connector relays every caller's lines
+/// over one daemon connection, so neither that connection's session nor any
+/// scope in the connector's own process can say who made a call; a field on
+/// the line can, on whichever thread finally runs it.
+///
+/// Advisory, like `clientInfo`: whoever sends a line can set it.
+pub const CALLER_META_KEY: &str = "rusty-remind-me/caller";
+
+/// The caller a request names under [`CALLER_META_KEY`]: `Some(None)` for a
+/// caller that named nobody, `None` for a request that does not say.
+fn forwarded_caller(request_json: &str) -> Option<Option<String>> {
+    // Most lines never carry the key; skip the second parse for them.
+    if !request_json.contains(CALLER_META_KEY) {
+        return None;
+    }
+    let req: Value = serde_json::from_str(request_json).ok()?;
+    let caller = req.get("params")?.get("_meta")?.get(CALLER_META_KEY)?;
+    Some(caller.as_str().map(str::to_string))
+}
+
+/// `"name/version"` for a client's reported `name` and `version`, or `None`
+/// for a blank name: the identity [`client_identity`] reads from a stdio
+/// handshake, for transports that receive the handshake already parsed.
+pub fn identity(name: &str, version: Option<&str>) -> Option<String> {
+    let name = name.trim();
     if name.is_empty() {
         return None;
     }
-    match info.get("version").and_then(|v| v.as_str()).map(str::trim) {
+    match version.map(str::trim) {
         Some(version) if !version.is_empty() => Some(format!("{name}/{version}")),
         _ => Some(name.to_string()),
     }
@@ -434,7 +506,12 @@ impl McpServer {
     /// the single point every reply passes through, rather than at the
     /// several hundred `json!` sites that build them.
     pub fn handle_request(&self, request_json: &str) -> Option<Value> {
-        let mut response = self.dispatch_request(request_json)?;
+        let mut response = match forwarded_caller(request_json) {
+            Some(caller) => remind_me_core::sync::with_call_client(caller, || {
+                self.dispatch_request(request_json)
+            }),
+            None => self.dispatch_request(request_json),
+        }?;
         stamp_result_type(&mut response);
         Some(response)
     }
@@ -561,14 +638,14 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_get",
-                                "description": "Get a memory by ID.",
+                                "description": "Get memories by ID: one with memory_id, or several with memory_ids (e.g. the ids a compact remind_me_search returned or trimmed). memory_ids returns {memories, missing}.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
                                         "memory_id": { "type": "string" },
+                                        "memory_ids": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": GET_IDS_MAX, "description": "Fetch several memories in one call. Use instead of memory_id, not with it." },
                                         "id": { "type": "string", "description": "Deprecated alias for memory_id. Prefer memory_id; kept for backward compatibility." }
-                                    },
-                                    "required": ["memory_id"]
+                                    }
                                 }
                             },
                             {
@@ -631,13 +708,15 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_search",
-                                "description": "Search memories using FTS5 keyword & hybrid ranking. The three expansion flags surface adjacent memories in their own sections, outside the ranked results, so they never consume `limit`. `since`/`until` narrow to a time window; with an empty `query` they list that window newest-first, e.g. { \"query\": \"\", \"since\": \"2d\" } for the last two days.",
+                                "description": "Search memories using FTS5 keyword & hybrid ranking. Returns compact hits by default (id, category, date, tags, score, snippet); fetch full text with remind_me_get memory_ids, or pass detail=full. Hits cut by token_budget are listed by id. The three expansion flags surface adjacent memories in their own sections, outside the ranked results, so they never consume `limit`. `since`/`until` narrow to a time window; with an empty `query` they list that window newest-first, e.g. { \"query\": \"\", \"since\": \"2d\" } for the last two days.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
                                         "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "markdown", "description": "markdown (default, as the reference) renders the results; json returns the full envelope including scores." },
                                         "query": { "type": "string", "description": "Search text. May be empty when since or until is set, to list that window newest-first." },
                                         "limit": { "type": "integer", "default": 20 },
+                                        "detail": { "type": "string", "enum": ["compact", "full"], "default": "compact", "description": "compact (default): one short line per hit, so more hits fit the budget. full: whole memories with metadata and references." },
+                                        "token_budget": { "type": "integer", "default": 800, "minimum": 0, "description": "Estimated tokens the hits may use; 0 is unlimited. Hits that do not fit are listed by id." },
                                         "category": { "type": "string" },
                                         "project": { "type": "string", "description": "Only memories written in this project (case-insensitive)" },
                                         "branch": { "type": "string", "description": "Only memories written on this git branch" },
@@ -1559,6 +1638,13 @@ impl McpServer {
                             }
                         }
                     }
+                    "remind_me_get" if args.get("memory_ids").is_some() => {
+                        if args.get("memory_id").is_some() || args.get("id").is_some() {
+                            json!({ "isError": true, "content": [{ "type": "text", "text": "Invalid input: pass memory_id or memory_ids, not both" }] })
+                        } else {
+                            get_memories(&store, &args["memory_ids"])
+                        }
+                    }
                     "remind_me_get" => {
                         // "memory_id" is the canonical parameter, matching every
                         // other single-memory tool. "id" is a deprecated alias
@@ -1662,6 +1748,12 @@ impl McpServer {
                         }
                     }
                     "remind_me_search" => {
+                        // The tool defaults to compact; the library keeps full
+                        // so its other callers are unchanged (card #51).
+                        let mut args = args;
+                        if let Some(object) = args.as_object_mut() {
+                            object.entry("detail").or_insert(json!("compact"));
+                        }
                         let input: Result<MemorySearchInput, _> = serde_json::from_value(args);
                         match input {
                             Ok(search_input) => {
@@ -1674,14 +1766,26 @@ impl McpServer {
                                         // The value was parsed and then thrown
                                         // away here, so a markdown request got
                                         // a successful JSON response (#224).
-                                        let text = match search_input.response_format {
-                                            ResponseFormat::Json => serde_json::to_string_pretty(
-                                                &references::search_json(&store, &res)
-                                                    .unwrap_or_else(|_| json!(res)),
-                                            )
-                                            .unwrap(),
-                                            ResponseFormat::Markdown => {
-                                                render::search_response(&res)
+                                        let detail = search_input.detail;
+                                        let text = match (search_input.response_format, detail) {
+                                            (ResponseFormat::Json, SearchDetail::Compact) => {
+                                                serde_json::to_string_pretty(
+                                                    &render::compact_search_json(&res),
+                                                )
+                                                .unwrap()
+                                            }
+                                            (ResponseFormat::Json, SearchDetail::Full) => {
+                                                serde_json::to_string_pretty(
+                                                    &references::search_json(&store, &res)
+                                                        .unwrap_or_else(|_| json!(res)),
+                                                )
+                                                .unwrap()
+                                            }
+                                            (ResponseFormat::Markdown, SearchDetail::Compact) => {
+                                                render::search_response(&res, detail)
+                                            }
+                                            (ResponseFormat::Markdown, SearchDetail::Full) => {
+                                                render::search_response(&res, detail)
                                                     + &references::search_markdown_footer(
                                                         &store, &res,
                                                     )
@@ -3753,6 +3857,115 @@ mod tests {
             .to_string()
     }
 
+    /// Add `content` and return its id.
+    fn add(server: &McpServer, content: &str) -> String {
+        let added = call(server, "remind_me_add", json!({ "content": content }));
+        serde_json::from_str::<Value>(&text_of(&added)).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn long_body(tail: &str) -> String {
+        format!("Compactness {} {tail}", "filler ".repeat(60))
+    }
+
+    #[test]
+    fn search_is_compact_by_default() {
+        let server = McpServer::new(Database::open_in_memory().unwrap());
+        let id = add(&server, &long_body("ENDMARK"));
+
+        let text = text_of(&call(
+            &server,
+            "remind_me_search",
+            json!({ "query": "Compactness" }),
+        ));
+        assert!(text.contains(&format!("- `{id}` · ")), "{text}");
+        assert!(text.contains('…'), "{text}");
+        assert!(!text.contains("ENDMARK"), "compact must not carry the body");
+
+        let full = text_of(&call(
+            &server,
+            "remind_me_search",
+            json!({ "query": "Compactness", "detail": "full" }),
+        ));
+        assert!(full.contains("ENDMARK"), "{full}");
+    }
+
+    #[test]
+    fn compact_json_carries_a_snippet_not_the_memory() {
+        let server = McpServer::new(Database::open_in_memory().unwrap());
+        let id = add(&server, &long_body("ENDMARK"));
+
+        let res = call(
+            &server,
+            "remind_me_search",
+            json!({ "query": "Compactness", "response_format": "json" }),
+        );
+        let res: Value = serde_json::from_str(&text_of(&res)).unwrap();
+        let hit = &res["memories"][0];
+        assert_eq!(hit["id"], id.as_str());
+        assert!(hit["snippet"].as_str().unwrap().starts_with("Compactness"));
+        assert!(hit.get("memory").is_none(), "{hit}");
+        assert_eq!(res["trimmed"], 0);
+    }
+
+    #[test]
+    fn a_trimmed_search_names_the_dropped_ids_and_get_fetches_them() {
+        let server = McpServer::new(Database::open_in_memory().unwrap());
+        for i in 0..3 {
+            add(&server, &long_body(&i.to_string()));
+        }
+        let search = |format: &str| {
+            text_of(&call(
+                &server,
+                "remind_me_search",
+                json!({ "query": "Compactness", "detail": "full", "token_budget": 100, "response_format": format }),
+            ))
+        };
+
+        let res: Value = serde_json::from_str(&search("json")).unwrap();
+        let dropped = res["trimmed_ids"].as_array().unwrap().clone();
+        assert_eq!(dropped.len(), 2, "{res}");
+
+        let text = search("markdown");
+        assert!(text.contains("remind_me_get"), "{text}");
+        for id in &dropped {
+            assert!(
+                text.contains(&format!("`{}`", id.as_str().unwrap())),
+                "{text}"
+            );
+        }
+
+        let got = call(
+            &server,
+            "remind_me_get",
+            json!({ "memory_ids": [dropped[0], dropped[1], "mem_missing"] }),
+        );
+        let got: Value = serde_json::from_str(&text_of(&got)).unwrap();
+        assert_eq!(got["memories"].as_array().unwrap().len(), 2, "{got}");
+        assert_eq!(got["missing"], json!(["mem_missing"]));
+    }
+
+    #[test]
+    fn get_rejects_bad_memory_ids() {
+        let server = McpServer::new(Database::open_in_memory().unwrap());
+        let too_many: Vec<String> = (0..=GET_IDS_MAX).map(|i| format!("m{i}")).collect();
+        for args in [
+            json!({ "memory_ids": [] }),
+            json!({ "memory_ids": too_many }),
+            json!({ "memory_ids": [1] }),
+            json!({ "memory_ids": "m1" }),
+            json!({ "memory_ids": ["m1"], "memory_id": "m1" }),
+        ] {
+            assert_eq!(
+                call(&server, "remind_me_get", args.clone())["isError"],
+                true,
+                "{args}"
+            );
+        }
+    }
+
     #[test]
     fn test_crud_tools_are_registered() {
         let db = Database::open_in_memory().unwrap();
@@ -3824,7 +4037,7 @@ mod tests {
         let searched = call(
             &server,
             "remind_me_search",
-            json!({ "query": "Shipped", "response_format": "json" }),
+            json!({ "query": "Shipped", "response_format": "json", "detail": "full" }),
         );
         let searched: Value = serde_json::from_str(&text_of(&searched)).unwrap();
         assert_eq!(
@@ -3835,7 +4048,11 @@ mod tests {
             2,
             "{searched}"
         );
-        let md = call(&server, "remind_me_search", json!({ "query": "Shipped" }));
+        let md = call(
+            &server,
+            "remind_me_search",
+            json!({ "query": "Shipped", "detail": "full" }),
+        );
         assert!(
             text_of(&md).contains("refs: commit:3ac9f797, issue:o/r#321"),
             "{}",
@@ -4067,16 +4284,13 @@ mod tests {
             props.contains_key("id"),
             "id stays advertised as a deprecated alias so existing schema-reading clients still see it"
         );
-        let required: Vec<&str> = tool["inputSchema"]["required"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
-        assert_eq!(
-            required,
-            vec!["memory_id"],
-            "memory_id is the canonical required param, not id"
+        assert!(
+            props.contains_key("memory_ids"),
+            "memory_ids fetches several at once (card #51)"
+        );
+        assert!(
+            tool["inputSchema"].get("required").is_none(),
+            "either memory_id or memory_ids may be given, so neither is required"
         );
     }
 
@@ -5441,8 +5655,8 @@ mod tests {
 
 #[cfg(test)]
 mod handshake_identity {
-    use super::client_identity;
-    use serde_json::json;
+    use super::{client_identity, forwarded_caller, CALLER_META_KEY};
+    use serde_json::{json, Value};
 
     fn parse(params: serde_json::Value) -> Option<String> {
         client_identity(&json!({ "method": "initialize", "params": params }))
@@ -5482,6 +5696,25 @@ mod handshake_identity {
         assert_eq!(parse(json!({ "clientInfo": { "name": 42 } })), None);
         // A handshake with no params at all must not panic.
         assert_eq!(client_identity(&json!({ "method": "initialize" })), None);
+    }
+
+    #[test]
+    fn a_forwarded_caller_is_named_null_or_absent() {
+        let line = |meta: Value| {
+            json!({ "method": "tools/call", "params": { "name": "x", "_meta": meta } }).to_string()
+        };
+        assert_eq!(
+            forwarded_caller(&line(json!({ CALLER_META_KEY: "claude-ai/1.0" }))),
+            Some(Some("claude-ai/1.0".to_string()))
+        );
+        // Null is a caller that named nobody: still a decision, so the
+        // connection's handshake must not stand in for it.
+        assert_eq!(
+            forwarded_caller(&line(json!({ CALLER_META_KEY: null }))),
+            Some(None)
+        );
+        assert_eq!(forwarded_caller(&line(json!({}))), None);
+        assert_eq!(forwarded_caller(r#"{"method":"tools/list"}"#), None);
     }
 }
 
@@ -5729,7 +5962,29 @@ mod structure_tests {
                     "metadata": { "rationale": "one store", "alternatives": ["sqlite"] },
                     "confidence": 0.5, "valid_until": "2020-01-01T00:00:00Z" }),
         );
-        let found = call(&s, "remind_me_search", json!({ "query": "quokka policy" }));
+        let compact = text(&call(
+            &s,
+            "remind_me_search",
+            json!({ "query": "quokka policy" }),
+        ));
+        assert!(
+            compact.contains("expired"),
+            "a compact hit keeps its marks: {compact}"
+        );
+        let json = text(&call(
+            &s,
+            "remind_me_search",
+            json!({ "query": "quokka policy", "response_format": "json" }),
+        ));
+        let hit = &serde_json::from_str::<Value>(&json).unwrap()["memories"][0];
+        assert_eq!(hit["expired"], true, "{hit}");
+        assert_eq!(hit["valid_until"], "2020-01-01T00:00:00Z", "{hit}");
+        assert_eq!(hit["confidence"], 0.5, "{hit}");
+        let found = call(
+            &s,
+            "remind_me_search",
+            json!({ "query": "quokka policy", "detail": "full" }),
+        );
         let md = text(&found);
         assert!(md.contains("**Rationale:** one store"), "{md}");
         assert!(md.contains("**Alternatives:** sqlite"), "{md}");

@@ -23,8 +23,8 @@ mod test_env;
 
 use remind_me_core::db::Store;
 use remind_me_core::sync::{
-    configured_client, memory_provenance, set_handshake_client, CLIENT_ENV, DEFAULT_CLIENT,
-    NODE_ID_ENV,
+    configured_client, memory_provenance, set_handshake_client, with_call_client, CLIENT_ENV,
+    DEFAULT_CLIENT, NODE_ID_ENV,
 };
 use remind_me_core::{db::queries, Database};
 use std::sync::Mutex;
@@ -260,6 +260,43 @@ fn the_handshake_identity_beats_the_configured_one() {
     // A blank name must not record a client called "".
     set_handshake_client(Some("   ".to_string()));
     assert_eq!(configured_client(), TEST_CLIENT);
+}
+
+#[test]
+fn a_call_client_wins_for_its_call_only_and_keeps_concurrent_callers_apart() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _ident = Ident::set();
+    set_handshake_client(Some("last-handshake/1".to_string()));
+
+    // One handler serving many callers: each call names its own caller, and
+    // neither sees the other's or the process-wide handshake.
+    let callers = ["claude-ai/1.0", "chatgpt/2"].map(|name| {
+        std::thread::spawn(move || {
+            with_call_client(Some(name.to_string()), || {
+                std::thread::yield_now();
+                configured_client()
+            })
+        })
+    });
+    let seen = callers.map(|h| h.join().unwrap());
+    assert_eq!(seen, ["claude-ai/1.0", "chatgpt/2"]);
+
+    // A call that named nobody falls to the configured client, not to
+    // whoever shook hands last; a blank name is nobody.
+    assert_eq!(with_call_client(None, configured_client), TEST_CLIENT);
+    assert_eq!(
+        with_call_client(Some(" ".to_string()), configured_client),
+        TEST_CLIENT
+    );
+
+    // Nested calls restore the outer caller, and the scope ends with the call.
+    with_call_client(Some("outer".to_string()), || {
+        with_call_client(Some("inner".to_string()), || {
+            assert_eq!(configured_client(), "inner");
+        });
+        assert_eq!(configured_client(), "outer");
+    });
+    assert_eq!(configured_client(), "last-handshake/1");
 }
 
 #[test]
