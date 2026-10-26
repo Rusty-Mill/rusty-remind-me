@@ -211,6 +211,7 @@ fn a_capture_is_searchable() {
             min_confidence: 0.0,
             // The dialog half is raw, ranked only on request (ADR-0029).
             include_raw: true,
+            filters: Default::default(),
             window: Default::default(),
         },
     )

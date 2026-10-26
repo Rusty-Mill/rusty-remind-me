@@ -242,7 +242,7 @@ pub fn record_feedback(
 /// Jaccard similarity (intersection over union) of two token sets. `0.0` if
 /// either side is empty — matching the reference, which special-cases this
 /// rather than letting an empty union divide by zero.
-fn jaccard(a: &HashSet<&str>, b: &HashSet<&str>) -> f64 {
+pub(crate) fn jaccard(a: &HashSet<&str>, b: &HashSet<&str>) -> f64 {
     if a.is_empty() || b.is_empty() {
         return 0.0;
     }

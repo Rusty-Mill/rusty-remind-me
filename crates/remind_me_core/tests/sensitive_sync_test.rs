@@ -73,6 +73,7 @@ fn search_ids(store: &Store<'_>, query: &str, include_sensitive: bool) -> Vec<St
             window: Default::default(),
             include_sensitive,
             include_raw: false,
+            filters: Default::default(),
         },
     )
     .unwrap()

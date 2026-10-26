@@ -592,6 +592,7 @@ fn search_input(query: &str) -> MemorySearchInput {
         include_expired: true,
         min_confidence: 0.0,
         include_raw: false,
+        filters: Default::default(),
         window: Default::default(),
     }
 }

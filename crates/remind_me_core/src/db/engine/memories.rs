@@ -1211,6 +1211,7 @@ pub(crate) fn keyword_hits(
         .into_iter()
         .filter(|(row, _)| row.admits(filter))
         .map(|(row, score)| (row.to_memory(), score))
+        .filter(|(memory, _)| filter.narrowing.admits(memory))
         .filter(|(memory, _)| vital_enough(filter, memory, now))
         .take(limit)
         .collect())
@@ -1230,6 +1231,7 @@ pub(crate) fn window_hits(tables: &EngineTables, filter: &KeywordFilter) -> Resu
     Ok(hits
         .into_iter()
         .map(|row| row.to_memory())
+        .filter(|memory| filter.narrowing.admits(memory))
         .filter(|memory| vital_enough(filter, memory, now))
         .collect())
 }
@@ -1248,13 +1250,6 @@ fn vital_enough(
 pub(crate) fn sensitive_ids(tables: &EngineTables) -> Result<HashSet<String>> {
     Ok(rows(core_ref(tables)?)
         .filter(|row| row.sensitive)
-        .map(|row| row.id)
-        .collect())
-}
-
-pub(crate) fn raw_ids(tables: &EngineTables) -> Result<HashSet<String>> {
-    Ok(rows(core_ref(tables)?)
-        .filter(|row| crate::db::memories::is_raw_category(&row.category))
         .map(|row| row.id)
         .collect())
 }

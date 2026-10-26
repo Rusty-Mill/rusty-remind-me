@@ -259,6 +259,10 @@ pub struct MemoryAddInput {
     /// are stored, never the bytes.
     #[serde(default)]
     pub attachments: Vec<AttachmentInput>,
+    /// Live memories this one replaces: each is marked superseded by it. An
+    /// id that is missing, deleted or already superseded refuses the add.
+    #[serde(default)]
+    pub supersedes: Vec<String>,
 }
 
 /// One attachment of a [`MemoryAddInput`]: a local `path` (hashed, never
@@ -295,6 +299,7 @@ impl Default for MemoryAddInput {
             sensitive: false,
             extract: true,
             attachments: Vec::new(),
+            supersedes: Vec::new(),
         }
     }
 }
@@ -396,6 +401,9 @@ pub struct MemorySearchInput {
     /// session turns it on.
     #[serde(default)]
     pub include_raw: bool,
+    /// How `tags` combine, and narrowing by entity or repository.
+    #[serde(default, flatten)]
+    pub filters: SearchFilters,
     /// Narrow to a `since`/`until` window over `created_at` or `updated_at`.
     /// Bounded with an empty `query`, the search lists the window newest-first.
     #[serde(default, flatten)]
@@ -412,6 +420,35 @@ impl MemorySearchInput {
                 .as_deref()
                 .is_some_and(crate::db::memories::is_raw_category)
     }
+}
+
+/// How a search's `tags` combine.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TagMatch {
+    /// A memory must carry every tag, as `remind_me_list` requires.
+    #[default]
+    All,
+    /// A memory must carry at least one tag.
+    Any,
+}
+
+/// Content filters on a ranked search, beside [`MemorySearchInput::tags`].
+///
+/// Blank strings are treated as unset, as [`crate::context::ScopeFilter`]
+/// treats them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchFilters {
+    #[serde(default)]
+    pub tag_mode: TagMatch,
+    /// Only memories linked to this entity, named or aliased, or whose
+    /// subject or object is it. An unknown entity matches nothing.
+    #[serde(default)]
+    pub entity: Option<String>,
+    /// Only memories written in this repository: a `git_remote` in any form
+    /// `git` accepts, compared after [`crate::context::normalize_remote`].
+    #[serde(default)]
+    pub repo: Option<String>,
 }
 
 fn default_include_expired() -> bool {
@@ -444,6 +481,7 @@ impl Default for MemorySearchInput {
             include_expired: true,
             min_confidence: 0.0,
             include_raw: false,
+            filters: SearchFilters::default(),
             window: Default::default(),
         }
     }
@@ -1879,6 +1917,49 @@ pub struct ContradictionCandidate {
     /// Absent for pairs that are not a triple conflict, or are a dead heat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recommended_keep: Option<String>,
+}
+
+/// Why a saved decision was matched against an existing one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictReason {
+    /// The same subject and predicate with a different object.
+    SameClaim,
+    /// A shared entity and enough word overlap to read as the same topic.
+    SharedEntity,
+}
+
+/// An existing standing decision that a just-saved decision may contradict.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DecisionConflict {
+    pub memory: ContradictionSide,
+    /// `1.0` for [`ConflictReason::SameClaim`], else the content's word
+    /// overlap (Jaccard), at least [`crate::contradictions::ON_SAVE_MIN_OVERLAP`].
+    pub score: f64,
+    pub reason: ConflictReason,
+    /// Names of the entities both decisions mention, in name order.
+    pub shared_entities: Vec<String>,
+}
+
+/// What the contradiction check on save adds to a write's result. Both
+/// fields are omitted when empty, so a write that found nothing reads as
+/// it always has.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SaveCheck {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contradiction_candidates: Vec<DecisionConflict>,
+    /// The check failed; the write it followed still stands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contradiction_check_error: Option<String>,
+}
+
+/// A memory as a write returns it, with the contradiction check's findings.
+#[derive(Debug, Clone, Serialize)]
+pub struct SavedMemory<'a> {
+    #[serde(flatten)]
+    pub memory: &'a Memory,
+    #[serde(flatten)]
+    pub check: SaveCheck,
 }
 
 /// A page of candidate pairs.

@@ -1,6 +1,7 @@
 use super::{Result, Store, StoreError};
 use crate::db::memories::{
-    EntityScope, KeywordFilter, ListFilter, Memories, MemoryEdit, NewMemory, PageFilter,
+    is_raw_category, EntityMembers, EntityScope, KeywordFilter, ListFilter, Memories, MemoryEdit,
+    Narrowing, NewMemory, PageFilter,
 };
 use crate::expansion::{self, MemorySearchResponse};
 use crate::kinds::StructuredFields;
@@ -60,49 +61,66 @@ pub fn add_memory_with(
     let base_weight = type_prior * source_prior;
     let initial_vitality = calculate_vitality(base_weight, 0, decay_rate, &now_iso, now);
 
-    Memories::new(store).insert(&NewMemory {
-        category: input.category.clone(),
-        tags: input.tags.clone(),
-        source: input.source.clone(),
-        metadata: input.metadata.clone(),
-        subject: input.subject.clone(),
-        predicate: input.predicate.clone(),
-        object: input.object.clone(),
-        decay_rate,
-        vitality: initial_vitality,
-        base_weight,
-        accessed_at: Some(now_iso.clone()),
-        sensitive: input.sensitive,
-        memory_type: fields
-            .memory_type
-            .clone()
-            .unwrap_or_else(|| UNCLASSIFIED.to_string()),
-        confidence: fields
-            .confidence
-            .unwrap_or_else(crate::models::default_confidence),
-        valid_from: fields.valid_from.clone(),
-        valid_until: fields.valid_until.clone(),
-        verified_at: fields.verified_at.clone(),
-        outcome: fields.outcome.clone(),
-        ..crate::context::default_provenance().stamp(NewMemory::new(
-            id.clone(),
-            content.clone(),
-            &now_iso,
-        ))
-    })?;
+    let write = |tx: &Store<'_>| -> Result<()> {
+        Memories::new(tx).insert(&NewMemory {
+            category: input.category.clone(),
+            tags: input.tags.clone(),
+            source: input.source.clone(),
+            metadata: input.metadata.clone(),
+            subject: input.subject.clone(),
+            predicate: input.predicate.clone(),
+            object: input.object.clone(),
+            decay_rate,
+            vitality: initial_vitality,
+            base_weight,
+            accessed_at: Some(now_iso.clone()),
+            sensitive: input.sensitive,
+            memory_type: fields
+                .memory_type
+                .clone()
+                .unwrap_or_else(|| UNCLASSIFIED.to_string()),
+            confidence: fields
+                .confidence
+                .unwrap_or_else(crate::models::default_confidence),
+            valid_from: fields.valid_from.clone(),
+            valid_until: fields.valid_until.clone(),
+            verified_at: fields.verified_at.clone(),
+            outcome: fields.outcome.clone(),
+            ..crate::context::default_provenance().stamp(NewMemory::new(
+                id.clone(),
+                content.clone(),
+                &now_iso,
+            ))
+        })?;
 
-    // `MemoryAddInput::entities` was previously parsed and then dropped, so a
-    // caller supplying entity mentions got a silent no-op. Same path as
-    // `annotate_memories` so both behave identically.
-    crate::boundary::index(
-        store,
-        &id,
-        &content,
-        &input.entities,
-        input.extract,
-        &attachments,
-        &now_iso,
-    )?;
+        // `MemoryAddInput::entities` was previously parsed and then dropped, so a
+        // caller supplying entity mentions got a silent no-op. Same path as
+        // `annotate_memories` so both behave identically.
+        crate::boundary::index(
+            tx,
+            &id,
+            &content,
+            &input.entities,
+            input.extract,
+            &attachments,
+            &now_iso,
+        )?;
+
+        // Stamped, so the change reaches the sync outbox.
+        for old in &input.supersedes {
+            retire(tx, old, &id, &now_iso)?;
+        }
+        Ok(())
+    };
+    // With `supersedes`, one transaction: the insert, its index and every
+    // retirement land together or not at all, and each target is checked
+    // inside it, so no other writer can change it between check and write.
+    // Without, the add stays the plain write it always was.
+    if input.supersedes.is_empty() {
+        write(store)?;
+    } else {
+        store.transaction(write)?;
+    }
 
     // Best-effort: no embedder configured, or one that fails mid-request,
     // leaves this memory keyword-searchable only — never a reason to fail
@@ -122,6 +140,19 @@ pub fn add_memory_with(
     crate::events::emit(crate::events::Event::Created, &memory.id, &memory.category);
 
     Ok(memory)
+}
+
+/// Mark live memory `old` superseded by `new`, refusing one that is missing,
+/// deleted, already superseded or a project claim (claims are append-only).
+fn retire(store: &Store<'_>, old: &str, new: &str, now_iso: &str) -> Result<()> {
+    let target = get_memory_by_id(store, old)?.filter(|m| m.superseded_by.is_none());
+    let Some(target) = target else {
+        return Err(StoreError::Invalid(format!(
+            "supersedes: {old:?} is not a live memory (missing, deleted or already superseded)"
+        )));
+    };
+    crate::project::refuse_claim_edit(&target)?;
+    Memories::new(store).set_superseded_by(old, new, Some(now_iso))
 }
 
 pub fn get_memory_by_id(store: &Store<'_>, id: &str) -> Result<Option<Memory>> {
@@ -644,6 +675,14 @@ pub fn search_memories_deadlined(
     // syntax error rather than a search. No phrases leaves nothing to rank —
     // handled below, once the filter exists.
     let phrases = crate::fts::query_phrases(&input.query);
+    // An entity the store has never seen matches nothing: an empty result,
+    // not an error, as `search_paginated` answers it.
+    let Some(narrowing) = resolve_narrowing(store, input)? else {
+        let mut outcome = trim_by_token_budget(Vec::new(), input.token_budget, input.detail);
+        timing.elapsed_ms = deadline.elapsed_ms();
+        outcome.timing = timing;
+        return Ok(outcome);
+    };
 
     // Dormancy is filtered on *effective* vitality, inside the query and before
     // its limit: the stored column never decays, and thinning a page after the
@@ -662,6 +701,7 @@ pub fn search_memories_deadlined(
         include_sensitive: input.include_sensitive,
         scope: input.scope.clone(),
         exclude_raw: !input.ranks_raw(),
+        narrowing: narrowing.clone(),
         window: input.window,
     };
 
@@ -729,21 +769,33 @@ pub fn search_memories_deadlined(
     let (semantic_memories, semantic_similarity) = match semantic_embedder {
         Some(semantic) => {
             let extra_texts = crate::query_expansion::expand_query(&input.query);
-            // Raw rows are left out before the best `limit * 2` are chosen:
-            // filtering after would let stronger raw hits take every slot.
-            let excluded = if filter.exclude_raw {
-                memories_repo.raw_ids()?
-            } else {
+            // Filtering the keyword half alone would not be enough: RRF fuses
+            // two independent result sets, so a sensitive, out-of-scope,
+            // out-of-window or raw memory excluded there could still arrive
+            // through the semantic half. Admitted inside the scan, before its limit,
+            // so the filters never starve the semantic list.
+            let hidden = if input.include_sensitive {
                 std::collections::HashSet::new()
+            } else {
+                memories_repo.sensitive_ids()?
             };
-            let scored = crate::vectors::semantic_search_excluding(
+            let admit = |m: &Memory| {
+                !hidden.contains(&m.id)
+                    && input.scope.matches_memory(m)
+                    && input.window.contains_memory(m)
+                    && narrowing.admits(m)
+                    // Raw rows go before the best `limit * 2` are chosen, or
+                    // stronger raw hits would take every slot (ADR-0029).
+                    && !(filter.exclude_raw && is_raw_category(&m.category))
+            };
+            let scored = crate::vectors::semantic_search_admitted(
                 store,
                 semantic,
                 &input.query,
                 &extra_texts,
                 input.limit * 2,
                 input.category.as_deref(),
-                &excluded,
+                &admit,
             )
             .unwrap_or_default();
             let mut memories = Vec::with_capacity(scored.len());
@@ -751,24 +803,6 @@ pub fn search_memories_deadlined(
             for (memory, sim) in scored {
                 similarity.insert(memory.id.clone(), sim as f64);
                 memories.push(memory);
-            }
-            // Filtering the keyword SQL alone would not be enough: RRF fuses
-            // two independent result sets, so a sensitive memory excluded from
-            // the keyword half could still arrive through the semantic half and
-            // rank into the output. Done here rather than by threading a
-            // parameter through `semantic_search_scored`, which would change an
-            // existing public signature.
-            // Same reason for the project/branch/session/writer scope and
-            // the time window.
-            if !input.scope.is_empty() || !input.window.is_unbounded() {
-                memories
-                    .retain(|m| input.scope.matches_memory(m) && input.window.contains_memory(m));
-                similarity.retain(|id, _| memories.iter().any(|m| &m.id == id));
-            }
-            if !input.include_sensitive {
-                let hidden = memories_repo.sensitive_ids()?;
-                memories.retain(|m| !hidden.contains(&m.id));
-                similarity.retain(|id, _| !hidden.contains(id));
             }
             (memories, similarity)
         }
@@ -864,6 +898,41 @@ fn raw_fallback(
         }
     }
     Ok(outcome)
+}
+
+/// `input`'s tag, entity and repo filters, resolved against the store.
+/// `None` when the entity names nothing this store knows, so no memory can
+/// match. Blank values are unset.
+fn resolve_narrowing(store: &Store<'_>, input: &MemorySearchInput) -> Result<Option<Narrowing>> {
+    fn clean(v: &Option<String>) -> Option<&str> {
+        v.as_deref().map(str::trim).filter(|v| !v.is_empty())
+    }
+    let entity = match clean(&input.filters.entity) {
+        None => None,
+        Some(name) => {
+            let Some(entity) = crate::entity::resolve_entity(store, name)? else {
+                return Ok(None);
+            };
+            Some(EntityMembers {
+                canonical: crate::entity::normalize_entity_name(&entity.name),
+                linked: Memories::new(store).linked_ids(&entity.id)?,
+            })
+        }
+    };
+    let tags = input
+        .tags
+        .iter()
+        .flatten()
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect();
+    Ok(Some(Narrowing {
+        tags,
+        tag_match: input.filters.tag_mode,
+        entity,
+        repo: clean(&input.filters.repo).and_then(crate::context::normalize_remote),
+    }))
 }
 
 /// A window listing's row. There is no relevance to score, so every row gets

@@ -5,6 +5,7 @@
 //! reachable: on request, by category, and as a marked fallback when nothing
 //! refined matches.
 
+use remind_me_core::db::memories::{Memories, NewMemory};
 use remind_me_core::db::queries;
 use remind_me_core::db::Store;
 use remind_me_core::models::MemorySearchInput;
@@ -108,8 +109,9 @@ fn a_session_or_raw_category_turns_raw_ranking_on() {
     assert!(skeleton.ranks_raw());
 }
 
-/// Points every query and raw text one way and everything else close by, so
-/// raw rows are the stronger semantic hits without any keyword overlap.
+/// Points every query, raw text and `strong` distractor one way and
+/// everything else close by, so those are the stronger semantic hits without
+/// any keyword overlap.
 struct RawLeaningEmbedder;
 
 impl remind_me_core::embedder::Embedder for RawLeaningEmbedder {
@@ -123,7 +125,9 @@ impl remind_me_core::embedder::Embedder for RawLeaningEmbedder {
             .iter()
             .map(|t| match role {
                 EmbedRole::Query => vec![1.0, 0.0],
-                EmbedRole::Passage if t.contains("dialog") => vec![1.0, 0.0],
+                EmbedRole::Passage if t.contains("dialog") || t.contains("strong") => {
+                    vec![1.0, 0.0]
+                }
                 EmbedRole::Passage => vec![0.8, 0.6],
             })
             .collect())
@@ -310,4 +314,144 @@ fn semantic_raw_exclusion_composes_with_the_window() {
         .collect();
     assert_eq!(found, vec![fact.as_str()]);
     assert!(!outcome.raw_fallback);
+}
+
+/// A row in project `mill`, tagged `zoo`, made `days` ago: what the filtered
+/// searches below admit, unless a field is overridden.
+fn row(id: &str, content: &str, category: &str, days: i64) -> NewMemory {
+    let when = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+    NewMemory {
+        category: category.into(),
+        tags: vec!["zoo".into()],
+        project: Some("mill".into()),
+        ..NewMemory::new(id, content, &when)
+    }
+}
+
+fn put(store: &Store<'_>, memory: NewMemory) {
+    Memories::new(store).insert(&memory).unwrap();
+    remind_me_core::vectors::embed_and_store(
+        store,
+        &RawLeaningEmbedder,
+        &memory.id,
+        &memory.content,
+    )
+    .unwrap();
+}
+
+/// Window, scope and tag filter at once, the `zoo` tag and `mill` project
+/// set by [`row`].
+fn filtered(text: &str) -> MemorySearchInput {
+    MemorySearchInput {
+        tags: Some(vec!["zoo".into()]),
+        scope: remind_me_core::context::ScopeFilter {
+            project: Some("mill".into()),
+            ..Default::default()
+        },
+        window: last_day(),
+        include_dormant: true,
+        ..query(text)
+    }
+}
+
+#[test]
+fn every_filter_and_raw_exclusion_admit_before_the_semantic_limit() {
+    use remind_me_core::retrieval::Deadline;
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    // Three of each kind, more than the `limit * 2` the semantic scan keeps,
+    // all stronger semantic hits than the one eligible fact.
+    for n in 0..3 {
+        put(
+            &store,
+            row(&format!("raw{n}"), "dialog strong", "dialog", 0),
+        );
+        put(&store, row(&format!("old{n}"), "strong old", "fact", 3));
+        put(
+            &store,
+            NewMemory {
+                project: Some("elsewhere".into()),
+                ..row(&format!("out{n}"), "strong elsewhere", "fact", 0)
+            },
+        );
+        put(
+            &store,
+            NewMemory {
+                tags: Vec::new(),
+                ..row(&format!("bare{n}"), "strong untagged", "fact", 0)
+            },
+        );
+    }
+    put(&store, row("fact", "striped horses graze", "fact", 0));
+    let input = MemorySearchInput {
+        limit: 1,
+        ..filtered("zebra")
+    };
+
+    let outcome = queries::search_memories_deadlined(
+        &store,
+        &input,
+        Some(&RawLeaningEmbedder),
+        Deadline::unbounded(),
+    )
+    .unwrap();
+
+    let found: Vec<&str> = outcome
+        .results
+        .iter()
+        .map(|r| r.memory.id.as_str())
+        .collect();
+    assert_eq!(found, vec!["fact"]);
+    assert!(!outcome.raw_fallback);
+}
+
+#[test]
+fn a_filtered_queryless_fallback_keeps_every_filter_detail_and_deadline() {
+    use remind_me_core::models::SearchDetail;
+    use remind_me_core::retrieval::Deadline;
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let long = "dialog ".repeat(300);
+    put(&store, row("old-fact", "striped horses graze", "fact", 3));
+    put(&store, row("raw-a", &long, "dialog", 0));
+    put(&store, row("raw-b", &long, "dialog", 0));
+    put(&store, row("raw-old", &long, "dialog", 3));
+    put(
+        &store,
+        NewMemory {
+            project: Some("elsewhere".into()),
+            ..row("raw-out", &long, "dialog", 0)
+        },
+    );
+    put(
+        &store,
+        NewMemory {
+            tags: Vec::new(),
+            ..row("raw-bare", &long, "dialog", 0)
+        },
+    );
+    // Two compact hits fit 200 tokens; two full ones would not.
+    let input = MemorySearchInput {
+        detail: SearchDetail::Compact,
+        token_budget: 200,
+        ..filtered("")
+    };
+
+    let outcome = queries::search_memories_deadlined(
+        &store,
+        &input,
+        Some(&RawLeaningEmbedder),
+        Deadline::already_passed(),
+    )
+    .unwrap();
+
+    let mut found: Vec<&str> = outcome
+        .results
+        .iter()
+        .map(|r| r.memory.id.as_str())
+        .collect();
+    found.sort();
+    assert_eq!(found, vec!["raw-a", "raw-b"]);
+    assert!(outcome.raw_fallback);
+    assert_eq!(outcome.trimmed, 0);
 }
