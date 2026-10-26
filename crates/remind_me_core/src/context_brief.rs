@@ -557,8 +557,8 @@ fn project_drafts(memories: &[&Memory], since: DateTime<Utc>, branch: Option<&st
         })
         .collect();
     activity.sort_by(|a, b| {
-        on_branch(*b)
-            .cmp(&on_branch(*a))
+        on_branch(b)
+            .cmp(&on_branch(a))
             .then_with(|| newest_first(a, b))
     });
 
