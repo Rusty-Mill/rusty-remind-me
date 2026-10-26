@@ -4066,6 +4066,41 @@ mod tests {
     }
 
     #[test]
+    fn a_blank_query_with_a_window_searches_and_keeps_its_shaping_options() {
+        let server = McpServer::new(Database::open_in_memory().unwrap());
+        let id = add(&server, &long_body("ENDMARK"));
+        let windowed = |extra: Value| {
+            let mut args = json!({ "query": "", "since": "1h" });
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            call(&server, "remind_me_search", args)
+        };
+
+        let compact = text_of(&windowed(json!({})));
+        assert!(compact.contains(&format!("- `{id}` · ")), "{compact}");
+        assert!(
+            !compact.contains("ENDMARK"),
+            "compact must not carry the body"
+        );
+
+        let full = windowed(json!({ "detail": "full" }));
+        assert!(full.get("isError").is_none(), "{}", text_of(&full));
+        assert!(text_of(&full).contains("ENDMARK"), "{}", text_of(&full));
+
+        add(&server, &long_body("second"));
+        let tight = text_of(&windowed(json!({ "detail": "full", "token_budget": 100 })));
+        assert!(tight.contains("Trimmed:"), "{tight}");
+
+        let future = windowed(json!({ "since": "2999-01-01T00:00:00Z" }));
+        assert!(
+            text_of(&future).contains("No memories"),
+            "{}",
+            text_of(&future)
+        );
+    }
+
+    #[test]
     fn a_search_without_a_query_lists_under_its_filters_and_refuses_ranking_options() {
         let server = McpServer::new(Database::open_in_memory().unwrap());
         for (content, category) in [("Alpha listing", "fact"), ("Beta listing", "note")] {

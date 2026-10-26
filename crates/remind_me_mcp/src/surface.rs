@@ -207,7 +207,12 @@ fn search(args: &mut Value) -> Result<&'static str, String> {
         rename(args, "reference_kind", "kind");
         return Ok("remind_me_references");
     }
-    if text(args, "query").is_some() {
+    // A time window is a search filter: with a blank query the search
+    // handler lists that window newest first, keeping every other option.
+    let windowed = ["since", "until"]
+        .iter()
+        .any(|key| args.get(*key).is_some_and(|v| !v.is_null()));
+    if text(args, "query").is_some() || windowed {
         return Ok("remind_me_search");
     }
     let others = outside(args, &FOR_LISTING);
@@ -333,8 +338,10 @@ fn definition(name: &str, catalog: &[Value]) -> Option<Value> {
             "Search remind-me memories by keyword and meaning; call this first to recall anything \
              about the user, their projects or past decisions. Hits are compact by default (id, \
              snippet, score); fetch whole memories with remind_me_get `memory_ids`, or pass \
-             `detail=full`. Without `query` it lists memories newest first, filtered by \
-             category, tags, source, project, branch, session or writer. With `reference` it finds the memories that point at an issue, commit, URL \
+             `detail=full`. `since`/`until` narrow to a time window, and with a blank `query` \
+             list that window newest first. Without `query` or a window it lists memories \
+             newest first, filtered by category, tags, source, project, branch, session or \
+             writer. With `reference` it finds the memories that point at an issue, commit, URL \
              or path.",
             &["remind_me_search", "remind_me_list"],
             &[],
@@ -565,6 +572,12 @@ mod tests {
         );
         assert_eq!(handler, "remind_me_list");
         assert!(args.get("query").is_none(), "{args}");
+        for windowed in [
+            json!({"query": "", "since": "2d", "detail": "full", "token_budget": 50}),
+            json!({"until": "2030-01-01T00:00:00Z", "min_confidence": 0.5}),
+        ] {
+            assert_eq!(routed("remind_me_search", windowed).0, "remind_me_search");
+        }
         let (handler, args) = routed(
             "remind_me_search",
             json!({"reference": "o/r#1", "reference_kind": "issue"}),
