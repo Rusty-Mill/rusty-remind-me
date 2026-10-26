@@ -30,10 +30,15 @@
 //!
 //! # Budget
 //!
-//! Tokens, estimated with [`estimated_content_tokens`], the estimator search
-//! trims with. Each section is allotted a share of what is left by weight, so
-//! what one section leaves unused rolls forward. Items are dropped whole,
-//! never cut, and counted in `omitted`.
+//! Tokens of the returned text, by the estimator search trims with
+//! ([`estimated_content_tokens`], bytes / 4). Every piece is costed as the
+//! larger of its compact JSON and its Markdown, rounded up, so either
+//! rendering of the brief stays within the budget: the envelope and each
+//! section's heading are reserved first, then each section is allotted a
+//! share of what is left by weight, so what one section leaves unused rolls
+//! forward. Items are dropped whole, never cut, and counted in `omitted`.
+//! `used` exceeds `limit` only when the envelope alone does (a very long
+//! alias list); then no items are shown.
 
 use crate::db::entities::Entities;
 use crate::db::memories::Memories;
@@ -64,10 +69,6 @@ const HIT_LIMIT: usize = 5;
 const SUGGESTION_LIMIT: usize = 5;
 /// An item's text is its first line, cut to this many characters.
 const TEXT_CHARS: usize = 240;
-/// Tokens an item costs beyond its text: id, type and timestamp.
-const ITEM_OVERHEAD: usize = 8;
-/// Tokens a section's heading costs.
-const HEADING_COST: usize = 4;
 
 /// Which caller the brief is for. See the module docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -233,8 +234,20 @@ pub fn build(store: &Store<'_>, request: &ContextRequest<'_>) -> Result<Outcome>
         return Ok(Outcome::Brief(brief));
     }
 
-    let memories = Memories::new(store).all_live()?;
+    // Only what may be shown takes part in discovery too: a name that lives
+    // only on hidden rows (sensitive, superseded, expired, dialog) is neither
+    // known nor suggested.
+    let memories: Vec<Memory> = Memories::new(store)
+        .all_live()?
+        .into_iter()
+        .filter(|m| injectable(m, now))
+        .collect();
     let scope = match request.project.map(str::trim).filter(|p| !p.is_empty()) {
+        None if request.mode == Mode::Project => {
+            return Err(StoreError::Invalid(
+                "`project` must name a project or entity".to_string(),
+            ));
+        }
         None => Scope::everything(),
         Some(name) => match resolve_scope(store, name, &memories)? {
             Some(scope) => scope,
@@ -248,10 +261,7 @@ pub fn build(store: &Store<'_>, request: &ContextRequest<'_>) -> Result<Outcome>
         },
     };
 
-    let in_scope: Vec<&Memory> = memories
-        .iter()
-        .filter(|m| injectable(m, now) && scope.admits(m))
-        .collect();
+    let in_scope: Vec<&Memory> = memories.iter().filter(|m| scope.admits(m)).collect();
     brief.project = scope.project_match(&in_scope);
 
     let mut drafts = Vec::new();
@@ -634,45 +644,83 @@ fn hits_draft(store: &Store<'_>, prompt: &str, now: DateTime<Utc>) -> Result<Dra
 
 // -- budget -------------------------------------------------------------------
 
-fn cost(item: &Item) -> usize {
-    estimated_content_tokens(&item.text) + ITEM_OVERHEAD
+/// Estimated tokens of `bytes` bytes, rounded up, so the sum over pieces
+/// bounds the estimate of the whole.
+fn tokens(bytes: usize) -> usize {
+    bytes.div_ceil(4)
 }
 
-/// Allot the budget across `drafts` in order, each a share of what is left
-/// by its weight, and keep the items that fit.
+fn json_len(value: &impl Serialize) -> usize {
+    serde_json::to_string(value).map_or(0, |s| s.len())
+}
+
+/// An item: its JSON plus a separator, or its Markdown line.
+fn item_cost(section: &str, item: &Item) -> usize {
+    tokens((json_len(item) + 1).max(line(section, item).len() + 1))
+}
+
+/// A section without items, with `omitted` items noted.
+fn section_cost(name: &'static str, omitted: usize) -> usize {
+    let skeleton = Section {
+        name,
+        items: Vec::new(),
+        omitted,
+    };
+    tokens((json_len(&skeleton) + 1).max(section_markdown(&skeleton).len()))
+}
+
+/// The brief without its sections: the JSON envelope or the Markdown title.
+fn envelope_cost(brief: &Brief) -> usize {
+    let sized = Brief {
+        sections: Vec::new(),
+        budget: Budget {
+            limit: brief.budget.limit,
+            used: brief.budget.limit,
+        },
+        ..brief.clone()
+    };
+    tokens(json_len(&sized).max(title(brief).len()))
+}
+
+/// Reserve the envelope and every section's heading, then allot what is
+/// left across `drafts` in order, each a share of the remainder by its
+/// weight, and keep the items that fit.
 fn fit(brief: &mut Brief, drafts: Vec<Draft>) {
     let limit = brief.budget.limit;
+    let overhead = envelope_cost(brief)
+        + drafts
+            .iter()
+            .map(|d| section_cost(d.name, d.items.len()))
+            .sum::<usize>();
+    let available = limit.saturating_sub(overhead);
     let mut weight_left: usize = drafts.iter().map(|d| d.weight).sum();
-    let mut used = 0;
+    let mut spent_total = 0;
     for draft in drafts {
         let allotted = if limit == 0 {
             usize::MAX
         } else {
-            (limit - used) * draft.weight / weight_left.max(1)
+            (available - spent_total) * draft.weight / weight_left.max(1)
         };
         weight_left -= draft.weight;
         let total = draft.items.len();
-        let mut spent = if total == 0 { 0 } else { HEADING_COST };
+        let mut spent = 0;
         let mut items = Vec::new();
         for item in draft.items {
-            let c = cost(&item);
+            let c = item_cost(draft.name, &item);
             if spent + c > allotted {
                 break;
             }
             spent += c;
             items.push(item);
         }
-        if items.is_empty() {
-            spent = 0;
-        }
-        used += spent;
+        spent_total += spent;
         brief.sections.push(Section {
             name: draft.name,
             omitted: total - items.len(),
             items,
         });
     }
-    brief.budget.used = used;
+    brief.budget.used = overhead + spent_total;
 }
 
 // -- rendering ----------------------------------------------------------------
@@ -713,20 +761,25 @@ pub fn render_markdown(brief: &Brief) -> String {
     }
     let mut out = title(brief);
     for section in shown {
-        out.push_str(&format!("\n## {}\n", heading(section.name)));
-        if section.items.is_empty() {
-            out.push_str("_None._\n");
-        }
-        for item in &section.items {
-            out.push_str(&line(section.name, item));
-            out.push('\n');
-        }
-        if section.omitted > 0 {
-            out.push_str(&format!(
-                "_{} more not shown; raise the budget._\n",
-                section.omitted
-            ));
-        }
+        out.push_str(&section_markdown(section));
+    }
+    out
+}
+
+fn section_markdown(section: &Section) -> String {
+    let mut out = format!("\n## {}\n", heading(section.name));
+    if section.items.is_empty() {
+        out.push_str("_None._\n");
+    }
+    for item in &section.items {
+        out.push_str(&line(section.name, item));
+        out.push('\n');
+    }
+    if section.omitted > 0 {
+        out.push_str(&format!(
+            "_{} more not shown; raise the budget._\n",
+            section.omitted
+        ));
     }
     out
 }
@@ -1129,6 +1182,85 @@ mod tests {
             .iter()
             .all(|i| i.text.chars().count() <= TEXT_CHARS + 1));
         assert!(render_markdown(&tight).contains("more not shown"));
+    }
+
+    #[test]
+    fn either_rendering_stays_within_the_budget() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        seed(&store);
+        for i in 0..30 {
+            add(&store, &format!("mem_{i:02}"), |r| {
+                r.project = Some("quokka".into());
+                r.memory_type = if i % 3 == 0 { "decision" } else { "fact" }.into();
+                r.content = format!("{i} {}", "word ".repeat(10 + i * 3));
+            });
+        }
+        for limit in [
+            MIN_TOKEN_BUDGET,
+            500,
+            DEFAULT_TOKEN_BUDGET,
+            MAX_TOKEN_BUDGET,
+        ] {
+            let req = ContextRequest {
+                budget: limit,
+                ..project("quokka")
+            };
+            let brief = brief(&store, &req);
+            let json = estimated_content_tokens(&serde_json::to_string(&brief).unwrap());
+            let markdown = estimated_content_tokens(&render_markdown(&brief));
+            assert!(brief.budget.used <= limit, "{limit}: {:?}", brief.budget);
+            assert!(
+                json <= brief.budget.used,
+                "{limit}: json {json} > {:?}",
+                brief.budget
+            );
+            assert!(
+                markdown <= brief.budget.used,
+                "{limit}: md {markdown} > {:?}",
+                brief.budget
+            );
+        }
+    }
+
+    #[test]
+    fn hidden_rows_neither_establish_nor_suggest_a_project() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        add(&store, "mem_secret", |r| {
+            r.project = Some("hush_project".into());
+            r.sensitive = true;
+        });
+        add(&store, "mem_gone", |r| {
+            r.git_remote = Some("github.com/o/old_repo".into());
+            r.superseded_by = Some("mem_secret".into());
+        });
+        for name in ["hush_project", "hush_projec", "old_repo"] {
+            match build(&store, &project(name)).unwrap() {
+                Outcome::UnknownProject { suggestions, .. } => {
+                    assert!(suggestions.is_empty(), "{name}: {suggestions:?}")
+                }
+                Outcome::Brief(b) => panic!("{name} known through a hidden row: {:?}", b.project),
+            }
+        }
+    }
+
+    #[test]
+    fn a_project_brief_requires_a_name_but_a_session_does_not() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        seed(&store);
+        for blank in [None, Some(""), Some("   ")] {
+            let req = ContextRequest {
+                mode: Mode::Project,
+                project: blank,
+                budget: DEFAULT_TOKEN_BUDGET,
+                ..ContextRequest::default()
+            };
+            assert!(build(&store, &req).is_err(), "{blank:?} accepted");
+        }
+        let unscoped = brief(&store, &ContextRequest::default());
+        assert!(ids(&unscoped, "activity").contains(&"mem_other_project".to_string()));
     }
 
     #[test]

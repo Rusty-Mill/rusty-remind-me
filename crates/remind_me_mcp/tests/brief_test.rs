@@ -104,6 +104,7 @@ fn input_is_validated_at_the_boundary() {
     let (s, _) = seeded();
     for args in [
         json!({}),
+        json!({"project": "   "}),
         json!({"project": "quokka", "sinse": "2d"}),
         json!({"project": "quokka", "since": "soon"}),
         json!({"project": "quokka", "token_budget": 10}),
