@@ -4098,6 +4098,60 @@ mod tests {
             "{}",
             text_of(&future)
         );
+
+        // No `query` at all: the window alone still lists.
+        for bound in [
+            json!({ "since": "1h" }),
+            json!({ "until": "2999-01-01T00:00:00Z" }),
+        ] {
+            let listed = call(&server, "remind_me_search", bound.clone());
+            assert!(
+                listed.get("isError").is_none(),
+                "{bound}: {}",
+                text_of(&listed)
+            );
+            assert!(
+                text_of(&listed).contains(&id),
+                "{bound}: {}",
+                text_of(&listed)
+            );
+        }
+    }
+
+    #[test]
+    fn a_window_narrows_by_what_it_applies_and_refuses_what_it_does_not() {
+        let server = McpServer::new(Database::open_in_memory().unwrap());
+        for (content, category) in [("Alpha window", "fact"), ("Beta window", "note")] {
+            call(
+                &server,
+                "remind_me_add",
+                json!({ "content": content, "category": category, "tags": ["wanted"] }),
+            );
+        }
+
+        let narrowed = text_of(&call(
+            &server,
+            "remind_me_search",
+            json!({ "since": "1h", "category": "fact" }),
+        ));
+        assert!(narrowed.contains("Alpha window"), "{narrowed}");
+        assert!(
+            !narrowed.contains("Beta window"),
+            "category was dropped: {narrowed}"
+        );
+
+        for unapplied in [
+            json!({ "query": "", "since": "1h", "tags": ["wanted"] }),
+            json!({ "since": "1h", "source": "chat" }),
+            json!({ "since": "1h", "offset": 1 }),
+        ] {
+            let refused = call(&server, "remind_me_search", unapplied.clone());
+            assert_eq!(refused["isError"], true, "{unapplied} was silently dropped");
+            assert!(
+                text_of(&refused).contains("list that window"),
+                "{unapplied}"
+            );
+        }
     }
 
     #[test]

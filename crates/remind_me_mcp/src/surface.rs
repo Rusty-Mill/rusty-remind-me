@@ -183,6 +183,31 @@ const FOR_LISTING: [&str; 12] = [
     "written_by",
 ];
 
+/// The only arguments a blank-query search over a `since`/`until` window
+/// honours: the filters its newest-first listing applies, and the shaping of
+/// its output. `tags`, `source`, `offset`, the expansion flags and the
+/// ranking options do nothing there, so they are refused.
+const FOR_WINDOW: [&str; 18] = [
+    "query",
+    "since",
+    "until",
+    "time_field",
+    "category",
+    "include_sensitive",
+    "project",
+    "branch",
+    "session_id",
+    "written_by",
+    "include_dormant",
+    "min_vitality",
+    "include_expired",
+    "min_confidence",
+    "limit",
+    "token_budget",
+    "detail",
+    "response_format",
+];
+
 /// The non-null arguments outside `allowed`, in argument order.
 fn outside<'a>(args: &'a Value, allowed: &[&str]) -> Vec<&'a str> {
     args.as_object()
@@ -212,7 +237,21 @@ fn search(args: &mut Value) -> Result<&'static str, String> {
     let windowed = ["since", "until"]
         .iter()
         .any(|key| args.get(*key).is_some_and(|v| !v.is_null()));
-    if text(args, "query").is_some() || windowed {
+    if text(args, "query").is_some() {
+        return Ok("remind_me_search");
+    }
+    if windowed {
+        let others = outside(args, &FOR_WINDOW);
+        if !others.is_empty() {
+            return Err(format!(
+                "without `query`, `since`/`until` list that window newest first, which does \
+                 not take {}; pass a query or drop them",
+                others.join(", ")
+            ));
+        }
+        if let Some(object) = args.as_object_mut() {
+            object.insert("query".to_string(), Value::String(String::new()));
+        }
         return Ok("remind_me_search");
     }
     let others = outside(args, &FOR_LISTING);
@@ -575,8 +614,20 @@ mod tests {
         for windowed in [
             json!({"query": "", "since": "2d", "detail": "full", "token_budget": 50}),
             json!({"until": "2030-01-01T00:00:00Z", "min_confidence": 0.5}),
+            json!({"query": null, "since": "1h"}),
         ] {
-            assert_eq!(routed("remind_me_search", windowed).0, "remind_me_search");
+            let (handler, args) = routed("remind_me_search", windowed);
+            assert_eq!(handler, "remind_me_search");
+            assert_eq!(args["query"], "", "{args}");
+        }
+        for unapplied in [
+            json!({"query": "", "since": "1h", "tags": ["wanted"]}),
+            json!({"since": "1h", "source": "chat"}),
+            json!({"until": "2030-01-01T00:00:00Z", "offset": 5}),
+            json!({"since": "1h", "expand_entities": true}),
+        ] {
+            let why = route("remind_me_search", unapplied.clone()).unwrap_err();
+            assert!(why.contains("list that window"), "{unapplied}: {why}");
         }
         let (handler, args) = routed(
             "remind_me_search",
