@@ -51,6 +51,7 @@ pub mod pid;
 pub mod project;
 pub mod project_backfill;
 pub mod project_proposals;
+pub mod project_tool;
 pub mod promotion;
 pub mod query_expansion;
 pub mod rate_limit;

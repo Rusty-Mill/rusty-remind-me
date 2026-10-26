@@ -187,14 +187,18 @@ Nothing promotes automatically, including in the backfill.
   `list` (default) | `get` | `history` | `proposals` | `confirm` | `reject` |
   `set` | `revert`.
   `list` returns compact JSON grouped by stage, for example
-  `{"built":[{"name","status","repo","path","evidence_count"}]}`, with an
-  optional text rendering for small models (#65). It goes in the core tier
-  under #54. The writes go in the curation tier.
-- HTTP: `GET /api/projects`, `GET /api/projects/{name}/history` and
-  `POST /api/projects/{confirm,reject,set,revert}`.
+  `{"built":[{"name","status","repo","path","evidence_count"}]}`; evidence ids
+  come from `get` and `history`, so a listing stays cheap to read (#65).
+  It belongs in the core tier, but `core` is deliberately held below twenty
+  tools, so it ships in `standard` until the tool-surface audit (#54) decides
+  what leaves. One tool, one tier: the writes are not split out, because a
+  confirm is the point of the read.
+- HTTP: `GET /api/projects` for every read (`action` selects `get`, `history`
+  or `proposals`) and `POST /api/projects` for every write. A writing action
+  over `GET` is refused with 405 rather than performed.
 - Dashboard: a Projects view with columns Idea, Designed and Built, a status
-  chip, links for each anchor, an evidence count that expands to the memories
-  behind it, and a "Pending" lane with confirm and reject buttons.
+  chip, links for each anchor, an evidence count, a "Pending" lane with
+  confirm and reject buttons, and anything the projection could not read.
 - `remind_me_brief` (#62) reads `project::get` for its header.
 
 ### 7. Backfill is proposals, not writes

@@ -13,6 +13,7 @@ function App() {
   const entityStore = useEntityStore();
   const reminderStore = useReminderStore();
   const savedSearchStore = useSavedSearchStore();
+  const projectStore = useProjectStore();
   const ops = useOpsStore();
   const [view, setView] = useState("browse");
   const [searchQuery, setSearchQuery] = useState("");
@@ -156,7 +157,7 @@ function App() {
       React.createElement("div",{style:{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}},
         store.loading && React.createElement("span",{style:{color:theme.textMuted}}, React.createElement(Icons.Loader)),
         React.createElement("div",{style:{display:"flex",background:theme.surface,borderRadius:6,border:"1px solid "+theme.border,overflow:"hidden"}},
-          [["browse","Browse"],["stats","Stats"],["wiki","Wiki"],["entities","Entities"],["reminders","Reminders"],["searches","Searches"]].map(([v,l])=>React.createElement("button",{key:v,onClick:()=>setView(v),style:{padding:"10px 14px",minHeight:40,border:"none",fontSize:12,fontFamily:mono,fontWeight:500,cursor:"pointer",background:view===v?theme.accent:"transparent",color:view===v?"#fff":theme.textSecondary,transition:"all 0.15s"}},
+          [["browse","Browse"],["stats","Stats"],["wiki","Wiki"],["entities","Entities"],["projects","Projects"],["reminders","Reminders"],["searches","Searches"]].map(([v,l])=>React.createElement("button",{key:v,onClick:()=>setView(v),style:{padding:"10px 14px",minHeight:40,border:"none",fontSize:12,fontFamily:mono,fontWeight:500,cursor:"pointer",background:view===v?theme.accent:"transparent",color:view===v?"#fff":theme.textSecondary,transition:"all 0.15s"}},
             l,
             v==="wiki" && wikiStore.status.pending_compile>0 && React.createElement("span",{style:{marginLeft:6,padding:"1px 6px",borderRadius:8,background:view===v?"rgba(255,255,255,0.25)":theme.warningSubtle,color:view===v?"#fff":theme.warning,fontSize:10,fontWeight:700}}, wikiStore.status.pending_compile),
             // Overdue means a reminder came due with nothing running to
@@ -360,6 +361,72 @@ function App() {
               React.createElement("div",{style:{fontSize:13}},"Open any memory's clock button in Browse to schedule one.")
             )
           )
+        ) :
+        view==="projects" ?
+        // Projects view (ADR-0027) — a column per stage, each project's
+        // anchors and how many memories back its stage, plus the Pending lane
+        // where a proposal is confirmed or rejected. Read-only otherwise: a
+        // claim is written by answering a proposal or by remind_me_project,
+        // never by typing a stage into this page.
+        React.createElement("div",null,
+          React.createElement("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",gap:12,marginBottom:16,flexWrap:"wrap"}},
+            React.createElement("h2",{style:{fontFamily:sans,fontWeight:700,fontSize:22,margin:0,letterSpacing:"-0.02em"}},"Projects"),
+            React.createElement("div",{style:{fontSize:12,color:theme.textMuted,fontFamily:mono}},
+              projectStore.count+" project"+(projectStore.count===1?"":"s")+
+              (projectStore.proposals.length>0 ? " · "+projectStore.proposals.length+" pending" : ""))
+          ),
+          projectStore.error && React.createElement("div",{style:{marginBottom:12,padding:"10px 12px",borderRadius:6,background:theme.surfaceActive,color:theme.text,fontSize:13,fontFamily:sans}}, projectStore.error),
+          projectStore.proposals.length>0 && React.createElement("div",{style:{marginBottom:20,background:theme.surface,border:"1px solid "+theme.border,borderRadius:8,padding:"16px 18px"}},
+            React.createElement("div",{style:labelSt},"Pending — nothing changes until you answer"),
+            React.createElement("div",{style:{display:"flex",flexDirection:"column",gap:10}},
+              projectStore.proposals.map(p=>React.createElement("div",{key:p.key,style:{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:12,flexWrap:"wrap",padding:"10px 12px",background:theme.surfaceActive,borderRadius:6}},
+                React.createElement("div",{style:{minWidth:0}},
+                  React.createElement("div",{style:{fontFamily:mono,fontSize:13,color:theme.text}},
+                    React.createElement("b",null,p.project)," ",p.predicate," → ",React.createElement("b",null,p.value)),
+                  React.createElement("div",{style:{fontSize:12,color:theme.textMuted,fontFamily:sans,marginTop:3}},
+                    p.why+" · "+p.evidence.length+" memor"+(p.evidence.length===1?"y":"ies"))
+                ),
+                React.createElement("div",{style:{display:"flex",gap:6}},
+                  React.createElement("button",{onClick:()=>projectStore.answer("confirm",p.key),
+                    style:{padding:"6px 12px",minHeight:36,borderRadius:6,border:"none",background:theme.accent,color:"#fff",fontSize:12,fontWeight:600,fontFamily:mono,cursor:"pointer"}},"Confirm"),
+                  React.createElement("button",{onClick:()=>projectStore.answer("reject",p.key),
+                    style:{padding:"6px 12px",minHeight:36,borderRadius:6,border:"1px solid "+theme.border,background:"transparent",color:theme.textSecondary,fontSize:12,fontFamily:mono,cursor:"pointer"}},"Reject")
+                )
+              ))
+            )
+          ),
+          React.createElement("div",{style:{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(240px,1fr))",gap:12}},
+            [["idea","Idea"],["designed","Designed"],["built","Built"]].map(([stage,label])=>React.createElement("div",{key:stage,style:{background:theme.surface,border:"1px solid "+theme.border,borderRadius:8,padding:"14px 16px"}},
+              React.createElement("div",{style:labelSt}, label+" ("+((projectStore.byStage[stage]||[]).length)+")"),
+              (projectStore.byStage[stage]||[]).length===0 ?
+                React.createElement("div",{style:{fontSize:12,color:theme.textMuted,fontFamily:sans}},"Nothing here yet.") :
+                React.createElement("div",{style:{display:"flex",flexDirection:"column",gap:8}},
+                  (projectStore.byStage[stage]||[]).map(p=>React.createElement("div",{key:p.name,style:{padding:"8px 10px",background:theme.surfaceActive,borderRadius:5}},
+                    React.createElement("div",{style:{display:"flex",justifyContent:"space-between",gap:8,alignItems:"baseline"}},
+                      React.createElement("span",{style:{fontFamily:sans,fontWeight:600,fontSize:13,color:theme.text}}, p.name),
+                      React.createElement("span",{style:{fontFamily:mono,fontSize:11,color:theme.textMuted}}, p.status)
+                    ),
+                    p.repo && React.createElement("div",{style:{marginTop:4}},
+                      React.createElement("a",{href:p.repo,target:"_blank",rel:"noreferrer",style:{fontFamily:mono,fontSize:11,color:theme.accent,wordBreak:"break-all"}}, p.repo)),
+                    p.path && React.createElement("div",{style:{fontFamily:mono,fontSize:11,color:theme.textSecondary,marginTop:2}}, p.path),
+                    p.tracker && React.createElement("div",{style:{fontFamily:mono,fontSize:11,color:theme.textSecondary,marginTop:2}}, p.tracker),
+                    p.parent && React.createElement("div",{style:{fontFamily:mono,fontSize:11,color:theme.textMuted,marginTop:2}}, "in "+p.parent),
+                    React.createElement("div",{style:{fontSize:11,color:theme.textMuted,fontFamily:mono,marginTop:4}},
+                      p.evidence_count+" evidence")
+                  ))
+                )
+            ))
+          ),
+          projectStore.invalid.length>0 && React.createElement("div",{style:{marginTop:16,background:theme.surface,border:"1px solid "+theme.border,borderRadius:8,padding:"14px 16px"}},
+            React.createElement("div",{style:labelSt},"Could not be read ("+projectStore.invalid.length+")"),
+            projectStore.invalid.map((r,i)=>React.createElement("div",{key:i,style:{fontFamily:mono,fontSize:12,color:theme.textSecondary,marginTop:3}},
+              r.subject+": "+r.reason))
+          ),
+          projectStore.count===0 && projectStore.proposals.length===0 && !projectStore.loading &&
+            React.createElement("div",{style:{textAlign:"center",padding:"60px 20px",color:theme.textMuted}},
+              React.createElement("div",{style:{fontSize:15,marginBottom:6}},"No projects yet"),
+              React.createElement("div",{style:{fontSize:13}},"A project appears once something claims its stage. Ask Claude for remind_me_project, or run the backfill over a checkout.")
+            )
         ) :
         view==="searches" ?
         // Saved searches view — remind_me_save_search / list / run / delete.

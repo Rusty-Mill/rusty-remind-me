@@ -63,7 +63,12 @@ pub const CORE: [&str; 19] = [
 ];
 
 /// The LLM-driven maintenance loops, each fronted by a prompt.
-pub const MAINTENANCE: [&str; 15] = [
+pub const MAINTENANCE: [&str; 16] = [
+    // ADR-0027 asks for this in `core`, and an ordinary session does reach
+    // for it ("is there actually a repo for this?"). It waits here because
+    // `core` is deliberately held below 20 tools and deciding what leaves is
+    // the tool-surface audit's call, not this feature's.
+    "remind_me_project",
     "remind_me_decompose",
     "remind_me_decompose_batch",
     "remind_me_normalize_batch",
