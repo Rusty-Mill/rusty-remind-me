@@ -5911,6 +5911,15 @@ mod structure_tests {
             compact.contains("expired"),
             "a compact hit keeps its marks: {compact}"
         );
+        let json = text(&call(
+            &s,
+            "remind_me_search",
+            json!({ "query": "quokka policy", "response_format": "json" }),
+        ));
+        let hit = &serde_json::from_str::<Value>(&json).unwrap()["memories"][0];
+        assert_eq!(hit["expired"], true, "{hit}");
+        assert_eq!(hit["valid_until"], "2020-01-01T00:00:00Z", "{hit}");
+        assert_eq!(hit["confidence"], 0.5, "{hit}");
         let found = call(
             &s,
             "remind_me_search",

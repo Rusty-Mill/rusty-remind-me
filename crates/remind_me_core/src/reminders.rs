@@ -180,6 +180,34 @@ pub fn render_compact_hits_markdown(hits: &[crate::models::MemorySearchResult]) 
         .join("\n")
 }
 
+/// One search hit's compact JSON: the same fields as its compact line, with
+/// the trust fields as values rather than marks. `confidence` is always
+/// present; `valid_until`, `expired`, `outcome` and `sensitive` appear only
+/// when they say something, so an ordinary hit stays short.
+pub fn compact_hit_json(hit: &crate::models::MemorySearchResult) -> serde_json::Value {
+    let m = &hit.memory;
+    let mut value = serde_json::json!({
+        "id": m.id,
+        "category": m.category,
+        "created_at": m.created_at,
+        "tags": m.tags,
+        "score": hit.score,
+        "confidence": m.confidence,
+        "snippet": crate::retrieval::compact_snippet(&m.content),
+    });
+    if let Some(until) = &m.valid_until {
+        value["valid_until"] = until.as_str().into();
+        value["expired"] = crate::retrieval::is_expired(Utc::now(), Some(until)).into();
+    }
+    if let Some(outcome) = &m.outcome {
+        value["outcome"] = outcome.as_str().into();
+    }
+    if m.sensitive {
+        value["sensitive"] = true.into();
+    }
+    value
+}
+
 /// Render a `remind_me_list` page the way the reference's `_fmt_memories`
 /// does when it is given a `total`: a `**Showing N of M memories**` header
 /// ahead of the same per-memory rendering, joined by the same `\n---\n`

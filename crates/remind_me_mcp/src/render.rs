@@ -30,7 +30,6 @@ use remind_me_core::expansion::{MemorySearchResponse, RelatedMemory};
 use remind_me_core::models::{
     CaptureResult, Memory, RevertOutcome, SavedSearch, SearchDetail, SetReminderOutcome,
 };
-use remind_me_core::retrieval::compact_snippet;
 use remind_me_core::updater::UpdateStatus;
 use remind_me_core::vectors::ReindexResult;
 use remind_me_core::wiki::WikiPage;
@@ -561,17 +560,7 @@ pub fn compact_search_json(res: &MemorySearchResponse) -> serde_json::Value {
     value["memories"] = res
         .memories
         .iter()
-        .map(|hit| {
-            let m = &hit.memory;
-            serde_json::json!({
-                "id": m.id,
-                "category": m.category,
-                "created_at": m.created_at,
-                "tags": m.tags,
-                "score": hit.score,
-                "snippet": compact_snippet(&m.content),
-            })
-        })
+        .map(remind_me_core::reminders::compact_hit_json)
         .collect();
     value
 }
