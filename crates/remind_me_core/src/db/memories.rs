@@ -1111,6 +1111,10 @@ mod tests {
     /// engine's does not, so only the matches must agree.
     fn exercise_search(db: &Database, tombstones: bool) -> Vec<Value> {
         const T2: &str = "2026-09-27T00:00:00+00:00";
+        // The vitality floor is checked against the wall clock, so `f` and
+        // `g` were read just now: from a fixed date, `f` decays below the
+        // floor too once enough real days pass.
+        let read_now = chrono::Utc::now().to_rfc3339();
         let store = db.store();
         let m = Memories::new(&store);
         let text = |s: &str| Some(s.to_string());
@@ -1162,6 +1166,7 @@ mod tests {
                 tags: tags.into_iter().map(String::from).collect(),
                 sensitive: id == "f",
                 base_weight: if id == "g" { 0.001 } else { 1.0 },
+                accessed_at: matches!(id, "f" | "g").then(|| read_now.clone()),
                 subject: if id == "d" { text("Rust") } else { None },
                 ..NewMemory::new(id, content, at)
             })
