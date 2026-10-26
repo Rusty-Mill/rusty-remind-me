@@ -382,6 +382,18 @@ pub(crate) fn linked_memories(
         .collect())
 }
 
+/// Every live memory linked to `entity_id`, whole rows, newest first (ties
+/// by id, descending).
+pub(crate) fn linked_memories_full(
+    tables: &EngineTables,
+    entity_id: &str,
+) -> Result<Vec<crate::models::Memory>> {
+    Ok(linked_rows(core_ref(tables)?, entity_id)
+        .iter()
+        .map(memories::MemoryRow::to_memory)
+        .collect())
+}
+
 pub(crate) fn linked_memory_count(tables: &EngineTables, entity_id: &str) -> Result<usize> {
     Ok(linked_rows(core_ref(tables)?, entity_id).len())
 }

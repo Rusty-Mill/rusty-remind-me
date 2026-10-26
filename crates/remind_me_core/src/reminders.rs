@@ -147,6 +147,67 @@ pub fn render_memories_markdown(memories: &[Memory]) -> String {
         .join("\n---\n")
 }
 
+/// One line per search hit: id, category, date, tags, score, marks such as
+/// `expired`, and a snippet (card #51). The compact counterpart of
+/// [`render_memories_markdown`], for a search that fetches bodies by id later.
+pub fn render_compact_hits_markdown(hits: &[crate::models::MemorySearchResult]) -> String {
+    let now = Utc::now();
+    hits.iter()
+        .map(|hit| {
+            let m = &hit.memory;
+            let tags = if m.tags.is_empty() {
+                String::new()
+            } else {
+                format!(" · {}", m.tags.join(", "))
+            };
+            let marks = crate::kinds::header_marks(m, now);
+            let marks = if marks.is_empty() {
+                String::new()
+            } else {
+                format!(" _({})_", marks.join(", "))
+            };
+            let date: String = m.created_at.chars().take(10).collect();
+            format!(
+                "- `{}` · {} · {date}{tags} · {:.2}{}{marks} — {}",
+                m.id,
+                m.category,
+                hit.score,
+                if m.sensitive { " 🔒" } else { "" },
+                crate::retrieval::compact_snippet(&m.content)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// One search hit's compact JSON: the same fields as its compact line, with
+/// the trust fields as values rather than marks. `confidence` is always
+/// present; `valid_until`, `expired`, `outcome` and `sensitive` appear only
+/// when they say something, so an ordinary hit stays short.
+pub fn compact_hit_json(hit: &crate::models::MemorySearchResult) -> serde_json::Value {
+    let m = &hit.memory;
+    let mut value = serde_json::json!({
+        "id": m.id,
+        "category": m.category,
+        "created_at": m.created_at,
+        "tags": m.tags,
+        "score": hit.score,
+        "confidence": m.confidence,
+        "snippet": crate::retrieval::compact_snippet(&m.content),
+    });
+    if let Some(until) = &m.valid_until {
+        value["valid_until"] = until.as_str().into();
+        value["expired"] = crate::retrieval::is_expired(Utc::now(), Some(until)).into();
+    }
+    if let Some(outcome) = &m.outcome {
+        value["outcome"] = outcome.as_str().into();
+    }
+    if m.sensitive {
+        value["sensitive"] = true.into();
+    }
+    value
+}
+
 /// Render a `remind_me_list` page the way the reference's `_fmt_memories`
 /// does when it is given a `total`: a `**Showing N of M memories**` header
 /// ahead of the same per-memory rendering, joined by the same `\n---\n`
