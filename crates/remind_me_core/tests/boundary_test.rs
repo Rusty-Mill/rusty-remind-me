@@ -68,6 +68,22 @@ fn add_writes_extracted_references_and_entities() {
 }
 
 #[test]
+fn a_tick_task_link_is_found_from_the_task() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let task = "0190f3a2-7c1e-7b2a-9d4e-3f5a6b7c8d9e";
+    let m = add(
+        &store,
+        input(&format!(
+            "Chose the tick store for tick:{task} because of drift"
+        )),
+    );
+    let hits = References::new(&store).find("task", task).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].memory_id, m.id);
+}
+
+#[test]
 fn extract_false_skips_both_passes() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();

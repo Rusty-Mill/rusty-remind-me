@@ -20,7 +20,7 @@ const MAX_RUN_WORDS: usize = 4;
 /// One extracted reference, before it is bound to a memory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewReferenceParts {
-    /// `url`, `issue`, `pull`, `commit`, `path` or `handle`.
+    /// `url`, `issue`, `pull`, `commit`, `path`, `handle` or `task`.
     pub kind: &'static str,
     pub value: String,
     pub label: Option<String>,
@@ -84,6 +84,9 @@ fn reference_of(token: &str) -> Option<NewReferenceParts> {
     if token.starts_with("http://") || token.starts_with("https://") {
         return Some(url_reference(token));
     }
+    if let Some(task) = tick_task(token) {
+        return Some(part("task", task, None));
+    }
     if let Some(value) = repo_issue(token) {
         return Some(part("issue", value, None));
     }
@@ -137,6 +140,17 @@ fn repo_issue(token: &str) -> Option<String> {
     let ok = |s: &str| !s.is_empty() && s.chars().all(is_name_char);
     let numeric = !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit());
     (ok(owner) && ok(repo) && numeric).then(|| token.to_string())
+}
+
+/// `tick:<uuid>`, a rusty_tick task (rusty_mill ADR-0012), as the lowercase
+/// UUID. Only the hyphenated form, so `tick:list:<uuid>` (a list, not a task)
+/// and other `tick:` words are not task links.
+fn tick_task(token: &str) -> Option<String> {
+    let id = token.strip_prefix("tick:")?;
+    if id.len() != 36 {
+        return None;
+    }
+    uuid::Uuid::parse_str(id).ok().map(|u| u.to_string())
 }
 
 /// 7-40 lowercase hex with at least one digit and one letter a-f, so plain
@@ -333,6 +347,10 @@ mod tests {
             ("/etc/x.conf", one("path", "/etc/x.conf")),
             ("./a/b.py,", one("path", "./a/b.py")),
             ("@baileyrd please look", one("handle", "@baileyrd")),
+            (
+                "why: tick:0190F3A2-7C1E-7B2A-9D4E-3F5A6B7C8D9E.",
+                one("task", "0190f3a2-7c1e-7b2a-9d4e-3f5a6b7c8d9e"),
+            ),
         ];
         for (text, want) in cases {
             assert_eq!(refs(text), want, "{text}");
@@ -354,6 +372,10 @@ mod tests {
             "1/2.5",
             "a//b.rs",
             "@",
+            "tick:list:0190f3a2-7c1e-7b2a-9d4e-3f5a6b7c8d9e",
+            "tick:0190f3a27c1e7b2a9d4e3f5a6b7c8d9e",
+            "tick:{0190f3a2-7c1e-7b2a-9d4e-3f5a6b7c8d9e}",
+            "tick:soon",
         ] {
             assert_eq!(refs(text), Refs::new(), "{text}");
         }
