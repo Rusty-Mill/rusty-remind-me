@@ -618,7 +618,7 @@ pub fn search_memories_deadlined(
     // searchable.
     let phrases = crate::fts::query_phrases(&input.query);
     if phrases.is_empty() {
-        let mut outcome = trim_by_token_budget(Vec::new(), input.token_budget);
+        let mut outcome = trim_by_token_budget(Vec::new(), input.token_budget, input.detail);
         timing.elapsed_ms = deadline.elapsed_ms();
         outcome.timing = timing;
         return Ok(outcome);
@@ -771,7 +771,7 @@ pub fn search_memories_deadlined(
     };
     ranked.truncate(input.limit);
 
-    let mut outcome = trim_by_token_budget(ranked, input.token_budget);
+    let mut outcome = trim_by_token_budget(ranked, input.token_budget, input.detail);
     timing.elapsed_ms = deadline.elapsed_ms();
     outcome.timing = timing;
     Ok(outcome)
@@ -938,6 +938,7 @@ pub fn search_with_expansions(
         total_candidates: outcome.total_candidates,
         returned: outcome.returned,
         trimmed: outcome.trimmed,
+        trimmed_ids: outcome.trimmed_ids,
         // Hits only, matching this field's documented meaning. The bootstrap
         // carries its own `tokens_used`, so the response total is the sum of
         // the two rather than either one restated — see the renderer, which
