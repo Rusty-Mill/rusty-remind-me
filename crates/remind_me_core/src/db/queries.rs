@@ -38,6 +38,11 @@ pub fn add_memory_with(
 ) -> Result<Memory> {
     fields.validate(&input.metadata, None)?;
     crate::project::refuse_reserved_predicate(input.predicate.as_deref())?;
+    if let Some(scheduled) =
+        crate::review::schedule_if_decision(fields.memory_type.as_deref(), &input.metadata)
+    {
+        input.metadata = scheduled;
+    }
     let now = Utc::now();
     let now_iso = now.to_rfc3339();
     let id = format!("mem_{}", uuid::Uuid::new_v4().simple());
@@ -218,6 +223,12 @@ pub fn update_memory_with(
     crate::project::refuse_claim_edit(&stored)?;
     let metadata = input.metadata.as_ref().unwrap_or(&stored.metadata);
     fields.validate(metadata, stored.memory_type.as_deref())?;
+    // Becoming a decision schedules its follow-up; staying one does not.
+    let scheduled = if stored.memory_type.as_deref() == Some("decision") {
+        None
+    } else {
+        crate::review::schedule_if_decision(fields.memory_type.as_deref(), metadata)
+    };
 
     // `sensitive` is an `Option<bool>`: `None` leaves the flag alone, so an
     // update that does not mention it cannot silently clear it.
@@ -228,7 +239,7 @@ pub fn update_memory_with(
         content: input.content.clone(),
         category: input.category.clone(),
         tags: input.tags.clone(),
-        metadata: input.metadata.clone(),
+        metadata: scheduled.or_else(|| input.metadata.clone()),
         sensitive: input.sensitive,
         clear_superseded: input.clear_superseded,
         memory_type: fields.memory_type.clone(),
@@ -535,14 +546,24 @@ pub fn reclassify_memories(store: &Store<'_>, input: &ReclassifyInput) -> Result
     let mut not_found = Vec::new();
 
     for classification in &input.classifications {
-        if get_memory_by_id(store, &classification.memory_id)?.is_none() {
+        let Some(stored) = get_memory_by_id(store, &classification.memory_id)? else {
             not_found.push(classification.memory_id.clone());
             continue;
-        }
+        };
+        // Becoming a decision schedules its follow-up; staying one does not.
+        let metadata = if stored.memory_type.as_deref() == Some("decision") {
+            None
+        } else {
+            crate::review::schedule_if_decision(
+                Some(classification.memory_type.as_str()),
+                &stored.metadata,
+            )
+        };
 
         memories.apply_edit(
             &classification.memory_id,
             &MemoryEdit {
+                metadata,
                 memory_type: Some(classification.memory_type.clone()),
                 decay_rate: Some(get_decay_rate(&classification.memory_type)),
                 ..MemoryEdit::at(now.as_str())

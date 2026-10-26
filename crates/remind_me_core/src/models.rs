@@ -2028,7 +2028,19 @@ pub struct DigestData {
     pub vitality: crate::vitality::VitalityReport,
     pub reminders_upcoming: Vec<DigestReminder>,
     pub reminders_overdue: Vec<DigestReminder>,
+    /// Decisions whose follow-up review is due (`crate::review`). Defaulted
+    /// so a digest serialised before follow-ups existed still reads.
+    #[serde(default)]
+    pub reviews_due: Vec<DigestReview>,
     pub sync: SyncStatus,
+}
+
+/// One decision due for review, as the digest lists it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DigestReview {
+    pub id: String,
+    pub due: String,
+    pub content: String,
 }
 
 /// One reminder as the digest lists it.
