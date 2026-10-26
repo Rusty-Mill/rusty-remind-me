@@ -58,6 +58,7 @@ fn search(store: &Store<'_>, query: &str, include_sensitive: bool) -> Vec<String
             include_expired: true,
             min_confidence: 0.0,
             include_sensitive,
+            include_raw: false,
         },
     )
     .unwrap()

@@ -640,6 +640,7 @@ pub fn search_memories_deadlined(
         category: input.category.clone(),
         include_sensitive: input.include_sensitive,
         scope: input.scope.clone(),
+        exclude_raw: !input.ranks_raw(),
     };
 
     // `RrfFusion::Score` mode needs the raw BM25 magnitude alongside each hit.
@@ -710,6 +711,10 @@ pub fn search_memories_deadlined(
                 memories.retain(|m| !hidden.contains(&m.id));
                 similarity.retain(|id, _| !hidden.contains(id));
             }
+            if filter.exclude_raw {
+                memories.retain(|m| !crate::db::memories::is_raw_category(&m.category));
+                similarity.retain(|id, _| memories.iter().any(|m| &m.id == id));
+            }
             (memories, similarity)
         }
         None => (Vec::new(), std::collections::HashMap::new()),
@@ -770,6 +775,18 @@ pub fn search_memories_deadlined(
         crate::reranker::maybe_rerank(&input.query, ranked)
     };
     ranked.truncate(input.limit);
+
+    // Nothing refined matched: a session not yet decomposed is still
+    // findable through its dialog, reported as such (ADR-0029).
+    if ranked.is_empty() && filter.exclude_raw {
+        let raw = MemorySearchInput {
+            include_raw: true,
+            ..input.clone()
+        };
+        let mut outcome = search_memories_deadlined(store, &raw, embedder, deadline)?;
+        outcome.raw_fallback = !outcome.results.is_empty();
+        return Ok(outcome);
+    }
 
     let mut outcome = trim_by_token_budget(ranked, input.token_budget, input.detail);
     timing.elapsed_ms = deadline.elapsed_ms();
@@ -933,6 +950,7 @@ pub fn search_with_expansions(
             None
         },
         timing: outcome.timing,
+        raw_fallback: outcome.raw_fallback,
         bootstrap,
         memories,
         total_candidates: outcome.total_candidates,

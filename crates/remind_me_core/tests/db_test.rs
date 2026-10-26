@@ -49,6 +49,7 @@ fn test_database_creation_and_add_memory() {
         bootstrap: false,
         include_expired: true,
         min_confidence: 0.0,
+        include_raw: false,
     };
 
     let search_results = queries::search_memories(&store, &search_input).expect("Search failed");

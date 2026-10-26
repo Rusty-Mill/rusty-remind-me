@@ -1182,6 +1182,9 @@ pub(crate) fn keyword_hits(
         .into_iter()
         .filter(|(row, _)| filter.include_sensitive || !row.sensitive)
         .filter(|(row, _)| filter.category.as_ref().is_none_or(|c| &row.category == c))
+        .filter(|(row, _)| {
+            !(filter.exclude_raw && crate::db::memories::is_raw_category(&row.category))
+        })
         .filter(|(row, _)| row.in_scope(&filter.scope))
         .map(|(row, score)| (row.to_memory(), score))
         .filter(|(memory, _)| {

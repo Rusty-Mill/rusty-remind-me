@@ -71,6 +71,7 @@ fn search_ids(store: &Store<'_>, query: &str, include_sensitive: bool) -> Vec<St
             include_expired: true,
             min_confidence: 0.0,
             include_sensitive,
+            include_raw: false,
         },
     )
     .unwrap()

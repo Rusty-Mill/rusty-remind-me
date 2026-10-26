@@ -390,6 +390,24 @@ pub struct MemorySearchInput {
     /// Drop memories below this `confidence`. `0.0` keeps everything.
     #[serde(default)]
     pub min_confidence: f64,
+    /// Rank raw session dialogs and skeletons with everything else. Off by
+    /// default (ADR-0029): facts and summaries answer a query, and a dialog
+    /// is reached through their `capture_id`. Asking for a raw category or a
+    /// session turns it on.
+    #[serde(default)]
+    pub include_raw: bool,
+}
+
+impl MemorySearchInput {
+    /// Whether raw dialogs compete in this search's ranking.
+    pub fn ranks_raw(&self) -> bool {
+        self.include_raw
+            || self.scope.session_id.is_some()
+            || self
+                .category
+                .as_deref()
+                .is_some_and(crate::db::memories::is_raw_category)
+    }
 }
 
 fn default_include_expired() -> bool {
@@ -421,6 +439,7 @@ impl Default for MemorySearchInput {
             scope: Default::default(),
             include_expired: true,
             min_confidence: 0.0,
+            include_raw: false,
         }
     }
 }

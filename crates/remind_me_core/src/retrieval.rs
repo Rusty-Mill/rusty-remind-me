@@ -579,6 +579,8 @@ pub struct TrimOutcome {
     /// would have to be threaded through three public signatures to say one
     /// thing.
     pub timing: SearchTiming,
+    /// Nothing refined matched, so these are raw session dialogs (ADR-0029).
+    pub raw_fallback: bool,
 }
 
 /// Wall-clock budget for one search.
@@ -787,6 +789,7 @@ pub fn trim_by_token_budget(
             total_candidates,
             results,
             timing: SearchTiming::default(),
+            raw_fallback: false,
         };
     }
 
@@ -810,6 +813,7 @@ pub fn trim_by_token_budget(
                 total_candidates,
                 results: kept,
                 timing: SearchTiming::default(),
+                raw_fallback: false,
             };
         }
         tokens_used += est_tokens;
@@ -824,6 +828,7 @@ pub fn trim_by_token_budget(
         total_candidates,
         results: kept,
         timing: SearchTiming::default(),
+        raw_fallback: false,
     }
 }
 
