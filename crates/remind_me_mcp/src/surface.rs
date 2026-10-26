@@ -165,15 +165,37 @@ fn pick(
 /// later.
 const FOR_REFERENCES: [&str; 3] = ["reference", "reference_kind", "include_sensitive"];
 
+/// The only arguments a search without `query` honours: the listing's own
+/// filters. Ranking and shaping options (`detail`, `token_budget`,
+/// `min_confidence`, ...) are refused, for the same reason.
+const FOR_LISTING: [&str; 12] = [
+    "query",
+    "category",
+    "tags",
+    "source",
+    "limit",
+    "offset",
+    "response_format",
+    "include_sensitive",
+    "project",
+    "branch",
+    "session_id",
+    "written_by",
+];
+
+/// The non-null arguments outside `allowed`, in argument order.
+fn outside<'a>(args: &'a Value, allowed: &[&str]) -> Vec<&'a str> {
+    args.as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(key, value)| !value.is_null() && !allowed.contains(&key.as_str()))
+        .map(|(key, _)| key.as_str())
+        .collect()
+}
+
 fn search(args: &mut Value) -> Result<&'static str, String> {
     if text(args, "reference").is_some() || text(args, "reference_kind").is_some() {
-        let others: Vec<&str> = args
-            .as_object()
-            .into_iter()
-            .flatten()
-            .filter(|(key, value)| !value.is_null() && !FOR_REFERENCES.contains(&key.as_str()))
-            .map(|(key, _)| key.as_str())
-            .collect();
+        let others = outside(args, &FOR_REFERENCES);
         if !others.is_empty() {
             return Err(format!(
                 "`reference` looks up references only, with `reference_kind` and \
@@ -185,10 +207,21 @@ fn search(args: &mut Value) -> Result<&'static str, String> {
         rename(args, "reference_kind", "kind");
         return Ok("remind_me_references");
     }
-    Ok(match text(args, "query") {
-        Some(_) => "remind_me_search",
-        None => "remind_me_list",
-    })
+    if text(args, "query").is_some() {
+        return Ok("remind_me_search");
+    }
+    let others = outside(args, &FOR_LISTING);
+    if !others.is_empty() {
+        return Err(format!(
+            "without `query` this lists memories newest first, which does not take {}; \
+             pass a query or drop them",
+            others.join(", ")
+        ));
+    }
+    if let Some(object) = args.as_object_mut() {
+        object.remove("query");
+    }
+    Ok("remind_me_list")
 }
 
 fn get(args: &mut Value) -> Result<&'static str, String> {
@@ -300,8 +333,8 @@ fn definition(name: &str, catalog: &[Value]) -> Option<Value> {
             "Search remind-me memories by keyword and meaning; call this first to recall anything \
              about the user, their projects or past decisions. Hits are compact by default (id, \
              snippet, score); fetch whole memories with remind_me_get `memory_ids`, or pass \
-             `detail=full`. Without `query` it lists memories newest first under the same \
-             filters. With `reference` it finds the memories that point at an issue, commit, URL \
+             `detail=full`. Without `query` it lists memories newest first, filtered by \
+             category, tags, source, project, branch, session or writer. With `reference` it finds the memories that point at an issue, commit, URL \
              or path.",
             &["remind_me_search", "remind_me_list"],
             &[],
@@ -517,6 +550,21 @@ mod tests {
             "remind_me_list"
         );
         assert_eq!(routed("remind_me_search", json!({})).0, "remind_me_list");
+        for shaped in [
+            json!({"detail": "full"}),
+            json!({"query": "", "token_budget": 50}),
+            json!({"min_confidence": 0.5}),
+            json!({"include_expired": true}),
+        ] {
+            let why = route("remind_me_search", shaped.clone()).unwrap_err();
+            assert!(why.contains("without `query`"), "{shaped}: {why}");
+        }
+        let (handler, args) = routed(
+            "remind_me_search",
+            json!({"query": " ", "category": "fact", "detail": null}),
+        );
+        assert_eq!(handler, "remind_me_list");
+        assert!(args.get("query").is_none(), "{args}");
         let (handler, args) = routed(
             "remind_me_search",
             json!({"reference": "o/r#1", "reference_kind": "issue"}),

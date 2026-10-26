@@ -4063,6 +4063,43 @@ mod tests {
     }
 
     #[test]
+    fn a_search_without_a_query_lists_under_its_filters_and_refuses_ranking_options() {
+        let server = McpServer::new(Database::open_in_memory().unwrap());
+        for (content, category) in [("Alpha listing", "fact"), ("Beta listing", "note")] {
+            call(
+                &server,
+                "remind_me_add",
+                json!({ "content": content, "category": category }),
+            );
+        }
+
+        let listed = call(
+            &server,
+            "remind_me_search",
+            json!({ "query": "", "category": "fact" }),
+        );
+        let text = text_of(&listed);
+        assert!(listed.get("isError").is_none(), "{text}");
+        assert!(text.contains("Alpha listing"), "{text}");
+        assert!(
+            !text.contains("Beta listing"),
+            "category filter was dropped: {text}"
+        );
+
+        for shaped in [
+            json!({ "detail": "full" }),
+            json!({ "token_budget": 10 }),
+            json!({ "include_expired": true }),
+            json!({ "min_confidence": 0.9 }),
+            json!({ "min_vitality": 0.5 }),
+        ] {
+            let refused = call(&server, "remind_me_search", shaped.clone());
+            assert_eq!(refused["isError"], true, "{shaped} was silently dropped");
+            assert!(text_of(&refused).contains("without `query`"), "{shaped}");
+        }
+    }
+
+    #[test]
     fn a_trimmed_search_names_the_dropped_ids_and_get_fetches_them() {
         let server = McpServer::new(Database::open_in_memory().unwrap());
         for i in 0..3 {
