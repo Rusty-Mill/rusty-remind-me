@@ -640,7 +640,7 @@ impl McpServer {
                         "tools": [
                             {
                                 "name": "remind_me_add",
-                                "description": "Store a new memory fact, preference, or note. Saving a decision checks it against the standing decisions on the same claim or a shared entity and returns likely conflicts as contradiction_candidates; nothing is blocked or superseded automatically. Pass supersedes to retire the old decision in the same call.",
+                                "description": "Store a new memory fact, preference, or note. Saving a decision checks it against the standing, non-sensitive decisions in the same project on the same claim or a shared entity and returns likely conflicts as contradiction_candidates; nothing is blocked or superseded automatically. Pass supersedes to retire the old decision in the same call.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -685,7 +685,7 @@ impl McpServer {
                                         "valid_from": { "type": "string", "description": "RFC 3339 time the memory starts to hold; omit for always." },
                                         "valid_until": { "type": "string", "description": "RFC 3339 time it stops holding; after it the memory ranks last and is marked expired." },
                                         "outcome": { "type": "string", "enum": ["done", "abandoned", "reverted", "superseded"], "description": "Only for decision and action_item memories; prefer remind_me_resolve for an existing one." },
-                                        "supersedes": { "type": "array", "items": { "type": "string" }, "description": "IDs of live memories this one replaces, e.g. a contradiction_candidates id. Each is marked superseded by the new memory; an id that is missing, deleted or already superseded refuses the add." }
+                                        "supersedes": { "type": "array", "items": { "type": "string" }, "description": "IDs of live memories this one replaces, e.g. a contradiction_candidates id. Each is marked superseded by the new memory, in one transaction with the add; an id that is missing, deleted, already superseded or a project claim refuses the whole add." }
                                     },
                                     "required": ["content"]
                                 }
@@ -5834,6 +5834,104 @@ mod tests {
             body.get("total_candidates").is_some(),
             "total_candidates must be present in the response: {body}"
         );
+    }
+
+    /// `remind_me_add` of a decision mentioning `Postgres` that claims the
+    /// session store uses `object`, with `extra` arguments merged in.
+    fn add_decision(server: &McpServer, content: &str, object: &str, extra: Value) -> Value {
+        let mut args = json!({
+            "content": content,
+            "memory_type": "decision",
+            "metadata": { "rationale": "r" },
+            "subject": "session store",
+            "predicate": "uses",
+            "object": object,
+            "entities": [{ "name": "Postgres" }],
+            "extract": false,
+        });
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().cloned().unwrap_or_default());
+        call(server, "remind_me_add", args)
+    }
+
+    #[test]
+    fn add_of_a_decision_returns_its_conflicts_in_json_and_markdown() {
+        let server = McpServer::new(Database::open_in_memory().unwrap());
+        let old: Value = serde_json::from_str(&text_of(&add_decision(
+            &server,
+            "Use Postgres for the session store",
+            "Postgres",
+            json!({}),
+        )))
+        .unwrap();
+        assert!(old.get("contradiction_candidates").is_none(), "{old}");
+
+        let json_reply: Value = serde_json::from_str(&text_of(&add_decision(
+            &server,
+            "Use Redis for the session store",
+            "Redis",
+            json!({}),
+        )))
+        .unwrap();
+        let found = &json_reply["contradiction_candidates"];
+        assert_eq!(found.as_array().map(Vec::len), Some(1), "{json_reply}");
+        assert_eq!(found[0]["memory"]["id"], old["id"]);
+        assert_eq!(found[0]["reason"], "same_claim");
+
+        let markdown = text_of(&add_decision(
+            &server,
+            "Use Memcached for the session store",
+            "Memcached",
+            json!({ "response_format": "markdown" }),
+        ));
+        assert!(markdown.contains("May contradict"), "{markdown}");
+        assert!(markdown.contains(old["id"].as_str().unwrap()), "{markdown}");
+    }
+
+    #[test]
+    fn sensitive_decisions_never_surface_as_conflicts() {
+        let server = McpServer::new(Database::open_in_memory().unwrap());
+        // One sensitive decision on the same claim, one sharing the entity
+        // and the topic: both would be conflicts if they were not sensitive.
+        add_decision(
+            &server,
+            "Use Postgres for the session store SECRETMARK",
+            "Postgres",
+            json!({ "sensitive": true }),
+        );
+        call(
+            &server,
+            "remind_me_add",
+            json!({
+                "content": "Use Valkey for the session store SECRETMARK",
+                "memory_type": "decision",
+                "metadata": { "rationale": "r" },
+                "entities": [{ "name": "Postgres" }],
+                "extract": false,
+                "sensitive": true,
+            }),
+        );
+
+        let json_text = text_of(&add_decision(
+            &server,
+            "Use Redis for the session store",
+            "Redis",
+            json!({}),
+        ));
+        let markdown = text_of(&add_decision(
+            &server,
+            "Use Memcached for the session store",
+            "Memcached",
+            json!({ "response_format": "markdown" }),
+        ));
+
+        let reply: Value = serde_json::from_str(&json_text).unwrap();
+        // Only the sensitive decisions preceded it, so it has no conflicts;
+        // the markdown add then conflicts with this one alone.
+        assert!(reply.get("contradiction_candidates").is_none(), "{reply}");
+        assert!(!json_text.contains("SECRETMARK"), "{json_text}");
+        assert!(!markdown.contains("SECRETMARK"), "{markdown}");
     }
 }
 

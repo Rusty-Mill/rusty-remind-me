@@ -230,12 +230,7 @@ fn supersedes_retires_the_named_memories() {
 fn supersedes_naming_a_memory_that_is_not_live_refuses_the_add() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
-    let count = |store: &Store<'_>| {
-        queries::list_memories(store, &Default::default())
-            .unwrap()
-            .total
-    };
-    let before = count(&store);
+    let before = live_count(&store);
 
     let refused = queries::add_memory_with(
         &store,
@@ -247,5 +242,96 @@ fn supersedes_naming_a_memory_that_is_not_live_refuses_the_add() {
     );
 
     assert!(matches!(refused, Err(StoreError::Invalid(why)) if why.contains("mem_missing")));
-    assert_eq!(count(&store), before);
+    assert_eq!(live_count(&store), before);
+}
+
+fn live_count(store: &Store<'_>) -> usize {
+    queries::list_memories(store, &Default::default())
+        .unwrap()
+        .total
+}
+
+#[test]
+fn a_failure_on_a_later_target_rolls_back_the_whole_add() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let old = decision(&store, "Use Postgres for the session store", &["Postgres"]);
+    let before = live_count(&store);
+
+    // The second retirement finds `old` already retired by the first.
+    let refused = queries::add_memory_with(
+        &store,
+        MemoryAddInput {
+            supersedes: vec![old.clone(), old.clone()],
+            ..input("Use Redis for the session store", &["Postgres"])
+        },
+        &kind("decision"),
+    );
+
+    assert!(
+        matches!(refused, Err(StoreError::Invalid(_))),
+        "{refused:?}"
+    );
+    assert_eq!(live_count(&store), before);
+    let old = queries::get_memory_by_id(&store, &old).unwrap().unwrap();
+    assert!(
+        old.superseded_by.is_none(),
+        "the first retirement rolled back"
+    );
+}
+
+#[test]
+fn a_target_already_superseded_refuses_the_add() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let old = decision(&store, "Use Postgres for the session store", &["Postgres"]);
+    let replace = |content: &str| {
+        queries::add_memory_with(
+            &store,
+            MemoryAddInput {
+                supersedes: vec![old.clone()],
+                ..input(content, &["Postgres"])
+            },
+            &kind("decision"),
+        )
+    };
+    replace("Use Redis for the session store").unwrap();
+    let before = live_count(&store);
+
+    let stale = replace("Use Memcached for the session store");
+
+    assert!(matches!(stale, Err(StoreError::Invalid(why)) if why.contains("already superseded")));
+    assert_eq!(live_count(&store), before);
+}
+
+#[test]
+fn only_decisions_in_the_same_project_are_compared() {
+    use remind_me_core::db::derived::Origin;
+    use remind_me_core::db::entities::Entities;
+    use remind_me_core::db::memories::{Memories, NewMemory};
+    const NOW: &str = "2026-10-26T00:00:00+00:00";
+
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let insert = |id: &str, object: &str, project: Option<&str>| {
+        Memories::new(&store)
+            .insert(&NewMemory {
+                memory_type: "decision".into(),
+                subject: Some("session store".into()),
+                predicate: Some("uses".into()),
+                object: Some(object.into()),
+                project: project.map(str::to_string),
+                ..NewMemory::new(id, format!("Use {object} for the session store"), NOW)
+            })
+            .unwrap();
+        Entities::new(&store)
+            .link(id, "postgres", NOW, Origin::Local)
+            .unwrap();
+    };
+    insert("same", "Postgres", Some("ALPHA"));
+    insert("other", "Memcached", Some("beta"));
+    insert("unnamed", "Valkey", None);
+    insert("saved", "Redis", Some("alpha"));
+
+    assert_eq!(ids(&store, "saved"), vec!["same".to_string()]);
 }

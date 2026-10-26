@@ -251,10 +251,13 @@ pub(crate) fn contradiction_pairs(
         .collect())
 }
 
-/// Whether `row` is a decision still in force: live, and not resolved as
-/// reverted, abandoned or superseded.
+/// Whether `row` is a decision still in force: live, not sensitive, and not
+/// resolved as reverted, abandoned or superseded. Sensitive rows are left
+/// out because the result rides an ordinary write's response, which must not
+/// surface them unasked.
 fn standing_decision(row: &MemoryRow) -> bool {
     live(row)
+        && !row.sensitive
         && row.memory_type == "decision"
         && !matches!(
             row.outcome.as_deref(),
@@ -262,10 +265,22 @@ fn standing_decision(row: &MemoryRow) -> bool {
         )
 }
 
-/// The standing decisions other than `memory_id` that make the same claim as
-/// it, or mention an entity it mentions that at most `max_fanout` memories
-/// mention, in id order, each with the names of those shared entities (by
-/// name). Empty when `memory_id` is missing.
+/// Whether two rows were written in the same project, ignoring ASCII case.
+/// Two rows with no project are in the same (unnamed) one; a row with a
+/// project and one without are not, so a claim in one repository is never
+/// matched against a same-named claim in another.
+fn same_project(a: &MemoryRow, b: &MemoryRow) -> bool {
+    match (&a.project, &b.project) {
+        (Some(pa), Some(pb)) => pa.eq_ignore_ascii_case(pb),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// The standing decisions other than `memory_id`, in its project, that make
+/// the same claim as it, or mention an entity it mentions that at most
+/// `max_fanout` memories mention, in id order, each with the names of those
+/// shared entities (by name). Empty when `memory_id` is missing.
 ///
 /// One pass over the links finds the saved memory's entities; each entity's
 /// memories then come from the link index, and the claim scan runs only when
@@ -300,7 +315,10 @@ pub(crate) fn decision_neighbours(
     found.remove(memory_id);
     Ok(found
         .into_iter()
-        .filter(|(id, _)| memories::row(core, id).is_some_and(|row| standing_decision(&row)))
+        .filter(|(id, _)| {
+            memories::row(core, id)
+                .is_some_and(|row| standing_decision(&row) && same_project(&row, &saved))
+        })
         .map(|(id, names)| (id, names.into_iter().collect()))
         .collect())
 }

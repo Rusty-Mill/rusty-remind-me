@@ -356,3 +356,50 @@ fn a_realistic_mix_of_traffic_stays_bounded() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The keys of every unsent outbox row, oldest first.
+fn outbox_keys(store: &Store<'_>) -> Vec<String> {
+    remind_me_core::db::outbox::Outbox::new(store)
+        .unsent_to(HUB_REMOTE_ID, 0, 1000)
+        .unwrap()
+        .into_iter()
+        .map(|row| row.key)
+        .collect()
+}
+
+fn add_superseding(
+    store: &Store<'_>,
+    content: &str,
+    supersedes: Vec<String>,
+) -> Result<String, String> {
+    queries::add_memory(
+        store,
+        MemoryAddInput {
+            content: content.to_string(),
+            supersedes,
+            ..Default::default()
+        },
+    )
+    .map(|m| m.id)
+    .map_err(|e| e.to_string())
+}
+
+#[test]
+fn a_retirement_by_supersedes_reaches_the_outbox_and_a_refused_one_queues_nothing() {
+    ensure_sync_enabled();
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let old = add(&store, "old answer");
+    let before = outbox_keys(&store);
+
+    // Refused on its second target: neither the new memory nor the first
+    // retirement may reach a peer.
+    add_superseding(&store, "doubled", vec![old.clone(), old.clone()]).unwrap_err();
+    assert_eq!(outbox_keys(&store), before);
+
+    let new = add_superseding(&store, "new answer", vec![old.clone()]).unwrap();
+    let queued = outbox_keys(&store);
+    let added = &queued[before.len()..];
+    assert!(added.contains(&new), "{added:?}");
+    assert!(added.contains(&old), "the retirement must sync: {added:?}");
+}

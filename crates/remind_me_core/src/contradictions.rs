@@ -37,13 +37,16 @@
 //!
 //! The queue above only runs when asked, so a stale decision can sit beside
 //! its replacement indefinitely. [`check_on_save`] runs a narrow version of
-//! it when a decision is written: only against standing decisions, only
-//! those sharing the claim or a non-hub entity, and a shared entity alone is
-//! not enough — the content must also overlap by [`ON_SAVE_MIN_OVERLAP`], so
-//! two decisions that merely name the same project are not flagged. At most
-//! [`ON_SAVE_LIMIT`] come back with the write. It never blocks the write and
-//! never supersedes: the writer decides, and can do it in the same call with
-//! `remind_me_add`'s `supersedes`.
+//! it when a decision is written. It compares only against standing
+//! decisions in the same project that are not sensitive (the findings ride
+//! an ordinary write's response, which must not surface sensitive text
+//! unasked), and only those sharing the claim or a non-hub entity. A shared
+//! entity alone is not enough: the content must also overlap by
+//! [`ON_SAVE_MIN_OVERLAP`], so two decisions that merely name the same
+//! project are not flagged. At most [`ON_SAVE_LIMIT`] come back with the
+//! write. It never blocks the write and never supersedes: the writer
+//! decides, and can do it in the same call with `remind_me_add`'s
+//! `supersedes`.
 
 use crate::db::curation::Curation;
 use crate::db::memories::Memories;
