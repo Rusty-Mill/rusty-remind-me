@@ -232,6 +232,7 @@ pub struct KeywordFilter {
     pub scope: crate::context::ScopeFilter,
     /// Leave out [`RAW_CATEGORIES`].
     pub exclude_raw: bool,
+    pub window: crate::time_window::TimeWindow,
 }
 
 /// Categories holding a session's verbatim record rather than something
@@ -448,6 +449,12 @@ impl<'c> Memories<'c> {
         engine::memories::all_live(&self.core.lock())
     }
 
+    /// Undeleted memories whose predicate starts with `prefix`, ignoring
+    /// case, superseded ones included, oldest first (ties by id).
+    pub fn with_predicate_prefix(&self, prefix: &str) -> Result<Vec<Memory>> {
+        engine::memories::with_predicate_prefix(&self.core.lock(), prefix)
+    }
+
     /// Memory `id`, unless it is missing or deleted.
     pub fn get_live(&self, id: &str) -> Result<Option<Memory>> {
         engine::memories::get_live(&self.core.lock(), id)
@@ -516,6 +523,14 @@ impl<'c> Memories<'c> {
             return Ok(Vec::new());
         }
         engine::memories::keyword_hits(&self.core.lock(), phrases, filter, limit)
+    }
+
+    /// Every live, unsuperseded memory `filter` admits, newest first on its
+    /// window's timestamp (ties by id). Serves a search with a time window and
+    /// no query text, where there is nothing to rank. Unlimited, because the
+    /// caller's validity and confidence filters must run before its `limit`.
+    pub fn window_hits(&self, filter: &KeywordFilter) -> Result<Vec<Memory>> {
+        engine::memories::window_hits(&self.core.lock(), filter)
     }
 
     /// The ids of every memory marked sensitive.
@@ -1232,6 +1247,7 @@ mod tests {
                 category: text("fact"),
                 include_sensitive: true,
                 exclude_raw: true,
+                window: Default::default(),
             },
         ];
         for query in queries {

@@ -396,6 +396,10 @@ pub struct MemorySearchInput {
     /// session turns it on.
     #[serde(default)]
     pub include_raw: bool,
+    /// Narrow to a `since`/`until` window over `created_at` or `updated_at`.
+    /// Bounded with an empty `query`, the search lists the window newest-first.
+    #[serde(default, flatten)]
+    pub window: crate::time_window::TimeWindow,
 }
 
 impl MemorySearchInput {
@@ -440,6 +444,7 @@ impl Default for MemorySearchInput {
             include_expired: true,
             min_confidence: 0.0,
             include_raw: false,
+            window: Default::default(),
         }
     }
 }

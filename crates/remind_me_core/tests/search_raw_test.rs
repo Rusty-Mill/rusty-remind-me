@@ -206,3 +206,108 @@ fn a_fallback_past_the_deadline_still_reports_the_skipped_semantic_stage() {
     );
     assert!(outcome.timing.degraded());
 }
+
+fn last_day() -> remind_me_core::time_window::TimeWindow {
+    use remind_me_core::time_window::{RawTimeWindow, TimeField, TimeWindow};
+    let raw = RawTimeWindow {
+        since: Some("1d".into()),
+        until: None,
+        time_field: TimeField::Created,
+    };
+    TimeWindow::resolve(&raw, chrono::Utc::now()).unwrap()
+}
+
+fn aged(store: &Store<'_>, id: &str, days: i64) {
+    let when = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+    remind_me_core::testing::set_memory_column(store, id, "created_at", when).unwrap();
+}
+
+#[test]
+fn a_window_listing_leaves_dialogs_out_while_refined_rows_are_in_it() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let fact = add(&store, "wombat burrows face north", "fact");
+    add(&store, "user: which way do wombat burrows face?", "dialog");
+    let input = MemorySearchInput {
+        window: last_day(),
+        include_dormant: true,
+        ..query("")
+    };
+
+    let (found, fallback) = ids(&store, input);
+
+    assert_eq!((found, fallback), (vec![fact], false));
+}
+
+#[test]
+fn a_window_with_only_dialogs_lists_them_as_raw_fallback() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let old_fact = add(&store, "wombat burrows face north", "fact");
+    aged(&store, &old_fact, 3);
+    let dialog = add(&store, "user: which way do wombat burrows face?", "dialog");
+    let input = MemorySearchInput {
+        window: last_day(),
+        include_dormant: true,
+        ..query("")
+    };
+
+    let (found, fallback) = ids(&store, input);
+
+    assert_eq!((found, fallback), (vec![dialog], true));
+}
+
+#[test]
+fn a_windowed_keyword_search_falls_back_only_to_dialogs_in_the_window() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let old_fact = add(&store, "wombat burrows face north", "fact");
+    aged(&store, &old_fact, 3);
+    let old_dialog = add(&store, "user: wombat burrows again", "dialog");
+    aged(&store, &old_dialog, 3);
+    let dialog = add(&store, "user: which way do wombat burrows face?", "dialog");
+    let input = MemorySearchInput {
+        window: last_day(),
+        include_dormant: true,
+        ..query("wombat")
+    };
+
+    let (found, fallback) = ids(&store, input);
+
+    assert_eq!((found, fallback), (vec![dialog], true));
+}
+
+#[test]
+fn semantic_raw_exclusion_composes_with_the_window() {
+    use remind_me_core::retrieval::Deadline;
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    for n in 0..5 {
+        embedded(&store, &format!("dialog number {n}"), "dialog");
+    }
+    let old_fact = embedded(&store, "striped horses graze far away", "fact");
+    aged(&store, &old_fact, 3);
+    let fact = embedded(&store, "striped horses graze", "fact");
+    let input = MemorySearchInput {
+        limit: 1,
+        window: last_day(),
+        include_dormant: true,
+        ..query("zebra")
+    };
+
+    let outcome = queries::search_memories_deadlined(
+        &store,
+        &input,
+        Some(&RawLeaningEmbedder),
+        Deadline::unbounded(),
+    )
+    .unwrap();
+
+    let found: Vec<&str> = outcome
+        .results
+        .iter()
+        .map(|r| r.memory.id.as_str())
+        .collect();
+    assert_eq!(found, vec![fact.as_str()]);
+    assert!(!outcome.raw_fallback);
+}

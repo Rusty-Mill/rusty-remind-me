@@ -48,6 +48,7 @@ fn search(store: &Store<'_>, query: &str) -> Vec<String> {
         include_expired: true,
         min_confidence: 0.0,
         include_raw: false,
+        window: Default::default(),
     };
     queries::search_memories(store, &input)
         .expect("search failed")
