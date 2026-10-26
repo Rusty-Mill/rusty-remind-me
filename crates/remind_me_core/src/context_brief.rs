@@ -91,8 +91,8 @@ fn line_of(memory: &Memory) -> String {
 }
 
 /// Not superseded, not expired, not sensitive, not a raw dialog: what is fit
-/// to inject unasked.
-fn injectable(memory: &Memory, now: &str) -> bool {
+/// to inject unasked. Shared with [`crate::review::due_among`].
+pub(crate) fn injectable(memory: &Memory, now: &str) -> bool {
     memory.superseded_by.is_none()
         && !memory.sensitive
         && memory.category != crate::models::DIALOG_CATEGORY

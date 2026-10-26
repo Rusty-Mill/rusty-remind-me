@@ -149,6 +149,13 @@ pub fn review_due(memory: &Memory) -> Option<&str> {
     review_of(memory)?.get("due")?.as_str()
 }
 
+/// The review date as an instant. Compared parsed, never as text: an RFC 3339
+/// string with an offset does not sort with one in UTC.
+fn due_instant(memory: &Memory) -> Option<DateTime<Utc>> {
+    let due = DateTime::parse_from_rfc3339(review_due(memory)?).ok()?;
+    Some(due.with_timezone(&Utc))
+}
+
 /// The metadata a new decision should hold: `metadata` plus a review due
 /// `days` after `from`. `None` when nothing should change: scheduling is
 /// off, the decision is low-stakes, or it already has a review.
@@ -194,10 +201,7 @@ pub fn state(memory: &Memory, now: DateTime<Utc>) -> ReviewState {
     if is_low_stakes(&memory.metadata) {
         return ReviewState::LowStakes;
     }
-    let due = review_due(memory)
-        .and_then(|d| DateTime::parse_from_rfc3339(d).ok())
-        .map(|d| d.with_timezone(&Utc));
-    match due {
+    match due_instant(memory) {
         Some(due) if due <= now => ReviewState::Due,
         Some(_) => ReviewState::Pending,
         None => ReviewState::Unscheduled,
@@ -205,21 +209,23 @@ pub fn state(memory: &Memory, now: DateTime<Utc>) -> ReviewState {
 }
 
 /// The decisions among `memories` due for review as of `now`, in `project`
-/// when given, oldest due date first. Sensitive and superseded decisions
-/// are left out: these lists are surfaced unasked.
+/// when given, oldest due date first (ties by id). Only what the session
+/// brief would inject unasked is listed: not sensitive, superseded, expired
+/// or a raw dialog.
 pub fn due_among<'a>(
     memories: &'a [Memory],
     now: DateTime<Utc>,
     project: Option<&str>,
 ) -> Vec<&'a Memory> {
     let scope = crate::context::ScopeFilter::new(project.map(str::to_string), None, None, None);
+    let now_text = now.to_rfc3339();
     let mut due: Vec<&Memory> = memories
         .iter()
         .filter(|m| m.memory_type.as_deref() == Some(DECISION))
-        .filter(|m| !m.sensitive && m.superseded_by.is_none() && scope.matches_memory(m))
+        .filter(|m| crate::context_brief::injectable(m, &now_text) && scope.matches_memory(m))
         .filter(|m| state(m, now) == ReviewState::Due)
         .collect();
-    due.sort_by(|a, b| (review_due(a), &a.id).cmp(&(review_due(b), &b.id)));
+    due.sort_by(|a, b| (due_instant(a), &a.id).cmp(&(due_instant(b), &b.id)));
     due
 }
 
@@ -524,7 +530,13 @@ mod tests {
             "pending",
             json!({ "review": { "due": "2027-01-01T00:00:00Z" } }),
         );
-        let all = [other, secret, replaced, fact, b, a, pending];
+        let mut expired = decision("expired", past());
+        expired.valid_until = Some("2026-03-01T00:00:00+00:00".into());
+        let mut dialog = decision("dialog", past());
+        dialog.category = crate::models::DIALOG_CATEGORY.into();
+        let all = [
+            other, secret, replaced, fact, b, a, pending, expired, dialog,
+        ];
 
         let ids = |v: Vec<&Memory>| v.iter().map(|m| m.id.clone()).collect::<Vec<_>>();
         assert_eq!(
@@ -535,6 +547,29 @@ mod tests {
             ids(due_among(&all, now, None)),
             ["a_earlier", "other_project", "b_later"]
         );
+    }
+
+    #[test]
+    fn due_dates_sort_as_instants_not_text() {
+        // 09:00+09:00 is 00:00Z, before 01:00Z; as text it sorts after.
+        let offset = decision(
+            "z_offset",
+            json!({ "review": { "due": "2026-01-02T09:00:00+09:00" } }),
+        );
+        let utc = decision(
+            "a_utc",
+            json!({ "review": { "due": "2026-01-02T01:00:00Z" } }),
+        );
+        let tie = decision(
+            "b_tie",
+            json!({ "review": { "due": "2026-01-02T00:00:00+00:00" } }),
+        );
+        let all = [utc, offset, tie];
+        let ids: Vec<&str> = due_among(&all, at(NOW), None)
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect();
+        assert_eq!(ids, ["b_tie", "z_offset", "a_utc"]);
     }
 
     #[test]
@@ -828,6 +863,16 @@ mod tests {
             r.project = Some("elsewhere".into());
         });
         insert(&store, "not_yet", |r| r.project = Some("quokka".into()));
+        insert(&store, "expired_here", |r| {
+            r.metadata = past();
+            r.project = Some("quokka".into());
+            r.valid_until = Some("2026-03-01T00:00:00+00:00".into());
+        });
+        insert(&store, "dialog_here", |r| {
+            r.metadata = past();
+            r.project = Some("quokka".into());
+            r.category = crate::models::DIALOG_CATEGORY.into();
+        });
 
         let digest = crate::digest::build_digest(&store, 7).unwrap();
         let ids: Vec<&str> = digest.reviews_due.iter().map(|r| r.id.as_str()).collect();
