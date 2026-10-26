@@ -124,12 +124,16 @@ fn a_failed_probe_does_not_answer_for_a_different_backend_address() {
     let available = available_embedder().is_some();
 
     clear_backend();
-    let _ = handle.join();
+    let served = handle.join().expect("stub thread panicked");
 
     assert!(
         available,
         "a reachable daemon must be reported available immediately, not after \
          the previous address's failure TTL expires"
+    );
+    assert!(
+        served,
+        "the live address must be probed, not answered from a cache"
     );
 }
 
@@ -150,7 +154,10 @@ fn a_successful_probe_is_still_cached_for_the_same_configuration() {
         available_embedder().is_some(),
         "the stub answers the first probe"
     );
-    let _ = handle.join();
+    assert!(
+        handle.join().expect("stub thread panicked"),
+        "the first call must reach the stub, not a cached verdict"
+    );
 
     let second = available_embedder().is_some();
     clear_backend();
