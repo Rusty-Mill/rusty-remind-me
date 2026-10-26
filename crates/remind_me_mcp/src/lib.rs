@@ -976,7 +976,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_capture_transcript",
-                                "description": "Store or refresh a Claude Code session's capture from its raw JSONL transcript: one dialog and summary pair per session_id, replaced in place on every call. For hooks on machines without the CLI (cloud sessions); a model should use remind_me_auto_capture. The raw transcript is also archived when REMIND_ME_ARCHIVE_DIR is set.",
+                                "description": "remind-me import: store or refresh a Claude Code session's capture from its raw JSONL transcript: one dialog and summary pair per session_id, replaced in place on every call. For hooks on machines without the CLI (cloud sessions); a model should use remind_me_auto_capture. The raw transcript is also archived when REMIND_ME_ARCHIVE_DIR is set.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {

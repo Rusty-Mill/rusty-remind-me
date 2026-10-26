@@ -5,12 +5,12 @@ Date: 2026-10-26
 
 ## Context
 
-The MCP server advertised 75 tools. A typical session uses about eight.
+The MCP server advertised 76 tools. A typical session uses about eight.
 Claude clients defer tools and load them by keyword search over name and
 description, so a large surface makes the right tool hard to find: a search
 for `remind_me_search` returned `remind_me_delete_saved_search` first, and no
 description contained the words "remind-me". Clients that load every tool up
-front (Hermes, local models, ChatGPT, Gemini) pay for all 75 schemas each
+front (Hermes, local models, ChatGPT, Gemini) pay for all 76 schemas each
 session, and small models choose worse among near-identical names.
 
 Profiles already existed (`REMIND_ME_TOOL_PROFILE` = `full`, `standard`,
@@ -51,8 +51,8 @@ instructions and the clients' standing instructions, not from usage data.
    - `reminders`, `saved_search(action)`, `sync_status(reconcile)`.
 
    A merged schema is the union of its handlers' properties; a property
-   whose handlers disagree on a default advertises none. 75 tools become 43;
-   `self_update` leaving MCP (step 2) makes it 42.
+   whose handlers disagree on a default advertises none. 76 tools become 44;
+   `self_update` leaving MCP (step 2) makes it 43.
 5. **Apply tools with different item schemas stay separate** (`decompose`,
    `annotate`, `normalize_apply`, `reclassify`). One tool with a `oneOf`
    union would suit small models worse than four strict schemas.
@@ -80,7 +80,7 @@ instructions and the clients' standing instructions, not from usage data.
 
 ## Consequences
 
-- Under `full` a client sees 43 tools instead of 75; after step 2, a client
+- Under `full` a client sees 44 tools instead of 76; after step 2, a client
   that sets nothing sees 10.
 - 36 tool names are deprecated. Anything that calls them keeps working until
   0.6.0.

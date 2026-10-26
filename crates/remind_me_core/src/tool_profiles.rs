@@ -78,7 +78,11 @@ pub const WIKI: [&str; 4] = [
     "remind_me_wiki_compile",
 ];
 
-pub const IMPORT: [&str; 2] = ["remind_me_import", "remind_me_undo_import"];
+pub const IMPORT: [&str; 3] = [
+    "remind_me_import",
+    "remind_me_undo_import",
+    "remind_me_capture_transcript",
+];
 
 /// Operations a person runs, not a conversation. `self_update` leaves MCP for
 /// the CLI in the next step of ADR-0027.

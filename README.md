@@ -128,7 +128,7 @@ pick up a new stdio server until it restarts.
 | `core` (always on) | search, get, add, update, delete, auto_capture, resolve, entity, digest, server_status |
 | `pipeline` | queue and the refinement steps it feeds: decompose, annotate, normalize_apply, reclassify, promote, consolidate, feedback, entity_upsert, entity_traverse, persona, provenance, skeleton_read, skeleton_write, revert |
 | `wiki` | wiki_read, wiki_write, wiki_delete, wiki_compile |
-| `import` | import, undo_import |
+| `import` | import, undo_import, capture_transcript |
 | `admin` | backup, reindex, archive_prune, export_memories, revoke_clients, api_key, sync_status, sync_repair, self_update |
 | `extras` | reminders, saved_search, session_timeline |
 

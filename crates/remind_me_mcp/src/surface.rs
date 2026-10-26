@@ -192,6 +192,14 @@ fn search(args: &mut Value) -> Result<&'static str, String> {
 }
 
 fn get(args: &mut Value) -> Result<&'static str, String> {
+    if args.get("memory_ids").is_some() {
+        if text(args, "capture_id").is_some() || flag(args, "history") || flag(args, "raw") {
+            return Err(
+                "`memory_ids` fetches memories only; drop capture_id, history and raw".to_string(),
+            );
+        }
+        return Ok("remind_me_get");
+    }
     if text(args, "capture_id").is_some() {
         return Ok("remind_me_get_capture");
     }
@@ -290,9 +298,11 @@ fn definition(name: &str, catalog: &[Value]) -> Option<Value> {
     match name {
         "remind_me_search" => merged(
             "Search remind-me memories by keyword and meaning; call this first to recall anything \
-             about the user, their projects or past decisions. Without `query` it lists memories \
-             newest first under the same filters. With `reference` it finds the memories that \
-             point at an issue, commit, URL or path.",
+             about the user, their projects or past decisions. Hits are compact by default (id, \
+             snippet, score); fetch whole memories with remind_me_get `memory_ids`, or pass \
+             `detail=full`. Without `query` it lists memories newest first under the same \
+             filters. With `reference` it finds the memories that point at an issue, commit, URL \
+             or path.",
             &["remind_me_search", "remind_me_list"],
             &[],
             json!({
@@ -302,9 +312,10 @@ fn definition(name: &str, catalog: &[Value]) -> Option<Value> {
             }),
         ),
         "remind_me_get" => merged(
-            "Get one remind-me memory by id, or a captured conversation's dialog and summary by \
-             `capture_id`. `history=true` lists its earlier versions; `raw=true` returns the \
-             imported source it came from.",
+            "Get a remind-me memory by `memory_id`, several at once by `memory_ids` (such as the \
+             ids a compact search returned), or a captured conversation's dialog and summary by \
+             `capture_id`. `history=true` lists a memory's earlier versions; `raw=true` returns \
+             the imported source it came from.",
             &[
                 "remind_me_get",
                 "remind_me_history",
@@ -559,6 +570,20 @@ mod tests {
             "remind_me_source"
         );
         assert!(route("remind_me_get", json!({"history": true, "raw": true})).is_err());
+        assert_eq!(
+            routed("remind_me_get", json!({"memory_ids": ["a", "b"]})).0,
+            "remind_me_get"
+        );
+        assert!(route(
+            "remind_me_get",
+            json!({"memory_ids": ["a"], "history": true})
+        )
+        .is_err());
+        assert!(route(
+            "remind_me_get",
+            json!({"memory_ids": ["a"], "capture_id": "c"})
+        )
+        .is_err());
     }
 
     #[test]

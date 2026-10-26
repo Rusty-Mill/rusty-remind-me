@@ -96,7 +96,7 @@ fn every_public_tool_is_in_exactly_one_group() {
             assert_eq!(group_of(tool), Some(group));
         }
     }
-    assert_eq!(seen.len(), 43);
+    assert_eq!(seen.len(), 44);
 }
 
 #[test]
@@ -112,8 +112,8 @@ fn every_alias_points_at_a_public_tool_and_is_not_one_itself() {
         assert!(!public.contains(old), "{old} is both public and an alias");
         assert_eq!(replacement(old), Some(new));
     }
-    // 75 tools before ADR-0027: 43 public names, 4 of them new, plus 36 aliases.
-    assert_eq!(public.len() - 4 + ALIASES.len(), 75);
+    // 76 tools before ADR-0027: 44 public names, 4 of them new, plus 36 aliases.
+    assert_eq!(public.len() - 4 + ALIASES.len(), 76);
 }
 
 #[test]
