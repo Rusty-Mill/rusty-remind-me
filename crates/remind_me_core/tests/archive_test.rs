@@ -533,3 +533,41 @@ fn a_recaptured_session_keeps_only_its_latest_transcript() {
     crate::test_env::remove_var(ARCHIVE_DIR_ENV);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The archived transcript is scrubbed as the dialog is: the source of a
+/// capture never returns a secret its dialog redacted.
+#[test]
+fn an_archived_session_keeps_no_secret_its_dialog_redacted() {
+    use remind_me_core::transcript::{capture_transcript, TranscriptRequest};
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_limits();
+
+    let dir = scratch("session-secret");
+    crate::test_env::set_var(ARCHIVE_DIR_ENV, dir.join("archive"));
+    let db = open();
+    let store = db.store();
+    let request = TranscriptRequest {
+        session_id: "sess_secret",
+        cwd: None,
+        reason: Some("stop"),
+        context: None,
+    };
+    let token = format!("ghp_{}", "b".repeat(36));
+
+    let made = capture_transcript(
+        &store,
+        &transcript_line(&format!("push with {token}"), "thinking", "/one"),
+        &request,
+    )
+    .unwrap();
+
+    let source = archive::source_for(&store, &made.dialog_id, false)
+        .unwrap()
+        .expect("the dialog has a source");
+    assert!(!source.content.contains(&token), "{}", source.content);
+    assert!(source.content.contains("[REDACTED:github_token]"));
+    assert!(source.content.contains("thinking"), "structure is kept");
+
+    crate::test_env::remove_var(ARCHIVE_DIR_ENV);
+    let _ = std::fs::remove_dir_all(&dir);
+}

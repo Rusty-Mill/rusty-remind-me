@@ -32,10 +32,15 @@ match almost any query, alongside the facts drawn from them.
      `transcript::capture_transcript` over MCP, so a hook on a machine with no
      CLI captures through the remote server and its bearer auth. The caller's
      context is stamped as given; its cwd is never probed on the server.
-   - A transcript is at most `MAX_TRANSCRIPT_BYTES` (3 MiB), so it fits the
-     remote server's 4 MiB body once escaped into JSON. A longer session sends
-     its tail, cut at a line; the dialog keeps only the newest 200,000
-     characters anyway.
+   - A transcript is at most `MAX_TRANSCRIPT_BYTES` (3 MiB) counted once
+     JSON-escaped (`transcript::encoded_len`), the bytes it costs in the
+     request, so it always fits the remote server's 4 MiB body with room for
+     the envelope. A longer session sends its tail, cut at a line; the dialog
+     keeps only the newest 200,000 characters anyway.
+   - Write-time redaction (ADR-0026) holds on every path: a recapture scrubs
+     its text as a first capture does, and the archived transcript is
+     scrubbed string by string (each line stays valid JSON), so neither the
+     dialog nor its source returns a secret the capture redacted.
    - Dedupe is by session id, not content hash: a growing transcript has a
      new hash every turn. The existing upsert replaces the pair and records a
      `recapture` revision.

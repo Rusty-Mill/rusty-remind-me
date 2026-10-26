@@ -28,11 +28,24 @@ pub const SUMMARY_PART_CHARS: usize = 500;
 /// transcript can run to megabytes, and what was said last is what a later
 /// session needs.
 pub const MAX_DIALOG_CHARS: usize = 200_000;
-/// Largest transcript a remote caller may send in one capture. A longer
-/// session sends its tail: the dialog keeps only the newest
-/// [`MAX_DIALOG_CHARS`] anyway. Sized so the transcript, escaped into a JSON
-/// string, still fits the remote server's 4 MiB request body.
+/// Largest transcript a remote caller may send in one capture, counted as
+/// it travels: its [`encoded_len`] as a JSON string, since escaping can
+/// nearly double quote-heavy JSONL. A longer session sends its tail: the
+/// dialog keeps only the newest [`MAX_DIALOG_CHARS`] anyway. The remaining
+/// 1 MiB of the remote server's 4 MiB request body is the envelope's.
 pub const MAX_TRANSCRIPT_BYTES: usize = 3 * 1024 * 1024;
+/// Bytes `text` takes once escaped into a JSON string, quotes excluded:
+/// what it costs in a request body.
+pub fn encoded_len(text: &str) -> usize {
+    text.bytes()
+        .map(|b| match b {
+            b'"' | b'\\' | b'\n' | b'\r' | b'\t' | 0x08 | 0x0c => 2,
+            0x00..=0x1f => 6,
+            _ => 1,
+        })
+        .sum()
+}
+
 const TRUNCATION_MARKER: &str = "[earlier messages truncated]\n\n";
 
 /// What a transcript says, ready to store.
@@ -209,9 +222,12 @@ pub fn capture_transcript(
         None => first_capture(store, session_id, &parsed, request)?,
     };
     // The raw transcript decorates the capture; failing to keep it must not
-    // fail the capture, so it is reported and the capture stands.
+    // fail the capture, so it is reported and the capture stands. It is
+    // scrubbed like the dialog, so the source never returns what the
+    // dialog redacted.
+    let kept = crate::boundary::scrub_jsonl(raw);
     if let Err(e) =
-        crate::archive::store_session(store, session_id, raw.as_bytes(), &outcome.dialog_id)
+        crate::archive::store_session(store, session_id, kept.as_bytes(), &outcome.dialog_id)
     {
         eprintln!("rusty-remind-me: transcript of session {session_id} not archived: {e}");
     }
@@ -330,29 +346,36 @@ fn recapture(
 }
 
 /// Edit a memory's content and metadata, writing a `recapture` revision of
-/// what it held and re-embedding best-effort, as an update does.
+/// what it held and re-embedding best-effort, as an update does. The text
+/// is scrubbed as a first capture's is, so a refresh never stores what a
+/// capture would have redacted.
 fn replace_text(
     store: &Store<'_>,
     memory: &crate::models::Memory,
     content: &str,
     metadata: &serde_json::Value,
 ) -> Result<()> {
+    let mut tags = memory.tags.clone();
+    let mut metadata = metadata.clone();
+    let content = crate::boundary::scrub(content, &mut tags, &mut metadata);
     let tracked = TrackedChanges {
-        content: Some(content.to_string()),
-        metadata_json: Some(serde_json::to_string(metadata).unwrap_or_else(|_| "{}".into())),
+        content: Some(content.clone()),
+        tags_json: Some(serde_json::to_string(&tags).unwrap_or_else(|_| "[]".into())),
+        metadata_json: Some(serde_json::to_string(&metadata).unwrap_or_else(|_| "{}".into())),
         ..TrackedChanges::default()
     };
     capture_revision(store, &memory.id, &tracked, Some("recapture"))?;
     Memories::new(store).apply_edit(
         &memory.id,
         &MemoryEdit {
-            content: Some(content.to_string()),
-            metadata: Some(metadata.clone()),
+            content: Some(content.clone()),
+            tags: Some(tags),
+            metadata: Some(metadata),
             ..MemoryEdit::at(Utc::now().to_rfc3339())
         },
     )?;
     if let Some(embedder) = crate::embedder::available_embedder() {
-        let _ = crate::vectors::embed_and_store(store, &*embedder, &memory.id, content);
+        let _ = crate::vectors::embed_and_store(store, &*embedder, &memory.id, &content);
     }
     Ok(())
 }
@@ -521,5 +544,34 @@ mod tests {
         assert_eq!(dialog.git_branch.as_deref(), Some("main"));
         assert_eq!(dialog.git_sha.as_deref(), Some("abc123"));
         assert_eq!(dialog.cwd.as_deref(), Some("/home/user/rusty_mill"));
+    }
+
+    #[test]
+    fn a_recapture_redacts_as_a_first_capture_does() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        let token = format!("ghp_{}", "a".repeat(36));
+        capture_transcript(&store, &transcript(""), &request("stop")).unwrap();
+
+        let leaked = line("user", "s1", &format!("use {token} to push"));
+        let made = capture_transcript(&store, &transcript(&leaked), &request("stop")).unwrap();
+
+        let memories = crate::episodes::session_memories(&store, "s1").unwrap();
+        let dialog = memories.iter().find(|m| m.id == made.dialog_id).unwrap();
+        assert!(!dialog.content.contains(&token), "{}", dialog.content);
+        assert!(dialog.content.contains("[REDACTED:github_token]"));
+        assert!(dialog.tags.iter().any(|t| t == crate::redact::REDACTED_TAG));
+        assert_eq!(
+            dialog.metadata["redactions"],
+            serde_json::json!(["github_token"])
+        );
+    }
+
+    #[test]
+    fn encoded_len_is_what_json_escaping_costs() {
+        let text = "plain \"quoted\" back\\slash\nline\ttab\u{1}ctl é";
+        let escaped = serde_json::to_string(text).unwrap();
+        assert_eq!(encoded_len(text), escaped.len() - 2);
+        assert_eq!(encoded_len(&"\"".repeat(10)), 20);
     }
 }

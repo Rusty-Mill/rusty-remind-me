@@ -393,7 +393,9 @@ fn capture_transcript_tool(
     args: &Value,
 ) -> Result<remind_me_core::transcript::TranscriptOutcome, String> {
     use remind_me_core::models::WriteContext;
-    use remind_me_core::transcript::{capture_transcript, TranscriptRequest, MAX_TRANSCRIPT_BYTES};
+    use remind_me_core::transcript::{
+        capture_transcript, encoded_len, TranscriptRequest, MAX_TRANSCRIPT_BYTES,
+    };
     let text = |key: &str| {
         args.get(key)
             .and_then(Value::as_str)
@@ -406,10 +408,10 @@ fn capture_transcript_tool(
         .get("transcript")
         .and_then(Value::as_str)
         .ok_or("transcript is required")?;
-    if transcript.len() > MAX_TRANSCRIPT_BYTES {
+    let size = encoded_len(transcript);
+    if size > MAX_TRANSCRIPT_BYTES {
         return Err(format!(
-            "transcript is {} bytes; send at most {MAX_TRANSCRIPT_BYTES}, its tail cut at a line",
-            transcript.len()
+            "transcript is {size} bytes JSON-escaped; send at most {MAX_TRANSCRIPT_BYTES}, its tail cut at a line"
         ));
     }
     let reason = text("reason");
@@ -899,7 +901,7 @@ impl McpServer {
                                     "type": "object",
                                     "properties": {
                                         "session_id": { "type": "string", "minLength": 1, "maxLength": 200 },
-                                        "transcript": { "type": "string", "minLength": 1, "maxLength": 3145728, "description": "The session's JSONL transcript so far; a caller over the limit sends its tail, cut at a line" },
+                                        "transcript": { "type": "string", "minLength": 1, "description": "The session's JSONL transcript so far, at most 3145728 bytes once JSON-escaped (each quote, backslash and newline counts twice); a caller over the limit sends its tail, cut at a line" },
                                         "reason": { "type": "string", "enum": ["stop", "precompact", "end"] },
                                         "project": { "type": "string", "maxLength": 200 },
                                         "git_remote": { "type": "string", "maxLength": 500 },
@@ -3969,6 +3971,34 @@ mod tests {
             let result = call(&server, "remind_me_capture_transcript", args);
             assert_eq!(result["isError"], true, "{result}");
         }
+    }
+
+    #[test]
+    fn capture_transcript_bounds_what_travels_not_what_it_decodes_to() {
+        use remind_me_core::transcript::MAX_TRANSCRIPT_BYTES;
+        let db = Database::open_in_memory().unwrap();
+        let server = McpServer::new(db);
+        // Quote-heavy: under the limit decoded, twice it once escaped.
+        let heavy = "\"".repeat(MAX_TRANSCRIPT_BYTES / 2 + 1);
+        let result = call(
+            &server,
+            "remind_me_capture_transcript",
+            json!({ "session_id": "s", "transcript": heavy }),
+        );
+        assert_eq!(result["isError"], true, "{result}");
+        assert!(text_of(&result).contains("JSON-escaped"), "{result}");
+
+        // The worst transcript the limit admits still fits a 4 MiB body.
+        let at_limit = "\"".repeat(MAX_TRANSCRIPT_BYTES / 2);
+        let body = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "remind_me_capture_transcript", "arguments": {
+                "session_id": "x".repeat(200), "transcript": at_limit, "reason": "precompact",
+                "project": "p".repeat(200), "git_remote": "r".repeat(500),
+                "git_branch": "b".repeat(250), "git_sha": "0".repeat(40), "cwd": "c".repeat(4096),
+            }},
+        });
+        assert!(serde_json::to_vec(&body).unwrap().len() <= 4 * 1024 * 1024);
     }
 
     #[test]
