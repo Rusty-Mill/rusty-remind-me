@@ -532,10 +532,22 @@ mod tests {
         );
         let mut expired = decision("expired", past());
         expired.valid_until = Some("2026-03-01T00:00:00+00:00".into());
+        // 13:00+02:00 is 11:00Z, an hour before NOW, though it sorts after.
+        let mut offset_expired = decision("offset_expired", past());
+        offset_expired.valid_until = Some("2026-10-26T13:00:00+02:00".into());
         let mut dialog = decision("dialog", past());
         dialog.category = crate::models::DIALOG_CATEGORY.into();
         let all = [
-            other, secret, replaced, fact, b, a, pending, expired, dialog,
+            other,
+            secret,
+            replaced,
+            fact,
+            b,
+            a,
+            pending,
+            expired,
+            offset_expired,
+            dialog,
         ];
 
         let ids = |v: Vec<&Memory>| v.iter().map(|m| m.id.clone()).collect::<Vec<_>>();
@@ -867,6 +879,15 @@ mod tests {
             r.metadata = past();
             r.project = Some("quokka".into());
             r.valid_until = Some("2026-03-01T00:00:00+00:00".into());
+        });
+        // Expired an hour before the real now, in a later-looking offset.
+        let offset_expired = (Utc::now() - Duration::hours(1))
+            .with_timezone(&chrono::FixedOffset::east_opt(2 * 3600).unwrap())
+            .to_rfc3339();
+        insert(&store, "offset_expired_here", |r| {
+            r.metadata = past();
+            r.project = Some("quokka".into());
+            r.valid_until = Some(offset_expired);
         });
         insert(&store, "dialog_here", |r| {
             r.metadata = past();

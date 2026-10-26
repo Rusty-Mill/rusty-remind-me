@@ -99,7 +99,20 @@ pub(crate) fn injectable(memory: &Memory, now: &str) -> bool {
         && memory
             .valid_until
             .as_deref()
-            .is_none_or(|until| until > now)
+            .is_none_or(|until| not_yet(until, now))
+}
+
+/// Whether `until` is after `now`, both RFC 3339. Compared as instants: as
+/// text, `13:00+02:00` (11:00Z) sorts after `12:00Z`. Text order is the
+/// fallback only for a value that does not parse.
+fn not_yet(until: &str, now: &str) -> bool {
+    match (
+        chrono::DateTime::parse_from_rfc3339(until),
+        chrono::DateTime::parse_from_rfc3339(now),
+    ) {
+        (Ok(until), Ok(now)) => until > now,
+        _ => until > now,
+    }
 }
 
 /// Filter on `project` with the same rule search and list use (case-insensitive).
@@ -306,6 +319,14 @@ fn assemble(sections: Vec<Section>, request: &ContextRequest<'_>) -> ContextBrie
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expiry_compares_instants_not_text() {
+        let now = "2026-10-26T12:00:00+00:00";
+        assert!(!not_yet("2026-10-26T13:00:00+02:00", now));
+        assert!(not_yet("2026-10-26T15:00:00+02:00", now));
+        assert!(!not_yet("2026-10-26T12:00:00Z", now));
+    }
     use crate::db::memories::NewMemory;
     use crate::db::Database;
 
