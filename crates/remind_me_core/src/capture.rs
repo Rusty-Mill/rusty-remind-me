@@ -69,15 +69,17 @@ pub struct CaptureStamp {
     pub written_by: Option<String>,
     /// Overrides the schema default `manual` when set.
     pub capture_method: Option<String>,
-    /// The context was recorded on another machine (a backfilled
-    /// transcript): the git columns this process supplied are not its own,
-    /// so they are cleared rather than kept where the context has none.
-    pub foreign: bool,
+    /// The context is the whole truth about where the capture was made (a
+    /// caller's own, or a backfilled transcript's): its project, cwd and git
+    /// columns replace this process's, so an unknown stays unknown instead
+    /// of taking the value of wherever the store runs.
+    pub authoritative: bool,
 }
 
 impl CaptureStamp {
     fn apply(&self, row: &mut NewMemory) {
-        if self.foreign {
+        if self.authoritative {
+            (row.project, row.cwd) = (None, None);
             (row.git_remote, row.git_branch, row.git_sha) = (None, None, None);
         }
         self.context.apply(row);

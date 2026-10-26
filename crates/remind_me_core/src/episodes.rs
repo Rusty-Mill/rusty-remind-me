@@ -24,13 +24,8 @@ use std::path::Path;
 pub const WORK_LOG_CATEGORY: &str = "work_log";
 
 /// Short project name for `cwd`: the git top-level directory's basename,
-/// else `cwd`'s own. A `cwd` that is not a directory here was recorded on
-/// another machine (a backfilled transcript), so its last segment is taken
-/// with either separator: to a Unix `Path`, `C:\x\proj` is one segment.
+/// else `cwd`'s own.
 pub fn project_of_cwd(cwd: &Path) -> Option<String> {
-    if !cwd.is_dir() {
-        return foreign_basename(cwd);
-    }
     let top = worklog::git(cwd, &["rev-parse", "--show-toplevel"]);
     let dir = top.as_deref().map(Path::new).unwrap_or(cwd);
     dir.file_name()
@@ -39,25 +34,17 @@ pub fn project_of_cwd(cwd: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
-fn foreign_basename(cwd: &Path) -> Option<String> {
-    cwd.to_str()?
-        .rsplit(['/', '\\'])
-        .find(|segment| !segment.is_empty())
-        .map(str::to_string)
-}
-
 /// Everything a write made from `cwd` should be stamped with. Git fields are
 /// `None` outside a repository. `git_remote` is left to the caller that
 /// normalises remotes.
 pub fn write_context(cwd: &Path, session_id: Option<&str>) -> WriteContext {
-    // Git is not asked about a directory that is not here.
-    let git = |args: &[&str]| cwd.is_dir().then(|| worklog::git(cwd, args)).flatten();
+    let branch = worklog::git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]);
     WriteContext {
         project: project_of_cwd(cwd),
         session_id: session_id.map(str::to_string),
         git_remote: None,
-        git_branch: git(&["rev-parse", "--abbrev-ref", "HEAD"]),
-        git_sha: git(&["rev-parse", "HEAD"]),
+        git_branch: branch,
+        git_sha: worklog::git(cwd, &["rev-parse", "HEAD"]),
         cwd: Some(cwd.display().to_string()),
     }
 }
@@ -332,19 +319,6 @@ mod tests {
     use super::*;
     use crate::db::Database;
     use std::path::PathBuf;
-
-    #[test]
-    fn a_cwd_from_another_machine_names_its_last_segment_and_skips_git() {
-        let windows = Path::new(r"C:\Users\nano\code\quokka\");
-        assert_eq!(project_of_cwd(windows).as_deref(), Some("quokka"));
-        assert_eq!(
-            project_of_cwd(Path::new("/gone/wombat")).as_deref(),
-            Some("wombat")
-        );
-        let context = write_context(windows, Some("s1"));
-        assert_eq!(context.project.as_deref(), Some("quokka"));
-        assert_eq!((context.git_branch, context.git_sha), (None, None));
-    }
 
     fn temp_repo() -> Option<PathBuf> {
         let dir =
