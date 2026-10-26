@@ -24,6 +24,10 @@ const RESUME_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 /// The largest request body accepted, MCP or OAuth.
 const MAX_BODY_BYTES: u64 = 4 * 1024 * 1024;
 
+// A transcript at its limit must leave room for the JSON-RPC envelope.
+const _: () =
+    assert!(remind_me_core::transcript::MAX_TRANSCRIPT_BYTES as u64 + 512 * 1024 <= MAX_BODY_BYTES);
+
 /// Why [`build_router`] failed.
 #[derive(Debug, thiserror::Error)]
 pub enum BuildError {

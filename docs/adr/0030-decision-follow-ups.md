@@ -1,4 +1,4 @@
-# ADR-0027: Decisions get a follow-up review, stored in their metadata
+# ADR-0030: Decisions get a follow-up review, stored in their metadata
 
 Status: Accepted (2026-10-26); implemented
 Date: 2026-10-26

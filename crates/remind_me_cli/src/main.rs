@@ -888,6 +888,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     },
                     include_dormant: false,
                     min_vitality: 0.0,
+                    detail: Default::default(),
                     verbose: false,
                     expand_entities: false,
                     include_neighbors: false,

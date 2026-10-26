@@ -296,6 +296,10 @@ pub fn decompose(store: &Store<'_>, input: &DecomposeInput) -> Result<Option<Dec
     let Some(parent_tags) = parent_tags else {
         return Ok(None);
     };
+    // Before any fact is written, so a refused batch leaves nothing behind.
+    for fact in &input.facts {
+        crate::project::refuse_reserved_predicate(fact.predicate.as_deref())?;
+    }
 
     let now = Utc::now();
     let now_iso = now.to_rfc3339();
