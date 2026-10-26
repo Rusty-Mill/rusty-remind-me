@@ -79,6 +79,9 @@ fn search(store: &Store<'_>, scope: ScopeFilter) -> Vec<String> {
     let input = MemorySearchInput {
         query: "quokka".into(),
         scope,
+        // The fixture is dated (NOW); the default vitality floor decays it
+        // against the real clock. These tests are about scope, not decay.
+        include_dormant: true,
         ..Default::default()
     };
     let mut got: Vec<String> = queries::search_memories_with_embedder(store, &input, None)

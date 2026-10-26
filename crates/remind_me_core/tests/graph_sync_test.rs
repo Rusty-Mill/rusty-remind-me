@@ -93,7 +93,7 @@ fn a_newer_incoming_entity_wins_and_aliases_still_union_merge() {
         "bailey",
         Some("person"),
         &["Bails"],
-        "2030-01-01T00:00:00+00:00",
+        "2099-01-01T00:00:00+00:00",
     );
     upsert_entity_record(&store, &incoming).unwrap();
 
@@ -129,7 +129,7 @@ fn an_older_incoming_entity_loses_the_rename_but_still_merges_its_alias() {
             &local.id,
             local.kind.as_deref(),
             &local.aliases,
-            "2030-03-01T00:00:00+00:00",
+            "2099-03-01T00:00:00+00:00",
         )
         .unwrap();
     let (_, _, _, updated_before) = entity_row(&store, &entity_id("Bailey")).unwrap();
@@ -212,7 +212,7 @@ fn winning_an_existing_entity_does_not_touch_created_at() {
         .unwrap()
         .created_at;
 
-    let mut incoming = entity_record("bailey", None, &[], "2030-01-01T00:00:00+00:00");
+    let mut incoming = entity_record("bailey", None, &[], "2099-01-01T00:00:00+00:00");
     incoming.created_at = "1999-01-01T00:00:00+00:00".to_string();
     upsert_entity_record(&store, &incoming).unwrap();
 

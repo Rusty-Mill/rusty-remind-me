@@ -94,7 +94,7 @@ fn a_strictly_newer_incoming_record_wins_and_replaces_content() {
     let store = db.store();
     let id = add(&store, "local content");
 
-    let mut incoming = record(&id, "remote content", "2030-01-01T00:00:00+00:00");
+    let mut incoming = record(&id, "remote content", "2099-01-01T00:00:00+00:00");
     incoming.tags = vec!["remote-tag".to_string()];
 
     let outcome = upsert_record(&store, &incoming).unwrap();
@@ -124,7 +124,7 @@ fn tags_union_merge_regardless_of_which_side_wins() {
     )
     .unwrap();
 
-    let mut incoming = record(&id, "remote content", "2030-01-01T00:00:00+00:00");
+    let mut incoming = record(&id, "remote content", "2099-01-01T00:00:00+00:00");
     incoming.tags = vec!["remote-tag".to_string()];
     upsert_record(&store, &incoming).unwrap();
 
@@ -141,7 +141,7 @@ fn an_older_incoming_record_loses_but_its_tag_still_merges_in() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
     let id = add(&store, "local content");
-    testing::set_memory_column(&store, &id, "updated_at", "2030-01-01T00:00:00+00:00").unwrap();
+    testing::set_memory_column(&store, &id, "updated_at", "2099-01-01T00:00:00+00:00").unwrap();
     let (_, _, _, updated_before) = memory_row(&store, &id);
 
     let mut incoming = record(&id, "older remote content", "2020-01-01T00:00:00+00:00");
@@ -197,7 +197,7 @@ fn metadata_shallow_merge_the_winner_takes_a_conflicting_key() {
     )
     .unwrap();
 
-    let mut incoming = record(&id, "remote content", "2030-01-01T00:00:00+00:00");
+    let mut incoming = record(&id, "remote content", "2099-01-01T00:00:00+00:00");
     incoming.metadata = json!({"shared": "remote-value", "remote_only": "kept"});
     upsert_record(&store, &incoming).unwrap();
 
@@ -213,7 +213,7 @@ fn metadata_merge_when_incoming_loses_keeps_the_local_value_on_the_shared_key() 
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
     let id = add(&store, "local content");
-    testing::set_memory_column(&store, &id, "updated_at", "2030-01-01T00:00:00+00:00").unwrap();
+    testing::set_memory_column(&store, &id, "updated_at", "2099-01-01T00:00:00+00:00").unwrap();
     testing::set_memory_column(&store, &id, "metadata", r#"{"shared":"local-value"}"#).unwrap();
 
     let mut incoming = record(&id, "older remote content", "2020-01-01T00:00:00+00:00");
@@ -265,7 +265,7 @@ fn winning_an_existing_row_does_not_touch_created_at() {
         .unwrap()
         .unwrap();
 
-    let mut incoming = record(&id, "remote content", "2030-01-01T00:00:00+00:00");
+    let mut incoming = record(&id, "remote content", "2099-01-01T00:00:00+00:00");
     incoming.created_at = "1999-01-01T00:00:00+00:00".to_string();
     upsert_record(&store, &incoming).unwrap();
 
@@ -319,7 +319,7 @@ fn an_incoming_record_is_not_queued_and_local_edits_stay_queued() {
         "add + the local edit both queued"
     );
 
-    let incoming = record(&id, "remote content", "2030-01-01T00:00:00+00:00");
+    let incoming = record(&id, "remote content", "2099-01-01T00:00:00+00:00");
     upsert_record(&store, &incoming).unwrap();
 
     // The applied record is never queued, so there is no echo to mark sent;
