@@ -631,7 +631,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_search",
-                                "description": "Search memories using FTS5 keyword & hybrid ranking. The three expansion flags surface adjacent memories in their own sections, outside the ranked results, so they never consume `limit`.",
+                                "description": "Search memories using FTS5 keyword & hybrid ranking. tags, entity, repo and the project/branch/session/writer filters narrow the ranked results before the limit applies. The three expansion flags surface adjacent memories in their own sections, outside the ranked results, so they never consume `limit`.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -639,6 +639,10 @@ impl McpServer {
                                         "query": { "type": "string" },
                                         "limit": { "type": "integer", "default": 20 },
                                         "category": { "type": "string" },
+                                        "tags": { "type": "array", "items": { "type": "string" }, "description": "Only memories carrying these tags (see tag_mode)" },
+                                        "tag_mode": { "type": "string", "enum": ["all", "any"], "default": "all", "description": "all: every tag must be present; any: at least one" },
+                                        "entity": { "type": "string", "description": "Only memories about this entity, by name or alias: linked to it, or naming it as subject or object. An unknown entity matches nothing." },
+                                        "repo": { "type": "string", "description": "Only memories written in this git repository (origin remote, any URL form, e.g. github.com/owner/repo)" },
                                         "project": { "type": "string", "description": "Only memories written in this project (case-insensitive)" },
                                         "branch": { "type": "string", "description": "Only memories written on this git branch" },
                                         "session_id": { "type": "string", "description": "Only memories written in this client session" },
@@ -5585,6 +5589,41 @@ mod structure_tests {
             true
         );
         assert!(search["inputSchema"]["properties"]["min_confidence"].is_object());
+    }
+
+    #[test]
+    fn search_narrows_by_tags_and_advertises_its_filters() {
+        let s = server();
+        let props = &tool(&s, "remind_me_search")["inputSchema"]["properties"];
+        for field in ["tags", "tag_mode", "entity", "repo"] {
+            assert!(props[field].is_object(), "search should advertise {field}");
+        }
+        call(
+            &s,
+            "remind_me_add",
+            json!({ "content": "mux pane layout", "tags": ["mux"] }),
+        );
+        call(
+            &s,
+            "remind_me_add",
+            json!({ "content": "mux in the terminal", "tags": ["term"] }),
+        );
+
+        let found = call(
+            &s,
+            "remind_me_search",
+            json!({ "query": "mux", "tags": ["mux"], "response_format": "json" }),
+        );
+        let md = text(&found);
+        assert!(md.contains("mux pane layout"), "{md}");
+        assert!(!md.contains("mux in the terminal"), "{md}");
+
+        let bad = call(
+            &s,
+            "remind_me_search",
+            json!({ "query": "mux", "tag_mode": "some" }),
+        );
+        assert!(is_error(&bad), "{bad}");
     }
 
     #[test]

@@ -371,6 +371,38 @@ pub struct MemorySearchInput {
     /// Drop memories below this `confidence`. `0.0` keeps everything.
     #[serde(default)]
     pub min_confidence: f64,
+    /// How `tags` combine, and narrowing by entity or repository.
+    #[serde(default, flatten)]
+    pub filters: SearchFilters,
+}
+
+/// How a search's `tags` combine.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TagMatch {
+    /// A memory must carry every tag, as `remind_me_list` requires.
+    #[default]
+    All,
+    /// A memory must carry at least one tag.
+    Any,
+}
+
+/// Content filters on a ranked search, beside [`MemorySearchInput::tags`].
+///
+/// Blank strings are treated as unset, as [`crate::context::ScopeFilter`]
+/// treats them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchFilters {
+    #[serde(default)]
+    pub tag_mode: TagMatch,
+    /// Only memories linked to this entity, named or aliased, or whose
+    /// subject or object is it. An unknown entity matches nothing.
+    #[serde(default)]
+    pub entity: Option<String>,
+    /// Only memories written in this repository: a `git_remote` in any form
+    /// `git` accepts, compared after [`crate::context::normalize_remote`].
+    #[serde(default)]
+    pub repo: Option<String>,
 }
 
 fn default_include_expired() -> bool {
@@ -401,6 +433,7 @@ impl Default for MemorySearchInput {
             scope: Default::default(),
             include_expired: true,
             min_confidence: 0.0,
+            filters: SearchFilters::default(),
         }
     }
 }

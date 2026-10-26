@@ -1,6 +1,7 @@
 use super::{Result, Store, StoreError};
 use crate::db::memories::{
-    EntityScope, KeywordFilter, ListFilter, Memories, MemoryEdit, NewMemory, PageFilter,
+    EntityMembers, EntityScope, KeywordFilter, ListFilter, Memories, MemoryEdit, Narrowing,
+    NewMemory, PageFilter,
 };
 use crate::expansion::{self, MemorySearchResponse};
 use crate::kinds::StructuredFields;
@@ -617,12 +618,17 @@ pub fn search_memories_deadlined(
     // syntax error rather than a search. No phrases means nothing was
     // searchable.
     let phrases = crate::fts::query_phrases(&input.query);
-    if phrases.is_empty() {
-        let mut outcome = trim_by_token_budget(Vec::new(), input.token_budget);
-        timing.elapsed_ms = deadline.elapsed_ms();
-        outcome.timing = timing;
-        return Ok(outcome);
-    }
+    // An entity the store has never seen matches nothing: an empty result,
+    // not an error, as `search_paginated` answers it.
+    let narrowing = match resolve_narrowing(store, input)? {
+        Some(narrowing) if !phrases.is_empty() => narrowing,
+        _ => {
+            let mut outcome = trim_by_token_budget(Vec::new(), input.token_budget);
+            timing.elapsed_ms = deadline.elapsed_ms();
+            outcome.timing = timing;
+            return Ok(outcome);
+        }
+    };
 
     // Dormancy is filtered on *effective* vitality, inside the query and before
     // its limit: the stored column never decays, and thinning a page after the
@@ -640,6 +646,7 @@ pub fn search_memories_deadlined(
         category: input.category.clone(),
         include_sensitive: input.include_sensitive,
         scope: input.scope.clone(),
+        narrowing: narrowing.clone(),
     };
 
     // `RrfFusion::Score` mode needs the raw BM25 magnitude alongside each hit.
@@ -700,11 +707,10 @@ pub fn search_memories_deadlined(
             // rank into the output. Done here rather than by threading a
             // parameter through `semantic_search_scored`, which would change an
             // existing public signature.
-            // Same reason for the project/branch/session/writer scope.
-            if !input.scope.is_empty() {
-                memories.retain(|m| input.scope.matches_memory(m));
-                similarity.retain(|id, _| memories.iter().any(|m| &m.id == id));
-            }
+            // Same reason for the project/branch/session/writer scope and
+            // the tag/entity/repo narrowing.
+            memories.retain(|m| input.scope.matches_memory(m) && narrowing.admits(m));
+            similarity.retain(|id, _| memories.iter().any(|m| &m.id == id));
             if !input.include_sensitive {
                 let hidden = memories_repo.sensitive_ids()?;
                 memories.retain(|m| !hidden.contains(&m.id));
@@ -775,6 +781,41 @@ pub fn search_memories_deadlined(
     timing.elapsed_ms = deadline.elapsed_ms();
     outcome.timing = timing;
     Ok(outcome)
+}
+
+/// `input`'s tag, entity and repo filters, resolved against the store.
+/// `None` when the entity names nothing this store knows, so no memory can
+/// match. Blank values are unset.
+fn resolve_narrowing(store: &Store<'_>, input: &MemorySearchInput) -> Result<Option<Narrowing>> {
+    fn clean(v: &Option<String>) -> Option<&str> {
+        v.as_deref().map(str::trim).filter(|v| !v.is_empty())
+    }
+    let entity = match clean(&input.filters.entity) {
+        None => None,
+        Some(name) => {
+            let Some(entity) = crate::entity::resolve_entity(store, name)? else {
+                return Ok(None);
+            };
+            Some(EntityMembers {
+                canonical: crate::entity::normalize_entity_name(&entity.name),
+                linked: Memories::new(store).linked_ids(&entity.id)?,
+            })
+        }
+    };
+    let tags = input
+        .tags
+        .iter()
+        .flatten()
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect();
+    Ok(Some(Narrowing {
+        tags,
+        tag_match: input.filters.tag_mode,
+        entity,
+        repo: clean(&input.filters.repo).and_then(crate::context::normalize_remote),
+    }))
 }
 
 /// Paginated full-text search behind `GET /api/memories/search`.

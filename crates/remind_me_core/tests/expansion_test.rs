@@ -76,6 +76,7 @@ fn search(
         bootstrap: false,
         include_expired: true,
         min_confidence: 0.0,
+        filters: Default::default(),
     };
     configure(&mut input);
     queries::search_with_expansions(store, &input).unwrap()

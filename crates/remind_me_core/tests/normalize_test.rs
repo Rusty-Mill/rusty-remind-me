@@ -484,6 +484,7 @@ fn the_distillation_is_searchable() {
             bootstrap: false,
             include_expired: true,
             min_confidence: 0.0,
+            filters: Default::default(),
         },
     )
     .unwrap();

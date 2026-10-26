@@ -1184,6 +1184,7 @@ pub(crate) fn keyword_hits(
         .filter(|(row, _)| filter.category.as_ref().is_none_or(|c| &row.category == c))
         .filter(|(row, _)| row.in_scope(&filter.scope))
         .map(|(row, score)| (row.to_memory(), score))
+        .filter(|(memory, _)| filter.narrowing.admits(memory))
         .filter(|(memory, _)| {
             filter
                 .min_effective_vitality

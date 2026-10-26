@@ -99,6 +99,7 @@ fn input(query: &str) -> MemorySearchInput {
         bootstrap: false,
         include_expired: true,
         min_confidence: 0.0,
+        filters: Default::default(),
     }
 }
 

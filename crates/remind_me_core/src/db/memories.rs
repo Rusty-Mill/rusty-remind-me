@@ -230,6 +230,66 @@ pub struct KeywordFilter {
     pub category: Option<String>,
     pub include_sensitive: bool,
     pub scope: crate::context::ScopeFilter,
+    pub narrowing: Narrowing,
+}
+
+/// A search's tag, entity and repository filters, resolved against the store.
+///
+/// The default admits every memory.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Narrowing {
+    pub tags: Vec<String>,
+    pub tag_match: crate::models::TagMatch,
+    pub entity: Option<EntityMembers>,
+    /// Normalized with [`crate::context::normalize_remote`].
+    pub repo: Option<String>,
+}
+
+/// The memories an entity covers: linked to it, or naming it as subject or
+/// object.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntityMembers {
+    /// The entity's normalized name.
+    pub canonical: String,
+    /// Ids of the memories linked to it.
+    pub linked: HashSet<String>,
+}
+
+impl Narrowing {
+    /// Whether `memory` passes every set filter.
+    pub fn admits(&self, memory: &Memory) -> bool {
+        self.admits_tags(&memory.tags)
+            && self.entity.as_ref().is_none_or(|e| e.covers(memory))
+            && self.repo.as_deref().is_none_or(|want| {
+                memory
+                    .git_remote
+                    .as_deref()
+                    .and_then(crate::context::normalize_remote)
+                    .is_some_and(|got| got.eq_ignore_ascii_case(want))
+            })
+    }
+
+    fn admits_tags(&self, tags: &[String]) -> bool {
+        if self.tags.is_empty() {
+            return true;
+        }
+        let has = |t: &String| tags.contains(t);
+        match self.tag_match {
+            crate::models::TagMatch::All => self.tags.iter().all(has),
+            crate::models::TagMatch::Any => self.tags.iter().any(has),
+        }
+    }
+}
+
+impl EntityMembers {
+    fn covers(&self, memory: &Memory) -> bool {
+        // `lower()` folds ASCII only, as `keyword_page` compares.
+        let names = |v: &Option<String>| {
+            v.as_ref()
+                .is_some_and(|v| v.to_ascii_lowercase() == self.canonical)
+        };
+        self.linked.contains(&memory.id) || names(&memory.subject) || names(&memory.object)
+    }
 }
 
 /// Which live, unsuperseded memories a paged search takes.
@@ -504,6 +564,11 @@ impl<'c> Memories<'c> {
             return Ok(Vec::new());
         }
         engine::memories::keyword_hits(&self.core.lock(), phrases, filter, limit)
+    }
+
+    /// The ids of the memories linked to entity `entity_id`.
+    pub fn linked_ids(&self, entity_id: &str) -> Result<HashSet<String>> {
+        engine::graph::linked_ids(&self.core.lock(), entity_id)
     }
 
     /// The ids of every memory marked sensitive.
@@ -1214,6 +1279,7 @@ mod tests {
                 min_effective_vitality: Some(crate::vitality::VITALITY_FLOOR),
                 category: text("fact"),
                 include_sensitive: true,
+                narrowing: Default::default(),
             },
         ];
         for query in queries {
