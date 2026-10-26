@@ -37,8 +37,9 @@ pub const VALID_PROFILES: [&str; 3] = ["full", "standard", "core"];
 /// `remind_me_server_status` is here deliberately despite otherwise being an
 /// ops tool — it is what *reports which profile is active*, and a profile you
 /// cannot diagnose from inside a session is a trap.
-pub const CORE: [&str; 19] = [
+pub const CORE: [&str; 20] = [
     "remind_me_search",
+    "remind_me_brief",
     "remind_me_add",
     "remind_me_get",
     "remind_me_list",

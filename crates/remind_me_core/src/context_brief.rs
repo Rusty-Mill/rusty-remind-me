@@ -1,283 +1,761 @@
-//! The brief a session starts with: what is worth knowing before the first
-//! prompt, within a character budget.
+//! The brief: what is worth knowing about a project, within a token budget.
 //!
-//! Five sections, in this order, each omitted when empty:
-//! 1. persona (the durable statements the refinement ladder promoted),
-//! 2. reminders due within a week (overdue ones included),
-//! 3. open action items for the project,
-//! 4. the project's most recent memories, the current branch's first,
-//! 5. the best matches for the user's prompt, when one is given.
+//! One builder, three callers, one [`Mode`] each:
 //!
-//! Trimming happens at section boundaries: a section that does not fit the
-//! remaining budget is dropped whole and named in `dropped`, never cut
-//! mid-line, so what the model reads is always complete statements. Earlier
-//! sections have priority because they are the more durable.
+//! - [`Mode::Session`]: the SessionStart hook. Persona and reminders due
+//!   within a week, then the project's sections. An unknown project leaves
+//!   the project sections empty: the hook names whatever directory it is in.
+//! - [`Mode::Project`]: `remind_me_brief`, `GET /api/brief` and
+//!   `rusty-remind-me brief`. The project's sections only. An unknown project
+//!   is refused with the closest known names, never guessed.
+//! - [`Mode::Prompt`]: the per-prompt hook. Only the best matches for the
+//!   prompt, so it does not repeat the session's brief.
+//!
+//! The project's sections, in priority order:
+//!
+//! 1. **state**: the newest session summaries. Not windowed, so a dormant
+//!    project still has a state.
+//! 2. **open**: blockers raised in the window, then decisions and action
+//!    items with no outcome. Open is open, so those two are not windowed.
+//! 3. **activity**: everything else in the window, newest first, the current
+//!    branch's first.
+//!
+//! # Scope
+//!
+//! A project name resolves through the entity graph, so an alias finds its
+//! entity. A memory is in scope when it is linked to that entity, or when one
+//! of the names (input, canonical, aliases) equals its `project`, the
+//! repository of its `git_remote`, one of its tags, or its subject or object.
+//! Every comparison is on [`normalize_entity_name`].
+//!
+//! # Budget
+//!
+//! Tokens, estimated with [`estimated_content_tokens`], the estimator search
+//! trims with. Each section is allotted a share of what is left by weight, so
+//! what one section leaves unused rolls forward. Items are dropped whole,
+//! never cut, and counted in `omitted`.
 
+use crate::db::entities::Entities;
 use crate::db::memories::Memories;
-use crate::db::{Result, Store};
+use crate::db::{Result, Store, StoreError};
+use crate::entity::{normalize_entity_name, resolve_entity};
 use crate::models::{Memory, MemorySearchInput, ReminderWindow};
-use chrono::{Duration, Utc};
+use crate::retrieval::estimated_content_tokens;
+use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
+use std::collections::{BTreeSet, HashSet};
 
-/// Recent memories listed.
-pub const RECENT_LIMIT: usize = 8;
-/// Open action items listed.
-pub const ACTION_LIMIT: usize = 8;
-/// Prompt hits listed.
-pub const HIT_LIMIT: usize = 5;
-/// Persona statements listed.
-pub const PERSONA_LIMIT: usize = 10;
+/// The window when none is given.
+pub const DEFAULT_SINCE: &str = "7d";
+/// The longest window accepted.
+pub const MAX_WINDOW_DAYS: i64 = 365;
+/// `remind_me_brief`'s budget when none is given, and the accepted range.
+pub const DEFAULT_TOKEN_BUDGET: usize = 1500;
+pub const MIN_TOKEN_BUDGET: usize = 200;
+pub const MAX_TOKEN_BUDGET: usize = 8000;
 /// Days ahead a reminder counts as due.
 pub const REMINDER_DAYS: i64 = 7;
-/// A memory line is cut to this many characters.
-const LINE_CHARS: usize = 240;
+
+const PERSONA_LIMIT: usize = 10;
+const STATE_LIMIT: usize = 3;
+const OPEN_LIMIT: usize = 15;
+const ACTIVITY_LIMIT: usize = 20;
+const HIT_LIMIT: usize = 5;
+const SUGGESTION_LIMIT: usize = 5;
+/// An item's text is its first line, cut to this many characters.
+const TEXT_CHARS: usize = 240;
+/// Tokens an item costs beyond its text: id, type and timestamp.
+const ITEM_OVERHEAD: usize = 8;
+/// Tokens a section's heading costs.
+const HEADING_COST: usize = 4;
+
+/// Which caller the brief is for. See the module docs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Mode {
+    #[default]
+    Session,
+    Project,
+    Prompt,
+}
 
 /// What to build a brief for.
 #[derive(Debug, Clone, Default)]
 pub struct ContextRequest<'a> {
+    pub mode: Mode,
+    /// A project or entity name, or an alias. `None` (Session only) is every
+    /// project.
     pub project: Option<&'a str>,
     pub branch: Option<&'a str>,
     pub prompt: Option<&'a str>,
-    /// Characters; `0` means unlimited.
+    /// `7d`, `12h` or RFC 3339; `None` is [`DEFAULT_SINCE`].
+    pub since: Option<&'a str>,
+    /// Tokens; `0` means unlimited.
     pub budget: usize,
-    /// Only the memories related to `prompt`, none of the standing sections:
-    /// for a per-prompt hook that must not repeat the session's brief.
-    pub hits_only: bool,
 }
 
-/// How many items each section held (0 when it was empty or dropped).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-pub struct SectionCounts {
-    pub persona: usize,
-    pub reminders: usize,
-    pub action_items: usize,
-    pub recent: usize,
-    pub hits: usize,
+/// One memory, as the brief shows it. Drill down with `remind_me_get(id)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Item {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub text: String,
+    /// When it was written; for a reminder, when it is due.
+    pub at: String,
 }
 
-/// The rendered brief.
 #[derive(Debug, Clone, Serialize)]
-pub struct ContextBrief {
-    pub context: String,
-    pub sections: SectionCounts,
-    /// Sections that did not fit the budget.
-    pub dropped: Vec<&'static str>,
+pub struct Section {
+    pub name: &'static str,
+    pub items: Vec<Item>,
+    /// Items that did not fit the budget.
+    pub omitted: usize,
 }
 
-struct Section {
-    name: &'static str,
-    heading: &'static str,
-    lines: Vec<String>,
+/// The project a name resolved to, and what matched it.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectMatch {
+    pub name: String,
+    pub entity_id: Option<String>,
+    pub aliases: Vec<String>,
+    /// Sorted: `alias`, `entity`, `git_remote`, `project`, `tag`.
+    pub matched_by: Vec<&'static str>,
 }
 
-impl Section {
-    fn render(&self) -> String {
-        format!("## {}\n{}\n", self.heading, self.lines.join("\n"))
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Budget {
+    /// `0` means unlimited.
+    pub limit: usize,
+    pub used: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Brief {
+    pub project: Option<ProjectMatch>,
+    /// Start of the window, RFC 3339.
+    pub since: String,
+    pub sections: Vec<Section>,
+    pub budget: Budget,
+    #[serde(skip)]
+    pub mode: Mode,
+    #[serde(skip)]
+    pub branch: Option<String>,
+}
+
+/// What [`build`] produced.
+#[derive(Debug, Clone)]
+pub enum Outcome {
+    Brief(Brief),
+    /// [`Mode::Project`] only: nothing is known by that name.
+    UnknownProject {
+        name: String,
+        suggestions: Vec<String>,
+    },
+}
+
+/// Parse a window start: `<n>d`, `<n>h` or RFC 3339, at most
+/// [`MAX_WINDOW_DAYS`] back and not in the future.
+pub fn parse_since(raw: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>> {
+    let raw = raw.trim();
+    let invalid = || {
+        StoreError::Invalid(format!(
+            "`since` must be like `7d`, `12h` or an RFC 3339 time, at most {MAX_WINDOW_DAYS} days back; got {raw:?}"
+        ))
+    };
+    let relative = |unit: fn(i64) -> Option<Duration>, n: &str| {
+        n.parse::<i64>()
+            .ok()
+            .filter(|n| *n > 0)
+            .and_then(unit)
+            .and_then(|span| now.checked_sub_signed(span))
+    };
+    let start = if let Some(n) = raw.strip_suffix('d') {
+        relative(Duration::try_days, n)
+    } else if let Some(n) = raw.strip_suffix('h') {
+        relative(Duration::try_hours, n)
+    } else {
+        DateTime::parse_from_rfc3339(raw)
+            .ok()
+            .map(|t| t.with_timezone(&Utc))
+    }
+    .ok_or_else(invalid)?;
+    if start > now || now - start > Duration::days(MAX_WINDOW_DAYS) {
+        return Err(invalid());
+    }
+    Ok(start)
+}
+
+/// What to tell a caller who named an unknown project: the closest known
+/// names to send instead, or how to find one.
+pub fn unknown_project_message(name: &str, suggestions: &[String]) -> String {
+    if suggestions.is_empty() {
+        format!("no project or entity named {name:?}; find its name with remind_me_search")
+    } else {
+        format!(
+            "no project or entity named {name:?}; did you mean: {}?",
+            suggestions.join(", ")
+        )
     }
 }
 
-fn line_of(memory: &Memory) -> String {
-    let first = memory
-        .content
+/// Check a [`Mode::Project`] budget is in range.
+pub fn check_token_budget(budget: usize) -> Result<()> {
+    if (MIN_TOKEN_BUDGET..=MAX_TOKEN_BUDGET).contains(&budget) {
+        return Ok(());
+    }
+    Err(StoreError::Invalid(format!(
+        "`token_budget` must be between {MIN_TOKEN_BUDGET} and {MAX_TOKEN_BUDGET}; got {budget}"
+    )))
+}
+
+/// Build the brief for `request`.
+pub fn build(store: &Store<'_>, request: &ContextRequest<'_>) -> Result<Outcome> {
+    let now = Utc::now();
+    let since = parse_since(request.since.unwrap_or(DEFAULT_SINCE), now)?;
+    let mut brief = Brief {
+        project: None,
+        since: since.to_rfc3339(),
+        sections: Vec::new(),
+        budget: Budget {
+            limit: request.budget,
+            used: 0,
+        },
+        mode: request.mode,
+        branch: request.branch.map(str::to_string),
+    };
+    let prompt = request.prompt.map(str::trim).filter(|p| !p.is_empty());
+    if request.mode == Mode::Prompt {
+        let drafts = match prompt {
+            Some(prompt) => vec![hits_draft(store, prompt, now)?],
+            None => Vec::new(),
+        };
+        fit(&mut brief, drafts);
+        return Ok(Outcome::Brief(brief));
+    }
+
+    let memories = Memories::new(store).all_live()?;
+    let scope = match request.project.map(str::trim).filter(|p| !p.is_empty()) {
+        None => Scope::everything(),
+        Some(name) => match resolve_scope(store, name, &memories)? {
+            Some(scope) => scope,
+            None if request.mode == Mode::Project => {
+                return Ok(Outcome::UnknownProject {
+                    name: name.to_string(),
+                    suggestions: suggestions(store, name, &memories)?,
+                });
+            }
+            None => Scope::nothing(),
+        },
+    };
+
+    let in_scope: Vec<&Memory> = memories
+        .iter()
+        .filter(|m| injectable(m, now) && scope.admits(m))
+        .collect();
+    brief.project = scope.project_match(&in_scope);
+
+    let mut drafts = Vec::new();
+    if request.mode == Mode::Session {
+        drafts.push(persona_draft(store)?);
+        drafts.push(reminders_draft(store, now)?);
+    }
+    drafts.extend(project_drafts(&in_scope, since, request.branch));
+    if request.mode == Mode::Session {
+        if let Some(prompt) = prompt {
+            drafts.push(hits_draft(store, prompt, now)?);
+        }
+    }
+    fit(&mut brief, drafts);
+    Ok(Outcome::Brief(brief))
+}
+
+// -- scope --------------------------------------------------------------------
+
+/// The memories a project name covers.
+struct Scope {
+    /// `None` admits everything.
+    names: Option<HashSet<String>>,
+    linked: HashSet<String>,
+    project: Option<ProjectMatch>,
+}
+
+impl Scope {
+    fn everything() -> Self {
+        Self {
+            names: None,
+            linked: HashSet::new(),
+            project: None,
+        }
+    }
+
+    fn nothing() -> Self {
+        Self {
+            names: Some(HashSet::new()),
+            linked: HashSet::new(),
+            project: None,
+        }
+    }
+
+    /// Why `memory` is in scope, or `None` when it is not.
+    fn reason(&self, memory: &Memory) -> Option<&'static str> {
+        let names = self.names.as_ref()?;
+        let has = |v: Option<&str>| v.is_some_and(|v| names.contains(&normalize_entity_name(v)));
+        if self.linked.contains(&memory.id) {
+            Some("entity")
+        } else if has(memory.project.as_deref()) {
+            Some("project")
+        } else if has(memory.git_remote.as_deref().and_then(repo_of)) {
+            Some("git_remote")
+        } else if memory.tags.iter().any(|t| has(Some(t.as_str()))) {
+            Some("tag")
+        } else if has(memory.subject.as_deref()) || has(memory.object.as_deref()) {
+            Some("entity")
+        } else {
+            None
+        }
+    }
+
+    fn admits(&self, memory: &Memory) -> bool {
+        self.names.is_none() || self.reason(memory).is_some()
+    }
+
+    fn project_match(&self, in_scope: &[&Memory]) -> Option<ProjectMatch> {
+        let mut project = self.project.clone()?;
+        let mut by: BTreeSet<&'static str> = project.matched_by.iter().copied().collect();
+        by.extend(in_scope.iter().filter_map(|m| self.reason(m)));
+        project.matched_by = by.into_iter().collect();
+        Some(project)
+    }
+}
+
+/// The repository segment of a normalised remote (`host/owner/repo`).
+fn repo_of(remote: &str) -> Option<&str> {
+    remote.rsplit('/').next().filter(|r| !r.is_empty())
+}
+
+/// Resolve `name` to a scope, or `None` when no entity and no memory knows it.
+fn resolve_scope(store: &Store<'_>, name: &str, memories: &[Memory]) -> Result<Option<Scope>> {
+    let wanted = normalize_entity_name(name);
+    let entity = resolve_entity(store, name)?;
+    let mut names = HashSet::from([wanted.clone()]);
+    let mut linked = HashSet::new();
+    let mut matched_by = Vec::new();
+    let project = match &entity {
+        Some(entity) => {
+            names.insert(normalize_entity_name(&entity.name));
+            names.extend(entity.aliases.iter().map(|a| normalize_entity_name(a)));
+            linked.extend(
+                Entities::new(store)
+                    .linked_memories(&entity.id, usize::MAX)?
+                    .into_iter()
+                    .map(|m| m.id),
+            );
+            if normalize_entity_name(&entity.name) != wanted {
+                matched_by.push("alias");
+            }
+            ProjectMatch {
+                name: entity.name.clone(),
+                entity_id: Some(entity.id.clone()),
+                aliases: entity.aliases.clone(),
+                matched_by,
+            }
+        }
+        None => ProjectMatch {
+            name: name.to_string(),
+            entity_id: None,
+            aliases: Vec::new(),
+            matched_by,
+        },
+    };
+    let scope = Scope {
+        names: Some(names),
+        linked,
+        project: Some(project),
+    };
+    let known = entity.is_some() || memories.iter().any(|m| scope.reason(m).is_some());
+    Ok(known.then_some(scope))
+}
+
+/// Up to [`SUGGESTION_LIMIT`] known names close to `name`: containing it or
+/// contained in it first, then by edit distance.
+fn suggestions(store: &Store<'_>, name: &str, memories: &[Memory]) -> Result<Vec<String>> {
+    let wanted = normalize_entity_name(name);
+    let mut known: BTreeSet<String> = memories
+        .iter()
+        .flat_map(|m| {
+            [
+                m.project.as_deref(),
+                m.git_remote.as_deref().and_then(repo_of),
+            ]
+        })
+        .flatten()
+        .map(str::to_string)
+        .collect();
+    known.extend(Entities::new(store).all()?.into_iter().map(|e| e.name));
+
+    let mut scored: Vec<(usize, String)> = known
+        .into_iter()
+        .filter_map(|candidate| {
+            let norm = normalize_entity_name(&candidate);
+            let score = if norm.contains(&wanted) || wanted.contains(&norm) {
+                0
+            } else {
+                let d = edit_distance(&norm, &wanted);
+                if d > (wanted.chars().count() / 3).max(2) {
+                    return None;
+                }
+                d
+            };
+            Some((score, candidate))
+        })
+        .collect();
+    scored.sort();
+    scored.dedup_by(|a, b| normalize_entity_name(&a.1) == normalize_entity_name(&b.1));
+    Ok(scored
+        .into_iter()
+        .take(SUGGESTION_LIMIT)
+        .map(|(_, name)| name)
+        .collect())
+}
+
+/// Levenshtein distance over chars.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let above = row[j + 1];
+            row[j + 1] = (above + 1)
+                .min(row[j] + 1)
+                .min(diagonal + usize::from(ca != *cb));
+            diagonal = above;
+        }
+    }
+    row[b.len()]
+}
+
+// -- sections -----------------------------------------------------------------
+
+/// A section before the budget: its items in order, and its share weight.
+struct Draft {
+    name: &'static str,
+    weight: usize,
+    items: Vec<Item>,
+}
+
+fn first_line(content: &str) -> String {
+    let line = content
         .lines()
         .find(|l| !l.trim().is_empty())
-        .unwrap_or("");
-    let text: String = first.trim().chars().take(LINE_CHARS).collect();
-    format!("- [{}] {} ({})", memory.category, text, memory.id)
+        .unwrap_or("")
+        .trim();
+    let mut text: String = line.chars().take(TEXT_CHARS).collect();
+    if line.chars().count() > TEXT_CHARS {
+        text.push('…');
+    }
+    text
+}
+
+fn kind_of(memory: &Memory) -> &str {
+    memory
+        .memory_type
+        .as_deref()
+        .filter(|t| *t != "unclassified")
+        .unwrap_or(&memory.category)
+}
+
+fn item(memory: &Memory) -> Item {
+    Item {
+        id: memory.id.clone(),
+        kind: kind_of(memory).to_string(),
+        text: first_line(&memory.content),
+        at: memory.created_at.clone(),
+    }
+}
+
+fn after(timestamp: &str, start: DateTime<Utc>) -> bool {
+    DateTime::parse_from_rfc3339(timestamp).is_ok_and(|t| t >= start)
 }
 
 /// Not superseded, not expired, not sensitive, not a raw dialog: what is fit
-/// to inject unasked.
-fn injectable(memory: &Memory, now: &str) -> bool {
+/// to show unasked.
+fn injectable(memory: &Memory, now: DateTime<Utc>) -> bool {
     memory.superseded_by.is_none()
         && !memory.sensitive
         && memory.category != crate::models::DIALOG_CATEGORY
-        && memory
-            .valid_until
-            .as_deref()
-            .is_none_or(|until| until > now)
+        && memory.valid_until.as_deref().is_none_or(|until| {
+            DateTime::parse_from_rfc3339(until).map_or(true, |until| until > now)
+        })
 }
 
-/// Filter on `project` with the same rule search and list use (case-insensitive).
-fn in_project(memory: &Memory, project: Option<&str>) -> bool {
-    crate::context::ScopeFilter::new(project.map(str::to_string), None, None, None)
-        .matches_memory(memory)
+/// Where an open memory sorts in the open section, or `None` if it is not
+/// open: blockers in the window, then decisions, then action items.
+fn open_rank(memory: &Memory, since: DateTime<Utc>) -> Option<u8> {
+    let unresolved = memory.outcome.is_none();
+    match memory.memory_type.as_deref() {
+        Some("blocker") if after(&memory.created_at, since) => Some(0),
+        Some("decision") if unresolved => Some(1),
+        Some("action_item")
+            if unresolved
+                && !matches!(
+                    memory.metadata.get("status").and_then(|s| s.as_str()),
+                    Some("done" | "dropped")
+                ) =>
+        {
+            Some(2)
+        }
+        _ => None,
+    }
 }
 
-fn persona_section(store: &Store<'_>) -> Result<Section> {
-    let lines = crate::promotion::persona(store)?
+fn newest_first(a: &&Memory, b: &&Memory) -> std::cmp::Ordering {
+    b.created_at.cmp(&a.created_at)
+}
+
+fn project_drafts(memories: &[&Memory], since: DateTime<Utc>, branch: Option<&str>) -> [Draft; 3] {
+    let mut state: Vec<&Memory> = memories
+        .iter()
+        .copied()
+        .filter(|m| m.category == "summary")
+        .collect();
+    state.sort_by(newest_first);
+    state.truncate(STATE_LIMIT);
+
+    let mut open: Vec<(u8, &Memory)> = memories
+        .iter()
+        .filter_map(|m| open_rank(m, since).map(|rank| (rank, *m)))
+        .collect();
+    open.sort_by(|(ra, a), (rb, b)| ra.cmp(rb).then_with(|| newest_first(a, b)));
+
+    let shown: HashSet<&str> = state.iter().map(|m| m.id.as_str()).collect();
+    let on_branch = |m: &Memory| branch.is_some() && m.git_branch.as_deref() == branch;
+    let mut activity: Vec<&Memory> = memories
+        .iter()
+        .copied()
+        .filter(|m| {
+            after(&m.created_at, since)
+                && open_rank(m, since).is_none()
+                && m.memory_type.as_deref() != Some("action_item")
+                && !shown.contains(m.id.as_str())
+        })
+        .collect();
+    activity.sort_by(|a, b| {
+        on_branch(*b)
+            .cmp(&on_branch(*a))
+            .then_with(|| newest_first(a, b))
+    });
+
+    [
+        Draft {
+            name: "state",
+            weight: 20,
+            items: state.into_iter().map(item).collect(),
+        },
+        Draft {
+            name: "open",
+            weight: 40,
+            items: open
+                .into_iter()
+                .take(OPEN_LIMIT)
+                .map(|(_, m)| item(m))
+                .collect(),
+        },
+        Draft {
+            name: "activity",
+            weight: 40,
+            items: activity
+                .into_iter()
+                .take(ACTIVITY_LIMIT)
+                .map(item)
+                .collect(),
+        },
+    ]
+}
+
+fn persona_draft(store: &Store<'_>) -> Result<Draft> {
+    let items = crate::promotion::persona(store)?
         .into_iter()
         .take(PERSONA_LIMIT)
-        .map(|s| format!("- {}", s.content.lines().next().unwrap_or("").trim()))
+        .map(|s| Item {
+            text: first_line(&s.content),
+            id: s.id,
+            kind: crate::models::PERSONA_CATEGORY.to_string(),
+            at: s.created_at,
+        })
         .collect();
-    Ok(Section {
+    Ok(Draft {
         name: "persona",
-        heading: "Persona",
-        lines,
+        weight: 15,
+        items,
     })
 }
 
-fn reminders_section(store: &Store<'_>) -> Result<Section> {
-    let horizon = (Utc::now() + Duration::days(REMINDER_DAYS)).to_rfc3339();
-    let lines = crate::reminders::list_reminders(store, ReminderWindow::All, 50)?
+fn reminders_draft(store: &Store<'_>, now: DateTime<Utc>) -> Result<Draft> {
+    let horizon = now + Duration::days(REMINDER_DAYS);
+    let items = crate::reminders::list_reminders(store, ReminderWindow::All, 50)?
         .iter()
-        .filter(|m| {
-            m.remind_at
-                .as_deref()
-                .is_some_and(|at| at <= horizon.as_str())
+        .filter_map(|m| {
+            let due = m.remind_at.as_deref()?;
+            let in_horizon = DateTime::parse_from_rfc3339(due).is_ok_and(|t| t <= horizon);
+            in_horizon.then(|| Item {
+                at: due.to_string(),
+                ..item(m)
+            })
         })
-        .map(|m| format!("- {}: {}", m.remind_at.as_deref().unwrap_or(""), line_of(m)))
         .collect();
-    Ok(Section {
+    Ok(Draft {
         name: "reminders",
-        heading: "Reminders due within 7 days",
-        lines,
+        weight: 10,
+        items,
     })
 }
 
-fn is_open_action(memory: &Memory) -> bool {
-    memory.memory_type.as_deref() == Some("action_item")
-        && memory.outcome.is_none()
-        && memory.metadata.get("status").and_then(|s| s.as_str()) != Some("done")
-}
-
-fn action_section(memories: &[Memory], project: Option<&str>, now: &str) -> Section {
-    let mut open: Vec<&Memory> = memories
-        .iter()
-        .filter(|m| is_open_action(m) && injectable(m, now) && in_project(m, project))
-        .collect();
-    open.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-    Section {
-        name: "action_items",
-        heading: "Open action items",
-        lines: open.into_iter().take(ACTION_LIMIT).map(line_of).collect(),
-    }
-}
-
-fn recent_section(
-    memories: &[Memory],
-    project: Option<&str>,
-    branch: Option<&str>,
-    now: &str,
-) -> Section {
-    let mut recent: Vec<&Memory> = memories
-        .iter()
-        .filter(|m| {
-            injectable(m, now)
-                && in_project(m, project)
-                && m.memory_type.as_deref() != Some("action_item")
-        })
-        .collect();
-    // The branch's own memories first, newest first within each group.
-    let on_branch = |m: &Memory| branch.is_some() && m.git_branch.as_deref() == branch;
-    recent.sort_by(|a, b| {
-        on_branch(b)
-            .cmp(&on_branch(a))
-            .then_with(|| b.created_at.cmp(&a.created_at))
-    });
-    Section {
-        name: "recent",
-        heading: "Recent memories",
-        lines: recent.into_iter().take(RECENT_LIMIT).map(line_of).collect(),
-    }
-}
-
-fn hits_section(store: &Store<'_>, prompt: &str, now: &str) -> Result<Section> {
+fn hits_draft(store: &Store<'_>, prompt: &str, now: DateTime<Utc>) -> Result<Draft> {
     let input = MemorySearchInput {
         query: prompt.to_string(),
         limit: HIT_LIMIT * 2,
         ..MemorySearchInput::default()
     };
-    let lines = crate::db::queries::search_memories(store, &input)?
+    let items = crate::db::queries::search_memories(store, &input)?
         .iter()
         .map(|r| &r.memory)
         .filter(|m| injectable(m, now))
         .take(HIT_LIMIT)
-        .map(line_of)
+        .map(item)
         .collect();
-    Ok(Section {
+    Ok(Draft {
         name: "hits",
-        heading: "Related to this prompt",
-        lines,
+        weight: 25,
+        items,
     })
 }
 
-/// Build the brief for `request`.
-pub fn build(store: &Store<'_>, request: &ContextRequest<'_>) -> Result<ContextBrief> {
-    let now = Utc::now().to_rfc3339();
-    let prompt = request.prompt.map(str::trim).filter(|p| !p.is_empty());
-    if request.hits_only {
-        let sections = match prompt {
-            Some(prompt) => vec![hits_section(store, prompt, &now)?],
-            None => Vec::new(),
+// -- budget -------------------------------------------------------------------
+
+fn cost(item: &Item) -> usize {
+    estimated_content_tokens(&item.text) + ITEM_OVERHEAD
+}
+
+/// Allot the budget across `drafts` in order, each a share of what is left
+/// by its weight, and keep the items that fit.
+fn fit(brief: &mut Brief, drafts: Vec<Draft>) {
+    let limit = brief.budget.limit;
+    let mut weight_left: usize = drafts.iter().map(|d| d.weight).sum();
+    let mut used = 0;
+    for draft in drafts {
+        let allotted = if limit == 0 {
+            usize::MAX
+        } else {
+            (limit - used) * draft.weight / weight_left.max(1)
         };
-        return Ok(assemble(sections, request));
+        weight_left -= draft.weight;
+        let total = draft.items.len();
+        let mut spent = if total == 0 { 0 } else { HEADING_COST };
+        let mut items = Vec::new();
+        for item in draft.items {
+            let c = cost(&item);
+            if spent + c > allotted {
+                break;
+            }
+            spent += c;
+            items.push(item);
+        }
+        if items.is_empty() {
+            spent = 0;
+        }
+        used += spent;
+        brief.sections.push(Section {
+            name: draft.name,
+            omitted: total - items.len(),
+            items,
+        });
     }
-    let memories = Memories::new(store).all_live()?;
-    let mut sections = vec![
-        persona_section(store)?,
-        reminders_section(store)?,
-        action_section(&memories, request.project, &now),
-        recent_section(&memories, request.project, request.branch, &now),
-    ];
-    if let Some(prompt) = prompt {
-        sections.push(hits_section(store, prompt, &now)?);
-    }
-    Ok(assemble(sections, request))
+    brief.budget.used = used;
 }
 
-fn header(request: &ContextRequest<'_>) -> String {
-    if request.hits_only {
-        return "# Possibly relevant memories\n".to_string();
-    }
-    let scope = [
-        request.project.map(|p| format!("project: {p}")),
-        request.branch.map(|b| format!("branch: {b}")),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>()
-    .join(", ");
-    if scope.is_empty() {
-        "# Memory context\n".to_string()
-    } else {
-        format!("# Memory context ({scope})\n")
+// -- rendering ----------------------------------------------------------------
+
+fn heading(name: &str) -> &'static str {
+    match name {
+        "persona" => "Persona",
+        "reminders" => "Reminders due within 7 days",
+        "state" => "Current state",
+        "open" => "Open: blockers, decisions, action items",
+        "activity" => "Recent activity",
+        _ => "Related to this prompt",
     }
 }
 
-/// Join the non-empty sections in order, dropping each that would overrun
-/// the budget. A dropped section does not stop a later, smaller one.
-fn assemble(sections: Vec<Section>, request: &ContextRequest<'_>) -> ContextBrief {
-    let mut context = header(request);
-    let mut counts = SectionCounts::default();
-    let mut dropped = Vec::new();
-    for section in sections.iter().filter(|s| !s.lines.is_empty()) {
-        let text = section.render();
-        let used = context.chars().count() + 1 + text.chars().count();
-        if request.budget != 0 && used > request.budget {
-            dropped.push(section.name);
-            continue;
+fn line(section: &str, item: &Item) -> String {
+    match section {
+        "persona" => format!("- {}", item.text),
+        "reminders" => format!("- due {}: {} ({})", item.at, item.text, item.id),
+        _ => format!("- [{}] {} ({})", item.kind, item.text, item.id),
+    }
+}
+
+/// Render as Markdown.
+///
+/// A [`Mode::Project`] brief shows every section, an empty one as "None", so
+/// a reader can tell "nothing open" from "not looked at". The hooks' briefs
+/// leave empty sections out, and are empty when every section is.
+pub fn render_markdown(brief: &Brief) -> String {
+    let show_empty = brief.mode == Mode::Project;
+    let shown: Vec<&Section> = brief
+        .sections
+        .iter()
+        .filter(|s| show_empty || !s.items.is_empty())
+        .collect();
+    if shown.is_empty() {
+        return String::new();
+    }
+    let mut out = title(brief);
+    for section in shown {
+        out.push_str(&format!("\n## {}\n", heading(section.name)));
+        if section.items.is_empty() {
+            out.push_str("_None._\n");
         }
-        context.push('\n');
-        context.push_str(&text);
-        let n = section.lines.len();
-        match section.name {
-            "persona" => counts.persona = n,
-            "reminders" => counts.reminders = n,
-            "action_items" => counts.action_items = n,
-            "recent" => counts.recent = n,
-            _ => counts.hits = n,
+        for item in &section.items {
+            out.push_str(&line(section.name, item));
+            out.push('\n');
+        }
+        if section.omitted > 0 {
+            out.push_str(&format!(
+                "_{} more not shown; raise the budget._\n",
+                section.omitted
+            ));
         }
     }
-    // Nothing fit, or nothing exists: an empty brief is empty, not a
-    // header with no body.
-    if counts == SectionCounts::default() {
-        context.clear();
-    }
-    ContextBrief {
-        context,
-        sections: counts,
-        dropped,
+    out
+}
+
+fn title(brief: &Brief) -> String {
+    match brief.mode {
+        Mode::Prompt => "# Possibly relevant memories\n".to_string(),
+        Mode::Project => {
+            let name = brief.project.as_ref().map_or("", |p| p.name.as_str());
+            format!("# Brief: {name}\n_Activity since {}._\n", brief.since)
+        }
+        Mode::Session => {
+            let scope = [
+                brief
+                    .project
+                    .as_ref()
+                    .map(|p| format!("project: {}", p.name)),
+                brief.branch.as_ref().map(|b| format!("branch: {b}")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(", ");
+            if scope.is_empty() {
+                "# Memory context\n".to_string()
+            } else {
+                format!("# Memory context ({scope})\n")
+            }
+        }
     }
 }
 
@@ -286,6 +764,7 @@ mod tests {
     use super::*;
     use crate::db::memories::NewMemory;
     use crate::db::Database;
+    use crate::models::EntityInput;
 
     fn add(store: &Store<'_>, id: &str, f: impl FnOnce(&mut NewMemory)) {
         let mut row = NewMemory::new(id, format!("content of {id}"), &Utc::now().to_rfc3339());
@@ -294,8 +773,11 @@ mod tests {
         Memories::new(store).insert(&row).unwrap();
     }
 
+    fn day(d: i64) -> String {
+        (Utc::now() - Duration::days(d)).to_rfc3339()
+    }
+
     fn seed(store: &Store<'_>) {
-        let day = |d: i64| (Utc::now() - Duration::days(d)).to_rfc3339();
         add(store, "mem_old_main", |r| {
             r.project = Some("quokka".into());
             r.git_branch = Some("main".into());
@@ -339,7 +821,7 @@ mod tests {
         });
     }
 
-    fn request(budget: usize) -> ContextRequest<'static> {
+    fn session(budget: usize) -> ContextRequest<'static> {
         ContextRequest {
             project: Some("quokka"),
             branch: Some("feat"),
@@ -348,52 +830,64 @@ mod tests {
         }
     }
 
+    fn project(name: &'static str) -> ContextRequest<'static> {
+        ContextRequest {
+            mode: Mode::Project,
+            project: Some(name),
+            budget: DEFAULT_TOKEN_BUDGET,
+            ..ContextRequest::default()
+        }
+    }
+
+    fn brief(store: &Store<'_>, request: &ContextRequest<'_>) -> Brief {
+        match build(store, request).unwrap() {
+            Outcome::Brief(brief) => brief,
+            Outcome::UnknownProject { name, .. } => panic!("{name} unknown"),
+        }
+    }
+
+    fn ids(brief: &Brief, section: &str) -> Vec<String> {
+        brief
+            .sections
+            .iter()
+            .find(|s| s.name == section)
+            .map(|s| s.items.iter().map(|i| i.id.clone()).collect())
+            .unwrap_or_default()
+    }
+
     #[test]
     fn scopes_to_project_branch_first_and_hides_unfit_memories() {
         let db = Database::open_in_memory().unwrap();
         let store = db.store();
         seed(&store);
-        let brief = build(&store, &request(0)).unwrap();
+        let brief = brief(&store, &session(0));
+        let text = render_markdown(&brief);
 
-        assert_eq!(brief.sections.action_items, 1, "{}", brief.context);
-        assert!(brief.context.contains("mem_todo"));
-        assert!(!brief.context.contains("mem_done") && !brief.context.contains("mem_closed"));
-        assert!(!brief.context.contains("mem_other_project"));
-        assert!(!brief.context.contains("mem_secret"));
-        assert!(!brief.context.contains("mem_expired"));
-        let feature = brief.context.find("mem_feature").unwrap();
-        let newest = brief.context.find("mem_new_main").unwrap();
-        assert!(
-            feature < newest,
-            "the branch's memory leads: {}",
-            brief.context
+        assert_eq!(ids(&brief, "open"), ["mem_todo"], "{text}");
+        for hidden in [
+            "mem_done",
+            "mem_closed",
+            "mem_other_project",
+            "mem_secret",
+            "mem_expired",
+        ] {
+            assert!(!text.contains(hidden), "{hidden} shown: {text}");
+        }
+        assert_eq!(
+            ids(&brief, "activity"),
+            ["mem_feature", "mem_new_main", "mem_old_main"],
+            "the branch's memory leads, then newest first"
         );
-        assert!(brief
-            .context
-            .starts_with("# Memory context (project: quokka, branch: feat)"));
-        assert!(brief.dropped.is_empty());
-    }
-
-    #[test]
-    fn a_tight_budget_drops_whole_sections_and_names_them() {
-        let db = Database::open_in_memory().unwrap();
-        let store = db.store();
-        seed(&store);
-        let full = build(&store, &request(0)).unwrap();
-        // Room for the action-item section but not the recent list.
-        let tight = build(&store, &request(210)).unwrap();
-        assert!(tight.context.chars().count() <= 210);
-        assert_eq!(tight.sections.action_items, 1);
-        assert_eq!(tight.dropped, vec!["recent"]);
-        assert!(full.context.chars().count() > 210);
+        assert!(text.starts_with("# Memory context (project: quokka, branch: feat)"));
+        assert_eq!(brief.budget.limit, 0);
     }
 
     #[test]
     fn nothing_to_say_is_an_empty_context() {
         let db = Database::open_in_memory().unwrap();
-        let brief = build(&db.store(), &request(500)).unwrap();
-        assert_eq!(brief.context, "");
-        assert_eq!(brief.sections, SectionCounts::default());
+        let brief = brief(&db.store(), &session(500));
+        assert!(brief.sections.iter().all(|s| s.items.is_empty()));
+        assert_eq!(render_markdown(&brief), "");
     }
 
     #[test]
@@ -415,15 +909,14 @@ mod tests {
             prompt: Some("flaky scheduler"),
             ..ContextRequest::default()
         };
-        let brief = build(&store, &req).unwrap();
-        assert_eq!(brief.sections.reminders, 1, "{}", brief.context);
-        assert!(brief.context.contains("renew the certificate"));
-        assert!(brief.sections.hits >= 1, "{}", brief.context);
-        assert!(brief.context.contains("Related to this prompt"));
+        let brief = brief(&store, &req);
+        assert_eq!(ids(&brief, "reminders"), ["mem_remind"]);
+        assert!(ids(&brief, "hits").contains(&"mem_flaky".to_string()));
+        assert!(render_markdown(&brief).contains("Related to this prompt"));
     }
 
     #[test]
-    fn hits_only_returns_just_the_prompt_matches_and_nothing_without_one() {
+    fn prompt_mode_returns_just_the_prompt_matches_and_nothing_without_one() {
         let db = Database::open_in_memory().unwrap();
         let store = db.store();
         seed(&store);
@@ -432,26 +925,247 @@ mod tests {
             r.project = Some("quokka".into());
         });
         let req = ContextRequest {
+            mode: Mode::Prompt,
             project: Some("quokka"),
             prompt: Some("flaky scheduler"),
-            hits_only: true,
             ..ContextRequest::default()
         };
-        let brief = build(&store, &req).unwrap();
-        assert!(brief.context.starts_with("# Possibly relevant memories"));
-        assert!(brief.sections.hits >= 1, "{}", brief.context);
-        assert_eq!(brief.sections.recent, 0, "no standing sections");
-        assert_eq!(brief.sections.persona + brief.sections.action_items, 0);
+        let hits = brief(&store, &req);
+        assert!(render_markdown(&hits).starts_with("# Possibly relevant memories"));
+        assert_eq!(
+            hits.sections.iter().map(|s| s.name).collect::<Vec<_>>(),
+            ["hits"]
+        );
+        assert!(!hits.sections[0].items.is_empty());
 
-        let none = build(
+        let none = brief(
             &store,
             &ContextRequest {
-                hits_only: true,
+                mode: Mode::Prompt,
                 ..ContextRequest::default()
+            },
+        );
+        assert!(none.sections.is_empty());
+        assert_eq!(render_markdown(&none), "");
+    }
+
+    #[test]
+    fn project_mode_has_state_open_and_windowed_activity() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        seed(&store);
+        add(&store, "mem_summary_old", |r| {
+            r.project = Some("quokka".into());
+            r.category = "summary".into();
+            r.created_at = day(40);
+        });
+        add(&store, "mem_decision", |r| {
+            r.project = Some("quokka".into());
+            r.memory_type = "decision".into();
+            r.created_at = day(30);
+        });
+        add(&store, "mem_blocker_new", |r| {
+            r.project = Some("quokka".into());
+            r.memory_type = "blocker".into();
+        });
+        add(&store, "mem_blocker_old", |r| {
+            r.project = Some("quokka".into());
+            r.memory_type = "blocker".into();
+            r.created_at = day(30);
+        });
+        let req = ContextRequest {
+            since: Some("2d"),
+            ..project("quokka")
+        };
+        let brief = brief(&store, &req);
+
+        assert_eq!(
+            ids(&brief, "state"),
+            ["mem_summary_old"],
+            "state is not windowed"
+        );
+        assert_eq!(
+            ids(&brief, "open"),
+            ["mem_blocker_new", "mem_decision", "mem_todo"],
+            "blockers in the window, then decisions, then action items"
+        );
+        assert_eq!(ids(&brief, "activity"), ["mem_new_main", "mem_old_main"]);
+        assert_eq!(
+            brief.sections.iter().map(|s| s.name).collect::<Vec<_>>(),
+            ["state", "open", "activity"],
+            "no persona or reminders"
+        );
+        assert_eq!(brief.project.as_ref().unwrap().matched_by, ["project"]);
+    }
+
+    #[test]
+    fn an_empty_window_still_shows_what_is_open() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        add(&store, "mem_todo", |r| {
+            r.project = Some("quokka".into());
+            r.memory_type = "action_item".into();
+            r.created_at = day(60);
+        });
+        add(&store, "mem_old", |r| {
+            r.project = Some("quokka".into());
+            r.created_at = day(60);
+        });
+        let brief = brief(&store, &project("quokka"));
+        assert_eq!(ids(&brief, "open"), ["mem_todo"]);
+        assert!(ids(&brief, "activity").is_empty());
+        let text = render_markdown(&brief);
+        assert!(text.contains("## Recent activity\n_None._"), "{text}");
+    }
+
+    #[test]
+    fn an_alias_resolves_through_the_entity_and_its_links() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        crate::entity::upsert_entity(
+            &store,
+            &EntityInput {
+                name: "rusty_mux".into(),
+                kind: Some("project".into()),
+                aliases: vec!["mux".into()],
             },
         )
         .unwrap();
-        assert_eq!(none.sections, SectionCounts::default());
-        assert!(none.context.is_empty(), "{}", none.context);
+        add(&store, "mem_by_project", |r| {
+            r.project = Some("Rusty_Mux".into())
+        });
+        add(&store, "mem_by_remote", |r| {
+            r.git_remote = Some("github.com/rusty-mill/rusty_mux".into())
+        });
+        add(&store, "mem_by_tag", |r| r.tags = vec!["mux".into()]);
+        add(&store, "mem_linked", |r| {
+            r.project = Some("rusty_mill".into())
+        });
+        add(&store, "mem_unrelated", |r| {
+            r.project = Some("rusty_term".into())
+        });
+        let linked = crate::entity::entity_id("rusty_mux");
+        crate::entity::link_memory_entity(&store, "mem_linked", &linked).unwrap();
+
+        let brief = brief(&store, &project("mux"));
+        let mut found = ids(&brief, "activity");
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                "mem_by_project",
+                "mem_by_remote",
+                "mem_by_tag",
+                "mem_linked"
+            ]
+        );
+        let matched = brief.project.unwrap();
+        assert_eq!(matched.name, "rusty_mux");
+        assert_eq!(
+            matched.matched_by,
+            ["alias", "entity", "git_remote", "project", "tag"]
+        );
+    }
+
+    #[test]
+    fn an_unknown_project_is_refused_with_suggestions_not_guessed() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        seed(&store);
+        add(&store, "mem_mux", |r| r.project = Some("rusty_mux".into()));
+        match build(&store, &project("quoka")).unwrap() {
+            Outcome::UnknownProject { name, suggestions } => {
+                assert_eq!(name, "quoka");
+                assert_eq!(suggestions, ["quokka"]);
+            }
+            Outcome::Brief(b) => panic!("guessed {:?}", b.project),
+        }
+        match build(&store, &project("mux")).unwrap() {
+            Outcome::UnknownProject { suggestions, .. } => assert_eq!(suggestions, ["rusty_mux"]),
+            Outcome::Brief(b) => panic!("guessed {:?}", b.project),
+        }
+        // The session hook names whatever directory it is in: no project
+        // sections, no refusal.
+        let hook = brief(
+            &store,
+            &ContextRequest {
+                project: Some("nowhere"),
+                ..ContextRequest::default()
+            },
+        );
+        assert!(hook.project.is_none());
+        assert!(ids(&hook, "activity").is_empty());
+    }
+
+    #[test]
+    fn budget_overflow_drops_whole_items_counts_them_and_rolls_forward() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        for i in 0..30 {
+            add(&store, &format!("mem_{i:02}"), |r| {
+                r.project = Some("quokka".into());
+                r.content = format!("{i} {}", "word ".repeat(40));
+            });
+        }
+        let req = ContextRequest {
+            budget: MIN_TOKEN_BUDGET,
+            ..project("quokka")
+        };
+        let tight = brief(&store, &req);
+        let activity = tight
+            .sections
+            .iter()
+            .find(|s| s.name == "activity")
+            .unwrap();
+        assert!(
+            !activity.items.is_empty(),
+            "state and open roll their share forward"
+        );
+        assert_eq!(activity.items.len() + activity.omitted, ACTIVITY_LIMIT);
+        assert!(activity.omitted > 0);
+        assert!(tight.budget.used <= MIN_TOKEN_BUDGET, "{:?}", tight.budget);
+        assert!(activity
+            .items
+            .iter()
+            .all(|i| i.text.chars().count() <= TEXT_CHARS + 1));
+        assert!(render_markdown(&tight).contains("more not shown"));
+    }
+
+    #[test]
+    fn since_accepts_days_hours_and_rfc3339_and_refuses_the_rest() {
+        let now = Utc::now();
+        assert_eq!(parse_since("7d", now).unwrap(), now - Duration::days(7));
+        assert_eq!(parse_since("12h", now).unwrap(), now - Duration::hours(12));
+        let at = (now - Duration::days(3)).to_rfc3339();
+        assert_eq!(parse_since(&at, now).unwrap().to_rfc3339(), at);
+        for bad in [
+            "",
+            "0d",
+            "-1d",
+            "7",
+            "7w",
+            "366d",
+            "99999999999999d",
+            "soon",
+        ] {
+            assert!(parse_since(bad, now).is_err(), "{bad:?} accepted");
+        }
+        let future = (now + Duration::days(1)).to_rfc3339();
+        assert!(parse_since(&future, now).is_err());
+    }
+
+    #[test]
+    fn token_budget_bounds_are_inclusive() {
+        assert!(check_token_budget(MIN_TOKEN_BUDGET).is_ok());
+        assert!(check_token_budget(MAX_TOKEN_BUDGET).is_ok());
+        assert!(check_token_budget(MIN_TOKEN_BUDGET - 1).is_err());
+        assert!(check_token_budget(MAX_TOKEN_BUDGET + 1).is_err());
+    }
+
+    #[test]
+    fn edit_distance_counts_single_char_edits() {
+        assert_eq!(edit_distance("quokka", "quoka"), 1);
+        assert_eq!(edit_distance("", "abc"), 3);
+        assert_eq!(edit_distance("same", "same"), 0);
     }
 }

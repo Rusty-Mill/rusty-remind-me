@@ -13,6 +13,6 @@ case "$PROMPT" in /*) echo "$off"; exit 0 ;; esac
 [ "${#PROMPT}" -ge 12 ] || { echo "$off"; exit 0; }
 have_bin || { echo "$off"; exit 0; }
 
-"$BIN" context --cwd "$CWD" --prompt "$PROMPT" --hits-only --budget 3000 --json 2>/dev/null \
+"$BIN" context --cwd "$CWD" --prompt "$PROMPT" --hits-only --budget 750 --json 2>/dev/null \
   | brief_text | emit_context UserPromptSubmit
 exit 0

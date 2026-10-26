@@ -716,7 +716,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             "daemon" => daemon::command(&args[2..], &db_path)?,
             // The hook-facing session commands (`session.rs`).
-            "session" | "capture-transcript" | "context" => {
+            "session" | "capture-transcript" | "context" | "brief" => {
                 session::command(&args[1], &args[2..], &db_path)?
             }
             "configure" | "setup" => {
@@ -1084,7 +1084,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", serde_json::to_string_pretty(&stats)?);
             }
             cmd => {
-                eprintln!("Unknown subcommand: {}. Available: configure, daemon, api, remote, server, search, add, list, get, entity, wiki-write, wiki-read, wiki-import, stats, resolve, session, capture-transcript, context, impact-export", cmd);
+                eprintln!("Unknown subcommand: {}. Available: configure, daemon, api, remote, server, search, add, list, get, entity, wiki-write, wiki-read, wiki-import, stats, resolve, session, capture-transcript, context, brief, impact-export", cmd);
                 std::process::exit(1);
             }
         }

@@ -11,18 +11,19 @@
 
 use crate::http::{Body, Request};
 use remind_me_core::db::queries;
-use remind_me_core::db::Store;
+use remind_me_core::db::{Store, StoreError};
 use remind_me_core::entity::{entity_profile, list_entities, traverse_from_name};
 use remind_me_core::import_paths::{self, ImportPathError};
 use remind_me_core::status::SubsystemStatus;
 use remind_me_core::webhook::constant_time_eq;
 use remind_me_core::wiki_fs::{pending_compile_count, Wiki};
 use remind_me_core::{
-    self as core, digest, export, importer, saved_searches, stats, vitality, BulkImportDirInput,
-    BulkTagInput, ChatImportInput, EntityTraverseInput, ExportFormat, ExportInput, MemoryAddInput,
-    MemoryListInput, MemoryUpdateInput, ReclassifyInput, ReminderWindow, SaveSearchInput,
-    SearchPageInput, SetReminderInput, SetReminderOutcome, UpdateOutcome, BULK_IDS_MAX,
-    LIST_LIMIT_MAX, LIST_LIMIT_MIN, REMINDER_LIMIT_MAX, REMINDER_LIMIT_MIN,
+    self as core, context_brief, digest, export, importer, saved_searches, stats, vitality,
+    BulkImportDirInput, BulkTagInput, ChatImportInput, EntityTraverseInput, ExportFormat,
+    ExportInput, MemoryAddInput, MemoryListInput, MemoryUpdateInput, ReclassifyInput,
+    ReminderWindow, SaveSearchInput, SearchPageInput, SetReminderInput, SetReminderOutcome,
+    UpdateOutcome, BULK_IDS_MAX, LIST_LIMIT_MAX, LIST_LIMIT_MIN, REMINDER_LIMIT_MAX,
+    REMINDER_LIMIT_MIN,
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -1221,6 +1222,45 @@ pub fn api_digest(store: &Store<'_>, _wiki: &Wiki, req: &Request, _params: &Para
     }
 }
 
+/// `context_brief::build` in project mode, shared with `remind_me_brief`.
+/// `?project=` (required), `?since=`, `?token_budget=`. An unknown project is
+/// a 404 carrying `suggestions`.
+pub fn api_brief(store: &Store<'_>, _wiki: &Wiki, req: &Request, _params: &Params) -> (u16, Body) {
+    let Some(project) = req
+        .query_str("project")
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    else {
+        return err(400, "Missing 'project' parameter");
+    };
+    let budget = match int_query(req, "token_budget", context_brief::DEFAULT_TOKEN_BUDGET) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if let Err(e) = context_brief::check_token_budget(budget) {
+        return err(400, e.to_string());
+    }
+    let request = context_brief::ContextRequest {
+        mode: context_brief::Mode::Project,
+        project: Some(project),
+        since: req.query_str("since"),
+        budget,
+        ..Default::default()
+    };
+    match context_brief::build(store, &request) {
+        Ok(context_brief::Outcome::Brief(brief)) => ok(brief),
+        Ok(context_brief::Outcome::UnknownProject { name, suggestions }) => (
+            404,
+            Body::Json(json!({
+                "error": context_brief::unknown_project_message(&name, &suggestions),
+                "suggestions": suggestions,
+            })),
+        ),
+        Err(StoreError::Invalid(message)) => err(400, message),
+        Err(e) => internal_err(e),
+    }
+}
+
 /// `status::server_status`, shared with `remind_me_server_status` — the build
 /// actually serving the request, where the database lives, schema currency,
 /// backup state, and which subsystems are running.
@@ -1391,6 +1431,11 @@ pub const ROUTES: &[Route] = &[
         methods: &["GET"],
         pattern: "/api/digest",
         handler: api_digest,
+    },
+    Route {
+        methods: &["GET"],
+        pattern: "/api/brief",
+        handler: api_brief,
     },
     Route {
         methods: &["GET"],

@@ -134,30 +134,30 @@ fn format_or(args: &serde_json::Value, default: ResponseFormat) -> ResponseForma
 
 use remind_me_core::kinds::StructuredFields;
 use remind_me_core::{
-    backup, capture, consolidation::consolidate, contradictions, db::queries, dbs_import, digest,
-    entity, export, history, importer, mempalace_import, normalize, recalibrate, saved_searches,
-    stats, status, sync::SyncPeer, undo_import, updater, vectors, vitality, watcher,
-    webhook::Webhook, wiki, wiki_fs::Wiki, wiki_import, AnnotateInput, AutoCaptureInput,
-    BulkImportDirInput, ChatImportInput, ConsolidateInput, ContradictionCandidatesInput, Database,
-    DbsImportInput, DecomposeBatchInput, DecomposeInput, DigestInput, EntityInput,
-    EntityLookupInput, EntityTraverseInput, ExportInput, ExtractBatchInput, FeedbackInput,
-    HistoryInput, ListRemindersInput, MemoryAddInput, MemoryListInput, MemorySearchInput,
-    MemoryStatsInput, MemoryUpdateInput, MempalaceImportInput, NormalizeApplyInput,
-    NormalizeBatchInput, RecalibrateCandidatesInput, ReclassifyBatchInput, ReclassifyInput,
-    ReconcilePeerInput, ResponseFormat, RevertInput, SaveSearchInput, SavedSearchNameInput,
-    SetReminderInput, SyncRepairInput, UndoImportInput, UpdateOutcome, WikiDeleteOutcome,
-    ANNOTATE_BATCH_MAX, ANNOTATE_BATCH_MIN, CONSOLIDATE_LIMIT_MAX, CONSOLIDATE_LIMIT_MIN,
-    CONSOLIDATE_SIMILARITY_MAX, CONSOLIDATE_SIMILARITY_MIN, CONTRADICTION_LIMIT_MAX,
-    CONTRADICTION_LIMIT_MIN, DBS_IMPORT_LIMIT_MAX, DBS_IMPORT_LIMIT_MIN, DECOMPOSE_BATCH_MAX,
-    DECOMPOSE_BATCH_MIN, DECOMPOSE_FACTS_MAX, DECOMPOSE_FACTS_MIN, ENTITY_LOOKUP_LIMIT_MAX,
-    ENTITY_LOOKUP_LIMIT_MIN, EXTRACT_BATCH_MAX, EXTRACT_BATCH_MIN, EXTRACT_MODES,
-    HISTORY_LIMIT_MAX, HISTORY_LIMIT_MIN, IMPORT_MAX_LENGTH_MAX, IMPORT_MAX_LENGTH_MIN,
-    MEMPALACE_IMPORT_LIMIT_MAX, MEMPALACE_IMPORT_LIMIT_MIN, NORMALIZE_APPLY_MAX,
-    NORMALIZE_APPLY_MIN, NORMALIZE_BATCH_MAX, NORMALIZE_BATCH_MIN, PROMOTION_LIMIT_DEFAULT,
-    PROMOTION_LIMIT_MAX, PROMOTION_LIMIT_MIN, RECALIBRATE_LIMIT_MAX, RECALIBRATE_LIMIT_MIN,
-    RECLASSIFY_BATCH_MAX, RECLASSIFY_BATCH_MIN, REMINDER_LIMIT_MAX, REMINDER_LIMIT_MIN,
-    STALE_CANDIDATES_LIMIT_DEFAULT, STALE_CANDIDATES_LIMIT_MAX, STALE_CANDIDATES_LIMIT_MIN,
-    UNDO_IMPORT_LIMIT_MAX, UNDO_IMPORT_LIMIT_MIN,
+    backup, capture, consolidation::consolidate, context_brief, contradictions, db::queries,
+    dbs_import, digest, entity, export, history, importer, mempalace_import, normalize,
+    recalibrate, saved_searches, stats, status, sync::SyncPeer, undo_import, updater, vectors,
+    vitality, watcher, webhook::Webhook, wiki, wiki_fs::Wiki, wiki_import, AnnotateInput,
+    AutoCaptureInput, BriefInput, BulkImportDirInput, ChatImportInput, ConsolidateInput,
+    ContradictionCandidatesInput, Database, DbsImportInput, DecomposeBatchInput, DecomposeInput,
+    DigestInput, EntityInput, EntityLookupInput, EntityTraverseInput, ExportInput,
+    ExtractBatchInput, FeedbackInput, HistoryInput, ListRemindersInput, MemoryAddInput,
+    MemoryListInput, MemorySearchInput, MemoryStatsInput, MemoryUpdateInput, MempalaceImportInput,
+    NormalizeApplyInput, NormalizeBatchInput, RecalibrateCandidatesInput, ReclassifyBatchInput,
+    ReclassifyInput, ReconcilePeerInput, ResponseFormat, RevertInput, SaveSearchInput,
+    SavedSearchNameInput, SetReminderInput, SyncRepairInput, UndoImportInput, UpdateOutcome,
+    WikiDeleteOutcome, ANNOTATE_BATCH_MAX, ANNOTATE_BATCH_MIN, CONSOLIDATE_LIMIT_MAX,
+    CONSOLIDATE_LIMIT_MIN, CONSOLIDATE_SIMILARITY_MAX, CONSOLIDATE_SIMILARITY_MIN,
+    CONTRADICTION_LIMIT_MAX, CONTRADICTION_LIMIT_MIN, DBS_IMPORT_LIMIT_MAX, DBS_IMPORT_LIMIT_MIN,
+    DECOMPOSE_BATCH_MAX, DECOMPOSE_BATCH_MIN, DECOMPOSE_FACTS_MAX, DECOMPOSE_FACTS_MIN,
+    ENTITY_LOOKUP_LIMIT_MAX, ENTITY_LOOKUP_LIMIT_MIN, EXTRACT_BATCH_MAX, EXTRACT_BATCH_MIN,
+    EXTRACT_MODES, HISTORY_LIMIT_MAX, HISTORY_LIMIT_MIN, IMPORT_MAX_LENGTH_MAX,
+    IMPORT_MAX_LENGTH_MIN, MEMPALACE_IMPORT_LIMIT_MAX, MEMPALACE_IMPORT_LIMIT_MIN,
+    NORMALIZE_APPLY_MAX, NORMALIZE_APPLY_MIN, NORMALIZE_BATCH_MAX, NORMALIZE_BATCH_MIN,
+    PROMOTION_LIMIT_DEFAULT, PROMOTION_LIMIT_MAX, PROMOTION_LIMIT_MIN, RECALIBRATE_LIMIT_MAX,
+    RECALIBRATE_LIMIT_MIN, RECLASSIFY_BATCH_MAX, RECLASSIFY_BATCH_MIN, REMINDER_LIMIT_MAX,
+    REMINDER_LIMIT_MIN, STALE_CANDIDATES_LIMIT_DEFAULT, STALE_CANDIDATES_LIMIT_MAX,
+    STALE_CANDIDATES_LIMIT_MIN, UNDO_IMPORT_LIMIT_MAX, UNDO_IMPORT_LIMIT_MIN,
 };
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
@@ -655,6 +655,21 @@ impl McpServer {
                                         "strategy": { "type": "string", "enum": ["auto", "balanced", "keyword_favored", "semantic_favored"], "default": "auto", "description": "RRF weight profile. Leave at auto (routes by query shape: quoted phrases, prefix* wildcards and very short queries favour keyword relevance; long or question-shaped queries favour semantic similarity) unless deliberately A/B testing a pinned preset." }
                                     },
                                     "required": ["query"]
+                                }
+                            },
+                            {
+                                "name": "remind_me_brief",
+                                "description": "Get a remind-me brief for one project: current state, open blockers, decisions and action items, and recent activity, with ids for remind_me_get.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "properties": {
+                                        "project": { "type": "string", "description": "Project or entity name, or an alias" },
+                                        "since": { "type": "string", "default": context_brief::DEFAULT_SINCE, "description": "Activity window: 7d, 12h or an RFC 3339 time, at most 365 days" },
+                                        "token_budget": { "type": "integer", "default": context_brief::DEFAULT_TOKEN_BUDGET, "minimum": context_brief::MIN_TOKEN_BUDGET, "maximum": context_brief::MAX_TOKEN_BUDGET },
+                                        "response_format": { "type": "string", "enum": ["json", "markdown"] }
+                                    },
+                                    "required": ["project"]
                                 }
                             },
                             {
@@ -1700,6 +1715,7 @@ impl McpServer {
                     // `found: false` rather than creating the entity -- see
                     // `EntityLookupInput`'s docs for why that distinction is
                     // load-bearing rather than cosmetic.
+                    "remind_me_brief" => brief_tool(&store, args),
                     "remind_me_entity" => {
                         let input: Result<EntityLookupInput, _> = serde_json::from_value(args);
                         match input {
@@ -3377,6 +3393,76 @@ fn stamp_result_type(response: &mut Value) {
 /// its own parse of `id` never returned) so the client can still match this
 /// error to the call it made, the same as every other error reply in
 /// `handle_request` does.
+/// A tool error in the shape every client can act on (ADR-0028 §3):
+/// `{"error": {"code", "message", "fix"}}`, plus any `extra` fields.
+fn contract_error(code: &str, message: &str, fix: &str, extra: Value) -> Value {
+    let mut body = json!({ "error": { "code": code, "message": message, "fix": fix } });
+    if let (Some(body), Some(extra)) = (body.as_object_mut(), extra.as_object()) {
+        body.extend(extra.clone());
+    }
+    json!({ "isError": true, "content": [{ "type": "text", "text": body.to_string() }] })
+}
+
+/// `remind_me_brief`: validate at the boundary, build, render.
+fn brief_tool(store: &remind_me_core::db::Store<'_>, args: Value) -> Value {
+    let input: BriefInput = match serde_json::from_value(args) {
+        Ok(input) => input,
+        Err(e) => {
+            return contract_error(
+                "invalid_input",
+                &e.to_string(),
+                "send {\"project\": NAME} and optionally since, token_budget, response_format",
+                json!({}),
+            )
+        }
+    };
+    if let Err(e) = context_brief::check_token_budget(input.token_budget) {
+        return contract_error(
+            "invalid_input",
+            &e.to_string(),
+            "send a token_budget in range",
+            json!({}),
+        );
+    }
+    let request = context_brief::ContextRequest {
+        mode: context_brief::Mode::Project,
+        project: Some(&input.project),
+        since: input.since.as_deref(),
+        budget: input.token_budget,
+        ..Default::default()
+    };
+    match context_brief::build(store, &request) {
+        Ok(context_brief::Outcome::Brief(brief)) => {
+            let text = match input
+                .response_format
+                .unwrap_or_else(configured_default_format)
+            {
+                ResponseFormat::Json => serde_json::to_string(&brief).unwrap_or_default(),
+                ResponseFormat::Markdown => context_brief::render_markdown(&brief),
+            };
+            json!({ "content": [{ "type": "text", "text": text }] })
+        }
+        Ok(context_brief::Outcome::UnknownProject { name, suggestions }) => contract_error(
+            "unknown_project",
+            &context_brief::unknown_project_message(&name, &suggestions),
+            "send one of the suggestions as project, or find the name with remind_me_search",
+            json!({ "suggestions": suggestions }),
+        ),
+        Err(remind_me_core::db::StoreError::Invalid(message)) => contract_error(
+            "invalid_input",
+            &message,
+            "fix the field named in the message",
+            json!({}),
+        ),
+        Err(e) => contract_error(
+            "internal",
+            &e.to_string(),
+            "retry; report it if it persists",
+            json!({}),
+        ),
+    }
+}
+
 fn panicked_response(request_json: &str) -> Value {
     error_response(request_json, "internal error: request handler panicked")
 }

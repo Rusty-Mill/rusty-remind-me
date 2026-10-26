@@ -87,6 +87,12 @@ pub enum Op {
     SessionTimeline {
         session_id: String,
     },
+    /// A project brief; see [`crate::context_brief`].
+    Brief {
+        project: String,
+        since: Option<String>,
+        budget: usize,
+    },
     /// The daemon's own state. Answered by the daemon, not [`execute`].
     Status,
     /// Stop the daemon. Answered by the daemon, not [`execute`].
@@ -193,6 +199,13 @@ fn run(store: &Store<'_>, op: &Op) -> Result<Value, String> {
             },
         )
         .map_err(|e| e.to_string()),
+        Op::Brief {
+            project,
+            since,
+            budget,
+        } => {
+            session_ops::brief(store, project, since.as_deref(), *budget).map_err(|e| e.to_string())
+        }
         Op::SessionTimeline { session_id } => {
             session_ops::session_timeline(store, session_id).map_err(|e| e.to_string())
         }
