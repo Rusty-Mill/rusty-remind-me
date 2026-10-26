@@ -159,8 +159,38 @@ fn pick(
         .ok_or_else(|| format!("unknown {key} {wanted:?}: one of {}", options()))
 }
 
+/// Search arguments a reference lookup cannot honour. Refused rather than
+/// silently ignored, so a scoped search never widens into an unscoped one.
+const NOT_FOR_REFERENCES: [&str; 14] = [
+    "query",
+    "category",
+    "tags",
+    "source",
+    "project",
+    "branch",
+    "session_id",
+    "written_by",
+    "min_vitality",
+    "min_confidence",
+    "include_dormant",
+    "expand_entities",
+    "include_neighbors",
+    "expand_co_retrieval",
+];
+
 fn search(args: &mut Value) -> Result<&'static str, String> {
     if text(args, "reference").is_some() || text(args, "reference_kind").is_some() {
+        let set: Vec<&str> = NOT_FOR_REFERENCES
+            .into_iter()
+            .filter(|key| args.get(*key).is_some_and(|v| !v.is_null()))
+            .collect();
+        if !set.is_empty() {
+            return Err(format!(
+                "`reference` looks up references only, with `reference_kind` and \
+                 `include_sensitive`; drop {}",
+                set.join(", ")
+            ));
+        }
         rename(args, "reference", "value");
         rename(args, "reference_kind", "kind");
         return Ok("remind_me_references");
@@ -285,7 +315,12 @@ fn definition(name: &str, catalog: &[Value]) -> Option<Value> {
             "Get one remind-me memory by id, or a captured conversation's dialog and summary by \
              `capture_id`. `history=true` lists its earlier versions; `raw=true` returns the \
              imported source it came from.",
-            &["remind_me_get", "remind_me_history", "remind_me_source"],
+            &[
+                "remind_me_get",
+                "remind_me_history",
+                "remind_me_source",
+                "remind_me_get_capture",
+            ],
             &[],
             json!({
                 "capture_id": { "type": "string", "description": "The shared id of a dialog and summary saved by remind_me_auto_capture." },
@@ -487,6 +522,19 @@ mod tests {
         );
         assert_eq!(handler, "remind_me_references");
         assert_eq!(args, json!({"value": "o/r#1", "kind": "issue"}));
+    }
+
+    #[test]
+    fn a_reference_lookup_refuses_search_filters_it_cannot_honour() {
+        let err = route(
+            "remind_me_search",
+            json!({"reference": "o/r#1", "project": "p", "category": "c"}),
+        )
+        .unwrap_err();
+        assert!(err.contains("project") && err.contains("category"), "{err}");
+        // Null is unset, and include_sensitive is honoured by the lookup.
+        let ok = json!({"reference": "o/r#1", "project": null, "include_sensitive": true});
+        assert_eq!(routed("remind_me_search", ok).0, "remind_me_references");
     }
 
     #[test]

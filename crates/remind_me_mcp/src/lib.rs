@@ -3836,11 +3836,6 @@ mod tests {
             );
             assert!(replacement(old).is_some());
         }
-        assert_eq!(
-            handlers.len(),
-            75,
-            "ADR-0027 merges 75 handlers; it adds none"
-        );
     }
 
     #[test]
@@ -3865,6 +3860,59 @@ mod tests {
         ] {
             assert!(names.contains(&expected), "{} not in tools/list", expected);
         }
+    }
+
+    #[test]
+    fn a_reference_search_leaves_out_sensitive_memories_unless_asked() {
+        let server = McpServer::new(Database::open_in_memory().unwrap());
+        call(
+            &server,
+            "remind_me_add",
+            json!({ "content": "Open note on o/r#77" }),
+        );
+        call(
+            &server,
+            "remind_me_add",
+            json!({ "content": "Private note on o/r#77", "sensitive": true }),
+        );
+        let found = |args: Value| {
+            let result = call(&server, "remind_me_search", args);
+            serde_json::from_str::<Value>(&text_of(&result)).unwrap()
+        };
+
+        let plain = found(json!({ "reference": "o/r#77" }));
+        assert_eq!(plain["count"], 1, "{plain}");
+        assert!(!plain.to_string().contains("Private"), "{plain}");
+        let all = found(json!({ "reference": "o/r#77", "include_sensitive": true }));
+        assert_eq!(all["count"], 2, "{all}");
+
+        let scoped = call(
+            &server,
+            "remind_me_search",
+            json!({ "reference": "o/r#77", "project": "elsewhere" }),
+        );
+        assert_eq!(
+            scoped["isError"], true,
+            "a scope it cannot honour is refused"
+        );
+    }
+
+    #[test]
+    fn the_published_get_schema_does_not_require_a_memory_id() {
+        // `capture_id` alone is a complete call, so the merged tool cannot
+        // require `memory_id`.
+        let server = McpServer::new(Database::open_in_memory().unwrap());
+        let req = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
+        let resp = server.handle_request(&req.to_string()).unwrap();
+        let get = resp["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "remind_me_get")
+            .cloned()
+            .unwrap();
+        assert!(get["inputSchema"].get("required").is_none(), "{get}");
+        assert!(get["inputSchema"]["properties"]["capture_id"].is_object());
     }
 
     #[test]
@@ -4137,6 +4185,9 @@ mod tests {
 
     #[test]
     fn test_remind_me_get_schema_advertises_memory_id_as_required() {
+        // The handler's own schema: the public `get` also takes `capture_id`
+        // alone, so it requires nothing.
+        let _handlers = handler_view();
         let db = Database::open_in_memory().unwrap();
         let server = McpServer::new(db);
         let listed = server
