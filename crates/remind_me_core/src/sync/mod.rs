@@ -172,9 +172,11 @@ impl Drop for CallClientGuard {
 
 /// Run `f` as one call made by `identity`.
 ///
-/// For a transport that serves many callers from one handler, such as the
-/// remote connector: it knows each call's caller, and neither a process-wide
-/// slot nor a thread's session would keep two concurrent callers apart.
+/// For calls that name their own caller, as the remote connector's do: it
+/// serves many callers through one handler (and one daemon connection), so
+/// neither a process-wide slot nor a connection's session would keep two of
+/// them apart. The MCP server runs each such call inside this scope, on
+/// whichever thread, in whichever process, executes it.
 /// Inside `f` the identity wins over both; `None` reads as a caller that
 /// named nobody, falling through to [`CLIENT_ENV`] rather than to whoever
 /// shook hands last.

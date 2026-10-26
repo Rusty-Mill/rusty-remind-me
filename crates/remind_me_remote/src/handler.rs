@@ -14,8 +14,7 @@
 
 use std::sync::Arc;
 
-use remind_me_core::sync::with_call_client;
-use remind_me_mcp::{Handler, SERVER_INSTRUCTIONS};
+use remind_me_mcp::{Handler, CALLER_META_KEY, SERVER_INSTRUCTIONS};
 use rusty_mcp_server::json::Value as WireValue;
 use rusty_mcp_server::proto::{
     CallToolParams, CallToolResult, ErrorCode, ErrorData, GetPromptParams, GetPromptResult, Prompt,
@@ -105,9 +104,11 @@ impl ToolSource for Tools {
             .unwrap_or_default()
     }
 
-    /// The call runs as its caller: one remote server serves every connected
-    /// client, so who wrote a memory is read from this call's context, never
-    /// from a slot the last handshake left behind.
+    /// The call names its caller: one remote server serves every connected
+    /// client, so who wrote a memory is read from this call's context and
+    /// sent with the call under [`CALLER_META_KEY`], never left to a slot the
+    /// last handshake set. The handler may be a proxy to the daemon, so the
+    /// caller rides the request rather than any scope in this process.
     fn call(
         &self,
         ctx: &CallContext,
@@ -118,14 +119,18 @@ impl ToolSource for Tools {
             .as_ref()
             .and_then(|a| serde_json::from_str::<Value>(&a.to_json_string()).ok())
             .unwrap_or_else(|| json!({}));
-        let params = json!({"name": call.name, "arguments": arguments});
         let caller = ctx
             .client_info()
             .and_then(|info| remind_me_mcp::identity(&info.name, Some(&info.version)));
-        Some(with_call_client(caller, || {
+        let params = json!({
+            "name": call.name,
+            "arguments": arguments,
+            "_meta": { CALLER_META_KEY: caller },
+        });
+        Some(
             ask(self.0.as_ref(), "tools/call", params)
-                .and_then(|result| decode::<CallToolResult>(&result, "tools/call result"))
-        }))
+                .and_then(|result| decode::<CallToolResult>(&result, "tools/call result")),
+        )
     }
 }
 

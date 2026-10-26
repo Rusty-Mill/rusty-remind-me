@@ -12,10 +12,16 @@
 mod common;
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use remind_me_core::daemon::endpoint::Endpoint;
+use remind_me_core::daemon::ops::{Op, OpReply};
+use remind_me_core::daemon::server::{Daemon, Service, Start};
 use remind_me_core::Database;
-use remind_me_mcp::McpServer;
+use remind_me_mcp::daemon_proxy::DaemonProxy;
+use remind_me_mcp::{Handler, McpServer};
 use serde_json::{json, Value};
 
 const TOKEN: &str = "test-connector-token";
@@ -27,6 +33,49 @@ async fn spawn_server() -> SocketAddr {
     let db = Database::open_in_memory().unwrap();
     let mcp = Arc::new(McpServer::new(db));
     let router = remind_me_remote::build_router(mcp, TOKEN.to_string(), None).unwrap();
+    common::serve(router)
+}
+
+/// The daemon's side of the production setup: an MCP server over the store,
+/// answering lines that arrive on daemon connections.
+struct DaemonStore(McpServer);
+
+impl Service for DaemonStore {
+    fn mcp(&self, line: &str) -> Option<Value> {
+        self.0.handle_line(line)
+    }
+
+    fn op(&self, _: &Op) -> OpReply {
+        OpReply::Err("not served by this fixture".to_string())
+    }
+
+    fn http(&self, _: &mut std::net::TcpStream) -> std::io::Result<()> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+}
+
+/// [`spawn_server`] as production runs it: the connector's handler is a
+/// [`DaemonProxy`] relaying every caller's lines over one connection to a
+/// daemon that owns the store, so writes run on the daemon's thread.
+async fn spawn_daemon_backed_server() -> SocketAddr {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "rrm_remote_daemon_{}_{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let endpoint = Endpoint::for_db(&dir.join("memory.db"));
+    let Start::Started(locked) = Daemon::start(endpoint.clone()).unwrap() else {
+        panic!("a fresh endpoint must start");
+    };
+    let daemon = locked.listen().unwrap();
+    let store = DaemonStore(McpServer::new(Database::open_in_memory().unwrap()));
+    // Serves for the rest of the test binary's life, like `common::serve`.
+    std::thread::spawn(move || daemon.serve(Arc::new(store)));
+    // The daemon is already running, so the executable is never started.
+    let proxy = DaemonProxy::connect(endpoint, PathBuf::from("unused")).unwrap();
+    let router = remind_me_remote::build_router(Arc::new(proxy), TOKEN.to_string(), None).unwrap();
     common::serve(router)
 }
 
@@ -698,11 +747,9 @@ async fn initialize_tells_a_remote_client_how_to_use_the_memory() {
     assert_eq!(init["instructions"], remind_me_mcp::SERVER_INSTRUCTIONS);
 }
 
-#[tokio::test]
-async fn each_remote_caller_stamps_its_own_writes() {
-    // One server, two connected clients: each memory names the client that
-    // wrote it, not "unknown" and not whichever client shook hands last.
-    let addr = spawn_server().await;
+/// One server, two connected clients taking turns: each memory names the
+/// client that wrote it, not "unknown" and not whichever shook hands last.
+async fn assert_alternating_callers_stamp_their_own_writes(addr: SocketAddr) {
     let client = reqwest::Client::new();
     let (claude, _) = open_session(&client, addr, "claude-ai").await;
     let (chatgpt, _) = open_session(&client, addr, "chatgpt").await;
@@ -714,4 +761,52 @@ async fn each_remote_caller_stamps_its_own_writes() {
     assert_eq!(first["client"], "claude-ai/1.0", "{first}");
     assert_eq!(second["client"], "chatgpt/1.0", "{second}");
     assert_eq!(third["client"], "claude-ai/1.0", "{third}");
+}
+
+#[tokio::test]
+async fn each_remote_caller_stamps_its_own_writes() {
+    assert_alternating_callers_stamp_their_own_writes(spawn_server().await).await;
+}
+
+#[tokio::test]
+async fn each_remote_caller_stamps_its_own_writes_through_the_daemon() {
+    assert_alternating_callers_stamp_their_own_writes(spawn_daemon_backed_server().await).await;
+}
+
+#[tokio::test]
+async fn concurrent_remote_callers_through_the_daemon_never_swap_names() {
+    let addr = spawn_daemon_backed_server().await;
+    let client = reqwest::Client::new();
+    let (claude, _) = open_session(&client, addr, "claude-ai").await;
+    let (chatgpt, _) = open_session(&client, addr, "chatgpt").await;
+
+    for round in 0..8 {
+        let (from_claude, from_chatgpt) = (
+            format!("claude.ai round {round}"),
+            format!("chatgpt round {round}"),
+        );
+        let (a, b) = tokio::join!(
+            add_over(&client, addr, &claude, &from_claude),
+            add_over(&client, addr, &chatgpt, &from_chatgpt),
+        );
+        assert_eq!(a["client"], "claude-ai/1.0", "{a}");
+        assert_eq!(b["client"], "chatgpt/1.0", "{b}");
+    }
+}
+
+#[tokio::test]
+async fn a_nameless_remote_caller_through_the_daemon_gets_the_configured_client() {
+    // A caller with a blank name named nobody: its write falls to the
+    // configured client, never to a named caller that wrote just before it.
+    let addr = spawn_daemon_backed_server().await;
+    let client = reqwest::Client::new();
+    let (named, _) = open_session(&client, addr, "claude-ai").await;
+    let (nameless, _) = open_session(&client, addr, " ").await;
+
+    add_over(&client, addr, &named, "named first").await;
+    let memory = add_over(&client, addr, &nameless, "nameless after").await;
+
+    let configured =
+        std::env::var(remind_me_core::sync::CLIENT_ENV).unwrap_or_else(|_| "unknown".into());
+    assert_eq!(memory["client"], configured.as_str(), "{memory}");
 }
