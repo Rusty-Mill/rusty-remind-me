@@ -330,6 +330,7 @@ fn a_superseded_fact_drops_out_of_search() {
             bootstrap: false,
             include_expired: true,
             min_confidence: 0.0,
+            include_raw: false,
             filters: Default::default(),
             window: Default::default(),
         },

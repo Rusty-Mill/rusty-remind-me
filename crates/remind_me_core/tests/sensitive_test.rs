@@ -59,6 +59,7 @@ fn search(store: &Store<'_>, query: &str, include_sensitive: bool) -> Vec<String
             min_confidence: 0.0,
             window: Default::default(),
             include_sensitive,
+            include_raw: false,
             filters: Default::default(),
         },
     )

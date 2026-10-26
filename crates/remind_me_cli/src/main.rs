@@ -901,6 +901,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     scope: search_args.scope,
                     include_expired: true,
                     min_confidence: 0.0,
+                    include_raw: false,
                     filters: Default::default(),
                     window: Default::default(),
                 };

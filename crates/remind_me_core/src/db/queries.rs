@@ -1,7 +1,7 @@
 use super::{Result, Store, StoreError};
 use crate::db::memories::{
-    EntityMembers, EntityScope, KeywordFilter, ListFilter, Memories, MemoryEdit, Narrowing,
-    NewMemory, PageFilter,
+    is_raw_category, EntityMembers, EntityScope, KeywordFilter, ListFilter, Memories, MemoryEdit,
+    Narrowing, NewMemory, PageFilter,
 };
 use crate::expansion::{self, MemorySearchResponse};
 use crate::kinds::StructuredFields;
@@ -721,6 +721,7 @@ pub fn search_memories_deadlined(
         category: input.category.clone(),
         include_sensitive: input.include_sensitive,
         scope: input.scope.clone(),
+        exclude_raw: !input.ranks_raw(),
         narrowing: narrowing.clone(),
         window: input.window,
     };
@@ -744,6 +745,9 @@ pub fn search_memories_deadlined(
             listed.truncate(input.limit);
             listed
         };
+        if listed.is_empty() && filter.exclude_raw && !input.window.is_unbounded() {
+            return raw_fallback(store, input, embedder, deadline, timing);
+        }
         let mut outcome = trim_by_token_budget(listed, input.token_budget, input.detail);
         timing.elapsed_ms = deadline.elapsed_ms();
         outcome.timing = timing;
@@ -775,22 +779,21 @@ pub fn search_memories_deadlined(
     // Degrading to keyword-only rather than erroring is the same choice the
     // `None` arm below already makes for an unconfigured embedder: partial
     // results with an honest label beat a killed query.
-    let embedder = match embedder {
-        Some(e) if deadline.expired() => {
+    let semantic_embedder = match embedder {
+        Some(_) if deadline.expired() => {
             timing.skipped.push("semantic".to_string());
-            let _ = e;
             None
         }
         other => other,
     };
 
-    let (semantic_memories, semantic_similarity) = match embedder {
-        Some(embedder) => {
+    let (semantic_memories, semantic_similarity) = match semantic_embedder {
+        Some(semantic) => {
             let extra_texts = crate::query_expansion::expand_query(&input.query);
             // Filtering the keyword half alone would not be enough: RRF fuses
-            // two independent result sets, so a sensitive, out-of-scope or
-            // out-of-window memory excluded there could still arrive through
-            // the semantic half. Admitted inside the scan, before its limit,
+            // two independent result sets, so a sensitive, out-of-scope,
+            // out-of-window or raw memory excluded there could still arrive
+            // through the semantic half. Admitted inside the scan, before its limit,
             // so the filters never starve the semantic list.
             let hidden = if input.include_sensitive {
                 std::collections::HashSet::new()
@@ -802,10 +805,13 @@ pub fn search_memories_deadlined(
                     && input.scope.matches_memory(m)
                     && input.window.contains_memory(m)
                     && narrowing.admits(m)
+                    // Raw rows go before the best `limit * 2` are chosen, or
+                    // stronger raw hits would take every slot (ADR-0029).
+                    && !(filter.exclude_raw && is_raw_category(&m.category))
             };
             let scored = crate::vectors::semantic_search_admitted(
                 store,
-                embedder,
+                semantic,
                 &input.query,
                 &extra_texts,
                 input.limit * 2,
@@ -880,9 +886,38 @@ pub fn search_memories_deadlined(
     };
     ranked.truncate(input.limit);
 
+    if ranked.is_empty() && filter.exclude_raw {
+        return raw_fallback(store, input, embedder, deadline, timing);
+    }
+
     let mut outcome = trim_by_token_budget(ranked, input.token_budget, input.detail);
     timing.elapsed_ms = deadline.elapsed_ms();
     outcome.timing = timing;
+    Ok(outcome)
+}
+
+/// Nothing refined matched: a session not yet decomposed is still findable
+/// through its dialog, so `input` runs again with raw rows admitted and the
+/// result is marked (ADR-0029). Same embedder and deadline, so the second
+/// pass skips what the first skipped; both passes' skipped stages are kept.
+fn raw_fallback(
+    store: &Store<'_>,
+    input: &MemorySearchInput,
+    embedder: Option<&dyn crate::embedder::Embedder>,
+    deadline: crate::retrieval::Deadline,
+    first: crate::retrieval::SearchTiming,
+) -> Result<crate::retrieval::TrimOutcome> {
+    let raw = MemorySearchInput {
+        include_raw: true,
+        ..input.clone()
+    };
+    let mut outcome = search_memories_deadlined(store, &raw, embedder, deadline)?;
+    outcome.raw_fallback = !outcome.results.is_empty();
+    for stage in first.skipped {
+        if !outcome.timing.skipped.contains(&stage) {
+            outcome.timing.skipped.push(stage);
+        }
+    }
     Ok(outcome)
 }
 
@@ -1095,6 +1130,7 @@ pub fn search_with_expansions(
             None
         },
         timing: outcome.timing,
+        raw_fallback: outcome.raw_fallback,
         bootstrap,
         memories,
         total_candidates: outcome.total_candidates,

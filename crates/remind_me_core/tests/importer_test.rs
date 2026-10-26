@@ -459,6 +459,7 @@ fn neighbour_expansion_finally_finds_something() {
             bootstrap: false,
             include_expired: true,
             min_confidence: 0.0,
+            include_raw: false,
             filters: Default::default(),
             window: Default::default(),
         },

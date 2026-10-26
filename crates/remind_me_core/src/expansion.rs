@@ -111,6 +111,10 @@ pub struct MemorySearchResponse {
     /// `degraded()` should not have to distinguish absent from clean.
     #[serde(default)]
     pub timing: crate::retrieval::SearchTiming,
+    /// Nothing refined matched, so `memories` are raw session dialogs
+    /// (ADR-0029).
+    #[serde(default)]
+    pub raw_fallback: bool,
     /// The L2/L3 persona bootstrap, when one was asked for (#255).
     ///
     /// `None` and `Some(empty)` are deliberately different answers: the first

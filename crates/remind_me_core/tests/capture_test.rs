@@ -209,6 +209,8 @@ fn a_capture_is_searchable() {
             bootstrap: false,
             include_expired: true,
             min_confidence: 0.0,
+            // The dialog half is raw, ranked only on request (ADR-0029).
+            include_raw: true,
             filters: Default::default(),
             window: Default::default(),
         },
