@@ -1,6 +1,6 @@
 # ADR-0028: One contract for every client
 
-Status: Proposed (2026-10-26); awaiting owner approval, nothing implemented
+Status: Accepted (2026-10-26); not yet implemented
 Date: 2026-10-26
 
 ## Context
