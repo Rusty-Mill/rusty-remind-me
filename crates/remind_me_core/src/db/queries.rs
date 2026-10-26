@@ -37,6 +37,7 @@ pub fn add_memory_with(
     fields: &StructuredFields,
 ) -> Result<Memory> {
     fields.validate(&input.metadata, None)?;
+    crate::project::refuse_reserved_predicate(input.predicate.as_deref())?;
     let now = Utc::now();
     let now_iso = now.to_rfc3339();
     let id = format!("mem_{}", uuid::Uuid::new_v4().simple());
@@ -184,6 +185,7 @@ pub fn update_memory_with(
     let Some(stored) = get_memory_by_id(store, &input.memory_id)? else {
         return Ok(UpdateOutcome::NotFound);
     };
+    crate::project::refuse_claim_edit(&stored)?;
     let metadata = input.metadata.as_ref().unwrap_or(&stored.metadata);
     fields.validate(metadata, stored.memory_type.as_deref())?;
 
@@ -287,6 +289,7 @@ pub fn delete_memory(store: &Store<'_>, memory_id: &str) -> Result<bool> {
     let Some(category) = memories.live_category(memory_id)? else {
         return Ok(false);
     };
+    refuse_claims(store, &[memory_id.to_string()])?;
 
     // A tombstoned memory's embeddings are stale the moment it stops being
     // searchable, same as an incoming sync tombstone's are, so they go on
@@ -332,6 +335,8 @@ pub fn empty_tombstones(store: &Store<'_>) -> Result<(usize, usize)> {
 /// independently — reused, not reimplemented, so the two paths cannot drift —
 /// and one missing id does not fail the rest of the batch.
 pub fn bulk_delete(store: &Store<'_>, ids: &[String]) -> Result<BulkDeleteResult> {
+    // Checked before any delete, so a claim in the batch refuses all of it.
+    refuse_claims(store, ids)?;
     let mut result = BulkDeleteResult::default();
     for id in ids {
         if delete_memory(store, id)? {
@@ -343,11 +348,24 @@ pub fn bulk_delete(store: &Store<'_>, ids: &[String]) -> Result<BulkDeleteResult
     Ok(result)
 }
 
+/// Refuse when any of `ids` is a project claim, which is append-only
+/// (ADR-0027); missing ids are left to the caller.
+fn refuse_claims(store: &Store<'_>, ids: &[String]) -> Result<()> {
+    let memories = Memories::new(store);
+    for id in ids {
+        if let Some(memory) = memories.get_live(id)? {
+            crate::project::refuse_claim_edit(&memory)?;
+        }
+    }
+    Ok(())
+}
+
 /// Add, remove, or replace tags on several memories in one request.
 ///
 /// A missing id is recorded in `not_found` and the rest of the batch still
 /// applies, matching [`bulk_delete`]'s per-item error handling.
 pub fn bulk_tag(store: &Store<'_>, input: &BulkTagInput) -> Result<BulkTagResult> {
+    refuse_claims(store, &input.ids)?;
     let memories = Memories::new(store);
     let now = Utc::now().to_rfc3339();
     let mut result = BulkTagResult::default();
@@ -400,10 +418,19 @@ pub fn annotate_memories(store: &Store<'_>, input: &AnnotateInput) -> Result<Ann
     let mut errors = Vec::new();
 
     for annotation in &input.annotations {
-        if get_memory_by_id(store, &annotation.memory_id)?.is_none() {
+        let Some(stored) = get_memory_by_id(store, &annotation.memory_id)? else {
             errors.push(AnnotationError {
                 memory_id: annotation.memory_id.clone(),
                 error: "memory not found".to_string(),
+            });
+            continue;
+        };
+        let guarded = crate::project::refuse_reserved_predicate(annotation.predicate.as_deref())
+            .and_then(|()| crate::project::refuse_claim_edit(&stored));
+        if let Err(refused) = guarded {
+            errors.push(AnnotationError {
+                memory_id: annotation.memory_id.clone(),
+                error: refused.to_string(),
             });
             continue;
         }
@@ -615,19 +642,16 @@ pub fn search_memories_deadlined(
 
     // Raw user text is not a valid FTS5 MATCH expression — ordinary punctuation
     // is operator syntax there, so a question like "what's the plan?" was a
-    // syntax error rather than a search. No phrases means nothing was
-    // searchable.
+    // syntax error rather than a search. No phrases leaves nothing to rank —
+    // handled below, once the filter exists.
     let phrases = crate::fts::query_phrases(&input.query);
     // An entity the store has never seen matches nothing: an empty result,
     // not an error, as `search_paginated` answers it.
-    let narrowing = match resolve_narrowing(store, input)? {
-        Some(narrowing) if !phrases.is_empty() => narrowing,
-        _ => {
-            let mut outcome = trim_by_token_budget(Vec::new(), input.token_budget, input.detail);
-            timing.elapsed_ms = deadline.elapsed_ms();
-            outcome.timing = timing;
-            return Ok(outcome);
-        }
+    let Some(narrowing) = resolve_narrowing(store, input)? else {
+        let mut outcome = trim_by_token_budget(Vec::new(), input.token_budget, input.detail);
+        timing.elapsed_ms = deadline.elapsed_ms();
+        outcome.timing = timing;
+        return Ok(outcome);
     };
 
     // Dormancy is filtered on *effective* vitality, inside the query and before
@@ -647,7 +671,33 @@ pub fn search_memories_deadlined(
         include_sensitive: input.include_sensitive,
         scope: input.scope.clone(),
         narrowing: narrowing.clone(),
+        window: input.window,
     };
+
+    // Nothing to rank. A bounded window still asks a question — "what
+    // happened in the last two days" — so answer it as a newest-first listing;
+    // with no window either, nothing was searchable.
+    // `limit` applies after `apply_validity`, so a dropped or demoted row
+    // gives its place to an eligible one, as in the ranked path.
+    if phrases.is_empty() {
+        let listed = if input.window.is_unbounded() {
+            Vec::new()
+        } else {
+            let hits = memories_repo.window_hits(&filter)?;
+            let mut listed = crate::retrieval::apply_validity(
+                hits.into_iter().map(listed_result).collect(),
+                Utc::now(),
+                input.include_expired,
+                input.min_confidence,
+            );
+            listed.truncate(input.limit);
+            listed
+        };
+        let mut outcome = trim_by_token_budget(listed, input.token_budget, input.detail);
+        timing.elapsed_ms = deadline.elapsed_ms();
+        outcome.timing = timing;
+        return Ok(outcome);
+    }
 
     // `RrfFusion::Score` mode needs the raw BM25 magnitude alongside each hit.
     let mut keyword_memories = Vec::new();
@@ -687,17 +737,20 @@ pub fn search_memories_deadlined(
         Some(embedder) => {
             let extra_texts = crate::query_expansion::expand_query(&input.query);
             // Filtering the keyword half alone would not be enough: RRF fuses
-            // two independent result sets, so a sensitive or out-of-scope
-            // memory excluded there could still arrive through the semantic
-            // half. Admitted inside the scan, before its limit, so the filters
-            // never starve the semantic list.
+            // two independent result sets, so a sensitive, out-of-scope or
+            // out-of-window memory excluded there could still arrive through
+            // the semantic half. Admitted inside the scan, before its limit,
+            // so the filters never starve the semantic list.
             let hidden = if input.include_sensitive {
                 std::collections::HashSet::new()
             } else {
                 memories_repo.sensitive_ids()?
             };
             let admit = |m: &Memory| {
-                !hidden.contains(&m.id) && input.scope.matches_memory(m) && narrowing.admits(m)
+                !hidden.contains(&m.id)
+                    && input.scope.matches_memory(m)
+                    && input.window.contains_memory(m)
+                    && narrowing.admits(m)
             };
             let scored = crate::vectors::semantic_search_admitted(
                 store,
@@ -815,6 +868,24 @@ fn resolve_narrowing(store: &Store<'_>, input: &MemorySearchInput) -> Result<Opt
         entity,
         repo: clean(&input.filters.repo).and_then(crate::context::normalize_remote),
     }))
+}
+
+/// A window listing's row. There is no relevance to score, so every row gets
+/// the same 1.0: the newest-first order survives `apply_validity`'s stable
+/// sort, and its validity and confidence factors still push expired and
+/// low-confidence rows down, as they do in a ranked search.
+fn listed_result(memory: Memory) -> MemorySearchResult {
+    MemorySearchResult {
+        memory,
+        score: 1.0,
+        fts_score: None,
+        vec_score: None,
+        recency_score: None,
+        vitality_score: None,
+        idf_score: None,
+        feedback_adjustment: None,
+        rerank_score: None,
+    }
 }
 
 /// Paginated full-text search behind `GET /api/memories/search`.

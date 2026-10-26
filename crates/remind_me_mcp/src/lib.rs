@@ -457,6 +457,58 @@ pub fn identity(name: &str, version: Option<&str>) -> Option<String> {
     }
 }
 
+/// `remind_me_capture_transcript`: the hook-facing capture, for a caller with
+/// no CLI on its machine. The caller's context is taken as given: its cwd is
+/// on another machine, so nothing here probes it.
+fn capture_transcript_tool(
+    store: &remind_me_core::db::Store<'_>,
+    args: &Value,
+) -> Result<remind_me_core::transcript::TranscriptOutcome, String> {
+    use remind_me_core::models::WriteContext;
+    use remind_me_core::transcript::{
+        capture_transcript, encoded_len, TranscriptRequest, MAX_TRANSCRIPT_BYTES,
+    };
+    let text = |key: &str| {
+        args.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    let session_id = text("session_id").ok_or("session_id is required")?;
+    let transcript = args
+        .get("transcript")
+        .and_then(Value::as_str)
+        .ok_or("transcript is required")?;
+    let size = encoded_len(transcript);
+    if size > MAX_TRANSCRIPT_BYTES {
+        return Err(format!(
+            "transcript is {size} bytes JSON-escaped; send at most {MAX_TRANSCRIPT_BYTES}, its tail cut at a line"
+        ));
+    }
+    let reason = text("reason");
+    if let Some(r) = reason.as_deref() {
+        if !matches!(r, "stop" | "precompact" | "end") {
+            return Err(format!("reason must be stop, precompact or end, not {r:?}"));
+        }
+    }
+    let context = WriteContext {
+        project: text("project"),
+        session_id: Some(session_id.clone()),
+        git_remote: text("git_remote"),
+        git_branch: text("git_branch"),
+        git_sha: text("git_sha"),
+        cwd: text("cwd"),
+    };
+    let request = TranscriptRequest {
+        session_id: &session_id,
+        cwd: None,
+        reason: reason.as_deref(),
+        context: Some(&context),
+    };
+    capture_transcript(store, transcript, &request).map_err(|e| e.to_string())
+}
+
 impl McpServer {
     pub fn new(db: Database) -> Self {
         Self::with_wiki(db, Wiki::from_env())
@@ -713,7 +765,7 @@ impl McpServer {
                                     "type": "object",
                                     "properties": {
                                         "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "markdown", "description": "markdown (default, as the reference) renders the results; json returns the full envelope including scores." },
-                                        "query": { "type": "string" },
+                                        "query": { "type": "string", "description": "Search text. May be empty when since or until is set, to list that window newest-first." },
                                         "limit": { "type": "integer", "default": 20 },
                                         "detail": { "type": "string", "enum": ["compact", "full"], "default": "compact", "description": "compact (default): one short line per hit, so more hits fit the budget. full: whole memories with metadata and references." },
                                         "token_budget": { "type": "integer", "default": 800, "minimum": 0, "description": "Estimated tokens the hits may use; 0 is unlimited. Hits that do not fit are listed by id." },
@@ -735,6 +787,9 @@ impl McpServer {
                                         "bootstrap": { "type": "boolean", "default": false, "description": "Prepend the durable persona (L3) as context, whether or not it matches the query. Spends up to a quarter of token_budget; the rest still goes to the ranked results." },
                                         "include_expired": { "type": "boolean", "default": true, "description": "Include memories whose valid_until has passed. They always rank after in-window ones; set false to drop them." },
                                         "min_confidence": { "type": "number", "default": 0, "description": "Only return memories at or above this confidence (0 to 1)." },
+                                        "since": { "type": "string", "description": "Only memories at or after this time (inclusive): RFC 3339, or an age back from now like 30m, 12h, 2d, 1w." },
+                                        "until": { "type": "string", "description": "Only memories before this time (exclusive): RFC 3339, or an age back from now like 30m, 12h, 2d, 1w. Must be after since." },
+                                        "time_field": { "type": "string", "enum": ["created", "updated"], "default": "created", "description": "Which timestamp since/until apply to." },
                                         "strategy": { "type": "string", "enum": ["auto", "balanced", "keyword_favored", "semantic_favored"], "default": "auto", "description": "RRF weight profile. Leave at auto (routes by query shape: quoted phrases, prefix* wildcards and very short queries favour keyword relevance; long or question-shaped queries favour semantic similarity) unless deliberately A/B testing a pinned preset." }
                                     },
                                     "required": ["query"]
@@ -751,6 +806,11 @@ impl McpServer {
                                     },
                                     "required": ["name"]
                                 }
+                            },
+                            {
+                                "name": "remind_me_project",
+                                "description": remind_me_core::project_tool::DESCRIPTION,
+                                "inputSchema": remind_me_core::project_tool::input_schema()
                             },
                             {
                                 "name": "remind_me_entity_upsert",
@@ -923,6 +983,24 @@ impl McpServer {
                                         "metadata": { "type": "object" }
                                     },
                                     "required": ["conversation", "summary"]
+                                }
+                            },
+                            {
+                                "name": "remind_me_capture_transcript",
+                                "description": "Store or refresh a Claude Code session's capture from its raw JSONL transcript: one dialog and summary pair per session_id, replaced in place on every call. For hooks on machines without the CLI (cloud sessions); a model should use remind_me_auto_capture. The raw transcript is also archived when REMIND_ME_ARCHIVE_DIR is set.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "session_id": { "type": "string", "minLength": 1, "maxLength": 200 },
+                                        "transcript": { "type": "string", "minLength": 1, "description": "The session's JSONL transcript so far, at most 3145728 bytes once JSON-escaped (each quote, backslash and newline counts twice); a caller over the limit sends its tail, cut at a line" },
+                                        "reason": { "type": "string", "enum": ["stop", "precompact", "end"] },
+                                        "project": { "type": "string", "maxLength": 200 },
+                                        "git_remote": { "type": "string", "maxLength": 500 },
+                                        "git_branch": { "type": "string", "maxLength": 200 },
+                                        "git_sha": { "type": "string", "maxLength": 64 },
+                                        "cwd": { "type": "string", "maxLength": 1000, "description": "Recorded as given; never read on this machine" }
+                                    },
+                                    "required": ["session_id", "transcript"]
                                 }
                             },
                             {
@@ -1808,6 +1886,19 @@ impl McpServer {
                     // `found: false` rather than creating the entity -- see
                     // `EntityLookupInput`'s docs for why that distinction is
                     // load-bearing rather than cosmetic.
+                    // One tool, one entry point: `project_tool::call` is
+                    // what `/api/projects` calls too, so a model and the
+                    // dashboard cannot be told different things.
+                    "remind_me_project" => {
+                        match remind_me_core::project_tool::call(&store, &args) {
+                            Ok(payload) => {
+                                json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&payload).unwrap() }] })
+                            }
+                            Err(e) => {
+                                json!({ "isError": true, "content": [{ "type": "text", "text": store_error_text("Project error", &e) }] })
+                            }
+                        }
+                    }
                     "remind_me_entity" => {
                         let input: Result<EntityLookupInput, _> = serde_json::from_value(args);
                         match input {
@@ -2201,6 +2292,16 @@ impl McpServer {
                             }
                             Err(e) => {
                                 json!({ "isError": true, "content": [{ "type": "text", "text": format!("Invalid auto capture input: {}", e) }] })
+                            }
+                        }
+                    }
+                    "remind_me_capture_transcript" => {
+                        match capture_transcript_tool(&store, &args) {
+                            Ok(outcome) => {
+                                json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&outcome).unwrap() }] })
+                            }
+                            Err(e) => {
+                                json!({ "isError": true, "content": [{ "type": "text", "text": format!("Capture transcript error: {}", e) }] })
                             }
                         }
                     }
@@ -4059,6 +4160,87 @@ mod tests {
             "{}",
             text_of(&md)
         );
+    }
+
+    #[test]
+    fn capture_transcript_stores_one_capture_per_session_with_the_callers_context() {
+        let db = Database::open_in_memory().unwrap();
+        let server = McpServer::new(db);
+        let line = |text: &str| {
+            json!({"type": "user", "sessionId": "cloud-1", "cwd": "/nowhere/here",
+                   "message": {"role": "user", "content": text}})
+            .to_string()
+        };
+        let args = |transcript: String| {
+            json!({ "session_id": "cloud-1", "transcript": transcript, "reason": "stop",
+                    "project": "rusty_mill", "git_branch": "main", "cwd": "/home/user/rusty_mill" })
+        };
+
+        let first = call(
+            &server,
+            "remind_me_capture_transcript",
+            args(line("ship it")),
+        );
+        assert!(first.get("isError").is_none(), "{first}");
+        let first: Value = serde_json::from_str(&text_of(&first)).unwrap();
+        let grown = format!("{}\n{}", line("ship it"), line("and test it"));
+        let second = call(&server, "remind_me_capture_transcript", args(grown));
+        let second: Value = serde_json::from_str(&text_of(&second)).unwrap();
+        assert_eq!(first["capture_id"], second["capture_id"]);
+        assert_eq!(second["messages"], 2);
+
+        let got = call(
+            &server,
+            "remind_me_get",
+            json!({ "memory_id": second["dialog_id"], "response_format": "json" }),
+        );
+        let dialog: Value = serde_json::from_str(&text_of(&got)).unwrap();
+        assert_eq!(dialog["project"], "rusty_mill");
+        assert_eq!(dialog["git_branch"], "main");
+        assert_eq!(dialog["cwd"], "/home/user/rusty_mill");
+    }
+
+    #[test]
+    fn capture_transcript_refuses_bad_input() {
+        let db = Database::open_in_memory().unwrap();
+        let server = McpServer::new(db);
+        for args in [
+            json!({ "transcript": "{}" }),
+            json!({ "session_id": "s", "transcript": "" }),
+            json!({ "session_id": "s", "transcript": "{}", "reason": "later" }),
+            json!({ "session_id": "s", "transcript": "x".repeat(remind_me_core::transcript::MAX_TRANSCRIPT_BYTES + 1) }),
+        ] {
+            let result = call(&server, "remind_me_capture_transcript", args);
+            assert_eq!(result["isError"], true, "{result}");
+        }
+    }
+
+    #[test]
+    fn capture_transcript_bounds_what_travels_not_what_it_decodes_to() {
+        use remind_me_core::transcript::MAX_TRANSCRIPT_BYTES;
+        let db = Database::open_in_memory().unwrap();
+        let server = McpServer::new(db);
+        // Quote-heavy: under the limit decoded, twice it once escaped.
+        let heavy = "\"".repeat(MAX_TRANSCRIPT_BYTES / 2 + 1);
+        let result = call(
+            &server,
+            "remind_me_capture_transcript",
+            json!({ "session_id": "s", "transcript": heavy }),
+        );
+        assert_eq!(result["isError"], true, "{result}");
+        assert!(text_of(&result).contains("JSON-escaped"), "{result}");
+
+        // The worst transcript the limit admits still fits a 4 MiB body.
+        let at_limit = "\"".repeat(MAX_TRANSCRIPT_BYTES / 2);
+        let body = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "remind_me_capture_transcript", "arguments": {
+                "session_id": "x".repeat(200), "transcript": at_limit, "reason": "precompact",
+                "project": "p".repeat(200), "git_remote": "r".repeat(500),
+                "git_branch": "b".repeat(250), "git_sha": "0".repeat(40), "cwd": "c".repeat(4096),
+            }},
+        });
+        assert!(serde_json::to_vec(&body).unwrap().len() <= 4 * 1024 * 1024);
     }
 
     #[test]
@@ -6035,5 +6217,97 @@ mod structure_tests {
             json!({ "query": "quokka policy", "include_expired": false }),
         );
         assert!(text(&hidden).contains("No memories"), "{}", text(&hidden));
+    }
+
+    #[test]
+    fn a_queryless_window_search_is_narrowed_ranked_by_validity_and_limited() {
+        let s = server();
+        call(
+            &s,
+            "remind_me_add",
+            json!({ "content": "solid mux note", "tags": ["mux"] }),
+        );
+        call(
+            &s,
+            "remind_me_add",
+            json!({ "content": "shaky mux note", "tags": ["mux"], "confidence": 0.2 }),
+        );
+        call(
+            &s,
+            "remind_me_add",
+            json!({ "content": "term pane note", "tags": ["term"] }),
+        );
+
+        let search = |args: Value| text(&call(&s, "remind_me_search", args));
+        // Newest first would put the shaky note on top; low confidence
+        // demotes it, and the limit keeps one.
+        let top = search(json!({ "query": "", "since": "1h", "tags": ["mux"], "limit": 1 }));
+        assert!(top.contains("solid mux note"), "{top}");
+        assert!(
+            !top.contains("shaky mux note") && !top.contains("term pane note"),
+            "{top}"
+        );
+
+        let both = search(json!({ "query": "", "since": "1h", "tags": ["mux"], "limit": 5 }));
+        assert!(
+            both.contains("shaky mux note") && !both.contains("term pane note"),
+            "{both}"
+        );
+
+        let none = search(json!({ "query": "", "since": "1h", "repo": "github.com/acme/none" }));
+        assert!(none.contains("No memories"), "{none}");
+    }
+
+    #[test]
+    fn search_takes_a_time_window_and_lists_it_without_a_query() {
+        let s = server();
+        let search = tool(&s, "remind_me_search");
+        for field in ["since", "until", "time_field"] {
+            assert!(
+                search["inputSchema"]["properties"][field].is_object(),
+                "{field}"
+            );
+        }
+        call(
+            &s,
+            "remind_me_add",
+            json!({ "content": "wombat burrow note" }),
+        );
+
+        let listed = call(
+            &s,
+            "remind_me_search",
+            json!({ "query": "", "since": "1h", "response_format": "json" }),
+        );
+        assert!(!is_error(&listed), "{}", text(&listed));
+        assert!(
+            text(&listed).contains("wombat burrow note"),
+            "{}",
+            text(&listed)
+        );
+
+        let future = call(
+            &s,
+            "remind_me_search",
+            json!({ "query": "wombat", "since": "2999-01-01T00:00:00Z" }),
+        );
+        assert!(text(&future).contains("No memories"), "{}", text(&future));
+
+        let bad = call(
+            &s,
+            "remind_me_search",
+            json!({ "query": "", "since": "soon" }),
+        );
+        assert!(
+            is_error(&bad) && text(&bad).contains("`since`"),
+            "{}",
+            text(&bad)
+        );
+        let backwards = call(
+            &s,
+            "remind_me_search",
+            json!({ "query": "", "since": "1d", "until": "2d" }),
+        );
+        assert!(is_error(&backwards) && text(&backwards).contains("must be after"));
     }
 }

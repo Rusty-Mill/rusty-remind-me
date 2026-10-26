@@ -85,6 +85,7 @@ fn search(store: &Store<'_>, query: &str) {
             include_expired: true,
             min_confidence: 0.0,
             filters: Default::default(),
+            window: Default::default(),
         },
     )
     .unwrap();

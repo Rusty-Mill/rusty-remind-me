@@ -342,3 +342,70 @@ fn semantic_filters_refill_past_out_of_scope_neighbours() {
             .collect();
     assert_eq!(got, ["kept"]);
 }
+
+fn since(when: &str) -> remind_me_core::time_window::TimeWindow {
+    let raw = remind_me_core::time_window::RawTimeWindow {
+        since: Some(when.into()),
+        until: None,
+        time_field: Default::default(),
+    };
+    remind_me_core::time_window::TimeWindow::resolve(&raw, chrono::Utc::now()).unwrap()
+}
+
+#[test]
+fn a_queryless_window_listing_is_narrowed_too() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    fixture(&store);
+    // Tagged and in the repo, but before the window.
+    Memories::new(&store)
+        .insert(&NewMemory {
+            tags: vec!["mux".into()],
+            git_remote: Some("github.com/Rusty-Mill/rusty_mux".into()),
+            ..NewMemory::new("old", "mux history", "2026-01-01T00:00:00+00:00")
+        })
+        .unwrap();
+
+    let listed = |tags: &[&str], filters: SearchFilters| {
+        let mut input = input("", tags, filters);
+        input.window = since("2026-10-25T00:00:00Z");
+        ids(&store, &input)
+    };
+    assert_eq!(listed(&[], SearchFilters::default()), ["a", "b", "c", "d"]);
+    assert_eq!(listed(&["mux"], SearchFilters::default()), ["a", "b"]);
+    assert_eq!(listed(&[], entity("rusty_mux")), ["a", "d"]);
+    assert_eq!(listed(&[], repo("github.com/Rusty-Mill/rusty_term")), ["c"]);
+    assert!(listed(&[], entity("nobody")).is_empty());
+}
+
+#[test]
+fn the_window_is_admitted_inside_the_semantic_scan() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    // Five better semantic matches before the window, more than the pool
+    // (2 x limit) holds, and one worse match inside it.
+    for i in 0..5 {
+        let id = format!("t{i}");
+        Memories::new(&store)
+            .insert(&NewMemory::new(
+                &id,
+                "term note",
+                "2026-01-01T00:00:00+00:00",
+            ))
+            .unwrap();
+        embed_and_store(&store, &TermFirst, &id, "term note").unwrap();
+    }
+    put(&store, "kept", "pane layout", &[], None);
+    embed_and_store(&store, &TermFirst, "kept", "pane layout").unwrap();
+
+    let mut narrowed = input("term", &[], SearchFilters::default());
+    narrowed.limit = 1;
+    narrowed.window = since("2026-10-25T00:00:00Z");
+    let got: Vec<String> =
+        queries::search_memories_with_embedder(&store, &narrowed, Some(&TermFirst))
+            .unwrap()
+            .into_iter()
+            .map(|r| r.memory.id)
+            .collect();
+    assert_eq!(got, ["kept"]);
+}

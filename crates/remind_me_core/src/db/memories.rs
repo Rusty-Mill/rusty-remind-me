@@ -231,6 +231,7 @@ pub struct KeywordFilter {
     pub include_sensitive: bool,
     pub scope: crate::context::ScopeFilter,
     pub narrowing: Narrowing,
+    pub window: crate::time_window::TimeWindow,
 }
 
 /// A search's tag, entity and repository filters, resolved against the store.
@@ -496,6 +497,12 @@ impl<'c> Memories<'c> {
         engine::memories::all_live(&self.core.lock())
     }
 
+    /// Undeleted memories whose predicate starts with `prefix`, ignoring
+    /// case, superseded ones included, oldest first (ties by id).
+    pub fn with_predicate_prefix(&self, prefix: &str) -> Result<Vec<Memory>> {
+        engine::memories::with_predicate_prefix(&self.core.lock(), prefix)
+    }
+
     /// Memory `id`, unless it is missing or deleted.
     pub fn get_live(&self, id: &str) -> Result<Option<Memory>> {
         engine::memories::get_live(&self.core.lock(), id)
@@ -569,6 +576,14 @@ impl<'c> Memories<'c> {
     /// The ids of the memories linked to entity `entity_id`.
     pub fn linked_ids(&self, entity_id: &str) -> Result<HashSet<String>> {
         engine::graph::linked_ids(&self.core.lock(), entity_id)
+    }
+
+    /// Every live, unsuperseded memory `filter` admits, newest first on its
+    /// window's timestamp (ties by id). Serves a search with a time window and
+    /// no query text, where there is nothing to rank. Unlimited, because the
+    /// caller's validity and confidence filters must run before its `limit`.
+    pub fn window_hits(&self, filter: &KeywordFilter) -> Result<Vec<Memory>> {
+        engine::memories::window_hits(&self.core.lock(), filter)
     }
 
     /// The ids of every memory marked sensitive.
@@ -1280,6 +1295,7 @@ mod tests {
                 category: text("fact"),
                 include_sensitive: true,
                 narrowing: Default::default(),
+                window: Default::default(),
             },
         ];
         for query in queries {

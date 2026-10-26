@@ -48,6 +48,10 @@ pub mod notifications;
 pub mod obsidian_import;
 pub mod pdf_import;
 pub mod pid;
+pub mod project;
+pub mod project_backfill;
+pub mod project_proposals;
+pub mod project_tool;
 pub mod promotion;
 pub mod query_expansion;
 pub mod rate_limit;
@@ -70,6 +74,7 @@ pub mod sync;
 pub mod telemetry;
 #[doc(hidden)]
 pub mod testing;
+pub mod time_window;
 pub mod tool_profiles;
 pub mod transcript;
 pub mod undo_import;
