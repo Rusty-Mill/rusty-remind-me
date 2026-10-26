@@ -31,7 +31,7 @@
 //! # Budget
 //!
 //! Tokens of the returned text, by the estimator search trims with
-//! ([`estimated_content_tokens`], bytes / 4). Every piece is costed as the
+//! ([`crate::retrieval::estimated_content_tokens`], bytes / 4). Every piece is costed as the
 //! larger of its compact JSON and its Markdown, rounded up, so either
 //! rendering of the brief stays within the budget: the envelope and each
 //! section's heading are reserved first, then each section is allotted a
@@ -47,7 +47,6 @@ use crate::db::memories::Memories;
 use crate::db::{Result, Store, StoreError};
 use crate::entity::{normalize_entity_name, resolve_entity};
 use crate::models::{Memory, MemorySearchInput, ReminderWindow};
-use crate::retrieval::estimated_content_tokens;
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 use std::collections::{BTreeSet, HashSet};
@@ -848,6 +847,7 @@ mod tests {
     use crate::db::memories::NewMemory;
     use crate::db::Database;
     use crate::models::EntityInput;
+    use crate::retrieval::estimated_content_tokens;
 
     fn add(store: &Store<'_>, id: &str, f: impl FnOnce(&mut NewMemory)) {
         let mut row = NewMemory::new(id, format!("content of {id}"), &Utc::now().to_rfc3339());
