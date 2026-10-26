@@ -1,6 +1,9 @@
 # ADR-0027: Projects are entities with evidenced claims
 
-Status: Accepted (2026-10-26, owner approval); not yet implemented
+Status: Accepted (2026-10-26). The owner approved this design as written on
+the project thread for [Mill Board #57](https://claude.ai/artifact/8FH4gghybgGz7UBj24rA4T)
+("Approve as written"), recorded in that card's notes. Implemented in
+[#1094](https://github.com/Rusty-Mill/rusty_mill/pull/1094).
 Date: 2026-10-26
 Board: Mill Board #57
 
@@ -55,9 +58,19 @@ scheme. ADR-0012 gives tasks `tick:<task uuid>`; a list here is
 `tick:list:<list uuid>`, so the reference detector's task rule never takes a
 list for a task.
 
-Writing a claim supersedes the previous one through the existing SPO rule.
+Writing a claim supersedes every other live claim of the same
+`(project, predicate)`. It does not reuse `supersede_contradicting_facts`,
+whose case-folding equality would call `crates/Foo` and `crates/foo` the same
+path: equality is per predicate (enums and normalised URLs and tick ids by
+value, paths case-sensitively, a parent by entity name). A `set` or `revert`
+writes its evidence, claims and supersessions in one `Store::transaction`.
 Claim memories are `memory_type: fact`, tagged `project-record`, and synced
-like any memory. Claim memories are never edited after they are written.
+like any memory. They are never edited or deleted after they are written:
+generic update, annotate, delete, bulk delete and bulk tag refuse them, and
+consolidation never takes one as a candidate. Text this module saves (the
+`because` sentence, the claim's content) passes the same secret scrubber as
+any capture; a project or parent name that looks like a secret is refused,
+since subject and object are not redacted.
 
 **History and reversal are new work, not existing tools.** `remind_me_history`
 and `remind_me_revert` (`history.rs`) record and roll back edits *within* one

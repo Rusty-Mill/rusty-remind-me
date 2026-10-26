@@ -288,6 +288,7 @@ pub fn delete_memory(store: &Store<'_>, memory_id: &str) -> Result<bool> {
     let Some(category) = memories.live_category(memory_id)? else {
         return Ok(false);
     };
+    refuse_claims(store, &[memory_id.to_string()])?;
 
     // A tombstoned memory's embeddings are stale the moment it stops being
     // searchable, same as an incoming sync tombstone's are, so they go on
@@ -333,6 +334,8 @@ pub fn empty_tombstones(store: &Store<'_>) -> Result<(usize, usize)> {
 /// independently — reused, not reimplemented, so the two paths cannot drift —
 /// and one missing id does not fail the rest of the batch.
 pub fn bulk_delete(store: &Store<'_>, ids: &[String]) -> Result<BulkDeleteResult> {
+    // Checked before any delete, so a claim in the batch refuses all of it.
+    refuse_claims(store, ids)?;
     let mut result = BulkDeleteResult::default();
     for id in ids {
         if delete_memory(store, id)? {
@@ -344,11 +347,24 @@ pub fn bulk_delete(store: &Store<'_>, ids: &[String]) -> Result<BulkDeleteResult
     Ok(result)
 }
 
+/// Refuse when any of `ids` is a project claim, which is append-only
+/// (ADR-0027); missing ids are left to the caller.
+fn refuse_claims(store: &Store<'_>, ids: &[String]) -> Result<()> {
+    let memories = Memories::new(store);
+    for id in ids {
+        if let Some(memory) = memories.get_live(id)? {
+            crate::project::refuse_claim_edit(&memory)?;
+        }
+    }
+    Ok(())
+}
+
 /// Add, remove, or replace tags on several memories in one request.
 ///
 /// A missing id is recorded in `not_found` and the rest of the batch still
 /// applies, matching [`bulk_delete`]'s per-item error handling.
 pub fn bulk_tag(store: &Store<'_>, input: &BulkTagInput) -> Result<BulkTagResult> {
+    refuse_claims(store, &input.ids)?;
     let memories = Memories::new(store);
     let now = Utc::now().to_rfc3339();
     let mut result = BulkTagResult::default();

@@ -254,6 +254,12 @@ pub(crate) fn consolidation_candidates(
     let mut rows: Vec<MemoryRow> = memories::rows(core)
         .filter(|r| r.status == "active" && live(r))
         .filter(|r| category.is_none_or(|c| r.category == c))
+        // Project claims are append-only (ADR-0027): never merged away.
+        .filter(|r| {
+            !r.predicate
+                .as_deref()
+                .is_some_and(crate::project::is_reserved_predicate)
+        })
         .collect();
     rows.sort_by(|a, b| (&a.created_at, &a.id).cmp(&(&b.created_at, &b.id)));
     let mut candidates = Vec::new();

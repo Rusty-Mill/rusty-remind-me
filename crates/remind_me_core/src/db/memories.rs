@@ -436,8 +436,8 @@ impl<'c> Memories<'c> {
         engine::memories::all_live(&self.core.lock())
     }
 
-    /// Undeleted memories whose predicate starts with `prefix`, superseded
-    /// ones included, oldest first (ties by id).
+    /// Undeleted memories whose predicate starts with `prefix`, ignoring
+    /// case, superseded ones included, oldest first (ties by id).
     pub fn with_predicate_prefix(&self, prefix: &str) -> Result<Vec<Memory>> {
         engine::memories::with_predicate_prefix(&self.core.lock(), prefix)
     }

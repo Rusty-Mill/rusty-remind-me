@@ -21,7 +21,7 @@ use crate::db::memories::{Memories, NewMemory};
 use crate::db::{Result, Store, StoreError};
 use crate::entity::{
     entity_id, get_entity_by_id, link_memory_entity, normalize_entity_name, resolve_entity,
-    supersede_contradicting_facts, upsert_entity,
+    upsert_entity,
 };
 use crate::models::{EntityInput, Memory, FACT_CATEGORY};
 use crate::vitality::{calculate_vitality, get_decay_rate, get_source_prior, get_type_prior};
@@ -131,7 +131,8 @@ impl Predicate {
 }
 
 /// A repository URL, normalised to `https://host/owner/name`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// Serialize only: a value is built by `parse`, never deserialized around it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct RepoUrl(String);
 
@@ -183,7 +184,7 @@ fn scp_style(raw: &str) -> Option<String> {
 }
 
 /// A path relative to a repository root, `/`-separated, never escaping it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct RepoPath(String);
 
@@ -216,7 +217,7 @@ impl RepoPath {
 }
 
 /// A rusty_tick list reference, `tick:list:<uuid>` (ADR-0012's `tick:` scheme).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct TickListId(String);
 
@@ -289,6 +290,37 @@ impl ClaimValue {
             Self::Tracker(t) => t.as_str().to_string(),
             Self::Parent(name) => name.clone(),
         }
+    }
+
+    /// Refuse a value that did not come out of [`ClaimValue::parse`], such as
+    /// a hand-built `Parent("")`: the variants are public, so `set` checks.
+    fn validated(&self) -> Result<()> {
+        if ClaimValue::parse(self.predicate(), &self.object())? != *self {
+            return Err(StoreError::Invalid(format!(
+                "{} '{}' is not in canonical form",
+                self.predicate().qualified(),
+                self.object()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Equality as the predicate defines it. A parent is an entity name, so
+    /// it compares the way entity names do; every other value is already
+    /// canonical, and a path stays case-sensitive.
+    pub fn same_as(&self, other: &ClaimValue) -> bool {
+        match (self, other) {
+            (Self::Parent(a), Self::Parent(b)) => {
+                normalize_entity_name(a) == normalize_entity_name(b)
+            }
+            _ => self == other,
+        }
+    }
+
+    /// The value a stored claim memory holds, `None` when it does not parse.
+    fn of(memory: &Memory) -> Option<Self> {
+        let predicate = Predicate::from_qualified(pred(memory)).ok()?;
+        ClaimValue::parse(predicate, memory.object.as_deref()?).ok()
     }
 }
 
@@ -461,7 +493,7 @@ pub fn refuse_reserved_predicate(predicate: Option<&str>) -> Result<()> {
     }
 }
 
-/// Refuse an edit to a claim memory: claims are append-only.
+/// Refuse an edit or delete of a claim memory: claims are append-only.
 pub fn refuse_claim_edit(memory: &Memory) -> Result<()> {
     if memory
         .predicate
@@ -469,7 +501,7 @@ pub fn refuse_claim_edit(memory: &Memory) -> Result<()> {
         .is_some_and(is_reserved_predicate)
     {
         return Err(StoreError::Invalid(format!(
-            "memory {} is a project claim and cannot be edited; use remind_me_project revert",
+            "memory {} is a project claim and cannot be edited or deleted; use remind_me_project revert",
             memory.id
         )));
     }
@@ -481,7 +513,14 @@ pub fn refuse_claim_edit(memory: &Memory) -> Result<()> {
 /// Every project and every record that failed to project.
 pub fn list(store: &Store<'_>) -> Result<ProjectList> {
     let mut out = ProjectList::default();
-    for (_, chain) in claims_by_subject(store)? {
+    let (groups, orphans) = claims_by_subject(store)?;
+    out.invalid
+        .extend(orphans.into_iter().map(|m| InvalidRecord {
+            subject: String::new(),
+            claim_id: Some(m.id),
+            reason: format!("{} claim has no subject", pred_or_none(&m.predicate)),
+        }));
+    for (_, chain) in groups {
         if let Some(project) = project_from(store, &chain, &mut out.invalid)? {
             out.projects.push(project);
         }
@@ -553,23 +592,34 @@ fn pred(memory: &Memory) -> &str {
     memory.predicate.as_deref().unwrap_or_default()
 }
 
-/// Claim memories grouped by normalised subject, each oldest first.
-fn claims_by_subject(store: &Store<'_>) -> Result<BTreeMap<String, Vec<Memory>>> {
+fn pred_or_none(predicate: &Option<String>) -> &str {
+    predicate.as_deref().unwrap_or("project.*")
+}
+
+/// Claim memories grouped by normalised subject, each oldest first, and the
+/// claims with no subject at all, which no project can own.
+type ClaimGroups = (BTreeMap<String, Vec<Memory>>, Vec<Memory>);
+
+fn claims_by_subject(store: &Store<'_>) -> Result<ClaimGroups> {
     let mut groups: BTreeMap<String, Vec<Memory>> = BTreeMap::new();
+    let mut orphans = Vec::new();
     for memory in Memories::new(store).with_predicate_prefix(PREDICATE_PREFIX)? {
-        let Some(subject) = memory.subject.as_deref() else {
-            continue;
-        };
-        groups
-            .entry(normalize_entity_name(subject))
-            .or_default()
-            .push(memory);
+        let subject = memory
+            .subject
+            .as_deref()
+            .map(normalize_entity_name)
+            .filter(|s| !s.is_empty());
+        match subject {
+            Some(subject) => groups.entry(subject).or_default().push(memory),
+            None => orphans.push(memory),
+        }
     }
-    Ok(groups)
+    Ok((groups, orphans))
 }
 
 fn claims_for(store: &Store<'_>, subject: &str) -> Result<Vec<Memory>> {
     Ok(claims_by_subject(store)?
+        .0
         .remove(&normalize_entity_name(subject))
         .unwrap_or_default())
 }
@@ -642,6 +692,17 @@ fn project_from(
             }
         };
         let id = memory.id.as_str();
+        if pred(memory) != predicate.qualified() {
+            report(
+                Some(id),
+                format!(
+                    "predicate '{}' is not the canonical '{}'",
+                    pred(memory),
+                    predicate.qualified()
+                ),
+            );
+            continue;
+        }
         let result = match predicate {
             Predicate::Stage => typed_claim(memory, str::parse).map(|c| stage = Some(c)),
             Predicate::Status => typed_claim(memory, str::parse).map(|c| status = Some(c)),
@@ -695,11 +756,19 @@ fn entity_ref(store: &Store<'_>, subject: &str) -> Result<EntityRef> {
 /// Everything is validated before anything is written: the claims, that no
 /// predicate repeats, that each evidence id is a live memory, and that a new
 /// project gets both a stage and a status. A claim equal to the live value is
-/// skipped and reported in [`WriteOutcome::unchanged`].
+/// skipped and reported in [`WriteOutcome::unchanged`]. The writes happen in
+/// one transaction: a failure part way leaves nothing behind.
 pub fn set(store: &Store<'_>, input: &SetInput) -> Result<WriteOutcome> {
+    store.transaction(|page| set_in(page, input))
+}
+
+fn set_in(store: &Store<'_>, input: &SetInput) -> Result<WriteOutcome> {
     let confirmed_by = required(&input.confirmed_by, "confirmed_by")?;
     if input.claims.is_empty() {
         return Err(StoreError::Invalid("no claims given".into()));
+    }
+    for claim in &input.claims {
+        claim.validated()?;
     }
     let mut seen = HashSet::new();
     if let Some(dup) = input.claims.iter().find(|c| !seen.insert(c.predicate())) {
@@ -710,11 +779,13 @@ pub fn set(store: &Store<'_>, input: &SetInput) -> Result<WriteOutcome> {
     }
 
     let subject = canonical_subject(store, &input.project)?;
+    refuse_secret(&subject, "project name")?;
     if let Some(ClaimValue::Parent(parent)) = input
         .claims
         .iter()
         .find(|c| c.predicate() == Predicate::Parent)
     {
+        refuse_secret(parent, "parent name")?;
         if normalize_entity_name(parent) == normalize_entity_name(&subject) {
             return Err(StoreError::Invalid(
                 "a project cannot be its own parent".into(),
@@ -744,13 +815,16 @@ pub fn set(store: &Store<'_>, input: &SetInput) -> Result<WriteOutcome> {
         ));
     }
 
+    // Unchanged only when the live claim is canonical and holds the same
+    // value; a miscased predicate is replaced so it stops being reported.
     let changed: Vec<&ClaimValue> = input
         .claims
         .iter()
         .filter(|c| {
-            live.get(&c.predicate().qualified())
-                .and_then(|m| m.object.as_deref())
-                .is_none_or(|o| normalize_entity_name(o) != normalize_entity_name(&c.object()))
+            live.get(&c.predicate().qualified()).is_none_or(|m| {
+                pred(m) != c.predicate().qualified()
+                    || ClaimValue::of(m).is_none_or(|v| !v.same_as(c))
+            })
         })
         .collect();
     let mut outcome = WriteOutcome {
@@ -791,7 +865,7 @@ pub fn set(store: &Store<'_>, input: &SetInput) -> Result<WriteOutcome> {
             proposal: input.proposal.clone(),
             reverts: None,
         };
-        let (id, superseded) = write_claim(store, &entity.name, claim, &meta)?;
+        let (id, superseded) = write_claim(store, &entity.name, claim, &meta, &chain)?;
         outcome.written.push(id);
         outcome.superseded.extend(superseded);
     }
@@ -803,7 +877,12 @@ pub fn set(store: &Store<'_>, input: &SetInput) -> Result<WriteOutcome> {
 /// The new claim restores the most recent earlier value that differs, cites
 /// that claim's evidence plus the `because` sentence, and names the claim it
 /// reverts. Refused when the claim is not current or nothing earlier differs.
+/// Like [`set`], it writes in one transaction.
 pub fn revert(store: &Store<'_>, input: &RevertInput) -> Result<WriteOutcome> {
+    store.transaction(|page| revert_in(page, input))
+}
+
+fn revert_in(store: &Store<'_>, input: &RevertInput) -> Result<WriteOutcome> {
     let confirmed_by = required(&input.confirmed_by, "confirmed_by")?;
     let because = required(&input.because, "because")?;
     let subject = canonical_subject(store, &input.project)?;
@@ -821,18 +900,16 @@ pub fn revert(store: &Store<'_>, input: &RevertInput) -> Result<WriteOutcome> {
         )));
     }
 
-    let target_object = normalize_entity_name(target.object.as_deref().unwrap_or_default());
-    let earlier = chain
+    // An unparsable current value differs from every valid earlier one.
+    let current = ClaimValue::of(target);
+    let (earlier, restored) = chain
         .iter()
         .take_while(|m| m.id != target.id)
         .filter(|m| normalize_entity_name(pred(m)) == key)
-        .filter(|m| normalize_entity_name(m.object.as_deref().unwrap_or_default()) != target_object)
+        .filter_map(|m| ClaimValue::of(m).map(|v| (m, v)))
+        .filter(|(_, v)| current.as_ref().is_none_or(|c| !c.same_as(v)))
         .last()
         .ok_or_else(|| StoreError::Invalid(format!("no earlier {key} to restore")))?;
-    let restored = ClaimValue::parse(
-        Predicate::from_qualified(&key)?,
-        earlier.object.as_deref().unwrap_or_default(),
-    )?;
     let earlier_meta = ClaimMeta::from_metadata(&earlier.metadata).map_err(StoreError::Invalid)?;
 
     let entity = upsert_entity(
@@ -857,7 +934,7 @@ pub fn revert(store: &Store<'_>, input: &RevertInput) -> Result<WriteOutcome> {
         proposal: None,
         reverts: Some(target.id.clone()),
     };
-    let (id, superseded) = write_claim(store, &entity.name, &restored, &meta)?;
+    let (id, superseded) = write_claim(store, &entity.name, &restored, &meta, &chain)?;
     Ok(WriteOutcome {
         project: entity.name,
         written: vec![id],
@@ -875,6 +952,18 @@ fn required<'a>(value: &'a str, field: &str) -> Result<&'a str> {
     Ok(trimmed)
 }
 
+/// Refuse a name the secret scrubber would rewrite. A name is stored in the
+/// claim's subject or object, which are not redacted, so it is refused
+/// rather than saved with the secret in it.
+fn refuse_secret(name: &str, what: &str) -> Result<()> {
+    let mut tags = Vec::new();
+    let mut metadata = Value::Null;
+    if crate::boundary::scrub(name, &mut tags, &mut metadata) != name {
+        return Err(StoreError::Invalid(format!("{what} looks like a secret")));
+    }
+    Ok(())
+}
+
 fn check_live(store: &Store<'_>, ids: &[String]) -> Result<()> {
     let memories = Memories::new(store);
     for id in ids.iter().map(|id| id.trim()).filter(|id| !id.is_empty()) {
@@ -887,8 +976,10 @@ fn check_live(store: &Store<'_>, ids: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// A fact memory written by this module, stamped like any local write.
-fn new_fact(content: String, tags: Vec<String>, metadata: Value) -> NewMemory {
+/// A fact memory written by this module, stamped like any local write, with
+/// its content passed through the same secret scrubber as every other write.
+fn new_fact(content: &str, mut tags: Vec<String>, mut metadata: Value) -> NewMemory {
+    let content = crate::boundary::scrub(content, &mut tags, &mut metadata);
     let now = Utc::now();
     let now_iso = now.to_rfc3339();
     let decay_rate = get_decay_rate(FACT_CATEGORY);
@@ -913,7 +1004,7 @@ fn new_fact(content: String, tags: Vec<String>, metadata: Value) -> NewMemory {
 
 fn write_because(store: &Store<'_>, entity_id: &str, sentence: &str) -> Result<String> {
     let row = new_fact(
-        sentence.to_string(),
+        sentence,
         vec![EVIDENCE_TAG.to_string()],
         Value::Object(Default::default()),
     );
@@ -922,32 +1013,53 @@ fn write_because(store: &Store<'_>, entity_id: &str, sentence: &str) -> Result<S
     Ok(row.id)
 }
 
-/// Write one claim memory and supersede the value it replaces.
+#[cfg(test)]
+thread_local! {
+    /// Fail the n-th claim write on this thread (1-based), to prove `set`
+    /// and `revert` leave nothing behind when a write fails part way.
+    static FAIL_CLAIM_WRITE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Write one claim memory and supersede every other live claim of its
+/// predicate in `chain`, the project's claims as read before this write.
 fn write_claim(
     store: &Store<'_>,
     subject: &str,
     claim: &ClaimValue,
     meta: &ClaimMeta,
+    chain: &[Memory],
 ) -> Result<(String, Vec<String>)> {
+    #[cfg(test)]
+    if FAIL_CLAIM_WRITE.with(|n| {
+        let left = n.get();
+        n.set(left.saturating_sub(1));
+        left == 1
+    }) {
+        return Err(StoreError::Engine("injected claim write failure".into()));
+    }
     let predicate = claim.predicate().qualified();
     let object = claim.object();
     let metadata = serde_json::json!({ META_KEY: meta });
     let mut row = new_fact(
-        format!("Project {subject}: {} is {object}", claim.predicate()),
+        &format!("Project {subject}: {} is {object}", claim.predicate()),
         vec![CLAIM_TAG.to_string()],
         metadata,
     );
     row.subject = Some(subject.to_string());
     row.predicate = Some(predicate.clone());
-    row.object = Some(object.clone());
-    Memories::new(store).insert(&row)?;
-    let superseded = supersede_contradicting_facts(
-        store,
-        &row.id,
-        Some(subject),
-        Some(&predicate),
-        Some(&object),
-    )?;
+    row.object = Some(object);
+    let memories = Memories::new(store);
+    memories.insert(&row)?;
+
+    let mut superseded = Vec::new();
+    for old in chain
+        .iter()
+        .filter(|m| m.superseded_by.is_none())
+        .filter(|m| normalize_entity_name(pred(m)) == predicate)
+    {
+        memories.set_superseded_by(&old.id, &row.id, Some(&row.created_at))?;
+        superseded.push(old.id.clone());
+    }
     Ok((row.id, superseded))
 }
 
@@ -957,11 +1069,7 @@ mod tests {
     use crate::db::Database;
 
     fn seed(store: &Store<'_>, content: &str) -> String {
-        let row = new_fact(
-            content.to_string(),
-            Vec::new(),
-            Value::Object(Default::default()),
-        );
+        let row = new_fact(content, Vec::new(), Value::Object(Default::default()));
         Memories::new(store).insert(&row).unwrap();
         row.id
     }
@@ -1276,7 +1384,7 @@ mod tests {
     fn a_malformed_synced_claim_is_reported_not_dropped() {
         let db = Database::open_in_memory().unwrap();
         let store = db.store();
-        let mut row = new_fact("bad".into(), vec![CLAIM_TAG.into()], serde_json::json!({}));
+        let mut row = new_fact("bad", vec![CLAIM_TAG.into()], serde_json::json!({}));
         row.subject = Some("ghost".into());
         row.predicate = Some("project.stage".into());
         row.object = Some("shipped".into());
@@ -1353,5 +1461,226 @@ mod tests {
         let fact = seed(&store, "seen");
         create(&store, "mill", Stage::Idea, &fact);
         assert!(set_one(&store, "mill", ClaimValue::Parent("Mill".into()), "x").is_err());
+    }
+
+    // --- review round 2 ----------------------------------------------------
+
+    /// A synthetic AWS key id: the redaction rules' own fixture shape.
+    const SECRET: &str = "AKIAIOSFODNN7EXAMPLE";
+
+    #[test]
+    fn a_secret_in_because_is_redacted_and_one_in_a_name_is_refused() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        let fact = seed(&store, "seen");
+        create(&store, "mill", Stage::Idea, &fact);
+
+        let because = format!("deploy key {SECRET} proves it");
+        let built = set_one(&store, "mill", ClaimValue::Stage(Stage::Built), &because).unwrap();
+        let saved = Memories::new(&store)
+            .get_live(built.because_id.as_deref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(!saved.content.contains(SECRET), "{}", saved.content);
+        assert!(saved.content.contains("[REDACTED:"));
+
+        let named = set_one(&store, SECRET, ClaimValue::Stage(Stage::Idea), "x");
+        assert!(named.is_err());
+        let parent = set_one(&store, "mill", ClaimValue::Parent(SECRET.into()), "x");
+        assert!(parent.is_err());
+        let all = Memories::new(&store).all_live().unwrap();
+        assert!(all.iter().all(|m| !m.content.contains(SECRET)
+            && m.subject.as_deref().is_none_or(|s| !s.contains(SECRET))
+            && m.object.as_deref().is_none_or(|o| !o.contains(SECRET))));
+    }
+
+    #[test]
+    fn a_failed_write_part_way_leaves_nothing_behind() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        let fact = seed(&store, "seen");
+        create(&store, "mill", Stage::Idea, &fact);
+        let before = Memories::new(&store).all_live().unwrap().len();
+
+        // The second of two claims fails: the first claim, its supersession
+        // and the because sentence must all roll back.
+        FAIL_CLAIM_WRITE.with(|n| n.set(2));
+        let failed = set(
+            &store,
+            &SetInput {
+                project: "mill".into(),
+                claims: vec![
+                    ClaimValue::Stage(Stage::Built),
+                    ClaimValue::Status(Status::Dormant),
+                ],
+                evidence: Vec::new(),
+                because: Some("both changed".into()),
+                confirmed_by: "human".into(),
+                proposal: None,
+            },
+        );
+        assert!(failed.is_err());
+        assert_eq!(Memories::new(&store).all_live().unwrap().len(), before);
+        let project = get(&store, "mill").unwrap().unwrap();
+        assert_eq!(project.stage.value, Stage::Idea);
+        assert_eq!(project.status.value, Status::Active);
+
+        let built = set_one(&store, "mill", ClaimValue::Stage(Stage::Built), "b").unwrap();
+        let count = Memories::new(&store).all_live().unwrap().len();
+        FAIL_CLAIM_WRITE.with(|n| n.set(1));
+        let reverted = revert(
+            &store,
+            &RevertInput {
+                project: "mill".into(),
+                claim_id: built.written[0].clone(),
+                because: "undo".into(),
+                confirmed_by: "human".into(),
+            },
+        );
+        assert!(reverted.is_err());
+        assert_eq!(Memories::new(&store).all_live().unwrap().len(), count);
+        assert_eq!(
+            get(&store, "mill").unwrap().unwrap().stage.value,
+            Stage::Built
+        );
+    }
+
+    #[test]
+    fn delete_tagging_and_consolidation_leave_claims_alone() {
+        use crate::db::queries::{bulk_delete, bulk_tag, delete_memory};
+        use crate::db::vectors::Vectors;
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        let fact = seed(&store, "seen");
+        let claims = create(&store, "mill", Stage::Idea, &fact).written;
+
+        assert!(delete_memory(&store, &claims[0]).is_err());
+        assert!(bulk_delete(&store, &[fact.clone(), claims[1].clone()]).is_err());
+        assert!(
+            Memories::new(&store).get_live(&fact).unwrap().is_some(),
+            "a refused batch deletes nothing"
+        );
+        let tag = serde_json::from_value(serde_json::json!({
+            "ids": [claims[0]], "tags": ["x"], "mode": "set",
+        }))
+        .unwrap();
+        assert!(bulk_tag(&store, &tag).is_err());
+
+        let vectors = Vectors::new(&store);
+        for id in claims.iter().chain([&fact]) {
+            vectors.put(id, 0, &[1, 0, 0, 0]).unwrap();
+        }
+        let candidates: Vec<String> = vectors
+            .consolidation_candidates(None, 10)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(candidates, [fact.clone()]);
+
+        assert!(
+            delete_memory(&store, &fact).unwrap(),
+            "evidence still deletes"
+        );
+        let project = get(&store, "mill").unwrap().unwrap();
+        assert_eq!(project.stage.value, Stage::Idea);
+        assert_eq!(project.status.value, Status::Active);
+    }
+
+    #[test]
+    fn paths_compare_case_sensitively_and_parents_do_not() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        let fact = seed(&store, "seen");
+        create(&store, "mill", Stage::Idea, &fact);
+        let path = |p: &str| ClaimValue::Path(RepoPath::parse(p).unwrap());
+
+        set_one(&store, "mill", path("crates/Foo"), "a").unwrap();
+        let lower = set_one(&store, "mill", path("crates/foo"), "b").unwrap();
+        assert_eq!(lower.written.len(), 1, "a case change is a change");
+        assert_eq!(lower.superseded.len(), 1);
+
+        let undone = revert(
+            &store,
+            &RevertInput {
+                project: "mill".into(),
+                claim_id: lower.written[0].clone(),
+                because: "it was Foo".into(),
+                confirmed_by: "human".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(undone.superseded, lower.written);
+        let anchors = get(&store, "mill").unwrap().unwrap().anchors;
+        assert_eq!(anchors.path.unwrap().value.as_str(), "crates/Foo");
+
+        set_one(&store, "mill", ClaimValue::Parent("rusty_mill".into()), "c").unwrap();
+        let same = set_one(&store, "mill", ClaimValue::Parent("Rusty_Mill".into()), "d").unwrap();
+        assert_eq!(same.unchanged, [Predicate::Parent]);
+    }
+
+    #[test]
+    fn hand_built_values_are_revalidated_before_any_write() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        let fact = seed(&store, "seen");
+        create(&store, "mill", Stage::Idea, &fact);
+        let before = Memories::new(&store).all_live().unwrap().len();
+        for bad in [
+            ClaimValue::Parent(String::new()),
+            ClaimValue::Parent("  two   spaces ".into()),
+            ClaimValue::Path(RepoPath("../escape".into())),
+            ClaimValue::Repo(RepoUrl("not a url".into())),
+            ClaimValue::Tracker(TickListId("tick:list:nope".into())),
+        ] {
+            assert!(
+                set_one(&store, "mill", bad.clone(), "x").is_err(),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(Memories::new(&store).all_live().unwrap().len(), before);
+    }
+
+    #[test]
+    fn subjectless_and_miscased_claims_are_reported() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        let fact = seed(&store, "seen");
+        create(&store, "mill", Stage::Idea, &fact);
+        let synced = |subject: Option<&str>, predicate: &str, object: &str| {
+            let meta =
+                serde_json::json!({ META_KEY: { "evidence": [fact], "confirmed_by": "peer" } });
+            let mut row = new_fact("synced", vec![CLAIM_TAG.into()], meta);
+            row.subject = subject.map(str::to_string);
+            row.predicate = Some(predicate.into());
+            row.object = Some(object.into());
+            Memories::new(&store).insert(&row).unwrap();
+            row.id
+        };
+        let orphan = synced(None, "project.stage", "built");
+        let blank = synced(Some("  "), "project.stage", "built");
+        let miscased = synced(Some("mill"), "Project.Status", "dormant");
+
+        let listed = list(&store).unwrap();
+        let reported = |id: &str| {
+            listed
+                .invalid
+                .iter()
+                .any(|r| r.claim_id.as_deref() == Some(id))
+        };
+        assert!(reported(&orphan) && reported(&blank) && reported(&miscased));
+        assert!(listed.projects.is_empty(), "mill has no valid live status");
+
+        // Confirming a status supersedes every live status claim, the
+        // miscased one included, and the report clears.
+        let fixed = set_one(&store, "mill", ClaimValue::Status(Status::Dormant), "ok").unwrap();
+        assert_eq!(fixed.superseded.len(), 2);
+        assert!(fixed.superseded.contains(&miscased));
+        let listed = list(&store).unwrap();
+        assert_eq!(listed.projects.len(), 1);
+        assert!(!listed
+            .invalid
+            .iter()
+            .any(|r| r.claim_id.as_deref() == Some(miscased.as_str())));
     }
 }
