@@ -1,4 +1,4 @@
-use crate::models::{Memory, MemorySearchResult, RetrievalStrategy};
+use crate::models::{Memory, MemorySearchResult, RetrievalStrategy, SearchDetail};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -566,6 +566,9 @@ pub struct TrimOutcome {
     /// boolean: "3 were cut" and "something was cut" are different answers,
     /// and only one of them tells a caller whether to raise the budget.
     pub trimmed: usize,
+    /// Ids of the dropped results, in rank order, so a caller can fetch them
+    /// by id instead of re-running the search with a bigger budget.
+    pub trimmed_ids: Vec<String>,
     /// Estimated tokens across what was kept.
     pub tokens_used: usize,
     /// What the wall-clock deadline did to this search (#257).
@@ -729,21 +732,57 @@ pub fn estimated_content_tokens(content: &str) -> usize {
     (content.len() / 4).max(1)
 }
 
-/// Estimated token cost of one result.
-fn estimated_tokens(result: &MemorySearchResult) -> usize {
-    estimated_content_tokens(&result.memory.content)
+/// Characters of content a compact hit carries.
+pub const COMPACT_SNIPPET_CHARS: usize = 160;
+
+/// Flat token charge for a compact hit's id, category, date, tags and score,
+/// on top of its snippet. A rough constant rather than a measurement of the
+/// rendered line: the estimator is already `len / 4`, and the point is only
+/// that a compact hit is not free.
+pub const COMPACT_META_TOKENS: usize = 24;
+
+/// The first [`COMPACT_SNIPPET_CHARS`] characters of `content`, whitespace
+/// collapsed to single spaces, with `…` when anything was cut.
+///
+/// By character, not byte, so a multi-byte boundary cannot be split.
+pub fn compact_snippet(content: &str) -> String {
+    let flat = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= COMPACT_SNIPPET_CHARS {
+        return flat;
+    }
+    let cut: String = flat.chars().take(COMPACT_SNIPPET_CHARS).collect();
+    format!("{}…", cut.trim_end())
 }
 
-pub fn trim_by_token_budget(results: Vec<MemorySearchResult>, token_budget: usize) -> TrimOutcome {
+/// Estimated token cost of one result at `detail`.
+fn estimated_tokens(result: &MemorySearchResult, detail: SearchDetail) -> usize {
+    match detail {
+        SearchDetail::Full => estimated_content_tokens(&result.memory.content),
+        SearchDetail::Compact => {
+            estimated_content_tokens(&compact_snippet(&result.memory.content)) + COMPACT_META_TOKENS
+        }
+    }
+}
+
+/// Keep ranked results, in order, until the next would exceed `token_budget`.
+///
+/// Each hit is charged at `detail`, so a compact search fits more hits into
+/// the same budget. The first hit is always kept, and `0` means unlimited.
+pub fn trim_by_token_budget(
+    results: Vec<MemorySearchResult>,
+    token_budget: usize,
+    detail: SearchDetail,
+) -> TrimOutcome {
     let total_candidates = results.len();
 
     if token_budget == 0 {
         // Unlimited. The tokens are still counted, because "how big was this
         // response" is a fair question even when nothing was cut.
-        let tokens_used = results.iter().map(estimated_tokens).sum();
+        let tokens_used = results.iter().map(|r| estimated_tokens(r, detail)).sum();
         return TrimOutcome {
             returned: total_candidates,
             trimmed: 0,
+            trimmed_ids: Vec::new(),
             tokens_used,
             total_candidates,
             results,
@@ -753,11 +792,25 @@ pub fn trim_by_token_budget(results: Vec<MemorySearchResult>, token_budget: usiz
 
     let mut tokens_used = 0;
     let mut kept = Vec::new();
+    let mut rest = results.into_iter();
 
-    for res in results {
-        let est_tokens = estimated_tokens(&res);
+    for res in rest.by_ref() {
+        let est_tokens = estimated_tokens(&res, detail);
         if tokens_used + est_tokens > token_budget && !kept.is_empty() {
-            break;
+            // Put the one that did not fit back at the head of the dropped set.
+            let trimmed_ids: Vec<String> = std::iter::once(res)
+                .chain(rest)
+                .map(|r| r.memory.id)
+                .collect();
+            return TrimOutcome {
+                returned: kept.len(),
+                trimmed: trimmed_ids.len(),
+                trimmed_ids,
+                tokens_used,
+                total_candidates,
+                results: kept,
+                timing: SearchTiming::default(),
+            };
         }
         tokens_used += est_tokens;
         kept.push(res);
@@ -765,7 +818,8 @@ pub fn trim_by_token_budget(results: Vec<MemorySearchResult>, token_budget: usiz
 
     TrimOutcome {
         returned: kept.len(),
-        trimmed: total_candidates - kept.len(),
+        trimmed: 0,
+        trimmed_ids: Vec::new(),
         tokens_used,
         total_candidates,
         results: kept,
@@ -995,6 +1049,64 @@ mod tests {
             written_by: "unknown".to_string(),
             capture_method: "manual".to_string(),
         }
+    }
+
+    fn hit(id: &str, content: &str) -> MemorySearchResult {
+        MemorySearchResult {
+            memory: Memory {
+                content: content.to_string(),
+                ..mem(id, 1.0)
+            },
+            score: 1.0,
+            fts_score: None,
+            vec_score: None,
+            recency_score: None,
+            vitality_score: None,
+            idf_score: None,
+            feedback_adjustment: None,
+            rerank_score: None,
+        }
+    }
+
+    fn long_hits(n: usize) -> Vec<MemorySearchResult> {
+        (0..n)
+            .map(|i| hit(&format!("m{i}"), &"word ".repeat(400)))
+            .collect()
+    }
+
+    #[test]
+    fn compact_snippet_collapses_whitespace_and_keeps_short_text_whole() {
+        assert_eq!(compact_snippet("  one\n\ttwo   three "), "one two three");
+    }
+
+    #[test]
+    fn compact_snippet_cuts_long_text_on_a_char_boundary() {
+        let snippet = compact_snippet(&"é".repeat(500));
+        assert!(snippet.ends_with('…'));
+        assert_eq!(snippet.chars().count(), COMPACT_SNIPPET_CHARS + 1);
+    }
+
+    #[test]
+    fn a_compact_trim_fits_more_hits_than_a_full_one() {
+        let full = trim_by_token_budget(long_hits(5), 800, SearchDetail::Full);
+        let compact = trim_by_token_budget(long_hits(5), 800, SearchDetail::Compact);
+        assert_eq!(full.returned, 1);
+        assert_eq!(compact.returned, 5);
+        assert!(compact.trimmed_ids.is_empty());
+    }
+
+    #[test]
+    fn a_trim_names_what_it_dropped_in_rank_order() {
+        let out = trim_by_token_budget(long_hits(4), 800, SearchDetail::Full);
+        assert_eq!(out.trimmed, 3);
+        assert_eq!(out.trimmed_ids, vec!["m1", "m2", "m3"]);
+    }
+
+    #[test]
+    fn an_unlimited_trim_drops_nothing() {
+        let out = trim_by_token_budget(long_hits(4), 0, SearchDetail::Full);
+        assert_eq!((out.returned, out.trimmed), (4, 0));
+        assert!(out.trimmed_ids.is_empty());
     }
 
     fn rank_only(weights: RrfWeights) -> RrfConfig {

@@ -97,6 +97,9 @@ pub struct MemorySearchResponse {
     pub returned: usize,
     /// How many were dropped — a count, as in the reference.
     pub trimmed: usize,
+    /// Ids of the dropped candidates, in rank order (card #51).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trimmed_ids: Vec<String>,
     /// Estimated tokens across `memories`.
     pub tokens_used: usize,
     /// The budget that was in force. `0` means unlimited.

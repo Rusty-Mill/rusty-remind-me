@@ -147,6 +147,39 @@ pub fn render_memories_markdown(memories: &[Memory]) -> String {
         .join("\n---\n")
 }
 
+/// One line per search hit: id, category, date, tags, score, marks such as
+/// `expired`, and a snippet (card #51). The compact counterpart of
+/// [`render_memories_markdown`], for a search that fetches bodies by id later.
+pub fn render_compact_hits_markdown(hits: &[crate::models::MemorySearchResult]) -> String {
+    let now = Utc::now();
+    hits.iter()
+        .map(|hit| {
+            let m = &hit.memory;
+            let tags = if m.tags.is_empty() {
+                String::new()
+            } else {
+                format!(" · {}", m.tags.join(", "))
+            };
+            let marks = crate::kinds::header_marks(m, now);
+            let marks = if marks.is_empty() {
+                String::new()
+            } else {
+                format!(" _({})_", marks.join(", "))
+            };
+            let date: String = m.created_at.chars().take(10).collect();
+            format!(
+                "- `{}` · {} · {date}{tags} · {:.2}{}{marks} — {}",
+                m.id,
+                m.category,
+                hit.score,
+                if m.sensitive { " 🔒" } else { "" },
+                crate::retrieval::compact_snippet(&m.content)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Render a `remind_me_list` page the way the reference's `_fmt_memories`
 /// does when it is given a `total`: a `**Showing N of M memories**` header
 /// ahead of the same per-memory rendering, joined by the same `\n---\n`
