@@ -295,3 +295,33 @@ fn an_extra_row_sharing_the_id_is_surfaced_not_dropped() {
         "a row that is neither half must be visible, not silently dropped"
     );
 }
+
+#[test]
+fn a_secret_never_reaches_the_title_whichever_source_it_comes_from() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let token = format!("ghp_{}", "c".repeat(36));
+    let clean = |title: &str| !title.contains("ghp_") && !title.contains("cccccccc");
+
+    // Derived from the summary, the token straddling the title's cut.
+    let pad = "x".repeat(remind_me_core::models::CAPTURE_TITLE_CHARS - 10);
+    let derived = capture(&store, "dialog", &format!("{pad} {token} done"));
+    assert!(clean(&derived.title), "{}", derived.title);
+    // Supplied by the caller.
+    let supplied = auto_capture(
+        &store,
+        &AutoCaptureInput {
+            title: format!("push with {token}"),
+            ..input("dialog", "summary")
+        },
+    )
+    .unwrap();
+    assert!(clean(&supplied.title), "{}", supplied.title);
+
+    for made in [&derived, &supplied] {
+        for id in [&made.dialog_id, &made.summary_id] {
+            let title = metadata(&store, id)["title"].as_str().unwrap().to_string();
+            assert!(clean(&title), "{title}");
+        }
+    }
+}

@@ -81,6 +81,9 @@ pub enum Op {
         cwd: Option<PathBuf>,
         reason: Option<String>,
     },
+    ImportSessions {
+        dir: PathBuf,
+    },
     Context {
         cwd: Option<PathBuf>,
         project: Option<String>,
@@ -190,6 +193,9 @@ fn run(store: &Store<'_>, op: &Op) -> Result<Value, String> {
             reason.as_deref(),
         )
         .map_err(|e| e.to_string()),
+        Op::ImportSessions { dir } => {
+            session_ops::import_sessions(store, dir).map_err(|e| e.to_string())
+        }
         Op::Context {
             cwd,
             project,
