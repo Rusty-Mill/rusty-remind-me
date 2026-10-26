@@ -624,6 +624,51 @@ pub fn api_entity(store: &Store<'_>, _wiki: &Wiki, req: &Request, _params: &Para
     }
 }
 
+/// Projects (ADR-0027). `GET` reads: the listing by default, or one project,
+/// its history or the open proposals via `action`. `POST` writes: `confirm`,
+/// `reject`, `set`, `revert` or `backfill`, with the body as the arguments.
+///
+/// Both call `project_tool::call`, the same entry point the MCP tool uses, so
+/// the dashboard and a model cannot see different data or different rules.
+pub fn api_projects(
+    store: &Store<'_>,
+    _wiki: &Wiki,
+    req: &Request,
+    _params: &Params,
+) -> (u16, Body) {
+    let args = if req.method == "POST" {
+        match json_body(req) {
+            Ok(body) => body,
+            Err(e) => return e,
+        }
+    } else {
+        let mut args = json!({});
+        let object = args.as_object_mut().expect("built as an object");
+        for key in ["action", "project", "predicate", "key"] {
+            if let Some(value) = req.query_str(key) {
+                object.insert(key.to_string(), json!(value));
+            }
+        }
+        args
+    };
+    // A read-only method must not reach a writing action, whatever it asks
+    // for: a GET that writes is a CSRF waiting to happen.
+    let action = args.get("action").and_then(Value::as_str).unwrap_or("list");
+    match action.parse::<remind_me_core::project_tool::Action>() {
+        Ok(action) if action.writes() && req.method != "POST" => {
+            return err(405, format!("{} requires POST", action.as_str()))
+        }
+        Ok(_) => {}
+        Err(e) => return err(400, e.to_string()),
+    }
+    match remind_me_core::project_tool::call(store, &args) {
+        Ok(payload) => ok(payload),
+        Err(remind_me_core::db::StoreError::Invalid(why)) => err(400, why),
+        Err(remind_me_core::db::StoreError::NotFound) => err(404, "Not found"),
+        Err(e) => internal_err(e),
+    }
+}
+
 pub fn api_entities(
     store: &Store<'_>,
     _wiki: &Wiki,
@@ -1534,6 +1579,11 @@ pub const ROUTES: &[Route] = &[
         methods: &["GET"],
         pattern: "/api/entity",
         handler: api_entity,
+    },
+    Route {
+        methods: &["GET", "POST"],
+        pattern: "/api/projects",
+        handler: api_projects,
     },
     Route {
         methods: &["GET"],

@@ -999,6 +999,24 @@ pub(crate) fn exportable(
     Ok(rows.iter().map(MemoryRow::to_memory).collect())
 }
 
+/// Undeleted memories whose predicate starts with `prefix`, ignoring case,
+/// superseded ones included, oldest first (ties by id).
+pub(crate) fn with_predicate_prefix(tables: &EngineTables, prefix: &str) -> Result<Vec<Memory>> {
+    let prefix = prefix.to_lowercase();
+    let mut rows: Vec<MemoryRow> = rows(core_ref(tables)?)
+        .filter(|row| row.deleted_at.is_none())
+        // Case-insensitive, so a miscased predicate from another writer is
+        // found and reported rather than missed.
+        .filter(|row| {
+            row.predicate
+                .as_deref()
+                .is_some_and(|p| p.trim().to_lowercase().starts_with(&prefix))
+        })
+        .collect();
+    rows.sort_by(|a, b| (&a.created_at, &a.id).cmp(&(&b.created_at, &b.id)));
+    Ok(rows.iter().map(MemoryRow::to_memory).collect())
+}
+
 pub(crate) fn all_live(tables: &EngineTables) -> Result<Vec<Memory>> {
     Ok(rows(core_ref(tables)?)
         .filter(|row| row.deleted_at.is_none())

@@ -165,6 +165,46 @@ pub fn store(
     Ok(Some(path))
 }
 
+/// The archive id a session's transcript is kept under.
+pub fn session_import_id(session_id: &str) -> String {
+    format!("session:{session_id}")
+}
+
+/// Retain a session transcript as the source of `memory_id`, if retention is
+/// on, replacing the session's previous copy.
+///
+/// A session is captured again on every hook firing, each time with the whole
+/// transcript so far, so one archive per session is kept rather than one per
+/// firing: the new blob is written, the row and the span are replaced, and the
+/// old blob is unlinked unless another archive still points at it.
+pub fn store_session(
+    store: &Store<'_>,
+    session_id: &str,
+    raw: &[u8],
+    memory_id: &str,
+) -> Result<Option<PathBuf>, ArchiveError> {
+    if !is_enabled() {
+        return Ok(None);
+    }
+    let import_id = session_import_id(session_id);
+    let archives = Archives::new(store);
+    let previous = archives.blob_of(&import_id)?;
+    let hash = sha256::digest(raw)[..16].to_string();
+    let path = self::store(store, &import_id, "transcript.jsonl", &hash, raw)?;
+    archives.record_span(memory_id, &import_id, 0, raw.len() as i64)?;
+
+    if let Some((old_path, old_hash)) = previous {
+        if old_hash != hash && archives.count_with_hash(&old_hash)? == 0 {
+            // Already gone (pruned, or removed by hand) is the state wanted.
+            match std::fs::remove_file(old_path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+                _ => {}
+            }
+        }
+    }
+    Ok(path)
+}
+
 /// Record which bytes of an archived import produced `memory_id`.
 ///
 /// A no-op when retention is off, so callers do not have to check first.
