@@ -45,10 +45,16 @@ Each piece of project state is one fact memory:
 | `project.status`  | `active` \| `dormant` \| `abandoned`            | one         |
 | `project.repo`    | normalised repo URL `https://host/owner/name`   | one         |
 | `project.path`    | repo-relative path, e.g. `crates/apps/rusty_mux`| one         |
-| `project.tracker` | rusty_tick project or tag id                    | one         |
+| `project.tracker` | `tick:list:<list uuid>`, the project's tick list | one         |
 | `project.parent`  | parent project's entity name                    | one         |
 
 `subject` is the project's canonical entity name. Aliases stay on the entity.
+`project.tracker` follows the root ADR-0012 (one task store): a board project
+is a rusty_tick list, and remind-me refers to tick objects with the `tick:`
+scheme. ADR-0012 gives tasks `tick:<task uuid>`; a list here is
+`tick:list:<list uuid>`, so the reference detector's task rule never takes a
+list for a task.
+
 Writing a claim supersedes the previous one through the existing SPO rule, so
 history, `remind_me_history` and `remind_me_revert` work unchanged. Claim
 memories are `memory_type: fact`, tagged `project-record`, and synced like any
@@ -100,7 +106,7 @@ pub struct Project {
 pub struct Anchors {
     pub repo: Option<Claim<RepoUrl>>,             // newtype, normalised
     pub path: Option<Claim<RepoPath>>,            // relative, no `..`
-    pub tracker: Option<Claim<TrackerRef>>,
+    pub tracker: Option<Claim<TickListId>>,        // `tick:list:<uuid>`
     pub parent: Option<Claim<EntityId>>,
 }
 ```
@@ -211,7 +217,7 @@ revertible memories. Nothing is migrated.
   testable, and small local models would disagree with each other. Agents
   can still call `set` with `because`.
 - **Mill Board track as an anchor.** #55 retires the board's own store, so the
-  anchor is a rusty_tick reference instead.
+  anchor is the project's rusty_tick list (`tick:list:<uuid>`) instead.
 
 ## Implementation slices (after approval)
 
