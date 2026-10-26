@@ -581,11 +581,11 @@ mod tests {
     /// nothing, forever.
     #[test]
     fn a_closed_port_reads_as_closed() {
-        // Bind and immediately drop, so the port is real but unbound.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        assert!(!port_open("127.0.0.1", port));
+        // Port 0 cannot be connected to on any platform, so nothing can be
+        // listening there. A freshly freed ephemeral port is not safe: a
+        // parallel test that binds port 0 can be handed the same port before
+        // the probe runs, and the probe then finds it open.
+        assert!(!port_open("127.0.0.1", 0));
     }
 
     #[test]
