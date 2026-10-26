@@ -438,9 +438,13 @@ pub fn undecomposed_batch(
         .batch_size
         .clamp(DECOMPOSE_BATCH_MIN, DECOMPOSE_BATCH_MAX);
     let curation = Curation::new(store);
-    let total = curation.count_undecomposed()?;
+    let settled_before = (input.idle_minutes > 0).then(|| {
+        (Utc::now() - chrono::Duration::minutes(i64::from(input.idle_minutes))).to_rfc3339()
+    });
+    let settled_before = settled_before.as_deref();
+    let total = curation.count_undecomposed(settled_before)?;
     let memories: Vec<UndecomposedCapture> = curation
-        .undecomposed(batch_size)?
+        .undecomposed(batch_size, settled_before)?
         .into_iter()
         .map(|row| UndecomposedCapture {
             id: row.id,

@@ -1217,6 +1217,10 @@ pub struct DecomposeResult {
 pub struct DecomposeBatchInput {
     #[serde(default = "default_decompose_batch_size")]
     pub batch_size: usize,
+    /// Only captures unchanged for at least this many minutes: a scheduled
+    /// pass leaves a live session until it settles (ADR-0029). `0` takes all.
+    #[serde(default)]
+    pub idle_minutes: u32,
 }
 
 fn default_decompose_batch_size() -> usize {

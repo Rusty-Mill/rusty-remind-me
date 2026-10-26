@@ -72,9 +72,17 @@ impl<'c> Promotions<'c> {
         category: &str,
         rung: &str,
         min_facts: usize,
+        min_sources: usize,
         limit: usize,
     ) -> Result<Vec<EntityFactGroup>> {
-        engine::promotions::entity_fact_groups(&self.core.lock(), category, rung, min_facts, limit)
+        engine::promotions::entity_fact_groups(
+            &self.core.lock(),
+            category,
+            rung,
+            min_facts,
+            min_sources,
+            limit,
+        )
     }
 
     /// How many groups [`Promotions::entity_fact_groups`] would find
@@ -84,8 +92,15 @@ impl<'c> Promotions<'c> {
         category: &str,
         rung: &str,
         min_facts: usize,
+        min_sources: usize,
     ) -> Result<usize> {
-        engine::promotions::count_entity_fact_groups(&self.core.lock(), category, rung, min_facts)
+        engine::promotions::count_entity_fact_groups(
+            &self.core.lock(),
+            category,
+            rung,
+            min_facts,
+            min_sources,
+        )
     }
 
     /// Live, non-sensitive `category` memories at or above `floor`

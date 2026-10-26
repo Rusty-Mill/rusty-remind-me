@@ -603,3 +603,25 @@ fn the_rung_string_form_is_stable() {
     assert_eq!(Rung::FactToScenario.as_str(), "fact_to_scenario");
     assert_eq!(Rung::ScenarioToPersona.as_str(), "scenario_to_persona");
 }
+
+/// One session restating itself is not a pattern: facts drawn from a single
+/// capture need a second origin before they propose a scenario (ADR-0029).
+#[test]
+fn facts_from_one_session_need_a_second_origin() {
+    let db = db("two_sources");
+    let store = db.store();
+    let ids = facts_about(&store, "Wombat", 3);
+    for id in &ids {
+        remind_me_core::testing::set_memory_column(&store, id, "source_capture_id", "cap_one")
+            .unwrap();
+    }
+    assert!(promotion_candidates(&store, Rung::FactToScenario, 20)
+        .unwrap()
+        .is_empty());
+
+    remind_me_core::testing::set_memory_column(&store, &ids[2], "source_capture_id", "cap_two")
+        .unwrap();
+    let candidates = promotion_candidates(&store, Rung::FactToScenario, 20).unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].source_ids.len(), 3);
+}

@@ -211,13 +211,8 @@ pub(crate) fn is_live(tables: &EngineTables, id: &str) -> Result<bool> {
 /// Captured dialogs nothing names as `source_capture_id`, newest first, ties
 /// by id descending.
 fn undecomposed_dialog_rows(core: &CoreTables) -> Vec<MemoryRow> {
-    let named: HashSet<String> = memories::rows(core)
-        .filter_map(|row| row.source_capture_id)
-        .collect();
-    let mut rows: Vec<MemoryRow> = memories::rows(core)
-        .filter(|row| row.deleted_at.is_none() && row.category == "dialog")
-        .filter(|row| row.source_capture_id.is_none())
-        .filter(|row| row.capture_id.as_ref().is_some_and(|c| !named.contains(c)))
+    let mut rows: Vec<MemoryRow> = super::curation::undecomposed_captures(core)
+        .filter(|row| row.category == "dialog")
         .collect();
     rows.sort_by(|a, b| (&b.created_at, &b.id).cmp(&(&a.created_at, &a.id)));
     rows
@@ -239,13 +234,19 @@ pub(crate) fn count_undecomposed_dialogs(tables: &EngineTables) -> Result<usize>
 }
 
 /// Live `category` memories not promoted at `rung`, grouped by an entity
-/// they mention, groups of at least `min_facts`: largest first, ties by
-/// entity id, ids sorted within a group.
+/// they mention, groups of at least `min_facts` drawn from at least
+/// `min_sources` origins: largest first, ties by entity id, ids sorted
+/// within a group.
+///
+/// A fact's origin is the capture it was decomposed from, or the fact itself
+/// when it was written directly, so one long session cannot promote itself
+/// while hand-written facts still count one each (ADR-0029).
 fn fact_groups(
     core: &CoreTables,
     category: &str,
     rung: &str,
     min_facts: usize,
+    min_sources: usize,
 ) -> Vec<EntityFactGroup> {
     let promoted = promoted_at_rung(core, rung);
     let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -259,7 +260,7 @@ fn fact_groups(
     }
     let mut found: Vec<(String, Vec<String>)> = groups
         .into_iter()
-        .filter(|(_, ids)| ids.len() >= min_facts)
+        .filter(|(_, ids)| ids.len() >= min_facts && origins(core, ids) >= min_sources)
         .collect();
     found.sort_by(|(ea, a), (eb, b)| b.len().cmp(&a.len()).then_with(|| ea.cmp(eb)));
     found
@@ -274,14 +275,27 @@ fn fact_groups(
         .collect()
 }
 
+/// How many distinct origins (see [`fact_groups`]) the memories `ids` have.
+fn origins(core: &CoreTables, ids: &[String]) -> usize {
+    ids.iter()
+        .map(|id| {
+            memories::row(core, id)
+                .and_then(|row| row.source_capture_id)
+                .unwrap_or_else(|| id.clone())
+        })
+        .collect::<HashSet<_>>()
+        .len()
+}
+
 pub(crate) fn entity_fact_groups(
     tables: &EngineTables,
     category: &str,
     rung: &str,
     min_facts: usize,
+    min_sources: usize,
     limit: usize,
 ) -> Result<Vec<EntityFactGroup>> {
-    let mut groups = fact_groups(core_ref(tables)?, category, rung, min_facts);
+    let mut groups = fact_groups(core_ref(tables)?, category, rung, min_facts, min_sources);
     groups.truncate(limit);
     Ok(groups)
 }
@@ -291,8 +305,9 @@ pub(crate) fn count_entity_fact_groups(
     category: &str,
     rung: &str,
     min_facts: usize,
+    min_sources: usize,
 ) -> Result<usize> {
-    Ok(fact_groups(core_ref(tables)?, category, rung, min_facts).len())
+    Ok(fact_groups(core_ref(tables)?, category, rung, min_facts, min_sources).len())
 }
 
 /// Live, non-sensitive `category` memories at or above `floor` stored

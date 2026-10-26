@@ -454,7 +454,14 @@ fn a_fresh_capture_awaits_decomposition() {
     let store = db.store();
     let parent = capture(&store, &["session"]);
 
-    let batch = undecomposed_batch(&store, &DecomposeBatchInput { batch_size: 20 }).unwrap();
+    let batch = undecomposed_batch(
+        &store,
+        &DecomposeBatchInput {
+            batch_size: 20,
+            idle_minutes: 0,
+        },
+    )
+    .unwrap();
 
     // Both halves of the capture carry the capture_id, so both are offered.
     assert_eq!(batch.total_undecomposed, 2);
@@ -469,9 +476,15 @@ fn a_decomposed_capture_drops_out_of_the_batch() {
     let store = db.store();
     let parent = capture(&store, &[]);
     assert_eq!(
-        undecomposed_batch(&store, &DecomposeBatchInput { batch_size: 20 })
-            .unwrap()
-            .total_undecomposed,
+        undecomposed_batch(
+            &store,
+            &DecomposeBatchInput {
+                batch_size: 20,
+                idle_minutes: 0
+            }
+        )
+        .unwrap()
+        .total_undecomposed,
         2
     );
 
@@ -480,9 +493,15 @@ fn a_decomposed_capture_drops_out_of_the_batch() {
     // There is no decomposed flag — the backlog shrinks because a fact now
     // names this capture as its source.
     assert_eq!(
-        undecomposed_batch(&store, &DecomposeBatchInput { batch_size: 20 })
-            .unwrap()
-            .total_undecomposed,
+        undecomposed_batch(
+            &store,
+            &DecomposeBatchInput {
+                batch_size: 20,
+                idle_minutes: 0
+            }
+        )
+        .unwrap()
+        .total_undecomposed,
         0
     );
 }
@@ -509,7 +528,14 @@ fn ordinary_memories_never_enter_the_batch() {
     )
     .unwrap();
 
-    let batch = undecomposed_batch(&store, &DecomposeBatchInput { batch_size: 20 }).unwrap();
+    let batch = undecomposed_batch(
+        &store,
+        &DecomposeBatchInput {
+            batch_size: 20,
+            idle_minutes: 0,
+        },
+    )
+    .unwrap();
 
     assert_eq!(batch.total_undecomposed, 0);
 }
@@ -522,16 +548,98 @@ fn the_batch_size_is_clamped_and_the_backlog_is_reported() {
         capture(&store, &[]);
     }
 
-    let page = undecomposed_batch(&store, &DecomposeBatchInput { batch_size: 2 }).unwrap();
+    let page = undecomposed_batch(
+        &store,
+        &DecomposeBatchInput {
+            batch_size: 2,
+            idle_minutes: 0,
+        },
+    )
+    .unwrap();
     assert_eq!(page.memories.len(), 2);
     assert_eq!(page.total_undecomposed, 6);
 
     assert_eq!(
-        undecomposed_batch(&store, &DecomposeBatchInput { batch_size: 0 })
-            .unwrap()
-            .memories
-            .len(),
+        undecomposed_batch(
+            &store,
+            &DecomposeBatchInput {
+                batch_size: 0,
+                idle_minutes: 0
+            }
+        )
+        .unwrap()
+        .memories
+        .len(),
         1,
         "zero clamps up to 1"
     );
+}
+
+/// A session captured again after decomposition is due again, so what it
+/// added is not lost; one decomposed since is not (ADR-0029).
+#[test]
+fn a_session_recaptured_after_decomposition_is_due_again() {
+    use remind_me_core::transcript::{capture_transcript, TranscriptRequest};
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let line = |text: &str| {
+        serde_json::json!({"type": "user", "sessionId": "s1",
+                           "message": {"role": "user", "content": text}})
+        .to_string()
+    };
+    let request = TranscriptRequest {
+        session_id: "s1",
+        cwd: None,
+        reason: Some("stop"),
+        context: None,
+    };
+    let due = |store: &Store<'_>| {
+        undecomposed_batch(
+            store,
+            &DecomposeBatchInput {
+                batch_size: 10,
+                idle_minutes: 0,
+            },
+        )
+        .unwrap()
+        .total_undecomposed
+    };
+
+    let made = capture_transcript(&store, &line("first"), &request).unwrap();
+    assert_eq!(due(&store), 2, "dialog and summary");
+    run(&store, &made.capture_id, vec![fact("the first thing")]);
+    assert_eq!(due(&store), 0);
+
+    let grown = format!("{}\n{}", line("first"), line("second"));
+    capture_transcript(&store, &grown, &request).unwrap();
+    assert_eq!(due(&store), 2, "the recapture is due again");
+    run(&store, &made.capture_id, vec![fact("the second thing")]);
+    assert_eq!(due(&store), 0);
+}
+
+/// A scheduled pass asks for settled captures only, so a live session is
+/// left alone until it goes quiet.
+#[test]
+fn idle_minutes_leaves_a_recently_changed_capture_for_later() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let made = capture(&store, &[]);
+    let settled = |store: &Store<'_>| {
+        undecomposed_batch(
+            store,
+            &DecomposeBatchInput {
+                batch_size: 10,
+                idle_minutes: 120,
+            },
+        )
+        .unwrap()
+        .total_undecomposed
+    };
+    assert_eq!(settled(&store), 0);
+
+    let long_ago = (chrono::Utc::now() - chrono::Duration::hours(3)).to_rfc3339();
+    for id in [&made.dialog_id, &made.summary_id] {
+        testing::set_memory_column(&store, id, "updated_at", long_ago.as_str()).unwrap();
+    }
+    assert_eq!(settled(&store), 2);
 }

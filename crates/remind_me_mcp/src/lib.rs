@@ -972,7 +972,8 @@ impl McpServer {
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
-                                        "batch_size": { "type": "integer", "default": 20, "minimum": DECOMPOSE_BATCH_MIN, "maximum": DECOMPOSE_BATCH_MAX }
+                                        "batch_size": { "type": "integer", "default": 20, "minimum": DECOMPOSE_BATCH_MIN, "maximum": DECOMPOSE_BATCH_MAX },
+                                        "idle_minutes": { "type": "integer", "default": 0, "minimum": 0, "description": "Only captures unchanged for at least this many minutes, so a scheduled pass leaves a live session until it settles" }
                                     }
                                 }
                             },
@@ -2289,8 +2290,11 @@ impl McpServer {
                         }
                     }
                     "remind_me_decompose_batch" => {
-                        let input: DecomposeBatchInput = serde_json::from_value(args)
-                            .unwrap_or(DecomposeBatchInput { batch_size: 20 });
+                        let input: DecomposeBatchInput =
+                            serde_json::from_value(args).unwrap_or(DecomposeBatchInput {
+                                batch_size: 20,
+                                idle_minutes: 0,
+                            });
                         match capture::undecomposed_batch(&store, &input) {
                             Ok(batch) => {
                                 json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&batch).unwrap() }] })

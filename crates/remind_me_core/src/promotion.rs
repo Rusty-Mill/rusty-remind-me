@@ -64,6 +64,11 @@ pub const PROMOTION_SOURCE: &str = "promotion";
 /// moment anything is decomposed.
 pub const MIN_SCENARIO_FACTS: usize = 3;
 
+/// Fewest origins those facts must come from: two sessions, or two facts
+/// written directly. One long session repeating itself is not a pattern
+/// (ADR-0029).
+pub const MIN_SCENARIO_SOURCES: usize = 2;
+
 /// Vitality a scenario must still hold to be persona material.
 ///
 /// The persona rung is meant to be *stable*, so the gate is the decay model
@@ -175,6 +180,7 @@ fn scenario_candidates(store: &Store<'_>, limit: usize) -> SqlResult<Vec<Promoti
         FACT_CATEGORY,
         Rung::FactToScenario.as_str(),
         MIN_SCENARIO_FACTS,
+        MIN_SCENARIO_SOURCES,
         limit,
     )?;
     Ok(groups
@@ -254,6 +260,7 @@ pub fn count_candidates(store: &Store<'_>, rung: Rung) -> SqlResult<usize> {
             FACT_CATEGORY,
             Rung::FactToScenario.as_str(),
             MIN_SCENARIO_FACTS,
+            MIN_SCENARIO_SOURCES,
         ),
         Rung::ScenarioToPersona => promotions.count_ready_scenarios(
             SCENARIO_CATEGORY,

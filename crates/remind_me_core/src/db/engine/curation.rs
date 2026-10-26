@@ -43,22 +43,55 @@ pub(crate) fn capture_tags(tables: &EngineTables, capture_id: &str) -> Result<Op
         .map(|row| tags(&row)))
 }
 
-/// Captures, not themselves decomposed facts and not deleted, that no
-/// memory names as its `source_capture_id`, newest first.
-fn undecomposed_rows(core: &CoreTables) -> Vec<MemoryRow> {
-    let named: HashSet<String> = memories::rows(core)
-        .filter_map(|row| row.source_capture_id)
-        .collect();
-    let mut rows: Vec<MemoryRow> = memories::rows(core)
+/// When each capture was last decomposed: the newest `created_at` among the
+/// memories naming it as their `source_capture_id`.
+fn decomposed_at(core: &CoreTables) -> HashMap<String, String> {
+    let mut newest: HashMap<String, String> = HashMap::new();
+    for row in memories::rows(core) {
+        let Some(capture) = row.source_capture_id else {
+            continue;
+        };
+        let slot = newest.entry(capture).or_default();
+        if row.created_at > *slot {
+            *slot = row.created_at;
+        }
+    }
+    newest
+}
+
+/// Whether capture row `row` still needs decomposing: no fact names its
+/// capture, or the capture changed after its newest fact was written (a
+/// session recaptured after decomposition, ADR-0029).
+pub(crate) fn needs_decomposing(row: &MemoryRow, decomposed: &HashMap<String, String>) -> bool {
+    row.capture_id
+        .as_ref()
+        .is_some_and(|c| decomposed.get(c).is_none_or(|at| row.updated_at > *at))
+}
+
+/// The captures still needing decomposition, as [`needs_decomposing`] says.
+pub(crate) fn undecomposed_captures(core: &CoreTables) -> impl Iterator<Item = MemoryRow> + '_ {
+    let decomposed = decomposed_at(core);
+    memories::rows(core)
         .filter(|row| row.deleted_at.is_none() && row.source_capture_id.is_none())
-        .filter(|row| row.capture_id.as_ref().is_some_and(|c| !named.contains(c)))
+        .filter(move |row| needs_decomposing(row, &decomposed))
+}
+
+/// Captures, not themselves decomposed facts and not deleted, that need
+/// decomposing and last changed at or before `settled_before`, newest first.
+fn undecomposed_rows(core: &CoreTables, settled_before: Option<&str>) -> Vec<MemoryRow> {
+    let mut rows: Vec<MemoryRow> = undecomposed_captures(core)
+        .filter(|row| settled_before.is_none_or(|cutoff| row.updated_at.as_str() <= cutoff))
         .collect();
     newest_first(&mut rows);
     rows
 }
 
-pub(crate) fn undecomposed(tables: &EngineTables, limit: usize) -> Result<Vec<CaptureRow>> {
-    Ok(undecomposed_rows(core_ref(tables)?)
+pub(crate) fn undecomposed(
+    tables: &EngineTables,
+    limit: usize,
+    settled_before: Option<&str>,
+) -> Result<Vec<CaptureRow>> {
+    Ok(undecomposed_rows(core_ref(tables)?, settled_before)
         .into_iter()
         .take(limit)
         .map(|row| CaptureRow {
@@ -71,8 +104,13 @@ pub(crate) fn undecomposed(tables: &EngineTables, limit: usize) -> Result<Vec<Ca
         .collect())
 }
 
-pub(crate) fn count_undecomposed(tables: &EngineTables) -> Result<i64> {
-    Ok(count(undecomposed_rows(core_ref(tables)?).len()))
+pub(crate) fn count_undecomposed(
+    tables: &EngineTables,
+    settled_before: Option<&str>,
+) -> Result<i64> {
+    Ok(count(
+        undecomposed_rows(core_ref(tables)?, settled_before).len(),
+    ))
 }
 
 pub(crate) fn capture_activity(tables: &EngineTables) -> Result<CaptureActivity> {
@@ -160,7 +198,7 @@ pub(crate) fn normalization_source(
 pub(crate) fn backlog_depth(tables: &EngineTables, backlog: Backlog) -> Result<i64> {
     let core = core_ref(tables)?;
     let depth = match backlog {
-        Backlog::Undecomposed => undecomposed_rows(core).len(),
+        Backlog::Undecomposed => undecomposed_rows(core, None).len(),
         Backlog::Unannotated => {
             let linked: HashSet<String> = super::graph::link_pairs(core)
                 .into_iter()

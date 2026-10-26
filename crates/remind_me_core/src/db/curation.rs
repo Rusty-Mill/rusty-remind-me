@@ -86,15 +86,19 @@ impl<'c> Curation<'c> {
         engine::curation::capture_tags(&self.core.lock(), capture_id)
     }
 
-    /// Captures nothing has been decomposed from, newest first, at most
-    /// `limit`.
-    pub fn undecomposed(&self, limit: usize) -> Result<Vec<CaptureRow>> {
-        engine::curation::undecomposed(&self.core.lock(), limit)
+    /// Captures due for decomposition, newest first, at most `limit`; with
+    /// `settled_before`, only those last changed at or before it (RFC 3339).
+    pub fn undecomposed(
+        &self,
+        limit: usize,
+        settled_before: Option<&str>,
+    ) -> Result<Vec<CaptureRow>> {
+        engine::curation::undecomposed(&self.core.lock(), limit, settled_before)
     }
 
-    /// How many captures nothing has been decomposed from.
-    pub fn count_undecomposed(&self) -> Result<i64> {
-        engine::curation::count_undecomposed(&self.core.lock())
+    /// How many captures [`Curation::undecomposed`] would list.
+    pub fn count_undecomposed(&self, settled_before: Option<&str>) -> Result<i64> {
+        engine::curation::count_undecomposed(&self.core.lock(), settled_before)
     }
 
     /// How many distinct live captures there are, and the newest one's
@@ -335,7 +339,7 @@ mod tests {
         );
         assert_eq!(curation.capture_tags("none").unwrap(), None);
         let undecomposed: Vec<String> = curation
-            .undecomposed(10)
+            .undecomposed(10, None)
             .unwrap()
             .into_iter()
             .map(|c| c.id)
@@ -345,7 +349,7 @@ mod tests {
             ["s1", "d1"],
             "c2 was decomposed into f1; c1's two rows wait, newest first then by id"
         );
-        assert_eq!(curation.count_undecomposed().unwrap(), 2);
+        assert_eq!(curation.count_undecomposed(None).unwrap(), 2);
         assert_eq!(
             curation.capture_activity().unwrap(),
             CaptureActivity {
@@ -415,7 +419,7 @@ mod tests {
         assert_eq!(dialogs, ["d1"]);
         assert_eq!(promotions.count_undecomposed_dialogs().unwrap(), 1);
         let groups = promotions
-            .entity_fact_groups("fact", "scenario", 2, 10)
+            .entity_fact_groups("fact", "scenario", 2, 1, 10)
             .unwrap();
         assert_eq!(groups.len(), 1, "{groups:?}");
         assert_eq!(groups[0].entity_name, "Rust");
@@ -426,14 +430,14 @@ mod tests {
         );
         assert_eq!(
             promotions
-                .entity_fact_groups("fact", "other", 1, 1)
+                .entity_fact_groups("fact", "other", 1, 1, 1)
                 .unwrap()
                 .len(),
             1
         );
         assert_eq!(
             promotions
-                .count_entity_fact_groups("fact", "other", 1)
+                .count_entity_fact_groups("fact", "other", 1, 1)
                 .unwrap(),
             3
         );
@@ -497,7 +501,7 @@ mod tests {
             })
             .unwrap();
         let curation = Curation::new(&store);
-        assert_eq!(curation.count_undecomposed().unwrap(), 1);
+        assert_eq!(curation.count_undecomposed(None).unwrap(), 1);
         assert_eq!(curation.backlog_depth(Backlog::Undecomposed).unwrap(), 1);
 
         memories
@@ -506,8 +510,8 @@ mod tests {
                 ..NewMemory::new("fact", "y", NOW)
             })
             .unwrap();
-        assert_eq!(curation.count_undecomposed().unwrap(), 0);
-        assert!(curation.undecomposed(10).unwrap().is_empty());
+        assert_eq!(curation.count_undecomposed(None).unwrap(), 0);
+        assert!(curation.undecomposed(10, None).unwrap().is_empty());
         assert_eq!(curation.backlog_depth(Backlog::Undecomposed).unwrap(), 0);
     }
 
