@@ -159,36 +159,26 @@ fn pick(
         .ok_or_else(|| format!("unknown {key} {wanted:?}: one of {}", options()))
 }
 
-/// Search arguments a reference lookup cannot honour. Refused rather than
-/// silently ignored, so a scoped search never widens into an unscoped one.
-const NOT_FOR_REFERENCES: [&str; 14] = [
-    "query",
-    "category",
-    "tags",
-    "source",
-    "project",
-    "branch",
-    "session_id",
-    "written_by",
-    "min_vitality",
-    "min_confidence",
-    "include_dormant",
-    "expand_entities",
-    "include_neighbors",
-    "expand_co_retrieval",
-];
+/// The only arguments a reference lookup honours. Any other search argument
+/// is refused rather than silently dropped, so a scoped or shaped search
+/// never quietly turns into something else, including filters search gains
+/// later.
+const FOR_REFERENCES: [&str; 3] = ["reference", "reference_kind", "include_sensitive"];
 
 fn search(args: &mut Value) -> Result<&'static str, String> {
     if text(args, "reference").is_some() || text(args, "reference_kind").is_some() {
-        let set: Vec<&str> = NOT_FOR_REFERENCES
+        let others: Vec<&str> = args
+            .as_object()
             .into_iter()
-            .filter(|key| args.get(*key).is_some_and(|v| !v.is_null()))
+            .flatten()
+            .filter(|(key, value)| !value.is_null() && !FOR_REFERENCES.contains(&key.as_str()))
+            .map(|(key, _)| key.as_str())
             .collect();
-        if !set.is_empty() {
+        if !others.is_empty() {
             return Err(format!(
                 "`reference` looks up references only, with `reference_kind` and \
                  `include_sensitive`; drop {}",
-                set.join(", ")
+                others.join(", ")
             ));
         }
         rename(args, "reference", "value");
@@ -532,6 +522,20 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("project") && err.contains("category"), "{err}");
+        for shaping in [
+            json!({"include_expired": false}),
+            json!({"limit": 5}),
+            json!({"response_format": "markdown"}),
+        ] {
+            let mut args = json!({"reference": "o/r#1"});
+            args.as_object_mut()
+                .unwrap()
+                .extend(shaping.as_object().unwrap().clone());
+            assert!(
+                route("remind_me_search", args).is_err(),
+                "{shaping} not refused"
+            );
+        }
         // Null is unset, and include_sensitive is honoured by the lookup.
         let ok = json!({"reference": "o/r#1", "project": null, "include_sensitive": true});
         assert_eq!(routed("remind_me_search", ok).0, "remind_me_references");
