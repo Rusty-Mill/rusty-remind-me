@@ -16,9 +16,9 @@ pub mod daemon_proxy;
 pub mod references;
 pub mod render;
 
-/// What an MCP client is told about the server on `initialize`: when to
-/// reach for which tool. Kept short; it is paid for in every session.
-const SERVER_INSTRUCTIONS: &str = "Long-term memory for the user. Search (remind_me_search) \
+/// What an MCP client is told about the server on `initialize`, over every
+/// transport: when to reach for which tool. Kept short; it is paid for in every session.
+pub const SERVER_INSTRUCTIONS: &str = "Long-term memory for the user. Search (remind_me_search) \
 before answering anything about the user, their projects or past decisions. Call remind_me_add \
 for each durable fact, decision or preference the user states, passing memory_type (a decision \
 needs metadata.rationale) and confidence when known. Call remind_me_auto_capture at the end of \
@@ -414,11 +414,44 @@ pub struct McpServer {
 /// recording a client called "".
 fn client_identity(req: &serde_json::Value) -> Option<String> {
     let info = req.get("params")?.get("clientInfo")?;
-    let name = info.get("name")?.as_str()?.trim();
+    let name = info.get("name")?.as_str()?;
+    identity(name, info.get("version").and_then(|v| v.as_str()))
+}
+
+/// The request `_meta` key a transport serving many callers from one handler
+/// puts each call's caller under: a `"name/version"` string, or `null` for a
+/// caller that named nobody.
+///
+/// The caller travels in the request itself because the request is all that
+/// crosses to the daemon. The remote connector relays every caller's lines
+/// over one daemon connection, so neither that connection's session nor any
+/// scope in the connector's own process can say who made a call; a field on
+/// the line can, on whichever thread finally runs it.
+///
+/// Advisory, like `clientInfo`: whoever sends a line can set it.
+pub const CALLER_META_KEY: &str = "rusty-remind-me/caller";
+
+/// The caller a request names under [`CALLER_META_KEY`]: `Some(None)` for a
+/// caller that named nobody, `None` for a request that does not say.
+fn forwarded_caller(request_json: &str) -> Option<Option<String>> {
+    // Most lines never carry the key; skip the second parse for them.
+    if !request_json.contains(CALLER_META_KEY) {
+        return None;
+    }
+    let req: Value = serde_json::from_str(request_json).ok()?;
+    let caller = req.get("params")?.get("_meta")?.get(CALLER_META_KEY)?;
+    Some(caller.as_str().map(str::to_string))
+}
+
+/// `"name/version"` for a client's reported `name` and `version`, or `None`
+/// for a blank name: the identity [`client_identity`] reads from a stdio
+/// handshake, for transports that receive the handshake already parsed.
+pub fn identity(name: &str, version: Option<&str>) -> Option<String> {
+    let name = name.trim();
     if name.is_empty() {
         return None;
     }
-    match info.get("version").and_then(|v| v.as_str()).map(str::trim) {
+    match version.map(str::trim) {
         Some(version) if !version.is_empty() => Some(format!("{name}/{version}")),
         _ => Some(name.to_string()),
     }
@@ -473,7 +506,12 @@ impl McpServer {
     /// the single point every reply passes through, rather than at the
     /// several hundred `json!` sites that build them.
     pub fn handle_request(&self, request_json: &str) -> Option<Value> {
-        let mut response = self.dispatch_request(request_json)?;
+        let mut response = match forwarded_caller(request_json) {
+            Some(caller) => remind_me_core::sync::with_call_client(caller, || {
+                self.dispatch_request(request_json)
+            }),
+            None => self.dispatch_request(request_json),
+        }?;
         stamp_result_type(&mut response);
         Some(response)
     }
@@ -5614,8 +5652,8 @@ mod tests {
 
 #[cfg(test)]
 mod handshake_identity {
-    use super::client_identity;
-    use serde_json::json;
+    use super::{client_identity, forwarded_caller, CALLER_META_KEY};
+    use serde_json::{json, Value};
 
     fn parse(params: serde_json::Value) -> Option<String> {
         client_identity(&json!({ "method": "initialize", "params": params }))
@@ -5655,6 +5693,25 @@ mod handshake_identity {
         assert_eq!(parse(json!({ "clientInfo": { "name": 42 } })), None);
         // A handshake with no params at all must not panic.
         assert_eq!(client_identity(&json!({ "method": "initialize" })), None);
+    }
+
+    #[test]
+    fn a_forwarded_caller_is_named_null_or_absent() {
+        let line = |meta: Value| {
+            json!({ "method": "tools/call", "params": { "name": "x", "_meta": meta } }).to_string()
+        };
+        assert_eq!(
+            forwarded_caller(&line(json!({ CALLER_META_KEY: "claude-ai/1.0" }))),
+            Some(Some("claude-ai/1.0".to_string()))
+        );
+        // Null is a caller that named nobody: still a decision, so the
+        // connection's handshake must not stand in for it.
+        assert_eq!(
+            forwarded_caller(&line(json!({ CALLER_META_KEY: null }))),
+            Some(None)
+        );
+        assert_eq!(forwarded_caller(&line(json!({}))), None);
+        assert_eq!(forwarded_caller(r#"{"method":"tools/list"}"#), None);
     }
 }
 
