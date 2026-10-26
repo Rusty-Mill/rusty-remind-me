@@ -9,23 +9,24 @@
 //! router (`server::build_router`) and the legacy secret-path/bearer
 //! credential keeps working in both.
 //!
-//! # Why this is its own crate, on tokio + axum
+//! # Why this is its own crate, on rusty_axum
 //!
-//! Recorded as a binding decision on `#57`: scoping `tokio` and `axum` to this
-//! one crate keeps `remind_me_core`/`remind_me_api`/`remind_me_mcp`/
-//! `remind_me_cli` untouched and synchronous. The MCP protocol itself is the
-//! workspace's first-party stack: [`handler::describe`] turns the synchronous
-//! [`remind_me_mcp::Handler`] into a `rusty_mcp_server` server (it used to be
-//! an `rmcp` `ServerHandler` adapter), and `rusty_mcp_axum` mounts that
-//! server's HTTP handler in the axum router, so the auth gate and the OAuth
-//! routes stay ordinary axum.
+//! Recorded as a binding decision on `#57`: scoping the async runtime and
+//! the HTTP framework to this one crate keeps `remind_me_core`/
+//! `remind_me_api`/`remind_me_mcp`/`remind_me_cli` untouched and
+//! synchronous. The MCP protocol itself is the workspace's first-party
+//! stack: [`handler::describe`] turns the synchronous
+//! [`remind_me_mcp::Handler`] into a `rusty_mcp_server` server, and that
+//! crate's `rusty_axum` mount serves its HTTP handler in a `rusty_axum`
+//! router (on `rusty_tokio`), so the auth gate and the OAuth routes stay
+//! ordinary handlers and middleware (#875).
 //!
 //! # The async boundary
 //!
 //! [`McpServer`](remind_me_mcp::McpServer) itself stays synchronous. The MCP
 //! handlers are blocking too, and the HTTP layer runs each request on a
 //! blocking thread, so a slow tool call (holding `Database`'s store lock)
-//! cannot stall the tokio runtime's other work. `Database` being
+//! cannot stall the runtime's other work. `Database` being
 //! `Send + Sync` is what makes sharing one `Arc<McpServer>` across
 //! concurrent connector sessions sound.
 //!
@@ -47,4 +48,6 @@ pub mod handler;
 pub mod oauth;
 pub mod server;
 
-pub use server::{build_router, is_loopback_host, run, run_blocking, warn_if_widened, BuildError};
+pub use server::{
+    build_router, is_loopback_host, run, run_blocking, serve, warn_if_widened, BuildError,
+};

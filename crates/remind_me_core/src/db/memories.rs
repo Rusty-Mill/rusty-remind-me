@@ -1162,6 +1162,10 @@ mod tests {
                 tags: tags.into_iter().map(String::from).collect(),
                 sensitive: id == "f",
                 base_weight: if id == "g" { 0.001 } else { 1.0 },
+                // The vitality floor decays against the real clock; with no
+                // decay the fixture keeps the vitality it was written with, so
+                // only "g"'s base weight puts it under the floor.
+                decay_rate: 0.0,
                 subject: if id == "d" { text("Rust") } else { None },
                 ..NewMemory::new(id, content, at)
             })

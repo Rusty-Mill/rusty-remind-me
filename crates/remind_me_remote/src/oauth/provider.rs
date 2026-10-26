@@ -22,7 +22,7 @@
 //!
 //! Every method here is synchronous — pure computation plus small local
 //! JSON-file I/O, no network calls. `routes.rs`'s handlers run
-//! store-touching calls through `tokio::task::spawn_blocking`, mirroring
+//! store-touching calls through `rusty_tokio::spawn_blocking`, mirroring
 //! the reference's own `asyncio.to_thread` calls in `tools/admin.py`'s
 //! `remind_me_revoke_clients` (PF-06 conventions) and this crate's own
 //! established precedent in `handler.rs`.

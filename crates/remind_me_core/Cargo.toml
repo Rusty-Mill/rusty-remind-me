@@ -125,7 +125,7 @@ local-embed = ["dep:rten", "dep:rten-tensor", "dep:tokenizers"]
 # from this list's "no system binary" rule, which is why it is off by default
 # and why `docs/adr/0014` exists. Feature-off, the watchdog reports the stuck
 # call's identity and duration exactly as it does today.
-stack-dumps = ["dep:rstack-self"]
+stack-dumps = ["dep:rstack-self", "dep:backtrace"]
 
 # The workspace's only *unconditional* FFI dependency, and target-gated so it
 # exists nowhere else. `docs/adr/0013` records why the sidecar teardown gap was
@@ -147,6 +147,9 @@ windows-sys = { version = "0.61", features = [
 # what an in-process signal handler could not do safely.
 [target.'cfg(target_os = "linux")'.dependencies]
 rstack-self = { version = "0.3", optional = true }
+# Already used by rstack-self; resolve sampled first-frame PCs without its
+# caller-return-address adjustment. Still out-of-process capture (ADR-0014).
+backtrace = { version = "0.3", optional = true }
 
 # Test fixture for `stack-dumps`, not a shipped tool. Declared explicitly so
 # `required-features` applies: without it, a default build would try to compile
