@@ -65,7 +65,10 @@ pub struct Proposal {
     pub value: String,
     pub rule: Rule,
     pub evidence: Vec<String>,
-    /// Set together with `stage` when the project is new.
+    /// Set together when the project has no stage yet, so the proposal can
+    /// be confirmed on its own: `set` refuses a new project without both.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub with_stage: Option<Stage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub with_status: Option<Status>,
     pub why: String,
@@ -79,36 +82,50 @@ impl Proposal {
         evidence: Vec<String>,
         why: String,
     ) -> Self {
-        let object = value.object();
         Self {
-            key: proposal_key(project, value.predicate(), &object),
+            key: proposal_key(project, &value),
             project: project.to_string(),
             predicate: value.predicate(),
-            value: object,
+            value: value.object(),
             rule,
             evidence,
+            with_stage: None,
             with_status: None,
             why,
         }
     }
 
+    /// Bundle the stage and status a project with no stage needs, so a
+    /// confirm of this anchor alone can create it.
+    fn creating(mut self, stage: Stage) -> Self {
+        self.with_stage = Some(stage);
+        self.with_status = Some(Status::Active);
+        self
+    }
+
     /// The claims a confirm of this proposal writes.
     fn claims(&self) -> Result<Vec<ClaimValue>> {
         let mut claims = vec![ClaimValue::parse(self.predicate, &self.value)?];
-        if let Some(status) = self.with_status {
-            claims.push(ClaimValue::Status(status));
-        }
+        claims.extend(self.with_stage.map(ClaimValue::Stage));
+        claims.extend(self.with_status.map(ClaimValue::Status));
         Ok(claims)
     }
 }
 
 /// The key a rejection stores, so the same suggestion is not offered twice.
-pub fn proposal_key(project: &str, predicate: Predicate, value: &str) -> String {
+///
+/// The project is an entity name, so it is normalised. The value keeps its
+/// canonical form, so equality is the predicate's own: a rejected
+/// `crates/Foo` does not hide `crates/foo`.
+pub fn proposal_key(project: &str, value: &ClaimValue) -> String {
+    let object = match value {
+        ClaimValue::Parent(name) => normalize_entity_name(name),
+        other => other.object(),
+    };
     format!(
-        "{}:{}:{}",
+        "{}:{}:{object}",
         normalize_entity_name(project),
-        predicate.as_str(),
-        normalize_entity_name(value)
+        value.predicate().as_str(),
     )
 }
 
@@ -124,37 +141,52 @@ pub fn proposals(store: &Store<'_>) -> Result<Vec<Proposal>> {
 
     let mut out = Vec::new();
     for entity in entities.all()? {
+        // A name the scrubber would rewrite cannot become a claim subject.
+        if project::looks_secret(&entity.name) {
+            continue;
+        }
         let linked = entities.linked_memories_full(&entity.id)?;
         let live = project::get(store, &entity.name).ok().flatten();
         let stage = live.as_ref().map(|p| p.stage.value);
         let status = live.as_ref().map(|p| p.status.value);
         let anchored_repo = live.as_ref().and_then(|p| p.anchors.repo.clone());
         let anchored_path = live.as_ref().is_some_and(|p| p.anchors.path.is_some());
+        let remote = remote_evidence(&entity, &linked);
+        let path = path_evidence(&entity, &linked);
 
-        if let Some(found) = remote_evidence(&entity, &linked) {
+        if let Seen::One(found) = &remote {
             // The remote is the strongest evidence there is a repository, so
             // it proposes `built` as well as the anchor.
-            if anchored_repo.as_ref().map(|c| c.value.clone()) != Some(found.url.clone()) {
-                out.push(Proposal::new(
+            if anchored_repo.as_ref().map(|c| &c.value) != Some(&found.value) {
+                let proposal = Proposal::new(
                     &entity.name,
-                    ClaimValue::Repo(found.url.clone()),
+                    ClaimValue::Repo(found.value.clone()),
                     Rule::RemoteSeen,
                     found.evidence.clone(),
                     format!("{} sessions ran against this remote", found.evidence.len()),
-                ));
+                );
+                out.push(match stage {
+                    None => proposal.creating(Stage::Built),
+                    Some(_) => proposal,
+                });
             }
             if stage != Some(Stage::Built) {
                 let mut proposal = Proposal::new(
                     &entity.name,
                     ClaimValue::Stage(Stage::Built),
                     Rule::RemoteSeen,
-                    found.evidence,
+                    found.evidence.clone(),
                     "a session's git remote names this project".to_string(),
                 );
-                proposal.with_status = (status.is_none()).then_some(Status::Active);
+                proposal.with_status = status.is_none().then_some(Status::Active);
                 out.push(proposal);
             }
-        } else if stage.is_none() && mentioned_enough(&entity, &linked) {
+        }
+
+        // An idea only when nothing at all says where it lives: a
+        // contradiction is evidence too, and is left to a person.
+        let nothing_seen = matches!(remote, Seen::Nothing) && matches!(path, Seen::Nothing);
+        if stage.is_none() && nothing_seen && mentioned_enough(&entity, &linked) {
             let mut proposal = Proposal::new(
                 &entity.name,
                 ClaimValue::Stage(Stage::Idea),
@@ -169,16 +201,20 @@ pub fn proposals(store: &Store<'_>) -> Result<Vec<Proposal>> {
             out.push(proposal);
         }
 
-        if !anchored_path {
-            if let Some((path, evidence)) = path_evidence(&entity, &linked) {
-                out.push(Proposal::new(
-                    &entity.name,
-                    ClaimValue::Path(path),
-                    Rule::PathSeen,
-                    evidence,
-                    "a session worked inside this directory".to_string(),
-                ));
-            }
+        if let (false, Seen::One(found)) = (anchored_path, path) {
+            let proposal = Proposal::new(
+                &entity.name,
+                ClaimValue::Path(found.value),
+                Rule::PathSeen,
+                found.evidence,
+                "a session worked inside this directory".to_string(),
+            );
+            // A crate directory is code that exists, so a project with no
+            // stage yet is created `built` with it.
+            out.push(match stage {
+                None => proposal.creating(Stage::Built),
+                Some(_) => proposal,
+            });
         }
 
         if stage == Some(Stage::Idea) {
@@ -251,28 +287,37 @@ pub fn reject(store: &Store<'_>, key: &str, rejected_by: &str) -> Result<String>
     }
     let proposal = find(store, key)?;
     let now = Utc::now().to_rfc3339();
+    let mut tags = vec![REJECTED_TAG.to_string()];
+    let mut metadata = serde_json::json!({
+        "project_proposal": {
+            "key": proposal.key,
+            "project": proposal.project,
+            "predicate": proposal.predicate.as_str(),
+            "value": proposal.value,
+            "rejected_by": rejected_by,
+        }
+    });
+    // Proposals already skip secret-shaped values; the common boundary
+    // still runs, as on every write.
+    let content = crate::boundary::scrub(
+        &format!(
+            "Rejected proposal: {} {} = {}",
+            proposal.project,
+            proposal.predicate.qualified(),
+            proposal.value
+        ),
+        &mut tags,
+        &mut metadata,
+    );
     let row = NewMemory {
         category: crate::kinds::MemoryKind::WorkLog.as_str().to_string(),
         memory_type: crate::kinds::MemoryKind::WorkLog.as_str().to_string(),
-        tags: vec![REJECTED_TAG.to_string()],
+        tags,
         source: SOURCE.to_string(),
-        metadata: serde_json::json!({
-            "project_proposal": {
-                "key": proposal.key,
-                "project": proposal.project,
-                "predicate": proposal.predicate.as_str(),
-                "value": proposal.value,
-                "rejected_by": rejected_by,
-            }
-        }),
+        metadata,
         ..crate::context::default_provenance().stamp(NewMemory::new(
             format!("mem_{}", uuid::Uuid::new_v4().simple()),
-            format!(
-                "Rejected proposal: {} {} = {}",
-                proposal.project,
-                proposal.predicate.qualified(),
-                proposal.value
-            ),
+            content,
             &now,
         ))
     };
@@ -355,9 +400,38 @@ fn names(entity: &Entity) -> Vec<String> {
         .collect()
 }
 
-struct RemoteEvidence {
-    url: RepoUrl,
+/// What the linked memories say about one anchor.
+enum Seen<T> {
+    /// Nothing names it.
+    Nothing,
+    /// Exactly one value, with the memories that show it.
+    One(Found<T>),
+    /// Two different values: a contradiction a person resolves with `set`,
+    /// not something a rule guesses at.
+    Conflicting,
+}
+
+struct Found<T> {
+    value: T,
     evidence: Vec<String>,
+}
+
+/// Fold `(memory id, value)` observations into one [`Seen`].
+fn seen<T: PartialEq>(observed: impl IntoIterator<Item = (String, T)>) -> Seen<T> {
+    let mut found: Option<Found<T>> = None;
+    for (id, value) in observed {
+        match &mut found {
+            Some(f) if f.value != value => return Seen::Conflicting,
+            Some(f) => f.evidence.push(id),
+            None => {
+                found = Some(Found {
+                    value,
+                    evidence: vec![id],
+                })
+            }
+        }
+    }
+    found.map_or(Seen::Nothing, Seen::One)
 }
 
 /// A repository whose last path segment matches the entity's name or an alias.
@@ -365,66 +439,44 @@ struct RemoteEvidence {
 /// Matching on the repository's own name, not on the memory's `project`
 /// field: the field holds whatever directory a session ran in, which is how a
 /// crate inside a monorepo would otherwise claim the monorepo's remote.
-fn remote_evidence(entity: &Entity, linked: &[Memory]) -> Option<RemoteEvidence> {
+/// A secret-shaped remote is never evidence: it would be stored verbatim.
+fn remote_evidence(entity: &Entity, linked: &[Memory]) -> Seen<RepoUrl> {
     let names = names(entity);
-    let mut found: Option<RepoUrl> = None;
-    let mut evidence = Vec::new();
-    for memory in linked {
-        let Some(url) = memory
-            .git_remote
-            .as_deref()
-            .and_then(|r| RepoUrl::parse(r).ok())
-        else {
-            continue;
-        };
+    seen(linked.iter().filter_map(|memory| {
+        let raw = memory.git_remote.as_deref()?;
+        if project::looks_secret(raw) {
+            return None;
+        }
+        let url = RepoUrl::parse(raw).ok()?;
         let repo_name = url.as_str().rsplit('/').next().unwrap_or_default();
-        if !names.contains(&normalize_entity_name(repo_name)) {
-            continue;
-        }
-        // One remote only: a second, different one is a contradiction a
-        // person resolves with `set`, not something a rule guesses at.
-        match &found {
-            Some(seen) if *seen != url => return None,
-            Some(_) => {}
-            None => found = Some(url),
-        }
-        evidence.push(memory.id.clone());
-    }
-    found.map(|url| RemoteEvidence { url, evidence })
+        names
+            .contains(&normalize_entity_name(repo_name))
+            .then(|| (memory.id.clone(), url))
+    }))
 }
 
 /// A path under the repository root whose last segment names the entity.
-fn path_evidence(entity: &Entity, linked: &[Memory]) -> Option<(RepoPath, Vec<String>)> {
+///
+/// Only the `crates/<group>/<name>` layout this workspace uses anchors; a
+/// working directory elsewhere is skipped, not taken as the end of the
+/// search, so an older session inside the crate still counts.
+fn path_evidence(entity: &Entity, linked: &[Memory]) -> Seen<RepoPath> {
     let names = names(entity);
-    let mut found: Option<RepoPath> = None;
-    let mut evidence = Vec::new();
-    for memory in linked {
-        let Some(cwd) = memory.cwd.as_deref() else {
-            continue;
-        };
+    seen(linked.iter().filter_map(|memory| {
+        let cwd = memory.cwd.as_deref()?;
+        if project::looks_secret(cwd) {
+            return None;
+        }
         let normalized = cwd.replace('\\', "/");
         let segments: Vec<&str> = normalized.split('/').filter(|s| !s.is_empty()).collect();
-        let Some(last) = segments.last() else {
-            continue;
-        };
+        let last = segments.last()?;
         if !names.contains(&normalize_entity_name(last)) {
-            continue;
+            return None;
         }
-        // Keep the repository-relative tail: `crates/<group>/<name>`, the
-        // layout this workspace uses. Anything else is too shallow to anchor.
         let crates_at = segments.iter().position(|s| *s == "crates")?;
-        let tail = segments[crates_at..].join("/");
-        let Ok(path) = RepoPath::parse(&tail) else {
-            continue;
-        };
-        match &found {
-            Some(seen) if *seen != path => return None,
-            Some(_) => {}
-            None => found = Some(path),
-        }
-        evidence.push(memory.id.clone());
-    }
-    found.map(|path| (path, evidence))
+        let path = RepoPath::parse(&segments[crates_at..].join("/")).ok()?;
+        Some((memory.id.clone(), path))
+    }))
 }
 
 /// A decision memory tagged as design work.
@@ -481,14 +533,17 @@ mod tests {
     }
 
     #[test]
-    fn keys_are_stable_and_normalised() {
+    fn keys_normalise_the_project_and_keep_canonical_values() {
+        let built = ClaimValue::Stage(Stage::Built);
         assert_eq!(
-            proposal_key("  Rusty  Mux ", Predicate::Stage, " Built "),
-            proposal_key("rusty mux", Predicate::Stage, "built")
+            proposal_key("  Rusty  Mux ", &built),
+            proposal_key("rusty mux", &built)
         );
-        assert_eq!(
-            proposal_key("mill", Predicate::Stage, "built"),
-            "mill:stage:built"
+        assert_eq!(proposal_key("mill", &built), "mill:stage:built");
+        let path = |p: &str| ClaimValue::Path(RepoPath::parse(p).unwrap());
+        assert_ne!(
+            proposal_key("mill", &path("crates/Foo")),
+            proposal_key("mill", &path("crates/foo"))
         );
     }
 
@@ -533,7 +588,7 @@ mod tests {
         assert_eq!(
             found,
             [
-                "rusty_mill:repo:https://github.com/rusty-mill/rusty_mill",
+                "rusty_mill:repo:https://github.com/Rusty-Mill/rusty_mill",
                 "rusty_mill:stage:built",
             ]
         );
@@ -701,5 +756,122 @@ mod tests {
         let store = db.store();
         assert!(confirm(&store, "nope:stage:built", "human").is_err());
         assert!(reject(&store, "nope:stage:built", "human").is_err());
+    }
+
+    #[test]
+    fn an_anchor_for_a_new_project_bundles_what_set_needs() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        let e = entity(&store, "rusty_mux", None);
+        linked(&store, &e.id, "mem_c", |row| {
+            row.cwd = Some("/src/rusty_mill/crates/apps/rusty_mux".into());
+        });
+        let key = "rusty_mux:path:crates/apps/rusty_mux";
+        let path = proposals(&store)
+            .unwrap()
+            .into_iter()
+            .find(|p| p.key == key)
+            .unwrap();
+        assert_eq!(path.with_stage, Some(Stage::Built));
+        assert_eq!(path.with_status, Some(Status::Active));
+
+        confirm(&store, key, "human").unwrap();
+        let project = project::get(&store, "rusty_mux").unwrap().unwrap();
+        assert_eq!(project.stage.value, Stage::Built);
+        assert_eq!(
+            project.anchors.path.unwrap().value.as_str(),
+            "crates/apps/rusty_mux"
+        );
+    }
+
+    #[test]
+    fn a_repo_proposal_alone_can_create_the_project() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        let e = entity(&store, "rusty_mill", None);
+        linked(&store, &e.id, "mem_r", |row| {
+            row.git_remote = Some("https://github.com/Rusty-Mill/rusty_mill".into());
+        });
+        let repo = "rusty_mill:repo:https://github.com/Rusty-Mill/rusty_mill";
+        confirm(&store, repo, "human").unwrap();
+        let project = project::get(&store, "rusty_mill").unwrap().unwrap();
+        assert_eq!(project.stage.value, Stage::Built);
+        assert!(project.anchors.repo.is_some());
+        assert!(keys(&store).is_empty(), "built and anchored: nothing left");
+    }
+
+    #[test]
+    fn path_or_conflicting_evidence_is_not_an_idea() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        let at_path = entity(&store, "rusty_mux", Some("crate"));
+        linked(&store, &at_path.id, "mem_p", |row| {
+            row.cwd = Some("/src/crates/apps/rusty_mux".into());
+        });
+        let torn = entity(&store, "rusty_tick", Some("app"));
+        for (id, owner) in [("mem_a", "one"), ("mem_b", "two")] {
+            linked(&store, &torn.id, id, |row| {
+                row.git_remote = Some(format!("https://github.com/{owner}/rusty_tick"));
+            });
+        }
+        let found = keys(&store);
+        assert!(
+            !found.iter().any(|k| k.ends_with(":stage:idea")),
+            "{found:?}"
+        );
+        assert_eq!(found, ["rusty_mux:path:crates/apps/rusty_mux"]);
+    }
+
+    #[test]
+    fn rejecting_one_case_of_a_path_keeps_the_other() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        let e = entity(&store, "Foo", None);
+        let upper = linked(&store, &e.id, "mem_u", |row| {
+            row.cwd = Some("/src/crates/apps/Foo".into());
+        });
+        reject(&store, "foo:path:crates/apps/Foo", "human").unwrap();
+        assert!(keys(&store).is_empty());
+
+        // The session turns out to have been elsewhere; a later one ran in
+        // the lower-case directory, which is a different path.
+        crate::db::queries::delete_memory(&store, &upper).unwrap();
+        linked(&store, &e.id, "mem_l", |row| {
+            row.cwd = Some("/src/crates/apps/foo".into());
+        });
+        assert_eq!(keys(&store), ["foo:path:crates/apps/foo"]);
+    }
+
+    #[test]
+    fn a_working_directory_elsewhere_does_not_end_the_search() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        let e = entity(&store, "rusty_mux", None);
+        let old = (Utc::now() - Duration::days(2)).to_rfc3339();
+        linked(&store, &e.id, "mem_old", |row| {
+            row.created_at = old.clone();
+            row.cwd = Some("/src/rusty_mill/crates/apps/rusty_mux".into());
+        });
+        // Newest first: this one is read first and has no `crates` segment.
+        linked(&store, &e.id, "mem_new", |row| {
+            row.cwd = Some("/tmp/rusty_mux".into());
+        });
+        assert_eq!(keys(&store), ["rusty_mux:path:crates/apps/rusty_mux"]);
+    }
+
+    #[test]
+    fn secret_shaped_context_never_becomes_a_proposal() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        let secret = "AKIAIOSFODNN7EXAMPLE";
+        let e = entity(&store, "rusty_mux", None);
+        linked(&store, &e.id, "mem_c", |row| {
+            row.cwd = Some(format!("/src/crates/{secret}/rusty_mux"));
+            row.git_remote = Some(format!("https://github.com/{secret}/rusty_mux"));
+        });
+        let named = entity(&store, secret, Some("app"));
+        linked(&store, &named.id, "mem_n", |_| {});
+        let all = proposals(&store).unwrap();
+        assert!(all.is_empty(), "{all:?}");
     }
 }

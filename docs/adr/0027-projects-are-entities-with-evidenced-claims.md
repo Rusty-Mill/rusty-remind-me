@@ -167,17 +167,28 @@ said so" is recorded as evidence and can be found later.
 ### 5. Proposals are computed when read; only a person confirms
 
 Like `promotion_candidates`, proposals are computed from the store and are
-never stored. Each one has a stable key: `hash(entity_id, predicate, value)`.
+never stored. Each one has a stable key, `<project>:<predicate>:<value>`: the
+project name normalised like any entity name, the value in its canonical form
+so keys compare by the predicate's own equality (`crates/Foo` is not
+`crates/foo`).
 
 Version 1 rules, all deterministic and with no LLM call:
 
 | rule | proposes | evidence |
 |------|----------|----------|
-| entity with kind `project`, `app`, `crate` or `repo`, or 3+ linked memories, no stage claim, and no repo or path evidence | `stage = idea`, `status = active` | the linked memories |
+| entity with kind `project`, `app`, `crate` or `repo`, or 3+ linked memories, no stage claim, and no repo or path evidence (a conflicting one counts as evidence) | `stage = idea`, `status = active` | the linked memories |
 | memories linked to the entity carry a `git_remote` whose repo name matches the name or an alias | `stage = built`, `repo = <remote>` | those memories |
-| memories linked to the entity carry a `cwd` under `<repo>/crates/<group>/<name>` | `path = crates/<group>/<name>` | those memories |
+| memories linked to the entity carry a `cwd` under `<repo>/crates/<group>/<name>` (other layouts are skipped) | `path = crates/<group>/<name>` | those memories |
 | a linked `decision` memory with tag `design` or `adr`, and stage `idea` | `stage = designed` | that decision |
 | `status = active` and no linked memory for 60 days (configurable) | `status = dormant` | the last linked memory |
+
+Two different remotes, or two different paths, propose nothing for that
+anchor: a contradiction is for a person. A remote or `cwd` that looks like a
+secret is never evidence, and an entity whose name does is never proposed,
+because those values are stored verbatim. A repo or path proposal for an
+entity with no stage yet carries `stage = built, status = active`, so it can
+be confirmed on its own; a crate directory or matching remote is code that
+exists.
 
 A proposal never moves a project backwards (built to idea) on its own; only a
 direct `set` can. Rules improve as #56 feeds more session facts in, but they

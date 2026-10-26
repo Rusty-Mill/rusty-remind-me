@@ -768,6 +768,8 @@ fn set_in(store: &Store<'_>, input: &SetInput) -> Result<WriteOutcome> {
         return Err(StoreError::Invalid("no claims given".into()));
     }
     for claim in &input.claims {
+        // Secret first, so a refusal never echoes the value back.
+        refuse_secret(&claim.object(), &claim.predicate().qualified())?;
         claim.validated()?;
     }
     let mut seen = HashSet::new();
@@ -785,7 +787,6 @@ fn set_in(store: &Store<'_>, input: &SetInput) -> Result<WriteOutcome> {
         .iter()
         .find(|c| c.predicate() == Predicate::Parent)
     {
-        refuse_secret(parent, "parent name")?;
         if normalize_entity_name(parent) == normalize_entity_name(&subject) {
             return Err(StoreError::Invalid(
                 "a project cannot be its own parent".into(),
@@ -952,13 +953,19 @@ fn required<'a>(value: &'a str, field: &str) -> Result<&'a str> {
     Ok(trimmed)
 }
 
-/// Refuse a name the secret scrubber would rewrite. A name is stored in the
-/// claim's subject or object, which are not redacted, so it is refused
-/// rather than saved with the secret in it.
-fn refuse_secret(name: &str, what: &str) -> Result<()> {
+/// Whether the secret scrubber would rewrite `text`. Identity and anchor
+/// values (a claim's subject and object, a session's `cwd` or `git_remote`)
+/// are stored verbatim, so a caller refuses or skips such a value rather
+/// than redacting part of an identifier.
+pub(crate) fn looks_secret(text: &str) -> bool {
     let mut tags = Vec::new();
     let mut metadata = Value::Null;
-    if crate::boundary::scrub(name, &mut tags, &mut metadata) != name {
+    crate::boundary::scrub(text, &mut tags, &mut metadata) != text
+}
+
+/// Refuse a value that [`looks_secret`], naming only what it was.
+fn refuse_secret(text: &str, what: &str) -> Result<()> {
+    if looks_secret(text) {
         return Err(StoreError::Invalid(format!("{what} looks like a secret")));
     }
     Ok(())
@@ -1488,6 +1495,11 @@ mod tests {
         assert!(named.is_err());
         let parent = set_one(&store, "mill", ClaimValue::Parent(SECRET.into()), "x");
         assert!(parent.is_err());
+        let path = RepoPath::parse(&format!("crates/apps/{SECRET}")).unwrap();
+        let anchored = set_one(&store, "mill", ClaimValue::Path(path), "x");
+        assert!(anchored.is_err_and(|e| !e.to_string().contains(SECRET)));
+        let repo = RepoUrl::parse(&format!("https://github.com/{SECRET}/mill")).unwrap();
+        assert!(set_one(&store, "mill", ClaimValue::Repo(repo), "x").is_err());
         let all = Memories::new(&store).all_live().unwrap();
         assert!(all.iter().all(|m| !m.content.contains(SECRET)
             && m.subject.as_deref().is_none_or(|s| !s.contains(SECRET))

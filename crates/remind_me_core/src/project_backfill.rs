@@ -15,7 +15,7 @@
 use crate::db::memories::{Memories, NewMemory};
 use crate::db::{Result, Store, StoreError};
 use crate::entity::{link_memory_entity, resolve_entity, Entity};
-use crate::project::{RepoPath, RepoUrl};
+use crate::project::{looks_secret, RepoPath, RepoUrl};
 use chrono::Utc;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -44,6 +44,9 @@ pub struct BackfillReport {
     pub seeds: Vec<Seed>,
     /// Crate directories no entity answers to, so nothing was written.
     pub unmatched: Vec<String>,
+    /// Crate directories skipped because their path looks like a secret,
+    /// shown redacted. A seed stores the path verbatim, so none is written.
+    pub refused: Vec<String>,
     pub dry_run: bool,
 }
 
@@ -58,6 +61,11 @@ pub fn backfill(
     repo: &RepoUrl,
     write: bool,
 ) -> Result<BackfillReport> {
+    if looks_secret(repo.as_str()) {
+        return Err(StoreError::Invalid(
+            "repository URL looks like a secret".into(),
+        ));
+    }
     let mut report = BackfillReport {
         dry_run: !write,
         ..BackfillReport::default()
@@ -69,6 +77,10 @@ pub fn backfill(
         let Some(path) = relative.to_str().map(|p| p.replace('\\', "/")) else {
             continue;
         };
+        if looks_secret(&path) || looks_secret(&dir.display().to_string()) {
+            report.refused.push(redacted(&path));
+            continue;
+        }
         let Ok(path) = RepoPath::parse(&path) else {
             continue;
         };
@@ -92,7 +104,12 @@ pub fn backfill(
         .seeds
         .sort_by(|a, b| a.path.as_str().cmp(b.path.as_str()));
     report.unmatched.sort();
+    report.refused.sort();
     Ok(report)
+}
+
+fn redacted(text: &str) -> String {
+    crate::boundary::scrub(text, &mut Vec::new(), &mut serde_json::Value::Null)
 }
 
 /// `crates/<group>/<name>` directories, the layout this workspace uses.
@@ -136,26 +153,35 @@ fn write_seed(
     dir: &Path,
 ) -> Result<String> {
     let now = Utc::now().to_rfc3339();
+    let mut tags = vec![SEED_TAG.to_string()];
+    let mut metadata = serde_json::json!({
+        "project_backfill": { "repo": repo.as_str(), "path": path.as_str() }
+    });
+    // The common boundary, as on every write; the caller has already
+    // refused secret-shaped paths and remotes, which are stored verbatim.
+    let content = crate::boundary::scrub(
+        &format!(
+            "{} lives at {} in {}",
+            entity.name,
+            path.as_str(),
+            repo.as_str()
+        ),
+        &mut tags,
+        &mut metadata,
+    );
     let row = NewMemory {
         category: crate::kinds::MemoryKind::Reference.as_str().to_string(),
         memory_type: crate::kinds::MemoryKind::Reference.as_str().to_string(),
-        tags: vec![SEED_TAG.to_string()],
+        tags,
         source: SOURCE.to_string(),
         // The same two context fields a session would have recorded, so the
         // `built` and `path` rules read this exactly as they read a session.
         git_remote: Some(repo.as_str().to_string()),
         cwd: Some(dir.display().to_string()),
-        metadata: serde_json::json!({
-            "project_backfill": { "repo": repo.as_str(), "path": path.as_str() }
-        }),
+        metadata,
         ..crate::context::default_provenance().stamp(NewMemory::new(
             format!("mem_{}", uuid::Uuid::new_v4().simple()),
-            format!(
-                "{} lives at {} in {}",
-                entity.name,
-                path.as_str(),
-                repo.as_str()
-            ),
+            content,
             &now,
         ))
     };
@@ -254,8 +280,47 @@ mod tests {
         // The remote names the monorepo, so only it is proposed `built`; the
         // crate inside it gets a path, nothing more.
         assert!(keys.contains(&"rusty_mill:stage:built".to_string()));
-        assert!(keys.contains(&"rusty_mux:path:crates/apps/rusty_mux".to_string()));
+        let mux_path = "rusty_mux:path:crates/apps/rusty_mux";
+        assert!(keys.contains(&mux_path.to_string()));
         assert!(!keys.contains(&"rusty_mux:stage:built".to_string()));
+
+        // End to end: the path proposal alone creates the crate's project.
+        crate::project_proposals::confirm(&store, mux_path, "human").unwrap();
+        let mux = crate::project::get(&store, "rusty_mux").unwrap().unwrap();
+        assert_eq!(
+            mux.anchors.path.unwrap().value.as_str(),
+            "crates/apps/rusty_mux"
+        );
+    }
+
+    #[test]
+    fn a_secret_shaped_crate_path_is_refused_not_seeded() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        let secret = "AKIAIOSFODNN7EXAMPLE";
+        upsert_entity(
+            &store,
+            &EntityInput {
+                name: secret.into(),
+                kind: None,
+                aliases: vec![],
+            },
+        )
+        .unwrap();
+        let root = checkout("secret", &[("apps", secret)]);
+
+        let report = backfill(&store, &root, &repo(), true).unwrap();
+        assert!(report.seeds.is_empty());
+        assert_eq!(report.refused.len(), 1);
+        assert!(!report.refused[0].contains(secret));
+        let all = Memories::new(&store).all_live().unwrap();
+        assert!(all
+            .iter()
+            .all(|m| !m.content.contains(secret)
+                && m.cwd.as_deref().is_none_or(|c| !c.contains(secret))));
+
+        let bad_repo = RepoUrl::parse(&format!("https://github.com/{secret}/x")).unwrap();
+        assert!(backfill(&store, &root, &bad_repo, true).is_err());
     }
 
     #[test]
