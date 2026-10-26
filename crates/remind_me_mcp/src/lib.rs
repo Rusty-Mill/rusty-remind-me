@@ -760,12 +760,12 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_search",
-                                "description": "Search memories using FTS5 keyword & hybrid ranking. Returns compact hits by default (id, category, date, tags, score, snippet); fetch full text with remind_me_get memory_ids, or pass detail=full. Hits cut by token_budget are listed by id. The three expansion flags surface adjacent memories in their own sections, outside the ranked results, so they never consume `limit`.",
+                                "description": "Search memories using FTS5 keyword & hybrid ranking. Returns compact hits by default (id, category, date, tags, score, snippet); fetch full text with remind_me_get memory_ids, or pass detail=full. Hits cut by token_budget are listed by id. The three expansion flags surface adjacent memories in their own sections, outside the ranked results, so they never consume `limit`. `since`/`until` narrow to a time window; with an empty `query` they list that window newest-first, e.g. { \"query\": \"\", \"since\": \"2d\" } for the last two days.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
                                         "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "markdown", "description": "markdown (default, as the reference) renders the results; json returns the full envelope including scores." },
-                                        "query": { "type": "string" },
+                                        "query": { "type": "string", "description": "Search text. May be empty when since or until is set, to list that window newest-first." },
                                         "limit": { "type": "integer", "default": 20 },
                                         "detail": { "type": "string", "enum": ["compact", "full"], "default": "compact", "description": "compact (default): one short line per hit, so more hits fit the budget. full: whole memories with metadata and references." },
                                         "token_budget": { "type": "integer", "default": 800, "minimum": 0, "description": "Estimated tokens the hits may use; 0 is unlimited. Hits that do not fit are listed by id." },
@@ -783,6 +783,9 @@ impl McpServer {
                                         "bootstrap": { "type": "boolean", "default": false, "description": "Prepend the durable persona (L3) as context, whether or not it matches the query. Spends up to a quarter of token_budget; the rest still goes to the ranked results." },
                                         "include_expired": { "type": "boolean", "default": true, "description": "Include memories whose valid_until has passed. They always rank after in-window ones; set false to drop them." },
                                         "min_confidence": { "type": "number", "default": 0, "description": "Only return memories at or above this confidence (0 to 1)." },
+                                        "since": { "type": "string", "description": "Only memories at or after this time (inclusive): RFC 3339, or an age back from now like 30m, 12h, 2d, 1w." },
+                                        "until": { "type": "string", "description": "Only memories before this time (exclusive): RFC 3339, or an age back from now like 30m, 12h, 2d, 1w. Must be after since." },
+                                        "time_field": { "type": "string", "enum": ["created", "updated"], "default": "created", "description": "Which timestamp since/until apply to." },
                                         "strategy": { "type": "string", "enum": ["auto", "balanced", "keyword_favored", "semantic_favored"], "default": "auto", "description": "RRF weight profile. Leave at auto (routes by query shape: quoted phrases, prefix* wildcards and very short queries favour keyword relevance; long or question-shaped queries favour semantic similarity) unless deliberately A/B testing a pinned preset." }
                                     },
                                     "required": ["query"]
@@ -6175,5 +6178,58 @@ mod structure_tests {
             json!({ "query": "quokka policy", "include_expired": false }),
         );
         assert!(text(&hidden).contains("No memories"), "{}", text(&hidden));
+    }
+
+    #[test]
+    fn search_takes_a_time_window_and_lists_it_without_a_query() {
+        let s = server();
+        let search = tool(&s, "remind_me_search");
+        for field in ["since", "until", "time_field"] {
+            assert!(
+                search["inputSchema"]["properties"][field].is_object(),
+                "{field}"
+            );
+        }
+        call(
+            &s,
+            "remind_me_add",
+            json!({ "content": "wombat burrow note" }),
+        );
+
+        let listed = call(
+            &s,
+            "remind_me_search",
+            json!({ "query": "", "since": "1h", "response_format": "json" }),
+        );
+        assert!(!is_error(&listed), "{}", text(&listed));
+        assert!(
+            text(&listed).contains("wombat burrow note"),
+            "{}",
+            text(&listed)
+        );
+
+        let future = call(
+            &s,
+            "remind_me_search",
+            json!({ "query": "wombat", "since": "2999-01-01T00:00:00Z" }),
+        );
+        assert!(text(&future).contains("No memories"), "{}", text(&future));
+
+        let bad = call(
+            &s,
+            "remind_me_search",
+            json!({ "query": "", "since": "soon" }),
+        );
+        assert!(
+            is_error(&bad) && text(&bad).contains("`since`"),
+            "{}",
+            text(&bad)
+        );
+        let backwards = call(
+            &s,
+            "remind_me_search",
+            json!({ "query": "", "since": "1d", "until": "2d" }),
+        );
+        assert!(is_error(&backwards) && text(&backwards).contains("must be after"));
     }
 }
