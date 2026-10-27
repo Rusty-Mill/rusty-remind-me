@@ -4,8 +4,8 @@
 //!
 //! **Context and selection.** Every advertised tool's name, description and
 //! input schema is sent to the model on every session, and clients that defer
-//! tools find them by keyword search over that text. Ten tools a model can tell
-//! apart beat seventy-seven it has to search through (ADR-0030).
+//! tools find them by keyword search over that text. Eleven tools a model can tell
+//! apart beat seventy-eight it has to search through (ADR-0030).
 //!
 //! # Every tool is in exactly one group
 //!
@@ -39,8 +39,9 @@ pub const PRESETS: [&str; 2] = ["full", "standard"];
 ///
 /// `remind_me_server_status` is here because it reports which profile is
 /// active, and a profile you cannot diagnose from inside a session is a trap.
-pub const CORE: [&str; 10] = [
+pub const CORE: [&str; 11] = [
     "remind_me_search",
+    "remind_me_brief",
     "remind_me_get",
     "remind_me_add",
     "remind_me_update",

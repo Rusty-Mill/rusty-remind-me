@@ -6,12 +6,12 @@ Date: 2026-10-26
 
 ## Context
 
-The MCP server advertised 77 tools. A typical session uses about eight.
+The MCP server advertised 78 tools. A typical session uses about eight.
 Claude clients defer tools and load them by keyword search over name and
 description, so a large surface makes the right tool hard to find: a search
 for `remind_me_search` returned `remind_me_delete_saved_search` first, and no
 description contained the words "remind-me". Clients that load every tool up
-front (Hermes, local models, ChatGPT, Gemini) pay for all 77 schemas each
+front (Hermes, local models, ChatGPT, Gemini) pay for all 78 schemas each
 session, and small models choose worse among near-identical names.
 
 Profiles already existed (`REMIND_ME_TOOL_PROFILE` = `full`, `standard`,
@@ -29,9 +29,10 @@ instructions and the clients' standing instructions, not from usage data.
    asserts each advertised tool is in exactly one, and that every handler is
    either a public tool or an alias.
 2. **Core is ten tools**: search, get, add, update, delete, auto_capture,
-   resolve, entity, digest, server_status.
+   resolve, entity, digest, server_status; plus `brief`, which #1119 added to
+   core at the owner's request, so eleven in all.
    `remind_me_project` is in `pipeline`, not `core`: ADR-0027 (projects)
-   suggests core, but holding core at ten is this ADR's point, and a session
+   suggests core, but holding core small is this ADR's point, and a session
    that tracks projects adds `pipeline`.
 3. **`REMIND_ME_TOOL_PROFILE` takes a comma list of groups**, such as
    `core,wiki`. Core is always on. `full` is every group; `standard` keeps
@@ -55,8 +56,8 @@ instructions and the clients' standing instructions, not from usage data.
    - `reminders`, `saved_search(action)`, `sync_status(reconcile)`.
 
    A merged schema is the union of its handlers' properties; a property
-   whose handlers disagree on a default advertises none. 77 tools become 45;
-   `self_update` leaving MCP (step 2) makes it 44.
+   whose handlers disagree on a default advertises none. 78 tools become 46;
+   `self_update` leaving MCP (step 2) makes it 45.
 5. **Apply tools with different item schemas stay separate** (`decompose`,
    `annotate`, `normalize_apply`, `reclassify`). One tool with a `oneOf`
    union would suit small models worse than four strict schemas.
@@ -84,8 +85,8 @@ instructions and the clients' standing instructions, not from usage data.
 
 ## Consequences
 
-- Under `full` a client sees 45 tools instead of 77; after step 2, a client
-  that sets nothing sees 10.
+- Under `full` a client sees 46 tools instead of 78; after step 2, a client
+  that sets nothing sees 11.
 - 36 tool names are deprecated. Anything that calls them keeps working until
   0.6.0.
 - Per-client profiles keyed by client id are left to the multi-client

@@ -55,17 +55,6 @@ else:
 ' "$1" 2>/dev/null || echo '{"continue": true}'
 }
 
-# brief_text: stdin is `context --json` output; print its Markdown.
-brief_text() {
-  python3 -c '
-import json, sys
-try:
-    print(json.load(sys.stdin).get("context", ""), end="")
-except Exception:
-    pass
-' 2>/dev/null || true
-}
-
 missing_bin_message() {
   echo '{"continue": true, "systemMessage": "rusty-remind-me is not on PATH, so the rusty_remind_me plugin cannot read or save memories. Build it (cargo build --release -p rusty-remind-me) and put target/release on PATH, or `cargo install --path crates/apps/rusty_remind_me/crates/remind_me_cli` from a Rusty-Mill/rusty_mill checkout."}'
 }

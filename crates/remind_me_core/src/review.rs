@@ -218,11 +218,10 @@ pub fn due_among<'a>(
     project: Option<&str>,
 ) -> Vec<&'a Memory> {
     let scope = crate::context::ScopeFilter::new(project.map(str::to_string), None, None, None);
-    let now_text = now.to_rfc3339();
     let mut due: Vec<&Memory> = memories
         .iter()
         .filter(|m| m.memory_type.as_deref() == Some(DECISION))
-        .filter(|m| crate::context_brief::injectable(m, &now_text) && scope.matches_memory(m))
+        .filter(|m| crate::context_brief::injectable(m, now) && scope.matches_memory(m))
         .filter(|m| state(m, now) == ReviewState::Due)
         .collect();
     due.sort_by(|a, b| (due_instant(a), &a.id).cmp(&(due_instant(b), &b.id)));
@@ -905,17 +904,30 @@ mod tests {
             "{md}"
         );
 
-        let brief = crate::context_brief::build(
-            &store,
-            &crate::context_brief::ContextRequest {
-                project: Some("quokka"),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(brief.sections.reviews, 1, "{}", brief.context);
-        assert!(brief.context.contains("Decisions to review"));
-        assert!(brief.context.contains("(due_here)") && !brief.context.contains("due_elsewhere"));
+        let request = crate::context_brief::ContextRequest {
+            project: Some("quokka"),
+            budget: crate::context_brief::DEFAULT_TOKEN_BUDGET,
+            ..Default::default()
+        };
+        let crate::context_brief::Outcome::Brief(brief) =
+            crate::context_brief::build(&store, &request).unwrap()
+        else {
+            panic!("quokka is a known project");
+        };
+        let context = crate::context_brief::render_markdown(&brief);
+        let section = |name: &str| brief.sections.iter().find(|s| s.name == name).unwrap();
+        let reviews: Vec<&str> = section("reviews")
+            .items
+            .iter()
+            .map(|i| i.id.as_str())
+            .collect();
+        assert_eq!(reviews, ["due_here"], "{context}");
+        assert!(context.contains("Decisions to review"), "{context}");
+        assert!(
+            !section("open").items.iter().any(|i| i.id == "due_here"),
+            "a due review is listed once"
+        );
+        assert!(!context.contains("due_elsewhere"), "{context}");
 
         record_review(&store, "due_here", "held", None).unwrap();
         let digest = crate::digest::build_digest(&store, 7).unwrap();

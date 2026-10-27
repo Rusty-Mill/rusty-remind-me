@@ -7,7 +7,7 @@
 //! Paths must be absolute: the daemon's working directory is not the
 //! client's.
 
-use crate::context_brief::{self, ContextRequest};
+use crate::context_brief::{self, Brief, ContextRequest, Mode, Outcome};
 use crate::db::{Result, Store, StoreError};
 use crate::episodes;
 use crate::transcript::{self, TranscriptRequest};
@@ -202,12 +202,20 @@ pub struct ContextArgs<'a> {
     pub project: Option<&'a str>,
     pub branch: Option<&'a str>,
     pub prompt: Option<&'a str>,
+    /// Tokens; `0` means unlimited.
     pub budget: usize,
     pub hits_only: bool,
 }
 
-/// `{"context", "sections", "dropped"}`. The project and branch default to
-/// the ones `cwd` is in.
+/// `{"brief", "context"}`: the brief's JSON and its Markdown, each within
+/// the budget on its own. A caller prints one of them, never both.
+fn brief_json(brief: &Brief) -> Result<Value> {
+    let data = serde_json::to_value(brief).map_err(|e| StoreError::Invalid(e.to_string()))?;
+    Ok(json!({ "brief": data, "context": context_brief::render_markdown(brief) }))
+}
+
+/// A session brief (see [`context_brief`]), as [`brief_json`].
+/// The project and branch default to the ones `cwd` is in.
 pub fn context(store: &Store<'_>, args: &ContextArgs<'_>) -> Result<Value> {
     if let Some(cwd) = args.cwd {
         absolute(cwd, "cwd")?;
@@ -221,17 +229,49 @@ pub fn context(store: &Store<'_>, args: &ContextArgs<'_>) -> Result<Value> {
         .branch
         .map(str::to_string)
         .or_else(|| from_cwd.as_ref().and_then(|c| c.git_branch.clone()));
-    let brief = context_brief::build(
-        store,
-        &ContextRequest {
-            project: project.as_deref(),
-            branch: branch.as_deref(),
-            prompt: args.prompt,
-            budget: args.budget,
-            hits_only: args.hits_only,
+    let request = ContextRequest {
+        mode: if args.hits_only {
+            Mode::Prompt
+        } else {
+            Mode::Session
         },
-    )?;
-    serde_json::to_value(brief).map_err(|e| StoreError::Invalid(e.to_string()))
+        project: project.as_deref(),
+        branch: branch.as_deref(),
+        prompt: args.prompt,
+        since: None,
+        budget: args.budget,
+    };
+    match context_brief::build(store, &request)? {
+        Outcome::Brief(brief) => brief_json(&brief),
+        // Session and prompt briefs never refuse a project.
+        Outcome::UnknownProject { name, .. } => {
+            Err(StoreError::Invalid(format!("unknown project {name:?}")))
+        }
+    }
+}
+
+/// A project brief (`rusty-remind-me brief`), as [`brief_json`]. An
+/// unknown project is an error naming the closest known ones.
+pub fn brief(
+    store: &Store<'_>,
+    project: &str,
+    since: Option<&str>,
+    budget: usize,
+) -> Result<Value> {
+    context_brief::check_token_budget(budget)?;
+    let request = ContextRequest {
+        mode: Mode::Project,
+        project: Some(project),
+        since,
+        budget,
+        ..ContextRequest::default()
+    };
+    match context_brief::build(store, &request)? {
+        Outcome::Brief(brief) => brief_json(&brief),
+        Outcome::UnknownProject { name, suggestions } => Err(StoreError::Invalid(
+            context_brief::unknown_project_message(&name, &suggestions),
+        )),
+    }
 }
 
 /// `{"session": {...}, "memories": [...], "markdown": "..."}`, or `null` for
@@ -495,7 +535,39 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(brief["sections"]["recent"].as_u64().unwrap() >= 1);
+        let shown: usize = brief["brief"]["sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["items"].as_array().unwrap().len())
+            .sum();
+        assert!(shown >= 1, "{brief}");
+        assert!(brief["context"]
+            .as_str()
+            .unwrap()
+            .starts_with("# Memory context"));
+
+        let unknown = super::brief(&store, "nowhere", None, 1500).unwrap_err();
+        assert!(unknown.to_string().contains("no project"), "{unknown}");
+        assert!(super::brief(&store, "nowhere", None, 1).is_err());
+        // The CLI prints `brief` or `context`, each within the budget.
+        let tight = context(
+            &store,
+            &ContextArgs {
+                budget: 200,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for printed in [
+            tight["brief"].to_string(),
+            tight["context"].as_str().unwrap().to_string(),
+        ] {
+            assert!(
+                crate::retrieval::estimated_content_tokens(&printed) <= 200,
+                "{printed}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

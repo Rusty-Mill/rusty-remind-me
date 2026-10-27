@@ -62,7 +62,7 @@ fn profiles_are_normalised_for_case_blanks_and_spacing() {
 
 #[test]
 fn core_is_ten_tools_and_always_on() {
-    assert_eq!(CORE.len(), 10);
+    assert_eq!(CORE.len(), 11);
     let core = allowed_tools("core").expect("core narrows");
     assert_eq!(core, CORE.into_iter().collect());
     // Naming another group never drops core.
@@ -96,7 +96,7 @@ fn every_public_tool_is_in_exactly_one_group() {
             assert_eq!(group_of(tool), Some(group));
         }
     }
-    assert_eq!(seen.len(), 45);
+    assert_eq!(seen.len(), 46);
 }
 
 #[test]
@@ -112,8 +112,8 @@ fn every_alias_points_at_a_public_tool_and_is_not_one_itself() {
         assert!(!public.contains(old), "{old} is both public and an alias");
         assert_eq!(replacement(old), Some(new));
     }
-    // 77 tools before ADR-0030: 45 public names, 4 of them new, plus 36 aliases.
-    assert_eq!(public.len() - 4 + ALIASES.len(), 77);
+    // 78 tools before ADR-0030: 46 public names, 4 of them new, plus 36 aliases.
+    assert_eq!(public.len() - 4 + ALIASES.len(), 78);
 }
 
 #[test]
