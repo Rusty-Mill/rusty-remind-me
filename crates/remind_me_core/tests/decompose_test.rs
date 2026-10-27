@@ -593,8 +593,12 @@ fn a_session_recaptured_after_decomposition_is_due_again() {
         reason: Some("stop"),
         context: None,
     };
+    // The batch, the capture_to_fact candidates and the backlog share one
+    // predicate, so all three agree on what is due.
     let due = |store: &Store<'_>| {
-        undecomposed_batch(
+        use remind_me_core::models::Rung;
+        use remind_me_core::promotion::{backlog, promotion_candidates};
+        let batch = undecomposed_batch(
             store,
             &DecomposeBatchInput {
                 batch_size: 10,
@@ -602,19 +606,24 @@ fn a_session_recaptured_after_decomposition_is_due_again() {
             },
         )
         .unwrap()
-        .total_undecomposed
+        .total_undecomposed;
+        let candidates = promotion_candidates(store, Rung::CaptureToFact, 10)
+            .unwrap()
+            .len();
+        let backlog = backlog(store).unwrap().capture_to_fact;
+        (batch, candidates > 0, backlog > 0)
     };
 
     let made = capture_transcript(&store, &line("first"), &request).unwrap();
-    assert_eq!(due(&store), 2, "dialog and summary");
+    assert_eq!(due(&store), (2, true, true), "dialog and summary");
     run(&store, &made.capture_id, vec![fact("the first thing")]);
-    assert_eq!(due(&store), 0);
+    assert_eq!(due(&store), (0, false, false));
 
     let grown = format!("{}\n{}", line("first"), line("second"));
     capture_transcript(&store, &grown, &request).unwrap();
-    assert_eq!(due(&store), 2, "the recapture is due again");
+    assert_eq!(due(&store), (2, true, true), "the recapture is due again");
     run(&store, &made.capture_id, vec![fact("the second thing")]);
-    assert_eq!(due(&store), 0);
+    assert_eq!(due(&store), (0, false, false));
 }
 
 /// A scheduled pass asks for settled captures only, so a live session is
