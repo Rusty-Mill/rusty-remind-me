@@ -773,6 +773,73 @@ mod interleaving {
         assert_eq!(offered(&store).0.len(), 2, "a later recapture is still due");
     }
 
+    /// Decomposes with no top-level revision but a nested one in the fact's
+    /// metadata, as a legacy-shaped request would; returns the fact's id.
+    fn decompose_nested(store: &Store<'_>, capture_id: &str, nested: &str) -> String {
+        let mut smuggled = fact("nested");
+        smuggled.metadata = Some(serde_json::json!({"capture_revision": nested}));
+        decompose(
+            store,
+            &DecomposeInput {
+                capture_id: capture_id.to_string(),
+                facts: vec![smuggled],
+                capture_revision: None,
+            },
+        )
+        .unwrap()
+        .unwrap()
+        .fact_ids
+        .remove(0)
+    }
+
+    #[test]
+    fn a_nested_revision_is_never_trusted() {
+        for nested in ["2999-01-01T00:00:00Z", "yesterday"] {
+            let db = Database::open_in_memory().unwrap();
+            let store = db.store();
+            let capture = recapture(&store, &line("first"));
+            let id = decompose_nested(&store, &capture, nested);
+            let metadata: serde_json::Value =
+                serde_json::from_str(&column(&store, &id, "metadata")).unwrap();
+            assert!(
+                metadata.get("capture_revision").is_none(),
+                "{nested}: {metadata}"
+            );
+
+            recapture(&store, &format!("{}\n{}", line("first"), line("later")));
+            assert_eq!(
+                offered(&store).0.len(),
+                2,
+                "{nested}: a later recapture is due"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stored_marker_that_is_not_a_past_time_is_ignored() {
+        for planted in ["2999-01-01T00:00:00Z", "yesterday"] {
+            let db = Database::open_in_memory().unwrap();
+            let store = db.store();
+            let capture = recapture(&store, &line("first"));
+            let (seen, ..) = offered(&store);
+            decompose_at(&store, &capture, &seen[0], "the first thing");
+            let fact = remind_me_core::testing::memory_ids(&store)
+                .unwrap()
+                .into_iter()
+                .find(|id| column(&store, id, "category") == "fact")
+                .unwrap();
+            let marker = serde_json::json!({"capture_revision": planted}).to_string();
+            remind_me_core::testing::set_memory_column(&store, &fact, "metadata", marker).unwrap();
+
+            recapture(&store, &format!("{}\n{}", line("first"), line("later")));
+            assert_eq!(
+                offered(&store).0.len(),
+                2,
+                "{planted}: a later recapture is due"
+            );
+        }
+    }
+
     #[test]
     fn facts_carry_the_session_they_were_drawn_from() {
         let db = Database::open_in_memory().unwrap();

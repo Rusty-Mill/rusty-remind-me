@@ -366,8 +366,15 @@ pub fn decompose(store: &Store<'_>, input: &DecomposeInput) -> Result<Option<Dec
             .filter(serde_json::Value::is_object)
             .unwrap_or_else(|| serde_json::json!({}));
         metadata["source_capture_id"] = serde_json::json!(input.capture_id);
-        if let Some(revision) = &revision {
-            metadata["capture_revision"] = serde_json::json!(revision);
+        // Reserved: only a validated top-level `capture_revision` may set it,
+        // or a caller's nested value would hide later recaptures.
+        match &revision {
+            Some(revision) => metadata["capture_revision"] = serde_json::json!(revision),
+            None => {
+                if let Some(m) = metadata.as_object_mut() {
+                    m.remove("capture_revision");
+                }
+            }
         }
         let code_refs = crate::code_refs::detect_code_refs(&fact.content);
         crate::code_refs::merge_code_refs(&mut metadata, &code_refs);

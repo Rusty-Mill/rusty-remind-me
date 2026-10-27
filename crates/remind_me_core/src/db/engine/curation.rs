@@ -44,11 +44,16 @@ pub(crate) fn capture_tags(tables: &EngineTables, capture_id: &str) -> Result<Op
 }
 
 /// The revision of the capture a fact was drawn from: its
-/// `metadata.capture_revision`, else its own `created_at`.
+/// `metadata.capture_revision` when that is an RFC 3339 time no later than
+/// the fact itself, else its own `created_at`. A marker that is not a time,
+/// or lies in the fact's future, was never validated and is ignored.
 fn drawn_from(row: &MemoryRow) -> String {
+    let parse = |raw: &str| chrono::DateTime::parse_from_rfc3339(raw.trim()).ok();
     serde_json::from_str::<serde_json::Value>(&row.metadata)
         .ok()
-        .and_then(|m| m.get("capture_revision")?.as_str().map(str::to_string))
+        .and_then(|m| parse(m.get("capture_revision")?.as_str()?))
+        .filter(|at| parse(&row.created_at).is_some_and(|created| *at <= created))
+        .map(|at| at.with_timezone(&chrono::Utc).to_rfc3339())
         .unwrap_or_else(|| row.created_at.clone())
 }
 
