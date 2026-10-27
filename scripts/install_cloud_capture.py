@@ -61,7 +61,11 @@ def ours(hook: Any) -> bool:
 
 
 def validate(settings: dict[str, Any]) -> None:
-    """Refuse settings whose hooks Claude Code could not read as written."""
+    """Refuse settings whose hooks Claude Code could not read as written.
+
+    Errors name the location and field only, never a value: handlers can
+    carry credentials in a command or header.
+    """
     if 'hooks' not in settings:
         return
     hooks = settings['hooks']
@@ -71,23 +75,65 @@ def validate(settings: dict[str, Any]) -> None:
         groups = hooks.get(event, [])
         if not isinstance(groups, list):
             raise InstallError(f'settings.json hooks.{event} is not a list')
-        for group in groups:
+        for i, group in enumerate(groups):
+            where = f'settings.json hooks.{event}[{i}]'
             if not isinstance(group, dict) or not isinstance(group.get('hooks'), list):
-                raise InstallError(f'settings.json hooks.{event} has a group without a "hooks" list')
-            for hook in group['hooks']:
-                if not valid_handler(hook):
-                    raise InstallError(f'settings.json hooks.{event} has a malformed hook: {hook!r}')
+                raise InstallError(f'{where} has no "hooks" list')
+            for j, hook in enumerate(group['hooks']):
+                field = handler_fault(hook)
+                if field is not None:
+                    raise InstallError(f'{where}.hooks[{j}] has a missing or invalid "{field}"')
 
 
-def valid_handler(hook: Any) -> bool:
-    """A handler with a type; a command handler also needs its command and a numeric timeout."""
-    if not isinstance(hook, dict) or not isinstance(hook.get('type'), str) or not hook['type']:
-        return False
-    timeout = hook.get('timeout', 1)
-    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
-        return False
-    command = hook.get('command')
-    return hook['type'] != 'command' or (isinstance(command, str) and bool(command.strip()))
+def is_str(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def is_str_list(value: Any) -> bool:
+    return isinstance(value, list) and all(isinstance(v, str) for v in value)
+
+
+def is_timeout(value: Any) -> bool:
+    return not isinstance(value, bool) and isinstance(value, (int, float)) and value > 0
+
+
+# Hook handler fields, per https://code.claude.com/docs/en/hooks#hook-handler-fields:
+# the fields each type requires, then the type each optional field must have.
+REQUIRED: dict[str, tuple[str, ...]] = {
+    'command': ('command',),
+    'http': ('url',),
+    'mcp_tool': ('server', 'tool'),
+    'prompt': ('prompt',),
+    'agent': ('prompt',),
+}
+OPTIONAL: dict[str, Any] = {
+    'timeout': is_timeout,
+    'if': is_str,
+    'statusMessage': lambda v: isinstance(v, str),
+    'once': lambda v: isinstance(v, bool),
+    'args': is_str_list,
+    'async': lambda v: isinstance(v, bool),
+    'asyncRewake': lambda v: isinstance(v, bool),
+    'shell': lambda v: v in ('bash', 'powershell'),
+    'onFailure': lambda v: v in ('continue', 'block'),
+    'headers': lambda v: isinstance(v, dict) and all(isinstance(x, str) for x in v.values()),
+    'allowedEnvVars': is_str_list,
+    'input': lambda v: isinstance(v, dict),
+    'model': is_str,
+}
+
+
+def handler_fault(hook: Any) -> str | None:
+    """The first field that makes `hook` an invalid handler, or None if it is valid."""
+    if not isinstance(hook, dict) or hook.get('type') not in REQUIRED:
+        return 'type'
+    for field in REQUIRED[hook['type']]:
+        if not is_str(hook.get(field)):
+            return field
+    for field, ok in OPTIONAL.items():
+        if field in hook and not ok(hook[field]):
+            return field
+    return None
 
 
 def registered(groups: list[dict[str, Any]]) -> bool:
