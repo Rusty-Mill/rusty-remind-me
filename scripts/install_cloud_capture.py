@@ -125,7 +125,7 @@ OPTIONAL: dict[str, Any] = {
 
 def handler_fault(hook: Any) -> str | None:
     """The first field that makes `hook` an invalid handler, or None if it is valid."""
-    if not isinstance(hook, dict) or hook.get('type') not in REQUIRED:
+    if not isinstance(hook, dict) or not isinstance(hook.get('type'), str) or hook['type'] not in REQUIRED:
         return 'type'
     for field in REQUIRED[hook['type']]:
         if not is_str(hook.get(field)):
