@@ -502,6 +502,11 @@ pub fn search_response(res: &MemorySearchResponse, detail: SearchDetail) -> Stri
     // a claim rather than a report -- so the count is stated and the method is
     // not.
     parts.push(format!("**{} results**", res.returned));
+    if res.raw_fallback {
+        parts.push(
+            "_Raw sessions: nothing refined matched, so these are session dialogs._".to_string(),
+        );
+    }
     // Ahead of the budget envelope, because it qualifies the result set more
     // strongly than the trim does: trimming drops results that were found,
     // whereas a skipped stage means results that were never looked for.
@@ -650,6 +655,7 @@ mod bootstrap_rendering {
             budget: 800,
             timing: Default::default(),
             bootstrap,
+            raw_fallback: false,
             related_via_entities: None,
             related_via_neighbors: None,
             related_via_co_retrieval: None,
@@ -741,6 +747,7 @@ mod deadline_rendering {
             budget: 800,
             timing,
             bootstrap: None,
+            raw_fallback: false,
             related_via_entities: None,
             related_via_neighbors: None,
             related_via_co_retrieval: None,

@@ -790,6 +790,7 @@ impl McpServer {
                                         "bootstrap": { "type": "boolean", "default": false, "description": "Prepend the durable persona (L3) as context, whether or not it matches the query. Spends up to a quarter of token_budget; the rest still goes to the ranked results." },
                                         "include_expired": { "type": "boolean", "default": true, "description": "Include memories whose valid_until has passed. They always rank after in-window ones; set false to drop them." },
                                         "min_confidence": { "type": "number", "default": 0, "description": "Only return memories at or above this confidence (0 to 1)." },
+                                        "include_raw": { "type": "boolean", "default": false, "description": "Rank raw session dialogs and skeletons too. Off by default: facts and summaries rank, and each carries the capture_id of its dialog. A dialog category or a session_id filter turns it on, and when nothing refined matches the best dialogs come back marked as raw." },
                                         "since": { "type": "string", "description": "Only memories at or after this time (inclusive): RFC 3339, or an age back from now like 30m, 12h, 2d, 1w." },
                                         "until": { "type": "string", "description": "Only memories before this time (exclusive): RFC 3339, or an age back from now like 30m, 12h, 2d, 1w. Must be after since." },
                                         "time_field": { "type": "string", "enum": ["created", "updated"], "default": "created", "description": "Which timestamp since/until apply to." },
@@ -4141,6 +4142,42 @@ mod tests {
                 text_of(&listed)
             );
         }
+    }
+
+    #[test]
+    fn a_window_leaves_dialogs_out_unless_asked_and_falls_back_to_them() {
+        let server = McpServer::new(Database::open_in_memory().unwrap());
+        let add_in = |content: &str, category: &str| {
+            call(
+                &server,
+                "remind_me_add",
+                json!({ "content": content, "category": category }),
+            );
+        };
+        let window = |extra: Value| {
+            let mut args = json!({ "since": "1h" });
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            text_of(&call(&server, "remind_me_search", args))
+        };
+
+        add_in("Gamma dialog turn", "dialog");
+        let fallback = window(json!({}));
+        assert!(fallback.contains("Gamma dialog turn"), "{fallback}");
+        assert!(fallback.contains("Raw sessions"), "{fallback}");
+
+        add_in("Gamma refined fact", "fact");
+        let refined = window(json!({}));
+        assert!(refined.contains("Gamma refined fact"), "{refined}");
+        assert!(!refined.contains("Gamma dialog turn"), "{refined}");
+
+        let raw = window(json!({ "include_raw": true }));
+        assert!(raw.contains("Gamma refined fact"), "{raw}");
+        assert!(
+            raw.contains("Gamma dialog turn"),
+            "include_raw was dropped: {raw}"
+        );
     }
 
     #[test]

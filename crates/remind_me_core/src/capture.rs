@@ -22,13 +22,14 @@ use chrono::Utc;
 /// Derive a display title from a summary when the caller supplied none.
 ///
 /// First line, capped — a summary's opening line is the closest thing to a
-/// headline it has.
+/// headline it has. Either source is redacted whole first: the title is
+/// metadata, which the halves' own redaction does not reach.
 fn derive_title(title: &str, summary: &str) -> String {
     let supplied = title.trim();
     if !supplied.is_empty() {
-        return supplied.to_string();
+        return crate::boundary::scrub_field(supplied);
     }
-    summary
+    crate::boundary::scrub_field(summary)
         .lines()
         .next()
         .unwrap_or("")
@@ -69,10 +70,19 @@ pub struct CaptureStamp {
     pub written_by: Option<String>,
     /// Overrides the schema default `manual` when set.
     pub capture_method: Option<String>,
+    /// The context is the whole truth about where the capture was made (a
+    /// caller's own, or a backfilled transcript's): its project, cwd and git
+    /// columns replace this process's, so an unknown stays unknown instead
+    /// of taking the value of wherever the store runs.
+    pub authoritative: bool,
 }
 
 impl CaptureStamp {
     fn apply(&self, row: &mut NewMemory) {
+        if self.authoritative {
+            (row.project, row.cwd) = (None, None);
+            (row.git_remote, row.git_branch, row.git_sha) = (None, None, None);
+        }
         self.context.apply(row);
         if let Some(by) = &self.written_by {
             row.written_by.clone_from(by);

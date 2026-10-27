@@ -125,12 +125,13 @@ impl MemoryRow {
         )
     }
 
-    /// Whether this row passes a search's sensitivity, category, scope and
-    /// time-window filters. Vitality needs the converted memory, so it is not
-    /// checked here.
+    /// Whether this row passes a search's sensitivity, category, raw, scope
+    /// and time-window filters. Vitality needs the converted memory, so it is
+    /// not checked here.
     pub(crate) fn admits(&self, filter: &KeywordFilter) -> bool {
         (filter.include_sensitive || !self.sensitive)
             && filter.category.as_ref().is_none_or(|c| &self.category == c)
+            && !(filter.exclude_raw && crate::db::memories::is_raw_category(&self.category))
             && self.in_scope(&filter.scope)
             && filter.window.contains(&self.created_at, &self.updated_at)
     }

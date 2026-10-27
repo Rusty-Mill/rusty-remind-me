@@ -187,11 +187,12 @@ const FOR_LISTING: [&str; 12] = [
 /// honours: the filters its newest-first listing applies, and the shaping of
 /// its output. `source`, `offset`, the expansion flags and the ranking options
 /// do nothing there, so they are refused.
-const FOR_WINDOW: [&str; 22] = [
+const FOR_WINDOW: [&str; 23] = [
     "query",
     "since",
     "until",
     "time_field",
+    "include_raw",
     "category",
     "tags",
     "tag_mode",
@@ -622,6 +623,7 @@ mod tests {
             json!({"until": "2030-01-01T00:00:00Z", "min_confidence": 0.5}),
             json!({"query": null, "since": "1h"}),
             json!({"since": "1h", "tags": ["a"], "tag_mode": "any", "entity": "e", "repo": "r"}),
+            json!({"since": "1h", "include_raw": true}),
         ] {
             let (handler, args) = routed("remind_me_search", windowed);
             assert_eq!(handler, "remind_me_search");

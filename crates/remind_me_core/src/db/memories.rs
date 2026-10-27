@@ -230,8 +230,20 @@ pub struct KeywordFilter {
     pub category: Option<String>,
     pub include_sensitive: bool,
     pub scope: crate::context::ScopeFilter,
+    /// Leave out [`RAW_CATEGORIES`].
+    pub exclude_raw: bool,
     pub narrowing: Narrowing,
     pub window: crate::time_window::TimeWindow,
+}
+
+/// Categories holding a session's verbatim record rather than something
+/// distilled from it. A ranked search leaves them out unless asked
+/// (ADR-0029): one long dialog matches almost any query.
+pub const RAW_CATEGORIES: [&str; 2] = ["dialog", "skeleton"];
+
+/// Whether `category` holds raw session text.
+pub fn is_raw_category(category: &str) -> bool {
+    RAW_CATEGORIES.contains(&category)
 }
 
 /// A search's tag, entity and repository filters, resolved against the store.
@@ -1299,6 +1311,7 @@ mod tests {
                 min_effective_vitality: Some(crate::vitality::VITALITY_FLOOR),
                 category: text("fact"),
                 include_sensitive: true,
+                exclude_raw: true,
                 narrowing: Default::default(),
                 window: Default::default(),
             },
