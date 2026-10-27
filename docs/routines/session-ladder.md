@@ -1,16 +1,16 @@
 # Routine: refine settled sessions (ADR-0029)
 
 A scheduled Claude routine runs this once a day. It needs the remind-me connector with the
-`full` or `standard` tool profile. It touches nothing outside remind-me.
+`full` or `standard` tool profile, or any profile with the `pipeline` group (ADR-0030). It touches nothing outside remind-me.
 
 ## Prompt
 
 You are refining captured Claude Code sessions in remind-me. Use only the remind-me tools.
 
-1. Call `remind_me_decompose_batch` with `batch_size: 20, idle_minutes: 120`. Each entry is one
+1. Call `remind_me_queue` with `kind: "decompose", batch_size: 20, idle_minutes: 120`. Each entry is one
    half of a capture: the `dialog` half holds the session, so work from that half and skip the
    summary half of the same `capture_id`.
-2. For each dialog, read the whole capture with `remind_me_get_capture`. For a long one, use
+2. For each dialog, read the whole capture with `remind_me_get` and its `capture_id`. For a long one, use
    `remind_me_skeleton_read` or read it in parts. Then extract only these facts, and only where
    the dialog states them, and set each fact's `memory_type` to the kind shown:
    - `decision`: what was chosen, with `metadata.rationale` saying why.
@@ -26,7 +26,7 @@ You are refining captured Claude Code sessions in remind-me. Use only the remind
 3. Call `remind_me_decompose` with that `capture_id` and the facts. A session captured again
    after an earlier pass comes back here. Only add what is new, because restating an old fact
    adds noise.
-4. Call `remind_me_promotion_candidates` with `rung: "fact_to_scenario"`. For each candidate,
+4. Call `remind_me_queue` with `kind: "promotion", rung: "fact_to_scenario"`. For each candidate,
    write a short topic summary that the facts support, and call `remind_me_promote` with
    `rung: "fact_to_scenario"` and all of its `source_ids`. Don't promote to persona.
 5. Finish with one line: how many sessions were decomposed, how many facts were written and how
