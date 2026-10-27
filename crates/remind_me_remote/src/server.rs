@@ -153,8 +153,7 @@ pub fn build_router(
     let store = remind_me_core::remote::OAuthStateStore::new(
         remind_me_core::remote::oauth_state_file_path(),
     );
-    let provider = Arc::new(oauth::Provider::new(token.clone(), store));
-    let oauth_state = OAuthAppState { provider, issuer };
+    let oauth_state = OAuthAppState::new(token.clone(), issuer, store);
 
     // The bearer check wraps only the MCP handler, not the OAuth routes,
     // which authenticate themselves differently (owner-credential consent,

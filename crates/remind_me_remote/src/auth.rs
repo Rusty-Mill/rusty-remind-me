@@ -87,7 +87,7 @@ pub struct GateConfig {
     /// The resolved connector token (never logged, never included in a
     /// response). In OAuth mode it doubles as the owner credential the
     /// `/consent` page checks, but that comparison lives in
-    /// `oauth::Provider`, not here.
+    /// `oauth::OAuthAppState::new`, not here.
     pub token: String,
     /// `true` once `REMIND_ME_REMOTE_ISSUER` is set: `/mcp` (bare, no
     /// matching secret-path segment) is forwarded rather than gated on the

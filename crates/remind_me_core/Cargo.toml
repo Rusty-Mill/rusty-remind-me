@@ -13,6 +13,7 @@ layer = "apps"
 rusty_percent = { workspace = true }
 rusty_hex = { workspace = true }
 rusty_oauth = { workspace = true }
+rusty_oauth_server = { workspace = true }
 rusty_crypto_key = { workspace = true }
 rusty_atomic_file = { workspace = true }
 
@@ -66,6 +67,8 @@ symphonia = { version = "0.6", optional = true, default-features = false, featur
 ] }
 
 [dev-dependencies]
+# `json!` for the OAuth state store's `rusty_json` values in tests.
+rusty_json = { workspace = true }
 # The real remind_me_hub binary's library, without the copy tool's Postgres
 # reader (tests need no Postgres connection) -- used by
 # `tests/support`'s `MockHub` to run actual remind_me_hub request handling

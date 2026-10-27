@@ -103,11 +103,16 @@ async fn spawn_oauth_server() -> SocketAddr {
 }
 
 /// RFC 7636 PKCE pair: a random verifier and its S256 challenge, using the
-/// crate's own (independently unit-tested) implementation -- this file
+/// `rusty_oauth`'s own (independently unit-tested) implementation -- this file
 /// tests the HTTP surface built on top of it, not PKCE math itself.
 fn pkce_pair() -> (String, String) {
     let verifier = remind_me_core::remote::generate_token();
-    let challenge = remind_me_remote::oauth::pkce::code_challenge_s256(&verifier);
+    let challenge = rusty_oauth::pkce::Pkce::from_verifier(
+        verifier.clone(),
+        rusty_oauth::pkce::CodeChallengeMethod::S256,
+    )
+    .expect("a valid verifier")
+    .code_challenge;
     (verifier, challenge)
 }
 
