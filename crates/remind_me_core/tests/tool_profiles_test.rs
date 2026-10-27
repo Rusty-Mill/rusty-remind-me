@@ -160,3 +160,16 @@ fn maintenance_prompts_follow_the_pipeline_group() {
     }
     assert!(prompt_allowed("core", "recall_context"));
 }
+
+#[test]
+fn no_other_public_tool_name_reads_like_search() {
+    // Clients that find tools by name ranked a `remind_me_saved_search`
+    // above `remind_me_search` for an exact-name query (#52).
+    let clashes: Vec<&str> = GROUPS
+        .iter()
+        .flat_map(|(_, tools)| tools.iter().copied())
+        .filter(|name| *name != "remind_me_search" && name.contains("_search"))
+        .filter(|name| !name.ends_with("_searches"))
+        .collect();
+    assert!(clashes.is_empty(), "{clashes:?}");
+}

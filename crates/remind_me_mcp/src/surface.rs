@@ -41,7 +41,7 @@ pub fn route(tool: &str, mut args: Value) -> Result<Route, String> {
         } else {
             "remind_me_list_reminders"
         }),
-        "remind_me_saved_search" => pick(&args, "action", None, SAVED_SEARCH),
+        "remind_me_saved_searches" => pick(&args, "action", None, SAVED_SEARCH),
         "remind_me_sync_status" => pick(&args, "reconcile", Some("none"), SYNC),
         other => {
             note_alias(other);
@@ -379,9 +379,9 @@ fn definition(name: &str, catalog: &[Value]) -> Option<Value> {
     };
     match name {
         "remind_me_search" => merged(
-            "Search remind-me memories by keyword and meaning; call this first to recall anything \
-             about the user, their projects or past decisions. Hits are compact by default (id, \
-             snippet, score); fetch whole memories with remind_me_get `memory_ids`, or pass \
+            "Search or list remind-me memories by keyword and meaning; call this first to recall \
+             anything about the user, their projects or past decisions. Hits are compact by \
+             default (id, snippet, score); fetch whole memories with remind_me_get `memory_ids`, or pass \
              `detail=full`. `since`/`until` narrow to a time window, and with a blank `query` \
              list that window newest first. Without `query` or a window it lists memories \
              newest first, filtered by category, tags, source, project, branch, session or \
@@ -482,7 +482,7 @@ fn definition(name: &str, catalog: &[Value]) -> Option<Value> {
             &[],
             json!({ "ics_url": { "type": "boolean", "default": false, "description": "Return the subscribable ICS feed URL. It embeds a secret token." } }),
         ),
-        "remind_me_saved_search" => merged(
+        "remind_me_saved_searches" => merged(
             "remind-me extras: keep a saved query by name. `action=save` stores one, `list` shows \
              them, `run` re-runs one and `delete` removes it.",
             &handlers(SAVED_SEARCH),
@@ -806,7 +806,7 @@ mod tests {
                 "remind_me_reminders_ics_url",
             ),
             (
-                "remind_me_saved_search",
+                "remind_me_saved_searches",
                 json!({"action": "run"}),
                 "remind_me_run_saved_search",
             ),
@@ -820,7 +820,7 @@ mod tests {
         for (tool, args, handler) in cases {
             assert_eq!(routed(tool, args.clone()).0, handler, "{tool} {args}");
         }
-        assert!(route("remind_me_saved_search", json!({})).is_err());
+        assert!(route("remind_me_saved_searches", json!({})).is_err());
     }
 
     #[test]

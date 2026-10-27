@@ -130,7 +130,7 @@ pick up a new stdio server until it restarts.
 | `wiki` | wiki_read, wiki_write, wiki_delete, wiki_compile |
 | `import` | import, undo_import, capture_transcript |
 | `admin` | backup, reindex, archive_prune, export_memories, revoke_clients, api_key, sync_status, sync_repair, self_update |
-| `extras` | reminders, saved_search, session_timeline |
+| `extras` | reminders, saved_searches, session_timeline |
 
 Set a comma list such as `REMIND_ME_TOOL_PROFILE=core,wiki`. `full` (the
 default for now) is every group and `standard` is `core,pipeline,wiki`. Small

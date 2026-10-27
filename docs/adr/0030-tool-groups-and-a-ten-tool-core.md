@@ -53,7 +53,7 @@ instructions and the clients' standing instructions, not from usage data.
      `wiki_search`, `wiki_load`, `wiki_list`).
    - `import(from, path)`: file, directory, dbs, mempalace, wiki (was five
      import tools).
-   - `reminders`, `saved_search(action)`, `sync_status(reconcile)`.
+   - `reminders`, `saved_searches(action)`, `sync_status(reconcile)`.
 
    A merged schema is the union of its handlers' properties; a property
    whose handlers disagree on a default advertises none. 78 tools become 46;

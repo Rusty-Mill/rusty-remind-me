@@ -104,7 +104,7 @@ pub const ADMIN: [&str; 9] = [
 
 pub const EXTRAS: [&str; 3] = [
     "remind_me_reminders",
-    "remind_me_saved_search",
+    "remind_me_saved_searches",
     "remind_me_session_timeline",
 ];
 
@@ -152,10 +152,10 @@ pub const ALIASES: [(&str, &str); 36] = [
     ("remind_me_sync_reconcile_peer", "remind_me_sync_status"),
     ("remind_me_list_reminders", "remind_me_reminders"),
     ("remind_me_reminders_ics_url", "remind_me_reminders"),
-    ("remind_me_save_search", "remind_me_saved_search"),
-    ("remind_me_list_saved_searches", "remind_me_saved_search"),
-    ("remind_me_run_saved_search", "remind_me_saved_search"),
-    ("remind_me_delete_saved_search", "remind_me_saved_search"),
+    ("remind_me_save_search", "remind_me_saved_searches"),
+    ("remind_me_list_saved_searches", "remind_me_saved_searches"),
+    ("remind_me_run_saved_search", "remind_me_saved_searches"),
+    ("remind_me_delete_saved_search", "remind_me_saved_searches"),
 ];
 
 /// Prompts driving [`PIPELINE`], hidden unless that group is on.
