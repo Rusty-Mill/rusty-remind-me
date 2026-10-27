@@ -330,6 +330,7 @@ fn a_decomposed_fact_keeps_its_kind_metadata() {
         &store,
         &DecomposeInput {
             capture_id: cap.capture_id.clone(),
+            capture_revision: None,
             facts: vec![AtomicFact {
                 content: "use the engine".into(),
                 memory_type: Some("decision".into()),

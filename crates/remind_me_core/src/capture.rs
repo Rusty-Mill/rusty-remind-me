@@ -302,14 +302,27 @@ pub fn get_capture(store: &Store<'_>, capture_id: &str) -> Result<Option<Capture
 ///
 /// Returns `None` when no memory carries `capture_id`.
 pub fn decompose(store: &Store<'_>, input: &DecomposeInput) -> Result<Option<DecomposeResult>> {
-    let parent_tags = Curation::new(store).capture_tags(&input.capture_id)?;
-    let Some(parent_tags) = parent_tags else {
+    let rows = Curation::new(store).capture_rows(&input.capture_id)?;
+    let Some(parent) = rows.iter().min_by(|a, b| a.id.cmp(&b.id)) else {
         return Ok(None);
     };
+    let parent_tags = parent.tags.clone();
     // Before any fact is written, so a refused batch leaves nothing behind.
     for fact in &input.facts {
         crate::project::refuse_reserved_predicate(fact.predicate.as_deref())?;
     }
+    let revision = input
+        .capture_revision
+        .as_deref()
+        .map(observed_revision)
+        .transpose()?;
+    // ADR-0029: a fact is stamped with the session it was drawn from, not
+    // with wherever the decomposing routine runs. Who wrote it stays the
+    // decomposer.
+    let provenance = crate::context::Provenance {
+        context: session_context(parent),
+        ..crate::context::default_provenance()
+    };
 
     let now = Utc::now();
     let now_iso = now.to_rfc3339();
@@ -344,8 +357,6 @@ pub fn decompose(store: &Store<'_>, input: &DecomposeInput) -> Result<Option<Dec
         let decay_rate = get_decay_rate(memory_type);
         let base_weight = get_type_prior(memory_type);
 
-        let provenance = crate::context::default_provenance();
-
         // #260: a no-op unless REMIND_ME_CODE_ROOTS is configured. Merged
         // into the metadata object already built for `source_capture_id`
         // rather than a separate write, so one INSERT still carries both.
@@ -355,6 +366,9 @@ pub fn decompose(store: &Store<'_>, input: &DecomposeInput) -> Result<Option<Dec
             .filter(serde_json::Value::is_object)
             .unwrap_or_else(|| serde_json::json!({}));
         metadata["source_capture_id"] = serde_json::json!(input.capture_id);
+        if let Some(revision) = &revision {
+            metadata["capture_revision"] = serde_json::json!(revision);
+        }
         let code_refs = crate::code_refs::detect_code_refs(&fact.content);
         crate::code_refs::merge_code_refs(&mut metadata, &code_refs);
 
@@ -423,6 +437,32 @@ pub fn decompose(store: &Store<'_>, input: &DecomposeInput) -> Result<Option<Dec
     }))
 }
 
+/// `raw` as a UTC RFC 3339 instant, comparable with stored timestamps, and
+/// no later than now: a revision from the future would hide every later
+/// recapture.
+fn observed_revision(raw: &str) -> Result<String> {
+    let at = chrono::DateTime::parse_from_rfc3339(raw.trim())
+        .map_err(|_| {
+            crate::db::StoreError::Invalid(format!(
+                "capture_revision '{raw}' is not an RFC 3339 time"
+            ))
+        })?
+        .with_timezone(&Utc);
+    Ok(at.min(Utc::now()).to_rfc3339())
+}
+
+/// The session columns of a capture, which its facts inherit.
+fn session_context(capture: &Memory) -> WriteContext {
+    WriteContext {
+        project: capture.project.clone(),
+        session_id: capture.session_id.clone(),
+        git_remote: capture.git_remote.clone(),
+        git_branch: capture.git_branch.clone(),
+        git_sha: capture.git_sha.clone(),
+        cwd: capture.cwd.clone(),
+    }
+}
+
 /// Captures that have not been decomposed yet, newest first.
 ///
 /// A row qualifies when it **is** a capture (`capture_id` set), is **not itself
@@ -452,6 +492,7 @@ pub fn undecomposed_batch(
             content_snippet: row.content.chars().take(500).collect(),
             category: row.category,
             tags: row.tags,
+            capture_revision: row.revision,
         })
         .collect();
 

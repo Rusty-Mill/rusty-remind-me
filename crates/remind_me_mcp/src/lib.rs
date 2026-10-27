@@ -325,6 +325,7 @@ fn decompose_input_schema() -> Value {
         "type": "object",
         "properties": {
             "capture_id": { "type": "string", "minLength": 1 },
+            "capture_revision": { "type": "string", "description": "The capture_revision the decompose queue listed: the capture leaves the queue only up to it, so a session recaptured meanwhile is offered again" },
             "facts": {
                 "type": "array",
                 "minItems": DECOMPOSE_FACTS_MIN,
@@ -974,7 +975,7 @@ impl McpServer {
                                     "type": "object",
                                     "properties": {
                                         "batch_size": { "type": "integer", "default": 20, "minimum": DECOMPOSE_BATCH_MIN, "maximum": DECOMPOSE_BATCH_MAX },
-                                        "idle_minutes": { "type": "integer", "default": 0, "minimum": 0, "description": "Only captures unchanged for at least this many minutes, so a scheduled pass leaves a live session until it settles" }
+                                        "idle_minutes": { "type": "integer", "default": 0, "minimum": 0, "maximum": u32::MAX, "description": "Only captures unchanged for at least this many minutes, so a scheduled pass leaves a live session until it settles" }
                                     }
                                 }
                             },
@@ -2317,7 +2318,7 @@ impl McpServer {
                                             json!({ "isError": true, "content": [{ "type": "text", "text": format!("No memory found with capture_id {:?}.", decompose_input.capture_id) }] })
                                         }
                                         Err(e) => {
-                                            json!({ "isError": true, "content": [{ "type": "text", "text": format!("Decompose error: {}", e) }] })
+                                            json!({ "isError": true, "content": [{ "type": "text", "text": store_error_text("Decompose error", &e) }] })
                                         }
                                     }
                                 }
@@ -2328,18 +2329,21 @@ impl McpServer {
                         }
                     }
                     "remind_me_decompose_batch" => {
-                        let input: DecomposeBatchInput =
-                            serde_json::from_value(args).unwrap_or(DecomposeBatchInput {
-                                batch_size: 20,
-                                idle_minutes: 0,
-                            });
-                        match capture::undecomposed_batch(&store, &input) {
-                            Ok(batch) => {
-                                json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&batch).unwrap() }] })
-                            }
+                        // Omitted fields take their defaults; a supplied one
+                        // that does not parse is refused, never replaced by a
+                        // default that would drop the settle guard.
+                        match serde_json::from_value::<DecomposeBatchInput>(args) {
                             Err(e) => {
-                                json!({ "isError": true, "content": [{ "type": "text", "text": format!("Decompose batch error: {}", e) }] })
+                                json!({ "isError": true, "content": [{ "type": "text", "text": format!("Invalid input: {e}") }] })
                             }
+                            Ok(input) => match capture::undecomposed_batch(&store, &input) {
+                                Ok(batch) => {
+                                    json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&batch).unwrap() }] })
+                                }
+                                Err(e) => {
+                                    json!({ "isError": true, "content": [{ "type": "text", "text": format!("Decompose batch error: {}", e) }] })
+                                }
+                            },
                         }
                     }
                     "remind_me_auto_capture" => {

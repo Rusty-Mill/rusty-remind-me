@@ -67,9 +67,13 @@ match almost any query, alongside the facts drawn from them.
 3. **Fact rung.** A scheduled routine decomposes captures not updated for two
    hours into `decision` (with `metadata.rationale`), `reference` (PR, merge,
    issue activity), `learning` (gotchas) and `preference` facts, each linked to
-   its capture and stamped with the session. A recapture flags the capture
-   for decomposition again; supersession by subject and predicate keeps a
-   re-run from duplicating.
+   its capture and carrying the capture's session provenance (project,
+   session, git and working directory). The queue hands out each capture's
+   `capture_revision`, the newest `updated_at` among its rows, and decompose
+   stores it on every fact, so a capture is done only up to the revision its
+   facts were drawn from: a recapture while facts are written, or after,
+   flags it for decomposition again. Supersession by subject and predicate
+   keeps a re-run from duplicating.
 4. **Summary rung.** The same routine promotes `fact_to_scenario` candidates
    with at least `MIN_SCENARIO_FACTS` (3) facts on one entity drawn from at
    least two sessions, listing every source. The persona rung is unchanged.

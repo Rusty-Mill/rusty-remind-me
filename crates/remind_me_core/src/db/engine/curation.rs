@@ -43,25 +43,51 @@ pub(crate) fn capture_tags(tables: &EngineTables, capture_id: &str) -> Result<Op
         .map(|row| tags(&row)))
 }
 
-/// When each capture was last decomposed: the newest `created_at` among the
-/// memories naming it as their `source_capture_id`.
+/// The revision of the capture a fact was drawn from: its
+/// `metadata.capture_revision`, else its own `created_at`.
+fn drawn_from(row: &MemoryRow) -> String {
+    serde_json::from_str::<serde_json::Value>(&row.metadata)
+        .ok()
+        .and_then(|m| m.get("capture_revision")?.as_str().map(str::to_string))
+        .unwrap_or_else(|| row.created_at.clone())
+}
+
+/// Up to which revision each capture has been decomposed: the newest
+/// [`drawn_from`] among the memories naming it as their `source_capture_id`.
 fn decomposed_at(core: &CoreTables) -> HashMap<String, String> {
     let mut newest: HashMap<String, String> = HashMap::new();
     for row in memories::rows(core) {
-        let Some(capture) = row.source_capture_id else {
+        let Some(capture) = row.source_capture_id.clone() else {
+            continue;
+        };
+        let at = drawn_from(&row);
+        let slot = newest.entry(capture).or_default();
+        if at > *slot {
+            *slot = at;
+        }
+    }
+    newest
+}
+
+/// The newest `updated_at` among each capture's own rows.
+fn capture_revisions(core: &CoreTables) -> HashMap<String, String> {
+    let mut newest: HashMap<String, String> = HashMap::new();
+    for row in memories::rows(core) {
+        let (Some(capture), None) = (row.capture_id, row.source_capture_id) else {
             continue;
         };
         let slot = newest.entry(capture).or_default();
-        if row.created_at > *slot {
-            *slot = row.created_at;
+        if row.updated_at > *slot {
+            *slot = row.updated_at;
         }
     }
     newest
 }
 
 /// Whether capture row `row` still needs decomposing: no fact names its
-/// capture, or the capture changed after its newest fact was written (a
-/// session recaptured after decomposition, ADR-0029).
+/// capture, or the row changed after the revision its newest facts were
+/// drawn from (a session recaptured after, or during, decomposition;
+/// ADR-0029).
 pub(crate) fn needs_decomposing(row: &MemoryRow, decomposed: &HashMap<String, String>) -> bool {
     row.capture_id
         .as_ref()
@@ -91,11 +117,18 @@ pub(crate) fn undecomposed(
     limit: usize,
     settled_before: Option<&str>,
 ) -> Result<Vec<CaptureRow>> {
-    Ok(undecomposed_rows(core_ref(tables)?, settled_before)
+    let core = core_ref(tables)?;
+    let revisions = capture_revisions(core);
+    Ok(undecomposed_rows(core, settled_before)
         .into_iter()
         .take(limit)
         .map(|row| CaptureRow {
             tags: tags(&row),
+            revision: row
+                .capture_id
+                .as_ref()
+                .and_then(|c| revisions.get(c).cloned())
+                .unwrap_or_else(|| row.updated_at.clone()),
             capture_id: row.capture_id.unwrap_or_default(),
             id: row.id,
             content: row.content,

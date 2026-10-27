@@ -21,6 +21,8 @@ pub struct CaptureRow {
     pub content: String,
     pub category: String,
     pub tags: Vec<String>,
+    /// The newest `updated_at` among the capture's rows.
+    pub revision: String,
 }
 
 /// A raw import that nothing has been normalized from yet.

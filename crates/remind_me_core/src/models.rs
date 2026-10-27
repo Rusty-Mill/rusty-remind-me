@@ -1089,6 +1089,12 @@ pub struct AtomicFact {
 pub struct DecomposeInput {
     pub capture_id: String,
     pub facts: Vec<AtomicFact>,
+    /// The `capture_revision` the facts were drawn from, as the decompose
+    /// queue reported it (RFC 3339). The capture leaves the queue only up to
+    /// that revision, so a recapture landing while the facts are written is
+    /// still due (ADR-0029). Without it, the facts' write time is used.
+    #[serde(default)]
+    pub capture_revision: Option<String>,
 }
 
 /// Inclusive bounds the reference enforces on a decomposition.
@@ -1240,6 +1246,9 @@ pub struct UndecomposedCapture {
     pub content_snippet: String,
     pub category: String,
     pub tags: Vec<String>,
+    /// When any row of this capture last changed (RFC 3339): pass it back as
+    /// [`DecomposeInput::capture_revision`].
+    pub capture_revision: String,
 }
 
 /// A page of captures awaiting decomposition.

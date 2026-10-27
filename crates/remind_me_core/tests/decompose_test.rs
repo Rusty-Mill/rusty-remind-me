@@ -56,6 +56,7 @@ fn run(store: &Store<'_>, capture_id: &str, facts: Vec<AtomicFact>) -> Decompose
         &DecomposeInput {
             capture_id: capture_id.to_string(),
             facts,
+            capture_revision: None,
         },
     )
     .unwrap()
@@ -171,6 +172,7 @@ fn an_unknown_capture_id_reports_not_found() {
         &DecomposeInput {
             capture_id: "cap_nope".into(),
             facts: vec![fact("orphan")],
+            capture_revision: None,
         },
     )
     .unwrap();
@@ -651,4 +653,136 @@ fn idle_minutes_leaves_a_recently_changed_capture_for_later() {
         testing::set_memory_column(&store, id, "updated_at", long_ago.as_str()).unwrap();
     }
     assert_eq!(settled(&store), 2);
+}
+
+/// One recapturable session, `s1`, run from `/work/quokka` on `main`.
+mod interleaving {
+    use super::*;
+    use remind_me_core::models::{Rung, WriteContext};
+    use remind_me_core::promotion::{backlog, promotion_candidates};
+    use remind_me_core::transcript::{capture_transcript, TranscriptRequest};
+
+    fn line(text: &str) -> String {
+        serde_json::json!({"type": "user", "sessionId": "s1",
+                           "message": {"role": "user", "content": text}})
+        .to_string()
+    }
+
+    fn context() -> WriteContext {
+        WriteContext {
+            project: Some("quokka".into()),
+            session_id: Some("s1".into()),
+            git_branch: Some("main".into()),
+            cwd: Some("/work/quokka".into()),
+            ..WriteContext::default()
+        }
+    }
+
+    fn recapture(store: &Store<'_>, transcript: &str) -> String {
+        let given = context();
+        let request = TranscriptRequest {
+            session_id: "s1",
+            cwd: None,
+            reason: Some("stop"),
+            context: Some(&given),
+        };
+        capture_transcript(store, transcript, &request)
+            .unwrap()
+            .capture_id
+    }
+
+    /// What the queue offers: its entries' revisions, and whether the
+    /// candidates and the backlog agree that something is due.
+    fn offered(store: &Store<'_>) -> (Vec<String>, bool, bool) {
+        let batch = undecomposed_batch(
+            store,
+            &DecomposeBatchInput {
+                batch_size: 10,
+                idle_minutes: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(batch.total_undecomposed, batch.memories.len());
+        let candidates = !promotion_candidates(store, Rung::CaptureToFact, 10)
+            .unwrap()
+            .is_empty();
+        let backlog = backlog(store).unwrap().capture_to_fact > 0;
+        let revisions = batch
+            .memories
+            .into_iter()
+            .map(|m| m.capture_revision)
+            .collect();
+        (revisions, candidates, backlog)
+    }
+
+    fn decompose_at(store: &Store<'_>, capture_id: &str, revision: &str, text: &str) {
+        decompose(
+            store,
+            &DecomposeInput {
+                capture_id: capture_id.to_string(),
+                facts: vec![fact(text)],
+                capture_revision: Some(revision.to_string()),
+            },
+        )
+        .unwrap()
+        .unwrap();
+    }
+
+    #[test]
+    fn a_recapture_while_facts_are_written_stays_due() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        let capture = recapture(&store, &line("first"));
+        let (seen, ..) = offered(&store);
+        assert_eq!(seen.len(), 2, "dialog and summary");
+        assert_eq!(seen[0], seen[1], "one revision for the whole capture");
+
+        // The routine read revision A; the hook recaptures B before the
+        // routine writes A's facts.
+        recapture(&store, &format!("{}\n{}", line("first"), line("second")));
+        decompose_at(&store, &capture, &seen[0], "the first thing");
+
+        let (again, candidates, backlog) = offered(&store);
+        assert_eq!(again.len(), 2, "B was never read, so it is still due");
+        assert!(again[0] > seen[0]);
+        assert!(candidates && backlog, "every queue agrees");
+
+        decompose_at(&store, &capture, &again[0], "the second thing");
+        assert_eq!(offered(&store), (vec![], false, false));
+    }
+
+    #[test]
+    fn a_revision_must_be_a_time_and_is_never_later_than_now() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        let capture = recapture(&store, &line("first"));
+        let err = decompose(
+            &store,
+            &DecomposeInput {
+                capture_id: capture.clone(),
+                facts: vec![fact("x")],
+                capture_revision: Some("yesterday".into()),
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("RFC 3339"), "{err}");
+        assert_eq!(offered(&store).0.len(), 2, "a refused batch writes nothing");
+
+        decompose_at(&store, &capture, "2999-01-01T00:00:00Z", "from the future");
+        recapture(&store, &format!("{}\n{}", line("first"), line("later")));
+        assert_eq!(offered(&store).0.len(), 2, "a later recapture is still due");
+    }
+
+    #[test]
+    fn facts_carry_the_session_they_were_drawn_from() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        let capture = recapture(&store, &line("first"));
+        let made = run(&store, &capture, vec![fact("the first thing")]);
+        let id = &made.fact_ids[0];
+        assert_eq!(column(&store, id, "session_id"), "s1");
+        assert_eq!(column(&store, id, "project"), "quokka");
+        assert_eq!(column(&store, id, "git_branch"), "main");
+        assert_eq!(column(&store, id, "cwd"), "/work/quokka");
+    }
 }

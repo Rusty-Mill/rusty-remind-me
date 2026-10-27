@@ -7,7 +7,7 @@ A scheduled Claude routine runs this once a day. It needs the remind-me connecto
 
 You are refining captured Claude Code sessions in remind-me. Use only the remind-me tools.
 
-1. Call `remind_me_queue` with `kind: "decompose", batch_size: 20, idle_minutes: 120`. Each entry is one
+1. Call `remind_me_queue` with `kind: "decompose", limit: 20, idle_minutes: 120`. Each entry is one
    half of a capture: the `dialog` half holds the session, so work from that half and skip the
    summary half of the same `capture_id`.
 2. For each dialog, read the whole capture with `remind_me_get` and its `capture_id`. For a long one, use
@@ -23,7 +23,9 @@ You are refining captured Claude Code sessions in remind-me. Use only the remind
    names in `entities`, because summaries group facts by entity. Skip chit-chat, status updates and
    anything the dialog only guesses at. If a session has nothing worth keeping, record one
    fact saying so (`learning`, "Session <id>: nothing durable"), so it leaves the backlog.
-3. Call `remind_me_decompose` with that `capture_id` and the facts. A session captured again
+3. Call `remind_me_decompose` with that `capture_id`, the entry's `capture_revision` and the
+   facts. The revision records which version of the session the facts were drawn from, so a
+   session that grew while you read it stays due. A session captured again
    after an earlier pass comes back here. Only add what is new, because restating an old fact
    adds noise.
 4. Call `remind_me_queue` with `kind: "promotion", rung: "fact_to_scenario"`. For each candidate,
