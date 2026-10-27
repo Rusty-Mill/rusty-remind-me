@@ -5472,21 +5472,21 @@ mod tests {
         store
             .put_client(
                 "client-1",
-                json!({ "client_name": "claude.ai", "redirect_uris": ["https://claude.ai/cb"] }),
+                rusty_json::json!({ "client_name": "claude.ai", "redirect_uris": ["https://claude.ai/cb"] }),
             )
             .expect("write");
         store
             .put_token(
                 remind_me_core::remote::TokenKind::Access,
                 "access-tok",
-                json!({ "client_id": "client-1" }),
+                rusty_json::json!({ "client_id": "client-1" }),
             )
             .expect("write");
         store
             .put_token(
                 remind_me_core::remote::TokenKind::Refresh,
                 "refresh-tok",
-                json!({ "client_id": "client-1" }),
+                rusty_json::json!({ "client_id": "client-1" }),
             )
             .expect("write");
 

@@ -10,10 +10,9 @@ repository = "https://github.com/Rusty-Mill/rusty_mill"
 layer = "apps"
 
 [dependencies]
-rusty_percent = { workspace = true }
-rusty_hex = { workspace = true }
-rusty_base64 = { workspace = true }
 rusty_oauth = { workspace = true }
+rusty_oauth_server = { workspace = true }
+rusty_crypto_key = { workspace = true }
 remind_me_core.workspace = true
 remind_me_mcp.workspace = true
 rusty_axum = { workspace = true }
@@ -23,7 +22,6 @@ thiserror = "2"
 
 serde = { workspace = true }
 serde_json = "1.0"
-sha256 = "1.5"
 
 [dev-dependencies]
 # The tests' HTTP client (reqwest) runs on tokio; the server under test runs
