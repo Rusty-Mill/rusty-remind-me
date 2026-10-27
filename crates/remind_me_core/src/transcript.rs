@@ -202,6 +202,17 @@ fn with_keys(base: &serde_json::Value, pairs: &[(&str, serde_json::Value)]) -> s
     serde_json::Value::Object(meta)
 }
 
+/// Serializes every transcript capture in this process.
+///
+/// The hook, the MCP tool and the folder watcher all reach
+/// [`capture_transcript`], and the watcher does so from its own thread
+/// without the store's lock. Choosing between a first capture and a refresh,
+/// writing the dialog and summary pair, and archiving the transcript are
+/// separate store calls; interleaved, two first captures make two pairs and
+/// a stale refresh lands over a newer one. Holding this across all of it
+/// makes each capture one step.
+static CAPTURE_LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(());
+
 /// Write or refresh the session's capture from `raw` transcript text.
 ///
 /// Errors with `Invalid` for an empty session id or a transcript with no
@@ -211,6 +222,79 @@ pub fn capture_transcript(
     raw: &str,
     request: &TranscriptRequest<'_>,
 ) -> Result<TranscriptOutcome> {
+    let (session_id, parsed) = checked(raw, request)?;
+    let _serial = CAPTURE_LOCK.lock();
+    let existing = existing_dialog(store, session_id)?;
+    write_capture(store, session_id, raw, &parsed, existing, request)
+}
+
+/// When [`capture_unless_held`] may replace a session's existing capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Replace {
+    /// Never: a backfill fills in sessions nothing captured.
+    Never,
+    /// Only with a transcript holding more messages: the folder watcher,
+    /// which must not put an older reading over a newer capture.
+    IfLonger,
+}
+
+/// What [`capture_unless_held`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Conditional {
+    /// The session had no capture; one was written.
+    First(TranscriptOutcome),
+    /// The transcript held more messages than the capture; it was refreshed.
+    Refreshed(TranscriptOutcome),
+    /// The session's capture, holding this many messages, was left alone.
+    Held(usize),
+}
+
+/// [`capture_transcript`], unless the session already has a capture that
+/// `replace` says to keep: what a writer other than the hook runs. The
+/// lookup, the comparison and the write happen under the same lock as every
+/// other capture, so the decision cannot go stale before the write.
+pub fn capture_unless_held(
+    store: &Store<'_>,
+    raw: &str,
+    request: &TranscriptRequest<'_>,
+    replace: Replace,
+) -> Result<Conditional> {
+    capture_unless_held_pausing(store, raw, request, replace, &|| {})
+}
+
+/// [`capture_unless_held`], calling `after_lookup` between reading the
+/// existing capture and writing: the point where a second writer would
+/// otherwise slip in. For tests that put one there.
+#[doc(hidden)]
+pub fn capture_unless_held_pausing(
+    store: &Store<'_>,
+    raw: &str,
+    request: &TranscriptRequest<'_>,
+    replace: Replace,
+    after_lookup: &dyn Fn(),
+) -> Result<Conditional> {
+    let (session_id, parsed) = checked(raw, request)?;
+    let _serial = CAPTURE_LOCK.lock();
+    let existing = existing_dialog(store, session_id)?;
+    after_lookup();
+    let held = existing.as_ref().map(held_messages);
+    let keep = |held: usize| match replace {
+        Replace::Never => true,
+        Replace::IfLonger => held >= parsed.messages,
+    };
+    if let Some(held) = held.filter(|held| keep(*held)) {
+        return Ok(Conditional::Held(held));
+    }
+    let outcome = write_capture(store, session_id, raw, &parsed, existing, request)?;
+    Ok(match held {
+        Some(_) => Conditional::Refreshed(outcome),
+        None => Conditional::First(outcome),
+    })
+}
+
+/// The trimmed session id and the parsed transcript, or why there is
+/// nothing to capture.
+fn checked<'r>(raw: &str, request: &TranscriptRequest<'r>) -> Result<(&'r str, TranscriptSummary)> {
     let session_id = request.session_id.trim();
     if session_id.is_empty() {
         return Err(StoreError::Invalid("session id must not be empty".into()));
@@ -219,9 +303,31 @@ pub fn capture_transcript(
     if parsed.messages == 0 {
         return Err(StoreError::Invalid("transcript has no messages".into()));
     }
-    let outcome = match existing_dialog(store, session_id)? {
-        Some(existing) => recapture(store, &existing, &parsed, request.reason)?,
-        None => first_capture(store, session_id, &parsed, request)?,
+    Ok((session_id, parsed))
+}
+
+/// How many messages a captured dialog holds; `0` for one written before
+/// the count was recorded.
+fn held_messages(dialog: &crate::models::Memory) -> usize {
+    dialog
+        .metadata
+        .get("messages")
+        .and_then(serde_json::Value::as_u64)
+        .map_or(0, |n| n as usize)
+}
+
+/// The capture itself, with [`CAPTURE_LOCK`] held by the caller.
+fn write_capture(
+    store: &Store<'_>,
+    session_id: &str,
+    raw: &str,
+    parsed: &TranscriptSummary,
+    existing: Option<crate::models::Memory>,
+    request: &TranscriptRequest<'_>,
+) -> Result<TranscriptOutcome> {
+    let outcome = match existing {
+        Some(existing) => recapture(store, &existing, parsed, request.reason)?,
+        None => first_capture(store, session_id, parsed, request)?,
     };
     // The raw transcript decorates the capture; failing to keep it must not
     // fail the capture, so it is reported and the capture stands. It is
@@ -305,6 +411,14 @@ fn first_capture(
 /// Whether `session_id` already has a capture.
 pub fn is_captured(store: &Store<'_>, session_id: &str) -> Result<bool> {
     Ok(existing_dialog(store, session_id)?.is_some())
+}
+
+/// How many messages `session_id`'s capture holds, or `None` when it has
+/// none.
+pub fn captured_messages(store: &Store<'_>, session_id: &str) -> Result<Option<usize>> {
+    Ok(existing_dialog(store, session_id)?
+        .as_ref()
+        .map(held_messages))
 }
 
 /// The dialog half already captured for `session_id`, if any.

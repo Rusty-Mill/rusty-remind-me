@@ -210,6 +210,8 @@ fn a_watcher_that_is_configured_but_not_looping_reports_running_false() {
         rejected_dirs: vec![],
         interval_seconds: 60,
         grace_seconds: 5,
+        idle_seconds: 0,
+        ingest: watcher::Ingest::Files,
         scans: 0,
         last_scan_at: None,
         files_ingested: 0,

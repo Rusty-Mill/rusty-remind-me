@@ -10,9 +10,9 @@
 use crate::context_brief::{self, Brief, ContextRequest, Mode, Outcome};
 use crate::db::{Result, Store, StoreError};
 use crate::episodes;
-use crate::transcript::{self, TranscriptRequest};
+use crate::transcript::{self, Conditional, Replace, TranscriptRequest};
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn absolute(path: &Path, what: &str) -> Result<()> {
     if path.is_absolute() {
@@ -91,13 +91,18 @@ pub fn capture_transcript(
 /// session id (else the file stem) the transcript carries and stamped only
 /// with where the transcript says it ran ([`transcript_context`]). A session
 /// already captured, by the hook or an earlier run, is left as it is, so a
-/// re-run imports nothing twice. A file that cannot be read or stored is
-/// reported in `failed` and the walk goes on.
+/// re-run imports nothing twice. A project folder or file that cannot be
+/// read or stored is reported in `failed` and the walk goes on.
 pub fn import_sessions(store: &Store<'_>, dir: &Path) -> Result<Value> {
     absolute(dir, "sessions directory")?;
     let (mut imported, mut skipped, mut empty) = (0, 0, 0);
-    let mut failed = Vec::new();
-    for path in session_files(dir)? {
+    let found = session_files(dir)?;
+    let mut failed: Vec<Value> = found
+        .failed
+        .iter()
+        .map(|(path, error)| json!({"path": path.display().to_string(), "error": error}))
+        .collect();
+    for path in found.files {
         match backfill(store, &path) {
             Ok(Backfill::Imported) => imported += 1,
             Ok(Backfill::Skipped) => skipped += 1,
@@ -117,11 +122,75 @@ enum Backfill {
 }
 
 fn backfill(store: &Store<'_>, path: &Path) -> Result<Backfill> {
+    let Some(session) = read_session(path)? else {
+        return Ok(Backfill::Empty);
+    };
+    Ok(match session.capture(store, "backfill", Replace::Never)? {
+        Conditional::Held(_) => Backfill::Skipped,
+        Conditional::First(_) | Conditional::Refreshed(_) => Backfill::Imported,
+    })
+}
+
+/// What [`sync_session`] did with one transcript file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionSync {
+    /// The session had no capture; one was written.
+    Captured,
+    /// The file holds more messages than the capture; it was refreshed.
+    Refreshed,
+    /// The capture already holds at least this many messages, which is the
+    /// usual case once the hook has run.
+    Unchanged,
+    /// The transcript has no messages.
+    Empty,
+}
+
+/// Capture, or refresh, the session in the Claude Code transcript at
+/// `path`: what the folder watcher runs for a settled session file.
+///
+/// Converges on the hook's capture rather than beside it: both are keyed by
+/// the session id, so a session the hook already saved at this length is
+/// left alone, and one that grew past it is refreshed in place. A first
+/// capture is stamped only with where the transcript says it ran, as a
+/// backfill is.
+pub fn sync_session(store: &Store<'_>, path: &Path) -> Result<SessionSync> {
+    let Some(session) = read_session(path)? else {
+        return Ok(SessionSync::Empty);
+    };
+    Ok(match session.capture(store, "watch", Replace::IfLonger)? {
+        Conditional::First(_) => SessionSync::Captured,
+        Conditional::Refreshed(_) => SessionSync::Refreshed,
+        Conditional::Held(_) => SessionSync::Unchanged,
+    })
+}
+
+/// A transcript file read and parsed, with the session id it is keyed by.
+struct SessionFile {
+    id: String,
+    raw: String,
+    parsed: transcript::TranscriptSummary,
+}
+
+impl SessionFile {
+    fn capture(&self, store: &Store<'_>, reason: &str, replace: Replace) -> Result<Conditional> {
+        let context = transcript_context(&self.parsed);
+        let request = TranscriptRequest {
+            session_id: &self.id,
+            cwd: None,
+            reason: Some(reason),
+            context: Some(&context),
+        };
+        transcript::capture_unless_held(store, &self.raw, &request, replace)
+    }
+}
+
+/// The session at `path`, or `None` when its transcript has no messages.
+fn read_session(path: &Path) -> Result<Option<SessionFile>> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| StoreError::Invalid(format!("cannot read {}: {e}", path.display())))?;
     let parsed = transcript::parse(&raw);
     if parsed.messages == 0 {
-        return Ok(Backfill::Empty);
+        return Ok(None);
     }
     let stem = path
         .file_stem()
@@ -129,24 +198,13 @@ fn backfill(store: &Store<'_>, path: &Path) -> Result<Backfill> {
         .unwrap_or_default();
     // Trimmed once, here, as the capture trims it: the lookup and the
     // capture must agree on the key, or a padded id overwrites the hook's.
-    let session_id = parsed
+    let id = parsed
         .session_id
         .as_deref()
         .unwrap_or(stem)
         .trim()
         .to_string();
-    if transcript::is_captured(store, &session_id)? {
-        return Ok(Backfill::Skipped);
-    }
-    let context = transcript_context(&parsed);
-    let request = TranscriptRequest {
-        session_id: &session_id,
-        cwd: None,
-        reason: Some("backfill"),
-        context: Some(&context),
-    };
-    transcript::capture_transcript(store, &raw, &request)?;
-    Ok(Backfill::Imported)
+    Ok(Some(SessionFile { id, raw, parsed }))
 }
 
 /// Where a transcript says its session ran, and nothing else: its cwd and
@@ -171,28 +229,47 @@ fn last_segment(path: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Session files found under a Claude Code `projects` folder, and the
+/// project folders that could not be listed.
+#[derive(Debug, Default)]
+pub(crate) struct Discovered {
+    pub files: Vec<PathBuf>,
+    pub failed: Vec<(PathBuf, String)>,
+}
+
 /// `dir/*/*.jsonl`, sorted: one folder per project, one file per session.
-/// Deeper files (a session's subagent transcripts) are not sessions.
-fn session_files(dir: &Path) -> Result<Vec<std::path::PathBuf>> {
-    let read = |d: &Path| {
-        std::fs::read_dir(d)
-            .map_err(|e| StoreError::Invalid(format!("cannot read {}: {e}", d.display())))
-    };
-    let mut files = Vec::new();
-    for project in read(dir)?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.is_dir())
-    {
-        files.extend(
-            read(&project)?
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "jsonl")),
-        );
+/// Deeper files (a session's subagent transcripts) are not sessions. An
+/// unreadable `dir` is an error; an unreadable project folder is reported in
+/// `failed` and the others are still listed.
+pub(crate) fn session_files(dir: &Path) -> Result<Discovered> {
+    session_files_in(dir, &list_dir)
+}
+
+fn list_dir(dir: &Path) -> Result<Vec<PathBuf>> {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| StoreError::Invalid(format!("cannot read {}: {e}", dir.display())))?;
+    Ok(entries.flatten().map(|e| e.path()).collect())
+}
+
+/// [`session_files`] over `list`, so a test can make one folder fail.
+fn session_files_in(
+    dir: &Path,
+    list: &dyn Fn(&Path) -> Result<Vec<PathBuf>>,
+) -> Result<Discovered> {
+    let mut found = Discovered::default();
+    for project in list(dir)?.into_iter().filter(|p| p.is_dir()) {
+        match list(&project) {
+            Ok(entries) => found.files.extend(
+                entries
+                    .into_iter()
+                    .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "jsonl")),
+            ),
+            Err(e) => found.failed.push((project, e.to_string())),
+        }
     }
-    files.sort();
-    Ok(files)
+    found.files.sort();
+    found.failed.sort();
+    Ok(found)
 }
 
 /// What the `context` subcommand was asked for.
@@ -344,6 +421,48 @@ pub fn timeline_text(
 mod tests {
     use super::*;
     use crate::db::Database;
+
+    #[test]
+    fn one_unreadable_project_does_not_hide_the_others() {
+        let root =
+            std::env::temp_dir().join(format!("rrm_discover_{}", uuid::Uuid::new_v4().simple()));
+        for project in ["a-first", "m-middle", "z-last"] {
+            let dir = root.join(project);
+            std::fs::create_dir_all(dir.join("s").join("subagents")).unwrap();
+            std::fs::write(dir.join("s.jsonl"), "{}").unwrap();
+            std::fs::write(dir.join("s").join("subagents").join("a.jsonl"), "{}").unwrap();
+        }
+        std::fs::write(root.join("top.jsonl"), "{}").unwrap();
+
+        // The failing folder first in listing order, then last.
+        for broken in ["a-first", "z-last"] {
+            let failing = root.join(broken);
+            let list = |dir: &Path| {
+                if dir == failing {
+                    return Err(StoreError::Invalid(format!(
+                        "cannot read {}",
+                        dir.display()
+                    )));
+                }
+                list_dir(dir)
+            };
+            let found = session_files_in(&root, &list).unwrap();
+
+            let healthy: Vec<PathBuf> = ["a-first", "m-middle", "z-last"]
+                .into_iter()
+                .filter(|p| *p != broken)
+                .map(|p| root.join(p).join("s.jsonl"))
+                .collect();
+            assert_eq!(found.files, healthy, "broken {broken}");
+            assert_eq!(found.failed.len(), 1);
+            assert_eq!(found.failed[0].0, failing);
+        }
+
+        // An unreadable root is still an error.
+        let list = |_: &Path| Err(StoreError::Invalid("cannot read root".into()));
+        assert!(session_files_in(&root, &list).is_err());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn import_sessions_backfills_once_and_reports_every_file() {
