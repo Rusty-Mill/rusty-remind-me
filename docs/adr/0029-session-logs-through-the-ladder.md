@@ -52,10 +52,16 @@ match almost any query, alongside the facts drawn from them.
      archive's existing age and size limits.
 2. **Cloud transport.** A hook committed to the repo's `.claude/settings.json`
    on `Stop` and `PreCompact` posts the transcript to the remote server when
-   `CLAUDE_CODE_REMOTE=true` and `REMIND_ME_URL` and `REMIND_ME_TOKEN` are
-   set. It is throttled to once a minute, skipped when re-entrant, and always
-   exits 0. The environment allows the server's host and holds the token as a
-   secret.
+   `CLAUDE_CODE_REMOTE=true`, the opt-in `REMIND_ME_CLOUD_CAPTURE=1`,
+   `REMIND_ME_URL` and `REMIND_ME_TOKEN` are set. Server write-time redaction
+   does not stop a secret leaving the container, so the hook scrubs first:
+   thinking blocks are dropped and every string is redacted with the server's
+   secret shapes, bearer values and the token itself. It sends over https only,
+   follows no redirects, bounds what it reads, and shares one deadline inside
+   the hook timeout. Stop is throttled to once a minute after a successful
+   capture and skipped when re-entrant; it always exits 0 and logs only a
+   failure category. The environment allows the server's host and holds the
+   token as a secret.
 3. **Fact rung.** A scheduled routine decomposes captures not updated for two
    hours into `decision` (with `metadata.rationale`), `reference` (PR, merge,
    issue activity), `learning` (gotchas) and `preference` facts, each linked to
