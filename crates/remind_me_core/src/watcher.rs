@@ -428,7 +428,15 @@ impl Watcher {
             match self.ingest {
                 Ingest::Files => collect(root, root, &mut files),
                 Ingest::Sessions => match session_files(root) {
-                    Ok(found) => files.extend(found),
+                    Ok(found) => {
+                        files.extend(found.files);
+                        errors.extend(
+                            found
+                                .failed
+                                .into_iter()
+                                .map(|(dir, e)| format!("{}: {e}", dir.display())),
+                        );
+                    }
                     Err(e) => errors.push(e.to_string()),
                 },
             }
