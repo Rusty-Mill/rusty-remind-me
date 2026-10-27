@@ -346,7 +346,7 @@ pub fn input_schema() -> Value {
 }
 
 /// What the tool tells a model it is for.
-pub const DESCRIPTION: &str = "Projects as records, not names: what stage each project is at (idea, designed, built), whether it is active, dormant or abandoned, and where it lives (repository, path in the monorepo, rusty_tick list, parent project). Every claim cites the memories behind it, so 'is there actually a repo?' has an answer you can check. Start with action=list. Proposals are suggestions from captured session context that only a person confirms; nothing changes stage on its own.";
+pub const DESCRIPTION: &str = "remind-me pipeline: projects as records, not names: what stage each project is at (idea, designed, built), whether it is active, dormant or abandoned, and where it lives (repository, path in the monorepo, rusty_tick list, parent project). Every claim cites the memories behind it, so 'is there actually a repo?' has an answer you can check. Start with action=list. Proposals are suggestions from captured session context that only a person confirms; nothing changes stage on its own.";
 
 #[cfg(test)]
 mod tests {

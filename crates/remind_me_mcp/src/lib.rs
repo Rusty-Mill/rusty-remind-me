@@ -15,6 +15,7 @@ mod test_env;
 pub mod daemon_proxy;
 pub mod references;
 pub mod render;
+pub mod surface;
 
 /// What an MCP client is told about the server on `initialize`, over every
 /// transport: when to reach for which tool. Kept short; it is paid for in every session.
@@ -640,7 +641,7 @@ impl McpServer {
                         "tools": [
                             {
                                 "name": "remind_me_add",
-                                "description": "Store a new memory fact, preference, or note. Saving a decision checks it against the standing, non-sensitive decisions in the same project on the same claim or a shared entity and returns likely conflicts as contradiction_candidates; nothing is blocked or superseded automatically. Pass supersedes to retire the old decision in the same call.",
+                                "description": "Save a fact, decision, preference or note to remind-me memory; call this whenever the user states something durable. A decision needs metadata.rationale. Saving a decision checks it against the standing, non-sensitive decisions in the same project on the same claim or a shared entity and returns likely conflicts as contradiction_candidates; nothing is blocked or superseded automatically. Pass supersedes to retire the old decision in the same call.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -684,7 +685,7 @@ impl McpServer {
                                         "confidence": { "type": "number", "minimum": 0, "maximum": 1, "default": 1, "description": "How far to trust this memory; scales its search ranking." },
                                         "valid_from": { "type": "string", "description": "RFC 3339 time the memory starts to hold; omit for always." },
                                         "valid_until": { "type": "string", "description": "RFC 3339 time it stops holding; after it the memory ranks last and is marked expired." },
-                                        "outcome": { "type": "string", "enum": ["done", "abandoned", "reverted", "superseded"], "description": "Only for decision and action_item memories; prefer remind_me_resolve for an existing one." },
+                                        "outcome": { "type": "string", "enum": ["done", "abandoned", "reverted", "superseded", "carded"], "description": "Only for decision and action_item memories; prefer remind_me_resolve for an existing one." },
                                         "supersedes": { "type": "array", "items": { "type": "string" }, "description": "IDs of live memories this one replaces, e.g. a contradiction_candidates id. Each is marked superseded by the new memory, in one transaction with the add; an id that is missing, deleted, already superseded or a project claim refuses the whole add." }
                                     },
                                     "required": ["content"]
@@ -744,14 +745,14 @@ impl McpServer {
                                         "confidence": { "type": "number", "minimum": 0, "maximum": 1, "description": "How far to trust this memory; scales its search ranking." },
                                         "valid_from": { "type": "string", "description": "RFC 3339 time the memory starts to hold." },
                                         "valid_until": { "type": "string", "description": "RFC 3339 time it stops holding; after it the memory ranks last and is marked expired." },
-                                        "outcome": { "type": "string", "enum": ["done", "abandoned", "reverted", "superseded"], "description": "Only for decision and action_item memories." }
+                                        "outcome": { "type": "string", "enum": ["done", "abandoned", "reverted", "superseded", "carded"], "description": "Only for decision and action_item memories." }
                                     },
                                     "required": ["memory_id"]
                                 }
                             },
                             {
                                 "name": "remind_me_delete",
-                                "description": "Delete a memory by ID.",
+                                "description": "Delete one remind-me memory by id, when the user asks to forget it or it is wrong.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -815,7 +816,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_entity",
-                                "description": "Everything known about ONE named thing — a person, project, tool, org, or place. Read-only: returns the entity record, its facts, and the memories mentioning it, or found=false for an unknown name. Use remind_me_search for topic questions or anything you cannot name exactly.",
+                                "description": "Look up everything remind-me knows about ONE named thing: a person, project, tool, org or place. Read-only: returns the entity record, its facts, and the memories mentioning it, or found=false for an unknown name. Use remind_me_search for topic questions or anything you cannot name exactly.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -832,7 +833,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_entity_upsert",
-                                "description": "Create a knowledge-graph entity, or update its kind. Not present in remind_me — remind_me_entity is read-only there, and is here too, so writing is a separate, explicit call.",
+                                "description": "remind-me pipeline: create a knowledge-graph entity, or update its kind. remind_me_entity is read-only, so writing is a separate, explicit call.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -908,7 +909,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_self_update",
-                                "description": "Pull the latest changes from origin/main (fast-forward only) and rebuild the workspace in release mode. Refuses a working tree with uncommitted changes unless force is set; force never bypasses the fast-forward-only pull, so a diverged local history is still refused either way. Always requires a restart to take effect on success.",
+                                "description": "remind-me admin: pull the latest changes from origin/main (fast-forward only) and rebuild the workspace in release mode. Refuses a working tree with uncommitted changes unless force is set; force never bypasses the fast-forward-only pull, so a diverged local history is still refused either way. Always requires a restart to take effect on success.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -918,7 +919,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_revoke_clients",
-                                "description": "List OAuth clients registered with the remote connector's authorization server (FT-07), or revoke one by client_id. Without client_id, lists every registered client with its live access/refresh token counts -- this is the read path, not a bulk-revoke shorthand: there is no 'revoke all' operation, only 'list' (empty client_id) and 'revoke this one client' (client_id set). With client_id, deletes that client's registration and every token it holds; the live remote server re-reads the state file on each token check, so the client is locked out immediately and must re-register and re-obtain the owner's consent to reconnect.",
+                                "description": "remind-me admin: list OAuth clients registered with the remote connector's authorization server (FT-07), or revoke one by client_id. Without client_id, lists every registered client with its live access/refresh token counts -- this is the read path, not a bulk-revoke shorthand: there is no 'revoke all' operation, only 'list' (empty client_id) and 'revoke this one client' (client_id set). With client_id, deletes that client's registration and every token it holds; the live remote server re-reads the state file on each token check, so the client is locked out immediately and must re-register and re-obtain the owner's consent to reconnect.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -928,7 +929,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_reindex",
-                                "description": "Rebuild vector embeddings for every memory that doesn't have one yet. Existing embeddings are preserved; only missing ones are generated. Run this after configuring REMIND_ME_EMBEDDING_BACKEND, or after a bulk import that ran before an embedder was available. Reports 'degraded' when no embedder is configured or reachable, rather than silently doing nothing.",
+                                "description": "remind-me admin: rebuild vector embeddings for every memory that doesn't have one yet. Existing embeddings are preserved; only missing ones are generated. Run this after configuring REMIND_ME_EMBEDDING_BACKEND, or after a bulk import that ran before an embedder was available. Reports 'degraded' when no embedder is configured or reachable, rather than silently doing nothing.",
                                 "inputSchema": { "type": "object", "properties": { "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "json", "description": "json (default) returns the structured record; markdown returns a human-readable summary." } } }
                             },
                             {
@@ -948,7 +949,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_export_memories",
-                                "description": "Export live memories to JSON or JSONL — every column, plus the entity graph. Deleted and superseded memories are excluded unless include_deleted is set, so an export is safe to re-import. Embedding vectors are excluded as derived data. Writes to file_path when given (must be inside the allowed export roots), otherwise returns the payload inline.",
+                                "description": "remind-me admin: export live memories to JSON or JSONL — every column, plus the entity graph. Deleted and superseded memories are excluded unless include_deleted is set, so an export is safe to re-import. Embedding vectors are excluded as derived data. Writes to file_path when given (must be inside the allowed export roots), otherwise returns the payload inline.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -963,7 +964,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_decompose",
-                                "description": "Break a captured conversation into individually searchable atomic facts, each linked to the capture. A fact whose subject/predicate match an existing fact but whose object differs supersedes it.",
+                                "description": "remind-me pipeline: break a captured conversation into individually searchable atomic facts, each linked to the capture. A fact whose subject/predicate match an existing fact but whose object differs supersedes it.",
                                 "inputSchema": decompose_input_schema()
                             },
                             {
@@ -989,7 +990,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_auto_capture",
-                                "description": "Capture a whole conversation as two linked memories: the verbatim dialog and a concise summary. They share a capture_id, which remind_me_get_capture retrieves both by and remind_me_decompose breaks into atomic facts.",
+                                "description": "Save a whole conversation to remind-me as two linked memories, the verbatim dialog and a concise summary; call this at the end of any substantive conversation. They share a capture_id, which remind_me_get retrieves both by and remind_me_decompose breaks into atomic facts.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -1006,7 +1007,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_capture_transcript",
-                                "description": "Store or refresh a Claude Code session's capture from its raw JSONL transcript: one dialog and summary pair per session_id, replaced in place on every call. For hooks on machines without the CLI (cloud sessions); a model should use remind_me_auto_capture. The raw transcript is also archived when REMIND_ME_ARCHIVE_DIR is set.",
+                                "description": "remind-me import: store or refresh a Claude Code session's capture from its raw JSONL transcript: one dialog and summary pair per session_id, replaced in place on every call. For hooks on machines without the CLI (cloud sessions); a model should use remind_me_auto_capture. The raw transcript is also archived when REMIND_ME_ARCHIVE_DIR is set.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -1035,7 +1036,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_archive_prune",
-                                "description": "Enforce the raw-transcript archive's retention limits (REMIND_ME_ARCHIVE_MAX_AGE_DAYS, REMIND_ME_ARCHIVE_MAX_BYTES), removing oldest-first. Runs automatically after each archived import; call it directly to reclaim space now or, with dry_run, to see what would go. Removes archives only — the memories derived from them are untouched.",
+                                "description": "remind-me admin: enforce the raw-transcript archive's retention limits (REMIND_ME_ARCHIVE_MAX_AGE_DAYS, REMIND_ME_ARCHIVE_MAX_BYTES), removing oldest-first. Runs automatically after each archived import; call it directly to reclaim space now or, with dry_run, to see what would go. Removes archives only — the memories derived from them are untouched.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -1057,7 +1058,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_promote",
-                                "description": "Store a distillation of some memories as the rung above them, recording what it was built from. Provenance is mandatory: a promoted artifact with no sources could never be checked or demoted. Refuses capture_to_fact — that is remind_me_decompose — and refuses a sensitive source for a persona.",
+                                "description": "remind-me pipeline: store a distillation of some memories as the rung above them, recording what it was built from. Provenance is mandatory: a promoted artifact with no sources could never be checked or demoted. Refuses capture_to_fact — that is remind_me_decompose — and refuses a sensitive source for a persona.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -1080,7 +1081,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_persona",
-                                "description": "The current persona: durable statements about the user whose grounds still hold. A statement whose sources have all been superseded or deleted is withheld automatically, so a contradicted fact demotes what was built on it. Set include_demoted to also see what is currently withheld and why.",
+                                "description": "remind-me pipeline: the current persona: durable statements about the user whose grounds still hold. A statement whose sources have all been superseded or deleted is withheld automatically, so a contradicted fact demotes what was built on it. Set include_demoted to also see what is currently withheld and why.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -1090,7 +1091,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_provenance",
-                                "description": "What a memory was distilled from, and what was distilled from it. Walks the refinement ladder in both directions from one memory id.",
+                                "description": "remind-me pipeline: what a memory was distilled from, and what was distilled from it. Walks the refinement ladder in both directions from one memory id.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -1102,7 +1103,7 @@ impl McpServer {
                             references::tool_schema(),
                             {
                                 "name": "remind_me_session_timeline",
-                                "description": "A client session as an episode. With session_id: the session's start and end, branch and shas, then every memory written under it (captures, facts, the work log) oldest first. Without: the most recent sessions, newest first, each with how many memories it wrote.",
+                                "description": "remind-me extras: a client session as an episode. With session_id: the session's start and end, branch and shas, then every memory written under it (captures, facts, the work log) oldest first. Without: the most recent sessions, newest first, each with how many memories it wrote.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -1115,7 +1116,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_skeleton_write",
-                                "description": "Attach a Mermaid diagram of a capture's structure, so the conversation's shape can be read without reading the transcript. Each node maps to an inclusive, 1-based line range in the capture's dialog; remind_me_skeleton_read then drills into one node at a time. Ranges are validated against the dialog and the write is refused if any is out of bounds.",
+                                "description": "remind-me pipeline: attach a Mermaid diagram of a capture's structure, so the conversation's shape can be read without reading the transcript. Each node maps to an inclusive, 1-based line range in the capture's dialog; remind_me_skeleton_read then drills into one node at a time. Ranges are validated against the dialog and the write is refused if any is out of bounds.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -1128,7 +1129,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_skeleton_read",
-                                "description": "Read a capture's skeleton. Without 'node' this returns the Mermaid diagram and its node map — the cheap view of a long conversation. With 'node' it returns only that node's lines of the dialog, which is how to drill in without pulling the whole transcript.",
+                                "description": "remind-me pipeline: read a capture's skeleton. Without 'node' this returns the Mermaid diagram and its node map — the cheap view of a long conversation. With 'node' it returns only that node's lines of the dialog, which is how to drill in without pulling the whole transcript.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -1178,7 +1179,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_api_key",
-                                "description": "Issue, list, or revoke named dashboard API keys with a read or read-write scope. A read-scoped key is refused on every mutating HTTP route. The plaintext key is shown exactly once, at issuance — only its hash is stored, so it can be revoked and replaced but never recovered. Not multi-tenancy: every key reads and writes the same vault, only the permitted methods differ.",
+                                "description": "remind-me admin: issue, list, or revoke named dashboard API keys with a read or read-write scope. A read-scoped key is refused on every mutating HTTP route. The plaintext key is shown exactly once, at issuance — only its hash is stored, so it can be revoked and replaced but never recovered. Not multi-tenancy: every key reads and writes the same vault, only the permitted methods differ.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -1225,7 +1226,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_sync_repair",
-                                "description": "Reset a remote's pull cursors so the next sync re-pulls history from the beginning. Only the cursors are reset — the contact timestamps record what actually happened and are left intact.",
+                                "description": "remind-me admin: reset a remote's pull cursors so the next sync re-pulls history from the beginning. Only the cursors are reset — the contact timestamps record what actually happened and are left intact.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -1271,7 +1272,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_revert",
-                                "description": "Restore a memory's content, category, tags, metadata and sensitive flag to a prior revision. Reverting is itself an edit: it records a new revision of the state just before the revert, so a revert can be undone.",
+                                "description": "remind-me pipeline: restore a memory's content, category, tags, metadata and sensitive flag to a prior revision. Reverting is itself an edit: it records a new revision of the state just before the revert, so a revert can be undone.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -1329,7 +1330,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_undo_import",
-                                "description": "Roll back a previous import, removing its memories and its tracking rows. Defaults to a dry run — pass dry_run=false to actually delete. On a sync-enabled node this soft-deletes: a tombstone without the memory's text stays, so the removal propagates to every other node. Resumable: call again until 'remaining' is 0.",
+                                "description": "remind-me import: roll back a previous import, removing its memories and its tracking rows. Defaults to a dry run — pass dry_run=false to actually delete. On a sync-enabled node this soft-deletes: a tombstone without the memory's text stays, so the removal propagates to every other node. Resumable: call again until 'remaining' is 0.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -1353,12 +1354,12 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_normalize_apply",
-                                "description": "Write distilled normalizations back as new memories, each linked to the raw import it came from via a normalized_from metadata pointer. The raw memory is left untouched.",
+                                "description": "remind-me pipeline: write distilled normalizations back as new memories, each linked to the raw import it came from via a normalized_from metadata pointer. The raw memory is left untouched.",
                                 "inputSchema": normalize_apply_input_schema()
                             },
                             {
                                 "name": "remind_me_entity_traverse",
-                                "description": "Multi-hop traversal of the typed entity-relation graph from a starting entity. Unlike remind_me_entity (one entity's direct facts) this follows entity_relations edges in both directions, so it answers questions that chain relations rather than co-mention.",
+                                "description": "remind-me pipeline: multi-hop traversal of the typed entity-relation graph from a starting entity. Unlike remind_me_entity (one entity's direct facts) this follows entity_relations edges in both directions, so it answers questions that chain relations rather than co-mention.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -1372,7 +1373,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_wiki_write",
-                                "description": "Write or update a markdown wiki page.",
+                                "description": "remind-me wiki: write or update a markdown wiki page.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -1409,7 +1410,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_reclassify",
-                                "description": "Apply memory_type classifications. Updates each memory's decay rate to match its new type.",
+                                "description": "remind-me pipeline: apply memory_type classifications. Updates each memory's decay rate to match its new type.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -1442,7 +1443,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_feedback",
-                                "description": "Mark a memory helpful or unhelpful. Without `query` this is a global judgement that adjusts the memory's weight; with `query` it is recorded as feedback for similar future searches only.",
+                                "description": "remind-me pipeline: mark a memory helpful or unhelpful. Without `query` this is a global judgement that adjusts the memory's weight; with `query` it is recorded as feedback for similar future searches only.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -1455,7 +1456,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_backup",
-                                "description": "Create a WAL-safe online backup of the memory database, beside the database file. Older backups beyond the retention count are pruned.",
+                                "description": "remind-me admin: create a WAL-safe online backup of the memory database, beside the database file. Older backups beyond the retention count are pruned.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {}
@@ -1463,7 +1464,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_annotate",
-                                "description": "Apply subject/predicate/object triples and entity mentions to existing memories, in batches of up to 100.",
+                                "description": "remind-me pipeline: apply subject/predicate/object triples and entity mentions to existing memories, in batches of up to 100.",
                                 "inputSchema": annotate_input_schema()
                             },
                             {
@@ -1489,7 +1490,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_wiki_compile",
-                                "description": "Drive wiki synthesis over raw memories. With mark_integrated=false (the default) returns a brief of pending sources and never advances the watermark, so it is safe to call repeatedly. Call again with mark_integrated=true after writing the pages.",
+                                "description": "remind-me wiki: drive wiki synthesis over raw memories. With mark_integrated=false (the default) returns a brief of pending sources and never advances the watermark, so it is safe to call repeatedly. Call again with mark_integrated=true after writing the pages.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -1522,7 +1523,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_wiki_delete",
-                                "description": "Delete a wiki page by title or slug.",
+                                "description": "remind-me wiki: delete a wiki page by title or slug.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -1538,7 +1539,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_consolidate",
-                                "description": "Find clusters of near-duplicate memories by embedding similarity and optionally merge them into one canonical representative. dry_run (default true) reports clusters — canonical, members, and each member's similarity to the canonical — without changing anything. To actually merge, review the report, write a short summary per cluster you want consolidated, then call again with dry_run=false and summaries={canonical_id: summary}; a cluster with no matching summary is skipped, not merged with a raw concatenation.",
+                                "description": "remind-me pipeline: find clusters of near-duplicate memories by embedding similarity and optionally merge them into one canonical representative. dry_run (default true) reports clusters — canonical, members, and each member's similarity to the canonical — without changing anything. To actually merge, review the report, write a short summary per cluster you want consolidated, then call again with dry_run=false and summaries={canonical_id: summary}; a cluster with no matching summary is skipped, not merged with a raw concatenation.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -1552,12 +1553,12 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_resolve",
-                                "description": "Close a decision or action item as done, abandoned, reverted or superseded (`outcome`), or record a decision's follow-up review (`review`): whether it held up, which is separate from whether it was carried out. Pass exactly one. A reverted or abandoned one loses half its weight so it stops outranking what replaced it; the prior state is kept in history.",
+                                "description": "Close a remind-me decision or action item with `outcome`: done, abandoned, reverted, superseded, or carded (moved to a board card, so no longer open but not done). Or record a decision's follow-up review with `review`: whether it held up, which is separate from whether it was carried out. Pass exactly one. A reverted or abandoned one loses half its weight so it stops outranking what replaced it; the prior state is kept in history.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
                                         "memory_id": { "type": "string" },
-                                        "outcome": { "type": "string", "enum": ["done", "abandoned", "reverted", "superseded"] },
+                                        "outcome": { "type": "string", "enum": ["done", "abandoned", "reverted", "superseded", "carded"] },
                                         "review": { "type": "string", "enum": ["held", "revised", "reverted"], "description": "Decisions only. `reverted` also sets outcome to reverted." },
                                         "note": { "type": "string", "description": "Why; stored as metadata.outcome_note, or metadata.review.note for a review." }
                                     },
@@ -1577,6 +1578,18 @@ impl McpServer {
                         ]
                     }
                 });
+                // The literal above is every handler under its own name;
+                // what is advertised is the public surface built from it
+                // (ADR-0030). Handlers keep their pre-0.5 names so an alias
+                // reaches its own handler unchanged.
+                #[cfg(test)]
+                if tests::HANDLER_VIEW.with(std::cell::Cell::get) {
+                    return Some(listed);
+                }
+                let handlers = listed["result"]["tools"].take();
+                listed["result"]["tools"] = Value::Array(surface::public_tools(
+                    handlers.as_array().map(Vec::as_slice).unwrap_or_default(),
+                ));
                 // Pruned once, here, after the whole surface is declared —
                 // rather than by guarding each entry, which would put the
                 // tier decision in 62 places and let the next tool forget it.
@@ -1687,17 +1700,36 @@ impl McpServer {
                             "isError": true,
                             "content": [{
                                 "type": "text",
-                                "text": format!(
-                                    "Tool '{}' is not available under the '{}' tool profile. \
-                                     Set {}=full to expose the whole surface.",
-                                    tool_name,
-                                    profile,
-                                    remind_me_core::tool_profiles::TOOL_PROFILE_ENV
-                                )
+                                "text": match remind_me_core::tool_profiles::group_of(tool_name) {
+                                    Some(group) => format!(
+                                        "Tool '{tool_name}' is not available under the '{profile}' \
+                                         tool profile. It is in the '{group}' group: set \
+                                         {env}={profile},{group}, or {env}=full for the whole surface.",
+                                        env = remind_me_core::tool_profiles::TOOL_PROFILE_ENV
+                                    ),
+                                    None => format!(
+                                        "Tool '{tool_name}' is not available under the '{profile}' \
+                                         tool profile. Set {}=full to expose the whole surface.",
+                                        remind_me_core::tool_profiles::TOOL_PROFILE_ENV
+                                    ),
+                                }
                             }]
                         }
                     }));
                 }
+                let surface::Route { handler, args } = match surface::route(tool_name, args) {
+                    Ok(route) => route,
+                    Err(why) => {
+                        return Some(json!({
+                            "jsonrpc": "2.0",
+                            "id": req_id,
+                            "result": {
+                                "isError": true,
+                                "content": [{ "type": "text", "text": format!("Invalid input: {why}") }]
+                            }
+                        }));
+                    }
+                };
                 let mut span = remind_me_core::telemetry::maybe_span(&format!("tool.{tool_name}"));
                 // Started unconditionally: `record_tool_call` decides for
                 // itself whether metrics are on, the same way `maybe_span`
@@ -1710,7 +1742,7 @@ impl McpServer {
                 // one finishes.
                 let _watchdog = remind_me_core::watchdog::arm(tool_name);
 
-                let result = match tool_name {
+                let result = match handler.as_str() {
                     "remind_me_add" => {
                         // The structured fields sit beside the input model, not
                         // in it, so both read from the same arguments.
@@ -2233,6 +2265,12 @@ impl McpServer {
                                 })
                                 .unwrap_or(json!({})),
                             };
+                            report["tool_profile"] = json!({
+                                "profile": profile,
+                                "groups": remind_me_core::tool_profiles::allowed_groups(&profile)
+                                    .map(|g| g.into_iter().collect::<Vec<_>>()),
+                                "env": remind_me_core::tool_profiles::TOOL_PROFILE_ENV,
+                            });
                             {
                                 let text = match format {
                                     ResponseFormat::Json => {
@@ -3723,6 +3761,25 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    thread_local! {
+        /// Set by [`handler_view`]: `tools/list` returns every handler under
+        /// its own name, for the tests that check a handler's declared schema
+        /// rather than the public surface built from it.
+        pub(super) static HANDLER_VIEW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Switch this test's thread to the handler view until the guard drops.
+    fn handler_view() -> impl Drop {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                HANDLER_VIEW.with(|v| v.set(false));
+            }
+        }
+        HANDLER_VIEW.with(|v| v.set(true));
+        Reset
+    }
+
     /// Held by every test that reads or sets `REMIND_ME_EMBEDDING_BACKEND`
     /// (a process-global env var), **and by every test that calls
     /// `remind_me_server_status`**: that tool's `embeddings` override
@@ -4125,6 +4182,193 @@ mod tests {
     }
 
     #[test]
+    fn a_blank_query_with_a_window_searches_and_keeps_its_shaping_options() {
+        let server = McpServer::new(Database::open_in_memory().unwrap());
+        let id = add(&server, &long_body("ENDMARK"));
+        let windowed = |extra: Value| {
+            let mut args = json!({ "query": "", "since": "1h" });
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            call(&server, "remind_me_search", args)
+        };
+
+        let compact = text_of(&windowed(json!({})));
+        assert!(compact.contains(&format!("- `{id}` · ")), "{compact}");
+        assert!(
+            !compact.contains("ENDMARK"),
+            "compact must not carry the body"
+        );
+
+        let full = windowed(json!({ "detail": "full" }));
+        assert!(full.get("isError").is_none(), "{}", text_of(&full));
+        assert!(text_of(&full).contains("ENDMARK"), "{}", text_of(&full));
+
+        add(&server, &long_body("second"));
+        let tight = text_of(&windowed(json!({ "detail": "full", "token_budget": 100 })));
+        assert!(tight.contains("Trimmed:"), "{tight}");
+
+        let future = windowed(json!({ "since": "2999-01-01T00:00:00Z" }));
+        assert!(
+            text_of(&future).contains("No memories"),
+            "{}",
+            text_of(&future)
+        );
+
+        // No `query` at all: the window alone still lists.
+        for bound in [
+            json!({ "since": "1h" }),
+            json!({ "until": "2999-01-01T00:00:00Z" }),
+        ] {
+            let listed = call(&server, "remind_me_search", bound.clone());
+            assert!(
+                listed.get("isError").is_none(),
+                "{bound}: {}",
+                text_of(&listed)
+            );
+            assert!(
+                text_of(&listed).contains(&id),
+                "{bound}: {}",
+                text_of(&listed)
+            );
+        }
+    }
+
+    #[test]
+    fn a_window_leaves_dialogs_out_unless_asked_and_falls_back_to_them() {
+        let server = McpServer::new(Database::open_in_memory().unwrap());
+        let add_in = |content: &str, category: &str| {
+            call(
+                &server,
+                "remind_me_add",
+                json!({ "content": content, "category": category }),
+            );
+        };
+        let window = |extra: Value| {
+            let mut args = json!({ "since": "1h" });
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            text_of(&call(&server, "remind_me_search", args))
+        };
+
+        add_in("Gamma dialog turn", "dialog");
+        let fallback = window(json!({}));
+        assert!(fallback.contains("Gamma dialog turn"), "{fallback}");
+        assert!(fallback.contains("Raw sessions"), "{fallback}");
+
+        add_in("Gamma refined fact", "fact");
+        let refined = window(json!({}));
+        assert!(refined.contains("Gamma refined fact"), "{refined}");
+        assert!(!refined.contains("Gamma dialog turn"), "{refined}");
+
+        let raw = window(json!({ "include_raw": true }));
+        assert!(raw.contains("Gamma refined fact"), "{raw}");
+        assert!(
+            raw.contains("Gamma dialog turn"),
+            "include_raw was dropped: {raw}"
+        );
+    }
+
+    #[test]
+    fn search_finds_a_task_link_by_kind_or_by_its_uuid_alone() {
+        let server = McpServer::new(Database::open_in_memory().unwrap());
+        let uuid = "0b9f2c1e-4d3a-4e5f-9a6b-7c8d9e0f1a2b";
+        let id = add(&server, &format!("Blocked on tick:{uuid} landing first"));
+        add(&server, "No task here");
+
+        for lookup in [
+            json!({ "reference_kind": "task" }),
+            json!({ "reference": uuid }),
+            json!({ "reference": uuid, "reference_kind": "task" }),
+        ] {
+            let found = call(&server, "remind_me_search", lookup.clone());
+            let text = text_of(&found);
+            assert!(found.get("isError").is_none(), "{lookup}: {text}");
+            assert!(text.contains(&id), "{lookup}: {text}");
+            assert!(!text.contains("No task here"), "{lookup}: {text}");
+        }
+    }
+
+    #[test]
+    fn a_window_narrows_by_what_it_applies_and_refuses_what_it_does_not() {
+        let server = McpServer::new(Database::open_in_memory().unwrap());
+        for (content, category, tag) in [
+            ("Alpha window", "fact", "wanted"),
+            ("Beta window", "note", "other"),
+        ] {
+            call(
+                &server,
+                "remind_me_add",
+                json!({ "content": content, "category": category, "tags": [tag] }),
+            );
+        }
+
+        for narrowing in [
+            json!({ "since": "1h", "category": "fact" }),
+            json!({ "query": "", "since": "1h", "tags": ["wanted"] }),
+        ] {
+            let narrowed = call(&server, "remind_me_search", narrowing.clone());
+            let text = text_of(&narrowed);
+            assert!(narrowed.get("isError").is_none(), "{narrowing}: {text}");
+            assert!(text.contains("Alpha window"), "{narrowing}: {text}");
+            assert!(
+                !text.contains("Beta window"),
+                "{narrowing} was dropped: {text}"
+            );
+        }
+
+        for unapplied in [
+            json!({ "since": "1h", "source": "chat" }),
+            json!({ "since": "1h", "offset": 1 }),
+        ] {
+            let refused = call(&server, "remind_me_search", unapplied.clone());
+            assert_eq!(refused["isError"], true, "{unapplied} was silently dropped");
+            assert!(
+                text_of(&refused).contains("list that window"),
+                "{unapplied}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_search_without_a_query_lists_under_its_filters_and_refuses_ranking_options() {
+        let server = McpServer::new(Database::open_in_memory().unwrap());
+        for (content, category) in [("Alpha listing", "fact"), ("Beta listing", "note")] {
+            call(
+                &server,
+                "remind_me_add",
+                json!({ "content": content, "category": category }),
+            );
+        }
+
+        let listed = call(
+            &server,
+            "remind_me_search",
+            json!({ "query": "", "category": "fact" }),
+        );
+        let text = text_of(&listed);
+        assert!(listed.get("isError").is_none(), "{text}");
+        assert!(text.contains("Alpha listing"), "{text}");
+        assert!(
+            !text.contains("Beta listing"),
+            "category filter was dropped: {text}"
+        );
+
+        for shaped in [
+            json!({ "detail": "full" }),
+            json!({ "token_budget": 10 }),
+            json!({ "include_expired": true }),
+            json!({ "min_confidence": 0.9 }),
+            json!({ "min_vitality": 0.5 }),
+        ] {
+            let refused = call(&server, "remind_me_search", shaped.clone());
+            assert_eq!(refused["isError"], true, "{shaped} was silently dropped");
+            assert!(text_of(&refused).contains("without `query`"), "{shaped}");
+        }
+    }
+
+    #[test]
     fn a_trimmed_search_names_the_dropped_ids_and_get_fetches_them() {
         let server = McpServer::new(Database::open_in_memory().unwrap());
         for i in 0..3 {
@@ -4181,7 +4425,39 @@ mod tests {
     }
 
     #[test]
+    fn every_handler_is_a_public_tool_or_an_alias_and_every_alias_has_a_handler() {
+        use remind_me_core::tool_profiles::{group_of, replacement, ALIASES};
+        let _handlers = handler_view();
+        let server = McpServer::new(Database::open_in_memory().unwrap());
+        let req = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
+        let resp = server.handle_request(&req.to_string()).unwrap();
+        let handlers: Vec<String> = resp["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(str::to_string))
+            .collect();
+
+        // A handler in neither table would be unreachable under any narrowed
+        // profile and missing from the public list: a tool nobody can find.
+        for handler in &handlers {
+            assert!(
+                group_of(handler).is_some(),
+                "{handler} is neither a public tool nor an alias"
+            );
+        }
+        for (old, _) in ALIASES {
+            assert!(
+                handlers.iter().any(|h| h == old),
+                "alias {old} has no handler"
+            );
+            assert!(replacement(old).is_some());
+        }
+    }
+
+    #[test]
     fn test_crud_tools_are_registered() {
+        let _handlers = handler_view();
         let db = Database::open_in_memory().unwrap();
         let server = McpServer::new(db);
         let req = json!({ "jsonrpc": "2.0", "id": 4, "method": "tools/list" });
@@ -4204,7 +4480,61 @@ mod tests {
     }
 
     #[test]
+    fn a_reference_search_leaves_out_sensitive_memories_unless_asked() {
+        let server = McpServer::new(Database::open_in_memory().unwrap());
+        call(
+            &server,
+            "remind_me_add",
+            json!({ "content": "Open note on o/r#77" }),
+        );
+        call(
+            &server,
+            "remind_me_add",
+            json!({ "content": "Private note on o/r#77", "sensitive": true }),
+        );
+        let found = |args: Value| {
+            let result = call(&server, "remind_me_search", args);
+            serde_json::from_str::<Value>(&text_of(&result)).unwrap()
+        };
+
+        let plain = found(json!({ "reference": "o/r#77" }));
+        assert_eq!(plain["count"], 1, "{plain}");
+        assert!(!plain.to_string().contains("Private"), "{plain}");
+        let all = found(json!({ "reference": "o/r#77", "include_sensitive": true }));
+        assert_eq!(all["count"], 2, "{all}");
+
+        let scoped = call(
+            &server,
+            "remind_me_search",
+            json!({ "reference": "o/r#77", "project": "elsewhere" }),
+        );
+        assert_eq!(
+            scoped["isError"], true,
+            "a scope it cannot honour is refused"
+        );
+    }
+
+    #[test]
+    fn the_published_get_schema_does_not_require_a_memory_id() {
+        // `capture_id` alone is a complete call, so the merged tool cannot
+        // require `memory_id`.
+        let server = McpServer::new(Database::open_in_memory().unwrap());
+        let req = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
+        let resp = server.handle_request(&req.to_string()).unwrap();
+        let get = resp["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "remind_me_get")
+            .cloned()
+            .unwrap();
+        assert!(get["inputSchema"].get("required").is_none(), "{get}");
+        assert!(get["inputSchema"]["properties"]["capture_id"].is_object());
+    }
+
+    #[test]
     fn references_tool_is_registered_and_reverse_lookup_works() {
+        let _handlers = handler_view();
         let db = Database::open_in_memory().unwrap();
         let server = McpServer::new(db);
         let req = json!({ "jsonrpc": "2.0", "id": 4, "method": "tools/list" });
@@ -4557,6 +4887,9 @@ mod tests {
 
     #[test]
     fn test_remind_me_get_schema_advertises_memory_id_as_required() {
+        // The handler's own schema: the public `get` also takes `capture_id`
+        // alone, so it requires nothing.
+        let _handlers = handler_view();
         let db = Database::open_in_memory().unwrap();
         let server = McpServer::new(db);
         let listed = server
@@ -4683,6 +5016,7 @@ mod tests {
 
     #[test]
     fn test_vitality_report_tool() {
+        let _handlers = handler_view();
         let db = Database::open_in_memory().unwrap();
         let server = McpServer::new(db);
 
@@ -4777,6 +5111,7 @@ mod tests {
 
     #[test]
     fn test_wiki_tools_are_registered() {
+        let _handlers = handler_view();
         let db = Database::open_in_memory().unwrap();
         let server = McpServer::new(db);
         let req = json!({ "jsonrpc": "2.0", "id": 5, "method": "tools/list" });
@@ -4841,6 +5176,7 @@ mod tests {
 
     #[test]
     fn test_wiki_search_tool() {
+        let _handlers = handler_view();
         let (server, root) = wiki_server("search");
 
         let req = json!({ "jsonrpc": "2.0", "id": 8, "method": "tools/list" });
@@ -4936,6 +5272,7 @@ mod tests {
 
     #[test]
     fn test_import_dbs_is_registered_and_refuses_a_path_outside_the_roots() {
+        let _handlers = handler_view();
         let db = Database::open_in_memory().unwrap();
         let server = McpServer::new(db);
 
@@ -4968,6 +5305,7 @@ mod tests {
 
     #[test]
     fn test_import_mempalace_is_registered_and_has_no_path_field() {
+        let _handlers = handler_view();
         let db = Database::open_in_memory().unwrap();
         let server = McpServer::new(db);
 
@@ -5001,6 +5339,7 @@ mod tests {
 
     #[test]
     fn test_webhook_status_is_registered_and_reports_disabled() {
+        let _handlers = handler_view();
         // No `REMIND_ME_WEBHOOK_SECRET` in the test environment, so nothing
         // binds a port — which is the state this asserts.
         let db = Database::open_in_memory().unwrap();
@@ -5035,6 +5374,7 @@ mod tests {
 
     #[test]
     fn test_check_update_and_self_update_are_registered() {
+        let _handlers = handler_view();
         // Not invoked here, unlike every other tool this file tests end to
         // end: both discover their repository from the process's current
         // working directory (docs/adr/0003-self-update-strategy.md), and
@@ -5481,6 +5821,7 @@ mod tests {
     /// (#183), and nothing was asserting it.
     #[test]
     fn test_history_limit_defaults_to_the_references_ten() {
+        let _handlers = handler_view();
         let parsed: HistoryInput =
             serde_json::from_value(json!({ "memory_id": "m1" })).expect("parse");
         assert_eq!(parsed.limit, 10);
@@ -5533,6 +5874,7 @@ mod tests {
 
     #[test]
     fn test_both_tools_declare_response_format_defaulting_to_markdown() {
+        let _handlers = handler_view();
         let db = Database::open_in_memory().unwrap();
         let server = McpServer::new(db);
         let listed = server
@@ -5869,6 +6211,7 @@ mod tests {
 
     #[test]
     fn stale_candidates_schema_bounds_match_the_rust_side_clamp_constants() {
+        let _handlers = handler_view();
         let db = Database::open_in_memory().unwrap();
         let server = McpServer::new(db);
         let listed = server
@@ -5895,6 +6238,7 @@ mod tests {
 
     #[test]
     fn promotion_candidates_schema_bounds_match_the_rust_side_clamp_constants() {
+        let _handlers = handler_view();
         let db = Database::open_in_memory().unwrap();
         let server = McpServer::new(db);
         let listed = server

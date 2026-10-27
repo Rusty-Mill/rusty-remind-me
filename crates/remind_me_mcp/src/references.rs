@@ -17,7 +17,7 @@ const MARKDOWN_REFS: usize = 5;
 /// Rows the reverse lookup returns at most.
 const LOOKUP_LIMIT: usize = 100;
 /// Reference kinds, for a lookup that names a value but no kind.
-const KINDS: [&str; 8] = [
+pub const KINDS: [&str; 8] = [
     "url",
     "issue",
     "pull",
@@ -107,7 +107,8 @@ pub fn tool_schema() -> Value {
             "properties": {
                 "kind": { "type": "string", "enum": KINDS },
                 "value": { "type": "string", "description": "The normalised value: owner/repo#123, a commit sha, a path, a URL, @handle, sha256:<hex>." },
-                "memory_id": { "type": "string" }
+                "memory_id": { "type": "string" },
+                "include_sensitive": { "type": "boolean", "default": false, "description": "Include references from memories marked sensitive." }
             }
         }
     })
@@ -136,31 +137,43 @@ fn lookup(store: &Store<'_>, args: &Value) -> Result<Vec<MemoryReference>, Strin
 
 /// Run the tool: each reference plus a short view of the memory it points
 /// from (a memory that was since deleted is shown as `null`).
+///
+/// References from a sensitive memory are left out, before counting, unless
+/// `include_sensitive` is set: `remind_me_search` reaches this for its
+/// `reference` filter, and search keeps sensitive memories out by default.
 pub fn run(store: &Store<'_>, args: &Value) -> Result<Value, String> {
-    let mut rows = lookup(store, args)?;
+    let include_sensitive = args
+        .get("include_sensitive")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut memories: BTreeMap<String, Option<Memory>> = BTreeMap::new();
+    let mut rows = Vec::new();
+    for row in lookup(store, args)? {
+        let memory = memories.entry(row.memory_id.clone()).or_insert_with(|| {
+            queries::get_memory_by_id(store, &row.memory_id)
+                .ok()
+                .flatten()
+        });
+        if include_sensitive || !memory.as_ref().is_some_and(|m| m.sensitive) {
+            rows.push(row);
+        }
+    }
     let total = rows.len();
     rows.truncate(LOOKUP_LIMIT);
-    let mut memories: BTreeMap<String, Value> = BTreeMap::new();
-    for row in &rows {
-        if memories.contains_key(&row.memory_id) {
-            continue;
-        }
-        let view = match queries::get_memory_by_id(store, &row.memory_id) {
-            Ok(Some(m)) => json!({
-                "id": m.id,
-                "category": m.category,
-                "content": m.content.chars().take(200).collect::<String>(),
-                "created_at": m.created_at,
-            }),
-            _ => Value::Null,
-        };
-        memories.insert(row.memory_id.clone(), view);
-    }
+    let view = |memory: Option<&Memory>| match memory {
+        Some(m) => json!({
+            "id": m.id,
+            "category": m.category,
+            "content": m.content.chars().take(200).collect::<String>(),
+            "created_at": m.created_at,
+        }),
+        None => Value::Null,
+    };
     let references: Vec<Value> = rows
         .iter()
         .map(|r| {
             let mut v = serde_json::to_value(r).unwrap_or(Value::Null);
-            v["memory"] = memories.get(&r.memory_id).cloned().unwrap_or(Value::Null);
+            v["memory"] = view(memories.get(&r.memory_id).and_then(Option::as_ref));
             v
         })
         .collect();

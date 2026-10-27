@@ -172,19 +172,28 @@ fn the_four_schemas_advertise_the_parameter() {
         .unwrap();
     let tools = listed["result"]["tools"].as_array().unwrap();
     for (tool, _, markdown_default) in MIRRORED {
+        // A merged handler is advertised through the tool it merged into
+        // (ADR-0030).
+        let public = remind_me_core::tool_profiles::replacement(tool).unwrap_or(tool);
         let entry = tools
             .iter()
-            .find(|t| t["name"] == tool)
-            .unwrap_or_else(|| panic!("{tool} missing from tools/list"));
+            .find(|t| t["name"] == public)
+            .unwrap_or_else(|| panic!("{public} missing from tools/list"));
         let prop = &entry["inputSchema"]["properties"]["response_format"];
-        assert!(!prop.is_null(), "{tool} does not advertise response_format");
-        // The advertised default has to agree with the behaviour above, or the
-        // schema documents a tool that does not exist.
-        assert_eq!(
-            prop["default"],
-            if markdown_default { "markdown" } else { "json" },
-            "{tool} advertises a default it does not honour"
+        assert!(
+            !prop.is_null(),
+            "{public} does not advertise response_format"
         );
+        // An advertised default has to agree with the behaviour above, or the
+        // schema documents a tool that does not exist. A merged tool whose
+        // handlers disagree advertises none.
+        if !prop["default"].is_null() {
+            assert_eq!(
+                prop["default"],
+                if markdown_default { "markdown" } else { "json" },
+                "{public} advertises a default {tool} does not honour"
+            );
+        }
     }
 }
 
