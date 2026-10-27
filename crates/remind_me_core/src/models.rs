@@ -2087,6 +2087,25 @@ fn default_digest_since_days() -> i64 {
     crate::digest::DEFAULT_SINCE_DAYS
 }
 
+/// Request for a project brief (`remind_me_brief`). Strict: an unknown
+/// field is refused rather than ignored, so a misspelled `since` is not a
+/// silent 7-day window.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BriefInput {
+    pub project: String,
+    #[serde(default)]
+    pub since: Option<String>,
+    #[serde(default = "default_brief_token_budget")]
+    pub token_budget: usize,
+    #[serde(default)]
+    pub response_format: Option<ResponseFormat>,
+}
+
+fn default_brief_token_budget() -> usize {
+    crate::context_brief::DEFAULT_TOKEN_BUDGET
+}
+
 // ---------------------------------------------------------------------------
 // Analytics snapshots (gap A1, issue #112)
 // ---------------------------------------------------------------------------

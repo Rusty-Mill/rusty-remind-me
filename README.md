@@ -262,8 +262,8 @@ New surfaces: MCP tools `remind_me_resolve`, `remind_me_references` and `remind_
 
 - **`.mcp.json`** — the same stdio MCP server (`rusty-remind-me server`) described above, registered automatically instead of via the `configure` command or a manual client config edit.
 - **`hooks/hooks.json`** — five hooks that run the CLI directly (no MCP round-trip, no model decision required):
-  - `SessionStart` (`session-start.sh`) opens the session and injects a brief scoped to the current project and branch: persona, reminders due within 7 days, open action items, recent memories.
-  - `UserPromptSubmit` (`prompt-submit.sh`) injects only the few memories that match the prompt, under a 3,000-character budget. Prompts under 12 characters and slash commands are skipped.
+  - `SessionStart` (`session-start.sh`) opens the session and injects a brief scoped to the current project and branch, under a 2,000-token budget: persona, reminders due within 7 days, then the project brief (see `rusty-remind-me brief` below).
+  - `UserPromptSubmit` (`prompt-submit.sh`) injects only the few memories that match the prompt, under a 750-token budget. Prompts under 12 characters and slash commands are skipped.
   - `Stop`, `PreCompact` and `SessionEnd` (`capture.sh`) save the conversation, so a session no one remembered to save still leaves a record. There is one capture per session and each run replaces its dialog. `Stop` fires every turn, so it is throttled to once a minute; `PreCompact` and `SessionEnd` always run. `SessionEnd` also closes the session and records a work log from `git diff` since the session began.
 - **`commands/remember.md`, `commands/recall.md`** — `/rusty-remind-me:remember <text> [--category NAME] [--tags a,b]` and `/rusty-remind-me:recall <query> [--limit N]`, each running `rusty-remind-me add`/`search` directly (via the command body's `` !`...` `` bash-execution syntax) before the model ever sees the prompt. `allowed-tools` scopes each command to exactly one CLI invocation shape (`Bash(rusty-remind-me add *)` / `Bash(rusty-remind-me search *)`). Plugin-provided commands are namespaced as `/plugin-name:command-name` — the bare `/remember` is not registered, only `/rusty-remind-me:remember`.
 
@@ -606,13 +606,20 @@ Retrieves a specific memory record by its primary key:
 rusty-remind-me get mem_4b307c2bd6ec4deb8c891a4b28cc592a
 ```
 
-### 8. Knowledge Graph Entity Management
+### 8. Project Brief
+One call for what is worth knowing about a project: its current state (the newest session summaries), what is open (blockers raised in the window, decisions and action items with no outcome) and recent activity, newest first, each with an id for `get`:
+```bash
+rusty-remind-me brief rusty_mux --since 2d --budget 1500
+```
+The name resolves through the entity graph, so an alias works, and a memory is in scope when its project, its git remote's repository, a tag, its subject or object, or an entity link names the project. An unknown name is refused with the closest known names, never guessed. `--since` takes `7d` (the default), `12h` or an RFC 3339 time; `--budget` is in tokens (200 to 8,000) and bounds the returned text, JSON or Markdown, by the same bytes/4 estimate search uses; items that do not fit are dropped whole and counted, and a budget too small even for the header is refused with the size it needs. `--json` prints the brief's JSON instead of its Markdown. Sensitive, superseded and expired memories never appear, and never make a name known or suggested. The same brief is the MCP tool `remind_me_brief` (in the `core` profile, JSON by default) and `GET /api/brief`.
+
+### 9. Knowledge Graph Entity Management
 Upserts an entity with optional category/kind classification:
 ```bash
 rusty-remind-me entity "Bailey Robertson" "person"
 ```
 
-### 9. Markdown Wiki Synthesis
+### 10. Markdown Wiki Synthesis
 Creates or updates a structured wiki topic page:
 ```bash
 rusty-remind-me wiki-write architecture "System Architecture" "Rusty Remind Me is a high performance memory engine written in Rust."
@@ -644,7 +651,7 @@ dbs export-wiki --out-dir ./wiki-pages    # in the dbs repo
 rusty-remind-me wiki-import ./wiki-pages
 ```
 
-### 10. System Statistics
+### 11. System Statistics
 Prints total memory counts and database metrics:
 ```bash
 rusty-remind-me stats
@@ -652,7 +659,7 @@ rusty-remind-me stats
 
 ---
 
-### 11. Store Daemon
+### 12. Store Daemon
 One `rusty-remind-me daemon` process owns the store, and every MCP session,
 CLI command, `api` and `remote` becomes its client over loopback. Set
 `REMIND_ME_DAEMON=0` to open the store in each process instead. The first client starts it; nothing needs to be run by
@@ -676,7 +683,7 @@ The daemon writes `<db>.daemon.json`, `<db>.daemon.token` (mode 600) and
 `<db>.daemon.log` beside the database (`remind_me.db.daemon.json` and so on),
 and holds `<db>.daemon.lock` while it runs.
 
-### 12. The Engine Store
+### 13. The Engine Store
 The node's only store is the `rusty_multimodal_db` engine (ADR-0023,
 ADR-0025): a directory of tables, `memory.engine`, beside the path the
 store is configured at. A node that still has a SQLite `memory.db` from an
@@ -739,6 +746,7 @@ surfaces):
 | `GET` | `/api/reminders?when=upcoming\|overdue\|all&limit=...` | Memories with a reminder set, soonest first (`remind_me_list_reminders`) |
 | `POST` | `/api/reminders` | Set or clear a reminder — `{"memory_id": ..., "remind_at": ISO-8601 or null}` (`remind_me_set_reminder`) |
 | `GET` | `/api/digest?since_days=...` | Recent memories, vitality, reminders and sync state (`remind_me_digest`) |
+| `GET` | `/api/brief?project=...&since=...&token_budget=...` | One project's state, open items and recent activity; 404 with `suggestions` for an unknown name (`remind_me_brief`) |
 | `GET` | `/api/status` | Build, database, schema currency, backups and subsystem state (`remind_me_server_status`) |
 | `GET` | `/api/saved-searches` | List saved searches (`remind_me_list_saved_searches`) |
 | `POST` | `/api/saved-searches` | Create or update one by name (`remind_me_save_search`) |

@@ -1,5 +1,5 @@
-//! `session start|end|timeline`, `capture-transcript` and `context`: the
-//! subcommands a client's hooks call; and `import-sessions`, the one-time
+//! `session start|end|timeline`, `capture-transcript`, `context` and `brief`:
+//! the subcommands a client's hooks call; and `import-sessions`, the one-time
 //! backfill of the transcripts captured before the hooks were installed. The flags and the JSON they print are
 //! the contract the hook scripts are written against; the work is
 //! `remind_me_core::session_ops`, run wherever the store is (the daemon or
@@ -23,14 +23,15 @@ Usage:
                   [--reason stop|precompact|end] [--json]
   rusty-remind-me import-sessions DIR   (a Claude Code `projects` folder)
   rusty-remind-me context [--cwd DIR] [--project P] [--branch B] [--prompt TEXT]
-                  [--budget CHARS] [--hits-only] [--json]
+                  [--budget TOKENS] [--hits-only] [--json]
+  rusty-remind-me brief PROJECT [--since 7d|12h|RFC3339] [--budget TOKENS] [--json]
 
 --session-id defaults to $REMIND_ME_SESSION_ID and --cwd to $REMIND_ME_CWD,
 then the current directory. Every subcommand prints one JSON object, except
-`session timeline` and `context` without --json, which print Markdown.";
+`session timeline`, `context` and `brief` without --json, which print Markdown.";
 
-/// Default `--budget` for `context`: about 2,000 tokens.
-const DEFAULT_BUDGET: usize = 8000;
+/// Default `--budget` for `context`, in tokens.
+const DEFAULT_BUDGET: usize = 2000;
 
 /// Flags common to the subcommands; each takes only the ones it knows.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -43,6 +44,7 @@ struct Flags {
     project: Option<String>,
     branch: Option<String>,
     prompt: Option<String>,
+    since: Option<String>,
     budget: Option<usize>,
     json: bool,
     hits_only: bool,
@@ -81,9 +83,10 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
             "--project" => flags.project = Some(value),
             "--branch" => flags.branch = Some(value),
             "--prompt" => flags.prompt = Some(value),
+            "--since" => flags.since = Some(value),
             "--budget" => {
                 flags.budget = Some(value.parse().map_err(|_| {
-                    format!("Error: --budget expects a number of characters, got {value:?}.")
+                    format!("Error: --budget expects a number of tokens, got {value:?}.")
                 })?)
             }
             other => return Err(format!("Error: unknown flag {other}.\n{USAGE}")),
@@ -134,7 +137,7 @@ enum Plan {
     Json(Op),
     /// `session timeline`: `{"markdown", ..}` or null.
     Timeline(Op, bool),
-    /// `context`: `{"context", ..}`.
+    /// `context` and `brief`: `{"brief", "context"}`.
     Context(Op, bool),
 }
 
@@ -172,6 +175,23 @@ fn plan(command: &str, rest: &[String]) -> Result<Plan, String> {
                     prompt: flags.prompt.clone(),
                     budget: flags.budget.unwrap_or(DEFAULT_BUDGET),
                     hits_only: flags.hits_only,
+                },
+                flags.json,
+            ))
+        }
+        "brief" => {
+            let flags = parse_flags(rest)?;
+            let project = flags
+                .positional
+                .clone()
+                .ok_or_else(|| format!("Error: brief expects a project name.\n{USAGE}"))?;
+            Ok(Plan::Context(
+                Op::Brief {
+                    project,
+                    since: flags.since.clone(),
+                    budget: flags
+                        .budget
+                        .unwrap_or(remind_me_core::context_brief::DEFAULT_TOKEN_BUDGET),
                 },
                 flags.json,
             ))
@@ -214,7 +234,9 @@ fn render(plan: &Plan, reply: Value) -> String {
     match plan {
         Plan::Json(_) => pretty(&reply),
         Plan::Timeline(_, true) => pretty(&reply),
-        Plan::Context(_, true) => pretty(&reply),
+        // The brief's JSON alone: the Markdown beside it would double the
+        // output past the budget.
+        Plan::Context(_, true) => pretty(reply.get("brief").unwrap_or(&Value::Null)),
         Plan::Timeline(_, false) => match reply.get("markdown").and_then(Value::as_str) {
             Some(text) => text.to_string(),
             None => "No session found.".to_string(),
@@ -233,7 +255,7 @@ fn op_of(plan: Plan) -> (Op, Plan) {
     }
 }
 
-/// Run `command` (`session`, `capture-transcript`, `import-sessions` or `context`) with its
+/// Run `command` (`session`, `capture-transcript`, `import-sessions`, `context` or `brief`) with its
 /// arguments, printing the result. Exits 1 with a message on bad arguments.
 pub fn command(
     command: &str,
@@ -372,6 +394,32 @@ mod tests {
     }
 
     #[test]
+    fn brief_takes_a_project_window_and_budget() {
+        match plan("brief", &args(&["mux", "--since", "2d", "--budget", "900"])).unwrap() {
+            Plan::Context(
+                Op::Brief {
+                    project,
+                    since,
+                    budget,
+                },
+                false,
+            ) => {
+                assert_eq!(project, "mux");
+                assert_eq!(since.as_deref(), Some("2d"));
+                assert_eq!(budget, 900);
+            }
+            _ => panic!("expected Brief"),
+        }
+        match plan("brief", &args(&["mux", "--json"])).unwrap() {
+            Plan::Context(Op::Brief { since, budget, .. }, true) => {
+                assert_eq!(since, None);
+                assert_eq!(budget, remind_me_core::context_brief::DEFAULT_TOKEN_BUDGET);
+            }
+            _ => panic!("expected Brief"),
+        }
+    }
+
+    #[test]
     fn bad_arguments_are_refused_with_the_usage() {
         assert!(plan("session", &args(&[])).is_err());
         assert!(plan("session", &args(&["pause"])).is_err());
@@ -384,11 +432,13 @@ mod tests {
         )
         .is_err());
         assert!(plan("context", &args(&["--budget", "lots"])).is_err());
+        assert!(plan("brief", &args(&[])).is_err());
+        assert!(plan("brief", &args(&["a", "b"])).is_err());
     }
 
     #[test]
     fn markdown_is_unwrapped_unless_json_is_asked_for() {
-        let reply = serde_json::json!({"context": "# Hi", "sections": {}});
+        let reply = serde_json::json!({"brief": {"sections": []}, "context": "# Hi"});
         let op = Op::Context {
             cwd: None,
             project: None,
@@ -401,6 +451,10 @@ mod tests {
             render(&Plan::Context(op.clone(), false), reply.clone()),
             "# Hi"
         );
-        assert!(render(&Plan::Context(op, true), reply).contains("\"sections\""));
+        let json = render(&Plan::Context(op, true), reply);
+        assert!(
+            json.contains("\"sections\"") && !json.contains("# Hi"),
+            "{json}"
+        );
     }
 }

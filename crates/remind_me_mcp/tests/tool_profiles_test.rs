@@ -69,7 +69,7 @@ fn core_lists_only_the_conversational_surface() {
     assert!(!tools.iter().any(|t| t == "remind_me_import_chat"));
     assert!(!tools.iter().any(|t| t == "remind_me_consolidate"));
     assert!(
-        tools.len() < 20,
+        tools.len() <= 20,
         "core listed {} tools — the whole point is a small surface",
         tools.len()
     );
