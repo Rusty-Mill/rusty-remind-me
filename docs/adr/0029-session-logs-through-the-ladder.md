@@ -55,8 +55,10 @@ match almost any query, alongside the facts drawn from them.
    `CLAUDE_CODE_REMOTE=true`, the opt-in `REMIND_ME_CLOUD_CAPTURE=1`,
    `REMIND_ME_URL` and `REMIND_ME_TOKEN` are set. Server write-time redaction
    does not stop a secret leaving the container, so the hook scrubs first:
-   thinking blocks are dropped and every string is redacted with the server's
-   secret shapes, bearer values and the token itself. It sends over https only,
+   thinking blocks are dropped, fields named like secrets are withheld (also
+   inside JSON carried in strings), and every string is redacted with the
+   server's secret shapes, quoted key-value pairs, bearer values and the token
+   itself. It sends over https only,
    follows no redirects, bounds what it reads, and shares one deadline inside
    the hook timeout. Stop is throttled to once a minute after a successful
    capture and skipped when re-entrant; it always exits 0 and logs only a
