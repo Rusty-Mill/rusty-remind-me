@@ -307,6 +307,18 @@ pub fn is_captured(store: &Store<'_>, session_id: &str) -> Result<bool> {
     Ok(existing_dialog(store, session_id)?.is_some())
 }
 
+/// How many messages `session_id`'s capture holds, or `None` when it has
+/// none. A capture written before the count was recorded reads as `0`.
+pub fn captured_messages(store: &Store<'_>, session_id: &str) -> Result<Option<usize>> {
+    Ok(existing_dialog(store, session_id)?.map(|dialog| {
+        dialog
+            .metadata
+            .get("messages")
+            .and_then(serde_json::Value::as_u64)
+            .map_or(0, |n| n as usize)
+    }))
+}
+
 /// The dialog half already captured for `session_id`, if any.
 fn existing_dialog(store: &Store<'_>, session_id: &str) -> Result<Option<crate::models::Memory>> {
     Ok(crate::episodes::session_memories(store, session_id)?

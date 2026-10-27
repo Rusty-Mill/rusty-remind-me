@@ -582,3 +582,142 @@ fn a_connector_that_is_not_a_file_parser_says_so() {
         );
     }
 }
+
+// --- Claude Code sessions ----------------------------------------------------
+
+/// One transcript line in Claude Code's envelope.
+fn turn(session: &str, role: &str, text: &str) -> String {
+    format!(
+        "{}\n",
+        serde_json::json!({"type": role, "sessionId": session,
+            "message": {"role": role, "content": text}})
+    )
+}
+
+/// Backdate `path` past any idle period, as a session finished an hour ago.
+fn settle(path: &std::path::Path) {
+    filetime_set(
+        path,
+        std::time::SystemTime::now() - std::time::Duration::from_secs(3_600),
+    );
+}
+
+fn sessions_watcher(dir: &std::path::Path) -> Watcher {
+    Watcher::new(vec![dir.to_path_buf()], Vec::new())
+        .with_sessions()
+        .with_grace(0)
+        .with_idle(600)
+}
+
+fn captured(store: &Store<'_>, session: &str) -> Option<usize> {
+    remind_me_core::transcript::captured_messages(store, session).unwrap()
+}
+
+#[test]
+fn older_sessions_are_captured_on_the_first_scan_and_subagents_are_not() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let dir = scratch("sessions_backlog");
+    let one = write(
+        &dir,
+        "proj/s-one.jsonl",
+        &turn("s-one", "user", "first ask"),
+    );
+    let sub = write(
+        &dir,
+        "proj/s-one/subagents/a.jsonl",
+        &turn("s-sub", "user", "sub"),
+    );
+    let stray = write(
+        &dir,
+        "top.jsonl",
+        &turn("s-top", "user", "not in a project"),
+    );
+    for path in [&one, &sub, &stray] {
+        settle(path);
+    }
+    let mut w = sessions_watcher(&dir);
+
+    let counts = w.scan_once(&store);
+
+    assert_eq!(counts.ingested, 1);
+    assert_eq!(captured(&store, "s-one"), Some(1));
+    assert_eq!(captured(&store, "s-sub"), None);
+    assert_eq!(captured(&store, "s-top"), None);
+    assert_eq!(w.scan_once(&store), ScanCounts::default());
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_session_written_to_within_the_idle_period_waits() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let dir = scratch("sessions_idle");
+    let path = write(
+        &dir,
+        "proj/s-live.jsonl",
+        &turn("s-live", "user", "still going"),
+    );
+    let mut w = sessions_watcher(&dir);
+
+    // Unchanged across scans is not enough: a paused session is still live.
+    assert_eq!(w.scan_once(&store).debounced, 1);
+    assert_eq!(w.scan_once(&store).debounced, 1);
+    assert_eq!(captured(&store, "s-live"), None);
+
+    settle(&path);
+    assert_eq!(w.scan_once(&store).ingested, 1);
+    assert_eq!(captured(&store, "s-live"), Some(1));
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_session_that_grows_is_refreshed_in_place_not_duplicated() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let dir = scratch("sessions_grow");
+    let first = turn("s-grow", "user", "ask");
+    let path = write(&dir, "proj/s-grow.jsonl", &first);
+    settle(&path);
+    let mut w = sessions_watcher(&dir);
+    assert_eq!(w.scan_once(&store).ingested, 1);
+    let before = live_memories(&store).len();
+
+    let longer = format!("{first}{}", turn("s-grow", "assistant", "answer"));
+    write(&dir, "proj/s-grow.jsonl", &longer);
+    settle(&path);
+    assert_eq!(w.scan_once(&store).ingested, 1);
+
+    assert_eq!(captured(&store, "s-grow"), Some(2));
+    assert_eq!(live_memories(&store).len(), before);
+    assert!(live_memories(&store).iter().any(|m| m.contains("answer")));
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_session_the_hook_already_captured_is_left_alone() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let dir = scratch("sessions_hook");
+    let raw = format!(
+        "{}{}",
+        turn("s-hook", "user", "ask"),
+        turn("s-hook", "assistant", "reply")
+    );
+    let path = write(&dir, "proj/s-hook.jsonl", &raw);
+    remind_me_core::session_ops::capture_transcript(&store, &path, "s-hook", None, Some("end"))
+        .unwrap();
+    settle(&path);
+    let before = live_memories(&store);
+    let mut w = sessions_watcher(&dir);
+
+    let counts = w.scan_once(&store);
+
+    assert_eq!((counts.ingested, counts.skipped), (0, 1));
+    assert_eq!(live_memories(&store), before);
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}

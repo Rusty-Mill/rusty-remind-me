@@ -117,11 +117,79 @@ enum Backfill {
 }
 
 fn backfill(store: &Store<'_>, path: &Path) -> Result<Backfill> {
+    let Some(session) = read_session(path)? else {
+        return Ok(Backfill::Empty);
+    };
+    if transcript::is_captured(store, &session.id)? {
+        return Ok(Backfill::Skipped);
+    }
+    session.capture(store, "backfill")?;
+    Ok(Backfill::Imported)
+}
+
+/// What [`sync_session`] did with one transcript file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionSync {
+    /// The session had no capture; one was written.
+    Captured,
+    /// The file holds more messages than the capture; it was refreshed.
+    Refreshed,
+    /// The capture already holds at least this many messages, which is the
+    /// usual case once the hook has run.
+    Unchanged,
+    /// The transcript has no messages.
+    Empty,
+}
+
+/// Capture, or refresh, the session in the Claude Code transcript at
+/// `path`: what the folder watcher runs for a settled session file.
+///
+/// Converges on the hook's capture rather than beside it: both are keyed by
+/// the session id, so a session the hook already saved at this length is
+/// left alone, and one that grew past it is refreshed in place. A first
+/// capture is stamped only with where the transcript says it ran, as a
+/// backfill is.
+pub fn sync_session(store: &Store<'_>, path: &Path) -> Result<SessionSync> {
+    let Some(session) = read_session(path)? else {
+        return Ok(SessionSync::Empty);
+    };
+    let outcome = match transcript::captured_messages(store, &session.id)? {
+        Some(held) if held >= session.parsed.messages => return Ok(SessionSync::Unchanged),
+        Some(_) => SessionSync::Refreshed,
+        None => SessionSync::Captured,
+    };
+    session.capture(store, "watch")?;
+    Ok(outcome)
+}
+
+/// A transcript file read and parsed, with the session id it is keyed by.
+struct SessionFile {
+    id: String,
+    raw: String,
+    parsed: transcript::TranscriptSummary,
+}
+
+impl SessionFile {
+    fn capture(&self, store: &Store<'_>, reason: &str) -> Result<()> {
+        let context = transcript_context(&self.parsed);
+        let request = TranscriptRequest {
+            session_id: &self.id,
+            cwd: None,
+            reason: Some(reason),
+            context: Some(&context),
+        };
+        transcript::capture_transcript(store, &self.raw, &request)?;
+        Ok(())
+    }
+}
+
+/// The session at `path`, or `None` when its transcript has no messages.
+fn read_session(path: &Path) -> Result<Option<SessionFile>> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| StoreError::Invalid(format!("cannot read {}: {e}", path.display())))?;
     let parsed = transcript::parse(&raw);
     if parsed.messages == 0 {
-        return Ok(Backfill::Empty);
+        return Ok(None);
     }
     let stem = path
         .file_stem()
@@ -129,24 +197,13 @@ fn backfill(store: &Store<'_>, path: &Path) -> Result<Backfill> {
         .unwrap_or_default();
     // Trimmed once, here, as the capture trims it: the lookup and the
     // capture must agree on the key, or a padded id overwrites the hook's.
-    let session_id = parsed
+    let id = parsed
         .session_id
         .as_deref()
         .unwrap_or(stem)
         .trim()
         .to_string();
-    if transcript::is_captured(store, &session_id)? {
-        return Ok(Backfill::Skipped);
-    }
-    let context = transcript_context(&parsed);
-    let request = TranscriptRequest {
-        session_id: &session_id,
-        cwd: None,
-        reason: Some("backfill"),
-        context: Some(&context),
-    };
-    transcript::capture_transcript(store, &raw, &request)?;
-    Ok(Backfill::Imported)
+    Ok(Some(SessionFile { id, raw, parsed }))
 }
 
 /// Where a transcript says its session ran, and nothing else: its cwd and
@@ -173,7 +230,7 @@ fn last_segment(path: &str) -> Option<String> {
 
 /// `dir/*/*.jsonl`, sorted: one folder per project, one file per session.
 /// Deeper files (a session's subagent transcripts) are not sessions.
-fn session_files(dir: &Path) -> Result<Vec<std::path::PathBuf>> {
+pub(crate) fn session_files(dir: &Path) -> Result<Vec<std::path::PathBuf>> {
     let read = |d: &Path| {
         std::fs::read_dir(d)
             .map_err(|e| StoreError::Invalid(format!("cannot read {}: {e}", d.display())))
