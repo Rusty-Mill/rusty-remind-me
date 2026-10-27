@@ -12,8 +12,10 @@ twice; `--check` reports drift without writing.
 
 HOME is refused untouched when a path the installer would use is a symlink or
 not a regular file, or when its settings are not the shape Claude Code reads.
-Files are staged beside their destination and replaced atomically; if the
-second replacement fails, the first is put back.
+These checks run before any access and again before publishing; they do not
+guard against directories changed concurrently. Files are staged beside their
+destination with recovery copies of the originals and replaced atomically; if
+the second replacement fails, the first is put back.
 
 Usage: install_cloud_capture.py [--check] [--home DIR] [--source HOOK]
 """
@@ -72,8 +74,20 @@ def validate(settings: dict[str, Any]) -> None:
         for group in groups:
             if not isinstance(group, dict) or not isinstance(group.get('hooks'), list):
                 raise InstallError(f'settings.json hooks.{event} has a group without a "hooks" list')
-            if not all(isinstance(hook, dict) for hook in group['hooks']):
-                raise InstallError(f'settings.json hooks.{event} has a hook that is not an object')
+            for hook in group['hooks']:
+                if not valid_handler(hook):
+                    raise InstallError(f'settings.json hooks.{event} has a malformed hook: {hook!r}')
+
+
+def valid_handler(hook: Any) -> bool:
+    """A handler with a type; a command handler also needs its command and a numeric timeout."""
+    if not isinstance(hook, dict) or not isinstance(hook.get('type'), str) or not hook['type']:
+        return False
+    timeout = hook.get('timeout', 1)
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
+        return False
+    command = hook.get('command')
+    return hook['type'] != 'command' or (isinstance(command, str) and bool(command.strip()))
 
 
 def registered(groups: list[dict[str, Any]]) -> bool:
@@ -175,33 +189,64 @@ def stage(change: Change) -> pathlib.Path:
 
 
 def publish(home: pathlib.Path, changes: list[Change]) -> None:
-    """Replace every file atomically, putting earlier ones back if a later one fails."""
+    """Replace every file atomically; if one fails, put back those already replaced.
+
+    A recovery copy of each file being replaced is written beside it before
+    anything is replaced, so rolling back needs no new write. If a rollback
+    step still fails, the error names the recovery copy left in place.
+    """
     for change in changes:
         change.path.parent.mkdir(parents=True, exist_ok=True)
     paths(home)  # nothing became a symlink while directories were made
-    originals = {c.path: c.path.read_bytes() if c.path.exists() else None for c in changes}
+    backups: dict[pathlib.Path, pathlib.Path | None] = {}
     staged: dict[pathlib.Path, pathlib.Path] = {}
-    done: list[Change] = []
     try:
         for change in changes:
+            original = change.path.read_bytes() if change.path.exists() else None
+            backups[change.path] = None if original is None else stage(
+                Change(change.path, original, change.mode))
             staged[change.path] = stage(change)
+    except BaseException:
+        discard([*staged.values(), *filter(None, backups.values())])
+        raise
+    done: list[pathlib.Path] = []
+    try:
         for change in changes:
             os.replace(staged[change.path], change.path)
             del staged[change.path]
-            done.append(change)
-    except BaseException:
-        for leftover in staged.values():
-            leftover.unlink(missing_ok=True)
-        for change in reversed(done):
-            restore(change, originals[change.path])
+            done.append(change.path)
+    except BaseException as failure:
+        stranded = rollback(done, backups)
+        discard([*staged.values(), *(b for p, b in backups.items() if b and p not in done)])
+        if stranded:
+            raise InstallError(f'{failure}; rollback incomplete: {"; ".join(stranded)}') from failure
         raise
+    discard(list(filter(None, backups.values())))
 
 
-def restore(change: Change, original: bytes | None) -> None:
-    if original is None:
-        change.path.unlink(missing_ok=True)
-        return
-    os.replace(stage(Change(change.path, original, change.mode)), change.path)
+def rollback(done: list[pathlib.Path], backups: dict[pathlib.Path, pathlib.Path | None]) -> list[str]:
+    """Put back every replaced file, newest first; describe each step that failed."""
+    stranded = []
+    for path in reversed(done):
+        backup = backups[path]
+        try:
+            if backup is None:
+                path.unlink(missing_ok=True)
+            else:
+                os.replace(backup, path)
+        except OSError as e:
+            stranded.append(f'{path} could not be removed ({e})' if backup is None
+                            else f'{path} not restored ({e}); its original is kept at {backup}')
+    return stranded
+
+
+def discard(temporaries: list[pathlib.Path]) -> None:
+    """Remove staged or recovery files that are no longer needed, warning on any left behind."""
+    for path in temporaries:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as e:
+            print(f'warning: could not remove {path}: {e}', file=sys.stderr)
 
 
 def main(argv: list[str]) -> int:
