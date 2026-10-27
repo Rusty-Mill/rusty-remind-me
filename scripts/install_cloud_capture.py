@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
-"""Install the cloud session capture hook (ADR-0029) into another repository.
+"""Install the cloud session capture hook (ADR-0029) in a user's Claude settings.
 
-Cloud Claude Code sessions load hooks only from the checked-out repository's
-`.claude/settings.json`, so each repository whose sessions should reach
-remind-me needs its own copy. This copies `.claude/hooks/remind-me-capture.py`
-from this monorepo into TARGET and registers it on Stop and PreCompact,
-keeping everything else in TARGET's settings. Re-running it updates the copy
-and repairs the registration without adding it twice; `--check` reports drift
-without writing.
+A cloud session that checks out several repositories starts above them, in
+`/home/user`, so no repository's `.claude/settings.json` is loaded and a hook
+committed there never runs. Installing at user level covers every session of
+an environment: its setup script runs this once per container. It copies
+`remind-me-capture.py` into `~/.claude/hooks/` and registers it on Stop and
+PreCompact in `~/.claude/settings.json`, keeping everything else there.
+Re-running it updates the copy and repairs the registration without adding it
+twice; `--check` reports drift without writing.
 
-TARGET is refused untouched when a path the installer would use is a symlink
-or not a regular file, or when its settings are not the shape Claude Code
-reads. Files are staged beside their destination and replaced atomically; if
-the second replacement fails, the first is put back.
+HOME is refused untouched when a path the installer would use is a symlink or
+not a regular file, or when its settings are not the shape Claude Code reads.
+Files are staged beside their destination and replaced atomically; if the
+second replacement fails, the first is put back.
 
-Usage: install_cloud_capture.py [--check] TARGET
+Usage: install_cloud_capture.py [--check] [--home DIR] [--source HOOK]
 """
 from __future__ import annotations
 
@@ -30,8 +31,10 @@ from dataclasses import dataclass
 from typing import Any
 
 HOOK_NAME = 'remind-me-capture.py'
-SOURCE = pathlib.Path(__file__).resolve().parents[4] / '.claude' / 'hooks' / HOOK_NAME
-COMMAND = f'python3 "$CLAUDE_PROJECT_DIR"/.claude/hooks/{HOOK_NAME}'
+HERE = pathlib.Path(__file__).resolve()
+# This checkout's copy; a downloaded installer passes --source instead.
+SOURCE = HERE.parents[4] / '.claude' / 'hooks' / HOOK_NAME if len(HERE.parents) > 4 else None
+COMMAND = f'python3 "$HOME"/.claude/hooks/{HOOK_NAME}'
 EVENTS = ('Stop', 'PreCompact')
 TIMEOUT_SECONDS = 30
 HOOK_ENTRY = {'type': 'command', 'command': COMMAND, 'timeout': TIMEOUT_SECONDS}
@@ -40,7 +43,7 @@ NEW_FILE_MODE = 0o644
 
 
 class InstallError(Exception):
-    """TARGET cannot be installed into as it stands."""
+    """HOME cannot be installed into as it stands."""
 
 
 @dataclass(frozen=True)
@@ -109,11 +112,11 @@ def checked(path: pathlib.Path) -> pathlib.Path:
     return path
 
 
-def paths(target: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
-    """The hook and settings paths in TARGET, every component checked."""
-    if not (target / '.git').exists():
-        raise InstallError(f'{target} is not a git repository root')
-    claude = checked(target / '.claude')
+def paths(home: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
+    """The hook and settings paths under HOME, every component checked."""
+    if not home.is_dir():
+        raise InstallError(f'{home} is not a directory')
+    claude = checked(home / '.claude')
     hooks_dir = checked(claude / 'hooks')
     hook, settings = checked(hooks_dir / HOOK_NAME), checked(claude / 'settings.json')
     for path in (hook, settings):
@@ -138,15 +141,17 @@ def mode_of(path: pathlib.Path, default: int) -> int:
     return stat.S_IMODE(path.stat().st_mode) if path.exists() else default
 
 
-def plan(target: pathlib.Path) -> list[Change]:
-    """The files TARGET needs written, in publication order."""
-    hook, settings_path = paths(target)
-    source = SOURCE.read_bytes()
+def plan(home: pathlib.Path, source_path: pathlib.Path) -> list[Change]:
+    """The files HOME needs written, in publication order."""
+    hook, settings_path = paths(home)
+    if not source_path.is_file():
+        raise InstallError(f'{source_path} is not a file')
+    source = source_path.read_bytes()
     current = read_settings(settings_path)
     wanted = merged(copy.deepcopy(current))
     changes = []
     if not hook.exists() or hook.read_bytes() != source:
-        changes.append(Change(hook, source, mode_of(hook, mode_of(SOURCE, NEW_FILE_MODE))))
+        changes.append(Change(hook, source, mode_of(hook, mode_of(source_path, NEW_FILE_MODE))))
     if wanted != current:
         text = json.dumps(wanted, indent=2) + '\n'
         changes.append(Change(settings_path, text.encode('utf-8'), mode_of(settings_path, NEW_FILE_MODE)))
@@ -169,11 +174,11 @@ def stage(change: Change) -> pathlib.Path:
     return staged
 
 
-def publish(target: pathlib.Path, changes: list[Change]) -> None:
+def publish(home: pathlib.Path, changes: list[Change]) -> None:
     """Replace every file atomically, putting earlier ones back if a later one fails."""
     for change in changes:
         change.path.parent.mkdir(parents=True, exist_ok=True)
-    paths(target)  # nothing became a symlink while directories were made
+    paths(home)  # nothing became a symlink while directories were made
     originals = {c.path: c.path.read_bytes() if c.path.exists() else None for c in changes}
     staged: dict[pathlib.Path, pathlib.Path] = {}
     done: list[Change] = []
@@ -201,25 +206,28 @@ def restore(change: Change, original: bytes | None) -> None:
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
-    parser.add_argument('target', type=pathlib.Path, help='root of the repository to install into')
+    parser.add_argument('--home', type=pathlib.Path, default=pathlib.Path.home(),
+                        help='home directory whose .claude/ to install into (default: $HOME)')
+    parser.add_argument('--source', type=pathlib.Path, default=SOURCE, required=SOURCE is None,
+                        help='the hook to install (default: this checkout\'s copy)')
     parser.add_argument('--check', action='store_true', help='report drift, write nothing')
     args = parser.parse_args(argv)
-    target = args.target.resolve()
+    home = args.home.resolve()
     try:
-        changes = plan(target)
+        changes = plan(home, args.source)
         if not changes:
-            print(f'{target}: capture hook is current')
+            print(f'{home}: capture hook is current')
             return 0
         if not args.check:
-            publish(target, changes)
+            publish(home, changes)
     except (InstallError, OSError) as e:
         print(f'error: {e}', file=sys.stderr)
         return 2
     for change in changes:
-        print(f'{"stale" if args.check else "wrote"}: {change.path.relative_to(target)}')
+        print(f'{"stale" if args.check else "wrote"}: {change.path.relative_to(home)}')
     if args.check:
         return 1
-    print('Commit .claude/ in that repository; capture still needs the environment settings.')
+    print('Capture also needs REMIND_ME_CLOUD_CAPTURE, REMIND_ME_URL and REMIND_ME_TOKEN.')
     return 0
 
 
