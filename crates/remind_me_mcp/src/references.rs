@@ -17,7 +17,7 @@ const MARKDOWN_REFS: usize = 5;
 /// Rows the reverse lookup returns at most.
 const LOOKUP_LIMIT: usize = 100;
 /// Reference kinds, for a lookup that names a value but no kind.
-pub const KINDS: [&str; 7] = [
+pub const KINDS: [&str; 8] = [
     "url",
     "issue",
     "pull",
@@ -25,6 +25,7 @@ pub const KINDS: [&str; 7] = [
     "path",
     "handle",
     "attachment",
+    "task",
 ];
 
 fn by_memory(rows: Vec<MemoryReference>) -> BTreeMap<String, Vec<MemoryReference>> {
@@ -100,7 +101,7 @@ pub fn search_markdown_footer(store: &Store<'_>, res: &MemorySearchResponse) -> 
 pub fn tool_schema() -> Value {
     json!({
         "name": "remind_me_references",
-        "description": "Reverse lookup of what memories point at. Give `memory_id` for everything one memory references, or `kind` and/or `value` for every memory that references a thing (e.g. value \"rusty_mill/x#321\", or kind \"commit\"). Kinds: url, issue, pull, commit, path, handle, attachment.",
+        "description": "Reverse lookup of what memories point at. Give `memory_id` for everything one memory references, or `kind` and/or `value` for every memory that references a thing (e.g. value \"rusty_mill/x#321\", or kind \"commit\"). Kinds: url, issue, pull, commit, path, handle, attachment, task (a rusty_tick task written `tick:<uuid>`; its value is the uuid).",
         "inputSchema": {
             "type": "object",
             "properties": {

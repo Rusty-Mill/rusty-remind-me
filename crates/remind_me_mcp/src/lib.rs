@@ -4267,6 +4267,26 @@ mod tests {
     }
 
     #[test]
+    fn search_finds_a_task_link_by_kind_or_by_its_uuid_alone() {
+        let server = McpServer::new(Database::open_in_memory().unwrap());
+        let uuid = "0b9f2c1e-4d3a-4e5f-9a6b-7c8d9e0f1a2b";
+        let id = add(&server, &format!("Blocked on tick:{uuid} landing first"));
+        add(&server, "No task here");
+
+        for lookup in [
+            json!({ "reference_kind": "task" }),
+            json!({ "reference": uuid }),
+            json!({ "reference": uuid, "reference_kind": "task" }),
+        ] {
+            let found = call(&server, "remind_me_search", lookup.clone());
+            let text = text_of(&found);
+            assert!(found.get("isError").is_none(), "{lookup}: {text}");
+            assert!(text.contains(&id), "{lookup}: {text}");
+            assert!(!text.contains("No task here"), "{lookup}: {text}");
+        }
+    }
+
+    #[test]
     fn a_window_narrows_by_what_it_applies_and_refuses_what_it_does_not() {
         let server = McpServer::new(Database::open_in_memory().unwrap());
         for (content, category, tag) in [
