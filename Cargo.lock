@@ -2898,7 +2898,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "remind_me_api"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "remind_me_core",
  "rusty_oauth",
@@ -2909,7 +2909,7 @@ dependencies = [
 
 [[package]]
 name = "remind_me_core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aws-config",
  "aws-sdk-s3",
@@ -2948,7 +2948,7 @@ dependencies = [
 
 [[package]]
 name = "remind_me_hub"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "chrono",
  "postgres",
@@ -2963,7 +2963,7 @@ dependencies = [
 
 [[package]]
 name = "remind_me_mcp"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "remind_me_core",
  "rusty_json",
@@ -2972,7 +2972,7 @@ dependencies = [
 
 [[package]]
 name = "remind_me_remote"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "remind_me_core",
  "remind_me_mcp",
@@ -3280,7 +3280,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "rusty-remind-me"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "dirs",
  "remind_me_api",

@@ -2,6 +2,18 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-10-28 — 0.4.1: released from this repository again
+
+### Changed
+- rusty-remind-me is developed and released here again, not in the `Rusty-Mill/rusty_mill` monorepo. The history is kept: the monorepo-era commits were split out of `crates/apps/rusty_remind_me` and joined to this repository's own (#340).
+- The plugin marketplace is at this repository's root again, so `rusty-remind-me@rusty-remind-me` installs update from here. Release tags are bare `vX.Y.Z` again.
+- The monorepo crates it uses (`rusty_mcp_server`, `rusty_tokio`, …) are git dependencies pinned to rusty_mill's `libs-2026.10.0` tag.
+- The cloud capture installer now always needs `--source`, because the hook stays in rusty_mill.
+- No behaviour change: the code is the same as 0.4.0.
+
+### Tests
+- `cargo test --workspace` passes in the standalone layout (2,478 tests). CI ran the jobs ported from rusty_mill, including Windows.
+
 ## 2026-10-09 — The remote connector no longer uses `rmcp`
 
 ### Changed
