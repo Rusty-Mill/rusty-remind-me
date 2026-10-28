@@ -2549,7 +2549,7 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 [[package]]
 name = "platform"
 version = "0.29.0"
-source = "git+https://github.com/Rusty-Mill/rusty_mill?rev=eff5a5dd6da2dea52d5e78964d4ea53a80498508#eff5a5dd6da2dea52d5e78964d4ea53a80498508"
+source = "git+https://github.com/Rusty-Mill/rusty_mill?tag=libs-2026.10.0#4e04d59196cc016d7d34d246207c1d05d36e39f4"
 dependencies = [
  "thiserror 1.0.69",
 ]
@@ -2557,7 +2557,7 @@ dependencies = [
 [[package]]
 name = "platform-bsd"
 version = "0.29.0"
-source = "git+https://github.com/Rusty-Mill/rusty_mill?rev=eff5a5dd6da2dea52d5e78964d4ea53a80498508#eff5a5dd6da2dea52d5e78964d4ea53a80498508"
+source = "git+https://github.com/Rusty-Mill/rusty_mill?tag=libs-2026.10.0#4e04d59196cc016d7d34d246207c1d05d36e39f4"
 dependencies = [
  "libc",
  "platform",
@@ -2567,7 +2567,7 @@ dependencies = [
 [[package]]
 name = "platform-linux"
 version = "0.29.0"
-source = "git+https://github.com/Rusty-Mill/rusty_mill?rev=eff5a5dd6da2dea52d5e78964d4ea53a80498508#eff5a5dd6da2dea52d5e78964d4ea53a80498508"
+source = "git+https://github.com/Rusty-Mill/rusty_mill?tag=libs-2026.10.0#4e04d59196cc016d7d34d246207c1d05d36e39f4"
 dependencies = [
  "libc",
  "platform",
@@ -2578,7 +2578,7 @@ dependencies = [
 [[package]]
 name = "platform-windows"
 version = "0.29.0"
-source = "git+https://github.com/Rusty-Mill/rusty_mill?rev=eff5a5dd6da2dea52d5e78964d4ea53a80498508#eff5a5dd6da2dea52d5e78964d4ea53a80498508"
+source = "git+https://github.com/Rusty-Mill/rusty_mill?tag=libs-2026.10.0#4e04d59196cc016d7d34d246207c1d05d36e39f4"
 dependencies = [
  "platform",
  "winargv",
@@ -3294,12 +3294,12 @@ dependencies = [
 [[package]]
 name = "rusty_atomic_file"
 version = "0.1.0"
-source = "git+https://github.com/Rusty-Mill/rusty_mill?rev=eff5a5dd6da2dea52d5e78964d4ea53a80498508#eff5a5dd6da2dea52d5e78964d4ea53a80498508"
+source = "git+https://github.com/Rusty-Mill/rusty_mill?tag=libs-2026.10.0#4e04d59196cc016d7d34d246207c1d05d36e39f4"
 
 [[package]]
 name = "rusty_axum"
 version = "0.1.0"
-source = "git+https://github.com/Rusty-Mill/rusty_mill?rev=eff5a5dd6da2dea52d5e78964d4ea53a80498508#eff5a5dd6da2dea52d5e78964d4ea53a80498508"
+source = "git+https://github.com/Rusty-Mill/rusty_mill?tag=libs-2026.10.0#4e04d59196cc016d7d34d246207c1d05d36e39f4"
 dependencies = [
  "futures-core",
  "rusty_http",
@@ -3313,12 +3313,12 @@ dependencies = [
 [[package]]
 name = "rusty_base64"
 version = "0.1.0"
-source = "git+https://github.com/Rusty-Mill/rusty_mill?rev=eff5a5dd6da2dea52d5e78964d4ea53a80498508#eff5a5dd6da2dea52d5e78964d4ea53a80498508"
+source = "git+https://github.com/Rusty-Mill/rusty_mill?tag=libs-2026.10.0#4e04d59196cc016d7d34d246207c1d05d36e39f4"
 
 [[package]]
 name = "rusty_crypto_key"
 version = "0.1.0"
-source = "git+https://github.com/Rusty-Mill/rusty_mill?rev=eff5a5dd6da2dea52d5e78964d4ea53a80498508#eff5a5dd6da2dea52d5e78964d4ea53a80498508"
+source = "git+https://github.com/Rusty-Mill/rusty_mill?tag=libs-2026.10.0#4e04d59196cc016d7d34d246207c1d05d36e39f4"
 dependencies = [
  "rusty_atomic_file",
 ]
@@ -3326,12 +3326,12 @@ dependencies = [
 [[package]]
 name = "rusty_hex"
 version = "0.1.0"
-source = "git+https://github.com/Rusty-Mill/rusty_mill?rev=eff5a5dd6da2dea52d5e78964d4ea53a80498508#eff5a5dd6da2dea52d5e78964d4ea53a80498508"
+source = "git+https://github.com/Rusty-Mill/rusty_mill?tag=libs-2026.10.0#4e04d59196cc016d7d34d246207c1d05d36e39f4"
 
 [[package]]
 name = "rusty_http"
 version = "0.1.0"
-source = "git+https://github.com/Rusty-Mill/rusty_mill?rev=eff5a5dd6da2dea52d5e78964d4ea53a80498508#eff5a5dd6da2dea52d5e78964d4ea53a80498508"
+source = "git+https://github.com/Rusty-Mill/rusty_mill?tag=libs-2026.10.0#4e04d59196cc016d7d34d246207c1d05d36e39f4"
 dependencies = [
  "rusty_percent",
  "rusty_retry",
@@ -3341,7 +3341,7 @@ dependencies = [
 [[package]]
 name = "rusty_json"
 version = "0.1.0"
-source = "git+https://github.com/Rusty-Mill/rusty_mill?rev=eff5a5dd6da2dea52d5e78964d4ea53a80498508#eff5a5dd6da2dea52d5e78964d4ea53a80498508"
+source = "git+https://github.com/Rusty-Mill/rusty_mill?tag=libs-2026.10.0#4e04d59196cc016d7d34d246207c1d05d36e39f4"
 dependencies = [
  "serde",
 ]
@@ -3349,12 +3349,12 @@ dependencies = [
 [[package]]
 name = "rusty_libc"
 version = "0.0.1"
-source = "git+https://github.com/Rusty-Mill/rusty_mill?rev=eff5a5dd6da2dea52d5e78964d4ea53a80498508#eff5a5dd6da2dea52d5e78964d4ea53a80498508"
+source = "git+https://github.com/Rusty-Mill/rusty_mill?tag=libs-2026.10.0#4e04d59196cc016d7d34d246207c1d05d36e39f4"
 
 [[package]]
 name = "rusty_mcp_proto"
 version = "0.1.0"
-source = "git+https://github.com/Rusty-Mill/rusty_mill?rev=eff5a5dd6da2dea52d5e78964d4ea53a80498508#eff5a5dd6da2dea52d5e78964d4ea53a80498508"
+source = "git+https://github.com/Rusty-Mill/rusty_mill?tag=libs-2026.10.0#4e04d59196cc016d7d34d246207c1d05d36e39f4"
 dependencies = [
  "rusty_json",
 ]
@@ -3362,7 +3362,7 @@ dependencies = [
 [[package]]
 name = "rusty_mcp_server"
 version = "0.1.0"
-source = "git+https://github.com/Rusty-Mill/rusty_mill?rev=eff5a5dd6da2dea52d5e78964d4ea53a80498508#eff5a5dd6da2dea52d5e78964d4ea53a80498508"
+source = "git+https://github.com/Rusty-Mill/rusty_mill?tag=libs-2026.10.0#4e04d59196cc016d7d34d246207c1d05d36e39f4"
 dependencies = [
  "rusty_axum",
  "rusty_base64",
@@ -3378,7 +3378,7 @@ dependencies = [
 [[package]]
 name = "rusty_multimodal_db_engine"
 version = "0.2.0"
-source = "git+https://github.com/Rusty-Mill/rusty_mill?rev=eff5a5dd6da2dea52d5e78964d4ea53a80498508#eff5a5dd6da2dea52d5e78964d4ea53a80498508"
+source = "git+https://github.com/Rusty-Mill/rusty_mill?tag=libs-2026.10.0#4e04d59196cc016d7d34d246207c1d05d36e39f4"
 dependencies = [
  "bincode",
  "memmap2",
@@ -3390,7 +3390,7 @@ dependencies = [
 [[package]]
 name = "rusty_oauth"
 version = "0.1.0"
-source = "git+https://github.com/Rusty-Mill/rusty_mill?rev=eff5a5dd6da2dea52d5e78964d4ea53a80498508#eff5a5dd6da2dea52d5e78964d4ea53a80498508"
+source = "git+https://github.com/Rusty-Mill/rusty_mill?tag=libs-2026.10.0#4e04d59196cc016d7d34d246207c1d05d36e39f4"
 dependencies = [
  "rusty_base64",
  "rusty_crypto_key",
@@ -3402,7 +3402,7 @@ dependencies = [
 [[package]]
 name = "rusty_oauth_server"
 version = "0.1.0"
-source = "git+https://github.com/Rusty-Mill/rusty_mill?rev=eff5a5dd6da2dea52d5e78964d4ea53a80498508#eff5a5dd6da2dea52d5e78964d4ea53a80498508"
+source = "git+https://github.com/Rusty-Mill/rusty_mill?tag=libs-2026.10.0#4e04d59196cc016d7d34d246207c1d05d36e39f4"
 dependencies = [
  "rusty_atomic_file",
  "rusty_hex",
@@ -3416,12 +3416,12 @@ dependencies = [
 [[package]]
 name = "rusty_percent"
 version = "0.1.0"
-source = "git+https://github.com/Rusty-Mill/rusty_mill?rev=eff5a5dd6da2dea52d5e78964d4ea53a80498508#eff5a5dd6da2dea52d5e78964d4ea53a80498508"
+source = "git+https://github.com/Rusty-Mill/rusty_mill?tag=libs-2026.10.0#4e04d59196cc016d7d34d246207c1d05d36e39f4"
 
 [[package]]
 name = "rusty_rand"
 version = "0.1.0"
-source = "git+https://github.com/Rusty-Mill/rusty_mill?rev=eff5a5dd6da2dea52d5e78964d4ea53a80498508#eff5a5dd6da2dea52d5e78964d4ea53a80498508"
+source = "git+https://github.com/Rusty-Mill/rusty_mill?tag=libs-2026.10.0#4e04d59196cc016d7d34d246207c1d05d36e39f4"
 dependencies = [
  "rusty_libc",
 ]
@@ -3429,17 +3429,17 @@ dependencies = [
 [[package]]
 name = "rusty_retry"
 version = "0.1.0"
-source = "git+https://github.com/Rusty-Mill/rusty_mill?rev=eff5a5dd6da2dea52d5e78964d4ea53a80498508#eff5a5dd6da2dea52d5e78964d4ea53a80498508"
+source = "git+https://github.com/Rusty-Mill/rusty_mill?tag=libs-2026.10.0#4e04d59196cc016d7d34d246207c1d05d36e39f4"
 
 [[package]]
 name = "rusty_rsa"
 version = "0.1.0"
-source = "git+https://github.com/Rusty-Mill/rusty_mill?rev=eff5a5dd6da2dea52d5e78964d4ea53a80498508#eff5a5dd6da2dea52d5e78964d4ea53a80498508"
+source = "git+https://github.com/Rusty-Mill/rusty_mill?tag=libs-2026.10.0#4e04d59196cc016d7d34d246207c1d05d36e39f4"
 
 [[package]]
 name = "rusty_serve"
 version = "0.1.0"
-source = "git+https://github.com/Rusty-Mill/rusty_mill?rev=eff5a5dd6da2dea52d5e78964d4ea53a80498508#eff5a5dd6da2dea52d5e78964d4ea53a80498508"
+source = "git+https://github.com/Rusty-Mill/rusty_mill?tag=libs-2026.10.0#4e04d59196cc016d7d34d246207c1d05d36e39f4"
 dependencies = [
  "rusty_http",
 ]
@@ -3447,12 +3447,12 @@ dependencies = [
 [[package]]
 name = "rusty_time"
 version = "0.1.0"
-source = "git+https://github.com/Rusty-Mill/rusty_mill?rev=eff5a5dd6da2dea52d5e78964d4ea53a80498508#eff5a5dd6da2dea52d5e78964d4ea53a80498508"
+source = "git+https://github.com/Rusty-Mill/rusty_mill?tag=libs-2026.10.0#4e04d59196cc016d7d34d246207c1d05d36e39f4"
 
 [[package]]
 name = "rusty_tls"
 version = "0.14.0"
-source = "git+https://github.com/Rusty-Mill/rusty_mill?rev=eff5a5dd6da2dea52d5e78964d4ea53a80498508#eff5a5dd6da2dea52d5e78964d4ea53a80498508"
+source = "git+https://github.com/Rusty-Mill/rusty_mill?tag=libs-2026.10.0#4e04d59196cc016d7d34d246207c1d05d36e39f4"
 dependencies = [
  "platform",
  "platform-bsd",
@@ -3465,7 +3465,7 @@ dependencies = [
 [[package]]
 name = "rusty_tokio"
 version = "0.2.1"
-source = "git+https://github.com/Rusty-Mill/rusty_mill?rev=eff5a5dd6da2dea52d5e78964d4ea53a80498508#eff5a5dd6da2dea52d5e78964d4ea53a80498508"
+source = "git+https://github.com/Rusty-Mill/rusty_mill?tag=libs-2026.10.0#4e04d59196cc016d7d34d246207c1d05d36e39f4"
 dependencies = [
  "crossbeam-deque",
  "libc",
@@ -3480,7 +3480,7 @@ dependencies = [
 [[package]]
 name = "rusty_tokio-macros"
 version = "0.1.0"
-source = "git+https://github.com/Rusty-Mill/rusty_mill?rev=eff5a5dd6da2dea52d5e78964d4ea53a80498508#eff5a5dd6da2dea52d5e78964d4ea53a80498508"
+source = "git+https://github.com/Rusty-Mill/rusty_mill?tag=libs-2026.10.0#4e04d59196cc016d7d34d246207c1d05d36e39f4"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3490,7 +3490,7 @@ dependencies = [
 [[package]]
 name = "rusty_url"
 version = "0.1.0"
-source = "git+https://github.com/Rusty-Mill/rusty_mill?rev=eff5a5dd6da2dea52d5e78964d4ea53a80498508#eff5a5dd6da2dea52d5e78964d4ea53a80498508"
+source = "git+https://github.com/Rusty-Mill/rusty_mill?tag=libs-2026.10.0#4e04d59196cc016d7d34d246207c1d05d36e39f4"
 dependencies = [
  "idna",
 ]
@@ -4660,7 +4660,7 @@ dependencies = [
 [[package]]
 name = "winargv"
 version = "0.1.0"
-source = "git+https://github.com/Rusty-Mill/rusty_mill?rev=eff5a5dd6da2dea52d5e78964d4ea53a80498508#eff5a5dd6da2dea52d5e78964d4ea53a80498508"
+source = "git+https://github.com/Rusty-Mill/rusty_mill?tag=libs-2026.10.0#4e04d59196cc016d7d34d246207c1d05d36e39f4"
 dependencies = [
  "platform",
 ]
