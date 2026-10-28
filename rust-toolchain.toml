@@ -1,0 +1,7 @@
+# Single toolchain pin for local work (ADR-0009). Workflows pin the same
+# channel in `RUST_TOOLCHAIN`; test_ci_workflow fails if the two disagree.
+# Bump both in one PR with a full sweep.
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

@@ -1,291 +1,176 @@
 name: CI
 
+# Pre-merge CI for rusty-remind-me. The jobs are the ones rusty_mill ran for
+# this product while it lived there (crates/apps/rusty_remind_me), with their
+# feature matrix and runner choices unchanged. Monorepo crates are git
+# dependencies pinned to one libs-* tag (Cargo.toml), so a tag bump is the only
+# way a monorepo change reaches this build.
 on:
-  push:
-    branches: [main]
   pull_request:
-    branches: [main]
+  # The merge queue validates each entry on a temporary branch; required-gate
+  # must run there or the queue waits forever.
+  merge_group:
+    types: [checks_requested]
   workflow_dispatch:
+  # Daily: picks up new RustSec advisories and runner-image drift.
+  schedule:
+    - cron: "41 4 * * *"
+
+permissions:
+  contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -D warnings
-
-  # Build tuning that applies to CI only. Deliberately env vars here rather
-  # than a `[profile.*]` block in Cargo.toml: the cost being paid is specific
-  # to a runner, and putting it in Cargo.toml would silently strip debug info
-  # from every contributor's local builds to fix a problem they do not have.
-  #
-  # Incremental compilation is pure overhead on a runner. Its state is never
-  # reused across runs -- each starts from a restored dependency cache at
-  # best -- so it only writes artifacts nothing reads, while inflating
-  # `target/`, which this workflow has repeatedly run out of (see `check`'s
-  # disk-freeing and `cargo clean` steps).
+  # Pinned rather than `stable`, in step with rust-toolchain.toml and release.yml.
+  RUST_TOOLCHAIN: "1.98.1"
   CARGO_INCREMENTAL: 0
-  # `line-tables-only` rather than `0`: full debug info across this
-  # workspace's 131 integration-test binaries is a large share of both link
-  # time and `target/` size, but dropping it entirely would leave a CI panic
-  # with a backtrace and no line numbers -- and a CI log is the one place a
-  # backtrace has to be readable without attaching a debugger.
-  CARGO_PROFILE_DEV_DEBUG: line-tables-only
-  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
-  # Also cheap and toolchain-independent -- catches a version bump that
-  # updated Cargo.toml but forgot .claude-plugin/plugin.json (or vice versa)
-  # before it ever reaches the release workflow, which tags and packages
-  # both from the same PR.
-  plugin-version:
-    name: plugin.json version vs. workspace version
+  fmt:
+    name: fmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Compare .claude-plugin/plugin.json against Cargo.toml
-        run: scripts/check_plugin_version.sh
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  cargo-deny:
+    name: cargo-deny (advisories, licenses, sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2
+        with:
+          tool: cargo-deny
+      - run: cargo deny --workspace check
 
   check:
-    name: build / test / clippy / fmt
+    name: build / test / clippy (default features)
     runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install the pinned Rust toolchain
-        # rust-toolchain.toml is the source of truth for the compiler and its
-        # components, so CI and a developer's machine lint identically. Before
-        # this, CI took whatever `stable` was that day and a developer took
-        # whatever they had installed; the gap was invisible until CI failed on
-        # a lint the local toolchain did not have (#213).
-        run: rustup toolchain install
-
-      # Swatinem/rust-cache rather than actions/cache over `target/`, measured
-      # rather than assumed: on run 31951918373 the `combined-features` job
-      # spent 4m49s restoring and 6m59s saving a cache to avoid 5m44s of
-      # compilation -- 66% of its wall clock moving a cache that cost more
-      # than it saved. `windows` spent 6m40s of 16m42s the same way, and this
-      # job's own restore was a 5-second miss, which is what several multi-GB
-      # caches evicting each other against the repository's 10GB cache budget
-      # looks like.
-      #
-      # This action caches the registry and *dependency* artifacts only,
-      # pruning the workspace's own crates (rebuilt every run regardless) and
-      # stale entries. Far smaller, so far faster, and small enough that the
-      # caches here stop fighting each other.
-      #
-      # Must run after the toolchain install: the cache key includes the rustc
-      # version, which it reads from the installed toolchain.
-      - name: Cache cargo registry and dependency build output
-        uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          key: check
-
-      # Formatting first: it is the cheapest gate and needs no compilation.
-      - name: cargo fmt --check
-        run: cargo fmt --all --check
-
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
       - name: cargo build
-        run: cargo build --workspace --locked
-
+        run: cargo build --locked -p remind_me_core -p remind_me_mcp -p remind_me_api -p rusty-remind-me -p remind_me_remote -p remind_me_hub
       - name: cargo test
-        run: cargo test --workspace --locked
-
-      # --all-targets so tests and benches are linted too, not just lib/bin.
+        run: cargo test --locked -p remind_me_core -p remind_me_mcp -p remind_me_api -p rusty-remind-me -p remind_me_remote -p remind_me_hub
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo clippy --locked -p remind_me_core -p remind_me_mcp -p remind_me_api -p rusty-remind-me -p remind_me_remote -p remind_me_hub --all-targets -- -D warnings
 
-  # Optional features are off by default, so `check` above never compiles
-  # them. Without this, a feature could rot untested and only break for
-  # whoever actually enabled it.
-  #
-  # One runner per feature, in parallel, rather than the ~10 sequential steps
-  # this used to be inside `check`. The work is identical; only the wall clock
-  # changes -- from the sum of every feature's build to the slowest single one
-  # (`ann`, whose usearch C++ build dominates).
-  #
-  # This is also what removed `check`'s "Free disk space" step and its three
-  # `cargo clean` steps. All four existed because consecutive feature steps
-  # relinked every integration test binary in remind_me_core/remind_me_hub
-  # against a new feature set, and the accumulated dead binaries exhausted the
-  # runner's disk mid-link -- an ENOSPC during `ann`'s link, and an `ld` SIGBUS
-  # during `local-embed`'s. One feature per runner means nothing accumulates,
-  # so there is nothing to reclaim. If `check` ever hits ENOSPC again,
-  # restoring a disk-freeing step there is the fix: it was dropped because its
-  # cause moved, not because runners grew.
-  #
-  # `test` and `clippy` are per-feature flags rather than both running
-  # everywhere, preserving exactly what each feature was verified with before.
-  # That mapping is deliberate and load-bearing:
-  #
-  #   - `ocr`/`audio` are clippy-only because neither can do its actual job
-  #     without a model, and downloading one in CI is precisely the implicit
-  #     fetch these features are required never to perform. Everything that
-  #     *is* checkable without a model -- the feature-off refusals, the
-  #     model-configuration errors, the audio decode/resample arithmetic --
-  #     runs unconditionally in `check`.
-  #   - `ann` runs its tests because the equivalence check (that narrowing
-  #     never drops a row brute force would rank) is the whole reason the
-  #     feature is safe to enable, and it has to actually run somewhere.
-  #   - `rerank` runs its tests because they assert something a build check
-  #     cannot: that compiling the reranker in does *not* turn a search into a
-  #     model download, and that a configured-but-unloadable model still
-  #     degrades to RRF order.
-  #   - `stack-dumps` runs its tests because the feature's entire claim is that
-  #     a thread wedged in CPU-bound code still gets dumped. Only running it can
-  #     show that; a compile check would pass against a build that dumps
-  #     nothing.
-  #   - `local-embed` is clippy-only for a reason that no longer applies: per
-  #     the step comment this replaces, it was *not* because it needs a model
-  #     (it does not -- onnx_embedder_test.rs covers the graceful-degradation
-  #     paths with synthetic files) but because `cargo test` relinking every
-  #     integration test binary against rten/tokenizers exhausted the shared
-  #     runner's disk mid-link. A dedicated runner removes that constraint, so
-  #     this could become `test: true` and gain real coverage. Left as-is on
-  #     purpose: this change is about how long CI takes, and quietly widening
-  #     what is verified inside it would make a speed change and a coverage
-  #     change indistinguishable in the history.
+  # One runner per optional remind_me_core feature. Which features run tests
+  # and which are clippy-only is deliberate (models that can't be fetched in
+  # CI, runner disk) -- see the original workflow's comment before changing it.
   features:
     name: feature ${{ matrix.feature }}
     runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings
+      # This workflow strips debug info (CARGO_PROFILE_DEV_DEBUG: 0 above),
+      # but `stack-dumps`' watchdog_stack_dump_test asserts that dumped
+      # frames resolve to file:line, which needs line tables.
+      # `line-tables-only` is what this product's own CI always ran with.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
     strategy:
-      # One feature failing should not cancel the others: which *set* of
-      # features broke is the useful signal, and fail-fast reports one.
       fail-fast: false
       matrix:
         include:
-          - feature: pdf
-            test: true
-            clippy: true
-          - feature: cloud-backup
-            # The AWS SDK is a large tree, but `put_object`'s
-            # request-construction logic (bucket/key, the custom-endpoint
-            # override, region, and the SDK-error-to-string mapping) is
-            # exercised here too, not just by clippy: none of it needs a
-            # network call or a live S3-compatible server, only a client-side
-            # `SdkError` and the pure `plan_put_object` helper.
-            test: true
-            clippy: true
-          - feature: ann
-            test: true
-            clippy: false
-          - feature: ocr
-            test: false
-            clippy: true
-          - feature: audio
-            test: false
-            clippy: true
-          - feature: rerank
-            test: true
-            clippy: false
-          - feature: local-embed
-            test: false
-            clippy: true
-          - feature: stack-dumps
-            test: true
-            clippy: true
-            # The cost this feature carries and no other one here does:
-            # `rstack-self` links libunwind's ptrace API, a *system* library.
-            #
-            # liblzma-dev is not optional, and its absence is not obvious.
-            # libunwind-ptrace.so carries undefined lzma_* references; whether
-            # they resolve depends on whether the local libunwind.so happens to
-            # declare DT_NEEDED on liblzma, which differs between builds.
-            # remind_me_core's build.rs asks for -llzma explicitly so it never
-            # depends on that accident -- which means the dev package has to be
-            # here. See docs/adr/0014.
-            apt: libunwind-dev liblzma-dev
+          - { feature: pdf, test: true, clippy: true }
+          - { feature: cloud-backup, test: true, clippy: true }
+          - { feature: ann, test: true, clippy: false }
+          - { feature: ocr, test: false, clippy: true }
+          - { feature: audio, test: false, clippy: true }
+          - { feature: rerank, test: true, clippy: false }
+          - { feature: local-embed, test: false, clippy: true }
+          # rstack-self links libunwind's ptrace API; liblzma-dev is required
+          # too (remind_me_core's build.rs asks for -llzma -- its docs/adr/0014).
+          - { feature: stack-dumps, test: true, clippy: true, apt: libunwind-dev liblzma-dev }
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install the pinned Rust toolchain
-        run: rustup toolchain install
-
-      # Keyed per feature: each feature set produces different dependency
-      # artifacts, and one shared cache across all eight legs would have them
-      # overwriting each other's entries every run.
-      - name: Cache cargo registry and dependency build output
-        uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          key: feature-${{ matrix.feature }}
-
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
       - name: Install system packages this feature needs
         if: matrix.apt
         run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt }}
-
       - name: cargo test --features ${{ matrix.feature }}
         if: matrix.test
-        run: cargo test -p remind_me_core --features ${{ matrix.feature }} --locked
-
+        run: cargo test --locked -p remind_me_core --features ${{ matrix.feature }}
       - name: cargo clippy --features ${{ matrix.feature }}
         if: matrix.clippy
-        run: cargo clippy -p remind_me_core --features ${{ matrix.feature }} --all-targets --locked -- -D warnings
+        run: cargo clippy --locked -p remind_me_core --features ${{ matrix.feature }} --all-targets -- -D warnings
 
-  # Every leg above enables exactly one optional feature at a time, so a
-  # regression that only shows up when several are compiled *together* has
-  # nothing here to catch it (#279). That gap matters most for `ocr`,
-  # `rerank`, and `local-embed`: per their comments in
-  # `crates/remind_me_core/Cargo.toml`, they deliberately share one `rten`/
-  # `tokenizers` runtime instead of each pulling in its own, specifically so a
-  # "full install" does not carry a second neural-network runtime. Nothing
-  # before this job has ever compiled that combination, so a `rten` upgrade
-  # that changes global state it keeps (its thread pool, say) could break the
-  # combination invisibly -- every feature passes alone, but two
-  # `rten::Model` loads sharing that state at once could race or panic.
-  #
-  # A separate job rather than more `check` steps, on purpose: `check`
-  # already runs right up against the runner's disk building `local-embed`
-  # last (see that step's comment), and this feature set links `rten` and
-  # `tokenizers` into even more test binaries than `local-embed` does alone.
-  # A fresh runner gives it a full disk instead of `check`'s leftovers.
-  #
-  # `ann`/`pdf` ride along too: the issue's "realistic full install" is what a
-  # user who wants everything actually enables, and `pdf`/`ocr`/`audio` are
-  # three parallel branches of the same `import_content` dispatch, so `pdf`
-  # compiling alongside `ocr` here is worth the (cheap, pure-Rust) inclusion.
-  # `audio` and `cloud-backup` are left out: neither shares any runtime with
-  # `ocr`/`rerank`/`local-embed`, so they add compile time without covering
-  # any new cross-feature interaction. `stack-dumps` is left out too -- it is
-  # the one feature here with a *system*-library dependency
-  # (`libunwind-dev`/`liblzma-dev`), off by default for exactly that reason
-  # (see its own step and `docs/adr/0014`), and no combination above installs
-  # or needs those packages, so this job does not either.
-  #
-  # This runs the actual test suite, not just clippy, unlike the `ocr`/
-  # `local-embed` steps above: the whole point is to exercise
-  # `ocr`/`rerank`/`local-embed` initializing and using `rten` in the same
-  # process, which a compile-only check can never do.
+  # ocr/rerank/local-embed share one rten/tokenizers runtime; this is the only
+  # leg that exercises them initialising together in one process.
   combined-features:
     name: build / test / clippy (combined features)
     runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install the pinned Rust toolchain
-        run: rustup toolchain install
-
-      - name: Cache cargo registry and dependency build output
-        uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          key: combined
-
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
       - name: cargo build --features ann,ocr,rerank,local-embed,pdf
-        run: cargo build -p remind_me_core --features ann,ocr,rerank,local-embed,pdf --locked
-
+        run: cargo build --locked -p remind_me_core --features ann,ocr,rerank,local-embed,pdf
       - name: cargo test --features ann,ocr,rerank,local-embed,pdf
-        run: cargo test -p remind_me_core --features ann,ocr,rerank,local-embed,pdf --locked
-
+        run: cargo test --locked -p remind_me_core --features ann,ocr,rerank,local-embed,pdf
       - name: cargo clippy --features ann,ocr,rerank,local-embed,pdf
-        run: cargo clippy -p remind_me_core --features ann,ocr,rerank,local-embed,pdf --all-targets --locked -- -D warnings
+        run: cargo clippy --locked -p remind_me_core --features ann,ocr,rerank,local-embed,pdf --all-targets -- -D warnings
 
-  # A separate job, not more steps on `check`, because it needs a Postgres
-  # service container and the rest of the workspace does not. Keeping it apart
-  # means the main gate is not held up by a database that takes seconds to
-  # become healthy, and a Postgres outage cannot red-X the whole workspace.
-  hub:
-    name: hub (sqlite + postgres)
+  plugin-version:
+    # rusty_remind_me's `.claude-plugin/plugin.json` version must equal its six
+    # crates' versions (check_plugin_version.sh also fails if the crates
+    # disagree). Lives here, not in its own workflow, so `required-gate` covers
+    # it: a drifted bump must not merge while the sole required check is green.
+    name: plugin.json version vs. crate versions
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Compare .claude-plugin/plugin.json against the crates' Cargo.toml
+        run: scripts/check_plugin_version.sh
+
+  hub:
+    name: hub (engine + SQLite copy)
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+      - name: cargo clippy -p remind_me_hub --no-default-features
+        run: cargo clippy --locked -p remind_me_hub --no-default-features --all-targets -- -D warnings
+      - name: cargo test -p remind_me_hub --no-default-features
+        run: cargo test --locked -p remind_me_hub --no-default-features
+
+  legacy-import:
+    # Postgres is only a legacy recovery source, never a runtime backend.
+    name: legacy Postgres import
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings
     services:
       postgres:
         image: postgres:16
@@ -294,84 +179,73 @@ jobs:
           POSTGRES_DB: hubtest
         ports:
           - 5432:5432
-        # Without this the job races the database's startup; `pg_isready`
-        # gates on the server actually accepting connections, not just the
-        # container existing.
         options: >-
           --health-cmd pg_isready
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install the pinned Rust toolchain
-        run: rustup toolchain install
-
-      - name: Cache cargo registry and dependency build output
-        uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          key: hub
-
-      - name: cargo clippy -p remind_me_hub
-        run: cargo clippy -p remind_me_hub --all-targets --locked -- -D warnings
-
-      # No database URL: the Postgres copy tests skip themselves, which is the
-      # path a contributor without a database takes. Running it here proves
-      # that path stays green rather than only ever being claimed.
-      - name: cargo test -p remind_me_hub (no Postgres server)
-        run: cargo test -p remind_me_hub --locked
-
-      # The copy tool's Postgres reader, legacy schema included, only runs
-      # against a real server.
-      - name: cargo test -p remind_me_hub (with postgres)
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+      - name: Lint the recovery feature and binaries
+        run: cargo clippy --locked -p remind_me_hub --no-default-features --features postgres-import --all-targets -- -D warnings
+      - name: Test legacy Postgres recovery against a disposable server
         env:
           REMIND_ME_HUB_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/hubtest
-          # A skipped Postgres test reports as *passed* and cargo hides the
-          # SKIP line, so losing the service container here would look
-          # identical to a clean run. This makes that a hard failure instead.
+          # Refuse a missing service instead of reporting skipped imports as passed.
           REMIND_ME_HUB_REQUIRE_POSTGRES: "1"
-        run: cargo test -p remind_me_hub --locked -- --test-threads=1
+        run: cargo test --locked -p remind_me_hub --no-default-features --features postgres-import --test hub_postgres_copy_test -- --test-threads=1
 
-      # The build without the copy tool's Postgres reader must keep working: a
-      # `postgres::` reference leaking outside the feature gate would only
-      # show up here.
-      - name: cargo test -p remind_me_hub --no-default-features
-        run: cargo test -p remind_me_hub --no-default-features --locked
-
-  # `remind_me_core` has real Win32 FFI (`sidecars.rs`'s job-object teardown,
-  # `export.rs`'s `\\?\`-prefix stripping — see `Cargo.toml`'s
-  # `[target.'cfg(windows)'.dependencies]`), which every job above compiles
-  # exactly zero lines of: `cfg(windows)` is false on every `ubuntu-latest`
-  # runner in this file. A mistake in that code — even one as basic as a
-  # syntax error — could sit unnoticed indefinitely.
-  #
-  # Scoped to the default build rather than mirroring `check`'s whole feature
-  # matrix: the platform-specific risk lives in the unconditional `windows-sys`
-  # dependency, not in any of the optional features, and several of those
-  # (`stack-dumps`'s `rstack-self` ptrace backend, the `libunwind`/`liblzma`
-  # apt packages) are Linux-only by design and would not even build here.
+  # remind_me_core's cfg(windows) FFI (sidecar job objects, `\\?\` stripping)
+  # compiles on no Linux leg above.
   windows:
     name: build / test / clippy (windows)
     runs-on: windows-latest
+    env:
+      RUSTFLAGS: -D warnings
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install the pinned Rust toolchain
-        run: rustup toolchain install
-
-      # `windows` needs no distinct key beyond this: the action already keys on
-      # the runner OS, so it cannot collide with the Linux jobs above.
-      - name: Cache cargo registry and dependency build output
-        uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          key: windows
-
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
       - name: cargo build
-        run: cargo build --workspace --locked
-
+        run: cargo build --locked -p remind_me_core -p remind_me_mcp -p remind_me_api -p rusty-remind-me -p remind_me_remote -p remind_me_hub
       - name: cargo test
-        run: cargo test --workspace --locked
-
+        run: cargo test --locked -p remind_me_core -p remind_me_mcp -p remind_me_api -p rusty-remind-me -p remind_me_remote -p remind_me_hub
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo clippy --locked -p remind_me_core -p remind_me_mcp -p remind_me_api -p rusty-remind-me -p remind_me_remote -p remind_me_hub --all-targets -- -D warnings
+
+  # ---------------------------------------------------------------------------
+  # Constant-time evidence for the native crypto crates (rusty_ct_check,
+  # rusty_sha2, rusty_pk, rusty_aead). Compiler-sensitive: LLVM can turn a
+  # branch-free masked select into a branch on a secret, which no functional
+  # test sees (it happened once in rusty_pk::mont::reduce_once and was caught
+  # only by the valgrind taint run below). The jump-count budgets in each
+  # crate's scripts/disasm_limits.txt are tied to a compiler version, so this
+  # job runs on the pinned RUST_TOOLCHAIN every other job ships with; moving
+  # that toolchain is a global change that reruns this job, and a changed count
+  # fails it until someone re-reviews the budget. Evidence, not proof: see
+  # docs/research/CRYPTO-REPLACEMENT-PLAN.md section 4.5. The statistical
+  # timing tests are deliberately NOT run here (noisy shared runners); they run
+  # from docs/research/crypto-evidence/collect.sh.
+  # ---------------------------------------------------------------------------
+
+  required-gate:
+    # The one check branch protection requires. A failed or cancelled job fails it.
+    name: required-gate
+    if: always()
+    needs: [fmt, cargo-deny, check, features, combined-features, plugin-version, hub, legacy-import, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any job failed or was cancelled
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "job results: $RESULTS"
+          case " $RESULTS " in
+            *" failure "*|*" cancelled "*) exit 1 ;;
+          esac

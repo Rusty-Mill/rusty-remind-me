@@ -1,26 +1,26 @@
 name: Release
 
-# Watches every push to `main` that touches the root Cargo.toml. If
-# `[workspace.package].version` there is ahead of the last `vX.Y.Z` tag this
-# repo published, this builds the CLI/hub binaries and the Claude Code
-# plugin archive and publishes them as a GitHub Release tagged to that
-# version -- see the "Releases and versioning" section of README.md.
+# A push to `main` that moves the six crates' `[package].version` (kept in
+# lockstep by scripts/get_workspace_version.sh) past the newest `vX.Y.Z` tag
+# builds the CLI/hub binaries and the Claude Code plugin archive and publishes
+# them as a GitHub Release with that tag. This is rusty_mill's
+# remind-me-release.yml from while the product lived there, back at a
+# repository root: bare `vX.Y.Z` tags again, and "Latest" set again.
 #
-# Deliberately one workflow, not "tag on version bump" + a second workflow
-# triggered by that tag push: a tag pushed with the default GITHUB_TOKEN does
-# not trigger other workflow runs (GitHub's own loop-prevention), so a
-# two-workflow split would silently never build anything. `softprops/action-
-# gh-release` creates the tag itself as part of creating the release, in the
-# same run that already did the version-bump detection.
+# One workflow rather than "tag on bump" + "build on tag": a tag pushed with
+# the default GITHUB_TOKEN triggers no other workflow, so a two-workflow split
+# would silently never build anything. softprops/action-gh-release creates the
+# tag itself, in the same run that detected the bump.
 
 on:
   push:
     branches: [main]
-    paths: ["Cargo.toml"]
+    paths:
+      - "crates/*/Cargo.toml"
   workflow_dispatch:
 
 concurrency:
-  group: release
+  group: remind-me-release
   cancel-in-progress: false
 
 permissions:
@@ -28,11 +28,16 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # The Rust toolchain every job builds with (except the MSRV check, which
+  # pins its own). Pinned rather than `stable`: Rust 1.99 deprecated
+  # `fetch_update` and added the default `clippy::assert_is_empty` lint
+  # (~1,300 hits), so a stable bump broke every warnings-as-errors job at
+  # once. Moving to a newer Rust is now a deliberate change here.
+  RUST_TOOLCHAIN: "1.98.1"
+  PRODUCT_DIR: "."
+  TAG_PREFIX: v
 
 jobs:
-  # Cheap and toolchain-independent, same shape as ci.yml's plugin-version
-  # job: report in seconds whether there is anything to release before any
-  # platform build spins up.
   detect-version:
     name: detect version bump
     runs-on: ubuntu-latest
@@ -40,33 +45,29 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       is_new: ${{ steps.version.outputs.is_new }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # Tags, not just this branch's history -- the existing-tag check
-          # below needs every `vX.Y.Z` this repo has ever published.
+          # Every tag, not just this branch's history -- the existing-tag
+          # check below needs every release ever published.
           fetch-depth: 0
 
       - id: version
-        name: Read the workspace version and check for an existing release tag
+        name: Read the crates' version and check for an existing release tag
         run: |
           set -euo pipefail
-          version="$(scripts/get_workspace_version.sh)"
+          version="$("$PRODUCT_DIR/scripts/get_workspace_version.sh")"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+          if git rev-parse -q --verify "refs/tags/${TAG_PREFIX}${version}" >/dev/null; then
             echo "is_new=false" >> "$GITHUB_OUTPUT"
-            echo "v$version is already tagged -- nothing to release."
+            echo "${TAG_PREFIX}${version} is already tagged -- nothing to release."
           else
             echo "is_new=true" >> "$GITHUB_OUTPUT"
-            echo "v$version is new -- will build and publish a release."
+            echo "${TAG_PREFIX}${version} is new -- will build and publish a release."
           fi
 
-  # One native build per platform -- no cross-compilation. `remind_me_hub`'s
-  # default `postgres-import` feature pulls in the pure-Rust `postgres` crate
-  # (no libpq, no TLS feature enabled) and `rusqlite`'s `bundled` feature
-  # compiles SQLite from source via `cc`, both of which need only the C
-  # toolchain each of these runner images already ships -- so a native build
-  # per OS is simpler and more reliable here than teaching one Linux runner
-  # to cross-compile for four targets.
+  # One native build per platform, no cross-compilation (see the original
+  # workflow). `macos-15` replaced `macos-14`, unsupported from 2026-11-02;
+  # both Apple targets build on the one arm64 image.
   build:
     name: build (${{ matrix.target }})
     needs: detect-version
@@ -77,51 +78,30 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-          # `macos-13` (the Intel-native runner this target originally used)
-          # was fully retired by GitHub in December 2025 -- a job requesting
-          # it queues forever with no runner ever assigned, discovered when
-          # v0.1.1's release run sat queued for over an hour. Building
-          # `x86_64-apple-darwin` on the same `macos-14` (arm64) runner as
-          # the aarch64 leg instead: Xcode's toolchain cross-links either
-          # Apple Silicon or Intel object code from an arm64 host without
-          # needing Rosetta or a second physical architecture, so this loses
-          # nothing -- it only stops depending on a second, separately
-          # deprecatable macOS runner image existing at all.
-          # `macos-14` itself starts deprecating 2026-07-06, fully
-          # unsupported 2026-11-02 -- if this queues indefinitely again after
-          # that, replace both entries below with whatever runner label is
-          # current then (`macos-15` was next in line as of this writing).
           - target: x86_64-apple-darwin
-            os: macos-14
+            os: macos-15
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
           - target: x86_64-pc-windows-msvc
             os: windows-latest
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install the pinned Rust toolchain
-        run: rustup toolchain install
-
-      - name: Add the release target
-        run: rustup target add ${{ matrix.target }}
-
-      - name: Cache cargo registry and build output
-        uses: actions/cache@v4
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-release-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-release-${{ matrix.target }}-
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: remind-me-release-${{ matrix.target }}
 
       # Default features only, matching what README tells a from-source user
-      # to build -- the heavy optional features (ann, ocr, rerank,
-      # local-embed, audio, cloud-backup) each take explicit model/credential
-      # setup that a downloaded binary can't carry anyway.
-      - name: Build rusty-remind-me and rusty-remind-me-hub (release)
+      # to build. `-p` keeps this to the shipped binaries. remind_me_hub builds two: the hub,
+      # and rusty-remind-me-hub-copy, which moves a SQLite or Postgres hub onto
+      # the embedded engine (docs/adr/0021).
+      - name: Build rusty-remind-me, rusty-remind-me-hub and the hub copy tool (release)
         run: cargo build --release --locked --target ${{ matrix.target }} -p rusty-remind-me -p remind_me_hub
 
       - name: Package the archive (Linux / macOS)
@@ -134,7 +114,8 @@ jobs:
           mkdir "$stage"
           cp "target/${{ matrix.target }}/release/rusty-remind-me" "$stage/"
           cp "target/${{ matrix.target }}/release/rusty-remind-me-hub" "$stage/"
-          cp README.md "$stage/"
+          cp "target/${{ matrix.target }}/release/rusty-remind-me-hub-copy" "$stage/"
+          cp "$PRODUCT_DIR/README.md" "$stage/"
           tar czf "${stage}.tar.gz" "$stage"
           echo "ASSET_PATH=${stage}.tar.gz" >> "$GITHUB_ENV"
 
@@ -147,33 +128,31 @@ jobs:
           New-Item -ItemType Directory -Path $stage | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/rusty-remind-me.exe" "$stage/"
           Copy-Item "target/${{ matrix.target }}/release/rusty-remind-me-hub.exe" "$stage/"
-          Copy-Item README.md "$stage/"
+          Copy-Item "target/${{ matrix.target }}/release/rusty-remind-me-hub-copy.exe" "$stage/"
+          Copy-Item "$env:PRODUCT_DIR/README.md" "$stage/"
           Compress-Archive -Path $stage -DestinationPath "$stage.zip"
           echo "ASSET_PATH=$stage.zip" >> $env:GITHUB_ENV
 
-      - name: Upload the archive as a workflow artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-asset-${{ matrix.target }}
           path: ${{ env.ASSET_PATH }}
           if-no-files-found: error
 
-  # A second, independent asset: the Claude Code plugin surface, zipped up
-  # so it can be grabbed from the Release page without cloning the repo.
-  # Separate job from `build` because it needs no Rust toolchain at all.
+  # The Claude Code plugin surface, zipped so it can be grabbed from the
+  # Release page without cloning. Needs no Rust toolchain.
   package-plugin:
     name: package Claude Code plugin
     needs: detect-version
     if: needs.detect-version.outputs.is_new == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # Belt-and-suspenders: ci.yml's plugin-version job should already have
-      # blocked any PR where this drifted, but a release must never ship a
-      # plugin archive silently claiming the wrong version.
+      # ci.yml's remind-me-plugin-version job should already have blocked a drifted PR, but a
+      # release must never ship a plugin archive claiming the wrong version.
       - name: Verify plugin.json version matches this release
-        run: scripts/check_plugin_version.sh
+        run: '"$PRODUCT_DIR/scripts/check_plugin_version.sh"'
 
       - name: Build the plugin archive
         run: |
@@ -181,12 +160,11 @@ jobs:
           version="${{ needs.detect-version.outputs.version }}"
           stage="rusty-remind-me-plugin-v${version}"
           mkdir "$stage"
-          cp -R .claude-plugin commands hooks .mcp.json README.md "$stage/"
+          (cd "$PRODUCT_DIR" && cp -R .claude-plugin commands hooks .mcp.json README.md "$GITHUB_WORKSPACE/$stage/")
           zip -rq "${stage}.zip" "$stage"
           echo "ASSET_PATH=${stage}.zip" >> "$GITHUB_ENV"
 
-      - name: Upload the archive as a workflow artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-asset-plugin
           path: ${{ env.ASSET_PATH }}
@@ -198,20 +176,22 @@ jobs:
     if: needs.detect-version.outputs.is_new == 'true'
     runs-on: ubuntu-latest
     steps:
-      - name: Download every platform/plugin archive built above
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: dist
           pattern: release-asset-*
           merge-multiple: true
 
-      # Creates the vX.Y.Z tag (pointed at this run's commit) and the
-      # Release together -- see the loop-prevention note at the top of this
-      # file for why that happens here rather than via a separate tag push.
+      # The body links RELEASE_NOTES.md rather than generated notes, which
+      # would list the monorepo-era merge commits in the first release.
       - name: Create the release and attach all archives
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
-          tag_name: v${{ needs.detect-version.outputs.version }}
-          name: v${{ needs.detect-version.outputs.version }}
-          generate_release_notes: true
+          tag_name: ${{ env.TAG_PREFIX }}${{ needs.detect-version.outputs.version }}
+          name: rusty_remind_me v${{ needs.detect-version.outputs.version }}
+          body: >-
+            rusty_remind_me v${{ needs.detect-version.outputs.version }}.
+            What changed is in
+            [RELEASE_NOTES.md](https://github.com/${{ github.repository }}/blob/${{ github.sha }}/RELEASE_NOTES.md).
+          make_latest: true
           files: dist/*
