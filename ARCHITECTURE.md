@@ -9,7 +9,7 @@ This document details the architectural principles, data flow, mathematical scor
 `rusty_remind_me` is designed as a **high-performance, zero-overhead persistent memory engine** for AI agents.
 
 Key Architectural Tenets:
-1. **Predictable Performance**: Microsecond-level SQLite FTS5 query latency and zero runtime Garbage Collection pauses.
+1. **Predictable Performance**: In-process, memory-mapped engine tables with an in-memory full-text index — no database server, no network hop — and zero runtime Garbage Collection pauses.
 2. **Minimal, Call-Site-Justified Dependencies**: No dependency is declared
    speculatively. (This project once aspired to a "Rusty Mill" ecosystem of
    shared crates — `rusty_tokio`, `rusty-db`, `rusty_json`, `rusty-search`,
@@ -19,8 +19,8 @@ Key Architectural Tenets:
    removed. See the "Rusty Mill ecosystem dependencies" comment in the
    workspace `Cargo.toml` for the full account, and re-adopt one only at the
    point it gains a real call site.)
-3. **Data Parity with `remind-me`**: Identical SQLite Version 29 schema and JSON tool signatures for drop-in interoperability. The schema is generated from the reference rather than transcribed (§5); the version here is the one `remind_me` itself reports, and a mismatch is what makes a database silently unreadable to it.
-4. **Thread Safety**: Thread-safe database access using `Arc<Database>` wrapped in `parking_lot::Mutex<rusqlite::Connection>`, safe for concurrent access from plain OS threads — the scheduler, folder watcher, sync worker and promotion nudge are each `std::thread::Builder::spawn` loops, not `tokio` tasks; `remind_me_remote` is the one crate in this workspace that runs on `tokio` (§2).
+3. **Wire compatibility, not file sharing** (*replaced 2026-09-26*). This tenet used to be "Data Parity with `remind-me`": an identical SQLite v29 schema so the Python `remind_me` and this port could open the same `memory.db`. The Python reference is retired (ADR-0023), so the node's storage is its own. What stays compatible is the **sync protocol**: nodes, peers and the hub exchange records in the same wire format, whatever each stores them in. The MCP tool names and signatures stay as they are, because clients rely on them, not because Python does.
+4. **Thread Safety**: Thread-safe store access through `Arc<Database>`, whose `store()` takes a `parking_lot::Mutex<()>` so one caller runs at a time while background threads share the engine tables (which lock per call) through a `SecondarySource`; safe for concurrent access from plain OS threads — the scheduler, folder watcher, sync worker and promotion nudge are each `std::thread::Builder::spawn` loops, not `tokio` tasks; `remind_me_remote` is the one crate in this workspace that runs on `tokio` (§2).
 
 ---
 
@@ -36,8 +36,9 @@ graph TD
     REMOTE --> MCP
     REMOTE --> CORE
     HUB[remind_me_hub binary: rusty-remind-me-hub]
-    CORE --> RUSQLITE[rusqlite / SQLite]
-    HUB -.->|optional postgres-store feature| POSTGRES[Postgres]
+    CORE --> ENGINE[rusty_multimodal_db engine, in-process]
+    CORE -.read-only, first open only.-> LEGACY[old SQLite memory.db]
+    HUB --> ENGINE
 ```
 
 `remind_me_hub` is its own binary (`rusty-remind-me-hub`), not reached
@@ -46,13 +47,14 @@ through the `remind_me_cli` dispatch and not a build dependency of
 and pull from over HTTP, sharing a wire protocol with `remind_me_core::sync`
 rather than a crate dependency. The one Cargo edge between them runs the
 other direction and only in tests: `remind_me_core`'s `dev-dependencies` path
-to `remind_me_hub` (SQLite-only, `default-features = false`) lets
+to `remind_me_hub` (without the copy tool's Postgres reader,
+`default-features = false`) lets
 `tests/support`'s `MockHub` exercise real `remind_me_hub` request handling
 without a spawned process.
 
 ### Crate Roles
 - **`remind_me_core`**: The domain core containing:
-  - Database schema creation & migrations (`db/schema.rs`, `db/queries.rs`).
+  - The store: one repository per table group under `db/`, each a thin layer over its `db/engine/*` module (ADR-0023, ADR-0025); the tool-level operations in `db/queries.rs`.
   - ACT-R Memory Vitality calculation engine (`vitality.rs`).
   - Hybrid Search Engine & RRF rank fusion algorithm (`retrieval.rs`).
   - Entity Knowledge Graph management (`entity.rs`).
@@ -95,10 +97,10 @@ without a spawned process.
     happens once a key *is* set, the `/health` carve-out, and read-scoped
     keys — and is not restated here.
 - **`remind_me_cli`**: The unified CLI binary executable (`rusty-remind-me`) handling command line flags and subcommand dispatch (`server`, `api`, `remote`, `configure`, `add`, `search`, `get`, `entity`, `wiki-write`, `wiki-read`, `wiki-import`, `stats`).
-- **`remind_me_remote`**: The Streamable HTTP MCP connector, on `tokio` + `axum` + `rmcp` (the one place this workspace takes on that async stack — every other crate stays synchronous, a deliberate boundary; see `crates/remind_me_remote/src/lib.rs`'s module doc):
+- **`remind_me_remote`**: The Streamable HTTP MCP connector, on `rusty_tokio` + `rusty_axum` + `rusty_mcp_server` (the one place this workspace takes on an async stack — every other crate stays synchronous, a deliberate boundary; see `crates/remind_me_remote/src/lib.rs`'s module doc):
   - Secret-path/bearer auth (FT-05) and, when an issuer is configured, a hand-rolled OAuth 2.1 authorization server (FT-07, `docs/adr/0011`).
-  - `RemindMeHandler` adapts `remind_me_mcp::McpServer::handle_request` (synchronous) to `rmcp`'s async `ServerHandler` trait via `spawn_blocking`, rather than reimplementing tool/resource/prompt dispatch.
-- **`remind_me_hub`**: The central multi-node sync server (`rusty-remind-me-hub` binary) speaking the same push/pull peer protocol `remind_me_core::sync` serves node-to-node, over a pluggable storage trait backed by SQLite or Postgres (`docs/adr/0015`). A hub never pulls; nodes push to and pull from it.
+  - `handler::describe` turns `remind_me_mcp::Handler` (synchronous) into a `rusty_mcp_server` server, whose HTTP handler runs each request on a blocking thread, rather than reimplementing tool/resource/prompt dispatch.
+- **`remind_me_hub`**: The central multi-node sync server (`rusty-remind-me-hub` binary) speaking the same push/pull peer protocol `remind_me_core::sync` serves node-to-node, storing its data in the embedded `rusty_multimodal_db` engine (`docs/adr/0021`); its Postgres and SQLite stores (`docs/adr/0015`) are retired, and `rusty-remind-me-hub-copy` moves an old hub onto the engine. A hub never pulls; nodes push to and pull from it.
 
 ---
 
@@ -114,12 +116,12 @@ Input (MemoryAddInput)
   ├──► Generate Unique Memory ID (UUID v4: mem_...)
   │
   ▼
-SQLite Database (`memories` table)
+Engine store (`memories` table, `db::engine::memories`)
   │
-  └──► Automatic SQLite Trigger (`memories_ai`)
+  └──► one journal batch with the row
          │
          ▼
-       SQLite FTS5 Index (`memories_fts`)
+       the full-text index, the tag index, and the sync outbox entry
 ```
 
 ### B. Read & Search Path (`remind_me_search` / `search_memories`)
@@ -129,7 +131,7 @@ Search Input (MemorySearchInput query, category, limit, min_vitality)
   ├──► Query Shape Heuristic Router (looks_keyword_shaped, looks_semantic_shaped, looks_temporal_shaped)
   ├──► RRF Weight Selection (choose_rrf_weights)
   │
-  ├──► Execute SQLite FTS5 Match Query (bm25 ranking)
+  ├──► Execute the engine's full-text query (BM25 ranking, FTS5-compatible)
   ├──► Filter Dormant Memories (vitality < 0.05 or min_vitality threshold)
   │
   ├──► Execute Reciprocal Rank Fusion (rank_rrf) over five signals (§4B)
@@ -171,49 +173,47 @@ same reason §5 stopped reproducing the schema DDL.
 
 ---
 
-## 5. Database Schema Specification (Version 29)
+## 5. Storage
 
-The schema is **generated, not hand-written**: `crates/remind_me_core/src/db/`
-holds `schema_tables.sql`, `schema_indexes.sql` and `schema_triggers.sql`,
-dumped verbatim from a `remind_me` database at `_SCHEMA_VERSION = 29` and
-regenerated by `scripts/regenerate_schema.py`. Those files are the
-specification; `db/migrations.rs` reconciles any database it opens against
-them and stamps `PRAGMA user_version = 29` (`SCHEMA_VERSION` in
-`db/migrations.rs` — check that constant directly rather than trusting this
-number to stay current; it has already drifted once).
+The node's only store is the `rusty_multimodal_db` engine (ADR-0023;
+ADR-0025 records the removal of the SQLite store). Each table group has a
+repository under `crates/remind_me_core/src/db/` (`memories.rs`,
+`entities.rs`, `outbox.rs`, `wiki.rs`, …) that callers reach through a
+`Store` handle, and each repository is a thin layer over the module that
+owns its records under `db/engine/`. Records are serialised positionally,
+so a change to a record's fields bumps its `SchemaTag` and adds an open-time
+upgrade from the previous layout (`db/engine/memories_v31.rs` is the
+pattern); `#[serde(default)]` covers only the JSON journal.
 
-This section used to reproduce the `CREATE TABLE` statements inline. It no
-longer does, and the reason is the same one behind the generated schema
-itself: a hand-maintained copy of a generated artifact drifts, and drifts
-silently. The copy that was here had gone stale in exactly that way — it still
-showed `last_accessed_at` (renamed to `accessed_at`), an `entities` table with
-no `node_id`, `memory_entities` with cascading foreign keys, and a
-`wiki_pages.topic` column — four shapes the schema tests now assert are
-*wrong*. A reader trusting this document would have been misled by all four.
+Derived data — the memories' full-text index and tag index, the wiki's
+full-text index — is rebuilt from the records at open and kept in step by
+every write; nothing durable depends on it. Writes that must land together
+travel as one journal batch (`node.journal`), and an importer's page of
+writes is one page with an undo log (`node.undo`), so a crash leaves all of
+a page or none of it.
 
-### Where to look instead
+The store is still located by the path of the old SQLite file: `memory.db`
+has its engine directory at `memory.engine` beside it. `db/legacy_sqlite.rs`
+is the one module that links SQLite, read-only: `Database::open` copies a
+`memory.db` beside which no engine directory exists onto the engine
+(`db/engine/copy.rs`), then never opens the file again, and the two
+foreign-file importers (`dbs_import.rs`, `mempalace_import.rs`) read other
+programs' SQLite databases through it (ADR-0023 §6).
+
+### Where to look
 
 | For | Read |
 | --- | --- |
-| The exact current DDL | `crates/remind_me_core/src/db/schema_*.sql` |
-| How an existing database is brought to it | `db/migrations.rs` (module docs: reconciliation, not a ladder) |
-| Why it is generated rather than transcribed | `db/migrations.rs` module docs, and ADR-0007 |
-| Whether this crate matches the reference | `crates/remind_me_core/tests/schema_test.rs` — compares every table, index and trigger by normalised DDL |
-
-### Objects this crate adds beyond the dump
-
-One, deliberately: `vec_embeddings`. `remind_me` stores vectors in a
-`sqlite-vec` `vec0` virtual table this crate has no way to load, so it keeps
-its own plain table for the bytes
-(`docs/adr/0002-embeddings-ollama-and-brute-force-vectors.md`). `vec_chunks`,
-the rowid map, *is* part of the generated schema. `schema_test.rs`'s
-`OWN_ADDITIONS` is the allowlist, and anything not on it that appears in a live
-database fails the parity test.
+| A table group's records and queries | `crates/remind_me_core/src/db/engine/<group>.rs` |
+| The repository callers use | `crates/remind_me_core/src/db/<group>.rs` |
+| What the schema looks like as columns | `db::testing::MEMORY_COLUMNS` for `memories`; the engine record of each group otherwise |
+| The schema version a copied `memory.db` may be at | `db::legacy_sqlite::{SCHEMA_VERSION, OLDEST_COPIED_VERSION}` |
+| How an old `memory.db` is copied | `db/engine/copy.rs`, with `tests/fixtures/legacy_store/` as its sources |
 
 ### Notes that outlive the DDL
 
 `wiki_pages.slug` being the primary key is what makes `wiki-import`
-(`wiki_import.rs`) idempotent: `write_wiki_page` upserts, so re-importing a
+(`wiki_import.rs`) idempotent: `WikiIndex::upsert` upserts, so re-importing a
 regenerated directory revises pages in place. `content` stores the Markdown
 body *after* front matter — the fields front matter carries are columns here,
 so retaining them in the body would duplicate them and leak YAML into anything
@@ -228,9 +228,16 @@ actually uses — CLI subcommand processes, the MCP stdio loop, and the
 scheduler/watcher/sync-worker/promotion-nudge background threads (each a
 `std::thread::Builder::spawn` loop, not a `tokio` task; see §1 tenet 4)
 — without lock contention or data races:
-- The `Database` struct wraps `rusqlite::Connection` in
-  `parking_lot::Mutex<Connection>`, not `std::sync::Mutex` — `parking_lot`'s
-  `lock()` returns the guard directly rather than a `LockResult`, since this
-  codebase has no use for poisoning semantics.
-- Calling `db.conn()` returns a `MutexGuard<'_, Connection>`, which derefs to `&rusqlite::Connection`.
-- Automatic SQLite WAL (Write-Ahead Logging) journal mode (`PRAGMA journal_mode=WAL`) and busy timeouts (`PRAGMA busy_timeout=30000`) enable high-concurrency readers and sequential writers.
+- The `Database` struct holds the engine tables behind an `Arc<EngineLock>`
+  and a `parking_lot::Mutex<()>` that `store()` takes, so one tool call runs
+  at a time, as the SQLite connection's mutex once ordered them.
+  `parking_lot` rather than `std::sync::Mutex`: its `lock()` returns the
+  guard directly rather than a `LockResult`, since this codebase has no use
+  for poisoning semantics.
+- A background thread takes a `SecondarySource` instead and works on the
+  shared engine tables without that lock; the tables lock per call, and a
+  page (`db::engine::page`) makes every other thread wait until an
+  importer's batch is whole.
+- Durability is the engine's: records are memory-mapped files, cross-store
+  writes go through a redo journal that is fsync'd before it is applied, and
+  the directory lock (`node.lock`) keeps a second process out.

@@ -6,6 +6,8 @@
 *.db
 *.db-wal
 *.db-shm
+# ...except the checked-in legacy stores the first-open copy is tested against
+!crates/remind_me_core/tests/fixtures/legacy_store/*.db
 
 # Editor / OS
 .vscode/

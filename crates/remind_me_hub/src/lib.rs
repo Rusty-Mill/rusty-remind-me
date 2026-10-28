@@ -1,10 +1,11 @@
 //! The remind-me sync hub: a central sync point speaking the peer protocol.
 //!
-//! A port of the reference's `hub/main.py` — a FastAPI server backed by
-//! Postgres — with one deliberate addition: the storage backend is behind a
-//! trait, so the same hub runs on Postgres (the drop-in for an existing
-//! deployment) or on SQLite (a self-hosted hub that wants one file and no
-//! server). `docs/adr/0015` records why.
+//! A port of the reference's `hub/main.py`, a FastAPI server backed by
+//! Postgres. This hub stores its data in the embedded `rusty_multimodal_db`
+//! engine instead: one data directory, no database server
+//! (`docs/adr/0021`). The Postgres and SQLite stores it used to offer are
+//! gone; [`import`] reads both, and `rusty-remind-me-hub-copy` copies an
+//! old hub onto the engine.
 //!
 //! # What a hub is, relative to a peer
 //!
@@ -21,7 +22,7 @@
 //! | `GET /stats` | bearer | the full aggregate, once per reconcile |
 //! | `GET /count` | bearer | scalar counts, cheap enough to poll |
 //! | `GET /metrics` | bearer | Prometheus text, off by default |
-//! | `POST /admin/compact_tombstones` | bearer | hard-delete expired tombstones |
+//! | `POST /admin/compact_tombstones` | bearer | empty tombstones that still hold text |
 //! | `POST /sync/push` | bearer | upsert a batch, LWW on `updated_at` |
 //! | `GET /sync/pull` | bearer | memory records since a cursor |
 //! | `GET /sync/pull_entities` | bearer | entity records |
@@ -39,11 +40,13 @@
 
 pub mod canon;
 pub mod http;
+pub mod import;
 pub mod record;
 pub mod routes;
 pub mod store;
 
 use http::{Head, Response};
+use rusty_crypto_key::constant_time_eq;
 use store::HubStore;
 
 /// Version of the hub server, reported by `/health`, `/count`, `/stats`,
@@ -73,7 +76,6 @@ pub struct Config {
     /// *allow everything* — see [`authorized`].
     pub secret: String,
     pub metrics_enabled: bool,
-    pub tombstone_retention_days: i64,
 }
 
 impl Config {
@@ -89,10 +91,6 @@ impl Config {
                     .as_str(),
                 "1" | "true" | "yes"
             ),
-            tombstone_retention_days: std::env::var("REMIND_ME_HUB_TOMBSTONE_RETENTION_DAYS")
-                .ok()
-                .and_then(|v| v.trim().parse().ok())
-                .unwrap_or(90),
         }
     }
 }
@@ -114,22 +112,6 @@ pub fn authorized(config: &Config, header: &str) -> bool {
     }
     let expected = format!("Bearer {}", config.secret);
     constant_time_eq(header.as_bytes(), expected.as_bytes())
-}
-
-/// Length-independent, data-independent byte comparison.
-///
-/// The length check is intentionally *not* an early return on mismatch: it
-/// folds into the same accumulator, so a wrong-length header costs the same
-/// time as a wrong-value one.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    let mut diff = (a.len() ^ b.len()) as u8;
-    let n = a.len().max(b.len());
-    for i in 0..n {
-        let x = a.get(i).copied().unwrap_or(0);
-        let y = b.get(i).copied().unwrap_or(0);
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 /// Whether a route requires the bearer secret.
@@ -158,7 +140,7 @@ pub fn dispatch(store: &dyn HubStore, config: &Config, head: &Head, body: &[u8])
         "/stats" if get => routes::stats(store),
         "/count" if get => routes::count(store, &head.query),
         "/metrics" if get => routes::metrics(store, config),
-        "/admin/compact_tombstones" if post => routes::compact_tombstones(store, config),
+        "/admin/compact_tombstones" if post => routes::compact_tombstones(store),
         "/sync/push" if post => routes::push(store, body),
         "/sync/pull" if get => routes::pull(store, &head.query),
         "/sync/pull_entities" if get => routes::pull_entities(store, &head.query),
@@ -190,7 +172,6 @@ mod tests {
         Config {
             secret: secret.to_string(),
             metrics_enabled: false,
-            tombstone_retention_days: 90,
         }
     }
 

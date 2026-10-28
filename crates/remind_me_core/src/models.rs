@@ -9,6 +9,22 @@ pub enum ResponseFormat {
     Json,
 }
 
+/// How much of each hit a search carries, and is charged for (card #51).
+///
+/// The token budget is spent per hit, so this decides how many hits fit, not
+/// just how they look. `Full` is the library default and keeps every existing
+/// caller unchanged; the MCP tool defaults to `Compact` so a budgeted search
+/// returns ids and snippets, with full bodies fetched by id on demand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchDetail {
+    /// Id, category, date, tags, score and a short snippet.
+    Compact,
+    /// The whole memory.
+    #[default]
+    Full,
+}
+
 /// RRF retrieval strategy profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -113,6 +129,103 @@ pub struct Memory {
     /// and a key that appears on one implementation and not the other is the
     /// divergence this closes.
     pub deleted_at: Option<String>,
+
+    // Schema v32: where the memory was written, how far to trust it, and
+    // who wrote it. `#[serde(default)]` throughout, so a record serialised
+    // by a build before v32 (an export, a remote's reply) still reads.
+    /// Short project name: the git top-level directory's basename, else
+    /// the working directory's.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// The client session that wrote it (a Claude Code hook's
+    /// `session_id`, or `REMIND_ME_SESSION_ID`).
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// `origin`'s fetch URL, without credentials or a trailing `.git`.
+    #[serde(default)]
+    pub git_remote: Option<String>,
+    /// The branch at write time, or `HEAD` when detached.
+    #[serde(default)]
+    pub git_branch: Option<String>,
+    /// The full HEAD sha at write time.
+    #[serde(default)]
+    pub git_sha: Option<String>,
+    /// The working directory at write time.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// RFC 3339; `None` means the memory has always held.
+    #[serde(default)]
+    pub valid_from: Option<String>,
+    /// RFC 3339; `None` means it does not expire.
+    #[serde(default)]
+    pub valid_until: Option<String>,
+    /// How far to trust it, 0.0..=1.0. The schema's default is 1.0.
+    #[serde(default = "default_confidence")]
+    pub confidence: f64,
+    /// RFC 3339 when a human or tool last confirmed it.
+    #[serde(default)]
+    pub verified_at: Option<String>,
+    /// `done`, `abandoned`, `reverted`, `superseded` or `carded`; `None` while open
+    /// or where an outcome does not apply.
+    #[serde(default)]
+    pub outcome: Option<String>,
+    /// `human`, `model:<id>`, `hook`, `importer:<name>` or `unknown`.
+    #[serde(default = "default_written_by")]
+    pub written_by: String,
+    /// `manual` or `auto`.
+    #[serde(default = "default_capture_method")]
+    pub capture_method: String,
+}
+
+/// The schema's default `confidence`.
+pub fn default_confidence() -> f64 {
+    1.0
+}
+
+/// The schema's default `written_by`.
+pub fn default_written_by() -> String {
+    "unknown".to_string()
+}
+
+/// The schema's default `capture_method`.
+pub fn default_capture_method() -> String {
+    "manual".to_string()
+}
+
+/// Where a write happens: the six context columns of schema v32, as a
+/// writer learns them once per process and stamps on every row.
+///
+/// Only the struct and [`WriteContext::apply`] live here. Nothing fills it
+/// yet: deriving the values from the environment and `git rev-parse` is a
+/// later step, and a struct every writer already takes keeps that step
+/// from touching every write path again.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WriteContext {
+    pub project: Option<String>,
+    pub session_id: Option<String>,
+    pub git_remote: Option<String>,
+    pub git_branch: Option<String>,
+    pub git_sha: Option<String>,
+    pub cwd: Option<String>,
+}
+
+impl WriteContext {
+    /// Stamp `row` with every column this context knows. A `None` leaves
+    /// the row's value as it is, so a caller that already set one column
+    /// explicitly is not overwritten by an unknown.
+    pub fn apply(&self, row: &mut crate::db::memories::NewMemory) {
+        let set = |field: &mut Option<String>, value: &Option<String>| {
+            if value.is_some() {
+                field.clone_from(value);
+            }
+        };
+        set(&mut row.project, &self.project);
+        set(&mut row.session_id, &self.session_id);
+        set(&mut row.git_remote, &self.git_remote);
+        set(&mut row.git_branch, &self.git_branch);
+        set(&mut row.git_sha, &self.git_sha);
+        set(&mut row.cwd, &self.cwd);
+    }
 }
 
 /// Input model for adding a memory.
@@ -138,6 +251,57 @@ pub struct MemoryAddInput {
     /// memory out of ordinary search and list results unless asked for.
     #[serde(default)]
     pub sensitive: bool,
+    /// Run the rule-based reference/entity extraction (`extract.rs`) on the
+    /// content. On by default; `REMIND_ME_EXTRACT=0` turns it off globally.
+    #[serde(default = "default_true")]
+    pub extract: bool,
+    /// Files or URLs this memory points at. Only a fingerprint and a label
+    /// are stored, never the bytes.
+    #[serde(default)]
+    pub attachments: Vec<AttachmentInput>,
+    /// Live memories this one replaces: each is marked superseded by it. An
+    /// id that is missing, deleted or already superseded refuses the add.
+    #[serde(default)]
+    pub supersedes: Vec<String>,
+}
+
+/// One attachment of a [`MemoryAddInput`]: a local `path` (hashed, never
+/// stored) or a `url`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachmentInput {
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for MemoryAddInput {
+    /// An empty-content add with every optional field at its serde default, so
+    /// callers and tests name only what they set (`..Default::default()`),
+    /// and a field added here does not touch every call site.
+    fn default() -> Self {
+        Self {
+            content: String::new(),
+            category: default_category(),
+            tags: Vec::new(),
+            source: default_source(),
+            metadata: serde_json::Value::Null,
+            subject: None,
+            predicate: None,
+            object: None,
+            entities: Vec::new(),
+            sensitive: false,
+            extract: true,
+            attachments: Vec::new(),
+            supersedes: Vec::new(),
+        }
+    }
 }
 
 fn default_category() -> String {
@@ -167,6 +331,9 @@ pub struct MemorySearchInput {
     pub token_budget: usize,
     #[serde(default)]
     pub response_format: ResponseFormat,
+    /// What each hit carries and costs against `token_budget`.
+    #[serde(default)]
+    pub detail: SearchDetail,
     #[serde(default)]
     pub include_dormant: bool,
     #[serde(default)]
@@ -218,6 +385,74 @@ pub struct MemorySearchInput {
     /// ([`crate::promotion::BOOTSTRAP_RESERVE_MAX`]).
     #[serde(default)]
     pub bootstrap: bool,
+    /// Narrow to a project, branch, session or writer (schema v32).
+    #[serde(default, flatten)]
+    pub scope: crate::context::ScopeFilter,
+    /// Keep memories whose `valid_until` has passed. On by default so nothing
+    /// disappears: an expired memory is ranked last and marked, not hidden.
+    #[serde(default = "default_include_expired")]
+    pub include_expired: bool,
+    /// Drop memories below this `confidence`. `0.0` keeps everything.
+    #[serde(default)]
+    pub min_confidence: f64,
+    /// Rank raw session dialogs and skeletons with everything else. Off by
+    /// default (ADR-0029): facts and summaries answer a query, and a dialog
+    /// is reached through their `capture_id`. Asking for a raw category or a
+    /// session turns it on.
+    #[serde(default)]
+    pub include_raw: bool,
+    /// How `tags` combine, and narrowing by entity or repository.
+    #[serde(default, flatten)]
+    pub filters: SearchFilters,
+    /// Narrow to a `since`/`until` window over `created_at` or `updated_at`.
+    /// Bounded with an empty `query`, the search lists the window newest-first.
+    #[serde(default, flatten)]
+    pub window: crate::time_window::TimeWindow,
+}
+
+impl MemorySearchInput {
+    /// Whether raw dialogs compete in this search's ranking.
+    pub fn ranks_raw(&self) -> bool {
+        self.include_raw
+            || self.scope.session_id.is_some()
+            || self
+                .category
+                .as_deref()
+                .is_some_and(crate::db::memories::is_raw_category)
+    }
+}
+
+/// How a search's `tags` combine.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TagMatch {
+    /// A memory must carry every tag, as `remind_me_list` requires.
+    #[default]
+    All,
+    /// A memory must carry at least one tag.
+    Any,
+}
+
+/// Content filters on a ranked search, beside [`MemorySearchInput::tags`].
+///
+/// Blank strings are treated as unset, as [`crate::context::ScopeFilter`]
+/// treats them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchFilters {
+    #[serde(default)]
+    pub tag_mode: TagMatch,
+    /// Only memories linked to this entity, named or aliased, or whose
+    /// subject or object is it. An unknown entity matches nothing.
+    #[serde(default)]
+    pub entity: Option<String>,
+    /// Only memories written in this repository: a `git_remote` in any form
+    /// `git` accepts, compared after [`crate::context::normalize_remote`].
+    #[serde(default)]
+    pub repo: Option<String>,
+}
+
+fn default_include_expired() -> bool {
+    true
 }
 
 impl Default for MemorySearchInput {
@@ -232,6 +467,7 @@ impl Default for MemorySearchInput {
             limit: default_limit(),
             token_budget: default_token_budget(),
             response_format: ResponseFormat::default(),
+            detail: SearchDetail::default(),
             include_dormant: false,
             min_vitality: 0.0,
             verbose: false,
@@ -241,6 +477,12 @@ impl Default for MemorySearchInput {
             strategy: RetrievalStrategy::default(),
             expand_co_retrieval: false,
             bootstrap: false,
+            scope: Default::default(),
+            include_expired: true,
+            min_confidence: 0.0,
+            include_raw: false,
+            filters: SearchFilters::default(),
+            window: Default::default(),
         }
     }
 }
@@ -271,6 +513,9 @@ pub struct MemoryListInput {
     /// [`MemoryAddInput::sensitive`] for why this is not access control.
     #[serde(default)]
     pub include_sensitive: bool,
+    /// Narrow to a project, branch, session or writer (schema v32).
+    #[serde(default, flatten)]
+    pub scope: crate::context::ScopeFilter,
 }
 
 fn default_list_limit() -> usize {
@@ -381,6 +626,10 @@ pub struct AnnotationApplied {
     pub memory_id: String,
     /// Number of *new* mention links created for this memory.
     pub entities_linked: usize,
+    /// Memories this annotation superseded because its triple contradicts
+    /// theirs, as `decompose` does.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub superseded_ids: Vec<String>,
 }
 
 /// Why one annotation in the batch could not be applied.
@@ -829,6 +1078,10 @@ pub struct AtomicFact {
     pub object: Option<String>,
     #[serde(default)]
     pub entities: Vec<EntityInput>,
+    /// Kind-specific metadata (a decision's `rationale`, say), merged into
+    /// the fact's own.
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
 }
 
 /// A batch of facts to write against one capture.
@@ -836,6 +1089,12 @@ pub struct AtomicFact {
 pub struct DecomposeInput {
     pub capture_id: String,
     pub facts: Vec<AtomicFact>,
+    /// The `capture_revision` the facts were drawn from, as the decompose
+    /// queue reported it (RFC 3339). The capture leaves the queue only up to
+    /// that revision, so a recapture landing while the facts are written is
+    /// still due (ADR-0029). Without it, the facts' write time is used.
+    #[serde(default)]
+    pub capture_revision: Option<String>,
 }
 
 /// Inclusive bounds the reference enforces on a decomposition.
@@ -964,6 +1223,10 @@ pub struct DecomposeResult {
 pub struct DecomposeBatchInput {
     #[serde(default = "default_decompose_batch_size")]
     pub batch_size: usize,
+    /// Only captures unchanged for at least this many minutes: a scheduled
+    /// pass leaves a live session until it settles (ADR-0029). `0` takes all.
+    #[serde(default)]
+    pub idle_minutes: u32,
 }
 
 fn default_decompose_batch_size() -> usize {
@@ -983,6 +1246,9 @@ pub struct UndecomposedCapture {
     pub content_snippet: String,
     pub category: String,
     pub tags: Vec<String>,
+    /// When any row of this capture last changed (RFC 3339): pass it back as
+    /// [`DecomposeInput::capture_revision`].
+    pub capture_revision: String,
 }
 
 /// A page of captures awaiting decomposition.
@@ -1658,6 +1924,55 @@ pub struct ContradictionCandidate {
     /// the conflict reads, and re-deriving the join caller-side is work the
     /// producer has already done.
     pub shared_entities: Vec<String>,
+    /// When both sides state the same subject and predicate with different
+    /// objects, the one to keep: higher confidence, then newer
+    /// `verified_at`, then newer `updated_at`. `memory_a` is then that side.
+    /// Absent for pairs that are not a triple conflict, or are a dead heat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommended_keep: Option<String>,
+}
+
+/// Why a saved decision was matched against an existing one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictReason {
+    /// The same subject and predicate with a different object.
+    SameClaim,
+    /// A shared entity and enough word overlap to read as the same topic.
+    SharedEntity,
+}
+
+/// An existing standing decision that a just-saved decision may contradict.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DecisionConflict {
+    pub memory: ContradictionSide,
+    /// `1.0` for [`ConflictReason::SameClaim`], else the content's word
+    /// overlap (Jaccard), at least [`crate::contradictions::ON_SAVE_MIN_OVERLAP`].
+    pub score: f64,
+    pub reason: ConflictReason,
+    /// Names of the entities both decisions mention, in name order.
+    pub shared_entities: Vec<String>,
+}
+
+/// What the contradiction check on save adds to a write's result. Both
+/// fields are omitted when empty, so a write that found nothing reads as
+/// it always has.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SaveCheck {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contradiction_candidates: Vec<DecisionConflict>,
+    /// The check failed; the write it followed still stands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contradiction_check_error: Option<String>,
+}
+
+/// A memory as a write returns it, with the contradiction check's findings.
+#[derive(Debug, Clone, Serialize)]
+pub struct SavedMemory<'a> {
+    #[serde(flatten)]
+    pub memory: &'a Memory,
+    #[serde(flatten)]
+    pub check: SaveCheck,
 }
 
 /// A page of candidate pairs.
@@ -1745,7 +2060,19 @@ pub struct DigestData {
     pub vitality: crate::vitality::VitalityReport,
     pub reminders_upcoming: Vec<DigestReminder>,
     pub reminders_overdue: Vec<DigestReminder>,
+    /// Decisions whose follow-up review is due (`crate::review`). Defaulted
+    /// so a digest serialised before follow-ups existed still reads.
+    #[serde(default)]
+    pub reviews_due: Vec<DigestReview>,
     pub sync: SyncStatus,
+}
+
+/// One decision due for review, as the digest lists it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DigestReview {
+    pub id: String,
+    pub due: String,
+    pub content: String,
 }
 
 /// One reminder as the digest lists it.
@@ -1771,6 +2098,25 @@ pub struct DigestInput {
 
 fn default_digest_since_days() -> i64 {
     crate::digest::DEFAULT_SINCE_DAYS
+}
+
+/// Request for a project brief (`remind_me_brief`). Strict: an unknown
+/// field is refused rather than ignored, so a misspelled `since` is not a
+/// silent 7-day window.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BriefInput {
+    pub project: String,
+    #[serde(default)]
+    pub since: Option<String>,
+    #[serde(default = "default_brief_token_budget")]
+    pub token_budget: usize,
+    #[serde(default)]
+    pub response_format: Option<ResponseFormat>,
+}
+
+fn default_brief_token_budget() -> usize {
+    crate::context_brief::DEFAULT_TOKEN_BUDGET
 }
 
 // ---------------------------------------------------------------------------
@@ -1830,8 +2176,13 @@ pub struct OutboxStatus {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TombstoneStatus {
+    /// Deleted memories this store keeps as tombstones, for last-write-wins.
+    /// They are never purged (ADR-0024).
     pub total: i64,
-    pub compactable_now: i64,
+    /// Tombstones that still hold their text. Every open empties them, as
+    /// does every delete and sync apply, so anything but 0 means a
+    /// tombstone arrived or was written some other way.
+    pub holding_text: i64,
 }
 
 /// One remote's contact state.
@@ -2059,3 +2410,42 @@ impl Default for ListRemindersInput {
 pub const STALE_CANDIDATES_LIMIT_MIN: usize = 1;
 pub const STALE_CANDIDATES_LIMIT_MAX: usize = 100;
 pub const STALE_CANDIDATES_LIMIT_DEFAULT: usize = 20;
+
+pub use crate::kinds::MemoryKind;
+
+#[cfg(test)]
+mod write_context_tests {
+    use super::WriteContext;
+    use crate::db::memories::NewMemory;
+
+    #[test]
+    fn apply_sets_what_it_knows_and_leaves_the_rest() {
+        let context = WriteContext {
+            project: Some("quokka".into()),
+            git_branch: Some("main".into()),
+            cwd: Some("/work".into()),
+            ..WriteContext::default()
+        };
+        let mut row = NewMemory {
+            session_id: Some("explicit".into()),
+            git_branch: Some("overridden".into()),
+            ..NewMemory::new("m", "x", "2026-09-26T00:00:00+00:00")
+        };
+        context.apply(&mut row);
+        assert_eq!(row.project.as_deref(), Some("quokka"));
+        assert_eq!(
+            row.git_branch.as_deref(),
+            Some("main"),
+            "a known value wins"
+        );
+        assert_eq!(row.cwd.as_deref(), Some("/work"));
+        assert_eq!(
+            row.session_id.as_deref(),
+            Some("explicit"),
+            "an unknown leaves it"
+        );
+        assert_eq!(row.git_remote, None);
+        assert_eq!(row.git_sha, None);
+        assert_eq!(row.written_by, "unknown", "not a context column");
+    }
+}

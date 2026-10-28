@@ -154,34 +154,15 @@ fn write_keys(keys: &[StoredKey]) -> Result<(), ApiKeyError> {
             .map_err(|e| ApiKeyError::Io(format!("creating {}: {}", parent.display(), e)))?;
     }
 
-    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
     let body = serde_json::to_string_pretty(&KeyFile {
         keys: keys.to_vec(),
     })
     .map_err(|e| ApiKeyError::Io(e.to_string()))?;
 
-    std::fs::write(&temp, body + "\n")
-        .map_err(|e| ApiKeyError::Io(format!("writing {}: {}", temp.display(), e)))?;
-
-    // Tightened before the rename, not after: between a world-readable create
-    // and a later chmod there is a window in which the hashes are readable.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600)) {
-            let _ = std::fs::remove_file(&temp);
-            return Err(ApiKeyError::Io(format!(
-                "securing {}: {}",
-                temp.display(),
-                e
-            )));
-        }
-    }
-
-    std::fs::rename(&temp, &path).map_err(|e| {
-        let _ = std::fs::remove_file(&temp);
-        ApiKeyError::Io(format!("replacing {}: {}", path.display(), e))
-    })
+    // Created 0600, so the hashes are never readable by others, not even
+    // briefly before a chmod.
+    rusty_atomic_file::write_private(&path, (body + "\n").as_bytes())
+        .map_err(|e| ApiKeyError::Io(format!("replacing {}: {}", path.display(), e)))
 }
 
 /// Every stored key's name, scope and creation time — never a hash, never a

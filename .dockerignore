@@ -1,0 +1,5 @@
+# Build context for the hub image (crates/remind_me_hub/Containerfile), which
+# builds from the repository root.
+.git
+target
+**/target

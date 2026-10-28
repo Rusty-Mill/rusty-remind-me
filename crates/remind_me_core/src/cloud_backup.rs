@@ -137,6 +137,26 @@ pub fn plaintext_gate() -> Result<(), String> {
     Err(PLAINTEXT_REFUSED.to_string())
 }
 
+/// What uploading the engine backup directory `path` does: nothing yet.
+/// The upload sends one file, and an engine backup is a directory, so a
+/// configured bucket gets an honest `Unavailable` rather than a silent skip.
+/// The plaintext gate is checked first, as it is for a file: a bucket that
+/// may not receive plaintext is told that, whatever the upload could do.
+pub fn upload_backup_dir(path: &std::path::Path) -> UploadOutcome {
+    if configured_bucket().is_empty() {
+        return UploadOutcome::NotConfigured;
+    }
+    if let Err(reason) = plaintext_gate() {
+        return UploadOutcome::Refused { reason };
+    }
+    UploadOutcome::Unavailable {
+        reason: format!(
+            "{} is a backup of a store on the engine, a directory; uploading those is not built yet",
+            path.display()
+        ),
+    }
+}
+
 /// Upload a finished backup file.
 ///
 /// Never returns an error: the caller is `create_backup`, which has already
@@ -300,8 +320,8 @@ mod put_object_tests {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn clear() {
-        std::env::remove_var(ENDPOINT_ENV);
-        std::env::remove_var(REGION_ENV);
+        crate::test_env::remove_var(ENDPOINT_ENV);
+        crate::test_env::remove_var(REGION_ENV);
     }
 
     #[test]
@@ -338,7 +358,7 @@ mod put_object_tests {
     fn a_custom_endpoint_forces_path_style_addressing() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear();
-        std::env::set_var(ENDPOINT_ENV, "https://s3.us-west-002.backblazeb2.com");
+        crate::test_env::set_var(ENDPOINT_ENV, "https://s3.us-west-002.backblazeb2.com");
 
         let plan = plan_put_object("bucket", "key");
 
@@ -360,7 +380,7 @@ mod put_object_tests {
     fn a_configured_region_is_passed_through() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear();
-        std::env::set_var(REGION_ENV, "us-west-002");
+        crate::test_env::set_var(REGION_ENV, "us-west-002");
 
         let plan = plan_put_object("bucket", "key");
 
@@ -372,8 +392,8 @@ mod put_object_tests {
     fn a_blank_endpoint_or_region_is_treated_as_unset() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear();
-        std::env::set_var(ENDPOINT_ENV, "   ");
-        std::env::set_var(REGION_ENV, "   ");
+        crate::test_env::set_var(ENDPOINT_ENV, "   ");
+        crate::test_env::set_var(REGION_ENV, "   ");
 
         let plan = plan_put_object("bucket", "key");
 

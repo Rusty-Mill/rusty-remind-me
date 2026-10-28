@@ -1,13 +1,18 @@
+use super::{Result, Store, StoreError};
+use crate::db::memories::{
+    is_raw_category, EntityMembers, EntityScope, KeywordFilter, ListFilter, Memories, MemoryEdit,
+    Narrowing, NewMemory, PageFilter,
+};
 use crate::expansion::{self, MemorySearchResponse};
-use crate::fts::sanitize_fts_query;
+use crate::kinds::StructuredFields;
 use crate::models::{
     AnnotateInput, AnnotateResult, AnnotationApplied, AnnotationError, BulkDeleteResult,
     BulkTagInput, BulkTagResult, ExtractBatchInput, ExtractBatchResult, Memory, MemoryAddInput,
     MemoryListInput, MemoryListResult, MemorySearchInput, MemorySearchResult, MemoryUpdateInput,
     ReclassifyBatchInput, ReclassifyBatchResult, ReclassifyInput, ReclassifyResult,
-    SearchPageInput, SearchPageResult, TagMode, UnannotatedMemory, UnclassifiedMemory,
-    UpdateOutcome, EXTRACT_BATCH_MAX, EXTRACT_BATCH_MIN, LIST_LIMIT_MAX, LIST_LIMIT_MIN,
-    RECLASSIFY_BATCH_MAX, RECLASSIFY_BATCH_MIN, UNCLASSIFIED,
+    SearchPageInput, SearchPageResult, TagMode, UpdateOutcome, EXTRACT_BATCH_MAX,
+    EXTRACT_BATCH_MIN, LIST_LIMIT_MAX, LIST_LIMIT_MIN, RECLASSIFY_BATCH_MAX, RECLASSIFY_BATCH_MIN,
+    UNCLASSIFIED,
 };
 use crate::retrieval::{
     choose_rrf_weights, rank_rrf, rrf_k_from_env, trim_by_token_budget, RrfConfig, RrfFusion,
@@ -15,87 +20,29 @@ use crate::retrieval::{
 };
 use crate::vitality::{
     apply_feedback_adjustment, calculate_vitality, get_decay_rate, get_source_prior,
-    get_type_prior, EFFECTIVE_VITALITY_FN, VITALITY_FLOOR,
+    get_type_prior, VITALITY_FLOOR,
 };
 use chrono::Utc;
-use rusqlite::types::Value;
-use rusqlite::{params, params_from_iter, Connection, Result, Row};
 
-/// Columns selected wherever a full [`Memory`] is parsed via [`parse_memory_row`].
-///
-/// This list must stay a superset of what [`parse_memory_row`] reads, and the
-/// serialised [`Memory`] must in turn cover every column of `memories` — see
-/// `memory_json_test.rs`, which asserts exactly that against the live schema.
-/// A column added to the schema but not here silently vanished from every
-/// tool response before #198.
-pub const MEMORY_COLUMNS: &str = "id, content, category, tags, source, metadata, created_at, \
-     updated_at, capture_id, subject, predicate, object, superseded_by, decay_rate, vitality, \
-     base_weight, access_count, accessed_at, doc_id, chunk_index, remind_at, sensitive, \
-     memory_type, status, node_id, client, source_capture_id, deleted_at";
-
-/// [`MEMORY_COLUMNS`] with each name qualified by `alias`, for queries that join.
-pub fn prefixed_memory_columns(alias: &str) -> String {
-    MEMORY_COLUMNS
-        .split(',')
-        .map(|c| format!("{}.{}", alias, c.trim()))
-        .collect::<Vec<_>>()
-        .join(", ")
+pub fn add_memory(store: &Store<'_>, input: MemoryAddInput) -> Result<Memory> {
+    add_memory_with(store, input, &StructuredFields::default())
 }
 
-pub fn parse_memory_row(row: &Row) -> Result<Memory> {
-    let tags_json: String = row.get("tags")?;
-    let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
-
-    let meta_json: String = row.get("metadata")?;
-    let metadata: serde_json::Value =
-        serde_json::from_str(&meta_json).unwrap_or(serde_json::Value::Null);
-
-    let created_at: String = row.get("created_at")?;
-
-    Ok(Memory {
-        id: row.get("id")?,
-        content: row.get("content")?,
-        category: row.get("category")?,
-        tags,
-        source: row.get("source")?,
-        metadata,
-        created_at: created_at.clone(),
-        updated_at: row.get("updated_at")?,
-        capture_id: row.get("capture_id")?,
-        subject: row.get("subject")?,
-        predicate: row.get("predicate")?,
-        object: row.get("object")?,
-        superseded_by: row.get("superseded_by")?,
-        decay_rate: row.get("decay_rate")?,
-        vitality: row.get("vitality")?,
-        base_weight: row.get("base_weight")?,
-        access_count: row.get("access_count")?,
-        // The column is nullable and a row written by `remind_me` may leave it
-        // unset. Falling back to `created_at` matches the reference, and keeps
-        // `get::<String>` from failing on NULL.
-        accessed_at: row
-            .get::<_, Option<String>>("accessed_at")?
-            .unwrap_or_else(|| created_at.clone()),
-        doc_id: row.get("doc_id")?,
-        chunk_index: row.get("chunk_index")?,
-        remind_at: row.get("remind_at")?,
-        // SQLite has no boolean type and the column is nullable, so this
-        // arrives as 0/1/NULL. Same shape trap as `SyncRecord::sensitive`.
-        sensitive: row.get::<_, Option<i64>>("sensitive")?.unwrap_or(0) != 0,
-        // Read as Option even where the column is NOT NULL: this database is
-        // shared with `remind_me`, and a row written before a column gained
-        // its default arrives as NULL. A non-optional get would fail the whole
-        // read rather than report a missing value.
-        memory_type: row.get("memory_type")?,
-        status: row.get("status")?,
-        node_id: row.get("node_id")?,
-        client: row.get("client")?,
-        source_capture_id: row.get("source_capture_id")?,
-        deleted_at: row.get("deleted_at")?,
-    })
-}
-
-pub fn add_memory(conn: &Connection, mut input: MemoryAddInput) -> Result<Memory> {
+/// [`add_memory`] with the structured fields (`memory_type`, `confidence`,
+/// the validity window, `outcome`) a writer may set. Validated first: a
+/// malformed kind is refused with an error naming the field, nothing stored.
+pub fn add_memory_with(
+    store: &Store<'_>,
+    mut input: MemoryAddInput,
+    fields: &StructuredFields,
+) -> Result<Memory> {
+    fields.validate(&input.metadata, None)?;
+    crate::project::refuse_reserved_predicate(input.predicate.as_deref())?;
+    if let Some(scheduled) =
+        crate::review::schedule_if_decision(fields.memory_type.as_deref(), &input.metadata)
+    {
+        input.metadata = scheduled;
+    }
     let now = Utc::now();
     let now_iso = now.to_rfc3339();
     let id = format!("mem_{}", uuid::Uuid::new_v4().simple());
@@ -104,56 +51,92 @@ pub fn add_memory(conn: &Connection, mut input: MemoryAddInput) -> Result<Memory
     let code_refs = crate::code_refs::detect_code_refs(&input.content);
     crate::code_refs::merge_code_refs(&mut input.metadata, &code_refs);
 
-    let tags_json = serde_json::to_string(&input.tags).unwrap_or_else(|_| "[]".to_string());
-    let metadata_json = serde_json::to_string(&input.metadata).unwrap_or_else(|_| "{}".to_string());
-    let decay_rate = get_decay_rate(&input.category);
-    let type_prior = get_type_prior(&input.category);
+    // Write boundary: scrub secrets first (so nothing downstream sees them),
+    // and resolve attachments before the insert so a bad path fails the add.
+    let content = crate::boundary::scrub(&input.content, &mut input.tags, &mut input.metadata);
+    let attachments = crate::attachments::resolve(&input.attachments)?;
+    crate::attachments::merge_metadata(&mut input.metadata, &attachments);
+
+    // A stated kind drives decay and weight; otherwise the category does, as
+    // it always has.
+    let kind = fields.memory_type.as_deref().unwrap_or(&input.category);
+    let decay_rate = get_decay_rate(kind);
+    let type_prior = get_type_prior(kind);
     let source_prior = get_source_prior(&input.source);
     let base_weight = type_prior * source_prior;
     let initial_vitality = calculate_vitality(base_weight, 0, decay_rate, &now_iso, now);
 
-    conn.execute(
-        "INSERT INTO memories (
-            id, content, category, tags, source, metadata, created_at, updated_at,
-            subject, predicate, object, decay_rate, vitality, base_weight, access_count, accessed_at,
-            node_id, client, sensitive
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)",
-        params![
-            id,
-            input.content,
-            input.category,
-            tags_json,
-            input.source,
-            metadata_json,
-            now_iso,
-            now_iso,
-            input.subject,
-            input.predicate,
-            input.object,
+    let write = |tx: &Store<'_>| -> Result<()> {
+        Memories::new(tx).insert(&NewMemory {
+            category: input.category.clone(),
+            tags: input.tags.clone(),
+            source: input.source.clone(),
+            metadata: input.metadata.clone(),
+            subject: input.subject.clone(),
+            predicate: input.predicate.clone(),
+            object: input.object.clone(),
             decay_rate,
-            initial_vitality,
+            vitality: initial_vitality,
             base_weight,
-            now_iso,
-            crate::sync::configured_node_id(),
-            crate::sync::configured_client(),
-            input.sensitive,
-        ],
-    )?;
+            accessed_at: Some(now_iso.clone()),
+            sensitive: input.sensitive,
+            memory_type: fields
+                .memory_type
+                .clone()
+                .unwrap_or_else(|| UNCLASSIFIED.to_string()),
+            confidence: fields
+                .confidence
+                .unwrap_or_else(crate::models::default_confidence),
+            valid_from: fields.valid_from.clone(),
+            valid_until: fields.valid_until.clone(),
+            verified_at: fields.verified_at.clone(),
+            outcome: fields.outcome.clone(),
+            ..crate::context::default_provenance().stamp(NewMemory::new(
+                id.clone(),
+                content.clone(),
+                &now_iso,
+            ))
+        })?;
 
-    // `MemoryAddInput::entities` was previously parsed and then dropped, so a
-    // caller supplying entity mentions got a silent no-op. Same path as
-    // `annotate_memories` so both behave identically.
-    crate::entity::apply_entity_mentions(conn, &id, &input.entities)?;
+        // `MemoryAddInput::entities` was previously parsed and then dropped, so a
+        // caller supplying entity mentions got a silent no-op. Same path as
+        // `annotate_memories` so both behave identically.
+        crate::boundary::index(
+            tx,
+            &id,
+            &content,
+            &input.entities,
+            input.extract,
+            &attachments,
+            &now_iso,
+        )?;
+
+        // Stamped, so the change reaches the sync outbox.
+        for old in &input.supersedes {
+            retire(tx, old, &id, &now_iso)?;
+        }
+        Ok(())
+    };
+    // With `supersedes`, one transaction: the insert, its index and every
+    // retirement land together or not at all, and each target is checked
+    // inside it, so no other writer can change it between check and write.
+    // Without, the add stays the plain write it always was.
+    if input.supersedes.is_empty() {
+        write(store)?;
+    } else {
+        store.transaction(write)?;
+    }
 
     // Best-effort: no embedder configured, or one that fails mid-request,
     // leaves this memory keyword-searchable only — never a reason to fail
     // the write that already succeeded. `remind_me_reindex` is the backstop
     // for anything that lands here without an embedder available.
     if let Some(embedder) = crate::embedder::available_embedder() {
-        let _ = crate::vectors::embed_and_store(conn, &*embedder, &id, &input.content);
+        let _ = crate::vectors::embed_and_store(store, &*embedder, &id, &content);
     }
 
-    let memory = get_memory_by_id(conn, &id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+    let memory = get_memory_by_id(store, &id)?.ok_or(StoreError::NotFound)?;
+    crate::episodes::ensure_session_for(store, &memory)?;
 
     // Local mutation, so automation hears about it. A record arriving from a
     // peer goes through `sync::upsert_record` instead, which deliberately
@@ -164,96 +147,44 @@ pub fn add_memory(conn: &Connection, mut input: MemoryAddInput) -> Result<Memory
     Ok(memory)
 }
 
-pub fn get_memory_by_id(conn: &Connection, id: &str) -> Result<Option<Memory>> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {} FROM memories WHERE id = ? AND deleted_at IS NULL",
-        MEMORY_COLUMNS
-    ))?;
-
-    let mut rows = stmt.query_map(params![id], parse_memory_row)?;
-    if let Some(row) = rows.next() {
-        row.map(Some)
-    } else {
-        Ok(None)
-    }
+/// Mark live memory `old` superseded by `new`, refusing one that is missing,
+/// deleted, already superseded or a project claim (claims are append-only).
+fn retire(store: &Store<'_>, old: &str, new: &str, now_iso: &str) -> Result<()> {
+    let target = get_memory_by_id(store, old)?.filter(|m| m.superseded_by.is_none());
+    let Some(target) = target else {
+        return Err(StoreError::Invalid(format!(
+            "supersedes: {old:?} is not a live memory (missing, deleted or already superseded)"
+        )));
+    };
+    crate::project::refuse_claim_edit(&target)?;
+    Memories::new(store).set_superseded_by(old, new, Some(now_iso))
 }
 
-/// Build the shared `WHERE` clause and its bindings for [`list_memories`].
-///
-/// Tag matching is ALL-of, one `EXISTS` per requested tag, against the
-/// normalized `memory_tags` index. That table is kept in step with the JSON
-/// `tags` column by the `memories_tags_ai` / `_au` / `_ad` triggers, so the two
-/// representations cannot drift.
-///
-/// The predicate stays in SQL rather than filtering parsed rows in Rust, which
-/// is what lets `COUNT`, `LIMIT` and `OFFSET` stay correct — the reference hit
-/// exactly that pagination bug as `DATA-02`. This previously scanned
-/// `json_each(m.tags)` for the same reason, before `memory_tags` existed;
-/// `idx_memory_tags_tag` now serves it without parsing JSON per row.
-fn list_filters(input: &MemoryListInput) -> (String, Vec<Value>) {
-    let mut conditions = vec!["m.deleted_at IS NULL".to_string()];
-    let mut bindings: Vec<Value> = Vec::new();
-
-    // Applied here rather than after the query so `COUNT`, `LIMIT` and
-    // `OFFSET` all agree — the same reason every other filter in this function
-    // is a SQL condition rather than a post-filter.
-    if !input.include_sensitive {
-        conditions.push("m.sensitive = 0".to_string());
-    }
-
-    if let Some(category) = input.category.as_ref().filter(|c| !c.is_empty()) {
-        conditions.push("m.category = ?".to_string());
-        bindings.push(Value::Text(category.clone()));
-    }
-    if let Some(source) = input.source.as_ref().filter(|s| !s.is_empty()) {
-        conditions.push("m.source = ?".to_string());
-        bindings.push(Value::Text(source.clone()));
-    }
-    for tag in input.tags.iter().flatten() {
-        conditions.push(
-            "EXISTS (SELECT 1 FROM memory_tags mt WHERE mt.memory_id = m.id AND mt.tag = ?)"
-                .to_string(),
-        );
-        bindings.push(Value::Text(tag.clone()));
-    }
-
-    (format!("WHERE {}", conditions.join(" AND ")), bindings)
+pub fn get_memory_by_id(store: &Store<'_>, id: &str) -> Result<Option<Memory>> {
+    Memories::new(store).get_live(id)
 }
 
 /// List memories newest-first, filtered by category, source and/or tags.
 ///
 /// `limit` is clamped to [`LIST_LIMIT_MIN`]..=[`LIST_LIMIT_MAX`]; the clamped
 /// value is echoed back in the result so callers can tell what was applied.
-pub fn list_memories(conn: &Connection, input: &MemoryListInput) -> Result<MemoryListResult> {
+pub fn list_memories(store: &Store<'_>, input: &MemoryListInput) -> Result<MemoryListResult> {
     let limit = input.limit.clamp(LIST_LIMIT_MIN, LIST_LIMIT_MAX);
-    let (where_clause, bindings) = list_filters(input);
-
-    let total: i64 = conn.query_row(
-        &format!("SELECT count(*) FROM memories m {}", where_clause),
-        params_from_iter(bindings.iter()),
-        |row| row.get(0),
-    )?;
-
-    let sql = format!(
-        "SELECT {} FROM memories m {} ORDER BY m.created_at DESC, m.id DESC LIMIT ? OFFSET ?",
-        MEMORY_COLUMNS, where_clause
-    );
-    let mut page_bindings = bindings;
-    page_bindings.push(Value::Integer(limit as i64));
-    page_bindings.push(Value::Integer(input.offset as i64));
-
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(page_bindings.iter()), parse_memory_row)?;
-
-    let mut memories = Vec::new();
-    for row in rows {
-        memories.push(row?);
-    }
+    // Filters apply before `COUNT`, `LIMIT` and `OFFSET`, so all three agree:
+    // the reference hit exactly that pagination bug as `DATA-02`.
+    let filter = ListFilter {
+        include_sensitive: input.include_sensitive,
+        category: input.category.clone().filter(|c| !c.is_empty()),
+        source: input.source.clone().filter(|s| !s.is_empty()),
+        tags: input.tags.clone().unwrap_or_default(),
+        scope: input.scope.clone(),
+    };
+    let (total, memories) = Memories::new(store).list_page(&filter, limit, input.offset)?;
 
     Ok(MemoryListResult {
         count: memories.len(),
         memories,
-        total: total.max(0) as usize,
+        total,
         limit,
         offset: input.offset,
     })
@@ -270,50 +201,61 @@ pub fn list_memories(conn: &Connection, input: &MemoryListInput) -> Result<Memor
 ///
 /// `vitality`, `base_weight` and `access_count` are left alone too: they encode
 /// accrued retrieval history, and resetting them on an edit would discard it.
-pub fn update_memory(conn: &Connection, input: &MemoryUpdateInput) -> Result<UpdateOutcome> {
-    if get_memory_by_id(conn, &input.memory_id)?.is_none() {
+pub fn update_memory(store: &Store<'_>, input: &MemoryUpdateInput) -> Result<UpdateOutcome> {
+    update_memory_with(store, input, &StructuredFields::default())
+}
+
+/// [`update_memory`] with the structured fields a writer may set. Validated
+/// against the metadata the memory will hold after this edit and the kind it
+/// will have, so `outcome` on a `fact`, or a `decision` with no rationale, is
+/// refused before anything is written.
+///
+/// A new `memory_type` also rewrites `decay_rate`, as `reclassify` does:
+/// the type owns the rate.
+pub fn update_memory_with(
+    store: &Store<'_>,
+    input: &MemoryUpdateInput,
+    fields: &StructuredFields,
+) -> Result<UpdateOutcome> {
+    let Some(stored) = get_memory_by_id(store, &input.memory_id)? else {
         return Ok(UpdateOutcome::NotFound);
-    }
+    };
+    crate::project::refuse_claim_edit(&stored)?;
+    let metadata = input.metadata.as_ref().unwrap_or(&stored.metadata);
+    fields.validate(metadata, stored.memory_type.as_deref())?;
+    // Becoming a decision schedules its follow-up; staying one does not.
+    let scheduled = if stored.memory_type.as_deref() == Some("decision") {
+        None
+    } else {
+        crate::review::schedule_if_decision(fields.memory_type.as_deref(), metadata)
+    };
 
-    let mut sets: Vec<&str> = Vec::new();
-    let mut bindings: Vec<Value> = Vec::new();
-
-    if let Some(content) = &input.content {
-        sets.push("content = ?");
-        bindings.push(Value::Text(content.clone()));
-    }
-    if let Some(category) = &input.category {
-        sets.push("category = ?");
-        bindings.push(Value::Text(category.clone()));
-    }
-    if let Some(tags) = &input.tags {
-        sets.push("tags = ?");
-        bindings.push(Value::Text(
-            serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string()),
-        ));
-    }
-    if let Some(metadata) = &input.metadata {
-        sets.push("metadata = ?");
-        bindings.push(Value::Text(
-            serde_json::to_string(metadata).unwrap_or_else(|_| "{}".to_string()),
-        ));
-    }
-
-    // `Option<bool>` rather than `bool`: `None` means "leave it alone", so an
-    // update that does not mention the flag cannot silently clear it.
-    if let Some(sensitive) = input.sensitive {
-        sets.push("sensitive = ?");
-        bindings.push(Value::Integer(sensitive as i64));
-    }
-
-    // Unconditional NULL rather than a bound parameter: the flag has only one
-    // direction. Re-superseding is `remind_me_add`'s job, on detecting a
-    // contradiction -- it is never something an update asserts directly.
-    if input.clear_superseded {
-        sets.push("superseded_by = NULL");
-    }
-
-    if sets.is_empty() {
+    // `sensitive` is an `Option<bool>`: `None` leaves the flag alone, so an
+    // update that does not mention it cannot silently clear it.
+    // `clear_superseded` has one direction only: re-superseding is
+    // `remind_me_add`'s job, on detecting a contradiction, never something an
+    // update asserts directly.
+    let edit = MemoryEdit {
+        content: input.content.clone(),
+        category: input.category.clone(),
+        tags: input.tags.clone(),
+        metadata: scheduled.or_else(|| input.metadata.clone()),
+        sensitive: input.sensitive,
+        clear_superseded: input.clear_superseded,
+        memory_type: fields.memory_type.clone(),
+        decay_rate: fields.memory_type.as_deref().map(get_decay_rate),
+        confidence: fields.confidence,
+        valid_from: fields.valid_from.clone(),
+        valid_until: fields.valid_until.clone(),
+        verified_at: fields.verified_at.clone(),
+        outcome: fields.outcome.clone(),
+        ..MemoryEdit::at(Utc::now().to_rfc3339())
+    };
+    let nothing_to_write = MemoryEdit {
+        updated_at: edit.updated_at.clone(),
+        ..MemoryEdit::default()
+    };
+    if edit == nothing_to_write {
         return Ok(UpdateOutcome::NoFields);
     }
 
@@ -338,16 +280,9 @@ pub fn update_memory(conn: &Connection, input: &MemoryUpdateInput) -> Result<Upd
             .map(|m| serde_json::to_string(m).unwrap_or_else(|_| "{}".to_string())),
         sensitive: input.sensitive,
     };
-    crate::history::capture_revision(conn, &input.memory_id, &tracked, None)?;
+    crate::history::capture_revision(store, &input.memory_id, &tracked, None)?;
 
-    sets.push("updated_at = ?");
-    bindings.push(Value::Text(Utc::now().to_rfc3339()));
-    bindings.push(Value::Text(input.memory_id.clone()));
-
-    conn.execute(
-        &format!("UPDATE memories SET {} WHERE id = ?", sets.join(", ")),
-        params_from_iter(bindings.iter()),
-    )?;
+    Memories::new(store).apply_edit(&input.memory_id, &edit)?;
 
     // Only a content change invalidates the stored embeddings — category,
     // tags and metadata don't change what the text means. Best-effort, same
@@ -355,12 +290,11 @@ pub fn update_memory(conn: &Connection, input: &MemoryUpdateInput) -> Result<Upd
     // that already committed.
     if let Some(content) = &input.content {
         if let Some(embedder) = crate::embedder::available_embedder() {
-            let _ = crate::vectors::embed_and_store(conn, &*embedder, &input.memory_id, content);
+            let _ = crate::vectors::embed_and_store(store, &*embedder, &input.memory_id, content);
         }
     }
 
-    let memory =
-        get_memory_by_id(conn, &input.memory_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+    let memory = get_memory_by_id(store, &input.memory_id)?.ok_or(StoreError::NotFound)?;
     crate::events::emit(crate::events::Event::Updated, &memory.id, &memory.category);
 
     Ok(UpdateOutcome::Updated(Box::new(memory)))
@@ -370,96 +304,70 @@ pub fn update_memory(conn: &Connection, input: &MemoryUpdateInput) -> Result<Upd
 ///
 /// Soft-deletes (tombstones via `deleted_at` + bumps `updated_at`) when sync
 /// is configured (`NODE_ID and HUB_URL and SYNC_SECRET`, `#57`), matching the
-/// reference exactly: a hard `DELETE` produces no outbox row at all (the
-/// sync triggers only fire on INSERT/UPDATE), so it would otherwise silently
-/// resurrect on the next pull elsewhere. The tombstone is excluded from every
+/// reference exactly: a hard `DELETE` queues no outbox row at all, so it
+/// would otherwise silently resurrect on the next pull elsewhere. The tombstone is excluded from every
 /// normal read (`deleted_at IS NULL` everywhere this crate reads memories)
 /// and, on a node with sync disabled, there is nothing to propagate to, so
 /// this is a plain, immediate delete exactly as before.
 ///
-/// **Known limitation**: the installed `memories_outbox_au` trigger's
-/// payload (`schema_triggers.sql`, generated verbatim and not this crate's
-/// file to hand-edit) does not carry `deleted_at` at all, so this tombstone
-/// does not yet actually propagate over the wire even though the row is
-/// correctly marked locally — see
-/// `docs/adr/0004-sync-protocol-and-conflict-resolution.md`'s "Known
-/// limitation" section. There is no background compaction of old tombstones
-/// yet either (the reference's own `TOMBSTONE_RETENTION_DAYS`); both are
-/// left for a follow-up once the schema carries what tombstone propagation
-/// actually needs.
+/// The queued payload carries `deleted_at`, so the tombstone travels. The
+/// tombstone keeps no text (ADR-0024): its content becomes
+/// [`crate::sync::TOMBSTONE_CONTENT`] and its tags and triple go, and its
+/// revision history is deleted on either path. It is never purged, since the
+/// row is what a stale copy of the memory loses to.
 ///
-/// The FTS row and `memory_tags` are handled by triggers. Everything else is
+/// The FTS row and `memory_tags` go with the write (`db::derived`). Everything else is
 /// cleaned up explicitly, because the reference's schema carries **no foreign
 /// keys** on `memory_entities`, `memory_feedback` or `memory_associations` —
 /// deliberately, since sync can deliver a link before the memory it points at,
 /// and a cascade would reject that. This crate previously relied on a cascade
 /// it had added itself; regenerating the schema from `remind_me` removed it.
-pub fn delete_memory(conn: &Connection, memory_id: &str) -> Result<bool> {
-    // Fetched before either delete path: once a hard delete removes the row
-    // there is no `WHERE id = ?` left to find its rowid by, and that rowid
-    // is exactly what `vec_chunks` is keyed on. Matches the reference's own
-    // `memory_delete` order (fetch rowid, clean up vectors, then delete or
-    // tombstone) rather than only cleaning up vectors on a hard delete —
-    // a tombstoned memory's embeddings are stale the moment it stops being
-    // searchable, same as an incoming sync tombstone's are.
-    // The category comes out with the rowid rather than in a second query: a
-    // hard delete removes the row, so after this point there is nothing left
-    // to read it from, and the event would have to guess.
-    let existing: Option<(i64, String)> = conn
-        .query_row(
-            "SELECT rowid, category FROM memories WHERE id = ? AND deleted_at IS NULL",
-            params![memory_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .ok();
-    let memory_rowid: Option<i64> = existing.as_ref().map(|(rowid, _)| *rowid);
-    let category: Option<String> = existing.map(|(_, category)| category);
-    if memory_rowid.is_none() {
+pub fn delete_memory(store: &Store<'_>, memory_id: &str) -> Result<bool> {
+    let memories = Memories::new(store);
+    // The category is read before either delete path: a hard delete removes
+    // the row, so after this point there is nothing left to read it from, and
+    // the event would have to guess.
+    let Some(category) = memories.live_category(memory_id)? else {
         return Ok(false);
-    }
-
-    // SQLite reuses freed rowids: left alone, a later memory landing on this
-    // same rowid would silently inherit these chunk vectors through the
-    // surviving `vec_chunks` rows.
-    if let Some(memory_rowid) = memory_rowid {
-        crate::vectors::delete_chunks_for_memory(conn, memory_rowid)?;
-    }
-
-    let affected = if crate::sync::sync_enabled() {
-        let now = Utc::now().to_rfc3339();
-        conn.execute(
-            "UPDATE memories SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL",
-            params![now, now, memory_id],
-        )?
-    } else {
-        conn.execute(
-            "DELETE FROM memories WHERE id = ? AND deleted_at IS NULL",
-            params![memory_id],
-        )?
     };
-    if affected == 0 {
+    refuse_claims(store, &[memory_id.to_string()])?;
+
+    // A tombstoned memory's embeddings are stale the moment it stops being
+    // searchable, same as an incoming sync tombstone's are, so they go on
+    // either path.
+    crate::vectors::delete_chunks_for_memory(store, memory_id)?;
+
+    let tombstone_at = crate::sync::store_syncs(store)?.then(|| Utc::now().to_rfc3339());
+    if !memories.delete_live(memory_id, tombstone_at.as_deref())? {
         return Ok(false);
     }
 
     // Entities themselves survive — other memories may still mention them.
-    for table in ["memory_entities", "memory_feedback"] {
-        conn.execute(
-            &format!("DELETE FROM {} WHERE memory_id = ?", table),
-            params![memory_id],
-        )?;
-    }
-    conn.execute(
-        "DELETE FROM memory_associations WHERE memory_id_a = ? OR memory_id_b = ?",
-        params![memory_id, memory_id],
-    )?;
+    crate::db::entities::Entities::new(store).unlink_memory(memory_id)?;
+    crate::db::feedback::Feedback::new(store).delete_for(memory_id)?;
+    crate::db::related::Related::new(store).unlink_memory(memory_id)?;
+    // Its history would keep the text the delete removes (ADR-0024).
+    crate::db::history::Revisions::new(store).delete_for(memory_id)?;
 
-    crate::events::emit(
-        crate::events::Event::Deleted,
-        memory_id,
-        category.as_deref().unwrap_or(""),
-    );
+    crate::events::emit(crate::events::Event::Deleted, memory_id, &category);
 
     Ok(true)
+}
+
+/// Drop what ADR-0024 says a tombstone must not keep, for the memories
+/// deleted before a delete did it: their text, and their revision history.
+/// Run at every open; after the first it finds nothing. Returns how many
+/// tombstones were emptied and how many revisions went.
+pub fn empty_tombstones(store: &Store<'_>) -> Result<(usize, usize)> {
+    let emptied = Memories::new(store).empty_tombstones()?;
+    let revisions = crate::db::history::Revisions::new(store).delete_of_tombstones()?;
+    if emptied > 0 || revisions > 0 {
+        eprintln!(
+            "rusty-remind-me: dropped the text of {emptied} deleted memories \
+             and {revisions} of their revisions (ADR-0024)"
+        );
+    }
+    Ok((emptied, revisions))
 }
 
 /// Delete several memories by id in one request.
@@ -467,10 +375,12 @@ pub fn delete_memory(conn: &Connection, memory_id: &str) -> Result<bool> {
 /// Applies the exact same per-memory logic as [`delete_memory`] to each id
 /// independently — reused, not reimplemented, so the two paths cannot drift —
 /// and one missing id does not fail the rest of the batch.
-pub fn bulk_delete(conn: &Connection, ids: &[String]) -> Result<BulkDeleteResult> {
+pub fn bulk_delete(store: &Store<'_>, ids: &[String]) -> Result<BulkDeleteResult> {
+    // Checked before any delete, so a claim in the batch refuses all of it.
+    refuse_claims(store, ids)?;
     let mut result = BulkDeleteResult::default();
     for id in ids {
-        if delete_memory(conn, id)? {
+        if delete_memory(store, id)? {
             result.deleted.push(id.clone());
         } else {
             result.not_found.push(id.clone());
@@ -479,16 +389,30 @@ pub fn bulk_delete(conn: &Connection, ids: &[String]) -> Result<BulkDeleteResult
     Ok(result)
 }
 
+/// Refuse when any of `ids` is a project claim, which is append-only
+/// (ADR-0027); missing ids are left to the caller.
+fn refuse_claims(store: &Store<'_>, ids: &[String]) -> Result<()> {
+    let memories = Memories::new(store);
+    for id in ids {
+        if let Some(memory) = memories.get_live(id)? {
+            crate::project::refuse_claim_edit(&memory)?;
+        }
+    }
+    Ok(())
+}
+
 /// Add, remove, or replace tags on several memories in one request.
 ///
 /// A missing id is recorded in `not_found` and the rest of the batch still
 /// applies, matching [`bulk_delete`]'s per-item error handling.
-pub fn bulk_tag(conn: &Connection, input: &BulkTagInput) -> Result<BulkTagResult> {
+pub fn bulk_tag(store: &Store<'_>, input: &BulkTagInput) -> Result<BulkTagResult> {
+    refuse_claims(store, &input.ids)?;
+    let memories = Memories::new(store);
     let now = Utc::now().to_rfc3339();
     let mut result = BulkTagResult::default();
 
     for id in &input.ids {
-        let Some(memory) = get_memory_by_id(conn, id)? else {
+        let Some(memory) = get_memory_by_id(store, id)? else {
             result.not_found.push(id.clone());
             continue;
         };
@@ -505,13 +429,12 @@ pub fn bulk_tag(conn: &Connection, input: &BulkTagInput) -> Result<BulkTagResult
             ),
         };
 
-        conn.execute(
-            "UPDATE memories SET tags = ?, updated_at = ? WHERE id = ?",
-            params![
-                serde_json::to_string(&new_tags).unwrap_or_else(|_| "[]".to_string()),
-                now,
-                id
-            ],
+        memories.apply_edit(
+            id,
+            &MemoryEdit {
+                tags: Some(new_tags),
+                ..MemoryEdit::at(now.as_str())
+            },
         )?;
         result.updated.push(id.clone());
     }
@@ -529,44 +452,42 @@ pub fn bulk_tag(conn: &Connection, input: &BulkTagInput) -> Result<BulkTagResult
 /// Only the SPO fields actually supplied are written; omitted ones keep their
 /// current value. `updated_at` moves whenever an annotation is applied, even if
 /// it only added entity mentions.
-pub fn annotate_memories(conn: &Connection, input: &AnnotateInput) -> Result<AnnotateResult> {
+pub fn annotate_memories(store: &Store<'_>, input: &AnnotateInput) -> Result<AnnotateResult> {
+    let memories = Memories::new(store);
     let now = Utc::now().to_rfc3339();
     let mut results = Vec::new();
     let mut errors = Vec::new();
 
     for annotation in &input.annotations {
-        if get_memory_by_id(conn, &annotation.memory_id)?.is_none() {
+        let Some(stored) = get_memory_by_id(store, &annotation.memory_id)? else {
             errors.push(AnnotationError {
                 memory_id: annotation.memory_id.clone(),
                 error: "memory not found".to_string(),
             });
             continue;
+        };
+        let guarded = crate::project::refuse_reserved_predicate(annotation.predicate.as_deref())
+            .and_then(|()| crate::project::refuse_claim_edit(&stored));
+        if let Err(refused) = guarded {
+            errors.push(AnnotationError {
+                memory_id: annotation.memory_id.clone(),
+                error: refused.to_string(),
+            });
+            continue;
         }
 
-        let mut sets: Vec<&str> = Vec::new();
-        let mut bindings: Vec<Value> = Vec::new();
-        for (column, value) in [
-            ("subject = ?", &annotation.subject),
-            ("predicate = ?", &annotation.predicate),
-            ("object = ?", &annotation.object),
-        ] {
-            if let Some(v) = value {
-                sets.push(column);
-                bindings.push(Value::Text(v.clone()));
-            }
-        }
-
-        sets.push("updated_at = ?");
-        bindings.push(Value::Text(now.clone()));
-        bindings.push(Value::Text(annotation.memory_id.clone()));
-
-        conn.execute(
-            &format!("UPDATE memories SET {} WHERE id = ?", sets.join(", ")),
-            params_from_iter(bindings.iter()),
+        memories.apply_edit(
+            &annotation.memory_id,
+            &MemoryEdit {
+                subject: annotation.subject.clone(),
+                predicate: annotation.predicate.clone(),
+                object: annotation.object.clone(),
+                ..MemoryEdit::at(now.as_str())
+            },
         )?;
 
         let entities_linked = crate::entity::apply_entity_mentions(
-            conn,
+            store,
             &annotation.memory_id,
             &annotation.entities,
         )?;
@@ -575,15 +496,29 @@ pub fn annotate_memories(conn: &Connection, input: &AnnotateInput) -> Result<Ann
         // sides of the triple resolve to *known* entities, and the ones this
         // annotation names were created a moment ago.
         crate::entity::maybe_link_entity_relation(
-            conn,
+            store,
             annotation.subject.as_deref(),
             annotation.predicate.as_deref(),
             annotation.object.as_deref(),
         )?;
 
+        // Against the triple the memory holds now, which an annotation that
+        // set only some of the three completes. Same rule `decompose` applies.
+        let superseded_ids = match get_memory_by_id(store, &annotation.memory_id)? {
+            Some(m) => crate::entity::supersede_contradicting_facts(
+                store,
+                &m.id,
+                m.subject.as_deref(),
+                m.predicate.as_deref(),
+                m.object.as_deref(),
+            )?,
+            None => Vec::new(),
+        };
+
         results.push(AnnotationApplied {
             memory_id: annotation.memory_id.clone(),
             entities_linked,
+            superseded_ids,
         });
     }
 
@@ -604,25 +539,35 @@ pub fn annotate_memories(conn: &Connection, input: &AnnotateInput) -> Result<Ann
 /// a classification pass over stale ids should not discard its good work.
 /// Vitality and `base_weight` are untouched; classification says what a memory
 /// *is*, not how much it has been used.
-pub fn reclassify_memories(conn: &Connection, input: &ReclassifyInput) -> Result<ReclassifyResult> {
+pub fn reclassify_memories(store: &Store<'_>, input: &ReclassifyInput) -> Result<ReclassifyResult> {
+    let memories = Memories::new(store);
     let now = Utc::now().to_rfc3339();
     let mut updated = 0;
     let mut not_found = Vec::new();
 
     for classification in &input.classifications {
-        if get_memory_by_id(conn, &classification.memory_id)?.is_none() {
+        let Some(stored) = get_memory_by_id(store, &classification.memory_id)? else {
             not_found.push(classification.memory_id.clone());
             continue;
-        }
+        };
+        // Becoming a decision schedules its follow-up; staying one does not.
+        let metadata = if stored.memory_type.as_deref() == Some("decision") {
+            None
+        } else {
+            crate::review::schedule_if_decision(
+                Some(classification.memory_type.as_str()),
+                &stored.metadata,
+            )
+        };
 
-        conn.execute(
-            "UPDATE memories SET memory_type = ?, decay_rate = ?, updated_at = ? WHERE id = ?",
-            params![
-                classification.memory_type,
-                get_decay_rate(&classification.memory_type),
-                now,
-                classification.memory_id
-            ],
+        memories.apply_edit(
+            &classification.memory_id,
+            &MemoryEdit {
+                metadata,
+                memory_type: Some(classification.memory_type.clone()),
+                decay_rate: Some(get_decay_rate(&classification.memory_type)),
+                ..MemoryEdit::at(now.as_str())
+            },
         )?;
         updated += 1;
     }
@@ -639,79 +584,20 @@ pub fn reclassify_memories(conn: &Connection, input: &ReclassifyInput) -> Result
 /// `total_unclassified` counts every remaining memory, not just this page, so a
 /// caller can tell whether another round is worth requesting.
 pub fn unclassified_batch(
-    conn: &Connection,
+    store: &Store<'_>,
     input: &ReclassifyBatchInput,
 ) -> Result<ReclassifyBatchResult> {
     let batch_size = input
         .batch_size
         .clamp(RECLASSIFY_BATCH_MIN, RECLASSIFY_BATCH_MAX);
 
-    let total_unclassified: i64 = conn.query_row(
-        "SELECT count(*) FROM memories WHERE memory_type = ? AND deleted_at IS NULL",
-        params![UNCLASSIFIED],
-        |r| r.get(0),
-    )?;
-
-    let mut stmt = conn.prepare(
-        "SELECT id, substr(content, 1, 500), category, tags
-           FROM memories
-          WHERE memory_type = ? AND deleted_at IS NULL
-          ORDER BY created_at, id
-          LIMIT ?",
-    )?;
-    let rows = stmt.query_map(params![UNCLASSIFIED, batch_size as i64], |row| {
-        let tags_json: String = row.get(3)?;
-        Ok(UnclassifiedMemory {
-            id: row.get(0)?,
-            content_snippet: row.get(1)?,
-            category: row.get(2)?,
-            tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-        })
-    })?;
-
-    let mut memories = Vec::new();
-    for row in rows {
-        memories.push(row?);
-    }
+    let (total_unclassified, memories) =
+        Memories::new(store).of_type_page(UNCLASSIFIED, batch_size)?;
 
     Ok(ReclassifyBatchResult {
         memories,
-        total_unclassified: total_unclassified.max(0) as usize,
+        total_unclassified,
     })
-}
-
-/// Effective vitality as a SQL expression over the alias `m`.
-///
-/// The stored `vitality` column is a write-time snapshot that never decays, so
-/// filtering on it means `include_dormant: false` filters nothing and
-/// `min_vitality` compares against a number unrelated to the memory's current
-/// standing. This calls [`vitality::register_sql_functions`]'s scalar function
-/// instead, which keeps the predicate *before* `LIMIT`.
-///
-/// Doing it in Rust after the fetch would push the filter after the limit, the
-/// shape the reference warns about as `DI-03`: the page would be truncated
-/// first and then thinned, under-filling every result set.
-///
-/// `coalesce`s `accessed_at` to `created_at`, because a memory that has never
-/// been retrieved should age from when it was written.
-fn effective_vitality_sql() -> String {
-    format!(
-        "{}(m.base_weight, m.access_count, m.decay_rate, coalesce(m.accessed_at, m.created_at))",
-        EFFECTIVE_VITALITY_FN
-    )
-}
-
-/// Ids of every memory currently marked sensitive.
-///
-/// One query rather than a per-result check: the set is small by construction
-/// — a flag a user sets deliberately, on a single-user store — and the callers
-/// need membership tests, not rows.
-fn sensitive_ids(conn: &Connection) -> Result<std::collections::HashSet<String>> {
-    let mut stmt = conn.prepare("SELECT id FROM memories WHERE sensitive = 1")?;
-    let ids = stmt
-        .query_map([], |r| r.get::<_, String>(0))?
-        .collect::<Result<std::collections::HashSet<String>>>()?;
-    Ok(ids)
 }
 
 /// Search with the configured embedder, if one is resolvable and answering.
@@ -721,12 +607,12 @@ fn sensitive_ids(conn: &Connection) -> Result<std::collections::HashSet<String>>
 /// yields `None` when none is set or it does not answer, which is the same
 /// "keyword-only" case the fused ranker already handles.
 pub fn search_memories(
-    conn: &Connection,
+    store: &Store<'_>,
     input: &MemorySearchInput,
 ) -> Result<Vec<MemorySearchResult>> {
     let configured = crate::embedder::available_embedder();
     search_memories_with_embedder(
-        conn,
+        store,
         input,
         configured
             .as_ref()
@@ -738,11 +624,11 @@ pub fn search_memories(
 /// budget accounting. Kept so #200 did not have to churn ten call sites to
 /// report five numbers.
 pub fn search_memories_with_embedder(
-    conn: &Connection,
+    store: &Store<'_>,
     input: &MemorySearchInput,
     embedder: Option<&dyn crate::embedder::Embedder>,
 ) -> Result<Vec<MemorySearchResult>> {
-    Ok(search_memories_budgeted(conn, input, embedder)?.results)
+    Ok(search_memories_budgeted(store, input, embedder)?.results)
 }
 
 /// Search with a caller-supplied embedder, or none.
@@ -764,7 +650,7 @@ pub fn search_memories_with_embedder(
 /// [`search_memories_with_embedder`], but keeping the token-budget counts
 /// instead of discarding them (#200).
 pub fn search_memories_budgeted(
-    conn: &Connection,
+    store: &Store<'_>,
     input: &MemorySearchInput,
     embedder: Option<&dyn crate::embedder::Embedder>,
 ) -> Result<crate::retrieval::TrimOutcome> {
@@ -772,7 +658,7 @@ pub fn search_memories_budgeted(
     // before any work — including the FTS query, which is not free on a large
     // store.
     search_memories_deadlined(
-        conn,
+        store,
         input,
         embedder,
         crate::retrieval::Deadline::from_env(),
@@ -792,11 +678,12 @@ pub fn search_memories_budgeted(
 /// longer budget than an interactive query, and passing one beats mutating a
 /// process-global.
 pub fn search_memories_deadlined(
-    conn: &Connection,
+    store: &Store<'_>,
     input: &MemorySearchInput,
     embedder: Option<&dyn crate::embedder::Embedder>,
     deadline: crate::retrieval::Deadline,
 ) -> Result<crate::retrieval::TrimOutcome> {
+    let memories_repo = Memories::new(store);
     let mut timing = crate::retrieval::SearchTiming {
         deadline_ms: deadline.limit_ms(),
         ..Default::default()
@@ -806,61 +693,71 @@ pub fn search_memories_deadlined(
 
     // Raw user text is not a valid FTS5 MATCH expression — ordinary punctuation
     // is operator syntax there, so a question like "what's the plan?" was a
-    // syntax error rather than a search. An empty result means nothing was
-    // searchable; MATCH on an empty string is itself an error.
-    let match_expr = sanitize_fts_query(&input.query);
-    if match_expr.is_empty() {
-        let mut outcome = trim_by_token_budget(Vec::new(), input.token_budget);
+    // syntax error rather than a search. No phrases leaves nothing to rank —
+    // handled below, once the filter exists.
+    let phrases = crate::fts::query_phrases(&input.query);
+    // An entity the store has never seen matches nothing: an empty result,
+    // not an error, as `search_paginated` answers it.
+    let Some(narrowing) = resolve_narrowing(store, input)? else {
+        let mut outcome = trim_by_token_budget(Vec::new(), input.token_budget, input.detail);
+        timing.elapsed_ms = deadline.elapsed_ms();
+        outcome.timing = timing;
+        return Ok(outcome);
+    };
+
+    // Dormancy is filtered on *effective* vitality, inside the query and before
+    // its limit: the stored column never decays, and thinning a page after the
+    // limit under-fills it (the reference's `DI-03`).
+    let mut floor = if input.include_dormant {
+        None
+    } else {
+        Some(VITALITY_FLOOR)
+    };
+    if input.min_vitality > 0.0 {
+        floor = Some(floor.map_or(input.min_vitality, |f: f64| f.max(input.min_vitality)));
+    }
+    let filter = KeywordFilter {
+        min_effective_vitality: floor,
+        category: input.category.clone(),
+        include_sensitive: input.include_sensitive,
+        scope: input.scope.clone(),
+        exclude_raw: !input.ranks_raw(),
+        narrowing: narrowing.clone(),
+        window: input.window,
+    };
+
+    // Nothing to rank. A bounded window still asks a question — "what
+    // happened in the last two days" — so answer it as a newest-first listing;
+    // with no window either, nothing was searchable.
+    // `limit` applies after `apply_validity`, so a dropped or demoted row
+    // gives its place to an eligible one, as in the ranked path.
+    if phrases.is_empty() {
+        let listed = if input.window.is_unbounded() {
+            Vec::new()
+        } else {
+            let hits = memories_repo.window_hits(&filter)?;
+            let mut listed = crate::retrieval::apply_validity(
+                hits.into_iter().map(listed_result).collect(),
+                Utc::now(),
+                input.include_expired,
+                input.min_confidence,
+            );
+            listed.truncate(input.limit);
+            listed
+        };
+        if listed.is_empty() && filter.exclude_raw && !input.window.is_unbounded() {
+            return raw_fallback(store, input, embedder, deadline, timing);
+        }
+        let mut outcome = trim_by_token_budget(listed, input.token_budget, input.detail);
         timing.elapsed_ms = deadline.elapsed_ms();
         outcome.timing = timing;
         return Ok(outcome);
     }
 
-    // Derived from MEMORY_COLUMNS rather than spelled out, so adding a column
-    // cannot leave this query selecting a stale subset — which is exactly how
-    // `base_weight` slipped past here once. `bm25_score` rides along as a
-    // trailing extra column -- `parse_memory_row` only ever looks up columns
-    // by name, so it ignores it, and `RrfFusion::Score` mode needs the raw
-    // magnitude alongside the memory it belongs to.
-    let mut sql = format!(
-        "SELECT {}, bm25(memories_fts) AS bm25_score
-         FROM memories_fts fts
-         JOIN memories m ON m.rowid = fts.rowid
-         WHERE memories_fts MATCH ? AND m.superseded_by IS NULL AND m.deleted_at IS NULL",
-        prefixed_memory_columns("m")
-    );
-
-    let mut bindings: Vec<Value> = vec![Value::Text(match_expr.clone())];
-
-    let effective = effective_vitality_sql();
-    if !input.include_dormant {
-        sql.push_str(&format!(" AND {} >= {}", effective, VITALITY_FLOOR));
-    }
-    if input.min_vitality > 0.0 {
-        sql.push_str(&format!(" AND {} >= {}", effective, input.min_vitality));
-    }
-    if let Some(ref cat) = input.category {
-        sql.push_str(" AND m.category = ?");
-        bindings.push(Value::Text(cat.clone()));
-    }
-    if !input.include_sensitive {
-        sql.push_str(" AND m.sensitive = 0");
-    }
-
-    sql.push_str(" ORDER BY bm25(memories_fts) LIMIT ?");
-    bindings.push(Value::Integer((input.limit * 2) as i64));
-
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(bindings.iter()), |row| {
-        let memory = parse_memory_row(row)?;
-        let bm25_score: f64 = row.get("bm25_score")?;
-        Ok((memory, bm25_score))
-    })?;
-
+    // `RrfFusion::Score` mode needs the raw BM25 magnitude alongside each hit.
     let mut keyword_memories = Vec::new();
     let mut keyword_bm25 = std::collections::HashMap::new();
-    for r in rows {
-        let (memory, bm25_score) = r?;
+    for (memory, bm25_score) in memories_repo.keyword_hits(&phrases, &filter, input.limit * 2)? {
         keyword_bm25.insert(memory.id.clone(), bm25_score);
         keyword_memories.push(memory);
     }
@@ -882,25 +779,44 @@ pub fn search_memories_deadlined(
     // Degrading to keyword-only rather than erroring is the same choice the
     // `None` arm below already makes for an unconfigured embedder: partial
     // results with an honest label beat a killed query.
-    let embedder = match embedder {
-        Some(e) if deadline.expired() => {
+    let semantic_embedder = match embedder {
+        Some(_) if deadline.expired() => {
             timing.skipped.push("semantic".to_string());
-            let _ = e;
             None
         }
         other => other,
     };
 
-    let (semantic_memories, semantic_similarity) = match embedder {
-        Some(embedder) => {
+    let (semantic_memories, semantic_similarity) = match semantic_embedder {
+        Some(semantic) => {
             let extra_texts = crate::query_expansion::expand_query(&input.query);
-            let scored = crate::vectors::semantic_search_scored(
-                conn,
-                embedder,
+            // Filtering the keyword half alone would not be enough: RRF fuses
+            // two independent result sets, so a sensitive, out-of-scope,
+            // out-of-window or raw memory excluded there could still arrive
+            // through the semantic half. Admitted inside the scan, before its limit,
+            // so the filters never starve the semantic list.
+            let hidden = if input.include_sensitive {
+                std::collections::HashSet::new()
+            } else {
+                memories_repo.sensitive_ids()?
+            };
+            let admit = |m: &Memory| {
+                !hidden.contains(&m.id)
+                    && input.scope.matches_memory(m)
+                    && input.window.contains_memory(m)
+                    && narrowing.admits(m)
+                    // Raw rows go before the best `limit * 2` are chosen, or
+                    // stronger raw hits would take every slot (ADR-0029).
+                    && !(filter.exclude_raw && is_raw_category(&m.category))
+            };
+            let scored = crate::vectors::semantic_search_admitted(
+                store,
+                semantic,
                 &input.query,
                 &extra_texts,
                 input.limit * 2,
                 input.category.as_deref(),
+                &admit,
             )
             .unwrap_or_default();
             let mut memories = Vec::with_capacity(scored.len());
@@ -908,17 +824,6 @@ pub fn search_memories_deadlined(
             for (memory, sim) in scored {
                 similarity.insert(memory.id.clone(), sim as f64);
                 memories.push(memory);
-            }
-            // Filtering the keyword SQL alone would not be enough: RRF fuses
-            // two independent result sets, so a sensitive memory excluded from
-            // the keyword half could still arrive through the semantic half and
-            // rank into the output. Done here rather than by threading a
-            // parameter through `semantic_search_scored`, which would change an
-            // existing public signature.
-            if !input.include_sensitive {
-                let hidden = sensitive_ids(conn)?;
-                memories.retain(|m| !hidden.contains(&m.id));
-                similarity.retain(|id, _| !hidden.contains(id));
             }
             (memories, similarity)
         }
@@ -940,7 +845,17 @@ pub fn search_memories_deadlined(
     // Query-contextual feedback adjustment (issue #94): nudges `score` by
     // any similarly-worded past feedback before truncating to `limit`, so a
     // memory boosted from just past the cutoff can still make the page.
-    let mut ranked = apply_feedback_adjustment(conn, &input.query, ranked)?;
+    let ranked = apply_feedback_adjustment(store, &input.query, ranked)?;
+
+    // Validity and confidence scale the fused score; expired and
+    // low-confidence rows can be dropped on request. Before truncation, so
+    // a demoted row gives its place to one that is in window.
+    let mut ranked = crate::retrieval::apply_validity(
+        ranked,
+        Utc::now(),
+        input.include_expired,
+        input.min_confidence,
+    );
 
     // Optional cross-encoder rerank of the head, before truncation. The pool
     // is deliberately wider than `limit`: rescoring only what was already
@@ -971,33 +886,92 @@ pub fn search_memories_deadlined(
     };
     ranked.truncate(input.limit);
 
-    let mut outcome = trim_by_token_budget(ranked, input.token_budget);
+    if ranked.is_empty() && filter.exclude_raw {
+        return raw_fallback(store, input, embedder, deadline, timing);
+    }
+
+    let mut outcome = trim_by_token_budget(ranked, input.token_budget, input.detail);
     timing.elapsed_ms = deadline.elapsed_ms();
     outcome.timing = timing;
     Ok(outcome)
 }
 
-/// Category/tag conditions shared by both branches of [`search_paginated`].
-///
-/// Deliberately narrower than [`list_filters`]: the reference's `api_search`
-/// supports `category` and `tags`, not `source` — this mirrors that exactly
-/// rather than silently offering a superset.
-fn search_page_filters(input: &SearchPageInput) -> (String, Vec<Value>) {
-    let mut sql = String::new();
-    let mut bindings: Vec<Value> = Vec::new();
-
-    if let Some(category) = input.category.as_ref().filter(|c| !c.is_empty()) {
-        sql.push_str(" AND m.category = ?");
-        bindings.push(Value::Text(category.clone()));
+/// Nothing refined matched: a session not yet decomposed is still findable
+/// through its dialog, so `input` runs again with raw rows admitted and the
+/// result is marked (ADR-0029). Same embedder and deadline, so the second
+/// pass skips what the first skipped; both passes' skipped stages are kept.
+fn raw_fallback(
+    store: &Store<'_>,
+    input: &MemorySearchInput,
+    embedder: Option<&dyn crate::embedder::Embedder>,
+    deadline: crate::retrieval::Deadline,
+    first: crate::retrieval::SearchTiming,
+) -> Result<crate::retrieval::TrimOutcome> {
+    let raw = MemorySearchInput {
+        include_raw: true,
+        ..input.clone()
+    };
+    let mut outcome = search_memories_deadlined(store, &raw, embedder, deadline)?;
+    outcome.raw_fallback = !outcome.results.is_empty();
+    for stage in first.skipped {
+        if !outcome.timing.skipped.contains(&stage) {
+            outcome.timing.skipped.push(stage);
+        }
     }
-    for tag in input.tags.iter().flatten() {
-        sql.push_str(
-            " AND EXISTS (SELECT 1 FROM memory_tags mt WHERE mt.memory_id = m.id AND mt.tag = ?)",
-        );
-        bindings.push(Value::Text(tag.clone()));
-    }
+    Ok(outcome)
+}
 
-    (sql, bindings)
+/// `input`'s tag, entity and repo filters, resolved against the store.
+/// `None` when the entity names nothing this store knows, so no memory can
+/// match. Blank values are unset.
+fn resolve_narrowing(store: &Store<'_>, input: &MemorySearchInput) -> Result<Option<Narrowing>> {
+    fn clean(v: &Option<String>) -> Option<&str> {
+        v.as_deref().map(str::trim).filter(|v| !v.is_empty())
+    }
+    let entity = match clean(&input.filters.entity) {
+        None => None,
+        Some(name) => {
+            let Some(entity) = crate::entity::resolve_entity(store, name)? else {
+                return Ok(None);
+            };
+            Some(EntityMembers {
+                canonical: crate::entity::normalize_entity_name(&entity.name),
+                linked: Memories::new(store).linked_ids(&entity.id)?,
+            })
+        }
+    };
+    let tags = input
+        .tags
+        .iter()
+        .flatten()
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect();
+    Ok(Some(Narrowing {
+        tags,
+        tag_match: input.filters.tag_mode,
+        entity,
+        repo: clean(&input.filters.repo).and_then(crate::context::normalize_remote),
+    }))
+}
+
+/// A window listing's row. There is no relevance to score, so every row gets
+/// the same 1.0: the newest-first order survives `apply_validity`'s stable
+/// sort, and its validity and confidence factors still push expired and
+/// low-confidence rows down, as they do in a ranked search.
+fn listed_result(memory: Memory) -> MemorySearchResult {
+    MemorySearchResult {
+        memory,
+        score: 1.0,
+        fts_score: None,
+        vec_score: None,
+        recency_score: None,
+        vitality_score: None,
+        idf_score: None,
+        feedback_adjustment: None,
+        rerank_score: None,
+    }
 }
 
 /// Paginated full-text search behind `GET /api/memories/search`.
@@ -1026,15 +1000,19 @@ fn search_page_filters(input: &SearchPageInput) -> (String, Vec<Value>) {
 /// since the dormancy-filtering fix, and reproducing the reference's
 /// inconsistency here would mean two search entry points disagreeing about
 /// whether a stale, superseded chunk is a result.
-pub fn search_paginated(conn: &Connection, input: &SearchPageInput) -> Result<SearchPageResult> {
+pub fn search_paginated(store: &Store<'_>, input: &SearchPageInput) -> Result<SearchPageResult> {
     let limit = input.limit.clamp(LIST_LIMIT_MIN, LIST_LIMIT_MAX);
     let offset = input.offset;
-    let (filter_sql, filter_bindings) = search_page_filters(input);
 
-    let mut entity_sql = String::new();
-    let mut entity_bindings: Vec<Value> = Vec::new();
+    // Deliberately narrower than `list_memories`: the reference's `api_search`
+    // supports `category` and `tags`, not `source`.
+    let mut filter = PageFilter {
+        category: input.category.clone().filter(|c| !c.is_empty()),
+        tags: input.tags.clone().unwrap_or_default(),
+        entity: None,
+    };
     if let Some(entity_query) = &input.entity {
-        let Some(entity) = crate::entity::resolve_entity(conn, entity_query)? else {
+        let Some(entity) = crate::entity::resolve_entity(store, entity_query)? else {
             return Ok(SearchPageResult {
                 total: 0,
                 count: 0,
@@ -1045,90 +1023,14 @@ pub fn search_paginated(conn: &Connection, input: &SearchPageInput) -> Result<Se
                 message: Some(format!("No entity found matching {:?}.", entity_query)),
             });
         };
-        let canonical = crate::entity::normalize_entity_name(&entity.name);
-        entity_sql.push_str(
-            " AND (EXISTS (SELECT 1 FROM memory_entities me \
-               WHERE me.memory_id = m.id AND me.entity_id = ?) \
-               OR lower(m.subject) = ? OR lower(m.object) = ?)",
-        );
-        entity_bindings = vec![
-            Value::Text(entity.id),
-            Value::Text(canonical.clone()),
-            Value::Text(canonical),
-        ];
+        filter.entity = Some(EntityScope {
+            canonical: crate::entity::normalize_entity_name(&entity.name),
+            id: entity.id,
+        });
     }
 
-    let match_expr = sanitize_fts_query(&input.query);
-
-    let (total, memories) = if !match_expr.is_empty() {
-        let mut bindings = vec![Value::Text(match_expr)];
-        bindings.extend(filter_bindings.iter().cloned());
-        bindings.extend(entity_bindings.iter().cloned());
-
-        let total: i64 = conn.query_row(
-            &format!(
-                "SELECT count(*) FROM memories m
-                   JOIN memories_fts fts ON m.rowid = fts.rowid
-                  WHERE memories_fts MATCH ? AND m.superseded_by IS NULL
-                    AND m.deleted_at IS NULL{}{}",
-                filter_sql, entity_sql
-            ),
-            params_from_iter(bindings.iter()),
-            |row| row.get(0),
-        )?;
-
-        let mut page_bindings = bindings;
-        page_bindings.push(Value::Integer(limit as i64));
-        page_bindings.push(Value::Integer(offset as i64));
-        let sql = format!(
-            "SELECT {}
-               FROM memories m JOIN memories_fts fts ON m.rowid = fts.rowid
-              WHERE memories_fts MATCH ? AND m.superseded_by IS NULL AND m.deleted_at IS NULL{}{}
-              ORDER BY bm25(memories_fts) LIMIT ? OFFSET ?",
-            prefixed_memory_columns("m"),
-            filter_sql,
-            entity_sql
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params_from_iter(page_bindings.iter()), parse_memory_row)?;
-        let mut memories = Vec::new();
-        for row in rows {
-            memories.push(row?);
-        }
-        (total.max(0) as usize, memories)
-    } else {
-        let mut bindings = filter_bindings;
-        bindings.extend(entity_bindings.iter().cloned());
-
-        let total: i64 = conn.query_row(
-            &format!(
-                "SELECT count(*) FROM memories m
-                  WHERE m.superseded_by IS NULL AND m.deleted_at IS NULL{}{}",
-                filter_sql, entity_sql
-            ),
-            params_from_iter(bindings.iter()),
-            |row| row.get(0),
-        )?;
-
-        let mut page_bindings = bindings;
-        page_bindings.push(Value::Integer(limit as i64));
-        page_bindings.push(Value::Integer(offset as i64));
-        let sql = format!(
-            "SELECT {} FROM memories m
-              WHERE m.superseded_by IS NULL AND m.deleted_at IS NULL{}{}
-              ORDER BY m.created_at DESC LIMIT ? OFFSET ?",
-            prefixed_memory_columns("m"),
-            filter_sql,
-            entity_sql
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params_from_iter(page_bindings.iter()), parse_memory_row)?;
-        let mut memories = Vec::new();
-        for row in rows {
-            memories.push(row?);
-        }
-        (total.max(0) as usize, memories)
-    };
+    let phrases = crate::fts::query_phrases(&input.query);
+    let (total, memories) = Memories::new(store).keyword_page(&phrases, &filter, limit, offset)?;
 
     let count = memories.len();
     Ok(SearchPageResult {
@@ -1155,7 +1057,7 @@ pub fn search_paginated(conn: &Connection, input: &SearchPageInput) -> Result<Se
 /// into it, so they do not consume `limit`. See [`crate::expansion`] for why
 /// keeping co-retrieval out of the ranking matters.
 pub fn search_with_expansions(
-    conn: &Connection,
+    store: &Store<'_>,
     input: &MemorySearchInput,
 ) -> Result<MemorySearchResponse> {
     let configured = crate::embedder::available_embedder();
@@ -1166,7 +1068,7 @@ pub fn search_with_expansions(
     // put the response over budget by exactly the size of the bootstrap,
     // which is the failure #200 spent an issue making visible.
     let bootstrap = if input.bootstrap {
-        Some(crate::promotion::bootstrap(conn, input.token_budget)?)
+        Some(crate::promotion::bootstrap(store, input.token_budget)?)
     } else {
         None
     };
@@ -1193,7 +1095,7 @@ pub fn search_with_expansions(
     };
 
     let outcome = search_memories_budgeted(
-        conn,
+        store,
         hit_input,
         configured
             .as_ref()
@@ -1202,7 +1104,7 @@ pub fn search_with_expansions(
     let memories = outcome.results;
     let ids: Vec<String> = memories.iter().map(|r| r.memory.id.clone()).collect();
 
-    expansion::record_co_retrieval(conn, &ids)?;
+    expansion::record_co_retrieval(store, &ids)?;
 
     // Direct hits only. Expansion results are a discovery aid surfaced by
     // adjacency, not answers to the query, and recording them would inflate
@@ -1213,26 +1115,28 @@ pub fn search_with_expansions(
     // describe the store as the caller found it.
     let response = MemorySearchResponse {
         related_via_entities: if input.expand_entities {
-            Some(expansion::expand_via_entities(conn, &ids)?)
+            Some(expansion::expand_via_entities(store, &ids)?)
         } else {
             None
         },
         related_via_neighbors: if input.include_neighbors {
-            Some(expansion::expand_via_neighbors(conn, &memories)?)
+            Some(expansion::expand_via_neighbors(store, &memories)?)
         } else {
             None
         },
         related_via_co_retrieval: if input.expand_co_retrieval {
-            Some(expansion::expand_via_co_retrieval(conn, &ids)?)
+            Some(expansion::expand_via_co_retrieval(store, &ids)?)
         } else {
             None
         },
         timing: outcome.timing,
+        raw_fallback: outcome.raw_fallback,
         bootstrap,
         memories,
         total_candidates: outcome.total_candidates,
         returned: outcome.returned,
         trimmed: outcome.trimmed,
+        trimmed_ids: outcome.trimmed_ids,
         // Hits only, matching this field's documented meaning. The bootstrap
         // carries its own `tokens_used`, so the response total is the sum of
         // the two rather than either one restated — see the renderer, which
@@ -1242,32 +1146,9 @@ pub fn search_with_expansions(
         budget: input.token_budget,
     };
 
-    crate::vitality::record_accesses(conn, &ids)?;
+    crate::vitality::record_accesses(store, &ids)?;
 
     Ok(response)
-}
-
-/// Which memories still need a triple or entity mentions.
-///
-/// A memory qualifies when it is live, is **not a raw dialog**, has no SPO
-/// triple at all, and has no entity links at all.
-///
-/// Two parts of that are easy to get wrong. The `dialog` exclusion is not
-/// cosmetic: a captured transcript's facts are meant to come out through
-/// `decompose`, so without it every captured conversation would flood this
-/// backlog. And a memory needs to be missing *both* signals — one that has
-/// entities but no triple is already considered annotated, so an `OR` here
-/// would keep re-offering work that is done.
-///
-/// `skeleton` is excluded on the same grounds and then some (#207): it is
-/// Mermaid source describing a conversation's shape, so there is no fact in it
-/// to extract and offering one costs a model call to find that out.
-fn unannotated_where() -> &'static str {
-    "m.superseded_by IS NULL
-     AND m.deleted_at IS NULL
-     AND m.category NOT IN ('dialog', 'skeleton')
-     AND m.subject IS NULL AND m.predicate IS NULL AND m.object IS NULL
-     AND NOT EXISTS (SELECT 1 FROM memory_entities me WHERE me.memory_id = m.id)"
 }
 
 /// A page of memories awaiting extraction, newest first.
@@ -1277,44 +1158,14 @@ fn unannotated_where() -> &'static str {
 /// them. Without it, annotation could only be applied to memories the caller
 /// already happened to know about.
 pub fn unannotated_batch(
-    conn: &Connection,
+    store: &Store<'_>,
     input: &ExtractBatchInput,
 ) -> Result<ExtractBatchResult> {
     let batch_size = input.batch_size.clamp(EXTRACT_BATCH_MIN, EXTRACT_BATCH_MAX);
-    let predicate = unannotated_where();
-
-    let total: i64 = conn.query_row(
-        &format!("SELECT count(*) FROM memories m WHERE {}", predicate),
-        [],
-        |r| r.get(0),
-    )?;
-
-    let mut stmt = conn.prepare(&format!(
-        "SELECT m.id, m.content, m.category, m.memory_type, m.tags
-           FROM memories m
-          WHERE {}
-          ORDER BY m.created_at DESC
-          LIMIT ?",
-        predicate
-    ))?;
-    let memories: Vec<UnannotatedMemory> = stmt
-        .query_map(params![batch_size as i64], |row| {
-            let content: String = row.get("content")?;
-            let tags_json: String = row.get("tags")?;
-            Ok(UnannotatedMemory {
-                id: row.get("id")?,
-                // By characters, not bytes — a multi-byte character on the
-                // boundary would panic a byte slice.
-                content_snippet: content.chars().take(500).collect(),
-                category: row.get("category")?,
-                memory_type: row.get("memory_type")?,
-                tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-            })
-        })?
-        .collect::<Result<_>>()?;
+    let (total_unannotated, memories) = Memories::new(store).unannotated_page(batch_size)?;
 
     Ok(ExtractBatchResult {
         memories,
-        total_unannotated: total.max(0) as usize,
+        total_unannotated,
     })
 }

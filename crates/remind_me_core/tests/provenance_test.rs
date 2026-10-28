@@ -18,12 +18,15 @@
 //! was omission at a call site rather than a wrong value in a shared helper —
 //! and a test of the helper alone would have passed throughout.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
+use remind_me_core::db::Store;
 use remind_me_core::sync::{
-    configured_client, memory_provenance, set_handshake_client, CLIENT_ENV, DEFAULT_CLIENT,
-    NODE_ID_ENV,
+    configured_client, memory_provenance, set_handshake_client, with_call_client, CLIENT_ENV,
+    DEFAULT_CLIENT, NODE_ID_ENV,
 };
 use remind_me_core::{db::queries, Database};
-use rusqlite::{params, Connection};
 use std::sync::Mutex;
 
 /// `REMIND_ME_CLIENT`, `REMIND_ME_NODE_ID` and the handshake slot are all
@@ -38,16 +41,16 @@ const TEST_CLIENT: &str = "test-client";
 struct Ident;
 impl Ident {
     fn set() -> Self {
-        std::env::set_var(NODE_ID_ENV, TEST_NODE);
-        std::env::set_var(CLIENT_ENV, TEST_CLIENT);
+        crate::test_env::set_var(NODE_ID_ENV, TEST_NODE);
+        crate::test_env::set_var(CLIENT_ENV, TEST_CLIENT);
         set_handshake_client(None);
         Ident
     }
 }
 impl Drop for Ident {
     fn drop(&mut self) {
-        std::env::remove_var(NODE_ID_ENV);
-        std::env::remove_var(CLIENT_ENV);
+        crate::test_env::remove_var(NODE_ID_ENV);
+        crate::test_env::remove_var(CLIENT_ENV);
         set_handshake_client(None);
     }
 }
@@ -61,20 +64,23 @@ fn db(name: &str) -> Database {
 
 /// Every non-deleted memory's `(node_id, client)`, so a path that writes more
 /// than one row (a capture writes two) cannot pass by having only one right.
-fn stamps(conn: &Connection) -> Vec<(Option<String>, String)> {
-    let mut stmt = conn
-        .prepare("SELECT node_id, client FROM memories ORDER BY rowid")
-        .unwrap();
-    let rows = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+fn stamps(store: &Store<'_>) -> Vec<(Option<String>, String)> {
+    remind_me_core::testing::memory_ids(store)
         .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-    rows
+        .iter()
+        .map(|id| {
+            (
+                remind_me_core::testing::memory_text(store, id, "node_id").unwrap(),
+                remind_me_core::testing::memory_text(store, id, "client")
+                    .unwrap()
+                    .unwrap_or_default(),
+            )
+        })
+        .collect()
 }
 
-fn assert_all_stamped(conn: &Connection, path: &str, expected_rows: usize) {
-    let rows = stamps(conn);
+fn assert_all_stamped(store: &Store<'_>, path: &str, expected_rows: usize) {
+    let rows = stamps(store);
     assert_eq!(
         rows.len(),
         expected_rows,
@@ -101,17 +107,17 @@ fn add_memory_stamps_both() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _ident = Ident::set();
     let db = db("add");
-    let conn = db.conn();
+    let store = db.store();
 
     queries::add_memory(
-        &conn,
+        &store,
         serde_json::from_value(serde_json::json!({ "content": "a quokka fact" })).unwrap(),
     )
     .unwrap();
 
     // The one path that was already correct; asserted so a refactor that
     // routes everything through the new helper cannot regress it unnoticed.
-    assert_all_stamped(&conn, "add_memory", 1);
+    assert_all_stamped(&store, "add_memory", 1);
 }
 
 #[test]
@@ -119,10 +125,10 @@ fn auto_capture_stamps_both_halves() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _ident = Ident::set();
     let db = db("capture");
-    let conn = db.conn();
+    let store = db.store();
 
     remind_me_core::capture::auto_capture(
-        &conn,
+        &store,
         &serde_json::from_value(serde_json::json!({
             "conversation": "user: hello\nassistant: hi",
             "summary": "a greeting",
@@ -132,7 +138,7 @@ fn auto_capture_stamps_both_halves() {
     .unwrap();
 
     // Two rows: the verbatim dialog and the summary.
-    assert_all_stamped(&conn, "auto_capture", 2);
+    assert_all_stamped(&store, "auto_capture", 2);
 }
 
 #[test]
@@ -140,10 +146,10 @@ fn decomposed_facts_are_stamped() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _ident = Ident::set();
     let db = db("decompose");
-    let conn = db.conn();
+    let store = db.store();
 
     let capture = remind_me_core::capture::auto_capture(
-        &conn,
+        &store,
         &serde_json::from_value(serde_json::json!({
             "conversation": "user: I prefer Rust\nassistant: noted",
             "summary": "language preference",
@@ -153,7 +159,7 @@ fn decomposed_facts_are_stamped() {
     .unwrap();
 
     remind_me_core::capture::decompose(
-        &conn,
+        &store,
         &serde_json::from_value(serde_json::json!({
             "capture_id": capture.capture_id,
             "facts": [{ "content": "Prefers Rust." }],
@@ -163,7 +169,7 @@ fn decomposed_facts_are_stamped() {
     .unwrap();
 
     // Two capture halves plus the one fact.
-    assert_all_stamped(&conn, "decompose", 3);
+    assert_all_stamped(&store, "decompose", 3);
 }
 
 #[test]
@@ -171,19 +177,20 @@ fn a_promoted_memory_is_stamped() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _ident = Ident::set();
     let db = db("promote");
-    let conn = db.conn();
+    let store = db.store();
 
     let now = chrono::Utc::now().to_rfc3339();
-    conn.execute(
-        "INSERT INTO memories (id, content, category, tags, source, metadata,
-            created_at, updated_at, vitality, node_id, client)
-         VALUES ('mem_src', 'scenario source', 'scenario', '[]', 'manual', '{}', ?, ?, 1.0, ?, ?)",
-        params![now, now, TEST_NODE, TEST_CLIENT],
-    )
-    .unwrap();
+    remind_me_core::db::memories::Memories::new(&store)
+        .insert(&remind_me_core::db::memories::NewMemory {
+            category: "scenario".to_string(),
+            node_id: Some(TEST_NODE.to_string()),
+            client: TEST_CLIENT.to_string(),
+            ..remind_me_core::db::memories::NewMemory::new("mem_src", "scenario source", &now)
+        })
+        .unwrap();
 
     remind_me_core::promotion::promote(
-        &conn,
+        &store,
         &serde_json::from_value(serde_json::json!({
             "rung": "scenario_to_persona",
             "source_ids": ["mem_src"],
@@ -193,7 +200,7 @@ fn a_promoted_memory_is_stamped() {
     )
     .unwrap();
 
-    assert_all_stamped(&conn, "promote", 2);
+    assert_all_stamped(&store, "promote", 2);
 }
 
 #[test]
@@ -201,10 +208,10 @@ fn a_skeleton_is_stamped() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _ident = Ident::set();
     let db = db("skeleton");
-    let conn = db.conn();
+    let store = db.store();
 
     let capture = remind_me_core::capture::auto_capture(
-        &conn,
+        &store,
         &serde_json::from_value(serde_json::json!({
             "conversation": "user: one\nassistant: two\nuser: three",
             "summary": "a short exchange",
@@ -214,7 +221,7 @@ fn a_skeleton_is_stamped() {
     .unwrap();
 
     remind_me_core::skeleton::write_skeleton(
-        &conn,
+        &store,
         &serde_json::from_value(serde_json::json!({
             "capture_id": capture.capture_id,
             "mermaid": "graph TD\n  n1[opening]",
@@ -225,7 +232,7 @@ fn a_skeleton_is_stamped() {
     .unwrap();
 
     // Two capture halves plus the skeleton.
-    assert_all_stamped(&conn, "skeleton", 3);
+    assert_all_stamped(&store, "skeleton", 3);
 }
 
 #[test]
@@ -256,10 +263,47 @@ fn the_handshake_identity_beats_the_configured_one() {
 }
 
 #[test]
+fn a_call_client_wins_for_its_call_only_and_keeps_concurrent_callers_apart() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _ident = Ident::set();
+    set_handshake_client(Some("last-handshake/1".to_string()));
+
+    // One handler serving many callers: each call names its own caller, and
+    // neither sees the other's or the process-wide handshake.
+    let callers = ["claude-ai/1.0", "chatgpt/2"].map(|name| {
+        std::thread::spawn(move || {
+            with_call_client(Some(name.to_string()), || {
+                std::thread::yield_now();
+                configured_client()
+            })
+        })
+    });
+    let seen = callers.map(|h| h.join().unwrap());
+    assert_eq!(seen, ["claude-ai/1.0", "chatgpt/2"]);
+
+    // A call that named nobody falls to the configured client, not to
+    // whoever shook hands last; a blank name is nobody.
+    assert_eq!(with_call_client(None, configured_client), TEST_CLIENT);
+    assert_eq!(
+        with_call_client(Some(" ".to_string()), configured_client),
+        TEST_CLIENT
+    );
+
+    // Nested calls restore the outer caller, and the scope ends with the call.
+    with_call_client(Some("outer".to_string()), || {
+        with_call_client(Some("inner".to_string()), || {
+            assert_eq!(configured_client(), "inner");
+        });
+        assert_eq!(configured_client(), "outer");
+    });
+    assert_eq!(configured_client(), "last-handshake/1");
+}
+
+#[test]
 fn with_nothing_configured_the_client_is_unknown_and_the_node_is_empty() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var(NODE_ID_ENV);
-    std::env::remove_var(CLIENT_ENV);
+    crate::test_env::remove_var(NODE_ID_ENV);
+    crate::test_env::remove_var(CLIENT_ENV);
     set_handshake_client(None);
 
     // The default is still `unknown`; this change makes the column *consistent*,
@@ -275,10 +319,10 @@ fn a_normalized_memory_is_stamped() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _ident = Ident::set();
     let db = db("normalize");
-    let conn = db.conn();
+    let store = db.store();
 
     let raw = queries::add_memory(
-        &conn,
+        &store,
         serde_json::from_value(serde_json::json!({
             "content": "a long raw import chunk about quokkas",
         }))
@@ -287,7 +331,7 @@ fn a_normalized_memory_is_stamped() {
     .unwrap();
 
     let outcome = remind_me_core::normalize::apply_normalizations(
-        &conn,
+        &store,
         &serde_json::from_value(serde_json::json!({
             "normalizations": [{
                 "memory_id": raw.id,
@@ -305,5 +349,5 @@ fn a_normalized_memory_is_stamped() {
     );
 
     // The raw memory plus its distillation.
-    assert_all_stamped(&conn, "apply_normalizations", 2);
+    assert_all_stamped(&store, "apply_normalizations", 2);
 }

@@ -39,9 +39,10 @@
 //! [`crate::promotion::promotion_candidates`]: a list for a caller to judge,
 //! not an automatic demotion.
 
+use crate::db::Result as SqlResult;
+use crate::db::Store;
 use crate::import_paths::{expand_home, is_contained, resolve_lexically, split_path_list};
 use crate::models::{STALE_CANDIDATES_LIMIT_MAX, STALE_CANDIDATES_LIMIT_MIN};
-use rusqlite::{Connection, Result as SqlResult};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -200,6 +201,8 @@ pub enum StaleReason {
     Modified,
     /// No longer exists at all.
     Deleted,
+    /// The memory's own `valid_until` has passed.
+    Expired,
 }
 
 /// One anchored path that no longer matches what a memory recorded.
@@ -215,6 +218,10 @@ pub struct StaleCandidate {
     pub memory_id: String,
     pub content_snippet: String,
     pub stale_refs: Vec<StaleRef>,
+    /// The `valid_until` that has passed: set, with an empty `stale_refs`,
+    /// for a memory reported as [`StaleReason::Expired`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expired_at: Option<String>,
 }
 
 /// A page of stale-anchor candidates, plus the true backlog behind it.
@@ -227,6 +234,24 @@ pub struct StaleCandidate {
 pub struct StaleCandidatesResult {
     pub candidates: Vec<StaleCandidate>,
     pub total_candidates: usize,
+}
+
+/// Live memories whose `valid_until` has passed, reported as
+/// [`StaleReason::Expired`]. The caller merges these with the anchor
+/// candidates so a memory with both is reported once.
+fn expired_candidates(store: &Store<'_>) -> SqlResult<Vec<StaleCandidate>> {
+    let now = chrono::Utc::now();
+    let rows = crate::db::memories::Memories::new(store).with_valid_until()?;
+    Ok(rows
+        .into_iter()
+        .filter(|(_, _, until)| crate::retrieval::is_expired(now, Some(until)))
+        .map(|(id, content, until)| StaleCandidate {
+            memory_id: id,
+            content_snippet: content.chars().take(SNIPPET_CHARS).collect(),
+            stale_refs: Vec::new(),
+            expired_at: Some(until),
+        })
+        .collect())
 }
 
 /// Re-check every anchored path and report memories where at least one no
@@ -273,20 +298,9 @@ pub struct StaleCandidatesResult {
 ///   `include_sensitive` override, because this is assembled to be read
 ///   rather than asked for, so there is no per-call intent to opt back in
 ///   against.
-pub fn stale_candidates(conn: &Connection, limit: usize) -> SqlResult<StaleCandidatesResult> {
+pub fn stale_candidates(store: &Store<'_>, limit: usize) -> SqlResult<StaleCandidatesResult> {
     let limit = limit.clamp(STALE_CANDIDATES_LIMIT_MIN, STALE_CANDIDATES_LIMIT_MAX);
-    let mut stmt = conn.prepare(
-        "SELECT id, content, metadata
-           FROM memories
-          WHERE deleted_at IS NULL
-            AND superseded_by IS NULL
-            AND sensitive = 0
-            AND json_extract(metadata, '$.code_refs') IS NOT NULL",
-    )?;
-
-    let rows: Vec<(String, String, String)> = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-        .collect::<SqlResult<_>>()?;
+    let rows = crate::db::memories::Memories::new(store).with_code_refs()?;
 
     let roots = configured_code_roots();
     // No early break on `limit` here -- every row is checked so
@@ -331,7 +345,14 @@ pub fn stale_candidates(conn: &Connection, limit: usize) -> SqlResult<StaleCandi
                 memory_id: id,
                 content_snippet,
                 stale_refs,
+                expired_at: None,
             });
+        }
+    }
+    for expired in expired_candidates(store)? {
+        match out.iter_mut().find(|c| c.memory_id == expired.memory_id) {
+            Some(existing) => existing.expired_at = expired.expired_at,
+            None => out.push(expired),
         }
     }
 

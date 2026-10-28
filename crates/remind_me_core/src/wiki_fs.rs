@@ -20,10 +20,13 @@
 //! delete. They are on disk so the directory is self-describing to a human
 //! reading it without any tooling.
 
+use crate::db::memories::{CreatedMemory, Memories};
+use crate::db::wiki::{PageSummary, WikiIndex};
+use crate::db::Result;
+use crate::db::Store;
 use crate::wiki::{WikiDeleteOutcome, WikiPage, WikiSearchHit, RESERVED_SLUGS};
 use crate::wiki_import::slugify;
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -168,40 +171,25 @@ impl Wiki {
     /// The sole writer of those tables from disk — [`Wiki::write_page`] routes
     /// through here too, so the index cannot diverge from the file by taking a
     /// different path in.
-    fn index_page(&self, conn: &Connection, slug: &str, path: &Path) -> Result<()> {
+    fn index_page(&self, store: &Store<'_>, slug: &str, path: &Path) -> Result<()> {
         let content = std::fs::read_to_string(path).map_err(io_error)?;
         let title = extract_title(&content, slug);
         let summary = extract_summary(&content);
         let mtime = mtime_of(path);
 
-        conn.execute(
-            "INSERT INTO wiki_pages (slug, title, content, summary, mtime, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?)
-             ON CONFLICT(slug) DO UPDATE SET
-                title = excluded.title, content = excluded.content,
-                summary = excluded.summary, mtime = excluded.mtime,
-                updated_at = excluded.updated_at",
-            params![
-                slug,
-                title,
-                content,
-                summary,
-                mtime,
-                Utc::now().to_rfc3339()
-            ],
-        )?;
-
+        let links = parse_wikilinks(&content);
+        let wiki = WikiIndex::new(store);
+        wiki.upsert(&WikiPage {
+            slug: slug.to_string(),
+            title,
+            content,
+            summary,
+            mtime,
+            updated_at: Utc::now().to_rfc3339(),
+        })?;
         // Links are replaced wholesale: an edit that removes a `[[link]]` must
         // remove the edge, which an insert-only pass would leave behind.
-        conn.execute("DELETE FROM wiki_links WHERE src_slug = ?", params![slug])?;
-        for (dst_slug, dst_title) in parse_wikilinks(&content) {
-            conn.execute(
-                "INSERT OR IGNORE INTO wiki_links (src_slug, dst_slug, dst_title)
-                 VALUES (?, ?, ?)",
-                params![slug, dst_slug, dst_title],
-            )?;
-        }
-        Ok(())
+        wiki.replace_links(slug, &links)
     }
 
     /// Bring the index in line with the directory.
@@ -210,15 +198,11 @@ impl Wiki {
     /// and drops rows whose file is gone. Cheap enough to run at the head of
     /// every read path, which is what keeps an out-of-band edit — someone
     /// changing a page in their editor — visible without any explicit sync.
-    pub fn reconcile(&self, conn: &Connection) -> Result<ReconcileStats> {
+    pub fn reconcile(&self, store: &Store<'_>) -> Result<ReconcileStats> {
         self.ensure_root()?;
         let files = self.page_files();
 
-        let mut stmt = conn.prepare("SELECT slug, mtime FROM wiki_pages")?;
-        let cached: std::collections::HashMap<String, f64> = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?)))?
-            .collect::<Result<_>>()?;
-        drop(stmt);
+        let cached = WikiIndex::new(store).mtimes()?;
 
         let mut stats = ReconcileStats {
             pages: files.len(),
@@ -231,7 +215,7 @@ impl Wiki {
             // has a new mtime and is re-indexed, which is cheaper than hashing
             // every file on every read.
             if cached.get(slug).map(|m| *m != mtime).unwrap_or(true) {
-                self.index_page(conn, slug, path)?;
+                self.index_page(store, slug, path)?;
                 stats.indexed += 1;
             }
         }
@@ -239,8 +223,7 @@ impl Wiki {
         let on_disk: std::collections::HashSet<&String> =
             files.iter().map(|(slug, _)| slug).collect();
         for slug in cached.keys().filter(|s| !on_disk.contains(s)) {
-            conn.execute("DELETE FROM wiki_pages WHERE slug = ?", params![slug])?;
-            conn.execute("DELETE FROM wiki_links WHERE src_slug = ?", params![slug])?;
+            WikiIndex::new(store).remove(slug)?;
             stats.removed += 1;
         }
 
@@ -258,7 +241,7 @@ impl Wiki {
     /// with the pages it claims to list.
     pub fn write_page(
         &self,
-        conn: &Connection,
+        store: &Store<'_>,
         title: &str,
         content: &str,
         log_note: Option<&str>,
@@ -274,8 +257,8 @@ impl Wiki {
         let created = !path.exists();
         std::fs::write(&path, &body).map_err(io_error)?;
 
-        self.index_page(conn, &slug, &path)?;
-        self.rebuild_index(conn)?;
+        self.index_page(store, &slug, &path)?;
+        self.rebuild_index(store)?;
         self.append_log(&format!(
             "{} [[{}]]",
             if created { "created" } else { "updated" },
@@ -295,57 +278,51 @@ impl Wiki {
     }
 
     /// Read a page by title or slug, reconciling first.
-    pub fn read_page(&self, conn: &Connection, title_or_slug: &str) -> Result<Option<WikiPage>> {
-        self.reconcile(conn)?;
-        crate::wiki::get_wiki_page(conn, &slugify(title_or_slug))
+    pub fn read_page(&self, store: &Store<'_>, title_or_slug: &str) -> Result<Option<WikiPage>> {
+        self.reconcile(store)?;
+        crate::wiki::get_wiki_page(store, &slugify(title_or_slug))
     }
 
     /// Every content page, most recently revised first.
-    pub fn list_pages(&self, conn: &Connection) -> Result<Vec<WikiPage>> {
-        self.reconcile(conn)?;
-        crate::wiki::list_wiki_pages(conn)
+    pub fn list_pages(&self, store: &Store<'_>) -> Result<Vec<WikiPage>> {
+        self.reconcile(store)?;
+        crate::wiki::list_wiki_pages(store)
     }
 
     /// Full-text search over the reconciled index.
     pub fn search_pages(
         &self,
-        conn: &Connection,
+        store: &Store<'_>,
         query: &str,
         limit: usize,
     ) -> Result<Vec<WikiSearchHit>> {
-        self.reconcile(conn)?;
-        crate::wiki::search_wiki_pages(conn, query, limit)
+        self.reconcile(store)?;
+        crate::wiki::search_wiki_pages(store, query, limit)
     }
 
     /// Delete a page's file and its index rows.
-    pub fn delete_page(&self, conn: &Connection, title_or_slug: &str) -> Result<WikiDeleteOutcome> {
+    pub fn delete_page(&self, store: &Store<'_>, title_or_slug: &str) -> Result<WikiDeleteOutcome> {
         let slug = slugify(title_or_slug);
         if RESERVED_SLUGS.contains(&slug.as_str()) {
             return Ok(WikiDeleteOutcome::Reserved);
         }
-        self.reconcile(conn)?;
+        self.reconcile(store)?;
 
         let path = self.page_path(&slug);
         if !path.exists() {
             return Ok(WikiDeleteOutcome::NotFound);
         }
         std::fs::remove_file(&path).map_err(io_error)?;
-        conn.execute("DELETE FROM wiki_pages WHERE slug = ?", params![slug])?;
-        conn.execute("DELETE FROM wiki_links WHERE src_slug = ?", params![slug])?;
+        WikiIndex::new(store).remove(&slug)?;
 
-        self.rebuild_index(conn)?;
+        self.rebuild_index(store)?;
         self.append_log(&format!("deleted [[{}]]", title_or_slug))?;
         Ok(WikiDeleteOutcome::Deleted)
     }
 
     /// Regenerate `index.md` from the current pages.
-    pub fn rebuild_index(&self, conn: &Connection) -> Result<String> {
-        let mut stmt =
-            conn.prepare("SELECT title, summary FROM wiki_pages ORDER BY title COLLATE NOCASE")?;
-        let rows: Vec<(String, String)> = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<Result<_>>()?;
-        drop(stmt);
+    pub fn rebuild_index(&self, store: &Store<'_>) -> Result<String> {
+        let rows = WikiIndex::new(store).summaries_by_title()?;
 
         let mut lines = vec![
             "# Wiki Index".to_string(),
@@ -359,7 +336,7 @@ impl Wiki {
         if rows.is_empty() {
             lines.push("_(empty)_".to_string());
         } else {
-            for (title, summary) in rows {
+            for PageSummary { title, summary } in rows {
                 let tail = if summary.is_empty() {
                     String::new()
                 } else {
@@ -410,20 +387,17 @@ impl Wiki {
     /// individually.
     pub fn load(
         &self,
-        conn: &Connection,
+        store: &Store<'_>,
         token_budget: usize,
         include_index: bool,
     ) -> Result<WikiLoad> {
-        self.reconcile(conn)?;
+        self.reconcile(store)?;
 
-        let mut stmt = conn.prepare(
-            "SELECT title, content, summary FROM wiki_pages
-              ORDER BY updated_at DESC, title COLLATE NOCASE",
-        )?;
-        let rows: Vec<(String, String, String)> = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-            .collect::<Result<_>>()?;
-        drop(stmt);
+        let rows: Vec<(String, String, String)> = WikiIndex::new(store)
+            .recent_first_then_title()?
+            .into_iter()
+            .map(|p| (p.title, p.content, p.summary))
+            .collect();
 
         let mut parts: Vec<String> = Vec::new();
         if include_index {
@@ -491,38 +465,28 @@ impl Wiki {
     /// synthesising.
     pub fn compile(
         &self,
-        conn: &Connection,
+        store: &Store<'_>,
         limit: usize,
         mark_integrated: bool,
     ) -> Result<WikiCompile> {
-        self.reconcile(conn)?;
-        let watermark = get_meta(conn, COMPILE_WATERMARK_KEY)?.unwrap_or_default();
+        self.reconcile(store)?;
+        let watermark = get_meta(store, COMPILE_WATERMARK_KEY)?.unwrap_or_default();
         let cutoff = if watermark.is_empty() {
             EPOCH.to_string()
         } else {
             watermark.clone()
         };
 
-        let mut stmt = conn.prepare(
-            "SELECT id, category, content, created_at FROM memories
-              WHERE superseded_by IS NULL AND deleted_at IS NULL AND created_at > ?
-              ORDER BY created_at ASC LIMIT ?",
-        )?;
-        let pending: Vec<(String, String, String, String)> = stmt
-            .query_map(params![cutoff, limit as i64], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-            })?
-            .collect::<Result<_>>()?;
-        drop(stmt);
+        let pending = Memories::new(store).live_created_after(&cutoff, limit)?;
 
         if mark_integrated {
-            let Some((_, _, _, last_created)) = pending.last() else {
+            let Some(last_created) = pending.last().map(|m| &m.created_at) else {
                 return Ok(WikiCompile::Noop {
                     reason: "no pending memories to mark".to_string(),
                     watermark,
                 });
             };
-            set_meta(conn, COMPILE_WATERMARK_KEY, last_created)?;
+            set_meta(store, COMPILE_WATERMARK_KEY, last_created)?;
             self.append_log(&format!(
                 "compiled {} source(s) — watermark -> {}",
                 pending.len(),
@@ -541,7 +505,7 @@ impl Wiki {
             });
         }
 
-        let pages = crate::wiki::list_wiki_pages(conn)?;
+        let pages = crate::wiki::list_wiki_pages(store)?;
         let index = if pages.is_empty() {
             "_(the wiki is currently empty — you are bootstrapping it)_".to_string()
         } else {
@@ -561,20 +525,27 @@ impl Wiki {
 
         let sources = pending
             .iter()
-            .map(|(id, category, content, created_at)| {
-                let body: String = if content.chars().count() > COMPILE_SOURCE_CHARS {
-                    format!(
-                        "{} …[truncated]",
-                        content
-                            .chars()
-                            .take(COMPILE_SOURCE_CHARS)
-                            .collect::<String>()
-                    )
-                } else {
-                    content.clone()
-                };
-                format!("### `{}` [{}] ({})\n{}", id, category, created_at, body)
-            })
+            .map(
+                |CreatedMemory {
+                     id,
+                     category,
+                     content,
+                     created_at,
+                 }| {
+                    let body: String = if content.chars().count() > COMPILE_SOURCE_CHARS {
+                        format!(
+                            "{} …[truncated]",
+                            content
+                                .chars()
+                                .take(COMPILE_SOURCE_CHARS)
+                                .collect::<String>()
+                        )
+                    } else {
+                        content.clone()
+                    };
+                    format!("### `{}` [{}] ({})\n{}", id, category, created_at, body)
+                },
+            )
             .collect::<Vec<_>>()
             .join("\n\n");
 
@@ -616,44 +587,28 @@ impl Wiki {
 /// uncapped: `compile`'s own `pending` count is truncated by its `limit`
 /// argument, which is right for a synthesis brief and wrong for a status
 /// badge. Zero means the wiki is current with the memory store.
-pub fn pending_compile_count(conn: &Connection) -> Result<usize> {
-    let watermark = get_meta(conn, COMPILE_WATERMARK_KEY)?.unwrap_or_default();
+pub fn pending_compile_count(store: &Store<'_>) -> Result<usize> {
+    let watermark = get_meta(store, COMPILE_WATERMARK_KEY)?.unwrap_or_default();
     let cutoff = if watermark.is_empty() {
         EPOCH.to_string()
     } else {
         watermark
     };
-    let count: i64 = conn.query_row(
-        "SELECT count(*) FROM memories
-          WHERE superseded_by IS NULL AND deleted_at IS NULL AND created_at > ?",
-        params![cutoff],
-        |row| row.get(0),
-    )?;
-    Ok(count.max(0) as usize)
+    Memories::new(store).count_live_created_after(&cutoff)
 }
 
 /// Read a `wiki_meta` value.
-pub fn get_meta(conn: &Connection, key: &str) -> Result<Option<String>> {
-    conn.query_row(
-        "SELECT value FROM wiki_meta WHERE key = ?",
-        params![key],
-        |r| r.get(0),
-    )
-    .optional()
+pub fn get_meta(store: &Store<'_>, key: &str) -> Result<Option<String>> {
+    WikiIndex::new(store).meta(key)
 }
 
 /// Write a `wiki_meta` value.
-pub fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<()> {
-    conn.execute(
-        "INSERT INTO wiki_meta (key, value) VALUES (?, ?)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        params![key, value],
-    )?;
-    Ok(())
+pub fn set_meta(store: &Store<'_>, key: &str, value: &str) -> Result<()> {
+    WikiIndex::new(store).set_meta(key, value)
 }
 
-fn io_error(e: std::io::Error) -> rusqlite::Error {
-    rusqlite::Error::InvalidParameterName(e.to_string())
+fn io_error(e: std::io::Error) -> crate::db::StoreError {
+    crate::db::StoreError::Invalid(e.to_string())
 }
 
 fn mtime_of(path: &Path) -> f64 {

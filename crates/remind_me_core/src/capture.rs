@@ -5,30 +5,31 @@
 //! keys on — `remind_me_get_capture` to retrieve both halves, and
 //! `remind_me_decompose` to break the capture into atomic facts.
 
-use crate::db::queries::{parse_memory_row, MEMORY_COLUMNS};
-use crate::entity::{
-    apply_entity_mentions, maybe_link_entity_relation, supersede_contradicting_facts,
-};
+use crate::db::curation::Curation;
+use crate::db::memories::{Memories, NewMemory};
+use crate::db::Result;
+use crate::db::Store;
+use crate::entity::{maybe_link_entity_relation, supersede_contradicting_facts};
 use crate::models::{
     AutoCaptureInput, Capture, CaptureResult, DecomposeBatchInput, DecomposeBatchResult,
-    DecomposeInput, DecomposeResult, Memory, UndecomposedCapture, CAPTURE_SOURCE,
+    DecomposeInput, DecomposeResult, Memory, UndecomposedCapture, WriteContext, CAPTURE_SOURCE,
     CAPTURE_TITLE_CHARS, DECOMPOSE_BATCH_MAX, DECOMPOSE_BATCH_MIN, DECOMPOSITION_SOURCE,
     DIALOG_CATEGORY, FACT_CATEGORY, UNCLASSIFIED,
 };
 use crate::vitality::{calculate_vitality, get_decay_rate, get_source_prior, get_type_prior};
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension, Result};
 
 /// Derive a display title from a summary when the caller supplied none.
 ///
 /// First line, capped — a summary's opening line is the closest thing to a
-/// headline it has.
+/// headline it has. Either source is redacted whole first: the title is
+/// metadata, which the halves' own redaction does not reach.
 fn derive_title(title: &str, summary: &str) -> String {
     let supplied = title.trim();
     if !supplied.is_empty() {
-        return supplied.to_string();
+        return crate::boundary::scrub_field(supplied);
     }
-    summary
+    crate::boundary::scrub_field(summary)
         .lines()
         .next()
         .unwrap_or("")
@@ -60,47 +61,92 @@ fn capture_metadata(
     metadata
 }
 
+/// Where and by whom a capture was written, for the callers that know
+/// (the transcript hook); a plain [`auto_capture`] stamps none of it.
+#[derive(Debug, Clone, Default)]
+pub struct CaptureStamp {
+    pub context: WriteContext,
+    /// Overrides the schema default `unknown` when set.
+    pub written_by: Option<String>,
+    /// Overrides the schema default `manual` when set.
+    pub capture_method: Option<String>,
+    /// The context is the whole truth about where the capture was made (a
+    /// caller's own, or a backfilled transcript's): its project, cwd and git
+    /// columns replace this process's, so an unknown stays unknown instead
+    /// of taking the value of wherever the store runs.
+    pub authoritative: bool,
+}
+
+impl CaptureStamp {
+    fn apply(&self, row: &mut NewMemory) {
+        if self.authoritative {
+            (row.project, row.cwd) = (None, None);
+            (row.git_remote, row.git_branch, row.git_sha) = (None, None, None);
+        }
+        self.context.apply(row);
+        if let Some(by) = &self.written_by {
+            row.written_by.clone_from(by);
+        }
+        if let Some(method) = &self.capture_method {
+            row.capture_method.clone_from(method);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn insert_half(
-    conn: &Connection,
+    store: &Store<'_>,
     id: &str,
     content: &str,
     category: &str,
-    tags_json: &str,
-    metadata: &serde_json::Value,
+    tags: &[String],
+    metadata: serde_json::Value,
     capture_id: &str,
     now_iso: &str,
+    extract: bool,
+    stamp: &CaptureStamp,
 ) -> Result<()> {
+    let (mut tags, mut metadata) = (tags.to_vec(), metadata);
+    let content = crate::boundary::scrub(content, &mut tags, &mut metadata);
+    let content = content.as_str();
     let now = Utc::now();
     let decay_rate = get_decay_rate(category);
     let base_weight = get_type_prior(category) * get_source_prior(CAPTURE_SOURCE);
     let vitality = calculate_vitality(base_weight, 0, decay_rate, now_iso, now);
 
-    let (node_id, client) = crate::sync::memory_provenance();
-    conn.execute(
-        "INSERT INTO memories (
-            id, content, category, tags, source, metadata, capture_id,
-            created_at, updated_at, decay_rate, vitality, base_weight,
-            access_count, accessed_at, node_id, client
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
-        params![
-            id,
-            content,
-            category,
-            tags_json,
-            CAPTURE_SOURCE,
-            metadata.to_string(),
-            capture_id,
-            now_iso,
-            now_iso,
-            decay_rate,
-            vitality,
-            base_weight,
-            now_iso,
-            node_id,
-            client,
-        ],
-    )?;
+    let provenance = crate::context::default_provenance().auto();
+    let mut row = NewMemory {
+        category: category.to_string(),
+        tags,
+        source: CAPTURE_SOURCE.to_string(),
+        metadata,
+        capture_id: Some(capture_id.to_string()),
+        decay_rate,
+        vitality,
+        base_weight,
+        accessed_at: Some(now_iso.to_string()),
+        ..provenance.stamp(NewMemory::new(id, content, now_iso))
+    };
+    // The hook's explicit session/project/branch win over what the
+    // environment supplied.
+    stamp.apply(&mut row);
+    // A session this store has not heard of (written outside the hook)
+    // still appears in `sessions`.
+    let session = WriteContext {
+        project: row.project.clone(),
+        session_id: row.session_id.clone(),
+        git_remote: row.git_remote.clone(),
+        git_branch: row.git_branch.clone(),
+        git_sha: row.git_sha.clone(),
+        cwd: row.cwd.clone(),
+    };
+    crate::episodes::ensure_session(store, &session)?;
+    Memories::new(store).insert(&row)?;
+    // The summary half only: a raw dialog is too long and too noisy for
+    // the rules to mean anything.
+    if extract {
+        crate::boundary::index(store, id, content, &[], true, &[], now_iso)?;
+    }
     Ok(())
 }
 
@@ -118,14 +164,22 @@ fn insert_half(
 /// (`linked_dialog` / `linked_summary`). The dialog's pointer is written in a
 /// second pass, because the summary's id does not exist when the dialog is
 /// inserted.
-pub fn auto_capture(conn: &Connection, input: &AutoCaptureInput) -> Result<CaptureResult> {
+pub fn auto_capture(store: &Store<'_>, input: &AutoCaptureInput) -> Result<CaptureResult> {
+    auto_capture_stamped(store, input, &CaptureStamp::default())
+}
+
+/// [`auto_capture`] with the provenance columns a hook knows: session,
+/// project, cwd, branch, who wrote it and how.
+pub fn auto_capture_stamped(
+    store: &Store<'_>,
+    input: &AutoCaptureInput,
+    stamp: &CaptureStamp,
+) -> Result<CaptureResult> {
     let now_iso = Utc::now().to_rfc3339();
     let capture_id = format!("cap_{}", uuid::Uuid::new_v4().simple());
     let dialog_id = format!("mem_{}", uuid::Uuid::new_v4().simple());
     let summary_id = format!("mem_{}", uuid::Uuid::new_v4().simple());
     let title = derive_title(&input.title, &input.summary);
-    let tags_json = serde_json::to_string(&input.tags).unwrap_or_else(|_| "[]".to_string());
-
     let dialog_meta = capture_metadata(
         &input.metadata,
         &capture_id,
@@ -144,24 +198,28 @@ pub fn auto_capture(conn: &Connection, input: &AutoCaptureInput) -> Result<Captu
     );
 
     insert_half(
-        conn,
+        store,
         &dialog_id,
         &input.conversation,
         DIALOG_CATEGORY,
-        &tags_json,
-        &dialog_meta,
+        &input.tags,
+        dialog_meta,
         &capture_id,
         &now_iso,
+        false,
+        stamp,
     )?;
     insert_half(
-        conn,
+        store,
         &summary_id,
         &input.summary,
         &input.category,
-        &tags_json,
-        &summary_meta,
+        &input.tags,
+        summary_meta,
         &capture_id,
         &now_iso,
+        true,
+        stamp,
     )?;
 
     Ok(CaptureResult {
@@ -183,14 +241,8 @@ pub fn auto_capture(conn: &Connection, input: &AutoCaptureInput) -> Result<Captu
 /// but matching neither is returned in `other` rather than dropped — a capture
 /// that has lost a half, or gained a third row through sync, should be visible
 /// rather than silently half-reported.
-pub fn get_capture(conn: &Connection, capture_id: &str) -> Result<Option<Capture>> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {} FROM memories WHERE capture_id = ? ORDER BY category",
-        MEMORY_COLUMNS
-    ))?;
-    let rows: Vec<Memory> = stmt
-        .query_map(params![capture_id], parse_memory_row)?
-        .collect::<Result<_>>()?;
+pub fn get_capture(store: &Store<'_>, capture_id: &str) -> Result<Option<Capture>> {
+    let rows = Curation::new(store).capture_rows(capture_id)?;
     if rows.is_empty() {
         return Ok(None);
     }
@@ -249,19 +301,27 @@ pub fn get_capture(conn: &Connection, capture_id: &str) -> Result<Option<Capture
 /// 3. **Contradicted facts are superseded.**
 ///
 /// Returns `None` when no memory carries `capture_id`.
-pub fn decompose(conn: &Connection, input: &DecomposeInput) -> Result<Option<DecomposeResult>> {
-    let parent_tags: Option<Vec<String>> = conn
-        .query_row(
-            "SELECT tags FROM memories WHERE capture_id = ? LIMIT 1",
-            params![input.capture_id],
-            |row| {
-                let tags_json: String = row.get(0)?;
-                Ok(serde_json::from_str(&tags_json).unwrap_or_default())
-            },
-        )
-        .optional()?;
-    let Some(parent_tags) = parent_tags else {
+pub fn decompose(store: &Store<'_>, input: &DecomposeInput) -> Result<Option<DecomposeResult>> {
+    let rows = Curation::new(store).capture_rows(&input.capture_id)?;
+    let Some(parent) = rows.iter().min_by(|a, b| a.id.cmp(&b.id)) else {
         return Ok(None);
+    };
+    let parent_tags = parent.tags.clone();
+    // Before any fact is written, so a refused batch leaves nothing behind.
+    for fact in &input.facts {
+        crate::project::refuse_reserved_predicate(fact.predicate.as_deref())?;
+    }
+    let revision = input
+        .capture_revision
+        .as_deref()
+        .map(observed_revision)
+        .transpose()?;
+    // ADR-0029: a fact is stamped with the session it was drawn from, not
+    // with wherever the decomposing routine runs. Who wrote it stays the
+    // decomposer.
+    let provenance = crate::context::Provenance {
+        context: session_context(parent),
+        ..crate::context::default_provenance()
     };
 
     let now = Utc::now();
@@ -297,49 +357,65 @@ pub fn decompose(conn: &Connection, input: &DecomposeInput) -> Result<Option<Dec
         let decay_rate = get_decay_rate(memory_type);
         let base_weight = get_type_prior(memory_type);
 
-        let (node_id, client) = crate::sync::memory_provenance();
-
         // #260: a no-op unless REMIND_ME_CODE_ROOTS is configured. Merged
         // into the metadata object already built for `source_capture_id`
         // rather than a separate write, so one INSERT still carries both.
-        let mut metadata = serde_json::json!({ "source_capture_id": input.capture_id });
+        let mut metadata = fact
+            .metadata
+            .clone()
+            .filter(serde_json::Value::is_object)
+            .unwrap_or_else(|| serde_json::json!({}));
+        metadata["source_capture_id"] = serde_json::json!(input.capture_id);
+        // Reserved: only a validated top-level `capture_revision` may set it,
+        // or a caller's nested value would hide later recaptures.
+        match &revision {
+            Some(revision) => metadata["capture_revision"] = serde_json::json!(revision),
+            None => {
+                if let Some(m) = metadata.as_object_mut() {
+                    m.remove("capture_revision");
+                }
+            }
+        }
         let code_refs = crate::code_refs::detect_code_refs(&fact.content);
         crate::code_refs::merge_code_refs(&mut metadata, &code_refs);
 
-        conn.execute(
-            "INSERT INTO memories (
-                id, content, category, tags, source, metadata,
-                capture_id, source_capture_id, created_at, updated_at,
-                memory_type, decay_rate, vitality, base_weight, status,
-                accessed_at, access_count, subject, predicate, object,
-                node_id, client
-             ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, 'active', ?, 0, ?, ?, ?, ?, ?)",
-            params![
-                fact_id,
-                fact.content,
-                FACT_CATEGORY,
-                serde_json::to_string(&merged_tags).unwrap_or_else(|_| "[]".to_string()),
-                DECOMPOSITION_SOURCE,
-                metadata.to_string(),
-                input.capture_id,
-                now_iso,
-                now_iso,
-                memory_type,
-                decay_rate,
-                base_weight,
-                base_weight,
-                now_iso,
-                fact.subject,
-                fact.predicate,
-                fact.object,
-                node_id,
-                client,
-            ],
-        )?;
+        let fact_content = crate::boundary::scrub(&fact.content, &mut merged_tags, &mut metadata);
+        if let Some(scheduled) = crate::review::schedule_if_decision(Some(memory_type), &metadata) {
+            metadata = scheduled;
+        }
 
-        entities_linked += apply_entity_mentions(conn, &fact_id, &fact.entities)?;
+        Memories::new(store).insert(&NewMemory {
+            category: FACT_CATEGORY.to_string(),
+            tags: merged_tags,
+            source: DECOMPOSITION_SOURCE.to_string(),
+            metadata,
+            source_capture_id: Some(input.capture_id.clone()),
+            memory_type: memory_type.to_string(),
+            decay_rate,
+            vitality: base_weight,
+            base_weight,
+            accessed_at: Some(now_iso.clone()),
+            subject: fact.subject.clone(),
+            predicate: fact.predicate.clone(),
+            object: fact.object.clone(),
+            ..provenance.stamp(NewMemory::new(
+                fact_id.clone(),
+                fact_content.clone(),
+                &now_iso,
+            ))
+        })?;
+
+        entities_linked += crate::boundary::index(
+            store,
+            &fact_id,
+            &fact_content,
+            &fact.entities,
+            true,
+            &[],
+            &now_iso,
+        )?;
         if maybe_link_entity_relation(
-            conn,
+            store,
             fact.subject.as_deref(),
             fact.predicate.as_deref(),
             fact.object.as_deref(),
@@ -347,7 +423,7 @@ pub fn decompose(conn: &Connection, input: &DecomposeInput) -> Result<Option<Dec
             relations_linked += 1;
         }
         superseded_ids.extend(supersede_contradicting_facts(
-            conn,
+            store,
             &fact_id,
             fact.subject.as_deref(),
             fact.predicate.as_deref(),
@@ -368,6 +444,32 @@ pub fn decompose(conn: &Connection, input: &DecomposeInput) -> Result<Option<Dec
     }))
 }
 
+/// `raw` as a UTC RFC 3339 instant, comparable with stored timestamps, and
+/// no later than now: a revision from the future would hide every later
+/// recapture.
+fn observed_revision(raw: &str) -> Result<String> {
+    let at = chrono::DateTime::parse_from_rfc3339(raw.trim())
+        .map_err(|_| {
+            crate::db::StoreError::Invalid(format!(
+                "capture_revision '{raw}' is not an RFC 3339 time"
+            ))
+        })?
+        .with_timezone(&Utc);
+    Ok(at.min(Utc::now()).to_rfc3339())
+}
+
+/// The session columns of a capture, which its facts inherit.
+fn session_context(capture: &Memory) -> WriteContext {
+    WriteContext {
+        project: capture.project.clone(),
+        session_id: capture.session_id.clone(),
+        git_remote: capture.git_remote.clone(),
+        git_branch: capture.git_branch.clone(),
+        git_sha: capture.git_sha.clone(),
+        cwd: capture.cwd.clone(),
+    }
+}
+
 /// Captures that have not been decomposed yet, newest first.
 ///
 /// A row qualifies when it **is** a capture (`capture_id` set), is **not itself
@@ -376,46 +478,30 @@ pub fn decompose(conn: &Connection, input: &DecomposeInput) -> Result<Option<Dec
 /// there is no decomposed flag, so a capture leaves the backlog once any fact
 /// points back at it.
 pub fn undecomposed_batch(
-    conn: &Connection,
+    store: &Store<'_>,
     input: &DecomposeBatchInput,
 ) -> Result<DecomposeBatchResult> {
     let batch_size = input
         .batch_size
         .clamp(DECOMPOSE_BATCH_MIN, DECOMPOSE_BATCH_MAX);
-    let predicate = "m.capture_id IS NOT NULL
-         AND m.source_capture_id IS NULL
-         AND m.deleted_at IS NULL
-         AND NOT EXISTS (
-             SELECT 1 FROM memories c WHERE c.source_capture_id = m.capture_id
-         )";
-
-    let total: i64 = conn.query_row(
-        &format!("SELECT count(*) FROM memories m WHERE {}", predicate),
-        [],
-        |r| r.get(0),
-    )?;
-
-    let mut stmt = conn.prepare(&format!(
-        "SELECT m.id, m.capture_id, m.content, m.category, m.tags
-           FROM memories m
-          WHERE {}
-          ORDER BY m.created_at DESC
-          LIMIT ?",
-        predicate
-    ))?;
-    let memories: Vec<UndecomposedCapture> = stmt
-        .query_map(params![batch_size as i64], |row| {
-            let content: String = row.get("content")?;
-            let tags_json: String = row.get("tags")?;
-            Ok(UndecomposedCapture {
-                id: row.get("id")?,
-                capture_id: row.get("capture_id")?,
-                content_snippet: content.chars().take(500).collect(),
-                category: row.get("category")?,
-                tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-            })
-        })?
-        .collect::<Result<_>>()?;
+    let curation = Curation::new(store);
+    let settled_before = (input.idle_minutes > 0).then(|| {
+        (Utc::now() - chrono::Duration::minutes(i64::from(input.idle_minutes))).to_rfc3339()
+    });
+    let settled_before = settled_before.as_deref();
+    let total = curation.count_undecomposed(settled_before)?;
+    let memories: Vec<UndecomposedCapture> = curation
+        .undecomposed(batch_size, settled_before)?
+        .into_iter()
+        .map(|row| UndecomposedCapture {
+            id: row.id,
+            capture_id: row.capture_id,
+            content_snippet: row.content.chars().take(500).collect(),
+            category: row.category,
+            tags: row.tags,
+            capture_revision: row.revision,
+        })
+        .collect();
 
     Ok(DecomposeBatchResult {
         memories,

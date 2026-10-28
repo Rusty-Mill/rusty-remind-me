@@ -1,12 +1,18 @@
 [package]
 name = "remind_me_api"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+version = "0.4.0"
+edition = "2021"
+rust-version = "1.89"
+license = "MIT"
+repository = "https://github.com/Rusty-Mill/rusty_mill"
+
+[package.metadata.rusty_mill]
+layer = "apps"
 
 [dependencies]
+rusty_percent = { workspace = true }
+rusty_oauth = { workspace = true }
 remind_me_core.workspace = true
 
-serde.workspace = true
-serde_json.workspace = true
-rusqlite.workspace = true
+serde = { workspace = true }
+serde_json = "1.0"

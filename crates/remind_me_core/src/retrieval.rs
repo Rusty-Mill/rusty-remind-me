@@ -1,4 +1,4 @@
-use crate::models::{Memory, MemorySearchResult, RetrievalStrategy};
+use crate::models::{Memory, MemorySearchResult, RetrievalStrategy, SearchDetail};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -566,6 +566,9 @@ pub struct TrimOutcome {
     /// boolean: "3 were cut" and "something was cut" are different answers,
     /// and only one of them tells a caller whether to raise the budget.
     pub trimmed: usize,
+    /// Ids of the dropped results, in rank order, so a caller can fetch them
+    /// by id instead of re-running the search with a bigger budget.
+    pub trimmed_ids: Vec<String>,
     /// Estimated tokens across what was kept.
     pub tokens_used: usize,
     /// What the wall-clock deadline did to this search (#257).
@@ -576,6 +579,8 @@ pub struct TrimOutcome {
     /// would have to be threaded through three public signatures to say one
     /// thing.
     pub timing: SearchTiming,
+    /// Nothing refined matched, so these are raw session dialogs (ADR-0029).
+    pub raw_fallback: bool,
 }
 
 /// Wall-clock budget for one search.
@@ -729,35 +734,87 @@ pub fn estimated_content_tokens(content: &str) -> usize {
     (content.len() / 4).max(1)
 }
 
-/// Estimated token cost of one result.
-fn estimated_tokens(result: &MemorySearchResult) -> usize {
-    estimated_content_tokens(&result.memory.content)
+/// Characters of content a compact hit carries.
+pub const COMPACT_SNIPPET_CHARS: usize = 160;
+
+/// Flat token charge for a compact hit's id, category, date, tags and score,
+/// on top of its snippet. A rough constant rather than a measurement of the
+/// rendered line: the estimator is already `len / 4`, and the point is only
+/// that a compact hit is not free.
+pub const COMPACT_META_TOKENS: usize = 24;
+
+/// The first [`COMPACT_SNIPPET_CHARS`] characters of `content`, whitespace
+/// collapsed to single spaces, with `…` when anything was cut.
+///
+/// By character, not byte, so a multi-byte boundary cannot be split.
+pub fn compact_snippet(content: &str) -> String {
+    let flat = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= COMPACT_SNIPPET_CHARS {
+        return flat;
+    }
+    let cut: String = flat.chars().take(COMPACT_SNIPPET_CHARS).collect();
+    format!("{}…", cut.trim_end())
 }
 
-pub fn trim_by_token_budget(results: Vec<MemorySearchResult>, token_budget: usize) -> TrimOutcome {
+/// Estimated token cost of one result at `detail`.
+fn estimated_tokens(result: &MemorySearchResult, detail: SearchDetail) -> usize {
+    match detail {
+        SearchDetail::Full => estimated_content_tokens(&result.memory.content),
+        SearchDetail::Compact => {
+            estimated_content_tokens(&compact_snippet(&result.memory.content)) + COMPACT_META_TOKENS
+        }
+    }
+}
+
+/// Keep ranked results, in order, until the next would exceed `token_budget`.
+///
+/// Each hit is charged at `detail`, so a compact search fits more hits into
+/// the same budget. The first hit is always kept, and `0` means unlimited.
+pub fn trim_by_token_budget(
+    results: Vec<MemorySearchResult>,
+    token_budget: usize,
+    detail: SearchDetail,
+) -> TrimOutcome {
     let total_candidates = results.len();
 
     if token_budget == 0 {
         // Unlimited. The tokens are still counted, because "how big was this
         // response" is a fair question even when nothing was cut.
-        let tokens_used = results.iter().map(estimated_tokens).sum();
+        let tokens_used = results.iter().map(|r| estimated_tokens(r, detail)).sum();
         return TrimOutcome {
             returned: total_candidates,
             trimmed: 0,
+            trimmed_ids: Vec::new(),
             tokens_used,
             total_candidates,
             results,
             timing: SearchTiming::default(),
+            raw_fallback: false,
         };
     }
 
     let mut tokens_used = 0;
     let mut kept = Vec::new();
+    let mut rest = results.into_iter();
 
-    for res in results {
-        let est_tokens = estimated_tokens(&res);
+    for res in rest.by_ref() {
+        let est_tokens = estimated_tokens(&res, detail);
         if tokens_used + est_tokens > token_budget && !kept.is_empty() {
-            break;
+            // Put the one that did not fit back at the head of the dropped set.
+            let trimmed_ids: Vec<String> = std::iter::once(res)
+                .chain(rest)
+                .map(|r| r.memory.id)
+                .collect();
+            return TrimOutcome {
+                returned: kept.len(),
+                trimmed: trimmed_ids.len(),
+                trimmed_ids,
+                tokens_used,
+                total_candidates,
+                results: kept,
+                timing: SearchTiming::default(),
+                raw_fallback: false,
+            };
         }
         tokens_used += est_tokens;
         kept.push(res);
@@ -765,11 +822,13 @@ pub fn trim_by_token_budget(results: Vec<MemorySearchResult>, token_budget: usiz
 
     TrimOutcome {
         returned: kept.len(),
-        trimmed: total_candidates - kept.len(),
+        trimmed: 0,
+        trimmed_ids: Vec::new(),
         tokens_used,
         total_candidates,
         results: kept,
         timing: SearchTiming::default(),
+        raw_fallback: false,
     }
 }
 
@@ -784,13 +843,13 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn clear_env() {
-        std::env::remove_var(ENV_RRF_K);
-        std::env::remove_var(ENV_RRF_W_KEYWORD);
-        std::env::remove_var(ENV_RRF_W_SEMANTIC);
-        std::env::remove_var(ENV_RRF_W_RECENCY);
-        std::env::remove_var(ENV_RRF_W_VITALITY);
-        std::env::remove_var(ENV_RRF_W_IDF);
-        std::env::remove_var(ENV_RRF_FUSION);
+        crate::test_env::remove_var(ENV_RRF_K);
+        crate::test_env::remove_var(ENV_RRF_W_KEYWORD);
+        crate::test_env::remove_var(ENV_RRF_W_SEMANTIC);
+        crate::test_env::remove_var(ENV_RRF_W_RECENCY);
+        crate::test_env::remove_var(ENV_RRF_W_VITALITY);
+        crate::test_env::remove_var(ENV_RRF_W_IDF);
+        crate::test_env::remove_var(ENV_RRF_FUSION);
     }
 
     #[test]
@@ -814,7 +873,7 @@ mod tests {
     fn rrf_k_reads_a_valid_override() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
-        std::env::set_var(ENV_RRF_K, "12.5");
+        crate::test_env::set_var(ENV_RRF_K, "12.5");
         assert_eq!(rrf_k_from_env(), 12.5);
         clear_env();
     }
@@ -823,7 +882,7 @@ mod tests {
     fn rrf_k_falls_back_to_default_on_an_unparseable_value() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
-        std::env::set_var(ENV_RRF_K, "not-a-number");
+        crate::test_env::set_var(ENV_RRF_K, "not-a-number");
         assert_eq!(rrf_k_from_env(), RRF_K_DEFAULT);
         clear_env();
     }
@@ -832,9 +891,9 @@ mod tests {
     fn rrf_k_falls_back_to_default_on_a_non_finite_value() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
-        std::env::set_var(ENV_RRF_K, "NaN");
+        crate::test_env::set_var(ENV_RRF_K, "NaN");
         assert_eq!(rrf_k_from_env(), RRF_K_DEFAULT);
-        std::env::set_var(ENV_RRF_K, "inf");
+        crate::test_env::set_var(ENV_RRF_K, "inf");
         assert_eq!(rrf_k_from_env(), RRF_K_DEFAULT);
         clear_env();
     }
@@ -843,11 +902,11 @@ mod tests {
     fn rrf_weights_from_env_reads_all_five_overrides() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
-        std::env::set_var(ENV_RRF_W_KEYWORD, "2.0");
-        std::env::set_var(ENV_RRF_W_SEMANTIC, "0.25");
-        std::env::set_var(ENV_RRF_W_RECENCY, "0.0");
-        std::env::set_var(ENV_RRF_W_VITALITY, "3.0");
-        std::env::set_var(ENV_RRF_W_IDF, "1.0");
+        crate::test_env::set_var(ENV_RRF_W_KEYWORD, "2.0");
+        crate::test_env::set_var(ENV_RRF_W_SEMANTIC, "0.25");
+        crate::test_env::set_var(ENV_RRF_W_RECENCY, "0.0");
+        crate::test_env::set_var(ENV_RRF_W_VITALITY, "3.0");
+        crate::test_env::set_var(ENV_RRF_W_IDF, "1.0");
 
         let w = RrfWeights::from_env();
 
@@ -876,8 +935,8 @@ mod tests {
     fn a_malformed_weight_falls_back_to_its_own_default_not_the_whole_profile() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
-        std::env::set_var(ENV_RRF_W_KEYWORD, "garbage");
-        std::env::set_var(ENV_RRF_W_SEMANTIC, "0.75");
+        crate::test_env::set_var(ENV_RRF_W_KEYWORD, "garbage");
+        crate::test_env::set_var(ENV_RRF_W_SEMANTIC, "0.75");
 
         let w = RrfWeights::from_env();
 
@@ -892,7 +951,7 @@ mod tests {
         // deliberate way to penalize a signal, not malformed input.
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
-        std::env::set_var(ENV_RRF_W_KEYWORD, "-2.5");
+        crate::test_env::set_var(ENV_RRF_W_KEYWORD, "-2.5");
         assert_eq!(RrfWeights::from_env().w_keyword, -2.5);
         clear_env();
     }
@@ -910,7 +969,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
         for value in ["score", "SCORE", "Score", "  score  "] {
-            std::env::set_var(ENV_RRF_FUSION, value);
+            crate::test_env::set_var(ENV_RRF_FUSION, value);
             assert_eq!(RrfFusion::from_env(), RrfFusion::Score, "{value:?}");
         }
         clear_env();
@@ -920,7 +979,7 @@ mod tests {
     fn an_unrecognized_fusion_string_falls_back_to_rank_not_an_error() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
-        std::env::set_var(ENV_RRF_FUSION, "banana");
+        crate::test_env::set_var(ENV_RRF_FUSION, "banana");
         assert_eq!(RrfFusion::from_env(), RrfFusion::Rank);
         clear_env();
     }
@@ -932,7 +991,7 @@ mod tests {
         // discard the env override in favor of a fixed absolute number.
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
-        std::env::set_var(ENV_RRF_W_KEYWORD, "2.0");
+        crate::test_env::set_var(ENV_RRF_W_KEYWORD, "2.0");
         let w = choose_rrf_weights("id", RetrievalStrategy::Auto);
         assert_eq!(w.w_keyword, 3.0);
         clear_env();
@@ -981,7 +1040,78 @@ mod tests {
             client: None,
             source_capture_id: None,
             deleted_at: None,
+            project: None,
+            session_id: None,
+            git_remote: None,
+            git_branch: None,
+            git_sha: None,
+            cwd: None,
+            valid_from: None,
+            valid_until: None,
+            confidence: 1.0,
+            verified_at: None,
+            outcome: None,
+            written_by: "unknown".to_string(),
+            capture_method: "manual".to_string(),
         }
+    }
+
+    fn hit(id: &str, content: &str) -> MemorySearchResult {
+        MemorySearchResult {
+            memory: Memory {
+                content: content.to_string(),
+                ..mem(id, 1.0)
+            },
+            score: 1.0,
+            fts_score: None,
+            vec_score: None,
+            recency_score: None,
+            vitality_score: None,
+            idf_score: None,
+            feedback_adjustment: None,
+            rerank_score: None,
+        }
+    }
+
+    fn long_hits(n: usize) -> Vec<MemorySearchResult> {
+        (0..n)
+            .map(|i| hit(&format!("m{i}"), &"word ".repeat(400)))
+            .collect()
+    }
+
+    #[test]
+    fn compact_snippet_collapses_whitespace_and_keeps_short_text_whole() {
+        assert_eq!(compact_snippet("  one\n\ttwo   three "), "one two three");
+    }
+
+    #[test]
+    fn compact_snippet_cuts_long_text_on_a_char_boundary() {
+        let snippet = compact_snippet(&"é".repeat(500));
+        assert!(snippet.ends_with('…'));
+        assert_eq!(snippet.chars().count(), COMPACT_SNIPPET_CHARS + 1);
+    }
+
+    #[test]
+    fn a_compact_trim_fits_more_hits_than_a_full_one() {
+        let full = trim_by_token_budget(long_hits(5), 800, SearchDetail::Full);
+        let compact = trim_by_token_budget(long_hits(5), 800, SearchDetail::Compact);
+        assert_eq!(full.returned, 1);
+        assert_eq!(compact.returned, 5);
+        assert!(compact.trimmed_ids.is_empty());
+    }
+
+    #[test]
+    fn a_trim_names_what_it_dropped_in_rank_order() {
+        let out = trim_by_token_budget(long_hits(4), 800, SearchDetail::Full);
+        assert_eq!(out.trimmed, 3);
+        assert_eq!(out.trimmed_ids, vec!["m1", "m2", "m3"]);
+    }
+
+    #[test]
+    fn an_unlimited_trim_drops_nothing() {
+        let out = trim_by_token_budget(long_hits(4), 0, SearchDetail::Full);
+        assert_eq!((out.returned, out.trimmed), (4, 0));
+        assert!(out.trimmed_ids.is_empty());
     }
 
     fn rank_only(weights: RrfWeights) -> RrfConfig {
@@ -1275,5 +1405,132 @@ mod tests {
 
         assert_eq!(find(&ranked, "a").idf_score, Some(0.0));
         assert_eq!(find(&ranked, "b").idf_score, Some(0.0));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Validity window and confidence
+// ---------------------------------------------------------------------------
+
+/// What an out-of-window memory's fused score is multiplied by: low enough
+/// to rank after everything in-window, not zero, so it is still found.
+pub const OUT_OF_WINDOW_FACTOR: f64 = 0.25;
+
+fn parse_ts(ts: Option<&str>) -> Option<chrono::DateTime<chrono::Utc>> {
+    ts.and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        .map(|t| t.with_timezone(&chrono::Utc))
+}
+
+/// Whether `valid_until` has passed at `now`. Exactly at `valid_until` the
+/// memory still holds; an unset or unparseable value never expires.
+pub fn is_expired(now: chrono::DateTime<chrono::Utc>, valid_until: Option<&str>) -> bool {
+    parse_ts(valid_until).is_some_and(|until| until < now)
+}
+
+/// The multiplier a memory's fused score takes for its validity window and
+/// confidence: [`OUT_OF_WINDOW_FACTOR`] when it has expired or is not yet
+/// valid, times `confidence` clamped to 0..=1. A memory with no window and
+/// full confidence is 1.0, so existing rankings are untouched.
+pub fn validity_factor(
+    now: chrono::DateTime<chrono::Utc>,
+    valid_from: Option<&str>,
+    valid_until: Option<&str>,
+    confidence: f64,
+) -> f64 {
+    let not_yet = parse_ts(valid_from).is_some_and(|from| from > now);
+    let window = if not_yet || is_expired(now, valid_until) {
+        OUT_OF_WINDOW_FACTOR
+    } else {
+        1.0
+    };
+    let confidence = if confidence.is_nan() {
+        1.0
+    } else {
+        confidence.clamp(0.0, 1.0)
+    };
+    window * confidence
+}
+
+/// Apply [`validity_factor`] to every result's score and re-sort. Drops
+/// expired results when `include_expired` is false, and any below
+/// `min_confidence`.
+pub fn apply_validity(
+    results: Vec<MemorySearchResult>,
+    now: chrono::DateTime<chrono::Utc>,
+    include_expired: bool,
+    min_confidence: f64,
+) -> Vec<MemorySearchResult> {
+    let mut kept: Vec<MemorySearchResult> = results
+        .into_iter()
+        .filter(|r| include_expired || !is_expired(now, r.memory.valid_until.as_deref()))
+        .filter(|r| r.memory.confidence >= min_confidence)
+        .collect();
+    for r in &mut kept {
+        r.score *= validity_factor(
+            now,
+            r.memory.valid_from.as_deref(),
+            r.memory.valid_until.as_deref(),
+            r.memory.confidence,
+        );
+    }
+    kept.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    kept
+}
+
+#[cfg(test)]
+mod validity_tests {
+    use super::*;
+    use chrono::{Duration, Utc};
+
+    fn at(now: chrono::DateTime<Utc>, d: i64) -> String {
+        (now + Duration::seconds(d)).to_rfc3339()
+    }
+
+    #[test]
+    fn no_window_and_full_confidence_changes_nothing() {
+        assert_eq!(validity_factor(Utc::now(), None, None, 1.0), 1.0);
+    }
+
+    #[test]
+    fn expiry_is_strictly_after_valid_until() {
+        let now = Utc::now();
+        let f = |d: i64| validity_factor(now, None, Some(&at(now, d)), 1.0);
+        assert_eq!(f(60), 1.0, "still in window");
+        assert_eq!(f(0), 1.0, "exactly at valid_until still holds");
+        assert_eq!(f(-1), OUT_OF_WINDOW_FACTOR);
+        assert!(!is_expired(now, None));
+        assert!(!is_expired(now, Some("not a date")));
+    }
+
+    #[test]
+    fn a_future_valid_from_is_out_of_window() {
+        let now = Utc::now();
+        assert_eq!(
+            validity_factor(now, Some(&at(now, 60)), None, 1.0),
+            OUT_OF_WINDOW_FACTOR
+        );
+        assert_eq!(validity_factor(now, Some(&at(now, -60)), None, 1.0), 1.0);
+    }
+
+    #[test]
+    fn confidence_scales_the_score_and_is_clamped() {
+        let now = Utc::now();
+        assert_eq!(validity_factor(now, None, None, 0.5), 0.5);
+        assert_eq!(validity_factor(now, None, None, 0.0), 0.0);
+        assert_eq!(validity_factor(now, None, None, 1.0), 1.0);
+        assert_eq!(validity_factor(now, None, None, 7.0), 1.0);
+        assert_eq!(validity_factor(now, None, None, -1.0), 0.0);
+        assert_eq!(validity_factor(now, None, None, f64::NAN), 1.0);
+    }
+
+    #[test]
+    fn expiry_and_confidence_compose() {
+        let now = Utc::now();
+        let f = validity_factor(now, None, Some(&at(now, -1)), 0.5);
+        assert_eq!(f, OUT_OF_WINDOW_FACTOR * 0.5);
     }
 }

@@ -17,51 +17,78 @@
 //! `ENV_LOCK` convention those tests follow serialises the environment, but a
 //! process-global cache is not the environment, so the lock never covered it.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 use remind_me_core::embedder::{
     available_embedder, EMBEDDING_BACKEND_ENV, EMBEDDING_DIM_ENV, OLLAMA_URL_ENV,
 };
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::TcpListener;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 /// Held by every test here that touches the embedding environment, matching
 /// the convention in `status_test.rs` and `remind_me_mcp`'s own suite.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+/// How long the stub waits for its one probe, and for that probe's bytes.
+/// Bounded so a test whose probe never arrives (a cache hit it did not
+/// expect) fails on its assertion instead of hanging on `join`.
+const STUB_PATIENCE: Duration = Duration::from_secs(10);
+
 /// A stub that answers the `embed` probe well enough to count as reachable,
-/// on a port the OS picks so two runs never collide.
-fn fake_daemon() -> (u16, std::thread::JoinHandle<()>) {
+/// on a port the OS picks so two runs never collide. It serves at most one
+/// connection, gives up after [`STUB_PATIENCE`], and its thread returns
+/// whether it served one.
+fn fake_daemon() -> (u16, std::thread::JoinHandle<bool>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
     let handle = std::thread::spawn(move || {
-        let Ok((mut stream, _)) = listener.accept() else {
-            return;
+        let deadline = Instant::now() + STUB_PATIENCE;
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(e) if e.kind() == ErrorKind::WouldBlock && Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => return false,
+            }
         };
+        let bounded = stream.set_nonblocking(false).is_ok()
+            && stream.set_read_timeout(Some(STUB_PATIENCE)).is_ok()
+            && stream.set_write_timeout(Some(STUB_PATIENCE)).is_ok();
+        if !bounded {
+            return false;
+        }
         let mut buf = [0u8; 4096];
         let _ = stream.read(&mut buf);
         let body = r#"{"embeddings":[[0.1,0.2]]}"#;
-        let _ = stream.write_all(
-            format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                body.len(),
-                body
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
             )
-            .as_bytes(),
-        );
+            .is_ok()
     });
     (port, handle)
 }
 
 fn set_backend(port: u16) {
-    std::env::set_var(EMBEDDING_BACKEND_ENV, "ollama");
-    std::env::set_var(OLLAMA_URL_ENV, format!("http://127.0.0.1:{port}"));
-    std::env::set_var(EMBEDDING_DIM_ENV, "2");
+    crate::test_env::set_var(EMBEDDING_BACKEND_ENV, "ollama");
+    crate::test_env::set_var(OLLAMA_URL_ENV, format!("http://127.0.0.1:{port}"));
+    crate::test_env::set_var(EMBEDDING_DIM_ENV, "2");
 }
 
 fn clear_backend() {
-    std::env::remove_var(EMBEDDING_BACKEND_ENV);
-    std::env::remove_var(OLLAMA_URL_ENV);
-    std::env::remove_var(EMBEDDING_DIM_ENV);
+    crate::test_env::remove_var(EMBEDDING_BACKEND_ENV);
+    crate::test_env::remove_var(OLLAMA_URL_ENV);
+    crate::test_env::remove_var(EMBEDDING_DIM_ENV);
 }
 
 /// A dead address, then a live one, with no wait in between.
@@ -75,11 +102,16 @@ fn clear_backend() {
 fn a_failed_probe_does_not_answer_for_a_different_backend_address() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
+    // The live stub binds first, so the dead port below cannot be its port:
+    // a released port the stub then reused would hit the cached failure, the
+    // stub would never be probed, and the test would hang on its thread.
+    let (live_port, handle) = fake_daemon();
     // Bind and immediately drop, so the port is one nothing is listening on.
     let dead_port = {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.local_addr().unwrap().port()
     };
+    assert_ne!(dead_port, live_port, "the live stub still holds its port");
     set_backend(dead_port);
     assert!(
         available_embedder().is_none(),
@@ -88,17 +120,20 @@ fn a_failed_probe_does_not_answer_for_a_different_backend_address() {
 
     // Same backend, same model, same dimension -- only the address differs,
     // which is exactly the case an identity-based key would have missed.
-    let (live_port, handle) = fake_daemon();
     set_backend(live_port);
     let available = available_embedder().is_some();
 
     clear_backend();
-    let _ = handle.join();
+    let served = handle.join().expect("stub thread panicked");
 
     assert!(
         available,
         "a reachable daemon must be reported available immediately, not after \
          the previous address's failure TTL expires"
+    );
+    assert!(
+        served,
+        "the live address must be probed, not answered from a cache"
     );
 }
 
@@ -119,7 +154,10 @@ fn a_successful_probe_is_still_cached_for_the_same_configuration() {
         available_embedder().is_some(),
         "the stub answers the first probe"
     );
-    let _ = handle.join();
+    assert!(
+        handle.join().expect("stub thread panicked"),
+        "the first call must reach the stub, not a cached verdict"
+    );
 
     let second = available_embedder().is_some();
     clear_backend();

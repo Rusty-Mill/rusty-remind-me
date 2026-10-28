@@ -13,86 +13,40 @@
 //! produce a second row, or a day with three restarts shows three data points
 //! and the trend reads as a spike that never happened.
 
+use crate::db::stats::{GroupBy, StoreStats};
+use crate::db::Result;
+use crate::db::Store;
 use crate::models::{AnalyticsSnapshot, CapturedSnapshot};
 use crate::vitality::build_vitality_report;
-use rusqlite::{params, Connection, OptionalExtension, Result};
-use std::collections::BTreeMap;
-
-fn category_counts(conn: &Connection) -> Result<BTreeMap<String, i64>> {
-    let mut stmt = conn.prepare(
-        "SELECT category, COUNT(*) FROM memories
-          WHERE deleted_at IS NULL GROUP BY category",
-    )?;
-    let counts = stmt
-        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
-        .collect();
-    counts
-}
 
 /// Record one snapshot for today, unless today already has one.
 ///
 /// Returns [`CapturedSnapshot::AlreadyToday`] rather than an error when a row
 /// exists: being called more than once a day is the expected case, not a
 /// failure — the caller is a poll loop, not a user.
-pub fn capture_snapshot(conn: &Connection) -> Result<CapturedSnapshot> {
+pub fn capture_snapshot(store: &Store<'_>) -> Result<CapturedSnapshot> {
     let now = chrono::Utc::now();
     let today = now.date_naive().to_string();
 
-    let existing: Option<i64> = conn
-        .query_row(
-            "SELECT id FROM analytics_snapshots WHERE date(captured_at) = ?",
-            params![today],
-            |r| r.get(0),
-        )
-        .optional()?;
-    if let Some(id) = existing {
+    let stats = StoreStats::new(store);
+    if let Some(id) = stats.snapshot_on(&today)? {
         return Ok(CapturedSnapshot::AlreadyToday { id });
     }
 
-    let report = build_vitality_report(conn)?;
-    let categories = category_counts(conn)?;
-
-    conn.execute(
-        "INSERT INTO analytics_snapshots
-             (captured_at, total_memories, vitality_buckets, category_counts)
-         VALUES (?, ?, ?, ?)",
-        params![
-            now.to_rfc3339(),
-            report.total_memories as i64,
-            serde_json::to_string(&report.vitality_buckets).unwrap_or_else(|_| "{}".into()),
-            serde_json::to_string(&categories).unwrap_or_else(|_| "{}".into()),
-        ],
-    )?;
-
-    Ok(CapturedSnapshot::Captured {
-        id: conn.last_insert_rowid(),
-    })
+    let report = build_vitality_report(store)?;
+    let id = stats.insert_snapshot(&AnalyticsSnapshot {
+        captured_at: now.to_rfc3339(),
+        total_memories: report.total_memories as i64,
+        vitality_buckets: report.vitality_buckets,
+        category_counts: stats.count_by(GroupBy::Category)?,
+    })?;
+    Ok(CapturedSnapshot::Captured { id })
 }
 
 /// Every snapshot, **oldest first**.
 ///
 /// Oldest-first because the only consumer is a chart, and a series that has to
 /// be reversed before plotting is a trap the first caller falls into.
-pub fn trend(conn: &Connection) -> Result<Vec<AnalyticsSnapshot>> {
-    let mut stmt = conn.prepare(
-        "SELECT captured_at, total_memories, vitality_buckets, category_counts
-           FROM analytics_snapshots
-          ORDER BY captured_at ASC",
-    )?;
-    let rows = stmt
-        .query_map([], |r| {
-            let buckets: String = r.get(2)?;
-            let categories: String = r.get(3)?;
-            Ok(AnalyticsSnapshot {
-                captured_at: r.get(0)?,
-                total_memories: r.get(1)?,
-                // Decoded here rather than handed to the caller as a string:
-                // a malformed value becomes an empty map, because one bad row
-                // should not take the whole chart down with it.
-                vitality_buckets: serde_json::from_str(&buckets).unwrap_or_default(),
-                category_counts: serde_json::from_str(&categories).unwrap_or_default(),
-            })
-        })?
-        .collect();
-    rows
+pub fn trend(store: &Store<'_>) -> Result<Vec<AnalyticsSnapshot>> {
+    StoreStats::new(store).snapshots()
 }

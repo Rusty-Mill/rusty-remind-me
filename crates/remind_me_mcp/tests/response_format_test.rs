@@ -25,6 +25,9 @@
 //!   JSON, so the parameter is a pure addition here and JSON keeps this port's
 //!   existing callers working (#206).
 
+#[path = "../../remind_me_core/src/test_env.rs"]
+mod test_env;
+
 use remind_me_mcp::McpServer;
 use serde_json::json;
 
@@ -169,19 +172,28 @@ fn the_four_schemas_advertise_the_parameter() {
         .unwrap();
     let tools = listed["result"]["tools"].as_array().unwrap();
     for (tool, _, markdown_default) in MIRRORED {
+        // A merged handler is advertised through the tool it merged into
+        // (ADR-0030).
+        let public = remind_me_core::tool_profiles::replacement(tool).unwrap_or(tool);
         let entry = tools
             .iter()
-            .find(|t| t["name"] == tool)
-            .unwrap_or_else(|| panic!("{tool} missing from tools/list"));
+            .find(|t| t["name"] == public)
+            .unwrap_or_else(|| panic!("{public} missing from tools/list"));
         let prop = &entry["inputSchema"]["properties"]["response_format"];
-        assert!(!prop.is_null(), "{tool} does not advertise response_format");
-        // The advertised default has to agree with the behaviour above, or the
-        // schema documents a tool that does not exist.
-        assert_eq!(
-            prop["default"],
-            if markdown_default { "markdown" } else { "json" },
-            "{tool} advertises a default it does not honour"
+        assert!(
+            !prop.is_null(),
+            "{public} does not advertise response_format"
         );
+        // An advertised default has to agree with the behaviour above, or the
+        // schema documents a tool that does not exist. A merged tool whose
+        // handlers disagree advertises none.
+        if !prop["default"].is_null() {
+            assert_eq!(
+                prop["default"],
+                if markdown_default { "markdown" } else { "json" },
+                "{public} advertises a default {tool} does not honour"
+            );
+        }
     }
 }
 
@@ -251,13 +263,13 @@ fn with_default_format<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let previous = std::env::var(remind_me_mcp::DEFAULT_FORMAT_ENV).ok();
     match value {
-        Some(v) => std::env::set_var(remind_me_mcp::DEFAULT_FORMAT_ENV, v),
-        None => std::env::remove_var(remind_me_mcp::DEFAULT_FORMAT_ENV),
+        Some(v) => crate::test_env::set_var(remind_me_mcp::DEFAULT_FORMAT_ENV, v),
+        None => crate::test_env::remove_var(remind_me_mcp::DEFAULT_FORMAT_ENV),
     }
     let out = f();
     match previous {
-        Some(v) => std::env::set_var(remind_me_mcp::DEFAULT_FORMAT_ENV, v),
-        None => std::env::remove_var(remind_me_mcp::DEFAULT_FORMAT_ENV),
+        Some(v) => crate::test_env::set_var(remind_me_mcp::DEFAULT_FORMAT_ENV, v),
+        None => crate::test_env::remove_var(remind_me_mcp::DEFAULT_FORMAT_ENV),
     }
     out
 }

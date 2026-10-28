@@ -27,10 +27,11 @@
 //! exactly (only the header-based `/mcp` form uses 401 in legacy mode, since
 //! that form has no ambiguity about which endpoint it targets).
 //!
-//! Implemented as an axum middleware ([`secret_gate`], via
-//! `axum::middleware::from_fn_with_state`) applied at the `Router` level, so
-//! it runs — and can rewrite [`http::Uri`] — before the inner router matches
-//! a route, the same ordering the reference's ASGI middleware relies on.
+//! Implemented as a `rusty_axum` middleware ([`secret_gate`], via
+//! `rusty_axum::middleware::from_fn`) applied at the `Router` level, so it
+//! runs — and can rewrite the request's path — before the inner router
+//! matches a route, the same ordering the reference's ASGI middleware relies
+//! on.
 //!
 //! The token comparison reuses [`remind_me_core::webhook::constant_time_eq`]
 //! rather than a new implementation next to it, per this crate's own
@@ -38,17 +39,10 @@
 
 use std::sync::Arc;
 
-use axum::body::Body;
-use axum::extract::ConnectInfo;
-use axum::extract::{Request, State};
-use axum::http::uri::PathAndQuery;
-use axum::http::{header, HeaderValue, StatusCode, Uri};
-use axum::middleware::Next;
-use axum::response::{IntoResponse, Response};
-use axum::Json;
 use remind_me_core::webhook::constant_time_eq;
+use rusty_axum::middleware::Next;
+use rusty_axum::{IntoResponse, Json, Request, Response, StatusCode};
 use serde_json::json;
-use std::net::SocketAddr;
 
 /// The one path the MCP transport is mounted at. Not configurable: nothing
 /// in this crate exposes a different mount point, unlike the reference
@@ -70,20 +64,21 @@ fn unauthorized() -> Response {
         .into_response()
 }
 
-/// Rewrite `uri`'s path to `new_path`, preserving any query string.
-///
-/// `None` only if `new_path` (built entirely from this module's own
-/// constants and validated path segments) somehow fails to parse as a valid
-/// `PathAndQuery` -- callers treat that as a 404 rather than panicking, but
-/// it is not expected to occur in practice.
-fn rewrite_path(uri: &Uri, new_path: &str) -> Option<Uri> {
-    let mut parts = uri.clone().into_parts();
-    let path_and_query = match uri.query() {
+/// `request` addressed to `new_path` instead, preserving any query string,
+/// its headers, body and peer address.
+fn rewrite_path(mut request: Request, new_path: &str) -> Request {
+    let target = match request.query() {
         Some(query) => format!("{new_path}?{query}"),
         None => new_path.to_string(),
     };
-    parts.path_and_query = Some(PathAndQuery::try_from(path_and_query).ok()?);
-    Uri::from_parts(parts).ok()
+    let body = request.take_body();
+    let rewritten = Request::new(request.method().clone(), target)
+        .with_headers(request.headers().clone())
+        .with_body(body);
+    match request.peer_addr() {
+        Some(peer) => rewritten.with_peer_addr(peer),
+        None => rewritten,
+    }
 }
 
 /// [`secret_gate`]'s configuration — a direct port of the reference's
@@ -92,7 +87,7 @@ pub struct GateConfig {
     /// The resolved connector token (never logged, never included in a
     /// response). In OAuth mode it doubles as the owner credential the
     /// `/consent` page checks, but that comparison lives in
-    /// `oauth::Provider`, not here.
+    /// `oauth::OAuthAppState::new`, not here.
     pub token: String,
     /// `true` once `REMIND_ME_REMOTE_ISSUER` is set: `/mcp` (bare, no
     /// matching secret-path segment) is forwarded rather than gated on the
@@ -122,7 +117,7 @@ impl GateConfig {
 
 /// Whatever credential this request would be authenticated by: the secret
 /// path segment in secret-path mode, otherwise the bearer token.
-fn presented_credential(request: &Request<Body>, path: &str) -> String {
+fn presented_credential(request: &Request, path: &str) -> String {
     let prefix = format!("{MCP_PATH}/");
     if let Some(after_prefix) = path.strip_prefix(&prefix) {
         return after_prefix
@@ -133,9 +128,8 @@ fn presented_credential(request: &Request<Body>, path: &str) -> String {
     }
     request
         .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
+        .get("authorization")
+        .and_then(rusty_oauth::bearer::token_from_authorization)
         .unwrap_or("")
         .to_string()
 }
@@ -145,19 +139,15 @@ fn presented_credential(request: &Request<Body>, path: &str) -> String {
 fn too_many_requests(retry_after: u64) -> Response {
     (
         StatusCode::TOO_MANY_REQUESTS,
-        [(header::RETRY_AFTER, retry_after.to_string())],
         Json(json!({ "error": "rate limit exceeded" })),
     )
         .into_response()
+        .with_header("retry-after", &retry_after.to_string())
 }
 
-/// The axum middleware itself.
-pub async fn secret_gate(
-    State(config): State<Arc<GateConfig>>,
-    mut request: Request<Body>,
-    next: Next,
-) -> Response {
-    let path = request.uri().path().to_string();
+/// The middleware itself.
+pub async fn secret_gate(config: Arc<GateConfig>, request: Request, next: Next) -> Response {
+    let path = request.path().to_string();
 
     if path == HEALTH_PATH
         || config.extra_allow_paths.contains(&path.as_str())
@@ -179,9 +169,8 @@ pub async fn secret_gate(
     // `auth:known` bucket either way rather than being limited per address.
     let presented = presented_credential(&request, &path);
     let peer = request
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|ConnectInfo(addr)| addr.ip().to_string())
+        .peer_addr()
+        .map(|addr| addr.ip().to_string())
         .unwrap_or_default();
     let bucket =
         remind_me_core::rate_limit::resolve_key(&presented, &peer, Some(config.token.as_str()));
@@ -209,22 +198,22 @@ pub async fn secret_gate(
             Some(rest) if !rest.is_empty() => format!("{MCP_PATH}/{rest}"),
             _ => MCP_PATH.to_string(),
         };
-        return match rewrite_path(request.uri(), &new_path) {
-            Some(rewritten) => {
-                *request.uri_mut() = rewritten;
-                if config.oauth_mode {
-                    // Re-express the secret path as a bearer credential so
-                    // `oauth::require_bearer` authenticates it like any
-                    // other token.
-                    if let Ok(value) = HeaderValue::from_str(&format!("Bearer {}", config.token)) {
-                        request.headers_mut().remove(header::AUTHORIZATION);
-                        request.headers_mut().insert(header::AUTHORIZATION, value);
-                    }
-                }
-                next.run(request).await
+        let mut request = rewrite_path(request, &new_path);
+        if config.oauth_mode {
+            // Re-express the secret path as a bearer credential so
+            // `oauth::require_bearer` authenticates it like any other token.
+            // A token that is not a valid header value goes without one, and
+            // `require_bearer` answers 401.
+            let bearer = format!("Bearer {}", config.token);
+            if request
+                .headers_mut()
+                .insert_sensitive("authorization", &bearer)
+                .is_err()
+            {
+                request.headers_mut().remove("authorization");
             }
-            None => not_found(),
-        };
+        }
+        return next.run(request).await;
     }
 
     if path == MCP_PATH {
@@ -234,11 +223,7 @@ pub async fn secret_gate(
             // the legacy connector token via `Provider::load_access_token`).
             return next.run(request).await;
         }
-        let authorization = request
-            .headers()
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
+        let authorization = request.headers().get("authorization").unwrap_or("");
         let expected = format!("Bearer {}", config.token);
         return if constant_time_eq(authorization.as_bytes(), expected.as_bytes()) {
             next.run(request).await
@@ -254,17 +239,32 @@ pub async fn secret_gate(
 mod tests {
     use super::*;
 
+    use rusty_axum::Method;
+
     #[test]
     fn rewrite_path_preserves_an_existing_query_string() {
-        let uri: Uri = "/mcp/sekrit?foo=bar".parse().unwrap();
-        let rewritten = rewrite_path(&uri, MCP_PATH).unwrap();
-        assert_eq!(rewritten, "/mcp?foo=bar");
+        let request = Request::new(Method::Get, "/mcp/sekrit?foo=bar");
+        assert_eq!(rewrite_path(request, MCP_PATH).target(), "/mcp?foo=bar");
     }
 
     #[test]
     fn rewrite_path_with_no_query_string() {
-        let uri: Uri = "/mcp/sekrit".parse().unwrap();
-        let rewritten = rewrite_path(&uri, MCP_PATH).unwrap();
-        assert_eq!(rewritten, "/mcp");
+        let request = Request::new(Method::Get, "/mcp/sekrit");
+        assert_eq!(rewrite_path(request, MCP_PATH).target(), "/mcp");
+    }
+
+    #[test]
+    fn rewrite_path_keeps_method_headers_body_and_peer() {
+        let peer = std::net::SocketAddr::from(([10, 0, 0, 7], 4000));
+        let request = Request::new(Method::Post, "/mcp/sekrit")
+            .with_header("x-trace", "t1")
+            .unwrap()
+            .with_body(b"{}".to_vec())
+            .with_peer_addr(peer);
+        let rewritten = rewrite_path(request, MCP_PATH);
+        assert_eq!(*rewritten.method(), Method::Post);
+        assert_eq!(rewritten.headers().get("x-trace"), Some("t1"));
+        assert_eq!(rewritten.body(), b"{}");
+        assert_eq!(rewritten.peer_addr(), Some(peer));
     }
 }

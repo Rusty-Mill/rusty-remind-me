@@ -6,19 +6,14 @@
 //! of memories to serve locally, no scheduler.
 
 use remind_me_hub::http::{read_body, read_head, write_response, HeadOutcome, Response};
-use remind_me_hub::store::{sqlite::SqliteStore, HubStore};
+use remind_me_hub::store::multimodal::MultimodalHubStore;
+use remind_me_hub::store::HubStore;
 use remind_me_hub::{dispatch, Config, HUB_VERSION};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-/// How long to wait for the database before giving up at startup.
-///
-/// A service manager's ordering only sequences unit *start*, not readiness, so
-/// a hub started alongside its database routinely comes up first.
-const DB_WAIT: Duration = Duration::from_secs(120);
-const DB_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default listen port, shared by the server and `--health-check` so the two
 /// can never disagree about where the hub is.
@@ -105,20 +100,6 @@ fn run() -> Result<(), String> {
 
     let store = open_store()?;
 
-    // Wait for the database rather than crash-looping against one that is
-    // still starting.
-    let deadline = Instant::now() + DB_WAIT;
-    loop {
-        match store.migrate() {
-            Ok(()) => break,
-            Err(e) if Instant::now() < deadline => {
-                eprintln!("hub: waiting for the database: {e}");
-                std::thread::sleep(DB_RETRY_INTERVAL);
-            }
-            Err(e) => return Err(format!("database never became ready: {e}")),
-        }
-    }
-
     let bind = std::env::var("REMIND_ME_HUB_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
     let port: u16 = std::env::var("REMIND_ME_HUB_PORT")
         .ok()
@@ -127,9 +108,8 @@ fn run() -> Result<(), String> {
     let listener = TcpListener::bind((bind.as_str(), port))
         .map_err(|e| format!("could not bind {bind}:{port}: {e}"))?;
 
-    eprintln!("hub: schema ready; v{HUB_VERSION} listening on {bind}:{port}");
+    eprintln!("hub: v{HUB_VERSION} listening on {bind}:{port}");
 
-    let store: Arc<dyn HubStore> = Arc::from(store);
     let config = Arc::new(config);
     for stream in listener.incoming() {
         match stream {
@@ -155,49 +135,95 @@ fn run() -> Result<(), String> {
 
 /// Build the configured store.
 ///
-/// `DATABASE_URL` selects Postgres, matching the reference's only
-/// configuration. `REMIND_ME_HUB_DB_PATH` selects SQLite. Setting neither is
-/// an error rather than a silent default: a hub that quietly created an empty
-/// SQLite file when its `DATABASE_URL` was misspelled would look healthy while
-/// serving nothing.
-fn open_store() -> Result<Box<dyn HubStore>, String> {
-    let database_url = std::env::var("DATABASE_URL").unwrap_or_default();
-    let sqlite_path = std::env::var("REMIND_ME_HUB_DB_PATH").unwrap_or_default();
-
-    match (database_url.is_empty(), sqlite_path.is_empty()) {
-        (false, true) => open_postgres(&database_url),
-        (true, false) => {
-            eprintln!("hub: using the SQLite backend at {sqlite_path}");
-            Ok(Box::new(SqliteStore::open(&sqlite_path).map_err(|e| e.0)?))
-        }
-        (false, false) => Err("both DATABASE_URL and REMIND_ME_HUB_DB_PATH are set — \
-             set exactly one so it is unambiguous which store is serving"
-            .to_string()),
-        (true, true) => Err("no store configured — set DATABASE_URL for Postgres or \
-             REMIND_ME_HUB_DB_PATH for SQLite"
+/// `REMIND_ME_HUB_DATA_DIR` names the embedded engine's data directory. Not
+/// setting it is an error rather than a silent default: a hub that quietly
+/// created an empty store would look healthy while serving nothing.
+///
+/// `DATABASE_URL` and `REMIND_ME_HUB_DB_PATH` selected the Postgres and
+/// SQLite stores, which are gone. Either one being set is an error too, even
+/// alongside `REMIND_ME_HUB_DATA_DIR`: it means an old hub's data may not
+/// have been copied over, and serving an empty engine in front of it would
+/// hide that.
+fn open_store() -> Result<Arc<dyn HubStore>, String> {
+    if let Some(retired) = retired_store_variable() {
+        return Err(retired_store_message(retired));
+    }
+    match env_value("REMIND_ME_HUB_DATA_DIR") {
+        Some(dir) => open_multimodal(&dir),
+        None => Err("no store configured — set REMIND_ME_HUB_DATA_DIR to the \
+                     embedded engine's data directory"
             .to_string()),
     }
 }
 
-#[cfg(feature = "postgres-store")]
-fn open_postgres(url: &str) -> Result<Box<dyn HubStore>, String> {
-    eprintln!("hub: using the Postgres backend");
-    Ok(Box::new(
-        remind_me_hub::store::postgres::PostgresStore::new(url),
-    ))
+/// `variable`'s value, if it is set and non-empty.
+fn env_value(variable: &str) -> Option<String> {
+    std::env::var(variable)
+        .ok()
+        .filter(|value| !value.is_empty())
 }
 
-/// Built without the Postgres backend, `DATABASE_URL` must fail loudly.
-///
-/// Silently falling back to SQLite would be the worst possible outcome: the
-/// hub would come up healthy, serving an empty database, while the real one
-/// sat untouched.
-#[cfg(not(feature = "postgres-store"))]
-fn open_postgres(_url: &str) -> Result<Box<dyn HubStore>, String> {
-    Err("DATABASE_URL is set but this binary was built without the \
-         `postgres-store` feature — rebuild with it, or set \
-         REMIND_ME_HUB_DB_PATH to use SQLite"
-        .to_string())
+/// The retired stores' variables, with the copy-tool flag that reads each.
+const RETIRED_STORES: [(&str, &str); 2] = [
+    ("DATABASE_URL", "--from-postgres"),
+    (
+        "REMIND_ME_HUB_DB_PATH",
+        "--from-sqlite \"$REMIND_ME_HUB_DB_PATH\"",
+    ),
+];
+
+/// The first retired store variable that is set, with its copy flag.
+fn retired_store_variable() -> Option<(&'static str, &'static str)> {
+    RETIRED_STORES
+        .into_iter()
+        .find(|(variable, _)| env_value(variable).is_some())
+}
+
+/// Why the hub will not start on a retired store's configuration, and the
+/// copy that moves it onto the engine.
+fn retired_store_message((variable, copy_from): (&str, &str)) -> String {
+    format!(
+        "{variable} is set, but this hub no longer stores data in Postgres or \
+         SQLite. Copy the old store onto the embedded engine, then configure \
+         the engine in its place:\n  \
+         rusty-remind-me-hub-copy {copy_from} --to DIR\n  \
+         unset {variable}; set REMIND_ME_HUB_DATA_DIR=DIR\n\
+         The copy keeps every hub_seq, so nodes carry on from their cursors \
+         (see the hub README, \"Moving a hub onto the engine\")."
+    )
+}
+
+/// Default interval between scheduled compactions of the embedded store.
+const DEFAULT_COMPACT_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+fn open_multimodal(dir: &str) -> Result<Arc<dyn HubStore>, String> {
+    eprintln!("hub: using the embedded rusty_multimodal_db backend in {dir}");
+    let store = Arc::new(MultimodalHubStore::open(std::path::Path::new(dir)).map_err(|e| e.0)?);
+    let interval = std::env::var("REMIND_ME_HUB_COMPACT_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map_or(DEFAULT_COMPACT_INTERVAL, Duration::from_secs);
+    spawn_compactor(Arc::clone(&store), interval)?;
+    Ok(store)
+}
+
+/// Fold the embedded store's insert logs on a schedule (docs/adr/0021:
+/// they grow with every write until compacted). A failed run is logged and
+/// retried at the next tick: the logs stay correct, only larger.
+fn spawn_compactor(store: Arc<MultimodalHubStore>, interval: Duration) -> Result<(), String> {
+    std::thread::Builder::new()
+        .name("hub-compact".to_string())
+        .spawn(move || loop {
+            std::thread::sleep(interval);
+            match store.compact() {
+                Ok(true) => eprintln!("hub: compacted the store's insert logs"),
+                Ok(false) => {}
+                Err(e) => eprintln!("hub: scheduled compaction failed: {e}"),
+            }
+        })
+        .map(|_| ())
+        .map_err(|e| format!("could not start the compaction thread: {e}"))
 }
 
 fn serve_connection(mut stream: TcpStream, store: &dyn HubStore, config: &Config) {

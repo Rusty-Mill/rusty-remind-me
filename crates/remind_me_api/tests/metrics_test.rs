@@ -5,6 +5,9 @@
 //! a `# TYPE` without its family, a sample whose name does not match its
 //! header — and substring assertions pass on both.
 
+#[path = "../../remind_me_core/src/test_env.rs"]
+mod test_env;
+
 mod common;
 use common::{get, server};
 use remind_me_core::metrics::METRICS_ENABLED_ENV;
@@ -68,13 +71,13 @@ fn parse(text: &str) -> Exposition {
 fn with_metrics<T>(enabled: bool, body: impl FnOnce() -> T) -> T {
     let _guard = env_lock().lock().unwrap();
     if enabled {
-        std::env::set_var(METRICS_ENABLED_ENV, "1");
+        crate::test_env::set_var(METRICS_ENABLED_ENV, "1");
     } else {
-        std::env::remove_var(METRICS_ENABLED_ENV);
+        crate::test_env::remove_var(METRICS_ENABLED_ENV);
     }
     remind_me_core::metrics::reset();
     let out = body();
-    std::env::remove_var(METRICS_ENABLED_ENV);
+    crate::test_env::remove_var(METRICS_ENABLED_ENV);
     out
 }
 
@@ -201,8 +204,9 @@ fn the_search_tiers_are_zero_filled_rather_than_omitted() {
 fn the_memory_gauge_counts_live_memories_only() {
     with_metrics(true, || {
         let (srv, root) = common::seeded_server("metrics-gauge", |conn| {
+            let mut ids = Vec::new();
             for content in ["one", "two", "three"] {
-                remind_me_core::db::queries::add_memory(
+                let memory = remind_me_core::db::queries::add_memory(
                     conn,
                     remind_me_core::MemoryAddInput {
                         content: content.to_string(),
@@ -215,15 +219,15 @@ fn the_memory_gauge_counts_live_memories_only() {
                         object: None,
                         entities: vec![],
                         sensitive: false,
+                        ..Default::default()
                     },
                 )
                 .unwrap();
+                ids.push(memory.id);
             }
-            conn.execute(
-                "UPDATE memories SET deleted_at = '2020-01-01T00:00:00+00:00' WHERE content = 'three'",
-                [],
-            )
-            .unwrap();
+            remind_me_core::db::memories::Memories::new(conn)
+                .delete_live(&ids[2], Some("2020-01-01T00:00:00+00:00"))
+                .unwrap();
         });
 
         let body = get(&srv, "/metrics").body;

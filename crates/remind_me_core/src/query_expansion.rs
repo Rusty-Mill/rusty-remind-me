@@ -228,18 +228,18 @@ mod tests {
     #[test]
     fn disabled_by_default() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var(EXPANSION_MODE_ENV);
+        crate::test_env::remove_var(EXPANSION_MODE_ENV);
         assert!(!enabled());
     }
 
     #[test]
     fn mode_is_case_insensitive() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var(EXPANSION_MODE_ENV, "HyDE");
+        crate::test_env::set_var(EXPANSION_MODE_ENV, "HyDE");
         assert!(enabled());
-        std::env::set_var(EXPANSION_MODE_ENV, "off");
+        crate::test_env::set_var(EXPANSION_MODE_ENV, "off");
         assert!(!enabled());
-        std::env::remove_var(EXPANSION_MODE_ENV);
+        crate::test_env::remove_var(EXPANSION_MODE_ENV);
     }
 
     #[test]

@@ -195,6 +195,7 @@ fn wiki_status_reports_pages_and_pending_compile() {
                 predicate: None,
                 object: None,
                 entities: vec![],
+                ..Default::default()
             },
         )
         .unwrap();

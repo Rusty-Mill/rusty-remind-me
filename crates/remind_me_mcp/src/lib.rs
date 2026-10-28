@@ -8,7 +8,71 @@
 // restructuring is the better answer once it is closer to sixty.
 #![recursion_limit = "512"]
 
+#[cfg(test)]
+#[path = "../../remind_me_core/src/test_env.rs"]
+mod test_env;
+
+pub mod daemon_proxy;
+pub mod references;
 pub mod render;
+pub mod surface;
+
+/// What an MCP client is told about the server on `initialize`, over every
+/// transport: when to reach for which tool. Kept short; it is paid for in every session.
+pub const SERVER_INSTRUCTIONS: &str = "Long-term memory for the user. Search (remind_me_search) \
+before answering anything about the user, their projects or past decisions. Call remind_me_add \
+for each durable fact, decision or preference the user states, passing memory_type (a decision \
+needs metadata.rationale) and confidence when known. Call remind_me_auto_capture at the end of \
+any substantive conversation. Close decisions and action items with remind_me_resolve when they \
+are done, abandoned or reverted, and with its `review` once a due decision held up or not.";
+
+/// A tool error's text: a rejected input reads as such, anything else is
+/// the store's failure, under `prefix`.
+fn store_error_text(prefix: &str, e: &remind_me_core::db::StoreError) -> String {
+    match e {
+        remind_me_core::db::StoreError::Invalid(why) => format!("Invalid input: {why}"),
+        other => format!("{prefix}: {other}"),
+    }
+}
+
+/// Most ids one `remind_me_get` call fetches (card #51): enough for a page of
+/// search hits, small enough that a stray call cannot dump the store.
+const GET_IDS_MAX: usize = 20;
+
+/// `remind_me_get` with `memory_ids`: every memory found, plus the ids that
+/// were not, so one stale id does not fail the whole fetch.
+fn get_memories(store: &remind_me_core::db::Store<'_>, raw: &Value) -> Value {
+    let ids: Option<Vec<&str>> = raw
+        .as_array()
+        .map(|items| items.iter().map(Value::as_str).collect::<Option<Vec<_>>>())
+        .unwrap_or(None);
+    let ids = match ids {
+        Some(ids) if !ids.is_empty() && ids.len() <= GET_IDS_MAX => ids,
+        _ => {
+            return json!({ "isError": true, "content": [{ "type": "text", "text": format!(
+                "Invalid input: memory_ids must be an array of 1 to {GET_IDS_MAX} id strings"
+            ) }] })
+        }
+    };
+    let mut memories = Vec::new();
+    let mut missing = Vec::new();
+    for id in ids {
+        match queries::get_memory_by_id(store, id) {
+            Ok(Some(mem)) => match references::memory_json(store, &mem) {
+                Ok(value) => memories.push(value),
+                Err(e) => {
+                    return json!({ "isError": true, "content": [{ "type": "text", "text": format!("Error: {e}") }] })
+                }
+            },
+            Ok(None) => missing.push(id),
+            Err(e) => {
+                return json!({ "isError": true, "content": [{ "type": "text", "text": format!("Error: {e}") }] })
+            }
+        }
+    }
+    let payload = json!({ "memories": memories, "missing": missing });
+    json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&payload).unwrap_or_default() }] })
+}
 
 /// The response format a call asked for, defaulting to **JSON** (#206).
 ///
@@ -42,7 +106,8 @@ fn requested_format(args: &serde_json::Value) -> ResponseFormat {
 
 /// The configured fallback for the [`requested_format`] population.
 fn configured_default_format() -> ResponseFormat {
-    default_format_from(std::env::var(DEFAULT_FORMAT_ENV).ok().as_deref())
+    // Per session: on the daemon, each client keeps its own default.
+    default_format_from(remind_me_core::daemon::session::var(DEFAULT_FORMAT_ENV).as_deref())
 }
 
 /// [`configured_default_format`] with the raw variable injected.
@@ -107,31 +172,33 @@ fn format_or(args: &serde_json::Value, default: ResponseFormat) -> ResponseForma
     }
 }
 
+use remind_me_core::kinds::StructuredFields;
 use remind_me_core::{
-    backup, capture, consolidation::consolidate, contradictions, db::queries, dbs_import, digest,
-    entity, export, history, importer, mempalace_import, normalize, recalibrate, saved_searches,
-    stats, status, sync::SyncPeer, undo_import, updater, vectors, vitality, watcher,
-    webhook::Webhook, wiki, wiki_fs::Wiki, wiki_import, AnnotateInput, AutoCaptureInput,
-    BulkImportDirInput, ChatImportInput, ConsolidateInput, ContradictionCandidatesInput, Database,
-    DbsImportInput, DecomposeBatchInput, DecomposeInput, DigestInput, EntityInput,
-    EntityLookupInput, EntityTraverseInput, ExportInput, ExtractBatchInput, FeedbackInput,
-    HistoryInput, ListRemindersInput, MemoryAddInput, MemoryListInput, MemorySearchInput,
-    MemoryStatsInput, MemoryUpdateInput, MempalaceImportInput, NormalizeApplyInput,
-    NormalizeBatchInput, RecalibrateCandidatesInput, ReclassifyBatchInput, ReclassifyInput,
-    ReconcilePeerInput, ResponseFormat, RevertInput, SaveSearchInput, SavedSearchNameInput,
-    SetReminderInput, SyncRepairInput, UndoImportInput, UpdateOutcome, WikiDeleteOutcome,
-    ANNOTATE_BATCH_MAX, ANNOTATE_BATCH_MIN, CONSOLIDATE_LIMIT_MAX, CONSOLIDATE_LIMIT_MIN,
-    CONSOLIDATE_SIMILARITY_MAX, CONSOLIDATE_SIMILARITY_MIN, CONTRADICTION_LIMIT_MAX,
-    CONTRADICTION_LIMIT_MIN, DBS_IMPORT_LIMIT_MAX, DBS_IMPORT_LIMIT_MIN, DECOMPOSE_BATCH_MAX,
-    DECOMPOSE_BATCH_MIN, DECOMPOSE_FACTS_MAX, DECOMPOSE_FACTS_MIN, ENTITY_LOOKUP_LIMIT_MAX,
-    ENTITY_LOOKUP_LIMIT_MIN, EXTRACT_BATCH_MAX, EXTRACT_BATCH_MIN, EXTRACT_MODES,
-    HISTORY_LIMIT_MAX, HISTORY_LIMIT_MIN, IMPORT_MAX_LENGTH_MAX, IMPORT_MAX_LENGTH_MIN,
-    MEMPALACE_IMPORT_LIMIT_MAX, MEMPALACE_IMPORT_LIMIT_MIN, NORMALIZE_APPLY_MAX,
-    NORMALIZE_APPLY_MIN, NORMALIZE_BATCH_MAX, NORMALIZE_BATCH_MIN, PROMOTION_LIMIT_DEFAULT,
-    PROMOTION_LIMIT_MAX, PROMOTION_LIMIT_MIN, RECALIBRATE_LIMIT_MAX, RECALIBRATE_LIMIT_MIN,
-    RECLASSIFY_BATCH_MAX, RECLASSIFY_BATCH_MIN, REMINDER_LIMIT_MAX, REMINDER_LIMIT_MIN,
-    STALE_CANDIDATES_LIMIT_DEFAULT, STALE_CANDIDATES_LIMIT_MAX, STALE_CANDIDATES_LIMIT_MIN,
-    UNDO_IMPORT_LIMIT_MAX, UNDO_IMPORT_LIMIT_MIN,
+    backup, capture, consolidation::consolidate, context_brief, contradictions, db::queries,
+    dbs_import, digest, entity, export, history, importer, mempalace_import, normalize,
+    recalibrate, saved_searches, stats, status, sync::SyncPeer, undo_import, updater, vectors,
+    vitality, watcher, webhook::Webhook, wiki, wiki_fs::Wiki, wiki_import, AnnotateInput,
+    AutoCaptureInput, BriefInput, BulkImportDirInput, ChatImportInput, ConsolidateInput,
+    ContradictionCandidatesInput, Database, DbsImportInput, DecomposeBatchInput, DecomposeInput,
+    DigestInput, EntityInput, EntityLookupInput, EntityTraverseInput, ExportInput,
+    ExtractBatchInput, FeedbackInput, HistoryInput, ListRemindersInput, MemoryAddInput,
+    MemoryListInput, MemorySearchInput, MemoryStatsInput, MemoryUpdateInput, MempalaceImportInput,
+    NormalizeApplyInput, NormalizeBatchInput, RecalibrateCandidatesInput, ReclassifyBatchInput,
+    ReclassifyInput, ReconcilePeerInput, ResponseFormat, RevertInput, SaveSearchInput, SavedMemory,
+    SavedSearchNameInput, SearchDetail, SetReminderInput, SyncRepairInput, UndoImportInput,
+    UpdateOutcome, WikiDeleteOutcome, ANNOTATE_BATCH_MAX, ANNOTATE_BATCH_MIN,
+    CONSOLIDATE_LIMIT_MAX, CONSOLIDATE_LIMIT_MIN, CONSOLIDATE_SIMILARITY_MAX,
+    CONSOLIDATE_SIMILARITY_MIN, CONTRADICTION_LIMIT_MAX, CONTRADICTION_LIMIT_MIN,
+    DBS_IMPORT_LIMIT_MAX, DBS_IMPORT_LIMIT_MIN, DECOMPOSE_BATCH_MAX, DECOMPOSE_BATCH_MIN,
+    DECOMPOSE_FACTS_MAX, DECOMPOSE_FACTS_MIN, ENTITY_LOOKUP_LIMIT_MAX, ENTITY_LOOKUP_LIMIT_MIN,
+    EXTRACT_BATCH_MAX, EXTRACT_BATCH_MIN, EXTRACT_MODES, HISTORY_LIMIT_MAX, HISTORY_LIMIT_MIN,
+    IMPORT_MAX_LENGTH_MAX, IMPORT_MAX_LENGTH_MIN, MEMPALACE_IMPORT_LIMIT_MAX,
+    MEMPALACE_IMPORT_LIMIT_MIN, NORMALIZE_APPLY_MAX, NORMALIZE_APPLY_MIN, NORMALIZE_BATCH_MAX,
+    NORMALIZE_BATCH_MIN, PROMOTION_LIMIT_DEFAULT, PROMOTION_LIMIT_MAX, PROMOTION_LIMIT_MIN,
+    RECALIBRATE_LIMIT_MAX, RECALIBRATE_LIMIT_MIN, RECLASSIFY_BATCH_MAX, RECLASSIFY_BATCH_MIN,
+    REMINDER_LIMIT_MAX, REMINDER_LIMIT_MIN, STALE_CANDIDATES_LIMIT_DEFAULT,
+    STALE_CANDIDATES_LIMIT_MAX, STALE_CANDIDATES_LIMIT_MIN, UNDO_IMPORT_LIMIT_MAX,
+    UNDO_IMPORT_LIMIT_MIN,
 };
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
@@ -258,6 +325,7 @@ fn decompose_input_schema() -> Value {
         "type": "object",
         "properties": {
             "capture_id": { "type": "string", "minLength": 1 },
+            "capture_revision": { "type": "string", "description": "The capture_revision the decompose queue listed: the capture leaves the queue only up to it, so a session recaptured meanwhile is offered again" },
             "facts": {
                 "type": "array",
                 "minItems": DECOMPOSE_FACTS_MIN,
@@ -349,14 +417,99 @@ pub struct McpServer {
 /// recording a client called "".
 fn client_identity(req: &serde_json::Value) -> Option<String> {
     let info = req.get("params")?.get("clientInfo")?;
-    let name = info.get("name")?.as_str()?.trim();
+    let name = info.get("name")?.as_str()?;
+    identity(name, info.get("version").and_then(|v| v.as_str()))
+}
+
+/// The request `_meta` key a transport serving many callers from one handler
+/// puts each call's caller under: a `"name/version"` string, or `null` for a
+/// caller that named nobody.
+///
+/// The caller travels in the request itself because the request is all that
+/// crosses to the daemon. The remote connector relays every caller's lines
+/// over one daemon connection, so neither that connection's session nor any
+/// scope in the connector's own process can say who made a call; a field on
+/// the line can, on whichever thread finally runs it.
+///
+/// Advisory, like `clientInfo`: whoever sends a line can set it.
+pub const CALLER_META_KEY: &str = "rusty-remind-me/caller";
+
+/// The caller a request names under [`CALLER_META_KEY`]: `Some(None)` for a
+/// caller that named nobody, `None` for a request that does not say.
+fn forwarded_caller(request_json: &str) -> Option<Option<String>> {
+    // Most lines never carry the key; skip the second parse for them.
+    if !request_json.contains(CALLER_META_KEY) {
+        return None;
+    }
+    let req: Value = serde_json::from_str(request_json).ok()?;
+    let caller = req.get("params")?.get("_meta")?.get(CALLER_META_KEY)?;
+    Some(caller.as_str().map(str::to_string))
+}
+
+/// `"name/version"` for a client's reported `name` and `version`, or `None`
+/// for a blank name: the identity [`client_identity`] reads from a stdio
+/// handshake, for transports that receive the handshake already parsed.
+pub fn identity(name: &str, version: Option<&str>) -> Option<String> {
+    let name = name.trim();
     if name.is_empty() {
         return None;
     }
-    match info.get("version").and_then(|v| v.as_str()).map(str::trim) {
+    match version.map(str::trim) {
         Some(version) if !version.is_empty() => Some(format!("{name}/{version}")),
         _ => Some(name.to_string()),
     }
+}
+
+/// `remind_me_capture_transcript`: the hook-facing capture, for a caller with
+/// no CLI on its machine. The caller's context is taken as given: its cwd is
+/// on another machine, so nothing here probes it.
+fn capture_transcript_tool(
+    store: &remind_me_core::db::Store<'_>,
+    args: &Value,
+) -> Result<remind_me_core::transcript::TranscriptOutcome, String> {
+    use remind_me_core::models::WriteContext;
+    use remind_me_core::transcript::{
+        capture_transcript, encoded_len, TranscriptRequest, MAX_TRANSCRIPT_BYTES,
+    };
+    let text = |key: &str| {
+        args.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    let session_id = text("session_id").ok_or("session_id is required")?;
+    let transcript = args
+        .get("transcript")
+        .and_then(Value::as_str)
+        .ok_or("transcript is required")?;
+    let size = encoded_len(transcript);
+    if size > MAX_TRANSCRIPT_BYTES {
+        return Err(format!(
+            "transcript is {size} bytes JSON-escaped; send at most {MAX_TRANSCRIPT_BYTES}, its tail cut at a line"
+        ));
+    }
+    let reason = text("reason");
+    if let Some(r) = reason.as_deref() {
+        if !matches!(r, "stop" | "precompact" | "end") {
+            return Err(format!("reason must be stop, precompact or end, not {r:?}"));
+        }
+    }
+    let context = WriteContext {
+        project: text("project"),
+        session_id: Some(session_id.clone()),
+        git_remote: text("git_remote"),
+        git_branch: text("git_branch"),
+        git_sha: text("git_sha"),
+        cwd: text("cwd"),
+    };
+    let request = TranscriptRequest {
+        session_id: &session_id,
+        cwd: None,
+        reason: reason.as_deref(),
+        context: Some(&context),
+    };
+    capture_transcript(store, transcript, &request).map_err(|e| e.to_string())
 }
 
 impl McpServer {
@@ -369,7 +522,12 @@ impl McpServer {
     /// Tests need this: the default root is a real shared directory, so a test
     /// using it would write into whatever wiki the machine's user actually has.
     pub fn with_wiki(db: Database, wiki: Wiki) -> Self {
-        let db = Arc::new(db);
+        Self::shared(Arc::new(db), wiki)
+    }
+
+    /// Build a server over a database other servers also use: the daemon
+    /// runs this and the dashboard API over one store.
+    pub fn shared(db: Arc<Database>, wiki: Wiki) -> Self {
         Self {
             // A no-op without `REMIND_ME_WEBHOOK_SECRET`, which is the ordinary
             // case — nothing binds a port unless someone asked for one.
@@ -403,7 +561,12 @@ impl McpServer {
     /// the single point every reply passes through, rather than at the
     /// several hundred `json!` sites that build them.
     pub fn handle_request(&self, request_json: &str) -> Option<Value> {
-        let mut response = self.dispatch_request(request_json)?;
+        let mut response = match forwarded_caller(request_json) {
+            Some(caller) => remind_me_core::sync::with_call_client(caller, || {
+                self.dispatch_request(request_json)
+            }),
+            None => self.dispatch_request(request_json),
+        }?;
         stamp_result_type(&mut response);
         Some(response)
     }
@@ -455,7 +618,8 @@ impl McpServer {
                         "serverInfo": {
                             "name": "rusty_remind_me",
                             "version": "0.1.0"
-                        }
+                        },
+                        "instructions": SERVER_INSTRUCTIONS
                     }
                 }))
             }
@@ -478,7 +642,7 @@ impl McpServer {
                         "tools": [
                             {
                                 "name": "remind_me_add",
-                                "description": "Store a new memory fact, preference, or note.",
+                                "description": "Save a fact, decision, preference or note to remind-me memory; call this whenever the user states something durable. A decision needs metadata.rationale. Saving a decision checks it against the standing, non-sensitive decisions in the same project on the same claim or a shared entity and returns likely conflicts as contradiction_candidates; nothing is blocked or superseded automatically. Pass supersedes to retire the old decision in the same call.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -487,21 +651,57 @@ impl McpServer {
                                         "category": { "type": "string", "default": "general" },
                                         "tags": { "type": "array", "items": { "type": "string" } },
                                         "source": { "type": "string", "default": "manual" },
-                                        "sensitive": { "type": "boolean", "default": false, "description": "Mark this memory sensitive: kept out of ordinary search and list results unless include_sensitive is set. A convenience flag, NOT access control — this is a single-user store and anyone with the database reads everything regardless." }
+                                        "sensitive": { "type": "boolean", "default": false, "description": "Mark this memory sensitive: kept out of ordinary search and list results unless include_sensitive is set. A convenience flag, NOT access control — this is a single-user store and anyone with the database reads everything regardless." },
+                                        "extract": { "type": "boolean", "default": true, "description": "Extract references (issues, commits, URLs, paths, handles) and entities from the content. REMIND_ME_EXTRACT=0 disables it globally." },
+                                        "attachments": {
+                                            "type": "array",
+                                            "description": "Files or URLs this memory points at. A path is hashed (sha256) and only the fingerprint, size and mime type are stored, never the bytes.",
+                                            "items": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "path": { "type": "string" },
+                                                    "url": { "type": "string" },
+                                                    "label": { "type": "string" }
+                                                }
+                                            }
+                                        },
+                                        "metadata": { "type": "object", "description": "Free-form JSON stored with the memory; a decision requires a `rationale` string here, an action_item may hold due, owner and status." },
+                                        "subject": { "type": "string", "description": "Subject of a subject-predicate-object fact. remind_me_add does not supersede a live triple with the same subject and predicate; name it in supersedes to do so." },
+                                        "predicate": { "type": "string", "description": "Predicate of the fact triple." },
+                                        "object": { "type": "string", "description": "Object of the fact triple." },
+                                        "entities": {
+                                            "type": "array",
+                                            "description": "Entities this memory mentions, linked into the knowledge graph.",
+                                            "items": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "name": { "type": "string" },
+                                                    "kind": { "type": "string" },
+                                                    "aliases": { "type": "array", "items": { "type": "string" } }
+                                                },
+                                                "required": ["name"]
+                                            }
+                                        },
+                                        "memory_type": { "type": "string", "enum": ["decision", "action_item", "preference", "fact", "reference", "insight", "learning", "blocker", "work_log", "unclassified"], "description": "What kind of memory this is; a decision requires metadata.rationale." },
+                                        "confidence": { "type": "number", "minimum": 0, "maximum": 1, "default": 1, "description": "How far to trust this memory; scales its search ranking." },
+                                        "valid_from": { "type": "string", "description": "RFC 3339 time the memory starts to hold; omit for always." },
+                                        "valid_until": { "type": "string", "description": "RFC 3339 time it stops holding; after it the memory ranks last and is marked expired." },
+                                        "outcome": { "type": "string", "enum": ["done", "abandoned", "reverted", "superseded", "carded"], "description": "Only for decision and action_item memories; prefer remind_me_resolve for an existing one." },
+                                        "supersedes": { "type": "array", "items": { "type": "string" }, "description": "IDs of live memories this one replaces, e.g. a contradiction_candidates id. Each is marked superseded by the new memory, in one transaction with the add; an id that is missing, deleted, already superseded or a project claim refuses the whole add." }
                                     },
                                     "required": ["content"]
                                 }
                             },
                             {
                                 "name": "remind_me_get",
-                                "description": "Get a memory by ID.",
+                                "description": "Get memories by ID: one with memory_id, or several with memory_ids (e.g. the ids a compact remind_me_search returned or trimmed). memory_ids returns {memories, missing}.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
                                         "memory_id": { "type": "string" },
+                                        "memory_ids": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": GET_IDS_MAX, "description": "Fetch several memories in one call. Use instead of memory_id, not with it." },
                                         "id": { "type": "string", "description": "Deprecated alias for memory_id. Prefer memory_id; kept for backward compatibility." }
-                                    },
-                                    "required": ["memory_id"]
+                                    }
                                 }
                             },
                             {
@@ -518,6 +718,10 @@ impl McpServer {
                                             "description": "Memory must have ALL of these tags"
                                         },
                                         "source": { "type": "string" },
+                                        "project": { "type": "string", "description": "Only memories written in this project (case-insensitive)" },
+                                        "branch": { "type": "string", "description": "Only memories written on this git branch" },
+                                        "session_id": { "type": "string", "description": "Only memories written in this client session" },
+                                        "written_by": { "type": "string", "description": "Only memories by this writer: human, hook, model, model:<id> or importer:<name>" },
                                         "limit": { "type": "integer", "default": 20, "minimum": 1, "maximum": 100 },
                                         "offset": { "type": "integer", "default": 0, "minimum": 0 },
                                         "include_sensitive": { "type": "boolean", "default": false, "description": "Include memories marked sensitive. Off by default, so sensitive content never surfaces in an ordinary request." }
@@ -526,7 +730,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_update",
-                                "description": "Update an existing memory's content, category, tags, or metadata.",
+                                "description": "Update an existing memory's content, category, tags, or metadata. A content or type change that leaves a decision returns likely conflicting standing decisions as contradiction_candidates.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -537,14 +741,19 @@ impl McpServer {
                                         "tags": { "type": "array", "items": { "type": "string" } },
                                         "metadata": { "type": "object" },
                                         "sensitive": { "type": "boolean", "description": "Set or clear the sensitive flag. Omit to leave it unchanged." },
-                                        "clear_superseded": { "type": "boolean", "default": false, "description": "Clear this memory's superseded_by flag, un-hiding it from search, entity, and subject/predicate lookups. Recovery path for a false-positive contradiction-supersession. Does not affect the memory that did the superseding." }
+                                        "clear_superseded": { "type": "boolean", "default": false, "description": "Clear this memory's superseded_by flag, un-hiding it from search, entity, and subject/predicate lookups. Recovery path for a false-positive contradiction-supersession. Does not affect the memory that did the superseding." },
+                                        "memory_type": { "type": "string", "enum": ["decision", "action_item", "preference", "fact", "reference", "insight", "learning", "blocker", "work_log", "unclassified"], "description": "Reclassify; a decision requires metadata.rationale (in this call or already stored)." },
+                                        "confidence": { "type": "number", "minimum": 0, "maximum": 1, "description": "How far to trust this memory; scales its search ranking." },
+                                        "valid_from": { "type": "string", "description": "RFC 3339 time the memory starts to hold." },
+                                        "valid_until": { "type": "string", "description": "RFC 3339 time it stops holding; after it the memory ranks last and is marked expired." },
+                                        "outcome": { "type": "string", "enum": ["done", "abandoned", "reverted", "superseded", "carded"], "description": "Only for decision and action_item memories." }
                                     },
                                     "required": ["memory_id"]
                                 }
                             },
                             {
                                 "name": "remind_me_delete",
-                                "description": "Delete a memory by ID.",
+                                "description": "Delete one remind-me memory by id, when the user asks to forget it or it is wrong.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -555,14 +764,24 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_search",
-                                "description": "Search memories using FTS5 keyword & hybrid ranking. The three expansion flags surface adjacent memories in their own sections, outside the ranked results, so they never consume `limit`.",
+                                "description": "Search memories using FTS5 keyword & hybrid ranking. tags, entity, repo and the project/branch/session/writer filters narrow the ranked results before the limit applies. Returns compact hits by default (id, category, date, tags, score, snippet); fetch full text with remind_me_get memory_ids, or pass detail=full. Hits cut by token_budget are listed by id. The three expansion flags surface adjacent memories in their own sections, outside the ranked results, so they never consume `limit`.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
                                         "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "markdown", "description": "markdown (default, as the reference) renders the results; json returns the full envelope including scores." },
-                                        "query": { "type": "string" },
+                                        "query": { "type": "string", "description": "Search text. May be empty when since or until is set, to list that window newest-first." },
                                         "limit": { "type": "integer", "default": 20 },
+                                        "detail": { "type": "string", "enum": ["compact", "full"], "default": "compact", "description": "compact (default): one short line per hit, so more hits fit the budget. full: whole memories with metadata and references." },
+                                        "token_budget": { "type": "integer", "default": 800, "minimum": 0, "description": "Estimated tokens the hits may use; 0 is unlimited. Hits that do not fit are listed by id." },
                                         "category": { "type": "string" },
+                                        "tags": { "type": "array", "items": { "type": "string" }, "description": "Only memories carrying these tags (see tag_mode)" },
+                                        "tag_mode": { "type": "string", "enum": ["all", "any"], "default": "all", "description": "all: every tag must be present; any: at least one" },
+                                        "entity": { "type": "string", "description": "Only memories about this entity, by name or alias: linked to it, or naming it as subject or object. An unknown entity matches nothing." },
+                                        "repo": { "type": "string", "description": "Only memories written in this git repository (origin remote, any URL form, e.g. github.com/owner/repo)" },
+                                        "project": { "type": "string", "description": "Only memories written in this project (case-insensitive)" },
+                                        "branch": { "type": "string", "description": "Only memories written on this git branch" },
+                                        "session_id": { "type": "string", "description": "Only memories written in this client session" },
+                                        "written_by": { "type": "string", "description": "Only memories by this writer: human, hook, model, model:<id> or importer:<name>" },
                                         "include_dormant": { "type": "boolean", "default": false, "description": "Include memories that have decayed below the vitality floor" },
                                         "min_vitality": { "type": "number", "default": 0, "description": "Only return memories at or above this current vitality" },
                                         "expand_entities": { "type": "boolean", "default": false, "description": "Also surface memories mentioning the same entities" },
@@ -570,14 +789,35 @@ impl McpServer {
                                         "expand_co_retrieval": { "type": "boolean", "default": false, "description": "Also surface memories frequently retrieved alongside these" },
                                         "include_sensitive": { "type": "boolean", "default": false, "description": "Include memories marked sensitive. Off by default, so sensitive content never surfaces in an ordinary request." },
                                         "bootstrap": { "type": "boolean", "default": false, "description": "Prepend the durable persona (L3) as context, whether or not it matches the query. Spends up to a quarter of token_budget; the rest still goes to the ranked results." },
+                                        "include_expired": { "type": "boolean", "default": true, "description": "Include memories whose valid_until has passed. They always rank after in-window ones; set false to drop them." },
+                                        "min_confidence": { "type": "number", "default": 0, "description": "Only return memories at or above this confidence (0 to 1)." },
+                                        "include_raw": { "type": "boolean", "default": false, "description": "Rank raw session dialogs and skeletons too. Off by default: facts and summaries rank, and each carries the capture_id of its dialog. A dialog category or a session_id filter turns it on, and when nothing refined matches the best dialogs come back marked as raw." },
+                                        "since": { "type": "string", "description": "Only memories at or after this time (inclusive): RFC 3339, or an age back from now like 30m, 12h, 2d, 1w." },
+                                        "until": { "type": "string", "description": "Only memories before this time (exclusive): RFC 3339, or an age back from now like 30m, 12h, 2d, 1w. Must be after since." },
+                                        "time_field": { "type": "string", "enum": ["created", "updated"], "default": "created", "description": "Which timestamp since/until apply to." },
                                         "strategy": { "type": "string", "enum": ["auto", "balanced", "keyword_favored", "semantic_favored"], "default": "auto", "description": "RRF weight profile. Leave at auto (routes by query shape: quoted phrases, prefix* wildcards and very short queries favour keyword relevance; long or question-shaped queries favour semantic similarity) unless deliberately A/B testing a pinned preset." }
                                     },
                                     "required": ["query"]
                                 }
                             },
                             {
+                                "name": "remind_me_brief",
+                                "description": "Get a remind-me brief for one project: current state, open blockers, decisions and action items, and recent activity, with ids for remind_me_get.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "properties": {
+                                        "project": { "type": "string", "description": "Project or entity name, or an alias" },
+                                        "since": { "type": "string", "default": context_brief::DEFAULT_SINCE, "description": "Activity window: 7d, 12h or an RFC 3339 time, at most 365 days" },
+                                        "token_budget": { "type": "integer", "default": context_brief::DEFAULT_TOKEN_BUDGET, "minimum": context_brief::MIN_TOKEN_BUDGET, "maximum": context_brief::MAX_TOKEN_BUDGET },
+                                        "response_format": { "type": "string", "enum": ["json", "markdown"] }
+                                    },
+                                    "required": ["project"]
+                                }
+                            },
+                            {
                                 "name": "remind_me_entity",
-                                "description": "Everything known about ONE named thing — a person, project, tool, org, or place. Read-only: returns the entity record, its facts, and the memories mentioning it, or found=false for an unknown name. Use remind_me_search for topic questions or anything you cannot name exactly.",
+                                "description": "Look up everything remind-me knows about ONE named thing: a person, project, tool, org or place. Read-only: returns the entity record, its facts, and the memories mentioning it, or found=false for an unknown name. Use remind_me_search for topic questions or anything you cannot name exactly.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -588,8 +828,13 @@ impl McpServer {
                                 }
                             },
                             {
+                                "name": "remind_me_project",
+                                "description": remind_me_core::project_tool::DESCRIPTION,
+                                "inputSchema": remind_me_core::project_tool::input_schema()
+                            },
+                            {
                                 "name": "remind_me_entity_upsert",
-                                "description": "Create a knowledge-graph entity, or update its kind. Not present in remind_me — remind_me_entity is read-only there, and is here too, so writing is a separate, explicit call.",
+                                "description": "remind-me pipeline: create a knowledge-graph entity, or update its kind. remind_me_entity is read-only, so writing is a separate, explicit call.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -665,7 +910,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_self_update",
-                                "description": "Pull the latest changes from origin/main (fast-forward only) and rebuild the workspace in release mode. Refuses a working tree with uncommitted changes unless force is set; force never bypasses the fast-forward-only pull, so a diverged local history is still refused either way. Always requires a restart to take effect on success.",
+                                "description": "remind-me admin: pull the latest changes from origin/main (fast-forward only) and rebuild the workspace in release mode. Refuses a working tree with uncommitted changes unless force is set; force never bypasses the fast-forward-only pull, so a diverged local history is still refused either way. Always requires a restart to take effect on success.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -675,7 +920,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_revoke_clients",
-                                "description": "List OAuth clients registered with the remote connector's authorization server (FT-07), or revoke one by client_id. Without client_id, lists every registered client with its live access/refresh token counts -- this is the read path, not a bulk-revoke shorthand: there is no 'revoke all' operation, only 'list' (empty client_id) and 'revoke this one client' (client_id set). With client_id, deletes that client's registration and every token it holds; the live remote server re-reads the state file on each token check, so the client is locked out immediately and must re-register and re-obtain the owner's consent to reconnect.",
+                                "description": "remind-me admin: list OAuth clients registered with the remote connector's authorization server (FT-07), or revoke one by client_id. Without client_id, lists every registered client with its live access/refresh token counts -- this is the read path, not a bulk-revoke shorthand: there is no 'revoke all' operation, only 'list' (empty client_id) and 'revoke this one client' (client_id set). With client_id, deletes that client's registration and every token it holds; the live remote server re-reads the state file on each token check, so the client is locked out immediately and must re-register and re-obtain the owner's consent to reconnect.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -685,7 +930,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_reindex",
-                                "description": "Rebuild vector embeddings for every memory that doesn't have one yet. Existing embeddings are preserved; only missing ones are generated. Run this after configuring REMIND_ME_EMBEDDING_BACKEND, or after a bulk import that ran before an embedder was available. Reports 'degraded' when no embedder is configured or reachable, rather than silently doing nothing.",
+                                "description": "remind-me admin: rebuild vector embeddings for every memory that doesn't have one yet. Existing embeddings are preserved; only missing ones are generated. Run this after configuring REMIND_ME_EMBEDDING_BACKEND, or after a bulk import that ran before an embedder was available. Reports 'degraded' when no embedder is configured or reachable, rather than silently doing nothing.",
                                 "inputSchema": { "type": "object", "properties": { "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "json", "description": "json (default) returns the structured record; markdown returns a human-readable summary." } } }
                             },
                             {
@@ -705,7 +950,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_export_memories",
-                                "description": "Export live memories to JSON or JSONL — every column, plus the entity graph. Deleted and superseded memories are excluded unless include_deleted is set, so an export is safe to re-import. Embedding vectors are excluded as derived data. Writes to file_path when given (must be inside the allowed export roots), otherwise returns the payload inline.",
+                                "description": "remind-me admin: export live memories to JSON or JSONL — every column, plus the entity graph. Deleted and superseded memories are excluded unless include_deleted is set, so an export is safe to re-import. Embedding vectors are excluded as derived data. Writes to file_path when given (must be inside the allowed export roots), otherwise returns the payload inline.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -720,7 +965,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_decompose",
-                                "description": "Break a captured conversation into individually searchable atomic facts, each linked to the capture. A fact whose subject/predicate match an existing fact but whose object differs supersedes it.",
+                                "description": "remind-me pipeline: break a captured conversation into individually searchable atomic facts, each linked to the capture. A fact whose subject/predicate match an existing fact but whose object differs supersedes it.",
                                 "inputSchema": decompose_input_schema()
                             },
                             {
@@ -729,7 +974,8 @@ impl McpServer {
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
-                                        "batch_size": { "type": "integer", "default": 20, "minimum": DECOMPOSE_BATCH_MIN, "maximum": DECOMPOSE_BATCH_MAX }
+                                        "batch_size": { "type": "integer", "default": 20, "minimum": DECOMPOSE_BATCH_MIN, "maximum": DECOMPOSE_BATCH_MAX },
+                                        "idle_minutes": { "type": "integer", "default": 0, "minimum": 0, "maximum": u32::MAX, "description": "Only captures unchanged for at least this many minutes, so a scheduled pass leaves a live session until it settles" }
                                     }
                                 }
                             },
@@ -745,7 +991,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_auto_capture",
-                                "description": "Capture a whole conversation as two linked memories: the verbatim dialog and a concise summary. They share a capture_id, which remind_me_get_capture retrieves both by and remind_me_decompose breaks into atomic facts.",
+                                "description": "Save a whole conversation to remind-me as two linked memories, the verbatim dialog and a concise summary; call this at the end of any substantive conversation. They share a capture_id, which remind_me_get retrieves both by and remind_me_decompose breaks into atomic facts.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -761,6 +1007,24 @@ impl McpServer {
                                 }
                             },
                             {
+                                "name": "remind_me_capture_transcript",
+                                "description": "remind-me import: store or refresh a Claude Code session's capture from its raw JSONL transcript: one dialog and summary pair per session_id, replaced in place on every call. For hooks on machines without the CLI (cloud sessions); a model should use remind_me_auto_capture. The raw transcript is also archived when REMIND_ME_ARCHIVE_DIR is set.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "session_id": { "type": "string", "minLength": 1, "maxLength": 200 },
+                                        "transcript": { "type": "string", "minLength": 1, "description": "The session's JSONL transcript so far, at most 3145728 bytes once JSON-escaped (each quote, backslash and newline counts twice); a caller over the limit sends its tail, cut at a line" },
+                                        "reason": { "type": "string", "enum": ["stop", "precompact", "end"] },
+                                        "project": { "type": "string", "maxLength": 200 },
+                                        "git_remote": { "type": "string", "maxLength": 500 },
+                                        "git_branch": { "type": "string", "maxLength": 200 },
+                                        "git_sha": { "type": "string", "maxLength": 64 },
+                                        "cwd": { "type": "string", "maxLength": 1000, "description": "Recorded as given; never read on this machine" }
+                                    },
+                                    "required": ["session_id", "transcript"]
+                                }
+                            },
+                            {
                                 "name": "remind_me_get_capture",
                                 "description": "Retrieve a linked dialog and summary pair by their shared capture_id.",
                                 "inputSchema": {
@@ -773,7 +1037,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_archive_prune",
-                                "description": "Enforce the raw-transcript archive's retention limits (REMIND_ME_ARCHIVE_MAX_AGE_DAYS, REMIND_ME_ARCHIVE_MAX_BYTES), removing oldest-first. Runs automatically after each archived import; call it directly to reclaim space now or, with dry_run, to see what would go. Removes archives only — the memories derived from them are untouched.",
+                                "description": "remind-me admin: enforce the raw-transcript archive's retention limits (REMIND_ME_ARCHIVE_MAX_AGE_DAYS, REMIND_ME_ARCHIVE_MAX_BYTES), removing oldest-first. Runs automatically after each archived import; call it directly to reclaim space now or, with dry_run, to see what would go. Removes archives only — the memories derived from them are untouched.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -795,7 +1059,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_promote",
-                                "description": "Store a distillation of some memories as the rung above them, recording what it was built from. Provenance is mandatory: a promoted artifact with no sources could never be checked or demoted. Refuses capture_to_fact — that is remind_me_decompose — and refuses a sensitive source for a persona.",
+                                "description": "remind-me pipeline: store a distillation of some memories as the rung above them, recording what it was built from. Provenance is mandatory: a promoted artifact with no sources could never be checked or demoted. Refuses capture_to_fact — that is remind_me_decompose — and refuses a sensitive source for a persona.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -808,7 +1072,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_stale_candidates",
-                                "description": "List memories whose content names a file (inside REMIND_ME_CODE_ROOTS) that has since changed or been deleted. Read-only and never touches the memory it reports: a changed file does not prove the memory wrong, it only means the claim is worth re-checking. Off entirely -- always an empty list -- unless REMIND_ME_CODE_ROOTS is configured.",
+                                "description": "List memories worth re-checking: those whose content names a file (inside REMIND_ME_CODE_ROOTS) that has since changed or been deleted, and those whose valid_until has passed (reason `expired`, shown as expired_at). Read-only and never touches the memory it reports: a changed file does not prove the memory wrong, it only means the claim is worth re-checking. The file check is off -- only expired memories are listed -- unless REMIND_ME_CODE_ROOTS is configured.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -818,7 +1082,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_persona",
-                                "description": "The current persona: durable statements about the user whose grounds still hold. A statement whose sources have all been superseded or deleted is withheld automatically, so a contradicted fact demotes what was built on it. Set include_demoted to also see what is currently withheld and why.",
+                                "description": "remind-me pipeline: the current persona: durable statements about the user whose grounds still hold. A statement whose sources have all been superseded or deleted is withheld automatically, so a contradicted fact demotes what was built on it. Set include_demoted to also see what is currently withheld and why.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -828,7 +1092,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_provenance",
-                                "description": "What a memory was distilled from, and what was distilled from it. Walks the refinement ladder in both directions from one memory id.",
+                                "description": "remind-me pipeline: what a memory was distilled from, and what was distilled from it. Walks the refinement ladder in both directions from one memory id.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -837,9 +1101,23 @@ impl McpServer {
                                     "required": ["memory_id"]
                                 }
                             },
+                            references::tool_schema(),
+                            {
+                                "name": "remind_me_session_timeline",
+                                "description": "remind-me extras: a client session as an episode. With session_id: the session's start and end, branch and shas, then every memory written under it (captures, facts, the work log) oldest first. Without: the most recent sessions, newest first, each with how many memories it wrote.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "session_id": { "type": "string", "description": "One session to read in full. Omit to list recent sessions." },
+                                        "project": { "type": "string", "description": "When listing, only sessions of this project." },
+                                        "limit": { "type": "integer", "minimum": 1, "default": 10, "description": "When listing, how many sessions." },
+                                        "response_format": { "type": "string", "enum": ["markdown", "json"] }
+                                    }
+                                }
+                            },
                             {
                                 "name": "remind_me_skeleton_write",
-                                "description": "Attach a Mermaid diagram of a capture's structure, so the conversation's shape can be read without reading the transcript. Each node maps to an inclusive, 1-based line range in the capture's dialog; remind_me_skeleton_read then drills into one node at a time. Ranges are validated against the dialog and the write is refused if any is out of bounds.",
+                                "description": "remind-me pipeline: attach a Mermaid diagram of a capture's structure, so the conversation's shape can be read without reading the transcript. Each node maps to an inclusive, 1-based line range in the capture's dialog; remind_me_skeleton_read then drills into one node at a time. Ranges are validated against the dialog and the write is refused if any is out of bounds.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -852,7 +1130,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_skeleton_read",
-                                "description": "Read a capture's skeleton. Without 'node' this returns the Mermaid diagram and its node map — the cheap view of a long conversation. With 'node' it returns only that node's lines of the dialog, which is how to drill in without pulling the whole transcript.",
+                                "description": "remind-me pipeline: read a capture's skeleton. Without 'node' this returns the Mermaid diagram and its node map — the cheap view of a long conversation. With 'node' it returns only that node's lines of the dialog, which is how to drill in without pulling the whole transcript.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -902,7 +1180,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_api_key",
-                                "description": "Issue, list, or revoke named dashboard API keys with a read or read-write scope. A read-scoped key is refused on every mutating HTTP route. The plaintext key is shown exactly once, at issuance — only its hash is stored, so it can be revoked and replaced but never recovered. Not multi-tenancy: every key reads and writes the same vault, only the permitted methods differ.",
+                                "description": "remind-me admin: issue, list, or revoke named dashboard API keys with a read or read-write scope. A read-scoped key is refused on every mutating HTTP route. The plaintext key is shown exactly once, at issuance — only its hash is stored, so it can be revoked and replaced but never recovered. Not multi-tenancy: every key reads and writes the same vault, only the permitted methods differ.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -949,7 +1227,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_sync_repair",
-                                "description": "Reset a remote's pull cursors so the next sync re-pulls history from the beginning. Only the cursors are reset — the contact timestamps record what actually happened and are left intact.",
+                                "description": "remind-me admin: reset a remote's pull cursors so the next sync re-pulls history from the beginning. Only the cursors are reset — the contact timestamps record what actually happened and are left intact.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -970,7 +1248,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_contradiction_candidates",
-                                "description": "Surface pairs of memories that might assert incompatible things but were never caught by exact-triple supersession — two pieces of prose that conflict without either carrying a formal subject/predicate/object. Read-only: these are pairs that MIGHT conflict, and most turn out merely topically similar. Read both before acting; fix a real one with remind_me_update, remind_me_delete, or remind_me_add carrying an explicit triple. Paginate by passing the next_after_a/next_after_b from one response as after_a/after_b on the next call, and stop when has_more is false — without a cursor every call returns the same first page, so a large queue has only `limit` reachable rows.",
+                                "description": "Surface pairs of memories that might assert incompatible things but were never caught by exact-triple supersession — two pieces of prose that conflict without either carrying a formal subject/predicate/object. Read-only: these are pairs that MIGHT conflict, and most turn out merely topically similar. Read both before acting; fix a real one with remind_me_update, remind_me_delete, or remind_me_add carrying an explicit triple. When both sides state the same subject and predicate with different objects, recommended_keep names the one to keep (higher confidence, then newer verified_at, then newer updated_at) and it is listed as memory_a. Paginate by passing the next_after_a/next_after_b from one response as after_a/after_b on the next call, and stop when has_more is false — without a cursor every call returns the same first page, so a large queue has only `limit` reachable rows.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -995,7 +1273,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_revert",
-                                "description": "Restore a memory's content, category, tags, metadata and sensitive flag to a prior revision. Reverting is itself an edit: it records a new revision of the state just before the revert, so a revert can be undone.",
+                                "description": "remind-me pipeline: restore a memory's content, category, tags, metadata and sensitive flag to a prior revision. Reverting is itself an edit: it records a new revision of the state just before the revert, so a revert can be undone.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -1053,7 +1331,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_undo_import",
-                                "description": "Roll back a previous import, removing its memories and its tracking rows. Defaults to a dry run — pass dry_run=false to actually delete. On a sync-enabled node this soft-deletes (tombstones), so the removal propagates to every other node and disk is not reclaimed until compaction. Resumable: call again until 'remaining' is 0.",
+                                "description": "remind-me import: roll back a previous import, removing its memories and its tracking rows. Defaults to a dry run — pass dry_run=false to actually delete. On a sync-enabled node this soft-deletes: a tombstone without the memory's text stays, so the removal propagates to every other node. Resumable: call again until 'remaining' is 0.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -1077,12 +1355,12 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_normalize_apply",
-                                "description": "Write distilled normalizations back as new memories, each linked to the raw import it came from via a normalized_from metadata pointer. The raw memory is left untouched.",
+                                "description": "remind-me pipeline: write distilled normalizations back as new memories, each linked to the raw import it came from via a normalized_from metadata pointer. The raw memory is left untouched.",
                                 "inputSchema": normalize_apply_input_schema()
                             },
                             {
                                 "name": "remind_me_entity_traverse",
-                                "description": "Multi-hop traversal of the typed entity-relation graph from a starting entity. Unlike remind_me_entity (one entity's direct facts) this follows entity_relations edges in both directions, so it answers questions that chain relations rather than co-mention.",
+                                "description": "remind-me pipeline: multi-hop traversal of the typed entity-relation graph from a starting entity. Unlike remind_me_entity (one entity's direct facts) this follows entity_relations edges in both directions, so it answers questions that chain relations rather than co-mention.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -1096,7 +1374,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_wiki_write",
-                                "description": "Write or update a markdown wiki page.",
+                                "description": "remind-me wiki: write or update a markdown wiki page.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -1133,7 +1411,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_reclassify",
-                                "description": "Apply memory_type classifications. Updates each memory's decay rate to match its new type.",
+                                "description": "remind-me pipeline: apply memory_type classifications. Updates each memory's decay rate to match its new type.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -1166,7 +1444,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_feedback",
-                                "description": "Mark a memory helpful or unhelpful. Without `query` this is a global judgement that adjusts the memory's weight; with `query` it is recorded as feedback for similar future searches only.",
+                                "description": "remind-me pipeline: mark a memory helpful or unhelpful. Without `query` this is a global judgement that adjusts the memory's weight; with `query` it is recorded as feedback for similar future searches only.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -1179,7 +1457,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_backup",
-                                "description": "Create a WAL-safe online backup of the memory database, beside the database file. Older backups beyond the retention count are pruned.",
+                                "description": "remind-me admin: create a WAL-safe online backup of the memory database, beside the database file. Older backups beyond the retention count are pruned.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {}
@@ -1187,7 +1465,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_annotate",
-                                "description": "Apply subject/predicate/object triples and entity mentions to existing memories, in batches of up to 100.",
+                                "description": "remind-me pipeline: apply subject/predicate/object triples and entity mentions to existing memories, in batches of up to 100.",
                                 "inputSchema": annotate_input_schema()
                             },
                             {
@@ -1213,7 +1491,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_wiki_compile",
-                                "description": "Drive wiki synthesis over raw memories. With mark_integrated=false (the default) returns a brief of pending sources and never advances the watermark, so it is safe to call repeatedly. Call again with mark_integrated=true after writing the pages.",
+                                "description": "remind-me wiki: drive wiki synthesis over raw memories. With mark_integrated=false (the default) returns a brief of pending sources and never advances the watermark, so it is safe to call repeatedly. Call again with mark_integrated=true after writing the pages.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -1246,7 +1524,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_wiki_delete",
-                                "description": "Delete a wiki page by title or slug.",
+                                "description": "remind-me wiki: delete a wiki page by title or slug.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -1262,7 +1540,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_consolidate",
-                                "description": "Find clusters of near-duplicate memories by embedding similarity and optionally merge them into one canonical representative. dry_run (default true) reports clusters — canonical, members, and each member's similarity to the canonical — without changing anything. To actually merge, review the report, write a short summary per cluster you want consolidated, then call again with dry_run=false and summaries={canonical_id: summary}; a cluster with no matching summary is skipped, not merged with a raw concatenation.",
+                                "description": "remind-me pipeline: find clusters of near-duplicate memories by embedding similarity and optionally merge them into one canonical representative. dry_run (default true) reports clusters — canonical, members, and each member's similarity to the canonical — without changing anything. To actually merge, review the report, write a short summary per cluster you want consolidated, then call again with dry_run=false and summaries={canonical_id: summary}; a cluster with no matching summary is skipped, not merged with a raw concatenation.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -1272,6 +1550,20 @@ impl McpServer {
                                         "limit": { "type": "integer", "default": 500, "minimum": CONSOLIDATE_LIMIT_MIN, "maximum": CONSOLIDATE_LIMIT_MAX, "description": "Maximum memories to consider (prevents runaway on large vaults)" },
                                         "summaries": { "type": "object", "additionalProperties": { "type": "string" }, "description": "{canonical_id: summary}, one entry per cluster (from a prior dry_run=true call) you want consolidated. Required to actually merge a cluster when dry_run=false." }
                                     }
+                                }
+                            },
+                            {
+                                "name": "remind_me_resolve",
+                                "description": "Close a remind-me decision or action item with `outcome`: done, abandoned, reverted, superseded, or carded (moved to a board card, so no longer open but not done). Or record a decision's follow-up review with `review`: whether it held up, which is separate from whether it was carried out. Pass exactly one. A reverted or abandoned one loses half its weight so it stops outranking what replaced it; the prior state is kept in history.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "memory_id": { "type": "string" },
+                                        "outcome": { "type": "string", "enum": ["done", "abandoned", "reverted", "superseded", "carded"] },
+                                        "review": { "type": "string", "enum": ["held", "revised", "reverted"], "description": "Decisions only. `reverted` also sets outcome to reverted." },
+                                        "note": { "type": "string", "description": "Why; stored as metadata.outcome_note, or metadata.review.note for a review." }
+                                    },
+                                    "required": ["memory_id"]
                                 }
                             },
                             {
@@ -1287,6 +1579,18 @@ impl McpServer {
                         ]
                     }
                 });
+                // The literal above is every handler under its own name;
+                // what is advertised is the public surface built from it
+                // (ADR-0030). Handlers keep their pre-0.5 names so an alias
+                // reaches its own handler unchanged.
+                #[cfg(test)]
+                if tests::HANDLER_VIEW.with(std::cell::Cell::get) {
+                    return Some(listed);
+                }
+                let handlers = listed["result"]["tools"].take();
+                listed["result"]["tools"] = Value::Array(surface::public_tools(
+                    handlers.as_array().map(Vec::as_slice).unwrap_or_default(),
+                ));
                 // Pruned once, here, after the whole surface is declared —
                 // rather than by guarding each entry, which would put the
                 // tier decision in 62 places and let the next tool forget it.
@@ -1319,8 +1623,8 @@ impl McpServer {
             }
             "resources/read" => {
                 let req_id = id.unwrap_or(json!(1));
-                let conn = self.db.conn();
-                match stats::collect(&conn) {
+                let store = self.db.store();
+                match stats::collect(&store) {
                     Ok(s) => Some(json!({
                         "jsonrpc": "2.0",
                         "id": req_id,
@@ -1383,7 +1687,7 @@ impl McpServer {
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
                 // Read before `args` is moved into any tool's input model.
                 let format = requested_format(&args);
-                let conn = self.db.conn();
+                let store = self.db.store();
                 // Hidden means gone, not merely undocumented: a model that
                 // guessed the name would otherwise still reach it, and a
                 // caller who trimmed their surface would never know it was
@@ -1397,17 +1701,36 @@ impl McpServer {
                             "isError": true,
                             "content": [{
                                 "type": "text",
-                                "text": format!(
-                                    "Tool '{}' is not available under the '{}' tool profile. \
-                                     Set {}=full to expose the whole surface.",
-                                    tool_name,
-                                    profile,
-                                    remind_me_core::tool_profiles::TOOL_PROFILE_ENV
-                                )
+                                "text": match remind_me_core::tool_profiles::group_of(tool_name) {
+                                    Some(group) => format!(
+                                        "Tool '{tool_name}' is not available under the '{profile}' \
+                                         tool profile. It is in the '{group}' group: set \
+                                         {env}={profile},{group}, or {env}=full for the whole surface.",
+                                        env = remind_me_core::tool_profiles::TOOL_PROFILE_ENV
+                                    ),
+                                    None => format!(
+                                        "Tool '{tool_name}' is not available under the '{profile}' \
+                                         tool profile. Set {}=full to expose the whole surface.",
+                                        remind_me_core::tool_profiles::TOOL_PROFILE_ENV
+                                    ),
+                                }
                             }]
                         }
                     }));
                 }
+                let surface::Route { handler, args } = match surface::route(tool_name, args) {
+                    Ok(route) => route,
+                    Err(why) => {
+                        return Some(json!({
+                            "jsonrpc": "2.0",
+                            "id": req_id,
+                            "result": {
+                                "isError": true,
+                                "content": [{ "type": "text", "text": format!("Invalid input: {why}") }]
+                            }
+                        }));
+                    }
+                };
                 let mut span = remind_me_core::telemetry::maybe_span(&format!("tool.{tool_name}"));
                 // Started unconditionally: `record_tool_call` decides for
                 // itself whether metrics are on, the same way `maybe_span`
@@ -1420,24 +1743,39 @@ impl McpServer {
                 // one finishes.
                 let _watchdog = remind_me_core::watchdog::arm(tool_name);
 
-                let result = match tool_name {
+                let result = match handler.as_str() {
                     "remind_me_add" => {
-                        let input: Result<MemoryAddInput, _> = serde_json::from_value(args);
+                        // The structured fields sit beside the input model, not
+                        // in it, so both read from the same arguments.
+                        let input = serde_json::from_value::<MemoryAddInput>(args.clone())
+                            .and_then(|i| {
+                                serde_json::from_value::<StructuredFields>(args).map(|f| (i, f))
+                            });
                         match input {
-                            Ok(add_input) => match queries::add_memory(&conn, add_input) {
-                                Ok(mem) => {
-                                    json!({ "content": [{ "type": "text", "text": match format {
-    ResponseFormat::Json => serde_json::to_string_pretty(&mem).unwrap(),
-    ResponseFormat::Markdown => render::memory_stored(&mem),
+                            Ok((add_input, fields)) => {
+                                match queries::add_memory_with(&store, add_input, &fields) {
+                                    Ok(mem) => {
+                                        let check = contradictions::check_on_save(&store, &mem.id);
+                                        json!({ "content": [{ "type": "text", "text": match format {
+    ResponseFormat::Json => serde_json::to_string_pretty(&SavedMemory { memory: &mem, check }).unwrap(),
+    ResponseFormat::Markdown => render::memory_stored(&mem) + &render::save_check(&check),
 } }] })
+                                    }
+                                    Err(e) => {
+                                        json!({ "isError": true, "content": [{ "type": "text", "text": store_error_text("Database error", &e) }] })
+                                    }
                                 }
-                                Err(e) => {
-                                    json!({ "isError": true, "content": [{ "type": "text", "text": format!("Database error: {}", e) }] })
-                                }
-                            },
+                            }
                             Err(e) => {
                                 json!({ "isError": true, "content": [{ "type": "text", "text": format!("Invalid input: {}", e) }] })
                             }
+                        }
+                    }
+                    "remind_me_get" if args.get("memory_ids").is_some() => {
+                        if args.get("memory_id").is_some() || args.get("id").is_some() {
+                            json!({ "isError": true, "content": [{ "type": "text", "text": "Invalid input: pass memory_id or memory_ids, not both" }] })
+                        } else {
+                            get_memories(&store, &args["memory_ids"])
                         }
                     }
                     "remind_me_get" => {
@@ -1450,10 +1788,15 @@ impl McpServer {
                             .and_then(|v| v.as_str())
                             .or_else(|| args.get("id").and_then(|v| v.as_str()))
                             .unwrap_or("");
-                        match queries::get_memory_by_id(&conn, id) {
-                            Ok(Some(mem)) => {
-                                json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&mem).unwrap() }] })
-                            }
+                        match queries::get_memory_by_id(&store, id) {
+                            Ok(Some(mem)) => match references::memory_json(&store, &mem) {
+                                Ok(with_refs) => {
+                                    json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&with_refs).unwrap() }] })
+                                }
+                                Err(e) => {
+                                    json!({ "isError": true, "content": [{ "type": "text", "text": format!("Error: {}", e) }] })
+                                }
+                            },
                             Ok(None) => {
                                 json!({ "isError": true, "content": [{ "type": "text", "text": "Memory not found" }] })
                             }
@@ -1465,7 +1808,7 @@ impl McpServer {
                     "remind_me_list" => {
                         let input: Result<MemoryListInput, _> = serde_json::from_value(args);
                         match input {
-                            Ok(list_input) => match queries::list_memories(&conn, &list_input) {
+                            Ok(list_input) => match queries::list_memories(&store, &list_input) {
                                 Ok(page) => {
                                     // Same as search above: the field was
                                     // parsed with the reference's Markdown
@@ -1493,14 +1836,22 @@ impl McpServer {
                         }
                     }
                     "remind_me_update" => {
-                        let input: Result<MemoryUpdateInput, _> = serde_json::from_value(args);
+                        let input = serde_json::from_value::<MemoryUpdateInput>(args.clone())
+                            .and_then(|i| {
+                                serde_json::from_value::<StructuredFields>(args).map(|f| (i, f))
+                            });
                         match input {
-                            Ok(update_input) => {
-                                match queries::update_memory(&conn, &update_input) {
+                            Ok((update_input, fields)) => {
+                                match queries::update_memory_with(&store, &update_input, &fields) {
                                     Ok(UpdateOutcome::Updated(mem)) => {
+                                        let check = contradictions::check_on_update(
+                                            &store,
+                                            &update_input,
+                                            &fields,
+                                        );
                                         json!({ "content": [{ "type": "text", "text": match format {
-    ResponseFormat::Json => serde_json::to_string_pretty(&mem).unwrap(),
-    ResponseFormat::Markdown => render::memory_updated(&mem),
+    ResponseFormat::Json => serde_json::to_string_pretty(&SavedMemory { memory: &mem, check }).unwrap(),
+    ResponseFormat::Markdown => render::memory_updated(&mem) + &render::save_check(&check),
 } }] })
                                     }
                                     Ok(UpdateOutcome::NotFound) => {
@@ -1510,7 +1861,7 @@ impl McpServer {
                                         json!({ "isError": true, "content": [{ "type": "text", "text": "Nothing to update — no fields provided" }] })
                                     }
                                     Err(e) => {
-                                        json!({ "isError": true, "content": [{ "type": "text", "text": format!("Update error: {}", e) }] })
+                                        json!({ "isError": true, "content": [{ "type": "text", "text": store_error_text("Update error", &e) }] })
                                     }
                                 }
                             }
@@ -1522,7 +1873,7 @@ impl McpServer {
                     "remind_me_delete" => {
                         let memory_id =
                             args.get("memory_id").and_then(|v| v.as_str()).unwrap_or("");
-                        match queries::delete_memory(&conn, memory_id) {
+                        match queries::delete_memory(&store, memory_id) {
                             Ok(true) => {
                                 json!({ "content": [{ "type": "text", "text": format!("Memory `{}` deleted", memory_id) }] })
                             }
@@ -1535,10 +1886,16 @@ impl McpServer {
                         }
                     }
                     "remind_me_search" => {
+                        // The tool defaults to compact; the library keeps full
+                        // so its other callers are unchanged (card #51).
+                        let mut args = args;
+                        if let Some(object) = args.as_object_mut() {
+                            object.entry("detail").or_insert(json!("compact"));
+                        }
                         let input: Result<MemorySearchInput, _> = serde_json::from_value(args);
                         match input {
                             Ok(search_input) => {
-                                match queries::search_with_expansions(&conn, &search_input) {
+                                match queries::search_with_expansions(&store, &search_input) {
                                     Ok(res) => {
                                         // `MemorySearchInput` already carries
                                         // `response_format`, already defaulting
@@ -1547,12 +1904,29 @@ impl McpServer {
                                         // The value was parsed and then thrown
                                         // away here, so a markdown request got
                                         // a successful JSON response (#224).
-                                        let text = match search_input.response_format {
-                                            ResponseFormat::Json => {
-                                                serde_json::to_string_pretty(&res).unwrap()
+                                        let detail = search_input.detail;
+                                        let text = match (search_input.response_format, detail) {
+                                            (ResponseFormat::Json, SearchDetail::Compact) => {
+                                                serde_json::to_string_pretty(
+                                                    &render::compact_search_json(&res),
+                                                )
+                                                .unwrap()
                                             }
-                                            ResponseFormat::Markdown => {
-                                                render::search_response(&res)
+                                            (ResponseFormat::Json, SearchDetail::Full) => {
+                                                serde_json::to_string_pretty(
+                                                    &references::search_json(&store, &res)
+                                                        .unwrap_or_else(|_| json!(res)),
+                                                )
+                                                .unwrap()
+                                            }
+                                            (ResponseFormat::Markdown, SearchDetail::Compact) => {
+                                                render::search_response(&res, detail)
+                                            }
+                                            (ResponseFormat::Markdown, SearchDetail::Full) => {
+                                                render::search_response(&res, detail)
+                                                    + &references::search_markdown_footer(
+                                                        &store, &res,
+                                                    )
                                             }
                                         };
                                         json!({ "content": [{ "type": "text", "text": text }] })
@@ -1571,6 +1945,20 @@ impl McpServer {
                     // `found: false` rather than creating the entity -- see
                     // `EntityLookupInput`'s docs for why that distinction is
                     // load-bearing rather than cosmetic.
+                    // One tool, one entry point: `project_tool::call` is
+                    // what `/api/projects` calls too, so a model and the
+                    // dashboard cannot be told different things.
+                    "remind_me_project" => {
+                        match remind_me_core::project_tool::call(&store, &args) {
+                            Ok(payload) => {
+                                json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&payload).unwrap() }] })
+                            }
+                            Err(e) => {
+                                json!({ "isError": true, "content": [{ "type": "text", "text": store_error_text("Project error", &e) }] })
+                            }
+                        }
+                    }
+                    "remind_me_brief" => brief_tool(&store, args),
                     "remind_me_entity" => {
                         let input: Result<EntityLookupInput, _> = serde_json::from_value(args);
                         match input {
@@ -1578,7 +1966,7 @@ impl McpServer {
                                 let limit = lookup
                                     .limit
                                     .clamp(ENTITY_LOOKUP_LIMIT_MIN, ENTITY_LOOKUP_LIMIT_MAX);
-                                match entity::entity_profile(&conn, &lookup.name, limit) {
+                                match entity::entity_profile(&store, &lookup.name, limit) {
                                     Ok(Some(profile)) => {
                                         // `found` alongside the profile's own
                                         // fields, not wrapping them -- the
@@ -1621,7 +2009,7 @@ impl McpServer {
                     "remind_me_entity_upsert" => {
                         let input: Result<EntityInput, _> = serde_json::from_value(args);
                         match input {
-                            Ok(ent_input) => match entity::upsert_entity(&conn, &ent_input) {
+                            Ok(ent_input) => match entity::upsert_entity(&store, &ent_input) {
                                 Ok(ent) => {
                                     json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&ent).unwrap() }] })
                                 }
@@ -1637,7 +2025,7 @@ impl McpServer {
                     "remind_me_extract_batch" => {
                         let input: ExtractBatchInput = serde_json::from_value(args)
                             .unwrap_or(ExtractBatchInput { batch_size: 20 });
-                        match queries::unannotated_batch(&conn, &input) {
+                        match queries::unannotated_batch(&store, &input) {
                             Ok(batch) => {
                                 json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&batch).unwrap() }] })
                             }
@@ -1649,14 +2037,16 @@ impl McpServer {
                     "remind_me_import_chat" => {
                         let input: Result<ChatImportInput, _> = serde_json::from_value(args);
                         match input {
-                            Ok(import_input) => match importer::import_chat(&conn, &import_input) {
-                                Ok(outcome) => {
-                                    json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&outcome).unwrap() }] })
+                            Ok(import_input) => {
+                                match importer::import_chat(&store, &import_input) {
+                                    Ok(outcome) => {
+                                        json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&outcome).unwrap() }] })
+                                    }
+                                    Err(e) => {
+                                        json!({ "isError": true, "content": [{ "type": "text", "text": format!("Import error: {}", e) }] })
+                                    }
                                 }
-                                Err(e) => {
-                                    json!({ "isError": true, "content": [{ "type": "text", "text": format!("Import error: {}", e) }] })
-                                }
-                            },
+                            }
                             Err(e) => {
                                 json!({ "isError": true, "content": [{ "type": "text", "text": format!("Invalid import input: {}", e) }] })
                             }
@@ -1666,7 +2056,7 @@ impl McpServer {
                         let input: Result<BulkImportDirInput, _> = serde_json::from_value(args);
                         match input {
                             Ok(import_input) => {
-                                match importer::import_directory(&conn, &import_input) {
+                                match importer::import_directory(&store, &import_input) {
                                     Ok(result) => {
                                         json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap() }] })
                                     }
@@ -1697,7 +2087,7 @@ impl McpServer {
                         // not of the folder scan, and the watcher has no
                         // connection to ask.
                         report.pending_wiki_compile =
-                            remind_me_core::wiki_fs::pending_compile_count(&conn).unwrap_or(0);
+                            remind_me_core::wiki_fs::pending_compile_count(&store).unwrap_or(0);
                         json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&report).unwrap() }] })
                     }
                     "remind_me_check_update" => {
@@ -1755,7 +2145,7 @@ impl McpServer {
                         };
                         json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&body).unwrap() }] })
                     }
-                    "remind_me_reindex" => match vectors::reindex(&conn) {
+                    "remind_me_reindex" => match vectors::reindex(&store) {
                         Ok(result) => {
                             json!({ "content": [{ "type": "text", "text": match format {
     ResponseFormat::Json => serde_json::to_string_pretty(&result).unwrap(),
@@ -1769,7 +2159,7 @@ impl McpServer {
                     "remind_me_import_dbs" => {
                         let input: Result<DbsImportInput, _> = serde_json::from_value(args);
                         match input {
-                            Ok(import_input) => match dbs_import::pull_dbs(&conn, &import_input) {
+                            Ok(import_input) => match dbs_import::pull_dbs(&store, &import_input) {
                                 Ok(result) => {
                                     json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap() }] })
                                 }
@@ -1786,7 +2176,7 @@ impl McpServer {
                         let input: Result<MempalaceImportInput, _> = serde_json::from_value(args);
                         match input {
                             Ok(import_input) => {
-                                match mempalace_import::pull_mempalace(&conn, &import_input) {
+                                match mempalace_import::pull_mempalace(&store, &import_input) {
                                     Ok(result) => {
                                         json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap() }] })
                                     }
@@ -1811,7 +2201,7 @@ impl McpServer {
                         });
                         json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&body).unwrap() }] })
                     }
-                    "remind_me_server_status" => match status::server_status(&conn) {
+                    "remind_me_server_status" => match status::server_status(&store) {
                         Ok(report) => {
                             // The webhook's/sync peer's state lives on these
                             // structs, not on the connection, so they are
@@ -1830,7 +2220,7 @@ impl McpServer {
                             report["sync_peer"] =
                                 serde_json::to_value(self.sync_peer.status()).unwrap_or(json!({}));
                             report["sync"] = serde_json::to_value(
-                                remind_me_core::sync::sync_live_status(&conn).unwrap_or_else(
+                                remind_me_core::sync::sync_live_status(&store).unwrap_or_else(
                                     remind_me_core::sync::sync_worker_disabled_status,
                                 ),
                             )
@@ -1865,7 +2255,7 @@ impl McpServer {
                             // database has nowhere to put one, which is not
                             // an error: it just means there is no dashboard
                             // to find.
-                            report["dashboard"] = match remind_me_core::pid::pid_file_path(&conn)
+                            report["dashboard"] = match remind_me_core::pid::pid_file_path(&store)
                             {
                                 Ok(path) => serde_json::to_value(
                                     remind_me_core::pid::dashboard_status(&path),
@@ -1876,6 +2266,12 @@ impl McpServer {
                                 })
                                 .unwrap_or(json!({})),
                             };
+                            report["tool_profile"] = json!({
+                                "profile": profile,
+                                "groups": remind_me_core::tool_profiles::allowed_groups(&profile)
+                                    .map(|g| g.into_iter().collect::<Vec<_>>()),
+                                "env": remind_me_core::tool_profiles::TOOL_PROFILE_ENV,
+                            });
                             {
                                 let text = match format {
                                     ResponseFormat::Json => {
@@ -1892,7 +2288,7 @@ impl McpServer {
                     },
                     "remind_me_export_memories" => {
                         let input: ExportInput = serde_json::from_value(args).unwrap_or_default();
-                        match export::export_memories(&conn, &input) {
+                        match export::export_memories(&store, &input) {
                             Ok(result) => {
                                 json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap() }] })
                             }
@@ -1909,8 +2305,12 @@ impl McpServer {
                                     || decompose_input.facts.len() > DECOMPOSE_FACTS_MAX
                                 {
                                     json!({ "isError": true, "content": [{ "type": "text", "text": format!("facts must hold {}..={} entries", DECOMPOSE_FACTS_MIN, DECOMPOSE_FACTS_MAX) }] })
+                                } else if let Err(e) =
+                                    remind_me_core::resolve::validate_facts(&decompose_input.facts)
+                                {
+                                    json!({ "isError": true, "content": [{ "type": "text", "text": store_error_text("Decompose error", &e) }] })
                                 } else {
-                                    match capture::decompose(&conn, &decompose_input) {
+                                    match capture::decompose(&store, &decompose_input) {
                                         Ok(Some(result)) => {
                                             json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap() }] })
                                         }
@@ -1918,7 +2318,7 @@ impl McpServer {
                                             json!({ "isError": true, "content": [{ "type": "text", "text": format!("No memory found with capture_id {:?}.", decompose_input.capture_id) }] })
                                         }
                                         Err(e) => {
-                                            json!({ "isError": true, "content": [{ "type": "text", "text": format!("Decompose error: {}", e) }] })
+                                            json!({ "isError": true, "content": [{ "type": "text", "text": store_error_text("Decompose error", &e) }] })
                                         }
                                     }
                                 }
@@ -1929,22 +2329,28 @@ impl McpServer {
                         }
                     }
                     "remind_me_decompose_batch" => {
-                        let input: DecomposeBatchInput = serde_json::from_value(args)
-                            .unwrap_or(DecomposeBatchInput { batch_size: 20 });
-                        match capture::undecomposed_batch(&conn, &input) {
-                            Ok(batch) => {
-                                json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&batch).unwrap() }] })
-                            }
+                        // Omitted fields take their defaults; a supplied one
+                        // that does not parse is refused, never replaced by a
+                        // default that would drop the settle guard.
+                        match serde_json::from_value::<DecomposeBatchInput>(args) {
                             Err(e) => {
-                                json!({ "isError": true, "content": [{ "type": "text", "text": format!("Decompose batch error: {}", e) }] })
+                                json!({ "isError": true, "content": [{ "type": "text", "text": format!("Invalid input: {e}") }] })
                             }
+                            Ok(input) => match capture::undecomposed_batch(&store, &input) {
+                                Ok(batch) => {
+                                    json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&batch).unwrap() }] })
+                                }
+                                Err(e) => {
+                                    json!({ "isError": true, "content": [{ "type": "text", "text": format!("Decompose batch error: {}", e) }] })
+                                }
+                            },
                         }
                     }
                     "remind_me_auto_capture" => {
                         let input: Result<AutoCaptureInput, _> = serde_json::from_value(args);
                         match input {
                             Ok(capture_input) => {
-                                match capture::auto_capture(&conn, &capture_input) {
+                                match capture::auto_capture(&store, &capture_input) {
                                     Ok(result) => {
                                         json!({ "content": [{ "type": "text", "text": match format {
     ResponseFormat::Json => serde_json::to_string_pretty(&result).unwrap(),
@@ -1961,12 +2367,22 @@ impl McpServer {
                             }
                         }
                     }
+                    "remind_me_capture_transcript" => {
+                        match capture_transcript_tool(&store, &args) {
+                            Ok(outcome) => {
+                                json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&outcome).unwrap() }] })
+                            }
+                            Err(e) => {
+                                json!({ "isError": true, "content": [{ "type": "text", "text": format!("Capture transcript error: {}", e) }] })
+                            }
+                        }
+                    }
                     "remind_me_get_capture" => {
                         let capture_id = args
                             .get("capture_id")
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
-                        match capture::get_capture(&conn, capture_id) {
+                        match capture::get_capture(&store, capture_id) {
                             Ok(Some(found)) => {
                                 json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&found).unwrap() }] })
                             }
@@ -1986,7 +2402,7 @@ impl McpServer {
                             .get("dry_run")
                             .and_then(|v| v.as_bool())
                             .unwrap_or(true);
-                        match remind_me_core::archive::prune(&conn, dry_run) {
+                        match remind_me_core::archive::prune(&store, dry_run) {
                             Ok(report) => {
                                 json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&report).unwrap() }] })
                             }
@@ -2008,14 +2424,14 @@ impl McpServer {
                         match rung {
                             Ok(rung) => {
                                 match remind_me_core::promotion::promotion_candidates(
-                                    &conn, rung, limit,
+                                    &store, rung, limit,
                                 ) {
                                     Ok(found) => {
                                         // The whole backlog rides along, not
                                         // just this rung's: a caller working
                                         // one rung has no other way to notice
                                         // the one below it filling up.
-                                        let backlog = remind_me_core::promotion::backlog(&conn)
+                                        let backlog = remind_me_core::promotion::backlog(&store)
                                             .unwrap_or_default();
                                         // Uncapped, unlike `backlog` above (which probes
                                         // only up to BACKLOG_PROBE per rung so it stays
@@ -2024,7 +2440,7 @@ impl McpServer {
                                         // ceiling instead of reading as stuck (#283).
                                         let total_candidates =
                                             remind_me_core::promotion::count_candidates(
-                                                &conn, rung,
+                                                &store, rung,
                                             )
                                             .unwrap_or_default();
                                         json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&json!({
@@ -2058,7 +2474,7 @@ impl McpServer {
                         let parsed: std::result::Result<remind_me_core::PromoteInput, _> =
                             serde_json::from_value(args.clone());
                         match parsed {
-                            Ok(input) => match remind_me_core::promotion::promote(&conn, &input) {
+                            Ok(input) => match remind_me_core::promotion::promote(&store, &input) {
                                 Ok(result) => {
                                     json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap() }] })
                                 }
@@ -2077,7 +2493,7 @@ impl McpServer {
                             .and_then(|v| v.as_u64())
                             .unwrap_or(STALE_CANDIDATES_LIMIT_DEFAULT as u64)
                             as usize;
-                        match remind_me_core::code_refs::stale_candidates(&conn, limit) {
+                        match remind_me_core::code_refs::stale_candidates(&store, limit) {
                             Ok(found) => {
                                 json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&json!({
                                     "count": found.candidates.len(),
@@ -2095,10 +2511,10 @@ impl McpServer {
                             .get("include_demoted")
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
-                        match remind_me_core::promotion::persona(&conn) {
+                        match remind_me_core::promotion::persona(&store) {
                             Ok(statements) => {
                                 let demoted = if include_demoted {
-                                    remind_me_core::promotion::demoted(&conn).unwrap_or_default()
+                                    remind_me_core::promotion::demoted(&store).unwrap_or_default()
                                 } else {
                                     Vec::new()
                                 };
@@ -2119,7 +2535,7 @@ impl McpServer {
                     "remind_me_provenance" => {
                         let memory_id =
                             args.get("memory_id").and_then(|v| v.as_str()).unwrap_or("");
-                        match remind_me_core::promotion::provenance(&conn, memory_id) {
+                        match remind_me_core::promotion::provenance(&store, memory_id) {
                             Ok(found) => {
                                 json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&found).unwrap() }] })
                             }
@@ -2128,12 +2544,40 @@ impl McpServer {
                             }
                         }
                     }
+                    "remind_me_references" => match references::run(&store, &args) {
+                        Ok(found) => {
+                            json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&found).unwrap() }] })
+                        }
+                        Err(e) => {
+                            json!({ "isError": true, "content": [{ "type": "text", "text": format!("References error: {}", e) }] })
+                        }
+                    },
+                    "remind_me_session_timeline" => {
+                        let text_arg = |key: &str| args.get(key).and_then(|v| v.as_str());
+                        let limit = args
+                            .get("limit")
+                            .and_then(|v| v.as_u64())
+                            .map(|n| n as usize)
+                            .unwrap_or(remind_me_core::session_ops::DEFAULT_TIMELINE_LIMIT);
+                        match remind_me_core::session_ops::timeline_text(
+                            &store,
+                            text_arg("session_id"),
+                            text_arg("project"),
+                            limit,
+                            matches!(format, ResponseFormat::Markdown),
+                        ) {
+                            Ok(text) => json!({ "content": [{ "type": "text", "text": text }] }),
+                            Err(e) => {
+                                json!({ "isError": true, "content": [{ "type": "text", "text": format!("Session timeline error: {}", e) }] })
+                            }
+                        }
+                    }
                     "remind_me_skeleton_write" => {
                         let parsed: std::result::Result<remind_me_core::SkeletonWriteInput, _> =
                             serde_json::from_value(args.clone());
                         match parsed {
                             Ok(input) => {
-                                match remind_me_core::skeleton::write_skeleton(&conn, &input) {
+                                match remind_me_core::skeleton::write_skeleton(&store, &input) {
                                     Ok(written) => {
                                         json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&written).unwrap() }] })
                                     }
@@ -2162,7 +2606,7 @@ impl McpServer {
                             .filter(|n| !n.trim().is_empty());
                         match node {
                             Some(node) => {
-                                match remind_me_core::skeleton::node_slice(&conn, capture_id, node)
+                                match remind_me_core::skeleton::node_slice(&store, capture_id, node)
                                 {
                                     Ok(Some(slice)) => {
                                         json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&slice).unwrap() }] })
@@ -2176,7 +2620,7 @@ impl McpServer {
                                 }
                             }
                             None => {
-                                match remind_me_core::skeleton::read_skeleton(&conn, capture_id) {
+                                match remind_me_core::skeleton::read_skeleton(&store, capture_id) {
                                     Ok(Some(skeleton)) => {
                                         json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&skeleton).unwrap() }] })
                                     }
@@ -2198,7 +2642,7 @@ impl McpServer {
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
                         match remind_me_core::archive::source_for(
-                            &conn,
+                            &store,
                             memory_id,
                             include_sensitive,
                         ) {
@@ -2225,7 +2669,7 @@ impl McpServer {
                     "remind_me_normalize_batch" => {
                         let input: NormalizeBatchInput = serde_json::from_value(args)
                             .unwrap_or(NormalizeBatchInput { batch_size: 20 });
-                        match normalize::unnormalized_batch(&conn, &input) {
+                        match normalize::unnormalized_batch(&store, &input) {
                             Ok(batch) => {
                                 json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&batch).unwrap() }] })
                             }
@@ -2235,7 +2679,7 @@ impl McpServer {
                         }
                     }
                     "remind_me_sync_reconcile" => {
-                        match remind_me_core::sync::reconcile_hub(&conn) {
+                        match remind_me_core::sync::reconcile_hub(&store) {
                             Ok(report) => {
                                 json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&report).unwrap() }] })
                             }
@@ -2247,7 +2691,7 @@ impl McpServer {
                     "remind_me_sync_reconcile_peer" => {
                         match serde_json::from_value::<ReconcilePeerInput>(args) {
                             Ok(input) => {
-                                match remind_me_core::sync::reconcile_peer(&conn, &input.node_id) {
+                                match remind_me_core::sync::reconcile_peer(&store, &input.node_id) {
                                     Ok(report) => {
                                         json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&report).unwrap() }] })
                                     }
@@ -2324,7 +2768,7 @@ impl McpServer {
                         // back a URL that silently never resolves.
                         let token = remind_me_core::ics::resolve_ics_token();
                         let feed_path = remind_me_core::ics::feed_path(&token);
-                        let status = remind_me_core::pid::pid_file_path(&conn)
+                        let status = remind_me_core::pid::pid_file_path(&store)
                             .ok()
                             .map(|path| remind_me_core::pid::dashboard_status(&path));
                         let text = match status.filter(|s| s.running).and_then(|s| s.url) {
@@ -2341,7 +2785,7 @@ impl McpServer {
                     "remind_me_set_reminder" => {
                         match serde_json::from_value::<SetReminderInput>(args) {
                             Ok(input) => match remind_me_core::reminders::set_reminder(
-                                &conn,
+                                &store,
                                 &input.memory_id,
                                 input.remind_at.as_deref(),
                             ) {
@@ -2364,7 +2808,7 @@ impl McpServer {
                         let input: ListRemindersInput =
                             serde_json::from_value(args).unwrap_or_default();
                         let limit = input.limit.clamp(REMINDER_LIMIT_MIN, REMINDER_LIMIT_MAX);
-                        match remind_me_core::reminders::list_reminders(&conn, input.when, limit) {
+                        match remind_me_core::reminders::list_reminders(&store, input.when, limit) {
                             Ok(memories) => {
                                 let text = match input.response_format {
                                     ResponseFormat::Json => json!({
@@ -2385,7 +2829,7 @@ impl McpServer {
                             }
                         }
                     }
-                    "remind_me_sync_status" => match remind_me_core::sync::sync_status(&conn) {
+                    "remind_me_sync_status" => match remind_me_core::sync::sync_status(&store) {
                         Ok(status) => {
                             json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&status).unwrap() }] })
                         }
@@ -2398,7 +2842,7 @@ impl McpServer {
                             serde_json::from_value(args).unwrap_or(SyncRepairInput {
                                 remote_id: "hub".to_string(),
                             });
-                        match remind_me_core::sync::sync_repair(&conn, &input.remote_id) {
+                        match remind_me_core::sync::sync_repair(&store, &input.remote_id) {
                             Ok(true) => {
                                 json!({ "content": [{ "type": "text", "text": format!("Reset pull cursors for '{}'. The next sync will re-pull its history.", input.remote_id) }] })
                             }
@@ -2423,7 +2867,7 @@ impl McpServer {
                         input.since_days = input
                             .since_days
                             .clamp(digest::DIGEST_SINCE_DAYS_MIN, digest::DIGEST_SINCE_DAYS_MAX);
-                        match digest::build_digest(&conn, input.since_days) {
+                        match digest::build_digest(&store, input.since_days) {
                             Ok(data) => {
                                 let text = match input.response_format {
                                     ResponseFormat::Json => {
@@ -2457,7 +2901,7 @@ impl McpServer {
                                 json!({ "isError": true, "content": [{ "type": "text", "text": message }] })
                             }
                             Ok(cursor) => {
-                                match contradictions::candidates(&conn, input.limit, cursor) {
+                                match contradictions::candidates(&store, input.limit, cursor) {
                                     Ok(result) => {
                                         json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap() }] })
                                     }
@@ -2471,10 +2915,10 @@ impl McpServer {
                     "remind_me_history" => match serde_json::from_value::<HistoryInput>(args) {
                         Ok(mut input) => {
                             input.limit = input.limit.clamp(HISTORY_LIMIT_MIN, HISTORY_LIMIT_MAX);
-                            if !history::memory_is_live(&conn, &input.memory_id).unwrap_or(false) {
+                            if !history::memory_is_live(&store, &input.memory_id).unwrap_or(false) {
                                 json!({ "content": [{ "type": "text", "text": format!("Memory '{}' not found.", input.memory_id) }] })
                             } else {
-                                match history::history(&conn, &input.memory_id, input.limit) {
+                                match history::history(&store, &input.memory_id, input.limit) {
                                     Ok(revisions) => {
                                         let text = match input.response_format {
                                             // The reference's JSON branch is an
@@ -2511,7 +2955,7 @@ impl McpServer {
                     },
                     "remind_me_revert" => match serde_json::from_value::<RevertInput>(args) {
                         Ok(input) => match history::revert(
-                            &conn,
+                            &store,
                             &input.memory_id,
                             input.revision_id,
                             input.reason.as_deref(),
@@ -2532,7 +2976,7 @@ impl McpServer {
                     },
                     "remind_me_save_search" => {
                         match serde_json::from_value::<SaveSearchInput>(args) {
-                            Ok(input) => match saved_searches::save_search(&conn, &input) {
+                            Ok(input) => match saved_searches::save_search(&store, &input) {
                                 Ok(saved) => {
                                     json!({ "content": [{ "type": "text", "text": match format {
     ResponseFormat::Json => serde_json::to_string_pretty(&saved).unwrap(),
@@ -2549,7 +2993,7 @@ impl McpServer {
                         }
                     }
                     "remind_me_list_saved_searches" => {
-                        match saved_searches::list_saved_searches(&conn) {
+                        match saved_searches::list_saved_searches(&store) {
                             Ok(searches) => {
                                 json!({ "content": [{ "type": "text", "text": match format {
     ResponseFormat::Json => serde_json::to_string_pretty(&searches).unwrap(),
@@ -2563,28 +3007,29 @@ impl McpServer {
                     }
                     "remind_me_run_saved_search" => {
                         match serde_json::from_value::<SavedSearchNameInput>(args) {
-                            Ok(input) => match saved_searches::get_saved_search(&conn, &input.name)
-                            {
-                                Ok(Some(saved)) => {
-                                    match saved_searches::run_saved_search(&conn, &saved) {
-                                        Ok(results) => {
-                                            json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&results).unwrap() }] })
-                                        }
-                                        Err(e) => {
-                                            json!({ "isError": true, "content": [{ "type": "text", "text": format!("Run saved search error: {}", e) }] })
+                            Ok(input) => {
+                                match saved_searches::get_saved_search(&store, &input.name) {
+                                    Ok(Some(saved)) => {
+                                        match saved_searches::run_saved_search(&store, &saved) {
+                                            Ok(results) => {
+                                                json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&results).unwrap() }] })
+                                            }
+                                            Err(e) => {
+                                                json!({ "isError": true, "content": [{ "type": "text", "text": format!("Run saved search error: {}", e) }] })
+                                            }
                                         }
                                     }
+                                    // A missing name is a caller mistake with an
+                                    // obvious remedy, not a server error — same
+                                    // posture the reference takes.
+                                    Ok(None) => {
+                                        json!({ "content": [{ "type": "text", "text": format!("Saved search '{}' not found.", input.name) }] })
+                                    }
+                                    Err(e) => {
+                                        json!({ "isError": true, "content": [{ "type": "text", "text": format!("Run saved search error: {}", e) }] })
+                                    }
                                 }
-                                // A missing name is a caller mistake with an
-                                // obvious remedy, not a server error — same
-                                // posture the reference takes.
-                                Ok(None) => {
-                                    json!({ "content": [{ "type": "text", "text": format!("Saved search '{}' not found.", input.name) }] })
-                                }
-                                Err(e) => {
-                                    json!({ "isError": true, "content": [{ "type": "text", "text": format!("Run saved search error: {}", e) }] })
-                                }
-                            },
+                            }
                             Err(e) => {
                                 json!({ "isError": true, "content": [{ "type": "text", "text": format!("Invalid run_saved_search input: {}", e) }] })
                             }
@@ -2593,7 +3038,7 @@ impl McpServer {
                     "remind_me_delete_saved_search" => {
                         match serde_json::from_value::<SavedSearchNameInput>(args) {
                             Ok(input) => {
-                                match saved_searches::delete_saved_search(&conn, &input.name) {
+                                match saved_searches::delete_saved_search(&store, &input.name) {
                                     Ok(true) => {
                                         json!({ "content": [{ "type": "text", "text": format!("Saved search '{}' deleted.", input.name) }] })
                                     }
@@ -2620,7 +3065,7 @@ impl McpServer {
                                 input.limit = input
                                     .limit
                                     .clamp(UNDO_IMPORT_LIMIT_MIN, UNDO_IMPORT_LIMIT_MAX);
-                                match undo_import::undo_import(&conn, &input) {
+                                match undo_import::undo_import(&store, &input) {
                                     Ok(result) => {
                                         json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap() }] })
                                     }
@@ -2645,7 +3090,7 @@ impl McpServer {
                         input.limit = input
                             .limit
                             .clamp(RECALIBRATE_LIMIT_MIN, RECALIBRATE_LIMIT_MAX);
-                        match recalibrate::candidates(&conn, &input) {
+                        match recalibrate::candidates(&store, &input) {
                             Ok(batch) => {
                                 json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&batch).unwrap() }] })
                             }
@@ -2663,7 +3108,7 @@ impl McpServer {
                                 {
                                     json!({ "isError": true, "content": [{ "type": "text", "text": format!("normalizations must hold {}..={} entries", NORMALIZE_APPLY_MIN, NORMALIZE_APPLY_MAX) }] })
                                 } else {
-                                    match normalize::apply_normalizations(&conn, &apply_input) {
+                                    match normalize::apply_normalizations(&store, &apply_input) {
                                         Ok(result) => {
                                             json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap() }] })
                                         }
@@ -2682,7 +3127,7 @@ impl McpServer {
                         let input: Result<EntityTraverseInput, _> = serde_json::from_value(args);
                         match input {
                             Ok(traverse_input) => {
-                                match entity::traverse_from_name(&conn, &traverse_input) {
+                                match entity::traverse_from_name(&store, &traverse_input) {
                                     Ok(result) => {
                                         json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap() }] })
                                     }
@@ -2707,7 +3152,7 @@ impl McpServer {
                         // `slug` argument is still tolerated as the title when
                         // none is given, so an older caller is not broken.
                         let title = if title.is_empty() { slug } else { title };
-                        match self.wiki.write_page(&conn, title, content, log_note) {
+                        match self.wiki.write_page(&store, title, content, log_note) {
                             Ok(Ok(outcome)) => {
                                 json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&outcome).unwrap() }] })
                             }
@@ -2721,7 +3166,7 @@ impl McpServer {
                     }
                     "remind_me_wiki_read" => {
                         let slug = args.get("slug").and_then(|v| v.as_str()).unwrap_or("");
-                        match self.wiki.read_page(&conn, slug) {
+                        match self.wiki.read_page(&store, slug) {
                             Ok(Some(page)) => {
                                 json!({ "content": [{ "type": "text", "text": match format {
     ResponseFormat::Json => serde_json::to_string_pretty(&page).unwrap(),
@@ -2743,7 +3188,7 @@ impl McpServer {
                             .and_then(|v| v.as_bool())
                             .unwrap_or(true);
                         match wiki_import::import_wiki_dir(
-                            &conn,
+                            &store,
                             std::path::Path::new(dir),
                             recursive,
                         ) {
@@ -2779,8 +3224,13 @@ impl McpServer {
                                 let count = rc.classifications.len();
                                 if !(RECLASSIFY_BATCH_MIN..=RECLASSIFY_BATCH_MAX).contains(&count) {
                                     json!({ "isError": true, "content": [{ "type": "text", "text": format!("`classifications` must hold {}..={} items, got {}", RECLASSIFY_BATCH_MIN, RECLASSIFY_BATCH_MAX, count) }] })
+                                } else if let Err(e) = remind_me_core::resolve::validate_reclassify(
+                                    &store,
+                                    &rc.classifications,
+                                ) {
+                                    json!({ "isError": true, "content": [{ "type": "text", "text": store_error_text("Reclassify error", &e) }] })
                                 } else {
-                                    match queries::reclassify_memories(&conn, &rc) {
+                                    match queries::reclassify_memories(&store, &rc) {
                                         Ok(outcome) => {
                                             json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&outcome).unwrap() }] })
                                         }
@@ -2798,7 +3248,7 @@ impl McpServer {
                     "remind_me_reclassify_batch" => {
                         let input: Result<ReclassifyBatchInput, _> = serde_json::from_value(args);
                         match input {
-                            Ok(batch) => match queries::unclassified_batch(&conn, &batch) {
+                            Ok(batch) => match queries::unclassified_batch(&store, &batch) {
                                 Ok(result) => {
                                     json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap() }] })
                                 }
@@ -2815,7 +3265,7 @@ impl McpServer {
                         let input: Result<FeedbackInput, _> = serde_json::from_value(args);
                         match input {
                             Ok(fb) => match vitality::record_feedback(
-                                &conn,
+                                &store,
                                 &fb.memory_id,
                                 fb.signal,
                                 fb.query.as_deref(),
@@ -2840,7 +3290,7 @@ impl McpServer {
                             }
                         }
                     }
-                    "remind_me_backup" => match backup::create_backup(&conn, "manual") {
+                    "remind_me_backup" => match backup::create_backup(&store, "manual") {
                         Ok(outcome) => {
                             json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&outcome).unwrap() }] })
                         }
@@ -2856,7 +3306,7 @@ impl McpServer {
                                 if !(ANNOTATE_BATCH_MIN..=ANNOTATE_BATCH_MAX).contains(&count) {
                                     json!({ "isError": true, "content": [{ "type": "text", "text": format!("`annotations` must hold {}..={} items, got {}", ANNOTATE_BATCH_MIN, ANNOTATE_BATCH_MAX, count) }] })
                                 } else {
-                                    match queries::annotate_memories(&conn, &annotate_input) {
+                                    match queries::annotate_memories(&store, &annotate_input) {
                                         Ok(outcome) => {
                                             json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&outcome).unwrap() }] })
                                         }
@@ -2871,7 +3321,7 @@ impl McpServer {
                             }
                         }
                     }
-                    "remind_me_vitality_report" => match vitality::build_vitality_report(&conn) {
+                    "remind_me_vitality_report" => match vitality::build_vitality_report(&store) {
                         Ok(report) => {
                             // The one reference model that defaults to JSON
                             // (`VitalityReportInput`, models.py:1653), so the
@@ -2900,7 +3350,7 @@ impl McpServer {
                             .get("include_index")
                             .and_then(|v| v.as_bool())
                             .unwrap_or(true);
-                        match self.wiki.load(&conn, token_budget, include_index) {
+                        match self.wiki.load(&store, token_budget, include_index) {
                             Ok(loaded) if loaded.pages_included == 0 => {
                                 json!({ "content": [{ "type": "text", "text": "_The wiki is empty._ Synthesise pages from raw memories with `remind_me_wiki_compile`." }] })
                             }
@@ -2923,7 +3373,7 @@ impl McpServer {
                             .get("mark_integrated")
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
-                        match self.wiki.compile(&conn, limit, mark_integrated) {
+                        match self.wiki.compile(&store, limit, mark_integrated) {
                             Ok(outcome) => {
                                 json!({ "content": [{ "type": "text", "text": match format {
     ResponseFormat::Json => serde_json::to_string_pretty(&outcome).unwrap(),
@@ -2945,7 +3395,7 @@ impl McpServer {
                         if query.is_empty() {
                             json!({ "isError": true, "content": [{ "type": "text", "text": "`query` is required" }] })
                         } else {
-                            match self.wiki.search_pages(&conn, query, limit) {
+                            match self.wiki.search_pages(&store, query, limit) {
                                 Ok(hits) => {
                                     let body = json!({ "count": hits.len(), "results": hits });
                                     json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&body).unwrap() }] })
@@ -2956,7 +3406,7 @@ impl McpServer {
                             }
                         }
                     }
-                    "remind_me_wiki_list" => match self.wiki.list_pages(&conn) {
+                    "remind_me_wiki_list" => match self.wiki.list_pages(&store) {
                         Ok(pages) => {
                             // The reference's `WikiListInput` defaults to
                             // MARKDOWN (models.py:1547); this had no field at
@@ -2981,7 +3431,7 @@ impl McpServer {
                         if title.is_empty() {
                             json!({ "isError": true, "content": [{ "type": "text", "text": "`title` is required" }] })
                         } else {
-                            match self.wiki.delete_page(&conn, title) {
+                            match self.wiki.delete_page(&store, title) {
                                 Ok(WikiDeleteOutcome::Deleted) => {
                                     json!({ "content": [{ "type": "text", "text": format!("Wiki page '{}' deleted", title) }] })
                                 }
@@ -3003,7 +3453,7 @@ impl McpServer {
                         // malformed body still has one sensible reading.
                         let input: MemoryStatsInput =
                             serde_json::from_value(args).unwrap_or_default();
-                        match stats::collect(&conn) {
+                        match stats::collect(&store) {
                             Ok(s) => {
                                 let text = match input.response_format {
                                     ResponseFormat::Json => {
@@ -3021,16 +3471,51 @@ impl McpServer {
                     "remind_me_consolidate" => {
                         let input: Result<ConsolidateInput, _> = serde_json::from_value(args);
                         match input {
-                            Ok(consolidate_input) => match consolidate(&conn, &consolidate_input) {
-                                Ok(report) => {
-                                    json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&report).unwrap() }] })
+                            Ok(consolidate_input) => {
+                                match consolidate(&store, &consolidate_input) {
+                                    Ok(report) => {
+                                        json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&report).unwrap() }] })
+                                    }
+                                    Err(e) => {
+                                        json!({ "isError": true, "content": [{ "type": "text", "text": format!("Consolidate error: {}", e) }] })
+                                    }
                                 }
-                                Err(e) => {
-                                    json!({ "isError": true, "content": [{ "type": "text", "text": format!("Consolidate error: {}", e) }] })
-                                }
-                            },
+                            }
                             Err(e) => {
                                 json!({ "isError": true, "content": [{ "type": "text", "text": format!("Invalid consolidate input: {}", e) }] })
+                            }
+                        }
+                    }
+                    "remind_me_resolve" => {
+                        let memory_id = args.get("memory_id").and_then(Value::as_str).unwrap_or("");
+                        let outcome = args.get("outcome").and_then(Value::as_str);
+                        let review = args.get("review").and_then(Value::as_str);
+                        let note = args.get("note").and_then(Value::as_str);
+                        let resolved = match (outcome, review) {
+                            (Some(outcome), None) => remind_me_core::resolve::resolve_memory(
+                                &store, memory_id, outcome, note,
+                            )
+                            .map(|m| m.map(|m| (m, format!("resolved as {outcome}")))),
+                            (None, Some(review)) => remind_me_core::review::record_review(
+                                &store, memory_id, review, note,
+                            )
+                            .map(|m| m.map(|m| (m, format!("reviewed: {review}")))),
+                            _ => Err(remind_me_core::db::StoreError::Invalid(
+                                "pass exactly one of `outcome` and `review`".to_string(),
+                            )),
+                        };
+                        match resolved {
+                            Ok(Some((mem, done))) => {
+                                json!({ "content": [{ "type": "text", "text": match format {
+                                    ResponseFormat::Json => serde_json::to_string_pretty(&mem).unwrap(),
+                                    ResponseFormat::Markdown => format!("✓ Memory `{}` {}.", mem.id, done),
+                                } }] })
+                            }
+                            Ok(None) => {
+                                json!({ "isError": true, "content": [{ "type": "text", "text": format!("Memory `{}` not found", memory_id) }] })
+                            }
+                            Err(e) => {
+                                json!({ "isError": true, "content": [{ "type": "text", "text": store_error_text("Resolve error", &e) }] })
                             }
                         }
                     }
@@ -3088,23 +3573,42 @@ impl McpServer {
     }
 
     pub fn run_stdio_loop(&self) -> io::Result<()> {
-        let stdin = io::stdin();
-        let mut stdout = io::stdout();
-        let handle = stdin.lock();
-
-        for line in handle.lines() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            if let Some(resp) = dispatch_line_catching_panics(&line, |l| self.handle_request(l)) {
-                let resp_str = serde_json::to_string(&resp)?;
-                writeln!(stdout, "{}", resp_str)?;
-                stdout.flush()?;
-            }
-        }
-        Ok(())
+        run_stdio(self)
     }
+}
+
+/// Something that answers MCP JSON-RPC lines: this process's own
+/// [`McpServer`], or [`daemon_proxy::DaemonProxy`] relaying to the daemon's.
+pub trait Handler: Send + Sync {
+    /// Answer one request line, or `None` for a notification. Never panics:
+    /// a failure is a JSON-RPC error reply.
+    fn handle_line(&self, line: &str) -> Option<Value>;
+}
+
+impl Handler for McpServer {
+    fn handle_line(&self, line: &str) -> Option<Value> {
+        dispatch_line_catching_panics(line, |l| self.handle_request(l))
+    }
+}
+
+/// Serve MCP over stdin and stdout with `handler`.
+pub fn run_stdio(handler: &dyn Handler) -> io::Result<()> {
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+    let handle = stdin.lock();
+
+    for line in handle.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Some(resp) = handler.handle_line(&line) {
+            let resp_str = serde_json::to_string(&resp)?;
+            writeln!(stdout, "{}", resp_str)?;
+            stdout.flush()?;
+        }
+    }
+    Ok(())
 }
 
 /// Runs `handler` against one line of input, converting a panic inside it
@@ -3113,7 +3617,7 @@ impl McpServer {
 /// loop and take every other in-flight and future request down with it. A
 /// panic inside a single tool call (an unwrap on unexpected input, an
 /// out-of-bounds index) used to do exactly that, since `handle_request` ran
-/// on the loop's own unguarded call stack. `db.conn()`'s lock is a
+/// on the loop's own unguarded call stack. `db.store()`'s lock is a
 /// `parking_lot::Mutex`, which does not poison on an unwind through a held
 /// guard, so a caught panic mid-call leaves the database perfectly usable
 /// for the next request.
@@ -3166,7 +3670,82 @@ fn stamp_result_type(response: &mut Value) {
 /// its own parse of `id` never returned) so the client can still match this
 /// error to the call it made, the same as every other error reply in
 /// `handle_request` does.
+/// A tool error in the shape every client can act on (ADR-0028 §3):
+/// `{"error": {"code", "message", "fix"}}`, plus any `extra` fields.
+fn contract_error(code: &str, message: &str, fix: &str, extra: Value) -> Value {
+    let mut body = json!({ "error": { "code": code, "message": message, "fix": fix } });
+    if let (Some(body), Some(extra)) = (body.as_object_mut(), extra.as_object()) {
+        body.extend(extra.clone());
+    }
+    json!({ "isError": true, "content": [{ "type": "text", "text": body.to_string() }] })
+}
+
+/// `remind_me_brief`: validate at the boundary, build, render.
+fn brief_tool(store: &remind_me_core::db::Store<'_>, args: Value) -> Value {
+    let input: BriefInput = match serde_json::from_value(args) {
+        Ok(input) => input,
+        Err(e) => {
+            return contract_error(
+                "invalid_input",
+                &e.to_string(),
+                "send {\"project\": NAME} and optionally since, token_budget, response_format",
+                json!({}),
+            )
+        }
+    };
+    if let Err(e) = context_brief::check_token_budget(input.token_budget) {
+        return contract_error(
+            "invalid_input",
+            &e.to_string(),
+            "send a token_budget in range",
+            json!({}),
+        );
+    }
+    let request = context_brief::ContextRequest {
+        mode: context_brief::Mode::Project,
+        project: Some(&input.project),
+        since: input.since.as_deref(),
+        budget: input.token_budget,
+        ..Default::default()
+    };
+    match context_brief::build(store, &request) {
+        Ok(context_brief::Outcome::Brief(brief)) => {
+            let text = match input
+                .response_format
+                .unwrap_or_else(configured_default_format)
+            {
+                ResponseFormat::Json => serde_json::to_string(&brief).unwrap_or_default(),
+                ResponseFormat::Markdown => context_brief::render_markdown(&brief),
+            };
+            json!({ "content": [{ "type": "text", "text": text }] })
+        }
+        Ok(context_brief::Outcome::UnknownProject { name, suggestions }) => contract_error(
+            "unknown_project",
+            &context_brief::unknown_project_message(&name, &suggestions),
+            "send one of the suggestions as project, or find the name with remind_me_search",
+            json!({ "suggestions": suggestions }),
+        ),
+        Err(remind_me_core::db::StoreError::Invalid(message)) => contract_error(
+            "invalid_input",
+            &message,
+            "fix the field named in the message",
+            json!({}),
+        ),
+        Err(e) => contract_error(
+            "internal",
+            &e.to_string(),
+            "retry; report it if it persists",
+            json!({}),
+        ),
+    }
+}
+
 fn panicked_response(request_json: &str) -> Value {
+    error_response(request_json, "internal error: request handler panicked")
+}
+
+/// A JSON-RPC internal error answering `request_json`.
+fn error_response(request_json: &str, message: &str) -> Value {
     let req_id = serde_json::from_str::<Value>(request_json)
         .ok()
         .and_then(|v| v.get("id").cloned())
@@ -3176,7 +3755,7 @@ fn panicked_response(request_json: &str) -> Value {
         "id": req_id,
         "error": {
             "code": -32603,
-            "message": "internal error: request handler panicked"
+            "message": message
         }
     })
 }
@@ -3186,12 +3765,228 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    thread_local! {
+        /// Set by [`handler_view`]: `tools/list` returns every handler under
+        /// its own name, for the tests that check a handler's declared schema
+        /// rather than the public surface built from it.
+        pub(super) static HANDLER_VIEW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Switch this test's thread to the handler view until the guard drops.
+    fn handler_view() -> impl Drop {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                HANDLER_VIEW.with(|v| v.set(false));
+            }
+        }
+        HANDLER_VIEW.with(|v| v.set(true));
+        Reset
+    }
+
     /// Held by every test that reads or sets `REMIND_ME_EMBEDDING_BACKEND`
-    /// (a process-global env var): `remind_me_server_status`'s `embeddings`
-    /// override (`#90`) now reflects it, so a test asserting the unset
-    /// default must not race one that configures a backend. Same convention
-    /// as `remind_me_core`'s own `sync_test.rs`/`status_test.rs` `ENV_LOCK`.
+    /// (a process-global env var), **and by every test that calls
+    /// `remind_me_server_status`**: that tool's `embeddings` override
+    /// (`#90`) runs `embedder::embedding_status`, a live probe of whatever
+    /// backend the env names, through a process-global availability cache
+    /// whose lock is released during the network round trip. A status call
+    /// racing a test that has pointed the env at a one-shot fake daemon can
+    /// therefore consume that daemon's single connection, or record a
+    /// failed probe in the cache under the same fingerprint, and make the
+    /// other test's "active" assertion fail. Same convention as
+    /// `remind_me_core`'s own `sync_test.rs`/`status_test.rs` `ENV_LOCK`.
+    ///
+    /// The lock alone cannot isolate a test that *installs* a backend:
+    /// `remind_me_add` and `remind_me_search` reach the same probe and are
+    /// called by tests that have no reason to take it. The one test that
+    /// installs a live configuration therefore runs in a child process
+    /// instead (`run_in_child`), and the parent never sets those variables.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// A fake Ollama daemon for exactly one embedding probe: accepts one
+    /// connection, reads the whole request (head and `Content-Length`
+    /// body), answers with a two-dimensional embedding and closes. One
+    /// overall `deadline` bounds every step: the accept loop, each read
+    /// (its timeout is the time remaining) and the write. A probe that
+    /// never arrives or stalls fails with a reason instead of hanging the
+    /// thread; the caller's own deadline bounds the `join`.
+    fn fake_ollama_once(
+        listener: std::net::TcpListener,
+        deadline: std::time::Duration,
+    ) -> std::thread::JoinHandle<Result<(), String>> {
+        use std::io::{Read, Write};
+        use std::time::{Duration, Instant};
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let remaining = |what: &str| -> Result<Duration, String> {
+                deadline
+                    .checked_sub(started.elapsed())
+                    .filter(|d| !d.is_zero())
+                    .ok_or_else(|| format!("deadline {deadline:?} passed before {what}"))
+            };
+
+            listener
+                .set_nonblocking(true)
+                .map_err(|e| format!("set_nonblocking: {e}"))?;
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        remaining("a probe connected")?;
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(e) => return Err(format!("accept: {e}")),
+                }
+            };
+            stream
+                .set_nonblocking(false)
+                .map_err(|e| format!("set_blocking: {e}"))?;
+
+            // Read the head, then exactly the declared body, so the response
+            // never races the client's own write. Every read is bounded by
+            // the time left on the overall deadline.
+            let mut raw = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let mut read_some = |raw: &mut Vec<u8>, what: &str| -> Result<(), String> {
+                stream
+                    .set_read_timeout(Some(remaining(what)?))
+                    .map_err(|e| format!("set_read_timeout: {e}"))?;
+                let n = stream
+                    .read(&mut chunk)
+                    .map_err(|e| format!("reading {what}: {e}"))?;
+                if n == 0 {
+                    return Err(format!("client closed before {what} completed"));
+                }
+                raw.extend_from_slice(&chunk[..n]);
+                Ok(())
+            };
+            let head_end = loop {
+                if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+                read_some(&mut raw, "the request head")?;
+            };
+            let head = String::from_utf8_lossy(&raw[..head_end]).to_string();
+            let content_length: usize = head
+                .lines()
+                .find_map(|l| {
+                    let (name, value) = l.split_once(':')?;
+                    name.trim()
+                        .eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            while raw.len() - head_end < content_length {
+                read_some(&mut raw, "the request body")?;
+            }
+
+            let body = serde_json::json!({ "embeddings": [[1.0, 0.0]] }).to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .set_write_timeout(Some(remaining("the response write")?))
+                .map_err(|e| format!("set_write_timeout: {e}"))?;
+            stream
+                .write_all(response.as_bytes())
+                .map_err(|e| format!("writing response: {e}"))?;
+            Ok(())
+        })
+    }
+
+    /// Selects the one scenario this test binary runs in child mode: the
+    /// environment-mutating active-embeddings fixture below.
+    const CHILD_SCENARIO_VAR: &str = "REMIND_ME_MCP_TEST_CHILD_SCENARIO";
+
+    /// Attempts to terminate `child` and reap it within `deadline`, polling
+    /// rather than blocking so a hung child cannot hang the parent, and
+    /// returns a description that says plainly when cleanup did not succeed.
+    fn terminate_child(child: &mut std::process::Child, deadline: std::time::Duration) -> String {
+        let kill = child.kill();
+        let started = std::time::Instant::now();
+        let reaped = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(Some(status)),
+                Ok(None) if started.elapsed() >= deadline => break Ok(None),
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                Err(e) => break Err(e),
+            }
+        };
+        match (kill, reaped) {
+            (Ok(()), Ok(Some(status))) => format!("child killed and reaped ({status})"),
+            (Ok(()), Ok(None)) => {
+                format!("child killed but NOT reaped within {deadline:?}; it may still be running")
+            }
+            (Ok(()), Err(e)) => {
+                format!("child killed but polling failed: {e}; it may still be running")
+            }
+            (Err(k), Ok(Some(status))) => {
+                format!("kill failed ({k}) but the child exited ({status})")
+            }
+            (Err(k), Ok(None)) => {
+                format!("kill FAILED ({k}) and the child is still running after {deadline:?}")
+            }
+            (Err(k), Err(w)) => {
+                format!(
+                    "kill FAILED ({k}) and polling failed ({w}); the child may still be running"
+                )
+            }
+        }
+    }
+
+    /// Runs `test_name`'s body in a child process (this same test binary,
+    /// re-executed with `CHILD_SCENARIO_VAR` set) and asserts it exits
+    /// cleanly within `deadline`. The parent process never installs the
+    /// scenario's environment, so no other test in this binary, however it
+    /// reaches the embedding probe, can observe it or consume its fixture.
+    /// Returns `true` in the child, after running `body`.
+    fn run_in_child(test_name: &str, deadline: std::time::Duration, body: fn()) -> bool {
+        use std::process::{Command, Stdio};
+        if std::env::var(CHILD_SCENARIO_VAR).as_deref() == Ok(test_name) {
+            body();
+            return true;
+        }
+        let exe = std::env::current_exe().expect("locate the running test binary");
+        let mut child = Command::new(exe)
+            .args([
+                "--exact",
+                &format!("tests::{test_name}"),
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_SCENARIO_VAR, test_name)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn child test process");
+        let started = std::time::Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let output = child.wait_with_output().expect("collect child output");
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    assert!(
+                        status.success(),
+                        "child `{test_name}` failed ({status}):\n{stderr}"
+                    );
+                    return false;
+                }
+                Ok(None) => {}
+                Err(poll_error) => {
+                    let cleanup = terminate_child(&mut child, std::time::Duration::from_secs(5));
+                    panic!("polling child `{test_name}` failed: {poll_error}; {cleanup}");
+                }
+            }
+            if started.elapsed() > deadline {
+                let cleanup = terminate_child(&mut child, std::time::Duration::from_secs(5));
+                panic!("child `{test_name}` exceeded {deadline:?}; {cleanup}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
 
     #[test]
     fn a_panicking_handler_produces_an_internal_error_response_instead_of_unwinding() {
@@ -3239,7 +4034,7 @@ mod tests {
     #[test]
     fn a_caught_panic_while_holding_the_db_lock_still_leaves_it_usable() {
         // What makes catching the panic here safe rather than merely quiet:
-        // unwinding through a held `db.conn()` guard runs its destructor the
+        // unwinding through a held `db.store()` guard runs its destructor the
         // same as any other scope exit, and `parking_lot::Mutex` (unlike
         // `std::sync::Mutex`) never poisons on that unwind -- so the lock is
         // free again by the time `catch_unwind` returns. A synthetic panic
@@ -3249,7 +4044,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let server = McpServer::new(db);
         let resp = dispatch_line_catching_panics(r#"{"id":1}"#, |_line| {
-            let _guard = server.db.conn();
+            let _guard = server.db.store();
             panic!("simulated panic while a connection guard is live")
         });
         assert_eq!(resp.unwrap()["error"]["code"], -32603);
@@ -3337,8 +4132,336 @@ mod tests {
             .to_string()
     }
 
+    /// Add `content` and return its id.
+    fn add(server: &McpServer, content: &str) -> String {
+        let added = call(server, "remind_me_add", json!({ "content": content }));
+        serde_json::from_str::<Value>(&text_of(&added)).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn long_body(tail: &str) -> String {
+        format!("Compactness {} {tail}", "filler ".repeat(60))
+    }
+
+    #[test]
+    fn search_is_compact_by_default() {
+        let server = McpServer::new(Database::open_in_memory().unwrap());
+        let id = add(&server, &long_body("ENDMARK"));
+
+        let text = text_of(&call(
+            &server,
+            "remind_me_search",
+            json!({ "query": "Compactness" }),
+        ));
+        assert!(text.contains(&format!("- `{id}` · ")), "{text}");
+        assert!(text.contains('…'), "{text}");
+        assert!(!text.contains("ENDMARK"), "compact must not carry the body");
+
+        let full = text_of(&call(
+            &server,
+            "remind_me_search",
+            json!({ "query": "Compactness", "detail": "full" }),
+        ));
+        assert!(full.contains("ENDMARK"), "{full}");
+    }
+
+    #[test]
+    fn compact_json_carries_a_snippet_not_the_memory() {
+        let server = McpServer::new(Database::open_in_memory().unwrap());
+        let id = add(&server, &long_body("ENDMARK"));
+
+        let res = call(
+            &server,
+            "remind_me_search",
+            json!({ "query": "Compactness", "response_format": "json" }),
+        );
+        let res: Value = serde_json::from_str(&text_of(&res)).unwrap();
+        let hit = &res["memories"][0];
+        assert_eq!(hit["id"], id.as_str());
+        assert!(hit["snippet"].as_str().unwrap().starts_with("Compactness"));
+        assert!(hit.get("memory").is_none(), "{hit}");
+        assert_eq!(res["trimmed"], 0);
+    }
+
+    #[test]
+    fn a_blank_query_with_a_window_searches_and_keeps_its_shaping_options() {
+        let server = McpServer::new(Database::open_in_memory().unwrap());
+        let id = add(&server, &long_body("ENDMARK"));
+        let windowed = |extra: Value| {
+            let mut args = json!({ "query": "", "since": "1h" });
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            call(&server, "remind_me_search", args)
+        };
+
+        let compact = text_of(&windowed(json!({})));
+        assert!(compact.contains(&format!("- `{id}` · ")), "{compact}");
+        assert!(
+            !compact.contains("ENDMARK"),
+            "compact must not carry the body"
+        );
+
+        let full = windowed(json!({ "detail": "full" }));
+        assert!(full.get("isError").is_none(), "{}", text_of(&full));
+        assert!(text_of(&full).contains("ENDMARK"), "{}", text_of(&full));
+
+        add(&server, &long_body("second"));
+        let tight = text_of(&windowed(json!({ "detail": "full", "token_budget": 100 })));
+        assert!(tight.contains("Trimmed:"), "{tight}");
+
+        let future = windowed(json!({ "since": "2999-01-01T00:00:00Z" }));
+        assert!(
+            text_of(&future).contains("No memories"),
+            "{}",
+            text_of(&future)
+        );
+
+        // No `query` at all: the window alone still lists.
+        for bound in [
+            json!({ "since": "1h" }),
+            json!({ "until": "2999-01-01T00:00:00Z" }),
+        ] {
+            let listed = call(&server, "remind_me_search", bound.clone());
+            assert!(
+                listed.get("isError").is_none(),
+                "{bound}: {}",
+                text_of(&listed)
+            );
+            assert!(
+                text_of(&listed).contains(&id),
+                "{bound}: {}",
+                text_of(&listed)
+            );
+        }
+    }
+
+    #[test]
+    fn a_window_leaves_dialogs_out_unless_asked_and_falls_back_to_them() {
+        let server = McpServer::new(Database::open_in_memory().unwrap());
+        let add_in = |content: &str, category: &str| {
+            call(
+                &server,
+                "remind_me_add",
+                json!({ "content": content, "category": category }),
+            );
+        };
+        let window = |extra: Value| {
+            let mut args = json!({ "since": "1h" });
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            text_of(&call(&server, "remind_me_search", args))
+        };
+
+        add_in("Gamma dialog turn", "dialog");
+        let fallback = window(json!({}));
+        assert!(fallback.contains("Gamma dialog turn"), "{fallback}");
+        assert!(fallback.contains("Raw sessions"), "{fallback}");
+
+        add_in("Gamma refined fact", "fact");
+        let refined = window(json!({}));
+        assert!(refined.contains("Gamma refined fact"), "{refined}");
+        assert!(!refined.contains("Gamma dialog turn"), "{refined}");
+
+        let raw = window(json!({ "include_raw": true }));
+        assert!(raw.contains("Gamma refined fact"), "{raw}");
+        assert!(
+            raw.contains("Gamma dialog turn"),
+            "include_raw was dropped: {raw}"
+        );
+    }
+
+    #[test]
+    fn search_finds_a_task_link_by_kind_or_by_its_uuid_alone() {
+        let server = McpServer::new(Database::open_in_memory().unwrap());
+        let uuid = "0b9f2c1e-4d3a-4e5f-9a6b-7c8d9e0f1a2b";
+        let id = add(&server, &format!("Blocked on tick:{uuid} landing first"));
+        add(&server, "No task here");
+
+        for lookup in [
+            json!({ "reference_kind": "task" }),
+            json!({ "reference": uuid }),
+            json!({ "reference": uuid, "reference_kind": "task" }),
+        ] {
+            let found = call(&server, "remind_me_search", lookup.clone());
+            let text = text_of(&found);
+            assert!(found.get("isError").is_none(), "{lookup}: {text}");
+            assert!(text.contains(&id), "{lookup}: {text}");
+            assert!(!text.contains("No task here"), "{lookup}: {text}");
+        }
+    }
+
+    #[test]
+    fn a_window_narrows_by_what_it_applies_and_refuses_what_it_does_not() {
+        let server = McpServer::new(Database::open_in_memory().unwrap());
+        for (content, category, tag) in [
+            ("Alpha window", "fact", "wanted"),
+            ("Beta window", "note", "other"),
+        ] {
+            call(
+                &server,
+                "remind_me_add",
+                json!({ "content": content, "category": category, "tags": [tag] }),
+            );
+        }
+
+        for narrowing in [
+            json!({ "since": "1h", "category": "fact" }),
+            json!({ "query": "", "since": "1h", "tags": ["wanted"] }),
+        ] {
+            let narrowed = call(&server, "remind_me_search", narrowing.clone());
+            let text = text_of(&narrowed);
+            assert!(narrowed.get("isError").is_none(), "{narrowing}: {text}");
+            assert!(text.contains("Alpha window"), "{narrowing}: {text}");
+            assert!(
+                !text.contains("Beta window"),
+                "{narrowing} was dropped: {text}"
+            );
+        }
+
+        for unapplied in [
+            json!({ "since": "1h", "source": "chat" }),
+            json!({ "since": "1h", "offset": 1 }),
+        ] {
+            let refused = call(&server, "remind_me_search", unapplied.clone());
+            assert_eq!(refused["isError"], true, "{unapplied} was silently dropped");
+            assert!(
+                text_of(&refused).contains("list that window"),
+                "{unapplied}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_search_without_a_query_lists_under_its_filters_and_refuses_ranking_options() {
+        let server = McpServer::new(Database::open_in_memory().unwrap());
+        for (content, category) in [("Alpha listing", "fact"), ("Beta listing", "note")] {
+            call(
+                &server,
+                "remind_me_add",
+                json!({ "content": content, "category": category }),
+            );
+        }
+
+        let listed = call(
+            &server,
+            "remind_me_search",
+            json!({ "query": "", "category": "fact" }),
+        );
+        let text = text_of(&listed);
+        assert!(listed.get("isError").is_none(), "{text}");
+        assert!(text.contains("Alpha listing"), "{text}");
+        assert!(
+            !text.contains("Beta listing"),
+            "category filter was dropped: {text}"
+        );
+
+        for shaped in [
+            json!({ "detail": "full" }),
+            json!({ "token_budget": 10 }),
+            json!({ "include_expired": true }),
+            json!({ "min_confidence": 0.9 }),
+            json!({ "min_vitality": 0.5 }),
+        ] {
+            let refused = call(&server, "remind_me_search", shaped.clone());
+            assert_eq!(refused["isError"], true, "{shaped} was silently dropped");
+            assert!(text_of(&refused).contains("without `query`"), "{shaped}");
+        }
+    }
+
+    #[test]
+    fn a_trimmed_search_names_the_dropped_ids_and_get_fetches_them() {
+        let server = McpServer::new(Database::open_in_memory().unwrap());
+        for i in 0..3 {
+            add(&server, &long_body(&i.to_string()));
+        }
+        let search = |format: &str| {
+            text_of(&call(
+                &server,
+                "remind_me_search",
+                json!({ "query": "Compactness", "detail": "full", "token_budget": 100, "response_format": format }),
+            ))
+        };
+
+        let res: Value = serde_json::from_str(&search("json")).unwrap();
+        let dropped = res["trimmed_ids"].as_array().unwrap().clone();
+        assert_eq!(dropped.len(), 2, "{res}");
+
+        let text = search("markdown");
+        assert!(text.contains("remind_me_get"), "{text}");
+        for id in &dropped {
+            assert!(
+                text.contains(&format!("`{}`", id.as_str().unwrap())),
+                "{text}"
+            );
+        }
+
+        let got = call(
+            &server,
+            "remind_me_get",
+            json!({ "memory_ids": [dropped[0], dropped[1], "mem_missing"] }),
+        );
+        let got: Value = serde_json::from_str(&text_of(&got)).unwrap();
+        assert_eq!(got["memories"].as_array().unwrap().len(), 2, "{got}");
+        assert_eq!(got["missing"], json!(["mem_missing"]));
+    }
+
+    #[test]
+    fn get_rejects_bad_memory_ids() {
+        let server = McpServer::new(Database::open_in_memory().unwrap());
+        let too_many: Vec<String> = (0..=GET_IDS_MAX).map(|i| format!("m{i}")).collect();
+        for args in [
+            json!({ "memory_ids": [] }),
+            json!({ "memory_ids": too_many }),
+            json!({ "memory_ids": [1] }),
+            json!({ "memory_ids": "m1" }),
+            json!({ "memory_ids": ["m1"], "memory_id": "m1" }),
+        ] {
+            assert_eq!(
+                call(&server, "remind_me_get", args.clone())["isError"],
+                true,
+                "{args}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_handler_is_a_public_tool_or_an_alias_and_every_alias_has_a_handler() {
+        use remind_me_core::tool_profiles::{group_of, replacement, ALIASES};
+        let _handlers = handler_view();
+        let server = McpServer::new(Database::open_in_memory().unwrap());
+        let req = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
+        let resp = server.handle_request(&req.to_string()).unwrap();
+        let handlers: Vec<String> = resp["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(str::to_string))
+            .collect();
+
+        // A handler in neither table would be unreachable under any narrowed
+        // profile and missing from the public list: a tool nobody can find.
+        for handler in &handlers {
+            assert!(
+                group_of(handler).is_some(),
+                "{handler} is neither a public tool nor an alias"
+            );
+        }
+        for (old, _) in ALIASES {
+            assert!(
+                handlers.iter().any(|h| h == old),
+                "alias {old} has no handler"
+            );
+            assert!(replacement(old).is_some());
+        }
+    }
+
     #[test]
     fn test_crud_tools_are_registered() {
+        let _handlers = handler_view();
         let db = Database::open_in_memory().unwrap();
         let server = McpServer::new(db);
         let req = json!({ "jsonrpc": "2.0", "id": 4, "method": "tools/list" });
@@ -3350,9 +4473,249 @@ mod tests {
             .map(|t| t["name"].as_str().unwrap())
             .collect();
 
-        for expected in ["remind_me_list", "remind_me_update", "remind_me_delete"] {
+        for expected in [
+            "remind_me_list",
+            "remind_me_update",
+            "remind_me_delete",
+            "remind_me_session_timeline",
+        ] {
             assert!(names.contains(&expected), "{} not in tools/list", expected);
         }
+    }
+
+    #[test]
+    fn a_reference_search_leaves_out_sensitive_memories_unless_asked() {
+        let server = McpServer::new(Database::open_in_memory().unwrap());
+        call(
+            &server,
+            "remind_me_add",
+            json!({ "content": "Open note on o/r#77" }),
+        );
+        call(
+            &server,
+            "remind_me_add",
+            json!({ "content": "Private note on o/r#77", "sensitive": true }),
+        );
+        let found = |args: Value| {
+            let result = call(&server, "remind_me_search", args);
+            serde_json::from_str::<Value>(&text_of(&result)).unwrap()
+        };
+
+        let plain = found(json!({ "reference": "o/r#77" }));
+        assert_eq!(plain["count"], 1, "{plain}");
+        assert!(!plain.to_string().contains("Private"), "{plain}");
+        let all = found(json!({ "reference": "o/r#77", "include_sensitive": true }));
+        assert_eq!(all["count"], 2, "{all}");
+
+        let scoped = call(
+            &server,
+            "remind_me_search",
+            json!({ "reference": "o/r#77", "project": "elsewhere" }),
+        );
+        assert_eq!(
+            scoped["isError"], true,
+            "a scope it cannot honour is refused"
+        );
+    }
+
+    #[test]
+    fn the_published_get_schema_does_not_require_a_memory_id() {
+        // `capture_id` alone is a complete call, so the merged tool cannot
+        // require `memory_id`.
+        let server = McpServer::new(Database::open_in_memory().unwrap());
+        let req = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
+        let resp = server.handle_request(&req.to_string()).unwrap();
+        let get = resp["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "remind_me_get")
+            .cloned()
+            .unwrap();
+        assert!(get["inputSchema"].get("required").is_none(), "{get}");
+        assert!(get["inputSchema"]["properties"]["capture_id"].is_object());
+    }
+
+    #[test]
+    fn references_tool_is_registered_and_reverse_lookup_works() {
+        let _handlers = handler_view();
+        let db = Database::open_in_memory().unwrap();
+        let server = McpServer::new(db);
+        let req = json!({ "jsonrpc": "2.0", "id": 4, "method": "tools/list" });
+        let resp = server.handle_request(&req.to_string()).unwrap();
+        let names: Vec<&str> = resp["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"remind_me_references"));
+
+        let added = call(
+            &server,
+            "remind_me_add",
+            json!({ "content": "Shipped o/r#321 in 3ac9f797" }),
+        );
+        let id = serde_json::from_str::<Value>(&text_of(&added)).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let by_value = call(
+            &server,
+            "remind_me_references",
+            json!({ "value": "o/r#321" }),
+        );
+        let found: Value = serde_json::from_str(&text_of(&by_value)).unwrap();
+        assert_eq!(found["count"], 1, "{found}");
+        assert_eq!(found["references"][0]["memory_id"], id.as_str());
+        assert_eq!(found["references"][0]["memory"]["id"], id.as_str());
+
+        let by_memory = call(&server, "remind_me_references", json!({ "memory_id": id }));
+        let found: Value = serde_json::from_str(&text_of(&by_memory)).unwrap();
+        assert_eq!(found["count"], 2, "{found}");
+
+        let none = call(&server, "remind_me_references", json!({}));
+        assert_eq!(none["isError"], true);
+
+        let got = call(&server, "remind_me_get", json!({ "memory_id": id }));
+        let got: Value = serde_json::from_str(&text_of(&got)).unwrap();
+        assert_eq!(got["references"].as_array().unwrap().len(), 2);
+
+        let searched = call(
+            &server,
+            "remind_me_search",
+            json!({ "query": "Shipped", "response_format": "json", "detail": "full" }),
+        );
+        let searched: Value = serde_json::from_str(&text_of(&searched)).unwrap();
+        assert_eq!(
+            searched["memories"][0]["memory"]["references"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2,
+            "{searched}"
+        );
+        let md = call(
+            &server,
+            "remind_me_search",
+            json!({ "query": "Shipped", "detail": "full" }),
+        );
+        assert!(
+            text_of(&md).contains("refs: commit:3ac9f797, issue:o/r#321"),
+            "{}",
+            text_of(&md)
+        );
+    }
+
+    #[test]
+    fn capture_transcript_stores_one_capture_per_session_with_the_callers_context() {
+        let db = Database::open_in_memory().unwrap();
+        let server = McpServer::new(db);
+        let line = |text: &str| {
+            json!({"type": "user", "sessionId": "cloud-1", "cwd": "/nowhere/here",
+                   "message": {"role": "user", "content": text}})
+            .to_string()
+        };
+        let args = |transcript: String| {
+            json!({ "session_id": "cloud-1", "transcript": transcript, "reason": "stop",
+                    "project": "rusty_mill", "git_branch": "main", "cwd": "/home/user/rusty_mill" })
+        };
+
+        let first = call(
+            &server,
+            "remind_me_capture_transcript",
+            args(line("ship it")),
+        );
+        assert!(first.get("isError").is_none(), "{first}");
+        let first: Value = serde_json::from_str(&text_of(&first)).unwrap();
+        let grown = format!("{}\n{}", line("ship it"), line("and test it"));
+        let second = call(&server, "remind_me_capture_transcript", args(grown));
+        let second: Value = serde_json::from_str(&text_of(&second)).unwrap();
+        assert_eq!(first["capture_id"], second["capture_id"]);
+        assert_eq!(second["messages"], 2);
+
+        let got = call(
+            &server,
+            "remind_me_get",
+            json!({ "memory_id": second["dialog_id"], "response_format": "json" }),
+        );
+        let dialog: Value = serde_json::from_str(&text_of(&got)).unwrap();
+        assert_eq!(dialog["project"], "rusty_mill");
+        assert_eq!(dialog["git_branch"], "main");
+        assert_eq!(dialog["cwd"], "/home/user/rusty_mill");
+    }
+
+    #[test]
+    fn capture_transcript_refuses_bad_input() {
+        let db = Database::open_in_memory().unwrap();
+        let server = McpServer::new(db);
+        for args in [
+            json!({ "transcript": "{}" }),
+            json!({ "session_id": "s", "transcript": "" }),
+            json!({ "session_id": "s", "transcript": "{}", "reason": "later" }),
+            json!({ "session_id": "s", "transcript": "x".repeat(remind_me_core::transcript::MAX_TRANSCRIPT_BYTES + 1) }),
+        ] {
+            let result = call(&server, "remind_me_capture_transcript", args);
+            assert_eq!(result["isError"], true, "{result}");
+        }
+    }
+
+    #[test]
+    fn capture_transcript_bounds_what_travels_not_what_it_decodes_to() {
+        use remind_me_core::transcript::MAX_TRANSCRIPT_BYTES;
+        let db = Database::open_in_memory().unwrap();
+        let server = McpServer::new(db);
+        // Quote-heavy: under the limit decoded, twice it once escaped.
+        let heavy = "\"".repeat(MAX_TRANSCRIPT_BYTES / 2 + 1);
+        let result = call(
+            &server,
+            "remind_me_capture_transcript",
+            json!({ "session_id": "s", "transcript": heavy }),
+        );
+        assert_eq!(result["isError"], true, "{result}");
+        assert!(text_of(&result).contains("JSON-escaped"), "{result}");
+
+        // The worst transcript the limit admits still fits a 4 MiB body.
+        let at_limit = "\"".repeat(MAX_TRANSCRIPT_BYTES / 2);
+        let body = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "remind_me_capture_transcript", "arguments": {
+                "session_id": "x".repeat(200), "transcript": at_limit, "reason": "precompact",
+                "project": "p".repeat(200), "git_remote": "r".repeat(500),
+                "git_branch": "b".repeat(250), "git_sha": "0".repeat(40), "cwd": "c".repeat(4096),
+            }},
+        });
+        assert!(serde_json::to_vec(&body).unwrap().len() <= 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_session_timeline_answers_for_an_empty_store_and_an_unknown_session() {
+        let db = Database::open_in_memory().unwrap();
+        let server = McpServer::new(db);
+
+        let listed = call(
+            &server,
+            "remind_me_session_timeline",
+            json!({ "response_format": "markdown" }),
+        );
+        assert!(listed.get("isError").is_none(), "{listed}");
+        assert!(text_of(&listed).contains("No sessions recorded"));
+
+        let as_json = call(
+            &server,
+            "remind_me_session_timeline",
+            json!({ "response_format": "json", "limit": 3 }),
+        );
+        let parsed: Value = serde_json::from_str(&text_of(&as_json)).unwrap();
+        assert_eq!(parsed["count"], 0);
+
+        let unknown = call(
+            &server,
+            "remind_me_session_timeline",
+            json!({ "session_id": "nope" }),
+        );
+        assert!(text_of(&unknown).contains("No session found"));
     }
 
     #[test]
@@ -3528,6 +4891,9 @@ mod tests {
 
     #[test]
     fn test_remind_me_get_schema_advertises_memory_id_as_required() {
+        // The handler's own schema: the public `get` also takes `capture_id`
+        // alone, so it requires nothing.
+        let _handlers = handler_view();
         let db = Database::open_in_memory().unwrap();
         let server = McpServer::new(db);
         let listed = server
@@ -3550,16 +4916,13 @@ mod tests {
             props.contains_key("id"),
             "id stays advertised as a deprecated alias so existing schema-reading clients still see it"
         );
-        let required: Vec<&str> = tool["inputSchema"]["required"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
-        assert_eq!(
-            required,
-            vec!["memory_id"],
-            "memory_id is the canonical required param, not id"
+        assert!(
+            props.contains_key("memory_ids"),
+            "memory_ids fetches several at once (card #51)"
+        );
+        assert!(
+            tool["inputSchema"].get("required").is_none(),
+            "either memory_id or memory_ids may be given, so neither is required"
         );
     }
 
@@ -3657,6 +5020,7 @@ mod tests {
 
     #[test]
     fn test_vitality_report_tool() {
+        let _handlers = handler_view();
         let db = Database::open_in_memory().unwrap();
         let server = McpServer::new(db);
 
@@ -3751,6 +5115,7 @@ mod tests {
 
     #[test]
     fn test_wiki_tools_are_registered() {
+        let _handlers = handler_view();
         let db = Database::open_in_memory().unwrap();
         let server = McpServer::new(db);
         let req = json!({ "jsonrpc": "2.0", "id": 5, "method": "tools/list" });
@@ -3815,6 +5180,7 @@ mod tests {
 
     #[test]
     fn test_wiki_search_tool() {
+        let _handlers = handler_view();
         let (server, root) = wiki_server("search");
 
         let req = json!({ "jsonrpc": "2.0", "id": 8, "method": "tools/list" });
@@ -3910,6 +5276,7 @@ mod tests {
 
     #[test]
     fn test_import_dbs_is_registered_and_refuses_a_path_outside_the_roots() {
+        let _handlers = handler_view();
         let db = Database::open_in_memory().unwrap();
         let server = McpServer::new(db);
 
@@ -3942,6 +5309,7 @@ mod tests {
 
     #[test]
     fn test_import_mempalace_is_registered_and_has_no_path_field() {
+        let _handlers = handler_view();
         let db = Database::open_in_memory().unwrap();
         let server = McpServer::new(db);
 
@@ -3975,6 +5343,7 @@ mod tests {
 
     #[test]
     fn test_webhook_status_is_registered_and_reports_disabled() {
+        let _handlers = handler_view();
         // No `REMIND_ME_WEBHOOK_SECRET` in the test environment, so nothing
         // binds a port — which is the state this asserts.
         let db = Database::open_in_memory().unwrap();
@@ -4009,11 +5378,12 @@ mod tests {
 
     #[test]
     fn test_check_update_and_self_update_are_registered() {
+        let _handlers = handler_view();
         // Not invoked here, unlike every other tool this file tests end to
         // end: both discover their repository from the process's current
         // working directory (docs/adr/0003-self-update-strategy.md), and
         // remind_me_self_update would really run `git pull`/`cargo build
-        // --release --workspace` against whatever repo contains this test
+        // --release -p rusty-remind-me -p remind_me_hub` against whatever repo contains this test
         // binary's cwd -- which, inside this workspace's own test suite, is
         // this very checkout. That behavior is exercised instead in
         // remind_me_core's updater.rs unit tests, against real but
@@ -4064,7 +5434,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let state_file = dir.join("oauth.json");
-        std::env::set_var(
+        crate::test_env::set_var(
             remind_me_core::remote::REMOTE_OAUTH_STATE_FILE_ENV,
             &state_file,
         );
@@ -4102,21 +5472,21 @@ mod tests {
         store
             .put_client(
                 "client-1",
-                json!({ "client_name": "claude.ai", "redirect_uris": ["https://claude.ai/cb"] }),
+                rusty_json::json!({ "client_name": "claude.ai", "redirect_uris": ["https://claude.ai/cb"] }),
             )
             .expect("write");
         store
             .put_token(
                 remind_me_core::remote::TokenKind::Access,
                 "access-tok",
-                json!({ "client_id": "client-1" }),
+                rusty_json::json!({ "client_id": "client-1" }),
             )
             .expect("write");
         store
             .put_token(
                 remind_me_core::remote::TokenKind::Refresh,
                 "refresh-tok",
-                json!({ "client_id": "client-1" }),
+                rusty_json::json!({ "client_id": "client-1" }),
             )
             .expect("write");
 
@@ -4160,7 +5530,7 @@ mod tests {
         .unwrap();
         assert_eq!(unknown["status"], "error");
 
-        std::env::remove_var(remind_me_core::remote::REMOTE_OAUTH_STATE_FILE_ENV);
+        crate::test_env::remove_var(remind_me_core::remote::REMOTE_OAUTH_STATE_FILE_ENV);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4169,7 +5539,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // No REMIND_ME_EMBEDDING_BACKEND in the test environment, so this
         // must report degraded rather than silently doing nothing.
-        std::env::remove_var(remind_me_core::embedder::EMBEDDING_BACKEND_ENV);
+        crate::test_env::remove_var(remind_me_core::embedder::EMBEDDING_BACKEND_ENV);
         let db = Database::open_in_memory().unwrap();
         let server = McpServer::new(db);
 
@@ -4455,6 +5825,7 @@ mod tests {
     /// (#183), and nothing was asserting it.
     #[test]
     fn test_history_limit_defaults_to_the_references_ten() {
+        let _handlers = handler_view();
         let parsed: HistoryInput =
             serde_json::from_value(json!({ "memory_id": "m1" })).expect("parse");
         assert_eq!(parsed.limit, 10);
@@ -4507,6 +5878,7 @@ mod tests {
 
     #[test]
     fn test_both_tools_declare_response_format_defaulting_to_markdown() {
+        let _handlers = handler_view();
         let db = Database::open_in_memory().unwrap();
         let server = McpServer::new(db);
         let listed = server
@@ -4530,7 +5902,7 @@ mod tests {
     #[test]
     fn test_server_status_carries_the_webhook() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var(remind_me_core::embedder::EMBEDDING_BACKEND_ENV);
+        crate::test_env::remove_var(remind_me_core::embedder::EMBEDDING_BACKEND_ENV);
         let db = Database::open_in_memory().unwrap();
         let server = McpServer::new(db);
 
@@ -4561,59 +5933,62 @@ mod tests {
 
     #[test]
     fn test_server_status_reports_embeddings_active_when_the_backend_is_configured_and_reachable() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        use std::io::{Read, Write};
-        use std::net::TcpListener;
+        // The only test that installs a live Ollama configuration. It runs
+        // in a child process: `remind_me_add`, `remind_me_search` and every
+        // status call reach `available_embedder`, so any test in this
+        // binary could otherwise probe the fake daemon (or cache a failed
+        // verdict) while these variables are set, whether or not it takes
+        // `ENV_LOCK`. The parent never installs the variables; the child's
+        // whole run, fake daemon join included, is bounded by the deadline.
+        run_in_child(
+            "test_server_status_reports_embeddings_active_when_the_backend_is_configured_and_reachable",
+            std::time::Duration::from_secs(60),
+            || {
+                use std::net::TcpListener;
+                let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-        // A fake Ollama daemon answering the "ping" probe `available_embedder`
-        // makes -- same shape as `ollama_embedder_test.rs`'s `fake_server`.
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept");
-            let mut buf = [0u8; 4096];
-            let _ = stream.read(&mut buf);
-            let body = serde_json::json!({ "embeddings": [[1.0, 0.0]] }).to_string();
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            stream
-                .write_all(response.as_bytes())
-                .expect("write response");
-        });
+                // A fake Ollama daemon answering the one "ping" probe
+                // `available_embedder` makes.
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let port = listener.local_addr().unwrap().port();
+                let handle = fake_ollama_once(listener, std::time::Duration::from_secs(20));
 
-        std::env::set_var(remind_me_core::embedder::EMBEDDING_BACKEND_ENV, "ollama");
-        std::env::set_var(
-            remind_me_core::embedder::OLLAMA_URL_ENV,
-            format!("http://127.0.0.1:{port}"),
-        );
-        std::env::set_var(remind_me_core::embedder::EMBEDDING_DIM_ENV, "2");
+                crate::test_env::set_var(remind_me_core::embedder::EMBEDDING_BACKEND_ENV, "ollama");
+                crate::test_env::set_var(
+                    remind_me_core::embedder::OLLAMA_URL_ENV,
+                    format!("http://127.0.0.1:{port}"),
+                );
+                crate::test_env::set_var(remind_me_core::embedder::EMBEDDING_DIM_ENV, "2");
 
-        let db = Database::open_in_memory().unwrap();
-        let server = McpServer::new(db);
-        let report: Value = serde_json::from_str(&text_of(&call(
-            &server,
-            "remind_me_server_status",
-            json!({}),
-        )))
-        .unwrap();
+                let db = Database::open_in_memory().unwrap();
+                let server = McpServer::new(db);
+                let report: Value = serde_json::from_str(&text_of(&call(
+                    &server,
+                    "remind_me_server_status",
+                    json!({}),
+                )))
+                .unwrap();
 
-        std::env::remove_var(remind_me_core::embedder::EMBEDDING_BACKEND_ENV);
-        std::env::remove_var(remind_me_core::embedder::OLLAMA_URL_ENV);
-        std::env::remove_var(remind_me_core::embedder::EMBEDDING_DIM_ENV);
-        handle.join().unwrap();
+                crate::test_env::remove_var(remind_me_core::embedder::EMBEDDING_BACKEND_ENV);
+                crate::test_env::remove_var(remind_me_core::embedder::OLLAMA_URL_ENV);
+                crate::test_env::remove_var(remind_me_core::embedder::EMBEDDING_DIM_ENV);
+                let served = handle.join().expect("fake daemon thread panicked");
 
-        assert_eq!(
-            report["embeddings"]["state"], "active",
-            "expected active, got {:?}",
-            report["embeddings"]
+                assert_eq!(
+                    report["embeddings"]["state"], "active",
+                    "expected active, got {:?}; fake daemon: {served:?}",
+                    report["embeddings"]
+                );
+                assert_eq!(served, Ok(()), "the fake daemon must have served the probe");
+            },
         );
     }
 
     #[test]
     fn test_server_status_reports_dashboard_running_from_a_live_pid_file() {
+        // Calls `remind_me_server_status`, which runs the live embedding
+        // probe -- see `ENV_LOCK`.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
@@ -4648,7 +6023,7 @@ mod tests {
                 .expect("write response");
         });
 
-        let pid_path = remind_me_core::pid::pid_file_path(&db.conn()).unwrap();
+        let pid_path = remind_me_core::pid::pid_file_path(&db.store()).unwrap();
         let record = remind_me_core::pid::write_pid_file(&pid_path, "127.0.0.1", port).unwrap();
 
         let server = McpServer::new(db);
@@ -4676,6 +6051,9 @@ mod tests {
     /// response for the same call carried the truth.
     #[test]
     fn test_server_status_markdown_reports_dashboard_state_instead_of_a_bare_question_mark() {
+        // Calls `remind_me_server_status`, which runs the live embedding
+        // probe -- see `ENV_LOCK`.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let db = Database::open_in_memory().unwrap();
         let server = McpServer::new(db);
 
@@ -4746,7 +6124,7 @@ mod tests {
         let _lock = CODE_ROOTS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var(remind_me_core::code_refs::CODE_ROOTS_ENV);
+        crate::test_env::remove_var(remind_me_core::code_refs::CODE_ROOTS_ENV);
 
         let db = Database::open_in_memory().unwrap();
         let server = McpServer::new(db);
@@ -4771,7 +6149,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let file = root.join("auth.rs");
         std::fs::write(&file, "fn login() {}\n").unwrap();
-        std::env::set_var(
+        crate::test_env::set_var(
             remind_me_core::code_refs::CODE_ROOTS_ENV,
             root.display().to_string(),
         );
@@ -4786,7 +6164,7 @@ mod tests {
         std::fs::remove_file(&file).unwrap();
 
         let res = call(&server, "remind_me_stale_candidates", json!({}));
-        std::env::remove_var(remind_me_core::code_refs::CODE_ROOTS_ENV);
+        crate::test_env::remove_var(remind_me_core::code_refs::CODE_ROOTS_ENV);
         let _ = std::fs::remove_dir_all(&root);
 
         assert!(res.get("isError").is_none());
@@ -4806,7 +6184,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let file = root.join("auth.rs");
         std::fs::write(&file, "fn login() {}\n").unwrap();
-        std::env::set_var(
+        crate::test_env::set_var(
             remind_me_core::code_refs::CODE_ROOTS_ENV,
             root.display().to_string(),
         );
@@ -4823,7 +6201,7 @@ mod tests {
         std::fs::remove_file(&file).unwrap();
 
         let res = call(&server, "remind_me_stale_candidates", json!({ "limit": 2 }));
-        std::env::remove_var(remind_me_core::code_refs::CODE_ROOTS_ENV);
+        crate::test_env::remove_var(remind_me_core::code_refs::CODE_ROOTS_ENV);
         let _ = std::fs::remove_dir_all(&root);
 
         assert!(res.get("isError").is_none());
@@ -4837,6 +6215,7 @@ mod tests {
 
     #[test]
     fn stale_candidates_schema_bounds_match_the_rust_side_clamp_constants() {
+        let _handlers = handler_view();
         let db = Database::open_in_memory().unwrap();
         let server = McpServer::new(db);
         let listed = server
@@ -4863,6 +6242,7 @@ mod tests {
 
     #[test]
     fn promotion_candidates_schema_bounds_match_the_rust_side_clamp_constants() {
+        let _handlers = handler_view();
         let db = Database::open_in_memory().unwrap();
         let server = McpServer::new(db);
         let listed = server
@@ -4914,12 +6294,110 @@ mod tests {
             "total_candidates must be present in the response: {body}"
         );
     }
+
+    /// `remind_me_add` of a decision mentioning `Postgres` that claims the
+    /// session store uses `object`, with `extra` arguments merged in.
+    fn add_decision(server: &McpServer, content: &str, object: &str, extra: Value) -> Value {
+        let mut args = json!({
+            "content": content,
+            "memory_type": "decision",
+            "metadata": { "rationale": "r" },
+            "subject": "session store",
+            "predicate": "uses",
+            "object": object,
+            "entities": [{ "name": "Postgres" }],
+            "extract": false,
+        });
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().cloned().unwrap_or_default());
+        call(server, "remind_me_add", args)
+    }
+
+    #[test]
+    fn add_of_a_decision_returns_its_conflicts_in_json_and_markdown() {
+        let server = McpServer::new(Database::open_in_memory().unwrap());
+        let old: Value = serde_json::from_str(&text_of(&add_decision(
+            &server,
+            "Use Postgres for the session store",
+            "Postgres",
+            json!({}),
+        )))
+        .unwrap();
+        assert!(old.get("contradiction_candidates").is_none(), "{old}");
+
+        let json_reply: Value = serde_json::from_str(&text_of(&add_decision(
+            &server,
+            "Use Redis for the session store",
+            "Redis",
+            json!({}),
+        )))
+        .unwrap();
+        let found = &json_reply["contradiction_candidates"];
+        assert_eq!(found.as_array().map(Vec::len), Some(1), "{json_reply}");
+        assert_eq!(found[0]["memory"]["id"], old["id"]);
+        assert_eq!(found[0]["reason"], "same_claim");
+
+        let markdown = text_of(&add_decision(
+            &server,
+            "Use Memcached for the session store",
+            "Memcached",
+            json!({ "response_format": "markdown" }),
+        ));
+        assert!(markdown.contains("May contradict"), "{markdown}");
+        assert!(markdown.contains(old["id"].as_str().unwrap()), "{markdown}");
+    }
+
+    #[test]
+    fn sensitive_decisions_never_surface_as_conflicts() {
+        let server = McpServer::new(Database::open_in_memory().unwrap());
+        // One sensitive decision on the same claim, one sharing the entity
+        // and the topic: both would be conflicts if they were not sensitive.
+        add_decision(
+            &server,
+            "Use Postgres for the session store SECRETMARK",
+            "Postgres",
+            json!({ "sensitive": true }),
+        );
+        call(
+            &server,
+            "remind_me_add",
+            json!({
+                "content": "Use Valkey for the session store SECRETMARK",
+                "memory_type": "decision",
+                "metadata": { "rationale": "r" },
+                "entities": [{ "name": "Postgres" }],
+                "extract": false,
+                "sensitive": true,
+            }),
+        );
+
+        let json_text = text_of(&add_decision(
+            &server,
+            "Use Redis for the session store",
+            "Redis",
+            json!({}),
+        ));
+        let markdown = text_of(&add_decision(
+            &server,
+            "Use Memcached for the session store",
+            "Memcached",
+            json!({ "response_format": "markdown" }),
+        ));
+
+        let reply: Value = serde_json::from_str(&json_text).unwrap();
+        // Only the sensitive decisions preceded it, so it has no conflicts;
+        // the markdown add then conflicts with this one alone.
+        assert!(reply.get("contradiction_candidates").is_none(), "{reply}");
+        assert!(!json_text.contains("SECRETMARK"), "{json_text}");
+        assert!(!markdown.contains("SECRETMARK"), "{markdown}");
+    }
 }
 
 #[cfg(test)]
 mod handshake_identity {
-    use super::client_identity;
-    use serde_json::json;
+    use super::{client_identity, forwarded_caller, CALLER_META_KEY};
+    use serde_json::{json, Value};
 
     fn parse(params: serde_json::Value) -> Option<String> {
         client_identity(&json!({ "method": "initialize", "params": params }))
@@ -4959,5 +6437,485 @@ mod handshake_identity {
         assert_eq!(parse(json!({ "clientInfo": { "name": 42 } })), None);
         // A handshake with no params at all must not panic.
         assert_eq!(client_identity(&json!({ "method": "initialize" })), None);
+    }
+
+    #[test]
+    fn a_forwarded_caller_is_named_null_or_absent() {
+        let line = |meta: Value| {
+            json!({ "method": "tools/call", "params": { "name": "x", "_meta": meta } }).to_string()
+        };
+        assert_eq!(
+            forwarded_caller(&line(json!({ CALLER_META_KEY: "claude-ai/1.0" }))),
+            Some(Some("claude-ai/1.0".to_string()))
+        );
+        // Null is a caller that named nobody: still a decision, so the
+        // connection's handshake must not stand in for it.
+        assert_eq!(
+            forwarded_caller(&line(json!({ CALLER_META_KEY: null }))),
+            Some(None)
+        );
+        assert_eq!(forwarded_caller(&line(json!({}))), None);
+        assert_eq!(forwarded_caller(r#"{"method":"tools/list"}"#), None);
+    }
+}
+
+/// Wave 1A: typed kinds, outcomes and the advertised surface, over JSON-RPC.
+#[cfg(test)]
+mod structure_tests {
+    use super::*;
+
+    fn server() -> McpServer {
+        McpServer::new(Database::open_in_memory().unwrap())
+    }
+
+    fn call(server: &McpServer, name: &str, args: Value) -> Value {
+        let req = json!({
+            "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+            "params": { "name": name, "arguments": args }
+        });
+        server.handle_request(&req.to_string()).unwrap()["result"].clone()
+    }
+
+    fn text(result: &Value) -> String {
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap_or("")
+            .to_string()
+    }
+
+    fn is_error(result: &Value) -> bool {
+        result
+            .get("isError")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    fn stored_id(result: &Value) -> String {
+        let memory: Value = serde_json::from_str(&text(result)).unwrap();
+        memory["id"].as_str().unwrap().to_string()
+    }
+
+    fn tool(server: &McpServer, name: &str) -> Value {
+        let req = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
+        let listed = server.handle_request(&req.to_string()).unwrap();
+        listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("{name} not in tools/list"))
+            .clone()
+    }
+
+    #[test]
+    fn initialize_carries_short_instructions() {
+        let req = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} });
+        let resp = server().handle_request(&req.to_string()).unwrap();
+        let text = resp["result"]["instructions"].as_str().unwrap();
+        assert!(text.len() < 600, "{} chars", text.len());
+        for tool in [
+            "remind_me_auto_capture",
+            "remind_me_add",
+            "remind_me_search",
+        ] {
+            assert!(text.contains(tool), "instructions should name {tool}");
+        }
+        assert!(text.contains("memory_type") && text.contains("confidence"));
+    }
+
+    #[test]
+    fn add_advertises_every_field_the_input_accepts() {
+        let s = server();
+        let schema = tool(&s, "remind_me_add");
+        let props = schema["inputSchema"]["properties"].as_object().unwrap();
+        for field in [
+            "metadata",
+            "subject",
+            "predicate",
+            "object",
+            "entities",
+            "memory_type",
+            "confidence",
+            "valid_from",
+            "valid_until",
+            "outcome",
+        ] {
+            assert!(props.contains_key(field), "add should advertise {field}");
+        }
+        assert!(props["entities"]["items"]["properties"]["name"].is_object());
+        let update = tool(&s, "remind_me_update");
+        for field in [
+            "memory_type",
+            "confidence",
+            "valid_from",
+            "valid_until",
+            "outcome",
+        ] {
+            assert!(
+                update["inputSchema"]["properties"][field].is_object(),
+                "{field}"
+            );
+        }
+        let search = tool(&s, "remind_me_search");
+        assert_eq!(
+            search["inputSchema"]["properties"]["include_expired"]["default"],
+            true
+        );
+        assert!(search["inputSchema"]["properties"]["min_confidence"].is_object());
+    }
+
+    #[test]
+    fn search_narrows_by_tags_and_advertises_its_filters() {
+        let s = server();
+        let props = &tool(&s, "remind_me_search")["inputSchema"]["properties"];
+        for field in ["tags", "tag_mode", "entity", "repo"] {
+            assert!(props[field].is_object(), "search should advertise {field}");
+        }
+        call(
+            &s,
+            "remind_me_add",
+            json!({ "content": "mux pane layout", "tags": ["mux"] }),
+        );
+        call(
+            &s,
+            "remind_me_add",
+            json!({ "content": "mux in the terminal", "tags": ["term"] }),
+        );
+
+        let found = call(
+            &s,
+            "remind_me_search",
+            json!({ "query": "mux", "tags": ["mux"], "response_format": "json" }),
+        );
+        let md = text(&found);
+        assert!(md.contains("mux pane layout"), "{md}");
+        assert!(!md.contains("mux in the terminal"), "{md}");
+
+        let bad = call(
+            &s,
+            "remind_me_search",
+            json!({ "query": "mux", "tag_mode": "some" }),
+        );
+        assert!(is_error(&bad), "{bad}");
+    }
+
+    #[test]
+    fn a_decision_without_a_rationale_is_rejected_with_the_field_named() {
+        let s = server();
+        let bad = call(
+            &s,
+            "remind_me_add",
+            json!({ "content": "use X", "memory_type": "decision" }),
+        );
+        assert!(is_error(&bad));
+        assert!(text(&bad).contains("rationale"), "{}", text(&bad));
+
+        let ok = call(
+            &s,
+            "remind_me_add",
+            json!({ "content": "use X", "memory_type": "decision",
+                    "metadata": { "rationale": "cheaper" }, "confidence": 0.8 }),
+        );
+        assert!(!is_error(&ok), "{}", text(&ok));
+        let stored: Value = serde_json::from_str(&text(&ok)).unwrap();
+        assert_eq!(stored["memory_type"], "decision");
+        assert_eq!(stored["confidence"], 0.8);
+
+        let out_of_range = call(
+            &s,
+            "remind_me_add",
+            json!({ "content": "x", "confidence": 2 }),
+        );
+        assert!(is_error(&out_of_range) && text(&out_of_range).contains("confidence"));
+    }
+
+    #[test]
+    fn update_sets_kind_fields_and_refuses_a_bad_outcome() {
+        let s = server();
+        let id = stored_id(&call(&s, "remind_me_add", json!({ "content": "a note" })));
+        let bad = call(
+            &s,
+            "remind_me_update",
+            json!({ "memory_id": id, "outcome": "done" }),
+        );
+        assert!(is_error(&bad) && text(&bad).contains("outcome"));
+
+        let ok = call(
+            &s,
+            "remind_me_update",
+            json!({ "memory_id": id, "memory_type": "action_item",
+                    "metadata": { "due": "2026-10-05T09:00:00Z" }, "outcome": "done" }),
+        );
+        assert!(!is_error(&ok), "{}", text(&ok));
+    }
+
+    #[test]
+    fn reclassify_and_decompose_refuse_a_malformed_kind() {
+        let s = server();
+        let id = stored_id(&call(&s, "remind_me_add", json!({ "content": "a note" })));
+        let bad = call(
+            &s,
+            "remind_me_reclassify",
+            json!({ "classifications": [{ "memory_id": id, "memory_type": "decision" }] }),
+        );
+        assert!(
+            is_error(&bad) && text(&bad).contains("rationale"),
+            "{}",
+            text(&bad)
+        );
+
+        let cap = call(
+            &s,
+            "remind_me_auto_capture",
+            json!({ "conversation": "u: hi", "summary": "greeting" }),
+        );
+        let capture: Value = serde_json::from_str(&text(&cap)).unwrap();
+        let bad = call(
+            &s,
+            "remind_me_decompose",
+            json!({ "capture_id": capture["capture_id"],
+                    "facts": [{ "content": "use X", "memory_type": "decision" }] }),
+        );
+        assert!(
+            is_error(&bad) && text(&bad).contains("rationale"),
+            "{}",
+            text(&bad)
+        );
+        let good = call(
+            &s,
+            "remind_me_decompose",
+            json!({ "capture_id": capture["capture_id"],
+                    "facts": [{ "content": "use X", "memory_type": "decision",
+                                "metadata": { "rationale": "r" } }] }),
+        );
+        assert!(!is_error(&good), "{}", text(&good));
+    }
+
+    #[test]
+    fn resolve_is_listed_and_demotes_a_reverted_decision() {
+        let s = server();
+        let schema = &tool(&s, "remind_me_resolve")["inputSchema"];
+        assert_eq!(schema["required"], json!(["memory_id"]));
+        assert_eq!(
+            schema["properties"]["review"]["enum"],
+            json!(["held", "revised", "reverted"])
+        );
+        let id = stored_id(&call(
+            &s,
+            "remind_me_add",
+            json!({ "content": "adopt X", "memory_type": "decision",
+                    "metadata": { "rationale": "r" } }),
+        ));
+        let resolved = call(
+            &s,
+            "remind_me_resolve",
+            json!({ "memory_id": id, "outcome": "reverted", "note": "broke CI" }),
+        );
+        assert!(!is_error(&resolved), "{}", text(&resolved));
+        let m: Value = serde_json::from_str(&text(&resolved)).unwrap();
+        assert_eq!(m["outcome"], "reverted");
+        assert_eq!(m["metadata"]["outcome_note"], "broke CI");
+
+        let missing = call(
+            &s,
+            "remind_me_resolve",
+            json!({ "memory_id": "mem_x", "outcome": "done" }),
+        );
+        assert!(is_error(&missing));
+        let bad = call(
+            &s,
+            "remind_me_resolve",
+            json!({ "memory_id": id, "outcome": "meh" }),
+        );
+        assert!(is_error(&bad) && text(&bad).contains("outcome"));
+    }
+
+    #[test]
+    fn resolve_records_a_review_separately_from_the_outcome() {
+        let s = server();
+        let id = stored_id(&call(
+            &s,
+            "remind_me_add",
+            json!({ "content": "adopt Y", "memory_type": "decision",
+                    "metadata": { "rationale": "r" } }),
+        ));
+        call(
+            &s,
+            "remind_me_resolve",
+            json!({ "memory_id": id, "outcome": "done" }),
+        );
+        let reviewed = call(
+            &s,
+            "remind_me_resolve",
+            json!({ "memory_id": id, "review": "held", "note": "fewer pages" }),
+        );
+        assert!(!is_error(&reviewed), "{}", text(&reviewed));
+        let m: Value = serde_json::from_str(&text(&reviewed)).unwrap();
+        assert_eq!(m["outcome"], "done");
+        assert_eq!(m["metadata"]["review"]["outcome"], "held");
+        assert_eq!(m["metadata"]["review"]["note"], "fewer pages");
+
+        for args in [
+            json!({ "memory_id": id }),
+            json!({ "memory_id": id, "outcome": "done", "review": "held" }),
+        ] {
+            let both = call(&s, "remind_me_resolve", args);
+            assert!(
+                is_error(&both) && text(&both).contains("exactly one"),
+                "{}",
+                text(&both)
+            );
+        }
+        let bad = call(
+            &s,
+            "remind_me_resolve",
+            json!({ "memory_id": id, "review": "fine" }),
+        );
+        assert!(
+            is_error(&bad) && text(&bad).contains("review"),
+            "{}",
+            text(&bad)
+        );
+    }
+
+    #[test]
+    fn markdown_shows_kind_extras_and_the_expired_mark() {
+        let s = server();
+        call(
+            &s,
+            "remind_me_add",
+            json!({ "content": "quokka policy", "memory_type": "decision",
+                    "metadata": { "rationale": "one store", "alternatives": ["sqlite"] },
+                    "confidence": 0.5, "valid_until": "2020-01-01T00:00:00Z" }),
+        );
+        let compact = text(&call(
+            &s,
+            "remind_me_search",
+            json!({ "query": "quokka policy" }),
+        ));
+        assert!(
+            compact.contains("expired"),
+            "a compact hit keeps its marks: {compact}"
+        );
+        let json = text(&call(
+            &s,
+            "remind_me_search",
+            json!({ "query": "quokka policy", "response_format": "json" }),
+        ));
+        let hit = &serde_json::from_str::<Value>(&json).unwrap()["memories"][0];
+        assert_eq!(hit["expired"], true, "{hit}");
+        assert_eq!(hit["valid_until"], "2020-01-01T00:00:00Z", "{hit}");
+        assert_eq!(hit["confidence"], 0.5, "{hit}");
+        let found = call(
+            &s,
+            "remind_me_search",
+            json!({ "query": "quokka policy", "detail": "full" }),
+        );
+        let md = text(&found);
+        assert!(md.contains("**Rationale:** one store"), "{md}");
+        assert!(md.contains("**Alternatives:** sqlite"), "{md}");
+        assert!(
+            md.contains("expired") && md.contains("confidence 0.50"),
+            "{md}"
+        );
+
+        let hidden = call(
+            &s,
+            "remind_me_search",
+            json!({ "query": "quokka policy", "include_expired": false }),
+        );
+        assert!(text(&hidden).contains("No memories"), "{}", text(&hidden));
+    }
+
+    #[test]
+    fn a_queryless_window_search_is_narrowed_ranked_by_validity_and_limited() {
+        let s = server();
+        call(
+            &s,
+            "remind_me_add",
+            json!({ "content": "solid mux note", "tags": ["mux"] }),
+        );
+        call(
+            &s,
+            "remind_me_add",
+            json!({ "content": "shaky mux note", "tags": ["mux"], "confidence": 0.2 }),
+        );
+        call(
+            &s,
+            "remind_me_add",
+            json!({ "content": "term pane note", "tags": ["term"] }),
+        );
+
+        let search = |args: Value| text(&call(&s, "remind_me_search", args));
+        // Newest first would put the shaky note on top; low confidence
+        // demotes it, and the limit keeps one.
+        let top = search(json!({ "query": "", "since": "1h", "tags": ["mux"], "limit": 1 }));
+        assert!(top.contains("solid mux note"), "{top}");
+        assert!(
+            !top.contains("shaky mux note") && !top.contains("term pane note"),
+            "{top}"
+        );
+
+        let both = search(json!({ "query": "", "since": "1h", "tags": ["mux"], "limit": 5 }));
+        assert!(
+            both.contains("shaky mux note") && !both.contains("term pane note"),
+            "{both}"
+        );
+
+        let none = search(json!({ "query": "", "since": "1h", "repo": "github.com/acme/none" }));
+        assert!(none.contains("No memories"), "{none}");
+    }
+
+    #[test]
+    fn search_takes_a_time_window_and_lists_it_without_a_query() {
+        let s = server();
+        let search = tool(&s, "remind_me_search");
+        for field in ["since", "until", "time_field"] {
+            assert!(
+                search["inputSchema"]["properties"][field].is_object(),
+                "{field}"
+            );
+        }
+        call(
+            &s,
+            "remind_me_add",
+            json!({ "content": "wombat burrow note" }),
+        );
+
+        let listed = call(
+            &s,
+            "remind_me_search",
+            json!({ "query": "", "since": "1h", "response_format": "json" }),
+        );
+        assert!(!is_error(&listed), "{}", text(&listed));
+        assert!(
+            text(&listed).contains("wombat burrow note"),
+            "{}",
+            text(&listed)
+        );
+
+        let future = call(
+            &s,
+            "remind_me_search",
+            json!({ "query": "wombat", "since": "2999-01-01T00:00:00Z" }),
+        );
+        assert!(text(&future).contains("No memories"), "{}", text(&future));
+
+        let bad = call(
+            &s,
+            "remind_me_search",
+            json!({ "query": "", "since": "soon" }),
+        );
+        assert!(
+            is_error(&bad) && text(&bad).contains("`since`"),
+            "{}",
+            text(&bad)
+        );
+        let backwards = call(
+            &s,
+            "remind_me_search",
+            json!({ "query": "", "since": "1d", "until": "2d" }),
+        );
+        assert!(is_error(&backwards) && text(&backwards).contains("must be after"));
     }
 }

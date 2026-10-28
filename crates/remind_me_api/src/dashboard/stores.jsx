@@ -309,3 +309,62 @@ function useOpsStore() {
 
   return { digest, status, running, error, run };
 }
+
+// Projects — the dashboard half of remind_me_project (ADR-0027). Both go
+// through /api/projects, which calls the same `project_tool::call` the MCP
+// tool does, so what Nano sees here and what Claude is told cannot differ.
+//
+// Proposals are suggestions computed from captured session context. They are
+// kept in the store beside the projects because the Pending lane is the point
+// of the view: nothing changes a project's stage until someone answers one.
+// Every claim a confirm writes: the proposal's own, then the stage and
+// status bundled with it when the project does not exist yet. The pending
+// lane shows all of them, so a confirm never declares more than it showed.
+function proposalClaims(p) {
+  const claims = [[p.predicate, p.value]];
+  if (p.with_stage) claims.push(["stage", p.with_stage]);
+  if (p.with_status) claims.push(["status", p.with_status]);
+  return claims;
+}
+
+function useProjectStore() {
+  const [byStage, setByStage] = useState({});
+  const [count, setCount] = useState(0);
+  const [invalid, setInvalid] = useState([]);
+  const [proposals, setProposals] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  const refresh = useCallback(async () => {
+    setLoading(true); setError(null);
+    try {
+      const listed = await api("/projects");
+      if (listed.error) { setError(listed.error); }
+      else {
+        setByStage(listed.by_stage || {});
+        setCount(listed.count || 0);
+        setInvalid(listed.invalid || []);
+      }
+      const open = await api("/projects?action=proposals");
+      setProposals(open.error ? [] : (open.proposals || []));
+    } catch (e) { setError("Could not load projects: " + e.message); }
+    setLoading(false);
+  }, []);
+
+  // One call for both answers: a confirm and a reject differ only by action,
+  // and both must be followed by a refresh or the lane would still show a
+  // proposal that no longer exists.
+  const answer = useCallback(async (action, key) => {
+    setError(null);
+    try {
+      const result = await api("/projects", { method: "POST", body: { action, key } });
+      if (result.error) { setError(result.error); return false; }
+      await refresh();
+      return true;
+    } catch (e) { setError("Could not " + action + " the proposal: " + e.message); return false; }
+  }, [refresh]);
+
+  useEffect(() => { refresh(); }, [refresh]);
+
+  return { byStage, count, invalid, proposals, loading, error, refresh, answer };
+}

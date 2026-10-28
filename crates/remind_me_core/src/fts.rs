@@ -17,14 +17,30 @@
 /// that as "no results" rather than passing it to `MATCH`, which would itself
 /// be a syntax error.
 pub fn sanitize_fts_query(query: &str) -> String {
-    let tokens: Vec<String> = query
+    match_expression(&query_phrases(query))
+}
+
+/// The word tokens of `query`, each one phrase of an any-of search: what
+/// [`sanitize_fts_query`] quotes and joins with `OR`. A full-text index that
+/// takes phrases directly (the engine's, ADR-0023) uses these instead of the
+/// expression, so both backends search for exactly the same thing.
+pub fn query_phrases(query: &str) -> Vec<String> {
+    query
         .split(|c: char| !c.is_alphanumeric() && c != '_')
         .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// `phrases` as an FTS5 `MATCH` expression matching any of them. Empty for
+/// no phrases, which callers must treat as "no results".
+pub fn match_expression(phrases: &[String]) -> String {
+    phrases
+        .iter()
         // FTS5 escapes a literal double quote by doubling it.
         .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
-        .collect();
-
-    tokens.join(" OR ")
+        .collect::<Vec<_>>()
+        .join(" OR ")
 }
 
 /// Pull an `entity:NAME` (or `entity:"Full Name"`) token out of a query.

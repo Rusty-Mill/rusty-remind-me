@@ -37,14 +37,28 @@
 //! [`DEFAULT_IMPORTS_STALE_SCANS`] consecutive scans, so a watch directory
 //! with years of churn does not carry one entry forever for every filename
 //! ever seen.
+//!
+//! # Claude Code sessions are captured, not imported
+//!
+//! The transcripts directory ([`WATCH_CLAUDE_PROJECTS_ENV`]) is watched in
+//! [`Ingest::Sessions`] mode: each `<project>/<session>.jsonl` goes through
+//! [`crate::session_ops::sync_session`], the per-session capture the plugin
+//! hooks write, so a session is stored once whichever of the two saw it
+//! first, and a growing one is refreshed in place rather than re-imported.
+//! The first scan therefore backfills every older session the hooks never
+//! saw. A live session appends on every turn, so it is left until it has
+//! been idle for [`DEFAULT_SESSION_IDLE_SECONDS`] ([`WATCH_IDLE_ENV`]).
 
+use crate::db::memories::Memories;
+use crate::db::Result;
+use crate::db::{SecondarySource, Store};
 use crate::import_paths::{
     import_roots, is_contained, resolve_lexically, split_path_list, SUPPORTED_SUFFIXES,
 };
 use crate::importer::import_file;
 use crate::models::{ImportKind, ImportOutcome};
+use crate::session_ops::{session_files, sync_session, SessionSync};
 use chrono::Utc;
-use rusqlite::{params, Connection, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -56,9 +70,34 @@ pub const WATCH_DIRS_ENV: &str = "REMIND_ME_WATCH_DIRS";
 pub const WATCH_INTERVAL_ENV: &str = "REMIND_ME_WATCH_INTERVAL";
 /// Seconds a file must be untouched before it is considered stable.
 pub const WATCH_GRACE_ENV: &str = "REMIND_ME_WATCH_GRACE";
+/// Seconds a file must have been idle before it is ingested at all. Defaults
+/// to `0` for watch directories and [`DEFAULT_SESSION_IDLE_SECONDS`] for
+/// Claude Code sessions.
+pub const WATCH_IDLE_ENV: &str = "REMIND_ME_WATCH_IDLE";
+
+/// `1` makes Claude Code's session-transcript directory (`.claude/projects`
+/// under the home directory) the watch root when [`WATCH_DIRS_ENV`] is unset.
+/// Off by default: transcripts hold everything said in a session, so reading
+/// them is an explicit choice.
+pub const WATCH_CLAUDE_PROJECTS_ENV: &str = "REMIND_ME_WATCH_CLAUDE_PROJECTS";
 
 pub const DEFAULT_INTERVAL_SECONDS: u64 = 60;
 pub const DEFAULT_GRACE_SECONDS: u64 = 5;
+/// Ten minutes: long enough that a session paused between turns is not
+/// captured on every pause, short enough that a finished one lands soon.
+pub const DEFAULT_SESSION_IDLE_SECONDS: u64 = 600;
+
+/// How a watcher turns a settled file into memories.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Ingest {
+    /// Any supported file, through the chat importer.
+    #[default]
+    Files,
+    /// Claude Code `<project>/<session>.jsonl` transcripts, through the
+    /// per-session capture.
+    Sessions,
+}
 
 /// Consecutive absent scans after which an `imports` entry is evicted.
 ///
@@ -114,6 +153,8 @@ pub struct WatchStatus {
     pub rejected_dirs: Vec<RejectedDir>,
     pub interval_seconds: u64,
     pub grace_seconds: u64,
+    pub idle_seconds: u64,
+    pub ingest: Ingest,
     pub scans: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_scan_at: Option<String>,
@@ -166,18 +207,44 @@ pub fn validate_watch_dirs(dirs: &[PathBuf]) -> (Vec<PathBuf>, Vec<RejectedDir>)
     (accepted, rejected)
 }
 
-/// Watch directories from the environment.
+/// Watch directories from the environment: [`WATCH_DIRS_ENV`] when set,
+/// else the Claude Code transcripts directory when
+/// [`WATCH_CLAUDE_PROJECTS_ENV`] is `1`, else none.
 pub fn configured_watch_dirs() -> Vec<PathBuf> {
-    std::env::var(WATCH_DIRS_ENV)
+    configured_watch().0
+}
+
+/// [`configured_watch_dirs`], with how they are ingested.
+fn configured_watch() -> (Vec<PathBuf>, Ingest) {
+    let explicit = std::env::var(WATCH_DIRS_ENV)
         .ok()
         .filter(|v| !v.trim().is_empty())
         .map(|raw| {
             split_path_list(&raw)
                 .into_iter()
                 .map(PathBuf::from)
-                .collect()
-        })
-        .unwrap_or_default()
+                .collect::<Vec<_>>()
+        });
+    match explicit {
+        Some(dirs) => (dirs, Ingest::Files),
+        None => (claude_projects_dir(), Ingest::Sessions),
+    }
+}
+
+/// The transcripts directory when [`WATCH_CLAUDE_PROJECTS_ENV`] is `1` and a
+/// home directory is known, else empty.
+fn claude_projects_dir() -> Vec<PathBuf> {
+    let flag = std::env::var(WATCH_CLAUDE_PROJECTS_ENV).ok();
+    claude_projects_in(flag.as_deref(), dirs::home_dir())
+}
+
+fn claude_projects_in(flag: Option<&str>, home: Option<PathBuf>) -> Vec<PathBuf> {
+    if flag != Some("1") {
+        return Vec::new();
+    }
+    home.map(|home| home.join(".claude").join("projects"))
+        .into_iter()
+        .collect()
 }
 
 /// Mark a previous import's memories superseded by a newer one.
@@ -192,19 +259,11 @@ pub fn configured_watch_dirs() -> Vec<PathBuf> {
 /// the `superseded_by IS NULL` filter every read path uses, so stale chunks
 /// drop out of search while staying in the database for audit.
 pub fn supersede_import(
-    conn: &Connection,
+    store: &Store<'_>,
     old_import_id: &str,
     new_import_id: &str,
 ) -> Result<usize> {
-    let affected = conn.execute(
-        "UPDATE memories
-            SET superseded_by = ?, updated_at = ?
-          WHERE superseded_by IS NULL
-            AND deleted_at IS NULL
-            AND json_extract(metadata, '$.import_id') = ?",
-        params![new_import_id, Utc::now().to_rfc3339(), old_import_id],
-    )?;
-    Ok(affected)
+    Memories::new(store).supersede_import(old_import_id, new_import_id, &Utc::now().to_rfc3339())
 }
 
 /// A file's identity for change detection.
@@ -221,6 +280,9 @@ pub struct Watcher {
     rejected: Vec<RejectedDir>,
     interval: u64,
     grace: u64,
+    /// Seconds since its last write before a file is considered at all.
+    idle: u64,
+    ingest: Ingest,
     category: String,
     tags: Vec<String>,
     extract_mode: String,
@@ -274,6 +336,8 @@ impl Watcher {
             rejected,
             interval: env_seconds(WATCH_INTERVAL_ENV, DEFAULT_INTERVAL_SECONDS),
             grace: env_seconds(WATCH_GRACE_ENV, DEFAULT_GRACE_SECONDS),
+            idle: env_seconds(WATCH_IDLE_ENV, 0),
+            ingest: Ingest::Files,
             category: "chat_import".to_string(),
             tags: Vec::new(),
             extract_mode: "assistant_messages".to_string(),
@@ -299,7 +363,7 @@ impl Watcher {
     /// watcher with no directories is not a running feature, and reporting it
     /// as one would be misleading.
     pub fn from_env() -> Option<Self> {
-        let configured = configured_watch_dirs();
+        let (configured, ingest) = configured_watch();
         if configured.is_empty() {
             return None;
         }
@@ -307,7 +371,25 @@ impl Watcher {
         if accepted.is_empty() {
             return None;
         }
-        Some(Self::new(accepted, rejected))
+        let watcher = Self::new(accepted, rejected);
+        Some(match ingest {
+            Ingest::Files => watcher,
+            Ingest::Sessions => watcher.with_sessions(),
+        })
+    }
+
+    /// Ingest the watch directories as Claude Code session folders, with the
+    /// idle period defaulting to [`DEFAULT_SESSION_IDLE_SECONDS`].
+    pub fn with_sessions(mut self) -> Self {
+        self.ingest = Ingest::Sessions;
+        self.idle = env_seconds(WATCH_IDLE_ENV, DEFAULT_SESSION_IDLE_SECONDS);
+        self
+    }
+
+    /// Override the idle period.
+    pub fn with_idle(mut self, seconds: u64) -> Self {
+        self.idle = seconds;
+        self
     }
 
     /// Seconds between scans.
@@ -332,14 +414,35 @@ impl Watcher {
     ///
     /// Hidden entries are judged **relative to the watch directory**, so
     /// watching `~/.notes` works while `~/notes/.git/` is still skipped.
-    fn candidates(&self) -> Vec<PathBuf> {
+    ///
+    /// In [`Ingest::Sessions`] mode only `<project>/<session>.jsonl` counts:
+    /// deeper files are a session's subagent transcripts, not sessions.
+    fn candidates(&mut self) -> Vec<PathBuf> {
         let mut files = Vec::new();
+        let mut errors = Vec::new();
         for root in &self.watch_dirs {
             if !root.is_dir() {
                 // May be created later; scans skip what is not there.
                 continue;
             }
-            collect(root, root, &mut files);
+            match self.ingest {
+                Ingest::Files => collect(root, root, &mut files),
+                Ingest::Sessions => match session_files(root) {
+                    Ok(found) => {
+                        files.extend(found.files);
+                        errors.extend(
+                            found
+                                .failed
+                                .into_iter()
+                                .map(|(dir, e)| format!("{}: {e}", dir.display())),
+                        );
+                    }
+                    Err(e) => errors.push(e.to_string()),
+                },
+            }
+        }
+        for error in errors {
+            self.record_error(error);
         }
         files.sort();
         files.dedup();
@@ -347,7 +450,7 @@ impl Watcher {
     }
 
     /// Run one scan pass.
-    pub fn scan_once(&mut self, conn: &Connection) -> ScanCounts {
+    pub fn scan_once(&mut self, store: &Store<'_>) -> ScanCounts {
         let _span = crate::telemetry::maybe_span("watcher.scan");
         let mut counts = ScanCounts::default();
         let now = now_seconds();
@@ -364,6 +467,11 @@ impl Watcher {
                 continue;
             }
             let age = now.saturating_sub(signature.0);
+            if age < self.idle {
+                // Still being written to, by this measure; not even pending.
+                counts.debounced += 1;
+                continue;
+            }
             if age < self.grace && self.pending.get(&path) != Some(&signature) {
                 // Too fresh, and this is the first sighting at this signature.
                 self.pending.insert(path.clone(), signature);
@@ -371,7 +479,7 @@ impl Watcher {
                 continue;
             }
 
-            self.ingest(conn, &path, signature, &mut counts);
+            self.ingest(store, &path, signature, &mut counts);
             self.pending.remove(&path);
         }
 
@@ -410,13 +518,17 @@ impl Watcher {
 
     fn ingest(
         &mut self,
-        conn: &Connection,
+        store: &Store<'_>,
         path: &Path,
         signature: Signature,
         counts: &mut ScanCounts,
     ) {
+        if self.ingest == Ingest::Sessions {
+            self.ingest_session(store, path, signature, counts);
+            return;
+        }
         let outcome = import_file(
-            conn,
+            store,
             path,
             &self.category,
             &self.tags,
@@ -434,7 +546,7 @@ impl Watcher {
             Ok(ImportOutcome::Imported { import_id, .. }) => {
                 let superseded = match self.imports.get(path) {
                     Some(previous) if *previous != import_id => {
-                        supersede_import(conn, previous, &import_id).unwrap_or(0)
+                        supersede_import(store, previous, &import_id).unwrap_or(0)
                     }
                     _ => 0,
                 };
@@ -452,6 +564,25 @@ impl Watcher {
                 counts.errors += 1;
                 self.record_error(format!("{}: {}", path.display(), reason));
             }
+            Err(e) => {
+                counts.errors += 1;
+                self.record_error(format!("{}: {}", path.display(), e));
+            }
+        }
+    }
+
+    fn ingest_session(
+        &mut self,
+        store: &Store<'_>,
+        path: &Path,
+        signature: Signature,
+        counts: &mut ScanCounts,
+    ) {
+        // Recorded whatever happened, as for a file: see `ingest`.
+        self.attempted.insert(path.to_path_buf(), signature);
+        match sync_session(store, path) {
+            Ok(SessionSync::Captured | SessionSync::Refreshed) => counts.ingested += 1,
+            Ok(SessionSync::Unchanged | SessionSync::Empty) => counts.skipped += 1,
             Err(e) => {
                 counts.errors += 1;
                 self.record_error(format!("{}: {}", path.display(), e));
@@ -484,6 +615,8 @@ impl Watcher {
             rejected_dirs: self.rejected.clone(),
             interval_seconds: self.interval,
             grace_seconds: self.grace,
+            idle_seconds: self.idle,
+            ingest: self.ingest,
             scans: self.scans,
             last_scan_at: self.last_scan_at.clone(),
             files_ingested: self.files_ingested,
@@ -511,6 +644,8 @@ pub fn disabled_status() -> WatchStatus {
         rejected_dirs: rejected,
         interval_seconds: env_seconds(WATCH_INTERVAL_ENV, DEFAULT_INTERVAL_SECONDS),
         grace_seconds: env_seconds(WATCH_GRACE_ENV, DEFAULT_GRACE_SECONDS),
+        idle_seconds: env_seconds(WATCH_IDLE_ENV, 0),
+        ingest: Ingest::Files,
         scans: 0,
         last_scan_at: None,
         files_ingested: 0,
@@ -623,37 +758,23 @@ impl WatcherHandle {
     }
 }
 
-/// Where this connection's database lives, or `None` for an in-memory one.
-fn database_path(conn: &Connection) -> Option<PathBuf> {
-    let path: String = conn
-        .query_row("PRAGMA database_list", [], |row| row.get(2))
-        .ok()?;
-    if path.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(path))
-    }
-}
-
-/// Start the folder-watch loop for the database `conn` is attached to.
+/// Start the folder-watch loop for the database `store` is attached to.
 ///
 /// Returns `None` when there is nothing to run: no watch directories
 /// configured (or none usable), or an in-memory database. The in-memory case
 /// matters for the same reason it does for the scheduler — the loop's thread
-/// opens its own connection by path, and `:memory:` would give it a
-/// *different*, empty database, so it would scan files into a store nobody
-/// can read.
+/// lives only as long as its `Database`, so there is nothing a background
+/// thread could outlive it on.
 ///
 /// Conditional, unlike the scheduler: the watcher has an explicit enable
 /// switch in `REMIND_ME_WATCH_DIRS`, and a watcher with no directories is not
 /// a feature to run.
-pub fn start_watcher_for(conn: &Connection) -> Option<WatcherHandle> {
+pub fn start_watcher_for(store: &Store<'_>) -> Option<WatcherHandle> {
     let watcher = Watcher::from_env()?;
-    let db_path = database_path(conn)?;
-    Some(start_watcher(watcher, db_path))
+    Some(start_watcher(watcher, store.secondary_source()?))
 }
 
-fn start_watcher(watcher: Watcher, db_path: PathBuf) -> WatcherHandle {
+fn start_watcher(watcher: Watcher, source: SecondarySource) -> WatcherHandle {
     let interval = std::time::Duration::from_secs(watcher.interval().max(1));
     let shared = std::sync::Arc::new(std::sync::Mutex::new(watcher));
     let (liveness, liveness_guard) = crate::scheduler::Liveness::new();
@@ -668,25 +789,15 @@ fn start_watcher(watcher: Watcher, db_path: PathBuf) -> WatcherHandle {
         .name("folder-watcher".to_string())
         .spawn(move || {
             let _liveness_guard = liveness_guard;
-            // Its own connection, by path: `rusqlite::Connection` is not
-            // `Sync`, so sharing the caller's would trade a compile error for
-            // a runtime serialisation problem.
-            let conn = match Connection::open(&db_path) {
-                Ok(conn) => conn,
-                Err(e) => {
-                    eprintln!("folder watcher: cannot open {:?}: {}", db_path, e);
-                    // Clear the registration rather than leave a `running:
-                    // true` behind a thread that is about to exit.
-                    *LIVE.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                    return;
-                }
-            };
+            // Its own store over the shared engine tables, holding no lock
+            // across a scan.
+            let store = source.store();
             while !loop_stop.is_stopped() {
                 {
                     // Scoped so the lock is released before the sleep — a
                     // status call must not block for a whole interval.
                     let mut guard = loop_shared.lock().unwrap_or_else(|e| e.into_inner());
-                    let counts = guard.scan_once(&conn);
+                    let counts = guard.scan_once(&store);
                     if counts.ingested > 0 || counts.superseded > 0 {
                         eprintln!(
                             "folder watcher: ingested {}, superseded {}",
@@ -726,4 +837,21 @@ pub fn live_status() -> Option<WatchStatus> {
     let mut status = guard.status();
     status.running = alive;
     Some(status)
+}
+
+#[cfg(test)]
+mod claude_projects_tests {
+    use super::*;
+
+    #[test]
+    fn transcripts_are_watched_only_when_switched_on_and_home_is_known() {
+        let home = Some(PathBuf::from("/home/u"));
+        assert_eq!(
+            claude_projects_in(Some("1"), home.clone()),
+            vec![PathBuf::from("/home/u/.claude/projects")]
+        );
+        assert!(claude_projects_in(None, home.clone()).is_empty());
+        assert!(claude_projects_in(Some("0"), home).is_empty());
+        assert!(claude_projects_in(Some("1"), None).is_empty());
+    }
 }

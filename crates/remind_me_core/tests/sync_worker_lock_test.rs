@@ -1,14 +1,17 @@
-//! Regression coverage: the sync worker used to hold `Database::conn()`'s
+//! Regression coverage: the sync worker used to hold `Database::store()`'s
 //! process-wide mutex across its whole network cycle (push + pull against
 //! the hub and every discovered peer), so a hub that accepted a connection
 //! but never answered blocked every other database read or write for up to
 //! that call's full I/O timeout. `SyncWorker` now works its own
-//! `Database::open_secondary()` connection instead, so an ordinary read
+//! store over the shared engine tables instead, so an ordinary read
 //! made while a cycle is stuck talking to a dead remote stays fast.
 //!
 //! `REMIND_ME_NODE_ID`/`REMIND_ME_HUB_URL`/`REMIND_ME_SYNC_SECRET` are
 //! process-global, so this holds `ENV_LOCK` for its duration -- the same
 //! convention `sync_test.rs` established.
+
+#[path = "../src/test_env.rs"]
+mod test_env;
 
 use remind_me_core::sync::{SyncWorker, HUB_URL_ENV, NODE_ID_ENV, SYNC_SECRET_ENV};
 use remind_me_core::Database;
@@ -44,30 +47,30 @@ fn a_stuck_hub_never_blocks_an_ordinary_database_read() {
     let db_path = dir.join("memory.db");
     let db = Arc::new(Database::open(&db_path).unwrap());
 
-    std::env::set_var(NODE_ID_ENV, "lock-test-node");
-    std::env::set_var(HUB_URL_ENV, format!("http://{hub_addr}"));
-    std::env::set_var(SYNC_SECRET_ENV, "lock-test-secret");
+    crate::test_env::set_var(NODE_ID_ENV, "lock-test-node");
+    crate::test_env::set_var(HUB_URL_ENV, format!("http://{hub_addr}"));
+    crate::test_env::set_var(SYNC_SECRET_ENV, "lock-test-secret");
 
-    let mut worker = SyncWorker::from_env(db_path.clone()).expect("sync enabled by env");
+    let mut worker =
+        SyncWorker::from_env(db.secondary_source().unwrap()).expect("sync enabled by env");
 
     // Give the freshly spawned cycle time to reach the hub and block on it.
     std::thread::sleep(Duration::from_millis(300));
 
     let start = Instant::now();
-    db.conn()
-        .query_row("SELECT 1", [], |_| Ok(()))
+    remind_me_core::testing::count(&db.store(), remind_me_core::testing::Table::Memories)
         .expect("a plain local read");
     let elapsed = start.elapsed();
 
     worker.stop();
-    std::env::remove_var(NODE_ID_ENV);
-    std::env::remove_var(HUB_URL_ENV);
-    std::env::remove_var(SYNC_SECRET_ENV);
+    crate::test_env::remove_var(NODE_ID_ENV);
+    crate::test_env::remove_var(HUB_URL_ENV);
+    crate::test_env::remove_var(SYNC_SECRET_ENV);
     let _ = std::fs::remove_dir_all(&dir);
 
     assert!(
         elapsed < Duration::from_secs(2),
         "a plain read took {elapsed:?} while the sync worker was talking to a stuck hub \
-         -- Database::conn()'s mutex is being held across network I/O again"
+         -- Database::store()'s mutex is being held across network I/O again"
     );
 }

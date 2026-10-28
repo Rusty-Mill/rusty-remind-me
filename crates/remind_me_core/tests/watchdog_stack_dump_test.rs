@@ -88,7 +88,14 @@ fn frames_carry_source_locations_not_just_addresses() {
     // Asserted against the probe's own file, which is guaranteed to have
     // debug info in a test build, rather than against std or libc.
     assert!(
-        dump.contains("watchdog_stack_probe.rs:"),
-        "frames should resolve to file:line, not bare addresses\n\n{dump}"
+        dump.lines().any(|frame| {
+            frame.contains("remind_me_probe_stuck_frame")
+                && frame
+                    .split_once("watchdog_stack_probe.rs:")
+                    .and_then(|(_, rest)| rest.strip_suffix(')'))
+                    .and_then(|line| line.parse::<u32>().ok())
+                    .is_some_and(|line| line > 0)
+        }),
+        "the stuck frame should resolve to file:line, not bare addresses\n\n{dump}"
     );
 }

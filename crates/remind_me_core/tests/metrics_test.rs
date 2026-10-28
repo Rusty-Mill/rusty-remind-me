@@ -10,6 +10,9 @@
 //! lives as an inline `#[cfg(test)]` module in `src/metrics.rs`; this file
 //! sticks to the `pub` surface.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 use remind_me_core::metrics::{self, GaugeSpec, METRICS_ENABLED_ENV, SEARCH_TIERS};
 use std::sync::{Mutex, OnceLock};
 
@@ -24,12 +27,12 @@ fn env_lock() -> &'static Mutex<()> {
 fn with_metrics<T>(raw: Option<&str>, body: impl FnOnce() -> T) -> T {
     let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     match raw {
-        Some(v) => std::env::set_var(METRICS_ENABLED_ENV, v),
-        None => std::env::remove_var(METRICS_ENABLED_ENV),
+        Some(v) => crate::test_env::set_var(METRICS_ENABLED_ENV, v),
+        None => crate::test_env::remove_var(METRICS_ENABLED_ENV),
     }
     metrics::reset();
     let out = body();
-    std::env::remove_var(METRICS_ENABLED_ENV);
+    crate::test_env::remove_var(METRICS_ENABLED_ENV);
     out
 }
 

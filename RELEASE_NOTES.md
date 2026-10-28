@@ -2,6 +2,1012 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-10-09 — The remote connector no longer uses `rmcp`
+
+### Changed
+- `remind_me_remote` serves MCP through the workspace's own stack (`rusty_mcp_server`, mounted in axum by `rusty_mcp_axum`). `RemindMeHandler` (the `rmcp` adapter) is replaced by `handler::describe`, which forwards tools, the one resource and the one prompt from `remind_me_mcp::Handler`; the in-memory `InProcessEventStore` is replaced by the server's resumable replies, so `Last-Event-Id` resumption still works with no session.
+- `build_router` now returns `Result<Router, BuildError>` (it was `IssuerError`; `BuildError::Issuer` wraps it). `RemindMeHandler` and `InProcessEventStore` are gone from the public API.
+- Resources and prompts are listed once, when the router is built; tools are asked for on every request.
+- The server no longer offers a standalone `GET` stream for classic sessions (`405`, which the spec allows) and no longer advertises `listChanged` (it never sent one).
+
+### Tests
+- All 13 HTTP tests and 16 OAuth tests pass unchanged, including resumption of a dropped reply. With resumption switched off in the server, five of them fail.
+- Not tested: a real claude.ai connector or `mcp-remote`.
+
+## 2026-10-04 — A store written by another version is refused in plain words
+
+### Changed
+- Opening a store whose tables were written under a record layout this build does not read now fails with a message that names both versions and says what to do: open it with the version that wrote it, or restore a backup from before the upgrade. It used to fail with the engine's hash comparison. The store is not changed by the refusal.
+- Checked by hand against a real rollback: a store written by 0.3.0 was opened with the build before it. Every command, read or write, was refused, nothing in the store changed, and 0.3.0 read it normally afterwards.
+
+### Tests
+- A store with its `memories` layout tag altered is refused with that message and keeps the engine's detail; putting the tag back opens it unchanged. The test fails if the recognition is removed.
+
+## 2026-10-04 — Plugin hooks capture and recall without being asked (ADR-0026)
+
+### Added
+- `UserPromptSubmit` injects only the memories that match the prompt, under a 3,000-character budget. `rusty-remind-me context --hits-only` returns just that section. Prompts under 12 characters and slash commands are skipped.
+- `Stop`, `PreCompact` and `SessionEnd` run `capture-transcript`, so a session no one remembered to save still leaves a capture. There is one capture per session, and each run replaces its dialog. `Stop` is throttled to once a minute and skipped when re-entrant. `SessionEnd` also closes the session and records a work log from git.
+- `REMIND_ME_HOOKS=0` turns every hook off. `REMIND_ME_PROMPT_CONTEXT=0` turns off only the per-prompt injection.
+- `scripts/test_hooks.sh` drives each hook end to end with real hook JSON against the built binary and a temporary store and git repo: 18 checks.
+
+### Changed
+- `SessionStart` opens the session row and injects a brief scoped to the project and branch (persona, reminders due within 7 days, open action items, recent memories), where it used to list the eight newest memories whatever the project.
+- A memory written with a session id leaves a `sessions` row, and the dashboard stamps its writes as `human`.
+
+### Tests
+- `context_brief`: a hits-only request returns just the prompt matches under its own heading, and nothing without a prompt.
+
+## 2026-10-04 — Sessions: transcript capture, episodes, work log and the context brief
+
+### Added
+- `rusty-remind-me session start --session-id ID [--cwd DIR] [--client NAME]` records a session and the repository's HEAD as its `start_sha`. A second start with the same id keeps the first `started_at` and `start_sha`. Prints `{"session_id","started_at","start_sha"}`.
+- `rusty-remind-me session end --session-id ID [--cwd DIR] [--reason R]` sets `ended_at` and `end_sha` and writes a `work_log` memory (category and `memory_type` `work_log`, tags `[work_log, <project>]`, `written_by` `hook`, `capture_method` `auto`) from the repository's diff since `start_sha` plus the working tree: files, insertions, deletions, untracked count, at most 40 file lines then "+N more". Prints `{"session_id","ended_at","end_sha","work_log"}`; `work_log` is the memory id, or `null` when nothing changed (no memory is written). Ending twice refreshes the same memory. A session never started is created at its end, without a `start_sha`.
+- `rusty-remind-me capture-transcript PATH.jsonl --session-id ID [--cwd DIR] [--reason stop|precompact|end]` stores a Claude Code transcript as ONE capture per session id. The first call creates the dialog and summary pair (`written_by` `hook`, `capture_method` `auto`, with the session, project, cwd and branch); later calls replace both halves' text in place and record a `recapture` revision. The summary's title is the first user message cut to 120 characters; its body is "First ask / Last reply / Messages / Tools used". The dialog keeps the last 200,000 characters. Prints `{"capture_id","dialog_id","summary_id","messages"}`.
+- `rusty-remind-me context [--cwd DIR] [--project P] [--branch B] [--prompt TEXT] [--budget CHARS] [--json]` renders the brief a session starts with: persona, reminders due within 7 days, open action items, the project's 8 most recent memories (the branch's first), and with `--prompt` the top 5 matches. Sections that do not fit `--budget` (default 8000, `0` for none) are dropped whole and named. `--json` prints `{"context","sections","dropped"}`. Project and branch default to those of `--cwd`.
+- `rusty-remind-me session timeline --session-id ID [--json]` and the MCP tool `remind_me_session_timeline {session_id?, project?, limit?, response_format?}`: one session with its memories oldest first, or without an id the most recent sessions with how many memories each wrote.
+- `--session-id` falls back to `REMIND_ME_SESSION_ID` and `--cwd` to `REMIND_ME_CWD`, then the current directory. The commands run through the store daemon when it is on, like `add` and `search`; paths are made absolute first.
+- A write that carries a `session_id` and finds no `sessions` row creates a minimal one: captures and chat imports do now.
+- `REMIND_ME_WATCH_CLAUDE_PROJECTS=1` makes the folder watcher watch the Claude Code transcripts directory (`.claude/projects` under the home directory) when `REMIND_ME_WATCH_DIRS` is unset. Off by default.
+
+### Changed
+- A chat import keeps what the transcript envelopes say. `ChatMessage` gains `timestamp`, `session_id`, `uuid`, `cwd`, `git_branch` and `tool_use` (one summary per call: tool name, the first 200 characters of its main argument, whether it failed). A memory from a chat import now carries `session_id`, `cwd`, `git_branch` and `project` (the last part of the cwd), `created_at` set to the message's own time (`updated_at` stays the import time), `written_by` `importer:chat` and `capture_method` `auto`. Tool calls are summarised as `tool: Bash — cargo test -p …`, one line each, in the `conversations` extract mode only.
+- `importer::extract_messages_with_tools` also returns a message that is only tool calls; `extract_messages` still drops it.
+- Every chat import is stamped `written_by` `importer:chat`, `capture_method` `auto`; the v32 round-trip test now expects that for a plain chat (it expected `unknown` and `manual`).
+
+### Tests
+- Importer: a JSONL fixture with timestamps, session id, cwd and tool calls gives the stamped fields; a re-import adds nothing; tool lines appear in `conversations` mode only; a plain chat is still written by the importer.
+- Transcript: parsing (ask, reply, tools, bad lines, meta lines, truncation) and one capture per session on the engine, with a recapture revision and separate captures for separate sessions.
+- Work log against a temporary git repository: a commit plus an unstaged edit give the expected counts, no change and no repository give nothing, and the file list is capped.
+- Episodes: start is idempotent, end writes and links one work log, an end with no change writes none, a stamped write creates its session. The context brief: project and branch scoping, hidden sensitive, expired and closed items, budget trimming, due reminders and prompt hits. The CLI argument parsing, the daemon op shapes and the MCP tool on an empty store.
+
+## 2026-10-04 — Boundary passes: reference extraction, secret redaction, attachment references
+
+### Added
+- Rule-based extraction at write time (`extract.rs`, no new dependency). `owner/repo#123` and GitHub issue/pull URLs become `issue`/`pull` references (`o/r#5`); other URLs, commit shas (7-40 lowercase hex with a digit and a letter), `@handles` and file paths (`src/foo.rs`, `file.rs:123` with the line kept in the label) become references too. A bare `#123`, plain numbers and emails are never extracted. Capitalised two-to-four-word runs and `snake_case`/`PascalCase` identifiers that appear twice become entity mentions; the caller's entities win on kind. At most 50 references and 20 entities per memory.
+- Extraction runs in `remind_me_add`, the summary half of `remind_me_auto_capture` (not the raw dialog), decompose facts and the importers' chunk insert (which also covers the webhook). `MemoryAddInput.extract` (default true) or `REMIND_ME_EXTRACT=0` turns it off.
+- `remind_me_get` and `remind_me_search` (JSON) carry `references` on each memory, fetched in one pass by the new `References::for_memories`. Markdown search appends a `refs:` line (up to five) per memory that has any.
+- New MCP tool `remind_me_references { kind?, value?, memory_id? }`: the reverse lookup ("everything about rusty_mill/x#321"), with a short view of each memory the references point from. Also `References::of_kind`.
+- Secret redaction (`redact.rs`): AWS access key ids, GitHub tokens, Slack tokens, `api_key`/`secret`/`token`/`password` `:`/`=` values of eight characters or more (the value only), PEM private key blocks, JWTs and the password in `https://user:pass@host`. Each is replaced by `[REDACTED:<kind>]`; the memory gains the `redacted` tag and `metadata.redactions`. Applied in add, both capture halves, decompose and the importers, before the insert. `REMIND_ME_REDACT=0` opts out.
+- Attachment references: `MemoryAddInput.attachments` (`{path?, url?, label?}`). A path is hashed with SHA-256 and stored as a `kind=attachment` reference `sha256:<hex>` labelled with the given label or the file name, plus `metadata.attachments[]` with path, size, mime (by extension) and hash. The bytes are never stored. A URL is stored as given. A missing path fails the add and names the path. `rusty-remind-me add --attach <path>` is repeatable. The `sha256` crate was already a dependency.
+
+### Tests
+- Table-driven unit tests for every extraction rule and its negatives, every redaction kind plus false-positive guards, attachment hashing, and the merge of caller and extracted entities. Integration tests on the engine store check the reference rows after `remind_me_add`, the `redacted` tag on the stored row, attachment references and the reverse lookup tool.
+
+## 2026-10-04 — Every memory records where and by whom it was written; search and list filter on it
+
+### Added
+- A `context` module fills the schema v32 context columns on every new memory: `project`, `git_remote`, `git_branch`, `git_sha`, `cwd` and `session_id`. The directory is `REMIND_ME_CWD`, else the process's own. `project` is the git top-level directory's name, else the directory's. Each `git` call has a 2-second timeout and a failure leaves only that field empty. The result is cached per directory for 30 seconds, so a burst of writes forks `git` once while a long-running server still notices a branch switch.
+- `git_remote` is stored as `host/owner/repo`: no scheme, credentials, port or `.git`. `https://user:token@github.com/o/r.git`, `ssh://git@github.com:22/o/r` and `git@github.com:o/r.git` all become `github.com/o/r`, so a token in `origin` never reaches the store and one repository is one value.
+- `written_by` and `capture_method` are filled on every write path. `REMIND_ME_WRITTEN_BY` wins when set to `human`, `hook`, `unknown`, `model`, `model:<id>` or `importer:<name>`; an unrecognised value is ignored. Otherwise `rusty-remind-me add` is `human`, an MCP tool call is `model` (`model:<id>` when `REMIND_ME_MODEL` is set), and an importer is `importer:<source>`. The webhook marks what it ingests `importer:webhook`. An importer is never overridden by the environment.
+- `capture_method` is `auto` for captures, promotions and importers, `manual` otherwise. An importer keeps only the project from the context: the branch and sha of wherever the tool ran say nothing about the files it read.
+- `REMIND_ME_CWD`, `REMIND_ME_SESSION_ID`, `REMIND_ME_WRITTEN_BY` and `REMIND_ME_MODEL` travel with each daemon connection like `REMIND_ME_CLIENT`, so the daemon stamps the caller's directory and session, not its own. A client that sets no `REMIND_ME_CWD` sends its own current directory, and the CLI's `add` declares itself `human`. These four are left out of the settings clients compare with the daemon's.
+- `remind_me_search` and `remind_me_list` take `project` (case-insensitive), `branch`, `session_id` and `written_by` (exact match). `rusty-remind-me search` and `list` take `--project`, `--branch`, `--session` and `--written-by`. They narrow inside the ranked query, so `limit` and `total` count only matching memories; the semantic half of a search is narrowed the same way.
+- Markdown rendering shows `project@branch` on a memory's header line when it has a project. The session id appears only in JSON.
+- `remind_me_stats` adds `by_project`, the ten projects with the most memories, busiest first, and a `### Projects` section in its markdown.
+
+### Changed
+- Feedback on a memory written by a hook or an importer counts half: a helpful or unhelpful signal moves `base_weight`, or is logged as a contextual event, at `0.075` instead of `0.15`. A verbatim capture is noisier than something a person or model chose to write.
+- The dashboard-database and MemPalace importers, which stamped neither `node_id` nor `client`, now stamp both along with the rest.
+
+### Tests
+- `tests/context_test.rs`: list and search filtered by each field and by all four, project case-insensitivity, `total` after filtering, flat tool arguments deserialising into the filters, `add_memory` stamping the context and writer from the environment (and ignoring a bogus override), an importer stamping itself despite `REMIND_ME_WRITTEN_BY`, feedback at half weight for `hook` and `importer:*`, `by_project` capped at ten, and the markdown header.
+- `context.rs` unit tests: remote normalisation, the `written_by` rule, `detect` against a real temporary git repository (skipped without `git`), a non-repository directory and a missing one.
+- An engine test checks the webhook marker credits `importer:webhook`.
+
+## 2026-10-04 — Typed memory kinds, outcome tracking, and validity-aware ranking
+
+### Added
+- Typed memory kinds. `MemoryKind` is a closed set (`decision`, `action_item`, `preference`, `fact`, `reference`, `insight`, `learning`, `blocker`, `work_log`, `unclassified`) in the new `kinds` module, with per-kind metadata checks: a decision needs `rationale` (a non-empty string) and may hold `alternatives` (strings) and `adr`; an action item may hold `due` (RFC 3339), `owner` and `status` (`open`, `done`, `dropped`). Other keys are allowed.
+- `remind_me_add` and `remind_me_update` take `memory_type`, `confidence` (0 to 1), `valid_from`, `valid_until` (RFC 3339, not before `valid_from`) and `outcome` (only for decisions and action items). A malformed value is refused with an error naming the field, and nothing is stored. `remind_me_decompose` checks each fact's kind and takes a per-fact `metadata`; `remind_me_reclassify` checks the kind against the memory's stored metadata, so a decision without a rationale cannot be reclassified into one. A stated `memory_type` also sets the decay rate and weight.
+- `remind_me_resolve { memory_id, outcome, note? }` and `rusty-remind-me resolve <id> <outcome> [--note]` close a decision or action item as `done`, `abandoned`, `reverted` or `superseded`. The state it replaces is kept in history with reason `resolve`. A reverted or abandoned memory loses half its `base_weight` (vitality is recomputed); `done` and `superseded` leave it. The note is stored as `metadata.outcome_note`. The tool is in the `core` profile.
+- A scenario built on a reverted or abandoned decision is no longer offered as a persona candidate, and such a source stops counting as grounds for a persona statement.
+- `remind_me_search` takes `include_expired` (default true, so nothing disappears) and `min_confidence` (default 0). A memory whose `valid_until` has passed ranks after everything in window (score times 0.25), and every memory's score is multiplied by its `confidence`. A future `valid_from` is treated like an expired window.
+- Markdown output: a decision shows its rationale and alternatives, an action item its due date and status, and the header line shows `confidence` below 1, a `valid until` date or `expired`, and an `outcome`. Memories with none of these render as before.
+- `remind_me_stale_candidates` also lists memories whose `valid_until` has passed, as `expired_at`, even when `REMIND_ME_CODE_ROOTS` is unset.
+- `remind_me_contradiction_candidates` recommends which side of a same-subject, same-predicate pair to keep (higher confidence, then newer `verified_at`, then newer `updated_at`) in `recommended_keep`, and lists that side as `memory_a`.
+- `remind_me_annotate` supersedes memories its triple contradicts, as `decompose` does, and reports `superseded_ids`.
+- `remind_me_provenance` follows `source_capture_id`: the capture a fact was decomposed from appears in `sources`, and a capture's decomposed facts in `derived`.
+- The MCP `initialize` reply carries an `instructions` string (under 600 characters) on when to search, add, auto-capture and resolve.
+
+### Fixed
+- `remind_me_add`'s schema advertised only five of the fields it accepts. It now lists `metadata`, `subject`, `predicate`, `object` and `entities` as well.
+
+### Changed
+- `remind_me_contradiction_candidates` now also pairs memories that state the same subject and predicate with different objects, which supersession should have settled and did not (a sync merge, an import). A restatement with the same object is still excluded.
+
+### Tests
+- `structure_test.rs` (16 tests): stored fields, rejection of each malformed kind with nothing written, update against the stored kind, resolve with weight and history, reclassify and decompose guards, provenance through a capture, expired and low-confidence ranking and filters, contradiction preference and its tie-breaks, expired stale candidates, annotate supersession, persona withholding.
+- `kinds` and `retrieval` unit tests, including `validity_factor` at exactly `valid_until`, with no window, and at confidence 0 and 1.
+- MCP tests over JSON-RPC for the schema, the `initialize` instructions, validation errors, `remind_me_resolve` and the Markdown extras; CLI parser and `Op::Resolve` tests.
+
+## 2026-10-04 — The SQLite runtime store is removed (ADR-0025)
+
+### Changed
+- The node's only store is the `rusty_multimodal_db` engine. The `engine-store` feature, `REMIND_ME_STORE`, `Database::open_on_sqlite`, `Database::open_on_engine`, `Database::open_in_memory_on_engine`, `Store::sqlite()`, `Store::over_sqlite` and every SQLite arm of every repository under `db/` are gone; `Database::open` always opens the engine directory beside the configured path, and `Database::open_in_memory` always opens temporary engine tables. The SQLite schema files, their migrations and the open-time schema checks went with them (about 12,500 lines).
+- Each repository under `db/` (`Memories`, `Entities`, `Outbox`, `WikiIndex`, …) is a thin layer over the `db/engine/<group>.rs` module that owns its records. Callers' names are unchanged.
+- `rusqlite` is linked in one module, read-only: `db::legacy_sqlite`. It copies an old `memory.db` onto the engine on the first open (the file is then never opened again), reads the `dbs` and MemPalace importers' SQLite files, and writes test fixtures. `grep -rn rusqlite crates/*/src | grep -v legacy_sqlite` is empty.
+- The copy reads a `memory.db` at schema version 30, 31 or 32 (v31's missing columns take the engine record's defaults). An older file is refused with the remedy: open it once with rusty-remind-me 0.2.x first. After a copy, entity ids an earlier build derived differently are rewritten once.
+- `StoreError::Sqlite(rusqlite::Error)` is `StoreError::Legacy(String)`; `BackupError::Sqlite` and `BackupError::NotSqlite` are gone. The importers' `Sqlite` error variants are folded into `Store`.
+- Backups are a copy of the engine directory (`backups/<label>-<timestamp>.engine`), taken while the tables are held and renamed into place from a `.partial` directory. Older `backups/*.db` files still list and are pruned in turn. A cloud upload of an engine backup checks the plaintext gate first, then reports `Unavailable`, as before.
+- Background threads (scheduler, watcher, promotion nudge, sync worker, peer server) work on a `SecondarySource::store()` over the shared engine tables, which lock per call, instead of a SQLite connection of their own; `Database::open_secondary` and `open_secondary_at` are gone.
+- Two things the SQLite open did on every open now happen on the engine's: the outbox is pruned by the retention rule, and a changed embedding model clears the stored vectors.
+- `remind_me_server_status` reports `database_exists` as whether the engine directory exists and `database_bytes` as the engine directory's size; `schema_version` is the version the engine's records mirror (`db::SCHEMA_VERSION`, 32).
+- `rusty-remind-me copy-store` is no longer behind a feature. The `store_bench` example runs `engine` and `open` modes only.
+- `remind_me_hub`'s SQLite reader for the hub copy tool is renamed `import::legacy_sqlite` (from `import::sqlite`); its behaviour is unchanged.
+- CI: the `store: sqlite` matrix leg is gone, and no leg passes `--features engine-store`.
+
+### Tests
+- The differential tests (`on_each_backend`, "the engine ... as SQLite does") are direct engine tests with the SQLite results written down as expectations. `schema_test.rs`, `migration_snapshot_test.rs` and `vector_rekey_test.rs` (SQLite schema, migrations and the v29 vector rekey) are deleted; the outbox gate and embedding-model checks at open moved from `schema_test.rs` to `open_reconcile_test.rs`, which also covers the outbox prune at open.
+- The copy on first open is tested against two checked-in SQLite files written by the last SQLite-storing build, `tests/fixtures/legacy_store/legacy_v32.db` and `legacy_v31.db`, with a row in every table: both copy onto the engine and read back through every repository, refused rows are reported, a filled target and an unreadable version are refused, the source is byte-for-byte untouched, and a fresh node with no file starts empty.
+- `backup_test.rs` round-trips an engine backup by restoring it and opening the restore, and checks a leftover SQLite backup still lists and prunes.
+- Before: 2182 passed, 0 failed, 0 ignored across 151 test binaries. After: see the report.
+
+## 2026-10-04 — Schema v32: where a memory was written, how far to trust it, and the tables for references and sessions
+
+### Added
+- `memories` gains thirteen columns, every one defaulted so existing rows need nothing: where the row was written (`project`, `session_id`, `git_remote`, `git_branch`, `git_sha`, `cwd`), how far to trust it (`valid_from`, `valid_until`, `confidence` at 1.0, `verified_at`, `outcome`) and who wrote it (`written_by` at `unknown`, `capture_method` at `manual`). `SCHEMA_VERSION` is 32. The entries above fill them.
+- The columns travel everywhere a memory row does: `Memory`, `NewMemory`, `MemoryEdit` (one optional setter per column, so `remind_me_update` can set them), the engine's `MemoryRow`, the outbox payload (41 keys now) and `SyncRecord` (defaulted on the way in, so a peer on an older build still syncs), the hub's `MemoryRecord`, row and wire form, and `remind_me_export_memories`. Importing one of this crate's own exports reads them back; a chat someone else exported leaves them at the defaults.
+- `models::WriteContext`: the six context columns a writer learns once per process, with `apply` to stamp a `NewMemory`.
+- Two tables on the engine store, with their repositories: `memory_references` (`db::references::References`: `insert`, `for_memory`, `find`, `delete_for_memory`) for the URLs, issues, commits, paths, handles and attachments a memory names, and `sessions` (`db::sessions::Sessions`: `upsert_start`, `end`, `get`, `recent`) for each client session's start and end. A repeated start keeps the first beginning and fills in what the first did not know. Both are part of the memories core, so a `Store::transaction` covers them and the engine copy's emptiness check counts them.
+- `SyncRecord::from_memory`, the wire record for a stored memory.
+
+### Changed
+- The engine's `memories` table moved to the `@2` layout. A table written before (`@1`) is read under its own layout and rewritten at the next open, every new column at its default; the journal and undo log need no upgrade. The hub's `MemoryRow` does the same.
+- The engine is the only store for them (ADR-0025). An older `memory.db` is copied onto the engine on first open with every new column at its default.
+
+### Tests
+- A row with every new column set reads back as written, one with none reads the defaults, and the edit's setters write each column, across insert, synced upsert and edit.
+- References inserted, listed by memory, found by kind and value, deleted; a session's repeated start, end and `recent` by project; a `@1` memories table (blob and insert log) upgrades at open and the garbage case names both failures; a journal batch from before v32 replays with defaults; a v31 SQLite file opens on the engine with every copied row's new columns defaulted.
+- Sync: a record without the columns reads the defaults; the columns round-trip through the outbox, apply on another node and read back as the same record.
+- Export: an export carries the columns and importing it reads them back; a plain chat import defaults them.
+- Hub: the columns default on parse and reach the wire; a `@1` memories table is upgraded at open and new writes follow it. The recorded route answers carry the new keys.
+
+## 2026-09-29 — Sync status reports tombstones still holding text
+
+### Changed
+- `remind_me_sync_status`'s `tombstones.compactable_now` is replaced by `tombstones.holding_text`. The old field counted tombstones older than the 30-day outbox retention, from when compaction was expected to purge them. Tombstones are never purged now (ADR-0024), so it measured nothing.
+- `holding_text` counts tombstones that still hold their text. Every open, delete and sync apply empties them, so it should read 0. Any other number means a tombstone was written some other way.
+
+### Tests
+- `sync_status_test.rs`: a delete leaves a tombstone that is not counted; one stamped directly, keeping its text, is.
+
+## 2026-09-29 — The store daemon compacts its tables every hour
+
+### Added
+- The store daemon compacts the engine tables every hour (`REMIND_ME_COMPACT_INTERVAL_SECS`, default `3600`, `0` for off), as the hub already does. Only tables with something to reclaim are rewritten: an insert log holding entries, or slots left by deleted rows. Each pass that compacts anything logs how many tables it did.
+- Opening the store already folds each table's log into a fresh file, so this matters for a daemon that runs a long time between restarts. On a real node the pruned outbox left `sync_outbox.mmap.records` at 102.7 MB until the next restart or compaction.
+- The engine gains `GenericMmapStore::needs_compaction`, a cheap check, since `compact` always rewrites a table whole.
+- `REMIND_ME_COMPACT_INTERVAL_SECS` is left out of the settings clients compare with the daemon's, since only the daemon reads it.
+
+### Tests
+- On an on-disk store, compaction after writes and a delete compacts some tables, a second pass compacts none, and a reopen reads every row as before. An engine test covers `needs_compaction` before and after a replace, a delete and a compaction.
+
+## 2026-09-29 — Hub compaction empties every tombstone that holds text (ADR-0024)
+
+### Changed
+- `POST /admin/compact_tombstones` empties every tombstone that still holds its text, whatever its age, and answers `{"emptied": n}`; the `retention_days` key is gone. `REMIND_ME_HUB_TOMBSTONE_RETENTION_DAYS` is removed, and a hub that still sets it ignores it.
+- On the real hub the 90-day default emptied nothing: the 47,008 tombstones copied from Postgres were all younger than that, so they kept their text. Emptying never changes which write wins, so there was nothing to wait for.
+
+### Tests
+- Compaction empties a recent tombstone as well as an old one.
+
+## 2026-09-29 — The outbox drops what the hub has taken
+
+### Fixed
+- Since sends became per remote, a sent outbox row was only pruned once it was 30 days old: the prune dropped rows with `sent_at` set, and per-remote sends never set it. On a real node the outbox was the largest thing in the store, 102.7 MB of 185 MB for 66,678 rows, every one already at the hub. Each row is a full copy of a memory as it was when queued, so it also kept the text of memories deleted since (ADR-0024).
+- A row the hub has taken is now pruned on the next sync cycle or open. Every node pulls it from the hub, and a peer can also pull it from this node's feed, which reads the memories themselves, not the outbox. A row not yet taken by the hub is kept for the retention window as before, whatever peers have taken, and a node without a hub is unaffected.
+
+### Tests
+- A row the hub has taken is pruned at once, with its send marker; a row only a peer has taken waits for the window.
+
+## 2026-09-29 — A node keeps no text of a deleted memory (ADR-0024)
+
+### Changed
+- A delete now keeps the tombstone without its text: `content` becomes `(deleted)`, `tags` becomes `[]`, and `subject`, `predicate` and `object` become null. The id, timestamps, `deleted_at`, `category`, `source` and `metadata` stay, so last-write-wins and re-import checks work as before. The copy queued for sync carries no text either.
+- A deleted memory's revision history is deleted with it, whether the delete tombstones or removes the row.
+- A tombstone arriving by sync is stored the same way, whatever the sender kept. A live copy that loses to a local tombstone no longer adds its tags to it.
+- The first open after the upgrade empties every tombstone that still holds text and deletes the revisions of every deleted memory, on whichever store the node runs. It logs what it dropped. It is storage, not an edit: nothing is queued and `updated_at` stays, since every node empties its own copy. Later opens find nothing to do.
+- `remind_me_export_memories` with `include_deleted` exports tombstones with the placeholder text, not their old text.
+
+### Tests
+- `tombstone_empty_test.rs`, on both stores: a delete drops the text, the history and the queued text; a hard delete drops the history; a tombstone arriving by sync is stored empty, a losing live copy adds no tags, and a newer edit still wins; an open empties tombstones an earlier build left, queues nothing and is idempotent; an open drops the history of deleted memories only.
+
+## 2026-09-29 — The hub stores tombstones without their text and never deletes them (ADR-0024)
+
+### Changed
+- A pushed tombstone is stored emptied: `content` becomes `(deleted)`, `tags` becomes `[]`, and `subject`, `predicate` and `object` become null. Its id, timestamps, `deleted_at`, `category`, `source` and `metadata` stay. Last-write-wins compares `updated_at` only, so no push applies or loses differently.
+- `POST /admin/compact_tombstones` no longer deletes anything. It empties tombstones older than `REMIND_ME_HUB_TOMBSTONE_RETENTION_DAYS` that still hold text, such as those a copy brought over from an older hub, leaving each row's `updated_at` and `hub_seq` as they were. It answers `{"emptied": n, "retention_days": d}`; the `purged` key is gone. Links to deleted memories are kept.
+
+### Fixed
+- Compaction could bring a deleted memory back. It hard-deleted tombstones by age, so a node offline for longer than the retention never saw the delete, and its next push of the memory found no row on the hub, was inserted as live, and reached every node. The tombstone now stays to lose against.
+
+### Tests
+- A pushed tombstone pulls back emptied, with its `source` and `metadata`; a stale live push loses to it after compaction, and a newer edit still wins; compaction deletes no tombstone and no link, and renumbers nothing; a copied hub's text-holding tombstone is emptied in place by compaction.
+
+## 2026-09-29 — The hub's Quadlet unit keeps retrying until its address exists
+
+### Fixed
+- `deploy/remind-me-hub.container` publishes the hub on one address. At boot the unit can start before that address is assigned: `network-online.target` does not wait for it unless the host enables a wait-online service. Every attempt failed with `bind: cannot assign requested address`, and systemd's default start limit marked the unit failed after five tries in about a second. A real hub stayed down for six days that way. The unit now sets `StartLimitIntervalSec=0` and `RestartSec=5`, so it retries every 5 s until the address exists. `setup.sh install` and `setup.sh migrate` install the fixed unit. An already-installed hub picks it up on the next `setup.sh update`, or by adding the two lines by hand.
+
+## 2026-09-29 — A process without the sync settings no longer switches sync off (ADR-0007)
+
+### Fixed
+- Every open aligned the store's sync switch with the opening process's own settings. On a node whose processes differ (a claude.ai connector with `REMIND_ME_NODE_ID`, `REMIND_ME_HUB_URL` and `REMIND_ME_SYNC_SECRET`, a dashboard without), each dashboard open switched sync off and emptied the outbox, and each connector open switched it on and queued the whole store again. Edits made in between were never queued, and the dashboard's deletes were hard deletes no other node saw. A real node's sync was broken this way for six days.
+- A process without the settings now leaves a syncing store syncing, and warns on stderr. Its edits are queued, and its deletes are tombstones.
+- Whether a delete (including `undo_import`) leaves a tombstone now follows the store's sync switch, not the process's settings.
+
+### Changed
+- Turning sync off takes `REMIND_ME_SYNC_DISABLE=1` (or `true`, `yes`, `on`). It empties the outbox and wins over the sync settings. Unsetting the settings in one process no longer turns sync off.
+
+### Tests
+- `sync_gate_test.rs` reopens one store under changing settings. Against the previous behaviour it fails as the node did: the switch off and the outbox empty.
+
+## 2026-09-28 — The engine's search index holds live memories only (ADR-0023)
+
+### Changed
+- A node keeps deleted and superseded memories as sync tombstones: on a real node, 47,008 of 62,060 rows. The engine indexed all of them for full-text search, though every search keeps live memories only. Now only live memories are indexed. On 60,000 synthetic memories with three quarters deleted, the steady open went from 5.2–5.5 s and 419 MB resident to 2.1–2.2 s and 275 MB.
+- Keyword search finds the same memories as before. Its BM25 scores now count live memories only, where SQLite's FTS5 counted tombstones too, so scores and near-tie ordering can differ slightly from a node on SQLite.
+
+### Tests
+- A superseded or deleted memory leaves the index, and one brought back is searchable again, including after a rebuild.
+- The comparison with FTS5 runs twice: with no tombstones, the scores must match exactly; with tombstones, the matches and totals must.
+
+## 2026-09-28 — The first start on the engine says what it is doing, and clients wait for it (ADR-0023)
+
+### Changed
+- The first start with an engine build copies `memory.db` into `memory.engine`, once. On a real 15,000-memory node that took about two minutes, and the node printed nothing while it ran. It now logs each table as it finishes and the total time, to stderr: in `memory.db.daemon.log` when a client started the daemon.
+- A client waiting for the daemon it started now waits up to 30 minutes, not 60 seconds, once it sees that copy under way (`memory.engine.partial` exists), including the open that follows it. It says once on stderr why it is waiting and where the progress is. Before, the first client after the upgrade gave up after a minute and then failed, because the daemon held the store.
+- `rusty-remind-me copy-store` prints each table as it finishes, with its time.
+
+### Upgrading
+- Expect the first start after upgrading to take a while on a large store: minutes, not seconds. Leave it running; the copy verifies every row and happens once. Don't run `copy-store` into `memory.engine` while the node is still running on SQLite. Rows written after the copy would be missing, because the new build finds `memory.engine` and does not copy again.
+
+### Tests
+- The copy reports every table it copied, once each and with the report's counts.
+- Whether a copy is under way follows the partial and engine directories.
+
+## 2026-09-28 — The engine opens faster in a fifth of the memory (ADR-0023)
+
+### Changed
+- The engine's full-text index is laid out compactly: each term and each memory is numbered once, instead of the memory's id and the term's text being copied into every entry. At 15,000 memories a node on the engine now opens in about 1.2 s with 110 MB resident, where it took 4.5 s and 622 MB. Keyword search returns the same results, scores and snippets.
+
+### Tests
+- A document slot freed by a delete is reused without leaking the old document's terms, and a phrase with a word no document holds matches nothing.
+
+## 2026-09-28 — The copy onto the engine keeps every float exactly (ADR-0023)
+
+### Fixed
+- The first open on the engine refused memories whose `vitality` or `base_weight` did not survive `serde_json`'s default float parser, which reads some values back one bit off (`0.9774999999999999` as `0.9775`). Decay produces such values, so an ordinary node could refuse to start after upgrading. `remind_me_core` now enables `serde_json`'s `float_roundtrip`, as the rest of the workspace already does, so the engine reads back exactly what it stored.
+
+### Tests
+- A memory with such a value copies onto the engine and reads back bit for bit.
+
+## 2026-09-28 — The engine is the default store (ADR-0023, phase 5.4b)
+
+### Changed
+- The node's store is now the engine. On the first start with this build, `memory.db` is copied into `memory.engine` beside it, keeping every id and verifying every row; if any row cannot be copied the start fails, names it, and leaves `memory.db` untouched. `engine-store` is now a default feature.
+- `REMIND_ME_STORE=sqlite` keeps a node on SQLite. After the copy, move `memory.engine` aside first to go back to `memory.db` as it was at the copy.
+- A client that cannot use a running daemon now says that the daemon holds the store and that `rusty-remind-me daemon stop` releases it, instead of a bare "in use by another process".
+
+## 2026-09-28 — The store daemon is on by default (ADR-0023, phase 2b)
+
+### Changed
+- The store daemon is now on by default: the first MCP session, CLI command, `api` or `remote` starts `rusty-remind-me daemon`, and every other one talks to it. Set `REMIND_ME_DAEMON=0` (or `false`, `no`, `off`) to open the store in each process as before. A client that cannot use the daemon still falls back to opening the store itself and says why on stderr.
+
+## 2026-09-28 — Backups of a store on the engine (ADR-0023, phase 5.4a)
+
+### Added
+- `remind_me_backup` backs up a store on the engine to `backups/{label}-{timestamp}.engine`: a directory holding the SQLite file and the engine directory, copied while the engine is held so no write lands half-copied. Restoring is putting both back beside each other. Listing and retention count these backups alongside `.db` ones.
+
+### Changed
+- A store on the engine is no longer refused a backup. With a cloud bucket configured, the upload of an engine backup reports that it is not available yet rather than skipping silently.
+
+## 2026-09-28 — An on-disk node opens on the engine (ADR-0023, phase 5.3)
+
+### Added
+- With `engine-store` and `REMIND_ME_STORE=engine`, `Database::open` keeps the node's store in the engine directory beside its file (`memory.db` has `memory.engine`). The first open copies the SQLite file there, into a `.partial` directory that is renamed into place only once every row copied. A refused row stops the open and leaves the file as it was.
+- `Database::open_on_sqlite` and `Database::open_on_engine`, which pick a backend whatever `REMIND_ME_STORE` says.
+
+### Changed
+- A background thread that writes while an import holds a page open now waits for the page to finish instead of being refused.
+- Without the engine, `Database::open` refuses a file whose store has been copied onto the engine, since that file stopped changing at the copy.
+- `remind_me_backup` refuses a store on the engine instead of backing up its SQLite file, which stopped changing at the copy. Engine backups follow in the next step.
+
+## 2026-09-28 — Copy a whole node store onto the engine, and `copy-store` (ADR-0023, phase 5.2)
+
+### Added
+- `db::engine::copy::copy_store`, which copies a node's whole SQLite store onto the engine: the memories core, saved searches, import archives, the sync log, analytics snapshots, memory revisions and the wiki. Every id is kept, every row is verified, and refused rows are reported, never dropped silently.
+- `rusty-remind-me copy-store --to <engine-dir> [--from <memory.db>]`, behind the CLI's new `engine-store` feature. It never writes to its source, and it exits non-zero, listing each refused row, if anything could not be copied.
+
+### Fixed
+- The core copy's differential test no longer depends on the unspecified order of `Memories::all_live`.
+
+## 2026-09-28 — Copy the memories core from SQLite to the engine (ADR-0023, phase 5.1)
+
+### Added
+- `db::engine::copy::copy_core`, which copies the sixteen memories-core tables from a node's SQLite store into an empty engine core, keeping every id. It never writes to its source, and it refuses a source at another schema version. A row the engine cannot keep is refused and reported, never dropped silently. Every row is verified after it is written.
+
+### Tests
+- A differential test copies a store with a row in every core table and requires every repository read to answer the same on SQLite and on the copy. Further tests cover refusals, a non-empty target, an old source, the outbox sequence, and a source that is left untouched.
+
+## 2026-09-28 — The memories core is switched on (ADR-0023, core PR 5b)
+
+### Changed
+- The engine's memories core is now always open. With `engine-store` and `REMIND_ME_STORE=engine`, memories and every group that joins them live on the engine, so the whole engine test leg runs on the core.
+
+### Removed
+- The test-only "no core" mode of the engine tables, its constructors and its two tests.
+
+## 2026-09-28 — Tests reach stored rows through the repositories (ADR-0023, core PR 5a)
+
+### Added
+- `remind_me_core::testing`, a hidden public module for tests. Its raw reads and writes of memory columns, row counts, outbox entries and send markers work on SQLite and on the engine's memories core alike.
+- `Database::open_sqlite_in_memory`, for tests of what only SQLite has.
+
+### Fixed
+- An in-memory database on the engine now sets the `sync_enabled` gate in the engine's own sync flags. Before this, with sync configured, writes on the engine were never queued.
+
+### Tests
+- About 330 tests in 52 suites no longer seed or read memories with SQL, so they are ready for the core to be switched on. No test or assertion was removed.
+
+## 2026-09-27 — Import pages as one journal batch on the engine core (ADR-0023, core PR 4b)
+
+### Added
+- `Store::transaction`, which makes a unit of work land whole or not at all. It uses a SQLite transaction, plus one page on the engine's memories core when the core is present. An error or a panic rolls both back.
+- Pages on the engine core. A page's writes are readable as it goes, and an undo log beside the redo journal makes a crash leave either all of the page or none of it.
+
+### Changed
+- The dbs and mempalace importers write each page through `Store::transaction`.
+
+### Tests
+- Page tests: finishing, abandoning, a crash inside a page, a crash after its redo commit, and another thread's write during a page.
+- Differential tests on both backends: a failed transaction and a successful one, and a dbs import followed by a rerun that supersedes an item.
+
+## 2026-09-27 — Vectors and import bookkeeping on the engine core, built dark (ADR-0023, core PR 4a)
+
+### Added
+- The engine's memories core gains tables for chunk vectors, embedding metadata, and the chat, dbs and mempalace import ledgers. `Vectors` and `ImportLedger` use the core when it is present, for every read and write. The chat-import count in the store stats moves with them.
+
+### Changed
+- Several orders that were unspecified are now fixed:
+  - chunks come back in key order, so "any" embedding is the first by key;
+  - consolidation candidates come oldest first, then by id, which also decides which ones a limit keeps;
+  - embedding metadata comes back by key;
+  - the earliest chat import is returned for a content hash;
+  - every id list from the import ledger comes back sorted.
+
+### Tests
+- A differential test runs every vector and import-ledger method against SQLite and the core, and requires identical answers.
+
+## 2026-09-27 — Curation and promotions on the engine core, built dark (ADR-0023, core PR 3c)
+
+### Added
+- The engine's memories core gains the promotions provenance table. `Promotions` and `Curation` use the core when it is present, for every read and write. This covers:
+  - capture, normalization and maintenance queues;
+  - contradiction pairs;
+  - fact groups;
+  - ready scenarios;
+  - persona statements.
+
+### Changed
+- Several orders that were unspecified are now fixed, breaking ties by id:
+  - a capture's rows;
+  - the tags taken for a capture;
+  - the undecomposed and unnormalized queues;
+  - the entity fact groups and the ids within each group;
+  - scenarios, statements and provenance lists.
+
+### Tests
+- A differential test runs every curation and promotion method against SQLite and the core, and requires identical answers.
+
+## 2026-09-27 — Associations and the sync feed on the engine core, built dark (ADR-0023, core PR 3b)
+
+### Added
+- The engine's memories core now holds memory associations. When the core is present, `Related` uses it for bumping pairs, relatives through shared entities, the document window and co-retrieval.
+- When the core is present, `SyncFeed` serves all four pull feeds and the graph counts from it.
+- `Related::unlink_memory`, which removes a memory's associations when the memory is deleted.
+
+### Changed
+- The document window and co-retrieval now return tied results in id order. Before, the order of ties was unspecified.
+
+### Tests
+- A differential test runs associations, expansion reads and every sync feed page against SQLite and the core, and requires identical results.
+
+## 2026-09-27 — Entities, relations and mentions on the engine core, built dark (ADR-0023, core PR 3a)
+
+### Added
+- The engine's memories core gains the knowledge graph: entities, mention links and relations. `Entities` uses them when the core is present.
+- On the core, each graph write commits in one journal batch with its sync outbox entry. The backfill takes entities and links from the core.
+- `Entities::unlink_memory`, which removes a memory's mention links when the memory is deleted.
+- `Memories::unannotated_page`, the batch of memories still awaiting extraction.
+
+### Changed
+- Results that tie now come back in id order instead of an unspecified order. This applies to:
+  - the mention-ranked entity page;
+  - memories linked to an entity;
+  - facts naming an entity;
+  - relations touching an entity;
+  - the unannotated batch.
+
+### Tests
+- A differential test runs every graph operation with sync on against SQLite and the core. It requires identical reads, queued outbox payloads and backfill.
+
+## 2026-09-27 — Stats counts on the engine core, built dark (ADR-0023, core PR 2d)
+
+### Added
+- `StoreStats` counts memories on the engine's memories core when it is present. This covers:
+  - live memories;
+  - counts by category, source and tag;
+  - totals and tombstones;
+  - all memories by category;
+  - the shareable digest;
+  - the recent list.
+
+  The chat-import count and the storage figures stay on SQLite.
+
+### Changed
+- Memories in the digest's newest-first list that share a creation time now come in descending id order.
+
+### Tests
+- A differential test runs every count against SQLite and the core, and requires identical answers.
+
+## 2026-09-27 — Reminders, feedback and history on the engine core, built dark (ADR-0023, core PR 2c)
+
+### Added
+- The engine's memories core gains the `reminder_deliveries` and `memory_feedback` tables.
+- `Reminders`, `Feedback` and `Revisions` use the core when it is present, for every read or write of memories, deliveries or feedback.
+- `Feedback::delete_for` removes a memory's feedback events, which is part of deleting a memory.
+
+### Changed
+- Ties now break by id where the order was unspecified:
+  - reminders with the same `remind_at`;
+  - review candidates with the same weight and last access.
+- A memory's feedback events now list oldest first.
+
+### Tests
+- Differential tests run reminders, feedback and history against SQLite and the core, and require identical answers. They cover:
+  - reminder windows and deliveries;
+  - rescheduled and cleared reminders;
+  - the review queue;
+  - refused feedback ids and signals;
+  - importance;
+  - deleting feedback;
+  - reverts.
+
+## 2026-09-27 — Search on the engine core, built dark (ADR-0023, core PR 2b)
+
+### Added
+- `Memories::keyword_hits` (with a `KeywordFilter`), `Memories::keyword_page` (with a `PageFilter` and an optional `EntityScope`), and `Memories::sensitive_ids`. Each uses the engine's memories core and its full-text index when present, and SQLite otherwise.
+
+### Changed
+- The keyword half of search and paginated search go through the repository instead of building SQL inline.
+- Search results with equal BM25 scores now come in id order, where SQLite left their order unspecified. In a search with no terms, memories created at the same instant come in descending id order.
+
+### Tests
+- A differential test runs one corpus through FTS5 and the engine core. It covers ranked hits and scores, the category, sensitivity and vitality filters, limits, paging, tags, the entity scope, and superseded and deleted memories. It requires identical results.
+
+## 2026-09-27 — Get, list and field edits on the engine core, built dark (ADR-0023, core PR 2a)
+
+### Added
+- New `Memories` methods: `get_live`, `live_category`, `list_page` with a `ListFilter`, `apply_edit` with a `MemoryEdit`, `delete_live` and `of_type_page`. Each uses the engine's memories core when it is present, and SQLite otherwise.
+
+### Changed
+- These now go through the repository instead of inline SQL: getting, listing, updating, deleting, bulk tagging, annotating and reclassifying memories, and the unclassified batch. Behaviour on SQLite is unchanged. Update, bulk tag, annotate and reclassify share one `MemoryEdit`, so their writes can't drift apart.
+
+### Tests
+- A differential test runs listings, edits, tombstones, hard deletes and the unclassified batch against SQLite and the core, and requires identical answers. It covers filters, sensitivity, paging, tie order and 500-character snippets of multi-byte text.
+
+## 2026-09-27 — Memory writes on the engine, built dark (ADR-0023, core PR 1)
+
+### Added
+- With the `engine-store` feature, the engine tables can hold the memories core: memories, the sync outbox, its send markers and the sync flags, plus a full-text index and a tag index rebuilt from the memories at open. Nothing opens the core yet except its own tests. A running node, and the engine CI leg, keep these tables on SQLite until the switch-on PR.
+- On the core, a memory write and the outbox entry recording it commit as one journal batch, the first cross-store batches. The journal replays an unapplied batch at the next open. After a batch fails part-way, the tables refuse further writes until reopened.
+- `Memories`, `Outbox` and `SyncState`'s flags and sends use the core when it is present. The graph's outbox entries are queued into it from the SQLite rows.
+
+### Changed
+- The engine journal now replays core batches at open instead of refusing every non-empty batch. It still refuses changes to a store it does not know, and tables opened without the core refuse core changes.
+
+### Tests
+- A differential test runs every `Memories` write with sync on, against SQLite and the core. It requires identical rows, reads, counts and outbox payloads. The memories, outbox and sync-flag repository tests also run on both.
+- Engine tests cover:
+  - the derived indexes through update and delete;
+  - the outbox gate;
+  - a failed edit;
+  - `json_each`'s tag semantics;
+  - `json_set`'s ingest marker;
+  - reopening, with outbox ids still rising;
+  - replaying a batch left in the journal;
+  - refusing core batches without the core.
+- Lock re-acquire races with a forked sibling test are fixed: the daemon endpoint lock, the hub copy reopen, and the engine reopen tests now retry while the lock reads as held.
+
+## 2026-09-27 — The wiki on the engine (ADR-0023, phase 4h)
+
+### Added
+- With the `engine-store` feature and engine tables present, the wiki's pages, links and metadata live in the engine, and wiki search runs on the engine's full-text index, rebuilt from the pages at open. Search results, their order and their snippets match FTS5's.
+- `fts::query_phrases` and `fts::match_expression`: a query's search phrases, and the FTS5 expression built from them. `sanitize_fts_query` is now the two together. `WikiIndex::search` takes phrases rather than an FTS5 expression.
+- `WikiIndex::link_count`.
+
+### Tests
+- The wiki repository's tests run on both backends, including listing orders and duplicate links. A differential test runs one corpus through FTS5 and the engine and requires identical hits and snippets. An engine test covers rebuilding the search index at open.
+
+## 2026-09-27 — Memory revisions on the engine (ADR-0023, phase 4g)
+
+### Added
+- With the `engine-store` feature and engine tables present, memory revisions live in the engine, with ids from the journal's durable sequence. Listing, reverting by id, and the rule that a revision id from another memory is not found all behave as on SQLite.
+
+### Tests
+- A new repository test runs on both backends: revisions list newest first, edits in the same clock tick list in write order, limits apply, and a revision is only found under its own memory. An engine test covers ids and rows across a reopen. The reminders test counts revisions through `history()` instead of SQL.
+
+## 2026-09-27 — Analytics snapshots on the engine, with journal-backed ids (ADR-0023, phase 4f)
+
+### Added
+- With the `engine-store` feature, the engine tables open the redo journal (`node.journal`) and use its durable sequences for integer ids. An id is made durable before the record that uses it is written, so a crash leaves a gap rather than a reissued id. A journal holding changes this build cannot apply is refused at open.
+- Analytics snapshots live in the engine when engine tables are present. `snapshot_on` uses the UTC day of `captured_at`, as SQLite's `date()` does.
+
+### Tests
+- Snapshot storage runs on both backends, including a capture east of UTC that belongs to the previous day. Engine tests cover ids rising across a reopen and the refused journal. The analytics integration test plants its series through the repository; the malformed-value test stays on an on-disk (SQLite) database, since only SQL can plant one.
+
+## 2026-09-27 — Sync cursors on the engine (ADR-0023, phase 4e)
+
+### Added
+- With the `engine-store` feature and engine tables present, `sync_log` (each remote's pull cursors and liveness stamps) lives in the engine. The other sync bookkeeping, `sync_flags` and `sync_sends`, stays on SQLite for now.
+- `SyncState::remote_row` and `SyncState::put_remote_row`, a whole-row read and write over the new `SyncLogRow`, whose `new` holds the schema's defaults.
+
+### Tests
+- The sync-state repository's cursor tests run on both backends, and a new test covers whole-row round trips and default rows. The sync integration tests seed and inspect `sync_log` through the repository, so the engine CI leg covers them.
+
+## 2026-09-27 — Background threads share the engine tables (ADR-0023, phase 4d)
+
+### Changed
+- The scheduler, folder watcher, promotion nudge, sync worker and sync peer server reopen the store through a `SecondarySource`: their own SQLite connection, as before, plus the database's engine tables, shared rather than dropped. `Database::secondary_source()` and `Store::secondary_source()` provide one. `SyncWorker::from_env`, `scheduler::start_scheduler` and `promotion::start_nudge` take a `SecondarySource` instead of a path.
+- The dbs and mempalace importers keep the engine tables inside their own SQLite transaction (`Store::sharing_engine`).
+- No behaviour changes in default builds: without `engine-store` a `SecondarySource` is just the path.
+
+### Tests
+- A thread's store and an importer's transaction store see the same engine tables as the main store, in both directions.
+
+## 2026-09-27 — Import archives on the engine (ADR-0023, phase 4c)
+
+### Added
+- With the `engine-store` feature and engine tables present, raw-transcript archives and their per-memory spans live in the engine. The repository behaves as on SQLite: recording again replaces, removing an import takes its spans, a span without an archive has no source, and shared blobs are counted by hash.
+- `Archives::span_count`, so callers and tests can count spans without SQL.
+
+### Tests
+- The archive repository's unit tests run on both backends. The archive integration tests use an in-memory database and repository reads, so the engine CI leg covers them.
+
+## 2026-09-27 — Saved searches on the engine (ADR-0023, phase 4b)
+
+### Added
+- The `engine-store` feature of `remind_me_core` (off by default): `db::engine::EngineTables`, the engine stores for the table groups moved so far, locked by `node.lock` in their directory. With the feature on, `REMIND_ME_STORE=engine` makes `Database::open_in_memory()` keep those groups on temporary engine tables. On-disk databases stay on SQLite until the copy tool lands.
+- Saved searches and their seen-memory rows are the first group with an engine implementation. The repository behaves identically on both backends: a name in use is refused, the first sighting is kept, and a delete takes the seen rows with it.
+- `StoreError::Engine`, for failures the engine reports.
+
+### Fixed
+- `remind-me-checks.yml` parses again. A half-deleted header comment had broken it since the phase 0 change, so the plugin.json version check had not run.
+
+### Tests
+- The saved-search repository's unit tests run every case on SQLite and, with the feature, on the engine. Engine tests cover reopening, the directory lock, id collisions and temp-dir cleanup. A new CI leg runs the whole core suite with `REMIND_ME_STORE=engine`.
+
+## 2026-09-27 — The store seam (ADR-0023, phase 4a)
+
+### Changed
+- Callers in `remind_me_core`, `remind_me_mcp`, `remind_me_api`, the CLI and `remind_me_remote` take a `db::Store` handle instead of a `rusqlite::Connection`. Repositories return `db::Result`, whose error is the backend-neutral `db::StoreError`. `Database::conn()` is now `Database::store()`, and `Store::sqlite()` is the escape hatch for schema code and tests. SQLite is still the only backend; behaviour is unchanged. This is the seam the engine-backed store plugs into, one table group at a time.
+
+### Tests
+- Existing suites were moved onto `Store` without changing their assertions. New unit tests pin `NotFound` to SQLite's message and check the borrowed-connection path.
+
+## 2026-09-27 — Engine full-text index matching FTS5 (ADR-0023, phase 3b)
+
+### Added
+- `rusty_multimodal_db_engine::fulltext`: an in-memory full-text index that tokenizes, matches, scores and writes snippets exactly as SQLite FTS5 does for the node's queries, so its keyword search survives the move off SQLite unchanged. The `unicode61` tables are generated from the bundled SQLite (`scripts/gen_unicode61_tables.py`).
+
+### Tests
+- A differential suite runs a seeded corpus and 600 queries through FTS5 and the index: same rows, same order, scores within 1e-9, identical snippets. A test pins the tokenizer tables to the linked SQLite version.
+
+## 2026-09-27 — Engine journal, sequences and directory lock (ADR-0023, phase 3a)
+
+### Added
+- `rusty_multimodal_db_engine::journal`: a redo journal that makes a batch across several engine stores crash-atomic, and durable named sequence counters. The node will write a memory, its tags and its outbox entry through it (phase 4).
+- `rusty_multimodal_db_engine::dir_lock`: the data-directory lock, moved from the hub into the engine so the node daemon takes the same one.
+
+### Changed
+- The hub takes its directory lock from the engine. Same file (`hub.lock`), same error message; behaviour is unchanged.
+
+### Tests
+- Journal unit tests: replay order, checkpoint, sequences across reopen and checkpoint, every torn-tail cut, a zeroed last entry, corruption before the last entry, foreign files and versions. Integration tests over two real engine stores for crash-atomicity, idempotent replay and never-reissued outbox ids.
+
+## 2026-09-26 — The store daemon, opt-in (ADR-0023, phase 2a)
+
+### Added
+- **`rusty-remind-me daemon`**: one process owns the store, and MCP sessions, CLI commands, `api` and `remote` become its clients over loopback. It is on only with `REMIND_ME_DAEMON=1`; the first client starts it. `daemon status` and `daemon stop` manage it.
+- The reminder scheduler, folder watcher, promotion nudge and sync worker run once in the daemon, not in every long-lived process. When configured, the webhook and sync-peer listeners run once too, where before every MCP session tried to bind the same port.
+
+### Changed
+- `REMIND_ME_CLIENT`, `REMIND_ME_DEFAULT_RESPONSE_FORMAT`, `REMIND_ME_TOOL_PROFILE` and the MCP handshake's client identity are per connection on the daemon, so one client never takes on another's.
+- A client whose other `REMIND_ME_*` settings differ from the running daemon's, or that is a different build, says why on stderr and opens the store in-process as before. Nothing changes silently.
+- With the daemon off (the default), behaviour is unchanged.
+
+### Tests
+- The handshake, refusals, sessions, fingerprint and endpoint files are unit-tested. End-to-end tests run the real binary: CLI output through the daemon is byte-identical to in-process, a mismatched client falls back and names the setting, MCP over stdio records its own session's client, and the dashboard API is relayed.
+
+## 2026-09-26 — The last store reads move into db:: (ADR-0023, phase 1, step 8a)
+
+### Changed
+- **No SQL against the node's store is left outside `db::`.** Expansion's reads and association writes (`db::related`), the peer server's pull feeds and counts (`db::sync_feed`), the digest, vitality report, code-reference scan, export, sync status and reconcile reads moved into repositories. `db::database_path` replaces six copies of `PRAGMA database_list`.
+- The only remaining SQL outside `db::` reads the foreign SQLite files the dbs and mempalace importers take in. Behaviour is unchanged.
+- ADR-0023: step 8b (a store handle replacing `&Connection`) moves to phase 4, where the engine-backed `NodeStore` gives it a second implementation. Phase 1 is complete.
+
+### Tests
+- New repository test: a co-retrieval pair is read from either side and its weight is capped.
+- The core, API, MCP, CLI and remote suites pass unchanged.
+
+## 2026-09-26 — No more SQLite triggers; schema v31 (ADR-0023, phase 1, step 7)
+
+### Breaking
+- **Schema version 31.**
+  - The fifteen triggers that maintained the full-text indexes, the tag index and the sync outbox are gone, and opening an older database drops them.
+  - `db::derived` does their work in the same savepoint as each write, so a failed write leaves the indexes as they were.
+  - A write made with raw SQL outside `db::` is no longer indexed or queued; `db::derived::rebuild_indexes` rebuilds the indexes from the rows.
+- **Synced records are no longer queued at all.** Before, the triggers queued them and the apply marked them sent. `sync_outbox` no longer holds sent echo rows, and `Outbox::high_water`/`suppress_echo` are removed.
+- `Entities::link` and `Entities::insert_relation_or_ignore` take an `Origin`.
+- `schema_triggers.sql` is removed. The v30 triggers are kept as a test fixture (`tests/fixtures/schema_v30_triggers.sql`).
+
+### Unchanged
+- Outbox payloads keep the triggers' shape exactly: SQLite's `json_object` over the same columns, with tags and metadata as JSON text and `sensitive` as 0 or 1. Peers and the hub need no change.
+- Access tracking still queues nothing, and a local edit queues exactly one row.
+
+### Tests
+- New `db::derived` tests:
+  - the index and tags follow a memory through insert, update and delete;
+  - only local edits that move `updated_at` are queued, and nothing is queued with sync off;
+  - a failed write leaves the index as it was;
+  - the payload keeps the trigger shape, all 28 keys.
+- Updated tests:
+  - the stale-trigger test now installs the v30 outbox triggers and checks that reopening drops them, so an edit is queued once;
+  - the v19 migration test checks that its triggers are gone;
+  - the echo test checks that an applied record queues nothing while local edits stay queued.
+- Fixtures that plant rows with raw SQL rebuild the indexes. The core, API, MCP, CLI and remote suites pass.
+
+## 2026-09-26 — Vectors are keyed by memory id; schema v30 (ADR-0023, phase 1, step 4)
+
+### Breaking
+- **Schema version 30.** `vec_chunks` is now `(memory_id, chunk_ix, embedding)`, keyed by memory id rather than `memories.rowid`, and `vec_embeddings` is gone.
+  - Opening a v29 database moves every chunk across, inside one savepoint, after the usual pre-migration backup. Chunks whose memory no longer exists are dropped.
+  - Nothing needs re-embedding.
+- **A database from a newer build is refused.** Before, an older build would have reshaped it back to its own schema; now it names the version and asks for an upgrade. An older build of this crate opening a v30 database fails when it tries to rebuild `vec_chunks`, which leaves the database as it was.
+- **The optional ANN index must be rebuilt** (`--features ann`). Its manifest now keys vectors by memory id. An older manifest reads as unusable, so search uses the exact full scan until the index is rebuilt.
+- `sync::ApplyOutcome::Applied` no longer carries a rowid.
+
+### Changed
+- Every vector statement lives in `db::vectors::Vectors`: storing, deleting, the semantic scan, the reindex list, consolidation's candidates and `embedding_meta`.
+
+### Tests
+- New migration tests build the v29 vector layout by hand, then check that opening it keeps every chunk under its memory id, drops the orphan, runs once, and that a newer stamp is refused and left untouched.
+- The vector, ANN (with and without `--features ann`), consolidation and schema tests now seed the v30 table. The core, API, MCP and CLI suites pass.
+
+## 2026-09-26 — The sync outbox goes behind db::outbox (ADR-0023, phase 1, step 6)
+
+### Changed
+- **`db::outbox::Outbox` now holds every statement against `sync_outbox` and `sync_sends`:** push batches, pending counts, pruning, the clear and backfill when sync is toggled, and echo suppression. Echo suppression works as before; it becomes a flag on the write once the triggers move (step 7). Behaviour is unchanged.
+
+### Tests
+- New repository tests: echo suppression touches only the key's rows above the mark; pending counts rows with no send to the remote; pruning drops old and sent rows and their send markers.
+- The core, API, MCP and CLI suites pass unchanged.
+
+## 2026-09-26 — Curation queue reads go behind db::curation (ADR-0023, phase 1, step 5c)
+
+### Changed
+- **`db::curation::Curation` now holds every statement `capture.rs`, `normalize.rs`, `maintenance.rs` and `contradictions.rs` ran:** the decomposition and normalization backlogs, capture lookups, the maintenance counts, and contradiction pairs. Behaviour is unchanged.
+
+### Tests
+- New repository tests: a capture leaves the backlog once a fact names it, and an import once it is normalized, with the batch count and the maintenance count agreeing each time; contradiction pairs page by keyset and respect the fan-out ceiling.
+- The core, API, MCP and CLI suites pass unchanged.
+
+## 2026-09-26 — Import bookkeeping goes behind db:: (ADR-0023, phase 1, step 5b)
+
+### Changed
+- **`db::archives::Archives`** now holds every statement against `import_archives` and `import_archive_spans`, and creates them at open. `archive::ensure_schema` is gone.
+- **`db::imports::ImportLedger`** now holds every statement against `chat_imports`, `dbs_imports` and `mempalace_imports` from the importers and `undo_import`, including the undo's per-kind memory queries.
+- Reading the foreign SQLite files the dbs and mempalace importers take in stays with them. Behaviour is unchanged.
+
+### Tests
+- New repository tests: a chat import is forgotten only once nothing of it is left; a dbs rerun replaces the tracked memory; a recorded drawer is not re-recorded; removing an archive takes its spans and leaves a shared blob counted.
+- The core, API, MCP and CLI suites pass unchanged.
+
+## 2026-09-26 — Promotion's storage goes behind db::promotions (ADR-0023, phase 1, step 5a)
+
+### Changed
+- **Every statement `promotion.rs` ran now lives in `db::promotions::Promotions`.** That covers the candidate queries and counts for all three rungs, source checks, duplicate detection, provenance, and the persona and demoted listings. The `promotions` table is created by `db::promotions::ensure_table`; `promotion::ensure_schema` is gone. Behaviour is unchanged.
+
+### Tests
+- New repository tests: surviving sources count only live, unsuperseded sources; a superseded source is unusable.
+- The core suite passes unchanged.
+
+## 2026-09-26 — The wiki index goes behind db::wiki (ADR-0023, phase 1, step 3)
+
+### Changed
+- **Every statement against `wiki_pages`, `wiki_links`, `wiki_meta` and `wiki_fts` now lives in `db::wiki::WikiIndex`.** `wiki.rs` and `wiki_fs.rs` keep the rules: files are the source of truth, reserved slugs, reconcile, the load budget and the compile watermark. The compile brief's reads of new memories moved to `db::memories`.
+- `delete_wiki_page` now also clears the deleted page's outgoing links, as the file-backed delete already did.
+
+### Tests
+- New repository tests: an unbacked write keeps the cached mtime and a new one starts at 0; removing a page takes its links and reports a missing page; `wiki_meta` round-trips and overwrites.
+- The core, API, MCP and CLI suites pass unchanged.
+
+## 2026-09-26 — The knowledge graph's storage goes behind db::entities (ADR-0023, phase 1, step 2)
+
+### Changed
+- **Every statement against `entities`, `entity_relations` and `memory_entities` from `entity.rs` and `sync/graph.rs` now lives in `db::entities::Entities`.** That covers lookups, upserts, mention links, relations, the traversal's edge query, id renormalisation and sync apply. Nothing outside `db::` writes to the graph tables or to `memories` now. Behaviour is unchanged.
+
+### Tests
+- New repository tests: a synced entity overwrite keeps `created_at`; repointing drops a link the target already has; a traversal step from no entities is empty.
+- The core, API, MCP and CLI suites pass unchanged.
+
+## 2026-09-26 — Memory writes go through one repository (ADR-0023, phase 1, step 1)
+
+### Changed
+- **Every write to `memories` now lives in `db::`.** `db::memories::Memories` holds the inserts, the sync upsert and the field updates that capture, skeletons, promotion, normalization, consolidation, the importers, the watcher, the webhook, access tracking and sync apply used to write inline. A new row is a `NewMemory`, whose defaults are the schema's. This is the groundwork for moving the FTS, tag and outbox triggers into Rust (step 7).
+- A normalized memory's tags, copied from its source, are re-serialized rather than copied as text. They read the same.
+
+### Tests
+- New repository tests: `NewMemory::new` matches the schema default of every column; `insert` refuses a taken id and `insert_or_ignore` reports it; a synced overwrite keeps `created_at`, `doc_id` and `chunk_index`; tags that are not an array read as none; access inputs skip unknown ids.
+- The core, API, MCP and CLI suites pass unchanged.
+
+## 2026-09-26 — The Python remind_me is retired (ADR-0023, phase 0)
+
+### Changed
+- **The schema files are hand-owned.** `schema_{tables,indexes,triggers}.sql` were dumps of the Python remind_me's schema, and CI failed when they drifted from it. With Python retired, they are edited by hand, and a change to them is a schema change (`db/migrations.rs`). `SCHEMA_VERSION` stays 29 and is now this crate's own number.
+- **ARCHITECTURE.md Tenet 3 is replaced.** "Data Parity with `remind-me`" (an identical v29 SQLite file the Python server could open) becomes "Wire compatibility, not file sharing": the node keeps the MCP tool signatures and the sync protocol, and no longer promises a file the Python server can read. §5 now says where the schema lives and lists the objects this crate adds.
+- **Docs:** the README's substitution section becomes "Coming from the Python `remind_me`", a one-way move. `docs/CUTOVER.md` and `gap-analysis.md` are marked historical. ADR-0007's regeneration half is superseded.
+
+### Removed
+- The `schema-drift` CI job, its weekly schedule, and `scripts/check_schema_drift.sh`, `scripts/check_schema_regen_drift.sh` and `scripts/regenerate_schema.py`. The plugin-version check stays.
+
+### Fixed
+- **`configure_mcp.py` and `configure_mcp.ps1` pointed clients at an empty database.** Their default path was not the one the server uses; both now default to `~/.remind-me/memory.db`.
+
+## 2026-09-26 — The hub's Postgres and SQLite stores are removed
+
+### Breaking
+- **The hub stores its data only in the embedded engine** (ADR-0021, phase 3). A hub configured with `DATABASE_URL` or `REMIND_ME_HUB_DB_PATH` now refuses to start, even beside `REMIND_ME_HUB_DATA_DIR`. It prints the copy that moves its store over, so it never comes up empty in front of data that was not copied.
+  - This lands in the same release as the engine default, not one later as ADR-0021 first planned. The ADR's decision 6 is amended.
+- **Moving an existing hub over:**
+  - A `setup.sh` hub: run `setup.sh migrate`. It builds the new image, checks every row can be copied while the hub still runs, stops the hub, copies the store with every `hub_seq` kept, rewrites `hub.env` (keeping the old one as `hub.env.pre-engine`), installs the one-container unit, and starts the hub. The old Postgres container or SQLite file is left for you to remove. `--drop-invalid` copies past rows the engine cannot store.
+  - Anything else: run `rusty-remind-me-hub-copy`, then replace the old variable with `REMIND_ME_HUB_DATA_DIR`. The crate README has the steps; `deploy/fly.toml` has Fly's.
+- **`setup.sh`:** `--postgres` and `--sqlite` are gone. `install` and `update` refuse a hub still on a retired store and point at `migrate`. `restore <dump.sql>` now loads the dump into a throwaway Postgres container and copies it onto the engine; a hub that already holds memories needs `--force`, and the data it replaces is moved aside, not deleted.
+- **Deploy templates are engine-only.**
+  - Removed: the Postgres Quadlet units and network, the Postgres and SQLite Compose files, and the Postgres and SQLite env examples.
+  - Renamed to the plain names: `remind-me-hub.container` (was `remind-me-hub-standalone.container`), `docker-compose.yml` (was `docker-compose.engine.yml`), `hub.env.example` (was `hub-engine.env.example`).
+  - `fly.toml` mounts a Fly Volume instead of attaching Fly Postgres. Railway takes a volume and two variables, set in its dashboard (`deploy/README.md`).
+- **Cargo features:** `postgres-store` and `multimodal-store` are gone; the engine is always built. `postgres-import`, on by default, is the only feature left and gates the copy tool's Postgres reader.
+- **`HubStore::migrate` is gone.** The engine has nothing to migrate, so the hub's 120-second startup wait for a database went with it. `REMIND_ME_HUB_STATEMENT_TIMEOUT_MS` no longer does anything.
+
+### Unchanged
+- The wire protocol. Nodes need no change.
+- `rusty-remind-me-hub-copy` reads both old stores in this release and later ones, so a hub that migrates late is not stranded.
+
+### Tests
+- Before the stores went, their answers and databases were recorded (`remind_me_hub/tests/fixtures`, from `main` at `72299199d`). They replace the differential test:
+  - the engine must give the SQLite store's answer to every read of the shared script, before and after a tombstone compaction and after a reopen;
+  - the copy tests rebuild SQLite and Postgres hubs from those stores' own dumps, gap-ridden `hub_seq`s and the Python hub's legacy schema included, and hold each copy to the store's recorded answers.
+- Breaking the engine's "a win keeps the first `created_at`" rule fails the recorded check.
+- The concurrent `since_seq` puller test moved from the Postgres suite to the engine, which had no equivalent.
+- The route suite now forwards `apply_records`, so it exercises the engine's batched push path rather than the one-by-one default.
+- The node's `MockHub` (`remind_me_core/tests/support`) runs on the engine.
+- New `hub_startup_test.rs` runs the binary: `DATABASE_URL` or `REMIND_ME_HUB_DB_PATH` refuses start and names the copy, even beside a data directory, and creates nothing.
+
+### Provenance
+
+The image was built with Docker 29 from the monorepo root and run end to end. A SQLite hub rebuilt from the recorded dump was:
+- refused by the hub (`REMIND_ME_HUB_DB_PATH` set);
+- copied by the tool inside the image (7 memories, highest `hub_seq` 8);
+- served from the engine: `--health-check` passed, `/count` matched, and the next push got `hub_seq` 9.
+
+`setup.sh` was run against stubbed Podman, systemd and curl:
+- a fresh install gets the engine;
+- `--postgres` and `--sqlite` are refused, pointing at `migrate`;
+- `install` and `update` refuse a Postgres `hub.env`, and `status` warns;
+- `migrate` stops nothing when the pre-copy check finds rows it cannot copy;
+- `migrate` of a Postgres hub rewrites `hub.env` (both files kept at mode 600) and keeps the installed unit's `PublishPort`;
+- `migrate --drop-invalid` of a SQLite hub skips the check;
+- `migrate` of an engine hub is refused;
+- `restore` loads through a throwaway container and swaps the copy in.
+
+`docker compose config` resolves the Compose file's build context to the monorepo root.
+
+## 2026-09-25 — The engine hub applies a push under one sync per chunk
+
+### Changed
+- **`/sync/push` on the embedded engine is about 13 times faster for batched pushes.**
+  - The store applies a push in chunks of 64 records, each under one `fsync` per table rather than one per record (the engine's new `GroupCommit`).
+  - In `examples/pull_latency.rs` with 4 pushers sending 100 records each, it went from 1327 to 17 040 records/s. SQLite managed 2780.
+  - Pull p99 stayed at 11 ms.
+  - A node's first full sync of 20 000 memories now spends about a second in the store, not 20.
+- `HubStore` gains `apply_records`, which the push route calls once per request. The SQL stores keep the default, record by record, so their behaviour is unchanged.
+- Each record is still isolated. A refused id or an LWW loss affects only its own outcome.
+
+### Fixed
+- **After a failed `fsync`, the engine store now refuses every write, and `/health` fails, until the hub restarts.** A failed sync leaves the chunk it covered applied in memory but possibly not on disk. Acknowledging later writes on top of that could lose them in a crash. The whole chunk is reported `failed`, so senders retry it.
+
+- **A write pause at each power of two of rows, cut from up to a second to tens of milliseconds.**
+  - The engine's record map regrows in one step under the write lock. With each ~800-byte memory held inline, that copied every row, and the lock hold reached 170–370 ms at 115 000 memories. Pulls behind it waited up to 1 s once under benchmark load.
+  - The engine now boxes its records. The hold is under 10 ms at 115 000 memories and 37 ms at 229 000.
+  - The pause was not new: the benchmark had never grown a hub that large before.
+
+`examples/pull_latency.rs` gains a `BATCH` argument.
+
+## 2026-09-25 — The embedded engine becomes the hub's default store; hub images build again
+
+### Changed
+- **A new hub runs on the embedded engine** (ADR-0021, phase 3).
+  - `setup.sh install` sets up one container with a data directory and no database server. Pass `--postgres` or `--sqlite` for the other stores.
+  - `remind_me_hub` builds the engine and the copy tool by default.
+  - `deploy/docker-compose.engine.yml` and `hub-engine.env.example` are new.
+  - The single-container quadlet is renamed `remind-me-hub-standalone.container`, since it now serves either the engine or SQLite.
+- **Existing hubs are not switched.**
+  - `setup.sh` keeps the store an existing `~/remind-me-hub/hub.env` names, and refuses a flag that contradicts it.
+  - `docker-compose.yml`, Fly and Railway stay on Postgres.
+  - To move a hub onto the engine, copy it with `rusty-remind-me-hub-copy`. The crate README has the steps.
+- The Postgres and SQLite stores are still built in, and are removed in a later release.
+
+### Fixed
+- **The hub image had not built since the monorepo import.** The Containerfile, `setup.sh`, the Compose files, Fly and Railway all built from `crates/apps/rusty_remind_me`, which has no workspace `Cargo.toml` or `Cargo.lock`. They now build from the monorepo root, with a root `.dockerignore` and BuildKit cache mounts.
+- **A Compose named volume came up root-owned**, so the hub (uid 10001) could not create its store. This affected the SQLite Compose file too. The image now creates `/data` owned by the hub user.
+- **Missing binary:** the image and the release archives now ship `rusty-remind-me-hub-copy`.
+
+### Provenance
+
+The image was built with Docker 29 from the monorepo root and run end to end:
+- the engine on a fresh named volume: push, `--health-check`, restart, count;
+- a SQLite hub, then the copy tool inside the image, then the engine on the same volume (`hub_seq` 1 and 2 kept).
+
+`setup.sh --dry-run` was run against stubbed Podman and systemd:
+- a fresh install gets the engine;
+- `--postgres` gets the Postgres units;
+- an existing Postgres `hub.env` stays on Postgres without flags;
+- a contradicting flag, both flags, a `hub.env` naming no store, and `restore` on an engine hub are each refused with a message.
+
+`docker compose config` resolves all three Compose files' build context to the monorepo root.
+
+## 2026-09-25 — The embedded-engine hub no longer starves pulls under push load
+
+### Fixed
+- **A pull could wait seconds behind queued pushes on the embedded-engine backend.** Every push holds the store's write lock through its `fsync`. `std`'s `RwLock` also lets a waiting writer go ahead of waiting readers. With four pushers, a pull's median wait was 10 s. Writers now queue on a mutex before asking for the lock, so a pull waits for at most one push. Pulls also copy their rows under the lock and build the JSON after releasing it.
+- **Writes got slower as the store grew.** This was an engine bug: every insert read the whole insert log. It was fixed in `rusty_multimodal_db_engine`.
+
+### Added
+- **`examples/pull_latency.rs`**, the measurement ADR-0021 requires before the default switches. It preloads a hub, runs pushers against pullers, and prints push throughput and pull latency percentiles for SQLite and the engine. Run it with:
+
+  ```sh
+  cargo run --release -p remind_me_hub --features multimodal-store --example pull_latency
+  ```
+
+### Provenance
+
+| 20k memories preloaded, 4 pushers, 2 pullers | SQLite | Engine before | Engine after |
+|---|---|---|---|
+| Pushes per second | 2534 | 259 | 1102 |
+| Pull latency, p50 / p99 | 27 / 232 ms | 10 s / 10 s | 3.2 / 7.1 ms |
+
+With one pusher, the engine manages 1893 pushes/s against SQLite's 828. The full table is in ADR-0021's phase 3 notes. All hub tests pass on every feature combination, including against Postgres.
+
+## 2026-09-25 — rusty-remind-me-hub-copy: move a SQLite or Postgres hub onto the embedded engine
+
+### Added
+- **`rusty-remind-me-hub-copy`** (feature `multimodal-store`). Phase 3 of ADR-0021. It copies a SQLite hub (`--from-sqlite PATH`) or a Postgres hub (`--from-postgres`, which reads `DATABASE_URL`) into a new embedded-engine data directory.
+- **Every `hub_seq` and `origin_node` is kept exactly**, so nodes carry on from their cursors. The next `hub_seq` starts above the highest the source ever issued. That can be above every remaining row. For Postgres it is the sequence's last value, and for SQLite the mark it keeps in `hub_meta`.
+- **Rows the engine cannot store are listed, and nothing is written**: ids over 64 bytes or holding NUL, and rows that do not parse. `--check` lists them without writing; `--drop-invalid` copies everything else.
+- **After writing, the tool reads every row back and compares it with the source.**
+- **The source is only ever read.** SQLite is opened read-only. Postgres is read in one repeatable-read, read-only transaction. A legacy Python-hub database (`TIMESTAMPTZ` columns) is read as it stands, not migrated.
+- **New feature `postgres-import`** for the Postgres reader. It is kept apart from `postgres-store` so it can outlive that store.
+
+### Provenance
+
+New tests:
+- `tests/hub_copy_test.rs`. A copied SQLite hub answers every read of the shared differential script exactly as the source does, before and after a reopen. It covers refused and dropped ids, a source left byte-for-byte unchanged, a non-empty target, and the binary end to end.
+- In `hub_postgres_test.rs`, two cases:
+  - a Postgres hub with `hub_seq` gaps copies exactly, and the next write gets the same `hub_seq` on both;
+  - a legacy database copies to exactly what the Postgres store's own in-place migration makes of it.
+- In `hub_copy_test.rs`, a SQLite hub that compacted away its newest row: the copy's next write gets the same `hub_seq` as the source's. It failed (2 against 3) before the SQLite reader read `hub_meta`.
+- A mutation check: when the copy ignores the sequence's high-water mark, the gap test fails.
+
+## 2026-09-25 — The SQLite hub no longer reissues a `hub_seq` after tombstone compaction
+
+### Fixed
+- **A node pulling from a SQLite-backed hub could miss a memory written just after a tombstone compaction.** The SQLite store numbered each memory write `MAX(hub_seq)+1`. If `/admin/compact_tombstones` purged the row holding the highest `hub_seq`, the next write was given that same number again. A node whose `since_seq` cursor already sat on it resumes strictly after it, so it never pulled the new row, short of a `full` pull.
+- The store now keeps the highest `hub_seq` it has issued in a one-row `hub_meta` table, written in the same transaction as each memory write and pinned again before compaction deletes anything. The next number is one past the larger of that mark and `MAX(hub_seq)`. Numbering is otherwise unchanged: an LWW loser still consumes no number.
+- `migrate` creates the table and seeds it from the rows present, idempotently, so an existing hub is covered from its first start on this version. A number already reissued before the upgrade cannot be recovered; a node stuck behind one needs a `full` pull.
+- The Postgres store (a real sequence) and the embedded-engine store (its seq floor file) were not affected.
+
+### Provenance
+
+New route-suite test `compacting_the_newest_tombstone_never_reissues_its_hub_seq` runs against SQLite and the engine store. It failed on SQLite before the fix (the node at cursor 2 pulled nothing) and passes after. Two SQLite unit tests cover an upgraded database without `hub_meta` and a repeated `migrate`. `cargo test -p remind_me_hub` passes with and without `multimodal-store`, and clippy with `-D warnings` is clean.
+
+## 2026-09-25 — The hub gains a third storage backend: the embedded rusty_multimodal_db engine (preview)
+
+### Added
+- **`MultimodalHubStore`, behind the new `multimodal-store` feature (off by default).** Phase 2 of ADR-0021. Set `REMIND_ME_HUB_DATA_DIR` to run the hub on `rusty_multimodal_db`'s storage engine in-process: one data directory, no database server. Selecting more than one of `DATABASE_URL`, `REMIND_ME_HUB_DB_PATH` and `REMIND_ME_HUB_DATA_DIR` is a startup error, as is a variable for a backend the binary was built without.
+- It answers every route as the SQLite store does. The differences: it refuses ids over 64 bytes or containing NUL (the record counts as `failed` and stays in the sender's outbox); it keeps the whole dataset in memory; pulls wait while a push is being written; it folds its insert logs hourly (`REMIND_ME_HUB_COMPACT_INTERVAL_SECS`) and on every `/admin/compact_tombstones`; and it locks its data directory against a second hub.
+- `hub_seq` never repeats on this backend, even after a tombstone compaction deletes the row holding the highest one.
+
+### Changed (tests and CI)
+- The route suite (`tests/suite/routes.rs`) now runs once per backend that needs no server: SQLite, and the engine under `multimodal-store`.
+- A shared differential script (`tests/suite/differential.rs`) replaces the Postgres-vs-SQLite check. It pushes ids that prefix each other, an id at the 64-byte cap, LWW wins and losses and tombstones, then walks every cursor a page at a time and compares every read. It runs SQLite against the engine with no server, and all three backends against Postgres in CI. A cursor walk that never advances now fails with a message instead of looping.
+- The CI hub job also runs clippy and the tests with `multimodal-store`.
+- `rusty_multimodal_db_engine` gains `tests/stacked_ordered.rs`, the phase-2 spike: three stacked sort orders page correctly through writes and a reopen.
+
+Not the default, and no copy tool yet: an existing hub cannot move onto this backend until phase 3.
+
+### Provenance
+
+`cargo test -p remind_me_hub` passes with every feature combination (default, `multimodal-store`, `--no-default-features` with and without it), including against Postgres 16 with `REMIND_ME_HUB_REQUIRE_POSTGRES=1`. Clippy with `-D warnings` is clean on all four. Mutation checks: breaking the `created_at` rule, the `hub_seq` cursor, the keyset cursor or `exclude_node` in the engine store each fails the differential test.
+
+## 2026-09-25 — ADR-0021: the hub's storage is to move to an embedded rusty_multimodal_db
+
+### Added
+- **`docs/adr/0021-hub-storage-moves-to-rusty-multimodal-db.md` (Proposed).** It records the plan to replace the hub's Postgres and SQLite stores with `rusty_multimodal_db`'s storage engine embedded in the hub process, with record types the hub owns. The node's own SQLite stays, because of Tenet 3 and the SQLite features it depends on.
+- Planned in four phases: extract the engine to a libs crate; add a third `HubStore` backend tested alongside the other two; build a copy tool that preserves `hub_seq`, then switch the default and retire the old stores; later, a storage port in core.
+- It also records the behaviour changes and costs: ids capped at 64 bytes, the whole dataset held in RAM, pushes that block pulls, scheduled compaction, and backups that copy the data directory.
+
+Documentation only; no code or behaviour change.
+
+## 2026-09-25 — v0.2.3: the Postgres hub no longer lets a node's pull skip rows
+
+### Fixed
+- **A node pulling from a Postgres-backed hub could silently miss memories pushed at the same time.** The hub numbers each memory write with `hub_seq` from `nextval()`, which Postgres assigns when the statement runs, but a row only becomes visible when its transaction commits. Two concurrent pushes could therefore commit out of order. A node that had already pulled seq 12 moved its cursor past 11, and when 11 committed a moment later, that node never pulled it, short of a full re-sync. In a test of 1200 concurrent pushes on 8 threads, a puller on the `since_seq` cursor (the one nodes use) missed 36 to 40 rows on every run.
+- `apply_record` now takes a transaction-scoped advisory lock before assigning `hub_seq`, so memory writes commit in sequence order. That is the ordering the SQLite hub store already had, since it serialises writes; it missed no rows in the same test. Memory pushes to a Postgres hub are now applied one at a time.
+- **If you run a Postgres hub:** a node that pulled while other nodes were pushing may be missing rows. Its next `full` pull re-fetches everything.
+- Bumped to 0.2.3 (all six crates and `.claude-plugin/plugin.json`), so this ships as its own release.
+
+### Provenance
+
+New regression test `a_seq_puller_sees_every_row_under_concurrent_pushes` in `remind_me_hub/tests/hub_postgres_test.rs`, which CI runs against a real Postgres. Against Postgres 16 it skipped 37 of 1200 rows without the fix, and passed 5 runs out of 5 with it. All hub tests pass (80), and clippy with `-D warnings` on Rust 1.98 is clean.
+
+## 2026-09-24 — Test binaries no longer segfault when a test changes an env var
+
+### Fixed
+- **Any test binary could crash with SIGSEGV when a test changed an environment variable.** Tests run on parallel threads. A core dump showed the crash was SQLite's one-time setup, which runs on the first connection a process opens and reads `SQLITE_TMPDIR`/`TMPDIR` with C `getenv`. That call takes no lock, and glibc's `setenv` on another thread can free the array it is walking. `image_import_test` hit this in CI twice.
+- Every test-side env write (480 call sites across 64 files) now goes through `crate::test_env::set_var`/`remove_var`. The helper, in `remind_me_core/src/test_env.rs`, finishes SQLite's setup once per binary before its first write. After that SQLite never reads the environment again, so no test needs a lock merely to be safe from a write it never sees.
+- A new `clippy.toml` at the product root disallows `std::env::set_var`/`remove_var`, so a direct call fails `clippy -D warnings`. CONTRIBUTING documents the rule.
+
+Test-only: no product code or behaviour changes, so no version bump.
+
+### Provenance
+
+Reproduced the crash on the pre-fix `image_import_test` binary: it segfaulted on run 1214, and the core dump's faulting frame was `getenv("SQLITE_TMPDIR")` inside `sqlite3_initialize`, racing a concurrent `set_var`. The same pre-fix test, changed only to write through the helper, ran 3000 times with 0 segfaults, where about 7 would be expected at the old rate.
+
+Also checked that no two library test modules write the same variable under different locks. The only shared one, `SYNC_SECRET_ENV`, already shares `sync`'s lock. Clippy with `-D warnings` on Rust 1.98 is clean for the default, combined-features and `cloud-backup` builds; a probe test calling `std::env::set_var` directly is rejected.
+
+Full suites on Rust 1.98: default features across all six crates 1950 passed, 0 failed; `remind_me_core` with `ann,ocr,rerank,local-embed,pdf` 1478 passed; with `cloud-backup` 1477 passed.
+
+## 2026-09-24 — v0.2.2: the SessionStart hook survives an install path with a space in it
+
+### Fixed
+- **The `SessionStart` hook failed whenever the plugin was installed under a path containing a space.** `hooks/hooks.json` ran `${CLAUDE_PLUGIN_ROOT}/hooks/scripts/session-start.sh` unquoted, so the shell split the expanded path into several words and the hook exited 127 (`not found`) instead of injecting recent memories. The command is now double-quoted. `claude plugin validate` flagged it.
+- **The hook's "not on PATH" hint named a path that no longer exists.** It suggested `cargo install --path crates/remind_me_cli`, which went stale with the move into the monorepo. It now names `crates/apps/rusty_remind_me/crates/remind_me_cli` from a rusty_mill checkout.
+
+### Provenance
+
+Ran the hook command through `sh -c` with `CLAUDE_PLUGIN_ROOT` set to a directory containing a space: the quoted form runs the script (exit 0), the previous form fails (exit 127). The script's fallback output still parses as JSON. `claude plugin validate` no longer reports the hooks warning. Bumped to 0.2.2 (all six crates and `.claude-plugin/plugin.json`), so this ships as its own release and installed plugins pick up the new hook.
+
+## 2026-09-24 — v0.2.1: moved into the Rusty Mill monorepo
+
+This product now lives in [`Rusty-Mill/rusty_mill`](https://github.com/Rusty-Mill/rusty_mill) at `crates/apps/rusty_remind_me`, imported with its full history via `git subtree`. `baileyrd/rusty_remind_me` is frozen at v0.2.0. The decision records are `docs/adr/0020` here and the monorepo's `docs/adr/0004`.
+
+### Changed
+- **Releases come from the monorepo, tagged `rusty-remind-me-vX.Y.Z`.** `.github/workflows/remind-me-release.yml` at the monorepo root builds the same four platform archives and the plugin archive, triggered by a version bump in any of the six crate manifests. v0.2.1 is the first; v0.2.0 and earlier stay on the standalone repository's Releases page.
+- **The plugin marketplace moved to the monorepo root** (`claude plugin marketplace add Rusty-Mill/rusty_mill`, then `rusty-remind-me@rusty-mill`). The standalone repository's marketplace entry now uses a `git-subdir` source pointing at this directory, so existing `rusty-remind-me@rusty-remind-me` installs keep updating without doing anything.
+- **`remind_me_self_update` rebuilds `-p rusty-remind-me -p remind_me_hub`, not `--workspace`.** At the monorepo root, `--workspace` is ~240 crates, several of which need system libraries this product never did.
+- **`remind_me_check_update` counts only commits that touch this product.** In the monorepo, `main` moves for every crate; counting all of them would leave the update notice on permanently. Both layouts are recognised (`updater::product_dir`), so an old standalone clone still reports accurately.
+- **Each crate carries a literal `version`**, since the monorepo's `[workspace.package]` belongs to other crates. `scripts/get_workspace_version.sh` now fails when the six disagree, the lockstep that inheritance used to guarantee, and `check_plugin_version.sh` runs it.
+- **`rusqlite` 0.31 → 0.39 and `rmcp` 3.0.1 → 3.1.4**, forced by the shared `Cargo.lock`: `rusqlite`'s `links = "sqlite3"` allows one version per graph, and Cargo keeps one `rmcp` per semver-compatible range, where the rest of the workspace needs `^3.1`. One source change came from `rusqlite`: `recalibrate.rs` binds its `LIMIT` as a saturating `i64`, because `usize` lost `ToSql` in 0.32.
+- **A session-free `2026-07-28` request without per-request `_meta` is now rejected** with `-32602` by `remind_me_remote`. `rmcp` 3.1 enforces the spec's requirement for `io.modelcontextprotocol/protocolVersion` and `clientCapabilities` on those requests. A conformant client already sends both; the six test fixtures that didn't were fixed, not the server. Session-based and pre-`2026-07-28` requests are unaffected.
+- **No more `rust-toolchain.toml`.** CI builds with stable, like the rest of the monorepo; the 1.94 floor is unchanged. `scripts/configure_mcp.py`/`.ps1` now find `target/` at the Cargo workspace root, and the `.ps1` no longer hardcodes `C:\dev\rusty_remind_me`.
+
+### Provenance
+
+From the monorepo root, local rustc 1.94.1 (the floor), `RUSTFLAGS=-D warnings`: `cargo test --locked` over the six crates, 1950 passed / 0 failed across 144 test binaries; `cargo test --locked -p remind_me_hub --no-default-features` 73/73; `cargo clippy --locked --all-targets -- -D warnings` over the six, clean. The optional-feature legs and the Postgres leg were not run locally and are left to CI. Updater: five new tests (`product_dir` in both layouts and neither; in the monorepo layout, only commits under this product count, and unrelated ones alone are not an update), and the successful-build test's fixture is now a two-member workspace named after `BUILD_PACKAGES`. `scripts/check_schema_drift.sh` and `check_schema_regen_drift.sh` run from their new location: in parity at v29, no regen drift. `get_workspace_version.sh` checked against a copy with one crate bumped (exit 1, names the crate). `claude plugin validate` passes on the monorepo marketplace, the plugin directory, and the standalone repository's redirected marketplace. The rmcp cause was read out of `rmcp` 3.1.4's `handler/server.rs` (`missing_required_keys` for 2026-07-28) after capturing the actual 400 body, not inferred.
+
 ## 2026-09-06 — Every reply carries `resultType`, so a `2026-07-28` client can call a tool again
 
 ### Fixed

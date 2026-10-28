@@ -1,15 +1,19 @@
 //! Coverage for `remind_me_import_chat` / `remind_me_import_directory`.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
+use remind_me_core::db::Store;
 use remind_me_core::import_paths::{validate_import_dir, validate_import_file, ImportPathError};
 use remind_me_core::importer::{
     chunk_text, import_chat, import_directory, looks_like_chat_markdown, parse_document,
     split_markdown_sections, CHAT_SOURCE, DOCUMENT_CATEGORY, DOCUMENT_SOURCE,
 };
 use remind_me_core::sync::{CLIENT_ENV, NODE_ID_ENV};
+use remind_me_core::testing;
 use remind_me_core::{
     BulkImportDirInput, ChatImportInput, Database, ImportKind, ImportOutcome, NormalizeBatchInput,
 };
-use rusqlite::Connection;
 use std::sync::Mutex;
 
 /// A scratch directory inside the default import root (the home directory).
@@ -28,7 +32,7 @@ fn write(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
 }
 
 fn import(
-    conn: &Connection,
+    store: &Store<'_>,
     path: &std::path::Path,
     configure: impl FnOnce(&mut ChatImportInput),
 ) -> ImportOutcome {
@@ -41,22 +45,29 @@ fn import(
         kind: ImportKind::Auto,
     };
     configure(&mut input);
-    import_chat(conn, &input).unwrap()
+    import_chat(store, &input).unwrap()
 }
 
-fn contents(conn: &Connection) -> Vec<String> {
-    let mut stmt = conn
-        .prepare("SELECT content FROM memories ORDER BY chunk_index, id")
-        .unwrap();
-    let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
-    rows.map(|r| r.unwrap()).collect()
+fn contents(store: &Store<'_>) -> Vec<String> {
+    let mut rows: Vec<(Option<i64>, String, String)> = testing::memory_ids(store)
+        .unwrap()
+        .into_iter()
+        .map(|id| {
+            let index = testing::memory_i64(store, &id, "chunk_index").unwrap();
+            let content = testing::memory_text(store, &id, "content")
+                .unwrap()
+                .unwrap();
+            (index, id, content)
+        })
+        .collect();
+    rows.sort();
+    rows.into_iter().map(|(_, _, content)| content).collect()
 }
 
-fn column(conn: &Connection, name: &str) -> String {
-    conn.query_row(&format!("SELECT {} FROM memories LIMIT 1", name), [], |r| {
-        r.get::<_, String>(0)
-    })
-    .unwrap()
+/// `name` of the first stored memory.
+fn column(store: &Store<'_>, name: &str) -> String {
+    let ids = testing::memory_ids(store).unwrap();
+    testing::memory_text(store, &ids[0], name).unwrap().unwrap()
 }
 
 const CHAT_JSON: &str = r#"[
@@ -115,15 +126,15 @@ fn chunking_does_not_split_a_multibyte_character() {
 #[test]
 fn a_json_chat_export_imports_assistant_turns_by_default() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let dir = scratch("json");
     let path = write(&dir, "chat.json", CHAT_JSON);
 
-    let outcome = import(&conn, &path, |_| {});
+    let outcome = import(&store, &path, |_| {});
 
     assert!(matches!(outcome, ImportOutcome::Imported { .. }));
-    assert_eq!(contents(&conn), vec!["a small marsupial".to_string()]);
-    assert_eq!(column(&conn, "source"), CHAT_SOURCE);
+    assert_eq!(contents(&store), vec!["a small marsupial".to_string()]);
+    assert_eq!(column(&store, "source"), CHAT_SOURCE);
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -141,25 +152,23 @@ fn a_chat_import_is_stamped_with_the_configured_node_and_client() {
     let _guard = PROVENANCE_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    std::env::set_var(NODE_ID_ENV, "import-test-node");
-    std::env::set_var(CLIENT_ENV, "import-test-client");
+    crate::test_env::set_var(NODE_ID_ENV, "import-test-node");
+    crate::test_env::set_var(CLIENT_ENV, "import-test-client");
 
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let dir = scratch("provenance");
     let path = write(&dir, "chat.json", CHAT_JSON);
 
-    let outcome = import(&conn, &path, |_| {});
+    let outcome = import(&store, &path, |_| {});
     assert!(matches!(outcome, ImportOutcome::Imported { .. }));
 
-    let (node_id, client): (Option<String>, String) = conn
-        .query_row("SELECT node_id, client FROM memories LIMIT 1", [], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })
-        .unwrap();
+    let node_id =
+        testing::memory_text(&store, &testing::memory_ids(&store).unwrap()[0], "node_id").unwrap();
+    let client = column(&store, "client");
 
-    std::env::remove_var(NODE_ID_ENV);
-    std::env::remove_var(CLIENT_ENV);
+    crate::test_env::remove_var(NODE_ID_ENV);
+    crate::test_env::remove_var(CLIENT_ENV);
     std::fs::remove_dir_all(&dir).unwrap();
 
     assert_eq!(node_id.as_deref(), Some("import-test-node"));
@@ -185,9 +194,9 @@ fn every_extract_mode_selects_what_it_says() {
         ("summaries", vec![]),
     ] {
         let db = Database::open_in_memory().unwrap();
-        let conn = db.conn();
-        import(&conn, &path, |i| i.extract_mode = mode.to_string());
-        let got = contents(&conn);
+        let store = db.store();
+        import(&store, &path, |i| i.extract_mode = mode.to_string());
+        let got = contents(&store);
         assert_eq!(got, expected, "mode {}", mode);
     }
 
@@ -197,7 +206,7 @@ fn every_extract_mode_selects_what_it_says() {
 #[test]
 fn a_claude_export_with_block_content_is_parsed() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let dir = scratch("claude");
     let path = write(
         &dir,
@@ -208,9 +217,9 @@ fn a_claude_export_with_block_content_is_parsed() {
            ]}"#,
     );
 
-    import(&conn, &path, |_| {});
+    import(&store, &path, |_| {});
 
-    assert_eq!(contents(&conn), vec!["block one\nblock two".to_string()]);
+    assert_eq!(contents(&store), vec!["block one\nblock two".to_string()]);
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -218,7 +227,7 @@ fn a_claude_export_with_block_content_is_parsed() {
 #[test]
 fn a_malformed_jsonl_line_does_not_lose_the_rest() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let dir = scratch("jsonl");
     let path = write(
         &dir,
@@ -226,10 +235,10 @@ fn a_malformed_jsonl_line_does_not_lose_the_rest() {
         "{\"role\":\"assistant\",\"content\":\"first\"}\nnot json at all\n{\"role\":\"assistant\",\"content\":\"second\"}\n",
     );
 
-    import(&conn, &path, |_| {});
+    import(&store, &path, |_| {});
 
     assert_eq!(
-        contents(&conn).len(),
+        contents(&store).len(),
         2,
         "one bad line must not fail the import"
     );
@@ -280,19 +289,19 @@ fn a_document_chunk_keeps_its_heading_in_the_content() {
 #[test]
 fn a_notes_file_imports_as_a_document() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let dir = scratch("notes");
     let path = write(&dir, "notes.md", "# Setup\n\nRun cargo build.");
 
-    let outcome = import(&conn, &path, |_| {});
+    let outcome = import(&store, &path, |_| {});
 
     match outcome {
         ImportOutcome::Imported { kind, .. } => assert_eq!(kind, ImportKind::Document),
         other => panic!("expected an import, got {:?}", other),
     }
-    assert_eq!(column(&conn, "source"), DOCUMENT_SOURCE);
+    assert_eq!(column(&store, "source"), DOCUMENT_SOURCE);
     // The chat-shaped default category gives way for a document.
-    assert_eq!(column(&conn, "category"), DOCUMENT_CATEGORY);
+    assert_eq!(column(&store, "category"), DOCUMENT_CATEGORY);
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -300,13 +309,13 @@ fn a_notes_file_imports_as_a_document() {
 #[test]
 fn an_explicit_category_survives_a_document_import() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let dir = scratch("cat");
     let path = write(&dir, "notes.md", "# Setup\n\nbody");
 
-    import(&conn, &path, |i| i.category = "runbook".into());
+    import(&store, &path, |i| i.category = "runbook".into());
 
-    assert_eq!(column(&conn, "category"), "runbook");
+    assert_eq!(column(&store, "category"), "runbook");
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -325,7 +334,7 @@ fn chat_shaped_markdown_is_detected_as_chat() {
 #[test]
 fn auto_mode_routes_chat_markdown_to_the_chat_parser() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let dir = scratch("sniff");
     let path = write(
         &dir,
@@ -333,13 +342,13 @@ fn auto_mode_routes_chat_markdown_to_the_chat_parser() {
         "## Human\n\nwhat is a quokka\n\n## Assistant\n\na small marsupial",
     );
 
-    let outcome = import(&conn, &path, |_| {});
+    let outcome = import(&store, &path, |_| {});
 
     match outcome {
         ImportOutcome::Imported { kind, .. } => assert_eq!(kind, ImportKind::Chat),
         other => panic!("expected an import, got {:?}", other),
     }
-    assert_eq!(contents(&conn), vec!["a small marsupial".to_string()]);
+    assert_eq!(contents(&store), vec!["a small marsupial".to_string()]);
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -347,13 +356,13 @@ fn auto_mode_routes_chat_markdown_to_the_chat_parser() {
 #[test]
 fn an_explicit_kind_overrides_the_sniffer() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let dir = scratch("forced");
     let path = write(&dir, "log.md", "## Human\n\nhi\n\n## Assistant\n\nhello");
 
-    import(&conn, &path, |i| i.kind = ImportKind::Document);
+    import(&store, &path, |i| i.kind = ImportKind::Document);
 
-    assert_eq!(column(&conn, "source"), DOCUMENT_SOURCE);
+    assert_eq!(column(&store, "source"), DOCUMENT_SOURCE);
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -361,11 +370,11 @@ fn an_explicit_kind_overrides_the_sniffer() {
 #[test]
 fn a_document_import_refuses_json() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let dir = scratch("badkind");
     let path = write(&dir, "chat.json", CHAT_JSON);
 
-    let outcome = import(&conn, &path, |i| i.kind = ImportKind::Document);
+    let outcome = import(&store, &path, |i| i.kind = ImportKind::Document);
 
     assert!(matches!(outcome, ImportOutcome::Failed { .. }));
 
@@ -377,7 +386,7 @@ fn a_document_import_refuses_json() {
 #[test]
 fn chunks_share_a_doc_id_and_are_indexed_in_source_order() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let dir = scratch("chunks");
     let path = write(
         &dir,
@@ -385,16 +394,24 @@ fn chunks_share_a_doc_id_and_are_indexed_in_source_order() {
         "# One\n\nalpha\n\n# Two\n\nbeta\n\n# Three\n\ngamma",
     );
 
-    import(&conn, &path, |_| {});
+    import(&store, &path, |_| {});
 
-    let mut stmt = conn
-        .prepare("SELECT doc_id, chunk_index, content FROM memories ORDER BY chunk_index")
-        .unwrap();
-    let rows: Vec<(String, i64, String)> = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+    let mut rows: Vec<(String, i64, String)> = testing::memory_ids(&store)
         .unwrap()
-        .map(|r| r.unwrap())
+        .iter()
+        .map(|id| {
+            (
+                testing::memory_text(&store, id, "doc_id").unwrap().unwrap(),
+                testing::memory_i64(&store, id, "chunk_index")
+                    .unwrap()
+                    .unwrap(),
+                testing::memory_text(&store, id, "content")
+                    .unwrap()
+                    .unwrap(),
+            )
+        })
         .collect();
+    rows.sort_by_key(|(_, index, _)| *index);
 
     assert_eq!(rows.len(), 3);
     assert!(rows.iter().all(|(doc, _, _)| *doc == rows[0].0));
@@ -411,18 +428,19 @@ fn chunks_share_a_doc_id_and_are_indexed_in_source_order() {
 #[test]
 fn neighbour_expansion_finally_finds_something() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let dir = scratch("neighbours");
     let path = write(
         &dir,
         "notes.md",
         "# One\n\nopening\n\n# Two\n\nquokka section\n\n# Three\n\nclosing",
     );
-    import(&conn, &path, |_| {});
+    import(&store, &path, |_| {});
 
     let response = remind_me_core::db::queries::search_with_expansions(
-        &conn,
+        &store,
         &remind_me_core::MemorySearchInput {
+            scope: Default::default(),
             strategy: Default::default(),
             include_sensitive: false,
             query: "quokka".into(),
@@ -433,11 +451,17 @@ fn neighbour_expansion_finally_finds_something() {
             response_format: Default::default(),
             include_dormant: true,
             min_vitality: 0.0,
+            detail: Default::default(),
             verbose: false,
             expand_entities: false,
             include_neighbors: true,
             expand_co_retrieval: false,
             bootstrap: false,
+            include_expired: true,
+            min_confidence: 0.0,
+            include_raw: false,
+            filters: Default::default(),
+            window: Default::default(),
         },
     )
     .unwrap();
@@ -453,13 +477,13 @@ fn neighbour_expansion_finally_finds_something() {
 #[test]
 fn the_normalize_backlog_finally_has_something_in_it() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let dir = scratch("normalize");
     let path = write(&dir, "notes.md", "# Topic\n\nsome raw imported prose");
-    import(&conn, &path, |_| {});
+    import(&store, &path, |_| {});
 
     let batch = remind_me_core::normalize::unnormalized_batch(
-        &conn,
+        &store,
         &NormalizeBatchInput { batch_size: 20 },
     )
     .unwrap();
@@ -478,15 +502,15 @@ fn the_normalize_backlog_finally_has_something_in_it() {
 #[test]
 fn re_importing_the_same_file_is_a_no_op() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let dir = scratch("dedup");
     let path = write(&dir, "chat.json", CHAT_JSON);
 
-    import(&conn, &path, |_| {});
-    let again = import(&conn, &path, |_| {});
+    import(&store, &path, |_| {});
+    let again = import(&store, &path, |_| {});
 
     assert!(matches!(again, ImportOutcome::Skipped { .. }));
-    assert_eq!(contents(&conn).len(), 1);
+    assert_eq!(contents(&store).len(), 1);
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -494,13 +518,13 @@ fn re_importing_the_same_file_is_a_no_op() {
 #[test]
 fn dedup_is_on_content_not_filename() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let dir = scratch("rename");
     let first = write(&dir, "chat.json", CHAT_JSON);
     let renamed = write(&dir, "copy.json", CHAT_JSON);
 
-    import(&conn, &first, |_| {});
-    let second = import(&conn, &renamed, |_| {});
+    import(&store, &first, |_| {});
+    let second = import(&store, &renamed, |_| {});
 
     assert!(matches!(second, ImportOutcome::Skipped { .. }));
 
@@ -510,16 +534,16 @@ fn dedup_is_on_content_not_filename() {
 #[test]
 fn an_edited_file_imports_again() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let dir = scratch("edited");
     let path = write(&dir, "notes.md", "# One\n\noriginal");
-    import(&conn, &path, |_| {});
+    import(&store, &path, |_| {});
 
     write(&dir, "notes.md", "# One\n\nedited");
-    let again = import(&conn, &path, |_| {});
+    let again = import(&store, &path, |_| {});
 
     assert!(matches!(again, ImportOutcome::Imported { .. }));
-    assert_eq!(contents(&conn).len(), 2);
+    assert_eq!(contents(&store).len(), 2);
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -581,12 +605,12 @@ fn an_unsupported_extension_is_rejected() {
 // --- directory import --------------------------------------------------------
 
 fn bulk(
-    conn: &Connection,
+    store: &Store<'_>,
     dir: &std::path::Path,
     recursive: bool,
 ) -> remind_me_core::BulkImportResult {
     import_directory(
-        conn,
+        store,
         &BulkImportDirInput {
             directory: dir.display().to_string(),
             category: "chat_import".into(),
@@ -603,13 +627,13 @@ fn bulk(
 #[test]
 fn a_directory_import_walks_subdirectories_when_asked() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let dir = scratch("bulk");
     write(&dir, "top.md", "# Top\n\nalpha");
     std::fs::create_dir_all(dir.join("nested")).unwrap();
     write(&dir.join("nested"), "deep.md", "# Deep\n\nbeta");
 
-    let result = bulk(&conn, &dir, true);
+    let result = bulk(&store, &dir, true);
 
     assert_eq!(result.files_seen, 2);
     assert_eq!(result.files_imported, 2);
@@ -621,13 +645,13 @@ fn a_directory_import_walks_subdirectories_when_asked() {
 #[test]
 fn a_non_recursive_import_stays_at_the_top_level() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let dir = scratch("flat");
     write(&dir, "top.md", "# Top\n\nalpha");
     std::fs::create_dir_all(dir.join("nested")).unwrap();
     write(&dir.join("nested"), "deep.md", "# Deep\n\nbeta");
 
-    let result = bulk(&conn, &dir, false);
+    let result = bulk(&store, &dir, false);
 
     assert_eq!(result.files_seen, 1);
 
@@ -637,12 +661,12 @@ fn a_non_recursive_import_stays_at_the_top_level() {
 #[test]
 fn unsupported_files_are_passed_over_rather_than_failing_the_run() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let dir = scratch("mixed");
     write(&dir, "notes.md", "# Notes\n\nalpha");
     write(&dir, "installer.exe", "binary-ish");
 
-    let result = bulk(&conn, &dir, true);
+    let result = bulk(&store, &dir, true);
 
     // A notes folder holding a stray file of a format nothing here reads
     // should import the markdown beside it, not refuse the lot.
@@ -655,17 +679,17 @@ fn unsupported_files_are_passed_over_rather_than_failing_the_run() {
 #[test]
 fn a_second_directory_run_skips_everything() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let dir = scratch("rerun");
     write(&dir, "one.md", "# One\n\nalpha");
     write(&dir, "two.md", "# Two\n\nbeta");
-    bulk(&conn, &dir, true);
+    bulk(&store, &dir, true);
 
-    let again = bulk(&conn, &dir, true);
+    let again = bulk(&store, &dir, true);
 
     assert_eq!(again.files_skipped, 2);
     assert_eq!(again.files_imported, 0);
-    assert_eq!(contents(&conn).len(), 2);
+    assert_eq!(contents(&store).len(), 2);
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -676,7 +700,7 @@ fn a_missing_directory_reports_a_failure_rather_than_erroring() {
     let home = remind_me_core::import_paths::home_dir_var().unwrap();
 
     let result = import_directory(
-        &db.conn(),
+        &db.store(),
         &BulkImportDirInput {
             directory: format!("{}/no_such_dir_11111", home),
             category: "chat_import".into(),
@@ -698,7 +722,7 @@ fn a_missing_directory_reports_a_failure_rather_than_erroring() {
 #[test]
 fn an_export_restores_its_entity_graph() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let dir = scratch("graph");
     // An export carries memories with no record_type, and graph rows with one.
     let path = write(
@@ -711,7 +735,7 @@ fn an_export_restores_its_entity_graph() {
         ]"#,
     );
 
-    let outcome = import(&conn, &path, |_| {});
+    let outcome = import(&store, &path, |_| {});
 
     match outcome {
         ImportOutcome::Imported { stats, .. } => {
@@ -724,7 +748,7 @@ fn an_export_restores_its_entity_graph() {
         other => panic!("expected an import, got {:?}", other),
     }
 
-    let entity = remind_me_core::entity::resolve_entity(&conn, "tasmania")
+    let entity = remind_me_core::entity::resolve_entity(&store, "tasmania")
         .unwrap()
         .unwrap();
     assert_eq!(entity.kind.as_deref(), Some("place"));
@@ -736,7 +760,7 @@ fn an_export_restores_its_entity_graph() {
 #[test]
 fn graph_records_are_not_imported_as_chat_messages() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     let dir = scratch("nomix");
     let path = write(
         &dir,
@@ -747,9 +771,81 @@ fn graph_records_are_not_imported_as_chat_messages() {
         ]"#,
     );
 
-    import(&conn, &path, |_| {});
+    import(&store, &path, |_| {});
 
-    assert_eq!(contents(&conn), vec!["a real memory".to_string()]);
+    assert_eq!(contents(&store), vec!["a real memory".to_string()]);
 
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// An export carries the schema v32 columns, and importing it reads them
+/// back; a chat someone else exported leaves them at the schema's defaults.
+#[test]
+fn an_export_round_trips_the_v32_columns_and_a_plain_chat_defaults_them() {
+    use remind_me_core::db::memories::{Memories, NewMemory};
+    use remind_me_core::export::export_memories;
+    use remind_me_core::ExportInput;
+
+    let source = Database::open_in_memory().unwrap();
+    let store = source.store();
+    Memories::new(&store)
+        .insert(&NewMemory {
+            project: Some("quokka".into()),
+            git_branch: Some("main".into()),
+            cwd: Some("/work".into()),
+            confidence: 0.5,
+            outcome: Some("done".into()),
+            written_by: "model:test".into(),
+            capture_method: "auto".into(),
+            ..NewMemory::new("m1", "a small marsupial", "2026-09-26T00:00:00+00:00")
+        })
+        .unwrap();
+    let exported = export_memories(&store, &ExportInput::default()).unwrap();
+    let body = exported.content.expect("inline export");
+    let records: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+    assert_eq!(records[0]["project"], "quokka");
+    assert_eq!(records[0]["confidence"], 0.5);
+    assert_eq!(records[0]["written_by"], "model:test");
+
+    let dir = scratch("v32_round_trip");
+    let path = write(&dir, "export.json", &body);
+    let target = Database::open_in_memory().unwrap();
+    let store = target.store();
+    import(&store, &path, |_| {});
+    assert_eq!(contents(&store), ["a small marsupial"]);
+    assert_eq!(column(&store, "project"), "quokka");
+    assert_eq!(column(&store, "git_branch"), "main");
+    assert_eq!(column(&store, "cwd"), "/work");
+    assert_eq!(column(&store, "outcome"), "done");
+    assert_eq!(column(&store, "written_by"), "model:test");
+    assert_eq!(column(&store, "capture_method"), "auto");
+    let ids = testing::memory_ids(&store).unwrap();
+    assert_eq!(
+        testing::memory_f64(&store, &ids[0], "confidence").unwrap(),
+        Some(0.5)
+    );
+    assert_eq!(
+        testing::memory_text(&store, &ids[0], "git_sha").unwrap(),
+        None
+    );
+
+    let plain = Database::open_in_memory().unwrap();
+    let store = plain.store();
+    let path = write(&dir, "chat.json", CHAT_JSON);
+    import(&store, &path, |_| {});
+    let ids = testing::memory_ids(&store).unwrap();
+    // Not an export of ours, so nothing is restored: the importer stamps
+    // itself, and keeps only the project (the directory it ran in).
+    assert_eq!(
+        testing::memory_text(&store, &ids[0], "git_sha").unwrap(),
+        None
+    );
+    assert_eq!(
+        testing::memory_f64(&store, &ids[0], "confidence").unwrap(),
+        Some(1.0)
+    );
+    // Wave 1D: any chat import is written by the importer, automatically.
+    assert_eq!(column(&store, "written_by"), "importer:chat");
+    assert_eq!(column(&store, "capture_method"), "auto");
     std::fs::remove_dir_all(&dir).unwrap();
 }

@@ -97,6 +97,7 @@ fn every_command_endpoint_the_dashboard_calls_is_a_real_route() {
         "/vitality",
         "/wiki",
         "/wiki/schema",
+        "/projects",
     ] {
         assert!(
             page.contains(&format!("\"{}", path)),

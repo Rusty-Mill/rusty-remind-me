@@ -96,8 +96,14 @@ impl ApiServer {
     /// test using it would write into whatever wiki the machine's user
     /// actually has.
     pub fn with_wiki(db: Database, wiki: Wiki) -> Self {
+        Self::shared(Arc::new(db), wiki)
+    }
+
+    /// Build a server over a database other servers also use: the daemon
+    /// runs this and the MCP server over one store.
+    pub fn shared(db: Arc<Database>, wiki: Wiki) -> Self {
         Self {
-            db: Arc::new(db),
+            db,
             wiki,
             api_key: resolve_api_key(),
         }
@@ -120,6 +126,8 @@ impl ApiServer {
 
     /// Bind `addr` and serve forever, one connection at a time.
     pub fn run(&self, addr: &str) -> io::Result<()> {
+        // The dashboard is a person at a browser, not a model.
+        remind_me_core::context::set_default_writer(remind_me_core::context::Writer::Human);
         let listener = TcpListener::bind(addr)?;
         println!("REST API server listening on http://{}", addr);
         loop {
@@ -152,7 +160,7 @@ impl ApiServer {
 
         if request.path == "/health" {
             let (status, body) =
-                routes::health(&self.db.conn(), &self.wiki, &request, &Default::default());
+                routes::health(&self.db.store(), &self.wiki, &request, &Default::default());
             return http::write_response_cors(stream, status, body, cors);
         }
 
@@ -166,7 +174,7 @@ impl ApiServer {
                 .strip_prefix("/api/reminders/")
                 .and_then(|rest| rest.strip_suffix(".ics"))
             {
-                let (status, body) = routes::api_reminders_ics(&self.db.conn(), token);
+                let (status, body) = routes::api_reminders_ics(&self.db.store(), token);
                 return http::write_response_cors(stream, status, body, cors);
             }
         }
@@ -208,7 +216,9 @@ impl ApiServer {
 
                 // A named, scope-limited key (issue #120). Checked only after
                 // the flat key misses, so the common path is one comparison.
-                if let Some(presented) = request.authorization.strip_prefix("Bearer ") {
+                if let Some(presented) =
+                    rusty_oauth::bearer::token_from_authorization(&request.authorization)
+                {
                     if let Some(verified) = remind_me_core::api_keys::verify(presented) {
                         if verified.may_use(&request.method) {
                             return None;
@@ -253,8 +263,8 @@ impl ApiServer {
             };
             path_matched = true;
             if route.methods.contains(&request.method.as_str()) {
-                let conn = self.db.conn();
-                return (route.handler)(&conn, &self.wiki, request, &params);
+                let store = self.db.store();
+                return (route.handler)(&store, &self.wiki, request, &params);
             }
         }
         if path_matched {

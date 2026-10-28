@@ -1,6 +1,6 @@
 # ADR-0003: Self-update means "pull and rebuild," not "swap a binary"
 
-Status: Accepted
+Status: Accepted (amended by [ADR-0020](0020-moved-into-the-rusty-mill-monorepo.md): builds `-p rusty-remind-me -p remind_me_hub` rather than `--workspace`, and counts only commits touching this product)
 Date: 2026-07-29
 
 ## Context

@@ -34,7 +34,8 @@
 //! silence. Reporting the count and the last capture time makes "never
 //! configured" a visible state rather than something to infer.
 
-use rusqlite::Connection;
+use crate::db::curation::{Backlog, Curation};
+use crate::db::Store;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -59,72 +60,33 @@ struct Queue {
     key: &'static str,
     label: &'static str,
     prompt: &'static str,
-    sql: &'static str,
+    backlog: Backlog,
 }
-
-/// Captures with no decomposed facts pointing back at them.
-const UNDECOMPOSED: &str = "SELECT COUNT(*) FROM memories m
-     WHERE m.capture_id IS NOT NULL
-       AND m.source_capture_id IS NULL
-       AND m.deleted_at IS NULL
-       AND NOT EXISTS (
-           SELECT 1 FROM memories c WHERE c.source_capture_id = m.capture_id
-       )";
-
-/// Eligible for entity/triple annotation: not superseded, not a raw verbatim
-/// dialog (the summary gets annotated instead), and carrying neither a triple
-/// nor any entity mention.
-const UNANNOTATED: &str = "SELECT COUNT(*) FROM memories m
-     WHERE m.superseded_by IS NULL
-       AND m.deleted_at IS NULL
-       AND m.category != 'dialog'
-       AND m.subject IS NULL AND m.predicate IS NULL AND m.object IS NULL
-       AND NOT EXISTS (
-           SELECT 1 FROM memory_entities me WHERE me.memory_id = m.id
-       )";
-
-/// Raw imports with nothing pointing back at them via `normalized_from`.
-///
-/// `NOT IN` over an uncorrelated subquery rather than `NOT EXISTS`: correlated,
-/// SQLite re-scans the index once per candidate row, which on a large vault is
-/// a per-row scan rather than a seek. The set form materialises once and probes
-/// per row — same answer, dramatically cheaper.
-const UNNORMALIZED: &str = "SELECT COUNT(*) FROM memories m
-     WHERE m.superseded_by IS NULL
-       AND m.deleted_at IS NULL
-       AND m.source IN ('document_import', 'chat_import')
-       AND m.id NOT IN (
-           SELECT json_extract(metadata, '$.normalized_from') FROM memories
-           WHERE json_extract(metadata, '$.normalized_from') IS NOT NULL
-       )";
-
-const UNCLASSIFIED: &str = "SELECT COUNT(*) FROM memories m
-     WHERE m.memory_type = 'unclassified' AND m.deleted_at IS NULL";
 
 const QUEUES: &[Queue] = &[
     Queue {
         key: "undecomposed_captures",
         label: "captures not decomposed into facts",
         prompt: "decompose_facts",
-        sql: UNDECOMPOSED,
+        backlog: Backlog::Undecomposed,
     },
     Queue {
         key: "unannotated_memories",
         label: "memories with no entity/triple annotation",
         prompt: "backfill_graph",
-        sql: UNANNOTATED,
+        backlog: Backlog::Unannotated,
     },
     Queue {
         key: "unnormalized_imports",
         label: "raw imports not normalized",
         prompt: "normalize_imports",
-        sql: UNNORMALIZED,
+        backlog: Backlog::Unnormalized,
     },
     Queue {
         key: "unclassified_memories",
         label: "memories unclassified",
         prompt: "classify_memories",
-        sql: UNCLASSIFIED,
+        backlog: Backlog::Unclassified,
     },
 ];
 
@@ -132,12 +94,11 @@ const QUEUES: &[Queue] = &[
 ///
 /// Never fails: a queue whose query errors reports 0 rather than propagating,
 /// because a status helper must not be the thing that breaks a search.
-pub fn pending_counts(conn: &Connection) -> HashMap<String, i64> {
+pub fn pending_counts(store: &Store<'_>) -> HashMap<String, i64> {
+    let curation = Curation::new(store);
     let mut counts = HashMap::new();
     for queue in QUEUES {
-        let count = conn
-            .query_row(queue.sql, [], |r| r.get::<_, i64>(0))
-            .unwrap_or(0);
+        let count = curation.backlog_depth(queue.backlog).unwrap_or(0);
         counts.insert(queue.key.to_string(), count);
     }
 
@@ -145,11 +106,11 @@ pub fn pending_counts(conn: &Connection) -> HashMap<String, i64> {
     // nudge cannot disagree with what draining it actually finds.
     counts.insert(
         "contradiction_candidates".to_string(),
-        crate::contradictions::candidate_count(conn).unwrap_or(0),
+        crate::contradictions::candidate_count(store).unwrap_or(0),
     );
     counts.insert(
         "recalibration_candidates".to_string(),
-        crate::recalibrate::candidate_count(conn).unwrap_or(0),
+        crate::recalibrate::candidate_count(store).unwrap_or(0),
     );
 
     counts
@@ -167,17 +128,11 @@ pub struct CaptureHealth {
     pub ever_captured: bool,
 }
 
-pub fn capture_health(conn: &Connection) -> CaptureHealth {
-    let row: Option<(i64, Option<String>)> = conn
-        .query_row(
-            "SELECT COUNT(DISTINCT capture_id), MAX(created_at) FROM memories
-              WHERE capture_id IS NOT NULL AND deleted_at IS NULL",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .ok();
-
-    let (captures, last_capture_at) = row.unwrap_or((0, None));
+pub fn capture_health(store: &Store<'_>) -> CaptureHealth {
+    let (captures, last_capture_at) = Curation::new(store)
+        .capture_activity()
+        .map(|a| (a.captures, a.last_capture_at))
+        .unwrap_or((0, None));
     CaptureHealth {
         captures,
         last_capture_at,
@@ -279,7 +234,7 @@ pub fn render_notice(counts: &HashMap<String, i64>) -> Option<String> {
 ///
 /// Returns `None` when nudges are disabled, when the throttle slot is not yet
 /// due, or when no queue has crossed the threshold.
-pub fn maybe_notice(conn: &Connection) -> Option<String> {
+pub fn maybe_notice(store: &Store<'_>) -> Option<String> {
     if !nudges_enabled() {
         return None;
     }
@@ -287,5 +242,5 @@ pub fn maybe_notice(conn: &Connection) -> Option<String> {
     if !due("maintenance", NUDGE_INTERVAL_SECONDS) {
         return None;
     }
-    render_notice(&pending_counts(conn))
+    render_notice(&pending_counts(store))
 }

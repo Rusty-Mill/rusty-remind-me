@@ -28,7 +28,7 @@
 
 use remind_me_core::expansion::{MemorySearchResponse, RelatedMemory};
 use remind_me_core::models::{
-    CaptureResult, Memory, RevertOutcome, SavedSearch, SetReminderOutcome,
+    CaptureResult, Memory, RevertOutcome, SaveCheck, SavedSearch, SearchDetail, SetReminderOutcome,
 };
 use remind_me_core::updater::UpdateStatus;
 use remind_me_core::vectors::ReindexResult;
@@ -49,6 +49,31 @@ pub fn memory_stored(memory: &Memory) -> String {
         "✓ Memory stored with id `{}` in category '{}'.",
         memory.id, memory.category
     )
+}
+
+/// The contradiction check's findings, to append to a write's summary;
+/// empty when it found nothing.
+pub fn save_check(check: &SaveCheck) -> String {
+    let mut out = String::new();
+    if let Some(e) = &check.contradiction_check_error {
+        out.push_str(&format!("\n\n⚠ Contradiction check failed: {e}"));
+    }
+    if !check.contradiction_candidates.is_empty() {
+        out.push_str(
+            "\n\n⚠ May contradict these standing decisions. Supersede one \
+             (`remind_me_add` with `supersedes`, or `remind_me_resolve`), or keep both:",
+        );
+        for c in &check.contradiction_candidates {
+            out.push_str(&format!(
+                "\n- `{}` ({:?}, {:.2}): {}",
+                c.memory.id,
+                c.reason,
+                c.score,
+                preview(&c.memory.content_snippet, 120)
+            ));
+        }
+    }
+    out
 }
 
 pub fn memory_updated(memory: &Memory) -> String {
@@ -424,7 +449,7 @@ fn degradation_note(res: &MemorySearchResponse) -> Option<String> {
     ))
 }
 
-pub fn search_response(res: &MemorySearchResponse) -> String {
+pub fn search_response(res: &MemorySearchResponse, detail: SearchDetail) -> String {
     let bootstrap = res.bootstrap.as_ref().filter(|b| !b.is_empty());
 
     // A bootstrap without hits is still an answer. The persona was assembled
@@ -477,6 +502,11 @@ pub fn search_response(res: &MemorySearchResponse) -> String {
     // a claim rather than a report -- so the count is stated and the method is
     // not.
     parts.push(format!("**{} results**", res.returned));
+    if res.raw_fallback {
+        parts.push(
+            "_Raw sessions: nothing refined matched, so these are session dialogs._".to_string(),
+        );
+    }
     // Ahead of the budget envelope, because it qualifies the result set more
     // strongly than the trim does: trimming drops results that were found,
     // whereas a skipped stage means results that were never looked for.
@@ -488,6 +518,7 @@ pub fn search_response(res: &MemorySearchResponse) -> String {
             "_{} of {} candidates (trimmed {}, ~{}/{} tokens)_\n",
             res.returned, res.total_candidates, res.trimmed, res.tokens_used, res.budget
         ));
+        parts.push(trimmed_hint(res));
     } else {
         parts.push(format!(
             "_~{} tokens used (budget: {})_\n",
@@ -495,10 +526,15 @@ pub fn search_response(res: &MemorySearchResponse) -> String {
         ));
     }
 
-    let memories: Vec<_> = res.memories.iter().map(|r| r.memory.clone()).collect();
-    parts.push(remind_me_core::reminders::render_memories_markdown(
-        &memories,
-    ));
+    parts.push(match detail {
+        SearchDetail::Compact => {
+            remind_me_core::reminders::render_compact_hits_markdown(&res.memories)
+        }
+        SearchDetail::Full => {
+            let memories: Vec<_> = res.memories.iter().map(|r| r.memory.clone()).collect();
+            remind_me_core::reminders::render_memories_markdown(&memories)
+        }
+    });
 
     if let Some(related) = res.related_via_entities.as_ref().filter(|r| !r.is_empty()) {
         parts.push(expansion_section(
@@ -530,6 +566,33 @@ pub fn search_response(res: &MemorySearchResponse) -> String {
     }
 
     parts.join("\n---\n")
+}
+
+/// How to get what the budget dropped: the ids, and the call that fetches them.
+fn trimmed_hint(res: &MemorySearchResponse) -> String {
+    let ids = res
+        .trimmed_ids
+        .iter()
+        .map(|id| format!("`{id}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "_Trimmed: {ids}. Fetch them with remind_me_get (`memory_ids`), or raise `token_budget`._\n"
+    )
+}
+
+/// The JSON envelope with each hit cut to its compact fields.
+///
+/// Same envelope as `detail=full` (counts, budget, timing, expansions), so a
+/// caller switches modes without reparsing; only `memories` changes shape.
+pub fn compact_search_json(res: &MemorySearchResponse) -> serde_json::Value {
+    let mut value = serde_json::to_value(res).unwrap_or_else(|_| serde_json::json!({}));
+    value["memories"] = res
+        .memories
+        .iter()
+        .map(remind_me_core::reminders::compact_hit_json)
+        .collect();
+    value
 }
 
 /// One expansion block, matching `_fmt_expansion_md`'s per-item shape.
@@ -587,10 +650,12 @@ mod bootstrap_rendering {
             total_candidates: 0,
             returned: 0,
             trimmed: 0,
+            trimmed_ids: Vec::new(),
             tokens_used: 0,
             budget: 800,
             timing: Default::default(),
             bootstrap,
+            raw_fallback: false,
             related_via_entities: None,
             related_via_neighbors: None,
             related_via_co_retrieval: None,
@@ -599,7 +664,10 @@ mod bootstrap_rendering {
 
     #[test]
     fn nothing_at_all_still_renders_the_reference_empty_case() {
-        assert_eq!(search_response(&response(None)), "_No memories found._");
+        assert_eq!(
+            search_response(&response(None), SearchDetail::Full),
+            "_No memories found._"
+        );
     }
 
     #[test]
@@ -608,18 +676,21 @@ mod bootstrap_rendering {
         // Otherwise every search on a store with no persona yet would carry an
         // empty heading.
         assert_eq!(
-            search_response(&response(Some(Bootstrap::default()))),
+            search_response(&response(Some(Bootstrap::default())), SearchDetail::Full),
             "_No memories found._"
         );
     }
 
     #[test]
     fn a_bootstrap_without_hits_is_still_an_answer() {
-        let rendered = search_response(&response(Some(Bootstrap {
-            statements: vec![statement("Ships small changes.")],
-            tokens_used: 5,
-            omitted: 0,
-        })));
+        let rendered = search_response(
+            &response(Some(Bootstrap {
+                statements: vec![statement("Ships small changes.")],
+                tokens_used: 5,
+                omitted: 0,
+            })),
+            SearchDetail::Full,
+        );
 
         assert!(rendered.contains("Ships small changes."));
         // The distinction the change exists for: the query matched nothing,
@@ -634,22 +705,28 @@ mod bootstrap_rendering {
 
     #[test]
     fn a_trimmed_bootstrap_says_how_much_it_withheld() {
-        let rendered = search_response(&response(Some(Bootstrap {
-            statements: vec![statement("Ships small changes.")],
-            tokens_used: 5,
-            omitted: 3,
-        })));
+        let rendered = search_response(
+            &response(Some(Bootstrap {
+                statements: vec![statement("Ships small changes.")],
+                tokens_used: 5,
+                omitted: 3,
+            })),
+            SearchDetail::Full,
+        );
         // A count, not a boolean -- same reasoning as the trim envelope.
         assert!(rendered.contains("3 further statements omitted"));
     }
 
     #[test]
     fn one_withheld_statement_is_not_pluralised() {
-        let rendered = search_response(&response(Some(Bootstrap {
-            statements: vec![statement("Ships small changes.")],
-            tokens_used: 5,
-            omitted: 1,
-        })));
+        let rendered = search_response(
+            &response(Some(Bootstrap {
+                statements: vec![statement("Ships small changes.")],
+                tokens_used: 5,
+                omitted: 1,
+            })),
+            SearchDetail::Full,
+        );
         assert!(rendered.contains("1 further statement omitted"));
     }
 }
@@ -665,10 +742,12 @@ mod deadline_rendering {
             total_candidates: hits,
             returned: hits,
             trimmed: 0,
+            trimmed_ids: Vec::new(),
             tokens_used: 0,
             budget: 800,
             timing,
             bootstrap: None,
+            raw_fallback: false,
             related_via_entities: None,
             related_via_neighbors: None,
             related_via_co_retrieval: None,
@@ -685,14 +764,14 @@ mod deadline_rendering {
 
     #[test]
     fn a_clean_run_says_nothing_about_timing() {
-        let rendered = search_response(&response(SearchTiming::default(), 0));
+        let rendered = search_response(&response(SearchTiming::default(), 0), SearchDetail::Full);
         assert_eq!(rendered, "_No memories found._");
         assert!(!rendered.contains("Degraded"));
     }
 
     #[test]
     fn finding_nothing_after_a_timeout_does_not_read_as_finding_nothing() {
-        let rendered = search_response(&response(degraded(), 0));
+        let rendered = search_response(&response(degraded(), 0), SearchDetail::Full);
         // The dangerous case: "no memories" looks authoritative, and a caller
         // is most likely to act on it.
         assert!(rendered.contains("_No memories found._"));
@@ -703,14 +782,17 @@ mod deadline_rendering {
 
     #[test]
     fn the_note_names_the_stages_rather_than_saying_timed_out() {
-        let rendered = search_response(&response(
-            SearchTiming {
-                elapsed_ms: 2000,
-                deadline_ms: Some(500),
-                skipped: vec!["semantic".to_string(), "rerank".to_string()],
-            },
-            0,
-        ));
+        let rendered = search_response(
+            &response(
+                SearchTiming {
+                    elapsed_ms: 2000,
+                    deadline_ms: Some(500),
+                    skipped: vec!["semantic".to_string(), "rerank".to_string()],
+                },
+                0,
+            ),
+            SearchDetail::Full,
+        );
         // Which stage was lost changes what the reader may infer: no semantic
         // means "nothing about this topic" is not a safe conclusion, whereas
         // no rerank only means the order is worse.

@@ -9,6 +9,9 @@
 //! same enabled/endpoint configuration, and no other file may also enable
 //! tracing without its own separate process.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 use remind_me_core::telemetry::{self, OTEL_ENABLED_ENV, OTEL_ENDPOINT_ENV};
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -32,8 +35,8 @@ fn a_dropped_span_reaches_a_real_collector_with_the_right_json_shape() {
         }
     });
 
-    std::env::set_var(OTEL_ENABLED_ENV, "1");
-    std::env::set_var(
+    crate::test_env::set_var(OTEL_ENABLED_ENV, "1");
+    crate::test_env::set_var(
         OTEL_ENDPOINT_ENV,
         format!("http://127.0.0.1:{port}/v1/traces"),
     );

@@ -7,14 +7,18 @@
 //! the two ways it could go wrong: a bootstrap that crowds out the answer, and
 //! one that resurrects a statement the ladder has already withdrawn.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
+use remind_me_core::db::memories::{Memories, NewMemory};
 use remind_me_core::db::queries::search_with_expansions;
+use remind_me_core::db::Store;
 use remind_me_core::models::MemorySearchInput;
 use remind_me_core::promotion::{
     bootstrap, bootstrap_reserve_fraction, persona, promote, BOOTSTRAP_RESERVE_DEFAULT,
     BOOTSTRAP_RESERVE_MAX,
 };
 use remind_me_core::{Database, PromoteInput, Rung, FACT_CATEGORY, PERSONA_CATEGORY};
-use rusqlite::{params, Connection};
 use std::sync::Mutex;
 
 /// `REMIND_ME_BOOTSTRAP_RESERVE` is process-global; serialize the tests that
@@ -28,29 +32,32 @@ fn db(name: &str) -> Database {
     Database::open(dir.join("memories.db").display().to_string()).unwrap()
 }
 
-fn seed(conn: &Connection, id: &str, content: &str, category: &str, sensitive: bool) {
+fn seed(store: &Store<'_>, id: &str, content: &str, category: &str, sensitive: bool) {
     let now = chrono::Utc::now().to_rfc3339();
-    conn.execute(
-        "INSERT INTO memories (id, content, category, tags, source, metadata,
-            created_at, updated_at, vitality, sensitive)
-         VALUES (?, ?, ?, '[]', 'manual', '{}', ?, ?, 1.0, ?)",
-        params![id, content, category, now, now, sensitive as i64],
-    )
-    .unwrap();
+    Memories::new(store)
+        .insert(&NewMemory {
+            category: category.to_string(),
+            sensitive,
+            ..NewMemory::new(id, content, &now)
+        })
+        .unwrap();
+    // Planted with raw SQL, so it needs indexing to be searchable, and to be
+    // deletable without the full-text index losing track of it.
+    remind_me_core::db::derived::rebuild_indexes(store).unwrap();
 }
 
 /// A persona statement with real provenance, built through `promote` so the
 /// surviving-sources rule these tests lean on is the production one.
-fn persona_from(conn: &Connection, source_id: &str, content: &str) -> String {
+fn persona_from(store: &Store<'_>, source_id: &str, content: &str) -> String {
     seed(
-        conn,
+        store,
         source_id,
         "scenario source material",
         "scenario",
         false,
     );
     promote(
-        conn,
+        store,
         &PromoteInput {
             rung: Rung::ScenarioToPersona,
             source_ids: vec![source_id.to_string()],
@@ -61,25 +68,23 @@ fn persona_from(conn: &Connection, source_id: &str, content: &str) -> String {
     .promoted_id
 }
 
-fn supersede(conn: &Connection, id: &str) {
-    conn.execute(
-        "UPDATE memories SET superseded_by = 'mem_newer' WHERE id = ?",
-        params![id],
-    )
-    .unwrap();
+fn supersede(store: &Store<'_>, id: &str) {
+    remind_me_core::testing::set_memory_column(store, id, "superseded_by", "mem_newer").unwrap();
 }
 
 fn search(
-    conn: &Connection,
+    store: &Store<'_>,
     query: &str,
     want_bootstrap: bool,
     budget: usize,
 ) -> MemorySearchInput {
-    let _ = conn;
+    let _ = store;
     MemorySearchInput {
         query: query.to_string(),
         token_budget: budget,
         bootstrap: want_bootstrap,
+        include_expired: true,
+        min_confidence: 0.0,
         ..Default::default()
     }
 }
@@ -87,10 +92,10 @@ fn search(
 #[test]
 fn the_bootstrap_is_off_unless_asked_for() {
     let db = db("default_off");
-    let conn = db.conn();
-    persona_from(&conn, "mem_src_off", "Prefers Rust over Go for services.");
+    let store = db.store();
+    persona_from(&store, "mem_src_off", "Prefers Rust over Go for services.");
     seed(
-        &conn,
+        &store,
         "mem_hit_off",
         "quokka sightings on the island",
         FACT_CATEGORY,
@@ -103,7 +108,7 @@ fn the_bootstrap_is_off_unless_asked_for() {
          switch the feature on for programmatic callers only"
     );
 
-    let res = search_with_expansions(&conn, &search(&conn, "quokka", false, 800)).unwrap();
+    let res = search_with_expansions(&store, &search(&store, "quokka", false, 800)).unwrap();
     assert!(
         res.bootstrap.is_none(),
         "not asking must produce None, not an empty bootstrap -- the two mean \
@@ -114,21 +119,21 @@ fn the_bootstrap_is_off_unless_asked_for() {
 #[test]
 fn a_persona_is_injected_even_though_it_does_not_match_the_query() {
     let db = db("injected");
-    let conn = db.conn();
+    let store = db.store();
     persona_from(
-        &conn,
+        &store,
         "mem_src_inj",
         "Prefers small reversible changes over big rewrites.",
     );
     seed(
-        &conn,
+        &store,
         "mem_hit_inj",
         "quokka sightings on the island",
         FACT_CATEGORY,
         false,
     );
 
-    let res = search_with_expansions(&conn, &search(&conn, "quokka", true, 800)).unwrap();
+    let res = search_with_expansions(&store, &search(&store, "quokka", true, 800)).unwrap();
 
     let boot = res.bootstrap.expect("asked for a bootstrap");
     assert_eq!(boot.statements.len(), 1);
@@ -150,24 +155,24 @@ fn a_persona_is_injected_even_though_it_does_not_match_the_query() {
 #[test]
 fn an_empty_persona_leaves_the_hits_exactly_as_they_were() {
     let db = db("empty_persona");
-    let conn = db.conn();
+    let store = db.store();
     seed(
-        &conn,
+        &store,
         "mem_a",
         "quokka sightings on the island",
         FACT_CATEGORY,
         false,
     );
     seed(
-        &conn,
+        &store,
         "mem_b",
         "quokka feeding habits",
         FACT_CATEGORY,
         false,
     );
 
-    let without = search_with_expansions(&conn, &search(&conn, "quokka", false, 800)).unwrap();
-    let with = search_with_expansions(&conn, &search(&conn, "quokka", true, 800)).unwrap();
+    let without = search_with_expansions(&store, &search(&store, "quokka", false, 800)).unwrap();
+    let with = search_with_expansions(&store, &search(&store, "quokka", true, 800)).unwrap();
 
     let ids = |r: &remind_me_core::expansion::MemorySearchResponse| {
         r.memories
@@ -194,13 +199,13 @@ fn a_large_persona_cannot_starve_the_ranked_results() {
     // The pathological setting: a caller asking for the whole budget to go to
     // the persona. The cap is what makes this survivable, so test it at the
     // value that would break it rather than at the default.
-    std::env::set_var("REMIND_ME_BOOTSTRAP_RESERVE", "4.0");
+    crate::test_env::set_var("REMIND_ME_BOOTSTRAP_RESERVE", "4.0");
 
     let db = db("starvation");
-    let conn = db.conn();
+    let store = db.store();
     for i in 0..40 {
         persona_from(
-            &conn,
+            &store,
             &format!("mem_src_big_{}", i),
             &format!(
                 "Durable statement number {} about how this person works, written \
@@ -210,7 +215,7 @@ fn a_large_persona_cannot_starve_the_ranked_results() {
         );
     }
     seed(
-        &conn,
+        &store,
         "mem_hit_big",
         "quokka sightings on the island",
         FACT_CATEGORY,
@@ -218,8 +223,8 @@ fn a_large_persona_cannot_starve_the_ranked_results() {
     );
 
     let budget = 400usize;
-    let res = search_with_expansions(&conn, &search(&conn, "quokka", true, budget)).unwrap();
-    std::env::remove_var("REMIND_ME_BOOTSTRAP_RESERVE");
+    let res = search_with_expansions(&store, &search(&store, "quokka", true, budget)).unwrap();
+    crate::test_env::remove_var("REMIND_ME_BOOTSTRAP_RESERVE");
 
     let boot = res.bootstrap.expect("asked for one");
     let ceiling = (budget as f64 * BOOTSTRAP_RESERVE_MAX) as usize;
@@ -244,82 +249,82 @@ fn a_large_persona_cannot_starve_the_ranked_results() {
 #[test]
 fn superseding_the_last_source_withdraws_the_statement_from_the_bootstrap_too() {
     let db = db("demotion");
-    let conn = db.conn();
-    persona_from(&conn, "mem_src_dem", "Ships on Fridays without ceremony.");
+    let store = db.store();
+    persona_from(&store, "mem_src_dem", "Ships on Fridays without ceremony.");
     seed(
-        &conn,
+        &store,
         "mem_hit_dem",
         "quokka sightings on the island",
         FACT_CATEGORY,
         false,
     );
 
-    assert_eq!(persona(&conn).unwrap().len(), 1);
-    assert_eq!(bootstrap(&conn, 800).unwrap().statements.len(), 1);
+    assert_eq!(persona(&store).unwrap().len(), 1);
+    assert_eq!(bootstrap(&store, 800).unwrap().statements.len(), 1);
 
-    supersede(&conn, "mem_src_dem");
+    supersede(&store, "mem_src_dem");
 
     // One code path, so these cannot disagree -- which is the guarantee, not
     // an incidental consequence. A separate query in the bootstrap would let
     // a withdrawn statement keep being injected into every search while
     // `remind_me_persona` correctly reported it gone.
-    assert!(persona(&conn).unwrap().is_empty());
-    assert!(bootstrap(&conn, 800).unwrap().is_empty());
+    assert!(persona(&store).unwrap().is_empty());
+    assert!(bootstrap(&store, 800).unwrap().is_empty());
 
-    let res = search_with_expansions(&conn, &search(&conn, "quokka", true, 800)).unwrap();
+    let res = search_with_expansions(&store, &search(&store, "quokka", true, 800)).unwrap();
     assert!(res.bootstrap.expect("asked for one").is_empty());
 }
 
 #[test]
 fn sensitive_statements_never_enter_the_bootstrap() {
     let db = db("sensitive");
-    let conn = db.conn();
+    let store = db.store();
 
     // Seeded rather than promoted: `promote` refuses a sensitive source for
     // the persona rung, so this is the only way such a row can exist -- an
     // older row, or one marked sensitive after the fact. That is precisely the
     // case the read-side filter has to cover.
     seed(
-        &conn,
+        &store,
         "mem_sens_src",
         "scenario source material",
         "scenario",
         false,
     );
     seed(
-        &conn,
+        &store,
         "mem_sens_persona",
         "Sensitive durable statement that must never be injected.",
         PERSONA_CATEGORY,
         true,
     );
-    conn.execute(
-        "INSERT INTO promotions (promoted_id, source_id, rung, promoted_at)
-         VALUES ('mem_sens_persona', 'mem_sens_src', 'scenario_to_persona', ?)",
-        params![chrono::Utc::now().to_rfc3339()],
-    )
-    .unwrap();
+    remind_me_core::db::promotions::Promotions::new(&store)
+        .record(
+            "mem_sens_persona",
+            "mem_sens_src",
+            "scenario_to_persona",
+            &chrono::Utc::now().to_rfc3339(),
+        )
+        .unwrap();
 
     // Its provenance is intact, so it is withheld for being sensitive rather
     // than for having lost its grounds -- otherwise this would pass for the
     // wrong reason.
     assert_eq!(
-        conn.query_row(
-            "SELECT count(*) FROM promotions WHERE promoted_id = 'mem_sens_persona'",
-            [],
-            |r| r.get::<_, i64>(0)
-        )
-        .unwrap(),
+        remind_me_core::db::promotions::Promotions::new(&store)
+            .sources_of("mem_sens_persona")
+            .unwrap()
+            .len(),
         1
     );
-    assert!(bootstrap(&conn, 800).unwrap().is_empty());
+    assert!(bootstrap(&store, 800).unwrap().is_empty());
 
     // Even asking for sensitive content in the search does not reach it: the
     // bootstrap is ambient rather than requested per-item, so there is no
     // per-call intent to opt back in against.
-    let mut input = search(&conn, "quokka", true, 800);
+    let mut input = search(&store, "quokka", true, 800);
     input.include_sensitive = true;
-    let res = search_with_expansions(&conn, &input).unwrap();
+    let res = search_with_expansions(&store, &input).unwrap();
     assert!(res.bootstrap.expect("asked for one").is_empty());
 }
 
@@ -331,43 +336,43 @@ fn the_reserve_fraction_is_clamped_rather_than_trusted() {
     // the clamp engaged or the default did -- 0.25 and a clamped 0.5 both sit
     // under the ceiling it checks. This is the assertion that fails if the
     // clamp is removed.
-    std::env::set_var("REMIND_ME_BOOTSTRAP_RESERVE", "4.0");
+    crate::test_env::set_var("REMIND_ME_BOOTSTRAP_RESERVE", "4.0");
     assert_eq!(bootstrap_reserve_fraction(), BOOTSTRAP_RESERVE_MAX);
 
     // A percentage typed where a fraction was wanted is the likely slip, and
     // it must not hand the whole budget to the persona either.
-    std::env::set_var("REMIND_ME_BOOTSTRAP_RESERVE", "90");
+    crate::test_env::set_var("REMIND_ME_BOOTSTRAP_RESERVE", "90");
     assert_eq!(bootstrap_reserve_fraction(), BOOTSTRAP_RESERVE_MAX);
 
     // Malformed input falls back rather than failing the search around it.
-    std::env::set_var("REMIND_ME_BOOTSTRAP_RESERVE", "not-a-number");
+    crate::test_env::set_var("REMIND_ME_BOOTSTRAP_RESERVE", "not-a-number");
     assert_eq!(bootstrap_reserve_fraction(), BOOTSTRAP_RESERVE_DEFAULT);
 
-    std::env::set_var("REMIND_ME_BOOTSTRAP_RESERVE", "-1");
+    crate::test_env::set_var("REMIND_ME_BOOTSTRAP_RESERVE", "-1");
     assert_eq!(bootstrap_reserve_fraction(), BOOTSTRAP_RESERVE_DEFAULT);
 
     // Zero is a legitimate setting -- "assemble no bootstrap" -- and must not
     // be mistaken for unset.
-    std::env::set_var("REMIND_ME_BOOTSTRAP_RESERVE", "0");
+    crate::test_env::set_var("REMIND_ME_BOOTSTRAP_RESERVE", "0");
     assert_eq!(bootstrap_reserve_fraction(), 0.0);
 
-    std::env::remove_var("REMIND_ME_BOOTSTRAP_RESERVE");
+    crate::test_env::remove_var("REMIND_ME_BOOTSTRAP_RESERVE");
     assert_eq!(bootstrap_reserve_fraction(), BOOTSTRAP_RESERVE_DEFAULT);
 }
 
 #[test]
 fn an_unlimited_budget_takes_the_whole_persona() {
     let db = db("unlimited");
-    let conn = db.conn();
+    let store = db.store();
     for i in 0..5 {
         persona_from(
-            &conn,
+            &store,
             &format!("mem_src_unl_{}", i),
             &format!("Durable statement number {}.", i),
         );
     }
 
-    let boot = bootstrap(&conn, 0).unwrap();
+    let boot = bootstrap(&store, 0).unwrap();
     assert_eq!(
         boot.statements.len(),
         5,

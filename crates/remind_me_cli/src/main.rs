@@ -1,8 +1,22 @@
+#[cfg(test)]
+#[path = "../../remind_me_core/src/test_env.rs"]
+mod test_env;
+
+mod copy_store;
+mod daemon;
+mod session;
+
+use daemon::Store;
 use remind_me_api::ApiServer;
-use remind_me_core::db::queries;
+use remind_me_core::daemon::ops::Op;
+use remind_me_core::entity::Entity;
+use remind_me_core::models::{Memory, MemoryListResult, MemorySearchResult};
+use remind_me_core::stats::Stats;
+use remind_me_core::wiki::WikiPage;
+use remind_me_core::wiki_import::WikiImportReport;
 use remind_me_core::{
-    entity, reminders, stats, updater, wiki, wiki_import, Database, EntityInput, MemoryAddInput,
-    MemoryListInput, MemorySearchInput, ResponseFormat, LIST_LIMIT_MAX, LIST_LIMIT_MIN,
+    reminders, updater, AttachmentInput, Database, EntityInput, MemoryAddInput, MemoryListInput,
+    MemorySearchInput, ResponseFormat, LIST_LIMIT_MAX, LIST_LIMIT_MIN,
 };
 use remind_me_mcp::McpServer;
 use serde_json::{json, Value};
@@ -299,6 +313,7 @@ fn configure_mcp_clients(parsed: &ConfigureArgs) -> Result<(), Box<dyn std::erro
 struct ListArgs {
     limit: usize,
     category: Option<String>,
+    scope: remind_me_core::context::ScopeFilter,
     as_json: bool,
 }
 
@@ -311,6 +326,7 @@ fn parse_list_args(args: &[String]) -> Result<ListArgs, String> {
         // Matches `list_p.add_argument("--limit", type=int, default=20)`.
         limit: 20,
         category: None,
+        scope: Default::default(),
         as_json: false,
     };
     let mut i = 0;
@@ -346,6 +362,13 @@ fn parse_list_args(args: &[String]) -> Result<ListArgs, String> {
                 }
                 i += 2;
             }
+            flag @ ("--project" | "--branch" | "--session" | "--written-by") => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| format!("Error: {} expects a value.\n{}", flag, LIST_USAGE))?;
+                parsed.scope.set_from_flag(flag, value);
+                i += 2;
+            }
             other => {
                 return Err(format!("Error: unknown flag {:?}.\n{}", other, LIST_USAGE));
             }
@@ -354,11 +377,82 @@ fn parse_list_args(args: &[String]) -> Result<ListArgs, String> {
     Ok(parsed)
 }
 
-const LIST_USAGE: &str = "Usage: rusty-remind-me list [--limit N] [--category CATEGORY] [--json]";
+const LIST_USAGE: &str = "Usage: rusty-remind-me list [--limit N] [--category CATEGORY] [--project P] [--branch B] [--session ID] [--json]";
 
-const ADD_USAGE: &str = "Usage: rusty-remind-me add <content> [--category CATEGORY] [--tags a,b,c]";
+const ADD_USAGE: &str =
+    "Usage: rusty-remind-me add <content> [--category CATEGORY] [--tags a,b,c] [--attach PATH]...";
 
-const SEARCH_USAGE: &str = "Usage: rusty-remind-me search <query> [--limit N] [--json]";
+const RESOLVE_USAGE: &str = "Usage: rusty-remind-me resolve <id> \
+(<done|abandoned|reverted|superseded> | --review <held|revised|reverted>) [--note TEXT]";
+
+/// What a `resolve` records: whether it was carried out, or whether a
+/// decision held up at its follow-up review.
+#[derive(Debug, PartialEq, Eq)]
+enum Resolution {
+    Outcome(String),
+    Review(String),
+}
+
+/// Parsed form of `rusty-remind-me resolve <id> (<outcome> | --review R) [--note TEXT]`.
+#[derive(Debug, PartialEq, Eq)]
+struct ResolveArgs {
+    memory_id: String,
+    resolution: Resolution,
+    note: Option<String>,
+}
+
+fn parse_resolve_args(args: &[String]) -> Result<ResolveArgs, String> {
+    let mut words: Vec<&String> = Vec::new();
+    let mut note = None;
+    let mut review = None;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--note" {
+            note = Some(flag_value(args, i, "--note", RESOLVE_USAGE)?);
+            i += 2;
+        } else if args[i] == "--review" {
+            review = Some(flag_value(args, i, "--review", RESOLVE_USAGE)?);
+            i += 2;
+        } else if args[i].starts_with("--") {
+            return Err(format!(
+                "Error: unknown flag {:?}.\n{}",
+                args[i], RESOLVE_USAGE
+            ));
+        } else {
+            words.push(&args[i]);
+            i += 1;
+        }
+    }
+    let resolution = match (&words[..], review) {
+        ([_, outcome], None) => {
+            check_one_of("outcome", outcome, &remind_me_core::kinds::OUTCOMES)?;
+            Resolution::Outcome(outcome.to_string())
+        }
+        ([_], Some(review)) => {
+            check_one_of("--review", &review, &remind_me_core::kinds::REVIEW_OUTCOMES)?;
+            Resolution::Review(review)
+        }
+        _ => return Err(RESOLVE_USAGE.to_string()),
+    };
+    Ok(ResolveArgs {
+        memory_id: words[0].clone(),
+        resolution,
+        note,
+    })
+}
+
+fn check_one_of(name: &str, value: &str, allowed: &[&str]) -> Result<(), String> {
+    if allowed.contains(&value) {
+        return Ok(());
+    }
+    Err(format!(
+        "Error: {name} must be one of {}.\n{}",
+        allowed.join(", "),
+        RESOLVE_USAGE
+    ))
+}
+
+const SEARCH_USAGE: &str = "Usage: rusty-remind-me search <query> [--limit N] [--project P] [--branch B] [--session ID] [--json]";
 
 /// Parsed form of `rusty-remind-me add <content> [--category C] [--tags a,b]`.
 ///
@@ -372,6 +466,8 @@ struct AddArgs {
     content: String,
     category: String,
     tags: Vec<String>,
+    /// `--attach <path>`, repeatable: files recorded by fingerprint.
+    attach: Vec<String>,
 }
 
 /// Parsed form of `rusty-remind-me search <query> [--limit N] [--json]`.
@@ -379,6 +475,7 @@ struct AddArgs {
 struct SearchArgs {
     query: String,
     limit: usize,
+    scope: remind_me_core::context::ScopeFilter,
     as_json: bool,
 }
 
@@ -464,6 +561,7 @@ fn parse_add_args(args: &[String]) -> Result<AddArgs, String> {
     // `--tags` defaulting to "" -> [].
     let mut category = "general".to_string();
     let mut tags: Vec<String> = Vec::new();
+    let mut attach: Vec<String> = Vec::new();
 
     let content = collect_positional(args, ADD_USAGE, |flag, args, i| match flag {
         "--category" => {
@@ -476,6 +574,11 @@ fn parse_add_args(args: &[String]) -> Result<AddArgs, String> {
             *i += 2;
             Ok(true)
         }
+        "--attach" => {
+            attach.push(flag_value(args, *i, flag, ADD_USAGE)?);
+            *i += 2;
+            Ok(true)
+        }
         _ => Ok(false),
     })?;
 
@@ -483,6 +586,7 @@ fn parse_add_args(args: &[String]) -> Result<AddArgs, String> {
         content,
         category,
         tags,
+        attach,
     })
 }
 
@@ -490,8 +594,14 @@ fn parse_search_args(args: &[String]) -> Result<SearchArgs, String> {
     // `search_p.add_argument("--limit", type=int, default=20)`.
     let mut limit = 20usize;
     let mut as_json = false;
+    let mut scope = remind_me_core::context::ScopeFilter::default();
 
     let query = collect_positional(args, SEARCH_USAGE, |flag, args, i| match flag {
+        "--project" | "--branch" | "--session" | "--written-by" => {
+            scope.set_from_flag(flag, &flag_value(args, *i, flag, SEARCH_USAGE)?);
+            *i += 2;
+            Ok(true)
+        }
         "--json" => {
             as_json = true;
             *i += 1;
@@ -522,6 +632,7 @@ fn parse_search_args(args: &[String]) -> Result<SearchArgs, String> {
     Ok(SearchArgs {
         query,
         limit,
+        scope,
         as_json,
     })
 }
@@ -550,9 +661,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let db = Database::open(&db_path)?;
-
     if args.len() < 2 || args[1] == "server" || args[1] == "mcp" {
+        // With the daemon on, this process only relays: the daemon owns the
+        // store and runs the background loops below for every client.
+        if let Some(proxy) = daemon::mcp_proxy(&db_path) {
+            updater::start_background_check();
+            remind_me_mcp::run_stdio(&proxy)?;
+            return Ok(());
+        }
+        let db = Database::open(&db_path)?;
         // Non-blocking, and deliberately not inside McpServer::new: that
         // constructor is also what the test suite uses to build a server
         // per-test, and a background `git fetch` on every one of those
@@ -562,18 +679,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // switch, only a poll interval. Without this the scheduler would be
         // code nothing ever runs, and a reminder would only ever fire if
         // someone happened to call a tool.
-        let scheduler = remind_me_core::scheduler::start_scheduler_for(&db.conn());
+        let scheduler = remind_me_core::scheduler::start_scheduler_for(&db.store());
         // Conditional, unlike the scheduler: the watcher has an explicit
         // enable switch, so this is `None` unless REMIND_ME_WATCH_DIRS names a
         // usable directory. Until #203 this call did not exist at all, and
         // `scan_once` ran only when a test invoked it — the status surface
         // reported a configured watcher that was never going to scan anything.
-        let watcher = remind_me_core::watcher::start_watcher_for(&db.conn());
+        let watcher = remind_me_core::watcher::start_watcher_for(&db.store());
         // Conditional like the watcher: `None` unless
         // REMIND_ME_PROMOTION_INTERVAL is set. The refinement ladder's
         // candidate queries are pull-only without this, so a backlog can grow
         // indefinitely with nothing ever mentioning it (#208).
-        let nudge = remind_me_core::promotion::start_nudge_for(&db.conn());
+        let nudge = remind_me_core::promotion::start_nudge_for(&db.store());
         // Conditional like the watcher/nudge: `None` unless node id, hub URL
         // and secret are all configured. A background loop like the three
         // above, not something `McpServer` owns (#316's plugin work needed
@@ -581,7 +698,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // `rusty-remind-me api` process, not only ones written over MCP) --
         // started here alongside it instead, and stopped in the same join
         // block below.
-        let mut sync = remind_me_core::sync::SyncWorker::from_env(db_path.clone());
+        let mut sync = db
+            .secondary_source()
+            .and_then(remind_me_core::sync::SyncWorker::from_env);
         let server = McpServer::new(db);
         let result = server.run_stdio_loop();
         // All joined before the database goes out of scope, so an in-flight
@@ -602,6 +721,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         result?;
     } else {
         match args[1].as_str() {
+            "impact-export" => {
+                if args.len() > 3 {
+                    return Err("usage: rusty-remind-me impact-export [QUERY]".into());
+                }
+                let snapshot: serde_json::Value =
+                    Store::open(&db_path)?.call(Op::ImpactExport {
+                        query: args.get(2).cloned(),
+                    })?;
+                println!("{}", serde_json::to_string_pretty(&snapshot)?);
+            }
+            "copy-store" => match copy_store::parse(&args[2..], &db_path) {
+                Ok(parsed) => copy_store::run(&parsed)?,
+                Err(message) => {
+                    eprintln!("{}", message);
+                    std::process::exit(1);
+                }
+            },
+            "daemon" => daemon::command(&args[2..], &db_path)?,
+            // The hook-facing session commands (`session.rs`).
+            "session" | "capture-transcript" | "import-sessions" | "context" | "brief" => {
+                session::command(&args[1], &args[2..], &db_path)?
+            }
             "configure" | "setup" => {
                 let configure_args = match parse_configure_args(&args[2..]) {
                     Ok(parsed) => parsed,
@@ -639,17 +780,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // is not an error, it just means this protection is
                 // unavailable, same as an in-memory DB having no backup
                 // directory (`status::server_status`).
-                let pid_path = match remind_me_core::pid::pid_file_path(&db.conn()) {
-                    Ok(path) => Some(path),
-                    Err(remind_me_core::pid::PidError::InMemory) => {
-                        eprintln!(
-                            "Warning: in-memory database has no on-disk location for a PID \
-                             file; double-start protection is unavailable."
-                        );
-                        None
-                    }
-                    Err(e) => return Err(e.into()),
-                };
+                let pid_path = Some(remind_me_core::pid::pid_file_path_for(&db_path));
                 if let Some(path) = &pid_path {
                     let status = remind_me_core::pid::dashboard_status(path);
                     if status.running {
@@ -667,12 +798,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     remind_me_core::pid::write_pid_file(path, &host, port)?;
                 }
 
-                let scheduler = remind_me_core::scheduler::start_scheduler_for(&db.conn());
+                // With the daemon on, each connection is relayed to it, and
+                // the daemon runs the scheduler and sync worker below.
+                let relayed = daemon::serve_api_via_daemon(&db_path, &addr);
+                if !matches!(relayed, Ok(false)) {
+                    if let Some(path) = &pid_path {
+                        remind_me_core::pid::remove_pid_file(path);
+                    }
+                    relayed?;
+                    return Ok(());
+                }
+
+                let db = Database::open(&db_path)?;
+                let scheduler = remind_me_core::scheduler::start_scheduler_for(&db.store());
                 // A long-lived daemon like "server", so it can carry the sync
                 // worker just as well -- see the comment on "server"'s own
                 // `SyncWorker::from_env` call for why this no longer lives
                 // inside `McpServer` specifically.
-                let mut sync = remind_me_core::sync::SyncWorker::from_env(db_path.clone());
+                let mut sync = db
+                    .secondary_source()
+                    .and_then(remind_me_core::sync::SyncWorker::from_env);
                 let api_server = ApiServer::new(db);
                 let result = api_server.run(&addr);
                 if let Some(scheduler) = scheduler {
@@ -705,9 +850,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // "server" did. Stopped after `run_blocking` returns, same as
                 // the others; `run_blocking` blocks for the connector's whole
                 // life, so there is nothing to interleave it with.
-                let mut sync = remind_me_core::sync::SyncWorker::from_env(db_path.clone());
+                if let Some(proxy) = daemon::mcp_proxy(&db_path) {
+                    remind_me_remote::run_blocking(std::sync::Arc::new(proxy))?;
+                    return Ok(());
+                }
+                let db = Database::open(&db_path)?;
+                let mut sync = db
+                    .secondary_source()
+                    .and_then(remind_me_core::sync::SyncWorker::from_env);
                 let server = McpServer::new(db);
-                let result = remind_me_remote::run_blocking(server);
+                let result = remind_me_remote::run_blocking(std::sync::Arc::new(server));
                 if let Some(sync) = sync.as_mut() {
                     sync.stop();
                 }
@@ -736,6 +888,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     },
                     include_dormant: false,
                     min_vitality: 0.0,
+                    detail: Default::default(),
                     verbose: false,
                     expand_entities: false,
                     include_neighbors: false,
@@ -745,10 +898,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // would be silently ignored, so it stays false until the
                     // CLI grows a flag and the call to match.
                     bootstrap: false,
+                    scope: search_args.scope,
+                    include_expired: true,
+                    min_confidence: 0.0,
+                    include_raw: false,
+                    filters: Default::default(),
+                    window: Default::default(),
                 };
-                let conn = db.conn();
-                let results = queries::search_memories(&conn, &search_input)?;
-                match search_input.response_format {
+                let response_format = search_input.response_format;
+                let results: Vec<MemorySearchResult> = Store::open(&db_path)?.call(Op::Search {
+                    input: search_input,
+                })?;
+                match response_format {
                     // JSON keeps the whole result -- scores, per-signal
                     // components, the lot -- because that is what a script
                     // piping this wants.
@@ -768,6 +929,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             "add" => {
+                // A person typing `add`, not a model: see `context`'s rule.
+                remind_me_core::context::set_default_writer(remind_me_core::context::Writer::Human);
                 let add_args = match parse_add_args(&args[2..]) {
                     Ok(parsed) => parsed,
                     Err(message) => {
@@ -776,6 +939,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 };
                 let add_input = MemoryAddInput {
+                    attachments: add_args
+                        .attach
+                        .into_iter()
+                        .map(|path| AttachmentInput {
+                            path: Some(path),
+                            ..Default::default()
+                        })
+                        .collect(),
                     sensitive: false,
                     content: add_args.content,
                     category: add_args.category,
@@ -786,9 +957,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     predicate: None,
                     object: None,
                     entities: vec![],
+                    ..Default::default()
                 };
-                let conn = db.conn();
-                let mem = queries::add_memory(&conn, add_input)?;
+                let mem: Memory = Store::open(&db_path)?.call(Op::Add { input: add_input })?;
                 println!("Added memory: {}", mem.id);
             }
             "list" => {
@@ -804,6 +975,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 let list_input = MemoryListInput {
                     category: list_args.category,
+                    scope: list_args.scope,
                     limit: list_args.limit,
                     response_format: if list_args.as_json {
                         ResponseFormat::Json
@@ -812,9 +984,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     },
                     ..Default::default()
                 };
-                let conn = db.conn();
-                let page = queries::list_memories(&conn, &list_input)?;
-                match list_input.response_format {
+                let response_format = list_input.response_format;
+                let page: MemoryListResult =
+                    Store::open(&db_path)?.call(Op::List { input: list_input })?;
+                match response_format {
                     // The reference's `_fmt_memories` JSON branch carries
                     // `count`/`memories`/`total`; `MemoryListResult` also
                     // carries the pagination cursor, so it is serialized whole
@@ -836,8 +1009,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 }
                 let id = &args[2];
-                let conn = db.conn();
-                if let Some(mem) = queries::get_memory_by_id(&conn, id)? {
+                let found: Option<Memory> =
+                    Store::open(&db_path)?.call(Op::Get { id: id.clone() })?;
+                if let Some(mem) = found {
                     println!("{}", serde_json::to_string_pretty(&mem)?);
                 } else {
                     eprintln!("Memory not found: {}", id);
@@ -850,15 +1024,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 let name = args[2].clone();
                 let kind = args.get(3).cloned();
-                let conn = db.conn();
-                let ent = entity::upsert_entity(
-                    &conn,
-                    &EntityInput {
+                let ent: Entity = Store::open(&db_path)?.call(Op::UpsertEntity {
+                    input: EntityInput {
                         name,
                         kind,
                         aliases: vec![],
                     },
-                )?;
+                })?;
                 println!("{}", serde_json::to_string_pretty(&ent)?);
             }
             "wiki-write" => {
@@ -869,8 +1041,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let slug = &args[2];
                 let title = &args[3];
                 let content = &args[4];
-                let conn = db.conn();
-                let page = wiki::write_wiki_page(&conn, slug, title, content, "")?;
+                let page: WikiPage = Store::open(&db_path)?.call(Op::WikiWrite {
+                    slug: slug.clone(),
+                    title: title.clone(),
+                    content: content.clone(),
+                })?;
                 println!("Saved wiki page: {}", page.slug);
             }
             "wiki-read" => {
@@ -879,8 +1054,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 }
                 let slug = &args[2];
-                let conn = db.conn();
-                if let Some(page) = wiki::get_wiki_page(&conn, slug)? {
+                let found: Option<WikiPage> =
+                    Store::open(&db_path)?.call(Op::WikiRead { slug: slug.clone() })?;
+                if let Some(page) = found {
                     println!("{}", serde_json::to_string_pretty(&page)?);
                 } else {
                     eprintln!("Wiki page not found: {}", slug);
@@ -893,9 +1069,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("`dbs export-wiki --out-dir <dir>` from daily-backup-system.");
                     std::process::exit(1);
                 }
-                let dir = PathBuf::from(&args[2]);
-                let conn = db.conn();
-                let report = wiki_import::import_wiki_dir(&conn, &dir, true)?;
+                // Absolute, because the daemon does not share this
+                // process's working directory.
+                let dir = std::path::absolute(PathBuf::from(&args[2]))?;
+                let report: WikiImportReport =
+                    Store::open(&db_path)?.call(Op::WikiImport { dir })?;
                 for page in &report.imported {
                     println!("{}  <- {}", page.slug, page.path);
                 }
@@ -908,12 +1086,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     report.skipped.len()
                 );
             }
+            "resolve" => {
+                let resolve = match parse_resolve_args(&args[2..]) {
+                    Ok(parsed) => parsed,
+                    Err(message) => {
+                        eprintln!("{}", message);
+                        std::process::exit(1);
+                    }
+                };
+                let memory_id = resolve.memory_id.clone();
+                let note = resolve.note;
+                let op = match resolve.resolution {
+                    Resolution::Outcome(outcome) => Op::Resolve {
+                        memory_id,
+                        outcome,
+                        note,
+                    },
+                    Resolution::Review(outcome) => Op::Review {
+                        memory_id,
+                        outcome,
+                        note,
+                    },
+                };
+                let found: Option<Memory> = Store::open(&db_path)?.call(op)?;
+                match found {
+                    Some(mem) => println!("{}", serde_json::to_string_pretty(&mem)?),
+                    None => {
+                        eprintln!("Memory not found: {}", resolve.memory_id);
+                        std::process::exit(1);
+                    }
+                }
+            }
             "stats" => {
-                let conn = db.conn();
-                println!("{}", serde_json::to_string_pretty(&stats::collect(&conn)?)?);
+                let stats: Stats = Store::open(&db_path)?.call(Op::Stats)?;
+                println!("{}", serde_json::to_string_pretty(&stats)?);
             }
             cmd => {
-                eprintln!("Unknown subcommand: {}. Available: configure, api, remote, server, search, add, list, get, entity, wiki-write, wiki-read, wiki-import, stats", cmd);
+                eprintln!("Unknown subcommand: {}. Available: configure, daemon, api, remote, server, search, add, list, get, entity, wiki-write, wiki-read, wiki-import, stats, resolve, session, capture-transcript, import-sessions, context, brief, impact-export", cmd);
                 std::process::exit(1);
             }
         }
@@ -928,6 +1137,45 @@ mod tests {
 
     fn args(raw: &[&str]) -> Vec<String> {
         raw.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn resolve_takes_an_id_an_outcome_and_an_optional_note() {
+        let parsed =
+            parse_resolve_args(&args(&["mem_1", "reverted", "--note", "broke CI"])).unwrap();
+        assert_eq!(parsed.memory_id, "mem_1");
+        assert_eq!(parsed.resolution, Resolution::Outcome("reverted".into()));
+        assert_eq!(parsed.note.as_deref(), Some("broke CI"));
+        assert_eq!(
+            parse_resolve_args(&args(&["mem_1", "done"])).unwrap().note,
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_takes_a_review_instead_of_an_outcome() {
+        let parsed =
+            parse_resolve_args(&args(&["mem_1", "--review", "held", "--note", "ok"])).unwrap();
+        assert_eq!(parsed.memory_id, "mem_1");
+        assert_eq!(parsed.resolution, Resolution::Review("held".into()));
+        assert_eq!(parsed.note.as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn resolve_rejects_a_bad_outcome_missing_words_and_unknown_flags() {
+        for bad in [
+            args(&["mem_1", "--review", "fine"]),
+            args(&["mem_1", "done", "--review", "held"]),
+            args(&["mem_1", "--review"]),
+            args(&["mem_1", "maybe"]),
+            args(&["mem_1"]),
+            args(&["a", "b", "done"]),
+            args(&["mem_1", "done", "--note"]),
+            args(&["mem_1", "done", "--force"]),
+        ] {
+            let err = parse_resolve_args(&bad).unwrap_err();
+            assert!(err.contains("Usage"), "{bad:?}: {err}");
+        }
     }
 
     #[test]
@@ -1016,6 +1264,15 @@ mod tests {
         // `add_p.add_argument("--category", default="general")`.
         assert_eq!(parsed.category, "general");
         assert!(parsed.tags.is_empty());
+        assert!(parsed.attach.is_empty());
+    }
+
+    #[test]
+    fn add_attach_is_repeatable() {
+        let parsed =
+            parse_add_args(&args(&["note", "--attach", "a.txt", "--attach", "b.pdf"])).unwrap();
+        assert_eq!(parsed.attach, vec!["a.txt", "b.pdf"]);
+        assert!(parse_add_args(&args(&["note", "--attach"])).is_err());
     }
 
     #[test]
@@ -1174,13 +1431,13 @@ mod tests {
         let _guard = SECRET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let previous = std::env::var(remind_me_core::sync::SYNC_SECRET_ENV).ok();
         match value {
-            Some(v) => std::env::set_var(remind_me_core::sync::SYNC_SECRET_ENV, v),
-            None => std::env::remove_var(remind_me_core::sync::SYNC_SECRET_ENV),
+            Some(v) => crate::test_env::set_var(remind_me_core::sync::SYNC_SECRET_ENV, v),
+            None => crate::test_env::remove_var(remind_me_core::sync::SYNC_SECRET_ENV),
         }
         let result = f();
         match previous {
-            Some(v) => std::env::set_var(remind_me_core::sync::SYNC_SECRET_ENV, v),
-            None => std::env::remove_var(remind_me_core::sync::SYNC_SECRET_ENV),
+            Some(v) => crate::test_env::set_var(remind_me_core::sync::SYNC_SECRET_ENV, v),
+            None => crate::test_env::remove_var(remind_me_core::sync::SYNC_SECRET_ENV),
         }
         result
     }

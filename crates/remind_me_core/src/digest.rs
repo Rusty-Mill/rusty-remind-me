@@ -22,9 +22,10 @@
 //! subsystems now exist (issues #116 and #114), so the honest shape is the
 //! real answer.
 
-use crate::models::{DigestData, DigestRecentMemory, DigestReminder, ReminderWindow, SyncStatus};
+use crate::db::Result;
+use crate::db::Store;
+use crate::models::{DigestData, DigestReminder, DigestReview, ReminderWindow, SyncStatus};
 use crate::vitality::build_vitality_report;
-use rusqlite::{params, Connection, Result};
 
 /// Days back that count as "recent" by default.
 pub const DEFAULT_SINCE_DAYS: i64 = 7;
@@ -38,59 +39,52 @@ pub const DIGEST_SINCE_DAYS_MAX: i64 = 365;
 /// Cap on the reminders listed per section.
 pub const MAX_DIGEST_REMINDERS: i64 = 10;
 
-/// Project a memory down to what the digest shows for a reminder.
-fn digest_reminder(memory: &crate::models::Memory) -> DigestReminder {
+/// A memory's content cut to the digest's 120 characters.
+fn snippet(memory: &crate::models::Memory) -> String {
     let mut content: String = memory.content.chars().take(120).collect();
     if memory.content.chars().count() > 120 {
         content.push('…');
     }
+    content
+}
+
+/// Project a memory down to what the digest shows for a reminder.
+fn digest_reminder(memory: &crate::models::Memory) -> DigestReminder {
     DigestReminder {
         id: memory.id.clone(),
         remind_at: memory.remind_at.clone(),
-        content,
+        content: snippet(memory),
+    }
+}
+
+/// Project a decision down to what the digest shows for a due review.
+fn digest_review(memory: &crate::models::Memory) -> DigestReview {
+    DigestReview {
+        id: memory.id.clone(),
+        due: crate::review::review_due(memory).unwrap_or("").to_string(),
+        content: snippet(memory),
     }
 }
 
 /// Assemble the digest's underlying data.
-pub fn build_digest(conn: &Connection, since_days: i64) -> Result<DigestData> {
+pub fn build_digest(store: &Store<'_>, since_days: i64) -> Result<DigestData> {
     let cutoff = (chrono::Utc::now() - chrono::Duration::days(since_days)).to_rfc3339();
 
-    let mut stmt = conn.prepare(
-        "SELECT id, content, category, created_at
-           FROM memories
-          WHERE deleted_at IS NULL AND sensitive = 0 AND created_at >= ?
-          ORDER BY created_at DESC
-          LIMIT ?",
-    )?;
-    let recent_memories: Vec<DigestRecentMemory> = stmt
-        .query_map(params![cutoff, MAX_RECENT_MEMORIES as i64], |r| {
-            Ok(DigestRecentMemory {
-                id: r.get(0)?,
-                content: r.get(1)?,
-                category: r.get(2)?,
-                created_at: r.get(3)?,
-            })
-        })?
-        .collect::<Result<Vec<_>>>()?;
-    drop(stmt);
+    let stats = crate::db::stats::StoreStats::new(store);
+    let recent_memories = stats.shareable_since(&cutoff, MAX_RECENT_MEMORIES)?;
 
     // Counted rather than taken from the capped list, so the cap is visible
     // rather than silently making a busy week look like a quiet one.
-    let recent_total: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM memories
-          WHERE deleted_at IS NULL AND sensitive = 0 AND created_at >= ?",
-        params![cutoff],
-        |r| r.get(0),
-    )?;
+    let recent_total = stats.count_shareable_since(&cutoff)?;
 
     Ok(DigestData {
         generated_at: chrono::Utc::now().to_rfc3339(),
         since_days,
         recent_memories,
         recent_total,
-        vitality: build_vitality_report(conn)?,
+        vitality: build_vitality_report(store)?,
         reminders_upcoming: crate::reminders::list_reminders(
-            conn,
+            store,
             ReminderWindow::Upcoming,
             MAX_DIGEST_REMINDERS,
         )?
@@ -98,17 +92,22 @@ pub fn build_digest(conn: &Connection, since_days: i64) -> Result<DigestData> {
         .map(digest_reminder)
         .collect(),
         reminders_overdue: crate::reminders::list_reminders(
-            conn,
+            store,
             ReminderWindow::Overdue,
             MAX_DIGEST_REMINDERS,
         )?
         .iter()
         .map(digest_reminder)
         .collect(),
+        // Shared with the session brief, so the two agree on what is due.
+        reviews_due: crate::review::list_due(store, None, MAX_DIGEST_REMINDERS as usize)?
+            .iter()
+            .map(digest_review)
+            .collect(),
         // Local-only, no network: the digest has to stay callable from a
         // scheduled path that cannot afford to block on a remote. The
         // hub-reconcile verdict is a network call and stays out.
-        sync: crate::sync::sync_status(conn)?,
+        sync: crate::sync::sync_status(store)?,
     })
 }
 
@@ -190,6 +189,21 @@ pub fn render_markdown(data: &DigestData) -> String {
             }
         }
         out.push('\n');
+    }
+
+    out.push_str("## Decisions to review\n\n");
+    if data.reviews_due.is_empty() {
+        out.push_str("_None due._\n\n");
+    } else {
+        for review in &data.reviews_due {
+            out.push_str(&format!(
+                "- `{}` due {}: {}\n",
+                review.id, review.due, review.content
+            ));
+        }
+        out.push_str(
+            "\n_Record each with `remind_me_resolve` and `review`: held, revised or reverted._\n\n",
+        );
     }
 
     out.push_str("## Sync health\n\n");

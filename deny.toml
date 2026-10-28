@@ -1,0 +1,48 @@
+# cargo-deny policy, copied from rusty_mill (its ADR-0009, ADR-0002). The CI job is blocking: a finding is
+# fixed, or ignored below with a reason. Run locally: `cargo deny check`.
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "warn"
+# Unmaintained: only crates a workspace member depends on directly. Transitive
+# ones are visible in `cargo deny check` output but do not fail the gate.
+unmaintained = "workspace"
+ignore = [
+    { id = "RUSTSEC-2023-0071", reason = "rsa Marvin timing attack, no patched release exists (patched = []). Reached via jsonwebtoken for JWT RS* verification; re-check on every rsa release." },
+    { id = "RUSTSEC-2023-0018", reason = "remove_dir_all 0.5 via tempdir <- mmap <- perfcnt <- criterion-perf-events: optional Linux-only `perf-events` benchmark feature of rusty_multimodal_db, never in a shipped binary." },
+    { id = "RUSTSEC-2025-0141", reason = "bincode 1.3.3 unmaintained (its team ceased development; 1.3.3 is declared complete, no known defect). It is the on-disk and wire encoding of rusty_multimodal_db and rusty_multimodal_db_engine (pinned \"1\" on purpose), so replacing it needs a format migration. Planned: ADR-0009 future growth." },
+]
+
+[licenses]
+version = 2
+# Seeded permissively from the first run; tighten, don't widen blindly.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "0BSD",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "MPL-2.0", # file-level copyleft; fine as an unmodified dependency
+    "Unlicense",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "allow" # many pre-merge duplicates; revisit after triage
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# Monorepo crates, pinned to one libs-* tag (Cargo.toml; rusty_mill ADR-0013).
+allow-git = ["https://github.com/Rusty-Mill/rusty_mill"]
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

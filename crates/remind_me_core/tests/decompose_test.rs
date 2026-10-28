@@ -3,18 +3,19 @@
 
 use remind_me_core::capture::{auto_capture, decompose, undecomposed_batch};
 use remind_me_core::db::queries;
+use remind_me_core::db::Store;
 use remind_me_core::entity::{entity_id, traverse_entities, upsert_entity};
+use remind_me_core::testing::{self, Table};
 use remind_me_core::vitality::get_decay_rate;
 use remind_me_core::{
     AtomicFact, AutoCaptureInput, CaptureResult, Database, DecomposeBatchInput, DecomposeInput,
     DecomposeResult, EntityInput, DECOMPOSE_FACTS_MAX, DECOMPOSITION_SOURCE, FACT_CATEGORY,
     UNCLASSIFIED,
 };
-use rusqlite::Connection;
 
-fn capture(conn: &Connection, tags: &[&str]) -> CaptureResult {
+fn capture(store: &Store<'_>, tags: &[&str]) -> CaptureResult {
     auto_capture(
-        conn,
+        store,
         &AutoCaptureInput {
             conversation: "user: where do you live\nassistant: Seattle".into(),
             summary: "a conversation about where I live".into(),
@@ -36,6 +37,7 @@ fn fact(content: &str) -> AtomicFact {
         predicate: None,
         object: None,
         entities: vec![],
+        metadata: None,
     }
 }
 
@@ -48,30 +50,26 @@ fn triple(content: &str, subject: &str, predicate: &str, object: &str) -> Atomic
     }
 }
 
-fn run(conn: &Connection, capture_id: &str, facts: Vec<AtomicFact>) -> DecomposeResult {
+fn run(store: &Store<'_>, capture_id: &str, facts: Vec<AtomicFact>) -> DecomposeResult {
     decompose(
-        conn,
+        store,
         &DecomposeInput {
             capture_id: capture_id.to_string(),
             facts,
+            capture_revision: None,
         },
     )
     .unwrap()
     .unwrap()
 }
 
-fn column(conn: &Connection, id: &str, name: &str) -> String {
-    conn.query_row(
-        &format!("SELECT {} FROM memories WHERE id = ?", name),
-        rusqlite::params![id],
-        |r| r.get::<_, String>(0),
-    )
-    .unwrap()
+fn column(store: &Store<'_>, id: &str, name: &str) -> String {
+    testing::memory_text(store, id, name).unwrap().unwrap()
 }
 
-fn known(conn: &Connection, name: &str) {
+fn known(store: &Store<'_>, name: &str) {
     upsert_entity(
-        conn,
+        store,
         &EntityInput {
             name: name.to_string(),
             kind: None,
@@ -84,34 +82,29 @@ fn known(conn: &Connection, name: &str) {
 #[test]
 fn facts_are_written_and_linked_to_their_capture() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let parent = capture(&conn, &[]);
+    let store = db.store();
+    let parent = capture(&store, &[]);
 
-    let result = run(&conn, &parent.capture_id, vec![fact("I live in Seattle")]);
+    let result = run(&store, &parent.capture_id, vec![fact("I live in Seattle")]);
 
     assert_eq!(result.created, 1);
     let id = &result.fact_ids[0];
-    assert_eq!(column(&conn, id, "content"), "I live in Seattle");
-    assert_eq!(column(&conn, id, "category"), FACT_CATEGORY);
-    assert_eq!(column(&conn, id, "source"), DECOMPOSITION_SOURCE);
-    assert_eq!(column(&conn, id, "source_capture_id"), parent.capture_id);
+    assert_eq!(column(&store, id, "content"), "I live in Seattle");
+    assert_eq!(column(&store, id, "category"), FACT_CATEGORY);
+    assert_eq!(column(&store, id, "source"), DECOMPOSITION_SOURCE);
+    assert_eq!(column(&store, id, "source_capture_id"), parent.capture_id);
 }
 
 #[test]
 fn a_fact_is_not_itself_a_capture() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let parent = capture(&conn, &[]);
+    let store = db.store();
+    let parent = capture(&store, &[]);
 
-    let result = run(&conn, &parent.capture_id, vec![fact("a fact")]);
+    let result = run(&store, &parent.capture_id, vec![fact("a fact")]);
 
-    let capture_id: Option<String> = conn
-        .query_row(
-            "SELECT capture_id FROM memories WHERE id = ?",
-            rusqlite::params![result.fact_ids[0]],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let capture_id: Option<String> =
+        testing::memory_text(&store, &result.fact_ids[0], "capture_id").unwrap();
     // A fact carrying a capture_id would re-enter the decomposition backlog,
     // so decomposition would generate its own work forever.
     assert!(capture_id.is_none());
@@ -120,15 +113,15 @@ fn a_fact_is_not_itself_a_capture() {
 #[test]
 fn facts_inherit_the_parents_tags_merged_with_their_own() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let parent = capture(&conn, &["session", "shared"]);
+    let store = db.store();
+    let parent = capture(&store, &["session", "shared"]);
 
     let mut extra = fact("a fact");
     extra.extra_tags = vec!["shared".into(), "specific".into()];
-    let result = run(&conn, &parent.capture_id, vec![extra]);
+    let result = run(&store, &parent.capture_id, vec![extra]);
 
     let tags: Vec<String> =
-        serde_json::from_str(&column(&conn, &result.fact_ids[0], "tags")).unwrap();
+        serde_json::from_str(&column(&store, &result.fact_ids[0], "tags")).unwrap();
     // Parent first, then the fact's own, de-duplicated and order-preserving.
     assert_eq!(tags, vec!["session", "shared", "specific"]);
     assert_eq!(result.parent_tags_inherited, vec!["session", "shared"]);
@@ -137,22 +130,17 @@ fn facts_inherit_the_parents_tags_merged_with_their_own() {
 #[test]
 fn the_memory_type_drives_the_decay_rate_and_weight() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let parent = capture(&conn, &[]);
+    let store = db.store();
+    let parent = capture(&store, &[]);
 
     let mut decision = fact("we chose SQLite");
     decision.memory_type = Some("decision".into());
-    let result = run(&conn, &parent.capture_id, vec![decision]);
+    let result = run(&store, &parent.capture_id, vec![decision]);
 
     let id = &result.fact_ids[0];
-    assert_eq!(column(&conn, id, "memory_type"), "decision");
-    let (decay, weight, vitality): (f64, f64, f64) = conn
-        .query_row(
-            "SELECT decay_rate, base_weight, vitality FROM memories WHERE id = ?",
-            rusqlite::params![id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .unwrap();
+    assert_eq!(column(&store, id, "memory_type"), "decision");
+    let real = |name: &str| testing::memory_f64(&store, id, name).unwrap().unwrap();
+    let (decay, weight, vitality) = (real("decay_rate"), real("base_weight"), real("vitality"));
     assert!((decay - get_decay_rate("decision")).abs() < 1e-9);
     // A decision outranks an unclassified aside before any feedback exists. At
     // zero elapsed days vitality equals base_weight exactly.
@@ -163,13 +151,13 @@ fn the_memory_type_drives_the_decay_rate_and_weight() {
 #[test]
 fn an_unspecified_memory_type_is_unclassified() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let parent = capture(&conn, &[]);
+    let store = db.store();
+    let parent = capture(&store, &[]);
 
-    let result = run(&conn, &parent.capture_id, vec![fact("a fact")]);
+    let result = run(&store, &parent.capture_id, vec![fact("a fact")]);
 
     assert_eq!(
-        column(&conn, &result.fact_ids[0], "memory_type"),
+        column(&store, &result.fact_ids[0], "memory_type"),
         UNCLASSIFIED
     );
 }
@@ -177,13 +165,14 @@ fn an_unspecified_memory_type_is_unclassified() {
 #[test]
 fn an_unknown_capture_id_reports_not_found() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
     let outcome = decompose(
-        &conn,
+        &store,
         &DecomposeInput {
             capture_id: "cap_nope".into(),
             facts: vec![fact("orphan")],
+            capture_revision: None,
         },
     )
     .unwrap();
@@ -194,13 +183,13 @@ fn an_unknown_capture_id_reports_not_found() {
 #[test]
 fn a_full_batch_of_facts_applies() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let parent = capture(&conn, &[]);
+    let store = db.store();
+    let parent = capture(&store, &[]);
 
     let facts: Vec<AtomicFact> = (0..DECOMPOSE_FACTS_MAX)
         .map(|i| fact(&format!("fact {}", i)))
         .collect();
-    let result = run(&conn, &parent.capture_id, facts);
+    let result = run(&store, &parent.capture_id, facts);
 
     assert_eq!(result.created, DECOMPOSE_FACTS_MAX);
 }
@@ -210,16 +199,16 @@ fn a_full_batch_of_facts_applies() {
 #[test]
 fn a_contradicting_triple_supersedes_the_older_fact() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let parent = capture(&conn, &[]);
+    let store = db.store();
+    let parent = capture(&store, &[]);
     let first = run(
-        &conn,
+        &store,
         &parent.capture_id,
         vec![triple("I live in Seattle", "Bailey", "lives_in", "Seattle")],
     );
 
     let second = run(
-        &conn,
+        &store,
         &parent.capture_id,
         vec![triple("I moved to Boston", "Bailey", "lives_in", "Boston")],
     );
@@ -228,7 +217,7 @@ fn a_contradicting_triple_supersedes_the_older_fact() {
     // this. Same subject and predicate, different object, is the signal.
     assert_eq!(second.superseded_ids, first.fact_ids);
     assert_eq!(
-        column(&conn, &first.fact_ids[0], "superseded_by"),
+        column(&store, &first.fact_ids[0], "superseded_by"),
         second.fact_ids[0]
     );
 }
@@ -236,16 +225,16 @@ fn a_contradicting_triple_supersedes_the_older_fact() {
 #[test]
 fn restating_the_same_fact_is_not_a_contradiction() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let parent = capture(&conn, &[]);
+    let store = db.store();
+    let parent = capture(&store, &[]);
     run(
-        &conn,
+        &store,
         &parent.capture_id,
         vec![triple("I live in Seattle", "Bailey", "lives_in", "Seattle")],
     );
 
     let again = run(
-        &conn,
+        &store,
         &parent.capture_id,
         vec![triple("Still Seattle", "bailey", "Lives_In", "  seattle ")],
     );
@@ -257,16 +246,16 @@ fn restating_the_same_fact_is_not_a_contradiction() {
 #[test]
 fn a_different_predicate_is_not_a_contradiction() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let parent = capture(&conn, &[]);
+    let store = db.store();
+    let parent = capture(&store, &[]);
     run(
-        &conn,
+        &store,
         &parent.capture_id,
         vec![triple("I live in Seattle", "Bailey", "lives_in", "Seattle")],
     );
 
     let visited = run(
-        &conn,
+        &store,
         &parent.capture_id,
         vec![triple("I visited Boston", "Bailey", "visited", "Boston")],
     );
@@ -279,10 +268,10 @@ fn a_different_predicate_is_not_a_contradiction() {
 #[test]
 fn an_incomplete_triple_supersedes_nothing() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let parent = capture(&conn, &[]);
+    let store = db.store();
+    let parent = capture(&store, &[]);
     run(
-        &conn,
+        &store,
         &parent.capture_id,
         vec![triple("I live in Seattle", "Bailey", "lives_in", "Seattle")],
     );
@@ -290,7 +279,7 @@ fn an_incomplete_triple_supersedes_nothing() {
     let mut partial = fact("something vague");
     partial.subject = Some("Bailey".into());
     partial.predicate = Some("lives_in".into());
-    let result = run(&conn, &parent.capture_id, vec![partial]);
+    let result = run(&store, &parent.capture_id, vec![partial]);
 
     assert!(result.superseded_ids.is_empty());
 }
@@ -298,10 +287,10 @@ fn an_incomplete_triple_supersedes_nothing() {
 #[test]
 fn a_superseded_fact_drops_out_of_search() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let parent = capture(&conn, &[]);
+    let store = db.store();
+    let parent = capture(&store, &[]);
     run(
-        &conn,
+        &store,
         &parent.capture_id,
         vec![triple(
             "quokka lives in Seattle",
@@ -311,7 +300,7 @@ fn a_superseded_fact_drops_out_of_search() {
         )],
     );
     let second = run(
-        &conn,
+        &store,
         &parent.capture_id,
         vec![triple(
             "quokka moved to Boston",
@@ -322,8 +311,9 @@ fn a_superseded_fact_drops_out_of_search() {
     );
 
     let found: Vec<String> = queries::search_memories(
-        &conn,
+        &store,
         &remind_me_core::MemorySearchInput {
+            scope: Default::default(),
             strategy: Default::default(),
             include_sensitive: false,
             query: "quokka".into(),
@@ -334,11 +324,17 @@ fn a_superseded_fact_drops_out_of_search() {
             response_format: Default::default(),
             include_dormant: true,
             min_vitality: 0.0,
+            detail: Default::default(),
             verbose: false,
             expand_entities: false,
             include_neighbors: false,
             expand_co_retrieval: false,
             bootstrap: false,
+            include_expired: true,
+            min_confidence: 0.0,
+            include_raw: false,
+            filters: Default::default(),
+            window: Default::default(),
         },
     )
     .unwrap()
@@ -359,19 +355,19 @@ fn a_superseded_fact_drops_out_of_search() {
 #[test]
 fn a_triple_naming_two_known_entities_records_an_edge() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let parent = capture(&conn, &[]);
-    known(&conn, "Bailey");
-    known(&conn, "Seattle");
+    let store = db.store();
+    let parent = capture(&store, &[]);
+    known(&store, "Bailey");
+    known(&store, "Seattle");
 
     let result = run(
-        &conn,
+        &store,
         &parent.capture_id,
         vec![triple("I live in Seattle", "Bailey", "lives_in", "Seattle")],
     );
 
     assert_eq!(result.relations_linked, 1);
-    let edges = traverse_entities(&conn, &[entity_id("Bailey")], 1, None, 20).unwrap();
+    let edges = traverse_entities(&store, &[entity_id("Bailey")], 1, None, 20).unwrap();
     assert_eq!(edges.len(), 1);
     assert_eq!(edges[0].relation, "lives_in");
     assert_eq!(edges[0].object_name, "Seattle");
@@ -380,8 +376,8 @@ fn a_triple_naming_two_known_entities_records_an_edge() {
 #[test]
 fn entities_named_by_the_fact_itself_resolve_for_the_edge() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let parent = capture(&conn, &[]);
+    let store = db.store();
+    let parent = capture(&store, &[]);
 
     let mut with_entities = triple("I live in Seattle", "Bailey", "lives_in", "Seattle");
     with_entities.entities = vec![
@@ -396,7 +392,7 @@ fn entities_named_by_the_fact_itself_resolve_for_the_edge() {
             aliases: vec![],
         },
     ];
-    let result = run(&conn, &parent.capture_id, vec![with_entities]);
+    let result = run(&store, &parent.capture_id, vec![with_entities]);
 
     // The mentions are applied before the edge is attempted, so the entities
     // this same fact names are already known by the time it resolves them.
@@ -408,12 +404,12 @@ fn entities_named_by_the_fact_itself_resolve_for_the_edge() {
 #[test]
 fn a_triple_naming_an_unknown_entity_records_no_edge() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let parent = capture(&conn, &[]);
-    known(&conn, "Bailey");
+    let store = db.store();
+    let parent = capture(&store, &[]);
+    known(&store, "Bailey");
 
     let result = run(
-        &conn,
+        &store,
         &parent.capture_id,
         vec![triple(
             "I live in Atlantis",
@@ -426,28 +422,26 @@ fn a_triple_naming_an_unknown_entity_records_no_edge() {
     // A triple is free text; writing one does not imply it names anything in
     // the graph. The memory-level triple still stands.
     assert_eq!(result.relations_linked, 0);
-    assert_eq!(column(&conn, &result.fact_ids[0], "object"), "Atlantis");
+    assert_eq!(column(&store, &result.fact_ids[0], "object"), "Atlantis");
 }
 
 #[test]
 fn repeating_an_edge_does_not_duplicate_it() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let parent = capture(&conn, &[]);
-    known(&conn, "Bailey");
-    known(&conn, "Seattle");
+    let store = db.store();
+    let parent = capture(&store, &[]);
+    known(&store, "Bailey");
+    known(&store, "Seattle");
 
     for _ in 0..3 {
         run(
-            &conn,
+            &store,
             &parent.capture_id,
             vec![triple("I live in Seattle", "Bailey", "lives_in", "Seattle")],
         );
     }
 
-    let edges: i64 = conn
-        .query_row("SELECT count(*) FROM entity_relations", [], |r| r.get(0))
-        .unwrap();
+    let edges = testing::count(&store, Table::EntityRelations).unwrap();
     assert_eq!(
         edges, 1,
         "the edge id is derived, so re-recording is a no-op"
@@ -459,10 +453,17 @@ fn repeating_an_edge_does_not_duplicate_it() {
 #[test]
 fn a_fresh_capture_awaits_decomposition() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let parent = capture(&conn, &["session"]);
+    let store = db.store();
+    let parent = capture(&store, &["session"]);
 
-    let batch = undecomposed_batch(&conn, &DecomposeBatchInput { batch_size: 20 }).unwrap();
+    let batch = undecomposed_batch(
+        &store,
+        &DecomposeBatchInput {
+            batch_size: 20,
+            idle_minutes: 0,
+        },
+    )
+    .unwrap();
 
     // Both halves of the capture carry the capture_id, so both are offered.
     assert_eq!(batch.total_undecomposed, 2);
@@ -474,23 +475,35 @@ fn a_fresh_capture_awaits_decomposition() {
 #[test]
 fn a_decomposed_capture_drops_out_of_the_batch() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let parent = capture(&conn, &[]);
+    let store = db.store();
+    let parent = capture(&store, &[]);
     assert_eq!(
-        undecomposed_batch(&conn, &DecomposeBatchInput { batch_size: 20 })
-            .unwrap()
-            .total_undecomposed,
+        undecomposed_batch(
+            &store,
+            &DecomposeBatchInput {
+                batch_size: 20,
+                idle_minutes: 0
+            }
+        )
+        .unwrap()
+        .total_undecomposed,
         2
     );
 
-    run(&conn, &parent.capture_id, vec![fact("a fact")]);
+    run(&store, &parent.capture_id, vec![fact("a fact")]);
 
     // There is no decomposed flag — the backlog shrinks because a fact now
     // names this capture as its source.
     assert_eq!(
-        undecomposed_batch(&conn, &DecomposeBatchInput { batch_size: 20 })
-            .unwrap()
-            .total_undecomposed,
+        undecomposed_batch(
+            &store,
+            &DecomposeBatchInput {
+                batch_size: 20,
+                idle_minutes: 0
+            }
+        )
+        .unwrap()
+        .total_undecomposed,
         0
     );
 }
@@ -498,9 +511,9 @@ fn a_decomposed_capture_drops_out_of_the_batch() {
 #[test]
 fn ordinary_memories_never_enter_the_batch() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     queries::add_memory(
-        &conn,
+        &store,
         remind_me_core::MemoryAddInput {
             sensitive: false,
             content: "written by hand".into(),
@@ -512,11 +525,19 @@ fn ordinary_memories_never_enter_the_batch() {
             predicate: None,
             object: None,
             entities: vec![],
+            ..Default::default()
         },
     )
     .unwrap();
 
-    let batch = undecomposed_batch(&conn, &DecomposeBatchInput { batch_size: 20 }).unwrap();
+    let batch = undecomposed_batch(
+        &store,
+        &DecomposeBatchInput {
+            batch_size: 20,
+            idle_minutes: 0,
+        },
+    )
+    .unwrap();
 
     assert_eq!(batch.total_undecomposed, 0);
 }
@@ -524,21 +545,311 @@ fn ordinary_memories_never_enter_the_batch() {
 #[test]
 fn the_batch_size_is_clamped_and_the_backlog_is_reported() {
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     for _ in 0..3 {
-        capture(&conn, &[]);
+        capture(&store, &[]);
     }
 
-    let page = undecomposed_batch(&conn, &DecomposeBatchInput { batch_size: 2 }).unwrap();
+    let page = undecomposed_batch(
+        &store,
+        &DecomposeBatchInput {
+            batch_size: 2,
+            idle_minutes: 0,
+        },
+    )
+    .unwrap();
     assert_eq!(page.memories.len(), 2);
     assert_eq!(page.total_undecomposed, 6);
 
     assert_eq!(
-        undecomposed_batch(&conn, &DecomposeBatchInput { batch_size: 0 })
-            .unwrap()
-            .memories
-            .len(),
+        undecomposed_batch(
+            &store,
+            &DecomposeBatchInput {
+                batch_size: 0,
+                idle_minutes: 0
+            }
+        )
+        .unwrap()
+        .memories
+        .len(),
         1,
         "zero clamps up to 1"
     );
+}
+
+/// A session captured again after decomposition is due again, so what it
+/// added is not lost; one decomposed since is not (ADR-0029).
+#[test]
+fn a_session_recaptured_after_decomposition_is_due_again() {
+    use remind_me_core::transcript::{capture_transcript, TranscriptRequest};
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let line = |text: &str| {
+        serde_json::json!({"type": "user", "sessionId": "s1",
+                           "message": {"role": "user", "content": text}})
+        .to_string()
+    };
+    let request = TranscriptRequest {
+        session_id: "s1",
+        cwd: None,
+        reason: Some("stop"),
+        context: None,
+    };
+    // The batch, the capture_to_fact candidates and the backlog share one
+    // predicate, so all three agree on what is due.
+    let due = |store: &Store<'_>| {
+        use remind_me_core::models::Rung;
+        use remind_me_core::promotion::{backlog, promotion_candidates};
+        let batch = undecomposed_batch(
+            store,
+            &DecomposeBatchInput {
+                batch_size: 10,
+                idle_minutes: 0,
+            },
+        )
+        .unwrap()
+        .total_undecomposed;
+        let candidates = promotion_candidates(store, Rung::CaptureToFact, 10)
+            .unwrap()
+            .len();
+        let backlog = backlog(store).unwrap().capture_to_fact;
+        (batch, candidates > 0, backlog > 0)
+    };
+
+    let made = capture_transcript(&store, &line("first"), &request).unwrap();
+    assert_eq!(due(&store), (2, true, true), "dialog and summary");
+    run(&store, &made.capture_id, vec![fact("the first thing")]);
+    assert_eq!(due(&store), (0, false, false));
+
+    let grown = format!("{}\n{}", line("first"), line("second"));
+    capture_transcript(&store, &grown, &request).unwrap();
+    assert_eq!(due(&store), (2, true, true), "the recapture is due again");
+    run(&store, &made.capture_id, vec![fact("the second thing")]);
+    assert_eq!(due(&store), (0, false, false));
+}
+
+/// A scheduled pass asks for settled captures only, so a live session is
+/// left alone until it goes quiet.
+#[test]
+fn idle_minutes_leaves_a_recently_changed_capture_for_later() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let made = capture(&store, &[]);
+    let settled = |store: &Store<'_>| {
+        undecomposed_batch(
+            store,
+            &DecomposeBatchInput {
+                batch_size: 10,
+                idle_minutes: 120,
+            },
+        )
+        .unwrap()
+        .total_undecomposed
+    };
+    assert_eq!(settled(&store), 0);
+
+    let long_ago = (chrono::Utc::now() - chrono::Duration::hours(3)).to_rfc3339();
+    for id in [&made.dialog_id, &made.summary_id] {
+        testing::set_memory_column(&store, id, "updated_at", long_ago.as_str()).unwrap();
+    }
+    assert_eq!(settled(&store), 2);
+}
+
+/// One recapturable session, `s1`, run from `/work/quokka` on `main`.
+mod interleaving {
+    use super::*;
+    use remind_me_core::models::{Rung, WriteContext};
+    use remind_me_core::promotion::{backlog, promotion_candidates};
+    use remind_me_core::transcript::{capture_transcript, TranscriptRequest};
+
+    fn line(text: &str) -> String {
+        serde_json::json!({"type": "user", "sessionId": "s1",
+                           "message": {"role": "user", "content": text}})
+        .to_string()
+    }
+
+    fn context() -> WriteContext {
+        WriteContext {
+            project: Some("quokka".into()),
+            session_id: Some("s1".into()),
+            git_branch: Some("main".into()),
+            cwd: Some("/work/quokka".into()),
+            ..WriteContext::default()
+        }
+    }
+
+    fn recapture(store: &Store<'_>, transcript: &str) -> String {
+        let given = context();
+        let request = TranscriptRequest {
+            session_id: "s1",
+            cwd: None,
+            reason: Some("stop"),
+            context: Some(&given),
+        };
+        capture_transcript(store, transcript, &request)
+            .unwrap()
+            .capture_id
+    }
+
+    /// What the queue offers: its entries' revisions, and whether the
+    /// candidates and the backlog agree that something is due.
+    fn offered(store: &Store<'_>) -> (Vec<String>, bool, bool) {
+        let batch = undecomposed_batch(
+            store,
+            &DecomposeBatchInput {
+                batch_size: 10,
+                idle_minutes: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(batch.total_undecomposed, batch.memories.len());
+        let candidates = !promotion_candidates(store, Rung::CaptureToFact, 10)
+            .unwrap()
+            .is_empty();
+        let backlog = backlog(store).unwrap().capture_to_fact > 0;
+        let revisions = batch
+            .memories
+            .into_iter()
+            .map(|m| m.capture_revision)
+            .collect();
+        (revisions, candidates, backlog)
+    }
+
+    fn decompose_at(store: &Store<'_>, capture_id: &str, revision: &str, text: &str) {
+        decompose(
+            store,
+            &DecomposeInput {
+                capture_id: capture_id.to_string(),
+                facts: vec![fact(text)],
+                capture_revision: Some(revision.to_string()),
+            },
+        )
+        .unwrap()
+        .unwrap();
+    }
+
+    #[test]
+    fn a_recapture_while_facts_are_written_stays_due() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        let capture = recapture(&store, &line("first"));
+        let (seen, ..) = offered(&store);
+        assert_eq!(seen.len(), 2, "dialog and summary");
+        assert_eq!(seen[0], seen[1], "one revision for the whole capture");
+
+        // The routine read revision A; the hook recaptures B before the
+        // routine writes A's facts.
+        recapture(&store, &format!("{}\n{}", line("first"), line("second")));
+        decompose_at(&store, &capture, &seen[0], "the first thing");
+
+        let (again, candidates, backlog) = offered(&store);
+        assert_eq!(again.len(), 2, "B was never read, so it is still due");
+        assert!(again[0] > seen[0]);
+        assert!(candidates && backlog, "every queue agrees");
+
+        decompose_at(&store, &capture, &again[0], "the second thing");
+        assert_eq!(offered(&store), (vec![], false, false));
+    }
+
+    #[test]
+    fn a_revision_must_be_a_time_and_is_never_later_than_now() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        let capture = recapture(&store, &line("first"));
+        let err = decompose(
+            &store,
+            &DecomposeInput {
+                capture_id: capture.clone(),
+                facts: vec![fact("x")],
+                capture_revision: Some("yesterday".into()),
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("RFC 3339"), "{err}");
+        assert_eq!(offered(&store).0.len(), 2, "a refused batch writes nothing");
+
+        decompose_at(&store, &capture, "2999-01-01T00:00:00Z", "from the future");
+        recapture(&store, &format!("{}\n{}", line("first"), line("later")));
+        assert_eq!(offered(&store).0.len(), 2, "a later recapture is still due");
+    }
+
+    /// Decomposes with no top-level revision but a nested one in the fact's
+    /// metadata, as a legacy-shaped request would; returns the fact's id.
+    fn decompose_nested(store: &Store<'_>, capture_id: &str, nested: &str) -> String {
+        let mut smuggled = fact("nested");
+        smuggled.metadata = Some(serde_json::json!({"capture_revision": nested}));
+        decompose(
+            store,
+            &DecomposeInput {
+                capture_id: capture_id.to_string(),
+                facts: vec![smuggled],
+                capture_revision: None,
+            },
+        )
+        .unwrap()
+        .unwrap()
+        .fact_ids
+        .remove(0)
+    }
+
+    #[test]
+    fn a_nested_revision_is_never_trusted() {
+        for nested in ["2999-01-01T00:00:00Z", "yesterday"] {
+            let db = Database::open_in_memory().unwrap();
+            let store = db.store();
+            let capture = recapture(&store, &line("first"));
+            let id = decompose_nested(&store, &capture, nested);
+            let metadata: serde_json::Value =
+                serde_json::from_str(&column(&store, &id, "metadata")).unwrap();
+            assert!(
+                metadata.get("capture_revision").is_none(),
+                "{nested}: {metadata}"
+            );
+
+            recapture(&store, &format!("{}\n{}", line("first"), line("later")));
+            assert_eq!(
+                offered(&store).0.len(),
+                2,
+                "{nested}: a later recapture is due"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stored_marker_that_is_not_a_past_time_is_ignored() {
+        for planted in ["2999-01-01T00:00:00Z", "yesterday"] {
+            let db = Database::open_in_memory().unwrap();
+            let store = db.store();
+            let capture = recapture(&store, &line("first"));
+            let (seen, ..) = offered(&store);
+            decompose_at(&store, &capture, &seen[0], "the first thing");
+            let fact = remind_me_core::testing::memory_ids(&store)
+                .unwrap()
+                .into_iter()
+                .find(|id| column(&store, id, "category") == "fact")
+                .unwrap();
+            let marker = serde_json::json!({"capture_revision": planted}).to_string();
+            remind_me_core::testing::set_memory_column(&store, &fact, "metadata", marker).unwrap();
+
+            recapture(&store, &format!("{}\n{}", line("first"), line("later")));
+            assert_eq!(
+                offered(&store).0.len(),
+                2,
+                "{planted}: a later recapture is due"
+            );
+        }
+    }
+
+    #[test]
+    fn facts_carry_the_session_they_were_drawn_from() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        let capture = recapture(&store, &line("first"));
+        let made = run(&store, &capture, vec![fact("the first thing")]);
+        let id = &made.fact_ids[0];
+        assert_eq!(column(&store, id, "session_id"), "s1");
+        assert_eq!(column(&store, id, "project"), "quokka");
+        assert_eq!(column(&store, id, "git_branch"), "main");
+        assert_eq!(column(&store, id, "cwd"), "/work/quokka");
+    }
 }

@@ -1,5 +1,10 @@
 # Gap Analysis — `rusty_remind_me` vs. `remind_me`
 
+> **Historical (2026-09-26).** The Python `remind_me` is retired (ADR-0023).
+> This analysis measured the port against it; its gap table closed empty,
+> and nothing here is tracked any more. The schema-drift check it mentions
+> was removed with the reference.
+
 **Run date:** 2026-08-07 (surface counts re-derived; earlier revisions
 2026-08-05 and 2026-08-06)
 **Target:** `baileyrd/rusty_remind_me` @ `68ae0a9`, 6 crates

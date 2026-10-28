@@ -7,6 +7,10 @@
 //! (`_register`, `_authorize`, `_pkce_pair`, ...) so this file's coverage
 //! maps onto that one test-for-test where the scenario applies.
 
+mod common;
+#[path = "../../remind_me_core/src/test_env.rs"]
+mod test_env;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -78,7 +82,7 @@ async fn isolated_oauth_state_file(label: &str) -> tokio::sync::MutexGuard<'stat
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    std::env::set_var(
+    crate::test_env::set_var(
         remind_me_core::remote::REMOTE_OAUTH_STATE_FILE_ENV,
         dir.join("oauth.json"),
     );
@@ -95,20 +99,20 @@ async fn spawn_oauth_server() -> SocketAddr {
     let router =
         remind_me_remote::build_router(mcp, OWNER_TOKEN.to_string(), Some(ISSUER.to_string()))
             .expect("a plain http://localhost issuer must validate");
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, router).await;
-    });
-    addr
+    common::serve(router)
 }
 
 /// RFC 7636 PKCE pair: a random verifier and its S256 challenge, using the
-/// crate's own (independently unit-tested) implementation -- this file
+/// `rusty_oauth`'s own (independently unit-tested) implementation -- this file
 /// tests the HTTP surface built on top of it, not PKCE math itself.
 fn pkce_pair() -> (String, String) {
     let verifier = remind_me_core::remote::generate_token();
-    let challenge = remind_me_remote::oauth::pkce::code_challenge_s256(&verifier);
+    let challenge = rusty_oauth::pkce::Pkce::from_verifier(
+        verifier.clone(),
+        rusty_oauth::pkce::CodeChallengeMethod::S256,
+    )
+    .expect("a valid verifier")
+    .code_challenge;
     (verifier, challenge)
 }
 
@@ -697,7 +701,11 @@ async fn a_2026_07_28_discover_lifecycle_request_authenticates_via_oauth_bearer_
     let response = client
         .post(format!("http://{addr}/mcp"))
         .headers(headers)
-        .body(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#)
+        // The per-request `_meta` every 2026-07-28 request carries -- see
+        // `discover_meta` in http_test.rs.
+        .body(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}"#,
+        )
         .send()
         .await
         .unwrap();
@@ -738,6 +746,15 @@ async fn probes_still_fail_closed_in_oauth_mode() {
         .unwrap();
     assert_eq!(unrelated.status(), 404);
 
+    // The gate passes every `/.well-known/` path through; one no route
+    // serves is still 404, not the MCP endpoint's 401.
+    let unknown_metadata = client
+        .get(format!("http://{addr}/.well-known/not-a-document"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown_metadata.status(), 404);
+
     let health = client
         .get(format!("http://{addr}/health"))
         .send()
@@ -755,7 +772,7 @@ async fn build_router_rejects_an_issuer_with_a_path_or_plain_http_on_a_non_local
     let db = Database::open_in_memory().unwrap();
     let mcp = Arc::new(McpServer::new(db));
     assert!(remind_me_remote::build_router(
-        Arc::clone(&mcp),
+        mcp,
         OWNER_TOKEN.to_string(),
         Some("https://machine.example/path".to_string()),
     )
@@ -776,11 +793,7 @@ async fn build_router_without_an_issuer_serves_the_plain_ft05_app_with_no_oauth_
     let db = Database::open_in_memory().unwrap();
     let mcp = Arc::new(McpServer::new(db));
     let router = remind_me_remote::build_router(mcp, OWNER_TOKEN.to_string(), None).unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, router).await;
-    });
+    let addr = common::serve(router);
 
     for path in [
         "/authorize",

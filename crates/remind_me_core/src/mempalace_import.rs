@@ -37,9 +37,12 @@
 //! stays imported, matching the reference exactly (it has no content-hash
 //! column to compare against).
 
+use crate::db::imports::ImportLedger;
+use crate::db::legacy_sqlite::LegacyDb;
+use crate::db::memories::{Memories, NewMemory};
+use crate::db::Store;
 use crate::models::{MempalaceImportInput, MEMPALACE_IMPORT_LIMIT_MAX, MEMPALACE_IMPORT_LIMIT_MIN};
 use chrono::Utc;
-use rusqlite::{params, params_from_iter, Connection, OpenFlags, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -76,20 +79,14 @@ pub fn mempalace_path() -> PathBuf {
 #[derive(Debug)]
 pub enum MempalaceImportError {
     /// No store at the configured path.
-    NotFound {
-        path: String,
-    },
+    NotFound { path: String },
     /// A file exists there, but is not a readable SQLite database.
-    NotADatabase {
-        path: String,
-        detail: String,
-    },
+    NotADatabase { path: String, detail: String },
     /// A readable database, but no `mempalace_drawers` collection in it —
     /// wrong path, an empty palace, or not a Chroma store at all.
-    NoCollection {
-        path: String,
-    },
-    Sqlite(rusqlite::Error),
+    NoCollection { path: String },
+    /// The node's own store failed, or the Chroma store could not be read.
+    Store(crate::db::StoreError),
 }
 
 impl std::fmt::Display for MempalaceImportError {
@@ -104,16 +101,16 @@ impl std::fmt::Display for MempalaceImportError {
                 "No '{}' collection in the MemPalace store at {}",
                 COLLECTION_NAME, path
             ),
-            Self::Sqlite(e) => write!(f, "{}", e),
+            Self::Store(e) => write!(f, "{}", e),
         }
     }
 }
 
 impl std::error::Error for MempalaceImportError {}
 
-impl From<rusqlite::Error> for MempalaceImportError {
-    fn from(e: rusqlite::Error) -> Self {
-        Self::Sqlite(e)
+impl From<crate::db::StoreError> for MempalaceImportError {
+    fn from(e: crate::db::StoreError) -> Self {
+        Self::Store(e)
     }
 }
 
@@ -149,52 +146,44 @@ struct Drawer {
 /// Open a Chroma store's SQLite file read-only, and confirm it is at least a
 /// readable database — real content validation happens when the caller looks
 /// for the collection.
-fn open_store(path: &Path) -> std::result::Result<Connection, MempalaceImportError> {
-    let conn = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-    )
-    .map_err(|e| MempalaceImportError::NotADatabase {
+fn open_store(path: &Path) -> std::result::Result<LegacyDb, MempalaceImportError> {
+    LegacyDb::open(path).map_err(|e| MempalaceImportError::NotADatabase {
         path: path.display().to_string(),
         detail: e.to_string(),
-    })?;
+    })
+}
 
-    conn.query_row("SELECT 1 FROM sqlite_master LIMIT 1", [], |_| Ok(()))
-        .or_else(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => Ok(()),
-            other => Err(MempalaceImportError::NotADatabase {
-                path: path.display().to_string(),
-                detail: other.to_string(),
-            }),
-        })?;
-
-    Ok(conn)
+/// `row`'s `column` as text, if it is there and is text.
+fn text(row: &crate::db::legacy_sqlite::Row, column: &str) -> Option<String> {
+    row.get(column).and_then(|v| v.as_str()).map(str::to_string)
 }
 
 /// The metadata segment id backing the `mempalace_drawers` collection.
 fn metadata_segment_id(
-    chroma: &Connection,
+    chroma: &LegacyDb,
     store_path: &Path,
 ) -> std::result::Result<String, MempalaceImportError> {
-    let collection_id: String = chroma
-        .query_row(
+    let no_collection = || MempalaceImportError::NoCollection {
+        path: store_path.display().to_string(),
+    };
+    let collection_id = chroma
+        .query_one(
             "SELECT id FROM collections WHERE name = ?",
-            params![COLLECTION_NAME],
-            |row| row.get(0),
+            &[COLLECTION_NAME.into()],
         )
-        .map_err(|_| MempalaceImportError::NoCollection {
-            path: store_path.display().to_string(),
-        })?;
-
+        .ok()
+        .flatten()
+        .and_then(|row| text(&row, "id"))
+        .ok_or_else(no_collection)?;
     chroma
-        .query_row(
+        .query_one(
             "SELECT id FROM segments WHERE collection = ? AND scope = 'METADATA'",
-            params![collection_id],
-            |row| row.get(0),
+            &[collection_id.into()],
         )
-        .map_err(|_| MempalaceImportError::NoCollection {
-            path: store_path.display().to_string(),
-        })
+        .ok()
+        .flatten()
+        .and_then(|row| text(&row, "id"))
+        .ok_or_else(no_collection)
 }
 
 /// Every drawer in the metadata segment, in insertion order.
@@ -203,33 +192,28 @@ fn metadata_segment_id(
 /// number of metadata keys per drawer is small and fixed (`chroma:document`,
 /// `wing`, `room`), so the simplicity is worth more than the extra
 /// round-trips.
-fn read_drawers(chroma: &Connection, segment_id: &str) -> Result<Vec<Drawer>> {
-    let mut stmt = chroma
-        .prepare("SELECT id, embedding_id FROM embeddings WHERE segment_id = ? ORDER BY id")?;
-    let rows: Vec<(i64, String)> = stmt
-        .query_map(params![segment_id], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<Result<_>>()?;
-    drop(stmt);
-
-    let mut meta_stmt = chroma.prepare(
-        "SELECT key, string_value FROM embedding_metadata WHERE id = ? AND key IN (?, 'wing', 'room')",
+fn read_drawers(chroma: &LegacyDb, segment_id: &str) -> crate::db::Result<Vec<Drawer>> {
+    let rows = chroma.query(
+        "SELECT id, embedding_id FROM embeddings WHERE segment_id = ? ORDER BY id",
+        &[segment_id.into()],
     )?;
-
     let mut drawers = Vec::with_capacity(rows.len());
-    for (embeddings_id, drawer_id) in rows {
+    for row in rows {
+        let embeddings_id = row.get("id").cloned().unwrap_or_default();
+        let drawer_id = text(&row, "embedding_id").unwrap_or_default();
         let mut document = String::new();
         let mut wing = None;
         let mut room = None;
-        let entries = meta_stmt
-            .query_map(params![embeddings_id, RESERVED_DOCUMENT_KEY], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-            })?;
+        let entries = chroma.query(
+            "SELECT key, string_value FROM embedding_metadata WHERE id = ? AND key IN (?, 'wing', 'room')",
+            &[embeddings_id, RESERVED_DOCUMENT_KEY.into()],
+        )?;
         for entry in entries {
-            let (key, value) = entry?;
-            match key.as_str() {
-                RESERVED_DOCUMENT_KEY => document = value.unwrap_or_default(),
-                "wing" => wing = value,
-                "room" => room = value,
+            let value = text(&entry, "string_value");
+            match text(&entry, "key").as_deref() {
+                Some(RESERVED_DOCUMENT_KEY) => document = value.unwrap_or_default(),
+                Some("wing") => wing = value,
+                Some("room") => room = value,
                 _ => {}
             }
         }
@@ -292,7 +276,7 @@ pub fn parse_frontmatter(
 /// about reading a flat key/value table requires that, and doing it here avoids
 /// depending on whatever internal query API a given Chroma version exposes.
 pub fn pull_mempalace(
-    conn: &Connection,
+    store: &Store<'_>,
     input: &MempalaceImportInput,
 ) -> std::result::Result<MempalaceImportResult, MempalaceImportError> {
     let store_dir = mempalace_path();
@@ -341,17 +325,11 @@ pub fn pull_mempalace(
     }
 
     let already: std::collections::HashSet<String> = {
-        let placeholders = std::iter::repeat_n("?", page.len())
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql = format!(
-            "SELECT drawer_id FROM mempalace_imports WHERE drawer_id IN ({})",
-            placeholders
-        );
         let ids: Vec<&str> = page.iter().map(|d| d.drawer_id.as_str()).collect();
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params_from_iter(ids.iter()), |row| row.get::<_, String>(0))?;
-        rows.collect::<Result<_>>()?
+        ImportLedger::new(store)
+            .imported_drawers(&ids)?
+            .into_iter()
+            .collect()
     };
 
     let to_import: Vec<&Drawer> = page
@@ -372,100 +350,91 @@ pub fn pull_mempalace(
     }
 
     let now = Utc::now().to_rfc3339();
-    let tx = conn.unchecked_transaction()?;
+    // One transaction for the page: a SQLite transaction, and one journal
+    // batch on the engine's memories core (ADR-0023, core PR 4b).
+    store.transaction(|batch| -> Result<(), MempalaceImportError> {
+        for drawer in &to_import {
+            let wing_val = drawer.wing.clone().unwrap_or_default();
+            let room_val = drawer.room.clone().unwrap_or_default();
 
-    for drawer in &to_import {
-        let wing_val = drawer.wing.clone().unwrap_or_default();
-        let room_val = drawer.room.clone().unwrap_or_default();
+            let (mem_category, mem_tags, mem_source, created_at, content) =
+                match parse_frontmatter(&drawer.document) {
+                    Some((fields, body)) => {
+                        let category = fields
+                            .get("category")
+                            .filter(|c| !c.is_empty())
+                            .cloned()
+                            .or_else(|| Some(input.category.clone()).filter(|c| !c.is_empty()))
+                            .unwrap_or_else(|| DEFAULT_CATEGORY.to_string());
+                        let native_tags: Vec<String> = fields
+                            .get("tags")
+                            .map(|t| {
+                                t.split(',')
+                                    .map(str::trim)
+                                    .filter(|t| !t.is_empty())
+                                    .map(str::to_string)
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let tags: Vec<String> = native_tags
+                            .into_iter()
+                            .chain(input.tags.iter().cloned())
+                            .collect();
+                        let source = format!(
+                            "mempalace:{}",
+                            fields
+                                .get("source")
+                                .map(String::as_str)
+                                .unwrap_or("unknown")
+                        );
+                        let created = fields
+                            .get("created")
+                            .cloned()
+                            .unwrap_or_else(|| now.clone());
+                        (category, tags, source, created, body)
+                    }
+                    None => {
+                        let category = if input.category.is_empty() {
+                            DEFAULT_CATEGORY.to_string()
+                        } else {
+                            input.category.clone()
+                        };
+                        let tags: Vec<String> = [wing_val.as_str(), room_val.as_str()]
+                            .into_iter()
+                            .filter(|t| !t.is_empty())
+                            .map(str::to_string)
+                            .chain(input.tags.iter().cloned())
+                            .collect();
+                        (
+                            category,
+                            tags,
+                            OPAQUE_SOURCE.to_string(),
+                            now.clone(),
+                            drawer.document.clone(),
+                        )
+                    }
+                };
 
-        let (mem_category, mem_tags, mem_source, created_at, content) =
-            match parse_frontmatter(&drawer.document) {
-                Some((fields, body)) => {
-                    let category = fields
-                        .get("category")
-                        .filter(|c| !c.is_empty())
-                        .cloned()
-                        .or_else(|| Some(input.category.clone()).filter(|c| !c.is_empty()))
-                        .unwrap_or_else(|| DEFAULT_CATEGORY.to_string());
-                    let native_tags: Vec<String> = fields
-                        .get("tags")
-                        .map(|t| {
-                            t.split(',')
-                                .map(str::trim)
-                                .filter(|t| !t.is_empty())
-                                .map(str::to_string)
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    let tags: Vec<String> = native_tags
-                        .into_iter()
-                        .chain(input.tags.iter().cloned())
-                        .collect();
-                    let source = format!(
-                        "mempalace:{}",
-                        fields
-                            .get("source")
-                            .map(String::as_str)
-                            .unwrap_or("unknown")
-                    );
-                    let created = fields
-                        .get("created")
-                        .cloned()
-                        .unwrap_or_else(|| now.clone());
-                    (category, tags, source, created, body)
-                }
-                None => {
-                    let category = if input.category.is_empty() {
-                        DEFAULT_CATEGORY.to_string()
-                    } else {
-                        input.category.clone()
-                    };
-                    let tags: Vec<String> = [wing_val.as_str(), room_val.as_str()]
-                        .into_iter()
-                        .filter(|t| !t.is_empty())
-                        .map(str::to_string)
-                        .chain(input.tags.iter().cloned())
-                        .collect();
-                    (
-                        category,
-                        tags,
-                        OPAQUE_SOURCE.to_string(),
-                        now.clone(),
-                        drawer.document.clone(),
-                    )
-                }
-            };
+            let memory_id = format!("mem_{}", uuid::Uuid::new_v4().simple());
+            let metadata = serde_json::json!({
+                "mempalace_drawer_id": drawer.drawer_id,
+                "wing": wing_val,
+                "room": room_val,
+            });
 
-        let memory_id = format!("mem_{}", uuid::Uuid::new_v4().simple());
-        let metadata = serde_json::json!({
-            "mempalace_drawer_id": drawer.drawer_id,
-            "wing": wing_val,
-            "room": room_val,
-        });
-
-        tx.execute(
-            "INSERT OR IGNORE INTO memories
-                (id, content, category, tags, source, metadata, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            params![
-                memory_id,
-                content,
-                mem_category,
-                serde_json::to_string(&mem_tags).unwrap_or_else(|_| "[]".to_string()),
-                mem_source,
-                metadata.to_string(),
+            let provenance = crate::context::importer_provenance("mempalace");
+            Memories::new(batch).insert_or_ignore(&NewMemory {
+                category: mem_category,
+                tags: mem_tags,
+                source: mem_source,
+                metadata,
                 created_at,
-                now,
-            ],
-        )?;
-        tx.execute(
-            "INSERT OR IGNORE INTO mempalace_imports (drawer_id, memory_id, imported_at)
-             VALUES (?, ?, ?)",
-            params![drawer.drawer_id, memory_id, now],
-        )?;
-    }
-
-    tx.commit()?;
+                ..provenance.stamp(NewMemory::new(memory_id.clone(), content, &now))
+            })?;
+            ImportLedger::new(batch).record_mempalace(&drawer.drawer_id, &memory_id, &now)?;
+        }
+        Ok(())
+    })?;
     result.imported = to_import.len();
     Ok(result)
 }

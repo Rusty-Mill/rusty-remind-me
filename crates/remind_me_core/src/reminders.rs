@@ -27,10 +27,11 @@
 //! Both exclude tombstones. A deleted memory's reminder firing would surface
 //! content the user deleted.
 
-use crate::db::queries::{parse_memory_row, prefixed_memory_columns};
+use crate::db::reminders::Reminders;
+use crate::db::Result;
+use crate::db::Store;
 use crate::models::{Memory, ReminderWindow, SetReminderOutcome};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
-use rusqlite::{params, Connection, OptionalExtension, Result};
 
 /// Parse an ISO-8601 timestamp the way the reference's `datetime.fromisoformat`
 /// does, and canonicalize it to UTC.
@@ -76,18 +77,12 @@ pub fn parse_remind_at(raw: &str) -> Option<DateTime<Utc>> {
 /// vault whose history is half reminder-scheduling noise is harder to read
 /// back than one that only records edits.
 pub fn set_reminder(
-    conn: &Connection,
+    store: &Store<'_>,
     memory_id: &str,
     remind_at: Option<&str>,
 ) -> Result<SetReminderOutcome> {
-    let exists: Option<String> = conn
-        .query_row(
-            "SELECT id FROM memories WHERE id = ? AND deleted_at IS NULL",
-            params![memory_id],
-            |r| r.get(0),
-        )
-        .optional()?;
-    if exists.is_none() {
+    let repo = Reminders::new(store);
+    if !repo.is_live(memory_id)? {
         return Ok(SetReminderOutcome::NotFound {
             memory_id: memory_id.to_string(),
         });
@@ -99,10 +94,7 @@ pub fn set_reminder(
     // the reference: a blank string arriving from a form field is not a
     // timestamp, and rejecting it would make clearing awkward to express.
     let Some(raw) = remind_at.map(str::trim).filter(|r| !r.is_empty()) else {
-        conn.execute(
-            "UPDATE memories SET remind_at = NULL, updated_at = ? WHERE id = ?",
-            params![now.to_rfc3339(), memory_id],
-        )?;
+        repo.set_remind_at(memory_id, None, &now.to_rfc3339())?;
         return Ok(SetReminderOutcome::Cleared {
             memory_id: memory_id.to_string(),
         });
@@ -124,62 +116,19 @@ pub fn set_reminder(
     }
 
     let stored = when.to_rfc3339();
-    conn.execute(
-        "UPDATE memories SET remind_at = ?, updated_at = ? WHERE id = ?",
-        params![stored, now.to_rfc3339(), memory_id],
-    )?;
+    repo.set_remind_at(memory_id, Some(&stored), &now.to_rfc3339())?;
     Ok(SetReminderOutcome::Set {
         memory_id: memory_id.to_string(),
         remind_at: stored,
     })
 }
 
-/// The SQL fragment for one window, and how many `now` bindings it consumes.
-fn window_sql(when: ReminderWindow) -> (String, usize) {
-    let not_delivered = "NOT EXISTS (SELECT 1 FROM reminder_deliveries rd \
-         WHERE rd.memory_id = m.id AND rd.remind_at = m.remind_at)";
-    let upcoming = "m.remind_at > ?";
-    let overdue = format!("(m.remind_at <= ? AND {})", not_delivered);
-
-    match when {
-        ReminderWindow::Upcoming => (upcoming.to_string(), 1),
-        ReminderWindow::Overdue => (overdue, 1),
-        ReminderWindow::All => (format!("({} OR {})", upcoming, overdue), 2),
-    }
-}
-
 /// Memories with a reminder set, filtered to a window, soonest first.
 ///
 /// Shared with the digest rather than re-derived there, so the two can never
 /// disagree about what is overdue.
-pub fn list_reminders(conn: &Connection, when: ReminderWindow, limit: i64) -> Result<Vec<Memory>> {
-    let now = Utc::now().to_rfc3339();
-    let (window, now_bindings) = window_sql(when);
-
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {} FROM memories m
-          WHERE m.remind_at IS NOT NULL
-            AND m.deleted_at IS NULL
-            AND {}
-          ORDER BY m.remind_at ASC
-          LIMIT ?",
-        prefixed_memory_columns("m"),
-        window
-    ))?;
-
-    let mut bindings: Vec<rusqlite::types::Value> = Vec::new();
-    for _ in 0..now_bindings {
-        bindings.push(rusqlite::types::Value::Text(now.clone()));
-    }
-    bindings.push(rusqlite::types::Value::Integer(limit));
-
-    let rows = stmt
-        .query_map(
-            rusqlite::params_from_iter(bindings.iter()),
-            parse_memory_row,
-        )?
-        .collect::<Result<Vec<_>>>()?;
-    Ok(rows)
+pub fn list_reminders(store: &Store<'_>, when: ReminderWindow, limit: i64) -> Result<Vec<Memory>> {
+    Reminders::new(store).in_window(when, &Utc::now().to_rfc3339(), limit)
 }
 
 /// Render memories the way the reference's `_fmt_memory_md` does.
@@ -196,6 +145,67 @@ pub fn render_memories_markdown(memories: &[Memory]) -> String {
         .map(render_memory_markdown)
         .collect::<Vec<_>>()
         .join("\n---\n")
+}
+
+/// One line per search hit: id, category, date, tags, score, marks such as
+/// `expired`, and a snippet (card #51). The compact counterpart of
+/// [`render_memories_markdown`], for a search that fetches bodies by id later.
+pub fn render_compact_hits_markdown(hits: &[crate::models::MemorySearchResult]) -> String {
+    let now = Utc::now();
+    hits.iter()
+        .map(|hit| {
+            let m = &hit.memory;
+            let tags = if m.tags.is_empty() {
+                String::new()
+            } else {
+                format!(" · {}", m.tags.join(", "))
+            };
+            let marks = crate::kinds::header_marks(m, now);
+            let marks = if marks.is_empty() {
+                String::new()
+            } else {
+                format!(" _({})_", marks.join(", "))
+            };
+            let date: String = m.created_at.chars().take(10).collect();
+            format!(
+                "- `{}` · {} · {date}{tags} · {:.2}{}{marks} — {}",
+                m.id,
+                m.category,
+                hit.score,
+                if m.sensitive { " 🔒" } else { "" },
+                crate::retrieval::compact_snippet(&m.content)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// One search hit's compact JSON: the same fields as its compact line, with
+/// the trust fields as values rather than marks. `confidence` is always
+/// present; `valid_until`, `expired`, `outcome` and `sensitive` appear only
+/// when they say something, so an ordinary hit stays short.
+pub fn compact_hit_json(hit: &crate::models::MemorySearchResult) -> serde_json::Value {
+    let m = &hit.memory;
+    let mut value = serde_json::json!({
+        "id": m.id,
+        "category": m.category,
+        "created_at": m.created_at,
+        "tags": m.tags,
+        "score": hit.score,
+        "confidence": m.confidence,
+        "snippet": crate::retrieval::compact_snippet(&m.content),
+    });
+    if let Some(until) = &m.valid_until {
+        value["valid_until"] = until.as_str().into();
+        value["expired"] = crate::retrieval::is_expired(Utc::now(), Some(until)).into();
+    }
+    if let Some(outcome) = &m.outcome {
+        value["outcome"] = outcome.as_str().into();
+    }
+    if m.sensitive {
+        value["sensitive"] = true.into();
+    }
+    value
 }
 
 /// Render a `remind_me_list` page the way the reference's `_fmt_memories`
@@ -216,23 +226,43 @@ pub fn render_memory_page_markdown(memories: &[Memory], total: usize) -> String 
         .join("\n---\n")
 }
 
+/// ` — project@branch` for a memory that knows its project, else nothing.
+/// The session id is deliberately left to the JSON form: it is a key for
+/// tools, not something for a reader to take in.
+fn project_label(m: &Memory) -> String {
+    match (&m.project, &m.git_branch) {
+        (Some(project), Some(branch)) => format!(" — {project}@{branch}"),
+        (Some(project), None) => format!(" — {project}"),
+        _ => String::new(),
+    }
+}
+
 fn render_memory_markdown(m: &Memory) -> String {
     let tags = if m.tags.is_empty() {
         "none".to_string()
     } else {
         m.tags.join(", ")
     };
+    let marks = crate::kinds::header_marks(m, Utc::now());
+    let marks = if marks.is_empty() {
+        String::new()
+    } else {
+        format!(" _({})_", marks.join(", "))
+    };
     let mut lines = vec![
         format!(
-            "### Memory `{}`{}",
+            "### Memory `{}`{}{}{}",
             m.id,
-            if m.sensitive { " 🔒 _sensitive_" } else { "" }
+            if m.sensitive { " 🔒 _sensitive_" } else { "" },
+            project_label(m),
+            marks
         ),
         format!(
             "**Category:** {}  |  **Tags:** {}  |  **Source:** {}",
             m.category, tags, m.source
         ),
     ];
+    lines.extend(crate::kinds::kind_lines(m));
 
     if let Some(object) = m.metadata.as_object() {
         if !object.is_empty() {

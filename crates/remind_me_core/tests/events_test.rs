@@ -6,6 +6,10 @@
 //! test that only reads `payload()` would keep passing if a later change
 //! started sending the whole memory from the emit path.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
+use remind_me_core::db::Store;
 use remind_me_core::events::{self, Event};
 use remind_me_core::{Database, MemoryAddInput};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -50,9 +54,9 @@ fn capture(count: usize) -> (String, mpsc::Receiver<String>) {
     (url, rx)
 }
 
-fn add(conn: &rusqlite::Connection, content: &str, category: &str) -> String {
+fn add(store: &Store<'_>, content: &str, category: &str) -> String {
     remind_me_core::db::queries::add_memory(
-        conn,
+        store,
         MemoryAddInput {
             content: content.to_string(),
             category: category.to_string(),
@@ -64,6 +68,7 @@ fn add(conn: &rusqlite::Connection, content: &str, category: &str) -> String {
             object: None,
             entities: vec![],
             sensitive: false,
+            ..Default::default()
         },
     )
     .unwrap()
@@ -85,11 +90,11 @@ fn received(rx: &mpsc::Receiver<String>) -> serde_json::Value {
 fn the_payload_carries_no_memory_content() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (url, rx) = capture(1);
-    std::env::set_var(events::EVENT_WEBHOOK_URL_ENV, &url);
+    crate::test_env::set_var(events::EVENT_WEBHOOK_URL_ENV, &url);
 
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "the nuclear launch codes are 0000", "general");
+    let store = db.store();
+    let id = add(&store, "the nuclear launch codes are 0000", "general");
     events::drain();
 
     let event = received(&rx);
@@ -108,20 +113,20 @@ fn the_payload_carries_no_memory_content() {
     assert_eq!(event["category"], "general");
     assert!(event["timestamp"].is_string());
 
-    std::env::remove_var(events::EVENT_WEBHOOK_URL_ENV);
+    crate::test_env::remove_var(events::EVENT_WEBHOOK_URL_ENV);
 }
 
 #[test]
 fn each_mutation_kind_emits_its_own_event() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (url, rx) = capture(3);
-    std::env::set_var(events::EVENT_WEBHOOK_URL_ENV, &url);
+    crate::test_env::set_var(events::EVENT_WEBHOOK_URL_ENV, &url);
 
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "something", "general");
+    let store = db.store();
+    let id = add(&store, "something", "general");
     remind_me_core::db::queries::update_memory(
-        &conn,
+        &store,
         &remind_me_core::models::MemoryUpdateInput {
             memory_id: id.clone(),
             clear_superseded: false,
@@ -133,7 +138,7 @@ fn each_mutation_kind_emits_its_own_event() {
         },
     )
     .unwrap();
-    remind_me_core::db::queries::delete_memory(&conn, &id).unwrap();
+    remind_me_core::db::queries::delete_memory(&store, &id).unwrap();
     events::drain();
 
     let mut kinds: Vec<String> = (0..3)
@@ -153,20 +158,20 @@ fn each_mutation_kind_emits_its_own_event() {
     // Nothing currently makes one.
     kinds.sort();
     assert_eq!(kinds, vec!["created", "deleted", "updated"]);
-    std::env::remove_var(events::EVENT_WEBHOOK_URL_ENV);
+    crate::test_env::remove_var(events::EVENT_WEBHOOK_URL_ENV);
 }
 
 #[test]
 fn a_delete_still_reports_the_category_it_had() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (url, rx) = capture(2);
-    std::env::set_var(events::EVENT_WEBHOOK_URL_ENV, &url);
+    crate::test_env::set_var(events::EVENT_WEBHOOK_URL_ENV, &url);
 
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    let id = add(&conn, "doomed", "engineering");
+    let store = db.store();
+    let id = add(&store, "doomed", "engineering");
     let _created = received(&rx);
-    remind_me_core::db::queries::delete_memory(&conn, &id).unwrap();
+    remind_me_core::db::queries::delete_memory(&store, &id).unwrap();
     events::drain();
 
     // A hard delete removes the row, so the category has to be captured before
@@ -175,7 +180,7 @@ fn a_delete_still_reports_the_category_it_had() {
     assert_eq!(deleted["event"], "deleted");
     assert_eq!(deleted["category"], "engineering");
 
-    std::env::remove_var(events::EVENT_WEBHOOK_URL_ENV);
+    crate::test_env::remove_var(events::EVENT_WEBHOOK_URL_ENV);
 }
 
 // ---------------------------------------------------------------------------
@@ -185,40 +190,40 @@ fn a_delete_still_reports_the_category_it_had() {
 #[test]
 fn an_unconfigured_stream_is_a_true_no_op() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var(events::EVENT_WEBHOOK_URL_ENV);
+    crate::test_env::remove_var(events::EVENT_WEBHOOK_URL_ENV);
 
     assert!(!events::enabled());
 
     // No thread is started at all, rather than one that discovers it has
     // nowhere to go — this runs on every single write.
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
-    add(&conn, "no consumer configured", "general");
+    let store = db.store();
+    add(&store, "no consumer configured", "general");
     events::drain();
 }
 
 #[test]
 fn a_blank_url_counts_as_unconfigured() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var(events::EVENT_WEBHOOK_URL_ENV, "   ");
+    crate::test_env::set_var(events::EVENT_WEBHOOK_URL_ENV, "   ");
 
     // A blank env var is how "unset" arrives from a lot of process managers.
     assert!(!events::enabled());
 
-    std::env::remove_var(events::EVENT_WEBHOOK_URL_ENV);
+    crate::test_env::remove_var(events::EVENT_WEBHOOK_URL_ENV);
 }
 
 #[test]
 fn a_sync_applied_write_emits_nothing() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (url, rx) = capture(1);
-    std::env::set_var(events::EVENT_WEBHOOK_URL_ENV, &url);
-    std::env::set_var(remind_me_core::sync::NODE_ID_ENV, "node-events-test");
-    std::env::set_var(remind_me_core::sync::HUB_URL_ENV, "http://hub.example");
-    std::env::set_var(remind_me_core::sync::SYNC_SECRET_ENV, "shh");
+    crate::test_env::set_var(events::EVENT_WEBHOOK_URL_ENV, &url);
+    crate::test_env::set_var(remind_me_core::sync::NODE_ID_ENV, "node-events-test");
+    crate::test_env::set_var(remind_me_core::sync::HUB_URL_ENV, "http://hub.example");
+    crate::test_env::set_var(remind_me_core::sync::SYNC_SECRET_ENV, "shh");
 
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
     let record = remind_me_core::sync::SyncRecord {
         id: "mem_from_peer".into(),
@@ -247,8 +252,21 @@ fn a_sync_applied_write_emits_nothing() {
         deleted_at: None,
         sensitive: false,
         remind_at: None,
+        project: None,
+        session_id: None,
+        git_remote: None,
+        git_branch: None,
+        git_sha: None,
+        cwd: None,
+        valid_from: None,
+        valid_until: None,
+        confidence: 1.0,
+        verified_at: None,
+        outcome: None,
+        written_by: "unknown".into(),
+        capture_method: "manual".into(),
     };
-    remind_me_core::sync::upsert_record(&conn, &record).unwrap();
+    remind_me_core::sync::upsert_record(&store, &record).unwrap();
     events::drain();
 
     // Emitting on a sync-applied write is how two synced nodes would echo each
@@ -259,10 +277,10 @@ fn a_sync_applied_write_emits_nothing() {
         "a record arriving from a peer must not emit a local event"
     );
 
-    std::env::remove_var(events::EVENT_WEBHOOK_URL_ENV);
-    std::env::remove_var(remind_me_core::sync::NODE_ID_ENV);
-    std::env::remove_var(remind_me_core::sync::HUB_URL_ENV);
-    std::env::remove_var(remind_me_core::sync::SYNC_SECRET_ENV);
+    crate::test_env::remove_var(events::EVENT_WEBHOOK_URL_ENV);
+    crate::test_env::remove_var(remind_me_core::sync::NODE_ID_ENV);
+    crate::test_env::remove_var(remind_me_core::sync::HUB_URL_ENV);
+    crate::test_env::remove_var(remind_me_core::sync::SYNC_SECRET_ENV);
 }
 
 // ---------------------------------------------------------------------------
@@ -277,33 +295,33 @@ fn a_dead_endpoint_does_not_fail_the_write() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         format!("http://{}/events", listener.local_addr().unwrap())
     };
-    std::env::set_var(events::EVENT_WEBHOOK_URL_ENV, &dead);
+    crate::test_env::set_var(events::EVENT_WEBHOOK_URL_ENV, &dead);
 
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
 
     // A write is the user's data; a webhook is someone's convenience, and the
     // second must never be able to cost the first.
-    let id = add(&conn, "the write must survive", "general");
+    let id = add(&store, "the write must survive", "general");
     events::drain();
 
-    assert!(remind_me_core::db::queries::get_memory_by_id(&conn, &id)
+    assert!(remind_me_core::db::queries::get_memory_by_id(&store, &id)
         .unwrap()
         .is_some());
 
-    std::env::remove_var(events::EVENT_WEBHOOK_URL_ENV);
+    crate::test_env::remove_var(events::EVENT_WEBHOOK_URL_ENV);
 }
 
 #[test]
 fn there_is_no_throttle() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (url, rx) = capture(5);
-    std::env::set_var(events::EVENT_WEBHOOK_URL_ENV, &url);
+    crate::test_env::set_var(events::EVENT_WEBHOOK_URL_ENV, &url);
 
     let db = Database::open_in_memory().unwrap();
-    let conn = db.conn();
+    let store = db.store();
     for i in 0..5 {
-        add(&conn, &format!("memory {i}"), "general");
+        add(&store, &format!("memory {i}"), "general");
     }
     events::drain();
 
@@ -314,7 +332,7 @@ fn there_is_no_throttle() {
         assert_eq!(received(&rx)["event"], "created");
     }
 
-    std::env::remove_var(events::EVENT_WEBHOOK_URL_ENV);
+    crate::test_env::remove_var(events::EVENT_WEBHOOK_URL_ENV);
 }
 
 #[test]

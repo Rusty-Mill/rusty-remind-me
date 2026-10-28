@@ -2,32 +2,19 @@
 
 > High-performance, persistent long-term memory engine and Model Context Protocol (MCP) server written in Rust, built on the **Rusty Mill** ecosystem.
 
-> [!IMPORTANT]
-> **This repository is frozen at v0.2.0. Development and releases moved to
-> the Rusty Mill monorepo:
-> [`Rusty-Mill/rusty_mill`](https://github.com/Rusty-Mill/rusty_mill), under
-> [`crates/apps/rusty_remind_me`](https://github.com/Rusty-Mill/rusty_mill/tree/main/crates/apps/rusty_remind_me)**
-> (imported with full history). Open issues and PRs there.
->
-> - **Plugin users:** nothing to do. This repository's marketplace entry now
->   points at the monorepo copy, so `rusty-remind-me@rusty-remind-me` keeps
->   updating. For new installs, prefer
->   `claude plugin marketplace add Rusty-Mill/rusty_mill` and
->   `claude plugin install rusty-remind-me@rusty-mill`.
-> - **Releases:** v0.2.1 onward are on the monorepo's Releases page, tagged
->   `rusty-remind-me-vX.Y.Z`.
-> - **Source clones:** `remind_me_check_update`/`remind_me_self_update`
->   follow this repository's `main`, which no longer moves. Re-clone
->   `Rusty-Mill/rusty_mill` and build with
->   `cargo build --release -p rusty-remind-me`.
+> **Its own repository again.** From v0.2.1 to 0.4.x this product was developed
+> in the [`Rusty-Mill/rusty_mill`](https://github.com/Rusty-Mill/rusty_mill) monorepo
+> (`crates/apps/rusty_remind_me`); it moved back here with its full history.
+> The monorepo crates it uses are git dependencies pinned to one `libs-*` tag
+> (root `Cargo.toml`).
 
-`rusty_remind_me` is a native Rust port of `remind-me`. It equips AI assistants (such as Claude Desktop, Antigravity, Cursor, OpenAI Codex, and custom LLM agents) with persistent, searchable memory using SQLite FTS5 full-text search, ACT-R inspired memory vitality decay, Reciprocal Rank Fusion (RRF) search ranking, a structured Knowledge Graph entity system, and automated markdown wiki compilation.
+`rusty_remind_me` is a native Rust port of `remind-me`. It equips AI assistants (such as Claude Desktop, Antigravity, Cursor, OpenAI Codex, and custom LLM agents) with persistent, searchable memory using full-text search on the embedded `rusty_multimodal_db` engine, ACT-R inspired memory vitality decay, Reciprocal Rank Fusion (RRF) search ranking, a structured Knowledge Graph entity system, and automated markdown wiki compilation.
 
 ---
 
 ## Key Features
 
-- **Hybrid Search Engine**: FTS5 BM25 keyword matching combined with Reciprocal Rank Fusion (RRF) rank scoring.
+- **Hybrid Search Engine**: BM25 keyword matching (the engine's own full-text index, FTS5-compatible ranking) combined with Reciprocal Rank Fusion (RRF) rank scoring.
 - **Semantic Search, Reranking & Query Expansion**: Optional vector search (Ollama or an in-process ONNX bi-encoder), cross-encoder reranking, and HyDE query expansion — each off by default, each degrading to keyword-only on any failure.
 - **ACT-R Memory Vitality Model**: Time-based exponential decay, write-time priors by category/source, and bridge protection (decay rate halved for frequently accessed memories).
 - **Forward-Compatible Model Context Protocol (MCP) Server**: Stdio JSON-RPC MCP server with dynamic protocol version negotiation (supporting `2024-11-05` through upcoming 2026 releases), resources, prompts, dynamic tool change notifications (`listChanged`), and tool execution.
@@ -38,7 +25,7 @@
 - **Markdown Wiki Synthesis**: Topic-based wiki page compilation, queryable topic search, and
   bulk import of Markdown directories (`wiki-import`) — the ingestion path for
   [`dbs export-wiki`](https://github.com/baileyrd/Daily-Backup-System).
-- **Rusty Mill Ecosystem**: Part of the `Rusty Mill` project family; no `rusty_*` crates are wired in as dependencies yet — current dependencies are ordinary crates.io crates (`serde`, `tokio`, `rusqlite`, `chrono`, `uuid`).
+- **Rusty Mill Ecosystem**: Part of the `Rusty Mill` project family; no `rusty_*` crates are wired in as dependencies yet — current dependencies are ordinary crates.io crates (`serde`, `tokio`, `chrono`, `uuid`), plus the workspace's own `rusty_multimodal_db_engine` for the store.
 
 ---
 
@@ -50,7 +37,7 @@ optionally add multi-node sync and the other off-by-default features.
 
 ### Prerequisites
 
-- **Rust 1.94+** with Cargo (`rust-version` in the workspace `Cargo.toml`).
+- **Rust 1.94+** with Cargo.
 - Nothing else is required for the base install. Semantic search's `ollama`
   backend and HyDE query expansion need a running
   [Ollama](https://ollama.com) daemon — optional, see [Search
@@ -59,16 +46,16 @@ optionally add multi-node sync and the other off-by-default features.
 ### 1. Clone & build
 
 ```bash
-git clone https://github.com/baileyrd/rusty_remind_me
-cd rusty_remind_me
+git clone https://github.com/Rusty-Mill/rusty-remind-me
+cd rusty-remind-me
 cargo build --release -p rusty-remind-me
 ```
 
-This produces `target/release/rusty-remind-me`. Put it on `PATH` either by
-adding `target/release` to it, or by installing it directly:
+This produces `target/release/rusty-remind-me`. Put it on `PATH` either by adding `target/release` to it, or
+by installing it directly:
 
 ```bash
-cargo install --path crates/remind_me_cli
+cargo install --path crates/apps/rusty_remind_me/crates/remind_me_cli
 ```
 
 Verify it's reachable:
@@ -83,23 +70,30 @@ first use.
 
 Prebuilt binaries for Linux, macOS (Intel/Apple Silicon), and Windows are
 also published on the [Releases
-page](https://github.com/baileyrd/rusty_remind_me/releases) for every
-tagged version — each includes both `rusty-remind-me` and
+page](https://github.com/Rusty-Mill/rusty-remind-me/releases) for every
+tagged version (tags `vX.Y.Z`; the monorepo-era releases are tagged
+`rusty-remind-me-vX.Y.Z` on [its Releases
+page](https://github.com/Rusty-Mill/rusty_mill/releases)) — each includes both `rusty-remind-me` and
 `rusty-remind-me-hub` — if you'd rather skip the build step. See [Releases
 and versioning](#releases-and-versioning) below for how those get produced.
 
 ### 2. Connect it to a client
 
-**Claude Code plugin** (recommended if you're using Claude Code): this repo
-ships its own single-plugin marketplace (`.claude-plugin/marketplace.json`,
-pointing at the plugin manifest described in [Claude Code
+**Claude Code plugin** (recommended if you're using Claude Code): this
+repository ships a marketplace at its root (`.claude-plugin/marketplace.json`,
+pointing at the plugin manifest beside it, described in [Claude Code
 Plugin](#claude-code-plugin) below), so no separate marketplace repo is
 needed —
 
 ```bash
-claude plugin marketplace add baileyrd/rusty_remind_me
+claude plugin marketplace add Rusty-Mill/rusty-remind-me
 claude plugin install rusty-remind-me@rusty-remind-me
 ```
+
+An existing `rusty-remind-me@rusty-remind-me` install (from
+`baileyrd/rusty_remind_me`, which now redirects here) keeps updating from this
+repository. So does a `rusty-remind-me@rusty-mill` install: the monorepo's
+marketplace entry points here.
 
 `rusty-remind-me` must already be on `PATH` (step 1) — the plugin's
 `.mcp.json` runs it as a subprocess, it isn't bundled. Verify with
@@ -123,6 +117,23 @@ below for the PowerShell/Python equivalents and exactly which config files
 this touches. Restart the client afterward — a running MCP client does not
 pick up a new stdio server until it restarts.
 
+**Choosing which tools a client sees.** Tools come in six groups, and
+`REMIND_ME_TOOL_PROFILE` picks them per client (ADR-0030):
+
+| Group | Tools |
+| --- | --- |
+| `core` (always on) | search, brief, get, add, update, delete, auto_capture, resolve, entity, digest, server_status |
+| `pipeline` | queue and the refinement steps it feeds: decompose, annotate, normalize_apply, reclassify, promote, consolidate, feedback, entity_upsert, entity_traverse, persona, provenance, skeleton_read, skeleton_write, revert, project |
+| `wiki` | wiki_read, wiki_write, wiki_delete, wiki_compile |
+| `import` | import, undo_import, capture_transcript |
+| `admin` | backup, reindex, archive_prune, export_memories, revoke_clients, api_key, sync_status, sync_repair, self_update |
+| `extras` | reminders, saved_searches, session_timeline |
+
+Set a comma list such as `REMIND_ME_TOOL_PROFILE=core,wiki`. `full` (the
+default for now) is every group and `standard` is `core,pipeline,wiki`. Small
+local models do best on plain `core`. Tool names merged away in 0.5 still work
+until 0.6.0 but are no longer listed.
+
 ### 3. Verify end to end
 
 ```bash
@@ -140,8 +151,8 @@ sync is entirely opt-in. To share memories across machines, stand up a hub
 once and point every node at it:
 
 ```bash
-# On the hub machine — SQLite backend, no separate database server:
-crates/remind_me_hub/setup.sh --sqlite install
+# On the hub machine — one container, no separate database server:
+crates/remind_me_hub/setup.sh install
 # Prints the generated SYNC_SECRET every client below needs.
 
 # On each client machine:
@@ -149,12 +160,13 @@ REMIND_ME_SYNC_SECRET=<printed secret> rusty-remind-me configure \
     --node-id my-laptop --hub-url http://<hub-host>:8765
 ```
 
-`crates/remind_me_hub/setup.sh install` (without `--sqlite`) instead brings
-up Postgres in a rootless Podman container, and `crates/remind_me_hub/client-setup.sh
+That runs the hub on its embedded storage engine. A hub still on the
+Postgres or SQLite store it used to offer moves over with
+`crates/remind_me_hub/setup.sh migrate`, and `crates/remind_me_hub/client-setup.sh
 --node-id my-laptop --tunnel me@hub-host` automates the SSH-tunnel case.
 Docker Compose, Fly.io, and Railway deployments are under
 `crates/remind_me_hub/deploy/`. See [`crates/remind_me_hub/README.md`](crates/remind_me_hub/README.md)
-for the full reference (routes, security posture, backends) and [Multi-Node
+for the full reference (routes, security posture, the store) and [Multi-Node
 Sync, Hub & Remote Connector](#multi-node-sync-hub--remote-connector) below
 for every client-side environment variable this `configure` call sets.
 
@@ -174,13 +186,13 @@ section — enable only what you need:
 | Semantic/vector search, cross-encoder reranking, HyDE query expansion | [Search Quality](#search-quality-embeddings-reranking--query-expansion) |
 | A network-reachable MCP endpoint (e.g. for `claude.ai`'s custom connector) | [Remote MCP connector](#remote-mcp-connector-remind_me_remote-rusty-remind-me-remote) |
 | The REST API / dashboard | [REST API Endpoints](#rest-api-endpoints) — `rusty-remind-me api [port]` |
-| Sharing a database with the Python `remind_me` reference | [Substituting for the `remind_me` MCP server](#substituting-for-the-remind_me-mcp-server) |
+| Moving over from the Python `remind_me` (retired) | [Coming from the Python `remind_me`](#coming-from-the-python-remind_me) |
 
 ---
 
 ## Workspace Structure
 
-`rusty_remind_me` is organized as a Cargo workspace containing six modular crates:
+`rusty_remind_me` is six modular crates in one Cargo workspace:
 
 ```
 rusty_remind_me/
@@ -189,12 +201,12 @@ rusty_remind_me/
 ├── ARCHITECTURE.md             # Technical design & schema documentation
 ├── CONTRIBUTING.md             # Development & testing guidelines
 ├── docs/
-│   └── CUTOVER.md              # Runbook: migrating clients from the Python reference to this port
+│   └── CUTOVER.md              # Historical: the 2026-08 cutover of clients from the Python reference
 ├── scripts/
 │   ├── configure_mcp.ps1       # PowerShell auto-configuration script for Windows
 │   └── configure_mcp.py        # Cross-platform Python auto-configuration script
 └── crates/
-    ├── remind_me_core/         # Domain models, SQLite/FTS5 database, ACT-R decay, RRF ranking
+    ├── remind_me_core/         # Domain models, the engine store (rusty_multimodal_db), ACT-R decay, RRF ranking
     ├── remind_me_mcp/          # Stdio JSON-RPC MCP protocol engine & tool handlers
     ├── remind_me_api/          # Async REST HTTP server daemon (`rusty_http` + `tokio`)
     ├── remind_me_remote/       # Remote MCP connector over Streamable HTTP (claude.ai, OAuth 2.1)
@@ -206,41 +218,65 @@ rusty_remind_me/
 
 ## Releases and versioning
 
-`.github/workflows/release.yml` watches every push to `main` that touches
-the root `Cargo.toml`. When `[workspace.package].version` there has moved
-past the last version this repo published (checked against existing `vX.Y.Z`
-tags — nothing hand-maintains a changelog of already-shipped versions), it:
+`.github/workflows/release.yml` watches
+every push to `main` that touches one of this product's six crate manifests.
+When their `version` has moved past the last published version
+(checked against existing `vX.Y.Z` tags — nothing
+hand-maintains a changelog of already-shipped versions), it:
 
 1. Builds `rusty-remind-me` and `rusty-remind-me-hub` in release mode,
    natively, for `x86_64-unknown-linux-gnu`, `x86_64-apple-darwin`,
    `aarch64-apple-darwin`, and `x86_64-pc-windows-msvc` — one job per
    platform, no cross-compilation, matching the "no system binary at build
    time" convention the optional feature flags already follow (see
-   `Cargo.toml`).
+   `crates/remind_me_core/Cargo.toml`).
 2. Packages the Claude Code plugin surface (`.claude-plugin/`, `commands/`,
    `hooks/`, `.mcp.json`) into its own archive.
-3. Publishes a GitHub Release tagged `vX.Y.Z`, with all of the above
-   attached as downloadable assets.
+3. Publishes a GitHub Release tagged `vX.Y.Z` with all of the
+   above attached as downloadable assets.
 
 Bumping the version is therefore the entire release process — there is no
 separate "cut a release" step, and nothing here pushes a tag by hand; the
 release action creates it from the version it read.
 
-A CI job (`plugin-version` in `.github/workflows/ci.yml`,
-`scripts/check_plugin_version.sh`) fails any PR where
-`.claude-plugin/plugin.json`'s `"version"` has drifted from the workspace
-version, so a version bump PR that forgets to update the plugin manifest
-never merges in the first place — the release workflow's plugin archive is
-never a version behind the binaries it ships alongside.
+The six crates each carry their own literal `version`, and must be bumped together
+with `.claude-plugin/plugin.json`'s `"version"`.
+`scripts/get_workspace_version.sh` fails if the six disagree, and
+`scripts/check_plugin_version.sh` fails if the plugin manifest differs from
+them; both run on every PR touching this directory (the
+`plugin-version` job in `.github/workflows/ci.yml`, covered by its
+`required-gate`), so a bump that
+misses one never merges — the release's plugin archive is never a version
+behind the binaries it ships alongside.
 
 ---
 
+## What a memory records
+
+Besides its text, category and tags, each memory carries the context it was written in, so it can be found by where it came from and trusted accordingly.
+
+| Group | Fields |
+| --- | --- |
+| Where | `project`, `git_remote`, `git_branch`, `git_sha`, `cwd`, `session_id`, taken from the working directory (`REMIND_ME_CWD`, else the process's own) and `REMIND_ME_SESSION_ID` |
+| Who | `written_by` (`human`, `model`, `model:<id>`, `hook`, `importer:<name>`) and `capture_method` (`manual`, `auto`) |
+| How far to trust it | `confidence` (0 to 1, scales ranking), `valid_from`, `valid_until` (an expired memory ranks last and is marked), `verified_at` |
+| What it is | `memory_type`: `decision` (needs `metadata.rationale`), `action_item` (`due`, `owner`, `status`), `preference`, `fact`, `reference`, `insight`, `learning`, `blocker`, `work_log`; and `outcome` (`done`, `abandoned`, `reverted`, `superseded`) for decisions and action items |
+| Did it hold up | a decision gets `metadata.review.due` 21 days after it is written (`REMIND_ME_DECISION_REVIEW_DAYS`, `0` turns it off; `metadata.stakes: "low"` skips it). Due reviews appear in the digest and the session brief; `remind_me_resolve` with `review` (`held`, `revised`, `reverted`) or CLI `resolve <id> --review <outcome>` records the finding, and `remind_me_stats` reports decisions by review state. Design: ADR-0031 |
+| What it points at | `memory_references`: issues, pull requests, commits, URLs, file paths, @handles, rusty_tick tasks (`tick:<uuid>`) and attachments, extracted at write time by rules (`REMIND_ME_EXTRACT=0` turns that off). An attachment keeps a SHA-256 and a label, never the bytes |
+
+Two things happen to content before it is stored. Secrets (cloud and GitHub tokens, private keys, JWTs, passwords in URLs, `key=value` credentials) are replaced with `[REDACTED:<kind>]` and the memory is tagged `redacted` (`REMIND_ME_REDACT=0` turns that off). And a `sessions` table records each session's project, branch, start and end commit.
+
+New surfaces: MCP tools `remind_me_resolve`, `remind_me_references` and `remind_me_session_timeline` (`references` has since merged into `remind_me_search`, ADR-0030); CLI `resolve`, `session start|end|timeline`, `capture-transcript` and `context`; `--project`, `--branch`, `--session` and `--written-by` filters on `search` and `list`. With `REMIND_ME_WATCH_CLAUDE_PROJECTS=1` and `REMIND_ME_WATCH_DIRS` unset, the folder watcher ingests `~/.claude/projects/` transcripts. Design: ADR-0026.
+
 ## Claude Code Plugin
 
-`rusty_remind_me` also ships as a [Claude Code plugin](https://code.claude.com/docs/en/plugins) — `.claude-plugin/plugin.json` at the repo root, bundling:
+`rusty_remind_me` also ships as a [Claude Code plugin](https://code.claude.com/docs/en/plugins) — `.claude-plugin/plugin.json` in this directory (the plugin root), bundling:
 
 - **`.mcp.json`** — the same stdio MCP server (`rusty-remind-me server`) described above, registered automatically instead of via the `configure` command or a manual client config edit.
-- **`hooks/hooks.json`** — a `SessionStart` hook (`hooks/scripts/session-start.sh`) that runs `rusty-remind-me list --limit 8` directly (no MCP round-trip, no model decision required) and injects the most recently written memories as context at the start of every session.
+- **`hooks/hooks.json`** — five hooks that run the CLI directly (no MCP round-trip, no model decision required):
+  - `SessionStart` (`session-start.sh`) opens the session and injects a brief scoped to the current project and branch, under a 2,000-token budget: persona, reminders due within 7 days, then the project brief (see `rusty-remind-me brief` below).
+  - `UserPromptSubmit` (`prompt-submit.sh`) injects only the few memories that match the prompt, under a 750-token budget. Prompts under 12 characters and slash commands are skipped.
+  - `Stop`, `PreCompact` and `SessionEnd` (`capture.sh`) save the conversation, so a session no one remembered to save still leaves a record. There is one capture per session and each run replaces its dialog. `Stop` fires every turn, so it is throttled to once a minute; `PreCompact` and `SessionEnd` always run. `SessionEnd` also closes the session and records a work log from `git diff` since the session began.
 - **`commands/remember.md`, `commands/recall.md`** — `/rusty-remind-me:remember <text> [--category NAME] [--tags a,b]` and `/rusty-remind-me:recall <query> [--limit N]`, each running `rusty-remind-me add`/`search` directly (via the command body's `` !`...` `` bash-execution syntax) before the model ever sees the prompt. `allowed-tools` scopes each command to exactly one CLI invocation shape (`Bash(rusty-remind-me add *)` / `Bash(rusty-remind-me search *)`). Plugin-provided commands are namespaced as `/plugin-name:command-name` — the bare `/remember` is not registered, only `/rusty-remind-me:remember`.
 
 Three different connections, each with a different trigger:
@@ -248,12 +284,32 @@ Three different connections, each with a different trigger:
 | Surface | Fires when | Model's role |
 | --- | --- | --- |
 | MCP tools | Model issues a `tools/call` | Decides whether and when to call |
-| `SessionStart` hook | Every session start, unconditionally | None — output is injected before the model sees the prompt |
+| `SessionStart`, `UserPromptSubmit` hooks | Every session start and every prompt, unconditionally | None — output is injected before the model sees the prompt |
+| `Stop`, `PreCompact`, `SessionEnd` hooks | Every turn end, before compaction, at session end | None — the transcript is saved without the model |
 | `/rusty-remind-me:remember`, `/rusty-remind-me:recall` | User types the command | None for the CLI call itself; model only sees/summarizes the result |
 
-The hook and the slash commands both bypass MCP entirely — they invoke the plain CLI binary as a subprocess and never speak the MCP JSON-RPC protocol. The hook degrades safely: if `rusty-remind-me` isn't on `PATH` yet, or the store is empty, it emits `{"continue": true}` (optionally with a one-line `systemMessage` nudge to build the binary) rather than failing the session. The slash commands surface the same "not on PATH" condition as plain shell output for the model to relay, rather than silently retrying some other way.
+The hooks and the slash commands both bypass MCP entirely — they invoke the plain CLI binary as a subprocess and never speak the MCP JSON-RPC protocol. The hooks degrade safely: if `rusty-remind-me` isn't on `PATH` yet, or the store is empty, they emit `{"continue": true}` (optionally with a one-line `systemMessage` nudge to build the binary) and always exit 0, so they cannot fail a session. They write with `written_by = hook`. `REMIND_ME_HOOKS=0` turns every hook off and `REMIND_ME_PROMPT_CONTEXT=0` turns off only the per-prompt injection. `scripts/test_hooks.sh` drives each hook end to end against a built binary. The slash commands surface the same "not on PATH" condition as plain shell output for the model to relay, rather than silently retrying some other way.
 
-To use it, `rusty-remind-me` must be on `PATH` (`cargo build --release -p rusty-remind-me` then add `target/release` to `PATH`, or `cargo install --path crates/remind_me_cli`), then add this repo as a plugin source in Claude Code.
+To use it, `rusty-remind-me` must be on `PATH` (`cargo build --release -p rusty-remind-me` then add `target/release` to `PATH`, or `cargo install --path crates/remind_me_cli`), then add this repository as a plugin marketplace in Claude Code (see [Connect it to a client](#2-connect-it-to-a-client)).
+
+### Cloud sessions (claude.ai Projects)
+
+A cloud session runs in a fresh container that has no plugin, no binary, and a transcript that is deleted along with the container. The rusty_mill monorepo's own `.claude/settings.json` registers `.claude/hooks/remind-me-capture.py` on `Stop` and `PreCompact`. The hook sends the transcript to the remote connector's `remind_me_capture_transcript` tool, which keeps one capture per session, as the plugin does (ADR-0029). It runs only when `CLAUDE_CODE_REMOTE=true`, the explicit opt-in `REMIND_ME_CLOUD_CAPTURE=1`, `REMIND_ME_URL` (the connector's `https://…/mcp` endpoint) and `REMIND_ME_TOKEN` are all set, so a local session is left to the plugin and holding the credentials alone captures nothing. Before anything leaves the container, thinking blocks are dropped, the values of fields named like secrets (`password`, `token`, `api_key`, …) are withheld, JSON inside strings is scrubbed field by field, and every string is scrubbed for the secret shapes the server redacts, quoted `key: "value"` pairs, bearer values and the token itself; tool calls and results are otherwise sent as they are, so turn the opt-in on only for environments whose sessions you want stored. The endpoint must be https, redirects are not followed, and the git remote is sent without credentials, query or fragment. To turn it on, set the opt-in and both variables in the cloud environment, keep the token as a secret, add the connector's host to the environment's network allowlist, and run the connector with the `full` tool profile. The hook always exits 0 and reports a failure on stderr as a fixed category, never server text. A session that checks out several repositories starts above them in `/home/user` and loads none of their `.claude/settings.json`, so the repository hook alone misses it. To capture every session of a cloud environment, add this to the environment's setup script, with `MILL_REF` a rusty_mill commit (the hook stays there) and `REF` a release tag of this repository (pinning both fixes what runs); `scripts/install_cloud_capture.py` takes the hook's path with `--source`, copies it into `~/.claude/hooks/` and registers it in `~/.claude/settings.json` without touching other settings, and `--check` reports a stale copy:
+
+```bash
+# remind-me cloud session capture (ADR-0029)
+MILL_REF=<rusty_mill commit sha>
+REF=<rusty-remind-me release tag>
+raw="https://raw.githubusercontent.com/Rusty-Mill"
+tmp="$(mktemp -d)"
+curl -fsSL --max-time 30 "$raw/rusty_mill/$MILL_REF/.claude/hooks/remind-me-capture.py" -o "$tmp/hook.py" \
+  && curl -fsSL --max-time 30 "$raw/rusty-remind-me/$REF/scripts/install_cloud_capture.py" -o "$tmp/install.py" \
+  && python3 -I "$tmp/install.py" --source "$tmp/hook.py" \
+  || echo "remind-me capture hook not installed" >&2
+rm -rf "$tmp"
+```
+
+In a single-repository rusty_mill session both registrations run; the server keeps one capture per session, so the second send only replaces it.
 
 ### Multi-node sync through the plugin
 
@@ -340,44 +396,35 @@ Each setup option safely merges the `"rusty-remind-me"` MCP server configuration
 
 ## Database Location
 
-By default the store is `~/.remind-me/memory.db` — the same path [`remind_me`](https://github.com/baileyrd/remind_me) uses, so an unconfigured install of either one opens the same database.
+By default the store is `~/.remind-me/memory.engine`, a directory of engine
+tables (ADR-0023, ADR-0025). It is still located by the path of the old
+SQLite file, `~/.remind-me/memory.db`: the engine directory stands beside
+that path, and the file itself is only read once, to copy an existing store
+onto the engine (see [The Engine Store](#12-the-engine-store)).
 
-Two environment variables override it, most specific first:
+Two environment variables override the path, most specific first:
 
 | Variable | Names a | Notes |
 | --- | --- | --- |
-| `REMIND_ME_DB_PATH` | database **file** | Wins if both are set. Specific to this implementation. |
-| `REMIND_ME_MCP_DIR` | **directory** holding `memory.db` | Shared with `remind_me`. Set this to point both implementations at one store. |
+| `REMIND_ME_DB_PATH` | the database **file** path (`.../memory.db`); the store is `.../memory.engine` beside it | Wins if both are set. |
+| `REMIND_ME_MCP_DIR` | **directory** holding `memory.engine` | Also where the wiki, API keys and connector token live. |
 
 A leading `~` is expanded in either. A variable set to the empty string counts as unset.
 
-To share a database with `remind_me`, set `REMIND_ME_MCP_DIR` only — `REMIND_ME_DB_PATH` has no meaning to `remind_me` and setting it there is silently ignored.
+## Coming from the Python `remind_me`
 
-## Substituting for the `remind_me` MCP server
-
-Two settings make this binary a drop-in replacement for [`remind_me`](https://github.com/baileyrd/remind_me)'s MCP server:
+The Python [`remind_me`](https://github.com/baileyrd/remind_me) this project was ported from is **retired** (ADR-0023). A `memory.db` the Python server wrote at its last schema (v29) has to be opened once with rusty-remind-me 0.2.x, which brings it to v32; this build then copies it onto the engine on its first start (ADR-0025). After that, moving over is a matter of pointing your MCP clients at `rusty-remind-me` instead:
 
 ```bash
-REMIND_ME_MCP_DIR=~/.remind-me                 # the same database (the default)
-REMIND_ME_DEFAULT_RESPONSE_FORMAT=markdown     # the same output format
+rusty-remind-me configure                             # JSON output (the default)
+rusty-remind-me configure --default-format markdown   # the Python server's output format
 ```
 
-Or write both into every MCP client config at once:
+Do not run the Python server against the same `memory.db` afterwards. The node's store is the engine directory beside it; the file is never read again after the copy, so anything Python writes there is not seen.
 
-```bash
-rusty-remind-me configure --default-format markdown
-```
+`REMIND_ME_DEFAULT_RESPONSE_FORMAT` accepts `json` (the default) or `markdown`, and affects **only** the tools where the Python server had no `response_format` parameter at all — it returned Markdown from those and offered no JSON, whereas this port offers both and defaults to JSON so existing callers keep working. Tools that mirror a Python input model already use that model's own default and are untouched by this setting: Markdown for `search`, `list`, `wiki_list`, `stats`, `history`, `digest` and `list_reminders`, JSON for `vitality_report`. A per-call `"response_format"` argument always wins over the setting, in both directions.
 
-`REMIND_ME_DEFAULT_RESPONSE_FORMAT` accepts `json` (the default) or `markdown`, and affects **only** the tools where `remind_me` has no `response_format` parameter at all — it returns Markdown from those and offers no JSON, whereas this port offers both and defaults to JSON so existing callers keep working.
-
-Tools that mirror a `remind_me` input model already use that model's own default and are deliberately untouched by this setting: Markdown for `search`, `list`, `wiki_list`, `stats`, `history`, `digest` and `list_reminders`, JSON for `vitality_report`. Making `vitality_report` render Markdown because you asked for "markdown defaults" would move this port *away* from the reference.
-
-A per-call `"response_format"` argument always wins over the setting, in both directions.
-
-**Migrating an already-running client from `remind_me` to this binary?** A
-stdio client will not pick up a config change until it restarts — see
-`docs/CUTOVER.md` for the full runbook and the lessons learned cutting over
-every consumer on a real machine.
+A stdio client will not pick up a config change until it restarts. `docs/CUTOVER.md` records the 2026-08 cutover of every consumer on a real machine; it is kept as history.
 
 ## Multi-Node Sync, Hub & Remote Connector
 
@@ -401,11 +448,18 @@ something any single binary owns. `rusty-remind-me server`, `api`, and
 `remote` each start one alongside their own work
 (`crates/remind_me_cli/src/main.rs`); the one-shot CLI subcommands (`add`,
 `search`, `list`, ...) don't, since they exit before a cycle could ever run.
-A write from one of those one-shot commands still lands in the shared SQLite
+A write from one of those one-shot commands still lands in the shared
 outbox — it isn't lost — but nothing pushes it to the hub until a process
 that *is* running a sync worker picks it up on its next cycle. Concretely:
 one of `rusty-remind-me server`/`api`/`remote` has to be running somewhere
-for sync to actually move data. Status is process-global, not tied to
+for sync to actually move data.
+
+**Sync is a property of the store, not of each process.** Every process that
+opens a node's store must agree on it, but they need not all carry the
+settings: a dashboard started without them leaves a syncing store syncing (it
+warns on stderr), queues its edits for the process that pushes, and deletes by
+tombstone. Turning sync off takes `REMIND_ME_SYNC_DISABLE=1`; unsetting the
+settings in one process no longer does it. Status is process-global, not tied to
 whichever instance started the worker:
 `remind_me_server_status` reports on whatever sync worker is live in *that*
 process, the same way it already reports on the folder watcher.
@@ -416,9 +470,11 @@ process, the same way it already reports on the folder watcher.
 | `REMIND_ME_CLIENT` | Human-readable label for this install, alongside `node_id` | `unknown` |
 | `REMIND_ME_HUB_URL` | Hub this node pushes to / pulls from | unset (sync off) |
 | `REMIND_ME_SYNC_SECRET` | Bearer token for `/sync/push` and `/sync/pull`, sent and required | unset (sync off) |
+| `REMIND_ME_SYNC_DISABLE` | `1`/`true`/`yes`/`on`: turn sync off for this store and empty its outbox. Without it, a process that lacks the three settings above leaves a syncing store syncing | unset |
 | `REMIND_ME_SYNC_INTERVAL` | Seconds between background sync cycles | `60` |
 | `REMIND_ME_PEER_BIND` | Bind address for this node's own peer server (accepts another node's push/pull) | `0.0.0.0` — all interfaces; narrow to `127.0.0.1` behind a tunnel-only setup |
 | `REMIND_ME_PEER_PORT` | Port for the peer server above, and the port every discovered peer is assumed to listen on | `8766` |
+| `REMIND_ME_COMPACT_INTERVAL_SECS` | Seconds between the store daemon's compactions of the engine tables it has written to since the last one; `0` turns them off. Read by the daemon only | `3600` |
 
 `rusty-remind-me configure --node-id ID --hub-url URL [--peer-port N] [--sync-interval SECS]`
 writes both the MCP entry and this sync environment for every configured
@@ -455,7 +511,7 @@ Funnel) rather than widening the bind address directly.
 
 ## Search Quality: Embeddings, Reranking & Query Expansion
 
-Three independent, optional layers on top of FTS5 keyword search. Each is
+Three independent, optional layers on top of BM25 keyword search. Each is
 **off by default** and degrades to keyword-only (or its next-cheapest
 fallback) on any failure — a missing daemon, an unconfigured model, or a
 disabled build feature is never a reason a search should fail.
@@ -558,7 +614,7 @@ Connector](#multi-node-sync-hub--remote-connector) above for the full
 environment variable reference.
 
 ### 5. Adding Memories
-Stores a new memory note, fact, or preference in SQLite with automatic FTS5 indexing:
+Stores a new memory note, fact, or preference, indexed for full-text search as it lands:
 ```bash
 rusty-remind-me add "User prefers dark mode and Rust for low-level server development"
 rusty-remind-me add "Deploy runbook lives in the ops wiki" --category engineering --tags ops,runbook
@@ -567,7 +623,7 @@ rusty-remind-me add "Deploy runbook lives in the ops wiki" --category engineerin
 `--category` defaults to `general`; `--tags` is comma-separated and drops blanks. Use `--` before content that starts with dashes.
 
 ### 6. Searching Memories
-Executes an FTS5 BM25 search with RRF rank fusion and ACT-R vitality scoring:
+Executes a BM25 keyword search with RRF rank fusion and ACT-R vitality scoring:
 ```bash
 rusty-remind-me search "dark mode Rust"
 rusty-remind-me search "dark mode Rust" --limit 5 --json
@@ -581,13 +637,20 @@ Retrieves a specific memory record by its primary key:
 rusty-remind-me get mem_4b307c2bd6ec4deb8c891a4b28cc592a
 ```
 
-### 8. Knowledge Graph Entity Management
+### 8. Project Brief
+One call for what is worth knowing about a project: its current state (the newest session summaries), what is open (blockers raised in the window, decisions and action items with no outcome) and recent activity, newest first, each with an id for `get`:
+```bash
+rusty-remind-me brief rusty_mux --since 2d --budget 1500
+```
+The name resolves through the entity graph, so an alias works, and a memory is in scope when its project, its git remote's repository, a tag, its subject or object, or an entity link names the project. An unknown name is refused with the closest known names, never guessed. `--since` takes `7d` (the default), `12h` or an RFC 3339 time; `--budget` is in tokens (200 to 8,000) and bounds the returned text, JSON or Markdown, by the same bytes/4 estimate search uses; items that do not fit are dropped whole and counted, and a budget too small even for the header is refused with the size it needs. `--json` prints the brief's JSON instead of its Markdown. Sensitive, superseded and expired memories never appear, and never make a name known or suggested. The same brief is the MCP tool `remind_me_brief` (in the `core` profile, JSON by default) and `GET /api/brief`.
+
+### 9. Knowledge Graph Entity Management
 Upserts an entity with optional category/kind classification:
 ```bash
 rusty-remind-me entity "Bailey Robertson" "person"
 ```
 
-### 9. Markdown Wiki Synthesis
+### 10. Markdown Wiki Synthesis
 Creates or updates a structured wiki topic page:
 ```bash
 rusty-remind-me wiki-write architecture "System Architecture" "Rusty Remind Me is a high performance memory engine written in Rust."
@@ -619,13 +682,67 @@ dbs export-wiki --out-dir ./wiki-pages    # in the dbs repo
 rusty-remind-me wiki-import ./wiki-pages
 ```
 
-### 10. System Statistics
+### 11. System Statistics
 Prints total memory counts and database metrics:
 ```bash
 rusty-remind-me stats
 ```
 
 ---
+
+### 12. Store Daemon
+One `rusty-remind-me daemon` process owns the store, and every MCP session,
+CLI command, `api` and `remote` becomes its client over loopback. Set
+`REMIND_ME_DAEMON=0` to open the store in each process instead. The first client starts it; nothing needs to be run by
+hand. The background loops (reminders, folder watcher, promotion nudge, sync)
+then run once in the daemon instead of in every long-lived process.
+```bash
+rusty-remind-me list                  # starts the daemon if it is not running
+rusty-remind-me daemon status    # pid, port, start time; exit 1 if not running
+rusty-remind-me daemon stop      # the next client starts a fresh one
+```
+
+`REMIND_ME_CLIENT`, `REMIND_ME_DEFAULT_RESPONSE_FORMAT` and
+`REMIND_ME_TOOL_PROFILE` stay per client. Every other `REMIND_ME_*` setting
+belongs to the daemon, which takes them from the client that started it. A
+client whose settings differ, or a client from a different build, does not
+use that daemon: it prints why on stderr and opens the store in-process, as
+it would with the daemon off. After upgrading, run `rusty-remind-me daemon
+stop` so the next client starts the new build.
+
+The daemon writes `<db>.daemon.json`, `<db>.daemon.token` (mode 600) and
+`<db>.daemon.log` beside the database (`remind_me.db.daemon.json` and so on),
+and holds `<db>.daemon.lock` while it runs.
+
+### 13. The Engine Store
+The node's only store is the `rusty_multimodal_db` engine (ADR-0023,
+ADR-0025): a directory of tables, `memory.engine`, beside the path the
+store is configured at. A node that still has a SQLite `memory.db` from an
+earlier build and no `memory.engine` copies the file onto the engine on its
+first start: every id is kept, every row is verified after it is written,
+and if any row cannot be copied the node refuses to start and says which,
+leaving `memory.db` as it was. Every later start uses `memory.engine` and
+never opens the file again; it can be archived or deleted.
+
+- The copy reads a `memory.db` at schema version 30, 31 or 32. An older
+  file (the Python reference's v29 or earlier) has to be opened once with
+  rusty-remind-me 0.2.x first, which brings it to v32.
+- There is no SQLite store any more: `REMIND_ME_STORE` is gone, and
+  `sqlite3 memory.db` no longer shows the node's data.
+- Only one process opens the engine store, so the store daemon (§11)
+  serves every client. A client that cannot use a running daemon says why
+  and that `rusty-remind-me daemon stop` releases the store.
+- Backups are `backups/*.engine` directories, each a copy of the engine
+  directory taken while the tables are held; restoring is putting one back
+  as `memory.engine`. Backups taken while the node stored in SQLite
+  (`backups/*.db`) still list and are pruned in turn.
+
+`copy-store` copies an old SQLite file into a separate engine directory
+without touching the node:
+```bash
+rusty-remind-me copy-store --to ./engine-copy                  # from the configured database path
+rusty-remind-me copy-store --from old.db --to ./engine-copy    # from another file
+```
 
 ## REST API Endpoints
 
@@ -660,6 +777,7 @@ surfaces):
 | `GET` | `/api/reminders?when=upcoming\|overdue\|all&limit=...` | Memories with a reminder set, soonest first (`remind_me_list_reminders`) |
 | `POST` | `/api/reminders` | Set or clear a reminder — `{"memory_id": ..., "remind_at": ISO-8601 or null}` (`remind_me_set_reminder`) |
 | `GET` | `/api/digest?since_days=...` | Recent memories, vitality, reminders and sync state (`remind_me_digest`) |
+| `GET` | `/api/brief?project=...&since=...&token_budget=...` | One project's state, open items and recent activity; 404 with `suggestions` for an unknown name (`remind_me_brief`) |
 | `GET` | `/api/status` | Build, database, schema currency, backups and subsystem state (`remind_me_server_status`) |
 | `GET` | `/api/saved-searches` | List saved searches (`remind_me_list_saved_searches`) |
 | `POST` | `/api/saved-searches` | Create or update one by name (`remind_me_save_search`) |
@@ -699,3 +817,9 @@ future brief whether they were written up or not.
 ## License
 
 MIT License. See [LICENSE](LICENSE) for details.
+
+For Orch proposed-change reports, `rusty-remind-me impact-export [QUERY]` exports
+a complete engine-backed inventory through the existing daemon/store path, with
+optional supplemental retrieval. This explicit export includes sensitive and
+inactive records; keep it private like a backup. See the
+[impact snapshot contract](../rusty_orch/docs/change-impact.md).

@@ -5,6 +5,9 @@
 //! hurry, and one that sleeps a *shortened* window is a race waiting to fail
 //! on a loaded CI box.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 use remind_me_core::rate_limit::{
     rate_limit_enabled, resolve_key, retry_after_seconds, RateLimiter, DEFAULT_REQUESTS,
     DEFAULT_WINDOW_SECONDS, RATE_LIMIT_ENABLED_ENV,
@@ -214,7 +217,7 @@ fn an_empty_configured_secret_never_matches() {
 #[test]
 fn limiting_is_on_by_default() {
     let _guard = env_lock().lock().unwrap();
-    std::env::remove_var(RATE_LIMIT_ENABLED_ENV);
+    crate::test_env::remove_var(RATE_LIMIT_ENABLED_ENV);
 
     // Unlike metrics, the safe default here is the protective one: both
     // guarded surfaces are reachable from the internet when tunnelled.
@@ -226,13 +229,13 @@ fn limiting_is_on_by_default() {
 #[test]
 fn an_empty_string_is_the_explicit_opt_out() {
     let _guard = env_lock().lock().unwrap();
-    std::env::set_var(RATE_LIMIT_ENABLED_ENV, "");
+    crate::test_env::set_var(RATE_LIMIT_ENABLED_ENV, "");
     assert!(!rate_limit_enabled());
-    std::env::set_var(RATE_LIMIT_ENABLED_ENV, "0");
+    crate::test_env::set_var(RATE_LIMIT_ENABLED_ENV, "0");
     assert!(!rate_limit_enabled());
-    std::env::set_var(RATE_LIMIT_ENABLED_ENV, "1");
+    crate::test_env::set_var(RATE_LIMIT_ENABLED_ENV, "1");
     assert!(rate_limit_enabled());
-    std::env::remove_var(RATE_LIMIT_ENABLED_ENV);
+    crate::test_env::remove_var(RATE_LIMIT_ENABLED_ENV);
 }
 
 #[test]

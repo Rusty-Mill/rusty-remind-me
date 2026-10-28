@@ -1,0 +1,13 @@
+{
+  "aws-sigv4": {
+    "version": "1.6.0",
+    "archive": "https://static.crates.io/crates/aws-sigv4/aws-sigv4-1.6.0.crate",
+    "sha256": "2312577f088c9fbf4206dfdb884cf1de9407b43e1a923cbed5237775116fc24b",
+    "vcs": {
+      "git": {
+        "sha1": "dd4d62780ee72db9adae16134e5dac47a9b6393e"
+      },
+      "path_in_vcs": "sdk/aws-sigv4"
+    }
+  }
+}

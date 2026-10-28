@@ -5,6 +5,9 @@
 //! misparsed — by a real calendar client. An unescaped comma does not corrupt
 //! its own VEVENT; it corrupts every one after it.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 use remind_me_core::ics::{
     build_ics, escape_ics_text, fold_line, resolve_ics_token, ICS_TOKEN_ENV, ICS_TOKEN_FILE_ENV,
     PRODID, SUMMARY_MAX_CHARS,
@@ -55,6 +58,19 @@ fn memory(id: &str, content: &str, remind_at: Option<&str>) -> Memory {
         client: None,
         source_capture_id: None,
         deleted_at: None,
+        project: None,
+        session_id: None,
+        git_remote: None,
+        git_branch: None,
+        git_sha: None,
+        cwd: None,
+        valid_from: None,
+        valid_until: None,
+        confidence: 1.0,
+        verified_at: None,
+        outcome: None,
+        written_by: "unknown".to_string(),
+        capture_method: "manual".to_string(),
     }
 }
 
@@ -335,21 +351,21 @@ fn a_long_summary_is_truncated_but_the_description_keeps_everything() {
 #[test]
 fn an_explicit_token_env_var_wins() {
     let _guard = env_lock().lock().unwrap();
-    std::env::set_var(ICS_TOKEN_ENV, "explicit-token");
+    crate::test_env::set_var(ICS_TOKEN_ENV, "explicit-token");
 
     assert_eq!(resolve_ics_token(), "explicit-token");
-    std::env::remove_var(ICS_TOKEN_ENV);
+    crate::test_env::remove_var(ICS_TOKEN_ENV);
 }
 
 #[test]
 fn a_generated_token_persists_and_is_reused() {
     let _guard = env_lock().lock().unwrap();
-    std::env::remove_var(ICS_TOKEN_ENV);
+    crate::test_env::remove_var(ICS_TOKEN_ENV);
     let dir = std::env::temp_dir().join(format!("rmm_ics_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("ics_token");
-    std::env::set_var(ICS_TOKEN_FILE_ENV, &file);
+    crate::test_env::set_var(ICS_TOKEN_FILE_ENV, &file);
 
     let first = resolve_ics_token();
     let second = resolve_ics_token();
@@ -375,19 +391,19 @@ fn a_generated_token_persists_and_is_reused() {
         assert_eq!(mode & 0o077, 0, "token file is group/other readable");
     }
 
-    std::env::remove_var(ICS_TOKEN_FILE_ENV);
+    crate::test_env::remove_var(ICS_TOKEN_FILE_ENV);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn deleting_the_token_file_rotates_the_token() {
     let _guard = env_lock().lock().unwrap();
-    std::env::remove_var(ICS_TOKEN_ENV);
+    crate::test_env::remove_var(ICS_TOKEN_ENV);
     let dir = std::env::temp_dir().join(format!("rmm_ics_rot_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("ics_token");
-    std::env::set_var(ICS_TOKEN_FILE_ENV, &file);
+    crate::test_env::set_var(ICS_TOKEN_FILE_ENV, &file);
 
     let before = resolve_ics_token();
     std::fs::remove_file(&file).unwrap();
@@ -398,6 +414,6 @@ fn deleting_the_token_file_rotates_the_token() {
     // subscribed calendar must be re-pointed.
     assert_ne!(before, after);
 
-    std::env::remove_var(ICS_TOKEN_FILE_ENV);
+    crate::test_env::remove_var(ICS_TOKEN_FILE_ENV);
     let _ = std::fs::remove_dir_all(&dir);
 }

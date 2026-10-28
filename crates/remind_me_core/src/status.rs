@@ -30,8 +30,10 @@
 //! is worse than one that omits a field.
 
 use crate::backup::{backup_dir, list_backups, BackupInfo};
-use crate::db::migrations::SCHEMA_VERSION;
-use rusqlite::{Connection, Result};
+use crate::db::stats::StoreStats;
+use crate::db::Result;
+use crate::db::Store;
+use crate::db::SCHEMA_VERSION;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -70,7 +72,8 @@ pub struct ServerStatus {
     pub database_path: Option<String>,
     pub database_exists: bool,
     pub database_bytes: Option<u64>,
-    /// What `PRAGMA user_version` reports.
+    /// The schema version the store's records mirror (see
+    /// `db::stats::StorageInfo::schema_version`).
     pub schema_version: i32,
     /// What this build's generated schema corresponds to.
     pub expected_schema_version: i32,
@@ -103,39 +106,33 @@ pub struct ServerStatus {
     pub watchdog: crate::watchdog::WatchdogStatus,
 }
 
-fn database_file(conn: &Connection) -> Result<Option<PathBuf>> {
-    let path: String = conn.query_row("PRAGMA database_list", [], |row| row.get(2))?;
-    Ok(if path.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(path))
-    })
-}
-
 /// Collect the status snapshot.
 ///
 /// Reports only what this crate actually has. Subsystems it lacks are named
 /// with a reason rather than reported as stopped — shipping a field that reads
 /// "not running" for something that was never built is the hollow-stub failure
 /// mode, and it makes a real outage indistinguishable from an absent feature.
-pub fn server_status(conn: &Connection) -> Result<ServerStatus> {
-    let database_path = database_file(conn)?;
-    let database_exists = database_path.as_ref().map(|p| p.exists()).unwrap_or(true); // in-memory: it exists, it just has no file
+pub fn server_status(store: &Store<'_>) -> Result<ServerStatus> {
+    let stats = StoreStats::new(store);
+    let info = stats.storage_info()?;
+    let database_path: Option<PathBuf> = info.path;
+    // The store is the engine directory beside the configured path; the
+    // path itself is the old SQLite file, which need not exist. In memory:
+    // it exists, it just has no directory.
+    let database_exists = database_path
+        .as_ref()
+        .map(|p| crate::db::engine_dir(p).is_dir())
+        .unwrap_or(true);
     let database_bytes = database_path
         .as_ref()
-        .and_then(|p| std::fs::metadata(p).ok())
-        .map(|m| m.len());
+        .map(|_| u64::try_from(info.size_bytes).unwrap_or(0));
 
-    let schema_version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    let memory_count: i64 = conn.query_row(
-        "SELECT count(*) FROM memories WHERE deleted_at IS NULL",
-        [],
-        |row| row.get(0),
-    )?;
+    let schema_version = info.schema_version;
+    let memory_count = stats.live_memories()?;
 
     // An in-memory database has no directory to hold backups, so this is
     // absent rather than empty.
-    let dir = backup_dir(conn).ok();
+    let dir = backup_dir(store).ok();
     let backups = dir
         .as_ref()
         .and_then(|d| list_backups(d).ok())

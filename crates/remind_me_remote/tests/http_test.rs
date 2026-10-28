@@ -1,4 +1,4 @@
-//! Integration tests driving the real axum/rmcp server over HTTP.
+//! Integration tests driving the real `rusty_axum` server over HTTP.
 //!
 //! These exercise `remind_me_remote::build_router` exactly as production
 //! uses it (default `StreamableHttpServerConfig`, so real session-managed
@@ -9,11 +9,19 @@
 //! has no public constructor outside `rmcp`): this file is where that
 //! coverage lives instead.
 
+mod common;
+
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use remind_me_core::daemon::endpoint::Endpoint;
+use remind_me_core::daemon::ops::{Op, OpReply};
+use remind_me_core::daemon::server::{Daemon, Service, Start};
 use remind_me_core::Database;
-use remind_me_mcp::McpServer;
+use remind_me_mcp::daemon_proxy::DaemonProxy;
+use remind_me_mcp::{Handler, McpServer};
 use serde_json::{json, Value};
 
 const TOKEN: &str = "test-connector-token";
@@ -25,12 +33,50 @@ async fn spawn_server() -> SocketAddr {
     let db = Database::open_in_memory().unwrap();
     let mcp = Arc::new(McpServer::new(db));
     let router = remind_me_remote::build_router(mcp, TOKEN.to_string(), None).unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, router).await;
-    });
-    addr
+    common::serve(router)
+}
+
+/// The daemon's side of the production setup: an MCP server over the store,
+/// answering lines that arrive on daemon connections.
+struct DaemonStore(McpServer);
+
+impl Service for DaemonStore {
+    fn mcp(&self, line: &str) -> Option<Value> {
+        self.0.handle_line(line)
+    }
+
+    fn op(&self, _: &Op) -> OpReply {
+        OpReply::Err("not served by this fixture".to_string())
+    }
+
+    fn http(&self, _: &mut std::net::TcpStream) -> std::io::Result<()> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+}
+
+/// [`spawn_server`] as production runs it: the connector's handler is a
+/// [`DaemonProxy`] relaying every caller's lines over one connection to a
+/// daemon that owns the store, so writes run on the daemon's thread.
+async fn spawn_daemon_backed_server() -> SocketAddr {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "rrm_remote_daemon_{}_{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let endpoint = Endpoint::for_db(&dir.join("memory.db"));
+    let Start::Started(locked) = Daemon::start(endpoint.clone()).unwrap() else {
+        panic!("a fresh endpoint must start");
+    };
+    let daemon = locked.listen().unwrap();
+    let store = DaemonStore(McpServer::new(Database::open_in_memory().unwrap()));
+    // Serves for the rest of the test binary's life, like `common::serve`.
+    std::thread::spawn(move || daemon.serve(Arc::new(store)));
+    // The daemon is already running, so the executable is never started.
+    let proxy = DaemonProxy::connect(endpoint, PathBuf::from("unused")).unwrap();
+    let router = remind_me_remote::build_router(Arc::new(proxy), TOKEN.to_string(), None).unwrap();
+    common::serve(router)
 }
 
 /// Extract every JSON payload carried by an SSE response body's `data:`
@@ -84,6 +130,18 @@ fn sse_events(body: &str) -> Vec<(Option<String>, Option<Value>)> {
             (id, parsed)
         })
         .collect()
+}
+
+/// The per-request `_meta` a 2026-07-28 client attaches to every
+/// session-free (discover-lifecycle) request. The spec requires both keys,
+/// and rmcp enforces it from 3.1 on (a missing one is `-32602 Invalid
+/// params`); 3.0.1, which this crate used before joining the rusty_mill
+/// workspace, did not check.
+fn discover_meta() -> Value {
+    json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {}
+    })
 }
 
 fn mcp_headers() -> reqwest::header::HeaderMap {
@@ -160,6 +218,30 @@ async fn a_wrong_secret_path_token_404s_identically_to_an_unrelated_path() {
         wrong_token.text().await.unwrap(),
         unrelated.text().await.unwrap()
     );
+}
+
+#[tokio::test]
+async fn a_body_over_four_mib_is_refused_with_413() {
+    use std::io::{Read, Write};
+
+    let addr = spawn_server().await;
+    // Only the head: the server refuses on the declared length, before any
+    // of the body is sent.
+    let head = format!(
+        "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {TOKEN}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        4 * 1024 * 1024 + 1
+    );
+    let reply = tokio::task::spawn_blocking(move || {
+        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        stream.write_all(head.as_bytes()).unwrap();
+        let mut reply = Vec::new();
+        let _ = stream.read_to_end(&mut reply);
+        String::from_utf8_lossy(&reply).into_owned()
+    })
+    .await
+    .unwrap();
+    assert!(reply.starts_with("HTTP/1.1 413"), "{reply}");
 }
 
 #[tokio::test]
@@ -318,7 +400,12 @@ async fn a_2026_07_28_client_calls_a_tool_in_one_post_with_no_session_at_all() {
     let response = client
         .post(format!("http://{addr}/mcp/{TOKEN}"))
         .headers(headers)
-        .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": { "_meta": discover_meta() }
+        }))
         .send()
         .await
         .unwrap();
@@ -403,7 +490,8 @@ async fn a_2026_07_28_client_calls_a_mutating_tool_in_one_post_with_no_session_a
             "method": "tools/call",
             "params": {
                 "name": "remind_me_add",
-                "arguments": { "content": "written through the discover lifecycle" }
+                "arguments": { "content": "written through the discover lifecycle" },
+                "_meta": discover_meta()
             }
         }))
         .send()
@@ -449,7 +537,7 @@ async fn a_2026_07_28_client_reads_the_stats_resource_with_no_session() {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "resources/read",
-            "params": { "uri": "memory://stats" }
+            "params": { "uri": "memory://stats", "_meta": discover_meta() }
         }))
         .send()
         .await
@@ -479,7 +567,12 @@ async fn a_2026_07_28_client_lists_prompts_with_no_session() {
     let response = client
         .post(format!("http://{addr}/mcp/{TOKEN}"))
         .headers(headers)
-        .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": "prompts/list" }))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "prompts/list",
+            "params": { "_meta": discover_meta() }
+        }))
         .send()
         .await
         .unwrap();
@@ -521,7 +614,12 @@ async fn a_2026_07_28_client_resumes_a_dropped_response_stream_via_last_event_id
     let response = client
         .post(format!("http://{addr}/mcp/{TOKEN}"))
         .headers(headers)
-        .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": { "_meta": discover_meta() }
+        }))
         .send()
         .await
         .unwrap();
@@ -568,4 +666,147 @@ async fn a_2026_07_28_client_resumes_a_dropped_response_stream_via_last_event_id
         result["result"]["tools"].as_array().is_some(),
         "expected the real tools/list result to be replayed, got: {result}"
     );
+}
+
+/// Open a legacy session as `client_name`, returning its id and the
+/// `initialize` result.
+async fn open_session(
+    client: &reqwest::Client,
+    addr: SocketAddr,
+    client_name: &str,
+) -> (String, Value) {
+    let init = client
+        .post(format!("http://{addr}/mcp/{TOKEN}"))
+        .headers(mcp_headers())
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": { "name": client_name, "version": "1.0" }
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    let session_id = init.headers()["mcp-session-id"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    let payloads = sse_json_payloads(&init.text().await.unwrap());
+    let result = payloads
+        .into_iter()
+        .find(|p| p.get("id") == Some(&json!(1)))
+        .expect("the initialize response must be among the SSE payloads");
+    client
+        .post(format!("http://{addr}/mcp/{TOKEN}"))
+        .headers(mcp_headers())
+        .header("Mcp-Session-Id", &session_id)
+        .json(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }))
+        .send()
+        .await
+        .unwrap();
+    (session_id, result["result"].clone())
+}
+
+/// Add `content` over `session_id` and return the stored memory.
+async fn add_over(
+    client: &reqwest::Client,
+    addr: SocketAddr,
+    session_id: &str,
+    content: &str,
+) -> Value {
+    let call = client
+        .post(format!("http://{addr}/mcp/{TOKEN}"))
+        .headers(mcp_headers())
+        .header("Mcp-Session-Id", session_id)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": "remind_me_add", "arguments": { "content": content } }
+        }))
+        .send()
+        .await
+        .unwrap();
+    let payloads = sse_json_payloads(&call.text().await.unwrap());
+    let result = payloads
+        .iter()
+        .find(|p| p.get("id") == Some(&json!(2)))
+        .expect("the tools/call response must be among the SSE payloads");
+    let text = result["result"]["content"][0]["text"].as_str().unwrap();
+    serde_json::from_str(text).unwrap()
+}
+
+#[tokio::test]
+async fn initialize_tells_a_remote_client_how_to_use_the_memory() {
+    let addr = spawn_server().await;
+    let (_, init) = open_session(&reqwest::Client::new(), addr, "claude-ai").await;
+    assert_eq!(init["instructions"], remind_me_mcp::SERVER_INSTRUCTIONS);
+}
+
+/// One server, two connected clients taking turns: each memory names the
+/// client that wrote it, not "unknown" and not whichever shook hands last.
+async fn assert_alternating_callers_stamp_their_own_writes(addr: SocketAddr) {
+    let client = reqwest::Client::new();
+    let (claude, _) = open_session(&client, addr, "claude-ai").await;
+    let (chatgpt, _) = open_session(&client, addr, "chatgpt").await;
+
+    let first = add_over(&client, addr, &claude, "written by claude.ai").await;
+    let second = add_over(&client, addr, &chatgpt, "written by chatgpt").await;
+    let third = add_over(&client, addr, &claude, "claude.ai again").await;
+
+    assert_eq!(first["client"], "claude-ai/1.0", "{first}");
+    assert_eq!(second["client"], "chatgpt/1.0", "{second}");
+    assert_eq!(third["client"], "claude-ai/1.0", "{third}");
+}
+
+#[tokio::test]
+async fn each_remote_caller_stamps_its_own_writes() {
+    assert_alternating_callers_stamp_their_own_writes(spawn_server().await).await;
+}
+
+#[tokio::test]
+async fn each_remote_caller_stamps_its_own_writes_through_the_daemon() {
+    assert_alternating_callers_stamp_their_own_writes(spawn_daemon_backed_server().await).await;
+}
+
+#[tokio::test]
+async fn concurrent_remote_callers_through_the_daemon_never_swap_names() {
+    let addr = spawn_daemon_backed_server().await;
+    let client = reqwest::Client::new();
+    let (claude, _) = open_session(&client, addr, "claude-ai").await;
+    let (chatgpt, _) = open_session(&client, addr, "chatgpt").await;
+
+    for round in 0..8 {
+        let (from_claude, from_chatgpt) = (
+            format!("claude.ai round {round}"),
+            format!("chatgpt round {round}"),
+        );
+        let (a, b) = tokio::join!(
+            add_over(&client, addr, &claude, &from_claude),
+            add_over(&client, addr, &chatgpt, &from_chatgpt),
+        );
+        assert_eq!(a["client"], "claude-ai/1.0", "{a}");
+        assert_eq!(b["client"], "chatgpt/1.0", "{b}");
+    }
+}
+
+#[tokio::test]
+async fn a_nameless_remote_caller_through_the_daemon_gets_the_configured_client() {
+    // A caller with a blank name named nobody: its write falls to the
+    // configured client, never to a named caller that wrote just before it.
+    let addr = spawn_daemon_backed_server().await;
+    let client = reqwest::Client::new();
+    let (named, _) = open_session(&client, addr, "claude-ai").await;
+    let (nameless, _) = open_session(&client, addr, " ").await;
+
+    add_over(&client, addr, &named, "named first").await;
+    let memory = add_over(&client, addr, &nameless, "nameless after").await;
+
+    let configured =
+        std::env::var(remind_me_core::sync::CLIENT_ENV).unwrap_or_else(|_| "unknown".into());
+    assert_eq!(memory["client"], configured.as_str(), "{memory}");
 }

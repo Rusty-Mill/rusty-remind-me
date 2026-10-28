@@ -32,9 +32,34 @@
 //! This is not an optimisation to add later. Without it the queue is
 //! dominated by pairs whose only relationship is naming the same project, and
 //! the tool is unusable on exactly the vaults that need it most.
+//!
+//! # On save, for decisions
+//!
+//! The queue above only runs when asked, so a stale decision can sit beside
+//! its replacement indefinitely. [`check_on_save`] runs a narrow version of
+//! it when a decision is written. It compares only against standing
+//! decisions in the same project that are not sensitive (the findings ride
+//! an ordinary write's response, which must not surface sensitive text
+//! unasked), and only those sharing the claim or a non-hub entity. A shared
+//! entity alone is not enough: the content must also overlap by
+//! [`ON_SAVE_MIN_OVERLAP`], so two decisions that merely name the same
+//! project are not flagged. At most [`ON_SAVE_LIMIT`] come back with the
+//! write. It never blocks the write and never supersedes: the writer
+//! decides, and can do it in the same call with `remind_me_add`'s
+//! `supersedes`.
 
-use crate::models::{ContradictionCandidate, ContradictionCandidatesResult, ContradictionSide};
-use rusqlite::{params, Connection, Result};
+use crate::db::curation::Curation;
+use crate::db::memories::Memories;
+use crate::db::Result;
+use crate::db::Store;
+use crate::kinds::StructuredFields;
+use crate::models::{
+    ConflictReason, ContradictionCandidate, ContradictionCandidatesResult, ContradictionSide,
+    DecisionConflict, Memory, MemoryUpdateInput, SaveCheck,
+};
+use crate::vitality::{jaccard, tokenize_query};
+use std::cmp::Ordering;
+use std::collections::HashSet;
 
 /// Entities mentioned by more memories than this are excluded from the pairing
 /// join.
@@ -48,70 +73,40 @@ pub const MAX_ENTITY_FANOUT: i64 = 20;
 /// returning two whole documents per row.
 const SNIPPET_CHARS: usize = 500;
 
-/// Pairs of live, non-dialog memories sharing a low-fan-out entity, excluding
-/// anything the exact-triple mechanism already covers.
-///
-/// The triple exclusion is subtler than it looks. A pair where both sides
-/// share a normalised (subject, predicate) but differ in object *cannot* be
-/// observed here: the moment the second was written, the supersession check
-/// would have set `superseded_by` on the first, and this query only considers
-/// live rows. So excluding matching subject+predicate filters out same-object
-/// verbatim restatements — not a contradiction worth flagging — rather than
-/// defending against pairs that could otherwise slip through.
-///
-/// `lower`/`trim` approximates the entity-name normalisation rather than
-/// reproducing it exactly. This only narrows a set for human review, so an
-/// imprecise exclusion is a false negative — the caller recognises the pair
-/// and skips it — not the correctness bug it would be in the write-path check.
-fn pairs_sql() -> String {
-    format!(
-        "SELECT DISTINCT me1.memory_id AS id_a, me2.memory_id AS id_b
-           FROM memory_entities me1
-           JOIN memory_entities me2
-             ON me2.entity_id = me1.entity_id AND me2.memory_id > me1.memory_id
-           JOIN memories m1 ON m1.id = me1.memory_id
-           JOIN memories m2 ON m2.id = me2.memory_id
-           JOIN (
-               SELECT entity_id, COUNT(*) AS mentions
-                 FROM memory_entities
-                GROUP BY entity_id
-           ) fanout ON fanout.entity_id = me1.entity_id
-          WHERE m1.superseded_by IS NULL AND m1.deleted_at IS NULL
-            AND m2.superseded_by IS NULL AND m2.deleted_at IS NULL
-            AND m1.category != 'dialog' AND m2.category != 'dialog'
-            AND fanout.mentions <= {fanout}
-            AND NOT (
-                m1.subject IS NOT NULL AND m1.predicate IS NOT NULL
-                AND m2.subject IS NOT NULL AND m2.predicate IS NOT NULL
-                AND lower(trim(m1.subject)) = lower(trim(m2.subject))
-                AND lower(trim(m1.predicate)) = lower(trim(m2.predicate))
-            )",
-        fanout = MAX_ENTITY_FANOUT
-    )
+fn side(store: &Store<'_>, memory_id: &str) -> Result<ContradictionSide> {
+    Curation::new(store).contradiction_side(memory_id, SNIPPET_CHARS)
 }
 
-fn side(conn: &Connection, memory_id: &str) -> Result<ContradictionSide> {
-    conn.query_row(
-        &format!(
-            "SELECT id, substr(content, 1, {}) AS content_snippet, category,
-                    memory_type, subject, predicate, object, created_at
-               FROM memories WHERE id = ?",
-            SNIPPET_CHARS
-        ),
-        params![memory_id],
-        |r| {
-            Ok(ContradictionSide {
-                id: r.get(0)?,
-                content_snippet: r.get(1)?,
-                category: r.get(2)?,
-                memory_type: r.get(3)?,
-                subject: r.get(4)?,
-                predicate: r.get(5)?,
-                object: r.get(6)?,
-                created_at: r.get(7)?,
-            })
-        },
-    )
+/// Whether two memories state the same subject and predicate with different
+/// objects (case and surrounding space ignored): a conflict worth ranking,
+/// not merely two memories on one topic.
+fn conflicting_triples(a: &Memory, b: &Memory) -> bool {
+    let norm = |s: &Option<String>| s.as_deref().map(|s| s.trim().to_lowercase());
+    let (sa, sb) = (norm(&a.subject), norm(&b.subject));
+    let (pa, pb) = (norm(&a.predicate), norm(&b.predicate));
+    let (oa, ob) = (norm(&a.object), norm(&b.object));
+    sa.is_some() && sa == sb && pa.is_some() && pa == pb && oa.is_some() && ob.is_some() && oa != ob
+}
+
+/// Which of two conflicting memories to keep: higher confidence, then newer
+/// `verified_at`, then newer `updated_at`. `None` for a pair that is not a
+/// triple conflict, or ties on all three. RFC 3339 strings are compared as
+/// text, as everywhere else in this crate.
+pub fn preferred<'a>(a: &'a Memory, b: &'a Memory) -> Option<&'a Memory> {
+    if !conflicting_triples(a, b) {
+        return None;
+    }
+    let order = a
+        .confidence
+        .partial_cmp(&b.confidence)
+        .unwrap_or(Ordering::Equal)
+        .then_with(|| a.verified_at.cmp(&b.verified_at))
+        .then_with(|| a.updated_at.cmp(&b.updated_at));
+    match order {
+        Ordering::Greater => Some(a),
+        Ordering::Less => Some(b),
+        Ordering::Equal => None,
+    }
 }
 
 /// A batch of candidate pairs, plus the full backlog size.
@@ -119,12 +114,8 @@ fn side(conn: &Connection, memory_id: &str) -> Result<ContradictionSide> {
 ///
 /// Reuses [`pairs_sql`] rather than approximating with a second query, so the
 /// maintenance nudge cannot claim a backlog that draining it does not find.
-pub fn candidate_count(conn: &Connection) -> Result<i64> {
-    conn.query_row(
-        &format!("SELECT COUNT(*) FROM ({}) p", pairs_sql()),
-        [],
-        |r| r.get(0),
-    )
+pub fn candidate_count(store: &Store<'_>) -> Result<i64> {
+    Curation::new(store).count_contradiction_pairs(MAX_ENTITY_FANOUT)
 }
 
 /// The entity names both memories mention, in name order.
@@ -136,18 +127,8 @@ pub fn candidate_count(conn: &Connection) -> Result<i64> {
 /// Ordered by name so two calls return the same list in the same order — the
 /// pair itself is stable across pages, and a field that reshuffled between
 /// identical requests would make responses gratuitously un-diffable.
-fn shared_entities(conn: &Connection, id_a: &str, id_b: &str) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT e.name FROM memory_entities me1
-           JOIN memory_entities me2 ON me2.entity_id = me1.entity_id
-           JOIN entities e ON e.id = me1.entity_id
-          WHERE me1.memory_id = ? AND me2.memory_id = ?
-          ORDER BY e.name",
-    )?;
-    let names = stmt
-        .query_map(params![id_a, id_b], |r| r.get::<_, String>(0))?
-        .collect::<Result<Vec<_>>>()?;
-    Ok(names)
+fn shared_entities(store: &Store<'_>, id_a: &str, id_b: &str) -> Result<Vec<String>> {
+    Curation::new(store).shared_entity_names(id_a, id_b)
 }
 
 /// A page of candidate pairs, optionally starting after `cursor`.
@@ -170,47 +151,18 @@ fn shared_entities(conn: &Connection, id_a: &str, id_b: &str) -> Result<Vec<Stri
 /// correctly judged *not* to conflict, so reviewing them changes nothing and
 /// they would be re-served forever — the very bug being fixed.
 pub fn candidates(
-    conn: &Connection,
+    store: &Store<'_>,
     limit: usize,
     cursor: Option<(&str, &str)>,
 ) -> Result<ContradictionCandidatesResult> {
-    let pairs = pairs_sql();
+    let curation = Curation::new(store);
 
     // The whole queue, deliberately not narrowed by the cursor: a caller
     // watching this number shrink as it pages would be watching the backlog
     // it has left to review, which is not what "how big is the backlog" means
     // to the maintenance nudge that also reads it.
-    let total: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM ({}) p", pairs), [], |r| {
-        r.get(0)
-    })?;
-
-    let cursor_clause = if cursor.is_some() {
-        "WHERE (id_a > ?1 OR (id_a = ?1 AND id_b > ?2))"
-    } else {
-        ""
-    };
-    let sql = format!(
-        "SELECT id_a, id_b FROM ({}) {} ORDER BY id_a, id_b LIMIT ?3",
-        pairs, cursor_clause
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let ids: Vec<(String, String)> = match cursor {
-        Some((after_a, after_b)) => stmt
-            .query_map(params![after_a, after_b, limit as i64], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })?
-            .collect::<Result<Vec<_>>>()?,
-        // Bind the unused cursor slots to NULL rather than building a second
-        // statement: the clause referencing them is not in the SQL at all, so
-        // the values are never evaluated.
-        None => stmt
-            .query_map(
-                params![Option::<&str>::None, Option::<&str>::None, limit as i64],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )?
-            .collect::<Result<Vec<_>>>()?,
-    };
-    drop(stmt);
+    let total = curation.count_contradiction_pairs(MAX_ENTITY_FANOUT)?;
+    let ids = curation.contradiction_pairs(MAX_ENTITY_FANOUT, cursor, limit)?;
 
     // Null on a short page, which is the queue being exhausted. A full page
     // whose last row happens to be the final one costs the caller one extra
@@ -223,11 +175,23 @@ pub fn candidates(
     };
 
     let mut candidates = Vec::with_capacity(ids.len());
+    let memories = Memories::new(store);
     for (id_a, id_b) in ids {
+        // Only the sides swap; the cursor above came from `ids` and is
+        // unaffected.
+        let keep = match (memories.get_live(&id_a)?, memories.get_live(&id_b)?) {
+            (Some(a), Some(b)) => preferred(&a, &b).map(|m| m.id.clone()),
+            _ => None,
+        };
+        let (first, second) = match &keep {
+            Some(k) if *k == id_b => (&id_b, &id_a),
+            _ => (&id_a, &id_b),
+        };
         candidates.push(ContradictionCandidate {
-            shared_entities: shared_entities(conn, &id_a, &id_b)?,
-            memory_a: side(conn, &id_a)?,
-            memory_b: side(conn, &id_b)?,
+            shared_entities: shared_entities(store, &id_a, &id_b)?,
+            memory_a: side(store, first)?,
+            memory_b: side(store, second)?,
+            recommended_keep: keep,
         });
     }
 
@@ -238,4 +202,122 @@ pub fn candidates(
         next_after_a,
         next_after_b,
     })
+}
+
+/// At most this many conflicts come back with a saved decision.
+pub const ON_SAVE_LIMIT: usize = 5;
+
+/// The word overlap (Jaccard) a decision sharing only an entity needs to be
+/// returned: the threshold feedback matching already uses for "the same
+/// topic" ([`crate::vitality::FEEDBACK_SIMILARITY_THRESHOLD`]).
+pub const ON_SAVE_MIN_OVERLAP: f64 = crate::vitality::FEEDBACK_SIMILARITY_THRESHOLD;
+
+/// Whether two memories state the same subject and predicate with the same
+/// object: a restatement, which is no conflict.
+fn same_triple(a: &Memory, b: &Memory) -> bool {
+    let norm = |s: &Option<String>| s.as_deref().map(|s| s.trim().to_lowercase());
+    norm(&a.subject).is_some()
+        && norm(&a.subject) == norm(&b.subject)
+        && norm(&a.predicate) == norm(&b.predicate)
+        && norm(&a.object) == norm(&b.object)
+}
+
+fn token_set(tokens: &[String]) -> HashSet<&str> {
+    tokens.iter().map(String::as_str).collect()
+}
+
+/// Word overlap (Jaccard) of two texts, tokenized as search queries are.
+fn overlap(a: &str, b: &str) -> f64 {
+    let (ta, tb) = (tokenize_query(a), tokenize_query(b));
+    jaccard(&token_set(&ta), &token_set(&tb))
+}
+
+/// How `other` conflicts with `saved`, if it does.
+fn conflict(saved: &Memory, other: &Memory, shared: &[String]) -> Option<(f64, ConflictReason)> {
+    if conflicting_triples(saved, other) {
+        return Some((1.0, ConflictReason::SameClaim));
+    }
+    if shared.is_empty() || same_triple(saved, other) {
+        return None;
+    }
+    let score = overlap(&saved.content, &other.content);
+    (score >= ON_SAVE_MIN_OVERLAP).then_some((score, ConflictReason::SharedEntity))
+}
+
+/// The standing decisions that `memory_id`, if it is a live decision, may
+/// contradict: highest score first, then newest, at most [`ON_SAVE_LIMIT`].
+/// Empty for any other memory.
+pub fn decision_conflicts(store: &Store<'_>, memory_id: &str) -> Result<Vec<DecisionConflict>> {
+    let memories = Memories::new(store);
+    let Some(saved) = memories.get_live(memory_id)? else {
+        return Ok(Vec::new());
+    };
+    if saved.memory_type.as_deref() != Some("decision") || saved.superseded_by.is_some() {
+        return Ok(Vec::new());
+    }
+    let curation = Curation::new(store);
+    let mut found = Vec::new();
+    for (id, shared) in curation.decision_neighbours(memory_id, MAX_ENTITY_FANOUT)? {
+        let Some(other) = memories.get_live(&id)? else {
+            continue;
+        };
+        if let Some((score, reason)) = conflict(&saved, &other, &shared) {
+            found.push((other.created_at.clone(), score, reason, shared, id));
+        }
+    }
+    found.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| b.0.cmp(&a.0))
+    });
+    found
+        .into_iter()
+        .take(ON_SAVE_LIMIT)
+        .map(|(_, score, reason, shared_entities, id)| {
+            Ok(DecisionConflict {
+                memory: side(store, &id)?,
+                score,
+                reason,
+                shared_entities,
+            })
+        })
+        .collect()
+}
+
+/// A check's outcome as a write reports it. A failure is logged with the
+/// memory it concerns and carried in the result, never dropped: the write
+/// it followed has already committed and stands.
+pub fn save_check(memory_id: &str, outcome: Result<Vec<DecisionConflict>>) -> SaveCheck {
+    match outcome {
+        Ok(contradiction_candidates) => SaveCheck {
+            contradiction_candidates,
+            contradiction_check_error: None,
+        },
+        Err(e) => {
+            eprintln!("rusty-remind-me: contradiction check on save of {memory_id} failed: {e}");
+            SaveCheck {
+                contradiction_candidates: Vec::new(),
+                contradiction_check_error: Some(e.to_string()),
+            }
+        }
+    }
+}
+
+/// Run the contradiction check for a just-written memory. Never fails: see
+/// [`save_check`].
+pub fn check_on_save(store: &Store<'_>, memory_id: &str) -> SaveCheck {
+    save_check(memory_id, decision_conflicts(store, memory_id))
+}
+
+/// [`check_on_save`] after an update, run only when the edit could change the
+/// answer: new content or a new type. A tag or metadata edit reports nothing.
+pub fn check_on_update(
+    store: &Store<'_>,
+    input: &MemoryUpdateInput,
+    fields: &StructuredFields,
+) -> SaveCheck {
+    if input.content.is_none() && fields.memory_type.is_none() {
+        return SaveCheck::default();
+    }
+    check_on_save(store, &input.memory_id)
 }

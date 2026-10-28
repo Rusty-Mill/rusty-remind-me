@@ -15,6 +15,14 @@
 use crate::canon::{canon_ts, coerce_json_field};
 use serde_json::Value;
 
+/// The `content` an emptied tombstone carries (ADR-0024).
+///
+/// Not `""`: a node rejects a pulled record whose `content` is empty, and its
+/// pull cursor stops at a record that did not apply, so an empty tombstone
+/// would stall every node on it. Nodes hold the same value; it is part of
+/// the wire format.
+pub const TOMBSTONE_CONTENT: &str = "(deleted)";
+
 /// A record that failed validation. Counted as `failed` in a push response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordError(pub String);
@@ -62,6 +70,22 @@ pub struct MemoryRecord {
     /// A scheduled reminder time, if the memory carries one. Missing for the
     /// same reason `sensitive` was.
     pub remind_at: Option<String>,
+    // Schema v32 (the node's `memories` columns). Each defaults when a
+    // sender predating v32 leaves it out, so the hub keeps a column list no
+    // node pushing to it is behind on.
+    pub project: Option<String>,
+    pub session_id: Option<String>,
+    pub git_remote: Option<String>,
+    pub git_branch: Option<String>,
+    pub git_sha: Option<String>,
+    pub cwd: Option<String>,
+    pub valid_from: Option<String>,
+    pub valid_until: Option<String>,
+    pub confidence: f64,
+    pub verified_at: Option<String>,
+    pub outcome: Option<String>,
+    pub written_by: String,
+    pub capture_method: String,
 }
 
 /// An entity record. `aliases` is always a list of non-empty strings.
@@ -271,6 +295,19 @@ fn parse_memory(rec: &Value) -> Result<MemoryRecord, RecordError> {
         deleted_at,
         sensitive: as_bool(rec, "sensitive", false),
         remind_at: as_opt_str(rec, "remind_at"),
+        project: as_opt_str(rec, "project"),
+        session_id: as_opt_str(rec, "session_id"),
+        git_remote: as_opt_str(rec, "git_remote"),
+        git_branch: as_opt_str(rec, "git_branch"),
+        git_sha: as_opt_str(rec, "git_sha"),
+        cwd: as_opt_str(rec, "cwd"),
+        valid_from: as_opt_str(rec, "valid_from"),
+        valid_until: as_opt_str(rec, "valid_until"),
+        confidence: as_f64(rec, "confidence", 1.0),
+        verified_at: as_opt_str(rec, "verified_at"),
+        outcome: as_opt_str(rec, "outcome"),
+        written_by: or_default(rec, "written_by", "unknown"),
+        capture_method: or_default(rec, "capture_method", "manual"),
     })
 }
 

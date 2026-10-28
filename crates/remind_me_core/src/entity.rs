@@ -1,7 +1,10 @@
+use crate::db::derived::Origin;
+use crate::db::entities::{Entities, RelationRow};
+use crate::db::memories::Memories;
+use crate::db::Result;
+use crate::db::Store;
 use crate::models::EntityInput;
 use chrono::Utc;
-use rusqlite::types::Value;
-use rusqlite::{params, params_from_iter, Connection, Result};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,7 +58,7 @@ pub fn entity_id(name: &str) -> String {
 ///
 /// `updated_at` moves only when something actually changed, so a no-op mention
 /// does not churn the row.
-pub fn upsert_entity(conn: &Connection, input: &EntityInput) -> Result<Entity> {
+pub fn upsert_entity(store: &Store<'_>, input: &EntityInput) -> Result<Entity> {
     let now = Utc::now().to_rfc3339();
     let name = input.name.trim();
     let id = entity_id(name);
@@ -73,21 +76,18 @@ pub fn upsert_entity(conn: &Connection, input: &EntityInput) -> Result<Entity> {
     // are one entity. Matching on the `name` column instead is case-sensitive,
     // so a casing variant misses the lookup, tries to insert, and collides on
     // the `entities.id` unique constraint.
-    match get_entity_by_id(conn, &id)? {
+    let entities = Entities::new(store);
+    match entities.get(&id)? {
         None => {
-            conn.execute(
-                "INSERT INTO entities (id, name, kind, aliases, created_at, updated_at, node_id)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
-                params![
-                    id,
-                    name,
-                    input.kind,
-                    serde_json::to_string(&clean_aliases).unwrap_or_else(|_| "[]".to_string()),
-                    now,
-                    now,
-                    crate::sync::configured_node_id(),
-                ],
-            )?;
+            let entity = Entity {
+                id: id.clone(),
+                name: name.to_string(),
+                kind: input.kind.clone(),
+                aliases: clean_aliases,
+                created_at: now.clone(),
+                updated_at: now,
+            };
+            entities.insert(&entity, Some(&crate::sync::configured_node_id()))?;
         }
         Some(existing) => {
             let merged = dedup_preserving_order(
@@ -101,31 +101,17 @@ pub fn upsert_entity(conn: &Connection, input: &EntityInput) -> Result<Entity> {
             let new_kind = existing.kind.clone().or_else(|| input.kind.clone());
 
             if merged != existing.aliases || new_kind != existing.kind {
-                conn.execute(
-                    "UPDATE entities SET kind = ?, aliases = ?, updated_at = ? WHERE id = ?",
-                    params![
-                        new_kind,
-                        serde_json::to_string(&merged).unwrap_or_else(|_| "[]".to_string()),
-                        now,
-                        id
-                    ],
-                )?;
+                entities.set_kind_and_aliases(&id, new_kind.as_deref(), &merged, &now)?;
             }
         }
     }
 
-    get_entity_by_id(conn, &id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
+    entities.get(&id)?.ok_or(crate::db::StoreError::NotFound)
 }
 
 /// Fetch an entity by its deterministic id.
-pub fn get_entity_by_id(conn: &Connection, id: &str) -> Result<Option<Entity>> {
-    let mut stmt = conn.prepare(&format!("{} WHERE id = ?", ENTITY_SELECT))?;
-    let mut rows = stmt.query_map(params![id], parse_entity_row)?;
-    if let Some(row) = rows.next() {
-        row.map(Some)
-    } else {
-        Ok(None)
-    }
+pub fn get_entity_by_id(store: &Store<'_>, id: &str) -> Result<Option<Entity>> {
+    Entities::new(store).get(id)
 }
 
 pub(crate) fn dedup_preserving_order<I: IntoIterator<Item = String>>(items: I) -> Vec<String> {
@@ -140,13 +126,13 @@ pub(crate) fn dedup_preserving_order<I: IntoIterator<Item = String>>(items: I) -
 ///
 /// Insert-or-ignore: mention links are immutable, and re-annotating with the
 /// same entity is a no-op rather than an error.
-pub fn link_memory_entity(conn: &Connection, memory_id: &str, entity_id: &str) -> Result<bool> {
-    let inserted = conn.execute(
-        "INSERT OR IGNORE INTO memory_entities (memory_id, entity_id, created_at)
-         VALUES (?, ?, ?)",
-        params![memory_id, entity_id, Utc::now().to_rfc3339()],
-    )?;
-    Ok(inserted > 0)
+pub fn link_memory_entity(store: &Store<'_>, memory_id: &str, entity_id: &str) -> Result<bool> {
+    Entities::new(store).link(
+        memory_id,
+        entity_id,
+        &Utc::now().to_rfc3339(),
+        Origin::Local,
+    )
 }
 
 /// Upsert each mentioned entity and link it to `memory_id`.
@@ -155,7 +141,7 @@ pub fn link_memory_entity(conn: &Connection, memory_id: &str, entity_id: &str) -
 /// memory are counted as zero. Shared by `add_memory` and `remind_me_annotate`
 /// so both apply mentions identically.
 pub fn apply_entity_mentions(
-    conn: &Connection,
+    store: &Store<'_>,
     memory_id: &str,
     entities: &[EntityInput],
 ) -> Result<usize> {
@@ -164,27 +150,12 @@ pub fn apply_entity_mentions(
         if input.name.trim().is_empty() {
             continue;
         }
-        let entity = upsert_entity(conn, input)?;
-        if link_memory_entity(conn, memory_id, &entity.id)? {
+        let entity = upsert_entity(store, input)?;
+        if link_memory_entity(store, memory_id, &entity.id)? {
             linked += 1;
         }
     }
     Ok(linked)
-}
-
-const ENTITY_SELECT: &str = "SELECT id, name, kind, aliases, created_at, updated_at FROM entities";
-
-fn parse_entity_row(row: &rusqlite::Row) -> Result<Entity> {
-    let aliases_json: String = row.get("aliases")?;
-    let aliases: Vec<String> = serde_json::from_str(&aliases_json).unwrap_or_default();
-    Ok(Entity {
-        id: row.get("id")?,
-        name: row.get("name")?,
-        kind: row.get("kind")?,
-        aliases,
-        created_at: row.get("created_at")?,
-        updated_at: row.get("updated_at")?,
-    })
 }
 
 /// Fetch an entity by name, case- and whitespace-insensitively.
@@ -192,8 +163,8 @@ fn parse_entity_row(row: &rusqlite::Row) -> Result<Entity> {
 /// Resolves through the derived id rather than matching the `name` column, so
 /// `"tasmania"` finds the entity stored as `"Tasmania"` — the same identity the
 /// id encodes.
-pub fn get_entity_by_name(conn: &Connection, name: &str) -> Result<Option<Entity>> {
-    get_entity_by_id(conn, &entity_id(name))
+pub fn get_entity_by_name(store: &Store<'_>, name: &str) -> Result<Option<Entity>> {
+    get_entity_by_id(store, &entity_id(name))
 }
 
 /// Resolve a name *or alias* to its canonical entity row.
@@ -209,8 +180,8 @@ pub fn get_entity_by_name(conn: &Connection, name: &str) -> Result<Option<Entity
 /// A canonical-name match anywhere in the scan beats an alias match found
 /// earlier, because an alias is a nickname and the canonical name is the thing
 /// itself. That is why the alias hit is held rather than returned immediately.
-pub fn resolve_entity(conn: &Connection, query: &str) -> Result<Option<Entity>> {
-    if let Some(entity) = get_entity_by_id(conn, &entity_id(query))? {
+pub fn resolve_entity(store: &Store<'_>, query: &str) -> Result<Option<Entity>> {
+    if let Some(entity) = get_entity_by_id(store, &entity_id(query))? {
         return Ok(Some(entity));
     }
 
@@ -219,11 +190,8 @@ pub fn resolve_entity(conn: &Connection, query: &str) -> Result<Option<Entity>> 
         return Ok(None);
     }
 
-    let mut stmt = conn.prepare(ENTITY_SELECT)?;
-    let rows = stmt.query_map([], parse_entity_row)?;
     let mut alias_hit: Option<Entity> = None;
-    for row in rows {
-        let entity = row?;
+    for entity in Entities::new(store).all()? {
         if normalize_entity_name(&entity.name) == normalized {
             return Ok(Some(entity));
         }
@@ -290,66 +258,19 @@ pub struct EntityProfile {
 /// Returns `None` when the entity is unknown, so a caller can answer with 404
 /// rather than an empty-but-200 profile.
 pub fn entity_profile(
-    conn: &Connection,
+    store: &Store<'_>,
     query: &str,
     limit: usize,
 ) -> Result<Option<EntityProfile>> {
-    let Some(entity) = resolve_entity(conn, query)? else {
+    let Some(entity) = resolve_entity(store, query)? else {
         return Ok(None);
     };
 
     let canonical = normalize_entity_name(&entity.name);
-    let mut stmt = conn.prepare(
-        "SELECT id, content, subject, predicate, object, category, created_at
-           FROM memories
-          WHERE superseded_by IS NULL AND deleted_at IS NULL
-            AND (lower(subject) = ? OR lower(object) = ?)
-          ORDER BY created_at DESC
-          LIMIT ?",
-    )?;
-    let facts = stmt
-        .query_map(params![canonical, canonical, limit as i64], |row| {
-            Ok(EntityFact {
-                id: row.get("id")?,
-                content: row.get("content")?,
-                subject: row.get("subject")?,
-                predicate: row.get("predicate")?,
-                object: row.get("object")?,
-                category: row.get("category")?,
-                created_at: row.get("created_at")?,
-            })
-        })?
-        .collect::<Result<Vec<_>>>()?;
-    drop(stmt);
-
-    let mut stmt = conn.prepare(
-        "SELECT m.id, substr(m.content, 1, 300) AS content_snippet, m.category, m.created_at
-           FROM memory_entities me
-           JOIN memories m ON m.id = me.memory_id
-          WHERE me.entity_id = ? AND m.superseded_by IS NULL AND m.deleted_at IS NULL
-          ORDER BY m.created_at DESC
-          LIMIT ?",
-    )?;
-    let memories = stmt
-        .query_map(params![entity.id, limit as i64], |row| {
-            Ok(EntityLinkedMemory {
-                id: row.get("id")?,
-                content_snippet: row.get("content_snippet")?,
-                category: row.get("category")?,
-                created_at: row.get("created_at")?,
-            })
-        })?
-        .collect::<Result<Vec<_>>>()?;
-    drop(stmt);
-
-    let total_linked_memories: usize = conn.query_row(
-        "SELECT count(*)
-           FROM memory_entities me
-           JOIN memories m ON m.id = me.memory_id
-          WHERE me.entity_id = ? AND m.superseded_by IS NULL AND m.deleted_at IS NULL",
-        params![entity.id],
-        |row| row.get::<_, i64>(0),
-    )? as usize;
+    let entities = Entities::new(store);
+    let facts = entities.facts_naming(&canonical, limit)?;
+    let memories = entities.linked_memories(&entity.id, limit)?;
+    let total_linked_memories = entities.linked_memory_count(&entity.id)?;
 
     Ok(Some(EntityProfile {
         entity,
@@ -387,39 +308,18 @@ pub struct EntityListResult {
 /// There is no MCP-tool equivalent — `remind_me_entity` is lookup-by-name, and
 /// browsing everything by list is specifically a dashboard need — so this is
 /// used only by `GET /api/entities`.
-pub fn list_entities(conn: &Connection, limit: usize, offset: usize) -> Result<EntityListResult> {
-    let total: i64 = conn.query_row("SELECT count(*) FROM entities", [], |row| row.get(0))?;
-
-    let mut stmt = conn.prepare(
-        "SELECT e.id, e.name, e.kind, e.aliases, e.updated_at,
-                count(me.memory_id) AS mention_count
-           FROM entities e
-      LEFT JOIN memory_entities me ON me.entity_id = e.id
-       GROUP BY e.id
-       ORDER BY mention_count DESC, e.name ASC
-          LIMIT ? OFFSET ?",
-    )?;
-    let entities = stmt
-        .query_map(params![limit as i64, offset as i64], |row| {
-            let aliases_json: String = row.get("aliases")?;
-            Ok(EntityListItem {
-                id: row.get("id")?,
-                name: row.get("name")?,
-                kind: row.get("kind")?,
-                aliases: serde_json::from_str(&aliases_json).unwrap_or_default(),
-                updated_at: row.get("updated_at")?,
-                mention_count: row.get("mention_count")?,
-            })
-        })?
-        .collect::<Result<Vec<_>>>()?;
+pub fn list_entities(store: &Store<'_>, limit: usize, offset: usize) -> Result<EntityListResult> {
+    let repo = Entities::new(store);
+    let total = repo.count()?;
+    let entities = repo.page_by_mentions(limit, offset)?;
 
     let count = entities.len();
     Ok(EntityListResult {
-        total: total.max(0) as usize,
+        total,
         count,
         offset,
         limit,
-        has_more: total.max(0) as usize > offset + count,
+        has_more: total > offset + count,
         entities,
     })
 }
@@ -465,7 +365,7 @@ pub struct RelationEdge {
 /// returned twice within a single hop when both its endpoints sit in the same
 /// frontier — not to bound the walk.
 pub fn traverse_entities(
-    conn: &Connection,
+    store: &Store<'_>,
     seed_entity_ids: &[String],
     hops: u32,
     relation: Option<&str>,
@@ -482,54 +382,7 @@ pub fn traverse_entities(
             break;
         }
 
-        let placeholders = vec!["?"; frontier.len()].join(",");
-        let relation_clause = if relation.is_some() {
-            " AND r.relation = ?"
-        } else {
-            ""
-        };
-        let sql = format!(
-            "SELECT r.id, r.subject_entity_id, r.relation, r.object_entity_id,
-                    s.name AS subject_name, s.kind AS subject_kind,
-                    o.name AS object_name, o.kind AS object_kind
-               FROM entity_relations r
-               JOIN entities s ON s.id = r.subject_entity_id
-               JOIN entities o ON o.id = r.object_entity_id
-              WHERE (r.subject_entity_id IN ({p}) OR r.object_entity_id IN ({p})){rel}
-              ORDER BY r.created_at",
-            p = placeholders,
-            rel = relation_clause
-        );
-
-        // The frontier is bound twice — once per side of the OR.
-        let mut bindings: Vec<Value> = frontier
-            .iter()
-            .chain(frontier.iter())
-            .map(|id| Value::Text(id.clone()))
-            .collect();
-        if let Some(label) = relation {
-            bindings.push(Value::Text(label.to_string()));
-        }
-
-        let mut stmt = conn.prepare(&sql)?;
-        let found: Vec<(String, RelationEdge)> = stmt
-            .query_map(params_from_iter(bindings), |row| {
-                Ok((
-                    row.get::<_, String>("id")?,
-                    RelationEdge {
-                        subject_entity_id: row.get("subject_entity_id")?,
-                        subject_name: row.get("subject_name")?,
-                        subject_kind: row.get("subject_kind")?,
-                        relation: row.get("relation")?,
-                        object_entity_id: row.get("object_entity_id")?,
-                        object_name: row.get("object_name")?,
-                        object_kind: row.get("object_kind")?,
-                        hop,
-                    },
-                ))
-            })?
-            .collect::<Result<_>>()?;
-        drop(stmt);
+        let found = Entities::new(store).relations_touching(&frontier, relation, hop)?;
 
         let mut next_frontier = Vec::new();
         for (edge_id, edge) in found {
@@ -571,12 +424,9 @@ pub fn traverse_entities(
 /// whitespace used to be distinct entities. Those are merged rather than left
 /// to collide on the primary key: aliases union, the earliest `created_at`
 /// wins, and a `kind` already set is kept.
-pub fn renormalize_entity_ids(conn: &Connection) -> Result<usize> {
-    let mut stmt = conn.prepare(&format!("{} ORDER BY created_at, id", ENTITY_SELECT))?;
-    let existing: Vec<Entity> = stmt
-        .query_map([], parse_entity_row)?
-        .collect::<Result<_>>()?;
-    drop(stmt);
+pub fn renormalize_entity_ids(store: &Store<'_>) -> Result<usize> {
+    let entities = Entities::new(store);
+    let existing = entities.all_oldest_first()?;
 
     let mut rewritten = 0;
     for entity in existing {
@@ -585,52 +435,19 @@ pub fn renormalize_entity_ids(conn: &Connection) -> Result<usize> {
             continue;
         }
 
-        match get_entity_by_id(conn, &want)? {
-            None => {
-                conn.execute(
-                    "UPDATE entities SET id = ? WHERE id = ?",
-                    params![want, entity.id],
-                )?;
-            }
+        match entities.get(&want)? {
+            None => entities.rename(&entity.id, &want)?,
             Some(target) => {
                 let merged = dedup_preserving_order(
                     target.aliases.iter().cloned().chain(entity.aliases.clone()),
                 );
                 let kind = target.kind.clone().or_else(|| entity.kind.clone());
                 let created_at = target.created_at.min(entity.created_at.clone());
-                conn.execute(
-                    "UPDATE entities SET kind = ?, aliases = ?, created_at = ? WHERE id = ?",
-                    params![
-                        kind,
-                        serde_json::to_string(&merged).unwrap_or_else(|_| "[]".to_string()),
-                        created_at,
-                        want
-                    ],
-                )?;
-                conn.execute("DELETE FROM entities WHERE id = ?", params![entity.id])?;
+                entities.set_merged(&want, kind.as_deref(), &merged, &created_at)?;
+                entities.delete(&entity.id)?;
             }
         }
-
-        // `memory_entities` is keyed `(memory_id, entity_id)`, so repointing can
-        // collide with a link the surviving entity already has. Ignore those,
-        // then drop whatever the ignore left behind.
-        conn.execute(
-            "UPDATE OR IGNORE memory_entities SET entity_id = ? WHERE entity_id = ?",
-            params![want, entity.id],
-        )?;
-        conn.execute(
-            "DELETE FROM memory_entities WHERE entity_id = ?",
-            params![entity.id],
-        )?;
-        // Relations are keyed on their own id, so these cannot collide.
-        conn.execute(
-            "UPDATE entity_relations SET subject_entity_id = ? WHERE subject_entity_id = ?",
-            params![want, entity.id],
-        )?;
-        conn.execute(
-            "UPDATE entity_relations SET object_entity_id = ? WHERE object_entity_id = ?",
-            params![want, entity.id],
-        )?;
+        entities.repoint(&entity.id, &want)?;
 
         rewritten += 1;
     }
@@ -676,10 +493,10 @@ pub struct EntityTraverseResult {
 /// An unresolvable start node is `found: false` with a message, not an error —
 /// "no such entity" is an ordinary answer to this question.
 pub fn traverse_from_name(
-    conn: &Connection,
+    store: &Store<'_>,
     input: &crate::models::EntityTraverseInput,
 ) -> Result<EntityTraverseResult> {
-    let seed = match resolve_entity(conn, &input.name)? {
+    let seed = match resolve_entity(store, &input.name)? {
         Some(entity) => entity,
         None => {
             return Ok(EntityTraverseResult {
@@ -697,7 +514,7 @@ pub fn traverse_from_name(
     let hops = input.hops.clamp(TRAVERSE_HOPS_MIN, TRAVERSE_HOPS_MAX);
     let cap = input.cap.clamp(1, 100);
     let edges = traverse_entities(
-        conn,
+        store,
         std::slice::from_ref(&seed.id),
         hops,
         input.relation.as_deref(),
@@ -770,7 +587,7 @@ pub fn entity_relation_id(
 /// rather than an error. The stored label has its whitespace collapsed, matching
 /// the id's normalisation.
 pub fn upsert_entity_relation(
-    conn: &Connection,
+    store: &Store<'_>,
     subject_entity_id: &str,
     relation: &str,
     object_entity_id: &str,
@@ -778,21 +595,18 @@ pub fn upsert_entity_relation(
     let now = Utc::now().to_rfc3339();
     let id = entity_relation_id(subject_entity_id, relation, object_entity_id);
     let label = relation.split_whitespace().collect::<Vec<_>>().join(" ");
-    let inserted = conn.execute(
-        "INSERT OR IGNORE INTO entity_relations
-             (id, subject_entity_id, relation, object_entity_id, created_at, updated_at, node_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
-        params![
-            id,
+    Entities::new(store).insert_relation_or_ignore(
+        &RelationRow {
+            id: &id,
             subject_entity_id,
-            label,
+            relation: &label,
             object_entity_id,
-            now,
-            now,
-            crate::sync::configured_node_id(),
-        ],
-    )?;
-    Ok(inserted > 0)
+            created_at: &now,
+            updated_at: &now,
+            node_id: Some(&crate::sync::configured_node_id()),
+        },
+        Origin::Local,
+    )
 }
 
 /// Best-effort: record a relation edge when an SPO triple names two *known*
@@ -807,7 +621,7 @@ pub fn upsert_entity_relation(
 ///
 /// Returns `true` when both sides resolved, whether or not the edge was new.
 pub fn maybe_link_entity_relation(
-    conn: &Connection,
+    store: &Store<'_>,
     subject: Option<&str>,
     predicate: Option<&str>,
     object: Option<&str>,
@@ -820,13 +634,13 @@ pub fn maybe_link_entity_relation(
     }
 
     let (Some(subject_entity), Some(object_entity)) = (
-        resolve_entity(conn, subject)?,
-        resolve_entity(conn, object)?,
+        resolve_entity(store, subject)?,
+        resolve_entity(store, object)?,
     ) else {
         return Ok(false);
     };
 
-    upsert_entity_relation(conn, &subject_entity.id, predicate, &object_entity.id)?;
+    upsert_entity_relation(store, &subject_entity.id, predicate, &object_entity.id)?;
     Ok(true)
 }
 
@@ -857,7 +671,7 @@ pub fn maybe_link_entity_relation(
 /// candidates; the exact comparison happens here, against the same
 /// normalisation the entity graph uses for identity.
 pub fn supersede_contradicting_facts(
-    conn: &Connection,
+    store: &Store<'_>,
     memory_id: &str,
     subject: Option<&str>,
     predicate: Option<&str>,
@@ -874,35 +688,22 @@ pub fn supersede_contradicting_facts(
     let want_predicate = normalize_entity_name(predicate);
     let want_object = normalize_entity_name(object);
 
-    let mut stmt = conn.prepare(
-        "SELECT id, subject, predicate, object FROM memories
-          WHERE id != ?
-            AND superseded_by IS NULL AND deleted_at IS NULL
-            AND subject IS NOT NULL AND predicate IS NOT NULL AND object IS NOT NULL",
-    )?;
-    let candidates: Vec<(String, String, String, String)> = stmt
-        .query_map(params![memory_id], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-        })?
-        .collect::<Result<_>>()?;
-    drop(stmt);
+    let memories = Memories::new(store);
+    let candidates = memories.live_triples_except(memory_id)?;
 
     let now = Utc::now().to_rfc3339();
     let mut superseded = Vec::new();
-    for (id, candidate_subject, candidate_predicate, candidate_object) in candidates {
-        if normalize_entity_name(&candidate_subject) != want_subject
-            || normalize_entity_name(&candidate_predicate) != want_predicate
+    for triple in candidates {
+        if normalize_entity_name(&triple.subject) != want_subject
+            || normalize_entity_name(&triple.predicate) != want_predicate
         {
             continue;
         }
-        if normalize_entity_name(&candidate_object) == want_object {
+        if normalize_entity_name(&triple.object) == want_object {
             continue; // the same fact restated, not a contradiction
         }
-        conn.execute(
-            "UPDATE memories SET superseded_by = ?, updated_at = ? WHERE id = ?",
-            params![memory_id, now, id],
-        )?;
-        superseded.push(id);
+        memories.set_superseded_by(&triple.id, memory_id, Some(&now))?;
+        superseded.push(triple.id);
     }
     Ok(superseded)
 }

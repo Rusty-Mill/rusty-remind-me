@@ -6,8 +6,12 @@
 //! be *required*, a wrong one must not be distinguishable from a route that
 //! does not exist, and no other path may inherit the bypass.
 
+#[path = "../../remind_me_core/src/test_env.rs"]
+mod test_env;
+
 mod common;
 use common::{get, seeded_server, server};
+use remind_me_core::db::Store;
 use remind_me_core::ics::{ICS_TOKEN_ENV, ICS_TOKEN_FILE_ENV};
 use std::sync::{Mutex, OnceLock};
 
@@ -23,16 +27,16 @@ fn with_token<T>(body: impl FnOnce() -> T) -> T {
     let _guard = env_lock().lock().unwrap();
     // Pinned rather than generated, so a failure is a real one and not a
     // stray token file left by another test.
-    std::env::set_var(ICS_TOKEN_ENV, TOKEN);
-    std::env::remove_var(ICS_TOKEN_FILE_ENV);
+    crate::test_env::set_var(ICS_TOKEN_ENV, TOKEN);
+    crate::test_env::remove_var(ICS_TOKEN_FILE_ENV);
     let out = body();
-    std::env::remove_var(ICS_TOKEN_ENV);
+    crate::test_env::remove_var(ICS_TOKEN_ENV);
     out
 }
 
-fn seed_reminder(conn: &rusqlite::Connection, content: &str, remind_at: &str) -> String {
+fn seed_reminder(store: &Store<'_>, content: &str, remind_at: &str) -> String {
     let memory = remind_me_core::db::queries::add_memory(
-        conn,
+        store,
         remind_me_core::MemoryAddInput {
             content: content.to_string(),
             category: "general".into(),
@@ -44,14 +48,13 @@ fn seed_reminder(conn: &rusqlite::Connection, content: &str, remind_at: &str) ->
             object: None,
             entities: vec![],
             sensitive: false,
+            ..Default::default()
         },
     )
     .unwrap();
-    conn.execute(
-        "UPDATE memories SET remind_at = ? WHERE id = ?",
-        rusqlite::params![remind_at, &memory.id],
-    )
-    .unwrap();
+    remind_me_core::db::reminders::Reminders::new(store)
+        .set_remind_at(&memory.id, Some(remind_at), &memory.updated_at)
+        .unwrap();
     memory.id
 }
 
@@ -100,8 +103,8 @@ fn future() -> String {
 #[test]
 fn a_valid_token_serves_the_feed_without_any_auth_header() {
     with_token(|| {
-        let (srv, root) = seeded_server("ics-valid", |conn| {
-            seed_reminder(conn, "renew the passport", &future());
+        let (srv, root) = seeded_server("ics-valid", |store| {
+            seed_reminder(store, "renew the passport", &future());
         });
 
         // No Authorization header, on purpose. A calendar app polls this from
@@ -201,9 +204,9 @@ fn an_empty_vault_serves_a_valid_empty_calendar() {
 fn the_feed_carries_the_same_window_the_listing_tool_shows() {
     with_token(|| {
         let past = offset_hours(-2);
-        let (srv, root) = seeded_server("ics-window", |conn| {
-            seed_reminder(conn, "upcoming one", &future());
-            seed_reminder(conn, "overdue one", &past);
+        let (srv, root) = seeded_server("ics-window", |store| {
+            seed_reminder(store, "upcoming one", &future());
+            seed_reminder(store, "overdue one", &past);
         });
 
         let response = get(&srv, &format!("/api/reminders/{}.ics", TOKEN));
@@ -221,13 +224,11 @@ fn the_feed_carries_the_same_window_the_listing_tool_shows() {
 #[test]
 fn a_deleted_memorys_reminder_never_reaches_the_feed() {
     with_token(|| {
-        let (srv, root) = seeded_server("ics-deleted", |conn| {
-            let id = seed_reminder(conn, "deleted but scheduled", &future());
-            conn.execute(
-                "UPDATE memories SET deleted_at = ? WHERE id = ?",
-                rusqlite::params![offset_hours(-1), &id],
-            )
-            .unwrap();
+        let (srv, root) = seeded_server("ics-deleted", |store| {
+            let id = seed_reminder(store, "deleted but scheduled", &future());
+            remind_me_core::db::memories::Memories::new(store)
+                .delete_live(&id, Some(&offset_hours(-1)))
+                .unwrap();
         });
 
         let response = get(&srv, &format!("/api/reminders/{}.ics", TOKEN));

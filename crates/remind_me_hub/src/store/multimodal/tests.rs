@@ -1,0 +1,534 @@
+//! What is only true of this backend. The protocol itself is the route
+//! suite's (`tests/hub_routes_test.rs`), which runs against this store too.
+
+use super::*;
+use crate::record;
+use crate::record::TOMBSTONE_CONTENT;
+use serde_json::json;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// A fresh data directory, removed when dropped.
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new(label: &str) -> Self {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "remind_me_hub_multimodal_{label}_{}_{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        Self(dir)
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn memory(id: &str, updated: &str) -> Record {
+    record::parse(&json!({
+        "id": id,
+        "content": format!("content of {id}"),
+        "created_at": "2026-08-01T00:00:00Z",
+        "updated_at": updated,
+    }))
+    .expect("a valid memory")
+}
+
+fn tombstone(id: &str, updated: &str, deleted: &str) -> Record {
+    record::parse(&json!({
+        "id": id,
+        "content": "gone",
+        "created_at": "2026-08-01T00:00:00Z",
+        "updated_at": updated,
+        "deleted_at": deleted,
+    }))
+    .expect("a valid tombstone")
+}
+
+fn link(memory_id: &str, entity_id: &str) -> Record {
+    record::parse(&json!({
+        "record_type": "memory_entity",
+        "memory_id": memory_id,
+        "entity_id": entity_id,
+        "created_at": "2026-08-01T00:00:00Z",
+    }))
+    .expect("a valid link")
+}
+
+fn seqs(store: &MultimodalHubStore) -> Vec<(String, i64)> {
+    store
+        .pull_memories(&PullQuery {
+            cursor: PullCursor::Seq(0),
+            exclude_node: None,
+            full: false,
+            limit: 500,
+        })
+        .unwrap()
+        .iter()
+        .map(|m| {
+            (
+                m["id"].as_str().unwrap().to_string(),
+                m["hub_seq"].as_i64().unwrap(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn every_table_survives_a_reopen_and_hub_seq_carries_on_above_it() {
+    let dir = TempDir::new("reopen");
+    {
+        let store = MultimodalHubStore::open(&dir.0).unwrap();
+        store
+            .apply_record(&memory("m1", "2026-08-02T00:00:00Z"), Some("n1"))
+            .unwrap();
+        store
+            .apply_record(&memory("m2", "2026-08-02T00:00:00Z"), Some("n1"))
+            .unwrap();
+        store.apply_record(&link("m1", "e1"), Some("n1")).unwrap();
+    }
+    let store = MultimodalHubStore::open(&dir.0).unwrap();
+    assert_eq!(seqs(&store), vec![("m1".into(), 1), ("m2".into(), 2)]);
+    assert_eq!(store.stats().unwrap().memory_entities, 1);
+
+    store
+        .apply_record(&memory("m3", "2026-08-02T00:00:00Z"), None)
+        .unwrap();
+    assert_eq!(seqs(&store).last(), Some(&("m3".to_string(), 3)));
+}
+
+/// Every memory row, sorted by id.
+fn rows(store: &MultimodalHubStore) -> Vec<MemoryRow> {
+    let mut rows = all_rows::<_, MemoryRow>(&store.read().memories);
+    rows.sort_by(|a, b| a.id.cmp(&b.id));
+    rows
+}
+
+/// Store a tombstone with its text, as a copy of an older hub leaves one,
+/// bypassing the emptying a push does.
+fn store_unemptied_tombstone(store: &MultimodalHubStore, id: &str, deleted: &str) {
+    let Record::Memory(m) = tombstone(id, deleted, deleted) else {
+        unreachable!("tombstone() builds a memory")
+    };
+    let mut t = store.write().unwrap();
+    let row = MemoryRow::new(&m, Some("node-a"), t.next_seq).unwrap();
+    t.memories.insert(row).unwrap();
+    t.next_seq += 1;
+}
+
+#[test]
+fn a_pushed_tombstone_is_stored_without_its_text() {
+    let dir = TempDir::new("emptied_on_apply");
+    let store = MultimodalHubStore::open(&dir.0).unwrap();
+    store
+        .apply_record(
+            &tombstone("m1", "2026-08-02T00:00:00Z", "2026-08-02T00:00:00Z"),
+            None,
+        )
+        .unwrap();
+    let row = &rows(&store)[0];
+    assert_eq!(row.content, TOMBSTONE_CONTENT);
+    assert_eq!(row.tags, "[]");
+    assert!(row.deleted_at.is_some(), "it is still a tombstone");
+    assert_eq!(row.hub_seq, 1);
+}
+
+#[test]
+fn compaction_empties_every_tombstone_in_place_and_deletes_nothing() {
+    let dir = TempDir::new("compaction_empties");
+    {
+        let store = MultimodalHubStore::open(&dir.0).unwrap();
+        store
+            .apply_record(&memory("live", "2026-08-01T00:00:00Z"), None)
+            .unwrap();
+        store_unemptied_tombstone(&store, "old", "2026-08-02T00:00:00Z");
+        store_unemptied_tombstone(&store, "recent", "2026-09-10T00:00:00Z");
+        let before = rows(&store);
+
+        assert_eq!(store.compact_tombstones().unwrap(), 2, "whatever their age");
+        assert_eq!(
+            store.compact_tombstones().unwrap(),
+            0,
+            "an emptied tombstone is not counted again"
+        );
+
+        let after = rows(&store);
+        assert_eq!(after.len(), 3, "no row is deleted");
+        let old = &after[1];
+        assert_eq!(old.id, "old");
+        assert_eq!(old.content, TOMBSTONE_CONTENT);
+        assert_eq!(old.hub_seq, before[1].hub_seq, "hub_seq stays");
+        assert_eq!(old.updated_at, before[1].updated_at, "updated_at stays");
+        assert_eq!(
+            after[2].content, TOMBSTONE_CONTENT,
+            "a recent tombstone is emptied too"
+        );
+        assert_eq!(after[0], before[0], "a live memory is untouched");
+    }
+    // The emptied row survives a reopen, and the next write numbers on.
+    let store = MultimodalHubStore::open(&dir.0).unwrap();
+    assert_eq!(rows(&store)[1].content, TOMBSTONE_CONTENT);
+    store
+        .apply_record(&memory("next", "2026-08-03T00:00:00Z"), None)
+        .unwrap();
+    assert_eq!(seqs(&store).last(), Some(&("next".to_string(), 4)));
+}
+
+#[test]
+fn an_id_over_the_cap_is_a_storage_error_and_writes_nothing() {
+    let dir = TempDir::new("id_cap");
+    let store = MultimodalHubStore::open(&dir.0).unwrap();
+    let long = "x".repeat(ID_CAP + 1);
+    let err = store
+        .apply_record(&memory(&long, "2026-08-02T00:00:00Z"), None)
+        .unwrap_err();
+    assert!(err.0.contains("at most 64 bytes"), "{}", err.0);
+    assert!(store.apply_record(&link("m1", &long), None).is_err());
+    assert_eq!(store.stats().unwrap().total, 0);
+
+    // The id at the cap is fine, and does not burn a hub_seq on the way.
+    store
+        .apply_record(&memory(&"x".repeat(ID_CAP), "2026-08-02T00:00:00Z"), None)
+        .unwrap();
+    assert_eq!(seqs(&store)[0].1, 1);
+}
+
+#[test]
+fn a_panic_under_the_lock_does_not_take_later_requests_down() {
+    let dir = TempDir::new("poison");
+    let store = MultimodalHubStore::open(&dir.0).unwrap();
+    let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _held = store.write();
+        panic!("a request panics while holding the lock");
+    }));
+    assert!(poisoned.is_err());
+    assert!(store.tables.is_poisoned());
+
+    assert!(store
+        .apply_record(&memory("m1", "2026-08-02T00:00:00Z"), None)
+        .unwrap());
+    assert_eq!(store.stats().unwrap().total, 1);
+}
+
+#[test]
+fn a_panic_inside_a_group_commit_does_not_leave_later_writes_unsynced() {
+    let dir = TempDir::new("panic_in_batch");
+    let store = MultimodalHubStore::open(&dir.0).unwrap();
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut t = store.write().unwrap();
+        t.defer_sync();
+        apply_one(&mut t, &memory("m1", "2026-08-02T00:00:00Z"), None).unwrap();
+        panic!("a request panics before its commit");
+    }));
+    assert!(panicked.is_err());
+
+    let t = store.write().unwrap();
+    assert!(
+        !t.memories.inner().inner().is_sync_deferred(),
+        "the next writer starts with each write synced"
+    );
+}
+
+#[test]
+fn a_second_hub_cannot_open_a_directory_in_use() {
+    let dir = TempDir::new("dir_lock");
+    let first = MultimodalHubStore::open(&dir.0).unwrap();
+    let err = MultimodalHubStore::open(&dir.0).err().expect("refused");
+    assert!(err.0.contains("in use"), "{}", err.0);
+    drop(first);
+    assert!(MultimodalHubStore::open(&dir.0).is_ok());
+}
+
+#[test]
+fn compaction_is_free_with_nothing_to_fold_and_loses_nothing_when_it_runs() {
+    let dir = TempDir::new("compact");
+    {
+        let store = MultimodalHubStore::open(&dir.0).unwrap();
+        assert!(!store.compact().unwrap(), "nothing written yet");
+        store
+            .apply_record(&memory("m1", "2026-08-02T00:00:00Z"), None)
+            .unwrap();
+        store
+            .apply_record(&memory("m1", "2026-08-03T00:00:00Z"), None)
+            .unwrap();
+        assert!(store.compact().unwrap());
+        assert!(!store.compact().unwrap(), "folded already");
+        assert!(
+            !dir.0.join("memories.mmap.inserts").exists(),
+            "compaction removes the insert log"
+        );
+    }
+    let store = MultimodalHubStore::open(&dir.0).unwrap();
+    let pulled = store
+        .pull_memories(&PullQuery {
+            cursor: PullCursor::Seq(0),
+            exclude_node: None,
+            full: false,
+            limit: 10,
+        })
+        .unwrap();
+    assert_eq!(pulled.len(), 1);
+    assert_eq!(pulled[0]["updated_at"], "2026-08-03T00:00:00+00:00");
+    assert_eq!(pulled[0]["hub_seq"], 2);
+}
+
+#[test]
+fn an_lww_win_keeps_the_original_created_at_as_the_sql_upsert_does() {
+    let dir = TempDir::new("created_at");
+    let store = MultimodalHubStore::open(&dir.0).unwrap();
+    store
+        .apply_record(&memory("m1", "2026-08-02T00:00:00Z"), None)
+        .unwrap();
+    let mut newer = json!({
+        "id": "m1",
+        "content": "edited",
+        "created_at": "2026-08-09T00:00:00Z",
+        "updated_at": "2026-08-10T00:00:00Z",
+    });
+    store
+        .apply_record(&record::parse(&newer).unwrap(), None)
+        .unwrap();
+    let pulled = seqs(&store);
+    assert_eq!(pulled, vec![("m1".into(), 2)]);
+    let row = &store
+        .pull_memories(&PullQuery {
+            cursor: PullCursor::Seq(0),
+            exclude_node: None,
+            full: false,
+            limit: 1,
+        })
+        .unwrap()[0];
+    assert_eq!(row["content"], "edited");
+    assert_eq!(row["created_at"], "2026-08-01T00:00:00+00:00");
+    newer["updated_at"] = json!("2026-08-10T00:00:00Z");
+    assert!(!store
+        .apply_record(&record::parse(&newer).unwrap(), None)
+        .unwrap());
+}
+
+#[test]
+fn a_malformed_cursor_timestamp_is_an_error_not_an_empty_page() {
+    let dir = TempDir::new("cursor");
+    let store = MultimodalHubStore::open(&dir.0).unwrap();
+    let err = store
+        .pull_memories(&PullQuery {
+            cursor: PullCursor::Since("yesterday".into()),
+            exclude_node: None,
+            full: false,
+            limit: 10,
+        })
+        .unwrap_err();
+    assert!(err.0.contains("yesterday"), "{}", err.0);
+}
+
+#[test]
+fn a_batch_over_several_chunks_keeps_each_record_isolated_and_in_order() {
+    let dir = TempDir::new("batch");
+    let long = "x".repeat(ID_CAP + 1);
+    let mut batch: Vec<Record> = (0..GROUP_COMMIT * 2 + 5)
+        .map(|n| memory(&format!("m{n:03}"), "2026-08-02T00:00:00Z"))
+        .collect();
+    // A refused id in the first chunk, an LWW loss against a record earlier
+    // in the same chunk, and one straddling into the next chunk.
+    batch[3] = memory(&long, "2026-08-02T00:00:00Z");
+    batch[10] = memory("m005", "2026-08-01T00:00:00Z");
+    batch[GROUP_COMMIT] = memory("m001", "2026-08-03T00:00:00Z");
+    let expected_ids: Vec<String> = {
+        let mut ids: Vec<String> = (0..batch.len())
+            .filter(|n| ![3, 10, GROUP_COMMIT].contains(n))
+            .map(|n| format!("m{n:03}"))
+            .collect();
+        // m001 won LWW in the second chunk, so it moved to the next hub_seq.
+        ids.retain(|id| id != "m001");
+        ids.insert(GROUP_COMMIT - 3, "m001".to_string());
+        ids
+    };
+    {
+        let store = MultimodalHubStore::open(&dir.0).unwrap();
+        let results = store.apply_records(&batch, Some("n1"));
+        assert_eq!(results.len(), batch.len());
+        for (n, result) in results.iter().enumerate() {
+            match n {
+                3 => assert!(result.is_err(), "record {n}: {result:?}"),
+                10 => assert_eq!(result, &Ok(false), "record {n}"),
+                _ => assert_eq!(result, &Ok(true), "record {n}"),
+            }
+        }
+    }
+    let store = MultimodalHubStore::open(&dir.0).unwrap();
+    let after = seqs(&store);
+    let ids: Vec<String> = after.iter().map(|(id, _)| id.clone()).collect();
+    assert_eq!(
+        ids, expected_ids,
+        "the reopened hub holds the batch, in hub_seq order"
+    );
+    let issued: Vec<i64> = after.iter().map(|(_, seq)| *seq).collect();
+    assert!(issued.windows(2).all(|w| w[0] < w[1]), "{issued:?}");
+    assert_eq!(
+        issued.last().copied(),
+        Some(i64::try_from(batch.len() - 2).unwrap()),
+        "one hub_seq per applied memory write, none for the refused id or the LWW loss"
+    );
+}
+
+#[test]
+fn after_a_failed_sync_every_write_is_refused_and_ping_fails() {
+    let dir = TempDir::new("sync_failure");
+    let store = MultimodalHubStore::open(&dir.0).unwrap();
+    store
+        .apply_record(&memory("m1", "2026-08-02T00:00:00Z"), None)
+        .unwrap();
+    // No portable way to make `fsync` fail, so set what a failed commit
+    // leaves behind.
+    store.tables.write().unwrap().sync_failure = Some(StoreError("disk gone".into()));
+
+    assert_eq!(store.ping(), Err(StoreError("disk gone".into())));
+    let batch = [memory("m2", "2026-08-02T00:00:00Z"), link("m1", "e1")];
+    assert_eq!(
+        store.apply_records(&batch, None),
+        vec![Err(StoreError("disk gone".into())); 2]
+    );
+    assert!(store.compact().is_err());
+    assert!(store.compact_tombstones().is_err());
+    // Reads carry on.
+    assert_eq!(seqs(&store), vec![("m1".into(), 1)]);
+}
+
+/// A wire record without the node's v32 columns parses to their defaults,
+/// and the stored row emits every one of them.
+#[test]
+fn the_v32_columns_default_on_parse_and_reach_the_wire() {
+    let dir = TempDir::new("v32_wire");
+    let store = MultimodalHubStore::open(&dir.0).unwrap();
+    store
+        .apply_record(&memory("m1", "2026-08-02T00:00:00Z"), Some("node-a"))
+        .unwrap();
+    let with_columns = record::parse(&json!({
+        "id": "m2",
+        "content": "in context",
+        "created_at": "2026-08-01T00:00:00Z",
+        "updated_at": "2026-08-02T00:00:00Z",
+        "project": "quokka",
+        "git_branch": "main",
+        "confidence": 0.5,
+        "written_by": "hook",
+        "capture_method": "auto",
+        "outcome": "done",
+    }))
+    .expect("a valid memory");
+    store.apply_record(&with_columns, Some("node-a")).unwrap();
+
+    let pulled = store
+        .pull_memories(&PullQuery {
+            cursor: PullCursor::Seq(0),
+            exclude_node: None,
+            full: false,
+            limit: 500,
+        })
+        .unwrap();
+    assert_eq!(pulled.len(), 2);
+    let m1 = &pulled[0];
+    assert_eq!(m1["id"], "m1");
+    assert_eq!(m1["project"], Value::Null);
+    assert_eq!(m1["confidence"], 1.0);
+    assert_eq!(m1["written_by"], "unknown");
+    assert_eq!(m1["capture_method"], "manual");
+    let m2 = &pulled[1];
+    assert_eq!(m2["project"], "quokka");
+    assert_eq!(m2["git_branch"], "main");
+    assert_eq!(m2["confidence"], 0.5);
+    assert_eq!(m2["written_by"], "hook");
+    assert_eq!(m2["capture_method"], "auto");
+    assert_eq!(m2["outcome"], "done");
+    assert_eq!(m2["git_sha"], Value::Null);
+}
+
+/// A hub written before the node's v32 columns holds its memories under
+/// the `@1` layout. Opening it reads them under that layout and rewrites
+/// them, every new column at its default.
+#[test]
+fn a_memories_table_under_the_v1_layout_is_upgraded_at_open() {
+    let dir = TempDir::new("v1_layout");
+    std::fs::create_dir_all(&dir.0).unwrap();
+    let path = table_path(&dir.0, MEMORIES);
+    let Record::Memory(m) = memory("old", "2026-08-02T00:00:00Z") else {
+        unreachable!("memory() builds a memory record")
+    };
+    let current = MemoryRow::new(&m, Some("node-a"), 7).unwrap();
+    let legacy = MemoryRowV1 {
+        engine_id: current.engine_id,
+        id: current.id.clone(),
+        content: current.content.clone(),
+        category: current.category.clone(),
+        tags: current.tags.clone(),
+        source: current.source.clone(),
+        metadata: current.metadata.clone(),
+        created_at: current.created_at.clone(),
+        updated_at: current.updated_at.clone(),
+        updated_at_us: current.updated_at_us,
+        capture_id: None,
+        node_id: None,
+        client: current.client.clone(),
+        accessed_at: current.accessed_at.clone(),
+        access_count: 0,
+        decay_rate: 0.1,
+        vitality: 1.0,
+        base_weight: 1.0,
+        status: "active".into(),
+        memory_type: "unclassified".into(),
+        source_capture_id: None,
+        subject: None,
+        predicate: None,
+        object: None,
+        superseded_by: None,
+        deleted_at: None,
+        origin_node: Some("node-a".into()),
+        hub_seq: 7,
+        sensitive: true,
+        remind_at: None,
+    };
+    {
+        let mut second = legacy.clone();
+        let mut table = Core::<MemoryRowV1, Seq>::create(vec![legacy], &path).unwrap();
+        // One more through the insert log, which the upgrade must fold in.
+        second.id = "newer".into();
+        second.engine_id = keys::engine_id("newer");
+        second.hub_seq = 8;
+        second.origin_node = Some("node-b".into());
+        table.insert(second).unwrap();
+    }
+    assert!(Core::<MemoryRow, Seq>::open_portable(&path).is_err());
+
+    let store = MultimodalHubStore::open(&dir.0).unwrap();
+    assert_eq!(
+        seqs(&store),
+        [("old".to_string(), 7), ("newer".to_string(), 8)]
+    );
+    let pulled = store
+        .pull_memories(&PullQuery {
+            cursor: PullCursor::Seq(0),
+            exclude_node: None,
+            full: false,
+            limit: 500,
+        })
+        .unwrap();
+    assert_eq!(pulled[0]["sensitive"], true);
+    assert_eq!(pulled[0]["project"], Value::Null);
+    assert_eq!(pulled[0]["confidence"], 1.0);
+    assert_eq!(pulled[0]["written_by"], "unknown");
+    assert_eq!(pulled[1]["id"], "newer");
+    // A new write lands beside the upgraded rows, and the next `hub_seq`
+    // follows the copied ones.
+    store
+        .apply_record(&memory("m3", "2026-08-03T00:00:00Z"), None)
+        .unwrap();
+    drop(store);
+    let again = MultimodalHubStore::open(&dir.0).unwrap();
+    assert_eq!(seqs(&again).len(), 3);
+    assert_eq!(seqs(&again)[2], ("m3".to_string(), 9));
+}

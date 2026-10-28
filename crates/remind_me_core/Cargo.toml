@@ -1,24 +1,47 @@
 [package]
 name = "remind_me_core"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+version = "0.4.0"
+edition = "2021"
+rust-version = "1.89"
+license = "MIT"
+repository = "https://github.com/Rusty-Mill/rusty_mill"
+
+[package.metadata.rusty_mill]
+layer = "apps"
 
 [dependencies]
+rusty_percent = { workspace = true }
+rusty_hex = { workspace = true }
+rusty_oauth = { workspace = true }
+rusty_oauth_server = { workspace = true }
+rusty_crypto_key = { workspace = true }
+rusty_atomic_file = { workspace = true }
 
-serde.workspace = true
-serde_json.workspace = true
-async-trait.workspace = true
-thiserror.workspace = true
-tokio.workspace = true
-rusqlite.workspace = true
-chrono.workspace = true
-uuid.workspace = true
-sha256.workspace = true
-dirs.workspace = true
-parking_lot.workspace = true
+serde = { workspace = true }
+# `float_roundtrip`: the engine stores records as JSON, and the default
+# parser reads some floats back one bit off (0.9774999999999999 as 0.9775).
+# Decay leaves such values, which the copy onto the engine then refused.
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
+thiserror = "2.0"
+tokio = { version = "1.0", features = ["full"] }
+# Read-only, in one module: `db::legacy_sqlite` copies an old `memory.db`
+# onto the engine on first open and reads the two foreign-file importers'
+# SQLite databases (ADR-0025). Nothing is stored in SQLite any more.
+# 0.39 rather than the 0.31 this crate used standalone: rusqlite declares
+# `links = "sqlite3"`, so Cargo allows one version per graph, and the rest of
+# the rusty_mill workspace is on 0.39.
+rusqlite = { version = "0.39", features = ["bundled"] }
+chrono = { workspace = true }
+uuid = { version = "1.0", features = ["v4", "v5"] }
+sha256 = "1.5"
+dirs = "5.0"
+parking_lot = "0.12"
+# The node's store (ADR-0023, ADR-0025).
+rusty_multimodal_db_engine = { workspace = true }
 pdf-extract = { version = "0.12", optional = true }
-aws-sdk-s3 = { version = "1", optional = true }
+# default-features off: the default `rustls` feature is the legacy hyper-0.14 /
+# rustls-0.21 client (RUSTSEC-2026-0098/-0099/-0104, -0258); keep the rest.
+aws-sdk-s3 = { version = "1", optional = true, default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
 aws-config = { version = "1", optional = true }
 usearch = { version = "2", optional = true }
 ocrs = { version = "0.12", optional = true }
@@ -44,8 +67,10 @@ symphonia = { version = "0.6", optional = true, default-features = false, featur
 ] }
 
 [dev-dependencies]
-# The real remind_me_hub binary's library, SQLite-only (no `postgres-store`:
-# tests need an in-memory store, not a Postgres connection) -- used by
+# `json!` for the OAuth state store's `rusty_json` values in tests.
+rusty_json = { workspace = true }
+# The real remind_me_hub binary's library, without the copy tool's Postgres
+# reader (tests need no Postgres connection) -- used by
 # `tests/support`'s `MockHub` to run actual remind_me_hub request handling
 # against this crate's sync client, not just another copy of this crate's
 # own peer server (which `tests/support`'s `MockNode` already covers).
@@ -103,7 +128,7 @@ local-embed = ["dep:rten", "dep:rten-tensor", "dep:tokenizers"]
 # from this list's "no system binary" rule, which is why it is off by default
 # and why `docs/adr/0014` exists. Feature-off, the watchdog reports the stuck
 # call's identity and duration exactly as it does today.
-stack-dumps = ["dep:rstack-self"]
+stack-dumps = ["dep:rstack-self", "dep:backtrace"]
 
 # The workspace's only *unconditional* FFI dependency, and target-gated so it
 # exists nowhere else. `docs/adr/0013` records why the sidecar teardown gap was
@@ -113,6 +138,8 @@ stack-dumps = ["dep:rstack-self"]
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    # The daemon client's `stop_inheriting_std_handles` (daemon/client.rs).
+    "Win32_System_Console",
     "Win32_System_JobObjects",
 ] }
 
@@ -123,6 +150,9 @@ windows-sys = { version = "0.61", features = [
 # what an in-process signal handler could not do safely.
 [target.'cfg(target_os = "linux")'.dependencies]
 rstack-self = { version = "0.3", optional = true }
+# Already used by rstack-self; resolve sampled first-frame PCs without its
+# caller-return-address adjustment. Still out-of-process capture (ADR-0014).
+backtrace = { version = "0.3", optional = true }
 
 # Test fixture for `stack-dumps`, not a shipped tool. Declared explicitly so
 # `required-features` applies: without it, a default build would try to compile

@@ -8,6 +8,9 @@
 //! directly against `remind_me_core`, so `cargo test -p remind_me_core` gives
 //! signal on the storage logic itself without needing the API crate at all.
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
 use remind_me_core::api_keys::{
     self, ApiKeyError, VerifiedKey, API_KEYS_FILE_ENV, DEFAULT_KEY_NAME, SCOPE_READ,
     SCOPE_READ_WRITE,
@@ -35,14 +38,14 @@ impl Store {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("api_keys.json");
-        std::env::set_var(API_KEYS_FILE_ENV, &path);
+        crate::test_env::set_var(API_KEYS_FILE_ENV, &path);
         Self(path)
     }
 }
 
 impl Drop for Store {
     fn drop(&mut self) {
-        std::env::remove_var(API_KEYS_FILE_ENV);
+        crate::test_env::remove_var(API_KEYS_FILE_ENV);
         if let Some(parent) = self.0.parent() {
             let _ = std::fs::remove_dir_all(parent);
         }

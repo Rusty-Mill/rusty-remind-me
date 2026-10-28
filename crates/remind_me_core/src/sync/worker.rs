@@ -6,10 +6,9 @@
 //! [`live_status_against`].
 
 use super::{prune_outbox, pull_remote, push_outbox};
-use crate::Database;
-use rusqlite::Connection;
+use crate::db::sync_state::SyncState;
+use crate::db::{SecondarySource, Store};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -61,13 +60,11 @@ impl SyncWorker {
     /// `None` when sync isn't enabled — matching the reference's own
     /// `if SYNC_ENABLED: start_sync_thread()` gating exactly.
     ///
-    /// Takes a database path rather than a `Database`/`Arc`, like
-    /// [`crate::scheduler::start_scheduler`]/[`crate::watcher::start_watcher`]:
-    /// the thread reopens its own connection by path on every retry (via
-    /// [`crate::Database::open_secondary_at`]), so nothing here needs a
-    /// caller's `Database` to still be alive, and starting a worker no longer
-    /// requires being the one holding one.
-    pub fn from_env(db_path: PathBuf) -> Option<Self> {
+    /// Takes a [`SecondarySource`] rather than a `Database`/`Arc`, like
+    /// [`crate::scheduler::start_scheduler`]: the thread works on the
+    /// source's shared engine tables without the database's lock, so
+    /// nothing here needs a caller's `Database` to still be alive.
+    pub fn from_env(source: SecondarySource) -> Option<Self> {
         if !super::sync_enabled() {
             return None;
         }
@@ -98,33 +95,19 @@ impl SyncWorker {
                 // reason: a tunnel is only wanted while something is syncing
                 // through it.
                 let mut sidecars = crate::sidecars::Sidecars::new();
-                // A connection of its own, not `Database::conn()`'s shared
-                // `Mutex`: a cycle below pushes/pulls every remote over the
-                // network, which can run for many multiples of any one HTTP
-                // timeout. Holding the process-wide mutex for that whole span
-                // used to block every other MCP tool call -- reads and
-                // writes alike -- until the cycle finished. Opened once and
-                // kept for the thread's life; re-opened on the next cycle if
-                // the attempt itself failed (e.g. transient file-permission
-                // trouble).
-                let mut conn = Database::open_secondary_at(&db_path).ok();
+                // A store of its own, not `Database::store()`'s locked one: a
+                // cycle below pushes/pulls every remote over the network,
+                // which can run for many multiples of any one HTTP timeout.
+                // Holding the process-wide lock for that whole span used to
+                // block every other MCP tool call -- reads and writes alike
+                // -- until the cycle finished. The engine tables lock per
+                // call instead.
+                let store = source.store();
                 while !thread_shutdown.load(Ordering::Relaxed) {
                     // Before the cycle, not after: the tunnel this may start
                     // is what the cycle about to run needs in place.
                     sidecars.ensure();
-                    if conn.is_none() {
-                        conn = Database::open_secondary_at(&db_path).ok();
-                    }
-                    match conn.as_ref() {
-                        Some(c) => run_one_cycle(c, &hub_url, &secret, &node_id, &thread_state),
-                        None => {
-                            let mut guard = thread_state.lock().unwrap_or_else(|e| e.into_inner());
-                            guard.last_error = Some(
-                                "sync worker could not open its own database connection"
-                                    .to_string(),
-                            );
-                        }
-                    }
+                    run_one_cycle(&store, &hub_url, &secret, &node_id, &thread_state);
 
                     let mut waited = Duration::ZERO;
                     while waited < interval && !thread_shutdown.load(Ordering::Relaxed) {
@@ -167,7 +150,7 @@ impl Drop for SyncWorker {
 /// fallback (a live loop, else a freshly-built baseline), collapsed into one
 /// function here because sync's "not yet registered" baseline needs no
 /// config of its own to build, unlike `Watcher::from_env`.
-pub fn live_status_against(conn: &Connection) -> Option<SyncWorkerStatus> {
+pub fn live_status_against(store: &Store<'_>) -> Option<SyncWorkerStatus> {
     if !super::sync_enabled() {
         return None;
     }
@@ -194,7 +177,7 @@ pub fn live_status_against(conn: &Connection) -> Option<SyncWorkerStatus> {
     drop(state_guard);
     drop(live);
     if status.last_error.is_some()
-        && superseded(conn, status.last_cycle_at.as_deref()).unwrap_or(false)
+        && superseded(store, status.last_cycle_at.as_deref()).unwrap_or(false)
     {
         status.superseded_error = status.last_error.take();
     }
@@ -209,40 +192,40 @@ pub fn live_status_against(conn: &Connection) -> Option<SyncWorkerStatus> {
 /// tables from being tried against it, and never stops the cycle from
 /// moving on to the next remote.
 fn sync_with_remote(
-    conn: &Connection,
+    store: &Store<'_>,
     url: &str,
     secret: &str,
     node_id: &str,
     remote_id: &str,
 ) -> Option<String> {
     let mut error = None;
-    if let Err(e) = push_outbox(conn, url, secret, node_id, remote_id) {
+    if let Err(e) = push_outbox(store, url, secret, node_id, remote_id) {
         error = Some(format!("push to {remote_id} failed: {e}"));
     }
-    if let Err(e) = pull_remote(conn, url, secret, node_id, remote_id) {
+    if let Err(e) = pull_remote(store, url, secret, node_id, remote_id) {
         error.get_or_insert_with(|| format!("pull from {remote_id} failed: {e}"));
     }
-    if let Err(e) = super::pull_entities(conn, url, secret, node_id, remote_id) {
+    if let Err(e) = super::pull_entities(store, url, secret, node_id, remote_id) {
         error.get_or_insert_with(|| format!("pull entities from {remote_id} failed: {e}"));
     }
-    if let Err(e) = super::pull_links(conn, url, secret, node_id, remote_id) {
+    if let Err(e) = super::pull_links(store, url, secret, node_id, remote_id) {
         error.get_or_insert_with(|| format!("pull links from {remote_id} failed: {e}"));
     }
-    if let Err(e) = super::pull_entity_relations(conn, url, secret, node_id, remote_id) {
+    if let Err(e) = super::pull_entity_relations(store, url, secret, node_id, remote_id) {
         error.get_or_insert_with(|| format!("pull entity relations from {remote_id} failed: {e}"));
     }
     error
 }
 
 fn run_one_cycle(
-    conn: &Connection,
+    store: &Store<'_>,
     hub_url: &str,
     secret: &str,
     node_id: &str,
     state: &Mutex<WorkerState>,
 ) {
     let mut span = crate::telemetry::maybe_span("sync.cycle");
-    let mut error = sync_with_remote(conn, hub_url, secret, node_id, HUB_REMOTE_ID);
+    let mut error = sync_with_remote(store, hub_url, secret, node_id, HUB_REMOTE_ID);
 
     // Every discovered peer (static list plus Tailscale) gets the same
     // treatment as the hub: probed first (the only "is this really a
@@ -255,12 +238,12 @@ fn run_one_cycle(
         if !super::probe_peer(&peer.url, secret) {
             continue;
         }
-        if let Some(e) = sync_with_remote(conn, &peer.url, secret, node_id, &peer.node_id) {
+        if let Some(e) = sync_with_remote(store, &peer.url, secret, node_id, &peer.node_id) {
             error.get_or_insert(e);
         }
     }
 
-    if let Err(e) = prune_outbox(conn) {
+    if let Err(e) = prune_outbox(store) {
         error.get_or_insert_with(|| format!("outbox prune failed: {e}"));
     }
 
@@ -345,16 +328,16 @@ pub fn disabled_status() -> SyncWorkerStatus {
 /// - no remotes at all, because there is nothing to supersede it;
 /// - a remote still sitting at the epoch default, which means *never
 ///   succeeded* rather than *succeeded a long time ago*.
-pub fn superseded(conn: &Connection, failed_cycle_at: Option<&str>) -> rusqlite::Result<bool> {
+pub fn superseded(store: &Store<'_>, failed_cycle_at: Option<&str>) -> crate::db::Result<bool> {
     let Some(failed_at) = failed_cycle_at.and_then(parse_ts) else {
         return Ok(false);
     };
 
-    let mut stmt = conn.prepare("SELECT last_push_at, last_pull_at FROM sync_log")?;
-    let rows: Vec<(String, String)> = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    drop(stmt);
+    let rows: Vec<(String, String)> = SyncState::new(store)
+        .remotes()?
+        .into_iter()
+        .map(|log| (log.last_push_at, log.last_pull_at))
+        .collect();
 
     if rows.is_empty() {
         return Ok(false);
