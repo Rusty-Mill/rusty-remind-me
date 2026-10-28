@@ -26,10 +26,10 @@
 services:
   remind-me-hub:
     build:
-      # The monorepo root, six levels up: the hub is one crate in a Cargo
+      # The repository root, three levels up: the hub is one crate in a Cargo
       # workspace, so the build needs the workspace Cargo.toml and Cargo.lock.
-      context: ../../../../../..
-      dockerfile: crates/apps/rusty_remind_me/crates/remind_me_hub/Containerfile
+      context: ../../..
+      dockerfile: crates/remind_me_hub/Containerfile
     restart: always
     env_file: hub.env
     volumes:

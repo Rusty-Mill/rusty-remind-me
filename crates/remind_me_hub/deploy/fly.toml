@@ -10,8 +10,8 @@
 #   fly apps create remind-me-hub
 #   fly volumes create remind_me_hub_data --size 1 -a remind-me-hub
 #   fly secrets set SYNC_SECRET=$(openssl rand -hex 32) -a remind-me-hub
-#   fly deploy --config crates/apps/rusty_remind_me/crates/remind_me_hub/deploy/fly.toml \
-#              --dockerfile crates/apps/rusty_remind_me/crates/remind_me_hub/Containerfile
+#   fly deploy --config crates/remind_me_hub/deploy/fly.toml \
+#              --dockerfile crates/remind_me_hub/Containerfile
 #
 # A Fly Volume is pinned to one machine, so the app runs as a single instance
 # and a host failure takes the hub offline until it returns. The hub cannot
@@ -38,7 +38,7 @@ app = "remind-me-hub"
 primary_region = "iad" # change to your nearest Fly region
 
 [build]
-  dockerfile = "crates/apps/rusty_remind_me/crates/remind_me_hub/Containerfile"
+  dockerfile = "crates/remind_me_hub/Containerfile"
 
 [env]
   REMIND_ME_HUB_DATA_DIR = "/data/hub"

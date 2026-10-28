@@ -2,14 +2,14 @@
 # End-to-end test of the plugin hooks: each one is fed real hook JSON and run
 # against the built binary, a temporary store and a temporary git repo.
 #
-#   cargo build -p rusty-remind-me && crates/apps/rusty_remind_me/scripts/test_hooks.sh
+#   cargo build -p rusty-remind-me && scripts/test_hooks.sh
 #
 # REMIND_ME_BIN overrides the binary (default: target/debug/rusty-remind-me).
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PRODUCT="$(dirname "$HERE")"
-ROOT="$(cd "$PRODUCT/../../.." && pwd)"
+ROOT="$PRODUCT"
 export REMIND_ME_BIN="${REMIND_ME_BIN:-$ROOT/target/debug/rusty-remind-me}"
 HOOKS="$PRODUCT/hooks/scripts"
 [ -x "$REMIND_ME_BIN" ] || { echo "no binary at $REMIND_ME_BIN; build it first" >&2; exit 2; }

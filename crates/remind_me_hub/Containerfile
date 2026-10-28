@@ -1,14 +1,13 @@
 # Container image for the remind-me sync hub.
 #
-# Build from the **monorepo root** (the directory holding the workspace
-# `Cargo.toml` and `Cargo.lock`), not this directory and not
-# `crates/apps/rusty_remind_me`:
+# Build from the **repository root** (the directory holding the workspace
+# `Cargo.toml` and `Cargo.lock`), not this directory:
 #
-#     podman build -f crates/apps/rusty_remind_me/crates/remind_me_hub/Containerfile \
+#     podman build -f crates/remind_me_hub/Containerfile \
 #                  -t remind-me-hub .
 #
 # `setup.sh` and every deploy template pass that context. The hub is one crate
-# in a workspace of several hundred, so cargo needs the workspace manifest and
+# of a workspace, so cargo needs the workspace manifest and
 # lockfile, and every member's manifest, to resolve it. The root
 # `.dockerignore` keeps `target/` and `.git` out of the context.
 

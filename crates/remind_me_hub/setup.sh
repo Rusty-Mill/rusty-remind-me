@@ -34,9 +34,9 @@
 set -euo pipefail
 
 HUB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# The monorepo root, five levels up, not the crate: the image build context
+# The repository root, two levels up, not the crate: the image build context
 # must hold the workspace Cargo.toml and Cargo.lock (see the Containerfile).
-REPO_DIR="$(cd "$HUB_DIR/../../../../.." && pwd)"
+REPO_DIR="$(cd "$HUB_DIR/../.." && pwd)"
 DATA_DIR="${REMIND_ME_HUB_DATA:-$HOME/remind-me-hub}"
 QUADLET_DIR="$HOME/.config/containers/systemd"
 
@@ -217,7 +217,7 @@ build_image() {
     # checkout, under exactly the time pressure that makes that unpleasant.
     log "Building the hub image (version $version) — a release build, allow a few minutes"
     [[ -f "$REPO_DIR/Cargo.lock" ]] \
-        || die "no Cargo.lock in $REPO_DIR; run setup.sh from inside the monorepo checkout"
+        || die "no Cargo.lock in $REPO_DIR; run setup.sh from inside a rusty-remind-me checkout"
     run podman build \
         --build-arg "HUB_VERSION=$version" \
         -f "$HUB_DIR/Containerfile" \

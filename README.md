@@ -2,12 +2,11 @@
 
 > High-performance, persistent long-term memory engine and Model Context Protocol (MCP) server written in Rust, built on the **Rusty Mill** ecosystem.
 
-> **Lives in the Rusty Mill monorepo.** Since v0.2.1 this product is developed
-> and released from [`Rusty-Mill/rusty_mill`](https://github.com/Rusty-Mill/rusty_mill)
-> under `crates/apps/rusty_remind_me` (imported with full history). The
-> standalone [`baileyrd/rusty_remind_me`](https://github.com/baileyrd/rusty_remind_me)
-> repository is frozen at v0.2.0. Paths below are relative to this directory
-> unless they say otherwise; `cargo` commands run from the monorepo root.
+> **Its own repository again.** From v0.2.1 to 0.4.x this product was developed
+> in the [`Rusty-Mill/rusty_mill`](https://github.com/Rusty-Mill/rusty_mill) monorepo
+> (`crates/apps/rusty_remind_me`); it moved back here with its full history.
+> The monorepo crates it uses are git dependencies pinned to one `libs-*` tag
+> (root `Cargo.toml`).
 
 `rusty_remind_me` is a native Rust port of `remind-me`. It equips AI assistants (such as Claude Desktop, Antigravity, Cursor, OpenAI Codex, and custom LLM agents) with persistent, searchable memory using full-text search on the embedded `rusty_multimodal_db` engine, ACT-R inspired memory vitality decay, Reciprocal Rank Fusion (RRF) search ranking, a structured Knowledge Graph entity system, and automated markdown wiki compilation.
 
@@ -47,14 +46,12 @@ optionally add multi-node sync and the other off-by-default features.
 ### 1. Clone & build
 
 ```bash
-git clone https://github.com/Rusty-Mill/rusty_mill
-cd rusty_mill
+git clone https://github.com/Rusty-Mill/rusty-remind-me
+cd rusty-remind-me
 cargo build --release -p rusty-remind-me
 ```
 
-Always pass `-p`: a bare `cargo build` at the monorepo root builds every
-Rusty Mill crate. This produces `target/release/rusty-remind-me` (at the
-monorepo root). Put it on `PATH` either by adding `target/release` to it, or
+This produces `target/release/rusty-remind-me`. Put it on `PATH` either by adding `target/release` to it, or
 by installing it directly:
 
 ```bash
@@ -73,30 +70,30 @@ first use.
 
 Prebuilt binaries for Linux, macOS (Intel/Apple Silicon), and Windows are
 also published on the [Releases
-page](https://github.com/Rusty-Mill/rusty_mill/releases) for every
-tagged version (tags `rusty-remind-me-vX.Y.Z`; v0.2.0 and earlier are on the
-[standalone repo's Releases
-page](https://github.com/baileyrd/rusty_remind_me/releases)) — each includes both `rusty-remind-me` and
+page](https://github.com/Rusty-Mill/rusty-remind-me/releases) for every
+tagged version (tags `vX.Y.Z`; the monorepo-era releases are tagged
+`rusty-remind-me-vX.Y.Z` on [its Releases
+page](https://github.com/Rusty-Mill/rusty_mill/releases)) — each includes both `rusty-remind-me` and
 `rusty-remind-me-hub` — if you'd rather skip the build step. See [Releases
 and versioning](#releases-and-versioning) below for how those get produced.
 
 ### 2. Connect it to a client
 
-**Claude Code plugin** (recommended if you're using Claude Code): the
-monorepo ships a marketplace at its root (`.claude-plugin/marketplace.json`,
-pointing at this directory's plugin manifest, described in [Claude Code
+**Claude Code plugin** (recommended if you're using Claude Code): this
+repository ships a marketplace at its root (`.claude-plugin/marketplace.json`,
+pointing at the plugin manifest beside it, described in [Claude Code
 Plugin](#claude-code-plugin) below), so no separate marketplace repo is
 needed —
 
 ```bash
-claude plugin marketplace add Rusty-Mill/rusty_mill
-claude plugin install rusty-remind-me@rusty-mill
+claude plugin marketplace add Rusty-Mill/rusty-remind-me
+claude plugin install rusty-remind-me@rusty-remind-me
 ```
 
-An existing install from the old `rusty-remind-me` marketplace
-(`baileyrd/rusty_remind_me`) keeps working: that marketplace's entry now
-points at this directory of the monorepo, so updates arrive from here either
-way. Switching to `rusty-remind-me@rusty-mill` is still recommended.
+An existing `rusty-remind-me@rusty-remind-me` install (from
+`baileyrd/rusty_remind_me`, which now redirects here) keeps updating from this
+repository. So does a `rusty-remind-me@rusty-mill` install: the monorepo's
+marketplace entry points here.
 
 `rusty-remind-me` must already be on `PATH` (step 1) — the plugin's
 `.mcp.json` runs it as a subprocess, it isn't bundled. Verify with
@@ -195,7 +192,7 @@ section — enable only what you need:
 
 ## Workspace Structure
 
-`rusty_remind_me` is six modular crates (members of the Rusty Mill monorepo's Cargo workspace):
+`rusty_remind_me` is six modular crates in one Cargo workspace:
 
 ```
 rusty_remind_me/
@@ -221,10 +218,10 @@ rusty_remind_me/
 
 ## Releases and versioning
 
-`.github/workflows/remind-me-release.yml` (at the monorepo root) watches
+`.github/workflows/release.yml` watches
 every push to `main` that touches one of this product's six crate manifests.
-When their `version` has moved past the last version published from the
-monorepo (checked against existing `rusty-remind-me-vX.Y.Z` tags — nothing
+When their `version` has moved past the last published version
+(checked against existing `vX.Y.Z` tags — nothing
 hand-maintains a changelog of already-shipped versions), it:
 
 1. Builds `rusty-remind-me` and `rusty-remind-me-hub` in release mode,
@@ -235,22 +232,20 @@ hand-maintains a changelog of already-shipped versions), it:
    `crates/remind_me_core/Cargo.toml`).
 2. Packages the Claude Code plugin surface (`.claude-plugin/`, `commands/`,
    `hooks/`, `.mcp.json`) into its own archive.
-3. Publishes a GitHub Release tagged `rusty-remind-me-vX.Y.Z` — prefixed,
-   because the monorepo releases more than one product — with all of the
+3. Publishes a GitHub Release tagged `vX.Y.Z` with all of the
    above attached as downloadable assets.
 
 Bumping the version is therefore the entire release process — there is no
 separate "cut a release" step, and nothing here pushes a tag by hand; the
 release action creates it from the version it read.
 
-The six crates each carry their own literal `version` (the monorepo's
-`[workspace.package]` belongs to other crates), and must be bumped together
+The six crates each carry their own literal `version`, and must be bumped together
 with `.claude-plugin/plugin.json`'s `"version"`.
 `scripts/get_workspace_version.sh` fails if the six disagree, and
 `scripts/check_plugin_version.sh` fails if the plugin manifest differs from
 them; both run on every PR touching this directory (the
-`remind-me-plugin-version` job in the monorepo's `.github/workflows/ci.yml`,
-covered by its `required-gate`), so a bump that
+`plugin-version` job in `.github/workflows/ci.yml`, covered by its
+`required-gate`), so a bump that
 misses one never merges — the release's plugin archive is never a version
 behind the binaries it ships alongside.
 
@@ -295,11 +290,11 @@ Three different connections, each with a different trigger:
 
 The hooks and the slash commands both bypass MCP entirely — they invoke the plain CLI binary as a subprocess and never speak the MCP JSON-RPC protocol. The hooks degrade safely: if `rusty-remind-me` isn't on `PATH` yet, or the store is empty, they emit `{"continue": true}` (optionally with a one-line `systemMessage` nudge to build the binary) and always exit 0, so they cannot fail a session. They write with `written_by = hook`. `REMIND_ME_HOOKS=0` turns every hook off and `REMIND_ME_PROMPT_CONTEXT=0` turns off only the per-prompt injection. `scripts/test_hooks.sh` drives each hook end to end against a built binary. The slash commands surface the same "not on PATH" condition as plain shell output for the model to relay, rather than silently retrying some other way.
 
-To use it, `rusty-remind-me` must be on `PATH` (`cargo build --release -p rusty-remind-me` then add `target/release` to `PATH`, or `cargo install --path crates/apps/rusty_remind_me/crates/remind_me_cli` from the monorepo root), then add the monorepo as a plugin marketplace in Claude Code (see [Connect it to a client](#2-connect-it-to-a-client)).
+To use it, `rusty-remind-me` must be on `PATH` (`cargo build --release -p rusty-remind-me` then add `target/release` to `PATH`, or `cargo install --path crates/remind_me_cli`), then add this repository as a plugin marketplace in Claude Code (see [Connect it to a client](#2-connect-it-to-a-client)).
 
 ### Cloud sessions (claude.ai Projects)
 
-A cloud session runs in a fresh container that has no plugin, no binary, and a transcript that is deleted along with the container. The monorepo's own `.claude/settings.json` registers `.claude/hooks/remind-me-capture.py` on `Stop` and `PreCompact`. The hook sends the transcript to the remote connector's `remind_me_capture_transcript` tool, which keeps one capture per session, as the plugin does (ADR-0029). It runs only when `CLAUDE_CODE_REMOTE=true`, the explicit opt-in `REMIND_ME_CLOUD_CAPTURE=1`, `REMIND_ME_URL` (the connector's `https://…/mcp` endpoint) and `REMIND_ME_TOKEN` are all set, so a local session is left to the plugin and holding the credentials alone captures nothing. Before anything leaves the container, thinking blocks are dropped, the values of fields named like secrets (`password`, `token`, `api_key`, …) are withheld, JSON inside strings is scrubbed field by field, and every string is scrubbed for the secret shapes the server redacts, quoted `key: "value"` pairs, bearer values and the token itself; tool calls and results are otherwise sent as they are, so turn the opt-in on only for environments whose sessions you want stored. The endpoint must be https, redirects are not followed, and the git remote is sent without credentials, query or fragment. To turn it on, set the opt-in and both variables in the cloud environment, keep the token as a secret, add the connector's host to the environment's network allowlist, and run the connector with the `full` tool profile. The hook always exits 0 and reports a failure on stderr as a fixed category, never server text. A session that checks out several repositories starts above them in `/home/user` and loads none of their `.claude/settings.json`, so the repository hook alone misses it. To capture every session of a cloud environment, add this to the environment's setup script, with `REF` a rusty_mill commit (pinning a commit fixes what runs); `scripts/install_cloud_capture.py` copies the hook into `~/.claude/hooks/` and registers it in `~/.claude/settings.json` without touching other settings, and `--check` reports a stale copy:
+A cloud session runs in a fresh container that has no plugin, no binary, and a transcript that is deleted along with the container. The rusty_mill monorepo's own `.claude/settings.json` registers `.claude/hooks/remind-me-capture.py` on `Stop` and `PreCompact`. The hook sends the transcript to the remote connector's `remind_me_capture_transcript` tool, which keeps one capture per session, as the plugin does (ADR-0029). It runs only when `CLAUDE_CODE_REMOTE=true`, the explicit opt-in `REMIND_ME_CLOUD_CAPTURE=1`, `REMIND_ME_URL` (the connector's `https://…/mcp` endpoint) and `REMIND_ME_TOKEN` are all set, so a local session is left to the plugin and holding the credentials alone captures nothing. Before anything leaves the container, thinking blocks are dropped, the values of fields named like secrets (`password`, `token`, `api_key`, …) are withheld, JSON inside strings is scrubbed field by field, and every string is scrubbed for the secret shapes the server redacts, quoted `key: "value"` pairs, bearer values and the token itself; tool calls and results are otherwise sent as they are, so turn the opt-in on only for environments whose sessions you want stored. The endpoint must be https, redirects are not followed, and the git remote is sent without credentials, query or fragment. To turn it on, set the opt-in and both variables in the cloud environment, keep the token as a secret, add the connector's host to the environment's network allowlist, and run the connector with the `full` tool profile. The hook always exits 0 and reports a failure on stderr as a fixed category, never server text. A session that checks out several repositories starts above them in `/home/user` and loads none of their `.claude/settings.json`, so the repository hook alone misses it. To capture every session of a cloud environment, add this to the environment's setup script, with `REF` a rusty_mill commit (pinning a commit fixes what runs); `scripts/install_cloud_capture.py` copies the hook into `~/.claude/hooks/` and registers it in `~/.claude/settings.json` without touching other settings, and `--check` reports a stale copy:
 
 ```bash
 # remind-me cloud session capture (ADR-0029)

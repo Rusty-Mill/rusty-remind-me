@@ -56,5 +56,5 @@ else:
 }
 
 missing_bin_message() {
-  echo '{"continue": true, "systemMessage": "rusty-remind-me is not on PATH, so the rusty_remind_me plugin cannot read or save memories. Build it (cargo build --release -p rusty-remind-me) and put target/release on PATH, or `cargo install --path crates/apps/rusty_remind_me/crates/remind_me_cli` from a Rusty-Mill/rusty_mill checkout."}'
+  echo '{"continue": true, "systemMessage": "rusty-remind-me is not on PATH, so the rusty_remind_me plugin cannot read or save memories. Build it (cargo build --release -p rusty-remind-me) and put target/release on PATH, or `cargo install --path crates/remind_me_cli` from a Rusty-Mill/rusty-remind-me checkout."}'
 }

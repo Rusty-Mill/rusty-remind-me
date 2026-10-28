@@ -47,11 +47,11 @@ settings, attach a volume mounted at `/data` and set the variables
 `REMIND_ME_HUB_DATA_DIR=/data/hub` and `SYNC_SECRET`. A volume is attached to
 one replica, so run a single instance.
 
-## The build context is the monorepo root
+## The build context is the repository root
 
-Every template here builds with the monorepo root (the directory holding the
+Every template here builds with the repository root (the directory holding the
 workspace `Cargo.toml` and `Cargo.lock`) as context and
-`crates/apps/rusty_remind_me/crates/remind_me_hub/Containerfile` as the file.
+`crates/remind_me_hub/Containerfile` as the file.
 That differs from the Python hub, whose context was `hub/` alone because it
 copied one `main.py`; this hub is a crate in a Cargo workspace. Building with
 any other directory as context fails on a missing manifest, which does not

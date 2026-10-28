@@ -7,10 +7,10 @@ Thank you for contributing to `rusty_remind_me`! This document outlines our deve
 ## 1. Development Setup
 
 ### Prerequisites
-- **Rust Toolchain**: Rust 1.94+ with Cargo (a demonstrated floor, not a bisected minimum). CI builds with current stable, like the rest of the Rusty Mill monorepo; the `rust-toolchain.toml` pin this product had as a standalone repo did not come across (a nested one would only apply when cargo runs from this directory, giving two toolchains in one checkout).
+- **Rust Toolchain**: pinned in `rust-toolchain.toml` (kept in step with rusty_mill's, whose crates this builds against); `rust-version` 1.89 is the declared floor.
 
 ### Local Workspace Setup
-This product lives in the Rusty Mill monorepo at `crates/apps/rusty_remind_me`. Run cargo from the monorepo root and always select this product's crates with `-p` — `--workspace` there means every Rusty Mill crate.
+Run cargo from the repository root; `--workspace` is this product's six crates. Monorepo crates (`rusty_mcp_server`, `rusty_tokio`, …) are git dependencies on `Rusty-Mill/rusty_mill`, all pinned to one `libs-*` tag in the root `Cargo.toml`. To move to a newer tag, change it there, run `cargo update`, and open a PR; a fix needed in one of those crates lands in rusty_mill first (its ADR-0013).
 
 ```bash
 # Clone the repository
@@ -83,17 +83,13 @@ Every crate in this product once listed the `rusty_*` "Rusty Mill" crates
 at those paths — the workspace failed to load, and not one source file
 actually called into any of them. They were removed.
 
-That monorepo now exists, and this product lives in it: those crates are
-workspace siblings under the monorepo's `crates/`. **Still do not add a
-`rusty_*` crate speculatively.** If a real call site needs a capability one
-of them provides, depend on it as a workspace path dependency (its
-`[workspace.dependencies]` entry in the root `Cargo.toml`, via
-`crate.workspace = true`) — never as a git dependency, which the monorepo's
-dependency-policy CI job rejects for any crate that is also a workspace
-member (root `docs/adr/0002-dependency-sovereignty-policy.md`). The layer
-rule applies too: this product is in `apps/`, so it may depend on
-`foundation/`, `platform/` and `libs/` crates, but nothing may depend on it
-(root `docs/adr/0003-workspace-layout-by-layer.md`).
+That monorepo now exists, and this product depends on it from outside.
+**Still do not add a `rusty_*` crate speculatively.** If a real call site
+needs a capability one of them provides, add it to the root
+`[workspace.dependencies]` with the same `git` URL and `tag` as the others
+(rusty_mill ADR-0013) and use it via `crate.workspace = true`. The layer rule
+still holds: this is an app, so it may use rusty_mill's `foundation/`,
+`platform/` and `libs/` crates, and nothing there may depend on it.
 
 ---
 
