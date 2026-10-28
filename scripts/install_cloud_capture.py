@@ -17,7 +17,10 @@ guard against directories changed concurrently. Files are staged beside their
 destination with recovery copies of the originals and replaced atomically; if
 the second replacement fails, the first is put back.
 
-Usage: install_cloud_capture.py [--check] [--home DIR] [--source HOOK]
+The hook lives in the rusty_mill repository, not here, so its path is always
+passed with --source; the installer never guesses one.
+
+Usage: install_cloud_capture.py [--check] [--home DIR] --source HOOK
 """
 from __future__ import annotations
 
@@ -33,9 +36,6 @@ from dataclasses import dataclass
 from typing import Any
 
 HOOK_NAME = 'remind-me-capture.py'
-HERE = pathlib.Path(__file__).resolve()
-# This checkout's copy; a downloaded installer passes --source instead.
-SOURCE = HERE.parents[4] / '.claude' / 'hooks' / HOOK_NAME if len(HERE.parents) > 4 else None
 COMMAND = f'python3 "$HOME"/.claude/hooks/{HOOK_NAME}'
 EVENTS = ('Stop', 'PreCompact')
 TIMEOUT_SECONDS = 30
@@ -299,8 +299,8 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     parser.add_argument('--home', type=pathlib.Path, default=pathlib.Path.home(),
                         help='home directory whose .claude/ to install into (default: $HOME)')
-    parser.add_argument('--source', type=pathlib.Path, default=SOURCE, required=SOURCE is None,
-                        help='the hook to install (default: this checkout\'s copy)')
+    parser.add_argument('--source', type=pathlib.Path, required=True,
+                        help='the hook to install: rusty_mill\'s .claude/hooks/remind-me-capture.py')
     parser.add_argument('--check', action='store_true', help='report drift, write nothing')
     args = parser.parse_args(argv)
     home = args.home.resolve()

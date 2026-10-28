@@ -14,8 +14,8 @@ Run cargo from the repository root; `--workspace` is this product's six crates. 
 
 ```bash
 # Clone the repository
-git clone https://github.com/Rusty-Mill/rusty_mill
-cd rusty_mill
+git clone https://github.com/Rusty-Mill/rusty-remind-me
+cd rusty-remind-me
 
 # Validate cargo dependencies and path resolution
 cargo check -p remind_me_core -p remind_me_mcp -p remind_me_api -p rusty-remind-me -p remind_me_remote -p remind_me_hub
