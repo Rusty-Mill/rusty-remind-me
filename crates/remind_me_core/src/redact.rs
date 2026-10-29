@@ -49,7 +49,7 @@ pub fn redact(content: &str) -> Redacted {
     let mut text = content.to_string();
     let mut hits = Vec::new();
     for (kind, find) in RULES {
-        let ranges = find(&text);
+        let ranges = coalesce(find(&text));
         if ranges.is_empty() {
             continue;
         }
@@ -80,6 +80,23 @@ pub fn guard(content: &str, tags: &mut Vec<String>, metadata: &mut Value) -> Str
     }
     metadata["redactions"] = json!(redacted.hits);
     redacted.content
+}
+
+/// `ranges` sorted, with overlapping or touching ranges merged into one, so
+/// [`replace`] can walk them left to right. A rule may report nested
+/// matches (`sk-<run>-sk-<run>`: the first run swallows the second prefix,
+/// which still matches on its own); merging covers both without leaking
+/// either.
+fn coalesce(mut ranges: Ranges) -> Ranges {
+    ranges.sort_unstable();
+    let mut out: Ranges = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        match out.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => out.push((start, end)),
+        }
+    }
+    out
 }
 
 fn replace(text: &str, ranges: &[(usize, usize)], kind: &str) -> String {
@@ -213,6 +230,11 @@ fn google_api_keys(text: &str) -> Ranges {
 /// or hyphens, with a known network prefix and length and a valid Luhn
 /// check digit. The prefix and length rules keep millisecond timestamps
 /// and other long ids out.
+///
+/// A run of separated digit groups can hold more than a card (`<pan> 12 30`,
+/// two cards side by side), so every whole-group window of it is tried,
+/// longest valid card first from the earliest group. A window never splits
+/// a group, so digits glued to a longer number stay unmatched.
 fn card_numbers(text: &str) -> Ranges {
     let bytes = text.as_bytes();
     let mut out = Ranges::new();
@@ -222,30 +244,72 @@ fn card_numbers(text: &str) -> Ranges {
             i += 1;
             continue;
         }
-        let end = digit_span_end(bytes, i);
-        let digits: Vec<u8> = bytes[i..end]
-            .iter()
-            .filter(|b| b.is_ascii_digit())
-            .map(|b| b - b'0')
-            .collect();
-        let bounded = bytes.get(end).is_none_or(|&b| !is_alnum(b));
-        if bounded && is_card(&digits) {
-            out.push((i, end));
+        let groups = digit_groups(bytes, i);
+        let end = groups.last().map_or(i + 1, |g| g.1);
+        if bytes.get(end).is_none_or(|&b| !is_alnum(b)) {
+            out.extend(cards_in(bytes, &groups));
         }
-        i = end.max(i + 1);
+        i = end;
     }
     out
 }
 
-/// End of a run of digits joined by single ` ` or `-` separators.
-fn digit_span_end(bytes: &[u8], start: usize) -> usize {
-    let mut end = start + run(bytes, start, |b| b.is_ascii_digit());
-    while matches!(bytes.get(end), Some(b' ' | b'-'))
-        && bytes.get(end + 1).is_some_and(u8::is_ascii_digit)
-    {
-        end += 1 + run(bytes, end + 1, |b| b.is_ascii_digit());
+/// The digit groups of a run joined by single ` ` or `-` separators,
+/// starting at `start`.
+fn digit_groups(bytes: &[u8], start: usize) -> Ranges {
+    let digit = |b: u8| b.is_ascii_digit();
+    let mut groups = vec![(start, start + run(bytes, start, digit))];
+    while let Some(&(_, end)) = groups.last() {
+        let joined = matches!(bytes.get(end), Some(b' ' | b'-'))
+            && bytes.get(end + 1).is_some_and(u8::is_ascii_digit);
+        if !joined {
+            break;
+        }
+        groups.push((end + 1, end + 1 + run(bytes, end + 1, digit)));
     }
-    end
+    groups
+}
+
+/// Each longest whole-group window of `groups` that is a card-shaped valid
+/// card, taken left to right without overlap.
+fn cards_in(bytes: &[u8], groups: &[(usize, usize)]) -> Ranges {
+    let mut out = Ranges::new();
+    let mut first = 0;
+    while first < groups.len() {
+        let mut digits: Vec<u8> = Vec::new();
+        let mut lens: Vec<usize> = Vec::new();
+        let mut found = None;
+        for (last, &(start, end)) in groups.iter().enumerate().skip(first) {
+            digits.extend(bytes[start..end].iter().map(|b| b - b'0'));
+            lens.push(end - start);
+            if digits.len() > 19 {
+                break;
+            }
+            if card_shaped(&lens) && is_card(&digits) {
+                found = Some(last);
+            }
+        }
+        match found {
+            Some(last) => {
+                out.push((groups[first].0, groups[last].1));
+                first = last + 1;
+            }
+            None => first += 1,
+        }
+    }
+    out
+}
+
+/// Whether digit groups of these lengths are how a card is written: one
+/// unbroken run, groups of four with a short tail (`4-4-4-4`, `4-4-4-4-3`),
+/// or the Amex/Diners `4-6-5`/`4-6-4`. Keeps the tails of longer
+/// separator-joined numbers, such as an all-digit UUID, from matching.
+fn card_shaped(lens: &[usize]) -> bool {
+    match lens {
+        [_] | [4, 6, 4 | 5] => true,
+        [head @ .., tail] => head.iter().all(|&n| n == 4) && (1..=4).contains(tail),
+        [] => false,
+    }
 }
 
 fn is_card(digits: &[u8]) -> bool {
@@ -545,6 +609,74 @@ mod tests {
                 r.content,
                 format!("{scheme}://app:[REDACTED:url_credentials]@{host}")
             );
+        }
+    }
+
+    #[test]
+    fn nested_and_repeated_prefixes_redact_without_panicking() {
+        let body = |c: &str| c.repeat(32);
+        for text in [
+            format!("sk-{}-sk-{}", body("a"), body("b")),
+            format!("glpat-{}-glpat-{}", body("a"), body("b")),
+            format!(
+                "github_pat_{}_github_pat_{}",
+                body("a").repeat(2),
+                body("b").repeat(2)
+            ),
+            format!("sk-{}sk-{} tail", body("a"), body("b")),
+        ] {
+            let r = redact(&format!("x {text} y"));
+            assert!(r.content.starts_with("x [REDACTED:"), "{}", r.content);
+            assert!(
+                !r.content.contains("aaaa") && !r.content.contains("bbbb"),
+                "{}",
+                r.content
+            );
+        }
+    }
+
+    #[test]
+    fn coalesce_merges_nested_overlapping_and_touching_ranges() {
+        assert_eq!(coalesce(vec![(36, 71), (0, 71)]), vec![(0, 71)]);
+        assert_eq!(
+            coalesce(vec![(5, 9), (0, 6), (9, 12), (20, 25)]),
+            vec![(0, 12), (20, 25)]
+        );
+    }
+
+    #[test]
+    fn cards_next_to_other_numbers_are_still_redacted() {
+        let cases = [
+            ("4111111111111111 12/30", "[REDACTED:card_number] 12/30"),
+            ("4111111111111111 12 30", "[REDACTED:card_number] 12 30"),
+            (
+                "ref 2026 4111 1111 1111 1111",
+                "ref 2026 [REDACTED:card_number]",
+            ),
+            (
+                "4111111111111111 5555555555554444",
+                "[REDACTED:card_number] [REDACTED:card_number]",
+            ),
+            (
+                "4111-1111-1111-1111 378282246310005",
+                "[REDACTED:card_number] [REDACTED:card_number]",
+            ),
+        ];
+        for (input, want) in cases {
+            assert_eq!(redact(input).content, want, "{input}");
+        }
+    }
+
+    #[test]
+    fn a_card_glued_into_a_longer_number_is_not_matched() {
+        for text in [
+            "41111111111111119",
+            "x4111111111111111",
+            "4111111111111111y",
+            "11111111-2222-3333-4444-555555555555",
+            "ref 4444-555555555555",
+        ] {
+            assert!(kinds(text).is_empty(), "{text}");
         }
     }
 
