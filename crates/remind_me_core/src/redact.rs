@@ -245,11 +245,8 @@ fn card_numbers(text: &str) -> Ranges {
             continue;
         }
         let groups = digit_groups(bytes, i);
-        let end = groups.last().map_or(i + 1, |g| g.1);
-        if bytes.get(end).is_none_or(|&b| !is_alnum(b)) {
-            out.extend(cards_in(bytes, &groups));
-        }
-        i = end;
+        out.extend(cards_in(bytes, &groups));
+        i = groups.last().map_or(i + 1, |g| g.1);
     }
     out
 }
@@ -271,7 +268,8 @@ fn digit_groups(bytes: &[u8], start: usize) -> Ranges {
 }
 
 /// Each longest whole-group window of `groups` that is a card-shaped valid
-/// card, taken left to right without overlap.
+/// card not glued to a following letter or digit, taken left to right
+/// without overlap.
 fn cards_in(bytes: &[u8], groups: &[(usize, usize)]) -> Ranges {
     let mut out = Ranges::new();
     let mut first = 0;
@@ -285,7 +283,8 @@ fn cards_in(bytes: &[u8], groups: &[(usize, usize)]) -> Ranges {
             if digits.len() > 19 {
                 break;
             }
-            if card_shaped(&lens) && is_card(&digits) {
+            let bounded = bytes.get(end).is_none_or(|&b| !is_alnum(b));
+            if bounded && card_shaped(&lens) && is_card(&digits) {
                 found = Some(last);
             }
         }
@@ -652,6 +651,10 @@ mod tests {
             (
                 "ref 2026 4111 1111 1111 1111",
                 "ref 2026 [REDACTED:card_number]",
+            ),
+            (
+                "4111111111111111 12months",
+                "[REDACTED:card_number] 12months",
             ),
             (
                 "4111111111111111 5555555555554444",
