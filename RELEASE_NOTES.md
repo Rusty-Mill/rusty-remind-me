@@ -13,6 +13,16 @@ Dated entries, newest first. One entry per merged pull request.
 ### Tests
 - A fake `/v1/embeddings` server covers the request path and model, a trailing `/v1` in the URL, out-of-order entries, wrong counts, bad, missing and malformed (null, string, fractional, negative) indexes, chunked and truncated chunked responses, a dimension mismatch, a non-2xx status and a missing model. The Ollama, availability-cache and status suites pass unchanged.
 
+## 2026-10-29 — Redaction catches more secret shapes
+
+### Added
+- Write-time redaction (`redact.rs`) now also replaces OpenAI and Anthropic `sk-` keys (`llm_api_key`), Stripe secret, restricted and webhook keys (`stripe_key`), GitLab tokens (`gitlab_token`), GitHub fine-grained `github_pat_` tokens (`github_token`), npm (`npm_token`) and PyPI (`pypi_token`) tokens, Google API keys (`google_api_key`) and payment card numbers (`card_number`: a known network prefix and length plus a Luhn check, optionally grouped by spaces or hyphens). Still hand-rolled, no `regex`.
+- Postgres, MySQL and MongoDB connection-string passwords were already covered by the URL-credentials rule; tests now say so.
+
+### Tests
+- One case per new shape, and ordinary text that must stay untouched: millisecond timestamps, numbers that fail Luhn or have no network prefix, phone numbers, `ask-me`-style words and bare prefixes.
+- Not done: the optional `REMIND_ME_REDACT=block` mode for importers. It changes the importer's report, so it is left for its own change.
+
 ## 2026-10-29 — Tool descriptions say what a good fact looks like
 
 ### Changed
