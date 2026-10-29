@@ -2,6 +2,14 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-10-29 — Merged memories count their evidence
+
+### Added
+- `remind_me_consolidate` records on each canonical memory how many memories it now stands for, as `metadata.evidence`, accumulated across merges (a merged member that was itself a canonical brings its own count). The count raises `base_weight` by `1 + 0.1·ln(evidence)`, capped at 1.5× and within the existing `base_weight` bounds; only the change since the last merge is applied, so a repeat merge does not compound. No schema change.
+
+### Tests
+- Unit: default and malformed counts, first merge, repeat merge equals a single merge, the cap. Integration: a real merge writes `evidence: 2` and the boosted weight; a second merge reaches `evidence: 3` without compounding.
+
 ## 2026-10-28 — 0.4.1: released from this repository again
 
 ### Changed

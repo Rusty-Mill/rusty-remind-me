@@ -20,12 +20,18 @@
 //!     memory, deduplicating lines and summing access counts, then supersedes
 //!     the rest via the same `superseded_by` mechanism
 //!     [`crate::entity::supersede_contradicting_facts`] already uses.
+//!   - **Evidence**: the canonical's `metadata.evidence` counts the memories
+//!     it now stands for, accumulated across merges, and nudges its
+//!     `base_weight` up by a small, capped factor ([`evidence_weight`]).
 
+use crate::db::feedback::Feedback;
 use crate::db::memories::Memories;
 use crate::db::vectors::Vectors;
 use crate::db::Store;
 use crate::models::ConsolidateInput;
-use crate::vitality::calculate_vitality;
+use crate::vitality::{
+    calculate_vitality, BASE_WEIGHT_MAX, BASE_WEIGHT_MIN, EVIDENCE_BOOST, EVIDENCE_FACTOR_MAX,
+};
 use chrono::Utc;
 
 use crate::db::Result as SqlResult;
@@ -283,6 +289,29 @@ pub fn merge_cluster(
     }
 }
 
+/// How many memories `metadata` stands for: its `evidence` count, or 1 for
+/// a memory that has never absorbed a merge (or carries a malformed count).
+pub fn evidence_of(metadata: Option<&Json>) -> u64 {
+    metadata
+        .and_then(|m| m.get("evidence"))
+        .and_then(Json::as_u64)
+        .filter(|&n| n >= 1)
+        .unwrap_or(1)
+}
+
+fn evidence_factor(evidence: u64) -> f64 {
+    (1.0 + EVIDENCE_BOOST * (evidence.max(1) as f64).ln()).min(EVIDENCE_FACTOR_MAX)
+}
+
+/// `base_weight` rescaled from `before` to `after` pieces of evidence. Only
+/// the change in factor is applied, so a weight already carrying an earlier
+/// merge's boost is not boosted twice; the result stays within
+/// [`BASE_WEIGHT_MIN`]..=[`BASE_WEIGHT_MAX`].
+pub fn evidence_weight(base_weight: f64, before: u64, after: u64) -> f64 {
+    let scaled = base_weight * evidence_factor(after) / evidence_factor(before);
+    scaled.clamp(BASE_WEIGHT_MIN, BASE_WEIGHT_MAX)
+}
+
 // ---------------------------------------------------------------------------
 // DB-touching orchestration
 // ---------------------------------------------------------------------------
@@ -459,6 +488,22 @@ fn apply_merges(
         let merged = merge_cluster(canonical, &member_refs, Some(summary.as_str()));
 
         let memories = Memories::new(store);
+        let ids: Vec<String> = cluster.iter().map(|m| m.id.clone()).collect();
+        let mut metadata: HashMap<String, Json> = memories
+            .get_many(&ids)?
+            .into_iter()
+            .map(|m| (m.id, m.metadata))
+            .collect();
+        let before = evidence_of(metadata.get(&canonical.id));
+        let after: u64 = ids.iter().map(|id| evidence_of(metadata.get(id))).sum();
+        let mut canonical_metadata = metadata
+            .remove(&canonical.id)
+            .filter(Json::is_object)
+            .unwrap_or_else(|| json!({}));
+        canonical_metadata["evidence"] = json!(after);
+        // Before `set_merged`, whose `updated_at` stamp puts the row, this
+        // metadata included, in the sync outbox.
+        memories.set_tags_and_metadata(&canonical.id, &merged.merged_tags, &canonical_metadata)?;
         memories.set_merged(
             &canonical.id,
             &merged.merged_content,
@@ -470,14 +515,15 @@ fn apply_merges(
         // Recompute vitality for the canonical at zero elapsed days, the same
         // write-time snapshot `add_memory` seeds — `calculate_vitality`
         // already applies bridge protection internally from `access_count`.
+        let base_weight = evidence_weight(canonical.base_weight, before, after);
         let new_vitality = calculate_vitality(
-            canonical.base_weight,
+            base_weight,
             merged.total_access_count,
             canonical.decay_rate,
             &now_iso,
             now,
         );
-        memories.set_vitality(&canonical.id, new_vitality, "active")?;
+        Feedback::new(store).set_importance(&canonical.id, base_weight, new_vitality, "active")?;
 
         for member_id in &merged.superseded_ids {
             memories.set_superseded_by(member_id, &canonical.id, Some(&now_iso))?;
@@ -710,6 +756,39 @@ mod tests {
             merged.superseded_ids,
             vec!["a".to_string(), "b".to_string()]
         );
+    }
+
+    #[test]
+    fn evidence_defaults_to_one_and_ignores_malformed_counts() {
+        assert_eq!(evidence_of(None), 1);
+        assert_eq!(evidence_of(Some(&json!({}))), 1);
+        assert_eq!(evidence_of(Some(&json!({"evidence": 0}))), 1);
+        assert_eq!(evidence_of(Some(&json!({"evidence": "4"}))), 1);
+        assert_eq!(evidence_of(Some(&json!({"evidence": -2}))), 1);
+        assert_eq!(evidence_of(Some(&json!({"evidence": 4}))), 4);
+    }
+
+    #[test]
+    fn evidence_weight_boosts_the_first_merge_by_the_log_factor() {
+        let w = evidence_weight(1.0, 1, 2);
+        assert!((w - (1.0 + 0.1 * 2f64.ln())).abs() < 1e-12);
+    }
+
+    #[test]
+    fn evidence_weight_applies_only_the_change_on_a_repeat_merge() {
+        let once = evidence_weight(1.0, 1, 3);
+        let twice = evidence_weight(evidence_weight(1.0, 1, 2), 2, 3);
+        assert!((once - twice).abs() < 1e-12);
+    }
+
+    #[test]
+    fn evidence_weight_is_capped() {
+        let factor = evidence_weight(1.0, 1, 1_000_000);
+        assert!((factor - EVIDENCE_FACTOR_MAX).abs() < 1e-12);
+        assert_eq!(evidence_weight(BASE_WEIGHT_MAX, 1, 50), BASE_WEIGHT_MAX);
+        // Past the cap more evidence changes nothing.
+        let capped = evidence_weight(1.0, 1, 500_000);
+        assert_eq!(evidence_weight(capped, 500_000, 1_000_000), capped);
     }
 
     #[test]
