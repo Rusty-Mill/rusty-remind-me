@@ -216,32 +216,45 @@ fn a_missing_or_malformed_index_is_an_error() {
 
 #[test]
 fn a_chunked_response_is_decoded() {
-    let body = response(&[(1, vec![0.0, 2.0]), (0, vec![3.0, 0.0])]);
-    let (url, handle) = raw_server(chunked(&body, 7, "0\r\n\r\n"));
-    let embedder = OpenAiEmbedder::new("m", url, 2);
+    for terminator in ["0\r\n\r\n", "0\r\nX-Trailer: v\r\nX-Other: w\r\n\r\n"] {
+        let body = response(&[(1, vec![0.0, 2.0]), (0, vec![3.0, 0.0])]);
+        let (url, handle) = raw_server(chunked(&body, 7, terminator));
+        let embedder = OpenAiEmbedder::new("m", url, 2);
 
-    let vectors = embedder
-        .embed(&["a".to_string(), "b".to_string()], EmbedRole::Passage)
-        .unwrap();
+        let vectors = embedder
+            .embed(&["a".to_string(), "b".to_string()], EmbedRole::Passage)
+            .unwrap();
 
-    assert_eq!(vectors, vec![vec![1.0, 0.0], vec![0.0, 1.0]]);
-    handle.join().unwrap();
+        assert_eq!(
+            vectors,
+            vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+            "{terminator:?}"
+        );
+        handle.join().unwrap();
+    }
 }
 
 #[test]
 fn a_truncated_chunked_response_is_an_error() {
     let body = response(&[(0, vec![1.0, 0.0])]);
-    let mut raw = chunked(&body, 7, "");
-    raw.truncate(raw.len() - 4);
-    let (url, handle) = raw_server(raw);
-    let embedder = OpenAiEmbedder::new("m", url, 2);
+    let mut cut_mid_chunk = chunked(&body, 7, "");
+    cut_mid_chunk.truncate(cut_mid_chunk.len() - 4);
+    for raw in [
+        cut_mid_chunk,
+        chunked(&body, 7, "0\r\n"),
+        chunked(&body, 7, "0\r\nX-Trailer: v\r\n"),
+        chunked(&body, 7, "0\r\nX-Trailer: v"),
+    ] {
+        let (url, handle) = raw_server(raw.clone());
+        let embedder = OpenAiEmbedder::new("m", url, 2);
 
-    let err = embedder
-        .embed(&["a".to_string()], EmbedRole::Passage)
-        .unwrap_err();
+        let err = embedder
+            .embed(&["a".to_string()], EmbedRole::Passage)
+            .unwrap_err();
 
-    assert!(err.0.contains("malformed HTTP response"), "{err}");
-    handle.join().unwrap();
+        assert!(err.0.contains("malformed HTTP response"), "{raw:?}: {err}");
+        handle.join().unwrap();
+    }
 }
 
 #[test]

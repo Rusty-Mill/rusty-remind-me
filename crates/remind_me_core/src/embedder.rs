@@ -373,7 +373,8 @@ fn response_body(raw: &[u8], label: &str) -> Result<String, EmbedError> {
 }
 
 /// The payload of a chunked transfer-encoded `body`, or `None` if it is cut
-/// short or a chunk size is not hex. Chunk extensions and trailers are ignored.
+/// short (the trailer section's closing empty line included) or a chunk size
+/// is not hex. Chunk extensions and trailer fields are ignored.
 fn dechunk(mut body: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     loop {
@@ -382,7 +383,8 @@ fn dechunk(mut body: &[u8]) -> Option<Vec<u8>> {
         let size = usize::from_str_radix(line.split(';').next()?.trim(), 16).ok()?;
         body = &body[line_end + 2..];
         if size == 0 {
-            return Some(out);
+            let terminated = body.starts_with(b"\r\n") || body.windows(4).any(|w| w == b"\r\n\r\n");
+            return terminated.then_some(out);
         }
         let chunk = body.get(..size)?;
         if body.get(size..size + 2)? != b"\r\n" {
