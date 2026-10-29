@@ -107,6 +107,13 @@ pub const FEEDBACK_ADJUSTMENT_CAP: f64 = 0.4;
 /// Ceiling and floor `base_weight` is clamped to, so repeated feedback on one
 /// memory cannot run away in either direction.
 pub const BASE_WEIGHT_MAX: f64 = 3.0;
+
+/// Weight of corroborating evidence: a canonical memory that absorbed `n`
+/// merged duplicates scores `1 + EVIDENCE_BOOST * ln(n)` on `base_weight`
+/// (Hindsight's proof-count boost, alpha = 0.1), capped at
+/// [`EVIDENCE_FACTOR_MAX`] so repetition alone cannot dominate ranking.
+pub const EVIDENCE_BOOST: f64 = 0.1;
+pub const EVIDENCE_FACTOR_MAX: f64 = 1.5;
 pub const BASE_WEIGHT_MIN: f64 = 0.1;
 
 /// Factor applied to [`FEEDBACK_MAGNITUDE`] when the memory was written by

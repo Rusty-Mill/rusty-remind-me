@@ -306,3 +306,79 @@ fn superseded_members_are_excluded_from_a_later_consolidate_pass() {
         "the superseded member must not resurface as a consolidation candidate"
     );
 }
+
+fn merge_into(store: &Store<'_>, canonical: &str, summary: &str) -> serde_json::Value {
+    let mut summaries = HashMap::new();
+    summaries.insert(canonical.to_string(), summary.to_string());
+    consolidate(
+        store,
+        &ConsolidateInput {
+            dry_run: false,
+            summaries: Some(summaries),
+            ..default_input()
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_merge_records_evidence_and_raises_base_weight() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let canonical = add_with_vector(&store, "the meeting moved to 3pm", "general", &[1.0, 0.0]);
+    let member = add_with_vector(&store, "meeting is now at 3pm", "general", &[0.99, 0.14107]);
+    set_vitality_and_access(&store, &canonical, 0.9, 5);
+    set_vitality_and_access(&store, &member, 0.5, 3);
+    let before = queries::get_memory_by_id(&store, &canonical)
+        .unwrap()
+        .unwrap();
+
+    merge_into(&store, &canonical, "the meeting is at 3pm");
+
+    let after = queries::get_memory_by_id(&store, &canonical)
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.metadata["evidence"], 2);
+    let want = before.base_weight * (1.0 + 0.1 * 2f64.ln());
+    assert!(
+        (after.base_weight - want).abs() < 1e-9,
+        "{}",
+        after.base_weight
+    );
+}
+
+#[test]
+fn evidence_accumulates_across_merges_without_compounding_the_boost() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let canonical = add_with_vector(&store, "the meeting moved to 3pm", "general", &[1.0, 0.0]);
+    let first = add_with_vector(&store, "meeting is now at 3pm", "general", &[0.99, 0.14107]);
+    set_vitality_and_access(&store, &canonical, 0.9, 5);
+    set_vitality_and_access(&store, &first, 0.5, 3);
+    let original = queries::get_memory_by_id(&store, &canonical)
+        .unwrap()
+        .unwrap()
+        .base_weight;
+    merge_into(&store, &canonical, "the meeting is at 3pm");
+
+    let second = add_with_vector(
+        &store,
+        "3pm is the meeting time",
+        "general",
+        &[0.98, 0.19867],
+    );
+    set_vitality_and_access(&store, &second, 0.1, 0);
+    let report = merge_into(&store, &canonical, "the meeting is at 3pm");
+
+    assert_eq!(report["canonical_ids"][0], canonical);
+    let after = queries::get_memory_by_id(&store, &canonical)
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.metadata["evidence"], 3);
+    let want = original * (1.0 + 0.1 * 3f64.ln());
+    assert!(
+        (after.base_weight - want).abs() < 1e-9,
+        "{}",
+        after.base_weight
+    );
+}
