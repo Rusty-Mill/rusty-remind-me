@@ -121,6 +121,45 @@ fn embed_returns_l2_normalized_vectors_parsed_from_the_response() {
     handle.join().unwrap();
 }
 
+/// Real Ollama sends `/api/embed` replies with `Transfer-Encoding: chunked`
+/// (no `Content-Length`); the client must decode them, not parse the chunk
+/// size lines as JSON.
+#[test]
+fn embed_decodes_a_chunked_response_like_real_ollama_sends() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let body = embed_response(&[vec![3.0, 4.0]]);
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        read_request_body(&mut stream);
+        let (first, second) = body.split_at(body.len() / 2);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{}\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+            first.len(),
+            first,
+            second.len(),
+            second
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write response");
+    });
+    let embedder = OllamaEmbedder::new(
+        "qwen3-embedding:0.6b",
+        format!("http://127.0.0.1:{port}"),
+        2,
+    );
+
+    let vectors = embedder
+        .embed(&["hello".to_string()], EmbedRole::Passage)
+        .unwrap();
+
+    assert_eq!(vectors.len(), 1);
+    assert!((vectors[0][0] - 0.6).abs() < 1e-5);
+    assert!((vectors[0][1] - 0.8).abs() < 1e-5);
+    handle.join().unwrap();
+}
+
 #[test]
 fn embed_sends_the_models_role_prefix_and_the_configured_model_name() {
     let (url, handle) = fake_server(vec![embed_response(&[vec![1.0, 0.0]])]);

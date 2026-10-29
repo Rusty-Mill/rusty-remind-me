@@ -2,6 +2,16 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-10-29 — Ollama embeddings work against a real Ollama
+
+### Fixed
+- The Ollama embedder now decodes `Transfer-Encoding: chunked` replies. Ollama sends every real `/api/embed` reply chunked, so each embed failed with "Ollama response was not JSON", status showed the backend as "configured but not answering", and `remind_me_reindex` stayed degraded. Found on Ollama 0.40.5 with `qwen3-embedding:0.6b`.
+- A truncated or malformed chunked reply is a clear error, not a partial parse.
+
+### Tests
+- New: a fake Ollama that replies chunked (fails on the old code with the same error seen live), and unit tests for the decoder covering extensions, trailers, truncation, bad sizes and size overflow.
+- Not tested here: a real Ollama daemon.
+
 ## 2026-10-29 — Tool descriptions say what a good fact looks like
 
 ### Changed
