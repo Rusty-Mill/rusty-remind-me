@@ -501,16 +501,6 @@ fn apply_merges(
             .filter(Json::is_object)
             .unwrap_or_else(|| json!({}));
         canonical_metadata["evidence"] = json!(after);
-        // Before `set_merged`, whose `updated_at` stamp puts the row, this
-        // metadata included, in the sync outbox.
-        memories.set_tags_and_metadata(&canonical.id, &merged.merged_tags, &canonical_metadata)?;
-        memories.set_merged(
-            &canonical.id,
-            &merged.merged_content,
-            merged.total_access_count,
-            &merged.merged_tags,
-            &now_iso,
-        )?;
 
         // Recompute vitality for the canonical at zero elapsed days, the same
         // write-time snapshot `add_memory` seeds — `calculate_vitality`
@@ -523,7 +513,18 @@ fn apply_merges(
             &now_iso,
             now,
         );
+        // Metadata and weight first: only `set_merged` moves `updated_at`, so
+        // it alone queues the row for sync, carrying all three writes in one
+        // payload rather than a second same-timestamp update LWW would drop.
+        memories.set_tags_and_metadata(&canonical.id, &merged.merged_tags, &canonical_metadata)?;
         Feedback::new(store).set_importance(&canonical.id, base_weight, new_vitality, "active")?;
+        memories.set_merged(
+            &canonical.id,
+            &merged.merged_content,
+            merged.total_access_count,
+            &merged.merged_tags,
+            &now_iso,
+        )?;
 
         for member_id in &merged.superseded_ids {
             memories.set_superseded_by(member_id, &canonical.id, Some(&now_iso))?;
