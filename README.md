@@ -524,6 +524,7 @@ off entirely.
 | Backend | `REMIND_ME_EMBEDDING_BACKEND` | Needs |
 | --- | --- | --- |
 | Ollama | `ollama` | A running Ollama daemon (`REMIND_ME_OLLAMA_URL`, default `http://localhost:11434`; `REMIND_ME_OLLAMA_EMBED_MODEL`, default `nomic-embed-text`) |
+| OpenAI-compatible | `openai` | A server speaking `POST /v1/embeddings`, such as llama.cpp's `llama-server --embeddings` or llama-swap (`REMIND_ME_OPENAI_EMBED_URL`, default `http://localhost:8080`, a trailing `/v1` is fine; `REMIND_ME_OPENAI_EMBED_MODEL`, required, the model name the server routes on). Plain `http://`, no API key |
 | In-process ONNX | `onnx` | Build with `--features remind_me_core/local-embed`; `REMIND_ME_ONNX_MODEL_PATH`/`REMIND_ME_ONNX_TOKENIZER_PATH` pointing at a `.rten` bi-encoder + its `tokenizer.json` — no implicit download, same convention as reranking below |
 
 `REMIND_ME_EMBEDDING_DIM` (default `384`, sized for
