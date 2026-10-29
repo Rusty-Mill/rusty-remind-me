@@ -12,6 +12,14 @@ Dated entries, newest first. One entry per merged pull request.
 - One case per new shape, and ordinary text that must stay untouched: millisecond timestamps, numbers that fail Luhn or have no network prefix, phone numbers, `ask-me`-style words and bare prefixes.
 - Not done: the optional `REMIND_ME_REDACT=block` mode for importers. It changes the importer's report, so it is left for its own change.
 
+## 2026-10-29 — Tool descriptions say what a good fact looks like
+
+### Changed
+- `remind_me_decompose` asks for 2-5 facts per conversation, each self-contained (who, what, when, why) with relative dates resolved to absolute ones; its `content` field says the same. `remind_me_auto_capture` asks for a summary that stands alone, with absolute dates. Wording only; no schema or behaviour change.
+
+### Tests
+- The description-convention test (core leads with "remind-me") and the full `remind_me_mcp` suite pass unchanged.
+
 ## 2026-10-28 — 0.4.1: released from this repository again
 
 ### Changed
