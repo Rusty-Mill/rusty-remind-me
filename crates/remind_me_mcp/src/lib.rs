@@ -310,7 +310,7 @@ fn decompose_input_schema() -> Value {
     let fact = json!({
         "type": "object",
         "properties": {
-            "content": { "type": "string", "minLength": 1, "maxLength": 50000 },
+            "content": { "type": "string", "minLength": 1, "maxLength": 50000, "description": "One self-contained fact in a full sentence: who, what, when (an absolute date) and why" },
             "memory_type": { "type": "string", "description": "decision, preference, fact, insight, learning, blocker or action_item; defaults to unclassified" },
             "extra_tags": { "type": "array", "items": { "type": "string" }, "description": "Merged with the parent capture's tags" },
             "subject": { "type": "string", "maxLength": 200 },
@@ -965,7 +965,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_decompose",
-                                "description": "remind-me pipeline: break a captured conversation into individually searchable atomic facts, each linked to the capture. A fact whose subject/predicate match an existing fact but whose object differs supersedes it.",
+                                "description": "remind-me pipeline: break a captured conversation into individually searchable atomic facts, each linked to the capture. Write 2-5 per conversation, each self-contained for a reader with no other context: who, what, when and why, with relative dates resolved to absolute ones (2026-10-03, not 'last Friday'). A fact whose subject/predicate match an existing fact but whose object differs supersedes it.",
                                 "inputSchema": decompose_input_schema()
                             },
                             {
@@ -991,13 +991,13 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_auto_capture",
-                                "description": "Save a whole conversation to remind-me as two linked memories, the verbatim dialog and a concise summary; call this at the end of any substantive conversation. They share a capture_id, which remind_me_get retrieves both by and remind_me_decompose breaks into atomic facts.",
+                                "description": "Save a whole conversation to remind-me as two linked memories, the verbatim dialog and a concise summary; call this at the end of any substantive conversation. Write the summary to stand alone: who decided or learned what, when (absolute dates, never 'today' or 'yesterday') and why. They share a capture_id, which remind_me_get retrieves both by and remind_me_decompose breaks into atomic facts.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
                                         "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "json", "description": "json (default) returns the structured record; markdown returns a human-readable summary." },
                                         "conversation": { "type": "string", "minLength": 1, "maxLength": 500000, "description": "The verbatim exchange" },
-                                        "summary": { "type": "string", "minLength": 1, "maxLength": 50000, "description": "A concise distillation of it" },
+                                        "summary": { "type": "string", "minLength": 1, "maxLength": 50000, "description": "A concise, self-contained distillation: decisions, facts and action items with absolute dates" },
                                         "title": { "type": "string", "maxLength": 200, "description": "Defaults to the summary's first line" },
                                         "tags": { "type": "array", "items": { "type": "string" }, "maxItems": 20 },
                                         "category": { "type": "string", "default": "conversation", "maxLength": 100, "description": "Category for the SUMMARY; the dialog is always stored as 'dialog'" },
