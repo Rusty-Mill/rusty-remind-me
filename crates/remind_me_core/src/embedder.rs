@@ -332,23 +332,65 @@ fn post_json(url: &str, label: &str, path: &str, body: &str) -> Result<String, E
     stream
         .read_to_end(&mut raw)
         .map_err(|e| EmbedError(format!("reading from {label} failed: {e}")))?;
-    let text = String::from_utf8_lossy(&raw);
-    let (head, response_body) = text
-        .split_once("\r\n\r\n")
-        .ok_or_else(|| EmbedError(format!("malformed HTTP response from {label}")))?;
+    response_body(&raw, label)
+}
+
+/// The body of the raw HTTP/1.1 response `raw`, refused unless the status is
+/// 2xx. A `Transfer-Encoding: chunked` body is de-chunked first.
+fn response_body(raw: &[u8], label: &str) -> Result<String, EmbedError> {
+    let malformed = || EmbedError(format!("malformed HTTP response from {label}"));
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or_else(malformed)?;
+    let head = String::from_utf8_lossy(&raw[..split]);
+    let body = &raw[split + 4..];
     let status: u16 = head
         .lines()
         .next()
         .and_then(|line| line.split(' ').nth(1))
         .and_then(|code| code.parse().ok())
         .ok_or_else(|| EmbedError(format!("malformed HTTP status line from {label}")))?;
+    let chunked = head.lines().skip(1).any(|line| {
+        line.split_once(':').is_some_and(|(name, value)| {
+            name.trim().eq_ignore_ascii_case("transfer-encoding")
+                && value.trim().eq_ignore_ascii_case("chunked")
+        })
+    });
+    let body = if chunked {
+        dechunk(body).ok_or_else(malformed)?
+    } else {
+        body.to_vec()
+    };
+    let body = String::from_utf8_lossy(&body).into_owned();
     if !(200..300).contains(&status) {
         return Err(EmbedError(format!(
             "{label} returned {status}: {}",
-            response_body.trim()
+            body.trim()
         )));
     }
-    Ok(response_body.to_string())
+    Ok(body)
+}
+
+/// The payload of a chunked transfer-encoded `body`, or `None` if it is cut
+/// short or a chunk size is not hex. Chunk extensions and trailers are ignored.
+fn dechunk(mut body: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    loop {
+        let line_end = body.windows(2).position(|w| w == b"\r\n")?;
+        let line = std::str::from_utf8(&body[..line_end]).ok()?;
+        let size = usize::from_str_radix(line.split(';').next()?.trim(), 16).ok()?;
+        body = &body[line_end + 2..];
+        if size == 0 {
+            return Some(out);
+        }
+        let chunk = body.get(..size)?;
+        if body.get(size..size + 2)? != b"\r\n" {
+            return None;
+        }
+        out.extend_from_slice(chunk);
+        body = &body[size + 2..];
+    }
 }
 
 /// `texts` with the model family's instruction prefix for `role`, if any.
@@ -479,8 +521,11 @@ impl OpenAiEmbedder {
         for (position, entry) in data.iter().enumerate() {
             let index = entry
                 .get("index")
-                .and_then(|i| i.as_u64())
-                .map_or(position, |i| i as usize);
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|i| usize::try_from(i).ok())
+                .ok_or_else(|| {
+                    EmbedError(format!("{LABEL} entry {position} has no valid index"))
+                })?;
             let embedding = entry
                 .get("embedding")
                 .ok_or_else(|| EmbedError(format!("{LABEL} entry has no embedding")))?;

@@ -66,6 +66,34 @@ fn fake_server(
     (format!("http://127.0.0.1:{port}"), handle)
 }
 
+/// A fake server answering one request with the raw HTTP response `raw`.
+fn raw_server(raw: String) -> (String, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        read_request(&mut stream);
+        stream.write_all(raw.as_bytes()).expect("write response");
+    });
+    (format!("http://127.0.0.1:{port}"), handle)
+}
+
+/// `body` as a chunked HTTP 200 response, split into `size`-byte chunks
+/// (the first carrying a chunk extension), ending in `terminator`.
+fn chunked(body: &str, size: usize, terminator: &str) -> String {
+    let mut raw = String::from(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: Chunked\r\nConnection: close\r\n\r\n",
+    );
+    for (n, piece) in body.as_bytes().chunks(size).enumerate() {
+        let ext = if n == 0 { ";name=value" } else { "" };
+        raw.push_str(&format!("{:x}{ext}\r\n", piece.len()));
+        raw.push_str(std::str::from_utf8(piece).unwrap());
+        raw.push_str("\r\n");
+    }
+    raw.push_str(terminator);
+    raw
+}
+
 /// An OpenAI-style response with `(index, vector)` entries in the given order.
 fn response(entries: &[(usize, Vec<f32>)]) -> String {
     let data: Vec<_> = entries
@@ -158,6 +186,62 @@ fn a_repeated_or_out_of_range_index_is_an_error() {
         assert!(err.0.contains("bad index"), "{err}");
         handle.join().unwrap();
     }
+}
+
+#[test]
+fn a_missing_or_malformed_index_is_an_error() {
+    for index in [
+        None,
+        Some(serde_json::json!(null)),
+        Some(serde_json::json!("0")),
+        Some(serde_json::json!(0.5)),
+        Some(serde_json::json!(-1)),
+    ] {
+        let mut entry = serde_json::json!({ "embedding": [1.0, 0.0] });
+        if let Some(index) = &index {
+            entry["index"] = index.clone();
+        }
+        let body = serde_json::json!({ "data": [entry] }).to_string();
+        let (url, handle) = fake_server("200 OK", vec![body]);
+        let embedder = OpenAiEmbedder::new("m", url, 2);
+
+        let err = embedder
+            .embed(&["a".to_string()], EmbedRole::Passage)
+            .unwrap_err();
+
+        assert!(err.0.contains("no valid index"), "{index:?}: {err}");
+        handle.join().unwrap();
+    }
+}
+
+#[test]
+fn a_chunked_response_is_decoded() {
+    let body = response(&[(1, vec![0.0, 2.0]), (0, vec![3.0, 0.0])]);
+    let (url, handle) = raw_server(chunked(&body, 7, "0\r\n\r\n"));
+    let embedder = OpenAiEmbedder::new("m", url, 2);
+
+    let vectors = embedder
+        .embed(&["a".to_string(), "b".to_string()], EmbedRole::Passage)
+        .unwrap();
+
+    assert_eq!(vectors, vec![vec![1.0, 0.0], vec![0.0, 1.0]]);
+    handle.join().unwrap();
+}
+
+#[test]
+fn a_truncated_chunked_response_is_an_error() {
+    let body = response(&[(0, vec![1.0, 0.0])]);
+    let mut raw = chunked(&body, 7, "");
+    raw.truncate(raw.len() - 4);
+    let (url, handle) = raw_server(raw);
+    let embedder = OpenAiEmbedder::new("m", url, 2);
+
+    let err = embedder
+        .embed(&["a".to_string()], EmbedRole::Passage)
+        .unwrap_err();
+
+    assert!(err.0.contains("malformed HTTP response"), "{err}");
+    handle.join().unwrap();
 }
 
 #[test]

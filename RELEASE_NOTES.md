@@ -5,13 +5,13 @@ Dated entries, newest first. One entry per merged pull request.
 ## 2026-10-29 — Embeddings from an OpenAI-compatible server
 
 ### Added
-- `REMIND_ME_EMBEDDING_BACKEND=openai` embeds through `POST /v1/embeddings`, the endpoint llama.cpp's server, llama-swap, vLLM and LM Studio serve. Before, remind-me could only call Ollama's `/api/embed`, so a llama-swap embedder was unreachable. Set `REMIND_ME_OPENAI_EMBED_URL` (default `http://localhost:8080`) and `REMIND_ME_OPENAI_EMBED_MODEL`, and `REMIND_ME_EMBEDDING_DIM` to the model's dimension. Response entries are placed by their `index`; a wrong count, a repeated index or a wrong dimension is an error, not a silent mismatch.
+- `REMIND_ME_EMBEDDING_BACKEND=openai` embeds through `POST /v1/embeddings`, the endpoint llama.cpp's server, llama-swap, vLLM and LM Studio serve. Before, remind-me could only call Ollama's `/api/embed`, so a llama-swap embedder was unreachable. Set `REMIND_ME_OPENAI_EMBED_URL` (default `http://localhost:8080`) and `REMIND_ME_OPENAI_EMBED_MODEL`, and `REMIND_ME_EMBEDDING_DIM` to the model's dimension. Response entries are placed by their `index`; a wrong count, a missing, malformed, repeated or out-of-range index, or a wrong dimension is an error, not a silent mismatch.
 
 ### Changed
-- The Ollama backend's HTTP client is shared with the new backend; Ollama requests and error messages are unchanged.
+- The Ollama backend's HTTP client is shared with the new backend, and now decodes `Transfer-Encoding: chunked` responses, which it previously failed to parse as JSON. Ollama requests and error messages are otherwise unchanged.
 
 ### Tests
-- A fake `/v1/embeddings` server covers the request path and model, a trailing `/v1` in the URL, out-of-order entries, wrong counts, bad indexes, a dimension mismatch, a non-2xx status and a missing model. The Ollama, availability-cache and status suites pass unchanged.
+- A fake `/v1/embeddings` server covers the request path and model, a trailing `/v1` in the URL, out-of-order entries, wrong counts, bad, missing and malformed (null, string, fractional, negative) indexes, chunked and truncated chunked responses, a dimension mismatch, a non-2xx status and a missing model. The Ollama, availability-cache and status suites pass unchanged.
 
 ## 2026-10-28 — 0.4.1: released from this repository again
 
