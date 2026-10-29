@@ -55,7 +55,7 @@ This produces `target/release/rusty-remind-me`. Put it on `PATH` either by addin
 by installing it directly:
 
 ```bash
-cargo install --path crates/apps/rusty_remind_me/crates/remind_me_cli
+cargo install --locked --path crates/remind_me_cli
 ```
 
 Verify it's reachable:
