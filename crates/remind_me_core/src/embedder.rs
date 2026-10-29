@@ -1,12 +1,16 @@
 //! Turning text into vectors: chunking, the embedding backend(s), and
 //! graceful degradation when none is configured.
 //!
-//! Two backends, both matching the reference's own two supported backends
+//! Three backends; the first and last match the reference's own two
 //! (`embeddings.py`'s `OllamaEmbedder` and `_Embedder`):
 //!
 //! - `ollama` ([`OllamaEmbedder`]): Ollama's HTTP `/api/embed`. No compile-time
 //!   ML dependency, works with whatever retriever the operator already
 //!   pulled into Ollama.
+//! - `openai` ([`OpenAiEmbedder`]): the OpenAI-style `/v1/embeddings` that
+//!   llama.cpp's server, llama-swap, vLLM and LM Studio all serve. Same
+//!   hand-rolled HTTP client as `ollama`, only the request path and the
+//!   response shape differ.
 //! - `onnx` ([`OnnxEmbedder`], behind the `local-embed` feature): an
 //!   in-process ONNX bi-encoder via `rten` (the same pure-Rust runtime
 //!   `reranker`/`ocr` use), mean-pooled and L2-normalised the same way the
@@ -21,7 +25,7 @@
 //! # Off unless configured
 //!
 //! [`resolve_embedder`] returns `None` unless `REMIND_ME_EMBEDDING_BACKEND`
-//! is `ollama` or `onnx` — matching the folder watcher (#55) and webhook
+//! is `ollama`, `openai` or `onnx` — matching the folder watcher (#55) and webhook
 //! (#56) convention of "the risky/heavy thing stays off until asked for." A
 //! caller that gets `None` degrades to keyword-only search; nothing here
 //! ever makes that an error.
@@ -31,12 +35,18 @@ use std::net::TcpStream;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// `REMIND_ME_EMBEDDING_BACKEND` must be `ollama` or `onnx` to enable
-/// semantic search.
+/// `REMIND_ME_EMBEDDING_BACKEND` must be `ollama`, `openai` or `onnx` to
+/// enable semantic search.
 pub const EMBEDDING_BACKEND_ENV: &str = "REMIND_ME_EMBEDDING_BACKEND";
 pub const OLLAMA_URL_ENV: &str = "REMIND_ME_OLLAMA_URL";
 pub const OLLAMA_MODEL_ENV: &str = "REMIND_ME_OLLAMA_EMBED_MODEL";
 pub const EMBEDDING_DIM_ENV: &str = "REMIND_ME_EMBEDDING_DIM";
+/// Base URL of an OpenAI-compatible server, e.g. `http://baileyai:8080`; a
+/// trailing `/v1` is accepted and ignored.
+pub const OPENAI_EMBED_URL_ENV: &str = "REMIND_ME_OPENAI_EMBED_URL";
+/// The `model` sent with each request: the name the server (or llama-swap's
+/// config) routes on. Required; there is no sensible default.
+pub const OPENAI_EMBED_MODEL_ENV: &str = "REMIND_ME_OPENAI_EMBED_MODEL";
 /// Path to an ONNX bi-encoder, in `rten` format — see `reranker`'s
 /// `REMIND_ME_RERANK_MODEL_PATH` for the same convention and the same
 /// reason (no implicit download).
@@ -46,6 +56,8 @@ pub const ONNX_TOKENIZER_PATH_ENV: &str = "REMIND_ME_ONNX_TOKENIZER_PATH";
 
 pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
 pub const DEFAULT_OLLAMA_MODEL: &str = "nomic-embed-text";
+/// llama.cpp's server and llama-swap both listen on 8080 by default.
+pub const DEFAULT_OPENAI_EMBED_URL: &str = "http://localhost:8080";
 /// Matches the reference's own default, sized for
 /// `sentence-transformers/all-MiniLM-L6-v2` — the reference's default ONNX
 /// model and this crate's own `onnx` backend's expected dimension when
@@ -96,6 +108,13 @@ const ROLE_PREFIXES: &[(&str, &str, &str)] = &[
     (
         "bge-",
         "Represent this sentence for searching relevant passages: ",
+        "",
+    ),
+    // Qwen3-Embedding's query instruction, in its model card's exact
+    // `Instruct: {task}\nQuery:{query}` form; documents go in bare.
+    (
+        "qwen3-embed",
+        "Instruct: Given a search query, retrieve relevant passages that answer the query\nQuery:",
         "",
     ),
 ];
@@ -261,73 +280,109 @@ impl OllamaEmbedder {
             dim,
         }
     }
+}
 
-    fn host_port(&self) -> Result<(String, u16), EmbedError> {
-        let rest = self.url.strip_prefix("http://").ok_or_else(|| {
-            EmbedError(format!(
-                "only http:// Ollama URLs are supported, got {:?}",
-                self.url
-            ))
-        })?;
-        let (host, port) = rest
-            .split_once(':')
-            .ok_or_else(|| EmbedError(format!("Ollama URL has no port: {:?}", self.url)))?;
-        let port: u16 = port
-            .parse()
-            .map_err(|_| EmbedError(format!("invalid port in Ollama URL: {:?}", self.url)))?;
-        Ok((host.to_string(), port))
+/// `http://host:port` split into its host and port. `label` names the
+/// backend in errors.
+fn host_port(url: &str, label: &str) -> Result<(String, u16), EmbedError> {
+    let rest = url.strip_prefix("http://").ok_or_else(|| {
+        EmbedError(format!(
+            "only http:// {label} URLs are supported, got {url:?}"
+        ))
+    })?;
+    let (host, port) = rest
+        .split_once(':')
+        .ok_or_else(|| EmbedError(format!("{label} URL has no port: {url:?}")))?;
+    let port: u16 = port
+        .parse()
+        .map_err(|_| EmbedError(format!("invalid port in {label} URL: {url:?}")))?;
+    Ok((host.to_string(), port))
+}
+
+/// POST `body` as JSON to `url` + `path` and return the response body of a
+/// 2xx reply. `label` names the backend in errors.
+fn post_json(url: &str, label: &str, path: &str, body: &str) -> Result<String, EmbedError> {
+    let (host, port) = host_port(url, label)?;
+    // `connect_timeout` needs a concrete `SocketAddr`, so a hostname
+    // (e.g. "localhost") is resolved first — this also transparently
+    // covers an IP literal, which resolves to itself.
+    use std::net::ToSocketAddrs;
+    let addr = (host.as_str(), port)
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut a| a.next())
+        .ok_or_else(|| EmbedError(format!("cannot resolve {label} host {host:?}")))?;
+    let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
+        .map_err(|e| EmbedError(format!("cannot reach {label} at {url}: {e}")))?;
+    stream.set_read_timeout(Some(IO_TIMEOUT)).ok();
+    stream.set_write_timeout(Some(IO_TIMEOUT)).ok();
+
+    let request = format!(
+        "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        path,
+        host,
+        body.len(),
+        body
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| EmbedError(format!("writing to {label} failed: {e}")))?;
+
+    let mut raw = Vec::new();
+    stream
+        .read_to_end(&mut raw)
+        .map_err(|e| EmbedError(format!("reading from {label} failed: {e}")))?;
+    let text = String::from_utf8_lossy(&raw);
+    let (head, response_body) = text
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| EmbedError(format!("malformed HTTP response from {label}")))?;
+    let status: u16 = head
+        .lines()
+        .next()
+        .and_then(|line| line.split(' ').nth(1))
+        .and_then(|code| code.parse().ok())
+        .ok_or_else(|| EmbedError(format!("malformed HTTP status line from {label}")))?;
+    if !(200..300).contains(&status) {
+        return Err(EmbedError(format!(
+            "{label} returned {status}: {}",
+            response_body.trim()
+        )));
     }
+    Ok(response_body.to_string())
+}
 
-    fn post_json(&self, path: &str, body: &str) -> Result<String, EmbedError> {
-        let (host, port) = self.host_port()?;
-        // `connect_timeout` needs a concrete `SocketAddr`, so a hostname
-        // (e.g. "localhost") is resolved first — this also transparently
-        // covers an IP literal, which resolves to itself.
-        use std::net::ToSocketAddrs;
-        let addr = (host.as_str(), port)
-            .to_socket_addrs()
-            .ok()
-            .and_then(|mut a| a.next())
-            .ok_or_else(|| EmbedError(format!("cannot resolve Ollama host {:?}", host)))?;
-        let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
-            .map_err(|e| EmbedError(format!("cannot reach Ollama at {}: {}", self.url, e)))?;
-        stream.set_read_timeout(Some(IO_TIMEOUT)).ok();
-        stream.set_write_timeout(Some(IO_TIMEOUT)).ok();
-
-        let request = format!(
-            "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            path,
-            host,
-            body.len(),
-            body
-        );
-        stream
-            .write_all(request.as_bytes())
-            .map_err(|e| EmbedError(format!("writing to Ollama failed: {}", e)))?;
-
-        let mut raw = Vec::new();
-        stream
-            .read_to_end(&mut raw)
-            .map_err(|e| EmbedError(format!("reading from Ollama failed: {}", e)))?;
-        let text = String::from_utf8_lossy(&raw);
-        let (head, response_body) = text
-            .split_once("\r\n\r\n")
-            .ok_or_else(|| EmbedError("malformed HTTP response from Ollama".to_string()))?;
-        let status: u16 = head
-            .lines()
-            .next()
-            .and_then(|line| line.split(' ').nth(1))
-            .and_then(|code| code.parse().ok())
-            .ok_or_else(|| EmbedError("malformed HTTP status line from Ollama".to_string()))?;
-        if !(200..300).contains(&status) {
-            return Err(EmbedError(format!(
-                "Ollama returned {}: {}",
-                status,
-                response_body.trim()
-            )));
-        }
-        Ok(response_body.to_string())
+/// `texts` with the model family's instruction prefix for `role`, if any.
+fn with_prefix(model: &str, texts: &[String], role: EmbedRole) -> Vec<String> {
+    let prefix = prefix_for(model, role);
+    if prefix.is_empty() {
+        return texts.to_vec();
     }
+    texts.iter().map(|t| format!("{prefix}{t}")).collect()
+}
+
+/// One JSON embedding array as an L2-normalised vector, refusing one whose
+/// length is not `dim`: a mismatch is a configuration error, never a silent
+/// truncation or pad.
+fn checked_vector(
+    value: &serde_json::Value,
+    label: &str,
+    model: &str,
+    dim: usize,
+) -> Result<Vec<f32>, EmbedError> {
+    let raw: Vec<f32> = value
+        .as_array()
+        .ok_or_else(|| EmbedError(format!("{label} embedding entry was not an array")))?
+        .iter()
+        .map(|v| v.as_f64().unwrap_or(0.0) as f32)
+        .collect();
+    if raw.len() != dim {
+        return Err(EmbedError(format!(
+            "{label} model {model:?} returned dim {}, but {EMBEDDING_DIM_ENV} is {dim}. Set the \
+             dimension to match the model and run remind_me_reindex on a fresh vector table.",
+            raw.len(),
+        )));
+    }
+    Ok(l2_normalize(raw))
 }
 
 impl Embedder for OllamaEmbedder {
@@ -335,54 +390,25 @@ impl Embedder for OllamaEmbedder {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-        let prefix = prefix_for(&self.model, role);
-        let prefixed: Vec<String> = if prefix.is_empty() {
-            texts.to_vec()
-        } else {
-            texts.iter().map(|t| format!("{}{}", prefix, t)).collect()
-        };
-
+        let prefixed = with_prefix(&self.model, texts, role);
         let mut all = Vec::with_capacity(prefixed.len());
         for batch in prefixed.chunks(EMBED_FORWARD_BATCH) {
             let body = serde_json::json!({ "model": self.model, "input": batch }).to_string();
-            let response = self.post_json("/api/embed", &body)?;
+            let response = post_json(&self.url, "Ollama", "/api/embed", &body)?;
             let parsed: serde_json::Value = serde_json::from_str(&response)
                 .map_err(|e| EmbedError(format!("Ollama response was not JSON: {}", e)))?;
             let vectors = parsed
                 .get("embeddings")
                 .and_then(|v| v.as_array())
+                .filter(|v| !v.is_empty())
                 .ok_or_else(|| {
                     EmbedError(format!(
                         "Ollama returned no embeddings for model {:?}",
                         self.model
                     ))
                 })?;
-            if vectors.is_empty() {
-                return Err(EmbedError(format!(
-                    "Ollama returned no embeddings for model {:?}",
-                    self.model
-                )));
-            }
             for vector in vectors {
-                let raw: Vec<f32> = vector
-                    .as_array()
-                    .ok_or_else(|| {
-                        EmbedError("Ollama embedding entry was not an array".to_string())
-                    })?
-                    .iter()
-                    .map(|v| v.as_f64().unwrap_or(0.0) as f32)
-                    .collect();
-                if raw.len() != self.dim {
-                    return Err(EmbedError(format!(
-                        "Ollama model {:?} returned dim {}, but {} is {}. Set the dimension to \
-                         match the model and run remind_me_reindex on a fresh vector table.",
-                        self.model,
-                        raw.len(),
-                        EMBEDDING_DIM_ENV,
-                        self.dim
-                    )));
-                }
-                all.push(l2_normalize(raw));
+                all.push(checked_vector(vector, "Ollama", &self.model, self.dim)?);
             }
         }
         Ok(all)
@@ -395,6 +421,106 @@ impl Embedder for OllamaEmbedder {
     fn identity(&self) -> EmbeddingIdentity {
         EmbeddingIdentity {
             backend: "ollama".to_string(),
+            model: self.model.clone(),
+            dim: self.dim,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OpenAI-compatible backend (llama.cpp server, llama-swap, vLLM, ...)
+// ---------------------------------------------------------------------------
+
+/// Embeds via an OpenAI-compatible `POST /v1/embeddings`.
+///
+/// For servers that do not speak Ollama's `/api/embed`, notably llama.cpp's
+/// `llama-server --embeddings` behind llama-swap. Plain `http://` only, no
+/// API key: like `ollama`, it is meant for a daemon on the local network.
+/// The same dimension rule as [`OllamaEmbedder`] applies.
+pub struct OpenAiEmbedder {
+    pub model: String,
+    /// e.g. `http://baileyai:8080`, no trailing slash or `/v1`.
+    pub url: String,
+    pub dim: usize,
+}
+
+impl OpenAiEmbedder {
+    pub fn new(model: impl Into<String>, url: impl Into<String>, dim: usize) -> Self {
+        let url = url.into();
+        let url = url.trim_end_matches('/');
+        Self {
+            model: model.into(),
+            url: url.strip_suffix("/v1").unwrap_or(url).to_string(),
+            dim,
+        }
+    }
+
+    /// One batch's vectors in input order. The spec returns `data` entries
+    /// tagged with `index`; they are placed by it rather than trusted to
+    /// arrive in order.
+    fn embed_batch(&self, batch: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        const LABEL: &str = "OpenAI-compatible server";
+        let body = serde_json::json!({ "model": self.model, "input": batch }).to_string();
+        let response = post_json(&self.url, LABEL, "/v1/embeddings", &body)?;
+        let parsed: serde_json::Value = serde_json::from_str(&response)
+            .map_err(|e| EmbedError(format!("{LABEL} response was not JSON: {e}")))?;
+        let data = parsed
+            .get("data")
+            .and_then(|v| v.as_array())
+            .filter(|d| d.len() == batch.len())
+            .ok_or_else(|| {
+                EmbedError(format!(
+                    "{LABEL} did not return {} embeddings for model {:?}",
+                    batch.len(),
+                    self.model
+                ))
+            })?;
+        let mut slots: Vec<Option<Vec<f32>>> = vec![None; batch.len()];
+        for (position, entry) in data.iter().enumerate() {
+            let index = entry
+                .get("index")
+                .and_then(|i| i.as_u64())
+                .map_or(position, |i| i as usize);
+            let embedding = entry
+                .get("embedding")
+                .ok_or_else(|| EmbedError(format!("{LABEL} entry has no embedding")))?;
+            let slot = slots
+                .get_mut(index)
+                .filter(|slot| slot.is_none())
+                .ok_or_else(|| EmbedError(format!("{LABEL} returned a bad index {index}")))?;
+            *slot = Some(checked_vector(embedding, LABEL, &self.model, self.dim)?);
+        }
+        // Every slot is filled: `data` has `batch.len()` entries and no
+        // index repeats or falls outside it.
+        Ok(slots.into_iter().flatten().collect())
+    }
+}
+
+impl Embedder for OpenAiEmbedder {
+    fn embed(&self, texts: &[String], role: EmbedRole) -> Result<Vec<Vec<f32>>, EmbedError> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self.model.is_empty() {
+            return Err(EmbedError(format!(
+                "the openai embedding backend needs a model: set {OPENAI_EMBED_MODEL_ENV}"
+            )));
+        }
+        let prefixed = with_prefix(&self.model, texts, role);
+        let mut all = Vec::with_capacity(prefixed.len());
+        for batch in prefixed.chunks(EMBED_FORWARD_BATCH) {
+            all.extend(self.embed_batch(batch)?);
+        }
+        Ok(all)
+    }
+
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn identity(&self) -> EmbeddingIdentity {
+        EmbeddingIdentity {
+            backend: "openai".to_string(),
             model: self.model.clone(),
             dim: self.dim,
         }
@@ -700,6 +826,8 @@ fn config_fingerprint() -> String {
         EMBEDDING_DIM_ENV,
         OLLAMA_URL_ENV,
         OLLAMA_MODEL_ENV,
+        OPENAI_EMBED_URL_ENV,
+        OPENAI_EMBED_MODEL_ENV,
         ONNX_MODEL_PATH_ENV,
         ONNX_TOKENIZER_PATH_ENV,
     ]
@@ -717,7 +845,7 @@ fn config_fingerprint() -> String {
 /// Reads the environment fresh on every call — cheap, and it means a
 /// configuration change takes effect on the next search rather than
 /// requiring a restart. Returns `None` when `REMIND_ME_EMBEDDING_BACKEND` is
-/// anything other than `ollama`/`onnx`; that is the disabled state, not an
+/// anything other than `ollama`/`openai`/`onnx`; that is the disabled state, not an
 /// error.
 pub fn resolve_embedder() -> Option<Box<dyn Embedder>> {
     let backend = std::env::var(EMBEDDING_BACKEND_ENV).unwrap_or_default();
@@ -732,6 +860,12 @@ pub fn resolve_embedder() -> Option<Box<dyn Embedder>> {
             let model = std::env::var(OLLAMA_MODEL_ENV)
                 .unwrap_or_else(|_| DEFAULT_OLLAMA_MODEL.to_string());
             Some(Box::new(OllamaEmbedder::new(model, url, dim)))
+        }
+        "openai" => {
+            let url = std::env::var(OPENAI_EMBED_URL_ENV)
+                .unwrap_or_else(|_| DEFAULT_OPENAI_EMBED_URL.to_string());
+            let model = std::env::var(OPENAI_EMBED_MODEL_ENV).unwrap_or_default();
+            Some(Box::new(OpenAiEmbedder::new(model, url, dim)))
         }
         "onnx" => {
             let model_path = std::env::var(ONNX_MODEL_PATH_ENV).unwrap_or_default();
@@ -805,8 +939,8 @@ pub fn embedding_status() -> crate::status::SubsystemStatus {
     use crate::status::SubsystemStatus;
     if resolve_embedder().is_none() {
         return SubsystemStatus::NotImplemented {
-            reason: "no embedding backend configured; set REMIND_ME_EMBEDDING_BACKEND=ollama \
-                     or REMIND_ME_EMBEDDING_BACKEND=onnx to enable semantic search"
+            reason: "no embedding backend configured; set REMIND_ME_EMBEDDING_BACKEND to \
+                     ollama, openai or onnx to enable semantic search"
                 .to_string(),
         };
     }
