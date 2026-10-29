@@ -309,10 +309,18 @@ impl OllamaEmbedder {
         stream
             .read_to_end(&mut raw)
             .map_err(|e| EmbedError(format!("reading from Ollama failed: {}", e)))?;
-        let text = String::from_utf8_lossy(&raw);
-        let (head, response_body) = text
-            .split_once("\r\n\r\n")
+        let headers_end = find_subslice(&raw, b"\r\n\r\n")
             .ok_or_else(|| EmbedError("malformed HTTP response from Ollama".to_string()))?;
+        let head = String::from_utf8_lossy(&raw[..headers_end]);
+        let body_bytes = &raw[headers_end + 4..];
+        // Ollama streams any reply too big for one write (a real embedding
+        // always is) with `Transfer-Encoding: chunked`.
+        let body_bytes: std::borrow::Cow<[u8]> = if is_chunked(&head) {
+            std::borrow::Cow::Owned(decode_chunked(body_bytes)?)
+        } else {
+            std::borrow::Cow::Borrowed(body_bytes)
+        };
+        let response_body = String::from_utf8_lossy(&body_bytes);
         let status: u16 = head
             .lines()
             .next()
@@ -327,6 +335,53 @@ impl OllamaEmbedder {
             )));
         }
         Ok(response_body.to_string())
+    }
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Whether the response head declares `Transfer-Encoding: chunked`.
+fn is_chunked(head: &str) -> bool {
+    head.lines().any(|line| {
+        let Some((name, value)) = line.split_once(':') else {
+            return false;
+        };
+        name.trim().eq_ignore_ascii_case("transfer-encoding")
+            && value.to_ascii_lowercase().contains("chunked")
+    })
+}
+
+/// Decodes an HTTP/1.1 chunked body (RFC 9112 §7.1): hex size line
+/// (extensions after `;` ignored), that many bytes, CRLF, repeated until a
+/// zero-size chunk. Trailers after the last chunk are ignored.
+fn decode_chunked(mut body: &[u8]) -> Result<Vec<u8>, EmbedError> {
+    let malformed =
+        |why: &str| EmbedError(format!("malformed chunked response from Ollama: {why}"));
+    let mut out = Vec::with_capacity(body.len());
+    loop {
+        let line_end =
+            find_subslice(body, b"\r\n").ok_or_else(|| malformed("missing size line"))?;
+        let size_line = std::str::from_utf8(&body[..line_end])
+            .map_err(|_| malformed("size line is not text"))?;
+        let size_hex = size_line.split(';').next().unwrap_or_default().trim();
+        let size = usize::from_str_radix(size_hex, 16).map_err(|_| malformed("bad chunk size"))?;
+        body = &body[line_end + 2..];
+        if size == 0 {
+            return Ok(out);
+        }
+        let needed = size
+            .checked_add(2)
+            .ok_or_else(|| malformed("chunk size overflows"))?;
+        if body.len() < needed {
+            return Err(malformed("chunk shorter than its declared size"));
+        }
+        out.extend_from_slice(&body[..size]);
+        if &body[size..size + 2] != b"\r\n" {
+            return Err(malformed("chunk not followed by CRLF"));
+        }
+        body = &body[size + 2..];
     }
 }
 
@@ -926,6 +981,27 @@ mod tests {
             prefix_for("sentence-transformers/all-MiniLM-L6-v2", EmbedRole::Query),
             ""
         );
+    }
+
+    #[test]
+    fn is_chunked_matches_the_header_case_insensitively() {
+        assert!(is_chunked("HTTP/1.1 200 OK\r\ntransfer-encoding: Chunked"));
+        assert!(!is_chunked("HTTP/1.1 200 OK\r\nContent-Length: 5"));
+    }
+
+    #[test]
+    fn decode_chunked_joins_chunks_and_ignores_extensions_and_trailers() {
+        let body = b"5;ext=1\r\nhello\r\n6\r\n world\r\n0\r\nX-Trailer: y\r\n\r\n";
+        assert_eq!(decode_chunked(body).unwrap(), b"hello world");
+    }
+
+    #[test]
+    fn decode_chunked_rejects_truncated_and_malformed_bodies() {
+        assert!(decode_chunked(b"a\r\nshort\r\n0\r\n\r\n").is_err());
+        assert!(decode_chunked(b"zz\r\nhello\r\n0\r\n\r\n").is_err());
+        assert!(decode_chunked(b"5\r\nhelloXX0\r\n\r\n").is_err());
+        assert!(decode_chunked(b"5\r\nhello\r\n").is_err());
+        assert!(decode_chunked(b"ffffffffffffffff\r\n").is_err());
     }
 
     #[test]
