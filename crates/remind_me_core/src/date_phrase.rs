@@ -5,8 +5,8 @@
 //! included. [`configured_zone`] is the one place that reads the zone setting.
 
 use chrono::{
-    DateTime, Datelike, Days, Month, Months, NaiveDate, NaiveDateTime, TimeDelta, TimeZone, Utc,
-    Weekday,
+    DateTime, Datelike, Days, LocalResult, Month, Months, NaiveDate, NaiveDateTime, TimeDelta,
+    TimeZone, Utc, Weekday,
 };
 use chrono_tz::Tz;
 
@@ -74,15 +74,36 @@ fn day_start(tz: Tz, day: NaiveDate) -> Option<DateTime<Utc>> {
 
 /// The instant a local wall-clock time names. In a DST fold (the time occurs
 /// twice) it is the earlier one, so a window starting there loses nothing; in
-/// a DST gap (it never occurs) it is the first time that exists after the jump.
+/// a DST gap (it never occurs) it is the moment of the jump, the first instant
+/// whose local time is after it.
 fn local_instant(tz: Tz, local: NaiveDateTime) -> Option<DateTime<Utc>> {
-    const STEP_MINUTES: i64 = 15; // every zone's offsets are whole quarter hours
-    (0..=12).find_map(|i| {
-        let t = local.checked_add_signed(TimeDelta::try_minutes(i * STEP_MINUTES)?)?;
-        tz.from_local_datetime(&t)
-            .earliest()
-            .map(|t| t.with_timezone(&Utc))
-    })
+    match tz.from_local_datetime(&local) {
+        LocalResult::Single(t) | LocalResult::Ambiguous(t, _) => Some(t.with_timezone(&Utc)),
+        LocalResult::None => first_instant_at_or_after(tz, local),
+    }
+}
+
+/// The earliest whole-second instant whose local time is at or after `local`.
+///
+/// Binary search on UTC seconds: local time only moves forward within a
+/// day's span except at a fold, and a gap's own neighbourhood holds none.
+/// Transitions fall on whole seconds, so the answer is exact.
+fn first_instant_at_or_after(tz: Tz, local: NaiveDateTime) -> Option<DateTime<Utc>> {
+    const MAX_OFFSET_SECS: i64 = 18 * 3600; // chrono bounds every UTC offset by this
+    let wall =
+        |secs: i64| DateTime::from_timestamp(secs, 0).map(|u| u.with_timezone(&tz).naive_local());
+    let guess = local.and_utc().timestamp();
+    // Invariant: wall(lo) < local <= wall(hi).
+    let (mut lo, mut hi) = (guess - MAX_OFFSET_SECS, guess + MAX_OFFSET_SECS);
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if wall(mid)? >= local {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    DateTime::from_timestamp(hi, 0)
 }
 
 fn rolling(words: &[&str], now: DateTime<Tz>) -> Option<Span> {
@@ -440,6 +461,42 @@ mod tests {
         assert_eq!(
             start("2027-04-04T16:30:00Z", "past year"),
             utc("2026-04-04T15:30:00Z")
+        );
+    }
+
+    #[test]
+    fn a_gap_resolves_to_the_jump_whatever_the_minutes_and_seconds() {
+        let sydney = chrono_tz::Australia::Sydney;
+        let start =
+            |now: &str, text: &str| parse(text, utc(now).with_timezone(&sydney)).unwrap().start;
+        // 02:37 and 02:59:59.5 AEDT on Oct 5: a day back is inside Oct 4's
+        // 02:00-03:00 gap, so the window starts at the jump, 03:00 AEDT.
+        for now in [
+            "2026-10-04T15:37:00Z",
+            "2026-10-04T15:52:42Z",
+            "2026-10-04T15:59:59.5Z",
+            "2026-10-04T15:00:00Z",
+        ] {
+            assert_eq!(
+                start(now, "past 1 day"),
+                utc("2026-10-03T16:00:00Z"),
+                "{now}"
+            );
+        }
+        // 03:00:01 is just past the gap: the same wall-clock time a day back.
+        assert_eq!(
+            start("2026-10-04T16:00:01Z", "past 1 day"),
+            utc("2026-10-03T16:00:01Z")
+        );
+        // A fold keeps its minutes and seconds, on the earlier pass.
+        assert_eq!(
+            start("2026-04-05T16:37:42Z", "past 1 day"),
+            utc("2026-04-04T15:37:42Z")
+        );
+        // Hours are elapsed time, gap or not.
+        assert_eq!(
+            start("2026-10-04T15:37:00Z", "last 24 hours"),
+            utc("2026-10-03T15:37:00Z")
         );
     }
 
