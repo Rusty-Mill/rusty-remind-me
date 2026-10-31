@@ -160,13 +160,24 @@ pub enum Outcome {
     },
 }
 
-/// Parse a window start: `<n>d`, `<n>h` or RFC 3339, at most
-/// [`MAX_WINDOW_DAYS`] back and not in the future.
+/// Parse a window start: `<n>d`, `<n>h`, RFC 3339 or a date phrase (its
+/// start: `last week` is last Monday), at most [`MAX_WINDOW_DAYS`] back and
+/// not in the future.
 pub fn parse_since(raw: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>> {
+    parse_since_with(raw, now, crate::date_phrase::configured_zone)
+}
+
+/// [`parse_since`] with the zone injected; asked for only by a phrase.
+fn parse_since_with(
+    raw: &str,
+    now: DateTime<Utc>,
+    zone: impl Fn() -> std::result::Result<chrono_tz::Tz, String>,
+) -> Result<DateTime<Utc>> {
     let raw = raw.trim();
     let invalid = || {
         StoreError::Invalid(format!(
-            "`since` must be like `7d`, `12h` or an RFC 3339 time, at most {MAX_WINDOW_DAYS} days back; got {raw:?}"
+            "`since` must be like `7d`, `12h`, an RFC 3339 time or a date phrase like \
+             `yesterday` or `last week`, at most {MAX_WINDOW_DAYS} days back; got {raw:?}"
         ))
     };
     let relative = |unit: fn(i64) -> Option<Duration>, n: &str| {
@@ -176,7 +187,7 @@ pub fn parse_since(raw: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>> {
             .and_then(unit)
             .and_then(|span| now.checked_sub_signed(span))
     };
-    let start = if let Some(n) = raw.strip_suffix('d') {
+    let fixed = if let Some(n) = raw.strip_suffix('d') {
         relative(Duration::try_days, n)
     } else if let Some(n) = raw.strip_suffix('h') {
         relative(Duration::try_hours, n)
@@ -184,8 +195,16 @@ pub fn parse_since(raw: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>> {
         DateTime::parse_from_rfc3339(raw)
             .ok()
             .map(|t| t.with_timezone(&Utc))
-    }
-    .ok_or_else(invalid)?;
+    };
+    let start = match fixed {
+        Some(at) => at,
+        None => {
+            let tz = zone().map_err(StoreError::Invalid)?;
+            crate::date_phrase::parse(raw, now.with_timezone(&tz))
+                .ok_or_else(invalid)?
+                .start
+        }
+    };
     if start > now || now - start > Duration::days(MAX_WINDOW_DAYS) {
         return Err(invalid());
     }
@@ -1404,6 +1423,26 @@ mod tests {
         }
         let future = (now + Duration::days(1)).to_rfc3339();
         assert!(parse_since(&future, now).is_err());
+    }
+
+    #[test]
+    fn since_takes_a_date_phrase_s_start_within_the_cap() {
+        let now = DateTime::parse_from_rfc3339("2026-10-28T09:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let utc = || Ok(chrono_tz::Tz::UTC);
+        let start = |raw: &str| parse_since_with(raw, now, utc).map(|t| t.to_rfc3339());
+        assert_eq!(start("yesterday").unwrap(), "2026-10-27T00:00:00+00:00");
+        assert_eq!(start("last week").unwrap(), "2026-10-19T00:00:00+00:00");
+        assert_eq!(start("since monday").unwrap(), "2026-10-26T00:00:00+00:00");
+        assert_eq!(start("this year").unwrap(), "2026-01-01T00:00:00+00:00");
+        assert!(
+            start("last year").is_err(),
+            "more than MAX_WINDOW_DAYS back"
+        );
+        assert_eq!(start("in november").unwrap(), "2025-11-01T00:00:00+00:00");
+        assert!(start("2026-11").is_err(), "starts in the future");
+        assert!(start("past 5 minutes").is_err(), "not a phrase");
     }
 
     #[test]

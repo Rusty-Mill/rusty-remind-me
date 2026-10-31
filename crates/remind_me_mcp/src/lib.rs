@@ -792,8 +792,8 @@ impl McpServer {
                                         "include_expired": { "type": "boolean", "default": true, "description": "Include memories whose valid_until has passed. They always rank after in-window ones; set false to drop them." },
                                         "min_confidence": { "type": "number", "default": 0, "description": "Only return memories at or above this confidence (0 to 1)." },
                                         "include_raw": { "type": "boolean", "default": false, "description": "Rank raw session dialogs and skeletons too. Off by default: facts and summaries rank, and each carries the capture_id of its dialog. A dialog category or a session_id filter turns it on, and when nothing refined matches the best dialogs come back marked as raw." },
-                                        "since": { "type": "string", "description": "Only memories at or after this time (inclusive): RFC 3339, or an age back from now like 30m, 12h, 2d, 1w." },
-                                        "until": { "type": "string", "description": "Only memories before this time (exclusive): RFC 3339, or an age back from now like 30m, 12h, 2d, 1w. Must be after since." },
+                                        "since": { "type": "string", "description": "Only memories at or after this time (inclusive): RFC 3339, an age back from now like 30m, 12h, 2d, 1w, or a date phrase like yesterday, last week, past 3 days, since monday, in march, Q3, 2026-10 or 2026-01 to 2026-03. A phrase naming a whole period (yesterday, last week, Q3) also ends the window at that period's end unless until is given. Phrases use the server's REMIND_ME_TZ calendar (UTC if unset)." },
+                                        "until": { "type": "string", "description": "Only memories before this time (exclusive): RFC 3339, an age back from now like 30m, 12h, 2d, 1w, or a date phrase naming a period, which ends the window at that period's end (today, last month, Q3). Must be after since." },
                                         "time_field": { "type": "string", "enum": ["created", "updated"], "default": "created", "description": "Which timestamp since/until apply to." },
                                         "strategy": { "type": "string", "enum": ["auto", "balanced", "keyword_favored", "semantic_favored"], "default": "auto", "description": "RRF weight profile. Leave at auto (routes by query shape: quoted phrases, prefix* wildcards and very short queries favour keyword relevance; long or question-shaped queries favour semantic similarity) unless deliberately A/B testing a pinned preset." }
                                     },
@@ -808,7 +808,7 @@ impl McpServer {
                                     "additionalProperties": false,
                                     "properties": {
                                         "project": { "type": "string", "description": "Project or entity name, or an alias" },
-                                        "since": { "type": "string", "default": context_brief::DEFAULT_SINCE, "description": "Activity window: 7d, 12h or an RFC 3339 time, at most 365 days" },
+                                        "since": { "type": "string", "default": context_brief::DEFAULT_SINCE, "description": "Activity window start: 7d, 12h, an RFC 3339 time or a date phrase such as yesterday or last week (its start), at most 365 days back" },
                                         "token_budget": { "type": "integer", "default": context_brief::DEFAULT_TOKEN_BUDGET, "minimum": context_brief::MIN_TOKEN_BUDGET, "maximum": context_brief::MAX_TOKEN_BUDGET },
                                         "response_format": { "type": "string", "enum": ["json", "markdown"] }
                                     },

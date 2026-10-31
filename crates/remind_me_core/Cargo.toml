@@ -32,6 +32,9 @@ tokio = { version = "1.0", features = ["full"] }
 # the rusty_mill workspace is on 0.39.
 rusqlite = { version = "0.39", features = ["bundled"] }
 chrono = { workspace = true }
+# IANA zones for calendar date phrases ("yesterday", "last week") in the
+# user's own zone, daylight saving included (REMIND_ME_TZ, card #63).
+chrono-tz = "0.10"
 uuid = { version = "1.0", features = ["v4", "v5"] }
 sha256 = "1.5"
 dirs = "5.0"
