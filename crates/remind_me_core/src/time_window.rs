@@ -359,6 +359,9 @@ mod tests {
             ),
             // A rolling phrase runs up to now.
             (Some("past 3 days"), None, "2026-10-23T12:00:00Z", None),
+            // Explicit arguments keep #350's leading plus; only query
+            // inference refuses it.
+            (Some("past +3 days"), None, "2026-10-23T12:00:00Z", None),
             // An explicit `until` wins over the period's end.
             (
                 Some("last month"),

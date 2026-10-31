@@ -72,6 +72,9 @@ pub fn find_relative(query: &str, now: DateTime<Tz>) -> Option<(Span, Range<usiz
             if norms.get(i + len).is_some_and(|next| qualifies(next)) {
                 continue;
             }
+            if words.iter().any(|w| !plain(w)) {
+                continue;
+            }
             let words: Vec<&str> = words.iter().map(String::as_str).collect();
             if let Some(span) = relative(&words, now) {
                 return Some((span, tokens[i].0..tokens[i + len - 1].1));
@@ -86,6 +89,13 @@ pub fn find_relative(query: &str, now: DateTime<Tz>) -> Option<(Span, Range<usiz
 /// absolute date the relative prefix would get wrong.
 fn qualifies(next: &str) -> bool {
     next == "of" || four_digit_year(next).is_some()
+}
+
+/// Free text only: a word made of letters and digits. `+3`, `-3`, `.5` and
+/// `3.5` are not counts a phrase in prose should be read from, though the
+/// explicit `since`/`until` parser keeps accepting `past +3 days`.
+fn plain(word: &str) -> bool {
+    word.chars().all(char::is_alphanumeric)
 }
 
 /// `word` lowercased with enclosing punctuation dropped. A leading sign or
@@ -189,7 +199,7 @@ fn first_instant_at_or_after(tz: Tz, local: NaiveDateTime) -> Option<DateTime<Ut
 fn rolling(words: &[&str], now: DateTime<Tz>) -> Option<Span> {
     let open = |start| Some(Span { start, end: None });
     match words {
-        ["past" | "last", n, unit] => open(back(now, count(n)?, unit)?),
+        ["past" | "last", n, unit] => open(back(now, n.parse().ok().filter(|n| *n > 0)?, unit)?),
         ["past", unit] if !unit.ends_with('s') => open(back(now, 1, unit)?),
         ["since", name] => {
             let today = now.date_naive();
@@ -202,14 +212,6 @@ fn rolling(words: &[&str], now: DateTime<Tz>) -> Option<Span> {
         }
         _ => None,
     }
-}
-
-/// A whole positive count written in plain digits; not `+3`, `-3`, `.5` or `3.5`.
-fn count(word: &str) -> Option<u32> {
-    if word.is_empty() || !word.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    word.parse().ok().filter(|n| *n > 0)
 }
 
 /// `now` moved back `n` units: hours on the clock, the rest on the local
@@ -481,6 +483,8 @@ mod tests {
                 .to_string()
         };
         assert_eq!(start("past 3 days"), "2026-10-25T09:00");
+        // As on #350: the explicit parser takes a leading plus.
+        assert_eq!(start("past +3 days"), "2026-10-25T09:00");
         assert_eq!(start("last 24 hours"), "2026-10-27T09:00");
         assert_eq!(start("past week"), "2026-10-21T09:00");
         assert_eq!(start("past 2 weeks"), "2026-10-14T09:00");
@@ -657,7 +661,6 @@ mod tests {
             "7",
             "past 0 days",
             "past -1 days",
-            "past +3 days",
             "past .5 days",
             "past 3.5 days",
             "past 3 fortnights",
