@@ -6,10 +6,29 @@
 use chrono::{Duration, Utc};
 use remind_me_core::db::queries;
 use remind_me_core::db::Store;
+use remind_me_core::embedder::{EmbedError, EmbedRole, Embedder, EmbeddingIdentity};
 use remind_me_core::testing;
+use remind_me_core::vectors::embed_and_store;
 use remind_me_core::{Database, MemoryAddInput, MemorySearchInput};
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
+/// Switches off every configured model stage for this whole binary: the
+/// embedder `add` and `search` would probe, HyDE and rerank. These tests are
+/// about filters, so they must not depend on, or wait for, a live model.
+/// Every helper below calls it first; nothing here wants a model back.
+fn offline() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        test_env::remove_var(remind_me_core::embedder::EMBEDDING_BACKEND_ENV);
+        test_env::set_var(remind_me_core::query_expansion::EXPANSION_MODE_ENV, "off");
+        test_env::set_var(remind_me_core::reranker::BACKEND_ENV, "");
+    });
+}
+
 fn add(store: &Store<'_>, content: &str, category: &str) -> String {
+    offline();
     queries::add_memory(
         store,
         MemoryAddInput {
@@ -37,6 +56,7 @@ fn age_by_days(store: &Store<'_>, id: &str, days: i64) {
 }
 
 fn search(store: &Store<'_>, query: &str, include_dormant: bool, min_vitality: f64) -> Vec<String> {
+    offline();
     let input = MemorySearchInput {
         scope: Default::default(),
         strategy: Default::default(),
@@ -208,4 +228,126 @@ fn the_filter_runs_before_the_limit_so_pages_stay_full() {
     found.sort();
     live.sort();
     assert_eq!(found, live, "every live memory should still be returned");
+}
+
+// ---------------------------------------------------------------------------
+// The semantic half (#564)
+// ---------------------------------------------------------------------------
+
+/// Every text lands on the same vector, so a memory is a perfect semantic
+/// match whatever its words: the only way it can be left out is a filter.
+struct SameVector;
+
+impl Embedder for SameVector {
+    fn embed(&self, texts: &[String], _role: EmbedRole) -> Result<Vec<Vec<f32>>, EmbedError> {
+        Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect())
+    }
+    fn dim(&self) -> usize {
+        2
+    }
+    fn identity(&self) -> EmbeddingIdentity {
+        EmbeddingIdentity {
+            backend: "same-vector".into(),
+            model: "test".into(),
+            dim: 2,
+        }
+    }
+}
+
+/// `add` plus a stored vector, so the memory is reachable semantically.
+fn add_embedded(store: &Store<'_>, content: &str, category: &str) -> String {
+    let id = add(store, content, category);
+    embed_and_store(store, &SameVector, &id, content).unwrap();
+    id
+}
+
+fn search_semantic(
+    store: &Store<'_>,
+    query: &str,
+    include_dormant: bool,
+    min_vitality: f64,
+) -> Vec<String> {
+    offline();
+    let input = MemorySearchInput {
+        query: query.to_string(),
+        limit: 10,
+        token_budget: 0,
+        include_dormant,
+        min_vitality,
+        ..Default::default()
+    };
+    queries::search_memories_with_embedder(store, &input, Some(&SameVector))
+        .unwrap()
+        .into_iter()
+        .map(|r| r.memory.id)
+        .collect()
+}
+
+#[test]
+fn a_dormant_memory_does_not_return_through_the_semantic_half() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let fresh = add_embedded(&store, "quokka sighting today", "fact");
+    // No word in common with the query: only a vector can bring it back.
+    let stale = add_embedded(&store, "wombat burrow survey", "action_item");
+    age_by_days(&store, &stale, 365);
+
+    let found = search_semantic(&store, "quokka", false, 0.0);
+    assert!(found.contains(&fresh));
+    assert!(
+        !found.contains(&stale),
+        "a dormant memory must stay out whichever half finds it: {found:?}"
+    );
+}
+
+#[test]
+fn include_dormant_admits_it_through_the_semantic_half() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let stale = add_embedded(&store, "wombat burrow survey", "action_item");
+    age_by_days(&store, &stale, 365);
+
+    assert_eq!(search_semantic(&store, "quokka", true, 0.0), vec![stale]);
+}
+
+#[test]
+fn min_vitality_applies_to_the_semantic_half() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    // A fact thirty days old decays to about 0.26 (see the keyword test above).
+    let id = add_embedded(&store, "wombat notes", "fact");
+    age_by_days(&store, &id, 30);
+
+    assert!(search_semantic(&store, "quokka", true, 0.9).is_empty());
+    assert_eq!(search_semantic(&store, "quokka", true, 0.1), vec![id]);
+}
+
+#[test]
+fn dormant_rows_do_not_crowd_live_ones_out_of_the_semantic_list() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    // The semantic stage keeps its best `limit * 2`. Were dormant rows dropped
+    // after that cut, they would take every slot and the live rows none.
+    for i in 0..40 {
+        let id = add_embedded(&store, &format!("wombat dormant {i}"), "action_item");
+        age_by_days(&store, &id, 365);
+    }
+    let mut live: Vec<String> = (0..5)
+        .map(|i| add_embedded(&store, &format!("wombat live {i}"), "fact"))
+        .collect();
+
+    let mut found = search_semantic(&store, "quokka", false, 0.0);
+    found.sort();
+    live.sort();
+    assert_eq!(found, live);
+}
+
+#[test]
+fn every_model_stage_is_off_after_offline() {
+    // Nothing in this binary turns a stage back on, so after `offline` the
+    // inherited configuration can no longer reach a model.
+    offline();
+    assert!(remind_me_core::embedder::resolve_embedder().is_none());
+    assert!(!remind_me_core::query_expansion::enabled());
+    assert!(!remind_me_core::reranker::enabled());
 }

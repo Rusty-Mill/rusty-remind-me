@@ -1245,8 +1245,9 @@ pub(crate) fn window_hits(tables: &EngineTables, filter: &KeywordFilter) -> Resu
         .collect())
 }
 
-/// `filter`'s effective-vitality floor, as of `now`.
-fn vital_enough(
+/// `filter`'s effective-vitality floor, as of `now`. Both halves of a search
+/// admit on this, so dormancy means the same thing to each (#564).
+pub(crate) fn vital_enough(
     filter: &KeywordFilter,
     memory: &Memory,
     now: chrono::DateTime<chrono::Utc>,
