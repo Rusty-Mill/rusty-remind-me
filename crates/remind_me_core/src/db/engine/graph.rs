@@ -398,6 +398,15 @@ pub(crate) fn linked_memory_count(tables: &EngineTables, entity_id: &str) -> Res
     Ok(linked_rows(core_ref(tables)?, entity_id).len())
 }
 
+pub(crate) fn shared_memory_count(tables: &EngineTables, a: &str, b: &str) -> Result<usize> {
+    let core = core_ref(tables)?;
+    let of_a: HashSet<String> = linked_rows(core, a).into_iter().map(|r| r.id).collect();
+    Ok(linked_rows(core, b)
+        .iter()
+        .filter(|r| of_a.contains(&r.id))
+        .count())
+}
+
 /// Live, unsuperseded memories whose subject or object, lowercased as
 /// SQLite's ASCII-only `lower()` does, is `canonical`; newest first, ties by
 /// id descending.

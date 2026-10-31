@@ -10,6 +10,7 @@ use daemon::Store;
 use remind_me_api::ApiServer;
 use remind_me_core::daemon::ops::Op;
 use remind_me_core::entity::Entity;
+use remind_me_core::entity_duplicates::{self, DuplicateCandidate};
 use remind_me_core::models::{Memory, MemoryListResult, MemorySearchResult};
 use remind_me_core::stats::Stats;
 use remind_me_core::wiki::WikiPage;
@@ -1033,6 +1034,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })?;
                 println!("{}", serde_json::to_string_pretty(&ent)?);
             }
+            "entity-duplicates" => {
+                let json = match args.get(2..).unwrap_or_default() {
+                    [] => false,
+                    [flag] if flag == "--json" => true,
+                    _ => {
+                        eprintln!("Usage: rusty-remind-me entity-duplicates [--json]");
+                        std::process::exit(1);
+                    }
+                };
+                let found: Vec<DuplicateCandidate> =
+                    Store::open(&db_path)?.call(Op::EntityDuplicates)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&found)?);
+                } else {
+                    print!("{}", entity_duplicates::render_text(&found));
+                }
+            }
             "wiki-write" => {
                 if args.len() < 5 {
                     eprintln!("Usage: rusty-remind-me wiki-write <slug> <title> <content>");
@@ -1122,7 +1140,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", serde_json::to_string_pretty(&stats)?);
             }
             cmd => {
-                eprintln!("Unknown subcommand: {}. Available: configure, daemon, api, remote, server, search, add, list, get, entity, wiki-write, wiki-read, wiki-import, stats, resolve, session, capture-transcript, import-sessions, context, brief, impact-export", cmd);
+                eprintln!("Unknown subcommand: {}. Available: configure, daemon, api, remote, server, search, add, list, get, entity, entity-duplicates, wiki-write, wiki-read, wiki-import, stats, resolve, session, capture-transcript, import-sessions, context, brief, impact-export", cmd);
                 std::process::exit(1);
             }
         }

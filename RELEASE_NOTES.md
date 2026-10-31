@@ -2,6 +2,17 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-10-31 — Find duplicate entities (report only)
+
+### Added
+- Likely duplicate entities are listed for a person to confirm: `rusty_mux`, `rusty-mux` and `Rusty Mux` are three entities, because an entity id folds only case and whitespace. A pair is reported as `same_key` when some name or alias of each matches once case and `-`, `_`, `.`, `/` and whitespace are ignored, or as `similar` when the names are one edit apart (keys of 5 to 8 characters) or two (9 or more), never for shorter names, and at least two live memories mention both. Each candidate carries its shared-memory count and `kind_mismatch` (both kinds set and different).
+- Nothing is merged, and entity ids do not change: they are the sync key. Adding one name as an alias of the other marks a pair reviewed and hides it. A real, sync-safe merge is a separate card.
+- `remind_me_entity`, `GET /api/entity` and the `remind_me_entity_upsert` answer carry `possible_duplicates` (omitted when empty). New CLI subcommand `rusty-remind-me entity-duplicates [--json]`, with a matching daemon op, lists every pair, same-key first.
+- `edit_distance` moved from `context_brief` to a shared `text` module; it now has two callers.
+
+### Tests
+- `entity_duplicates` unit tests cover the match key, the three spellings, alias keys, same-key over similar, the two-shared-memory rule, distant and short names (`rusty_mill`/`rusty_mux`, `ui`/`uix`, `q3`/`q4`), empty keys, reviewed pairs, kind mismatch and that shared counts are asked only for name matches. `entity_duplicates_test` checks that deleted and superseded memories do not count, the profile field and the daemon op against a real store; `entity_duplicates_cli_test` runs the binary; the MCP test covers the upsert and lookup answers.
+
 ## 2026-10-31 — Date phrases in the search text (off by default)
 
 ### Added
