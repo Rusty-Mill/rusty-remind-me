@@ -33,7 +33,9 @@
 {"query": "Juniper Okafor", "relevant": ["m-owner-juniper", "m-juniper-pref"], "kind": "entity"}
 {"query": "who owns billing", "relevant": ["m-owner-juniper"], "kind": "entity"}
 {"query": "Rafa Lind", "relevant": ["m-owner-rafa"], "kind": "entity"}
-{"query": "dock controller", "relevant": ["m-dock-firmware", "m-dock-battery", "m-dock-lock-fault", "m-pr-412", "m-owner-rafa"], "kind": "entity", "entity": "dock-controller"}
+{"query": "dock controller", "relevant": ["m-dock-firmware", "m-dock-battery", "m-dock-lock-fault", "m-pr-412", "m-owner-rafa"], "kind": "entity", "must_not": ["m-dock-count", "m-todo-latch"], "entity": "dock-controller"}
+{"query": "pricing", "relevant": ["m-owner-juniper", "m-juniper-pref"], "kind": "entity", "must_not": ["m-pricing-new", "m-pricing-surge", "m-harbor-pricing"], "entity": "juniper-okafor"}
+{"query": "hardware fault escalation", "relevant": ["m-owner-rafa"], "kind": "entity", "must_not": ["m-dock-lock-fault"], "entity": "rafa-lind"}
 {"query": "dock controller firmware", "relevant": ["m-dock-firmware"], "kind": "entity"}
 {"query": "who to call about a hardware fault", "relevant": ["m-owner-rafa"], "kind": "entity"}
 {"query": "Juniper pricing", "relevant": ["m-juniper-pref", "m-owner-juniper"], "kind": "entity"}

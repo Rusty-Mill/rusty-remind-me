@@ -14,6 +14,10 @@
 //!   that moves a score shows the move in its diff.
 //! - `REMIND_ME_EVAL_LIVE=1` also scores the configured embedder (and any
 //!   configured rerank or HyDE). It is printed, never gated: CI has no model.
+//! - The gated runs switch HyDE and rerank off, whatever the environment says,
+//!   so no model is called and the baseline compares like with like.
+//! - A query with an `entity` filter that finds none of its relevant ids
+//!   fails outright, so a broken filter path cannot hide inside the averages.
 //!
 //! CI has no embedding server, so the gated modes are keyword-only and
 //! [`HashedEmbedder`], a deterministic stand-in that exercises the vector
@@ -35,10 +39,15 @@ use remind_me_core::embedder::{
     available_embedder, EmbedError, EmbedRole, Embedder, EmbeddingIdentity,
 };
 use remind_me_core::entity::{link_memory_entity, upsert_entity};
+use remind_me_core::query_expansion::EXPANSION_MODE_ENV;
+use remind_me_core::reranker::BACKEND_ENV as RERANK_ENV;
 use remind_me_core::retrieval::Deadline;
 use remind_me_core::vectors::embed_and_store;
 use remind_me_core::{Database, EntityInput, MemorySearchInput, RetrievalStrategy, SearchFilters};
 use serde::{Deserialize, Serialize};
+
+#[path = "../src/test_env.rs"]
+mod test_env;
 
 /// How far a score may fall below its baseline before the test fails. Two
 /// points is about one or two queries moving on a set this size.
@@ -331,10 +340,42 @@ impl Embedder for HashedEmbedder {
 // The run
 // ---------------------------------------------------------------------------
 
-/// Scores per `mode/strategy`, plus every `must_not` hit seen.
+/// Scores per `mode/strategy`, plus every hard failure seen: a `must_not`
+/// hit, or an entity-filtered query that found nothing it should.
+#[derive(Default)]
 struct Report {
     scores: BTreeMap<String, Scores>,
-    leaks: Vec<String>,
+    violations: Vec<String>,
+}
+
+/// Turns the model-backed stages (HyDE, rerank) off until dropped, then
+/// restores what the environment held, so the live run still sees them.
+struct ModelStagesOff(Vec<(&'static str, Option<String>)>);
+
+impl ModelStagesOff {
+    fn new() -> Self {
+        // HyDE runs only for "hyde"; rerank is off for an empty value.
+        let off = [(EXPANSION_MODE_ENV, "off"), (RERANK_ENV, "")];
+        let saved = off
+            .iter()
+            .map(|(k, _)| (*k, std::env::var(k).ok()))
+            .collect();
+        for (key, value) in off {
+            test_env::set_var(key, value);
+        }
+        Self(saved)
+    }
+}
+
+impl Drop for ModelStagesOff {
+    fn drop(&mut self) {
+        for (key, value) in &self.0 {
+            match value {
+                Some(v) => test_env::set_var(key, v),
+                None => test_env::remove_var(key),
+            }
+        }
+    }
 }
 
 fn evaluate(mode: &str, embedder: Option<&dyn Embedder>, report: &mut Report) {
@@ -355,7 +396,7 @@ fn evaluate(mode: &str, embedder: Option<&dyn Embedder>, report: &mut Report) {
             let ranking = ranked(&store, g, strategy, embedder);
             for leak in g.must_not.iter().filter(|id| ranking.contains(id)) {
                 report
-                    .leaks
+                    .violations
                     .push(format!("{mode}/{name}: {:?} surfaced {leak}", g.query));
             }
             let row = (
@@ -363,6 +404,12 @@ fn evaluate(mode: &str, embedder: Option<&dyn Embedder>, report: &mut Report) {
                 recall_at(&ranking, &g.relevant, DEPTH),
                 reciprocal_rank(&ranking, &g.relevant),
             );
+            if g.entity.is_some() && row.1 == 0.0 {
+                report.violations.push(format!(
+                    "{mode}/{name}: {:?} with its entity filter found nothing relevant",
+                    g.query
+                ));
+            }
             // Misses under the default router, so a drop names its queries.
             if strategy == RetrievalStrategy::Auto && row.1 < 1.0 {
                 println!(
@@ -402,32 +449,29 @@ fn env_on(name: &str) -> bool {
 
 #[test]
 fn retrieval_quality_holds_against_the_baseline() {
-    let mut report = Report {
-        scores: BTreeMap::new(),
-        leaks: Vec::new(),
-    };
-    evaluate("keyword", None, &mut report);
-    evaluate("hashed", Some(&HashedEmbedder), &mut report);
+    let mut report = Report::default();
+    {
+        let _offline = ModelStagesOff::new();
+        evaluate("keyword", None, &mut report);
+        evaluate("hashed", Some(&HashedEmbedder), &mut report);
+    }
 
     if env_on("REMIND_ME_EVAL_LIVE") {
         let live = available_embedder();
-        let mut live_report = Report {
-            scores: BTreeMap::new(),
-            leaks: Vec::new(),
-        };
+        let mut live_report = Report::default();
         match live.as_deref() {
             Some(e) => evaluate("live", Some(e), &mut live_report),
             None => println!("live: no embedder configured or reachable; skipped"),
         }
-        for leak in &live_report.leaks {
-            println!("live leak (not gated): {leak}");
+        for violation in &live_report.violations {
+            println!("live (not gated): {violation}");
         }
     }
 
     assert!(
-        report.leaks.is_empty(),
-        "hidden rows surfaced:\n{}",
-        report.leaks.join("\n")
+        report.violations.is_empty(),
+        "hard failures:\n{}",
+        report.violations.join("\n")
     );
 
     let path = fixture_dir().join("baseline.json");
