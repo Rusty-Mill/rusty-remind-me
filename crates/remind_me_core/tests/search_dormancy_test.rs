@@ -11,7 +11,24 @@ use remind_me_core::testing;
 use remind_me_core::vectors::embed_and_store;
 use remind_me_core::{Database, MemoryAddInput, MemorySearchInput};
 
+#[path = "../src/test_env.rs"]
+mod test_env;
+
+/// Switches off every configured model stage for this whole binary: the
+/// embedder `add` and `search` would probe, HyDE and rerank. These tests are
+/// about filters, so they must not depend on, or wait for, a live model.
+/// Every helper below calls it first; nothing here wants a model back.
+fn offline() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        test_env::remove_var(remind_me_core::embedder::EMBEDDING_BACKEND_ENV);
+        test_env::set_var(remind_me_core::query_expansion::EXPANSION_MODE_ENV, "off");
+        test_env::set_var(remind_me_core::reranker::BACKEND_ENV, "");
+    });
+}
+
 fn add(store: &Store<'_>, content: &str, category: &str) -> String {
+    offline();
     queries::add_memory(
         store,
         MemoryAddInput {
@@ -39,6 +56,7 @@ fn age_by_days(store: &Store<'_>, id: &str, days: i64) {
 }
 
 fn search(store: &Store<'_>, query: &str, include_dormant: bool, min_vitality: f64) -> Vec<String> {
+    offline();
     let input = MemorySearchInput {
         scope: Default::default(),
         strategy: Default::default(),
@@ -249,6 +267,7 @@ fn search_semantic(
     include_dormant: bool,
     min_vitality: f64,
 ) -> Vec<String> {
+    offline();
     let input = MemorySearchInput {
         query: query.to_string(),
         limit: 10,
@@ -321,4 +340,14 @@ fn dormant_rows_do_not_crowd_live_ones_out_of_the_semantic_list() {
     found.sort();
     live.sort();
     assert_eq!(found, live);
+}
+
+#[test]
+fn every_model_stage_is_off_after_offline() {
+    // Nothing in this binary turns a stage back on, so after `offline` the
+    // inherited configuration can no longer reach a model.
+    offline();
+    assert!(remind_me_core::embedder::resolve_embedder().is_none());
+    assert!(!remind_me_core::query_expansion::enabled());
+    assert!(!remind_me_core::reranker::enabled());
 }
