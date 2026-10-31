@@ -88,9 +88,12 @@ fn qualifies(next: &str) -> bool {
     next == "of" || four_digit_year(next).is_some()
 }
 
-/// `word` lowercased with leading and trailing punctuation dropped.
+/// `word` lowercased with enclosing punctuation dropped. A leading sign or
+/// decimal point stays, so `-3` and `.5` are not read as the count `3` or `5`.
 pub(crate) fn normalize_word(word: &str) -> String {
-    word.trim_matches(|c: char| !c.is_alphanumeric())
+    let numeric_syntax = |c: char| matches!(c, '-' | '+' | '.');
+    word.trim_start_matches(|c: char| !c.is_alphanumeric() && !numeric_syntax(c))
+        .trim_end_matches(|c: char| !c.is_alphanumeric())
         .to_lowercase()
 }
 
@@ -186,7 +189,7 @@ fn first_instant_at_or_after(tz: Tz, local: NaiveDateTime) -> Option<DateTime<Ut
 fn rolling(words: &[&str], now: DateTime<Tz>) -> Option<Span> {
     let open = |start| Some(Span { start, end: None });
     match words {
-        ["past" | "last", n, unit] => open(back(now, n.parse().ok().filter(|n| *n > 0)?, unit)?),
+        ["past" | "last", n, unit] => open(back(now, count(n)?, unit)?),
         ["past", unit] if !unit.ends_with('s') => open(back(now, 1, unit)?),
         ["since", name] => {
             let today = now.date_naive();
@@ -199,6 +202,14 @@ fn rolling(words: &[&str], now: DateTime<Tz>) -> Option<Span> {
         }
         _ => None,
     }
+}
+
+/// A whole positive count written in plain digits; not `+3`, `-3`, `.5` or `3.5`.
+fn count(word: &str) -> Option<u32> {
+    if word.is_empty() || !word.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    word.parse().ok().filter(|n| *n > 0)
 }
 
 /// `now` moved back `n` units: hours on the clock, the rest on the local
@@ -588,6 +599,7 @@ mod tests {
             ("TODAY standup", "TODAY"),
             ("last week and yesterday", "last week"),
             ("app crashes last 24 hours", "last 24 hours"),
+            ("outages (past 3 days)", "(past 3 days)"),
         ] {
             let (_, range) = find_relative(query, now).unwrap_or_else(|| panic!("{query:?}"));
             assert_eq!(&query[range], phrase, "{query:?}");
@@ -613,6 +625,11 @@ mod tests {
             "deploys since March 2025",
             "since june 2024, the backlog",
             "last week 2025",
+            "deploys past -3 days",
+            "deploys past .5 days",
+            "deploys past 3.5 days",
+            "deploys past +3 days",
+            "deploys last (-3) days",
             "",
         ] {
             assert_eq!(find_relative(query, now), None, "{query:?}");
@@ -640,6 +657,9 @@ mod tests {
             "7",
             "past 0 days",
             "past -1 days",
+            "past +3 days",
+            "past .5 days",
+            "past 3.5 days",
             "past 3 fortnights",
             "past days",
             "since soon",

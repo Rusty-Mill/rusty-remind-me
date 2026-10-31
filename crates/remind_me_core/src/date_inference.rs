@@ -245,6 +245,10 @@ mod tests {
             "in March",
             "deploys",
             "deploys since March 2025",
+            "deploys past -3 days",
+            "deploys past .5 days",
+            "deploys past 3.5 days",
+            "deploys past +3 days",
         ] {
             assert!(infer_utc(query).is_none(), "{query:?}");
         }

@@ -13,7 +13,8 @@
 //! - `REMIND_ME_EVAL_BLESS=1` rewrites `baseline.json` from this run, so a PR
 //!   that moves a score shows the move in its diff.
 //! - `REMIND_ME_EVAL_LIVE=1` also scores the configured embedder (and any
-//!   configured rerank or HyDE). It is printed, never gated: CI has no model.
+//!   configured rerank or HyDE), with and without date inference, and prints
+//!   the date-phrase lift for it. It is printed, never gated: CI has no model.
 //! - The gated runs switch HyDE and rerank off, whatever the environment says,
 //!   so no model is called and the baseline compares like with like.
 //! - A query with an `entity` filter that finds none of its relevant ids
@@ -500,25 +501,38 @@ fn evaluate(mode: &str, embedder: Option<&dyn Embedder>, report: &mut Report) {
     }
 }
 
-/// Each kind's change under `auto` when date phrases are inferred: the
-/// measurement behind turning `REMIND_ME_DATE_PHRASES` on by default.
-fn print_date_lift(report: &Report) {
-    println!("date-phrase lift (auto, +dates minus plain):");
-    for (key, dated) in report
+/// Each kind's change under `auto` when date phrases are inferred, as
+/// `(plain key, recall@5 lift, MRR lift)`: the measurement behind turning
+/// `REMIND_ME_DATE_PHRASES` on by default.
+fn date_lift(report: &Report) -> Vec<(String, f64, f64)> {
+    report
         .kinds
         .iter()
         .filter(|(k, _)| k.contains("+dates/auto/"))
-    {
-        let plain_key = key.replace("+dates", "");
-        let Some(plain) = report.kinds.get(&plain_key) else {
-            continue;
-        };
-        println!(
-            "  {plain_key:40} r@5 {:+.3}  mrr {:+.3}",
-            dated.recall_at_5 - plain.recall_at_5,
-            dated.mrr - plain.mrr
-        );
+        .filter_map(|(key, dated)| {
+            let plain_key = key.replace("+dates", "");
+            let plain = report.kinds.get(&plain_key)?;
+            Some((
+                plain_key,
+                dated.recall_at_5 - plain.recall_at_5,
+                dated.mrr - plain.mrr,
+            ))
+        })
+        .collect()
+}
+
+fn print_date_lift(report: &Report) {
+    println!("date-phrase lift (auto, +dates minus plain):");
+    for (key, r5, mrr) in date_lift(report) {
+        println!("  {key:40} r@5 {r5:+.3}  mrr {mrr:+.3}");
     }
+}
+
+/// The opt-in live run: `embedder` with and without date inference, so the
+/// lift is measured on a real model too. Printed by the caller, never gated.
+fn evaluate_live(embedder: &dyn Embedder, report: &mut Report) {
+    evaluate("live", Some(embedder), report);
+    evaluate("live+dates", Some(embedder), report);
 }
 
 fn fmt(s: &Scores) -> String {
@@ -549,7 +563,10 @@ fn retrieval_quality_holds_against_the_baseline() {
         let live = available_embedder();
         let mut live_report = Report::default();
         match live.as_deref() {
-            Some(e) => evaluate("live", Some(e), &mut live_report),
+            Some(e) => {
+                evaluate_live(e, &mut live_report);
+                print_date_lift(&live_report);
+            }
             None => println!("live: no embedder configured or reachable; skipped"),
         }
         for violation in &live_report.violations {
@@ -700,6 +717,23 @@ fn a_during_row_lands_inside_its_window_on_every_weekday() {
             assert!(span.end.is_none_or(|e| at < e), "{} at {now}", m.id);
         }
     }
+}
+
+/// The live arms cannot run in CI, so wire them to the hashed embedder and
+/// check both land and pair up into lift lines.
+#[test]
+fn the_live_run_measures_both_date_arms() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _offline = model_stages_off();
+    let mut report = Report::default();
+    evaluate_live(&HashedEmbedder, &mut report);
+    assert!(report.scores.contains_key("live/auto"));
+    assert!(report.measured.contains_key("live+dates/auto"));
+    let lift = date_lift(&report);
+    assert!(
+        lift.iter().any(|(key, _, _)| key == "live/auto/dated"),
+        "{lift:?}"
+    );
 }
 
 #[test]
