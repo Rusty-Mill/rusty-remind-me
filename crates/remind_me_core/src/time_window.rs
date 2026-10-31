@@ -106,6 +106,18 @@ impl TimeWindow {
         self.field
     }
 
+    /// The window a date phrase's span names, over `field`.
+    ///
+    /// A span always starts before it ends, so the `since < until` invariant
+    /// holds without a check.
+    pub fn from_span(field: TimeField, span: Span) -> Self {
+        Self {
+            field,
+            since: Some(span.start),
+            until: span.end,
+        }
+    }
+
     /// No bound set, so every memory is inside.
     pub fn is_unbounded(&self) -> bool {
         self.since.is_none() && self.until.is_none()

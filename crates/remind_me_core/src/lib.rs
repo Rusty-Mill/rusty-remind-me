@@ -22,6 +22,7 @@ pub mod context;
 pub mod context_brief;
 pub mod contradictions;
 pub mod daemon;
+pub mod date_inference;
 pub mod date_phrase;
 pub mod db;
 pub mod dbs_import;

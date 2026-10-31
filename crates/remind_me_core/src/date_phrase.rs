@@ -9,6 +9,7 @@ use chrono::{
     TimeZone, Utc, Weekday,
 };
 use chrono_tz::Tz;
+use std::ops::Range;
 
 /// The IANA zone (`Australia/Sydney`) date phrases are read in; UTC if unset.
 pub const TZ_ENV: &str = "REMIND_ME_TZ";
@@ -49,6 +50,74 @@ pub fn parse(text: &str, now: DateTime<Tz>) -> Option<Span> {
     let words: Vec<&str> = lower.split_whitespace().collect();
     rolling(&words, now)
         .or_else(|| range(&lower, &words, now.date_naive()).and_then(|p| p.span(now.timezone())))
+}
+
+/// The first relative phrase inside `query` (`yesterday`, `last week`,
+/// `past 3 days`, `since monday`; no month names, quarters or ISO dates, which
+/// in free text are usually the subject rather than a filter), with the byte
+/// range it covers. Punctuation around a word is ignored; a phrase followed by
+/// `of` ("the last week of September") is not one.
+pub fn find_relative(query: &str, now: DateTime<Tz>) -> Option<(Span, Range<usize>)> {
+    let tokens = tokens(query);
+    let norms: Vec<String> = tokens
+        .iter()
+        .map(|&(a, b)| normalize_word(&query[a..b]))
+        .collect();
+    for i in 0..tokens.len() {
+        for len in (1..=3).rev() {
+            let Some(words) = norms.get(i..i + len) else {
+                continue;
+            };
+            if norms.get(i + len).is_some_and(|next| next == "of") {
+                continue;
+            }
+            let words: Vec<&str> = words.iter().map(String::as_str).collect();
+            if let Some(span) = relative(&words, now) {
+                return Some((span, tokens[i].0..tokens[i + len - 1].1));
+            }
+        }
+    }
+    None
+}
+
+/// `word` lowercased with leading and trailing punctuation dropped.
+pub(crate) fn normalize_word(word: &str) -> String {
+    word.trim_matches(|c: char| !c.is_alphanumeric())
+        .to_lowercase()
+}
+
+/// Byte ranges of the whitespace-separated words of `text`.
+fn tokens(text: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut start = None;
+    for (i, c) in text.char_indices() {
+        match (c.is_whitespace(), start) {
+            (true, Some(s)) => {
+                out.push((s, i));
+                start = None;
+            }
+            (false, None) => start = Some(i),
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        out.push((s, text.len()));
+    }
+    out
+}
+
+/// A relative phrase only: the rolling forms and the calendar periods named
+/// from today.
+fn relative(words: &[&str], now: DateTime<Tz>) -> Option<Span> {
+    if let Some(span) = rolling(words, now) {
+        return Some(span);
+    }
+    match words {
+        ["today" | "yesterday"] | ["this" | "last", _] => {
+            period(words, now.date_naive())?.span(now.timezone())
+        }
+        _ => None,
+    }
 }
 
 /// A run of whole days, `[start, end)`.
@@ -498,6 +567,45 @@ mod tests {
             start("2026-10-04T15:37:00Z", "last 24 hours"),
             utc("2026-10-03T15:37:00Z")
         );
+    }
+
+    #[test]
+    fn find_relative_locates_the_first_relative_phrase() {
+        let now = local(Tz::UTC, "2026-10-28T09:00:00");
+        for (query, phrase) in [
+            ("deploy decisions last week", "last week"),
+            ("What happened yesterday?", "yesterday?"),
+            ("incidents in the past 3 days, please", "past 3 days,"),
+            ("firmware since Monday", "since Monday"),
+            ("TODAY standup", "TODAY"),
+            ("last week and yesterday", "last week"),
+            ("app crashes last 24 hours", "last 24 hours"),
+        ] {
+            let (_, range) = find_relative(query, now).unwrap_or_else(|| panic!("{query:?}"));
+            assert_eq!(&query[range], phrase, "{query:?}");
+        }
+        let (span, _) = find_relative("what happened yesterday", now).unwrap();
+        assert_eq!(Some(span), parse("yesterday", now));
+    }
+
+    #[test]
+    fn find_relative_skips_subjects_and_near_misses() {
+        let now = local(Tz::UTC, "2026-10-28T09:00:00");
+        for query in [
+            "Q3 roadmap",
+            "the 2026-10-26 outage",
+            "what changed in March",
+            "march 2026 billing",
+            "the last week of September",
+            "this weekend",
+            "weekly report",
+            "pricing recently",
+            "last mile delivery",
+            "since monday's outage",
+            "",
+        ] {
+            assert_eq!(find_relative(query, now), None, "{query:?}");
+        }
     }
 
     #[test]

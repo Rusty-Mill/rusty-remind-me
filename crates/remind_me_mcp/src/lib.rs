@@ -769,7 +769,7 @@ impl McpServer {
                                     "type": "object",
                                     "properties": {
                                         "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "markdown", "description": "markdown (default, as the reference) renders the results; json returns the full envelope including scores." },
-                                        "query": { "type": "string", "description": "Search text. May be empty when since or until is set, to list that window newest-first." },
+                                        "query": { "type": "string", "description": "Search text. May be empty when since or until is set, to list that window newest-first. When the server sets REMIND_ME_DATE_PHRASES=on and no since/until is given, a relative date phrase in it (yesterday, last week, past 3 days, since monday) becomes the window and leaves the text; the response's inferred_window says so." },
                                         "limit": { "type": "integer", "default": 20 },
                                         "detail": { "type": "string", "enum": ["compact", "full"], "default": "compact", "description": "compact (default): one short line per hit, so more hits fit the budget. full: whole memories with metadata and references." },
                                         "token_budget": { "type": "integer", "default": 800, "minimum": 0, "description": "Estimated tokens the hits may use; 0 is unlimited. Hits that do not fit are listed by id." },

@@ -124,6 +124,10 @@ pub struct MemorySearchResponse {
     /// off", which is the confusion this field exists to end.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bootstrap: Option<crate::promotion::Bootstrap>,
+    /// The window a date phrase in the query set, when inference is on and the
+    /// caller gave none (card #63). The phrase was taken out of the query.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inferred_window: Option<crate::date_inference::InferredWindow>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub related_via_entities: Option<Vec<RelatedMemory>>,
     #[serde(skip_serializing_if = "Option::is_none")]

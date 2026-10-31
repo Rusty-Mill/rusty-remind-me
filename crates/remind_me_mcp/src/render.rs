@@ -450,6 +450,30 @@ fn degradation_note(res: &MemorySearchResponse) -> Option<String> {
 }
 
 pub fn search_response(res: &MemorySearchResponse, detail: SearchDetail) -> String {
+    let body = search_response_body(res, detail);
+    match res.inferred_window.as_ref() {
+        Some(w) => format!("{}\n\n{body}", window_note(w)),
+        None => body,
+    }
+}
+
+/// The line that says a date phrase narrowed the search, first, so the
+/// reader knows why rows outside it are missing and how to override it.
+fn window_note(w: &remind_me_core::date_inference::InferredWindow) -> String {
+    const AT: &str = "%Y-%m-%d %H:%M";
+    let until = w
+        .until
+        .map_or_else(|| "now".to_string(), |t| t.format(AT).to_string());
+    format!(
+        "_Window from \"{}\": {} to {} UTC ({} calendar); pass since/until to override._",
+        w.phrase,
+        w.since.format(AT),
+        until,
+        w.zone
+    )
+}
+
+fn search_response_body(res: &MemorySearchResponse, detail: SearchDetail) -> String {
     let bootstrap = res.bootstrap.as_ref().filter(|b| !b.is_empty());
 
     // A bootstrap without hits is still an answer. The persona was assembled
@@ -655,11 +679,41 @@ mod bootstrap_rendering {
             budget: 800,
             timing: Default::default(),
             bootstrap,
+            inferred_window: None,
             raw_fallback: false,
             related_via_entities: None,
             related_via_neighbors: None,
             related_via_co_retrieval: None,
         }
+    }
+
+    #[test]
+    fn an_inferred_window_is_named_first_and_carried_in_json() {
+        let mut res = response(None);
+        res.inferred_window = Some(
+            serde_json::from_value(serde_json::json!({
+                "phrase": "last week",
+                "since": "2026-10-18T13:00:00Z",
+                "until": "2026-10-25T13:00:00Z",
+                "zone": "Australia/Sydney",
+            }))
+            .unwrap(),
+        );
+        let md = search_response(&res, SearchDetail::Compact);
+        assert_eq!(
+            md,
+            "_Window from \"last week\": 2026-10-18 13:00 to 2026-10-25 13:00 UTC \
+             (Australia/Sydney calendar); pass since/until to override._\n\n_No memories found._"
+        );
+        let json = compact_search_json(&res);
+        assert_eq!(json["inferred_window"]["phrase"], "last week");
+        assert_eq!(json["inferred_window"]["until"], "2026-10-25T13:00:00Z");
+
+        res.inferred_window.as_mut().unwrap().until = None;
+        assert!(search_response(&res, SearchDetail::Compact).contains("13:00 to now UTC"));
+        assert!(compact_search_json(&response(None))
+            .get("inferred_window")
+            .is_none());
     }
 
     #[test]
@@ -747,6 +801,7 @@ mod deadline_rendering {
             budget: 800,
             timing,
             bootstrap: None,
+            inferred_window: None,
             raw_fallback: false,
             related_via_entities: None,
             related_via_neighbors: None,

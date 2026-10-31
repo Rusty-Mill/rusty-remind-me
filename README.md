@@ -556,9 +556,22 @@ at 02:30 starts at 02:30 yesterday); across a daylight-saving change, a time
 that happens twice takes the earlier and one that never happens takes the
 first time after the jump. Hours are plain elapsed time.
 
+With `REMIND_ME_DATE_PHRASES=on`, `remind_me_search` also reads a relative
+phrase in the query itself (`today`, `yesterday`, `this|last week|month|quarter|year`,
+the rolling forms and `since <weekday|month>`; never month names, quarters or
+ISO dates, which in a query are usually the subject) when no `since`/`until`
+is given: "deploy decisions last week" searches last week for "deploy
+decisions". The phrase, and filler words leading into it, leave the query; a
+query left with only fillers ("what happened yesterday") lists the window
+newest first. The response carries `inferred_window` (phrase, bounds, zone),
+and Markdown opens with a line naming it. Only the search tool infers: saved
+searches, the brief, export and the CLI search their text as written. It is
+off by default until the retrieval eval's `+dates` modes show it helps.
+
 | Variable | Purpose | Default |
 | --- | --- | --- |
 | `REMIND_ME_TZ` | IANA zone whose calendar phrases mean (`Australia/Sydney`); an unknown name fails phrases, never RFC 3339 or ages | UTC |
+| `REMIND_ME_DATE_PHRASES` | `on` to infer a search window from a date phrase in the query | unset (off) |
 
 ### Query expansion (`remind_me_core::query_expansion`)
 

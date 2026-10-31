@@ -2,6 +2,17 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-10-31 — Date phrases in the search text (off by default)
+
+### Added
+- `REMIND_ME_DATE_PHRASES=on` makes `remind_me_search` read a relative date phrase in the query when no `since`/`until` is given: "deploy decisions last week" searches last week for "deploy decisions" instead of matching the words "last" and "week". Only relative forms count (`yesterday`, `this|last week|month|quarter|year`, `past 3 days`, `last 24 hours`, `since monday`); month names, quarters and ISO dates in a query are usually its subject and are left alone, as is a phrase followed by "of" ("the last week of September"). The phrase and the filler words leading into it ("in the past week") leave the query; a query left with only fillers ("what happened yesterday") lists the window newest first. Phrases use `REMIND_ME_TZ`'s calendar.
+- The response's `inferred_window` (`phrase`, `since`, `until`, `zone`) reports what was applied, in both JSON shapes; Markdown opens with a line naming the window and saying how to override it. Additive and the same for every client.
+- Inference runs only in `search_with_expansions`, the search tool's path. Saved searches, the brief, export, the daemon's `Op::Search` and the CLI call the ranker directly and search their text as written.
+
+### Tests
+- `date_inference` covers stripping, fillers, rolling and calendar phrases, an explicit window or no phrase changing nothing, the time field kept, and a bad zone failing only a query that has a phrase. `search_date_inference_test` (its own binary, as it writes the env) runs `search_with_expansions` with the flag on and off, an explicit window winning, the ranker under saved searches and the brief never inferring, and a non-UTC calendar.
+- The retrieval eval gains `keyword+dates` and `hashed+dates` modes that run every query through the same inference step, 16 rows and 8 `dated` queries whose distractor shares the topic outside the window, and rows that sit inside a calendar window by name (`during: "last week"`) so a calendar phrase finds the same rows on any weekday. The `+dates` modes' `must_not` and entity checks are gated; their scores are printed with each kind's lift over the plain mode, not gated, because which age-based rows fall inside "this week" changes through the week. `baseline.json` moves for the plain modes because of the new rows and queries. Measured under `auto`: `dated` MRR +0.146 keyword-only, -0.062 with the hashed embedder, whose meaningless similarity and the recency list outrank keyword hits inside a narrow window. The flag stays off.
+
 ## 2026-10-31 — Date phrases in `since` and `until`
 
 ### Added
