@@ -2,6 +2,18 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-10-31 — Date phrases in `since` and `until`
+
+### Added
+- Search's `since`/`until` and the brief's `since` accept plain-English dates as well as RFC 3339 and ages: `yesterday`, `last week`, `past 3 days`, `since monday`, `in march`, `Q3 2026`, `2026-10`, `2026-01 to 2026-03` and similar. One pure parser, `remind_me_core::date_phrase`, serves both, so the two `since` parsers can no longer drift apart. A `since` phrase naming a whole period (`last week`) also ends the window at that period's end unless `until` is given; `until` takes a period's end and refuses a rolling phrase with a message saying to pass it as `since`. The brief takes a phrase's start and keeps its 365-day cap.
+- `REMIND_ME_TZ` names the IANA zone (`Australia/Sydney`) whose calendar phrases mean, daylight saving included; unset means UTC. An unknown zone fails phrases with a message naming it and never affects RFC 3339 or age bounds. Rolling days, weeks, months and years keep the wall-clock time; across a daylight-saving change a time that happens twice takes the earlier, and one that never happens takes the first time after the jump. New dependency: `chrono-tz` (MIT/Apache-2.0), for the zone database.
+
+### Changed
+- `since: "yesterday"` and other phrases used to be refused; inputs that worked before resolve exactly as before. The MCP schema descriptions and README list the new forms.
+
+### Tests
+- Table tests for every phrase at fixed clocks, including year and quarter rollover, Sunday "this week", a leap day, a month-end clamp, local midnight in Sydney, a DST gap at midnight (Santiago), a 23-hour DST day, and rolling `past 1 day`/`past week`/`past month`/`past year` landing in Sydney's spring gap and autumn fold (also through `TimeWindow` and `parse_since`), with off-quarter-hour and fractional-second times that must still start exactly at the jump; near misses such as "weekly", "this weekend", "the last week of September", "may said", "Q5" and "2026-02-30" stay unparsed. `TimeWindow` covers the argument rules and that ages and instants never move with the zone; `parse_since` covers phrase starts, the cap and the future. `date_phrase_zone_test` (its own binary, as it writes the env) covers `REMIND_ME_TZ` end to end, including a bad zone that fails phrases but not `2d` or RFC 3339.
+
 ## 2026-10-31 — Dormant memories stay out of semantic results
 
 ### Fixed

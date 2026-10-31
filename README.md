@@ -540,6 +540,26 @@ does nothing until `REMIND_ME_RERANK_MODEL_PATH`/
 `REMIND_ME_RERANK_TOKENIZER_PATH` name a `.rten` cross-encoder and its
 `tokenizer.json` — same no-implicit-download rule.
 
+### Date phrases (`remind_me_core::date_phrase`)
+
+Search's `since`/`until` and the brief's `since` take plain-English dates as
+well as RFC 3339 and ages: `today`, `yesterday`, `this|last week|month|quarter|year`,
+`past|last N hours|days|weeks|months|years`, `past week`, `since monday`,
+`since june`, `[in] march [2026]`, `Q3 [2026]`, `2026-10-26`, `2026-10`, and
+ranges such as `2026-01 to 2026-03` or `between Q1 and Q2`. Weeks start on
+Monday; a month or quarter with no year is the latest one that has started.
+A `since` phrase naming a whole period (`last week`) also ends the window at
+that period's end unless `until` is given; `until` takes a period's end and
+refuses a rolling phrase (`past 3 days`). The brief takes a phrase's start.
+Rolling days, weeks, months and years keep the wall-clock time (`past 1 day`
+at 02:30 starts at 02:30 yesterday); across a daylight-saving change, a time
+that happens twice takes the earlier and one that never happens takes the
+first time after the jump. Hours are plain elapsed time.
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `REMIND_ME_TZ` | IANA zone whose calendar phrases mean (`Australia/Sydney`); an unknown name fails phrases, never RFC 3339 or ages | UTC |
+
 ### Query expansion (`remind_me_core::query_expansion`)
 
 `REMIND_ME_QUERY_EXPANSION=hyde` enables HyDE (Hypothetical Document
@@ -643,7 +663,7 @@ One call for what is worth knowing about a project: its current state (the newes
 ```bash
 rusty-remind-me brief rusty_mux --since 2d --budget 1500
 ```
-The name resolves through the entity graph, so an alias works, and a memory is in scope when its project, its git remote's repository, a tag, its subject or object, or an entity link names the project. An unknown name is refused with the closest known names, never guessed. `--since` takes `7d` (the default), `12h` or an RFC 3339 time; `--budget` is in tokens (200 to 8,000) and bounds the returned text, JSON or Markdown, by the same bytes/4 estimate search uses; items that do not fit are dropped whole and counted, and a budget too small even for the header is refused with the size it needs. `--json` prints the brief's JSON instead of its Markdown. Sensitive, superseded and expired memories never appear, and never make a name known or suggested. The same brief is the MCP tool `remind_me_brief` (in the `core` profile, JSON by default) and `GET /api/brief`.
+The name resolves through the entity graph, so an alias works, and a memory is in scope when its project, its git remote's repository, a tag, its subject or object, or an entity link names the project. An unknown name is refused with the closest known names, never guessed. `--since` takes `7d` (the default), `12h`, an RFC 3339 time or a date phrase such as `yesterday` or `last week` (its start); `--budget` is in tokens (200 to 8,000) and bounds the returned text, JSON or Markdown, by the same bytes/4 estimate search uses; items that do not fit are dropped whole and counted, and a budget too small even for the header is refused with the size it needs. `--json` prints the brief's JSON instead of its Markdown. Sensitive, superseded and expired memories never appear, and never make a name known or suggested. The same brief is the MCP tool `remind_me_brief` (in the `core` profile, JSON by default) and `GET /api/brief`.
 
 ### 9. Knowledge Graph Entity Management
 Upserts an entity with optional category/kind classification:

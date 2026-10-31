@@ -1,11 +1,14 @@
 //! The `since`/`until` window a search narrows to.
 //!
-//! Each bound is RFC 3339 or a relative age (`30m`, `12h`, `2d`, `1w`) that is
+//! Each bound is RFC 3339, a relative age (`30m`, `12h`, `2d`, `1w`) or a date
+//! phrase (`yesterday`, `last week`, `Q3`; see [`crate::date_phrase`]) that is
 //! resolved against the clock once, at the boundary, so everything downstream
 //! sees absolute instants and a search serialised to the daemon means the same
 //! thing when it arrives.
 
+use crate::date_phrase::{self, Span};
 use chrono::{DateTime, TimeDelta, Utc};
+use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 
 /// Which timestamp a [`TimeWindow`] reads.
@@ -42,20 +45,46 @@ pub struct RawTimeWindow {
 }
 
 impl TimeWindow {
-    /// Validate `raw`, resolving relative ages against `now`.
+    /// Validate `raw`, resolving relative ages and date phrases against `now`.
     ///
-    /// Errors name the offending argument: a bound that is neither RFC 3339
-    /// nor a positive `<n>m|h|d|w` age, or a window that ends at or before it
-    /// starts.
+    /// Phrases are read in [`date_phrase::configured_zone`]. A `since` phrase
+    /// naming a whole period (`last week`, `Q3`) also sets `until` to its end
+    /// when `until` is not given. Errors name the offending argument: a bound
+    /// that is none of the accepted forms, an `until` phrase with no end
+    /// (`past 3 days`), or a window that ends at or before it starts.
     pub fn resolve(raw: &RawTimeWindow, now: DateTime<Utc>) -> Result<Self, String> {
+        Self::resolve_with(raw, now, date_phrase::configured_zone)
+    }
+
+    /// [`Self::resolve`] with the zone injected; it is only asked for when a
+    /// bound is a phrase, so a bad zone setting never fails an RFC 3339 bound.
+    fn resolve_with(
+        raw: &RawTimeWindow,
+        now: DateTime<Utc>,
+        zone: impl Fn() -> Result<Tz, String>,
+    ) -> Result<Self, String> {
         let bound = |name: &str, value: &Option<String>| {
             value
                 .as_deref()
-                .map(|v| parse_bound(v, now).map_err(|e| format!("`{name}`: {e}")))
+                .map(|v| parse_bound(v, now, &zone).map_err(|e| format!("`{name}`: {e}")))
                 .transpose()
         };
-        let since = bound("since", &raw.since)?;
-        let until = bound("until", &raw.until)?;
+        let (since, implied_until) = match bound("since", &raw.since)? {
+            None => (None, None),
+            Some(Bound::At(at)) => (Some(at), None),
+            Some(Bound::Span(span)) => (Some(span.start), span.end),
+        };
+        let until = match bound("until", &raw.until)? {
+            None => implied_until,
+            Some(Bound::At(at)) => Some(at),
+            Some(Bound::Span(Span { end: Some(end), .. })) => Some(end),
+            Some(Bound::Span(Span { end: None, .. })) => {
+                return Err(format!(
+                    "`until`: {:?} runs up to now and has no end; pass it as `since`",
+                    raw.until.as_deref().unwrap_or_default()
+                ))
+            }
+        };
         if let (Some(s), Some(u)) = (since, until) {
             if u <= s {
                 return Err(format!(
@@ -133,16 +162,35 @@ pub fn parse_rfc3339(ts: &str) -> Option<DateTime<Utc>> {
         .map(|t| t.with_timezone(&Utc))
 }
 
-fn parse_bound(value: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>, String> {
+/// One parsed `since`/`until` value: an instant, or a phrase's span.
+enum Bound {
+    At(DateTime<Utc>),
+    Span(Span),
+}
+
+fn parse_bound(
+    value: &str,
+    now: DateTime<Utc>,
+    zone: impl Fn() -> Result<Tz, String>,
+) -> Result<Bound, String> {
     let value = value.trim();
     if let Some(at) = parse_rfc3339(value) {
-        return Ok(at);
+        return Ok(Bound::At(at));
     }
-    let age = parse_age(value).ok_or_else(|| {
-        format!("{value:?} is neither RFC 3339 nor a positive age like 30m, 12h, 2d or 1w")
-    })?;
-    now.checked_sub_signed(age)
-        .ok_or_else(|| format!("{value:?} reaches before the earliest representable time"))
+    if let Some(age) = parse_age(value) {
+        return now
+            .checked_sub_signed(age)
+            .map(Bound::At)
+            .ok_or_else(|| format!("{value:?} reaches before the earliest representable time"));
+    }
+    date_phrase::parse(value, now.with_timezone(&zone()?))
+        .map(Bound::Span)
+        .ok_or_else(|| {
+            format!(
+                "{value:?} is not RFC 3339, an age like 30m, 12h, 2d or 1w, \
+                 or a date phrase like yesterday, last week, Q3 or 2026-10"
+            )
+        })
 }
 
 /// `<n>m|h|d|w` with `n > 0`.
@@ -167,6 +215,14 @@ mod tests {
 
     fn now() -> DateTime<Utc> {
         parse_rfc3339("2026-10-26T12:00:00Z").unwrap()
+    }
+
+    fn in_utc(r: &RawTimeWindow) -> Result<TimeWindow, String> {
+        TimeWindow::resolve_with(r, now(), || Ok(Tz::UTC))
+    }
+
+    fn at(ts: &str) -> Option<DateTime<Utc>> {
+        parse_rfc3339(ts)
     }
 
     fn raw(since: Option<&str>, until: Option<&str>) -> RawTimeWindow {
@@ -199,15 +255,17 @@ mod tests {
     #[test]
     fn bad_input_is_rejected_naming_the_argument() {
         for (r, needle) in [
-            (raw(Some("yesterday"), None), "`since`"),
+            (raw(Some("soon"), None), "`since`"),
             (raw(None, Some("2x")), "`until`"),
+            (raw(None, Some("past 3 days")), "has no end"),
+            (raw(Some("past 2 days"), Some("past 3 days")), "`until`"),
             (raw(Some("0d"), None), "`since`"),
             (raw(Some("-2d"), None), "`since`"),
             (raw(Some("d"), None), "`since`"),
             (raw(Some(""), None), "`since`"),
             (raw(Some("99999999999w"), None), "`since`"),
         ] {
-            let err = TimeWindow::resolve(&r, now()).unwrap_err();
+            let err = in_utc(&r).unwrap_err();
             assert!(err.contains(needle), "{err}");
         }
     }
@@ -262,5 +320,82 @@ mod tests {
         assert!(
             serde_json::from_value::<TimeWindow>(serde_json::json!({ "since": "soon" })).is_err()
         );
+    }
+
+    #[test]
+    fn date_phrases_set_bounds_by_the_argument_rules() {
+        // now() is Monday 2026-10-26 12:00 UTC.
+        for (since, until, want_since, want_until) in [
+            // `since` alone naming a whole period sets both bounds.
+            (
+                Some("yesterday"),
+                None,
+                "2026-10-25T00:00:00Z",
+                Some("2026-10-26T00:00:00Z"),
+            ),
+            (
+                Some("last week"),
+                None,
+                "2026-10-19T00:00:00Z",
+                Some("2026-10-26T00:00:00Z"),
+            ),
+            (
+                Some("Q3"),
+                None,
+                "2026-07-01T00:00:00Z",
+                Some("2026-10-01T00:00:00Z"),
+            ),
+            // A rolling phrase runs up to now.
+            (Some("past 3 days"), None, "2026-10-23T12:00:00Z", None),
+            // An explicit `until` wins over the period's end.
+            (
+                Some("last month"),
+                Some("2026-09-15T00:00:00Z"),
+                "2026-09-01T00:00:00Z",
+                Some("2026-09-15T00:00:00Z"),
+            ),
+            // `until` takes a period's end.
+            (
+                Some("2d"),
+                Some("today"),
+                "2026-10-24T12:00:00Z",
+                Some("2026-10-27T00:00:00Z"),
+            ),
+            (
+                Some("2026-01"),
+                Some("2026-03"),
+                "2026-01-01T00:00:00Z",
+                Some("2026-04-01T00:00:00Z"),
+            ),
+        ] {
+            let w = in_utc(&raw(since, until)).unwrap();
+            assert_eq!(w.since, at(want_since), "{since:?} {until:?}");
+            assert_eq!(w.until, want_until.and_then(at), "{since:?} {until:?}");
+        }
+    }
+
+    #[test]
+    fn a_phrase_never_shifts_ages_or_instants() {
+        for value in ["30m", "2d", "1w", "2026-10-26T14:00:00+02:00"] {
+            let plain = in_utc(&raw(Some(value), None)).unwrap();
+            let sydney = TimeWindow::resolve_with(&raw(Some(value), None), now(), || {
+                Ok(chrono_tz::Australia::Sydney)
+            })
+            .unwrap();
+            assert_eq!(plain, sydney, "{value}");
+            assert_eq!(plain.until, None, "{value}");
+        }
+    }
+
+    #[test]
+    fn a_rolling_since_across_a_dst_change_resolves() {
+        // 02:30 AEDT on 2026-10-05; a day earlier is inside the spring-forward gap.
+        let now = parse_rfc3339("2026-10-04T15:30:00Z").unwrap();
+        let w = TimeWindow::resolve_with(&raw(Some("past 1 day"), None), now, || {
+            Ok(chrono_tz::Australia::Sydney)
+        })
+        .unwrap();
+        assert_eq!(w.since, at("2026-10-03T16:00:00Z"));
+        assert_eq!(w.until, None);
     }
 }
