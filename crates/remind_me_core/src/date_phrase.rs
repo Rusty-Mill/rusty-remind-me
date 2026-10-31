@@ -5,7 +5,8 @@
 //! included. [`configured_zone`] is the one place that reads the zone setting.
 
 use chrono::{
-    DateTime, Datelike, Days, Month, Months, NaiveDate, TimeDelta, TimeZone, Utc, Weekday,
+    DateTime, Datelike, Days, Month, Months, NaiveDate, NaiveDateTime, TimeDelta, TimeZone, Utc,
+    Weekday,
 };
 use chrono_tz::Tz;
 
@@ -40,7 +41,9 @@ pub fn configured_zone() -> Result<Tz, String> {
 /// of those as `A to B`, `A..B` or `between A and B`. Rolling forms run up to
 /// now: `past|last N hours|days|weeks|months|years`, `past week|month|year`,
 /// `since <weekday>`, `since <month>`. A month or quarter without a year is the
-/// latest one that has started. Anything else is `None`.
+/// latest one that has started. Rolling days to years keep the wall-clock time
+/// and cross DST taking the earlier of a repeated time and the first time
+/// after a skipped one. Anything else is `None`.
 pub fn parse(text: &str, now: DateTime<Tz>) -> Option<Span> {
     let lower = text.trim().to_ascii_lowercase();
     let words: Vec<&str> = lower.split_whitespace().collect();
@@ -64,23 +67,26 @@ impl Period {
     }
 }
 
-/// Local midnight, or the first hour that exists when a DST jump skips it.
+/// Local midnight, or the first time that exists when a DST jump skips it.
 fn day_start(tz: Tz, day: NaiveDate) -> Option<DateTime<Utc>> {
-    (0..3).find_map(|h| {
-        let local = day.and_hms_opt(h, 0, 0)?;
-        tz.from_local_datetime(&local)
+    local_instant(tz, day.and_hms_opt(0, 0, 0)?)
+}
+
+/// The instant a local wall-clock time names. In a DST fold (the time occurs
+/// twice) it is the earlier one, so a window starting there loses nothing; in
+/// a DST gap (it never occurs) it is the first time that exists after the jump.
+fn local_instant(tz: Tz, local: NaiveDateTime) -> Option<DateTime<Utc>> {
+    const STEP_MINUTES: i64 = 15; // every zone's offsets are whole quarter hours
+    (0..=12).find_map(|i| {
+        let t = local.checked_add_signed(TimeDelta::try_minutes(i * STEP_MINUTES)?)?;
+        tz.from_local_datetime(&t)
             .earliest()
             .map(|t| t.with_timezone(&Utc))
     })
 }
 
 fn rolling(words: &[&str], now: DateTime<Tz>) -> Option<Span> {
-    let open = |start: DateTime<Tz>| {
-        Some(Span {
-            start: start.with_timezone(&Utc),
-            end: None,
-        })
-    };
+    let open = |start| Some(Span { start, end: None });
     match words {
         ["past" | "last", n, unit] => open(back(now, n.parse().ok().filter(|n| *n > 0)?, unit)?),
         ["past", unit] if !unit.ends_with('s') => open(back(now, 1, unit)?),
@@ -91,25 +97,30 @@ fn rolling(words: &[&str], now: DateTime<Tz>) -> Option<Span> {
                 (_, Ok(m)) => latest_month(today, m)?,
                 _ => return None,
             };
-            Some(Span {
-                start: day_start(now.timezone(), day)?,
-                end: None,
-            })
+            open(day_start(now.timezone(), day)?)
         }
         _ => None,
     }
 }
 
-/// `now` moved back `n` units on the local calendar.
-fn back(now: DateTime<Tz>, n: u32, unit: &str) -> Option<DateTime<Tz>> {
-    match unit.strip_suffix('s').unwrap_or(unit) {
-        "hour" => now.checked_sub_signed(TimeDelta::try_hours(i64::from(n))?),
-        "day" => now.checked_sub_days(Days::new(u64::from(n))),
-        "week" => now.checked_sub_days(Days::new(7 * u64::from(n))),
-        "month" => now.checked_sub_months(Months::new(n)),
-        "year" => now.checked_sub_months(Months::new(n.checked_mul(12)?)),
-        _ => None,
-    }
+/// `now` moved back `n` units: hours on the clock, the rest on the local
+/// calendar (the same wall-clock time `n` days or months ago), resolved
+/// through DST by [`local_instant`].
+fn back(now: DateTime<Tz>, n: u32, unit: &str) -> Option<DateTime<Utc>> {
+    let local = now.naive_local();
+    let target = match unit.strip_suffix('s').unwrap_or(unit) {
+        "hour" => {
+            return now
+                .checked_sub_signed(TimeDelta::try_hours(i64::from(n))?)
+                .map(|t| t.with_timezone(&Utc))
+        }
+        "day" => local.checked_sub_days(Days::new(u64::from(n)))?,
+        "week" => local.checked_sub_days(Days::new(7 * u64::from(n)))?,
+        "month" => local.checked_sub_months(Months::new(n))?,
+        "year" => local.checked_sub_months(Months::new(n.checked_mul(12)?))?,
+        _ => return None,
+    };
+    local_instant(now.timezone(), target)
 }
 
 fn days_since(from: Weekday, back_to: Weekday) -> u64 {
@@ -398,6 +409,38 @@ mod tests {
         let sydney = chrono_tz::Australia::Sydney;
         let span = parse("2026-10-04", local(sydney, "2026-10-28T09:00:00")).unwrap();
         assert_eq!(span.end.unwrap() - span.start, TimeDelta::hours(23));
+    }
+
+    #[test]
+    fn rolling_targets_in_a_dst_gap_or_fold_still_resolve() {
+        let sydney = chrono_tz::Australia::Sydney;
+        let start = |now: &str, text: &str| {
+            parse(text, utc(now).with_timezone(&sydney))
+                .unwrap_or_else(|| panic!("{text:?} at {now}"))
+                .start
+        };
+        // 2026-10-04 02:00-03:00 AEST never happens: the first time after it.
+        assert_eq!(
+            start("2026-10-04T15:30:00Z", "past 1 day"),
+            utc("2026-10-03T16:00:00Z")
+        );
+        assert_eq!(
+            start("2026-11-03T15:30:00Z", "past month"),
+            utc("2026-10-03T16:00:00Z")
+        );
+        assert_eq!(
+            start("2026-10-10T15:30:00Z", "past week"),
+            utc("2026-10-03T16:00:00Z")
+        );
+        // 2026-04-05 02:00-03:00 happens twice: the earlier, still in AEDT.
+        assert_eq!(
+            start("2026-04-05T16:30:00Z", "past 1 day"),
+            utc("2026-04-04T15:30:00Z")
+        );
+        assert_eq!(
+            start("2027-04-04T16:30:00Z", "past year"),
+            utc("2026-04-04T15:30:00Z")
+        );
     }
 
     #[test]

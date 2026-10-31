@@ -386,4 +386,16 @@ mod tests {
             assert_eq!(plain.until, None, "{value}");
         }
     }
+
+    #[test]
+    fn a_rolling_since_across_a_dst_change_resolves() {
+        // 02:30 AEDT on 2026-10-05; a day earlier is inside the spring-forward gap.
+        let now = parse_rfc3339("2026-10-04T15:30:00Z").unwrap();
+        let w = TimeWindow::resolve_with(&raw(Some("past 1 day"), None), now, || {
+            Ok(chrono_tz::Australia::Sydney)
+        })
+        .unwrap();
+        assert_eq!(w.since, at("2026-10-03T16:00:00Z"));
+        assert_eq!(w.until, None);
+    }
 }

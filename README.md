@@ -551,6 +551,10 @@ Monday; a month or quarter with no year is the latest one that has started.
 A `since` phrase naming a whole period (`last week`) also ends the window at
 that period's end unless `until` is given; `until` takes a period's end and
 refuses a rolling phrase (`past 3 days`). The brief takes a phrase's start.
+Rolling days, weeks, months and years keep the wall-clock time (`past 1 day`
+at 02:30 starts at 02:30 yesterday); across a daylight-saving change, a time
+that happens twice takes the earlier and one that never happens takes the
+first time after the jump. Hours are plain elapsed time.
 
 | Variable | Purpose | Default |
 | --- | --- | --- |

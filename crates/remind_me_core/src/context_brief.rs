@@ -1446,6 +1446,16 @@ mod tests {
     }
 
     #[test]
+    fn since_phrase_across_a_dst_fold_resolves() {
+        // 02:30 AEST on 2026-04-06; a day earlier, 02:30 happened twice.
+        let now = DateTime::parse_from_rfc3339("2026-04-05T16:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let start = parse_since_with("past 1 day", now, || Ok(chrono_tz::Australia::Sydney));
+        assert_eq!(start.unwrap().to_rfc3339(), "2026-04-04T15:30:00+00:00");
+    }
+
+    #[test]
     fn token_budget_bounds_are_inclusive() {
         assert!(check_token_budget(MIN_TOKEN_BUDGET).is_ok());
         assert!(check_token_budget(MAX_TOKEN_BUDGET).is_ok());
