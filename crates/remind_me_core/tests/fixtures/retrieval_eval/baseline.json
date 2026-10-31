@@ -1,0 +1,42 @@
+{
+  "hashed/auto": {
+    "recall_at_5": 0.9093,
+    "recall_at_10": 0.9093,
+    "mrr": 0.8078
+  },
+  "hashed/balanced": {
+    "recall_at_5": 0.9093,
+    "recall_at_10": 0.9093,
+    "mrr": 0.8061
+  },
+  "hashed/keyword_favored": {
+    "recall_at_5": 0.8799,
+    "recall_at_10": 0.9093,
+    "mrr": 0.7672
+  },
+  "hashed/semantic_favored": {
+    "recall_at_5": 0.9069,
+    "recall_at_10": 0.9093,
+    "mrr": 0.8098
+  },
+  "keyword/auto": {
+    "recall_at_5": 0.8725,
+    "recall_at_10": 0.9044,
+    "mrr": 0.7852
+  },
+  "keyword/balanced": {
+    "recall_at_5": 0.8873,
+    "recall_at_10": 0.9044,
+    "mrr": 0.7832
+  },
+  "keyword/keyword_favored": {
+    "recall_at_5": 0.8873,
+    "recall_at_10": 0.9044,
+    "mrr": 0.7854
+  },
+  "keyword/semantic_favored": {
+    "recall_at_5": 0.8284,
+    "recall_at_10": 0.9044,
+    "mrr": 0.7756
+  }
+}
