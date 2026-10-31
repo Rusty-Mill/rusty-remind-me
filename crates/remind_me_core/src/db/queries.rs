@@ -1064,6 +1064,24 @@ pub fn search_with_expansions(
     store: &Store<'_>,
     input: &MemorySearchInput,
 ) -> Result<MemorySearchResponse> {
+    // A date phrase in the query becomes the window here, at the tool's
+    // boundary, and nowhere deeper: saved searches, the brief and export call
+    // the ranker directly and keep searching their text as written.
+    let inferred = if crate::date_inference::enabled() {
+        crate::date_inference::infer(input, Utc::now(), crate::date_phrase::configured_zone)
+            .map_err(StoreError::Invalid)?
+    } else {
+        None
+    };
+    let narrowed;
+    let (input, inferred_window) = match inferred {
+        Some((rewritten, applied)) => {
+            narrowed = rewritten;
+            (&narrowed, Some(applied))
+        }
+        None => (input, None),
+    };
+
     let configured = crate::embedder::available_embedder();
 
     // The bootstrap is assembled first because it *spends* from the same
@@ -1136,6 +1154,7 @@ pub fn search_with_expansions(
         timing: outcome.timing,
         raw_fallback: outcome.raw_fallback,
         bootstrap,
+        inferred_window,
         memories,
         total_candidates: outcome.total_candidates,
         returned: outcome.returned,

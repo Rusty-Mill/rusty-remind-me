@@ -13,7 +13,8 @@
 //! - `REMIND_ME_EVAL_BLESS=1` rewrites `baseline.json` from this run, so a PR
 //!   that moves a score shows the move in its diff.
 //! - `REMIND_ME_EVAL_LIVE=1` also scores the configured embedder (and any
-//!   configured rerank or HyDE). It is printed, never gated: CI has no model.
+//!   configured rerank or HyDE), with and without date inference, and prints
+//!   the date-phrase lift for it. It is printed, never gated: CI has no model.
 //! - The gated runs switch HyDE and rerank off, whatever the environment says,
 //!   so no model is called and the baseline compares like with like.
 //! - A query with an `entity` filter that finds none of its relevant ids
@@ -23,8 +24,19 @@
 //! [`HashedEmbedder`], a deterministic stand-in that exercises the vector
 //! stage and fusion but knows nothing about meaning.
 //!
+//! Two more modes, `keyword+dates` and `hashed+dates`, run every query through
+//! the date-phrase inference step the search tool uses when
+//! `REMIND_ME_DATE_PHRASES=on` (card #63), and print each kind's lift over the
+//! plain mode. Their `must_not` and entity checks are gated like every other
+//! run, but their scores are printed, not compared with the baseline: which
+//! age-based rows fall inside "this week" changes with the weekday, so those
+//! scores move by a query or two through the week however the code behaves.
+//!
 //! Ages in the fixture are relative to the run, so recency sees the same ages
-//! every day and the fixture never expires with the calendar. A row is last
+//! every day and the fixture never expires with the calendar. A row that must
+//! sit inside a calendar window names it instead (`during: "last week"`) and is
+//! placed mid-way through that window at load time, so a calendar phrase finds
+//! the same rows whatever weekday the test runs on. A row is last
 //! read at load time unless it sets `accessed_days`; the few that do are
 //! dormant, and the `dormant` queries check that no stage surfaces them. The env-reading
 //! parts keep this file its own test binary.
@@ -33,8 +45,11 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
+use chrono_tz::Tz;
 use remind_me_core::context::ScopeFilter;
+use remind_me_core::date_inference;
+use remind_me_core::date_phrase;
 use remind_me_core::db::memories::{Memories, NewMemory};
 use remind_me_core::db::{queries, Store};
 use remind_me_core::embedder::{
@@ -67,7 +82,8 @@ const STRATEGIES: [(&str, RetrievalStrategy); 4] = [
 // Fixture
 // ---------------------------------------------------------------------------
 
-/// One stored memory. `age_days` is resolved against the clock at load time.
+/// One stored memory. `age_days`, or the calendar window `during` names, is
+/// resolved against the clock at load time.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FixtureMemory {
@@ -78,7 +94,11 @@ struct FixtureMemory {
     #[serde(default)]
     tags: Vec<String>,
     project: Option<String>,
+    #[serde(default)]
     age_days: i64,
+    /// A date phrase (`last week`, `this month`): the row is placed mid-way
+    /// through that window, up to now. Not with `age_days`.
+    during: Option<String>,
     /// Days since it was last read; default today. Old enough and the row is
     /// dormant, which search must hide from every stage.
     #[serde(default)]
@@ -127,6 +147,9 @@ fn validate(memories: &[FixtureMemory], golden: &[GoldenQuery]) -> Result<(), St
         return Err("duplicate memory id in memories.jsonl".into());
     }
     for m in memories {
+        if m.during.is_some() && m.age_days != 0 {
+            return Err(format!("{}: both during and age_days", m.id));
+        }
         if let Some(next) = &m.superseded_by {
             if !known.contains(next.as_str()) {
                 return Err(format!(
@@ -161,7 +184,7 @@ fn load(store: &Store<'_>, memories: &[FixtureMemory], embedder: Option<&dyn Emb
     let now = Utc::now();
     let repo = Memories::new(store);
     for m in memories {
-        let at = (now - Duration::days(m.age_days)).to_rfc3339();
+        let at = created_at(m, now).to_rfc3339();
         repo.insert(&NewMemory {
             category: m.category.clone(),
             memory_type: m.memory_type.clone(),
@@ -192,11 +215,24 @@ fn load(store: &Store<'_>, memories: &[FixtureMemory], embedder: Option<&dyn Emb
     }
 }
 
+/// `age_days` back, or mid-way through the window `during` names (in UTC,
+/// the zone the `+dates` modes infer in).
+fn created_at(m: &FixtureMemory, now: DateTime<Utc>) -> DateTime<Utc> {
+    let Some(phrase) = &m.during else {
+        return now - Duration::days(m.age_days);
+    };
+    let span = date_phrase::parse(phrase, now.with_timezone(&Tz::UTC))
+        .unwrap_or_else(|| panic!("{}: during {phrase:?} is not a date phrase", m.id));
+    let end = span.end.map_or(now, |e| e.min(now));
+    span.start + (end - span.start) / 2
+}
+
 fn ranked(
     store: &Store<'_>,
     g: &GoldenQuery,
     strategy: RetrievalStrategy,
     embedder: Option<&dyn Embedder>,
+    dates: bool,
 ) -> Vec<String> {
     let input = MemorySearchInput {
         query: g.query.clone(),
@@ -212,6 +248,13 @@ fn ranked(
             ..Default::default()
         },
         ..Default::default()
+    };
+    let input = if dates {
+        date_inference::infer(&input, Utc::now(), || Ok(Tz::UTC))
+            .unwrap()
+            .map_or(input, |(narrowed, _)| narrowed)
+    } else {
+        input
     };
     queries::search_memories_deadlined(store, &input, embedder, Deadline::unbounded())
         .unwrap()
@@ -349,6 +392,10 @@ impl Embedder for HashedEmbedder {
 #[derive(Default)]
 struct Report {
     scores: BTreeMap<String, Scores>,
+    /// `+dates` runs' scores per `mode/strategy`: printed, never gated.
+    measured: BTreeMap<String, Scores>,
+    /// `mode/strategy/kind`, for the `+dates` lift lines; not gated.
+    kinds: BTreeMap<String, Scores>,
     violations: Vec<String>,
 }
 
@@ -394,6 +441,7 @@ fn model_stages_off() -> EnvOverride {
 }
 
 fn evaluate(mode: &str, embedder: Option<&dyn Embedder>, report: &mut Report) {
+    let dates = mode.ends_with("+dates");
     let memories: Vec<FixtureMemory> = read_jsonl("memories.jsonl");
     let golden: Vec<GoldenQuery> = read_jsonl("queries.jsonl");
     validate(&memories, &golden).unwrap();
@@ -408,7 +456,7 @@ fn evaluate(mode: &str, embedder: Option<&dyn Embedder>, report: &mut Report) {
         let mut all = Vec::new();
         let mut by_kind: BTreeMap<&str, Vec<(f64, f64, f64)>> = BTreeMap::new();
         for g in &golden {
-            let ranking = ranked(&store, g, strategy, embedder);
+            let ranking = ranked(&store, g, strategy, embedder, dates);
             for leak in g.must_not.iter().filter(|id| ranking.contains(id)) {
                 report
                     .violations
@@ -441,14 +489,50 @@ fn evaluate(mode: &str, embedder: Option<&dyn Embedder>, report: &mut Report) {
         let total = Scores::mean(&all);
         println!("{key:32} {}", fmt(&total));
         for (kind, rows) in &by_kind {
-            println!(
-                "  {kind:30} {} (n={})",
-                fmt(&Scores::mean(rows)),
-                rows.len()
-            );
+            let scores = Scores::mean(rows);
+            println!("  {kind:30} {} (n={})", fmt(&scores), rows.len());
+            report.kinds.insert(format!("{key}/{kind}"), scores);
         }
-        report.scores.insert(key, total);
+        if dates {
+            report.measured.insert(key, total);
+        } else {
+            report.scores.insert(key, total);
+        }
     }
+}
+
+/// Each kind's change under `auto` when date phrases are inferred, as
+/// `(plain key, recall@5 lift, MRR lift)`: the measurement behind turning
+/// `REMIND_ME_DATE_PHRASES` on by default.
+fn date_lift(report: &Report) -> Vec<(String, f64, f64)> {
+    report
+        .kinds
+        .iter()
+        .filter(|(k, _)| k.contains("+dates/auto/"))
+        .filter_map(|(key, dated)| {
+            let plain_key = key.replace("+dates", "");
+            let plain = report.kinds.get(&plain_key)?;
+            Some((
+                plain_key,
+                dated.recall_at_5 - plain.recall_at_5,
+                dated.mrr - plain.mrr,
+            ))
+        })
+        .collect()
+}
+
+fn print_date_lift(report: &Report) {
+    println!("date-phrase lift (auto, +dates minus plain):");
+    for (key, r5, mrr) in date_lift(report) {
+        println!("  {key:40} r@5 {r5:+.3}  mrr {mrr:+.3}");
+    }
+}
+
+/// The opt-in live run: `embedder` with and without date inference, so the
+/// lift is measured on a real model too. Printed by the caller, never gated.
+fn evaluate_live(embedder: &dyn Embedder, report: &mut Report) {
+    evaluate("live", Some(embedder), report);
+    evaluate("live+dates", Some(embedder), report);
 }
 
 fn fmt(s: &Scores) -> String {
@@ -470,13 +554,19 @@ fn retrieval_quality_holds_against_the_baseline() {
         let _offline = model_stages_off();
         evaluate("keyword", None, &mut report);
         evaluate("hashed", Some(&HashedEmbedder), &mut report);
+        evaluate("keyword+dates", None, &mut report);
+        evaluate("hashed+dates", Some(&HashedEmbedder), &mut report);
     }
+    print_date_lift(&report);
 
     if env_on("REMIND_ME_EVAL_LIVE") {
         let live = available_embedder();
         let mut live_report = Report::default();
         match live.as_deref() {
-            Some(e) => evaluate("live", Some(e), &mut live_report),
+            Some(e) => {
+                evaluate_live(e, &mut live_report);
+                print_date_lift(&live_report);
+            }
             None => println!("live: no embedder configured or reachable; skipped"),
         }
         for violation in &live_report.violations {
@@ -603,6 +693,47 @@ fn validate_refuses_a_golden_set_that_cannot_hold() {
     assert!(validate(&memories, &[golden(&["missing"], &[])]).is_err());
     assert!(validate(&memories, &[golden(&["a"], &["missing"])]).is_err());
     assert!(validate(&memories, &[golden(&["a"], &["a"])]).is_err());
+    let both: Vec<FixtureMemory> = vec![serde_json::from_value(serde_json::json!({
+        "id": "a", "content": "x", "category": "general", "memory_type": "fact",
+        "project": null, "age_days": 1, "during": "last week"
+    }))
+    .unwrap()];
+    assert!(validate(&both, &[golden(&["a"], &[])]).is_err());
+}
+
+#[test]
+fn a_during_row_lands_inside_its_window_on_every_weekday() {
+    let memories: Vec<FixtureMemory> = read_jsonl("memories.jsonl");
+    let start = DateTime::parse_from_rfc3339("2026-10-26T00:00:30Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    for hours in (0..24 * 9).step_by(5) {
+        let now = start + Duration::hours(hours);
+        for m in memories.iter().filter(|m| m.during.is_some()) {
+            let phrase = m.during.as_deref().unwrap();
+            let span = date_phrase::parse(phrase, now.with_timezone(&Tz::UTC)).unwrap();
+            let at = created_at(m, now);
+            assert!(at >= span.start && at <= now, "{} at {now}", m.id);
+            assert!(span.end.is_none_or(|e| at < e), "{} at {now}", m.id);
+        }
+    }
+}
+
+/// The live arms cannot run in CI, so wire them to the hashed embedder and
+/// check both land and pair up into lift lines.
+#[test]
+fn the_live_run_measures_both_date_arms() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _offline = model_stages_off();
+    let mut report = Report::default();
+    evaluate_live(&HashedEmbedder, &mut report);
+    assert!(report.scores.contains_key("live/auto"));
+    assert!(report.measured.contains_key("live+dates/auto"));
+    let lift = date_lift(&report);
+    assert!(
+        lift.iter().any(|(key, _, _)| key == "live/auto/dated"),
+        "{lift:?}"
+    );
 }
 
 #[test]

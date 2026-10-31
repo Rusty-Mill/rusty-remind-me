@@ -66,6 +66,14 @@
 {"query": "pricing", "relevant": ["m-pricing-new", "m-pricing-old", "m-pricing-student", "m-pricing-surge", "m-owner-juniper", "m-juniper-pref"], "kind": "hidden", "must_not": ["m-harbor-pricing"], "project": "pedalpath"}
 {"query": "backups", "relevant": ["m-ops-backups", "m-billing-postgres"], "kind": "hidden", "must_not": ["m-harbor-backups"], "project": "pedalpath"}
 {"query": "deploy pipeline container image", "relevant": ["m-deploy-pipeline"], "kind": "hidden", "must_not": ["m-harbor-pipeline"], "project": "pedalpath"}
+{"query": "helmet rental decisions last week", "relevant": ["m-dated-helmet-new"], "kind": "dated"}
+{"query": "sponsorship talks since monday", "relevant": ["m-dated-sponsor-new"], "kind": "dated"}
+{"query": "parking fines this month", "relevant": ["m-dated-fines-new"], "kind": "dated"}
+{"query": "warehouse lease past 3 days", "relevant": ["m-dated-lease-new"], "kind": "dated"}
+{"query": "newsletter last 24 hours", "relevant": ["m-dated-newsletter-new"], "kind": "dated"}
+{"query": "graffiti cleanup this quarter", "relevant": ["m-dated-graffiti-new"], "kind": "dated"}
+{"query": "sticker campaign in the past week", "relevant": ["m-dated-sticker-new"], "kind": "dated"}
+{"query": "what happened yesterday", "relevant": ["m-incident-outage", "m-todo-postmortem", "m-dated-lease-new"], "kind": "dated", "must_not": ["m-harbor-incident"], "project": "pedalpath"}
 {"query": "VM snapshot rollback", "relevant": ["m-deploy-rollback"], "kind": "dormant", "must_not": ["m-dormant-rollback"]}
 {"query": "dock controller firmware update", "relevant": ["m-dock-firmware"], "kind": "dormant", "must_not": ["m-dormant-firmware"]}
 {"query": "API rate limit per IP address", "relevant": ["m-ratelimit-300"], "kind": "dormant", "must_not": ["m-dormant-ratelimit", "m-ratelimit-120"]}

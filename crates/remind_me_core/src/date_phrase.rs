@@ -9,6 +9,7 @@ use chrono::{
     TimeZone, Utc, Weekday,
 };
 use chrono_tz::Tz;
+use std::ops::Range;
 
 /// The IANA zone (`Australia/Sydney`) date phrases are read in; UTC if unset.
 pub const TZ_ENV: &str = "REMIND_ME_TZ";
@@ -49,6 +50,95 @@ pub fn parse(text: &str, now: DateTime<Tz>) -> Option<Span> {
     let words: Vec<&str> = lower.split_whitespace().collect();
     rolling(&words, now)
         .or_else(|| range(&lower, &words, now.date_naive()).and_then(|p| p.span(now.timezone())))
+}
+
+/// The first relative phrase inside `query` (`yesterday`, `last week`,
+/// `past 3 days`, `since monday`; no month names, quarters or ISO dates, which
+/// in free text are usually the subject rather than a filter), with the byte
+/// range it covers. Punctuation around a word is ignored; a phrase followed by
+/// `of` or a year ("the last week of September", "since March 2025") is not
+/// one, as the whole names something the relative part alone would not.
+pub fn find_relative(query: &str, now: DateTime<Tz>) -> Option<(Span, Range<usize>)> {
+    let tokens = tokens(query);
+    let norms: Vec<String> = tokens
+        .iter()
+        .map(|&(a, b)| normalize_word(&query[a..b]))
+        .collect();
+    for i in 0..tokens.len() {
+        for len in (1..=3).rev() {
+            let Some(words) = norms.get(i..i + len) else {
+                continue;
+            };
+            if norms.get(i + len).is_some_and(|next| qualifies(next)) {
+                continue;
+            }
+            if words.iter().any(|w| !plain(w)) {
+                continue;
+            }
+            let words: Vec<&str> = words.iter().map(String::as_str).collect();
+            if let Some(span) = relative(&words, now) {
+                return Some((span, tokens[i].0..tokens[i + len - 1].1));
+            }
+        }
+    }
+    None
+}
+
+/// A word after a relative phrase that makes it something else: `of` ("the
+/// last week of September") or a year ("since March 2025"), which names an
+/// absolute date the relative prefix would get wrong.
+fn qualifies(next: &str) -> bool {
+    next == "of" || four_digit_year(next).is_some()
+}
+
+/// Free text only: a word made of letters and digits. `+3`, `-3`, `.5` and
+/// `3.5` are not counts a phrase in prose should be read from, though the
+/// explicit `since`/`until` parser keeps accepting `past +3 days`.
+fn plain(word: &str) -> bool {
+    word.chars().all(char::is_alphanumeric)
+}
+
+/// `word` lowercased with enclosing punctuation dropped. A leading sign or
+/// decimal point stays, so `-3` and `.5` are not read as the count `3` or `5`.
+pub(crate) fn normalize_word(word: &str) -> String {
+    let numeric_syntax = |c: char| matches!(c, '-' | '+' | '.');
+    word.trim_start_matches(|c: char| !c.is_alphanumeric() && !numeric_syntax(c))
+        .trim_end_matches(|c: char| !c.is_alphanumeric())
+        .to_lowercase()
+}
+
+/// Byte ranges of the whitespace-separated words of `text`.
+fn tokens(text: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut start = None;
+    for (i, c) in text.char_indices() {
+        match (c.is_whitespace(), start) {
+            (true, Some(s)) => {
+                out.push((s, i));
+                start = None;
+            }
+            (false, None) => start = Some(i),
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        out.push((s, text.len()));
+    }
+    out
+}
+
+/// A relative phrase only: the rolling forms and the calendar periods named
+/// from today.
+fn relative(words: &[&str], now: DateTime<Tz>) -> Option<Span> {
+    if let Some(span) = rolling(words, now) {
+        return Some(span);
+    }
+    match words {
+        ["today" | "yesterday"] | ["this" | "last", _] => {
+            period(words, now.date_naive())?.span(now.timezone())
+        }
+        _ => None,
+    }
 }
 
 /// A run of whole days, `[start, end)`.
@@ -393,6 +483,8 @@ mod tests {
                 .to_string()
         };
         assert_eq!(start("past 3 days"), "2026-10-25T09:00");
+        // As on #350: the explicit parser takes a leading plus.
+        assert_eq!(start("past +3 days"), "2026-10-25T09:00");
         assert_eq!(start("last 24 hours"), "2026-10-27T09:00");
         assert_eq!(start("past week"), "2026-10-21T09:00");
         assert_eq!(start("past 2 weeks"), "2026-10-14T09:00");
@@ -501,6 +593,54 @@ mod tests {
     }
 
     #[test]
+    fn find_relative_locates_the_first_relative_phrase() {
+        let now = local(Tz::UTC, "2026-10-28T09:00:00");
+        for (query, phrase) in [
+            ("deploy decisions last week", "last week"),
+            ("What happened yesterday?", "yesterday?"),
+            ("incidents in the past 3 days, please", "past 3 days,"),
+            ("firmware since Monday", "since Monday"),
+            ("TODAY standup", "TODAY"),
+            ("last week and yesterday", "last week"),
+            ("app crashes last 24 hours", "last 24 hours"),
+            ("outages (past 3 days)", "(past 3 days)"),
+        ] {
+            let (_, range) = find_relative(query, now).unwrap_or_else(|| panic!("{query:?}"));
+            assert_eq!(&query[range], phrase, "{query:?}");
+        }
+        let (span, _) = find_relative("what happened yesterday", now).unwrap();
+        assert_eq!(Some(span), parse("yesterday", now));
+    }
+
+    #[test]
+    fn find_relative_skips_subjects_and_near_misses() {
+        let now = local(Tz::UTC, "2026-10-28T09:00:00");
+        for query in [
+            "Q3 roadmap",
+            "the 2026-10-26 outage",
+            "what changed in March",
+            "march 2026 billing",
+            "the last week of September",
+            "this weekend",
+            "weekly report",
+            "pricing recently",
+            "last mile delivery",
+            "since monday's outage",
+            "deploys since March 2025",
+            "since june 2024, the backlog",
+            "last week 2025",
+            "deploys past -3 days",
+            "deploys past .5 days",
+            "deploys past 3.5 days",
+            "deploys past +3 days",
+            "deploys last (-3) days",
+            "",
+        ] {
+            assert_eq!(find_relative(query, now), None, "{query:?}");
+        }
+    }
+
+    #[test]
     fn near_misses_are_not_phrases() {
         let now = sydney();
         for text in [
@@ -521,6 +661,8 @@ mod tests {
             "7",
             "past 0 days",
             "past -1 days",
+            "past .5 days",
+            "past 3.5 days",
             "past 3 fortnights",
             "past days",
             "since soon",
