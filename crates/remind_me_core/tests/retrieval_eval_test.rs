@@ -352,26 +352,27 @@ struct Report {
 /// Held by every test here that reads or writes the model-stage variables.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-/// Turns the model-backed stages (HyDE, rerank) off until dropped, then
-/// restores what the environment held, so the live run still sees them.
-struct ModelStagesOff(Vec<(&'static str, Option<String>)>);
+/// Sets env vars until dropped (`None` removes one), then restores what the
+/// environment held before, panics included.
+struct EnvOverride(Vec<(&'static str, Option<String>)>);
 
-impl ModelStagesOff {
-    fn new() -> Self {
-        // HyDE runs only for "hyde"; rerank is off for an empty value.
-        let off = [(EXPANSION_MODE_ENV, "off"), (RERANK_ENV, "")];
-        let saved = off
+impl EnvOverride {
+    fn new(vars: &[(&'static str, Option<&str>)]) -> Self {
+        let saved = vars
             .iter()
             .map(|(k, _)| (*k, std::env::var(k).ok()))
             .collect();
-        for (key, value) in off {
-            test_env::set_var(key, value);
+        for (key, value) in vars {
+            match value {
+                Some(v) => test_env::set_var(key, v),
+                None => test_env::remove_var(key),
+            }
         }
         Self(saved)
     }
 }
 
-impl Drop for ModelStagesOff {
+impl Drop for EnvOverride {
     fn drop(&mut self) {
         for (key, value) in &self.0 {
             match value {
@@ -380,6 +381,13 @@ impl Drop for ModelStagesOff {
             }
         }
     }
+}
+
+/// Turns the model-backed stages (HyDE, rerank) off until dropped, then
+/// restores what the environment held, so the live run still sees them.
+/// HyDE runs only for "hyde"; rerank is off for an empty value.
+fn model_stages_off() -> EnvOverride {
+    EnvOverride::new(&[(EXPANSION_MODE_ENV, Some("off")), (RERANK_ENV, Some(""))])
 }
 
 fn evaluate(mode: &str, embedder: Option<&dyn Embedder>, report: &mut Report) {
@@ -456,7 +464,7 @@ fn retrieval_quality_holds_against_the_baseline() {
     let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut report = Report::default();
     {
-        let _offline = ModelStagesOff::new();
+        let _offline = model_stages_off();
         evaluate("keyword", None, &mut report);
         evaluate("hashed", Some(&HashedEmbedder), &mut report);
     }
@@ -613,16 +621,23 @@ fn hashed_embedder_is_deterministic_and_normalised() {
 #[test]
 fn gated_runs_switch_inherited_model_stages_off_and_restore_them() {
     let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    test_env::set_var(EXPANSION_MODE_ENV, "hyde");
-    test_env::remove_var(RERANK_ENV);
-    assert!(remind_me_core::query_expansion::enabled());
-    assert!(remind_me_core::reranker::enabled());
+    let inherited = [EXPANSION_MODE_ENV, RERANK_ENV].map(|k| std::env::var(k).ok());
     {
-        let _offline = ModelStagesOff::new();
-        assert!(!remind_me_core::query_expansion::enabled());
-        assert!(!remind_me_core::reranker::enabled());
+        // Model stages on, as a developer environment might have them; the
+        // outer guard puts back whatever this process inherited.
+        let _on = EnvOverride::new(&[(EXPANSION_MODE_ENV, Some("hyde")), (RERANK_ENV, None)]);
+        assert!(remind_me_core::query_expansion::enabled());
+        assert!(remind_me_core::reranker::enabled());
+        {
+            let _offline = model_stages_off();
+            assert!(!remind_me_core::query_expansion::enabled());
+            assert!(!remind_me_core::reranker::enabled());
+        }
+        assert_eq!(std::env::var(EXPANSION_MODE_ENV).as_deref(), Ok("hyde"));
+        assert!(std::env::var(RERANK_ENV).is_err());
     }
-    assert_eq!(std::env::var(EXPANSION_MODE_ENV).as_deref(), Ok("hyde"));
-    assert!(std::env::var(RERANK_ENV).is_err());
-    test_env::remove_var(EXPANSION_MODE_ENV);
+    assert_eq!(
+        [EXPANSION_MODE_ENV, RERANK_ENV].map(|k| std::env::var(k).ok()),
+        inherited
+    );
 }
