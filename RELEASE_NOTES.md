@@ -2,6 +2,14 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-10-31 — Dormant memories stay out of semantic results
+
+### Fixed
+- `remind_me_search` hid dormant memories (effective vitality under the 0.05 floor, or under `min_vitality`) from keyword matches only. With an embedder configured, the same memories still came back through the semantic stage, so whether an old row surfaced depended on which stage found it. The semantic stage now admits on the same floor, inside its scan and before its limit, as `ARCHITECTURE.md` already described. `include_dormant: true` still brings them back.
+
+### Tests
+- `search_dormancy_test` covers the semantic stage with an injected embedder: a dormant row with no words in common with the query stays hidden, `include_dormant` and `min_vitality` apply to it, and 40 dormant rows cannot crowd five live ones out of the semantic list. The retrieval eval gains three dormant rows and a `dormant` query kind whose `must_not` fails the run without the fix.
+
 ## 2026-10-31 — Search quality is measured in CI
 
 ### Tests

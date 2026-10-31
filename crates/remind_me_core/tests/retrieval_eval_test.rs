@@ -24,8 +24,9 @@
 //! stage and fusion but knows nothing about meaning.
 //!
 //! Ages in the fixture are relative to the run, so recency sees the same ages
-//! every day and the fixture never expires with the calendar. Every row was
-//! last read at load time, so none is dormant. The env-reading
+//! every day and the fixture never expires with the calendar. A row is last
+//! read at load time unless it sets `accessed_days`; the few that do are
+//! dormant, and the `dormant` queries check that no stage surfaces them. The env-reading
 //! parts keep this file its own test binary.
 
 use std::collections::{BTreeMap, HashSet};
@@ -78,6 +79,10 @@ struct FixtureMemory {
     tags: Vec<String>,
     project: Option<String>,
     age_days: i64,
+    /// Days since it was last read; default today. Old enough and the row is
+    /// dormant, which search must hide from every stage.
+    #[serde(default)]
+    accessed_days: i64,
     superseded_by: Option<String>,
     #[serde(default)]
     sensitive: bool,
@@ -164,9 +169,7 @@ fn load(store: &Store<'_>, memories: &[FixtureMemory], embedder: Option<&dyn Emb
             project: m.project.clone(),
             superseded_by: m.superseded_by.clone(),
             sensitive: m.sensitive,
-            // Read today, so `age_days` moves recency and nothing goes
-            // dormant: dormancy is not what this set measures.
-            accessed_at: Some(now.to_rfc3339()),
+            accessed_at: Some((now - Duration::days(m.accessed_days)).to_rfc3339()),
             ..NewMemory::new(&m.id, &m.content, &at)
         })
         .unwrap();

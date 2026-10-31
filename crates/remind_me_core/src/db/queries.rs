@@ -794,7 +794,10 @@ pub fn search_memories_deadlined(
             // two independent result sets, so a sensitive, out-of-scope,
             // out-of-window or raw memory excluded there could still arrive
             // through the semantic half. Admitted inside the scan, before its limit,
-            // so the filters never starve the semantic list.
+            // so the filters never starve the semantic list. That includes the
+            // vitality floor: a dormant row kept out of the keyword half must
+            // not return through vectors (#564).
+            let now = Utc::now();
             let hidden = if input.include_sensitive {
                 std::collections::HashSet::new()
             } else {
@@ -805,6 +808,7 @@ pub fn search_memories_deadlined(
                     && input.scope.matches_memory(m)
                     && input.window.contains_memory(m)
                     && narrowing.admits(m)
+                    && crate::db::engine::memories::vital_enough(&filter, m, now)
                     // Raw rows go before the best `limit * 2` are chosen, or
                     // stronger raw hits would take every slot (ADR-0029).
                     && !(filter.exclude_raw && is_raw_category(&m.category))

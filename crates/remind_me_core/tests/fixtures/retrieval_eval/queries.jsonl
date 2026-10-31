@@ -66,3 +66,6 @@
 {"query": "pricing", "relevant": ["m-pricing-new", "m-pricing-old", "m-pricing-student", "m-pricing-surge", "m-owner-juniper", "m-juniper-pref"], "kind": "hidden", "must_not": ["m-harbor-pricing"], "project": "pedalpath"}
 {"query": "backups", "relevant": ["m-ops-backups", "m-billing-postgres"], "kind": "hidden", "must_not": ["m-harbor-backups"], "project": "pedalpath"}
 {"query": "deploy pipeline container image", "relevant": ["m-deploy-pipeline"], "kind": "hidden", "must_not": ["m-harbor-pipeline"], "project": "pedalpath"}
+{"query": "VM snapshot rollback", "relevant": ["m-deploy-rollback"], "kind": "dormant", "must_not": ["m-dormant-rollback"]}
+{"query": "dock controller firmware update", "relevant": ["m-dock-firmware"], "kind": "dormant", "must_not": ["m-dormant-firmware"]}
+{"query": "API rate limit per IP address", "relevant": ["m-ratelimit-300"], "kind": "dormant", "must_not": ["m-dormant-ratelimit", "m-ratelimit-120"]}
