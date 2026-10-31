@@ -2,6 +2,11 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-10-31 — Search quality is measured in CI
+
+### Tests
+- `retrieval_eval_test` scores search against a checked-in golden set: 87 synthetic memories (no personal data) and 66 queries labelled exact, paraphrase, entity, temporal, reversed and hidden. It reports recall@5, recall@10 and MRR for every strategy (auto, balanced, keyword_favored, semantic_favored), keyword-only and with a deterministic hashed embedder, and fails when a score drops more than 0.02 below `tests/fixtures/retrieval_eval/baseline.json`. Any superseded, sensitive or other-project row a query lists as `must_not` that reaches its top ten fails the test outright. `REMIND_ME_EVAL_BLESS=1` rewrites the baseline. `REMIND_ME_EVAL_LIVE=1` also scores the configured embedder, which is printed but not gated. Fixture ages are relative to the run, so the test does not expire with the calendar.
+
 ## 2026-10-29 — Embeddings from an OpenAI-compatible server
 
 ### Added

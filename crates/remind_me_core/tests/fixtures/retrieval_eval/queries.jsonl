@@ -1,0 +1,66 @@
+{"query": "PR #412", "relevant": ["m-pr-412"], "kind": "exact"}
+{"query": "PR #418 double charge", "relevant": ["m-pr-418"], "kind": "exact"}
+{"query": "issue #407 GPS", "relevant": ["m-issue-407"], "kind": "exact"}
+{"query": "websocket push notifications", "relevant": ["m-pr-431"], "kind": "exact"}
+{"query": "lock fault code E17", "relevant": ["m-dock-lock-fault"], "kind": "exact"}
+{"query": "pp deploy --tag prev", "relevant": ["m-deploy-rollback"], "kind": "exact"}
+{"query": "NATS queue trip events", "relevant": ["m-arch-queue"], "kind": "exact"}
+{"query": "Metabase dashboards", "relevant": ["m-analytics-tool"], "kind": "exact"}
+{"query": "passkeys magic links", "relevant": ["m-arch-auth"], "kind": "exact"}
+{"query": "vector tiles map fees", "relevant": ["m-arch-maps"], "kind": "exact"}
+{"query": "Riverside docks canary", "relevant": ["m-deploy-canary"], "kind": "exact"}
+{"query": "48-hour battery backup", "relevant": ["m-dock-battery"], "kind": "exact"}
+{"query": "Android 10 iOS 16 minimum", "relevant": ["m-mobile-minimum"], "kind": "exact"}
+{"query": "merge commits never squash", "relevant": ["m-pref-commits"], "kind": "exact"}
+{"query": "token bucket burst", "relevant": ["m-ratelimit-burst"], "kind": "exact"}
+{"query": "dock heartbeat timeout", "relevant": ["m-pr-412"], "kind": "exact"}
+{"query": "how do we undo a bad release", "relevant": ["m-deploy-rollback"], "kind": "paraphrase"}
+{"query": "can we ship on a Friday afternoon", "relevant": ["m-deploy-freeze"], "kind": "paraphrase"}
+{"query": "which language is the backend written in", "relevant": ["m-arch-monolith"], "kind": "paraphrase"}
+{"query": "how long do we keep logs", "relevant": ["m-ops-logs"], "kind": "paraphrase"}
+{"query": "do we test that backups can be restored", "relevant": ["m-ops-backups"], "kind": "paraphrase"}
+{"query": "what happens when a rider loses signal at the end of a trip", "relevant": ["m-mobile-offline"], "kind": "paraphrase"}
+{"query": "riders were billed two times", "relevant": ["m-pr-418"], "kind": "paraphrase"}
+{"query": "when are riders most active", "relevant": ["m-analytics-ridership"], "kind": "paraphrase"}
+{"query": "how precise is location data in reports", "relevant": ["m-analytics-privacy"], "kind": "paraphrase"}
+{"query": "discount for university students", "relevant": ["m-pricing-student"], "kind": "paraphrase"}
+{"query": "do fares go up at busy times", "relevant": ["m-pricing-surge"], "kind": "paraphrase"}
+{"query": "what alerts wake someone up at night", "relevant": ["m-ops-alerts"], "kind": "paraphrase"}
+{"query": "how many docking stations are there", "relevant": ["m-dock-count"], "kind": "paraphrase"}
+{"query": "how often are e-bike batteries changed", "relevant": ["m-bike-ebike"], "kind": "paraphrase"}
+{"query": "how are config toggles shipped", "relevant": ["m-arch-feature-flags"], "kind": "paraphrase"}
+{"query": "what makes new riders leave", "relevant": ["m-analytics-churn"], "kind": "paraphrase"}
+{"query": "Juniper Okafor", "relevant": ["m-owner-juniper", "m-juniper-pref"], "kind": "entity"}
+{"query": "who owns billing", "relevant": ["m-owner-juniper"], "kind": "entity"}
+{"query": "Rafa Lind", "relevant": ["m-owner-rafa"], "kind": "entity"}
+{"query": "dock controller", "relevant": ["m-dock-firmware", "m-dock-battery", "m-dock-lock-fault", "m-pr-412", "m-owner-rafa"], "kind": "entity", "entity": "dock-controller"}
+{"query": "dock controller firmware", "relevant": ["m-dock-firmware"], "kind": "entity"}
+{"query": "who to call about a hardware fault", "relevant": ["m-owner-rafa"], "kind": "entity"}
+{"query": "Juniper pricing", "relevant": ["m-juniper-pref", "m-owner-juniper"], "kind": "entity"}
+{"query": "e-bike fleet", "relevant": ["m-bike-ebike"], "kind": "entity"}
+{"query": "PedalPath rollback", "relevant": ["m-deploy-rollback"], "kind": "entity"}
+{"query": "harbor rollback", "relevant": ["m-harbor-rollback"], "kind": "entity", "must_not": ["m-deploy-rollback"], "project": "harbor"}
+{"query": "what did we decide about pricing recently", "relevant": ["m-pricing-new"], "kind": "temporal"}
+{"query": "incident yesterday", "relevant": ["m-incident-outage"], "kind": "temporal", "must_not": ["m-harbor-incident"], "project": "pedalpath"}
+{"query": "GPS problem last month", "relevant": ["m-incident-gps"], "kind": "temporal"}
+{"query": "pricing review this week", "relevant": ["m-pricing-new"], "kind": "temporal"}
+{"query": "outage postmortem due", "relevant": ["m-todo-postmortem"], "kind": "temporal"}
+{"query": "what changed in the API limit recently", "relevant": ["m-ratelimit-300"], "kind": "temporal", "must_not": ["m-ratelimit-120"]}
+{"query": "payments outage", "relevant": ["m-incident-outage", "m-todo-postmortem"], "kind": "temporal"}
+{"query": "spring DNS outage", "relevant": ["m-incident-old"], "kind": "temporal"}
+{"query": "where are ride trips stored", "relevant": ["m-trips-sqlite"], "kind": "reversed", "must_not": ["m-trips-postgres"]}
+{"query": "trips Postgres", "relevant": ["m-trips-sqlite"], "kind": "reversed", "must_not": ["m-trips-postgres"]}
+{"query": "public API rate limit", "relevant": ["m-ratelimit-300"], "kind": "reversed", "must_not": ["m-ratelimit-120"]}
+{"query": "120 requests per minute", "relevant": ["m-ratelimit-300"], "kind": "reversed", "must_not": ["m-ratelimit-120"]}
+{"query": "storage decision for trips", "relevant": ["m-trips-sqlite"], "kind": "reversed", "must_not": ["m-trips-postgres"]}
+{"query": "rate limit per API key", "relevant": ["m-ratelimit-300", "m-ratelimit-burst"], "kind": "reversed", "must_not": ["m-ratelimit-120"]}
+{"query": "central Postgres cluster", "relevant": ["m-trips-sqlite", "m-billing-postgres"], "kind": "reversed", "must_not": ["m-trips-postgres"]}
+{"query": "API partners hit the cap", "relevant": ["m-ratelimit-300"], "kind": "reversed", "must_not": ["m-ratelimit-120"]}
+{"query": "staging database password", "relevant": ["m-staging-vault"], "kind": "hidden", "must_not": ["m-staging-secret"]}
+{"query": "staging credentials", "relevant": ["m-staging-vault"], "kind": "hidden", "must_not": ["m-staging-secret"]}
+{"query": "harassment report Elm Street", "relevant": ["m-safety-process"], "kind": "hidden", "must_not": ["m-rider-complaint"]}
+{"query": "rider safety reports", "relevant": ["m-safety-process"], "kind": "hidden", "must_not": ["m-rider-complaint"]}
+{"query": "on-call rotation", "relevant": ["m-oncall-rota"], "kind": "hidden", "must_not": ["m-harbor-oncall"], "project": "pedalpath"}
+{"query": "pricing", "relevant": ["m-pricing-new", "m-pricing-old", "m-pricing-student", "m-pricing-surge", "m-owner-juniper", "m-juniper-pref"], "kind": "hidden", "must_not": ["m-harbor-pricing"], "project": "pedalpath"}
+{"query": "backups", "relevant": ["m-ops-backups", "m-billing-postgres"], "kind": "hidden", "must_not": ["m-harbor-backups"], "project": "pedalpath"}
+{"query": "deploy pipeline container image", "relevant": ["m-deploy-pipeline"], "kind": "hidden", "must_not": ["m-harbor-pipeline"], "project": "pedalpath"}
