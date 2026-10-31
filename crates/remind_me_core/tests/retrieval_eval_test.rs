@@ -30,6 +30,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use chrono::{Duration, Utc};
 use remind_me_core::context::ScopeFilter;
@@ -348,6 +349,9 @@ struct Report {
     violations: Vec<String>,
 }
 
+/// Held by every test here that reads or writes the model-stage variables.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
 /// Turns the model-backed stages (HyDE, rerank) off until dropped, then
 /// restores what the environment held, so the live run still sees them.
 struct ModelStagesOff(Vec<(&'static str, Option<String>)>);
@@ -449,6 +453,7 @@ fn env_on(name: &str) -> bool {
 
 #[test]
 fn retrieval_quality_holds_against_the_baseline() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut report = Report::default();
     {
         let _offline = ModelStagesOff::new();
@@ -603,4 +608,21 @@ fn hashed_embedder_is_deterministic_and_normalised() {
     let norm: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     assert!((norm - 1.0).abs() < 1e-5);
     assert!(HashedEmbedder::vector("").iter().all(|x| *x == 0.0));
+}
+
+#[test]
+fn gated_runs_switch_inherited_model_stages_off_and_restore_them() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_env::set_var(EXPANSION_MODE_ENV, "hyde");
+    test_env::remove_var(RERANK_ENV);
+    assert!(remind_me_core::query_expansion::enabled());
+    assert!(remind_me_core::reranker::enabled());
+    {
+        let _offline = ModelStagesOff::new();
+        assert!(!remind_me_core::query_expansion::enabled());
+        assert!(!remind_me_core::reranker::enabled());
+    }
+    assert_eq!(std::env::var(EXPANSION_MODE_ENV).as_deref(), Ok("hyde"));
+    assert!(std::env::var(RERANK_ENV).is_err());
+    test_env::remove_var(EXPANSION_MODE_ENV);
 }
