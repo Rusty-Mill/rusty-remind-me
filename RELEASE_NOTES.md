@@ -7,7 +7,7 @@ Dated entries, newest first. One entry per merged pull request.
 ### Added
 - Likely duplicate entities are listed for a person to confirm: `rusty_mux`, `rusty-mux` and `Rusty Mux` are three entities, because an entity id folds only case and whitespace. A pair is reported as `same_key` when some name or alias of each matches once case and `-`, `_`, `.`, `/` and whitespace are ignored, or as `similar` when the names are one edit apart (keys of 5 to 8 characters) or two (9 or more), never for shorter names, and at least two live memories mention both. Each candidate carries its shared-memory count and `kind_mismatch` (both kinds set and different).
 - Nothing is merged, and entity ids do not change: they are the sync key. Adding one name as an alias of the other marks a pair reviewed and hides it. A real, sync-safe merge is a separate card.
-- `remind_me_entity`, `GET /api/entity` and the `remind_me_entity_upsert` answer carry `possible_duplicates` (omitted when empty). New CLI subcommand `rusty-remind-me entity-duplicates [--json]`, with a matching daemon op, lists every pair, same-key first.
+- `remind_me_entity`, `GET /api/entity` and the `remind_me_entity_upsert` answer carry `possible_duplicates` (omitted when empty). New CLI subcommand `rusty-remind-me entity-duplicates [--json]`, with a matching daemon op, lists every pair, same-key first. The text report escapes control characters in names (`\n`, `\r`, `\u{1b}`), so a stored name prints as data on one line, never as a terminal instruction; `--json` and stored names are unchanged.
 - `edit_distance` moved from `context_brief` to a shared `text` module; it now has two callers.
 
 ### Tests

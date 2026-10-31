@@ -166,10 +166,10 @@ pub fn render_text(candidates: &[DuplicateCandidate]) -> String {
         for c in rows {
             out.push_str(&format!(
                 "  {} [{}] ~ {} [{}], {} shared{}\n",
-                c.a.name,
-                c.a.id,
-                c.b.name,
-                c.b.id,
+                printable(&c.a.name),
+                printable(&c.a.id),
+                printable(&c.b.name),
+                printable(&c.b.id),
                 c.shared_memories,
                 if c.kind_mismatch {
                     ", kinds differ"
@@ -182,6 +182,21 @@ pub fn render_text(candidates: &[DuplicateCandidate]) -> String {
     out.push_str(
         "Nothing was merged. To mark a pair reviewed, add one name as an alias of the other.\n",
     );
+    out
+}
+
+/// `text` with control characters escaped (`\n`, `\r`, `\u{1b}`), so a
+/// stored name prints as data on one line, never as a terminal instruction.
+/// Only for display; stored names and JSON values are unchanged.
+fn printable(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_control() {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
     out
 }
 
@@ -501,5 +516,31 @@ mod tests {
         assert!(same < similar, "{text}");
         assert!(text.contains("2 shared"), "{text}");
         assert_eq!(render_text(&[]), "No likely duplicate entities.\n");
+    }
+
+    #[test]
+    fn the_text_report_escapes_control_characters_in_names() {
+        let entities = [
+            ent("rusty_mux", &[]),
+            ent("rusty\nmux", &[]),
+            ent("x\u{1b}[2Jforged", &["rusty mux"]),
+            ent("deploy\rbot", &[]),
+            ent("deploy_bot", &[]),
+        ];
+        let got = find_candidates(&entities, shared_by(&[])).unwrap();
+        assert!(got
+            .iter()
+            .any(|c| c.a.name.contains('\n') || c.b.name.contains('\n')));
+        let text = render_text(&got);
+        assert!(!text.contains('\u{1b}'), "{text:?}");
+        assert!(!text.contains('\r'), "{text:?}");
+        assert!(text.contains("rusty\\nmux"), "{text}");
+        assert!(text.contains("x\\u{1b}[2Jforged"), "{text}");
+        assert!(text.contains("deploy\\rbot"), "{text}");
+        // One heading, one line per pair, one footer: no line breaks from names.
+        assert_eq!(text.lines().count(), 1 + got.len() + 1, "{text}");
+        // The JSON report keeps the stored names as they are.
+        let json = serde_json::to_string(&got).unwrap();
+        assert!(json.contains("rusty\\nmux"), "{json}");
     }
 }
