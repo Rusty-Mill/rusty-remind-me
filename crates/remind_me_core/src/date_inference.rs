@@ -239,7 +239,13 @@ mod tests {
         let mut explicit = search("deploys last week");
         explicit.window = serde_json::from_value(serde_json::json!({ "since": "2d" })).unwrap();
         assert!(infer(&explicit, now(), utc).unwrap().is_none());
-        for query in ["Q3 roadmap", "pricing recently", "in March", "deploys"] {
+        for query in [
+            "Q3 roadmap",
+            "pricing recently",
+            "in March",
+            "deploys",
+            "deploys since March 2025",
+        ] {
             assert!(infer_utc(query).is_none(), "{query:?}");
         }
     }

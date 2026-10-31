@@ -559,7 +559,8 @@ first time after the jump. Hours are plain elapsed time.
 With `REMIND_ME_DATE_PHRASES=on`, `remind_me_search` also reads a relative
 phrase in the query itself (`today`, `yesterday`, `this|last week|month|quarter|year`,
 the rolling forms and `since <weekday|month>`; never month names, quarters or
-ISO dates, which in a query are usually the subject) when no `since`/`until`
+ISO dates, which in a query are usually the subject, nor a phrase followed by
+`of` or a year, as in "since March 2025") when no `since`/`until`
 is given: "deploy decisions last week" searches last week for "deploy
 decisions". The phrase, and filler words leading into it, leave the query; a
 query left with only fillers ("what happened yesterday") lists the window

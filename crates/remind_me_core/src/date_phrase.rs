@@ -56,7 +56,8 @@ pub fn parse(text: &str, now: DateTime<Tz>) -> Option<Span> {
 /// `past 3 days`, `since monday`; no month names, quarters or ISO dates, which
 /// in free text are usually the subject rather than a filter), with the byte
 /// range it covers. Punctuation around a word is ignored; a phrase followed by
-/// `of` ("the last week of September") is not one.
+/// `of` or a year ("the last week of September", "since March 2025") is not
+/// one, as the whole names something the relative part alone would not.
 pub fn find_relative(query: &str, now: DateTime<Tz>) -> Option<(Span, Range<usize>)> {
     let tokens = tokens(query);
     let norms: Vec<String> = tokens
@@ -68,7 +69,7 @@ pub fn find_relative(query: &str, now: DateTime<Tz>) -> Option<(Span, Range<usiz
             let Some(words) = norms.get(i..i + len) else {
                 continue;
             };
-            if norms.get(i + len).is_some_and(|next| next == "of") {
+            if norms.get(i + len).is_some_and(|next| qualifies(next)) {
                 continue;
             }
             let words: Vec<&str> = words.iter().map(String::as_str).collect();
@@ -78,6 +79,13 @@ pub fn find_relative(query: &str, now: DateTime<Tz>) -> Option<(Span, Range<usiz
         }
     }
     None
+}
+
+/// A word after a relative phrase that makes it something else: `of` ("the
+/// last week of September") or a year ("since March 2025"), which names an
+/// absolute date the relative prefix would get wrong.
+fn qualifies(next: &str) -> bool {
+    next == "of" || four_digit_year(next).is_some()
 }
 
 /// `word` lowercased with leading and trailing punctuation dropped.
@@ -602,6 +610,9 @@ mod tests {
             "pricing recently",
             "last mile delivery",
             "since monday's outage",
+            "deploys since March 2025",
+            "since june 2024, the backlog",
+            "last week 2025",
             "",
         ] {
             assert_eq!(find_relative(query, now), None, "{query:?}");
