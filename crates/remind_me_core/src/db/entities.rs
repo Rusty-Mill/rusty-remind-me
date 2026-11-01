@@ -191,6 +191,11 @@ impl<'c> Entities<'c> {
         engine::graph::linked_memory_count(&self.core.lock(), entity_id)
     }
 
+    /// How many live memories are linked to both `a` and `b`.
+    pub fn shared_memory_count(&self, a: &str, b: &str) -> Result<usize> {
+        engine::graph::shared_memory_count(&self.core.lock(), a, b)
+    }
+
     /// Live memories whose subject or object, lowercased, is `canonical`,
     /// newest first (ties by id, descending), at most `limit`.
     pub fn facts_naming(&self, canonical: &str, limit: usize) -> Result<Vec<EntityFact>> {

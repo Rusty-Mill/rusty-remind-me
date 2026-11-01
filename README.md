@@ -685,6 +685,19 @@ Upserts an entity with optional category/kind classification:
 rusty-remind-me entity "Bailey Robertson" "person"
 ```
 
+Lists likely duplicate entities, such as `rusty_mux`, `rusty-mux` and
+`Rusty Mux`, for a person to confirm (`--json` for the raw report):
+```bash
+rusty-remind-me entity-duplicates
+```
+A pair is reported when the names match once case and the separators `-`,
+`_`, `.`, `/` and spaces are ignored, or when the names are one or two edits
+apart (never for names under five characters) and at least two live memories
+mention both. Nothing is merged. Adding one name as an alias of the other
+(`remind_me_entity_upsert` with `aliases`) marks the pair reviewed and hides
+it. The same candidates appear as `possible_duplicates` on `remind_me_entity`,
+`GET /api/entity` and the `remind_me_entity_upsert` answer.
+
 ### 10. Markdown Wiki Synthesis
 Creates or updates a structured wiki topic page:
 ```bash

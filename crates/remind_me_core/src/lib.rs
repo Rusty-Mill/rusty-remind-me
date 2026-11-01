@@ -29,6 +29,7 @@ pub mod dbs_import;
 pub mod digest;
 pub mod embedder;
 pub mod entity;
+pub mod entity_duplicates;
 pub mod episodes;
 pub mod events;
 pub mod expansion;
@@ -77,6 +78,7 @@ pub mod sync;
 pub mod telemetry;
 #[doc(hidden)]
 pub mod testing;
+mod text;
 pub mod time_window;
 pub mod tool_profiles;
 pub mod transcript;

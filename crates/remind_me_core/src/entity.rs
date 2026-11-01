@@ -242,6 +242,10 @@ pub struct EntityProfile {
     /// Every memory linked to this entity, not just the page in `memories` —
     /// so a caller can tell whether raising `limit` would surface more.
     pub total_linked_memories: usize,
+    /// Other entities that are likely the same thing (card #65). Listed for
+    /// a person to confirm; nothing is merged. Omitted when there are none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub possible_duplicates: Vec<crate::entity_duplicates::DuplicateRef>,
 }
 
 /// Build the full lookup payload for an entity: row + facts + memories.
@@ -271,12 +275,14 @@ pub fn entity_profile(
     let facts = entities.facts_naming(&canonical, limit)?;
     let memories = entities.linked_memories(&entity.id, limit)?;
     let total_linked_memories = entities.linked_memory_count(&entity.id)?;
+    let possible_duplicates = crate::entity_duplicates::possible_duplicates(store, &entity)?;
 
     Ok(Some(EntityProfile {
         entity,
         facts,
         memories,
         total_linked_memories,
+        possible_duplicates,
     }))
 }
 

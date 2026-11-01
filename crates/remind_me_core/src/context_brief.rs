@@ -49,6 +49,7 @@ use crate::db::memories::Memories;
 use crate::db::{Result, Store, StoreError};
 use crate::entity::{normalize_entity_name, resolve_entity};
 use crate::models::{Memory, MemorySearchInput, ReminderWindow};
+use crate::text::edit_distance;
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 use std::collections::{BTreeSet, HashSet};
@@ -458,24 +459,6 @@ fn suggestions(store: &Store<'_>, name: &str, memories: &[Memory]) -> Result<Vec
         .take(SUGGESTION_LIMIT)
         .map(|(_, name)| name)
         .collect())
-}
-
-/// Levenshtein distance over chars.
-fn edit_distance(a: &str, b: &str) -> usize {
-    let b: Vec<char> = b.chars().collect();
-    let mut row: Vec<usize> = (0..=b.len()).collect();
-    for (i, ca) in a.chars().enumerate() {
-        let mut diagonal = row[0];
-        row[0] = i + 1;
-        for (j, cb) in b.iter().enumerate() {
-            let above = row[j + 1];
-            row[j + 1] = (above + 1)
-                .min(row[j] + 1)
-                .min(diagonal + usize::from(ca != *cb));
-            diagonal = above;
-        }
-    }
-    row[b.len()]
 }
 
 // -- sections -----------------------------------------------------------------
@@ -1461,12 +1444,5 @@ mod tests {
         assert!(check_token_budget(MAX_TOKEN_BUDGET).is_ok());
         assert!(check_token_budget(MIN_TOKEN_BUDGET - 1).is_err());
         assert!(check_token_budget(MAX_TOKEN_BUDGET + 1).is_err());
-    }
-
-    #[test]
-    fn edit_distance_counts_single_char_edits() {
-        assert_eq!(edit_distance("quokka", "quoka"), 1);
-        assert_eq!(edit_distance("", "abc"), 3);
-        assert_eq!(edit_distance("same", "same"), 0);
     }
 }

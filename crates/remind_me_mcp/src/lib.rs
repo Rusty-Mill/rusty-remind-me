@@ -35,6 +35,27 @@ fn store_error_text(prefix: &str, e: &remind_me_core::db::StoreError) -> String 
     }
 }
 
+/// `remind_me_entity_upsert`'s answer: the entity, plus `possible_duplicates`
+/// when it likely names something already stored (card #65). The upsert has
+/// committed by then, so a failed report is named in the answer as
+/// `possible_duplicates_error` rather than turning a saved entity into an error.
+fn upserted_entity_payload(store: &remind_me_core::db::Store<'_>, ent: &entity::Entity) -> Value {
+    let mut payload = serde_json::to_value(ent).unwrap_or(json!({}));
+    let Some(object) = payload.as_object_mut() else {
+        return payload;
+    };
+    match entity_duplicates::possible_duplicates(store, ent) {
+        Ok(found) if found.is_empty() => {}
+        Ok(found) => {
+            object.insert("possible_duplicates".into(), json!(found));
+        }
+        Err(e) => {
+            object.insert("possible_duplicates_error".into(), json!(e.to_string()));
+        }
+    }
+    payload
+}
+
 /// Most ids one `remind_me_get` call fetches (card #51): enough for a page of
 /// search hits, small enough that a stray call cannot dump the store.
 const GET_IDS_MAX: usize = 20;
@@ -175,9 +196,9 @@ fn format_or(args: &serde_json::Value, default: ResponseFormat) -> ResponseForma
 use remind_me_core::kinds::StructuredFields;
 use remind_me_core::{
     backup, capture, consolidation::consolidate, context_brief, contradictions, db::queries,
-    dbs_import, digest, entity, export, history, importer, mempalace_import, normalize,
-    recalibrate, saved_searches, stats, status, sync::SyncPeer, undo_import, updater, vectors,
-    vitality, watcher, webhook::Webhook, wiki, wiki_fs::Wiki, wiki_import, AnnotateInput,
+    dbs_import, digest, entity, entity_duplicates, export, history, importer, mempalace_import,
+    normalize, recalibrate, saved_searches, stats, status, sync::SyncPeer, undo_import, updater,
+    vectors, vitality, watcher, webhook::Webhook, wiki, wiki_fs::Wiki, wiki_import, AnnotateInput,
     AutoCaptureInput, BriefInput, BulkImportDirInput, ChatImportInput, ConsolidateInput,
     ContradictionCandidatesInput, Database, DbsImportInput, DecomposeBatchInput, DecomposeInput,
     DigestInput, EntityInput, EntityLookupInput, EntityTraverseInput, ExportInput,
@@ -817,7 +838,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_entity",
-                                "description": "Look up everything remind-me knows about ONE named thing: a person, project, tool, org or place. Read-only: returns the entity record, its facts, and the memories mentioning it, or found=false for an unknown name. Use remind_me_search for topic questions or anything you cannot name exactly.",
+                                "description": "Look up everything remind-me knows about ONE named thing: a person, project, tool, org or place. Read-only: returns the entity record, its facts, the memories mentioning it and any possible_duplicates (likely the same thing under another spelling; never merged), or found=false for an unknown name. Use remind_me_search for topic questions or anything you cannot name exactly.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -834,7 +855,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_entity_upsert",
-                                "description": "remind-me pipeline: create a knowledge-graph entity, or update its kind. remind_me_entity is read-only, so writing is a separate, explicit call.",
+                                "description": "remind-me pipeline: create a knowledge-graph entity, or update its kind. remind_me_entity is read-only, so writing is a separate, explicit call. The answer lists possible_duplicates when the name likely matches an existing entity (rusty_mux vs rusty-mux); nothing is merged. Adding one name as an alias of the other marks a pair reviewed.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -2011,7 +2032,8 @@ impl McpServer {
                         match input {
                             Ok(ent_input) => match entity::upsert_entity(&store, &ent_input) {
                                 Ok(ent) => {
-                                    json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&ent).unwrap() }] })
+                                    let payload = upserted_entity_payload(&store, &ent);
+                                    json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&payload).unwrap() }] })
                                 }
                                 Err(e) => {
                                     json!({ "isError": true, "content": [{ "type": "text", "text": format!("Entity error: {}", e) }] })
@@ -5700,6 +5722,56 @@ mod tests {
             report["entity"]["kind"], "place",
             "and carried the kind through"
         );
+    }
+
+    /// An upsert names the entities it likely duplicates, a lookup lists them
+    /// too, and neither carries the field when there are none (card #65).
+    #[test]
+    fn test_entity_upsert_and_lookup_report_possible_duplicates() {
+        let db = Database::open_in_memory().unwrap();
+        let server = McpServer::new(db);
+        let upsert = |name: &str| -> Value {
+            serde_json::from_str(&text_of(&call(
+                &server,
+                "remind_me_entity_upsert",
+                json!({ "name": name }),
+            )))
+            .unwrap()
+        };
+
+        let first = upsert("rusty_mux");
+        assert!(first.get("possible_duplicates").is_none(), "{first}");
+        let second = upsert("Rusty-Mux");
+        assert_eq!(
+            second["name"], "Rusty-Mux",
+            "the entity is still the answer"
+        );
+        let dupes = second["possible_duplicates"].as_array().unwrap();
+        assert_eq!(dupes.len(), 1, "{second}");
+        assert_eq!(dupes[0]["name"], "rusty_mux");
+        assert_eq!(dupes[0]["reason"], "same_key");
+
+        let lookup: Value = serde_json::from_str(&text_of(&call(
+            &server,
+            "remind_me_entity",
+            json!({ "name": "rusty_mux" }),
+        )))
+        .unwrap();
+        assert_eq!(lookup["possible_duplicates"][0]["name"], "Rusty-Mux");
+
+        // Marking the pair reviewed hides it from both.
+        call(
+            &server,
+            "remind_me_entity_upsert",
+            json!({ "name": "rusty_mux", "aliases": ["Rusty-Mux"] }),
+        );
+        let lookup: Value = serde_json::from_str(&text_of(&call(
+            &server,
+            "remind_me_entity",
+            json!({ "name": "Rusty-Mux" }),
+        )))
+        .unwrap();
+        assert!(lookup.get("possible_duplicates").is_none(), "{lookup}");
     }
 
     /// Both halves must be declared, or a client cannot discover the write it

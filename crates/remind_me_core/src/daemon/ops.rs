@@ -10,7 +10,7 @@
 
 use crate::db::Store;
 use crate::models::{EntityInput, MemoryAddInput, MemoryListInput, MemorySearchInput};
-use crate::{db::queries, entity, session_ops, stats, wiki, wiki_import};
+use crate::{db::queries, entity, entity_duplicates, session_ops, stats, wiki, wiki_import};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -38,6 +38,8 @@ pub enum Op {
     UpsertEntity {
         input: EntityInput,
     },
+    /// Likely duplicate entities; see [`crate::entity_duplicates`].
+    EntityDuplicates,
     WikiWrite {
         slug: String,
         title: String,
@@ -142,6 +144,7 @@ fn run(store: &Store<'_>, op: &Op) -> Result<Value, String> {
         Op::List { input } => to_value(queries::list_memories(store, input)),
         Op::Get { id } => to_value(queries::get_memory_by_id(store, id)),
         Op::UpsertEntity { input } => to_value(entity::upsert_entity(store, input)),
+        Op::EntityDuplicates => to_value(entity_duplicates::entity_duplicates(store)),
         Op::WikiWrite {
             slug,
             title,
