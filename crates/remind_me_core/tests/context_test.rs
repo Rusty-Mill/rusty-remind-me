@@ -549,6 +549,11 @@ fn register(store: &Store<'_>, name: &str, status: remind_me_core::project::Stat
     .unwrap();
 }
 
+/// The fixture's one-letter ids, without the registry's own memories.
+fn only_fixture(got: Vec<String>) -> Vec<String> {
+    got.into_iter().filter(|id| id.len() == 1).collect()
+}
+
 fn with_status(status: remind_me_core::project::Status) -> ScopeFilter {
     ScopeFilter {
         project_status: Some(status),
@@ -566,8 +571,6 @@ fn project_status_narrows_list_and_search_to_registered_projects() {
     register(&store, "Rusty", Status::Active);
     register(&store, "other", Status::Dormant);
 
-    let only_fixture =
-        |got: Vec<String>| -> Vec<String> { got.into_iter().filter(|id| id.len() == 1).collect() };
     assert_eq!(
         only_fixture(list(&store, with_status(Status::Active))),
         ["a", "b"]
@@ -609,6 +612,10 @@ fn project_status_admits_a_projects_aliases() {
     register(&store, "Rusty Mill", Status::Active);
     alias(&store, "Rusty Mill", "Other");
 
+    assert_eq!(
+        only_fixture(list(&store, with_status(Status::Active))),
+        ["c"]
+    );
     assert_eq!(search(&store, with_status(Status::Active)), ["c"]);
 }
 
@@ -624,6 +631,14 @@ fn a_canonical_project_name_beats_another_projects_alias() {
     register(&store, "other", Status::Dormant);
     alias(&store, "Rusty", "Other");
 
+    assert_eq!(
+        only_fixture(list(&store, with_status(Status::Active))),
+        ["a", "b"]
+    );
+    assert_eq!(
+        only_fixture(list(&store, with_status(Status::Dormant))),
+        ["c"]
+    );
     assert_eq!(search(&store, with_status(Status::Active)), ["a", "b"]);
     assert_eq!(search(&store, with_status(Status::Dormant)), ["c"]);
 }
