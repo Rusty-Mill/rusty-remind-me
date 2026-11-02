@@ -392,6 +392,8 @@ fn first_capture(
                 ("reason", request.reason.into()),
             ],
         ),
+        // The stamp carries the session's project.
+        project: None,
     };
     let stamp = CaptureStamp {
         context,

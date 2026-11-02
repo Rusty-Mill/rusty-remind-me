@@ -204,6 +204,12 @@ fn cache() -> &'static Cache {
 /// The context writes are stamped with right now: the session's directory
 /// detected once per [`CACHE_TTL`], plus `REMIND_ME_SESSION_ID`.
 pub fn current() -> WriteContext {
+    // A call forwarded by the remote connector comes from a client this
+    // process knows nothing about: its own directory, git checkout and
+    // session would be stamped on someone else's memory (#592).
+    if crate::sync::in_forwarded_call() {
+        return WriteContext::default();
+    }
     let session_id = env_value(SESSION_ID_ENV);
     let Some(cwd) = resolve_cwd() else {
         return WriteContext {
@@ -226,6 +232,29 @@ pub fn current() -> WriteContext {
     });
     context.session_id = session_id;
     context
+}
+
+/// Longest explicit `project` a write accepts.
+pub const MAX_PROJECT_LEN: usize = 200;
+
+/// A caller's explicit `project`: trimmed, `None` when blank, refused when it
+/// spans lines or exceeds [`MAX_PROJECT_LEN`]. It replaces only the detected
+/// project; the rest of the context stays as detected.
+pub fn explicit_project(raw: Option<&str>) -> crate::db::Result<Option<String>> {
+    let Some(value) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    if value.contains(['\n', '\r']) {
+        return Err(crate::db::StoreError::Invalid(
+            "project must be a single line".to_string(),
+        ));
+    }
+    if value.len() > MAX_PROJECT_LEN {
+        return Err(crate::db::StoreError::Invalid(format!(
+            "project is longer than {MAX_PROJECT_LEN} bytes"
+        )));
+    }
+    Ok(Some(value.to_string()))
 }
 
 // -- who wrote it ------------------------------------------------------------
@@ -395,6 +424,11 @@ pub fn importer_provenance(source: &str) -> Provenance {
 /// Exact match, except `project`, which is case-insensitive (directory
 /// names are typed by people). Empty strings are treated as unset, so a
 /// client sending `""` for "no filter" does not match nothing.
+///
+/// `project_status` keeps rows whose `project` names a registered project
+/// (by name or alias, ADR-0027) with that status. It is a read-only join:
+/// [`ScopeFilter::resolve`] reads the registry once per query, and a filter
+/// that was never resolved admits nothing rather than everything.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ScopeFilter {
     #[serde(default)]
@@ -405,7 +439,19 @@ pub struct ScopeFilter {
     pub session_id: Option<String>,
     #[serde(default)]
     pub written_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_status: Option<crate::project::Status>,
+    /// The projects with `project_status`, filled only by
+    /// [`ScopeFilter::resolve`]; `None` (the default) until then.
+    #[serde(skip)]
+    pub status_projects: Option<StatusProjects>,
 }
+
+/// Normalized names and aliases of the projects with one status, as
+/// [`ScopeFilter::resolve`] read them. Only `resolve` builds one, so a filter
+/// cannot claim a join it never made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusProjects(std::collections::BTreeSet<String>);
 
 impl ScopeFilter {
     /// Set the field a CLI flag names (`--project`, `--branch`, `--session`,
@@ -435,7 +481,44 @@ impl ScopeFilter {
             branch: clean(branch),
             session_id: clean(session_id),
             written_by: clean(written_by),
+            ..Self::default()
         }
+    }
+
+    /// This filter with `project_status` joined against the project
+    /// registry: every registered project's name and alias whose owner, as
+    /// [`crate::entity::resolve_entity`] resolves it across all entities,
+    /// is a project with that status. A name with no entity yet (sync can
+    /// deliver claims first) is owned by the project it names, as in
+    /// [`crate::project::get`].
+    /// Without a `project_status` it is returned unchanged.
+    pub fn resolve(&self, store: &crate::db::Store<'_>) -> crate::db::Result<Self> {
+        use crate::entity::{entity_id, normalize_entity_name, resolve_entity};
+        let Some(status) = self.project_status else {
+            return Ok(self.clone());
+        };
+        let projects = crate::project::list(store)?.projects;
+        let wanted: std::collections::BTreeSet<&str> = projects
+            .iter()
+            .filter(|p| p.status.value == status)
+            .map(|p| p.entity.id.as_str())
+            .collect();
+        let candidates: std::collections::BTreeSet<&str> = projects
+            .iter()
+            .flat_map(|p| std::iter::once(&p.entity.name).chain(&p.entity.aliases))
+            .map(String::as_str)
+            .collect();
+        let mut names = std::collections::BTreeSet::new();
+        for name in candidates {
+            let owner = resolve_entity(store, name)?.map_or_else(|| entity_id(name), |e| e.id);
+            if wanted.contains(owner.as_str()) {
+                names.insert(normalize_entity_name(name));
+            }
+        }
+        Ok(Self {
+            status_projects: Some(StatusProjects(names)),
+            ..self.clone()
+        })
     }
 
     /// Whether no field narrows anything.
@@ -460,6 +543,19 @@ impl ScopeFilter {
             && want(&self.branch, branch)
             && want(&self.session_id, session_id)
             && self.written_by.as_deref().is_none_or(|w| w == written_by)
+            && self.admits_status(project)
+    }
+
+    /// Whether `project` has the wanted status. Fails closed when the
+    /// filter was never [resolved](Self::resolve).
+    fn admits_status(&self, project: Option<&str>) -> bool {
+        if self.project_status.is_none() {
+            return true;
+        }
+        let (Some(StatusProjects(names)), Some(project)) = (&self.status_projects, project) else {
+            return false;
+        };
+        names.contains(&crate::entity::normalize_entity_name(project))
     }
 
     /// [`Self::matches`] over a [`crate::models::Memory`].

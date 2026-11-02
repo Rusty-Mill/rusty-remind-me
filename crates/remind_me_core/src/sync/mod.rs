@@ -187,6 +187,13 @@ pub fn with_call_client<R>(identity: Option<String>, f: impl FnOnce() -> R) -> R
     f()
 }
 
+/// Whether the call running on this thread was forwarded by a transport
+/// that names its caller (the remote connector): inside
+/// [`with_call_client`], whatever identity it carried.
+pub fn in_forwarded_call() -> bool {
+    CALL_CLIENT.with(|slot| slot.borrow().is_some())
+}
+
 /// The client identity currently in force.
 pub fn handshake_client() -> Option<String> {
     if let Some(in_call) = CALL_CLIENT.with(|slot| slot.borrow().clone()) {

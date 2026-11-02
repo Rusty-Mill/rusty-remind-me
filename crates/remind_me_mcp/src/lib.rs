@@ -686,6 +686,7 @@ impl McpServer {
                                                 }
                                             }
                                         },
+                                        "project": { "type": "string", "maxLength": 200, "description": "The project this memory belongs to, e.g. a registered project name. Replaces the project detected from the writer's directory; blank is unset." },
                                         "metadata": { "type": "object", "description": "Free-form JSON stored with the memory; a decision requires a `rationale` string here, an action_item may hold due, owner and status." },
                                         "subject": { "type": "string", "description": "Subject of a subject-predicate-object fact. remind_me_add does not supersede a live triple with the same subject and predicate; name it in supersedes to do so." },
                                         "predicate": { "type": "string", "description": "Predicate of the fact triple." },
@@ -740,6 +741,7 @@ impl McpServer {
                                         },
                                         "source": { "type": "string" },
                                         "project": { "type": "string", "description": "Only memories written in this project (case-insensitive)" },
+                                        "project_status": { "type": "string", "enum": ["active", "dormant", "abandoned"], "description": "Only memories whose project is a registered project (remind_me_project, by name or alias) with this status" },
                                         "branch": { "type": "string", "description": "Only memories written on this git branch" },
                                         "session_id": { "type": "string", "description": "Only memories written in this client session" },
                                         "written_by": { "type": "string", "description": "Only memories by this writer: human, hook, model, model:<id> or importer:<name>" },
@@ -800,6 +802,7 @@ impl McpServer {
                                         "entity": { "type": "string", "description": "Only memories about this entity, by name or alias: linked to it, or naming it as subject or object. An unknown entity matches nothing." },
                                         "repo": { "type": "string", "description": "Only memories written in this git repository (origin remote, any URL form, e.g. github.com/owner/repo)" },
                                         "project": { "type": "string", "description": "Only memories written in this project (case-insensitive)" },
+                                        "project_status": { "type": "string", "enum": ["active", "dormant", "abandoned"], "description": "Only memories whose project is a registered project (remind_me_project, by name or alias) with this status" },
                                         "branch": { "type": "string", "description": "Only memories written on this git branch" },
                                         "session_id": { "type": "string", "description": "Only memories written in this client session" },
                                         "written_by": { "type": "string", "description": "Only memories by this writer: human, hook, model, model:<id> or importer:<name>" },
@@ -1022,7 +1025,8 @@ impl McpServer {
                                         "title": { "type": "string", "maxLength": 200, "description": "Defaults to the summary's first line" },
                                         "tags": { "type": "array", "items": { "type": "string" }, "maxItems": 20 },
                                         "category": { "type": "string", "default": "conversation", "maxLength": 100, "description": "Category for the SUMMARY; the dialog is always stored as 'dialog'" },
-                                        "metadata": { "type": "object" }
+                                        "metadata": { "type": "object" },
+                                        "project": { "type": "string", "maxLength": 200, "description": "The project both memories belong to, e.g. a registered project name. Replaces the project detected from the writer's directory; blank is unset." }
                                     },
                                     "required": ["conversation", "summary"]
                                 }

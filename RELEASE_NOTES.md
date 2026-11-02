@@ -2,6 +2,18 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-02 — Explicit project, connector context, project_status filter (#592)
+
+### Added
+- `remind_me_add` and `remind_me_auto_capture` take an optional `project`. It replaces the project detected from the writer's directory (and, for a capture, a hook's); the rest of the context is still detected. Trimmed; blank is unset; a value over 200 bytes or spanning lines is refused. A capture's decomposed facts inherit it from the capture.
+- `remind_me_search` and `remind_me_list` take an optional `project_status` (`active`, `dormant`, `abandoned`): only memories whose `project` names a registered project (`remind_me_project`, by name or alias, case-insensitive) with that status. A read-only join against the registry, read once per query; nothing is written.
+
+### Changed
+- A call forwarded by the remote connector (one carrying the `rusty-remind-me/caller` meta, local or proxied to the daemon) is stamped with no project, cwd, git remote, branch, sha or session id. Before, the server's own directory was used: `/` on the deployed connector, so the fields were null by accident, and a server started in a checkout would have stamped its own repository on every connector write. Local and daemon clients are unchanged.
+
+### Tests
+- `context_test`: explicit project wins and is validated, stamps both capture halves, a forwarded call leaves every context column null but keeps an explicit project, `project_status` narrows list and search (with aliases, combined with branch), deserialises from flat arguments and fails closed when never resolved. `forwarded_context_test` drives the same through `handle_request` with and without the caller meta.
+
 ## 2026-10-31 — Find duplicate entities (report only)
 
 ### Added

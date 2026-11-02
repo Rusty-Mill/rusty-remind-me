@@ -46,6 +46,7 @@ fn capture(store: &Store<'_>, conversation: &str) -> String {
             tags: vec![],
             category: "conversation".into(),
             metadata: serde_json::json!({}),
+            project: None,
         },
     )
     .unwrap()

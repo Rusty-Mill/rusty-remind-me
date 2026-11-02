@@ -407,3 +407,340 @@ fn markdown_header_shows_project_at_branch_and_never_the_session() {
     let json = serde_json::to_string(&page.memories).unwrap();
     assert!(json.contains("secret-session"));
 }
+
+// -- #592: explicit project, forwarded calls, project_status -----------------
+
+#[test]
+fn an_explicit_project_wins_over_the_detected_one() {
+    let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join(format!("rmm-ctx-proj-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    test_env::set_var(CWD_ENV, &dir);
+
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let named = queries::add_memory(
+        &store,
+        MemoryAddInput {
+            project: Some("  let-em-loose ".into()),
+            ..add_input("named")
+        },
+    )
+    .unwrap();
+    let blank = queries::add_memory(
+        &store,
+        MemoryAddInput {
+            project: Some("   ".into()),
+            ..add_input("blank")
+        },
+    )
+    .unwrap();
+    let two_lines = queries::add_memory(
+        &store,
+        MemoryAddInput {
+            project: Some("a\nb".into()),
+            ..add_input("bad")
+        },
+    );
+    let too_long = queries::add_memory(
+        &store,
+        MemoryAddInput {
+            project: Some("x".repeat(remind_me_core::context::MAX_PROJECT_LEN + 1)),
+            ..add_input("bad")
+        },
+    );
+
+    test_env::remove_var(CWD_ENV);
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert_eq!(named.project.as_deref(), Some("let-em-loose"));
+    // The rest of the context is still detected.
+    assert_eq!(named.cwd.as_deref(), Some(dir.to_string_lossy().as_ref()));
+    // Blank is unset: the detected project stands.
+    assert!(blank.project.is_some());
+    assert_ne!(blank.project.as_deref(), Some(""));
+    assert!(two_lines.is_err());
+    assert!(too_long.is_err());
+}
+
+#[test]
+fn an_explicit_project_stamps_both_halves_of_a_capture() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let input = remind_me_core::models::AutoCaptureInput {
+        conversation: "user: hi\nassistant: hello".into(),
+        summary: "greeting".into(),
+        title: String::new(),
+        tags: vec![],
+        category: "conversation".into(),
+        metadata: serde_json::json!({}),
+        project: Some("let-em-loose".into()),
+    };
+    let out = remind_me_core::capture::auto_capture(&store, &input).unwrap();
+    for id in [&out.dialog_id, &out.summary_id] {
+        let m = queries::get_memory_by_id(&store, id).unwrap().unwrap();
+        assert_eq!(m.project.as_deref(), Some("let-em-loose"), "{id}");
+    }
+}
+
+#[test]
+fn a_forwarded_call_leaves_cwd_and_git_unknown() {
+    let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    // Whatever directory the server runs in says nothing about a remote
+    // caller, even one it was told about.
+    let dir = std::env::temp_dir().join(format!("rmm-ctx-fwd-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    test_env::set_var(CWD_ENV, &dir);
+    test_env::set_var(SESSION_ID_ENV, "server-session");
+
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let remote = remind_me_core::sync::with_call_client(Some("claude-ai/1.0".into()), || {
+        queries::add_memory(&store, add_input("from the connector")).unwrap()
+    });
+    let named = remind_me_core::sync::with_call_client(None, || {
+        queries::add_memory(
+            &store,
+            MemoryAddInput {
+                project: Some("let-em-loose".into()),
+                ..add_input("named by the connector")
+            },
+        )
+        .unwrap()
+    });
+    let local = queries::add_memory(&store, add_input("local")).unwrap();
+
+    test_env::remove_var(CWD_ENV);
+    test_env::remove_var(SESSION_ID_ENV);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let unknown = (None, None, None, None, None, None);
+    let columns = |m: &remind_me_core::Memory| {
+        (
+            m.project.clone(),
+            m.cwd.clone(),
+            m.git_remote.clone(),
+            m.git_branch.clone(),
+            m.git_sha.clone(),
+            m.session_id.clone(),
+        )
+    };
+    assert_eq!(columns(&remote), unknown);
+    assert_eq!(named.project.as_deref(), Some("let-em-loose"));
+    assert_eq!(named.cwd, None);
+    // Outside a forwarded call nothing changes.
+    assert_eq!(local.cwd.as_deref(), Some(dir.to_string_lossy().as_ref()));
+    assert_eq!(local.session_id.as_deref(), Some("server-session"));
+}
+
+fn register(store: &Store<'_>, name: &str, status: remind_me_core::project::Status) {
+    use remind_me_core::project::{ClaimValue, SetInput, Stage};
+    remind_me_core::project::set(
+        store,
+        &SetInput {
+            project: name.into(),
+            claims: vec![ClaimValue::Stage(Stage::Built), ClaimValue::Status(status)],
+            evidence: vec![],
+            because: Some(format!("{name} is registered for the test")),
+            confirmed_by: "human".into(),
+            proposal: None,
+        },
+    )
+    .unwrap();
+}
+
+/// The fixture's one-letter ids, without the registry's own memories.
+fn only_fixture(got: Vec<String>) -> Vec<String> {
+    got.into_iter().filter(|id| id.len() == 1).collect()
+}
+
+fn with_status(status: remind_me_core::project::Status) -> ScopeFilter {
+    ScopeFilter {
+        project_status: Some(status),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn project_status_narrows_list_and_search_to_registered_projects() {
+    use remind_me_core::project::Status;
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    fixture(&store);
+    // "Rusty" and "rusty" are one project; "other" is dormant; "d" has none.
+    register(&store, "Rusty", Status::Active);
+    register(&store, "other", Status::Dormant);
+
+    assert_eq!(
+        only_fixture(list(&store, with_status(Status::Active))),
+        ["a", "b"]
+    );
+    assert_eq!(
+        only_fixture(list(&store, with_status(Status::Dormant))),
+        ["c"]
+    );
+    assert!(only_fixture(list(&store, with_status(Status::Abandoned))).is_empty());
+    assert_eq!(search(&store, with_status(Status::Active)), ["a", "b"]);
+    assert_eq!(search(&store, with_status(Status::Dormant)), ["c"]);
+    // It combines with the other scope fields.
+    let active_main = ScopeFilter {
+        branch: Some("main".into()),
+        ..with_status(Status::Active)
+    };
+    assert_eq!(only_fixture(list(&store, active_main)), ["a"]);
+}
+
+fn alias(store: &Store<'_>, name: &str, alias: &str) {
+    remind_me_core::entity::upsert_entity(
+        store,
+        &remind_me_core::models::EntityInput {
+            name: name.into(),
+            kind: None,
+            aliases: vec![alias.into()],
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn project_status_admits_a_projects_aliases() {
+    use remind_me_core::project::Status;
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    fixture(&store);
+    // "other" is an alias of the active project "Rusty Mill".
+    register(&store, "Rusty Mill", Status::Active);
+    alias(&store, "Rusty Mill", "Other");
+
+    assert_eq!(
+        only_fixture(list(&store, with_status(Status::Active))),
+        ["c"]
+    );
+    assert_eq!(search(&store, with_status(Status::Active)), ["c"]);
+}
+
+#[test]
+fn a_canonical_project_name_beats_another_projects_alias() {
+    use remind_me_core::project::Status;
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    fixture(&store);
+    // The active project claims "other" as an alias, but "other" is a
+    // dormant project's own name, so its memories stay dormant only.
+    register(&store, "Rusty", Status::Active);
+    register(&store, "other", Status::Dormant);
+    alias(&store, "Rusty", "Other");
+
+    assert_eq!(
+        only_fixture(list(&store, with_status(Status::Active))),
+        ["a", "b"]
+    );
+    assert_eq!(
+        only_fixture(list(&store, with_status(Status::Dormant))),
+        ["c"]
+    );
+    assert_eq!(search(&store, with_status(Status::Active)), ["a", "b"]);
+    assert_eq!(search(&store, with_status(Status::Dormant)), ["c"]);
+}
+
+#[test]
+fn a_shared_alias_belongs_to_the_project_registry_lookup_resolves() {
+    use remind_me_core::project::Status;
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    fixture(&store);
+    // Two projects with different statuses both claim the alias "other".
+    register(&store, "Rusty", Status::Active);
+    register(&store, "Mill", Status::Dormant);
+    alias(&store, "Rusty", "Other");
+    alias(&store, "Mill", "Other");
+    let owner = remind_me_core::entity::resolve_entity(&store, "other")
+        .unwrap()
+        .unwrap()
+        .name;
+    let (owns, other) = match owner.as_str() {
+        "Rusty" => (Status::Active, Status::Dormant),
+        "Mill" => (Status::Dormant, Status::Active),
+        _ => panic!("unexpected owner {owner}"),
+    };
+
+    assert!(only_fixture(list(&store, with_status(owns))).contains(&"c".to_string()));
+    assert!(search(&store, with_status(owns)).contains(&"c".to_string()));
+    assert!(!only_fixture(list(&store, with_status(other))).contains(&"c".to_string()));
+    assert!(!search(&store, with_status(other)).contains(&"c".to_string()));
+}
+
+#[test]
+fn a_non_project_entity_name_shadows_a_projects_alias() {
+    use remind_me_core::project::Status;
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    fixture(&store);
+    // "other" is an entity of its own, not a project, so the active
+    // project's alias "Other" resolves to it, not to the project.
+    remind_me_core::entity::upsert_entity(
+        &store,
+        &remind_me_core::models::EntityInput {
+            name: "other".into(),
+            kind: None,
+            aliases: vec![],
+        },
+    )
+    .unwrap();
+    register(&store, "Rusty", Status::Active);
+    alias(&store, "Rusty", "Other");
+
+    assert_eq!(
+        only_fixture(list(&store, with_status(Status::Active))),
+        ["a", "b"]
+    );
+    assert_eq!(search(&store, with_status(Status::Active)), ["a", "b"]);
+}
+
+#[test]
+fn a_project_whose_entity_has_not_synced_keeps_its_status() {
+    use remind_me_core::db::entities::Entities;
+    use remind_me_core::project::Status;
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    fixture(&store);
+    // Sync can deliver a project's claims before its entity row.
+    register(&store, "other", Status::Dormant);
+    Entities::new(&store)
+        .delete(&remind_me_core::entity::entity_id("other"))
+        .unwrap();
+    assert!(remind_me_core::entity::resolve_entity(&store, "other")
+        .unwrap()
+        .is_none());
+    let project = remind_me_core::project::get(&store, "other")
+        .unwrap()
+        .unwrap();
+    assert_eq!(project.status.value, Status::Dormant);
+
+    assert_eq!(
+        only_fixture(list(&store, with_status(Status::Dormant))),
+        ["c"]
+    );
+    assert_eq!(search(&store, with_status(Status::Dormant)), ["c"]);
+    assert!(search(&store, with_status(Status::Active)).is_empty());
+}
+
+#[test]
+fn project_status_deserialises_from_flat_tool_arguments() {
+    use remind_me_core::project::Status;
+    let input: MemoryListInput =
+        serde_json::from_value(serde_json::json!({"project_status": "active"})).unwrap();
+    assert_eq!(input.scope.project_status, Some(Status::Active));
+    let bad = serde_json::from_value::<MemoryListInput>(
+        serde_json::json!({"project_status": "finished"}),
+    );
+    assert!(bad.is_err());
+}
+
+#[test]
+fn an_unresolved_project_status_matches_nothing() {
+    use remind_me_core::project::Status;
+    // Fail closed: a filter that never met the registry admits no row.
+    let filter = with_status(Status::Active);
+    assert!(!filter.matches(Some("rusty"), None, None, "human"));
+}

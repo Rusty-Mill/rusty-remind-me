@@ -263,6 +263,11 @@ pub struct MemoryAddInput {
     /// id that is missing, deleted or already superseded refuses the add.
     #[serde(default)]
     pub supersedes: Vec<String>,
+    /// The project this memory belongs to, replacing the one detected from
+    /// the writer's directory. Blank is unset; see
+    /// [`crate::context::explicit_project`].
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 /// One attachment of a [`MemoryAddInput`]: a local `path` (hashed, never
@@ -300,6 +305,7 @@ impl Default for MemoryAddInput {
             extract: true,
             attachments: Vec::new(),
             supersedes: Vec::new(),
+            project: None,
         }
     }
 }
@@ -937,6 +943,11 @@ pub struct AutoCaptureInput {
     pub category: String,
     #[serde(default)]
     pub metadata: serde_json::Value,
+    /// The project both halves belong to, winning over the detected one and
+    /// over a hook's. Blank is unset; see
+    /// [`crate::context::explicit_project`].
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 fn default_capture_category() -> String {

@@ -23,6 +23,7 @@ fn capture(store: &Store<'_>, tags: &[&str]) -> CaptureResult {
             tags: tags.iter().map(|t| t.to_string()).collect(),
             category: "conversation".into(),
             metadata: serde_json::json!({}),
+            project: None,
         },
     )
     .unwrap()
