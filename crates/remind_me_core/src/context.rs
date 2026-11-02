@@ -486,29 +486,32 @@ impl ScopeFilter {
     }
 
     /// This filter with `project_status` joined against the project
-    /// registry: the names and aliases of every project with that status.
-    /// An alias that is another project's canonical name belongs to that
-    /// project, as in [`crate::entity::resolve_entity`].
+    /// registry: every registered project's name and alias whose owner, as
+    /// [`crate::entity::resolve_entity`] resolves it across all entities,
+    /// is a project with that status.
     /// Without a `project_status` it is returned unchanged.
     pub fn resolve(&self, store: &crate::db::Store<'_>) -> crate::db::Result<Self> {
-        use crate::entity::normalize_entity_name as normalize;
+        use crate::entity::{normalize_entity_name, resolve_entity};
         let Some(status) = self.project_status else {
             return Ok(self.clone());
         };
         let projects = crate::project::list(store)?.projects;
-        let canonical: std::collections::BTreeSet<String> =
-            projects.iter().map(|p| normalize(&p.entity.name)).collect();
+        let wanted: std::collections::BTreeSet<&str> = projects
+            .iter()
+            .filter(|p| p.status.value == status)
+            .map(|p| p.entity.id.as_str())
+            .collect();
+        let candidates: std::collections::BTreeSet<&str> = projects
+            .iter()
+            .flat_map(|p| std::iter::once(&p.entity.name).chain(&p.entity.aliases))
+            .map(String::as_str)
+            .collect();
         let mut names = std::collections::BTreeSet::new();
-        for project in projects.iter().filter(|p| p.status.value == status) {
-            names.insert(normalize(&project.entity.name));
-            names.extend(
-                project
-                    .entity
-                    .aliases
-                    .iter()
-                    .map(|alias| normalize(alias))
-                    .filter(|alias| !canonical.contains(alias)),
-            );
+        for name in candidates {
+            let owner = resolve_entity(store, name)?;
+            if owner.is_some_and(|e| wanted.contains(e.id.as_str())) {
+                names.insert(normalize_entity_name(name));
+            }
         }
         Ok(Self {
             status_projects: Some(StatusProjects(names)),

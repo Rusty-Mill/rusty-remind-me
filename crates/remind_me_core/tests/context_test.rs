@@ -644,6 +644,60 @@ fn a_canonical_project_name_beats_another_projects_alias() {
 }
 
 #[test]
+fn a_shared_alias_belongs_to_the_project_registry_lookup_resolves() {
+    use remind_me_core::project::Status;
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    fixture(&store);
+    // Two projects with different statuses both claim the alias "other".
+    register(&store, "Rusty", Status::Active);
+    register(&store, "Mill", Status::Dormant);
+    alias(&store, "Rusty", "Other");
+    alias(&store, "Mill", "Other");
+    let owner = remind_me_core::entity::resolve_entity(&store, "other")
+        .unwrap()
+        .unwrap()
+        .name;
+    let (owns, other) = match owner.as_str() {
+        "Rusty" => (Status::Active, Status::Dormant),
+        "Mill" => (Status::Dormant, Status::Active),
+        _ => panic!("unexpected owner {owner}"),
+    };
+
+    assert!(only_fixture(list(&store, with_status(owns))).contains(&"c".to_string()));
+    assert!(search(&store, with_status(owns)).contains(&"c".to_string()));
+    assert!(!only_fixture(list(&store, with_status(other))).contains(&"c".to_string()));
+    assert!(!search(&store, with_status(other)).contains(&"c".to_string()));
+}
+
+#[test]
+fn a_non_project_entity_name_shadows_a_projects_alias() {
+    use remind_me_core::project::Status;
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    fixture(&store);
+    // "other" is an entity of its own, not a project, so the active
+    // project's alias "Other" resolves to it, not to the project.
+    remind_me_core::entity::upsert_entity(
+        &store,
+        &remind_me_core::models::EntityInput {
+            name: "other".into(),
+            kind: None,
+            aliases: vec![],
+        },
+    )
+    .unwrap();
+    register(&store, "Rusty", Status::Active);
+    alias(&store, "Rusty", "Other");
+
+    assert_eq!(
+        only_fixture(list(&store, with_status(Status::Active))),
+        ["a", "b"]
+    );
+    assert_eq!(search(&store, with_status(Status::Active)), ["a", "b"]);
+}
+
+#[test]
 fn project_status_deserialises_from_flat_tool_arguments() {
     use remind_me_core::project::Status;
     let input: MemoryListInput =
