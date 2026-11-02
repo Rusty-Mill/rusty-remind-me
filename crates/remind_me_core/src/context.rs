@@ -488,10 +488,12 @@ impl ScopeFilter {
     /// This filter with `project_status` joined against the project
     /// registry: every registered project's name and alias whose owner, as
     /// [`crate::entity::resolve_entity`] resolves it across all entities,
-    /// is a project with that status.
+    /// is a project with that status. A name with no entity yet (sync can
+    /// deliver claims first) is owned by the project it names, as in
+    /// [`crate::project::get`].
     /// Without a `project_status` it is returned unchanged.
     pub fn resolve(&self, store: &crate::db::Store<'_>) -> crate::db::Result<Self> {
-        use crate::entity::{normalize_entity_name, resolve_entity};
+        use crate::entity::{entity_id, normalize_entity_name, resolve_entity};
         let Some(status) = self.project_status else {
             return Ok(self.clone());
         };
@@ -508,8 +510,8 @@ impl ScopeFilter {
             .collect();
         let mut names = std::collections::BTreeSet::new();
         for name in candidates {
-            let owner = resolve_entity(store, name)?;
-            if owner.is_some_and(|e| wanted.contains(e.id.as_str())) {
+            let owner = resolve_entity(store, name)?.map_or_else(|| entity_id(name), |e| e.id);
+            if wanted.contains(owner.as_str()) {
                 names.insert(normalize_entity_name(name));
             }
         }

@@ -698,6 +698,34 @@ fn a_non_project_entity_name_shadows_a_projects_alias() {
 }
 
 #[test]
+fn a_project_whose_entity_has_not_synced_keeps_its_status() {
+    use remind_me_core::db::entities::Entities;
+    use remind_me_core::project::Status;
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    fixture(&store);
+    // Sync can deliver a project's claims before its entity row.
+    register(&store, "other", Status::Dormant);
+    Entities::new(&store)
+        .delete(&remind_me_core::entity::entity_id("other"))
+        .unwrap();
+    assert!(remind_me_core::entity::resolve_entity(&store, "other")
+        .unwrap()
+        .is_none());
+    let project = remind_me_core::project::get(&store, "other")
+        .unwrap()
+        .unwrap();
+    assert_eq!(project.status.value, Status::Dormant);
+
+    assert_eq!(
+        only_fixture(list(&store, with_status(Status::Dormant))),
+        ["c"]
+    );
+    assert_eq!(search(&store, with_status(Status::Dormant)), ["c"]);
+    assert!(search(&store, with_status(Status::Active)).is_empty());
+}
+
+#[test]
 fn project_status_deserialises_from_flat_tool_arguments() {
     use remind_me_core::project::Status;
     let input: MemoryListInput =
