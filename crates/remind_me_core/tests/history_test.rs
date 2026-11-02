@@ -41,6 +41,7 @@ fn update(store: &Store<'_>, id: &str, content: Option<&str>, category: Option<&
     queries::update_memory(
         store,
         &MemoryUpdateInput {
+            project: None,
             memory_id: id.to_string(),
             clear_superseded: false,
             content: content.map(str::to_string),
@@ -169,6 +170,7 @@ fn reverting_restores_every_tracked_field_together() {
     queries::update_memory(
         &store,
         &MemoryUpdateInput {
+            project: None,
             memory_id: id.clone(),
             clear_superseded: false,
             content: Some("rewritten".into()),

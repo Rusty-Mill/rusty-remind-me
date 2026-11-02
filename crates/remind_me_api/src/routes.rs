@@ -427,6 +427,8 @@ pub fn api_update(store: &Store<'_>, _wiki: &Wiki, req: &Request, params: &Param
         // MCP-tool affordance there, not an HTTP one. Exposing it here would
         // be a route this crate has and `remind_me` does not.
         clear_superseded: false,
+        // The project is an MCP-tool affordance (#592), like `clear_superseded`.
+        project: None,
         // Absent means "leave it alone", so a PATCH that does not mention the
         // flag cannot clear it.
         sensitive: body.get("sensitive").and_then(Value::as_bool),

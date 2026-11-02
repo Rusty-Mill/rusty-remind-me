@@ -269,6 +269,7 @@ fn editing_a_category_no_longer_contradicts_a_classification() {
     queries::update_memory(
         &store,
         &MemoryUpdateInput {
+            project: None,
             sensitive: None,
             memory_id: id.clone(),
             content: None,

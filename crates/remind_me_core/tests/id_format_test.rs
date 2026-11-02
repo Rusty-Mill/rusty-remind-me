@@ -112,6 +112,7 @@ fn a_reference_shaped_id_updates() {
     queries::update_memory(
         &store,
         &MemoryUpdateInput {
+            project: None,
             memory_id: REFERENCE_SHAPED[0].to_string(),
             clear_superseded: false,
             content: Some("after".into()),

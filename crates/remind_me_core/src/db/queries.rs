@@ -222,6 +222,7 @@ pub fn update_memory_with(
         return Ok(UpdateOutcome::NotFound);
     };
     crate::project::refuse_claim_edit(&stored)?;
+    let project = crate::context::explicit_project(input.project.as_deref())?;
     let metadata = input.metadata.as_ref().unwrap_or(&stored.metadata);
     fields.validate(metadata, stored.memory_type.as_deref())?;
     // Becoming a decision schedules its follow-up; staying one does not.
@@ -250,6 +251,7 @@ pub fn update_memory_with(
         valid_until: fields.valid_until.clone(),
         verified_at: fields.verified_at.clone(),
         outcome: fields.outcome.clone(),
+        project,
         ..MemoryEdit::at(Utc::now().to_rfc3339())
     };
     let nothing_to_write = MemoryEdit {

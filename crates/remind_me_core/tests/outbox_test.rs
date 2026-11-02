@@ -151,6 +151,7 @@ fn a_real_content_change_still_reaches_the_outbox() {
     let outcome = queries::update_memory(
         &store,
         &MemoryUpdateInput {
+            project: None,
             sensitive: None,
             memory_id: id,
             content: Some("quokka sighting, confirmed".into()),
@@ -176,6 +177,41 @@ fn a_real_content_change_still_reaches_the_outbox() {
         .unwrap()
         .operation;
     assert_eq!(operation, "update");
+}
+
+#[test]
+fn a_project_edit_reaches_the_outbox_with_the_project() {
+    // #592 backfill: setting a project must sync like any other edit.
+    ensure_sync_enabled();
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let id = add(&store, "quokka sighting");
+    let after_write = outbox_rows(&store);
+
+    let outcome = queries::update_memory(
+        &store,
+        &MemoryUpdateInput {
+            project: Some(" let-em-loose ".into()),
+            sensitive: None,
+            memory_id: id,
+            content: None,
+            category: None,
+            tags: None,
+            metadata: None,
+            clear_superseded: false,
+        },
+    )
+    .unwrap();
+    let UpdateOutcome::Updated(memory) = outcome else {
+        panic!("expected an update, got {outcome:?}");
+    };
+    assert_eq!(memory.project.as_deref(), Some("let-em-loose"));
+
+    assert_eq!(outbox_rows(&store), after_write + 1);
+    let row = testing::outbox_rows(&store).unwrap().pop().unwrap();
+    assert_eq!(row.operation, "update");
+    let payload: serde_json::Value = serde_json::from_str(&row.payload).unwrap();
+    assert_eq!(payload["project"], "let-em-loose");
 }
 
 #[test]

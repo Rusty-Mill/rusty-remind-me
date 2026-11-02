@@ -58,6 +58,7 @@ fn decision(store: &Store<'_>, content: &str) -> String {
 
 fn update(memory_id: &str) -> MemoryUpdateInput {
     MemoryUpdateInput {
+        project: None,
         memory_id: memory_id.to_string(),
         content: None,
         category: None,

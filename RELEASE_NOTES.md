@@ -2,6 +2,14 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-02 — Set a memory's project on update (#592)
+
+### Added
+- `remind_me_update` takes an optional `project`, validated as on `remind_me_add` (trimmed, one line, at most 200 bytes). It sets the `project` column through the normal edit path, so the change is queued for sync like any other edit. Omitted or blank leaves the project alone; it cannot be cleared to null. MCP only; the HTTP PATCH route is unchanged. Lets memories written before #592 (with no project) be filed under one.
+
+### Tests
+- `context_test`: an update sets the project, keeps it when omitted, replaces a detected one, and refuses a multi-line or over-long value without writing. `outbox_test`: a project edit enqueues one `update` row carrying the project. `forwarded_context_test`: a connector-forwarded `remind_me_update` sets it.
+
 ## 2026-11-02 — Explicit project, connector context, project_status filter (#592)
 
 ### Added

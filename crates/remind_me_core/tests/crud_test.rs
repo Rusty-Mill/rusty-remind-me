@@ -126,6 +126,7 @@ fn tag_filtering_tracks_edits_to_a_memory_s_tags() {
     queries::update_memory(
         &store,
         &MemoryUpdateInput {
+            project: None,
             sensitive: None,
             memory_id: id.clone(),
             content: None,
@@ -266,6 +267,7 @@ fn update_changes_only_the_supplied_fields() {
     let outcome = queries::update_memory(
         &store,
         &MemoryUpdateInput {
+            project: None,
             sensitive: None,
             memory_id: id.clone(),
             content: Some("revised".into()),
@@ -298,6 +300,7 @@ fn update_leaves_decay_and_retrieval_history_alone() {
     let outcome = queries::update_memory(
         &store,
         &MemoryUpdateInput {
+            project: None,
             sensitive: None,
             memory_id: id,
             content: None,
@@ -337,6 +340,7 @@ fn update_reports_not_found_and_no_fields_distinctly() {
     let missing = queries::update_memory(
         &store,
         &MemoryUpdateInput {
+            project: None,
             sensitive: None,
             memory_id: "mem_does_not_exist".into(),
             content: Some("x".into()),
@@ -352,6 +356,7 @@ fn update_reports_not_found_and_no_fields_distinctly() {
     let empty = queries::update_memory(
         &store,
         &MemoryUpdateInput {
+            project: None,
             sensitive: None,
             memory_id: id,
             content: None,
@@ -381,6 +386,7 @@ fn update_keeps_the_fts_index_consistent() {
     queries::update_memory(
         &store,
         &MemoryUpdateInput {
+            project: None,
             sensitive: None,
             memory_id: id.clone(),
             content: Some("wombat sightings in tasmania".into()),
