@@ -38,6 +38,7 @@ pub fn add_memory_with(
 ) -> Result<Memory> {
     fields.validate(&input.metadata, None)?;
     crate::project::refuse_reserved_predicate(input.predicate.as_deref())?;
+    let project = crate::context::explicit_project(input.project.as_deref())?;
     if let Some(scheduled) =
         crate::review::schedule_if_decision(fields.memory_type.as_deref(), &input.metadata)
     {
@@ -66,6 +67,10 @@ pub fn add_memory_with(
     let base_weight = type_prior * source_prior;
     let initial_vitality = calculate_vitality(base_weight, 0, decay_rate, &now_iso, now);
 
+    let mut provenance = crate::context::default_provenance();
+    if project.is_some() {
+        provenance.context.project = project;
+    }
     let write = |tx: &Store<'_>| -> Result<()> {
         Memories::new(tx).insert(&NewMemory {
             category: input.category.clone(),
@@ -91,11 +96,7 @@ pub fn add_memory_with(
             valid_until: fields.valid_until.clone(),
             verified_at: fields.verified_at.clone(),
             outcome: fields.outcome.clone(),
-            ..crate::context::default_provenance().stamp(NewMemory::new(
-                id.clone(),
-                content.clone(),
-                &now_iso,
-            ))
+            ..provenance.stamp(NewMemory::new(id.clone(), content.clone(), &now_iso))
         })?;
 
         // `MemoryAddInput::entities` was previously parsed and then dropped, so a
@@ -177,7 +178,7 @@ pub fn list_memories(store: &Store<'_>, input: &MemoryListInput) -> Result<Memor
         category: input.category.clone().filter(|c| !c.is_empty()),
         source: input.source.clone().filter(|s| !s.is_empty()),
         tags: input.tags.clone().unwrap_or_default(),
-        scope: input.scope.clone(),
+        scope: input.scope.resolve(store)?,
     };
     let (total, memories) = Memories::new(store).list_page(&filter, limit, input.offset)?;
 
@@ -698,6 +699,7 @@ pub fn search_memories_deadlined(
     let phrases = crate::fts::query_phrases(&input.query);
     // An entity the store has never seen matches nothing: an empty result,
     // not an error, as `search_paginated` answers it.
+    let scope = input.scope.resolve(store)?;
     let Some(narrowing) = resolve_narrowing(store, input)? else {
         let mut outcome = trim_by_token_budget(Vec::new(), input.token_budget, input.detail);
         timing.elapsed_ms = deadline.elapsed_ms();
@@ -720,7 +722,7 @@ pub fn search_memories_deadlined(
         min_effective_vitality: floor,
         category: input.category.clone(),
         include_sensitive: input.include_sensitive,
-        scope: input.scope.clone(),
+        scope: scope.clone(),
         exclude_raw: !input.ranks_raw(),
         narrowing: narrowing.clone(),
         window: input.window,
@@ -805,7 +807,7 @@ pub fn search_memories_deadlined(
             };
             let admit = |m: &Memory| {
                 !hidden.contains(&m.id)
-                    && input.scope.matches_memory(m)
+                    && scope.matches_memory(m)
                     && input.window.contains_memory(m)
                     && narrowing.admits(m)
                     && crate::db::engine::memories::vital_enough(&filter, m, now)

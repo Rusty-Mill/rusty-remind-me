@@ -323,6 +323,7 @@ fn a_decomposed_fact_keeps_its_kind_metadata() {
             tags: vec![],
             category: "conversation".into(),
             metadata: json!({}),
+            project: None,
         },
     )
     .unwrap();

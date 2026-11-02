@@ -175,6 +175,12 @@ pub fn auto_capture_stamped(
     input: &AutoCaptureInput,
     stamp: &CaptureStamp,
 ) -> Result<CaptureResult> {
+    // The caller's explicit project wins over the hook's and the detected.
+    let mut stamp = stamp.clone();
+    if let Some(project) = crate::context::explicit_project(input.project.as_deref())? {
+        stamp.context.project = Some(project);
+    }
+    let stamp = &stamp;
     let now_iso = Utc::now().to_rfc3339();
     let capture_id = format!("cap_{}", uuid::Uuid::new_v4().simple());
     let dialog_id = format!("mem_{}", uuid::Uuid::new_v4().simple());

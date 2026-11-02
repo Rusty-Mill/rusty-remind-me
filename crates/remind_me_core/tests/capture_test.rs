@@ -17,6 +17,7 @@ fn input(conversation: &str, summary: &str) -> AutoCaptureInput {
         tags: vec!["session".into()],
         category: "conversation".into(),
         metadata: serde_json::json!({}),
+        project: None,
     }
 }
 

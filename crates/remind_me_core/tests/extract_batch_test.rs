@@ -144,6 +144,7 @@ fn raw_dialogs_are_excluded() {
             tags: vec![],
             category: "conversation".into(),
             metadata: serde_json::json!({}),
+            project: None,
         },
     )
     .unwrap();
