@@ -153,6 +153,7 @@ fn the_flag_can_be_set_and_cleared_after_creation() {
         queries::update_memory(
             &store,
             &MemoryUpdateInput {
+                project: None,
                 memory_id: id.clone(),
                 clear_superseded: false,
                 content: None,
@@ -183,6 +184,7 @@ fn an_update_that_does_not_mention_the_flag_leaves_it_alone() {
     queries::update_memory(
         &store,
         &MemoryUpdateInput {
+            project: None,
             memory_id: id.clone(),
             clear_superseded: false,
             content: Some("quokka sighting, confirmed".into()),
@@ -210,6 +212,7 @@ fn an_update_of_only_the_flag_is_not_reported_as_no_fields() {
     let outcome = queries::update_memory(
         &store,
         &MemoryUpdateInput {
+            project: None,
             memory_id: id,
             clear_superseded: false,
             content: None,

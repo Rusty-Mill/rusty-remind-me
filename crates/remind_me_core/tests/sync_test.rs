@@ -113,6 +113,7 @@ fn tags_union_merge_regardless_of_which_side_wins() {
     queries::update_memory(
         &store,
         &remind_me_core::MemoryUpdateInput {
+            project: None,
             memory_id: id.clone(),
             content: None,
             category: None,
@@ -303,6 +304,7 @@ fn an_incoming_record_is_not_queued_and_local_edits_stay_queued() {
     queries::update_memory(
         &store,
         &remind_me_core::MemoryUpdateInput {
+            project: None,
             memory_id: id.clone(),
             content: Some("a local edit".into()),
             category: None,

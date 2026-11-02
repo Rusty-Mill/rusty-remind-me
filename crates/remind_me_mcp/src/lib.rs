@@ -769,7 +769,8 @@ impl McpServer {
                                         "confidence": { "type": "number", "minimum": 0, "maximum": 1, "description": "How far to trust this memory; scales its search ranking." },
                                         "valid_from": { "type": "string", "description": "RFC 3339 time the memory starts to hold." },
                                         "valid_until": { "type": "string", "description": "RFC 3339 time it stops holding; after it the memory ranks last and is marked expired." },
-                                        "outcome": { "type": "string", "enum": ["done", "abandoned", "reverted", "superseded", "carded"], "description": "Only for decision and action_item memories." }
+                                        "outcome": { "type": "string", "enum": ["done", "abandoned", "reverted", "superseded", "carded"], "description": "Only for decision and action_item memories." },
+                                        "project": { "type": "string", "description": "Set the memory's project (trimmed, one line, at most 200 bytes). Omit or leave blank to keep it; it cannot be cleared." }
                                     },
                                     "required": ["memory_id"]
                                 }

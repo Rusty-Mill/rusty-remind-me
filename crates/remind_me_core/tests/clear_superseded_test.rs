@@ -43,6 +43,7 @@ fn update(store: &Store<'_>, id: &str, clear_superseded: bool) -> UpdateOutcome 
     queries::update_memory(
         store,
         &MemoryUpdateInput {
+            project: None,
             memory_id: id.to_string(),
             content: None,
             category: None,
@@ -119,6 +120,7 @@ fn omitting_the_flag_leaves_the_pointer_alone() {
     queries::update_memory(
         &store,
         &MemoryUpdateInput {
+            project: None,
             memory_id: first.clone(),
             content: Some("the deploy target is staging (revised)".to_string()),
             category: None,

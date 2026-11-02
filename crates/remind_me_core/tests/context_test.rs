@@ -8,6 +8,7 @@ use remind_me_core::context::{ScopeFilter, CWD_ENV, SESSION_ID_ENV, WRITTEN_BY_E
 use remind_me_core::db::memories::{Memories, NewMemory};
 use remind_me_core::db::queries;
 use remind_me_core::db::Store;
+use remind_me_core::db::StoreError;
 use remind_me_core::importer::import_bytes;
 use remind_me_core::stats;
 use remind_me_core::vitality::{
@@ -15,6 +16,7 @@ use remind_me_core::vitality::{
 };
 use remind_me_core::{
     Database, ImportKind, ImportOutcome, MemoryAddInput, MemoryListInput, MemorySearchInput,
+    MemoryUpdateInput, UpdateOutcome,
 };
 use std::sync::Mutex;
 
@@ -723,6 +725,63 @@ fn a_project_whose_entity_has_not_synced_keeps_its_status() {
     );
     assert_eq!(search(&store, with_status(Status::Dormant)), ["c"]);
     assert!(search(&store, with_status(Status::Active)).is_empty());
+}
+
+fn set_project(
+    store: &Store<'_>,
+    id: &str,
+    project: Option<&str>,
+) -> remind_me_core::db::Result<UpdateOutcome> {
+    queries::update_memory(
+        store,
+        &serde_json::from_value::<MemoryUpdateInput>(serde_json::json!({
+            "memory_id": id,
+            "project": project,
+            "content": project.is_none().then_some("edited"),
+        }))
+        .unwrap(),
+    )
+}
+
+fn project_of(store: &Store<'_>, id: &str) -> Option<String> {
+    queries::get_memory_by_id(store, id)
+        .unwrap()
+        .unwrap()
+        .project
+}
+
+#[test]
+fn an_update_sets_a_memorys_project_and_leaves_it_when_omitted() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    fixture(&store);
+
+    set_project(&store, "d", Some("  let-em-loose ")).unwrap();
+    assert_eq!(project_of(&store, "d").as_deref(), Some("let-em-loose"));
+    // Omitted, the project stays; only the content changes.
+    set_project(&store, "d", None).unwrap();
+    assert_eq!(project_of(&store, "d").as_deref(), Some("let-em-loose"));
+    // It replaces a detected project too.
+    set_project(&store, "a", Some("let-em-loose")).unwrap();
+    assert_eq!(project_of(&store, "a").as_deref(), Some("let-em-loose"));
+}
+
+#[test]
+fn an_update_refuses_a_bad_project_and_writes_nothing() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    fixture(&store);
+
+    for bad in ["two\nlines".to_string(), "p".repeat(201)] {
+        let err = set_project(&store, "a", Some(&bad)).unwrap_err();
+        assert!(matches!(err, StoreError::Invalid(_)), "{err:?}");
+    }
+    assert_eq!(project_of(&store, "a").as_deref(), Some("Rusty"));
+    // Blank is "not given": with nothing else set, there is nothing to do.
+    assert!(matches!(
+        set_project(&store, "a", Some("   ")).unwrap(),
+        UpdateOutcome::NoFields
+    ));
 }
 
 #[test]

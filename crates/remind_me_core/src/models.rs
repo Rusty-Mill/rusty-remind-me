@@ -584,6 +584,11 @@ pub struct MemoryUpdateInput {
     /// way (`models.py:391`, `default=False`).
     #[serde(default)]
     pub clear_superseded: bool,
+    /// Set the memory's project, validated as on
+    /// [`MemoryAddInput`]'s: trimmed, single line, at most 200 bytes. `None`
+    /// or blank leaves it alone; there is no way to clear it to null here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
 }
 
 /// Outcome of an update attempt.

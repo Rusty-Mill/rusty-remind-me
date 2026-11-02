@@ -17,7 +17,11 @@ fn server() -> McpServer {
 }
 
 fn add(s: &McpServer, args: Value, forwarded: bool) -> Value {
-    let mut params = json!({ "name": "remind_me_add", "arguments": args });
+    call(s, "remind_me_add", args, forwarded)
+}
+
+fn call(s: &McpServer, tool: &str, args: Value, forwarded: bool) -> Value {
+    let mut params = json!({ "name": tool, "arguments": args });
     if forwarded {
         params["_meta"] = json!({ CALLER_META_KEY: "claude-ai/1.0" });
     }
@@ -57,4 +61,20 @@ fn a_local_add_still_detects_its_directory() {
     let s = server();
     let local = add(&s, json!({ "content": "local" }), false);
     assert_ne!(local["cwd"], Value::Null, "{local}");
+}
+
+#[test]
+fn a_forwarded_update_sets_the_project() {
+    // The #592 backfill path: the connector sets a project on an old memory.
+    let s = server();
+    let old = add(&s, json!({ "content": "written before #592" }), true);
+    assert_eq!(old["project"], Value::Null);
+    let updated = call(
+        &s,
+        "remind_me_update",
+        json!({ "memory_id": old["id"], "project": "let-em-loose" }),
+        true,
+    );
+    assert_eq!(updated["project"], "let-em-loose", "{updated}");
+    assert_eq!(updated["content"], "written before #592");
 }

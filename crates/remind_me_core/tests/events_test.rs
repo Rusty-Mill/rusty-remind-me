@@ -128,6 +128,7 @@ fn each_mutation_kind_emits_its_own_event() {
     remind_me_core::db::queries::update_memory(
         &store,
         &remind_me_core::models::MemoryUpdateInput {
+            project: None,
             memory_id: id.clone(),
             clear_superseded: false,
             content: Some("something else".into()),

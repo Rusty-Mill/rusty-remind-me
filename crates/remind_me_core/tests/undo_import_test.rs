@@ -271,6 +271,7 @@ fn an_edited_imported_memory_is_still_removed() {
     remind_me_core::db::queries::update_memory(
         &store,
         &remind_me_core::MemoryUpdateInput {
+            project: None,
             sensitive: None,
             memory_id: "mem_edited".into(),
             content: Some("hand-edited afterwards".into()),
