@@ -2,6 +2,11 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-02 — 0.4.2: version bump
+
+### Changed
+- All workspace crates and the plugin manifest are now 0.4.2, so a build that includes #358 and #359 (explicit `project` on add, capture and update) can be told apart from 0.4.1. The code is otherwise unchanged.
+
 ## 2026-11-02 — Set a memory's project on update (#592)
 
 ### Added
