@@ -487,18 +487,29 @@ impl ScopeFilter {
 
     /// This filter with `project_status` joined against the project
     /// registry: the names and aliases of every project with that status.
+    /// An alias that is another project's canonical name belongs to that
+    /// project, as in [`crate::entity::resolve_entity`].
     /// Without a `project_status` it is returned unchanged.
     pub fn resolve(&self, store: &crate::db::Store<'_>) -> crate::db::Result<Self> {
+        use crate::entity::normalize_entity_name as normalize;
         let Some(status) = self.project_status else {
             return Ok(self.clone());
         };
-        let names = crate::project::list(store)?
-            .projects
-            .into_iter()
-            .filter(|p| p.status.value == status)
-            .flat_map(|p| std::iter::once(p.entity.name).chain(p.entity.aliases))
-            .map(|name| crate::entity::normalize_entity_name(&name))
-            .collect();
+        let projects = crate::project::list(store)?.projects;
+        let canonical: std::collections::BTreeSet<String> =
+            projects.iter().map(|p| normalize(&p.entity.name)).collect();
+        let mut names = std::collections::BTreeSet::new();
+        for project in projects.iter().filter(|p| p.status.value == status) {
+            names.insert(normalize(&project.entity.name));
+            names.extend(
+                project
+                    .entity
+                    .aliases
+                    .iter()
+                    .map(|alias| normalize(alias))
+                    .filter(|alias| !canonical.contains(alias)),
+            );
+        }
         Ok(Self {
             status_projects: Some(StatusProjects(names)),
             ..self.clone()

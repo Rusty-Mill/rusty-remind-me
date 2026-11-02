@@ -587,6 +587,47 @@ fn project_status_narrows_list_and_search_to_registered_projects() {
     assert_eq!(only_fixture(list(&store, active_main)), ["a"]);
 }
 
+fn alias(store: &Store<'_>, name: &str, alias: &str) {
+    remind_me_core::entity::upsert_entity(
+        store,
+        &remind_me_core::models::EntityInput {
+            name: name.into(),
+            kind: None,
+            aliases: vec![alias.into()],
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn project_status_admits_a_projects_aliases() {
+    use remind_me_core::project::Status;
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    fixture(&store);
+    // "other" is an alias of the active project "Rusty Mill".
+    register(&store, "Rusty Mill", Status::Active);
+    alias(&store, "Rusty Mill", "Other");
+
+    assert_eq!(search(&store, with_status(Status::Active)), ["c"]);
+}
+
+#[test]
+fn a_canonical_project_name_beats_another_projects_alias() {
+    use remind_me_core::project::Status;
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    fixture(&store);
+    // The active project claims "other" as an alias, but "other" is a
+    // dormant project's own name, so its memories stay dormant only.
+    register(&store, "Rusty", Status::Active);
+    register(&store, "other", Status::Dormant);
+    alias(&store, "Rusty", "Other");
+
+    assert_eq!(search(&store, with_status(Status::Active)), ["a", "b"]);
+    assert_eq!(search(&store, with_status(Status::Dormant)), ["c"]);
+}
+
 #[test]
 fn project_status_deserialises_from_flat_tool_arguments() {
     use remind_me_core::project::Status;
