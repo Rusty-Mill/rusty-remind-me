@@ -10,13 +10,13 @@ Dated entries, newest first. One entry per merged pull request.
 - A card behind digits that happen to pass Luhn (`4000 0000 0000 4111 1111 1111 1111`) was redacted only up to the first valid window, leaving `1111 1111 1111` of the real card visible. Every valid window is redacted now, and overlapping ones merge, so the whole run goes.
 - Diners cards written `4-6-4` (14 digits, prefix 36, 38 or 300–305) were documented but could never match. They now do.
 - The session archive scrub (`boundary::scrub_jsonl`) redacted JSON strings only, so a card stored as a JSON number survived. A number that redacts is replaced by the redacted string.
-- Repeated anchors (`sk-sk-sk-…`, `glpat-…`, `-AIza…`, `eyJ…`) made the scan quadratic on the write path: 200 KB of `sk-` took about 3 s. Anchors inside a run already scanned are skipped and the Google key run is capped, so each scan is linear.
+- Repeated anchors (`sk-sk-sk-…`, `glpat-…`, `-AIza…`, `eyJ…`) made the scan quadratic on the write path: 200 KB of `sk-` took about 3 s. An anchor whose whole prefix lies inside a run already scanned is skipped, and the Google key run is capped, so each scan is linear. An anchor whose prefix crosses the end of the earlier run (`ghp_ghp_<token>`) is still scanned.
 
 ### Not changed
 - A space-separated list of four four-digit numbers that happens to pass a network prefix and Luhn (`PRs 4012 4013 4015 4028`) is still redacted. Written that way it can't be told apart from a card, and over-redacting is the safe side.
 
 ### Tests
-- `redact`: slugs and branch names after `sk-`; decimals, plus a card before a full stop; the Luhn-valid prefix case; three Diners cards; 200 KB of each of five anchors within 500 ms. `boundary`: a card as a JSON number is scrubbed. All six failed on the base. The existing nested-prefix test's `sk-` bodies now carry `X9`, since an all-`a` run is no longer a key.
+- `redact`: slugs and branch names after `sk-`; decimals, plus a card before a full stop; the Luhn-valid prefix case; three Diners cards; 200 KB of each of seven anchors (including `ghp_` and `sk_live_`) within 500 ms; a token nested in an invalid outer prefix (`ghp_ghp_…`, `npm_npm_…`, `sk_live_sk_live_…`, `whsec_whsec_…`) and a valid token followed by such a pair lose their whole bodies. `boundary`: a card as a JSON number is scrubbed. All six failed on the base. The existing nested-prefix test's `sk-` bodies now carry `X9`, since an all-`a` run is no longer a key.
 
 ## 2026-11-03 — Capture keeps posted messages in full (card #706)
 

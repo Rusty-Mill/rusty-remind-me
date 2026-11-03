@@ -154,10 +154,13 @@ fn prefixed(text: &str, prefixes: &[&str], ok: fn(u8) -> bool, min: usize) -> Ra
     prefixed_where(text, prefixes, ok, min, |_| true)
 }
 
-/// [`prefixed`], keeping only runs `keep` accepts. An anchor inside a run
-/// already scanned is skipped: its run is a suffix of that one, so it can
-/// only be shorter with fewer kinds of byte, and rescanning it from every
-/// such anchor made repeated prefixes quadratic (#353).
+/// [`prefixed`], keeping only runs `keep` accepts. An anchor whose whole
+/// prefix lies inside the run already scanned is skipped: its own run then
+/// ends where that one does, so it is a suffix that can only be shorter with
+/// fewer kinds of byte, and rescanning it from every such anchor made
+/// repeated prefixes quadratic (#353). An anchor whose prefix holds a byte
+/// the run stops at (`ghp_ghp_…`, where `_` ends an alphanumeric run) is
+/// scanned, since its body starts past where the earlier run ended.
 fn prefixed_where(
     text: &str,
     prefixes: &[&str],
@@ -168,14 +171,15 @@ fn prefixed_where(
     let bytes = text.as_bytes();
     let mut out = Ranges::new();
     for prefix in prefixes {
-        let mut floor = 0;
+        let mut scanned = (0, 0);
         for i in anchors(text, prefix) {
-            if i < floor {
+            if scanned.0 <= i && i + prefix.len() <= scanned.1 {
                 continue;
             }
             let from = i + prefix.len();
             let n = run(bytes, from, ok);
-            floor = from + n;
+            let floor = from + n;
+            scanned = (from, floor);
             if n >= min && keep(&bytes[from..floor]) {
                 out.push((i, floor));
             }
@@ -832,8 +836,39 @@ mod tests {
     }
 
     #[test]
+    fn a_token_nested_in_an_invalid_outer_prefix_is_redacted() {
+        let body = "aB3d".repeat(9);
+        for (text, kind) in [
+            (format!("ghp_ghp_{body}"), "github_token"),
+            (format!("npm_npm_{body}"), "npm_token"),
+            (format!("sk_live_sk_live_{body}"), "stripe_key"),
+            (format!("whsec_whsec_{body}"), "stripe_key"),
+        ] {
+            let r = redact(&format!("x {text} y"));
+            assert!(!r.content.contains(&body), "{text}: {}", r.content);
+            assert_eq!(r.hits, vec![kind], "{text}");
+        }
+    }
+
+    #[test]
+    fn a_valid_token_then_a_nested_one_both_lose_their_bodies() {
+        let first = "aB3d".repeat(9);
+        let second = "Zy9x".repeat(9);
+        for (prefix, kind) in [("ghp_", "github_token"), ("sk_live_", "stripe_key")] {
+            let text = format!("{prefix}{first} {prefix}{prefix}{second}");
+            let r = redact(&text);
+            assert!(
+                !r.content.contains(&first) && !r.content.contains(&second),
+                "{text}: {}",
+                r.content
+            );
+            assert_eq!(r.hits, vec![kind], "{text}");
+        }
+    }
+
+    #[test]
     fn repeated_anchors_redact_in_linear_time() {
-        for anchor in ["sk-", "glpat-", "-AIza", "eyJ", "xoxb-"] {
+        for anchor in ["sk-", "glpat-", "-AIza", "eyJ", "xoxb-", "ghp_", "sk_live_"] {
             let text = anchor.repeat(200_000 / anchor.len());
             let started = std::time::Instant::now();
             redact(&text);
