@@ -32,8 +32,9 @@
 //!
 //! It also returns `None` for a backend chosen without a setting it cannot
 //! embed without (`openai`'s model, `onnx`'s two paths): such an embedder
-//! has no identity to compare stored vectors against, and treating its
-//! blank one as a model change would clear them all on open (#351).
+//! cannot embed, so it has no identity to compare stored vectors against.
+//! For the settings in the identity (`openai`'s model, `onnx`'s model path)
+//! treating the blank one as a model change cleared them all on open (#351).
 //! [`configured_embedder`] keeps that case apart so status can name the
 //! missing setting.
 
@@ -858,11 +859,11 @@ fn availability_cell() -> &'static Mutex<Option<AvailabilityCache>> {
     AVAILABILITY.get_or_init(|| Mutex::new(None))
 }
 
-/// Every environment variable [`resolve_embedder`] reads, joined into one
+/// Every environment variable [`configured_embedder`] reads, joined into one
 /// value that changes whenever the resolved embedder would.
 ///
 /// This exists because [`available_embedder`]'s cache is keyed on it, and
-/// that is what keeps `resolve_embedder`'s documented promise — "a
+/// that is what keeps `configured_embedder`'s documented promise — "a
 /// configuration change takes effect on the next search rather than requiring
 /// a restart" — true of the *availability-gated* resolver too. Without it a
 /// verdict reached about one backend answered for a different one: point the
@@ -901,10 +902,11 @@ pub enum ConfiguredEmbedder {
     /// A backend is named but a setting it cannot embed without is unset or
     /// blank; `reason` names that setting.
     ///
-    /// It has no identity, so nothing compares, clears or records vectors
-    /// against it (#351): an identity built from a missing setting would
-    /// differ from the stored one and clear every vector on the next open,
-    /// leaving nothing to re-embed them with.
+    /// It cannot embed, so it has no identity and nothing compares, clears
+    /// or records vectors against it (#351). An identity built from a blank
+    /// model setting (`openai`'s model, `onnx`'s model path) would differ
+    /// from the stored one and clear every vector on the next open, leaving
+    /// nothing to re-embed them with.
     Unusable { reason: String },
     /// A backend with every setting it needs. It may still be unreachable;
     /// [`available_embedder`] probes that.
