@@ -384,6 +384,38 @@ fn a_stale_dimension_vector_is_skipped_rather_than_crashing_the_scan() {
     );
 }
 
+#[test]
+fn a_stored_nan_vector_neither_panics_the_ranking_nor_matches() {
+    // A vector stored before embeddings were validated may hold NaN, whose
+    // similarity has no order. Enough of them used to break the sort's total
+    // order (#352); they must be skipped and the finite matches still ranked.
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let nan: Vec<u8> = [f32::NAN, f32::NAN]
+        .iter()
+        .flat_map(|x| x.to_le_bytes())
+        .collect();
+    let mut finite = Vec::new();
+    for i in 0..40 {
+        let id = add(&store, &format!("memory {i}"));
+        if i % 2 == 0 {
+            Vectors::new(&store).put(&id, 0, &nan).unwrap();
+            continue;
+        }
+        let x = i as f32 / 40.0;
+        let bytes: Vec<u8> = [x, 1.0 - x].iter().flat_map(|v| v.to_le_bytes()).collect();
+        Vectors::new(&store).put(&id, 0, &bytes).unwrap();
+        finite.push(id);
+    }
+
+    let embedder = FakeEmbedder::new(2).with("query", vec![1.0, 0.0]);
+    let results = semantic_search(&store, &embedder, "query", 40, None).unwrap();
+
+    let ids: Vec<String> = results.into_iter().map(|m| m.id).collect();
+    finite.reverse();
+    assert_eq!(ids, finite, "only finite matches, best first");
+}
+
 // ---------------------------------------------------------------------------
 // Reindex
 // ---------------------------------------------------------------------------

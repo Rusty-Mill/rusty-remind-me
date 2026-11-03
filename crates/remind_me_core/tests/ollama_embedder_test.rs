@@ -224,3 +224,16 @@ fn a_batch_larger_than_the_forward_batch_size_is_split_across_multiple_requests(
         "the batch was split into exactly two HTTP requests"
     );
 }
+
+#[test]
+fn a_null_embedding_element_is_an_error_not_a_zero() {
+    let (url, handle) = fake_server(vec![r#"{"embeddings":[[1.0,null]]}"#.to_string()]);
+    let embedder = OllamaEmbedder::new("nomic-embed-text", url, 2);
+
+    let err = embedder
+        .embed(&["hello".to_string()], EmbedRole::Passage)
+        .unwrap_err();
+
+    assert!(err.0.contains("element 1 is not a finite number"), "{err}");
+    handle.join().unwrap();
+}
