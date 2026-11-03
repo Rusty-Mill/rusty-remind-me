@@ -159,7 +159,18 @@ pub struct ToolUseSummary {
     pub name: String,
     /// First [`TOOL_INPUT_CHARS`] characters of the call's main argument.
     pub input_summary: String,
+    /// The call's whole `input`, for a reader that keeps one argument in
+    /// full (a transcript capture keeps a posted message's text).
+    pub input: serde_json::Value,
     pub is_error: bool,
+}
+
+impl ToolUseSummary {
+    /// `tool: <name> — <shown>`, marked when the call failed.
+    pub fn line(&self, shown: &str) -> String {
+        let err = if self.is_error { " (error)" } else { "" };
+        format!("tool: {} — {shown}{err}", self.name)
+    }
 }
 
 /// Cap on [`ToolUseSummary::input_summary`].
@@ -183,10 +194,7 @@ impl ChatMessage {
     pub fn tool_lines(&self) -> Vec<String> {
         self.tool_use
             .iter()
-            .map(|t| {
-                let err = if t.is_error { " (error)" } else { "" };
-                format!("tool: {} — {}{err}", t.name, t.input_summary)
-            })
+            .map(|t| t.line(&t.input_summary))
             .collect()
     }
 }
@@ -227,17 +235,21 @@ fn tool_use_of(content: &serde_json::Value) -> Vec<ToolUseSummary> {
     blocks
         .iter()
         .filter(|b| kind(b).as_deref() == Some("tool_use"))
-        .map(|b| ToolUseSummary {
-            name: b
-                .get("name")
-                .and_then(|n| n.as_str())
-                .unwrap_or("unknown")
-                .to_string(),
-            input_summary: summarize_tool_input(b.get("input").unwrap_or(&serde_json::Value::Null)),
-            is_error: b
-                .get("id")
-                .and_then(|i| i.as_str())
-                .is_some_and(|id| failed.contains(&id)),
+        .map(|b| {
+            let input = b.get("input").cloned().unwrap_or(serde_json::Value::Null);
+            ToolUseSummary {
+                name: b
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("unknown")
+                    .to_string(),
+                input_summary: summarize_tool_input(&input),
+                input,
+                is_error: b
+                    .get("id")
+                    .and_then(|i| i.as_str())
+                    .is_some_and(|id| failed.contains(&id)),
+            }
         })
         .collect()
 }

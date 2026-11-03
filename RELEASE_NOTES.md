@@ -2,6 +2,17 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-03 — Capture keeps posted messages in full (card #706)
+
+### Fixed
+- A transcript capture kept only a 200-character preview of every tool call, so a claude.ai thread, which replies through `mcp__hearthbot__post_message`, was saved with its replies cut mid-sentence, and its summary said "Last reply: (none)". The text a message tool posts is now kept in full in the dialog, and the last posted message is the summary's "Last reply" when nothing plainly said comes after it. Other tools keep their preview. A session captured before this is fixed on its next recapture.
+
+### Added
+- `REMIND_ME_MESSAGE_TOOLS`: the message tools, as comma-separated `tool=argument` pairs. Unset means `mcp__hearthbot__post_message=text`; blank means none; a malformed value is reported and the default used.
+
+### Tests
+- `transcript`: a posted message is kept in full and is the last reply while another tool in the same message keeps its preview; a tool left out of the setting keeps its preview; the setting's defaults, blank value, whitespace and malformed pairs.
+
 ## 2026-11-02 — 0.4.2: version bump
 
 ### Changed
