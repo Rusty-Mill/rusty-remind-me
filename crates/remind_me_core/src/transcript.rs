@@ -14,7 +14,7 @@ use crate::capture::{auto_capture_stamped, get_capture, CaptureStamp};
 use crate::db::memories::{Memories, MemoryEdit};
 use crate::db::{Result, Store, StoreError};
 use crate::history::{capture_revision, TrackedChanges};
-use crate::importer::{extract_messages_with_tools, ChatMessage};
+use crate::importer::{extract_messages_with_tools, ChatMessage, ToolUseSummary};
 use crate::models::{AutoCaptureInput, WriteContext};
 use chrono::Utc;
 use std::collections::BTreeMap;
@@ -48,6 +48,86 @@ pub fn encoded_len(text: &str) -> usize {
 
 const TRUNCATION_MARKER: &str = "[earlier messages truncated]\n\n";
 
+/// Names the tools whose call posts a message the user reads, as
+/// `tool=argument` pairs separated by commas. Unset means
+/// [`MessageTools::defaults`]; set but blank means none.
+pub const MESSAGE_TOOLS_ENV: &str = "REMIND_ME_MESSAGE_TOOLS";
+
+/// A tool whose call posts a message the user reads, and the argument that
+/// holds the message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageTool {
+    pub name: String,
+    pub arg: String,
+}
+
+/// The tools whose posted message a capture keeps in full and counts as a
+/// reply. A session that talks through such a tool (a claude.ai thread
+/// posting with `mcp__hearthbot__post_message`) says its substance there,
+/// not in plain assistant text. Every other tool keeps its short preview.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageTools(pub Vec<MessageTool>);
+
+impl MessageTools {
+    /// The thread reply tool of claude.ai projects.
+    pub fn defaults() -> Self {
+        Self(vec![MessageTool {
+            name: "mcp__hearthbot__post_message".into(),
+            arg: "text".into(),
+        }])
+    }
+
+    /// The list a [`MESSAGE_TOOLS_ENV`] value names: `None` (unset) is the
+    /// defaults, a blank value is none, anything else must be well formed.
+    pub fn from_setting(value: Option<&str>) -> std::result::Result<Self, String> {
+        let Some(value) = value else {
+            return Ok(Self::defaults());
+        };
+        if value.trim().is_empty() {
+            return Ok(Self(Vec::new()));
+        }
+        value
+            .split(',')
+            .map(parse_pair)
+            .collect::<std::result::Result<_, _>>()
+            .map(Self)
+    }
+
+    /// [`Self::from_setting`] of the environment. A malformed value is
+    /// reported and the defaults used, so a typo never stops a capture.
+    pub fn from_env() -> Self {
+        let value = std::env::var(MESSAGE_TOOLS_ENV).ok();
+        Self::from_setting(value.as_deref()).unwrap_or_else(|e| {
+            eprintln!("rusty-remind-me: {MESSAGE_TOOLS_ENV} ignored: {e}");
+            Self::defaults()
+        })
+    }
+
+    /// The message `call` posted, when it is one of these tools and the
+    /// argument holds text.
+    fn posted<'a>(&self, call: &'a ToolUseSummary) -> Option<&'a str> {
+        let tool = self.0.iter().find(|t| t.name == call.name)?;
+        call.input
+            .get(&tool.arg)
+            .and_then(serde_json::Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+    }
+}
+
+/// One `tool=argument` pair of a [`MESSAGE_TOOLS_ENV`] value.
+fn parse_pair(pair: &str) -> std::result::Result<MessageTool, String> {
+    let malformed = || format!("`{}` is not tool=argument", pair.trim());
+    let (name, arg) = pair.split_once('=').ok_or_else(malformed)?;
+    let (name, arg) = (name.trim(), arg.trim());
+    if name.is_empty() || arg.is_empty() || arg.contains('=') {
+        return Err(malformed());
+    }
+    Ok(MessageTool {
+        name: name.into(),
+        arg: arg.into(),
+    })
+}
+
 /// What a transcript says, ready to store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptSummary {
@@ -75,9 +155,16 @@ fn cut(text: &str, chars: usize) -> String {
     text.chars().take(chars).collect()
 }
 
+/// [`parse_with`] the message tools the environment names.
+pub fn parse(raw: &str) -> TranscriptSummary {
+    parse_with(raw, &MessageTools::from_env())
+}
+
 /// Read a Claude Code JSONL transcript. A malformed line is skipped, as the
 /// importer skips one: a half-written last line must not lose the session.
-pub fn parse(raw: &str) -> TranscriptSummary {
+/// A message posted through one of `message_tools` is kept in full and is
+/// the session's reply wherever it comes last.
+pub fn parse_with(raw: &str, message_tools: &MessageTools) -> TranscriptSummary {
     let messages: Vec<ChatMessage> = raw
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
@@ -102,27 +189,80 @@ pub fn parse(raw: &str) -> TranscriptSummary {
         last_assistant: messages
             .iter()
             .rev()
-            .find(|m| m.role == "assistant" && !m.content.is_empty())
-            .map(|m| m.content.clone()),
+            .filter(|m| m.role == "assistant")
+            .find_map(|m| reply_of(m, message_tools))
+            .map(str::to_string),
         tools,
-        dialog: render_dialog(&messages),
+        dialog: render_dialog(&messages, message_tools),
         session_id: messages.iter().find_map(|m| m.session_id.clone()),
         cwd: messages.iter().find_map(|m| m.cwd.clone()),
         git_branch: messages.iter().find_map(|m| m.git_branch.clone()),
     }
 }
 
-fn render_dialog(messages: &[ChatMessage]) -> String {
+/// One piece of a message, in the order it was written.
+enum Part<'a> {
+    Text(&'a str),
+    Tool(&'a ToolUseSummary),
+}
+
+/// A message's text blocks and tool calls in content order. A message with
+/// no text blocks or no calls is its text, then its calls, so text-only
+/// messages render exactly as their joined content.
+fn parts(message: &ChatMessage) -> Vec<Part<'_>> {
+    if message.text_blocks.is_empty() || message.tool_use.is_empty() {
+        let text = (!message.content.is_empty()).then_some(Part::Text(&message.content));
+        return text
+            .into_iter()
+            .chain(message.tool_use.iter().map(Part::Tool))
+            .collect();
+    }
+    let mut ordered: Vec<(usize, Part<'_>)> = message
+        .text_blocks
+        .iter()
+        .map(|t| (t.block, Part::Text(&t.text)))
+        .chain(message.tool_use.iter().map(|c| (c.block, Part::Tool(c))))
+        .collect();
+    ordered.sort_by_key(|(block, _)| *block);
+    ordered.into_iter().map(|(_, part)| part).collect()
+}
+
+/// What an assistant message said last: the last of its text blocks and
+/// posted messages, in content order.
+fn reply_of<'a>(message: &'a ChatMessage, message_tools: &MessageTools) -> Option<&'a str> {
+    parts(message)
+        .into_iter()
+        .rev()
+        .find_map(|part| match part {
+            Part::Text(text) => Some(text.trim()),
+            Part::Tool(call) => message_tools.posted(call),
+        })
+}
+
+/// A message as one dialog block, `**role:** ` then its text and tool lines
+/// in content order: a message tool's text in full, any other tool's preview.
+fn render_message(message: &ChatMessage, message_tools: &MessageTools) -> String {
+    let lines: Vec<String> = parts(message)
+        .into_iter()
+        .map(|part| match part {
+            Part::Text(text) => text.to_string(),
+            Part::Tool(call) => {
+                call.line(message_tools.posted(call).unwrap_or(&call.input_summary))
+            }
+        })
+        .collect();
+    let separator = if message.content.is_empty() { "\n" } else { "" };
+    format!(
+        "**{}:** {separator}{}",
+        message.role,
+        lines.join("\n").trim()
+    )
+}
+
+fn render_dialog(messages: &[ChatMessage], message_tools: &MessageTools) -> String {
     let dialog = messages
         .iter()
-        .map(|m| {
-            let mut block = format!("**{}:** {}", m.role, m.content);
-            for line in m.tool_lines() {
-                block.push('\n');
-                block.push_str(&line);
-            }
-            block
-        })
+        .map(|m| render_message(m, message_tools))
         .collect::<Vec<_>>()
         .join("\n\n");
     let total = dialog.chars().count();
@@ -556,6 +696,149 @@ mod tests {
         let summary = p.summary();
         assert!(summary.starts_with("First ask: fix the flaky test please\nLast reply: done"));
         assert!(summary.ends_with("Messages: 3\nTools used: Bash x1"));
+    }
+
+    fn post_line(text: &str) -> String {
+        serde_json::json!({
+            "type": "assistant", "sessionId": "s1",
+            "timestamp": "2026-10-04T10:00:09.000Z",
+            "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t2", "name": "mcp__hearthbot__post_message",
+                 "input": {"text": text}},
+                {"type": "tool_use", "id": "t3", "name": "Bash",
+                 "input": {"command": "z".repeat(400)}}
+            ]}
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn a_posted_message_is_kept_in_full_and_is_the_last_reply() {
+        let posted = format!("Dream-RSI is the best fit.\n\n{}", "Because ".repeat(100));
+        let raw = [transcript(""), post_line(&posted)].join("\n");
+        let p = parse_with(&raw, &MessageTools::defaults());
+        assert!(
+            p.dialog
+                .contains(&format!("tool: mcp__hearthbot__post_message — {posted}")),
+            "{}",
+            p.dialog
+        );
+        // Other tools keep their short preview.
+        assert!(
+            p.dialog
+                .contains(&format!("tool: Bash — {}\n", "z".repeat(200)))
+                || p.dialog
+                    .ends_with(&format!("tool: Bash — {}", "z".repeat(200)))
+        );
+        assert!(!p.dialog.contains(&"z".repeat(201)));
+        assert_eq!(p.last_assistant.as_deref(), Some(posted.as_str()));
+        assert!(p
+            .summary()
+            .contains("Last reply: Dream-RSI is the best fit.\n\nBecause"));
+    }
+
+    fn mixed_line(blocks: serde_json::Value) -> String {
+        serde_json::json!({
+            "type": "assistant", "sessionId": "s1",
+            "message": {"role": "assistant", "content": blocks}
+        })
+        .to_string()
+    }
+
+    fn post(text: &str) -> serde_json::Value {
+        serde_json::json!({"type": "tool_use", "id": format!("t-{text}"),
+            "name": "mcp__hearthbot__post_message", "input": {"text": text}})
+    }
+
+    fn said(text: &str) -> serde_json::Value {
+        serde_json::json!({"type": "text", "text": text})
+    }
+
+    /// The reply and dialog of one assistant message made of `blocks`.
+    fn read(blocks: serde_json::Value) -> (Option<String>, String) {
+        let p = parse_with(&mixed_line(blocks), &MessageTools::defaults());
+        (p.last_assistant, p.dialog)
+    }
+
+    #[test]
+    fn the_last_reply_and_the_dialog_follow_block_order() {
+        let (reply, dialog) = read(serde_json::json!([said("first"), post("posted")]));
+        assert_eq!(reply.as_deref(), Some("posted"));
+        assert_eq!(
+            dialog,
+            "**assistant:** first\ntool: mcp__hearthbot__post_message — posted"
+        );
+
+        let (reply, dialog) = read(serde_json::json!([
+            post("Initial answer"),
+            said("Correction")
+        ]));
+        assert_eq!(reply.as_deref(), Some("Correction"));
+        assert_eq!(
+            dialog,
+            "**assistant:** tool: mcp__hearthbot__post_message — Initial answer\nCorrection"
+        );
+
+        let blocks = serde_json::json!([said("a"), post("b"), said("c"), post("d")]);
+        assert_eq!(read(blocks).0.as_deref(), Some("d"));
+        let blocks = serde_json::json!([post("a"), said("b"), post("c"), said("d")]);
+        let (reply, dialog) = read(blocks);
+        assert_eq!(reply.as_deref(), Some("d"));
+        assert!(dialog.ends_with("— a\nb\ntool: mcp__hearthbot__post_message — c\nd"));
+    }
+
+    #[test]
+    fn text_blocks_keep_their_inner_whitespace() {
+        let code = serde_json::json!([said("```python\nif ready:"), said("    run()\n```")]);
+        assert!(read(code).1.contains("if ready:\n    run()\n```"));
+        let mixed = serde_json::json!([
+            said("```python\nif ready:"),
+            said("    run()\n```"),
+            post("p")
+        ]);
+        let (reply, dialog) = read(mixed);
+        assert!(
+            dialog.contains("if ready:\n    run()\n```\ntool:"),
+            "{dialog}"
+        );
+        assert_eq!(reply.as_deref(), Some("p"));
+        let (reply, _) = read(serde_json::json!([post("p"), said("  later  ")]));
+        assert_eq!(reply.as_deref(), Some("later"));
+    }
+
+    #[test]
+    fn a_tool_left_out_of_the_setting_keeps_its_preview() {
+        let posted = "p".repeat(400);
+        let raw = [line("user", "s1", "hi"), post_line(&posted)].join("\n");
+        let p = parse_with(&raw, &MessageTools::from_setting(Some("")).unwrap());
+        assert!(!p.dialog.contains(&posted));
+        assert_eq!(p.last_assistant, None);
+        assert!(p.summary().contains("Last reply: (none)"));
+    }
+
+    #[test]
+    fn the_message_tool_setting_is_explicit_and_validated() {
+        assert_eq!(
+            MessageTools::from_setting(None).unwrap(),
+            MessageTools::defaults()
+        );
+        let set = MessageTools::from_setting(Some(" a__post=text , b=body ")).unwrap();
+        assert_eq!(
+            set,
+            MessageTools(vec![
+                MessageTool {
+                    name: "a__post".into(),
+                    arg: "text".into()
+                },
+                MessageTool {
+                    name: "b".into(),
+                    arg: "body".into()
+                },
+            ])
+        );
+        for bad in ["post_message", "=text", "a=", "a=b,,c=d", "a=b=c"] {
+            assert!(MessageTools::from_setting(Some(bad)).is_err(), "{bad}");
+        }
     }
 
     #[test]

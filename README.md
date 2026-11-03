@@ -290,6 +290,8 @@ Three different connections, each with a different trigger:
 
 The hooks and the slash commands both bypass MCP entirely — they invoke the plain CLI binary as a subprocess and never speak the MCP JSON-RPC protocol. The hooks degrade safely: if `rusty-remind-me` isn't on `PATH` yet, or the store is empty, they emit `{"continue": true}` (optionally with a one-line `systemMessage` nudge to build the binary) and always exit 0, so they cannot fail a session. They write with `written_by = hook`. `REMIND_ME_HOOKS=0` turns every hook off and `REMIND_ME_PROMPT_CONTEXT=0` turns off only the per-prompt injection. `scripts/test_hooks.sh` drives each hook end to end against a built binary. The slash commands surface the same "not on PATH" condition as plain shell output for the model to relay, rather than silently retrying some other way.
 
+A captured dialog keeps each tool call as one line with a 200-character preview of its main argument, except for tools that post a message the user reads: their message is kept in full, and the last one posted is the summary's "Last reply" when it comes after the session's last plain text. `REMIND_ME_MESSAGE_TOOLS` names them as comma-separated `tool=argument` pairs; unset, it is `mcp__hearthbot__post_message=text` (the claude.ai project thread reply), and set but blank, it is none. A malformed value is reported on stderr and the default used.
+
 To use it, `rusty-remind-me` must be on `PATH` (`cargo build --release -p rusty-remind-me` then add `target/release` to `PATH`, or `cargo install --path crates/remind_me_cli`), then add this repository as a plugin marketplace in Claude Code (see [Connect it to a client](#2-connect-it-to-a-client)).
 
 ### Cloud sessions (claude.ai Projects)
