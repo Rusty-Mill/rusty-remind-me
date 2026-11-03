@@ -161,7 +161,8 @@ pub struct ChatMessage {
 pub struct TextBlock {
     /// Index of the block in the content array.
     pub block: usize,
-    /// Its text, trimmed.
+    /// Its text as written: inner whitespace (a code block's indentation)
+    /// is kept.
     pub text: String,
 }
 
@@ -329,8 +330,8 @@ fn text_blocks(content: &serde_json::Value) -> Vec<TextBlock> {
         .iter()
         .enumerate()
         .filter_map(|(block, b)| {
-            let text = block_text(b)?.trim().to_string();
-            (!text.is_empty()).then_some(TextBlock { block, text })
+            let text = block_text(b).filter(|t| !t.trim().is_empty())?;
+            Some(TextBlock { block, text })
         })
         .collect()
 }

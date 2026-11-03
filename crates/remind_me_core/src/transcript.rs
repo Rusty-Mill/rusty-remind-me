@@ -206,10 +206,11 @@ enum Part<'a> {
     Tool(&'a ToolUseSummary),
 }
 
-/// A message's text blocks and tool calls in content order. Bare-string
-/// content (no blocks) is its text, then its calls.
+/// A message's text blocks and tool calls in content order. A message with
+/// no text blocks or no calls is its text, then its calls, so text-only
+/// messages render exactly as their joined content.
 fn parts(message: &ChatMessage) -> Vec<Part<'_>> {
-    if message.text_blocks.is_empty() {
+    if message.text_blocks.is_empty() || message.tool_use.is_empty() {
         let text = (!message.content.is_empty()).then_some(Part::Text(&message.content));
         return text
             .into_iter()
@@ -233,7 +234,7 @@ fn reply_of<'a>(message: &'a ChatMessage, message_tools: &MessageTools) -> Optio
         .into_iter()
         .rev()
         .find_map(|part| match part {
-            Part::Text(text) => Some(text),
+            Part::Text(text) => Some(text.trim()),
             Part::Tool(call) => message_tools.posted(call),
         })
 }
@@ -251,7 +252,11 @@ fn render_message(message: &ChatMessage, message_tools: &MessageTools) -> String
         })
         .collect();
     let separator = if message.content.is_empty() { "\n" } else { "" };
-    format!("**{}:** {separator}{}", message.role, lines.join("\n"))
+    format!(
+        "**{}:** {separator}{}",
+        message.role,
+        lines.join("\n").trim()
+    )
 }
 
 fn render_dialog(messages: &[ChatMessage], message_tools: &MessageTools) -> String {
@@ -780,6 +785,25 @@ mod tests {
         let (reply, dialog) = read(blocks);
         assert_eq!(reply.as_deref(), Some("d"));
         assert!(dialog.ends_with("— a\nb\ntool: mcp__hearthbot__post_message — c\nd"));
+    }
+
+    #[test]
+    fn text_blocks_keep_their_inner_whitespace() {
+        let code = serde_json::json!([said("```python\nif ready:"), said("    run()\n```")]);
+        assert!(read(code).1.contains("if ready:\n    run()\n```"));
+        let mixed = serde_json::json!([
+            said("```python\nif ready:"),
+            said("    run()\n```"),
+            post("p")
+        ]);
+        let (reply, dialog) = read(mixed);
+        assert!(
+            dialog.contains("if ready:\n    run()\n```\ntool:"),
+            "{dialog}"
+        );
+        assert_eq!(reply.as_deref(), Some("p"));
+        let (reply, _) = read(serde_json::json!([post("p"), said("  later  ")]));
+        assert_eq!(reply.as_deref(), Some("later"));
     }
 
     #[test]
