@@ -151,13 +151,33 @@ fn aws_keys(text: &str) -> Ranges {
 /// Every `prefix` followed by at least `min` bytes satisfying `ok`; the
 /// range covers the prefix and the whole run.
 fn prefixed(text: &str, prefixes: &[&str], ok: fn(u8) -> bool, min: usize) -> Ranges {
+    prefixed_where(text, prefixes, ok, min, |_| true)
+}
+
+/// [`prefixed`], keeping only runs `keep` accepts. An anchor inside a run
+/// already scanned is skipped: its run is a suffix of that one, so it can
+/// only be shorter with fewer kinds of byte, and rescanning it from every
+/// such anchor made repeated prefixes quadratic (#353).
+fn prefixed_where(
+    text: &str,
+    prefixes: &[&str],
+    ok: fn(u8) -> bool,
+    min: usize,
+    keep: fn(&[u8]) -> bool,
+) -> Ranges {
     let bytes = text.as_bytes();
     let mut out = Ranges::new();
     for prefix in prefixes {
+        let mut floor = 0;
         for i in anchors(text, prefix) {
-            let n = run(bytes, i + prefix.len(), ok);
-            if n >= min {
-                out.push((i, i + prefix.len() + n));
+            if i < floor {
+                continue;
+            }
+            let from = i + prefix.len();
+            let n = run(bytes, from, ok);
+            floor = from + n;
+            if n >= min && keep(&bytes[from..floor]) {
+                out.push((i, floor));
             }
         }
     }
@@ -197,9 +217,17 @@ fn slack_tokens(text: &str) -> Ranges {
 
 /// OpenAI (`sk-`, `sk-proj-`) and Anthropic (`sk-ant-`) keys. Real keys run
 /// to 40+ characters; the floor of 32 leaves `sk-live-1234` style prose to
-/// the generic rule.
+/// the generic rule. A key is random, so its run mixes upper case, lower
+/// case and digits; a slug or branch name (`sk-learn-…`, `sk-1234-fix-…`)
+/// does not.
 fn llm_api_keys(text: &str) -> Ranges {
-    prefixed(text, &["sk-"], is_b64url, 32)
+    prefixed_where(text, &["sk-"], is_b64url, 32, mixes_case_and_digits)
+}
+
+fn mixes_case_and_digits(run: &[u8]) -> bool {
+    run.iter().any(u8::is_ascii_uppercase)
+        && run.iter().any(u8::is_ascii_lowercase)
+        && run.iter().any(u8::is_ascii_digit)
 }
 
 fn stripe_keys(text: &str) -> Ranges {
@@ -221,7 +249,12 @@ fn pypi_tokens(text: &str) -> Ranges {
 fn google_api_keys(text: &str) -> Ranges {
     let bytes = text.as_bytes();
     anchors(text, "AIza")
-        .filter(|&i| run(bytes, i + 4, is_b64url) == 35)
+        .filter(|&i| {
+            // Capped: only "exactly 35" matters, and an uncapped run from
+            // every repeated anchor is quadratic (#353).
+            let tail = &bytes[i + 4..];
+            tail.iter().take(36).take_while(|&&b| is_b64url(b)).count() == 35
+        })
         .map(|i| (i, i + 39))
         .collect()
 }
@@ -232,15 +265,18 @@ fn google_api_keys(text: &str) -> Ranges {
 /// and other long ids out.
 ///
 /// A run of separated digit groups can hold more than a card (`<pan> 12 30`,
-/// two cards side by side), so every whole-group window of it is tried,
-/// longest valid card first from the earliest group. A window never splits
-/// a group, so digits glued to a longer number stay unmatched.
+/// two cards side by side), so every whole-group window of it is tried, and
+/// the longest valid card from each group is redacted. Overlapping windows
+/// merge, so a card behind digits that happen to pass Luhn is not left
+/// half visible. A window never splits a group, so digits glued to a longer
+/// number stay unmatched, as do digits after a decimal point.
 fn card_numbers(text: &str) -> Ranges {
     let bytes = text.as_bytes();
     let mut out = Ranges::new();
     let mut i = 0;
     while i < bytes.len() {
-        if !bytes[i].is_ascii_digit() || (i > 0 && is_alnum(bytes[i - 1])) {
+        let glued = i > 0 && (is_alnum(bytes[i - 1]) || is_decimal_point(bytes, i - 1));
+        if !bytes[i].is_ascii_digit() || glued {
             i += 1;
             continue;
         }
@@ -267,13 +303,20 @@ fn digit_groups(bytes: &[u8], start: usize) -> Ranges {
     groups
 }
 
-/// Each longest whole-group window of `groups` that is a card-shaped valid
-/// card not glued to a following letter or digit, taken left to right
-/// without overlap.
+/// Whether `bytes[at]` is a `.` with a digit on both sides.
+fn is_decimal_point(bytes: &[u8], at: usize) -> bool {
+    bytes[at] == b'.'
+        && at > 0
+        && bytes[at - 1].is_ascii_digit()
+        && bytes.get(at + 1).is_some_and(u8::is_ascii_digit)
+}
+
+/// For each group of `groups`, the longest whole-group window starting there
+/// that is a card-shaped valid card not glued to a following letter, digit
+/// or decimal fraction. Windows may overlap; [`coalesce`] merges them.
 fn cards_in(bytes: &[u8], groups: &[(usize, usize)]) -> Ranges {
     let mut out = Ranges::new();
-    let mut first = 0;
-    while first < groups.len() {
+    for first in 0..groups.len() {
         let mut digits: Vec<u8> = Vec::new();
         let mut lens: Vec<usize> = Vec::new();
         let mut found = None;
@@ -283,17 +326,15 @@ fn cards_in(bytes: &[u8], groups: &[(usize, usize)]) -> Ranges {
             if digits.len() > 19 {
                 break;
             }
-            let bounded = bytes.get(end).is_none_or(|&b| !is_alnum(b));
+            let bounded = bytes
+                .get(end)
+                .is_none_or(|&b| !is_alnum(b) && !is_decimal_point(bytes, end));
             if bounded && card_shaped(&lens) && is_card(&digits) {
                 found = Some(last);
             }
         }
-        match found {
-            Some(last) => {
-                out.push((groups[first].0, groups[last].1));
-                first = last + 1;
-            }
-            None => first += 1,
+        if let Some(last) = found {
+            out.push((groups[first].0, groups[last].1));
         }
     }
     out
@@ -321,7 +362,11 @@ fn is_card(digits: &[u8]) -> bool {
     };
     let network = match digits.first() {
         Some(4) => matches!(len, 13 | 16 | 19),
-        Some(3) => matches!(prefix(2), 34 | 37) && len == 15,
+        Some(3) => match len {
+            15 => matches!(prefix(2), 34 | 37),
+            14 => matches!(prefix(2), 36 | 38) || (300..=305).contains(&prefix(3)),
+            _ => false,
+        },
         Some(5) => (51..=55).contains(&prefix(2)) && len == 16,
         Some(2) => (2221..=2720).contains(&prefix(4)) && len == 16,
         Some(6) => {
@@ -384,9 +429,15 @@ fn jwts(text: &str) -> Ranges {
         if i < floor {
             continue;
         }
-        if let Some(end) = jwt_end(bytes, i) {
-            out.push((i, end));
-            floor = end;
+        match jwt_end(bytes, i) {
+            Some(end) => {
+                out.push((i, end));
+                floor = end;
+            }
+            // An anchor inside this one's first segment ends at the same
+            // byte, so fails the same way; skipping it keeps repeated
+            // `eyJ` linear (#353).
+            None => floor = i + run(bytes, i, is_b64url),
         }
     }
     out
@@ -615,14 +666,15 @@ mod tests {
     fn nested_and_repeated_prefixes_redact_without_panicking() {
         let body = |c: &str| c.repeat(32);
         for text in [
-            format!("sk-{}-sk-{}", body("a"), body("b")),
+            // A key mixes case and digits (#353), so these runs carry `X9`.
+            format!("sk-{}X9-sk-{}X9", body("a"), body("b")),
             format!("glpat-{}-glpat-{}", body("a"), body("b")),
             format!(
                 "github_pat_{}_github_pat_{}",
                 body("a").repeat(2),
                 body("b").repeat(2)
             ),
-            format!("sk-{}sk-{} tail", body("a"), body("b")),
+            format!("sk-{}X9sk-{}X9 tail", body("a"), body("b")),
         ] {
             let r = redact(&format!("x {text} y"));
             assert!(r.content.starts_with("x [REDACTED:"), "{}", r.content);
@@ -732,5 +784,64 @@ mod tests {
         let mut meta = Value::Null;
         assert_eq!(guard("nothing here", &mut tags, &mut meta), "nothing here");
         assert!(tags.is_empty() && meta.is_null());
+    }
+
+    // #353 regressions.
+
+    #[test]
+    fn slugs_and_branch_names_after_sk_are_left_alone() {
+        for text in [
+            "use sk-learn-compatible-estimators-with-pipelines-and-grids here",
+            "branch sk-1234-fix-the-flaky-retry-in-the-sync-worker-loop",
+            "sk-proj-roadmap-for-the-next-quarter-and-the-one-after",
+        ] {
+            assert!(kinds(text).is_empty(), "{text}");
+        }
+    }
+
+    #[test]
+    fn digits_after_a_decimal_point_are_not_a_card() {
+        for text in [
+            "p = 0.5555555555554444",
+            "weight 1.4111111111111111",
+            "4111111111111111.5 is a float",
+        ] {
+            assert!(kinds(text).is_empty(), "{text}");
+        }
+        assert_eq!(
+            redact("card 4111111111111111.").content,
+            "card [REDACTED:card_number]."
+        );
+    }
+
+    #[test]
+    fn a_card_behind_a_luhn_valid_prefix_is_redacted_whole() {
+        let r = redact("x 4000 0000 0000 4111 1111 1111 1111 y");
+        assert_eq!(r.content, "x [REDACTED:card_number] y");
+    }
+
+    #[test]
+    fn a_diners_card_in_4_6_4_is_redacted() {
+        for card in ["3056 930902 5904", "30569309025904", "3852 000002 3237"] {
+            assert_eq!(
+                redact(&format!("card {card} ok")).content,
+                "card [REDACTED:card_number] ok",
+                "{card}"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_anchors_redact_in_linear_time() {
+        for anchor in ["sk-", "glpat-", "-AIza", "eyJ", "xoxb-"] {
+            let text = anchor.repeat(200_000 / anchor.len());
+            let started = std::time::Instant::now();
+            redact(&text);
+            let took = started.elapsed();
+            assert!(
+                took < std::time::Duration::from_millis(500),
+                "{anchor}: {took:?}"
+            );
+        }
     }
 }

@@ -65,6 +65,16 @@ fn redact_strings(value: &mut Value) -> bool {
             }
             hit
         }
+        // A card number stored as a JSON number is as much a secret as one
+        // in a string (#353); a redacted number becomes a string.
+        Value::Number(number) => {
+            let redacted = crate::redact::redact(&number.to_string());
+            let hit = !redacted.hits.is_empty();
+            if hit {
+                *value = Value::String(redacted.content);
+            }
+            hit
+        }
         Value::Array(items) => items
             .iter_mut()
             .fold(false, |hit, v| redact_strings(v) | hit),
@@ -134,6 +144,13 @@ mod tests {
             kind: kind.map(str::to_string),
             aliases: vec![],
         }
+    }
+
+    #[test]
+    fn a_card_stored_as_a_json_number_is_scrubbed() {
+        let raw = "{\"card\":4111111111111111,\"n\":3}\n";
+        let out = scrub_jsonl(raw);
+        assert_eq!(out, "{\"card\":\"[REDACTED:card_number]\",\"n\":3}\n");
     }
 
     #[test]
