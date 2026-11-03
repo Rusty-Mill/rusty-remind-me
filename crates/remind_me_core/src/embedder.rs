@@ -31,10 +31,13 @@
 //! ever makes that an error.
 //!
 //! It also returns `None` for a backend chosen without a setting it cannot
-//! embed without (`openai`'s model, `onnx`'s two paths): such an embedder
+//! embed without (`openai`'s model, `onnx`'s two paths, `ollama`'s model set
+//! blank) or with a malformed `REMIND_ME_EMBEDDING_DIM`: such an embedder
 //! cannot embed, so it has no identity to compare stored vectors against.
-//! For the settings in the identity (`openai`'s model, `onnx`'s model path)
-//! treating the blank one as a model change cleared them all on open (#351).
+//! For the settings in the identity (a model, `onnx`'s model path, the
+//! dimension) treating the slip as a model change cleared them all on open
+//! (#351, #362). An unset `ollama` model or dimension still means the
+//! default.
 //! [`configured_embedder`] keeps that case apart so status can name the
 //! missing setting.
 
@@ -899,24 +902,59 @@ fn config_fingerprint() -> String {
 pub enum ConfiguredEmbedder {
     /// `REMIND_ME_EMBEDDING_BACKEND` names no backend: keyword-only search.
     Off,
-    /// A backend is named but a setting it cannot embed without is unset or
-    /// blank; `reason` names that setting.
+    /// A backend is named but a setting it cannot embed without is missing,
+    /// blank or malformed; `reason` names that setting.
     ///
     /// It cannot embed, so it has no identity and nothing compares, clears
-    /// or records vectors against it (#351). An identity built from a blank
-    /// model setting (`openai`'s model, `onnx`'s model path) would differ
-    /// from the stored one and clear every vector on the next open, leaving
-    /// nothing to re-embed them with.
+    /// or records vectors against it (#351, #362). An identity built from a
+    /// blank model setting (`ollama`'s or `openai`'s model, `onnx`'s model
+    /// path) or a malformed dimension would differ from the stored one and
+    /// clear every vector on the next open, leaving nothing to re-embed them
+    /// with.
     Unusable { reason: String },
     /// A backend with every setting it needs. It may still be unreachable;
     /// [`available_embedder`] probes that.
     Ready(Box<dyn Embedder>),
 }
 
-/// The value of `key`, or `None` when it is unset or blank. The value is
-/// returned untrimmed so it still matches the identity it was recorded under.
+/// The value of `key`, or `None` when it is unset, blank or not Unicode.
+/// The value is returned untrimmed so it still matches the identity it was
+/// recorded under.
 fn non_blank_env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.trim().is_empty())
+}
+
+/// The value of `key`, `default` when it is unset, or `None` when it is set
+/// but blank or not Unicode: a setting that was written but holds nothing
+/// usable is a slip, not a request for the default.
+fn env_or_default(key: &str, default: &str) -> Option<String> {
+    match std::env::var(key) {
+        Err(std::env::VarError::NotPresent) => Some(default.to_string()),
+        Err(std::env::VarError::NotUnicode(_)) => None,
+        Ok(value) => (!value.trim().is_empty()).then_some(value),
+    }
+}
+
+/// `REMIND_ME_EMBEDDING_DIM`: the default when unset, otherwise a positive
+/// integer with no surrounding spaces. Anything else is refused with a reason rather
+/// than read as the default, which would differ from the stored dimension
+/// and clear every vector (#362).
+fn configured_dim() -> Result<usize, String> {
+    let refused = |shown: String| {
+        format!(
+            "{EMBEDDING_DIM_ENV} must be a positive integer, not {shown}; unset it for the \
+             default {DEFAULT_EMBEDDING_DIM}. Semantic search is off and stored vectors are kept \
+             until it is fixed"
+        )
+    };
+    match std::env::var(EMBEDDING_DIM_ENV) {
+        Err(std::env::VarError::NotPresent) => Ok(DEFAULT_EMBEDDING_DIM),
+        Err(std::env::VarError::NotUnicode(raw)) => Err(refused(format!("{raw:?}"))),
+        Ok(raw) => match raw.parse::<usize>() {
+            Ok(dim) if dim > 0 => Ok(dim),
+            _ => Err(refused(format!("{raw:?}"))),
+        },
+    }
 }
 
 /// Read the embedding configuration from the environment.
@@ -926,56 +964,66 @@ fn non_blank_env(key: &str) -> Option<String> {
 /// requiring a restart.
 pub fn configured_embedder() -> ConfiguredEmbedder {
     let backend = std::env::var(EMBEDDING_BACKEND_ENV).unwrap_or_default();
-    let dim = std::env::var(EMBEDDING_DIM_ENV)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_EMBEDDING_DIM);
-    match backend.as_str() {
-        "ollama" => {
-            let url =
-                std::env::var(OLLAMA_URL_ENV).unwrap_or_else(|_| DEFAULT_OLLAMA_URL.to_string());
-            let model = std::env::var(OLLAMA_MODEL_ENV)
-                .unwrap_or_else(|_| DEFAULT_OLLAMA_MODEL.to_string());
-            ConfiguredEmbedder::Ready(Box::new(OllamaEmbedder::new(model, url, dim)))
-        }
-        "openai" => {
-            let Some(model) = non_blank_env(OPENAI_EMBED_MODEL_ENV) else {
-                return unusable("openai", &[OPENAI_EMBED_MODEL_ENV]);
-            };
-            let url = std::env::var(OPENAI_EMBED_URL_ENV)
-                .unwrap_or_else(|_| DEFAULT_OPENAI_EMBED_URL.to_string());
-            ConfiguredEmbedder::Ready(Box::new(OpenAiEmbedder::new(model, url, dim)))
-        }
-        "onnx" => {
-            let (model_path, tokenizer_path) = (
-                non_blank_env(ONNX_MODEL_PATH_ENV),
-                non_blank_env(ONNX_TOKENIZER_PATH_ENV),
-            );
-            let (Some(model_path), Some(tokenizer_path)) = (&model_path, &tokenizer_path) else {
-                let missing: Vec<&str> = [
-                    (model_path.is_none(), ONNX_MODEL_PATH_ENV),
-                    (tokenizer_path.is_none(), ONNX_TOKENIZER_PATH_ENV),
-                ]
-                .into_iter()
-                .filter_map(|(absent, key)| absent.then_some(key))
-                .collect();
-                return unusable("onnx", &missing);
-            };
-            ConfiguredEmbedder::Ready(Box::new(OnnxEmbedder::new(model_path, tokenizer_path, dim)))
-        }
-        _ => ConfiguredEmbedder::Off,
+    let built = match backend.as_str() {
+        "ollama" => ollama_embedder(),
+        "openai" => openai_embedder(),
+        "onnx" => onnx_embedder(),
+        _ => return ConfiguredEmbedder::Off,
+    };
+    match built {
+        Ok(embedder) => ConfiguredEmbedder::Ready(embedder),
+        Err(reason) => ConfiguredEmbedder::Unusable { reason },
     }
 }
 
-/// The [`ConfiguredEmbedder::Unusable`] for `backend` missing `settings`.
-fn unusable(backend: &str, settings: &[&str]) -> ConfiguredEmbedder {
-    ConfiguredEmbedder::Unusable {
-        reason: format!(
-            "{EMBEDDING_BACKEND_ENV}={backend} needs {}; semantic search is off and stored \
-             vectors are kept until it is set",
-            settings.join(" and ")
-        ),
-    }
+fn ollama_embedder() -> Result<Box<dyn Embedder>, String> {
+    let dim = configured_dim()?;
+    let model = env_or_default(OLLAMA_MODEL_ENV, DEFAULT_OLLAMA_MODEL).ok_or_else(|| {
+        format!(
+            "{OLLAMA_MODEL_ENV} is set but blank or not Unicode; unset it for the default \
+                 {DEFAULT_OLLAMA_MODEL} or name a model. Semantic search is off and stored \
+                 vectors are kept until it is fixed"
+        )
+    })?;
+    let url = std::env::var(OLLAMA_URL_ENV).unwrap_or_else(|_| DEFAULT_OLLAMA_URL.to_string());
+    Ok(Box::new(OllamaEmbedder::new(model, url, dim)))
+}
+
+fn openai_embedder() -> Result<Box<dyn Embedder>, String> {
+    let dim = configured_dim()?;
+    let model = non_blank_env(OPENAI_EMBED_MODEL_ENV)
+        .ok_or_else(|| needs("openai", &[OPENAI_EMBED_MODEL_ENV]))?;
+    let url = std::env::var(OPENAI_EMBED_URL_ENV)
+        .unwrap_or_else(|_| DEFAULT_OPENAI_EMBED_URL.to_string());
+    Ok(Box::new(OpenAiEmbedder::new(model, url, dim)))
+}
+
+fn onnx_embedder() -> Result<Box<dyn Embedder>, String> {
+    let dim = configured_dim()?;
+    let (model_path, tokenizer_path) = (
+        non_blank_env(ONNX_MODEL_PATH_ENV),
+        non_blank_env(ONNX_TOKENIZER_PATH_ENV),
+    );
+    let (Some(model_path), Some(tokenizer_path)) = (&model_path, &tokenizer_path) else {
+        let missing: Vec<&str> = [
+            (model_path.is_none(), ONNX_MODEL_PATH_ENV),
+            (tokenizer_path.is_none(), ONNX_TOKENIZER_PATH_ENV),
+        ]
+        .into_iter()
+        .filter_map(|(absent, key)| absent.then_some(key))
+        .collect();
+        return Err(needs("onnx", &missing));
+    };
+    Ok(Box::new(OnnxEmbedder::new(model_path, tokenizer_path, dim)))
+}
+
+/// The reason `backend` is unusable without `settings`.
+fn needs(backend: &str, settings: &[&str]) -> String {
+    format!(
+        "{EMBEDDING_BACKEND_ENV}={backend} needs {}; semantic search is off and stored vectors \
+         are kept until it is set",
+        settings.join(" and ")
+    )
 }
 
 /// The configured embedder, or `None` when none is configured or the one
