@@ -200,15 +200,20 @@ pub fn parse_with(raw: &str, message_tools: &MessageTools) -> TranscriptSummary 
     }
 }
 
-/// What an assistant message said last: its last posted message, else its
-/// text.
+/// What an assistant message said last: its last posted message, unless
+/// plain text follows that call in the content, else its text.
 fn reply_of<'a>(message: &'a ChatMessage, message_tools: &MessageTools) -> Option<&'a str> {
-    let posted = message
-        .tool_use
-        .iter()
-        .rev()
-        .find_map(|call| message_tools.posted(call));
-    posted.or_else(|| Some(message.content.as_str()).filter(|text| !text.is_empty()))
+    let text = Some(message.content.as_str()).filter(|text| !text.is_empty());
+    let posted = message.tool_use.iter().rev().find_map(|call| {
+        message_tools
+            .posted(call)
+            .map(|posted| (call.block, posted))
+    });
+    match posted {
+        Some((block, _)) if text.is_some() && message.last_text_block > Some(block) => text,
+        Some((_, posted)) => Some(posted),
+        None => text,
+    }
 }
 
 fn render_dialog(messages: &[ChatMessage], message_tools: &MessageTools) -> String {
@@ -695,6 +700,32 @@ mod tests {
         assert!(p
             .summary()
             .contains("Last reply: Dream-RSI is the best fit.\n\nBecause"));
+    }
+
+    fn mixed_line(blocks: serde_json::Value) -> String {
+        serde_json::json!({
+            "type": "assistant", "sessionId": "s1",
+            "message": {"role": "assistant", "content": blocks}
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn the_last_reply_follows_block_order_within_a_message() {
+        let post = serde_json::json!({"type": "tool_use", "id": "t9",
+            "name": "mcp__hearthbot__post_message", "input": {"text": "posted"}});
+        let text = serde_json::json!({"type": "text", "text": "said"});
+        let tools = MessageTools::defaults();
+        let after = mixed_line(serde_json::json!([post.clone(), text.clone()]));
+        assert_eq!(
+            parse_with(&after, &tools).last_assistant.as_deref(),
+            Some("said")
+        );
+        let before = mixed_line(serde_json::json!([text, post]));
+        assert_eq!(
+            parse_with(&before, &tools).last_assistant.as_deref(),
+            Some("posted")
+        );
     }
 
     #[test]

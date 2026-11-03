@@ -150,6 +150,10 @@ pub struct ChatMessage {
     pub git_branch: Option<String>,
     /// One summary per `tool_use` block; the blocks themselves are not kept.
     pub tool_use: Vec<ToolUseSummary>,
+    /// Index in the content array of the last block with text, so a reader
+    /// can tell whether text came before or after a tool call
+    /// ([`ToolUseSummary::block`]). `None` for bare-string content.
+    pub last_text_block: Option<usize>,
 }
 
 /// A `tool_use` block reduced to what is worth recalling: which tool, and
@@ -163,6 +167,8 @@ pub struct ToolUseSummary {
     /// full (a transcript capture keeps a posted message's text).
     pub input: serde_json::Value,
     pub is_error: bool,
+    /// Index of the `tool_use` block in the message's content array.
+    pub block: usize,
 }
 
 impl ToolUseSummary {
@@ -187,6 +193,7 @@ impl ChatMessage {
             cwd: None,
             git_branch: None,
             tool_use: Vec::new(),
+            last_text_block: None,
         }
     }
 
@@ -234,8 +241,9 @@ fn tool_use_of(content: &serde_json::Value) -> Vec<ToolUseSummary> {
         .collect();
     blocks
         .iter()
-        .filter(|b| kind(b).as_deref() == Some("tool_use"))
-        .map(|b| {
+        .enumerate()
+        .filter(|(_, b)| kind(b).as_deref() == Some("tool_use"))
+        .map(|(block, b)| {
             let input = b.get("input").cloned().unwrap_or(serde_json::Value::Null);
             ToolUseSummary {
                 name: b
@@ -249,6 +257,7 @@ fn tool_use_of(content: &serde_json::Value) -> Vec<ToolUseSummary> {
                     .get("id")
                     .and_then(|i| i.as_str())
                     .is_some_and(|id| failed.contains(&id)),
+                block,
             }
         })
         .collect()
@@ -273,21 +282,7 @@ fn text_of(value: &serde_json::Value) -> String {
         serde_json::Value::String(s) => s.trim().to_string(),
         serde_json::Value::Array(blocks) => blocks
             .iter()
-            .filter_map(|b| match b {
-                serde_json::Value::String(s) => Some(s.clone()),
-                serde_json::Value::Object(o) => {
-                    let kind = o.get("type").and_then(|t| t.as_str());
-                    let keep = kind == Some("text") || (kind.is_none() && o.contains_key("text"));
-                    keep.then(|| {
-                        o.get("text")
-                            .and_then(|t| t.as_str())
-                            .unwrap_or_default()
-                            .to_string()
-                    })
-                }
-                _ => None,
-            })
-            .filter(|p| !p.is_empty())
+            .filter_map(block_text)
             .collect::<Vec<_>>()
             .join("\n")
             .trim()
@@ -295,6 +290,33 @@ fn text_of(value: &serde_json::Value) -> String {
         serde_json::Value::Null => String::new(),
         other => other.to_string().trim().to_string(),
     }
+}
+
+/// The text a content block contributes, if any: see [`text_of`].
+fn block_text(block: &serde_json::Value) -> Option<String> {
+    let text = match block {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Object(o) => {
+            let kind = o.get("type").and_then(|t| t.as_str());
+            let keep = kind == Some("text") || (kind.is_none() && o.contains_key("text"));
+            keep.then(|| {
+                o.get("text")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or_default()
+                    .to_string()
+            })
+        }
+        _ => None,
+    };
+    text.filter(|p| !p.is_empty())
+}
+
+/// Index of the last block of `content` that contributes text.
+fn last_text_block(content: &serde_json::Value) -> Option<usize> {
+    let blocks = content.as_array()?;
+    blocks
+        .iter()
+        .rposition(|b| block_text(b).is_some_and(|t| !t.trim().is_empty()))
 }
 
 fn push_message(out: &mut Vec<ChatMessage>, role: &str, content: String) {
@@ -333,6 +355,7 @@ fn push_envelope(
     message.cwd = str_field(source, "cwd");
     message.git_branch = str_field(source, "gitBranch");
     message.tool_use = tool_use;
+    message.last_text_block = content.and_then(last_text_block);
     out.push(message);
 }
 

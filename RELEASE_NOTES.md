@@ -11,7 +11,7 @@ Dated entries, newest first. One entry per merged pull request.
 - `REMIND_ME_MESSAGE_TOOLS`: the message tools, as comma-separated `tool=argument` pairs. Unset means `mcp__hearthbot__post_message=text`; blank means none; a malformed value is reported and the default used.
 
 ### Tests
-- `transcript`: a posted message is kept in full and is the last reply while another tool in the same message keeps its preview; a tool left out of the setting keeps its preview; the setting's defaults, blank value, whitespace and malformed pairs.
+- `transcript`: a posted message is kept in full and is the last reply while another tool in the same message keeps its preview; a tool left out of the setting keeps its preview; the setting's defaults, blank value, whitespace and malformed pairs. Within one message, text after a posted message is the reply and a posted message after text is (`ChatMessage::last_text_block`, `ToolUseSummary::block` keep block order).
 
 ## 2026-11-03 — A missing embedder setting no longer clears stored vectors (#351)
 
