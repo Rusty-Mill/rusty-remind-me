@@ -150,10 +150,19 @@ pub struct ChatMessage {
     pub git_branch: Option<String>,
     /// One summary per `tool_use` block; the blocks themselves are not kept.
     pub tool_use: Vec<ToolUseSummary>,
-    /// Index in the content array of the last block with text, so a reader
-    /// can tell whether text came before or after a tool call
-    /// ([`ToolUseSummary::block`]). `None` for bare-string content.
-    pub last_text_block: Option<usize>,
+    /// The text blocks of a content array, in order, so a reader can place
+    /// text and tool calls ([`ToolUseSummary::block`]) as they were written.
+    /// Empty for bare-string content.
+    pub text_blocks: Vec<TextBlock>,
+}
+
+/// One text block of a message's content array.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextBlock {
+    /// Index of the block in the content array.
+    pub block: usize,
+    /// Its text, trimmed.
+    pub text: String,
 }
 
 /// A `tool_use` block reduced to what is worth recalling: which tool, and
@@ -193,7 +202,7 @@ impl ChatMessage {
             cwd: None,
             git_branch: None,
             tool_use: Vec::new(),
-            last_text_block: None,
+            text_blocks: Vec::new(),
         }
     }
 
@@ -311,12 +320,19 @@ fn block_text(block: &serde_json::Value) -> Option<String> {
     text.filter(|p| !p.is_empty())
 }
 
-/// Index of the last block of `content` that contributes text.
-fn last_text_block(content: &serde_json::Value) -> Option<usize> {
-    let blocks = content.as_array()?;
+/// The blocks of `content` that contribute text, in order.
+fn text_blocks(content: &serde_json::Value) -> Vec<TextBlock> {
+    let Some(blocks) = content.as_array() else {
+        return Vec::new();
+    };
     blocks
         .iter()
-        .rposition(|b| block_text(b).is_some_and(|t| !t.trim().is_empty()))
+        .enumerate()
+        .filter_map(|(block, b)| {
+            let text = block_text(b)?.trim().to_string();
+            (!text.is_empty()).then_some(TextBlock { block, text })
+        })
+        .collect()
 }
 
 fn push_message(out: &mut Vec<ChatMessage>, role: &str, content: String) {
@@ -355,7 +371,7 @@ fn push_envelope(
     message.cwd = str_field(source, "cwd");
     message.git_branch = str_field(source, "gitBranch");
     message.tool_use = tool_use;
-    message.last_text_block = content.and_then(last_text_block);
+    message.text_blocks = content.map(text_blocks).unwrap_or_default();
     out.push(message);
 }
 

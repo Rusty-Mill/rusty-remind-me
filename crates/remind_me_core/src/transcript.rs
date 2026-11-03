@@ -200,34 +200,64 @@ pub fn parse_with(raw: &str, message_tools: &MessageTools) -> TranscriptSummary 
     }
 }
 
-/// What an assistant message said last: its last posted message, unless
-/// plain text follows that call in the content, else its text.
-fn reply_of<'a>(message: &'a ChatMessage, message_tools: &MessageTools) -> Option<&'a str> {
-    let text = Some(message.content.as_str()).filter(|text| !text.is_empty());
-    let posted = message.tool_use.iter().rev().find_map(|call| {
-        message_tools
-            .posted(call)
-            .map(|posted| (call.block, posted))
-    });
-    match posted {
-        Some((block, _)) if text.is_some() && message.last_text_block > Some(block) => text,
-        Some((_, posted)) => Some(posted),
-        None => text,
+/// One piece of a message, in the order it was written.
+enum Part<'a> {
+    Text(&'a str),
+    Tool(&'a ToolUseSummary),
+}
+
+/// A message's text blocks and tool calls in content order. Bare-string
+/// content (no blocks) is its text, then its calls.
+fn parts(message: &ChatMessage) -> Vec<Part<'_>> {
+    if message.text_blocks.is_empty() {
+        let text = (!message.content.is_empty()).then_some(Part::Text(&message.content));
+        return text
+            .into_iter()
+            .chain(message.tool_use.iter().map(Part::Tool))
+            .collect();
     }
+    let mut ordered: Vec<(usize, Part<'_>)> = message
+        .text_blocks
+        .iter()
+        .map(|t| (t.block, Part::Text(&t.text)))
+        .chain(message.tool_use.iter().map(|c| (c.block, Part::Tool(c))))
+        .collect();
+    ordered.sort_by_key(|(block, _)| *block);
+    ordered.into_iter().map(|(_, part)| part).collect()
+}
+
+/// What an assistant message said last: the last of its text blocks and
+/// posted messages, in content order.
+fn reply_of<'a>(message: &'a ChatMessage, message_tools: &MessageTools) -> Option<&'a str> {
+    parts(message)
+        .into_iter()
+        .rev()
+        .find_map(|part| match part {
+            Part::Text(text) => Some(text),
+            Part::Tool(call) => message_tools.posted(call),
+        })
+}
+
+/// A message as one dialog block, `**role:** ` then its text and tool lines
+/// in content order: a message tool's text in full, any other tool's preview.
+fn render_message(message: &ChatMessage, message_tools: &MessageTools) -> String {
+    let lines: Vec<String> = parts(message)
+        .into_iter()
+        .map(|part| match part {
+            Part::Text(text) => text.to_string(),
+            Part::Tool(call) => {
+                call.line(message_tools.posted(call).unwrap_or(&call.input_summary))
+            }
+        })
+        .collect();
+    let separator = if message.content.is_empty() { "\n" } else { "" };
+    format!("**{}:** {separator}{}", message.role, lines.join("\n"))
 }
 
 fn render_dialog(messages: &[ChatMessage], message_tools: &MessageTools) -> String {
     let dialog = messages
         .iter()
-        .map(|m| {
-            let mut block = format!("**{}:** {}", m.role, m.content);
-            for call in &m.tool_use {
-                let shown = message_tools.posted(call).unwrap_or(&call.input_summary);
-                block.push('\n');
-                block.push_str(&call.line(shown));
-            }
-            block
-        })
+        .map(|m| render_message(m, message_tools))
         .collect::<Vec<_>>()
         .join("\n\n");
     let total = dialog.chars().count();
@@ -710,22 +740,46 @@ mod tests {
         .to_string()
     }
 
+    fn post(text: &str) -> serde_json::Value {
+        serde_json::json!({"type": "tool_use", "id": format!("t-{text}"),
+            "name": "mcp__hearthbot__post_message", "input": {"text": text}})
+    }
+
+    fn said(text: &str) -> serde_json::Value {
+        serde_json::json!({"type": "text", "text": text})
+    }
+
+    /// The reply and dialog of one assistant message made of `blocks`.
+    fn read(blocks: serde_json::Value) -> (Option<String>, String) {
+        let p = parse_with(&mixed_line(blocks), &MessageTools::defaults());
+        (p.last_assistant, p.dialog)
+    }
+
     #[test]
-    fn the_last_reply_follows_block_order_within_a_message() {
-        let post = serde_json::json!({"type": "tool_use", "id": "t9",
-            "name": "mcp__hearthbot__post_message", "input": {"text": "posted"}});
-        let text = serde_json::json!({"type": "text", "text": "said"});
-        let tools = MessageTools::defaults();
-        let after = mixed_line(serde_json::json!([post.clone(), text.clone()]));
+    fn the_last_reply_and_the_dialog_follow_block_order() {
+        let (reply, dialog) = read(serde_json::json!([said("first"), post("posted")]));
+        assert_eq!(reply.as_deref(), Some("posted"));
         assert_eq!(
-            parse_with(&after, &tools).last_assistant.as_deref(),
-            Some("said")
+            dialog,
+            "**assistant:** first\ntool: mcp__hearthbot__post_message — posted"
         );
-        let before = mixed_line(serde_json::json!([text, post]));
+
+        let (reply, dialog) = read(serde_json::json!([
+            post("Initial answer"),
+            said("Correction")
+        ]));
+        assert_eq!(reply.as_deref(), Some("Correction"));
         assert_eq!(
-            parse_with(&before, &tools).last_assistant.as_deref(),
-            Some("posted")
+            dialog,
+            "**assistant:** tool: mcp__hearthbot__post_message — Initial answer\nCorrection"
         );
+
+        let blocks = serde_json::json!([said("a"), post("b"), said("c"), post("d")]);
+        assert_eq!(read(blocks).0.as_deref(), Some("d"));
+        let blocks = serde_json::json!([post("a"), said("b"), post("c"), said("d")]);
+        let (reply, dialog) = read(blocks);
+        assert_eq!(reply.as_deref(), Some("d"));
+        assert!(dialog.ends_with("— a\nb\ntool: mcp__hearthbot__post_message — c\nd"));
     }
 
     #[test]
