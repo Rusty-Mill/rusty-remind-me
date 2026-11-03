@@ -312,6 +312,8 @@ impl Database {
         // growing without bound.
         crate::sync::prune_outbox(&db.store())?;
         // A changed embedding model invalidates every stored vector (#96).
+        // A backend missing a setting resolves to none, so a config slip is
+        // never read as a model change (#351).
         if let Some(embedder) = crate::embedder::resolve_embedder() {
             crate::vectors::reconcile_embedding_meta(&db.store(), &embedder.identity())?;
         }

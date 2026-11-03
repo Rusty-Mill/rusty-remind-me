@@ -14,14 +14,15 @@
 //! boolean cannot express.
 //!
 //! `embeddings` is different: the embedding backend's configuration
-//! ([`crate::embedder::resolve_embedder`]) is read from environment
+//! ([`crate::embedder::configured_embedder`]) is read from environment
 //! variables the same way in every process, so this module can and does
 //! answer it directly — see below.
 //!
 //! # No network
 //!
 //! Nothing in `server_status` itself makes a network call. `embeddings`
-//! reflects configuration only ([`crate::embedder::resolve_embedder`]); it
+//! reflects configuration only ([`crate::embedder::configured_embedder`]),
+//! naming a missing setting when a backend is chosen without one; it
 //! does not prove the configured backend is actually reachable, which needs
 //! a network probe ([`crate::embedder::available_embedder`]) the reference
 //! itself flags as a performance concern. The MCP dispatch layer calls
@@ -34,6 +35,7 @@ use crate::db::stats::StoreStats;
 use crate::db::Result;
 use crate::db::Store;
 use crate::db::SCHEMA_VERSION;
+use crate::embedder::ConfiguredEmbedder;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -155,13 +157,13 @@ pub fn server_status(store: &Store<'_>) -> Result<ServerStatus> {
             "dashboard liveness needs a cross-process PID-file check; see remind_me_mcp's \
              remind_me_server_status override",
         ),
-        embeddings: if crate::embedder::resolve_embedder().is_some() {
-            SubsystemStatus::Active
-        } else {
-            SubsystemStatus::missing(
+        embeddings: match crate::embedder::configured_embedder() {
+            ConfiguredEmbedder::Ready(_) => SubsystemStatus::Active,
+            ConfiguredEmbedder::Unusable { reason } => SubsystemStatus::NotImplemented { reason },
+            ConfiguredEmbedder::Off => SubsystemStatus::missing(
                 "no embedding backend configured; set REMIND_ME_EMBEDDING_BACKEND=ollama to \
                  enable semantic search",
-            )
+            ),
         },
         sync: SubsystemStatus::missing(
             "no sync engine in this crate; the outbox is written and pruned, never drained",
