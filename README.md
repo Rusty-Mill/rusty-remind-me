@@ -529,10 +529,12 @@ off entirely.
 
 `REMIND_ME_EMBEDDING_DIM` (default `384`, sized for
 `sentence-transformers/all-MiniLM-L6-v2`) must match the configured model's
-actual output dimension.
+actual output dimension. Set, it must be a positive integer written exactly
+(no spaces).
 
 A backend chosen without a setting it needs (`openai` with no model, `onnx`
-with either path unset or blank) leaves semantic search off and keeps the stored
+with either path unset or blank, `ollama` with its model set but blank), or
+with a malformed `REMIND_ME_EMBEDDING_DIM`, leaves semantic search off and keeps the stored
 vectors; `remind_me_server_status` names the missing setting. Changing the
 backend, a non-blank model or the dimension clears the stored vectors on the next open,
 ready for `remind_me_reindex`.

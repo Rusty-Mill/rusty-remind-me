@@ -233,3 +233,7 @@ the stored vectors are kept. For `openai`'s model and `onnx`'s model path
 (the two settings in the identity), comparing against the blank identity
 used to read the slip as a model change and clear every vector, with no
 model left to re-embed them. A real change to a non-blank model still clears.
+#362 (2026-11-03) extends this to `ollama`'s model set but blank (unset
+still means the default) and to a `REMIND_ME_EMBEDDING_DIM` that is not a
+positive integer, which used to fall back to the default dimension and
+clear.
