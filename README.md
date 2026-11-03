@@ -532,9 +532,9 @@ off entirely.
 actual output dimension.
 
 A backend chosen without a setting it needs (`openai` with no model, `onnx`
-with either path unset) leaves semantic search off and keeps the stored
-vectors; `remind_me_server_status` names the missing setting. Changing a
-non-blank model or the dimension clears the stored vectors on the next open,
+with either path unset or blank) leaves semantic search off and keeps the stored
+vectors; `remind_me_server_status` names the missing setting. Changing the
+backend, a non-blank model or the dimension clears the stored vectors on the next open,
 ready for `remind_me_reindex`.
 
 ### Cross-encoder reranking (`remind_me_core::reranker`)

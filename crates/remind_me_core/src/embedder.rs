@@ -871,7 +871,7 @@ fn availability_cell() -> &'static Mutex<Option<AvailabilityCache>> {
 /// [`AVAILABILITY_FAILURE_TTL`], because nothing invalidated the failure the
 /// old address earned.
 ///
-/// The list must stay in step with `resolve_embedder`. A variable it reads
+/// The list must stay in step with `configured_embedder`. A variable it reads
 /// but this omits is a variable you can change without the cache noticing —
 /// which is the bug this function exists to close, reintroduced quietly.
 fn config_fingerprint() -> String {
@@ -1066,7 +1066,7 @@ pub fn embedding_status() -> crate::status::SubsystemStatus {
         SubsystemStatus::NotImplemented {
             reason: format!(
                 "REMIND_ME_EMBEDDING_BACKEND={} is configured but not answering (unreachable \
-                 daemon, or an unconfigured/unloadable ONNX model)",
+                 daemon, or an unloadable ONNX model)",
                 std::env::var(EMBEDDING_BACKEND_ENV).unwrap_or_default()
             ),
         }
