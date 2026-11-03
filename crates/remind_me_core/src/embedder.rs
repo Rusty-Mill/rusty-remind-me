@@ -936,21 +936,24 @@ fn env_or_default(key: &str, default: &str) -> Option<String> {
 }
 
 /// `REMIND_ME_EMBEDDING_DIM`: the default when unset, otherwise a positive
-/// integer written exactly. Anything else is refused with a reason rather
+/// integer with no surrounding spaces. Anything else is refused with a reason rather
 /// than read as the default, which would differ from the stored dimension
 /// and clear every vector (#362).
 fn configured_dim() -> Result<usize, String> {
-    let raw = match std::env::var(EMBEDDING_DIM_ENV) {
-        Err(std::env::VarError::NotPresent) => return Ok(DEFAULT_EMBEDDING_DIM),
-        Err(std::env::VarError::NotUnicode(raw)) => format!("{raw:?}"),
-        Ok(raw) => raw,
+    let refused = |shown: String| {
+        format!(
+            "{EMBEDDING_DIM_ENV} must be a positive integer, not {shown}; unset it for the \
+             default {DEFAULT_EMBEDDING_DIM}. Semantic search is off and stored vectors are kept \
+             until it is fixed"
+        )
     };
-    match raw.parse::<usize>() {
-        Ok(dim) if dim > 0 => Ok(dim),
-        _ => Err(format!(
-            "{EMBEDDING_DIM_ENV} must be a positive integer, not {raw:?}; semantic search is \
-             off and stored vectors are kept until it is fixed"
-        )),
+    match std::env::var(EMBEDDING_DIM_ENV) {
+        Err(std::env::VarError::NotPresent) => Ok(DEFAULT_EMBEDDING_DIM),
+        Err(std::env::VarError::NotUnicode(raw)) => Err(refused(format!("{raw:?}"))),
+        Ok(raw) => match raw.parse::<usize>() {
+            Ok(dim) if dim > 0 => Ok(dim),
+            _ => Err(refused(format!("{raw:?}"))),
+        },
     }
 }
 
@@ -975,8 +978,13 @@ pub fn configured_embedder() -> ConfiguredEmbedder {
 
 fn ollama_embedder() -> Result<Box<dyn Embedder>, String> {
     let dim = configured_dim()?;
-    let model = env_or_default(OLLAMA_MODEL_ENV, DEFAULT_OLLAMA_MODEL)
-        .ok_or_else(|| needs("ollama", &[OLLAMA_MODEL_ENV]))?;
+    let model = env_or_default(OLLAMA_MODEL_ENV, DEFAULT_OLLAMA_MODEL).ok_or_else(|| {
+        format!(
+            "{OLLAMA_MODEL_ENV} is set but blank or not Unicode; unset it for the default \
+                 {DEFAULT_OLLAMA_MODEL} or name a model. Semantic search is off and stored \
+                 vectors are kept until it is fixed"
+        )
+    })?;
     let url = std::env::var(OLLAMA_URL_ENV).unwrap_or_else(|_| DEFAULT_OLLAMA_URL.to_string());
     Ok(Box::new(OllamaEmbedder::new(model, url, dim)))
 }

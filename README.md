@@ -529,8 +529,8 @@ off entirely.
 
 `REMIND_ME_EMBEDDING_DIM` (default `384`, sized for
 `sentence-transformers/all-MiniLM-L6-v2`) must match the configured model's
-actual output dimension. Set, it must be a positive integer written exactly
-(no spaces).
+actual output dimension. Set, it must be a positive integer with no surrounding
+spaces; set but empty is refused too, so unset it to get the default.
 
 A backend chosen without a setting it needs (`openai` with no model, `onnx`
 with either path unset or blank, `ollama` with its model set but blank), or
