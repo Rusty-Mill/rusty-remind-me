@@ -2,6 +2,17 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-03 — A missing embedder setting no longer clears stored vectors (#351)
+
+### Fixed
+- Choosing `REMIND_ME_EMBEDDING_BACKEND=openai` with `REMIND_ME_OPENAI_EMBED_MODEL` unset or blank, or `onnx` with `REMIND_ME_ONNX_MODEL_PATH` unset or blank, made every open read the blank identity as a model change and clear every stored vector, with no model left to re-embed them. Such an embedder, and `onnx` with `REMIND_ME_ONNX_TOKENIZER_PATH` unset or blank (which never cleared, since the tokenizer is not in the identity), is now unusable rather than resolved: the open skips the model check and keeps the vectors, semantic search stays off, and `remind_me_server_status` (both its config-only report and the live check, which no longer probes) names the missing setting instead of reporting `Active` or a failed probe. A whitespace-only model, which no server routes on, is now refused like an empty one. A change to a different non-blank model still clears, as ADR-0002 intends.
+
+### Changed
+- `embedder::configured_embedder` returns `Off`, `Unusable { reason }` or `Ready(embedder)`; `resolve_embedder` returns the embedder only when it is ready.
+
+### Tests
+- `open_reconcile_test`: reopening `openai` with the model unset, empty or blank keeps the stored vector and both status surfaces name `REMIND_ME_OPENAI_EMBED_MODEL` (on the base the vector count went from 1 to 0); the same for `onnx` with each path unset in turn (on the base the model-path case lost its vector and the tokenizer case reported `Active`); and a guard that a change from model `m` to `m2` still clears, which goes red on a mutant that refuses every `openai` configuration.
+
 ## 2026-11-02 — 0.4.2: version bump
 
 ### Changed

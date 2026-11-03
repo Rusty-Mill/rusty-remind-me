@@ -226,3 +226,10 @@ the reference's own check. When no backend is configured at all
 (`REMIND_ME_EMBEDDING_BACKEND` unset — the default, unlike the reference's
 always-on ONNX default), the check is skipped outright: nothing was written
 by this process either, so there is nothing meaningful to compare against.
+The same holds when a backend is chosen but a setting it cannot embed
+without is unset or blank (`openai`'s model, either `onnx` path; #351,
+2026-11-03): `resolve_embedder` returns `None`, so the check is skipped and
+the stored vectors are kept. For `openai`'s model and `onnx`'s model path
+(the two settings in the identity), comparing against the blank identity
+used to read the slip as a model change and clear every vector, with no
+model left to re-embed them. A real change to a non-blank model still clears.

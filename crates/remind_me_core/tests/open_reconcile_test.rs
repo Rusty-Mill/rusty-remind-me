@@ -16,7 +16,11 @@ use remind_me_core::db::queries;
 use remind_me_core::db::sync_state::SyncState;
 use remind_me_core::db::vectors::Vectors;
 use remind_me_core::db::Store;
-use remind_me_core::embedder::{EMBEDDING_BACKEND_ENV, EMBEDDING_DIM_ENV, OLLAMA_MODEL_ENV};
+use remind_me_core::embedder::{
+    embedding_status, EMBEDDING_BACKEND_ENV, EMBEDDING_DIM_ENV, OLLAMA_MODEL_ENV,
+    ONNX_MODEL_PATH_ENV, ONNX_TOKENIZER_PATH_ENV, OPENAI_EMBED_MODEL_ENV,
+};
+use remind_me_core::status::{server_status, SubsystemStatus};
 use remind_me_core::sync::{HUB_URL_ENV, NODE_ID_ENV, SYNC_SECRET_ENV};
 use remind_me_core::testing::{self, Table};
 use remind_me_core::{Database, MemoryAddInput};
@@ -170,6 +174,11 @@ fn a_sent_outbox_row_past_the_retention_window_is_pruned_at_open() {
 // ---------------------------------------------------------------------------
 
 fn plant_stale_vector(store: &Store<'_>, model: &str, dim: usize) {
+    plant_vector(store, "ollama", model, dim);
+}
+
+/// A stored vector recorded as produced by `backend`/`model`/`dim`.
+fn plant_vector(store: &Store<'_>, backend: &str, model: &str, dim: usize) {
     Memories::new(store)
         .insert(&NewMemory::new(
             "mem_versioning",
@@ -181,7 +190,7 @@ fn plant_stale_vector(store: &Store<'_>, model: &str, dim: usize) {
     vectors
         .put("mem_versioning", 0, &vec![0u8; dim * 4])
         .unwrap();
-    for (key, value) in [("backend", "ollama"), ("model", model)] {
+    for (key, value) in [("backend", backend), ("model", model)] {
         vectors
             .set_meta(key, value, "2020-01-01T00:00:00Z")
             .unwrap();
@@ -196,9 +205,16 @@ fn stored_vector_counts(store: &Store<'_>) -> usize {
 }
 
 fn clear_embedding_env() {
-    crate::test_env::remove_var(EMBEDDING_BACKEND_ENV);
-    crate::test_env::remove_var(OLLAMA_MODEL_ENV);
-    crate::test_env::remove_var(EMBEDDING_DIM_ENV);
+    for key in [
+        EMBEDDING_BACKEND_ENV,
+        OLLAMA_MODEL_ENV,
+        EMBEDDING_DIM_ENV,
+        OPENAI_EMBED_MODEL_ENV,
+        ONNX_MODEL_PATH_ENV,
+        ONNX_TOKENIZER_PATH_ENV,
+    ] {
+        crate::test_env::remove_var(key);
+    }
 }
 
 #[test]
@@ -324,5 +340,115 @@ fn reopening_with_the_embedding_backend_disabled_never_clears_stored_vectors() {
     let db = Database::open(&tmp.0).unwrap();
     assert_eq!(stored_vector_counts(&db.store()), 1);
 
+    clear_embedding_env();
+}
+
+// ---------------------------------------------------------------------------
+// An embedder that cannot embed never clears vectors (#351)
+// ---------------------------------------------------------------------------
+
+/// The reason a status reports, or a panic naming what it reported instead.
+fn missing_reason(status: &SubsystemStatus) -> &str {
+    match status {
+        SubsystemStatus::NotImplemented { reason } => reason,
+        other => panic!("expected the embedder reported unusable, got {other:?}"),
+    }
+}
+
+/// Both status surfaces name `variable` as the reason embeddings are off.
+fn assert_status_names(db: &Database, variable: &str) {
+    let report = server_status(&db.store()).unwrap();
+    let reason = missing_reason(&report.embeddings);
+    assert!(reason.contains(variable), "server_status said {reason:?}");
+    // `embedding_status` refuses before its network probe: nothing listens
+    // at the default URL in a test, so a probe would also say "unavailable",
+    // but for the wrong reason.
+    let live = embedding_status();
+    let reason = missing_reason(&live);
+    assert!(
+        reason.contains(variable),
+        "embedding_status said {reason:?}"
+    );
+}
+
+#[test]
+fn reopening_openai_without_a_model_keeps_vectors_and_says_the_model_is_missing() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // Unset, empty and blank are the same slip: no model to embed with.
+    for (case, model) in [("unset", None), ("empty", Some("")), ("blank", Some("  "))] {
+        let tmp = TempDb::new(&format!("openai_no_model_{case}"));
+        clear_embedding_env();
+        crate::test_env::set_var(EMBEDDING_BACKEND_ENV, "openai");
+        crate::test_env::set_var(OPENAI_EMBED_MODEL_ENV, "m");
+        crate::test_env::set_var(EMBEDDING_DIM_ENV, "4");
+        {
+            let db = Database::open(&tmp.0).unwrap();
+            plant_vector(&db.store(), "openai", "m", 4);
+        }
+
+        match model {
+            None => crate::test_env::remove_var(OPENAI_EMBED_MODEL_ENV),
+            Some(value) => crate::test_env::set_var(OPENAI_EMBED_MODEL_ENV, value),
+        }
+        let db = Database::open(&tmp.0).unwrap();
+        assert_eq!(
+            stored_vector_counts(&db.store()),
+            1,
+            "an {case} {OPENAI_EMBED_MODEL_ENV} must not clear the stored vectors"
+        );
+        assert_status_names(&db, OPENAI_EMBED_MODEL_ENV);
+    }
+    clear_embedding_env();
+}
+
+#[test]
+fn reopening_onnx_without_paths_keeps_vectors_and_says_which_path_is_missing() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    for (case, unset) in [
+        ("model", ONNX_MODEL_PATH_ENV),
+        ("tokenizer", ONNX_TOKENIZER_PATH_ENV),
+    ] {
+        let tmp = TempDb::new(&format!("onnx_no_{case}"));
+        clear_embedding_env();
+        crate::test_env::set_var(EMBEDDING_BACKEND_ENV, "onnx");
+        crate::test_env::set_var(ONNX_MODEL_PATH_ENV, "/models/e5.onnx");
+        crate::test_env::set_var(ONNX_TOKENIZER_PATH_ENV, "/models/tokenizer.json");
+        crate::test_env::set_var(EMBEDDING_DIM_ENV, "4");
+        {
+            let db = Database::open(&tmp.0).unwrap();
+            plant_vector(&db.store(), "onnx", "/models/e5.onnx", 4);
+        }
+
+        crate::test_env::remove_var(unset);
+        let db = Database::open(&tmp.0).unwrap();
+        assert_eq!(
+            stored_vector_counts(&db.store()),
+            1,
+            "an unset {unset} must not clear the stored vectors"
+        );
+        assert_status_names(&db, unset);
+    }
+    clear_embedding_env();
+}
+
+#[test]
+fn reopening_openai_with_a_different_model_still_clears_stored_vectors() {
+    // Guard for the fix above: a real identity change still clears
+    // (ADR-0002). A fix that skipped reconcile for every openai open, or
+    // compared only the backend, would keep the stale vector and fail here.
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDb::new("openai_model_change");
+    clear_embedding_env();
+    crate::test_env::set_var(EMBEDDING_BACKEND_ENV, "openai");
+    crate::test_env::set_var(OPENAI_EMBED_MODEL_ENV, "m");
+    crate::test_env::set_var(EMBEDDING_DIM_ENV, "4");
+    {
+        let db = Database::open(&tmp.0).unwrap();
+        plant_vector(&db.store(), "openai", "m", 4);
+    }
+
+    crate::test_env::set_var(OPENAI_EMBED_MODEL_ENV, "m2");
+    let db = Database::open(&tmp.0).unwrap();
+    assert_eq!(stored_vector_counts(&db.store()), 0);
     clear_embedding_env();
 }

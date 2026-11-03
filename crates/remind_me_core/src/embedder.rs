@@ -29,6 +29,14 @@
 //! (#56) convention of "the risky/heavy thing stays off until asked for." A
 //! caller that gets `None` degrades to keyword-only search; nothing here
 //! ever makes that an error.
+//!
+//! It also returns `None` for a backend chosen without a setting it cannot
+//! embed without (`openai`'s model, `onnx`'s two paths): such an embedder
+//! cannot embed, so it has no identity to compare stored vectors against.
+//! For the settings in the identity (`openai`'s model, `onnx`'s model path)
+//! treating the blank one as a model change cleared them all on open (#351).
+//! [`configured_embedder`] keeps that case apart so status can name the
+//! missing setting.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -851,11 +859,11 @@ fn availability_cell() -> &'static Mutex<Option<AvailabilityCache>> {
     AVAILABILITY.get_or_init(|| Mutex::new(None))
 }
 
-/// Every environment variable [`resolve_embedder`] reads, joined into one
+/// Every environment variable [`configured_embedder`] reads, joined into one
 /// value that changes whenever the resolved embedder would.
 ///
 /// This exists because [`available_embedder`]'s cache is keyed on it, and
-/// that is what keeps `resolve_embedder`'s documented promise — "a
+/// that is what keeps `configured_embedder`'s documented promise — "a
 /// configuration change takes effect on the next search rather than requiring
 /// a restart" — true of the *availability-gated* resolver too. Without it a
 /// verdict reached about one backend answered for a different one: point the
@@ -864,7 +872,7 @@ fn availability_cell() -> &'static Mutex<Option<AvailabilityCache>> {
 /// [`AVAILABILITY_FAILURE_TTL`], because nothing invalidated the failure the
 /// old address earned.
 ///
-/// The list must stay in step with `resolve_embedder`. A variable it reads
+/// The list must stay in step with `configured_embedder`. A variable it reads
 /// but this omits is a variable you can change without the cache noticing —
 /// which is the bug this function exists to close, reintroduced quietly.
 fn config_fingerprint() -> String {
@@ -887,14 +895,36 @@ fn config_fingerprint() -> String {
     .join("\u{1f}")
 }
 
-/// Build the configured embedder, or `None` when nothing is configured.
+/// What the embedding settings in the environment configure.
+pub enum ConfiguredEmbedder {
+    /// `REMIND_ME_EMBEDDING_BACKEND` names no backend: keyword-only search.
+    Off,
+    /// A backend is named but a setting it cannot embed without is unset or
+    /// blank; `reason` names that setting.
+    ///
+    /// It cannot embed, so it has no identity and nothing compares, clears
+    /// or records vectors against it (#351). An identity built from a blank
+    /// model setting (`openai`'s model, `onnx`'s model path) would differ
+    /// from the stored one and clear every vector on the next open, leaving
+    /// nothing to re-embed them with.
+    Unusable { reason: String },
+    /// A backend with every setting it needs. It may still be unreachable;
+    /// [`available_embedder`] probes that.
+    Ready(Box<dyn Embedder>),
+}
+
+/// The value of `key`, or `None` when it is unset or blank. The value is
+/// returned untrimmed so it still matches the identity it was recorded under.
+fn non_blank_env(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|v| !v.trim().is_empty())
+}
+
+/// Read the embedding configuration from the environment.
 ///
 /// Reads the environment fresh on every call — cheap, and it means a
 /// configuration change takes effect on the next search rather than
-/// requiring a restart. Returns `None` when `REMIND_ME_EMBEDDING_BACKEND` is
-/// anything other than `ollama`/`openai`/`onnx`; that is the disabled state, not an
-/// error.
-pub fn resolve_embedder() -> Option<Box<dyn Embedder>> {
+/// requiring a restart.
+pub fn configured_embedder() -> ConfiguredEmbedder {
     let backend = std::env::var(EMBEDDING_BACKEND_ENV).unwrap_or_default();
     let dim = std::env::var(EMBEDDING_DIM_ENV)
         .ok()
@@ -906,25 +936,58 @@ pub fn resolve_embedder() -> Option<Box<dyn Embedder>> {
                 std::env::var(OLLAMA_URL_ENV).unwrap_or_else(|_| DEFAULT_OLLAMA_URL.to_string());
             let model = std::env::var(OLLAMA_MODEL_ENV)
                 .unwrap_or_else(|_| DEFAULT_OLLAMA_MODEL.to_string());
-            Some(Box::new(OllamaEmbedder::new(model, url, dim)))
+            ConfiguredEmbedder::Ready(Box::new(OllamaEmbedder::new(model, url, dim)))
         }
         "openai" => {
+            let Some(model) = non_blank_env(OPENAI_EMBED_MODEL_ENV) else {
+                return unusable("openai", &[OPENAI_EMBED_MODEL_ENV]);
+            };
             let url = std::env::var(OPENAI_EMBED_URL_ENV)
                 .unwrap_or_else(|_| DEFAULT_OPENAI_EMBED_URL.to_string());
-            let model = std::env::var(OPENAI_EMBED_MODEL_ENV).unwrap_or_default();
-            Some(Box::new(OpenAiEmbedder::new(model, url, dim)))
+            ConfiguredEmbedder::Ready(Box::new(OpenAiEmbedder::new(model, url, dim)))
         }
         "onnx" => {
-            let model_path = std::env::var(ONNX_MODEL_PATH_ENV).unwrap_or_default();
-            let tokenizer_path = std::env::var(ONNX_TOKENIZER_PATH_ENV).unwrap_or_default();
-            // Unlike Ollama, an empty path is never usable, but resolving is
-            // still config-only here: `available_embedder`'s probe (below)
-            // is what turns "onnx requested but unconfigured" into the same
-            // "unavailable" state an unreachable Ollama daemon gets, via the
-            // same mechanism rather than a second special case.
-            Some(Box::new(OnnxEmbedder::new(model_path, tokenizer_path, dim)))
+            let (model_path, tokenizer_path) = (
+                non_blank_env(ONNX_MODEL_PATH_ENV),
+                non_blank_env(ONNX_TOKENIZER_PATH_ENV),
+            );
+            let (Some(model_path), Some(tokenizer_path)) = (&model_path, &tokenizer_path) else {
+                let missing: Vec<&str> = [
+                    (model_path.is_none(), ONNX_MODEL_PATH_ENV),
+                    (tokenizer_path.is_none(), ONNX_TOKENIZER_PATH_ENV),
+                ]
+                .into_iter()
+                .filter_map(|(absent, key)| absent.then_some(key))
+                .collect();
+                return unusable("onnx", &missing);
+            };
+            ConfiguredEmbedder::Ready(Box::new(OnnxEmbedder::new(model_path, tokenizer_path, dim)))
         }
-        _ => None,
+        _ => ConfiguredEmbedder::Off,
+    }
+}
+
+/// The [`ConfiguredEmbedder::Unusable`] for `backend` missing `settings`.
+fn unusable(backend: &str, settings: &[&str]) -> ConfiguredEmbedder {
+    ConfiguredEmbedder::Unusable {
+        reason: format!(
+            "{EMBEDDING_BACKEND_ENV}={backend} needs {}; semantic search is off and stored \
+             vectors are kept until it is set",
+            settings.join(" and ")
+        ),
+    }
+}
+
+/// The configured embedder, or `None` when none is configured or the one
+/// configured cannot embed ([`ConfiguredEmbedder`]).
+///
+/// Config only, no probe. `None` is the disabled state, not an error: the
+/// caller degrades to keyword-only search. [`configured_embedder`] tells the
+/// two `None` cases apart for a status report.
+pub fn resolve_embedder() -> Option<Box<dyn Embedder>> {
+    match configured_embedder() {
+        ConfiguredEmbedder::Ready(embedder) => Some(embedder),
+        ConfiguredEmbedder::Off | ConfiguredEmbedder::Unusable { .. } => None,
     }
 }
 
@@ -984,12 +1047,20 @@ pub fn available_embedder() -> Option<Box<dyn Embedder>> {
 /// state `server_status` cannot see.
 pub fn embedding_status() -> crate::status::SubsystemStatus {
     use crate::status::SubsystemStatus;
-    if resolve_embedder().is_none() {
-        return SubsystemStatus::NotImplemented {
-            reason: "no embedding backend configured; set REMIND_ME_EMBEDDING_BACKEND to \
-                     ollama, openai or onnx to enable semantic search"
-                .to_string(),
-        };
+    match configured_embedder() {
+        ConfiguredEmbedder::Off => {
+            return SubsystemStatus::NotImplemented {
+                reason: "no embedding backend configured; set REMIND_ME_EMBEDDING_BACKEND to \
+                         ollama, openai or onnx to enable semantic search"
+                    .to_string(),
+            };
+        }
+        // Refused before the probe, so the reason names the missing setting
+        // rather than a failed connection.
+        ConfiguredEmbedder::Unusable { reason } => {
+            return SubsystemStatus::NotImplemented { reason };
+        }
+        ConfiguredEmbedder::Ready(_) => {}
     }
     if available_embedder().is_some() {
         SubsystemStatus::Active
@@ -997,7 +1068,7 @@ pub fn embedding_status() -> crate::status::SubsystemStatus {
         SubsystemStatus::NotImplemented {
             reason: format!(
                 "REMIND_ME_EMBEDDING_BACKEND={} is configured but not answering (unreachable \
-                 daemon, or an unconfigured/unloadable ONNX model)",
+                 daemon, or an unloadable ONNX model)",
                 std::env::var(EMBEDDING_BACKEND_ENV).unwrap_or_default()
             ),
         }
