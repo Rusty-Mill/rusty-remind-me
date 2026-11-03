@@ -17,8 +17,9 @@ use remind_me_core::db::sync_state::SyncState;
 use remind_me_core::db::vectors::Vectors;
 use remind_me_core::db::Store;
 use remind_me_core::embedder::{
-    embedding_status, EMBEDDING_BACKEND_ENV, EMBEDDING_DIM_ENV, OLLAMA_MODEL_ENV,
-    ONNX_MODEL_PATH_ENV, ONNX_TOKENIZER_PATH_ENV, OPENAI_EMBED_MODEL_ENV,
+    embedding_status, DEFAULT_EMBEDDING_DIM, DEFAULT_OLLAMA_MODEL, EMBEDDING_BACKEND_ENV,
+    EMBEDDING_DIM_ENV, OLLAMA_MODEL_ENV, ONNX_MODEL_PATH_ENV, ONNX_TOKENIZER_PATH_ENV,
+    OPENAI_EMBED_MODEL_ENV,
 };
 use remind_me_core::status::{server_status, SubsystemStatus};
 use remind_me_core::sync::{HUB_URL_ENV, NODE_ID_ENV, SYNC_SECRET_ENV};
@@ -450,5 +451,97 @@ fn reopening_openai_with_a_different_model_still_clears_stored_vectors() {
     crate::test_env::set_var(OPENAI_EMBED_MODEL_ENV, "m2");
     let db = Database::open(&tmp.0).unwrap();
     assert_eq!(stored_vector_counts(&db.store()), 0);
+    clear_embedding_env();
+}
+
+// ---------------------------------------------------------------------------
+// A blank Ollama model or a malformed dimension is not an identity (#362)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn reopening_ollama_with_a_blank_model_keeps_vectors_and_names_the_variable() {
+    // Unset means the default model; set but blank is a slip, not a model.
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    for (case, model) in [("empty", ""), ("blank", "  ")] {
+        let tmp = TempDb::new(&format!("ollama_blank_model_{case}"));
+        clear_embedding_env();
+        crate::test_env::set_var(EMBEDDING_BACKEND_ENV, "ollama");
+        crate::test_env::set_var(EMBEDDING_DIM_ENV, "4");
+        {
+            let db = Database::open(&tmp.0).unwrap();
+            plant_stale_vector(&db.store(), DEFAULT_OLLAMA_MODEL, 4);
+        }
+
+        crate::test_env::set_var(OLLAMA_MODEL_ENV, model);
+        let db = Database::open(&tmp.0).unwrap();
+        assert_eq!(
+            stored_vector_counts(&db.store()),
+            1,
+            "an {case} {OLLAMA_MODEL_ENV} must not clear the stored vectors"
+        );
+        assert_status_names(&db, OLLAMA_MODEL_ENV);
+    }
+    clear_embedding_env();
+}
+
+#[test]
+fn reopening_with_a_malformed_dimension_keeps_vectors_and_names_the_variable() {
+    // Each value used to fall back to the default dimension (or, for "0",
+    // to a dimension nothing embeds at), read as a change, and clear.
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let cases = [
+        ("ollama", "38 4"),
+        ("ollama", "1024x"),
+        ("ollama", "0"),
+        ("ollama", ""),
+        ("ollama", " 4"),
+        ("openai", "abc"),
+    ];
+    for (index, (backend, dim)) in cases.into_iter().enumerate() {
+        let tmp = TempDb::new(&format!("malformed_dim_{index}"));
+        clear_embedding_env();
+        crate::test_env::set_var(EMBEDDING_BACKEND_ENV, backend);
+        crate::test_env::set_var(OLLAMA_MODEL_ENV, "m");
+        crate::test_env::set_var(OPENAI_EMBED_MODEL_ENV, "m");
+        crate::test_env::set_var(EMBEDDING_DIM_ENV, "4");
+        {
+            let db = Database::open(&tmp.0).unwrap();
+            plant_vector(&db.store(), backend, "m", 4);
+        }
+
+        crate::test_env::set_var(EMBEDDING_DIM_ENV, dim);
+        let db = Database::open(&tmp.0).unwrap();
+        assert_eq!(
+            stored_vector_counts(&db.store()),
+            1,
+            "{EMBEDDING_DIM_ENV}={dim:?} on {backend} must not clear the stored vectors"
+        );
+        assert_status_names(&db, EMBEDDING_DIM_ENV);
+    }
+    clear_embedding_env();
+}
+
+#[test]
+fn reopening_ollama_with_model_and_dimension_unset_uses_the_defaults() {
+    // Guard for the two refusals above: unset still means the documented
+    // default. A fix that refused an unset model or dimension would leave
+    // status off here; one that stopped defaulting would clear the vector.
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDb::new("ollama_defaults");
+    clear_embedding_env();
+    crate::test_env::set_var(EMBEDDING_BACKEND_ENV, "ollama");
+    {
+        let db = Database::open(&tmp.0).unwrap();
+        plant_stale_vector(&db.store(), DEFAULT_OLLAMA_MODEL, DEFAULT_EMBEDDING_DIM);
+    }
+
+    let db = Database::open(&tmp.0).unwrap();
+    assert_eq!(stored_vector_counts(&db.store()), 1);
+    let report = server_status(&db.store()).unwrap();
+    assert!(
+        matches!(report.embeddings, SubsystemStatus::Active),
+        "expected Active, got {:?}",
+        report.embeddings
+    );
     clear_embedding_env();
 }

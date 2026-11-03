@@ -13,6 +13,14 @@ Dated entries, newest first. One entry per merged pull request.
 ### Tests
 - `transcript`: a posted message is kept in full and is the last reply while another tool in the same message keeps its preview; a tool left out of the setting keeps its preview; the setting's defaults, blank value, whitespace and malformed pairs. Within one message the reply is whichever of text and posted messages comes last, and the dialog lists text and tool lines in the order they were written (`ChatMessage::text_blocks`, `ToolUseSummary::block`): text then post, post then text, and interleaved posts and text.
 
+## 2026-11-03 — A blank Ollama model or a malformed dimension no longer clears stored vectors (#362)
+
+### Fixed
+- `REMIND_ME_OLLAMA_EMBED_MODEL` set but blank became model `""`, and a `REMIND_ME_EMBEDDING_DIM` that did not parse fell back to the default dimension (`"0"` parsed to 0). Either read as a model change on the next open and cleared every stored vector. Both now make the embedder unusable, as #351 did for `openai` and `onnx`: the open keeps the vectors, semantic search stays off, and both status surfaces name the variable. Unset still means the default model and dimension. A set dimension must be a positive integer with no surrounding spaces, so `" 384"` is refused rather than trimmed. A set-but-empty `REMIND_ME_EMBEDDING_DIM=` (for example from compose substitution of an unset host variable) used to mean 384 and now turns semantic search off with the reason in status; unset it to get the default. A non-Unicode Ollama model or dimension is refused rather than read as unset (not covered by a test).
+
+### Tests
+- `open_reconcile_test`: reopening `ollama` with the model empty or blank, and with the dimension `"38 4"`, `"1024x"`, `"0"`, `""` or `" 4"` (and `"abc"` on `openai`), keeps the stored vector and names the variable in status (on the base the first of each went from 1 vector to 0); a guard that `ollama` with model and dimension unset keeps a vector stored under the defaults and reports `Active`, which goes red on a mutant that refuses an unset model.
+
 ## 2026-11-03 — A missing embedder setting no longer clears stored vectors (#351)
 
 ### Fixed
