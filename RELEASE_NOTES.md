@@ -17,6 +17,7 @@ Dated entries, newest first. One entry per merged pull request.
 
 ### Tests
 - `redact`: slugs and branch names after `sk-`; decimals, plus a card before a full stop; the Luhn-valid prefix case; three Diners cards; 200 KB of each of seven anchors (including `ghp_` and `sk_live_`) within 500 ms; a token nested in an invalid outer prefix (`ghp_ghp_…`, `npm_npm_…`, `sk_live_sk_live_…`, `whsec_whsec_…`) and a valid token followed by such a pair lose their whole bodies. `boundary`: a card as a JSON number is scrubbed. All six failed on the base. The existing nested-prefix test's `sk-` bodies now carry `X9`, since an all-`a` run is no longer a key.
+
 ## 2026-11-03 — An embedding with a non-numeric element is refused, and a NaN vector cannot break search (#352)
 
 ### Fixed
