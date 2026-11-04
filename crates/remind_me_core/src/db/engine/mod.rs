@@ -19,6 +19,7 @@ pub(crate) mod curation;
 pub(crate) mod feedback;
 pub(crate) mod graph;
 pub(crate) mod imports;
+pub(crate) mod legacy_upgrade;
 pub(crate) mod memories;
 pub(crate) mod memories_v31;
 pub(crate) mod outbox;

@@ -14,13 +14,11 @@
 //! [`MemoryRow`].
 
 use super::memories::{ByDoc, CreatedAt, MemoryRecord, MemoryRow, MemoryTable};
-use super::{engine_error, open_core};
+use super::{engine_error, legacy_upgrade, open_core};
 use crate::db::Result;
-use rusty_multimodal_db_engine::generic::insert_log;
 use rusty_multimodal_db_engine::generic::traits::{
     IndexedField, Record, ScannableField, SchemaTag,
 };
-use rusty_multimodal_db_engine::generic::GenericMmapStore;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use uuid::Uuid;
@@ -117,6 +115,14 @@ pub(crate) struct MemoryRecordV31 {
     pub(crate) row: MemoryRowV31,
 }
 
+impl MemoryRecordV31 {
+    /// The record under the current layout. Its engine id, derived from
+    /// the row's id, is unchanged.
+    fn into_current(self) -> MemoryRecord {
+        MemoryRecord::new(self.row.into_current())
+    }
+}
+
 impl Record for MemoryRecordV31 {
     type Id = Uuid;
     fn id(&self) -> Uuid {
@@ -146,8 +152,6 @@ impl ScannableField<CreatedAt> for MemoryRecordV31 {
     }
 }
 
-pub(crate) type MemoryTableV31 = GenericMmapStore<MemoryRecordV31, ByDoc, CreatedAt>;
-
 /// Open the `memories` table at `path`, creating it if absent, and
 /// upgrading it first when it was written under the v31 layout.
 ///
@@ -169,18 +173,10 @@ pub(crate) fn open_memories(path: &Path) -> Result<MemoryTable> {
     }
 }
 
-/// Read the v31 table at `path`, including what its insert log holds, and
-/// reopen it under the current layout. The log is folded into the records
-/// read, so it is cleared before the reopen would try to read it under the
-/// current tag.
+/// Rewrite the v31 table at `path` under the current layout, crash-safely:
+/// see [`legacy_upgrade`].
 fn upgrade(path: &Path) -> Result<MemoryTable> {
-    let legacy = MemoryTableV31::read_portable_records(path).map_err(engine_error)?;
-    let current: Vec<MemoryRecord> = legacy
-        .into_iter()
-        .map(|record| MemoryRecord::new(record.row.into_current()))
-        .collect();
-    insert_log::clear(&insert_log::log_path(path)).map_err(engine_error)?;
-    MemoryTable::open(current, path).map_err(engine_error)
+    legacy_upgrade::upgrade(path, MemoryRecordV31::into_current)
 }
 
 #[cfg(test)]
@@ -189,7 +185,12 @@ mod tests {
     use crate::db::engine::engine_id;
     use crate::db::engine::memories::MemoryRow;
     use crate::db::memories::NewMemory;
+    use rusty_multimodal_db_engine::durability::record_blob::TEMP_SUFFIX;
     use rusty_multimodal_db_engine::generic::query::{AllIds, GetById};
+    use rusty_multimodal_db_engine::generic::{insert_log, record_blob, GenericMmapStore};
+
+    /// The table as a build before v32 opened it.
+    type MemoryTableV31 = GenericMmapStore<MemoryRecordV31, ByDoc, CreatedAt>;
 
     const NOW: &str = "2026-09-26T00:00:00+00:00";
 
@@ -281,6 +282,123 @@ mod tests {
         let again = MemoryTable::open_portable(&path).unwrap();
         assert_eq!(again.all_ids().len(), 2);
         drop(again);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("remind_me_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A v31 table whose insert log holds a new row "c", a newer version
+    /// of blob row "b", and a tombstone for blob row "a".
+    fn legacy_table_with_log(path: &Path) {
+        let mut table = MemoryTableV31::create(vec![legacy("a"), legacy("b")], path).unwrap();
+        table.insert(legacy("c")).unwrap();
+        let mut newer = legacy("b");
+        newer.row.content = "content b, edited".to_string();
+        table.replace(newer).unwrap();
+        table.delete(engine_id("a")).unwrap();
+    }
+
+    /// The table's string ids, sorted, and row "b"'s content.
+    fn ids_and_b(table: &MemoryTable) -> (Vec<String>, String) {
+        let mut ids: Vec<String> = table
+            .all_ids()
+            .into_iter()
+            .filter_map(|id| table.get(id))
+            .map(|r| r.row.id)
+            .collect();
+        ids.sort();
+        (ids, table.get(engine_id("b")).unwrap().row.content)
+    }
+
+    fn temp_blob(path: &Path) -> std::ffi::OsString {
+        let mut temp = record_blob::blob_path(path).into_os_string();
+        temp.push(TEMP_SUFFIX);
+        temp
+    }
+
+    #[test]
+    fn a_failed_publish_leaves_the_v31_table_whole_and_a_retry_upgrades_it() {
+        let dir = scratch("engine_memories_v31_failed_publish");
+        let path = dir.join("memories.mmap");
+        legacy_table_with_log(&path);
+        // A directory where the new blob's temp file goes makes publication fail.
+        let temp = temp_blob(&path);
+        std::fs::create_dir(&temp).unwrap();
+
+        assert!(open_memories(&path).is_err(), "publication must fail");
+        let kept = MemoryTableV31::read_portable_records(&path).unwrap();
+        let mut ids: Vec<&str> = kept.iter().map(|r| r.row.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["b", "c"], "the v31 blob and log are both intact");
+
+        std::fs::remove_dir(&temp).unwrap();
+        let table = open_memories(&path).unwrap();
+        assert_eq!(
+            ids_and_b(&table),
+            (vec!["b".into(), "c".into()], "content b, edited".into()),
+            "log-only row and newer version kept, tombstone honoured"
+        );
+        drop(table);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_upgrade_interrupted_after_publication_resumes_from_the_mixed_layout() {
+        let dir = scratch("engine_memories_v31_mixed");
+        let path = dir.join("memories.mmap");
+        legacy_table_with_log(&path);
+        // A crash between publishing the v32 blob and removing the v31 log.
+        let folded = legacy_upgrade::fold(&path, MemoryRecordV31::into_current).unwrap();
+        legacy_upgrade::publish(&path, &folded).unwrap();
+        assert!(
+            insert_log::log_path(&path).exists(),
+            "the v31 log is still there"
+        );
+        assert!(MemoryTable::open_portable(&path).is_err(), "mixed layout");
+
+        let table = open_memories(&path).unwrap();
+        assert_eq!(
+            ids_and_b(&table),
+            (vec!["b".into(), "c".into()], "content b, edited".into()),
+            "the replayed log changes nothing"
+        );
+        drop(table);
+        let again = MemoryTable::open_portable(&path).unwrap();
+        assert_eq!(again.all_ids().len(), 2, "finished: no upgrade needed");
+        drop(again);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_torn_temp_blob_from_an_interrupted_publish_is_ignored() {
+        let dir = scratch("engine_memories_v31_torn_temp");
+        let path = dir.join("memories.mmap");
+        legacy_table_with_log(&path);
+        std::fs::write(temp_blob(&path), b"half a blob").unwrap();
+
+        let table = open_memories(&path).unwrap();
+        assert_eq!(ids_and_b(&table).0, ["b", "c"]);
+        drop(table);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_row_deleted_then_logged_again_survives_the_upgrade() {
+        let dir = scratch("engine_memories_v31_reinsert");
+        let path = dir.join("memories.mmap");
+        {
+            let mut table = MemoryTableV31::create(vec![legacy("a")], &path).unwrap();
+            table.delete(engine_id("a")).unwrap();
+            table.insert(legacy("a")).unwrap();
+        }
+        let table = open_memories(&path).unwrap();
+        assert!(table.get(engine_id("a")).is_some());
+        drop(table);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

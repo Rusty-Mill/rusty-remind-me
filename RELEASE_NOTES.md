@@ -2,6 +2,17 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-04 — The v31 memories upgrade no longer loses logged rows on a failure
+
+### Fixed
+- Opening a store whose `memories` table predates schema v32 rewrote it under the current layout, but removed the table's insert log before the rewritten blob was on disk. A crash or write error in between lost memories that only the log held, lost newer logged versions, and brought back memories a logged tombstone had deleted. The upgrade now reads everything first, publishes the new blob durably (temp file, `fsync`, rename), and only then removes the old log. The next open resumes from any intermediate state, including a published `@2` blob beside a `@1` log. Raised in review of #367, which fixes the same pattern in its own v33 upgrade.
+
+### Changed
+- The crash-safe upgrade lives in `db::engine::legacy_upgrade`, generic over the legacy and current record types, so the next layout change reuses it. The v33 `revisions_v1` upgrade from #367 now uses it too, in place of its own copy.
+
+### Tests
+- `memories_v31`: a failed publication leaves the v31 blob and log intact and a retry upgrades them; an upgrade stopped after publication resumes from the mixed layout; a torn temp blob is ignored; a row deleted and logged again survives. Each case checks a log-only row, a newer logged version and a logged tombstone. The failed-publication case fails on the base: the log-only row is lost and the deleted row returns.
+
 ## 2026-11-04 — Schema v33: a project edit can be reverted (card #702)
 
 ### Fixed
