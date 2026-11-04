@@ -29,6 +29,7 @@ pub(crate) mod references;
 pub(crate) mod related;
 pub(crate) mod reminders;
 pub(crate) mod revisions;
+pub(crate) mod revisions_v1;
 pub(crate) mod saved_searches;
 pub(crate) mod sessions;
 pub(crate) mod stats;
@@ -181,7 +182,7 @@ impl EngineTables {
             spans: open_core(&dir.join("import_archive_spans.mmap"))?,
             sync_log: open_core(&dir.join("sync_log.mmap"))?,
             snapshots: open_core(&dir.join("analytics_snapshots.mmap"))?,
-            revisions: open_core(&dir.join("memory_revisions.mmap"))?,
+            revisions: revisions_v1::open_revisions(&dir.join("memory_revisions.mmap"))?,
             wiki_pages: open_core(&dir.join("wiki_pages.mmap"))?,
             wiki_links: open_core(&dir.join("wiki_links.mmap"))?,
             wiki_meta: open_core(&dir.join("wiki_meta.mmap"))?,

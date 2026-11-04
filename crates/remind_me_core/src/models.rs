@@ -1845,6 +1845,10 @@ pub struct MemoryRevision {
     pub sensitive: Option<bool>,
     pub edited_at: String,
     pub revision_reason: Option<String>,
+    /// The project the edit replaced: `Some(None)` for no project, `None`
+    /// (omitted from JSON) for a revision from before schema v33.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<Option<String>>,
 }
 
 /// Request for a memory's revisions.

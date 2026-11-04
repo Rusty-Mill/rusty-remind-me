@@ -83,6 +83,9 @@ pub struct TrackedChanges {
     pub tags_json: Option<String>,
     pub metadata_json: Option<String>,
     pub sensitive: Option<bool>,
+    /// `None` leaves the project alone; `Some(None)` clears it, which only a
+    /// revert does.
+    pub project: Option<Option<String>>,
 }
 
 impl TrackedChanges {
@@ -92,6 +95,7 @@ impl TrackedChanges {
             && self.tags_json.is_none()
             && self.metadata_json.is_none()
             && self.sensitive.is_none()
+            && self.project.is_none()
     }
 
     fn differs_from(&self, stored: &Tracked) -> bool {
@@ -108,6 +112,10 @@ impl TrackedChanges {
             || self
                 .sensitive
                 .is_some_and(|v| v != stored.sensitive.unwrap_or(false))
+            || self
+                .project
+                .as_ref()
+                .is_some_and(|v| stored.project.as_ref() != Some(v))
     }
 }
 
@@ -161,6 +169,8 @@ pub fn revert(
         tags_json: Some(target.tags.clone()),
         metadata_json: Some(target.metadata.clone()),
         sensitive: target.sensitive,
+        // Unknown in a revision from before v33: the project is left alone.
+        project: target.project.clone(),
     };
     let stated = reason
         .map(str::to_string)

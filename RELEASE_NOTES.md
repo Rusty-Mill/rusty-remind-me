@@ -13,6 +13,22 @@ Dated entries, newest first. One entry per merged pull request.
 ### Tests
 - `memories_v31`: a failed publication leaves the v31 blob and log intact and a retry upgrades them; an upgrade stopped after publication resumes from the mixed layout; a torn temp blob is ignored; a row deleted and logged again survives. Each case checks a log-only row, a newer logged version and a logged tombstone. The failed-publication case fails on the base: the log-only row is lost and the deleted row returns.
 
+## 2026-11-04 — Schema v33: a project edit can be reverted (card #702)
+
+### Fixed
+- Since #359, `remind_me_update` can set a memory's `project`, but the edit made no revision, so `remind_me_revert` could not undo it. That included the 52-memory backfill for #592. A revision now records the project the edit replaced. A project-only edit makes one revision, and setting the same project again makes none. A revert restores the project, clearing it when the revision held none, so a revert is the one way back to no project. The revert goes through the synced edit path, so peers get the restored project.
+
+### Changed
+- The engine's `memory_revisions` table moved to the `@2` layout (`RevisionRecord` gains `project`). A `@1` table is read under its own layout and rewritten at the next open, including its insert log. The upgrade publishes the `@2` blob durably (temp file, `fsync`, rename) before it removes the `@1` log, so a crash or error at any point leaves the legacy rows recoverable and the next open resumes, including from a published `@2` blob beside a `@1` log. Its revisions read the project as unknown, and reverting to one leaves the memory's project alone, as reverting an old revision does for `sensitive`. Revisions copied from a legacy SQLite file are unknown too. `SCHEMA_VERSION`, the stamp for the legacy SQLite schema, stays 32 because that schema did not change.
+- `remind_me_history` JSON carries `project` for a revision that recorded one (`null` for none) and omits it when unknown. The Markdown is unchanged.
+
+### Upgrade
+- **One-way:** after this build opens a store, an older build refuses it, because it can't read the `@2` revisions table. To roll back the binary, restore the store backup taken before the upgrade.
+
+### Tests
+- `revert_project_test`: reverting a project edit restores no project, and an earlier project; a project-only edit makes exactly one revision, and repeating it makes none; an edit that omits the project leaves it, and reverting that edit keeps it; reverting a project edit queues exactly one outbox `update`, whose payload carries the restored project. All but the omitted-project guard failed on the base.
+- `revisions_v1`: a `@1` table, with one row in the blob and one in the insert log, opens with both rows and the project unknown, and is rewritten so the next open needs no upgrade. A table under neither layout names both failures. A failed publication leaves the `@1` blob and log intact and a retry upgrades them; an upgrade stopped after publication resumes from the mixed layout; a torn temp blob is ignored. Each keeps a log-only revision and honours a logged tombstone. The failed-publication case lost the log-only revision on the first version of this change.
+
 ## 2026-11-03 — Redaction: fewer false positives, no half-hidden cards, linear scan (#353)
 
 ### Fixed

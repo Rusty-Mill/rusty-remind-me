@@ -260,6 +260,7 @@ mod tests {
                     tags: "not json".into(),
                     metadata: "{}".into(),
                     sensitive: None,
+                    project: None,
                 },
                 "2026-09-27T00:00:00+00:00",
             )
