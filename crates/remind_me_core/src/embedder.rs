@@ -417,19 +417,21 @@ fn with_prefix(model: &str, texts: &[String], role: EmbedRole) -> Vec<String> {
 
 /// One JSON embedding array as an L2-normalised vector, refusing one whose
 /// length is not `dim`: a mismatch is a configuration error, never a silent
-/// truncation or pad.
+/// truncation or pad. An element that is not a number finite as an `f32` is
+/// refused too, rather than stored as `0.0` or NaN (#352).
 fn checked_vector(
     value: &serde_json::Value,
     label: &str,
     model: &str,
     dim: usize,
 ) -> Result<Vec<f32>, EmbedError> {
-    let raw: Vec<f32> = value
+    let raw = value
         .as_array()
         .ok_or_else(|| EmbedError(format!("{label} embedding entry was not an array")))?
         .iter()
-        .map(|v| v.as_f64().unwrap_or(0.0) as f32)
-        .collect();
+        .enumerate()
+        .map(|(i, v)| finite_element(v, i, label))
+        .collect::<Result<Vec<f32>, EmbedError>>()?;
     if raw.len() != dim {
         return Err(EmbedError(format!(
             "{label} model {model:?} returned dim {}, but {EMBEDDING_DIM_ENV} is {dim}. Set the \
@@ -438,6 +440,17 @@ fn checked_vector(
         )));
     }
     Ok(l2_normalize(raw))
+}
+
+/// Element `index` of an embedding as an `f32`, if it is a JSON number that
+/// stays finite at `f32` width.
+fn finite_element(value: &serde_json::Value, index: usize, label: &str) -> Result<f32, EmbedError> {
+    let element = value.as_f64().map(|x| x as f32).filter(|x| x.is_finite());
+    element.ok_or_else(|| {
+        EmbedError(format!(
+            "{label} embedding element {index} is not a finite number: {value}"
+        ))
+    })
 }
 
 impl Embedder for OllamaEmbedder {
@@ -831,8 +844,18 @@ mod onnx_backend {
 }
 
 pub(crate) fn l2_normalize(vector: Vec<f32>) -> Vec<f32> {
-    let norm = vector.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
-    vector.into_iter().map(|x| x / norm).collect()
+    // Summed in f64: squaring a large finite f32 overflows to infinity, which
+    // would turn every element into 0.
+    let norm = vector
+        .iter()
+        .map(|&x| f64::from(x) * f64::from(x))
+        .sum::<f64>()
+        .sqrt()
+        .max(1e-9);
+    vector
+        .into_iter()
+        .map(|x| (f64::from(x) / norm) as f32)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

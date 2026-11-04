@@ -341,3 +341,47 @@ fn qwen3_embedding_queries_carry_its_instruction_and_passages_go_bare() {
     );
     assert_eq!(passage["input"][0], "quokkas");
 }
+
+#[test]
+fn a_non_finite_or_non_numeric_element_is_an_error_naming_the_entry() {
+    for element in ["null", "\"0.1\"", "1e39", "true"] {
+        let body = format!(r#"{{"data":[{{"index":0,"embedding":[1.0,{element}]}}]}}"#);
+        let (url, handle) = fake_server("200 OK", vec![body]);
+        let embedder = OpenAiEmbedder::new("m", url, 2);
+
+        let err = embedder
+            .embed(&["a".to_string()], EmbedRole::Passage)
+            .unwrap_err();
+
+        assert!(
+            err.0.contains("element 1") && err.0.contains("not a finite number"),
+            "{element}: {err}"
+        );
+        handle.join().unwrap();
+    }
+}
+
+#[test]
+fn an_element_too_large_for_json_is_an_error() {
+    let body = r#"{"data":[{"index":0,"embedding":[1.0,1e400]}]}"#.to_string();
+    let (url, handle) = fake_server("200 OK", vec![body]);
+    let embedder = OpenAiEmbedder::new("m", url, 2);
+
+    assert!(embedder
+        .embed(&["a".to_string()], EmbedRole::Passage)
+        .is_err());
+    handle.join().unwrap();
+}
+
+#[test]
+fn a_large_but_finite_vector_normalises_without_overflow() {
+    let (url, handle) = fake_server("200 OK", vec![response(&[(0, vec![1.5e38, 2e38])])]);
+    let embedder = OpenAiEmbedder::new("m", url, 2);
+
+    let vectors = embedder
+        .embed(&["a".to_string()], EmbedRole::Passage)
+        .unwrap();
+
+    assert!((vectors[0][0] - 0.6).abs() < 1e-5 && (vectors[0][1] - 0.8).abs() < 1e-5);
+    handle.join().unwrap();
+}
