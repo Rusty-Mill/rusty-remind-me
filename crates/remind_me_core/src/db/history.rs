@@ -21,6 +21,9 @@ pub struct Tracked {
     /// `None` when unreadable, as in a revision captured before the column
     /// existed.
     pub sensitive: Option<bool>,
+    /// `Some(project)`, which may itself be `None` (no project), or `None`
+    /// when unknown: a revision captured before schema v33 did not record it.
+    pub project: Option<Option<String>>,
 }
 
 /// The revision table and the tracked memory columns, on the engine.
@@ -117,6 +120,7 @@ mod tests {
             tags: "[]".to_string(),
             metadata: "{}".to_string(),
             sensitive: Some(true),
+            project: None,
         }
     }
 
