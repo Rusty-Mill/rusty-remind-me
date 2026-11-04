@@ -17,6 +17,17 @@ Dated entries, newest first. One entry per merged pull request.
 
 ### Tests
 - `redact`: slugs and branch names after `sk-`; decimals, plus a card before a full stop; the Luhn-valid prefix case; three Diners cards; 200 KB of each of seven anchors (including `ghp_` and `sk_live_`) within 500 ms; a token nested in an invalid outer prefix (`ghp_ghp_…`, `npm_npm_…`, `sk_live_sk_live_…`, `whsec_whsec_…`) and a valid token followed by such a pair lose their whole bodies. `boundary`: a card as a JSON number is scrubbed. All six failed on the base. The existing nested-prefix test's `sk-` bodies now carry `X9`, since an all-`a` run is no longer a key.
+## 2026-11-03 — An embedding with a non-numeric element is refused, and a NaN vector cannot break search (#352)
+
+### Fixed
+- An `/api/embed` or `/v1/embeddings` reply whose embedding held `null`, a string, a boolean or a number too large for `f32` was accepted, with the element stored as `0.0` or infinity. Such a reply is now an error naming the element, and nothing is stored. Normalisation sums in `f64`, so a large but finite vector no longer normalises to all zeros.
+- Semantic search skips a stored vector whose similarity is NaN or infinite, which one stored before this fix can have, and ranks with a total order. Before, the NaN row was returned as a match, and enough of them could break the sort's ordering.
+
+### Corrected
+- The 2026-10-29 entry says Ollama requests are unchanged. That release also added the `qwen3-embed` query instruction, which applies on every backend, so Ollama Qwen3 queries changed too. Existing Ollama Qwen3 vectors are passages, which carry no prefix, so they need no reindex.
+
+### Tests
+- `openai_embedder_test`: `null`, `"0.1"`, `1e39` and `true` elements are each an error naming element 1; a `1e400` element is an error; a `[1.5e38, 2e38]` vector normalises to `[0.6, 0.8]` (all three failed on the base). `ollama_embedder_test`: a `null` element is an error. `vectors_test`: 20 NaN vectors among 20 finite ones are left out and the finite ones come back best first (failed on the base).
 
 ## 2026-11-03 — Capture keeps posted messages in full (card #706)
 
