@@ -11,12 +11,13 @@
 use super::revisions::{ByMemory, EditedAt, RevisionRecord, RevisionTable};
 use super::{engine_error, open_core};
 use crate::db::Result;
-use rusty_multimodal_db_engine::generic::insert_log;
+use rusty_multimodal_db_engine::generic::insert_log::{self, LogEntry};
+use rusty_multimodal_db_engine::generic::record_blob::{self, GenericRecordBlob};
 use rusty_multimodal_db_engine::generic::traits::{
     IndexedField, Record, ScannableField, SchemaTag,
 };
-use rusty_multimodal_db_engine::generic::GenericMmapStore;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
 
 /// One `memory_revisions` row as schema v32 and earlier stored it.
@@ -82,8 +83,6 @@ impl ScannableField<EditedAt> for RevisionRecordV1 {
     }
 }
 
-type RevisionTableV1 = GenericMmapStore<RevisionRecordV1, ByMemory, EditedAt>;
-
 /// Open the `memory_revisions` table at `path`, creating it if absent, and
 /// upgrading it first when it was written under the v32 layout.
 ///
@@ -105,23 +104,100 @@ pub(crate) fn open_revisions(path: &Path) -> Result<RevisionTable> {
     }
 }
 
-/// Read the v1 table at `path`, including its insert log, and reopen it
-/// under the current layout. The log is folded into the records read, so it
-/// is cleared before the reopen would read it under the current tag.
+/// Upgrade the table at `path` to the current layout, or finish an upgrade
+/// an earlier attempt left part-way.
+///
+/// Every step that writes happens only once the step before it is durable,
+/// so a crash or error anywhere leaves a state this function can resume
+/// from, and no legacy log entry loses its last durable copy:
+///
+/// 1. Read only: the base records, from the blob under either tag (`@2`
+///    once an earlier attempt published it), and the `@1` insert log.
+/// 2. Publish the folded records as a `@2` blob. The engine installs it by
+///    write-to-temp, `fsync`, rename and directory `fsync`, so the old blob
+///    stays whole until the new one is.
+/// 3. Only then remove the `@1` log, whose every entry the new blob holds.
+///    A retry between 2 and 3 folds the log into the `@2` blob again, which
+///    changes nothing: an item overwrites itself, a tombstone finds nothing.
 fn upgrade(path: &Path) -> Result<RevisionTable> {
-    let legacy = RevisionTableV1::read_portable_records(path).map_err(engine_error)?;
-    let current: Vec<RevisionRecord> = legacy
-        .into_iter()
-        .map(RevisionRecordV1::into_current)
-        .collect();
+    let records = fold(path)?;
+    publish(path, &records)?;
     insert_log::clear(&insert_log::log_path(path)).map_err(engine_error)?;
-    RevisionTable::open(current, path).map_err(engine_error)
+    RevisionTable::open(records, path).map_err(engine_error)
+}
+
+/// The table's records under the current layout: its blob, `@2` or `@1`,
+/// with its `@1` insert log applied. Reads only.
+fn fold(path: &Path) -> Result<Vec<RevisionRecord>> {
+    let blob = record_blob::blob_path(path);
+    let base = match record_blob::read::<RevisionRecord>(&blob) {
+        Ok(published) => published,
+        Err(current) => record_blob::read::<RevisionRecordV1>(&blob)
+            .map_err(|legacy| engine_error(format!("{current}; {legacy}")))?
+            .into_iter()
+            .map(RevisionRecordV1::into_current)
+            .collect(),
+    };
+    let logged = insert_log::read_entries::<RevisionRecordV1, i64>(
+        &insert_log::log_path(path),
+        RevisionRecordV1::SCHEMA_TAG,
+    )
+    .map_err(engine_error)?;
+    Ok(apply(base, logged))
+}
+
+/// `records` with each log entry applied in order, as the engine folds its
+/// own log: an item replaces the record with its id in place or is
+/// appended, and a tombstone removes the record it names, if any.
+fn apply(
+    records: Vec<RevisionRecord>,
+    logged: Vec<LogEntry<RevisionRecordV1, i64>>,
+) -> Vec<RevisionRecord> {
+    let mut slots: Vec<Option<RevisionRecord>> = records.into_iter().map(Some).collect();
+    let mut position: HashMap<i64, usize> = slots
+        .iter()
+        .flatten()
+        .enumerate()
+        .map(|(at, record)| (record.id, at))
+        .collect();
+    for entry in logged {
+        match entry {
+            LogEntry::Item(legacy) => {
+                let record = legacy.into_current();
+                match position.get(&record.id) {
+                    Some(&at) => slots[at] = Some(record),
+                    None => {
+                        position.insert(record.id, slots.len());
+                        slots.push(Some(record));
+                    }
+                }
+            }
+            LogEntry::Tombstone(id) => {
+                if let Some(at) = position.remove(&id) {
+                    slots[at] = None;
+                }
+            }
+        }
+    }
+    slots.into_iter().flatten().collect()
+}
+
+/// Durably install `records` as the table's `@2` blob.
+fn publish(path: &Path, records: &[RevisionRecord]) -> Result<()> {
+    GenericRecordBlob::new(records)
+        .encode()
+        .and_then(|encoded| encoded.write(&record_blob::blob_path(path)))
+        .map_err(engine_error)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusty_multimodal_db_engine::durability::record_blob::TEMP_SUFFIX;
     use rusty_multimodal_db_engine::generic::query::{AllIds, GetById};
+    use rusty_multimodal_db_engine::generic::GenericMmapStore;
+
+    type RevisionTableV1 = GenericMmapStore<RevisionRecordV1, ByMemory, EditedAt>;
 
     fn legacy(id: i64, content: &str) -> RevisionRecordV1 {
         RevisionRecordV1 {
@@ -172,6 +248,91 @@ mod tests {
         let again = RevisionTable::open_portable(&path).unwrap();
         assert_eq!(again.all_ids().len(), 2, "rewritten under the current tag");
         drop(again);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A v1 table holding revision 2 in its blob, revision 3 only in its
+    /// insert log, and a tombstone for revision 1, which the blob still has.
+    fn legacy_table_with_log(path: &Path) {
+        let mut table =
+            RevisionTableV1::create(vec![legacy(1, "a"), legacy(2, "b")], path).unwrap();
+        table.insert(legacy(3, "c")).unwrap();
+        table.delete(1).unwrap();
+    }
+
+    fn sorted_ids(table: &RevisionTable) -> Vec<i64> {
+        let mut ids = table.all_ids();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[test]
+    fn a_failed_publish_leaves_the_legacy_table_whole_and_a_retry_upgrades_it() {
+        let dir = scratch("engine_revisions_failed_publish");
+        let path = dir.join("memory_revisions.mmap");
+        legacy_table_with_log(&path);
+        // A directory where the new blob's temp file goes makes publication fail.
+        let mut temp = record_blob::blob_path(&path).into_os_string();
+        temp.push(TEMP_SUFFIX);
+        std::fs::create_dir(&temp).unwrap();
+
+        assert!(open_revisions(&path).is_err(), "publication must fail");
+        let kept = RevisionTableV1::read_portable_records(&path).unwrap();
+        let mut ids: Vec<i64> = kept.iter().map(|r| r.id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, [2, 3], "the v1 blob and log are both intact");
+
+        std::fs::remove_dir(&temp).unwrap();
+        let table = open_revisions(&path).unwrap();
+        assert_eq!(
+            sorted_ids(&table),
+            [2, 3],
+            "log-only row kept, tombstone honoured"
+        );
+        assert_eq!(table.get(3).unwrap().content, "c");
+        drop(table);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_upgrade_interrupted_after_publication_resumes_from_the_mixed_layout() {
+        let dir = scratch("engine_revisions_mixed");
+        let path = dir.join("memory_revisions.mmap");
+        legacy_table_with_log(&path);
+        // A crash between publishing the v2 blob and removing the v1 log.
+        publish(&path, &fold(&path).unwrap()).unwrap();
+        assert!(
+            insert_log::log_path(&path).exists(),
+            "the v1 log is still there"
+        );
+        assert!(RevisionTable::open_portable(&path).is_err(), "mixed layout");
+
+        let table = open_revisions(&path).unwrap();
+        assert_eq!(
+            sorted_ids(&table),
+            [2, 3],
+            "the replayed log changes nothing"
+        );
+        assert_eq!(table.get(3).unwrap().content, "c");
+        drop(table);
+        let again = RevisionTable::open_portable(&path).unwrap();
+        assert_eq!(sorted_ids(&again), [2, 3], "finished: no upgrade needed");
+        drop(again);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_torn_temp_blob_from_an_interrupted_publish_is_ignored() {
+        let dir = scratch("engine_revisions_torn_temp");
+        let path = dir.join("memory_revisions.mmap");
+        legacy_table_with_log(&path);
+        let mut temp = record_blob::blob_path(&path).into_os_string();
+        temp.push(TEMP_SUFFIX);
+        std::fs::write(&temp, b"half a blob").unwrap();
+
+        let table = open_revisions(&path).unwrap();
+        assert_eq!(sorted_ids(&table), [2, 3]);
+        drop(table);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
