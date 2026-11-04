@@ -794,6 +794,9 @@ pub(crate) fn restore_tracked(
         row.tags.clone_from(&values.tags);
         row.metadata.clone_from(&values.metadata);
         row.sensitive = values.sensitive.unwrap_or(false);
+        if let Some(project) = &values.project {
+            row.project.clone_from(project);
+        }
         row.updated_at = updated_at.to_string();
         Ok(())
     })
@@ -1116,6 +1119,7 @@ pub(crate) fn tracked(tables: &EngineTables, id: &str) -> Result<Option<Tracked>
         tags: row.tags,
         metadata: row.metadata,
         sensitive: Some(row.sensitive),
+        project: Some(row.project),
     }))
 }
 

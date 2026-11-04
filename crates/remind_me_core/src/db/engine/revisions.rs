@@ -29,18 +29,25 @@ pub struct EditedAt;
 pub(crate) type RevisionTable = GenericMmapStore<RevisionRecord, ByMemory, EditedAt>;
 
 /// One `memory_revisions` row.
+///
+/// Schema v33 added `project` (card #702), so the layout tag moved from `@1`
+/// to `@2`; [`super::revisions_v1`] reads and upgrades a `@1` table.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RevisionRecord {
-    id: i64,
-    memory_id: String,
-    content: String,
-    category: String,
-    tags: String,
-    metadata: String,
-    sensitive: Option<bool>,
-    edited_at: String,
-    edited_us: i64,
-    revision_reason: Option<String>,
+    pub(super) id: i64,
+    pub(super) memory_id: String,
+    pub(super) content: String,
+    pub(super) category: String,
+    pub(super) tags: String,
+    pub(super) metadata: String,
+    pub(super) sensitive: Option<bool>,
+    pub(super) edited_at: String,
+    pub(super) edited_us: i64,
+    pub(super) revision_reason: Option<String>,
+    /// The project the edit replaced, or `None` when unknown (a revision
+    /// from before v33, or copied from SQLite, which never stored it).
+    #[serde(default)]
+    pub(super) project: Option<Option<String>>,
 }
 
 impl RevisionRecord {
@@ -55,6 +62,7 @@ impl RevisionRecord {
             sensitive: self.sensitive,
             edited_at: self.edited_at.clone(),
             revision_reason: self.revision_reason.clone(),
+            project: self.project.clone(),
         }
     }
 
@@ -65,6 +73,7 @@ impl RevisionRecord {
             tags: self.tags.clone(),
             metadata: self.metadata.clone(),
             sensitive: self.sensitive,
+            project: self.project.clone(),
         }
     }
 }
@@ -77,7 +86,7 @@ impl Record for RevisionRecord {
 }
 
 impl SchemaTag for RevisionRecord {
-    const SCHEMA_TAG: &'static str = "rusty_remind_me::node::RevisionRecord@1";
+    const SCHEMA_TAG: &'static str = "rusty_remind_me::node::RevisionRecord@2";
 }
 
 impl IndexedField<ByMemory> for RevisionRecord {
@@ -117,6 +126,7 @@ pub(crate) fn insert(
         edited_at: edited_at.to_string(),
         edited_us: micros(edited_at),
         revision_reason: reason.map(str::to_string),
+        project: values.project.clone(),
     };
     tables.revisions.insert(record).map_err(engine_error)
 }
@@ -199,6 +209,7 @@ mod tests {
             tags: "[]".to_string(),
             metadata: "{}".to_string(),
             sensitive: None,
+            project: None,
         }
     }
 

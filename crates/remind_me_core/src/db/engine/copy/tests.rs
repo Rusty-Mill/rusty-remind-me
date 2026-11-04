@@ -429,6 +429,7 @@ fn new_ids_continue_past_the_copied_ones() {
                 tags: "[]".into(),
                 metadata: "{}".into(),
                 sensitive: None,
+                project: None,
             },
             "2026-03-01T00:00:00+00:00",
             None,

@@ -282,6 +282,7 @@ pub fn update_memory_with(
             .as_ref()
             .map(|m| serde_json::to_string(m).unwrap_or_else(|_| "{}".to_string())),
         sensitive: input.sensitive,
+        project: edit.project.clone().map(Some),
     };
     crate::history::capture_revision(store, &input.memory_id, &tracked, None)?;
 
