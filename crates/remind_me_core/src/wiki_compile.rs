@@ -16,9 +16,11 @@ use crate::db::memories::CreatedMemory;
 use crate::db::Store;
 use crate::embedder::{EmbedRole, Embedder};
 use crate::wiki::WikiPage;
-use crate::wiki_fs::{get_meta, set_meta, Wiki, WikiCompile};
-use chrono::{Duration, Utc};
+use crate::wiki_fs::{Wiki, WikiCompile};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
+use std::path::PathBuf;
+use std::sync::Mutex;
 
 /// Source characters one writer call carries at most; a larger group is
 /// written in consecutive calls on the same page.
@@ -29,9 +31,10 @@ pub const DEFAULT_MATCH: f32 = 0.55;
 const SECOND_PAGE_MARGIN: f32 = 0.05;
 /// A rewrite may not cut an existing page below this share of its length.
 const MIN_KEPT: f64 = 0.6;
-/// The `wiki_meta` key holding a running compile's lease.
-const LOCK_KEY: &str = "wiki_compile_lock";
-const LOCK_LEASE_MINUTES: i64 = 30;
+/// Wiki roots with a compile running. Only one process opens a store (the
+/// engine holds a lock for it), so an in-process set excludes every other
+/// run on the same wiki, atomically and for as long as the run takes.
+static RUNNING: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
 /// Memories a batch reads before the character budget trims it.
 const BATCH_LIMIT: usize = 100;
 
@@ -114,14 +117,12 @@ pub fn run(
     options: &AutoOptions,
 ) -> crate::db::Result<AutoReport> {
     let mut report = AutoReport::default();
-    if let Some(holder) = take_lock(store)? {
-        report.stopped = Some(format!("another compile has run since {holder}"));
+    let Some(_running) = RunGuard::take(wiki.root()) else {
+        report.stopped = Some("another compile is running on this wiki".to_string());
         report.pending = crate::wiki_fs::pending_compile_count(store)?;
         return Ok(report);
-    }
-    let result = run_batches(wiki, store, writer, embedder, options, &mut report);
-    set_meta(store, LOCK_KEY, "")?;
-    result?;
+    };
+    run_batches(wiki, store, writer, embedder, options, &mut report)?;
     report.pending = crate::wiki_fs::pending_compile_count(store)?;
     Ok(report)
 }
@@ -168,7 +169,6 @@ fn write_batch(
     let pages = wiki.list_pages(store)?;
     let groups = group(&pages, sources, embedder, options.match_threshold);
     let mut titles = Vec::new();
-    let mut written = String::new();
     for group in groups {
         let mut page = group.page.map(|i| pages[i].clone());
         for chunk in chunks(&group.sources, sources) {
@@ -197,9 +197,16 @@ fn write_batch(
             {
                 return Ok(Err(format!("{:?} is a reserved page name", draft.title)));
             }
-            written.push_str(&draft.content);
             titles.push(draft.title.clone());
             page = wiki.read_page(store, &draft.title)?;
+        }
+    }
+    // Checked against the pages as saved, not the drafts: a later rewrite of
+    // a page may have dropped a citation an earlier chunk wrote.
+    let mut written = String::new();
+    for title in titles.iter().collect::<BTreeSet<_>>() {
+        if let Some(page) = wiki.read_page(store, title)? {
+            written.push_str(&page.content);
         }
     }
     Ok(match uncited(sources, &written) {
@@ -396,18 +403,26 @@ fn uncited<'a>(sources: &'a [Source], written: &str) -> Option<&'a str> {
         .find(|id| !written.contains(id))
 }
 
-/// Take the run lease. `Some(holder)` when another run holds a live one.
-fn take_lock(store: &Store<'_>) -> crate::db::Result<Option<String>> {
-    let now = Utc::now();
-    if let Some(held) = get_meta(store, LOCK_KEY)?.filter(|v| !v.is_empty()) {
-        let live = chrono::DateTime::parse_from_rfc3339(&held)
-            .is_ok_and(|at| now - at.with_timezone(&Utc) < Duration::minutes(LOCK_LEASE_MINUTES));
-        if live {
-            return Ok(Some(held));
-        }
+/// A running compile's claim on its wiki root, released when dropped.
+struct RunGuard(PathBuf);
+
+impl RunGuard {
+    /// The claim on `root`, or `None` while another run holds it.
+    fn take(root: &std::path::Path) -> Option<Self> {
+        let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
+        running
+            .insert(root.to_path_buf())
+            .then(|| Self(root.to_path_buf()))
     }
-    set_meta(store, LOCK_KEY, &now.to_rfc3339())?;
-    Ok(None)
+}
+
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        RUNNING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.0);
+    }
 }
 
 #[cfg(test)]
@@ -482,6 +497,16 @@ mod tests {
             .collect();
         assert_eq!(ids, [vec!["a"], vec!["b"], vec!["c"], vec!["d"]]);
         assert_eq!(chunks(&[0, 3], &sources).len(), 1);
+    }
+
+    #[test]
+    fn a_wiki_root_is_claimed_by_one_run_at_a_time() {
+        let root = std::path::Path::new("/tmp/rrm-claim-test");
+        let first = RunGuard::take(root).unwrap();
+        assert!(RunGuard::take(root).is_none());
+        assert!(RunGuard::take(std::path::Path::new("/tmp/rrm-other")).is_some());
+        drop(first);
+        assert!(RunGuard::take(root).is_some());
     }
 
     #[test]

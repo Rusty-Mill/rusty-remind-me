@@ -5,7 +5,7 @@ use remind_me_core::db::memories::{Memories, NewMemory};
 use remind_me_core::db::Store;
 use remind_me_core::embedder::{EmbedError, EmbedRole, Embedder, EmbeddingIdentity};
 use remind_me_core::wiki_compile::{run, AutoOptions, PageDraft, PageRequest, WikiWriter};
-use remind_me_core::wiki_fs::{pending_compile_count, set_meta, Wiki};
+use remind_me_core::wiki_fs::{pending_compile_count, Wiki};
 use remind_me_core::Database;
 use std::cell::RefCell;
 
@@ -62,6 +62,8 @@ enum Fault {
     Fails,
     Shrinks,
     ForgetsCitations,
+    /// Rewrites a page without the citations it already had.
+    DropsEarlierCitations,
 }
 
 /// Appends a cited line per source to the page, or titles a new page after
@@ -99,6 +101,9 @@ impl WikiWriter for Scribe {
         };
         if self.fault == Fault::Shrinks {
             content = "gone".into();
+        }
+        if self.fault == Fault::DropsEarlierCitations {
+            content = content.replace(" (`mem_a`)", "");
         }
         for source in request.sources {
             match self.fault {
@@ -284,25 +289,80 @@ fn a_new_page_that_names_an_existing_one_is_guarded_as_a_rewrite() {
     std::fs::remove_dir_all(&root).unwrap();
 }
 
+/// A writer that, mid-run, starts a second compile on the same wiki.
+struct Reentrant<'a> {
+    wiki: &'a Wiki,
+    store: &'a Store<'a>,
+    inner: Scribe,
+    nested: RefCell<Option<remind_me_core::wiki_compile::AutoReport>>,
+}
+
+impl WikiWriter for Reentrant<'_> {
+    fn write_page(&self, request: &PageRequest<'_>) -> Result<PageDraft, String> {
+        let nested = run(
+            self.wiki,
+            self.store,
+            &Scribe::new(Fault::None),
+            None,
+            &AutoOptions::default(),
+        )
+        .unwrap();
+        *self.nested.borrow_mut() = Some(nested);
+        self.inner.write_page(request)
+    }
+}
+
 #[test]
-fn a_live_lock_stops_a_second_run_before_the_model_is_called() {
+fn a_second_run_on_the_same_wiki_stops_before_the_model_is_called() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
     let (w, root) = wiki("locked");
     remember(&store, &[("mem_a", "Rust has ownership")]);
-    set_meta(
+    let outer = Reentrant {
+        wiki: &w,
+        store: &store,
+        inner: Scribe::new(Fault::None),
+        nested: RefCell::new(None),
+    };
+
+    let report = run(&w, &store, &outer, None, &AutoOptions::default()).unwrap();
+
+    let nested = outer.nested.borrow_mut().take().unwrap();
+    assert!(nested.stopped.unwrap().contains("another compile"));
+    assert_eq!(nested.batches, 0);
+    // The first run carried on and finished; its claim was released after.
+    assert_eq!((report.batches, report.pending), (1, 0));
+    remember(&store, &[("mem_b", "Rust has traits")]);
+    let again = run(
+        &w,
         &store,
-        "wiki_compile_lock",
-        &chrono::Utc::now().to_rfc3339(),
+        &Scribe::new(Fault::None),
+        None,
+        &AutoOptions::default(),
     )
     .unwrap();
-    let scribe = Scribe::new(Fault::None);
+    assert_eq!(again.stopped, None);
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn a_citation_dropped_by_a_later_chunk_keeps_the_batch_pending() {
+    // Two 7,000-character sources exceed one call's budget, so one new page
+    // is written in two calls. The second keeps the page's length and links
+    // but drops `mem_a`'s citation: the draft that cited it no longer exists.
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let (w, root) = wiki("dropped-citation");
+    let long_a = format!("Rust {}", "a".repeat(7_000));
+    let long_b = format!("Rust {}", "b".repeat(7_000));
+    remember(&store, &[("mem_a", &long_a), ("mem_b", &long_b)]);
+    let scribe = Scribe::new(Fault::DropsEarlierCitations);
 
     let report = run(&w, &store, &scribe, None, &AutoOptions::default()).unwrap();
 
-    assert!(report.stopped.unwrap().contains("another compile"));
-    assert!(scribe.calls.borrow().is_empty());
-    assert_eq!(report.pending, 1);
+    assert_eq!(scribe.calls.borrow().len(), 2);
+    assert!(report.stopped.unwrap().contains("`mem_a`"));
+    assert_eq!((report.batches, report.pending), (0, 2));
     std::fs::remove_dir_all(&root).unwrap();
 }
 

@@ -43,10 +43,15 @@ enough to write a page from a dozen memories without anyone in the loop
    is empty, renames the page, or, unless `allow_shrink`, keeps less than
    60% of the page's text or drops one of its `[[links]]`. A new-page
    draft that names an existing page is checked as a rewrite of it. Every
-   source id must appear in some page the batch wrote.
-6. **One run at a time.** A lease in `wiki_meta` (`wiki_compile_lock`,
-   30 minutes) makes a second run report and return instead of writing
-   the same pages twice. A crashed run's lease simply expires.
+   source id must appear in the saved text of some page the batch wrote,
+   checked after the last write, so a later chunk cannot drop a citation
+   an earlier one made.
+6. **One run at a time.** A run claims its wiki root in an in-process
+   set for as long as it runs, and a second run on the same wiki reports
+   and returns before calling the model. In-process is enough because
+   only one process opens a store (the engine holds a lock for it), so
+   the claim is atomic, never expires under a slow model, and is released
+   only by its holder, on return or unwind.
 7. **Configuration.** Off unless both `REMIND_ME_WIKI_LLM_URL`
    (`http://host:port`) and `REMIND_ME_WIKI_LLM_MODEL` are set.
    `REMIND_ME_WIKI_LLM_TIMEOUT_SECS` (default 600) bounds one page and
