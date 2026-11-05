@@ -44,8 +44,11 @@ pub const COMPILE_WATERMARK_KEY: &str = "last_compile_at";
 /// Earliest timestamp, used when no compile has run.
 const EPOCH: &str = "1970-01-01T00:00:00+00:00";
 
-/// Characters of a raw memory shown in a compile brief.
-const COMPILE_SOURCE_CHARS: usize = 2_000;
+/// Characters of raw source text one compile brief carries. A source is
+/// never cut to fit: the batch ends before the first one that would pass
+/// this, and that source heads the next brief. A source longer than the
+/// whole budget still comes through, alone and whole, so it cannot stall.
+pub const COMPILE_BRIEF_CHARS: usize = 40_000;
 
 /// What a reconcile pass did.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -477,7 +480,10 @@ impl Wiki {
             watermark.clone()
         };
 
-        let pending = Memories::new(store).live_created_after(&cutoff, limit)?;
+        let mut pending = Memories::new(store).live_created_after(&cutoff, limit)?;
+        let fits = fitting(&pending, COMPILE_BRIEF_CHARS);
+        let deferred = pending.len() - fits;
+        pending.truncate(fits);
 
         if mark_integrated {
             let Some(last_created) = pending.last().map(|m| &m.created_at) else {
@@ -532,18 +538,7 @@ impl Wiki {
                      content,
                      created_at,
                  }| {
-                    let body: String = if content.chars().count() > COMPILE_SOURCE_CHARS {
-                        format!(
-                            "{} …[truncated]",
-                            content
-                                .chars()
-                                .take(COMPILE_SOURCE_CHARS)
-                                .collect::<String>()
-                        )
-                    } else {
-                        content.clone()
-                    };
-                    format!("### `{}` [{}] ({})\n{}", id, category, created_at, body)
+                    format!("### `{}` [{}] ({})\n{}", id, category, created_at, content)
                 },
             )
             .collect::<Vec<_>>()
@@ -551,7 +546,7 @@ impl Wiki {
 
         let brief = format!(
             "# Wiki Compile Brief\n\n\
-             {} pending raw memory(ies) to synthesise into the wiki (watermark: `{}`).\n\n\
+             {} pending raw memory(ies) to synthesise into the wiki (watermark: `{}`).{}\n\n\
              ## Maintainer schema\n\n{}\n\n\
              ## Current wiki pages\n\n{}\n\n\
              ## Pending raw sources\n\n{}\n\n\
@@ -567,6 +562,7 @@ impl Wiki {
             } else {
                 &watermark
             },
+            deferred_note(deferred),
             self.read_schema()?.trim(),
             index,
             sources
@@ -578,6 +574,32 @@ impl Wiki {
             brief,
         })
     }
+}
+
+/// How many of `pending`, from the front, one brief carries whole: sources
+/// are taken while their text stays within `budget` characters, and the
+/// first is always taken. Brief and mark both cut here, so the watermark
+/// never passes a source the brief left out.
+fn fitting(pending: &[CreatedMemory], budget: usize) -> usize {
+    let mut used = 0;
+    for (taken, memory) in pending.iter().enumerate() {
+        used += memory.content.chars().count();
+        if taken > 0 && used > budget {
+            return taken;
+        }
+    }
+    pending.len()
+}
+
+/// The brief's note on sources a full budget held back, if any.
+fn deferred_note(deferred: usize) -> String {
+    if deferred == 0 {
+        return String::new();
+    }
+    format!(
+        " {deferred} more did not fit this brief whole; they head the next one, \
+         after you mark this batch integrated."
+    )
 }
 
 /// Count raw memories awaiting wiki synthesis.

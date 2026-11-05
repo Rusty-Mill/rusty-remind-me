@@ -9,7 +9,8 @@ use remind_me_core::db::Store;
 use remind_me_core::wiki::WikiDeleteOutcome;
 use remind_me_core::wiki_fs::{
     extract_summary, extract_title, get_meta, parse_wikilinks, pending_compile_count, Wiki,
-    WikiCompile, COMPILE_WATERMARK_KEY, INDEX_FILE, LOG_FILE, SCHEMA_FILE, WIKI_DIR_ENV,
+    WikiCompile, COMPILE_BRIEF_CHARS, COMPILE_WATERMARK_KEY, INDEX_FILE, LOG_FILE, SCHEMA_FILE,
+    WIKI_DIR_ENV,
 };
 use remind_me_core::{Database, MemoryAddInput};
 use std::sync::Mutex;
@@ -577,6 +578,73 @@ fn a_memory_written_during_synthesis_is_not_skipped() {
         ),
     }
 
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// The brief text of a compile that must return one.
+fn brief_of(outcome: WikiCompile) -> (usize, String) {
+    match outcome {
+        WikiCompile::Brief { pending, brief, .. } => (pending, brief),
+        other => panic!("expected a brief, got {:?}", other),
+    }
+}
+
+#[test]
+fn a_source_larger_than_the_budget_is_surfaced_whole_and_then_marked() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let (w, root) = wiki("oversized");
+    let long = format!("{}TAIL-MARKER", "x".repeat(COMPILE_BRIEF_CHARS + 10));
+    add(&store, &long);
+
+    let (pending, brief) = brief_of(w.compile(&store, 20, false).unwrap());
+    assert_eq!(
+        pending, 1,
+        "a lone source heads its batch however long it is"
+    );
+    assert!(
+        brief.contains("TAIL-MARKER"),
+        "the source's tail is in the brief"
+    );
+    assert!(!brief.contains("[truncated]"));
+
+    match w.compile(&store, 20, true).unwrap() {
+        WikiCompile::Integrated { sources_marked, .. } => assert_eq!(sources_marked, 1),
+        other => panic!("expected an integration, got {:?}", other),
+    }
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn a_source_that_does_not_fit_ends_the_batch_and_heads_the_next() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let (w, root) = wiki("budget");
+    let half = COMPILE_BRIEF_CHARS * 2 / 3;
+    add(&store, &format!("FIRST {}", "a".repeat(half)));
+    add(&store, &format!("SECOND {}TAIL-MARKER", "b".repeat(half)));
+
+    let (pending, brief) = brief_of(w.compile(&store, 20, false).unwrap());
+    assert_eq!(pending, 1, "the second source would bust the budget");
+    assert!(brief.contains("FIRST"));
+    assert!(!brief.contains("SECOND"), "never surfaced in part");
+    assert!(brief.contains("1 more"), "the brief says more is waiting");
+
+    match w.compile(&store, 20, true).unwrap() {
+        WikiCompile::Integrated { sources_marked, .. } => {
+            assert_eq!(
+                sources_marked, 1,
+                "the watermark stops before the source left out"
+            )
+        }
+        other => panic!("expected an integration, got {:?}", other),
+    }
+    let (pending, brief) = brief_of(w.compile(&store, 20, false).unwrap());
+    assert_eq!(pending, 1);
+    assert!(
+        brief.contains("TAIL-MARKER"),
+        "it heads the next brief, whole"
+    );
     std::fs::remove_dir_all(&root).unwrap();
 }
 

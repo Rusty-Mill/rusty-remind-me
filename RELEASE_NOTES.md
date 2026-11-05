@@ -2,6 +2,14 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-05 — The wiki compile no longer marks cut-off sources as integrated (card #743)
+
+### Fixed
+- `remind_me_wiki_compile` cut every source in its brief to 2,000 characters, but `mark_integrated=true` moved the watermark past those sources as if their whole text had been used. The rest of a long source never reached a later brief and dropped out of the wiki. No source is cut now. A brief carries up to 40,000 characters of source text and ends before the first source that would go past that; that source heads the next brief. A single source longer than the whole budget comes through alone, uncut. Marking a batch integrated cuts at the same place, so the watermark never passes a source the brief left out. The brief says how many sources are waiting for the next one.
+
+### Tests
+- `wiki_fs_test`: a source longer than the budget is surfaced whole and then marked; a source that does not fit ends the batch, is not passed by the watermark, and heads the next brief whole. Both failed on the base.
+
 ## 2026-11-04 — The v31 memories upgrade no longer loses logged rows on a failure
 
 ### Fixed
