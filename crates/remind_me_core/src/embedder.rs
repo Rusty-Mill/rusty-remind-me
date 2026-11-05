@@ -327,6 +327,9 @@ pub(crate) fn post_json_within(
     body: &str,
     io_timeout: Duration,
 ) -> Result<String, EmbedError> {
+    // One budget for the whole call. Name resolution cannot be bounded with
+    // std, so it is counted against the budget and checked after it returns.
+    let deadline = std::time::Instant::now() + io_timeout;
     let (host, port) = host_port(url, label)?;
     // `connect_timeout` needs a concrete `SocketAddr`, so a hostname
     // (e.g. "localhost") is resolved first — this also transparently
@@ -337,10 +340,10 @@ pub(crate) fn post_json_within(
         .ok()
         .and_then(|mut a| a.next())
         .ok_or_else(|| EmbedError(format!("cannot resolve {label} host {host:?}")))?;
-    let deadline = std::time::Instant::now() + io_timeout;
-    let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
+    let timed_out = |phase: &str| EmbedError(format!("{label} timed out while {phase}"));
+    let left = remaining(deadline).ok_or_else(|| timed_out("resolving"))?;
+    let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT.min(left))
         .map_err(|e| EmbedError(format!("cannot reach {label} at {url}: {e}")))?;
-    stream.set_write_timeout(Some(io_timeout)).ok();
 
     let request = format!(
         "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -349,13 +352,45 @@ pub(crate) fn post_json_within(
         body.len(),
         body
     );
-    stream
-        .write_all(request.as_bytes())
+    write_until(&mut stream, request.as_bytes(), deadline)
         .map_err(|e| EmbedError(format!("writing to {label} failed: {e}")))?;
 
     let raw = read_until(&mut stream, deadline)
         .map_err(|e| EmbedError(format!("reading from {label} failed: {e}")))?;
     response_body(&raw, label)
+}
+
+/// The time left before `deadline`, or `None` once it has passed.
+fn remaining(deadline: std::time::Instant) -> Option<Duration> {
+    let left = deadline.saturating_duration_since(std::time::Instant::now());
+    (!left.is_zero()).then_some(left)
+}
+
+fn past_deadline() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "the call did not finish before the deadline",
+    )
+}
+
+/// Write all of `bytes`, failing with `TimedOut` once `deadline` passes
+/// however steadily the peer reads.
+fn write_until(
+    stream: &mut TcpStream,
+    mut bytes: &[u8],
+    deadline: std::time::Instant,
+) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        let left = remaining(deadline).ok_or_else(past_deadline)?;
+        stream.set_write_timeout(Some(left))?;
+        match stream.write(bytes) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(n) => bytes = &bytes[n..],
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// Read `stream` to its end, failing with `TimedOut` once `deadline` passes
@@ -364,13 +399,7 @@ fn read_until(stream: &mut TcpStream, deadline: std::time::Instant) -> std::io::
     let mut raw = Vec::new();
     let mut buf = [0u8; 8192];
     loop {
-        let left = deadline.saturating_duration_since(std::time::Instant::now());
-        if left.is_zero() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "no complete response before the deadline",
-            ));
-        }
+        let left = remaining(deadline).ok_or_else(past_deadline)?;
         stream.set_read_timeout(Some(left))?;
         match stream.read(&mut buf)? {
             0 => return Ok(raw),
@@ -1182,6 +1211,35 @@ pub fn embedding_status() -> crate::status::SubsystemStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_slow_reading_server_cannot_outlast_the_deadline() {
+        // The server takes a little of the upload every 50ms, so no single
+        // write ever idles long enough for a socket timeout; only a deadline
+        // on the whole write phase stops it.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = std::sync::Arc::clone(&done);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            while !stop.load(std::sync::atomic::Ordering::Relaxed)
+                && matches!(stream.read(&mut buf), Ok(n) if n > 0)
+            {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let body = "x".repeat(64 << 20);
+        let started = std::time::Instant::now();
+
+        let got = post_json_within(&url, "test", "/", &body, Duration::from_millis(500));
+
+        assert!(got.unwrap_err().0.contains("writing to test failed"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+    }
 
     #[test]
     fn short_text_is_a_single_chunk() {

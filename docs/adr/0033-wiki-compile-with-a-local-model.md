@@ -52,7 +52,10 @@ enough to write a page from a dozen memories without anyone in the loop
    and returns before calling the model. In-process is enough because
    only one process opens a store (the engine holds a lock for it), so
    the claim is atomic, never expires under a slow model, and is released
-   only by its holder, on return or unwind.
+   only by its holder, on return or unwind. The claim is on the root's
+   resolved path (symlinks, `.` and `..` resolved through the nearest
+   existing ancestor), so two spellings of one directory exclude each
+   other; a root that cannot be resolved is refused, never taken as free.
 7. **Configuration.** Off unless both `REMIND_ME_WIKI_LLM_URL`
    (`http://host:port`) and `REMIND_ME_WIKI_LLM_MODEL` are set.
    `REMIND_ME_WIKI_LLM_TIMEOUT_SECS` (default 600) bounds one page and
@@ -69,8 +72,11 @@ enough to write a page from a dozen memories without anyone in the loop
    page is saved, it is re-read under the same handle that saves it; if
    it changed since the model was shown it, the batch stops instead of
    overwriting the edit. `REMIND_ME_WIKI_LLM_TIMEOUT_SECS` is a deadline
-   for the whole call, not an idle timeout, so a server that trickles
-   bytes cannot hold a run open.
+   for the whole call, not an idle timeout: it starts before the host is
+   resolved and bounds the connect, every write of the request and every
+   read of the reply, so a server that reads or answers a trickle at a
+   time cannot hold a run open. Name resolution itself cannot be cut
+   short with std; its time counts against the deadline.
 
 ## Consequences
 

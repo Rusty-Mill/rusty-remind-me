@@ -19,7 +19,7 @@ use crate::wiki::WikiPage;
 use crate::wiki_fs::{Wiki, WikiCompile};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 /// Source characters one writer call carries at most; a larger group is
@@ -122,10 +122,13 @@ pub fn run(
     options: &AutoOptions,
 ) -> crate::db::Result<AutoReport> {
     let mut report = AutoReport::default();
-    let Some(_running) = RunGuard::take(wiki.root()) else {
-        report.stopped = Some("another compile is running on this wiki".to_string());
-        report.pending = crate::wiki_fs::pending_compile_count(&db.store())?;
-        return Ok(report);
+    let _running = match RunGuard::take(wiki.root()) {
+        Ok(guard) => guard,
+        Err(refused) => {
+            report.stopped = Some(refused);
+            report.pending = crate::wiki_fs::pending_compile_count(&db.store())?;
+            return Ok(report);
+        }
     };
     run_batches(wiki, db, writer, embedder, options, &mut report)?;
     report.pending = crate::wiki_fs::pending_compile_count(&db.store())?;
@@ -464,13 +467,42 @@ fn uncited<'a>(sources: &'a [Source], written: &str) -> Option<&'a str> {
 struct RunGuard(PathBuf);
 
 impl RunGuard {
-    /// The claim on `root`, or `None` while another run holds it.
-    fn take(root: &std::path::Path) -> Option<Self> {
+    /// The claim on `root`, or why it was refused: another run holds the
+    /// same directory, or the directory cannot be identified. A root that
+    /// cannot be identified is refused, never treated as free.
+    fn take(root: &Path) -> Result<Self, String> {
+        let identity = root_identity(root)
+            .map_err(|e| format!("cannot identify the wiki root {}: {e}", root.display()))?;
         let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
-        running
-            .insert(root.to_path_buf())
-            .then(|| Self(root.to_path_buf()))
+        if !running.insert(identity.clone()) {
+            return Err("another compile is running on this wiki".to_string());
+        }
+        Ok(Self(identity))
     }
+}
+
+/// One name for the directory `root` is or will be, however it is spelled:
+/// the nearest existing ancestor is resolved (symlinks, `.`, `..`) and the
+/// components not yet created are appended. A `..` among those is refused,
+/// since what it names depends on links not yet made.
+fn root_identity(root: &Path) -> std::io::Result<PathBuf> {
+    let absolute = std::path::absolute(root)?;
+    let mut tail = Vec::new();
+    let mut existing = absolute.as_path();
+    while !existing.try_exists()? {
+        // `file_name` is `None` for a path ending in `..`, so a `..` in the
+        // missing part is refused here.
+        let (Some(name), Some(parent)) = (existing.file_name(), existing.parent()) else {
+            return Err(std::io::Error::other(
+                "cannot resolve the part not yet created",
+            ));
+        };
+        tail.push(name.to_os_string());
+        existing = parent;
+    }
+    let mut identity = existing.canonicalize()?;
+    identity.extend(tail.iter().rev());
+    Ok(identity)
 }
 
 impl Drop for RunGuard {
@@ -558,12 +590,38 @@ mod tests {
 
     #[test]
     fn a_wiki_root_is_claimed_by_one_run_at_a_time() {
-        let root = std::path::Path::new("/tmp/rrm-claim-test");
+        let root = Path::new("/tmp/rrm-claim-test");
         let first = RunGuard::take(root).unwrap();
-        assert!(RunGuard::take(root).is_none());
-        assert!(RunGuard::take(std::path::Path::new("/tmp/rrm-other")).is_some());
+        assert!(RunGuard::take(root).is_err());
+        assert!(RunGuard::take(Path::new("/tmp/rrm-other")).is_ok());
         drop(first);
-        assert!(RunGuard::take(root).is_some());
+        assert!(RunGuard::take(root).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn two_spellings_of_one_root_exclude_each_other() {
+        let base = std::env::temp_dir().join(format!("rrm-alias-{}", std::process::id()));
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let spellings = [
+            (real.join("wiki"), link.join("wiki")),
+            (real.join("wiki"), real.join("./sub/../wiki")),
+            (real.join("new/wiki"), link.join("new/wiki")),
+        ];
+        std::fs::create_dir_all(real.join("wiki")).unwrap();
+        std::fs::create_dir_all(real.join("sub")).unwrap();
+        for (one, other) in &spellings {
+            let held = RunGuard::take(one).unwrap();
+            assert!(RunGuard::take(other).is_err(), "{other:?} aliases {one:?}");
+            drop(held);
+        }
+        // What `..` names past a missing directory is unknown: refused.
+        assert!(RunGuard::take(&link.join("missing/../wiki")).is_err());
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
