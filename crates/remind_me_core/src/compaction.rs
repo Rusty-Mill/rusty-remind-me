@@ -4,7 +4,7 @@
 //! and a delete leaves a retired slot, until the table is compacted. Opening
 //! a table folds its log, so a node that restarts often stays compact; a
 //! daemon that runs for weeks does not. This runs
-//! [`Database::compact_store`] on a timer, as the hub runs its own
+//! [`Database::compact_store`] on a timer, after pruning the sync outbox, as the hub runs its own
 //! compaction every `REMIND_ME_HUB_COMPACT_INTERVAL_SECS`.
 
 use crate::db::Database;
@@ -43,6 +43,28 @@ impl CompactorHandle {
     }
 }
 
+/// One maintenance pass: prune the outbox, then compact. Each step's failure
+/// is reported and the next still runs: the next pass may succeed, and
+/// compaction leaves every table readable whatever step it failed at.
+///
+/// The prune is here because nothing else runs it periodically since the
+/// sync worker went (ADR-0032). A store that synced keeps queuing outbox
+/// rows, and a daemon that runs for weeks would otherwise hold them past the
+/// retention window until it restarts. Pruning first lets the same pass
+/// reclaim the space.
+pub fn run_pass(db: &Database) {
+    match crate::sync::prune_outbox(&db.store()) {
+        Ok(0) => {}
+        Ok(n) => eprintln!("rusty-remind-me: pruned {n} outbox rows"),
+        Err(e) => eprintln!("rusty-remind-me: outbox prune failed: {e}"),
+    }
+    match db.compact_store() {
+        Ok(0) => {}
+        Ok(n) => eprintln!("rusty-remind-me: compacted {n} store tables"),
+        Err(e) => eprintln!("rusty-remind-me: compaction failed: {e}"),
+    }
+}
+
 /// Start compacting `db` every [`compact_interval`], the first pass one
 /// interval after the start. `None` when compaction is off.
 ///
@@ -57,21 +79,12 @@ pub fn start_compactor(db: Arc<Database>) -> Result<Option<CompactorHandle>, Str
     let loop_stop = Arc::clone(&stop);
     let thread = std::thread::Builder::new()
         .name("store-compact".to_string())
-        .spawn(move || {
-            loop {
-                loop_stop.wait(interval);
-                if loop_stop.is_stopped() {
-                    return;
-                }
-                // A failed pass is reported and the loop carries on: the
-                // next one may succeed, and compaction leaves every table
-                // readable whatever step it failed at.
-                match db.compact_store() {
-                    Ok(0) => {}
-                    Ok(n) => eprintln!("rusty-remind-me: compacted {n} store tables"),
-                    Err(e) => eprintln!("rusty-remind-me: compaction failed: {e}"),
-                }
+        .spawn(move || loop {
+            loop_stop.wait(interval);
+            if loop_stop.is_stopped() {
+                return;
             }
+            run_pass(&db);
         })
         .map_err(|e| format!("could not start the compaction thread: {e}"))?;
     Ok(Some(CompactorHandle {

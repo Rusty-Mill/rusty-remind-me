@@ -426,3 +426,28 @@ fn a_retirement_by_supersedes_reaches_the_outbox_and_a_refused_one_queues_nothin
     assert!(added.contains(&new), "{added:?}");
     assert!(added.contains(&old), "the retirement must sync: {added:?}");
 }
+
+#[test]
+fn the_daemons_maintenance_pass_prunes_expired_rows_without_a_reopen() {
+    // With the sync worker gone (ADR-0032), the compaction pass is what
+    // keeps a long-running daemon's outbox inside the retention window: the
+    // same open store, never reopened, loses the expired row and keeps the
+    // recent one.
+    let db = syncing_db();
+    let rows = {
+        let store = db.store();
+        add(&store, "expired change");
+        add(&store, "recent change");
+        let rows = testing::outbox_rows(&store).unwrap();
+        assert_eq!(rows.len(), 2);
+        let expired = (Utc::now() - Duration::days(DEFAULT_OUTBOX_RETENTION_DAYS + 1)).to_rfc3339();
+        testing::set_outbox_column(&store, rows[0].id, "created_at", &expired).unwrap();
+        rows
+    }; // The pass takes its own store handle, as the daemon's thread does.
+
+    remind_me_core::compaction::run_pass(&db);
+
+    let left = testing::outbox_rows(&db.store()).unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].id, rows[1].id);
+}
