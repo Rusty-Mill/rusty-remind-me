@@ -16,7 +16,7 @@ use remind_me_core::stats::Stats;
 use remind_me_core::wiki::WikiPage;
 use remind_me_core::wiki_import::WikiImportReport;
 use remind_me_core::{
-    reminders, updater, AttachmentInput, Database, EntityInput, MemoryAddInput, MemoryListInput,
+    reminders, updater, AttachmentInput, EntityInput, MemoryAddInput, MemoryListInput,
     MemorySearchInput, ResponseFormat, LIST_LIMIT_MAX, LIST_LIMIT_MIN,
 };
 use remind_me_mcp::McpServer;
@@ -665,12 +665,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.len() < 2 || args[1] == "server" || args[1] == "mcp" {
         // With the daemon on, this process only relays: the daemon owns the
         // store and runs the background loops below for every client.
-        if let Some(proxy) = daemon::mcp_proxy(&db_path) {
-            updater::start_background_check();
-            remind_me_mcp::run_stdio(&proxy)?;
-            return Ok(());
-        }
-        let db = Database::open(&db_path)?;
+        let fallback = match daemon::mcp_proxy(&db_path) {
+            Ok(proxy) => {
+                updater::start_background_check();
+                remind_me_mcp::run_stdio(&proxy)?;
+                return Ok(());
+            }
+            Err(fallback) => fallback,
+        };
+        let db = fallback.open(&db_path)?;
         // Non-blocking, and deliberately not inside McpServer::new: that
         // constructor is also what the test suite uses to build a server
         // per-test, and a background `git fetch` on every one of those
@@ -802,15 +805,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // With the daemon on, each connection is relayed to it, and
                 // the daemon runs the scheduler and sync worker below.
                 let relayed = daemon::serve_api_via_daemon(&db_path, &addr);
-                if !matches!(relayed, Ok(false)) {
-                    if let Some(path) = &pid_path {
-                        remind_me_core::pid::remove_pid_file(path);
+                let fallback = match relayed {
+                    Ok(Some(fallback)) => fallback,
+                    done => {
+                        if let Some(path) = &pid_path {
+                            remind_me_core::pid::remove_pid_file(path);
+                        }
+                        done?;
+                        return Ok(());
                     }
-                    relayed?;
-                    return Ok(());
-                }
+                };
 
-                let db = Database::open(&db_path)?;
+                let db = fallback.open(&db_path)?;
                 let scheduler = remind_me_core::scheduler::start_scheduler_for(&db.store());
                 // A long-lived daemon like "server", so it can carry the sync
                 // worker just as well -- see the comment on "server"'s own
@@ -851,11 +857,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // "server" did. Stopped after `run_blocking` returns, same as
                 // the others; `run_blocking` blocks for the connector's whole
                 // life, so there is nothing to interleave it with.
-                if let Some(proxy) = daemon::mcp_proxy(&db_path) {
-                    remind_me_remote::run_blocking(std::sync::Arc::new(proxy))?;
-                    return Ok(());
-                }
-                let db = Database::open(&db_path)?;
+                let fallback = match daemon::mcp_proxy(&db_path) {
+                    Ok(proxy) => {
+                        remind_me_remote::run_blocking(std::sync::Arc::new(proxy))?;
+                        return Ok(());
+                    }
+                    Err(fallback) => fallback,
+                };
+                let db = fallback.open(&db_path)?;
                 let mut sync = db
                     .secondary_source()
                     .and_then(remind_me_core::sync::SyncWorker::from_env);

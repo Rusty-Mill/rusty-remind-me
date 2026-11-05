@@ -2,6 +2,17 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-05 — A refused daemon client's final error names the setting, not only the lock (card #755)
+
+### Fixed
+- A client whose settings differed from the store daemon's printed one "not using the store daemon: ..." line, then failed to open the store itself because the daemon held the engine lock. The error that ended the run named only the lock, so in a journal the root cause sat a line above and was easy to miss (seen on the remindme host while diagnosing #742). That final error now ends with why this process opened the store itself, naming the differing setting. Nothing else about the fallback changes.
+
+### Changed
+- `daemon::Fallback` carries the reason a client is not using the daemon and opens the store with it: `mcp_proxy` returns it as its error, and `serve_api_via_daemon` returns it when it did not relay.
+
+### Tests
+- `daemon_cli_test`: the last line of a mismatched client's stderr names the differing setting. Failed on the base.
+
 ## 2026-11-05 — The wiki compile no longer marks cut-off sources as integrated (card #743)
 
 ### Fixed
