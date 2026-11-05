@@ -109,6 +109,18 @@ pub enum WikiCompile {
     Noop { reason: String, watermark: String },
 }
 
+/// One brief's sources as data, for a caller that writes the pages itself
+/// ([`Wiki::pending_batch`]).
+#[derive(Debug, Clone)]
+pub struct SourceBatch {
+    /// Whole, oldest first.
+    pub sources: Vec<CreatedMemory>,
+    /// Pending sources the budget held back for the next batch.
+    pub deferred: usize,
+    /// Marks exactly these sources (`compile` with `mark_integrated`).
+    pub through: String,
+}
+
 /// Rough token count. Four characters per token is the reference's estimate.
 pub fn estimate_tokens(text: &str) -> usize {
     text.len() / 4
@@ -491,12 +503,7 @@ impl Wiki {
                 return self.mark_through(store, watermark, through);
             }
         }
-        let from = Cursor::watermark(&watermark);
-        let mut pending =
-            Memories::new(store).live_created_after(&from.created_at, from.id.as_deref(), limit)?;
-        let fits = fitting(&pending, COMPILE_BRIEF_CHARS);
-        let deferred = pending.len() - fits;
-        pending.truncate(fits);
+        let (pending, deferred) = pending_sources(store, &watermark, limit)?;
 
         if mark_integrated {
             let Some(last) = pending.last() else {
@@ -514,8 +521,7 @@ impl Wiki {
                 watermark,
             });
         };
-        record_issued(store, &last)?;
-        let through = last.encode();
+        let through = issue(store, &last)?;
 
         let pages = crate::wiki::list_wiki_pages(store)?;
         let index = if pages.is_empty() {
@@ -582,6 +588,26 @@ impl Wiki {
             through,
             brief,
         })
+    }
+
+    /// The sources the next brief would carry, whole, with the `through`
+    /// that marks exactly them: what an automatic compile writes from
+    /// instead of the brief's text. `None` when nothing is pending. Like a
+    /// brief it records the boundary as issued and never moves the
+    /// watermark.
+    pub fn pending_batch(&self, store: &Store<'_>, limit: usize) -> Result<Option<SourceBatch>> {
+        self.reconcile(store)?;
+        let watermark = get_meta(store, COMPILE_WATERMARK_KEY)?.unwrap_or_default();
+        let (sources, deferred) = pending_sources(store, &watermark, limit)?;
+        let Some(last) = sources.last().map(Cursor::of) else {
+            return Ok(None);
+        };
+        let through = issue(store, &last)?;
+        Ok(Some(SourceBatch {
+            sources,
+            deferred,
+            through,
+        }))
     }
 
     /// Advance the watermark to `through`, a boundary a brief issued,
@@ -705,6 +731,28 @@ impl Cursor {
             },
         }
     }
+}
+
+/// The live memories after `watermark` that fit one brief, oldest first,
+/// and how many more the budget held back.
+fn pending_sources(
+    store: &Store<'_>,
+    watermark: &str,
+    limit: usize,
+) -> Result<(Vec<CreatedMemory>, usize)> {
+    let from = Cursor::watermark(watermark);
+    let mut pending =
+        Memories::new(store).live_created_after(&from.created_at, from.id.as_deref(), limit)?;
+    let fits = fitting(&pending, COMPILE_BRIEF_CHARS);
+    let deferred = pending.len() - fits;
+    pending.truncate(fits);
+    Ok((pending, deferred))
+}
+
+/// Record `last` as issued and return it encoded, as a brief's `through`.
+fn issue(store: &Store<'_>, last: &Cursor) -> Result<String> {
+    record_issued(store, last)?;
+    Ok(last.encode())
 }
 
 /// How many of `pending`, from the front, one brief carries whole: sources

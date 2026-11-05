@@ -2,6 +2,17 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-05 — The wiki can compile itself with a local model (card #747)
+
+### Added
+- `rusty-remind-me wiki-compile --auto [--max-batches N] [--allow-shrink]`, `remind_me_wiki_compile` with `auto=true`, and `POST /api/wiki/compile {"auto": true}` have a local model write the wiki pages for pending memories and mark each batch integrated once all its pages are saved. Off until `REMIND_ME_WIKI_LLM_URL` and `REMIND_ME_WIKI_LLM_MODEL` name an OpenAI-compatible server; `REMIND_ME_WIKI_LLM_TIMEOUT_SECS`, `REMIND_ME_WIKI_LLM_MAX_TOKENS` and `REMIND_ME_WIKI_MATCH` tune it. The configured embedder routes each memory to the page it belongs to. A rewrite that shrinks a page below 60% or drops a `[[link]]`, a renamed page, or a memory no page cites stops the run and leaves the batch pending. One run at a time. ADR-0033.
+
+### Changed
+- `Wiki::pending_batch` returns the batch a brief would show, with its `through`, for callers that write the pages themselves.
+
+### Tests
+- `wiki_compile_test`: pages written and marked with and without an embedder; a model error, a shrinking rewrite and a missing citation each leave the batch pending and the lock free; a new page that names an existing one is guarded as a rewrite; a live lock stops a second run before the model is called. `wiki_llm`: settings, reply parsing and a loopback round trip. `wiki_write_test`: auto options validated, 503 without a model. CLI argument parsing.
+
 ## 2026-11-05 — The wiki compile no longer marks cut-off sources as integrated (card #743)
 
 ### Fixed

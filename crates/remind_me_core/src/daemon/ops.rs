@@ -53,6 +53,12 @@ pub enum Op {
     WikiImport {
         dir: PathBuf,
     },
+    /// Compile pending memories into wiki pages with the configured local
+    /// model; see [`crate::wiki_compile`].
+    WikiAutoCompile {
+        max_batches: usize,
+        allow_shrink: bool,
+    },
     /// Close a decision or action item; see [`crate::resolve`].
     Resolve {
         memory_id: String,
@@ -154,6 +160,19 @@ fn run(store: &Store<'_>, op: &Op) -> Result<Value, String> {
         Op::WikiImport { dir } => {
             let report =
                 wiki_import::import_wiki_dir(store, dir, true).map_err(|e| e.to_string())?;
+            serde_json::to_value(report).map_err(|e| e.to_string())
+        }
+        Op::WikiAutoCompile {
+            max_batches,
+            allow_shrink,
+        } => {
+            let options = crate::wiki_compile::AutoOptions {
+                max_batches: *max_batches,
+                allow_shrink: *allow_shrink,
+                ..Default::default()
+            };
+            let wiki = crate::wiki_fs::Wiki::from_env();
+            let report = crate::wiki_llm::compile_with_configured_model(&wiki, store, &options)?;
             serde_json::to_value(report).map_err(|e| e.to_string())
         }
         Op::Resolve {

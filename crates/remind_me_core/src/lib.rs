@@ -90,8 +90,10 @@ pub mod watchdog;
 pub mod watcher;
 pub mod webhook;
 pub mod wiki;
+pub mod wiki_compile;
 pub mod wiki_fs;
 pub mod wiki_import;
+pub mod wiki_llm;
 pub mod worklog;
 
 pub use db::Database;

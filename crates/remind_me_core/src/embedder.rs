@@ -313,6 +313,18 @@ fn host_port(url: &str, label: &str) -> Result<(String, u16), EmbedError> {
 /// POST `body` as JSON to `url` + `path` and return the response body of a
 /// 2xx reply. `label` names the backend in errors.
 fn post_json(url: &str, label: &str, path: &str, body: &str) -> Result<String, EmbedError> {
+    post_json_within(url, label, path, body, IO_TIMEOUT)
+}
+
+/// [`post_json`] with its own read/write timeout, for a caller that waits
+/// on generation rather than an embedding (`wiki_llm`).
+pub(crate) fn post_json_within(
+    url: &str,
+    label: &str,
+    path: &str,
+    body: &str,
+    io_timeout: Duration,
+) -> Result<String, EmbedError> {
     let (host, port) = host_port(url, label)?;
     // `connect_timeout` needs a concrete `SocketAddr`, so a hostname
     // (e.g. "localhost") is resolved first — this also transparently
@@ -325,8 +337,8 @@ fn post_json(url: &str, label: &str, path: &str, body: &str) -> Result<String, E
         .ok_or_else(|| EmbedError(format!("cannot resolve {label} host {host:?}")))?;
     let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
         .map_err(|e| EmbedError(format!("cannot reach {label} at {url}: {e}")))?;
-    stream.set_read_timeout(Some(IO_TIMEOUT)).ok();
-    stream.set_write_timeout(Some(IO_TIMEOUT)).ok();
+    stream.set_read_timeout(Some(io_timeout)).ok();
+    stream.set_write_timeout(Some(io_timeout)).ok();
 
     let request = format!(
         "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",

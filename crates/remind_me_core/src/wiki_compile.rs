@@ -1,0 +1,493 @@
+//! Automatic wiki compile: pending memories become pages without a person
+//! carrying the brief to a model (card #747).
+//!
+//! A run takes the same batch a brief would ([`Wiki::pending_batch`]),
+//! groups its sources by the page they belong to, has a [`WikiWriter`] write
+//! each page, and marks the batch integrated through its `through` only after
+//! every page is saved. A failed batch leaves the watermark where it was, so
+//! the next run hands the model the same sources again.
+//!
+//! Everything here is policy: grouping, the guards on a rewrite and the run
+//! loop. The model is behind [`WikiWriter`] (`wiki_llm` has the
+//! OpenAI-compatible adapter) and the vectors behind [`Embedder`], so tests
+//! drive the loop with fakes.
+
+use crate::db::memories::CreatedMemory;
+use crate::db::Store;
+use crate::embedder::{EmbedRole, Embedder};
+use crate::wiki::WikiPage;
+use crate::wiki_fs::{get_meta, set_meta, Wiki, WikiCompile};
+use chrono::{Duration, Utc};
+use serde::{Deserialize, Serialize};
+
+/// Source characters one writer call carries at most; a larger group is
+/// written in consecutive calls on the same page.
+pub const GROUP_CHARS: usize = 12_000;
+/// Cosine a source needs to join an existing page by default.
+pub const DEFAULT_MATCH: f32 = 0.55;
+/// A second page also takes a source when it is this close to the best.
+const SECOND_PAGE_MARGIN: f32 = 0.05;
+/// A rewrite may not cut an existing page below this share of its length.
+const MIN_KEPT: f64 = 0.6;
+/// The `wiki_meta` key holding a running compile's lease.
+const LOCK_KEY: &str = "wiki_compile_lock";
+const LOCK_LEASE_MINUTES: i64 = 30;
+/// Memories a batch reads before the character budget trims it.
+const BATCH_LIMIT: usize = 100;
+
+/// One source as the writer sees it.
+pub type Source = CreatedMemory;
+
+/// What one writer call is asked to produce.
+#[derive(Debug, Clone)]
+pub struct PageRequest<'a> {
+    /// The maintainer schema (`schema.md`).
+    pub schema: &'a str,
+    /// The page to update; `None` asks for a new page the writer names.
+    pub page: Option<&'a WikiPage>,
+    pub sources: &'a [Source],
+}
+
+/// A page as the writer returns it: the whole new text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageDraft {
+    pub title: String,
+    pub content: String,
+}
+
+/// Writes one page from its sources. The port the model sits behind.
+pub trait WikiWriter {
+    fn write_page(&self, request: &PageRequest<'_>) -> Result<PageDraft, String>;
+}
+
+/// How a run behaves.
+#[derive(Debug, Clone)]
+pub struct AutoOptions {
+    /// Batches to compile before stopping.
+    pub max_batches: usize,
+    /// Accept a rewrite that shrinks a page or drops one of its links.
+    pub allow_shrink: bool,
+    /// Cosine a source needs to join an existing page.
+    pub match_threshold: f32,
+}
+
+impl Default for AutoOptions {
+    fn default() -> Self {
+        Self {
+            max_batches: 5,
+            allow_shrink: false,
+            match_threshold: DEFAULT_MATCH,
+        }
+    }
+}
+
+/// What a run did.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AutoReport {
+    /// Batches marked integrated.
+    pub batches: usize,
+    pub sources_integrated: usize,
+    /// Titles written, in order; a page written twice appears twice.
+    pub pages_written: Vec<String>,
+    /// Pending sources left after the run.
+    pub pending: usize,
+    /// Why the run stopped early: a batch failed and was left pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped: Option<String>,
+}
+
+/// Sources bound for one page: an existing one, or a new one (`page: None`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Group {
+    pub page: Option<usize>,
+    pub sources: Vec<usize>,
+}
+
+/// Compile pending memories into pages until none are left, a batch fails,
+/// or `max_batches` is reached. Errors are store errors; a writer or guard
+/// failure stops the run and is reported in [`AutoReport::stopped`].
+pub fn run(
+    wiki: &Wiki,
+    store: &Store<'_>,
+    writer: &dyn WikiWriter,
+    embedder: Option<&dyn Embedder>,
+    options: &AutoOptions,
+) -> crate::db::Result<AutoReport> {
+    let mut report = AutoReport::default();
+    if let Some(holder) = take_lock(store)? {
+        report.stopped = Some(format!("another compile has run since {holder}"));
+        report.pending = crate::wiki_fs::pending_compile_count(store)?;
+        return Ok(report);
+    }
+    let result = run_batches(wiki, store, writer, embedder, options, &mut report);
+    set_meta(store, LOCK_KEY, "")?;
+    result?;
+    report.pending = crate::wiki_fs::pending_compile_count(store)?;
+    Ok(report)
+}
+
+fn run_batches(
+    wiki: &Wiki,
+    store: &Store<'_>,
+    writer: &dyn WikiWriter,
+    embedder: Option<&dyn Embedder>,
+    options: &AutoOptions,
+    report: &mut AutoReport,
+) -> crate::db::Result<()> {
+    for _ in 0..options.max_batches {
+        let Some(batch) = wiki.pending_batch(store, BATCH_LIMIT)? else {
+            return Ok(());
+        };
+        match write_batch(wiki, store, writer, embedder, options, &batch.sources)? {
+            Err(why) => {
+                report.stopped = Some(why);
+                return Ok(());
+            }
+            Ok(titles) => report.pages_written.extend(titles),
+        }
+        if let WikiCompile::Integrated { sources_marked, .. } =
+            wiki.compile(store, BATCH_LIMIT, true, Some(&batch.through))?
+        {
+            report.sources_integrated += sources_marked;
+        }
+        report.batches += 1;
+    }
+    Ok(())
+}
+
+/// Write every page one batch needs. `Ok(Err(why))` is a failed batch.
+fn write_batch(
+    wiki: &Wiki,
+    store: &Store<'_>,
+    writer: &dyn WikiWriter,
+    embedder: Option<&dyn Embedder>,
+    options: &AutoOptions,
+    sources: &[Source],
+) -> crate::db::Result<Result<Vec<String>, String>> {
+    let schema = wiki.read_schema()?;
+    let pages = wiki.list_pages(store)?;
+    let groups = group(&pages, sources, embedder, options.match_threshold);
+    let mut titles = Vec::new();
+    let mut written = String::new();
+    for group in groups {
+        let mut page = group.page.map(|i| pages[i].clone());
+        for chunk in chunks(&group.sources, sources) {
+            let request = PageRequest {
+                schema: &schema,
+                page: page.as_ref(),
+                sources: &chunk,
+            };
+            let draft = match writer.write_page(&request) {
+                Ok(draft) => draft,
+                Err(e) => return Ok(Err(format!("the writer failed: {e}"))),
+            };
+            // A new-page draft that names an existing page is a rewrite of
+            // it, and gets the same guards.
+            let target = match page.take() {
+                Some(page) => Some(page),
+                None => wiki.read_page(store, &draft.title)?,
+            };
+            if let Err(why) = check_draft(target.as_ref(), &draft, options.allow_shrink) {
+                return Ok(Err(why));
+            }
+            let note = format!("auto-compiled from {} source(s)", chunk.len());
+            if wiki
+                .write_page(store, &draft.title, &draft.content, Some(&note))?
+                .is_err()
+            {
+                return Ok(Err(format!("{:?} is a reserved page name", draft.title)));
+            }
+            written.push_str(&draft.content);
+            titles.push(draft.title.clone());
+            page = wiki.read_page(store, &draft.title)?;
+        }
+    }
+    Ok(match uncited(sources, &written) {
+        Some(id) => Err(format!("no page written cites source `{id}`")),
+        None => Ok(titles),
+    })
+}
+
+/// Group sources by page. Each source joins its closest page at
+/// `threshold` or above, and a second page within a small margin of it;
+/// the rest gather, in order, around the first left unplaced. Without an
+/// embedder, or if embedding fails, the batch is one new-page group and the
+/// writer decides.
+pub fn group(
+    pages: &[WikiPage],
+    sources: &[Source],
+    embedder: Option<&dyn Embedder>,
+    threshold: f32,
+) -> Vec<Group> {
+    let everything = || {
+        vec![Group {
+            page: None,
+            sources: (0..sources.len()).collect(),
+        }]
+    };
+    let Some(embedder) = embedder else {
+        return everything();
+    };
+    let Some((page_vecs, source_vecs)) = embed_all(embedder, pages, sources) else {
+        return everything();
+    };
+
+    let mut by_page: Vec<Vec<usize>> = vec![Vec::new(); pages.len()];
+    let mut unplaced = Vec::new();
+    for (s, vector) in source_vecs.iter().enumerate() {
+        let mut scored: Vec<(usize, f32)> = page_vecs
+            .iter()
+            .enumerate()
+            .map(|(p, page)| (p, dot(vector, page)))
+            .filter(|(_, score)| *score >= threshold)
+            .collect();
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let Some(&(best, top)) = scored.first() else {
+            unplaced.push(s);
+            continue;
+        };
+        by_page[best].push(s);
+        if let Some(&(second, score)) = scored.get(1) {
+            if top - score <= SECOND_PAGE_MARGIN {
+                by_page[second].push(s);
+            }
+        }
+    }
+
+    let mut groups: Vec<Group> = by_page
+        .into_iter()
+        .enumerate()
+        .filter(|(_, members)| !members.is_empty())
+        .map(|(p, members)| Group {
+            page: Some(p),
+            sources: members,
+        })
+        .collect();
+    groups.extend(cluster(&unplaced, &source_vecs, threshold));
+    groups
+}
+
+/// Gather `unplaced` sources, in order, around the first one left over.
+fn cluster(unplaced: &[usize], vectors: &[Vec<f32>], threshold: f32) -> Vec<Group> {
+    let mut left: Vec<usize> = unplaced.to_vec();
+    let mut groups = Vec::new();
+    while let Some(&seed) = left.first() {
+        let (members, rest): (Vec<usize>, Vec<usize>) = left
+            .iter()
+            .partition(|&&s| s == seed || dot(&vectors[s], &vectors[seed]) >= threshold);
+        groups.push(Group {
+            page: None,
+            sources: members,
+        });
+        left = rest;
+    }
+    groups
+}
+
+type Vectors = Vec<Vec<f32>>;
+
+/// Page keys (`title` and summary) and sources, embedded in one call.
+fn embed_all(
+    embedder: &dyn Embedder,
+    pages: &[WikiPage],
+    sources: &[Source],
+) -> Option<(Vectors, Vectors)> {
+    let texts: Vec<String> = pages
+        .iter()
+        .map(|p| format!("{}\n{}", p.title, p.summary))
+        .chain(sources.iter().map(|s| s.content.clone()))
+        .collect();
+    let mut vectors = embedder.embed(&texts, EmbedRole::Passage).ok()?;
+    if vectors.len() != texts.len() {
+        return None;
+    }
+    let source_vecs = vectors.split_off(pages.len());
+    Some((vectors, source_vecs))
+}
+
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+/// A group's sources in writer calls of at most [`GROUP_CHARS`]; a source
+/// longer than that goes alone, whole.
+fn chunks(members: &[usize], sources: &[Source]) -> Vec<Vec<Source>> {
+    let mut out: Vec<Vec<Source>> = Vec::new();
+    let mut used = 0;
+    for &i in members {
+        let source = &sources[i];
+        let size = source.content.chars().count();
+        let fits = out.last().is_some_and(|c| !c.is_empty()) && used + size <= GROUP_CHARS;
+        if !fits {
+            out.push(Vec::new());
+            used = 0;
+        }
+        used += size;
+        if let Some(last) = out.last_mut() {
+            last.push(source.clone());
+        }
+    }
+    out
+}
+
+/// Refuse a draft that would lose what a page held: an empty page, a renamed
+/// page, or, unless allowed, a page cut below [`MIN_KEPT`] of its length or
+/// missing one of its `[[links]]`.
+pub fn check_draft(
+    page: Option<&WikiPage>,
+    draft: &PageDraft,
+    allow_shrink: bool,
+) -> Result<(), String> {
+    if draft.title.trim().is_empty() || draft.content.trim().is_empty() {
+        return Err("the writer returned an empty page".to_string());
+    }
+    let Some(page) = page else {
+        return Ok(());
+    };
+    if !draft.title.trim().eq_ignore_ascii_case(page.title.trim()) {
+        return Err(format!(
+            "the writer renamed [[{}]] to [[{}]]",
+            page.title, draft.title
+        ));
+    }
+    if allow_shrink {
+        return Ok(());
+    }
+    let before = page.content.chars().count() as f64;
+    let after = draft.content.chars().count() as f64;
+    if after < before * MIN_KEPT {
+        return Err(format!(
+            "the rewrite of [[{}]] keeps {:.0}% of its text",
+            page.title,
+            100.0 * after / before
+        ));
+    }
+    if let Some(link) = links(&page.content)
+        .into_iter()
+        .find(|link| !draft.content.contains(link.as_str()))
+    {
+        return Err(format!(
+            "the rewrite of [[{}]] drops the link {link}",
+            page.title
+        ));
+    }
+    Ok(())
+}
+
+/// Every `[[...]]` in `text`, as written.
+fn links(text: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("[[") {
+        let Some(len) = rest[start..].find("]]") else {
+            break;
+        };
+        found.push(rest[start..start + len + 2].to_string());
+        rest = &rest[start + len + 2..];
+    }
+    found
+}
+
+/// The first source whose id appears in no written page.
+fn uncited<'a>(sources: &'a [Source], written: &str) -> Option<&'a str> {
+    sources
+        .iter()
+        .map(|s| s.id.as_str())
+        .find(|id| !written.contains(id))
+}
+
+/// Take the run lease. `Some(holder)` when another run holds a live one.
+fn take_lock(store: &Store<'_>) -> crate::db::Result<Option<String>> {
+    let now = Utc::now();
+    if let Some(held) = get_meta(store, LOCK_KEY)?.filter(|v| !v.is_empty()) {
+        let live = chrono::DateTime::parse_from_rfc3339(&held)
+            .is_ok_and(|at| now - at.with_timezone(&Utc) < Duration::minutes(LOCK_LEASE_MINUTES));
+        if live {
+            return Ok(Some(held));
+        }
+    }
+    set_meta(store, LOCK_KEY, &now.to_rfc3339())?;
+    Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn page(title: &str, content: &str) -> WikiPage {
+        WikiPage {
+            slug: title.to_lowercase(),
+            title: title.into(),
+            content: content.into(),
+            summary: String::new(),
+            mtime: 0.0,
+            updated_at: String::new(),
+        }
+    }
+
+    fn draft(title: &str, content: &str) -> PageDraft {
+        PageDraft {
+            title: title.into(),
+            content: content.into(),
+        }
+    }
+
+    #[test]
+    fn a_new_page_needs_only_text() {
+        assert!(check_draft(None, &draft("Rust", "text"), false).is_ok());
+        assert!(check_draft(None, &draft("Rust", "  "), false).is_err());
+    }
+
+    #[test]
+    fn a_rewrite_may_not_rename_shrink_or_drop_links() {
+        let old = page("Rust", "Rust is a language. See [[Cargo]] and [[Clippy]].");
+        assert!(check_draft(Some(&old), &draft("Go", &old.content), false)
+            .unwrap_err()
+            .contains("renamed"));
+        assert!(check_draft(Some(&old), &draft("Rust", "Rust."), false)
+            .unwrap_err()
+            .contains("keeps"));
+        let dropped = "Rust is a language. See [[Cargo]] and the linter, at length.";
+        assert!(check_draft(Some(&old), &draft("rust", dropped), false)
+            .unwrap_err()
+            .contains("[[Clippy]]"));
+        assert!(check_draft(Some(&old), &draft("Rust", "Rust."), true).is_ok());
+    }
+
+    #[test]
+    fn links_are_found_in_order() {
+        assert_eq!(links("a [[B]] c [[D e]] [[open"), ["[[B]]", "[[D e]]"]);
+    }
+
+    fn source(id: &str, len: usize) -> Source {
+        Source {
+            id: id.into(),
+            category: "fact".into(),
+            content: "x".repeat(len),
+            created_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn chunks_respect_the_budget_and_keep_a_long_source_whole() {
+        let sources = [
+            source("a", 7_000),
+            source("b", 7_000),
+            source("c", 20_000),
+            source("d", 10),
+        ];
+        let ids: Vec<Vec<String>> = chunks(&[0, 1, 2, 3], &sources)
+            .into_iter()
+            .map(|c| c.into_iter().map(|s| s.id).collect())
+            .collect();
+        assert_eq!(ids, [vec!["a"], vec!["b"], vec!["c"], vec!["d"]]);
+        assert_eq!(chunks(&[0, 3], &sources).len(), 1);
+    }
+
+    #[test]
+    fn uncited_names_the_first_source_missing() {
+        let sources = [source("mem_a", 1), source("mem_b", 1)];
+        assert_eq!(uncited(&sources, "cites `mem_a`"), Some("mem_b"));
+        assert_eq!(uncited(&sources, "mem_a mem_b"), None);
+    }
+}

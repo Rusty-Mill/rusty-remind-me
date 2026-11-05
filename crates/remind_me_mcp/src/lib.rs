@@ -1517,14 +1517,17 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_wiki_compile",
-                                "description": "remind-me wiki: drive wiki synthesis over raw memories. With mark_integrated=false (the default) returns a brief of pending sources and never advances the watermark, so it is safe to call repeatedly. Call again with mark_integrated=true and the brief's `through` after writing the pages, so exactly that brief's sources are marked.",
+                                "description": "remind-me wiki: drive wiki synthesis over raw memories. With mark_integrated=false (the default) returns a brief of pending sources and never advances the watermark, so it is safe to call repeatedly. Call again with mark_integrated=true and the brief's `through` after writing the pages, so exactly that brief's sources are marked. With auto=true the server's own local model (REMIND_ME_WIKI_LLM_URL and _MODEL) writes the pages and marks each batch itself; this can take minutes per batch.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
                                         "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "json", "description": "json (default) returns the structured record; markdown returns a human-readable summary." },
                                         "limit": { "type": "integer", "default": 20, "minimum": 1, "maximum": 100 },
                                         "mark_integrated": { "type": "boolean", "default": false },
-                                        "through": { "type": "string", "description": "With mark_integrated=true: the `through` a brief returned. Marks exactly that brief's sources. Without it the batch is recomputed, which an edit in between can change." }
+                                        "through": { "type": "string", "description": "With mark_integrated=true: the `through` a brief returned. Marks exactly that brief's sources. Without it the batch is recomputed, which an edit in between can change." },
+                                        "auto": { "type": "boolean", "default": false, "description": "Have the configured local model write the pages. Ignores limit, mark_integrated and through." },
+                                        "max_batches": { "type": "integer", "default": 1, "minimum": 1, "maximum": 20, "description": "With auto=true: batches to compile before returning." },
+                                        "allow_shrink": { "type": "boolean", "default": false, "description": "With auto=true: accept a rewrite that shortens a page below 60% or drops one of its [[links]]." }
                                     }
                                 }
                             },
@@ -3387,6 +3390,36 @@ impl McpServer {
                             }
                             Err(e) => {
                                 json!({ "isError": true, "content": [{ "type": "text", "text": format!("Wiki load error: {}", e) }] })
+                            }
+                        }
+                    }
+                    "remind_me_wiki_compile"
+                        if args.get("auto").and_then(|v| v.as_bool()) == Some(true) =>
+                    {
+                        let options = remind_me_core::wiki_compile::AutoOptions {
+                            max_batches: args
+                                .get("max_batches")
+                                .and_then(|v| v.as_u64())
+                                .map(|v| v as usize)
+                                .unwrap_or(1)
+                                .clamp(1, 20),
+                            allow_shrink: args
+                                .get("allow_shrink")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false),
+                            ..Default::default()
+                        };
+                        match remind_me_core::wiki_llm::compile_with_configured_model(
+                            &self.wiki, &store, &options,
+                        ) {
+                            Ok(report) => {
+                                json!({ "content": [{ "type": "text", "text": match format {
+    ResponseFormat::Json => serde_json::to_string_pretty(&report).unwrap(),
+    ResponseFormat::Markdown => render::wiki_auto_compile(&report),
+} }] })
+                            }
+                            Err(e) => {
+                                json!({ "isError": true, "content": [{ "type": "text", "text": format!("Wiki compile error: {}", e) }] })
                             }
                         }
                     }

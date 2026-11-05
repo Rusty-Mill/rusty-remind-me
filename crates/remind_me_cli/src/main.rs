@@ -14,6 +14,7 @@ use remind_me_core::entity_duplicates::{self, DuplicateCandidate};
 use remind_me_core::models::{Memory, MemoryListResult, MemorySearchResult};
 use remind_me_core::stats::Stats;
 use remind_me_core::wiki::WikiPage;
+use remind_me_core::wiki_compile::AutoReport;
 use remind_me_core::wiki_import::WikiImportReport;
 use remind_me_core::{
     reminders, updater, AttachmentInput, Database, EntityInput, MemoryAddInput, MemoryListInput,
@@ -385,6 +386,52 @@ const ADD_USAGE: &str =
 
 const RESOLVE_USAGE: &str = "Usage: rusty-remind-me resolve <id> \
 (<done|abandoned|reverted|superseded> | --review <held|revised|reverted>) [--note TEXT]";
+
+const WIKI_COMPILE_USAGE: &str =
+    "Usage: rusty-remind-me wiki-compile --auto [--max-batches N] [--allow-shrink]";
+
+/// Parsed form of `rusty-remind-me wiki-compile --auto [--max-batches N] [--allow-shrink]`.
+/// `--auto` is required: the brief-and-mark mode is for a model driving the
+/// MCP tool, not a person at a shell.
+fn parse_wiki_compile_args(args: &[String]) -> Result<Op, String> {
+    let mut auto = false;
+    let mut max_batches = remind_me_core::wiki_compile::AutoOptions::default().max_batches;
+    let mut allow_shrink = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--auto" => auto = true,
+            "--allow-shrink" => allow_shrink = true,
+            "--max-batches" => {
+                let value = flag_value(args, i, "--max-batches", WIKI_COMPILE_USAGE)?;
+                max_batches = match value.parse::<usize>() {
+                    Ok(n) if n > 0 => n,
+                    _ => {
+                        return Err(format!(
+                            "Error: --max-batches must be a positive number, got {value:?}.\n{WIKI_COMPILE_USAGE}"
+                        ))
+                    }
+                };
+                i += 1;
+            }
+            other => {
+                return Err(format!(
+                    "Error: unknown argument {other:?}.\n{WIKI_COMPILE_USAGE}"
+                ))
+            }
+        }
+        i += 1;
+    }
+    if !auto {
+        return Err(format!(
+            "Error: wiki-compile needs --auto; a model drives the brief-and-mark mode through remind_me_wiki_compile.\n{WIKI_COMPILE_USAGE}"
+        ));
+    }
+    Ok(Op::WikiAutoCompile {
+        max_batches,
+        allow_shrink,
+    })
+}
 
 /// What a `resolve` records: whether it was carried out, or whether a
 /// decision held up at its follow-up review.
@@ -1104,6 +1151,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     report.skipped.len()
                 );
             }
+            "wiki-compile" => {
+                let op = match parse_wiki_compile_args(&args[2..]) {
+                    Ok(op) => op,
+                    Err(message) => {
+                        eprintln!("{}", message);
+                        std::process::exit(1);
+                    }
+                };
+                let report: AutoReport = Store::open(&db_path)?.call(op)?;
+                for title in &report.pages_written {
+                    println!("wrote [[{title}]]");
+                }
+                println!(
+                    "Compiled {} batch(es), {} source(s); {} pending.",
+                    report.batches, report.sources_integrated, report.pending
+                );
+                if let Some(why) = report.stopped {
+                    eprintln!("Stopped: {why}. Its sources stay pending.");
+                    std::process::exit(1);
+                }
+            }
             "resolve" => {
                 let resolve = match parse_resolve_args(&args[2..]) {
                     Ok(parsed) => parsed,
@@ -1140,7 +1208,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", serde_json::to_string_pretty(&stats)?);
             }
             cmd => {
-                eprintln!("Unknown subcommand: {}. Available: configure, daemon, api, remote, server, search, add, list, get, entity, entity-duplicates, wiki-write, wiki-read, wiki-import, stats, resolve, session, capture-transcript, import-sessions, context, brief, impact-export", cmd);
+                eprintln!("Unknown subcommand: {}. Available: configure, daemon, api, remote, server, search, add, list, get, entity, entity-duplicates, wiki-write, wiki-read, wiki-import, wiki-compile, stats, resolve, session, capture-transcript, import-sessions, context, brief, impact-export", cmd);
                 std::process::exit(1);
             }
         }
@@ -1155,6 +1223,34 @@ mod tests {
 
     fn args(raw: &[&str]) -> Vec<String> {
         raw.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn wiki_compile_needs_auto_and_takes_its_options() {
+        assert!(matches!(
+            parse_wiki_compile_args(&args(&["--auto", "--max-batches", "2", "--allow-shrink"])),
+            Ok(Op::WikiAutoCompile {
+                max_batches: 2,
+                allow_shrink: true
+            })
+        ));
+        assert!(matches!(
+            parse_wiki_compile_args(&args(&["--auto"])),
+            Ok(Op::WikiAutoCompile {
+                max_batches: 5,
+                allow_shrink: false
+            })
+        ));
+        assert!(parse_wiki_compile_args(&args(&[]))
+            .unwrap_err()
+            .contains("--auto"));
+        for bad in [
+            &["--auto", "--max-batches", "0"][..],
+            &["--auto", "--max-batches"],
+            &["--auto", "--bogus"],
+        ] {
+            assert!(parse_wiki_compile_args(&args(bad)).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

@@ -1113,6 +1113,9 @@ pub fn api_wiki_compile(
             Err(e) => return e,
         }
     };
+    if body.get("auto").and_then(Value::as_bool) == Some(true) {
+        return api_wiki_auto_compile(store, wiki, &body);
+    }
     let limit = match body.get("limit") {
         None | Some(Value::Null) => 20,
         Some(value) => match value.as_u64() {
@@ -1140,6 +1143,36 @@ pub fn api_wiki_compile(
         Ok(outcome) => ok(outcome),
         Err(StoreError::Invalid(why)) => err(400, why),
         Err(e) => internal_err(e),
+    }
+}
+
+/// `{"auto": true}`: the configured local model writes the pages (card #747).
+/// Takes `max_batches` (1 to 20, default 1) and `allow_shrink`. 503 when no
+/// model is configured; a batch the model or a guard stopped is a 200 whose
+/// `stopped` says why.
+fn api_wiki_auto_compile(store: &Store<'_>, wiki: &Wiki, body: &Value) -> (u16, Body) {
+    let max_batches = match body.get("max_batches") {
+        None | Some(Value::Null) => 1,
+        Some(value) => match value.as_u64() {
+            Some(n) if (1..=20).contains(&n) => n as usize,
+            _ => return err(400, "'max_batches' must be a number between 1 and 20"),
+        },
+    };
+    let allow_shrink = match body.get("allow_shrink") {
+        None | Some(Value::Null) => false,
+        Some(value) => match value.as_bool() {
+            Some(b) => b,
+            None => return err(400, "'allow_shrink' must be a boolean"),
+        },
+    };
+    let options = remind_me_core::wiki_compile::AutoOptions {
+        max_batches,
+        allow_shrink,
+        ..Default::default()
+    };
+    match remind_me_core::wiki_llm::compile_with_configured_model(wiki, store, &options) {
+        Ok(report) => ok(report),
+        Err(why) => err(503, why),
     }
 }
 
