@@ -192,10 +192,10 @@ function WikiCompilePanel({onCompile, onClose}) {
   const [copied, setCopied] = useState(false);
   const [confirmIntegrate, setConfirmIntegrate] = useState(false);
 
-  const run = useCallback(async (markIntegrated) => {
+  const run = useCallback(async (markIntegrated, through) => {
     setBusy(true); setError(null);
     let result;
-    try { result = await onCompile(markIntegrated); }
+    try { result = await onCompile(markIntegrated, through); }
     catch (e) { setBusy(false); setError("Request failed: " + e.message); return; }
     setBusy(false);
     if (result && result.error) { setError(result.error); return; }
@@ -244,7 +244,7 @@ function WikiCompilePanel({onCompile, onClose}) {
       React.createElement("button",{onClick:onClose,style:{padding:"8px 16px",borderRadius:6,border:"1px solid "+theme.border,background:"transparent",color:theme.textSecondary,fontSize:13,fontFamily:mono,cursor:"pointer"}},"Close"),
       outcome && outcome.status === "brief" && React.createElement("button",{onClick:copy,style:{display:"flex",alignItems:"center",gap:6,padding:"8px 16px",borderRadius:6,border:"1px solid "+theme.border,background:"transparent",color:theme.textSecondary,fontSize:13,fontFamily:mono,cursor:"pointer"}},
         copied ? React.createElement(Icons.Check) : React.createElement(Icons.Copy), copied ? "Copied" : "Copy brief"),
-      outcome && outcome.status === "brief" && React.createElement("button",{onClick:()=>confirmIntegrate?run(true):setConfirmIntegrate(true),disabled:busy,
+      outcome && outcome.status === "brief" && React.createElement("button",{onClick:()=>confirmIntegrate?run(true,outcome.through):setConfirmIntegrate(true),disabled:busy,
         style:{padding:"8px 20px",borderRadius:6,border:"none",background:busy?theme.surfaceActive:(confirmIntegrate?theme.warning:theme.accent),color:busy?theme.textMuted:"#fff",fontSize:13,fontWeight:600,fontFamily:mono,cursor:busy?"wait":"pointer",display:"flex",alignItems:"center",gap:6}},
         busy && React.createElement(Icons.Loader),
         confirmIntegrate ? "Yes, mark integrated" : "Mark integrated")
