@@ -6044,10 +6044,8 @@ mod tests {
             text.contains("- dashboard: not running"),
             "expected a concrete dashboard line, got: {text}"
         );
-        assert!(
-            text.contains("- sync: disabled"),
-            "expected a concrete sync line, got: {text}"
-        );
+        // ADR-0032: no sync, so no sync line at all.
+        assert!(!text.contains("sync:"), "unexpected sync line: {text}");
         assert!(
             text.contains("- webhook: disabled"),
             "expected a concrete webhook line, got: {text}"
