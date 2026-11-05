@@ -151,8 +151,16 @@ fn run_batches(
             }
             Ok(titles) => report.pages_written.extend(titles),
         }
+        // Checked and marked under one handle, so nothing changes between.
+        let store = db.store();
+        if let Some(id) = changed_source(&store, &batch.sources)? {
+            report.stopped = Some(format!(
+                "source `{id}` was edited while its pages were written"
+            ));
+            return Ok(());
+        }
         if let WikiCompile::Integrated { sources_marked, .. } =
-            wiki.compile(&db.store(), BATCH_LIMIT, true, Some(&batch.through))?
+            wiki.compile(&store, BATCH_LIMIT, true, Some(&batch.through))?
         {
             report.sources_integrated += sources_marked;
         }
@@ -209,6 +217,21 @@ fn write_batch(
         Some(id) => Err(format!("no page written cites source `{id}`")),
         None => Ok(titles),
     })
+}
+
+/// The first source whose text changed since the batch was read. A source
+/// deleted since is not a change: marking accepts it, as for a brief.
+fn changed_source<'a>(
+    store: &Store<'_>,
+    sources: &'a [Source],
+) -> crate::db::Result<Option<&'a str>> {
+    for source in sources {
+        let now = crate::db::queries::get_memory_by_id(store, &source.id)?;
+        if now.is_some_and(|memory| memory.content != source.content) {
+            return Ok(Some(&source.id));
+        }
+    }
+    Ok(None)
 }
 
 /// Check `draft` against the page as it stands now and save it, all under

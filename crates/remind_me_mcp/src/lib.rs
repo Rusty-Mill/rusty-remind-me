@@ -1784,7 +1784,9 @@ impl McpServer {
                 }
                 // Before the store handle is taken: it holds the database
                 // lock, and a model writing pages can take minutes.
-                if tool_name == "remind_me_wiki_compile"
+                let canonical =
+                    remind_me_core::tool_profiles::replacement(tool_name).unwrap_or(tool_name);
+                if canonical == "remind_me_wiki_compile"
                     && args.get("auto").and_then(Value::as_bool) == Some(true)
                 {
                     return Some(json!({

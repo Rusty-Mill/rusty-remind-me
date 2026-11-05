@@ -462,3 +462,50 @@ impl WikiWriter for Editor<'_> {
         Ok(draft)
     }
 }
+
+/// A writer during whose call someone edits a source memory.
+struct SourceEditor<'a> {
+    db: &'a Database,
+    inner: Scribe,
+}
+
+impl WikiWriter for SourceEditor<'_> {
+    fn write_page(&self, request: &PageRequest<'_>) -> Result<PageDraft, String> {
+        remind_me_core::db::queries::update_memory(
+            &self.db.store(),
+            &remind_me_core::MemoryUpdateInput {
+                memory_id: "mem_a".into(),
+                content: Some("Rust has ownership and borrowing".into()),
+                category: None,
+                tags: None,
+                metadata: None,
+                sensitive: None,
+                clear_superseded: false,
+                project: None,
+            },
+        )
+        .unwrap();
+        self.inner.write_page(request)
+    }
+}
+
+#[test]
+fn a_source_edited_while_the_model_writes_stays_pending() {
+    let db = Database::open_in_memory().unwrap();
+    let (w, root) = wiki("source-edited");
+    remember(&db.store(), &[("mem_a", "Rust has ownership")]);
+    let writer = SourceEditor {
+        db: &db,
+        inner: Scribe::new(Fault::None),
+    };
+    let one = AutoOptions {
+        max_batches: 1,
+        ..AutoOptions::default()
+    };
+
+    let report = run(&w, &db, &writer, None, &one).unwrap();
+
+    assert!(report.stopped.unwrap().contains("`mem_a` was edited"));
+    assert_eq!((report.batches, report.pending), (0, 1));
+    std::fs::remove_dir_all(&root).unwrap();
+}
