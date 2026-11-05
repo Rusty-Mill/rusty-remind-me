@@ -111,17 +111,8 @@ pub fn api_analytics_trend(
     }
 }
 
-/// Which builds are on each side of sync.
-///
-/// The node's own version is the point on a standalone install; `hub` exists
-/// for the case the dashboard has no other way to see. Auth-gated by the
-/// `/api/` prefix, unlike `/health`, and for a reason the reference states
-/// plainly: this node's build is its own to publish, the hub's is another
-/// machine's.
-///
-/// Best-effort throughout — an unreachable hub yields `null` rather than an
-/// error, so the dashboard omits a line instead of rendering a failure into
-/// its own chrome.
+/// This node's build and identity. Auth-gated by the `/api/` prefix, unlike
+/// `/health`, which publishes only the build.
 pub fn api_versions(
     _conn: &Store<'_>,
     _wiki: &Wiki,
@@ -134,8 +125,6 @@ pub fn api_versions(
         // `""` means unconfigured, and an empty string in a UI reads as a
         // rendering bug rather than as an absence.
         "node_id": if node_id.is_empty() { Value::Null } else { Value::String(node_id) },
-        "sync_enabled": remind_me_core::sync::sync_enabled(),
-        "hub": remind_me_core::sync::probe_hub_version(),
     }))
 }
 
@@ -1729,7 +1718,7 @@ pub fn api_reminders_ics(store: &Store<'_>, token: &str) -> (u16, Body) {
 ///
 /// The tradeoff is real and worth stating plainly: while enabled, this reveals
 /// usage patterns — which tools are called and how often, search volume,
-/// memory and outbox counts — to anyone who can reach the port. It exposes no
+/// memory counts — to anyone who can reach the port. It exposes no
 /// memory *content*. An operator who considers the shape sensitive should
 /// place the port accordingly, which is how self-hosted exporters are
 /// generally run.
@@ -1752,15 +1741,6 @@ pub fn metrics(
             "Total non-deleted memories currently in the store.",
             total as f64,
         ));
-    }
-    if remind_me_core::sync::sync_enabled() {
-        if let Ok(pending) = remind_me_core::db::outbox::Outbox::new(store).unsent_count() {
-            gauges.push(remind_me_core::metrics::GaugeSpec::new(
-                "remind_me_sync_outbox_pending",
-                "Sync outbox rows not yet acknowledged by the hub.",
-                pending as f64,
-            ));
-        }
     }
 
     (

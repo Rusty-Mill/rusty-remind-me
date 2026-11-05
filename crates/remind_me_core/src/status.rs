@@ -2,14 +2,13 @@
 //!
 //! # Reporting absence honestly
 //!
-//! `sync` and `dashboard` are subsystems this crate genuinely cannot answer
-//! for on its own: the sync worker only exists once the MCP server process
-//! instantiates one, and the dashboard is a wholly separate `rusty-remind-me
-//! api` process this crate has no handle to. Both are reported here as
-//! [`SubsystemStatus::NotImplemented`] carrying a reason, and both get
-//! overridden with live state at the MCP dispatch layer (`remind_me_mcp`'s
-//! `remind_me_server_status` arm), the same pattern `webhook`/`sync_peer`/
-//! `remote` already use. A caller can tell "this crate can't see a
+//! `dashboard` is a subsystem this crate genuinely cannot answer for on its
+//! own: the dashboard is a wholly separate `rusty-remind-me api` process this
+//! crate has no handle to. It is reported here as
+//! [`SubsystemStatus::NotImplemented`] carrying a reason, and overridden with
+//! live state at the MCP dispatch layer (`remind_me_mcp`'s
+//! `remind_me_server_status` arm), the same pattern `webhook`/`remote`
+//! already use. A caller can tell "this crate can't see a
 //! dashboard from here" apart from "the dashboard is down", which a bare
 //! boolean cannot express.
 //!
@@ -92,7 +91,6 @@ pub struct ServerStatus {
     pub mcp: SubsystemStatus,
     pub dashboard: SubsystemStatus,
     pub embeddings: SubsystemStatus,
-    pub sync: SubsystemStatus,
     /// Reported by the watcher itself now that one exists, rather than as an
     /// absent subsystem.
     pub watcher: crate::watcher::WatchStatus,
@@ -165,9 +163,6 @@ pub fn server_status(store: &Store<'_>) -> Result<ServerStatus> {
                  enable semantic search",
             ),
         },
-        sync: SubsystemStatus::missing(
-            "no sync engine in this crate; the outbox is written and pruned, never drained",
-        ),
         // Same precedence as the tool surface: a running loop knows more than
         // a freshly-built one, which has never scanned anything (#203).
         watcher: crate::watcher::live_status()

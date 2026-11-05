@@ -8,7 +8,7 @@
 
 function App() {
   const store = useMemoryStore();
-  const { version: serverVersion, hubVersion } = useServerVersion();
+  const { version: serverVersion } = useServerVersion();
   const wikiStore = useWikiStore();
   const entityStore = useEntityStore();
   const reminderStore = useReminderStore();
@@ -151,7 +151,7 @@ function App() {
         React.createElement("div",{style:{width:36,height:36,borderRadius:8,background:"linear-gradient(135deg,"+theme.accent+",#a855f7)",display:"flex",alignItems:"center",justifyContent:"center"}}, React.createElement(Icons.Brain)),
         React.createElement("div",null,
           React.createElement("h1",{style:{margin:0,fontSize:18,fontWeight:700,fontFamily:sans,letterSpacing:"-0.02em"}},"Remind Me"),
-          React.createElement("span",{style:{fontSize:11,color:theme.textMuted,fontFamily:mono}}, (stats.total||0)+" memories \u00b7 "+((stats.db_path||"").replace(/.*\//,"~/"))+(serverVersion?" \u00b7 v"+serverVersion:"")+(hubVersion?" \u00b7 hub v"+hubVersion:"")),
+          React.createElement("span",{style:{fontSize:11,color:theme.textMuted,fontFamily:mono}}, (stats.total||0)+" memories \u00b7 "+((stats.db_path||"").replace(/.*\//,"~/"))+(serverVersion?" \u00b7 v"+serverVersion:"")),
         )
       ),
       React.createElement("div",{style:{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}},
@@ -591,7 +591,7 @@ function App() {
                     // A subsystem this build never had reads as
                     // "not implemented", not as "stopped" -- the server
                     // reports the distinction, so the panel keeps it.
-                    ["mcp","dashboard","embeddings","sync"].map(k=>ops.status[k] && React.createElement("div",{key:k},
+                    ["mcp","dashboard","embeddings"].map(k=>ops.status[k] && React.createElement("div",{key:k},
                       k.charAt(0).toUpperCase()+k.slice(1)+" ",
                       React.createElement("code",{style:{color:ops.status[k].state==="active"?theme.success:theme.textMuted},title:ops.status[k].reason||""}, ops.status[k].state==="active"?"active":"not implemented")
                     ))

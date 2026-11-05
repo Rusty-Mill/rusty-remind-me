@@ -1,10 +1,10 @@
-//! A minimal hand-rolled HTTP/1.1 client for talking to a hub's peer
-//! server — the same `std::net::TcpStream`-based approach already used for
+//! A minimal hand-rolled HTTP/1.1 client for outgoing notification and
+//! event webhooks — the same `std::net::TcpStream`-based approach already used for
 //! the Ollama embedding client and the webhook/HTTP-API servers, rather
 //! than pulling in an async HTTP client for two request shapes.
 //!
 //! `http://` only, matching the same simplifying choice `embedder.rs`'s
-//! `OllamaEmbedder` already made: a sync deployment that needs TLS puts a
+//! `OllamaEmbedder` already made: a deployment that needs TLS puts a
 //! reverse proxy in front, the same way an Ollama deployment would.
 
 use std::io::{Read, Write};
@@ -56,53 +56,27 @@ fn parse_url(url: &str) -> Result<ParsedUrl, HttpError> {
     })
 }
 
-/// One HTTP request/response round-trip. `body: None` sends a bare
-/// request line (used for `GET`); `Some(json)` sends it with a
-/// `Content-Type: application/json` body (used for `POST`).
-fn request(
-    method: &str,
-    url: &str,
-    secret: Option<&str>,
-    body: Option<&str>,
-) -> Result<(u16, String), HttpError> {
+/// One `POST` of a JSON body, as one request/response round-trip.
+fn post(url: &str, body: &str) -> Result<(u16, String), HttpError> {
     let parsed = parse_url(url)?;
     use std::net::ToSocketAddrs;
     let addr = (parsed.host.as_str(), parsed.port)
         .to_socket_addrs()
         .ok()
         .and_then(|mut a| a.next())
-        .ok_or_else(|| HttpError(format!("cannot resolve sync host {:?}", parsed.host)))?;
+        .ok_or_else(|| HttpError(format!("cannot resolve host {:?}", parsed.host)))?;
     let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
         .map_err(|e| HttpError(format!("cannot reach {}: {}", url, e)))?;
     stream.set_read_timeout(Some(IO_TIMEOUT)).ok();
     stream.set_write_timeout(Some(IO_TIMEOUT)).ok();
 
-    // Omitted entirely rather than sent empty when there is no secret: a bare
-    // `Authorization: Bearer` is a malformed credential, and some endpoints
-    // reject it outright where they would have accepted no header at all.
-    let auth = match secret {
-        Some(secret) => format!("Authorization: Bearer {secret}\r\n"),
-        None => String::new(),
-    };
-    let request_text = match body {
-        Some(body) => format!(
-            "{method} {path} HTTP/1.1\r\nHost: {host}\r\n{auth}\
-             Content-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{body}",
-            method = method,
-            path = parsed.path_and_query,
-            host = parsed.host,
-            auth = auth,
-            len = body.len(),
-            body = body,
-        ),
-        None => format!(
-            "{method} {path} HTTP/1.1\r\nHost: {host}\r\n{auth}Connection: close\r\n\r\n",
-            method = method,
-            path = parsed.path_and_query,
-            host = parsed.host,
-            auth = auth,
-        ),
-    };
+    let request_text = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host}\r\n\
+         Content-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{body}",
+        path = parsed.path_and_query,
+        host = parsed.host,
+        len = body.len(),
+    );
     stream
         .write_all(request_text.as_bytes())
         .map_err(|e| HttpError(format!("writing to {}: {}", url, e)))?;
@@ -124,19 +98,11 @@ fn request(
     Ok((status, response_body.to_string()))
 }
 
-pub fn post_json(url: &str, secret: &str, body: &str) -> Result<(u16, String), HttpError> {
-    request("POST", url, Some(secret), Some(body))
-}
-
-pub fn get(url: &str, secret: &str) -> Result<(u16, String), HttpError> {
-    request("GET", url, Some(secret), None)
-}
-
 /// POST JSON with no `Authorization` header, for an endpoint this node does
 /// not share a secret with — a user-configured notification webhook, where
 /// any credential belongs in the URL the service itself issued.
 pub fn post_json_unauthenticated(url: &str, body: &str) -> Result<(u16, String), HttpError> {
-    request("POST", url, None, Some(body))
+    post(url, body)
 }
 
 #[cfg(test)]

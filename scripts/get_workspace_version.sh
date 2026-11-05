@@ -7,7 +7,7 @@
 # to compare against `.claude-plugin/plugin.json`.
 #
 # Before the move into the rusty_mill monorepo this read one
-# `[workspace.package].version` that all six crates inherited. The monorepo's
+# `[workspace.package].version` that all the crates inherited. The monorepo's
 # `[workspace.package]` belongs to other crates (and says 0.1.0), so each of
 # the six now carries a literal `version = "..."` -- and nothing in Cargo
 # keeps them in lockstep any more. This script is what does: it reads every
@@ -19,7 +19,7 @@
 set -euo pipefail
 
 product_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-members=(remind_me_core remind_me_mcp remind_me_api remind_me_cli remind_me_remote remind_me_hub)
+members=(remind_me_core remind_me_mcp remind_me_api remind_me_cli remind_me_remote)
 
 # The `version = "..."` line inside a manifest's own `[package]` table only --
 # not a bare first-match grep, which a `[dependencies]` entry written as

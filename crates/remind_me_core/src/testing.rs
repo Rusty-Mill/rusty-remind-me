@@ -184,6 +184,13 @@ pub struct OutboxRow {
     pub sent_at: String,
 }
 
+/// Mark the store as one that synced before multi-node sync was removed
+/// (card #746): its writes queue outbox rows and its deletes leave
+/// tombstones, as such a store keeps doing.
+pub fn mark_store_syncing(store: &Store<'_>) -> Result<()> {
+    crate::db::sync_state::SyncState::new(store).set_flag("sync_enabled", "1")
+}
+
 /// Every outbox row, oldest id first.
 pub fn outbox_rows(store: &Store<'_>) -> Result<Vec<OutboxRow>> {
     engine::testing::outbox_rows(&store.core().lock())

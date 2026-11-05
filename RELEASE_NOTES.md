@@ -2,6 +2,21 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-05 — Multi-node sync and the hub are removed, phase 1 (card #746)
+
+### Removed
+- The hub: the `remind_me_hub` crate with its `rusty-remind-me-hub` and `rusty-remind-me-hub-copy` binaries, its setup scripts and deployments, its CI jobs and its release assets. Releases ship `rusty-remind-me` alone, and `remind_me_self_update` rebuilds only that.
+- The sync transport in `remind_me_core`: push, pull, peer discovery, the peer server, the background sync worker, reconcile, sync status and repair, and the peer feed (`db::sync_feed`). The `sidecars` module went with the worker that supervised it (the hub tunnel and the UI sidecar).
+- MCP tools `remind_me_sync_status` and `remind_me_sync_repair`, and the aliases `remind_me_sync_reconcile` and `remind_me_sync_reconcile_peer`. The admin group lists seven tools.
+- The `sync` and `sync_peer` entries in `remind_me_server_status`, the digest's sync section (`DigestData.sync`), `sync_enabled` and `hub` in `GET /api/versions`, the hub version in the dashboard header, and the `remind_me_sync_outbox_pending` metric.
+- `configure --hub-url`, `--peer-port`, `--sync-interval`; those flags and `--secret` now fail saying sync is gone. `--node-id` stays and writes only `REMIND_ME_NODE_ID`. `REMIND_ME_HUB_URL`, `REMIND_ME_SYNC_SECRET`, `REMIND_ME_SYNC_INTERVAL`, `REMIND_ME_PEER_BIND`, `REMIND_ME_PEER_PORT`, `REMIND_ME_STATIC_PEERS`, `REMIND_ME_TAILSCALE_SOCKET`, `REMIND_ME_TUNNEL`, `REMIND_ME_SIDECAR_UI` and `REMIND_ME_MCP_UI_PORT` are no longer read.
+
+### Changed
+- Nothing turns sync on any more. A store that synced keeps its bookkeeping, so its data does not change: its writes still queue outbox rows (pruned by the retention window) and its deletes still leave tombstones, until `REMIND_ME_SYNC_DISABLE=1` turns that off and empties the outbox. A fresh store, or one already off, is set off at open. Retiring the outbox and the rest of the sync storage is phase 2. See ADR-0032.
+
+### Tests
+- `sync_gate_test`: a store that synced keeps syncing across opens, `REMIND_ME_SYNC_DISABLE` turns it off for good, and the old hub settings never turn a store syncing. Outbox, tombstone and undo-import tests mark their store syncing through `testing::mark_store_syncing` instead of the removed settings. Tests of the removed transport went with it.
+
 ## 2026-11-05 — A refused daemon client's final error names the setting, not only the lock (card #755)
 
 ### Fixed

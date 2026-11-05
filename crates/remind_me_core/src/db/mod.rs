@@ -26,7 +26,6 @@ pub mod saved_searches;
 pub mod sessions;
 pub mod stats;
 pub mod store;
-pub mod sync_feed;
 pub mod sync_state;
 pub mod vectors;
 pub mod wiki;

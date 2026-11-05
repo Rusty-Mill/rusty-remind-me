@@ -1,10 +1,10 @@
 //! Coverage for outbox growth and its pruning.
 //!
-//! The repositories queue an outbox row for every local write while sync is
-//! configured (triggers did this up to schema v30) (`#76`'s `sync_flags` gate — every test
-//! here runs with the three sync env vars set, via [`ensure_sync_enabled`],
-//! since this file is entirely about what accumulates once they do). Nothing
-//! in this crate drains the outbox on its own, so without a retention rule
+//! The repositories queue an outbox row for every local write in a store
+//! that synced (`#76`'s `sync_flags` gate; every test here marks its store
+//! that way via [`syncing_db`], since this file is entirely about what
+//! accumulates in one). Nothing drains the outbox since multi-node sync was
+//! removed (card #746), so without a retention rule
 //! the table grows without bound — carrying a full JSON copy of the memory
 //! each time.
 //!
@@ -14,30 +14,28 @@
 //! behavior from both sides — a read queues nothing, a real edit still queues
 //! exactly one.
 
-#[path = "../src/test_env.rs"]
-mod test_env;
-
 use chrono::{Duration, Utc};
 use remind_me_core::db::queries;
 use remind_me_core::db::sync_state::SyncState;
 use remind_me_core::db::Store;
-use remind_me_core::sync::{
-    prune_outbox, DEFAULT_OUTBOX_RETENTION_DAYS, HUB_REMOTE_ID, HUB_URL_ENV, NODE_ID_ENV,
-    SYNC_SECRET_ENV,
-};
+use remind_me_core::sync::{prune_outbox, DEFAULT_OUTBOX_RETENTION_DAYS, HUB_REMOTE_ID};
 use remind_me_core::testing::{self, Table};
 use remind_me_core::{
     Database, MemoryAddInput, MemorySearchInput, MemoryUpdateInput, UpdateOutcome,
 };
 
-/// Every test in this file wants sync on and never off, so setting these
-/// process-wide env vars needs no `ENV_LOCK`-style guard against other tests
-/// in the same binary racing it to a different value — there is no
-/// different value any test here ever wants.
-fn ensure_sync_enabled() {
-    crate::test_env::set_var(NODE_ID_ENV, "node-outbox-test");
-    crate::test_env::set_var(HUB_URL_ENV, "http://hub.example");
-    crate::test_env::set_var(SYNC_SECRET_ENV, "shh");
+/// An in-memory store marked as one that synced.
+fn syncing_db() -> Database {
+    let db = Database::open_in_memory().unwrap();
+    testing::mark_store_syncing(&db.store()).unwrap();
+    db
+}
+
+/// Open the store at `path`, marked as one that synced.
+fn open_syncing(path: &std::path::Path) -> Database {
+    let db = Database::open(path).unwrap();
+    testing::mark_store_syncing(&db.store()).unwrap();
+    db
 }
 
 fn add(store: &Store<'_>, content: &str) -> String {
@@ -105,8 +103,7 @@ fn backdate_outbox(store: &Store<'_>, days: i64) {
 
 #[test]
 fn writes_still_reach_the_outbox() {
-    ensure_sync_enabled();
-    let db = Database::open_in_memory().unwrap();
+    let db = syncing_db();
     let store = db.store();
     for i in 0..5 {
         add(&store, &format!("memory {}", i));
@@ -119,8 +116,7 @@ fn writes_still_reach_the_outbox() {
 
 #[test]
 fn reads_no_longer_grow_the_outbox() {
-    ensure_sync_enabled();
-    let db = Database::open_in_memory().unwrap();
+    let db = syncing_db();
     let store = db.store();
     add(&store, "quokka sighting");
     let after_write = outbox_rows(&store);
@@ -142,8 +138,7 @@ fn reads_no_longer_grow_the_outbox() {
 
 #[test]
 fn a_real_content_change_still_reaches_the_outbox() {
-    ensure_sync_enabled();
-    let db = Database::open_in_memory().unwrap();
+    let db = syncing_db();
     let store = db.store();
     let id = add(&store, "quokka sighting");
     let after_write = outbox_rows(&store);
@@ -182,8 +177,7 @@ fn a_real_content_change_still_reaches_the_outbox() {
 #[test]
 fn a_project_edit_reaches_the_outbox_with_the_project() {
     // #592 backfill: setting a project must sync like any other edit.
-    ensure_sync_enabled();
-    let db = Database::open_in_memory().unwrap();
+    let db = syncing_db();
     let store = db.store();
     let id = add(&store, "quokka sighting");
     let after_write = outbox_rows(&store);
@@ -216,8 +210,7 @@ fn a_project_edit_reaches_the_outbox_with_the_project() {
 
 #[test]
 fn already_sent_rows_are_pruned_immediately() {
-    ensure_sync_enabled();
-    let db = Database::open_in_memory().unwrap();
+    let db = syncing_db();
     let store = db.store();
     add(&store, "memory one");
     add(&store, "memory two");
@@ -237,8 +230,7 @@ fn rows_the_hub_has_taken_are_pruned_immediately() {
     // Every node pulls them from the hub, and a peer can pull them from
     // this node's feed, so keeping them only held a second copy of every
     // change, deleted memories' text included (ADR-0024).
-    ensure_sync_enabled();
-    let db = Database::open_in_memory().unwrap();
+    let db = syncing_db();
     let store = db.store();
     add(&store, "taken by the hub");
     add(&store, "not yet pushed");
@@ -261,8 +253,7 @@ fn rows_the_hub_has_taken_are_pruned_immediately() {
 #[test]
 fn a_row_only_a_peer_has_taken_waits_for_the_window() {
     // Without the hub's marker, a row is still owed to the hub.
-    ensure_sync_enabled();
-    let db = Database::open_in_memory().unwrap();
+    let db = syncing_db();
     let store = db.store();
     add(&store, "taken by a peer only");
     let row = testing::outbox_rows(&store).unwrap()[0].id;
@@ -276,8 +267,7 @@ fn a_row_only_a_peer_has_taken_waits_for_the_window() {
 
 #[test]
 fn rows_inside_the_retention_window_survive() {
-    ensure_sync_enabled();
-    let db = Database::open_in_memory().unwrap();
+    let db = syncing_db();
     let store = db.store();
     add(&store, "recent memory");
     backdate_outbox(&store, DEFAULT_OUTBOX_RETENTION_DAYS - 1);
@@ -292,8 +282,7 @@ fn rows_inside_the_retention_window_survive() {
 
 #[test]
 fn rows_past_the_retention_window_are_pruned() {
-    ensure_sync_enabled();
-    let db = Database::open_in_memory().unwrap();
+    let db = syncing_db();
     let store = db.store();
     add(&store, "stale memory");
     backdate_outbox(&store, DEFAULT_OUTBOX_RETENTION_DAYS + 1);
@@ -304,8 +293,7 @@ fn rows_past_the_retention_window_are_pruned() {
 
 #[test]
 fn pruning_drops_orphaned_send_markers() {
-    ensure_sync_enabled();
-    let db = Database::open_in_memory().unwrap();
+    let db = syncing_db();
     let store = db.store();
     add(&store, "memory one");
     let outbox_id = testing::outbox_rows(&store).unwrap()[0].id;
@@ -325,8 +313,7 @@ fn pruning_drops_orphaned_send_markers() {
 
 #[test]
 fn pruning_is_idempotent() {
-    ensure_sync_enabled();
-    let db = Database::open_in_memory().unwrap();
+    let db = syncing_db();
     let store = db.store();
     add(&store, "memory one");
 
@@ -337,14 +324,13 @@ fn pruning_is_idempotent() {
 
 #[test]
 fn opening_a_database_prunes_it() {
-    ensure_sync_enabled();
     let dir = std::env::temp_dir().join(format!("rrm_outbox_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("memories.db");
     let _ = std::fs::remove_file(&path);
 
     {
-        let db = Database::open(&path).unwrap();
+        let db = open_syncing(&path);
         let store = db.store();
         add(&store, "old memory");
         backdate_outbox(&store, DEFAULT_OUTBOX_RETENTION_DAYS + 1);
@@ -360,14 +346,13 @@ fn opening_a_database_prunes_it() {
 
 #[test]
 fn a_realistic_mix_of_traffic_stays_bounded() {
-    ensure_sync_enabled();
     let dir = std::env::temp_dir().join(format!("rrm_outbox_mix_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("memories.db");
     let _ = std::fs::remove_file(&path);
 
     {
-        let db = Database::open(&path).unwrap();
+        let db = open_syncing(&path);
         let store = db.store();
         for i in 0..10 {
             add(&store, &format!("quokka memory {}", i));
@@ -425,8 +410,7 @@ fn add_superseding(
 
 #[test]
 fn a_retirement_by_supersedes_reaches_the_outbox_and_a_refused_one_queues_nothing() {
-    ensure_sync_enabled();
-    let db = Database::open_in_memory().unwrap();
+    let db = syncing_db();
     let store = db.store();
     let old = add(&store, "old answer");
     let before = outbox_keys(&store);
@@ -441,4 +425,57 @@ fn a_retirement_by_supersedes_reaches_the_outbox_and_a_refused_one_queues_nothin
     let added = &queued[before.len()..];
     assert!(added.contains(&new), "{added:?}");
     assert!(added.contains(&old), "the retirement must sync: {added:?}");
+}
+
+#[test]
+fn a_long_lived_process_prunes_expired_rows_without_a_reopen() {
+    // With the sync worker gone (ADR-0032), the retention thread is what
+    // keeps a long-running process's outbox inside the window, whether or
+    // not compaction runs: the same open store, never reopened, loses the
+    // expired row and keeps the recent one.
+    let dir = std::env::temp_dir().join(format!("rrm_outbox_retention_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = open_syncing(&dir.join("memory.db"));
+    let (rows, source) = {
+        let store = db.store();
+        add(&store, "expired change");
+        add(&store, "recent change");
+        let rows = testing::outbox_rows(&store).unwrap();
+        assert_eq!(rows.len(), 2);
+        let expired = (Utc::now() - Duration::days(DEFAULT_OUTBOX_RETENTION_DAYS + 1)).to_rfc3339();
+        testing::set_outbox_column(&store, rows[0].id, "created_at", &expired).unwrap();
+        (rows, store.secondary_source().unwrap())
+    };
+
+    let pruner =
+        remind_me_core::sync::retention::start_pruner(source, std::time::Duration::from_millis(20))
+            .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while outbox_rows(&db.store()) > 1 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    pruner.stop();
+
+    let left = testing::outbox_rows(&db.store()).unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].id, rows[1].id);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn only_a_store_that_synced_gets_a_retention_thread() {
+    let dir = std::env::temp_dir().join(format!("rrm_outbox_no_retention_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let plain = Database::open(dir.join("memory.db")).unwrap();
+    assert!(remind_me_core::sync::retention::start_pruner_for(&plain.store()).is_none());
+    drop(plain);
+    let syncing = open_syncing(&dir.join("memory.db"));
+    let pruner = remind_me_core::sync::retention::start_pruner_for(&syncing.store());
+    assert!(pruner.is_some());
+    drop(pruner);
+    drop(syncing);
+    let _ = std::fs::remove_dir_all(&dir);
 }

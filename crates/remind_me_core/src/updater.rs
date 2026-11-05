@@ -13,7 +13,7 @@
 //! directory are no longer the same place. The updater therefore recognises
 //! both layouts ([`product_dir`]), scopes "commits behind" to commits that
 //! touch this product rather than any monorepo commit, and rebuilds only this
-//! product's two shipped binaries ([`BUILD_PACKAGES`]) instead of
+//! product's shipped binary ([`BUILD_PACKAGES`]) instead of
 //! `--workspace`, which in the monorepo would compile ~240 unrelated crates.
 
 use serde::{Deserialize, Serialize};
@@ -89,11 +89,11 @@ pub struct UpdateResult {
 /// `Rusty-Mill/rusty_mill` monorepo.
 pub const MONOREPO_PRODUCT_DIR: &str = "crates/apps/rusty_remind_me";
 
-/// The packages `remind_me_self_update` rebuilds: the two binaries a release
-/// ships (`rusty-remind-me` and `rusty-remind-me-hub`). Named explicitly
+/// The packages `remind_me_self_update` rebuilds: the binary a release
+/// ships (`rusty-remind-me`). Named explicitly
 /// rather than `--workspace` because in the monorepo the workspace is every
 /// Rusty Mill crate, not just this product.
-pub const BUILD_PACKAGES: [&str; 2] = ["rusty-remind-me", "remind_me_hub"];
+pub const BUILD_PACKAGES: [&str; 1] = ["rusty-remind-me"];
 
 /// This product's directory relative to `repo`: [`MONOREPO_PRODUCT_DIR`] in
 /// the monorepo, `"."` in a standalone `baileyrd/rusty_remind_me` clone (the

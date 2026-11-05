@@ -99,13 +99,11 @@ mod tests {
 
     const NOW: &str = "2026-09-26T00:00:00+00:00";
 
-    /// Associations, links and chunks, and every expansion read and sync
-    /// feed page over them.
+    /// Associations, links and chunks, and every expansion read over them.
     #[test]
-    fn expansion_reads_and_feeds_follow_the_graph() {
+    fn expansion_reads_follow_the_graph() {
         use crate::db::derived::Origin;
         use crate::db::entities::{Entities, RelationRow};
-        use crate::db::sync_feed::SyncFeed;
         use crate::entity::Entity;
         const T2: &str = "2026-09-27T00:00:00+00:00";
         let db = Database::open_in_memory().unwrap();
@@ -233,53 +231,6 @@ mod tests {
             .map(|c| c.memory.id)
             .collect();
         assert_eq!(co, ["b"]);
-
-        let feed = SyncFeed::new(&store);
-        let ids_of = |page: Vec<serde_json::Value>| -> Vec<String> {
-            page.into_iter()
-                .map(|v| v["id"].as_str().unwrap_or_default().to_string())
-                .collect()
-        };
-        assert_eq!(
-            ids_of(feed.memories_after("", "", None, 100).unwrap()),
-            ["a", "d1", "d2", "b", "c", "d3", "z"],
-            "by (updated_at, id)"
-        );
-        assert_eq!(
-            ids_of(feed.memories_after(NOW, "a", None, 3).unwrap()),
-            ["d1", "d2", "b"]
-        );
-        assert_eq!(
-            ids_of(feed.memories_after(NOW, "d2", Some("n1"), 100).unwrap()),
-            ["b", "c", "d3", "z"]
-        );
-        assert_eq!(
-            ids_of(feed.memories_after("", "", Some("n1"), 100).unwrap()),
-            ["d2", "b", "c", "d3", "z"],
-            "n1's own a and d1 are excluded"
-        );
-        assert_eq!(
-            ids_of(feed.entities_after("", "", Some("n1"), 100).unwrap()),
-            ["e2"]
-        );
-        let links = feed.links_after("", "", 100).unwrap();
-        assert_eq!(links.len(), 7);
-        assert_eq!(links[0]["record_type"], "memory_entity");
-        assert_eq!(
-            ids_of(feed.links_after(NOW, "b|e1", 2).unwrap()),
-            ["c|e2", "d1|e1"]
-        );
-        let relations = feed.relations_after("", "", 10).unwrap();
-        assert_eq!(relations.len(), 1);
-        assert_eq!(relations[0]["node_id"], "n1");
-        assert_eq!(
-            (
-                feed.entity_count().unwrap(),
-                feed.link_count().unwrap(),
-                feed.relation_count().unwrap()
-            ),
-            (2, 7, 1)
-        );
     }
 
     #[test]

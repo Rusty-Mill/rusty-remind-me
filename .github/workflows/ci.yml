@@ -67,11 +67,11 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
       - name: cargo build
-        run: cargo build --locked -p remind_me_core -p remind_me_mcp -p remind_me_api -p rusty-remind-me -p remind_me_remote -p remind_me_hub
+        run: cargo build --locked -p remind_me_core -p remind_me_mcp -p remind_me_api -p rusty-remind-me -p remind_me_remote
       - name: cargo test
-        run: cargo test --locked -p remind_me_core -p remind_me_mcp -p remind_me_api -p rusty-remind-me -p remind_me_remote -p remind_me_hub
+        run: cargo test --locked -p remind_me_core -p remind_me_mcp -p remind_me_api -p rusty-remind-me -p remind_me_remote
       - name: cargo clippy
-        run: cargo clippy --locked -p remind_me_core -p remind_me_mcp -p remind_me_api -p rusty-remind-me -p remind_me_remote -p remind_me_hub --all-targets -- -D warnings
+        run: cargo clippy --locked -p remind_me_core -p remind_me_mcp -p remind_me_api -p rusty-remind-me -p remind_me_remote --all-targets -- -D warnings
 
   # One runner per optional remind_me_core feature. Which features run tests
   # and which are clippy-only is deliberate (models that can't be fetched in
@@ -149,56 +149,6 @@ jobs:
       - name: Compare .claude-plugin/plugin.json against the crates' Cargo.toml
         run: scripts/check_plugin_version.sh
 
-  hub:
-    name: hub (engine + SQLite copy)
-    runs-on: ubuntu-latest
-    env:
-      RUSTFLAGS: -D warnings
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-          components: clippy
-      - name: cargo clippy -p remind_me_hub --no-default-features
-        run: cargo clippy --locked -p remind_me_hub --no-default-features --all-targets -- -D warnings
-      - name: cargo test -p remind_me_hub --no-default-features
-        run: cargo test --locked -p remind_me_hub --no-default-features
-
-  legacy-import:
-    # Postgres is only a legacy recovery source, never a runtime backend.
-    name: legacy Postgres import
-    runs-on: ubuntu-latest
-    env:
-      RUSTFLAGS: -D warnings
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: hubtest
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-          components: clippy
-      - name: Lint the recovery feature and binaries
-        run: cargo clippy --locked -p remind_me_hub --no-default-features --features postgres-import --all-targets -- -D warnings
-      - name: Test legacy Postgres recovery against a disposable server
-        env:
-          REMIND_ME_HUB_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/hubtest
-          # Refuse a missing service instead of reporting skipped imports as passed.
-          REMIND_ME_HUB_REQUIRE_POSTGRES: "1"
-        run: cargo test --locked -p remind_me_hub --no-default-features --features postgres-import --test hub_postgres_copy_test -- --test-threads=1
-
   # remind_me_core's cfg(windows) FFI (sidecar job objects, `\\?\` stripping)
   # compiles on no Linux leg above.
   windows:
@@ -213,11 +163,11 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
       - name: cargo build
-        run: cargo build --locked -p remind_me_core -p remind_me_mcp -p remind_me_api -p rusty-remind-me -p remind_me_remote -p remind_me_hub
+        run: cargo build --locked -p remind_me_core -p remind_me_mcp -p remind_me_api -p rusty-remind-me -p remind_me_remote
       - name: cargo test
-        run: cargo test --locked -p remind_me_core -p remind_me_mcp -p remind_me_api -p rusty-remind-me -p remind_me_remote -p remind_me_hub
+        run: cargo test --locked -p remind_me_core -p remind_me_mcp -p remind_me_api -p rusty-remind-me -p remind_me_remote
       - name: cargo clippy
-        run: cargo clippy --locked -p remind_me_core -p remind_me_mcp -p remind_me_api -p rusty-remind-me -p remind_me_remote -p remind_me_hub --all-targets -- -D warnings
+        run: cargo clippy --locked -p remind_me_core -p remind_me_mcp -p remind_me_api -p rusty-remind-me -p remind_me_remote --all-targets -- -D warnings
 
   # ---------------------------------------------------------------------------
   # Constant-time evidence for the native crypto crates (rusty_ct_check,
@@ -238,7 +188,7 @@ jobs:
     # The one check branch protection requires. A failed or cancelled job fails it.
     name: required-gate
     if: always()
-    needs: [fmt, cargo-deny, check, features, combined-features, plugin-version, hub, legacy-import, windows]
+    needs: [fmt, cargo-deny, check, features, combined-features, plugin-version, windows]
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any job failed or was cancelled

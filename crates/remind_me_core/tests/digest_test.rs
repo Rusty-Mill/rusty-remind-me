@@ -99,7 +99,7 @@ fn an_empty_window_says_so_rather_than_rendering_nothing() {
 }
 
 #[test]
-fn the_reminder_and_sync_sections_report_emptiness_rather_than_vanishing() {
+fn the_reminder_section_reports_emptiness_rather_than_vanishing() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
     add(&store, "something", false);
@@ -107,23 +107,32 @@ fn the_reminder_and_sync_sections_report_emptiness_rather_than_vanishing() {
     let data = build_digest(&store, 7).unwrap();
     let markdown = render_markdown(&data);
 
-    // Both sections were omitted while their subsystems did not exist, because
+    // The section was omitted while its subsystem did not exist, because
     // "Reminders: none" would have read as "you have nothing due" when the
-    // truth was "nothing here can tell". Both now exist (#116, #114), so an
-    // empty vault genuinely has nothing due and the section says so.
+    // truth was "nothing here can tell". It now exists (#116), so an empty
+    // vault genuinely has nothing due and the section says so.
     assert!(data.reminders_upcoming.is_empty());
     assert!(data.reminders_overdue.is_empty());
     assert!(markdown.contains("## Reminders"));
     assert!(markdown.contains("_No reminders set._"));
-    assert!(markdown.contains("## Sync health"));
-
-    // Sync is off in the test environment, and saying so is the answer — an
-    // absent section would leave the reader unable to tell "off" from "fine".
-    assert!(markdown.contains("Sync disabled"));
 
     let json = serde_json::to_value(&data).unwrap();
     assert_eq!(json["reminders_upcoming"], serde_json::json!([]));
-    assert_eq!(json["sync"]["state"], "disabled");
+}
+
+#[test]
+fn the_digest_has_no_sync_section_now_that_nodes_do_not_sync() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    add(&store, "something", false);
+
+    let data = build_digest(&store, 7).unwrap();
+    let markdown = render_markdown(&data);
+
+    // ADR-0032: there is no sync to report on, so neither form mentions it.
+    assert!(!markdown.contains("Sync"));
+    let json = serde_json::to_value(&data).unwrap();
+    assert!(json.get("sync").is_none());
 }
 
 #[test]

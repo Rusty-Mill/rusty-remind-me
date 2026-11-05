@@ -139,10 +139,7 @@ pub fn add_memory_with(
     let memory = get_memory_by_id(store, &id)?.ok_or(StoreError::NotFound)?;
     crate::episodes::ensure_session_for(store, &memory)?;
 
-    // Local mutation, so automation hears about it. A record arriving from a
-    // peer goes through `sync::upsert_record` instead, which deliberately
-    // emits nothing — see `events`' module docs for why echoing sync writes
-    // would make two nodes chase each other forever.
+    // Local mutation, so automation hears about it.
     crate::events::emit(crate::events::Event::Created, &memory.id, &memory.category);
 
     Ok(memory)
@@ -306,13 +303,11 @@ pub fn update_memory_with(
 
 /// Delete a memory. Returns `false` if no live memory had that id.
 ///
-/// Soft-deletes (tombstones via `deleted_at` + bumps `updated_at`) when sync
-/// is configured (`NODE_ID and HUB_URL and SYNC_SECRET`, `#57`), matching the
-/// reference exactly: a hard `DELETE` queues no outbox row at all, so it
-/// would otherwise silently resurrect on the next pull elsewhere. The tombstone is excluded from every
-/// normal read (`deleted_at IS NULL` everywhere this crate reads memories)
-/// and, on a node with sync disabled, there is nothing to propagate to, so
-/// this is a plain, immediate delete exactly as before.
+/// Soft-deletes (tombstones via `deleted_at` + bumps `updated_at`) in a store
+/// that synced ([`crate::sync::store_syncs`]), so its outbox and its copies
+/// agree; the tombstone is excluded from every normal read. A store that
+/// never synced has nothing to propagate to, so this is a plain, immediate
+/// delete.
 ///
 /// The queued payload carries `deleted_at`, so the tombstone travels. The
 /// tombstone keeps no text (ADR-0024): its content becomes

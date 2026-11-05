@@ -10,21 +10,14 @@
 //!
 //! # Every section reads from the tool that owns it
 //!
-//! Reminders come from [`crate::reminders::list_reminders`] and sync health
-//! from [`crate::sync::sync_status`] — the exact functions
-//! `remind_me_list_reminders` and `remind_me_sync_status` call. That is what
-//! makes it structurally impossible for the digest to disagree with them; a
-//! second query here would be a second opinion about what "overdue" means.
-//!
-//! Both sections were previously `Option` and omitted, because their
-//! subsystems did not exist yet and a "Reminders: none" line would have read
-//! as "you have nothing due" when the truth was "nothing here can tell". Both
-//! subsystems now exist (issues #116 and #114), so the honest shape is the
-//! real answer.
+//! Reminders come from [`crate::reminders::list_reminders`], the exact
+//! function `remind_me_list_reminders` calls. That is what makes it
+//! structurally impossible for the digest to disagree with it; a second
+//! query here would be a second opinion about what "overdue" means.
 
 use crate::db::Result;
 use crate::db::Store;
-use crate::models::{DigestData, DigestReminder, DigestReview, ReminderWindow, SyncStatus};
+use crate::models::{DigestData, DigestReminder, DigestReview, ReminderWindow};
 use crate::vitality::build_vitality_report;
 
 /// Days back that count as "recent" by default.
@@ -104,10 +97,6 @@ pub fn build_digest(store: &Store<'_>, since_days: i64) -> Result<DigestData> {
             .iter()
             .map(digest_review)
             .collect(),
-        // Local-only, no network: the digest has to stay callable from a
-        // scheduled path that cannot afford to block on a remote. The
-        // hub-reconcile verdict is a network call and stays out.
-        sync: crate::sync::sync_status(store)?,
     })
 }
 
@@ -204,39 +193,6 @@ pub fn render_markdown(data: &DigestData) -> String {
         out.push_str(
             "\n_Record each with `remind_me_resolve` and `review`: held, revised or reverted._\n\n",
         );
-    }
-
-    out.push_str("## Sync health\n\n");
-    match &data.sync {
-        SyncStatus::Disabled { hint, .. } => {
-            out.push_str(&format!("_Sync disabled — {}_\n", hint));
-        }
-        SyncStatus::Enabled {
-            node_id,
-            hub_url,
-            outbox,
-            remotes,
-            ..
-        } => {
-            out.push_str(&format!(
-                "Node `{}` → {}, outbox {} pending ({}).\n",
-                node_id,
-                hub_url,
-                outbox.pending,
-                format!("{:?}", outbox.drain).to_lowercase()
-            ));
-            for remote in remotes {
-                let state = if remote.ever_contacted {
-                    "ok"
-                } else {
-                    "never contacted"
-                };
-                out.push_str(&format!(
-                    "- **{}**: {} pending — {}\n",
-                    remote.remote_id, remote.pending, state
-                ));
-            }
-        }
     }
 
     out

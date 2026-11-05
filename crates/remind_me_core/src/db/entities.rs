@@ -2,11 +2,10 @@
 //! `memory_entities` mention links, on the engine's memories core
 //! (`db::engine::graph`).
 //!
-//! Every read and write [`crate::entity`] and [`crate::sync::graph`] make
-//! goes through here. The rules stay with them: how a name normalises into
-//! an id, how aliases merge, which kind wins, how a traversal walks, and how
-//! sync resolves a conflict. A local write queues its outbox entry as it
-//! lands; a synced one never does (see [`Origin`]).
+//! Every read and write [`crate::entity`] makes goes through here. The
+//! rules stay with it: how a name normalises into an id, how aliases merge,
+//! which kind wins and how a traversal walks. A write queues its outbox
+//! entry as it lands, in a store that syncs (see [`Origin`]).
 
 use super::derived::Origin;
 use super::engine::{self, EngineLock};
