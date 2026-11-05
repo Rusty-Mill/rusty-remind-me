@@ -1517,13 +1517,14 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_wiki_compile",
-                                "description": "remind-me wiki: drive wiki synthesis over raw memories. With mark_integrated=false (the default) returns a brief of pending sources and never advances the watermark, so it is safe to call repeatedly. Call again with mark_integrated=true after writing the pages.",
+                                "description": "remind-me wiki: drive wiki synthesis over raw memories. With mark_integrated=false (the default) returns a brief of pending sources and never advances the watermark, so it is safe to call repeatedly. Call again with mark_integrated=true and the brief's `through` after writing the pages, so exactly that brief's sources are marked.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
                                         "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "json", "description": "json (default) returns the structured record; markdown returns a human-readable summary." },
                                         "limit": { "type": "integer", "default": 20, "minimum": 1, "maximum": 100 },
-                                        "mark_integrated": { "type": "boolean", "default": false }
+                                        "mark_integrated": { "type": "boolean", "default": false },
+                                        "through": { "type": "string", "description": "With mark_integrated=true: the `through` a brief returned. Marks exactly that brief's sources. Without it the batch is recomputed, which an edit in between can change." }
                                     }
                                 }
                             },
@@ -3400,7 +3401,8 @@ impl McpServer {
                             .get("mark_integrated")
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
-                        match self.wiki.compile(&store, limit, mark_integrated) {
+                        let through = args.get("through").and_then(|v| v.as_str());
+                        match self.wiki.compile(&store, limit, mark_integrated, through) {
                             Ok(outcome) => {
                                 json!({ "content": [{ "type": "text", "text": match format {
     ResponseFormat::Json => serde_json::to_string_pretty(&outcome).unwrap(),

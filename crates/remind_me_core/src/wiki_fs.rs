@@ -37,8 +37,10 @@ pub const INDEX_FILE: &str = "index.md";
 pub const LOG_FILE: &str = "log.md";
 pub const SCHEMA_FILE: &str = "schema.md";
 
-/// `wiki_meta` key holding the compile watermark: the `created_at` of the last
-/// raw memory folded into the wiki.
+/// `wiki_meta` key holding the compile watermark: the `created_at` and id of
+/// the last raw memory folded into the wiki, as `"<created_at> <id>"`. A
+/// value holding the timestamp alone, as written before ids were added,
+/// covers every memory created at that instant.
 pub const COMPILE_WATERMARK_KEY: &str = "last_compile_at";
 
 /// Earliest timestamp, used when no compile has run.
@@ -89,6 +91,9 @@ pub enum WikiCompile {
     Brief {
         pending: usize,
         watermark: String,
+        /// The last surfaced source, as `"<created_at> <id>"`. Marking with it
+        /// integrates exactly this brief's sources, whatever changes between.
+        through: String,
         brief: String,
     },
     /// Phase two: the watermark moved past the surfaced batch.
@@ -461,9 +466,11 @@ impl Wiki {
     ///    watermark. **Idempotent** — calling it repeatedly never advances
     ///    anything, which is what makes it safe to re-read.
     /// 2. **Mark integrated** advances the watermark past the surfaced batch,
-    ///    after the caller has written the pages.
+    ///    after the caller has written the pages. Given the brief's `through`,
+    ///    it advances to exactly that source. Without one it recomputes the
+    ///    batch, which an edit or delete in between can change.
     ///
-    /// The new watermark is the **last surfaced row's `created_at`**, not the
+    /// The new watermark is the **last surfaced row's `created_at` and id**, not the
     /// wall clock. Using "now" would skip anything written while the caller was
     /// synthesising.
     pub fn compile(
@@ -471,45 +478,38 @@ impl Wiki {
         store: &Store<'_>,
         limit: usize,
         mark_integrated: bool,
+        through: Option<&str>,
     ) -> Result<WikiCompile> {
         self.reconcile(store)?;
         let watermark = get_meta(store, COMPILE_WATERMARK_KEY)?.unwrap_or_default();
-        let cutoff = if watermark.is_empty() {
-            EPOCH.to_string()
-        } else {
-            watermark.clone()
-        };
-
-        let mut pending = Memories::new(store).live_created_after(&cutoff, limit)?;
+        if mark_integrated {
+            if let Some(through) = through {
+                return self.mark_through(store, watermark, through);
+            }
+        }
+        let (cutoff, after_id) = parse_watermark(&watermark);
+        let mut pending = Memories::new(store).live_created_after(cutoff, after_id, limit)?;
         let fits = fitting(&pending, COMPILE_BRIEF_CHARS);
         let deferred = pending.len() - fits;
         pending.truncate(fits);
 
         if mark_integrated {
-            let Some(last_created) = pending.last().map(|m| &m.created_at) else {
+            let Some(last) = pending.last() else {
                 return Ok(WikiCompile::Noop {
                     reason: "no pending memories to mark".to_string(),
                     watermark,
                 });
             };
-            set_meta(store, COMPILE_WATERMARK_KEY, last_created)?;
-            self.append_log(&format!(
-                "compiled {} source(s) — watermark -> {}",
-                pending.len(),
-                last_created
-            ))?;
-            return Ok(WikiCompile::Integrated {
-                sources_marked: pending.len(),
-                watermark: last_created.clone(),
-            });
+            let marked = boundary(last);
+            return self.advance(store, pending.len(), marked);
         }
 
-        if pending.is_empty() {
+        let Some(through) = pending.last().map(boundary) else {
             return Ok(WikiCompile::Noop {
                 reason: "nothing pending; every raw memory is already integrated".to_string(),
                 watermark,
             });
-        }
+        };
 
         let pages = crate::wiki::list_wiki_pages(store)?;
         let index = if pages.is_empty() {
@@ -555,7 +555,8 @@ impl Wiki {
              2. Create or update those pages with `remind_me_wiki_write` — distil, \
              do not paste raw text; revise existing summaries; add [[cross-links]].\n\
              3. When done, call `remind_me_wiki_compile` again with \
-             `mark_integrated=true` to advance the watermark.",
+             `mark_integrated=true` and `through=\"{}\"` to advance the watermark \
+             past exactly these sources.",
             pending.len(),
             if watermark.is_empty() {
                 "never"
@@ -565,14 +566,69 @@ impl Wiki {
             deferred_note(deferred),
             self.read_schema()?.trim(),
             index,
-            sources
+            sources,
+            through
         );
 
         Ok(WikiCompile::Brief {
             pending: pending.len(),
             watermark,
+            through,
             brief,
         })
+    }
+
+    /// Advance the watermark to `through`, a brief's boundary, counting the
+    /// sources between. A boundary already passed is a no-op.
+    fn mark_through(
+        &self,
+        store: &Store<'_>,
+        watermark: String,
+        through: &str,
+    ) -> Result<WikiCompile> {
+        let Some((at, id)) = through.split_once(' ').filter(|(_, id)| !id.is_empty()) else {
+            return Err(crate::db::StoreError::Invalid(format!(
+                "`through` must be a brief's boundary, \"<created_at> <id>\"; got {through:?}"
+            )));
+        };
+        let (cutoff, after_id) = parse_watermark(&watermark);
+        if !is_after((at, id), (cutoff, after_id)) {
+            return Ok(WikiCompile::Noop {
+                reason: "that brief is already integrated".to_string(),
+                watermark,
+            });
+        }
+        let memories = Memories::new(store);
+        let pending = memories.count_live_created_after(cutoff, after_id)?;
+        let beyond = memories.count_live_created_after(at, Some(id))?;
+        self.advance(store, pending.saturating_sub(beyond), through.to_string())
+    }
+
+    /// Store `marked` as the watermark and log it.
+    fn advance(&self, store: &Store<'_>, sources: usize, marked: String) -> Result<WikiCompile> {
+        set_meta(store, COMPILE_WATERMARK_KEY, &marked)?;
+        self.append_log(&format!(
+            "compiled {sources} source(s) — watermark -> {marked}"
+        ))?;
+        Ok(WikiCompile::Integrated {
+            sources_marked: sources,
+            watermark: marked,
+        })
+    }
+}
+
+/// `memory`'s place in compile order, as a watermark stores it.
+fn boundary(memory: &CreatedMemory) -> String {
+    format!("{} {}", memory.created_at, memory.id)
+}
+
+/// Whether `(at, id)` comes after `(cutoff, after_id)` in (created_at, id)
+/// order. With no `after_id`, all of `cutoff` is behind.
+fn is_after((at, id): (&str, &str), (cutoff, after_id): (&str, Option<&str>)) -> bool {
+    match at.cmp(cutoff) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => after_id.is_some_and(|after| id > after),
     }
 }
 
@@ -611,12 +667,20 @@ fn deferred_note(deferred: usize) -> String {
 /// badge. Zero means the wiki is current with the memory store.
 pub fn pending_compile_count(store: &Store<'_>) -> Result<usize> {
     let watermark = get_meta(store, COMPILE_WATERMARK_KEY)?.unwrap_or_default();
-    let cutoff = if watermark.is_empty() {
-        EPOCH.to_string()
-    } else {
-        watermark
-    };
-    Memories::new(store).count_live_created_after(&cutoff)
+    let (cutoff, after_id) = parse_watermark(&watermark);
+    Memories::new(store).count_live_created_after(cutoff, after_id)
+}
+
+/// The (created_at, id) a stored watermark names; see
+/// [`COMPILE_WATERMARK_KEY`]. No watermark starts at the epoch.
+fn parse_watermark(watermark: &str) -> (&str, Option<&str>) {
+    if watermark.is_empty() {
+        return (EPOCH, None);
+    }
+    match watermark.split_once(' ') {
+        Some((created_at, id)) => (created_at, Some(id)),
+        None => (watermark, None),
+    }
 }
 
 /// Read a `wiki_meta` value.

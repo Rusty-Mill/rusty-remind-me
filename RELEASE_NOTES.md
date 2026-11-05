@@ -6,9 +6,12 @@ Dated entries, newest first. One entry per merged pull request.
 
 ### Fixed
 - `remind_me_wiki_compile` cut every source in its brief to 2,000 characters, but `mark_integrated=true` moved the watermark past those sources as if their whole text had been used. The rest of a long source never reached a later brief and dropped out of the wiki. No source is cut now. A brief carries up to 40,000 characters of source text and ends before the first source that would go past that; that source heads the next brief. A single source longer than the whole budget comes through alone, uncut. Marking a batch integrated cuts at the same place, so the watermark never passes a source the brief left out. The brief says how many sources are waiting for the next one.
+- The compile watermark now records the last integrated memory's id as well as its `created_at` (`"<created_at> <id>"`). Memories that share a timestamp, as every chunk of one import does, can be split across briefs without the watermark passing the ones left out. A watermark stored before this change holds the timestamp alone and still covers every memory at that instant.
+- A brief now returns `through`, its last source as `"<created_at> <id>"`, and `mark_integrated` accepts it (MCP argument and `POST /api/wiki/compile` field). Marking with it advances the watermark to exactly that source, so an edit or delete between the brief and the mark cannot integrate a source the brief never showed. Without `through` marking recomputes the batch as before. A malformed `through` is refused (400 over HTTP); one already passed is a no-op.
 
 ### Tests
 - `wiki_fs_test`: a source longer than the budget is surfaced whole and then marked; a source that does not fit ends the batch, is not passed by the watermark, and heads the next brief whole. Both failed on the base.
+- `wiki_fs_test`: a source deferred at the same `created_at` as the batch is surfaced in the next brief and counted as pending (failed before the id was added); a timestamp-only watermark still covers its whole instant; an edit between brief and mark cannot integrate an unseen source when marking through the brief's boundary; a boundary already passed is a no-op; a malformed one is refused. `wiki_write_test`: marking through a brief's boundary leaves a later memory pending; a non-string or id-less `through` is 400.
 
 ## 2026-11-04 — The v31 memories upgrade no longer loses logged rows on a failure
 

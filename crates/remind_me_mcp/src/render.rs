@@ -188,6 +188,7 @@ pub fn wiki_compile(outcome: &WikiCompile) -> String {
             pending,
             watermark,
             brief,
+            ..
         } => format!("**{pending} pending** (watermark {watermark})\n\n{brief}"),
         WikiCompile::Integrated {
             sources_marked,

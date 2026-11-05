@@ -3,16 +3,17 @@
 #[path = "../src/test_env.rs"]
 mod test_env;
 
+use remind_me_core::db::memories::{Memories, NewMemory};
 use remind_me_core::db::queries;
 use remind_me_core::db::wiki::WikiIndex;
 use remind_me_core::db::Store;
 use remind_me_core::wiki::WikiDeleteOutcome;
 use remind_me_core::wiki_fs::{
-    extract_summary, extract_title, get_meta, parse_wikilinks, pending_compile_count, Wiki,
-    WikiCompile, COMPILE_BRIEF_CHARS, COMPILE_WATERMARK_KEY, INDEX_FILE, LOG_FILE, SCHEMA_FILE,
-    WIKI_DIR_ENV,
+    extract_summary, extract_title, get_meta, parse_wikilinks, pending_compile_count, set_meta,
+    Wiki, WikiCompile, COMPILE_BRIEF_CHARS, COMPILE_WATERMARK_KEY, INDEX_FILE, LOG_FILE,
+    SCHEMA_FILE, WIKI_DIR_ENV,
 };
-use remind_me_core::{Database, MemoryAddInput};
+use remind_me_core::{Database, MemoryAddInput, MemoryUpdateInput};
 use std::sync::Mutex;
 
 /// `WIKI_DIR_ENV` is process-global; only one test in this file touches it
@@ -473,7 +474,7 @@ fn compiling_an_empty_store_reports_nothing_pending() {
     let store = db.store();
     let (w, root) = wiki("nothing");
 
-    match w.compile(&store, 20, false).unwrap() {
+    match w.compile(&store, 20, false, None).unwrap() {
         WikiCompile::Noop { .. } => {}
         other => panic!("expected a no-op, got {:?}", other),
     }
@@ -488,7 +489,7 @@ fn the_brief_surfaces_pending_sources_and_the_schema() {
     let (w, root) = wiki("brief");
     add(&store, "a raw memory about quokkas");
 
-    match w.compile(&store, 20, false).unwrap() {
+    match w.compile(&store, 20, false, None).unwrap() {
         WikiCompile::Brief { pending, brief, .. } => {
             assert_eq!(pending, 1);
             assert!(brief.contains("quokkas"));
@@ -511,7 +512,7 @@ fn the_brief_never_advances_the_watermark() {
     add(&store, "a raw memory");
 
     for _ in 0..3 {
-        match w.compile(&store, 20, false).unwrap() {
+        match w.compile(&store, 20, false, None).unwrap() {
             WikiCompile::Brief { pending, .. } => assert_eq!(pending, 1),
             other => panic!("expected a brief, got {:?}", other),
         }
@@ -531,7 +532,7 @@ fn marking_integrated_advances_the_watermark_past_the_batch() {
     add(&store, "first");
     add(&store, "second");
 
-    let marked = w.compile(&store, 20, true).unwrap();
+    let marked = w.compile(&store, 20, true, None).unwrap();
 
     match marked {
         WikiCompile::Integrated {
@@ -543,7 +544,7 @@ fn marking_integrated_advances_the_watermark_past_the_batch() {
         }
         other => panic!("expected an integration, got {:?}", other),
     }
-    match w.compile(&store, 20, false).unwrap() {
+    match w.compile(&store, 20, false, None).unwrap() {
         WikiCompile::Noop { .. } => {}
         other => panic!("expected nothing pending, got {:?}", other),
     }
@@ -558,16 +559,16 @@ fn a_memory_written_during_synthesis_is_not_skipped() {
     let (w, root) = wiki("during");
     add(&store, "surfaced in the brief");
     // Only the first is surfaced.
-    let brief = w.compile(&store, 1, false).unwrap();
+    let brief = w.compile(&store, 1, false, None).unwrap();
     assert!(matches!(brief, WikiCompile::Brief { pending: 1, .. }));
 
     // Something is written while the caller synthesises.
     add(&store, "written during synthesis");
-    w.compile(&store, 1, true).unwrap();
+    w.compile(&store, 1, true, None).unwrap();
 
     // The watermark is the last *surfaced* row's created_at, not the wall
     // clock — a clock-based watermark would swallow this memory unseen.
-    match w.compile(&store, 20, false).unwrap() {
+    match w.compile(&store, 20, false, None).unwrap() {
         WikiCompile::Brief { pending, brief, .. } => {
             assert_eq!(pending, 1);
             assert!(brief.contains("written during synthesis"));
@@ -597,7 +598,7 @@ fn a_source_larger_than_the_budget_is_surfaced_whole_and_then_marked() {
     let long = format!("{}TAIL-MARKER", "x".repeat(COMPILE_BRIEF_CHARS + 10));
     add(&store, &long);
 
-    let (pending, brief) = brief_of(w.compile(&store, 20, false).unwrap());
+    let (pending, brief) = brief_of(w.compile(&store, 20, false, None).unwrap());
     assert_eq!(
         pending, 1,
         "a lone source heads its batch however long it is"
@@ -608,7 +609,7 @@ fn a_source_larger_than_the_budget_is_surfaced_whole_and_then_marked() {
     );
     assert!(!brief.contains("[truncated]"));
 
-    match w.compile(&store, 20, true).unwrap() {
+    match w.compile(&store, 20, true, None).unwrap() {
         WikiCompile::Integrated { sources_marked, .. } => assert_eq!(sources_marked, 1),
         other => panic!("expected an integration, got {:?}", other),
     }
@@ -619,18 +620,18 @@ fn a_source_larger_than_the_budget_is_surfaced_whole_and_then_marked() {
 fn a_source_that_does_not_fit_ends_the_batch_and_heads_the_next() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
-    let (w, root) = wiki("budget");
+    let (w, root) = wiki("budget-defer");
     let half = COMPILE_BRIEF_CHARS * 2 / 3;
     add(&store, &format!("FIRST {}", "a".repeat(half)));
     add(&store, &format!("SECOND {}TAIL-MARKER", "b".repeat(half)));
 
-    let (pending, brief) = brief_of(w.compile(&store, 20, false).unwrap());
+    let (pending, brief) = brief_of(w.compile(&store, 20, false, None).unwrap());
     assert_eq!(pending, 1, "the second source would bust the budget");
     assert!(brief.contains("FIRST"));
     assert!(!brief.contains("SECOND"), "never surfaced in part");
     assert!(brief.contains("1 more"), "the brief says more is waiting");
 
-    match w.compile(&store, 20, true).unwrap() {
+    match w.compile(&store, 20, true, None).unwrap() {
         WikiCompile::Integrated { sources_marked, .. } => {
             assert_eq!(
                 sources_marked, 1,
@@ -639,7 +640,7 @@ fn a_source_that_does_not_fit_ends_the_batch_and_heads_the_next() {
         }
         other => panic!("expected an integration, got {:?}", other),
     }
-    let (pending, brief) = brief_of(w.compile(&store, 20, false).unwrap());
+    let (pending, brief) = brief_of(w.compile(&store, 20, false, None).unwrap());
     assert_eq!(pending, 1);
     assert!(
         brief.contains("TAIL-MARKER"),
@@ -649,12 +650,153 @@ fn a_source_that_does_not_fit_ends_the_batch_and_heads_the_next() {
 }
 
 #[test]
+fn a_source_deferred_at_the_same_instant_as_the_batch_is_not_skipped() {
+    // An import stamps every chunk with one `created_at`, so the budget can
+    // split rows that share a timestamp. The watermark must not pass the one
+    // left out.
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let (w, root) = wiki("tie");
+    let at = "2026-11-05T12:00:00+00:00";
+    let half = COMPILE_BRIEF_CHARS * 2 / 3;
+    for (id, label) in [("mem_a", "FIRST"), ("mem_b", "SECOND")] {
+        let content = format!("{label} {}TAIL-MARKER", "x".repeat(half));
+        Memories::new(&store)
+            .insert(&NewMemory::new(id, content, at))
+            .unwrap();
+    }
+
+    let (pending, brief) = brief_of(w.compile(&store, 20, false, None).unwrap());
+    assert_eq!(pending, 1);
+    assert!(brief.contains("FIRST") && !brief.contains("SECOND"));
+    w.compile(&store, 20, true, None).unwrap();
+
+    assert_eq!(pending_compile_count(&store).unwrap(), 1);
+    let (pending, brief) = brief_of(w.compile(&store, 20, false, None).unwrap());
+    assert_eq!(pending, 1);
+    assert!(brief.contains("SECOND") && brief.contains("TAIL-MARKER"));
+    w.compile(&store, 20, true, None).unwrap();
+    assert_eq!(pending_compile_count(&store).unwrap(), 0);
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn a_watermark_written_before_ids_still_covers_its_whole_instant() {
+    // A watermark from before this change holds the timestamp alone and
+    // meant "everything at or before it": it must keep meaning that.
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let (w, root) = wiki("legacy-mark");
+    let at = "2026-11-05T12:00:00+00:00";
+    Memories::new(&store)
+        .insert(&NewMemory::new("mem_a", "already integrated", at))
+        .unwrap();
+    set_meta(&store, COMPILE_WATERMARK_KEY, at).unwrap();
+
+    assert_eq!(pending_compile_count(&store).unwrap(), 0);
+    assert!(matches!(
+        w.compile(&store, 20, false, None).unwrap(),
+        WikiCompile::Noop { .. }
+    ));
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// A brief's `through`, the boundary its marking acknowledges.
+fn through_of(outcome: WikiCompile) -> String {
+    match outcome {
+        WikiCompile::Brief { through, .. } => through,
+        other => panic!("expected a brief, got {:?}", other),
+    }
+}
+
+#[test]
+fn an_edit_between_brief_and_mark_cannot_integrate_an_unseen_source() {
+    // The brief shows only FIRST. Shortening it before marking makes SECOND
+    // fit a recomputed batch; marking through the brief's boundary must not
+    // pass SECOND, which the caller never saw.
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let (w, root) = wiki("edit-between");
+    let half = COMPILE_BRIEF_CHARS * 2 / 3;
+    for (id, label, at) in [
+        ("mem_a", "FIRST", "2026-11-05T12:00:00+00:00"),
+        ("mem_b", "SECOND", "2026-11-05T12:00:01+00:00"),
+    ] {
+        let content = format!("{label} {}", "x".repeat(half));
+        Memories::new(&store)
+            .insert(&NewMemory::new(id, content, at))
+            .unwrap();
+    }
+    let through = through_of(w.compile(&store, 20, false, None).unwrap());
+
+    queries::update_memory(
+        &store,
+        &MemoryUpdateInput {
+            memory_id: "mem_a".into(),
+            content: Some("FIRST, now short".into()),
+            category: None,
+            tags: None,
+            metadata: None,
+            sensitive: None,
+            clear_superseded: false,
+            project: None,
+        },
+    )
+    .unwrap();
+
+    match w.compile(&store, 20, true, Some(&through)).unwrap() {
+        WikiCompile::Integrated { sources_marked, .. } => assert_eq!(sources_marked, 1),
+        other => panic!("expected an integration, got {:?}", other),
+    }
+    let (pending, brief) = brief_of(w.compile(&store, 20, false, None).unwrap());
+    assert_eq!(pending, 1);
+    assert!(brief.contains("SECOND"));
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn marking_through_a_boundary_already_passed_is_a_no_op() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let (w, root) = wiki("stale-through");
+    add(&store, "only");
+    let through = through_of(w.compile(&store, 20, false, None).unwrap());
+    w.compile(&store, 20, true, Some(&through)).unwrap();
+
+    assert!(matches!(
+        w.compile(&store, 20, true, Some(&through)).unwrap(),
+        WikiCompile::Noop { .. }
+    ));
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn a_through_that_names_no_source_is_refused() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let (w, root) = wiki("bad-through");
+    add(&store, "only");
+    for bad in [
+        "",
+        "2026-11-05T12:00:00+00:00",
+        "2026-11-05T12:00:00+00:00 ",
+    ] {
+        assert!(
+            w.compile(&store, 20, true, Some(bad)).is_err(),
+            "{bad:?} is not a brief's boundary"
+        );
+    }
+    assert_eq!(pending_compile_count(&store).unwrap(), 1);
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
 fn marking_with_nothing_pending_is_a_reported_no_op() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
     let (w, root) = wiki("emptymark");
 
-    match w.compile(&store, 20, true).unwrap() {
+    match w.compile(&store, 20, true, None).unwrap() {
         WikiCompile::Noop { reason, .. } => assert!(reason.contains("no pending")),
         other => panic!("expected a no-op, got {:?}", other),
     }
@@ -672,7 +814,7 @@ fn the_brief_lists_pages_that_already_exist() {
         .unwrap();
     add(&store, "a new raw memory");
 
-    match w.compile(&store, 20, false).unwrap() {
+    match w.compile(&store, 20, false, None).unwrap() {
         WikiCompile::Brief { brief, .. } => {
             assert!(brief.contains("[[Networking]]"));
             assert!(!brief.contains("bootstrapping"));
@@ -708,7 +850,7 @@ fn pending_count_is_not_capped_by_a_brief_limit() {
     w.list_pages(&store).unwrap();
 
     // compile() truncates its own `pending` count to the brief's limit...
-    match w.compile(&store, 2, false).unwrap() {
+    match w.compile(&store, 2, false, None).unwrap() {
         WikiCompile::Brief { pending, .. } => assert_eq!(pending, 2),
         other => panic!("expected a brief, got {:?}", other),
     }
@@ -726,7 +868,7 @@ fn marking_integrated_moves_the_watermark_and_drops_the_pending_count() {
     add(&store, "a raw memory");
     assert_eq!(pending_compile_count(&store).unwrap(), 1);
 
-    w.compile(&store, 20, true).unwrap();
+    w.compile(&store, 20, true, None).unwrap();
 
     assert_eq!(pending_compile_count(&store).unwrap(), 0);
 
