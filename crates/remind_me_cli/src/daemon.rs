@@ -11,6 +11,7 @@ use remind_me_core::daemon::client::{self, ConnectError, DaemonConnection};
 use remind_me_core::daemon::endpoint::Endpoint;
 use remind_me_core::daemon::ops::{self, Op, OpReply};
 use remind_me_core::daemon::server::{Daemon, Service, Start};
+use remind_me_core::daemon::settings::{self, Fingerprint};
 use remind_me_core::daemon::wire::Mode;
 use remind_me_core::wiki_fs::Wiki;
 use remind_me_core::Database;
@@ -49,10 +50,12 @@ impl Service for StoreService {
         ops::execute(&self.db.store(), op)
     }
 
-    fn http(&self, stream: &mut TcpStream) -> io::Result<()> {
+    fn http(&self, stream: &mut TcpStream, client: &Fingerprint) -> io::Result<()> {
         stream.set_read_timeout(Some(HTTP_TIMEOUT))?;
         stream.set_write_timeout(Some(HTTP_TIMEOUT))?;
-        let served = self.api.serve_one(stream);
+        let served = self
+            .api
+            .serve_one_for(stream, settings::api_key_digest(client));
         let _ = stream.shutdown(Shutdown::Both);
         served
     }

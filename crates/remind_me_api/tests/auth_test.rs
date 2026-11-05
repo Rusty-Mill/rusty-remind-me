@@ -6,7 +6,8 @@
 //! mutating routes is exactly the change that must not default open.
 
 mod common;
-use common::{authed_server, call, get, server, unauthed_json, KEY};
+use common::{authed_server, call, call_for, get, server, unauthed_json, KEY};
+use remind_me_core::daemon::settings::digest;
 
 #[test]
 fn health_is_always_public_with_no_key_configured() {
@@ -157,5 +158,58 @@ fn a_json_content_type_with_a_charset_suffix_is_accepted() {
         r#"{"content":"x"}"#,
     );
     assert_eq!(response.status, 201, "{:?}", response.body);
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn a_daemon_connection_is_checked_against_the_dashboard_units_key() {
+    // The daemon's own server has no key; the dashboard unit that relays to
+    // it has KEY. Its connections must be held to KEY, not served open.
+    let (server, root) = server("per-connection-key");
+    let theirs = digest(KEY);
+    let bearer = format!("Bearer {KEY}");
+
+    assert_eq!(
+        call_for(&server, Some(&theirs), "GET", "/api/stats", None).status,
+        401
+    );
+    let wrong = call_for(
+        &server,
+        Some(&theirs),
+        "GET",
+        "/api/stats",
+        Some("Bearer nope"),
+    );
+    assert_eq!(wrong.status, 401);
+    let right = call_for(&server, Some(&theirs), "GET", "/api/stats", Some(&bearer));
+    assert_eq!(right.status, 200);
+    let write = call_for(
+        &server,
+        Some(&theirs),
+        "POST",
+        "/api/memories",
+        Some(&bearer),
+    );
+    assert_ne!(write.status, 401, "the unit's key is read-write");
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn a_daemon_connection_from_a_unit_without_a_key_ignores_the_daemons_key() {
+    // The daemon has KEY; the relaying unit has none. The unit's posture
+    // holds: reads open, writes refused, KEY not required.
+    let (server, root) = authed_server("per-connection-none");
+    assert_eq!(
+        call_for(&server, None, "GET", "/api/stats", None).status,
+        200
+    );
+    let write = call_for(
+        &server,
+        None,
+        "POST",
+        "/api/memories",
+        Some(&format!("Bearer {KEY}")),
+    );
+    assert_eq!(write.status, 401);
     std::fs::remove_dir_all(&root).unwrap();
 }

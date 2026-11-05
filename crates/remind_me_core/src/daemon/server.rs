@@ -29,8 +29,9 @@ pub trait Service: Send + Sync + 'static {
     fn mcp(&self, line: &str) -> Option<Value>;
     /// Run one store operation.
     fn op(&self, op: &Op) -> OpReply;
-    /// Serve one HTTP exchange on `stream`.
-    fn http(&self, stream: &mut TcpStream) -> io::Result<()>;
+    /// Serve one HTTP exchange on `stream` for a client whose settings are
+    /// `client`: its API key, not the daemon's, guards the exchange.
+    fn http(&self, stream: &mut TcpStream, client: &Fingerprint) -> io::Result<()>;
 }
 
 /// The outcome of [`Daemon::start`].
@@ -311,7 +312,7 @@ fn serve_connection(
         Mode::Control => serve_ops(reader, writer, shared, None),
         Mode::Http => {
             debug_assert!(reader.buffer().is_empty());
-            service.http(&mut writer)
+            service.http(&mut writer, &hello.settings)
         }
     }
 }
@@ -488,8 +489,8 @@ mod tests {
             fn op(&self, op: &Op) -> OpReply {
                 Echo.op(op)
             }
-            fn http(&self, stream: &mut TcpStream) -> io::Result<()> {
-                Echo.http(stream)
+            fn http(&self, stream: &mut TcpStream, client: &Fingerprint) -> io::Result<()> {
+                Echo.http(stream, client)
             }
         }
         let endpoint = temp_endpoint();
@@ -531,7 +532,7 @@ mod tests {
             OpReply::Ok(serde_json::to_value(op).unwrap())
         }
 
-        fn http(&self, stream: &mut TcpStream) -> io::Result<()> {
+        fn http(&self, stream: &mut TcpStream, _: &Fingerprint) -> io::Result<()> {
             let mut request = [0u8; 4];
             stream.read_exact(&mut request)?;
             stream.write_all(b"pong")

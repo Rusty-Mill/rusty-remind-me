@@ -221,6 +221,23 @@ pub fn call_full(
     parse_response(&stream.output)
 }
 
+/// As [`call`], checked against the key whose digest is `key_digest` instead
+/// of the server's own, as the store daemon serves a dashboard connection.
+pub fn call_for(
+    server: &ApiServer,
+    key_digest: Option<&str>,
+    method: &str,
+    path: &str,
+    auth: Option<&str>,
+) -> Response {
+    let raw = raw_request(method, path, auth, Some("application/json"), "{}");
+    let mut stream = FakeStream::new(raw.into_bytes());
+    server
+        .serve_one_for(&mut stream, key_digest)
+        .expect("no I/O failure");
+    parse_response(&stream.output)
+}
+
 /// A GET with no auth header — the common case for read-route tests against
 /// an unauthenticated server.
 pub fn get(server: &ApiServer, path: &str) -> Response {
