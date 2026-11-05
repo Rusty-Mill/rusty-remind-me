@@ -6,7 +6,7 @@
 //! deployment that needs TLS puts a reverse proxy in front, as for Ollama.
 //! Off unless both [`URL_ENV`] and [`MODEL_ENV`] are set.
 
-use crate::db::Store;
+use crate::db::Database;
 use crate::embedder::post_json_within;
 use crate::wiki_compile::{run, AutoOptions, AutoReport, PageDraft, PageRequest, WikiWriter};
 use crate::wiki_fs::Wiki;
@@ -97,7 +97,7 @@ impl WikiWriter for ChatCompletionsWriter {
 /// replaced by [`MATCH_ENV`] when that is set.
 pub fn compile_with_configured_model(
     wiki: &Wiki,
-    store: &Store<'_>,
+    db: &Database,
     options: &AutoOptions,
 ) -> Result<AutoReport, String> {
     let writer = ChatCompletionsWriter::from_env()?.ok_or_else(|| {
@@ -111,7 +111,7 @@ pub fn compile_with_configured_model(
         ..options.clone()
     };
     let embedder = crate::embedder::available_embedder();
-    run(wiki, store, &writer, embedder.as_deref(), &options).map_err(|e| e.to_string())
+    run(wiki, db, &writer, embedder.as_deref(), &options).map_err(|e| e.to_string())
 }
 
 /// [`MATCH_ENV`]'s value, or `default` when unset.
@@ -187,26 +187,36 @@ struct Draft {
     content: String,
 }
 
-/// The page in a model's answer: the JSON object from its first `{` to its
-/// last `}`, after any `<think>` block, so a fenced or chatty answer still
-/// parses.
+/// The page in a model's answer. A reply that is the JSON page is taken as
+/// it is, whatever its content says. Otherwise a leading `<think>` block is
+/// dropped and the JSON object from the first `{` to the last `}` is parsed,
+/// so a fenced or chatty answer still parses.
 fn parse_draft(text: &str) -> Result<PageDraft, String> {
-    let text = match text.rfind("</think>") {
-        Some(end) => &text[end + "</think>".len()..],
-        None => text,
+    let text = text.trim();
+    let draft: Draft = match serde_json::from_str(text) {
+        Ok(draft) => draft,
+        Err(_) => serde_json::from_str(embedded_object(text)?)
+            .map_err(|e| format!("the {LABEL}'s page is not {{title, content}} JSON: {e}"))?,
     };
-    let (Some(start), Some(end)) = (text.find('{'), text.rfind('}')) else {
-        return Err(format!("the {LABEL} answered without a JSON page"));
-    };
-    if end < start {
-        return Err(format!("the {LABEL} answered without a JSON page"));
-    }
-    let draft: Draft = serde_json::from_str(&text[start..=end])
-        .map_err(|e| format!("the {LABEL}'s page is not {{title, content}} JSON: {e}"))?;
     Ok(PageDraft {
         title: draft.title.trim().to_string(),
         content: draft.content,
     })
+}
+
+/// The `{...}` in `text`, after a leading `<think>` block if there is one.
+fn embedded_object(text: &str) -> Result<&str, String> {
+    let text = match text
+        .strip_prefix("<think>")
+        .and_then(|rest| rest.split_once("</think>"))
+    {
+        Some((_, after)) => after,
+        None => text,
+    };
+    match (text.find('{'), text.rfind('}')) {
+        (Some(start), Some(end)) if start < end => Ok(&text[start..=end]),
+        _ => Err(format!("the {LABEL} answered without a JSON page")),
+    }
 }
 
 #[cfg(test)]
@@ -269,6 +279,17 @@ mod tests {
         assert_eq!(draft.title, "Rust");
         assert_eq!(draft.content, "A {braced} page");
         assert!(parse_draft("no page here").is_err());
+        // The literal tag inside a valid page is content, not a wrapper.
+        let about_tags = r#"{"title": "Tags", "content": "Models end reasoning with </think>."}"#;
+        assert_eq!(
+            parse_draft(about_tags).unwrap().content,
+            "Models end reasoning with </think>."
+        );
+        let wrapped = format!("<think>plan</think>\n{about_tags}");
+        assert_eq!(
+            parse_draft(&wrapped).unwrap().content,
+            "Models end reasoning with </think>."
+        );
         assert!(parse_draft("{\"title\": \"Rust\"}").is_err());
     }
 
@@ -311,6 +332,38 @@ mod tests {
             String::from_utf8(seen).unwrap()
         });
         (url, handle)
+    }
+
+    #[test]
+    fn a_trickling_server_cannot_outlast_the_timeout() {
+        // One byte every 200ms never goes idle long enough for a socket
+        // timeout; only a deadline on the whole call stops it.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\n");
+            while stream.write_all(b"x").is_ok() {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        });
+        let writer = ChatCompletionsWriter::from_vars(vars(&[
+            (URL_ENV, &url),
+            (MODEL_ENV, "qwen"),
+            (TIMEOUT_ENV, "1"),
+        ]))
+        .unwrap()
+        .unwrap();
+        let started = std::time::Instant::now();
+
+        let got = writer.write_page(&PageRequest {
+            schema: "",
+            page: None,
+            sources: &[],
+        });
+
+        assert!(got.unwrap_err().contains("reading from"));
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 
     #[test]

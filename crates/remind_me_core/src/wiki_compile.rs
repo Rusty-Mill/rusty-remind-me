@@ -13,7 +13,7 @@
 //! drive the loop with fakes.
 
 use crate::db::memories::CreatedMemory;
-use crate::db::Store;
+use crate::db::{Database, Store};
 use crate::embedder::{EmbedRole, Embedder};
 use crate::wiki::WikiPage;
 use crate::wiki_fs::{Wiki, WikiCompile};
@@ -109,9 +109,14 @@ pub struct Group {
 /// Compile pending memories into pages until none are left, a batch fails,
 /// or `max_batches` is reached. Errors are store errors; a writer or guard
 /// failure stops the run and is reported in [`AutoReport::stopped`].
+///
+/// Takes the database, not a store handle: a handle holds the database lock
+/// while it lives, and a model call can take minutes. Each store step takes
+/// its own short handle, and no handle is held while the writer runs, so
+/// other callers keep reading and writing in between.
 pub fn run(
     wiki: &Wiki,
-    store: &Store<'_>,
+    db: &Database,
     writer: &dyn WikiWriter,
     embedder: Option<&dyn Embedder>,
     options: &AutoOptions,
@@ -119,27 +124,27 @@ pub fn run(
     let mut report = AutoReport::default();
     let Some(_running) = RunGuard::take(wiki.root()) else {
         report.stopped = Some("another compile is running on this wiki".to_string());
-        report.pending = crate::wiki_fs::pending_compile_count(store)?;
+        report.pending = crate::wiki_fs::pending_compile_count(&db.store())?;
         return Ok(report);
     };
-    run_batches(wiki, store, writer, embedder, options, &mut report)?;
-    report.pending = crate::wiki_fs::pending_compile_count(store)?;
+    run_batches(wiki, db, writer, embedder, options, &mut report)?;
+    report.pending = crate::wiki_fs::pending_compile_count(&db.store())?;
     Ok(report)
 }
 
 fn run_batches(
     wiki: &Wiki,
-    store: &Store<'_>,
+    db: &Database,
     writer: &dyn WikiWriter,
     embedder: Option<&dyn Embedder>,
     options: &AutoOptions,
     report: &mut AutoReport,
 ) -> crate::db::Result<()> {
     for _ in 0..options.max_batches {
-        let Some(batch) = wiki.pending_batch(store, BATCH_LIMIT)? else {
+        let Some(batch) = wiki.pending_batch(&db.store(), BATCH_LIMIT)? else {
             return Ok(());
         };
-        match write_batch(wiki, store, writer, embedder, options, &batch.sources)? {
+        match write_batch(wiki, db, writer, embedder, options, &batch.sources)? {
             Err(why) => {
                 report.stopped = Some(why);
                 return Ok(());
@@ -147,7 +152,7 @@ fn run_batches(
             Ok(titles) => report.pages_written.extend(titles),
         }
         if let WikiCompile::Integrated { sources_marked, .. } =
-            wiki.compile(store, BATCH_LIMIT, true, Some(&batch.through))?
+            wiki.compile(&db.store(), BATCH_LIMIT, true, Some(&batch.through))?
         {
             report.sources_integrated += sources_marked;
         }
@@ -159,14 +164,14 @@ fn run_batches(
 /// Write every page one batch needs. `Ok(Err(why))` is a failed batch.
 fn write_batch(
     wiki: &Wiki,
-    store: &Store<'_>,
+    db: &Database,
     writer: &dyn WikiWriter,
     embedder: Option<&dyn Embedder>,
     options: &AutoOptions,
     sources: &[Source],
 ) -> crate::db::Result<Result<Vec<String>, String>> {
     let schema = wiki.read_schema()?;
-    let pages = wiki.list_pages(store)?;
+    let pages = wiki.list_pages(&db.store())?;
     let groups = group(&pages, sources, embedder, options.match_threshold);
     let mut titles = Vec::new();
     for group in groups {
@@ -177,35 +182,26 @@ fn write_batch(
                 page: page.as_ref(),
                 sources: &chunk,
             };
+            // No store handle is held here: this is the slow step.
             let draft = match writer.write_page(&request) {
                 Ok(draft) => draft,
                 Err(e) => return Ok(Err(format!("the writer failed: {e}"))),
             };
-            // A new-page draft that names an existing page is a rewrite of
-            // it, and gets the same guards.
-            let target = match page.take() {
-                Some(page) => Some(page),
-                None => wiki.read_page(store, &draft.title)?,
-            };
-            if let Err(why) = check_draft(target.as_ref(), &draft, options.allow_shrink) {
+            let store = db.store();
+            if let Err(why) = save_draft(wiki, &store, page.as_ref(), &draft, chunk.len(), options)?
+            {
                 return Ok(Err(why));
             }
-            let note = format!("auto-compiled from {} source(s)", chunk.len());
-            if wiki
-                .write_page(store, &draft.title, &draft.content, Some(&note))?
-                .is_err()
-            {
-                return Ok(Err(format!("{:?} is a reserved page name", draft.title)));
-            }
             titles.push(draft.title.clone());
-            page = wiki.read_page(store, &draft.title)?;
+            page = wiki.read_page(&store, &draft.title)?;
         }
     }
     // Checked against the pages as saved, not the drafts: a later rewrite of
     // a page may have dropped a citation an earlier chunk wrote.
+    let store = db.store();
     let mut written = String::new();
     for title in titles.iter().collect::<BTreeSet<_>>() {
-        if let Some(page) = wiki.read_page(store, title)? {
+        if let Some(page) = wiki.read_page(&store, title)? {
             written.push_str(&page.content);
         }
     }
@@ -213,6 +209,44 @@ fn write_batch(
         Some(id) => Err(format!("no page written cites source `{id}`")),
         None => Ok(titles),
     })
+}
+
+/// Check `draft` against the page as it stands now and save it, all under
+/// one store handle. `seen` is the page the writer was shown: if it changed
+/// while the writer ran, saving would discard that change, so the batch
+/// stops instead. A new-page draft that names an existing page is a rewrite
+/// of it, and gets the same guards.
+fn save_draft(
+    wiki: &Wiki,
+    store: &Store<'_>,
+    seen: Option<&WikiPage>,
+    draft: &PageDraft,
+    source_count: usize,
+    options: &AutoOptions,
+) -> crate::db::Result<Result<(), String>> {
+    let current = match seen {
+        Some(seen) => wiki.read_page(store, &seen.title)?,
+        None => wiki.read_page(store, &draft.title)?,
+    };
+    if let Some(seen) = seen {
+        if current.as_ref().map(|page| &page.content) != Some(&seen.content) {
+            return Ok(Err(format!(
+                "[[{}]] changed while it was being written",
+                seen.title
+            )));
+        }
+    }
+    if let Err(why) = check_draft(current.as_ref(), draft, options.allow_shrink) {
+        return Ok(Err(why));
+    }
+    let note = format!("auto-compiled from {source_count} source(s)");
+    if wiki
+        .write_page(store, &draft.title, &draft.content, Some(&note))?
+        .is_err()
+    {
+        return Ok(Err(format!("{:?} is a reserved page name", draft.title)));
+    }
+    Ok(Ok(()))
 }
 
 /// Group sources by page. Each source joins its closest page at

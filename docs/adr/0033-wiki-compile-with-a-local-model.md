@@ -15,12 +15,13 @@ enough to write a page from a dozen memories without anyone in the loop
 
 ## Decision
 
-1. **One run, on demand.** `remind_me_wiki_compile` with `auto=true`,
-   `POST /api/wiki/compile {"auto": true}` and `rusty-remind-me
-   wiki-compile --auto` compile up to `max_batches` batches (1 over MCP
-   and HTTP, 5 on the CLI) and return a report. There is no background
-   loop: a timer can call the CLI, and a run that writes pages unasked
-   should be one someone chose to schedule.
+1. **One run, on demand.** `remind_me_wiki_compile` with `auto=true` and
+   `rusty-remind-me wiki-compile --auto` compile up to `max_batches`
+   batches (1 over MCP, 5 on the CLI) and return a report. There is no
+   background loop: a timer can call the CLI, and a run that writes pages
+   unasked should be one someone chose to schedule. There is no HTTP
+   route: a request held open for minutes is the wrong shape for the
+   dashboard, which can poll the pending count instead.
 2. **Policy in core, the model behind a port.** `wiki_compile` holds the
    grouping, the guards and the run loop, and talks to a `WikiWriter`.
    `wiki_llm::ChatCompletionsWriter` is the only adapter; it POSTs to
@@ -61,12 +62,22 @@ enough to write a page from a dozen memories without anyone in the loop
    `}` after any `<think>` block is parsed, and the prompt ends in
    `/no_think` for Qwen models.
 
+8. **The database lock is not held while the model writes.** A store
+   handle holds the database lock while it lives, so a run takes the
+   database and opens a short handle for each step: reading the batch,
+   saving a page, marking. Other tools are served in between. Before a
+   page is saved, it is re-read under the same handle that saves it; if
+   it changed since the model was shown it, the batch stops instead of
+   overwriting the edit. `REMIND_ME_WIKI_LLM_TIMEOUT_SECS` is a deadline
+   for the whole call, not an idle timeout, so a server that trickles
+   bytes cannot hold a run open.
+
 ## Consequences
 
 - Pending memories reach the wiki without a person, at the cost of page
   quality bounded by the local model. The guards keep a weak model from
   erasing a page, not from writing a dull one.
-- A slow model makes an MCP or HTTP call take minutes. The default of one
+- A slow model makes an MCP call take minutes. The default of one
   batch keeps that bounded; the CLI is the place for longer runs.
 - The settings are `REMIND_ME_*`, so a client and the store daemon must
   agree on them like every other store setting (ADR-0023 §2).

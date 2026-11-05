@@ -534,6 +534,41 @@ fn capture_transcript_tool(
 }
 
 impl McpServer {
+    /// `remind_me_wiki_compile` with `auto=true`: the configured local model
+    /// writes the pages. Runs on the database rather than a store handle, so
+    /// other tools are served while the model writes.
+    fn wiki_auto_compile(&self, args: &Value, format: ResponseFormat) -> Value {
+        let options = remind_me_core::wiki_compile::AutoOptions {
+            max_batches: args
+                .get("max_batches")
+                .and_then(Value::as_u64)
+                .map(|v| v as usize)
+                .unwrap_or(1)
+                .clamp(1, 20),
+            allow_shrink: args
+                .get("allow_shrink")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            ..Default::default()
+        };
+        match remind_me_core::wiki_llm::compile_with_configured_model(
+            &self.wiki, &self.db, &options,
+        ) {
+            Ok(report) => {
+                let text = match format {
+                    ResponseFormat::Json => {
+                        serde_json::to_string_pretty(&report).unwrap_or_default()
+                    }
+                    ResponseFormat::Markdown => render::wiki_auto_compile(&report),
+                };
+                json!({ "content": [{ "type": "text", "text": text }] })
+            }
+            Err(e) => {
+                json!({ "isError": true, "content": [{ "type": "text", "text": format!("Wiki compile error: {e}") }] })
+            }
+        }
+    }
+
     pub fn new(db: Database) -> Self {
         Self::with_wiki(db, Wiki::from_env())
     }
@@ -1717,7 +1752,6 @@ impl McpServer {
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
                 // Read before `args` is moved into any tool's input model.
                 let format = requested_format(&args);
-                let store = self.db.store();
                 // Hidden means gone, not merely undocumented: a model that
                 // guessed the name would otherwise still reach it, and a
                 // caller who trimmed their surface would never know it was
@@ -1748,6 +1782,18 @@ impl McpServer {
                         }
                     }));
                 }
+                // Before the store handle is taken: it holds the database
+                // lock, and a model writing pages can take minutes.
+                if tool_name == "remind_me_wiki_compile"
+                    && args.get("auto").and_then(Value::as_bool) == Some(true)
+                {
+                    return Some(json!({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": self.wiki_auto_compile(&args, format),
+                    }));
+                }
+                let store = self.db.store();
                 let surface::Route { handler, args } = match surface::route(tool_name, args) {
                     Ok(route) => route,
                     Err(why) => {
@@ -3390,36 +3436,6 @@ impl McpServer {
                             }
                             Err(e) => {
                                 json!({ "isError": true, "content": [{ "type": "text", "text": format!("Wiki load error: {}", e) }] })
-                            }
-                        }
-                    }
-                    "remind_me_wiki_compile"
-                        if args.get("auto").and_then(|v| v.as_bool()) == Some(true) =>
-                    {
-                        let options = remind_me_core::wiki_compile::AutoOptions {
-                            max_batches: args
-                                .get("max_batches")
-                                .and_then(|v| v.as_u64())
-                                .map(|v| v as usize)
-                                .unwrap_or(1)
-                                .clamp(1, 20),
-                            allow_shrink: args
-                                .get("allow_shrink")
-                                .and_then(|v| v.as_bool())
-                                .unwrap_or(false),
-                            ..Default::default()
-                        };
-                        match remind_me_core::wiki_llm::compile_with_configured_model(
-                            &self.wiki, &store, &options,
-                        ) {
-                            Ok(report) => {
-                                json!({ "content": [{ "type": "text", "text": match format {
-    ResponseFormat::Json => serde_json::to_string_pretty(&report).unwrap(),
-    ResponseFormat::Markdown => render::wiki_auto_compile(&report),
-} }] })
-                            }
-                            Err(e) => {
-                                json!({ "isError": true, "content": [{ "type": "text", "text": format!("Wiki compile error: {}", e) }] })
                             }
                         }
                     }

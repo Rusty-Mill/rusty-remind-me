@@ -316,8 +316,10 @@ fn post_json(url: &str, label: &str, path: &str, body: &str) -> Result<String, E
     post_json_within(url, label, path, body, IO_TIMEOUT)
 }
 
-/// [`post_json`] with its own read/write timeout, for a caller that waits
-/// on generation rather than an embedding (`wiki_llm`).
+/// [`post_json`] within `io_timeout` for the whole call, for a caller that
+/// waits on generation rather than an embedding (`wiki_llm`). The limit is a
+/// deadline, not an idle timeout: a server that trickles bytes cannot keep
+/// the call alive past it.
 pub(crate) fn post_json_within(
     url: &str,
     label: &str,
@@ -335,9 +337,9 @@ pub(crate) fn post_json_within(
         .ok()
         .and_then(|mut a| a.next())
         .ok_or_else(|| EmbedError(format!("cannot resolve {label} host {host:?}")))?;
+    let deadline = std::time::Instant::now() + io_timeout;
     let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
         .map_err(|e| EmbedError(format!("cannot reach {label} at {url}: {e}")))?;
-    stream.set_read_timeout(Some(io_timeout)).ok();
     stream.set_write_timeout(Some(io_timeout)).ok();
 
     let request = format!(
@@ -351,11 +353,30 @@ pub(crate) fn post_json_within(
         .write_all(request.as_bytes())
         .map_err(|e| EmbedError(format!("writing to {label} failed: {e}")))?;
 
-    let mut raw = Vec::new();
-    stream
-        .read_to_end(&mut raw)
+    let raw = read_until(&mut stream, deadline)
         .map_err(|e| EmbedError(format!("reading from {label} failed: {e}")))?;
     response_body(&raw, label)
+}
+
+/// Read `stream` to its end, failing with `TimedOut` once `deadline` passes
+/// however steadily bytes arrive.
+fn read_until(stream: &mut TcpStream, deadline: std::time::Instant) -> std::io::Result<Vec<u8>> {
+    let mut raw = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "no complete response before the deadline",
+            ));
+        }
+        stream.set_read_timeout(Some(left))?;
+        match stream.read(&mut buf)? {
+            0 => return Ok(raw),
+            n => raw.extend_from_slice(&buf[..n]),
+        }
+    }
 }
 
 /// The body of the raw HTTP/1.1 response `raw`, refused unless the status is

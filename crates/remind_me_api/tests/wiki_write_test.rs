@@ -511,35 +511,3 @@ fn a_page_slugged_schema_does_not_shadow_the_schema_route() {
     assert!(authed_get(&server, "/api/wiki/schema").json()["schema"].is_string());
     std::fs::remove_dir_all(&root).unwrap();
 }
-
-// ---------------------------------------------------------------------------
-// POST /api/wiki/compile {"auto": true} (card #747)
-// ---------------------------------------------------------------------------
-
-#[test]
-fn auto_compile_validates_its_options() {
-    let (server, root) = authed_server("wiki-auto-options");
-    for body in [
-        json!({ "auto": true, "max_batches": 0 }),
-        json!({ "auto": true, "max_batches": 21 }),
-        json!({ "auto": true, "allow_shrink": "yes" }),
-    ] {
-        assert_eq!(compile(&server, body.clone()).status, 400, "{body}");
-    }
-    std::fs::remove_dir_all(&root).unwrap();
-}
-
-#[test]
-fn auto_compile_without_a_configured_model_is_unavailable() {
-    if std::env::var_os(remind_me_core::wiki_llm::URL_ENV).is_some() {
-        return; // A developer's own model is configured; nothing to assert.
-    }
-    let (server, root) = authed_server("wiki-auto-unconfigured");
-    let response = compile(&server, json!({ "auto": true }));
-    assert_eq!(response.status, 503);
-    assert!(response.json()["error"]
-        .as_str()
-        .unwrap_or_default()
-        .contains(remind_me_core::wiki_llm::URL_ENV));
-    std::fs::remove_dir_all(&root).unwrap();
-}

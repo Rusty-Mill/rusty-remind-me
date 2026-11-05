@@ -759,8 +759,9 @@ run and leaves that batch pending; the command exits 1 and says why.
 `REMIND_ME_WIKI_LLM_MAX_TOKENS` (default 4096) its length, and
 `REMIND_ME_WIKI_MATCH` (default 0.55) the cosine a memory needs to join an
 existing page. The same run is `remind_me_wiki_compile` with `auto=true` over
-MCP and `POST /api/wiki/compile {"auto": true}` over HTTP (one batch by
-default there).
+MCP (one batch by default there). The store stays usable while the model
+writes, and a page someone edits meanwhile stops the batch rather than being
+overwritten.
 
 ### 11. System Statistics
 Prints total memory counts and database metrics:
@@ -852,7 +853,7 @@ surfaces):
 | `GET` | `/api/wiki`, `/api/wiki/search`, `/api/wiki/load`, `/api/wiki/status`, `/api/wiki/{slug}` | Markdown wiki endpoints |
 | `POST` | `/api/wiki` | Create or replace a page — `{"title": ..., "content": ..., "log_note": ...}` (`remind_me_wiki_write`) |
 | `DELETE` | `/api/wiki/{slug}` | Delete a page and its index rows (`remind_me_wiki_delete`) |
-| `POST` | `/api/wiki/compile` | Compile brief; `{"mark_integrated": true, "through": <brief's through>}` advances the watermark (`remind_me_wiki_compile`); `{"auto": true, "max_batches": N, "allow_shrink": B}` has the configured local model write the pages (503 when none is configured) |
+| `POST` | `/api/wiki/compile` | Compile brief; `{"mark_integrated": true, "through": <brief's through>}` advances the watermark (`remind_me_wiki_compile`) |
 | `GET` | `/api/wiki/schema` | The maintainer schema the compile brief embeds |
 | `GET` | `/api/reminders?when=upcoming\|overdue\|all&limit=...` | Memories with a reminder set, soonest first (`remind_me_list_reminders`) |
 | `POST` | `/api/reminders` | Set or clear a reminder — `{"memory_id": ..., "remind_at": ISO-8601 or null}` (`remind_me_set_reminder`) |
