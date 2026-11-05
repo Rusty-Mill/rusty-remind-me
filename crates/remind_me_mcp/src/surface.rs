@@ -42,7 +42,6 @@ pub fn route(tool: &str, mut args: Value) -> Result<Route, String> {
             "remind_me_list_reminders"
         }),
         "remind_me_saved_searches" => pick(&args, "action", None, SAVED_SEARCH),
-        "remind_me_sync_status" => pick(&args, "reconcile", Some("none"), SYNC),
         other => {
             note_alias(other);
             return Ok(Route {
@@ -106,12 +105,6 @@ const SAVED_SEARCH: Choices = &[
     ("list", "remind_me_list_saved_searches"),
     ("run", "remind_me_run_saved_search"),
     ("delete", "remind_me_delete_saved_search"),
-];
-
-const SYNC: Choices = &[
-    ("none", "remind_me_sync_status"),
-    ("hub", "remind_me_sync_reconcile"),
-    ("peer", "remind_me_sync_reconcile_peer"),
 ];
 
 /// A non-empty string argument.
@@ -489,14 +482,6 @@ fn definition(name: &str, catalog: &[Value]) -> Option<Value> {
             &[],
             json!({ "action": choice(SAVED_SEARCH, None) }),
         ),
-        "remind_me_sync_status" => merged(
-            "remind-me admin: report multi-node sync state. `reconcile=hub`, or `reconcile=peer` \
-             with `node_id`, diffs record counts against the hub or one peer and says why they \
-             drift.",
-            &handlers(SYNC),
-            &[],
-            json!({ "reconcile": choice(SYNC, Some("none")) }),
-        ),
         _ => catalog.iter().find(|t| t["name"] == name).cloned(),
     }
 }
@@ -809,12 +794,6 @@ mod tests {
                 "remind_me_saved_searches",
                 json!({"action": "run"}),
                 "remind_me_run_saved_search",
-            ),
-            ("remind_me_sync_status", json!({}), "remind_me_sync_status"),
-            (
-                "remind_me_sync_status",
-                json!({"reconcile": "peer"}),
-                "remind_me_sync_reconcile_peer",
             ),
         ];
         for (tool, args, handler) in cases {

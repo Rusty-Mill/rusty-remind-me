@@ -1,28 +1,13 @@
-//! `remind_me_undo_import` on a **sync-enabled** node.
-//!
-//! Its own test binary rather than a case in `undo_import_test.rs`: the sync
-//! switch is three process-wide env vars, and every other test in that file
-//! asserts hard-delete behaviour. Sharing a process would mean either an
-//! `ENV_LOCK` serialising the whole file or a race that shows up as a flake
-//! months later.
-
-#[path = "../src/test_env.rs"]
-mod test_env;
+//! `remind_me_undo_import` on a store that synced before multi-node sync
+//! was removed (card #746), whose deletes still leave tombstones.
 
 use remind_me_core::db::imports::ImportLedger;
 use remind_me_core::db::memories::{Memories, NewMemory};
 use remind_me_core::db::outbox::Outbox;
 use remind_me_core::db::Store;
-use remind_me_core::sync::{HUB_URL_ENV, NODE_ID_ENV, SYNC_SECRET_ENV};
 use remind_me_core::testing::{self, Table};
 use remind_me_core::undo_import::undo_import;
 use remind_me_core::{Database, UndoImportInput, UndoImportKind};
-
-fn enable_sync() {
-    crate::test_env::set_var(NODE_ID_ENV, "node-undo-test");
-    crate::test_env::set_var(HUB_URL_ENV, "http://hub.example");
-    crate::test_env::set_var(SYNC_SECRET_ENV, "shh");
-}
 
 fn plant_chat_import(store: &Store<'_>, ids: &[&str], import_id: &str) {
     for id in ids {
@@ -61,9 +46,9 @@ fn tombstoned(store: &Store<'_>, deleted: bool) -> usize {
 
 #[test]
 fn undo_tombstones_rather_than_deleting_when_sync_is_on() {
-    enable_sync();
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
+    testing::mark_store_syncing(&store).unwrap();
     plant_chat_import(&store, &["mem_a", "mem_b"], "imp_1");
     Outbox::new(&store).clear().unwrap();
 
@@ -121,9 +106,9 @@ fn undo_tombstones_rather_than_deleting_when_sync_is_on() {
 
 #[test]
 fn a_tombstoned_import_still_loses_its_tracking_row() {
-    enable_sync();
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
+    testing::mark_store_syncing(&store).unwrap();
     plant_chat_import(&store, &["mem_a"], "imp_1");
 
     let result = undo_import(

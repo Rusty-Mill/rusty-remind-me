@@ -5,29 +5,22 @@
 // backs a view is answerable by reading one hook rather than grepping JSX.
 
 
-// Issue #211: the builds on each side of sync. The node's comes from /health
-// rather than /api/stats deliberately -- /health is unauthenticated, so it
-// still shows while the API key is wrong or missing, which is one of the
-// situations where you most want to know which build you are talking to. The
-// hub's needs /api/versions (another machine's build isn't ours to publish
-// unauthenticated), and is absent whenever sync is off or the hub can't be
-// reached. Both failures are silent: a missing version renders nothing rather
-// than putting an error in the chrome.
+// Issue #211: the serving build. It comes from /health rather than
+// /api/stats deliberately -- /health is unauthenticated, so it still shows
+// while the API key is wrong or missing, which is one of the situations where
+// you most want to know which build you are talking to. A failure is silent:
+// a missing version renders nothing rather than putting an error in the chrome.
 function useServerVersion() {
   const [version, setVersion] = useState("");
-  const [hubVersion, setHubVersion] = useState("");
   useEffect(() => {
     let cancelled = false;
     fetch(window.location.origin + "/health")
       .then(r => r.json())
       .then(d => { if (!cancelled && d && d.version) setVersion(d.version); })
       .catch(() => {});
-    api("/versions")
-      .then(d => { if (!cancelled && d && d.hub) setHubVersion(d.hub); })
-      .catch(() => {});
     return () => { cancelled = true; };
   }, []);
-  return { version, hubVersion };
+  return { version };
 }
 
 function useMemoryStore() {

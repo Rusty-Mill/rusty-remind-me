@@ -72,19 +72,6 @@ symphonia = { version = "0.6", optional = true, default-features = false, featur
 [dev-dependencies]
 # `json!` for the OAuth state store's `rusty_json` values in tests.
 rusty_json = { workspace = true }
-# The real remind_me_hub binary's library, without the copy tool's Postgres
-# reader (tests need no Postgres connection) -- used by
-# `tests/support`'s `MockHub` to run actual remind_me_hub request handling
-# against this crate's sync client, not just another copy of this crate's
-# own peer server (which `tests/support`'s `MockNode` already covers).
-# remind_me_hub has no dependency the other direction, so this is a
-# dev-only, test-only edge, not a runtime one.
-# `workspace = true` deliberately not used: Cargo ignores a downstream
-# `default-features = false` on a `workspace = true` dependency unless the
-# workspace table itself opts into that (a real restriction, not a bug --
-# confirmed by the build warning it produces, and it would otherwise
-# silently pull in the full `postgres`/`tokio-postgres` tree here).
-remind_me_hub = { path = "../remind_me_hub", default-features = false }
 
 [features]
 default = []
@@ -134,16 +121,14 @@ local-embed = ["dep:rten", "dep:rten-tensor", "dep:tokenizers"]
 stack-dumps = ["dep:rstack-self", "dep:backtrace"]
 
 # The workspace's only *unconditional* FFI dependency, and target-gated so it
-# exists nowhere else. `docs/adr/0013` records why the sidecar teardown gap was
-# worth closing and `docs/adr/0012` records the general reluctance -- read both
-# before adding a second one. (`stack-dumps` also reaches FFI, but only when
+# exists nowhere else. `docs/adr/0012` records the general reluctance -- read
+# it before adding a second one. (`stack-dumps` also reaches FFI, but only when
 # someone opts in; see `docs/adr/0014`.)
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     # The daemon client's `stop_inheriting_std_handles` (daemon/client.rs).
     "Win32_System_Console",
-    "Win32_System_JobObjects",
 ] }
 
 # Thread-stack dumping for the slow-call watchdog, behind the `stack-dumps`

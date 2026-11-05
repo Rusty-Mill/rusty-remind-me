@@ -12,10 +12,10 @@
 //! OAuth clients — both from a crate that must not pull tokio/axum/rmcp in
 //! just to read an env var, stat a file, or edit a small JSON document.
 //! Splitting "state a sync caller can read and mutate" from "the async
-//! server that serves it" mirrors [`crate::webhook::WebhookStatus`] and
-//! [`crate::sync::worker::SyncWorkerStatus`], which draw the same line
-//! between their status structs (here, sync, dependency-light) and their
-//! actual listener threads (also here, but could just as easily not be).
+//! server that serves it" mirrors [`crate::webhook::WebhookStatus`], which
+//! draws the same line between its status struct (here, sync,
+//! dependency-light) and its actual listener thread (also here, but could
+//! just as easily not be).
 //! [`OAuthStateStore`] is the same idea applied to OAuth: the reference's
 //! `remind_me_revoke_clients` tool (`tools/admin.py`) operates on
 //! `OAuthStateStore` directly, in the synchronous stdio process, and the
@@ -200,8 +200,7 @@ pub fn resolve_connector_token() -> String {
 
 /// What `remind_me_server_status` reports for the remote MCP connector.
 ///
-/// Mirrors [`crate::webhook::WebhookStatus`] / [`crate::sync::worker::SyncWorkerStatus`]'s
-/// shape: plain, `Serialize`-able, gathered by a sync free function. Matches
+/// Mirrors [`crate::webhook::WebhookStatus`]'s shape: plain, `Serialize`-able, gathered by a sync free function. Matches
 /// the reference's `get_remote_status()` field-for-field, including the
 /// FT-07 OAuth fields (`oauth_enabled`, `issuer`, `oauth_state_file`,
 /// `oauth_clients`).

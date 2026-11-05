@@ -1,17 +1,17 @@
-//! Multi-node sync: push the local outbox to a hub, pull its changes back.
+//! What is left of multi-node sync: write provenance and a syncing store's
+//! own bookkeeping.
 //!
-//! See `docs/adr/0004-sync-protocol-and-conflict-resolution.md`,
-//! `docs/adr/0005-graph-sync.md`, and `docs/adr/0006-peer-discovery.md` for
-//! what this module does and does not implement yet. In short: `memories`
-//! and the knowledge-graph tables (`entities`/`entity_relations`/
-//! `memory_entities`) sync against a configured hub and every discovered
-//! peer (a static list plus Tailscale's local API); no OAuth or
-//! `remind_me_revoke_clients` yet — deferred to its own follow-up issue,
-//! exactly as the epic asked for this to be split.
+//! The hub, peer discovery, push/pull and the background worker are gone
+//! (card #746): remind-me runs as one server with no other nodes. Two things
+//! stay here until the outbox itself is retired:
 //!
-//! Off unless [`NODE_ID_ENV`], [`HUB_URL_ENV`], and [`SYNC_SECRET_ENV`] are
-//! all set — the same default-off posture as the webhook endpoint (`#56`)
-//! and the folder watcher (`#55`).
+//! - **Provenance.** Every write is stamped with this node's id and the
+//!   calling client ([`memory_provenance`]); that never depended on sync.
+//! - **A store that synced keeps its bookkeeping.** Its `sync_enabled` flag
+//!   stays on, so deletes still leave tombstones and writes still queue
+//!   outbox rows, pruned by the retention window. Nothing changes in such a
+//!   store's data. [`SYNC_DISABLE_ENV`] turns that off explicitly, emptying
+//!   the outbox. A store that never synced is unaffected.
 
 use crate::db::outbox::Outbox;
 use crate::db::sync_state::SyncState;
@@ -19,73 +19,24 @@ use crate::db::Result;
 use crate::db::Store;
 use chrono::{Duration, Utc};
 
-mod graph;
-// Public so `notifications` can reuse the one HTTP client this crate has
-// rather than growing a second.
+// Public so `notifications` and `events` share one small HTTP client.
 pub mod http;
-mod peers;
-mod pull;
-mod push;
-mod reconcile;
-mod record;
-mod server;
-mod status;
-mod worker;
 
-pub use graph::{
-    apply_incoming_record, upsert_entity_record, upsert_entity_relation_record, upsert_link_record,
-    EntityRelationSyncRecord, EntitySyncRecord, GraphApplyError, LinkSyncRecord,
-};
-pub use peers::{discover_peers, probe_peer, Peer, STATIC_PEERS_ENV, TAILSCALE_SOCKET_ENV};
-pub use pull::{
-    pull_entities, pull_entity_relations, pull_links, pull_remote, PullError, PullReport,
-};
-pub use push::{push_outbox, PushError, PushReport};
-pub use reconcile::{classify, reconcile, reconcile_hub, reconcile_peer, PULL_LAG_GRACE_SECONDS};
-pub use record::{upsert_record, ApplyOutcome, SyncApplyError, SyncRecord};
-pub use server::{serve_once, PeerServer, PeerServerConfig, PeerServerStatus, SyncPeer};
-pub use status::{sync_repair, sync_status};
-pub use worker::{
-    disabled_status as sync_worker_disabled_status, live_status_against as sync_live_status,
-    superseded as sync_error_superseded, SyncWorker, SyncWorkerStatus, HUB_REMOTE_ID,
-};
-
-/// This node's identity in sync records. Empty (the default) means "no
-/// identity configured" — matching the reference's own `NODE_ID = ""`
-/// default, stamped onto every locally-created memory regardless of
-/// whether sync is actually enabled, so a node that turns sync on later
-/// does not have to guess which of its existing memories were its own.
+/// This node's identity, stamped on every newly created memory. Empty (the
+/// default) means "no identity configured".
 pub const NODE_ID_ENV: &str = "REMIND_ME_NODE_ID";
 /// A human-readable label for this device/install, stamped alongside
 /// `node_id`. Defaults to `"unknown"`, matching the reference.
 pub const CLIENT_ENV: &str = "REMIND_ME_CLIENT";
-/// The hub this node pushes to and pulls from. Sync is off without one.
-pub const HUB_URL_ENV: &str = "REMIND_ME_HUB_URL";
-/// Bearer token required on every `/sync/push` and `/sync/pull` request,
-/// both sent (to the hub) and required (of callers of this node's own peer
-/// server). Sync is off without one.
-pub const SYNC_SECRET_ENV: &str = "REMIND_ME_SYNC_SECRET";
-/// Set (`1`, `true`, `yes`, `on`) to turn sync off for this node's store:
-/// the flag goes off and the outbox is emptied. Without it, a process that
-/// lacks the sync settings above leaves a syncing store syncing.
+/// Set (`1`, `true`, `yes`, `on`) to stop a store that once synced from
+/// keeping sync bookkeeping: the flag goes off and the outbox is emptied.
 pub const SYNC_DISABLE_ENV: &str = "REMIND_ME_SYNC_DISABLE";
 /// The `content` a deleted memory keeps once its text is dropped
-/// (ADR-0024). Not `""`: `sync::record::upsert_record` rejects a record with
-/// empty content, and a pull stops at a record that did not apply, so an
-/// empty tombstone would stall every node on it. The hub stores the same
-/// value; it is part of the wire format.
+/// (ADR-0024), in a store that syncs.
 pub const TOMBSTONE_CONTENT: &str = "(deleted)";
-/// Seconds between background sync cycles.
-pub const SYNC_INTERVAL_ENV: &str = "REMIND_ME_SYNC_INTERVAL";
-pub const DEFAULT_SYNC_INTERVAL_SECS: u64 = 60;
-/// Bind address for this node's own peer server (accepting another node's
-/// push/pull). Defaults to all interfaces — unlike the webhook endpoint,
-/// a sync peer server has to be reachable by other machines to be useful
-/// at all, so there is no safe localhost-only default to fall back on.
-pub const PEER_BIND_ENV: &str = "REMIND_ME_PEER_BIND";
-pub const DEFAULT_PEER_BIND: &str = "0.0.0.0";
-pub const PEER_PORT_ENV: &str = "REMIND_ME_PEER_PORT";
-pub const DEFAULT_PEER_PORT: u16 = 8766;
+/// The send-marker id the hub's acknowledgements were recorded under;
+/// [`prune_outbox`] drops rows it took.
+pub const HUB_REMOTE_ID: &str = "hub";
 
 pub const DEFAULT_CLIENT: &str = "unknown";
 
@@ -97,17 +48,13 @@ pub const DEFAULT_CLIENT: &str = "unknown";
 /// of Claude Code's two documented delivery paths (manifest-level
 /// `${user_config.*}` substitution, or `CLAUDE_PLUGIN_OPTION_<KEY>` env
 /// export) actually reaches an MCP server subprocess, only hook processes.
-/// Kept as a defensive guard regardless of that history: none of
-/// `NODE_ID_ENV`/`HUB_URL_ENV`/`SYNC_SECRET_ENV` is ever legitimately this
-/// shape, so a value here means "never configured", not a hub URL/secret to
-/// actually use -- without this check, `sync_enabled` would read it as a
-/// real (if unusual) value and turn sync on against a garbage endpoint
-/// instead of leaving it off.
+/// Kept as a defensive guard regardless of that history: `NODE_ID_ENV` is
+/// never legitimately this shape, so a value here means "never configured".
 fn is_unresolved_placeholder(value: &str) -> bool {
     value.starts_with("${user_config.")
 }
 
-/// Read a sync config var, treating both "unset" and an unresolved
+/// Read a config var, treating both "unset" and an unresolved
 /// `${user_config.*}` placeholder (see [`is_unresolved_placeholder`]) as
 /// `""`.
 fn configured_env(key: &str) -> String {
@@ -120,8 +67,7 @@ fn configured_env(key: &str) -> String {
 }
 
 /// This node's configured identity, or `""` if unset — stamped on every
-/// newly created memory regardless of whether sync is enabled, matching
-/// the reference's own `memory_add` exactly (`NODE_ID`/`CLIENT` are plain
+/// newly created memory, matching the reference's own `memory_add` exactly (`NODE_ID`/`CLIENT` are plain
 /// module-level config, read unconditionally).
 pub fn configured_node_id() -> String {
     configured_env(NODE_ID_ENV)
@@ -235,149 +181,38 @@ pub fn configured_client() -> String {
 ///
 /// That is worse than not having the columns. A reader of `client` could not
 /// tell "unknown because nobody configured one" from "unknown because this
-/// write path forgot", and `node_id` rides the outbox payload
-/// (`db::derived`), so per-node attribution on the hub silently saw
-/// only manually-added memories.
+/// write path forgot".
 pub fn memory_provenance() -> (String, String) {
     (configured_node_id(), configured_client())
-}
-
-fn configured_hub_url() -> String {
-    configured_env(HUB_URL_ENV)
-}
-
-fn configured_sync_secret() -> String {
-    configured_env(SYNC_SECRET_ENV)
-}
-
-/// `NODE_ID`, `HUB_URL`, and `SYNC_SECRET` are all non-empty — matching the
-/// reference's `SYNC_ENABLED = bool(NODE_ID and HUB_URL and SYNC_SECRET)`
-/// exactly. Gates: whether `delete_memory` tombstones instead of hard
-/// deleting, whether the background sync worker does anything, and (via
-/// [`SyncPeer::from_env`]'s own additional secret-only check) whether this
-/// node's peer server binds a port at all.
-pub fn sync_enabled() -> bool {
-    !configured_node_id().is_empty()
-        && !configured_hub_url().is_empty()
-        && !configured_sync_secret().is_empty()
-}
-
-/// How long a probed hub version stays fresh.
-///
-/// Several dashboard tabs refreshing must not turn a page load into hub
-/// traffic; a build number does not change between requests anyway.
-const HUB_VERSION_TTL: std::time::Duration = std::time::Duration::from_secs(60);
-
-static HUB_VERSION_CACHE: std::sync::Mutex<Option<(std::time::Instant, Option<String>)>> =
-    std::sync::Mutex::new(None);
-
-/// The hub's build, probed from its `/health`.
-///
-/// `None` when sync is not configured, when the hub is unreachable, or when it
-/// reports no version — all three are the same thing to a caller: no line to
-/// render. Deliberately best-effort: a version display must never be able to
-/// fail the page it decorates.
-///
-/// **Probed live rather than read from sync state.** The reference makes this
-/// argument and it applies here too: a dashboard started standalone never runs
-/// a sync cycle, so anything populated by that cycle would report `null`
-/// forever while looking like a working feature. Asking the hub is correct
-/// regardless of which process is serving the page.
-///
-/// Wrapped here rather than exposing `sync::http`: the API crate has no
-/// business making raw HTTP requests, and this keeps the auth header and the
-/// cache in one place.
-pub fn probe_hub_version() -> Option<String> {
-    if !sync_enabled() {
-        return None;
-    }
-
-    let mut cache = HUB_VERSION_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((at, value)) = cache.as_ref() {
-        if at.elapsed() < HUB_VERSION_TTL {
-            return value.clone();
-        }
-    }
-
-    let url = format!("{}/health", configured_hub_url().trim_end_matches('/'));
-    let version = match http::get(&url, &configured_sync_secret()) {
-        Ok((200, body)) => serde_json::from_str::<serde_json::Value>(&body)
-            .ok()
-            .and_then(|v| {
-                v.get("version")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string)
-            }),
-        _ => None,
-    };
-
-    *cache = Some((std::time::Instant::now(), version.clone()));
-    version
 }
 
 /// The `sync_flags` key recording whether the outbox is being filled.
 const SYNC_ENABLED_FLAG: &str = "sync_enabled";
 
-/// Align `sync_flags.sync_enabled` with [`sync_enabled`], every time the
-/// schema is opened — matching the reference's own `_reconcile_sync_enabled_flag`,
-/// called on every startup, verbatim:
+/// Settle `sync_flags.sync_enabled` every time the schema is opened.
 ///
-/// - already matches: no-op.
-/// - stored `"0"`, now enabled: the outbox is backfilled with an `insert` row
-///   for every current `memories`/`entities`/`memory_entities` row, so
-///   changes made while sync was off still reach a remote once it's
-///   configured. Matches the reference exactly in NOT backfilling
-///   `entity_relations` either — preserved rather than "fixed," since
-///   covering more tables than the reference does would make the two diverge
-///   on what a first sync actually sends.
-/// - stored `"1"`, but this process has no sync settings: left as it is,
-///   with a warning. A store is shared by every process on a node, and
-///   one started without the settings (a dashboard, a one-off CLI) must
-///   not switch sync off for the rest: it used to clear the outbox and
-///   stop queueing their edits, which is how a real node lost six days of
-///   sync. [`SYNC_DISABLE_ENV`] is the explicit way to turn it off.
-/// - now disabled, from any other state or with [`SYNC_DISABLE_ENV`] set:
-///   `sync_outbox`/`sync_sends` are cleared — nothing is left to drain.
-/// - unset (a fresh database) and now enabled: no backfill, matching the
-///   reference's own reasoning verbatim even though the reference's stated
-///   justification ("pre-gate triggers were unconditional, so the outbox is
-///   already complete") describes reference history this crate never had.
-///   Reproducing the exact stored/desired matrix rather than the reasoning
-///   behind one cell of it keeps this one reconciliation function, not two
-///   diverging ones for "true fresh" vs. "upgraded from an older,
-///   once-ungated build."
+/// Nothing turns sync on any more, so a fresh store, or one whose flag is
+/// off, is set off with an empty outbox. A store whose flag is on keeps it,
+/// with its outbox and tombstones, unless [`SYNC_DISABLE_ENV`] asks for it
+/// off: a process may not quietly change how every other process on the
+/// store deletes.
 pub fn reconcile_sync_enabled_flag(store: &Store<'_>) -> Result<()> {
     let state = SyncState::new(store);
     let stored = state.flag(SYNC_ENABLED_FLAG)?;
-    let disable = sync_disable_requested();
-    let desired = if sync_enabled() && !disable { "1" } else { "0" };
-
-    if stored.as_deref() == Some(desired) {
-        return Ok(());
+    match stored.as_deref() {
+        Some("0") => Ok(()),
+        Some("1") if !sync_disable_requested() => Ok(()),
+        _ => {
+            Outbox::new(store).clear()?;
+            state.set_flag(SYNC_ENABLED_FLAG, "0")
+        }
     }
-    if desired == "0" && stored.as_deref() == Some("1") && !disable {
-        eprintln!(
-            "rusty-remind-me: this store syncs, but this process has no sync settings \
-             ({NODE_ID_ENV}, {HUB_URL_ENV}, {SYNC_SECRET_ENV}); leaving sync on. Set \
-             {SYNC_DISABLE_ENV}=1 to turn it off and empty the outbox."
-        );
-        return Ok(());
-    }
-
-    if desired == "1" && stored.as_deref() == Some("0") {
-        Outbox::new(store).backfill_everything()?;
-    } else if desired == "0" {
-        Outbox::new(store).clear()?;
-    }
-
-    state.set_flag(SYNC_ENABLED_FLAG, desired)
 }
 
 /// Whether this store syncs: its `sync_enabled` flag, which
 /// [`reconcile_sync_enabled_flag`] keeps. What decides whether a delete
 /// leaves a tombstone, so every process writing one store deletes the same
-/// way, whatever its own settings. A process without them used to hard
-/// delete, and the delete never reached any other node.
+/// way.
 pub fn store_syncs(store: &Store<'_>) -> Result<bool> {
     Ok(SyncState::new(store).flag(SYNC_ENABLED_FLAG)?.as_deref() == Some("1"))
 }
@@ -441,101 +276,29 @@ fn outbox_retention_days() -> i64 {
 ///
 /// # Where it runs
 ///
-/// The reference prunes on each sync cycle. This runs both on database open
-/// (bounding a long-lived database even with sync disabled) and, when sync
-/// is enabled, once per [`SyncWorker`] cycle — matching the reference's own
-/// arrangement now that one exists.
+/// On database open, bounding a long-lived database.
 pub fn prune_outbox(store: &Store<'_>) -> Result<usize> {
     let cutoff = (Utc::now() - Duration::days(outbox_retention_days())).to_rfc3339();
     Outbox::new(store).prune(&cutoff, HUB_REMOTE_ID)
 }
 
-/// Records a real, successful HTTP push round trip with `remote_id` (a push
-/// destination like `"hub"`) -- setting `last_attempt_at` and
-/// `last_push_at`. Only ever called with a bare destination id: pushing
-/// happens once per remote for the whole `sync_outbox`, not per resource
-/// type, so there is no namespaced push cursor the way pulls have one (see
-/// [`record_pull`] for those).
-///
-/// `sync_status`'s and `reconcile`'s docs both promise these `_at` columns
-/// "advance every cycle" so a quiet-but-healthy remote is distinguishable
-/// from a wedged one — a promise nothing wrote until now, which left every
-/// remote reading as permanently stuck at whatever value it last held
-/// (`1970-01-01` for one that has genuinely never answered, and otherwise
-/// whatever the last write happened to be, however old). Best-effort: a
-/// write failure here is telemetry, not correctness, and must not turn a
-/// successful sync into a reported failure.
-pub(crate) fn record_push(store: &Store<'_>, remote_id: &str) {
-    let _ = SyncState::new(store).stamp_push(remote_id, &Utc::now().to_rfc3339());
-}
-
-/// Same as [`record_push`], but for a successful pull -- sets
-/// `last_attempt_at` and `last_pull_at` instead.
-pub(crate) fn record_pull(store: &Store<'_>, remote_id: &str) {
-    let _ = SyncState::new(store).stamp_pull(remote_id, &Utc::now().to_rfc3339());
-}
-
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    // Env vars are process-global; serialize this module's env-touching
-    // tests so they don't race each other the way `cargo test` otherwise
-    // would. `pub(crate)` (rather than a second, module-local lock) because
-    // `sync::server`'s tests mutate this same `SYNC_SECRET_ENV` -- two
-    // independent locks over one shared process global would still race
-    // each other, which is exactly what happened before this was unified
-    // (a `combined-features` CI run hit
-    // `sync::server::tests::unresolved_user_config_placeholder_does_not_start_a_peer_server`
-    // failing because a concurrent `sync::tests` test set a real secret in
-    // the assertion's window).
-    pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    fn clear_env() {
-        crate::test_env::remove_var(NODE_ID_ENV);
-        crate::test_env::remove_var(HUB_URL_ENV);
-        crate::test_env::remove_var(SYNC_SECRET_ENV);
-    }
-
-    /// A stray literal `${user_config.KEY}` string in one of these vars --
-    /// what an MCP client's `env` config substitution would leave behind if
-    /// it were ever attempted and failed to resolve -- must not read as a
-    /// real (if unusual) hub URL/node id/secret. `sync_enabled` must treat
-    /// it exactly like the var being unset, and never turn sync on against a
-    /// garbage endpoint.
+    /// A stray literal `${user_config.KEY}` string -- what an MCP client's
+    /// `env` substitution leaves behind when it fails to resolve -- reads
+    /// as no node id at all.
     #[test]
-    fn unresolved_user_config_placeholder_does_not_enable_sync() {
+    fn unresolved_user_config_placeholder_is_no_node_id() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
         crate::test_env::set_var(NODE_ID_ENV, "${user_config.node_id}");
-        crate::test_env::set_var(HUB_URL_ENV, "${user_config.hub_url}");
-        crate::test_env::set_var(SYNC_SECRET_ENV, "${user_config.sync_secret}");
-
-        assert!(!sync_enabled());
         assert_eq!(configured_node_id(), "");
-        assert_eq!(configured_hub_url(), "");
-        assert_eq!(configured_sync_secret(), "");
-
-        clear_env();
-    }
-
-    /// A real, fully-configured triple still enables sync -- the placeholder
-    /// guard must not reject legitimate values that simply start with `$`
-    /// or otherwise resemble the pattern by coincidence.
-    #[test]
-    fn a_real_triple_still_enables_sync() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
         crate::test_env::set_var(NODE_ID_ENV, "my-laptop");
-        crate::test_env::set_var(HUB_URL_ENV, "https://hub.example.com");
-        crate::test_env::set_var(SYNC_SECRET_ENV, "s3cr3t");
-
-        assert!(sync_enabled());
         assert_eq!(configured_node_id(), "my-laptop");
-        assert_eq!(configured_hub_url(), "https://hub.example.com");
-        assert_eq!(configured_sync_secret(), "s3cr3t");
-
-        clear_env();
+        crate::test_env::remove_var(NODE_ID_ENV);
     }
 }

@@ -16,7 +16,7 @@ use std::sync::Mutex;
 /// Held by every test in this file that reads `report.embeddings`: that
 /// field now reflects `REMIND_ME_EMBEDDING_BACKEND`, a process-global env
 /// var, so a test asserting the unset (default) case must not race a test
-/// that sets it to `"ollama"` — same convention as `sync_test.rs`'s
+/// that sets it to `"ollama"` — same convention as the other env tests'
 /// `ENV_LOCK`.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -174,19 +174,16 @@ fn absent_subsystems_are_named_with_a_reason() {
     let report = server_status(&db.store()).unwrap();
 
     assert!(matches!(report.mcp, SubsystemStatus::Active));
-    // `dashboard` and `sync` are genuinely cross-process (a separate
-    // `rusty-remind-me api` process, and a worker the MCP server owns) --
-    // `server_status` alone can never answer for either, which is why both
-    // stay reported as not-implemented with a reason here (the MCP dispatch
-    // layer overrides both with live state; see `remind_me_mcp`'s
+    // `dashboard` is genuinely cross-process (a separate `rusty-remind-me
+    // api` process) -- `server_status` alone can never answer for it, which
+    // is why it stays reported as not-implemented with a reason here (the MCP
+    // dispatch layer overrides it with live state; see `remind_me_mcp`'s
     // `remind_me_server_status` arm and `crates/remind_me_mcp/tests`).
-    for status in [&report.dashboard, &report.sync] {
-        assert!(is_missing(status));
-        if let SubsystemStatus::NotImplemented { reason } = status {
-            assert!(!reason.is_empty(), "a reason must say something");
-        }
+    assert!(is_missing(&report.dashboard));
+    if let SubsystemStatus::NotImplemented { reason } = &report.dashboard {
+        assert!(!reason.is_empty(), "a reason must say something");
     }
-    // `embeddings`, unlike those two, is config read the same way in every
+    // `embeddings`, unlike that, is config read the same way in every
     // process -- with no backend configured, `server_status` itself already
     // reports it accurately, no override needed to prove this case.
     assert!(is_missing(&report.embeddings));

@@ -1,8 +1,8 @@
 name: Release
 
-# A push to `main` that moves the six crates' `[package].version` (kept in
+# A push to `main` that moves the five crates' `[package].version` (kept in
 # lockstep by scripts/get_workspace_version.sh) past the newest `vX.Y.Z` tag
-# builds the CLI/hub binaries and the Claude Code plugin archive and publishes
+# builds the CLI binary and the Claude Code plugin archive and publishes
 # them as a GitHub Release with that tag. This is rusty_mill's
 # remind-me-release.yml from while the product lived there, back at a
 # repository root: bare `vX.Y.Z` tags again, and "Latest" set again.
@@ -98,11 +98,9 @@ jobs:
           shared-key: remind-me-release-${{ matrix.target }}
 
       # Default features only, matching what README tells a from-source user
-      # to build. `-p` keeps this to the shipped binaries. remind_me_hub builds two: the hub,
-      # and rusty-remind-me-hub-copy, which moves a SQLite or Postgres hub onto
-      # the embedded engine (docs/adr/0021).
-      - name: Build rusty-remind-me, rusty-remind-me-hub and the hub copy tool (release)
-        run: cargo build --release --locked --target ${{ matrix.target }} -p rusty-remind-me -p remind_me_hub
+      # to build. `-p` keeps this to the shipped binary.
+      - name: Build rusty-remind-me (release)
+        run: cargo build --release --locked --target ${{ matrix.target }} -p rusty-remind-me
 
       - name: Package the archive (Linux / macOS)
         if: runner.os != 'Windows'
@@ -113,8 +111,6 @@ jobs:
           stage="rusty-remind-me-v${version}-${{ matrix.target }}"
           mkdir "$stage"
           cp "target/${{ matrix.target }}/release/rusty-remind-me" "$stage/"
-          cp "target/${{ matrix.target }}/release/rusty-remind-me-hub" "$stage/"
-          cp "target/${{ matrix.target }}/release/rusty-remind-me-hub-copy" "$stage/"
           cp "$PRODUCT_DIR/README.md" "$stage/"
           tar czf "${stage}.tar.gz" "$stage"
           echo "ASSET_PATH=${stage}.tar.gz" >> "$GITHUB_ENV"
@@ -127,8 +123,6 @@ jobs:
           $stage = "rusty-remind-me-v$version-${{ matrix.target }}"
           New-Item -ItemType Directory -Path $stage | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/rusty-remind-me.exe" "$stage/"
-          Copy-Item "target/${{ matrix.target }}/release/rusty-remind-me-hub.exe" "$stage/"
-          Copy-Item "target/${{ matrix.target }}/release/rusty-remind-me-hub-copy.exe" "$stage/"
           Copy-Item "$env:PRODUCT_DIR/README.md" "$stage/"
           Compress-Archive -Path $stage -DestinationPath "$stage.zip"
           echo "ASSET_PATH=$stage.zip" >> $env:GITHUB_ENV

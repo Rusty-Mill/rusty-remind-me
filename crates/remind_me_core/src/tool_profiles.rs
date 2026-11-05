@@ -90,15 +90,13 @@ pub const IMPORT: [&str; 3] = [
 
 /// Operations a person runs, not a conversation. `self_update` leaves MCP for
 /// the CLI in the next step of ADR-0030.
-pub const ADMIN: [&str; 9] = [
+pub const ADMIN: [&str; 7] = [
     "remind_me_backup",
     "remind_me_reindex",
     "remind_me_archive_prune",
     "remind_me_export_memories",
     "remind_me_revoke_clients",
     "remind_me_api_key",
-    "remind_me_sync_status",
-    "remind_me_sync_repair",
     "remind_me_self_update",
 ];
 
@@ -119,7 +117,7 @@ pub const GROUPS: [(&str, &[&str]); 6] = [
 ];
 
 /// Old name, and the public tool it merged into. Callable, never listed.
-pub const ALIASES: [(&str, &str); 36] = [
+pub const ALIASES: [(&str, &str); 34] = [
     ("remind_me_list", "remind_me_search"),
     ("remind_me_references", "remind_me_search"),
     ("remind_me_get_capture", "remind_me_get"),
@@ -148,8 +146,6 @@ pub const ALIASES: [(&str, &str); 36] = [
     ("remind_me_import_directory", "remind_me_import"),
     ("remind_me_import_dbs", "remind_me_import"),
     ("remind_me_import_mempalace", "remind_me_import"),
-    ("remind_me_sync_reconcile", "remind_me_sync_status"),
-    ("remind_me_sync_reconcile_peer", "remind_me_sync_status"),
     ("remind_me_list_reminders", "remind_me_reminders"),
     ("remind_me_reminders_ics_url", "remind_me_reminders"),
     ("remind_me_save_search", "remind_me_saved_searches"),

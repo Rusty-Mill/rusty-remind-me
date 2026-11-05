@@ -103,9 +103,6 @@ fn run(db_path: &Path, endpoint: Endpoint) -> Result<()> {
             eprintln!("rusty-remind-me daemon: {e}");
             None
         });
-    let mut sync = db
-        .secondary_source()
-        .and_then(remind_me_core::sync::SyncWorker::from_env);
 
     let wiki = Wiki::from_env();
     let service = StoreService {
@@ -132,10 +129,6 @@ fn run(db_path: &Path, endpoint: Endpoint) -> Result<()> {
         if let Some(compactor) = compactor {
             compactor.stop();
         }
-        if let Some(sync) = sync.as_mut() {
-            sync.stop();
-        }
-        drop(sync);
     });
     Ok(served?)
 }

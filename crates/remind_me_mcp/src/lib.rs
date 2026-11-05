@@ -197,29 +197,28 @@ use remind_me_core::kinds::StructuredFields;
 use remind_me_core::{
     backup, capture, consolidation::consolidate, context_brief, contradictions, db::queries,
     dbs_import, digest, entity, entity_duplicates, export, history, importer, mempalace_import,
-    normalize, recalibrate, saved_searches, stats, status, sync::SyncPeer, undo_import, updater,
-    vectors, vitality, watcher, webhook::Webhook, wiki, wiki_fs::Wiki, wiki_import, AnnotateInput,
-    AutoCaptureInput, BriefInput, BulkImportDirInput, ChatImportInput, ConsolidateInput,
+    normalize, recalibrate, saved_searches, stats, status, undo_import, updater, vectors, vitality,
+    watcher, webhook::Webhook, wiki, wiki_fs::Wiki, wiki_import, AnnotateInput, AutoCaptureInput,
+    BriefInput, BulkImportDirInput, ChatImportInput, ConsolidateInput,
     ContradictionCandidatesInput, Database, DbsImportInput, DecomposeBatchInput, DecomposeInput,
     DigestInput, EntityInput, EntityLookupInput, EntityTraverseInput, ExportInput,
     ExtractBatchInput, FeedbackInput, HistoryInput, ListRemindersInput, MemoryAddInput,
     MemoryListInput, MemorySearchInput, MemoryStatsInput, MemoryUpdateInput, MempalaceImportInput,
     NormalizeApplyInput, NormalizeBatchInput, RecalibrateCandidatesInput, ReclassifyBatchInput,
-    ReclassifyInput, ReconcilePeerInput, ResponseFormat, RevertInput, SaveSearchInput, SavedMemory,
-    SavedSearchNameInput, SearchDetail, SetReminderInput, SyncRepairInput, UndoImportInput,
-    UpdateOutcome, WikiDeleteOutcome, ANNOTATE_BATCH_MAX, ANNOTATE_BATCH_MIN,
-    CONSOLIDATE_LIMIT_MAX, CONSOLIDATE_LIMIT_MIN, CONSOLIDATE_SIMILARITY_MAX,
-    CONSOLIDATE_SIMILARITY_MIN, CONTRADICTION_LIMIT_MAX, CONTRADICTION_LIMIT_MIN,
-    DBS_IMPORT_LIMIT_MAX, DBS_IMPORT_LIMIT_MIN, DECOMPOSE_BATCH_MAX, DECOMPOSE_BATCH_MIN,
-    DECOMPOSE_FACTS_MAX, DECOMPOSE_FACTS_MIN, ENTITY_LOOKUP_LIMIT_MAX, ENTITY_LOOKUP_LIMIT_MIN,
-    EXTRACT_BATCH_MAX, EXTRACT_BATCH_MIN, EXTRACT_MODES, HISTORY_LIMIT_MAX, HISTORY_LIMIT_MIN,
-    IMPORT_MAX_LENGTH_MAX, IMPORT_MAX_LENGTH_MIN, MEMPALACE_IMPORT_LIMIT_MAX,
-    MEMPALACE_IMPORT_LIMIT_MIN, NORMALIZE_APPLY_MAX, NORMALIZE_APPLY_MIN, NORMALIZE_BATCH_MAX,
-    NORMALIZE_BATCH_MIN, PROMOTION_LIMIT_DEFAULT, PROMOTION_LIMIT_MAX, PROMOTION_LIMIT_MIN,
-    RECALIBRATE_LIMIT_MAX, RECALIBRATE_LIMIT_MIN, RECLASSIFY_BATCH_MAX, RECLASSIFY_BATCH_MIN,
-    REMINDER_LIMIT_MAX, REMINDER_LIMIT_MIN, STALE_CANDIDATES_LIMIT_DEFAULT,
-    STALE_CANDIDATES_LIMIT_MAX, STALE_CANDIDATES_LIMIT_MIN, UNDO_IMPORT_LIMIT_MAX,
-    UNDO_IMPORT_LIMIT_MIN,
+    ReclassifyInput, ResponseFormat, RevertInput, SaveSearchInput, SavedMemory,
+    SavedSearchNameInput, SearchDetail, SetReminderInput, UndoImportInput, UpdateOutcome,
+    WikiDeleteOutcome, ANNOTATE_BATCH_MAX, ANNOTATE_BATCH_MIN, CONSOLIDATE_LIMIT_MAX,
+    CONSOLIDATE_LIMIT_MIN, CONSOLIDATE_SIMILARITY_MAX, CONSOLIDATE_SIMILARITY_MIN,
+    CONTRADICTION_LIMIT_MAX, CONTRADICTION_LIMIT_MIN, DBS_IMPORT_LIMIT_MAX, DBS_IMPORT_LIMIT_MIN,
+    DECOMPOSE_BATCH_MAX, DECOMPOSE_BATCH_MIN, DECOMPOSE_FACTS_MAX, DECOMPOSE_FACTS_MIN,
+    ENTITY_LOOKUP_LIMIT_MAX, ENTITY_LOOKUP_LIMIT_MIN, EXTRACT_BATCH_MAX, EXTRACT_BATCH_MIN,
+    EXTRACT_MODES, HISTORY_LIMIT_MAX, HISTORY_LIMIT_MIN, IMPORT_MAX_LENGTH_MAX,
+    IMPORT_MAX_LENGTH_MIN, MEMPALACE_IMPORT_LIMIT_MAX, MEMPALACE_IMPORT_LIMIT_MIN,
+    NORMALIZE_APPLY_MAX, NORMALIZE_APPLY_MIN, NORMALIZE_BATCH_MAX, NORMALIZE_BATCH_MIN,
+    PROMOTION_LIMIT_DEFAULT, PROMOTION_LIMIT_MAX, PROMOTION_LIMIT_MIN, RECALIBRATE_LIMIT_MAX,
+    RECALIBRATE_LIMIT_MIN, RECLASSIFY_BATCH_MAX, RECLASSIFY_BATCH_MIN, REMINDER_LIMIT_MAX,
+    REMINDER_LIMIT_MIN, STALE_CANDIDATES_LIMIT_DEFAULT, STALE_CANDIDATES_LIMIT_MAX,
+    STALE_CANDIDATES_LIMIT_MIN, UNDO_IMPORT_LIMIT_MAX, UNDO_IMPORT_LIMIT_MIN,
 };
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
@@ -408,19 +407,8 @@ pub struct McpServer {
     /// thread, and that thread writes through the database. Listed after `db`
     /// it would still be sound — the thread holds its own `Arc` — but the
     /// connections would stay open until the thread noticed, which is the
-    /// shutdown ordering `SE-07` exists to pin down. `sync_peer` holds its
-    /// own serving thread for the same reason and is declared before `db` for
-    /// the same reason.
-    ///
-    /// No `sync_worker` field here (unlike before this comment last changed):
-    /// `SyncWorker` is a background loop like the scheduler/watcher/promotion
-    /// nudge, none of which this struct owns either — `remind_me_cli::main`
-    /// starts all of them alongside, not through, an `McpServer`. `remind_me_
-    /// server_status` reads a live one via `remind_me_core::sync::sync_live_
-    /// status`, which answers for whichever process is actually running it,
-    /// not only one this instance happens to hold.
+    /// shutdown ordering `SE-07` exists to pin down.
     webhook: Webhook,
-    sync_peer: SyncPeer,
     db: Arc<Database>,
     wiki: Wiki,
 }
@@ -553,9 +541,6 @@ impl McpServer {
             // A no-op without `REMIND_ME_WEBHOOK_SECRET`, which is the ordinary
             // case — nothing binds a port unless someone asked for one.
             webhook: Webhook::from_env(Arc::clone(&db)),
-            // A no-op without `REMIND_ME_SYNC_SECRET` — accepting another
-            // node's push/pull is off by default exactly like the webhook.
-            sync_peer: SyncPeer::from_env(Arc::clone(&db)),
             db,
             wiki,
         }
@@ -1189,22 +1174,6 @@ impl McpServer {
                                 }
                             },
                             {
-                                "name": "remind_me_sync_reconcile",
-                                "description": "Diff this node's record counts against the hub's and classify the drift: in-sync, pull-lag (hub ahead, pull recent — the ordinary state), node-ahead (this node holds records the hub does not, so pushes are not landing — the direction that means data is at risk), or fault (hub ahead but the pull is stale or never ran). Read-only on both sides.",
-                                "inputSchema": { "type": "object", "properties": {} }
-                            },
-                            {
-                                "name": "remind_me_sync_reconcile_peer",
-                                "description": "The peer-to-peer counterpart of remind_me_sync_reconcile: diff this node's counts against one discovered peer's. Same four verdicts from the same classifier — 'local greater than remote means pushes are not landing' does not depend on which machine is on the other end.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "node_id": { "type": "string", "description": "Which discovered peer to reconcile against" }
-                                    },
-                                    "required": ["node_id"]
-                                }
-                            },
-                            {
                                 "name": "remind_me_api_key",
                                 "description": "remind-me admin: issue, list, or revoke named dashboard API keys with a read or read-write scope. A read-scoped key is refused on every mutating HTTP route. The plaintext key is shown exactly once, at issuance — only its hash is stored, so it can be revoked and replaced but never recovered. Not multi-tenancy: every key reads and writes the same vault, only the permitted methods differ.",
                                 "inputSchema": {
@@ -1243,21 +1212,6 @@ impl McpServer {
                                         "when": { "type": "string", "enum": ["upcoming", "overdue", "all"], "default": "upcoming" },
                                         "limit": { "type": "integer", "default": 20, "minimum": REMINDER_LIMIT_MIN, "maximum": REMINDER_LIMIT_MAX },
                                         "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "markdown" }
-                                    }
-                                }
-                            },
-                            {
-                                "name": "remind_me_sync_status",
-                                "description": "Report multi-node sync state: outbox depth with a drain verdict, tombstone counts, and per-remote contact times. Liveness comes from wall-clock contact timestamps, not content cursors, so a quiet healthy remote is distinguishable from a wedged one. The first call establishes a drain baseline and reports 'unknown'; call again after ~30s for a rate.",
-                                "inputSchema": { "type": "object", "properties": {} }
-                            },
-                            {
-                                "name": "remind_me_sync_repair",
-                                "description": "remind-me admin: reset a remote's pull cursors so the next sync re-pulls history from the beginning. Only the cursors are reset — the contact timestamps record what actually happened and are left intact.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "remote_id": { "type": "string", "default": "hub", "description": "Which remote to repair" }
                                     }
                                 }
                             },
@@ -2245,14 +2199,6 @@ impl McpServer {
                             let mut report = serde_json::to_value(&report).unwrap_or(json!({}));
                             report["webhook"] =
                                 serde_json::to_value(self.webhook.status()).unwrap_or(json!({}));
-                            report["sync_peer"] =
-                                serde_json::to_value(self.sync_peer.status()).unwrap_or(json!({}));
-                            report["sync"] = serde_json::to_value(
-                                remind_me_core::sync::sync_live_status(&store).unwrap_or_else(
-                                    remind_me_core::sync::sync_worker_disabled_status,
-                                ),
-                            )
-                            .unwrap_or(json!({}));
                             // The remote MCP connector (FT-05, #85) has no
                             // running state to merge in the way the webhook/
                             // sync do -- remind_me_remote::run() only exists
@@ -2706,33 +2652,6 @@ impl McpServer {
                             }
                         }
                     }
-                    "remind_me_sync_reconcile" => {
-                        match remind_me_core::sync::reconcile_hub(&store) {
-                            Ok(report) => {
-                                json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&report).unwrap() }] })
-                            }
-                            Err(e) => {
-                                json!({ "isError": true, "content": [{ "type": "text", "text": format!("Reconcile error: {}", e) }] })
-                            }
-                        }
-                    }
-                    "remind_me_sync_reconcile_peer" => {
-                        match serde_json::from_value::<ReconcilePeerInput>(args) {
-                            Ok(input) => {
-                                match remind_me_core::sync::reconcile_peer(&store, &input.node_id) {
-                                    Ok(report) => {
-                                        json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&report).unwrap() }] })
-                                    }
-                                    Err(e) => {
-                                        json!({ "isError": true, "content": [{ "type": "text", "text": format!("Reconcile peer error: {}", e) }] })
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                json!({ "isError": true, "content": [{ "type": "text", "text": format!("Invalid reconcile_peer input: {}. node_id is required.", e) }] })
-                            }
-                        }
-                    }
                     "remind_me_api_key" => {
                         use remind_me_core::api_keys;
                         let action = args
@@ -2854,35 +2773,6 @@ impl McpServer {
                             }
                             Err(e) => {
                                 json!({ "isError": true, "content": [{ "type": "text", "text": format!("List reminders error: {}", e) }] })
-                            }
-                        }
-                    }
-                    "remind_me_sync_status" => match remind_me_core::sync::sync_status(&store) {
-                        Ok(status) => {
-                            json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&status).unwrap() }] })
-                        }
-                        Err(e) => {
-                            json!({ "isError": true, "content": [{ "type": "text", "text": format!("Sync status error: {}", e) }] })
-                        }
-                    },
-                    "remind_me_sync_repair" => {
-                        let input: SyncRepairInput =
-                            serde_json::from_value(args).unwrap_or(SyncRepairInput {
-                                remote_id: "hub".to_string(),
-                            });
-                        match remind_me_core::sync::sync_repair(&store, &input.remote_id) {
-                            Ok(true) => {
-                                json!({ "content": [{ "type": "text", "text": format!("Reset pull cursors for '{}'. The next sync will re-pull its history.", input.remote_id) }] })
-                            }
-                            // Distinct from success: a remote that was never
-                            // contacted has nothing to repair, and reporting
-                            // success would send the caller waiting for a
-                            // re-pull that is not coming.
-                            Ok(false) => {
-                                json!({ "content": [{ "type": "text", "text": format!("No sync_log row for '{}' — nothing to repair.", input.remote_id) }] })
-                            }
-                            Err(e) => {
-                                json!({ "isError": true, "content": [{ "type": "text", "text": format!("Sync repair error: {}", e) }] })
                             }
                         }
                     }
@@ -6005,8 +5895,6 @@ mod tests {
         // Merged in by the MCP layer rather than gathered from the connection,
         // because that is where the endpoint's state lives.
         assert_eq!(report["webhook"]["enabled"], false);
-        assert_eq!(report["sync_peer"]["enabled"], false);
-        assert_eq!(report["sync"]["enabled"], false);
         assert_eq!(report["schema_current"], true);
         // No REMIND_ME_REMOTE_MCP in the test environment, so the remote
         // connector (FT-05, #85) reports disabled the same way the others do.

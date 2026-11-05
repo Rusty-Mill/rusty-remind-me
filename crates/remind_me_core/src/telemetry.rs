@@ -23,9 +23,9 @@
 //! collector — batching is an optimization on top of that, not a
 //! correctness requirement. So: one span per HTTP POST, sent from a
 //! dedicated background thread over a bounded channel (the same
-//! `std::thread::Builder::new().spawn(...)` shape `SyncWorker` already
-//! uses), so a slow or unreachable collector never blocks the tool call,
-//! sync cycle, watcher pass, or webhook request the span is timing. A full
+//! `std::thread::Builder::new().spawn(...)` shape the other background
+//! loops use), so a slow or unreachable collector never blocks the tool call,
+//! watcher pass, or webhook request the span is timing. A full
 //! channel silently drops the span rather than blocking the caller —
 //! best-effort, matching the reference's own "telemetry must never be able
 //! to break the server it's observing."
@@ -87,7 +87,7 @@ static EXPORTER: OnceLock<Option<SyncSender<FinishedSpan>>> = OnceLock::new();
 
 /// The exporter thread's last failure, if tracing has latched off — this
 /// crate has no logging-framework dependency (matching every other
-/// background worker here, e.g. `SyncWorkerStatus::last_error`), so a
+/// background worker here), so a
 /// queryable status field is how a caller finds out *why* tracing stopped,
 /// rather than a log line nothing may be watching.
 static LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);

@@ -1,6 +1,5 @@
 //! What every open reconciles before the store is used: the outbox gate
-//! (`sync_flags.sync_enabled`) against this process's sync settings, and the
-//! stored vectors against the configured embedding model (#96).
+//! (`sync_flags.sync_enabled`), and the stored vectors against the configured embedding model (#96).
 //!
 //! The embedding checks plant a stale `embedding_meta` row plus a stored
 //! vector through the repositories (no real Ollama daemon needed) and reopen
@@ -22,7 +21,6 @@ use remind_me_core::embedder::{
     OPENAI_EMBED_MODEL_ENV,
 };
 use remind_me_core::status::{server_status, SubsystemStatus};
-use remind_me_core::sync::{HUB_URL_ENV, NODE_ID_ENV, SYNC_SECRET_ENV};
 use remind_me_core::testing::{self, Table};
 use remind_me_core::{Database, MemoryAddInput};
 use std::path::PathBuf;
@@ -88,21 +86,11 @@ fn first_outbox_payload(store: &Store<'_>) -> String {
         .payload_json
 }
 
-fn clear_sync_env() {
-    crate::test_env::remove_var(NODE_ID_ENV);
-    crate::test_env::remove_var(HUB_URL_ENV);
-    crate::test_env::remove_var(SYNC_SECRET_ENV);
-}
-
 #[test]
-fn writes_reach_the_sync_outbox_when_sync_is_configured() {
-    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    crate::test_env::set_var(NODE_ID_ENV, "node-a");
-    crate::test_env::set_var(HUB_URL_ENV, "http://hub.example");
-    crate::test_env::set_var(SYNC_SECRET_ENV, "shh");
-
+fn writes_reach_the_outbox_of_a_store_that_synced() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
+    testing::mark_store_syncing(&store).unwrap();
     add(&store, "syncable");
 
     let payload = first_outbox_payload(&store);
@@ -117,17 +105,13 @@ fn writes_reach_the_sync_outbox_when_sync_is_configured() {
             "the payload does not carry {column}"
         );
     }
-
-    clear_sync_env();
 }
 
 #[test]
-fn writes_do_not_reach_the_outbox_while_sync_is_unconfigured() {
+fn writes_do_not_reach_the_outbox_of_a_store_that_never_synced() {
     // The `#76` regression case: the outbox is gated on
-    // sync_flags.sync_enabled, so a write on a node that has never
-    // configured sync must not queue anything at all.
-    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    clear_sync_env();
+    // sync_flags.sync_enabled, so a write to a store that never synced
+    // must not queue anything at all.
 
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
@@ -140,7 +124,7 @@ fn writes_do_not_reach_the_outbox_while_sync_is_unconfigured() {
             .unwrap()
             .as_deref(),
         Some("0"),
-        "the gate is aligned with the configuration at open"
+        "a fresh store is set off at open"
     );
 }
 
@@ -148,12 +132,10 @@ fn writes_do_not_reach_the_outbox_while_sync_is_unconfigured() {
 fn a_sent_outbox_row_past_the_retention_window_is_pruned_at_open() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = TempDb::new("prune");
-    crate::test_env::set_var(NODE_ID_ENV, "node-a");
-    crate::test_env::set_var(HUB_URL_ENV, "http://hub.example");
-    crate::test_env::set_var(SYNC_SECRET_ENV, "shh");
     {
         let db = Database::open(&tmp.0).unwrap();
         let store = db.store();
+        testing::mark_store_syncing(&store).unwrap();
         add(&store, "old");
         let rows = testing::outbox_rows(&store).unwrap();
         assert_eq!(rows.len(), 1);
@@ -167,7 +149,6 @@ fn a_sent_outbox_row_past_the_retention_window_is_pruned_at_open() {
     }
     let db = Database::open(&tmp.0).unwrap();
     assert_eq!(testing::count(&db.store(), Table::SyncOutbox).unwrap(), 0);
-    clear_sync_env();
 }
 
 // ---------------------------------------------------------------------------
