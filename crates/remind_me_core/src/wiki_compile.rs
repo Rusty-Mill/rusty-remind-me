@@ -16,7 +16,7 @@ use crate::db::memories::CreatedMemory;
 use crate::db::{Database, Store};
 use crate::embedder::{EmbedRole, Embedder};
 use crate::wiki::WikiPage;
-use crate::wiki_fs::{Wiki, WikiCompile};
+use crate::wiki_fs::{SourceBatch, Wiki, WikiCompile};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -147,25 +147,21 @@ fn run_batches(
         let Some(batch) = wiki.pending_batch(&db.store(), BATCH_LIMIT)? else {
             return Ok(());
         };
-        match write_batch(wiki, db, writer, embedder, options, &batch.sources)? {
+        let titles = match write_batch(wiki, db, writer, embedder, options, &batch.sources)? {
             Err(why) => {
                 report.stopped = Some(why);
                 return Ok(());
             }
-            Ok(titles) => report.pages_written.extend(titles),
-        }
-        // Checked and marked under one handle, so nothing changes between.
+            Ok(titles) => titles,
+        };
+        report.pages_written.extend(titles.iter().cloned());
         let store = db.store();
-        if let Some(id) = changed_source(&store, &batch.sources)? {
-            report.stopped = Some(format!(
-                "source `{id}` was edited while its pages were written"
-            ));
-            return Ok(());
-        }
-        if let WikiCompile::Integrated { sources_marked, .. } =
-            wiki.compile(&store, BATCH_LIMIT, true, Some(&batch.through))?
-        {
-            report.sources_integrated += sources_marked;
+        match mark_batch(wiki, &store, &batch, &titles)? {
+            Err(why) => {
+                report.stopped = Some(why);
+                return Ok(());
+            }
+            Ok(marked) => report.sources_integrated += marked,
         }
         report.batches += 1;
     }
@@ -207,19 +203,41 @@ fn write_batch(
             page = wiki.read_page(&store, &draft.title)?;
         }
     }
-    // Checked against the pages as saved, not the drafts: a later rewrite of
-    // a page may have dropped a citation an earlier chunk wrote.
-    let store = db.store();
+    Ok(Ok(titles))
+}
+
+/// Mark `batch` integrated, unless a source changed while its pages were
+/// written or no saved page among `titles` cites one of them. Checked and
+/// marked under the one handle `store`, so nothing changes in between.
+/// Citations are checked against the pages as saved, not the drafts: a later
+/// rewrite may have dropped what an earlier chunk wrote, and a foreground
+/// edit may have removed it since. `Ok(Err(why))` leaves the batch pending.
+fn mark_batch(
+    wiki: &Wiki,
+    store: &Store<'_>,
+    batch: &SourceBatch,
+    titles: &[String],
+) -> crate::db::Result<Result<usize, String>> {
+    if let Some(id) = changed_source(store, &batch.sources)? {
+        return Ok(Err(format!(
+            "source `{id}` was edited while its pages were written"
+        )));
+    }
     let mut written = String::new();
     for title in titles.iter().collect::<BTreeSet<_>>() {
-        if let Some(page) = wiki.read_page(&store, title)? {
+        if let Some(page) = wiki.read_page(store, title)? {
             written.push_str(&page.content);
         }
     }
-    Ok(match uncited(sources, &written) {
-        Some(id) => Err(format!("no page written cites source `{id}`")),
-        None => Ok(titles),
-    })
+    if let Some(id) = uncited(&batch.sources, &written) {
+        return Ok(Err(format!("no page written cites source `{id}`")));
+    }
+    Ok(Ok(
+        match wiki.compile(store, BATCH_LIMIT, true, Some(&batch.through))? {
+            WikiCompile::Integrated { sources_marked, .. } => sources_marked,
+            WikiCompile::Brief { .. } | WikiCompile::Noop { .. } => 0,
+        },
+    ))
 }
 
 /// The first source whose text changed since the batch was read. A source
@@ -622,6 +640,43 @@ mod tests {
         // What `..` names past a missing directory is unknown: refused.
         assert!(RunGuard::take(&link.join("missing/../wiki")).is_err());
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn marking_rechecks_citations_against_the_pages_as_they_stand() {
+        use crate::db::memories::{Memories, NewMemory};
+        let root = std::env::temp_dir().join(format!("rrm-mark-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let wiki = Wiki::new(&root);
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        Memories::new(&store)
+            .insert(&NewMemory::new(
+                "mem_a",
+                "Rust has ownership".to_string(),
+                "2026-11-05T12:00:00+00:00",
+            ))
+            .unwrap();
+        let batch = wiki.pending_batch(&store, BATCH_LIMIT).unwrap().unwrap();
+        let titles = ["Rust".to_string()];
+        wiki.write_page(&store, "Rust", "Rust (`mem_a`)", None)
+            .unwrap()
+            .unwrap();
+        // A foreground edit after the pages were written drops the citation.
+        wiki.write_page(&store, "Rust", "Rust, edited", None)
+            .unwrap()
+            .unwrap();
+
+        let refused = mark_batch(&wiki, &store, &batch, &titles).unwrap();
+
+        assert_eq!(refused.unwrap_err(), "no page written cites source `mem_a`");
+        assert_eq!(crate::wiki_fs::pending_compile_count(&store).unwrap(), 1);
+        wiki.write_page(&store, "Rust", "Rust (`mem_a`), edited", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(mark_batch(&wiki, &store, &batch, &titles).unwrap(), Ok(1));
+        assert_eq!(crate::wiki_fs::pending_compile_count(&store).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -45,8 +45,8 @@ enough to write a page from a dozen memories without anyone in the loop
    60% of the page's text or drops one of its `[[links]]`. A new-page
    draft that names an existing page is checked as a rewrite of it. Every
    source id must appear in the saved text of some page the batch wrote,
-   checked after the last write, so a later chunk cannot drop a citation
-   an earlier one made.
+   checked under the same store handle that marks the batch, so neither a
+   later chunk nor an edit made meanwhile can drop a citation unnoticed.
 6. **One run at a time.** A run claims its wiki root in an in-process
    set for as long as it runs, and a second run on the same wiki reports
    and returns before calling the model. In-process is enough because
@@ -72,11 +72,12 @@ enough to write a page from a dozen memories without anyone in the loop
    page is saved, it is re-read under the same handle that saves it; if
    it changed since the model was shown it, the batch stops instead of
    overwriting the edit. `REMIND_ME_WIKI_LLM_TIMEOUT_SECS` is a deadline
-   for the whole call, not an idle timeout: it starts before the host is
-   resolved and bounds the connect, every write of the request and every
-   read of the reply, so a server that reads or answers a trickle at a
-   time cannot hold a run open. Name resolution itself cannot be cut
-   short with std; its time counts against the deadline.
+   for the whole call, not an idle timeout: it bounds name resolution,
+   the connect, every write of the request and every read of the reply,
+   so a slow resolver or a server that reads or answers a trickle at a
+   time cannot hold a run open. std cannot cancel a lookup, so a host
+   name is resolved on a helper thread that the call abandons at the
+   deadline; an IP literal is not looked up at all.
 
 ## Consequences
 

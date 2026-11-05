@@ -327,20 +327,14 @@ pub(crate) fn post_json_within(
     body: &str,
     io_timeout: Duration,
 ) -> Result<String, EmbedError> {
-    // One budget for the whole call. Name resolution cannot be bounded with
-    // std, so it is counted against the budget and checked after it returns.
+    // One budget for the whole call, name resolution included.
     let deadline = std::time::Instant::now() + io_timeout;
     let (host, port) = host_port(url, label)?;
-    // `connect_timeout` needs a concrete `SocketAddr`, so a hostname
-    // (e.g. "localhost") is resolved first — this also transparently
-    // covers an IP literal, which resolves to itself.
-    use std::net::ToSocketAddrs;
-    let addr = (host.as_str(), port)
-        .to_socket_addrs()
-        .ok()
-        .and_then(|mut a| a.next())
-        .ok_or_else(|| EmbedError(format!("cannot resolve {label} host {host:?}")))?;
     let timed_out = |phase: &str| EmbedError(format!("{label} timed out while {phase}"));
+    let addr = resolve_within(&host, port, deadline, system_lookup).map_err(|e| match e {
+        Unresolved::TimedOut => timed_out("resolving"),
+        Unresolved::Failed => EmbedError(format!("cannot resolve {label} host {host:?}")),
+    })?;
     let left = remaining(deadline).ok_or_else(|| timed_out("resolving"))?;
     let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT.min(left))
         .map_err(|e| EmbedError(format!("cannot reach {label} at {url}: {e}")))?;
@@ -358,6 +352,49 @@ pub(crate) fn post_json_within(
     let raw = read_until(&mut stream, deadline)
         .map_err(|e| EmbedError(format!("reading from {label} failed: {e}")))?;
     response_body(&raw, label)
+}
+
+/// Why [`resolve_within`] has no address.
+#[derive(Debug, PartialEq)]
+enum Unresolved {
+    Failed,
+    TimedOut,
+}
+
+/// The first address `host` resolves to, by the system resolver.
+fn system_lookup(host: &str, port: u16) -> Option<std::net::SocketAddr> {
+    use std::net::ToSocketAddrs;
+    (host, port).to_socket_addrs().ok()?.next()
+}
+
+/// `host:port` as a socket address, by `deadline`. An IP literal needs no
+/// lookup. A name is looked up on a helper thread, because std cannot bound
+/// or cancel a lookup: past the deadline the caller returns, and the thread
+/// ends whenever the resolver does, its answer discarded.
+fn resolve_within(
+    host: &str,
+    port: u16,
+    deadline: std::time::Instant,
+    lookup: fn(&str, u16) -> Option<std::net::SocketAddr>,
+) -> Result<std::net::SocketAddr, Unresolved> {
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return Ok(std::net::SocketAddr::new(ip, port));
+    }
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let name = host.to_string();
+    std::thread::Builder::new()
+        .name("http-resolve".into())
+        .spawn(move || {
+            // The caller may have given up and dropped the receiver.
+            let _ = sender.send(lookup(&name, port));
+        })
+        .map_err(|_| Unresolved::Failed)?;
+    let left = remaining(deadline).ok_or(Unresolved::TimedOut)?;
+    match receiver.recv_timeout(left) {
+        Ok(Some(addr)) => Ok(addr),
+        Ok(None) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(Unresolved::Failed),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(Unresolved::TimedOut),
+    }
 }
 
 /// The time left before `deadline`, or `None` once it has passed.
@@ -1213,6 +1250,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_stalled_resolver_cannot_outlast_the_deadline() {
+        fn stalled(_: &str, _: u16) -> Option<std::net::SocketAddr> {
+            std::thread::sleep(Duration::from_secs(5));
+            None
+        }
+        let started = std::time::Instant::now();
+        let deadline = started + Duration::from_millis(200);
+
+        let got = resolve_within("model.lan", 8080, deadline, stalled);
+
+        assert_eq!(got, Err(Unresolved::TimedOut));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn an_ip_literal_needs_no_lookup_and_a_failed_lookup_is_an_error() {
+        fn never(_: &str, _: u16) -> Option<std::net::SocketAddr> {
+            panic!("an IP literal was looked up")
+        }
+        fn nothing(_: &str, _: u16) -> Option<std::net::SocketAddr> {
+            None
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let addr = resolve_within("127.0.0.1", 8080, deadline, never).unwrap();
+        assert_eq!(addr.to_string(), "127.0.0.1:8080");
+        assert_eq!(
+            resolve_within("model.lan", 8080, deadline, nothing),
+            Err(Unresolved::Failed)
+        );
+    }
+
+    #[test]
     fn a_slow_reading_server_cannot_outlast_the_deadline() {
         // The server takes a little of the upload every 50ms, so no single
         // write ever idles long enough for a socket timeout; only a deadline
@@ -1235,7 +1304,9 @@ mod tests {
 
         let got = post_json_within(&url, "test", "/", &body, Duration::from_millis(500));
 
-        assert!(got.unwrap_err().0.contains("writing to test failed"));
+        // Which phase trips depends on how much the OS buffers (Windows may
+        // take the whole upload); the bound on the whole call is the point.
+        assert!(got.is_err());
         assert!(started.elapsed() < Duration::from_secs(2));
         done.store(true, std::sync::atomic::Ordering::Relaxed);
         server.join().unwrap();
