@@ -47,7 +47,7 @@ impl Service for StoreService {
     }
 
     fn op(&self, op: &Op) -> OpReply {
-        ops::execute(&self.db.store(), op)
+        ops::execute_on(&self.db, op)
     }
 
     fn http(&self, stream: &mut TcpStream, client: &Fingerprint) -> io::Result<()> {
@@ -250,7 +250,7 @@ impl Store {
     /// Run `op`, wherever the store is.
     pub fn call<T: DeserializeOwned>(&mut self, op: Op) -> Result<T> {
         let reply = match self {
-            Store::Local(db) => ops::execute(&db.store(), &op),
+            Store::Local(db) => ops::execute_on(db, &op),
             Store::Daemon(connection) => connection.call(&op)?,
         };
         Ok(reply.into_result()?)

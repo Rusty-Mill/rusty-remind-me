@@ -522,6 +522,41 @@ fn capture_transcript_tool(
 }
 
 impl McpServer {
+    /// `remind_me_wiki_compile` with `auto=true`: the configured local model
+    /// writes the pages. Runs on the database rather than a store handle, so
+    /// other tools are served while the model writes.
+    fn wiki_auto_compile(&self, args: &Value, format: ResponseFormat) -> Value {
+        let options = remind_me_core::wiki_compile::AutoOptions {
+            max_batches: args
+                .get("max_batches")
+                .and_then(Value::as_u64)
+                .map(|v| v as usize)
+                .unwrap_or(1)
+                .clamp(1, 20),
+            allow_shrink: args
+                .get("allow_shrink")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            ..Default::default()
+        };
+        match remind_me_core::wiki_llm::compile_with_configured_model(
+            &self.wiki, &self.db, &options,
+        ) {
+            Ok(report) => {
+                let text = match format {
+                    ResponseFormat::Json => {
+                        serde_json::to_string_pretty(&report).unwrap_or_default()
+                    }
+                    ResponseFormat::Markdown => render::wiki_auto_compile(&report),
+                };
+                json!({ "content": [{ "type": "text", "text": text }] })
+            }
+            Err(e) => {
+                json!({ "isError": true, "content": [{ "type": "text", "text": format!("Wiki compile error: {e}") }] })
+            }
+        }
+    }
+
     pub fn new(db: Database) -> Self {
         Self::with_wiki(db, Wiki::from_env())
     }
@@ -1471,14 +1506,17 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_wiki_compile",
-                                "description": "remind-me wiki: drive wiki synthesis over raw memories. With mark_integrated=false (the default) returns a brief of pending sources and never advances the watermark, so it is safe to call repeatedly. Call again with mark_integrated=true and the brief's `through` after writing the pages, so exactly that brief's sources are marked.",
+                                "description": "remind-me wiki: drive wiki synthesis over raw memories. With mark_integrated=false (the default) returns a brief of pending sources and never advances the watermark, so it is safe to call repeatedly. Call again with mark_integrated=true and the brief's `through` after writing the pages, so exactly that brief's sources are marked. With auto=true the server's own local model (REMIND_ME_WIKI_LLM_URL and _MODEL) writes the pages and marks each batch itself; this can take minutes per batch.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
                                         "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "json", "description": "json (default) returns the structured record; markdown returns a human-readable summary." },
                                         "limit": { "type": "integer", "default": 20, "minimum": 1, "maximum": 100 },
                                         "mark_integrated": { "type": "boolean", "default": false },
-                                        "through": { "type": "string", "description": "With mark_integrated=true: the `through` a brief returned. Marks exactly that brief's sources. Without it the batch is recomputed, which an edit in between can change." }
+                                        "through": { "type": "string", "description": "With mark_integrated=true: the `through` a brief returned. Marks exactly that brief's sources. Without it the batch is recomputed, which an edit in between can change." },
+                                        "auto": { "type": "boolean", "default": false, "description": "Have the configured local model write the pages. Ignores limit, mark_integrated and through." },
+                                        "max_batches": { "type": "integer", "default": 1, "minimum": 1, "maximum": 20, "description": "With auto=true: batches to compile before returning." },
+                                        "allow_shrink": { "type": "boolean", "default": false, "description": "With auto=true: accept a rewrite that shortens a page below 60% or drops one of its [[links]]." }
                                     }
                                 }
                             },
@@ -1668,7 +1706,6 @@ impl McpServer {
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
                 // Read before `args` is moved into any tool's input model.
                 let format = requested_format(&args);
-                let store = self.db.store();
                 // Hidden means gone, not merely undocumented: a model that
                 // guessed the name would otherwise still reach it, and a
                 // caller who trimmed their surface would never know it was
@@ -1699,6 +1736,20 @@ impl McpServer {
                         }
                     }));
                 }
+                // Before the store handle is taken: it holds the database
+                // lock, and a model writing pages can take minutes.
+                let canonical =
+                    remind_me_core::tool_profiles::replacement(tool_name).unwrap_or(tool_name);
+                if canonical == "remind_me_wiki_compile"
+                    && args.get("auto").and_then(Value::as_bool) == Some(true)
+                {
+                    return Some(json!({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": self.wiki_auto_compile(&args, format),
+                    }));
+                }
+                let store = self.db.store();
                 let surface::Route { handler, args } = match surface::route(tool_name, args) {
                     Ok(route) => route,
                     Err(why) => {

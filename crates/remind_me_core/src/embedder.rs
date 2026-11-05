@@ -313,20 +313,31 @@ fn host_port(url: &str, label: &str) -> Result<(String, u16), EmbedError> {
 /// POST `body` as JSON to `url` + `path` and return the response body of a
 /// 2xx reply. `label` names the backend in errors.
 fn post_json(url: &str, label: &str, path: &str, body: &str) -> Result<String, EmbedError> {
+    post_json_within(url, label, path, body, IO_TIMEOUT)
+}
+
+/// [`post_json`] within `io_timeout` for the whole call, for a caller that
+/// waits on generation rather than an embedding (`wiki_llm`). The limit is a
+/// deadline, not an idle timeout: a server that trickles bytes cannot keep
+/// the call alive past it.
+pub(crate) fn post_json_within(
+    url: &str,
+    label: &str,
+    path: &str,
+    body: &str,
+    io_timeout: Duration,
+) -> Result<String, EmbedError> {
+    // One budget for the whole call, name resolution included.
+    let deadline = std::time::Instant::now() + io_timeout;
     let (host, port) = host_port(url, label)?;
-    // `connect_timeout` needs a concrete `SocketAddr`, so a hostname
-    // (e.g. "localhost") is resolved first — this also transparently
-    // covers an IP literal, which resolves to itself.
-    use std::net::ToSocketAddrs;
-    let addr = (host.as_str(), port)
-        .to_socket_addrs()
-        .ok()
-        .and_then(|mut a| a.next())
-        .ok_or_else(|| EmbedError(format!("cannot resolve {label} host {host:?}")))?;
-    let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
+    let timed_out = |phase: &str| EmbedError(format!("{label} timed out while {phase}"));
+    let addr = resolve_within(&host, port, deadline, system_lookup).map_err(|e| match e {
+        Unresolved::TimedOut => timed_out("resolving"),
+        Unresolved::Failed => EmbedError(format!("cannot resolve {label} host {host:?}")),
+    })?;
+    let left = remaining(deadline).ok_or_else(|| timed_out("resolving"))?;
+    let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT.min(left))
         .map_err(|e| EmbedError(format!("cannot reach {label} at {url}: {e}")))?;
-    stream.set_read_timeout(Some(IO_TIMEOUT)).ok();
-    stream.set_write_timeout(Some(IO_TIMEOUT)).ok();
 
     let request = format!(
         "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -335,15 +346,103 @@ fn post_json(url: &str, label: &str, path: &str, body: &str) -> Result<String, E
         body.len(),
         body
     );
-    stream
-        .write_all(request.as_bytes())
+    write_until(&mut stream, request.as_bytes(), deadline)
         .map_err(|e| EmbedError(format!("writing to {label} failed: {e}")))?;
 
-    let mut raw = Vec::new();
-    stream
-        .read_to_end(&mut raw)
+    let raw = read_until(&mut stream, deadline)
         .map_err(|e| EmbedError(format!("reading from {label} failed: {e}")))?;
     response_body(&raw, label)
+}
+
+/// Why [`resolve_within`] has no address.
+#[derive(Debug, PartialEq)]
+enum Unresolved {
+    Failed,
+    TimedOut,
+}
+
+/// The first address `host` resolves to, by the system resolver.
+fn system_lookup(host: &str, port: u16) -> Option<std::net::SocketAddr> {
+    use std::net::ToSocketAddrs;
+    (host, port).to_socket_addrs().ok()?.next()
+}
+
+/// `host:port` as a socket address, by `deadline`. An IP literal needs no
+/// lookup. A name is looked up on a helper thread, because std cannot bound
+/// or cancel a lookup: past the deadline the caller returns, and the thread
+/// ends whenever the resolver does, its answer discarded.
+fn resolve_within(
+    host: &str,
+    port: u16,
+    deadline: std::time::Instant,
+    lookup: fn(&str, u16) -> Option<std::net::SocketAddr>,
+) -> Result<std::net::SocketAddr, Unresolved> {
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return Ok(std::net::SocketAddr::new(ip, port));
+    }
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let name = host.to_string();
+    std::thread::Builder::new()
+        .name("http-resolve".into())
+        .spawn(move || {
+            // The caller may have given up and dropped the receiver.
+            let _ = sender.send(lookup(&name, port));
+        })
+        .map_err(|_| Unresolved::Failed)?;
+    let left = remaining(deadline).ok_or(Unresolved::TimedOut)?;
+    match receiver.recv_timeout(left) {
+        Ok(Some(addr)) => Ok(addr),
+        Ok(None) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(Unresolved::Failed),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(Unresolved::TimedOut),
+    }
+}
+
+/// The time left before `deadline`, or `None` once it has passed.
+fn remaining(deadline: std::time::Instant) -> Option<Duration> {
+    let left = deadline.saturating_duration_since(std::time::Instant::now());
+    (!left.is_zero()).then_some(left)
+}
+
+fn past_deadline() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "the call did not finish before the deadline",
+    )
+}
+
+/// Write all of `bytes`, failing with `TimedOut` once `deadline` passes
+/// however steadily the peer reads.
+fn write_until(
+    stream: &mut TcpStream,
+    mut bytes: &[u8],
+    deadline: std::time::Instant,
+) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        let left = remaining(deadline).ok_or_else(past_deadline)?;
+        stream.set_write_timeout(Some(left))?;
+        match stream.write(bytes) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(n) => bytes = &bytes[n..],
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Read `stream` to its end, failing with `TimedOut` once `deadline` passes
+/// however steadily bytes arrive.
+fn read_until(stream: &mut TcpStream, deadline: std::time::Instant) -> std::io::Result<Vec<u8>> {
+    let mut raw = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let left = remaining(deadline).ok_or_else(past_deadline)?;
+        stream.set_read_timeout(Some(left))?;
+        match stream.read(&mut buf)? {
+            0 => return Ok(raw),
+            n => raw.extend_from_slice(&buf[..n]),
+        }
+    }
 }
 
 /// The body of the raw HTTP/1.1 response `raw`, refused unless the status is
@@ -1149,6 +1248,69 @@ pub fn embedding_status() -> crate::status::SubsystemStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stalled_resolver_cannot_outlast_the_deadline() {
+        fn stalled(_: &str, _: u16) -> Option<std::net::SocketAddr> {
+            std::thread::sleep(Duration::from_secs(5));
+            None
+        }
+        let started = std::time::Instant::now();
+        let deadline = started + Duration::from_millis(200);
+
+        let got = resolve_within("model.lan", 8080, deadline, stalled);
+
+        assert_eq!(got, Err(Unresolved::TimedOut));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn an_ip_literal_needs_no_lookup_and_a_failed_lookup_is_an_error() {
+        fn never(_: &str, _: u16) -> Option<std::net::SocketAddr> {
+            panic!("an IP literal was looked up")
+        }
+        fn nothing(_: &str, _: u16) -> Option<std::net::SocketAddr> {
+            None
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let addr = resolve_within("127.0.0.1", 8080, deadline, never).unwrap();
+        assert_eq!(addr.to_string(), "127.0.0.1:8080");
+        assert_eq!(
+            resolve_within("model.lan", 8080, deadline, nothing),
+            Err(Unresolved::Failed)
+        );
+    }
+
+    #[test]
+    fn a_slow_reading_server_cannot_outlast_the_deadline() {
+        // The server takes a little of the upload every 50ms, so no single
+        // write ever idles long enough for a socket timeout; only a deadline
+        // on the whole write phase stops it.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = std::sync::Arc::clone(&done);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            while !stop.load(std::sync::atomic::Ordering::Relaxed)
+                && matches!(stream.read(&mut buf), Ok(n) if n > 0)
+            {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let body = "x".repeat(64 << 20);
+        let started = std::time::Instant::now();
+
+        let got = post_json_within(&url, "test", "/", &body, Duration::from_millis(500));
+
+        // Which phase trips depends on how much the OS buffers (Windows may
+        // take the whole upload); the bound on the whole call is the point.
+        assert!(got.is_err());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+    }
 
     #[test]
     fn short_text_is_a_single_chunk() {

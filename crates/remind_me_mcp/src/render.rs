@@ -33,6 +33,7 @@ use remind_me_core::models::{
 use remind_me_core::updater::UpdateStatus;
 use remind_me_core::vectors::ReindexResult;
 use remind_me_core::wiki::WikiPage;
+use remind_me_core::wiki_compile::AutoReport;
 use remind_me_core::wiki_fs::WikiCompile;
 
 /// Truncate for a one-line summary, on a character boundary.
@@ -198,6 +199,23 @@ pub fn wiki_compile(outcome: &WikiCompile) -> String {
             format!("Nothing to compile: {reason} (watermark {watermark})")
         }
     }
+}
+
+pub fn wiki_auto_compile(report: &AutoReport) -> String {
+    let mut out = format!(
+        "Compiled {} batch(es), {} source(s) into {} page write(s); {} pending.",
+        report.batches,
+        report.sources_integrated,
+        report.pages_written.len(),
+        report.pending
+    );
+    for title in &report.pages_written {
+        out.push_str(&format!("\n- [[{title}]]"));
+    }
+    if let Some(why) = &report.stopped {
+        out.push_str(&format!("\n\nStopped: {why}. Its sources stay pending."));
+    }
+    out
 }
 
 pub fn wiki_page(page: &WikiPage) -> String {

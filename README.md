@@ -609,6 +609,29 @@ dbs export-wiki --out-dir ./wiki-pages    # in the dbs repo
 rusty-remind-me wiki-import ./wiki-pages
 ```
 
+Compiles pending memories into wiki pages with a local model (ADR-0033).
+Off until both settings name an OpenAI-compatible server (llama.cpp, vLLM,
+Ollama) and a model; the configured embedder, if any, decides which page each
+memory belongs to:
+```bash
+export REMIND_ME_WIKI_LLM_URL=http://127.0.0.1:8080   # http://host:port
+export REMIND_ME_WIKI_LLM_MODEL=qwen3-8b
+rusty-remind-me wiki-compile --auto                  # up to 5 batches
+rusty-remind-me wiki-compile --auto --max-batches 1 --allow-shrink
+```
+
+Each batch is marked integrated only after all its pages are written. A model
+error, a rewrite that keeps under 60% of a page or drops one of its `[[links]]`
+(unless `--allow-shrink`), a renamed page, or a memory no page cites stops the
+run and leaves that batch pending; the command exits 1 and says why.
+`REMIND_ME_WIKI_LLM_TIMEOUT_SECS` (default 600) bounds one page,
+`REMIND_ME_WIKI_LLM_MAX_TOKENS` (default 4096) its length, and
+`REMIND_ME_WIKI_MATCH` (default 0.55) the cosine a memory needs to join an
+existing page. The same run is `remind_me_wiki_compile` with `auto=true` over
+MCP (one batch by default there). The store stays usable while the model
+writes, and a page someone edits meanwhile stops the batch rather than being
+overwritten.
+
 ### 11. System Statistics
 Prints total memory counts and database metrics:
 ```bash

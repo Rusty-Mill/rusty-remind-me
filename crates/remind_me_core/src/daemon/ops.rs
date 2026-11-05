@@ -8,7 +8,7 @@
 //! [`execute`] is also what the CLI runs in-process, so both paths share one
 //! implementation and one serialization round trip.
 
-use crate::db::Store;
+use crate::db::{Database, Store};
 use crate::models::{EntityInput, MemoryAddInput, MemoryListInput, MemorySearchInput};
 use crate::{db::queries, entity, entity_duplicates, session_ops, stats, wiki, wiki_import};
 use serde::de::DeserializeOwned;
@@ -52,6 +52,12 @@ pub enum Op {
     /// client's.
     WikiImport {
         dir: PathBuf,
+    },
+    /// Compile pending memories into wiki pages with the configured local
+    /// model; see [`crate::wiki_compile`].
+    WikiAutoCompile {
+        max_batches: usize,
+        allow_shrink: bool,
     },
     /// Close a decision or action item; see [`crate::resolve`].
     Resolve {
@@ -128,6 +134,31 @@ impl OpReply {
     }
 }
 
+/// Run an operation against `db`. Every operation but one runs under one
+/// store handle; [`Op::WikiAutoCompile`] takes the database, so the handle,
+/// which holds the database lock, is not held while a model writes.
+pub fn execute_on(db: &Database, op: &Op) -> OpReply {
+    let Op::WikiAutoCompile {
+        max_batches,
+        allow_shrink,
+    } = op
+    else {
+        return execute(&db.store(), op);
+    };
+    let options = crate::wiki_compile::AutoOptions {
+        max_batches: *max_batches,
+        allow_shrink: *allow_shrink,
+        ..Default::default()
+    };
+    let wiki = crate::wiki_fs::Wiki::from_env();
+    match crate::wiki_llm::compile_with_configured_model(&wiki, db, &options)
+        .and_then(|report| serde_json::to_value(report).map_err(|e| e.to_string()))
+    {
+        Ok(value) => OpReply::Ok(value),
+        Err(message) => OpReply::Err(message),
+    }
+}
+
 /// Run a store operation against `store`.
 pub fn execute(store: &Store<'_>, op: &Op) -> OpReply {
     match run(store, op) {
@@ -155,6 +186,9 @@ fn run(store: &Store<'_>, op: &Op) -> Result<Value, String> {
             let report =
                 wiki_import::import_wiki_dir(store, dir, true).map_err(|e| e.to_string())?;
             serde_json::to_value(report).map_err(|e| e.to_string())
+        }
+        Op::WikiAutoCompile { .. } => {
+            Err("a wiki auto compile needs the database: run it with execute_on".to_string())
         }
         Op::Resolve {
             memory_id,
