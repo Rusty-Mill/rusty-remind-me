@@ -147,6 +147,13 @@ fn every_wiki_write_endpoint_the_dashboard_calls_is_a_real_route() {
         );
     }
 
+    // Marking integrated acknowledges the brief it was shown, not whatever a
+    // recomputed batch would hold by then (card #743 review).
+    assert!(
+        page.contains("mark_integrated: true, through"),
+        "the dashboard marks without the brief's `through`"
+    );
+
     // POST /api/wiki reaches the write handler: only that handler answers 400
     // naming the missing field. An absent route would be 405.
     let write = authed_json(&server, "POST", "/api/wiki", "{}");

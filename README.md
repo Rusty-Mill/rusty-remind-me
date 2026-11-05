@@ -830,7 +830,7 @@ surfaces):
 | `GET` | `/api/wiki`, `/api/wiki/search`, `/api/wiki/load`, `/api/wiki/status`, `/api/wiki/{slug}` | Markdown wiki endpoints |
 | `POST` | `/api/wiki` | Create or replace a page — `{"title": ..., "content": ..., "log_note": ...}` (`remind_me_wiki_write`) |
 | `DELETE` | `/api/wiki/{slug}` | Delete a page and its index rows (`remind_me_wiki_delete`) |
-| `POST` | `/api/wiki/compile` | Compile brief; `{"mark_integrated": true}` advances the watermark (`remind_me_wiki_compile`) |
+| `POST` | `/api/wiki/compile` | Compile brief; `{"mark_integrated": true, "through": <brief's through>}` advances the watermark (`remind_me_wiki_compile`) |
 | `GET` | `/api/wiki/schema` | The maintainer schema the compile brief embeds |
 | `GET` | `/api/reminders?when=upcoming\|overdue\|all&limit=...` | Memories with a reminder set, soonest first (`remind_me_list_reminders`) |
 | `POST` | `/api/reminders` | Set or clear a reminder — `{"memory_id": ..., "remind_at": ISO-8601 or null}` (`remind_me_set_reminder`) |
@@ -866,7 +866,9 @@ raw memories since the last watermark, the current page index, and the
 maintainer schema — and advances nothing, so it is safe to call repeatedly. The
 dashboard shows that brief and offers it for copying into a Claude session
 (which then writes the pages with `remind_me_wiki_write`); once the pages
-exist, `{"mark_integrated": true}` moves the watermark past that batch. Marking
+exist, `{"mark_integrated": true, "through": "<the brief's through>"}` moves
+the watermark past exactly that batch. Without `through` the batch is
+recomputed, so an edit made in between can change which sources it covers. Marking
 integrated is not reversible from the UI: those memories will not appear in a
 future brief whether they were written up or not.
 

@@ -1517,13 +1517,14 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_wiki_compile",
-                                "description": "remind-me wiki: drive wiki synthesis over raw memories. With mark_integrated=false (the default) returns a brief of pending sources and never advances the watermark, so it is safe to call repeatedly. Call again with mark_integrated=true after writing the pages.",
+                                "description": "remind-me wiki: drive wiki synthesis over raw memories. With mark_integrated=false (the default) returns a brief of pending sources and never advances the watermark, so it is safe to call repeatedly. Call again with mark_integrated=true and the brief's `through` after writing the pages, so exactly that brief's sources are marked.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
                                         "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "json", "description": "json (default) returns the structured record; markdown returns a human-readable summary." },
                                         "limit": { "type": "integer", "default": 20, "minimum": 1, "maximum": 100 },
-                                        "mark_integrated": { "type": "boolean", "default": false }
+                                        "mark_integrated": { "type": "boolean", "default": false },
+                                        "through": { "type": "string", "description": "With mark_integrated=true: the `through` a brief returned. Marks exactly that brief's sources. Without it the batch is recomputed, which an edit in between can change." }
                                     }
                                 }
                             },
@@ -3400,15 +3401,26 @@ impl McpServer {
                             .get("mark_integrated")
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
-                        match self.wiki.compile(&store, limit, mark_integrated) {
-                            Ok(outcome) => {
-                                json!({ "content": [{ "type": "text", "text": match format {
+                        let through = match args.get("through") {
+                            None | Some(Value::Null) => Ok(None),
+                            Some(value) => value.as_str().map(Some).ok_or(()),
+                        };
+                        match through {
+                            Err(()) => {
+                                json!({ "isError": true, "content": [{ "type": "text", "text": "Wiki compile error: `through` must be the string a brief returned" }] })
+                            }
+                            Ok(through) => {
+                                match self.wiki.compile(&store, limit, mark_integrated, through) {
+                                    Ok(outcome) => {
+                                        json!({ "content": [{ "type": "text", "text": match format {
     ResponseFormat::Json => serde_json::to_string_pretty(&outcome).unwrap(),
     ResponseFormat::Markdown => render::wiki_compile(&outcome),
 } }] })
-                            }
-                            Err(e) => {
-                                json!({ "isError": true, "content": [{ "type": "text", "text": format!("Wiki compile error: {}", e) }] })
+                                    }
+                                    Err(e) => {
+                                        json!({ "isError": true, "content": [{ "type": "text", "text": format!("Wiki compile error: {}", e) }] })
+                                    }
+                                }
                             }
                         }
                     }

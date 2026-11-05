@@ -185,6 +185,16 @@ function WikiPageForm({initial, onSubmit, onLoadSchema, onCancel}) {
 // the honest affordance is "here is what is pending, copy it to Claude" plus
 // the mechanical half — marking the batch integrated once the pages exist.
 // Pretending a Compile button could write the pages would be the lie.
+// The timestamp a watermark holds: either `["<created_at>","<id>"]` or, as
+// stored before ids were recorded, the bare timestamp.
+function watermarkTime(watermark) {
+  try {
+    const parsed = JSON.parse(watermark);
+    if (Array.isArray(parsed)) return String(parsed[0]).slice(0,19);
+  } catch (_) { /* a bare timestamp */ }
+  return (watermark||"").slice(0,19);
+}
+
 function WikiCompilePanel({onCompile, onClose}) {
   const [outcome, setOutcome] = useState(null);
   const [busy, setBusy] = useState(true);
@@ -192,10 +202,10 @@ function WikiCompilePanel({onCompile, onClose}) {
   const [copied, setCopied] = useState(false);
   const [confirmIntegrate, setConfirmIntegrate] = useState(false);
 
-  const run = useCallback(async (markIntegrated) => {
+  const run = useCallback(async (markIntegrated, through) => {
     setBusy(true); setError(null);
     let result;
-    try { result = await onCompile(markIntegrated); }
+    try { result = await onCompile(markIntegrated, through); }
     catch (e) { setBusy(false); setError("Request failed: " + e.message); return; }
     setBusy(false);
     if (result && result.error) { setError(result.error); return; }
@@ -224,7 +234,7 @@ function WikiCompilePanel({onCompile, onClose}) {
     ),
 
     outcome && outcome.status === "integrated" && React.createElement("div",{style:{padding:"10px 14px",borderRadius:6,background:theme.successSubtle,border:"1px solid "+theme.success+"40",color:theme.success,fontSize:13,fontFamily:mono,lineHeight:1.5}},
-      "✓ Marked "+outcome.sources_marked+" source"+(outcome.sources_marked===1?"":"s")+" integrated. The watermark moved to "+(outcome.watermark||"").slice(0,19)+"."
+      "✓ Marked "+outcome.sources_marked+" source"+(outcome.sources_marked===1?"":"s")+" integrated. The watermark moved to "+watermarkTime(outcome.watermark)+"."
     ),
 
     outcome && outcome.status === "brief" && React.createElement(React.Fragment,null,
@@ -244,7 +254,7 @@ function WikiCompilePanel({onCompile, onClose}) {
       React.createElement("button",{onClick:onClose,style:{padding:"8px 16px",borderRadius:6,border:"1px solid "+theme.border,background:"transparent",color:theme.textSecondary,fontSize:13,fontFamily:mono,cursor:"pointer"}},"Close"),
       outcome && outcome.status === "brief" && React.createElement("button",{onClick:copy,style:{display:"flex",alignItems:"center",gap:6,padding:"8px 16px",borderRadius:6,border:"1px solid "+theme.border,background:"transparent",color:theme.textSecondary,fontSize:13,fontFamily:mono,cursor:"pointer"}},
         copied ? React.createElement(Icons.Check) : React.createElement(Icons.Copy), copied ? "Copied" : "Copy brief"),
-      outcome && outcome.status === "brief" && React.createElement("button",{onClick:()=>confirmIntegrate?run(true):setConfirmIntegrate(true),disabled:busy,
+      outcome && outcome.status === "brief" && React.createElement("button",{onClick:()=>confirmIntegrate?run(true,outcome.through):setConfirmIntegrate(true),disabled:busy,
         style:{padding:"8px 20px",borderRadius:6,border:"none",background:busy?theme.surfaceActive:(confirmIntegrate?theme.warning:theme.accent),color:busy?theme.textMuted:"#fff",fontSize:13,fontWeight:600,fontFamily:mono,cursor:busy?"wait":"pointer",display:"flex",alignItems:"center",gap:6}},
         busy && React.createElement(Icons.Loader),
         confirmIntegrate ? "Yes, mark integrated" : "Mark integrated")

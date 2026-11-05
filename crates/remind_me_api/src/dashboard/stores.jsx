@@ -152,8 +152,10 @@ function useWikiStore() {
   // Phase one with no arguments, phase two with mark_integrated -- the same
   // two-call shape remind_me_wiki_compile has, kept rather than smoothed over,
   // because the gap between them is where the pages actually get written.
-  const compile = useCallback(async (markIntegrated) => {
-    const outcome = await api("/wiki/compile", { method: "POST", body: markIntegrated ? { mark_integrated: true } : {} });
+  // Phase two passes the brief's `through`, so it marks exactly the sources
+  // that brief showed, whatever changed in the meantime.
+  const compile = useCallback(async (markIntegrated, through) => {
+    const outcome = await api("/wiki/compile", { method: "POST", body: markIntegrated ? { mark_integrated: true, through } : {} });
     if (markIntegrated && !outcome.error) await refresh();
     return outcome;
   }, [refresh]);

@@ -1080,7 +1080,8 @@ pub fn api_wiki_delete(
 /// memories created since the watermark, the current page index and the
 /// maintainer schema, assembled into a prompt. It advances nothing, so it is
 /// safe to call repeatedly. Phase two (`mark_integrated: true`) moves the
-/// watermark past the batch that was surfaced.
+/// watermark past the batch that was surfaced: exactly to the brief's
+/// `through` when given, otherwise past a recomputed batch.
 ///
 /// Worth being plain about what this route can and cannot do: the brief is
 /// written for a model to act on, and this server has none. The dashboard
@@ -1127,8 +1128,17 @@ pub fn api_wiki_compile(
         },
     };
 
-    match wiki.compile(store, limit, mark_integrated) {
+    let through = match body.get("through") {
+        None | Some(Value::Null) => None,
+        Some(value) => match value.as_str() {
+            Some(t) => Some(t),
+            None => return err(400, "'through' must be a string"),
+        },
+    };
+
+    match wiki.compile(store, limit, mark_integrated, through) {
         Ok(outcome) => ok(outcome),
+        Err(StoreError::Invalid(why)) => err(400, why),
         Err(e) => internal_err(e),
     }
 }

@@ -465,15 +465,22 @@ impl<'c> Memories<'c> {
         engine::memories::live_triples_except(&self.core.lock(), except_id)
     }
 
-    /// Live, unsuperseded memories created after `cutoff`, oldest first, at
-    /// most `limit`.
-    pub fn live_created_after(&self, cutoff: &str, limit: usize) -> Result<Vec<CreatedMemory>> {
-        engine::memories::live_created_after(&self.core.lock(), cutoff, limit)
+    /// Live, unsuperseded memories after (`cutoff`, `after_id`) in
+    /// (created_at, id) order, oldest first, at most `limit`. With no
+    /// `after_id`, every memory created at `cutoff` is behind it.
+    pub fn live_created_after(
+        &self,
+        cutoff: &str,
+        after_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<CreatedMemory>> {
+        engine::memories::live_created_after(&self.core.lock(), cutoff, after_id, limit)
     }
 
-    /// How many live, unsuperseded memories were created after `cutoff`.
-    pub fn count_live_created_after(&self, cutoff: &str) -> Result<usize> {
-        engine::memories::count_live_created_after(&self.core.lock(), cutoff)
+    /// How many live, unsuperseded memories [`Self::live_created_after`]
+    /// would return with no limit.
+    pub fn count_live_created_after(&self, cutoff: &str, after_id: Option<&str>) -> Result<usize> {
+        engine::memories::count_live_created_after(&self.core.lock(), cutoff, after_id)
     }
 
     /// The memories `ids` names that exist, in no particular order.
@@ -911,8 +918,8 @@ mod tests {
                 .collect(),
             code_refs,
             triples,
-            created: m.live_created_after(NOW, 10).unwrap(),
-            created_count: m.count_live_created_after(NOW).unwrap(),
+            created: m.live_created_after(NOW, None, 10).unwrap(),
+            created_count: m.count_live_created_after(NOW, None).unwrap(),
             sensitivity: ids.iter().map(|id| m.sensitivity(id).unwrap()).collect(),
             views: ids.iter().map(|id| m.sync_view(id).unwrap()).collect(),
             outbox,

@@ -372,3 +372,18 @@ fn a_typo_selects_json_rather_than_markdown() {
         });
     }
 }
+
+#[test]
+fn a_non_string_through_is_an_error_not_a_silent_recompute() {
+    // Dropping a malformed `through` would mark a recomputed batch, which is
+    // the very hazard `through` exists to avoid (card #743 review).
+    let s = server();
+    let req = json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                     "params":{"name":"remind_me_wiki_compile",
+                               "arguments":{"mark_integrated":true,"through":7}}})
+    .to_string();
+    let r = s.handle_request(&req).expect("the server should answer");
+    assert_eq!(r["result"]["isError"], true, "got: {r}");
+    let text = r["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("through"), "got: {text}");
+}

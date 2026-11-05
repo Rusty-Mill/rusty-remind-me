@@ -383,6 +383,30 @@ fn marking_integrated_advances_the_watermark_and_clears_the_pending_count() {
 }
 
 #[test]
+fn marking_through_a_briefs_boundary_marks_exactly_that_brief() {
+    let (server, root) = authed_server("wiki-compile-through");
+    add_memory(&server, "the boiler service is due in the spring");
+    let through = compile(&server, json!({})).json()["through"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    add_memory(&server, "written after the brief");
+
+    let body = compile(
+        &server,
+        json!({ "mark_integrated": true, "through": through }),
+    )
+    .json();
+    assert_eq!(body["status"], "integrated");
+    assert_eq!(body["sources_marked"], 1);
+    assert_eq!(
+        authed_get(&server, "/api/wiki/status").json()["pending_compile"],
+        1
+    );
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
 fn an_empty_vault_compiles_to_a_noop_rather_than_an_empty_brief() {
     let (server, root) = authed_server("wiki-compile-noop");
     let body = compile(&server, json!({})).json();
@@ -415,6 +439,18 @@ fn a_non_numeric_limit_or_non_boolean_flag_is_400() {
     assert_eq!(compile(&server, json!({ "limit": "lots" })).status, 400);
     assert_eq!(
         compile(&server, json!({ "mark_integrated": "yes" })).status,
+        400
+    );
+    assert_eq!(
+        compile(&server, json!({ "mark_integrated": true, "through": 7 })).status,
+        400
+    );
+    assert_eq!(
+        compile(
+            &server,
+            json!({ "mark_integrated": true, "through": "no-id" })
+        )
+        .status,
         400
     );
     std::fs::remove_dir_all(&root).unwrap();

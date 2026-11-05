@@ -951,15 +951,27 @@ pub(crate) fn live_triples_except(tables: &EngineTables, except_id: &str) -> Res
     Ok(triples)
 }
 
-/// Live memories created after `cutoff` as SQLite compares the text,
-/// oldest first (ties by id), at most `limit`.
+/// Whether `row` comes after (`cutoff`, `after_id`) in (created_at, id)
+/// order, comparing text as SQLite does. With no `after_id`, the whole of
+/// `cutoff` is behind.
+fn is_after(row: &MemoryRow, cutoff: &str, after_id: Option<&str>) -> bool {
+    match row.created_at.as_str().cmp(cutoff) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => after_id.is_some_and(|id| row.id.as_str() > id),
+    }
+}
+
+/// Live memories after (`cutoff`, `after_id`), oldest first (ties by id), at
+/// most `limit`.
 pub(crate) fn live_created_after(
     tables: &EngineTables,
     cutoff: &str,
+    after_id: Option<&str>,
     limit: usize,
 ) -> Result<Vec<CreatedMemory>> {
     let mut rows: Vec<MemoryRow> = rows(core_ref(tables)?)
-        .filter(|row| row.is_live() && row.created_at.as_str() > cutoff)
+        .filter(|row| row.is_live() && is_after(row, cutoff, after_id))
         .collect();
     rows.sort_by(|a, b| (&a.created_at, &a.id).cmp(&(&b.created_at, &b.id)));
     Ok(rows
@@ -974,9 +986,13 @@ pub(crate) fn live_created_after(
         .collect())
 }
 
-pub(crate) fn count_live_created_after(tables: &EngineTables, cutoff: &str) -> Result<usize> {
+pub(crate) fn count_live_created_after(
+    tables: &EngineTables,
+    cutoff: &str,
+    after_id: Option<&str>,
+) -> Result<usize> {
     Ok(rows(core_ref(tables)?)
-        .filter(|row| row.is_live() && row.created_at.as_str() > cutoff)
+        .filter(|row| row.is_live() && is_after(row, cutoff, after_id))
         .count())
 }
 
