@@ -170,6 +170,17 @@ fn a_client_with_other_settings_falls_back_and_says_why() {
     // beside the daemon: it fails, and says how to release it.
     assert!(!out.status.success());
     assert!(stderr.contains("rusty-remind-me daemon stop"), "{stderr}");
+    // The error that ends the run names the root cause, not only the lock
+    // (card #755): the fallback notice above it is easy to miss in a log.
+    let last = stderr
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("");
+    assert!(
+        last.contains("REMIND_ME_OUTBOX_RETENTION_DAYS"),
+        "the final error should name the differing setting: {stderr}"
+    );
 
     // A per-session setting is not a mismatch.
     let out = store

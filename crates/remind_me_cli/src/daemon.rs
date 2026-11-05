@@ -175,31 +175,54 @@ fn this_exe() -> io::Result<PathBuf> {
     std::env::current_exe()
 }
 
-fn announce_fallback(e: &dyn std::fmt::Display) {
-    eprintln!(
-        "rusty-remind-me: not using the store daemon: {e}. Opening the store in this process."
-    );
+/// Why this process opens the store itself instead of using the daemon.
+/// It is carried to [`Fallback::open`] so that, when the store turns out to
+/// be held (usually by that same daemon), the error names the root cause
+/// rather than only the lock (card #755).
+pub struct Fallback {
+    /// `None` when the daemon is off; otherwise why it could not be used.
+    reason: Option<String>,
 }
 
-/// A relay to the daemon's MCP server, or `None` to serve in-process.
-pub fn mcp_proxy(db_path: &Path) -> Option<DaemonProxy> {
+impl Fallback {
+    /// The daemon is off: nothing to explain.
+    fn disabled() -> Self {
+        Self { reason: None }
+    }
+
+    /// The daemon is on but unusable: say so now, and remember why.
+    fn announced(e: &dyn std::fmt::Display) -> Self {
+        let reason = e.to_string();
+        eprintln!(
+            "rusty-remind-me: not using the store daemon: {reason}. Opening the store in this process."
+        );
+        Self {
+            reason: Some(reason),
+        }
+    }
+
+    /// Open the store in this process. A failure is reported together with
+    /// why the daemon was not used, since that is usually what to fix.
+    pub fn open(&self, db_path: &Path) -> Result<Database> {
+        Database::open(db_path).map_err(|e| match &self.reason {
+            None => e.into(),
+            Some(reason) => format!(
+                "{e}. This process opened the store itself because the store daemon \
+                 was not usable: {reason}"
+            )
+            .into(),
+        })
+    }
+}
+
+/// A relay to the daemon's MCP server, or the [`Fallback`] to serve
+/// in-process.
+pub fn mcp_proxy(db_path: &Path) -> std::result::Result<DaemonProxy, Fallback> {
     if !remind_me_core::daemon::enabled() {
-        return None;
+        return Err(Fallback::disabled());
     }
-    let exe = match this_exe() {
-        Ok(exe) => exe,
-        Err(e) => {
-            announce_fallback(&e);
-            return None;
-        }
-    };
-    match DaemonProxy::connect(Endpoint::for_db(db_path), exe) {
-        Ok(proxy) => Some(proxy),
-        Err(e) => {
-            announce_fallback(&e);
-            None
-        }
-    }
+    let exe = this_exe().map_err(|e| Fallback::announced(&e))?;
+    DaemonProxy::connect(Endpoint::for_db(db_path), exe).map_err(|e| Fallback::announced(&e))
 }
 
 /// Where the CLI's store operations run.
@@ -211,17 +234,17 @@ pub enum Store {
 impl Store {
     /// The daemon when it is enabled and usable, otherwise the store itself.
     pub fn open(db_path: &Path) -> Result<Self> {
-        if remind_me_core::daemon::enabled() {
-            let endpoint = Endpoint::for_db(db_path);
-            let connected = this_exe().map_err(|e| e.to_string()).and_then(|exe| {
-                client::connect_or_start(&endpoint, &exe, Mode::Op).map_err(|e| e.to_string())
-            });
-            match connected {
-                Ok(connection) => return Ok(Store::Daemon(connection)),
-                Err(e) => announce_fallback(&e),
-            }
+        if !remind_me_core::daemon::enabled() {
+            return Ok(Store::Local(Fallback::disabled().open(db_path)?));
         }
-        Ok(Store::Local(Database::open(db_path)?))
+        let endpoint = Endpoint::for_db(db_path);
+        let connected = this_exe().map_err(|e| e.to_string()).and_then(|exe| {
+            client::connect_or_start(&endpoint, &exe, Mode::Op).map_err(|e| e.to_string())
+        });
+        match connected {
+            Ok(connection) => Ok(Store::Daemon(connection)),
+            Err(e) => Ok(Store::Local(Fallback::announced(&e).open(db_path)?)),
+        }
     }
 
     /// Run `op`, wherever the store is.
@@ -235,11 +258,11 @@ impl Store {
 }
 
 /// Serve the dashboard API on `addr` by relaying each connection to the
-/// daemon. `Ok(false)` when the daemon is not usable and the caller should
-/// serve in-process.
-pub fn serve_api_via_daemon(db_path: &Path, addr: &str) -> Result<bool> {
+/// daemon. `Ok(Some(fallback))` when the daemon is not usable and the caller
+/// should serve in-process.
+pub fn serve_api_via_daemon(db_path: &Path, addr: &str) -> Result<Option<Fallback>> {
     if !remind_me_core::daemon::enabled() {
-        return Ok(false);
+        return Ok(Some(Fallback::disabled()));
     }
     let endpoint = Endpoint::for_db(db_path);
     // One probe up front, starting the daemon if need be, so a refusal falls
@@ -248,8 +271,7 @@ pub fn serve_api_via_daemon(db_path: &Path, addr: &str) -> Result<bool> {
         client::connect_or_start(&endpoint, &exe, Mode::Op).map_err(|e| e.to_string())
     });
     if let Err(e) = probe {
-        announce_fallback(&e);
-        return Ok(false);
+        return Ok(Some(Fallback::announced(&e)));
     }
     let listener = TcpListener::bind(addr)?;
     println!(
@@ -273,5 +295,5 @@ pub fn serve_api_via_daemon(db_path: &Path, addr: &str) -> Result<bool> {
             }
         });
     }
-    Ok(true)
+    Ok(None)
 }
