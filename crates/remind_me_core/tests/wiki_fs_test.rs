@@ -776,18 +776,105 @@ fn a_through_that_names_no_source_is_refused() {
     let store = db.store();
     let (w, root) = wiki("bad-through");
     add(&store, "only");
+    w.compile(&store, 20, false, None).unwrap();
     for bad in [
         "",
         "2026-11-05T12:00:00+00:00",
-        "2026-11-05T12:00:00+00:00 ",
+        "tomorrow mem_a",
+        r#"["tomorrow","mem_a"]"#,
+        r#"["2099-01-01T00:00:00+00:00","mem_z"]"#,
+        r#"["2026-11-05T12:00:00+00:00"]"#,
     ] {
         assert!(
             w.compile(&store, 20, true, Some(bad)).is_err(),
-            "{bad:?} is not a brief's boundary"
+            "{bad:?} is not a boundary a brief issued"
         );
     }
+    assert_eq!(get_meta(&store, COMPILE_WATERMARK_KEY).unwrap(), None);
     assert_eq!(pending_compile_count(&store).unwrap(), 1);
     std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn no_boundary_is_accepted_before_any_brief_is_issued() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let (w, root) = wiki("unissued");
+    Memories::new(&store)
+        .insert(&NewMemory::new(
+            "mem_a",
+            "never briefed",
+            "2026-11-05T12:00:00+00:00",
+        ))
+        .unwrap();
+    let forged = r#"["2026-11-05T12:00:00+00:00","mem_a"]"#;
+    assert!(w.compile(&store, 20, true, Some(forged)).is_err());
+    assert_eq!(pending_compile_count(&store).unwrap(), 1);
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn a_boundary_whose_source_was_deleted_is_still_acknowledged() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let (w, root) = wiki("deleted-boundary");
+    for (id, at) in [
+        ("mem_a", "2026-11-05T12:00:00+00:00"),
+        ("mem_b", "2026-11-05T12:00:01+00:00"),
+    ] {
+        Memories::new(&store)
+            .insert(&NewMemory::new(id, format!("source {id}"), at))
+            .unwrap();
+    }
+    let through = through_of(w.compile(&store, 20, false, None).unwrap());
+    assert!(queries::delete_memory(&store, "mem_b").unwrap());
+
+    match w.compile(&store, 20, true, Some(&through)).unwrap() {
+        WikiCompile::Integrated { sources_marked, .. } => assert_eq!(sources_marked, 1),
+        other => panic!("expected an integration, got {:?}", other),
+    }
+    assert_eq!(pending_compile_count(&store).unwrap(), 0);
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn timestamps_containing_spaces_round_trip_through_the_watermark() {
+    // An import may store a timestamp verbatim, spaces and all.
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let (w, root) = wiki("spaced");
+    let at = "2026-11-05 12:00:00";
+    let half = COMPILE_BRIEF_CHARS * 2 / 3;
+    for (id, label) in [("mem_a", "FIRST"), ("mem_b", "SECOND")] {
+        Memories::new(&store)
+            .insert(&NewMemory::new(
+                id,
+                format!("{label} {}", "x".repeat(half)),
+                at,
+            ))
+            .unwrap();
+    }
+
+    let through = through_of(w.compile(&store, 20, false, None).unwrap());
+    w.compile(&store, 20, true, Some(&through)).unwrap();
+    assert_eq!(pending_compile_count(&store).unwrap(), 1);
+    let (_, brief) = brief_of(w.compile(&store, 20, false, None).unwrap());
+    assert!(brief.contains("SECOND"));
+    w.compile(&store, 20, true, None).unwrap();
+    assert_eq!(pending_compile_count(&store).unwrap(), 0);
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn a_legacy_watermark_with_a_space_still_covers_its_whole_instant() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let at = "2026-11-05 12:00:00";
+    Memories::new(&store)
+        .insert(&NewMemory::new("mem_a", "already integrated", at))
+        .unwrap();
+    set_meta(&store, COMPILE_WATERMARK_KEY, at).unwrap();
+    assert_eq!(pending_compile_count(&store).unwrap(), 0);
 }
 
 #[test]

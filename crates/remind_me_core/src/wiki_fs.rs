@@ -38,10 +38,14 @@ pub const LOG_FILE: &str = "log.md";
 pub const SCHEMA_FILE: &str = "schema.md";
 
 /// `wiki_meta` key holding the compile watermark: the `created_at` and id of
-/// the last raw memory folded into the wiki, as `"<created_at> <id>"`. A
-/// value holding the timestamp alone, as written before ids were added,
-/// covers every memory created at that instant.
+/// the last raw memory folded into the wiki, as the JSON array
+/// `["<created_at>","<id>"]`. A value holding the timestamp alone, as written
+/// before ids were added, covers every memory created at that instant.
 pub const COMPILE_WATERMARK_KEY: &str = "last_compile_at";
+
+/// `wiki_meta` key holding the furthest boundary any brief has issued, in
+/// the watermark's format. Marking may not acknowledge a boundary past it.
+pub const COMPILE_ISSUED_KEY: &str = "last_compile_issued";
 
 /// Earliest timestamp, used when no compile has run.
 const EPOCH: &str = "1970-01-01T00:00:00+00:00";
@@ -91,7 +95,7 @@ pub enum WikiCompile {
     Brief {
         pending: usize,
         watermark: String,
-        /// The last surfaced source, as `"<created_at> <id>"`. Marking with it
+        /// The last surfaced source, as `["<created_at>","<id>"]`. Marking with it
         /// integrates exactly this brief's sources, whatever changes between.
         through: String,
         brief: String,
@@ -487,8 +491,9 @@ impl Wiki {
                 return self.mark_through(store, watermark, through);
             }
         }
-        let (cutoff, after_id) = parse_watermark(&watermark);
-        let mut pending = Memories::new(store).live_created_after(cutoff, after_id, limit)?;
+        let from = Cursor::watermark(&watermark);
+        let mut pending =
+            Memories::new(store).live_created_after(&from.created_at, from.id.as_deref(), limit)?;
         let fits = fitting(&pending, COMPILE_BRIEF_CHARS);
         let deferred = pending.len() - fits;
         pending.truncate(fits);
@@ -500,16 +505,17 @@ impl Wiki {
                     watermark,
                 });
             };
-            let marked = boundary(last);
-            return self.advance(store, pending.len(), marked);
+            return self.advance(store, pending.len(), &Cursor::of(last));
         }
 
-        let Some(through) = pending.last().map(boundary) else {
+        let Some(last) = pending.last().map(Cursor::of) else {
             return Ok(WikiCompile::Noop {
                 reason: "nothing pending; every raw memory is already integrated".to_string(),
                 watermark,
             });
         };
+        record_issued(store, &last)?;
+        let through = last.encode();
 
         let pages = crate::wiki::list_wiki_pages(store)?;
         let index = if pages.is_empty() {
@@ -555,7 +561,7 @@ impl Wiki {
              2. Create or update those pages with `remind_me_wiki_write` — distil, \
              do not paste raw text; revise existing summaries; add [[cross-links]].\n\
              3. When done, call `remind_me_wiki_compile` again with \
-             `mark_integrated=true` and `through=\"{}\"` to advance the watermark \
+             `mark_integrated=true` and `through` set to `{}` to advance the watermark \
              past exactly these sources.",
             pending.len(),
             if watermark.is_empty() {
@@ -578,34 +584,43 @@ impl Wiki {
         })
     }
 
-    /// Advance the watermark to `through`, a brief's boundary, counting the
-    /// sources between. A boundary already passed is a no-op.
+    /// Advance the watermark to `through`, a boundary a brief issued,
+    /// counting the sources between. A boundary already passed is a no-op;
+    /// one that is malformed or past every issued brief is refused.
     fn mark_through(
         &self,
         store: &Store<'_>,
         watermark: String,
         through: &str,
     ) -> Result<WikiCompile> {
-        let Some((at, id)) = through.split_once(' ').filter(|(_, id)| !id.is_empty()) else {
-            return Err(crate::db::StoreError::Invalid(format!(
-                "`through` must be a brief's boundary, \"<created_at> <id>\"; got {through:?}"
+        let Some(boundary) = Cursor::boundary(through) else {
+            return Err(invalid(format!(
+                "`through` must be the `through` a brief returned; got {through:?}"
             )));
         };
-        let (cutoff, after_id) = parse_watermark(&watermark);
-        if !is_after((at, id), (cutoff, after_id)) {
+        let from = Cursor::watermark(&watermark);
+        if !boundary.is_after(&from) {
             return Ok(WikiCompile::Noop {
                 reason: "that brief is already integrated".to_string(),
                 watermark,
             });
         }
+        let issued = get_meta(store, COMPILE_ISSUED_KEY)?.map(|raw| Cursor::watermark(&raw));
+        if issued.is_none_or(|issued| boundary.is_after(&issued)) {
+            return Err(invalid(format!(
+                "`through` {through:?} is past every brief issued so far"
+            )));
+        }
         let memories = Memories::new(store);
-        let pending = memories.count_live_created_after(cutoff, after_id)?;
-        let beyond = memories.count_live_created_after(at, Some(id))?;
-        self.advance(store, pending.saturating_sub(beyond), through.to_string())
+        let pending = memories.count_live_created_after(&from.created_at, from.id.as_deref())?;
+        let beyond =
+            memories.count_live_created_after(&boundary.created_at, boundary.id.as_deref())?;
+        self.advance(store, pending.saturating_sub(beyond), &boundary)
     }
 
     /// Store `marked` as the watermark and log it.
-    fn advance(&self, store: &Store<'_>, sources: usize, marked: String) -> Result<WikiCompile> {
+    fn advance(&self, store: &Store<'_>, sources: usize, marked: &Cursor) -> Result<WikiCompile> {
+        let marked = marked.encode();
         set_meta(store, COMPILE_WATERMARK_KEY, &marked)?;
         self.append_log(&format!(
             "compiled {sources} source(s) — watermark -> {marked}"
@@ -617,18 +632,78 @@ impl Wiki {
     }
 }
 
-/// `memory`'s place in compile order, as a watermark stores it.
-fn boundary(memory: &CreatedMemory) -> String {
-    format!("{} {}", memory.created_at, memory.id)
+fn invalid(why: String) -> crate::db::StoreError {
+    crate::db::StoreError::Invalid(why)
 }
 
-/// Whether `(at, id)` comes after `(cutoff, after_id)` in (created_at, id)
-/// order. With no `after_id`, all of `cutoff` is behind.
-fn is_after((at, id): (&str, &str), (cutoff, after_id): (&str, Option<&str>)) -> bool {
-    match at.cmp(cutoff) {
-        std::cmp::Ordering::Greater => true,
-        std::cmp::Ordering::Less => false,
-        std::cmp::Ordering::Equal => after_id.is_some_and(|after| id > after),
+/// Raise the issued high-water mark to `last` if it is further on.
+fn record_issued(store: &Store<'_>, last: &Cursor) -> Result<()> {
+    let issued = get_meta(store, COMPILE_ISSUED_KEY)?.map(|raw| Cursor::watermark(&raw));
+    if issued.is_none_or(|issued| last.is_after(&issued)) {
+        set_meta(store, COMPILE_ISSUED_KEY, &last.encode())?;
+    }
+    Ok(())
+}
+
+/// A place in compile order: a source's `created_at` and id. With no id it
+/// is a watermark from before ids were recorded, covering all of its instant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Cursor {
+    created_at: String,
+    id: Option<String>,
+}
+
+impl Cursor {
+    /// Just past `memory`.
+    fn of(memory: &CreatedMemory) -> Self {
+        Self {
+            created_at: memory.created_at.clone(),
+            id: Some(memory.id.clone()),
+        }
+    }
+
+    /// A stored watermark: a `[created_at, id]` array, a bare timestamp
+    /// (which may contain spaces), or nothing, which starts at the epoch.
+    fn watermark(raw: &str) -> Self {
+        if raw.is_empty() {
+            return Self {
+                created_at: EPOCH.to_string(),
+                id: None,
+            };
+        }
+        Self::boundary(raw).unwrap_or_else(|| Self {
+            created_at: raw.to_string(),
+            id: None,
+        })
+    }
+
+    /// A boundary a brief issued, or `None` if `raw` is not one.
+    fn boundary(raw: &str) -> Option<Self> {
+        let (created_at, id): (String, String) = serde_json::from_str(raw).ok()?;
+        Some(Self {
+            created_at,
+            id: Some(id),
+        })
+    }
+
+    fn encode(&self) -> String {
+        match &self.id {
+            Some(id) => serde_json::json!([self.created_at, id]).to_string(),
+            None => self.created_at.clone(),
+        }
+    }
+
+    /// Whether this comes after `other` in (created_at, id) order.
+    fn is_after(&self, other: &Cursor) -> bool {
+        match self.created_at.cmp(&other.created_at) {
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Less => false,
+            std::cmp::Ordering::Equal => match (&self.id, &other.id) {
+                (_, None) => false,
+                (None, Some(_)) => true,
+                (Some(ours), Some(theirs)) => ours > theirs,
+            },
+        }
     }
 }
 
@@ -667,20 +742,8 @@ fn deferred_note(deferred: usize) -> String {
 /// badge. Zero means the wiki is current with the memory store.
 pub fn pending_compile_count(store: &Store<'_>) -> Result<usize> {
     let watermark = get_meta(store, COMPILE_WATERMARK_KEY)?.unwrap_or_default();
-    let (cutoff, after_id) = parse_watermark(&watermark);
-    Memories::new(store).count_live_created_after(cutoff, after_id)
-}
-
-/// The (created_at, id) a stored watermark names; see
-/// [`COMPILE_WATERMARK_KEY`]. No watermark starts at the epoch.
-fn parse_watermark(watermark: &str) -> (&str, Option<&str>) {
-    if watermark.is_empty() {
-        return (EPOCH, None);
-    }
-    match watermark.split_once(' ') {
-        Some((created_at, id)) => (created_at, Some(id)),
-        None => (watermark, None),
-    }
+    let from = Cursor::watermark(&watermark);
+    Memories::new(store).count_live_created_after(&from.created_at, from.id.as_deref())
 }
 
 /// Read a `wiki_meta` value.

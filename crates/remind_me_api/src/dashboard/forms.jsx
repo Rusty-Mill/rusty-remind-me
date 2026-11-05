@@ -185,6 +185,16 @@ function WikiPageForm({initial, onSubmit, onLoadSchema, onCancel}) {
 // the honest affordance is "here is what is pending, copy it to Claude" plus
 // the mechanical half — marking the batch integrated once the pages exist.
 // Pretending a Compile button could write the pages would be the lie.
+// The timestamp a watermark holds: either `["<created_at>","<id>"]` or, as
+// stored before ids were recorded, the bare timestamp.
+function watermarkTime(watermark) {
+  try {
+    const parsed = JSON.parse(watermark);
+    if (Array.isArray(parsed)) return String(parsed[0]).slice(0,19);
+  } catch (_) { /* a bare timestamp */ }
+  return (watermark||"").slice(0,19);
+}
+
 function WikiCompilePanel({onCompile, onClose}) {
   const [outcome, setOutcome] = useState(null);
   const [busy, setBusy] = useState(true);
@@ -224,7 +234,7 @@ function WikiCompilePanel({onCompile, onClose}) {
     ),
 
     outcome && outcome.status === "integrated" && React.createElement("div",{style:{padding:"10px 14px",borderRadius:6,background:theme.successSubtle,border:"1px solid "+theme.success+"40",color:theme.success,fontSize:13,fontFamily:mono,lineHeight:1.5}},
-      "✓ Marked "+outcome.sources_marked+" source"+(outcome.sources_marked===1?"":"s")+" integrated. The watermark moved to "+(outcome.watermark||"").slice(0,19)+"."
+      "✓ Marked "+outcome.sources_marked+" source"+(outcome.sources_marked===1?"":"s")+" integrated. The watermark moved to "+watermarkTime(outcome.watermark)+"."
     ),
 
     outcome && outcome.status === "brief" && React.createElement(React.Fragment,null,

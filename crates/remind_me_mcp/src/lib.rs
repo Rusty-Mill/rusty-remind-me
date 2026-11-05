@@ -3401,16 +3401,26 @@ impl McpServer {
                             .get("mark_integrated")
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
-                        let through = args.get("through").and_then(|v| v.as_str());
-                        match self.wiki.compile(&store, limit, mark_integrated, through) {
-                            Ok(outcome) => {
-                                json!({ "content": [{ "type": "text", "text": match format {
+                        let through = match args.get("through") {
+                            None | Some(Value::Null) => Ok(None),
+                            Some(value) => value.as_str().map(Some).ok_or(()),
+                        };
+                        match through {
+                            Err(()) => {
+                                json!({ "isError": true, "content": [{ "type": "text", "text": "Wiki compile error: `through` must be the string a brief returned" }] })
+                            }
+                            Ok(through) => {
+                                match self.wiki.compile(&store, limit, mark_integrated, through) {
+                                    Ok(outcome) => {
+                                        json!({ "content": [{ "type": "text", "text": match format {
     ResponseFormat::Json => serde_json::to_string_pretty(&outcome).unwrap(),
     ResponseFormat::Markdown => render::wiki_compile(&outcome),
 } }] })
-                            }
-                            Err(e) => {
-                                json!({ "isError": true, "content": [{ "type": "text", "text": format!("Wiki compile error: {}", e) }] })
+                                    }
+                                    Err(e) => {
+                                        json!({ "isError": true, "content": [{ "type": "text", "text": format!("Wiki compile error: {}", e) }] })
+                                    }
+                                }
                             }
                         }
                     }
