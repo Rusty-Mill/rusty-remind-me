@@ -12,7 +12,7 @@
 use remind_me_core::db::queries;
 use remind_me_core::db::Store;
 use remind_me_core::models::{
-    AnnotateInput, ExportFormat, MemoryAddInput, MemoryAnnotation, MemoryListInput, ReconcileReport,
+    AnnotateInput, ExportFormat, MemoryAddInput, MemoryAnnotation, MemoryListInput,
 };
 use remind_me_core::{watcher, Database};
 use serde_json::Value;
@@ -154,24 +154,6 @@ fn export_reports_a_status() {
 
     assert_eq!(json["status"], "ok");
     assert_eq!(json["exported"], 2);
-}
-
-#[test]
-fn an_unreachable_reconcile_reports_hint_not_reason() {
-    // A rename on the wire only. The reference calls this `hint`, and a client
-    // keying on it found nothing here.
-    let report = ReconcileReport::Unavailable {
-        reason: "sync is not configured on this node".to_string(),
-    };
-    let json: Value = serde_json::to_value(&report).unwrap();
-
-    assert_eq!(json["status"], "unavailable");
-    assert_eq!(json["hint"], "sync is not configured on this node");
-    assert!(
-        json.get("reason").is_none(),
-        "the old key must be gone, not emitted alongside — two names for one \
-         value is worse than either"
-    );
 }
 
 #[test]

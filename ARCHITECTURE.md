@@ -19,8 +19,8 @@ Key Architectural Tenets:
    removed. See the "Rusty Mill ecosystem dependencies" comment in the
    workspace `Cargo.toml` for the full account, and re-adopt one only at the
    point it gains a real call site.)
-3. **Wire compatibility, not file sharing** (*replaced 2026-09-26*). This tenet used to be "Data Parity with `remind-me`": an identical SQLite v29 schema so the Python `remind_me` and this port could open the same `memory.db`. The Python reference is retired (ADR-0023), so the node's storage is its own. What stays compatible is the **sync protocol**: nodes, peers and the hub exchange records in the same wire format, whatever each stores them in. The MCP tool names and signatures stay as they are, because clients rely on them, not because Python does.
-4. **Thread Safety**: Thread-safe store access through `Arc<Database>`, whose `store()` takes a `parking_lot::Mutex<()>` so one caller runs at a time while background threads share the engine tables (which lock per call) through a `SecondarySource`; safe for concurrent access from plain OS threads — the scheduler, folder watcher, sync worker and promotion nudge are each `std::thread::Builder::spawn` loops, not `tokio` tasks; `remind_me_remote` is the one crate in this workspace that runs on `tokio` (§2).
+3. **Wire compatibility, not file sharing** (*replaced 2026-09-26*). This tenet used to be "Data Parity with `remind-me`": an identical SQLite v29 schema so the Python `remind_me` and this port could open the same `memory.db`. The Python reference is retired (ADR-0023), so the node's storage is its own. Multi-node sync, the last wire format it shared, was removed too (ADR-0032). The MCP tool names and signatures stay as they are, because clients rely on them, not because Python does.
+4. **Thread Safety**: Thread-safe store access through `Arc<Database>`, whose `store()` takes a `parking_lot::Mutex<()>` so one caller runs at a time while background threads share the engine tables (which lock per call) through a `SecondarySource`; safe for concurrent access from plain OS threads — the scheduler, folder watcher and promotion nudge are each `std::thread::Builder::spawn` loops, not `tokio` tasks; `remind_me_remote` is the one crate in this workspace that runs on `tokio` (§2).
 
 ---
 
@@ -35,22 +35,12 @@ graph TD
     API --> CORE
     REMOTE --> MCP
     REMOTE --> CORE
-    HUB[remind_me_hub binary: rusty-remind-me-hub]
     CORE --> ENGINE[rusty_multimodal_db engine, in-process]
     CORE -.read-only, first open only.-> LEGACY[old SQLite memory.db]
-    HUB --> ENGINE
 ```
 
-`remind_me_hub` is its own binary (`rusty-remind-me-hub`), not reached
-through the `remind_me_cli` dispatch and not a build dependency of
-`remind_me_core` or vice versa — it is the central sync point nodes push to
-and pull from over HTTP, sharing a wire protocol with `remind_me_core::sync`
-rather than a crate dependency. The one Cargo edge between them runs the
-other direction and only in tests: `remind_me_core`'s `dev-dependencies` path
-to `remind_me_hub` (without the copy tool's Postgres reader,
-`default-features = false`) lets
-`tests/support`'s `MockHub` exercise real `remind_me_hub` request handling
-without a spawned process.
+Multi-node sync and its hub were removed (ADR-0032): one server holds one
+store.
 
 ### Crate Roles
 - **`remind_me_core`**: The domain core containing:
@@ -100,7 +90,6 @@ without a spawned process.
 - **`remind_me_remote`**: The Streamable HTTP MCP connector, on `rusty_tokio` + `rusty_axum` + `rusty_mcp_server` (the one place this workspace takes on an async stack — every other crate stays synchronous, a deliberate boundary; see `crates/remind_me_remote/src/lib.rs`'s module doc):
   - Secret-path/bearer auth (FT-05) and, when an issuer is configured, a hand-rolled OAuth 2.1 authorization server (FT-07, `docs/adr/0011`).
   - `handler::describe` turns `remind_me_mcp::Handler` (synchronous) into a `rusty_mcp_server` server, whose HTTP handler runs each request on a blocking thread, rather than reimplementing tool/resource/prompt dispatch.
-- **`remind_me_hub`**: The central multi-node sync server (`rusty-remind-me-hub` binary) speaking the same push/pull peer protocol `remind_me_core::sync` serves node-to-node, storing its data in the embedded `rusty_multimodal_db` engine (`docs/adr/0021`); its Postgres and SQLite stores (`docs/adr/0015`) are retired, and `rusty-remind-me-hub-copy` moves an old hub onto the engine. A hub never pulls; nodes push to and pull from it.
 
 ---
 
@@ -225,7 +214,7 @@ that renders the page.
 
 To allow safe concurrent access from the plain OS threads this workspace
 actually uses — CLI subcommand processes, the MCP stdio loop, and the
-scheduler/watcher/sync-worker/promotion-nudge background threads (each a
+scheduler/watcher/promotion-nudge background threads (each a
 `std::thread::Builder::spawn` loop, not a `tokio` task; see §1 tenet 4)
 — without lock contention or data races:
 - The `Database` struct holds the engine tables behind an `Arc<EngineLock>`

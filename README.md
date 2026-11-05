@@ -20,7 +20,7 @@
 - **Forward-Compatible Model Context Protocol (MCP) Server**: Stdio JSON-RPC MCP server with dynamic protocol version negotiation (supporting `2024-11-05` through upcoming 2026 releases), resources, prompts, dynamic tool change notifications (`listChanged`), and tool execution.
 - **Automated Client Setup**: Built-in `configure` command & scripts for 1-click MCP setup across **Claude Desktop**, **Antigravity**, **Cursor**, and **Codex**.
 - **REST API Server**: Synchronous HTTP daemon hand-rolled on `std::net::TcpListener` (no framework, not even `tokio`) exposing endpoints for health checks, memory storage, FTS5 retrieval, and stats.
-- **Multi-Node Sync & Remote Connector**: Push/pull sync against a hub or discovered peers (static list or Tailscale), plus a Streamable HTTP remote MCP connector (secret-path/bearer or OAuth 2.1) for network-reachable clients like claude.ai.
+- **Remote Connector**: A Streamable HTTP remote MCP connector (secret-path/bearer or OAuth 2.1) for network-reachable clients like claude.ai. One server holds the store; there is no multi-node sync.
 - **Knowledge Graph Entities**: Canonical entity deduplication, alias resolution, and relation traversal up to 3 hops.
 - **Markdown Wiki Synthesis**: Topic-based wiki page compilation, queryable topic search, and
   bulk import of Markdown directories (`wiki-import`) — the ingestion path for
@@ -33,7 +33,7 @@
 
 A full walkthrough from a clean clone to a working setup — build, connect a
 client (Claude Code plugin or any other MCP client), verify it, then
-optionally add multi-node sync and the other off-by-default features.
+optionally add the off-by-default features.
 
 ### Prerequisites
 
@@ -73,8 +73,7 @@ also published on the [Releases
 page](https://github.com/Rusty-Mill/rusty-remind-me/releases) for every
 tagged version (tags `vX.Y.Z`; the monorepo-era releases are tagged
 `rusty-remind-me-vX.Y.Z` on [its Releases
-page](https://github.com/Rusty-Mill/rusty_mill/releases)) — each includes both `rusty-remind-me` and
-`rusty-remind-me-hub` — if you'd rather skip the build step. See [Releases
+page](https://github.com/Rusty-Mill/rusty_mill/releases)) — if you'd rather skip the build step. See [Releases
 and versioning](#releases-and-versioning) below for how those get produced.
 
 ### 2. Connect it to a client
@@ -126,7 +125,7 @@ pick up a new stdio server until it restarts.
 | `pipeline` | queue and the refinement steps it feeds: decompose, annotate, normalize_apply, reclassify, promote, consolidate, feedback, entity_upsert, entity_traverse, persona, provenance, skeleton_read, skeleton_write, revert, project |
 | `wiki` | wiki_read, wiki_write, wiki_delete, wiki_compile |
 | `import` | import, undo_import, capture_transcript |
-| `admin` | backup, reindex, archive_prune, export_memories, revoke_clients, api_key, sync_status, sync_repair, self_update |
+| `admin` | backup, reindex, archive_prune, export_memories, revoke_clients, api_key, self_update |
 | `extras` | reminders, saved_searches, session_timeline |
 
 Set a comma list such as `REMIND_ME_TOOL_PROFILE=core,wiki`. `full` (the
@@ -144,39 +143,7 @@ rusty-remind-me search "installed"
 Through whichever client you connected in step 2, ask it to recall something
 you just added — that exercises the actual MCP tool path, not just the CLI.
 
-### 4. Optional: multi-node sync via a hub
-
-Everything above is a complete, fully-functional single-machine install —
-sync is entirely opt-in. To share memories across machines, stand up a hub
-once and point every node at it:
-
-```bash
-# On the hub machine — one container, no separate database server:
-crates/remind_me_hub/setup.sh install
-# Prints the generated SYNC_SECRET every client below needs.
-
-# On each client machine:
-REMIND_ME_SYNC_SECRET=<printed secret> rusty-remind-me configure \
-    --node-id my-laptop --hub-url http://<hub-host>:8765
-```
-
-That runs the hub on its embedded storage engine. A hub still on the
-Postgres or SQLite store it used to offer moves over with
-`crates/remind_me_hub/setup.sh migrate`, and `crates/remind_me_hub/client-setup.sh
---node-id my-laptop --tunnel me@hub-host` automates the SSH-tunnel case.
-Docker Compose, Fly.io, and Railway deployments are under
-`crates/remind_me_hub/deploy/`. See [`crates/remind_me_hub/README.md`](crates/remind_me_hub/README.md)
-for the full reference (routes, security posture, the store) and [Multi-Node
-Sync, Hub & Remote Connector](#multi-node-sync-hub--remote-connector) below
-for every client-side environment variable this `configure` call sets.
-
-If you installed as a Claude Code plugin (step 2), see [Multi-node sync
-through the plugin](#multi-node-sync-through-the-plugin) — the short version
-is that ambient environment inheritance (shell export, or Claude Code
-`settings.json`'s `env` key) is the supported way to get these three
-variables into the plugin's MCP server process.
-
-### 5. Optional: everything else
+### 4. Optional: everything else
 
 Each of these is independently off by default and documented in its own
 section — enable only what you need:
@@ -210,7 +177,6 @@ rusty_remind_me/
     ├── remind_me_mcp/          # Stdio JSON-RPC MCP protocol engine & tool handlers
     ├── remind_me_api/          # Async REST HTTP server daemon (`rusty_http` + `tokio`)
     ├── remind_me_remote/       # Remote MCP connector over Streamable HTTP (claude.ai, OAuth 2.1)
-    ├── remind_me_hub/          # Multi-node sync hub: push/pull relay + Tailscale peer discovery
     └── remind_me_cli/          # Unified `rusty-remind-me` binary executable
 ```
 
@@ -219,12 +185,12 @@ rusty_remind_me/
 ## Releases and versioning
 
 `.github/workflows/release.yml` watches
-every push to `main` that touches one of this product's six crate manifests.
+every push to `main` that touches one of this product's crate manifests.
 When their `version` has moved past the last published version
 (checked against existing `vX.Y.Z` tags — nothing
 hand-maintains a changelog of already-shipped versions), it:
 
-1. Builds `rusty-remind-me` and `rusty-remind-me-hub` in release mode,
+1. Builds `rusty-remind-me` in release mode,
    natively, for `x86_64-unknown-linux-gnu`, `x86_64-apple-darwin`,
    `aarch64-apple-darwin`, and `x86_64-pc-windows-msvc` — one job per
    platform, no cross-compilation, matching the "no system binary at build
@@ -313,60 +279,6 @@ rm -rf "$tmp"
 
 In a single-repository rusty_mill session both registrations run; the server keeps one capture per session, so the second send only replaces it.
 
-### Multi-node sync through the plugin
-
-`.mcp.json` sets no `env` — Claude Code spawns a plugin's MCP server with
-`{...process.env, ...pluginEnv}`, so with nothing in `pluginEnv` the
-`rusty-remind-me server` process the plugin starts inherits Claude Code's own
-environment in full. If `REMIND_ME_NODE_ID`, `REMIND_ME_HUB_URL`, and
-`REMIND_ME_SYNC_SECRET` are already set in that environment, sync comes up
-transparently — the plugin neither enables nor blocks it, and there's
-nowhere here that would hardcode a shared secret into a file that ships with
-the plugin.
-
-What that inheritance does *not* change is which surface actually carries
-sync: per the note below, the background sync thread is a long-lived
-process's own background service (like the reminder scheduler or folder
-watcher), not something the MCP connection specifically owns — the plugin's
-bundled `rusty-remind-me server` runs one, but the `SessionStart` hook and
-both slash commands still invoke the plain CLI as one-shot subprocesses that
-exit immediately, same as `add`/`search` always have, sync thread or not. A
-memory added via `/rusty-remind-me:remember` while the MCP connection is
-down still lands in the local outbox; it just doesn't reach the hub until
-some running `rusty-remind-me server`/`api`/`remote` process — this plugin's
-or otherwise, against the same database — picks it up on its next cycle.
-
-**Why this isn't a `userConfig`-driven install prompt.** Claude Code plugins
-can declare `userConfig` fields that prompt the user for values when the
-plugin is enabled — the natural-looking way to turn "set three env vars
-yourself" into part of installing the plugin. Tried and abandoned: neither of
-Claude Code's two documented delivery paths for a configured `userConfig`
-value actually reaches this plugin's MCP server subprocess. Verified directly
-by wrapping the `rusty-remind-me` binary and logging its real spawn
-environment —
-
-- `${user_config.KEY}` substitution inside `.mcp.json`'s own `env` block
-  (what the plugin docs describe for "MCP and LSP server configs") does not
-  resolve for an `argv=["server"]` spawn; the literal, un-substituted
-  `${user_config.KEY}` string reaches the process instead. Worse than
-  useless: `sync_enabled()` sees three non-empty strings and turns sync *on*
-  against a garbage endpoint rather than leaving it off (this is what
-  `is_unresolved_placeholder` in `sync/mod.rs` now guards against).
-- `CLAUDE_PLUGIN_OPTION_<KEY>`, which Claude Code does export for a
-  configured `userConfig` option, reaches this plugin's `SessionStart` hook
-  invocation (`argv=["list", "--limit", "8"]`) but not the `argv=["server"]`
-  MCP server spawn in the same session — confirmed by tagging captured
-  environments with their argv and pid. The docs say these vars go to "hook
-  processes"; that turned out to be exact, not illustrative.
-
-Declaring `env` in `.mcp.json` is also not additive with today's ambient
-inheritance even where substitution *did* work: `pluginEnv` always wins in
-`{...process.env, ...pluginEnv}`, so wiring `userConfig` in would have
-silently broken the shell/`settings.json`-based setup described above for
-anyone already using it. Given neither delivery path works for the process
-that needs the values, ambient inheritance stays the only supported way to
-configure sync through this plugin.
-
 ---
 
 ## Automated Client Setup (Claude Desktop, Antigravity, Cursor, Codex)
@@ -428,61 +340,21 @@ Do not run the Python server against the same `memory.db` afterwards. The node's
 
 A stdio client will not pick up a config change until it restarts. `docs/CUTOVER.md` records the 2026-08 cutover of every consumer on a real machine; it is kept as history.
 
-## Multi-Node Sync, Hub & Remote Connector
+## Identity & Remote Connector
 
-Two additional crates extend a single-machine install into a synced fleet and
-an internet-reachable MCP endpoint. Both are **off by default** — nothing
-here changes single-machine behavior unless the corresponding environment
-variables are set.
-
-### Multi-node sync (`remind_me_hub`, `remind_me_core::sync`)
-
-A node pushes its outbox to a hub and pulls the hub's changes back; peers are
-also discovered directly (a static list, or Tailscale's local API) for
-peer-to-peer push. Sync stays off until `REMIND_ME_NODE_ID`,
-`REMIND_ME_HUB_URL`, and `REMIND_ME_SYNC_SECRET` are all set.
-
-**The background sync thread needs a long-lived process to run in.**
-`SyncWorker::from_env` — the loop that actually pushes/pulls on
-`REMIND_ME_SYNC_INTERVAL` — is a background service like the reminder
-scheduler or folder watcher (`crates/remind_me_core/src/sync/worker.rs`), not
-something any single binary owns. `rusty-remind-me server`, `api`, and
-`remote` each start one alongside their own work
-(`crates/remind_me_cli/src/main.rs`); the one-shot CLI subcommands (`add`,
-`search`, `list`, ...) don't, since they exit before a cycle could ever run.
-A write from one of those one-shot commands still lands in the shared
-outbox — it isn't lost — but nothing pushes it to the hub until a process
-that *is* running a sync worker picks it up on its next cycle. Concretely:
-one of `rusty-remind-me server`/`api`/`remote` has to be running somewhere
-for sync to actually move data.
-
-**Sync is a property of the store, not of each process.** Every process that
-opens a node's store must agree on it, but they need not all carry the
-settings: a dashboard started without them leaves a syncing store syncing (it
-warns on stderr), queues its edits for the process that pushes, and deletes by
-tombstone. Turning sync off takes `REMIND_ME_SYNC_DISABLE=1`; unsetting the
-settings in one process no longer does it. Status is process-global, not tied to
-whichever instance started the worker:
-`remind_me_server_status` reports on whatever sync worker is live in *that*
-process, the same way it already reports on the folder watcher.
+remind-me runs as one server holding one store; multi-node sync and its hub
+were removed (card #746, ADR-0032). Every memory is still stamped with who
+wrote it:
 
 | Variable | Purpose | Default |
 | --- | --- | --- |
-| `REMIND_ME_NODE_ID` | This node's identity, stamped on every row it writes | unset (sync off) |
-| `REMIND_ME_CLIENT` | Human-readable label for this install, alongside `node_id` | `unknown` |
-| `REMIND_ME_HUB_URL` | Hub this node pushes to / pulls from | unset (sync off) |
-| `REMIND_ME_SYNC_SECRET` | Bearer token for `/sync/push` and `/sync/pull`, sent and required | unset (sync off) |
-| `REMIND_ME_SYNC_DISABLE` | `1`/`true`/`yes`/`on`: turn sync off for this store and empty its outbox. Without it, a process that lacks the three settings above leaves a syncing store syncing | unset |
-| `REMIND_ME_SYNC_INTERVAL` | Seconds between background sync cycles | `60` |
-| `REMIND_ME_PEER_BIND` | Bind address for this node's own peer server (accepts another node's push/pull) | `0.0.0.0` — all interfaces; narrow to `127.0.0.1` behind a tunnel-only setup |
-| `REMIND_ME_PEER_PORT` | Port for the peer server above, and the port every discovered peer is assumed to listen on | `8766` |
+| `REMIND_ME_NODE_ID` | This install's identity, stamped on every row it writes | unset |
+| `REMIND_ME_CLIENT` | Human-readable label for the writer, alongside `node_id` | `unknown` |
+| `REMIND_ME_SYNC_DISABLE` | `1`/`true`/`yes`/`on`: stop a store that synced before the removal from keeping sync bookkeeping (outbox rows and delete tombstones) and empty its outbox | unset |
 | `REMIND_ME_COMPACT_INTERVAL_SECS` | Seconds between the store daemon's compactions of the engine tables it has written to since the last one; `0` turns them off. Read by the daemon only | `3600` |
 
-`rusty-remind-me configure --node-id ID --hub-url URL [--peer-port N] [--sync-interval SECS]`
-writes both the MCP entry and this sync environment for every configured
-client in one command. There is deliberately no `--secret` flag — it is read
-from `REMIND_ME_SYNC_SECRET` only, so it never lands in argv (`/proc`, shell
-history).
+`rusty-remind-me configure --node-id ID` writes the MCP entry with that
+identity for every configured client in one command.
 
 ### Remote MCP connector (`remind_me_remote`, `rusty-remind-me remote`)
 
@@ -634,12 +506,9 @@ Configures all installed MCP client applications:
 rusty-remind-me configure
 ```
 
-`configure` also accepts `--node-id ID --hub-url URL` (writes the sync
-environment too — see [Multi-Node Sync, Hub & Remote
-Connector](#multi-node-sync-hub--remote-connector) below), plus `--peer-port
-N`, `--sync-interval SECS`, `--db-path PATH`, and `--default-format
-json|markdown`. The sync secret always comes from `REMIND_ME_SYNC_SECRET`,
-never a flag — argv is world-readable via `/proc` and shell history.
+`configure` also accepts `--node-id ID` (see [Identity & Remote
+Connector](#identity--remote-connector) below), `--db-path PATH`, and
+`--default-format json|markdown`.
 
 ### 3. REST API Server Daemon
 Starts the async HTTP REST server listening on the specified port (default: 8080):
@@ -654,8 +523,8 @@ Serves the MCP server over Streamable HTTP for network-reachable clients
 REMIND_ME_REMOTE_MCP=1 rusty-remind-me remote
 ```
 Off by default; binds `127.0.0.1:8768` unless `REMIND_ME_REMOTE_HOST` /
-`REMIND_ME_REMOTE_PORT` are set. See [Multi-Node Sync, Hub & Remote
-Connector](#multi-node-sync-hub--remote-connector) above for the full
+`REMIND_ME_REMOTE_PORT` are set. See [Identity & Remote
+Connector](#identity--remote-connector) above for the full
 environment variable reference.
 
 ### 5. Adding Memories

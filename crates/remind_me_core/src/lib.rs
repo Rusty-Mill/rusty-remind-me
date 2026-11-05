@@ -70,7 +70,6 @@ pub mod review;
 pub mod saved_searches;
 pub mod scheduler;
 pub mod session_ops;
-pub mod sidecars;
 pub mod skeleton;
 pub mod stats;
 pub mod status;

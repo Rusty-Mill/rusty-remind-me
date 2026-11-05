@@ -1,40 +1,19 @@
 //! Tombstones are emptied, not purged (ADR-0024).
 //!
 //! A deleted memory keeps what last-write-wins and re-imports read and drops
-//! its text: on delete, when a tombstone arrives by sync, and at open for
-//! the ones deleted before that. Its revision history goes with it.
-//!
-//! Its own test binary, holding `ENV_LOCK` throughout: whether a delete
-//! tombstones follows the sync settings, which are process-wide env vars.
-
-#[path = "../src/test_env.rs"]
-mod test_env;
+//! its text: on delete, and at open for the ones deleted before that. Its
+//! revision history goes with it. Only a store that synced tombstones
+//! (`testing::mark_store_syncing`); one that never did hard deletes.
 
 use remind_me_core::db::history::Revisions;
 use remind_me_core::db::queries;
 use remind_me_core::db::Store;
 use remind_me_core::models::{MemoryAddInput, MemoryUpdateInput};
-use remind_me_core::sync::{
-    upsert_record, SyncRecord, HUB_URL_ENV, NODE_ID_ENV, SYNC_DISABLE_ENV, SYNC_SECRET_ENV,
-    TOMBSTONE_CONTENT,
-};
+use remind_me_core::sync::TOMBSTONE_CONTENT;
 use remind_me_core::testing::{self, Table};
 use remind_me_core::Database;
 use serde_json::json;
 use std::path::PathBuf;
-use std::sync::{Mutex, MutexGuard};
-
-static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-/// Hold the env lock with the sync settings in place, so deletes tombstone.
-fn syncing() -> MutexGuard<'static, ()> {
-    let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    test_env::set_var(NODE_ID_ENV, "node-tombstone-test");
-    test_env::set_var(HUB_URL_ENV, "http://hub.example");
-    test_env::set_var(SYNC_SECRET_ENV, "shh");
-    test_env::remove_var(SYNC_DISABLE_ENV);
-    guard
-}
 
 /// A fresh directory for one store, removed when dropped.
 struct Scratch(PathBuf);
@@ -115,16 +94,16 @@ fn assert_emptied(store: &Store<'_>, id: &str) {
 
 #[test]
 fn a_delete_drops_the_text_and_the_history() {
-    let _guard = syncing();
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
+    testing::mark_store_syncing(&store).unwrap();
     let id = add_with_history(&store);
 
     assert!(queries::delete_memory(&store, &id).unwrap());
 
     assert_emptied(&store, &id);
     assert!(Revisions::new(&store).list(&id, 10).unwrap().is_empty());
-    // The delete queued for the other nodes carries no text either.
+    // The delete it queues carries no text either.
     let queued = testing::outbox_rows(&store).unwrap();
     let payload = &queued.last().unwrap().payload;
     assert!(payload.contains(TOMBSTONE_CONTENT), "{payload}");
@@ -133,10 +112,6 @@ fn a_delete_drops_the_text_and_the_history() {
 
 #[test]
 fn a_hard_delete_drops_the_history_too() {
-    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    test_env::remove_var(NODE_ID_ENV);
-    test_env::remove_var(HUB_URL_ENV);
-    test_env::remove_var(SYNC_SECRET_ENV);
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
     let id = add_with_history(&store);
@@ -149,61 +124,13 @@ fn a_hard_delete_drops_the_history_too() {
     assert!(Revisions::new(&store).list(&id, 10).unwrap().is_empty());
 }
 
-fn record(id: &str, updated: &str, deleted: Option<&str>, tags: &[&str]) -> SyncRecord {
-    serde_json::from_value(json!({
-        "id": id,
-        "content": "text the sender kept",
-        "tags": tags,
-        "source": "chat_import",
-        "metadata": { "chat_id": "c1" },
-        "subject": "Ada",
-        "predicate": "plans",
-        "object": "a secret",
-        "created_at": "2026-08-01T00:00:00+00:00",
-        "updated_at": updated,
-        "deleted_at": deleted,
-    }))
-    .unwrap()
-}
-
-#[test]
-fn a_tombstone_arriving_by_sync_is_stored_empty() {
-    let _guard = syncing();
-    let db = Database::open_in_memory().unwrap();
-    let store = db.store();
-    let at = "2026-08-05T00:00:00+00:00";
-
-    upsert_record(&store, &record("m1", at, Some(at), &["private"])).unwrap();
-    assert_emptied(&store, "m1");
-
-    // A live copy that loses to the tombstone adds no tags back.
-    upsert_record(
-        &store,
-        &record("m1", "2026-08-01T00:00:00+00:00", None, &["late"]),
-    )
-    .unwrap();
-    assert_emptied(&store, "m1");
-
-    // A newer edit still wins, text and all.
-    upsert_record(
-        &store,
-        &record("m1", "2026-08-06T00:00:00+00:00", None, &["back"]),
-    )
-    .unwrap();
-    assert_eq!(text(&store, "m1", "deleted_at"), None);
-    assert_eq!(
-        text(&store, "m1", "content").as_deref(),
-        Some("text the sender kept")
-    );
-}
-
 #[test]
 fn opening_empties_tombstones_deleted_before_and_queues_nothing() {
-    let _guard = syncing();
     let scratch = Scratch::new("open");
     let (id, queued) = {
         let db = Database::open(scratch.db()).unwrap();
         let store = db.store();
+        testing::mark_store_syncing(&store).unwrap();
         let id = add_with_history(&store);
         // A tombstone as an earlier build left it: text, tags and history.
         assert!(queries::delete_memory(&store, &id).unwrap());
@@ -243,9 +170,9 @@ fn opening_empties_tombstones_deleted_before_and_queues_nothing() {
 
 #[test]
 fn opening_drops_the_history_of_memories_deleted_before() {
-    let _guard = syncing();
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
+    testing::mark_store_syncing(&store).unwrap();
     let kept = add_with_history(&store);
     let gone = add_with_history(&store);
     // A tombstone whose revisions an earlier build left behind.

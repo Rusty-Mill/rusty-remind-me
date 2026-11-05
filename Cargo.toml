@@ -1,4 +1,4 @@
-# rusty-remind-me: one workspace, six crates.
+# rusty-remind-me: one workspace, five crates.
 #
 # Monorepo crates come from Rusty-Mill/rusty_mill as git dependencies pinned to
 # one libs-* tag (rusty_mill ADR-0013). Bump every entry together: change the

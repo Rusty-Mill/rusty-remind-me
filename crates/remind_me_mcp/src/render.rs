@@ -248,15 +248,6 @@ fn subsystem_line(key: &str, v: &serde_json::Value) -> String {
                 "not running".to_string()
             }
         }
-        "sync" => {
-            if !b("enabled") {
-                return "disabled".to_string();
-            }
-            match s("last_error") {
-                Some(err) => format!("error: {err} (after {} cycles)", n("cycles")),
-                None => format!("active ({} cycles)", n("cycles")),
-            }
-        }
         "webhook" => {
             if !b("enabled") {
                 return "disabled".to_string();
@@ -320,14 +311,7 @@ pub fn server_status(report: &serde_json::Value) -> String {
         if current { "" } else { " — **MISMATCH**" }
     ));
     out.push_str(&format!("\n- backups: {}", n("backup_count")));
-    for key in [
-        "mcp",
-        "dashboard",
-        "embeddings",
-        "sync",
-        "webhook",
-        "remote",
-    ] {
+    for key in ["mcp", "dashboard", "embeddings", "webhook", "remote"] {
         let line = report
             .get(key)
             .map(|v| subsystem_line(key, v))
