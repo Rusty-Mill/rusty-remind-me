@@ -49,7 +49,11 @@ impl Service for DaemonStore {
         OpReply::Err("not served by this fixture".to_string())
     }
 
-    fn http(&self, _: &mut std::net::TcpStream) -> std::io::Result<()> {
+    fn http(
+        &self,
+        _: &mut std::net::TcpStream,
+        _: &remind_me_core::daemon::settings::Fingerprint,
+    ) -> std::io::Result<()> {
         Err(std::io::ErrorKind::Unsupported.into())
     }
 }

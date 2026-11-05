@@ -31,6 +31,16 @@ const EXCLUDED: &[&str] = &[
     crate::compaction::COMPACT_INTERVAL_ENV,
 ];
 
+/// Variables sent with the fingerprint but never a difference: the daemon
+/// applies the client's own value to that client's connection instead.
+/// `REMIND_ME_API_KEY` guards the dashboard API, which the daemon serves
+/// for each relaying unit under that unit's key (card #742), so units with
+/// different keys can share one daemon without either being served open.
+const PER_CONNECTION: &[&str] = &[API_KEY_ENV];
+
+/// The dashboard API key, as `remind_me_api` reads it.
+pub const API_KEY_ENV: &str = "REMIND_ME_API_KEY";
+
 /// Prefixes of variables that configure the client process itself: `remote`
 /// binds its own listener and holds its own connector token.
 const EXCLUDED_PREFIXES: &[&str] = &["REMIND_ME_REMOTE_"];
@@ -55,8 +65,25 @@ pub fn fingerprint() -> Fingerprint {
 pub fn fingerprint_of(vars: impl IntoIterator<Item = (String, String)>) -> Fingerprint {
     vars.into_iter()
         .filter(|(name, _)| compared(name))
-        .map(|(name, value)| (name, sha256::digest(value)))
+        .map(|(name, value)| {
+            let digest = digest(&value);
+            (name, digest)
+        })
         .collect()
+}
+
+/// The SHA-256 hex digest a fingerprint holds for `value`.
+pub fn digest(value: &str) -> String {
+    sha256::digest(value)
+}
+
+/// The digest of the API key in `settings`, or `None` when it is unset or
+/// empty, which is how the dashboard API reads an empty key.
+pub fn api_key_digest(settings: &Fingerprint) -> Option<&str> {
+    settings
+        .get(API_KEY_ENV)
+        .map(String::as_str)
+        .filter(|held| *held != digest(""))
 }
 
 /// Names whose value differs, or that one side sets and the other does not.
@@ -64,6 +91,7 @@ pub fn differences(ours: &Fingerprint, theirs: &Fingerprint) -> Vec<String> {
     let names: std::collections::BTreeSet<&String> = ours
         .keys()
         .chain(theirs.keys())
+        .filter(|name| !PER_CONNECTION.contains(&name.as_str()))
         .filter(|name| ours.get(*name) != theirs.get(*name))
         .collect();
     names.into_iter().cloned().collect()
@@ -95,6 +123,26 @@ mod tests {
         let got = fp(&[("REMIND_ME_SYNC_SECRET", "hunter2")]);
         assert!(!got["REMIND_ME_SYNC_SECRET"].contains("hunter2"));
         assert_eq!(got["REMIND_ME_SYNC_SECRET"].len(), 64);
+    }
+
+    #[test]
+    fn the_api_key_is_carried_but_never_a_difference() {
+        let ours = fp(&[("REMIND_ME_API_KEY", "k1")]);
+        let theirs = fp(&[]);
+        assert!(
+            ours.contains_key("REMIND_ME_API_KEY"),
+            "sent for the dashboard"
+        );
+        assert!(differences(&ours, &theirs).is_empty());
+        assert!(differences(&ours, &fp(&[("REMIND_ME_API_KEY", "k2")])).is_empty());
+    }
+
+    #[test]
+    fn an_empty_api_key_reads_as_none() {
+        assert_eq!(api_key_digest(&fp(&[])), None);
+        assert_eq!(api_key_digest(&fp(&[("REMIND_ME_API_KEY", "")])), None);
+        let set = fp(&[("REMIND_ME_API_KEY", "k")]);
+        assert_eq!(api_key_digest(&set), Some(digest("k").as_str()));
     }
 
     #[test]
