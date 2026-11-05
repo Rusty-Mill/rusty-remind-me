@@ -13,6 +13,17 @@ Dated entries, newest first. One entry per merged pull request.
 - `wiki_fs_test`: a source longer than the budget is surfaced whole and then marked; a source that does not fit ends the batch, is not passed by the watermark, and heads the next brief whole. Both failed on the base.
 - `wiki_fs_test`: a source deferred at the same `created_at` as the batch is surfaced in the next brief and counted as pending (failed before the id was added); a timestamp-only watermark still covers its whole instant; an edit between brief and mark cannot integrate an unseen source when marking through the brief's boundary; a boundary already passed is a no-op; a malformed one is refused. `wiki_write_test`: marking through a brief's boundary leaves a later memory pending; a non-string or id-less `through` is 400.
 
+## 2026-11-05 — A dashboard unit's API key no longer has to match the store daemon's (card #742)
+
+### Fixed
+- `REMIND_ME_API_KEY` counted in the settings a client must share with the store daemon. A dashboard unit with a key the daemon lacked was refused, fell back to opening the store itself, hit the engine lock and exited, so under `Restart=on-failure` it crash-looped (seen on the remindme host on 2026-11-05). The key is still sent with the settings, but it no longer counts as a difference. The daemon now checks each dashboard connection against the key of the unit that relayed it instead of its own. A unit with a key is never served open by a daemon without one, and a unit without a key is not locked out by the daemon's. MCP and CLI clients never use the key, so they no longer fall back over it either.
+
+### Changed
+- `ApiServer` keeps the key as a SHA-256 digest, the same form the daemon's settings carry, and compares the presented bearer token's digest in constant time. `ApiServer::serve_one_for` serves one request under a given key digest. `Service::http` receives the client's settings.
+
+### Tests
+- `daemon::settings`: the API key is carried but never a difference, and an empty key reads as none. `auth_test`: a daemon connection is held to the dashboard unit's key (a missing or wrong key gives 401, the right key is read-write), and a unit without a key keeps its own posture under a daemon that has one. The settings test failed on the base.
+
 ## 2026-11-04 — The v31 memories upgrade no longer loses logged rows on a failure
 
 ### Fixed

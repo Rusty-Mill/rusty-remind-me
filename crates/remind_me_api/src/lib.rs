@@ -60,6 +60,7 @@ mod http;
 mod routes;
 
 use http::{match_pattern, Body};
+use remind_me_core::daemon::settings::digest;
 use remind_me_core::webhook::constant_time_eq;
 use remind_me_core::wiki_fs::Wiki;
 use remind_me_core::Database;
@@ -82,7 +83,10 @@ const IO_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct ApiServer {
     db: Arc<Database>,
     wiki: Wiki,
-    api_key: Option<String>,
+    /// SHA-256 hex digest of `REMIND_ME_API_KEY`, as the store daemon's
+    /// settings fingerprint carries it, so a key that arrives from a
+    /// relaying unit is checked the same way as this process's own.
+    api_key_digest: Option<String>,
 }
 
 impl ApiServer {
@@ -105,14 +109,14 @@ impl ApiServer {
         Self {
             db,
             wiki,
-            api_key: resolve_api_key(),
+            api_key_digest: resolve_api_key().map(|key| digest(&key)),
         }
     }
 
     /// Override the resolved key — tests need a deterministic key rather
     /// than whatever happens to be in the process environment.
     pub fn with_api_key(mut self, key: Option<String>) -> Self {
-        self.api_key = key.filter(|k| !k.is_empty());
+        self.api_key_digest = key.filter(|k| !k.is_empty()).map(|k| digest(&k));
         self
     }
 
@@ -144,6 +148,20 @@ impl ApiServer {
     /// Exposed so tests can drive the whole stack — routing, auth, the
     /// content-type check — without a real socket.
     pub fn serve_one<S: io::Read + io::Write>(&self, stream: &mut S) -> io::Result<()> {
+        self.serve_one_for(stream, self.api_key_digest.as_deref())
+    }
+
+    /// [`Self::serve_one`], guarded by the API key whose digest is
+    /// `api_key_digest` instead of this process's own. The store daemon
+    /// serves each dashboard connection this way, under the key of the unit
+    /// that relayed it (card #742): a unit with a key is never served open
+    /// by a daemon without one, and a unit without one is not locked out by
+    /// a daemon's key.
+    pub fn serve_one_for<S: io::Read + io::Write>(
+        &self,
+        stream: &mut S,
+        api_key_digest: Option<&str>,
+    ) -> io::Result<()> {
         let Some(request) = http::read_request(stream)? else {
             return Ok(());
         };
@@ -180,7 +198,7 @@ impl ApiServer {
         }
 
         if request.path.starts_with("/api/") {
-            if let Some(response) = self.check_auth(&request) {
+            if let Some(response) = check_auth(&request, api_key_digest) {
                 return http::write_response_cors(stream, response.0, response.1, cors);
             }
             if MUTATING_METHODS.contains(&request.method.as_str()) {
@@ -200,61 +218,6 @@ impl ApiServer {
         http::write_response_cors(stream, status, body, cors)
     }
 
-    /// `None` when the request may proceed; `Some((status, body))` with the
-    /// response to send otherwise.
-    fn check_auth(&self, request: &http::Request) -> Option<(u16, Body)> {
-        match &self.api_key {
-            Some(key) => {
-                let expected = format!("Bearer {}", key);
-                if constant_time_eq(request.authorization.as_bytes(), expected.as_bytes()) {
-                    // The flat key is always read-write, exactly as it was
-                    // before scopes existed. Adding scopes must not
-                    // retroactively restrict a deployment already relying on
-                    // it.
-                    return None;
-                }
-
-                // A named, scope-limited key (issue #120). Checked only after
-                // the flat key misses, so the common path is one comparison.
-                if let Some(presented) =
-                    rusty_oauth::bearer::token_from_authorization(&request.authorization)
-                {
-                    if let Some(verified) = remind_me_core::api_keys::verify(presented) {
-                        if verified.may_use(&request.method) {
-                            return None;
-                        }
-                        // 403, not 401: the key is genuine and was
-                        // authenticated. Answering 401 would send the holder
-                        // looking for a credentials problem they do not have.
-                        return Some((
-                            403,
-                            Body::Json(json!({
-                                "error": format!(
-                                    "API key '{}' is read-only (scope=read); {} requires a read-write key",
-                                    verified.name, request.method
-                                )
-                            })),
-                        ));
-                    }
-                }
-
-                Some((401, Body::Json(json!({ "error": "Unauthorized" }))))
-            }
-            None => {
-                if MUTATING_METHODS.contains(&request.method.as_str()) {
-                    Some((
-                        401,
-                        Body::Json(json!({
-                            "error": "unauthenticated write access is disabled; set REMIND_ME_API_KEY to enable it"
-                        })),
-                    ))
-                } else {
-                    None
-                }
-            }
-        }
-    }
-
     fn dispatch(&self, request: &http::Request) -> (u16, Body) {
         let mut path_matched = false;
         for route in ROUTES {
@@ -271,6 +234,61 @@ impl ApiServer {
             (405, Body::Json(json!({ "error": "Method Not Allowed" })))
         } else {
             (404, Body::Json(json!({ "error": "Not Found" })))
+        }
+    }
+}
+
+/// `None` when the request may proceed; `Some((status, body))` with the
+/// response to send otherwise.
+fn check_auth(request: &http::Request, api_key_digest: Option<&str>) -> Option<(u16, Body)> {
+    match api_key_digest {
+        Some(expected) => {
+            let presented = request.authorization.strip_prefix("Bearer ").map(digest);
+            if presented.is_some_and(|got| constant_time_eq(got.as_bytes(), expected.as_bytes())) {
+                // The flat key is always read-write, exactly as it was
+                // before scopes existed. Adding scopes must not
+                // retroactively restrict a deployment already relying on
+                // it.
+                return None;
+            }
+
+            // A named, scope-limited key (issue #120). Checked only after
+            // the flat key misses, so the common path is one comparison.
+            if let Some(presented) =
+                rusty_oauth::bearer::token_from_authorization(&request.authorization)
+            {
+                if let Some(verified) = remind_me_core::api_keys::verify(presented) {
+                    if verified.may_use(&request.method) {
+                        return None;
+                    }
+                    // 403, not 401: the key is genuine and was
+                    // authenticated. Answering 401 would send the holder
+                    // looking for a credentials problem they do not have.
+                    return Some((
+                        403,
+                        Body::Json(json!({
+                            "error": format!(
+                                "API key '{}' is read-only (scope=read); {} requires a read-write key",
+                                verified.name, request.method
+                            )
+                        })),
+                    ));
+                }
+            }
+
+            Some((401, Body::Json(json!({ "error": "Unauthorized" }))))
+        }
+        None => {
+            if MUTATING_METHODS.contains(&request.method.as_str()) {
+                Some((
+                    401,
+                    Body::Json(json!({
+                        "error": "unauthenticated write access is disabled; set REMIND_ME_API_KEY to enable it"
+                    })),
+                ))
+            } else {
+                None
+            }
         }
     }
 }
