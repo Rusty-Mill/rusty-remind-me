@@ -98,6 +98,7 @@ fn run(db_path: &Path, endpoint: Endpoint) -> Result<()> {
     let scheduler = remind_me_core::scheduler::start_scheduler_for(&db.store());
     let watcher = remind_me_core::watcher::start_watcher_for(&db.store());
     let nudge = remind_me_core::promotion::start_nudge_for(&db.store());
+    let pruner = remind_me_core::sync::retention::start_pruner_for(&db.store());
     let compactor =
         remind_me_core::compaction::start_compactor(Arc::clone(&db)).unwrap_or_else(|e| {
             eprintln!("rusty-remind-me daemon: {e}");
@@ -125,6 +126,9 @@ fn run(db_path: &Path, endpoint: Endpoint) -> Result<()> {
         }
         if let Some(nudge) = nudge {
             nudge.stop();
+        }
+        if let Some(pruner) = pruner {
+            pruner.stop();
         }
         if let Some(compactor) = compactor {
             compactor.stop();

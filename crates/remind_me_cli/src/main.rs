@@ -595,6 +595,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // candidate queries are pull-only without this, so a backlog can grow
         // indefinitely with nothing ever mentioning it (#208).
         let nudge = remind_me_core::promotion::start_nudge_for(&db.store());
+        // `None` unless the store synced once: its outbox still fills and
+        // nothing else drains it (ADR-0032).
+        let pruner = remind_me_core::sync::retention::start_pruner_for(&db.store());
         let server = McpServer::new(db);
         let result = server.run_stdio_loop();
         // All joined before the database goes out of scope, so an in-flight
@@ -608,6 +611,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if let Some(nudge) = nudge {
             nudge.stop();
+        }
+        if let Some(pruner) = pruner {
+            pruner.stop();
         }
         result?;
     } else {
@@ -702,10 +708,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let db = Database::open(&db_path)?;
                 let scheduler = remind_me_core::scheduler::start_scheduler_for(&db.store());
+                let pruner = remind_me_core::sync::retention::start_pruner_for(&db.store());
                 let api_server = ApiServer::new(db);
                 let result = api_server.run(&addr);
                 if let Some(scheduler) = scheduler {
                     scheduler.stop();
+                }
+                if let Some(pruner) = pruner {
+                    pruner.stop();
                 }
                 if let Some(path) = &pid_path {
                     remind_me_core::pid::remove_pid_file(path);
@@ -728,6 +738,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return Ok(());
                 }
                 let db = Database::open(&db_path)?;
+                // Stopped when dropped, at the end of this arm.
+                let _pruner = remind_me_core::sync::retention::start_pruner_for(&db.store());
                 let server = McpServer::new(db);
                 remind_me_remote::run_blocking(std::sync::Arc::new(server))?;
             }

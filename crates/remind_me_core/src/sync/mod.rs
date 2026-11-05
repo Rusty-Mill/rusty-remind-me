@@ -21,6 +21,7 @@ use chrono::{Duration, Utc};
 
 // Public so `notifications` and `events` share one small HTTP client.
 pub mod http;
+pub mod retention;
 
 /// This node's identity, stamped on every newly created memory. Empty (the
 /// default) means "no identity configured".
@@ -276,8 +277,8 @@ fn outbox_retention_days() -> i64 {
 ///
 /// # Where it runs
 ///
-/// On database open, and on every pass of the store daemon's compactor
-/// ([`crate::compaction::run_pass`]), bounding a long-lived database.
+/// On database open, and every hour in a long-lived process
+/// ([`retention::start_pruner_for`]), bounding a long-lived database.
 pub fn prune_outbox(store: &Store<'_>) -> Result<usize> {
     let cutoff = (Utc::now() - Duration::days(outbox_retention_days())).to_rfc3339();
     Outbox::new(store).prune(&cutoff, HUB_REMOTE_ID)
