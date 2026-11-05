@@ -168,29 +168,36 @@ fn a_daemon_connection_is_checked_against_the_dashboard_units_key() {
     let (server, root) = server("per-connection-key");
     let theirs = digest(KEY);
     let bearer = format!("Bearer {KEY}");
+    let get = |auth: Option<&str>| call_for(&server, Some(&theirs), "GET", "/api/stats", auth, "");
 
-    assert_eq!(
-        call_for(&server, Some(&theirs), "GET", "/api/stats", None).status,
-        401
-    );
-    let wrong = call_for(
-        &server,
-        Some(&theirs),
-        "GET",
-        "/api/stats",
-        Some("Bearer nope"),
-    );
-    assert_eq!(wrong.status, 401);
-    let right = call_for(&server, Some(&theirs), "GET", "/api/stats", Some(&bearer));
-    assert_eq!(right.status, 200);
+    assert_eq!(get(None).status, 401);
+    assert_eq!(get(Some("Bearer nope")).status, 401);
+    assert_eq!(get(Some(&bearer)).status, 200);
+
     let write = call_for(
         &server,
         Some(&theirs),
         "POST",
         "/api/memories",
         Some(&bearer),
+        r#"{"content":"written under the unit's key"}"#,
     );
-    assert_ne!(write.status, 401, "the unit's key is read-write");
+    assert_eq!(
+        write.status, 201,
+        "the unit's key is read-write: {:?}",
+        write.body
+    );
+    let id = write.json()["id"].as_str().unwrap().to_string();
+    let read = call_for(
+        &server,
+        Some(&theirs),
+        "GET",
+        &format!("/api/memories/{id}"),
+        Some(&bearer),
+        "",
+    );
+    assert_eq!(read.status, 200);
+    assert_eq!(read.json()["content"], "written under the unit's key");
     std::fs::remove_dir_all(&root).unwrap();
 }
 
@@ -200,7 +207,7 @@ fn a_daemon_connection_from_a_unit_without_a_key_ignores_the_daemons_key() {
     // holds: reads open, writes refused, KEY not required.
     let (server, root) = authed_server("per-connection-none");
     assert_eq!(
-        call_for(&server, None, "GET", "/api/stats", None).status,
+        call_for(&server, None, "GET", "/api/stats", None, "").status,
         200
     );
     let write = call_for(
@@ -209,6 +216,7 @@ fn a_daemon_connection_from_a_unit_without_a_key_ignores_the_daemons_key() {
         "POST",
         "/api/memories",
         Some(&format!("Bearer {KEY}")),
+        r#"{"content":"x"}"#,
     );
     assert_eq!(write.status, 401);
     std::fs::remove_dir_all(&root).unwrap();

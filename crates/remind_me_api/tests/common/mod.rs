@@ -229,8 +229,9 @@ pub fn call_for(
     method: &str,
     path: &str,
     auth: Option<&str>,
+    body: &str,
 ) -> Response {
-    let raw = raw_request(method, path, auth, Some("application/json"), "{}");
+    let raw = raw_request(method, path, auth, Some("application/json"), body);
     let mut stream = FakeStream::new(raw.into_bytes());
     server
         .serve_one_for(&mut stream, key_digest)

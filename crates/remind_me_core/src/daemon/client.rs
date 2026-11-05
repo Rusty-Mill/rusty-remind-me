@@ -168,7 +168,10 @@ pub fn connect(endpoint: &Endpoint, mode: Mode) -> Result<DaemonConnection, Conn
     handshake(info.port, &hello).map_err(|_| ConnectError::NotRunning)?
 }
 
-fn handshake(port: u16, hello: &Hello) -> io::Result<Result<DaemonConnection, ConnectError>> {
+pub(crate) fn handshake(
+    port: u16,
+    hello: &Hello,
+) -> io::Result<Result<DaemonConnection, ConnectError>> {
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
     stream.set_nodelay(true)?;

@@ -532,10 +532,12 @@ mod tests {
             OpReply::Ok(serde_json::to_value(op).unwrap())
         }
 
-        fn http(&self, stream: &mut TcpStream, _: &Fingerprint) -> io::Result<()> {
+        /// Answers `pong`, then the API key digest it was handed, if any.
+        fn http(&self, stream: &mut TcpStream, client: &Fingerprint) -> io::Result<()> {
             let mut request = [0u8; 4];
             stream.read_exact(&mut request)?;
-            stream.write_all(b"pong")
+            let key = settings::api_key_digest(client).unwrap_or("none");
+            stream.write_all(format!("pong {key}").as_bytes())
         }
     }
 
@@ -604,7 +606,38 @@ mod tests {
         http.write_all(b"ping").unwrap();
         let mut answer = String::new();
         http.read_to_string(&mut answer).unwrap();
-        assert_eq!(answer, "pong");
+        assert_eq!(answer, "pong none");
+
+        stop(&endpoint, handle);
+    }
+
+    #[test]
+    fn a_dashboard_connection_is_served_under_its_own_api_key() {
+        // The relaying unit's key differs from the daemon's (unset) one: it
+        // is still welcomed, and its own key, not the daemon's, reaches the
+        // service for that connection.
+        let endpoint = temp_endpoint();
+        let handle = running(&endpoint);
+        let mut settings = settings::fingerprint();
+        settings.insert(settings::API_KEY_ENV.into(), settings::digest("unit-key"));
+        let hello = Hello {
+            protocol: wire::PROTOCOL,
+            token: endpoint.read_token().unwrap(),
+            build: wire::build_id(),
+            mode: Mode::Http,
+            session: Default::default(),
+            settings,
+        };
+        let port = endpoint.read_info().unwrap().port;
+
+        let mut http = client::handshake(port, &hello)
+            .unwrap()
+            .unwrap()
+            .into_stream();
+        http.write_all(b"ping").unwrap();
+        let mut answer = String::new();
+        http.read_to_string(&mut answer).unwrap();
+        assert_eq!(answer, format!("pong {}", settings::digest("unit-key")));
 
         stop(&endpoint, handle);
     }
