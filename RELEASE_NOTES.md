@@ -2,6 +2,15 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-06 — Stricter guards on automatic wiki rewrites
+
+### Changed
+- An automatic compile refuses a rewrite that keeps less than 95% of a page (was 60%), or that drops one of its headings or `backticked` details (citations, paths, ports, commands), as well as one of its `[[links]]`. `--allow-shrink` / `allow_shrink` still waives these. The first live run on 2026-11-06 kept 90% of a page and lost three facts, which these rules catch.
+- A refused draft goes back to the model once, with the reason, before the run stops. The prompt also tells the model to add to a page rather than condense it.
+
+### Tests
+- `wiki_compile`: heading and backticked-detail checks, the 95% boundary, and how spans and headings are read. `wiki_compile_test`: a refused draft is retried with its reason and then saved; a citation a later chunk drops is now refused at draft time. `wiki_llm`: the retry's reason reaches the prompt.
+
 ## 2026-11-06 — The dashboard's wiki view follows the store (card #761)
 
 ### Fixed

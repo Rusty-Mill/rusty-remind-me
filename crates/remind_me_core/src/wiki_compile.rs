@@ -30,7 +30,9 @@ pub const DEFAULT_MATCH: f32 = 0.55;
 /// A second page also takes a source when it is this close to the best.
 const SECOND_PAGE_MARGIN: f32 = 0.05;
 /// A rewrite may not cut an existing page below this share of its length.
-const MIN_KEPT: f64 = 0.6;
+/// An update folds sources in, so a page that gets shorter has usually lost
+/// something; the slack is for rewording, not for condensing.
+const MIN_KEPT: f64 = 0.95;
 /// Wiki roots with a compile running. Only one process opens a store (the
 /// engine holds a lock for it), so an in-process set excludes every other
 /// run on the same wiki, atomically and for as long as the run takes.
@@ -49,6 +51,9 @@ pub struct PageRequest<'a> {
     /// The page to update; `None` asks for a new page the writer names.
     pub page: Option<&'a WikiPage>,
     pub sources: &'a [Source],
+    /// Why the writer's previous draft of this page was refused, when this
+    /// is its one retry.
+    pub feedback: Option<&'a str>,
 }
 
 /// A page as the writer returns it: the whole new text.
@@ -184,15 +189,10 @@ fn write_batch(
     for group in groups {
         let mut page = group.page.map(|i| pages[i].clone());
         for chunk in chunks(&group.sources, sources) {
-            let request = PageRequest {
-                schema: &schema,
-                page: page.as_ref(),
-                sources: &chunk,
-            };
             // No store handle is held here: this is the slow step.
-            let draft = match writer.write_page(&request) {
+            let draft = match draft_page(writer, &schema, page.as_ref(), &chunk, options) {
                 Ok(draft) => draft,
-                Err(e) => return Ok(Err(format!("the writer failed: {e}"))),
+                Err(why) => return Ok(Err(why)),
             };
             let store = db.store();
             if let Err(why) = save_draft(wiki, &store, page.as_ref(), &draft, chunk.len(), options)?
@@ -204,6 +204,35 @@ fn write_batch(
         }
     }
     Ok(Ok(titles))
+}
+
+/// One page's draft, guarded. A draft the guards refuse goes back to the
+/// writer once with the reason, since a model that dropped a fact usually
+/// restores it when told which; a second refusal stops the batch.
+fn draft_page(
+    writer: &dyn WikiWriter,
+    schema: &str,
+    page: Option<&WikiPage>,
+    sources: &[Source],
+    options: &AutoOptions,
+) -> Result<PageDraft, String> {
+    let mut feedback: Option<String> = None;
+    loop {
+        let request = PageRequest {
+            schema,
+            page,
+            sources,
+            feedback: feedback.as_deref(),
+        };
+        let draft = writer
+            .write_page(&request)
+            .map_err(|e| format!("the writer failed: {e}"))?;
+        match check_draft(page, &draft, options.allow_shrink) {
+            Ok(()) => return Ok(draft),
+            Err(why) if feedback.is_none() => feedback = Some(why),
+            Err(why) => return Err(why),
+        }
+    }
 }
 
 /// Mark `batch` integrated, unless a source changed while its pages were
@@ -417,7 +446,9 @@ fn chunks(members: &[usize], sources: &[Source]) -> Vec<Vec<Source>> {
 
 /// Refuse a draft that would lose what a page held: an empty page, a renamed
 /// page, or, unless allowed, a page cut below [`MIN_KEPT`] of its length or
-/// missing one of its `[[links]]`.
+/// missing one of its `[[links]]`, headings or backticked spans. The spans
+/// are the page's citations, paths, commands and names: the facts a
+/// rewrite most often drops while the prose still reads well.
 pub fn check_draft(
     page: Option<&WikiPage>,
     draft: &PageDraft,
@@ -456,7 +487,43 @@ pub fn check_draft(
             page.title
         ));
     }
+    let kept_headings: BTreeSet<&str> = headings(&draft.content).collect();
+    if let Some(heading) = headings(&page.content).find(|h| !kept_headings.contains(h)) {
+        return Err(format!(
+            "the rewrite of [[{}]] drops the heading {heading:?}",
+            page.title
+        ));
+    }
+    if let Some(span) =
+        code_spans(&page.content).find(|span| !draft.content.contains(span.as_str()))
+    {
+        return Err(format!("the rewrite of [[{}]] drops {span}", page.title));
+    }
     Ok(())
+}
+
+/// The text of every Markdown heading line in `text`.
+fn headings(text: &str) -> impl Iterator<Item = &str> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with('#'))
+        .map(|line| line.trim_start_matches('#').trim())
+        .filter(|heading| !heading.is_empty())
+}
+
+/// Every single-line `` `...` `` span in `text`, backticks included.
+fn code_spans(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.lines().flat_map(|line| {
+        let parts: Vec<&str> = line.split('`').collect();
+        // Odd parts sit between two ticks, unless the last tick is unpaired.
+        let closed = parts.len().saturating_sub(1) / 2 * 2;
+        (1..closed)
+            .step_by(2)
+            .map(|i| parts[i])
+            .filter(|inner| !inner.is_empty())
+            .map(|inner| format!("`{inner}`"))
+            .collect::<Vec<_>>()
+    })
 }
 
 /// Every `[[...]]` in `text`, as written.
@@ -574,6 +641,46 @@ mod tests {
             .unwrap_err()
             .contains("[[Clippy]]"));
         assert!(check_draft(Some(&old), &draft("Rust", "Rust."), true).is_ok());
+    }
+
+    #[test]
+    fn a_rewrite_may_not_drop_a_heading_or_a_backticked_fact() {
+        let old = page(
+            "Skill",
+            "# Skill\n\n## Built\nRuns `scripts/setup.sh` on port `9001` (`mem_a`).",
+        );
+        let reworded = "# Skill\n\n## Built\nIt runs `scripts/setup.sh`, on port `9001` (`mem_a`).";
+        assert!(check_draft(Some(&old), &draft("Skill", reworded), false).is_ok());
+
+        let no_heading = "# Skill\n\n## Done\nRuns `scripts/setup.sh` on port `9001` (`mem_a`).";
+        assert!(check_draft(Some(&old), &draft("Skill", no_heading), false)
+            .unwrap_err()
+            .contains("\"Built\""));
+
+        let no_port = "# Skill\n\n## Built\nRuns `scripts/setup.sh` on its own port (`mem_a`).";
+        assert!(check_draft(Some(&old), &draft("Skill", no_port), false)
+            .unwrap_err()
+            .contains("`9001`"));
+        assert!(check_draft(Some(&old), &draft("Skill", no_port), true).is_ok());
+    }
+
+    #[test]
+    fn a_rewrite_may_not_get_a_tenth_shorter() {
+        // The 2026-11-06 rewrite that lost three facts kept 90% of the page.
+        let old = page("Rust", &"word ".repeat(100));
+        let ninety = "word ".repeat(90);
+        assert!(check_draft(Some(&old), &draft("Rust", &ninety), false)
+            .unwrap_err()
+            .contains("keeps 90%"));
+        let ninety_six = "word ".repeat(96);
+        assert!(check_draft(Some(&old), &draft("Rust", &ninety_six), false).is_ok());
+    }
+
+    #[test]
+    fn code_spans_and_headings_are_read_per_line() {
+        let text = "## A\n`x` and `y`\nan odd ` tick\n#\n`` empty";
+        assert_eq!(code_spans(text).collect::<Vec<_>>(), ["`x`", "`y`"]);
+        assert_eq!(headings(text).collect::<Vec<_>>(), ["A"]);
     }
 
     #[test]
