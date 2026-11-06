@@ -158,7 +158,13 @@ function useWikiStore() {
     return data.error ? "" : (data.schema || "");
   }, []);
 
-  useEffect(() => { refresh(); }, [refresh]);
+  // Pages and the pending count are written from Claude sessions too, so the
+  // list re-reads when the tab regains focus rather than only on load.
+  useEffect(() => {
+    refresh();
+    window.addEventListener("focus", refresh);
+    return () => window.removeEventListener("focus", refresh);
+  }, [refresh]);
 
   return { pages, status, current, setCurrent, loading, refresh, openPage, search, write, remove, compile, readSchema };
 }
