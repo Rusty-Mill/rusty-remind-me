@@ -484,3 +484,87 @@ function ImportForm({onComplete, onCancel}) {
     )
   );
 }
+
+// The dashboard's remind_me_wiki_compile with auto=true: the server's own
+// local model writes the pages and marks each batch (card #747). A batch
+// takes minutes, so the server runs it on its own thread and this panel
+// starts it, then polls "/wiki/compile/auto" until it finishes. Closing the
+// dialog does not stop a run; reopening it picks the run up again.
+const AUTO_POLL_MS = 5000;
+
+function elapsed(fromMs, toMs) {
+  const s = Math.max(0, Math.round(((toMs || Date.now()) - fromMs) / 1000));
+  return Math.floor(s / 60) + "m " + String(s % 60).padStart(2, "0") + "s";
+}
+
+function WikiAutoCompile({onFinished}) {
+  const [status, setStatus] = useState(null);
+  const [batches, setBatches] = useState(1);
+  const [error, setError] = useState(null);
+  const [, setTick] = useState(0);
+  const wasRunning = useRef(false);
+
+  const load = useCallback(async () => {
+    try {
+      const s = await api("/wiki/compile/auto");
+      if (s.error) { setError(s.error); return; }
+      if (wasRunning.current && !s.running) onFinished();
+      wasRunning.current = s.running;
+      setStatus(s);
+    } catch (e) { setError("Request failed: " + e.message); }
+  }, [onFinished]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const running = !!(status && status.running);
+  useEffect(() => {
+    if (!running) return undefined;
+    const poll = setInterval(() => { load(); setTick(t => t + 1); }, AUTO_POLL_MS);
+    return () => clearInterval(poll);
+  }, [running, load]);
+
+  const start = async () => {
+    setError(null);
+    try {
+      const s = await api("/wiki/compile/auto", { method: "POST", body: { max_batches: batches } });
+      const next = s.status || s; // a 409 carries the run already going
+      if (s.error && !s.status) { setError(s.error); return; }
+      wasRunning.current = !!next.running;
+      setStatus(next);
+    } catch (e) { setError("Request failed: " + e.message); }
+  };
+
+  const box = (color, subtle) => ({padding:"10px 14px",borderRadius:6,background:subtle,border:"1px solid "+color+"40",color,fontSize:13,fontFamily:mono,lineHeight:1.5});
+  const report = status && !status.running && status.report;
+
+  return React.createElement("div", {style:{display:"flex",flexDirection:"column",gap:12,borderTop:"1px solid "+theme.border,paddingTop:16,marginTop:4}},
+    React.createElement("div",{style:{fontSize:13,fontFamily:sans,color:theme.textSecondary,lineHeight:1.6}},
+      React.createElement("b",{style:{color:theme.text}},"Or let the local model write them. "),
+      "The server's model writes the pages and marks each batch itself. A batch takes several minutes; a rewrite that would lose part of a page stops the run and leaves its batch pending."
+    ),
+    error && React.createElement("div",{style:box(theme.danger,theme.dangerSubtle)}, error),
+    running && React.createElement("div",{style:{...box(theme.accent,theme.accentSubtle),display:"flex",alignItems:"center",gap:8}},
+      React.createElement(Icons.Loader),
+      "Compiling with the local model — "+status.max_batches+" batch"+(status.max_batches===1?"":"es")+" asked, running "+elapsed(status.started_ms)+"."
+    ),
+    status && !status.running && status.error && React.createElement("div",{style:box(theme.danger,theme.dangerSubtle)},
+      "The last run could not compile: "+status.error
+    ),
+    report && React.createElement("div",{style:box(report.stopped?theme.warning:theme.success, report.stopped?theme.warningSubtle:theme.successSubtle)},
+      (report.stopped ? "Stopped: "+report.stopped+". " : "✓ ")+
+      "Compiled "+report.batches+" batch"+(report.batches===1?"":"es")+", "+report.sources_integrated+" source"+(report.sources_integrated===1?"":"s")+
+      (report.pages_written.length ? " into "+Array.from(new Set(report.pages_written)).join(", ") : "")+
+      " in "+elapsed(status.started_ms, status.finished_ms)+". "+report.pending+" still pending."
+    ),
+    React.createElement("div",{style:{display:"flex",gap:8,justifyContent:"flex-end",alignItems:"center",flexWrap:"wrap"}},
+      React.createElement("label",{style:{fontSize:12,fontFamily:mono,color:theme.textSecondary,display:"flex",alignItems:"center",gap:6}},"Batches",
+        React.createElement("input",{type:"number",min:1,max:20,value:batches,disabled:running,
+          onChange:e=>setBatches(Math.min(20,Math.max(1,parseInt(e.target.value,10)||1))),
+          style:{width:56,padding:"6px 8px",borderRadius:6,border:"1px solid "+theme.border,background:theme.bg,color:theme.text,fontSize:13,fontFamily:mono}})
+      ),
+      React.createElement("button",{onClick:start,disabled:running||!status,
+        style:{display:"flex",alignItems:"center",gap:6,padding:"8px 16px",borderRadius:6,border:"none",background:running?theme.surfaceActive:theme.accent,color:running?theme.textMuted:"#fff",fontSize:13,fontWeight:600,fontFamily:mono,cursor:running?"wait":"pointer"}},
+        running ? React.createElement(Icons.Loader) : React.createElement(Icons.Play), " Run with local model")
+    )
+  );
+}

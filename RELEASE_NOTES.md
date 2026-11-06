@@ -2,6 +2,15 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-06 — Run the local-model wiki compile from the dashboard
+
+### Added
+- The Compile the Wiki dialog has a "Run with local model" control: choose 1 to 20 batches and the server's configured model (`REMIND_ME_WIKI_LLM_URL`, `_MODEL`) writes the pages and marks each batch, as `wiki-compile --auto` does. The dialog shows the run while it goes and what it compiled when it ends, then reloads the brief and the page list. Closing the dialog does not stop a run.
+- `POST /api/wiki/compile/auto` (`{"max_batches": 1..20}`, default 1) starts a run on its own thread and answers 202 at once, or 409 while one runs. `GET` on the same path reports the current or last run: `running`, `max_batches`, `started_ms`, `finished_ms`, and its `report` or `error`. A run that panics is reported as an error rather than left running.
+
+### Tests
+- `wiki_auto_compile_test`: a start answers at once, refuses a second, lets other routes answer meanwhile and reports when done; a run that cannot start reports why and frees the slot; a panicking run does not stay running; `max_batches` bounds; the key and method checks. `dashboard_test`: the page starts runs on a real route.
+
 ## 2026-11-06 — Stricter guards on automatic wiki rewrites
 
 ### Changed

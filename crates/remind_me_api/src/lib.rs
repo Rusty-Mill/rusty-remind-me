@@ -56,8 +56,11 @@
 //! connections would not finish faster; they would only move the queue from
 //! the kernel's accept backlog into this process.
 
+mod auto_compile;
 mod http;
 mod routes;
+
+pub use auto_compile::{AutoCompile, Compiler, RunStatus, Started};
 
 use http::{match_pattern, Body};
 use remind_me_core::daemon::settings::digest;
@@ -77,6 +80,32 @@ pub const API_KEY_ENV: &str = "REMIND_ME_API_KEY";
 
 const MUTATING_METHODS: [&str; 4] = ["POST", "PUT", "PATCH", "DELETE"];
 
+/// Where the dashboard starts and watches automatic compiles.
+const AUTO_COMPILE_PATH: &str = "/api/wiki/compile/auto";
+
+/// `max_batches` from a start request: 1 when absent, 1 to
+/// [`auto_compile::MAX_BATCHES`] otherwise.
+fn auto_batches(request: &http::Request) -> Result<usize, String> {
+    if request.body.is_empty() {
+        return Ok(1);
+    }
+    let body: serde_json::Value =
+        serde_json::from_slice(&request.body).map_err(|e| format!("Invalid JSON body: {e}"))?;
+    match body.get("max_batches") {
+        None | Some(serde_json::Value::Null) => Ok(1),
+        Some(value) => value
+            .as_u64()
+            .map(|n| n as usize)
+            .filter(|n| (1..=auto_compile::MAX_BATCHES).contains(n))
+            .ok_or_else(|| {
+                format!(
+                    "'max_batches' must be a number from 1 to {}",
+                    auto_compile::MAX_BATCHES
+                )
+            }),
+    }
+}
+
 /// Per-read and per-write deadline on a client connection.
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -87,6 +116,8 @@ pub struct ApiServer {
     /// settings fingerprint carries it, so a key that arrives from a
     /// relaying unit is checked the same way as this process's own.
     api_key_digest: Option<String>,
+    /// The dashboard's automatic compile runs (`/api/wiki/compile/auto`).
+    auto: AutoCompile,
 }
 
 impl ApiServer {
@@ -110,7 +141,15 @@ impl ApiServer {
             db,
             wiki,
             api_key_digest: resolve_api_key().map(|key| digest(&key)),
+            auto: AutoCompile::configured(),
         }
+    }
+
+    /// Run automatic compiles with `compiler` instead of the configured
+    /// model — tests have no model to call.
+    pub fn with_auto_compiler(mut self, compiler: Arc<Compiler>) -> Self {
+        self.auto = AutoCompile::new(compiler);
+        self
     }
 
     /// Override the resolved key — tests need a deterministic key rather
@@ -214,8 +253,46 @@ impl ApiServer {
             }
         }
 
-        let (status, body) = self.dispatch(&request);
+        let (status, body) = if request.path == AUTO_COMPILE_PATH {
+            self.auto_compile(&request)
+        } else {
+            self.dispatch(&request)
+        };
         http::write_response_cors(stream, status, body, cors)
+    }
+
+    /// `GET` reports the current or last automatic compile; `POST` starts
+    /// one (`{"max_batches": 1..=20}`, default 1) and answers 202 at once,
+    /// or 409 while one runs. Outside [`ROUTES`] because it needs the
+    /// database itself, not a store handle: see [`auto_compile`].
+    fn auto_compile(&self, request: &http::Request) -> (u16, Body) {
+        match request.method.as_str() {
+            "GET" => (200, Body::Json(json!(self.auto.status()))),
+            "POST" => {
+                let max_batches = match auto_batches(request) {
+                    Ok(n) => n,
+                    Err(why) => return (400, Body::Json(json!({ "error": why }))),
+                };
+                let options = remind_me_core::wiki_compile::AutoOptions {
+                    max_batches,
+                    ..Default::default()
+                };
+                match self
+                    .auto
+                    .start(Arc::clone(&self.db), self.wiki.clone(), options)
+                {
+                    Started::Now(status) => (202, Body::Json(json!(status))),
+                    Started::Busy(status) => (
+                        409,
+                        Body::Json(json!({
+                            "error": "a compile is already running",
+                            "status": status,
+                        })),
+                    ),
+                }
+            }
+            _ => (405, Body::Json(json!({ "error": "Method Not Allowed" }))),
+        }
     }
 
     fn dispatch(&self, request: &http::Request) -> (u16, Body) {

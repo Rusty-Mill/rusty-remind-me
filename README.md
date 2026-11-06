@@ -620,6 +620,10 @@ rusty-remind-me wiki-compile --auto                  # up to 5 batches
 rusty-remind-me wiki-compile --auto --max-batches 1 --allow-shrink
 ```
 
+The dashboard's Compile the Wiki dialog starts the same run ("Run with local
+model", 1 to 20 batches) through `POST /api/wiki/compile/auto`, and shows it
+until it ends; `GET` on that path reports the current or last run.
+
 Each batch is marked integrated only after all its pages are written. A model
 error, a rewrite that keeps under 95% of a page or drops one of its `[[links]]`,
 headings or `backticked` details (unless `--allow-shrink`; a refused draft is
