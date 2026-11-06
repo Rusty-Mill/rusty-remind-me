@@ -202,6 +202,10 @@ function WikiCompilePanel({onCompile, onClose}) {
   const [copied, setCopied] = useState(false);
   const [confirmIntegrate, setConfirmIntegrate] = useState(false);
 
+  // What the last mark did, kept apart from `outcome` so the dialog can show
+  // it above the brief that replaces the marked one.
+  const [notice, setNotice] = useState(null);
+
   const run = useCallback(async (markIntegrated, through) => {
     setBusy(true); setError(null);
     let result;
@@ -209,11 +213,24 @@ function WikiCompilePanel({onCompile, onClose}) {
     catch (e) { setBusy(false); setError("Request failed: " + e.message); return; }
     setBusy(false);
     if (result && result.error) { setError(result.error); return; }
-    setOutcome(result);
     setConfirmIntegrate(false);
+    if (!markIntegrated) { setOutcome(result); return; }
+    // A mark never leaves its own brief on screen: report what it did, then
+    // show whatever is pending now.
+    setNotice(result);
+    await run(false);
   }, [onCompile]);
 
-  useEffect(() => { run(false); }, [run]);
+  const reload = useCallback(() => { setNotice(null); run(false); }, [run]);
+
+  // The store moves without this dialog: a batch marked from a Claude session
+  // or another tab must not linger here as the current brief.
+  useEffect(() => {
+    run(false);
+    const onFocus = () => run(false);
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [run]);
 
   const copy = () => {
     navigator.clipboard.writeText(outcome.brief);
@@ -229,18 +246,22 @@ function WikiCompilePanel({onCompile, onClose}) {
   return React.createElement("div", {style:{display:"flex",flexDirection:"column",gap:16}},
     error && React.createElement("div",{style:{padding:"10px 14px",borderRadius:6,background:theme.dangerSubtle,border:"1px solid "+theme.danger+"40",color:theme.danger,fontSize:13,fontFamily:mono}}, error),
 
-    outcome && outcome.status === "noop" && React.createElement("div",{style:{fontSize:13,fontFamily:sans,color:theme.textSecondary,lineHeight:1.6}},
-      "Nothing pending — every raw memory is already integrated into the wiki."
+    notice && notice.status === "integrated" && React.createElement("div",{style:{padding:"10px 14px",borderRadius:6,background:theme.successSubtle,border:"1px solid "+theme.success+"40",color:theme.success,fontSize:13,fontFamily:mono,lineHeight:1.5}},
+      "✓ Marked "+notice.sources_marked+" source"+(notice.sources_marked===1?"":"s")+" integrated. The watermark moved to "+watermarkTime(notice.watermark)+"."
     ),
 
-    outcome && outcome.status === "integrated" && React.createElement("div",{style:{padding:"10px 14px",borderRadius:6,background:theme.successSubtle,border:"1px solid "+theme.success+"40",color:theme.success,fontSize:13,fontFamily:mono,lineHeight:1.5}},
-      "✓ Marked "+outcome.sources_marked+" source"+(outcome.sources_marked===1?"":"s")+" integrated. The watermark moved to "+watermarkTime(outcome.watermark)+"."
+    notice && notice.status === "noop" && React.createElement("div",{style:{padding:"10px 14px",borderRadius:6,background:theme.warningSubtle,border:"1px solid "+theme.warning+"40",color:theme.warning,fontSize:13,fontFamily:mono,lineHeight:1.5}},
+      "Nothing marked: that batch was already integrated elsewhere ("+notice.reason+"). Showing what is pending now."
+    ),
+
+    outcome && outcome.status === "noop" && React.createElement("div",{style:{fontSize:13,fontFamily:sans,color:theme.textSecondary,lineHeight:1.6}},
+      "Nothing pending — every raw memory is already integrated into the wiki."
     ),
 
     outcome && outcome.status === "brief" && React.createElement(React.Fragment,null,
       React.createElement("div",{style:{fontSize:13,fontFamily:sans,color:theme.textSecondary,lineHeight:1.6}},
         React.createElement("b",{style:{color:theme.text}}, outcome.pending+" raw "+(outcome.pending===1?"memory":"memories")),
-        " to synthesise. The brief below is written for Claude, not for this page — copy it into a session, let it write the pages with ",
+        (outcome.watermark ? " since "+watermarkTime(outcome.watermark) : "")+" to synthesise. The brief below is written for Claude, not for this page — copy it into a session, let it write the pages with ",
         React.createElement("code",{style:{fontFamily:mono,fontSize:12,color:theme.text}},"remind_me_wiki_write"),
         " (or write them here yourself), then come back and mark the batch integrated."
       ),
@@ -252,6 +273,7 @@ function WikiCompilePanel({onCompile, onClose}) {
 
     React.createElement("div", {style:{display:"flex",gap:8,justifyContent:"flex-end",flexWrap:"wrap",marginTop:8}},
       React.createElement("button",{onClick:onClose,style:{padding:"8px 16px",borderRadius:6,border:"1px solid "+theme.border,background:"transparent",color:theme.textSecondary,fontSize:13,fontFamily:mono,cursor:"pointer"}},"Close"),
+      React.createElement("button",{onClick:reload,disabled:busy,style:{padding:"8px 16px",borderRadius:6,border:"1px solid "+theme.border,background:"transparent",color:theme.textSecondary,fontSize:13,fontFamily:mono,cursor:busy?"wait":"pointer"}},"Refresh"),
       outcome && outcome.status === "brief" && React.createElement("button",{onClick:copy,style:{display:"flex",alignItems:"center",gap:6,padding:"8px 16px",borderRadius:6,border:"1px solid "+theme.border,background:"transparent",color:theme.textSecondary,fontSize:13,fontFamily:mono,cursor:"pointer"}},
         copied ? React.createElement(Icons.Check) : React.createElement(Icons.Copy), copied ? "Copied" : "Copy brief"),
       outcome && outcome.status === "brief" && React.createElement("button",{onClick:()=>confirmIntegrate?run(true,outcome.through):setConfirmIntegrate(true),disabled:busy,
