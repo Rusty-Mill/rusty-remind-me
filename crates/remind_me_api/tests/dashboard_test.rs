@@ -4,7 +4,9 @@
 //! `allow_methods=["*"]`, `allow_headers=["*"]`) rather than assumed.
 
 mod common;
-use common::{authed_json, authed_server, call, call_full, call_with_origin, get, server, KEY};
+use common::{
+    authed_get, authed_json, authed_server, call, call_full, call_with_origin, get, server, KEY,
+};
 
 #[test]
 fn the_dashboard_route_serves_html_embedding_the_vendored_jsx() {
@@ -153,6 +155,16 @@ fn every_wiki_write_endpoint_the_dashboard_calls_is_a_real_route() {
         page.contains("mark_integrated: true, through"),
         "the dashboard marks without the brief's `through`"
     );
+
+    // The local-model run: started and watched on its own path, which only
+    // its handler answers with a run status (card #747 follow-up).
+    assert!(
+        page.contains("\"/wiki/compile/auto\""),
+        "the dashboard no longer starts local-model runs"
+    );
+    let run = authed_get(&server, "/api/wiki/compile/auto");
+    assert_eq!(run.status, 200);
+    assert_eq!(run.json()["running"], false);
 
     // POST /api/wiki reaches the write handler: only that handler answers 400
     // naming the missing field. An absent route would be 405.

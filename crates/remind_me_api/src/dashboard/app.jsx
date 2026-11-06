@@ -39,6 +39,8 @@ function App() {
   const [wikiEdit, setWikiEdit] = useState(null);
   const [wikiDeleteConfirm, setWikiDeleteConfirm] = useState(null);
   const [showCompile, setShowCompile] = useState(false);
+  // Bumped when a local-model run finishes, so the brief above it reloads.
+  const [compileRuns, setCompileRuns] = useState(0);
   const searchRef = useRef(null);
   const debounceRef = useRef(null);
   const wikiDebounceRef = useRef(null);
@@ -90,6 +92,7 @@ function App() {
     if (outcome.outcome === "set" || outcome.outcome === "cleared") store.refresh();
     return outcome;
   };
+  const handleAutoCompiled = useCallback(() => { wikiStore.refresh(); setCompileRuns(n => n + 1); }, [wikiStore.refresh]);
   const handleWikiWrite = async (title, content, logNote) => wikiStore.write(title, content, logNote);
   const handleWikiDelete = async slug => {
     await wikiStore.remove(slug);
@@ -617,7 +620,8 @@ function App() {
       wikiEdit && React.createElement(WikiPageForm,{initial:wikiEdit.page,onSubmit:handleWikiWrite,onLoadSchema:wikiStore.readSchema,onCancel:()=>setWikiEdit(null)})
     ),
     React.createElement(Modal,{open:showCompile,onClose:()=>setShowCompile(false),title:"Compile the Wiki",width:720},
-      showCompile && React.createElement(WikiCompilePanel,{onCompile:wikiStore.compile,onClose:()=>setShowCompile(false)})
+      showCompile && React.createElement(WikiCompilePanel,{key:compileRuns,onCompile:wikiStore.compile,onClose:()=>setShowCompile(false)}),
+      showCompile && React.createElement(WikiAutoCompile,{onFinished:handleAutoCompiled})
     ),
     React.createElement(Modal,{open:!!wikiDeleteConfirm,onClose:()=>setWikiDeleteConfirm(null),title:"Delete Wiki Page",width:420},
       wikiDeleteConfirm && React.createElement(React.Fragment,null,
