@@ -2,6 +2,15 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-06 — The dashboard's wiki view follows the store (card #761)
+
+### Fixed
+- The Compile the Wiki dialog no longer keeps showing a batch that was marked integrated elsewhere (a Claude session, another tab). It reloads the pending brief when the tab regains focus and has a Refresh button. After a mark it shows the next pending brief. A mark the server declines now says "already integrated elsewhere" instead of "Nothing pending". The brief names the watermark it starts from.
+- The wiki page list and the "not yet compiled" count reload when the tab regains focus, so pages written from a Claude session appear without a page reload.
+
+### Tests
+- `dashboard_test`: the served page carries the focus reload, the Refresh button, the brief's starting watermark and the declined-mark message.
+
 ## 2026-11-05 — The wiki can compile itself with a local model (card #747)
 
 ### Added
