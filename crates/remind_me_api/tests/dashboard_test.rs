@@ -166,6 +166,21 @@ fn every_wiki_write_endpoint_the_dashboard_calls_is_a_real_route() {
     assert_eq!(run.status, 200);
     assert_eq!(run.json()["running"], false);
 
+    // The compile dialog follows the store, not the moment it opened: a batch
+    // marked elsewhere (MCP, another tab) must not linger as the current
+    // brief, and a mark the server declines is reported as such rather than
+    // as "nothing pending" (card #761).
+    for literal in [
+        "addEventListener(\"focus\"",
+        "\"Refresh\"",
+        "outcome.watermark",
+        "already integrated elsewhere",
+        // The page list and pending count follow the store the same way.
+        "window.addEventListener(\"focus\", refresh)",
+    ] {
+        assert!(page.contains(literal), "the compile dialog lost {literal}");
+    }
+
     // POST /api/wiki reaches the write handler: only that handler answers 400
     // naming the missing field. An absent route would be 405.
     let write = authed_json(&server, "POST", "/api/wiki", "{}");
