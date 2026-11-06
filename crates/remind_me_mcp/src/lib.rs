@@ -1516,7 +1516,7 @@ impl McpServer {
                                         "through": { "type": "string", "description": "With mark_integrated=true: the `through` a brief returned. Marks exactly that brief's sources. Without it the batch is recomputed, which an edit in between can change." },
                                         "auto": { "type": "boolean", "default": false, "description": "Have the configured local model write the pages. Ignores limit, mark_integrated and through." },
                                         "max_batches": { "type": "integer", "default": 1, "minimum": 1, "maximum": 20, "description": "With auto=true: batches to compile before returning." },
-                                        "allow_shrink": { "type": "boolean", "default": false, "description": "With auto=true: accept a rewrite that shortens a page below 60% or drops one of its [[links]]." }
+                                        "allow_shrink": { "type": "boolean", "default": false, "description": "With auto=true: accept a rewrite that shortens a page below 95% or drops one of its [[links]], headings or `backticked` details." }
                                     }
                                 }
                             },

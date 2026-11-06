@@ -42,7 +42,10 @@ enough to write a page from a dozen memories without anyone in the loop
    written before the failure stay written; the next run rewrites them.
 5. **Guards against losing what a page held.** A draft is refused when it
    is empty, renames the page, or, unless `allow_shrink`, keeps less than
-   60% of the page's text or drops one of its `[[links]]`. A new-page
+   95% of the page's text or drops one of its `[[links]]`, headings or
+   `backticked` spans (raised from 60% and links only on 2026-11-06, after
+   a rewrite kept 90% of a page and lost three facts). A refused draft goes
+   back to the model once with the reason before the run stops. A new-page
    draft that names an existing page is checked as a rewrite of it. Every
    source id must appear in the saved text of some page the batch wrote,
    checked under the same store handle that marks the batch, so neither a

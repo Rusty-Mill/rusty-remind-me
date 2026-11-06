@@ -34,7 +34,8 @@ const INSTRUCTIONS: &str = "You maintain one page of a personal wiki, following 
 Reply with only a JSON object: {\"title\": \"...\", \"content\": \"...\"}. \
 `content` is the whole page in Markdown. Fold every source into it and cite each one by its id \
 in backticks, for example (`mem_123`). When updating a page, keep its title, keep everything it \
-says unless a source corrects it, and keep every [[link]] it has.";
+says unless a source corrects it, and keep every heading, [[link]] and `backticked` detail it \
+has. Add to the page; do not condense it.";
 
 /// Writes pages through a chat-completions endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,6 +154,12 @@ fn prompt(request: &PageRequest<'_>) -> String {
         ),
         None => "Write a new page with a short, specific title.\n\n".to_string(),
     };
+    if let Some(why) = request.feedback {
+        text.push_str(&format!(
+            "Your last draft of this page was refused: {why}. Write it again, keeping \
+             every heading, [[link]] and `backticked` detail the page already has.\n\n"
+        ));
+    }
     text.push_str("Sources:\n");
     for source in request.sources {
         text.push_str(&format!(
@@ -360,6 +367,7 @@ mod tests {
             schema: "",
             page: None,
             sources: &[],
+            feedback: None,
         });
 
         assert!(got.unwrap_err().contains("reading from"));
@@ -386,6 +394,7 @@ mod tests {
                 schema: "SCHEMA",
                 page: None,
                 sources: &sources,
+                feedback: Some("it dropped `9001`"),
             })
             .unwrap();
         assert_eq!(draft.title, "Rust");
@@ -394,5 +403,6 @@ mod tests {
         assert!(sent.contains("\"model\":\"qwen\""));
         assert!(sent.contains("`mem_1`"));
         assert!(sent.contains("SCHEMA"));
+        assert!(sent.contains("was refused: it dropped `9001`"));
     }
 }

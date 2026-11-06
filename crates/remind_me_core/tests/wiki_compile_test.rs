@@ -320,11 +320,12 @@ fn a_second_run_on_the_same_wiki_stops_before_the_model_is_called() {
     // The first run carried on and finished; its claim was released after.
     assert_eq!((report.batches, report.pending), (1, 0));
     remember(&db.store(), &[("mem_b", "Rust has traits")]);
+    // With topics the source joins the page rather than replacing it.
     let again = run(
         &w,
         &db,
         &Scribe::new(Fault::None),
-        None,
+        Some(&Topics),
         &AutoOptions::default(),
     )
     .unwrap();
@@ -336,7 +337,9 @@ fn a_second_run_on_the_same_wiki_stops_before_the_model_is_called() {
 fn a_citation_dropped_by_a_later_chunk_keeps_the_batch_pending() {
     // Two 7,000-character sources exceed one call's budget, so one new page
     // is written in two calls. The second keeps the page's length and links
-    // but drops `mem_a`'s citation: the draft that cited it no longer exists.
+    // but drops `mem_a`'s citation. The guard refuses that draft, the retry
+    // drops it again, and the batch stays pending with the page as the first
+    // call left it.
     let db = Database::open_in_memory().unwrap();
     let (w, root) = wiki("dropped-citation");
     let long_a = format!("Rust {}", "a".repeat(7_000));
@@ -346,8 +349,8 @@ fn a_citation_dropped_by_a_later_chunk_keeps_the_batch_pending() {
 
     let report = run(&w, &db, &scribe, None, &AutoOptions::default()).unwrap();
 
-    assert_eq!(scribe.calls.borrow().len(), 2);
-    assert!(report.stopped.unwrap().contains("`mem_a`"));
+    assert_eq!(scribe.calls.borrow().len(), 3);
+    assert!(report.stopped.unwrap().contains("drops `mem_a`"));
     assert_eq!((report.batches, report.pending), (0, 2));
     std::fs::remove_dir_all(&root).unwrap();
 }
@@ -507,5 +510,61 @@ fn a_source_edited_while_the_model_writes_stays_pending() {
 
     assert!(report.stopped.unwrap().contains("`mem_a` was edited"));
     assert_eq!((report.batches, report.pending), (0, 1));
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// Drops the page's existing citations on its first draft, and keeps them
+/// once told why that draft was refused.
+struct Forgetful {
+    feedback: RefCell<Vec<Option<String>>>,
+}
+
+impl WikiWriter for Forgetful {
+    fn write_page(&self, request: &PageRequest<'_>) -> Result<PageDraft, String> {
+        self.feedback
+            .borrow_mut()
+            .push(request.feedback.map(str::to_string));
+        let page = request.page.expect("an update");
+        let mut content = match request.feedback {
+            None => page.content.replace("`9001`", "its port"),
+            Some(_) => page.content.clone(),
+        };
+        for source in request.sources {
+            content.push_str(&format!("\n{} (`{}`)", source.content, source.id));
+        }
+        Ok(PageDraft {
+            title: page.title.clone(),
+            content,
+        })
+    }
+}
+
+#[test]
+fn a_refused_draft_is_retried_once_with_the_reason() {
+    let db = Database::open_in_memory().unwrap();
+    let (w, root) = wiki("retry-with-reason");
+    let original = "# Rust\n\nThe rust bridge listens on `9001`, a fact worth keeping.";
+    w.write_page(&db.store(), "Rust", original, None)
+        .unwrap()
+        .unwrap();
+    remember(&db.store(), &[("mem_a", "rust has ownership")]);
+    let writer = Forgetful {
+        feedback: RefCell::new(Vec::new()),
+    };
+
+    let report = run(&w, &db, &writer, Some(&Topics), &AutoOptions::default()).unwrap();
+
+    assert_eq!(
+        (report.batches, report.pending),
+        (1, 0),
+        "{:?}",
+        report.stopped
+    );
+    let feedback = writer.feedback.borrow();
+    assert_eq!(feedback.len(), 2);
+    assert_eq!(feedback[0], None);
+    assert!(feedback[1].as_deref().unwrap().contains("drops `9001`"));
+    let saved = w.read_page(&db.store(), "Rust").unwrap().unwrap().content;
+    assert!(saved.contains("`9001`") && saved.contains("`mem_a`"));
     std::fs::remove_dir_all(&root).unwrap();
 }

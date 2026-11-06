@@ -625,8 +625,9 @@ model", 1 to 20 batches) through `POST /api/wiki/compile/auto`, and shows it
 until it ends; `GET` on that path reports the current or last run.
 
 Each batch is marked integrated only after all its pages are written. A model
-error, a rewrite that keeps under 60% of a page or drops one of its `[[links]]`
-(unless `--allow-shrink`), a renamed page, or a memory no page cites stops the
+error, a rewrite that keeps under 95% of a page or drops one of its `[[links]]`,
+headings or `backticked` details (unless `--allow-shrink`; a refused draft is
+first sent back to the model once with the reason), a renamed page, or a memory no page cites stops the
 run and leaves that batch pending; the command exits 1 and says why.
 `REMIND_ME_WIKI_LLM_TIMEOUT_SECS` (default 600) bounds one page,
 `REMIND_ME_WIKI_LLM_MAX_TOKENS` (default 4096) its length, and
