@@ -27,10 +27,11 @@ tokio = { version = "1.0", features = ["full"] }
 # Read-only, in one module: `db::legacy_sqlite` copies an old `memory.db`
 # onto the engine on first open and reads the two foreign-file importers'
 # SQLite databases (ADR-0025). Nothing is stored in SQLite any more.
-# 0.39 rather than the 0.31 this crate used standalone: rusqlite declares
+# 0.41 rather than the 0.31 this crate used standalone: rusqlite declares
 # `links = "sqlite3"`, so Cargo allows one version per graph, and the rest of
-# the rusty_mill workspace is on 0.39.
-rusqlite = { version = "0.39", features = ["bundled"] }
+# the rusty_mill workspace is on 0.41 (0.39 bundled a SQLite hit by
+# RUSTSEC-2026-0459).
+rusqlite = { version = "0.41", features = ["bundled"] }
 chrono = { workspace = true }
 # IANA zones for calendar date phrases ("yesterday", "last week") in the
 # user's own zone, daylight saving included (REMIND_ME_TZ, card #63).
