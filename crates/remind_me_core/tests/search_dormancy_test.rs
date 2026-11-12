@@ -351,3 +351,80 @@ fn every_model_stage_is_off_after_offline() {
     assert!(!remind_me_core::query_expansion::enabled());
     assert!(!remind_me_core::reranker::enabled());
 }
+
+// Millwright R1: decisions and preferences never drop out of default search
+// by age. Five years untouched is far past where either would decay below the
+// floor (a decision at 0.02/day crosses it after about 150 days).
+
+const FIVE_YEARS: i64 = 5 * 365;
+
+#[test]
+fn a_decision_never_ages_out_of_default_search() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    // Stored as Nano's decisions are: category `fact`, memory_type `decision`.
+    let decision = add(&store, "quokka storage stays on SQLite", "fact");
+    testing::set_memory_column(&store, &decision, "memory_type", "decision").unwrap();
+    let fact = add(&store, "quokka fact from long ago", "fact");
+    age_by_days(&store, &decision, FIVE_YEARS);
+    age_by_days(&store, &fact, FIVE_YEARS);
+
+    let found = search(&store, "quokka", false, 0.0);
+    assert_eq!(found, vec![decision], "only the decision survives the age");
+}
+
+#[test]
+fn a_preference_never_ages_out_of_default_search() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let by_category = add(&store, "quokka prefers terse replies", "preference");
+    let by_type = add(&store, "quokka prefers merge commits", "fact");
+    testing::set_memory_column(&store, &by_type, "memory_type", "preference").unwrap();
+    age_by_days(&store, &by_category, FIVE_YEARS);
+    age_by_days(&store, &by_type, FIVE_YEARS);
+
+    let mut found = search(&store, "quokka", false, 0.0);
+    found.sort();
+    let mut expected = vec![by_category, by_type];
+    expected.sort();
+    assert_eq!(found, expected);
+}
+
+#[test]
+fn a_decision_never_ages_out_of_the_semantic_half() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let decision = add_embedded(&store, "wombat burrows stay shallow", "fact");
+    testing::set_memory_column(&store, &decision, "memory_type", "decision").unwrap();
+    age_by_days(&store, &decision, FIVE_YEARS);
+
+    assert_eq!(
+        search_semantic(&store, "quokka", false, 0.0),
+        vec![decision]
+    );
+}
+
+#[test]
+fn a_reverted_decision_ages_out_like_anything_else() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let reverted = add(&store, "quokka storage moves to postgres", "fact");
+    testing::set_memory_column(&store, &reverted, "memory_type", "decision").unwrap();
+    testing::set_memory_column(&store, &reverted, "outcome", "reverted").unwrap();
+    age_by_days(&store, &reverted, FIVE_YEARS);
+
+    assert!(search(&store, "quokka", false, 0.0).is_empty());
+    assert_eq!(search(&store, "quokka", true, 0.0), vec![reverted]);
+}
+
+#[test]
+fn an_explicit_min_vitality_still_applies_to_decisions() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let decision = add(&store, "quokka decision", "fact");
+    testing::set_memory_column(&store, &decision, "memory_type", "decision").unwrap();
+    age_by_days(&store, &decision, FIVE_YEARS);
+
+    // The exemption is from the default floor, not from a caller's own one.
+    assert!(search(&store, "quokka", false, 0.01).is_empty());
+}

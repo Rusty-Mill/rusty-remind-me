@@ -225,7 +225,12 @@ impl MemoryEdit {
 /// Which live, unsuperseded memories a ranked keyword search takes.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct KeywordFilter {
+    /// Leave out dormant memories (effective vitality below
+    /// [`crate::vitality::VITALITY_FLOOR`]), except those
+    /// [`crate::vitality::never_dormant`] keeps.
+    pub hide_dormant: bool,
     /// Only memories whose effective vitality, as of now, is at least this.
+    /// A caller's explicit floor: unlike `hide_dormant`, it exempts no kind.
     pub min_effective_vitality: Option<f64>,
     pub category: Option<String>,
     pub include_sensitive: bool,
@@ -1315,7 +1320,8 @@ mod tests {
             },
             KeywordFilter {
                 scope: Default::default(),
-                min_effective_vitality: Some(crate::vitality::VITALITY_FLOOR),
+                hide_dormant: true,
+                min_effective_vitality: None,
                 category: text("fact"),
                 include_sensitive: true,
                 exclude_raw: true,

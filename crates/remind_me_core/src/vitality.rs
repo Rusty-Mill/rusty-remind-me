@@ -370,6 +370,24 @@ pub fn is_dormant(vitality: f64) -> bool {
     vitality < VITALITY_FLOOR
 }
 
+/// Whether `memory` stays out of the dormancy floor however old it gets.
+///
+/// Decisions and preferences are what a later session most needs and least
+/// often re-reads, so access-driven decay would hide exactly the memories
+/// that stop an agent re-asking a settled question (Millwright R1). They
+/// still decay for *ranking*; only the default floor ignores them. A decision
+/// resolved as reverted or abandoned was demoted on purpose and ages out like
+/// anything else.
+pub fn never_dormant(memory: &Memory) -> bool {
+    let kept = |kind: &str| matches!(kind, "decision" | "preference");
+    let is_kept = memory.memory_type.as_deref().is_some_and(kept) || kept(&memory.category);
+    is_kept
+        && !memory
+            .outcome
+            .as_deref()
+            .is_some_and(crate::resolve::demotes)
+}
+
 /// Vault health snapshot.
 ///
 /// Field names mirror the reference's `build_vitality_report` payload.

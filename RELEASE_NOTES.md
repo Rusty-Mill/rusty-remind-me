@@ -2,6 +2,15 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-12 — Decisions and preferences never go dormant (Millwright R1)
+
+### Changed
+- Default search no longer hides decisions and preferences once they decay below the dormancy floor. A memory counts as one when its `memory_type` or `category` is `decision` or `preference`. They still decay for ranking, so a fresh fact can outrank an old decision, but age alone never drops one from the results. A decision resolved as `reverted` or `abandoned` ages out as before.
+- An explicit `min_vitality` still applies to every memory, decisions included; `include_dormant: true` is unchanged.
+
+### Tests
+- `search_dormancy_test`: five-year-old decisions (by `memory_type`) and preferences (by `memory_type` and by `category`) stay in default search through the keyword and semantic halves while a fact of the same age drops out; a reverted decision ages out; `min_vitality` still filters a decision. The three exemption tests fail without the change.
+
 ## 2026-11-06 — Run the local-model wiki compile from the dashboard
 
 ### Added
