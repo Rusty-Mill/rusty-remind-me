@@ -142,7 +142,7 @@ impl LegacyDb {
     /// a table it names is missing, or the file is not what it claims.
     pub fn query(&self, sql: &str, bindings: &[Value]) -> Result<Vec<Row>> {
         let mut stmt = self.conn.prepare(sql).map_err(legacy_error)?;
-        let names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+        let names: Vec<String> = stmt.column_names().map(|s| s.to_string()).collect();
         let bound: Vec<SqlValue> = bindings.iter().map(binding).collect();
         let rows = stmt
             .query_map(rusqlite::params_from_iter(bound), |r| {
