@@ -19,8 +19,7 @@ use crate::retrieval::{
     RrfSignals,
 };
 use crate::vitality::{
-    apply_feedback_adjustment, calculate_vitality, get_decay_rate, get_source_prior,
-    get_type_prior, VITALITY_FLOOR,
+    apply_feedback_adjustment, calculate_vitality, get_decay_rate, get_source_prior, get_type_prior,
 };
 use chrono::Utc;
 
@@ -708,16 +707,11 @@ pub fn search_memories_deadlined(
     // Dormancy is filtered on *effective* vitality, inside the query and before
     // its limit: the stored column never decays, and thinning a page after the
     // limit under-fills it (the reference's `DI-03`).
-    let mut floor = if input.include_dormant {
-        None
-    } else {
-        Some(VITALITY_FLOOR)
-    };
-    if input.min_vitality > 0.0 {
-        floor = Some(floor.map_or(input.min_vitality, |f: f64| f.max(input.min_vitality)));
-    }
+    // Decisions and preferences are exempt from the default floor, not from a
+    // caller's explicit `min_vitality` (Millwright R1).
     let filter = KeywordFilter {
-        min_effective_vitality: floor,
+        hide_dormant: !input.include_dormant,
+        min_effective_vitality: (input.min_vitality > 0.0).then_some(input.min_vitality),
         category: input.category.clone(),
         include_sensitive: input.include_sensitive,
         scope: scope.clone(),
