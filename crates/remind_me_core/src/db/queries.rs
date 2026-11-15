@@ -37,6 +37,7 @@ pub fn add_memory_with(
 ) -> Result<Memory> {
     fields.validate(&input.metadata, None)?;
     crate::project::refuse_reserved_predicate(input.predicate.as_deref())?;
+    crate::topic::refuse_topic_entities(&input.entities)?;
     let project = crate::context::explicit_project(input.project.as_deref())?;
     if let Some(scheduled) =
         crate::review::schedule_if_decision(fields.memory_type.as_deref(), &input.metadata)
@@ -465,7 +466,8 @@ pub fn annotate_memories(store: &Store<'_>, input: &AnnotateInput) -> Result<Ann
             continue;
         };
         let guarded = crate::project::refuse_reserved_predicate(annotation.predicate.as_deref())
-            .and_then(|()| crate::project::refuse_claim_edit(&stored));
+            .and_then(|()| crate::project::refuse_claim_edit(&stored))
+            .and_then(|()| crate::topic::refuse_topic_entities(&annotation.entities));
         if let Err(refused) = guarded {
             errors.push(AnnotationError {
                 memory_id: annotation.memory_id.clone(),

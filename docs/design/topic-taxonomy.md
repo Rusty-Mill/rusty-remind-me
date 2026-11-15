@@ -1,6 +1,7 @@
 # Topic taxonomy (design)
 
-Status: Proposed, awaiting the owner's approval. No code yet.
+Status: Accepted (2026-11-15). The owner approved option A as written in the
+project thread; the build follows the PR plan in section 7.
 Board: Mill Board #1188 (roadmap M4). Feeds #1311 (knowledge-hub distill) and
 #1315 (semantic-zoom graph, under #764).
 
@@ -197,7 +198,7 @@ it is not gated, because CI has no model.
 
 ## 7. PR plan
 
-1. **This doc** (draft PR). On approval it becomes ADR-0034.
+1. **This doc.** On approval it becomes ADR-0034.
 2. **Topic core**: `TopicName`, `topic.*` claims, projection and `invalid`,
    guarded writes and the `topic:` refusal on generic paths, single-link
    unlink, `remind_me_entity` showing a topic's tree position. Unit tests.

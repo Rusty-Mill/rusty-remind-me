@@ -80,6 +80,7 @@ pub mod testing;
 mod text;
 pub mod time_window;
 pub mod tool_profiles;
+pub mod topic;
 pub mod transcript;
 pub mod undo_import;
 pub mod updater;
