@@ -478,34 +478,47 @@ pub struct WriteOutcome {
 
 // --- guards on the generic write paths -------------------------------------
 
-/// Whether `predicate` belongs to this module.
+/// Whether `predicate` belongs to a claim module: this one (`project.*`) or
+/// [`crate::topic`] (`topic.*`). Both are written only by their module.
 pub fn is_reserved_predicate(predicate: &str) -> bool {
-    normalize_entity_name(predicate).starts_with(PREDICATE_PREFIX)
+    reserved_owner(predicate).is_some()
 }
 
-/// Refuse a generic write that names a `project.*` predicate.
+/// The record kind and the way to change it, for a reserved predicate.
+fn reserved_owner(predicate: &str) -> Option<(&'static str, &'static str)> {
+    let normalized = normalize_entity_name(predicate);
+    if normalized.starts_with(PREDICATE_PREFIX) {
+        Some(("project", "remind_me_project"))
+    } else if normalized.starts_with(crate::topic::PREDICATE_PREFIX) {
+        Some(("topic", "the topics commands"))
+    } else {
+        None
+    }
+}
+
+/// Refuse a generic write that names a `project.*` or `topic.*` predicate.
 pub fn refuse_reserved_predicate(predicate: Option<&str>) -> Result<()> {
-    match predicate {
-        Some(p) if is_reserved_predicate(p) => Err(StoreError::Invalid(format!(
-            "predicate '{p}' is reserved for project records; use remind_me_project"
+    match predicate.and_then(|p| reserved_owner(p).map(|o| (p, o))) {
+        Some((p, (kind, via))) => Err(StoreError::Invalid(format!(
+            "predicate '{p}' is reserved for {kind} records; use {via}"
         ))),
-        _ => Ok(()),
+        None => Ok(()),
     }
 }
 
 /// Refuse an edit or delete of a claim memory: claims are append-only.
 pub fn refuse_claim_edit(memory: &Memory) -> Result<()> {
-    if memory
-        .predicate
-        .as_deref()
-        .is_some_and(is_reserved_predicate)
-    {
-        return Err(StoreError::Invalid(format!(
+    match memory.predicate.as_deref().and_then(reserved_owner) {
+        Some(("project", _)) => Err(StoreError::Invalid(format!(
             "memory {} is a project claim and cannot be edited or deleted; use remind_me_project revert",
             memory.id
-        )));
+        ))),
+        Some((kind, via)) => Err(StoreError::Invalid(format!(
+            "memory {} is a {kind} claim and cannot be edited or deleted; use {via}",
+            memory.id
+        ))),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 // --- reads -----------------------------------------------------------------
@@ -980,7 +993,8 @@ fn refuse_secret(text: &str, what: &str) -> Result<()> {
     Ok(())
 }
 
-fn check_live(store: &Store<'_>, ids: &[String]) -> Result<()> {
+/// Refuse when any non-blank id in `ids` is not a live memory.
+pub(crate) fn check_live(store: &Store<'_>, ids: &[String]) -> Result<()> {
     let memories = Memories::new(store);
     for id in ids.iter().map(|id| id.trim()).filter(|id| !id.is_empty()) {
         if memories.get_live(id)?.is_none() {
@@ -994,17 +1008,28 @@ fn check_live(store: &Store<'_>, ids: &[String]) -> Result<()> {
 
 /// A fact memory written by this module, stamped like any local write, with
 /// its content passed through the same secret scrubber as every other write.
-fn new_fact(content: &str, mut tags: Vec<String>, mut metadata: Value) -> NewMemory {
+fn new_fact(content: &str, tags: Vec<String>, metadata: Value) -> NewMemory {
+    fact_from(SOURCE, content, tags, metadata)
+}
+
+/// A fact memory from `source`, as [`new_fact`] builds one; shared with the
+/// other claim module, [`crate::topic`].
+pub(crate) fn fact_from(
+    source: &str,
+    content: &str,
+    mut tags: Vec<String>,
+    mut metadata: Value,
+) -> NewMemory {
     let content = crate::boundary::scrub(content, &mut tags, &mut metadata);
     let now = Utc::now();
     let now_iso = now.to_rfc3339();
     let decay_rate = get_decay_rate(FACT_CATEGORY);
-    let base_weight = get_type_prior(FACT_CATEGORY) * get_source_prior(SOURCE);
+    let base_weight = get_type_prior(FACT_CATEGORY) * get_source_prior(source);
     NewMemory {
         category: FACT_CATEGORY.to_string(),
         memory_type: FACT_CATEGORY.to_string(),
         tags,
-        source: SOURCE.to_string(),
+        source: source.to_string(),
         metadata,
         decay_rate,
         vitality: calculate_vitality(base_weight, 0, decay_rate, &now_iso, now),

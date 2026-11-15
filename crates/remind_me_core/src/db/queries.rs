@@ -37,6 +37,7 @@ pub fn add_memory_with(
 ) -> Result<Memory> {
     fields.validate(&input.metadata, None)?;
     crate::project::refuse_reserved_predicate(input.predicate.as_deref())?;
+    crate::topic::refuse_topic_entities(&input.entities)?;
     let project = crate::context::explicit_project(input.project.as_deref())?;
     if let Some(scheduled) =
         crate::review::schedule_if_decision(fields.memory_type.as_deref(), &input.metadata)
@@ -134,6 +135,10 @@ pub fn add_memory_with(
     if let Some(embedder) = crate::embedder::available_embedder() {
         let _ = crate::vectors::embed_and_store(store, &*embedder, &id, &content);
     }
+    // Best-effort like the embedding above: a write never fails for want of
+    // a topic. Reads the saved centroids only; a store without topics pays a
+    // file-existence check.
+    crate::topic_assign::assign_on_write(store, &id);
 
     let memory = get_memory_by_id(store, &id)?.ok_or(StoreError::NotFound)?;
     crate::episodes::ensure_session_for(store, &memory)?;
@@ -473,7 +478,8 @@ pub fn annotate_memories(store: &Store<'_>, input: &AnnotateInput) -> Result<Ann
             continue;
         };
         let guarded = crate::project::refuse_reserved_predicate(annotation.predicate.as_deref())
-            .and_then(|()| crate::project::refuse_claim_edit(&stored));
+            .and_then(|()| crate::project::refuse_claim_edit(&stored))
+            .and_then(|()| crate::topic::refuse_topic_entities(&annotation.entities));
         if let Err(refused) = guarded {
             errors.push(AnnotationError {
                 memory_id: annotation.memory_id.clone(),
@@ -946,6 +952,25 @@ fn resolve_narrowing(store: &Store<'_>, input: &MemorySearchInput) -> Result<Opt
             })
         }
     };
+    let topic = match clean(&input.filters.topic) {
+        None => None,
+        Some(name) => {
+            let Ok(name) = crate::topic::TopicName::parse(name) else {
+                return Ok(None);
+            };
+            let tree = crate::topic::tree(store)?;
+            let subtree = tree.subtree(&name);
+            if subtree.is_empty() {
+                return Ok(None);
+            }
+            let memories = Memories::new(store);
+            let mut members = std::collections::HashSet::new();
+            for t in subtree {
+                members.extend(memories.linked_ids(&t.entity_id)?);
+            }
+            Some(members)
+        }
+    };
     let tags = input
         .tags
         .iter()
@@ -958,6 +983,7 @@ fn resolve_narrowing(store: &Store<'_>, input: &MemorySearchInput) -> Result<Opt
         tags,
         tag_match: input.filters.tag_mode,
         entity,
+        topic,
         repo: clean(&input.filters.repo).and_then(crate::context::normalize_remote),
     }))
 }

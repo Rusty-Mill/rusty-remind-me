@@ -451,6 +451,10 @@ pub struct SearchFilters {
     /// subject or object is it. An unknown entity matches nothing.
     #[serde(default)]
     pub entity: Option<String>,
+    /// Only memories in this topic or any topic below it, by name (with or
+    /// without the `topic:` prefix). An unknown topic matches nothing.
+    #[serde(default)]
+    pub topic: Option<String>,
     /// Only memories written in this repository: a `git_remote` in any form
     /// `git` accepts, compared after [`crate::context::normalize_remote`].
     #[serde(default)]
@@ -2098,12 +2102,8 @@ pub struct DigestRecentMemory {
     pub created_at: String,
 }
 
-/// The digest's underlying data.
-///
-/// `reminders_*` and `sync` are `Option` because their subsystems do not exist
-/// yet (#116, #114). `None` means "nothing here can tell", which is different
-/// from "nothing to report" — the renderer omits those sections rather than
-/// printing a "none" that would read as an answer.
+/// The digest's underlying data: recent memories, vitality, reminders on
+/// both sides of now, and decisions due for review.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DigestData {
     pub generated_at: String,

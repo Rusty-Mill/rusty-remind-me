@@ -1,42 +1,42 @@
 {
   "hashed/auto": {
-    "recall_at_5": 0.9177,
-    "recall_at_10": 0.9177,
-    "mrr": 0.8036
+    "recall_at_5": 0.9085,
+    "recall_at_10": 0.9207,
+    "mrr": 0.8007
   },
   "hashed/balanced": {
-    "recall_at_5": 0.9051,
-    "recall_at_10": 0.9177,
-    "mrr": 0.7947
+    "recall_at_5": 0.8963,
+    "recall_at_10": 0.9207,
+    "mrr": 0.8061
   },
   "hashed/keyword_favored": {
-    "recall_at_5": 0.8797,
-    "recall_at_10": 0.9177,
-    "mrr": 0.7709
+    "recall_at_5": 0.872,
+    "recall_at_10": 0.9207,
+    "mrr": 0.7895
   },
   "hashed/semantic_favored": {
-    "recall_at_5": 0.9177,
-    "recall_at_10": 0.9177,
-    "mrr": 0.8116
+    "recall_at_5": 0.9085,
+    "recall_at_10": 0.9207,
+    "mrr": 0.807
   },
   "keyword/auto": {
-    "recall_at_5": 0.8608,
-    "recall_at_10": 0.9135,
-    "mrr": 0.7726
+    "recall_at_5": 0.8537,
+    "recall_at_10": 0.9045,
+    "mrr": 0.7705
   },
   "keyword/balanced": {
-    "recall_at_5": 0.8734,
-    "recall_at_10": 0.9135,
-    "mrr": 0.7667
+    "recall_at_5": 0.8537,
+    "recall_at_10": 0.9045,
+    "mrr": 0.7705
   },
   "keyword/keyword_favored": {
-    "recall_at_5": 0.8608,
-    "recall_at_10": 0.9135,
-    "mrr": 0.7678
+    "recall_at_5": 0.8659,
+    "recall_at_10": 0.9045,
+    "mrr": 0.7785
   },
   "keyword/semantic_favored": {
-    "recall_at_5": 0.8608,
-    "recall_at_10": 0.9135,
-    "mrr": 0.759
+    "recall_at_5": 0.8537,
+    "recall_at_10": 0.9045,
+    "mrr": 0.7598
   }
 }

@@ -12,6 +12,7 @@ use remind_me_core::dbs_import::{
     dbs_memory_id, memory_content, pull_dbs, DbsImportError, DEFAULT_CATEGORY, SOURCE_ENTITY_KIND,
     TAG_ENTITY_KIND,
 };
+use remind_me_core::source_artifact::SourceArtifact;
 use remind_me_core::testing::{self, Table};
 use remind_me_core::{Database, DbsImportInput};
 use rusqlite::params;
@@ -252,6 +253,10 @@ fn an_items_fields_land_where_they_are_useful() {
     assert_eq!(metadata["dbs_external_id"], "x1");
     assert_eq!(metadata["dbs_item_kind"], "link");
     assert_eq!(metadata["dbs_content_hash"], "hash-1");
+    assert_eq!(
+        SourceArtifact::from_metadata(&metadata),
+        Some(SourceArtifact::dbs("raindrop", "x1", "hash-1"))
+    );
 
     // The item's own creation time, not the import's. Vitality decay reads
     // this column, so importing an archive must not make a decade of history

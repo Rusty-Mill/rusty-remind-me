@@ -140,6 +140,11 @@ pub fn link_memory_entity(store: &Store<'_>, memory_id: &str, entity_id: &str) -
 /// Returns the number of **new** links created; entities already linked to this
 /// memory are counted as zero. Shared by `add_memory` and `remind_me_annotate`
 /// so both apply mentions identically.
+///
+/// A `topic:` name is not a mention: topic membership is written only by
+/// [`crate::topic::assign`]. Callers refuse caller-given topic names before
+/// writing anything (`add_memory_with`, annotate); what reaches here is a
+/// heuristic extraction of `topic:` text, which is skipped, never linked.
 pub fn apply_entity_mentions(
     store: &Store<'_>,
     memory_id: &str,
@@ -147,7 +152,7 @@ pub fn apply_entity_mentions(
 ) -> Result<usize> {
     let mut linked = 0;
     for input in entities {
-        if input.name.trim().is_empty() {
+        if input.name.trim().is_empty() || crate::topic::is_topic_name(&input.name) {
             continue;
         }
         let entity = upsert_entity(store, input)?;

@@ -14,6 +14,37 @@ Dated entries, newest first. One entry per merged pull request.
 ### Tests
 - `list_default_test`: both defaults match the wire defaults, a default list returns every seeded row, an explicit 0 is refused, and over-100 still clamps. Four of the five fail on the previous code. `list_limit_test` (MCP) and `memories_test` (HTTP) cover the error at each boundary.
 
+## 2026-11-15 — Memories imported from DBS link to their source artifact (#762)
+
+### Added
+- Each memory `dbs-import` writes now carries `metadata.source_artifact`: `store` (`dbs:<source>`), `id` (the item's id at that source) and `hash` (DBS's content hash for the imported version). This is the provenance contract from the #762 audit (`docs/design/dbs-modularity-audit.md`). Distilled memories will use the same key to point at clipped pages and verbatim dialogs once the artifact store exists. The existing `dbs_*` metadata keys are unchanged. Memories imported before this change are not rewritten.
+- `remind_me_core::source_artifact::SourceArtifact` reads and writes the link.
+
+### Tests
+- `source_artifact` unit tests: round trip through metadata, and a missing or malformed link reads as none. `dbs_import_test` checks that an imported item carries its link.
+
+## 2026-11-15 — Digest doc comments stop promising sync state
+
+### Docs
+- `DigestData` (`remind_me_core::models`) and `api_digest` (`remind_me_api::routes`) doc comments said the digest carries sync state and optional reminder sections. It carries recent memories, vitality, reminders and decisions due for review. Comments only; no behaviour change.
+
+## 2026-11-15 — Tests for the openai embedder's resolution and cache key (#352)
+
+### Tests
+- `openai_resolve_test` (new): with `REMIND_ME_EMBEDDING_BACKEND=openai`, a set model resolves to an `openai` identity with that model and dimension; an unset, empty or blank model resolves to nothing, and `configured_embedder`, `embedding_status` and `server_status` each name `REMIND_ME_OPENAI_EMBED_MODEL` without blaming the daemon or ONNX; a dead port and an unparseable URL resolve but are not available, and the status says the backend is not answering.
+- `embedder_availability_cache_test`: changing any of the eight variables the availability cache is keyed on makes the next call probe again, and an unchanged configuration is served from the cache. Dropping `REMIND_ME_ONNX_TOKENIZER_PATH` from the key fails the test.
+
+### Docs
+- README: the feature list names the OpenAI-compatible backend alongside Ollama and ONNX. The embedder table already had its row.
+
+## 2026-11-15 — Docs catch up with the hub removal; the openai backend gets its ADR (#209)
+
+### Docs
+- `CONTRIBUTING.md`: check, test and clippy commands use `--workspace` instead of six `-p` flags that still named the removed `remind_me_hub`, which made each command fail; the workspace is five crates.
+- `README.md`: the five crates share one version (was six); the daemon's background loops list the outbox prune instead of sync; `/api/digest` returns decisions due for review, not sync state.
+- `docs/parity-loop-decisions.md` and `docs/CUTOVER.md`: marked historical for their sync, peer and hub entries (ADR-0032).
+- `docs/adr/0034-openai-compatible-embeddings-backend.md`: records the `openai` embedding backend shipped in #346: no new dependency, local `http://` only with no API key, `EmbedRole` through the shared model-family prefixes. Closes #209.
+
 ## 2026-11-12 — Decisions and preferences never go dormant (Millwright R1)
 
 ### Changed

@@ -1252,7 +1252,8 @@ pub fn api_set_reminder(
 }
 
 /// `digest::build_digest`, shared with `remind_me_digest` — recent memories,
-/// vitality, reminders on both sides of now, and sync state in one payload.
+/// vitality, reminders on both sides of now, and decisions due for review in
+/// one payload.
 ///
 /// Sensitive memories are excluded by the core function with no override, and
 /// this route deliberately adds none: a digest is the ambient surface that

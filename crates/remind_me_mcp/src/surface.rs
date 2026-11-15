@@ -180,7 +180,7 @@ const FOR_LISTING: [&str; 12] = [
 /// honours: the filters its newest-first listing applies, and the shaping of
 /// its output. `source`, `offset`, the expansion flags and the ranking options
 /// do nothing there, so they are refused.
-const FOR_WINDOW: [&str; 23] = [
+const FOR_WINDOW: [&str; 24] = [
     "query",
     "since",
     "until",
@@ -190,6 +190,7 @@ const FOR_WINDOW: [&str; 23] = [
     "tags",
     "tag_mode",
     "entity",
+    "topic",
     "repo",
     "include_sensitive",
     "project",

@@ -259,6 +259,8 @@ pub struct Narrowing {
     pub tags: Vec<String>,
     pub tag_match: crate::models::TagMatch,
     pub entity: Option<EntityMembers>,
+    /// Members of a topic and every topic below it.
+    pub topic: Option<HashSet<String>>,
     /// Normalized with [`crate::context::normalize_remote`].
     pub repo: Option<String>,
 }
@@ -274,10 +276,14 @@ pub struct EntityMembers {
 }
 
 impl Narrowing {
-    /// Whether `memory` passes every set filter.
+    /// Whether `memory` passes every set filter. Topic records (the tree's
+    /// claims and their evidence sentences) never do: they describe the
+    /// taxonomy, and a name like "Testing" would otherwise crowd real hits.
     pub fn admits(&self, memory: &Memory) -> bool {
-        self.admits_tags(&memory.tags)
+        memory.source != crate::topic::SOURCE
+            && self.admits_tags(&memory.tags)
             && self.entity.as_ref().is_none_or(|e| e.covers(memory))
+            && self.topic.as_ref().is_none_or(|t| t.contains(&memory.id))
             && self.repo.as_deref().is_none_or(|want| {
                 memory
                     .git_remote
