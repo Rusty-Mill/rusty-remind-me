@@ -7,6 +7,15 @@ Dated entries, newest first. One entry per merged pull request.
 ### Docs
 - `DigestData` (`remind_me_core::models`) and `api_digest` (`remind_me_api::routes`) doc comments said the digest carries sync state and optional reminder sections. It carries recent memories, vitality, reminders and decisions due for review. Comments only; no behaviour change.
 
+## 2026-11-15 — Tests for the openai embedder's resolution and cache key (#352)
+
+### Tests
+- `openai_resolve_test` (new): with `REMIND_ME_EMBEDDING_BACKEND=openai`, a set model resolves to an `openai` identity with that model and dimension; an unset, empty or blank model resolves to nothing, and `configured_embedder`, `embedding_status` and `server_status` each name `REMIND_ME_OPENAI_EMBED_MODEL` without blaming the daemon or ONNX; a dead port and an unparseable URL resolve but are not available, and the status says the backend is not answering.
+- `embedder_availability_cache_test`: changing any of the eight variables the availability cache is keyed on makes the next call probe again, and an unchanged configuration is served from the cache. Dropping `REMIND_ME_ONNX_TOKENIZER_PATH` from the key fails the test.
+
+### Docs
+- README: the feature list names the OpenAI-compatible backend alongside Ollama and ONNX. The embedder table already had its row.
+
 ## 2026-11-15 — Docs catch up with the hub removal; the openai backend gets its ADR (#209)
 
 ### Docs
