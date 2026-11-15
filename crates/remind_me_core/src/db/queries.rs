@@ -163,10 +163,18 @@ pub fn get_memory_by_id(store: &Store<'_>, id: &str) -> Result<Option<Memory>> {
 
 /// List memories newest-first, filtered by category, source and/or tags.
 ///
-/// `limit` is clamped to [`LIST_LIMIT_MIN`]..=[`LIST_LIMIT_MAX`]; the clamped
-/// value is echoed back in the result so callers can tell what was applied.
+/// A `limit` below [`LIST_LIMIT_MIN`] is refused as [`StoreError::Invalid`]:
+/// it used to clamp to 1, so a caller asking for nothing silently got one row
+/// (#223). A `limit` above [`LIST_LIMIT_MAX`] is clamped, and the applied
+/// value is echoed back in the result so callers can tell.
 pub fn list_memories(store: &Store<'_>, input: &MemoryListInput) -> Result<MemoryListResult> {
-    let limit = input.limit.clamp(LIST_LIMIT_MIN, LIST_LIMIT_MAX);
+    if input.limit < LIST_LIMIT_MIN {
+        return Err(StoreError::Invalid(format!(
+            "limit must be between {LIST_LIMIT_MIN} and {LIST_LIMIT_MAX}, got {}",
+            input.limit
+        )));
+    }
+    let limit = input.limit.min(LIST_LIMIT_MAX);
     // Filters apply before `COUNT`, `LIMIT` and `OFFSET`, so all three agree:
     // the reference hit exactly that pagination bug as `DATA-02`.
     let filter = ListFilter {

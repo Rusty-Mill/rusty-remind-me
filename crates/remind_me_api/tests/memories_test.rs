@@ -103,6 +103,16 @@ fn an_invalid_limit_is_a_400_not_a_crash() {
     std::fs::remove_dir_all(&root).unwrap();
 }
 
+#[test]
+fn a_zero_limit_is_a_400_not_one_row() {
+    let (server, root) = authed_server("list-zero-limit");
+    add(&server, "first");
+    add(&server, "second");
+    let response = authed_get(&server, "/api/memories?limit=0");
+    assert_eq!(response.status, 400);
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // POST /api/memories
 // ---------------------------------------------------------------------------

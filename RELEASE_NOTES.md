@@ -2,6 +2,18 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-15 — `MemoryListInput::default()` lists 20 rows; `limit: 0` is an error (#223)
+
+### Fixed
+- `MemoryListInput::default()` now has `limit: 20`, the same as an omitted `limit` over MCP. The derived `Default` gave 0, which `list_memories` clamped to 1, so a Rust caller using `..Default::default()` silently got one row.
+- `ExportInput::default()` now includes the entity graph, as an omitted `include_graph` already did; the derived `Default` left it out.
+
+### Changed
+- `list_memories` refuses `limit: 0` with "limit must be between 1 and 100" instead of returning one row. `remind_me_list` reports it as an error and `GET /api/memories?limit=0` answers 400. A limit above 100 is still clamped. The CLI already refused 0.
+
+### Tests
+- `list_default_test`: both defaults match the wire defaults, a default list returns every seeded row, an explicit 0 is refused, and over-100 still clamps. Four of the five fail on the previous code. `list_limit_test` (MCP) and `memories_test` (HTTP) cover the error at each boundary.
+
 ## 2026-11-12 — Decisions and preferences never go dormant (Millwright R1)
 
 ### Changed
