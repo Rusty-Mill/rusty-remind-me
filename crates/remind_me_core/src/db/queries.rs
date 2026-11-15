@@ -135,6 +135,10 @@ pub fn add_memory_with(
     if let Some(embedder) = crate::embedder::available_embedder() {
         let _ = crate::vectors::embed_and_store(store, &*embedder, &id, &content);
     }
+    // Best-effort like the embedding above: a write never fails for want of
+    // a topic. Reads the saved centroids only; a store without topics pays a
+    // file-existence check.
+    crate::topic_assign::assign_on_write(store, &id);
 
     let memory = get_memory_by_id(store, &id)?.ok_or(StoreError::NotFound)?;
     crate::episodes::ensure_session_for(store, &memory)?;
@@ -940,6 +944,25 @@ fn resolve_narrowing(store: &Store<'_>, input: &MemorySearchInput) -> Result<Opt
             })
         }
     };
+    let topic = match clean(&input.filters.topic) {
+        None => None,
+        Some(name) => {
+            let Ok(name) = crate::topic::TopicName::parse(name) else {
+                return Ok(None);
+            };
+            let tree = crate::topic::tree(store)?;
+            let subtree = tree.subtree(&name);
+            if subtree.is_empty() {
+                return Ok(None);
+            }
+            let memories = Memories::new(store);
+            let mut members = std::collections::HashSet::new();
+            for t in subtree {
+                members.extend(memories.linked_ids(&t.entity_id)?);
+            }
+            Some(members)
+        }
+    };
     let tags = input
         .tags
         .iter()
@@ -952,6 +975,7 @@ fn resolve_narrowing(store: &Store<'_>, input: &MemorySearchInput) -> Result<Opt
         tags,
         tag_match: input.filters.tag_mode,
         entity,
+        topic,
         repo: clean(&input.filters.repo).and_then(crate::context::normalize_remote),
     }))
 }

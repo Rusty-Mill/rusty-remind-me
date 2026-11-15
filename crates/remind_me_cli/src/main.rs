@@ -338,7 +338,8 @@ fn parse_wiki_compile_args(args: &[String]) -> Result<Op, String> {
 
 const TOPICS_USAGE: &str = "Usage: rusty-remind-me topics seed\n       \
 rusty-remind-me topics name <run> [--max N]\n       \
-rusty-remind-me topics apply <run> [--dry-run]";
+rusty-remind-me topics apply <run> [--dry-run]\n       \
+rusty-remind-me topics assign";
 
 /// Nodes one `topics name` call names unless `--max` says otherwise.
 const DEFAULT_NAME_MAX: usize = 50;
@@ -348,6 +349,7 @@ fn parse_topics_args(args: &[String]) -> Result<Op, String> {
     let usage = |why: &str| format!("Error: {why}.\n{TOPICS_USAGE}");
     match args.first().map(String::as_str) {
         Some("seed") if args.len() == 1 => Ok(Op::TopicsSeed),
+        Some("assign") if args.len() == 1 => Ok(Op::TopicsAssign),
         Some("name") => {
             let run = args
                 .get(1)
@@ -383,7 +385,7 @@ fn parse_topics_args(args: &[String]) -> Result<Op, String> {
                 dry_run,
             })
         }
-        _ => Err(usage("expected seed, name or apply")),
+        _ => Err(usage("expected seed, name, apply or assign")),
     }
 }
 
@@ -1181,6 +1183,10 @@ mod tests {
         assert!(matches!(
             parse_topics_args(&args(&["seed"])),
             Ok(Op::TopicsSeed)
+        ));
+        assert!(matches!(
+            parse_topics_args(&args(&["assign"])),
+            Ok(Op::TopicsAssign)
         ));
         assert!(matches!(
             parse_topics_args(&args(&["name", "r1", "--max", "3"])),

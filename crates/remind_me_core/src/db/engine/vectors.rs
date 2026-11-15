@@ -184,6 +184,12 @@ pub(crate) fn clear(tables: &mut EngineTables) -> Result<()> {
     )
 }
 
+pub(crate) fn chunks_for(tables: &EngineTables, memory_id: &str) -> Result<Vec<ChunkVector>> {
+    let mut found = chunks_of(core_ref(tables)?, memory_id);
+    found.sort_by_key(|c| c.chunk_ix);
+    Ok(found.into_iter().map(vector).collect())
+}
+
 pub(crate) fn chunk_count(tables: &EngineTables, memory_id: &str) -> Result<usize> {
     Ok(chunks_of(core_ref(tables)?, memory_id).len())
 }

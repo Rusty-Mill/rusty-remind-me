@@ -123,6 +123,9 @@ pub enum Op {
         run: String,
         dry_run: bool,
     },
+    /// Rebuild topic centroids and assign every unplaced memory; see
+    /// [`crate::topic_assign`].
+    TopicsAssign,
     /// The daemon's own state. Answered by the daemon, not [`execute`].
     Status,
     /// Stop the daemon. Answered by the daemon, not [`execute`].
@@ -299,6 +302,8 @@ fn run(store: &Store<'_>, op: &Op) -> Result<Value, String> {
             Err("naming topics needs the database: run it with execute_on".to_string())
         }
         Op::TopicsApply { run, dry_run } => crate::topic_seed::apply(store, run, "human", *dry_run)
+            .and_then(|report| serde_json::to_value(report).map_err(|e| e.to_string())),
+        Op::TopicsAssign => crate::topic_assign::assign_pending(store)
             .and_then(|report| serde_json::to_value(report).map_err(|e| e.to_string())),
         Op::Status | Op::Shutdown => Err("only a daemon answers status and shutdown".into()),
     }

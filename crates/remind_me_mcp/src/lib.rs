@@ -808,7 +808,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_search",
-                                "description": "Search memories using FTS5 keyword & hybrid ranking. tags, entity, repo and the project/branch/session/writer filters narrow the ranked results before the limit applies. Returns compact hits by default (id, category, date, tags, score, snippet); fetch full text with remind_me_get memory_ids, or pass detail=full. Hits cut by token_budget are listed by id. The three expansion flags surface adjacent memories in their own sections, outside the ranked results, so they never consume `limit`.",
+                                "description": "Search memories using FTS5 keyword & hybrid ranking. tags, entity, topic, repo and the project/branch/session/writer filters narrow the ranked results before the limit applies. Returns compact hits by default (id, category, date, tags, score, snippet); fetch full text with remind_me_get memory_ids, or pass detail=full. Hits cut by token_budget are listed by id. The three expansion flags surface adjacent memories in their own sections, outside the ranked results, so they never consume `limit`.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -821,6 +821,7 @@ impl McpServer {
                                         "tags": { "type": "array", "items": { "type": "string" }, "description": "Only memories carrying these tags (see tag_mode)" },
                                         "tag_mode": { "type": "string", "enum": ["all", "any"], "default": "all", "description": "all: every tag must be present; any: at least one" },
                                         "entity": { "type": "string", "description": "Only memories about this entity, by name or alias: linked to it, or naming it as subject or object. An unknown entity matches nothing." },
+                                        "topic": { "type": "string", "description": "Only memories in this topic or any topic below it, e.g. Systems Engineering. An unknown topic matches nothing." },
                                         "repo": { "type": "string", "description": "Only memories written in this git repository (origin remote, any URL form, e.g. github.com/owner/repo)" },
                                         "project": { "type": "string", "description": "Only memories written in this project (case-insensitive)" },
                                         "project_status": { "type": "string", "enum": ["active", "dormant", "abandoned"], "description": "Only memories whose project is a registered project (remind_me_project, by name or alias) with this status" },
@@ -6598,7 +6599,7 @@ mod structure_tests {
     fn search_narrows_by_tags_and_advertises_its_filters() {
         let s = server();
         let props = &tool(&s, "remind_me_search")["inputSchema"]["properties"];
-        for field in ["tags", "tag_mode", "entity", "repo"] {
+        for field in ["tags", "tag_mode", "entity", "topic", "repo"] {
             assert!(props[field].is_object(), "search should advertise {field}");
         }
         call(
