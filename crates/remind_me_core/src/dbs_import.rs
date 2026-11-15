@@ -52,6 +52,7 @@ use crate::db::Store;
 use crate::entity::{link_memory_entity, upsert_entity};
 use crate::import_paths::{validate_import_database, ImportPathError};
 use crate::models::{DbsImportInput, EntityInput, DBS_IMPORT_LIMIT_MAX, DBS_IMPORT_LIMIT_MIN};
+use crate::source_artifact::{SourceArtifact, METADATA_KEY};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -407,6 +408,12 @@ pub fn pull_dbs(
                 "dbs_item_kind": item.item_kind,
                 "dbs_url": item.url,
                 "dbs_content_hash": item.content_hash,
+                METADATA_KEY: SourceArtifact::dbs(
+                    &item.source_name,
+                    &item.external_id,
+                    &item.content_hash,
+                )
+                .to_value(),
             });
 
             let provenance = crate::context::importer_provenance("dbs");

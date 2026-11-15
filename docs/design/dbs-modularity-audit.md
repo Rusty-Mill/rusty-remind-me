@@ -14,8 +14,8 @@ Daily-Backup-System `6cc6491`, rusty_dbs `fd2bf76`.
 - **DBS is SQLite.** That holds for both the Python Daily-Backup-System and the Rust port `rusty_dbs`.
   Both use one file with FTS5, revisions, and media blobs stored in the database.
 - **remind-me's storage sits behind a seam, not a port.** It has 20 concrete repositories over one
-  engine handle (ADR-0022), and there is no trait. The domain is well insulated from the engine: two
-  code leaks, both small. The coupling sits elsewhere. All tables live in one closed
+  engine handle (ADR-0022), and there is no trait. The domain is well insulated from the engine: no
+  production code outside `db/` touches it except the CLI's deliberate `copy-store`. The coupling sits elsewhere. All tables live in one closed
   `EngineTables` struct with one journal and one lock, and search and the ladder only understand the
   `memories` table.
 - **A DBS module with its own store can plug in without touching the memory schema,** if two rules
@@ -62,7 +62,6 @@ flowchart TD
   api --> core
   eng --> mmdb[(rusty_multimodal_db_engine<br/>libs-2026.10.0)]
   legacy --> dbsfile[(DBS SQLite file)]
-  domain -. review.rs:427 .-> eng
   cli -. copy_store.rs:48 .-> eng
 ```
 
@@ -84,7 +83,7 @@ The leaks (dashed lines in the diagram):
 
 | Leak | Where | Size |
 |---|---|---|
-| A domain module builds an engine row to render a memory | `remind_me_core/src/review.rs:427` (`db::engine::memories::MemoryRow`) | S |
+| ~~A domain module builds an engine row~~ Corrected 2026-11-15: `review.rs:427` is inside `#[cfg(test)]`, a test fixture, so it is not a leak | `remind_me_core/src/review.rs:427` | None |
 | The CLI drives the engine copy directly | `remind_me_cli/src/copy_store.rs:48` | Intentional (an ops tool); leave it |
 | **One closed table set.** Every table group is a field of `EngineTables`, under one journal, one undo log, one page and one `DirLock` | `db/engine/mod.rs:136-200`, `db/engine/core.rs:47` | The real coupling: a module cannot bring its own tables without editing this struct |
 | **Search knows one table.** Full-text is a `FullTextIndex` over `memories` built at open, and vectors are keyed by `memory_id` | `db/engine/memories.rs:47`, `db/engine/core.rs:70`, `db/engine/vectors.rs:36` | By design; see §4 |
@@ -147,15 +146,15 @@ output, not its job runner.
 
 | # | Seam | Effort | Files | Store-neutral? |
 |---|---|---|---|---|
-| 1 | Provenance contract: `metadata.source_artifact {store, id, hash}` on derived memories, reusing `capture_id`/`linked_dialog` where they already exist | S | `capture.rs:310` (decompose), `promotion.rs:395` (provenance) | Yes |
-| 2 | Close the domain leak: render through `Memories`, not `MemoryRow` | S | `review.rs:427` | Yes |
-| 3 | Lift `archive.rs`'s content-addressed blob store into a reusable blob store with its own root, included in backups | S | `archive.rs:72-180`, `backup.rs` | Yes |
+| 1 | Provenance contract: `metadata.source_artifact {store, id, hash}` on memories built from an artifact. **Done in this PR** for the first writer, `dbs_import` (`source_artifact.rs`). Decompose and promotion adopt it with the artifact module | S | `source_artifact.rs`, `dbs_import.rs`; later `capture.rs:310`, `promotion.rs:395` | Yes |
+| 2 | ~~Close the domain leak in `review.rs`~~ Dropped: the reference is test-only (see §3) | None | | |
+| 3 | Lift `archive.rs`'s content-addressed blob store into a reusable blob store with its own root, included in backups. **Deferred to seam 5:** its only user today is `archive.rs`, so extracting it now is an abstraction with one caller | S | `archive.rs:72-180`, `backup.rs` | Yes |
 | 4 | A second engine directory: extract open, journal, `DirLock`, compaction and backup from `EngineTables` so a module opens its own table set beside `memory.engine` | M | `db/engine/mod.rs:136-260`, `db/mod.rs:249-331`, `compaction.rs`, `backup.rs` | Engine-specific; under SQLite this is one more file |
 | 5 | Artifact module: ingest port, artifact repository, and the DBS and clip adapters. `dbs_import` moves from writing memories directly to writing artifacts and letting the ladder distil them | M | new `artifacts/`; `dbs_import.rs:339` | Yes, behind the port |
 | 6 | The R2 storage port: traits over the existing narrow repositories, so R3 can run the same tests and golden set on the engine, SQLite and Ledger's store | L (broad but mechanical: about 98 caller files, about 757 test setups) | `db/*.rs` | That is its purpose |
 | 7 | #528: move existing dialogs out of `memories` into the artifact store. A data migration: dry-run count, crash-safe upgrade (the `legacy_upgrade` pattern from PR #368), rollback. Remove the `DIALOG_CATEGORY` special cases from 12 source files | L | `models.rs:967` and the files in §3 | Needs seams 3 to 5; needs Nano |
 
-Seams 1 to 3 are worth doing on any path. Seam 4 is needed only if the engine stays. Seam 6 is
+Seams 1 and 3 are worth doing on any path; seam 1 is done, and seam 3 lands with its second user. Seam 4 is needed only if the engine stays. Seam 6 is
 Millwright R2.
 
 ## 6. DBS on `rusty_multimodal_db_engine`: readiness
