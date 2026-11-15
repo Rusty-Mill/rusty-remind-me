@@ -20,15 +20,22 @@
 //!     memory, deduplicating lines and summing access counts, then supersedes
 //!     the rest via the same `superseded_by` mechanism
 //!     [`crate::entity::supersede_contradicting_facts`] already uses.
-//!   - **Evidence**: the canonical's `metadata.evidence` counts the memories
-//!     it now stands for, accumulated across merges, and nudges its
-//!     `base_weight` up by a small, capped factor ([`evidence_weight`]).
+//!   - **Evidence**: the canonical's [`EVIDENCE_KEY`] metadata entry counts
+//!     the memories it now stands for, accumulated across merges, and nudges
+//!     its `base_weight` up by a small, capped factor ([`evidence_weight`]).
+//!     The system owns that key: `remind_me_add` drops it from client input
+//!     and `remind_me_update` carries the stored value over whatever a client
+//!     sends ([`keep_evidence`]), so a client edit can neither clobber the
+//!     count nor reset it under a weight that already carries its boost. A
+//!     reverted or abandoned decision adds no evidence. Each merge's writes
+//!     run in one [`Store::transaction`], so a failed merge counts nothing
+//!     and its retry counts once.
 
 use crate::db::feedback::Feedback;
 use crate::db::memories::Memories;
 use crate::db::vectors::Vectors;
 use crate::db::Store;
-use crate::models::ConsolidateInput;
+use crate::models::{ConsolidateInput, Memory};
 use crate::vitality::{
     calculate_vitality, BASE_WEIGHT_MAX, BASE_WEIGHT_MIN, EVIDENCE_BOOST, EVIDENCE_FACTOR_MAX,
 };
@@ -289,14 +296,80 @@ pub fn merge_cluster(
     }
 }
 
-/// How many memories `metadata` stands for: its `evidence` count, or 1 for
+/// Metadata key holding a canonical memory's evidence count (#354). The
+/// system owns it: clients cannot set or clear it ([`keep_evidence`]). A
+/// metadata key rather than a column because memory rows are positional in
+/// the store, and a column would mean a schema migration.
+pub const EVIDENCE_KEY: &str = "remind_me:evidence";
+
+/// Where merges before #354 wrote the count. Read only when [`EVIDENCE_KEY`]
+/// is absent, so a canonical merged before the fix keeps its count instead
+/// of starting again from 1 under an already boosted weight. Never written.
+const LEGACY_EVIDENCE_KEY: &str = "evidence";
+
+/// How many memories `metadata` stands for: its evidence count, or 1 for
 /// a memory that has never absorbed a merge (or carries a malformed count).
 pub fn evidence_of(metadata: Option<&Json>) -> u64 {
+    let Some(metadata) = metadata else {
+        return 1;
+    };
     metadata
-        .and_then(|m| m.get("evidence"))
+        .get(EVIDENCE_KEY)
+        .or_else(|| metadata.get(LEGACY_EVIDENCE_KEY))
         .and_then(Json::as_u64)
         .filter(|&n| n >= 1)
         .unwrap_or(1)
+}
+
+/// `incoming` client metadata with the system-owned evidence count taken
+/// from `stored` instead: any value the client sent under [`EVIDENCE_KEY`]
+/// is dropped, and the stored one, if any, is kept. Pass `None` for a new
+/// memory. Non-object metadata is left alone unless a count must be kept,
+/// in which case it becomes an object holding just the count, as
+/// `attachments::merge_metadata` does.
+pub fn keep_evidence(mut incoming: Json, stored: Option<&Json>) -> Json {
+    let kept = stored.and_then(|m| m.get(EVIDENCE_KEY)).cloned();
+    if let Some(object) = incoming.as_object_mut() {
+        object.remove(EVIDENCE_KEY);
+    }
+    let Some(kept) = kept else {
+        return incoming;
+    };
+    if !incoming.is_object() {
+        incoming = json!({});
+    }
+    incoming[EVIDENCE_KEY] = kept;
+    incoming
+}
+
+/// Whether `memory` is a decision that was reverted or abandoned: no longer
+/// grounds for anything, the same rule promotions apply
+/// (`db::engine::promotions::discredited`).
+fn discredited(memory: &Memory) -> bool {
+    memory.memory_type.as_deref() == Some("decision")
+        && memory
+            .outcome
+            .as_deref()
+            .is_some_and(crate::resolve::demotes)
+}
+
+/// Evidence `memory` brings to a merge: its count, or 0 when discredited.
+fn contribution(memory: &Memory) -> u64 {
+    if discredited(memory) {
+        return 0;
+    }
+    evidence_of(Some(&memory.metadata))
+}
+
+/// The canonical's count after absorbing `cluster` (the canonical
+/// included): the members' contributions, saturating rather than wrapping,
+/// and never below 1.
+fn merged_evidence<'m>(cluster: impl IntoIterator<Item = &'m Memory>) -> u64 {
+    cluster
+        .into_iter()
+        .map(contribution)
+        .fold(0u64, u64::saturating_add)
+        .max(1)
 }
 
 fn evidence_factor(evidence: u64) -> f64 {
@@ -370,9 +443,12 @@ fn fetch_candidates(
 /// when its canonical id has a matching entry in `input.summaries`; a
 /// cluster found but missing a summary is skipped and listed separately,
 /// never silently merged with a raw line union (the reference's issue #55
-/// fix). A merge updates the canonical's content/access_count/tags/vitality,
-/// supersedes every other member via `superseded_by`, and best-effort
-/// re-embeds the canonical with its merged content.
+/// fix). A merge updates the canonical's content, access count, tags,
+/// evidence count ([`EVIDENCE_KEY`]), `base_weight` and vitality, and
+/// supersedes every other member via `superseded_by`, all in one
+/// transaction: a merge that fails part way leaves nothing behind, so its
+/// retry counts the evidence once. After it commits, the canonical is
+/// re-embedded with its merged content, best effort.
 ///
 /// Only active, non-superseded memories are considered.
 pub fn consolidate(store: &Store<'_>, input: &ConsolidateInput) -> SqlResult<Json> {
@@ -454,13 +530,87 @@ fn dry_run_report(clusters: &[Vec<ClusterMember>], embeddings: &HashMap<String, 
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Fail the n-th merge on this thread (1-based) after its metadata and
+    /// weight writes, before `set_merged`, to prove a failed merge counts
+    /// nothing and its retry counts once (#354).
+    static FAIL_MERGE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Merge one cluster into `canonical` with `summary` as its content: the
+/// evidence count and weight, the merged content, tags and access count,
+/// and every other member superseded. Run inside a transaction by
+/// [`apply_merges`], so either all of it lands or none does.
+fn merge_one(
+    store: &Store<'_>,
+    canonical: &ClusterMember,
+    cluster: &[ClusterMember],
+    summary: &str,
+    now: chrono::DateTime<Utc>,
+) -> SqlResult<ClusterMerge> {
+    let now_iso = now.to_rfc3339();
+    let member_refs: Vec<ClusterMember> = cluster
+        .iter()
+        .filter(|m| m.id != canonical.id)
+        .cloned()
+        .collect();
+    let merged = merge_cluster(canonical, &member_refs, Some(summary));
+
+    let memories = Memories::new(store);
+    let ids: Vec<String> = cluster.iter().map(|m| m.id.clone()).collect();
+    let rows = memories.get_many(&ids)?;
+    let stored = rows.iter().find(|m| m.id == canonical.id);
+    let before = evidence_of(stored.map(|m| &m.metadata));
+    let after = merged_evidence(&rows);
+    let mut canonical_metadata = stored
+        .map(|m| m.metadata.clone())
+        .filter(Json::is_object)
+        .unwrap_or_else(|| json!({}));
+    canonical_metadata[EVIDENCE_KEY] = json!(after);
+
+    // Recompute vitality for the canonical at zero elapsed days, the same
+    // write-time snapshot `add_memory` seeds — `calculate_vitality`
+    // already applies bridge protection internally from `access_count`.
+    let base_weight = evidence_weight(canonical.base_weight, before, after);
+    let new_vitality = calculate_vitality(
+        base_weight,
+        merged.total_access_count,
+        canonical.decay_rate,
+        &now_iso,
+        now,
+    );
+    memories.set_tags_and_metadata(&canonical.id, &merged.merged_tags, &canonical_metadata)?;
+    Feedback::new(store).set_importance(&canonical.id, base_weight, new_vitality, "active")?;
+    #[cfg(test)]
+    if FAIL_MERGE.with(|n| {
+        let left = n.get();
+        n.set(left.saturating_sub(1));
+        left == 1
+    }) {
+        return Err(crate::db::StoreError::Engine(
+            "injected merge failure".into(),
+        ));
+    }
+    memories.set_merged(
+        &canonical.id,
+        &merged.merged_content,
+        merged.total_access_count,
+        &merged.merged_tags,
+        &now_iso,
+    )?;
+    for member_id in &merged.superseded_ids {
+        memories.set_superseded_by(member_id, &canonical.id, Some(&now_iso))?;
+    }
+    Ok(merged)
+}
+
 fn apply_merges(
     store: &Store<'_>,
     clusters: &[Vec<ClusterMember>],
     summaries: Option<&HashMap<String, String>>,
 ) -> SqlResult<Json> {
     let now = Utc::now();
-    let now_iso = now.to_rfc3339();
     let empty_summaries = HashMap::new();
     let summaries = summaries.unwrap_or(&empty_summaries);
 
@@ -480,56 +630,7 @@ fn apply_merges(
             continue;
         };
 
-        let member_refs: Vec<ClusterMember> = cluster
-            .iter()
-            .filter(|m| m.id != canonical.id)
-            .cloned()
-            .collect();
-        let merged = merge_cluster(canonical, &member_refs, Some(summary.as_str()));
-
-        let memories = Memories::new(store);
-        let ids: Vec<String> = cluster.iter().map(|m| m.id.clone()).collect();
-        let mut metadata: HashMap<String, Json> = memories
-            .get_many(&ids)?
-            .into_iter()
-            .map(|m| (m.id, m.metadata))
-            .collect();
-        let before = evidence_of(metadata.get(&canonical.id));
-        let after: u64 = ids.iter().map(|id| evidence_of(metadata.get(id))).sum();
-        let mut canonical_metadata = metadata
-            .remove(&canonical.id)
-            .filter(Json::is_object)
-            .unwrap_or_else(|| json!({}));
-        canonical_metadata["evidence"] = json!(after);
-
-        // Recompute vitality for the canonical at zero elapsed days, the same
-        // write-time snapshot `add_memory` seeds — `calculate_vitality`
-        // already applies bridge protection internally from `access_count`.
-        let base_weight = evidence_weight(canonical.base_weight, before, after);
-        let new_vitality = calculate_vitality(
-            base_weight,
-            merged.total_access_count,
-            canonical.decay_rate,
-            &now_iso,
-            now,
-        );
-        // Metadata and weight first: only `set_merged` moves `updated_at`, so
-        // it alone queues the row for sync, carrying all three writes in one
-        // payload rather than a second same-timestamp update LWW would drop.
-        memories.set_tags_and_metadata(&canonical.id, &merged.merged_tags, &canonical_metadata)?;
-        Feedback::new(store).set_importance(&canonical.id, base_weight, new_vitality, "active")?;
-        memories.set_merged(
-            &canonical.id,
-            &merged.merged_content,
-            merged.total_access_count,
-            &merged.merged_tags,
-            &now_iso,
-        )?;
-
-        for member_id in &merged.superseded_ids {
-            memories.set_superseded_by(member_id, &canonical.id, Some(&now_iso))?;
-        }
-
+        let merged = store.transaction(|page| merge_one(page, canonical, cluster, summary, now))?;
         total_superseded += merged.superseded_ids.len();
         canonical_ids.push(canonical.id.clone());
 
@@ -763,10 +864,79 @@ mod tests {
     fn evidence_defaults_to_one_and_ignores_malformed_counts() {
         assert_eq!(evidence_of(None), 1);
         assert_eq!(evidence_of(Some(&json!({}))), 1);
-        assert_eq!(evidence_of(Some(&json!({"evidence": 0}))), 1);
-        assert_eq!(evidence_of(Some(&json!({"evidence": "4"}))), 1);
-        assert_eq!(evidence_of(Some(&json!({"evidence": -2}))), 1);
+        assert_eq!(evidence_of(Some(&json!({EVIDENCE_KEY: 0}))), 1);
+        assert_eq!(evidence_of(Some(&json!({EVIDENCE_KEY: "4"}))), 1);
+        assert_eq!(evidence_of(Some(&json!({EVIDENCE_KEY: -2}))), 1);
+        assert_eq!(evidence_of(Some(&json!({EVIDENCE_KEY: 4}))), 4);
+    }
+
+    #[test]
+    fn the_owned_key_wins_over_the_legacy_one() {
         assert_eq!(evidence_of(Some(&json!({"evidence": 4}))), 4);
+        assert_eq!(
+            evidence_of(Some(&json!({EVIDENCE_KEY: 2, "evidence": "client"}))),
+            2
+        );
+        assert_eq!(
+            evidence_of(Some(&json!({EVIDENCE_KEY: 2, "evidence": 9}))),
+            2
+        );
+    }
+
+    #[test]
+    fn keep_evidence_drops_a_client_count_and_keeps_the_stored_one() {
+        let stored = json!({EVIDENCE_KEY: 3, "note": "old"});
+
+        let fresh = keep_evidence(json!({EVIDENCE_KEY: 99, "evidence": "mine"}), None);
+        assert_eq!(fresh, json!({"evidence": "mine"}));
+
+        let edited = keep_evidence(json!({"note": "new"}), Some(&stored));
+        assert_eq!(edited, json!({EVIDENCE_KEY: 3, "note": "new"}));
+
+        let forged = keep_evidence(json!({EVIDENCE_KEY: 1}), Some(&stored));
+        assert_eq!(forged, json!({EVIDENCE_KEY: 3}));
+
+        assert_eq!(keep_evidence(json!("x"), None), json!("x"));
+        assert_eq!(
+            keep_evidence(json!("x"), Some(&stored)),
+            json!({EVIDENCE_KEY: 3})
+        );
+    }
+
+    fn row(id: &str, metadata: Json, memory_type: Option<&str>, outcome: Option<&str>) -> Memory {
+        let mut row = crate::db::memories::NewMemory::new(id, id, "2026-11-15T00:00:00Z");
+        row.metadata = metadata;
+        let mut m = crate::db::engine::memories::MemoryRow::from_new(&row).to_memory();
+        m.memory_type = memory_type.map(str::to_string);
+        m.outcome = outcome.map(str::to_string);
+        m
+    }
+
+    #[test]
+    fn merged_evidence_saturates_instead_of_overflowing() {
+        let rows = [
+            row("a", json!({EVIDENCE_KEY: u64::MAX}), None, None),
+            row("b", json!({}), None, None),
+        ];
+        assert_eq!(merged_evidence(&rows), u64::MAX);
+    }
+
+    #[test]
+    fn reverted_and_abandoned_decisions_add_no_evidence() {
+        let rows = [
+            row("a", json!({}), Some("decision"), None),
+            row("b", json!({}), Some("decision"), Some("reverted")),
+            row(
+                "c",
+                json!({EVIDENCE_KEY: 4}),
+                Some("decision"),
+                Some("abandoned"),
+            ),
+            row("d", json!({}), Some("decision"), Some("done")),
+            row("e", json!({}), Some("action_item"), Some("abandoned")),
+        ];
+        assert_eq!(merged_evidence(&rows), 3);
+        assert_eq!(merged_evidence(&rows[1..3]), 1, "never below one");
     }
 
     #[test]
@@ -808,6 +978,86 @@ mod tests {
         assert_eq!(
             merged.merged_tags,
             vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+    }
+
+    fn get(store: &Store<'_>, id: &str) -> SqlResult<Option<Memory>> {
+        crate::db::queries::get_memory_by_id(store, id)
+    }
+
+    fn store_with_pair(store: &Store<'_>) -> (String, String) {
+        let mut ids = Vec::new();
+        for (content, vector, vitality) in [
+            ("the meeting moved to 3pm", [1.0f32, 0.0], 0.9),
+            ("meeting is now at 3pm", [0.99, 0.14107], 0.5),
+        ] {
+            let id = crate::db::queries::add_memory(
+                store,
+                crate::models::MemoryAddInput {
+                    content: content.into(),
+                    category: "general".into(),
+                    source: "manual".into(),
+                    metadata: json!({}),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .id;
+            let bytes: Vec<u8> = vector.iter().flat_map(|f| f.to_le_bytes()).collect();
+            Vectors::new(store).put(&id, 0, &bytes).unwrap();
+            crate::testing::set_memory_column(store, &id, "vitality", vitality).unwrap();
+            ids.push(id);
+        }
+        (ids.remove(0), ids.remove(0))
+    }
+
+    fn merge(store: &Store<'_>, canonical: &str) -> SqlResult<Json> {
+        let mut summaries = HashMap::new();
+        summaries.insert(canonical.to_string(), "the meeting is at 3pm".to_string());
+        consolidate(
+            store,
+            &ConsolidateInput {
+                similarity_threshold: 0.85,
+                dry_run: false,
+                category: None,
+                limit: 500,
+                summaries: Some(summaries),
+            },
+        )
+    }
+
+    #[test]
+    fn a_merge_that_fails_part_way_counts_nothing_and_its_retry_counts_once() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let store = db.store();
+        let (canonical, member) = store_with_pair(&store);
+        let original = get(&store, &canonical).unwrap().unwrap();
+
+        // Fail after the metadata and weight writes, before `set_merged`.
+        FAIL_MERGE.with(|n| n.set(1));
+        assert!(merge(&store, &canonical).is_err());
+
+        let rolled_back = get(&store, &canonical).unwrap().unwrap();
+        assert_eq!(rolled_back.metadata, original.metadata);
+        assert_eq!(rolled_back.base_weight, original.base_weight);
+        assert_eq!(rolled_back.content, original.content);
+        let untouched = get(&store, &member).unwrap().unwrap();
+        assert_eq!(untouched.superseded_by, None);
+
+        merge(&store, &canonical).unwrap();
+
+        let after = get(&store, &canonical).unwrap().unwrap();
+        assert_eq!(after.metadata[EVIDENCE_KEY], 2);
+        let want = original.base_weight * (1.0 + 0.1 * 2f64.ln());
+        assert!(
+            (after.base_weight - want).abs() < 1e-9,
+            "{}",
+            after.base_weight
+        );
+        let superseded = get(&store, &member).unwrap().unwrap();
+        assert_eq!(
+            superseded.superseded_by.as_deref(),
+            Some(canonical.as_str())
         );
     }
 }
