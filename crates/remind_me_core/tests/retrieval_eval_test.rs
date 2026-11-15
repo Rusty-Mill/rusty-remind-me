@@ -59,6 +59,7 @@ use remind_me_core::entity::{link_memory_entity, upsert_entity};
 use remind_me_core::query_expansion::EXPANSION_MODE_ENV;
 use remind_me_core::reranker::BACKEND_ENV as RERANK_ENV;
 use remind_me_core::retrieval::Deadline;
+use remind_me_core::topic::{self, Parent, TopicName};
 use remind_me_core::vectors::embed_and_store;
 use remind_me_core::{Database, EntityInput, MemorySearchInput, RetrievalStrategy, SearchFilters};
 use serde::{Deserialize, Serialize};
@@ -108,6 +109,10 @@ struct FixtureMemory {
     sensitive: bool,
     #[serde(default)]
     entities: Vec<String>,
+    /// Topic paths the row belongs to, `Parent/Child`; each topic on the
+    /// path is created under the one before it.
+    #[serde(default)]
+    topics: Vec<String>,
 }
 
 /// One golden query: what it should find, and what it must never surface.
@@ -121,6 +126,8 @@ struct GoldenQuery {
     must_not: Vec<String>,
     project: Option<String>,
     entity: Option<String>,
+    /// A `topic` search filter (the topic and every topic below it).
+    topic: Option<String>,
 }
 
 fn fixture_dir() -> PathBuf {
@@ -208,11 +215,43 @@ fn load(store: &Store<'_>, memories: &[FixtureMemory], embedder: Option<&dyn Emb
             .unwrap();
             link_memory_entity(store, &m.id, &entity.id).unwrap();
         }
+        for path in &m.topics {
+            let leaf = ensure_topic_path(store, path, &m.id);
+            topic::assign(store, &m.id, &leaf).unwrap();
+        }
     }
     let Some(embedder) = embedder else { return };
     for m in memories {
         embed_and_store(store, embedder, &m.id, &m.content).unwrap();
     }
+}
+
+/// Create every topic on `path` (`A/B/C`) under the one before it, citing
+/// `evidence` (a fixture row), and return the last. Idempotent.
+fn ensure_topic_path(store: &Store<'_>, path: &str, evidence: &str) -> TopicName {
+    let mut parent = Parent::Root;
+    let mut last = None;
+    for label in path.split('/') {
+        let name = TopicName::parse(label).unwrap();
+        let exists = topic::tree(store).unwrap().get(&name).is_some();
+        if !exists {
+            topic::set(
+                store,
+                &topic::SetInput {
+                    topic: name.clone(),
+                    parent: Some(parent),
+                    status: Some(topic::Status::Active),
+                    evidence: vec![evidence.to_string()],
+                    because: None,
+                    confirmed_by: "fixture".into(),
+                },
+            )
+            .unwrap();
+        }
+        parent = Parent::Topic(name.clone());
+        last = Some(name);
+    }
+    last.unwrap_or_else(|| panic!("empty topic path {path:?}"))
 }
 
 /// `age_days` back, or mid-way through the window `during` names (in UTC,
@@ -245,6 +284,7 @@ fn ranked(
         },
         filters: SearchFilters {
             entity: g.entity.clone(),
+            topic: g.topic.clone(),
             ..Default::default()
         },
         ..Default::default()
@@ -473,6 +513,12 @@ fn evaluate(mode: &str, embedder: Option<&dyn Embedder>, report: &mut Report) {
                     g.query
                 ));
             }
+            if g.topic.is_some() && row.1 == 0.0 {
+                report.violations.push(format!(
+                    "{mode}/{name}: {:?} with its topic filter found nothing relevant",
+                    g.query
+                ));
+            }
             // Misses under the default router, so a drop names its queries.
             if strategy == RetrievalStrategy::Auto && row.1 < 1.0 {
                 println!(
@@ -687,6 +733,7 @@ fn validate_refuses_a_golden_set_that_cannot_hold() {
         must_not: ids(must_not),
         project: None,
         entity: None,
+        topic: None,
     };
     assert!(validate(&memories, &[golden(&["a"], &[])]).is_ok());
     assert!(validate(&memories, &[golden(&[], &[])]).is_err());

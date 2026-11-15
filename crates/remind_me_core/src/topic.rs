@@ -40,8 +40,8 @@ pub const EVIDENCE_TAG: &str = "topic-evidence";
 pub const ROOT: &str = "root";
 /// The longest label a topic may have, in characters.
 pub const MAX_LABEL_CHARS: usize = 80;
-/// `source` of every memory this module writes.
-const SOURCE: &str = "topic";
+/// `source` of every memory this module writes. Search leaves these out.
+pub const SOURCE: &str = "topic";
 /// Key of the claim's block inside a memory's metadata.
 const META_KEY: &str = "topic_claim";
 

@@ -277,7 +277,7 @@ fn centroid(points: &[Vec<f32>], members: &[usize]) -> Vec<f32> {
     normalize(sum)
 }
 
-fn normalize(mut v: Vec<f32>) -> Vec<f32> {
+pub(crate) fn normalize(mut v: Vec<f32>) -> Vec<f32> {
     let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > 0.0 {
         v.iter_mut().for_each(|x| *x /= norm);
@@ -285,7 +285,7 @@ fn normalize(mut v: Vec<f32>) -> Vec<f32> {
     v
 }
 
-fn dot(a: &[f32], b: &[f32]) -> f32 {
+pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
@@ -300,7 +300,7 @@ pub fn is_seedable(memory: &Memory) -> bool {
             .predicate
             .as_deref()
             .is_some_and(crate::project::is_reserved_predicate)
-        && memory.source != "topic"
+        && memory.source != topic::SOURCE
         && memory.source != "project"
 }
 
@@ -636,6 +636,9 @@ pub fn apply(
                 Err(e) => return Err(format!("linking {member}: {e}")),
             }
         }
+    }
+    if !dry_run {
+        crate::topic_assign::rebuild(store)?;
     }
     Ok(report)
 }
