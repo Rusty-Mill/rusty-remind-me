@@ -458,7 +458,7 @@ pub fn reindex_with(
 /// three keys present) — either way there is nothing complete to compare
 /// against, so callers must treat this the same as "nothing recorded" rather
 /// than guess at the missing piece.
-fn read_embedding_meta(store: &Store<'_>) -> SqlResult<Option<EmbeddingIdentity>> {
+pub(crate) fn read_embedding_meta(store: &Store<'_>) -> SqlResult<Option<EmbeddingIdentity>> {
     let rows = Vectors::new(store).meta()?;
     if rows.is_empty() {
         return Ok(None);

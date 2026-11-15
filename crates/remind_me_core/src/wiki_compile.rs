@@ -549,13 +549,13 @@ fn uncited<'a>(sources: &'a [Source], written: &str) -> Option<&'a str> {
 }
 
 /// A running compile's claim on its wiki root, released when dropped.
-struct RunGuard(PathBuf);
+pub(crate) struct RunGuard(PathBuf);
 
 impl RunGuard {
     /// The claim on `root`, or why it was refused: another run holds the
     /// same directory, or the directory cannot be identified. A root that
     /// cannot be identified is refused, never treated as free.
-    fn take(root: &Path) -> Result<Self, String> {
+    pub(crate) fn take(root: &Path) -> Result<Self, String> {
         let identity = root_identity(root)
             .map_err(|e| format!("cannot identify the wiki root {}: {e}", root.display()))?;
         let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
