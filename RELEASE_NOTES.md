@@ -2,6 +2,11 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-15 — Digest doc comments stop promising sync state
+
+### Docs
+- `DigestData` (`remind_me_core::models`) and `api_digest` (`remind_me_api::routes`) doc comments said the digest carries sync state and optional reminder sections. It carries recent memories, vitality, reminders and decisions due for review. Comments only; no behaviour change.
+
 ## 2026-11-15 — Tests for the openai embedder's resolution and cache key (#352)
 
 ### Tests
