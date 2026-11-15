@@ -2,6 +2,14 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-15 — Docs catch up with the hub removal; the openai backend gets its ADR (#209)
+
+### Docs
+- `CONTRIBUTING.md`: check, test and clippy commands use `--workspace` instead of six `-p` flags that still named the removed `remind_me_hub`, which made each command fail; the workspace is five crates.
+- `README.md`: the five crates share one version (was six); the daemon's background loops list the outbox prune instead of sync; `/api/digest` returns decisions due for review, not sync state.
+- `docs/parity-loop-decisions.md` and `docs/CUTOVER.md`: marked historical for their sync, peer and hub entries (ADR-0032).
+- `docs/adr/0034-openai-compatible-embeddings-backend.md`: records the `openai` embedding backend shipped in #346: no new dependency, local `http://` only with no API key, `EmbedRole` through the shared model-family prefixes. Closes #209.
+
 ## 2026-11-12 — Decisions and preferences never go dormant (Millwright R1)
 
 ### Changed

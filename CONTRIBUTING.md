@@ -10,7 +10,7 @@ Thank you for contributing to `rusty_remind_me`! This document outlines our deve
 - **Rust Toolchain**: pinned in `rust-toolchain.toml` (kept in step with rusty_mill's, whose crates this builds against); `rust-version` 1.89 is the declared floor.
 
 ### Local Workspace Setup
-Run cargo from the repository root; `--workspace` is this product's six crates. Monorepo crates (`rusty_mcp_server`, `rusty_tokio`, …) are git dependencies on `Rusty-Mill/rusty_mill`, all pinned to one `libs-*` tag in the root `Cargo.toml`. To move to a newer tag, change it there, run `cargo update`, and open a PR; a fix needed in one of those crates lands in rusty_mill first (its ADR-0013).
+Run cargo from the repository root; `--workspace` is this product's five crates (`remind_me_core`, `remind_me_mcp`, `remind_me_api`, `remind_me_remote`, and the `rusty-remind-me` CLI in `crates/remind_me_cli`). Monorepo crates (`rusty_mcp_server`, `rusty_tokio`, …) are git dependencies on `Rusty-Mill/rusty_mill`, all pinned to one `libs-*` tag in the root `Cargo.toml`. To move to a newer tag, change it there, run `cargo update`, and open a PR; a fix needed in one of those crates lands in rusty_mill first (its ADR-0013).
 
 ```bash
 # Clone the repository
@@ -18,10 +18,10 @@ git clone https://github.com/Rusty-Mill/rusty-remind-me
 cd rusty-remind-me
 
 # Validate cargo dependencies and path resolution
-cargo check -p remind_me_core -p remind_me_mcp -p remind_me_api -p rusty-remind-me -p remind_me_remote -p remind_me_hub
+cargo check --workspace
 
 # Run tests
-cargo test -p remind_me_core -p remind_me_mcp -p remind_me_api -p rusty-remind-me -p remind_me_remote -p remind_me_hub
+cargo test --workspace
 ```
 
 ---
@@ -38,7 +38,7 @@ Run the following commands before submitting code:
 cargo fmt --all
 
 # Run Clippy lints
-cargo clippy -p remind_me_core -p remind_me_mcp -p remind_me_api -p rusty-remind-me -p remind_me_remote -p remind_me_hub --all-targets -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 ### Key Coding Conventions
@@ -55,8 +55,8 @@ Every feature or bug fix must be accompanied by automated unit or integration te
 
 ### Running Test Suites
 ```bash
-# Run unit tests across all six crates
-cargo test -p remind_me_core -p remind_me_mcp -p remind_me_api -p rusty-remind-me -p remind_me_remote -p remind_me_hub
+# Run unit tests across all five crates
+cargo test --workspace
 
 # Run a specific test by name
 cargo test test_database_creation_and_add_memory
@@ -96,7 +96,7 @@ still holds: this is an app, so it may use rusty_mill's `foundation/`,
 ## 5. Pull Request Checklist
 
 Before submitting a Pull Request:
-- [ ] `cargo check` (with the six `-p` flags above) compiles cleanly.
-- [ ] `cargo test` (with the six `-p` flags above) passes all unit and integration tests.
+- [ ] `cargo check --workspace` compiles cleanly.
+- [ ] `cargo test --workspace` passes all unit and integration tests.
 - [ ] `cargo fmt --all` formats all code files.
 - [ ] Documentation in `README.md` and `ARCHITECTURE.md` is updated if API signatures or CLI subcommands changed.
