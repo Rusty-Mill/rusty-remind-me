@@ -89,7 +89,7 @@ pub fn memory_vector(store: &Store<'_>, memory_id: &str) -> Result<Option<Vec<f3
 }
 
 /// Active topics with no active child.
-fn active_leaves(tree: &topic::TopicTree) -> Vec<&topic::Topic> {
+pub(crate) fn active_leaves(tree: &topic::TopicTree) -> Vec<&topic::Topic> {
     tree.topics
         .iter()
         .filter(|t| t.status == Status::Active)

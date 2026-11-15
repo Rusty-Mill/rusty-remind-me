@@ -126,6 +126,13 @@ pub enum Op {
     /// Rebuild topic centroids and assign every unplaced memory; see
     /// [`crate::topic_assign`].
     TopicsAssign,
+    /// The rebalance check; see [`crate::topic_curate::report`].
+    TopicsReport,
+    /// A tree change; see [`crate::topic_curate`].
+    TopicsCurate {
+        action: TopicAction,
+        because: String,
+    },
     /// The daemon's own state. Answered by the daemon, not [`execute`].
     Status,
     /// Stop the daemon. Answered by the daemon, not [`execute`].
@@ -148,6 +155,16 @@ impl OpReply {
             OpReply::Err(message) => Err(message),
         }
     }
+}
+
+/// One change to the topic tree, by topic name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum TopicAction {
+    Merge { from: String, into: String },
+    Rename { from: String, to: String },
+    Move { topic: String, parent: String },
+    Retire { topic: String },
 }
 
 /// Run an operation against `db`. Every operation but the two that call a
@@ -305,6 +322,20 @@ fn run(store: &Store<'_>, op: &Op) -> Result<Value, String> {
             .and_then(|report| serde_json::to_value(report).map_err(|e| e.to_string())),
         Op::TopicsAssign => crate::topic_assign::assign_pending(store)
             .and_then(|report| serde_json::to_value(report).map_err(|e| e.to_string())),
+        Op::TopicsReport => crate::topic_curate::report(store)
+            .and_then(|report| serde_json::to_value(report).map_err(|e| e.to_string())),
+        Op::TopicsCurate { action, because } => {
+            use crate::topic_curate as curate;
+            match action {
+                TopicAction::Merge { from, into } => curate::merge(store, from, into, because),
+                TopicAction::Rename { from, to } => curate::rename(store, from, to, because),
+                TopicAction::Move { topic, parent } => {
+                    curate::move_to(store, topic, parent, because)
+                }
+                TopicAction::Retire { topic } => curate::retire(store, topic, because),
+            }
+            .and_then(|outcome| serde_json::to_value(outcome).map_err(|e| e.to_string()))
+        }
         Op::Status | Op::Shutdown => Err("only a daemon answers status and shutdown".into()),
     }
 }

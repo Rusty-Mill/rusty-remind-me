@@ -83,6 +83,7 @@ pub mod time_window;
 pub mod tool_profiles;
 pub mod topic;
 pub mod topic_assign;
+pub mod topic_curate;
 pub mod topic_seed;
 pub mod transcript;
 pub mod undo_import;
