@@ -72,10 +72,6 @@ fn list_count_and_total_agree_when_a_page_holds_everything() {
     let store = db.store();
     seed(&store, 3);
 
-    // Explicit limit: `MemoryListInput::default()` derives `limit: 0`, which
-    // `list_memories` clamps to LIST_LIMIT_MIN, while serde's default for an
-    // omitted `limit` is 20. Same struct, two different defaults — not this
-    // test's subject, so it does not rely on either.
     let input = MemoryListInput {
         limit: 10,
         ..Default::default()

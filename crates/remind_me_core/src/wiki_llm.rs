@@ -8,7 +8,10 @@
 
 use crate::db::Database;
 use crate::embedder::post_json_within;
-use crate::wiki_compile::{run, AutoOptions, AutoReport, PageDraft, PageRequest, WikiWriter};
+use crate::topic_seed::{NameReport, NameRequest, NamedTopic, TopicNamer};
+use crate::wiki_compile::{
+    run, AutoOptions, AutoReport, PageDraft, PageRequest, RunGuard, WikiWriter,
+};
 use crate::wiki_fs::Wiki;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -91,6 +94,97 @@ impl WikiWriter for ChatCompletionsWriter {
             .map_err(|e| e.to_string())?;
         parse_draft(&message_content(&reply)?)
     }
+}
+
+const NAME_INSTRUCTIONS: &str = "You name one topic in a personal knowledge base's topic tree. \
+Reply with only a JSON object: {\"name\": \"...\", \"description\": \"...\"}. \
+`name` is a short noun phrase of one to four words in Title Case, such as \"Systems Engineering\" \
+or \"Rust Async\", naming what the samples (or subtopics) have in common, never a sentence. \
+`description` is one sentence saying what belongs under the topic.";
+
+impl TopicNamer for ChatCompletionsWriter {
+    fn name_topic(&self, request: &NameRequest) -> Result<NamedTopic, String> {
+        let body = json!({
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "temperature": 0.2,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": NAME_INSTRUCTIONS},
+                {"role": "user", "content": name_prompt(request)},
+            ],
+        })
+        .to_string();
+        let reply = post_json_within(&self.url, LABEL, PATH, &body, self.timeout)
+            .map_err(|e| e.to_string())?;
+        parse_named(&message_content(&reply)?)
+    }
+}
+
+/// The user message for naming one topic: its subtopics' names when it has
+/// any, then its most central members.
+fn name_prompt(request: &NameRequest) -> String {
+    let mut text = String::new();
+    if !request.children.is_empty() {
+        text.push_str("Subtopics:\n");
+        for child in &request.children {
+            text.push_str(&format!("- {child}\n"));
+        }
+        text.push('\n');
+    }
+    text.push_str("Samples:\n");
+    for sample in &request.samples {
+        text.push_str(&format!("- {}\n", sample.replace('\n', " ")));
+    }
+    text.push_str("\n/no_think");
+    text
+}
+
+#[derive(Deserialize)]
+struct Named {
+    name: String,
+    #[serde(default)]
+    description: String,
+}
+
+/// The `{name, description}` in a model's answer, parsed like a page.
+fn parse_named(text: &str) -> Result<NamedTopic, String> {
+    let text = text.trim();
+    let named: Named = match serde_json::from_str(text) {
+        Ok(named) => named,
+        Err(_) => serde_json::from_str(embedded_object(text)?)
+            .map_err(|e| format!("the {LABEL}'s answer is not {{name, description}} JSON: {e}"))?,
+    };
+    if named.name.trim().is_empty() {
+        return Err(format!("the {LABEL} gave an empty topic name"));
+    }
+    Ok(NamedTopic {
+        name: named.name,
+        description: named.description,
+    })
+}
+
+/// Name up to `max_nodes` nodes of seed run `run` with the configured model.
+/// Holds the wiki compile's claim on the wiki root for the whole run, so
+/// naming and a compile never share the model's single slot.
+pub fn name_topics_with_configured_model(
+    db: &Database,
+    run: &str,
+    max_nodes: usize,
+) -> Result<NameReport, String> {
+    let namer = ChatCompletionsWriter::from_env()?.ok_or_else(|| {
+        format!("naming topics needs a local model: set {URL_ENV} and {MODEL_ENV}")
+    })?;
+    let wiki = Wiki::from_env();
+    let _slot = RunGuard::take(wiki.root())?;
+    let dir = crate::topic_seed::snapshot_dir(&db.store())?;
+    let samples = |ids: &[String]| -> Result<Vec<String>, String> {
+        let store = db.store();
+        let memories = crate::db::memories::Memories::new(&store);
+        let found = memories.get_many(ids).map_err(|e| e.to_string())?;
+        Ok(found.into_iter().map(|m| m.content).collect())
+    };
+    crate::topic_seed::name_pending(&dir, run, &namer, &samples, max_nodes)
 }
 
 /// Compile pending memories with the configured model, grouping them with
@@ -233,6 +327,25 @@ mod tests {
     use std::collections::HashMap;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+
+    #[test]
+    fn a_topic_name_parses_from_json_or_chatty_text_and_never_empty() {
+        let plain = parse_named(r#"{"name": "Systems Engineering", "description": "d"}"#).unwrap();
+        assert_eq!(plain.name, "Systems Engineering");
+        let chatty =
+            parse_named("<think>hm</think>Sure: {\"name\": \"MBSE\"} hope that helps").unwrap();
+        assert_eq!(
+            (chatty.name.as_str(), chatty.description.as_str()),
+            ("MBSE", "")
+        );
+        assert!(parse_named(r#"{"name": "  "}"#).is_err());
+        assert!(parse_named("no json here").is_err());
+        let prompt = name_prompt(&NameRequest {
+            children: vec!["MBSE".into()],
+            samples: vec!["line one\nline two".into()],
+        });
+        assert!(prompt.contains("- MBSE\n") && prompt.contains("- line one line two\n"));
+    }
 
     fn vars(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let map: HashMap<String, String> = pairs

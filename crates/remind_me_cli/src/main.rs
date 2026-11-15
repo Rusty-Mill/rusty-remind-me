@@ -8,7 +8,7 @@ mod session;
 
 use daemon::Store;
 use remind_me_api::ApiServer;
-use remind_me_core::daemon::ops::Op;
+use remind_me_core::daemon::ops::{Op, TopicAction};
 use remind_me_core::entity::Entity;
 use remind_me_core::entity_duplicates::{self, DuplicateCandidate};
 use remind_me_core::models::{Memory, MemoryListResult, MemorySearchResult};
@@ -334,6 +334,104 @@ fn parse_wiki_compile_args(args: &[String]) -> Result<Op, String> {
         max_batches,
         allow_shrink,
     })
+}
+
+const TOPICS_USAGE: &str = "Usage: rusty-remind-me topics seed\n       \
+rusty-remind-me topics name <run> [--max N]\n       \
+rusty-remind-me topics apply <run> [--dry-run]\n       \
+rusty-remind-me topics assign\n       \
+rusty-remind-me topics report\n       \
+rusty-remind-me topics merge <from> <into> --because TEXT\n       \
+rusty-remind-me topics rename <from> <to> --because TEXT\n       \
+rusty-remind-me topics move <topic> <parent|root> --because TEXT\n       \
+rusty-remind-me topics retire <topic> --because TEXT";
+
+/// Nodes one `topics name` call names unless `--max` says otherwise.
+const DEFAULT_NAME_MAX: usize = 50;
+
+/// Parsed form of `rusty-remind-me topics <seed|name|apply> ...`.
+fn parse_topics_args(args: &[String]) -> Result<Op, String> {
+    let usage = |why: &str| format!("Error: {why}.\n{TOPICS_USAGE}");
+    match args.first().map(String::as_str) {
+        Some("seed") if args.len() == 1 => Ok(Op::TopicsSeed),
+        Some("assign") if args.len() == 1 => Ok(Op::TopicsAssign),
+        Some("report") if args.len() == 1 => Ok(Op::TopicsReport),
+        Some(verb @ ("merge" | "rename" | "move" | "retire")) => {
+            parse_topic_change(verb, &args[1..])
+        }
+        Some("name") => {
+            let run = args
+                .get(1)
+                .ok_or_else(|| usage("topics name needs a run id"))?;
+            let max_nodes = match &args[2..] {
+                [] => DEFAULT_NAME_MAX,
+                [flag, value] if flag == "--max" => match value.parse::<usize>() {
+                    Ok(n) if n > 0 => n,
+                    _ => {
+                        return Err(usage(&format!(
+                            "--max must be a positive number, got {value:?}"
+                        )))
+                    }
+                },
+                _ => return Err(usage("topics name takes only --max N")),
+            };
+            Ok(Op::TopicsName {
+                run: run.clone(),
+                max_nodes,
+            })
+        }
+        Some("apply") => {
+            let run = args
+                .get(1)
+                .ok_or_else(|| usage("topics apply needs a run id"))?;
+            let dry_run = match &args[2..] {
+                [] => false,
+                [flag] if flag == "--dry-run" => true,
+                _ => return Err(usage("topics apply takes only --dry-run")),
+            };
+            Ok(Op::TopicsApply {
+                run: run.clone(),
+                dry_run,
+            })
+        }
+        _ => Err(usage(
+            "expected seed, name, apply, assign, report, merge, rename, move or retire",
+        )),
+    }
+}
+
+/// `merge|rename|move <a> <b> --because TEXT` or `retire <a> --because TEXT`.
+fn parse_topic_change(verb: &str, rest: &[String]) -> Result<Op, String> {
+    let usage = |why: &str| format!("Error: {why}.\n{TOPICS_USAGE}");
+    let names = if verb == "retire" { 1 } else { 2 };
+    let (positional, flags) = rest.split_at(rest.len().min(names));
+    let because = match flags {
+        [flag, text] if flag == "--because" && !text.trim().is_empty() => text.clone(),
+        _ => return Err(usage(&format!("topics {verb} needs --because TEXT"))),
+    };
+    let arg = |i: usize| -> Result<String, String> {
+        positional
+            .get(i)
+            .filter(|s| !s.starts_with("--"))
+            .cloned()
+            .ok_or_else(|| usage(&format!("topics {verb} needs {names} topic name(s)")))
+    };
+    let action = match verb {
+        "merge" => TopicAction::Merge {
+            from: arg(0)?,
+            into: arg(1)?,
+        },
+        "rename" => TopicAction::Rename {
+            from: arg(0)?,
+            to: arg(1)?,
+        },
+        "move" => TopicAction::Move {
+            topic: arg(0)?,
+            parent: arg(1)?,
+        },
+        _ => TopicAction::Retire { topic: arg(0)? },
+    };
+    Ok(Op::TopicsCurate { action, because })
 }
 
 /// What a `resolve` records: whether it was carried out, or whether a
@@ -1037,6 +1135,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     report.skipped.len()
                 );
             }
+            "topics" => {
+                let op = match parse_topics_args(&args[2..]) {
+                    Ok(op) => op,
+                    Err(message) => {
+                        eprintln!("{}", message);
+                        std::process::exit(1);
+                    }
+                };
+                let value: serde_json::Value = Store::open(&db_path)?.call(op)?;
+                println!("{}", serde_json::to_string_pretty(&value)?);
+                if value.get("stopped").is_some_and(|s| !s.is_null()) {
+                    std::process::exit(1);
+                }
+            }
             "wiki-compile" => {
                 let op = match parse_wiki_compile_args(&args[2..]) {
                     Ok(op) => op,
@@ -1094,7 +1206,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", serde_json::to_string_pretty(&stats)?);
             }
             cmd => {
-                eprintln!("Unknown subcommand: {}. Available: configure, daemon, api, remote, server, search, add, list, get, entity, entity-duplicates, wiki-write, wiki-read, wiki-import, wiki-compile, stats, resolve, session, capture-transcript, import-sessions, context, brief, impact-export", cmd);
+                eprintln!("Unknown subcommand: {}. Available: configure, daemon, api, remote, server, search, add, list, get, entity, entity-duplicates, wiki-write, wiki-read, wiki-import, wiki-compile, topics, stats, resolve, session, capture-transcript, import-sessions, context, brief, impact-export", cmd);
                 std::process::exit(1);
             }
         }
@@ -1109,6 +1221,64 @@ mod tests {
 
     fn args(raw: &[&str]) -> Vec<String> {
         raw.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn topics_takes_seed_name_and_apply() {
+        assert!(matches!(
+            parse_topics_args(&args(&["seed"])),
+            Ok(Op::TopicsSeed)
+        ));
+        assert!(matches!(
+            parse_topics_args(&args(&["assign"])),
+            Ok(Op::TopicsAssign)
+        ));
+        assert!(matches!(
+            parse_topics_args(&args(&["merge", "A", "B", "--because", "dup"])),
+            Ok(Op::TopicsCurate {
+                action: TopicAction::Merge { .. },
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse_topics_args(&args(&["retire", "A", "--because", "unused"])),
+            Ok(Op::TopicsCurate {
+                action: TopicAction::Retire { .. },
+                ..
+            })
+        ));
+        for bad in [
+            &["merge", "A", "B"][..],
+            &["merge", "A", "--because", "x"],
+            &["retire", "A", "--because", " "],
+            &["move", "A"],
+        ] {
+            assert!(parse_topics_args(&args(bad)).is_err(), "{bad:?}");
+        }
+        assert!(matches!(
+            parse_topics_args(&args(&["name", "r1", "--max", "3"])),
+            Ok(Op::TopicsName { max_nodes: 3, .. })
+        ));
+        assert!(matches!(
+            parse_topics_args(&args(&["name", "r1"])),
+            Ok(Op::TopicsName {
+                max_nodes: DEFAULT_NAME_MAX,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse_topics_args(&args(&["apply", "r1", "--dry-run"])),
+            Ok(Op::TopicsApply { dry_run: true, .. })
+        ));
+        for bad in [
+            &[][..],
+            &["seed", "x"],
+            &["name"],
+            &["name", "r1", "--max", "0"],
+            &["apply", "r1", "--force"],
+        ] {
+            assert!(parse_topics_args(&args(bad)).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

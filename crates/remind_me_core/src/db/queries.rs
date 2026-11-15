@@ -39,6 +39,7 @@ pub fn add_memory_with(
     input.metadata = crate::consolidation::keep_evidence(std::mem::take(&mut input.metadata), None);
     fields.validate(&input.metadata, None)?;
     crate::project::refuse_reserved_predicate(input.predicate.as_deref())?;
+    crate::topic::refuse_topic_entities(&input.entities)?;
     let project = crate::context::explicit_project(input.project.as_deref())?;
     if let Some(scheduled) =
         crate::review::schedule_if_decision(fields.memory_type.as_deref(), &input.metadata)
@@ -136,6 +137,10 @@ pub fn add_memory_with(
     if let Some(embedder) = crate::embedder::available_embedder() {
         let _ = crate::vectors::embed_and_store(store, &*embedder, &id, &content);
     }
+    // Best-effort like the embedding above: a write never fails for want of
+    // a topic. Reads the saved centroids only; a store without topics pays a
+    // file-existence check.
+    crate::topic_assign::assign_on_write(store, &id);
 
     let memory = get_memory_by_id(store, &id)?.ok_or(StoreError::NotFound)?;
     crate::episodes::ensure_session_for(store, &memory)?;
@@ -165,10 +170,18 @@ pub fn get_memory_by_id(store: &Store<'_>, id: &str) -> Result<Option<Memory>> {
 
 /// List memories newest-first, filtered by category, source and/or tags.
 ///
-/// `limit` is clamped to [`LIST_LIMIT_MIN`]..=[`LIST_LIMIT_MAX`]; the clamped
-/// value is echoed back in the result so callers can tell what was applied.
+/// A `limit` below [`LIST_LIMIT_MIN`] is refused as [`StoreError::Invalid`]:
+/// it used to clamp to 1, so a caller asking for nothing silently got one row
+/// (#223). A `limit` above [`LIST_LIMIT_MAX`] is clamped, and the applied
+/// value is echoed back in the result so callers can tell.
 pub fn list_memories(store: &Store<'_>, input: &MemoryListInput) -> Result<MemoryListResult> {
-    let limit = input.limit.clamp(LIST_LIMIT_MIN, LIST_LIMIT_MAX);
+    if input.limit < LIST_LIMIT_MIN {
+        return Err(StoreError::Invalid(format!(
+            "limit must be between {LIST_LIMIT_MIN} and {LIST_LIMIT_MAX}, got {}",
+            input.limit
+        )));
+    }
+    let limit = input.limit.min(LIST_LIMIT_MAX);
     // Filters apply before `COUNT`, `LIMIT` and `OFFSET`, so all three agree:
     // the reference hit exactly that pagination bug as `DATA-02`.
     let filter = ListFilter {
@@ -473,7 +486,8 @@ pub fn annotate_memories(store: &Store<'_>, input: &AnnotateInput) -> Result<Ann
             continue;
         };
         let guarded = crate::project::refuse_reserved_predicate(annotation.predicate.as_deref())
-            .and_then(|()| crate::project::refuse_claim_edit(&stored));
+            .and_then(|()| crate::project::refuse_claim_edit(&stored))
+            .and_then(|()| crate::topic::refuse_topic_entities(&annotation.entities));
         if let Err(refused) = guarded {
             errors.push(AnnotationError {
                 memory_id: annotation.memory_id.clone(),
@@ -946,6 +960,25 @@ fn resolve_narrowing(store: &Store<'_>, input: &MemorySearchInput) -> Result<Opt
             })
         }
     };
+    let topic = match clean(&input.filters.topic) {
+        None => None,
+        Some(name) => {
+            let Ok(name) = crate::topic::TopicName::parse(name) else {
+                return Ok(None);
+            };
+            let tree = crate::topic::tree(store)?;
+            let subtree = tree.subtree(&name);
+            if subtree.is_empty() {
+                return Ok(None);
+            }
+            let memories = Memories::new(store);
+            let mut members = std::collections::HashSet::new();
+            for t in subtree {
+                members.extend(memories.linked_ids(&t.entity_id)?);
+            }
+            Some(members)
+        }
+    };
     let tags = input
         .tags
         .iter()
@@ -958,6 +991,7 @@ fn resolve_narrowing(store: &Store<'_>, input: &MemorySearchInput) -> Result<Opt
         tags,
         tag_match: input.filters.tag_mode,
         entity,
+        topic,
         repo: clean(&input.filters.repo).and_then(crate::context::normalize_remote),
     }))
 }

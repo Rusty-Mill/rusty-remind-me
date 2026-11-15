@@ -678,6 +678,18 @@ pub(crate) fn link(
     Ok(true)
 }
 
+/// Remove the one link from `memory_id` to `entity_id`. Whether it existed.
+/// Not queued: the outbox carries no link deletes (multi-node sync is gone,
+/// ADR-0032), the same as [`unlink_memory`].
+pub(crate) fn unlink(tables: &mut EngineTables, memory_id: &str, entity_id: &str) -> Result<bool> {
+    let id = pair_engine_id(memory_id, entity_id);
+    if core_ref(tables)?.links.get(id).is_none() {
+        return Ok(false);
+    }
+    tables.commit(vec![Change::Link(id, None)])?;
+    Ok(true)
+}
+
 /// Remove every link from memory `memory_id`: part of deleting a memory.
 pub(crate) fn unlink_memory(tables: &mut EngineTables, memory_id: &str) -> Result<()> {
     let changes = links(core_ref(tables)?)

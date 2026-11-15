@@ -77,3 +77,6 @@
 {"query": "VM snapshot rollback", "relevant": ["m-deploy-rollback"], "kind": "dormant", "must_not": ["m-dormant-rollback"]}
 {"query": "dock controller firmware update", "relevant": ["m-dock-firmware"], "kind": "dormant", "must_not": ["m-dormant-firmware"]}
 {"query": "API rate limit per IP address", "relevant": ["m-ratelimit-300"], "kind": "dormant", "must_not": ["m-dormant-ratelimit", "m-ratelimit-120"]}
+{"query": "testing", "relevant": ["m-test-dock-burnin", "m-test-lock-cycle"], "kind": "topic", "must_not": ["m-test-app-e2e", "m-test-api-contract"], "topic": "Hardware Testing"}
+{"query": "testing", "relevant": ["m-test-app-e2e", "m-test-api-contract"], "kind": "topic", "must_not": ["m-test-dock-burnin", "m-test-lock-cycle"], "topic": "Software"}
+{"query": "dock testing", "relevant": ["m-test-dock-burnin"], "kind": "topic", "must_not": ["m-test-app-e2e"], "topic": "Hardware"}

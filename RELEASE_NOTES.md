@@ -16,6 +16,49 @@ Dated entries, newest first. One entry per merged pull request.
 - `consolidation` unit tests: the owned key wins over the legacy one, `keep_evidence` drops a client count and keeps the stored one, the sum saturates at `u64::MAX`, discredited decisions count zero, and an injected failure between the weight write and `set_merged` rolls back so the retry counts once (fails without the transaction).
 - `consolidate_test`: a client's own `evidence` entry survives a merge, the issue's update-then-merge repro now gives f(3) instead of compounding, a client cannot seed or forge the count, and a reverted decision is merged without adding evidence.
 
+## 2026-11-15 — `MemoryListInput::default()` lists 20 rows; `limit: 0` is an error (#223)
+
+### Fixed
+- `MemoryListInput::default()` now has `limit: 20`, the same as an omitted `limit` over MCP. The derived `Default` gave 0, which `list_memories` clamped to 1, so a Rust caller using `..Default::default()` silently got one row.
+- `ExportInput::default()` now includes the entity graph, as an omitted `include_graph` already did; the derived `Default` left it out.
+
+### Changed
+- `list_memories` refuses `limit: 0` with "limit must be between 1 and 100" instead of returning one row. `remind_me_list` reports it as an error and `GET /api/memories?limit=0` answers 400. A limit above 100 is still clamped. The CLI already refused 0.
+
+### Tests
+- `list_default_test`: both defaults match the wire defaults, a default list returns every seeded row, an explicit 0 is refused, and over-100 still clamps. Four of the five fail on the previous code. `list_limit_test` (MCP) and `memories_test` (HTTP) cover the error at each boundary.
+
+## 2026-11-15 — Memories imported from DBS link to their source artifact (#762)
+
+### Added
+- Each memory `dbs-import` writes now carries `metadata.source_artifact`: `store` (`dbs:<source>`), `id` (the item's id at that source) and `hash` (DBS's content hash for the imported version). This is the provenance contract from the #762 audit (`docs/design/dbs-modularity-audit.md`). Distilled memories will use the same key to point at clipped pages and verbatim dialogs once the artifact store exists. The existing `dbs_*` metadata keys are unchanged. Memories imported before this change are not rewritten.
+- `remind_me_core::source_artifact::SourceArtifact` reads and writes the link.
+
+### Tests
+- `source_artifact` unit tests: round trip through metadata, and a missing or malformed link reads as none. `dbs_import_test` checks that an imported item carries its link.
+
+## 2026-11-15 — Digest doc comments stop promising sync state
+
+### Docs
+- `DigestData` (`remind_me_core::models`) and `api_digest` (`remind_me_api::routes`) doc comments said the digest carries sync state and optional reminder sections. It carries recent memories, vitality, reminders and decisions due for review. Comments only; no behaviour change.
+
+## 2026-11-15 — Tests for the openai embedder's resolution and cache key (#352)
+
+### Tests
+- `openai_resolve_test` (new): with `REMIND_ME_EMBEDDING_BACKEND=openai`, a set model resolves to an `openai` identity with that model and dimension; an unset, empty or blank model resolves to nothing, and `configured_embedder`, `embedding_status` and `server_status` each name `REMIND_ME_OPENAI_EMBED_MODEL` without blaming the daemon or ONNX; a dead port and an unparseable URL resolve but are not available, and the status says the backend is not answering.
+- `embedder_availability_cache_test`: changing any of the eight variables the availability cache is keyed on makes the next call probe again, and an unchanged configuration is served from the cache. Dropping `REMIND_ME_ONNX_TOKENIZER_PATH` from the key fails the test.
+
+### Docs
+- README: the feature list names the OpenAI-compatible backend alongside Ollama and ONNX. The embedder table already had its row.
+
+## 2026-11-15 — Docs catch up with the hub removal; the openai backend gets its ADR (#209)
+
+### Docs
+- `CONTRIBUTING.md`: check, test and clippy commands use `--workspace` instead of six `-p` flags that still named the removed `remind_me_hub`, which made each command fail; the workspace is five crates.
+- `README.md`: the five crates share one version (was six); the daemon's background loops list the outbox prune instead of sync; `/api/digest` returns decisions due for review, not sync state.
+- `docs/parity-loop-decisions.md` and `docs/CUTOVER.md`: marked historical for their sync, peer and hub entries (ADR-0032).
+- `docs/adr/0034-openai-compatible-embeddings-backend.md`: records the `openai` embedding backend shipped in #346: no new dependency, local `http://` only with no API key, `EmbedRole` through the shared model-family prefixes. Closes #209.
+
 ## 2026-11-12 — Decisions and preferences never go dormant (Millwright R1)
 
 ### Changed

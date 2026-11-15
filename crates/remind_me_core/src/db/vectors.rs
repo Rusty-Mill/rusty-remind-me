@@ -72,6 +72,11 @@ impl<'c> Vectors<'c> {
         engine::vectors::chunk_count(&self.core.lock(), memory_id)
     }
 
+    /// The chunks of `memory_id`, by chunk index, through the memory index.
+    pub fn chunks_for(&self, memory_id: &str) -> Result<Vec<ChunkVector>> {
+        engine::vectors::chunks_for(&self.core.lock(), memory_id)
+    }
+
     /// How many chunks are stored in all.
     pub fn count(&self) -> Result<usize> {
         engine::vectors::count(&self.core.lock())

@@ -451,6 +451,10 @@ pub struct SearchFilters {
     /// subject or object is it. An unknown entity matches nothing.
     #[serde(default)]
     pub entity: Option<String>,
+    /// Only memories in this topic or any topic below it, by name (with or
+    /// without the `topic:` prefix). An unknown topic matches nothing.
+    #[serde(default)]
+    pub topic: Option<String>,
     /// Only memories written in this repository: a `git_remote` in any form
     /// `git` accepts, compared after [`crate::context::normalize_remote`].
     #[serde(default)]
@@ -502,7 +506,10 @@ fn default_token_budget() -> usize {
 }
 
 /// Input model for listing memories with filters and pagination.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// `Default` is hand-written so `MemoryListInput::default()` agrees with an
+/// omitted `limit` over the wire (20); a derived one gave 0 (#223).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryListInput {
     pub category: Option<String>,
     /// A memory must carry *all* of these tags to match.
@@ -526,6 +533,21 @@ pub struct MemoryListInput {
 
 fn default_list_limit() -> usize {
     20
+}
+
+impl Default for MemoryListInput {
+    fn default() -> Self {
+        Self {
+            category: None,
+            tags: None,
+            source: None,
+            limit: default_list_limit(),
+            offset: 0,
+            response_format: ResponseFormat::default(),
+            include_sensitive: false,
+            scope: crate::context::ScopeFilter::default(),
+        }
+    }
 }
 
 /// Inclusive bounds the reference enforces on `MemoryListInput::limit`.
@@ -1286,7 +1308,10 @@ pub enum ExportFormat {
 }
 
 /// Input model for `remind_me_export_memories`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// `Default` is hand-written so `ExportInput::default()` includes the graph,
+/// as an omitted `include_graph` does over the wire; a derived one dropped it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportInput {
     #[serde(default)]
     pub format: ExportFormat,
@@ -1317,6 +1342,19 @@ pub struct ExportInput {
 
 fn default_include_graph() -> bool {
     true
+}
+
+impl Default for ExportInput {
+    fn default() -> Self {
+        Self {
+            format: ExportFormat::default(),
+            category: None,
+            tags: None,
+            file_path: None,
+            include_graph: default_include_graph(),
+            include_deleted: false,
+        }
+    }
 }
 
 /// Outcome of an export.
@@ -2064,12 +2102,8 @@ pub struct DigestRecentMemory {
     pub created_at: String,
 }
 
-/// The digest's underlying data.
-///
-/// `reminders_*` and `sync` are `Option` because their subsystems do not exist
-/// yet (#116, #114). `None` means "nothing here can tell", which is different
-/// from "nothing to report" — the renderer omits those sections rather than
-/// printing a "none" that would read as an answer.
+/// The digest's underlying data: recent memories, vitality, reminders on
+/// both sides of now, and decisions due for review.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DigestData {
     pub generated_at: String,

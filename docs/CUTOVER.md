@@ -5,6 +5,9 @@
 > record of the 2026-08 cutover are kept as history; hosts still running a
 > Python process should switch to `rusty-remind-me` as the README's "Coming
 > from the Python `remind_me`" describes.
+> Multi-node sync and the hub were removed later (ADR-0032), so its sync
+> steps (`HUB_URL`, `SYNC_SECRET`, the peer-sync receiver, the
+> `remind-me-hub` unit) no longer apply to any host.
 
 **What this is.** A runbook plus a dated record of the first real one: migrating
 every process on a machine that talks to `remind_me`/`rusty_remind_me` from the

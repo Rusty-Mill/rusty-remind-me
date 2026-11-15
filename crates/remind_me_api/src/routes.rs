@@ -299,6 +299,7 @@ pub fn api_list(store: &Store<'_>, _wiki: &Wiki, req: &Request, _params: &Params
                 "memories": result.memories,
             }))
         }
+        Err(StoreError::Invalid(why)) => err(400, why),
         Err(e) => internal_err(e),
     }
 }
@@ -676,6 +677,18 @@ pub fn api_entities(
     };
     match list_entities(store, limit, offset) {
         Ok(page) => ok(page),
+        Err(e) => internal_err(e),
+    }
+}
+
+/// One zoom step of the topic graph: the topics under `parent` (the top
+/// level when absent or `root`), with member counts. `include_retired=true`
+/// keeps retired topics. Read-only; the tree changes through the CLI.
+pub fn api_topics(store: &Store<'_>, _wiki: &Wiki, req: &Request, _params: &Params) -> (u16, Body) {
+    let include_retired = req.query_str("include_retired") == Some("true");
+    match remind_me_core::topic_curate::level(store, req.query_str("parent"), include_retired) {
+        Ok(level) => ok(level),
+        Err(e) if e.contains("is not a valid topic") || e.contains("topic label") => err(404, e),
         Err(e) => internal_err(e),
     }
 }
@@ -1251,7 +1264,8 @@ pub fn api_set_reminder(
 }
 
 /// `digest::build_digest`, shared with `remind_me_digest` — recent memories,
-/// vitality, reminders on both sides of now, and sync state in one payload.
+/// vitality, reminders on both sides of now, and decisions due for review in
+/// one payload.
 ///
 /// Sensitive memories are excluded by the core function with no override, and
 /// this route deliberately adds none: a digest is the ambient surface that
@@ -1590,6 +1604,11 @@ pub const ROUTES: &[Route] = &[
         methods: &["GET"],
         pattern: "/api/entities",
         handler: api_entities,
+    },
+    Route {
+        methods: &["GET"],
+        pattern: "/api/topics",
+        handler: api_topics,
     },
     Route {
         methods: &["GET"],
