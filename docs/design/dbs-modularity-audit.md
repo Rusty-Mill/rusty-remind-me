@@ -1,6 +1,6 @@
 # Audit: can DBS fold into remind-me as a module with its own storage?
 
-Status: Draft for Nano's decision (Mill Board #762). Design only: no code, schema, data or API change.
+Status: Direction chosen. Nano picked option A, "Refactor first, store at benchmark", on 2026-11-15. Design only: no code, schema, data or API change. Each build step still needs his go-ahead.
 Date: 2026-11-15. Read at rusty-remind-me `9aff941`, rusty_mill `7c5bc795`,
 Daily-Backup-System `6cc6491`, rusty_dbs `fd2bf76`.
 
