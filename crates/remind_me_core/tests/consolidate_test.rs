@@ -11,11 +11,12 @@
 //! matching `vectors_test.rs`'s convention — chunk 0 is what
 //! `consolidation::consolidate` reads.
 
-use remind_me_core::consolidation::consolidate;
+use remind_me_core::consolidation::{consolidate, EVIDENCE_KEY};
 use remind_me_core::db::queries;
 use remind_me_core::db::Store;
+use remind_me_core::kinds::StructuredFields;
 use remind_me_core::testing;
-use remind_me_core::{ConsolidateInput, Database, MemoryAddInput};
+use remind_me_core::{ConsolidateInput, Database, MemoryAddInput, MemoryUpdateInput};
 use std::collections::HashMap;
 
 fn add_with_vector(store: &Store<'_>, content: &str, category: &str, vector: &[f32]) -> String {
@@ -338,7 +339,7 @@ fn a_merge_records_evidence_and_raises_base_weight() {
     let after = queries::get_memory_by_id(&store, &canonical)
         .unwrap()
         .unwrap();
-    assert_eq!(after.metadata["evidence"], 2);
+    assert_eq!(after.metadata[EVIDENCE_KEY], 2);
     let want = before.base_weight * (1.0 + 0.1 * 2f64.ln());
     assert!(
         (after.base_weight - want).abs() < 1e-9,
@@ -374,8 +375,161 @@ fn evidence_accumulates_across_merges_without_compounding_the_boost() {
     let after = queries::get_memory_by_id(&store, &canonical)
         .unwrap()
         .unwrap();
-    assert_eq!(after.metadata["evidence"], 3);
+    assert_eq!(after.metadata[EVIDENCE_KEY], 3);
     let want = original * (1.0 + 0.1 * 3f64.ln());
+    assert!(
+        (after.base_weight - want).abs() < 1e-9,
+        "{}",
+        after.base_weight
+    );
+}
+
+/// A pair that clusters, canonical first (higher vitality).
+fn pair(store: &Store<'_>) -> (String, String) {
+    let canonical = add_with_vector(store, "the meeting moved to 3pm", "general", &[1.0, 0.0]);
+    let member = add_with_vector(store, "meeting is now at 3pm", "general", &[0.99, 0.14107]);
+    set_vitality_and_access(store, &canonical, 0.9, 5);
+    set_vitality_and_access(store, &member, 0.5, 3);
+    (canonical, member)
+}
+
+fn replace_metadata(store: &Store<'_>, id: &str, metadata: serde_json::Value) {
+    queries::update_memory(
+        store,
+        &MemoryUpdateInput {
+            project: None,
+            sensitive: None,
+            memory_id: id.to_string(),
+            content: None,
+            category: None,
+            tags: None,
+            metadata: Some(metadata),
+            clear_superseded: false,
+        },
+    )
+    .unwrap();
+}
+
+fn get(store: &Store<'_>, id: &str) -> remind_me_core::Memory {
+    queries::get_memory_by_id(store, id).unwrap().unwrap()
+}
+
+#[test]
+fn a_merge_keeps_a_clients_own_evidence_entry() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let (canonical, _) = pair(&store);
+    replace_metadata(
+        &store,
+        &canonical,
+        serde_json::json!({"evidence": ["doc-1"]}),
+    );
+
+    merge_into(&store, &canonical, "the meeting is at 3pm");
+
+    let after = get(&store, &canonical);
+    assert_eq!(after.metadata["evidence"], serde_json::json!(["doc-1"]));
+    assert_eq!(after.metadata[EVIDENCE_KEY], 2);
+}
+
+#[test]
+fn an_update_cannot_reset_the_count_so_the_boost_does_not_compound() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let (canonical, _) = pair(&store);
+    let original = get(&store, &canonical).base_weight;
+    merge_into(&store, &canonical, "the meeting is at 3pm");
+
+    // The issue's repro: replace metadata, dropping the count, then merge again.
+    replace_metadata(&store, &canonical, serde_json::json!({"note": "edited"}));
+    let kept = get(&store, &canonical);
+    assert_eq!(kept.metadata[EVIDENCE_KEY], 2);
+    assert_eq!(kept.metadata["note"], "edited");
+    let second = add_with_vector(
+        &store,
+        "3pm is the meeting time",
+        "general",
+        &[0.98, 0.19867],
+    );
+    set_vitality_and_access(&store, &second, 0.1, 0);
+    merge_into(&store, &canonical, "the meeting is at 3pm");
+
+    let after = get(&store, &canonical);
+    assert_eq!(after.metadata[EVIDENCE_KEY], 3);
+    let want = original * (1.0 + 0.1 * 3f64.ln());
+    assert!(
+        (after.base_weight - want).abs() < 1e-9,
+        "{}",
+        after.base_weight
+    );
+}
+
+#[test]
+fn a_client_cannot_seed_or_forge_the_count() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let seeded = queries::add_memory(
+        &store,
+        MemoryAddInput {
+            content: "seeded".into(),
+            category: "general".into(),
+            source: "manual".into(),
+            metadata: serde_json::json!({ EVIDENCE_KEY: 50 }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(seeded.metadata.get(EVIDENCE_KEY).is_none());
+
+    let (canonical, _) = pair(&store);
+    merge_into(&store, &canonical, "the meeting is at 3pm");
+    replace_metadata(&store, &canonical, serde_json::json!({ EVIDENCE_KEY: 1 }));
+    assert_eq!(get(&store, &canonical).metadata[EVIDENCE_KEY], 2);
+}
+
+#[test]
+fn a_reverted_decision_adds_no_evidence() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let (canonical, _) = pair(&store);
+    let reverted = queries::add_memory_with(
+        &store,
+        MemoryAddInput {
+            content: "the meeting is at 3pm, we decided".into(),
+            category: "general".into(),
+            source: "manual".into(),
+            metadata: serde_json::json!({ "rationale": "room free" }),
+            ..Default::default()
+        },
+        &StructuredFields {
+            memory_type: Some("decision".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .id;
+    let bytes: Vec<u8> = [0.98f32, 0.19867]
+        .iter()
+        .flat_map(|f| f.to_le_bytes())
+        .collect();
+    remind_me_core::db::vectors::Vectors::new(&store)
+        .put(&reverted, 0, &bytes)
+        .unwrap();
+    set_vitality_and_access(&store, &reverted, 0.1, 0);
+    remind_me_core::resolve::resolve_memory(&store, &reverted, "reverted", None)
+        .unwrap()
+        .unwrap();
+    let original = get(&store, &canonical).base_weight;
+
+    let report = merge_into(&store, &canonical, "the meeting is at 3pm");
+
+    assert_eq!(report["memories_superseded"], 2);
+    let after = get(&store, &canonical);
+    assert_eq!(
+        after.metadata[EVIDENCE_KEY], 2,
+        "the reverted decision is not evidence"
+    );
+    let want = original * (1.0 + 0.1 * 2f64.ln());
     assert!(
         (after.base_weight - want).abs() < 1e-9,
         "{}",

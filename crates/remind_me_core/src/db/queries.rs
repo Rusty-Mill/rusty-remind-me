@@ -35,6 +35,8 @@ pub fn add_memory_with(
     mut input: MemoryAddInput,
     fields: &StructuredFields,
 ) -> Result<Memory> {
+    // The evidence count is the system's (#354): a client cannot seed one.
+    input.metadata = crate::consolidation::keep_evidence(std::mem::take(&mut input.metadata), None);
     fields.validate(&input.metadata, None)?;
     crate::project::refuse_reserved_predicate(input.predicate.as_deref())?;
     crate::topic::refuse_topic_entities(&input.entities)?;
@@ -232,7 +234,14 @@ pub fn update_memory_with(
     };
     crate::project::refuse_claim_edit(&stored)?;
     let project = crate::context::explicit_project(input.project.as_deref())?;
-    let metadata = input.metadata.as_ref().unwrap_or(&stored.metadata);
+    // Replacing metadata keeps the system-owned evidence count (#354), so an
+    // edit can neither clobber it nor reset it under an already boosted
+    // `base_weight`.
+    let client_metadata = input
+        .metadata
+        .clone()
+        .map(|m| crate::consolidation::keep_evidence(m, Some(&stored.metadata)));
+    let metadata = client_metadata.as_ref().unwrap_or(&stored.metadata);
     fields.validate(metadata, stored.memory_type.as_deref())?;
     // Becoming a decision schedules its follow-up; staying one does not.
     let scheduled = if stored.memory_type.as_deref() == Some("decision") {
@@ -250,7 +259,7 @@ pub fn update_memory_with(
         content: input.content.clone(),
         category: input.category.clone(),
         tags: input.tags.clone(),
-        metadata: scheduled.or_else(|| input.metadata.clone()),
+        metadata: scheduled.or_else(|| client_metadata.clone()),
         sensitive: input.sensitive,
         clear_superseded: input.clear_superseded,
         memory_type: fields.memory_type.clone(),
@@ -286,8 +295,7 @@ pub fn update_memory_with(
             .tags
             .as_ref()
             .map(|t| serde_json::to_string(t).unwrap_or_else(|_| "[]".to_string())),
-        metadata_json: input
-            .metadata
+        metadata_json: client_metadata
             .as_ref()
             .map(|m| serde_json::to_string(m).unwrap_or_else(|_| "{}".to_string())),
         sensitive: input.sensitive,

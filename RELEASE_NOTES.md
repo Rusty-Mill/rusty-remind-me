@@ -2,6 +2,20 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-15 — Consolidation evidence count is the system's own (#354)
+
+### Fixed
+- A merge no longer overwrites a client's `metadata.evidence`. The count now lives under the reserved key `remind_me:evidence`, which the system owns: `remind_me_add` drops it from client metadata and `remind_me_update` keeps the stored value whatever a client sends. A canonical merged before this fix keeps its old `evidence` count until its next merge moves it to the new key; the old key is never written again.
+- The evidence boost on `base_weight` no longer compounds after a `remind_me_update` replaces metadata, because an update can no longer reset the count.
+- The evidence sum saturates instead of overflowing.
+- Each merge's writes run in one transaction, so a merge that fails part way leaves nothing behind and its retry counts the evidence once.
+- A decision resolved as `reverted` or `abandoned` adds no evidence to a merge, the same rule promotions use.
+- The multi-node "lossy across nodes" case in #354 no longer applies: ADR-0032 removed multi-node sync.
+
+### Tests
+- `consolidation` unit tests: the owned key wins over the legacy one, `keep_evidence` drops a client count and keeps the stored one, the sum saturates at `u64::MAX`, discredited decisions count zero, and an injected failure between the weight write and `set_merged` rolls back so the retry counts once (fails without the transaction).
+- `consolidate_test`: a client's own `evidence` entry survives a merge, the issue's update-then-merge repro now gives f(3) instead of compounding, a client cannot seed or forge the count, and a reverted decision is merged without adding evidence.
+
 ## 2026-11-15 — `MemoryListInput::default()` lists 20 rows; `limit: 0` is an error (#223)
 
 ### Fixed
