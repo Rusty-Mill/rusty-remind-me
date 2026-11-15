@@ -2,6 +2,17 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-15 — The default tool profile is `core`; admin tools move to the CLI (ADR-0030 step 2)
+
+### Changed
+- A client that sets no `REMIND_ME_TOOL_PROFILE` now sees the `core` group (11 tools: search, brief, get, add, update, delete, auto_capture, resolve, entity, digest, server_status), not all 46. **To get the old surface back, set `REMIND_ME_TOOL_PROFILE=full`** (or a list such as `core,pipeline,wiki`). A blank value is the default; a misspelt one still falls back to `full`.
+- Clients lose by default: the `pipeline` group (queue, decompose, annotate, normalize_apply, reclassify, promote, consolidate, feedback, entity_upsert, entity_traverse, persona, provenance, skeleton_read, skeleton_write, revert, project), `wiki` (wiki_read/write/delete/compile), `import` (import, undo_import, capture_transcript), `admin`, and `extras` (reminders, saved_searches, session_timeline). The old merged tool names stay callable until 0.6.0, but only where their replacement's group is on.
+- `rusty-remind-me admin <verb> [JSON-ARGS]` runs backup, reindex, archive-prune, export-memories, revoke-clients and api-key with every tool visible, whatever profile is set, and exits non-zero when the tool reports an error.
+- `remind_me_self_update` is no longer an MCP tool in any profile. Use `rusty-remind-me admin self-update [--force]`.
+
+### Tests
+- `tool_profiles_test`: the default is `core`, blank is the default, `full` stays selectable, `self_update` is in no group. `admin_cli_test`: each admin verb runs against a temp store under `REMIND_ME_TOOL_PROFILE=core`, verbs take JSON arguments, a tool error exits non-zero, unknown verbs and bad JSON print usage. The MCP registration test asserts `self_update` is not listed.
+
 ## 2026-11-15 — Consolidation evidence count is the system's own (#354)
 
 ### Fixed

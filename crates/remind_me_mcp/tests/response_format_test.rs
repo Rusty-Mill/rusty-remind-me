@@ -44,6 +44,9 @@ fn server() -> McpServer {
         std::process::id(),
         std::thread::current().id()
     ));
+    // Process-wide, not the thread-local `use_full_tool_surface`: these tests
+    // also set per-session variables of their own through the environment.
+    test_env::set_var(remind_me_core::tool_profiles::TOOL_PROFILE_ENV, "full");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("scratch wiki dir");
     McpServer::with_wiki(

@@ -234,6 +234,19 @@ pub fn queue_outbox(
     )
 }
 
+/// Make this thread see every MCP tool, as before the default profile became
+/// `core` (ADR-0030 step 2). For a test that exercises tools outside `core`
+/// and is not about profiles: it sets a thread-local session, so it neither
+/// reads nor writes the process environment and cannot race another test.
+pub fn use_full_tool_surface() {
+    use crate::daemon::session::{enter, Session};
+    use crate::tool_profiles::TOOL_PROFILE_ENV;
+    enter(Session {
+        vars: [(TOOL_PROFILE_ENV.to_string(), "full".to_string())].into(),
+        handshake_client: None,
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

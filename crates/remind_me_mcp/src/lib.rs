@@ -955,16 +955,6 @@ impl McpServer {
                                 "inputSchema": { "type": "object", "properties": { "response_format": { "type": "string", "enum": ["markdown", "json"], "default": "json", "description": "json (default) returns the structured record; markdown returns a human-readable summary." } } }
                             },
                             {
-                                "name": "remind_me_self_update",
-                                "description": "remind-me admin: pull the latest changes from origin/main (fast-forward only) and rebuild the workspace in release mode. Refuses a working tree with uncommitted changes unless force is set; force never bypasses the fast-forward-only pull, so a diverged local history is still refused either way. Always requires a restart to take effect on success.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "force": { "type": "boolean", "default": false, "description": "Skip the uncommitted-changes guard. Does not bypass the fast-forward-only pull." }
-                                    }
-                                }
-                            },
-                            {
                                 "name": "remind_me_revoke_clients",
                                 "description": "remind-me admin: list OAuth clients registered with the remote connector's authorization server (FT-07), or revoke one by client_id. Without client_id, lists every registered client with its live access/refresh token counts -- this is the read path, not a bulk-revoke shorthand: there is no 'revoke all' operation, only 'list' (empty client_id) and 'revoke this one client' (client_id set). With client_id, deletes that client's registration and every token it holds; the live remote server re-reads the state file on each token check, so the client is locked out immediately and must re-register and re-obtain the owner's consent to reconnect.",
                                 "inputSchema": {
@@ -1614,7 +1604,7 @@ impl McpServer {
                 // Pruned once, here, after the whole surface is declared —
                 // rather than by guarding each entry, which would put the
                 // tier decision in 62 places and let the next tool forget it.
-                let profile = remind_me_core::tool_profiles::configured_profile();
+                let profile = request_profile();
                 if let Some(tools) = listed["result"]["tools"].as_array_mut() {
                     tools.retain(|tool| {
                         tool.get("name")
@@ -1686,7 +1676,7 @@ impl McpServer {
                 // — but wired now so one added later is hidden with the tier
                 // it drives. A prompt sequencing invisible tools walks the
                 // model into calls that will be refused.
-                let profile = remind_me_core::tool_profiles::configured_profile();
+                let profile = request_profile();
                 if let Some(prompts) = listed["result"]["prompts"].as_array_mut() {
                     prompts.retain(|prompt| {
                         prompt
@@ -1711,7 +1701,7 @@ impl McpServer {
                 // guessed the name would otherwise still reach it, and a
                 // caller who trimmed their surface would never know it was
                 // porous.
-                let profile = remind_me_core::tool_profiles::configured_profile();
+                let profile = request_profile();
                 if !remind_me_core::tool_profiles::tool_allowed(&profile, tool_name) {
                     return Some(json!({
                         "jsonrpc": "2.0",
@@ -2134,15 +2124,6 @@ impl McpServer {
     ResponseFormat::Json => serde_json::to_string_pretty(&status).unwrap(),
     ResponseFormat::Markdown => render::update_status(&status),
 } }] })
-                    }
-                    "remind_me_self_update" => {
-                        let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
-                        let result = updater::perform_update(force);
-                        if result.success {
-                            json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap() }] })
-                        } else {
-                            json!({ "isError": true, "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap() }] })
-                        }
                     }
                     "remind_me_revoke_clients" => {
                         let client_id = args.get("client_id").and_then(Value::as_str).unwrap_or("");
@@ -3560,6 +3541,22 @@ impl McpServer {
     pub fn run_stdio_loop(&self) -> io::Result<()> {
         run_stdio(self)
     }
+}
+
+/// The tool profile a request runs under.
+///
+/// In this crate's own unit tests an unset profile means the whole surface:
+/// they exercise tools from every group and are not about profiles. The
+/// default, and each narrowed profile, are tested through the public API in
+/// `tests/tool_profiles_test.rs`, a separate binary built without this.
+fn request_profile() -> String {
+    #[cfg(test)]
+    if remind_me_core::daemon::session::var(remind_me_core::tool_profiles::TOOL_PROFILE_ENV)
+        .is_none()
+    {
+        return "full".to_string();
+    }
+    remind_me_core::tool_profiles::configured_profile()
 }
 
 /// Something that answers MCP JSON-RPC lines: this process's own
@@ -5362,18 +5359,12 @@ mod tests {
     }
 
     #[test]
-    fn test_check_update_and_self_update_are_registered() {
+    fn test_check_update_is_registered_and_self_update_is_not() {
         let _handlers = handler_view();
-        // Not invoked here, unlike every other tool this file tests end to
-        // end: both discover their repository from the process's current
-        // working directory (docs/adr/0003-self-update-strategy.md), and
-        // remind_me_self_update would really run `git pull`/`cargo build
-        // --release -p rusty-remind-me -p remind_me_hub` against whatever repo contains this test
-        // binary's cwd -- which, inside this workspace's own test suite, is
-        // this very checkout. That behavior is exercised instead in
-        // remind_me_core's updater.rs unit tests, against real but
-        // disposable git repos under a temp directory, never this sandbox's
-        // actual checkout.
+        // Not invoked here: it discovers its repository from the process's
+        // current working directory (docs/adr/0003-self-update-strategy.md).
+        // The update itself is exercised in remind_me_core's updater.rs unit
+        // tests, against disposable git repos.
         let db = Database::open_in_memory().unwrap();
         let server = McpServer::new(db);
 
@@ -5394,13 +5385,11 @@ mod tests {
             "remind_me_check_update should take no operational arguments"
         );
 
-        let self_update = tools
-            .iter()
-            .find(|t| t["name"] == "remind_me_self_update")
-            .expect("remind_me_self_update not in tools/list");
-        assert_eq!(
-            self_update["inputSchema"]["properties"]["force"]["default"],
-            false
+        // Self-update is CLI-only (ADR-0030 step 2): not listed, and not a
+        // handler either, so no profile can reach it.
+        assert!(
+            tools.iter().all(|t| t["name"] != "remind_me_self_update"),
+            "remind_me_self_update must not be an MCP tool"
         );
     }
 

@@ -2,7 +2,7 @@
 //! ADR-0030).
 //!
 //! Its own binary: the profile is a process-wide env var, and the inline unit
-//! tests in `lib.rs` assume the default `full` surface. Setting it there would
+//! tests in `lib.rs` assume the whole surface when it is unset. Setting it there would
 //! quietly shrink what those tests see.
 
 #[path = "../../remind_me_core/src/test_env.rs"]
@@ -70,7 +70,7 @@ fn text(result: &Value) -> String {
 
 #[test]
 fn full_advertises_every_grouped_tool_in_group_order_and_no_alias() {
-    let tools = with_profile(None, || names(&server()));
+    let tools = with_profile(Some("full"), || names(&server()));
 
     let expected: Vec<&str> = GROUPS.iter().flat_map(|(_, t)| t.iter().copied()).collect();
     assert_eq!(
@@ -83,6 +83,22 @@ fn full_advertises_every_grouped_tool_in_group_order_and_no_alias() {
             "{old} is an alias but listed"
         );
     }
+}
+
+#[test]
+fn an_unset_profile_lists_core_and_refuses_the_rest() {
+    // ADR-0030 step 2: what a client that configures nothing gets.
+    let (listed, refused) = with_profile(None, || {
+        let s = server();
+        (names(&s), call(&s, "remind_me_backup", json!({})))
+    });
+    assert_eq!(listed, CORE);
+    assert_eq!(refused["isError"], true);
+    assert!(
+        text(&refused).contains("'admin' group"),
+        "{}",
+        text(&refused)
+    );
 }
 
 #[test]
@@ -146,7 +162,7 @@ fn an_alias_follows_its_replacements_group() {
 
 #[test]
 fn every_alias_still_reaches_a_handler() {
-    let unknown: Vec<&str> = with_profile(None, || {
+    let unknown: Vec<&str> = with_profile(Some("full"), || {
         let s = server();
         ALIASES
             .iter()
@@ -159,7 +175,7 @@ fn every_alias_still_reaches_a_handler() {
 
 #[test]
 fn a_merged_tool_refuses_a_bad_discriminator_as_invalid_input() {
-    let result = with_profile(None, || {
+    let result = with_profile(Some("full"), || {
         call(&server(), "remind_me_queue", json!({"kind": "nope"}))
     });
     assert_eq!(result["isError"], true);
@@ -202,7 +218,7 @@ fn server_status_reports_the_active_profile() {
 fn every_description_leads_with_remind_me_and_non_core_names_its_group() {
     // Clients that defer tools find them by keyword search over name and
     // description, and a search for "remind me" must land on these (#52).
-    let tools = with_profile(None, || listed(&server()));
+    let tools = with_profile(Some("full"), || listed(&server()));
     for tool in &tools {
         let name = tool["name"].as_str().unwrap();
         let description = tool["description"].as_str().unwrap_or_default();
