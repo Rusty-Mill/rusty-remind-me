@@ -2064,12 +2064,8 @@ pub struct DigestRecentMemory {
     pub created_at: String,
 }
 
-/// The digest's underlying data.
-///
-/// `reminders_*` and `sync` are `Option` because their subsystems do not exist
-/// yet (#116, #114). `None` means "nothing here can tell", which is different
-/// from "nothing to report" — the renderer omits those sections rather than
-/// printing a "none" that would read as an answer.
+/// The digest's underlying data: recent memories, vitality, reminders on
+/// both sides of now, and decisions due for review.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DigestData {
     pub generated_at: String,
