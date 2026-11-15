@@ -686,6 +686,69 @@ fn parse_search_args(args: &[String]) -> Result<SearchArgs, String> {
     })
 }
 
+const ADMIN_USAGE: &str = "\
+Usage: rusty-remind-me admin <verb> [JSON-ARGS]
+  verbs: backup, reindex, archive-prune, export-memories, revoke-clients, api-key
+         (JSON-ARGS is the tool's argument object, e.g. '{\"client_id\":\"...\"}')
+       rusty-remind-me admin self-update [--force]";
+
+/// The `admin` tool group, which MCP clients no longer see by default
+/// (ADR-0030 step 2): run one verb with every tool visible, and print its
+/// answer. `self-update` is not a tool at all and exists only here.
+fn run_admin(db_path: &std::path::Path, rest: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use remind_me_core::tool_profiles::{ADMIN, TOOL_PROFILE_ENV};
+    use remind_me_mcp::Handler;
+
+    let usage =
+        |why: &str| -> Box<dyn std::error::Error> { format!("{why}\n{ADMIN_USAGE}").into() };
+    let verb = rest
+        .first()
+        .ok_or_else(|| usage("Error: admin needs a verb."))?;
+    if verb == "self-update" {
+        let result = updater::perform_update(rest.get(1).is_some_and(|f| f == "--force"));
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        if !result.success {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    let tool = format!("remind_me_{}", verb.replace('-', "_"));
+    if !ADMIN.contains(&tool.as_str()) {
+        return Err(usage(&format!("Error: unknown admin verb {verb:?}.")));
+    }
+    let arguments: Value = match rest.get(1) {
+        Some(raw) => {
+            serde_json::from_str(raw).map_err(|e| usage(&format!("Error: bad JSON-ARGS: {e}")))?
+        }
+        None => json!({}),
+    };
+    // Before the daemon is reached: a daemon connection carries this process's
+    // value of the variable, and the admin group is hidden by default.
+    // Safe here, unlike in a test: this is the only thread, before the store
+    // is opened, so no C code (SQLite's init) can be reading the environment.
+    #[allow(clippy::disallowed_methods)]
+    env::set_var(TOOL_PROFILE_ENV, "full");
+    let request = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": tool, "arguments": arguments },
+    })
+    .to_string();
+    let reply = match daemon::mcp_proxy(db_path) {
+        Ok(proxy) => proxy.handle_line(&request),
+        Err(fallback) => McpServer::new(fallback.open(db_path)?).handle_line(&request),
+    };
+    let result = reply.ok_or("no reply from the server")?["result"].clone();
+    for part in result["content"].as_array().into_iter().flatten() {
+        if let Some(text) = part["text"].as_str() {
+            println!("{text}");
+        }
+    }
+    if result["isError"].as_bool().unwrap_or(false) {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // First, before argv or the database. The slow-call watchdog dumps thread
     // stacks by re-executing this binary as a tracer child, and everything
@@ -1201,12 +1264,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
+            "admin" => {
+                if let Err(e) = run_admin(&db_path, args.get(2..).unwrap_or_default()) {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            }
             "stats" => {
                 let stats: Stats = Store::open(&db_path)?.call(Op::Stats)?;
                 println!("{}", serde_json::to_string_pretty(&stats)?);
             }
             cmd => {
-                eprintln!("Unknown subcommand: {}. Available: configure, daemon, api, remote, server, search, add, list, get, entity, entity-duplicates, wiki-write, wiki-read, wiki-import, wiki-compile, topics, stats, resolve, session, capture-transcript, import-sessions, context, brief, impact-export", cmd);
+                eprintln!("Unknown subcommand: {}. Available: configure, daemon, api, remote, admin, server, search, add, list, get, entity, entity-duplicates, wiki-write, wiki-read, wiki-import, wiki-compile, topics, stats, resolve, session, capture-transcript, import-sessions, context, brief, impact-export", cmd);
                 std::process::exit(1);
             }
         }

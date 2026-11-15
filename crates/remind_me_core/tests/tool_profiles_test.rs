@@ -28,14 +28,25 @@ fn profile_for(raw: &str) -> String {
 }
 
 #[test]
-fn the_default_profile_is_full() {
+fn the_default_profile_is_core() {
     let _guard = env_lock();
     crate::test_env::remove_var(TOOL_PROFILE_ENV);
 
-    // Upgrading must change nothing for an existing install (ADR-0030 flips
-    // this in its second step, not this one).
-    assert_eq!(configured_profile(), "full");
+    // ADR-0030 step 2. `full` is still one setting away.
+    assert_eq!(configured_profile(), "core");
+    assert!(allowed_tools("core").is_some(), "core narrows the surface");
     assert!(allowed_tools("full").is_none(), "full allows everything");
+    assert_eq!(profile_for(""), "core", "a blank setting is the default");
+    assert_eq!(profile_for("full"), "full", "full stays selectable");
+}
+
+#[test]
+fn self_update_is_in_no_group_so_no_profile_exposes_it() {
+    let _guard = env_lock();
+    assert!(group_of("remind_me_self_update").is_none());
+    assert!(GROUPS
+        .iter()
+        .all(|(_, tools)| !tools.contains(&"remind_me_self_update")));
 }
 
 #[test]
@@ -57,7 +68,7 @@ fn profiles_are_normalised_for_case_blanks_and_spacing() {
     let _guard = env_lock();
     assert_eq!(profile_for("  Core \n"), "core");
     assert_eq!(profile_for(" core , WIKI ,"), "core,wiki");
-    assert_eq!(profile_for("   "), "full");
+    assert_eq!(profile_for("   "), "core", "blank is the default");
 }
 
 #[test]
@@ -96,8 +107,9 @@ fn every_public_tool_is_in_exactly_one_group() {
             assert_eq!(group_of(tool), Some(group));
         }
     }
-    // 46 under ADR-0030; ADR-0032 retired the two sync tools.
-    assert_eq!(seen.len(), 44);
+    // 46 under ADR-0030; ADR-0032 retired the two sync tools; step 2 moved
+    // `self_update` to the CLI.
+    assert_eq!(seen.len(), 43);
 }
 
 #[test]
@@ -114,8 +126,9 @@ fn every_alias_points_at_a_public_tool_and_is_not_one_itself() {
         assert_eq!(replacement(old), Some(new));
     }
     // 78 tools before ADR-0030: 46 public names, 4 of them new, plus 36
-    // aliases. ADR-0032 retired two sync tools and two sync aliases.
-    assert_eq!(public.len() - 4 + ALIASES.len(), 74);
+    // aliases. ADR-0032 retired two sync tools and two sync aliases; step 2
+    // moved `self_update` to the CLI.
+    assert_eq!(public.len() - 4 + ALIASES.len(), 73);
 }
 
 #[test]

@@ -88,16 +88,16 @@ pub const IMPORT: [&str; 3] = [
     "remind_me_capture_transcript",
 ];
 
-/// Operations a person runs, not a conversation. `self_update` leaves MCP for
-/// the CLI in the next step of ADR-0030.
-pub const ADMIN: [&str; 7] = [
+/// Operations a person runs, not a conversation. Each has an
+/// `rusty-remind-me admin <verb>` form on the command line (which sees every
+/// tool); `self_update` is only there, never over MCP (ADR-0030 step 2).
+pub const ADMIN: [&str; 6] = [
     "remind_me_backup",
     "remind_me_reindex",
     "remind_me_archive_prune",
     "remind_me_export_memories",
     "remind_me_revoke_clients",
     "remind_me_api_key",
-    "remind_me_self_update",
 ];
 
 pub const EXTRAS: [&str; 3] = [
@@ -186,8 +186,11 @@ pub fn group_of(tool: &str) -> Option<&'static str> {
         .map(|(group, _)| *group)
 }
 
-/// The configured profile, normalised, falling back to `full` on anything
-/// unrecognised.
+/// The profile a client gets when it sets none (ADR-0030 step 2; `full` before).
+pub const DEFAULT_PROFILE: &str = "core";
+
+/// The configured profile, normalised: [`DEFAULT_PROFILE`] when unset or
+/// blank, `full` on anything unrecognised.
 ///
 /// A profile is `full`, `standard`, or a comma list of [`GROUPS`] names such
 /// as `core,wiki`. A typo yields the *widest* surface rather than an error or
@@ -210,7 +213,7 @@ pub fn configured_profile() -> String {
 }
 
 /// `raw` lowercased with blanks removed, or `None` when a part is unknown.
-/// Unset or blank is `full`.
+/// Unset or blank is [`DEFAULT_PROFILE`].
 fn normalise(raw: &str) -> Option<String> {
     let parts: Vec<String> = raw
         .split(',')
@@ -218,7 +221,7 @@ fn normalise(raw: &str) -> Option<String> {
         .filter(|p| !p.is_empty())
         .collect();
     if parts.is_empty() {
-        return Some("full".to_string());
+        return Some(DEFAULT_PROFILE.to_string());
     }
     let known = |p: &String| PRESETS.contains(&p.as_str()) || group_names().contains(&p.as_str());
     parts.iter().all(known).then(|| parts.join(","))

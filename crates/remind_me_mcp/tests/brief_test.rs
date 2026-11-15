@@ -10,6 +10,7 @@ fn server() -> McpServer {
         std::process::id(),
         std::thread::current().id()
     ));
+    remind_me_core::testing::use_full_tool_surface();
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("scratch wiki dir");
     McpServer::with_wiki(

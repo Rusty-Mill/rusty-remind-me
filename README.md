@@ -125,12 +125,13 @@ pick up a new stdio server until it restarts.
 | `pipeline` | queue and the refinement steps it feeds: decompose, annotate, normalize_apply, reclassify, promote, consolidate, feedback, entity_upsert, entity_traverse, persona, provenance, skeleton_read, skeleton_write, revert, project |
 | `wiki` | wiki_read, wiki_write, wiki_delete, wiki_compile |
 | `import` | import, undo_import, capture_transcript |
-| `admin` | backup, reindex, archive_prune, export_memories, revoke_clients, api_key, self_update |
+| `admin` | backup, reindex, archive_prune, export_memories, revoke_clients, api_key (also `rusty-remind-me admin <verb>`; `self-update` is CLI-only) |
 | `extras` | reminders, saved_searches, session_timeline |
 
-Set a comma list such as `REMIND_ME_TOOL_PROFILE=core,wiki`. `full` (the
-default for now) is every group and `standard` is `core,pipeline,wiki`. Small
-local models do best on plain `core`. Tool names merged away in 0.5 still work
+The default is `core`. Set a comma list such as
+`REMIND_ME_TOOL_PROFILE=core,wiki`; `full` is every group and `standard` is
+`core,pipeline,wiki`. To get the old surface back, set
+`REMIND_ME_TOOL_PROFILE=full`. Small local models do best on plain `core`. Tool names merged away in 0.5 still work
 until 0.6.0 but are no longer listed.
 
 ### 3. Verify end to end
