@@ -823,7 +823,7 @@ mod tests {
             .clone();
 
         let moved = move_to(&store, "Software", "Engineering").unwrap();
-        assert_eq!(moved.superseded, [first.clone()]);
+        assert_eq!(moved.superseded, std::slice::from_ref(&first));
         let tree = tree(&store).unwrap();
         assert_eq!(
             tree.get(&name("Software")).unwrap().parent,
