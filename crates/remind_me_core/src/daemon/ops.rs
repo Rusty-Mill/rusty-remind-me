@@ -110,6 +110,19 @@ pub enum Op {
         since: Option<String>,
         budget: usize,
     },
+    /// Cluster refined memories into a seed run; see [`crate::topic_seed`].
+    TopicsSeed,
+    /// Name a seed run's nodes with the configured local model. Takes the
+    /// database, like [`Op::WikiAutoCompile`].
+    TopicsName {
+        run: String,
+        max_nodes: usize,
+    },
+    /// Write a named seed run's topics and memberships, or show the plan.
+    TopicsApply {
+        run: String,
+        dry_run: bool,
+    },
     /// The daemon's own state. Answered by the daemon, not [`execute`].
     Status,
     /// Stop the daemon. Answered by the daemon, not [`execute`].
@@ -134,26 +147,32 @@ impl OpReply {
     }
 }
 
-/// Run an operation against `db`. Every operation but one runs under one
-/// store handle; [`Op::WikiAutoCompile`] takes the database, so the handle,
-/// which holds the database lock, is not held while a model writes.
+/// Run an operation against `db`. Every operation but the two that call a
+/// model runs under one store handle; [`Op::WikiAutoCompile`] and
+/// [`Op::TopicsName`] take the database, so the handle, which holds the
+/// database lock, is not held while a model writes.
 pub fn execute_on(db: &Database, op: &Op) -> OpReply {
-    let Op::WikiAutoCompile {
-        max_batches,
-        allow_shrink,
-    } = op
-    else {
-        return execute(&db.store(), op);
+    let result = match op {
+        Op::WikiAutoCompile {
+            max_batches,
+            allow_shrink,
+        } => {
+            let options = crate::wiki_compile::AutoOptions {
+                max_batches: *max_batches,
+                allow_shrink: *allow_shrink,
+                ..Default::default()
+            };
+            let wiki = crate::wiki_fs::Wiki::from_env();
+            crate::wiki_llm::compile_with_configured_model(&wiki, db, &options)
+                .and_then(|report| serde_json::to_value(report).map_err(|e| e.to_string()))
+        }
+        Op::TopicsName { run, max_nodes } => {
+            crate::wiki_llm::name_topics_with_configured_model(db, run, *max_nodes)
+                .and_then(|report| serde_json::to_value(report).map_err(|e| e.to_string()))
+        }
+        _ => return execute(&db.store(), op),
     };
-    let options = crate::wiki_compile::AutoOptions {
-        max_batches: *max_batches,
-        allow_shrink: *allow_shrink,
-        ..Default::default()
-    };
-    let wiki = crate::wiki_fs::Wiki::from_env();
-    match crate::wiki_llm::compile_with_configured_model(&wiki, db, &options)
-        .and_then(|report| serde_json::to_value(report).map_err(|e| e.to_string()))
-    {
+    match result {
         Ok(value) => OpReply::Ok(value),
         Err(message) => OpReply::Err(message),
     }
@@ -174,7 +193,10 @@ fn run(store: &Store<'_>, op: &Op) -> Result<Value, String> {
         Op::Add { input } => to_value(queries::add_memory(store, input.clone())),
         Op::List { input } => to_value(queries::list_memories(store, input)),
         Op::Get { id } => to_value(queries::get_memory_by_id(store, id)),
-        Op::UpsertEntity { input } => to_value(entity::upsert_entity(store, input)),
+        Op::UpsertEntity { input } => to_value(
+            crate::topic::refuse_topic_name(&input.name)
+                .and_then(|()| entity::upsert_entity(store, input)),
+        ),
         Op::EntityDuplicates => to_value(entity_duplicates::entity_duplicates(store)),
         Op::WikiWrite {
             slug,
@@ -268,8 +290,33 @@ fn run(store: &Store<'_>, op: &Op) -> Result<Value, String> {
         Op::SessionTimeline { session_id } => {
             session_ops::session_timeline(store, session_id).map_err(|e| e.to_string())
         }
+        Op::TopicsSeed => {
+            crate::topic_seed::seed(store, &Default::default()).and_then(|snapshot| {
+                serde_json::to_value(seed_summary(&snapshot)).map_err(|e| e.to_string())
+            })
+        }
+        Op::TopicsName { .. } => {
+            Err("naming topics needs the database: run it with execute_on".to_string())
+        }
+        Op::TopicsApply { run, dry_run } => crate::topic_seed::apply(store, run, "human", *dry_run)
+            .and_then(|report| serde_json::to_value(report).map_err(|e| e.to_string())),
         Op::Status | Op::Shutdown => Err("only a daemon answers status and shutdown".into()),
     }
+}
+
+/// A seed run without its member lists, which can be tens of thousands of
+/// ids: the run id, the node count, and the size of each level.
+fn seed_summary(snapshot: &crate::topic_seed::Snapshot) -> Value {
+    let mut levels: std::collections::BTreeMap<usize, usize> = Default::default();
+    for node in &snapshot.nodes {
+        *levels.entry(node.depth).or_default() += 1;
+    }
+    serde_json::json!({
+        "run": snapshot.run,
+        "nodes": snapshot.nodes.len(),
+        "memories": snapshot.nodes.iter().filter(|n| n.depth == 1).map(|n| n.size).sum::<usize>(),
+        "nodes_per_level": levels,
+    })
 }
 
 fn to_value<T: Serialize>(result: crate::db::Result<T>) -> Result<Value, String> {
