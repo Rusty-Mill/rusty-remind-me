@@ -506,7 +506,10 @@ fn default_token_budget() -> usize {
 }
 
 /// Input model for listing memories with filters and pagination.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// `Default` is hand-written so `MemoryListInput::default()` agrees with an
+/// omitted `limit` over the wire (20); a derived one gave 0 (#223).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryListInput {
     pub category: Option<String>,
     /// A memory must carry *all* of these tags to match.
@@ -530,6 +533,21 @@ pub struct MemoryListInput {
 
 fn default_list_limit() -> usize {
     20
+}
+
+impl Default for MemoryListInput {
+    fn default() -> Self {
+        Self {
+            category: None,
+            tags: None,
+            source: None,
+            limit: default_list_limit(),
+            offset: 0,
+            response_format: ResponseFormat::default(),
+            include_sensitive: false,
+            scope: crate::context::ScopeFilter::default(),
+        }
+    }
 }
 
 /// Inclusive bounds the reference enforces on `MemoryListInput::limit`.
@@ -1290,7 +1308,10 @@ pub enum ExportFormat {
 }
 
 /// Input model for `remind_me_export_memories`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// `Default` is hand-written so `ExportInput::default()` includes the graph,
+/// as an omitted `include_graph` does over the wire; a derived one dropped it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportInput {
     #[serde(default)]
     pub format: ExportFormat,
@@ -1321,6 +1342,19 @@ pub struct ExportInput {
 
 fn default_include_graph() -> bool {
     true
+}
+
+impl Default for ExportInput {
+    fn default() -> Self {
+        Self {
+            format: ExportFormat::default(),
+            category: None,
+            tags: None,
+            file_path: None,
+            include_graph: default_include_graph(),
+            include_deleted: false,
+        }
+    }
 }
 
 /// Outcome of an export.

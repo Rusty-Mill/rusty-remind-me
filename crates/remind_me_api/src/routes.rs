@@ -299,6 +299,7 @@ pub fn api_list(store: &Store<'_>, _wiki: &Wiki, req: &Request, _params: &Params
                 "memories": result.memories,
             }))
         }
+        Err(StoreError::Invalid(why)) => err(400, why),
         Err(e) => internal_err(e),
     }
 }

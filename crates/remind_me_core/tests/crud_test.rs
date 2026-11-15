@@ -229,11 +229,12 @@ fn list_offset_past_the_end_is_empty_but_reports_total() {
 }
 
 #[test]
-fn list_clamps_limit_to_the_reference_bounds() {
+fn list_refuses_zero_and_clamps_above_the_reference_bound() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
     add(&store, "only", "general", "manual", &[]);
 
+    // #223: zero used to clamp to 1 and hand back a one-row page.
     let low = queries::list_memories(
         &store,
         &MemoryListInput {
@@ -241,9 +242,8 @@ fn list_clamps_limit_to_the_reference_bounds() {
             limit: 0,
             ..Default::default()
         },
-    )
-    .unwrap();
-    assert_eq!(low.limit, 1);
+    );
+    assert!(low.is_err());
 
     let high = queries::list_memories(
         &store,
