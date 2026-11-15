@@ -15,7 +15,7 @@
 ## Key Features
 
 - **Hybrid Search Engine**: BM25 keyword matching (the engine's own full-text index, FTS5-compatible ranking) combined with Reciprocal Rank Fusion (RRF) rank scoring.
-- **Semantic Search, Reranking & Query Expansion**: Optional vector search (Ollama or an in-process ONNX bi-encoder), cross-encoder reranking, and HyDE query expansion — each off by default, each degrading to keyword-only on any failure.
+- **Semantic Search, Reranking & Query Expansion**: Optional vector search (Ollama, an OpenAI-compatible `/v1/embeddings` server, or an in-process ONNX bi-encoder), cross-encoder reranking, and HyDE query expansion — each off by default, each degrading to keyword-only on any failure.
 - **ACT-R Memory Vitality Model**: Time-based exponential decay, write-time priors by category/source, and bridge protection (decay rate halved for frequently accessed memories).
 - **Forward-Compatible Model Context Protocol (MCP) Server**: Stdio JSON-RPC MCP server with dynamic protocol version negotiation (supporting `2024-11-05` through upcoming 2026 releases), resources, prompts, dynamic tool change notifications (`listChanged`), and tool execution.
 - **Automated Client Setup**: Built-in `configure` command & scripts for 1-click MCP setup across **Claude Desktop**, **Antigravity**, **Cursor**, and **Codex**.
