@@ -205,9 +205,9 @@ Bumping the version is therefore the entire release process — there is no
 separate "cut a release" step, and nothing here pushes a tag by hand; the
 release action creates it from the version it read.
 
-The six crates each carry their own literal `version`, and must be bumped together
+The five crates each carry their own literal `version`, and must be bumped together
 with `.claude-plugin/plugin.json`'s `"version"`.
-`scripts/get_workspace_version.sh` fails if the six disagree, and
+`scripts/get_workspace_version.sh` fails if the five disagree, and
 `scripts/check_plugin_version.sh` fails if the plugin manifest differs from
 them; both run on every PR touching this directory (the
 `plugin-version` job in `.github/workflows/ci.yml`, covered by its
@@ -649,7 +649,7 @@ rusty-remind-me stats
 One `rusty-remind-me daemon` process owns the store, and every MCP session,
 CLI command, `api` and `remote` becomes its client over loopback. Set
 `REMIND_ME_DAEMON=0` to open the store in each process instead. The first client starts it; nothing needs to be run by
-hand. The background loops (reminders, folder watcher, promotion nudge, sync)
+hand. The background loops (reminders, folder watcher, promotion nudge, outbox prune)
 then run once in the daemon instead of in every long-lived process.
 ```bash
 rusty-remind-me list                  # starts the daemon if it is not running
@@ -731,7 +731,7 @@ surfaces):
 | `GET` | `/api/wiki/schema` | The maintainer schema the compile brief embeds |
 | `GET` | `/api/reminders?when=upcoming\|overdue\|all&limit=...` | Memories with a reminder set, soonest first (`remind_me_list_reminders`) |
 | `POST` | `/api/reminders` | Set or clear a reminder — `{"memory_id": ..., "remind_at": ISO-8601 or null}` (`remind_me_set_reminder`) |
-| `GET` | `/api/digest?since_days=...` | Recent memories, vitality, reminders and sync state (`remind_me_digest`) |
+| `GET` | `/api/digest?since_days=...` | Recent memories, vitality, reminders and decisions due for review (`remind_me_digest`) |
 | `GET` | `/api/brief?project=...&since=...&token_budget=...` | One project's state, open items and recent activity; 404 with `suggestions` for an unknown name (`remind_me_brief`) |
 | `GET` | `/api/status` | Build, database, schema currency, backups and subsystem state (`remind_me_server_status`) |
 | `GET` | `/api/saved-searches` | List saved searches (`remind_me_list_saved_searches`) |

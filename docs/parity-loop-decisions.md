@@ -9,6 +9,12 @@ here — if it is not written down, it did not happen deliberately.
 
 Entries are newest last, grouped by issue.
 
+> **Historical for sync and the hub (2026-11-05).** Multi-node sync, the peer
+> server and the hub were removed (ADR-0032, card #746). Entries about them
+> (`remind_me_sync_*`, `sync_repair`, peer `/count` and `/health`, reconcile
+> against hub and peer, E1's `remind_me_hub`) record why they were built that
+> way; none of their routes, tools or settings exist any more.
+
 ---
 
 ## #102 — `remind_me_recalibrate_candidates`
