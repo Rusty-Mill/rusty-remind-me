@@ -161,6 +161,11 @@ impl<'c> Entities<'c> {
         )
     }
 
+    /// Remove the link from `memory_id` to `entity_id`. Whether it existed.
+    pub fn unlink(&self, memory_id: &str, entity_id: &str) -> Result<bool> {
+        engine::graph::unlink(&mut self.core.lock(), memory_id, entity_id)
+    }
+
     /// Remove every mention link from `memory_id`: part of deleting a
     /// memory.
     pub fn unlink_memory(&self, memory_id: &str) -> Result<()> {

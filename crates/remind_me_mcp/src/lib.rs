@@ -2041,15 +2041,19 @@ impl McpServer {
                     "remind_me_entity_upsert" => {
                         let input: Result<EntityInput, _> = serde_json::from_value(args);
                         match input {
-                            Ok(ent_input) => match entity::upsert_entity(&store, &ent_input) {
-                                Ok(ent) => {
-                                    let payload = upserted_entity_payload(&store, &ent);
-                                    json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&payload).unwrap() }] })
+                            Ok(ent_input) => {
+                                match remind_me_core::topic::refuse_topic_name(&ent_input.name)
+                                    .and_then(|()| entity::upsert_entity(&store, &ent_input))
+                                {
+                                    Ok(ent) => {
+                                        let payload = upserted_entity_payload(&store, &ent);
+                                        json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&payload).unwrap() }] })
+                                    }
+                                    Err(e) => {
+                                        json!({ "isError": true, "content": [{ "type": "text", "text": format!("Entity error: {}", e) }] })
+                                    }
                                 }
-                                Err(e) => {
-                                    json!({ "isError": true, "content": [{ "type": "text", "text": format!("Entity error: {}", e) }] })
-                                }
-                            },
+                            }
                             Err(e) => {
                                 json!({ "isError": true, "content": [{ "type": "text", "text": format!("Invalid entity input: {}", e) }] })
                             }
