@@ -2,6 +2,15 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-15 — Memories imported from DBS link to their source artifact (#762)
+
+### Added
+- Each memory `dbs-import` writes now carries `metadata.source_artifact`: `store` (`dbs:<source>`), `id` (the item's id at that source) and `hash` (DBS's content hash for the imported version). This is the provenance contract from the #762 audit (`docs/design/dbs-modularity-audit.md`). Distilled memories will use the same key to point at clipped pages and verbatim dialogs once the artifact store exists. The existing `dbs_*` metadata keys are unchanged. Memories imported before this change are not rewritten.
+- `remind_me_core::source_artifact::SourceArtifact` reads and writes the link.
+
+### Tests
+- `source_artifact` unit tests: round trip through metadata, and a missing or malformed link reads as none. `dbs_import_test` checks that an imported item carries its link.
+
 ## 2026-11-15 — Digest doc comments stop promising sync state
 
 ### Docs
