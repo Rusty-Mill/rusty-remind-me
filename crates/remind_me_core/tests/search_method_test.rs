@@ -6,6 +6,7 @@ use remind_me_core::db::queries;
 use remind_me_core::db::Store;
 use remind_me_core::embedder::{EmbedError, EmbedRole, Embedder, EmbeddingIdentity};
 use remind_me_core::testing;
+use remind_me_core::time_window::{RawTimeWindow, TimeWindow};
 use remind_me_core::vectors::embed_and_store;
 use remind_me_core::{Database, MemoryAddInput, MemorySearchInput, SearchMethod};
 use std::collections::HashMap;
@@ -165,4 +166,74 @@ fn a_memory_below_the_callers_floor_is_not_counted_as_dormant() {
     )
     .unwrap();
     assert_eq!(outcome.dormant_excluded, 0);
+}
+
+/// One live memory today and one dormant one a year old, both about quokkas.
+fn one_dormant(store: &Store<'_>) -> String {
+    add(store, "quokka today", "fact");
+    let stale = add(store, "quokka long ago", "action_item");
+    age_by_days(store, &stale, 365);
+    stale
+}
+
+fn dormant_excluded(store: &Store<'_>, input: MemorySearchInput) -> usize {
+    offline();
+    queries::search_memories_budgeted(store, &input, None)
+        .unwrap()
+        .dormant_excluded
+}
+
+#[test]
+fn a_dormant_match_that_validity_would_drop_is_not_counted() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let stale = one_dormant(&store);
+    assert_eq!(dormant_excluded(&store, input("quokka")), 1);
+
+    let yesterday = (Utc::now() - Duration::days(1)).to_rfc3339();
+    testing::set_memory_column(&store, &stale, "valid_until", yesterday).unwrap();
+    // Expired rows are returned by default, so still counted.
+    assert_eq!(dormant_excluded(&store, input("quokka")), 1);
+    let unexpired_only = MemorySearchInput {
+        include_expired: false,
+        ..input("quokka")
+    };
+    assert_eq!(dormant_excluded(&store, unexpired_only), 0);
+}
+
+#[test]
+fn a_dormant_match_below_min_confidence_is_not_counted() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let stale = one_dormant(&store);
+    testing::set_memory_column(&store, &stale, "confidence", 0.2).unwrap();
+
+    let confident = MemorySearchInput {
+        min_confidence: 0.5,
+        ..input("quokka")
+    };
+    assert_eq!(dormant_excluded(&store, confident), 0);
+}
+
+#[test]
+fn a_window_listing_counts_dormant_memories() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    one_dormant(&store);
+    let raw = RawTimeWindow {
+        since: Some("400d".into()),
+        ..Default::default()
+    };
+    let window = TimeWindow::resolve(&raw, Utc::now()).unwrap();
+
+    let listing = MemorySearchInput {
+        window,
+        ..input("")
+    };
+    assert_eq!(dormant_excluded(&store, listing.clone()), 1);
+    let with_dormant = MemorySearchInput {
+        include_dormant: true,
+        ..listing
+    };
+    assert_eq!(dormant_excluded(&store, with_dormant), 0);
 }

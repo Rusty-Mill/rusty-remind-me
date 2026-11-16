@@ -1467,6 +1467,18 @@ pub fn validity_factor(
 /// Apply [`validity_factor`] to every result's score and re-sort. Drops
 /// expired results when `include_expired` is false, and any below
 /// `min_confidence`.
+/// Whether [`apply_validity`] keeps `memory`: unexpired unless
+/// `include_expired`, and at least `min_confidence`.
+pub fn passes_validity(
+    memory: &Memory,
+    now: chrono::DateTime<chrono::Utc>,
+    include_expired: bool,
+    min_confidence: f64,
+) -> bool {
+    (include_expired || !is_expired(now, memory.valid_until.as_deref()))
+        && memory.confidence >= min_confidence
+}
+
 pub fn apply_validity(
     results: Vec<MemorySearchResult>,
     now: chrono::DateTime<chrono::Utc>,
@@ -1475,8 +1487,7 @@ pub fn apply_validity(
 ) -> Vec<MemorySearchResult> {
     let mut kept: Vec<MemorySearchResult> = results
         .into_iter()
-        .filter(|r| include_expired || !is_expired(now, r.memory.valid_until.as_deref()))
-        .filter(|r| r.memory.confidence >= min_confidence)
+        .filter(|r| passes_validity(&r.memory, now, include_expired, min_confidence))
         .collect();
     for r in &mut kept {
         r.score *= validity_factor(
