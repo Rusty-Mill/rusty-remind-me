@@ -2,6 +2,13 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-16 — Storage port: the memories core, part 2 (ADR-0035, Millwright R2)
+
+### Tests
+- `db::memories::conformance` and `memory_conformance!` hold the `MemoryStore` behaviour every backend must show: a taken id, a synced overwrite, access inputs, and every v32 column through insert and edit. The engine runs it on temporary tables.
+- The reminder, history, feedback and stats suites now seed and tombstone memories through `MemoryStore`, so their macros take only a constructor. The per-backend `add`/`delete` fixtures are gone, as ADR-0035 item 4 said they would be once memories had a port.
+- Tests that cross groups (outbox, entity links) or set a column directly stay as `Memories` facade tests. No code outside tests changes.
+
 ## 2026-11-16 — `remind_me_server_status` names the live store (#357)
 
 ### Changed

@@ -131,16 +131,6 @@ impl ReminderStore for EngineTables {
 #[cfg(test)]
 mod conformance_tests {
     use super::EngineTables;
-    use crate::db::memories::NewMemory;
-    use crate::db::reminders::conformance::NOW;
 
-    crate::db::reminders::reminder_conformance!(
-        EngineTables::open_temporary().unwrap(),
-        |tables: &mut EngineTables, id: &str| {
-            super::memories::insert(tables, &NewMemory::new(id, "x", NOW)).unwrap();
-        },
-        |tables: &mut EngineTables, id: &str| {
-            super::memories::delete_live(tables, id, Some(NOW)).unwrap();
-        }
-    );
+    crate::db::reminders::reminder_conformance!(EngineTables::open_temporary().unwrap());
 }

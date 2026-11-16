@@ -263,17 +263,7 @@ mod tests {
 /// The port's shared behaviour, on fresh temporary engine tables.
 #[cfg(test)]
 mod conformance_tests {
-    use super::{memories, EngineTables};
-    use crate::db::history::conformance::NOW;
-    use crate::db::memories::NewMemory;
+    use super::EngineTables;
 
-    crate::db::history::history_conformance!(
-        EngineTables::open_temporary().unwrap(),
-        |tables: &mut EngineTables, id: &str| {
-            memories::insert(tables, &NewMemory::new(id, "x", NOW)).unwrap();
-        },
-        |tables: &mut EngineTables, id: &str| {
-            memories::delete_live(tables, id, Some(NOW)).unwrap();
-        }
-    );
+    crate::db::history::history_conformance!(EngineTables::open_temporary().unwrap());
 }

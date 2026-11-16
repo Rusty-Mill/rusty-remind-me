@@ -240,11 +240,7 @@ mod tests {
 /// The port's shared behaviour, on fresh temporary engine tables.
 #[cfg(test)]
 mod conformance_tests {
-    use super::{memories, EngineTables};
-    use crate::db::memories::NewMemory;
+    use super::EngineTables;
 
-    crate::db::feedback::feedback_conformance!(
-        EngineTables::open_temporary().unwrap(),
-        |tables: &mut EngineTables, new: &NewMemory| memories::insert(tables, new).unwrap()
-    );
+    crate::db::feedback::feedback_conformance!(EngineTables::open_temporary().unwrap());
 }
