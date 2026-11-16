@@ -1,12 +1,13 @@
 //! Storage for raw-transcript retention: `import_archives` (one row per
 //! archived import) and `import_archive_spans` (which bytes of it produced
-//! each memory), on the engine (`db::engine::archives`).
+//! each memory), behind the [`ArchiveStore`] port (ADR-0035), which the
+//! engine implements in `db::engine::archives`.
 //!
 //! Every read and write [`crate::archive`] makes goes through here. The
 //! rules stay there: whether retention is on, where blobs go, span
 //! clamping, the sensitive-memory gate, and pruning by age and size.
 
-use super::engine::{self, EngineLock};
+use super::engine::EngineLock;
 use super::{Result, Store};
 
 /// One archived import.
@@ -30,6 +31,44 @@ pub struct SpanSource {
     pub filename: String,
 }
 
+/// The port for the retention tables (ADR-0035). [`conformance`] holds the
+/// behaviour every implementation must show.
+pub trait ArchiveStore {
+    /// Record `row`, replacing any archive already recorded for its import.
+    fn record(&mut self, row: &ArchiveRow) -> Result<()>;
+
+    /// Record that bytes `byte_start..byte_end` of `import_id` produced
+    /// `memory_id`, replacing any span recorded for it.
+    fn record_span(
+        &mut self,
+        memory_id: &str,
+        import_id: &str,
+        byte_start: i64,
+        byte_end: i64,
+    ) -> Result<()>;
+
+    /// Where `memory_id`'s bytes are: `None` if it has no span, or its
+    /// span's import has no recorded archive.
+    fn span_source(&self, memory_id: &str) -> Result<Option<SpanSource>>;
+
+    /// The archive path and content hash recorded for `import_id`.
+    fn blob_of(&self, import_id: &str) -> Result<Option<(String, String)>>;
+
+    /// Remove `import_id`'s archive row and spans. A missing import is not
+    /// an error.
+    fn remove(&mut self, import_id: &str) -> Result<()>;
+
+    /// How many recorded archives share the blob `hash`.
+    fn count_with_hash(&self, hash: &str) -> Result<usize>;
+
+    /// Every recorded archive, oldest `archived_at` first (compared as
+    /// text).
+    fn oldest_first(&self) -> Result<Vec<ArchiveRow>>;
+
+    /// How many spans are recorded: for `import_id`, or in all when `None`.
+    fn span_count(&self, import_id: Option<&str>) -> Result<usize>;
+}
+
 /// The retention tables, on the engine.
 pub struct Archives<'c> {
     engine: &'c EngineLock,
@@ -42,13 +81,12 @@ impl<'c> Archives<'c> {
         }
     }
 
-    /// Record `row`, replacing any archive already recorded for its import.
+    /// See [`ArchiveStore::record`].
     pub fn record(&self, row: &ArchiveRow) -> Result<()> {
-        engine::archives::record(&mut self.engine.lock(), row)
+        ArchiveStore::record(&mut *self.engine.lock(), row)
     }
 
-    /// Record that bytes `byte_start..byte_end` of `import_id` produced
-    /// `memory_id`, replacing any span recorded for it.
+    /// See [`ArchiveStore::record_span`].
     pub fn record_span(
         &self,
         memory_id: &str,
@@ -56,8 +94,8 @@ impl<'c> Archives<'c> {
         byte_start: i64,
         byte_end: i64,
     ) -> Result<()> {
-        engine::archives::record_span(
-            &mut self.engine.lock(),
+        ArchiveStore::record_span(
+            &mut *self.engine.lock(),
             memory_id,
             import_id,
             byte_start,
@@ -65,44 +103,42 @@ impl<'c> Archives<'c> {
         )
     }
 
-    /// Where `memory_id`'s bytes are, if it has a span in a recorded archive.
+    /// See [`ArchiveStore::span_source`].
     pub fn span_source(&self, memory_id: &str) -> Result<Option<SpanSource>> {
-        Ok(engine::archives::span_source(
-            &self.engine.lock(),
-            memory_id,
-        ))
+        ArchiveStore::span_source(&*self.engine.lock(), memory_id)
     }
 
-    /// The archive path and content hash recorded for `import_id`.
+    /// See [`ArchiveStore::blob_of`].
     pub fn blob_of(&self, import_id: &str) -> Result<Option<(String, String)>> {
-        Ok(engine::archives::blob_of(&self.engine.lock(), import_id))
+        ArchiveStore::blob_of(&*self.engine.lock(), import_id)
     }
 
-    /// Remove `import_id`'s archive row and spans. The blob is not touched.
+    /// See [`ArchiveStore::remove`].
     pub fn remove(&self, import_id: &str) -> Result<()> {
-        engine::archives::remove(&mut self.engine.lock(), import_id)
+        ArchiveStore::remove(&mut *self.engine.lock(), import_id)
     }
 
-    /// How many recorded archives share the blob `hash`.
+    /// See [`ArchiveStore::count_with_hash`].
     pub fn count_with_hash(&self, hash: &str) -> Result<usize> {
-        Ok(engine::archives::count_with_hash(&self.engine.lock(), hash))
+        ArchiveStore::count_with_hash(&*self.engine.lock(), hash)
     }
 
-    /// Every recorded archive, oldest `archived_at` first.
+    /// See [`ArchiveStore::oldest_first`].
     pub fn oldest_first(&self) -> Result<Vec<ArchiveRow>> {
-        Ok(engine::archives::oldest_first(&self.engine.lock()))
+        ArchiveStore::oldest_first(&*self.engine.lock())
     }
 
-    /// How many spans are recorded: for `import_id`, or in all when `None`.
+    /// See [`ArchiveStore::span_count`].
     pub fn span_count(&self, import_id: Option<&str>) -> Result<usize> {
-        Ok(engine::archives::span_count(&self.engine.lock(), import_id))
+        ArchiveStore::span_count(&*self.engine.lock(), import_id)
     }
 }
 
+/// The behaviour every [`ArchiveStore`] must show, run against each backend
+/// by [`archive_conformance`] (ADR-0035).
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::db::Database;
+pub(crate) mod conformance {
+    use super::{ArchiveRow, ArchiveStore};
 
     fn row(import_id: &str, hash: &str, archived_at: &str) -> ArchiveRow {
         ArchiveRow {
@@ -115,22 +151,20 @@ mod tests {
         }
     }
 
-    #[test]
-    fn remove_takes_the_spans_and_leaves_a_shared_blob_counted() {
-        let db = Database::open_in_memory().unwrap();
-        let store = db.store();
-        let archives = Archives::new(&store);
-        archives.record(&row("a", "h", "2026-09-02")).unwrap();
-        archives.record(&row("b", "h", "2026-09-01")).unwrap();
-        archives.record_span("m1", "a", 0, 5).unwrap();
+    pub(crate) fn remove_takes_the_spans_and_leaves_a_shared_blob_counted(
+        store: &mut dyn ArchiveStore,
+    ) {
+        store.record(&row("a", "h", "2026-09-02")).unwrap();
+        store.record(&row("b", "h", "2026-09-01")).unwrap();
+        store.record_span("m1", "a", 0, 5).unwrap();
 
-        assert_eq!(archives.span_source("m1").unwrap().unwrap().import_id, "a");
-        assert_eq!(archives.span_count(Some("a")).unwrap(), 1);
-        archives.remove("a").unwrap();
-        assert!(archives.span_source("m1").unwrap().is_none());
-        assert_eq!(archives.span_count(None).unwrap(), 0);
-        assert_eq!(archives.count_with_hash("h").unwrap(), 1);
-        let ids: Vec<String> = archives
+        assert_eq!(store.span_source("m1").unwrap().unwrap().import_id, "a");
+        assert_eq!(store.span_count(Some("a")).unwrap(), 1);
+        store.remove("a").unwrap();
+        assert!(store.span_source("m1").unwrap().is_none());
+        assert_eq!(store.span_count(None).unwrap(), 0);
+        assert_eq!(store.count_with_hash("h").unwrap(), 1);
+        let ids: Vec<String> = store
             .oldest_first()
             .unwrap()
             .into_iter()
@@ -138,37 +172,105 @@ mod tests {
             .collect();
         assert_eq!(ids, vec!["b"]);
         // Removing again is not an error, as a delete of no rows is not.
-        archives.remove("a").unwrap();
+        store.remove("a").unwrap();
     }
 
-    #[test]
-    fn recording_again_replaces_the_archive_and_the_span() {
-        let db = Database::open_in_memory().unwrap();
-        let store = db.store();
-        let archives = Archives::new(&store);
-        archives.record(&row("a", "h1", "2026-09-01")).unwrap();
-        archives.record(&row("a", "h2", "2026-09-03")).unwrap();
-        archives.record_span("m1", "a", 0, 5).unwrap();
-        archives.record_span("m1", "a", 2, 9).unwrap();
+    pub(crate) fn recording_again_replaces_the_archive_and_the_span(store: &mut dyn ArchiveStore) {
+        store.record(&row("a", "h1", "2026-09-01")).unwrap();
+        store.record(&row("a", "h2", "2026-09-03")).unwrap();
+        store.record_span("m1", "a", 0, 5).unwrap();
+        store.record_span("m1", "a", 2, 9).unwrap();
 
         assert_eq!(
-            archives.oldest_first().unwrap(),
+            store.oldest_first().unwrap(),
             vec![row("a", "h2", "2026-09-03")]
         );
-        assert_eq!(archives.count_with_hash("h1").unwrap(), 0);
-        let span = archives.span_source("m1").unwrap().unwrap();
+        assert_eq!(store.count_with_hash("h1").unwrap(), 0);
+        let span = store.span_source("m1").unwrap().unwrap();
         assert_eq!((span.byte_start, span.byte_end), (2, 9));
-        assert_eq!(archives.span_count(None).unwrap(), 1);
+        assert_eq!(store.span_count(None).unwrap(), 1);
     }
 
+    pub(crate) fn a_span_whose_import_has_no_archive_has_no_source(store: &mut dyn ArchiveStore) {
+        store.record_span("m1", "gone", 0, 5).unwrap();
+        assert!(store.span_source("m1").unwrap().is_none());
+        assert!(store.blob_of("gone").unwrap().is_none());
+        assert_eq!(store.span_count(Some("gone")).unwrap(), 1);
+    }
+
+    pub(crate) fn blobs_and_order_follow_the_recorded_archives(store: &mut dyn ArchiveStore) {
+        store.record(&row("late", "h1", "2026-09-03")).unwrap();
+        store.record(&row("early", "h2", "2026-09-01")).unwrap();
+        assert_eq!(
+            store.blob_of("late").unwrap(),
+            Some(("/archive/h1".to_string(), "h1".to_string()))
+        );
+        let ids: Vec<String> = store
+            .oldest_first()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.import_id)
+            .collect();
+        assert_eq!(ids, ["early", "late"]);
+        assert_eq!(store.count_with_hash("missing").unwrap(), 0);
+    }
+}
+
+/// One `#[test]` per [`conformance`] check, each on a fresh store from
+/// `$make`.
+#[cfg(test)]
+macro_rules! archive_conformance {
+    ($make:expr) => {
+        use $crate::db::archives::conformance;
+
+        #[test]
+        fn remove_takes_the_spans_and_leaves_a_shared_blob_counted() {
+            conformance::remove_takes_the_spans_and_leaves_a_shared_blob_counted(&mut $make);
+        }
+        #[test]
+        fn recording_again_replaces_the_archive_and_the_span() {
+            conformance::recording_again_replaces_the_archive_and_the_span(&mut $make);
+        }
+        #[test]
+        fn a_span_whose_import_has_no_archive_has_no_source() {
+            conformance::a_span_whose_import_has_no_archive_has_no_source(&mut $make);
+        }
+        #[test]
+        fn blobs_and_order_follow_the_recorded_archives() {
+            conformance::blobs_and_order_follow_the_recorded_archives(&mut $make);
+        }
+    };
+}
+#[cfg(test)]
+pub(crate) use archive_conformance;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Database;
+
+    /// The facade locks per call and reaches the engine through the port.
     #[test]
-    fn a_span_whose_import_has_no_archive_has_no_source() {
+    fn the_facade_reads_back_what_it_records() {
         let db = Database::open_in_memory().unwrap();
         let store = db.store();
         let archives = Archives::new(&store);
-        archives.record_span("m1", "gone", 0, 5).unwrap();
-        assert!(archives.span_source("m1").unwrap().is_none());
-        assert!(archives.blob_of("gone").unwrap().is_none());
-        assert_eq!(archives.span_count(Some("gone")).unwrap(), 1);
+        let row = ArchiveRow {
+            import_id: "a".to_string(),
+            hash: "h".to_string(),
+            filename: "chat.json".to_string(),
+            archive_path: "/archive/h".to_string(),
+            byte_len: 10,
+            archived_at: "2026-09-01".to_string(),
+        };
+        archives.record(&row).unwrap();
+        archives.record_span("m1", "a", 0, 5).unwrap();
+        assert_eq!(archives.oldest_first().unwrap(), vec![row]);
+        assert_eq!(archives.span_source("m1").unwrap().unwrap().byte_end, 5);
+        assert_eq!(archives.blob_of("a").unwrap().unwrap().1, "h");
+        assert_eq!(archives.count_with_hash("h").unwrap(), 1);
+        assert_eq!(archives.span_count(Some("a")).unwrap(), 1);
+        archives.remove("a").unwrap();
+        assert_eq!(archives.span_count(None).unwrap(), 0);
     }
 }
