@@ -220,6 +220,11 @@ pub(crate) mod conformance {
         assert!(store.is_live("kept").unwrap());
         assert!(!store.is_live("gone").unwrap());
         assert!(!store.is_live("missing").unwrap());
+        assert_eq!(
+            store.current("gone").unwrap().map(|t| t.content),
+            Some(crate::sync::TOMBSTONE_CONTENT.to_string()),
+            "a tombstone's text is gone, but the row still reads"
+        );
         assert_eq!(store.delete_of_tombstones().unwrap(), 2);
         assert_eq!(store.delete_of_tombstones().unwrap(), 0);
         assert_eq!(store.list("kept", 10).unwrap().len(), 1);
@@ -242,6 +247,7 @@ pub(crate) mod conformance {
 
         // `None` sensitive reads back as not sensitive; `None` project keeps it.
         let unknown = Tracked {
+            tags: "not json".to_string(),
             sensitive: None,
             project: None,
             ..values("again")
@@ -251,6 +257,7 @@ pub(crate) mod conformance {
         assert_eq!(now.sensitive, Some(false));
         assert_eq!(now.project, Some(Some("p".to_string())));
         assert_eq!(now.content, "again");
+        assert_eq!(now.tags, "not json", "stored as given, not parsed");
     }
 }
 
