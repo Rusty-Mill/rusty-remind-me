@@ -1,5 +1,9 @@
 //! Storage for memory rows: every insert, sync upsert and field update of
-//! `memories`, on the engine's memories core (`db::engine::memories`).
+//! `memories`, and the reads over them.
+//!
+//! [`MemoryStore`] is the port (ADR-0035); the engine's adapter is in
+//! `db::engine::memories`. [`Memories`] is what callers take: it locks the
+//! store's tables for each call and goes through the port.
 //!
 //! Every write keeps the derived data (the full-text index, the tag index
 //! and the sync outbox) in step, as triggers did up to schema v30. The rules
@@ -341,7 +345,230 @@ pub(crate) fn tags_json(tags: &[String]) -> String {
     serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string())
 }
 
-/// The `memories` table, on the engine's memories core.
+/// The `memories` table, as a backend stores it (ADR-0035): every write,
+/// with the derived data (full-text index, tag index, sync outbox) kept in
+/// step, and every read over the rows.
+pub trait MemoryStore {
+    /// Insert `row`, made on this node. An existing id is an error.
+    fn insert(&mut self, row: &NewMemory) -> Result<()>;
+
+    /// Insert `row` unless its id is already taken. Returns whether it was
+    /// inserted.
+    fn insert_or_ignore(&mut self, row: &NewMemory) -> Result<bool>;
+
+    /// Write a record a peer sent: insert it, or overwrite the local row.
+    ///
+    /// An overwrite keeps the local `created_at`, `doc_id` and `chunk_index`:
+    /// a peer's record does not carry the last two, and the first never
+    /// changes. Never queued for sync: it came from there.
+    fn upsert_synced(&mut self, row: &NewMemory) -> Result<()>;
+
+    /// The local copy of `id` as a sync merge sees it, if there is one.
+    /// Unparseable `tags` read as none and unparseable `metadata` as `{}`.
+    fn sync_view(&self, id: &str) -> Result<Option<SyncView>>;
+
+    /// Replace `id`'s tags and metadata without stamping `updated_at`: a sync
+    /// merge that lost last-write-wins still keeps the union, and must not
+    /// look like a newer local edit.
+    fn set_tags_and_metadata(&mut self, id: &str, tags: &[String], metadata: &Value) -> Result<()>;
+
+    /// Point `id` at the memory that replaces it. `updated_at`, when given,
+    /// is stamped too, which is what puts the change in the sync outbox.
+    fn set_superseded_by(
+        &mut self,
+        id: &str,
+        superseded_by: &str,
+        updated_at: Option<&str>,
+    ) -> Result<()>;
+
+    /// Supersede every live, not yet superseded chunk of the import
+    /// `old_import_id` with `new_import_id`, stamping `updated_at`. Returns
+    /// how many were superseded.
+    fn supersede_import(
+        &mut self,
+        old_import_id: &str,
+        new_import_id: &str,
+        updated_at: &str,
+    ) -> Result<usize>;
+
+    /// Hard-delete every memory of `category` belonging to the capture
+    /// `capture_id`. Returns how many went.
+    fn delete_capture_category(&mut self, capture_id: &str, category: &str) -> Result<usize>;
+
+    /// Rewrite `id` as the merge of its cluster: content, summed access
+    /// count and tags, stamping `updated_at`.
+    fn set_merged(
+        &mut self,
+        id: &str,
+        content: &str,
+        access_count: i64,
+        tags: &[String],
+        updated_at: &str,
+    ) -> Result<()>;
+
+    /// Set `id`'s vitality and status, without stamping `updated_at`: both
+    /// are local scores, not edits.
+    fn set_vitality(&mut self, id: &str, vitality: f64, status: &str) -> Result<()>;
+
+    /// The access-tracking inputs of each of `ids` that exists, in no
+    /// particular order.
+    fn access_inputs(&self, ids: &[String]) -> Result<Vec<AccessInputs>>;
+
+    /// Record an access to `id`: when, the new count, and the vitality and
+    /// status it leads to. Not an edit, so `updated_at` is left alone.
+    fn record_access(
+        &mut self,
+        id: &str,
+        accessed_at: &str,
+        access_count: i64,
+        vitality: f64,
+        status: &str,
+    ) -> Result<()>;
+
+    /// The triple of every live, unsuperseded memory other than `except_id`
+    /// that has all three parts.
+    fn live_triples_except(&self, except_id: &str) -> Result<Vec<Triple>>;
+
+    /// Live, unsuperseded memories after (`cutoff`, `after_id`) in
+    /// (created_at, id) order, oldest first, at most `limit`. With no
+    /// `after_id`, every memory created at `cutoff` is behind it.
+    fn live_created_after(
+        &self,
+        cutoff: &str,
+        after_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<CreatedMemory>>;
+
+    /// How many live, unsuperseded memories [`Self::live_created_after`]
+    /// would return with no limit.
+    fn count_live_created_after(&self, cutoff: &str, after_id: Option<&str>) -> Result<usize>;
+
+    /// The memories `ids` names that exist, in no particular order.
+    fn get_many(&self, ids: &[String]) -> Result<Vec<Memory>>;
+
+    /// Whether `id` exists.
+    fn exists(&self, id: &str) -> Result<bool>;
+
+    /// Whether `id` is marked sensitive, or `None` when there is no such
+    /// memory.
+    fn sensitivity(&self, id: &str) -> Result<Option<bool>>;
+
+    /// The memories an export takes, oldest first (ties by id): of
+    /// `category` when given, carrying every one of `tags`, and only the live,
+    /// unsuperseded ones unless `include_deleted`.
+    fn exportable(
+        &self,
+        include_deleted: bool,
+        category: Option<&str>,
+        tags: &[String],
+    ) -> Result<Vec<Memory>>;
+
+    /// Every live memory, in no particular order.
+    fn all_live(&self) -> Result<Vec<Memory>>;
+
+    /// Every live memory of `memory_type`, oldest first.
+    fn live_of_type(&self, memory_type: &str) -> Result<Vec<Memory>>;
+
+    /// Undeleted memories whose predicate starts with `prefix`, ignoring
+    /// case, superseded ones included, oldest first (ties by id).
+    fn with_predicate_prefix(&self, prefix: &str) -> Result<Vec<Memory>>;
+
+    /// Memory `id`, unless it is missing or deleted.
+    fn get_live(&self, id: &str) -> Result<Option<Memory>>;
+
+    /// The memories `filter` takes, newest first (ties by id, descending):
+    /// how many there are in all, and the page at `offset` of at most
+    /// `limit`.
+    fn list_page(
+        &self,
+        filter: &ListFilter,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(usize, Vec<Memory>)>;
+
+    /// Apply `edit` to memory `id`, made on this node. A missing id is a
+    /// no-op.
+    fn apply_edit(&mut self, id: &str, edit: &MemoryEdit) -> Result<()>;
+
+    /// Drop the text of every tombstone that still holds it (ADR-0024), as
+    /// storage rather than an edit: `updated_at` stays and nothing is
+    /// queued, since every node empties its own copy. How many changed; 0
+    /// once they all have, so it is cheap to run at every open.
+    fn empty_tombstones(&mut self) -> Result<usize>;
+
+    /// Delete live memory `id`: tombstone it at `tombstone_at` (stamping
+    /// `deleted_at` and `updated_at`, and dropping its text as ADR-0024
+    /// says), or remove the row when that is `None`. Whether there was a
+    /// live memory to delete.
+    fn delete_live(&mut self, id: &str, tombstone_at: Option<&str>) -> Result<bool>;
+
+    /// Live memories of `memory_type`, oldest first (ties by id): how many
+    /// there are, and the first `limit` with the first 500 characters of
+    /// their content.
+    fn of_type_page(
+        &self,
+        memory_type: &str,
+        limit: usize,
+    ) -> Result<(usize, Vec<UnclassifiedMemory>)>;
+
+    /// Live, unsuperseded memories matching any of `phrases` in the full-text
+    /// index, best BM25 first (ties by id), at most `limit`, each with its
+    /// BM25 score. No phrases match nothing.
+    fn keyword_hits(
+        &self,
+        phrases: &[String],
+        filter: &KeywordFilter,
+        limit: usize,
+    ) -> Result<Vec<(Memory, f64)>>;
+
+    /// Every live, unsuperseded memory `filter` admits, newest first on its
+    /// window's timestamp (ties by id). Serves a search with a time window and
+    /// no query text, where there is nothing to rank. Unlimited, because the
+    /// caller's validity and confidence filters must run before its `limit`.
+    fn window_hits(&self, filter: &KeywordFilter) -> Result<Vec<Memory>>;
+
+    /// The ids of every memory marked sensitive.
+    fn sensitive_ids(&self) -> Result<HashSet<String>>;
+
+    /// A page of the live, unsuperseded memories `filter` takes: matching
+    /// any of `phrases`, best BM25 first, or with no phrases newest first
+    /// (ties by id either way). How many there are, and the page.
+    fn keyword_page(
+        &self,
+        phrases: &[String],
+        filter: &PageFilter,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(usize, Vec<Memory>)>;
+
+    /// Memories awaiting extraction, newest first (ties by id, descending):
+    /// how many there are, and the first `limit` with the first 500
+    /// characters of their content. A memory qualifies when it is live, is
+    /// **not a raw dialog or skeleton**, has no SPO triple at all, and has
+    /// no entity links at all: one that has entities but no triple is
+    /// already annotated, and a captured transcript's facts come out through
+    /// `decompose`, so dialogs would otherwise flood this backlog.
+    fn unannotated_page(&self, limit: usize) -> Result<(usize, Vec<UnannotatedMemory>)>;
+
+    /// The id, content and metadata JSON of every live, unsuperseded,
+    /// non-sensitive memory that records code references.
+    fn with_code_refs(&self) -> Result<Vec<(String, String, String)>>;
+
+    /// The id, content and `valid_until` of every live, unsuperseded,
+    /// non-sensitive memory that has one.
+    fn with_valid_until(&self) -> Result<Vec<(String, String, String)>>;
+
+    /// `(sources, derived)` of `id` through the capture it was decomposed
+    /// from, or the facts decomposed from it. Both empty for a memory with
+    /// neither link.
+    fn capture_links(&self, id: &str) -> Result<(Vec<String>, Vec<String>)>;
+
+    /// Set `metadata.ingest` to `marker` on every chunk of the import
+    /// `doc_id`. Returns how many were stamped.
+    fn set_ingest_marker(&mut self, doc_id: &str, marker: &str) -> Result<usize>;
+}
+
+/// The `memories` table of a [`Store`], one locked call at a time.
 pub struct Memories<'c> {
     core: &'c EngineLock,
 }
@@ -351,75 +578,62 @@ impl<'c> Memories<'c> {
         Self { core: store.core() }
     }
 
-    /// Insert `row`, made on this node. An existing id is an error.
+    /// See [`MemoryStore::insert`].
     pub fn insert(&self, row: &NewMemory) -> Result<()> {
-        engine::memories::insert(&mut self.core.lock(), row)
+        MemoryStore::insert(&mut *self.core.lock(), row)
     }
 
-    /// Insert `row` unless its id is already taken. Returns whether it was
-    /// inserted.
+    /// See [`MemoryStore::insert_or_ignore`].
     pub fn insert_or_ignore(&self, row: &NewMemory) -> Result<bool> {
-        engine::memories::insert_or_ignore(&mut self.core.lock(), row)
+        MemoryStore::insert_or_ignore(&mut *self.core.lock(), row)
     }
 
-    /// Write a record a peer sent: insert it, or overwrite the local row.
-    ///
-    /// An overwrite keeps the local `created_at`, `doc_id` and `chunk_index`:
-    /// a peer's record does not carry the last two, and the first never
-    /// changes. Never queued for sync: it came from there.
+    /// See [`MemoryStore::upsert_synced`].
     pub fn upsert_synced(&self, row: &NewMemory) -> Result<()> {
-        engine::memories::upsert_synced(&mut self.core.lock(), row)
+        MemoryStore::upsert_synced(&mut *self.core.lock(), row)
     }
 
-    /// The local copy of `id` as a sync merge sees it, if there is one.
-    /// Unparseable `tags` read as none and unparseable `metadata` as `{}`.
+    /// See [`MemoryStore::sync_view`].
     pub fn sync_view(&self, id: &str) -> Result<Option<SyncView>> {
-        engine::memories::sync_view(&self.core.lock(), id)
+        MemoryStore::sync_view(&*self.core.lock(), id)
     }
 
-    /// Replace `id`'s tags and metadata without stamping `updated_at`: a sync
-    /// merge that lost last-write-wins still keeps the union, and must not
-    /// look like a newer local edit.
+    /// See [`MemoryStore::set_tags_and_metadata`].
     pub fn set_tags_and_metadata(&self, id: &str, tags: &[String], metadata: &Value) -> Result<()> {
-        engine::memories::set_tags_and_metadata(&mut self.core.lock(), id, tags, metadata)
+        MemoryStore::set_tags_and_metadata(&mut *self.core.lock(), id, tags, metadata)
     }
 
-    /// Point `id` at the memory that replaces it. `updated_at`, when given,
-    /// is stamped too, which is what puts the change in the sync outbox.
+    /// See [`MemoryStore::set_superseded_by`].
     pub fn set_superseded_by(
         &self,
         id: &str,
         superseded_by: &str,
         updated_at: Option<&str>,
     ) -> Result<()> {
-        engine::memories::set_superseded_by(&mut self.core.lock(), id, superseded_by, updated_at)
+        MemoryStore::set_superseded_by(&mut *self.core.lock(), id, superseded_by, updated_at)
     }
 
-    /// Supersede every live, not yet superseded chunk of the import
-    /// `old_import_id` with `new_import_id`, stamping `updated_at`. Returns
-    /// how many were superseded.
+    /// See [`MemoryStore::supersede_import`].
     pub fn supersede_import(
         &self,
         old_import_id: &str,
         new_import_id: &str,
         updated_at: &str,
     ) -> Result<usize> {
-        engine::memories::supersede_import(
-            &mut self.core.lock(),
+        MemoryStore::supersede_import(
+            &mut *self.core.lock(),
             old_import_id,
             new_import_id,
             updated_at,
         )
     }
 
-    /// Hard-delete every memory of `category` belonging to the capture
-    /// `capture_id`. Returns how many went.
+    /// See [`MemoryStore::delete_capture_category`].
     pub fn delete_capture_category(&self, capture_id: &str, category: &str) -> Result<usize> {
-        engine::memories::delete_capture_category(&mut self.core.lock(), capture_id, category)
+        MemoryStore::delete_capture_category(&mut *self.core.lock(), capture_id, category)
     }
 
-    /// Rewrite `id` as the merge of its cluster: content, summed access
-    /// count and tags, stamping `updated_at`.
+    /// See [`MemoryStore::set_merged`].
     pub fn set_merged(
         &self,
         id: &str,
@@ -428,8 +642,8 @@ impl<'c> Memories<'c> {
         tags: &[String],
         updated_at: &str,
     ) -> Result<()> {
-        engine::memories::set_merged(
-            &mut self.core.lock(),
+        MemoryStore::set_merged(
+            &mut *self.core.lock(),
             id,
             content,
             access_count,
@@ -438,20 +652,17 @@ impl<'c> Memories<'c> {
         )
     }
 
-    /// Set `id`'s vitality and status, without stamping `updated_at`: both
-    /// are local scores, not edits.
+    /// See [`MemoryStore::set_vitality`].
     pub fn set_vitality(&self, id: &str, vitality: f64, status: &str) -> Result<()> {
-        engine::memories::set_vitality(&mut self.core.lock(), id, vitality, status)
+        MemoryStore::set_vitality(&mut *self.core.lock(), id, vitality, status)
     }
 
-    /// The access-tracking inputs of each of `ids` that exists, in no
-    /// particular order.
+    /// See [`MemoryStore::access_inputs`].
     pub fn access_inputs(&self, ids: &[String]) -> Result<Vec<AccessInputs>> {
-        engine::memories::access_inputs(&self.core.lock(), ids)
+        MemoryStore::access_inputs(&*self.core.lock(), ids)
     }
 
-    /// Record an access to `id`: when, the new count, and the vitality and
-    /// status it leads to. Not an edit, so `updated_at` is left alone.
+    /// See [`MemoryStore::record_access`].
     pub fn record_access(
         &self,
         id: &str,
@@ -460,8 +671,8 @@ impl<'c> Memories<'c> {
         vitality: f64,
         status: &str,
     ) -> Result<()> {
-        engine::memories::record_access(
-            &mut self.core.lock(),
+        MemoryStore::record_access(
+            &mut *self.core.lock(),
             id,
             accessed_at,
             access_count,
@@ -470,165 +681,126 @@ impl<'c> Memories<'c> {
         )
     }
 
-    /// The triple of every live, unsuperseded memory other than `except_id`
-    /// that has all three parts.
+    /// See [`MemoryStore::live_triples_except`].
     pub fn live_triples_except(&self, except_id: &str) -> Result<Vec<Triple>> {
-        engine::memories::live_triples_except(&self.core.lock(), except_id)
+        MemoryStore::live_triples_except(&*self.core.lock(), except_id)
     }
 
-    /// Live, unsuperseded memories after (`cutoff`, `after_id`) in
-    /// (created_at, id) order, oldest first, at most `limit`. With no
-    /// `after_id`, every memory created at `cutoff` is behind it.
+    /// See [`MemoryStore::live_created_after`].
     pub fn live_created_after(
         &self,
         cutoff: &str,
         after_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<CreatedMemory>> {
-        engine::memories::live_created_after(&self.core.lock(), cutoff, after_id, limit)
+        MemoryStore::live_created_after(&*self.core.lock(), cutoff, after_id, limit)
     }
 
-    /// How many live, unsuperseded memories [`Self::live_created_after`]
-    /// would return with no limit.
+    /// See [`MemoryStore::count_live_created_after`].
     pub fn count_live_created_after(&self, cutoff: &str, after_id: Option<&str>) -> Result<usize> {
-        engine::memories::count_live_created_after(&self.core.lock(), cutoff, after_id)
+        MemoryStore::count_live_created_after(&*self.core.lock(), cutoff, after_id)
     }
 
-    /// The memories `ids` names that exist, in no particular order.
+    /// See [`MemoryStore::get_many`].
     pub fn get_many(&self, ids: &[String]) -> Result<Vec<Memory>> {
-        engine::memories::get_many(&self.core.lock(), ids)
+        MemoryStore::get_many(&*self.core.lock(), ids)
     }
 
-    /// Whether `id` exists.
+    /// See [`MemoryStore::exists`].
     pub fn exists(&self, id: &str) -> Result<bool> {
-        engine::memories::exists(&self.core.lock(), id)
+        MemoryStore::exists(&*self.core.lock(), id)
     }
 
-    /// Whether `id` is marked sensitive, or `None` when there is no such
-    /// memory.
+    /// See [`MemoryStore::sensitivity`].
     pub fn sensitivity(&self, id: &str) -> Result<Option<bool>> {
-        engine::memories::sensitivity(&self.core.lock(), id)
+        MemoryStore::sensitivity(&*self.core.lock(), id)
     }
 
-    /// The memories an export takes, oldest first (ties by id): of
-    /// `category` when given, carrying every one of `tags`, and only the live,
-    /// unsuperseded ones unless `include_deleted`.
+    /// See [`MemoryStore::exportable`].
     pub fn exportable(
         &self,
         include_deleted: bool,
         category: Option<&str>,
         tags: &[String],
     ) -> Result<Vec<Memory>> {
-        engine::memories::exportable(&self.core.lock(), include_deleted, category, tags)
+        MemoryStore::exportable(&*self.core.lock(), include_deleted, category, tags)
     }
 
-    /// Every live memory, in no particular order.
+    /// See [`MemoryStore::all_live`].
     pub fn all_live(&self) -> Result<Vec<Memory>> {
-        engine::memories::all_live(&self.core.lock())
+        MemoryStore::all_live(&*self.core.lock())
     }
 
-    /// Every live memory of `memory_type`, oldest first.
+    /// See [`MemoryStore::live_of_type`].
     pub fn live_of_type(&self, memory_type: &str) -> Result<Vec<Memory>> {
-        engine::memories::live_of_type(&self.core.lock(), memory_type)
+        MemoryStore::live_of_type(&*self.core.lock(), memory_type)
     }
 
-    /// Undeleted memories whose predicate starts with `prefix`, ignoring
-    /// case, superseded ones included, oldest first (ties by id).
+    /// See [`MemoryStore::with_predicate_prefix`].
     pub fn with_predicate_prefix(&self, prefix: &str) -> Result<Vec<Memory>> {
-        engine::memories::with_predicate_prefix(&self.core.lock(), prefix)
+        MemoryStore::with_predicate_prefix(&*self.core.lock(), prefix)
     }
 
-    /// Memory `id`, unless it is missing or deleted.
+    /// See [`MemoryStore::get_live`].
     pub fn get_live(&self, id: &str) -> Result<Option<Memory>> {
-        engine::memories::get_live(&self.core.lock(), id)
+        MemoryStore::get_live(&*self.core.lock(), id)
     }
 
-    /// Live memory `id`'s category, or `None` when it is missing or deleted.
-    pub fn live_category(&self, id: &str) -> Result<Option<String>> {
-        Ok(engine::memories::get_live(&self.core.lock(), id)?.map(|m| m.category))
-    }
-
-    /// The memories `filter` takes, newest first (ties by id, descending):
-    /// how many there are in all, and the page at `offset` of at most
-    /// `limit`.
+    /// See [`MemoryStore::list_page`].
     pub fn list_page(
         &self,
         filter: &ListFilter,
         limit: usize,
         offset: usize,
     ) -> Result<(usize, Vec<Memory>)> {
-        engine::memories::list_page(&self.core.lock(), filter, limit, offset)
+        MemoryStore::list_page(&*self.core.lock(), filter, limit, offset)
     }
 
-    /// Apply `edit` to memory `id`, made on this node. A missing id is a
-    /// no-op.
+    /// See [`MemoryStore::apply_edit`].
     pub fn apply_edit(&self, id: &str, edit: &MemoryEdit) -> Result<()> {
-        engine::memories::apply_edit(&mut self.core.lock(), id, edit)
+        MemoryStore::apply_edit(&mut *self.core.lock(), id, edit)
     }
 
-    /// Drop the text of every tombstone that still holds it (ADR-0024), as
-    /// storage rather than an edit: `updated_at` stays and nothing is
-    /// queued, since every node empties its own copy. How many changed; 0
-    /// once they all have, so it is cheap to run at every open.
+    /// See [`MemoryStore::empty_tombstones`].
     pub fn empty_tombstones(&self) -> Result<usize> {
-        engine::memories::empty_tombstones(&mut self.core.lock())
+        MemoryStore::empty_tombstones(&mut *self.core.lock())
     }
 
-    /// Delete live memory `id`: tombstone it at `tombstone_at` (stamping
-    /// `deleted_at` and `updated_at`, and dropping its text as ADR-0024
-    /// says), or remove the row when that is `None`. Whether there was a
-    /// live memory to delete.
+    /// See [`MemoryStore::delete_live`].
     pub fn delete_live(&self, id: &str, tombstone_at: Option<&str>) -> Result<bool> {
-        engine::memories::delete_live(&mut self.core.lock(), id, tombstone_at)
+        MemoryStore::delete_live(&mut *self.core.lock(), id, tombstone_at)
     }
 
-    /// Live memories of `memory_type`, oldest first (ties by id): how many
-    /// there are, and the first `limit` with the first 500 characters of
-    /// their content.
+    /// See [`MemoryStore::of_type_page`].
     pub fn of_type_page(
         &self,
         memory_type: &str,
         limit: usize,
     ) -> Result<(usize, Vec<UnclassifiedMemory>)> {
-        engine::memories::of_type_page(&self.core.lock(), memory_type, limit)
+        MemoryStore::of_type_page(&*self.core.lock(), memory_type, limit)
     }
 
-    /// Live, unsuperseded memories matching any of `phrases` in the full-text
-    /// index, best BM25 first (ties by id), at most `limit`, each with its
-    /// BM25 score. No phrases match nothing.
+    /// See [`MemoryStore::keyword_hits`].
     pub fn keyword_hits(
         &self,
         phrases: &[String],
         filter: &KeywordFilter,
         limit: usize,
     ) -> Result<Vec<(Memory, f64)>> {
-        if phrases.is_empty() {
-            return Ok(Vec::new());
-        }
-        engine::memories::keyword_hits(&self.core.lock(), phrases, filter, limit)
+        MemoryStore::keyword_hits(&*self.core.lock(), phrases, filter, limit)
     }
 
-    /// The ids of the memories linked to entity `entity_id`.
-    pub fn linked_ids(&self, entity_id: &str) -> Result<HashSet<String>> {
-        engine::graph::linked_ids(&self.core.lock(), entity_id)
-    }
-
-    /// Every live, unsuperseded memory `filter` admits, newest first on its
-    /// window's timestamp (ties by id). Serves a search with a time window and
-    /// no query text, where there is nothing to rank. Unlimited, because the
-    /// caller's validity and confidence filters must run before its `limit`.
+    /// See [`MemoryStore::window_hits`].
     pub fn window_hits(&self, filter: &KeywordFilter) -> Result<Vec<Memory>> {
-        engine::memories::window_hits(&self.core.lock(), filter)
+        MemoryStore::window_hits(&*self.core.lock(), filter)
     }
 
-    /// The ids of every memory marked sensitive.
+    /// See [`MemoryStore::sensitive_ids`].
     pub fn sensitive_ids(&self) -> Result<HashSet<String>> {
-        engine::memories::sensitive_ids(&self.core.lock())
+        MemoryStore::sensitive_ids(&*self.core.lock())
     }
 
-    /// A page of the live, unsuperseded memories `filter` takes: matching
-    /// any of `phrases`, best BM25 first, or with no phrases newest first
-    /// (ties by id either way). How many there are, and the page.
+    /// See [`MemoryStore::keyword_page`].
     pub fn keyword_page(
         &self,
         phrases: &[String],
@@ -636,48 +808,43 @@ impl<'c> Memories<'c> {
         limit: usize,
         offset: usize,
     ) -> Result<(usize, Vec<Memory>)> {
-        let tables = self.core.lock();
-        let linked = match &filter.entity {
-            Some(scope) => engine::graph::linked_ids(&tables, &scope.id)?,
-            None => HashSet::new(),
-        };
-        engine::memories::keyword_page(&tables, phrases, filter, &linked, limit, offset)
+        MemoryStore::keyword_page(&*self.core.lock(), phrases, filter, limit, offset)
     }
 
-    /// Memories awaiting extraction, newest first (ties by id, descending):
-    /// how many there are, and the first `limit` with the first 500
-    /// characters of their content. A memory qualifies when it is live, is
-    /// **not a raw dialog or skeleton**, has no SPO triple at all, and has
-    /// no entity links at all: one that has entities but no triple is
-    /// already annotated, and a captured transcript's facts come out through
-    /// `decompose`, so dialogs would otherwise flood this backlog.
+    /// See [`MemoryStore::unannotated_page`].
     pub fn unannotated_page(&self, limit: usize) -> Result<(usize, Vec<UnannotatedMemory>)> {
-        engine::memories::unannotated_page(&self.core.lock(), limit)
+        MemoryStore::unannotated_page(&*self.core.lock(), limit)
     }
 
-    /// The id, content and metadata JSON of every live, unsuperseded,
-    /// non-sensitive memory that records code references.
+    /// See [`MemoryStore::with_code_refs`].
     pub fn with_code_refs(&self) -> Result<Vec<(String, String, String)>> {
-        engine::memories::with_code_refs(&self.core.lock())
+        MemoryStore::with_code_refs(&*self.core.lock())
     }
 
-    /// The id, content and `valid_until` of every live, unsuperseded,
-    /// non-sensitive memory that has one.
+    /// See [`MemoryStore::with_valid_until`].
     pub fn with_valid_until(&self) -> Result<Vec<(String, String, String)>> {
-        engine::memories::with_valid_until(&self.core.lock())
+        MemoryStore::with_valid_until(&*self.core.lock())
     }
 
-    /// `(sources, derived)` of `id` through the capture it was decomposed
-    /// from, or the facts decomposed from it. Both empty for a memory with
-    /// neither link.
+    /// See [`MemoryStore::capture_links`].
     pub fn capture_links(&self, id: &str) -> Result<(Vec<String>, Vec<String>)> {
-        engine::memories::capture_links(&self.core.lock(), id)
+        MemoryStore::capture_links(&*self.core.lock(), id)
     }
 
-    /// Set `metadata.ingest` to `marker` on every chunk of the import
-    /// `doc_id`. Returns how many were stamped.
+    /// See [`MemoryStore::set_ingest_marker`].
     pub fn set_ingest_marker(&self, doc_id: &str, marker: &str) -> Result<usize> {
-        engine::memories::set_ingest_marker(&mut self.core.lock(), doc_id, marker)
+        MemoryStore::set_ingest_marker(&mut *self.core.lock(), doc_id, marker)
+    }
+
+    /// Live memory `id`'s category, or `None` when it is missing or deleted.
+    pub fn live_category(&self, id: &str) -> Result<Option<String>> {
+        Ok(MemoryStore::get_live(&*self.core.lock(), id)?.map(|m| m.category))
+    }
+
+    /// The ids of the memories linked to entity `id`. Entity links are the
+    /// entities group's table; this read moves behind that group's port.
+    pub fn linked_ids(&self, entity_id: &str) -> Result<HashSet<String>> {
+        engine::graph::linked_ids(&self.core.lock(), entity_id)
     }
 }
 
