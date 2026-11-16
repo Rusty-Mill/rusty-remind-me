@@ -1,11 +1,13 @@
 //! Promotion provenance and the promotion reads on the engine core
-//! (ADR-0023, core PR 3c). [`crate::db::promotions`] calls
-//! these when its store carries the core.
+//! (ADR-0023, core PR 3c): the engine's [`PromotionStore`] adapter
+//! (ADR-0035).
 
 use super::core::{Change, CoreTables};
 use super::memories::{self, MemoryRow};
 use super::{core_ref, pair_engine_id, EngineTables};
-use crate::db::promotions::{EntityFactGroup, IdContent, ScoredMemory, StatementRow};
+use crate::db::promotions::{
+    EntityFactGroup, IdContent, PromotionStore, ScoredMemory, StatementRow,
+};
 use crate::db::Result;
 use rusty_multimodal_db_engine::generic::query::{AllIds, GetById};
 use rusty_multimodal_db_engine::generic::traits::{
@@ -98,30 +100,6 @@ fn promoted_at_rung(core: &CoreTables, rung: &str) -> HashSet<String> {
         .collect()
 }
 
-/// Record a promotion unless the pair is already recorded: `INSERT OR
-/// IGNORE`.
-pub(crate) fn record(
-    tables: &mut EngineTables,
-    promoted_id: &str,
-    source_id: &str,
-    rung: &str,
-    promoted_at: &str,
-) -> Result<()> {
-    let engine_id = pair_engine_id(promoted_id, source_id);
-    if core_ref(tables)?.promotions.get(engine_id).is_some() {
-        return Ok(());
-    }
-    let record = PromotionRecord {
-        engine_id,
-        promoted_id: promoted_id.to_string(),
-        source_id: source_id.to_string(),
-        rung: rung.to_string(),
-        promoted_at: promoted_at.to_string(),
-        slot: 0,
-    };
-    tables.commit(vec![Change::Promotion(engine_id, Some(record))])
-}
-
 /// The field `pick` of every promotion `keep` selects, sorted and without
 /// repeats when `distinct`.
 fn column(
@@ -142,72 +120,6 @@ fn column(
     Ok(values)
 }
 
-pub(crate) fn promoted_from(
-    tables: &EngineTables,
-    source_id: &str,
-    rung: &str,
-) -> Result<Vec<String>> {
-    column(
-        tables,
-        |p| p.source_id == source_id && p.rung == rung,
-        |p| p.promoted_id,
-        true,
-    )
-}
-
-pub(crate) fn sources_at(
-    tables: &EngineTables,
-    promoted_id: &str,
-    rung: &str,
-) -> Result<Vec<String>> {
-    column(
-        tables,
-        |p| p.promoted_id == promoted_id && p.rung == rung,
-        |p| p.source_id,
-        false,
-    )
-}
-
-pub(crate) fn sources_of(tables: &EngineTables, memory_id: &str) -> Result<Vec<String>> {
-    column(
-        tables,
-        |p| p.promoted_id == memory_id,
-        |p| p.source_id,
-        false,
-    )
-}
-
-pub(crate) fn derived_from(tables: &EngineTables, memory_id: &str) -> Result<Vec<String>> {
-    column(
-        tables,
-        |p| p.source_id == memory_id,
-        |p| p.promoted_id,
-        false,
-    )
-}
-
-/// How many of `promoted_id`'s sources are live and unsuperseded.
-pub(crate) fn surviving_sources(tables: &EngineTables, promoted_id: &str) -> Result<usize> {
-    let core = core_ref(tables)?;
-    Ok(promotions(core)
-        .into_iter()
-        .filter(|p| p.promoted_id == promoted_id)
-        .filter(|p| {
-            memories::row(core, &p.source_id).is_some_and(|row| live(&row) && !discredited(&row))
-        })
-        .count())
-}
-
-pub(crate) fn live_source_sensitivity(tables: &EngineTables, id: &str) -> Result<Option<bool>> {
-    Ok(memories::row(core_ref(tables)?, id)
-        .filter(live)
-        .map(|row| row.sensitive))
-}
-
-pub(crate) fn is_live(tables: &EngineTables, id: &str) -> Result<bool> {
-    Ok(memories::row(core_ref(tables)?, id).is_some_and(|row| live(&row)))
-}
-
 /// Captured dialogs nothing names as `source_capture_id`, newest first, ties
 /// by id descending.
 fn undecomposed_dialog_rows(core: &CoreTables) -> Vec<MemoryRow> {
@@ -216,21 +128,6 @@ fn undecomposed_dialog_rows(core: &CoreTables) -> Vec<MemoryRow> {
         .collect();
     rows.sort_by(|a, b| (&b.created_at, &b.id).cmp(&(&a.created_at, &a.id)));
     rows
-}
-
-pub(crate) fn undecomposed_dialogs(tables: &EngineTables, limit: usize) -> Result<Vec<IdContent>> {
-    Ok(undecomposed_dialog_rows(core_ref(tables)?)
-        .into_iter()
-        .take(limit)
-        .map(|row| IdContent {
-            id: row.id,
-            content: row.content,
-        })
-        .collect())
-}
-
-pub(crate) fn count_undecomposed_dialogs(tables: &EngineTables) -> Result<usize> {
-    Ok(undecomposed_dialog_rows(core_ref(tables)?).len())
 }
 
 /// Live `category` memories not promoted at `rung`, grouped by an entity
@@ -287,29 +184,6 @@ fn origins(core: &CoreTables, ids: &[String]) -> usize {
         .len()
 }
 
-pub(crate) fn entity_fact_groups(
-    tables: &EngineTables,
-    category: &str,
-    rung: &str,
-    min_facts: usize,
-    min_sources: usize,
-    limit: usize,
-) -> Result<Vec<EntityFactGroup>> {
-    let mut groups = fact_groups(core_ref(tables)?, category, rung, min_facts, min_sources);
-    groups.truncate(limit);
-    Ok(groups)
-}
-
-pub(crate) fn count_entity_fact_groups(
-    tables: &EngineTables,
-    category: &str,
-    rung: &str,
-    min_facts: usize,
-    min_sources: usize,
-) -> Result<usize> {
-    Ok(fact_groups(core_ref(tables)?, category, rung, min_facts, min_sources).len())
-}
-
 /// Live, non-sensitive `category` memories at or above `floor` stored
 /// vitality, not promoted at `rung`: most vital first, ties by id.
 fn scenarios(core: &CoreTables, category: &str, floor: f64, rung: &str) -> Vec<MemoryRow> {
@@ -330,36 +204,9 @@ fn scenarios(core: &CoreTables, category: &str, floor: f64, rung: &str) -> Vec<M
     rows
 }
 
-pub(crate) fn ready_scenarios(
-    tables: &EngineTables,
-    category: &str,
-    floor: f64,
-    rung: &str,
-    limit: usize,
-) -> Result<Vec<ScoredMemory>> {
-    Ok(scenarios(core_ref(tables)?, category, floor, rung)
-        .into_iter()
-        .take(limit)
-        .map(|row| ScoredMemory {
-            id: row.id,
-            content: row.content,
-            vitality: row.vitality,
-        })
-        .collect())
-}
-
-pub(crate) fn count_ready_scenarios(
-    tables: &EngineTables,
-    category: &str,
-    floor: f64,
-    rung: &str,
-) -> Result<usize> {
-    Ok(scenarios(core_ref(tables)?, category, floor, rung).len())
-}
-
 /// Live `category` memories as statements, non-sensitive and most vital
 /// first when `by_vitality`, else all of them newest first; ties by id.
-pub(crate) fn statements(
+fn statements(
     tables: &EngineTables,
     category: &str,
     by_vitality: bool,
@@ -390,4 +237,153 @@ pub(crate) fn statements(
             created_at: row.created_at,
         })
         .collect())
+}
+
+impl PromotionStore for EngineTables {
+    /// Record a promotion unless the pair is already recorded: `INSERT OR
+    /// IGNORE`.
+    fn record(
+        &mut self,
+        promoted_id: &str,
+        source_id: &str,
+        rung: &str,
+        promoted_at: &str,
+    ) -> Result<()> {
+        let engine_id = pair_engine_id(promoted_id, source_id);
+        if core_ref(self)?.promotions.get(engine_id).is_some() {
+            return Ok(());
+        }
+        let record = PromotionRecord {
+            engine_id,
+            promoted_id: promoted_id.to_string(),
+            source_id: source_id.to_string(),
+            rung: rung.to_string(),
+            promoted_at: promoted_at.to_string(),
+            slot: 0,
+        };
+        self.commit(vec![Change::Promotion(engine_id, Some(record))])
+    }
+
+    fn promoted_from(&self, source_id: &str, rung: &str) -> Result<Vec<String>> {
+        column(
+            self,
+            |p| p.source_id == source_id && p.rung == rung,
+            |p| p.promoted_id,
+            true,
+        )
+    }
+
+    fn sources_at(&self, promoted_id: &str, rung: &str) -> Result<Vec<String>> {
+        column(
+            self,
+            |p| p.promoted_id == promoted_id && p.rung == rung,
+            |p| p.source_id,
+            false,
+        )
+    }
+
+    fn sources_of(&self, memory_id: &str) -> Result<Vec<String>> {
+        column(self, |p| p.promoted_id == memory_id, |p| p.source_id, false)
+    }
+
+    fn derived_from(&self, memory_id: &str) -> Result<Vec<String>> {
+        column(self, |p| p.source_id == memory_id, |p| p.promoted_id, false)
+    }
+
+    /// How many of `promoted_id`'s sources are live and unsuperseded.
+    fn surviving_sources(&self, promoted_id: &str) -> Result<usize> {
+        let core = core_ref(self)?;
+        Ok(promotions(core)
+            .into_iter()
+            .filter(|p| p.promoted_id == promoted_id)
+            .filter(|p| {
+                memories::row(core, &p.source_id)
+                    .is_some_and(|row| live(&row) && !discredited(&row))
+            })
+            .count())
+    }
+
+    fn live_source_sensitivity(&self, id: &str) -> Result<Option<bool>> {
+        Ok(memories::row(core_ref(self)?, id)
+            .filter(live)
+            .map(|row| row.sensitive))
+    }
+
+    fn is_live(&self, id: &str) -> Result<bool> {
+        Ok(memories::row(core_ref(self)?, id).is_some_and(|row| live(&row)))
+    }
+
+    fn undecomposed_dialogs(&self, limit: usize) -> Result<Vec<IdContent>> {
+        Ok(undecomposed_dialog_rows(core_ref(self)?)
+            .into_iter()
+            .take(limit)
+            .map(|row| IdContent {
+                id: row.id,
+                content: row.content,
+            })
+            .collect())
+    }
+
+    fn count_undecomposed_dialogs(&self) -> Result<usize> {
+        Ok(undecomposed_dialog_rows(core_ref(self)?).len())
+    }
+
+    fn entity_fact_groups(
+        &self,
+        category: &str,
+        rung: &str,
+        min_facts: usize,
+        min_sources: usize,
+        limit: usize,
+    ) -> Result<Vec<EntityFactGroup>> {
+        let mut groups = fact_groups(core_ref(self)?, category, rung, min_facts, min_sources);
+        groups.truncate(limit);
+        Ok(groups)
+    }
+
+    fn count_entity_fact_groups(
+        &self,
+        category: &str,
+        rung: &str,
+        min_facts: usize,
+        min_sources: usize,
+    ) -> Result<usize> {
+        Ok(fact_groups(core_ref(self)?, category, rung, min_facts, min_sources).len())
+    }
+
+    fn ready_scenarios(
+        &self,
+        category: &str,
+        floor: f64,
+        rung: &str,
+        limit: usize,
+    ) -> Result<Vec<ScoredMemory>> {
+        Ok(scenarios(core_ref(self)?, category, floor, rung)
+            .into_iter()
+            .take(limit)
+            .map(|row| ScoredMemory {
+                id: row.id,
+                content: row.content,
+                vitality: row.vitality,
+            })
+            .collect())
+    }
+
+    fn count_ready_scenarios(&self, category: &str, floor: f64, rung: &str) -> Result<usize> {
+        Ok(scenarios(core_ref(self)?, category, floor, rung).len())
+    }
+
+    fn statements_by_vitality(&self, category: &str) -> Result<Vec<StatementRow>> {
+        statements(self, category, true)
+    }
+
+    fn statements_newest_first(&self, category: &str) -> Result<Vec<StatementRow>> {
+        statements(self, category, false)
+    }
+}
+
+#[cfg(test)]
+mod conformance_tests {
+    use super::EngineTables;
+    crate::db::promotions::promotion_conformance!(EngineTables::open_temporary().unwrap());
 }
