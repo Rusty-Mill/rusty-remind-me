@@ -140,14 +140,25 @@ impl<'c> Revisions<'c> {
 /// The behaviour every [`HistoryStore`] must show, run against each backend
 /// by [`history_conformance`] (ADR-0035).
 ///
-/// Revisions hang off memories, which have no port yet, so the checks that
-/// need a memory take the backend's own way to add one with content `"x"`
-/// (`add`) and to tombstone one (`delete`).
+/// Revisions hang off memories, so a backend under test implements
+/// [`MemoryStore`](crate::db::memories::MemoryStore) too, and the checks that
+/// need a memory seed it through that port.
 #[cfg(test)]
 pub(crate) mod conformance {
     use super::{HistoryStore, Tracked};
+    use crate::db::memories::{MemoryStore, NewMemory};
 
     pub(crate) const NOW: &str = "2026-09-27T12:00:00+00:00";
+
+    /// Add a live memory `id` with content `"x"`.
+    fn add<S: MemoryStore>(store: &mut S, id: &str) {
+        MemoryStore::insert(store, &NewMemory::new(id, "x", NOW)).unwrap();
+    }
+
+    /// Tombstone memory `id`.
+    fn delete<S: MemoryStore>(store: &mut S, id: &str) {
+        MemoryStore::delete_live(store, id, Some(NOW)).unwrap();
+    }
 
     fn values(content: &str) -> Tracked {
         Tracked {
@@ -162,8 +173,6 @@ pub(crate) mod conformance {
 
     pub(crate) fn revisions_list_newest_first_and_belong_to_their_memory<S: HistoryStore>(
         store: &mut S,
-        _add: impl Fn(&mut S, &str),
-        _delete: impl Fn(&mut S, &str),
     ) {
         let same_tick = "2026-09-27T00:00:01+00:00";
         store
@@ -193,11 +202,7 @@ pub(crate) mod conformance {
         );
     }
 
-    pub(crate) fn delete_for_takes_only_that_memorys_revisions<S: HistoryStore>(
-        store: &mut S,
-        _add: impl Fn(&mut S, &str),
-        _delete: impl Fn(&mut S, &str),
-    ) {
+    pub(crate) fn delete_for_takes_only_that_memorys_revisions<S: HistoryStore>(store: &mut S) {
         store.insert("m1", &values("a"), NOW, None).unwrap();
         store.insert("m2", &values("b"), NOW, None).unwrap();
         store.delete_for("m1").unwrap();
@@ -206,15 +211,11 @@ pub(crate) mod conformance {
         assert_eq!(store.list("m2", 10).unwrap().len(), 1);
     }
 
-    pub(crate) fn tombstones_lose_their_revisions<S: HistoryStore>(
-        store: &mut S,
-        add: impl Fn(&mut S, &str),
-        delete: impl Fn(&mut S, &str),
-    ) {
+    pub(crate) fn tombstones_lose_their_revisions<S: HistoryStore + MemoryStore>(store: &mut S) {
         add(store, "kept");
         add(store, "gone");
         for id in ["kept", "gone", "gone"] {
-            store.insert(id, &values("v"), NOW, None).unwrap();
+            HistoryStore::insert(store, id, &values("v"), NOW, None).unwrap();
         }
         delete(store, "gone");
         assert!(store.is_live("kept").unwrap());
@@ -230,10 +231,8 @@ pub(crate) mod conformance {
         assert_eq!(store.list("kept", 10).unwrap().len(), 1);
     }
 
-    pub(crate) fn restore_writes_the_tracked_columns_back<S: HistoryStore>(
+    pub(crate) fn restore_writes_the_tracked_columns_back<S: HistoryStore + MemoryStore>(
         store: &mut S,
-        add: impl Fn(&mut S, &str),
-        _delete: impl Fn(&mut S, &str),
     ) {
         add(store, "m");
         assert!(store.current("missing").unwrap().is_none());
@@ -262,29 +261,27 @@ pub(crate) mod conformance {
 }
 
 /// One `#[test]` per [`conformance`] check, each on a fresh store from
-/// `$make`, with `$add` and `$delete` as the checks' memory fixtures.
+/// `$make`.
 #[cfg(test)]
 macro_rules! history_conformance {
-    ($make:expr, $add:expr, $delete:expr) => {
+    ($make:expr) => {
         use $crate::db::history::conformance;
 
         #[test]
         fn revisions_list_newest_first_and_belong_to_their_memory() {
-            conformance::revisions_list_newest_first_and_belong_to_their_memory(
-                &mut $make, $add, $delete,
-            );
+            conformance::revisions_list_newest_first_and_belong_to_their_memory(&mut $make);
         }
         #[test]
         fn delete_for_takes_only_that_memorys_revisions() {
-            conformance::delete_for_takes_only_that_memorys_revisions(&mut $make, $add, $delete);
+            conformance::delete_for_takes_only_that_memorys_revisions(&mut $make);
         }
         #[test]
         fn tombstones_lose_their_revisions() {
-            conformance::tombstones_lose_their_revisions(&mut $make, $add, $delete);
+            conformance::tombstones_lose_their_revisions(&mut $make);
         }
         #[test]
         fn restore_writes_the_tracked_columns_back() {
-            conformance::restore_writes_the_tracked_columns_back(&mut $make, $add, $delete);
+            conformance::restore_writes_the_tracked_columns_back(&mut $make);
         }
     };
 }

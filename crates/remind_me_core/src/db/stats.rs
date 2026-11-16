@@ -209,13 +209,13 @@ use std::path::Path;
 /// against each backend by [`stats_conformance`] and
 /// [`snapshot_conformance`] (ADR-0035).
 ///
-/// The counts are over memories, which have no port yet, so their check
-/// takes the backend's own way to add a memory (`add`) and to tombstone one
-/// (`delete`).
+/// The counts are over memories, so a backend under [`stats_conformance`]
+/// implements [`MemoryStore`](crate::db::memories::MemoryStore) too, and the
+/// check seeds and tombstones memories through it.
 #[cfg(test)]
 pub(crate) mod conformance {
     use super::{GroupBy, SnapshotStore, StatsStore};
-    use crate::db::memories::NewMemory;
+    use crate::db::memories::{MemoryStore, NewMemory};
     use crate::models::AnalyticsSnapshot;
     use std::collections::BTreeMap;
 
@@ -223,11 +223,19 @@ pub(crate) mod conformance {
     pub(crate) const T2: &str = "2026-09-26T00:00:00+00:00";
     pub(crate) const T3: &str = "2026-09-27T00:00:00+00:00";
 
+    /// Add memory `new`.
+    fn add<S: MemoryStore>(store: &mut S, new: &NewMemory) {
+        MemoryStore::insert(store, new).unwrap();
+    }
+
+    /// Tombstone memory `id` at `at`.
+    fn delete<S: MemoryStore>(store: &mut S, id: &str, at: &str) {
+        MemoryStore::delete_live(store, id, Some(at)).unwrap();
+    }
+
     /// Memories of every kind, and every count over them.
-    pub(crate) fn counts_cover_live_memories_tombstones_and_tags<S: StatsStore>(
+    pub(crate) fn counts_cover_live_memories_tombstones_and_tags<S: StatsStore + MemoryStore>(
         store: &mut S,
-        add: impl Fn(&mut S, &NewMemory),
-        delete: impl Fn(&mut S, &str, &str),
     ) {
         for (id, category, source, tags, at, sensitive, project) in [
             (
@@ -371,15 +379,14 @@ pub(crate) mod conformance {
 }
 
 /// One `#[test]` per [`StatsStore`] check in [`conformance`], each on a
-/// fresh store from `$make`, with `$add` and `$delete` (id, tombstone time)
-/// as the checks' memory fixtures.
+/// fresh store from `$make`.
 #[cfg(test)]
 macro_rules! stats_conformance {
-    ($make:expr, $add:expr, $delete:expr) => {
+    ($make:expr) => {
         #[test]
         fn counts_cover_live_memories_tombstones_and_tags() {
             $crate::db::stats::conformance::counts_cover_live_memories_tombstones_and_tags(
-                &mut $make, $add, $delete,
+                &mut $make,
             );
         }
     };

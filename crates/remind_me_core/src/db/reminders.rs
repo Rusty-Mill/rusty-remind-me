@@ -93,15 +93,26 @@ impl<'c> Reminders<'c> {
 /// The behaviour every [`ReminderStore`] must show, run against each backend
 /// by [`reminder_conformance`] (ADR-0035).
 ///
-/// Reminders hang off memories, which have no port yet, so each check takes
-/// the backend's own way to add a live memory (`add`) and delete one
-/// (`delete`).
+/// Reminders hang off memories, so a backend under test implements
+/// [`MemoryStore`](crate::db::memories::MemoryStore) too, and the checks seed
+/// memories through it.
 #[cfg(test)]
 pub(crate) mod conformance {
     use super::ReminderStore;
+    use crate::db::memories::{MemoryStore, NewMemory};
     use crate::models::ReminderWindow;
 
     pub(crate) const NOW: &str = "2026-09-27T12:00:00+00:00";
+
+    /// Add a live memory `id` with content `"x"`.
+    fn add<S: MemoryStore>(store: &mut S, id: &str) {
+        MemoryStore::insert(store, &NewMemory::new(id, "x", NOW)).unwrap();
+    }
+
+    /// Tombstone memory `id`.
+    fn delete<S: MemoryStore>(store: &mut S, id: &str) {
+        MemoryStore::delete_live(store, id, Some(NOW)).unwrap();
+    }
 
     fn look<S: ReminderStore>(store: &S, window: ReminderWindow, limit: usize) -> Vec<String> {
         store
@@ -114,10 +125,8 @@ pub(crate) mod conformance {
 
     /// Reminders set, cleared, delivered and rescheduled, and what each
     /// window shows after every step.
-    pub(crate) fn windows_follow_delivery_and_rescheduling<S: ReminderStore>(
+    pub(crate) fn windows_follow_delivery_and_rescheduling<S: ReminderStore + MemoryStore>(
         store: &mut S,
-        add: impl Fn(&mut S, &str),
-        delete: impl Fn(&mut S, &str),
     ) {
         for id in ["past", "past2", "future", "none", "gone"] {
             add(store, id);
@@ -168,11 +177,7 @@ pub(crate) mod conformance {
         assert_eq!(look(store, ReminderWindow::All, 10).len(), 2);
     }
 
-    pub(crate) fn only_undeleted_memories_are_live<S: ReminderStore>(
-        store: &mut S,
-        add: impl Fn(&mut S, &str),
-        delete: impl Fn(&mut S, &str),
-    ) {
+    pub(crate) fn only_undeleted_memories_are_live<S: ReminderStore + MemoryStore>(store: &mut S) {
         add(store, "kept");
         add(store, "gone");
         delete(store, "gone");
@@ -185,19 +190,19 @@ pub(crate) mod conformance {
 }
 
 /// One `#[test]` per [`conformance`] check, each on a fresh store from
-/// `$make`, with `$add` and `$delete` as the checks' memory fixtures.
+/// `$make`.
 #[cfg(test)]
 macro_rules! reminder_conformance {
-    ($make:expr, $add:expr, $delete:expr) => {
+    ($make:expr) => {
         use $crate::db::reminders::conformance;
 
         #[test]
         fn windows_follow_delivery_and_rescheduling() {
-            conformance::windows_follow_delivery_and_rescheduling(&mut $make, $add, $delete);
+            conformance::windows_follow_delivery_and_rescheduling(&mut $make);
         }
         #[test]
         fn only_undeleted_memories_are_live() {
-            conformance::only_undeleted_memories_are_live(&mut $make, $add, $delete);
+            conformance::only_undeleted_memories_are_live(&mut $make);
         }
     };
 }

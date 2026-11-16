@@ -178,14 +178,20 @@ impl<'c> Feedback<'c> {
 /// The behaviour every [`FeedbackStore`] must show, run against each backend
 /// by [`feedback_conformance`] (ADR-0035).
 ///
-/// Feedback hangs off memories, which have no port yet, so each check takes
-/// the backend's own way to add a memory (`add`).
+/// Feedback hangs off memories, so a backend under test implements
+/// [`MemoryStore`](crate::db::memories::MemoryStore) too, and the checks seed
+/// memories through it.
 #[cfg(test)]
 pub(crate) mod conformance {
     use super::{FeedbackEvent, FeedbackStore, Importance, ReviewFilter};
-    use crate::db::memories::NewMemory;
+    use crate::db::memories::{MemoryStore, NewMemory};
 
     const OLD: &str = "2020-01-01T00:00:00+00:00";
+
+    /// Add memory `new`.
+    fn add<S: MemoryStore>(store: &mut S, new: &NewMemory) {
+        MemoryStore::insert(store, new).unwrap();
+    }
 
     fn filter() -> ReviewFilter<'static> {
         ReviewFilter {
@@ -214,10 +220,7 @@ pub(crate) mod conformance {
     }
 
     /// Feedback and importance writes, and the review reads after each.
-    pub(crate) fn feedback_settles_a_memory<S: FeedbackStore>(
-        store: &mut S,
-        add: impl Fn(&mut S, &NewMemory),
-    ) {
+    pub(crate) fn feedback_settles_a_memory<S: FeedbackStore + MemoryStore>(store: &mut S) {
         for (id, weight, kind) in [
             ("heavy", 2.0, "note"),
             ("heavier", 3.0, "note"),
@@ -300,9 +303,8 @@ pub(crate) mod conformance {
         );
     }
 
-    pub(crate) fn review_needs_weight_or_a_durable_type<S: FeedbackStore>(
+    pub(crate) fn review_needs_weight_or_a_durable_type<S: FeedbackStore + MemoryStore>(
         store: &mut S,
-        add: impl Fn(&mut S, &NewMemory),
     ) {
         for (id, weight, kind) in [
             ("heavy", 2.0, "note"),
@@ -336,19 +338,19 @@ pub(crate) mod conformance {
 }
 
 /// One `#[test]` per [`conformance`] check, each on a fresh store from
-/// `$make`, with `$add` as the checks' memory fixture.
+/// `$make`.
 #[cfg(test)]
 macro_rules! feedback_conformance {
-    ($make:expr, $add:expr) => {
+    ($make:expr) => {
         use $crate::db::feedback::conformance;
 
         #[test]
         fn feedback_settles_a_memory() {
-            conformance::feedback_settles_a_memory(&mut $make, $add);
+            conformance::feedback_settles_a_memory(&mut $make);
         }
         #[test]
         fn review_needs_weight_or_a_durable_type() {
-            conformance::review_needs_weight_or_a_durable_type(&mut $make, $add);
+            conformance::review_needs_weight_or_a_durable_type(&mut $make);
         }
     };
 }
