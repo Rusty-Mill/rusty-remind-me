@@ -1,14 +1,14 @@
 //! `sync_log` on the engine (ADR-0023, phase 4e): each remote's pull
-//! cursors and liveness stamps. [`crate::db::sync_state`] calls these when
-//! its store carries engine tables; `sync_flags` and `sync_sends` move with
-//! the outbox, in the memories core (`db::engine::outbox`).
+//! cursors and liveness stamps, and the engine's [`SyncStateStore`] adapter
+//! (ADR-0035). `sync_flags` and `sync_sends` live with the outbox, in the
+//! memories core (`db::engine::outbox`), and the adapter reaches them there.
 //!
 //! Every write is a read-modify-write of the remote's whole row, which is
 //! what the SQL's `INSERT … ON CONFLICT DO UPDATE` does column by column. A
 //! remote with no row starts from the schema's defaults.
 
-use super::{engine_error, engine_id, ensure_same_id, EngineTables};
-use crate::db::sync_state::{RemoteLog, SyncLogRow};
+use super::{core_ref, engine_error, engine_id, ensure_same_id, outbox, EngineTables};
+use crate::db::sync_state::{RemoteLog, SyncLogRow, SyncStateStore};
 use crate::db::Result;
 use rusty_multimodal_db_engine::generic::query::{AllIds, GetById};
 use rusty_multimodal_db_engine::generic::traits::{
@@ -161,6 +161,83 @@ pub(crate) fn remotes(tables: &EngineTables) -> Vec<RemoteLog> {
             last_pull_at: r.last_pull_at,
         })
         .collect()
+}
+
+impl SyncStateStore for EngineTables {
+    fn remote_row(&self, remote_id: &str) -> Result<Option<SyncLogRow>> {
+        Ok(row(self, remote_id))
+    }
+
+    fn put_remote_row(&mut self, sync_row: &SyncLogRow) -> Result<()> {
+        put(self, sync_row)
+    }
+
+    fn pull_cursor(&self, remote_id: &str) -> Result<Option<(String, String)>> {
+        Ok(row(self, remote_id).map(|r| (r.last_pull, r.last_pull_id)))
+    }
+
+    fn set_pull_cursor(&mut self, remote_id: &str, since: &str, since_id: &str) -> Result<()> {
+        upsert(self, remote_id, |r| {
+            r.last_pull = since.to_string();
+            r.last_pull_id = since_id.to_string();
+        })
+    }
+
+    fn seq_cursor(&self, remote_id: &str) -> Result<Option<i64>> {
+        Ok(row(self, remote_id).map(|r| r.last_pull_seq))
+    }
+
+    fn set_seq_cursor(&mut self, remote_id: &str, seq: i64) -> Result<()> {
+        upsert(self, remote_id, |r| r.last_pull_seq = seq)
+    }
+
+    fn reset_pull_cursors(&mut self, remote_id: &str, since: &str, seq: i64) -> Result<bool> {
+        update(self, remote_id, |r| {
+            r.last_pull = since.to_string();
+            r.last_pull_id = String::new();
+            r.last_pull_seq = seq;
+        })
+    }
+
+    fn stamp_push(&mut self, remote_id: &str, at: &str) -> Result<()> {
+        upsert(self, remote_id, |r| {
+            r.last_attempt_at = at.to_string();
+            r.last_push_at = at.to_string();
+        })
+    }
+
+    fn stamp_pull(&mut self, remote_id: &str, at: &str) -> Result<()> {
+        upsert(self, remote_id, |r| {
+            r.last_attempt_at = at.to_string();
+            r.last_pull_at = at.to_string();
+        })
+    }
+
+    fn last_pull_at(&self, remote_id: &str) -> Result<Option<String>> {
+        Ok(row(self, remote_id).map(|r| r.last_pull_at))
+    }
+
+    fn remotes(&self) -> Result<Vec<RemoteLog>> {
+        Ok(remotes(self))
+    }
+
+    fn flag(&self, key: &str) -> Result<Option<String>> {
+        core_ref(self).map(|core| outbox::flag(core, key))
+    }
+
+    fn set_flag(&mut self, key: &str, value: &str) -> Result<()> {
+        outbox::set_flag(self, key, value)
+    }
+
+    fn record_sends(&mut self, remote_id: &str, outbox_ids: &[i64], at: &str) -> Result<()> {
+        outbox::record_sends(self, remote_id, outbox_ids, at)
+    }
+}
+
+#[cfg(test)]
+mod conformance_tests {
+    use super::EngineTables;
+    crate::db::sync_state::sync_state_conformance!(EngineTables::open_temporary().unwrap());
 }
 
 #[cfg(test)]
