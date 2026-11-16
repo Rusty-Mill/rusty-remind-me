@@ -47,10 +47,10 @@ in-process, one port trait per table group with an engine adapter and a conforma
 - Tool input is a typed struct in models.rs with `*_MIN`/`*_MAX` bounds beside it; a wrong-typed argument is refused, not recomputed (2b438f0); `response_format` holds on every path (#224).
 - A tool named like a lookup never writes: `remind_me_entity` reads, `remind_me_entity_upsert` writes (models.rs:39-47).
 - A call forwarded by the remote connector gets no cwd, git or session context; only an explicit `project` (tests/forwarded_context_test.rs; bad1e5f).
-- `Memory.status`, `outcome`, `memory_type` are strings: parse to `kinds::MemoryKind` at the boundary, no inline literal compares (models.rs:117-171).
+- `Memory.memory_type`, `outcome` and `status` are strings: parse `memory_type` to `kinds::MemoryKind` and check `outcome` against `kinds::OUTCOMES` at the boundary; no inline literal compares (models.rs:117-171, kinds.rs:20, 86).
 - Existing string errors here (`Result<_, String>`, `EmbedError(String)`, embedder.rs:149) are debt, do not copy.
 - Model and embedding calls run under one deadline that starts before DNS (resolved on an abandoned helper thread) and covers connect, writes and reads (embedder.rs:385; fc5acf9, 83a1201). The webhook client `sync::http` has only per-I/O timeouts.
-- The API serves one connection at a time: work longer than its write timeout answers 202 from its own thread and is polled (remind_me_api lib.rs:170, 284; ffeff0d).
+- The API serves one connection at a time and runs each route synchronously under a store handle. Only the wiki auto-compile has its own thread (202, then polled); other long work needs the same explicit job handling (remind_me_api lib.rs:170, 255-307; ffeff0d).
 - Wiki compile watermarks are `(created_at, id)` pairs validated against the furthest issued; truncation and the mark cut at the same place (wiki_fs.rs:40; 45c4b6c, 72f6ebc).
 - Automatic rewrites of user content are guarded on length, headings, links and code spans, refused once with the reason, then stopped (f4d36ba).
 - A default filter that hides rows decides its exemptions up front: decisions and preferences never fall below the dormancy floor (vitality.rs:382; 4921c3c).

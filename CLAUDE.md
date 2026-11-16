@@ -24,8 +24,10 @@ copy the file's text anywhere.
 - When Nano answers, pass the answer to the expert to record.
   Don't write DECISIONS.md or remind-me yourself; one writer keeps each
   answer recorded exactly once.
-- Non-blocking? Take the expert's recommendation, keep going, and add the
-  question to the pack's OPEN_QUESTIONS.md.
+- Non-blocking default? Take the expert's default, keep going, and add the
+  question to the pack's OPEN_QUESTIONS.md. An ESCALATE is never acted on
+  before Nano answers, whatever its RECOMMEND says: leave that item pending
+  and continue unrelated work.
 
 ## Commit signing: retry once, then commit unsigned and say so
 
