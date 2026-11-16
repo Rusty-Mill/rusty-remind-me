@@ -1,14 +1,13 @@
 //! Analytics snapshots on the engine (ADR-0023, phase 4f): one row per day
-//! of vitality and category counts. [`crate::db::stats`] calls these when
-//! its store carries engine tables; every other read it makes stays on
-//! SQLite until memories move.
+//! of vitality and category counts, as the engine's adapter for the
+//! [`SnapshotStore`] port (ADR-0035).
 //!
 //! A snapshot's id is an integer, as SQLite's `INTEGER PRIMARY KEY` gives
 //! it, issued by the journal's `analytics_snapshots` sequence so an id is
 //! never issued twice, even across a crash.
 
 use super::{engine_error, EngineTables};
-use crate::db::stats::{decode_json, encode_json};
+use crate::db::stats::{decode_json, encode_json, SnapshotStore};
 use crate::db::Result;
 use crate::models::AnalyticsSnapshot;
 use rusty_multimodal_db_engine::generic::query::{AllIds, FilterEq, GetById};
@@ -80,43 +79,43 @@ impl ScannableField<Total> for SnapshotRecord {
     }
 }
 
-/// The id of a snapshot captured on `date` (`YYYY-MM-DD`, UTC), if any.
-/// When several were, the lowest id, which is the first captured.
-pub(crate) fn snapshot_on(tables: &EngineTables, date: &str) -> Option<i64> {
-    FilterEq::<SnapshotRecord, ByDay>::filter_eq(&tables.snapshots, &date.to_string())
-        .into_iter()
-        .min()
-}
+impl SnapshotStore for EngineTables {
+    /// When several were, the lowest id, which is the first captured.
+    fn snapshot_on(&self, date: &str) -> Result<Option<i64>> {
+        Ok(
+            FilterEq::<SnapshotRecord, ByDay>::filter_eq(&self.snapshots, &date.to_string())
+                .into_iter()
+                .min(),
+        )
+    }
 
-/// Store `snapshot` under the next id from the journal, and return it.
-///
-/// The counter is made durable before the record is written, so a crash
-/// between the two leaves a gap in the ids, never a reissued one.
-pub(crate) fn insert(tables: &mut EngineTables, snapshot: &AnalyticsSnapshot) -> Result<i64> {
-    let id = tables.next_id(SEQUENCE)?;
-    let record = SnapshotRecord {
-        id,
-        day: utc_day(&snapshot.captured_at),
-        captured_at: snapshot.captured_at.clone(),
-        total_memories: snapshot.total_memories,
-        vitality_buckets: encode_json(&snapshot.vitality_buckets),
-        category_counts: encode_json(&snapshot.category_counts),
-    };
-    tables.snapshots.insert(record).map_err(engine_error)?;
-    Ok(id)
-}
+    /// Under the next id from the journal. The counter is made durable
+    /// before the record is written, so a crash between the two leaves a
+    /// gap in the ids, never a reissued one.
+    fn insert_snapshot(&mut self, snapshot: &AnalyticsSnapshot) -> Result<i64> {
+        let id = self.next_id(SEQUENCE)?;
+        let record = SnapshotRecord {
+            id,
+            day: utc_day(&snapshot.captured_at),
+            captured_at: snapshot.captured_at.clone(),
+            total_memories: snapshot.total_memories,
+            vitality_buckets: encode_json(&snapshot.vitality_buckets),
+            category_counts: encode_json(&snapshot.category_counts),
+        };
+        self.snapshots.insert(record).map_err(engine_error)?;
+        Ok(id)
+    }
 
-/// Every snapshot, `captured_at` oldest first as SQLite compares the text,
-/// ties in id order.
-pub(crate) fn snapshots(tables: &EngineTables) -> Vec<AnalyticsSnapshot> {
-    let mut records: Vec<SnapshotRecord> = tables
-        .snapshots
-        .all_ids()
-        .into_iter()
-        .filter_map(|id| tables.snapshots.get(id))
-        .collect();
-    records.sort_by(|a, b| (a.captured_at.as_str(), a.id).cmp(&(b.captured_at.as_str(), b.id)));
-    records.iter().map(SnapshotRecord::to_snapshot).collect()
+    fn snapshots(&self) -> Result<Vec<AnalyticsSnapshot>> {
+        let mut records: Vec<SnapshotRecord> = self
+            .snapshots
+            .all_ids()
+            .into_iter()
+            .filter_map(|id| self.snapshots.get(id))
+            .collect();
+        records.sort_by(|a, b| (a.captured_at.as_str(), a.id).cmp(&(b.captured_at.as_str(), b.id)));
+        Ok(records.iter().map(SnapshotRecord::to_snapshot).collect())
+    }
 }
 
 /// The highest snapshot id stored, or 0: the floor for the sequence when
@@ -179,14 +178,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let first = {
             let mut tables = EngineTables::open(&dir).unwrap();
-            insert(&mut tables, &snap("2026-09-25T10:00:00+00:00", 1)).unwrap()
+            tables
+                .insert_snapshot(&snap("2026-09-25T10:00:00+00:00", 1))
+                .unwrap()
         };
         let mut tables = crate::db::engine::reopen(&dir);
-        let second = insert(&mut tables, &snap("2026-09-26T10:00:00+00:00", 2)).unwrap();
+        let second = tables
+            .insert_snapshot(&snap("2026-09-26T10:00:00+00:00", 2))
+            .unwrap();
         assert!(second > first, "{second} must follow {first}");
-        assert_eq!(snapshot_on(&tables, "2026-09-25"), Some(first));
-        assert_eq!(snapshots(&tables).len(), 2);
+        assert_eq!(tables.snapshot_on("2026-09-25").unwrap(), Some(first));
+        assert_eq!(tables.snapshots().unwrap().len(), 2);
         drop(tables);
         std::fs::remove_dir_all(&dir).unwrap();
     }
+}
+
+/// The port's shared behaviour, on fresh temporary engine tables.
+#[cfg(test)]
+mod conformance_tests {
+    use super::EngineTables;
+    crate::db::stats::snapshot_conformance!(EngineTables::open_temporary().unwrap());
 }

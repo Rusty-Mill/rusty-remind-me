@@ -2,6 +2,15 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-16 — Storage port: history, feedback and stats (ADR-0035, Millwright R2)
+
+### Changed
+- Four more storage ports, each implemented by the engine with that group's free functions folded into the `impl`: `db::history::HistoryStore` (revisions plus the tracked memory columns a revert writes back), `db::feedback::FeedbackStore` (the feedback log plus the importance columns), `db::stats::StatsStore` (store-wide counts and the store's size) and `db::stats::SnapshotStore` (the `analytics_snapshots` table). `Revisions`, `Feedback` and `StoreStats` lock per call and go through them. No behaviour, schema or caller changes.
+- Limits on the ports are `usize`. `Feedback::review_batch` and `StoreStats::recent` still take an `i64`, and a negative one still returns nothing.
+
+### Tests
+- Each group's repository tests become a conformance suite (`history_conformance!`, `feedback_conformance!`, `stats_conformance!`, `snapshot_conformance!`) run on temporary engine tables, given the backend's own fixtures for adding and tombstoning a memory. New checks: `delete_for` keeps other memories' revisions, tombstone cleanup is counted once, `restore` with a `None` project keeps the project and stores tags as given, a zero review limit returns nothing, counts by project leave no-project memories out, and a day with two snapshots finds the first. Each repository has a test covering its facade, including a negative limit.
+
 ## 2026-11-16 — Storage port: saved searches and reminders (ADR-0035, Millwright R2)
 
 ### Changed
