@@ -45,7 +45,9 @@ Programme questions (which Millwright phase, R-milestone order, gates) belong to
 - No store change before the storage port and the R3 benchmark (D2).
 - Ask first: schema or data migrations, public API changes (MCP tool names and
   signatures included), deletions, dependency or toolchain bumps (D3).
-Anything that would cross one escalates.
+Hard lines come only from `[stated]` rows (D11). Anything that would cross one
+escalates, and crossing one reverses its row: a request to skip an ask-first rule
+reverses D3. Report that row's D# in `REVERSES`.
 
 ## Decide the tier
 1. **Answer** when the pack, an ADR, remind-me or standing principles settle it.
