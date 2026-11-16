@@ -68,10 +68,16 @@ pub struct ServerStatus {
     /// fact a session otherwise has no way to observe — the reference makes the
     /// same argument for putting it on the first line of its own status output.
     pub version: String,
-    /// `None` for an in-memory database.
+    /// The live store: the engine directory (`memory.engine`). `None` for an
+    /// in-memory database.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub database_path: Option<String>,
+    /// Whether `database_path` exists.
     pub database_exists: bool,
+    /// A legacy SQLite file (`memory.db`) still sits beside the engine
+    /// directory. It is never opened again and can be archived.
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub legacy_db_present: bool,
     pub database_bytes: Option<u64>,
     /// The schema version the store's records mirror (see
     /// `db::stats::StorageInfo::schema_version`).
@@ -115,14 +121,14 @@ pub struct ServerStatus {
 pub fn server_status(store: &Store<'_>) -> Result<ServerStatus> {
     let stats = StoreStats::new(store);
     let info = stats.storage_info()?;
-    let database_path: Option<PathBuf> = info.path;
-    // The store is the engine directory beside the configured path; the
-    // path itself is the old SQLite file, which need not exist. In memory:
-    // it exists, it just has no directory.
-    let database_exists = database_path
-        .as_ref()
-        .map(|p| crate::db::engine_dir(p).is_dir())
-        .unwrap_or(true);
+    // The configured path is the old SQLite file; the live store is the
+    // engine directory beside it. Report the directory, so the path and
+    // `database_exists` describe the same thing. In memory: it exists, it
+    // just has no directory.
+    let configured: Option<PathBuf> = info.path;
+    let database_path: Option<PathBuf> = configured.as_deref().map(crate::db::engine_dir);
+    let database_exists = database_path.as_ref().map(|p| p.is_dir()).unwrap_or(true);
+    let legacy_db_present = database_exists && configured.as_ref().is_some_and(|p| p.is_file());
     let database_bytes = database_path
         .as_ref()
         .map(|_| u64::try_from(info.size_bytes).unwrap_or(0));
@@ -142,6 +148,7 @@ pub fn server_status(store: &Store<'_>) -> Result<ServerStatus> {
         version: crate::updater::INSTALLED_VERSION.to_string(),
         database_path: database_path.map(|p| p.display().to_string()),
         database_exists,
+        legacy_db_present,
         database_bytes,
         schema_version,
         expected_schema_version: SCHEMA_VERSION,
