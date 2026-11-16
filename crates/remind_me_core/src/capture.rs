@@ -439,6 +439,18 @@ pub fn decompose(store: &Store<'_>, input: &DecomposeInput) -> Result<Option<Dec
         fact_ids.push(fact_id);
     }
 
+    // After every fact is written, so the check sees the whole batch. Never
+    // fails the decomposition: the facts have already committed.
+    let mut duplicate_candidates = std::collections::BTreeMap::new();
+    let mut duplicate_check_error = None;
+    for fact_id in &fact_ids {
+        let check = crate::duplicates::check_on_save(store, fact_id);
+        if !check.duplicate_candidates.is_empty() {
+            duplicate_candidates.insert(fact_id.clone(), check.duplicate_candidates);
+        }
+        duplicate_check_error = duplicate_check_error.or(check.duplicate_check_error);
+    }
+
     Ok(Some(DecomposeResult {
         created: fact_ids.len(),
         fact_ids,
@@ -447,6 +459,8 @@ pub fn decompose(store: &Store<'_>, input: &DecomposeInput) -> Result<Option<Dec
         entities_linked,
         relations_linked,
         superseded_ids,
+        duplicate_candidates,
+        duplicate_check_error,
     }))
 }
 

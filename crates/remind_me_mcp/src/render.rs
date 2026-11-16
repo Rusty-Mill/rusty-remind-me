@@ -28,7 +28,8 @@
 
 use remind_me_core::expansion::{MemorySearchResponse, RelatedMemory};
 use remind_me_core::models::{
-    CaptureResult, Memory, RevertOutcome, SaveCheck, SavedSearch, SearchDetail, SetReminderOutcome,
+    CaptureResult, DuplicateCheck, Memory, RevertOutcome, SaveCheck, SavedSearch, SearchDetail,
+    SetReminderOutcome,
 };
 use remind_me_core::updater::UpdateStatus;
 use remind_me_core::vectors::ReindexResult;
@@ -65,6 +66,31 @@ pub fn save_check(check: &SaveCheck) -> String {
              (`remind_me_add` with `supersedes`, or `remind_me_resolve`), or keep both:",
         );
         for c in &check.contradiction_candidates {
+            out.push_str(&format!(
+                "\n- `{}` ({:?}, {:.2}): {}",
+                c.memory.id,
+                c.reason,
+                c.score,
+                preview(&c.memory.content_snippet, 120)
+            ));
+        }
+    }
+    out
+}
+
+/// The near-duplicate check's findings, to append to a write's summary;
+/// empty when it found nothing.
+pub fn duplicate_check(check: &DuplicateCheck) -> String {
+    let mut out = String::new();
+    if let Some(e) = &check.duplicate_check_error {
+        out.push_str(&format!("\n\n⚠ Duplicate check failed: {e}"));
+    }
+    if !check.duplicate_candidates.is_empty() {
+        out.push_str(
+            "\n\n⚠ May duplicate these memories. Merge or supersede one \
+             (`remind_me_add` with `supersedes`, or `remind_me_delete`), or keep both:",
+        );
+        for c in &check.duplicate_candidates {
             out.push_str(&format!(
                 "\n- `{}` ({:?}, {:.2}): {}",
                 c.memory.id,

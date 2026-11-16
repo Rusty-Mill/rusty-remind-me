@@ -255,6 +255,27 @@ pub fn semantic_search_admitted(
     fuse_texts.push(query.to_string());
     fuse_texts.extend(extra_texts.iter().cloned());
     let query_vector = fuse_query_embedding(embedder, &fuse_texts)?;
+    Ok(nearest_admitted(
+        store,
+        &query_vector,
+        limit,
+        category,
+        admit,
+    )?)
+}
+
+/// The live memories whose best chunk is nearest `query_vector` (cosine, the
+/// vectors being normalised), highest first, keeping only those `admit`
+/// accepts, at most `limit`. [`semantic_search_admitted`] without the
+/// embedding step, for a caller that already holds a stored vector. An empty
+/// vector finds nothing.
+pub fn nearest_admitted(
+    store: &Store<'_>,
+    query_vector: &[f32],
+    limit: usize,
+    category: Option<&str>,
+    admit: &dyn Fn(&Memory) -> bool,
+) -> SqlResult<Vec<(Memory, f32)>> {
     if query_vector.is_empty() {
         return Ok(Vec::new());
     }
@@ -264,15 +285,8 @@ pub fn semantic_search_admitted(
     // identical either way and nothing downstream needs to know which path
     // ran. `None` means scan everything — a search must not fail, or change
     // its answers, because an optimisation was unavailable.
-    if let Some(narrowed) = crate::ann_index::candidates(store, &query_vector, limit) {
-        let scored = scan_and_score(
-            store,
-            &query_vector,
-            limit,
-            category,
-            Some(&narrowed),
-            admit,
-        )?;
+    if let Some(narrowed) = crate::ann_index::candidates(store, query_vector, limit) {
+        let scored = scan_and_score(store, query_vector, limit, category, Some(&narrowed), admit)?;
         // A category filter can remove most of what the index proposed.
         // Returning fewer results than a full scan would have is a retrieval
         // regression nobody would notice, so fall back rather than accept a
@@ -281,7 +295,16 @@ pub fn semantic_search_admitted(
             return Ok(scored);
         }
     }
-    scan_and_score(store, &query_vector, limit, category, None, admit)
+    scan_and_score(store, query_vector, limit, category, None, admit)
+}
+
+/// The vector of `memory_id`'s first chunk, if it has been embedded.
+pub fn first_chunk_vector(store: &Store<'_>, memory_id: &str) -> SqlResult<Option<Vec<f32>>> {
+    let chunks = Vectors::new(store).chunks_for(memory_id)?;
+    Ok(chunks
+        .into_iter()
+        .next()
+        .map(|chunk| le_bytes_to_f32(&chunk.embedding)))
 }
 
 /// Score every candidate exactly and return the best `limit`.
@@ -296,7 +319,7 @@ fn scan_and_score(
     category: Option<&str>,
     narrowed: Option<&[String]>,
     admit: &dyn Fn(&Memory) -> bool,
-) -> Result<Vec<(Memory, f32)>, VectorError> {
+) -> SqlResult<Vec<(Memory, f32)>> {
     // The same filter the keyword branch of search applies, so the two ranked
     // lists retrieval fuses answer the same question.
     let category = category.filter(|c| !c.is_empty());
