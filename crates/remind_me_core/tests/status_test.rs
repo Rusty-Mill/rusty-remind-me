@@ -123,9 +123,16 @@ fn an_on_disk_database_reports_its_path_and_size() {
 
     assert_eq!(
         report.database_path.as_deref(),
-        Some(path.display().to_string().as_str())
+        Some(
+            remind_me_core::db::engine_dir(&path)
+                .display()
+                .to_string()
+                .as_str()
+        ),
+        "the live store is the engine directory, not the legacy file"
     );
     assert!(report.database_exists);
+    assert!(!report.legacy_db_present);
     assert!(report.database_bytes.unwrap() > 0);
     assert!(report.backup_dir.is_some());
 
@@ -258,4 +265,25 @@ fn the_report_names_the_build_that_produced_it() {
 
     let json = serde_json::to_value(&report).unwrap();
     assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
+}
+
+#[test]
+fn a_legacy_file_beside_the_engine_directory_is_flagged() {
+    let dir = scratch("legacy");
+    let path = dir.join("memories.db");
+    let db = Database::open(&path).unwrap();
+    let store = db.store();
+    add(&store, "a memory");
+    // Opened and copied once, then left behind: the stale SQLite file.
+    std::fs::write(&path, b"stale").unwrap();
+
+    let report = server_status(&store).unwrap();
+
+    assert!(report.database_exists);
+    assert!(report.legacy_db_present);
+    let json = serde_json::to_value(&report).unwrap();
+    assert_eq!(json["legacy_db_present"], true);
+    drop(store);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -2,6 +2,15 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-16 — `remind_me_server_status` names the live store (#357)
+
+### Changed
+- `database_path` is now the engine directory (`memory.engine`), the store actually being served, so it and `database_exists` describe the same thing. It used to name the configured legacy `memory.db`, which on a migrated host is a stale SQLite file.
+- New `legacy_db_present` (omitted when false): a legacy `memory.db` still sits beside the engine directory. It is never opened again and can be archived. The MCP status text shows it as a line under the database path.
+
+### Tests
+- The on-disk status test expects the engine directory; a new test covers a stale legacy file beside it.
+
 ## 2026-11-16 — Storage port: the memories core, part 1 (ADR-0035, Millwright R2)
 
 ### Changed
