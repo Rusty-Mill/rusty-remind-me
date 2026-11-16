@@ -1,0 +1,20 @@
+# Decisions — rusty-remind-me
+Architecture decisions live in `docs/adr/` (ADR-0001 to ADR-0035). Keep that numbering;
+a new architecture decision is a new ADR. ADRs are agent-written: treat them as
+`[default]` unless a row below quotes Nano for them.
+
+This table holds what has no ADR: Nano's statements found in the record, and the
+defaults `rusty-remind-me-expert` makes. Append-only, newest last. Never edit a row;
+add one that says `confirms D<n>` or `supersedes D<n>`.
+
+| # | Decision | Why | Rejected | Tag | Source |
+|---|---|---|---|---|---|
+| D1 | remind-me is one persistent memory for every model, agent and bot, so all of them work from the same knowledge base | The project's purpose | Per-client memories | [stated] | claude.ai project "Remindme MCP" topic, set by Nano: "Build a persistent memory that supports all models, agents, and bots. To allow everyone to operate from the same knowledge base" |
+| D2 | Storage takes the refactor-first path: cut three store-neutral seams now, build the artifact module on whichever store wins the R3 benchmark, fold in only DBS's knowledge rung. No store change before the port and the benchmark | The seams are needed on every path; the engine holds every record in RAM (4 GB host) | "11-06: harden multimodal_db first"; "Keep DBS separate" | [stated] | Nano tapped "Refactor first, store at benchmark" ("Cut 3 small store-neutral seams now, build the artifact module on whichever store wins the R3 benchmark, fold in DBS's knowledge rung only."), decision card `cmsg_012spbR8vYb6jWVUuV6ALzxu3Ew8dUJbJ6zoWfo4m95dQB`, 2026-11-15T19:42:26Z; rusty_mill `docs/projects/millwright/DECISIONS.md` `remind-me-order`; `mem_36a549586dfa42a5acd5ff61901db94a` |
+| D3 | Ask Nano before schema or data migrations, public API changes, deletions, and dependency or toolchain bumps | Hard to reverse | Deciding in the PR | [stated] | Nano's standing preferences: "ask before large/hard-to-reverse changes (schema/data migrations, public API changes, deletions, dependency/toolchain bumps)" |
+| D4 | The v33 revisions migration (card #702) was approved; it is one-way, so a deploy takes a store backup first | Revision rows are bincode-positional; no non-migration path | Approving #60 first | [stated] | Nano replied "702" when asked to choose between the #702 migration and the #60 design, 2026-11-04 02:11Z; `mem_86f25aa670fa4ec593c7a2fe54d88ee7`; PR #367 |
+| D5 | Verbatim dialogs are an append-only, non-decaying source of truth, never consolidated, merged, rewritten or pruned; facts, summaries, entities and the wiki are rebuildable projections of them | Derived data can be rebuilt, better by later models | Treating dialogs like other memories | [default] | `mem_10d2a2626df547cda1a5987404412709`, `mem_fbf2ee7cf42c439682b5c342a5d52c7d` (model paraphrases of Nano, 2026-10-29; no quote found, Q2) |
+| D6 | "Pure Rust" and "no third-party database" are preferences, not constraints; a C-backed store such as SQLite is acceptable if it wins the benchmark | Nano would trade them for not maintaining storage code | redb + tantivy on a firm pure-Rust assumption | [default] | rusty_mill `docs/projects/millwright/DECISIONS.md` `pure-rust`, `third-party-db`; `mem_24c63c828a7f41dda641501a4f587197` (paraphrase, Q3) |
+| D7 | Redaction keeps redacting card-shaped digit runs that pass Luhn; no exemption from surrounding words | A leaked card can't be recalled; over-redacting number lists costs little | Context-word exemption | [default] | `mem_d858c3439deb46f3b5a9c2b9935c811f` (card #717, issue #353; paraphrase, Q4) |
+| D8 | Wiki compiles with the local model run on demand from the dashboard, not in the background | Holds BaileyAi's single model slot | Background compile | [default] | `mem_aa33bea021634b248206b1c66601ce46` (2026-11-06 summary; paraphrase, Q5) |
+| D9 | Pack layout: `docs/handoff/` is the pack root, `docs/adr/` stays the architecture log, this table takes non-ADR decisions, `DOMAIN.md` is the per-session digest | Keep one log per kind; don't copy ADRs | Restating ADRs as D-rows | [default] | this harvest |
