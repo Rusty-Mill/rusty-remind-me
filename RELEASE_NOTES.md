@@ -2,6 +2,16 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-16 — Storage port: the memories core, part 1 (ADR-0035, Millwright R2)
+
+### Changed
+- `db::memories::MemoryStore` is the port for the `memories` table: all 36 reads and writes `Memories` makes, implemented by the engine. The engine's memory functions stay free, because the other adapters over the memories core call them too, and the impl delegates to them. `Memories` locks per call and goes through the port. No behaviour, schema or caller changes.
+- `Memories::linked_ids` reads the entity link table, so it stays a direct engine read until the entities group has its port. `live_category` is derived from `get_live`.
+- `keyword_hits` with no phrases returns nothing at the port as well as in the facade.
+
+### Tests
+- No test changes in this part: the existing `Memories` tests exercise the port through the facade. Part 2 turns them into a conformance suite.
+
 ## 2026-11-16 — Storage port: history, feedback and stats (ADR-0035, Millwright R2)
 
 ### Changed
