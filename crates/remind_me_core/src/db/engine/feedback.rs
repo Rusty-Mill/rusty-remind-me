@@ -1,11 +1,11 @@
 //! Feedback on the engine core (ADR-0023, core PR 2c): the
-//! `memory_feedback` event log and the review reads over memories.
-//! [`crate::db::feedback`] calls these when its store carries the core.
+//! `memory_feedback` event log and the review reads over memories, as the
+//! engine's adapter for the [`FeedbackStore`] port (ADR-0035).
 
 use super::core::{Change, CoreTables};
 use super::memories::{self, MemoryRow};
 use super::{core_ref, engine_error, engine_id, EngineTables};
-use crate::db::feedback::{FeedbackEvent, ReviewFilter};
+use crate::db::feedback::{FeedbackEvent, FeedbackStore, Importance, ReviewFilter};
 use crate::db::Result;
 use crate::models::RecalibrateCandidate;
 use rusty_multimodal_db_engine::generic::query::{FilterEq, GetById};
@@ -76,61 +76,6 @@ fn events_of(core: &CoreTables, memory_id: &str) -> Vec<FeedbackRecord> {
     events
 }
 
-/// Log an event under `id`. As the table's `PRIMARY KEY` and `CHECK` do, a
-/// taken id and a signal other than `helpful` or `unhelpful` are refused.
-pub(crate) fn log_event(
-    tables: &mut EngineTables,
-    id: &str,
-    memory_id: &str,
-    query: &str,
-    event: &FeedbackEvent,
-    created_at: &str,
-) -> Result<()> {
-    if !matches!(event.signal.as_str(), "helpful" | "unhelpful") {
-        return Err(engine_error(format!(
-            "feedback signal {:?} is neither helpful nor unhelpful",
-            event.signal
-        )));
-    }
-    let engine_id = engine_id(id);
-    if core_ref(tables)?.feedback.get(engine_id).is_some() {
-        return Err(engine_error(format!("feedback {id:?} already exists")));
-    }
-    let record = FeedbackRecord {
-        engine_id,
-        id: id.to_string(),
-        memory_id: memory_id.to_string(),
-        query: query.to_string(),
-        query_tokens: event.query_tokens.clone(),
-        signal: event.signal.clone(),
-        magnitude: event.magnitude,
-        created_at: created_at.to_string(),
-        slot: 0,
-    };
-    tables.commit(vec![Change::Feedback(engine_id, Some(record))])
-}
-
-/// Every event logged for `memory_id`, oldest first, ties by id.
-pub(crate) fn events(tables: &EngineTables, memory_id: &str) -> Result<Vec<FeedbackEvent>> {
-    Ok(events_of(core_ref(tables)?, memory_id)
-        .into_iter()
-        .map(|e| FeedbackEvent {
-            query_tokens: e.query_tokens,
-            signal: e.signal,
-            magnitude: e.magnitude,
-        })
-        .collect())
-}
-
-/// Remove every event logged for `memory_id`, in one batch.
-pub(crate) fn delete_for(tables: &mut EngineTables, memory_id: &str) -> Result<()> {
-    let changes = events_of(core_ref(tables)?, memory_id)
-        .into_iter()
-        .map(|e| Change::Feedback(e.engine_id, None))
-        .collect();
-    tables.commit(changes)
-}
-
 /// Days from `timestamp` to `now`, as `julianday('now') - julianday(ts)`
 /// computes them, or `None` where SQLite's `julianday` would be `NULL`.
 fn days_since(timestamp: &str, now: chrono::DateTime<chrono::Utc>) -> Option<f64> {
@@ -170,39 +115,109 @@ fn due(core: &CoreTables, filter: &ReviewFilter<'_>) -> Vec<MemoryRow> {
         .collect()
 }
 
-pub(crate) fn review_count(tables: &EngineTables, filter: &ReviewFilter<'_>) -> Result<i64> {
-    Ok(i64::try_from(due(core_ref(tables)?, filter).len()).unwrap_or(i64::MAX))
-}
+impl FeedbackStore for EngineTables {
+    fn importance(&self, memory_id: &str) -> Result<Option<Importance>> {
+        memories::importance(self, memory_id)
+    }
 
-/// What `Feedback::review_batch` selects: heaviest first, then longest
-/// unread (a never-read memory first, as SQLite sorts `NULL`), ties by id.
-pub(crate) fn review_batch(
-    tables: &EngineTables,
-    filter: &ReviewFilter<'_>,
-    snippet_chars: usize,
-    limit: usize,
-) -> Result<Vec<RecalibrateCandidate>> {
-    let mut rows = due(core_ref(tables)?, filter);
-    rows.sort_by(|a, b| {
-        b.base_weight
-            .total_cmp(&a.base_weight)
-            .then_with(|| a.accessed_at.cmp(&b.accessed_at))
-            .then_with(|| a.id.cmp(&b.id))
-    });
-    Ok(rows
-        .into_iter()
-        .take(limit)
-        .map(|row| RecalibrateCandidate {
-            content_snippet: row.content.chars().take(snippet_chars).collect(),
-            memory_type: Some(row.memory_type),
-            id: row.id,
-            category: row.category,
-            base_weight: row.base_weight,
-            access_count: row.access_count,
-            accessed_at: row.accessed_at,
-            created_at: row.created_at,
-        })
-        .collect())
+    fn set_importance(
+        &mut self,
+        memory_id: &str,
+        base_weight: f64,
+        vitality: f64,
+        status: &str,
+    ) -> Result<()> {
+        memories::set_importance(self, memory_id, base_weight, vitality, status)
+    }
+
+    /// As the table's `PRIMARY KEY` and `CHECK` do, a taken id and a signal
+    /// other than `helpful` or `unhelpful` are refused.
+    fn log_event(
+        &mut self,
+        id: &str,
+        memory_id: &str,
+        query: &str,
+        event: &FeedbackEvent,
+        created_at: &str,
+    ) -> Result<()> {
+        if !matches!(event.signal.as_str(), "helpful" | "unhelpful") {
+            return Err(engine_error(format!(
+                "feedback signal {:?} is neither helpful nor unhelpful",
+                event.signal
+            )));
+        }
+        let engine_id = engine_id(id);
+        if core_ref(self)?.feedback.get(engine_id).is_some() {
+            return Err(engine_error(format!("feedback {id:?} already exists")));
+        }
+        let record = FeedbackRecord {
+            engine_id,
+            id: id.to_string(),
+            memory_id: memory_id.to_string(),
+            query: query.to_string(),
+            query_tokens: event.query_tokens.clone(),
+            signal: event.signal.clone(),
+            magnitude: event.magnitude,
+            created_at: created_at.to_string(),
+            slot: 0,
+        };
+        self.commit(vec![Change::Feedback(engine_id, Some(record))])
+    }
+
+    fn events(&self, memory_id: &str) -> Result<Vec<FeedbackEvent>> {
+        Ok(events_of(core_ref(self)?, memory_id)
+            .into_iter()
+            .map(|e| FeedbackEvent {
+                query_tokens: e.query_tokens,
+                signal: e.signal,
+                magnitude: e.magnitude,
+            })
+            .collect())
+    }
+
+    /// In one batch.
+    fn delete_for(&mut self, memory_id: &str) -> Result<()> {
+        let changes = events_of(core_ref(self)?, memory_id)
+            .into_iter()
+            .map(|e| Change::Feedback(e.engine_id, None))
+            .collect();
+        self.commit(changes)
+    }
+
+    fn review_count(&self, filter: &ReviewFilter<'_>) -> Result<i64> {
+        Ok(i64::try_from(due(core_ref(self)?, filter).len()).unwrap_or(i64::MAX))
+    }
+
+    /// A never-read memory sorts first among equal weights, as SQLite sorts
+    /// `NULL`.
+    fn review_batch(
+        &self,
+        filter: &ReviewFilter<'_>,
+        snippet_chars: usize,
+        limit: usize,
+    ) -> Result<Vec<RecalibrateCandidate>> {
+        let mut rows = due(core_ref(self)?, filter);
+        rows.sort_by(|a, b| {
+            b.base_weight
+                .total_cmp(&a.base_weight)
+                .then_with(|| a.accessed_at.cmp(&b.accessed_at))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(rows
+            .into_iter()
+            .take(limit)
+            .map(|row| RecalibrateCandidate {
+                content_snippet: row.content.chars().take(snippet_chars).collect(),
+                memory_type: Some(row.memory_type),
+                id: row.id,
+                category: row.category,
+                base_weight: row.base_weight,
+                access_count: row.access_count,
+                accessed_at: row.accessed_at,
+                created_at: row.created_at,
+            })
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -220,4 +235,16 @@ mod tests {
         assert_eq!(days_since("2026-09-27", now), Some(0.5));
         assert_eq!(days_since("never", now), None);
     }
+}
+
+/// The port's shared behaviour, on fresh temporary engine tables.
+#[cfg(test)]
+mod conformance_tests {
+    use super::{memories, EngineTables};
+    use crate::db::memories::NewMemory;
+
+    crate::db::feedback::feedback_conformance!(
+        EngineTables::open_temporary().unwrap(),
+        |tables: &mut EngineTables, new: &NewMemory| memories::insert(tables, new).unwrap()
+    );
 }

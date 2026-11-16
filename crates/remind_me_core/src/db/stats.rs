@@ -1,13 +1,15 @@
 //! Storage for store-wide statistics: counts over live memories, the
 //! store's own size and location, and the daily `analytics_snapshots`.
 //!
-//! Every read behind `stats.rs`, `status.rs` and `analytics.rs` goes
-//! through here (ADR-0022), onto the engine (`db::engine::stats`,
-//! `db::engine::analytics`, `db::engine::imports`). Those modules keep the
-//! shapes they report and the rules (one snapshot per calendar day,
-//! oldest-first trends, how sizes round).
+//! [`StatsStore`] (counts and size) and [`SnapshotStore`] (the snapshot
+//! table) are the ports (ADR-0035); the engine's adapters are in
+//! `db::engine::stats` and `db::engine::analytics`. [`StoreStats`] is what
+//! callers take: it locks the store's tables for each call and goes through
+//! the ports. `stats.rs`, `status.rs` and `analytics.rs` keep the shapes
+//! they report and the rules (one snapshot per calendar day, oldest-first
+//! trends, how sizes round).
 
-use super::engine::{self, EngineLock};
+use super::engine::EngineLock;
 use super::{Result, Store};
 use crate::models::{AnalyticsSnapshot, DigestRecentMemory};
 use crate::stats::RecentMemory;
@@ -51,7 +53,67 @@ pub(crate) fn decode_json<T: serde::de::DeserializeOwned + Default>(json: &str) 
     serde_json::from_str(json).unwrap_or_default()
 }
 
-/// The statistics queries, on the engine.
+/// Store-wide counts over memories, and the store's size, as a backend
+/// computes them (ADR-0035). [`conformance`] holds the behaviour every
+/// implementation must show.
+pub trait StatsStore {
+    /// How many memories are not deleted.
+    fn live_memories(&self) -> Result<i64>;
+
+    /// How many chat imports are recorded.
+    fn imports(&self) -> Result<i64>;
+
+    /// Live memories counted by `group`.
+    fn count_by(&self, group: GroupBy) -> Result<BTreeMap<String, i64>>;
+
+    /// Live memories counted by tag. A tag no live memory carries is left
+    /// out.
+    fn count_by_tag(&self) -> Result<BTreeMap<String, i64>>;
+
+    /// How many memories are stored, tombstones included, and how many of
+    /// them are tombstones.
+    fn memory_totals(&self) -> Result<(i64, i64)>;
+
+    /// How many tombstones still hold their text: any not yet emptied as
+    /// ADR-0024 says.
+    fn tombstones_holding_text(&self) -> Result<i64>;
+
+    /// Every stored memory, tombstones included, counted by category, with
+    /// an empty category counted as `(none)`.
+    fn all_by_category(&self) -> Result<BTreeMap<String, i64>>;
+
+    /// Live, non-sensitive memories created at or after `cutoff` (compared
+    /// as text), newest first (ties by id, descending), at most `limit`.
+    fn shareable_since(&self, cutoff: &str, limit: usize) -> Result<Vec<DigestRecentMemory>>;
+
+    /// How many live, non-sensitive memories were created at or after
+    /// `cutoff`.
+    fn count_shareable_since(&self, cutoff: &str) -> Result<i64>;
+
+    /// The `limit` newest live memories (ties by id, descending), content
+    /// cut to 80 characters.
+    fn recent(&self, limit: usize) -> Result<Vec<RecentMemory>>;
+
+    /// The bytes the store takes on disk, which an in-memory store has too.
+    fn size_on_disk(&self) -> Result<u64>;
+}
+
+/// The daily `analytics_snapshots`, as a backend stores them (ADR-0035).
+pub trait SnapshotStore {
+    /// The id of a snapshot captured on `date` (`YYYY-MM-DD`, UTC), if any:
+    /// the first captured, when there are several.
+    fn snapshot_on(&self, date: &str) -> Result<Option<i64>>;
+
+    /// Store a snapshot under a new id, never one issued before, and
+    /// return it.
+    fn insert_snapshot(&mut self, snapshot: &AnalyticsSnapshot) -> Result<i64>;
+
+    /// Every snapshot, `captured_at` oldest first (compared as text), ties
+    /// in id order. A malformed map reads as empty.
+    fn snapshots(&self) -> Result<Vec<AnalyticsSnapshot>>;
+}
+
+/// The statistics of a [`Store`], one locked call at a time.
 pub struct StoreStats<'c> {
     engine: &'c EngineLock,
     path: Option<PathBuf>,
@@ -65,65 +127,59 @@ impl<'c> StoreStats<'c> {
         }
     }
 
-    /// How many memories are not deleted.
+    /// See [`StatsStore::live_memories`].
     pub fn live_memories(&self) -> Result<i64> {
-        engine::stats::live_memories(&self.engine.lock())
+        StatsStore::live_memories(&*self.engine.lock())
     }
 
-    /// How many chat imports are recorded.
+    /// See [`StatsStore::imports`].
     pub fn imports(&self) -> Result<i64> {
-        engine::imports::chat_import_count(&self.engine.lock())
+        StatsStore::imports(&*self.engine.lock())
     }
 
-    /// Live memories counted by `group`.
+    /// See [`StatsStore::count_by`].
     pub fn count_by(&self, group: GroupBy) -> Result<BTreeMap<String, i64>> {
-        engine::stats::count_by(&self.engine.lock(), group)
+        StatsStore::count_by(&*self.engine.lock(), group)
     }
 
-    /// Live memories counted by tag, through the tag index every write
-    /// keeps in step with each row's JSON `tags`.
+    /// See [`StatsStore::count_by_tag`].
     pub fn count_by_tag(&self) -> Result<BTreeMap<String, i64>> {
-        engine::stats::count_by_tag(&self.engine.lock())
+        StatsStore::count_by_tag(&*self.engine.lock())
     }
 
-    /// How many memories are stored, tombstones included, and how many of
-    /// them are tombstones.
+    /// See [`StatsStore::memory_totals`].
     pub fn memory_totals(&self) -> Result<(i64, i64)> {
-        engine::stats::memory_totals(&self.engine.lock())
+        StatsStore::memory_totals(&*self.engine.lock())
     }
 
-    /// How many tombstones still hold their text: any not yet emptied as
-    /// ADR-0024 says.
+    /// See [`StatsStore::tombstones_holding_text`].
     pub fn tombstones_holding_text(&self) -> Result<i64> {
-        engine::stats::tombstones_holding_text(&self.engine.lock())
+        StatsStore::tombstones_holding_text(&*self.engine.lock())
     }
 
-    /// Every stored memory, tombstones included, counted by category, with
-    /// an empty category counted as `(none)`.
+    /// See [`StatsStore::all_by_category`].
     pub fn all_by_category(&self) -> Result<BTreeMap<String, i64>> {
-        engine::stats::all_by_category(&self.engine.lock())
+        StatsStore::all_by_category(&*self.engine.lock())
     }
 
-    /// Live, non-sensitive memories created at or after `cutoff`, newest
-    /// first (ties by id, descending), at most `limit`.
+    /// See [`StatsStore::shareable_since`].
     pub fn shareable_since(&self, cutoff: &str, limit: usize) -> Result<Vec<DigestRecentMemory>> {
-        engine::stats::shareable_since(&self.engine.lock(), cutoff, limit)
+        StatsStore::shareable_since(&*self.engine.lock(), cutoff, limit)
     }
 
-    /// How many live, non-sensitive memories were created at or after
-    /// `cutoff`.
+    /// See [`StatsStore::count_shareable_since`].
     pub fn count_shareable_since(&self, cutoff: &str) -> Result<i64> {
-        engine::stats::count_shareable_since(&self.engine.lock(), cutoff)
+        StatsStore::count_shareable_since(&*self.engine.lock(), cutoff)
     }
 
-    /// The `limit` newest live memories, content cut to 80 characters.
+    /// See [`StatsStore::recent`]. A negative `limit` returns nothing.
     pub fn recent(&self, limit: i64) -> Result<Vec<RecentMemory>> {
-        engine::stats::recent(&self.engine.lock(), usize::try_from(limit).unwrap_or(0))
+        StatsStore::recent(&*self.engine.lock(), usize::try_from(limit).unwrap_or(0))
     }
 
     /// The store's file, size and schema version.
     pub fn storage_info(&self) -> Result<StorageInfo> {
-        let size_bytes = self.engine.lock().size_on_disk()?;
+        let size_bytes = StatsStore::size_on_disk(&*self.engine.lock())?;
         Ok(StorageInfo {
             path: self.path.clone(),
             size_bytes: i64::try_from(size_bytes).unwrap_or(i64::MAX),
@@ -131,64 +187,80 @@ impl<'c> StoreStats<'c> {
         })
     }
 
-    /// The id of the snapshot captured on `date` (`YYYY-MM-DD`), if any.
+    /// See [`SnapshotStore::snapshot_on`].
     pub fn snapshot_on(&self, date: &str) -> Result<Option<i64>> {
-        Ok(engine::analytics::snapshot_on(&self.engine.lock(), date))
+        SnapshotStore::snapshot_on(&*self.engine.lock(), date)
     }
 
-    /// Store a snapshot and return its id.
+    /// See [`SnapshotStore::insert_snapshot`].
     pub fn insert_snapshot(&self, snapshot: &AnalyticsSnapshot) -> Result<i64> {
-        engine::analytics::insert(&mut self.engine.lock(), snapshot)
+        SnapshotStore::insert_snapshot(&mut *self.engine.lock(), snapshot)
     }
 
-    /// Every snapshot, oldest first. A malformed JSON column reads as an
-    /// empty map, so one bad row does not take the whole series down.
+    /// See [`SnapshotStore::snapshots`].
     pub fn snapshots(&self) -> Result<Vec<AnalyticsSnapshot>> {
-        Ok(engine::analytics::snapshots(&self.engine.lock()))
+        SnapshotStore::snapshots(&*self.engine.lock())
     }
 }
 
 use std::path::Path;
 
+/// The behaviour every [`StatsStore`] and [`SnapshotStore`] must show, run
+/// against each backend by [`stats_conformance`] and
+/// [`snapshot_conformance`] (ADR-0035).
+///
+/// The counts are over memories, which have no port yet, so their check
+/// takes the backend's own way to add a memory (`add`) and to tombstone one
+/// (`delete`).
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::db::Database;
+pub(crate) mod conformance {
+    use super::{GroupBy, SnapshotStore, StatsStore};
+    use crate::db::memories::NewMemory;
+    use crate::models::AnalyticsSnapshot;
+    use std::collections::BTreeMap;
+
+    pub(crate) const T1: &str = "2026-09-25T00:00:00+00:00";
+    pub(crate) const T2: &str = "2026-09-26T00:00:00+00:00";
+    pub(crate) const T3: &str = "2026-09-27T00:00:00+00:00";
 
     /// Memories of every kind, and every count over them.
-    #[test]
-    fn counts_cover_live_memories_tombstones_and_tags() {
-        use crate::db::memories::{Memories, NewMemory};
-        const T1: &str = "2026-09-25T00:00:00+00:00";
-        const T2: &str = "2026-09-26T00:00:00+00:00";
-        const T3: &str = "2026-09-27T00:00:00+00:00";
-        let db = Database::open_in_memory().unwrap();
-        let store = db.store();
-        let memories = Memories::new(&store);
-        for (id, category, source, tags, at, sensitive) in [
-            ("a", "fact", "manual", vec!["red", "blue"], T1, false),
-            ("b", "fact", "import", vec!["red"], T2, false),
-            ("c", "", "manual", vec![], T2, true),
-            ("d", "note", "manual", vec!["red"], T3, false),
-            ("e", "note", "import", vec!["blue"], T3, false),
-            ("f", "note", "manual", vec!["red"], T1, false),
+    pub(crate) fn counts_cover_live_memories_tombstones_and_tags<S: StatsStore>(
+        store: &mut S,
+        add: impl Fn(&mut S, &NewMemory),
+        delete: impl Fn(&mut S, &str, &str),
+    ) {
+        for (id, category, source, tags, at, sensitive, project) in [
+            (
+                "a",
+                "fact",
+                "manual",
+                vec!["red", "blue"],
+                T1,
+                false,
+                Some("p"),
+            ),
+            ("b", "fact", "import", vec!["red"], T2, false, None),
+            ("c", "", "manual", vec![], T2, true, Some("p")),
+            ("d", "note", "manual", vec!["red"], T3, false, Some("q")),
+            ("e", "note", "import", vec!["blue"], T3, false, Some("q")),
+            ("f", "note", "manual", vec!["red"], T1, false, None),
         ] {
-            memories
-                .insert(&NewMemory {
-                    category: category.into(),
-                    source: source.into(),
-                    tags: tags.into_iter().map(String::from).collect(),
-                    sensitive,
-                    ..NewMemory::new(id, format!("{id} {}", "é".repeat(100)), at)
-                })
-                .unwrap();
+            let new = NewMemory {
+                category: category.into(),
+                source: source.into(),
+                tags: tags.into_iter().map(String::from).collect(),
+                sensitive,
+                project: project.map(String::from),
+                ..NewMemory::new(id, format!("{id} {}", "é".repeat(100)), at)
+            };
+            add(store, &new);
         }
-        memories.delete_live("f", Some(T2)).unwrap();
-        memories.delete_live("e", Some(T3)).unwrap();
-        let stats = StoreStats::new(&store);
-        assert_eq!(stats.live_memories().unwrap(), 4);
+        delete(store, "f", T2);
+        delete(store, "e", T3);
+        assert_eq!(store.live_memories().unwrap(), 4);
+        assert_eq!(store.imports().unwrap(), 0);
         assert_eq!(
-            stats.count_by(GroupBy::Category).unwrap(),
+            store.count_by(GroupBy::Category).unwrap(),
             BTreeMap::from([
                 ("".to_string(), 1),
                 ("fact".to_string(), 2),
@@ -196,24 +268,29 @@ mod tests {
             ])
         );
         assert_eq!(
-            stats.count_by(GroupBy::Source).unwrap(),
+            store.count_by(GroupBy::Source).unwrap(),
             BTreeMap::from([("import".to_string(), 1), ("manual".to_string(), 3)])
         );
         assert_eq!(
-            stats.count_by_tag().unwrap(),
+            store.count_by(GroupBy::Project).unwrap(),
+            BTreeMap::from([("p".to_string(), 2), ("q".to_string(), 1)]),
+            "no project is left out"
+        );
+        assert_eq!(
+            store.count_by_tag().unwrap(),
             BTreeMap::from([("blue".to_string(), 1), ("red".to_string(), 3)])
         );
-        assert_eq!(stats.memory_totals().unwrap(), (6, 2));
-        assert_eq!(stats.tombstones_holding_text().unwrap(), 0);
+        assert_eq!(store.memory_totals().unwrap(), (6, 2));
+        assert_eq!(store.tombstones_holding_text().unwrap(), 0);
         assert_eq!(
-            stats.all_by_category().unwrap(),
+            store.all_by_category().unwrap(),
             BTreeMap::from([
                 ("(none)".to_string(), 1),
                 ("fact".to_string(), 2),
                 ("note".to_string(), 3)
             ])
         );
-        let shareable: Vec<String> = stats
+        let shareable: Vec<String> = store
             .shareable_since(T2, 10)
             .unwrap()
             .into_iter()
@@ -224,9 +301,9 @@ mod tests {
             ["d", "b"],
             "newest first, no sensitive, no tombstones"
         );
-        assert_eq!(stats.shareable_since(T1, 1).unwrap().len(), 1);
-        assert_eq!(stats.count_shareable_since(T2).unwrap(), 2);
-        let recent: Vec<(String, usize)> = stats
+        assert_eq!(store.shareable_since(T1, 1).unwrap().len(), 1);
+        assert_eq!(store.count_shareable_since(T2).unwrap(), 2);
+        let recent: Vec<(String, usize)> = store
             .recent(3)
             .unwrap()
             .into_iter()
@@ -241,16 +318,7 @@ mod tests {
             ],
             "previews are cut by character"
         );
-    }
-
-    #[test]
-    fn an_in_memory_database_has_no_path_but_a_size() {
-        let db = Database::open_in_memory().unwrap();
-        let store = db.store();
-        let info = StoreStats::new(&store).storage_info().unwrap();
-        assert_eq!(info.path, None);
-        assert!(info.size_bytes > 0);
-        assert_eq!(info.schema_version, crate::db::SCHEMA_VERSION);
+        assert!(store.size_on_disk().unwrap() > 0);
     }
 
     fn snap(at: &str, total: i64) -> AnalyticsSnapshot {
@@ -262,22 +330,18 @@ mod tests {
         }
     }
 
-    #[test]
-    fn snapshots_round_trip_oldest_first() {
-        let db = Database::open_in_memory().unwrap();
-        let store = db.store();
-        let stats = StoreStats::new(&store);
-        let second = stats
+    pub(crate) fn snapshots_round_trip_oldest_first(store: &mut dyn SnapshotStore) {
+        let second = store
             .insert_snapshot(&snap("2026-09-25T10:00:00+00:00", 2))
             .unwrap();
-        let first = stats
+        let first = store
             .insert_snapshot(&snap("2026-09-24T10:00:00+00:00", 1))
             .unwrap();
         assert_ne!(first, second, "every snapshot gets its own id");
-        assert_eq!(stats.snapshot_on("2026-09-25").unwrap(), Some(second));
-        assert_eq!(stats.snapshot_on("2026-09-23").unwrap(), None);
+        assert_eq!(store.snapshot_on("2026-09-25").unwrap(), Some(second));
+        assert_eq!(store.snapshot_on("2026-09-23").unwrap(), None);
         assert_eq!(
-            stats.snapshots().unwrap(),
+            store.snapshots().unwrap(),
             vec![
                 snap("2026-09-24T10:00:00+00:00", 1),
                 snap("2026-09-25T10:00:00+00:00", 2)
@@ -287,16 +351,105 @@ mod tests {
 
     /// A snapshot's day is its UTC day, so a capture early in the day east
     /// of UTC belongs to the day before.
-    #[test]
-    fn a_snapshot_belongs_to_its_utc_day() {
-        let db = Database::open_in_memory().unwrap();
-        let store = db.store();
-        let stats = StoreStats::new(&store);
-        let id = stats
+    pub(crate) fn a_snapshot_belongs_to_its_utc_day(store: &mut dyn SnapshotStore) {
+        let id = store
             .insert_snapshot(&snap("2026-09-27T01:00:00+05:00", 3))
             .unwrap();
-        assert_eq!(stats.snapshot_on("2026-09-26").unwrap(), Some(id));
-        assert_eq!(stats.snapshot_on("2026-09-27").unwrap(), None);
+        assert_eq!(store.snapshot_on("2026-09-26").unwrap(), Some(id));
+        assert_eq!(store.snapshot_on("2026-09-27").unwrap(), None);
+    }
+
+    pub(crate) fn the_first_snapshot_of_a_day_is_found(store: &mut dyn SnapshotStore) {
+        let first = store
+            .insert_snapshot(&snap("2026-09-25T10:00:00+00:00", 1))
+            .unwrap();
+        store
+            .insert_snapshot(&snap("2026-09-25T11:00:00+00:00", 2))
+            .unwrap();
+        assert_eq!(store.snapshot_on("2026-09-25").unwrap(), Some(first));
+    }
+}
+
+/// One `#[test]` per [`StatsStore`] check in [`conformance`], each on a
+/// fresh store from `$make`, with `$add` and `$delete` (id, tombstone time)
+/// as the checks' memory fixtures.
+#[cfg(test)]
+macro_rules! stats_conformance {
+    ($make:expr, $add:expr, $delete:expr) => {
+        #[test]
+        fn counts_cover_live_memories_tombstones_and_tags() {
+            $crate::db::stats::conformance::counts_cover_live_memories_tombstones_and_tags(
+                &mut $make, $add, $delete,
+            );
+        }
+    };
+}
+#[cfg(test)]
+pub(crate) use stats_conformance;
+
+/// One `#[test]` per [`SnapshotStore`] check in [`conformance`], each on a
+/// fresh store from `$make`.
+#[cfg(test)]
+macro_rules! snapshot_conformance {
+    ($make:expr) => {
+        use $crate::db::stats::conformance;
+
+        #[test]
+        fn snapshots_round_trip_oldest_first() {
+            conformance::snapshots_round_trip_oldest_first(&mut $make);
+        }
+        #[test]
+        fn a_snapshot_belongs_to_its_utc_day() {
+            conformance::a_snapshot_belongs_to_its_utc_day(&mut $make);
+        }
+        #[test]
+        fn the_first_snapshot_of_a_day_is_found() {
+            conformance::the_first_snapshot_of_a_day_is_found(&mut $make);
+        }
+    };
+}
+#[cfg(test)]
+pub(crate) use snapshot_conformance;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::memories::{Memories, NewMemory};
+    use crate::db::Database;
+
+    #[test]
+    fn the_repository_reaches_the_store_through_the_ports() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        Memories::new(&store)
+            .insert(&NewMemory::new("m", "content", conformance::T1))
+            .unwrap();
+        let stats = StoreStats::new(&store);
+        assert_eq!(stats.live_memories().unwrap(), 1);
+        assert_eq!(stats.recent(5).unwrap().len(), 1);
+        assert!(
+            stats.recent(-1).unwrap().is_empty(),
+            "a negative limit returns nothing"
+        );
+        let snapshot = AnalyticsSnapshot {
+            captured_at: conformance::T1.to_string(),
+            total_memories: 1,
+            vitality_buckets: BTreeMap::new(),
+            category_counts: BTreeMap::new(),
+        };
+        let id = stats.insert_snapshot(&snapshot).unwrap();
+        assert_eq!(stats.snapshot_on("2026-09-25").unwrap(), Some(id));
+        assert_eq!(stats.snapshots().unwrap(), [snapshot]);
+    }
+
+    #[test]
+    fn an_in_memory_database_has_no_path_but_a_size() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        let info = StoreStats::new(&store).storage_info().unwrap();
+        assert_eq!(info.path, None);
+        assert!(info.size_bytes > 0);
+        assert_eq!(info.schema_version, crate::db::SCHEMA_VERSION);
     }
 
     #[test]

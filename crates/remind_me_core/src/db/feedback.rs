@@ -1,15 +1,15 @@
 //! Storage for feedback: the `memory_feedback` event log, the importance
 //! columns a global judgement rewrites (`base_weight`, `vitality`, `status`),
-//! and the recalibration queries that look for memories never given any,
-//! on the engine's memories core (`db::engine::feedback`,
-//! `db::engine::memories`).
+//! and the recalibration queries that look for memories never given any.
 //!
-//! Every read and write for feedback goes through here (ADR-0022). The
-//! rules stay where they were: the feedback maths and the similarity
+//! [`FeedbackStore`] is the port (ADR-0035); the engine's adapter is in
+//! `db::engine::feedback`. [`Feedback`] is what callers take: it locks the
+//! store's tables for each call and goes through the port. The rules stay
+//! where they were: the feedback maths and the similarity
 //! threshold in [`crate::vitality`], and what makes a memory due for review
 //! in [`crate::recalibrate`], which passes its thresholds in.
 
-use super::engine::{self, EngineLock};
+use super::engine::EngineLock;
 use super::{Result, Store};
 use crate::models::RecalibrateCandidate;
 
@@ -44,7 +44,59 @@ pub struct ReviewFilter<'a> {
     pub stale_days: i64,
 }
 
-/// The feedback tables, on the engine's memories core.
+/// The feedback log and the importance columns, as a backend stores them
+/// (ADR-0035). [`conformance`] holds the behaviour every implementation
+/// must show.
+pub trait FeedbackStore {
+    /// `memory_id`'s importance columns, or `None` if it is missing or
+    /// deleted.
+    fn importance(&self, memory_id: &str) -> Result<Option<Importance>>;
+
+    /// Rewrite `memory_id`'s importance after a global judgement, without
+    /// stamping `updated_at`.
+    fn set_importance(
+        &mut self,
+        memory_id: &str,
+        base_weight: f64,
+        vitality: f64,
+        status: &str,
+    ) -> Result<()>;
+
+    /// Log a query-contextual feedback event under `id`. A taken id, and a
+    /// signal other than `helpful` or `unhelpful`, are refused.
+    fn log_event(
+        &mut self,
+        id: &str,
+        memory_id: &str,
+        query: &str,
+        event: &FeedbackEvent,
+        created_at: &str,
+    ) -> Result<()>;
+
+    /// Every feedback event logged for `memory_id`, oldest first (ties by
+    /// id).
+    fn events(&self, memory_id: &str) -> Result<Vec<FeedbackEvent>>;
+
+    /// Remove every feedback event logged for `memory_id`.
+    fn delete_for(&mut self, memory_id: &str) -> Result<()>;
+
+    /// How many memories `filter` makes due for review: live, not
+    /// superseded, weighty or of a durable type, unread for `stale_days`,
+    /// and never given feedback.
+    fn review_count(&self, filter: &ReviewFilter<'_>) -> Result<i64>;
+
+    /// Up to `limit` memories `filter` makes due for review, heaviest first,
+    /// then longest unread (never read first), ties by id, their content cut
+    /// to `snippet_chars` characters.
+    fn review_batch(
+        &self,
+        filter: &ReviewFilter<'_>,
+        snippet_chars: usize,
+        limit: usize,
+    ) -> Result<Vec<RecalibrateCandidate>>;
+}
+
+/// The feedback tables of a [`Store`], one locked call at a time.
 pub struct Feedback<'c> {
     core: &'c EngineLock,
 }
@@ -54,13 +106,12 @@ impl<'c> Feedback<'c> {
         Self { core: store.core() }
     }
 
-    /// `memory_id`'s importance columns, or `None` if it is missing or
-    /// deleted.
+    /// See [`FeedbackStore::importance`].
     pub fn importance(&self, memory_id: &str) -> Result<Option<Importance>> {
-        engine::memories::importance(&self.core.lock(), memory_id)
+        FeedbackStore::importance(&*self.core.lock(), memory_id)
     }
 
-    /// Rewrite `memory_id`'s importance after a global judgement.
+    /// See [`FeedbackStore::set_importance`].
     pub fn set_importance(
         &self,
         memory_id: &str,
@@ -68,8 +119,8 @@ impl<'c> Feedback<'c> {
         vitality: f64,
         status: &str,
     ) -> Result<()> {
-        engine::memories::set_importance(
-            &mut self.core.lock(),
+        FeedbackStore::set_importance(
+            &mut *self.core.lock(),
             memory_id,
             base_weight,
             vitality,
@@ -77,7 +128,7 @@ impl<'c> Feedback<'c> {
         )
     }
 
-    /// Log a query-contextual feedback event under `id`.
+    /// See [`FeedbackStore::log_event`].
     pub fn log_event(
         &self,
         id: &str,
@@ -86,8 +137,8 @@ impl<'c> Feedback<'c> {
         event: &FeedbackEvent,
         created_at: &str,
     ) -> Result<()> {
-        engine::feedback::log_event(
-            &mut self.core.lock(),
+        FeedbackStore::log_event(
+            &mut *self.core.lock(),
             id,
             memory_id,
             query,
@@ -96,55 +147,77 @@ impl<'c> Feedback<'c> {
         )
     }
 
-    /// Every feedback event logged for `memory_id`, oldest first (ties by
-    /// id).
+    /// See [`FeedbackStore::events`].
     pub fn events(&self, memory_id: &str) -> Result<Vec<FeedbackEvent>> {
-        engine::feedback::events(&self.core.lock(), memory_id)
+        FeedbackStore::events(&*self.core.lock(), memory_id)
     }
 
-    /// Remove every feedback event logged for `memory_id`: part of deleting
-    /// a memory.
+    /// See [`FeedbackStore::delete_for`]: part of deleting a memory.
     pub fn delete_for(&self, memory_id: &str) -> Result<()> {
-        engine::feedback::delete_for(&mut self.core.lock(), memory_id)
+        FeedbackStore::delete_for(&mut *self.core.lock(), memory_id)
     }
 
-    /// How many memories `filter` makes due for review.
+    /// See [`FeedbackStore::review_count`].
     pub fn review_count(&self, filter: &ReviewFilter<'_>) -> Result<i64> {
-        engine::feedback::review_count(&self.core.lock(), filter)
+        FeedbackStore::review_count(&*self.core.lock(), filter)
     }
 
-    /// Up to `limit` memories `filter` makes due for review, heaviest and
-    /// longest-unread first (ties by id), their content cut to
-    /// `snippet_chars`.
+    /// See [`FeedbackStore::review_batch`]. A negative `limit` returns
+    /// nothing.
     pub fn review_batch(
         &self,
         filter: &ReviewFilter<'_>,
         snippet_chars: usize,
         limit: i64,
     ) -> Result<Vec<RecalibrateCandidate>> {
-        engine::feedback::review_batch(
-            &self.core.lock(),
-            filter,
-            snippet_chars,
-            usize::try_from(limit).unwrap_or(0),
-        )
+        let limit = usize::try_from(limit).unwrap_or(0);
+        FeedbackStore::review_batch(&*self.core.lock(), filter, snippet_chars, limit)
     }
 }
 
+/// The behaviour every [`FeedbackStore`] must show, run against each backend
+/// by [`feedback_conformance`] (ADR-0035).
+///
+/// Feedback hangs off memories, which have no port yet, so each check takes
+/// the backend's own way to add a memory (`add`).
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::db::history::{Revisions, Tracked};
-    use crate::db::memories::{Memories, NewMemory};
-    use crate::db::Database;
+pub(crate) mod conformance {
+    use super::{FeedbackEvent, FeedbackStore, Importance, ReviewFilter};
+    use crate::db::memories::NewMemory;
 
-    /// Feedback, importance and revert writes, and every read after.
-    #[test]
-    fn feedback_settles_a_memory_and_history_tracks_its_columns() {
-        let old = "2020-01-01T00:00:00+00:00";
-        let db = Database::open_in_memory().unwrap();
-        let store = db.store();
-        let memories = Memories::new(&store);
+    const OLD: &str = "2020-01-01T00:00:00+00:00";
+
+    fn filter() -> ReviewFilter<'static> {
+        ReviewFilter {
+            min_base_weight: 1.0,
+            durable_types: &["fact"],
+            stale_days: 30,
+        }
+    }
+
+    fn event(signal: &str, magnitude: f64) -> FeedbackEvent {
+        FeedbackEvent {
+            query_tokens: "q".into(),
+            signal: signal.into(),
+            magnitude,
+        }
+    }
+
+    fn look<S: FeedbackStore>(store: &S) -> (i64, Vec<String>) {
+        let batch: Vec<String> = store
+            .review_batch(&filter(), 12, 10)
+            .unwrap()
+            .into_iter()
+            .map(|c| format!("{}:{}:{:?}", c.id, c.content_snippet, c.accessed_at))
+            .collect();
+        (store.review_count(&filter()).unwrap(), batch)
+    }
+
+    /// Feedback and importance writes, and the review reads after each.
+    pub(crate) fn feedback_settles_a_memory<S: FeedbackStore>(
+        store: &mut S,
+        add: impl Fn(&mut S, &NewMemory),
+    ) {
         for (id, weight, kind) in [
             ("heavy", 2.0, "note"),
             ("heavier", 3.0, "note"),
@@ -155,33 +228,17 @@ mod tests {
             let at = if id == "fresh" {
                 "2999-01-01T00:00:00+00:00"
             } else {
-                old
+                OLD
             };
-            memories
-                .insert(&NewMemory {
-                    base_weight: weight,
-                    memory_type: kind.into(),
-                    accessed_at: (id == "heavy").then(|| old.to_string()),
-                    ..NewMemory::new(id, format!("content of {id} {}", "ü".repeat(20)), at)
-                })
-                .unwrap();
+            let new = NewMemory {
+                base_weight: weight,
+                memory_type: kind.into(),
+                accessed_at: (id == "heavy").then(|| OLD.to_string()),
+                ..NewMemory::new(id, format!("content of {id} {}", "ü".repeat(20)), at)
+            };
+            add(store, &new);
         }
-        let feedback = Feedback::new(&store);
-        let filter = ReviewFilter {
-            min_base_weight: 1.0,
-            durable_types: &["fact"],
-            stale_days: 30,
-        };
-        let look = |feedback: &Feedback<'_>| -> (i64, Vec<String>) {
-            let batch: Vec<String> = feedback
-                .review_batch(&filter, 12, 10)
-                .unwrap()
-                .into_iter()
-                .map(|c| format!("{}:{}:{:?}", c.id, c.content_snippet, c.accessed_at))
-                .collect();
-            (feedback.review_count(&filter).unwrap(), batch)
-        };
-        let (count, batch) = look(&feedback);
+        let (count, batch) = look(store);
         assert_eq!(
             count, 3,
             "heavy, heavier and fact; light is light, fresh is fresh"
@@ -195,150 +252,154 @@ mod tests {
             ],
             "heaviest first, snippets cut by character"
         );
-        let event = |signal: &str, magnitude| FeedbackEvent {
-            query_tokens: "q".into(),
-            signal: signal.into(),
-            magnitude,
-        };
-        feedback
-            .log_event("fb_2", "heavy", "q", &event("unhelpful", 0.2), old)
+        assert!(store.review_batch(&filter(), 12, 0).unwrap().is_empty());
+
+        store
+            .log_event("fb_2", "heavy", "q", &event("unhelpful", 0.2), OLD)
             .unwrap();
-        feedback
-            .log_event("fb_1", "heavy", "q", &event("helpful", 0.1), old)
+        store
+            .log_event("fb_1", "heavy", "q", &event("helpful", 0.1), OLD)
             .unwrap();
         assert!(
-            feedback
-                .log_event("fb_1", "fact", "q", &event("helpful", 0.1), old)
+            store
+                .log_event("fb_1", "fact", "q", &event("helpful", 0.1), OLD)
                 .is_err(),
             "a taken event id is refused"
         );
         assert!(
-            feedback
-                .log_event("fb_3", "fact", "q", &event("meh", 0.1), old)
+            store
+                .log_event("fb_3", "fact", "q", &event("meh", 0.1), OLD)
                 .is_err(),
             "an unknown signal is refused"
         );
         assert_eq!(
-            feedback.events("heavy").unwrap(),
+            store.events("heavy").unwrap(),
             [event("helpful", 0.1), event("unhelpful", 0.2)],
             "same stamp: by id, not by the order they were logged"
         );
-        assert_eq!(look(&feedback).0, 2, "feedback settles a memory");
-        feedback.set_importance("fact", 4.0, 0.9, "active").unwrap();
+        assert_eq!(look(store).0, 2, "feedback settles a memory");
+
+        store.set_importance("fact", 4.0, 0.9, "active").unwrap();
         assert_eq!(
-            feedback.importance("fact").unwrap(),
+            store.importance("fact").unwrap(),
             Some(Importance {
                 access_count: 0,
                 base_weight: 4.0,
                 vitality: 0.9,
             })
         );
-        assert_eq!(feedback.importance("missing").unwrap(), None);
+        assert_eq!(store.importance("missing").unwrap(), None);
+        assert_eq!(look(store).1[0], "fact:content of f:None", "heaviest first");
+
+        store.delete_for("heavy").unwrap();
+        assert!(store.events("heavy").unwrap().is_empty());
         assert_eq!(
-            look(&feedback).1[0],
-            "fact:content of f:None",
-            "heaviest first"
-        );
-        feedback.delete_for("heavy").unwrap();
-        assert!(feedback.events("heavy").unwrap().is_empty());
-        assert_eq!(
-            look(&feedback).0,
+            look(store).0,
             3,
             "with its feedback gone, heavy is due again"
         );
-
-        let revisions = Revisions::new(&store);
-        let before = revisions.current("light").unwrap().unwrap();
-        assert_eq!(before.category, "general");
-        assert_eq!(before.sensitive, Some(false));
-        revisions
-            .restore(
-                "light",
-                &Tracked {
-                    content: "restored".into(),
-                    category: "c".into(),
-                    tags: "not json".into(),
-                    metadata: "{}".into(),
-                    sensitive: None,
-                    project: None,
-                },
-                "2026-09-27T00:00:00+00:00",
-            )
-            .unwrap();
-        let after = revisions.current("light").unwrap().unwrap();
-        assert_eq!(after.content, "restored");
-        assert_eq!(after.category, "c");
-        assert_eq!(
-            after.sensitive,
-            Some(false),
-            "None is written as not sensitive"
-        );
-        memories.delete_live("light", Some(old)).unwrap();
-        assert!(!revisions.is_live("light").unwrap());
-        assert!(revisions.is_live("fact").unwrap());
-        assert_eq!(
-            revisions.current("light").unwrap().map(|t| t.content),
-            Some(crate::sync::TOMBSTONE_CONTENT.to_string()),
-            "a tombstone's text is gone, but the row still reads"
-        );
     }
 
-    #[test]
-    fn review_needs_weight_or_a_durable_type_and_no_feedback() {
-        let db = Database::open_in_memory().unwrap();
-        let store = db.store();
-        let old = "2020-01-01T00:00:00+00:00";
+    pub(crate) fn review_needs_weight_or_a_durable_type<S: FeedbackStore>(
+        store: &mut S,
+        add: impl Fn(&mut S, &NewMemory),
+    ) {
         for (id, weight, kind) in [
             ("heavy", 2.0, "note"),
             ("fact", 0.5, "fact"),
             ("light", 0.5, "note"),
         ] {
-            Memories::new(&store)
-                .insert(&NewMemory {
-                    base_weight: weight,
-                    memory_type: kind.to_string(),
-                    ..NewMemory::new(id, format!("content {id}"), old)
-                })
-                .unwrap();
+            let new = NewMemory {
+                base_weight: weight,
+                memory_type: kind.to_string(),
+                ..NewMemory::new(id, format!("content {id}"), OLD)
+            };
+            add(store, &new);
         }
+        assert_eq!(store.review_count(&filter()).unwrap(), 2);
+        let no_types = ReviewFilter {
+            durable_types: &[],
+            ..filter()
+        };
+        assert_eq!(
+            store.review_count(&no_types).unwrap(),
+            1,
+            "without durable types only weight counts"
+        );
+        let none = ReviewFilter {
+            min_base_weight: 10.0,
+            durable_types: &[],
+            ..filter()
+        };
+        assert_eq!(store.review_count(&none).unwrap(), 0);
+    }
+}
+
+/// One `#[test]` per [`conformance`] check, each on a fresh store from
+/// `$make`, with `$add` as the checks' memory fixture.
+#[cfg(test)]
+macro_rules! feedback_conformance {
+    ($make:expr, $add:expr) => {
+        use $crate::db::feedback::conformance;
+
+        #[test]
+        fn feedback_settles_a_memory() {
+            conformance::feedback_settles_a_memory(&mut $make, $add);
+        }
+        #[test]
+        fn review_needs_weight_or_a_durable_type() {
+            conformance::review_needs_weight_or_a_durable_type(&mut $make, $add);
+        }
+    };
+}
+#[cfg(test)]
+pub(crate) use feedback_conformance;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::memories::{Memories, NewMemory};
+    use crate::db::Database;
+
+    #[test]
+    fn the_repository_reaches_the_store_through_the_port() {
+        let old = "2020-01-01T00:00:00+00:00";
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        Memories::new(&store)
+            .insert(&NewMemory {
+                base_weight: 2.0,
+                ..NewMemory::new("m", "content", old)
+            })
+            .unwrap();
         let feedback = Feedback::new(&store);
         let filter = ReviewFilter {
             min_base_weight: 1.0,
-            durable_types: &["fact"],
+            durable_types: &[],
             stale_days: 30,
         };
-        assert_eq!(feedback.review_count(&filter).unwrap(), 2);
-        let ids: Vec<String> = feedback
-            .review_batch(&filter, 10, 10)
-            .unwrap()
-            .into_iter()
-            .map(|c| c.id)
-            .collect();
-        assert_eq!(ids, vec!["heavy", "fact"], "heaviest first");
-
+        assert_eq!(feedback.review_count(&filter).unwrap(), 1);
+        assert_eq!(
+            feedback.review_batch(&filter, 3, 10).unwrap()[0].content_snippet,
+            "con"
+        );
+        assert!(
+            feedback.review_batch(&filter, 3, -1).unwrap().is_empty(),
+            "a negative limit returns nothing"
+        );
         let event = FeedbackEvent {
             query_tokens: "q".into(),
             signal: "helpful".into(),
             magnitude: 0.1,
         };
-        feedback
-            .log_event("fb_1", "heavy", "q", &event, old)
-            .unwrap();
-        assert_eq!(feedback.events("heavy").unwrap(), vec![event]);
+        feedback.log_event("fb_1", "m", "q", &event, old).unwrap();
+        assert_eq!(feedback.events("m").unwrap(), [event]);
+        feedback.set_importance("m", 3.0, 0.5, "active").unwrap();
         assert_eq!(
-            feedback.review_count(&filter).unwrap(),
-            1,
-            "feedback settles a memory"
+            feedback.importance("m").unwrap().map(|i| i.base_weight),
+            Some(3.0)
         );
-
-        let no_types = ReviewFilter {
-            durable_types: &[],
-            ..filter
-        };
-        assert_eq!(
-            feedback.review_count(&no_types).unwrap(),
-            0,
-            "an empty type list matches nothing"
-        );
+        feedback.delete_for("m").unwrap();
+        assert!(feedback.events("m").unwrap().is_empty());
     }
 }

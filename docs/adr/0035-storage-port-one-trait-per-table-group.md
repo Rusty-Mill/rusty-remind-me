@@ -1,6 +1,6 @@
 # ADR-0035: The storage port is one trait per table group
 
-Status: Accepted (2026-11-16, confirmed by Nano); saved searches and reminders implemented
+Status: Accepted (2026-11-16, confirmed by Nano); saved searches, reminders, history, feedback, stats and snapshots implemented
 Date: 2026-11-16
 
 Continues ADR-0022, whose "extract traits only when a second backend is
