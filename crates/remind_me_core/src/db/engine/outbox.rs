@@ -1,7 +1,7 @@
 //! The sync outbox, its send markers and the sync flags on the engine
-//! (ADR-0023, core PR 1). [`crate::db::outbox`] and
-//! [`crate::db::sync_state`] call these when their store carries the core
-//! tables.
+//! (ADR-0023, core PR 1), and the engine's [`OutboxStore`] adapter
+//! (ADR-0035). The [`SyncStateStore`](crate::db::sync_state::SyncStateStore)
+//! adapter reaches the flags and send markers through here.
 //!
 //! An outbox entry's id is an integer, as SQLite's `INTEGER PRIMARY KEY`
 //! gives it, issued by the journal's `sync_outbox` sequence. An entry is
@@ -10,7 +10,7 @@
 
 use super::core::{Change, CoreTables};
 use super::{core_ref, engine_id, pair_engine_id, EngineTables};
-use crate::db::outbox::OutboxEntry;
+use crate::db::outbox::{OutboxEntry, OutboxStore};
 use crate::db::Result;
 use rusty_multimodal_db_engine::generic::query::{AllIds, FilterEq, GetById};
 use rusty_multimodal_db_engine::generic::traits::{
@@ -215,23 +215,6 @@ pub(crate) fn queue_at(
     Ok(id)
 }
 
-/// Queue every memory, then every entity and mention link, as inserts with
-/// the backfill's payloads, in one batch.
-pub(crate) fn backfill(tables: &mut EngineTables) -> Result<()> {
-    let others = super::graph::backfill_entries(core_ref(tables)?);
-    let mut rows: Vec<_> = super::memories::rows(core_ref(tables)?).collect();
-    rows.sort_by(|a, b| (&a.created_at, &a.id).cmp(&(&b.created_at, &b.id)));
-    let queued = rows
-        .into_iter()
-        .map(|row| (row.id.clone(), row.backfill_payload().to_string()))
-        .chain(others);
-    let mut changes = Vec::new();
-    for (key, payload) in queued {
-        changes.push(entry(tables, &key, "insert", payload)?);
-    }
-    tables.commit(changes)
-}
-
 // --- reads ----------------------------------------------------------------
 
 /// Every entry, oldest id first.
@@ -253,98 +236,8 @@ fn sent_to(core: &CoreTables, remote_id: &str) -> HashSet<i64> {
         .collect()
 }
 
-pub(crate) fn unsent_to(
-    tables: &EngineTables,
-    remote_id: &str,
-    after_id: i64,
-    limit: usize,
-) -> Result<Vec<OutboxEntry>> {
-    let core = core_ref(tables)?;
-    let sent = sent_to(core, remote_id);
-    Ok(entries(core)
-        .into_iter()
-        .filter(|e| e.id > after_id && e.sent_at.is_empty() && !sent.contains(&e.id))
-        .take(limit)
-        .map(|e| OutboxEntry {
-            id: e.id,
-            key: e.memory_id,
-            payload_json: e.payload,
-        })
-        .collect())
-}
-
-/// How many entries have no send to `remote_id`, and the oldest one's
-/// `created_at` as SQLite's `MIN` compares the text.
-pub(crate) fn pending_for(tables: &EngineTables, remote_id: &str) -> Result<(i64, Option<String>)> {
-    let core = core_ref(tables)?;
-    let sent = sent_to(core, remote_id);
-    let pending: Vec<OutboxRecord> = entries(core)
-        .into_iter()
-        .filter(|e| !sent.contains(&e.id))
-        .collect();
-    let oldest = pending.iter().map(|e| e.created_at.clone()).min();
-    Ok((count(pending.len()), oldest))
-}
-
-pub(crate) fn len(tables: &EngineTables) -> Result<i64> {
-    Ok(count(core_ref(tables)?.outbox.all_ids().len()))
-}
-
-pub(crate) fn unsent_count(tables: &EngineTables) -> Result<i64> {
-    let unsent = entries(core_ref(tables)?)
-        .into_iter()
-        .filter(|e| e.sent_at.is_empty())
-        .count();
-    Ok(count(unsent))
-}
-
 fn count(n: usize) -> i64 {
     i64::try_from(n).unwrap_or(i64::MAX)
-}
-
-// --- removal --------------------------------------------------------------
-
-/// Remove every sent entry, every one `done_by` has taken, and every one
-/// created before `cutoff`, and the send markers left pointing at nothing,
-/// in one batch. How many entries went.
-pub(crate) fn prune(tables: &mut EngineTables, cutoff: &str, done_by: &str) -> Result<usize> {
-    let core = core_ref(tables)?;
-    let taken: HashSet<i64> = sends(core)
-        .into_iter()
-        .filter(|s| s.remote_id == done_by)
-        .map(|s| s.outbox_id)
-        .collect();
-    let (gone, kept): (Vec<OutboxRecord>, Vec<OutboxRecord>) =
-        entries(core).into_iter().partition(|e| {
-            !e.sent_at.is_empty() || e.created_at.as_str() < cutoff || taken.contains(&e.id)
-        });
-    let kept: HashSet<i64> = kept.iter().map(|e| e.id).collect();
-    let mut changes: Vec<Change> = gone.iter().map(|e| Change::Outbox(e.id, None)).collect();
-    changes.extend(
-        sends(core)
-            .into_iter()
-            .filter(|s| !kept.contains(&s.outbox_id))
-            .map(|s| Change::Send(s.engine_id, None)),
-    );
-    tables.commit(changes)?;
-    Ok(gone.len())
-}
-
-/// Remove every entry and send marker, in one batch.
-pub(crate) fn clear(tables: &mut EngineTables) -> Result<()> {
-    let core = core_ref(tables)?;
-    let mut changes: Vec<Change> = core
-        .outbox
-        .all_ids()
-        .into_iter()
-        .map(|id| Change::Outbox(id, None))
-        .collect();
-    changes.extend(
-        sends(core)
-            .into_iter()
-            .map(|s| Change::Send(s.engine_id, None)),
-    );
-    tables.commit(changes)
 }
 
 // --- sends ----------------------------------------------------------------
@@ -406,6 +299,114 @@ pub(crate) fn max_id(table: &OutboxTable) -> u64 {
         .map_or(0, |id| u64::try_from(id).unwrap_or(0))
 }
 
+impl OutboxStore for EngineTables {
+    /// Queue every memory, then every entity and mention link, as inserts with
+    /// the backfill's payloads, in one batch.
+    fn backfill_everything(&mut self) -> Result<()> {
+        let others = super::graph::backfill_entries(core_ref(self)?);
+        let mut rows: Vec<_> = super::memories::rows(core_ref(self)?).collect();
+        rows.sort_by(|a, b| (&a.created_at, &a.id).cmp(&(&b.created_at, &b.id)));
+        let queued = rows
+            .into_iter()
+            .map(|row| (row.id.clone(), row.backfill_payload().to_string()))
+            .chain(others);
+        let mut changes = Vec::new();
+        for (key, payload) in queued {
+            changes.push(entry(self, &key, "insert", payload)?);
+        }
+        self.commit(changes)
+    }
+
+    fn unsent_to(&self, remote_id: &str, after_id: i64, limit: usize) -> Result<Vec<OutboxEntry>> {
+        let core = core_ref(self)?;
+        let sent = sent_to(core, remote_id);
+        Ok(entries(core)
+            .into_iter()
+            .filter(|e| e.id > after_id && e.sent_at.is_empty() && !sent.contains(&e.id))
+            .take(limit)
+            .map(|e| OutboxEntry {
+                id: e.id,
+                key: e.memory_id,
+                payload_json: e.payload,
+            })
+            .collect())
+    }
+
+    /// How many entries have no send to `remote_id`, and the oldest one's
+    /// `created_at` as SQLite's `MIN` compares the text.
+    fn pending_for(&self, remote_id: &str) -> Result<(i64, Option<String>)> {
+        let core = core_ref(self)?;
+        let sent = sent_to(core, remote_id);
+        let pending: Vec<OutboxRecord> = entries(core)
+            .into_iter()
+            .filter(|e| !sent.contains(&e.id))
+            .collect();
+        let oldest = pending.iter().map(|e| e.created_at.clone()).min();
+        Ok((count(pending.len()), oldest))
+    }
+
+    fn len(&self) -> Result<i64> {
+        Ok(count(core_ref(self)?.outbox.all_ids().len()))
+    }
+
+    fn unsent_count(&self) -> Result<i64> {
+        let unsent = entries(core_ref(self)?)
+            .into_iter()
+            .filter(|e| e.sent_at.is_empty())
+            .count();
+        Ok(count(unsent))
+    }
+
+    /// Remove every sent entry, every one `done_by` has taken, and every one
+    /// created before `cutoff`, and the send markers left pointing at nothing,
+    /// in one batch. How many entries went.
+    fn prune(&mut self, cutoff: &str, done_by: &str) -> Result<usize> {
+        let core = core_ref(self)?;
+        let taken: HashSet<i64> = sends(core)
+            .into_iter()
+            .filter(|s| s.remote_id == done_by)
+            .map(|s| s.outbox_id)
+            .collect();
+        let (gone, kept): (Vec<OutboxRecord>, Vec<OutboxRecord>) =
+            entries(core).into_iter().partition(|e| {
+                !e.sent_at.is_empty() || e.created_at.as_str() < cutoff || taken.contains(&e.id)
+            });
+        let kept: HashSet<i64> = kept.iter().map(|e| e.id).collect();
+        let mut changes: Vec<Change> = gone.iter().map(|e| Change::Outbox(e.id, None)).collect();
+        changes.extend(
+            sends(core)
+                .into_iter()
+                .filter(|s| !kept.contains(&s.outbox_id))
+                .map(|s| Change::Send(s.engine_id, None)),
+        );
+        self.commit(changes)?;
+        Ok(gone.len())
+    }
+
+    /// Remove every entry and send marker, in one batch.
+    fn clear(&mut self) -> Result<()> {
+        let core = core_ref(self)?;
+        let mut changes: Vec<Change> = core
+            .outbox
+            .all_ids()
+            .into_iter()
+            .map(|id| Change::Outbox(id, None))
+            .collect();
+        changes.extend(
+            sends(core)
+                .into_iter()
+                .map(|s| Change::Send(s.engine_id, None)),
+        );
+        self.commit(changes)
+    }
+}
+
+#[cfg(test)]
+mod conformance_tests {
+    use super::EngineTables;
+    crate::db::outbox::outbox_conformance!(EngineTables::open_temporary().unwrap());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -433,8 +434,8 @@ mod tests {
         record_sends(&mut tables, "hub", &[first], "t").unwrap();
 
         // Everything is older than a cutoff in the far future.
-        assert_eq!(prune(&mut tables, "9999", "hub").unwrap(), 2);
-        assert_eq!(len(&tables).unwrap(), 0);
+        assert_eq!(tables.prune("9999", "hub").unwrap(), 2);
+        assert_eq!(tables.len().unwrap(), 0);
         assert!(sent(&tables).is_empty());
     }
 }

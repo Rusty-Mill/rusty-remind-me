@@ -1,13 +1,14 @@
 //! Storage for the sync outbox: `sync_outbox` rows (one per local change to
-//! push) and their `sync_sends` markers, on the engine's memories core
-//! (`db::engine::outbox`).
+//! push) and their `sync_sends` markers, behind the [`OutboxStore`] port
+//! (ADR-0035), which the engine's memories core implements in
+//! `db::engine::outbox`.
 //!
 //! The rows themselves are queued by the repositories as they write, with
 //! the write's [`crate::db::derived::Origin`] deciding whether. The rules
 //! stay in [`crate::sync`]: when sync is enabled, the retention window,
 //! batch size, and how a payload decodes.
 
-use super::engine::{self, EngineLock};
+use super::engine::EngineLock;
 use super::{Result, Store};
 
 /// One outbox row as a push reads it.
@@ -20,6 +21,39 @@ pub struct OutboxEntry {
     pub payload_json: String,
 }
 
+/// The port for reading and pruning the outbox (ADR-0035). Rows are queued
+/// by the other ports' local writes while `sync_enabled` is set. Send
+/// markers are written through
+/// [`SyncStateStore::record_sends`](crate::db::sync_state::SyncStateStore::record_sends).
+/// [`conformance`] holds the behaviour every implementation must show.
+pub trait OutboxStore {
+    /// Up to `limit` unsent rows above `after_id` not yet sent to
+    /// `remote_id`, oldest first.
+    fn unsent_to(&self, remote_id: &str, after_id: i64, limit: usize) -> Result<Vec<OutboxEntry>>;
+
+    /// How many rows have no send recorded to `remote_id`, and the oldest
+    /// one's `created_at`.
+    fn pending_for(&self, remote_id: &str) -> Result<(i64, Option<String>)>;
+
+    /// How many rows the outbox holds.
+    fn len(&self) -> Result<i64>;
+
+    /// How many rows are not yet marked sent.
+    fn unsent_count(&self) -> Result<i64>;
+
+    /// Delete every sent row, every row `done_by` has taken, and every row
+    /// created before `cutoff`, then the send markers left pointing at
+    /// nothing. Returns how many rows went.
+    fn prune(&mut self, cutoff: &str, done_by: &str) -> Result<usize>;
+
+    /// Empty the outbox and its send markers.
+    fn clear(&mut self) -> Result<()>;
+
+    /// Queue every memory, entity and mention link as an insert, stamped
+    /// now: what a node that just turned sync on owes its remotes.
+    fn backfill_everything(&mut self) -> Result<()>;
+}
+
 /// The outbox, on the engine's memories core.
 pub struct Outbox<'c> {
     core: &'c EngineLock,
@@ -30,56 +64,177 @@ impl<'c> Outbox<'c> {
         Self { core: store.core() }
     }
 
-    /// Up to `limit` unsent rows above `after_id` not yet sent to
-    /// `remote_id`, oldest first.
+    /// See [`OutboxStore::unsent_to`].
     pub fn unsent_to(
         &self,
         remote_id: &str,
         after_id: i64,
         limit: usize,
     ) -> Result<Vec<OutboxEntry>> {
-        engine::outbox::unsent_to(&self.core.lock(), remote_id, after_id, limit)
+        OutboxStore::unsent_to(&*self.core.lock(), remote_id, after_id, limit)
     }
 
-    /// How many rows have no send recorded to `remote_id`, and the oldest
-    /// one's `created_at`.
+    /// See [`OutboxStore::pending_for`].
     pub fn pending_for(&self, remote_id: &str) -> Result<(i64, Option<String>)> {
-        engine::outbox::pending_for(&self.core.lock(), remote_id)
+        OutboxStore::pending_for(&*self.core.lock(), remote_id)
     }
 
-    /// How many rows the outbox holds.
+    /// See [`OutboxStore::len`].
     pub fn len(&self) -> Result<i64> {
-        engine::outbox::len(&self.core.lock())
+        OutboxStore::len(&*self.core.lock())
     }
 
-    /// How many rows are not yet marked sent.
+    /// See [`OutboxStore::unsent_count`].
     pub fn unsent_count(&self) -> Result<i64> {
-        engine::outbox::unsent_count(&self.core.lock())
+        OutboxStore::unsent_count(&*self.core.lock())
     }
 
     /// Whether the outbox is empty.
     pub fn is_empty(&self) -> Result<bool> {
-        Ok(engine::outbox::len(&self.core.lock())? == 0)
+        Ok(self.len()? == 0)
     }
 
-    /// Delete every sent row, every row `done_by` has taken, and every row
-    /// created before `cutoff`, then the send markers left pointing at
-    /// nothing. Returns how many rows went.
+    /// See [`OutboxStore::prune`].
     pub fn prune(&self, cutoff: &str, done_by: &str) -> Result<usize> {
-        engine::outbox::prune(&mut self.core.lock(), cutoff, done_by)
+        OutboxStore::prune(&mut *self.core.lock(), cutoff, done_by)
     }
 
-    /// Empty the outbox and its send markers.
+    /// See [`OutboxStore::clear`].
     pub fn clear(&self) -> Result<()> {
-        engine::outbox::clear(&mut self.core.lock())
+        OutboxStore::clear(&mut *self.core.lock())
     }
 
-    /// Queue every memory, entity and mention link as an insert, stamped
-    /// now: what a node that just turned sync on owes its remotes.
+    /// See [`OutboxStore::backfill_everything`].
     pub fn backfill_everything(&self) -> Result<()> {
-        engine::outbox::backfill(&mut self.core.lock())
+        OutboxStore::backfill_everything(&mut *self.core.lock())
     }
 }
+
+/// The behaviour every [`OutboxStore`] must show, run against each backend
+/// by [`outbox_conformance`] (ADR-0035).
+///
+/// Rows are queued by memory and entity writes, and marked sent through the
+/// sync state, so a backend under test implements [`MemoryStore`],
+/// [`EntityStore`] and [`SyncStateStore`] too.
+#[cfg(test)]
+pub(crate) mod conformance {
+    use super::OutboxStore;
+    use crate::db::entities::EntityStore;
+    use crate::db::memories::{MemoryStore, NewMemory};
+    use crate::db::sync_state::SyncStateStore;
+    use crate::entity::Entity;
+
+    const NOW: &str = "2026-09-26T00:00:00+00:00";
+
+    /// Sync off queues nothing; sync on queues memory and entity writes,
+    /// which sends, clearing, backfill and pruning then account for.
+    pub(crate) fn the_outbox_sends_and_backfill_agree<
+        S: OutboxStore + SyncStateStore + MemoryStore + EntityStore,
+    >(
+        store: &mut S,
+    ) {
+        MemoryStore::insert(store, &NewMemory::new("off", "x", NOW)).unwrap();
+        assert_eq!(
+            store.len().unwrap(),
+            0,
+            "nothing is queued while sync is off"
+        );
+
+        store.set_flag("sync_enabled", "1").unwrap();
+        MemoryStore::insert(store, &NewMemory::new("a", "x", NOW)).unwrap();
+        MemoryStore::insert(store, &NewMemory::new("b", "y", NOW)).unwrap();
+        let queued = store.unsent_to("hub", 0, 10).unwrap();
+        let keys: Vec<&str> = queued.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, ["a", "b"]);
+
+        store.record_sends("hub", &[queued[0].id], "t1").unwrap();
+        assert_eq!(store.pending_for("hub").unwrap().0, 1);
+        assert_eq!(store.pending_for("peer").unwrap().0, 2);
+        assert_eq!(store.unsent_to("hub", 0, 10).unwrap().len(), 1);
+        assert!(store
+            .unsent_to("peer", queued[1].id, 10)
+            .unwrap()
+            .is_empty());
+        assert_eq!(store.unsent_count().unwrap(), 2);
+
+        // The graph queues into the same outbox.
+        EntityStore::insert(
+            store,
+            &Entity {
+                id: "ent_1".into(),
+                name: "Quokka".into(),
+                kind: None,
+                aliases: Vec::new(),
+                created_at: NOW.into(),
+                updated_at: NOW.into(),
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(store.len().unwrap(), 3);
+
+        store.clear().unwrap();
+        assert_eq!(store.len().unwrap(), 0);
+        assert_eq!(store.pending_for("hub").unwrap(), (0, None));
+
+        store.backfill_everything().unwrap();
+        // Memories in scan order, which the store does not promise.
+        let mut keys: Vec<String> = store
+            .unsent_to("hub", 0, 10)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.key)
+            .collect();
+        keys.sort();
+        assert_eq!(keys, ["a", "b", "ent_1", "off"]);
+        assert_eq!(store.prune("9999", "hub").unwrap(), 4);
+        assert_eq!(store.len().unwrap(), 0);
+    }
+
+    /// A row the remote has taken goes at a prune, however new; the rest
+    /// stay until the cutoff passes them.
+    pub(crate) fn prune_drops_rows_the_remote_has_taken<
+        S: OutboxStore + SyncStateStore + MemoryStore,
+    >(
+        store: &mut S,
+    ) {
+        store.set_flag("sync_enabled", "1").unwrap();
+        MemoryStore::insert(store, &NewMemory::new("a", "x", NOW)).unwrap();
+        MemoryStore::insert(store, &NewMemory::new("b", "y", NOW)).unwrap();
+        let first = store.unsent_to("hub", 0, 10).unwrap()[0].id;
+        store.record_sends("hub", &[first], "t1").unwrap();
+
+        assert_eq!(store.prune("1970-01-01", "hub").unwrap(), 1);
+        let left: Vec<String> = store
+            .unsent_to("peer", 0, 10)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.key)
+            .collect();
+        assert_eq!(left, ["b"]);
+        assert_eq!(store.pending_for("hub").unwrap().0, 1);
+    }
+}
+
+/// One `#[test]` per [`conformance`] check, each on a fresh store from
+/// `$make`.
+#[cfg(test)]
+macro_rules! outbox_conformance {
+    ($make:expr) => {
+        use $crate::db::outbox::conformance;
+
+        #[test]
+        fn the_outbox_sends_and_backfill_agree() {
+            conformance::the_outbox_sends_and_backfill_agree(&mut $make);
+        }
+        #[test]
+        fn prune_drops_rows_the_remote_has_taken() {
+            conformance::prune_drops_rows_the_remote_has_taken(&mut $make);
+        }
+    };
+}
+#[cfg(test)]
+pub(crate) use outbox_conformance;
 
 #[cfg(test)]
 mod tests {
@@ -109,77 +264,6 @@ mod tests {
         assert_eq!(outbox.pending_for("peer").unwrap().0, 2);
         assert_eq!(outbox.unsent_to("hub", 0, 10).unwrap().len(), 1);
         assert_eq!(outbox.len().unwrap(), 2);
-    }
-
-    #[test]
-    fn the_outbox_sends_and_backfill_agree() {
-        use crate::db::entities::Entities;
-        use crate::db::memories::{Memories, NewMemory};
-        use crate::db::sync_state::SyncState;
-        use crate::entity::Entity;
-        const NOW: &str = "2026-09-26T00:00:00+00:00";
-
-        let db = Database::open_in_memory().unwrap();
-        let store = db.store();
-        let state = SyncState::new(&store);
-        let outbox = Outbox::new(&store);
-        let memories = Memories::new(&store);
-        memories.insert(&NewMemory::new("off", "x", NOW)).unwrap();
-        assert!(
-            outbox.is_empty().unwrap(),
-            "nothing is queued while sync is off"
-        );
-
-        state.set_flag("sync_enabled", "1").unwrap();
-        assert_eq!(state.flag("sync_enabled").unwrap().as_deref(), Some("1"));
-        memories.insert(&NewMemory::new("a", "x", NOW)).unwrap();
-        memories.insert(&NewMemory::new("b", "y", NOW)).unwrap();
-        let queued = outbox.unsent_to("hub", 0, 10).unwrap();
-        let keys: Vec<&str> = queued.iter().map(|e| e.key.as_str()).collect();
-        assert_eq!(keys, ["a", "b"]);
-
-        state.record_sends("hub", &[queued[0].id], "t1").unwrap();
-        assert_eq!(outbox.pending_for("hub").unwrap().0, 1);
-        assert_eq!(outbox.pending_for("peer").unwrap().0, 2);
-        assert_eq!(outbox.unsent_to("hub", 0, 10).unwrap().len(), 1);
-        assert!(outbox
-            .unsent_to("peer", queued[1].id, 10)
-            .unwrap()
-            .is_empty());
-        assert_eq!(outbox.unsent_count().unwrap(), 2);
-
-        // The graph queues into the same outbox.
-        Entities::new(&store)
-            .insert(
-                &Entity {
-                    id: "ent_1".into(),
-                    name: "Quokka".into(),
-                    kind: None,
-                    aliases: Vec::new(),
-                    created_at: NOW.into(),
-                    updated_at: NOW.into(),
-                },
-                None,
-            )
-            .unwrap();
-        assert_eq!(outbox.len().unwrap(), 3);
-
-        outbox.clear().unwrap();
-        assert!(outbox.is_empty().unwrap());
-        assert_eq!(outbox.pending_for("hub").unwrap(), (0, None));
-
-        outbox.backfill_everything().unwrap();
-        // Memories in scan order, which the store does not promise.
-        let mut keys: Vec<String> = outbox
-            .unsent_to("hub", 0, 10)
-            .unwrap()
-            .into_iter()
-            .map(|e| e.key)
-            .collect();
-        keys.sort();
-        assert_eq!(keys, ["a", "b", "ent_1", "off"]);
-        assert_eq!(outbox.prune("9999", "hub").unwrap(), 4);
-        assert!(outbox.is_empty().unwrap());
     }
 
     #[test]
