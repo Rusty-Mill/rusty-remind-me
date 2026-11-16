@@ -147,6 +147,32 @@ pub fn render_memories_markdown(memories: &[Memory]) -> String {
         .join("\n---\n")
 }
 
+/// ` ⚡` and the like: how a hit was found (#230), or nothing for a hit
+/// from a listing that ranked nothing.
+fn badge(hit: &crate::models::MemorySearchResult) -> String {
+    hit.search_method
+        .map(|m| format!(" {}", m.badge()))
+        .unwrap_or_default()
+}
+
+/// Search hits rendered whole, as [`render_memories_markdown`] renders
+/// memories, each header carrying its [`crate::models::SearchMethod`] badge.
+pub fn render_hits_markdown(hits: &[crate::models::MemorySearchResult]) -> String {
+    if hits.is_empty() {
+        return "_No memories found._".to_string();
+    }
+    hits.iter()
+        .map(|hit| {
+            let md = render_memory_markdown(&hit.memory);
+            match hit.search_method {
+                Some(m) => md.replacen("### ", &format!("### {} ", m.badge()), 1),
+                None => md,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n---\n")
+}
+
 /// One line per search hit: id, category, date, tags, score, marks such as
 /// `expired`, and a snippet (card #51). The compact counterpart of
 /// [`render_memories_markdown`], for a search that fetches bodies by id later.
@@ -168,10 +194,11 @@ pub fn render_compact_hits_markdown(hits: &[crate::models::MemorySearchResult]) 
             };
             let date: String = m.created_at.chars().take(10).collect();
             format!(
-                "- `{}` · {} · {date}{tags} · {:.2}{}{marks} — {}",
+                "- `{}` · {} · {date}{tags} · {:.2}{}{}{marks} — {}",
                 m.id,
                 m.category,
                 hit.score,
+                badge(hit),
                 if m.sensitive { " 🔒" } else { "" },
                 crate::retrieval::compact_snippet(&m.content)
             )
@@ -195,6 +222,9 @@ pub fn compact_hit_json(hit: &crate::models::MemorySearchResult) -> serde_json::
         "confidence": m.confidence,
         "snippet": crate::retrieval::compact_snippet(&m.content),
     });
+    if let Some(method) = hit.search_method {
+        value["search_method"] = serde_json::to_value(method).unwrap_or_default();
+    }
     if let Some(until) = &m.valid_until {
         value["valid_until"] = until.as_str().into();
         value["expired"] = crate::retrieval::is_expired(Utc::now(), Some(until)).into();

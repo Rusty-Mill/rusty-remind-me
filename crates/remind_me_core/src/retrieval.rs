@@ -1,4 +1,4 @@
-use crate::models::{Memory, MemorySearchResult, RetrievalStrategy, SearchDetail};
+use crate::models::{Memory, MemorySearchResult, RetrievalStrategy, SearchDetail, SearchMethod};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -522,7 +522,6 @@ pub fn rank_rrf(
                 + idf_contrib;
 
             MemorySearchResult {
-                memory,
                 score: total,
                 fts_score: Some(fts_score),
                 vec_score: semantic_ran.then_some(vec_score),
@@ -537,6 +536,13 @@ pub fn rank_rrf(
                 // Likewise applied later, by `reranker::maybe_rerank`, which
                 // reorders the head rather than contributing to this total.
                 rerank_score: None,
+                // Membership, not `vec_score`: that is set whenever semantic
+                // search ran at all, for every hit alike (#230).
+                search_method: SearchMethod::from_membership(
+                    keyword_rank.contains_key(memory.id.as_str()),
+                    semantic_rank.contains_key(memory.id.as_str()),
+                ),
+                memory,
             }
         })
         .collect();
@@ -581,6 +587,9 @@ pub struct TrimOutcome {
     pub timing: SearchTiming,
     /// Nothing refined matched, so these are raw session dialogs (ADR-0029).
     pub raw_fallback: bool,
+    /// Dormant memories that matched but were left out (#230); `0` when
+    /// dormant ones were asked for. See [`crate::db::queries`]' search.
+    pub dormant_excluded: usize,
 }
 
 /// Wall-clock budget for one search.
@@ -790,6 +799,7 @@ pub fn trim_by_token_budget(
             results,
             timing: SearchTiming::default(),
             raw_fallback: false,
+            dormant_excluded: 0,
         };
     }
 
@@ -814,6 +824,7 @@ pub fn trim_by_token_budget(
                 results: kept,
                 timing: SearchTiming::default(),
                 raw_fallback: false,
+                dormant_excluded: 0,
             };
         }
         tokens_used += est_tokens;
@@ -829,6 +840,7 @@ pub fn trim_by_token_budget(
         results: kept,
         timing: SearchTiming::default(),
         raw_fallback: false,
+        dormant_excluded: 0,
     }
 }
 
@@ -1070,6 +1082,7 @@ mod tests {
             idf_score: None,
             feedback_adjustment: None,
             rerank_score: None,
+            search_method: None,
         }
     }
 
