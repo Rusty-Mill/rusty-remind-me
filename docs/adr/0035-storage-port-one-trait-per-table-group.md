@@ -1,6 +1,6 @@
 # ADR-0035: The storage port is one trait per table group
 
-Status: Accepted (2026-11-16); step 1 (saved searches) implemented
+Status: Accepted (2026-11-16, confirmed by Nano); saved searches and reminders implemented
 Date: 2026-11-16
 
 Continues ADR-0022, whose "extract traits only when a second backend is
@@ -50,8 +50,11 @@ without an interface to run against.
    macro that turns them into one `#[test]` each for a given constructor.
    The engine adapter runs it on temporary tables; a SQLite adapter in R3
    invokes the same macro. Engine-specific tests (reopen, id hashing) stay
-   in the adapter's own module.
-5. **One table group per pull request,** in ADR-0022's order: the isolated
+   in the adapter's own module. A group whose rows hang off another group
+   that has no port yet (reminders hang off memories) takes that backend's
+   own fixtures as macro arguments, such as adding and deleting a memory;
+   they go once that group has a port.
+5. **One table group per commit,** a few per pull request, in ADR-0022's order: the isolated
    groups first (saved searches, reminders, history, feedback, stats), the
    memories core last. Each step is behaviour-preserving and leaves the
    schema and the on-disk format untouched.
