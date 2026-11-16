@@ -12,7 +12,7 @@ use super::memories::{self, MemoryRow};
 use super::outbox;
 use super::{core_ref, engine_error, engine_id, ensure_same_id, pair_engine_id, EngineTables};
 use crate::db::derived::Origin;
-use crate::db::entities::{EntitySyncView, RelationRow, StoredRelation};
+use crate::db::entities::{EntityStore, EntitySyncView, RelationRow, StoredRelation};
 use crate::db::Result;
 use crate::entity::{Entity, EntityFact, EntityLinkedMemory, EntityListItem, RelationEdge};
 use rusty_multimodal_db_engine::generic::query::{AllIds, FilterEq, GetById};
@@ -808,4 +808,150 @@ pub(crate) fn backfill_entries(core: &CoreTables) -> Vec<(String, String)> {
         .map(|e| (e.id.clone(), e.payload()))
         .chain(all_links.iter().map(|l| (l.memory_id.clone(), l.payload())))
         .collect()
+}
+
+impl EntityStore for EngineTables {
+    fn get(&self, id: &str) -> Result<Option<Entity>> {
+        get(self, id)
+    }
+
+    fn exists(&self, id: &str) -> Result<bool> {
+        exists(self, id)
+    }
+
+    fn all_oldest_first(&self) -> Result<Vec<Entity>> {
+        all_oldest_first(self)
+    }
+
+    fn all(&self) -> Result<Vec<Entity>> {
+        all(self)
+    }
+
+    fn insert(&mut self, entity: &Entity, node_id: Option<&str>) -> Result<()> {
+        insert(self, entity, node_id)
+    }
+
+    fn set_kind_and_aliases(
+        &mut self,
+        id: &str,
+        kind: Option<&str>,
+        aliases: &[String],
+        updated_at: &str,
+    ) -> Result<()> {
+        set_kind_and_aliases(self, id, kind, aliases, updated_at)
+    }
+
+    fn count(&self) -> Result<usize> {
+        count(self)
+    }
+
+    fn page_by_mentions(&self, limit: usize, offset: usize) -> Result<Vec<EntityListItem>> {
+        page_by_mentions(self, limit, offset)
+    }
+
+    fn rename(&mut self, from: &str, to: &str) -> Result<()> {
+        rename(self, from, to)
+    }
+
+    fn set_merged(
+        &mut self,
+        id: &str,
+        kind: Option<&str>,
+        aliases: &[String],
+        created_at: &str,
+    ) -> Result<()> {
+        set_merged(self, id, kind, aliases, created_at)
+    }
+
+    fn delete(&mut self, id: &str) -> Result<()> {
+        delete(self, id)
+    }
+
+    fn repoint(&mut self, from: &str, to: &str) -> Result<()> {
+        repoint(self, from, to)
+    }
+
+    fn links_oldest_first(&self) -> Result<Vec<(String, String, String)>> {
+        links_oldest_first(self)
+    }
+
+    fn link(
+        &mut self,
+        memory_id: &str,
+        entity_id: &str,
+        created_at: &str,
+        origin: Origin,
+    ) -> Result<bool> {
+        link(self, memory_id, entity_id, created_at, origin)
+    }
+
+    fn unlink(&mut self, memory_id: &str, entity_id: &str) -> Result<bool> {
+        unlink(self, memory_id, entity_id)
+    }
+
+    fn unlink_memory(&mut self, memory_id: &str) -> Result<()> {
+        unlink_memory(self, memory_id)
+    }
+
+    fn linked_memories(&self, entity_id: &str, limit: usize) -> Result<Vec<EntityLinkedMemory>> {
+        linked_memories(self, entity_id, limit)
+    }
+
+    fn linked_memories_full(&self, entity_id: &str) -> Result<Vec<crate::models::Memory>> {
+        linked_memories_full(self, entity_id)
+    }
+
+    fn linked_memory_count(&self, entity_id: &str) -> Result<usize> {
+        linked_memory_count(self, entity_id)
+    }
+
+    fn shared_memory_count(&self, a: &str, b: &str) -> Result<usize> {
+        shared_memory_count(self, a, b)
+    }
+
+    fn facts_naming(&self, canonical: &str, limit: usize) -> Result<Vec<EntityFact>> {
+        facts_naming(self, canonical, limit)
+    }
+
+    fn relations_oldest_first(&self) -> Result<Vec<StoredRelation>> {
+        relations_oldest_first(self)
+    }
+
+    fn insert_relation_or_ignore(&mut self, row: &RelationRow<'_>, origin: Origin) -> Result<bool> {
+        insert_relation_or_ignore(self, row, origin)
+    }
+
+    fn relations_touching(
+        &self,
+        entity_ids: &[String],
+        relation: Option<&str>,
+        hop: u32,
+    ) -> Result<Vec<(String, RelationEdge)>> {
+        if entity_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        relations_touching(self, entity_ids, relation, hop)
+    }
+
+    fn sync_view(&self, id: &str) -> Result<Option<EntitySyncView>> {
+        sync_view(self, id)
+    }
+
+    fn upsert_synced(&mut self, entity: &Entity, node_id: Option<&str>) -> Result<()> {
+        upsert_synced(self, entity, node_id)
+    }
+
+    fn set_aliases(&mut self, id: &str, aliases: &[String]) -> Result<()> {
+        set_aliases(self, id, aliases)
+    }
+
+    fn linked_ids(&self, entity_id: &str) -> Result<HashSet<String>> {
+        linked_ids(self, entity_id)
+    }
+}
+
+#[cfg(test)]
+mod conformance_tests {
+    use super::EngineTables;
+    crate::db::entities::entity_conformance!(EngineTables::open_temporary().unwrap());
 }

@@ -1,9 +1,9 @@
-//! Import archives and their spans on the engine (ADR-0023, phase 4c).
-//! [`crate::db::archives`] calls these when its store carries engine
-//! tables; the behaviour matches its SQLite statements one for one.
+//! Import archives and their spans on the engine (ADR-0023, phase 4c): the
+//! engine's [`ArchiveStore`] adapter (ADR-0035). The behaviour matches the
+//! old SQLite statements one for one.
 
 use super::{deleted, engine_error, engine_id, ensure_same_id, micros, EngineTables};
-use crate::db::archives::{ArchiveRow, SpanSource};
+use crate::db::archives::{ArchiveRow, ArchiveStore, SpanSource};
 use crate::db::Result;
 use rusty_multimodal_db_engine::generic::query::{AllIds, FilterEq, GetById};
 use rusty_multimodal_db_engine::generic::traits::{
@@ -131,102 +131,101 @@ impl ScannableField<ByteStart> for SpanRecord {
     }
 }
 
-/// Record `row`, replacing any archive recorded for its import, as
-/// `INSERT OR REPLACE` does.
-pub(crate) fn record(tables: &mut EngineTables, row: &ArchiveRow) -> Result<()> {
-    let record = ArchiveRecord::new(row);
-    match tables.archives.get(record.engine_id) {
-        Some(stored) => {
-            ensure_same_id(&stored.import_id, &row.import_id)?;
-            tables.archives.replace(record).map_err(engine_error)
+impl ArchiveStore for EngineTables {
+    /// Replaces any archive recorded for the import, as `INSERT OR REPLACE`
+    /// does.
+    fn record(&mut self, row: &ArchiveRow) -> Result<()> {
+        let record = ArchiveRecord::new(row);
+        match self.archives.get(record.engine_id) {
+            Some(stored) => {
+                ensure_same_id(&stored.import_id, &row.import_id)?;
+                self.archives.replace(record).map_err(engine_error)
+            }
+            None => self.archives.insert(record).map_err(engine_error),
         }
-        None => tables.archives.insert(record).map_err(engine_error),
     }
-}
 
-/// Record a span for `memory_id`, replacing any recorded for it.
-pub(crate) fn record_span(
-    tables: &mut EngineTables,
-    memory_id: &str,
-    import_id: &str,
-    byte_start: i64,
-    byte_end: i64,
-) -> Result<()> {
-    let record = SpanRecord {
-        engine_id: engine_id(memory_id),
-        memory_id: memory_id.to_string(),
-        import_id: import_id.to_string(),
-        byte_start,
-        byte_end,
-    };
-    match tables.spans.get(record.engine_id) {
-        Some(stored) => {
-            ensure_same_id(&stored.memory_id, memory_id)?;
-            tables.spans.replace(record).map_err(engine_error)
+    fn record_span(
+        &mut self,
+        memory_id: &str,
+        import_id: &str,
+        byte_start: i64,
+        byte_end: i64,
+    ) -> Result<()> {
+        let record = SpanRecord {
+            engine_id: engine_id(memory_id),
+            memory_id: memory_id.to_string(),
+            import_id: import_id.to_string(),
+            byte_start,
+            byte_end,
+        };
+        match self.spans.get(record.engine_id) {
+            Some(stored) => {
+                ensure_same_id(&stored.memory_id, memory_id)?;
+                self.spans.replace(record).map_err(engine_error)
+            }
+            None => self.spans.insert(record).map_err(engine_error),
         }
-        None => tables.spans.insert(record).map_err(engine_error),
     }
-}
 
-/// Where `memory_id`'s bytes are. `None` if it has no span, or its span's
-/// import has no archive: the SQL is an inner join.
-pub(crate) fn span_source(tables: &EngineTables, memory_id: &str) -> Option<SpanSource> {
-    let span = tables
-        .spans
-        .get(engine_id(memory_id))
-        .filter(|span| span.memory_id == memory_id)?;
-    let archive = archive(tables, &span.import_id)?;
-    Some(SpanSource {
-        import_id: span.import_id,
-        byte_start: span.byte_start,
-        byte_end: span.byte_end,
-        archive_path: archive.archive_path,
-        filename: archive.filename,
-    })
-}
-
-pub(crate) fn blob_of(tables: &EngineTables, import_id: &str) -> Option<(String, String)> {
-    archive(tables, import_id).map(|a| (a.archive_path, a.hash))
-}
-
-/// Remove `import_id`'s archive and spans. A missing import is not an
-/// error, as a `DELETE` matching no row is not.
-pub(crate) fn remove(tables: &mut EngineTables, import_id: &str) -> Result<()> {
-    for span in spans_of(tables, import_id) {
-        deleted(tables.spans.delete(span))?;
+    /// An inner join, as the SQL is: a span whose import has no archive
+    /// has no source.
+    fn span_source(&self, memory_id: &str) -> Result<Option<SpanSource>> {
+        let Some(span) = self
+            .spans
+            .get(engine_id(memory_id))
+            .filter(|span| span.memory_id == memory_id)
+        else {
+            return Ok(None);
+        };
+        Ok(archive(self, &span.import_id).map(|archive| SpanSource {
+            import_id: span.import_id,
+            byte_start: span.byte_start,
+            byte_end: span.byte_end,
+            archive_path: archive.archive_path,
+            filename: archive.filename,
+        }))
     }
-    if archive(tables, import_id).is_some() {
-        deleted(tables.archives.delete(engine_id(import_id)))?;
+
+    fn blob_of(&self, import_id: &str) -> Result<Option<(String, String)>> {
+        Ok(archive(self, import_id).map(|a| (a.archive_path, a.hash)))
     }
-    Ok(())
-}
 
-pub(crate) fn count_with_hash(tables: &EngineTables, hash: &str) -> usize {
-    FilterEq::<ArchiveRecord, ByHash>::filter_eq(&tables.archives, &hash.to_string()).len()
-}
+    fn remove(&mut self, import_id: &str) -> Result<()> {
+        for span in spans_of(self, import_id) {
+            deleted(self.spans.delete(span))?;
+        }
+        if archive(self, import_id).is_some() {
+            deleted(self.archives.delete(engine_id(import_id)))?;
+        }
+        Ok(())
+    }
 
-/// Every archive, oldest `archived_at` first. The text is compared as SQLite
-/// compares it; archives recorded at the same instant come in import-id
-/// order, where SQLite leaves them unspecified.
-pub(crate) fn oldest_first(tables: &EngineTables) -> Vec<ArchiveRow> {
-    let mut records: Vec<ArchiveRecord> = tables
-        .archives
-        .all_ids()
-        .into_iter()
-        .filter_map(|id| tables.archives.get(id))
-        .collect();
-    records.sort_by(|a, b| {
-        (a.archived_at.as_str(), a.import_id.as_str())
-            .cmp(&(b.archived_at.as_str(), b.import_id.as_str()))
-    });
-    records.iter().map(ArchiveRecord::to_row).collect()
-}
+    fn count_with_hash(&self, hash: &str) -> Result<usize> {
+        Ok(FilterEq::<ArchiveRecord, ByHash>::filter_eq(&self.archives, &hash.to_string()).len())
+    }
 
-/// How many spans are recorded: for `import_id`, or in all.
-pub(crate) fn span_count(tables: &EngineTables, import_id: Option<&str>) -> usize {
-    match import_id {
-        Some(import_id) => spans_of(tables, import_id).len(),
-        None => tables.spans.all_ids().len(),
+    /// Archives recorded at the same instant come in import-id order, where
+    /// SQLite leaves them unspecified.
+    fn oldest_first(&self) -> Result<Vec<ArchiveRow>> {
+        let mut records: Vec<ArchiveRecord> = self
+            .archives
+            .all_ids()
+            .into_iter()
+            .filter_map(|id| self.archives.get(id))
+            .collect();
+        records.sort_by(|a, b| {
+            (a.archived_at.as_str(), a.import_id.as_str())
+                .cmp(&(b.archived_at.as_str(), b.import_id.as_str()))
+        });
+        Ok(records.iter().map(ArchiveRecord::to_row).collect())
+    }
+
+    fn span_count(&self, import_id: Option<&str>) -> Result<usize> {
+        Ok(match import_id {
+            Some(import_id) => spans_of(self, import_id).len(),
+            None => self.spans.all_ids().len(),
+        })
     }
 }
 
@@ -239,6 +238,12 @@ fn archive(tables: &EngineTables, import_id: &str) -> Option<ArchiveRecord> {
 
 fn spans_of(tables: &EngineTables, import_id: &str) -> Vec<Uuid> {
     FilterEq::<SpanRecord, ByImport>::filter_eq(&tables.spans, &import_id.to_string())
+}
+
+#[cfg(test)]
+mod conformance_tests {
+    use super::EngineTables;
+    crate::db::archives::archive_conformance!(EngineTables::open_temporary().unwrap());
 }
 
 #[cfg(test)]
@@ -265,15 +270,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         {
             let mut tables = EngineTables::open(&dir).unwrap();
-            record(&mut tables, &row("a", "2026-09-01T00:00:00+00:00")).unwrap();
-            record_span(&mut tables, "m1", "a", 0, 5).unwrap();
+            tables
+                .record(&row("a", "2026-09-01T00:00:00+00:00"))
+                .unwrap();
+            tables.record_span("m1", "a", 0, 5).unwrap();
         }
         let tables = crate::db::engine::reopen(&dir);
         assert_eq!(
-            oldest_first(&tables),
+            tables.oldest_first().unwrap(),
             vec![row("a", "2026-09-01T00:00:00+00:00")]
         );
-        assert_eq!(span_source(&tables, "m1").unwrap().byte_end, 5);
+        assert_eq!(tables.span_source("m1").unwrap().unwrap().byte_end, 5);
         drop(tables);
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -282,9 +289,11 @@ mod tests {
     fn ties_in_archived_at_come_in_import_id_order() {
         let mut tables = EngineTables::open_temporary().unwrap();
         for id in ["c", "a", "b"] {
-            record(&mut tables, &row(id, "2026-09-01")).unwrap();
+            tables.record(&row(id, "2026-09-01")).unwrap();
         }
-        let ids: Vec<String> = oldest_first(&tables)
+        let ids: Vec<String> = tables
+            .oldest_first()
+            .unwrap()
             .into_iter()
             .map(|r| r.import_id)
             .collect();
