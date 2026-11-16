@@ -848,8 +848,209 @@ impl<'c> Memories<'c> {
     }
 }
 
+/// The behaviour every [`MemoryStore`] must show, run against each backend
+/// by [`memory_conformance`] (ADR-0035).
+#[cfg(test)]
+pub(crate) mod conformance {
+    use super::{AccessInputs, Memory, MemoryEdit, MemoryStore, NewMemory};
+    use serde_json::Value;
+
+    pub(crate) const NOW: &str = "2026-09-26T00:00:00+00:00";
+
+    /// The one memory `id`, which must exist.
+    fn get<S: MemoryStore>(store: &S, id: &str) -> Memory {
+        let mut found = store.get_many(&[id.to_string()]).unwrap();
+        assert_eq!(found.len(), 1, "memory {id}");
+        found.remove(0)
+    }
+
+    pub(crate) fn insert_refuses_a_taken_id_and_insert_or_ignore_reports_it<S: MemoryStore>(
+        store: &mut S,
+    ) {
+        let row = NewMemory::new("a", "first", NOW);
+
+        assert!(store.insert_or_ignore(&row).unwrap());
+        assert!(store.insert(&row).is_err());
+        let second = NewMemory::new("a", "second", NOW);
+        assert!(!store.insert_or_ignore(&second).unwrap());
+        assert_eq!(get(store, "a").content, "first");
+    }
+
+    pub(crate) fn a_synced_overwrite_keeps_created_at_and_the_chunk_position<S: MemoryStore>(
+        store: &mut S,
+    ) {
+        store
+            .insert(&NewMemory {
+                doc_id: Some("imp_1".to_string()),
+                chunk_index: Some(3),
+                ..NewMemory::new("a", "local", NOW)
+            })
+            .unwrap();
+
+        let later = "2026-09-27T00:00:00+00:00";
+        store
+            .upsert_synced(&NewMemory {
+                created_at: later.to_string(),
+                tags: vec!["peer".to_string()],
+                ..NewMemory::new("a", "remote", later)
+            })
+            .unwrap();
+
+        let a = get(store, "a");
+        assert_eq!(a.content, "remote");
+        assert_eq!(a.created_at, NOW);
+        assert_eq!(a.doc_id.as_deref(), Some("imp_1"));
+        assert_eq!(a.chunk_index, Some(3));
+        assert_eq!(a.tags, ["peer"]);
+    }
+
+    pub(crate) fn access_inputs_skips_unknown_ids_and_takes_an_empty_list<S: MemoryStore>(
+        store: &mut S,
+    ) {
+        store.insert(&NewMemory::new("a", "x", NOW)).unwrap();
+
+        assert!(store.access_inputs(&[]).unwrap().is_empty());
+        let found = store
+            .access_inputs(&["a".to_string(), "missing".to_string(), "a".to_string()])
+            .unwrap();
+        assert_eq!(
+            found,
+            vec![AccessInputs {
+                id: "a".to_string(),
+                access_count: 0,
+                decay_rate: 0.1,
+                base_weight: 1.0,
+            }]
+        );
+    }
+
+    /// `row` with every schema v32 column set to a value no default has.
+    pub(crate) fn with_every_v32_column(row: NewMemory) -> NewMemory {
+        let text = |s: &str| Some(s.to_string());
+        NewMemory {
+            project: text("quokka"),
+            session_id: text("sess-1"),
+            git_remote: text("github.com/o/r"),
+            git_branch: text("feature/x"),
+            git_sha: text("0123abcd"),
+            cwd: text("/work/quokka"),
+            valid_from: text("2026-09-01T00:00:00+00:00"),
+            valid_until: text("2026-12-01T00:00:00+00:00"),
+            confidence: 0.75,
+            verified_at: text("2026-09-27T00:00:00+00:00"),
+            outcome: text("done"),
+            written_by: "model:test".into(),
+            capture_method: "auto".into(),
+            ..row
+        }
+    }
+
+    /// Every schema v32 column of `memory`, as JSON, in a fixed order.
+    fn v32_columns(memory: &Memory) -> Value {
+        serde_json::json!([
+            memory.project,
+            memory.session_id,
+            memory.git_remote,
+            memory.git_branch,
+            memory.git_sha,
+            memory.cwd,
+            memory.valid_from,
+            memory.valid_until,
+            memory.confidence,
+            memory.verified_at,
+            memory.outcome,
+            memory.written_by,
+            memory.capture_method,
+        ])
+    }
+
+    /// A row with every v32 column set reads back with every one as
+    /// written, one with none set reads back the schema's defaults, and an
+    /// edit writes only the columns it sets.
+    pub(crate) fn every_v32_column_reads_back_as_written<S: MemoryStore>(store: &mut S) {
+        let written = with_every_v32_column(NewMemory::new("ctx", "x", NOW));
+        store.insert(&written).unwrap();
+        store.insert(&NewMemory::new("plain", "y", NOW)).unwrap();
+
+        assert_eq!(
+            v32_columns(&get(store, "ctx")),
+            serde_json::json!([
+                "quokka",
+                "sess-1",
+                "github.com/o/r",
+                "feature/x",
+                "0123abcd",
+                "/work/quokka",
+                "2026-09-01T00:00:00+00:00",
+                "2026-12-01T00:00:00+00:00",
+                0.75,
+                "2026-09-27T00:00:00+00:00",
+                "done",
+                "model:test",
+                "auto",
+            ])
+        );
+        assert_eq!(
+            v32_columns(&get(store, "plain")),
+            serde_json::json!([
+                null, null, null, null, null, null, null, null, 1.0, null, null, "unknown",
+                "manual"
+            ])
+        );
+
+        store
+            .apply_edit(
+                "plain",
+                &MemoryEdit {
+                    project: Some("edited".into()),
+                    confidence: Some(0.5),
+                    outcome: Some("abandoned".into()),
+                    written_by: Some("human".into()),
+                    ..MemoryEdit::at(NOW)
+                },
+            )
+            .unwrap();
+        let edited = get(store, "plain");
+        assert_eq!(edited.project.as_deref(), Some("edited"));
+        assert_eq!(edited.confidence, 0.5);
+        assert_eq!(edited.outcome.as_deref(), Some("abandoned"));
+        assert_eq!(edited.written_by, "human");
+        assert_eq!(edited.capture_method, "manual");
+        assert_eq!(edited.session_id, None);
+    }
+}
+
+/// One `#[test]` per [`conformance`] check, each on a fresh store from
+/// `$make`.
+#[cfg(test)]
+macro_rules! memory_conformance {
+    ($make:expr) => {
+        use $crate::db::memories::conformance;
+
+        #[test]
+        fn insert_refuses_a_taken_id_and_insert_or_ignore_reports_it() {
+            conformance::insert_refuses_a_taken_id_and_insert_or_ignore_reports_it(&mut $make);
+        }
+        #[test]
+        fn a_synced_overwrite_keeps_created_at_and_the_chunk_position() {
+            conformance::a_synced_overwrite_keeps_created_at_and_the_chunk_position(&mut $make);
+        }
+        #[test]
+        fn access_inputs_skips_unknown_ids_and_takes_an_empty_list() {
+            conformance::access_inputs_skips_unknown_ids_and_takes_an_empty_list(&mut $make);
+        }
+        #[test]
+        fn every_v32_column_reads_back_as_written() {
+            conformance::every_v32_column_reads_back_as_written(&mut $make);
+        }
+    };
+}
+#[cfg(test)]
+pub(crate) use memory_conformance;
+
 #[cfg(test)]
 mod tests {
+    use super::conformance::with_every_v32_column;
     use super::*;
     use crate::db::derived::Origin;
     use crate::db::outbox::Outbox;
@@ -861,59 +1062,6 @@ mod tests {
     /// Run `test` on a fresh in-memory database.
     fn on_engine(mut test: impl FnMut(&Database)) {
         test(&Database::open_in_memory().unwrap());
-    }
-
-    /// The one memory `id`, which must exist.
-    fn get(memories: &Memories<'_>, id: &str) -> Memory {
-        let mut found = memories.get_many(&[id.to_string()]).unwrap();
-        assert_eq!(found.len(), 1, "memory {id}");
-        found.remove(0)
-    }
-
-    #[test]
-    fn insert_refuses_a_taken_id_and_insert_or_ignore_reports_it() {
-        on_engine(|db| {
-            let store = db.store();
-            let memories = Memories::new(&store);
-            let row = NewMemory::new("a", "first", NOW);
-
-            assert!(memories.insert_or_ignore(&row).unwrap());
-            assert!(memories.insert(&row).is_err());
-            let second = NewMemory::new("a", "second", NOW);
-            assert!(!memories.insert_or_ignore(&second).unwrap());
-            assert_eq!(get(&memories, "a").content, "first");
-        });
-    }
-
-    #[test]
-    fn a_synced_overwrite_keeps_created_at_and_the_chunk_position() {
-        on_engine(|db| {
-            let store = db.store();
-            let memories = Memories::new(&store);
-            memories
-                .insert(&NewMemory {
-                    doc_id: Some("imp_1".to_string()),
-                    chunk_index: Some(3),
-                    ..NewMemory::new("a", "local", NOW)
-                })
-                .unwrap();
-
-            let later = "2026-09-27T00:00:00+00:00";
-            memories
-                .upsert_synced(&NewMemory {
-                    created_at: later.to_string(),
-                    tags: vec!["peer".to_string()],
-                    ..NewMemory::new("a", "remote", later)
-                })
-                .unwrap();
-
-            let a = get(&memories, "a");
-            assert_eq!(a.content, "remote");
-            assert_eq!(a.created_at, NOW);
-            assert_eq!(a.doc_id.as_deref(), Some("imp_1"));
-            assert_eq!(a.chunk_index, Some(3));
-            assert_eq!(a.tags, ["peer"]);
-        });
     }
 
     #[test]
@@ -931,29 +1079,6 @@ mod tests {
                 .sync_view("missing")
                 .unwrap()
                 .is_none());
-        });
-    }
-
-    #[test]
-    fn access_inputs_skips_unknown_ids_and_takes_an_empty_list() {
-        on_engine(|db| {
-            let store = db.store();
-            let memories = Memories::new(&store);
-            memories.insert(&NewMemory::new("a", "x", NOW)).unwrap();
-
-            assert!(memories.access_inputs(&[]).unwrap().is_empty());
-            let found = memories
-                .access_inputs(&["a".to_string(), "missing".to_string(), "a".to_string()])
-                .unwrap();
-            assert_eq!(
-                found,
-                vec![AccessInputs {
-                    id: "a".to_string(),
-                    access_count: 0,
-                    decay_rate: 0.1,
-                    base_weight: 1.0,
-                }]
-            );
         });
     }
 
@@ -1102,107 +1227,6 @@ mod tests {
             views: ids.iter().map(|id| m.sync_view(id).unwrap()).collect(),
             outbox,
         }
-    }
-
-    /// `row` with every schema v32 column set to a value no default has.
-    fn with_every_v32_column(row: NewMemory) -> NewMemory {
-        let text = |s: &str| Some(s.to_string());
-        NewMemory {
-            project: text("quokka"),
-            session_id: text("sess-1"),
-            git_remote: text("github.com/o/r"),
-            git_branch: text("feature/x"),
-            git_sha: text("0123abcd"),
-            cwd: text("/work/quokka"),
-            valid_from: text("2026-09-01T00:00:00+00:00"),
-            valid_until: text("2026-12-01T00:00:00+00:00"),
-            confidence: 0.75,
-            verified_at: text("2026-09-27T00:00:00+00:00"),
-            outcome: text("done"),
-            written_by: "model:test".into(),
-            capture_method: "auto".into(),
-            ..row
-        }
-    }
-
-    /// Every schema v32 column of `memory`, as JSON, in a fixed order.
-    fn v32_columns(memory: &Memory) -> Value {
-        serde_json::json!([
-            memory.project,
-            memory.session_id,
-            memory.git_remote,
-            memory.git_branch,
-            memory.git_sha,
-            memory.cwd,
-            memory.valid_from,
-            memory.valid_until,
-            memory.confidence,
-            memory.verified_at,
-            memory.outcome,
-            memory.written_by,
-            memory.capture_method,
-        ])
-    }
-
-    /// A row with every v32 column set reads back with every one as
-    /// written, and one with none set reads back the schema's defaults.
-    #[test]
-    fn every_v32_column_reads_back_as_written_on_both_stores() {
-        on_engine(|db| {
-            let store = db.store();
-            let m = Memories::new(&store);
-            let written = with_every_v32_column(NewMemory::new("ctx", "x", NOW));
-            m.insert(&written).unwrap();
-            m.insert(&NewMemory::new("plain", "y", NOW)).unwrap();
-
-            let read = get(&m, "ctx");
-            assert_eq!(
-                v32_columns(&read),
-                serde_json::json!([
-                    "quokka",
-                    "sess-1",
-                    "github.com/o/r",
-                    "feature/x",
-                    "0123abcd",
-                    "/work/quokka",
-                    "2026-09-01T00:00:00+00:00",
-                    "2026-12-01T00:00:00+00:00",
-                    0.75,
-                    "2026-09-27T00:00:00+00:00",
-                    "done",
-                    "model:test",
-                    "auto",
-                ])
-            );
-            let plain = get(&m, "plain");
-            assert_eq!(
-                v32_columns(&plain),
-                serde_json::json!([
-                    null, null, null, null, null, null, null, null, 1.0, null, null, "unknown",
-                    "manual"
-                ])
-            );
-
-            // The edit's setters write each column; the rest stay.
-            m.apply_edit(
-                "plain",
-                &MemoryEdit {
-                    project: Some("edited".into()),
-                    confidence: Some(0.5),
-                    outcome: Some("abandoned".into()),
-                    written_by: Some("human".into()),
-                    ..MemoryEdit::at(NOW)
-                },
-            )
-            .unwrap();
-            let edited = get(&m, "plain");
-            assert_eq!(edited.project.as_deref(), Some("edited"));
-            assert_eq!(edited.confidence, 0.5);
-            assert_eq!(edited.outcome.as_deref(), Some("abandoned"));
-            assert_eq!(edited.written_by, "human");
-            assert_eq!(edited.capture_method, "manual");
-            assert_eq!(edited.session_id, None);
-        });
     }
 
     /// Lists, edits and deletes on `db`, and what each read returns after.

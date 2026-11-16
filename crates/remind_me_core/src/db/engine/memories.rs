@@ -1767,3 +1767,9 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
+
+#[cfg(test)]
+mod conformance_tests {
+    use super::EngineTables;
+    crate::db::memories::memory_conformance!(EngineTables::open_temporary().unwrap());
+}
