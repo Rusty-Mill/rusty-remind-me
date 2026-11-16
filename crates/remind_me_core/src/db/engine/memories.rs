@@ -1,7 +1,9 @@
 //! Memories on the engine (ADR-0023, core PR 1): the rows, the
 //! full-text and tag indexes derived from them, and every write
 //! [`crate::db::memories`] makes, with its outbox entry committed in the
-//! same journal batch.
+//! same journal batch. The engine's adapter for the [`MemoryStore`] port
+//! (ADR-0035) is at the end; the functions it calls stay free because the
+//! other adapters over the memories core use them too.
 //!
 //! A row keeps each column as SQLite stores it: `tags` and `metadata` stay
 //! JSON text, so a malformed value reads back the same way on both
@@ -17,8 +19,8 @@ use crate::db::derived::Origin;
 use crate::db::feedback::Importance;
 use crate::db::history::Tracked;
 use crate::db::memories::{
-    tags_json, AccessInputs, CreatedMemory, KeywordFilter, ListFilter, MemoryEdit, NewMemory,
-    PageFilter, SyncView, Triple,
+    tags_json, AccessInputs, CreatedMemory, KeywordFilter, ListFilter, MemoryEdit, MemoryStore,
+    NewMemory, PageFilter, SyncView, Triple,
 };
 use crate::db::Result;
 use crate::models::{Memory, UnannotatedMemory, UnclassifiedMemory};
@@ -1378,6 +1380,217 @@ pub(crate) fn rebuild(tables: &mut EngineTables) -> Result<()> {
     core.search = search;
     core.tags = tags;
     Ok(())
+}
+
+impl MemoryStore for EngineTables {
+    fn insert(&mut self, row: &NewMemory) -> Result<()> {
+        insert(self, row)
+    }
+
+    fn insert_or_ignore(&mut self, row: &NewMemory) -> Result<bool> {
+        insert_or_ignore(self, row)
+    }
+
+    fn upsert_synced(&mut self, row: &NewMemory) -> Result<()> {
+        upsert_synced(self, row)
+    }
+
+    fn sync_view(&self, id: &str) -> Result<Option<SyncView>> {
+        sync_view(self, id)
+    }
+
+    fn set_tags_and_metadata(&mut self, id: &str, tags: &[String], metadata: &Value) -> Result<()> {
+        set_tags_and_metadata(self, id, tags, metadata)
+    }
+
+    fn set_superseded_by(
+        &mut self,
+        id: &str,
+        superseded_by: &str,
+        updated_at: Option<&str>,
+    ) -> Result<()> {
+        set_superseded_by(self, id, superseded_by, updated_at)
+    }
+
+    fn supersede_import(
+        &mut self,
+        old_import_id: &str,
+        new_import_id: &str,
+        updated_at: &str,
+    ) -> Result<usize> {
+        supersede_import(self, old_import_id, new_import_id, updated_at)
+    }
+
+    fn delete_capture_category(&mut self, capture_id: &str, category: &str) -> Result<usize> {
+        delete_capture_category(self, capture_id, category)
+    }
+
+    fn set_merged(
+        &mut self,
+        id: &str,
+        content: &str,
+        access_count: i64,
+        tags: &[String],
+        updated_at: &str,
+    ) -> Result<()> {
+        set_merged(self, id, content, access_count, tags, updated_at)
+    }
+
+    fn set_vitality(&mut self, id: &str, vitality: f64, status: &str) -> Result<()> {
+        set_vitality(self, id, vitality, status)
+    }
+
+    fn access_inputs(&self, ids: &[String]) -> Result<Vec<AccessInputs>> {
+        access_inputs(self, ids)
+    }
+
+    fn record_access(
+        &mut self,
+        id: &str,
+        accessed_at: &str,
+        access_count: i64,
+        vitality: f64,
+        status: &str,
+    ) -> Result<()> {
+        record_access(self, id, accessed_at, access_count, vitality, status)
+    }
+
+    fn live_triples_except(&self, except_id: &str) -> Result<Vec<Triple>> {
+        live_triples_except(self, except_id)
+    }
+
+    fn live_created_after(
+        &self,
+        cutoff: &str,
+        after_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<CreatedMemory>> {
+        live_created_after(self, cutoff, after_id, limit)
+    }
+
+    fn count_live_created_after(&self, cutoff: &str, after_id: Option<&str>) -> Result<usize> {
+        count_live_created_after(self, cutoff, after_id)
+    }
+
+    fn get_many(&self, ids: &[String]) -> Result<Vec<Memory>> {
+        get_many(self, ids)
+    }
+
+    fn exists(&self, id: &str) -> Result<bool> {
+        exists(self, id)
+    }
+
+    fn sensitivity(&self, id: &str) -> Result<Option<bool>> {
+        sensitivity(self, id)
+    }
+
+    fn exportable(
+        &self,
+        include_deleted: bool,
+        category: Option<&str>,
+        tags: &[String],
+    ) -> Result<Vec<Memory>> {
+        exportable(self, include_deleted, category, tags)
+    }
+
+    fn all_live(&self) -> Result<Vec<Memory>> {
+        all_live(self)
+    }
+
+    fn live_of_type(&self, memory_type: &str) -> Result<Vec<Memory>> {
+        live_of_type(self, memory_type)
+    }
+
+    fn with_predicate_prefix(&self, prefix: &str) -> Result<Vec<Memory>> {
+        with_predicate_prefix(self, prefix)
+    }
+
+    fn get_live(&self, id: &str) -> Result<Option<Memory>> {
+        get_live(self, id)
+    }
+
+    fn list_page(
+        &self,
+        filter: &ListFilter,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(usize, Vec<Memory>)> {
+        list_page(self, filter, limit, offset)
+    }
+
+    fn apply_edit(&mut self, id: &str, edit: &MemoryEdit) -> Result<()> {
+        apply_edit(self, id, edit)
+    }
+
+    fn empty_tombstones(&mut self) -> Result<usize> {
+        empty_tombstones(self)
+    }
+
+    fn delete_live(&mut self, id: &str, tombstone_at: Option<&str>) -> Result<bool> {
+        delete_live(self, id, tombstone_at)
+    }
+
+    fn of_type_page(
+        &self,
+        memory_type: &str,
+        limit: usize,
+    ) -> Result<(usize, Vec<UnclassifiedMemory>)> {
+        of_type_page(self, memory_type, limit)
+    }
+
+    fn keyword_hits(
+        &self,
+        phrases: &[String],
+        filter: &KeywordFilter,
+        limit: usize,
+    ) -> Result<Vec<(Memory, f64)>> {
+        if phrases.is_empty() {
+            return Ok(Vec::new());
+        }
+        keyword_hits(self, phrases, filter, limit)
+    }
+
+    fn window_hits(&self, filter: &KeywordFilter) -> Result<Vec<Memory>> {
+        window_hits(self, filter)
+    }
+
+    fn sensitive_ids(&self) -> Result<HashSet<String>> {
+        sensitive_ids(self)
+    }
+
+    fn keyword_page(
+        &self,
+        phrases: &[String],
+        filter: &PageFilter,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(usize, Vec<Memory>)> {
+        let linked = match &filter.entity {
+            Some(scope) => super::graph::linked_ids(self, &scope.id)?,
+            None => HashSet::new(),
+        };
+        keyword_page(self, phrases, filter, &linked, limit, offset)
+    }
+
+    fn unannotated_page(&self, limit: usize) -> Result<(usize, Vec<UnannotatedMemory>)> {
+        unannotated_page(self, limit)
+    }
+
+    fn with_code_refs(&self) -> Result<Vec<(String, String, String)>> {
+        with_code_refs(self)
+    }
+
+    fn with_valid_until(&self) -> Result<Vec<(String, String, String)>> {
+        with_valid_until(self)
+    }
+
+    fn capture_links(&self, id: &str) -> Result<(Vec<String>, Vec<String>)> {
+        capture_links(self, id)
+    }
+
+    fn set_ingest_marker(&mut self, doc_id: &str, marker: &str) -> Result<usize> {
+        set_ingest_marker(self, doc_id, marker)
+    }
 }
 
 #[cfg(test)]
