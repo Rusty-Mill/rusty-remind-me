@@ -993,6 +993,7 @@ fn resolve_narrowing(store: &Store<'_>, input: &MemorySearchInput) -> Result<Opt
         entity,
         topic,
         repo: clean(&input.filters.repo).and_then(crate::context::normalize_remote),
+        projectless: false,
     }))
 }
 

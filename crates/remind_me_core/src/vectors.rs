@@ -298,6 +298,54 @@ pub fn nearest_admitted(
     scan_and_score(store, query_vector, limit, category, None, admit)
 }
 
+/// The memories among `ids` whose best chunk is nearest `query_vector`,
+/// highest first, keeping only those `admit` accepts, at most `limit`. Each
+/// id's chunks are read by key, so the cost is bounded by `ids`, never by
+/// the store. Empty `ids` or an empty vector finds nothing.
+pub fn nearest_among(
+    store: &Store<'_>,
+    query_vector: &[f32],
+    limit: usize,
+    ids: &[String],
+    admit: &dyn Fn(&Memory) -> bool,
+) -> SqlResult<Vec<(Memory, f32)>> {
+    if query_vector.is_empty() {
+        return Ok(Vec::new());
+    }
+    let vectors = Vectors::new(store);
+    let mut scored = Vec::with_capacity(ids.len());
+    for id in ids {
+        let Some(memory) = crate::db::queries::get_memory_by_id(store, id)? else {
+            continue;
+        };
+        if memory.deleted_at.is_some() || !admit(&memory) {
+            continue;
+        }
+        let best = vectors
+            .chunks_for(id)?
+            .into_iter()
+            .filter_map(|chunk| similarity(query_vector, &le_bytes_to_f32(&chunk.embedding)))
+            .reduce(f32::max);
+        if let Some(best) = best {
+            scored.push((memory, best));
+        }
+    }
+    scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+    scored.truncate(limit);
+    Ok(scored)
+}
+
+/// The dot product of two normalised vectors, or `None` when their
+/// dimensions differ or the result is not finite (a NaN vector stored before
+/// elements were checked, #352).
+fn similarity(query: &[f32], vector: &[f32]) -> Option<f32> {
+    if vector.len() != query.len() {
+        return None;
+    }
+    let dot: f32 = query.iter().zip(vector).map(|(a, b)| a * b).sum();
+    dot.is_finite().then_some(dot)
+}
+
 /// The vector of `memory_id`'s first chunk, if it has been embedded.
 pub fn first_chunk_vector(store: &Store<'_>, memory_id: &str) -> SqlResult<Option<Vec<f32>>> {
     let chunks = Vectors::new(store).chunks_for(memory_id)?;
@@ -332,23 +380,11 @@ fn scan_and_score(
         embedding: bytes,
     } in chunks
     {
-        let vector = le_bytes_to_f32(&bytes);
-        if vector.len() != query_vector.len() {
-            // A stale vector from a dimension this store no longer embeds
-            // at — skip it rather than let a mismatched dot product either
-            // panic or silently misrank.
+        // A stale vector from another dimension, or a non-finite one, has
+        // no place in the ranking.
+        let Some(similarity) = similarity(query_vector, &le_bytes_to_f32(&bytes)) else {
             continue;
-        }
-        let similarity: f32 = query_vector
-            .iter()
-            .zip(vector.iter())
-            .map(|(a, b)| a * b)
-            .sum();
-        if !similarity.is_finite() {
-            // A NaN or infinite vector stored before elements were checked
-            // (#352) has no place in the ranking.
-            continue;
-        }
+        };
         best_by_memory
             .entry(memory_id)
             .and_modify(|best| {

@@ -23,14 +23,16 @@
 //!
 //! # Cost
 //!
-//! Two bounded lookups, no model call: one full-text query over at most
-//! [`MAX_QUERY_TERMS`] of the new text's words returning [`POOL`] hits, and,
-//! only when the new memory already has a stored vector, one nearest-neighbour
-//! scan with that vector (the ANN index narrows it when built). Nothing is
-//! embedded here: `remind_me_add` embeds before this runs, so the semantic
-//! side reuses that vector. A memory with no vector (no embedder, or a fact
-//! from `remind_me_decompose`, which does not embed) gets the keyword side
-//! only. Budget: well under the write's own embedding round trip, about the
+//! Two bounded lookups, no model call and never a scan of the store: one
+//! full-text query over at most [`MAX_QUERY_TERMS`] of the new text's words
+//! returning [`POOL`] hits, and, only when the new memory already has a stored
+//! vector, exact similarity against a bounded set of ids: the keyword hits
+//! plus what the last built ANN index proposes. Without a built index a
+//! paraphrase sharing no word with the new text is missed; that is the price
+//! of the bound. Nothing is embedded here: `remind_me_add` embeds before this
+//! runs, so the semantic side reuses that vector. A memory with no vector (no
+//! embedder, or a fact from `remind_me_decompose`, which does not embed) gets
+//! the keyword side only. Budget: well under the write's own embedding round trip, about the
 //! cost of one compact `remind_me_search`.
 
 use crate::db::memories::{KeywordFilter, Memories};
@@ -145,7 +147,10 @@ fn side_of(memory: &Memory) -> ContradictionSide {
     }
 }
 
-/// Keyword candidates: the full-text hits for the new text's words.
+/// Keyword candidates: the full-text hits for the new text's words, in the
+/// new memory's project. A projectless memory is narrowed to projectless
+/// hits before the limit, since an unset scope would admit every project and
+/// let other projects' hits fill the pool.
 fn keyword_pool(store: &Store<'_>, saved: &Memory) -> Result<Vec<Memory>> {
     let terms = query_terms(&saved.content);
     if terms.is_empty() {
@@ -156,6 +161,7 @@ fn keyword_pool(store: &Store<'_>, saved: &Memory) -> Result<Vec<Memory>> {
         ..Default::default()
     };
     filter.scope.project = saved.project.clone();
+    filter.narrowing.projectless = saved.project.is_none();
     // One extra, since the new memory itself is the likeliest hit.
     let hits = Memories::new(store).keyword_hits(&terms, &filter, POOL + 1)?;
     Ok(hits
@@ -165,13 +171,28 @@ fn keyword_pool(store: &Store<'_>, saved: &Memory) -> Result<Vec<Memory>> {
         .collect())
 }
 
-/// Semantic candidates, with their similarity: the nearest neighbours of the
-/// new memory's stored first-chunk vector. Empty when it has none.
-fn semantic_pool(store: &Store<'_>, saved: &Memory) -> Result<Vec<(Memory, f32)>> {
+/// Semantic candidates, with their similarity: the new memory's stored
+/// first-chunk vector scored against a bounded set of ids, the keyword pool's
+/// plus what the last built ANN index proposes. The index is always stale
+/// here (this write just added a vector), so it is read as of its build; with
+/// no index only the keyword pool is scored. Never a scan of every chunk.
+/// Empty when the new memory has no vector.
+fn semantic_pool(
+    store: &Store<'_>,
+    saved: &Memory,
+    keyword: &[Memory],
+) -> Result<Vec<(Memory, f32)>> {
     let Some(vector) = crate::vectors::first_chunk_vector(store, &saved.id)? else {
         return Ok(Vec::new());
     };
-    crate::vectors::nearest_admitted(store, &vector, POOL, None, &|m| admissible(saved, m))
+    let mut ids: Vec<String> =
+        crate::ann_index::stale_candidates(store, &vector, POOL).unwrap_or_default();
+    for memory in keyword {
+        if !ids.contains(&memory.id) {
+            ids.push(memory.id.clone());
+        }
+    }
+    crate::vectors::nearest_among(store, &vector, POOL, &ids, &|m| admissible(saved, m))
 }
 
 /// The memories `memory_id` may duplicate: highest score first, then newest,
@@ -180,11 +201,12 @@ pub fn near_duplicates(store: &Store<'_>, memory_id: &str) -> Result<Vec<Duplica
     let Some(saved) = Memories::new(store).get_live(memory_id)? else {
         return Ok(Vec::new());
     };
+    let keyword = keyword_pool(store, &saved)?;
     let mut pool: HashMap<String, (Memory, Option<f32>)> = HashMap::new();
-    for (memory, cosine) in semantic_pool(store, &saved)? {
+    for (memory, cosine) in semantic_pool(store, &saved, &keyword)? {
         pool.insert(memory.id.clone(), (memory, Some(cosine)));
     }
-    for memory in keyword_pool(store, &saved)? {
+    for memory in keyword {
         pool.entry(memory.id.clone()).or_insert((memory, None));
     }
 

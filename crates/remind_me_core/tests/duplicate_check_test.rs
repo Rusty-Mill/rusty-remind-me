@@ -1,6 +1,7 @@
 //! The near-duplicate check on save (Mill Board #1486).
 
 use remind_me_core::capture::{auto_capture, decompose};
+use remind_me_core::db::memories::{Memories, NewMemory};
 use remind_me_core::db::queries;
 use remind_me_core::db::{Store, StoreError};
 use remind_me_core::duplicates::{check_on_save, duplicate_check};
@@ -58,6 +59,16 @@ fn add_in(store: &Store<'_>, content: &str, project: &str, sensitive: bool) -> S
     .id
 }
 
+/// A memory with no project, inserted directly: an add would infer one from
+/// the working directory.
+fn add_projectless(store: &Store<'_>, content: &str, id: &str) -> String {
+    let now = chrono::Utc::now().to_rfc3339();
+    Memories::new(store)
+        .insert(&NewMemory::new(id, content, &now))
+        .unwrap();
+    id.to_string()
+}
+
 fn add(store: &Store<'_>, content: &str) -> String {
     add_in(store, content, "alpha", false)
 }
@@ -100,6 +111,23 @@ fn a_paraphrase_is_returned_by_embedding() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
     let old = add(&store, "The cat sleeps on the sofa");
+    // One shared word, far below the keyword bar: found by its vector.
+    let new = add(&store, "A feline naps upstairs on the sofa");
+    for (id, text) in [
+        (&old, "The cat sleeps on the sofa"),
+        (&new, "A feline naps upstairs on the sofa"),
+    ] {
+        embed_and_store(&store, &TopicEmbedder, id, text).unwrap();
+    }
+
+    assert_eq!(found(&store, &new), vec![(old, DuplicateReason::Semantic)]);
+}
+
+#[test]
+fn without_an_index_a_paraphrase_sharing_no_word_is_not_scanned_for() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let old = add(&store, "The cat sleeps on the sofa");
     let new = add(&store, "A feline naps upstairs");
     for (id, text) in [
         (&old, "The cat sleeps on the sofa"),
@@ -108,7 +136,8 @@ fn a_paraphrase_is_returned_by_embedding() {
         embed_and_store(&store, &TopicEmbedder, id, text).unwrap();
     }
 
-    assert_eq!(found(&store, &new), vec![(old, DuplicateReason::Semantic)]);
+    // The semantic side scores a bounded set of ids, never every chunk.
+    assert!(found(&store, &new).is_empty());
 }
 
 #[test]
@@ -129,6 +158,20 @@ fn a_duplicate_in_another_project_is_not_returned() {
     let new = add(&store, "Releases go out on Tuesdays");
 
     assert!(found(&store, &new).is_empty());
+}
+
+#[test]
+fn a_projectless_duplicate_is_found_past_many_hits_in_other_projects() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let text = "Releases go out on Tuesdays";
+    for i in 0..30 {
+        add_in(&store, text, &format!("project-{i}"), false);
+    }
+    let old = add_projectless(&store, text, "old");
+    let new = add_projectless(&store, text, "new");
+
+    assert_eq!(found(&store, &new), vec![(old, DuplicateReason::Exact)]);
 }
 
 #[test]
