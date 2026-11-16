@@ -7,7 +7,7 @@ Dated entries, newest first. One entry per merged pull request.
 ### Changed
 - `db::saved_searches::SavedSearchStore` is the first storage port: the one interface a backend implements for the saved-search tables. The engine implements it (`impl SavedSearchStore for EngineTables`), replacing that group's free functions, and `SavedSearches` locks per call and goes through it. No behaviour, schema or caller changes.
 - `db::reminders::ReminderStore` is the second port, implemented by the engine in `db::engine::reminders`. `set_remind_at` and the liveness check move behind it from the memories module's direct calls. `in_window` takes a `usize` limit; `Reminders::in_window` still takes an `i64`, and a negative one still returns nothing.
-- `docs/adr/0035-storage-port-one-trait-per-table-group.md`: one port per table group, the engine as an adapter, a shared conformance suite per port, one group per PR, and the store holding a backend as the last step, so the R3 benchmark can run the suite on another store. It records that R2's golden set already exists (`retrieval_eval_test`, 82 queries).
+- `docs/adr/0035-storage-port-one-trait-per-table-group.md`: one port per table group, the engine as an adapter, a shared conformance suite per port, one group per commit (a few per PR), and the store holding a backend as the last step, so the R3 benchmark can run the suite on another store. It records that R2's golden set already exists (`retrieval_eval_test`, 82 queries).
 
 ### Tests
 - The saved-search repository tests become a conformance suite over `&mut dyn SavedSearchStore` (`saved_search_conformance!`), run on temporary engine tables, plus a new check that every field round-trips. A repository test covers the facade.
