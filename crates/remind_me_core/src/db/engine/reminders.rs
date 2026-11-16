@@ -1,10 +1,11 @@
 //! Reminders on the engine core (ADR-0023, core PR 2c): the
-//! reminder reads over memories and the `reminder_deliveries` log.
-//! [`crate::db::reminders`] calls these when its store carries the core.
+//! reminder reads over memories and the `reminder_deliveries` log, as the
+//! engine's adapter for the [`ReminderStore`] port (ADR-0035).
 
 use super::core::{Change, CoreTables};
 use super::memories::{self, MemoryRow};
 use super::{core_ref, pair_engine_id, EngineTables};
+use crate::db::reminders::ReminderStore;
 use crate::db::Result;
 use crate::models::{Memory, ReminderWindow};
 use rusty_multimodal_db_engine::generic::query::GetById;
@@ -69,51 +70,77 @@ fn delivered(core: &CoreTables, memory_id: &str, remind_at: &str) -> bool {
         .is_some_and(|d| d.memory_id == memory_id && d.remind_at == remind_at)
 }
 
-/// Record a delivery, unless one is recorded for the same reminder: `INSERT
-/// OR IGNORE` on the unique pair.
-pub(crate) fn record_delivery(
-    tables: &mut EngineTables,
-    memory_id: &str,
-    remind_at: &str,
-    delivered_at: &str,
-) -> Result<()> {
-    if delivered(core_ref(tables)?, memory_id, remind_at) {
-        return Ok(());
+impl ReminderStore for EngineTables {
+    fn is_live(&self, memory_id: &str) -> Result<bool> {
+        Ok(memories::get_live(self, memory_id)?.is_some())
     }
-    let engine_id = pair_engine_id(memory_id, remind_at);
-    let record = DeliveryRecord {
-        engine_id,
-        memory_id: memory_id.to_string(),
-        remind_at: remind_at.to_string(),
-        delivered_at: delivered_at.to_string(),
-        slot: 0,
-    };
-    tables.commit(vec![Change::Delivery(engine_id, Some(record))])
+
+    fn set_remind_at(
+        &mut self,
+        memory_id: &str,
+        remind_at: Option<&str>,
+        updated_at: &str,
+    ) -> Result<()> {
+        memories::set_remind_at(self, memory_id, remind_at, updated_at)
+    }
+
+    /// Text comparison, as SQLite's.
+    fn in_window(&self, window: ReminderWindow, now: &str, limit: usize) -> Result<Vec<Memory>> {
+        let core = core_ref(self)?;
+        let due = |row: &MemoryRow, at: &str| {
+            let upcoming = at > now;
+            let overdue = at <= now && !delivered(core, &row.id, at);
+            match window {
+                ReminderWindow::Upcoming => upcoming,
+                ReminderWindow::Overdue => overdue,
+                ReminderWindow::All => upcoming || overdue,
+            }
+        };
+        let mut rows: Vec<MemoryRow> = memories::rows(core)
+            .filter(|row| row.deleted_at.is_none())
+            .filter(|row| row.remind_at.as_deref().is_some_and(|at| due(row, at)))
+            .collect();
+        rows.sort_by(|a, b| (&a.remind_at, &a.id).cmp(&(&b.remind_at, &b.id)));
+        Ok(rows.iter().take(limit).map(MemoryRow::to_memory).collect())
+    }
+
+    /// Unless one is recorded for the same reminder: `INSERT OR IGNORE` on
+    /// the unique pair.
+    fn record_delivery(
+        &mut self,
+        memory_id: &str,
+        remind_at: &str,
+        delivered_at: &str,
+    ) -> Result<()> {
+        if delivered(core_ref(self)?, memory_id, remind_at) {
+            return Ok(());
+        }
+        let engine_id = pair_engine_id(memory_id, remind_at);
+        let record = DeliveryRecord {
+            engine_id,
+            memory_id: memory_id.to_string(),
+            remind_at: remind_at.to_string(),
+            delivered_at: delivered_at.to_string(),
+            slot: 0,
+        };
+        self.commit(vec![Change::Delivery(engine_id, Some(record))])
+    }
 }
 
-/// What `Reminders::in_window` selects: live memories with a reminder in
-/// `window` as of `now` (text comparison, as SQLite's), soonest first, ties
-/// by id, at most `limit`.
-pub(crate) fn in_window(
-    tables: &EngineTables,
-    window: ReminderWindow,
-    now: &str,
-    limit: usize,
-) -> Result<Vec<Memory>> {
-    let core = core_ref(tables)?;
-    let due = |row: &MemoryRow, at: &str| {
-        let upcoming = at > now;
-        let overdue = at <= now && !delivered(core, &row.id, at);
-        match window {
-            ReminderWindow::Upcoming => upcoming,
-            ReminderWindow::Overdue => overdue,
-            ReminderWindow::All => upcoming || overdue,
+/// The port's shared behaviour, on fresh temporary engine tables.
+#[cfg(test)]
+mod conformance_tests {
+    use super::EngineTables;
+    use crate::db::memories::NewMemory;
+    use crate::db::reminders::conformance::NOW;
+
+    crate::db::reminders::reminder_conformance!(
+        EngineTables::open_temporary().unwrap(),
+        |tables: &mut EngineTables, id: &str| {
+            super::memories::insert(tables, &NewMemory::new(id, "x", NOW)).unwrap();
+        },
+        |tables: &mut EngineTables, id: &str| {
+            super::memories::delete_live(tables, id, Some(NOW)).unwrap();
         }
-    };
-    let mut rows: Vec<MemoryRow> = memories::rows(core)
-        .filter(|row| row.deleted_at.is_none())
-        .filter(|row| row.remind_at.as_deref().is_some_and(|at| due(row, at)))
-        .collect();
-    rows.sort_by(|a, b| (&a.remind_at, &a.id).cmp(&(&b.remind_at, &b.id)));
-    Ok(rows.iter().take(limit).map(MemoryRow::to_memory).collect())
+    );
 }
