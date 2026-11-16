@@ -299,6 +299,9 @@ pub fn server_status(report: &serde_json::Value) -> String {
             .and_then(|v| v.as_str())
             .unwrap_or("(in memory, no file)")
     ));
+    if report.get("legacy_db_present").and_then(|v| v.as_bool()) == Some(true) {
+        out.push_str("\n- legacy memory.db: still beside the store, never opened; safe to archive");
+    }
     out.push_str(&format!("\n- memories: {}", n("memory_count")));
     let current = report
         .get("schema_current")
