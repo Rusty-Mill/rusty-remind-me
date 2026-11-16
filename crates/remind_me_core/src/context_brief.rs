@@ -658,16 +658,33 @@ fn reviews_draft(memories: &[Memory], scope: &Scope, now: DateTime<Utc>) -> Draf
     }
 }
 
+/// `hits` less each memory that loses a conflict to another hit
+/// ([`crate::contradictions::preferred`]: a stated memory beats an inferred
+/// one, #1553), so the brief never shows both sides of one claim. Order is
+/// kept.
+fn without_overruled<'a>(hits: &[&'a Memory]) -> Vec<&'a Memory> {
+    let overruled = |m: &Memory| {
+        hits.iter().any(|other| {
+            crate::contradictions::preferred(m, other).is_some_and(|keep| keep.id == other.id)
+        })
+    };
+    hits.iter().copied().filter(|m| !overruled(m)).collect()
+}
+
 fn hits_draft(store: &Store<'_>, prompt: &str, now: DateTime<Utc>) -> Result<Draft> {
     let input = MemorySearchInput {
         query: prompt.to_string(),
         limit: HIT_LIMIT * 2,
         ..MemorySearchInput::default()
     };
-    let items = crate::db::queries::search_memories(store, &input)?
+    let results = crate::db::queries::search_memories(store, &input)?;
+    let hits: Vec<&Memory> = results
         .iter()
         .map(|r| &r.memory)
         .filter(|m| injectable(m, now))
+        .collect();
+    let items = without_overruled(&hits)
+        .into_iter()
         .take(HIT_LIMIT)
         .map(item)
         .collect();
@@ -898,6 +915,37 @@ mod tests {
             let memory = Memories::new(&store).get_live(id).unwrap().unwrap();
             assert_eq!(injectable(&memory, now), shown, "{until}");
         }
+    }
+
+    #[test]
+    fn a_hit_overruled_by_a_stated_one_is_left_out() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        let triple = |r: &mut NewMemory, object: &str, basis: serde_json::Value| {
+            r.subject = Some("service".into());
+            r.predicate = Some("runs_on".into());
+            r.object = Some(object.into());
+            r.metadata = basis;
+        };
+        add(&store, "mem_said", |r| {
+            triple(r, "aws", serde_json::json!({ "basis": "stated" }))
+        });
+        add(&store, "mem_guess", |r| {
+            triple(
+                r,
+                "gcp",
+                serde_json::json!({ "basis": "inferred", "premises": ["mem_x"] }),
+            )
+        });
+        add(&store, "mem_other", |_| {});
+        let get = |id: &str| Memories::new(&store).get_live(id).unwrap().unwrap();
+        let (said, guess, other) = (get("mem_said"), get("mem_guess"), get("mem_other"));
+
+        let kept: Vec<&str> = without_overruled(&[&guess, &other, &said])
+            .into_iter()
+            .map(|m| m.id.as_str())
+            .collect();
+        assert_eq!(kept, ["mem_other", "mem_said"]);
     }
 
     fn add(store: &Store<'_>, id: &str, f: impl FnOnce(&mut NewMemory)) {

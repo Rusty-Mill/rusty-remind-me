@@ -350,9 +350,18 @@ pub fn promote(store: &Store<'_>, input: &PromoteInput) -> Result<PromotionResul
     let now = Utc::now();
     let promoted_id = format!("mem_{}", uuid::Uuid::new_v4().simple());
 
+    // A distillation is a model's conclusion from its sources (#1553): a
+    // pattern when seen across two or more, else an inference from one.
+    let basis = if input.source_ids.len() >= 2 {
+        crate::kinds::Basis::Pattern
+    } else {
+        crate::kinds::Basis::Inferred
+    };
     let metadata = serde_json::json!({
         "rung": input.rung.as_str(),
         "promoted_from": input.source_ids,
+        "basis": basis.as_str(),
+        "premises": input.source_ids,
     });
 
     let decay_rate = get_decay_rate(category);
