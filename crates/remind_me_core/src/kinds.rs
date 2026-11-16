@@ -252,7 +252,13 @@ pub fn validate_basis(metadata: &Value) -> Result<(), KindError> {
         Some(_) => return Err(bad(K, "premises", "must be an array of memory ids")),
     };
     let needed = basis.map_or(0, Basis::min_premises);
-    if premises.len() < needed {
+    // A premise named twice is still one premise.
+    let distinct = premises
+        .iter()
+        .map(|id| id.trim())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    if distinct < needed {
         return Err(bad(
             K,
             "premises",
@@ -541,6 +547,10 @@ mod tests {
                 "only applies",
             ),
             (json!({ "premises": ["mem_a"] }), "only applies"),
+            (
+                json!({ "basis": "pattern", "premises": ["mem_a", "mem_a"] }),
+                "at least 2",
+            ),
             (
                 json!({ "basis": "inferred", "premises": [""] }),
                 "array of memory ids",

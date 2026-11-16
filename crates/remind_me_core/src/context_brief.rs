@@ -52,7 +52,7 @@ use crate::models::{Memory, MemorySearchInput, ReminderWindow};
 use crate::text::edit_distance;
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// The window when none is given.
 pub const DEFAULT_SINCE: &str = "7d";
@@ -288,6 +288,8 @@ pub fn build(store: &Store<'_>, request: &ContextRequest<'_>) -> Result<Outcome>
     };
 
     let in_scope: Vec<&Memory> = memories.iter().filter(|m| scope.admits(m)).collect();
+    // Before any section is drafted, so none shows both sides of one claim.
+    let in_scope = without_overruled(&in_scope);
     brief.project = scope.project_match(&in_scope);
 
     let mut drafts = Vec::new();
@@ -295,7 +297,8 @@ pub fn build(store: &Store<'_>, request: &ContextRequest<'_>) -> Result<Outcome>
     if request.mode == Mode::Session {
         drafts.push(persona_draft(store)?);
         drafts.push(reminders_draft(store, now)?);
-        let reviews = reviews_draft(&memories, &scope, now);
+        let shown: HashSet<&str> = rest.iter().map(|m| m.id.as_str()).collect();
+        let reviews = reviews_draft(&memories, &shown, now);
         let listed: HashSet<&str> = reviews.items.iter().map(|i| i.id.as_str()).collect();
         rest.retain(|m| !listed.contains(m.id.as_str()));
         drafts.push(reviews);
@@ -641,10 +644,12 @@ fn reminders_draft(store: &Store<'_>, now: DateTime<Utc>) -> Result<Draft> {
 
 /// Decisions in scope due for a follow-up review (`crate::review`), oldest
 /// due date first. Listed here, they are left out of the project sections.
-fn reviews_draft(memories: &[Memory], scope: &Scope, now: DateTime<Utc>) -> Draft {
+/// The decisions due for review among `memories`, keeping only the `shown`
+/// ids: those in scope and not overruled.
+fn reviews_draft(memories: &[Memory], shown: &HashSet<&str>, now: DateTime<Utc>) -> Draft {
     let items = crate::review::due_among(memories, now, None)
         .into_iter()
-        .filter(|m| scope.admits(m))
+        .filter(|m| shown.contains(m.id.as_str()))
         .take(REVIEW_LIMIT)
         .map(|m| Item {
             at: crate::review::review_due(m).unwrap_or_default().to_string(),
@@ -658,17 +663,30 @@ fn reviews_draft(memories: &[Memory], scope: &Scope, now: DateTime<Utc>) -> Draf
     }
 }
 
-/// `hits` less each memory that loses a conflict to another hit
+/// `memories` less each memory that loses a conflict to another of them
 /// ([`crate::contradictions::preferred`]: a stated memory beats an inferred
 /// one, #1553), so the brief never shows both sides of one claim. Order is
-/// kept.
-fn without_overruled<'a>(hits: &[&'a Memory]) -> Vec<&'a Memory> {
+/// kept. Only memories sharing a subject and predicate can conflict, so only
+/// those are compared.
+fn without_overruled<'a>(memories: &[&'a Memory]) -> Vec<&'a Memory> {
+    let key = |m: &Memory| -> Option<(String, String)> {
+        let norm = |s: &Option<String>| s.as_deref().map(|s| s.trim().to_lowercase());
+        Some((norm(&m.subject)?, norm(&m.predicate)?))
+    };
+    let mut groups: HashMap<(String, String), Vec<&Memory>> = HashMap::new();
+    for m in memories {
+        if let Some(k) = key(m) {
+            groups.entry(k).or_default().push(m);
+        }
+    }
     let overruled = |m: &Memory| {
-        hits.iter().any(|other| {
-            crate::contradictions::preferred(m, other).is_some_and(|keep| keep.id == other.id)
+        key(m).and_then(|k| groups.get(&k)).is_some_and(|group| {
+            group.iter().any(|other| {
+                crate::contradictions::preferred(m, other).is_some_and(|keep| keep.id == other.id)
+            })
         })
     };
-    hits.iter().copied().filter(|m| !overruled(m)).collect()
+    memories.iter().copied().filter(|m| !overruled(m)).collect()
 }
 
 fn hits_draft(store: &Store<'_>, prompt: &str, now: DateTime<Utc>) -> Result<Draft> {
@@ -946,6 +964,31 @@ mod tests {
             .map(|m| m.id.as_str())
             .collect();
         assert_eq!(kept, ["mem_other", "mem_said"]);
+    }
+
+    #[test]
+    fn activity_leaves_out_an_inference_a_statement_overrules() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        for (id, object, basis) in [
+            ("mem_said", "aws", serde_json::json!({ "basis": "stated" })),
+            (
+                "mem_guess",
+                "gcp",
+                serde_json::json!({ "basis": "inferred", "premises": ["mem_x"] }),
+            ),
+        ] {
+            add(&store, id, |r| {
+                r.project = Some("quokka".into());
+                r.subject = Some("service".into());
+                r.predicate = Some("runs_on".into());
+                r.object = Some(object.into());
+                r.metadata = basis;
+            });
+        }
+
+        let brief = brief(&store, &session(0));
+        assert_eq!(ids(&brief, "activity"), ["mem_said"]);
     }
 
     fn add(store: &Store<'_>, id: &str, f: impl FnOnce(&mut NewMemory)) {

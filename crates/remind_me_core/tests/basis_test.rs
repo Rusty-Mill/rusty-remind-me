@@ -3,6 +3,7 @@
 
 use remind_me_core::capture::{auto_capture, decompose};
 use remind_me_core::contradictions::preferred;
+use remind_me_core::db::memories::Memories;
 use remind_me_core::db::queries;
 use remind_me_core::db::Store;
 use remind_me_core::kinds::{Basis, StructuredFields};
@@ -134,10 +135,57 @@ fn a_promotion_records_its_sources_as_premises() {
     }
 }
 
-/// Decompose one fact "the service runs on `object`" from a fresh capture:
-/// the path that retires contradicted triples.
-fn decomposed(store: &Store<'_>, object: &str, metadata: Value) -> String {
-    let captured = auto_capture(
+#[test]
+fn a_source_named_twice_is_one_premise() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let a = add(&store, "Nano reviews PRs in the morning", json!({}));
+
+    let result = promote(
+        &store,
+        &PromoteInput {
+            rung: Rung::FactToScenario,
+            source_ids: vec![a.clone(), a.clone()],
+            content: "a distillation of one source".into(),
+        },
+    )
+    .unwrap();
+    let promoted = queries::get_memory_by_id(&store, &result.promoted_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(promoted.metadata["basis"], json!("inferred"));
+    assert_eq!(promoted.metadata["premises"], json!([a]));
+}
+
+#[test]
+fn decompose_refuses_a_bad_basis_and_writes_nothing() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let captured = capture(&store, "aws");
+    let good = runs_on_fact("aws", json!({}));
+    let bad = runs_on_fact("gcp", json!({ "basis": "inferred" }));
+
+    let e = decompose(
+        &store,
+        &DecomposeInput {
+            capture_id: captured.clone(),
+            facts: vec![good, bad],
+            capture_revision: None,
+        },
+    )
+    .unwrap_err()
+    .to_string();
+
+    assert!(e.contains("facts[1]") && e.contains("at least 1"), "{e}");
+    let live = Memories::new(&store).all_live().unwrap();
+    assert!(
+        live.iter().all(|m| m.subject.is_none()),
+        "a fact was written"
+    );
+}
+
+fn capture(store: &Store<'_>, object: &str) -> String {
+    auto_capture(
         store,
         &AutoCaptureInput {
             conversation: format!("user: where does it run\nassistant: {object}"),
@@ -149,8 +197,12 @@ fn decomposed(store: &Store<'_>, object: &str, metadata: Value) -> String {
             project: None,
         },
     )
-    .unwrap();
-    let fact = AtomicFact {
+    .unwrap()
+    .capture_id
+}
+
+fn runs_on_fact(object: &str, metadata: Value) -> AtomicFact {
+    AtomicFact {
         content: format!("the service runs on {object}"),
         memory_type: None,
         extra_tags: vec![],
@@ -159,12 +211,17 @@ fn decomposed(store: &Store<'_>, object: &str, metadata: Value) -> String {
         object: Some(object.into()),
         entities: vec![],
         metadata: Some(metadata),
-    };
+    }
+}
+
+/// Decompose one fact "the service runs on `object`" from a fresh capture:
+/// the path that retires contradicted triples.
+fn decomposed(store: &Store<'_>, object: &str, metadata: Value) -> String {
     let result = decompose(
         store,
         &DecomposeInput {
-            capture_id: captured.capture_id,
-            facts: vec![fact],
+            capture_id: capture(store, object),
+            facts: vec![runs_on_fact(object, metadata)],
             capture_revision: None,
         },
     )

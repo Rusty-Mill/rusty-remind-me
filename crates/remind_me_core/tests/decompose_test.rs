@@ -136,6 +136,7 @@ fn the_memory_type_drives_the_decay_rate_and_weight() {
 
     let mut decision = fact("we chose SQLite");
     decision.memory_type = Some("decision".into());
+    decision.metadata = Some(serde_json::json!({ "rationale": "one file, no server" }));
     let result = run(&store, &parent.capture_id, vec![decision]);
 
     let id = &result.fact_ids[0];

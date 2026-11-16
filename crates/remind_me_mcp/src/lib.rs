@@ -2317,10 +2317,6 @@ impl McpServer {
                                     || decompose_input.facts.len() > DECOMPOSE_FACTS_MAX
                                 {
                                     json!({ "isError": true, "content": [{ "type": "text", "text": format!("facts must hold {}..={} entries", DECOMPOSE_FACTS_MIN, DECOMPOSE_FACTS_MAX) }] })
-                                } else if let Err(e) =
-                                    remind_me_core::resolve::validate_facts(&decompose_input.facts)
-                                {
-                                    json!({ "isError": true, "content": [{ "type": "text", "text": store_error_text("Decompose error", &e) }] })
                                 } else {
                                     match capture::decompose(&store, &decompose_input) {
                                         Ok(Some(result)) => {
