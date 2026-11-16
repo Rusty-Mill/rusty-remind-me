@@ -2,6 +2,17 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-16 — Storage port: archives, entities and curation (ADR-0035, Millwright R2)
+
+### Changed
+- Three more storage ports, each implemented by the engine: `db::archives::ArchiveStore` (import archives and their spans), `db::entities::EntityStore` (entities, relations and mention links, plus `linked_ids`, which `Memories::linked_ids` now reaches through it) and `db::curation::CurationStore` (the curation and maintenance reads). `Archives`, `Entities` and `Curation` lock per call and go through them. No behaviour, schema or caller changes.
+- The archive and curation adapters fold their free functions into the `impl`. The graph adapter delegates, because the curation, promotion, related and outbox adapters share its functions, as the memories core does.
+- `relations_touching` with no ids returns nothing at the port as well as in the facade.
+
+### Tests
+- `archive_conformance!`, `entity_conformance!` and `curation_conformance!` run on temporary engine tables, seeding memories and entity links through `MemoryStore` and `EntityStore`. New check: `blob_of` and archive order.
+- The outbox entries graph writes queue are checked by running the entity conformance scenario on a store with sync on. The promotion reads over the curation corpus stay a facade test until promotions has its port.
+
 ## 2026-11-16 — Storage port: the memories core, part 2 (ADR-0035, Millwright R2)
 
 ### Tests
