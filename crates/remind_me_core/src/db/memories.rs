@@ -11,7 +11,7 @@
 //! writes, and how vitality is seeded, are decided there and handed over as
 //! a [`NewMemory`] or a field value.
 
-use super::engine::{self, EngineLock};
+use super::engine::EngineLock;
 use super::{Result, Store};
 use crate::models::{Memory, UnannotatedMemory, UnclassifiedMemory};
 use crate::sync::TOMBSTONE_CONTENT;
@@ -841,10 +841,10 @@ impl<'c> Memories<'c> {
         Ok(MemoryStore::get_live(&*self.core.lock(), id)?.map(|m| m.category))
     }
 
-    /// The ids of the memories linked to entity `id`. Entity links are the
-    /// entities group's table; this read moves behind that group's port.
+    /// The ids of the memories linked to entity `id`: see
+    /// [`EntityStore::linked_ids`](crate::db::entities::EntityStore::linked_ids).
     pub fn linked_ids(&self, entity_id: &str) -> Result<HashSet<String>> {
-        engine::graph::linked_ids(&self.core.lock(), entity_id)
+        crate::db::entities::EntityStore::linked_ids(&*self.core.lock(), entity_id)
     }
 }
 
