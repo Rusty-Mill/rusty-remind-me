@@ -1,7 +1,8 @@
 //! Storage reads for the curation queues: captures awaiting decomposition,
 //! raw imports awaiting normalization, contradiction candidates, and the
-//! maintenance counts over all of them, on the engine's memories core
-//! (`db::engine::curation`).
+//! maintenance counts over all of them, behind the [`CurationStore`] port
+//! (ADR-0035), which the engine's memories core implements in
+//! `db::engine::curation`.
 //!
 //! Every read [`crate::capture`], [`crate::normalize`],
 //! [`crate::maintenance`] and [`crate::contradictions`] make goes through
@@ -9,7 +10,7 @@
 //! count as raw imports, the entity fan-out ceiling, and the keyset
 //! cursor's meaning.
 
-use super::engine::{self, EngineLock};
+use super::engine::EngineLock;
 use super::{Result, Store};
 use crate::models::{ContradictionSide, Memory};
 
@@ -65,6 +66,76 @@ pub struct CaptureActivity {
     pub last_capture_at: Option<String>,
 }
 
+/// The port for the curation reads over the memories core (ADR-0035).
+/// Every method reads. [`conformance`] holds the behaviour every
+/// implementation must show.
+pub trait CurationStore {
+    /// Every memory carrying `capture_id`, by category (ties by id).
+    fn capture_rows(&self, capture_id: &str) -> Result<Vec<Memory>>;
+
+    /// The tags of the lowest-id memory carrying `capture_id`, or `None` when
+    /// none does. Unparseable tags read as none.
+    fn capture_tags(&self, capture_id: &str) -> Result<Option<Vec<String>>>;
+
+    /// Captures due for decomposition, newest first, at most `limit`; with
+    /// `settled_before`, only those last changed at or before it (RFC 3339).
+    fn undecomposed(&self, limit: usize, settled_before: Option<&str>) -> Result<Vec<CaptureRow>>;
+
+    /// How many captures [`CurationStore::undecomposed`] would list.
+    fn count_undecomposed(&self, settled_before: Option<&str>) -> Result<i64>;
+
+    /// How many distinct live captures there are, and the newest one's
+    /// `created_at`.
+    fn capture_activity(&self) -> Result<CaptureActivity>;
+
+    /// Live raw imports from `sources` nothing has been normalized from,
+    /// newest first, at most `limit`. Unparseable metadata reads as `{}`.
+    fn unnormalized(&self, sources: &[&str], limit: usize) -> Result<Vec<ImportRow>>;
+
+    /// How many live raw imports from `sources` nothing has been
+    /// normalized from.
+    fn count_unnormalized(&self, sources: &[&str]) -> Result<i64>;
+
+    /// What a normalization of `memory_id` copies from it, if it exists.
+    fn normalization_source(&self, memory_id: &str) -> Result<Option<NormalizationSource>>;
+
+    /// How deep `backlog` is.
+    fn backlog_depth(&self, backlog: Backlog) -> Result<i64>;
+
+    /// How many contradiction candidate pairs there are: pairs of live,
+    /// non-dialog memories sharing an entity mentioned at most `max_fanout`
+    /// times, excluding pairs with the same subject and predicate.
+    fn count_contradiction_pairs(&self, max_fanout: i64) -> Result<i64>;
+
+    /// Contradiction candidate pairs in `(id_a, id_b)` order, after `cursor`
+    /// when given, at most `limit`.
+    fn contradiction_pairs(
+        &self,
+        max_fanout: i64,
+        cursor: Option<(&str, &str)>,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>>;
+
+    /// The standing decisions that share a claim, or a non-hub entity, with
+    /// `memory_id`, in id order, each with the shared entities' names.
+    fn decision_neighbours(
+        &self,
+        memory_id: &str,
+        max_fanout: i64,
+    ) -> Result<Vec<(String, Vec<String>)>>;
+
+    /// The names of the entities both memories mention, by name.
+    fn shared_entity_names(&self, id_a: &str, id_b: &str) -> Result<Vec<String>>;
+
+    /// One side of a contradiction pair, with the first `snippet_chars`
+    /// characters of its content.
+    fn contradiction_side(
+        &self,
+        memory_id: &str,
+        snippet_chars: usize,
+    ) -> Result<ContradictionSide>;
+}
+
 /// The curation reads, on the engine's memories core.
 pub struct Curation<'c> {
     core: &'c EngineLock,
@@ -75,132 +146,115 @@ impl<'c> Curation<'c> {
         Self { core: store.core() }
     }
 
-    // --- captures --------------------------------------------------------
-
-    /// Every memory carrying `capture_id`, by category (ties by id).
+    /// See [`CurationStore::capture_rows`].
     pub fn capture_rows(&self, capture_id: &str) -> Result<Vec<Memory>> {
-        engine::curation::capture_rows(&self.core.lock(), capture_id)
+        CurationStore::capture_rows(&*self.core.lock(), capture_id)
     }
 
-    /// The tags of the lowest-id memory carrying `capture_id`, or `None` when
-    /// none does. Unparseable tags read as none.
+    /// See [`CurationStore::capture_tags`].
     pub fn capture_tags(&self, capture_id: &str) -> Result<Option<Vec<String>>> {
-        engine::curation::capture_tags(&self.core.lock(), capture_id)
+        CurationStore::capture_tags(&*self.core.lock(), capture_id)
     }
 
-    /// Captures due for decomposition, newest first, at most `limit`; with
-    /// `settled_before`, only those last changed at or before it (RFC 3339).
+    /// See [`CurationStore::undecomposed`].
     pub fn undecomposed(
         &self,
         limit: usize,
         settled_before: Option<&str>,
     ) -> Result<Vec<CaptureRow>> {
-        engine::curation::undecomposed(&self.core.lock(), limit, settled_before)
+        CurationStore::undecomposed(&*self.core.lock(), limit, settled_before)
     }
 
-    /// How many captures [`Curation::undecomposed`] would list.
+    /// See [`CurationStore::count_undecomposed`].
     pub fn count_undecomposed(&self, settled_before: Option<&str>) -> Result<i64> {
-        engine::curation::count_undecomposed(&self.core.lock(), settled_before)
+        CurationStore::count_undecomposed(&*self.core.lock(), settled_before)
     }
 
-    /// How many distinct live captures there are, and the newest one's
-    /// `created_at`.
+    /// See [`CurationStore::capture_activity`].
     pub fn capture_activity(&self) -> Result<CaptureActivity> {
-        engine::curation::capture_activity(&self.core.lock())
+        CurationStore::capture_activity(&*self.core.lock())
     }
 
-    // --- normalization ---------------------------------------------------
-
-    /// Live raw imports from `sources` nothing has been normalized from,
-    /// newest first, at most `limit`. Unparseable metadata reads as `{}`.
+    /// See [`CurationStore::unnormalized`].
     pub fn unnormalized(&self, sources: &[&str], limit: usize) -> Result<Vec<ImportRow>> {
-        engine::curation::unnormalized(&self.core.lock(), sources, limit)
+        CurationStore::unnormalized(&*self.core.lock(), sources, limit)
     }
 
-    /// How many live raw imports from `sources` nothing has been
-    /// normalized from.
+    /// See [`CurationStore::count_unnormalized`].
     pub fn count_unnormalized(&self, sources: &[&str]) -> Result<i64> {
-        engine::curation::count_unnormalized(&self.core.lock(), sources)
+        CurationStore::count_unnormalized(&*self.core.lock(), sources)
     }
 
-    /// What a normalization of `memory_id` copies from it, if it exists.
+    /// See [`CurationStore::normalization_source`].
     pub fn normalization_source(&self, memory_id: &str) -> Result<Option<NormalizationSource>> {
-        engine::curation::normalization_source(&self.core.lock(), memory_id)
+        CurationStore::normalization_source(&*self.core.lock(), memory_id)
     }
 
-    // --- maintenance -----------------------------------------------------
-
-    /// How deep `backlog` is.
+    /// See [`CurationStore::backlog_depth`].
     pub fn backlog_depth(&self, backlog: Backlog) -> Result<i64> {
-        engine::curation::backlog_depth(&self.core.lock(), backlog)
+        CurationStore::backlog_depth(&*self.core.lock(), backlog)
     }
 
-    // --- contradictions --------------------------------------------------
-
-    /// How many contradiction candidate pairs there are: pairs of live,
-    /// non-dialog memories sharing an entity mentioned at most `max_fanout`
-    /// times, excluding pairs with the same subject and predicate.
+    /// See [`CurationStore::count_contradiction_pairs`].
     pub fn count_contradiction_pairs(&self, max_fanout: i64) -> Result<i64> {
-        engine::curation::count_contradiction_pairs(&self.core.lock(), max_fanout)
+        CurationStore::count_contradiction_pairs(&*self.core.lock(), max_fanout)
     }
 
-    /// Contradiction candidate pairs in `(id_a, id_b)` order, after `cursor`
-    /// when given, at most `limit`.
+    /// See [`CurationStore::contradiction_pairs`].
     pub fn contradiction_pairs(
         &self,
         max_fanout: i64,
         cursor: Option<(&str, &str)>,
         limit: usize,
     ) -> Result<Vec<(String, String)>> {
-        engine::curation::contradiction_pairs(&self.core.lock(), max_fanout, cursor, limit)
+        CurationStore::contradiction_pairs(&*self.core.lock(), max_fanout, cursor, limit)
     }
 
-    /// The standing decisions that share a claim, or a non-hub entity, with
-    /// `memory_id`, in id order, each with the shared entities' names.
+    /// See [`CurationStore::decision_neighbours`].
     pub fn decision_neighbours(
         &self,
         memory_id: &str,
         max_fanout: i64,
     ) -> Result<Vec<(String, Vec<String>)>> {
-        engine::curation::decision_neighbours(&self.core.lock(), memory_id, max_fanout)
+        CurationStore::decision_neighbours(&*self.core.lock(), memory_id, max_fanout)
     }
 
-    /// The names of the entities both memories mention, by name.
+    /// See [`CurationStore::shared_entity_names`].
     pub fn shared_entity_names(&self, id_a: &str, id_b: &str) -> Result<Vec<String>> {
-        engine::curation::shared_entity_names(&self.core.lock(), id_a, id_b)
+        CurationStore::shared_entity_names(&*self.core.lock(), id_a, id_b)
     }
 
-    /// One side of a contradiction pair, with the first `snippet_chars`
-    /// characters of its content.
+    /// See [`CurationStore::contradiction_side`].
     pub fn contradiction_side(
         &self,
         memory_id: &str,
         snippet_chars: usize,
     ) -> Result<ContradictionSide> {
-        engine::curation::contradiction_side(&self.core.lock(), memory_id, snippet_chars)
+        CurationStore::contradiction_side(&*self.core.lock(), memory_id, snippet_chars)
     }
 }
 
+/// The behaviour every [`CurationStore`] must show, run against each backend
+/// by [`curation_conformance`] (ADR-0035).
+///
+/// The reads are over memories and their entity links, so a backend under
+/// test implements [`MemoryStore`] and [`EntityStore`] too, and the checks
+/// seed through them.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::db::memories::{Memories, NewMemory};
-    use crate::db::Database;
+pub(crate) mod conformance {
+    use super::{Backlog, CaptureActivity, CurationStore, NormalizationSource};
+    use crate::db::derived::Origin;
+    use crate::db::entities::EntityStore;
+    use crate::db::memories::{MemoryStore, NewMemory};
+    use crate::entity::Entity;
+    use crate::models::Memory;
 
-    const NOW: &str = "2026-09-26T00:00:00+00:00";
+    pub(crate) const NOW: &str = "2026-09-26T00:00:00+00:00";
+    pub(crate) const T2: &str = "2026-09-27T00:00:00+00:00";
 
-    /// Captures, imports, graph links and promotions, and every curation and
-    /// promotion read over them.
-    #[test]
-    fn curation_and_promotion_reads_see_the_corpus_as_the_rules_say() {
-        use crate::db::derived::Origin;
-        use crate::db::entities::Entities;
-        use crate::db::promotions::Promotions;
-        use crate::entity::Entity;
-        const T2: &str = "2026-09-27T00:00:00+00:00";
-        let db = Database::open_in_memory().unwrap();
-        let store = db.store();
-        let memories = Memories::new(&store);
+    /// Captures, imports, facts with triples, scenarios and personas, linked
+    /// to three entities, with `f2` superseded by `f1`.
+    pub(crate) fn seed_corpus<S: MemoryStore + EntityStore>(store: &mut S) {
         let text = |s: &str| Some(s.to_string());
         let rows: Vec<NewMemory> = vec![
             NewMemory {
@@ -285,23 +339,22 @@ mod tests {
             },
         ];
         for row in &rows {
-            memories.insert(row).unwrap();
+            MemoryStore::insert(store, row).unwrap();
         }
-        let entities = Entities::new(&store);
         for (id, name) in [("e1", "Rust"), ("e2", "Tokio"), ("e3", "Hub")] {
-            entities
-                .insert(
-                    &Entity {
-                        id: id.into(),
-                        name: name.into(),
-                        kind: None,
-                        aliases: vec![],
-                        created_at: NOW.into(),
-                        updated_at: NOW.into(),
-                    },
-                    None,
-                )
-                .unwrap();
+            EntityStore::insert(
+                store,
+                &Entity {
+                    id: id.into(),
+                    name: name.into(),
+                    kind: None,
+                    aliases: vec![],
+                    created_at: NOW.into(),
+                    updated_at: NOW.into(),
+                },
+                None,
+            )
+            .unwrap();
         }
         for (m, e) in [
             ("f1", "e1"),
@@ -316,31 +369,29 @@ mod tests {
             ("sc1", "e3"),
             ("ghost", "e3"),
         ] {
-            entities.link(m, e, NOW, Origin::Local).unwrap();
+            EntityStore::link(store, m, e, NOW, Origin::Local).unwrap();
         }
-        let promotions = Promotions::new(&store);
-        for (p, src, rung) in [
-            ("sc1", "f4", "scenario"),
-            ("sc1", "f2", "scenario"),
-            ("sc1", "f2", "scenario"),
-            ("p1", "sc1", "persona"),
-            ("p1", "gone", "persona"),
-        ] {
-            promotions.record(p, src, rung, NOW).unwrap();
-        }
-        memories.set_superseded_by("f2", "f1", None).unwrap();
+        MemoryStore::set_superseded_by(store, "f2", "f1", None).unwrap();
+    }
 
-        let curation = Curation::new(&store);
+    /// Every curation read over [`seed_corpus`].
+    pub(crate) fn curation_reads_see_the_corpus_as_the_rules_say<
+        S: CurationStore + MemoryStore + EntityStore,
+    >(
+        store: &mut S,
+    ) {
+        seed_corpus(store);
+        let text = |s: &str| Some(s.to_string());
         let sources = ["document_import", "chat_import"];
         let ids =
             |memories: Vec<Memory>| -> Vec<String> { memories.into_iter().map(|m| m.id).collect() };
-        assert_eq!(ids(curation.capture_rows("c1").unwrap()), ["d1", "s1"]);
+        assert_eq!(ids(store.capture_rows("c1").unwrap()), ["d1", "s1"]);
         assert_eq!(
-            curation.capture_tags("c1").unwrap(),
+            store.capture_tags("c1").unwrap(),
             Some(vec!["x".to_string()])
         );
-        assert_eq!(curation.capture_tags("none").unwrap(), None);
-        let undecomposed: Vec<String> = curation
+        assert_eq!(store.capture_tags("none").unwrap(), None);
+        let undecomposed: Vec<String> = store
             .undecomposed(10, None)
             .unwrap()
             .into_iter()
@@ -351,48 +402,48 @@ mod tests {
             ["s1", "d1"],
             "c2 was decomposed into f1; c1's two rows wait, newest first then by id"
         );
-        assert_eq!(curation.count_undecomposed(None).unwrap(), 2);
+        assert_eq!(store.count_undecomposed(None).unwrap(), 2);
         assert_eq!(
-            curation.capture_activity().unwrap(),
+            store.capture_activity().unwrap(),
             CaptureActivity {
                 captures: 2,
                 last_capture_at: Some(T2.to_string()),
             }
         );
-        let unnormalized = curation.unnormalized(&sources, 10).unwrap();
+        let unnormalized = store.unnormalized(&sources, 10).unwrap();
         assert_eq!(unnormalized.len(), 1, "{unnormalized:?}");
         assert_eq!(unnormalized[0].id, "raw2");
         assert_eq!(unnormalized[0].metadata, serde_json::json!({}));
-        assert_eq!(curation.count_unnormalized(&sources).unwrap(), 1);
+        assert_eq!(store.count_unnormalized(&sources).unwrap(), 1);
         assert_eq!(
-            curation.normalization_source("raw2").unwrap(),
+            store.normalization_source("raw2").unwrap(),
             Some(NormalizationSource {
                 tags: vec![],
                 doc_id: text("doc"),
                 chunk_index: Some(2),
             })
         );
-        assert_eq!(curation.normalization_source("missing").unwrap(), None);
-        assert_eq!(curation.backlog_depth(Backlog::Undecomposed).unwrap(), 2);
-        assert_eq!(curation.backlog_depth(Backlog::Unnormalized).unwrap(), 1);
+        assert_eq!(store.normalization_source("missing").unwrap(), None);
+        assert_eq!(store.backlog_depth(Backlog::Undecomposed).unwrap(), 2);
+        assert_eq!(store.backlog_depth(Backlog::Unnormalized).unwrap(), 1);
         assert_eq!(
-            curation.backlog_depth(Backlog::Unclassified).unwrap(),
+            store.backlog_depth(Backlog::Unclassified).unwrap(),
             14,
             "every live memory is unclassified"
         );
         // Unannotated: live, not dialog, no triple, no links.
-        assert_eq!(curation.backlog_depth(Backlog::Unannotated).unwrap(), 7);
+        assert_eq!(store.backlog_depth(Backlog::Unannotated).unwrap(), 7);
 
-        let pairs_at_20 = curation.count_contradiction_pairs(20).unwrap();
+        let pairs_at_20 = store.count_contradiction_pairs(20).unwrap();
         assert!(pairs_at_20 > 0, "the corpus has contradiction pairs");
         assert_eq!(
-            curation.contradiction_pairs(20, None, 2).unwrap(),
+            store.contradiction_pairs(20, None, 2).unwrap(),
             [
                 ("f1".to_string(), "f3".to_string()),
                 ("f1".to_string(), "f4".to_string())
             ]
         );
-        let after = curation
+        let after = store
             .contradiction_pairs(20, Some(("f1", "f3")), 10)
             .unwrap();
         assert_eq!(after.len() as i64, pairs_at_20 - 1);
@@ -400,18 +451,181 @@ mod tests {
             .iter()
             .all(|(a, b)| (a.as_str(), b.as_str()) > ("f1", "f3")));
         assert!(
-            curation.count_contradiction_pairs(3).unwrap() < pairs_at_20,
+            store.count_contradiction_pairs(3).unwrap() < pairs_at_20,
             "a lower fan-out ceiling drops e1's pairs"
         );
         assert_eq!(
-            curation.shared_entity_names("f1", "f4").unwrap(),
+            store.shared_entity_names("f1", "f4").unwrap(),
             ["Rust", "Tokio"]
         );
-        let side = curation.contradiction_side("f1", 5).unwrap();
+        let side = store.contradiction_side("f1", 5).unwrap();
         assert_eq!(side.content_snippet, "fact ");
         assert_eq!(side.subject.as_deref(), Some(" Rust "));
-        assert!(curation.contradiction_side("missing", 5).is_err());
+        assert!(store.contradiction_side("missing", 5).is_err());
+    }
 
+    pub(crate) fn a_capture_leaves_the_backlog_once_a_fact_names_it<
+        S: CurationStore + MemoryStore + EntityStore,
+    >(
+        store: &mut S,
+    ) {
+        MemoryStore::insert(
+            store,
+            &NewMemory {
+                capture_id: Some("cap".to_string()),
+                ..NewMemory::new("dialog", "x", NOW)
+            },
+        )
+        .unwrap();
+        assert_eq!(CurationStore::count_undecomposed(store, None).unwrap(), 1);
+        assert_eq!(
+            CurationStore::backlog_depth(store, Backlog::Undecomposed).unwrap(),
+            1
+        );
+
+        MemoryStore::insert(
+            store,
+            &NewMemory {
+                source_capture_id: Some("cap".to_string()),
+                ..NewMemory::new("fact", "y", NOW)
+            },
+        )
+        .unwrap();
+        assert_eq!(CurationStore::count_undecomposed(store, None).unwrap(), 0);
+        assert!(CurationStore::undecomposed(store, 10, None)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            CurationStore::backlog_depth(store, Backlog::Undecomposed).unwrap(),
+            0
+        );
+    }
+
+    pub(crate) fn an_import_leaves_the_backlog_once_normalized<
+        S: CurationStore + MemoryStore + EntityStore,
+    >(
+        store: &mut S,
+    ) {
+        MemoryStore::insert(
+            store,
+            &NewMemory {
+                source: "chat_import".to_string(),
+                ..NewMemory::new("raw", "x", NOW)
+            },
+        )
+        .unwrap();
+        let sources = ["document_import", "chat_import"];
+        assert_eq!(
+            CurationStore::count_unnormalized(store, &sources).unwrap(),
+            1
+        );
+        assert_eq!(
+            CurationStore::backlog_depth(store, Backlog::Unnormalized).unwrap(),
+            1
+        );
+
+        MemoryStore::insert(
+            store,
+            &NewMemory {
+                metadata: serde_json::json!({ "normalized_from": "raw" }),
+                ..NewMemory::new("norm", "y", NOW)
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            CurationStore::count_unnormalized(store, &sources).unwrap(),
+            0
+        );
+        assert_eq!(
+            CurationStore::backlog_depth(store, Backlog::Unnormalized).unwrap(),
+            0
+        );
+    }
+
+    pub(crate) fn contradiction_pairs_page_by_keyset<
+        S: CurationStore + MemoryStore + EntityStore,
+    >(
+        store: &mut S,
+    ) {
+        for id in ["a", "b", "c"] {
+            MemoryStore::insert(store, &NewMemory::new(id, id, NOW)).unwrap();
+            EntityStore::link(store, id, "e", NOW, Origin::Local).unwrap();
+        }
+        assert_eq!(
+            CurationStore::count_contradiction_pairs(store, 20).unwrap(),
+            3
+        );
+
+        let first = CurationStore::contradiction_pairs(store, 20, None, 2).unwrap();
+        assert_eq!(
+            first,
+            vec![
+                ("a".to_string(), "b".to_string()),
+                ("a".to_string(), "c".to_string())
+            ]
+        );
+        let rest = CurationStore::contradiction_pairs(store, 20, Some(("a", "c")), 2).unwrap();
+        assert_eq!(rest, vec![("b".to_string(), "c".to_string())]);
+        assert_eq!(
+            CurationStore::count_contradiction_pairs(store, 2).unwrap(),
+            0
+        );
+    }
+}
+
+/// One `#[test]` per [`conformance`] check, each on a fresh store from
+/// `$make`.
+#[cfg(test)]
+macro_rules! curation_conformance {
+    ($make:expr) => {
+        use $crate::db::curation::conformance;
+
+        #[test]
+        fn curation_reads_see_the_corpus_as_the_rules_say() {
+            conformance::curation_reads_see_the_corpus_as_the_rules_say(&mut $make);
+        }
+        #[test]
+        fn a_capture_leaves_the_backlog_once_a_fact_names_it() {
+            conformance::a_capture_leaves_the_backlog_once_a_fact_names_it(&mut $make);
+        }
+        #[test]
+        fn an_import_leaves_the_backlog_once_normalized() {
+            conformance::an_import_leaves_the_backlog_once_normalized(&mut $make);
+        }
+        #[test]
+        fn contradiction_pairs_page_by_keyset() {
+            conformance::contradiction_pairs_page_by_keyset(&mut $make);
+        }
+    };
+}
+#[cfg(test)]
+pub(crate) use curation_conformance;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Database;
+
+    /// The promotion reads over the curation corpus. Promotions have no port
+    /// yet, so this runs through the facades; it moves to the promotions
+    /// conformance suite with that group.
+    #[test]
+    fn promotion_reads_see_the_corpus_as_the_rules_say() {
+        use crate::db::promotions::Promotions;
+        const NOW: &str = conformance::NOW;
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        conformance::seed_corpus(&mut *store.core().lock());
+        let promotions = Promotions::new(&store);
+        for (p, src, rung) in [
+            ("sc1", "f4", "scenario"),
+            ("sc1", "f2", "scenario"),
+            ("sc1", "f2", "scenario"),
+            ("p1", "sc1", "persona"),
+            ("p1", "gone", "persona"),
+        ] {
+            promotions.record(p, src, rung, NOW).unwrap();
+        }
         let dialogs: Vec<String> = promotions
             .undecomposed_dialogs(10)
             .unwrap()
@@ -491,85 +705,16 @@ mod tests {
         assert_eq!(newest, ["f1", "f4", "f3"]);
     }
 
+    /// The facade locks per call and reaches the engine through the port.
     #[test]
-    fn a_capture_leaves_the_backlog_once_a_fact_names_it() {
+    fn the_facade_reads_through_the_port() {
         let db = Database::open_in_memory().unwrap();
         let store = db.store();
-        let memories = Memories::new(&store);
-        memories
-            .insert(&NewMemory {
-                capture_id: Some("cap".to_string()),
-                ..NewMemory::new("dialog", "x", NOW)
-            })
-            .unwrap();
+        conformance::seed_corpus(&mut *store.core().lock());
         let curation = Curation::new(&store);
-        assert_eq!(curation.count_undecomposed(None).unwrap(), 1);
-        assert_eq!(curation.backlog_depth(Backlog::Undecomposed).unwrap(), 1);
-
-        memories
-            .insert(&NewMemory {
-                source_capture_id: Some("cap".to_string()),
-                ..NewMemory::new("fact", "y", NOW)
-            })
-            .unwrap();
-        assert_eq!(curation.count_undecomposed(None).unwrap(), 0);
-        assert!(curation.undecomposed(10, None).unwrap().is_empty());
-        assert_eq!(curation.backlog_depth(Backlog::Undecomposed).unwrap(), 0);
-    }
-
-    #[test]
-    fn an_import_leaves_the_backlog_once_normalized() {
-        let db = Database::open_in_memory().unwrap();
-        let store = db.store();
-        let memories = Memories::new(&store);
-        memories
-            .insert(&NewMemory {
-                source: "chat_import".to_string(),
-                ..NewMemory::new("raw", "x", NOW)
-            })
-            .unwrap();
-        let curation = Curation::new(&store);
-        let sources = ["document_import", "chat_import"];
-        assert_eq!(curation.count_unnormalized(&sources).unwrap(), 1);
+        assert_eq!(curation.count_undecomposed(None).unwrap(), 2);
         assert_eq!(curation.backlog_depth(Backlog::Unnormalized).unwrap(), 1);
-
-        memories
-            .insert(&NewMemory {
-                metadata: serde_json::json!({ "normalized_from": "raw" }),
-                ..NewMemory::new("norm", "y", NOW)
-            })
-            .unwrap();
-        assert_eq!(curation.count_unnormalized(&sources).unwrap(), 0);
-        assert_eq!(curation.backlog_depth(Backlog::Unnormalized).unwrap(), 0);
-    }
-
-    #[test]
-    fn contradiction_pairs_page_by_keyset() {
-        let db = Database::open_in_memory().unwrap();
-        let store = db.store();
-        let memories = Memories::new(&store);
-        let entities = crate::db::entities::Entities::new(&store);
-        for id in ["a", "b", "c"] {
-            memories.insert(&NewMemory::new(id, id, NOW)).unwrap();
-            entities
-                .link(id, "e", NOW, crate::db::derived::Origin::Local)
-                .unwrap();
-        }
-        let curation = Curation::new(&store);
-        assert_eq!(curation.count_contradiction_pairs(20).unwrap(), 3);
-
-        let first = curation.contradiction_pairs(20, None, 2).unwrap();
-        assert_eq!(
-            first,
-            vec![
-                ("a".to_string(), "b".to_string()),
-                ("a".to_string(), "c".to_string())
-            ]
-        );
-        let rest = curation
-            .contradiction_pairs(20, Some(("a", "c")), 2)
-            .unwrap();
-        assert_eq!(rest, vec![("b".to_string(), "c".to_string())]);
-        assert_eq!(curation.count_contradiction_pairs(2).unwrap(), 0);
+        assert_eq!(curation.capture_rows("c1").unwrap().len(), 2);
+        assert!(curation.contradiction_side("missing", 5).is_err());
     }
 }
