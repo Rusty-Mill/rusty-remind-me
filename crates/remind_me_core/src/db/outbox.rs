@@ -38,6 +38,11 @@ pub trait OutboxStore {
     /// How many rows the outbox holds.
     fn len(&self) -> Result<i64>;
 
+    /// Whether the outbox holds no rows.
+    fn is_empty(&self) -> Result<bool> {
+        Ok(self.len()? == 0)
+    }
+
     /// How many rows are not yet marked sent.
     fn unsent_count(&self) -> Result<i64>;
 
@@ -89,9 +94,9 @@ impl<'c> Outbox<'c> {
         OutboxStore::unsent_count(&*self.core.lock())
     }
 
-    /// Whether the outbox is empty.
+    /// See [`OutboxStore::is_empty`].
     pub fn is_empty(&self) -> Result<bool> {
-        Ok(self.len()? == 0)
+        OutboxStore::is_empty(&*self.core.lock())
     }
 
     /// See [`OutboxStore::prune`].
