@@ -1,12 +1,12 @@
 //! Saved searches and their seen-memory rows on the engine: the first table
-//! group moved (ADR-0023, phase 4b). [`crate::db::saved_searches`] calls
-//! these when its store carries engine tables; the behaviour matches its
+//! group moved (ADR-0023, phase 4b), and the engine's adapter for the
+//! [`SavedSearchStore`] port (ADR-0035). The behaviour matches the old
 //! SQLite statements one for one.
 
 use super::{
     deleted, engine_error, engine_id, ensure_same_id, micros, pair_engine_id, EngineTables,
 };
-use crate::db::saved_searches::{decode_filters, encode_filters};
+use crate::db::saved_searches::{decode_filters, encode_filters, SavedSearchStore};
 use crate::db::{Result, StoreError};
 use crate::models::SavedSearch;
 use rusty_multimodal_db_engine::generic::query::{AllIds, FilterEq, GetById};
@@ -138,118 +138,112 @@ impl ScannableField<FirstSeen> for SeenRow {
     }
 }
 
-pub(crate) fn id_for_name(tables: &EngineTables, name: &str) -> Option<String> {
-    by_name(tables, name).map(|row| row.id)
-}
-
-/// Insert `saved`. A name already in use is refused, as SQLite's `UNIQUE`
-/// constraint refuses it.
-pub(crate) fn insert(tables: &mut EngineTables, saved: &SavedSearch) -> Result<()> {
-    if by_name(tables, &saved.name).is_some() {
-        return Err(StoreError::Invalid(format!(
-            "a saved search named {:?} already exists",
-            saved.name
-        )));
+impl SavedSearchStore for EngineTables {
+    fn id_for_name(&self, name: &str) -> Result<Option<String>> {
+        Ok(by_name(self, name).map(|row| row.id))
     }
-    let row = SavedSearchRow::new(saved);
-    if let Some(stored) = tables.saved_searches.get(row.engine_id) {
-        ensure_same_id(&stored.id, &saved.id)?;
-    }
-    tables.saved_searches.insert(row).map_err(engine_error)
-}
 
-/// Overwrite the query, filters, watch flag and `updated_at` of the saved
-/// search with `saved.id`, keeping its name and `created_at`. A missing id
-/// changes nothing, as an `UPDATE` matching no row does.
-pub(crate) fn update(tables: &mut EngineTables, saved: &SavedSearch) -> Result<()> {
-    let Some(stored) = tables.saved_searches.get(engine_id(&saved.id)) else {
-        return Ok(());
-    };
-    ensure_same_id(&stored.id, &saved.id)?;
-    let row = SavedSearchRow {
-        query: saved.query.clone(),
-        filters: encode_filters(&saved.filters),
-        watch: i64::from(saved.watch),
-        updated_at: saved.updated_at.clone(),
-        ..stored
-    };
-    tables.saved_searches.replace(row).map_err(engine_error)
-}
-
-pub(crate) fn get(tables: &EngineTables, id: &str) -> Result<SavedSearch> {
-    let row = tables
-        .saved_searches
-        .get(engine_id(id))
-        .filter(|row| row.id == id)
-        .ok_or(StoreError::NotFound)?;
-    Ok(row.to_model())
-}
-
-pub(crate) fn get_by_name(tables: &EngineTables, name: &str) -> Option<SavedSearch> {
-    by_name(tables, name).map(|row| row.to_model())
-}
-
-/// Every saved search, by name in byte order: SQLite's `BINARY` collation.
-pub(crate) fn list(tables: &EngineTables) -> Vec<SavedSearch> {
-    let mut rows: Vec<SavedSearchRow> = tables
-        .saved_searches
-        .all_ids()
-        .into_iter()
-        .filter_map(|id| tables.saved_searches.get(id))
-        .collect();
-    rows.sort_by(|a, b| a.name.cmp(&b.name));
-    rows.iter().map(SavedSearchRow::to_model).collect()
-}
-
-/// Delete the saved search with `id` and its seen rows. A missing id is not
-/// an error, as a `DELETE` matching no row is not.
-pub(crate) fn delete(tables: &mut EngineTables, id: &str) -> Result<()> {
-    for seen in seen_rows(tables, id) {
-        deleted(tables.seen.delete(seen))?;
-    }
-    let target = engine_id(id);
-    match tables.saved_searches.get(target) {
-        Some(stored) if stored.id == id => deleted(tables.saved_searches.delete(target)),
-        _ => Ok(()),
-    }
-}
-
-pub(crate) fn seen_ids(tables: &EngineTables, saved_search_id: &str) -> HashSet<String> {
-    seen_rows(tables, saved_search_id)
-        .into_iter()
-        .filter_map(|id| tables.seen.get(id))
-        .map(|row| row.memory_id)
-        .collect()
-}
-
-pub(crate) fn has_any_seen(tables: &EngineTables, saved_search_id: &str) -> bool {
-    !seen_rows(tables, saved_search_id).is_empty()
-}
-
-/// Record `memory_ids` as seen at `now`. An id already recorded keeps its
-/// first `first_seen_at`, as `INSERT OR IGNORE` does.
-pub(crate) fn mark_seen(
-    tables: &mut EngineTables,
-    saved_search_id: &str,
-    memory_ids: &[String],
-    now: &str,
-) -> Result<()> {
-    let first_seen_us = micros(now);
-    for memory_id in memory_ids {
-        let key = pair_engine_id(saved_search_id, memory_id);
-        if tables.seen.get(key).is_some() {
-            continue;
+    /// A name already in use is refused, as SQLite's `UNIQUE` constraint
+    /// refuses it.
+    fn insert(&mut self, saved: &SavedSearch) -> Result<()> {
+        if by_name(self, &saved.name).is_some() {
+            return Err(StoreError::Invalid(format!(
+                "a saved search named {:?} already exists",
+                saved.name
+            )));
         }
-        let row = SeenRow {
-            engine_id: key,
-            saved_search_id: saved_search_id.to_string(),
-            memory_id: memory_id.clone(),
-            first_seen_at: now.to_string(),
-            first_seen_us,
-        };
-        tables.seen.insert(row).map_err(engine_error)?;
+        let row = SavedSearchRow::new(saved);
+        if let Some(stored) = self.saved_searches.get(row.engine_id) {
+            ensure_same_id(&stored.id, &saved.id)?;
+        }
+        self.saved_searches.insert(row).map_err(engine_error)
     }
-    Ok(())
+
+    /// A missing id changes nothing, as an `UPDATE` matching no row does.
+    fn update(&mut self, saved: &SavedSearch) -> Result<()> {
+        let Some(stored) = self.saved_searches.get(engine_id(&saved.id)) else {
+            return Ok(());
+        };
+        ensure_same_id(&stored.id, &saved.id)?;
+        let row = SavedSearchRow {
+            query: saved.query.clone(),
+            filters: encode_filters(&saved.filters),
+            watch: i64::from(saved.watch),
+            updated_at: saved.updated_at.clone(),
+            ..stored
+        };
+        self.saved_searches.replace(row).map_err(engine_error)
+    }
+
+    fn get(&self, id: &str) -> Result<SavedSearch> {
+        let row = self
+            .saved_searches
+            .get(engine_id(id))
+            .filter(|row| row.id == id)
+            .ok_or(StoreError::NotFound)?;
+        Ok(row.to_model())
+    }
+
+    fn get_by_name(&self, name: &str) -> Result<Option<SavedSearch>> {
+        Ok(by_name(self, name).map(|row| row.to_model()))
+    }
+
+    /// By name in byte order: SQLite's `BINARY` collation.
+    fn list(&self) -> Result<Vec<SavedSearch>> {
+        let mut rows: Vec<SavedSearchRow> = self
+            .saved_searches
+            .all_ids()
+            .into_iter()
+            .filter_map(|id| self.saved_searches.get(id))
+            .collect();
+        rows.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(rows.iter().map(SavedSearchRow::to_model).collect())
+    }
+
+    /// A missing id is not an error, as a `DELETE` matching no row is not.
+    fn delete(&mut self, id: &str) -> Result<()> {
+        for seen in seen_rows(self, id) {
+            deleted(self.seen.delete(seen))?;
+        }
+        let target = engine_id(id);
+        match self.saved_searches.get(target) {
+            Some(stored) if stored.id == id => deleted(self.saved_searches.delete(target)),
+            _ => Ok(()),
+        }
+    }
+
+    fn seen_ids(&self, saved_search_id: &str) -> Result<HashSet<String>> {
+        Ok(seen_rows(self, saved_search_id)
+            .into_iter()
+            .filter_map(|id| self.seen.get(id))
+            .map(|row| row.memory_id)
+            .collect())
+    }
+
+    fn has_any_seen(&self, saved_search_id: &str) -> Result<bool> {
+        Ok(!seen_rows(self, saved_search_id).is_empty())
+    }
+
+    /// An id already recorded keeps its first `first_seen_at`, as
+    /// `INSERT OR IGNORE` does.
+    fn mark_seen(&mut self, saved_search_id: &str, memory_ids: &[String], now: &str) -> Result<()> {
+        let first_seen_us = micros(now);
+        for memory_id in memory_ids {
+            let key = pair_engine_id(saved_search_id, memory_id);
+            if self.seen.get(key).is_some() {
+                continue;
+            }
+            let row = SeenRow {
+                engine_id: key,
+                saved_search_id: saved_search_id.to_string(),
+                memory_id: memory_id.clone(),
+                first_seen_at: now.to_string(),
+                first_seen_us,
+            };
+            self.seen.insert(row).map_err(engine_error)?;
+        }
+        Ok(())
+    }
 }
 
 fn by_name(tables: &EngineTables, name: &str) -> Option<SavedSearchRow> {
@@ -260,6 +254,13 @@ fn by_name(tables: &EngineTables, name: &str) -> Option<SavedSearchRow> {
 
 fn seen_rows(tables: &EngineTables, saved_search_id: &str) -> Vec<Uuid> {
     FilterEq::<SeenRow, BySearch>::filter_eq(&tables.seen, &saved_search_id.to_string())
+}
+
+/// The port's shared behaviour, on fresh temporary engine tables.
+#[cfg(test)]
+mod conformance_tests {
+    use super::EngineTables;
+    crate::db::saved_searches::saved_search_conformance!(EngineTables::open_temporary().unwrap());
 }
 
 #[cfg(test)]
@@ -282,20 +283,12 @@ mod tests {
     #[test]
     fn the_first_seen_time_is_kept() {
         let mut tables = EngineTables::open_temporary().unwrap();
-        mark_seen(
-            &mut tables,
-            "ss_1",
-            &["m1".to_string()],
-            "2026-09-25T00:00:00+00:00",
-        )
-        .unwrap();
-        mark_seen(
-            &mut tables,
-            "ss_1",
-            &["m1".to_string()],
-            "2026-09-26T00:00:00+00:00",
-        )
-        .unwrap();
+        tables
+            .mark_seen("ss_1", &["m1".to_string()], "2026-09-25T00:00:00+00:00")
+            .unwrap();
+        tables
+            .mark_seen("ss_1", &["m1".to_string()], "2026-09-26T00:00:00+00:00")
+            .unwrap();
         let row = tables.seen.get(pair_engine_id("ss_1", "m1")).unwrap();
         assert_eq!(row.first_seen_at, "2026-09-25T00:00:00+00:00");
         assert_eq!(row.first_seen_us, micros("2026-09-25T00:00:00+00:00"));
@@ -308,18 +301,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         {
             let mut tables = EngineTables::open(&dir).unwrap();
-            insert(&mut tables, &saved("ss_1", "one")).unwrap();
-            mark_seen(
-                &mut tables,
-                "ss_1",
-                &["m1".to_string()],
-                "2026-09-25T00:00:00+00:00",
-            )
-            .unwrap();
+            SavedSearchStore::insert(&mut tables, &saved("ss_1", "one")).unwrap();
+            tables
+                .mark_seen("ss_1", &["m1".to_string()], "2026-09-25T00:00:00+00:00")
+                .unwrap();
         }
         let tables = crate::db::engine::reopen(&dir);
-        assert_eq!(get(&tables, "ss_1").unwrap(), saved("ss_1", "one"));
-        assert_eq!(seen_ids(&tables, "ss_1"), HashSet::from(["m1".to_string()]));
+        assert_eq!(
+            SavedSearchStore::get(&tables, "ss_1").unwrap(),
+            saved("ss_1", "one")
+        );
+        assert_eq!(
+            tables.seen_ids("ss_1").unwrap(),
+            HashSet::from(["m1".to_string()])
+        );
         drop(tables);
         std::fs::remove_dir_all(&dir).unwrap();
     }
