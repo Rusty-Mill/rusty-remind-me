@@ -44,7 +44,12 @@ Programme questions (which Millwright phase, R-milestone order, gates) belong to
 ## Hard lines
 - No store change before the storage port and the R3 benchmark (D2).
 - Ask first: schema or data migrations, public API changes (MCP tool names and
-  signatures included), deletions, dependency or toolchain bumps (D3).
+  signatures included), deletions, dependency or toolchain bumps (D3, D17).
+- Dialogs are never consolidated, merged, rewritten or pruned automatically;
+  Nano's own delete deletes (D13).
+- Luhn-passing card-shaped numbers stay redacted, no context exemption (D15).
+- Wiki compiles with the local model are started from the dashboard, not run in
+  the background (D16).
 Hard lines come only from `[stated]` rows (D11). Anything that would cross one
 escalates, and crossing one reverses its row: a request to skip an ask-first rule
 reverses D3. Report that row's D# in `REVERSES`.
