@@ -2,6 +2,17 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-16 — Storage port: promotions, sync state, outbox and imports (ADR-0035, Millwright R2)
+
+### Changed
+- Four more storage ports, each implemented by the engine: `db::promotions::PromotionStore` (the promotions table and the promotion reads), `db::sync_state::SyncStateStore` (sync log, flags and send markers), `db::outbox::OutboxStore` (reading, clearing, backfilling and pruning the outbox) and `db::imports::ImportStore` (chat, dbs and mempalace import bookkeeping). `Promotions`, `SyncState`, `Outbox` and `ImportLedger` lock per call and go through them. No behaviour, schema or caller changes.
+- The promotion, outbox and import adapters fold their free functions into the `impl`, keeping free only the helpers other adapters share. The sync state adapter takes over the cursor and stamp updates the facade used to write, and reaches flags and sends through the outbox module that holds their tables.
+- Sync state was planned for a later PR; it moved forward because the outbox suite marks sends through it.
+
+### Tests
+- `promotion_conformance!`, `sync_state_conformance!`, `outbox_conformance!` and `import_conformance!` run on temporary engine tables, seeding through the memory, entity, stats and sync state ports. The promotion reads over the curation corpus move here from the curation facade test. New check: a row the remote has taken goes at a prune.
+- Two tests read engine tables directly and stay on the facades: send markers replaced in place, and pruning backdated rows.
+
 ## 2026-11-16 — Storage port: archives, entities and curation (ADR-0035, Millwright R2)
 
 ### Changed
