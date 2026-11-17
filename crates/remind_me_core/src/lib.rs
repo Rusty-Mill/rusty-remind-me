@@ -27,6 +27,7 @@ pub mod date_phrase;
 pub mod db;
 pub mod dbs_import;
 pub mod digest;
+pub mod duplicates;
 pub mod embedder;
 pub mod entity;
 pub mod entity_duplicates;
