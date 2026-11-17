@@ -2,6 +2,11 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-17 — Unblock cargo-deny after the chrono advisories
+
+### Changed
+- `deny.toml` ignores RUSTSEC-2026-0543 (chrono unmaintained) and RUSTSEC-2026-0555 (chrono-tz unmaintained), each with its reason. Neither has a safe upgrade or a known defect, and replacing chrono is a migration, not a bump. The owner chose to ignore them on 2026-11-17. Without this, the advisories check fails on `main` and every PR.
+
 ## 2026-11-16 — Tell stated facts from inferences (Mill Board #1553)
 
 ### Added

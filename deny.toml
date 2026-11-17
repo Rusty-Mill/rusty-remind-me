@@ -13,6 +13,8 @@ ignore = [
     { id = "RUSTSEC-2023-0071", reason = "rsa Marvin timing attack, no patched release exists (patched = []). Reached via jsonwebtoken for JWT RS* verification; re-check on every rsa release." },
     { id = "RUSTSEC-2023-0018", reason = "remove_dir_all 0.5 via tempdir <- mmap <- perfcnt <- criterion-perf-events: optional Linux-only `perf-events` benchmark feature of rusty_multimodal_db, never in a shipped binary." },
     { id = "RUSTSEC-2025-0141", reason = "bincode 1.3.3 unmaintained (its team ceased development; 1.3.3 is declared complete, no known defect). It is the on-disk and wire encoding of rusty_multimodal_db and rusty_multimodal_db_engine (pinned \"1\" on purpose), so replacing it needs a format migration. Planned: ADR-0009 future growth." },
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained (announced chronotope/chrono#1768, no safe upgrade, no known defect). Used throughout remind_me_core for timestamps; replacing it (jiff or time) is a migration, not a bump. Owner chose to ignore, 2026-11-17; re-check on any chrono release or a security advisory." },
+    { id = "RUSTSEC-2026-0555", reason = "chrono-tz unmaintained, same announcement as chrono (RUSTSEC-2026-0543), no safe upgrade. Resolves date phrases in the configured zone; leaves with chrono. Owner chose to ignore, 2026-11-17." },
 ]
 
 [licenses]
