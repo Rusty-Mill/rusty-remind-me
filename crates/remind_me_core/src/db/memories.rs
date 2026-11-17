@@ -267,6 +267,9 @@ pub struct Narrowing {
     pub topic: Option<HashSet<String>>,
     /// Normalized with [`crate::context::normalize_remote`].
     pub repo: Option<String>,
+    /// Only memories with no project. A scope's unset project admits every
+    /// project; this admits none.
+    pub projectless: bool,
 }
 
 /// The memories an entity covers: linked to it, or naming it as subject or
@@ -295,6 +298,7 @@ impl Narrowing {
                     .and_then(crate::context::normalize_remote)
                     .is_some_and(|got| got.eq_ignore_ascii_case(want))
             })
+            && (!self.projectless || memory.project.is_none())
     }
 
     fn admits_tags(&self, tags: &[String]) -> bool {

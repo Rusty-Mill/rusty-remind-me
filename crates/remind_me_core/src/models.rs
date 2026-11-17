@@ -1290,6 +1290,13 @@ pub struct DecomposeResult {
     pub relations_linked: usize,
     /// Memories superseded because a fact contradicted them.
     pub superseded_ids: Vec<String>,
+    /// Likely near-duplicates of each fact, by fact id; facts with none are
+    /// left out, and so is the field when no fact has any.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub duplicate_candidates: std::collections::BTreeMap<String, Vec<DuplicateCandidate>>,
+    /// The first duplicate check that failed; the facts still stand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duplicate_check_error: Option<String>,
 }
 
 /// Request for a batch of captures still awaiting decomposition.
@@ -2060,13 +2067,50 @@ pub struct SaveCheck {
     pub contradiction_check_error: Option<String>,
 }
 
-/// A memory as a write returns it, with the contradiction check's findings.
+/// Why an existing memory was matched as a near-duplicate of a new one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DuplicateReason {
+    /// The same text, ignoring case and spacing.
+    Exact,
+    /// Enough word overlap (Jaccard).
+    Keyword,
+    /// Close enough embeddings (cosine).
+    Semantic,
+}
+
+/// An existing memory that a just-written one may duplicate.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DuplicateCandidate {
+    pub memory: ContradictionSide,
+    /// `1.0` for [`DuplicateReason::Exact`], else the word overlap or the
+    /// cosine similarity that cleared its threshold, whichever is higher.
+    pub score: f64,
+    pub reason: DuplicateReason,
+}
+
+/// What the near-duplicate check on save adds to a write's result. Both
+/// fields are omitted when empty, so a write that found nothing reads as
+/// it always has.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DuplicateCheck {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub duplicate_candidates: Vec<DuplicateCandidate>,
+    /// The check failed; the write it followed still stands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duplicate_check_error: Option<String>,
+}
+
+/// A memory as a write returns it, with the contradiction and near-duplicate
+/// checks' findings.
 #[derive(Debug, Clone, Serialize)]
 pub struct SavedMemory<'a> {
     #[serde(flatten)]
     pub memory: &'a Memory,
     #[serde(flatten)]
     pub check: SaveCheck,
+    #[serde(flatten)]
+    pub duplicates: DuplicateCheck,
 }
 
 /// A page of candidate pairs.

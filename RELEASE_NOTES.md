@@ -12,6 +12,19 @@ Dated entries, newest first. One entry per merged pull request.
 ### Tests
 - `search_method_test`: keyword-only search, each method with an embedder, dormant counts from both halves, the caller's floor not counted as dormant. Render tests over real searches: keyword-only and hybrid footers differ, badges agree with the footer, JSON matches markdown, a dormant count with no hits.
 
+## 2026-11-16 — Duplicate warning on every save (Mill Board #1486)
+
+### Added
+- `remind_me_add` and `remind_me_decompose` return likely near-duplicates of what they just wrote: `duplicate_candidates` on an add (a markdown warning in that format), and `duplicate_candidates` keyed by fact id on a decompose. Each carries the existing memory's snippet, a score and a reason: `exact` (same text, ignoring case and spacing), `keyword` (word overlap at least 0.6) or `semantic` (cosine at least 0.9). At most 3 per write, from the same project only, never sensitive or raw dialogs.
+- The check never blocks or merges. A failure is logged with the memory id and reported as `duplicate_check_error`; the write stands.
+- Cost: one full-text query over at most 32 of the new text's words (10 hits), and, when the new memory already has a vector, one nearest-neighbour lookup with that stored vector. Nothing extra is embedded. Decomposed facts are not embedded at write time, so they get the keyword side only.
+
+### Changed
+- `vectors::nearest_admitted` holds the vector-in half of `semantic_search_admitted`, so a caller with a stored vector can search without embedding again. `vectors::first_chunk_vector` reads one.
+
+### Tests
+- `duplicate_check_test`: exact duplicate, reworded restatement, paraphrase by embedding, unrelated, other project, sensitive, unknown memory, a failed check, and decompose reporting by fact.
+
 ## 2026-11-16 — Storage port: promotions, sync state, outbox and imports (ADR-0035, Millwright R2)
 
 ### Changed

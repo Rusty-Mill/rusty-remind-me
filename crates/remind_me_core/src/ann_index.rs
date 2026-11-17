@@ -154,8 +154,14 @@ mod backend {
         path.with_extension("ann.meta")
     }
 
-    /// Candidate memory ids for a query, or `None` to fall back.
-    pub fn candidates(store: &Store<'_>, query: &[f32], want: usize) -> Option<Vec<String>> {
+    /// Candidate memory ids for a query, or `None` to fall back. With
+    /// `allow_stale`, an index built before the latest vectors still answers.
+    pub fn candidates(
+        store: &Store<'_>,
+        query: &[f32],
+        want: usize,
+        allow_stale: bool,
+    ) -> Option<Vec<String>> {
         let path = index_path(store)?;
         if !path.exists() {
             return None;
@@ -177,7 +183,7 @@ mod backend {
 
         // Stale, or built at a dimension this query is not in. Either way the
         // answers would be wrong in a way that still looks plausible.
-        if built_count != live_count || built_dimension != live_dimension {
+        if (!allow_stale && built_count != live_count) || built_dimension != live_dimension {
             return None;
         }
         if query.len() != live_dimension {
@@ -223,7 +229,12 @@ mod backend {
         )
     }
 
-    pub fn candidates(_conn: &Store<'_>, _query: &[f32], _want: usize) -> Option<Vec<String>> {
+    pub fn candidates(
+        _conn: &Store<'_>,
+        _query: &[f32],
+        _want: usize,
+        _allow_stale: bool,
+    ) -> Option<Vec<String>> {
         None
     }
 }
@@ -236,5 +247,14 @@ pub fn build(store: &Store<'_>) -> Result<usize, String> {
 /// Candidate memory ids to score exactly, or `None` when the caller should
 /// fall back to a full scan.
 pub fn candidates(store: &Store<'_>, query: &[f32], want: usize) -> Option<Vec<String>> {
-    backend::candidates(store, query, want)
+    backend::candidates(store, query, want, false)
+}
+
+/// [`candidates`] from the last built index even when vectors were added
+/// since, so memories embedded after the build are never proposed. For a
+/// best-effort check that scores the proposals exactly against live chunks
+/// (deleted memories drop out there), never for a search: a write makes the
+/// index stale at once, and a check on that write must still stay bounded.
+pub fn stale_candidates(store: &Store<'_>, query: &[f32], want: usize) -> Option<Vec<String>> {
+    backend::candidates(store, query, want, true)
 }
