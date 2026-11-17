@@ -196,10 +196,10 @@ fn format_or(args: &serde_json::Value, default: ResponseFormat) -> ResponseForma
 use remind_me_core::kinds::StructuredFields;
 use remind_me_core::{
     backup, capture, consolidation::consolidate, context_brief, contradictions, db::queries,
-    dbs_import, digest, entity, entity_duplicates, export, history, importer, mempalace_import,
-    normalize, recalibrate, saved_searches, stats, status, undo_import, updater, vectors, vitality,
-    watcher, webhook::Webhook, wiki, wiki_fs::Wiki, wiki_import, AnnotateInput, AutoCaptureInput,
-    BriefInput, BulkImportDirInput, ChatImportInput, ConsolidateInput,
+    dbs_import, digest, duplicates, entity, entity_duplicates, export, history, importer,
+    mempalace_import, normalize, recalibrate, saved_searches, stats, status, undo_import, updater,
+    vectors, vitality, watcher, webhook::Webhook, wiki, wiki_fs::Wiki, wiki_import, AnnotateInput,
+    AutoCaptureInput, BriefInput, BulkImportDirInput, ChatImportInput, ConsolidateInput,
     ContradictionCandidatesInput, Database, DbsImportInput, DecomposeBatchInput, DecomposeInput,
     DigestInput, EntityInput, EntityLookupInput, EntityTraverseInput, ExportInput,
     ExtractBatchInput, FeedbackInput, HistoryInput, ListRemindersInput, MemoryAddInput,
@@ -683,7 +683,7 @@ impl McpServer {
                         "tools": [
                             {
                                 "name": "remind_me_add",
-                                "description": "Save a fact, decision, preference or note to remind-me memory; call this whenever the user states something durable. A decision needs metadata.rationale. Saving a decision checks it against the standing, non-sensitive decisions in the same project on the same claim or a shared entity and returns likely conflicts as contradiction_candidates; nothing is blocked or superseded automatically. Pass supersedes to retire the old decision in the same call.",
+                                "description": "Save a fact, decision, preference or note to remind-me memory; call this whenever the user states something durable. A decision needs metadata.rationale. Saving a decision checks it against the standing, non-sensitive decisions in the same project on the same claim or a shared entity and returns likely conflicts as contradiction_candidates. Any memory returns likely near-duplicates in its project as duplicate_candidates. Nothing is blocked or superseded automatically. Pass supersedes to retire the old decision in the same call.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -1779,9 +1779,10 @@ impl McpServer {
                                 match queries::add_memory_with(&store, add_input, &fields) {
                                     Ok(mem) => {
                                         let check = contradictions::check_on_save(&store, &mem.id);
+                                        let duplicates = duplicates::check_on_save(&store, &mem.id);
                                         json!({ "content": [{ "type": "text", "text": match format {
-    ResponseFormat::Json => serde_json::to_string_pretty(&SavedMemory { memory: &mem, check }).unwrap(),
-    ResponseFormat::Markdown => render::memory_stored(&mem) + &render::save_check(&check),
+    ResponseFormat::Json => serde_json::to_string_pretty(&SavedMemory { memory: &mem, check, duplicates }).unwrap(),
+    ResponseFormat::Markdown => render::memory_stored(&mem) + &render::save_check(&check) + &render::duplicate_check(&duplicates),
 } }] })
                                     }
                                     Err(e) => {
@@ -1873,7 +1874,7 @@ impl McpServer {
                                             &fields,
                                         );
                                         json!({ "content": [{ "type": "text", "text": match format {
-    ResponseFormat::Json => serde_json::to_string_pretty(&SavedMemory { memory: &mem, check }).unwrap(),
+    ResponseFormat::Json => serde_json::to_string_pretty(&SavedMemory { memory: &mem, check, duplicates: Default::default() }).unwrap(),
     ResponseFormat::Markdown => render::memory_updated(&mem) + &render::save_check(&check),
 } }] })
                                     }

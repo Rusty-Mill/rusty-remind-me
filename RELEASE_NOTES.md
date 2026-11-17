@@ -10,6 +10,29 @@ Dated entries, newest first. One entry per merged pull request.
 - `docs/handoff/sources/rust-adherence.md`: the Rust adherence audit taken at `9aff941`, copied in as a not-binding source.
 - `.claude/agents/rusty-remind-me-expert.md` and a "Project experts" table in CLAUDE.md, so design questions go to the expert before Nano.
 
+## 2026-11-16 — Search says how it ran (#230, Mill Board #1186)
+
+### Added
+- Each search hit carries `search_method`: `keyword`, `semantic` or `hybrid`, from which ranked list found it (set in `rank_rrf` from list membership, not from `vec_score`, which is set for every hit whenever semantic search ran). `None` for a window listing with no query.
+- Search responses carry `dormant_excluded`: matches left out for being dormant, from both halves (the keyword side with one extra bounded full-text query at the same depth; the semantic side counted inside the scan). A memory below the caller's own `min_vitality` is not counted. `0` with `include_dormant`.
+- Markdown: a badge per hit (`🔤` keyword, `🔮` semantic, `⚡` hybrid) in both details, and a `_Tiers: N keyword, N semantic, N hybrid | N dormant excluded_` footer, also shown when nothing matched. Compact JSON hits gain `search_method`. `semantic_distance` and the verbose rank line stay out of scope.
+
+### Tests
+- `search_method_test`: keyword-only search, each method with an embedder, dormant counts from both halves, the caller's floor not counted as dormant. Render tests over real searches: keyword-only and hybrid footers differ, badges agree with the footer, JSON matches markdown, a dormant count with no hits.
+
+## 2026-11-16 — Duplicate warning on every save (Mill Board #1486)
+
+### Added
+- `remind_me_add` and `remind_me_decompose` return likely near-duplicates of what they just wrote: `duplicate_candidates` on an add (a markdown warning in that format), and `duplicate_candidates` keyed by fact id on a decompose. Each carries the existing memory's snippet, a score and a reason: `exact` (same text, ignoring case and spacing), `keyword` (word overlap at least 0.6) or `semantic` (cosine at least 0.9). At most 3 per write, from the same project only, never sensitive or raw dialogs.
+- The check never blocks or merges. A failure is logged with the memory id and reported as `duplicate_check_error`; the write stands.
+- Cost: one full-text query over at most 32 of the new text's words (10 hits), and, when the new memory already has a vector, one nearest-neighbour lookup with that stored vector. Nothing extra is embedded. Decomposed facts are not embedded at write time, so they get the keyword side only.
+
+### Changed
+- `vectors::nearest_admitted` holds the vector-in half of `semantic_search_admitted`, so a caller with a stored vector can search without embedding again. `vectors::first_chunk_vector` reads one.
+
+### Tests
+- `duplicate_check_test`: exact duplicate, reworded restatement, paraphrase by embedding, unrelated, other project, sensitive, unknown memory, a failed check, and decompose reporting by fact.
+
 ## 2026-11-16 — Storage port: promotions, sync state, outbox and imports (ADR-0035, Millwright R2)
 
 ### Changed
