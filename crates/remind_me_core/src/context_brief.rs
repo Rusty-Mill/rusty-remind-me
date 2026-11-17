@@ -52,7 +52,7 @@ use crate::models::{Memory, MemorySearchInput, ReminderWindow};
 use crate::text::edit_distance;
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// The window when none is given.
 pub const DEFAULT_SINCE: &str = "7d";
@@ -253,7 +253,7 @@ pub fn build(store: &Store<'_>, request: &ContextRequest<'_>) -> Result<Outcome>
     let prompt = request.prompt.map(str::trim).filter(|p| !p.is_empty());
     if request.mode == Mode::Prompt {
         let drafts = match prompt {
-            Some(prompt) => vec![hits_draft(store, prompt, now)?],
+            Some(prompt) => vec![hits_draft(store, prompt, &[], now)?],
             None => Vec::new(),
         };
         fit(&mut brief, drafts)?;
@@ -288,14 +288,17 @@ pub fn build(store: &Store<'_>, request: &ContextRequest<'_>) -> Result<Outcome>
     };
 
     let in_scope: Vec<&Memory> = memories.iter().filter(|m| scope.admits(m)).collect();
+    // Before any section is drafted, so none shows both sides of one claim.
+    let in_scope = without_overruled(&in_scope);
     brief.project = scope.project_match(&in_scope);
 
     let mut drafts = Vec::new();
-    let mut rest = in_scope;
+    let mut rest = in_scope.clone();
     if request.mode == Mode::Session {
         drafts.push(persona_draft(store)?);
         drafts.push(reminders_draft(store, now)?);
-        let reviews = reviews_draft(&memories, &scope, now);
+        let shown: HashSet<&str> = rest.iter().map(|m| m.id.as_str()).collect();
+        let reviews = reviews_draft(&memories, &shown, now);
         let listed: HashSet<&str> = reviews.items.iter().map(|i| i.id.as_str()).collect();
         rest.retain(|m| !listed.contains(m.id.as_str()));
         drafts.push(reviews);
@@ -303,7 +306,7 @@ pub fn build(store: &Store<'_>, request: &ContextRequest<'_>) -> Result<Outcome>
     drafts.extend(project_drafts(&rest, since, request.branch));
     if request.mode == Mode::Session {
         if let Some(prompt) = prompt {
-            drafts.push(hits_draft(store, prompt, now)?);
+            drafts.push(hits_draft(store, prompt, &in_scope, now)?);
         }
     }
     fit(&mut brief, drafts)?;
@@ -641,10 +644,12 @@ fn reminders_draft(store: &Store<'_>, now: DateTime<Utc>) -> Result<Draft> {
 
 /// Decisions in scope due for a follow-up review (`crate::review`), oldest
 /// due date first. Listed here, they are left out of the project sections.
-fn reviews_draft(memories: &[Memory], scope: &Scope, now: DateTime<Utc>) -> Draft {
+/// The decisions due for review among `memories`, keeping only the `shown`
+/// ids: those in scope and not overruled.
+fn reviews_draft(memories: &[Memory], shown: &HashSet<&str>, now: DateTime<Utc>) -> Draft {
     let items = crate::review::due_among(memories, now, None)
         .into_iter()
-        .filter(|m| scope.admits(m))
+        .filter(|m| shown.contains(m.id.as_str()))
         .take(REVIEW_LIMIT)
         .map(|m| Item {
             at: crate::review::review_due(m).unwrap_or_default().to_string(),
@@ -658,16 +663,62 @@ fn reviews_draft(memories: &[Memory], scope: &Scope, now: DateTime<Utc>) -> Draf
     }
 }
 
-fn hits_draft(store: &Store<'_>, prompt: &str, now: DateTime<Utc>) -> Result<Draft> {
+/// `memories` less each memory that loses a conflict to another of them
+/// ([`crate::contradictions::preferred`]: a stated memory beats an inferred
+/// one, #1553), so the brief never shows both sides of one claim. Order is
+/// kept. Only memories sharing a subject and predicate can conflict, so only
+/// those are compared.
+fn without_overruled<'a>(memories: &[&'a Memory]) -> Vec<&'a Memory> {
+    let key = |m: &Memory| -> Option<(String, String)> {
+        let norm = |s: &Option<String>| s.as_deref().map(|s| s.trim().to_lowercase());
+        Some((norm(&m.subject)?, norm(&m.predicate)?))
+    };
+    let mut groups: HashMap<(String, String), Vec<&Memory>> = HashMap::new();
+    for m in memories {
+        if let Some(k) = key(m) {
+            groups.entry(k).or_default().push(m);
+        }
+    }
+    let overruled = |m: &Memory| {
+        key(m).and_then(|k| groups.get(&k)).is_some_and(|group| {
+            group.iter().any(|other| {
+                crate::contradictions::preferred(m, other).is_some_and(|keep| keep.id == other.id)
+            })
+        })
+    };
+    memories.iter().copied().filter(|m| !overruled(m)).collect()
+}
+
+/// The prompt's matches, less any that loses a conflict to another match or
+/// to one of `rivals` (the memories the brief's other sections draw on), so
+/// hits never show an inference a statement shown elsewhere beat.
+fn hits_draft(
+    store: &Store<'_>,
+    prompt: &str,
+    rivals: &[&Memory],
+    now: DateTime<Utc>,
+) -> Result<Draft> {
     let input = MemorySearchInput {
         query: prompt.to_string(),
         limit: HIT_LIMIT * 2,
         ..MemorySearchInput::default()
     };
-    let items = crate::db::queries::search_memories(store, &input)?
+    let results = crate::db::queries::search_memories(store, &input)?;
+    let hits: Vec<&Memory> = results
         .iter()
         .map(|r| &r.memory)
         .filter(|m| injectable(m, now))
+        .collect();
+    let hit_ids: HashSet<&str> = hits.iter().map(|m| m.id.as_str()).collect();
+    let mut contenders = hits.clone();
+    contenders.extend(rivals.iter().filter(|m| !hit_ids.contains(m.id.as_str())));
+    let kept: HashSet<&str> = without_overruled(&contenders)
+        .into_iter()
+        .map(|m| m.id.as_str())
+        .collect();
+    let items = hits
+        .into_iter()
+        .filter(|m| kept.contains(m.id.as_str()))
         .take(HIT_LIMIT)
         .map(item)
         .collect();
@@ -898,6 +949,102 @@ mod tests {
             let memory = Memories::new(&store).get_live(id).unwrap().unwrap();
             assert_eq!(injectable(&memory, now), shown, "{until}");
         }
+    }
+
+    #[test]
+    fn a_hit_overruled_by_a_stated_one_is_left_out() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        let triple = |r: &mut NewMemory, object: &str, basis: serde_json::Value| {
+            r.subject = Some("service".into());
+            r.predicate = Some("runs_on".into());
+            r.object = Some(object.into());
+            r.metadata = basis;
+        };
+        add(&store, "mem_said", |r| {
+            triple(r, "aws", serde_json::json!({ "basis": "stated" }))
+        });
+        add(&store, "mem_guess", |r| {
+            triple(
+                r,
+                "gcp",
+                serde_json::json!({ "basis": "inferred", "premises": ["mem_x"] }),
+            )
+        });
+        add(&store, "mem_other", |_| {});
+        let get = |id: &str| Memories::new(&store).get_live(id).unwrap().unwrap();
+        let (said, guess, other) = (get("mem_said"), get("mem_guess"), get("mem_other"));
+
+        let kept: Vec<&str> = without_overruled(&[&guess, &other, &said])
+            .into_iter()
+            .map(|m| m.id.as_str())
+            .collect();
+        assert_eq!(kept, ["mem_other", "mem_said"]);
+    }
+
+    #[test]
+    fn activity_leaves_out_an_inference_a_statement_overrules() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        for (id, object, basis) in [
+            ("mem_said", "aws", serde_json::json!({ "basis": "stated" })),
+            (
+                "mem_guess",
+                "gcp",
+                serde_json::json!({ "basis": "inferred", "premises": ["mem_x"] }),
+            ),
+        ] {
+            add(&store, id, |r| {
+                r.project = Some("quokka".into());
+                r.subject = Some("service".into());
+                r.predicate = Some("runs_on".into());
+                r.object = Some(object.into());
+                r.metadata = basis;
+            });
+        }
+
+        let brief = brief(&store, &session(0));
+        assert_eq!(ids(&brief, "activity"), ["mem_said"]);
+    }
+
+    #[test]
+    fn hits_leave_out_an_inference_a_statement_elsewhere_overrules() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        for (id, object, content, basis) in [
+            (
+                "mem_said",
+                "aws",
+                "the service runs on aws",
+                serde_json::json!({ "basis": "stated" }),
+            ),
+            (
+                "mem_guess",
+                "gcp",
+                "probably gcp hosting",
+                serde_json::json!({ "basis": "inferred", "premises": ["mem_x"] }),
+            ),
+        ] {
+            add(&store, id, |r| {
+                r.content = content.into();
+                r.project = Some("quokka".into());
+                r.subject = Some("service".into());
+                r.predicate = Some("runs_on".into());
+                r.object = Some(object.into());
+                r.metadata = basis;
+            });
+        }
+
+        // The prompt matches only the inference; the statement is in scope.
+        let brief = brief(
+            &store,
+            &ContextRequest {
+                prompt: Some("gcp hosting"),
+                ..session(0)
+            },
+        );
+        assert!(!ids(&brief, "hits").contains(&"mem_guess".to_string()));
+        assert_eq!(ids(&brief, "activity"), ["mem_said"]);
     }
 
     fn add(store: &Store<'_>, id: &str, f: impl FnOnce(&mut NewMemory)) {

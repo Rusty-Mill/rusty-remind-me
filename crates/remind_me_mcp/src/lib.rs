@@ -336,7 +336,8 @@ fn decompose_input_schema() -> Value {
             "subject": { "type": "string", "maxLength": 200 },
             "predicate": { "type": "string", "maxLength": 200 },
             "object": { "type": "string", "maxLength": 500 },
-            "entities": { "type": "array", "items": entity, "maxItems": 20 }
+            "entities": { "type": "array", "items": entity, "maxItems": 20 },
+            "metadata": { "type": "object", "description": "basis: stated, inferred or pattern; premises: the memory ids an inferred (1+) or pattern (2+) fact rests on. A decision also needs rationale" }
         },
         "required": ["content"]
     });
@@ -1001,7 +1002,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_decompose",
-                                "description": "remind-me pipeline: break a captured conversation into individually searchable atomic facts, each linked to the capture. Write 2-5 per conversation, each self-contained for a reader with no other context: who, what, when and why, with relative dates resolved to absolute ones (2026-10-03, not 'last Friday'). A fact whose subject/predicate match an existing fact but whose object differs supersedes it.",
+                                "description": "remind-me pipeline: break a captured conversation into individually searchable atomic facts, each linked to the capture. Write 2-5 per conversation, each self-contained for a reader with no other context: who, what, when and why, with relative dates resolved to absolute ones (2026-10-03, not 'last Friday'). Set metadata.basis: stated if someone said it, inferred if you concluded it (list the memory ids it rests on in metadata.premises). A fact whose subject/predicate match an existing fact but whose object differs supersedes it.",
                                 "inputSchema": decompose_input_schema()
                             },
                             {
@@ -2317,10 +2318,6 @@ impl McpServer {
                                     || decompose_input.facts.len() > DECOMPOSE_FACTS_MAX
                                 {
                                     json!({ "isError": true, "content": [{ "type": "text", "text": format!("facts must hold {}..={} entries", DECOMPOSE_FACTS_MIN, DECOMPOSE_FACTS_MAX) }] })
-                                } else if let Err(e) =
-                                    remind_me_core::resolve::validate_facts(&decompose_input.facts)
-                                {
-                                    json!({ "isError": true, "content": [{ "type": "text", "text": store_error_text("Decompose error", &e) }] })
                                 } else {
                                     match capture::decompose(&store, &decompose_input) {
                                         Ok(Some(result)) => {

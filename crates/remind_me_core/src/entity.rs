@@ -3,6 +3,7 @@ use crate::db::entities::{Entities, RelationRow};
 use crate::db::memories::Memories;
 use crate::db::Result;
 use crate::db::Store;
+use crate::kinds::Basis;
 use crate::models::EntityInput;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -655,6 +656,22 @@ pub fn maybe_link_entity_relation(
     Ok(true)
 }
 
+/// Whether a new memory of `new_basis` is an inference and `old_id` was
+/// stated: a model's conclusion never retires what someone said (#1553).
+fn inference_against_statement(
+    memories: &Memories<'_>,
+    new_basis: Option<Basis>,
+    old_id: &str,
+) -> Result<bool> {
+    if new_basis != Some(Basis::Inferred) {
+        return Ok(false);
+    }
+    let old_basis = memories
+        .get_live(old_id)?
+        .and_then(|m| Basis::of(&m.metadata));
+    Ok(old_basis == Some(Basis::Stated))
+}
+
 /// Supersede live facts that a new triple contradicts.
 ///
 /// A memory sharing this triple's `(subject, predicate)` but carrying a
@@ -701,6 +718,9 @@ pub fn supersede_contradicting_facts(
 
     let memories = Memories::new(store);
     let candidates = memories.live_triples_except(memory_id)?;
+    let new_basis = memories
+        .get_live(memory_id)?
+        .and_then(|m| Basis::of(&m.metadata));
 
     let now = Utc::now().to_rfc3339();
     let mut superseded = Vec::new();
@@ -712,6 +732,9 @@ pub fn supersede_contradicting_facts(
         }
         if normalize_entity_name(&triple.object) == want_object {
             continue; // the same fact restated, not a contradiction
+        }
+        if inference_against_statement(&memories, new_basis, &triple.id)? {
+            continue; // both stay live; the contradiction queue prefers the statement
         }
         memories.set_superseded_by(&triple.id, memory_id, Some(&now))?;
         superseded.push(triple.id);
