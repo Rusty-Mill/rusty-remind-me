@@ -96,6 +96,59 @@ pub const STAKES: [&str; 2] = ["low", "normal"];
 /// The `status` values an action item's metadata may hold.
 pub const ACTION_STATUSES: [&str; 3] = ["open", "done", "dropped"];
 
+/// Where a memory's content came from (`metadata.basis`, Mill Board #1553).
+/// `written_by` says who wrote it; this says whether someone said it or a
+/// model concluded it. Unset on a memory written before it existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Basis {
+    /// Someone said it.
+    Stated,
+    /// A model concluded it from other memories (`metadata.premises`).
+    Inferred,
+    /// Seen across at least two sources (`metadata.premises`).
+    Pattern,
+}
+
+impl Basis {
+    pub const ALL: [Basis; 3] = [Self::Stated, Self::Inferred, Self::Pattern];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stated => "stated",
+            Self::Inferred => "inferred",
+            Self::Pattern => "pattern",
+        }
+    }
+
+    /// The fewest `metadata.premises` this basis needs.
+    fn min_premises(self) -> usize {
+        match self {
+            Self::Stated => 0,
+            Self::Inferred => 1,
+            Self::Pattern => 2,
+        }
+    }
+
+    /// How strongly a conflict is settled in this memory's favour: stated
+    /// beats unset and pattern, which beat inferred. Unset ranks with
+    /// pattern, so memories written before `basis` existed lose only to a
+    /// stated one.
+    pub fn rank(basis: Option<Self>) -> u8 {
+        match basis {
+            Some(Self::Stated) => 2,
+            Some(Self::Pattern) | None => 1,
+            Some(Self::Inferred) => 0,
+        }
+    }
+
+    /// The basis `metadata` records, if a valid one.
+    pub fn of(metadata: &Value) -> Option<Self> {
+        let raw = metadata.get("basis")?.as_str()?;
+        Self::ALL.into_iter().find(|b| b.as_str() == raw)
+    }
+}
+
 /// Why a kind, a field or a metadata value was refused. Every variant names
 /// the offending field so a model can fix the call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,8 +227,60 @@ pub fn check_rfc3339(
         .map_err(|_| bad(kind, field, "must be an RFC 3339 timestamp"))
 }
 
+/// Check `metadata.basis` and `metadata.premises`, on any kind: `basis` is
+/// one of [`Basis::ALL`]; `inferred` needs at least one premise id and
+/// `pattern` two; `stated` takes none, and neither does a memory with no
+/// basis.
+pub fn validate_basis(metadata: &Value) -> Result<(), KindError> {
+    const K: &str = "memory";
+    let basis = match str_field(metadata, K, "basis")? {
+        None => None,
+        Some(raw) => Some(
+            Basis::ALL
+                .into_iter()
+                .find(|b| b.as_str() == raw)
+                .ok_or_else(|| bad(K, "basis", "must be one of stated, inferred, pattern"))?,
+        ),
+    };
+    let premises = match metadata.get("premises") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(ids)) => ids
+            .iter()
+            .map(|id| id.as_str().filter(|s| !s.trim().is_empty()))
+            .collect::<Option<Vec<&str>>>()
+            .ok_or_else(|| bad(K, "premises", "must be an array of memory ids"))?,
+        Some(_) => return Err(bad(K, "premises", "must be an array of memory ids")),
+    };
+    let needed = basis.map_or(0, Basis::min_premises);
+    // A premise named twice is still one premise.
+    let distinct = premises
+        .iter()
+        .map(|id| id.trim())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    if distinct < needed {
+        return Err(bad(
+            K,
+            "premises",
+            format!(
+                "needs at least {needed} memory id(s) for basis {}",
+                basis.map_or("", Basis::as_str)
+            ),
+        ));
+    }
+    if !premises.is_empty() && needed == 0 {
+        return Err(bad(
+            K,
+            "premises",
+            "only applies to basis inferred or pattern",
+        ));
+    }
+    Ok(())
+}
+
 /// Check `metadata` against what `kind` requires. Unknown keys are allowed.
 pub fn validate_metadata(kind: MemoryKind, metadata: &Value) -> Result<(), KindError> {
+    validate_basis(metadata)?;
     match kind {
         MemoryKind::Decision => validate_decision(metadata),
         MemoryKind::ActionItem => validate_action_item(metadata),
@@ -283,8 +388,9 @@ impl StructuredFields {
         metadata: &Value,
         effective_type: Option<&str>,
     ) -> Result<(), KindError> {
-        if let Some(t) = &self.memory_type {
-            validate_metadata(t.parse()?, metadata)?;
+        match &self.memory_type {
+            Some(t) => validate_metadata(t.parse()?, metadata)?,
+            None => validate_basis(metadata)?,
         }
         if let Some(c) = self.confidence {
             if !(0.0..=1.0).contains(&c) {
@@ -411,6 +517,73 @@ pub fn kind_lines(m: &crate::models::Memory) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn each_basis_is_accepted_with_its_premises() {
+        use serde_json::json;
+        for meta in [
+            json!({}),
+            json!({ "basis": "stated" }),
+            json!({ "basis": "inferred", "premises": ["mem_a"] }),
+            json!({ "basis": "pattern", "premises": ["mem_a", "mem_b"] }),
+        ] {
+            assert!(super::validate_basis(&meta).is_ok(), "{meta}");
+            assert!(super::validate_metadata(super::MemoryKind::Fact, &meta).is_ok());
+        }
+    }
+
+    #[test]
+    fn a_basis_without_enough_premises_or_an_unknown_one_is_refused() {
+        use serde_json::json;
+        for (meta, says) in [
+            (json!({ "basis": "inferred" }), "at least 1"),
+            (
+                json!({ "basis": "pattern", "premises": ["mem_a"] }),
+                "at least 2",
+            ),
+            (json!({ "basis": "guessed" }), "must be one of stated"),
+            (json!({ "basis": 1 }), "must be a string"),
+            (
+                json!({ "basis": "stated", "premises": ["mem_a"] }),
+                "only applies",
+            ),
+            (json!({ "premises": ["mem_a"] }), "only applies"),
+            (
+                json!({ "basis": "pattern", "premises": ["mem_a", "mem_a"] }),
+                "at least 2",
+            ),
+            (
+                json!({ "basis": "inferred", "premises": [""] }),
+                "array of memory ids",
+            ),
+            (
+                json!({ "basis": "inferred", "premises": "mem_a" }),
+                "array of memory ids",
+            ),
+        ] {
+            let e = super::validate_basis(&meta).unwrap_err().to_string();
+            assert!(e.contains(says), "{meta}: {e}");
+        }
+    }
+
+    #[test]
+    fn untyped_writes_still_check_the_basis() {
+        let bad = serde_json::json!({ "basis": "inferred" });
+        assert!(super::StructuredFields::default()
+            .validate(&bad, None)
+            .is_err());
+    }
+
+    #[test]
+    fn stated_outranks_unset_and_pattern_which_outrank_inferred() {
+        use super::Basis;
+        assert!(Basis::rank(Some(Basis::Stated)) > Basis::rank(None));
+        assert_eq!(Basis::rank(None), Basis::rank(Some(Basis::Pattern)));
+        assert!(Basis::rank(None) > Basis::rank(Some(Basis::Inferred)));
+        let meta = serde_json::json!({ "basis": "pattern" });
+        assert_eq!(Basis::of(&meta), Some(Basis::Pattern));
+        assert_eq!(Basis::of(&serde_json::json!({ "basis": "x" })), None);
+    }
+
     use super::*;
     use serde_json::json;
 

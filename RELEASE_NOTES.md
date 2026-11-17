@@ -7,6 +7,21 @@ Dated entries, newest first. One entry per merged pull request.
 ### Changed
 - `deny.toml` ignores RUSTSEC-2026-0543 (chrono unmaintained) and RUSTSEC-2026-0555 (chrono-tz unmaintained), each with its reason. Neither has a safe upgrade or a known defect, and replacing chrono is a migration, not a bump. The owner chose to ignore them on 2026-11-17. Without this, the advisories check fails on `main` and every PR.
 
+## 2026-11-16 — Tell stated facts from inferences (Mill Board #1553)
+
+### Added
+- `metadata.basis`: `stated` (someone said it), `inferred` (a model concluded it) or `pattern` (seen across sources), with `metadata.premises` (memory ids, at least 1 for inferred and 2 for pattern). Checked at the boundary on every add, update, decompose (in core, whatever the caller) and reclassify, whatever the memory type; unknown values, missing premises, and premises on a stated memory are refused with the field named. No schema change.
+- `remind_me_promote` records `basis` (`pattern` from two or more distinct sources, else `inferred`) and its sources as `premises`. `remind_me_decompose`'s description and fact schema tell writers how to set it.
+- docs/design/stated-vs-inferred.md: the values, who sets them, and how they map onto #1442's trust tiers.
+
+### Changed
+- `contradictions::preferred` ranks basis first (stated, then unset or pattern, then inferred), before confidence. The contradiction queue's `recommended_keep` follows it.
+- The session brief drops any memory that loses a conflict to another in scope, in every section including prompt hits, so it never shows both sides of one claim.
+- A new `inferred` triple no longer supersedes a contradicting `stated` one; both stay live. Every other write supersedes as before.
+
+### Tests
+- `basis_test`: each basis stored, refusals, a decomposed fact's basis checked, promotion premises, an inference not retiring a statement, a statement still retiring one, stated beating higher confidence. Unit tests for `validate_basis`, the rank order and the brief's conflict filter.
+
 ## 2026-11-16 — Search says how it ran (#230, Mill Board #1186)
 
 ### Added

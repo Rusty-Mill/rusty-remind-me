@@ -52,7 +52,7 @@ use crate::db::curation::Curation;
 use crate::db::memories::Memories;
 use crate::db::Result;
 use crate::db::Store;
-use crate::kinds::StructuredFields;
+use crate::kinds::{Basis, StructuredFields};
 use crate::models::{
     ConflictReason, ContradictionCandidate, ContradictionCandidatesResult, ContradictionSide,
     DecisionConflict, Memory, MemoryUpdateInput, SaveCheck,
@@ -88,18 +88,23 @@ fn conflicting_triples(a: &Memory, b: &Memory) -> bool {
     sa.is_some() && sa == sb && pa.is_some() && pa == pb && oa.is_some() && ob.is_some() && oa != ob
 }
 
-/// Which of two conflicting memories to keep: higher confidence, then newer
-/// `verified_at`, then newer `updated_at`. `None` for a pair that is not a
-/// triple conflict, or ties on all three. RFC 3339 strings are compared as
-/// text, as everywhere else in this crate.
+/// Which of two conflicting memories to keep: the stronger basis (stated
+/// over unset or pattern over inferred, [`Basis::rank`]), then higher
+/// confidence, then newer `verified_at`, then newer `updated_at`. `None` for
+/// a pair that is not a triple conflict, or ties on all four. RFC 3339
+/// strings are compared as text, as everywhere else in this crate.
 pub fn preferred<'a>(a: &'a Memory, b: &'a Memory) -> Option<&'a Memory> {
     if !conflicting_triples(a, b) {
         return None;
     }
-    let order = a
-        .confidence
-        .partial_cmp(&b.confidence)
-        .unwrap_or(Ordering::Equal)
+    let basis = |m: &Memory| Basis::rank(Basis::of(&m.metadata));
+    let order = basis(a)
+        .cmp(&basis(b))
+        .then_with(|| {
+            a.confidence
+                .partial_cmp(&b.confidence)
+                .unwrap_or(Ordering::Equal)
+        })
         .then_with(|| a.verified_at.cmp(&b.verified_at))
         .then_with(|| a.updated_at.cmp(&b.updated_at));
     match order {

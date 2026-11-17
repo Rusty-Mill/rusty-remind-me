@@ -317,6 +317,7 @@ pub fn decompose(store: &Store<'_>, input: &DecomposeInput) -> Result<Option<Dec
     for fact in &input.facts {
         crate::project::refuse_reserved_predicate(fact.predicate.as_deref())?;
     }
+    crate::resolve::validate_facts(&input.facts)?;
     let revision = input
         .capture_revision
         .as_deref()
