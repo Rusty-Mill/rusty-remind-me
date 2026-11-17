@@ -253,7 +253,7 @@ pub fn build(store: &Store<'_>, request: &ContextRequest<'_>) -> Result<Outcome>
     let prompt = request.prompt.map(str::trim).filter(|p| !p.is_empty());
     if request.mode == Mode::Prompt {
         let drafts = match prompt {
-            Some(prompt) => vec![hits_draft(store, prompt, now)?],
+            Some(prompt) => vec![hits_draft(store, prompt, &[], now)?],
             None => Vec::new(),
         };
         fit(&mut brief, drafts)?;
@@ -293,7 +293,7 @@ pub fn build(store: &Store<'_>, request: &ContextRequest<'_>) -> Result<Outcome>
     brief.project = scope.project_match(&in_scope);
 
     let mut drafts = Vec::new();
-    let mut rest = in_scope;
+    let mut rest = in_scope.clone();
     if request.mode == Mode::Session {
         drafts.push(persona_draft(store)?);
         drafts.push(reminders_draft(store, now)?);
@@ -306,7 +306,7 @@ pub fn build(store: &Store<'_>, request: &ContextRequest<'_>) -> Result<Outcome>
     drafts.extend(project_drafts(&rest, since, request.branch));
     if request.mode == Mode::Session {
         if let Some(prompt) = prompt {
-            drafts.push(hits_draft(store, prompt, now)?);
+            drafts.push(hits_draft(store, prompt, &in_scope, now)?);
         }
     }
     fit(&mut brief, drafts)?;
@@ -689,7 +689,15 @@ fn without_overruled<'a>(memories: &[&'a Memory]) -> Vec<&'a Memory> {
     memories.iter().copied().filter(|m| !overruled(m)).collect()
 }
 
-fn hits_draft(store: &Store<'_>, prompt: &str, now: DateTime<Utc>) -> Result<Draft> {
+/// The prompt's matches, less any that loses a conflict to another match or
+/// to one of `rivals` (the memories the brief's other sections draw on), so
+/// hits never show an inference a statement shown elsewhere beat.
+fn hits_draft(
+    store: &Store<'_>,
+    prompt: &str,
+    rivals: &[&Memory],
+    now: DateTime<Utc>,
+) -> Result<Draft> {
     let input = MemorySearchInput {
         query: prompt.to_string(),
         limit: HIT_LIMIT * 2,
@@ -701,8 +709,16 @@ fn hits_draft(store: &Store<'_>, prompt: &str, now: DateTime<Utc>) -> Result<Dra
         .map(|r| &r.memory)
         .filter(|m| injectable(m, now))
         .collect();
-    let items = without_overruled(&hits)
+    let hit_ids: HashSet<&str> = hits.iter().map(|m| m.id.as_str()).collect();
+    let mut contenders = hits.clone();
+    contenders.extend(rivals.iter().filter(|m| !hit_ids.contains(m.id.as_str())));
+    let kept: HashSet<&str> = without_overruled(&contenders)
         .into_iter()
+        .map(|m| m.id.as_str())
+        .collect();
+    let items = hits
+        .into_iter()
+        .filter(|m| kept.contains(m.id.as_str()))
         .take(HIT_LIMIT)
         .map(item)
         .collect();
@@ -988,6 +1004,46 @@ mod tests {
         }
 
         let brief = brief(&store, &session(0));
+        assert_eq!(ids(&brief, "activity"), ["mem_said"]);
+    }
+
+    #[test]
+    fn hits_leave_out_an_inference_a_statement_elsewhere_overrules() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        for (id, object, content, basis) in [
+            (
+                "mem_said",
+                "aws",
+                "the service runs on aws",
+                serde_json::json!({ "basis": "stated" }),
+            ),
+            (
+                "mem_guess",
+                "gcp",
+                "probably gcp hosting",
+                serde_json::json!({ "basis": "inferred", "premises": ["mem_x"] }),
+            ),
+        ] {
+            add(&store, id, |r| {
+                r.content = content.into();
+                r.project = Some("quokka".into());
+                r.subject = Some("service".into());
+                r.predicate = Some("runs_on".into());
+                r.object = Some(object.into());
+                r.metadata = basis;
+            });
+        }
+
+        // The prompt matches only the inference; the statement is in scope.
+        let brief = brief(
+            &store,
+            &ContextRequest {
+                prompt: Some("gcp hosting"),
+                ..session(0)
+            },
+        );
+        assert!(!ids(&brief, "hits").contains(&"mem_guess".to_string()));
         assert_eq!(ids(&brief, "activity"), ["mem_said"]);
     }
 
