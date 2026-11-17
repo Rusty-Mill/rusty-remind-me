@@ -2,6 +2,14 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-16 — Project expert pack and domain pack
+
+### Added
+- `docs/handoff/`: the project's expert pack, harvested from the repo docs, the ADRs, remind-me and the Millwright decision log. SPEC.md indexes the docs per subsystem, DECISIONS.md takes decisions that have no ADR (Nano's quoted statements and the expert's defaults), QA.md and OPEN_QUESTIONS.md as usual.
+- `docs/handoff/DOMAIN.md`: a digest of at most 60 lines for every session: intent, scope, hard lines, shape, and traps re-checked against current main.
+- `docs/handoff/sources/rust-adherence.md`: the Rust adherence audit taken at `9aff941`, copied in as a not-binding source.
+- `.claude/agents/rusty-remind-me-expert.md` and a "Project experts" table in CLAUDE.md, so design questions go to the expert before Nano.
+
 ## 2026-11-17 — Unblock cargo-deny after the chrono advisories
 
 ### Changed

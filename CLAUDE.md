@@ -2,6 +2,33 @@
 
 Guidance for Claude Code sessions (and any agents they dispatch) working in this repo.
 
+Read `docs/handoff/DOMAIN.md` at the start of every session here.
+
+## Project experts
+Before asking Nano any design, scope or behaviour question, ask the
+expert for the paths involved. Never ask Nano first.
+
+| Paths | Expert |
+|---|---|
+| `**` | `rusty-remind-me-expert` |
+
+Call it with `subagent_type: "<expert>"`. **Fallback:** if that type isn't
+available (cloud sessions can fail to load agents), read
+`.claude/agents/<expert>.md` fresh at call time, spawn a general-purpose Agent
+whose prompt is the file's body (everything after the frontmatter) followed by
+the question. That counts as the expert. Never answer without it, and never
+copy the file's text anywhere.
+- ANSWER: act on it; the source is cited.
+- ESCALATE: ask Nano exactly that block: question, options,
+  recommendation. Nothing more.
+- When Nano answers, pass the answer to the expert to record.
+  Don't write DECISIONS.md or remind-me yourself; one writer keeps each
+  answer recorded exactly once.
+- Non-blocking default? Take the expert's default, keep going, and add the
+  question to the pack's OPEN_QUESTIONS.md. An ESCALATE is never acted on
+  before Nano answers, whatever its RECOMMEND says: leave that item pending
+  and continue unrelated work.
+
 ## Commit signing: retry once, then commit unsigned and say so
 
 This environment signs commits via a helper at `/tmp/code-sign` (a symlink to
