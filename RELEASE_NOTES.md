@@ -5,17 +5,40 @@ Dated entries, newest first. One entry per merged pull request.
 ## 2026-11-16 — Tell stated facts from inferences (Mill Board #1553)
 
 ### Added
-- `metadata.basis`: `stated` (someone said it), `inferred` (a model concluded it) or `pattern` (seen across sources), with `metadata.premises` (memory ids, at least 1 for inferred and 2 for pattern). Checked at the boundary on every add, update, decompose and reclassify, whatever the memory type; unknown values, missing premises, and premises on a stated memory are refused with the field named. No schema change.
-- `remind_me_promote` records `basis` (`pattern` from two or more sources, else `inferred`) and its sources as `premises`. `remind_me_decompose`'s description and fact schema tell writers how to set it.
+- `metadata.basis`: `stated` (someone said it), `inferred` (a model concluded it) or `pattern` (seen across sources), with `metadata.premises` (memory ids, at least 1 for inferred and 2 for pattern). Checked at the boundary on every add, update, decompose (in core, whatever the caller) and reclassify, whatever the memory type; unknown values, missing premises, and premises on a stated memory are refused with the field named. No schema change.
+- `remind_me_promote` records `basis` (`pattern` from two or more distinct sources, else `inferred`) and its sources as `premises`. `remind_me_decompose`'s description and fact schema tell writers how to set it.
 - docs/design/stated-vs-inferred.md: the values, who sets them, and how they map onto #1442's trust tiers.
 
 ### Changed
 - `contradictions::preferred` ranks basis first (stated, then unset or pattern, then inferred), before confidence. The contradiction queue's `recommended_keep` follows it.
-- The session brief drops a hit that loses a conflict to another hit, so it never shows both sides of one claim.
+- The session brief drops any memory that loses a conflict to another in scope, in every section including prompt hits, so it never shows both sides of one claim.
 - A new `inferred` triple no longer supersedes a contradicting `stated` one; both stay live. Every other write supersedes as before.
 
 ### Tests
 - `basis_test`: each basis stored, refusals, a decomposed fact's basis checked, promotion premises, an inference not retiring a statement, a statement still retiring one, stated beating higher confidence. Unit tests for `validate_basis`, the rank order and the brief's conflict filter.
+
+## 2026-11-16 — Search says how it ran (#230, Mill Board #1186)
+
+### Added
+- Each search hit carries `search_method`: `keyword`, `semantic` or `hybrid`, from which ranked list found it (set in `rank_rrf` from list membership, not from `vec_score`, which is set for every hit whenever semantic search ran). `None` for a window listing with no query.
+- Search responses carry `dormant_excluded`: matches left out for being dormant, from both halves (the keyword side with one extra bounded full-text query at the same depth; the semantic side counted inside the scan). A memory below the caller's own `min_vitality` is not counted. `0` with `include_dormant`.
+- Markdown: a badge per hit (`🔤` keyword, `🔮` semantic, `⚡` hybrid) in both details, and a `_Tiers: N keyword, N semantic, N hybrid | N dormant excluded_` footer, also shown when nothing matched. Compact JSON hits gain `search_method`. `semantic_distance` and the verbose rank line stay out of scope.
+
+### Tests
+- `search_method_test`: keyword-only search, each method with an embedder, dormant counts from both halves, the caller's floor not counted as dormant. Render tests over real searches: keyword-only and hybrid footers differ, badges agree with the footer, JSON matches markdown, a dormant count with no hits.
+
+## 2026-11-16 — Duplicate warning on every save (Mill Board #1486)
+
+### Added
+- `remind_me_add` and `remind_me_decompose` return likely near-duplicates of what they just wrote: `duplicate_candidates` on an add (a markdown warning in that format), and `duplicate_candidates` keyed by fact id on a decompose. Each carries the existing memory's snippet, a score and a reason: `exact` (same text, ignoring case and spacing), `keyword` (word overlap at least 0.6) or `semantic` (cosine at least 0.9). At most 3 per write, from the same project only, never sensitive or raw dialogs.
+- The check never blocks or merges. A failure is logged with the memory id and reported as `duplicate_check_error`; the write stands.
+- Cost: one full-text query over at most 32 of the new text's words (10 hits), and, when the new memory already has a vector, one nearest-neighbour lookup with that stored vector. Nothing extra is embedded. Decomposed facts are not embedded at write time, so they get the keyword side only.
+
+### Changed
+- `vectors::nearest_admitted` holds the vector-in half of `semantic_search_admitted`, so a caller with a stored vector can search without embedding again. `vectors::first_chunk_vector` reads one.
+
+### Tests
+- `duplicate_check_test`: exact duplicate, reworded restatement, paraphrase by embedding, unrelated, other project, sensitive, unknown memory, a failed check, and decompose reporting by fact.
 
 ## 2026-11-16 — Storage port: promotions, sync state, outbox and imports (ADR-0035, Millwright R2)
 
