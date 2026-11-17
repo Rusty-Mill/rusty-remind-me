@@ -115,6 +115,10 @@ pub struct MemorySearchResponse {
     /// (ADR-0029).
     #[serde(default)]
     pub raw_fallback: bool,
+    /// Dormant memories that matched but were left out because
+    /// `include_dormant` was off (#230).
+    #[serde(default)]
+    pub dormant_excluded: usize,
     /// The L2/L3 persona bootstrap, when one was asked for (#255).
     ///
     /// `None` and `Some(empty)` are deliberately different answers: the first

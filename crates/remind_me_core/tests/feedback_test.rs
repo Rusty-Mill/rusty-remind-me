@@ -431,6 +431,7 @@ fn result(id: &str, score: f64) -> MemorySearchResult {
         idf_score: None,
         feedback_adjustment: None,
         rerank_score: None,
+        search_method: None,
     }
 }
 

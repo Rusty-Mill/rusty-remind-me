@@ -444,18 +444,14 @@ pub fn vitality_report(report: &remind_me_core::vitality::VitalityReport) -> Str
 /// both its trimmed and untrimmed forms, the `_No memories found._` empty case,
 /// the `\n---\n` joiner, and the three expansion sections.
 ///
-/// **Deliberately absent, because this port does not track the inputs:**
+/// Also reproduced (#230): the per-hit method badge (`⚡` hybrid, `🔮`
+/// semantic, `🔤` keyword) and the `_Tiers: N keyword, N semantic, N hybrid |
+/// N dormant excluded_` footer, both from each hit's `search_method`.
 ///
-/// - the per-hit method badge (`⚡ hybrid` / `🔮 semantic` / `🔤 keyword`) and
-///   `distance: N`, which need a per-result search-method tag,
-/// - the `_Tiers: N keyword, N semantic, N hybrid | N dormant excluded_`
-///   footer, which needs a tier breakdown and a dormant-exclusion count,
-/// - the `verbose` debug-signal line, which needs per-result rank positions.
+/// **Deliberately absent:** `distance: N` (a per-hit semantic distance) and
+/// the `verbose` debug-signal line (per-hit rank positions). Neither is
+/// tracked; #230 split them out as a debug surface rather than parity.
 ///
-/// None of those exist anywhere in `remind_me_core`. Adding them is search
-/// pipeline work rather than rendering work, so this deliberately renders less
-/// than the reference rather than inventing substitutes that would look right
-/// and mean something else.
 /// One line saying the deadline changed what this search did, or `None` when
 /// it ran in full (#257).
 ///
@@ -519,10 +515,16 @@ fn search_response_body(res: &MemorySearchResponse, detail: SearchDetail) -> Str
     // caller might notice the ranking is off, but "no memories" looks
     // authoritative and is the answer they are most likely to act on.
     if res.memories.is_empty() && bootstrap.is_none() {
-        return match degradation_note(res) {
-            Some(note) => format!("_No memories found._\n\n{note}"),
-            None => "_No memories found._".to_string(),
-        };
+        // A dormant count is most useful here: what matched has faded,
+        // which `include_dormant` brings back.
+        let notes: Vec<String> = [degradation_note(res), tier_footer(res)]
+            .into_iter()
+            .flatten()
+            .collect();
+        if notes.is_empty() {
+            return "_No memories found._".to_string();
+        }
+        return format!("_No memories found._\n\n{}", notes.join("\n"));
     }
 
     let mut parts: Vec<String> = Vec::new();
@@ -551,12 +553,14 @@ fn search_response_body(res: &MemorySearchResponse, detail: SearchDetail) -> Str
         if let Some(note) = degradation_note(res) {
             parts.push(note);
         }
+        if let Some(footer) = tier_footer(res) {
+            parts.push(footer);
+        }
         return parts.join("\n---\n");
     }
-    // The reference names the retrieval method here. Without a per-result
-    // method tag this port cannot say which ran, and guessing "hybrid" would be
-    // a claim rather than a report -- so the count is stated and the method is
-    // not.
+    // The reference names the retrieval method here. Hits can differ, so the
+    // count is stated here and each hit's method in its badge and the tier
+    // footer (#230).
     parts.push(format!("**{} results**", res.returned));
     if res.raw_fallback {
         parts.push(
@@ -586,11 +590,11 @@ fn search_response_body(res: &MemorySearchResponse, detail: SearchDetail) -> Str
         SearchDetail::Compact => {
             remind_me_core::reminders::render_compact_hits_markdown(&res.memories)
         }
-        SearchDetail::Full => {
-            let memories: Vec<_> = res.memories.iter().map(|r| r.memory.clone()).collect();
-            remind_me_core::reminders::render_memories_markdown(&memories)
-        }
+        SearchDetail::Full => remind_me_core::reminders::render_hits_markdown(&res.memories),
     });
+    if let Some(footer) = tier_footer(res) {
+        parts.push(footer);
+    }
 
     if let Some(related) = res.related_via_entities.as_ref().filter(|r| !r.is_empty()) {
         parts.push(expansion_section(
@@ -622,6 +626,43 @@ fn search_response_body(res: &MemorySearchResponse, detail: SearchDetail) -> Str
     }
 
     parts.join("\n---\n")
+}
+
+/// `_Tiers: N keyword, N semantic, N hybrid | N dormant excluded_` (#230):
+/// whether semantic search found anything, so "nothing about this" and "the
+/// embedder was down" read differently. Counted from each hit's
+/// `search_method`, the same field the badges show, so the two cannot
+/// disagree. `None` when there is nothing to say.
+fn tier_footer(res: &MemorySearchResponse) -> Option<String> {
+    use remind_me_core::models::SearchMethod;
+    let count = |method: SearchMethod| {
+        res.memories
+            .iter()
+            .filter(|r| r.search_method == Some(method))
+            .count()
+    };
+    let ranked = res.memories.iter().any(|r| r.search_method.is_some());
+    let mut parts = Vec::new();
+    if ranked {
+        parts.push(format!(
+            "_Tiers: {} keyword, {} semantic, {} hybrid",
+            count(SearchMethod::Keyword),
+            count(SearchMethod::Semantic),
+            count(SearchMethod::Hybrid)
+        ));
+    }
+    if res.dormant_excluded > 0 {
+        parts.push(format!("{} dormant excluded", res.dormant_excluded));
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let text = parts.join(" | ");
+    Some(if ranked {
+        format!("{text}_")
+    } else {
+        format!("_{text}_")
+    })
 }
 
 /// How to get what the budget dropped: the ids, and the call that fetches them.
@@ -713,6 +754,7 @@ mod bootstrap_rendering {
             bootstrap,
             inferred_window: None,
             raw_fallback: false,
+            dormant_excluded: 0,
             related_via_entities: None,
             related_via_neighbors: None,
             related_via_co_retrieval: None,
@@ -835,6 +877,7 @@ mod deadline_rendering {
             bootstrap: None,
             inferred_window: None,
             raw_fallback: false,
+            dormant_excluded: 0,
             related_via_entities: None,
             related_via_neighbors: None,
             related_via_co_retrieval: None,
@@ -884,5 +927,142 @@ mod deadline_rendering {
         // means "nothing about this topic" is not a safe conclusion, whereas
         // no rerank only means the order is worse.
         assert!(rendered.contains("semantic and rerank"));
+    }
+}
+
+#[cfg(test)]
+mod tier_rendering {
+    use super::*;
+    use remind_me_core::db::queries;
+    use remind_me_core::db::Store;
+    use remind_me_core::embedder::{EmbedError, EmbedRole, Embedder, EmbeddingIdentity};
+    use remind_me_core::models::{MemorySearchResult, SearchMethod};
+    use remind_me_core::{Database, MemoryAddInput, MemorySearchInput};
+
+    /// Every text on one vector: every embedded memory is a semantic match.
+    struct SameVector;
+
+    impl Embedder for SameVector {
+        fn embed(&self, texts: &[String], _: EmbedRole) -> Result<Vec<Vec<f32>>, EmbedError> {
+            Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect())
+        }
+        fn dim(&self) -> usize {
+            2
+        }
+        fn identity(&self) -> EmbeddingIdentity {
+            EmbeddingIdentity {
+                backend: "same-vector".into(),
+                model: "test".into(),
+                dim: 2,
+            }
+        }
+    }
+
+    fn add(store: &Store<'_>, content: &str, embedded: bool) {
+        let id = queries::add_memory(
+            store,
+            MemoryAddInput {
+                content: content.to_string(),
+                extract: false,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .id;
+        if embedded {
+            remind_me_core::vectors::embed_and_store(store, &SameVector, &id, content).unwrap();
+        }
+    }
+
+    /// A real search over two keyword matches, one of them embedded, and one
+    /// memory only a vector finds.
+    fn searched(embedder: Option<&dyn Embedder>) -> MemorySearchResponse {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        add(&store, "quokka sighting", true);
+        add(&store, "quokka burrow", false);
+        add(&store, "wombat survey", true);
+        let input = MemorySearchInput {
+            query: "quokka".into(),
+            limit: 10,
+            token_budget: 0,
+            ..Default::default()
+        };
+        let outcome = queries::search_memories_budgeted(&store, &input, embedder).unwrap();
+        response(outcome.results, outcome.dormant_excluded)
+    }
+
+    fn response(
+        memories: Vec<MemorySearchResult>,
+        dormant_excluded: usize,
+    ) -> MemorySearchResponse {
+        MemorySearchResponse {
+            total_candidates: memories.len(),
+            returned: memories.len(),
+            memories,
+            trimmed: 0,
+            trimmed_ids: Vec::new(),
+            tokens_used: 0,
+            budget: 0,
+            timing: Default::default(),
+            bootstrap: None,
+            inferred_window: None,
+            raw_fallback: false,
+            dormant_excluded,
+            related_via_entities: None,
+            related_via_neighbors: None,
+            related_via_co_retrieval: None,
+        }
+    }
+
+    #[test]
+    fn keyword_only_and_hybrid_searches_have_different_footers() {
+        let keyword = search_response(&searched(None), SearchDetail::Compact);
+        let hybrid = search_response(&searched(Some(&SameVector)), SearchDetail::Compact);
+
+        assert!(
+            keyword.contains("_Tiers: 2 keyword, 0 semantic, 0 hybrid_"),
+            "{keyword}"
+        );
+        assert!(
+            hybrid.contains("_Tiers: 1 keyword, 1 semantic, 1 hybrid_"),
+            "{hybrid}"
+        );
+    }
+
+    #[test]
+    fn badges_agree_with_the_footer_in_both_details() {
+        let res = searched(Some(&SameVector));
+        for detail in [SearchDetail::Compact, SearchDetail::Full] {
+            let md = search_response(&res, detail);
+            for (method, n) in [
+                (SearchMethod::Keyword, 1),
+                (SearchMethod::Semantic, 1),
+                (SearchMethod::Hybrid, 1),
+            ] {
+                assert_eq!(md.matches(method.badge()).count(), n, "{method:?}: {md}");
+            }
+        }
+    }
+
+    #[test]
+    fn json_reports_what_markdown_does() {
+        let res = searched(Some(&SameVector));
+        let json = compact_search_json(&res);
+        let mut methods: Vec<String> = json["memories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["search_method"].as_str().unwrap().to_string())
+            .collect();
+        methods.sort();
+        assert_eq!(methods, ["hybrid", "keyword", "semantic"]);
+        assert_eq!(json["dormant_excluded"], 0);
+    }
+
+    #[test]
+    fn a_dormant_count_shows_even_when_nothing_matched() {
+        let md = search_response(&response(Vec::new(), 3), SearchDetail::Compact);
+        assert_eq!(md, "_No memories found._\n\n_3 dormant excluded_");
     }
 }

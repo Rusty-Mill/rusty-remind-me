@@ -748,10 +748,24 @@ pub fn search_memories_deadlined(
     // `limit` applies after `apply_validity`, so a dropped or demoted row
     // gives its place to an eligible one, as in the ranked path.
     if phrases.is_empty() {
+        let mut dormant_excluded = 0;
         let listed = if input.window.is_unbounded() {
             Vec::new()
         } else {
-            let hits = memories_repo.window_hits(&filter)?;
+            // With dormant rows admitted, so the ones the floor hides can be
+            // counted (#230); then held to the floor like any listing.
+            let now = Utc::now();
+            let (hits, dormant): (Vec<Memory>, Vec<Memory>) = memories_repo
+                .window_hits(&KeywordFilter {
+                    hide_dormant: false,
+                    ..filter.clone()
+                })?
+                .into_iter()
+                .partition(|m| crate::db::engine::memories::vital_enough(&filter, m, now));
+            dormant_excluded = dormant
+                .iter()
+                .filter(|m| dormant_only(&filter, input, m, now))
+                .count();
             let mut listed = crate::retrieval::apply_validity(
                 hits.into_iter().map(listed_result).collect(),
                 Utc::now(),
@@ -767,6 +781,7 @@ pub fn search_memories_deadlined(
         let mut outcome = trim_by_token_budget(listed, input.token_budget, input.detail);
         timing.elapsed_ms = deadline.elapsed_ms();
         outcome.timing = timing;
+        outcome.dormant_excluded = dormant_excluded;
         return Ok(outcome);
     }
 
@@ -777,6 +792,15 @@ pub fn search_memories_deadlined(
         keyword_bm25.insert(memory.id.clone(), bm25_score);
         keyword_memories.push(memory);
     }
+    // Dormant matches the floor kept out, from both halves, so a reader can
+    // tell "nothing matched" from "what matched has gone dormant" (#230).
+    let dormant_ids = std::cell::RefCell::new(dormant_keyword_matches(
+        &memories_repo,
+        &phrases,
+        &filter,
+        input,
+        input.limit * 2,
+    )?);
 
     // Semantic augmentation is entirely optional: no embedder passed in — because
     // the caller has none, or because `search_memories` found none configured or
@@ -820,14 +844,23 @@ pub fn search_memories_deadlined(
                 memories_repo.sensitive_ids()?
             };
             let admit = |m: &Memory| {
-                !hidden.contains(&m.id)
+                let eligible = !hidden.contains(&m.id)
                     && scope.matches_memory(m)
                     && input.window.contains_memory(m)
                     && narrowing.admits(m)
-                    && crate::db::engine::memories::vital_enough(&filter, m, now)
                     // Raw rows go before the best `limit * 2` are chosen, or
                     // stronger raw hits would take every slot (ADR-0029).
-                    && !(filter.exclude_raw && is_raw_category(&m.category))
+                    && !(filter.exclude_raw && is_raw_category(&m.category));
+                if !eligible {
+                    return false;
+                }
+                if crate::db::engine::memories::vital_enough(&filter, m, now) {
+                    return true;
+                }
+                if dormant_only(&filter, input, m, now) {
+                    dormant_ids.borrow_mut().insert(m.id.clone());
+                }
+                false
             };
             let scored = crate::vectors::semantic_search_admitted(
                 store,
@@ -913,7 +946,62 @@ pub fn search_memories_deadlined(
     let mut outcome = trim_by_token_budget(ranked, input.token_budget, input.detail);
     timing.elapsed_ms = deadline.elapsed_ms();
     outcome.timing = timing;
+    outcome.dormant_excluded = dormant_ids.into_inner().len();
     Ok(outcome)
+}
+
+/// Whether the dormancy floor alone keeps `memory` out: it is dormant, yet
+/// clears the caller's explicit `min_effective_vitality` and the validity
+/// bars `apply_validity` holds every hit to (expiry, `min_confidence`). Such
+/// a row is one `include_dormant` would return, so only it is counted.
+fn dormant_only(
+    filter: &KeywordFilter,
+    input: &MemorySearchInput,
+    memory: &Memory,
+    now: chrono::DateTime<Utc>,
+) -> bool {
+    use crate::db::engine::memories::vital_enough;
+    let floor_only = KeywordFilter {
+        hide_dormant: false,
+        ..filter.clone()
+    };
+    filter.hide_dormant
+        && !vital_enough(filter, memory, now)
+        && vital_enough(&floor_only, memory, now)
+        && crate::retrieval::passes_validity(
+            memory,
+            now,
+            input.include_expired,
+            input.min_confidence,
+        )
+}
+
+/// The ids of keyword matches that only the dormancy floor left out
+/// ([`dormant_only`]), among the first `limit` matches with dormant ones
+/// admitted. Empty when dormant memories were not hidden. One extra bounded
+/// full-text query.
+fn dormant_keyword_matches(
+    memories: &Memories<'_>,
+    phrases: &[String],
+    filter: &KeywordFilter,
+    input: &MemorySearchInput,
+    limit: usize,
+) -> Result<std::collections::HashSet<String>> {
+    if !filter.hide_dormant || phrases.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let with_dormant = KeywordFilter {
+        hide_dormant: false,
+        ..filter.clone()
+    };
+    let now = Utc::now();
+    Ok(memories
+        .keyword_hits(phrases, &with_dormant, limit)?
+        .into_iter()
+        .map(|(memory, _)| memory)
+        .filter(|m| dormant_only(filter, input, m, now))
+        .map(|m| m.id)
+        .collect())
 }
 
 /// Nothing refined matched: a session not yet decomposed is still findable
@@ -1012,6 +1100,7 @@ fn listed_result(memory: Memory) -> MemorySearchResult {
         idf_score: None,
         feedback_adjustment: None,
         rerank_score: None,
+        search_method: None,
     }
 }
 
@@ -1190,6 +1279,7 @@ pub fn search_with_expansions(
         },
         timing: outcome.timing,
         raw_fallback: outcome.raw_fallback,
+        dormant_excluded: outcome.dormant_excluded,
         bootstrap,
         inferred_window,
         memories,

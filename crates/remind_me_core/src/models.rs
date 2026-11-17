@@ -804,6 +804,38 @@ pub struct FeedbackInput {
     pub query: Option<String>,
 }
 
+/// Which ranked list a search hit came from (#230): only the full-text
+/// index, only the vector scan, or both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchMethod {
+    Keyword,
+    Semantic,
+    Hybrid,
+}
+
+impl SearchMethod {
+    /// The method of a hit found by the lists it is in, or `None` for one in
+    /// neither (a listing that ranked nothing).
+    pub fn from_membership(in_keyword: bool, in_semantic: bool) -> Option<Self> {
+        match (in_keyword, in_semantic) {
+            (true, true) => Some(Self::Hybrid),
+            (true, false) => Some(Self::Keyword),
+            (false, true) => Some(Self::Semantic),
+            (false, false) => None,
+        }
+    }
+
+    /// One short badge, as the reference prints it.
+    pub fn badge(self) -> &'static str {
+        match self {
+            Self::Keyword => "🔤",
+            Self::Semantic => "🔮",
+            Self::Hybrid => "⚡",
+        }
+    }
+}
+
 /// Search result item containing memory and diagnostic ranking scores.
 ///
 /// Each `*_score` is that signal's already-weighted contribution to `score`
@@ -831,6 +863,10 @@ pub struct MemorySearchResult {
     /// `score`: reranking permutes the head rather than contributing to the
     /// fused total, so folding it in would double-count the signal.
     pub rerank_score: Option<f64>,
+    /// Which ranked list found it, set by [`crate::retrieval::rank_rrf`];
+    /// `None` for a listing that ranked nothing (a window with no query).
+    #[serde(default)]
+    pub search_method: Option<SearchMethod>,
 }
 
 /// Input model for `remind_me_entity_traverse`.
