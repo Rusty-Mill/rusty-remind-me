@@ -736,14 +736,22 @@ fn difference(memory: &Memory, entry: &LogEntry) -> Option<&'static str> {
     }
 }
 
-/// Markup and punctuation that never change what a decision says.
-const IGNORED: &str = "*_`~.,;:'\"()[]|‘’“”";
+/// Sentence punctuation that never changes what a decision says.
+const IGNORED: &str = ".,;:";
 
-/// Lowercase words for comparing decisions. Markup, punctuation and spacing
-/// are ignored; every other symbol is a token of its own, so `-1` differs
-/// from `1` and `< 100` from `> 100`. A symbol not known to be harmless
-/// counts, so doubt lands in "changed", never "unchanged".
+/// Markdown markup that wraps text: `**bold**`, `__bold__`, `` `code` ``,
+/// `~~struck~~`. Removed only as a matched pair around text.
+const PAIRED_MARKUP: [&str; 4] = ["**", "__", "`", "~~"];
+
+/// Lowercase words for comparing decisions. Spacing, sentence punctuation
+/// and paired Markdown markup are ignored; every other symbol is a token of
+/// its own, so `-1` differs from `1`, `< 100` from `> 100`, `*.rs` from
+/// `rs` and `f(x)` from `f x`. A symbol not known to be harmless counts, so
+/// doubt lands in "changed", never "unchanged".
 fn words(text: &str) -> Vec<String> {
+    let text = PAIRED_MARKUP
+        .iter()
+        .fold(text.to_string(), |t, mark| unwrap_pairs(&t, mark));
     let mut out = Vec::new();
     let mut word = String::new();
     for c in text.chars() {
@@ -764,21 +772,47 @@ fn words(text: &str) -> Vec<String> {
     out
 }
 
+/// `text` with each `mark`…`mark` pair around text replaced by the text. A
+/// mark with no partner, or one that wraps only spaces, stays.
+fn unwrap_pairs(text: &str, mark: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find(mark) {
+        let after = &rest[open + mark.len()..];
+        let Some(close) = after.find(mark) else {
+            break;
+        };
+        let inner = &after[..close];
+        out.push_str(&rest[..open]);
+        if inner.is_empty() || inner.starts_with(' ') || inner.ends_with(' ') {
+            out.push_str(mark);
+            rest = after;
+            continue;
+        }
+        out.push_str(inner);
+        rest = &after[close + mark.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// `words` without a leading definition of `reference`: an optional project
 /// (up to three words, hyphens included), the ref, a `stated` or `default`
-/// tag, and a `-` or `—` marker.
+/// tag with or without its brackets, and a `-` or `—` marker.
 fn without_ref(mut words: Vec<String>, reference: &str) -> Vec<String> {
     let target = reference.to_lowercase();
     let Some(mut end) = words.iter().take(8).position(|w| *w == target) else {
         return words;
     };
-    for skippable in [["stated", "default"], ["-", "—"]] {
-        if words
-            .get(end + 1)
-            .is_some_and(|w| skippable.contains(&w.as_str()))
-        {
-            end += 1;
-        }
+    let at = |i: usize| words.get(i).map(String::as_str);
+    let is_tag = |w: Option<&str>| matches!(w, Some("stated" | "default"));
+    if at(end + 1) == Some("[") && is_tag(at(end + 2)) && at(end + 3) == Some("]") {
+        end += 3;
+    } else if is_tag(at(end + 1)) {
+        end += 1;
+    }
+    if matches!(at(end + 1), Some("-" | "—")) {
+        end += 1;
     }
     words.drain(..=end);
     words
@@ -905,7 +939,7 @@ fn norm_line(r: &NormalizeRow) -> String {
 pub fn render_normalize(plan: &NormalizePlan) -> String {
     let scope = plan.project.as_deref().unwrap_or("all projects");
     let mut out = format!(
-        "# Decisions normalise dry run: {scope}\n\nNo memory was added, changed or deleted. Proposed: {} retype, {} add ref. Needs a person: {} need rationale, {} conflicts. Report only: {} mentions.\n",
+        "# Decisions normalise dry run: {scope}\n\nNothing was written to the store. Proposed: {} retype, {} add ref. Needs a person: {} need rationale, {} conflicts. Report only: {} mentions.\n",
         plan.retype.len(),
         plan.add_ref.len(),
         plan.needs_rationale.len(),
@@ -968,7 +1002,7 @@ fn link_line(r: &SupersedesRow) -> String {
 /// The import plan as markdown: counts, then every row per bucket.
 pub fn render_import(plan: &ImportPlan) -> String {
     let mut out = format!(
-        "# Decisions import dry run: {} from {}\n\nNo memory was added, changed or deleted. New {}, unchanged {}, changed {}, needs rationale {}, conflicts {}, supersedes {}, confirms {}, ambiguous {}, unparsed {}.\n",
+        "# Decisions import dry run: {} from {}\n\nNothing was written to the store. New {}, unchanged {}, changed {}, needs rationale {}, conflicts {}, supersedes {}, confirms {}, ambiguous {}, unparsed {}.\n",
         plan.project,
         plan.source,
         plan.new.len(),

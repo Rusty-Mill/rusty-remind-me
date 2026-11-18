@@ -770,8 +770,9 @@ const DECISIONS_USAGE: &str = "\
 Usage: rusty-remind-me decisions normalize [--project <PROJECT>] [--json]
        rusty-remind-me decisions import <DECISIONS.md> --project <PROJECT> [--json]
   Dry runs only: print what normalising decision memories, or importing a
-  repo decisions log, would change. No memory is added, changed or
-  deleted, and a path with no store is refused rather than created.";
+  repo decisions log, would change. They run in the remind-me daemon,
+  which must already be running, and write nothing to the store; with no
+  daemon they fail without reading or writing it.";
 
 /// A parsed `decisions` command.
 #[derive(Debug, PartialEq, Eq)]
@@ -834,8 +835,9 @@ fn run_decisions(
     use remind_me_core::decisions_backfill::{
         render_import, render_normalize, ImportPlan, NormalizePlan,
     };
-    // Read the log before the store opens, and never create or migrate a
-    // store: a dry run that did either would not be one.
+    // Read the log before any store contact. The plan runs only in an
+    // already-running daemon: starting one, or opening the store here, runs
+    // open-time housekeeping that writes, and a dry run writes nothing.
     let log = match &args {
         DecisionsArgs::Import { path, .. } => Some(
             std::fs::read_to_string(path)
@@ -843,19 +845,11 @@ fn run_decisions(
         ),
         DecisionsArgs::Normalize { .. } => None,
     };
-    if db_path != std::path::Path::new(":memory:")
-        && !remind_me_core::db::engine_dir(db_path).exists()
-    {
-        return Err(format!(
-            "Error: no store at {}. A dry run never creates or migrates one.",
-            db_path.display()
-        )
-        .into());
-    }
-    let mut store = Store::open(db_path)?;
+    let mut store = daemon::existing_daemon(db_path)?;
     let (report, json) = match args {
         DecisionsArgs::Normalize { project, json } => {
-            let plan: NormalizePlan = store.call(Op::DecisionsNormalizePlan { project })?;
+            let plan: NormalizePlan =
+                daemon_plan(&mut store, Op::DecisionsNormalizePlan { project })?;
             (
                 if json {
                     serde_json::to_string_pretty(&plan)?
@@ -870,11 +864,14 @@ fn run_decisions(
             project,
             json,
         } => {
-            let plan: ImportPlan = store.call(Op::DecisionsImportPlan {
-                project,
-                source: path.display().to_string(),
-                text: log.unwrap_or_default(),
-            })?;
+            let plan: ImportPlan = daemon_plan(
+                &mut store,
+                Op::DecisionsImportPlan {
+                    project,
+                    source: path.display().to_string(),
+                    text: log.unwrap_or_default(),
+                },
+            )?;
             (
                 if json {
                     serde_json::to_string_pretty(&plan)?
@@ -891,6 +888,14 @@ fn run_decisions(
         print!("{report}");
     }
     Ok(())
+}
+
+/// Run a planning op in the daemon and read its plan.
+fn daemon_plan<T: serde::de::DeserializeOwned>(
+    daemon: &mut remind_me_core::daemon::client::DaemonConnection,
+    op: Op,
+) -> Result<T, Box<dyn std::error::Error>> {
+    Ok(daemon.call(&op)?.into_result()?)
 }
 
 const EXPORT_USAGE: &str = "\

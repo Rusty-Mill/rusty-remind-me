@@ -141,7 +141,7 @@ fn import_sorts_entries_into_buckets_and_states_links() {
     assert_eq!(plan.confirms[0].supersedes, "D1");
     assert_eq!(refs(&plan.ambiguous), ["D6"]);
     let report = render_import(&plan);
-    assert!(report.contains("No memory was added, changed or deleted."));
+    assert!(report.contains("Nothing was written to the store."));
     assert_eq!(report, render_import(&plan), "deterministic");
 }
 
@@ -450,6 +450,22 @@ fn signs_and_comparisons_count_markup_does_not() {
     assert_eq!(
         bucket(&table("**Use** X.", same), "D2: use x", same),
         "unchanged"
+    );
+    for (file, stored) in [("*.rs", "rs"), ("a \\| b", "a b"), ("f(x)", "f x")] {
+        assert_eq!(
+            bucket(&table(file, same), &format!("D2: {stored}"), same),
+            "decision text differs",
+            "{file} vs {stored}"
+        );
+    }
+    assert_eq!(
+        bucket(&table("bold", same), "D2: **bold**", same),
+        "unchanged",
+        "paired markup is not a change"
+    );
+    assert_eq!(
+        bucket(&table("Use X", "a \\| b"), "D2: Use X", "a b"),
+        "same text, different rationale"
     );
     assert_eq!(
         bucket(
