@@ -763,6 +763,18 @@ fn code_parts(text: &str) -> Vec<(&str, bool)> {
     let mut prose = 0;
     let mut scan = 0;
     while let Some(open) = text[scan..].find('`').map(|i| scan + i) {
+        let escapes = text[..open]
+            .bytes()
+            .rev()
+            .take_while(|b| *b == b'\\')
+            .count();
+        if escapes % 2 == 1 {
+            // An escape consumes only the first backtick. Any remaining run
+            // may still open a span. Backslashes inside a span are literal,
+            // so closing delimiters below deliberately do not check escapes.
+            scan = open + 1;
+            continue;
+        }
         let width = text[open..].bytes().take_while(|b| *b == b'`').count();
         let mut next = open + width;
         let mut end = None;
@@ -1073,8 +1085,16 @@ fn import_line(r: &ImportRow) -> String {
     line
 }
 
-/// `text` on one line, so it stays inside its list item.
+/// `text` on one line, so it stays inside its list item. Multiline values use
+/// a quoted Rust string literal: escapes preserve every character, and an
+/// inline delimiter longer than any embedded run keeps fences inert.
 fn one_line(text: &str) -> String {
+    if text.contains(['\n', '\r']) {
+        let escaped = format!("{text:?}");
+        let width = escaped.split(|c| c != '`').map(str::len).max().unwrap_or(0) + 1;
+        let delimiter = "`".repeat(width);
+        return format!("escaped string {delimiter} {escaped} {delimiter}");
+    }
     let mut out = String::new();
     for (part, code) in code_parts(text) {
         if code {
@@ -1169,5 +1189,28 @@ mod tests {
     #[test]
     fn cells_keep_escaped_pipes() {
         assert_eq!(cells("| a \\| b | c |"), vec!["a | b", "c"]);
+    }
+
+    #[test]
+    fn code_openers_respect_escape_parity_and_exact_run_widths() {
+        for text in [r"\`foo\`", r"\\\`foo\`", "``foo```"] {
+            assert_eq!(code_parts(text), [(text, false)], "{text}");
+        }
+        for (text, prose, code) in [
+            (r"\\`foo`", r"\\", "`foo`"),
+            (r"\\``foo``", r"\\", "``foo``"),
+            (r"\``foo`", r"\`", "`foo`"),
+            (r"\```foo``", r"\`", "``foo``"),
+            (r"`foo\`", "", r"`foo\`"),
+            ("``a`b``", "", "``a`b``"),
+        ] {
+            assert_eq!(
+                code_parts(text),
+                [(prose, false), (code, true), ("", false)],
+                "{text}"
+            );
+        }
+        assert_ne!(words(r"\`foo\`"), words(r"\``foo\``"));
+        assert_eq!(words(r"\\`foo`"), words(r"\\``foo``"));
     }
 }

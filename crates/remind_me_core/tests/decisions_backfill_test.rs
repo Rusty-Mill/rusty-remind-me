@@ -624,3 +624,69 @@ fn section_decision_body_keeps_code_literals_in_the_report() {
         }
     }
 }
+
+#[test]
+fn escaped_backticks_cannot_hide_literal_delimiter_changes() {
+    let log =
+        parse_log("| # | Decision | Why |\n|---|---|---|\n| D2 | Match \\``foo\\`` | Fast |\n");
+    for (content, unchanged) in [
+        (r"D2: Match \`foo\`", false),
+        (r"D2: Match \``foo\``", true),
+    ] {
+        let memories = stored(vec![decision(
+            "m-d2",
+            "mill",
+            content,
+            json!({"decision_ref": "D2", "rationale": "Fast"}),
+        )]);
+        let plan = plan_import(&log, "mill", "synthetic.md", &memories);
+        assert_eq!(plan.unchanged.len(), usize::from(unchanged), "{content}");
+        assert_eq!(plan.changed.len(), usize::from(!unchanged), "{content}");
+    }
+}
+
+#[test]
+fn multiline_stored_values_stay_inside_their_report_detail() {
+    let content =
+        "D2: Before\n```\n**literal**  text\n```\n\n## Another heading\n- another item\nend\r\n";
+    let why = "Reason\n````\n`a` and \\n are literal\n````\nnext\rline";
+    let memories = stored(vec![decision(
+        "m-d2",
+        "mill",
+        content,
+        json!({"decision_ref": "D2", "rationale": why}),
+    )]);
+    let log = parse_log(
+        "| # | Decision | Why |\n|---|---|---|\n| D2 | After | Fast |\n| D3 | Later entry | Later reason |\n",
+    );
+    let plan = plan_import(&log, "mill", "synthetic.md", &memories);
+    assert_eq!(plan.changed[0].stored.as_deref(), Some(content));
+    assert_eq!(plan.changed[0].stored_rationale.as_deref(), Some(why));
+    let report = render_import(&plan);
+    let details: Vec<_> = report
+        .lines()
+        .filter(|line| line.starts_with("  - Stored"))
+        .collect();
+    assert_eq!(details.len(), 2);
+    // The quoted escaped representation preserves line breaks, backslashes,
+    // repeated spaces and delimiter runs without adding report structure.
+    assert!(details[0].contains(&format!("{content:?}")), "{report}");
+    assert!(details[1].contains(&format!("{why:?}")), "{report}");
+    for (detail, original) in details.into_iter().zip([content, why]) {
+        assert!(detail.contains("escaped string"), "{detail}");
+        let rendered = detail.split_once("escaped string ").expect("label").1;
+        let fence = rendered.split_once(' ').expect("code delimiter").0;
+        let longest = original
+            .split(|c| c != '`')
+            .map(str::len)
+            .max()
+            .unwrap_or(0);
+        assert!(fence.len() > longest && fence.chars().all(|c| c == '`'));
+        assert!(rendered.ends_with(fence));
+    }
+    assert!(!report
+        .lines()
+        .any(|line| line.starts_with("```") || line.starts_with("## Another")));
+    assert!(report.contains("\n## Unchanged (0)\n\nNone.\n\n## Needs rationale"));
+    assert!(report.contains("D3 (line 4)"));
+}
