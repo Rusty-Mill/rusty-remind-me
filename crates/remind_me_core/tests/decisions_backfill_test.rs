@@ -100,7 +100,7 @@ fn import_sorts_entries_into_buckets_and_states_links() {
             "m-d2",
             "mill",
             "rusty D2: keep | pipes",
-            json!({"decision_ref": "D2", "rationale": "x"}),
+            json!({"decision_ref": "D2", "rationale": "Escaped."}),
         ),
         decision(
             "m-d3",
@@ -143,6 +143,102 @@ fn import_sorts_entries_into_buckets_and_states_links() {
     let report = render_import(&plan);
     assert!(report.contains("Nothing was written."));
     assert_eq!(report, render_import(&plan), "deterministic");
+}
+
+fn buckets(plan: &[remind_me_core::decisions_backfill::ImportRow]) -> Vec<(String, String)> {
+    plan.iter()
+        .map(|r| (r.decision_ref.clone(), r.note.clone()))
+        .collect()
+}
+
+#[test]
+fn a_changed_body_or_rationale_under_the_same_heading_is_changed() {
+    let log = parse_log(
+        "## D8. Lenses, not stages\n\n**Decision.** Roles become lenses,\nnot stages.\n**Why.** Handoffs add queues.\n**Rejected.** Keep stages.\n",
+    );
+    assert_eq!(
+        log.entries[0].decision.as_deref(),
+        Some("Roles become lenses, not stages.")
+    );
+    let why = json!({"decision_ref": "D8", "rationale": "Handoffs add queues"});
+    let check = |content: &str, metadata: serde_json::Value| {
+        let memories = stored(vec![decision("m-d8", "mill", content, metadata)]);
+        let plan = plan_import(&log, "mill", "DECISIONS.md", &memories);
+        (buckets(&plan.unchanged), buckets(&plan.changed))
+    };
+    let same = "D8 [stated]: Lenses, not stages. Roles become lenses, not stages.";
+    assert_eq!(
+        check(same, why.clone()).0.len(),
+        1,
+        "same words are unchanged"
+    );
+    let (unchanged, changed) = check(
+        "D8: Lenses, not stages. Roles remain stages, not lenses.",
+        why.clone(),
+    );
+    assert!(unchanged.is_empty());
+    assert_eq!(changed, [("D8".into(), "decision text differs".into())]);
+    let (_, changed) = check("D8: Lenses, not stages", why.clone());
+    assert_eq!(
+        changed[0].1, "decision text differs",
+        "a stored heading alone is not the decision"
+    );
+    let (_, changed) = check(same, json!({"decision_ref": "D8", "rationale": "Speed"}));
+    assert_eq!(changed[0].1, "same text, different rationale");
+    let (_, changed) = check(same, json!({"decision_ref": "D8"}));
+    assert_eq!(changed[0].1, "same text; the store has no rationale");
+}
+
+#[test]
+fn a_table_title_inside_longer_stored_text_is_changed() {
+    let log = parse_log("| # | Decision | Why |\n|---|---|---|\n| D2 | Use X | Fast |\n");
+    let memories = stored(vec![decision(
+        "m-d2",
+        "mill",
+        "D2: Use X and Y",
+        json!({"decision_ref": "D2", "rationale": "Fast"}),
+    )]);
+    let plan = plan_import(&log, "mill", "DECISIONS.md", &memories);
+    assert!(plan.unchanged.is_empty());
+    assert_eq!(plan.changed.len(), 1);
+}
+
+#[test]
+fn only_plain_links_on_eligible_entries_are_proposed() {
+    let log = parse_log(concat!(
+        "| # | Decision | Why |\n|---|---|---|\n",
+        "| ~~D4~~ | ~~Supersedes D2~~ | Dropped |\n",
+        "| D5 | Supersedes D1 | a |\n",
+        "| D5 | Supersedes D3 | b |\n",
+        "| D6 | This does not supersedes D2 | c |\n",
+        "| D7 | Rejected wording was \"supersedes D2\" | d |\n",
+        "| D8 | Supersedes D3 for that run only; nothing else | e |\n",
+        "| D12 | Supersedes D3, D4 and D5's tag only | h |\n",
+        "| D9 | Keep it (supersedes D1). Run only once | f |\n",
+        "| D11 | Supersedes D2 in part. Keep the rest | g |\n",
+        "\n## D10. Keep both\n\n**Decision.** Keep both.\n**Rejected.** Supersedes D9.\n",
+    ));
+    let plan = plan_import(&log, "mill", "DECISIONS.md", &[]);
+    let links: Vec<(&str, &str)> = plan
+        .supersedes
+        .iter()
+        .map(|l| (l.decision_ref.as_str(), l.supersedes.as_str()))
+        .collect();
+    assert_eq!(links, [("D9", "D1")], "only D9's plain link is proposed");
+    assert_eq!(
+        buckets(&plan.ambiguous),
+        [
+            ("D4".into(), "link wording on a conflicting entry".into()),
+            ("D5".into(), "link wording on a conflicting entry".into()),
+            ("D5".into(), "link wording on a conflicting entry".into()),
+            ("D6".into(), "negated link".into()),
+            ("D7".into(), "quoted link".into()),
+            ("D8".into(), "partial link (words follow the ref)".into()),
+            ("D12".into(), "partial link (the clause says only)".into()),
+            ("D11".into(), "partial link (words follow the ref)".into()),
+        ],
+        "a link in Rejected is not the entry's own"
+    );
 }
 
 #[test]

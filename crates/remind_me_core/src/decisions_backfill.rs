@@ -229,9 +229,20 @@ pub struct LogEntry {
     pub line: usize,
     /// Struck through (`~~...~~`): kept for the report, never imported live.
     pub struck: bool,
-    /// Every word of the entry, for supersedes and confirms detection.
-    #[serde(skip)]
-    text: String,
+    /// A section's `**Decision.**` paragraph; a table row has only its title.
+    pub decision: Option<String>,
+}
+
+impl LogEntry {
+    /// What the entry decides: its title and, for a section, the decision
+    /// paragraph. Rationale, rejected options and notes are left out, so a
+    /// link quoted there is never read as the entry's own.
+    fn statement(&self) -> String {
+        match &self.decision {
+            Some(body) => format!("{} {body}", self.title),
+            None => self.title.clone(),
+        }
+    }
 }
 
 /// A line or row the parser could not read as a decision.
@@ -389,18 +400,21 @@ fn read_row(row: &[String], cols: &Columns, line: usize, raw: &str, log: &mut Pa
         tag: some(cols.tag),
         line,
         struck: ref_struck || title_struck,
-        text: row.join(" "),
+        decision: None,
     });
 }
 
-/// `## D<n>. Title` (or `###`) sections, with `**Why.**` as rationale.
+/// `## D<n>. Title` (or `###`) sections, with the `**Decision.**` and
+/// `**Why.**` paragraphs as decision and rationale.
 fn parse_sections(lines: &[&str]) -> Vec<LogEntry> {
     let mut out: Vec<LogEntry> = Vec::new();
     let mut open_section = false;
+    let mut field = Field::Other;
     for (i, line) in lines.iter().enumerate() {
         if let Some(entry) = section_heading(line, i + 1) {
             out.push(entry);
             open_section = true;
+            field = Field::Other;
             continue;
         }
         if line.starts_with('#') {
@@ -409,13 +423,56 @@ fn parse_sections(lines: &[&str]) -> Vec<LogEntry> {
         let Some(open) = out.last_mut().filter(|_| open_section) else {
             continue;
         };
-        open.text.push(' ');
-        open.text.push_str(line);
-        if let Some(why) = line.trim().strip_prefix("**Why.**") {
-            open.rationale.get_or_insert_with(|| why.trim().to_string());
-        }
+        field = section_line(open, line.trim(), field);
     }
     out
+}
+
+/// The section paragraph a continuation line belongs to.
+#[derive(Clone, Copy)]
+enum Field {
+    Decision,
+    Why,
+    Other,
+}
+
+/// Fold one body line into `entry`; returns the paragraph the next line
+/// continues. A blank line or another `**Label.**` ends a paragraph.
+fn section_line(entry: &mut LogEntry, line: &str, field: Field) -> Field {
+    if line.is_empty() {
+        return Field::Other;
+    }
+    if let Some(rest) = line.strip_prefix("**Decision.**") {
+        append(&mut entry.decision, rest);
+        return Field::Decision;
+    }
+    if let Some(rest) = line.strip_prefix("**Why.**") {
+        append(&mut entry.rationale, rest);
+        return Field::Why;
+    }
+    if line.starts_with("**") {
+        return Field::Other;
+    }
+    match field {
+        Field::Decision => append(&mut entry.decision, line),
+        Field::Why => append(&mut entry.rationale, line),
+        Field::Other => {}
+    }
+    field
+}
+
+fn append(slot: &mut Option<String>, text: &str) {
+    let text = text.trim();
+    if text.is_empty() {
+        return;
+    }
+    match slot {
+        Some(held) => {
+            held.push(' ');
+            held.push_str(text);
+        }
+        None => *slot = Some(text.to_string()),
+    }
 }
 
 fn section_heading(line: &str, number: usize) -> Option<LogEntry> {
@@ -435,7 +492,7 @@ fn section_heading(line: &str, number: usize) -> Option<LogEntry> {
         tag: None,
         line: number,
         struck,
-        text: title,
+        decision: None,
     })
 }
 
@@ -507,13 +564,24 @@ pub fn plan_import(
         .filter_map(|m| carried_ref(m).map(|(r, _)| (m, r)))
         .collect();
     for entry in &log.entries {
-        place(entry, log, &existing, &mut plan);
-        links(entry, &mut plan);
+        if place(entry, log, &existing, &mut plan) {
+            links(entry, &mut plan);
+        } else if has_link_wording(&entry.statement()) {
+            plan.ambiguous
+                .push(ambiguous_row(entry, "link wording on a conflicting entry"));
+        }
     }
     plan
 }
 
-fn place(entry: &LogEntry, log: &ParsedLog, existing: &[(&Memory, String)], plan: &mut ImportPlan) {
+/// Sort `entry` into its bucket. `false` when it is a conflict, whose links
+/// are then only reported, never proposed.
+fn place(
+    entry: &LogEntry,
+    log: &ParsedLog,
+    existing: &[(&Memory, String)],
+    plan: &mut ImportPlan,
+) -> bool {
     let row = |memory_id: Option<String>, note: &str| ImportRow {
         decision_ref: entry.decision_ref.clone(),
         line: entry.line,
@@ -528,11 +596,11 @@ fn place(entry: &LogEntry, log: &ParsedLog, existing: &[(&Memory, String)], plan
         .count();
     if twins > 1 {
         plan.conflicts.push(row(None, "ref appears more than once"));
-        return;
+        return false;
     }
     if entry.struck {
         plan.conflicts.push(row(None, "struck through"));
-        return;
+        return false;
     }
     let matches: Vec<&&Memory> = existing
         .iter()
@@ -544,37 +612,94 @@ fn place(entry: &LogEntry, log: &ParsedLog, existing: &[(&Memory, String)], plan
             .needs_rationale
             .push(row(None, "no rationale column or Why")),
         [] => plan.new.push(row(None, "not in the store")),
-        [one] if contains_loosely(&one.content, &entry.title) => plan
-            .unchanged
-            .push(row(Some(one.id.clone()), "same ref and text")),
-        [one] => plan
-            .changed
-            .push(row(Some(one.id.clone()), "same ref, different text")),
-        _ => plan
-            .conflicts
-            .push(row(None, "several memories carry this ref")),
+        [one] => match difference(one, entry) {
+            None => plan
+                .unchanged
+                .push(row(Some(one.id.clone()), "same ref, text and rationale")),
+            Some(what) => plan.changed.push(row(Some(one.id.clone()), what)),
+        },
+        _ => {
+            plan.conflicts
+                .push(row(None, "several memories carry this ref"));
+            return false;
+        }
+    }
+    true
+}
+
+/// What differs between a stored decision and the file's entry; `None` only
+/// when the words match exactly. Anything short of that counts as changed: a
+/// false "unchanged" would hide an edit from the person approving the plan.
+fn difference(memory: &Memory, entry: &LogEntry) -> Option<&'static str> {
+    let stored = without_ref(words(&memory.content), &entry.decision_ref);
+    if stored != words(&entry.statement()) {
+        return Some("decision text differs");
+    }
+    let stored_why = memory
+        .metadata
+        .get("rationale")
+        .and_then(|v| v.as_str())
+        .map(words)
+        .filter(|w| !w.is_empty());
+    let file_why = entry
+        .rationale
+        .as_deref()
+        .map(words)
+        .filter(|w| !w.is_empty());
+    match (stored_why, file_why) {
+        (a, b) if a == b => None,
+        (None, Some(_)) => Some("same text; the store has no rationale"),
+        _ => Some("same text, different rationale"),
     }
 }
 
-fn contains_loosely(haystack: &str, needle: &str) -> bool {
-    let words = |s: &str| {
-        s.split_whitespace()
-            .map(|w| w.to_ascii_lowercase())
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
-    words(haystack).contains(&words(needle))
+/// Lowercase alphanumeric words: punctuation and markup are not a change.
+fn words(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect()
 }
 
-/// `supersedes D<n>` / `confirms D<n>` stated outright; other supersede
-/// wording is ambiguous (D27).
+/// `words` without a leading definition of `reference`: an optional project
+/// of up to three words, the ref, and a `stated` or `default` tag.
+fn without_ref(mut words: Vec<String>, reference: &str) -> Vec<String> {
+    let target = reference.to_lowercase();
+    let Some(at) = words.iter().take(4).position(|w| *w == target) else {
+        return words;
+    };
+    let tagged = words
+        .get(at + 1)
+        .is_some_and(|w| w == "stated" || w == "default");
+    words.drain(..=at + usize::from(tagged));
+    words
+}
+
+/// Marks that open a quotation.
+const QUOTES: [char; 3] = ['"', '“', '`'];
+
+/// Words that turn the link after them around.
+const NEGATIONS: [&str; 6] = ["not", "never", "no", "nor", "doesn't", "don't"];
+
+/// `supersedes D<n>` / `confirms D<n>` stated outright in the entry's own
+/// decision. Negated, quoted or partial links, and other supersede wording,
+/// are ambiguous: reported, never proposed (D27).
 fn links(entry: &LogEntry, plan: &mut ImportPlan) {
-    let lower = entry.text.to_ascii_lowercase();
-    let words: Vec<&str> = entry.text.split_whitespace().collect();
+    let text = entry.statement();
+    let words: Vec<&str> = text.split_whitespace().collect();
     let mut explicit = false;
-    for pair in words.windows(2) {
-        let target = pair[1].trim_end_matches([',', '.', ';', ':', ')']);
-        if !is_d_ref(target) {
+    let mut doubt = None;
+    for (i, pair) in words.windows(2).enumerate() {
+        let keyword = pair[0]
+            .trim_start_matches(QUOTES)
+            .trim_start_matches('(')
+            .to_ascii_lowercase();
+        let target = pair[1].trim_end_matches([',', '.', ';', ':', ')', '"', '”', '`']);
+        if !matches!(keyword.as_str(), "supersedes" | "confirms") || !is_d_ref(target) {
+            continue;
+        }
+        if let Some(why) = hedged(&words, i) {
+            doubt = Some(why);
             continue;
         }
         let link = SupersedesRow {
@@ -582,23 +707,70 @@ fn links(entry: &LogEntry, plan: &mut ImportPlan) {
             supersedes: target.to_string(),
             line: entry.line,
         };
-        match pair[0].to_ascii_lowercase().as_str() {
-            "supersedes" => {
-                explicit = true;
-                plan.supersedes.push(link);
-            }
-            "confirms" => plan.confirms.push(link),
-            _ => {}
+        if keyword == "supersedes" {
+            explicit = true;
+            plan.supersedes.push(link);
+        } else {
+            plan.confirms.push(link);
         }
     }
-    if !explicit && lower.contains("supersede") {
-        plan.ambiguous.push(ImportRow {
-            decision_ref: entry.decision_ref.clone(),
-            line: entry.line,
-            title: snippet(&entry.title),
-            memory_id: None,
-            note: "supersede wording without a same-project ref".into(),
-        });
+    let note = match doubt {
+        Some(why) => why,
+        None if !explicit && text.to_ascii_lowercase().contains("supersede") => {
+            "supersede wording without a same-project ref"
+        }
+        None => return,
+    };
+    plan.ambiguous.push(ambiguous_row(entry, note));
+}
+
+/// Why the link whose keyword is `words[i]` (its ref at `words[i + 1]`) is
+/// not a plain statement: negated, quoted, or partial (`D2 in part`,
+/// `D2 item 4`, `... only`).
+fn hedged(words: &[&str], i: usize) -> Option<&'static str> {
+    let previous = i.checked_sub(1).map(|p| words[p].to_ascii_lowercase());
+    if previous.is_some_and(|w| NEGATIONS.contains(&w.as_str())) {
+        return Some("negated link");
+    }
+    let keyword = words[i];
+    let lead = &keyword[..keyword.len() - keyword.trim_start_matches(QUOTES).len()];
+    let before = format!("{} {lead}", words[..i].join(" "));
+    let open_curly = before.matches('“').count() > before.matches('”').count();
+    let odd = |mark: char| before.matches(mark).count() % 2 == 1;
+    if open_curly || odd('"') || odd('`') {
+        return Some("quoted link");
+    }
+    let target = words[i + 1];
+    let ends_phrase =
+        i + 2 == words.len() || target.ends_with([',', '.', ';', ':', ')', '"', '”', '`']);
+    if !ends_phrase {
+        return Some("partial link (words follow the ref)");
+    }
+    let clause = words[i..]
+        .iter()
+        .position(|w| w.ends_with(['.', ';']))
+        .map_or(&words[i..], |end| &words[i..=i + end]);
+    if clause.iter().any(|w| {
+        w.trim_matches(|c: char| !c.is_alphanumeric())
+            .eq_ignore_ascii_case("only")
+    }) {
+        return Some("partial link (the clause says only)");
+    }
+    None
+}
+
+fn has_link_wording(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("supersede") || lower.contains("confirms")
+}
+
+fn ambiguous_row(entry: &LogEntry, note: &str) -> ImportRow {
+    ImportRow {
+        decision_ref: entry.decision_ref.clone(),
+        line: entry.line,
+        title: snippet(&entry.title),
+        memory_id: None,
+        note: note.to_string(),
     }
 }
 
