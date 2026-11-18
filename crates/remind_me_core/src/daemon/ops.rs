@@ -23,6 +23,11 @@ pub enum Op {
     ImpactExport {
         query: Option<String>,
     },
+    /// One project's decisions as a markdown log; see [`crate::decisions_log`].
+    DecisionsLog {
+        project: String,
+        include_superseded: bool,
+    },
     Search {
         input: MemorySearchInput,
     },
@@ -209,6 +214,19 @@ pub fn execute(store: &Store<'_>, op: &Op) -> OpReply {
 fn run(store: &Store<'_>, op: &Op) -> Result<Value, String> {
     match op {
         Op::ImpactExport { query } => crate::export::impact_snapshot(store, query.as_deref()),
+        Op::DecisionsLog {
+            project,
+            include_superseded,
+        } => to_value(
+            crate::decisions_log::export(
+                store,
+                &crate::decisions_log::DecisionsQuery {
+                    project: project.clone(),
+                    include_superseded: *include_superseded,
+                },
+            )
+            .map(|log| log.markdown),
+        ),
         Op::Search { input } => to_value(queries::search_memories(store, input)),
         Op::Add { input } => to_value(queries::add_memory(store, input.clone())),
         Op::List { input } => to_value(queries::list_memories(store, input)),

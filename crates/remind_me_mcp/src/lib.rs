@@ -987,7 +987,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_export_memories",
-                                "description": "remind-me admin: export live memories to JSON or JSONL — every column, plus the entity graph. Deleted and superseded memories are excluded unless include_deleted is set, so an export is safe to re-import. Embedding vectors are excluded as derived data. Writes to file_path when given (must be inside the allowed export roots), otherwise returns the payload inline.",
+                                "description": "remind-me admin: export live memories to JSON or JSONL — every column, plus the entity graph. Deleted and superseded memories are excluded unless include_deleted is set, so an export is safe to re-import. Embedding vectors are excluded as derived data. Writes to file_path when given (must be inside the allowed export roots), otherwise returns the payload inline. With template \"decisions\" and a project it instead renders that project's decision memories as a deterministic markdown decisions log (superseded ones only with include_deleted).",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -996,7 +996,9 @@ impl McpServer {
                                         "tags": { "type": "array", "items": { "type": "string" }, "description": "Filter: memory must have ALL of these tags" },
                                         "file_path": { "type": "string", "description": "Destination file, inside the allowed export roots. Omit to return inline." },
                                         "include_graph": { "type": "boolean", "default": true, "description": "Append entities, links and relations as record_type-tagged records" },
-                                        "include_deleted": { "type": "boolean", "default": false, "description": "Include soft-deleted and superseded memories. Off by default: exported records are read back as live content, so re-importing an export that carried them would resurrect deleted and stale memories. Set only for a genuine full-backup or audit export, not for moving memories between machines." }
+                                        "include_deleted": { "type": "boolean", "default": false, "description": "Include soft-deleted and superseded memories. Off by default: exported records are read back as live content, so re-importing an export that carried them would resurrect deleted and stale memories. Set only for a genuine full-backup or audit export, not for moving memories between machines." },
+                                        "template": { "type": "string", "enum": ["decisions"], "description": "Render through a template instead of exporting records. decisions: the project's decision memories as a markdown log. format, category, tags and include_graph do not apply." },
+                                        "project": { "type": "string", "description": "Project the template covers; required with template." }
                                     }
                                 }
                             },
@@ -2300,13 +2302,30 @@ impl McpServer {
                         }
                     },
                     "remind_me_export_memories" => {
-                        let input: ExportInput = serde_json::from_value(args).unwrap_or_default();
-                        match export::export_memories(&store, &input) {
+                        // Fail closed: malformed arguments used to fall back to
+                        // a default full export, which a mistyped `template`
+                        // would turn into a dump of every memory.
+                        // An explicit `template: null` is a selector that names
+                        // nothing, not an omitted one: refused, not a full export.
+                        let null_template = args.get("template").is_some_and(Value::is_null);
+                        let parsed: Result<ExportInput, String> = if args.is_null() {
+                            Ok(ExportInput::default())
+                        } else if null_template {
+                            Err("template must be a string".to_string())
+                        } else {
+                            serde_json::from_value(args).map_err(|e| e.to_string())
+                        };
+                        match parsed
+                            .map_err(|e| format!("Export error: invalid arguments: {e}"))
+                            .and_then(|input| {
+                                export::export_memories(&store, &input)
+                                    .map_err(|e| format!("Export error: {e}"))
+                            }) {
                             Ok(result) => {
                                 json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap() }] })
                             }
-                            Err(e) => {
-                                json!({ "isError": true, "content": [{ "type": "text", "text": format!("Export error: {}", e) }] })
+                            Err(text) => {
+                                json!({ "isError": true, "content": [{ "type": "text", "text": text }] })
                             }
                         }
                     }

@@ -1381,6 +1381,17 @@ pub struct ExportInput {
     /// memories between machines.
     #[serde(default)]
     pub include_deleted: bool,
+    /// Render through a template instead of exporting records. Only
+    /// `decisions` exists: the `project`'s decision memories as a markdown
+    /// log (`crate::decisions_log`), with superseded ones kept only when
+    /// `include_deleted` is set. `format`, `category`, `tags` and
+    /// `include_graph` do not apply. A string, not an enum, so an unknown
+    /// name is refused instead of falling back to a full export.
+    #[serde(default)]
+    pub template: Option<String>,
+    /// The project a template export covers; required with `template`.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 fn default_include_graph() -> bool {
@@ -1396,6 +1407,8 @@ impl Default for ExportInput {
             file_path: None,
             include_graph: default_include_graph(),
             include_deleted: false,
+            template: None,
+            project: None,
         }
     }
 }
@@ -1410,6 +1423,10 @@ pub struct ExportResult {
     /// Memory records only; the graph counts are reported separately.
     pub exported: usize,
     pub format: ExportFormat,
+    /// The template rendered, when one was asked for; `format` then does
+    /// not apply.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entities: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]

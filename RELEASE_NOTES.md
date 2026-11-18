@@ -2,6 +2,18 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-18 — Decisions-log export (Mill Board #1565)
+
+### Added
+- `rusty-remind-me export --template decisions --project <p> [--include-superseded] [--out <path>]`: renders one project's `memory_type: decision` memories as a markdown table (number, date, decision, rationale, status, superseded by, source) and prints it, or writes it to `--out`. Read-only; nothing flows back from the file.
+- Output is byte-identical for the same memories: rows ordered by `valid_from` (else `created_at`), then `created_at`, then id; the header date is the newest `updated_at` among the rows, not the run time. Sensitive and deleted memories never appear; superseded ones only with `--include-superseded`.
+- Fields come from existing columns and metadata (pack D19): `metadata.decision_ref` for the number (never generated), `metadata.title` or the content's first line for the title, `outcome` for the status. No schema change, no new dependency.
+- MCP: `remind_me_export_memories` (admin group) takes `template: "decisions"` and `project`, returning the log inline or writing it under the export roots; superseded decisions only with `include_deleted`. An unknown template or a missing project is refused rather than falling back to a full export. No new tool (Nano, 2026-11-18, pack D22).
+
+### Changed
+- `remind_me_export_memories` refuses malformed arguments (`Export error: invalid arguments: ...`) instead of falling back to a default full export of every memory.
+- An explicit `template: null`, or a `project` without a template, is refused rather than run as an unscoped full export.
+
 ## 2026-11-16 — Project expert pack and domain pack
 
 ### Added

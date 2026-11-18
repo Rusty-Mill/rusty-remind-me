@@ -776,6 +776,11 @@ future brief whether they were written up or not.
 
 MIT License. See [LICENSE](LICENSE) for details.
 
+`rusty-remind-me export --template decisions --project <p> [--out <path>]`
+renders a project's decision memories as a markdown decisions log, deterministic
+so a regenerated file diffs cleanly. Add `--include-superseded` to keep replaced
+decisions, marked with what replaced them.
+
 For Orch proposed-change reports, `rusty-remind-me impact-export [QUERY]` exports
 a complete engine-backed inventory through the existing daemon/store path, with
 optional supplemental retrieval. This explicit export includes sensitive and

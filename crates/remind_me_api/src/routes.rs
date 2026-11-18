@@ -812,6 +812,7 @@ pub fn api_export(store: &Store<'_>, _wiki: &Wiki, req: &Request, _params: &Para
         file_path: file_path.clone(),
         include_graph,
         include_deleted,
+        ..Default::default()
     };
 
     if file_path.is_some() {
