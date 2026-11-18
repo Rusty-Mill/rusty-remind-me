@@ -404,3 +404,60 @@ fn the_import_report_carries_each_entry_in_full() {
     assert_eq!(changed.stored_rationale.as_deref(), Some("Old reason"));
     assert!(render_import(&plan).contains("  - Stored why: Old reason"));
 }
+
+#[test]
+fn signs_and_comparisons_count_markup_does_not() {
+    let table = |decision: &str, why: &str| {
+        parse_log(&format!(
+            "| # | Decision | Why |\n|---|---|---|\n| D2 | {decision} | {why} |\n"
+        ))
+    };
+    let bucket = |log: &remind_me_core::decisions_backfill::ParsedLog, content: &str, why: &str| {
+        let memories = stored(vec![decision(
+            "m-d2",
+            "mill",
+            content,
+            json!({"decision_ref": "D2", "rationale": why}),
+        )]);
+        let plan = plan_import(log, "mill", "DECISIONS.md", &memories);
+        match (plan.unchanged.len(), plan.changed.first()) {
+            (1, None) => "unchanged".to_string(),
+            (_, Some(row)) => row.note.clone(),
+            _ => "neither".to_string(),
+        }
+    };
+    let same = "Same reason";
+    assert_eq!(
+        bucket(&table("timeout -1", same), "D2: timeout 1", same),
+        "decision text differs"
+    );
+    assert_eq!(
+        bucket(&table("latency < 100", same), "D2: latency > 100", same),
+        "decision text differs"
+    );
+    assert_eq!(
+        bucket(
+            &table("Use X", "keeps p95 < 100"),
+            "D2: Use X",
+            "keeps p95 > 100"
+        ),
+        "same text, different rationale"
+    );
+    assert_eq!(
+        bucket(&table("Use X", "retry -1"), "D2: Use X", "retry 1"),
+        "same text, different rationale"
+    );
+    assert_eq!(
+        bucket(&table("**Use** X.", same), "D2: use x", same),
+        "unchanged"
+    );
+    assert_eq!(
+        bucket(
+            &table("Use X", same),
+            "let-em-loose D2 [stated] — Use X",
+            same
+        ),
+        "unchanged",
+        "a hyphenated project and a dash marker still open the definition"
+    );
+}

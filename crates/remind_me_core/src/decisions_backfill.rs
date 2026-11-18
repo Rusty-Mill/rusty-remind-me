@@ -736,25 +736,51 @@ fn difference(memory: &Memory, entry: &LogEntry) -> Option<&'static str> {
     }
 }
 
-/// Lowercase alphanumeric words: punctuation and markup are not a change.
+/// Markup and punctuation that never change what a decision says.
+const IGNORED: &str = "*_`~.,;:'\"()[]|‘’“”";
+
+/// Lowercase words for comparing decisions. Markup, punctuation and spacing
+/// are ignored; every other symbol is a token of its own, so `-1` differs
+/// from `1` and `< 100` from `> 100`. A symbol not known to be harmless
+/// counts, so doubt lands in "changed", never "unchanged".
 fn words(text: &str) -> Vec<String> {
-    text.split(|c: char| !c.is_alphanumeric())
-        .filter(|w| !w.is_empty())
-        .map(str::to_lowercase)
-        .collect()
+    let mut out = Vec::new();
+    let mut word = String::new();
+    for c in text.chars() {
+        if c.is_alphanumeric() {
+            word.extend(c.to_lowercase());
+            continue;
+        }
+        if !word.is_empty() {
+            out.push(std::mem::take(&mut word));
+        }
+        if !c.is_whitespace() && !IGNORED.contains(c) {
+            out.push(c.to_string());
+        }
+    }
+    if !word.is_empty() {
+        out.push(word);
+    }
+    out
 }
 
 /// `words` without a leading definition of `reference`: an optional project
-/// of up to three words, the ref, and a `stated` or `default` tag.
+/// (up to three words, hyphens included), the ref, a `stated` or `default`
+/// tag, and a `-` or `—` marker.
 fn without_ref(mut words: Vec<String>, reference: &str) -> Vec<String> {
     let target = reference.to_lowercase();
-    let Some(at) = words.iter().take(4).position(|w| *w == target) else {
+    let Some(mut end) = words.iter().take(8).position(|w| *w == target) else {
         return words;
     };
-    let tagged = words
-        .get(at + 1)
-        .is_some_and(|w| w == "stated" || w == "default");
-    words.drain(..=at + usize::from(tagged));
+    for skippable in [["stated", "default"], ["-", "—"]] {
+        if words
+            .get(end + 1)
+            .is_some_and(|w| skippable.contains(&w.as_str()))
+        {
+            end += 1;
+        }
+    }
+    words.drain(..=end);
     words
 }
 
