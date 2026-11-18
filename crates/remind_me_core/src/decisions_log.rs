@@ -85,7 +85,7 @@ fn row(memory: &Memory, all: &[&Memory]) -> String {
     format!(
         "| {} | {} | {} | {} | {} | {} | {} |\n",
         cell(metadata_str(memory, "decision_ref").unwrap_or(NONE)),
-        date(memory),
+        cell(&date(memory)),
         cell(&title(memory)),
         cell(rationale),
         cell(status(memory)),
@@ -210,5 +210,10 @@ mod tests {
     fn day_normalises_to_utc_and_tolerates_malformed_stamps() {
         assert_eq!(day("2026-11-18T23:30:00-02:00"), "2026-11-19");
         assert_eq!(day("2026-11-18 10:00"), "2026-11-18");
+        assert_eq!(
+            cell(&day("a|b\nc")),
+            "a\\|b c",
+            "a malformed stamp is escaped like any cell"
+        );
     }
 }
