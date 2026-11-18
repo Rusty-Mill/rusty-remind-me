@@ -370,7 +370,7 @@ pub fn export_memories(
     let relations = count_of("entity_relation");
     let exported = records.len() - entities - links - relations;
 
-    let mut result = ExportResult {
+    let result = ExportResult {
         status: "ok",
         exported,
         format: input.format,
