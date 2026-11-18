@@ -141,7 +141,7 @@ fn import_sorts_entries_into_buckets_and_states_links() {
     assert_eq!(plan.confirms[0].supersedes, "D1");
     assert_eq!(refs(&plan.ambiguous), ["D6"]);
     let report = render_import(&plan);
-    assert!(report.contains("Nothing was written."));
+    assert!(report.contains("No memory was added, changed or deleted."));
     assert_eq!(report, render_import(&plan), "deterministic");
 }
 
@@ -319,4 +319,88 @@ fn normalize_proposes_only_what_it_can_back() {
     let scoped = plan_normalize(&memories, Some("Let Em Loose"));
     assert_eq!(ids(&scoped.retype), ["m-def"]);
     assert_eq!(ids(&scoped.add_ref), ["m-id"]);
+}
+
+#[test]
+fn normalize_reports_refs_that_disagree_instead_of_picking_one() {
+    let memories = stored(vec![
+        decision(
+            "m-split",
+            "mill",
+            "D8: lenses",
+            json!({"decision_id": "D9", "rationale": "x"}),
+        ),
+        decision(
+            "m-elsewhere",
+            "mill",
+            "x",
+            json!({"decision": "other-project D9", "rationale": "x"}),
+        ),
+        decision(
+            "m-agree",
+            "mill",
+            "D9: x",
+            json!({"decision": "Mill D9", "rationale": "x"}),
+        ),
+    ]);
+    let plan = plan_normalize(&memories, None);
+    let notes: Vec<(&str, &str)> = plan
+        .conflicts
+        .iter()
+        .map(|r| (r.id.as_str(), r.note.as_str()))
+        .collect();
+    assert_eq!(
+        notes,
+        [
+            (
+                "m-elsewhere",
+                "metadata.decision names project \"other-project\", field is \"mill\""
+            ),
+            (
+                "m-split",
+                "refs disagree: content D8, metadata.decision_id D9"
+            ),
+        ]
+    );
+    assert_eq!(plan.add_ref.len(), 1);
+    assert_eq!(plan.add_ref[0].id, "m-agree");
+}
+
+#[test]
+fn the_import_report_carries_each_entry_in_full() {
+    let body =
+        |text: &str| format!("## D8. Same heading\n\n**Decision.** {text}\n**Why.** Because.\n");
+    let long = "word ".repeat(40);
+    let plans: Vec<String> = [
+        body("Roles become lenses."),
+        body("Roles stay stages."),
+        body(&long),
+    ]
+    .iter()
+    .map(|log| render_import(&plan_import(&parse_log(log), "mill", "DECISIONS.md", &[])))
+    .collect();
+    assert_ne!(plans[0], plans[1], "different bodies render differently");
+    assert!(plans[0].contains("  - Decision: Roles become lenses."));
+    assert!(plans[0].contains("  - Why: Because."));
+    assert!(plans[2].contains(long.trim()), "nothing is cut");
+
+    let memories = stored(vec![decision(
+        "m-d8",
+        "mill",
+        "D8: Same heading. Roles stay stages.",
+        json!({"decision_ref": "D8", "rationale": "Old reason"}),
+    )]);
+    let plan = plan_import(
+        &parse_log(&body("Roles become lenses.")),
+        "mill",
+        "x",
+        &memories,
+    );
+    let changed = &plan.changed[0];
+    assert_eq!(
+        changed.stored.as_deref(),
+        Some("D8: Same heading. Roles stay stages.")
+    );
+    assert_eq!(changed.stored_rationale.as_deref(), Some("Old reason"));
+    assert!(render_import(&plan).contains("  - Stored why: Old reason"));
 }

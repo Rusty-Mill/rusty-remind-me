@@ -70,12 +70,64 @@ fn carried_ref(memory: &Memory) -> Option<(String, &'static str)> {
         .map(|r| (r, "decision"))
 }
 
+/// Why the memory's refs cannot be trusted, if they cannot: the content's
+/// definition and the metadata keys name different refs, or
+/// `metadata.decision` names another project. A proposal would otherwise
+/// bless one of them as the memory's identity.
+fn ref_disagreement(memory: &Memory, defined: Option<&str>) -> Option<String> {
+    let get = |key: &str| {
+        memory
+            .metadata
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+    };
+    let decision = get("decision");
+    let named: Vec<(&str, String)> = [
+        ("content", defined.map(str::to_string)),
+        (
+            "metadata.decision_ref",
+            get("decision_ref")
+                .filter(|r| !r.is_empty())
+                .map(str::to_string),
+        ),
+        (
+            "metadata.decision_id",
+            get("decision_id")
+                .filter(|r| is_d_ref(r))
+                .map(str::to_string),
+        ),
+        ("metadata.decision", decision.and_then(|d| d_refs(d).pop())),
+    ]
+    .into_iter()
+    .filter_map(|(source, r)| r.map(|r| (source, r)))
+    .collect();
+    if named.iter().any(|(_, r)| *r != named[0].1) {
+        let all: Vec<String> = named.iter().map(|(s, r)| format!("{s} {r}")).collect();
+        return Some(format!("refs disagree: {}", all.join(", ")));
+    }
+    let qualifier = decision.map(|d| {
+        d_refs(d)
+            .iter()
+            .fold(d.to_string(), |rest, r| rest.replace(r.as_str(), ""))
+            .trim_matches(|c: char| !c.is_alphanumeric())
+            .to_string()
+    })?;
+    let field = memory.project.as_deref().unwrap_or("");
+    if qualifier.is_empty() || same_project(&qualifier, field) {
+        return None;
+    }
+    Some(format!(
+        "metadata.decision names project {qualifier:?}, field is {field:?}"
+    ))
+}
+
+fn metadata_rationale(memory: &Memory) -> Option<&str> {
+    memory.metadata.get("rationale").and_then(|v| v.as_str())
+}
+
 fn has_rationale(memory: &Memory) -> bool {
-    memory
-        .metadata
-        .get("rationale")
-        .and_then(|v| v.as_str())
-        .is_some_and(|r| !r.trim().is_empty())
+    metadata_rationale(memory).is_some_and(|r| !r.trim().is_empty())
 }
 
 /// Project names compared loosely: case, `-`, `_` and spaces ignored, so
@@ -169,6 +221,10 @@ fn classify(memory: &Memory, plan: &mut NormalizePlan) {
             plan.conflicts.push(row(Some(r.clone()), note));
             return;
         }
+    }
+    if let Some(note) = ref_disagreement(memory, defined.as_ref().map(|(_, r)| r.as_str())) {
+        plan.conflicts.push(row(None, note));
+        return;
     }
     let wanted_ref = carried
         .as_ref()
@@ -503,10 +559,42 @@ fn section_heading(line: &str, number: usize) -> Option<LogEntry> {
 pub struct ImportRow {
     pub decision_ref: String,
     pub line: usize,
+    /// In full: the report is what a person approves, so nothing is cut.
     pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rationale: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
     /// The matching memory, when the store already holds this ref.
     pub memory_id: Option<String>,
+    /// A changed row's stored content and rationale, to set beside the file's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stored: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stored_rationale: Option<String>,
     pub note: String,
+}
+
+impl ImportRow {
+    fn of(entry: &LogEntry, memory_id: Option<String>, note: &str) -> Self {
+        Self {
+            decision_ref: entry.decision_ref.clone(),
+            line: entry.line,
+            title: entry.title.clone(),
+            decision: entry.decision.clone(),
+            rationale: entry.rationale.clone(),
+            date: entry.date.clone(),
+            tag: entry.tag.clone(),
+            memory_id,
+            stored: None,
+            stored_rationale: None,
+            note: note.to_string(),
+        }
+    }
 }
 
 /// A supersedes link the file states outright.
@@ -582,13 +670,7 @@ fn place(
     existing: &[(&Memory, String)],
     plan: &mut ImportPlan,
 ) -> bool {
-    let row = |memory_id: Option<String>, note: &str| ImportRow {
-        decision_ref: entry.decision_ref.clone(),
-        line: entry.line,
-        title: snippet(&entry.title),
-        memory_id,
-        note: note.to_string(),
-    };
+    let row = |memory_id: Option<String>, note: &str| ImportRow::of(entry, memory_id, note);
     let twins = log
         .entries
         .iter()
@@ -616,7 +698,11 @@ fn place(
             None => plan
                 .unchanged
                 .push(row(Some(one.id.clone()), "same ref, text and rationale")),
-            Some(what) => plan.changed.push(row(Some(one.id.clone()), what)),
+            Some(what) => plan.changed.push(ImportRow {
+                stored: Some(one.content.clone()),
+                stored_rationale: metadata_rationale(one).map(str::to_string),
+                ..row(Some(one.id.clone()), what)
+            }),
         },
         _ => {
             plan.conflicts
@@ -635,10 +721,7 @@ fn difference(memory: &Memory, entry: &LogEntry) -> Option<&'static str> {
     if stored != words(&entry.statement()) {
         return Some("decision text differs");
     }
-    let stored_why = memory
-        .metadata
-        .get("rationale")
-        .and_then(|v| v.as_str())
+    let stored_why = metadata_rationale(memory)
         .map(words)
         .filter(|w| !w.is_empty());
     let file_why = entry
@@ -765,13 +848,7 @@ fn has_link_wording(text: &str) -> bool {
 }
 
 fn ambiguous_row(entry: &LogEntry, note: &str) -> ImportRow {
-    ImportRow {
-        decision_ref: entry.decision_ref.clone(),
-        line: entry.line,
-        title: snippet(&entry.title),
-        memory_id: None,
-        note: note.to_string(),
-    }
+    ImportRow::of(entry, None, note)
 }
 
 // -- report -------------------------------------------------------------------
@@ -802,7 +879,7 @@ fn norm_line(r: &NormalizeRow) -> String {
 pub fn render_normalize(plan: &NormalizePlan) -> String {
     let scope = plan.project.as_deref().unwrap_or("all projects");
     let mut out = format!(
-        "# Decisions normalise dry run: {scope}\n\nNothing was written. Proposed: {} retype, {} add ref. Needs a person: {} need rationale, {} conflicts. Report only: {} mentions.\n",
+        "# Decisions normalise dry run: {scope}\n\nNo memory was added, changed or deleted. Proposed: {} retype, {} add ref. Needs a person: {} need rationale, {} conflicts. Report only: {} mentions.\n",
         plan.retype.len(),
         plan.add_ref.len(),
         plan.needs_rationale.len(),
@@ -833,10 +910,29 @@ fn import_line(r: &ImportRow) -> String {
         .as_deref()
         .map(|m| format!(" `{m}`"))
         .unwrap_or_default();
-    format!(
+    let mut line = format!(
         "{} (line {}){memory} — {}: {}",
         r.decision_ref, r.line, r.note, r.title
-    )
+    );
+    let details = [
+        ("Decision", &r.decision),
+        ("Why", &r.rationale),
+        ("Date", &r.date),
+        ("Tag", &r.tag),
+        ("Stored", &r.stored),
+        ("Stored why", &r.stored_rationale),
+    ];
+    for (label, value) in details {
+        if let Some(value) = value {
+            line.push_str(&format!("\n  - {label}: {}", one_line(value)));
+        }
+    }
+    line
+}
+
+/// `text` on one line, so it stays inside its list item.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn link_line(r: &SupersedesRow) -> String {
@@ -846,7 +942,7 @@ fn link_line(r: &SupersedesRow) -> String {
 /// The import plan as markdown: counts, then every row per bucket.
 pub fn render_import(plan: &ImportPlan) -> String {
     let mut out = format!(
-        "# Decisions import dry run: {} from {}\n\nNothing was written. New {}, unchanged {}, changed {}, needs rationale {}, conflicts {}, supersedes {}, confirms {}, ambiguous {}, unparsed {}.\n",
+        "# Decisions import dry run: {} from {}\n\nNo memory was added, changed or deleted. New {}, unchanged {}, changed {}, needs rationale {}, conflicts {}, supersedes {}, confirms {}, ambiguous {}, unparsed {}.\n",
         plan.project,
         plan.source,
         plan.new.len(),

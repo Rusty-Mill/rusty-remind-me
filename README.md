@@ -784,7 +784,10 @@ decisions, marked with what replaced them.
 `rusty-remind-me decisions normalize [--project <p>]` and
 `rusty-remind-me decisions import <DECISIONS.md> --project <p>` print dry-run
 plans for bringing decisions onto one `memory_type` and importing repo
-decision logs. They write nothing.
+decision logs. They add, change or delete no memory. They refuse a path with no
+store rather than create or migrate one; opening an existing store still runs
+the same housekeeping as any other command, so run them where the store
+daemon is already up.
 
 For Orch proposed-change reports, `rusty-remind-me impact-export [QUERY]` exports
 a complete engine-backed inventory through the existing daemon/store path, with

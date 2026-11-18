@@ -770,7 +770,8 @@ const DECISIONS_USAGE: &str = "\
 Usage: rusty-remind-me decisions normalize [--project <PROJECT>] [--json]
        rusty-remind-me decisions import <DECISIONS.md> --project <PROJECT> [--json]
   Dry runs only: print what normalising decision memories, or importing a
-  repo decisions log, would change. Nothing is written to the store.";
+  repo decisions log, would change. No memory is added, changed or
+  deleted, and a path with no store is refused rather than created.";
 
 /// A parsed `decisions` command.
 #[derive(Debug, PartialEq, Eq)]
@@ -833,6 +834,24 @@ fn run_decisions(
     use remind_me_core::decisions_backfill::{
         render_import, render_normalize, ImportPlan, NormalizePlan,
     };
+    // Read the log before the store opens, and never create or migrate a
+    // store: a dry run that did either would not be one.
+    let log = match &args {
+        DecisionsArgs::Import { path, .. } => Some(
+            std::fs::read_to_string(path)
+                .map_err(|e| format!("Error: cannot read {}: {e}", path.display()))?,
+        ),
+        DecisionsArgs::Normalize { .. } => None,
+    };
+    if db_path != std::path::Path::new(":memory:")
+        && !remind_me_core::db::engine_dir(db_path).exists()
+    {
+        return Err(format!(
+            "Error: no store at {}. A dry run never creates or migrates one.",
+            db_path.display()
+        )
+        .into());
+    }
     let mut store = Store::open(db_path)?;
     let (report, json) = match args {
         DecisionsArgs::Normalize { project, json } => {
@@ -851,12 +870,10 @@ fn run_decisions(
             project,
             json,
         } => {
-            let text = std::fs::read_to_string(&path)
-                .map_err(|e| format!("Error: cannot read {}: {e}", path.display()))?;
             let plan: ImportPlan = store.call(Op::DecisionsImportPlan {
                 project,
                 source: path.display().to_string(),
-                text,
+                text: log.unwrap_or_default(),
             })?;
             (
                 if json {
