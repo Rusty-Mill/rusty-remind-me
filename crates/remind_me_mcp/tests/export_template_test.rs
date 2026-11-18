@@ -67,6 +67,8 @@ fn malformed_arguments_are_refused_not_exported_in_full() {
     add_decision(&s, "Ship the export", "mill", false);
     for args in [
         json!({"template": 5, "project": "mill"}),
+        json!({"format": "bogus"}),
+        json!({"template": "decisions", "project": 123}),
         json!({"template": "decisions", "project": ["mill"]}),
         json!({"template": "decisions", "project": "mill", "include_deleted": "yes"}),
         json!({"template": "decision", "project": "mill"}),
@@ -75,10 +77,7 @@ fn malformed_arguments_are_refused_not_exported_in_full() {
         let result = call(&s, "remind_me_export_memories", args.clone());
         assert_eq!(result["isError"], true, "{args}: {}", text(&result));
         let why = text(&result);
-        assert!(
-            why.starts_with("Invalid arguments") || why.starts_with("Export error"),
-            "{args}: {why}"
-        );
+        assert!(why.starts_with("Export error"), "{args}: {why}");
         assert!(!why.contains("Ship the export"), "{args}");
     }
 }
@@ -93,4 +92,33 @@ fn a_file_target_outside_the_export_roots_is_refused() {
     );
     assert_eq!(result["isError"], true, "{}", text(&result));
     assert!(text(&result).contains("export roots"), "{}", text(&result));
+}
+
+#[test]
+fn bad_arguments_name_the_problem() {
+    let s = server("message");
+    let result = call(&s, "remind_me_export_memories", json!({"template": 5}));
+    assert!(
+        text(&result).starts_with("Export error: invalid arguments: "),
+        "{}",
+        text(&result)
+    );
+}
+
+#[test]
+fn empty_and_null_arguments_still_run_the_default_full_export() {
+    let s = server("default");
+    add_decision(&s, "Ship the export", "mill", false);
+    add_decision(&s, "Other project choice", "tick", false);
+    for args in [json!({}), Value::Null] {
+        let result = call(&s, "remind_me_export_memories", args.clone());
+        assert_ne!(result["isError"], true, "{args}: {}", text(&result));
+        let body: Value = serde_json::from_str(text(&result)).unwrap();
+        assert!(body.get("template").is_none(), "{args}");
+        let content = body["content"].as_str().unwrap();
+        assert!(
+            content.contains("Ship the export") && content.contains("Other project choice"),
+            "{args}: {content}"
+        );
+    }
 }

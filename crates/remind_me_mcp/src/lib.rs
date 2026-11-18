@@ -2311,7 +2311,7 @@ impl McpServer {
                             serde_json::from_value(args)
                         };
                         match parsed
-                            .map_err(|e| format!("Invalid arguments: {e}"))
+                            .map_err(|e| format!("Export error: invalid arguments: {e}"))
                             .and_then(|input| {
                                 export::export_memories(&store, &input)
                                     .map_err(|e| format!("Export error: {e}"))
