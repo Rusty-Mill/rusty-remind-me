@@ -215,6 +215,34 @@ impl Fallback {
     }
 }
 
+/// The running daemon, for commands that promise to write nothing: no daemon
+/// is started and the store is never opened in this process, because opening
+/// it runs housekeeping that writes (outbox, vectors, tombstones).
+pub fn existing_daemon(db_path: &Path) -> Result<DaemonConnection> {
+    existing_daemon_with(remind_me_core::daemon::enabled(), || {
+        client::connect(&Endpoint::for_db(db_path), Mode::Op)
+    })
+}
+
+/// [`existing_daemon`] with the switch and the connector injected. It can
+/// only connect: there is no start and no local store on this path.
+fn existing_daemon_with(
+    enabled: bool,
+    connect: impl FnOnce() -> std::result::Result<DaemonConnection, ConnectError>,
+) -> Result<DaemonConnection> {
+    let refuse = |why: &str| -> Box<dyn Error> {
+        format!(
+            "decisions dry runs need the remind-me daemon already running ({why}); \
+             start it with `rusty-remind-me daemon` and retry. Nothing was read or written."
+        )
+        .into()
+    };
+    if !enabled {
+        return Err(refuse("REMIND_ME_DAEMON is off"));
+    }
+    connect().map_err(|e| refuse(&e.to_string()))
+}
+
 /// A relay to the daemon's MCP server, or the [`Fallback`] to serve
 /// in-process.
 pub fn mcp_proxy(db_path: &Path) -> std::result::Result<DaemonProxy, Fallback> {
@@ -296,4 +324,25 @@ pub fn serve_api_via_daemon(db_path: &Path, addr: &str) -> Result<Option<Fallbac
         });
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_disabled_daemon_refuses_without_trying_to_connect() {
+        let refused = existing_daemon_with(false, || panic!("must not connect"));
+        let message = refused.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(message.contains("REMIND_ME_DAEMON is off"), "{message}");
+        assert!(message.contains("Nothing was read or written."));
+    }
+
+    #[test]
+    fn no_running_daemon_fails_closed() {
+        let refused = existing_daemon_with(true, || Err(ConnectError::NotRunning));
+        let message = refused.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(message.contains("no daemon is running"), "{message}");
+        assert!(message.contains("already running"));
+    }
 }

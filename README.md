@@ -781,6 +781,14 @@ renders a project's decision memories as a markdown decisions log, deterministic
 so a regenerated file diffs cleanly. Add `--include-superseded` to keep replaced
 decisions, marked with what replaced them.
 
+`rusty-remind-me decisions normalize [--project <p>]` and
+`rusty-remind-me decisions import <DECISIONS.md> --project <p>` print dry-run
+plans for bringing decisions onto one `memory_type` and importing repo
+decision logs. They write nothing to the store: they run only in a store
+daemon that is already running, and never start one or open the store
+themselves, since opening it runs housekeeping that writes. With no daemon
+they fail without reading or writing anything.
+
 For Orch proposed-change reports, `rusty-remind-me impact-export [QUERY]` exports
 a complete engine-backed inventory through the existing daemon/store path, with
 optional supplemental retrieval. This explicit export includes sensitive and

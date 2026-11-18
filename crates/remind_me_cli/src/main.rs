@@ -766,6 +766,138 @@ fn parse_search_args(args: &[String]) -> Result<SearchArgs, String> {
     })
 }
 
+const DECISIONS_USAGE: &str = "\
+Usage: rusty-remind-me decisions normalize [--project <PROJECT>] [--json]
+       rusty-remind-me decisions import <DECISIONS.md> --project <PROJECT> [--json]
+  Dry runs only: print what normalising decision memories, or importing a
+  repo decisions log, would change. They run in the remind-me daemon,
+  which must already be running, and write nothing to the store; with no
+  daemon they fail without reading or writing it.";
+
+/// A parsed `decisions` command.
+#[derive(Debug, PartialEq, Eq)]
+enum DecisionsArgs {
+    Normalize {
+        project: Option<String>,
+        json: bool,
+    },
+    Import {
+        path: std::path::PathBuf,
+        project: String,
+        json: bool,
+    },
+}
+
+fn parse_decisions_args(args: &[String]) -> Result<DecisionsArgs, String> {
+    let usage = |why: &str| format!("Error: {why}\n{DECISIONS_USAGE}");
+    let (verb, rest) = args
+        .split_first()
+        .ok_or_else(|| usage("decisions needs a verb."))?;
+    let mut project: Option<String> = None;
+    let mut json = false;
+    let mut words: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--json" => json = true,
+            "--project" => {
+                project = Some(flag_value(rest, i, "--project", DECISIONS_USAGE)?);
+                i += 1;
+            }
+            flag if flag.starts_with("--") => {
+                return Err(usage(&format!("unknown flag {flag:?}.")))
+            }
+            word => words.push(word.to_string()),
+        }
+        i += 1;
+    }
+    let project = project
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty());
+    match (verb.as_str(), words.as_slice()) {
+        ("normalize", []) => Ok(DecisionsArgs::Normalize { project, json }),
+        ("import", [path]) => Ok(DecisionsArgs::Import {
+            path: path.into(),
+            project: project.ok_or_else(|| usage("import needs --project."))?,
+            json,
+        }),
+        ("import", _) => Err(usage("import takes exactly one file.")),
+        ("normalize", _) => Err(usage("normalize takes no file.")),
+        (other, _) => Err(usage(&format!("unknown verb {other:?}."))),
+    }
+}
+
+/// Run a `decisions` dry run and print its report.
+fn run_decisions(
+    db_path: &std::path::Path,
+    args: DecisionsArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use remind_me_core::decisions_backfill::{
+        render_import, render_normalize, ImportPlan, NormalizePlan,
+    };
+    // Read the log before any store contact. The plan runs only in an
+    // already-running daemon: starting one, or opening the store here, runs
+    // open-time housekeeping that writes, and a dry run writes nothing.
+    let log = match &args {
+        DecisionsArgs::Import { path, .. } => Some(
+            std::fs::read_to_string(path)
+                .map_err(|e| format!("Error: cannot read {}: {e}", path.display()))?,
+        ),
+        DecisionsArgs::Normalize { .. } => None,
+    };
+    let mut store = daemon::existing_daemon(db_path)?;
+    let (report, json) = match args {
+        DecisionsArgs::Normalize { project, json } => {
+            let plan: NormalizePlan =
+                daemon_plan(&mut store, Op::DecisionsNormalizePlan { project })?;
+            (
+                if json {
+                    serde_json::to_string_pretty(&plan)?
+                } else {
+                    render_normalize(&plan)
+                },
+                json,
+            )
+        }
+        DecisionsArgs::Import {
+            path,
+            project,
+            json,
+        } => {
+            let plan: ImportPlan = daemon_plan(
+                &mut store,
+                Op::DecisionsImportPlan {
+                    project,
+                    source: path.display().to_string(),
+                    text: log.unwrap_or_default(),
+                },
+            )?;
+            (
+                if json {
+                    serde_json::to_string_pretty(&plan)?
+                } else {
+                    render_import(&plan)
+                },
+                json,
+            )
+        }
+    };
+    if json {
+        println!("{report}");
+    } else {
+        print!("{report}");
+    }
+    Ok(())
+}
+
+/// Run a planning op in the daemon and read its plan.
+fn daemon_plan<T: serde::de::DeserializeOwned>(
+    daemon: &mut remind_me_core::daemon::client::DaemonConnection,
+    op: Op,
+) -> Result<T, Box<dyn std::error::Error>> {
+    Ok(daemon.call(&op)?.into_result()?)
+}
+
 const EXPORT_USAGE: &str = "\
 Usage: rusty-remind-me export --template decisions --project <PROJECT>
                               [--include-superseded] [--out <PATH>]
@@ -979,6 +1111,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         query: args.get(2).cloned(),
                     })?;
                 println!("{}", serde_json::to_string_pretty(&snapshot)?);
+            }
+            "decisions" => {
+                let parsed = match parse_decisions_args(&args[2..]) {
+                    Ok(parsed) => parsed,
+                    Err(message) => {
+                        eprintln!("{}", message);
+                        std::process::exit(1);
+                    }
+                };
+                run_decisions(&db_path, parsed)?;
             }
             "export" => {
                 let parsed = match parse_export_args(&args[2..]) {
@@ -1466,7 +1608,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", serde_json::to_string_pretty(&stats)?);
             }
             cmd => {
-                eprintln!("Unknown subcommand: {}. Available: configure, daemon, api, remote, admin, server, search, add, list, get, entity, entity-duplicates, wiki-write, wiki-read, wiki-import, wiki-compile, topics, routing, stats, resolve, session, capture-transcript, import-sessions, context, brief, impact-export, export", cmd);
+                eprintln!("Unknown subcommand: {}. Available: configure, daemon, api, remote, admin, server, search, add, list, get, entity, entity-duplicates, wiki-write, wiki-read, wiki-import, wiki-compile, topics, routing, stats, resolve, session, capture-transcript, import-sessions, context, brief, impact-export, export, decisions", cmd);
                 std::process::exit(1);
             }
         }
@@ -1481,6 +1623,35 @@ mod tests {
 
     fn args(raw: &[&str]) -> Vec<String> {
         raw.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn decisions_takes_normalize_and_import() {
+        assert_eq!(
+            parse_decisions_args(&args(&["normalize", "--json"])),
+            Ok(DecisionsArgs::Normalize {
+                project: None,
+                json: true
+            })
+        );
+        assert_eq!(
+            parse_decisions_args(&args(&["import", "D.md", "--project", "mill"])),
+            Ok(DecisionsArgs::Import {
+                path: "D.md".into(),
+                project: "mill".into(),
+                json: false
+            })
+        );
+        for bad in [
+            &[][..],
+            &["import", "D.md"],
+            &["import", "--project", "mill"],
+            &["normalize", "D.md"],
+            &["apply"],
+            &["normalize", "--apply"],
+        ] {
+            assert!(parse_decisions_args(&args(bad)).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
