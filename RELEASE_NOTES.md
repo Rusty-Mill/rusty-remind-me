@@ -5,8 +5,16 @@ Dated entries, newest first. One entry per merged pull request.
 ## 2026-11-18 — Decisions normalise and import dry runs (Mill Board #1564)
 
 ### Added
-- `rusty-remind-me decisions normalize [--project <p>] [--json]` and `rusty-remind-me decisions import <DECISIONS.md> --project <p> [--json]`: dry-run plans only, nothing is written (Nano chose a dry-run report first, pack D23). Normalise proposes `memory_type: decision` for legacy `category: decision` rows and for memories whose content opens by defining a ref, and `metadata.decision_ref` for decisions whose ref sits under `decision_id` or `decision`. Rows with no rationale, a project that disagrees with the content, or only a mention are reported, not proposed.
-- The import parser reads markdown tables by header name (D-number or slug keys, rows continuing after a blank line) and `## D<n>. Title` sections. It reports rows with no ref, refs used twice, and struck-through rows. Only `supersedes D<n>` proposes a supersedes link. `confirms D<n>` is listed separately, and any other wording about superseding is reported as unclear (pack D24 to D28).
+- `rusty-remind-me decisions normalize [--project <p>] [--json]` and `rusty-remind-me decisions import <DECISIONS.md> --project <p> [--json]`: dry-run plans only, nothing is written (Nano chose a dry-run report first, pack D30). Normalise proposes `memory_type: decision` for legacy `category: decision` rows and for memories whose content opens by defining a ref, and `metadata.decision_ref` for decisions whose ref sits under `decision_id` or `decision`. Rows with no rationale, a project that disagrees with the content, or only a mention are reported, not proposed.
+- The import parser reads markdown tables by header name (D-number or slug keys, rows continuing after a blank line) and `## D<n>. Title` sections. It reports rows with no ref, refs used twice, and struck-through rows. Only `supersedes D<n>` proposes a supersedes link. `confirms D<n>` is listed separately, and any other wording about superseding is reported as unclear (pack D31 to D35).
+
+## 2026-11-18 — Hierarchical routing spike harness (Mill Board #1563)
+
+### Added
+- `rusty-remind-me routing eval <queries.jsonl> [--run RUN] [--beam 1,2,4,8] [--log FILE]`: measures routed search (descend a tree of cluster centroids, then rank the chosen leaves' members) against flat semantic search over the same per-memory vectors. Reports recall@5/@10, tokens@5/@10, the tokens routed search needs to reach flat recall@10, vectors scored, p50/p95 latency, and the D23 go verdict per beam width.
+- Routes by a saved seed run (`topics seed`) with `--run`, or clusters in memory with the seed defaults and saves nothing. `--log` writes one JSON line per routed query per beam (path, scores, leaves, top hits) as router training data.
+- `remind_me_core::routing`: the pure tree, descent, ranking and metrics, and `eval_on`, which reads the store under one short handle and embeds the queries with none held.
+- Offline only: no store write, schema change or MCP change, and live search is untouched (Nano, 2026-11-18, D29). Write-up: `docs/research/1563-routing-spike.md`.
 
 ## 2026-11-18 — Decisions-log export (Mill Board #1565)
 

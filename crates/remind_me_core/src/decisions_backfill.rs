@@ -1,4 +1,4 @@
-//! Dry-run plans for normalising decisions (card #1564, pack D23 to D28).
+//! Dry-run plans for normalising decisions (card #1564, pack D30 to D35).
 //!
 //! Two read-only planners, nothing here writes to the store:
 //!
@@ -8,8 +8,8 @@
 //! - [`plan_import`]: which entries of a repo `DECISIONS.md` are new, already
 //!   in the store, or changed, plus supersedes links the file states outright.
 //!
-//! Anything ambiguous is reported, never guessed (D25 to D27). Plans are
-//! deterministic: same input, same report (D28).
+//! Anything ambiguous is reported, never guessed (D32 to D34). Plans are
+//! deterministic: same input, same report (D35).
 
 use crate::models::Memory;
 use serde::{Deserialize, Serialize};
@@ -683,7 +683,7 @@ const NEGATIONS: [&str; 6] = ["not", "never", "no", "nor", "doesn't", "don't"];
 
 /// `supersedes D<n>` / `confirms D<n>` stated outright in the entry's own
 /// decision. Negated, quoted or partial links, and other supersede wording,
-/// are ambiguous: reported, never proposed (D27).
+/// are ambiguous: reported, never proposed (D34).
 fn links(entry: &LogEntry, plan: &mut ImportPlan) {
     let text = entry.statement();
     let words: Vec<&str> = text.split_whitespace().collect();

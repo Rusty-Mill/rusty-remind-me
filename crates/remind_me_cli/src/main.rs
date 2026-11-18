@@ -400,6 +400,86 @@ fn parse_topics_args(args: &[String]) -> Result<Op, String> {
     }
 }
 
+const ROUTING_USAGE: &str = "Usage: rusty-remind-me routing eval <queries.jsonl> [--run RUN] \
+[--beam 1,2,4,8] [--log FILE]
+
+Measures hierarchical routing against flat semantic search (card #1563). Each
+line of the queries file is {\"query\", \"relevant\": [memory ids], \"kind\"}.
+--run routes by a saved seed run; without it the store is clustered in memory
+and nothing is saved. --log writes one JSON line per routed query per beam.
+Reads the store only.";
+
+/// Parsed `routing eval` arguments: the eval set's path, the request without
+/// its queries, and where to write the descent log.
+#[derive(Debug, PartialEq)]
+struct RoutingArgs {
+    queries: PathBuf,
+    run: Option<String>,
+    beams: Vec<usize>,
+    log: Option<PathBuf>,
+}
+
+/// Parse the arguments after `routing`.
+fn parse_routing_args(args: &[String]) -> Result<RoutingArgs, String> {
+    let usage = |why: &str| format!("Error: {why}.\n{ROUTING_USAGE}");
+    let (Some("eval"), Some(queries)) = (args.first().map(String::as_str), args.get(1)) else {
+        return Err(usage("expected routing eval <queries.jsonl>"));
+    };
+    let mut parsed = RoutingArgs {
+        queries: PathBuf::from(queries),
+        run: None,
+        beams: Vec::new(),
+        log: None,
+    };
+    let mut rest = args[2..].iter();
+    while let Some(flag) = rest.next() {
+        let value = rest
+            .next()
+            .ok_or_else(|| usage(&format!("{flag} expects a value")))?;
+        match flag.as_str() {
+            "--run" => parsed.run = Some(value.clone()),
+            "--log" => parsed.log = Some(PathBuf::from(value)),
+            "--beam" => {
+                parsed.beams = value
+                    .split(',')
+                    .map(|b| b.trim().parse::<usize>().ok().filter(|&n| n > 0))
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or_else(|| {
+                        usage(&format!("--beam takes positive numbers, got {value:?}"))
+                    })?;
+            }
+            other => return Err(usage(&format!("unknown argument {other:?}"))),
+        }
+    }
+    Ok(parsed)
+}
+
+/// Read an eval set: one JSON query per non-blank line.
+fn read_eval_queries(
+    path: &std::path::Path,
+) -> Result<Vec<remind_me_core::routing::EvalQuery>, String> {
+    let text =
+        fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    text.lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .map(|(i, line)| {
+            serde_json::from_str(line)
+                .map_err(|e| format!("{} line {}: {e}", path.display(), i + 1))
+        })
+        .collect()
+}
+
+/// Write each descent record as one JSON line.
+fn write_descents(path: &std::path::Path, descents: &[Value]) -> Result<(), String> {
+    let mut text = String::new();
+    for record in descents {
+        text.push_str(&record.to_string());
+        text.push('\n');
+    }
+    fs::write(path, text).map_err(|e| format!("cannot write {}: {e}", path.display()))
+}
+
 /// `merge|rename|move <a> <b> --because TEXT` or `retire <a> --because TEXT`.
 fn parse_topic_change(verb: &str, rest: &[String]) -> Result<Op, String> {
     let usage = |why: &str| format!("Error: {why}.\n{TOPICS_USAGE}");
@@ -1397,6 +1477,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     report.skipped.len()
                 );
             }
+            "routing" => {
+                let parsed = parse_routing_args(&args[2..]).and_then(|parsed| {
+                    read_eval_queries(&parsed.queries).map(|queries| (parsed, queries))
+                });
+                let (parsed, queries) = match parsed {
+                    Ok(ok) => ok,
+                    Err(message) => {
+                        eprintln!("{}", message);
+                        std::process::exit(1);
+                    }
+                };
+                let request = remind_me_core::routing::EvalRequest {
+                    queries,
+                    run: parsed.run.clone(),
+                    beams: parsed.beams.clone(),
+                    log: parsed.log.is_some(),
+                };
+                let mut value: Value = Store::open(&db_path)?.call(Op::RoutingEval { request })?;
+                let descents = value
+                    .as_object_mut()
+                    .and_then(|o| o.remove("descents"))
+                    .and_then(|d| d.as_array().cloned())
+                    .unwrap_or_default();
+                if let Some(path) = &parsed.log {
+                    if let Err(message) = write_descents(path, &descents) {
+                        eprintln!("{}", message);
+                        std::process::exit(1);
+                    }
+                    eprintln!("Wrote {} descent(s) to {}.", descents.len(), path.display());
+                }
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            }
             "topics" => {
                 let op = match parse_topics_args(&args[2..]) {
                     Ok(op) => op,
@@ -1474,7 +1586,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", serde_json::to_string_pretty(&stats)?);
             }
             cmd => {
-                eprintln!("Unknown subcommand: {}. Available: configure, daemon, api, remote, admin, server, search, add, list, get, entity, entity-duplicates, wiki-write, wiki-read, wiki-import, wiki-compile, topics, stats, resolve, session, capture-transcript, import-sessions, context, brief, impact-export, export, decisions", cmd);
+                eprintln!("Unknown subcommand: {}. Available: configure, daemon, api, remote, admin, server, search, add, list, get, entity, entity-duplicates, wiki-write, wiki-read, wiki-import, wiki-compile, topics, routing, stats, resolve, session, capture-transcript, import-sessions, context, brief, impact-export, export, decisions", cmd);
                 std::process::exit(1);
             }
         }
@@ -1546,6 +1658,52 @@ mod tests {
             &["--template"],
         ] {
             assert!(parse_export_args(&args(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn routing_eval_takes_a_file_run_beams_and_log() {
+        assert_eq!(
+            parse_routing_args(&args(&["eval", "q.jsonl"])),
+            Ok(RoutingArgs {
+                queries: PathBuf::from("q.jsonl"),
+                run: None,
+                beams: Vec::new(),
+                log: None,
+            })
+        );
+        assert_eq!(
+            parse_routing_args(&args(&[
+                "eval",
+                "q.jsonl",
+                "--run",
+                "20261118T000000Z",
+                "--beam",
+                "1, 4",
+                "--log",
+                "d.jsonl"
+            ])),
+            Ok(RoutingArgs {
+                queries: PathBuf::from("q.jsonl"),
+                run: Some("20261118T000000Z".into()),
+                beams: vec![1, 4],
+                log: Some(PathBuf::from("d.jsonl")),
+            })
+        );
+    }
+
+    #[test]
+    fn routing_eval_refuses_bad_arguments() {
+        for bad in [
+            &[][..],
+            &["eval"],
+            &["seed", "q.jsonl"],
+            &["eval", "q.jsonl", "--beam", "0"],
+            &["eval", "q.jsonl", "--beam", "two"],
+            &["eval", "q.jsonl", "--run"],
+            &["eval", "q.jsonl", "--top", "3"],
+        ] {
+            assert!(parse_routing_args(&args(bad)).is_err(), "{bad:?}");
         }
     }
 
