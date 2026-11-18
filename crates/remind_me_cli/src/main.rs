@@ -686,6 +686,67 @@ fn parse_search_args(args: &[String]) -> Result<SearchArgs, String> {
     })
 }
 
+const EXPORT_USAGE: &str = "\
+Usage: rusty-remind-me export --template decisions --project <PROJECT>
+                              [--include-superseded] [--out <PATH>]
+  Renders the project's decision memories as a markdown log; prints to
+  stdout unless --out names a file.";
+
+/// Parsed `export` arguments.
+#[derive(Debug, PartialEq, Eq)]
+struct ExportArgs {
+    project: String,
+    include_superseded: bool,
+    out: Option<std::path::PathBuf>,
+}
+
+/// `export`'s flags. `--template` is required and `decisions` is its only
+/// value, so a second export kind can be added without changing the call.
+fn parse_export_args(args: &[String]) -> Result<ExportArgs, String> {
+    let mut template: Option<String> = None;
+    let mut project: Option<String> = None;
+    let mut include_superseded = false;
+    let mut out: Option<std::path::PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let flag = args[i].as_str();
+        match flag {
+            "--include-superseded" => {
+                include_superseded = true;
+                i += 1;
+                continue;
+            }
+            "--template" => template = Some(flag_value(args, i, flag, EXPORT_USAGE)?),
+            "--project" => project = Some(flag_value(args, i, flag, EXPORT_USAGE)?),
+            "--out" => out = Some(flag_value(args, i, flag, EXPORT_USAGE)?.into()),
+            other => {
+                return Err(format!(
+                    "Error: unexpected argument {other:?}.\n{EXPORT_USAGE}"
+                ))
+            }
+        }
+        i += 2;
+    }
+    match template.as_deref() {
+        Some("decisions") => {}
+        Some(other) => {
+            return Err(format!(
+                "Error: unknown template {other:?}; only \"decisions\" exists.\n{EXPORT_USAGE}"
+            ))
+        }
+        None => return Err(format!("Error: --template is required.\n{EXPORT_USAGE}")),
+    }
+    let project = project
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| format!("Error: --project is required.\n{EXPORT_USAGE}"))?;
+    Ok(ExportArgs {
+        project,
+        include_superseded,
+        out,
+    })
+}
+
 const ADMIN_USAGE: &str = "\
 Usage: rusty-remind-me admin <verb> [JSON-ARGS]
   verbs: backup, reindex, archive-prune, export-memories, revoke-clients, api-key
@@ -838,6 +899,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         query: args.get(2).cloned(),
                     })?;
                 println!("{}", serde_json::to_string_pretty(&snapshot)?);
+            }
+            "export" => {
+                let parsed = match parse_export_args(&args[2..]) {
+                    Ok(parsed) => parsed,
+                    Err(message) => {
+                        eprintln!("{}", message);
+                        std::process::exit(1);
+                    }
+                };
+                let log: String = Store::open(&db_path)?.call(Op::DecisionsLog {
+                    project: parsed.project,
+                    include_superseded: parsed.include_superseded,
+                })?;
+                match parsed.out {
+                    Some(path) => std::fs::write(&path, log)
+                        .map_err(|e| format!("Error: cannot write {}: {e}", path.display()))?,
+                    None => print!("{log}"),
+                }
             }
             "copy-store" => match copy_store::parse(&args[2..], &db_path) {
                 Ok(parsed) => copy_store::run(&parsed)?,
@@ -1275,7 +1354,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", serde_json::to_string_pretty(&stats)?);
             }
             cmd => {
-                eprintln!("Unknown subcommand: {}. Available: configure, daemon, api, remote, admin, server, search, add, list, get, entity, entity-duplicates, wiki-write, wiki-read, wiki-import, wiki-compile, topics, stats, resolve, session, capture-transcript, import-sessions, context, brief, impact-export", cmd);
+                eprintln!("Unknown subcommand: {}. Available: configure, daemon, api, remote, admin, server, search, add, list, get, entity, entity-duplicates, wiki-write, wiki-read, wiki-import, wiki-compile, topics, stats, resolve, session, capture-transcript, import-sessions, context, brief, impact-export, export", cmd);
                 std::process::exit(1);
             }
         }
@@ -1290,6 +1369,35 @@ mod tests {
 
     fn args(raw: &[&str]) -> Vec<String> {
         raw.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn export_needs_the_decisions_template_and_a_project() {
+        assert_eq!(
+            parse_export_args(&args(&[
+                "--template",
+                "decisions",
+                "--project",
+                " mill ",
+                "--include-superseded",
+                "--out",
+                "D.md",
+            ])),
+            Ok(ExportArgs {
+                project: "mill".into(),
+                include_superseded: true,
+                out: Some("D.md".into()),
+            })
+        );
+        for bad in [
+            &["--project", "mill"][..],
+            &["--template", "roadmap", "--project", "mill"],
+            &["--template", "decisions"],
+            &["--template", "decisions", "--project", "mill", "stray"],
+            &["--template"],
+        ] {
+            assert!(parse_export_args(&args(bad)).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

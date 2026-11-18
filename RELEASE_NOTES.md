@@ -2,6 +2,13 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-18 — Decisions-log export (Mill Board #1565)
+
+### Added
+- `rusty-remind-me export --template decisions --project <p> [--include-superseded] [--out <path>]`: renders one project's `memory_type: decision` memories as a markdown table (number, date, decision, rationale, status, superseded by, source) and prints it, or writes it to `--out`. Read-only; nothing flows back from the file.
+- Output is byte-identical for the same memories: rows ordered by `valid_from` (else `created_at`), then `created_at`, then id; the header date is the newest `updated_at` among the rows, not the run time. Sensitive and deleted memories never appear; superseded ones only with `--include-superseded`.
+- Fields come from existing columns and metadata (pack D19): `metadata.decision_ref` for the number (never generated), `metadata.title` or the content's first line for the title, `outcome` for the status. No schema change, no new dependency, no MCP tool yet (open question Q10).
+
 ## 2026-11-16 — Project expert pack and domain pack
 
 ### Added
