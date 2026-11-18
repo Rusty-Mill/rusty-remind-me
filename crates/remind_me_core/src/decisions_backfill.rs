@@ -424,7 +424,16 @@ fn parse_table(lines: &[&str], start: usize, log: &mut ParsedLog) -> usize {
 /// Strip bold and strike-through marks; `true` when the text was struck.
 fn clean(cell: &str) -> (String, bool) {
     let struck = cell.starts_with("~~") && cell.ends_with("~~") && cell.len() > 4;
-    let text = cell.replace("~~", "").replace("**", "");
+    let text = code_parts(cell)
+        .into_iter()
+        .map(|(part, code)| {
+            if code {
+                part.to_string()
+            } else {
+                part.replace("~~", "").replace("**", "")
+            }
+        })
+        .collect::<String>();
     (text.trim().to_string(), struck)
 }
 
@@ -717,7 +726,11 @@ fn place(
 /// when the words match exactly. Anything short of that counts as changed: a
 /// false "unchanged" would hide an edit from the person approving the plan.
 fn difference(memory: &Memory, entry: &LogEntry) -> Option<&'static str> {
-    let stored = without_ref(words(&memory.content), &entry.decision_ref);
+    let stored = words(without_ref(
+        &memory.content,
+        &entry.decision_ref,
+        memory.project.as_deref().unwrap_or(""),
+    ));
     if stored != words(&entry.statement()) {
         return Some("decision text differs");
     }
@@ -739,16 +752,63 @@ fn difference(memory: &Memory, entry: &LogEntry) -> Option<&'static str> {
 /// Sentence punctuation that never changes what a decision says.
 const IGNORED: &str = ".,;:";
 
-/// Markdown markup that wraps text: `**bold**`, `__bold__`, `` `code` ``,
-/// `~~struck~~`. Removed only as a matched pair around text.
-const PAIRED_MARKUP: [&str; 4] = ["**", "__", "`", "~~"];
+/// Prose markup removed only as a matched pair, outside literal code spans.
+const PAIRED_MARKUP: [&str; 3] = ["**", "__", "~~"];
+
+/// Split prose from matched backtick spans, including multi-backtick fences.
+/// Keep the delimiters so parsing/reporting can retain the original code.
+/// Unmatched runs stay in prose and are compared as literal symbols.
+fn code_parts(text: &str) -> Vec<(&str, bool)> {
+    let mut parts = Vec::new();
+    let mut prose = 0;
+    let mut scan = 0;
+    while let Some(open) = text[scan..].find('`').map(|i| scan + i) {
+        let width = text[open..].bytes().take_while(|b| *b == b'`').count();
+        let mut next = open + width;
+        let mut end = None;
+        while let Some(close) = text[next..].find('`').map(|i| next + i) {
+            let run = text[close..].bytes().take_while(|b| *b == b'`').count();
+            next = close + run;
+            if run == width {
+                end = Some(next);
+                break;
+            }
+        }
+        if let Some(end) = end {
+            parts.push((&text[prose..open], false));
+            parts.push((&text[open..end], true));
+            prose = end;
+            scan = end;
+        } else {
+            scan = open + width;
+        }
+    }
+    parts.push((&text[prose..], false));
+    parts
+}
 
 /// Lowercase words for comparing decisions. Spacing, sentence punctuation
-/// and paired Markdown markup are ignored; every other symbol is a token of
+/// and paired prose markup are ignored; code contents compare literally.
+/// Every other symbol is a token of
 /// its own, so `-1` differs from `1`, `< 100` from `> 100`, `*.rs` from
 /// `rs` and `f(x)` from `f x`. A symbol not known to be harmless counts, so
 /// doubt lands in "changed", never "unchanged".
 fn words(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (part, code) in code_parts(text) {
+        if code {
+            let inner = part.trim_matches('`');
+            // A separate token namespace keeps literal case, punctuation and
+            // spacing distinct from prose and prevents marker removal in code.
+            out.push(format!("\0code:{inner}"));
+        } else {
+            out.extend(prose_words(part));
+        }
+    }
+    out
+}
+
+fn prose_words(text: &str) -> Vec<String> {
     let text = PAIRED_MARKUP
         .iter()
         .fold(text.to_string(), |t, mark| unwrap_pairs(&t, mark));
@@ -796,26 +856,49 @@ fn unwrap_pairs(text: &str, mark: &str) -> String {
     out
 }
 
-/// `words` without a leading definition of `reference`: an optional project
-/// (up to three words, hyphens included), the ref, a `stated` or `default`
-/// tag with or without its brackets, and a `-` or `—` marker.
-fn without_ref(mut words: Vec<String>, reference: &str) -> Vec<String> {
-    let target = reference.to_lowercase();
-    let Some(mut end) = words.iter().take(8).position(|w| *w == target) else {
-        return words;
+/// Remove only a validated opening definition with a matching project, before
+/// tokenization loses the punctuation that distinguishes definitions from mentions.
+fn without_ref<'a>(text: &'a str, reference: &str, project: &str) -> &'a str {
+    let Some((qualifier, defined)) = defined_ref(text) else {
+        return text;
     };
-    let at = |i: usize| words.get(i).map(String::as_str);
-    let is_tag = |w: Option<&str>| matches!(w, Some("stated" | "default"));
-    if at(end + 1) == Some("[") && is_tag(at(end + 2)) && at(end + 3) == Some("]") {
-        end += 3;
-    } else if is_tag(at(end + 1)) {
-        end += 1;
+    if defined != reference
+        || qualifier
+            .as_deref()
+            .is_some_and(|q| !same_project(q, project))
+    {
+        return text;
     }
-    if matches!(at(end + 1), Some("-" | "—")) {
-        end += 1;
+    let mut rest = text.trim_start();
+    for _ in 0..qualifier
+        .as_deref()
+        .map_or(0, |q| q.split_whitespace().count())
+    {
+        let Some((_, tail)) = rest.split_once(char::is_whitespace) else {
+            return text;
+        };
+        rest = tail.trim_start();
     }
-    words.drain(..=end);
-    words
+    let Some(tail) = rest.strip_prefix(reference) else {
+        return text;
+    };
+    rest = tail.strip_prefix(':').unwrap_or(tail).trim_start();
+    for tag in ["[stated]", "[default]"] {
+        if let Some(tail) = rest.strip_prefix(tag) {
+            rest = tail.strip_prefix(':').unwrap_or(tail).trim_start();
+            break;
+        }
+    }
+    for dash in ['-', '—'] {
+        if let Some(tail) = rest
+            .strip_prefix(dash)
+            .filter(|t| t.starts_with(char::is_whitespace))
+        {
+            rest = tail.trim_start();
+            break;
+        }
+    }
+    rest
 }
 
 /// Marks that open a quotation.
@@ -992,7 +1075,23 @@ fn import_line(r: &ImportRow) -> String {
 
 /// `text` on one line, so it stays inside its list item.
 fn one_line(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+    let mut out = String::new();
+    for (part, code) in code_parts(text) {
+        if code {
+            out.push_str(part);
+        } else {
+            for c in part.chars() {
+                if c.is_whitespace() {
+                    if !out.ends_with(' ') {
+                        out.push(' ');
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+        }
+    }
+    out.trim().to_string()
 }
 
 fn link_line(r: &SupersedesRow) -> String {
