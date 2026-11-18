@@ -69,6 +69,7 @@ pub mod reranker;
 pub mod resolve;
 pub mod retrieval;
 pub mod review;
+pub mod routing;
 pub mod saved_searches;
 pub mod scheduler;
 pub mod session_ops;

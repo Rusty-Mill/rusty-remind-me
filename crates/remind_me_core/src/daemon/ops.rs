@@ -138,6 +138,12 @@ pub enum Op {
         action: TopicAction,
         because: String,
     },
+    /// Measure hierarchical routing against flat search; see
+    /// [`crate::routing`]. Takes the database: the queries are embedded with
+    /// no store handle held.
+    RoutingEval {
+        request: crate::routing::EvalRequest,
+    },
     /// The daemon's own state. Answered by the daemon, not [`execute`].
     Status,
     /// Stop the daemon. Answered by the daemon, not [`execute`].
@@ -172,10 +178,10 @@ pub enum TopicAction {
     Retire { topic: String },
 }
 
-/// Run an operation against `db`. Every operation but the two that call a
-/// model runs under one store handle; [`Op::WikiAutoCompile`] and
-/// [`Op::TopicsName`] take the database, so the handle, which holds the
-/// database lock, is not held while a model writes.
+/// Run an operation against `db`. Every operation but the three that call a
+/// model runs under one store handle; [`Op::WikiAutoCompile`],
+/// [`Op::TopicsName`] and [`Op::RoutingEval`] take the database, so the
+/// handle, which holds the database lock, is not held while a model runs.
 pub fn execute_on(db: &Database, op: &Op) -> OpReply {
     let result = match op {
         Op::WikiAutoCompile {
@@ -195,6 +201,8 @@ pub fn execute_on(db: &Database, op: &Op) -> OpReply {
             crate::wiki_llm::name_topics_with_configured_model(db, run, *max_nodes)
                 .and_then(|report| serde_json::to_value(report).map_err(|e| e.to_string()))
         }
+        Op::RoutingEval { request } => crate::routing::eval_on(db, request)
+            .and_then(|outcome| serde_json::to_value(outcome).map_err(|e| e.to_string())),
         _ => return execute(&db.store(), op),
     };
     match result {
@@ -335,6 +343,9 @@ fn run(store: &Store<'_>, op: &Op) -> Result<Value, String> {
         }
         Op::TopicsName { .. } => {
             Err("naming topics needs the database: run it with execute_on".to_string())
+        }
+        Op::RoutingEval { .. } => {
+            Err("routing eval needs the database: run it with execute_on".to_string())
         }
         Op::TopicsApply { run, dry_run } => crate::topic_seed::apply(store, run, "human", *dry_run)
             .and_then(|report| serde_json::to_value(report).map_err(|e| e.to_string())),

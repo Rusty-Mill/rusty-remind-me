@@ -2,6 +2,14 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-18 — Hierarchical routing spike harness (Mill Board #1563)
+
+### Added
+- `rusty-remind-me routing eval <queries.jsonl> [--run RUN] [--beam 1,2,4,8] [--log FILE]`: measures routed search (descend a tree of cluster centroids, then rank the chosen leaves' members) against flat semantic search over the same per-memory vectors. Reports recall@5/@10, tokens@5/@10, the tokens routed search needs to reach flat recall@10, vectors scored, p50/p95 latency, and the D23 go verdict per beam width.
+- Routes by a saved seed run (`topics seed`) with `--run`, or clusters in memory with the seed defaults and saves nothing. `--log` writes one JSON line per routed query per beam (path, scores, leaves, top hits) as router training data.
+- `remind_me_core::routing`: the pure tree, descent, ranking and metrics, and `eval_on`, which reads the store under one short handle and embeds the queries with none held.
+- Offline only: no store write, schema change or MCP change, and live search is untouched (Nano, 2026-11-18, D29). Write-up: `docs/research/1563-routing-spike.md`.
+
 ## 2026-11-18 — Decisions-log export (Mill Board #1565)
 
 ### Added
