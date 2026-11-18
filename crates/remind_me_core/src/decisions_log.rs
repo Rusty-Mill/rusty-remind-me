@@ -88,7 +88,7 @@ fn row(memory: &Memory, all: &[&Memory]) -> String {
         date(memory),
         cell(&title(memory)),
         cell(rationale),
-        status(memory),
+        cell(status(memory)),
         superseded_by(memory, all),
         source(memory),
     )
@@ -145,8 +145,8 @@ fn superseded_by(memory: &Memory, all: &[&Memory]) -> String {
         .find(|m| m.id == id)
         .and_then(|m| metadata_str(m, "decision_ref"));
     match number {
-        Some(n) => format!("{} (`{id}`)", cell(n)),
-        None => format!("`{id}`"),
+        Some(n) => format!("{} ({})", cell(n), code(id)),
+        None => code(id),
     }
 }
 
@@ -156,8 +156,8 @@ fn source(memory: &Memory) -> String {
         .as_deref()
         .or(memory.capture_id.as_deref());
     match capture {
-        Some(c) => format!("`{}` · capture `{c}`", memory.id),
-        None => format!("`{}`", memory.id),
+        Some(c) => format!("{} · capture {}", code(&memory.id), code(c)),
+        None => code(&memory.id),
     }
 }
 
@@ -168,6 +168,12 @@ fn metadata_str<'m>(memory: &'m Memory, key: &str) -> Option<&'m str> {
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty())
+}
+
+/// An id as an inline code span, safe inside a table cell. Backticks are
+/// dropped: they would end the span, and no id format uses them.
+fn code(id: &str) -> String {
+    format!("`{}`", cell(&id.replace('`', "")))
 }
 
 /// Text safe inside a table cell: newlines folded to spaces, `|` escaped.
@@ -185,6 +191,12 @@ mod tests {
     #[test]
     fn cell_folds_newlines_and_escapes_pipes() {
         assert_eq!(cell("a |\n b\r\nc"), "a \\| b c");
+    }
+
+    #[test]
+    fn code_spans_survive_hostile_ids() {
+        assert_eq!(code("mem_1"), "`mem_1`");
+        assert_eq!(code("a`b|c\nd"), "`ab\\|c d`");
     }
 
     #[test]
