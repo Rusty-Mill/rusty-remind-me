@@ -158,6 +158,10 @@ impl RouteIndex {
         let positions = corpus.positions();
         let dim = corpus.dim();
         let mut sums = vec![vec![0.0f32; dim]; snapshot.nodes.len()];
+        // Members in the corpus at or below each node: a nonempty subtree
+        // whose vectors cancel still gets a (zero) centroid of the right
+        // dimension, so it can be chosen; only an empty one gets none.
+        let mut counts = vec![0usize; snapshot.nodes.len()];
         let mut nodes: Vec<RouteNode> = snapshot
             .nodes
             .iter()
@@ -178,13 +182,15 @@ impl RouteIndex {
             for &m in &nodes[i].members {
                 add_into(&mut sums[i], &corpus.vectors[m]);
             }
+            counts[i] += nodes[i].members.len();
             if let Some(p) = nodes[i].parent {
                 let child = sums[i].clone();
                 add_into(&mut sums[p], &child);
+                counts[p] += counts[i];
             }
         }
-        for (node, sum) in nodes.iter_mut().zip(sums) {
-            if sum.iter().any(|x| *x != 0.0) {
+        for ((node, sum), count) in nodes.iter_mut().zip(sums).zip(counts) {
+            if count > 0 {
                 node.centroid = normalize(sum);
             }
         }
@@ -632,9 +638,20 @@ pub fn evaluate(
         }
         let path = scores(&rows, corpus);
         let matched = tokens_to_match(&flat, &path);
+        // With no labelled query measured, every average is 0 and the rule
+        // would pass against nothing: such a run is never a go.
+        let verdict = match usable.is_empty() {
+            true => Verdict {
+                recall_ok: false,
+                tokens_ok: false,
+                latency_ok: false,
+                go: false,
+            },
+            false => verdict(&flat, &path, matched),
+        };
         routed.push(BeamScores {
             beam,
-            verdict: verdict(&flat, &path, matched),
+            verdict,
             tokens_to_match: matched,
             scores: path,
         });
@@ -820,6 +837,12 @@ pub fn eval_on(db: &Database, request: &EvalRequest) -> Result<EvalOutcome, Stri
     let queries: Vec<(EvalQuery, Vec<f32>)> =
         request.queries.iter().cloned().zip(vectors).collect();
     let (report, descents) = evaluate(&index, &loaded.corpus, &queries, beams, &from);
+    if report.queries == 0 {
+        return Err(format!(
+            "none of the {} queries has a relevant memory in this store's corpus; are the labels from another store?",
+            request.queries.len()
+        ));
+    }
     Ok(EvalOutcome {
         report,
         descents: if request.log { descents } else { Vec::new() },
@@ -950,6 +973,38 @@ mod tests {
         let index = RouteIndex::from_snapshot(&snap, &c);
         let descent = index.descend(&unit(&[0.0, 1.0, 0.0]), 2);
         assert_eq!(descent.leaves, vec![1]);
+    }
+
+    #[test]
+    fn a_leaf_whose_vectors_cancel_is_still_routable() {
+        let c = Corpus::new(vec![
+            ("p".into(), vec![1.0, 0.0], 1),
+            ("n".into(), vec![-1.0, 0.0], 1),
+        ]);
+        let index = RouteIndex::from_snapshot(&snapshot(vec![node(0, None, &["p", "n"])]), &c);
+        assert_eq!(index.nodes()[0].centroid.len(), 2);
+        let (ranking, _) = rank_routed(&index, &c, &[1.0, 0.0], 1, 10);
+        assert_eq!(ranking.hits.len(), 2);
+    }
+
+    #[test]
+    fn a_run_with_no_measured_query_is_never_a_go() {
+        let c = corpus();
+        let index = RouteIndex::from_snapshot(&two_level(), &c);
+        let only = EvalQuery {
+            query: "elsewhere".into(),
+            relevant: vec!["missing".into()],
+            kind: None,
+        };
+        let (report, _) = evaluate(
+            &index,
+            &c,
+            &[(only, unit(&[1.0, 0.0, 0.0]))],
+            &[1],
+            &Provenance::default(),
+        );
+        assert_eq!(report.queries, 0);
+        assert!(!report.routed[0].verdict.go);
     }
 
     #[test]
