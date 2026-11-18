@@ -217,13 +217,16 @@ fn run(store: &Store<'_>, op: &Op) -> Result<Value, String> {
         Op::DecisionsLog {
             project,
             include_superseded,
-        } => to_value(crate::decisions_log::export(
-            store,
-            &crate::decisions_log::DecisionsQuery {
-                project: project.clone(),
-                include_superseded: *include_superseded,
-            },
-        )),
+        } => to_value(
+            crate::decisions_log::export(
+                store,
+                &crate::decisions_log::DecisionsQuery {
+                    project: project.clone(),
+                    include_superseded: *include_superseded,
+                },
+            )
+            .map(|log| log.markdown),
+        ),
         Op::Search { input } => to_value(queries::search_memories(store, input)),
         Op::Add { input } => to_value(queries::add_memory(store, input.clone())),
         Op::List { input } => to_value(queries::list_memories(store, input)),

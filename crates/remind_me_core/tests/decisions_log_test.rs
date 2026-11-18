@@ -91,3 +91,47 @@ fn a_project_without_decisions_renders_an_empty_log() {
         "# Decisions: Mill\n\nGenerated from remind-me; do not hand-edit.\n\n_No decisions recorded._\n"
     );
 }
+
+fn template_input(template: &str, project: Option<&str>) -> remind_me_core::models::ExportInput {
+    remind_me_core::models::ExportInput {
+        template: Some(template.into()),
+        project: project.map(Into::into),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn export_memories_renders_the_decisions_template_inline() {
+    let db = Database::open_in_memory().expect("database");
+    seed(&db);
+    let result = remind_me_core::export::export_memories(
+        &db.store(),
+        &template_input("decisions", Some("mill")),
+    )
+    .expect("export");
+    assert_eq!(result.exported, 2);
+    assert_eq!(result.template.as_deref(), Some("decisions"));
+    assert!(result.entities.is_none());
+    let content = result.content.expect("inline");
+    assert!(content.starts_with("# Decisions: mill\n"));
+    assert!(
+        !content.contains("m-old"),
+        "superseded only with include_deleted"
+    );
+}
+
+#[test]
+fn export_memories_refuses_an_unknown_template_or_a_missing_project() {
+    let db = Database::open_in_memory().expect("database");
+    let store = db.store();
+    for input in [
+        template_input("decision", Some("mill")),
+        template_input("decisions", None),
+        template_input("decisions", Some("  ")),
+    ] {
+        assert!(
+            remind_me_core::export::export_memories(&store, &input).is_err(),
+            "{input:?}"
+        );
+    }
+}

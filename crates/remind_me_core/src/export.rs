@@ -353,6 +353,9 @@ pub fn export_memories(
     store: &Store<'_>,
     input: &ExportInput,
 ) -> std::result::Result<ExportResult, ExportError> {
+    if let Some(template) = input.template.as_deref() {
+        return export_template(store, input, template);
+    }
     let records = collect_export_records(store, input)?;
     let payload = render_export(&records, input.format);
 
@@ -371,6 +374,7 @@ pub fn export_memories(
         status: "ok",
         exported,
         format: input.format,
+        template: None,
         entities: input.include_graph.then_some(entities),
         links: input.include_graph.then_some(links),
         relations: input.include_graph.then_some(relations),
@@ -379,6 +383,57 @@ pub fn export_memories(
         content: None,
     };
 
+    deliver(input, payload, result)
+}
+
+/// A template export (card #1565, pack D22): only `decisions` exists.
+fn export_template(
+    store: &Store<'_>,
+    input: &ExportInput,
+    template: &str,
+) -> std::result::Result<ExportResult, ExportError> {
+    let invalid = |why: String| ExportError::Db(crate::db::StoreError::Invalid(why));
+    if template != crate::decisions_log::TEMPLATE {
+        return Err(invalid(format!(
+            "unknown template {template:?}; only {:?} exists",
+            crate::decisions_log::TEMPLATE
+        )));
+    }
+    let project = input
+        .project
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| invalid("template export needs a project".to_string()))?;
+    let log = crate::decisions_log::export(
+        store,
+        &crate::decisions_log::DecisionsQuery {
+            project: project.to_string(),
+            include_superseded: input.include_deleted,
+        },
+    )?;
+    let result = ExportResult {
+        status: "ok",
+        exported: log.rows,
+        format: input.format,
+        template: Some(template.to_string()),
+        entities: None,
+        links: None,
+        relations: None,
+        file: None,
+        bytes: None,
+        content: None,
+    };
+    deliver(input, log.markdown, result)
+}
+
+/// Write `payload` to the input's `file_path` (inside the export roots), or
+/// carry it inline when there is none.
+fn deliver(
+    input: &ExportInput,
+    payload: String,
+    mut result: ExportResult,
+) -> std::result::Result<ExportResult, ExportError> {
     match input.file_path.as_ref().filter(|p| !p.trim().is_empty()) {
         Some(raw) => {
             let path = validate_export_path(raw)?;
@@ -391,6 +446,5 @@ pub fn export_memories(
         }
         None => result.content = Some(payload),
     }
-
     Ok(result)
 }

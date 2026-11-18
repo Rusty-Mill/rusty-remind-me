@@ -32,10 +32,24 @@ pub struct DecisionsQuery {
     pub include_superseded: bool,
 }
 
+/// The template name `remind_me_export_memories` takes for this log.
+pub const TEMPLATE: &str = "decisions";
+
+/// A rendered log and how many decisions it holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecisionsLog {
+    pub markdown: String,
+    pub rows: usize,
+}
+
 /// Read `query`'s decisions from `store` and render the log.
-pub fn export(store: &Store<'_>, query: &DecisionsQuery) -> crate::db::Result<String> {
+pub fn export(store: &Store<'_>, query: &DecisionsQuery) -> crate::db::Result<DecisionsLog> {
     let all = Memories::new(store).live_of_type("decision")?;
-    Ok(render(&query.project, &select(&all, query)))
+    let picked = select(&all, query);
+    Ok(DecisionsLog {
+        markdown: render(&query.project, &picked),
+        rows: picked.len(),
+    })
 }
 
 /// The decisions `query` takes from `memories`, in log order: by date, then

@@ -47,6 +47,7 @@ fn export_input(include_deleted: bool) -> ExportInput {
         file_path: None,
         include_graph: false,
         include_deleted,
+        ..Default::default()
     }
 }
 
