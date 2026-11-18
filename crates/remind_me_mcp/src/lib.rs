@@ -2305,10 +2305,15 @@ impl McpServer {
                         // Fail closed: malformed arguments used to fall back to
                         // a default full export, which a mistyped `template`
                         // would turn into a dump of every memory.
-                        let parsed: Result<ExportInput, _> = if args.is_null() {
+                        // An explicit `template: null` is a selector that names
+                        // nothing, not an omitted one: refused, not a full export.
+                        let null_template = args.get("template").is_some_and(Value::is_null);
+                        let parsed: Result<ExportInput, String> = if args.is_null() {
                             Ok(ExportInput::default())
+                        } else if null_template {
+                            Err("template must be a string".to_string())
                         } else {
-                            serde_json::from_value(args)
+                            serde_json::from_value(args).map_err(|e| e.to_string())
                         };
                         match parsed
                             .map_err(|e| format!("Export error: invalid arguments: {e}"))

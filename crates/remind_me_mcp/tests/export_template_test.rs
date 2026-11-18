@@ -73,6 +73,9 @@ fn malformed_arguments_are_refused_not_exported_in_full() {
         json!({"template": "decisions", "project": "mill", "include_deleted": "yes"}),
         json!({"template": "decision", "project": "mill"}),
         json!({"template": "decisions"}),
+        json!({"template": null}),
+        json!({"template": null, "project": "mill"}),
+        json!({"project": "mill"}),
     ] {
         let result = call(&s, "remind_me_export_memories", args.clone());
         assert_eq!(result["isError"], true, "{args}: {}", text(&result));

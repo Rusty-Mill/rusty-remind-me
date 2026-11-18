@@ -356,6 +356,13 @@ pub fn export_memories(
     if let Some(template) = input.template.as_deref() {
         return export_template(store, input, template);
     }
+    // `project` only scopes a template export. Refused rather than ignored,
+    // so a caller who meant a scoped export never gets every memory.
+    if input.project.is_some() {
+        return Err(ExportError::Db(crate::db::StoreError::Invalid(
+            "project applies only with a template".to_string(),
+        )));
+    }
     let records = collect_export_records(store, input)?;
     let payload = render_export(&records, input.format);
 

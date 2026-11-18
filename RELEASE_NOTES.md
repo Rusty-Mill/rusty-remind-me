@@ -12,6 +12,7 @@ Dated entries, newest first. One entry per merged pull request.
 
 ### Changed
 - `remind_me_export_memories` refuses malformed arguments (`Export error: invalid arguments: ...`) instead of falling back to a default full export of every memory.
+- An explicit `template: null`, or a `project` without a template, is refused rather than run as an unscoped full export.
 
 ## 2026-11-16 — Project expert pack and domain pack
 
