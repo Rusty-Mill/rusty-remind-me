@@ -99,7 +99,7 @@ fn import_sorts_entries_into_buckets_and_states_links() {
         decision(
             "m-d2",
             "mill",
-            "rusty D2: keep | pipes",
+            "mill D2: keep | pipes",
             json!({"decision_ref": "D2", "rationale": "Escaped."}),
         ),
         decision(
@@ -473,7 +473,220 @@ fn signs_and_comparisons_count_markup_does_not() {
             "let-em-loose D2 [stated] — Use X",
             same
         ),
-        "unchanged",
-        "a hyphenated project and a dash marker still open the definition"
+        "decision text differs",
+        "a different project qualifier must remain in the comparison"
     );
+}
+
+#[test]
+fn only_valid_matching_definition_prefixes_are_removed() {
+    let log = parse_log("| # | Decision | Why |\n|---|---|---|\n| D2 | use X | Fast |\n");
+    for (content, unchanged) in [
+        ("use X", true),
+        ("D2: use X", true),
+        ("D2 [stated]: use X", true),
+        ("D2 [default] - use X", true),
+        ("D2 — use X", true),
+        ("Let Em Loose D2 [stated] - use X", true),
+        ("let_em_loose D2: use X", true),
+        ("Never follow D2; use X", false),
+        ("Never follow D2: use X", false),
+        ("See D2 use X", false),
+        ("D2 use X", false),
+        ("other-project D2: use X", false),
+        ("D3: use X", false),
+        ("D2: stated use X", false),
+        ("D2: -use X", false),
+    ] {
+        let memories = stored(vec![decision(
+            "m-d2",
+            "let-em-loose",
+            content,
+            json!({"decision_ref": "D2", "rationale": "Fast"}),
+        )]);
+        let plan = plan_import(&log, "let-em-loose", "synthetic.md", &memories);
+        assert_eq!(plan.unchanged.len(), usize::from(unchanged), "{content}");
+        assert_eq!(plan.changed.len(), usize::from(!unchanged), "{content}");
+        if !unchanged {
+            assert_eq!(plan.changed[0].stored.as_deref(), Some(content));
+            let report = render_import(&plan);
+            assert!(report.contains(content), "{report}");
+            assert!(report.contains("use X"));
+        }
+    }
+}
+
+#[test]
+fn code_literals_survive_table_and_section_parsing_and_comparison() {
+    for (literal, changed) in [
+        ("`**/cache/**`", "`/cache/`"),
+        ("`a**b**`", "`ab`"),
+        ("`__name__`", "`name`"),
+        ("`~~mask~~`", "`mask`"),
+        ("`Foo`", "`foo`"),
+        ("`x;y`", "`xy`"),
+        ("`a  b`", "`a b`"),
+        ("``a`**b**``", "``a`b``"),
+    ] {
+        for section in [false, true] {
+            for rationale in [false, true] {
+                let title = if rationale {
+                    "Use X".into()
+                } else {
+                    format!("Match {literal}")
+                };
+                let why = if rationale {
+                    format!("Keep {literal}")
+                } else {
+                    "Fast".into()
+                };
+                let body = if section {
+                    " **Decision.** Keep it.\n"
+                } else {
+                    ""
+                };
+                let raw = if section {
+                    format!("## D2. {title}\n\n{}**Why.** {why}\n", body.trim_start())
+                } else {
+                    format!("| # | Decision | Why |\n|---|---|---|\n| D2 | {title} | {why} |\n")
+                };
+                let log = parse_log(&raw);
+                assert_eq!(log.entries[0].title, title);
+                assert_eq!(log.entries[0].rationale.as_deref(), Some(why.as_str()));
+                let statement = if section {
+                    format!("{title} Keep it.")
+                } else {
+                    title.clone()
+                };
+                for differs in [false, true] {
+                    let content = format!("D2: {statement}");
+                    let content = if differs && !rationale {
+                        content.replace(literal, changed)
+                    } else {
+                        content
+                    };
+                    let stored_why = if differs && rationale {
+                        why.replace(literal, changed)
+                    } else {
+                        why.clone()
+                    };
+                    let memories = stored(vec![decision(
+                        "m-d2",
+                        "mill",
+                        &content,
+                        json!({"decision_ref": "D2", "rationale": stored_why}),
+                    )]);
+                    let plan = plan_import(&log, "mill", "synthetic.md", &memories);
+                    assert_eq!(
+                        plan.changed.len(),
+                        usize::from(differs),
+                        "{raw} vs {content} / {stored_why}"
+                    );
+                    assert_eq!(plan.unchanged.len(), usize::from(!differs));
+                    if differs {
+                        assert_eq!(plan.changed[0].stored.as_deref(), Some(content.as_str()));
+                        assert_eq!(
+                            plan.changed[0].stored_rationale.as_deref(),
+                            Some(stored_why.as_str())
+                        );
+                        let report = render_import(&plan);
+                        assert!(report.contains(&title));
+                        assert!(report.contains(&why));
+                        assert!(report.contains(&content));
+                        assert!(report.contains(&stored_why));
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn section_decision_body_keeps_code_literals_in_the_report() {
+    let log = parse_log(
+        "## D2. Cache rule\n\n**Decision.** Match `**/cache/**` using `__key__`.\n**Why.** Fast.\n",
+    );
+    let original = "D2: Cache rule Match `**/cache/**` using `__key__`.";
+    for content in [original, "D2: Cache rule Match `/cache/` using `key`."] {
+        let memories = stored(vec![decision(
+            "m-d2",
+            "mill",
+            content,
+            json!({"decision_ref": "D2", "rationale": "Fast"}),
+        )]);
+        let plan = plan_import(&log, "mill", "synthetic.md", &memories);
+        assert_eq!(plan.unchanged.len(), usize::from(content == original));
+        assert_eq!(plan.changed.len(), usize::from(content != original));
+        let report = render_import(&plan);
+        assert!(report.contains("Match `**/cache/**` using `__key__`."));
+        if content != original {
+            assert!(report.contains(content));
+        }
+    }
+}
+
+#[test]
+fn escaped_backticks_cannot_hide_literal_delimiter_changes() {
+    let log =
+        parse_log("| # | Decision | Why |\n|---|---|---|\n| D2 | Match \\``foo\\`` | Fast |\n");
+    for (content, unchanged) in [
+        (r"D2: Match \`foo\`", false),
+        (r"D2: Match \``foo\``", true),
+    ] {
+        let memories = stored(vec![decision(
+            "m-d2",
+            "mill",
+            content,
+            json!({"decision_ref": "D2", "rationale": "Fast"}),
+        )]);
+        let plan = plan_import(&log, "mill", "synthetic.md", &memories);
+        assert_eq!(plan.unchanged.len(), usize::from(unchanged), "{content}");
+        assert_eq!(plan.changed.len(), usize::from(!unchanged), "{content}");
+    }
+}
+
+#[test]
+fn multiline_stored_values_stay_inside_their_report_detail() {
+    let content =
+        "D2: Before\n```\n**literal**  text\n```\n\n## Another heading\n- another item\nend\r\n";
+    let why = "Reason\n````\n`a` and \\n are literal\n````\nnext\rline";
+    let memories = stored(vec![decision(
+        "m-d2",
+        "mill",
+        content,
+        json!({"decision_ref": "D2", "rationale": why}),
+    )]);
+    let log = parse_log(
+        "| # | Decision | Why |\n|---|---|---|\n| D2 | After | Fast |\n| D3 | Later entry | Later reason |\n",
+    );
+    let plan = plan_import(&log, "mill", "synthetic.md", &memories);
+    assert_eq!(plan.changed[0].stored.as_deref(), Some(content));
+    assert_eq!(plan.changed[0].stored_rationale.as_deref(), Some(why));
+    let report = render_import(&plan);
+    let details: Vec<_> = report
+        .lines()
+        .filter(|line| line.starts_with("  - Stored"))
+        .collect();
+    assert_eq!(details.len(), 2);
+    // The quoted escaped representation preserves line breaks, backslashes,
+    // repeated spaces and delimiter runs without adding report structure.
+    assert!(details[0].contains(&format!("{content:?}")), "{report}");
+    assert!(details[1].contains(&format!("{why:?}")), "{report}");
+    for (detail, original) in details.into_iter().zip([content, why]) {
+        assert!(detail.contains("escaped string"), "{detail}");
+        let rendered = detail.split_once("escaped string ").expect("label").1;
+        let fence = rendered.split_once(' ').expect("code delimiter").0;
+        let longest = original
+            .split(|c| c != '`')
+            .map(str::len)
+            .max()
+            .unwrap_or(0);
+        assert!(fence.len() > longest && fence.chars().all(|c| c == '`'));
+        assert!(rendered.ends_with(fence));
+    }
+    assert!(!report
+        .lines()
+        .any(|line| line.starts_with("```") || line.starts_with("## Another")));
+    assert!(report.contains("\n## Unchanged (0)\n\nNone.\n\n## Needs rationale"));
+    assert!(report.contains("D3 (line 4)"));
 }
