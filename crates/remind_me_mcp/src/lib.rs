@@ -2302,13 +2302,25 @@ impl McpServer {
                         }
                     },
                     "remind_me_export_memories" => {
-                        let input: ExportInput = serde_json::from_value(args).unwrap_or_default();
-                        match export::export_memories(&store, &input) {
+                        // Fail closed: malformed arguments used to fall back to
+                        // a default full export, which a mistyped `template`
+                        // would turn into a dump of every memory.
+                        let parsed: Result<ExportInput, _> = if args.is_null() {
+                            Ok(ExportInput::default())
+                        } else {
+                            serde_json::from_value(args)
+                        };
+                        match parsed
+                            .map_err(|e| format!("Invalid arguments: {e}"))
+                            .and_then(|input| {
+                                export::export_memories(&store, &input)
+                                    .map_err(|e| format!("Export error: {e}"))
+                            }) {
                             Ok(result) => {
                                 json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap() }] })
                             }
-                            Err(e) => {
-                                json!({ "isError": true, "content": [{ "type": "text", "text": format!("Export error: {}", e) }] })
+                            Err(text) => {
+                                json!({ "isError": true, "content": [{ "type": "text", "text": text }] })
                             }
                         }
                     }
