@@ -23,6 +23,17 @@ pub enum Op {
     ImpactExport {
         query: Option<String>,
     },
+    /// Dry-run normalise plan; see [`crate::decisions_backfill`]. Writes nothing.
+    DecisionsNormalizePlan {
+        project: Option<String>,
+    },
+    /// Dry-run import plan for one `DECISIONS.md`, sent as text so the
+    /// daemon never reads the client's paths. Writes nothing.
+    DecisionsImportPlan {
+        project: String,
+        source: String,
+        text: String,
+    },
     /// One project's decisions as a markdown log; see [`crate::decisions_log`].
     DecisionsLog {
         project: String,
@@ -214,6 +225,23 @@ pub fn execute(store: &Store<'_>, op: &Op) -> OpReply {
 fn run(store: &Store<'_>, op: &Op) -> Result<Value, String> {
     match op {
         Op::ImpactExport { query } => crate::export::impact_snapshot(store, query.as_deref()),
+        Op::DecisionsNormalizePlan { project } => to_value(
+            crate::db::memories::Memories::new(store)
+                .all_live()
+                .map(|all| crate::decisions_backfill::plan_normalize(&all, project.as_deref())),
+        ),
+        Op::DecisionsImportPlan {
+            project,
+            source,
+            text,
+        } => to_value(
+            crate::db::memories::Memories::new(store)
+                .live_of_type("decision")
+                .map(|all| {
+                    let log = crate::decisions_backfill::parse_log(text);
+                    crate::decisions_backfill::plan_import(&log, project, source, &all)
+                }),
+        ),
         Op::DecisionsLog {
             project,
             include_superseded,

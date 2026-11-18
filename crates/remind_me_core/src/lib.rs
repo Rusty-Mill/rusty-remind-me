@@ -26,6 +26,7 @@ pub mod date_inference;
 pub mod date_phrase;
 pub mod db;
 pub mod dbs_import;
+pub mod decisions_backfill;
 pub mod decisions_log;
 pub mod digest;
 pub mod duplicates;
