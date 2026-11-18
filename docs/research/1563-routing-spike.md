@@ -1,7 +1,8 @@
 # Spike: hierarchical embedding routing (Mill Board #1563)
 
-Status: harness built, **measurement pending** (it runs on the remindme host,
-which holds the store and the embedder). Results go in the table below.
+Status: **measured 2026-11-18**, on BaileyAi against a copy of the remindme
+store backup of 2026-11-17 (embedder `qwen3-embedding:0.6b`, 1024 dims, the
+same model as the stored vectors). Verdict: **no-go**.
 
 ## Question
 
@@ -69,10 +70,26 @@ summary per node handed to the model instead of leaves).
 
 | beam | recall@10 | flat recall@10 | tokens to match (k) | flat tokens@10 | vectors scored | p95 / flat p95 | go |
 |---|---|---|---|---|---|---|---|
-| 1 | | | | | | | |
-| 2 | | | | | | | |
-| 4 | | | | | | | |
-| 8 | | | | | | | |
+| 1 | 0.402 | 0.965 | not reached | 3346 | 249 / 8974 | 537 µs / 10076 µs (0.05×) | no |
+| 2 | 0.535 | 0.965 | not reached | 3346 | 451 / 8974 | 637 µs / 10076 µs (0.06×) | no |
+| 4 | 0.641 | 0.965 | not reached | 3346 | 867 / 8974 | 1129 µs / 10076 µs (0.11×) | no |
+| 8 | 0.758 | 0.965 | not reached | 3346 | 1674 / 8974 | 2119 µs / 10076 µs (0.21×) | no |
+
+Vectors scored and tokens are per-query means. Routed tokens@10 were
+3944 / 3706 / 3760 / 3742 for beams 1 / 2 / 4 / 8.
+
+**No-go.** At no beam width does routed recall@10 come within 2 points of
+flat (best 0.758 at beam 8 against 0.965), so no routed k reaches the match
+target and the token rule cannot be met; routed search does not hand the
+model less text either, since its tokens@10 are above flat's. Only the
+latency rule holds: routing scores 3-19% of the vectors and its p95 is
+0.05-0.21× flat. That matches the "What to expect" reading: over the same
+frozen vectors, centroid routing is a compute/scale optimisation that costs
+recall, not a context saving. Run shape: corpus 8,974 memories, an
+in-memory tree (no `--run`) of 92 nodes and 71 leaves at depth 3, 33 of the
+50 queries measured; 17 were skipped because none of their relevant ids is
+in the seedable corpus of this backup, and 48 relevant ids are missing in
+all (newer than the 2026-11-17 backup, or not seedable). Unrouted: 0.
 
 ## Running it
 
