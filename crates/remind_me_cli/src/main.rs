@@ -817,9 +817,12 @@ fn parse_decisions_args(args: &[String]) -> Result<DecisionsArgs, String> {
         }
         i += 1;
     }
-    let project = project
-        .map(|p| p.trim().to_string())
-        .filter(|p| !p.is_empty());
+    // An explicitly blank `--project` is refused, never read as "all
+    // projects": with `--apply` that would widen a scoped write to the store.
+    let project = match project.map(|p| p.trim().to_string()) {
+        Some(p) if p.is_empty() => return Err(usage("--project must not be blank.")),
+        other => other,
+    };
     match (verb.as_str(), words.as_slice()) {
         ("normalize", []) => Ok(DecisionsArgs::Normalize {
             project,
@@ -1683,8 +1686,29 @@ mod tests {
                 json: false
             })
         );
+        assert_eq!(
+            parse_decisions_args(&args(&["normalize", "--apply"])),
+            Ok(DecisionsArgs::Normalize {
+                project: None,
+                apply: true,
+                json: false
+            }),
+            "an omitted --project means every project"
+        );
+        assert_eq!(
+            parse_decisions_args(&args(&["normalize", "--apply", "--project", " mill "])),
+            Ok(DecisionsArgs::Normalize {
+                project: Some("mill".into()),
+                apply: true,
+                json: false
+            })
+        );
         for bad in [
             &[][..],
+            &["normalize", "--apply", "--project", ""],
+            &["normalize", "--apply", "--project", "   "],
+            &["normalize", "--project", "\t"],
+            &["import", "D.md", "--project", " "],
             &["import", "D.md"],
             &["import", "--project", "mill"],
             &["normalize", "D.md"],
