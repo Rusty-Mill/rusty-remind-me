@@ -31,7 +31,8 @@ pub enum Op {
     /// re-planned at apply time; see
     /// [`crate::decisions_backfill::apply_normalize`]. The only decisions op
     /// that writes. It needs no authorization beyond the daemon token every
-    /// op presents, as `Add`, `Resolve` and `TopicsApply` do.
+    /// op presents, as `Add`, `Resolve` and `TopicsApply` do. Claim rows
+    /// are skipped, as every generic edit refuses them.
     DecisionsNormalizeApply {
         project: Option<String>,
     },

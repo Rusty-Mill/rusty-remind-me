@@ -316,7 +316,8 @@ pub fn apply_normalize(
 /// only if it still wants the same ref, merging into the metadata just read.
 /// The engine's page gate keeps every other writer, background sync
 /// included, out between that read and the write, so a newer edit is never
-/// discarded and a row that stopped qualifying is skipped.
+/// discarded and a row that stopped qualifying is skipped. A project or
+/// topic claim row is skipped too, as every generic edit refuses it.
 ///
 /// The row edit is in the page and rolls back with it; the revision table is
 /// not. So the revision, holding what the edit replaced, is written last,
@@ -379,6 +380,11 @@ fn write_ref(
     let Some(current) = queries::get_memory_by_id(store, &row.id)? else {
         return Ok(RefWrite::Skipped("no longer live".into()));
     };
+    // Claim rows are written only by their own commands; refuse them as any
+    // generic edit does.
+    if let Err(refused) = crate::project::refuse_claim_edit(&current) {
+        return Ok(RefWrite::Skipped(refused.to_string()));
+    }
     let replan = plan_normalize(std::slice::from_ref(&current), project);
     let Some(wanted) = replan.add_ref.first() else {
         return Ok(RefWrite::Skipped("no longer needs a ref".into()));

@@ -822,7 +822,7 @@ fn apply_revalidates_each_row_against_the_store_at_write_time() {
     assert!(
         applied.skipped[2].note.contains("D30"),
         "{}",
-        applied.skipped[1].note
+        applied.skipped[2].note
     );
 
     let got = |id: &str| {
@@ -894,6 +894,53 @@ fn apply_isolates_a_failing_row() {
         .expect("live");
     assert_eq!(bad.metadata.get("decision_ref"), None);
     assert!(remind_me_core::history::history(&store, "m-bad", 10)
+        .expect("history")
+        .is_empty());
+}
+
+/// A project claim row is never written by the generic apply: it is
+/// skipped with the claim refusal, left as it was, and the rest still go.
+#[test]
+fn apply_skips_claim_rows() {
+    let db = Database::open_in_memory().expect("database");
+    let store = db.store();
+    let memories = Memories::new(&store);
+    let mut claim = decision(
+        "m-claim",
+        "mill",
+        "x",
+        json!({"decision_id": "D1", "rationale": "x"}),
+    );
+    claim.subject = Some("mill".into());
+    claim.predicate = Some("project.stage".into());
+    claim.object = Some("built".into());
+    memories.insert(&claim).expect("insert");
+    memories
+        .insert(&decision(
+            "m-ok",
+            "mill",
+            "x",
+            json!({"decision_id": "D2", "rationale": "x"}),
+        ))
+        .expect("insert");
+
+    let applied = apply_normalize(&store, None).expect("apply");
+    let ids = |rows: &[remind_me_core::decisions_backfill::NormalizeRow]| {
+        rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>()
+    };
+    assert_eq!(ids(&applied.plan.add_ref), ["m-claim", "m-ok"]);
+    assert_eq!(ids(&applied.skipped), ["m-claim"]);
+    assert!(
+        applied.skipped[0].note.contains("claim"),
+        "{}",
+        applied.skipped[0].note
+    );
+    assert_eq!(ids(&applied.updated), ["m-ok"]);
+    let claim = remind_me_core::db::queries::get_memory_by_id(&store, "m-claim")
+        .expect("read")
+        .expect("live");
+    assert_eq!(claim.metadata.get("decision_ref"), None);
+    assert!(remind_me_core::history::history(&store, "m-claim", 10)
         .expect("history")
         .is_empty());
 }
