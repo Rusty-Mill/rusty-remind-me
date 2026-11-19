@@ -796,7 +796,8 @@ wrote. It re-plans at that moment rather than trusting an earlier report, and a
 second run finds nothing left to add. Each row is its own transaction: the
 memory is re-read and re-checked, a row that changed so it no longer qualifies
 is skipped and listed, and the ref is merged into the metadata as it stands.
-Each write goes through the ordinary update path, so it leaves a revision. Retype, needs-rationale and conflict rows
+Each write leaves a revision holding what it replaced; the revision is written
+last in the row's transaction, so a failure leaves neither. Retype, needs-rationale and conflict rows
 are never written.
 
 For Orch proposed-change reports, `rusty-remind-me impact-export [QUERY]` exports
