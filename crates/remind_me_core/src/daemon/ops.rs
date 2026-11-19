@@ -27,6 +27,14 @@ pub enum Op {
     DecisionsNormalizePlan {
         project: Option<String>,
     },
+    /// Write `metadata.decision_ref` for the normalise plan's `add_ref` rows,
+    /// re-planned at apply time; see
+    /// [`crate::decisions_backfill::apply_normalize`]. The only decisions op
+    /// that writes. It needs no authorization beyond the daemon token every
+    /// op presents, as `Add`, `Resolve` and `TopicsApply` do.
+    DecisionsNormalizeApply {
+        project: Option<String>,
+    },
     /// Dry-run import plan for one `DECISIONS.md`, sent as text so the
     /// daemon never reads the client's paths. Writes nothing.
     DecisionsImportPlan {
@@ -237,6 +245,9 @@ fn run(store: &Store<'_>, op: &Op) -> Result<Value, String> {
             crate::db::memories::Memories::new(store)
                 .all_live()
                 .map(|all| crate::decisions_backfill::plan_normalize(&all, project.as_deref())),
+        ),
+        Op::DecisionsNormalizeApply { project } => to_value(
+            crate::decisions_backfill::apply_normalize(store, project.as_deref()),
         ),
         Op::DecisionsImportPlan {
             project,

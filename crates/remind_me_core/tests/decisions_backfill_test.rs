@@ -1,7 +1,9 @@
-//! Dry-run plans for card #1564: parsing decision logs, and planning the
-//! normalise and import passes. Nothing here writes to a store.
+//! Card #1564: parsing decision logs, planning the normalise and import
+//! passes, and applying the normalise plan's `add_ref` rows.
 use remind_me_core::db::memories::{Memories, NewMemory};
-use remind_me_core::decisions_backfill::{parse_log, plan_import, plan_normalize, render_import};
+use remind_me_core::decisions_backfill::{
+    apply_normalize, parse_log, plan_import, plan_normalize, render_import,
+};
 use remind_me_core::models::Memory;
 use remind_me_core::Database;
 use serde_json::json;
@@ -689,4 +691,71 @@ fn multiline_stored_values_stay_inside_their_report_detail() {
         .any(|line| line.starts_with("```") || line.starts_with("## Another")));
     assert!(report.contains("\n## Unchanged (0)\n\nNone.\n\n## Needs rationale"));
     assert!(report.contains("D3 (line 4)"));
+}
+
+#[test]
+fn apply_writes_decision_ref_merged_and_is_idempotent() {
+    let db = Database::open_in_memory().expect("database");
+    let store = db.store();
+    let memories = Memories::new(&store);
+    let rows = [
+        decision(
+            "m-id",
+            "let-em-loose",
+            "orch rule",
+            json!({"decision_id": "D38", "rationale": "keep me", "stakes": "low"}),
+        ),
+        decision(
+            "m-named",
+            "rusty_term",
+            "x",
+            json!({"decision": "rusty_term D64", "rationale": "x"}),
+        ),
+        decision(
+            "m-open",
+            "mill",
+            "D7: opens with its ref",
+            json!({"rationale": "x"}),
+        ),
+        decision(
+            "m-done",
+            "mill",
+            "x",
+            json!({"decision_ref": "D1", "rationale": "x"}),
+        ),
+    ];
+    for row in &rows {
+        memories.insert(row).expect("insert");
+    }
+
+    let scoped = apply_normalize(&store, Some("mill")).expect("apply");
+    let ids = |rows: &[remind_me_core::decisions_backfill::NormalizeRow]| {
+        rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>()
+    };
+    assert_eq!(ids(&scoped.updated), ["m-open"], "the project filter holds");
+
+    let applied = apply_normalize(&store, None).expect("apply");
+    assert_eq!(ids(&applied.updated), ["m-id", "m-named"]);
+    assert!(applied.failed.is_empty(), "{:?}", applied.failed);
+
+    let got = |id: &str| {
+        memories
+            .all_live()
+            .expect("read")
+            .into_iter()
+            .find(|m| m.id == id)
+            .expect("memory")
+    };
+    let m = got("m-id");
+    assert_eq!(m.metadata["decision_ref"], "D38");
+    assert_eq!(m.metadata["decision_id"], "D38", "legacy key kept");
+    assert_eq!(m.metadata["rationale"], "keep me");
+    assert_eq!(m.metadata["stakes"], "low");
+    assert_eq!(got("m-named").metadata["decision_ref"], "D64");
+    assert_eq!(got("m-open").metadata["decision_ref"], "D7");
+    assert_eq!(got("m-done").metadata["decision_ref"], "D1");
+
+    let again = apply_normalize(&store, None).expect("apply");
+    assert!(again.updated.is_empty() && again.failed.is_empty());
+    assert!(again.plan.add_ref.is_empty());
 }

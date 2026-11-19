@@ -1,6 +1,6 @@
-//! Dry-run plans for normalising decisions (card #1564, pack D30 to D35).
+//! Plans for normalising decisions (card #1564, pack D30 to D35).
 //!
-//! Two read-only planners, nothing here writes to the store:
+//! Two read-only planners:
 //!
 //! - [`plan_normalize`]: which live memories should become
 //!   `memory_type: decision`, or gain a `metadata.decision_ref`, and which
@@ -8,10 +8,16 @@
 //! - [`plan_import`]: which entries of a repo `DECISIONS.md` are new, already
 //!   in the store, or changed, plus supersedes links the file states outright.
 //!
+//! One writer, [`apply_normalize`], carries out the `add_ref` proposals only:
+//! it copies each ref into `metadata.decision_ref`. Every other bucket still
+//! needs a person.
+//!
 //! Anything ambiguous is reported, never guessed (D32 to D34). Plans are
 //! deterministic: same input, same report (D35).
 
-use crate::models::Memory;
+use crate::db::memories::Memories;
+use crate::db::{queries, Store};
+use crate::models::{Memory, MemoryUpdateInput, UpdateOutcome};
 use serde::{Deserialize, Serialize};
 
 // -- refs -----------------------------------------------------------------
@@ -267,6 +273,81 @@ fn classify(memory: &Memory, plan: &mut NormalizePlan) {
     if !mentioned.is_empty() {
         plan.mentions
             .push(row(None, format!("mentions {}", mentioned.join(", "))));
+    }
+}
+
+/// What [`apply_normalize`] wrote, and what it could not.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NormalizeApplied {
+    pub project: Option<String>,
+    /// `add_ref` rows now carrying `metadata.decision_ref`.
+    pub updated: Vec<NormalizeRow>,
+    /// `add_ref` rows left as they were, each with the reason in `note`.
+    pub failed: Vec<NormalizeRow>,
+    /// The plan this run applied, planned against the store as it stood.
+    pub plan: NormalizePlan,
+}
+
+/// Copy each `add_ref` row's ref into `metadata.decision_ref`, merged into
+/// the memory's existing metadata, through [`queries::update_memory`] so
+/// every write leaves a revision.
+///
+/// Plans afresh from `store`, never from a plan the caller holds, so it
+/// cannot write a stale proposal. A second run finds nothing to add. Rows are
+/// written one by one: a row that fails is reported in `failed` and the rest
+/// still go through, which is safe because a rerun picks up only what is left.
+///
+/// # Errors
+///
+/// A store error reading the memories. Per-row write errors land in `failed`.
+pub fn apply_normalize(
+    store: &Store<'_>,
+    project: Option<&str>,
+) -> crate::db::Result<NormalizeApplied> {
+    let memories = Memories::new(store).all_live()?;
+    let plan = plan_normalize(&memories, project);
+    let mut applied = NormalizeApplied {
+        project: plan.project.clone(),
+        ..Default::default()
+    };
+    for row in &plan.add_ref {
+        let stored = memories.iter().find(|m| m.id == row.id);
+        match write_ref(store, stored, row) {
+            Ok(()) => applied.updated.push(row.clone()),
+            Err(why) => applied.failed.push(NormalizeRow {
+                note: why,
+                ..row.clone()
+            }),
+        }
+    }
+    applied.plan = plan;
+    Ok(applied)
+}
+
+/// Write `row`'s ref into `memory`'s metadata, keeping every other key.
+fn write_ref(store: &Store<'_>, memory: Option<&Memory>, row: &NormalizeRow) -> Result<(), String> {
+    let memory = memory.ok_or("not in the store it was planned from")?;
+    let reference = row.decision_ref.as_deref().ok_or("no ref to write")?;
+    let mut metadata = match &memory.metadata {
+        serde_json::Value::Object(map) => map.clone(),
+        serde_json::Value::Null => serde_json::Map::new(),
+        _ => return Err("metadata is not an object, so there is nothing to merge into".into()),
+    };
+    metadata.insert("decision_ref".into(), reference.into());
+    let input = MemoryUpdateInput {
+        memory_id: memory.id.clone(),
+        content: None,
+        category: None,
+        tags: None,
+        metadata: Some(serde_json::Value::Object(metadata)),
+        sensitive: None,
+        clear_superseded: false,
+        project: None,
+    };
+    match queries::update_memory(store, &input).map_err(|e| e.to_string())? {
+        UpdateOutcome::Updated(_) => Ok(()),
+        UpdateOutcome::NotFound => Err("gone before it could be written".into()),
+        UpdateOutcome::NoFields => Err("nothing to write".into()),
     }
 }
 
@@ -1028,6 +1109,25 @@ fn norm_line(r: &NormalizeRow) -> String {
         r.note,
         r.snippet
     )
+}
+
+/// What an apply run wrote, as markdown: the rows it updated, the rows it
+/// could not, and the buckets it leaves for a person.
+pub fn render_normalize_applied(applied: &NormalizeApplied) -> String {
+    let plan = &applied.plan;
+    let scope = applied.project.as_deref().unwrap_or("all projects");
+    let mut out = format!(
+        "# Decisions normalise applied: {scope}\n\nWrote metadata.decision_ref on {} memories; {} failed. Left unchanged: {} retype, {} need rationale, {} conflicts, {} mentions.\n",
+        applied.updated.len(),
+        applied.failed.len(),
+        plan.retype.len(),
+        plan.needs_rationale.len(),
+        plan.conflicts.len(),
+        plan.mentions.len()
+    );
+    section(&mut out, "Updated", &applied.updated, norm_line);
+    section(&mut out, "Failed", &applied.failed, norm_line);
+    out
 }
 
 /// The normalise plan as markdown: counts, then every row per bucket.

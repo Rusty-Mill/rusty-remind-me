@@ -767,18 +767,22 @@ fn parse_search_args(args: &[String]) -> Result<SearchArgs, String> {
 }
 
 const DECISIONS_USAGE: &str = "\
-Usage: rusty-remind-me decisions normalize [--project <PROJECT>] [--json]
+Usage: rusty-remind-me decisions normalize [--project <PROJECT>] [--apply] [--json]
        rusty-remind-me decisions import <DECISIONS.md> --project <PROJECT> [--json]
-  Dry runs only: print what normalising decision memories, or importing a
-  repo decisions log, would change. They run in the remind-me daemon,
-  which must already be running, and write nothing to the store; with no
-  daemon they fail without reading or writing it.";
+  By default a dry run: print what normalising decision memories, or
+  importing a repo decisions log, would change, writing nothing.
+  normalize --apply writes metadata.decision_ref on the memories the plan
+  lists under \"add ref\", re-planned at that moment, and prints what it
+  wrote; nothing else is changed. Both run in the remind-me daemon, which
+  must already be running; with no daemon they fail without reading or
+  writing the store.";
 
 /// A parsed `decisions` command.
 #[derive(Debug, PartialEq, Eq)]
 enum DecisionsArgs {
     Normalize {
         project: Option<String>,
+        apply: bool,
         json: bool,
     },
     Import {
@@ -795,11 +799,13 @@ fn parse_decisions_args(args: &[String]) -> Result<DecisionsArgs, String> {
         .ok_or_else(|| usage("decisions needs a verb."))?;
     let mut project: Option<String> = None;
     let mut json = false;
+    let mut apply = false;
     let mut words: Vec<String> = Vec::new();
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
             "--json" => json = true,
+            "--apply" => apply = true,
             "--project" => {
                 project = Some(flag_value(rest, i, "--project", DECISIONS_USAGE)?);
                 i += 1;
@@ -815,7 +821,12 @@ fn parse_decisions_args(args: &[String]) -> Result<DecisionsArgs, String> {
         .map(|p| p.trim().to_string())
         .filter(|p| !p.is_empty());
     match (verb.as_str(), words.as_slice()) {
-        ("normalize", []) => Ok(DecisionsArgs::Normalize { project, json }),
+        ("normalize", []) => Ok(DecisionsArgs::Normalize {
+            project,
+            apply,
+            json,
+        }),
+        ("import", _) if apply => Err(usage("only normalize takes --apply.")),
         ("import", [path]) => Ok(DecisionsArgs::Import {
             path: path.into(),
             project: project.ok_or_else(|| usage("import needs --project."))?,
@@ -827,13 +838,14 @@ fn parse_decisions_args(args: &[String]) -> Result<DecisionsArgs, String> {
     }
 }
 
-/// Run a `decisions` dry run and print its report.
+/// Run a `decisions` command and print its report.
 fn run_decisions(
     db_path: &std::path::Path,
     args: DecisionsArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use remind_me_core::decisions_backfill::{
-        render_import, render_normalize, ImportPlan, NormalizePlan,
+        render_import, render_normalize, render_normalize_applied, ImportPlan, NormalizeApplied,
+        NormalizePlan,
     };
     // Read the log before any store contact. The plan runs only in an
     // already-running daemon: starting one, or opening the store here, runs
@@ -847,7 +859,27 @@ fn run_decisions(
     };
     let mut store = daemon::existing_daemon(db_path)?;
     let (report, json) = match args {
-        DecisionsArgs::Normalize { project, json } => {
+        DecisionsArgs::Normalize {
+            project,
+            apply: true,
+            json,
+        } => {
+            let applied: NormalizeApplied =
+                daemon_plan(&mut store, Op::DecisionsNormalizeApply { project })?;
+            (
+                if json {
+                    serde_json::to_string_pretty(&applied)?
+                } else {
+                    render_normalize_applied(&applied)
+                },
+                json,
+            )
+        }
+        DecisionsArgs::Normalize {
+            project,
+            apply: false,
+            json,
+        } => {
             let plan: NormalizePlan =
                 daemon_plan(&mut store, Op::DecisionsNormalizePlan { project })?;
             (
@@ -890,7 +922,7 @@ fn run_decisions(
     Ok(())
 }
 
-/// Run a planning op in the daemon and read its plan.
+/// Run a decisions op in the daemon and read its reply.
 fn daemon_plan<T: serde::de::DeserializeOwned>(
     daemon: &mut remind_me_core::daemon::client::DaemonConnection,
     op: Op,
@@ -1631,7 +1663,16 @@ mod tests {
             parse_decisions_args(&args(&["normalize", "--json"])),
             Ok(DecisionsArgs::Normalize {
                 project: None,
+                apply: false,
                 json: true
+            })
+        );
+        assert_eq!(
+            parse_decisions_args(&args(&["normalize", "--apply", "--project", "mill"])),
+            Ok(DecisionsArgs::Normalize {
+                project: Some("mill".into()),
+                apply: true,
+                json: false
             })
         );
         assert_eq!(
@@ -1648,7 +1689,7 @@ mod tests {
             &["import", "--project", "mill"],
             &["normalize", "D.md"],
             &["apply"],
-            &["normalize", "--apply"],
+            &["import", "D.md", "--project", "mill", "--apply"],
         ] {
             assert!(parse_decisions_args(&args(bad)).is_err(), "{bad:?}");
         }

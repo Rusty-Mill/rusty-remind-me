@@ -2,6 +2,12 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-19 — Decisions normalise apply
+
+### Added
+- `rusty-remind-me decisions normalize --apply [--project <p>] [--json]`: writes `metadata.decision_ref` on every memory the plan lists under "add ref" (refs held under the legacy `decision_id` or `decision` keys, or opening the content), merged into existing metadata; legacy keys are kept. Re-plans at apply time, is idempotent, and reports per-row failures without stopping the rest. Dry run stays the default. Retype, needs-rationale and conflict rows are not written.
+- `remind_me_core::decisions_backfill::apply_normalize` and daemon op `DecisionsNormalizeApply`, the first decisions op that writes; it uses the daemon token like every other write op.
+
 ## 2026-11-18 — Decisions normalise and import dry runs (Mill Board #1564)
 
 ### Added
