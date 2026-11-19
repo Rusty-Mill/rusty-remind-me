@@ -793,8 +793,10 @@ they fail without reading or writing anything.
 plan's "add ref" rows: it copies each decision's ref into
 `metadata.decision_ref`, merged into its existing metadata, and prints what it
 wrote. It re-plans at that moment rather than trusting an earlier report, and a
-second run finds nothing left to add. Each write goes through the ordinary
-update path, so it leaves a revision. Retype, needs-rationale and conflict rows
+second run finds nothing left to add. Each row is its own transaction: the
+memory is re-read and re-checked, a row that changed so it no longer qualifies
+is skipped and listed, and the ref is merged into the metadata as it stands.
+Each write goes through the ordinary update path, so it leaves a revision. Retype, needs-rationale and conflict rows
 are never written.
 
 For Orch proposed-change reports, `rusty-remind-me impact-export [QUERY]` exports

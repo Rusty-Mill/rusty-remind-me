@@ -2,7 +2,7 @@
 //! passes, and applying the normalise plan's `add_ref` rows.
 use remind_me_core::db::memories::{Memories, NewMemory};
 use remind_me_core::decisions_backfill::{
-    apply_normalize, parse_log, plan_import, plan_normalize, render_import,
+    apply_normalize, apply_planned, parse_log, plan_import, plan_normalize, render_import,
 };
 use remind_me_core::models::Memory;
 use remind_me_core::Database;
@@ -758,4 +758,142 @@ fn apply_writes_decision_ref_merged_and_is_idempotent() {
     let again = apply_normalize(&store, None).expect("apply");
     assert!(again.updated.is_empty() && again.failed.is_empty());
     assert!(again.plan.add_ref.is_empty());
+}
+
+/// Rows edited between planning and writing: the write merges into the
+/// newer metadata, a row that stopped qualifying or changed its ref is
+/// skipped, and each write records the metadata it replaced as a revision.
+#[test]
+fn apply_revalidates_each_row_against_the_store_at_write_time() {
+    use remind_me_core::db::queries::{delete_memory, update_memory};
+    use remind_me_core::models::MemoryUpdateInput;
+    let db = Database::open_in_memory().expect("database");
+    let store = db.store();
+    let memories = Memories::new(&store);
+    let meta = |r: &str| json!({"decision_id": r, "rationale": "x"});
+    for (id, r) in [
+        ("m-edit", "D1"),
+        ("m-done", "D2"),
+        ("m-moved", "D3"),
+        ("m-gone", "D4"),
+        ("m-ok", "D6"),
+    ] {
+        memories
+            .insert(&decision(id, "mill", "x", meta(r)))
+            .expect("insert");
+    }
+    let plan = plan_normalize(&memories.all_live().expect("read"), Some("mill"));
+    assert_eq!(plan.add_ref.len(), 5);
+
+    let set = |id: &str, metadata: serde_json::Value| {
+        update_memory(
+            &store,
+            &MemoryUpdateInput {
+                memory_id: id.into(),
+                content: None,
+                category: None,
+                tags: None,
+                metadata: Some(metadata),
+                sensitive: None,
+                clear_superseded: false,
+                project: None,
+            },
+        )
+        .expect("update");
+    };
+    // After planning, before applying:
+    set(
+        "m-edit",
+        json!({"decision_id": "D1", "rationale": "newer", "stakes": "low"}),
+    );
+    set(
+        "m-done",
+        json!({"decision_id": "D2", "decision_ref": "D2", "rationale": "x"}),
+    );
+    set("m-moved", json!({"decision_id": "D30", "rationale": "x"}));
+    assert!(delete_memory(&store, "m-gone").expect("delete"));
+
+    let applied = apply_planned(&store, Some("mill"), &plan.add_ref);
+    let ids = |rows: &[remind_me_core::decisions_backfill::NormalizeRow]| {
+        rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>()
+    };
+    assert_eq!(ids(&applied.updated), ["m-edit", "m-ok"]);
+    assert_eq!(ids(&applied.skipped), ["m-done", "m-gone", "m-moved"]);
+    assert!(
+        applied.skipped[2].note.contains("D30"),
+        "{}",
+        applied.skipped[1].note
+    );
+
+    let got = |id: &str| {
+        remind_me_core::db::queries::get_memory_by_id(&store, id)
+            .expect("read")
+            .expect("live")
+    };
+    let edited = got("m-edit");
+    assert_eq!(edited.metadata["decision_ref"], "D1");
+    assert_eq!(
+        edited.metadata["rationale"], "newer",
+        "the newer edit survives"
+    );
+    assert_eq!(edited.metadata["stakes"], "low");
+    assert_eq!(got("m-moved").metadata.get("decision_ref"), None);
+
+    let revisions = remind_me_core::history::history(&store, "m-edit", 10).expect("history");
+    let replaced: serde_json::Value = serde_json::from_str(&revisions[0].metadata).expect("json");
+    assert_eq!(
+        replaced["rationale"], "newer",
+        "the revision holds what apply replaced"
+    );
+    assert_eq!(replaced.get("decision_ref"), None);
+}
+
+/// A row whose write is refused is reported and rolled back, and the rows
+/// after it are still written.
+#[test]
+fn apply_isolates_a_failing_row() {
+    let db = Database::open_in_memory().expect("database");
+    let store = db.store();
+    let memories = Memories::new(&store);
+    // An invalid `basis` makes the update path refuse the metadata.
+    memories
+        .insert(&decision(
+            "m-bad",
+            "mill",
+            "x",
+            json!({"decision_id": "D1", "rationale": "x", "basis": "guess"}),
+        ))
+        .expect("insert");
+    memories
+        .insert(&decision(
+            "m-ok",
+            "mill",
+            "x",
+            json!({"decision_id": "D2", "rationale": "x"}),
+        ))
+        .expect("insert");
+    let applied = apply_normalize(&store, None).expect("apply");
+    assert_eq!(
+        applied
+            .failed
+            .iter()
+            .map(|r| r.id.as_str())
+            .collect::<Vec<_>>(),
+        ["m-bad"]
+    );
+    assert_eq!(
+        applied
+            .updated
+            .iter()
+            .map(|r| r.id.as_str())
+            .collect::<Vec<_>>(),
+        ["m-ok"]
+    );
+    let bad = remind_me_core::db::queries::get_memory_by_id(&store, "m-bad")
+        .expect("read")
+        .expect("live");
+    assert_eq!(bad.metadata.get("decision_ref"), None);
+    assert!(remind_me_core::history::history(&store, "m-bad", 10)
+        .expect("history")
+        .is_empty());
 }

@@ -276,66 +276,110 @@ fn classify(memory: &Memory, plan: &mut NormalizePlan) {
     }
 }
 
-/// What [`apply_normalize`] wrote, and what it could not.
+/// What [`apply_normalize`] wrote, and what it did not.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NormalizeApplied {
     pub project: Option<String>,
     /// `add_ref` rows now carrying `metadata.decision_ref`.
     pub updated: Vec<NormalizeRow>,
-    /// `add_ref` rows left as they were, each with the reason in `note`.
+    /// Planned rows that no longer qualified when their turn came (edited,
+    /// deleted, or given another ref meanwhile); `note` says why. Untouched.
+    pub skipped: Vec<NormalizeRow>,
+    /// Rows whose write failed, with the error in `note`. Untouched.
     pub failed: Vec<NormalizeRow>,
     /// The plan this run applied, planned against the store as it stood.
     pub plan: NormalizePlan,
 }
 
-/// Copy each `add_ref` row's ref into `metadata.decision_ref`, merged into
-/// the memory's existing metadata, through [`queries::update_memory`] so
-/// every write leaves a revision.
-///
-/// Plans afresh from `store`, never from a plan the caller holds, so it
-/// cannot write a stale proposal. A second run finds nothing to add. Rows are
-/// written one by one: a row that fails is reported in `failed` and the rest
-/// still go through, which is safe because a rerun picks up only what is left.
+/// Plan afresh from `store`, then apply the plan's `add_ref` rows with
+/// [`apply_planned`]. A second run finds nothing to add.
 ///
 /// # Errors
 ///
-/// A store error reading the memories. Per-row write errors land in `failed`.
+/// A store error reading the memories. Per-row outcomes are in the result.
 pub fn apply_normalize(
     store: &Store<'_>,
     project: Option<&str>,
 ) -> crate::db::Result<NormalizeApplied> {
-    let memories = Memories::new(store).all_live()?;
-    let plan = plan_normalize(&memories, project);
-    let mut applied = NormalizeApplied {
-        project: plan.project.clone(),
-        ..Default::default()
-    };
-    for row in &plan.add_ref {
-        let stored = memories.iter().find(|m| m.id == row.id);
-        match write_ref(store, stored, row) {
-            Ok(()) => applied.updated.push(row.clone()),
-            Err(why) => applied.failed.push(NormalizeRow {
-                note: why,
-                ..row.clone()
-            }),
-        }
-    }
+    let plan = plan_normalize(&Memories::new(store).all_live()?, project);
+    let mut applied = apply_planned(store, project, &plan.add_ref);
     applied.plan = plan;
     Ok(applied)
 }
 
-/// Write `row`'s ref into `memory`'s metadata, keeping every other key.
-fn write_ref(store: &Store<'_>, memory: Option<&Memory>, row: &NormalizeRow) -> Result<(), String> {
-    let memory = memory.ok_or("not in the store it was planned from")?;
-    let reference = row.decision_ref.as_deref().ok_or("no ref to write")?;
-    let mut metadata = match &memory.metadata {
+/// Copy each planned row's ref into `metadata.decision_ref`, merged into the
+/// row's metadata as it stands at write time.
+///
+/// Each row is one transaction: re-read the memory, plan it again, and write
+/// only if it still wants the same ref, merging into the metadata just read.
+/// The engine's page gate keeps every other writer, background sync
+/// included, out between that read and the write, so a newer edit is never
+/// discarded and a row that stopped qualifying is skipped. The write goes
+/// through [`queries::update_memory`], so it records a revision in the same
+/// transaction. A row that fails or is skipped does not stop the rest.
+pub fn apply_planned(
+    store: &Store<'_>,
+    project: Option<&str>,
+    rows: &[NormalizeRow],
+) -> NormalizeApplied {
+    let mut applied = NormalizeApplied {
+        project: project.map(str::to_string),
+        ..Default::default()
+    };
+    for row in rows {
+        let noted = |note: String| NormalizeRow {
+            note,
+            ..row.clone()
+        };
+        match store.transaction(|page| write_ref(page, project, row)) {
+            Ok(RefWrite::Written) => applied.updated.push(row.clone()),
+            Ok(RefWrite::Skipped(why)) => applied.skipped.push(noted(why)),
+            Err(e) => applied.failed.push(noted(e.to_string())),
+        }
+    }
+    applied
+}
+
+enum RefWrite {
+    Written,
+    Skipped(String),
+}
+
+/// Revalidate `row` against the memory as stored now and, if it still
+/// qualifies for the same ref, merge that ref into its current metadata.
+fn write_ref(
+    store: &Store<'_>,
+    project: Option<&str>,
+    row: &NormalizeRow,
+) -> crate::db::Result<RefWrite> {
+    let Some(current) = queries::get_memory_by_id(store, &row.id)? else {
+        return Ok(RefWrite::Skipped("no longer live".into()));
+    };
+    let replan = plan_normalize(std::slice::from_ref(&current), project);
+    let Some(wanted) = replan.add_ref.first() else {
+        return Ok(RefWrite::Skipped("no longer needs a ref".into()));
+    };
+    if wanted.decision_ref != row.decision_ref {
+        return Ok(RefWrite::Skipped(format!(
+            "ref changed to {} since planning",
+            wanted.decision_ref.as_deref().unwrap_or("none")
+        )));
+    }
+    let Some(reference) = wanted.decision_ref.as_deref() else {
+        return Ok(RefWrite::Skipped("no ref to write".into()));
+    };
+    let mut metadata = match &current.metadata {
         serde_json::Value::Object(map) => map.clone(),
         serde_json::Value::Null => serde_json::Map::new(),
-        _ => return Err("metadata is not an object, so there is nothing to merge into".into()),
+        _ => {
+            return Ok(RefWrite::Skipped(
+                "metadata is not an object, so there is nothing to merge into".into(),
+            ))
+        }
     };
     metadata.insert("decision_ref".into(), reference.into());
     let input = MemoryUpdateInput {
-        memory_id: memory.id.clone(),
+        memory_id: current.id.clone(),
         content: None,
         category: None,
         tags: None,
@@ -344,10 +388,10 @@ fn write_ref(store: &Store<'_>, memory: Option<&Memory>, row: &NormalizeRow) -> 
         clear_superseded: false,
         project: None,
     };
-    match queries::update_memory(store, &input).map_err(|e| e.to_string())? {
-        UpdateOutcome::Updated(_) => Ok(()),
-        UpdateOutcome::NotFound => Err("gone before it could be written".into()),
-        UpdateOutcome::NoFields => Err("nothing to write".into()),
+    match queries::update_memory(store, &input)? {
+        UpdateOutcome::Updated(_) => Ok(RefWrite::Written),
+        UpdateOutcome::NotFound => Ok(RefWrite::Skipped("no longer live".into())),
+        UpdateOutcome::NoFields => Ok(RefWrite::Skipped("nothing to write".into())),
     }
 }
 
@@ -1117,8 +1161,9 @@ pub fn render_normalize_applied(applied: &NormalizeApplied) -> String {
     let plan = &applied.plan;
     let scope = applied.project.as_deref().unwrap_or("all projects");
     let mut out = format!(
-        "# Decisions normalise applied: {scope}\n\nWrote metadata.decision_ref on {} memories; {} failed. Left unchanged: {} retype, {} need rationale, {} conflicts, {} mentions.\n",
+        "# Decisions normalise applied: {scope}\n\nWrote metadata.decision_ref on {} memories; {} skipped as changed since planning, {} failed. Left unchanged: {} retype, {} need rationale, {} conflicts, {} mentions.\n",
         applied.updated.len(),
+        applied.skipped.len(),
         applied.failed.len(),
         plan.retype.len(),
         plan.needs_rationale.len(),
@@ -1126,6 +1171,7 @@ pub fn render_normalize_applied(applied: &NormalizeApplied) -> String {
         plan.mentions.len()
     );
     section(&mut out, "Updated", &applied.updated, norm_line);
+    section(&mut out, "Skipped", &applied.skipped, norm_line);
     section(&mut out, "Failed", &applied.failed, norm_line);
     out
 }
