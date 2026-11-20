@@ -789,6 +789,17 @@ daemon that is already running, and never start one or open the store
 themselves, since opening it runs housekeeping that writes. With no daemon
 they fail without reading or writing anything.
 
+`rusty-remind-me decisions normalize --apply [--project <p>]` carries out the
+plan's "add ref" rows: it copies each decision's ref into
+`metadata.decision_ref`, merged into its existing metadata, and prints what it
+wrote. It re-plans at that moment rather than trusting an earlier report, and a
+second run finds nothing left to add. Each row is its own transaction: the
+memory is re-read and re-checked, a row that changed so it no longer qualifies
+is skipped and listed, and the ref is merged into the metadata as it stands.
+Each write leaves a revision holding what it replaced; the revision is written
+last in the row's transaction, so a failure leaves neither. Retype, needs-rationale and conflict rows
+are never written.
+
 For Orch proposed-change reports, `rusty-remind-me impact-export [QUERY]` exports
 a complete engine-backed inventory through the existing daemon/store path, with
 optional supplemental retrieval. This explicit export includes sensitive and

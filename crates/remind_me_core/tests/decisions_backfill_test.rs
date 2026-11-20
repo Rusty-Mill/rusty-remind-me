@@ -1,7 +1,9 @@
-//! Dry-run plans for card #1564: parsing decision logs, and planning the
-//! normalise and import passes. Nothing here writes to a store.
+//! Card #1564: parsing decision logs, planning the normalise and import
+//! passes, and applying the normalise plan's `add_ref` rows.
 use remind_me_core::db::memories::{Memories, NewMemory};
-use remind_me_core::decisions_backfill::{parse_log, plan_import, plan_normalize, render_import};
+use remind_me_core::decisions_backfill::{
+    apply_normalize, apply_planned, parse_log, plan_import, plan_normalize, render_import,
+};
 use remind_me_core::models::Memory;
 use remind_me_core::Database;
 use serde_json::json;
@@ -689,4 +691,256 @@ fn multiline_stored_values_stay_inside_their_report_detail() {
         .any(|line| line.starts_with("```") || line.starts_with("## Another")));
     assert!(report.contains("\n## Unchanged (0)\n\nNone.\n\n## Needs rationale"));
     assert!(report.contains("D3 (line 4)"));
+}
+
+#[test]
+fn apply_writes_decision_ref_merged_and_is_idempotent() {
+    let db = Database::open_in_memory().expect("database");
+    let store = db.store();
+    let memories = Memories::new(&store);
+    let rows = [
+        decision(
+            "m-id",
+            "let-em-loose",
+            "orch rule",
+            json!({"decision_id": "D38", "rationale": "keep me", "stakes": "low"}),
+        ),
+        decision(
+            "m-named",
+            "rusty_term",
+            "x",
+            json!({"decision": "rusty_term D64", "rationale": "x"}),
+        ),
+        decision(
+            "m-open",
+            "mill",
+            "D7: opens with its ref",
+            json!({"rationale": "x"}),
+        ),
+        decision(
+            "m-done",
+            "mill",
+            "x",
+            json!({"decision_ref": "D1", "rationale": "x"}),
+        ),
+    ];
+    for row in &rows {
+        memories.insert(row).expect("insert");
+    }
+
+    let scoped = apply_normalize(&store, Some("mill")).expect("apply");
+    let ids = |rows: &[remind_me_core::decisions_backfill::NormalizeRow]| {
+        rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>()
+    };
+    assert_eq!(ids(&scoped.updated), ["m-open"], "the project filter holds");
+
+    let applied = apply_normalize(&store, None).expect("apply");
+    assert_eq!(ids(&applied.updated), ["m-id", "m-named"]);
+    assert!(applied.failed.is_empty(), "{:?}", applied.failed);
+
+    let got = |id: &str| {
+        memories
+            .all_live()
+            .expect("read")
+            .into_iter()
+            .find(|m| m.id == id)
+            .expect("memory")
+    };
+    let m = got("m-id");
+    assert_eq!(m.metadata["decision_ref"], "D38");
+    assert_eq!(m.metadata["decision_id"], "D38", "legacy key kept");
+    assert_eq!(m.metadata["rationale"], "keep me");
+    assert_eq!(m.metadata["stakes"], "low");
+    assert_eq!(got("m-named").metadata["decision_ref"], "D64");
+    assert_eq!(got("m-open").metadata["decision_ref"], "D7");
+    assert_eq!(got("m-done").metadata["decision_ref"], "D1");
+
+    let again = apply_normalize(&store, None).expect("apply");
+    assert!(again.updated.is_empty() && again.failed.is_empty());
+    assert!(again.plan.add_ref.is_empty());
+}
+
+/// Rows edited between planning and writing: the write merges into the
+/// newer metadata, a row that stopped qualifying or changed its ref is
+/// skipped, and each write records the metadata it replaced as a revision.
+#[test]
+fn apply_revalidates_each_row_against_the_store_at_write_time() {
+    use remind_me_core::db::queries::{delete_memory, update_memory};
+    use remind_me_core::models::MemoryUpdateInput;
+    let db = Database::open_in_memory().expect("database");
+    let store = db.store();
+    let memories = Memories::new(&store);
+    let meta = |r: &str| json!({"decision_id": r, "rationale": "x"});
+    for (id, r) in [
+        ("m-edit", "D1"),
+        ("m-done", "D2"),
+        ("m-moved", "D3"),
+        ("m-gone", "D4"),
+        ("m-ok", "D6"),
+    ] {
+        memories
+            .insert(&decision(id, "mill", "x", meta(r)))
+            .expect("insert");
+    }
+    let plan = plan_normalize(&memories.all_live().expect("read"), Some("mill"));
+    assert_eq!(plan.add_ref.len(), 5);
+
+    let set = |id: &str, metadata: serde_json::Value| {
+        update_memory(
+            &store,
+            &MemoryUpdateInput {
+                memory_id: id.into(),
+                content: None,
+                category: None,
+                tags: None,
+                metadata: Some(metadata),
+                sensitive: None,
+                clear_superseded: false,
+                project: None,
+            },
+        )
+        .expect("update");
+    };
+    // After planning, before applying:
+    set(
+        "m-edit",
+        json!({"decision_id": "D1", "rationale": "newer", "stakes": "low"}),
+    );
+    set(
+        "m-done",
+        json!({"decision_id": "D2", "decision_ref": "D2", "rationale": "x"}),
+    );
+    set("m-moved", json!({"decision_id": "D30", "rationale": "x"}));
+    assert!(delete_memory(&store, "m-gone").expect("delete"));
+
+    let applied = apply_planned(&store, Some("mill"), &plan.add_ref);
+    let ids = |rows: &[remind_me_core::decisions_backfill::NormalizeRow]| {
+        rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>()
+    };
+    assert_eq!(ids(&applied.updated), ["m-edit", "m-ok"]);
+    assert_eq!(ids(&applied.skipped), ["m-done", "m-gone", "m-moved"]);
+    assert!(
+        applied.skipped[2].note.contains("D30"),
+        "{}",
+        applied.skipped[2].note
+    );
+
+    let got = |id: &str| {
+        remind_me_core::db::queries::get_memory_by_id(&store, id)
+            .expect("read")
+            .expect("live")
+    };
+    let edited = got("m-edit");
+    assert_eq!(edited.metadata["decision_ref"], "D1");
+    assert_eq!(
+        edited.metadata["rationale"], "newer",
+        "the newer edit survives"
+    );
+    assert_eq!(edited.metadata["stakes"], "low");
+    assert_eq!(got("m-moved").metadata.get("decision_ref"), None);
+
+    let revisions = remind_me_core::history::history(&store, "m-edit", 10).expect("history");
+    let replaced: serde_json::Value = serde_json::from_str(&revisions[0].metadata).expect("json");
+    assert_eq!(
+        replaced["rationale"], "newer",
+        "the revision holds what apply replaced"
+    );
+    assert_eq!(replaced.get("decision_ref"), None);
+}
+
+/// A row whose write is refused is reported and rolled back, and the rows
+/// after it are still written.
+#[test]
+fn apply_isolates_a_failing_row() {
+    let db = Database::open_in_memory().expect("database");
+    let store = db.store();
+    let memories = Memories::new(&store);
+    // An invalid `basis` makes the update path refuse the metadata.
+    memories
+        .insert(&decision(
+            "m-bad",
+            "mill",
+            "x",
+            json!({"decision_id": "D1", "rationale": "x", "basis": "guess"}),
+        ))
+        .expect("insert");
+    memories
+        .insert(&decision(
+            "m-ok",
+            "mill",
+            "x",
+            json!({"decision_id": "D2", "rationale": "x"}),
+        ))
+        .expect("insert");
+    let applied = apply_normalize(&store, None).expect("apply");
+    assert_eq!(
+        applied
+            .failed
+            .iter()
+            .map(|r| r.id.as_str())
+            .collect::<Vec<_>>(),
+        ["m-bad"]
+    );
+    assert_eq!(
+        applied
+            .updated
+            .iter()
+            .map(|r| r.id.as_str())
+            .collect::<Vec<_>>(),
+        ["m-ok"]
+    );
+    let bad = remind_me_core::db::queries::get_memory_by_id(&store, "m-bad")
+        .expect("read")
+        .expect("live");
+    assert_eq!(bad.metadata.get("decision_ref"), None);
+    assert!(remind_me_core::history::history(&store, "m-bad", 10)
+        .expect("history")
+        .is_empty());
+}
+
+/// A project claim row is never written by the generic apply: it is
+/// skipped with the claim refusal, left as it was, and the rest still go.
+#[test]
+fn apply_skips_claim_rows() {
+    let db = Database::open_in_memory().expect("database");
+    let store = db.store();
+    let memories = Memories::new(&store);
+    let mut claim = decision(
+        "m-claim",
+        "mill",
+        "x",
+        json!({"decision_id": "D1", "rationale": "x"}),
+    );
+    claim.subject = Some("mill".into());
+    claim.predicate = Some("project.stage".into());
+    claim.object = Some("built".into());
+    memories.insert(&claim).expect("insert");
+    memories
+        .insert(&decision(
+            "m-ok",
+            "mill",
+            "x",
+            json!({"decision_id": "D2", "rationale": "x"}),
+        ))
+        .expect("insert");
+
+    let applied = apply_normalize(&store, None).expect("apply");
+    let ids = |rows: &[remind_me_core::decisions_backfill::NormalizeRow]| {
+        rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>()
+    };
+    assert_eq!(ids(&applied.plan.add_ref), ["m-claim", "m-ok"]);
+    assert_eq!(ids(&applied.skipped), ["m-claim"]);
+    assert!(
+        applied.skipped[0].note.contains("claim"),
+        "{}",
+        applied.skipped[0].note
+    );
+    assert_eq!(ids(&applied.updated), ["m-ok"]);
+    let claim = remind_me_core::db::queries::get_memory_by_id(&store, "m-claim")
+        .expect("read")
+        .expect("live");
+    assert_eq!(claim.metadata.get("decision_ref"), None);
+    assert!(remind_me_core::history::history(&store, "m-claim", 10)
+        .expect("history")
+        .is_empty());
 }

@@ -1,6 +1,6 @@
-//! Dry-run plans for normalising decisions (card #1564, pack D30 to D35).
+//! Plans for normalising decisions (card #1564, pack D30 to D35).
 //!
-//! Two read-only planners, nothing here writes to the store:
+//! Two read-only planners:
 //!
 //! - [`plan_normalize`]: which live memories should become
 //!   `memory_type: decision`, or gain a `metadata.decision_ref`, and which
@@ -8,9 +8,17 @@
 //! - [`plan_import`]: which entries of a repo `DECISIONS.md` are new, already
 //!   in the store, or changed, plus supersedes links the file states outright.
 //!
+//! One writer, [`apply_normalize`], carries out the `add_ref` proposals only:
+//! it copies each ref into `metadata.decision_ref`. Every other bucket still
+//! needs a person.
+//!
 //! Anything ambiguous is reported, never guessed (D32 to D34). Plans are
 //! deterministic: same input, same report (D35).
 
+use crate::db::history::{Revisions, Tracked};
+use crate::db::memories::{Memories, MemoryEdit};
+use crate::db::{queries, Store, StoreError};
+use crate::kinds::StructuredFields;
 use crate::models::Memory;
 use serde::{Deserialize, Serialize};
 
@@ -268,6 +276,158 @@ fn classify(memory: &Memory, plan: &mut NormalizePlan) {
         plan.mentions
             .push(row(None, format!("mentions {}", mentioned.join(", "))));
     }
+}
+
+/// What [`apply_normalize`] wrote, and what it did not.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NormalizeApplied {
+    pub project: Option<String>,
+    /// `add_ref` rows now carrying `metadata.decision_ref`.
+    pub updated: Vec<NormalizeRow>,
+    /// Planned rows that no longer qualified when their turn came (edited,
+    /// deleted, or given another ref meanwhile); `note` says why. Untouched.
+    pub skipped: Vec<NormalizeRow>,
+    /// Rows whose write failed, with the error in `note`. Untouched.
+    pub failed: Vec<NormalizeRow>,
+    /// The plan this run applied, planned against the store as it stood.
+    pub plan: NormalizePlan,
+}
+
+/// Plan afresh from `store`, then apply the plan's `add_ref` rows with
+/// [`apply_planned`]. A second run finds nothing to add.
+///
+/// # Errors
+///
+/// A store error reading the memories. Per-row outcomes are in the result.
+pub fn apply_normalize(
+    store: &Store<'_>,
+    project: Option<&str>,
+) -> crate::db::Result<NormalizeApplied> {
+    let plan = plan_normalize(&Memories::new(store).all_live()?, project);
+    let mut applied = apply_planned(store, project, &plan.add_ref);
+    applied.plan = plan;
+    Ok(applied)
+}
+
+/// Copy each planned row's ref into `metadata.decision_ref`, merged into the
+/// row's metadata as it stands at write time.
+///
+/// Each row is one transaction: re-read the memory, plan it again, and write
+/// only if it still wants the same ref, merging into the metadata just read.
+/// The engine's page gate keeps every other writer, background sync
+/// included, out between that read and the write, so a newer edit is never
+/// discarded and a row that stopped qualifying is skipped. A project or
+/// topic claim row is skipped too, as every generic edit refuses it.
+///
+/// The row edit is in the page and rolls back with it; the revision table is
+/// not. So the revision, holding what the edit replaced, is written last,
+/// after the row: if it fails, the page is abandoned and neither lands, and
+/// nothing that can fail runs after it but the page's own finish. A row that
+/// fails or is skipped does not stop the rest.
+pub fn apply_planned(
+    store: &Store<'_>,
+    project: Option<&str>,
+    rows: &[NormalizeRow],
+) -> NormalizeApplied {
+    apply_rows(store, project, rows, &record_revision)
+}
+
+/// Writes the revision of a row's replaced values.
+type Recorder = dyn Fn(&Store<'_>, &str, &Tracked) -> crate::db::Result<()>;
+
+fn record_revision(store: &Store<'_>, id: &str, before: &Tracked) -> crate::db::Result<()> {
+    Revisions::new(store).insert(id, before, &chrono::Utc::now().to_rfc3339(), None)
+}
+
+fn apply_rows(
+    store: &Store<'_>,
+    project: Option<&str>,
+    rows: &[NormalizeRow],
+    record: &Recorder,
+) -> NormalizeApplied {
+    let mut applied = NormalizeApplied {
+        project: project.map(str::to_string),
+        ..Default::default()
+    };
+    for row in rows {
+        let noted = |note: String| NormalizeRow {
+            note,
+            ..row.clone()
+        };
+        match store.transaction(|page| write_ref(page, project, row, record)) {
+            Ok(RefWrite::Written) => applied.updated.push(row.clone()),
+            Ok(RefWrite::Skipped(why)) => applied.skipped.push(noted(why)),
+            Err(e) => applied.failed.push(noted(e.to_string())),
+        }
+    }
+    applied
+}
+
+enum RefWrite {
+    Written,
+    Skipped(String),
+}
+
+/// Revalidate `row` against the memory as stored now and, if it still
+/// qualifies for the same ref, merge that ref into its current metadata,
+/// then record the replaced values as a revision.
+fn write_ref(
+    store: &Store<'_>,
+    project: Option<&str>,
+    row: &NormalizeRow,
+    record: &Recorder,
+) -> crate::db::Result<RefWrite> {
+    let Some(current) = queries::get_memory_by_id(store, &row.id)? else {
+        return Ok(RefWrite::Skipped("no longer live".into()));
+    };
+    // Claim rows are written only by their own commands; refuse them as any
+    // generic edit does.
+    if let Err(refused) = crate::project::refuse_claim_edit(&current) {
+        return Ok(RefWrite::Skipped(refused.to_string()));
+    }
+    let replan = plan_normalize(std::slice::from_ref(&current), project);
+    let Some(wanted) = replan.add_ref.first() else {
+        return Ok(RefWrite::Skipped("no longer needs a ref".into()));
+    };
+    if wanted.decision_ref != row.decision_ref {
+        return Ok(RefWrite::Skipped(format!(
+            "ref changed to {} since planning",
+            wanted.decision_ref.as_deref().unwrap_or("none")
+        )));
+    }
+    let Some(reference) = wanted.decision_ref.as_deref() else {
+        return Ok(RefWrite::Skipped("no ref to write".into()));
+    };
+    let mut metadata = match &current.metadata {
+        serde_json::Value::Object(map) => map.clone(),
+        serde_json::Value::Null => serde_json::Map::new(),
+        _ => {
+            return Ok(RefWrite::Skipped(
+                "metadata is not an object, so there is nothing to merge into".into(),
+            ))
+        }
+    };
+    metadata.insert("decision_ref".into(), reference.into());
+    let metadata = serde_json::Value::Object(metadata);
+    // The same check an update makes on metadata alone; the type is unchanged.
+    StructuredFields::default()
+        .validate(&metadata, current.memory_type.as_deref())
+        .map_err(|e| StoreError::Invalid(e.to_string()))?;
+    let before = Revisions::new(store)
+        .current(&current.id)?
+        .ok_or(StoreError::NotFound)?;
+    let edit = MemoryEdit {
+        metadata: Some(metadata),
+        ..MemoryEdit::at(chrono::Utc::now().to_rfc3339())
+    };
+    Memories::new(store).apply_edit(&current.id, &edit)?;
+    record(store, &current.id, &before)?;
+    crate::events::emit(
+        crate::events::Event::Updated,
+        &current.id,
+        &current.category,
+    );
+    Ok(RefWrite::Written)
 }
 
 // -- DECISIONS.md parsing -----------------------------------------------------
@@ -1030,6 +1190,27 @@ fn norm_line(r: &NormalizeRow) -> String {
     )
 }
 
+/// What an apply run wrote, as markdown: the rows it updated, the rows it
+/// could not, and the buckets it leaves for a person.
+pub fn render_normalize_applied(applied: &NormalizeApplied) -> String {
+    let plan = &applied.plan;
+    let scope = applied.project.as_deref().unwrap_or("all projects");
+    let mut out = format!(
+        "# Decisions normalise applied: {scope}\n\nWrote metadata.decision_ref on {} memories; {} skipped as changed since planning, {} failed. Left unchanged: {} retype, {} need rationale, {} conflicts, {} mentions.\n",
+        applied.updated.len(),
+        applied.skipped.len(),
+        applied.failed.len(),
+        plan.retype.len(),
+        plan.needs_rationale.len(),
+        plan.conflicts.len(),
+        plan.mentions.len()
+    );
+    section(&mut out, "Updated", &applied.updated, norm_line);
+    section(&mut out, "Skipped", &applied.skipped, norm_line);
+    section(&mut out, "Failed", &applied.failed, norm_line);
+    out
+}
+
 /// The normalise plan as markdown: counts, then every row per bucket.
 pub fn render_normalize(plan: &NormalizePlan) -> String {
     let scope = plan.project.as_deref().unwrap_or("all projects");
@@ -1212,5 +1393,68 @@ mod tests {
         }
         assert_ne!(words(r"\`foo\`"), words(r"\``foo\``"));
         assert_eq!(words(r"\\`foo`"), words(r"\\``foo``"));
+    }
+}
+
+#[cfg(test)]
+mod apply_tests {
+    use super::*;
+    use crate::db::memories::NewMemory;
+    use crate::Database;
+
+    fn decision(id: &str, reference: &str) -> NewMemory {
+        let mut row = NewMemory::new(id, "x", "2026-11-01T00:00:00Z");
+        row.memory_type = "decision".into();
+        row.category = "decision".into();
+        row.project = Some("mill".into());
+        row.metadata = serde_json::json!({"decision_id": reference, "rationale": "x"});
+        row
+    }
+
+    /// The revision is the last write in a row's transaction. When it
+    /// fails, after the row edit has landed in the page, the page rolls the
+    /// row back, no revision is left, and the next row is still written
+    /// with its revision.
+    #[test]
+    fn a_failed_revision_rolls_back_its_row_and_the_next_row_goes_through() {
+        let db = Database::open_in_memory().expect("database");
+        let store = db.store();
+        let memories = Memories::new(&store);
+        memories.insert(&decision("m-bad", "D1")).expect("insert");
+        memories.insert(&decision("m-ok", "D2")).expect("insert");
+        let plan = plan_normalize(&memories.all_live().expect("read"), None);
+
+        let record = |s: &Store<'_>, id: &str, before: &Tracked| {
+            if id == "m-bad" {
+                // The row edit is already in the page when this runs.
+                let edited = queries::get_memory_by_id(s, id)?.ok_or(StoreError::NotFound)?;
+                assert_eq!(edited.metadata["decision_ref"], "D1");
+                return Err(StoreError::Engine("revision write failed".into()));
+            }
+            record_revision(s, id, before)
+        };
+        let applied = apply_rows(&store, None, &plan.add_ref, &record);
+
+        let ids = |rows: &[NormalizeRow]| rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&applied.failed), ["m-bad"]);
+        assert_eq!(ids(&applied.updated), ["m-ok"]);
+        let read = |id: &str| {
+            queries::get_memory_by_id(&store, id)
+                .expect("read")
+                .expect("live")
+        };
+        assert_eq!(read("m-bad").metadata.get("decision_ref"), None);
+        assert!(Revisions::new(&store)
+            .list("m-bad", 10)
+            .expect("history")
+            .is_empty());
+        assert_eq!(read("m-ok").metadata["decision_ref"], "D2");
+        assert_eq!(
+            Revisions::new(&store)
+                .list("m-ok", 10)
+                .expect("history")
+                .len(),
+            1
+        );
     }
 }
