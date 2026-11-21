@@ -14,7 +14,16 @@
 //! entity walks, search with four readers beside one writer, and a backup
 //! restored and compared row by row. `open` fills a store and times
 //! reopening it, which rebuilds whatever the backend derives at open. Each
-//! run prints one JSON line.
+//! run gets a new directory of its own under `<dir>` (never deleted, never
+//! reused) and prints one JSON line.
+//!
+//! These are smoke runs, not scoring: the reopen is warm, and the restore
+//! check compares ids, contents and vector row counts only, so neither is
+//! G7 or G8 evidence. A restore that differs fails the run.
+//!
+//! The run is offline. It refuses to start when the environment configures
+//! an embedder, query expansion or reranking, rather than letting them
+//! clear the bench vectors or call a model inside a timed search.
 //!
 //! The data is synthetic and deterministic: a Zipf-skewed vocabulary, so
 //! full-text posting lists look like prose, a mix of categories, tags and
@@ -30,9 +39,12 @@ use remind_me_core::models::{
 };
 use remind_me_core::{entity, testing, vectors, Database};
 use serde_json::{json, Map, Value};
+use std::collections::HashMap;
 use std::error::Error;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Barrier;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Any error, boxed.
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
@@ -78,24 +90,32 @@ pub fn run(candidates: &[Candidate]) -> Result<()> {
         )
         .into());
     };
+    // Every argument is checked before anything touches the filesystem.
+    if !matches!(mode.as_str(), "bench" | "open") {
+        return Err(format!("unknown mode {mode:?}; one of bench, open").into());
+    }
     let Some(&candidate) = candidates.iter().find(|c| c.name == backend) else {
         return Err(format!("unknown backend {backend:?}; one of {names:?}").into());
     };
     let n: usize = n.parse()?;
-    let dir = PathBuf::from(dir).join(format!("{mode}-{backend}-{n}"));
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir)?;
+    if n == 0 {
+        return Err("n must be at least 1".into());
     }
-    std::fs::create_dir_all(&dir)?;
+    refuse_model_config()?;
+    let dir = fresh_run_dir(Path::new(dir), &format!("{mode}-{backend}-{n}"))?;
 
     let mut report = Map::new();
     report.insert("mode".into(), json!(mode));
     report.insert("backend".into(), json!(backend));
     report.insert("n".into(), json!(n));
+    report.insert("run_dir".into(), json!(dir));
+    report.insert(
+        "note".into(),
+        json!("smoke run: warm reopen and the restore check are not G7 or G8 evidence"),
+    );
     match mode.as_str() {
         "bench" => workload(candidate, &dir, n, &mut report)?,
-        "open" => reopen(candidate, &dir, n, &mut report)?,
-        other => return Err(format!("unknown mode {other:?}").into()),
+        _ => reopen(candidate, &dir, n, &mut report)?,
     }
     report.insert(
         "disk_mb".into(),
@@ -103,6 +123,48 @@ pub fn run(candidates: &[Candidate]) -> Result<()> {
     );
     report.insert("peak_rss_mb".into(), json!(peak_rss_mb()));
     println!("{}", Value::Object(report));
+    Ok(())
+}
+
+/// A new directory under `root` that this run alone owns: `create_dir`
+/// fails if the name is taken, and nothing is ever deleted.
+fn fresh_run_dir(root: &Path, stem: &str) -> Result<PathBuf> {
+    std::fs::create_dir_all(root)?;
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let dir = root.join(format!("{stem}-{}-{nanos}", std::process::id()));
+    std::fs::create_dir(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    Ok(dir)
+}
+
+/// Refuse to run when the environment configures a model: an embedder
+/// would make `open_backend` reconcile and clear the bench vectors, and
+/// query expansion or reranking would call a model inside timed searches.
+/// The benchmark is offline and uses only [`BenchEmbedder`]; it never
+/// falls back to keyword-only search silently.
+fn refuse_model_config() -> Result<()> {
+    use remind_me_core::{embedder, query_expansion, reranker};
+    let set = |name: &str| std::env::var(name).is_ok_and(|v| !v.trim().is_empty());
+    if set(embedder::EMBEDDING_BACKEND_ENV) {
+        return Err(format!(
+            "{} is set; unset it, the benchmark embeds with its own seeded vectors",
+            embedder::EMBEDDING_BACKEND_ENV
+        )
+        .into());
+    }
+    if query_expansion::enabled() {
+        return Err(format!(
+            "{} asks for query expansion; unset it",
+            query_expansion::EXPANSION_MODE_ENV
+        )
+        .into());
+    }
+    if reranker::available() && reranker::enabled() {
+        return Err(format!(
+            "reranking is on; set {}= (empty) to turn it off",
+            reranker::BACKEND_ENV
+        )
+        .into());
+    }
     Ok(())
 }
 
@@ -194,7 +256,7 @@ fn workload(
 
     let started = Instant::now();
     let db = candidate.open(dir)?;
-    report.insert("reopen_ms".into(), json!(millis(started.elapsed())));
+    report.insert("reopen_warm_ms".into(), json!(millis(started.elapsed())));
     let store = db.store();
 
     // Dialogs are the verbatim record and refuse edits (#1616), so updates
@@ -240,6 +302,9 @@ fn workload(
     );
 
     let queries_: Vec<String> = (0..SAMPLES).map(|i| query(&corpus, &mut rng, i)).collect();
+    // Query vectors are made before any timed span, so the searches time
+    // retrieval, not embedding.
+    let vectors_ = Precomputed::new(&queries_);
     let search = |i: usize, embedder: Option<&dyn Embedder>| -> Result<()> {
         let input: MemorySearchInput = serde_json::from_value(json!({ "query": queries_[i] }))?;
         queries::search_memories_with_embedder(&store, &input, embedder)?;
@@ -249,13 +314,13 @@ fn workload(
     report.insert(
         "search_semantic".into(),
         timed(|i| {
-            vectors::semantic_search(&store, &BenchEmbedder, &queries_[i], 10, None)?;
+            vectors::semantic_search(&store, &vectors_, &queries_[i], 10, None)?;
             Ok(())
         })?,
     );
     report.insert(
         "search_hybrid".into(),
-        timed(|i| search(i, Some(&BenchEmbedder)))?,
+        timed(|i| search(i, Some(&vectors_)))?,
     );
 
     let t = Instant::now();
@@ -285,68 +350,91 @@ fn workload(
 
     report.insert(
         "search_hybrid_beside_writer".into(),
-        beside_writer(&db, &corpus, &queries_)?,
+        beside_writer(&db, &corpus, &queries_, &vectors_)?,
     );
 
     let t = Instant::now();
     remind_me_core::stats::collect(&store)?;
     report.insert("stats_ms".into(), json!(millis(t.elapsed())));
 
-    report.insert(
-        "delete".into(),
-        timed(|i| {
-            queries::delete_memory(&store, &editable[editable.len() - 1 - i % editable.len()])?;
-            Ok(())
-        })?,
-    );
+    // Distinct live rows, each deleted once; a delete that finds nothing is
+    // an error, not a fast sample.
+    let mut times = Vec::new();
+    for id in editable.iter().rev().take(SAMPLES) {
+        let t = Instant::now();
+        let deleted = queries::delete_memory(&store, id)?;
+        times.push(t.elapsed());
+        if !deleted {
+            return Err(format!("delete of live memory {id} did nothing").into());
+        }
+    }
+    report.insert("delete".into(), summary(times));
 
     drop(store);
     backup_and_restore(candidate, &db, report)
 }
 
-/// Hybrid search on `READERS` threads while one thread adds `SAMPLES`
-/// memories; the readers' times. Each thread takes a store from the
+/// Hybrid search on `READERS` threads while one thread keeps adding
+/// memories; the readers' times. All threads start together at a barrier,
+/// and the writer runs until every reader has finished, so every sample is
+/// taken beside a live writer. Each thread takes a store from the
 /// database's secondary source, as the node's background threads do: a
 /// store from [`Database::store`] holds the process lock.
-fn beside_writer(db: &Database, corpus: &Corpus, queries_: &[String]) -> Result<Value> {
+fn beside_writer(
+    db: &Database,
+    corpus: &Corpus,
+    queries_: &[String],
+    vectors_: &Precomputed,
+) -> Result<Value> {
     let source = &db.secondary_source().ok_or("an in-memory database")?;
+    let start = &Barrier::new(READERS + 1);
+    let readers_done = &AtomicBool::new(false);
+    let written = &AtomicUsize::new(0);
     let mut times: Vec<Duration> = Vec::new();
     std::thread::scope(|scope| -> Result<()> {
-        let writer = scope.spawn(|| -> std::result::Result<(), String> {
+        let writer = scope.spawn(move || -> std::result::Result<(), String> {
+            let store = source.store();
             let mut rng = Rng(0xbeef);
-            fill(&source.store(), SAMPLES, corpus, &mut rng)
-                .map(drop)
-                .map_err(|e| e.to_string())
+            start.wait();
+            while !readers_done.load(Ordering::SeqCst) {
+                fill(&store, 1, corpus, &mut rng).map_err(|e| e.to_string())?;
+                written.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
         });
         let readers: Vec<_> = (0..READERS)
             .map(|r| {
                 scope.spawn(move || -> std::result::Result<Vec<Duration>, String> {
                     let store = source.store();
                     let mut times = Vec::with_capacity(SAMPLES / READERS);
+                    start.wait();
                     for i in (r..SAMPLES).step_by(READERS) {
                         let input: MemorySearchInput =
                             serde_json::from_value(json!({ "query": queries_[i] }))
                                 .map_err(|e| e.to_string())?;
                         let t = Instant::now();
-                        queries::search_memories_with_embedder(
-                            &store,
-                            &input,
-                            Some(&BenchEmbedder),
-                        )
-                        .map_err(|e| e.to_string())?;
+                        queries::search_memories_with_embedder(&store, &input, Some(vectors_))
+                            .map_err(|e| e.to_string())?;
                         times.push(t.elapsed());
                     }
                     Ok(times)
                 })
             })
             .collect();
+        let mut joined = Ok(());
         for reader in readers {
-            times.extend(reader.join().map_err(|_| "a reader panicked")??);
+            match reader.join().map_err(|_| "a reader panicked".to_string()) {
+                Ok(Ok(t)) => times.extend(t),
+                Ok(Err(e)) | Err(e) => joined = Err(e),
+            }
         }
+        readers_done.store(true, Ordering::SeqCst);
         writer.join().map_err(|_| "the writer panicked")??;
-        Ok(())
+        Ok(joined?)
     })?;
-    Ok(summary(times))
+    let mut value = summary(times);
+    value["writer_adds"] = json!(written.load(Ordering::SeqCst));
+    Ok(value)
 }
 
 /// Time a backup, then open it as a fresh store and compare every memory's
@@ -375,11 +463,19 @@ fn backup_and_restore(
             differing += 1;
         }
     }
+    // Equal vector row counts only: a smoke check, not G8's content check.
     let same_vectors = testing::count(&store, testing::Table::VecChunks)?
         == testing::count(&copy, testing::Table::VecChunks)?;
+    if !same_ids || differing > 0 || !same_vectors {
+        return Err(format!(
+            "the restored copy differs: same ids {same_ids}, {differing} differing contents, \
+             same vector row count {same_vectors}"
+        )
+        .into());
+    }
     report.insert(
-        "restore".into(),
-        json!({ "rows": ids.len(), "same_ids": same_ids, "differing_content": differing, "same_vectors": same_vectors }),
+        "restore_smoke".into(),
+        json!({ "rows": ids.len(), "matched": true }),
     );
     Ok(())
 }
@@ -397,7 +493,7 @@ fn reopen(
     fill(&candidate.open(dir)?.store(), n, &corpus, &mut rng)?;
     let started = Instant::now();
     let _db = candidate.open(dir)?;
-    report.insert("reopen_ms".into(), json!(millis(started.elapsed())));
+    report.insert("reopen_warm_ms".into(), json!(millis(started.elapsed())));
     Ok(())
 }
 
@@ -442,6 +538,43 @@ fn unit_vector(text: &str) -> Vec<f32> {
         .sqrt()
         .max(f32::EPSILON);
     v.into_iter().map(|x| x / norm).collect()
+}
+
+/// The query vectors, made up front: an embedder that only looks them up,
+/// so timed searches do no embedding work. A text it was not given is an
+/// error, never embedded on the spot.
+struct Precomputed(HashMap<String, Vec<f32>>);
+
+impl Precomputed {
+    fn new(texts: &[String]) -> Self {
+        Self(texts.iter().map(|t| (t.clone(), unit_vector(t))).collect())
+    }
+}
+
+impl Embedder for Precomputed {
+    fn embed(
+        &self,
+        texts: &[String],
+        _role: EmbedRole,
+    ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+        texts
+            .iter()
+            .map(|t| {
+                self.0
+                    .get(t)
+                    .cloned()
+                    .ok_or_else(|| EmbedError(format!("no precomputed vector for {t:?}")))
+            })
+            .collect()
+    }
+
+    fn dim(&self) -> usize {
+        DIM
+    }
+
+    fn identity(&self) -> EmbeddingIdentity {
+        BenchEmbedder.identity()
+    }
 }
 
 /// Synthetic memories shaped like a node's.
@@ -548,7 +681,7 @@ fn summary(mut times: Vec<Duration>) -> Value {
     times.sort();
     let at = |q: f64| millis(times[((times.len() - 1) as f64 * q) as usize]);
     let mean = times.iter().sum::<Duration>() / times.len() as u32;
-    json!({ "mean": millis(mean), "p50": at(0.5), "p95": at(0.95), "p99": at(0.99), "max": at(1.0) })
+    json!({ "count": times.len(), "mean": millis(mean), "p50": at(0.5), "p95": at(0.95), "p99": at(0.99), "max": at(1.0) })
 }
 
 fn millis(d: Duration) -> f64 {
