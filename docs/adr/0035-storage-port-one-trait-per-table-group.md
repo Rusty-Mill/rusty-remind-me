@@ -125,6 +125,12 @@ pointed at SQLite, 2,710 of 2,725 tests pass; the 15 that fail test the
 engine itself (journal fault injection, the legacy copy, the engine's
 directory layout, one engine internal).
 
+This adapter is scaffolding, not benchmark parity: wiki pages and dialog
+bodies are stored inline in its tables, which is not the blob-store body
+layout D40, D41 and D43 set as the baseline. Before any number is scored,
+every candidate gets the same body layout, and G8 is checked by restoring
+a self-contained backup package in isolation.
+
 ## Not decided here
 
 - Which stores go in the benchmark (Millwright QUESTIONS.md R2) and the
