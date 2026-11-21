@@ -988,3 +988,89 @@ fn a_partial_role_tail_then_an_ambiguous_copy_then_a_snapshot_stay_in_order() {
     crate::test_env::remove_var(ARCHIVE_DIR_ENV);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `line` with message id `id`.
+fn with_id(line: &str, id: &str) -> String {
+    let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+    value["uuid"] = id.into();
+    value.to_string()
+}
+
+/// How many messages the session's placed rows hold, as the watcher sees it.
+fn placed(store: &Store<'_>, raw: &str, session_id: &str) -> usize {
+    use remind_me_core::transcript::{capture_unless_held, Conditional, Replace};
+    match capture_unless_held(store, raw, &request_for(session_id), Replace::Never).unwrap() {
+        Conditional::Held(n) => n,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A legacy first row (no roles listed), an unplaced tail with ids, its
+/// exact retry, then a tail with the same text and other ids. The retry
+/// keeps one copy; the other ids are new turns, kept with their own exact
+/// source; neither moves the placed watermark.
+#[test]
+fn an_equal_text_tail_with_other_ids_is_kept_and_an_exact_retry_is_not() {
+    use remind_me_core::db::memories::{Memories, MemoryEdit};
+    use remind_me_core::transcript::capture_transcript;
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_limits();
+
+    let dir = scratch("unplaced-ids");
+    crate::test_env::set_var(ARCHIVE_DIR_ENV, dir.join("archive"));
+    let db = open();
+    let store = db.store();
+    let sid = "sess_leg";
+    let first = [turn(sid, "user", "a1"), turn(sid, "assistant", "b1")].join("\n");
+    let made = capture_transcript(&store, &first, &request_for(sid)).unwrap();
+    let row = remind_me_core::db::queries::get_memory_by_id(&store, &made.dialog_id)
+        .unwrap()
+        .unwrap();
+    let mut metadata = row.metadata.clone();
+    metadata.as_object_mut().unwrap().remove("roles");
+    Memories::new(&store)
+        .apply_edit(
+            &made.dialog_id,
+            &MemoryEdit {
+                metadata: Some(metadata),
+                ..MemoryEdit::at("2026-11-21T10:00:01Z")
+            },
+        )
+        .unwrap();
+    assert_eq!(placed(&store, &first, sid), 2);
+
+    let tail = |ids: [&str; 2]| {
+        [
+            with_id(&turn(sid, "assistant", "x1"), ids[0]),
+            with_id(&turn(sid, "assistant", "y1"), ids[1]),
+        ]
+        .join("\n")
+    };
+    let kept = tail(["t1", "t2"]);
+    capture_transcript(&store, &kept, &request_for(sid)).unwrap();
+    capture_transcript(&store, &kept, &request_for(sid)).unwrap();
+    assert_eq!(
+        continuation_ids(&store, sid).len(),
+        1,
+        "the retry is one copy"
+    );
+
+    let other = tail(["t3", "t4"]);
+    capture_transcript(&store, &other, &request_for(sid)).unwrap();
+
+    let rows = continuation_ids(&store, sid);
+    assert_eq!(rows.len(), 2, "other ids are new turns");
+    assert_eq!(source(&store, &rows[0]), kept);
+    assert_eq!(source(&store, &rows[1]), other);
+    for id in &rows {
+        let row = remind_me_core::db::queries::get_memory_by_id(&store, id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.metadata["placement"], "unplaced_no_overlap");
+        assert_eq!(row.metadata["from_message"], 2);
+    }
+    assert_eq!(placed(&store, &first, sid), 2, "placed watermark unchanged");
+
+    crate::test_env::remove_var(ARCHIVE_DIR_ENV);
+    let _ = std::fs::remove_dir_all(&dir);
+}

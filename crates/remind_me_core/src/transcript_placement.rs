@@ -207,12 +207,6 @@ fn by_text(record: &[Block<'_>], blocks: &[String]) -> Placement {
     }
 }
 
-/// Whether `record` holds `blocks` as a run of whole messages.
-pub fn holds(record: &[Block<'_>], blocks: &[String]) -> bool {
-    let pattern: Vec<&str> = blocks.iter().map(String::as_str).collect();
-    !pattern.is_empty() && count(record, &pattern) > 0
-}
-
 /// KMP failure table: `fail[i]` is the length of the longest proper prefix
 /// of `pattern[..=i]` that is also its suffix.
 fn failure(pattern: &[&str]) -> Vec<usize> {

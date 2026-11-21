@@ -286,8 +286,7 @@ fn message_lines(raw: &str) -> impl Iterator<Item = (Range<usize>, ChatMessage)>
 }
 
 use crate::transcript_placement::{
-    holds, place, role_of, roles, split_row, Block, Incoming, Placement, Record, Shape,
-    MESSAGE_SEPARATOR,
+    place, role_of, roles, split_row, Block, Incoming, Placement, Record, Shape, MESSAGE_SEPARATOR,
 };
 
 /// Each message of `messages` rendered and scrubbed as a stored dialog
@@ -368,12 +367,26 @@ fn record_roles(rows: &[crate::models::Memory]) -> HashSet<String> {
     listed.chain(opening).collect()
 }
 
-/// Whether an unplaced row of `rows` holds `blocks` as a run of whole
-/// messages.
-fn held_unplaced(rows: &[crate::models::Memory], roles: &HashSet<&str>, blocks: &[String]) -> bool {
+/// Whether an unplaced row of `rows` already holds this exact submission,
+/// so keeping it again would only add a copy.
+///
+/// When the submission and the row both carry message ids, the ids decide:
+/// equal ids are a retry, and differing ids are new turns however equal
+/// their text. Otherwise the whole submission must equal the whole row,
+/// message for message; a run inside a row is not enough.
+fn held_unplaced(
+    rows: &[crate::models::Memory],
+    roles: &HashSet<&str>,
+    incoming: &Incoming<'_>,
+) -> bool {
     rows.iter()
         .filter(|row| is_unplaced(row))
-        .any(|row| holds(&row_blocks(row, roles), blocks))
+        .any(|row| match (incoming.ids, listed_ids(row)) {
+            (Some(ids), Some(stored)) => ids == stored.as_slice(),
+            _ => row_blocks(row, roles)
+                .into_iter()
+                .eq(incoming.blocks.iter().map(|b| Some(b.as_str()))),
+        })
 }
 
 /// Whether a dialog row holds a transcript kept whole because it could not
@@ -938,20 +951,21 @@ fn recapture_in(
     let placed_count: usize = placed_rows.iter().map(|row| held_messages(row)).sum();
     let held_ids = recorded_ids(&rows);
     let ids = message_ids(&messages);
+    let incoming = Incoming {
+        blocks: &blocks,
+        ids: ids.as_deref(),
+    };
     let placement = place(
         &Record {
             blocks: &recorded,
             ids: held_ids.as_ref(),
         },
-        &Incoming {
-            blocks: &blocks,
-            ids: ids.as_deref(),
-        },
+        &incoming,
     );
-    // A transcript an unplaced row already holds, such as a retry of the
-    // same tail, is not kept a second time.
+    // A submission an unplaced row already holds exactly, such as a retry
+    // of the same tail, is not kept a second time.
     let placement = match placement {
-        Placement::Unplaced(_) if held_unplaced(&rows, &roles, &blocks) => Placement::Held,
+        Placement::Unplaced(_) if held_unplaced(&rows, &roles, &incoming) => Placement::Held,
         other => other,
     };
     let mut written = Written::new();
@@ -1154,7 +1168,8 @@ mod tests {
         // Messages 0..4 on lines a, b, b, c: line b holds messages 1 and 2.
         let spans = [0..1, 2..3, 2..3, 4..5];
         assert_eq!(slices(&spans, &[0, 3]), Some(vec![0..1, 4..5]));
-        assert_eq!(slices(&spans, &[1, 2]), Some(vec![2..3]));
+        let shared_line = Range { start: 2, end: 3 };
+        assert_eq!(slices(&spans, &[1, 2]), Some(vec![shared_line]));
         // Message 1 alone would claim message 2's bytes too.
         assert_eq!(slices(&spans, &[1]), None);
         assert_eq!(slices(&spans, &[9]), None);
