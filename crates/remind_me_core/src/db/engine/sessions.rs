@@ -1,14 +1,14 @@
 //! `sessions` on the engine core (schema v32): each client session's start
-//! and end. [`crate::db::sessions`] calls these when its store carries the
-//! core.
+//! and end, and the engine's adapter for the [`SessionStore`] port
+//! (ADR-0035).
 //!
-//! The merge rules live with the SQL repository
-//! ([`SessionRecord::started`] and [`SessionRecord::ended`]), so both
-//! stores answer the same way by construction.
+//! The merge rules live beside the row ([`SessionRecord::started`] and
+//! [`SessionRecord::ended`]), so every backend answers the same way by
+//! construction.
 
 use super::core::{Change, CoreTables};
 use super::{core_ref, engine_id, EngineTables};
-use crate::db::sessions::{SessionRecord, SessionStart};
+use crate::db::sessions::{SessionRecord, SessionStart, SessionStore};
 use crate::db::Result;
 use rusty_multimodal_db_engine::generic::query::{AllIds, GetById};
 use rusty_multimodal_db_engine::generic::traits::{
@@ -123,48 +123,52 @@ fn put(tables: &mut EngineTables, record: &SessionRecord) -> Result<()> {
     tables.commit(vec![Change::Session(id, Some(Box::new(row)))])
 }
 
-/// Record that a session started, or refresh what its row knows: the SQL's
-/// `INSERT … ON CONFLICT DO UPDATE`.
-pub(crate) fn upsert_start(tables: &mut EngineTables, start: &SessionStart) -> Result<()> {
-    let current = stored(core_ref(tables)?, &start.session_id);
-    put(tables, &SessionRecord::started(current, start))
+impl SessionStore for EngineTables {
+    /// Record that a session started, or refresh what its row knows: the SQL's
+    /// `INSERT … ON CONFLICT DO UPDATE`.
+    fn upsert_start(&mut self, start: &SessionStart) -> Result<()> {
+        let current = stored(core_ref(self)?, &start.session_id);
+        put(self, &SessionRecord::started(current, start))
+    }
+
+    /// Record that a session ended. Whether there was a row to end.
+    fn end(
+        &mut self,
+        session_id: &str,
+        ended_at: &str,
+        end_sha: Option<&str>,
+        work_log_memory_id: Option<&str>,
+    ) -> Result<bool> {
+        let Some(mut current) = stored(core_ref(self)?, session_id) else {
+            return Ok(false);
+        };
+        current.ended(ended_at, end_sha, work_log_memory_id);
+        put(self, &current)?;
+        Ok(true)
+    }
+
+    fn get(&self, session_id: &str) -> Result<Option<SessionRecord>> {
+        Ok(stored(core_ref(self)?, session_id))
+    }
+
+    /// The most recently started sessions, of `project` when given, newest
+    /// first (ties by id, descending), at most `limit`.
+    fn recent(&self, limit: usize, project: Option<&str>) -> Result<Vec<SessionRecord>> {
+        let core = core_ref(self)?;
+        let mut rows: Vec<SessionRow> = core
+            .sessions
+            .all_ids()
+            .into_iter()
+            .filter_map(|id| core.sessions.get(id))
+            .filter(|r| !project.is_some_and(|p| r.project.as_deref() != Some(p)))
+            .collect();
+        rows.sort_by(|a, b| (&b.started_at, &b.session_id).cmp(&(&a.started_at, &a.session_id)));
+        Ok(rows.iter().take(limit).map(SessionRow::to_record).collect())
+    }
 }
 
-/// Record that a session ended. Whether there was a row to end.
-pub(crate) fn end(
-    tables: &mut EngineTables,
-    session_id: &str,
-    ended_at: &str,
-    end_sha: Option<&str>,
-    work_log_memory_id: Option<&str>,
-) -> Result<bool> {
-    let Some(mut current) = stored(core_ref(tables)?, session_id) else {
-        return Ok(false);
-    };
-    current.ended(ended_at, end_sha, work_log_memory_id);
-    put(tables, &current)?;
-    Ok(true)
-}
-
-pub(crate) fn get(tables: &EngineTables, session_id: &str) -> Result<Option<SessionRecord>> {
-    Ok(stored(core_ref(tables)?, session_id))
-}
-
-/// The most recently started sessions, of `project` when given, newest
-/// first (ties by id, descending), at most `limit`.
-pub(crate) fn recent(
-    tables: &EngineTables,
-    limit: usize,
-    project: Option<&str>,
-) -> Result<Vec<SessionRecord>> {
-    let core = core_ref(tables)?;
-    let mut rows: Vec<SessionRow> = core
-        .sessions
-        .all_ids()
-        .into_iter()
-        .filter_map(|id| core.sessions.get(id))
-        .filter(|r| !project.is_some_and(|p| r.project.as_deref() != Some(p)))
-        .collect();
-    rows.sort_by(|a, b| (&b.started_at, &b.session_id).cmp(&(&a.started_at, &a.session_id)));
-    Ok(rows.iter().take(limit).map(SessionRow::to_record).collect())
+#[cfg(test)]
+mod conformance_tests {
+    use super::EngineTables;
+    crate::db::sessions::session_conformance!(EngineTables::open_temporary().unwrap());
 }
