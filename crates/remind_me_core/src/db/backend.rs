@@ -219,7 +219,18 @@ impl BackendLock {
         }
         // Taken while still holding the gate, so no transaction can open
         // between the check and the lock.
-        Ok(self.backend_guard())
+        let guard = self.backend_guard();
+        // A write outside any transaction can leave the backend unsettled
+        // too (an indeterminate commit of its own): fail closed then, as
+        // after a transaction that did not settle. The gate's owner is
+        // inside its own transaction, which settles at commit.
+        if gate.owner.is_none() && guard.transaction_state() == TransactionState::NeedsRecovery {
+            let why = "a write outside a transaction did not settle".to_string();
+            let refused = needs_recovery(&why);
+            gate.failed = Some(why);
+            return Err(refused);
+        }
+        Ok(guard)
     }
 
     /// The backend, without the gate checks: only for a thread that holds

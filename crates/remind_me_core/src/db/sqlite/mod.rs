@@ -59,8 +59,12 @@ const FILE: &str = "remind_me.sqlite3";
 /// Every table group's rows in one SQLite database.
 pub struct SqliteTables {
     conn: Connection,
-    /// Set when a rollback failed: only reopening makes the store safe.
+    /// Set when a commit, rollback or savepoint did not settle: only
+    /// reopening makes the store safe.
     failed: bool,
+    /// Set when a savepoint inside an open transaction could not be put
+    /// back: that transaction may hold half of it, so it must not commit.
+    poisoned: bool,
 }
 
 impl SqliteTables {
@@ -104,16 +108,61 @@ impl SqliteTables {
         Ok(Self {
             conn,
             failed: false,
+            poisoned: false,
         })
     }
 
     /// Run `f` in a savepoint: its writes land together or not at all,
     /// nested inside an open transaction if there is one.
+    ///
+    /// Settled by hand, because rusqlite's `Savepoint` drop swallows
+    /// cleanup errors. Outside a transaction the final `RELEASE` is the
+    /// commit, so a failed one is indeterminate and marks the store
+    /// `NeedsRecovery`; so does a rollback that cannot be confirmed. Inside
+    /// one, a savepoint that cannot be put back poisons the transaction,
+    /// which then refuses to commit.
     pub(crate) fn atomic<T>(&mut self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-        let sp = self.conn.savepoint().map_err(sqlite_error)?;
-        let value = f(&sp)?;
-        sp.commit().map_err(sqlite_error)?;
+        if self.failed {
+            return Err(StoreError::Engine(
+                "sqlite: an earlier write did not settle; reopen the store".into(),
+            ));
+        }
+        let outermost = self.conn.is_autocommit();
+        self.conn
+            .execute_batch("SAVEPOINT atomic")
+            .map_err(sqlite_error)?;
+        let value = match f(&self.conn) {
+            Ok(value) => value,
+            Err(e) => {
+                self.undo_savepoint(outermost);
+                return Err(e);
+            }
+        };
+        if let Err(e) = self.conn.execute_batch("RELEASE atomic") {
+            if outermost {
+                self.failed = true;
+            } else {
+                self.undo_savepoint(false);
+            }
+            return Err(sqlite_error(e));
+        }
         Ok(value)
+    }
+
+    /// Put back the open savepoint `atomic`, and say so if that fails.
+    fn undo_savepoint(&mut self, outermost: bool) {
+        let undone = self
+            .conn
+            .execute_batch("ROLLBACK TO atomic; RELEASE atomic");
+        let settled = undone.is_ok() && self.conn.is_autocommit() == outermost;
+        if settled {
+            return;
+        }
+        if outermost {
+            self.failed = true;
+        } else {
+            self.poisoned = true;
+        }
     }
 }
 
@@ -133,6 +182,12 @@ impl Backend for SqliteTables {
     /// back in memory, but a whole frame may still be in the WAL for
     /// recovery to replay: state 4, so the lock fails closed.
     fn commit_transaction(&mut self) -> Result<()> {
+        if self.poisoned {
+            return Err(StoreError::Engine(
+                "sqlite: a write in this transaction could not be put back; it must roll back"
+                    .into(),
+            ));
+        }
         let committed = self.conn.execute_batch("COMMIT").map_err(sqlite_error);
         if committed.is_err() && self.conn.is_autocommit() {
             // SQLite rolled back in memory, but an I/O error (a failed WAL
@@ -156,6 +211,7 @@ impl Backend for SqliteTables {
         if rolled.is_err() && !self.conn.is_autocommit() {
             self.failed = true;
         }
+        self.poisoned = false;
         rolled
     }
 
@@ -358,6 +414,81 @@ mod tests {
         assert_eq!(t.size_on_disk().unwrap(), on_disk);
         drop(t);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A standalone write whose savepoint cleanup fails (here the write
+    /// released it early, so the final `RELEASE` cannot find it) leaves
+    /// the store `NeedsRecovery`, and a database on it refuses every
+    /// caller after.
+    #[test]
+    fn a_standalone_savepoint_that_does_not_settle_fails_closed() {
+        let mut t = SqliteTables::open_in_memory().unwrap();
+        let unsettled = t.atomic(|c| exec(c, "RELEASE atomic", []).map(drop));
+        assert!(unsettled.is_err());
+        assert_eq!(t.transaction_state(), TransactionState::NeedsRecovery);
+        assert!(t.atomic(|_| Ok(())).is_err(), "later writes are refused");
+
+        let db = Database::open_backend(Box::new(SqliteTables::open_in_memory().unwrap()), None)
+            .unwrap();
+        let store = db.store();
+        let failed = {
+            let mut guard = store.backend().lock().unwrap();
+            let backend: &mut dyn std::any::Any = &mut *guard;
+            let sqlite = backend.downcast_mut::<SqliteTables>().unwrap();
+            sqlite.atomic(|c| {
+                exec(c, "ROLLBACK TO atomic", [])?;
+                exec(c, "RELEASE atomic", [])?;
+                Err::<(), _>(StoreError::Invalid("give up".into()))
+            })
+        };
+        assert!(failed.is_err());
+        assert!(
+            Memories::new(&store).exists("m").is_err(),
+            "the lock refuses reads once the store needs recovery"
+        );
+    }
+
+    /// Inside a transaction, a savepoint that cannot be put back poisons
+    /// it: the commit is refused, and the rollback that follows clears it.
+    #[test]
+    fn a_nested_savepoint_that_cannot_be_put_back_refuses_the_commit() {
+        let mut t = SqliteTables::open_in_memory().unwrap();
+        t.begin_transaction().unwrap();
+        MemoryStore::insert(&mut t, &NewMemory::new("kept", "x", NOW)).unwrap();
+        let failed = t.atomic(|c| {
+            exec(c, "ROLLBACK TO atomic", [])?;
+            exec(c, "RELEASE atomic", [])?;
+            Err::<(), _>(StoreError::Invalid("give up".into()))
+        });
+        assert!(failed.is_err());
+        assert_eq!(t.transaction_state(), TransactionState::Open);
+        assert!(
+            t.commit_transaction().is_err(),
+            "a poisoned transaction does not commit"
+        );
+        t.rollback_transaction().unwrap();
+        assert_eq!(t.transaction_state(), TransactionState::Closed);
+        assert!(!MemoryStore::exists(&t, "kept").unwrap());
+        t.begin_transaction().unwrap();
+        MemoryStore::insert(&mut t, &NewMemory::new("next", "x", NOW)).unwrap();
+        t.commit_transaction().unwrap();
+        assert!(MemoryStore::exists(&t, "next").unwrap());
+    }
+
+    /// A write that fails inside a transaction is put back on its own:
+    /// the transaction's other writes still commit.
+    #[test]
+    fn a_failed_write_inside_a_transaction_is_put_back_alone() {
+        let mut t = SqliteTables::open_in_memory().unwrap();
+        t.begin_transaction().unwrap();
+        MemoryStore::insert(&mut t, &NewMemory::new("kept", "x", NOW)).unwrap();
+        let failed = t.atomic(|c| {
+            exec(c, "DELETE FROM memories", [])?;
+            Err::<(), _>(StoreError::Invalid("give up".into()))
+        });
+        assert!(failed.is_err());
+        t.commit_transaction().unwrap();
+        assert!(MemoryStore::exists(&t, "kept").unwrap());
     }
 
     #[test]
