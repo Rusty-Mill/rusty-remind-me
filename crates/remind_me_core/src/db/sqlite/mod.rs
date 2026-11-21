@@ -23,6 +23,7 @@ mod reminders;
 mod saved_searches;
 mod sessions;
 mod stats;
+mod testing;
 mod vectors;
 mod wiki;
 
@@ -171,6 +172,10 @@ impl Backend for SqliteTables {
 
     /// A consistent copy by `VACUUM INTO`, as a directory [`Self::open`]
     /// opens.
+    fn test_rows(&mut self) -> Option<&mut dyn crate::testing::TestRows> {
+        Some(self)
+    }
+
     fn backup_to(&self, dest: &Path) -> Result<()> {
         if dest.exists() {
             return Err(StoreError::Invalid(format!(

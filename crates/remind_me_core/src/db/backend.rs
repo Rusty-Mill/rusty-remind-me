@@ -41,8 +41,8 @@ use std::thread::ThreadId;
 
 /// A whole store: every table group's port, and what spans them.
 ///
-/// `Any` lets engine-only code (`crate::testing`'s raw-row helpers) find
-/// the engine behind a handle and refuse plainly on any other backend.
+/// `Any` lets engine-only code (the engine's own tests and copy) find the
+/// engine behind a handle and refuse plainly on any other backend.
 pub trait Backend:
     ArchiveStore
     + CurationStore
@@ -141,6 +141,13 @@ pub trait Backend:
     ///
     /// The backend's error naming what could not be copied.
     fn backup_to(&self, dest: &Path) -> Result<()>;
+
+    /// This backend's raw rows, for `crate::testing`'s helpers (D42).
+    /// `None`, the default, makes those helpers refuse.
+    #[doc(hidden)]
+    fn test_rows(&mut self) -> Option<&mut dyn crate::testing::TestRows> {
+        None
+    }
 }
 
 /// Where a backend's transaction stands ([`Backend::transaction_state`]).

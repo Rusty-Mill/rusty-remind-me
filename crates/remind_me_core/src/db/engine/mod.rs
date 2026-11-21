@@ -335,6 +335,9 @@ impl super::backend::Backend for EngineTables {
     fn backup_to(&self, dest: &Path) -> super::Result<()> {
         self.copy_files_to(dest)
     }
+    fn test_rows(&mut self) -> Option<&mut dyn crate::testing::TestRows> {
+        Some(self)
+    }
 }
 
 /// The memories core of `tables`. It cannot fail since the switch-on (core

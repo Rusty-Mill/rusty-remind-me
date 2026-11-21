@@ -379,6 +379,18 @@ fn unindex(c: &Connection, row: &MemoryRow) -> Result<()> {
     .map_err(sqlite_error)
 }
 
+/// Store `new` in place of `old` (the same id or another), the indexes
+/// kept in step and nothing queued: a raw write for `crate::testing`.
+pub(super) fn replace(c: &Connection, old: &MemoryRow, new: &MemoryRow) -> Result<()> {
+    unindex(c, old)?;
+    if new.id != old.id {
+        c.execute("DELETE FROM memories WHERE id = ?1", [&old.id])
+            .map_err(sqlite_error)?;
+    }
+    put(c, new).map_err(sqlite_error)?;
+    index(c, new)
+}
+
 /// Rebuild the full-text index and tag table from the rows.
 pub(super) fn rebuild(c: &Connection) -> Result<()> {
     c.execute_batch("DELETE FROM memories_fts; DELETE FROM memory_tags;")
