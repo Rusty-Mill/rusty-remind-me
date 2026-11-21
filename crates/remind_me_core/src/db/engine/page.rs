@@ -249,8 +249,9 @@ impl Drop for Page<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::engine::{memories, reopen, vectors};
+    use crate::db::engine::{memories, reopen};
     use crate::db::memories::NewMemory;
+    use crate::db::vectors::VectorStore;
     use rusty_multimodal_db_engine::fulltext::Query;
     use std::path::PathBuf;
 
@@ -266,16 +267,16 @@ mod tests {
     /// A chunk stored before the page, then a page that replaces it and
     /// adds a memory.
     fn write_a_page(tables: &mut EngineTables) {
-        vectors::put(tables, "a", 0, &[1]).unwrap();
+        VectorStore::put(tables, "a", 0, &[1]).unwrap();
         tables.begin_page().unwrap();
-        vectors::put(tables, "a", 0, &[2]).unwrap();
+        VectorStore::put(tables, "a", 0, &[2]).unwrap();
         memories::insert(tables, &NewMemory::new("m", "quokka", NOW)).unwrap();
     }
 
     fn landed(tables: &EngineTables) -> (Option<Vec<u8>>, bool, usize) {
         let core = &tables.core;
         (
-            vectors::any_embedding(tables).unwrap(),
+            VectorStore::any_embedding(tables).unwrap(),
             memories::row(core, "m").is_some(),
             core.search.search(&Query::any_of(["quokka"])).len(),
         )
@@ -305,7 +306,7 @@ mod tests {
             tables.abandon_page().unwrap();
             assert_eq!(landed(&tables), (Some(vec![1]), false, 0));
             // The tables take writes again.
-            vectors::put(&mut tables, "b", 0, &[3]).unwrap();
+            VectorStore::put(&mut tables, "b", 0, &[3]).unwrap();
         }
         let tables = reopen(&dir);
         assert_eq!(landed(&tables), (Some(vec![1]), false, 0));
@@ -348,24 +349,24 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         let tables = EngineLock::new(EngineTables::open_temporary().unwrap());
         let page = Page::begin(&tables).unwrap();
-        vectors::put(&mut tables.lock(), "a", 0, &[1]).unwrap();
+        VectorStore::put(&mut *tables.lock(), "a", 0, &[1]).unwrap();
         let wrote = AtomicBool::new(false);
         std::thread::scope(|scope| {
             let other = scope.spawn(|| {
                 // Waits at the lock until the page is finished, then sees
                 // both of its writes.
-                let seen = vectors::count(&tables.lock()).unwrap();
-                vectors::put(&mut tables.lock(), "x", 0, &[1]).unwrap();
+                let seen = VectorStore::count(&*tables.lock()).unwrap();
+                VectorStore::put(&mut *tables.lock(), "x", 0, &[1]).unwrap();
                 wrote.store(true, Ordering::SeqCst);
                 seen
             });
             std::thread::sleep(std::time::Duration::from_millis(100));
             assert!(!wrote.load(Ordering::SeqCst), "the other thread waited");
-            vectors::put(&mut tables.lock(), "b", 0, &[1]).unwrap();
+            VectorStore::put(&mut *tables.lock(), "b", 0, &[1]).unwrap();
             page.finish().unwrap();
             assert_eq!(other.join().unwrap(), 2, "it saw the page whole");
         });
-        assert_eq!(vectors::count(&tables.lock()).unwrap(), 3);
+        assert_eq!(VectorStore::count(&*tables.lock()).unwrap(), 3);
     }
 
     #[test]
@@ -373,9 +374,9 @@ mod tests {
         let tables = EngineLock::new(EngineTables::open_temporary().unwrap());
         {
             let _page = Page::begin(&tables).unwrap();
-            vectors::put(&mut tables.lock(), "y", 0, &[1]).unwrap();
+            VectorStore::put(&mut *tables.lock(), "y", 0, &[1]).unwrap();
         }
-        assert_eq!(vectors::count(&tables.lock()).unwrap(), 0);
+        assert_eq!(VectorStore::count(&*tables.lock()).unwrap(), 0);
         assert!(
             tables.lock().begin_page().is_ok(),
             "the page is closed and the tables take a new one"
