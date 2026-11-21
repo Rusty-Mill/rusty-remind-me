@@ -41,7 +41,7 @@ fn scratch(name: &str) -> std::path::PathBuf {
 fn transcript_line(text: &str, thinking: &str, tool_input: &str) -> String {
     serde_json::json!({
         "type": "assistant",
-        "uuid": "11111111-2222-3333-4444-555555555555",
+        "uuid": format!("u-{text}"),
         "parentUuid": "00000000-0000-0000-0000-000000000000",
         "sessionId": "sess_abc",
         "timestamp": "2026-08-10T12:00:00Z",
@@ -486,11 +486,12 @@ fn a_malformed_line_does_not_shift_the_spans_after_it() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A session captured twice keeps one archive: the latest transcript, with
-/// the first copy's blob unlinked, and the dialog pointing at the whole file.
+/// A session captured twice keeps one archive: the grown transcript, which
+/// extends the first byte for byte, with the first copy's blob unlinked.
+/// Each dialog row reads back exactly the lines it was made from.
 #[test]
 fn a_recaptured_session_keeps_only_its_latest_transcript() {
-    use remind_me_core::transcript::{capture_transcript, TranscriptRequest};
+    use remind_me_core::transcript::capture_transcript;
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_limits();
 
@@ -498,37 +499,230 @@ fn a_recaptured_session_keeps_only_its_latest_transcript() {
     crate::test_env::set_var(ARCHIVE_DIR_ENV, dir.join("archive"));
     let db = open();
     let store = db.store();
-    let request = TranscriptRequest {
-        session_id: "sess_abc",
-        cwd: None,
-        reason: Some("stop"),
-        context: None,
-    };
 
     let first = transcript_line("first answer", "thinking one", "/one");
-    let made = capture_transcript(&store, &first, &request).unwrap();
+    let made = capture_transcript(&store, &first, &session_request()).unwrap();
     let import_id = archive::session_import_id("sess_abc");
     let first_blob = archive_path(&store, &import_id);
 
-    let grown = format!(
-        "{first}\n{}",
-        transcript_line("second", "thinking two", "/two")
-    );
-    capture_transcript(&store, &grown, &request).unwrap();
+    let second = transcript_line("second", "thinking two", "/two");
+    let grown = format!("{first}\n{second}");
+    capture_transcript(&store, &grown, &session_request()).unwrap();
 
     assert_eq!(archive_rows(&store), 1, "one archive per session");
     assert!(
         !std::path::Path::new(&first_blob).exists(),
         "old copy unlinked"
     );
-    let source = archive::source_for(&store, &made.dialog_id, false)
-        .unwrap()
-        .expect("the dialog has a source");
-    assert_eq!(source.content, grown);
+    assert_eq!(archived(&store, &import_id), grown);
+    assert_eq!(source(&store, &made.dialog_id), first);
+    let continuation = continuation_ids(&store, "sess_abc");
+    let later = source(&store, &continuation[0]);
+    assert_eq!(later, second);
     assert!(
-        source.content.contains("thinking two"),
+        later.contains("thinking two"),
         "what the dialog drops is kept"
     );
+
+    crate::test_env::remove_var(ARCHIVE_DIR_ENV);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn session_request() -> remind_me_core::transcript::TranscriptRequest<'static> {
+    remind_me_core::transcript::TranscriptRequest {
+        session_id: "sess_abc",
+        cwd: None,
+        reason: Some("stop"),
+        context: None,
+    }
+}
+
+/// `n` numbered transcript lines from `from`, each its own message.
+fn lines(range: std::ops::RangeInclusive<usize>) -> Vec<String> {
+    range
+        .map(|n| transcript_line(&format!("turn {n}"), &format!("thought {n}"), "/x"))
+        .collect()
+}
+
+/// A line with its message id removed, so placement falls back to text.
+fn without_id(line: &str) -> String {
+    let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+    value.as_object_mut().unwrap().remove("uuid");
+    value.to_string()
+}
+
+/// The raw source of `memory_id`, which must have one.
+fn source(store: &Store<'_>, memory_id: &str) -> String {
+    archive::source_for(store, memory_id, true)
+        .unwrap()
+        .unwrap_or_else(|| panic!("{memory_id} has a source"))
+        .content
+}
+
+fn archived(store: &Store<'_>, import_id: &str) -> String {
+    String::from_utf8(archive::archived_bytes(store, import_id).unwrap().unwrap()).unwrap()
+}
+
+/// The session's continuation rows, in sequence order.
+fn continuation_ids(store: &Store<'_>, session_id: &str) -> Vec<String> {
+    let dialog = remind_me_core::episodes::session_memories(store, session_id)
+        .unwrap()
+        .into_iter()
+        .find(|m| m.metadata["type"] == "dialog")
+        .unwrap();
+    let capture =
+        remind_me_core::capture::get_capture(store, dialog.capture_id.as_deref().unwrap())
+            .unwrap()
+            .unwrap();
+    capture
+        .continuations()
+        .iter()
+        .map(|m| m.id.clone())
+        .collect()
+}
+
+/// The whole session, then only a later tail (sent over the size limit),
+/// then that tail again. The tail does not extend the archived transcript,
+/// so it is kept on its own and the session's copy is left whole; the retry
+/// adds and replaces nothing. Every row reads back its own lines.
+#[test]
+fn a_tail_never_replaces_the_whole_session_and_a_retry_changes_nothing() {
+    use remind_me_core::transcript::capture_transcript;
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_limits();
+
+    let dir = scratch("session-tail");
+    crate::test_env::set_var(ARCHIVE_DIR_ENV, dir.join("archive"));
+    let db = open();
+    let store = db.store();
+    let all = lines(1..=6);
+    let session = archive::session_import_id("sess_abc");
+
+    let full = all[..4].join("\n");
+    let made = capture_transcript(&store, &full, &session_request()).unwrap();
+    let tail = all[2..].join("\n");
+    capture_transcript(&store, &tail, &session_request()).unwrap();
+
+    let check = |label: &str| {
+        assert_eq!(
+            archived(&store, &session),
+            full,
+            "{label}: session copy whole"
+        );
+        assert_eq!(source(&store, &made.dialog_id), full, "{label}");
+        let continuation = continuation_ids(&store, "sess_abc");
+        assert_eq!(continuation.len(), 1, "{label}");
+        assert_eq!(
+            source(&store, &continuation[0]),
+            all[4..].join("\n"),
+            "{label}"
+        );
+        assert_eq!(archived(&store, &format!("{session}#1")), tail, "{label}");
+        assert_eq!(archive_rows(&store), 2, "{label}");
+    };
+    check("after the tail");
+
+    capture_transcript(&store, &tail, &session_request()).unwrap();
+    check("after the retry");
+
+    crate::test_env::remove_var(ARCHIVE_DIR_ENV);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An older, shorter copy is held: nothing is written, and the session's
+/// archive keeps the longer transcript.
+#[test]
+fn a_held_copy_never_replaces_the_session_archive() {
+    use remind_me_core::transcript::capture_transcript;
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_limits();
+
+    let dir = scratch("session-held");
+    crate::test_env::set_var(ARCHIVE_DIR_ENV, dir.join("archive"));
+    let db = open();
+    let store = db.store();
+    let all = lines(1..=4);
+    let full = all.join("\n");
+    let made = capture_transcript(&store, &full, &session_request()).unwrap();
+
+    capture_transcript(&store, &all[..2].join("\n"), &session_request()).unwrap();
+
+    assert_eq!(
+        archived(&store, &archive::session_import_id("sess_abc")),
+        full
+    );
+    assert_eq!(source(&store, &made.dialog_id), full);
+    assert!(continuation_ids(&store, "sess_abc").is_empty());
+    assert_eq!(archive_rows(&store), 1);
+
+    crate::test_env::remove_var(ARCHIVE_DIR_ENV);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A transcript that cannot be placed is kept whole in its own row, with
+/// its own archive; the session's archive is left as it was.
+#[test]
+fn an_unplaced_copy_never_replaces_the_session_archive() {
+    use remind_me_core::transcript::capture_transcript;
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_limits();
+
+    let dir = scratch("session-unplaced");
+    crate::test_env::set_var(ARCHIVE_DIR_ENV, dir.join("archive"));
+    let db = open();
+    let store = db.store();
+    let bare = |texts: &[&str]| {
+        texts
+            .iter()
+            .map(|t| without_id(&transcript_line(t, "t", "/x")))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let first = bare(&["a1", "b1"]);
+    let made = capture_transcript(&store, &first, &session_request()).unwrap();
+    let other = bare(&["x1", "y1"]);
+    capture_transcript(&store, &other, &session_request()).unwrap();
+
+    let session = archive::session_import_id("sess_abc");
+    assert_eq!(archived(&store, &session), first);
+    assert_eq!(source(&store, &made.dialog_id), first);
+    let continuation = continuation_ids(&store, "sess_abc");
+    assert_eq!(source(&store, &continuation[0]), other);
+    assert_eq!(archived(&store, &format!("{session}#1")), other);
+
+    crate::test_env::remove_var(ARCHIVE_DIR_ENV);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An archive that cannot be written fails no capture: every row is still
+/// recorded, and reads back no source rather than an error.
+#[test]
+fn an_unavailable_archive_fails_no_capture() {
+    use remind_me_core::transcript::{capture_transcript, captured_messages};
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_limits();
+
+    let dir = scratch("session-unavailable");
+    let blocker = dir.join("not-a-dir");
+    std::fs::write(&blocker, b"a file where the archive should go").unwrap();
+    crate::test_env::set_var(ARCHIVE_DIR_ENV, blocker.join("archive"));
+    let db = open();
+    let store = db.store();
+    let all = lines(1..=4);
+
+    let made = capture_transcript(&store, &all[..2].join("\n"), &session_request()).unwrap();
+    capture_transcript(&store, &all.join("\n"), &session_request()).unwrap();
+
+    assert_eq!(captured_messages(&store, "sess_abc").unwrap(), Some(4));
+    let continuation = continuation_ids(&store, "sess_abc");
+    assert_eq!(continuation.len(), 1);
+    for id in [&made.dialog_id, &continuation[0]] {
+        assert!(
+            archive::source_for(&store, id, true).unwrap().is_none(),
+            "{id}"
+        );
+    }
+    assert_eq!(archive_rows(&store), 0);
 
     crate::test_env::remove_var(ARCHIVE_DIR_ENV);
     let _ = std::fs::remove_dir_all(&dir);

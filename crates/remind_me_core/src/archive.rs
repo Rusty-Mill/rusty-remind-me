@@ -170,28 +170,26 @@ pub fn session_import_id(session_id: &str) -> String {
     format!("session:{session_id}")
 }
 
-/// Retain a session transcript as the source of `memory_id`, if retention is
-/// on, replacing the session's previous copy.
+/// Retain `raw` as the one copy of `import_id`, if retention is on,
+/// replacing its previous copy.
 ///
-/// A session is captured again on every hook firing, each time with the whole
-/// transcript so far, so one archive per session is kept rather than one per
-/// firing: the new blob is written, the row and the span are replaced, and the
-/// old blob is unlinked unless another archive still points at it.
-pub fn store_session(
+/// A session is captured again on every hook firing, so one archive per
+/// import is kept rather than one per firing: the new blob is written, the
+/// row is replaced, and the old blob is unlinked unless another archive
+/// still points at it. Spans are the caller's: it replaces a copy only with
+/// one its recorded spans still read correctly.
+pub fn replace(
     store: &Store<'_>,
-    session_id: &str,
+    import_id: &str,
     raw: &[u8],
-    memory_id: &str,
 ) -> Result<Option<PathBuf>, ArchiveError> {
     if !is_enabled() {
         return Ok(None);
     }
-    let import_id = session_import_id(session_id);
     let archives = Archives::new(store);
-    let previous = archives.blob_of(&import_id)?;
+    let previous = archives.blob_of(import_id)?;
     let hash = sha256::digest(raw)[..16].to_string();
-    let path = self::store(store, &import_id, "transcript.jsonl", &hash, raw)?;
-    archives.record_span(memory_id, &import_id, 0, raw.len() as i64)?;
+    let path = self::store(store, import_id, "transcript.jsonl", &hash, raw)?;
 
     if let Some((old_path, old_hash)) = previous {
         if old_hash != hash && archives.count_with_hash(&old_hash)? == 0 {
@@ -203,6 +201,19 @@ pub fn store_session(
         }
     }
     Ok(path)
+}
+
+/// The bytes archived for `import_id`, or `None` when it has no archive or
+/// its blob is gone.
+pub fn archived_bytes(store: &Store<'_>, import_id: &str) -> Result<Option<Vec<u8>>, ArchiveError> {
+    let Some((path, _)) = Archives::new(store).blob_of(import_id)? else {
+        return Ok(None);
+    };
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Record which bytes of an archived import produced `memory_id`.

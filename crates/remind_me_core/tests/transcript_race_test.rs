@@ -135,12 +135,13 @@ fn assert_one_consistent_pair(store: &Store<'_>, session: &str, messages: usize)
     let last = format!("turn {messages}");
     // The newest turn sits in the first dialog row or, once the session grew
     // past it, in a continuation row: dialog rows are never rewritten.
-    let recorded = memories
+    let holder = memories
         .iter()
         .filter(|m| m.category == "dialog")
-        .any(|m| m.content.contains(&last));
-    assert!(recorded, "{}", dialog.content);
-    let source = archive::source_for(store, &dialog.id, true)
+        .find(|m| m.content.contains(&last));
+    let holder = holder.unwrap_or_else(|| panic!("{}", dialog.content));
+    // Each row's source is the lines its own messages came from.
+    let source = archive::source_for(store, &holder.id, true)
         .unwrap()
         .unwrap();
     assert!(source.content.contains(&last));

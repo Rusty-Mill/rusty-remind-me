@@ -19,6 +19,7 @@ use crate::importer::{extract_messages_with_tools, ChatMessage, ToolUseSummary};
 use crate::models::{AutoCaptureInput, WriteContext};
 use chrono::Utc;
 use std::collections::{BTreeMap, HashSet};
+use std::ops::Range;
 use std::path::Path;
 
 /// Title length, matching the brief: the first user message, truncated.
@@ -256,12 +257,32 @@ fn render_message(message: &ChatMessage, message_tools: &MessageTools) -> String
 
 /// The messages of a JSONL transcript, in order. A malformed line is skipped.
 fn messages_of(raw: &str) -> Vec<ChatMessage> {
-    raw.lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
+    message_lines(raw).map(|(_, m)| m).collect()
+}
+
+/// Each message of a JSONL transcript with the byte range of the line it
+/// came from, line ending excluded. The one parse [`messages_of`] uses, so a
+/// message's source span cannot drift from the message.
+fn message_lines(raw: &str) -> impl Iterator<Item = (Range<usize>, ChatMessage)> + '_ {
+    let mut at = 0;
+    raw.split_inclusive('\n')
+        .map(move |line| {
+            let start = at;
+            at += line.len();
+            let body = line.trim_end_matches(['\n', '\r']);
+            (start..start + body.len(), body)
+        })
+        .filter_map(|(span, body)| {
+            let value = serde_json::from_str::<serde_json::Value>(body.trim()).ok()?;
+            Some((span, value))
+        })
         // Hook-injected context, not something the user or model said.
-        .filter(|v| v.get("isMeta").and_then(|m| m.as_bool()) != Some(true))
-        .flat_map(|v| extract_messages_with_tools(&v))
-        .collect()
+        .filter(|(_, v)| v.get("isMeta").and_then(|m| m.as_bool()) != Some(true))
+        .flat_map(|(span, v)| {
+            extract_messages_with_tools(&v)
+                .into_iter()
+                .map(move |m| (span.clone(), m))
+        })
 }
 
 use crate::transcript_placement::{
@@ -547,21 +568,94 @@ fn write_capture(
     existing: Option<crate::models::Memory>,
     request: &TranscriptRequest<'_>,
 ) -> Result<TranscriptOutcome> {
-    let outcome = match existing {
+    let (outcome, keep) = match existing {
         Some(existing) => recapture(store, &existing, raw, parsed, request.reason)?,
         None => first_capture(store, session_id, raw, parsed, request)?,
     };
     // The raw transcript decorates the capture; failing to keep it must not
-    // fail the capture, so it is reported and the capture stands. It is
-    // scrubbed like the dialog, so the source never returns what the
-    // dialog redacted.
-    let kept = crate::boundary::scrub_jsonl(raw);
-    if let Err(e) =
-        crate::archive::store_session(store, session_id, kept.as_bytes(), &outcome.dialog_id)
-    {
+    // fail the capture, so it is reported and the capture stands.
+    if let Err(e) = keep_source(store, session_id, raw, &keep) {
         eprintln!("rusty-remind-me: transcript of session {session_id} not archived: {e}");
     }
     Ok(outcome)
+}
+
+/// Where the row a capture wrote takes its raw source from.
+enum Keep {
+    /// Nothing was written: a copy the record already holds.
+    Nothing,
+    /// A first capture: the transcript becomes the session's archive.
+    First(Source),
+    /// A placed recapture: it replaces the session's archive only when it
+    /// extends the archived copy byte for byte, so every recorded row's span
+    /// still reads its own bytes; otherwise it is kept on its own.
+    Grown(Source),
+    /// An unplaced recapture: kept on its own, the session's archive left
+    /// as it is.
+    Own(Source),
+}
+
+/// One written row and the transcript messages it was made from.
+struct Source {
+    row: String,
+    /// The row's continuation sequence; `0` for the first row.
+    sequence: usize,
+    messages: Range<usize>,
+}
+
+/// Archive what `keep` asks for and record the written row's exact span:
+/// the bytes of the lines its messages came from. The transcript is
+/// scrubbed like the dialog, so the source never returns what the dialog
+/// redacted.
+fn keep_source(
+    store: &Store<'_>,
+    session_id: &str,
+    raw: &str,
+    keep: &Keep,
+) -> std::result::Result<(), crate::archive::ArchiveError> {
+    use crate::archive;
+    if !archive::is_enabled() {
+        return Ok(());
+    }
+    let kept = crate::boundary::scrub_jsonl(raw);
+    let session = archive::session_import_id(session_id);
+    let (source, import_id) = match keep {
+        Keep::Nothing => return Ok(()),
+        Keep::First(source) => (source, session),
+        Keep::Grown(source) if extends(store, &session, &kept)? => (source, session),
+        Keep::Grown(source) | Keep::Own(source) => {
+            (source, format!("{session}#{}", source.sequence))
+        }
+    };
+    archive::replace(store, &import_id, kept.as_bytes())?;
+    let spans: Vec<Range<usize>> = message_lines(&kept).map(|(span, _)| span).collect();
+    let Some(span) = cover(&spans, &source.messages) else {
+        return Err(archive::ArchiveError::Io(std::io::Error::other(format!(
+            "messages {:?} of row {} are not in its transcript",
+            source.messages, source.row
+        ))));
+    };
+    archive::record_span(store, &source.row, &import_id, span.start, span.end)?;
+    Ok(())
+}
+
+/// Whether `kept` starts with the bytes archived under `import_id`. An
+/// archive that cannot be read is not extended: its rows' spans would point
+/// at bytes nobody checked.
+fn extends(
+    store: &Store<'_>,
+    import_id: &str,
+    kept: &str,
+) -> std::result::Result<bool, crate::archive::ArchiveError> {
+    Ok(crate::archive::archived_bytes(store, import_id)?
+        .is_some_and(|old| kept.as_bytes().starts_with(&old)))
+}
+
+/// The bytes from the first to the last of `messages`' lines.
+fn cover(spans: &[Range<usize>], messages: &Range<usize>) -> Option<Range<usize>> {
+    let first = spans.get(messages.start)?;
+    let last = spans.get(messages.end.checked_sub(1)?)?;
+    Some(first.start..last.end)
 }
 
 /// Where the session ran: the caller's own context when given, else what
@@ -607,7 +701,7 @@ fn first_capture(
     raw: &str,
     parsed: &TranscriptSummary,
     request: &TranscriptRequest<'_>,
-) -> Result<TranscriptOutcome> {
+) -> Result<(TranscriptOutcome, Keep)> {
     let context = session_context(session_id, parsed, request);
 
     let mut tags = vec!["transcript".to_string()];
@@ -636,12 +730,18 @@ fn first_capture(
         authoritative: request.context.is_some(),
     };
     let made = auto_capture_stamped(store, &input, &stamp)?;
-    Ok(TranscriptOutcome {
+    let keep = Keep::First(Source {
+        row: made.dialog_id.clone(),
+        sequence: 0,
+        messages: 0..parsed.messages,
+    });
+    let outcome = TranscriptOutcome {
         capture_id: made.capture_id,
         dialog_id: made.dialog_id,
         summary_id: made.summary_id,
         messages: parsed.messages,
-    })
+    };
+    Ok((outcome, keep))
 }
 
 /// Whether `session_id` already has a capture.
@@ -680,8 +780,8 @@ fn recapture(
     raw: &str,
     parsed: &TranscriptSummary,
     reason: Option<&str>,
-) -> Result<TranscriptOutcome> {
-    let (outcome, written) =
+) -> Result<(TranscriptOutcome, Keep)> {
+    let (outcome, written, keep) =
         store.transaction(|page| recapture_in(page, dialog, raw, parsed, reason))?;
     // Embedded after the commit, best-effort as an update is: a model call
     // never runs inside the write, and its failure undoes nothing.
@@ -690,7 +790,7 @@ fn recapture(
             let _ = crate::vectors::embed_and_store(store, &*embedder, id, content);
         }
     }
-    Ok(outcome)
+    Ok((outcome, keep))
 }
 
 /// Ids and stored text of the rows a recapture wrote, for embedding.
@@ -702,7 +802,7 @@ fn recapture_in(
     raw: &str,
     parsed: &TranscriptSummary,
     reason: Option<&str>,
-) -> Result<(TranscriptOutcome, Written)> {
+) -> Result<(TranscriptOutcome, Written, Keep)> {
     let capture_id = dialog.capture_id.clone().ok_or(StoreError::NotFound)?;
     let rows = dialog_rows(store, dialog)?;
     let held: usize = rows.iter().map(held_messages).sum();
@@ -733,7 +833,7 @@ fn recapture_in(
         // describing the longer record rather than this copy.
         Placement::Held => {
             let outcome = held_outcome(store, dialog, &capture_id, held)?;
-            return Ok((outcome, written));
+            return Ok((outcome, written, Keep::Nothing));
         }
         Placement::New { indexes, .. } => indexes.clone(),
         // Not shown where it fits: kept whole and flagged, never skipped.
@@ -745,14 +845,27 @@ fn recapture_in(
         .map(|m| render_message(m, &tools))
         .collect::<Vec<_>>()
         .join(MESSAGE_SEPARATOR);
+    // The first row is 0, so the next continuation is the row count.
+    let sequence = rows.len();
     let continuation = Continuation {
+        sequence,
         from: held,
         count: new.len(),
         ids: new.iter().map(|m| m.uuid.clone()).collect(),
         placement: placement.label(),
         reason,
     };
-    written.push(append_continuation(store, dialog, &text, &continuation)?);
+    let (row, stored) = append_continuation(store, dialog, &text, &continuation)?;
+    let source = Source {
+        row: row.clone(),
+        sequence,
+        messages: indexes.first().map_or(0, |&i| i)..indexes.last().map_or(0, |&i| i + 1),
+    };
+    let keep = match placement {
+        Placement::New { .. } => Keep::Grown(source),
+        _ => Keep::Own(source),
+    };
+    written.push((row, stored));
     let total = held + new.len();
 
     let capture = get_capture(store, &capture_id)?.ok_or(StoreError::NotFound)?;
@@ -776,7 +889,7 @@ fn recapture_in(
         summary_id: summary.id,
         messages: total,
     };
-    Ok((outcome, written))
+    Ok((outcome, written, keep))
 }
 
 /// What a recapture of a copy the record already holds reports: the capture
@@ -801,6 +914,10 @@ pub use crate::models::CONTINUATION_TYPE;
 
 /// Where a continuation row sits in its session's record.
 struct Continuation<'a> {
+    /// Its place among the session's dialog rows: the first row is 0, each
+    /// continuation one more than the last. Rows are read back in this
+    /// order, never by timestamp.
+    sequence: usize,
     /// Messages recorded before it.
     from: usize,
     /// Messages it holds.
@@ -832,6 +949,7 @@ fn append_continuation(
     let mut metadata = serde_json::json!({
         "type": CONTINUATION_TYPE,
         "continues": first.id,
+        crate::models::SEQUENCE_KEY: at.sequence,
         "from_message": at.from,
         "messages": at.count,
         "placement": at.placement,
@@ -855,6 +973,8 @@ fn append_continuation(
         git_branch: first.git_branch.clone(),
         git_sha: first.git_sha.clone(),
         cwd: first.cwd.clone(),
+        // A sensitive record stays sensitive in every row of it.
+        sensitive: first.sensitive,
         written_by: "hook".into(),
         capture_method: "auto".into(),
         ..NewMemory::new(id.clone(), content.clone(), &now)

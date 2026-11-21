@@ -497,7 +497,7 @@ fn continuations(store: &Store<'_>) -> Vec<remind_me_core::models::Memory> {
         .into_iter()
         .filter(|m| m.metadata["type"] == remind_me_core::transcript::CONTINUATION_TYPE)
         .collect();
-    rows.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    rows.sort_by_key(|m| m.metadata[remind_me_core::models::SEQUENCE_KEY].as_u64());
     rows
 }
 
@@ -728,4 +728,30 @@ fn a_new_turn_that_starts_an_earlier_one_is_kept_not_held() {
     assert_eq!(rows[0].metadata["placement"], "unplaced_no_overlap");
     assert!(rows[0].content.ends_with("do it"), "{}", rows[0].content);
     assert_eq!(captured_messages(&store, "s-frozen").unwrap(), Some(4));
+}
+
+#[test]
+fn a_recaptured_sensitive_dialog_keeps_its_new_rows_sensitive() {
+    use remind_me_core::db::memories::MemoryEdit;
+    use remind_me_core::transcript::capture_transcript;
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let made = capture_transcript(&store, &turns(1..=2), &frozen_request("stop")).unwrap();
+    // Marked sensitive below the guarded paths, as a capture of a sensitive
+    // session would be.
+    Memories::new(&store)
+        .apply_edit(
+            &made.dialog_id,
+            &MemoryEdit {
+                sensitive: Some(true),
+                ..MemoryEdit::at("2026-11-21T10:00:01Z")
+            },
+        )
+        .unwrap();
+
+    capture_transcript(&store, &turns(1..=4), &frozen_request("stop")).unwrap();
+
+    let rows = continuations(&store);
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].sensitive, "the new row stays sensitive");
 }
