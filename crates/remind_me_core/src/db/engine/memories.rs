@@ -800,6 +800,9 @@ pub(crate) fn restore_tracked(
     updated_at: &str,
 ) -> Result<()> {
     update(tables, id, Origin::Local, |row| {
+        // A revert never rewrites a dialog: checked in the committing write
+        // (#1616).
+        crate::dialog::refuse_category(&row.id, &row.category)?;
         row.content.clone_from(&values.content);
         row.category.clone_from(&values.category);
         row.tags.clone_from(&values.tags);

@@ -264,12 +264,43 @@ fn messages_of(raw: &str) -> Vec<ChatMessage> {
         .collect()
 }
 
-/// The dialog of `raw`'s messages after the first `skip`, rendered as a
-/// first capture renders a whole session.
-fn dialog_after(raw: &str, skip: usize) -> String {
-    let messages = messages_of(raw);
-    let rest = messages.get(skip..).unwrap_or_default();
-    render_dialog(rest, &MessageTools::from_env())
+/// How many consecutive messages must line up with the end of the record
+/// before a transcript counts as overlapping it there: one short turn such
+/// as "yes" recurs too often to place a transcript on its own.
+const OVERLAP_RUN: usize = 3;
+
+/// Separator between rendered messages, as [`render_dialog`] joins them.
+const MESSAGE_SEPARATOR: &str = "\n\n";
+
+/// Each message of `messages` rendered and scrubbed as a stored dialog
+/// holds it, so it can be compared with the record.
+fn stored_blocks(messages: &[ChatMessage], message_tools: &MessageTools) -> Vec<String> {
+    messages
+        .iter()
+        .map(|m| {
+            let (mut tags, mut metadata) = (Vec::new(), serde_json::json!({}));
+            crate::boundary::scrub(&render_message(m, message_tools), &mut tags, &mut metadata)
+        })
+        .collect()
+}
+
+/// Where a transcript's messages stop overlapping what is recorded: the
+/// index of the first message the record does not hold yet. The latest
+/// position `j` wins whose run of up to [`OVERLAP_RUN`] messages ending at
+/// `j` is exactly how `recorded` ends. `None` when the transcript does not
+/// overlap the record anywhere.
+///
+/// Matching by content, not position: a transcript sent over the size limit
+/// is its tail, so its first message can be any turn of the session.
+fn first_unrecorded(recorded: &str, blocks: &[String]) -> Option<usize> {
+    let recorded = recorded.trim_end();
+    (0..blocks.len()).rev().find_map(|j| {
+        let run = &blocks[j.saturating_sub(OVERLAP_RUN - 1)..=j];
+        let tail = run.join(MESSAGE_SEPARATOR);
+        let tail = tail.trim();
+        let placed = !tail.is_empty() && recorded.ends_with(tail);
+        placed.then_some(j + 1)
+    })
 }
 
 fn render_dialog(messages: &[ChatMessage], message_tools: &MessageTools) -> String {
@@ -277,7 +308,7 @@ fn render_dialog(messages: &[ChatMessage], message_tools: &MessageTools) -> Stri
         .iter()
         .map(|m| render_message(m, message_tools))
         .collect::<Vec<_>>()
-        .join("\n\n");
+        .join(MESSAGE_SEPARATOR);
     let total = dialog.chars().count();
     if total <= MAX_DIALOG_CHARS {
         return dialog;
@@ -462,18 +493,30 @@ fn checked<'r>(raw: &str, request: &TranscriptRequest<'r>) -> Result<(&'r str, T
     Ok((session_id, parsed))
 }
 
-/// How many messages the capture `dialog` belongs to has seen: the larger of
-/// the dialog's count and its summary's, since a recapture refreshes only the
-/// summary.
-fn held_by(store: &Store<'_>, dialog: &crate::models::Memory) -> Result<usize> {
-    let summary = match dialog.capture_id.as_deref() {
-        Some(id) => get_capture(store, id)?.and_then(|c| c.summary),
-        None => None,
+/// The live rows holding the dialog of the capture `first` opens: `first`,
+/// then its continuation rows in the order they were written.
+fn dialog_rows(
+    store: &Store<'_>,
+    first: &crate::models::Memory,
+) -> Result<Vec<crate::models::Memory>> {
+    let mut continuations: Vec<crate::models::Memory> = match first.capture_id.as_deref() {
+        Some(id) => get_capture(store, id)?.map(|c| c.other).unwrap_or_default(),
+        None => Vec::new(),
     };
-    Ok(summary
-        .as_ref()
-        .map_or(0, held_messages)
-        .max(held_messages(dialog)))
+    continuations.retain(|m| {
+        m.category == crate::models::DIALOG_CATEGORY
+            && m.metadata.get("type").and_then(|t| t.as_str()) == Some(CONTINUATION_TYPE)
+    });
+    continuations.sort_by(|a, b| (&a.created_at, &a.id).cmp(&(&b.created_at, &b.id)));
+    let mut rows = vec![first.clone()];
+    rows.extend(continuations);
+    Ok(rows)
+}
+
+/// How many messages the dialog rows of `first`'s capture hold: each row
+/// records its own count.
+fn held_by(store: &Store<'_>, first: &crate::models::Memory) -> Result<usize> {
+    Ok(dialog_rows(store, first)?.iter().map(held_messages).sum())
 }
 
 /// How many messages a captured memory's metadata records; `0` for one
@@ -640,25 +683,44 @@ fn recapture_in(
     reason: Option<&str>,
 ) -> Result<(TranscriptOutcome, Written)> {
     let capture_id = dialog.capture_id.clone().ok_or(StoreError::NotFound)?;
-    let held = held_by(store, dialog)?;
+    let rows = dialog_rows(store, dialog)?;
+    let held: usize = rows.iter().map(held_messages).sum();
+    let recorded = rows
+        .iter()
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join(MESSAGE_SEPARATOR);
+
+    let tools = MessageTools::from_env();
+    let messages = messages_of(raw);
+    let found = first_unrecorded(&recorded, &stored_blocks(&messages, &tools));
+    // No overlap at all: keep every message rather than risk losing turns,
+    // and say so on the row.
+    let start = found.unwrap_or(0);
+    let new = messages.get(start..).unwrap_or_default();
     let mut written = Written::new();
-    if parsed.messages > held {
-        let text = dialog_after(raw, held);
-        written.push(append_continuation(
-            store,
-            dialog,
-            &text,
-            held,
-            parsed.messages,
+    if !new.is_empty() {
+        let text = new
+            .iter()
+            .map(|m| render_message(m, &tools))
+            .collect::<Vec<_>>()
+            .join(MESSAGE_SEPARATOR);
+        let continuation = Continuation {
+            from: held,
+            count: new.len(),
+            overlapped: found.is_some(),
             reason,
-        )?);
+        };
+        written.push(append_continuation(store, dialog, &text, &continuation)?);
     }
+    let total = held + new.len();
+
     let capture = get_capture(store, &capture_id)?.ok_or(StoreError::NotFound)?;
     let summary = capture.summary.ok_or(StoreError::NotFound)?;
     let title = parsed.title();
     let pairs = [
         ("title", serde_json::json!(title)),
-        ("messages", serde_json::json!(parsed.messages)),
+        ("messages", serde_json::json!(total)),
         ("reason", serde_json::json!(reason)),
     ];
     let content = replace_text(
@@ -672,7 +734,7 @@ fn recapture_in(
         capture_id,
         dialog_id: dialog.id.clone(),
         summary_id: summary.id,
-        messages: parsed.messages,
+        messages: total,
     };
     Ok((outcome, written))
 }
@@ -681,17 +743,29 @@ fn recapture_in(
 /// after its first dialog row was written.
 pub const CONTINUATION_TYPE: &str = "dialog_continuation";
 
-/// Insert a dialog row holding messages `from..to` of `first`'s session,
-/// sharing its capture id, scrubbed as a first capture is. Returns its id and
-/// stored text. Its category is [`crate::models::DIALOG_CATEGORY`], so it is
-/// as read-only as the first row.
+/// Where a continuation row sits in its session's record.
+struct Continuation<'a> {
+    /// Messages recorded before it.
+    from: usize,
+    /// Messages it holds.
+    count: usize,
+    /// Whether the transcript overlapped the record; `false` means it was
+    /// kept whole because no recorded turn could be found in it.
+    overlapped: bool,
+    reason: Option<&'a str>,
+}
+
+/// Insert a dialog row holding the session's turns after the record so far,
+/// sharing `first`'s capture id, scrubbed as a first capture is. Not cut to
+/// [`MAX_DIALOG_CHARS`]: the record keeps every turn, and a transcript's size
+/// is already bounded where it arrives. Returns its id and stored text. Its
+/// category is [`crate::models::DIALOG_CATEGORY`], so it is as read-only as
+/// the first row.
 fn append_continuation(
     store: &Store<'_>,
     first: &crate::models::Memory,
     text: &str,
-    from: usize,
-    to: usize,
-    reason: Option<&str>,
+    at: &Continuation<'_>,
 ) -> Result<(String, String)> {
     let now = Utc::now().to_rfc3339();
     let id = format!("mem_{}", uuid::Uuid::new_v4().simple());
@@ -699,9 +773,10 @@ fn append_continuation(
     let mut metadata = serde_json::json!({
         "type": CONTINUATION_TYPE,
         "continues": first.id,
-        "from_message": from,
-        "messages": to,
-        "reason": reason,
+        "from_message": at.from,
+        "messages": at.count,
+        "overlapped": at.overlapped,
+        "reason": at.reason,
     });
     let content = crate::boundary::scrub(text, &mut tags, &mut metadata);
     let row = NewMemory {
@@ -1022,7 +1097,8 @@ mod tests {
             serde_json::json!(first.dialog_id)
         );
         assert_eq!(more.metadata["from_message"], serde_json::json!(3));
-        assert_eq!(more.metadata["messages"], serde_json::json!(4));
+        assert_eq!(more.metadata["messages"], serde_json::json!(1));
+        assert_eq!(more.metadata["overlapped"], serde_json::json!(true));
         assert!(
             more.content.contains("and one more thing"),
             "{}",
@@ -1180,7 +1256,9 @@ mod tests {
         let made = capture_transcript(&store, &transcript(""), &request("stop")).unwrap();
         capture_transcript(&store, &leaky, &request("stop")).unwrap();
         let again = titles(&store);
-        assert_eq!(again.len(), 2);
+        // The leaky transcript shares no turn with the record, so it is kept
+        // whole in a continuation row, which carries no title.
+        assert_eq!(again.len(), 3);
         assert!(again.iter().all(|t| clean(t)), "{again:?}");
         let summary = crate::db::queries::get_memory_by_id(&store, &made.summary_id)
             .unwrap()
@@ -1189,6 +1267,40 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("xxx"));
+    }
+
+    fn blocks(texts: &[&str]) -> Vec<String> {
+        texts.iter().map(|t| format!("**user:** {t}")).collect()
+    }
+
+    #[test]
+    fn first_unrecorded_places_a_transcript_by_content_not_position() {
+        let recorded = blocks(&["a", "b", "c", "d"]).join(MESSAGE_SEPARATOR);
+        // The whole session again, then grown.
+        assert_eq!(
+            first_unrecorded(&recorded, &blocks(&["a", "b", "c", "d"])),
+            Some(4)
+        );
+        assert_eq!(
+            first_unrecorded(&recorded, &blocks(&["a", "b", "c", "d", "e"])),
+            Some(4)
+        );
+        // A tail starting mid-session.
+        assert_eq!(
+            first_unrecorded(&recorded, &blocks(&["c", "d", "e", "f"])),
+            Some(2)
+        );
+        // No recorded turn in it.
+        assert_eq!(first_unrecorded(&recorded, &blocks(&["x", "y"])), None);
+    }
+
+    #[test]
+    fn a_repeated_short_turn_alone_does_not_place_a_transcript() {
+        // "yes" ends the record, but the run before it does not line up
+        // where the transcript has "yes" earlier, so the later match wins.
+        let recorded = blocks(&["q1", "yes", "q2", "yes"]).join(MESSAGE_SEPARATOR);
+        let sent = blocks(&["q1", "yes", "q2", "yes", "q3", "yes"]);
+        assert_eq!(first_unrecorded(&recorded, &sent), Some(4));
     }
 
     #[test]

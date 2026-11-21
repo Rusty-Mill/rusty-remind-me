@@ -175,16 +175,28 @@ pub fn revert(
     let stated = reason
         .map(str::to_string)
         .unwrap_or_else(|| format!("revert to revision {}", revision_id));
-    let captured = capture_revision(store, memory_id, &changes, Some(&stated))?;
-
-    if !captured {
-        // Nothing tracked differs, so the memory already holds this revision's
-        // values. Reporting that beats writing a no-op revision and an outbox
-        // row that says nothing changed.
+    // One page, restore first and revision last: revisions are written
+    // outside the page's undo log (9e99968), so a restore that refuses (a
+    // dialog row, checked inside that write, #1616) must leave none behind.
+    let restored = store.transaction(|page| -> Result<bool> {
+        let revisions = Revisions::new(page);
+        let Some(before) = revisions.current(memory_id)? else {
+            return Ok(false);
+        };
+        if changes.is_empty() || !changes.differs_from(&before) {
+            // Nothing tracked differs, so the memory already holds this
+            // revision's values. Reporting that beats writing a no-op
+            // revision and an outbox row that says nothing changed.
+            return Ok(false);
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        revisions.restore(memory_id, &target, &now)?;
+        revisions.insert(memory_id, &before, &now, Some(&stated))?;
+        Ok(true)
+    })?;
+    if !restored {
         return Ok(RevertOutcome::NoChange);
     }
-
-    revisions.restore(memory_id, &target, &chrono::Utc::now().to_rfc3339())?;
 
     // Content changed means the stored vectors describe text that is no longer
     // there. Best-effort, like every other embed in this crate: a missing

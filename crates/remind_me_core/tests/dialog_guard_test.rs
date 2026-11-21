@@ -469,3 +469,129 @@ fn recapturing_a_captured_session_leaves_the_dialog_row_unchanged() {
         &continuation.id,
     );
 }
+
+fn frozen_request(reason: &str) -> remind_me_core::transcript::TranscriptRequest<'_> {
+    remind_me_core::transcript::TranscriptRequest {
+        session_id: "s-frozen",
+        cwd: None,
+        reason: Some(reason),
+        context: None,
+    }
+}
+
+fn turns(range: std::ops::RangeInclusive<usize>) -> String {
+    range
+        .map(|i| {
+            session_line(
+                if i % 2 == 1 { "user" } else { "assistant" },
+                &format!("turn {i}"),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn continuations(store: &Store<'_>) -> Vec<remind_me_core::models::Memory> {
+    let mut rows: Vec<_> = remind_me_core::episodes::session_memories(store, "s-frozen")
+        .unwrap()
+        .into_iter()
+        .filter(|m| m.metadata["type"] == remind_me_core::transcript::CONTINUATION_TYPE)
+        .collect();
+    rows.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    rows
+}
+
+#[test]
+fn a_tail_sent_mid_session_records_only_the_turns_after_the_overlap() {
+    use remind_me_core::transcript::{capture_transcript, captured_messages};
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    capture_transcript(&store, &turns(1..=5), &frozen_request("stop")).unwrap();
+
+    // Over the size limit, a caller sends the tail: turns 3 to 7.
+    let made = capture_transcript(&store, &turns(3..=7), &frozen_request("stop")).unwrap();
+
+    let added = continuations(&store);
+    assert_eq!(added.len(), 1);
+    let text = &added[0].content;
+    assert!(text.contains("turn 6") && text.contains("turn 7"), "{text}");
+    assert!(
+        !text.contains("turn 3") && !text.contains("turn 5"),
+        "{text}"
+    );
+    assert_eq!(added[0].metadata["from_message"], json!(5));
+    assert_eq!(added[0].metadata["messages"], json!(2));
+    assert_eq!(added[0].metadata["overlapped"], json!(true));
+    // The count comes from the dialog rows: 5 + 2.
+    assert_eq!(made.messages, 7);
+    assert_eq!(captured_messages(&store, "s-frozen").unwrap(), Some(7));
+
+    // The same tail again adds nothing.
+    capture_transcript(&store, &turns(3..=7), &frozen_request("stop")).unwrap();
+    assert_eq!(continuations(&store).len(), 1);
+}
+
+#[test]
+fn the_recorded_count_ignores_what_the_summary_claims() {
+    use remind_me_core::transcript::{capture_transcript, captured_messages};
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let made = capture_transcript(&store, &turns(1..=3), &frozen_request("stop")).unwrap();
+    capture_transcript(&store, &turns(1..=4), &frozen_request("stop")).unwrap();
+    // A summary that overstates the count must not hide new turns.
+    let summary = queries::get_memory_by_id(&store, &made.summary_id)
+        .unwrap()
+        .unwrap();
+    let mut metadata = summary.metadata.clone();
+    metadata["messages"] = json!(99);
+    Memories::new(&store)
+        .set_tags_and_metadata(&made.summary_id, &summary.tags, &metadata)
+        .unwrap();
+
+    assert_eq!(captured_messages(&store, "s-frozen").unwrap(), Some(4));
+    capture_transcript(&store, &turns(1..=5), &frozen_request("stop")).unwrap();
+    assert!(continuations(&store)
+        .iter()
+        .any(|m| m.content.contains("turn 5")));
+}
+
+#[test]
+fn a_transcript_with_no_recorded_turn_is_kept_whole_and_flagged() {
+    use remind_me_core::transcript::capture_transcript;
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    capture_transcript(&store, &turns(1..=3), &frozen_request("stop")).unwrap();
+
+    capture_transcript(&store, &turns(10..=11), &frozen_request("stop")).unwrap();
+
+    let added = continuations(&store);
+    assert_eq!(added.len(), 1);
+    assert!(added[0].content.contains("turn 10") && added[0].content.contains("turn 11"));
+    assert_eq!(added[0].metadata["overlapped"], json!(false));
+}
+
+#[test]
+fn reverting_a_dialog_is_refused_and_writes_no_revision() {
+    use remind_me_core::db::history::Revisions;
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    // A row edited before it became a dialog has revisions to revert to.
+    let id = add(&store, "first words", "learning", json!({}));
+    queries::update_memory(&store, &update(&id, json!({ "content": "second words" }))).unwrap();
+    queries::update_memory(&store, &update(&id, json!({ "category": DIALOG_CATEGORY }))).unwrap();
+    let history = Revisions::new(&store).list(&id, 10).unwrap();
+    let oldest = history.last().unwrap().id;
+    let before = queries::get_memory_by_id(&store, &id).unwrap().unwrap();
+
+    let refused = remind_me_core::history::revert(&store, &id, oldest, None);
+
+    assert_refused(refused, &id);
+    let after = queries::get_memory_by_id(&store, &id).unwrap().unwrap();
+    assert_eq!(after.content, before.content);
+    assert_eq!(after.category, DIALOG_CATEGORY);
+    assert_eq!(after.updated_at, before.updated_at);
+    assert_eq!(
+        Revisions::new(&store).list(&id, 10).unwrap().len(),
+        history.len()
+    );
+}
