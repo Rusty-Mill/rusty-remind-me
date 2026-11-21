@@ -23,7 +23,9 @@
 //!
 //! The run is offline. It refuses to start when the environment configures
 //! an embedder, query expansion or reranking, rather than letting them
-//! clear the bench vectors or call a model inside a timed search.
+//! clear the bench vectors or call a model inside a timed search. Searches
+//! run without a deadline, and one that skipped a stage, or a hybrid search
+//! whose semantic stage did not run, fails the run.
 //!
 //! The data is synthetic and deterministic: a Zipf-skewed vocabulary, so
 //! full-text posting lists look like prose, a mix of categories, tags and
@@ -37,6 +39,7 @@ use remind_me_core::embedder::{EmbedError, EmbedRole, Embedder, EmbeddingIdentit
 use remind_me_core::models::{
     EntityInput, MemoryAddInput, MemoryListInput, MemorySearchInput, MemoryUpdateInput,
 };
+use remind_me_core::retrieval::Deadline;
 use remind_me_core::{entity, testing, vectors, Database};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
@@ -305,10 +308,9 @@ fn workload(
     // Query vectors are made before any timed span, so the searches time
     // retrieval, not embedding.
     let vectors_ = Precomputed::new(&queries_);
-    let search = |i: usize, embedder: Option<&dyn Embedder>| -> Result<()> {
+    let search = |i: usize, vectors: Option<&Precomputed>| -> Result<()> {
         let input: MemorySearchInput = serde_json::from_value(json!({ "query": queries_[i] }))?;
-        queries::search_memories_with_embedder(&store, &input, embedder)?;
-        Ok(())
+        searched(&store, &input, vectors)
     };
     report.insert("search_keyword".into(), timed(|i| search(i, None))?);
     report.insert(
@@ -374,6 +376,43 @@ fn workload(
     backup_and_restore(candidate, &db, report)
 }
 
+/// One search, keyword-only (`vectors` is `None`) or hybrid, that fails
+/// rather than letting a degraded search into the summary. It ignores any
+/// inherited `REMIND_ME_SEARCH_DEADLINE_MS` (the deadline is unbounded),
+/// refuses a search that skipped a stage anyway, and for hybrid requires
+/// that the semantic stage ran and got every query vector it asked for.
+///
+/// What it cannot see: the production search maps an error inside the
+/// semantic scan, after the query is embedded, to an empty semantic list.
+/// The `search_semantic` workload runs that scan with errors propagated.
+fn searched(
+    store: &Store<'_>,
+    input: &MemorySearchInput,
+    vectors: Option<&Precomputed>,
+) -> Result<()> {
+    let probe = vectors.map(Probe::new);
+    let embedder = probe.as_ref().map(|p| p as &dyn Embedder);
+    let outcome =
+        queries::search_memories_deadlined(store, input, embedder, Deadline::unbounded())?;
+    if !outcome.timing.skipped.is_empty() {
+        return Err(format!("the search skipped {:?}", outcome.timing.skipped).into());
+    }
+    let Some(probe) = probe else {
+        return Ok(());
+    };
+    let (calls, misses) = (
+        probe.calls.load(Ordering::SeqCst),
+        probe.misses.load(Ordering::SeqCst),
+    );
+    if calls == 0 || misses > 0 {
+        return Err(format!(
+            "the semantic stage did not run cleanly ({calls} embeds, {misses} missing vectors)"
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// Hybrid search on `READERS` threads while one thread keeps adding
 /// memories; the readers' times. All threads start together at a barrier,
 /// and the writer runs until every reader has finished, so every sample is
@@ -413,8 +452,7 @@ fn beside_writer(
                             serde_json::from_value(json!({ "query": queries_[i] }))
                                 .map_err(|e| e.to_string())?;
                         let t = Instant::now();
-                        queries::search_memories_with_embedder(&store, &input, Some(vectors_))
-                            .map_err(|e| e.to_string())?;
+                        searched(&store, &input, Some(vectors_)).map_err(|e| e.to_string())?;
                         times.push(t.elapsed());
                     }
                     Ok(times)
@@ -574,6 +612,49 @@ impl Embedder for Precomputed {
 
     fn identity(&self) -> EmbeddingIdentity {
         BenchEmbedder.identity()
+    }
+}
+
+/// One search's view of [`Precomputed`]: counts the lookups it served and
+/// the ones it could not, so the caller can tell the semantic stage ran.
+struct Probe<'a> {
+    vectors: &'a Precomputed,
+    calls: AtomicUsize,
+    misses: AtomicUsize,
+}
+
+impl<'a> Probe<'a> {
+    fn new(vectors: &'a Precomputed) -> Self {
+        Self {
+            vectors,
+            calls: AtomicUsize::new(0),
+            misses: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl Embedder for Probe<'_> {
+    fn embed(
+        &self,
+        texts: &[String],
+        role: EmbedRole,
+    ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+        let embedded = self.vectors.embed(texts, role);
+        let counter = if embedded.is_ok() {
+            &self.calls
+        } else {
+            &self.misses
+        };
+        counter.fetch_add(1, Ordering::SeqCst);
+        embedded
+    }
+
+    fn dim(&self) -> usize {
+        self.vectors.dim()
+    }
+
+    fn identity(&self) -> EmbeddingIdentity {
+        self.vectors.identity()
     }
 }
 
