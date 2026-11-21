@@ -1,6 +1,6 @@
 # ADR-0035: The storage port is one trait per table group
 
-Status: Accepted (2026-11-16, confirmed by Nano); saved searches, reminders, history, feedback, stats, snapshots, the memories core, archives, entities, curation, promotions, sync state, outbox and imports implemented
+Status: Accepted (2026-11-16, confirmed by Nano); every table group has a port (saved searches, reminders, history, feedback, stats, snapshots, the memories core, archives, entities, curation, promotions, sync state, outbox, imports, references, related, sessions, vectors, wiki); step 6 not started
 Date: 2026-11-16
 
 Continues ADR-0022, whose "extract traits only when a second backend is
@@ -72,6 +72,26 @@ already exists: `crates/remind_me_core/tests/retrieval_eval_test.rs` scores
 gates on `baseline.json`, and runs in every CI test job. It opens its store
 with `Database::open_in_memory`, so after step 6 it runs unchanged on any
 backend. R3 measures on real data; this set stays the regression gate.
+
+## What remains before a second backend runs the suites
+
+Every group has a port and a conformance suite (2026-11-21). A second
+backend can already implement one port and run that port's suite on its
+own. Running the whole test suite on it still needs step 6:
+
+- **The store holds a backend.** Each repository takes `&EngineLock` from
+  `Store::engine()` or `Store::core()`. Both become one handle to a
+  backend that implements every port.
+- **The transaction becomes the backend's.** `Store::transaction` opens
+  the engine's page (`db::engine::page`), so a second backend needs its
+  own way to make several writes land whole.
+- **Four reaches still go past the ports.** `derived::rebuild_indexes`
+  calls `engine::memories::rebuild`, `backup` calls
+  `EngineTables::copy_files_to`, `queries` reads the vitality rule
+  `engine::memories::vital_enough` (pure logic, which belongs outside the
+  engine), and `crate::testing` reads and plants raw engine rows for
+  tests. Opening and upgrading an old `memory.db` (`db::engine::copy`,
+  `legacy_upgrade`) is engine-only by nature and stays.
 
 ## Not decided here
 

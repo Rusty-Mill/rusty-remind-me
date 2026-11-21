@@ -7,8 +7,11 @@
 //! write [`crate::wiki`] and [`crate::wiki_fs`] make goes through here. The
 //! rules stay with them: slugs, reserved pages, what a reconcile re-indexes,
 //! the load budget and the compile watermark.
+//!
+//! [`WikiStore`] is the port (ADR-0035); the engine's adapter is in
+//! `db::engine::wiki`. [`WikiIndex`] is what callers take.
 
-use super::engine::{self, EngineLock};
+use super::engine::EngineLock;
 use super::{Result, Store};
 use crate::wiki::{WikiPage, WikiSearchHit};
 use std::collections::HashMap;
@@ -20,7 +23,64 @@ pub struct PageSummary {
     pub summary: String,
 }
 
-/// The wiki tables, on the engine.
+/// The wiki tables and their full-text index, as a backend stores them
+/// (ADR-0035). [`conformance`] holds the behaviour every implementation
+/// must show.
+pub trait WikiStore {
+    /// Store `page`, replacing every column of an existing row with its slug.
+    fn upsert(&mut self, page: &WikiPage) -> Result<()>;
+
+    /// Store a page that no file backs: a new row gets mtime 0, and an
+    /// existing row keeps its mtime.
+    fn upsert_unbacked(
+        &mut self,
+        slug: &str,
+        title: &str,
+        content: &str,
+        summary: &str,
+        updated_at: &str,
+    ) -> Result<()>;
+
+    /// The page with slug `slug`, if there is one.
+    fn get(&self, slug: &str) -> Result<Option<WikiPage>>;
+
+    /// Every page, most recently updated first.
+    fn recent_first(&self) -> Result<Vec<WikiPage>>;
+
+    /// Every page, most recently updated first, ties by title ignoring case.
+    fn recent_first_then_title(&self) -> Result<Vec<WikiPage>>;
+
+    /// Every page's title and summary, by title ignoring case.
+    fn summaries_by_title(&self) -> Result<Vec<PageSummary>>;
+
+    /// Every page's cached file mtime, by slug.
+    fn mtimes(&self) -> Result<HashMap<String, f64>>;
+
+    /// Remove the page `slug` and the links out of it. Returns whether a
+    /// page was there.
+    fn remove(&mut self, slug: &str) -> Result<bool>;
+
+    /// Replace the links out of `slug` with `links`, each a destination slug
+    /// and title. Replaced wholesale, so an edit that drops a link drops the
+    /// edge; a destination listed twice keeps its first title.
+    fn replace_links(&mut self, slug: &str, links: &[(String, String)]) -> Result<()>;
+
+    /// How many links leave `slug`.
+    fn link_count(&self, slug: &str) -> Result<usize>;
+
+    /// Pages matching any of `phrases` (see [`crate::fts::query_phrases`]),
+    /// best BM25 first, at most `limit`, each with a bracketed snippet of its
+    /// content.
+    fn search(&self, phrases: &[String], limit: usize) -> Result<Vec<WikiSearchHit>>;
+
+    /// The `wiki_meta` value under `key`, if set.
+    fn meta(&self, key: &str) -> Result<Option<String>>;
+
+    /// Set the `wiki_meta` value under `key`.
+    fn set_meta(&mut self, key: &str, value: &str) -> Result<()>;
+}
+
+/// The wiki tables of a [`Store`], one locked call at a time.
 pub struct WikiIndex<'c> {
     engine: &'c EngineLock,
 }
@@ -32,15 +92,12 @@ impl<'c> WikiIndex<'c> {
         }
     }
 
-    // --- pages -----------------------------------------------------------
-
-    /// Store `page`, replacing every column of an existing row with its slug.
+    /// See [`WikiStore::upsert`].
     pub fn upsert(&self, page: &WikiPage) -> Result<()> {
-        engine::wiki::upsert(&mut self.engine.lock(), page)
+        WikiStore::upsert(&mut *self.engine.lock(), page)
     }
 
-    /// Store a page that no file backs: a new row gets mtime 0, and an
-    /// existing row keeps its mtime.
+    /// See [`WikiStore::upsert_unbacked`].
     pub fn upsert_unbacked(
         &self,
         slug: &str,
@@ -49,8 +106,8 @@ impl<'c> WikiIndex<'c> {
         summary: &str,
         updated_at: &str,
     ) -> Result<()> {
-        engine::wiki::upsert_unbacked(
-            &mut self.engine.lock(),
+        WikiStore::upsert_unbacked(
+            &mut *self.engine.lock(),
             slug,
             title,
             content,
@@ -59,77 +116,68 @@ impl<'c> WikiIndex<'c> {
         )
     }
 
-    /// The page with slug `slug`, if there is one.
+    /// See [`WikiStore::get`].
     pub fn get(&self, slug: &str) -> Result<Option<WikiPage>> {
-        Ok(engine::wiki::get(&self.engine.lock(), slug))
+        WikiStore::get(&*self.engine.lock(), slug)
     }
 
-    /// Every page, most recently updated first.
+    /// See [`WikiStore::recent_first`].
     pub fn recent_first(&self) -> Result<Vec<WikiPage>> {
-        Ok(engine::wiki::recent_first(&self.engine.lock()))
+        WikiStore::recent_first(&*self.engine.lock())
     }
 
-    /// Every page, most recently updated first, ties by title ignoring case.
+    /// See [`WikiStore::recent_first_then_title`].
     pub fn recent_first_then_title(&self) -> Result<Vec<WikiPage>> {
-        Ok(engine::wiki::recent_first_then_title(&self.engine.lock()))
+        WikiStore::recent_first_then_title(&*self.engine.lock())
     }
 
-    /// Every page's title and summary, by title ignoring case.
+    /// See [`WikiStore::summaries_by_title`].
     pub fn summaries_by_title(&self) -> Result<Vec<PageSummary>> {
-        Ok(engine::wiki::summaries_by_title(&self.engine.lock()))
+        WikiStore::summaries_by_title(&*self.engine.lock())
     }
 
-    /// Every page's cached file mtime, by slug.
+    /// See [`WikiStore::mtimes`].
     pub fn mtimes(&self) -> Result<HashMap<String, f64>> {
-        Ok(engine::wiki::mtimes(&self.engine.lock()))
+        WikiStore::mtimes(&*self.engine.lock())
     }
 
-    /// Remove the page `slug` and the links out of it. Returns whether a
-    /// page was there.
+    /// See [`WikiStore::remove`].
     pub fn remove(&self, slug: &str) -> Result<bool> {
-        engine::wiki::remove(&mut self.engine.lock(), slug)
+        WikiStore::remove(&mut *self.engine.lock(), slug)
     }
 
-    // --- links -----------------------------------------------------------
-
-    /// Replace the links out of `slug` with `links`, each a destination slug
-    /// and title. Replaced wholesale, so an edit that drops a link drops the
-    /// edge.
+    /// See [`WikiStore::replace_links`].
     pub fn replace_links(&self, slug: &str, links: &[(String, String)]) -> Result<()> {
-        engine::wiki::replace_links(&mut self.engine.lock(), slug, links)
+        WikiStore::replace_links(&mut *self.engine.lock(), slug, links)
     }
 
-    /// How many links leave `slug`.
+    /// See [`WikiStore::link_count`].
     pub fn link_count(&self, slug: &str) -> Result<usize> {
-        Ok(engine::wiki::link_count(&self.engine.lock(), slug))
+        WikiStore::link_count(&*self.engine.lock(), slug)
     }
 
-    // --- full-text search ------------------------------------------------
-
-    /// Pages matching any of `phrases` (see [`crate::fts::query_phrases`]),
-    /// best BM25 first, at most `limit`, each with a bracketed snippet of its
-    /// content.
+    /// See [`WikiStore::search`].
     pub fn search(&self, phrases: &[String], limit: usize) -> Result<Vec<WikiSearchHit>> {
-        Ok(engine::wiki::search(&self.engine.lock(), phrases, limit))
+        WikiStore::search(&*self.engine.lock(), phrases, limit)
     }
 
-    // --- meta ------------------------------------------------------------
-
-    /// The `wiki_meta` value under `key`, if set.
+    /// See [`WikiStore::meta`].
     pub fn meta(&self, key: &str) -> Result<Option<String>> {
-        Ok(engine::wiki::meta(&self.engine.lock(), key))
+        WikiStore::meta(&*self.engine.lock(), key)
     }
 
-    /// Set the `wiki_meta` value under `key`.
+    /// See [`WikiStore::set_meta`].
     pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
-        engine::wiki::set_meta(&mut self.engine.lock(), key, value)
+        WikiStore::set_meta(&mut *self.engine.lock(), key, value)
     }
 }
 
+/// The behaviour every [`WikiStore`] must show, run against each backend by
+/// [`wiki_conformance`] (ADR-0035).
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::db::Database;
+pub(crate) mod conformance {
+    use super::WikiStore;
+    use crate::wiki::WikiPage;
 
     const T1: &str = "2026-09-26T00:00:00+00:00";
     const T2: &str = "2026-09-27T00:00:00+00:00";
@@ -145,11 +193,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn an_unbacked_write_keeps_the_cached_mtime() {
-        let db = Database::open_in_memory().unwrap();
-        let store = db.store();
-        let wiki = WikiIndex::new(&store);
+    pub(crate) fn an_unbacked_write_keeps_the_cached_mtime(wiki: &mut dyn WikiStore) {
         wiki.upsert(&page("a", 42.0, T1)).unwrap();
         wiki.upsert_unbacked("a", "A", "new", "", T2).unwrap();
         wiki.upsert_unbacked("b", "B", "body", "", T2).unwrap();
@@ -159,11 +203,7 @@ mod tests {
         assert_eq!(wiki.get("b").unwrap().unwrap().mtime, 0.0);
     }
 
-    #[test]
-    fn remove_takes_the_links_and_reports_a_missing_page() {
-        let db = Database::open_in_memory().unwrap();
-        let store = db.store();
-        let wiki = WikiIndex::new(&store);
+    pub(crate) fn remove_takes_the_links_and_reports_a_missing_page(wiki: &mut dyn WikiStore) {
         wiki.upsert(&page("a", 1.0, T1)).unwrap();
         wiki.replace_links(
             "a",
@@ -186,22 +226,14 @@ mod tests {
         assert!(wiki.get("a").unwrap().is_none());
     }
 
-    #[test]
-    fn meta_round_trips_and_overwrites() {
-        let db = Database::open_in_memory().unwrap();
-        let store = db.store();
-        let wiki = WikiIndex::new(&store);
+    pub(crate) fn meta_round_trips_and_overwrites(wiki: &mut dyn WikiStore) {
         assert_eq!(wiki.meta("k").unwrap(), None);
         wiki.set_meta("k", "1").unwrap();
         wiki.set_meta("k", "2").unwrap();
         assert_eq!(wiki.meta("k").unwrap().as_deref(), Some("2"));
     }
 
-    #[test]
-    fn listings_order_by_recency_then_title_ignoring_case() {
-        let db = Database::open_in_memory().unwrap();
-        let store = db.store();
-        let wiki = WikiIndex::new(&store);
+    pub(crate) fn listings_order_by_recency_then_title_ignoring_case(wiki: &mut dyn WikiStore) {
         let titled = |slug: &str, title: &str, at: &str| WikiPage {
             title: title.to_string(),
             ..page(slug, 1.0, at)
@@ -229,17 +261,15 @@ mod tests {
 
     /// The full-text index on one corpus: the matching pages, best first,
     /// with bracketed snippets, and a rewrite replacing a page's entry.
-    #[test]
-    fn search_finds_and_ranks_pages_and_a_rewrite_replaces_the_entry() {
+    pub(crate) fn search_finds_and_ranks_pages_and_a_rewrite_replaces_the_entry(
+        wiki: &mut dyn WikiStore,
+    ) {
         let corpus = [
             ("ownership", "Ownership", "Rust ownership rules: each value has one owner. Borrowing lends it without moving."),
             ("borrowing", "Borrowing", "Borrowing and borrowing again: shared borrows and mutable borrows."),
             ("lifetimes", "Lifetimes", "Lifetimes tie a reference to the owner it borrows from."),
             ("unrelated", "Gardening", "Tomatoes like sun, and so does borrowing light."),
         ];
-        let db = Database::open_in_memory().unwrap();
-        let store = db.store();
-        let wiki = WikiIndex::new(&store);
         for (slug, title, content) in corpus {
             wiki.upsert(&WikiPage {
                 slug: slug.to_string(),
@@ -284,5 +314,65 @@ mod tests {
                 .len(),
             1
         );
+    }
+}
+
+/// One `#[test]` per [`conformance`] check, each on a fresh store from
+/// `$make`. A backend's adapter invokes it in its own test module.
+#[cfg(test)]
+macro_rules! wiki_conformance {
+    ($make:expr) => {
+        use $crate::db::wiki::conformance;
+
+        #[test]
+        fn an_unbacked_write_keeps_the_cached_mtime() {
+            conformance::an_unbacked_write_keeps_the_cached_mtime(&mut $make);
+        }
+        #[test]
+        fn remove_takes_the_links_and_reports_a_missing_page() {
+            conformance::remove_takes_the_links_and_reports_a_missing_page(&mut $make);
+        }
+        #[test]
+        fn meta_round_trips_and_overwrites() {
+            conformance::meta_round_trips_and_overwrites(&mut $make);
+        }
+        #[test]
+        fn listings_order_by_recency_then_title_ignoring_case() {
+            conformance::listings_order_by_recency_then_title_ignoring_case(&mut $make);
+        }
+        #[test]
+        fn search_finds_and_ranks_pages_and_a_rewrite_replaces_the_entry() {
+            conformance::search_finds_and_ranks_pages_and_a_rewrite_replaces_the_entry(&mut $make);
+        }
+    };
+}
+#[cfg(test)]
+pub(crate) use wiki_conformance;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Database;
+
+    #[test]
+    fn the_repository_reaches_the_store_through_the_port() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        let wiki = WikiIndex::new(&store);
+        let at = "2026-09-26T00:00:00+00:00";
+        wiki.upsert_unbacked("a", "A", "ownership", "", at).unwrap();
+        wiki.replace_links("a", &[("b".to_string(), "B".to_string())])
+            .unwrap();
+        wiki.set_meta("k", "v").unwrap();
+        assert_eq!(wiki.get("a").unwrap().unwrap().title, "A");
+        assert_eq!(wiki.link_count("a").unwrap(), 1);
+        assert_eq!(wiki.meta("k").unwrap().as_deref(), Some("v"));
+        assert_eq!(
+            wiki.search(&crate::fts::query_phrases("ownership"), 5)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(wiki.remove("a").unwrap());
     }
 }

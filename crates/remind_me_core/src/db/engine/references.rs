@@ -1,10 +1,10 @@
 //! `memory_references` on the engine core (schema v32): the URLs, issues,
 //! commits, paths, handles and attachments a memory names.
-//! [`crate::db::references`] calls these when its store carries the core.
+//! The engine's adapter for the [`ReferenceStore`] port (ADR-0035).
 
 use super::core::{Change, CoreTables};
 use super::{core_ref, engine_error, engine_id, EngineTables};
-use crate::db::references::{MemoryReference, NewReference};
+use crate::db::references::{MemoryReference, NewReference, ReferenceStore};
 use crate::db::Result;
 use rusty_multimodal_db_engine::generic::query::{AllIds, FilterEq, GetById};
 use rusty_multimodal_db_engine::generic::traits::{
@@ -91,13 +91,19 @@ impl ScannableField<Slot> for ReferenceRecord {
 /// The rows `keep` selects, oldest first, ties by id: the order the SQL
 /// reads them in.
 fn rows(core: &CoreTables, keep: impl Fn(&ReferenceRecord) -> bool) -> Vec<MemoryReference> {
-    let mut found: Vec<ReferenceRecord> = core
-        .references
-        .all_ids()
-        .into_iter()
-        .filter_map(|id| core.references.get(id))
-        .filter(|r| keep(r))
-        .collect();
+    ordered(
+        core.references
+            .all_ids()
+            .into_iter()
+            .filter_map(|id| core.references.get(id))
+            .filter(|r| keep(r))
+            .collect(),
+    )
+}
+
+/// `found` oldest first, ties by kind, value, then id: the order the SQL
+/// reads them in.
+fn ordered(mut found: Vec<ReferenceRecord>) -> Vec<MemoryReference> {
     found.sort_by(|a, b| {
         (&a.created_at, &a.kind, &a.value, &a.id).cmp(&(&b.created_at, &b.kind, &b.value, &b.id))
     });
@@ -113,64 +119,58 @@ fn of_memory(core: &CoreTables, memory_id: &str) -> Vec<ReferenceRecord> {
         .collect()
 }
 
-/// Insert `row`. An id already stored is an error, as the primary key
-/// makes it on SQLite.
-pub(crate) fn insert(tables: &mut EngineTables, row: &NewReference) -> Result<()> {
-    let record = ReferenceRecord::new(row);
-    if core_ref(tables)?.references.get(record.engine_id).is_some() {
-        return Err(engine_error(format!(
-            "reference {:?} already exists",
-            row.id
-        )));
+impl ReferenceStore for EngineTables {
+    /// An id already stored is an error, as the primary key makes it on
+    /// SQLite.
+    fn insert(&mut self, row: &NewReference) -> Result<()> {
+        let record = ReferenceRecord::new(row);
+        if core_ref(self)?.references.get(record.engine_id).is_some() {
+            return Err(engine_error(format!(
+                "reference {:?} already exists",
+                row.id
+            )));
+        }
+        let id = record.engine_id;
+        self.commit(vec![Change::Reference(id, Some(Box::new(record)))])
     }
-    let id = record.engine_id;
-    tables.commit(vec![Change::Reference(id, Some(Box::new(record)))])
+
+    fn for_memory(&self, memory_id: &str) -> Result<Vec<MemoryReference>> {
+        Ok(ordered(of_memory(core_ref(self)?, memory_id)))
+    }
+
+    fn for_memories(&self, memory_ids: &[String]) -> Result<Vec<MemoryReference>> {
+        let core = core_ref(self)?;
+        Ok(ordered(
+            memory_ids
+                .iter()
+                .flat_map(|id| of_memory(core, id))
+                .collect(),
+        ))
+    }
+
+    fn of_kind(&self, kind: &str) -> Result<Vec<MemoryReference>> {
+        Ok(rows(core_ref(self)?, |r| r.kind == kind))
+    }
+
+    fn find(&self, kind: &str, value: &str) -> Result<Vec<MemoryReference>> {
+        Ok(rows(core_ref(self)?, |r| {
+            r.kind == kind && r.value == value
+        }))
+    }
+
+    fn delete_for_memory(&mut self, memory_id: &str) -> Result<usize> {
+        let changes: Vec<Change> = of_memory(core_ref(self)?, memory_id)
+            .into_iter()
+            .map(|r| Change::Reference(r.engine_id, None))
+            .collect();
+        let count = changes.len();
+        self.commit(changes)?;
+        Ok(count)
+    }
 }
 
-pub(crate) fn for_memory(tables: &EngineTables, memory_id: &str) -> Result<Vec<MemoryReference>> {
-    let core = core_ref(tables)?;
-    let mut found = of_memory(core, memory_id);
-    found.sort_by(|a, b| {
-        (&a.created_at, &a.kind, &a.value, &a.id).cmp(&(&b.created_at, &b.kind, &b.value, &b.id))
-    });
-    Ok(found.iter().map(ReferenceRecord::to_row).collect())
-}
-
-/// The references of every id in `memory_ids`, grouped by neither: one
-/// ordered list (oldest first, ties by kind, value, then id), so a caller regroups by `memory_id`.
-pub(crate) fn for_memories(
-    tables: &EngineTables,
-    memory_ids: &[String],
-) -> Result<Vec<MemoryReference>> {
-    let core = core_ref(tables)?;
-    let mut found: Vec<ReferenceRecord> = memory_ids
-        .iter()
-        .flat_map(|id| of_memory(core, id))
-        .collect();
-    found.sort_by(|a, b| {
-        (&a.created_at, &a.kind, &a.value, &a.id).cmp(&(&b.created_at, &b.kind, &b.value, &b.id))
-    });
-    Ok(found.iter().map(ReferenceRecord::to_row).collect())
-}
-
-/// Every reference of this `kind`, oldest first.
-pub(crate) fn of_kind(tables: &EngineTables, kind: &str) -> Result<Vec<MemoryReference>> {
-    Ok(rows(core_ref(tables)?, |r| r.kind == kind))
-}
-
-pub(crate) fn find(tables: &EngineTables, kind: &str, value: &str) -> Result<Vec<MemoryReference>> {
-    Ok(rows(core_ref(tables)?, |r| {
-        r.kind == kind && r.value == value
-    }))
-}
-
-/// Remove every reference of `memory_id`. How many went.
-pub(crate) fn delete_for_memory(tables: &mut EngineTables, memory_id: &str) -> Result<usize> {
-    let changes: Vec<Change> = of_memory(core_ref(tables)?, memory_id)
-        .into_iter()
-        .map(|r| Change::Reference(r.engine_id, None))
-        .collect();
-    let count = changes.len();
-    tables.commit(changes)?;
-    Ok(count)
+#[cfg(test)]
+mod conformance_tests {
+    use super::EngineTables;
+    crate::db::references::reference_conformance!(EngineTables::open_temporary().unwrap());
 }

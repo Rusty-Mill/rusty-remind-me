@@ -1,6 +1,6 @@
 //! The wiki's index on the engine (ADR-0023, phase 4h): pages, the links
 //! out of them, the metadata keys, and the full-text index over the pages.
-//! [`crate::db::wiki`] calls these when its store carries engine tables.
+//! This is the engine's adapter for the [`WikiStore`] port (ADR-0035).
 //!
 //! The full-text index is derived data, kept in memory and rebuilt from the
 //! page records whenever the tables open (§3a); every page write here
@@ -10,7 +10,7 @@
 use super::{
     deleted, engine_error, engine_id, ensure_same_id, micros, pair_engine_id, EngineTables,
 };
-use crate::db::wiki::PageSummary;
+use crate::db::wiki::{PageSummary, WikiStore};
 use crate::db::Result;
 use crate::wiki::{WikiPage, WikiSearchHit};
 use rusty_multimodal_db_engine::fulltext::{FullTextIndex, Query, SnippetStyle};
@@ -164,185 +164,171 @@ pub(crate) fn index_pages(pages: &PageTable) -> PageSearch {
     index
 }
 
-// --- pages ---------------------------------------------------------------
+impl WikiStore for EngineTables {
+    // --- pages -----------------------------------------------------------
 
-/// Store `page`, replacing every field of the page with its slug.
-pub(crate) fn upsert(tables: &mut EngineTables, page: &WikiPage) -> Result<()> {
-    put_page(tables, PageRecord::new(page))
-}
-
-/// Store a page no file backs: a new page gets mtime 0, an existing one
-/// keeps its mtime.
-pub(crate) fn upsert_unbacked(
-    tables: &mut EngineTables,
-    slug: &str,
-    title: &str,
-    content: &str,
-    summary: &str,
-    updated_at: &str,
-) -> Result<()> {
-    let mtime = page_record(tables, slug).map_or(0.0, |p| p.mtime);
-    let page = WikiPage {
-        slug: slug.to_string(),
-        title: title.to_string(),
-        content: content.to_string(),
-        summary: summary.to_string(),
-        mtime,
-        updated_at: updated_at.to_string(),
-    };
-    put_page(tables, PageRecord::new(&page))
-}
-
-pub(crate) fn get(tables: &EngineTables, slug: &str) -> Option<WikiPage> {
-    page_record(tables, slug).map(|p| p.to_page())
-}
-
-/// Every page, most recently updated first, as SQLite compares the text;
-/// ties by slug, where SQLite leaves them unspecified.
-pub(crate) fn recent_first(tables: &EngineTables) -> Vec<WikiPage> {
-    let mut pages = all_pages(tables);
-    pages.sort_by(|a, b| {
-        b.updated_at
-            .cmp(&a.updated_at)
-            .then_with(|| a.slug.cmp(&b.slug))
-    });
-    pages.iter().map(PageRecord::to_page).collect()
-}
-
-/// Every page, most recently updated first, ties by title ignoring ASCII
-/// case (`COLLATE NOCASE`), then slug.
-pub(crate) fn recent_first_then_title(tables: &EngineTables) -> Vec<WikiPage> {
-    let mut pages = all_pages(tables);
-    pages.sort_by(|a, b| {
-        b.updated_at
-            .cmp(&a.updated_at)
-            .then_with(|| nocase(&a.title, &b.title))
-            .then_with(|| a.slug.cmp(&b.slug))
-    });
-    pages.iter().map(PageRecord::to_page).collect()
-}
-
-/// Every page's title and summary, by title ignoring ASCII case, then slug.
-pub(crate) fn summaries_by_title(tables: &EngineTables) -> Vec<PageSummary> {
-    let mut pages = all_pages(tables);
-    pages.sort_by(|a, b| nocase(&a.title, &b.title).then_with(|| a.slug.cmp(&b.slug)));
-    pages
-        .into_iter()
-        .map(|p| PageSummary {
-            title: p.title,
-            summary: p.summary,
-        })
-        .collect()
-}
-
-pub(crate) fn mtimes(tables: &EngineTables) -> HashMap<String, f64> {
-    all_pages(tables)
-        .into_iter()
-        .map(|p| (p.slug, p.mtime))
-        .collect()
-}
-
-/// Remove the page `slug` and the links out of it. Whether a page was
-/// there.
-pub(crate) fn remove(tables: &mut EngineTables, slug: &str) -> Result<bool> {
-    let existed = page_record(tables, slug).is_some();
-    if existed {
-        deleted(tables.wiki_pages.delete(engine_id(slug)))?;
-        tables.wiki_search.remove(&slug.to_string());
+    /// Replaces every field of the page with its slug.
+    fn upsert(&mut self, page: &WikiPage) -> Result<()> {
+        put_page(self, PageRecord::new(page))
     }
-    delete_links(tables, slug)?;
-    Ok(existed)
-}
 
-// --- links ---------------------------------------------------------------
-
-/// Replace the links out of `slug` with `links`. A destination listed twice
-/// keeps its first title, as `INSERT OR IGNORE` does.
-pub(crate) fn replace_links(
-    tables: &mut EngineTables,
-    slug: &str,
-    links: &[(String, String)],
-) -> Result<()> {
-    delete_links(tables, slug)?;
-    for (position, (dst_slug, dst_title)) in links.iter().enumerate() {
-        let key = pair_engine_id(slug, dst_slug);
-        if tables.wiki_links.get(key).is_some() {
-            continue;
-        }
-        let record = LinkRecord {
-            engine_id: key,
-            src_slug: slug.to_string(),
-            dst_slug: dst_slug.clone(),
-            dst_title: dst_title.clone(),
-            position: i64::try_from(position).unwrap_or(i64::MAX),
+    fn upsert_unbacked(
+        &mut self,
+        slug: &str,
+        title: &str,
+        content: &str,
+        summary: &str,
+        updated_at: &str,
+    ) -> Result<()> {
+        let mtime = page_record(self, slug).map_or(0.0, |p| p.mtime);
+        let page = WikiPage {
+            slug: slug.to_string(),
+            title: title.to_string(),
+            content: content.to_string(),
+            summary: summary.to_string(),
+            mtime,
+            updated_at: updated_at.to_string(),
         };
-        tables.wiki_links.insert(record).map_err(engine_error)?;
+        put_page(self, PageRecord::new(&page))
     }
-    Ok(())
-}
 
-/// How many links leave `slug`.
-pub(crate) fn link_count(tables: &EngineTables, slug: &str) -> usize {
-    links_of(tables, slug).len()
-}
+    fn get(&self, slug: &str) -> Result<Option<WikiPage>> {
+        Ok(page_record(self, slug).map(|p| p.to_page()))
+    }
 
-// --- full-text search ----------------------------------------------------
+    /// As SQLite compares the text; ties by slug, where SQLite leaves them
+    /// unspecified.
+    fn recent_first(&self) -> Result<Vec<WikiPage>> {
+        let mut pages = all_pages(self);
+        pages.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| a.slug.cmp(&b.slug))
+        });
+        Ok(pages.iter().map(PageRecord::to_page).collect())
+    }
 
-/// Pages matching any of `phrases`, best BM25 first, at most `limit`, each
-/// with a bracketed snippet of its content.
-pub(crate) fn search(
-    tables: &EngineTables,
-    phrases: &[String],
-    limit: usize,
-) -> Vec<WikiSearchHit> {
-    let query = Query::any_of(phrases.iter().map(String::as_str));
-    tables
-        .wiki_search
-        .search(&query)
-        .into_iter()
-        .filter_map(|hit| {
-            let page = page_record(tables, &hit.key)?;
-            let snippet = tables.wiki_search.snippet(
-                &query,
-                &hit,
-                [&page.title, &page.content],
-                Some(CONTENT),
-                SNIPPET,
-            );
-            Some(WikiSearchHit {
-                slug: page.slug,
-                title: page.title,
-                summary: page.summary,
-                snippet,
+    /// Ties by title ignoring ASCII case (`COLLATE NOCASE`), then slug.
+    fn recent_first_then_title(&self) -> Result<Vec<WikiPage>> {
+        let mut pages = all_pages(self);
+        pages.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| nocase(&a.title, &b.title))
+                .then_with(|| a.slug.cmp(&b.slug))
+        });
+        Ok(pages.iter().map(PageRecord::to_page).collect())
+    }
+
+    /// By title ignoring ASCII case, then slug.
+    fn summaries_by_title(&self) -> Result<Vec<PageSummary>> {
+        let mut pages = all_pages(self);
+        pages.sort_by(|a, b| nocase(&a.title, &b.title).then_with(|| a.slug.cmp(&b.slug)));
+        Ok(pages
+            .into_iter()
+            .map(|p| PageSummary {
+                title: p.title,
+                summary: p.summary,
             })
-        })
-        .take(limit)
-        .collect()
-}
+            .collect())
+    }
 
-// --- meta ----------------------------------------------------------------
+    fn mtimes(&self) -> Result<HashMap<String, f64>> {
+        Ok(all_pages(self)
+            .into_iter()
+            .map(|p| (p.slug, p.mtime))
+            .collect())
+    }
 
-pub(crate) fn meta(tables: &EngineTables, key: &str) -> Option<String> {
-    tables
-        .wiki_meta
-        .get(engine_id(key))
-        .filter(|m| m.key == key)
-        .map(|m| m.value)
-}
-
-pub(crate) fn set_meta(tables: &mut EngineTables, key: &str, value: &str) -> Result<()> {
-    let record = MetaRecord {
-        engine_id: engine_id(key),
-        key: key.to_string(),
-        value: value.to_string(),
-        slot: 0,
-    };
-    match tables.wiki_meta.get(record.engine_id) {
-        Some(stored) => {
-            ensure_same_id(&stored.key, key)?;
-            tables.wiki_meta.replace(record).map_err(engine_error)
+    fn remove(&mut self, slug: &str) -> Result<bool> {
+        let existed = page_record(self, slug).is_some();
+        if existed {
+            deleted(self.wiki_pages.delete(engine_id(slug)))?;
+            self.wiki_search.remove(&slug.to_string());
         }
-        None => tables.wiki_meta.insert(record).map_err(engine_error),
+        delete_links(self, slug)?;
+        Ok(existed)
+    }
+
+    // --- links -----------------------------------------------------------
+
+    /// A destination listed twice keeps its first title, as `INSERT OR
+    /// IGNORE` does.
+    fn replace_links(&mut self, slug: &str, links: &[(String, String)]) -> Result<()> {
+        delete_links(self, slug)?;
+        for (position, (dst_slug, dst_title)) in links.iter().enumerate() {
+            let key = pair_engine_id(slug, dst_slug);
+            if self.wiki_links.get(key).is_some() {
+                continue;
+            }
+            let record = LinkRecord {
+                engine_id: key,
+                src_slug: slug.to_string(),
+                dst_slug: dst_slug.clone(),
+                dst_title: dst_title.clone(),
+                position: i64::try_from(position).unwrap_or(i64::MAX),
+            };
+            self.wiki_links.insert(record).map_err(engine_error)?;
+        }
+        Ok(())
+    }
+
+    fn link_count(&self, slug: &str) -> Result<usize> {
+        Ok(links_of(self, slug).len())
+    }
+
+    // --- full-text search ------------------------------------------------
+
+    fn search(&self, phrases: &[String], limit: usize) -> Result<Vec<WikiSearchHit>> {
+        let query = Query::any_of(phrases.iter().map(String::as_str));
+        Ok(self
+            .wiki_search
+            .search(&query)
+            .into_iter()
+            .filter_map(|hit| {
+                let page = page_record(self, &hit.key)?;
+                let snippet = self.wiki_search.snippet(
+                    &query,
+                    &hit,
+                    [&page.title, &page.content],
+                    Some(CONTENT),
+                    SNIPPET,
+                );
+                Some(WikiSearchHit {
+                    slug: page.slug,
+                    title: page.title,
+                    summary: page.summary,
+                    snippet,
+                })
+            })
+            .take(limit)
+            .collect())
+    }
+
+    // --- meta ------------------------------------------------------------
+
+    fn meta(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .wiki_meta
+            .get(engine_id(key))
+            .filter(|m| m.key == key)
+            .map(|m| m.value))
+    }
+
+    fn set_meta(&mut self, key: &str, value: &str) -> Result<()> {
+        let record = MetaRecord {
+            engine_id: engine_id(key),
+            key: key.to_string(),
+            value: value.to_string(),
+            slot: 0,
+        };
+        match self.wiki_meta.get(record.engine_id) {
+            Some(stored) => {
+                ensure_same_id(&stored.key, key)?;
+                self.wiki_meta.replace(record).map_err(engine_error)
+            }
+            None => self.wiki_meta.insert(record).map_err(engine_error),
+        }
     }
 }
 
@@ -397,6 +383,12 @@ fn nocase(a: &str, b: &str) -> Ordering {
 }
 
 #[cfg(test)]
+mod conformance_tests {
+    use super::EngineTables;
+    crate::db::wiki::wiki_conformance!(EngineTables::open_temporary().unwrap());
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -420,10 +412,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         {
             let mut tables = EngineTables::open(&dir).unwrap();
-            upsert(&mut tables, &page("rust", "ownership and borrowing")).unwrap();
+            WikiStore::upsert(&mut tables, &page("rust", "ownership and borrowing")).unwrap();
         }
         let tables = crate::db::engine::reopen(&dir);
-        let hits = search(&tables, &["borrowing".to_string()], 10);
+        let hits = WikiStore::search(&tables, &["borrowing".to_string()], 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].slug, "rust");
         drop(tables);

@@ -1,11 +1,11 @@
 //! Embeddings on the engine core (ADR-0023, core PR 4a):
 //! `vec_chunks`, keyed by (memory id, chunk index), and `embedding_meta`.
-//! [`crate::db::vectors`] calls these when its store carries the core.
+//! The engine's adapter for the [`VectorStore`] port (ADR-0035).
 
 use super::core::{Change, CoreTables};
 use super::memories::{self, MemoryRow};
 use super::{core_ref, engine_id, ensure_same_id, pair_engine_id, EngineTables};
-use crate::db::vectors::{ChunkVector, ConsolidationCandidate, Unembedded};
+use crate::db::vectors::{ChunkVector, ConsolidationCandidate, Unembedded, VectorStore};
 use crate::db::{Result, StoreError};
 use rusty_multimodal_db_engine::generic::query::{AllIds, FilterEq, GetById};
 use rusty_multimodal_db_engine::generic::traits::{
@@ -141,197 +141,196 @@ fn live(row: &MemoryRow) -> bool {
     row.deleted_at.is_none() && row.superseded_by.is_none()
 }
 
-/// Store `embedding` as chunk `chunk_ix` of `memory_id`: `INSERT OR
-/// REPLACE`.
-pub(crate) fn put(
-    tables: &mut EngineTables,
-    memory_id: &str,
-    chunk_ix: i64,
-    embedding: &[u8],
-) -> Result<()> {
-    let id = chunk_id(memory_id, chunk_ix);
-    let record = ChunkRecord {
-        engine_id: id,
-        memory_id: memory_id.to_string(),
-        chunk_ix,
-        embedding: embedding.to_vec(),
-    };
-    tables.commit(vec![Change::Chunk(id, Some(Box::new(record)))])
-}
-
-pub(crate) fn delete_for(tables: &mut EngineTables, memory_id: &str) -> Result<usize> {
-    let doomed: Vec<Uuid> = chunks_of(core_ref(tables)?, memory_id)
-        .into_iter()
-        .map(|c| c.engine_id)
-        .collect();
-    let count = doomed.len();
-    tables.commit(
-        doomed
-            .into_iter()
-            .map(|id| Change::Chunk(id, None))
-            .collect(),
-    )?;
-    Ok(count)
-}
-
-pub(crate) fn clear(tables: &mut EngineTables) -> Result<()> {
-    let doomed = core_ref(tables)?.chunks.all_ids();
-    tables.commit(
-        doomed
-            .into_iter()
-            .map(|id| Change::Chunk(id, None))
-            .collect(),
-    )
-}
-
-pub(crate) fn chunks_for(tables: &EngineTables, memory_id: &str) -> Result<Vec<ChunkVector>> {
-    let mut found = chunks_of(core_ref(tables)?, memory_id);
-    found.sort_by_key(|c| c.chunk_ix);
-    Ok(found.into_iter().map(vector).collect())
-}
-
-pub(crate) fn chunk_count(tables: &EngineTables, memory_id: &str) -> Result<usize> {
-    Ok(chunks_of(core_ref(tables)?, memory_id).len())
-}
-
-pub(crate) fn count(tables: &EngineTables) -> Result<usize> {
-    Ok(core_ref(tables)?.chunks.all_ids().len())
-}
-
-/// The first chunk in key order, as the SQL's `ORDER BY memory_id,
-/// chunk_ix LIMIT 1` picks it.
-pub(crate) fn any_embedding(tables: &EngineTables) -> Result<Option<Vec<u8>>> {
-    Ok(chunks(core_ref(tables)?)
-        .into_iter()
-        .next()
-        .map(|c| c.embedding))
-}
-
-pub(crate) fn all(tables: &EngineTables) -> Result<Vec<ChunkVector>> {
-    Ok(chunks(core_ref(tables)?).into_iter().map(vector).collect())
-}
-
-pub(crate) fn live_chunks(
-    tables: &EngineTables,
-    category: Option<&str>,
-    among: Option<&[String]>,
-) -> Result<Vec<ChunkVector>> {
-    let core = core_ref(tables)?;
-    let among: Option<HashSet<&str>> = among.map(|ids| ids.iter().map(String::as_str).collect());
-    let keep = |memory_id: &str| {
-        let Some(row) = memories::row(core, memory_id) else {
-            return false;
+impl VectorStore for EngineTables {
+    /// Store `embedding` as chunk `chunk_ix` of `memory_id`: `INSERT OR
+    /// REPLACE`.
+    fn put(&mut self, memory_id: &str, chunk_ix: usize, embedding: &[u8]) -> Result<()> {
+        let chunk_ix = chunk_ix as i64;
+        let id = chunk_id(memory_id, chunk_ix);
+        let record = ChunkRecord {
+            engine_id: id,
+            memory_id: memory_id.to_string(),
+            chunk_ix,
+            embedding: embedding.to_vec(),
         };
-        live(&row)
-            && category.is_none_or(|c| row.category == c)
-            && among.as_ref().is_none_or(|ids| ids.contains(memory_id))
-    };
-    Ok(chunks(core)
-        .into_iter()
-        .filter(|c| keep(&c.memory_id))
-        .map(vector)
-        .collect())
-}
+        self.commit(vec![Change::Chunk(id, Some(Box::new(record)))])
+    }
 
-pub(crate) fn unembedded(tables: &EngineTables) -> Result<Vec<Unembedded>> {
-    let core = core_ref(tables)?;
-    let embedded: HashSet<String> = chunks(core).into_iter().map(|c| c.memory_id).collect();
-    let mut rows: Vec<MemoryRow> = memories::rows(core)
-        .filter(|r| r.deleted_at.is_none() && !embedded.contains(&r.id))
-        .collect();
-    rows.sort_by(|a, b| (&a.created_at, &a.id).cmp(&(&b.created_at, &b.id)));
-    Ok(rows
-        .into_iter()
-        .map(|r| Unembedded {
-            id: r.id,
-            content: r.content,
-        })
-        .collect())
-}
+    fn delete_for(&mut self, memory_id: &str) -> Result<usize> {
+        let doomed: Vec<Uuid> = chunks_of(core_ref(self)?, memory_id)
+            .into_iter()
+            .map(|c| c.engine_id)
+            .collect();
+        let count = doomed.len();
+        self.commit(
+            doomed
+                .into_iter()
+                .map(|id| Change::Chunk(id, None))
+                .collect(),
+        )?;
+        Ok(count)
+    }
 
-/// Active, live memories with a first chunk, oldest first (ties by id), at
-/// most `limit`.
-pub(crate) fn consolidation_candidates(
-    tables: &EngineTables,
-    category: Option<&str>,
-    limit: usize,
-) -> Result<Vec<ConsolidationCandidate>> {
-    let core = core_ref(tables)?;
-    let mut rows: Vec<MemoryRow> = memories::rows(core)
-        .filter(|r| r.status == "active" && live(r))
-        .filter(|r| category.is_none_or(|c| r.category == c))
-        // Dialogs are the verbatim record (D13): never merged.
-        .filter(|r| r.category != crate::models::DIALOG_CATEGORY)
-        // Project claims are append-only (ADR-0027): never merged away.
-        .filter(|r| {
-            !r.predicate
-                .as_deref()
-                .is_some_and(crate::project::is_reserved_predicate)
-        })
-        .collect();
-    rows.sort_by(|a, b| (&a.created_at, &a.id).cmp(&(&b.created_at, &b.id)));
-    let mut candidates = Vec::new();
-    for row in rows {
-        if candidates.len() >= limit {
-            break;
-        }
-        let Some(first) = core.chunks.get(chunk_id(&row.id, 0)) else {
-            continue;
+    fn clear(&mut self) -> Result<()> {
+        let doomed = core_ref(self)?.chunks.all_ids();
+        self.commit(
+            doomed
+                .into_iter()
+                .map(|id| Change::Chunk(id, None))
+                .collect(),
+        )
+    }
+
+    fn chunks_for(&self, memory_id: &str) -> Result<Vec<ChunkVector>> {
+        let mut found = chunks_of(core_ref(self)?, memory_id);
+        found.sort_by_key(|c| c.chunk_ix);
+        Ok(found.into_iter().map(vector).collect())
+    }
+
+    fn chunk_count(&self, memory_id: &str) -> Result<usize> {
+        Ok(chunks_of(core_ref(self)?, memory_id).len())
+    }
+
+    fn count(&self) -> Result<usize> {
+        Ok(core_ref(self)?.chunks.all_ids().len())
+    }
+
+    /// The first chunk in key order, as the SQL's `ORDER BY memory_id,
+    /// chunk_ix LIMIT 1` picks it.
+    fn any_embedding(&self) -> Result<Option<Vec<u8>>> {
+        Ok(chunks(core_ref(self)?)
+            .into_iter()
+            .next()
+            .map(|c| c.embedding))
+    }
+
+    fn all(&self) -> Result<Vec<ChunkVector>> {
+        Ok(chunks(core_ref(self)?).into_iter().map(vector).collect())
+    }
+
+    fn live_chunks(
+        &self,
+        category: Option<&str>,
+        among: Option<&[String]>,
+    ) -> Result<Vec<ChunkVector>> {
+        let core = core_ref(self)?;
+        let among: Option<HashSet<&str>> =
+            among.map(|ids| ids.iter().map(String::as_str).collect());
+        let keep = |memory_id: &str| {
+            let Some(row) = memories::row(core, memory_id) else {
+                return false;
+            };
+            live(&row)
+                && category.is_none_or(|c| row.category == c)
+                && among.as_ref().is_none_or(|ids| ids.contains(memory_id))
         };
-        if first.memory_id != row.id {
-            continue;
+        Ok(chunks(core)
+            .into_iter()
+            .filter(|c| keep(&c.memory_id))
+            .map(vector)
+            .collect())
+    }
+
+    fn unembedded(&self) -> Result<Vec<Unembedded>> {
+        let core = core_ref(self)?;
+        let embedded: HashSet<String> = chunks(core).into_iter().map(|c| c.memory_id).collect();
+        let mut rows: Vec<MemoryRow> = memories::rows(core)
+            .filter(|r| r.deleted_at.is_none() && !embedded.contains(&r.id))
+            .collect();
+        rows.sort_by(|a, b| (&a.created_at, &a.id).cmp(&(&b.created_at, &b.id)));
+        Ok(rows
+            .into_iter()
+            .map(|r| Unembedded {
+                id: r.id,
+                content: r.content,
+            })
+            .collect())
+    }
+
+    /// Active, live memories with a first chunk, oldest first (ties by id), at
+    /// most `limit`.
+    fn consolidation_candidates(
+        &self,
+        category: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ConsolidationCandidate>> {
+        let core = core_ref(self)?;
+        let mut rows: Vec<MemoryRow> = memories::rows(core)
+            .filter(|r| r.status == "active" && live(r))
+            .filter(|r| category.is_none_or(|c| r.category == c))
+            // Dialogs are the verbatim record (D13): never merged.
+            .filter(|r| r.category != crate::models::DIALOG_CATEGORY)
+            // Project claims are append-only (ADR-0027): never merged away.
+            .filter(|r| {
+                !r.predicate
+                    .as_deref()
+                    .is_some_and(crate::project::is_reserved_predicate)
+            })
+            .collect();
+        rows.sort_by(|a, b| (&a.created_at, &a.id).cmp(&(&b.created_at, &b.id)));
+        let mut candidates = Vec::new();
+        for row in rows {
+            if candidates.len() >= limit {
+                break;
+            }
+            let Some(first) = core.chunks.get(chunk_id(&row.id, 0)) else {
+                continue;
+            };
+            if first.memory_id != row.id {
+                continue;
+            }
+            // The SQL reads `accessed_at` as text, and fails on a NULL.
+            let accessed_at = row.accessed_at.clone().ok_or_else(|| {
+                StoreError::Engine(format!("memory {:?} has no accessed_at", row.id))
+            })?;
+            candidates.push(ConsolidationCandidate {
+                tags: serde_json::from_str(&row.tags).unwrap_or_default(),
+                id: row.id,
+                content: row.content,
+                vitality: row.vitality,
+                access_count: row.access_count,
+                accessed_at,
+                decay_rate: row.decay_rate,
+                base_weight: row.base_weight,
+                embedding: first.embedding,
+            });
         }
-        // The SQL reads `accessed_at` as text, and fails on a NULL.
-        let accessed_at = row
-            .accessed_at
-            .clone()
-            .ok_or_else(|| StoreError::Engine(format!("memory {:?} has no accessed_at", row.id)))?;
-        candidates.push(ConsolidationCandidate {
-            tags: serde_json::from_str(&row.tags).unwrap_or_default(),
-            id: row.id,
-            content: row.content,
-            vitality: row.vitality,
-            access_count: row.access_count,
-            accessed_at,
-            decay_rate: row.decay_rate,
-            base_weight: row.base_weight,
-            embedding: first.embedding,
-        });
+        Ok(candidates)
     }
-    Ok(candidates)
+
+    /// Every `embedding_meta` key and value, by key.
+    fn meta(&self) -> Result<Vec<(String, String)>> {
+        let core = core_ref(self)?;
+        let mut entries: Vec<(String, String)> = core
+            .embedding_meta
+            .all_ids()
+            .into_iter()
+            .filter_map(|id| core.embedding_meta.get(id))
+            .map(|m| (m.key, m.value))
+            .collect();
+        entries.sort();
+        Ok(entries)
+    }
+
+    /// Set the value under `key`: the SQL's upsert.
+    fn set_meta(&mut self, key: &str, value: &str, updated_at: &str) -> Result<()> {
+        let id = engine_id(key);
+        if let Some(stored) = core_ref(self)?.embedding_meta.get(id) {
+            ensure_same_id(&stored.key, key)?;
+        }
+        let record = MetaRecord {
+            engine_id: id,
+            key: key.to_string(),
+            value: value.to_string(),
+            updated_at: updated_at.to_string(),
+            slot: 0,
+        };
+        self.commit(vec![Change::EmbeddingMeta(id, Some(record))])
+    }
 }
 
-/// Every `embedding_meta` key and value, by key.
-pub(crate) fn meta(tables: &EngineTables) -> Result<Vec<(String, String)>> {
-    let core = core_ref(tables)?;
-    let mut entries: Vec<(String, String)> = core
-        .embedding_meta
-        .all_ids()
-        .into_iter()
-        .filter_map(|id| core.embedding_meta.get(id))
-        .map(|m| (m.key, m.value))
-        .collect();
-    entries.sort();
-    Ok(entries)
-}
-
-/// Set the value under `key`: the SQL's upsert.
-pub(crate) fn set_meta(
-    tables: &mut EngineTables,
-    key: &str,
-    value: &str,
-    updated_at: &str,
-) -> Result<()> {
-    let id = engine_id(key);
-    if let Some(stored) = core_ref(tables)?.embedding_meta.get(id) {
-        ensure_same_id(&stored.key, key)?;
-    }
-    let record = MetaRecord {
-        engine_id: id,
-        key: key.to_string(),
-        value: value.to_string(),
-        updated_at: updated_at.to_string(),
-        slot: 0,
-    };
-    tables.commit(vec![Change::EmbeddingMeta(id, Some(record))])
+#[cfg(test)]
+mod conformance_tests {
+    use super::EngineTables;
+    crate::db::vectors::vector_conformance!(EngineTables::open_temporary().unwrap());
 }
