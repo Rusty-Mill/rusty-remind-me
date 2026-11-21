@@ -64,7 +64,8 @@ pub trait HistoryStore {
 
     /// Write `values` into `memory_id`'s tracked columns, stamping
     /// `updated_at`. A `None` `sensitive` is written as not sensitive, and a
-    /// `None` `project` leaves the project as it is.
+    /// `None` `project` leaves the project as it is. Refuses a dialog row
+    /// ([`crate::dialog`]), checked inside the write.
     fn restore(&mut self, memory_id: &str, values: &Tracked, updated_at: &str) -> Result<()>;
 }
 

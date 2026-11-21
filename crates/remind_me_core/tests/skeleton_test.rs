@@ -300,3 +300,78 @@ fn a_skeleton_needs_at_least_one_node() {
 
     assert!(matches!(err, SkeletonError::NoNodes));
 }
+
+fn session_line(role: &str, text: &str) -> String {
+    serde_json::json!({
+        "type": role, "sessionId": "s-skel", "uuid": format!("u-{text}"),
+        "timestamp": "2026-11-21T10:00:00.000Z",
+        "message": {"role": role, "content": text}
+    })
+    .to_string()
+}
+
+#[test]
+fn nodes_cover_the_turns_a_grown_session_appended() {
+    use remind_me_core::transcript::{capture_transcript, TranscriptRequest};
+    let db = db("grown");
+    let store = db.store();
+    let request = |reason| TranscriptRequest {
+        session_id: "s-skel",
+        cwd: None,
+        reason: Some(reason),
+        context: None,
+    };
+    let first = [
+        session_line("user", "first ask"),
+        session_line("assistant", "first reply"),
+    ]
+    .join("\n");
+    let made = capture_transcript(&store, &first, &request("stop")).unwrap();
+    let grown = [
+        first,
+        session_line("user", "a later ask"),
+        session_line("assistant", "a later reply"),
+    ]
+    .join("\n");
+    capture_transcript(&store, &grown, &request("end")).unwrap();
+
+    // Lines 1-3 are the first row; the appended turns are lines 5-7 of the
+    // whole dialog, past the end of the first row alone.
+    write_skeleton(
+        &store,
+        &SkeletonWriteInput {
+            capture_id: made.capture_id.clone(),
+            mermaid: DIAGRAM.into(),
+            nodes: nodes(&[("first", 1, 3), ("later", 5, 7)]),
+        },
+    )
+    .unwrap();
+
+    let later = node_slice(&store, &made.capture_id, "later")
+        .unwrap()
+        .unwrap();
+    assert_eq!((later.start_line, later.end_line), (5, 7));
+    assert_eq!(
+        later.content,
+        "**user:** a later ask\n\n**assistant:** a later reply"
+    );
+    let opening = node_slice(&store, &made.capture_id, "first")
+        .unwrap()
+        .unwrap();
+    assert!(opening.content.contains("first ask"));
+    assert!(!opening.content.contains("later"));
+
+    // Past the end of the whole dialog is still refused.
+    let refused = write_skeleton(
+        &store,
+        &SkeletonWriteInput {
+            capture_id: made.capture_id,
+            mermaid: DIAGRAM.into(),
+            nodes: nodes(&[("beyond", 5, 8)]),
+        },
+    );
+    assert!(matches!(
+        refused,
+        Err(SkeletonError::BadRange { lines: 7, .. })
+    ));
+}

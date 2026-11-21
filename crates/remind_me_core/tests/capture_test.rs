@@ -267,7 +267,11 @@ fn a_half_lost_to_deletion_still_reports_the_other() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
     let result = capture(&store, "the transcript", "the summary");
-    queries::delete_memory(&store, &result.dialog_id).unwrap();
+    // The generic delete refuses a dialog (#1616); one deleted before that
+    // guard, or arriving deleted, is simulated at the store.
+    Memories::new(&store)
+        .delete_live(&result.dialog_id, None)
+        .unwrap();
 
     let found = get_capture(&store, &result.capture_id).unwrap().unwrap();
 

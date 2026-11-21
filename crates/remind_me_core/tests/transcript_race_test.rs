@@ -108,8 +108,8 @@ fn race(db: &Database, session: &str, watcher_raw: String, hook_raw: String) -> 
     })
 }
 
-/// The session holds exactly one dialog and one summary, and the archived
-/// transcript is the one behind the dialog that survived.
+/// The session holds exactly one first dialog and one summary (continuation
+/// rows aside), and the archived transcript is the newest one.
 fn assert_one_consistent_pair(store: &Store<'_>, session: &str, messages: usize) {
     let memories = session_memories(store, session).unwrap();
     let kinds: Vec<&str> = memories
@@ -133,8 +133,15 @@ fn assert_one_consistent_pair(store: &Store<'_>, session: &str, messages: usize)
         .find(|m| m.metadata.get("type").and_then(|t| t.as_str()) == Some("dialog"))
         .unwrap();
     let last = format!("turn {messages}");
-    assert!(dialog.content.contains(&last), "{}", dialog.content);
-    let source = archive::source_for(store, &dialog.id, true)
+    // The newest turn sits in the first dialog row or, once the session grew
+    // past it, in a continuation row: dialog rows are never rewritten.
+    let holder = memories
+        .iter()
+        .filter(|m| m.category == "dialog")
+        .find(|m| m.content.contains(&last));
+    let holder = holder.unwrap_or_else(|| panic!("{}", dialog.content));
+    // Each row's source is the lines its own messages came from.
+    let source = archive::source_for(store, &holder.id, true)
         .unwrap()
         .unwrap();
     assert!(source.content.contains(&last));

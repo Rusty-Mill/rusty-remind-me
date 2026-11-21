@@ -25,8 +25,8 @@
 
 use crate::db::imports::ImportLedger;
 use crate::db::queries::delete_memory;
-use crate::db::Result;
 use crate::db::Store;
+use crate::db::{Result, StoreError};
 use crate::models::{UndoImportInput, UndoImportKind, UndoImportResult};
 
 /// Memory ids belonging to an import, plus a human-readable scope label.
@@ -139,6 +139,27 @@ fn forget_tracking(
     }
 }
 
+/// Refuse when any of `ids` is a live dialog row, naming how many.
+fn refuse_dialogs(store: &Store<'_>, ids: &[String]) -> Result<()> {
+    let memories = crate::db::memories::Memories::new(store);
+    let mut dialogs = 0usize;
+    for id in ids {
+        if memories
+            .get_live(id)?
+            .as_ref()
+            .is_some_and(crate::dialog::is_dialog)
+        {
+            dialogs += 1;
+        }
+    }
+    if dialogs == 0 {
+        return Ok(());
+    }
+    Err(StoreError::Invalid(format!(
+        "this import holds {dialogs} dialog rows (the verbatim record), which cannot be deleted; nothing was removed"
+    )))
+}
+
 /// Roll back an import, or report what rolling it back would remove.
 ///
 /// Defaults to a dry run, deliberately: this is a bulk destructive operation
@@ -146,6 +167,9 @@ fn forget_tracking(
 /// work is resumable — call again until `remaining` reaches 0.
 pub fn undo_import(store: &Store<'_>, input: &UndoImportInput) -> Result<UndoImportResult> {
     let (memory_ids, scope) = matching_ids(store, input.import_kind, input.import_id.as_deref())?;
+    // Before anything is removed, dry run included: one dialog in the scope
+    // refuses the whole undo, so it never stops half done (`crate::dialog`).
+    refuse_dialogs(store, &memory_ids)?;
     let soft = crate::sync::store_syncs(store)?;
 
     let mode = if soft {

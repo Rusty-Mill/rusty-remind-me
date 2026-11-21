@@ -589,6 +589,8 @@ pub(crate) fn set_tags_and_metadata(
     metadata: &Value,
 ) -> Result<()> {
     update(tables, id, Origin::Sync, |row| {
+        // Checked in the committing write, not a read before it (#1616).
+        crate::dialog::refuse_category(&row.id, &row.category)?;
         row.tags = tags_json(tags);
         row.metadata = metadata.to_string();
         Ok(())
@@ -602,6 +604,8 @@ pub(crate) fn set_superseded_by(
     updated_at: Option<&str>,
 ) -> Result<()> {
     update(tables, id, Origin::Local, |row| {
+        // Checked in the committing write, not a read before it (#1616).
+        crate::dialog::refuse_category(&row.id, &row.category)?;
         row.superseded_by = Some(superseded_by.to_string());
         if let Some(stamp) = updated_at {
             row.updated_at = stamp.to_string();
@@ -618,8 +622,11 @@ pub(crate) fn supersede_import(
     new_import_id: &str,
     updated_at: &str,
 ) -> Result<usize> {
+    // A dialog is the verbatim record and is never retired automatically
+    // (D13): a re-import leaves the old copy live beside the new one.
     let ids = matching(core_ref(tables)?, |row| {
         row.is_live()
+            && row.category != crate::models::DIALOG_CATEGORY
             && row
                 .metadata_value()
                 .is_some_and(|m| m.get("import_id").and_then(Value::as_str) == Some(old_import_id))
@@ -653,6 +660,8 @@ pub(crate) fn set_merged(
     updated_at: &str,
 ) -> Result<()> {
     update(tables, id, Origin::Local, |row| {
+        // Checked in the committing write, not a read before it (#1616).
+        crate::dialog::refuse_category(&row.id, &row.category)?;
         row.content = content.to_string();
         row.access_count = access_count;
         row.tags = tags_json(tags);
@@ -791,6 +800,9 @@ pub(crate) fn restore_tracked(
     updated_at: &str,
 ) -> Result<()> {
     update(tables, id, Origin::Local, |row| {
+        // A revert never rewrites a dialog: checked in the committing write
+        // (#1616).
+        crate::dialog::refuse_category(&row.id, &row.category)?;
         row.content.clone_from(&values.content);
         row.category.clone_from(&values.category);
         row.tags.clone_from(&values.tags);
@@ -940,6 +952,9 @@ pub(crate) fn access_inputs(tables: &EngineTables, ids: &[String]) -> Result<Vec
 pub(crate) fn live_triples_except(tables: &EngineTables, except_id: &str) -> Result<Vec<Triple>> {
     let mut triples: Vec<Triple> = rows(core_ref(tables)?)
         .filter(|row| row.id != except_id && row.is_live())
+        // A dialog is the verbatim record (D13): never a contradiction
+        // candidate, so a new fact cannot supersede it.
+        .filter(|row| row.category != crate::models::DIALOG_CATEGORY)
         .filter_map(|row| {
             Some(Triple {
                 subject: row.subject?,
@@ -1197,6 +1212,9 @@ pub(crate) fn of_type_page(
 ) -> Result<(usize, Vec<UnclassifiedMemory>)> {
     let mut rows: Vec<MemoryRow> = rows(core_ref(tables)?)
         .filter(|row| row.deleted_at.is_none() && row.memory_type == memory_type)
+        // A dialog is never retyped (`crate::dialog`), so offering one would
+        // only ask for a classification that is then refused.
+        .filter(|row| row.category != crate::models::DIALOG_CATEGORY)
         .collect();
     rows.sort_by(|a, b| (&a.created_at, &a.id).cmp(&(&b.created_at, &b.id)));
     let total = rows.len();
