@@ -54,9 +54,12 @@ pub trait RelatedStore {
     fn bump_pair(&mut self, a: &str, b: &str, now: &str, max_weight: i64) -> Result<()>;
 
     /// Live memories outside `seed_ids` that mention an entity a seed
-    /// mentions, newest first (then id, then entity name), one row per
-    /// shared entity. A link whose memory or entity is not stored is
-    /// skipped; no seeds find nothing.
+    /// mentions, newest first (then id, then entity name). One row per
+    /// (seed link, neighbour link) pair, as the SQL's joins produce them:
+    /// a neighbour sharing one entity with two seeds comes back twice, and
+    /// one sharing two entities with a seed comes back once per entity.
+    /// Callers group and cap. A link whose memory or entity is not stored
+    /// is skipped; no seeds find nothing.
     fn via_entities(&self, seed_ids: &[String]) -> Result<Vec<EntityRelative>>;
 
     /// Remove every pair `memory_id` is part of: part of deleting a memory.
@@ -188,7 +191,7 @@ pub(crate) mod conformance {
         MemoryStore::delete_live(store, "z", Some(T2)).unwrap();
     }
 
-    pub(crate) fn via_entities_is_newest_first_one_row_per_entity<
+    pub(crate) fn via_entities_is_newest_first_one_row_per_link_pair<
         S: RelatedStore + MemoryStore + EntityStore,
     >(
         store: &mut S,
@@ -209,6 +212,22 @@ pub(crate) mod conformance {
                 ("d1".to_string(), "E1".to_string()),
             ],
             "newest first, one row per shared entity, no deleted z, no unknown entity"
+        );
+        let via: Vec<(String, String)> = store
+            .via_entities(&ids(&["a", "c"]))
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.memory.id, r.entity_name))
+            .collect();
+        assert_eq!(
+            via,
+            [
+                ("b".to_string(), "E1".to_string()),
+                ("b".to_string(), "E1".to_string()),
+                ("d1".to_string(), "E1".to_string()),
+                ("d1".to_string(), "E1".to_string()),
+            ],
+            "one row per seed link: two seeds sharing e1 return each neighbour twice"
         );
         assert!(store.via_entities(&[]).unwrap().is_empty());
     }
@@ -291,8 +310,8 @@ macro_rules! related_conformance {
         use $crate::db::related::conformance;
 
         #[test]
-        fn via_entities_is_newest_first_one_row_per_entity() {
-            conformance::via_entities_is_newest_first_one_row_per_entity(&mut $make);
+        fn via_entities_is_newest_first_one_row_per_link_pair() {
+            conformance::via_entities_is_newest_first_one_row_per_link_pair(&mut $make);
         }
         #[test]
         fn document_window_is_live_chunks_in_order() {
