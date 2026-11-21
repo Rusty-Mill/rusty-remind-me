@@ -286,7 +286,8 @@ fn message_lines(raw: &str) -> impl Iterator<Item = (Range<usize>, ChatMessage)>
 }
 
 use crate::transcript_placement::{
-    place, role_of, roles, split_row, Block, Incoming, Placement, Record, MESSAGE_SEPARATOR,
+    holds, place, role_of, roles, split_row, Block, Incoming, Placement, Record, Shape,
+    MESSAGE_SEPARATOR,
 };
 
 /// Each message of `messages` rendered and scrubbed as a stored dialog
@@ -309,8 +310,12 @@ fn row_blocks<'a>(row: &'a crate::models::Memory, roles: &HashSet<&str>) -> Vec<
         Some(rest) => (rest, true),
         None => (row.content.as_str(), false),
     };
-    let expected = Some(held_messages(row)).filter(|&n| n > 0);
-    split_row(content, roles, cut, expected)
+    let shape = Shape {
+        cut,
+        expected: Some(held_messages(row)).filter(|&n| n > 0),
+        roles_listed: row.metadata.get(ROLES_KEY).is_some_and(|r| r.is_array()),
+    };
+    split_row(content, roles, shape)
 }
 
 /// Every message's id, or `None` when any message lacks one.
@@ -361,6 +366,14 @@ fn record_roles(rows: &[crate::models::Memory]) -> HashSet<String> {
         .filter(|row| !row.content.starts_with(TRUNCATION_MARKER))
         .filter_map(|row| role_of(&row.content).map(str::to_string));
     listed.chain(opening).collect()
+}
+
+/// Whether an unplaced row of `rows` holds `blocks` as a run of whole
+/// messages.
+fn held_unplaced(rows: &[crate::models::Memory], roles: &HashSet<&str>, blocks: &[String]) -> bool {
+    rows.iter()
+        .filter(|row| is_unplaced(row))
+        .any(|row| holds(&row_blocks(row, roles), blocks))
 }
 
 /// Whether a dialog row holds a transcript kept whole because it could not
@@ -723,24 +736,32 @@ fn cover(spans: &[Range<usize>], count: usize) -> Option<Range<usize>> {
     Some(first.start..last.end)
 }
 
-/// The distinct source lines of the messages at `indexes`, in order, or
-/// `None` when one of them also holds a message not selected: those bytes
-/// would claim a turn the row does not hold.
+/// The distinct source lines of the messages at `indexes`, in transcript
+/// order, or `None` when one of them also holds a message not selected:
+/// those bytes would claim a turn the row does not hold.
+///
+/// One pass: a line's messages are adjacent in `spans`, so each run of
+/// equal spans is one line, kept when all its messages are selected and
+/// refused when only some are.
 fn slices(spans: &[Range<usize>], indexes: &[usize]) -> Option<Vec<Range<usize>>> {
-    let selected: HashSet<usize> = indexes.iter().copied().collect();
-    let mut lines: Vec<Range<usize>> = Vec::new();
+    let mut selected = vec![false; spans.len()];
     for &i in indexes {
-        let span = spans.get(i)?;
-        let shared = spans
+        *selected.get_mut(i)? = true;
+    }
+    let mut lines = Vec::new();
+    let mut at = 0;
+    while at < spans.len() {
+        let run = spans[at..]
             .iter()
-            .enumerate()
-            .any(|(j, other)| other == span && !selected.contains(&j));
-        if shared {
-            return None;
+            .take_while(|span| **span == spans[at])
+            .count();
+        let chosen = selected[at..at + run].iter().filter(|s| **s).count();
+        match chosen {
+            0 => {}
+            n if n == run => lines.push(spans[at].clone()),
+            _ => return None,
         }
-        if lines.last() != Some(span) {
-            lines.push(span.clone());
-        }
+        at += run;
     }
     Some(lines)
 }
@@ -927,6 +948,12 @@ fn recapture_in(
             ids: ids.as_deref(),
         },
     );
+    // A transcript an unplaced row already holds, such as a retry of the
+    // same tail, is not kept a second time.
+    let placement = match placement {
+        Placement::Unplaced(_) if held_unplaced(&rows, &roles, &blocks) => Placement::Held,
+        other => other,
+    };
     let mut written = Written::new();
     let indexes: Vec<usize> = match &placement {
         // An older or equal copy: nothing is added, and the summary keeps
@@ -1131,6 +1158,31 @@ mod tests {
         // Message 1 alone would claim message 2's bytes too.
         assert_eq!(slices(&spans, &[1]), None);
         assert_eq!(slices(&spans, &[9]), None);
+    }
+
+    #[test]
+    fn slices_stay_linear_over_many_short_lines() {
+        // 200,000 one-byte lines, two messages on every tenth. Scanning all
+        // spans per selected span would take ~10^10 steps; one pass is
+        // instant even unoptimised.
+        let mut spans = Vec::new();
+        for line in 0..200_000usize {
+            let span = line * 2..line * 2 + 1;
+            if line % 10 == 0 {
+                spans.push(span.clone());
+            }
+            spans.push(span);
+        }
+        let indexes: Vec<usize> = (0..spans.len()).step_by(2).collect();
+        let started = std::time::Instant::now();
+        let chosen = slices(&spans, &indexes);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        // Every tenth line's pair is split across the selection: refused.
+        assert_eq!(chosen, None);
+        let all: Vec<usize> = (0..spans.len()).collect();
+        let whole = slices(&spans, &all).unwrap();
+        assert_eq!(whole.len(), 200_000);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
     fn line(role: &str, session: &str, text: &str) -> String {

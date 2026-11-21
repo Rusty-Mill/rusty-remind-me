@@ -861,3 +861,77 @@ fn an_unplaced_sensitive_continuation_is_as_visible_as_its_first_row() {
     let later_at = full.find("another quokka thread").unwrap();
     assert!(first_at < later_at, "{full}");
 }
+
+/// Capture `first` as a row written before rows listed their roles,
+/// dropping its recorded count too when `keep_count` is false.
+fn legacy_capture(store: &Store<'_>, first: &str, keep_count: bool) -> String {
+    use remind_me_core::db::memories::MemoryEdit;
+    use remind_me_core::transcript::capture_transcript;
+    let made = capture_transcript(store, first, &frozen_request("stop")).unwrap();
+    let row = queries::get_memory_by_id(store, &made.dialog_id)
+        .unwrap()
+        .unwrap();
+    let mut metadata = row.metadata.clone();
+    let object = metadata.as_object_mut().unwrap();
+    object.remove("roles");
+    if !keep_count {
+        object.remove("messages");
+    }
+    // Below the guarded paths: the shape of a row an older build wrote.
+    Memories::new(store)
+        .apply_edit(
+            &made.dialog_id,
+            &MemoryEdit {
+                metadata: Some(metadata),
+                ..MemoryEdit::at("2026-11-21T10:00:01Z")
+            },
+        )
+        .unwrap();
+    made.dialog_id
+}
+
+fn assistant_tail(texts: &[&str]) -> String {
+    texts
+        .iter()
+        .map(|t| bare_line("assistant", t))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn a_legacy_row_with_no_roles_or_count_keeps_a_tail_unplaced_once() {
+    use remind_me_core::transcript::capture_transcript;
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    legacy_capture(&store, &bare(&["a1", "b1"]), false);
+
+    // Its boundaries cannot be checked: the tail is kept, flagged.
+    let tail = assistant_tail(&["b1", "c1"]);
+    capture_transcript(&store, &tail, &frozen_request("stop")).unwrap();
+    let rows = continuations(&store);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].metadata["placement"], "unplaced_no_overlap");
+
+    // The same tail again adds no copy.
+    let again = capture_transcript(&store, &tail, &frozen_request("stop")).unwrap();
+    assert_eq!(continuations(&store).len(), 1, "a retry adds nothing");
+    // The legacy row records no count; only the kept tail is counted.
+    assert_eq!(again.messages, 2);
+}
+
+#[test]
+fn a_legacy_row_with_a_count_places_a_tail_on_checked_boundaries() {
+    use remind_me_core::transcript::capture_transcript;
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    legacy_capture(&store, &bare(&["a1", "b1"]), true);
+
+    let tail = assistant_tail(&["b1", "c1"]);
+    capture_transcript(&store, &tail, &frozen_request("stop")).unwrap();
+    capture_transcript(&store, &tail, &frozen_request("stop")).unwrap();
+
+    let rows = continuations(&store);
+    assert_eq!(rows.len(), 1, "placed once, the retry is held");
+    assert_eq!(rows[0].metadata["placement"], "overlap");
+    assert_eq!(rows[0].content, "**assistant:** c1");
+}

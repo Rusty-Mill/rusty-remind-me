@@ -108,19 +108,36 @@ pub fn role_of(block: &str) -> Option<&str> {
         .map(|(role, _)| role)
 }
 
+/// What a stored row says about itself, for [`split_row`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Shape {
+    /// The row lost its start to truncation.
+    pub cut: bool,
+    /// How many messages the row records holding, when it records it.
+    pub expected: Option<usize>,
+    /// The row lists the roles of its messages.
+    pub roles_listed: bool,
+}
+
 /// One stored dialog row split back into its messages.
 ///
 /// A message starts where [`MESSAGE_SEPARATOR`] is followed by `**role:** `
-/// for one of `roles`. `cut` says the row lost its start to truncation, so
-/// its first piece is a fragment and compares as nothing. When the row
-/// records how many messages it holds (`expected`) and the split disagrees,
-/// a message's text held a marker, so the whole row compares as nothing.
-pub fn split_row<'a>(
-    content: &'a str,
-    roles: &HashSet<&str>,
-    cut: bool,
-    expected: Option<usize>,
-) -> Vec<Block<'a>> {
+/// for one of `roles`. A cut row's first piece is a fragment and compares
+/// as nothing. The boundaries are trusted only when the row lists its roles
+/// or its recorded count confirms the split; a split the count disagrees
+/// with means a message's text held a marker. An untrusted row compares as
+/// nothing, so a transcript placed against it stays unplaced.
+pub fn split_row<'a>(content: &'a str, roles: &HashSet<&str>, shape: Shape) -> Vec<Block<'a>> {
+    let Shape {
+        cut,
+        expected,
+        roles_listed,
+    } = shape;
+    // A legacy row (no roles listed) is trusted only on a count it can be
+    // checked against, which a cut row's total is not.
+    if !roles_listed && (cut || expected.is_none()) {
+        return vec![None];
+    }
     let opens = |rest: &str| roles.iter().any(|r| starts_message(rest, r));
     let mut pieces = Vec::new();
     let mut from = 0;
@@ -190,6 +207,12 @@ fn by_text(record: &[Block<'_>], blocks: &[String]) -> Placement {
     }
 }
 
+/// Whether `record` holds `blocks` as a run of whole messages.
+pub fn holds(record: &[Block<'_>], blocks: &[String]) -> bool {
+    let pattern: Vec<&str> = blocks.iter().map(String::as_str).collect();
+    !pattern.is_empty() && count(record, &pattern) > 0
+}
+
 /// KMP failure table: `fail[i]` is the length of the longest proper prefix
 /// of `pattern[..=i]` that is also its suffix.
 fn failure(pattern: &[&str]) -> Vec<usize> {
@@ -246,7 +269,7 @@ mod tests {
     fn by_text_of(record: &[&str], sent: &[&str]) -> Placement {
         let text = blocks(record).join(MESSAGE_SEPARATOR);
         let sent = blocks(sent);
-        let recorded = split_row(&text, &roles(&sent), false, Some(record.len()));
+        let recorded = split_row(&text, &roles(&sent), counted(record.len()));
         place(
             &Record {
                 blocks: &recorded,
@@ -257,6 +280,35 @@ mod tests {
                 ids: None,
             },
         )
+    }
+
+    /// A legacy row: no roles listed, `n` messages recorded.
+    fn counted(n: usize) -> Shape {
+        Shape {
+            cut: false,
+            expected: Some(n),
+            roles_listed: false,
+        }
+    }
+
+    #[test]
+    fn a_legacy_row_is_trusted_only_on_a_count_it_can_be_checked_against() {
+        let sent = blocks(&["x"]);
+        let roles = roles(&sent);
+        let row = "**user:** a\n\n**user:** b";
+        let legacy = |cut: bool, expected: Option<usize>| Shape {
+            cut,
+            expected,
+            roles_listed: false,
+        };
+        assert_eq!(split_row(row, &roles, legacy(false, None)), vec![None]);
+        assert_eq!(split_row(row, &roles, legacy(true, Some(2))), vec![None]);
+        assert_eq!(split_row(row, &roles, legacy(false, Some(2))).len(), 2);
+        let listed = Shape {
+            roles_listed: true,
+            ..legacy(false, None)
+        };
+        assert_eq!(split_row(row, &roles, listed).len(), 2);
     }
 
     fn new_at(indexes: impl IntoIterator<Item = usize>) -> Placement {
@@ -360,14 +412,22 @@ mod tests {
         let roles = roles(&sent);
         let row = "**user:** a\n\nstill a\n\n**user:** b";
         assert_eq!(
-            split_row(row, &roles, false, Some(2)),
+            split_row(row, &roles, counted(2)),
             vec![Some("**user:** a\n\nstill a"), Some("**user:** b")]
         );
         // A count that disagrees: some text held a marker. Nothing compares.
-        assert_eq!(split_row(row, &roles, false, Some(3)), vec![None]);
+        assert_eq!(split_row(row, &roles, counted(3)), vec![None]);
         // A row cut by truncation: its first piece is a fragment.
         assert_eq!(
-            split_row("tail of a\n\n**user:** b", &roles, true, None),
+            split_row(
+                "tail of a\n\n**user:** b",
+                &roles,
+                Shape {
+                    cut: true,
+                    expected: None,
+                    roles_listed: true
+                }
+            ),
             vec![None, Some("**user:** b")]
         );
     }
