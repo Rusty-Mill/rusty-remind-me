@@ -127,11 +127,20 @@ impl Backend for SqliteTables {
             .map_err(sqlite_error)
     }
 
-    /// A failed `COMMIT` leaves the transaction open (state 3) or, after an
-    /// I/O error, rolled back by SQLite itself (state 1); either way
-    /// [`Self::transaction_state`] reads which from the connection.
+    /// A failed `COMMIT` that leaves the transaction open (`SQLITE_BUSY`,
+    /// a deferred constraint) is state 3 and gets rolled back. One that
+    /// leaves the connection in autocommit was an I/O error SQLite rolled
+    /// back in memory, but a whole frame may still be in the WAL for
+    /// recovery to replay: state 4, so the lock fails closed.
     fn commit_transaction(&mut self) -> Result<()> {
-        self.conn.execute_batch("COMMIT").map_err(sqlite_error)
+        let committed = self.conn.execute_batch("COMMIT").map_err(sqlite_error);
+        if committed.is_err() && self.conn.is_autocommit() {
+            // SQLite rolled back in memory, but an I/O error (a failed WAL
+            // sync, say) can leave a whole commit frame that recovery
+            // replays on reopen: the outcome is not known.
+            self.failed = true;
+        }
+        committed
     }
 
     fn transaction_state(&self) -> TransactionState {
@@ -183,12 +192,12 @@ impl Backend for SqliteTables {
         Ok(usize::from(folded > 0) + usize::from(vacuum))
     }
 
-    /// A consistent copy by `VACUUM INTO`, as a directory [`Self::open`]
-    /// opens.
     fn test_rows(&mut self) -> Option<&mut dyn crate::testing::TestRows> {
         Some(self)
     }
 
+    /// A consistent copy by `VACUUM INTO`, as a directory [`Self::open`]
+    /// opens.
     fn backup_to(&self, dest: &Path) -> Result<()> {
         if dest.exists() {
             return Err(StoreError::Invalid(format!(
@@ -321,6 +330,33 @@ mod tests {
         assert!(refused.contains("daemon stop"), "{refused}");
         drop(first);
         SqliteTables::open(&dir).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn size_on_disk_counts_the_wal() {
+        use crate::db::stats::StatsStore;
+        let dir = scratch("size");
+        let mut t = SqliteTables::open(&dir).unwrap();
+        for i in 0..50 {
+            MemoryStore::insert(
+                &mut t,
+                &NewMemory::new(format!("m{i}"), &"x".repeat(2000), NOW),
+            )
+            .unwrap();
+        }
+        let on_disk: u64 = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().metadata().unwrap().len())
+            .sum();
+        assert!(
+            std::fs::metadata(dir.join(format!("{FILE}-wal")))
+                .unwrap()
+                .len()
+                > 0
+        );
+        assert_eq!(t.size_on_disk().unwrap(), on_disk);
+        drop(t);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

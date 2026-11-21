@@ -128,7 +128,13 @@ impl StatsStore for SqliteTables {
         )
     }
 
+    /// The database file and its WAL as they sit on disk; the page count
+    /// for an in-memory database.
     fn size_on_disk(&self) -> Result<u64> {
+        if let Some(file) = self.conn.path().filter(|p| !p.is_empty()) {
+            let size = |p: &str| std::fs::metadata(p).map_or(0, |m| m.len());
+            return Ok(size(file) + size(&format!("{file}-wal")));
+        }
         let bytes = self.count(
             "SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()",
             [],
