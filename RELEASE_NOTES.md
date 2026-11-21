@@ -10,7 +10,9 @@ Dated entries, newest first. One entry per merged pull request.
 - `remind_me_reclassify` leaves dialogs as they are and lists them in a new `refused` field; `remind_me_reclassify_batch` no longer offers them.
 - `remind_me_consolidate` never takes a dialog as a merge candidate (it could before), a contradicting fact from a capture or annotation never supersedes a dialog that carries a triple, and a changed-file re-import no longer supersedes the old import's dialog rows (pack D13).
 - Dialogs never go dormant, and `remind_me_vitality_report` leaves them out of its counts. Default search already left them out unless `include_raw` (ADR-0029); a test now pins it.
-- Unchanged: captures write dialogs, and a session transcript's recapture still grows its dialog in place with a `recapture` revision (pack Q14). No schema change, no data migration; no row is touched by this change.
+- A session transcript's recapture no longer rewrites its dialog row: the first dialog row is read-only, the turns added since go into a new continuation dialog row (`metadata.type` `dialog_continuation`, same capture id, `continues`, `from_message`, `messages`), and only the summary is refreshed, all in one transaction (Nano, pack Q14). Re-sending a transcript with no new turns adds nothing.
+- Superseding (contradicting facts, `supersedes`, re-import) and consolidation merges check the dialog category inside the write that commits them, not in a read before it.
+- No schema change, no data migration; no existing row is touched by this change.
 
 ## 2026-11-19 — Decisions normalise apply
 

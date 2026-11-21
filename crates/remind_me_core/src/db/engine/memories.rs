@@ -589,6 +589,8 @@ pub(crate) fn set_tags_and_metadata(
     metadata: &Value,
 ) -> Result<()> {
     update(tables, id, Origin::Sync, |row| {
+        // Checked in the committing write, not a read before it (#1616).
+        crate::dialog::refuse_category(&row.id, &row.category)?;
         row.tags = tags_json(tags);
         row.metadata = metadata.to_string();
         Ok(())
@@ -602,6 +604,8 @@ pub(crate) fn set_superseded_by(
     updated_at: Option<&str>,
 ) -> Result<()> {
     update(tables, id, Origin::Local, |row| {
+        // Checked in the committing write, not a read before it (#1616).
+        crate::dialog::refuse_category(&row.id, &row.category)?;
         row.superseded_by = Some(superseded_by.to_string());
         if let Some(stamp) = updated_at {
             row.updated_at = stamp.to_string();
@@ -656,6 +660,8 @@ pub(crate) fn set_merged(
     updated_at: &str,
 ) -> Result<()> {
     update(tables, id, Origin::Local, |row| {
+        // Checked in the committing write, not a read before it (#1616).
+        crate::dialog::refuse_category(&row.id, &row.category)?;
         row.content = content.to_string();
         row.access_count = access_count;
         row.tags = tags_json(tags);

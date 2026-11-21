@@ -22,12 +22,18 @@ pub fn is_dialog(memory: &Memory) -> bool {
 
 /// Refuse an edit, supersede, merge or delete of a dialog row.
 pub fn refuse_dialog_edit(memory: &Memory) -> Result<()> {
-    if !is_dialog(memory) {
+    refuse_category(&memory.id, &memory.category)
+}
+
+/// [`refuse_dialog_edit`] for a row known by id and category: what a store
+/// adapter checks inside the write that would change it, so nothing can
+/// slip in between a read and the write.
+pub fn refuse_category(id: &str, category: &str) -> Result<()> {
+    if category != DIALOG_CATEGORY {
         return Ok(());
     }
     Err(StoreError::Invalid(format!(
-        "memory {} is a dialog (the verbatim record) and cannot be edited or deleted",
-        memory.id
+        "memory {id} is a dialog (the verbatim record) and cannot be edited or deleted"
     )))
 }
 

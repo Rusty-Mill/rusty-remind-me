@@ -374,10 +374,12 @@ pub trait MemoryStore {
     /// Replace `id`'s tags and metadata without stamping `updated_at`: a sync
     /// merge that lost last-write-wins still keeps the union, and must not
     /// look like a newer local edit.
+    /// Refuses a dialog row ([`crate::dialog`]), checked inside the write.
     fn set_tags_and_metadata(&mut self, id: &str, tags: &[String], metadata: &Value) -> Result<()>;
 
     /// Point `id` at the memory that replaces it. `updated_at`, when given,
     /// is stamped too, which is what puts the change in the sync outbox.
+    /// Refuses a dialog row ([`crate::dialog`]), checked inside the write.
     fn set_superseded_by(
         &mut self,
         id: &str,
@@ -401,6 +403,7 @@ pub trait MemoryStore {
 
     /// Rewrite `id` as the merge of its cluster: content, summed access
     /// count and tags, stamping `updated_at`.
+    /// Refuses a dialog row ([`crate::dialog`]), checked inside the write.
     fn set_merged(
         &mut self,
         id: &str,

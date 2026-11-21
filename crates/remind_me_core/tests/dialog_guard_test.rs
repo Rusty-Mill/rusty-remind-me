@@ -409,3 +409,63 @@ fn a_contradicting_fact_supersedes_a_fact_but_never_a_dialog() {
     assert_eq!(superseded_by(&said), None);
     assert!(queries::get_memory_by_id(&store, &said).unwrap().is_some());
 }
+
+fn session_line(role: &str, text: &str) -> String {
+    json!({
+        "type": role, "sessionId": "s-frozen", "uuid": format!("u-{text}"),
+        "timestamp": "2026-11-21T10:00:00.000Z",
+        "message": {"role": role, "content": text}
+    })
+    .to_string()
+}
+
+#[test]
+fn recapturing_a_captured_session_leaves_the_dialog_row_unchanged() {
+    use remind_me_core::transcript::{capture_transcript, TranscriptRequest, CONTINUATION_TYPE};
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let request = |reason| TranscriptRequest {
+        session_id: "s-frozen",
+        cwd: None,
+        reason: Some(reason),
+        context: None,
+    };
+    let first = [
+        session_line("user", "first ask"),
+        session_line("assistant", "first reply"),
+    ];
+    let made = capture_transcript(&store, &first.join("\n"), &request("stop")).unwrap();
+    let before = queries::get_memory_by_id(&store, &made.dialog_id)
+        .unwrap()
+        .unwrap();
+
+    let grown = [first.join("\n"), session_line("user", "a later ask")].join("\n");
+    let again = capture_transcript(&store, &grown, &request("end")).unwrap();
+
+    let after = queries::get_memory_by_id(&store, &made.dialog_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(again.dialog_id, made.dialog_id);
+    assert_eq!(after.content, before.content);
+    assert_eq!(after.metadata, before.metadata);
+    assert_eq!(after.tags, before.tags);
+    assert_eq!(after.updated_at, before.updated_at);
+    let history = remind_me_core::db::history::Revisions::new(&store)
+        .list(&made.dialog_id, 10)
+        .unwrap();
+    assert!(history.is_empty(), "{history:?}");
+
+    // The later turn is kept, in its own read-only dialog row.
+    let continuation = remind_me_core::episodes::session_memories(&store, "s-frozen")
+        .unwrap()
+        .into_iter()
+        .find(|m| m.metadata["type"] == CONTINUATION_TYPE)
+        .unwrap();
+    assert!(continuation.content.contains("a later ask"));
+    assert!(!continuation.content.contains("first ask"));
+    assert_eq!(continuation.category, DIALOG_CATEGORY);
+    assert_refused(
+        queries::delete_memory(&store, &continuation.id),
+        &continuation.id,
+    );
+}

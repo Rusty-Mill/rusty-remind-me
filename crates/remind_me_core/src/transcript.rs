@@ -3,15 +3,16 @@
 //! A hook fires at every `Stop`, `PreCompact` and `SessionEnd`; each firing
 //! hands over the whole transcript so far. The first creates the dialog and
 //! summary pair ([`crate::capture::auto_capture_stamped`]); every later one
-//! replaces that pair's text in place (a `recapture` revision records what
-//! it replaced), so a long session is one capture, not one per turn.
+//! refreshes the summary in place (a `recapture` revision records what it
+//! replaced), so a long session is one capture, not one per turn. The dialog
+//! half is never rewritten: dialogs are read-only (`crate::dialog`).
 //!
 //! Parsing reuses the chat importer's envelope reader
 //! ([`crate::importer::extract_messages_with_tools`]), so the transcript's text, times
 //! and tool calls are read the same way an import reads them.
 
 use crate::capture::{auto_capture_stamped, get_capture, CaptureStamp};
-use crate::db::memories::{Memories, MemoryEdit};
+use crate::db::memories::{Memories, MemoryEdit, NewMemory};
 use crate::db::{Result, Store, StoreError};
 use crate::history::{capture_revision, TrackedChanges};
 use crate::importer::{extract_messages_with_tools, ChatMessage, ToolUseSummary};
@@ -165,13 +166,7 @@ pub fn parse(raw: &str) -> TranscriptSummary {
 /// A message posted through one of `message_tools` is kept in full and is
 /// the session's reply wherever it comes last.
 pub fn parse_with(raw: &str, message_tools: &MessageTools) -> TranscriptSummary {
-    let messages: Vec<ChatMessage> = raw
-        .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
-        // Hook-injected context, not something the user or model said.
-        .filter(|v| v.get("isMeta").and_then(|m| m.as_bool()) != Some(true))
-        .flat_map(|v| extract_messages_with_tools(&v))
-        .collect();
+    let messages = messages_of(raw);
 
     let mut tool_counts: BTreeMap<String, usize> = BTreeMap::new();
     for tool in messages.iter().flat_map(|m| &m.tool_use) {
@@ -257,6 +252,24 @@ fn render_message(message: &ChatMessage, message_tools: &MessageTools) -> String
         message.role,
         lines.join("\n").trim()
     )
+}
+
+/// The messages of a JSONL transcript, in order. A malformed line is skipped.
+fn messages_of(raw: &str) -> Vec<ChatMessage> {
+    raw.lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
+        // Hook-injected context, not something the user or model said.
+        .filter(|v| v.get("isMeta").and_then(|m| m.as_bool()) != Some(true))
+        .flat_map(|v| extract_messages_with_tools(&v))
+        .collect()
+}
+
+/// The dialog of `raw`'s messages after the first `skip`, rendered as a
+/// first capture renders a whole session.
+fn dialog_after(raw: &str, skip: usize) -> String {
+    let messages = messages_of(raw);
+    let rest = messages.get(skip..).unwrap_or_default();
+    render_dialog(rest, &MessageTools::from_env())
 }
 
 fn render_dialog(messages: &[ChatMessage], message_tools: &MessageTools) -> String {
@@ -417,7 +430,10 @@ pub fn capture_unless_held_pausing(
     let _serial = CAPTURE_LOCK.lock();
     let existing = existing_dialog(store, session_id)?;
     after_lookup();
-    let held = existing.as_ref().map(held_messages);
+    let held = existing
+        .as_ref()
+        .map(|dialog| held_by(store, dialog))
+        .transpose()?;
     let keep = |held: usize| match replace {
         Replace::Never => true,
         Replace::IfLonger => held >= parsed.messages,
@@ -446,8 +462,22 @@ fn checked<'r>(raw: &str, request: &TranscriptRequest<'r>) -> Result<(&'r str, T
     Ok((session_id, parsed))
 }
 
-/// How many messages a captured dialog holds; `0` for one written before
-/// the count was recorded.
+/// How many messages the capture `dialog` belongs to has seen: the larger of
+/// the dialog's count and its summary's, since a recapture refreshes only the
+/// summary.
+fn held_by(store: &Store<'_>, dialog: &crate::models::Memory) -> Result<usize> {
+    let summary = match dialog.capture_id.as_deref() {
+        Some(id) => get_capture(store, id)?.and_then(|c| c.summary),
+        None => None,
+    };
+    Ok(summary
+        .as_ref()
+        .map_or(0, held_messages)
+        .max(held_messages(dialog)))
+}
+
+/// How many messages a captured memory's metadata records; `0` for one
+/// written before the count was recorded.
 fn held_messages(dialog: &crate::models::Memory) -> usize {
     dialog
         .metadata
@@ -466,7 +496,7 @@ fn write_capture(
     request: &TranscriptRequest<'_>,
 ) -> Result<TranscriptOutcome> {
     let outcome = match existing {
-        Some(existing) => recapture(store, &existing, parsed, request.reason)?,
+        Some(existing) => recapture(store, &existing, raw, parsed, request.reason)?,
         None => first_capture(store, session_id, parsed, request)?,
     };
     // The raw transcript decorates the capture; failing to keep it must not
@@ -558,9 +588,10 @@ pub fn is_captured(store: &Store<'_>, session_id: &str) -> Result<bool> {
 /// How many messages `session_id`'s capture holds, or `None` when it has
 /// none.
 pub fn captured_messages(store: &Store<'_>, session_id: &str) -> Result<Option<usize>> {
-    Ok(existing_dialog(store, session_id)?
+    existing_dialog(store, session_id)?
         .as_ref()
-        .map(held_messages))
+        .map(|dialog| held_by(store, dialog))
+        .transpose()
 }
 
 /// The dialog half already captured for `session_id`, if any.
@@ -573,14 +604,55 @@ fn existing_dialog(store: &Store<'_>, session_id: &str) -> Result<Option<crate::
         }))
 }
 
-/// Replace both halves' text with `parsed`, recording what was replaced.
+/// Record a grown session: the turns no row holds yet go into a new,
+/// read-only continuation dialog row, and the summary half is refreshed with
+/// `parsed`, recording what it replaced. Both land in one transaction, so a
+/// failure cannot leave turns recorded under a summary that does not count
+/// them. The first dialog row is never rewritten: dialogs are the verbatim
+/// record and read-only (D13, pack Q14, `crate::dialog`).
 fn recapture(
     store: &Store<'_>,
     dialog: &crate::models::Memory,
+    raw: &str,
     parsed: &TranscriptSummary,
     reason: Option<&str>,
 ) -> Result<TranscriptOutcome> {
+    let (outcome, written) =
+        store.transaction(|page| recapture_in(page, dialog, raw, parsed, reason))?;
+    // Embedded after the commit, best-effort as an update is: a model call
+    // never runs inside the write, and its failure undoes nothing.
+    if let Some(embedder) = crate::embedder::available_embedder() {
+        for (id, content) in &written {
+            let _ = crate::vectors::embed_and_store(store, &*embedder, id, content);
+        }
+    }
+    Ok(outcome)
+}
+
+/// Ids and stored text of the rows a recapture wrote, for embedding.
+type Written = Vec<(String, String)>;
+
+fn recapture_in(
+    store: &Store<'_>,
+    dialog: &crate::models::Memory,
+    raw: &str,
+    parsed: &TranscriptSummary,
+    reason: Option<&str>,
+) -> Result<(TranscriptOutcome, Written)> {
     let capture_id = dialog.capture_id.clone().ok_or(StoreError::NotFound)?;
+    let held = held_by(store, dialog)?;
+    let mut written = Written::new();
+    if parsed.messages > held {
+        let text = dialog_after(raw, held);
+        written.push(append_continuation(
+            store,
+            dialog,
+            &text,
+            held,
+            parsed.messages,
+            reason,
+        )?);
+    }
     let capture = get_capture(store, &capture_id)?.ok_or(StoreError::NotFound)?;
     let summary = capture.summary.ok_or(StoreError::NotFound)?;
     let title = parsed.title();
@@ -589,36 +661,85 @@ fn recapture(
         ("messages", serde_json::json!(parsed.messages)),
         ("reason", serde_json::json!(reason)),
     ];
-    replace_text(
-        store,
-        dialog,
-        &parsed.dialog,
-        &with_keys(&dialog.metadata, &pairs),
-    )?;
-    replace_text(
+    let content = replace_text(
         store,
         &summary,
         &parsed.summary(),
         &with_keys(&summary.metadata, &pairs),
     )?;
-    Ok(TranscriptOutcome {
+    written.push((summary.id.clone(), content));
+    let outcome = TranscriptOutcome {
         capture_id,
         dialog_id: dialog.id.clone(),
         summary_id: summary.id,
         messages: parsed.messages,
-    })
+    };
+    Ok((outcome, written))
+}
+
+/// `metadata.type` of a continuation dialog row: the turns a session added
+/// after its first dialog row was written.
+pub const CONTINUATION_TYPE: &str = "dialog_continuation";
+
+/// Insert a dialog row holding messages `from..to` of `first`'s session,
+/// sharing its capture id, scrubbed as a first capture is. Returns its id and
+/// stored text. Its category is [`crate::models::DIALOG_CATEGORY`], so it is
+/// as read-only as the first row.
+fn append_continuation(
+    store: &Store<'_>,
+    first: &crate::models::Memory,
+    text: &str,
+    from: usize,
+    to: usize,
+    reason: Option<&str>,
+) -> Result<(String, String)> {
+    let now = Utc::now().to_rfc3339();
+    let id = format!("mem_{}", uuid::Uuid::new_v4().simple());
+    let mut tags = first.tags.clone();
+    let mut metadata = serde_json::json!({
+        "type": CONTINUATION_TYPE,
+        "continues": first.id,
+        "from_message": from,
+        "messages": to,
+        "reason": reason,
+    });
+    let content = crate::boundary::scrub(text, &mut tags, &mut metadata);
+    let row = NewMemory {
+        category: crate::models::DIALOG_CATEGORY.to_string(),
+        tags,
+        source: first.source.clone(),
+        metadata,
+        capture_id: first.capture_id.clone(),
+        memory_type: first
+            .memory_type
+            .clone()
+            .unwrap_or_else(|| "unclassified".into()),
+        project: first.project.clone(),
+        session_id: first.session_id.clone(),
+        git_remote: first.git_remote.clone(),
+        git_branch: first.git_branch.clone(),
+        git_sha: first.git_sha.clone(),
+        cwd: first.cwd.clone(),
+        written_by: "hook".into(),
+        capture_method: "auto".into(),
+        ..NewMemory::new(id.clone(), content.clone(), &now)
+    };
+    Memories::new(store).insert(&row)?;
+    Ok((id, content))
 }
 
 /// Edit a memory's content and metadata, writing a `recapture` revision of
-/// what it held and re-embedding best-effort, as an update does. The text
-/// is scrubbed as a first capture's is, so a refresh never stores what a
-/// capture would have redacted.
+/// what it held, and return the stored text for embedding. The text is
+/// scrubbed as a first capture's is, so a refresh never stores what a
+/// capture would have redacted. A dialog is refused: only the summary half
+/// is ever refreshed.
 fn replace_text(
     store: &Store<'_>,
     memory: &crate::models::Memory,
     content: &str,
     metadata: &serde_json::Value,
-) -> Result<()> {
+) -> Result<String> {
+    crate::dialog::refuse_dialog_edit(memory)?;
     let mut tags = memory.tags.clone();
     let mut metadata = metadata.clone();
     let content = crate::boundary::scrub(content, &mut tags, &mut metadata);
@@ -638,10 +759,7 @@ fn replace_text(
             ..MemoryEdit::at(Utc::now().to_rfc3339())
         },
     )?;
-    if let Some(embedder) = crate::embedder::available_embedder() {
-        let _ = crate::vectors::embed_and_store(store, &*embedder, &memory.id, &content);
-    }
-    Ok(())
+    Ok(content)
 }
 
 #[cfg(test)]
@@ -869,11 +987,14 @@ mod tests {
     }
 
     #[test]
-    fn one_capture_per_session_and_recapture_replaces_in_place() {
+    fn one_capture_per_session_and_recapture_appends_a_continuation() {
         let db = Database::open_in_memory().unwrap();
         let store = db.store();
         let first = capture_transcript(&store, &transcript(""), &request("stop")).unwrap();
         assert_eq!(first.messages, 3);
+        let before = crate::db::queries::get_memory_by_id(&store, &first.dialog_id)
+            .unwrap()
+            .unwrap();
 
         let grown = transcript(&line("user", "s1", "and one more thing"));
         let second = capture_transcript(&store, &grown, &request("end")).unwrap();
@@ -883,23 +1004,65 @@ mod tests {
         assert_eq!(second.messages, 4);
 
         let memories = crate::episodes::session_memories(&store, "s1").unwrap();
-        assert_eq!(memories.len(), 2, "still one pair");
+        assert_eq!(memories.len(), 3, "the pair and one continuation");
         let dialog = memories.iter().find(|m| m.id == first.dialog_id).unwrap();
-        assert!(dialog.content.contains("and one more thing"));
+        assert_eq!(
+            dialog.content, before.content,
+            "the first dialog row is read-only"
+        );
+        assert_eq!(dialog.updated_at, before.updated_at);
+        let more = memories
+            .iter()
+            .find(|m| m.metadata["type"] == CONTINUATION_TYPE)
+            .unwrap();
+        assert_eq!(more.category, crate::models::DIALOG_CATEGORY);
+        assert_eq!(more.capture_id.as_deref(), Some(first.capture_id.as_str()));
+        assert_eq!(
+            more.metadata["continues"],
+            serde_json::json!(first.dialog_id)
+        );
+        assert_eq!(more.metadata["from_message"], serde_json::json!(3));
+        assert_eq!(more.metadata["messages"], serde_json::json!(4));
+        assert!(
+            more.content.contains("and one more thing"),
+            "{}",
+            more.content
+        );
+        assert!(
+            !more.content.contains(&before.content),
+            "only the new turns"
+        );
+        assert_eq!(more.session_id, dialog.session_id);
+
+        // The same transcript again adds nothing.
+        capture_transcript(&store, &grown, &request("stop")).unwrap();
+        assert_eq!(
+            crate::episodes::session_memories(&store, "s1")
+                .unwrap()
+                .len(),
+            3
+        );
         assert_eq!(dialog.written_by, "hook");
         assert_eq!(dialog.capture_method, "auto");
         assert_eq!(dialog.session_id.as_deref(), Some("s1"));
         assert_eq!(dialog.cwd.as_deref(), Some("/work/quokka"));
         assert_eq!(dialog.project.as_deref(), Some("quokka"));
-        assert_eq!(dialog.metadata["reason"], "end");
+        assert_eq!(dialog.metadata["reason"], "stop", "never rewritten");
+        assert_eq!(more.metadata["reason"], "end");
         let summary = memories.iter().find(|m| m.id == first.summary_id).unwrap();
         assert!(summary.content.contains("Messages: 4"));
 
-        let revisions = crate::db::history::Revisions::new(&store)
-            .list(&first.dialog_id, 10)
-            .unwrap();
-        assert_eq!(revisions.len(), 1);
-        assert_eq!(revisions[0].revision_reason.as_deref(), Some("recapture"));
+        let revisions = |id: &str| {
+            crate::db::history::Revisions::new(&store)
+                .list(id, 10)
+                .unwrap()
+        };
+        assert!(revisions(&first.dialog_id).is_empty());
+        let refreshed = revisions(&first.summary_id);
+        assert!(!refreshed.is_empty());
+        assert!(refreshed
+            .iter()
+            .all(|r| r.revision_reason.as_deref() == Some("recapture")));
         assert!(crate::db::sessions::Sessions::new(&store)
             .get("s1")
             .unwrap()
@@ -966,12 +1129,22 @@ mod tests {
         let made = capture_transcript(&store, &transcript(&leaked), &request("stop")).unwrap();
 
         let memories = crate::episodes::session_memories(&store, "s1").unwrap();
-        let dialog = memories.iter().find(|m| m.id == made.dialog_id).unwrap();
-        assert!(!dialog.content.contains(&token), "{}", dialog.content);
-        assert!(dialog.content.contains("[REDACTED:github_token]"));
-        assert!(dialog.tags.iter().any(|t| t == crate::redact::REDACTED_TAG));
+        assert!(memories.iter().all(|m| !m.content.contains(&token)));
+        let more = memories
+            .iter()
+            .find(|m| {
+                m.metadata["type"] == CONTINUATION_TYPE
+                    && m.capture_id.as_deref() == Some(made.capture_id.as_str())
+            })
+            .unwrap();
+        assert!(
+            more.content.contains("[REDACTED:github_token]"),
+            "{}",
+            more.content
+        );
+        assert!(more.tags.iter().any(|t| t == crate::redact::REDACTED_TAG));
         assert_eq!(
-            dialog.metadata["redactions"],
+            more.metadata["redactions"],
             serde_json::json!(["github_token"])
         );
     }
@@ -1000,17 +1173,22 @@ mod tests {
         assert_eq!(first.len(), 2);
         assert!(first.iter().all(|t| clean(t) && !t.is_empty()), "{first:?}");
 
-        // Recapture over a session first captured clean.
+        // Recapture over a session first captured clean: only the summary
+        // is refreshed, so only its title changes.
         let db = Database::open_in_memory().unwrap();
         let store = db.store();
-        capture_transcript(&store, &transcript(""), &request("stop")).unwrap();
+        let made = capture_transcript(&store, &transcript(""), &request("stop")).unwrap();
         capture_transcript(&store, &leaky, &request("stop")).unwrap();
         let again = titles(&store);
         assert_eq!(again.len(), 2);
-        assert!(
-            again.iter().all(|t| clean(t) && t.starts_with("xxx")),
-            "{again:?}"
-        );
+        assert!(again.iter().all(|t| clean(t)), "{again:?}");
+        let summary = crate::db::queries::get_memory_by_id(&store, &made.summary_id)
+            .unwrap()
+            .unwrap();
+        assert!(summary.metadata["title"]
+            .as_str()
+            .unwrap()
+            .starts_with("xxx"));
     }
 
     #[test]
