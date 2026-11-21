@@ -6,6 +6,7 @@
 //! sequence, as SQLite's `INTEGER PRIMARY KEY` gives it: a caller passes it
 //! back to revert, so it must never be issued twice.
 
+use super::capture;
 use super::{core_ref, deleted, engine_error, memories, micros, EngineTables};
 use crate::db::history::{HistoryStore, Tracked};
 use crate::db::Result;
@@ -116,7 +117,9 @@ impl HistoryStore for EngineTables {
 
     fn delete_for(&mut self, memory_id: &str) -> Result<()> {
         for record in of_memory(self, memory_id) {
+            let noted = self.note(capture::REVISIONS, &record.id, None::<&RevisionRecord>)?;
             deleted(self.revisions.delete(record.id))?;
+            self.emit(noted)?;
         }
         Ok(())
     }
@@ -132,7 +135,9 @@ impl HistoryStore for EngineTables {
             .map(|r| r.id)
             .collect();
         for id in &doomed {
+            let noted = self.note(capture::REVISIONS, id, None::<&RevisionRecord>)?;
             deleted(self.revisions.delete(*id))?;
+            self.emit(noted)?;
         }
         Ok(doomed.len())
     }
@@ -158,7 +163,9 @@ impl HistoryStore for EngineTables {
             revision_reason: reason.map(str::to_string),
             project: values.project.clone(),
         };
-        self.revisions.insert(record).map_err(engine_error)
+        let noted = self.note(capture::REVISIONS, &id, Some(&record))?;
+        self.revisions.insert(record).map_err(engine_error)?;
+        self.emit(noted)
     }
 
     /// `edited_at` compared as SQLite compares the text.

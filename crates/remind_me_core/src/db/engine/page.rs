@@ -173,6 +173,7 @@ impl EngineTables {
             self.failed = true;
             return Err(e);
         }
+        self.emit_batch(&batch)?;
         let checkpointed = self.checkpoint_after_commit();
         if checkpointed.is_err() {
             self.failed = true;

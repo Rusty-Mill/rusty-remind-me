@@ -362,6 +362,7 @@ impl EngineTables {
         }
         let batch = encode(&changes)?;
         self.journal.commit(&batch).map_err(engine_error)?;
+        self.emit_batch(&batch)?;
         for change in changes {
             if let Err(e) = apply(&mut self.core, change) {
                 self.failed = true;

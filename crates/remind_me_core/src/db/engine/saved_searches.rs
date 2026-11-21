@@ -3,6 +3,7 @@
 //! [`SavedSearchStore`] port (ADR-0035). The behaviour matches the old
 //! SQLite statements one for one.
 
+use super::capture;
 use super::{
     deleted, engine_error, engine_id, ensure_same_id, micros, pair_engine_id, EngineTables,
 };
@@ -156,7 +157,9 @@ impl SavedSearchStore for EngineTables {
         if let Some(stored) = self.saved_searches.get(row.engine_id) {
             ensure_same_id(&stored.id, &saved.id)?;
         }
-        self.saved_searches.insert(row).map_err(engine_error)
+        let noted = self.note(capture::SAVED_SEARCHES, &row.engine_id, Some(&row))?;
+        self.saved_searches.insert(row).map_err(engine_error)?;
+        self.emit(noted)
     }
 
     /// A missing id changes nothing, as an `UPDATE` matching no row does.
@@ -172,7 +175,9 @@ impl SavedSearchStore for EngineTables {
             updated_at: saved.updated_at.clone(),
             ..stored
         };
-        self.saved_searches.replace(row).map_err(engine_error)
+        let noted = self.note(capture::SAVED_SEARCHES, &row.engine_id, Some(&row))?;
+        self.saved_searches.replace(row).map_err(engine_error)?;
+        self.emit(noted)
     }
 
     fn get(&self, id: &str) -> Result<SavedSearch> {
@@ -203,11 +208,17 @@ impl SavedSearchStore for EngineTables {
     /// A missing id is not an error, as a `DELETE` matching no row is not.
     fn delete(&mut self, id: &str) -> Result<()> {
         for seen in seen_rows(self, id) {
+            let noted = self.note(capture::SEEN, &seen, None::<&SeenRow>)?;
             deleted(self.seen.delete(seen))?;
+            self.emit(noted)?;
         }
         let target = engine_id(id);
         match self.saved_searches.get(target) {
-            Some(stored) if stored.id == id => deleted(self.saved_searches.delete(target)),
+            Some(stored) if stored.id == id => {
+                let noted = self.note(capture::SAVED_SEARCHES, &target, None::<&SavedSearchRow>)?;
+                deleted(self.saved_searches.delete(target))?;
+                self.emit(noted)
+            }
             _ => Ok(()),
         }
     }
@@ -240,7 +251,9 @@ impl SavedSearchStore for EngineTables {
                 first_seen_at: now.to_string(),
                 first_seen_us,
             };
+            let noted = self.note(capture::SEEN, &key, Some(&row))?;
             self.seen.insert(row).map_err(engine_error)?;
+            self.emit(noted)?;
         }
         Ok(())
     }
