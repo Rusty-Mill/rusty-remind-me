@@ -359,7 +359,7 @@ mod tests {
         assert_eq!(t.compact().unwrap(), 0, "nothing written since");
         let body = "x".repeat(4096);
         for i in 0..200 {
-            MemoryStore::insert(&mut t, &NewMemory::new(&format!("m{i}"), &body, NOW)).unwrap();
+            MemoryStore::insert(&mut t, &NewMemory::new(format!("m{i}"), &body, NOW)).unwrap();
         }
         t.exec("DELETE FROM memories", []).unwrap();
         assert_eq!(t.compact().unwrap(), 2, "folded and vacuumed");
