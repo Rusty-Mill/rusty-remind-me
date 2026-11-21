@@ -9,6 +9,7 @@
 //! [`super::backend::Backend`] transaction.
 
 mod archives;
+mod curation;
 mod entities;
 mod feedback;
 mod history;
