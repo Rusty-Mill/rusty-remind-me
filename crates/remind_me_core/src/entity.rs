@@ -736,6 +736,8 @@ pub fn supersede_contradicting_facts(
         if inference_against_statement(&memories, new_basis, &triple.id)? {
             continue; // both stay live; the contradiction queue prefers the statement
         }
+        // Candidates leave dialogs out, and the write itself refuses one in
+        // the same step that would commit it (`crate::dialog`).
         memories.set_superseded_by(&triple.id, memory_id, Some(&now))?;
         superseded.push(triple.id);
     }

@@ -260,6 +260,8 @@ pub(crate) fn consolidation_candidates(
     let mut rows: Vec<MemoryRow> = memories::rows(core)
         .filter(|r| r.status == "active" && live(r))
         .filter(|r| category.is_none_or(|c| r.category == c))
+        // Dialogs are the verbatim record (D13): never merged.
+        .filter(|r| r.category != crate::models::DIALOG_CATEGORY)
         // Project claims are append-only (ADR-0027): never merged away.
         .filter(|r| {
             !r.predicate

@@ -709,6 +709,10 @@ pub const RECLASSIFY_BATCH_MAX: usize = 100;
 pub struct ReclassifyResult {
     pub updated: usize,
     pub not_found: Vec<String>,
+    /// Dialog rows left as they were: the verbatim record is not retyped
+    /// ([`crate::dialog`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refused: Vec<String>,
     pub total: usize,
 }
 
@@ -1100,6 +1104,52 @@ pub struct Capture {
     /// malformed capture is visible rather than silently dropped.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub other: Vec<Memory>,
+}
+
+/// `metadata.type` of a continuation dialog row: the turns a session added
+/// after its first dialog row was written.
+pub const CONTINUATION_TYPE: &str = "dialog_continuation";
+
+/// `metadata` key of a continuation row's place in its session's dialog:
+/// the first row is 0, each continuation one more than the last.
+pub const SEQUENCE_KEY: &str = "sequence";
+
+impl Capture {
+    /// The continuation dialog rows, in sequence order.
+    pub fn continuations(&self) -> Vec<&Memory> {
+        let mut rows: Vec<&Memory> = self
+            .other
+            .iter()
+            .filter(|m| {
+                m.category == DIALOG_CATEGORY
+                    && m.metadata.get("type").and_then(|t| t.as_str()) == Some(CONTINUATION_TYPE)
+            })
+            .collect();
+        rows.sort_by_key(|m| {
+            let sequence = m.metadata.get(SEQUENCE_KEY).and_then(|v| v.as_u64());
+            // Ordered by the sequence each was written with; a row without
+            // one sorts after, by time, so it is still shown.
+            (
+                sequence.is_none(),
+                sequence,
+                m.created_at.clone(),
+                m.id.clone(),
+            )
+        });
+        rows
+    }
+
+    /// The whole dialog: the first row, then each continuation, joined as
+    /// one stored dialog joins its messages. `None` without a dialog half.
+    pub fn full_dialog(&self) -> Option<String> {
+        let first = self.dialog.as_ref()?;
+        let rows = std::iter::once(first).chain(self.continuations());
+        Some(
+            rows.map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+                .join(crate::transcript_placement::MESSAGE_SEPARATOR),
+        )
+    }
 }
 
 /// Request for a batch of memories still awaiting entity/triple extraction.
@@ -2423,5 +2473,43 @@ mod write_context_tests {
         assert_eq!(row.git_remote, None);
         assert_eq!(row.git_sha, None);
         assert_eq!(row.written_by, "unknown", "not a context column");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::memories::NewMemory;
+    #[test]
+    fn continuations_read_back_by_sequence_when_timestamps_tie() {
+        let row = |id: &str, sequence: u64, content: &str| {
+            let mut new = NewMemory::new(id, content, "2026-11-21T10:00:00Z");
+            new.category = DIALOG_CATEGORY.into();
+            new.metadata = serde_json::json!({"type": CONTINUATION_TYPE, SEQUENCE_KEY: sequence});
+            crate::db::engine::memories::MemoryRow::from_new(&new).to_memory()
+        };
+        let mut first = row("mem_first", 0, "**user:** one");
+        first.metadata = serde_json::json!({"type": "dialog"});
+        // Same timestamp, and ids that sort against the order written.
+        let capture = Capture {
+            capture_id: "c".into(),
+            title: "t".into(),
+            dialog: Some(first),
+            summary: None,
+            other: vec![
+                row("mem_a", 2, "**user:** three"),
+                row("mem_z", 1, "**user:** two"),
+            ],
+        };
+        let order: Vec<&str> = capture
+            .continuations()
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect();
+        assert_eq!(order, ["mem_z", "mem_a"]);
+        assert_eq!(
+            capture.full_dialog().unwrap(),
+            "**user:** one\n\n**user:** two\n\n**user:** three"
+        );
     }
 }

@@ -258,6 +258,10 @@ fn claude_projects_in(flag: Option<&str>, home: Option<PathBuf>) -> Vec<PathBuf>
 /// The value written is an *import* id rather than a memory id. Both satisfy
 /// the `superseded_by IS NULL` filter every read path uses, so stale chunks
 /// drop out of search while staying in the database for audit.
+///
+/// Dialog rows are skipped: the verbatim record is never retired
+/// automatically (D13, [`crate::dialog`]), so after a re-import the old
+/// dialogs stay live beside the new ones.
 pub fn supersede_import(
     store: &Store<'_>,
     old_import_id: &str,

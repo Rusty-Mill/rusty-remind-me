@@ -674,7 +674,7 @@ fn a_session_written_to_within_the_idle_period_waits() {
 }
 
 #[test]
-fn a_session_that_grows_is_refreshed_in_place_not_duplicated() {
+fn a_session_that_grows_gains_a_continuation_not_a_duplicate() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
     let dir = scratch("sessions_grow");
@@ -691,7 +691,8 @@ fn a_session_that_grows_is_refreshed_in_place_not_duplicated() {
     assert_eq!(w.scan_once(&store).ingested, 1);
 
     assert_eq!(captured(&store, "s-grow"), Some(2));
-    assert_eq!(live_memories(&store).len(), before);
+    // One continuation dialog row with the new turn; the first is untouched.
+    assert_eq!(live_memories(&store).len(), before + 1);
     assert!(live_memories(&store).iter().any(|m| m.contains("answer")));
 
     std::fs::remove_dir_all(&dir).unwrap();

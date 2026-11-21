@@ -160,7 +160,7 @@ fn retire(store: &Store<'_>, old: &str, new: &str, now_iso: &str) -> Result<()> 
             "supersedes: {old:?} is not a live memory (missing, deleted or already superseded)"
         )));
     };
-    crate::project::refuse_claim_edit(&target)?;
+    crate::dialog::refuse_protected_edit(&target)?;
     Memories::new(store).set_superseded_by(old, new, Some(now_iso))
 }
 
@@ -232,7 +232,7 @@ pub fn update_memory_with(
     let Some(stored) = get_memory_by_id(store, &input.memory_id)? else {
         return Ok(UpdateOutcome::NotFound);
     };
-    crate::project::refuse_claim_edit(&stored)?;
+    crate::dialog::refuse_protected_edit(&stored)?;
     let project = crate::context::explicit_project(input.project.as_deref())?;
     // Replacing metadata keeps the system-owned evidence count (#354), so an
     // edit can neither clobber it nor reset it under an already boosted
@@ -349,7 +349,7 @@ pub fn delete_memory(store: &Store<'_>, memory_id: &str) -> Result<bool> {
     let Some(category) = memories.live_category(memory_id)? else {
         return Ok(false);
     };
-    refuse_claims(store, &[memory_id.to_string()])?;
+    refuse_protected(store, &[memory_id.to_string()])?;
 
     // A tombstoned memory's embeddings are stale the moment it stops being
     // searchable, same as an incoming sync tombstone's are, so they go on
@@ -395,8 +395,8 @@ pub fn empty_tombstones(store: &Store<'_>) -> Result<(usize, usize)> {
 /// independently — reused, not reimplemented, so the two paths cannot drift —
 /// and one missing id does not fail the rest of the batch.
 pub fn bulk_delete(store: &Store<'_>, ids: &[String]) -> Result<BulkDeleteResult> {
-    // Checked before any delete, so a claim in the batch refuses all of it.
-    refuse_claims(store, ids)?;
+    // Checked before any delete, so a claim or dialog in the batch refuses all of it.
+    refuse_protected(store, ids)?;
     let mut result = BulkDeleteResult::default();
     for id in ids {
         if delete_memory(store, id)? {
@@ -408,13 +408,13 @@ pub fn bulk_delete(store: &Store<'_>, ids: &[String]) -> Result<BulkDeleteResult
     Ok(result)
 }
 
-/// Refuse when any of `ids` is a project claim, which is append-only
-/// (ADR-0027); missing ids are left to the caller.
-fn refuse_claims(store: &Store<'_>, ids: &[String]) -> Result<()> {
+/// Refuse when any of `ids` is append-only: a project claim (ADR-0027) or a
+/// dialog row ([`crate::dialog`]). Missing ids are left to the caller.
+fn refuse_protected(store: &Store<'_>, ids: &[String]) -> Result<()> {
     let memories = Memories::new(store);
     for id in ids {
         if let Some(memory) = memories.get_live(id)? {
-            crate::project::refuse_claim_edit(&memory)?;
+            crate::dialog::refuse_protected_edit(&memory)?;
         }
     }
     Ok(())
@@ -425,7 +425,7 @@ fn refuse_claims(store: &Store<'_>, ids: &[String]) -> Result<()> {
 /// A missing id is recorded in `not_found` and the rest of the batch still
 /// applies, matching [`bulk_delete`]'s per-item error handling.
 pub fn bulk_tag(store: &Store<'_>, input: &BulkTagInput) -> Result<BulkTagResult> {
-    refuse_claims(store, &input.ids)?;
+    refuse_protected(store, &input.ids)?;
     let memories = Memories::new(store);
     let now = Utc::now().to_rfc3339();
     let mut result = BulkTagResult::default();
@@ -486,7 +486,7 @@ pub fn annotate_memories(store: &Store<'_>, input: &AnnotateInput) -> Result<Ann
             continue;
         };
         let guarded = crate::project::refuse_reserved_predicate(annotation.predicate.as_deref())
-            .and_then(|()| crate::project::refuse_claim_edit(&stored))
+            .and_then(|()| crate::dialog::refuse_protected_edit(&stored))
             .and_then(|()| crate::topic::refuse_topic_entities(&annotation.entities));
         if let Err(refused) = guarded {
             errors.push(AnnotationError {
@@ -564,12 +564,17 @@ pub fn reclassify_memories(store: &Store<'_>, input: &ReclassifyInput) -> Result
     let now = Utc::now().to_rfc3339();
     let mut updated = 0;
     let mut not_found = Vec::new();
+    let mut refused = Vec::new();
 
     for classification in &input.classifications {
         let Some(stored) = get_memory_by_id(store, &classification.memory_id)? else {
             not_found.push(classification.memory_id.clone());
             continue;
         };
+        if crate::dialog::is_dialog(&stored) {
+            refused.push(classification.memory_id.clone());
+            continue;
+        }
         // Becoming a decision schedules its follow-up; staying one does not.
         let metadata = if stored.memory_type.as_deref() == Some("decision") {
             None
@@ -595,6 +600,7 @@ pub fn reclassify_memories(store: &Store<'_>, input: &ReclassifyInput) -> Result
     Ok(ReclassifyResult {
         updated,
         not_found,
+        refused,
         total: input.classifications.len(),
     })
 }
