@@ -422,12 +422,10 @@ fn workload(
 /// One search, keyword-only (`vectors` is `None`) or hybrid, that fails
 /// rather than letting a degraded search into the summary. It ignores any
 /// inherited `REMIND_ME_SEARCH_DEADLINE_MS` (the deadline is unbounded),
-/// refuses a search that skipped a stage anyway, and for hybrid requires
-/// that the semantic stage ran and got every query vector it asked for.
-///
-/// What it cannot see: the production search maps an error inside the
-/// semantic scan, after the query is embedded, to an empty semantic list.
-/// The `search_semantic` workload runs that scan with errors propagated.
+/// refuses a search that skipped or failed a stage (a failed vector scan
+/// shows in `timing.failed`, D49), and for hybrid requires that the
+/// semantic stage ran and got every query vector it asked for. A scan that
+/// completed with no hits is fine.
 fn searched(
     store: &Store<'_>,
     input: &MemorySearchInput,
@@ -437,8 +435,12 @@ fn searched(
     let embedder = probe.as_ref().map(|p| p as &dyn Embedder);
     let outcome =
         queries::search_memories_deadlined(store, input, embedder, Deadline::unbounded())?;
-    if !outcome.timing.skipped.is_empty() {
-        return Err(format!("the search skipped {:?}", outcome.timing.skipped).into());
+    if outcome.timing.degraded() {
+        return Err(format!(
+            "the search degraded: skipped {:?}, failed {:?}",
+            outcome.timing.skipped, outcome.timing.failed
+        )
+        .into());
     }
     let Some(probe) = probe else {
         return Ok(());

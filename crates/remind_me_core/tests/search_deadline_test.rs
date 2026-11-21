@@ -116,6 +116,50 @@ impl Drop for EnvGuard {
     }
 }
 
+/// An embedder that always fails, as a broken daemon would.
+struct FailingEmbedder;
+
+impl Embedder for FailingEmbedder {
+    fn embed(&self, _texts: &[String], _role: EmbedRole) -> Result<Vec<Vec<f32>>, EmbedError> {
+        Err(EmbedError("the daemon is down".into()))
+    }
+    fn dim(&self) -> usize {
+        DIM
+    }
+    fn identity(&self) -> EmbeddingIdentity {
+        EmbeddingIdentity {
+            backend: "failing".into(),
+            model: "test".into(),
+            dim: DIM,
+        }
+    }
+}
+
+/// A semantic stage that errors still returns the keyword results, as an
+/// interactive search should, but says the stage failed instead of passing
+/// for a clean search; a deadline played no part, so nothing is skipped.
+#[test]
+fn a_failed_semantic_stage_is_reported_and_keyword_results_stay() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    crate::test_env::remove_var(SEARCH_DEADLINE_ENV);
+
+    let db = db("failed");
+    let store = db.store();
+    add(&store, "quokka sightings on the island");
+
+    let outcome =
+        queries::search_memories_budgeted(&store, &query("quokka"), Some(&FailingEmbedder))
+            .unwrap();
+
+    assert_eq!(outcome.timing.failed, vec!["semantic".to_string()]);
+    assert!(outcome.timing.skipped.is_empty());
+    assert!(outcome.timing.degraded());
+    assert!(
+        !outcome.results.is_empty(),
+        "the keyword half still answers"
+    );
+}
+
 #[test]
 fn without_a_deadline_nothing_is_reported_and_nothing_is_skipped() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -131,6 +175,7 @@ fn without_a_deadline_nothing_is_reported_and_nothing_is_skipped() {
 
     assert!(!outcome.timing.degraded());
     assert!(outcome.timing.skipped.is_empty());
+    assert!(outcome.timing.failed.is_empty());
     assert_eq!(outcome.timing.deadline_ms, None);
     assert!(!outcome.results.is_empty());
     // Unset must mean unbounded, not "expire immediately" -- the semantic

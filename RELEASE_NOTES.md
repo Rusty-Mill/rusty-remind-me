@@ -2,6 +2,16 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-21 — Store benchmark harness on any backend (Millwright R3, Mill Board #1618)
+
+### Added
+- `examples/store_bench` runs R3's workloads on the engine or SQLite through `Database::open_backend`: writes, keyword, semantic and hybrid search over seeded 1024-dim vectors, the vitality pass, one- and two-hop entity walks, hybrid search beside a live writer, updates, deletes, and a backup restored and compared. The workloads live in `harness.rs` behind `harness::run`/`measure`, so a bench-only candidate (Attest, D45) runs the same code. Smoke runs only: warm reopen and the restore check are not G7 or G8 evidence. Each run gets a new directory of its own and deletes nothing; it is offline and refuses to start when an embedder, query expansion or reranking is configured; query vectors are made before timing; a degraded search, a no-op delete or a restore mismatch fails the run.
+### Changed
+- `retrieval::SearchTiming` has a `failed` list (D49): a semantic stage that errors (the embedder or the vector scan) is reported there and counted by `degraded()`, instead of passing for a clean search. Search still falls back to keyword results, and the MCP search output shows a "semantic stage failed" notice, separate from the deadline notice. The field is left out of the serialized form when empty.
+
+### Tests
+- A failed semantic stage is reported with the keyword results kept; the MCP notice for a failed stage does not mention a deadline; the benchmark's minimum size (n = 1, no editable rows) completes with skipped edits, and n = 0 is refused before any directory is made. The example's tests run with `cargo test`.
+
 ## 2026-11-21 — SQLite backend for the store benchmark (Millwright R3, Mill Board #1618)
 
 ### Added

@@ -617,12 +617,20 @@ pub struct SearchTiming {
     /// for different responses from a caller deciding whether to trust the
     /// result set.
     pub skipped: Vec<String>,
+    /// Stages that ran but failed, so the search went on without them
+    /// (today only `semantic`: the embedder or the vector scan errored, and
+    /// the results are keyword matches only). Kept apart from `skipped`,
+    /// which means the deadline passed: the fix for each is different.
+    /// Empty, and left out of the serialized form, when nothing failed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed: Vec<String>,
 }
 
 impl SearchTiming {
-    /// Whether the deadline changed what this search did.
+    /// Whether a stage was skipped or failed, so the results are not what
+    /// a full search would have returned.
     pub fn degraded(&self) -> bool {
-        !self.skipped.is_empty()
+        !self.skipped.is_empty() || !self.failed.is_empty()
     }
 }
 
