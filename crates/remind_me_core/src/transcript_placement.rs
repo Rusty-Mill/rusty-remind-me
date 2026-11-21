@@ -6,9 +6,11 @@
 //! new. Pure: no store, no I/O.
 //!
 //! Placement prefers a stable id (each Claude Code message carries a `uuid`)
-//! and falls back to text only when an overlap can be shown to be unique.
-//! When neither works the caller keeps the input whole under a flag, so no
-//! turn is skipped silently and no duplicate goes unmarked.
+//! and falls back to text only when an overlap of whole messages can be shown
+//! to be unique. Text is compared message by message, never as a substring,
+//! so a new turn that is only the start of an earlier one stays new. When
+//! neither works the caller keeps the input whole under a flag, so no turn is
+//! skipped silently and no duplicate goes unmarked.
 
 use std::collections::HashSet;
 
@@ -31,7 +33,7 @@ pub enum Placement {
 pub enum Method {
     /// Message ids the record lists.
     Id,
-    /// A text overlap that occurs once in the record, at its end.
+    /// A run of whole messages that occurs once in the record, at its end.
     Overlap,
 }
 
@@ -40,8 +42,8 @@ pub enum Method {
 pub enum Reason {
     /// No recorded turn was found in it.
     NoOverlap,
-    /// More than one place fits, or the fitting overlap occurs more than
-    /// once in the record.
+    /// More than one place fits, or the fitting run occurs more than once in
+    /// the record.
     Ambiguous,
 }
 
@@ -61,10 +63,15 @@ impl Placement {
     }
 }
 
+/// A recorded message as text placement sees it: its stored text, or `None`
+/// when it cannot be compared (a message cut by truncation, or a row whose
+/// messages could not be told apart). `None` equals nothing.
+pub type Block<'a> = Option<&'a str>;
+
 /// What the record holds.
 pub struct Record<'a> {
-    /// The dialog rows' text, joined with [`MESSAGE_SEPARATOR`].
-    pub text: &'a str,
+    /// The recorded messages in order, as [`split_row`] gives them.
+    pub blocks: &'a [Block<'a>],
     /// Every message id the rows hold, when every row lists its ids.
     pub ids: Option<&'a HashSet<String>>,
 }
@@ -85,7 +92,60 @@ pub fn place(record: &Record<'_>, incoming: &Incoming<'_>) -> Placement {
     if let (Some(held), Some(ids)) = (record.ids, incoming.ids) {
         return by_id(held, ids);
     }
-    by_text(record.text.trim_end(), incoming.blocks)
+    by_text(record.blocks, incoming.blocks)
+}
+
+/// The roles that open `blocks` (`**role:** …`), for [`split_row`].
+pub fn roles(blocks: &[String]) -> HashSet<&str> {
+    blocks.iter().filter_map(|b| role_of(b)).collect()
+}
+
+fn role_of(block: &str) -> Option<&str> {
+    block
+        .strip_prefix("**")?
+        .split_once(":** ")
+        .map(|(role, _)| role)
+}
+
+/// One stored dialog row split back into its messages.
+///
+/// A message starts where [`MESSAGE_SEPARATOR`] is followed by `**role:** `
+/// for one of `roles`. `cut` says the row lost its start to truncation, so
+/// its first piece is a fragment and compares as nothing. When the row
+/// records how many messages it holds (`expected`) and the split disagrees,
+/// a message's text held a marker, so the whole row compares as nothing.
+pub fn split_row<'a>(
+    content: &'a str,
+    roles: &HashSet<&str>,
+    cut: bool,
+    expected: Option<usize>,
+) -> Vec<Block<'a>> {
+    let opens = |rest: &str| roles.iter().any(|r| starts_message(rest, r));
+    let mut pieces = Vec::new();
+    let mut from = 0;
+    for (at, _) in content.match_indices(MESSAGE_SEPARATOR) {
+        if !opens(&content[at + MESSAGE_SEPARATOR.len()..]) {
+            continue;
+        }
+        pieces.push(&content[from..at]);
+        from = at + MESSAGE_SEPARATOR.len();
+    }
+    pieces.push(&content[from..]);
+    let whole = cut || opens(content);
+    if !whole || expected.is_some_and(|n| !cut && n != pieces.len()) {
+        return vec![None];
+    }
+    let mut blocks: Vec<Block<'a>> = pieces.into_iter().map(Some).collect();
+    if cut {
+        blocks[0] = None;
+    }
+    blocks
+}
+
+fn starts_message(text: &str, role: &str) -> bool {
+    text.strip_prefix("**")
+        .and_then(|t| t.strip_prefix(role))
+        .is_some_and(|t| t.starts_with(":** "))
 }
 
 fn by_id(held: &HashSet<String>, ids: &[String]) -> Placement {
@@ -101,41 +161,77 @@ fn by_id(held: &HashSet<String>, ids: &[String]) -> Placement {
     }
 }
 
-fn by_text(record: &str, blocks: &[String]) -> Placement {
+/// Whole-message placement in linear time: one KMP pass of the transcript
+/// over the record finds whether the record holds it whole and every
+/// transcript prefix the record ends with; a second pass counts the one
+/// candidate prefix.
+fn by_text(record: &[Block<'_>], blocks: &[String]) -> Placement {
+    let pattern: Vec<&str> = blocks.iter().map(String::as_str).collect();
+    let fail = failure(&pattern);
+    let (whole, end) = scan(record, &pattern, &fail);
     // A copy the record already holds whole, such as an older shorter one.
-    if occurrences(record, &blocks.join(MESSAGE_SEPARATOR)) > 0 {
+    if whole > 0 {
         return Placement::Held;
     }
-    // Where the transcript's first j+1 messages are exactly how the record
-    // ends. Placed only when one such j exists and its text occurs nowhere
-    // else in the record; any other fit makes the placement ambiguous.
-    let fits: Vec<usize> = (0..blocks.len())
-        .filter(|&j| record.ends_with(blocks[..=j].join(MESSAGE_SEPARATOR).as_str()))
+    // Every j where the transcript's first j messages are how the record
+    // ends: the final state and its failure chain. Placed only when one such
+    // j exists and its run occurs nowhere else in the record.
+    let fits: Vec<usize> = std::iter::successors(Some(end), |&j| (j > 0).then(|| fail[j - 1]))
+        .take_while(|&j| j > 0)
         .collect();
     match fits.as_slice() {
         [] => Placement::Unplaced(Reason::NoOverlap),
-        [j] if occurrences(record, &blocks[..=*j].join(MESSAGE_SEPARATOR)) == 1 => Placement::New {
-            indexes: (j + 1..blocks.len()).collect(),
+        [j] if count(record, &pattern[..*j]) == 1 => Placement::New {
+            indexes: (*j..blocks.len()).collect(),
             by: Method::Overlap,
         },
         _ => Placement::Unplaced(Reason::Ambiguous),
     }
 }
 
-/// How many times `needle` occurs in `haystack`, overlapping occurrences
-/// included; `0` for an empty needle.
-fn occurrences(haystack: &str, needle: &str) -> usize {
-    if needle.is_empty() {
-        return 0;
+/// KMP failure table: `fail[i]` is the length of the longest proper prefix
+/// of `pattern[..=i]` that is also its suffix.
+fn failure(pattern: &[&str]) -> Vec<usize> {
+    let mut fail = vec![0; pattern.len()];
+    let mut k = 0;
+    for i in 1..pattern.len() {
+        while k > 0 && pattern[i] != pattern[k] {
+            k = fail[k - 1];
+        }
+        if pattern[i] == pattern[k] {
+            k += 1;
+        }
+        fail[i] = k;
     }
-    let mut count = 0;
-    let mut from = 0;
-    while let Some(at) = haystack[from..].find(needle) {
-        count += 1;
-        let start = from + at;
-        from = start + haystack[start..].chars().next().map_or(1, char::len_utf8);
+    fail
+}
+
+/// Run `pattern` over `record`: how many times it occurs whole, and the
+/// length of the longest prefix of it the record ends with.
+fn scan(record: &[Block<'_>], pattern: &[&str], fail: &[usize]) -> (usize, usize) {
+    let (mut found, mut k) = (0, 0);
+    for block in record {
+        let Some(block) = *block else {
+            k = 0;
+            continue;
+        };
+        while k > 0 && block != pattern[k] {
+            k = fail[k - 1];
+        }
+        if block == pattern[k] {
+            k += 1;
+        }
+        if k == pattern.len() {
+            found += 1;
+            k = fail[k - 1];
+        }
     }
-    count
+    (found, k)
+}
+
+/// How many times the run `pattern` occurs in `record`, overlaps included.
+fn count(record: &[Block<'_>], pattern: &[&str]) -> usize {
+    scan(record, pattern, &failure(pattern)).0
 }
 
 #[cfg(test)]
@@ -149,9 +245,10 @@ mod tests {
     fn by_text_of(record: &[&str], sent: &[&str]) -> Placement {
         let text = blocks(record).join(MESSAGE_SEPARATOR);
         let sent = blocks(sent);
+        let recorded = split_row(&text, &roles(&sent), false, Some(record.len()));
         place(
             &Record {
-                text: &text,
+                blocks: &recorded,
                 ids: None,
             },
             &Incoming {
@@ -219,7 +316,7 @@ mod tests {
             let ids: Vec<String> = ids.iter().map(|s| s.to_string()).collect();
             place(
                 &Record {
-                    text: "",
+                    blocks: &[],
                     ids: Some(&held),
                 },
                 &Incoming {
@@ -239,9 +336,62 @@ mod tests {
     }
 
     #[test]
-    fn occurrences_counts_overlapping_matches() {
-        assert_eq!(occurrences("aaa", "aa"), 2);
-        assert_eq!(occurrences("abc", ""), 0);
-        assert_eq!(occurrences("é é", "é"), 2);
+    fn a_new_turn_that_starts_an_earlier_one_is_not_held() {
+        // "do it" is the start of the recorded "do it now", not that turn.
+        let placed = by_text_of(&["a", "do it now"], &["a", "do it"]);
+        assert_ne!(placed, Placement::Held);
+        assert_eq!(placed, Placement::Unplaced(Reason::NoOverlap));
+        // A recorded turn that is only the start of a new one is not an end.
+        assert_eq!(
+            by_text_of(&["a", "do it"], &["do it now", "b"]),
+            Placement::Unplaced(Reason::NoOverlap)
+        );
+        // A turn whose text runs past a separator is still one message.
+        assert_eq!(
+            by_text_of(&["a", "fix it\n\nthen deploy"], &["fix it", "b"]),
+            Placement::Unplaced(Reason::NoOverlap)
+        );
+    }
+
+    #[test]
+    fn split_row_finds_messages_and_refuses_what_it_cannot_show() {
+        let sent = blocks(&["x"]);
+        let roles = roles(&sent);
+        let row = "**user:** a\n\nstill a\n\n**user:** b";
+        assert_eq!(
+            split_row(row, &roles, false, Some(2)),
+            vec![Some("**user:** a\n\nstill a"), Some("**user:** b")]
+        );
+        // A count that disagrees: some text held a marker. Nothing compares.
+        assert_eq!(split_row(row, &roles, false, Some(3)), vec![None]);
+        // A row cut by truncation: its first piece is a fragment.
+        assert_eq!(
+            split_row("tail of a\n\n**user:** b", &roles, true, None),
+            vec![None, Some("**user:** b")]
+        );
+    }
+
+    #[test]
+    fn an_uncomparable_block_breaks_a_run() {
+        let sent = blocks(&["a", "b", "c"]);
+        let recorded = [Some(sent[0].as_str()), None, Some(sent[1].as_str())];
+        let placed = place(
+            &Record {
+                blocks: &recorded,
+                ids: None,
+            },
+            &Incoming {
+                blocks: &sent,
+                ids: None,
+            },
+        );
+        assert_eq!(placed, Placement::Unplaced(Reason::NoOverlap));
+    }
+
+    #[test]
+    fn count_includes_overlapping_runs() {
+        let record = [Some("y"), Some("y"), Some("y")];
+        assert_eq!(count(&record, &["y", "y"]), 2);
+        assert_eq!(count(&record, &["n"]), 0);
     }
 }

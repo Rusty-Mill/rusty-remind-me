@@ -135,8 +135,11 @@ pub fn write_skeleton(
         .dialog
         .as_ref()
         .ok_or_else(|| SkeletonError::NoDialog(input.capture_id.clone()))?;
+    // The whole dialog, continuations included, so a node can cover turns a
+    // grown session appended after the first row.
+    let full = capture.full_dialog().unwrap_or_default();
 
-    let line_count = dialog_lines(&dialog.content).len();
+    let line_count = dialog_lines(&full).len();
     for (node, (start, end)) in &input.nodes {
         // `start == 0` is caught by the same check: ranges are 1-based, so a
         // model that emitted 0-based offsets fails loudly on its first node
@@ -271,15 +274,15 @@ pub fn node_slice(
 
     let capture = get_capture(store, capture_id)?
         .ok_or_else(|| SkeletonError::NoCapture(capture_id.to_string()))?;
-    let dialog = capture
-        .dialog
+    let full = capture
+        .full_dialog()
         .ok_or_else(|| SkeletonError::NoDialog(capture_id.to_string()))?;
 
-    let lines = dialog_lines(&dialog.content);
-    // Ranges were validated against this dialog at write time, but the dialog
-    // is an ordinary memory and `remind_me_update` can shorten it afterwards.
-    // Clamping rather than erroring keeps an edited capture readable; the
-    // returned line numbers say what was actually served.
+    let lines = dialog_lines(&full);
+    // Ranges were validated against the whole dialog at write time, and
+    // dialog rows are read-only, but a row lost outside the generic paths
+    // would read back shorter. Clamping rather than erroring keeps the
+    // capture readable; the returned line numbers say what was served.
     if start == 0 || start > lines.len() {
         return Ok(None);
     }

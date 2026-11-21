@@ -18,7 +18,7 @@ use crate::history::{capture_revision, TrackedChanges};
 use crate::importer::{extract_messages_with_tools, ChatMessage, ToolUseSummary};
 use crate::models::{AutoCaptureInput, WriteContext};
 use chrono::Utc;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 /// Title length, matching the brief: the first user message, truncated.
@@ -264,7 +264,9 @@ fn messages_of(raw: &str) -> Vec<ChatMessage> {
         .collect()
 }
 
-use crate::transcript_placement::{place, Incoming, Placement, Record, MESSAGE_SEPARATOR};
+use crate::transcript_placement::{
+    place, roles, split_row, Block, Incoming, Placement, Record, MESSAGE_SEPARATOR,
+};
 
 /// Each message of `messages` rendered and scrubbed as a stored dialog
 /// holds it, so it can be compared with the record.
@@ -276,6 +278,18 @@ fn stored_blocks(messages: &[ChatMessage], message_tools: &MessageTools) -> Vec<
             crate::boundary::scrub(&render_message(m, message_tools), &mut tags, &mut metadata)
         })
         .collect()
+}
+
+/// A dialog row's messages for text placement. A row cut to
+/// [`MAX_DIALOG_CHARS`] opens with a fragment; a row that records its
+/// message count is checked against it.
+fn row_blocks<'a>(row: &'a crate::models::Memory, roles: &HashSet<&str>) -> Vec<Block<'a>> {
+    let (content, cut) = match row.content.strip_prefix(TRUNCATION_MARKER) {
+        Some(rest) => (rest, true),
+        None => (row.content.as_str(), false),
+    };
+    let expected = Some(held_messages(row)).filter(|&n| n > 0);
+    split_row(content, roles, cut, expected)
 }
 
 /// Every message's id, or `None` when any message lacks one.
@@ -290,8 +304,8 @@ fn listed_ids(row: &crate::models::Memory) -> Option<Vec<String>> {
 }
 
 /// Every id the record's rows hold, or `None` when any row lists none.
-fn recorded_ids(rows: &[crate::models::Memory]) -> Option<std::collections::HashSet<String>> {
-    let mut held = std::collections::HashSet::new();
+fn recorded_ids(rows: &[crate::models::Memory]) -> Option<HashSet<String>> {
+    let mut held = HashSet::new();
     for row in rows {
         held.extend(listed_ids(row)?);
     }
@@ -497,17 +511,14 @@ fn dialog_rows(
     store: &Store<'_>,
     first: &crate::models::Memory,
 ) -> Result<Vec<crate::models::Memory>> {
-    let mut continuations: Vec<crate::models::Memory> = match first.capture_id.as_deref() {
-        Some(id) => get_capture(store, id)?.map(|c| c.other).unwrap_or_default(),
-        None => Vec::new(),
+    let capture = match first.capture_id.as_deref() {
+        Some(id) => get_capture(store, id)?,
+        None => None,
     };
-    continuations.retain(|m| {
-        m.category == crate::models::DIALOG_CATEGORY
-            && m.metadata.get("type").and_then(|t| t.as_str()) == Some(CONTINUATION_TYPE)
-    });
-    continuations.sort_by(|a, b| (&a.created_at, &a.id).cmp(&(&b.created_at, &b.id)));
     let mut rows = vec![first.clone()];
-    rows.extend(continuations);
+    if let Some(capture) = capture {
+        rows.extend(capture.continuations().into_iter().cloned());
+    }
     Ok(rows)
 }
 
@@ -695,20 +706,20 @@ fn recapture_in(
     let capture_id = dialog.capture_id.clone().ok_or(StoreError::NotFound)?;
     let rows = dialog_rows(store, dialog)?;
     let held: usize = rows.iter().map(held_messages).sum();
-    let recorded = rows
-        .iter()
-        .map(|m| m.content.as_str())
-        .collect::<Vec<_>>()
-        .join(MESSAGE_SEPARATOR);
 
     let tools = MessageTools::from_env();
     let messages = messages_of(raw);
     let blocks = stored_blocks(&messages, &tools);
+    let roles = roles(&blocks);
+    let recorded: Vec<Block<'_>> = rows
+        .iter()
+        .flat_map(|row| row_blocks(row, &roles))
+        .collect();
     let held_ids = recorded_ids(&rows);
     let ids = message_ids(&messages);
     let placement = place(
         &Record {
-            text: &recorded,
+            blocks: &recorded,
             ids: held_ids.as_ref(),
         },
         &Incoming {
@@ -786,9 +797,7 @@ fn held_outcome(
     })
 }
 
-/// `metadata.type` of a continuation dialog row: the turns a session added
-/// after its first dialog row was written.
-pub const CONTINUATION_TYPE: &str = "dialog_continuation";
+pub use crate::models::CONTINUATION_TYPE;
 
 /// Where a continuation row sits in its session's record.
 struct Continuation<'a> {

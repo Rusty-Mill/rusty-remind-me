@@ -1106,6 +1106,38 @@ pub struct Capture {
     pub other: Vec<Memory>,
 }
 
+/// `metadata.type` of a continuation dialog row: the turns a session added
+/// after its first dialog row was written.
+pub const CONTINUATION_TYPE: &str = "dialog_continuation";
+
+impl Capture {
+    /// The continuation dialog rows, in the order they were written.
+    pub fn continuations(&self) -> Vec<&Memory> {
+        let mut rows: Vec<&Memory> = self
+            .other
+            .iter()
+            .filter(|m| {
+                m.category == DIALOG_CATEGORY
+                    && m.metadata.get("type").and_then(|t| t.as_str()) == Some(CONTINUATION_TYPE)
+            })
+            .collect();
+        rows.sort_by(|a, b| (&a.created_at, &a.id).cmp(&(&b.created_at, &b.id)));
+        rows
+    }
+
+    /// The whole dialog: the first row, then each continuation, joined as
+    /// one stored dialog joins its messages. `None` without a dialog half.
+    pub fn full_dialog(&self) -> Option<String> {
+        let first = self.dialog.as_ref()?;
+        let rows = std::iter::once(first).chain(self.continuations());
+        Some(
+            rows.map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+                .join(crate::transcript_placement::MESSAGE_SEPARATOR),
+        )
+    }
+}
+
 /// Request for a batch of memories still awaiting entity/triple extraction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtractBatchInput {

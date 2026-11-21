@@ -712,3 +712,20 @@ fn reverting_a_dialog_is_refused_and_writes_no_revision() {
         history.len()
     );
 }
+
+#[test]
+fn a_new_turn_that_starts_an_earlier_one_is_kept_not_held() {
+    use remind_me_core::transcript::{capture_transcript, captured_messages};
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    capture_transcript(&store, &bare(&["a1", "do it now"]), &frozen_request("stop")).unwrap();
+
+    // "do it" is only the start of the recorded "do it now": a new turn.
+    capture_transcript(&store, &bare(&["a1", "do it"]), &frozen_request("stop")).unwrap();
+
+    let rows = continuations(&store);
+    assert_eq!(rows.len(), 1, "kept, not taken as held");
+    assert_eq!(rows[0].metadata["placement"], "unplaced_no_overlap");
+    assert!(rows[0].content.ends_with("do it"), "{}", rows[0].content);
+    assert_eq!(captured_messages(&store, "s-frozen").unwrap(), Some(4));
+}
