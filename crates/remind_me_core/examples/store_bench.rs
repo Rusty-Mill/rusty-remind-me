@@ -1,28 +1,36 @@
-//! A node workload on the engine (ADR-0023).
+//! A node workload on any store backend (ADR-0023, ADR-0035; R3, #1618).
 //!
-//! Run in release, in its own process, so peak memory is its own:
+//! Run in release, one candidate per process, so peak memory is its own:
 //!
 //! ```text
-//! cargo run --release -p remind_me_core --example store_bench -- engine 15000 /tmp/bench
-//! cargo run --release -p remind_me_core --example store_bench -- open   15000 /tmp/bench
+//! cargo run --release -p remind_me_core --example store_bench -- bench engine 15000 /tmp/bench
+//! cargo run --release -p remind_me_core --example store_bench -- bench sqlite 15000 /tmp/bench
+//! cargo run --release -p remind_me_core --example store_bench -- open  sqlite 15000 /tmp/bench
 //! ```
 //!
-//! `engine` fills a fresh store with `n` synthetic memories and times each
-//! operation a node serves. `open` fills a store and times reopening it,
-//! which rebuilds the derived indexes. Each run prints one JSON line. The
-//! SQLite workload and the copy timing went with the SQLite store
-//! (ADR-0025); `tests/fixtures/legacy_store` keeps a copy source.
+//! `bench` fills a fresh store with `n` synthetic memories, each with a
+//! vector, plus an entity graph, and times what R3 measures: writes,
+//! keyword, semantic and hybrid search, the vitality pass, one- and two-hop
+//! entity walks, search with four readers beside one writer, and a backup
+//! restored and compared row by row. `open` fills a store and times
+//! reopening it, which rebuilds whatever the backend derives at open. Each
+//! run prints one JSON line.
 //!
 //! The data is synthetic and deterministic: a Zipf-skewed vocabulary, so
-//! full-text posting lists look like prose, and a mix of categories, tags
-//! and content lengths shaped like a real node. No embedder is configured,
-//! so search is keyword-only and nothing leaves the machine.
+//! full-text posting lists look like prose, a mix of categories, tags and
+//! content lengths shaped like a real node, and seeded random unit vectors
+//! from a stand-in embedder (`BenchEmbedder`), so no model is touched and
+//! nothing leaves the machine.
 
-use remind_me_core::db::queries;
+use remind_me_core::db::backend::Backend;
+use remind_me_core::db::engine::EngineTables;
+use remind_me_core::db::sqlite::SqliteTables;
+use remind_me_core::db::{queries, Store};
+use remind_me_core::embedder::{EmbedError, EmbedRole, Embedder, EmbeddingIdentity};
 use remind_me_core::models::{
-    MemoryAddInput, MemoryListInput, MemorySearchInput, MemoryUpdateInput,
+    EntityInput, MemoryAddInput, MemoryListInput, MemorySearchInput, MemoryUpdateInput,
 };
-use remind_me_core::Database;
+use remind_me_core::{entity, testing, vectors, Database};
 use serde_json::{json, Map, Value};
 use std::error::Error;
 use std::path::{Path, PathBuf};
@@ -32,154 +40,409 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 const VOCABULARY: usize = 6_000;
 const SAMPLES: usize = 500;
+const DIM: usize = 1024;
+const ENTITIES: usize = 500;
+const READERS: usize = 4;
+
+/// A store backend under test.
+#[derive(Clone, Copy)]
+enum Candidate {
+    Engine,
+    Sqlite,
+}
+
+impl Candidate {
+    fn parse(name: &str) -> Result<Self> {
+        match name {
+            "engine" => Ok(Self::Engine),
+            "sqlite" => Ok(Self::Sqlite),
+            other => Err(format!("unknown backend {other:?}").into()),
+        }
+    }
+
+    /// The backend's files in `dir`, opened.
+    fn tables(self, dir: &Path) -> Result<Box<dyn Backend>> {
+        Ok(match self {
+            Self::Engine => Box::new(EngineTables::open(dir)?),
+            Self::Sqlite => Box::new(SqliteTables::open(dir)?),
+        })
+    }
+
+    /// The database whose store lives in `dir/store`, standing beside
+    /// `dir/memory.db` (where backups go, under `dir/backups`).
+    fn open(self, dir: &Path) -> Result<Database> {
+        let tables = self.tables(&dir.join("store"))?;
+        Ok(Database::open_backend(tables, Some(dir.join("memory.db")))?)
+    }
+}
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let [mode, n, dir] = args.as_slice() else {
-        return Err("usage: store_bench <engine|open> <n> <dir>".into());
+    let [mode, backend, n, dir] = args.as_slice() else {
+        return Err("usage: store_bench <bench|open> <engine|sqlite> <n> <dir>".into());
     };
+    let candidate = Candidate::parse(backend)?;
     let n: usize = n.parse()?;
-    let dir = PathBuf::from(dir).join(format!("{mode}-{n}"));
+    let dir = PathBuf::from(dir).join(format!("{mode}-{backend}-{n}"));
     if dir.exists() {
         std::fs::remove_dir_all(&dir)?;
     }
     std::fs::create_dir_all(&dir)?;
-    let file = dir.join("memory.db");
 
     let mut report = Map::new();
-    report.insert("backend".into(), json!(mode));
+    report.insert("mode".into(), json!(mode));
+    report.insert("backend".into(), json!(backend));
     report.insert("n".into(), json!(n));
     match mode.as_str() {
-        "engine" => workload(&file, n, &mut report)?,
-        "open" => reopen(&file, n, &mut report)?,
+        "bench" => workload(candidate, &dir, n, &mut report)?,
+        "open" => reopen(candidate, &dir, n, &mut report)?,
         other => return Err(format!("unknown mode {other:?}").into()),
     }
-    report.insert("disk_mb".into(), json!(megabytes(dir_size(&dir)?)));
+    report.insert(
+        "disk_mb".into(),
+        json!(megabytes(dir_size(&dir.join("store"))?)),
+    );
     report.insert("peak_rss_mb".into(), json!(peak_rss_mb()));
     println!("{}", Value::Object(report));
     Ok(())
 }
 
-fn open(file: &Path) -> Result<Database> {
-    Ok(Database::open(file)?)
+/// Add `n` memories, each with its vector; their ids, and each add's time.
+fn fill(
+    store: &Store<'_>,
+    n: usize,
+    corpus: &Corpus,
+    rng: &mut Rng,
+) -> Result<(Vec<String>, Vec<Duration>)> {
+    let mut ids = Vec::with_capacity(n);
+    let mut adds = Vec::with_capacity(n);
+    for _ in 0..n {
+        let input = corpus.memory(rng);
+        let content = input.content.clone();
+        let t = Instant::now();
+        let id = queries::add_memory(store, input)?.id;
+        vectors::embed_and_store(store, &BenchEmbedder, &id, &content)?;
+        adds.push(t.elapsed());
+        ids.push(id);
+    }
+    Ok((ids, adds))
 }
 
-/// Fill a store with `n` memories, reopen it, then time each operation.
-fn workload(file: &Path, n: usize, report: &mut Map<String, Value>) -> Result<()> {
+/// `ENTITIES` entities, each related to three others and linked to a few
+/// memories; their ids.
+fn graph(db: &Database, ids: &[String], rng: &mut Rng) -> Result<Vec<String>> {
+    let store = db.store();
+    let mut entities = Vec::with_capacity(ENTITIES);
+    for i in 0..ENTITIES {
+        let input = EntityInput {
+            name: format!("entity {i}"),
+            kind: Some("concept".into()),
+            aliases: vec![],
+        };
+        let id = entity::upsert_entity(&store, &input)?.id;
+        for _ in 0..4 {
+            entity::link_memory_entity(&store, &ids[rng.below(ids.len())], &id)?;
+        }
+        entities.push(id);
+    }
+    for subject in &entities {
+        for _ in 0..3 {
+            let object = &entities[rng.below(entities.len())];
+            entity::upsert_entity_relation(&store, subject, "relates to", object)?;
+        }
+    }
+    Ok(entities)
+}
+
+/// Time `SAMPLES` runs of `f`, the `i`th given `i`.
+fn timed(mut f: impl FnMut(usize) -> Result<()>) -> Result<Value> {
+    let mut times = Vec::with_capacity(SAMPLES);
+    for i in 0..SAMPLES {
+        let t = Instant::now();
+        f(i)?;
+        times.push(t.elapsed());
+    }
+    Ok(summary(times))
+}
+
+/// A search query: common words (long posting lists) or rarer ones, one to
+/// three terms.
+fn query(corpus: &Corpus, rng: &mut Rng, i: usize) -> String {
+    (0..1 + i % 3)
+        .map(|_| corpus.search_word(rng, i.is_multiple_of(2)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Fill a store, reopen it, then time each operation.
+fn workload(
+    candidate: Candidate,
+    dir: &Path,
+    n: usize,
+    report: &mut Map<String, Value>,
+) -> Result<()> {
     let corpus = Corpus::new();
     let mut rng = Rng(0x5eed);
-    let mut ids = Vec::with_capacity(n);
-    {
-        let db = open(file)?;
-        let store = db.store();
-        let mut adds = Vec::with_capacity(n);
+    let (ids, entities) = {
+        let db = candidate.open(dir)?;
         let started = Instant::now();
-        for _ in 0..n {
-            let input = corpus.memory(&mut rng);
-            let t = Instant::now();
-            ids.push(queries::add_memory(&store, input)?.id);
-            adds.push(t.elapsed());
-        }
+        let (ids, adds) = fill(&db.store(), n, &corpus, &mut rng)?;
         report.insert("fill_s".into(), json!(started.elapsed().as_secs_f64()));
         report.insert("add".into(), summary(adds));
-    }
+        let entities = graph(&db, &ids, &mut rng)?;
+        (ids, entities)
+    };
 
     let started = Instant::now();
-    let db = open(file)?;
+    let db = candidate.open(dir)?;
     report.insert("reopen_ms".into(), json!(millis(started.elapsed())));
     let store = db.store();
 
-    let mut times = Vec::new();
-    for _ in 0..SAMPLES {
-        let id = &ids[rng.below(ids.len())];
-        let t = Instant::now();
-        queries::get_memory_by_id(&store, id)?;
-        times.push(t.elapsed());
+    // Dialogs are the verbatim record and refuse edits (#1616), so updates
+    // and deletes take the other memories.
+    let mut editable = Vec::new();
+    for id in &ids {
+        if testing::memory_text(&store, id, "category")?.as_deref() != Some("dialog") {
+            editable.push(id.clone());
+        }
     }
-    report.insert("get".into(), summary(std::mem::take(&mut times)));
-
-    for _ in 0..SAMPLES {
-        let input = MemoryListInput {
-            limit: 20,
-            offset: rng.below(n.min(2_000)),
-            ..MemoryListInput::default()
-        };
-        let t = Instant::now();
-        queries::list_memories(&store, &input)?;
-        times.push(t.elapsed());
-    }
-    report.insert("list".into(), summary(std::mem::take(&mut times)));
-
-    for _ in 0..SAMPLES {
-        let input = MemoryListInput {
-            limit: 20,
-            category: Some("fact".into()),
-            ..MemoryListInput::default()
-        };
-        let t = Instant::now();
-        queries::list_memories(&store, &input)?;
-        times.push(t.elapsed());
-    }
+    let pick = |rng: &mut Rng| ids[rng.below(ids.len())].clone();
+    let pick_editable = |rng: &mut Rng| editable[rng.below(editable.len())].clone();
+    report.insert(
+        "get".into(),
+        timed(|_| {
+            queries::get_memory_by_id(&store, &pick(&mut rng))?;
+            Ok(())
+        })?,
+    );
+    report.insert(
+        "list".into(),
+        timed(|_| {
+            let input = MemoryListInput {
+                limit: 20,
+                offset: rng.below(n.min(2_000)),
+                ..MemoryListInput::default()
+            };
+            queries::list_memories(&store, &input)?;
+            Ok(())
+        })?,
+    );
     report.insert(
         "list_by_category".into(),
-        summary(std::mem::take(&mut times)),
+        timed(|_| {
+            let input = MemoryListInput {
+                limit: 20,
+                category: Some("fact".into()),
+                ..MemoryListInput::default()
+            };
+            queries::list_memories(&store, &input)?;
+            Ok(())
+        })?,
     );
 
-    // Common words (long posting lists) and rarer ones, one to three terms.
-    for i in 0..SAMPLES {
-        let terms = 1 + i % 3;
-        let query = (0..terms)
-            .map(|_| corpus.search_word(&mut rng, i % 2 == 0))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let input: MemorySearchInput = serde_json::from_value(json!({ "query": query }))?;
-        let t = Instant::now();
-        queries::search_memories_with_embedder(&store, &input, None)?;
-        times.push(t.elapsed());
-    }
-    report.insert("search".into(), summary(std::mem::take(&mut times)));
+    let queries_: Vec<String> = (0..SAMPLES).map(|i| query(&corpus, &mut rng, i)).collect();
+    let search = |i: usize, embedder: Option<&dyn Embedder>| -> Result<()> {
+        let input: MemorySearchInput = serde_json::from_value(json!({ "query": queries_[i] }))?;
+        queries::search_memories_with_embedder(&store, &input, embedder)?;
+        Ok(())
+    };
+    report.insert("search_keyword".into(), timed(|i| search(i, None))?);
+    report.insert(
+        "search_semantic".into(),
+        timed(|i| {
+            vectors::semantic_search(&store, &BenchEmbedder, &queries_[i], 10, None)?;
+            Ok(())
+        })?,
+    );
+    report.insert(
+        "search_hybrid".into(),
+        timed(|i| search(i, Some(&BenchEmbedder)))?,
+    );
 
-    for _ in 0..SAMPLES {
-        let id = &ids[rng.below(ids.len())];
-        let input: MemoryUpdateInput = serde_json::from_value(json!({
-            "memory_id": id,
-            "content": corpus.content(&mut rng),
-        }))?;
-        let t = Instant::now();
-        queries::update_memory(&store, &input)?;
-        times.push(t.elapsed());
+    let t = Instant::now();
+    remind_me_core::vitality::build_vitality_report(&store)?;
+    report.insert("vitality_pass_ms".into(), json!(millis(t.elapsed())));
+
+    for hops in [1, 2] {
+        let walk = timed(|_| {
+            let seed = entities[rng.below(entities.len())].clone();
+            entity::traverse_entities(&store, &[seed], hops, None, 1_000)?;
+            Ok(())
+        })?;
+        report.insert(format!("entity_{hops}_hop"), walk);
     }
-    report.insert("update".into(), summary(std::mem::take(&mut times)));
+
+    report.insert(
+        "update".into(),
+        timed(|_| {
+            let input: MemoryUpdateInput = serde_json::from_value(json!({
+                "memory_id": pick_editable(&mut rng),
+                "content": corpus.content(&mut rng),
+            }))?;
+            queries::update_memory(&store, &input)?;
+            Ok(())
+        })?,
+    );
+
+    report.insert(
+        "search_hybrid_beside_writer".into(),
+        beside_writer(&db, &corpus, &queries_)?,
+    );
 
     let t = Instant::now();
     remind_me_core::stats::collect(&store)?;
     report.insert("stats_ms".into(), json!(millis(t.elapsed())));
 
-    for id in ids.iter().rev().take(SAMPLES) {
-        let t = Instant::now();
-        queries::delete_memory(&store, id)?;
-        times.push(t.elapsed());
+    report.insert(
+        "delete".into(),
+        timed(|i| {
+            queries::delete_memory(&store, &editable[editable.len() - 1 - i % editable.len()])?;
+            Ok(())
+        })?,
+    );
+
+    drop(store);
+    backup_and_restore(candidate, &db, report)
+}
+
+/// Hybrid search on `READERS` threads while one thread adds `SAMPLES`
+/// memories; the readers' times. Each thread takes a store from the
+/// database's secondary source, as the node's background threads do: a
+/// store from [`Database::store`] holds the process lock.
+fn beside_writer(db: &Database, corpus: &Corpus, queries_: &[String]) -> Result<Value> {
+    let source = &db.secondary_source().ok_or("an in-memory database")?;
+    let mut times: Vec<Duration> = Vec::new();
+    std::thread::scope(|scope| -> Result<()> {
+        let writer = scope.spawn(|| -> std::result::Result<(), String> {
+            let mut rng = Rng(0xbeef);
+            fill(&source.store(), SAMPLES, corpus, &mut rng)
+                .map(drop)
+                .map_err(|e| e.to_string())
+        });
+        let readers: Vec<_> = (0..READERS)
+            .map(|r| {
+                scope.spawn(move || -> std::result::Result<Vec<Duration>, String> {
+                    let store = source.store();
+                    let mut times = Vec::with_capacity(SAMPLES / READERS);
+                    for i in (r..SAMPLES).step_by(READERS) {
+                        let input: MemorySearchInput =
+                            serde_json::from_value(json!({ "query": queries_[i] }))
+                                .map_err(|e| e.to_string())?;
+                        let t = Instant::now();
+                        queries::search_memories_with_embedder(
+                            &store,
+                            &input,
+                            Some(&BenchEmbedder),
+                        )
+                        .map_err(|e| e.to_string())?;
+                        times.push(t.elapsed());
+                    }
+                    Ok(times)
+                })
+            })
+            .collect();
+        for reader in readers {
+            times.extend(reader.join().map_err(|_| "a reader panicked")??);
+        }
+        writer.join().map_err(|_| "the writer panicked")??;
+        Ok(())
+    })?;
+    Ok(summary(times))
+}
+
+/// Time a backup, then open it as a fresh store and compare every memory's
+/// content and every vector count with the source.
+fn backup_and_restore(
+    candidate: Candidate,
+    db: &Database,
+    report: &mut Map<String, Value>,
+) -> Result<()> {
+    let store = db.store();
+    let t = Instant::now();
+    let backup = remind_me_core::backup::create_backup(&store, "bench")?;
+    report.insert("backup_ms".into(), json!(millis(t.elapsed())));
+
+    let t = Instant::now();
+    let restored = Database::open_backend(candidate.tables(Path::new(&backup.path))?, None)?;
+    report.insert("restore_open_ms".into(), json!(millis(t.elapsed())));
+    let copy = restored.store();
+    let ids = testing::memory_ids(&store)?;
+    let same_ids = ids == testing::memory_ids(&copy)?;
+    let mut differing = 0usize;
+    for id in &ids {
+        if testing::memory_column(&store, id, "content")?
+            != testing::memory_column(&copy, id, "content")?
+        {
+            differing += 1;
+        }
     }
-    report.insert("delete".into(), summary(times));
+    let same_vectors = testing::count(&store, testing::Table::VecChunks)?
+        == testing::count(&copy, testing::Table::VecChunks)?;
+    report.insert(
+        "restore".into(),
+        json!({ "rows": ids.len(), "same_ids": same_ids, "differing_content": differing, "same_vectors": same_vectors }),
+    );
     Ok(())
 }
 
-/// Fill a store, then time reopening it: the cost of rebuilding the
-/// derived indexes at open.
-fn reopen(file: &Path, n: usize, report: &mut Map<String, Value>) -> Result<()> {
+/// Fill a store, then time reopening it: the cost of rebuilding what the
+/// backend derives at open.
+fn reopen(
+    candidate: Candidate,
+    dir: &Path,
+    n: usize,
+    report: &mut Map<String, Value>,
+) -> Result<()> {
     let corpus = Corpus::new();
     let mut rng = Rng(0x5eed);
-    {
-        let db = open(file)?;
-        let store = db.store();
-        for _ in 0..n {
-            queries::add_memory(&store, corpus.memory(&mut rng))?;
-        }
-    }
+    fill(&candidate.open(dir)?.store(), n, &corpus, &mut rng)?;
     let started = Instant::now();
-    let _db = open(file)?;
+    let _db = candidate.open(dir)?;
     report.insert("reopen_ms".into(), json!(millis(started.elapsed())));
     Ok(())
+}
+
+/// Seeded random unit vectors, one per text: a stand-in embedder, so
+/// semantic search runs without a model (the spec's D2 vectors).
+struct BenchEmbedder;
+
+impl Embedder for BenchEmbedder {
+    fn embed(
+        &self,
+        texts: &[String],
+        _role: EmbedRole,
+    ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+        Ok(texts.iter().map(|t| unit_vector(t)).collect())
+    }
+
+    fn dim(&self) -> usize {
+        DIM
+    }
+
+    fn identity(&self) -> EmbeddingIdentity {
+        EmbeddingIdentity {
+            backend: "bench".into(),
+            model: "seeded-random".into(),
+            dim: DIM,
+        }
+    }
+}
+
+/// A unit vector seeded by `text` (FNV-1a), so the same text always gets
+/// the same vector.
+fn unit_vector(text: &str) -> Vec<f32> {
+    let seed = text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+    });
+    let mut rng = Rng(seed | 1);
+    let v: Vec<f32> = (0..DIM).map(|_| rng.unit() as f32 - 0.5).collect();
+    let norm = v
+        .iter()
+        .map(|x| x * x)
+        .sum::<f32>()
+        .sqrt()
+        .max(f32::EPSILON);
+    v.into_iter().map(|x| x / norm).collect()
 }
 
 /// Synthetic memories shaped like a node's.
@@ -286,7 +549,7 @@ fn summary(mut times: Vec<Duration>) -> Value {
     times.sort();
     let at = |q: f64| millis(times[((times.len() - 1) as f64 * q) as usize]);
     let mean = times.iter().sum::<Duration>() / times.len() as u32;
-    json!({ "mean": millis(mean), "p50": at(0.5), "p99": at(0.99), "max": at(1.0) })
+    json!({ "mean": millis(mean), "p50": at(0.5), "p95": at(0.95), "p99": at(0.99), "max": at(1.0) })
 }
 
 fn millis(d: Duration) -> f64 {
