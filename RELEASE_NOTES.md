@@ -2,6 +2,16 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-21 — Storage port: references, related, sessions, vectors and wiki (ADR-0035, Millwright R2, Mill Board #1617)
+
+### Changed
+- The last five storage ports, each implemented by the engine with that group's free functions folded into the `impl`: `db::references::ReferenceStore` (`memory_references`), `db::related::RelatedStore` (`memory_associations` and the expansion reads through entities, document position and co-retrieval), `db::sessions::SessionStore` (`sessions`), `db::vectors::VectorStore` (`vec_chunks` and `embedding_meta`) and `db::wiki::WikiStore` (the wiki pages, links, meta and full-text index). `References`, `Related`, `Sessions`, `Vectors` and `WikiIndex` lock per call and go through them. No behaviour, schema or caller changes.
+- Every table group now has a port. The wiki reads that could not fail on the engine return `Result` through the port, as ADR-0035 item 2 asks.
+- ADR-0035 lists what remains before a second backend can run the whole suite: the store holding a backend, the transaction moving into it, and four reaches that still go past the ports.
+
+### Tests
+- `reference_conformance!`, `related_conformance!`, `session_conformance!`, `vector_conformance!` and `wiki_conformance!` run on temporary engine tables; the related and vector suites seed through `MemoryStore` and `EntityStore`. Each facade keeps one test that it reaches the store through the port.
+
 ## 2026-11-19 — Decisions normalise apply
 
 ### Added
