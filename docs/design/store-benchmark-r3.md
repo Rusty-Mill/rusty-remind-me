@@ -1,9 +1,12 @@
 # Store benchmark spec (Millwright R3, card #1618)
 
-Status: **signed off by Nano, 2026-11-21** ("Approve as written", decision
-card `cmsg_012spbR8vYb6jWVUuV6ALzxuHfQhCeUcyFwPpCFLQdtBQ9`, D40): gates,
-targets, the choosing rule and the raw-bodies rule below are fixed. The run
-waits for the storage port to finish (#1617, ADR-0035 step 6).
+Status: **revised after review; needs Nano's sign-off again.** He approved
+the first version on 2026-11-21 ("Approve as written", decision card
+`cmsg_012spbR8vYb6jWVUuV6ALzxuHfQhCeUcyFwPpCFLQdtBQ9`, D40). Review then
+tightened G6 (row and revision checked together) and G8 (restored bodies
+compared, not just a restore that succeeds), and corrected the blob store to
+audit seam 3. The run waits for that sign-off and for the storage port
+(#1617, ADR-0035 step 6).
 
 ## Question
 
@@ -35,7 +38,7 @@ from the log at open and of reclaiming space, is measured, not hidden.
 
 **Raw bodies.** Every adapter, the engine included, may keep raw
 page and dialog bodies outside its RAM-resident tables, in the reusable blob
-store (audit seam 4), and only metadata in the tables. That follows the
+store (audit seam 3), and only metadata in the tables. That follows the
 audit's option A ("raw bodies stay off the RAM-resident tables whichever
 store wins") and keeps G5 a fair test rather than ruling the engine out from
 the start.
@@ -75,10 +78,10 @@ timed path. Relevance is checked on the CI golden set
    alongside.
 6. **Open:** cold open (process start to first query answered).
 7. **Crash:** `kill -9` at 200 random points during writes and ingest, then
-   reopen and check.
+   reopen and check each acknowledged row against its revision.
 8. **Concurrency:** four reader threads searching while one writer adds.
-9. **Backup:** take a backup of D3 and restore it to a fresh directory,
-   verified (D36).
+9. **Backup:** take a backup of D3, restore it to a fresh directory, and
+   compare every row and every body with the source by content hash (D36).
 
 ## Thresholds
 
@@ -92,9 +95,9 @@ round trip is not measured.
 | G3 | Steady memory | resident at most 1.0 GB with D3 loaded and idle | leaves about 3 GB for the connector, UI, OS and the release build that OOM'd the host on 2026-11-06 |
 | G4 | Peak memory | resident at most 1.5 GB at any point in workloads 1 to 7 | same budget, with room for ingest bursts |
 | G5 | Raw text stays off RAM | resident with D3 at most 1.25x resident with D1 | the reason for R3: 1.5 GB of raw text must not become 1.5 GB of RAM |
-| G6 | Crash safety | 200 of 200 kills: reopens cleanly, loses no acknowledged write, `verify` (or `PRAGMA integrity_check`) clean | remind-me is the memory every agent leans on |
+| G6 | Crash safety | 200 of 200 kills: reopens cleanly; every acknowledged write is present with its revision, and no row exists without its revision or a revision without its row; `verify` (or `PRAGMA integrity_check`) clean | remind-me is the memory every agent leans on |
 | G7 | Cold open | at most 3 s on D1, at most 5 s on D3 | ADR-0023's existing 3 s bar; clients wait 60 s for a daemon |
-| G8 | Backup | a verified restore of D3 succeeds | D36: backups are a precondition |
+| G8 | Backup | a restore of D3 to a fresh directory holds every row and every page and dialog body, each body byte-identical to the source (content hash) | D36: backups are a precondition |
 
 Scored, not gating (reported for every candidate that passes the gates):
 
