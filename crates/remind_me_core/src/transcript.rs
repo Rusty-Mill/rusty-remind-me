@@ -370,23 +370,55 @@ fn record_roles(rows: &[crate::models::Memory]) -> HashSet<String> {
 /// Whether an unplaced row of `rows` already holds this exact submission,
 /// so keeping it again would only add a copy.
 ///
-/// When the submission and the row both carry message ids, the ids decide:
-/// equal ids are a retry, and differing ids are new turns however equal
-/// their text. Otherwise the whole submission must equal the whole row,
-/// message for message; a run inside a row is not enough.
+/// Compared position by position. Two known ids that differ at any
+/// position make the submission new turns, however equal the text. When
+/// every position has two known ids, the ids decide alone. Otherwise the
+/// whole submission must equal the whole row, message for message; a run
+/// inside a row is not enough.
 fn held_unplaced(
     rows: &[crate::models::Memory],
     roles: &HashSet<&str>,
-    incoming: &Incoming<'_>,
+    blocks: &[String],
+    ids: &[Option<String>],
 ) -> bool {
     rows.iter()
         .filter(|row| is_unplaced(row))
-        .any(|row| match (incoming.ids, listed_ids(row)) {
-            (Some(ids), Some(stored)) => ids == stored.as_slice(),
-            _ => row_blocks(row, roles)
-                .into_iter()
-                .eq(incoming.blocks.iter().map(|b| Some(b.as_str()))),
-        })
+        .any(|row| holds_exactly(row, roles, blocks, ids))
+}
+
+fn holds_exactly(
+    row: &crate::models::Memory,
+    roles: &HashSet<&str>,
+    blocks: &[String],
+    ids: &[Option<String>],
+) -> bool {
+    let stored = position_ids(row);
+    if stored.is_empty() {
+        return same_text(row, roles, blocks);
+    }
+    if stored.len() != ids.len() {
+        return false;
+    }
+    let pairs = || stored.iter().zip(ids);
+    if pairs().any(|(a, b)| matches!((a, b), (Some(a), Some(b)) if a != b)) {
+        return false;
+    }
+    pairs().all(|(a, b)| a.is_some() && b.is_some()) || same_text(row, roles, blocks)
+}
+
+fn same_text(row: &crate::models::Memory, roles: &HashSet<&str>, blocks: &[String]) -> bool {
+    row_blocks(row, roles)
+        .into_iter()
+        .eq(blocks.iter().map(|b| Some(b.as_str())))
+}
+
+/// The id a dialog row lists for each of its messages, `None` where a
+/// message had none; empty when the row lists no ids.
+fn position_ids(row: &crate::models::Memory) -> Vec<Option<String>> {
+    let Some(ids) = row.metadata.get(MESSAGE_IDS_KEY).and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    ids.iter().map(|v| v.as_str().map(str::to_string)).collect()
 }
 
 /// Whether a dialog row holds a transcript kept whole because it could not
@@ -951,6 +983,7 @@ fn recapture_in(
     let placed_count: usize = placed_rows.iter().map(|row| held_messages(row)).sum();
     let held_ids = recorded_ids(&rows);
     let ids = message_ids(&messages);
+    let position: Vec<Option<String>> = messages.iter().map(|m| m.uuid.clone()).collect();
     let incoming = Incoming {
         blocks: &blocks,
         ids: ids.as_deref(),
@@ -965,7 +998,9 @@ fn recapture_in(
     // A submission an unplaced row already holds exactly, such as a retry
     // of the same tail, is not kept a second time.
     let placement = match placement {
-        Placement::Unplaced(_) if held_unplaced(&rows, &roles, &incoming) => Placement::Held,
+        Placement::Unplaced(_) if held_unplaced(&rows, &roles, &blocks, &position) => {
+            Placement::Held
+        }
         other => other,
     };
     let mut written = Written::new();
@@ -1062,8 +1097,10 @@ struct Continuation<'a> {
     from: usize,
     /// Messages it holds.
     count: usize,
-    /// Its messages' ids, when each has one.
-    ids: Option<Vec<String>>,
+    /// Each message's id, `None` where it had none: placement by id trusts
+    /// the list only when every entry is known ([`listed_ids`]), and the
+    /// retry check compares it position by position.
+    ids: Vec<Option<String>>,
     /// How its messages were placed ([`Placement::label`]): `id` or
     /// `overlap`, or `unplaced_*` when the transcript was kept whole because
     /// no placement could be shown.

@@ -1071,6 +1071,41 @@ fn an_equal_text_tail_with_other_ids_is_kept_and_an_exact_retry_is_not() {
     }
     assert_eq!(placed(&store, &first, sid), 2, "placed watermark unchanged");
 
+    // Partially identified tails: one turn with an id, one without.
+    let partial = |id: &str| {
+        [
+            with_id(&turn(sid, "assistant", "x2"), id),
+            turn(sid, "assistant", "y2"),
+        ]
+        .join("\n")
+    };
+    let kept = partial("p1");
+    capture_transcript(&store, &kept, &request_for(sid)).unwrap();
+    capture_transcript(&store, &kept, &request_for(sid)).unwrap();
+    assert_eq!(
+        continuation_ids(&store, sid).len(),
+        3,
+        "the retry is one copy"
+    );
+    // Equal text, but the identified turn's known id differs.
+    let other = partial("p2");
+    capture_transcript(&store, &other, &request_for(sid)).unwrap();
+
+    let rows = continuation_ids(&store, sid);
+    assert_eq!(rows.len(), 4, "a distinct known id is a new turn");
+    assert_eq!(source(&store, &rows[2]), kept);
+    assert_eq!(source(&store, &rows[3]), other);
+    let ids = |id: &str| {
+        remind_me_core::db::queries::get_memory_by_id(&store, id)
+            .unwrap()
+            .unwrap()
+            .metadata["message_ids"]
+            .clone()
+    };
+    assert_eq!(ids(&rows[2]), serde_json::json!(["p1", null]));
+    assert_eq!(ids(&rows[3]), serde_json::json!(["p2", null]));
+    assert_eq!(placed(&store, &first, sid), 2, "placed watermark unchanged");
+
     crate::test_env::remove_var(ARCHIVE_DIR_ENV);
     let _ = std::fs::remove_dir_all(&dir);
 }
