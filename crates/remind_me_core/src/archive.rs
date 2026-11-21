@@ -170,6 +170,13 @@ pub fn session_import_id(session_id: &str) -> String {
     format!("session:{session_id}")
 }
 
+/// The archive id one memory's own source is kept under: a namespace apart
+/// from [`session_import_id`], keyed by the row, so no session id can name
+/// it and no other row shares it.
+pub fn row_import_id(memory_id: &str) -> String {
+    format!("row:{memory_id}")
+}
+
 /// Retain `raw` as the one copy of `import_id`, if retention is on,
 /// replacing its previous copy.
 ///

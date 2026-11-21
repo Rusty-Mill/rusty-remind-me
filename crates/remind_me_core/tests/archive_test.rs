@@ -509,7 +509,11 @@ fn a_recaptured_session_keeps_only_its_latest_transcript() {
     let grown = format!("{first}\n{second}");
     capture_transcript(&store, &grown, &session_request()).unwrap();
 
-    assert_eq!(archive_rows(&store), 1, "one archive per session");
+    assert_eq!(
+        archive_rows(&store),
+        2,
+        "one archive for the session, one for the continuation row"
+    );
     assert!(
         !std::path::Path::new(&first_blob).exists(),
         "old copy unlinked"
@@ -519,6 +523,10 @@ fn a_recaptured_session_keeps_only_its_latest_transcript() {
     let continuation = continuation_ids(&store, "sess_abc");
     let later = source(&store, &continuation[0]);
     assert_eq!(later, second);
+    assert_eq!(
+        archived(&store, &archive::row_import_id(&continuation[0])),
+        second
+    );
     assert!(
         later.contains("thinking two"),
         "what the dialog drops is kept"
@@ -583,7 +591,7 @@ fn continuation_ids(store: &Store<'_>, session_id: &str) -> Vec<String> {
 
 /// The whole session, then only a later tail (sent over the size limit),
 /// then that tail again. The tail does not extend the archived transcript,
-/// so it is kept on its own and the session's copy is left whole; the retry
+/// so the continuation keeps its own lines under its row and the session's copy is left whole; the retry
 /// adds and replaces nothing. Every row reads back its own lines.
 #[test]
 fn a_tail_never_replaces_the_whole_session_and_a_retry_changes_nothing() {
@@ -617,7 +625,11 @@ fn a_tail_never_replaces_the_whole_session_and_a_retry_changes_nothing() {
             all[4..].join("\n"),
             "{label}"
         );
-        assert_eq!(archived(&store, &format!("{session}#1")), tail, "{label}");
+        assert_eq!(
+            archived(&store, &archive::row_import_id(&continuation[0])),
+            all[4..].join("\n"),
+            "{label}: only the row's own lines"
+        );
         assert_eq!(archive_rows(&store), 2, "{label}");
     };
     check("after the tail");
@@ -688,7 +700,10 @@ fn an_unplaced_copy_never_replaces_the_session_archive() {
     assert_eq!(source(&store, &made.dialog_id), first);
     let continuation = continuation_ids(&store, "sess_abc");
     assert_eq!(source(&store, &continuation[0]), other);
-    assert_eq!(archived(&store, &format!("{session}#1")), other);
+    assert_eq!(
+        archived(&store, &archive::row_import_id(&continuation[0])),
+        other
+    );
 
     crate::test_env::remove_var(ARCHIVE_DIR_ENV);
     let _ = std::fs::remove_dir_all(&dir);
@@ -761,6 +776,214 @@ fn an_archived_session_keeps_no_secret_its_dialog_redacted() {
     assert!(!source.content.contains(&token), "{}", source.content);
     assert!(source.content.contains("[REDACTED:github_token]"));
     assert!(source.content.contains("thinking"), "structure is kept");
+
+    crate::test_env::remove_var(ARCHIVE_DIR_ENV);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn request_for(session_id: &str) -> remind_me_core::transcript::TranscriptRequest<'_> {
+    remind_me_core::transcript::TranscriptRequest {
+        session_id,
+        cwd: None,
+        reason: Some("stop"),
+        context: None,
+    }
+}
+
+/// `line` moved to session `session_id`.
+fn in_session(line: &str, session_id: &str) -> String {
+    let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+    value["sessionId"] = session_id.into();
+    value.to_string()
+}
+
+/// Every dialog row of `session_id` with the source it must read back.
+fn assert_sources(store: &Store<'_>, session_id: &str, first: &str, rows: &[String]) {
+    let dialog = remind_me_core::episodes::session_memories(store, session_id)
+        .unwrap()
+        .into_iter()
+        .find(|m| m.metadata["type"] == "dialog")
+        .unwrap();
+    assert_eq!(source(store, &dialog.id), first, "{session_id} first row");
+    let continuation = continuation_ids(store, session_id);
+    assert_eq!(continuation.len(), rows.len(), "{session_id}");
+    for (id, want) in continuation.iter().zip(rows) {
+        assert_eq!(&source(store, id), want, "{session_id} row {id}");
+    }
+}
+
+/// Two sessions with the same turns keep apart: each row reads back its
+/// own session's bytes after either one grows, whether by a copy that
+/// extends its archive or by a tail kept under the row.
+#[test]
+fn two_sessions_keep_their_exact_source_bytes_after_either_grows() {
+    use remind_me_core::transcript::capture_transcript;
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_limits();
+
+    let dir = scratch("two-sessions");
+    crate::test_env::set_var(ARCHIVE_DIR_ENV, dir.join("archive"));
+    let db = open();
+    let store = db.store();
+    let of =
+        |sid: &str| -> Vec<String> { lines(1..=4).iter().map(|l| in_session(l, sid)).collect() };
+    let (a, b) = (of("sess_a"), of("sess_b"));
+
+    capture_transcript(&store, &a[..2].join("\n"), &request_for("sess_a")).unwrap();
+    capture_transcript(&store, &b[..2].join("\n"), &request_for("sess_b")).unwrap();
+
+    // A grows by a copy that extends its archive.
+    capture_transcript(&store, &a[..3].join("\n"), &request_for("sess_a")).unwrap();
+    assert_sources(&store, "sess_a", &a[..2].join("\n"), &[a[2].clone()]);
+    assert_sources(&store, "sess_b", &b[..2].join("\n"), &[]);
+
+    // B grows by a tail that starts mid-session.
+    capture_transcript(&store, &b[1..].join("\n"), &request_for("sess_b")).unwrap();
+    assert_sources(&store, "sess_a", &a[..2].join("\n"), &[a[2].clone()]);
+    assert_sources(&store, "sess_b", &b[..2].join("\n"), &[b[2..].join("\n")]);
+    assert_eq!(
+        archived(&store, &archive::session_import_id("sess_a")),
+        a[..3].join("\n")
+    );
+    assert_eq!(
+        archived(&store, &archive::session_import_id("sess_b")),
+        b[..2].join("\n")
+    );
+
+    crate::test_env::remove_var(ARCHIVE_DIR_ENV);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// New turns interleaved with held ones: the row's source is exactly the
+/// new turns' lines, never the held lines between them.
+#[test]
+fn interleaved_held_and_new_turns_keep_only_the_new_lines() {
+    use remind_me_core::transcript::capture_transcript;
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_limits();
+
+    let dir = scratch("interleaved");
+    crate::test_env::set_var(ARCHIVE_DIR_ENV, dir.join("archive"));
+    let db = open();
+    let store = db.store();
+    let all = lines(1..=5);
+
+    capture_transcript(&store, &all[..3].join("\n"), &session_request()).unwrap();
+    // Held 1, new 4, held 2, new 5, held 3.
+    let mixed = [&all[0], &all[3], &all[1], &all[4], &all[2]].map(String::as_str);
+    capture_transcript(&store, &mixed.join("\n"), &session_request()).unwrap();
+
+    let continuation = continuation_ids(&store, "sess_abc");
+    assert_eq!(continuation.len(), 1);
+    assert_eq!(
+        source(&store, &continuation[0]),
+        format!("{}\n{}", all[3], all[4])
+    );
+    // Not an extension of the archived copy: the session keeps the first.
+    assert_eq!(
+        archived(&store, &archive::session_import_id("sess_abc")),
+        all[..3].join("\n")
+    );
+
+    crate::test_env::remove_var(ARCHIVE_DIR_ENV);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A plain-text message line in `session_id`, with no message id.
+fn turn(session_id: &str, role: &str, text: &str) -> String {
+    serde_json::json!({
+        "type": role, "sessionId": session_id,
+        "timestamp": "2026-11-21T10:00:00.000Z",
+        "message": {"role": role, "content": text}
+    })
+    .to_string()
+}
+
+/// A tail holding only assistant turns, then a capture that cannot be
+/// placed, then the real later snapshot. The tail is split by the roles the
+/// record holds and placed; the ambiguous copy is kept flagged outside the
+/// placed sequence; the snapshot is placed after the placed rows. Rows read
+/// back in sequence and every row keeps its own source.
+#[test]
+fn a_partial_role_tail_then_an_ambiguous_copy_then_a_snapshot_stay_in_order() {
+    use remind_me_core::transcript::{capture_transcript, captured_messages};
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_limits();
+
+    let dir = scratch("partial-ambiguous-snapshot");
+    crate::test_env::set_var(ARCHIVE_DIR_ENV, dir.join("archive"));
+    let db = open();
+    let store = db.store();
+    let sid = "sess_mix";
+    let u = |t: &str| turn(sid, "user", t);
+    let a = |t: &str| turn(sid, "assistant", t);
+    let join = |ls: &[String]| ls.join("\n");
+
+    let first = [u("q1"), a("ok"), u("q2"), a("r2")];
+    capture_transcript(&store, &join(&first), &request_for(sid)).unwrap();
+    // Assistant turns only: "r2" ends the record once, so "ok" is new.
+    let tail = [a("r2"), a("ok")];
+    capture_transcript(&store, &join(&tail), &request_for(sid)).unwrap();
+    // "ok" now ends the record and occurs in it twice: ambiguous.
+    let stray = [a("ok"), u("q9")];
+    capture_transcript(&store, &join(&stray), &request_for(sid)).unwrap();
+    // The real session so far.
+    let snapshot = [
+        u("q1"),
+        a("ok"),
+        u("q2"),
+        a("r2"),
+        a("ok"),
+        u("q3"),
+        a("r3"),
+    ];
+    capture_transcript(&store, &join(&snapshot), &request_for(sid)).unwrap();
+
+    let dialog = remind_me_core::episodes::session_memories(&store, sid)
+        .unwrap()
+        .into_iter()
+        .find(|m| m.metadata["type"] == "dialog")
+        .unwrap();
+    let capture =
+        remind_me_core::capture::get_capture(&store, dialog.capture_id.as_deref().unwrap())
+            .unwrap()
+            .unwrap();
+    let rows = capture.continuations();
+    let seen: Vec<(u64, &str, u64)> = rows
+        .iter()
+        .map(|m| {
+            (
+                m.metadata["sequence"].as_u64().unwrap(),
+                m.metadata["placement"].as_str().unwrap(),
+                m.metadata["from_message"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (1, "overlap", 4),
+            (2, "unplaced_ambiguous", 5),
+            (3, "overlap", 5)
+        ]
+    );
+    assert!(rows[2].content.contains("q3") && rows[2].content.contains("r3"));
+    assert!(!rows[2].content.contains("q9"));
+    assert_eq!(captured_messages(&store, sid).unwrap(), Some(9));
+
+    // Provenance: the first row its transcript's lines, each continuation
+    // only its own; the session archive was replaced by the snapshot alone,
+    // which extends the first transcript.
+    assert_sources(
+        &store,
+        sid,
+        &join(&first),
+        &[a("ok"), join(&stray), join(&snapshot[5..])],
+    );
+    assert_eq!(
+        archived(&store, &archive::session_import_id(sid)),
+        join(&snapshot)
+    );
 
     crate::test_env::remove_var(ARCHIVE_DIR_ENV);
     let _ = std::fs::remove_dir_all(&dir);

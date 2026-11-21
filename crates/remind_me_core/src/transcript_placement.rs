@@ -100,7 +100,8 @@ pub fn roles(blocks: &[String]) -> HashSet<&str> {
     blocks.iter().filter_map(|b| role_of(b)).collect()
 }
 
-fn role_of(block: &str) -> Option<&str> {
+/// The role that opens a rendered message (`**role:** …`).
+pub fn role_of(block: &str) -> Option<&str> {
     block
         .strip_prefix("**")?
         .split_once(":** ")

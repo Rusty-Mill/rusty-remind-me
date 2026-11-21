@@ -755,3 +755,109 @@ fn a_recaptured_sensitive_dialog_keeps_its_new_rows_sensitive() {
     assert_eq!(rows.len(), 1);
     assert!(rows[0].sensitive, "the new row stays sensitive");
 }
+
+#[test]
+fn unplaced_rows_do_not_make_the_watcher_skip_a_longer_reading() {
+    use remind_me_core::transcript::{
+        capture_transcript, capture_unless_held, Conditional, Replace,
+    };
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    capture_transcript(&store, &bare(&["a1", "b1"]), &frozen_request("stop")).unwrap();
+    // Unplaced: two more held messages that may repeat nothing or anything.
+    capture_transcript(&store, &bare(&["x1", "y1"]), &frozen_request("stop")).unwrap();
+
+    // Three messages beat the two placed ones, not the four held in all.
+    let watched = capture_unless_held(
+        &store,
+        &bare(&["a1", "b1", "a2"]),
+        &frozen_request("watch"),
+        Replace::IfLonger,
+    )
+    .unwrap();
+    assert!(matches!(watched, Conditional::Refreshed(_)), "{watched:?}");
+    let rows = continuations(&store);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[1].metadata["placement"], "overlap");
+    assert!(rows[1].content.ends_with("a2"), "{}", rows[1].content);
+}
+
+#[test]
+fn an_unplaced_sensitive_continuation_is_as_visible_as_its_first_row() {
+    use remind_me_core::db::memories::MemoryEdit;
+    use remind_me_core::transcript::capture_transcript;
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let made = capture_transcript(
+        &store,
+        &bare(&["the quokka plan", "noted"]),
+        &frozen_request("stop"),
+    )
+    .unwrap();
+    Memories::new(&store)
+        .apply_edit(
+            &made.dialog_id,
+            &MemoryEdit {
+                sensitive: Some(true),
+                ..MemoryEdit::at("2026-11-21T10:00:01Z")
+            },
+        )
+        .unwrap();
+    capture_transcript(
+        &store,
+        &bare(&["another quokka thread", "fine"]),
+        &frozen_request("stop"),
+    )
+    .unwrap();
+    let rows = continuations(&store);
+    assert_eq!(rows.len(), 1);
+    let continuation = &rows[0];
+    assert_eq!(continuation.metadata["placement"], "unplaced_no_overlap");
+    assert!(continuation.sensitive);
+
+    // Single reads: by id both are there; search shows both only when raw
+    // and sensitive rows are asked for, and neither otherwise.
+    for id in [&made.dialog_id, &continuation.id] {
+        let row = queries::get_memory_by_id(&store, id).unwrap().unwrap();
+        assert!(row.sensitive, "{id}");
+    }
+    let search = |include_raw: bool, include_sensitive: bool| -> Vec<String> {
+        queries::search_memories(
+            &store,
+            &MemorySearchInput {
+                query: "quokka".into(),
+                include_raw,
+                include_sensitive,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .into_iter()
+        .map(|r| r.memory.id)
+        .collect()
+    };
+    for (raw, sensitive) in [(false, false), (true, false), (false, true)] {
+        let found = search(raw, sensitive);
+        assert!(
+            !found.contains(&made.dialog_id) && !found.contains(&continuation.id),
+            "raw={raw} sensitive={sensitive}: {found:?}"
+        );
+    }
+    let found = search(true, true);
+    assert!(found.contains(&made.dialog_id), "{found:?}");
+    assert!(found.contains(&continuation.id), "{found:?}");
+
+    // Joined reads: the capture holds both rows, each still marked, and the
+    // whole dialog joins them in sequence.
+    let capture = remind_me_core::capture::get_capture(&store, &made.capture_id)
+        .unwrap()
+        .unwrap();
+    assert!(capture.dialog.as_ref().unwrap().sensitive);
+    let joined = capture.continuations();
+    assert_eq!(joined.len(), 1);
+    assert!(joined[0].sensitive);
+    let full = capture.full_dialog().unwrap();
+    let first_at = full.find("the quokka plan").unwrap();
+    let later_at = full.find("another quokka thread").unwrap();
+    assert!(first_at < later_at, "{full}");
+}

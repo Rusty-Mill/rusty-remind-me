@@ -286,7 +286,7 @@ fn message_lines(raw: &str) -> impl Iterator<Item = (Range<usize>, ChatMessage)>
 }
 
 use crate::transcript_placement::{
-    place, roles, split_row, Block, Incoming, Placement, Record, MESSAGE_SEPARATOR,
+    place, role_of, roles, split_row, Block, Incoming, Placement, Record, MESSAGE_SEPARATOR,
 };
 
 /// Each message of `messages` rendered and scrubbed as a stored dialog
@@ -335,6 +335,42 @@ fn recorded_ids(rows: &[crate::models::Memory]) -> Option<HashSet<String>> {
 
 /// `metadata` key listing the message ids a dialog row holds.
 const MESSAGE_IDS_KEY: &str = "message_ids";
+
+/// `metadata` key listing the roles of the messages a dialog row holds, so
+/// the row can be split back into messages whatever a later transcript
+/// holds.
+const ROLES_KEY: &str = "roles";
+
+/// The distinct roles of `messages`, sorted.
+fn roles_of(messages: &[&ChatMessage]) -> Vec<String> {
+    let roles: std::collections::BTreeSet<&str> =
+        messages.iter().map(|m| m.role.as_str()).collect();
+    roles.into_iter().map(str::to_string).collect()
+}
+
+/// Every role the record holds: what each row lists, and the role that
+/// opens each uncut row (rows written before roles were listed).
+fn record_roles(rows: &[crate::models::Memory]) -> HashSet<String> {
+    let listed = rows
+        .iter()
+        .filter_map(|row| row.metadata.get(ROLES_KEY)?.as_array().cloned())
+        .flatten()
+        .filter_map(|role| role.as_str().map(str::to_string));
+    let opening = rows
+        .iter()
+        .filter(|row| !row.content.starts_with(TRUNCATION_MARKER))
+        .filter_map(|row| role_of(&row.content).map(str::to_string));
+    listed.chain(opening).collect()
+}
+
+/// Whether a dialog row holds a transcript kept whole because it could not
+/// be placed.
+fn is_unplaced(row: &crate::models::Memory) -> bool {
+    row.metadata
+        .get("placement")
+        .and_then(|p| p.as_str())
+        .is_some_and(|p| p.starts_with("unplaced"))
+}
 
 fn render_dialog(messages: &[ChatMessage], message_tools: &MessageTools) -> String {
     let dialog = messages
@@ -494,9 +530,11 @@ pub fn capture_unless_held_pausing(
     let _serial = CAPTURE_LOCK.lock();
     let existing = existing_dialog(store, session_id)?;
     after_lookup();
+    // Unplaced rows may repeat turns already held, so they do not make a
+    // capture look longer than a newer reading.
     let held = existing
         .as_ref()
-        .map(|dialog| held_by(store, dialog))
+        .map(|dialog| placed_by(store, dialog))
         .transpose()?;
     let keep = |held: usize| match replace {
         Replace::Never => true,
@@ -549,6 +587,17 @@ fn held_by(store: &Store<'_>, first: &crate::models::Memory) -> Result<usize> {
     Ok(dialog_rows(store, first)?.iter().map(held_messages).sum())
 }
 
+/// How many messages the placed dialog rows of `first`'s capture hold:
+/// [`held_by`] without rows kept whole because they could not be placed.
+fn placed_by(store: &Store<'_>, first: &crate::models::Memory) -> Result<usize> {
+    let rows = dialog_rows(store, first)?;
+    Ok(rows
+        .iter()
+        .filter(|row| !is_unplaced(row))
+        .map(held_messages)
+        .sum())
+}
+
 /// How many messages a captured memory's metadata records; `0` for one
 /// written before the count was recorded.
 fn held_messages(dialog: &crate::models::Memory) -> usize {
@@ -584,29 +633,30 @@ fn write_capture(
 enum Keep {
     /// Nothing was written: a copy the record already holds.
     Nothing,
-    /// A first capture: the transcript becomes the session's archive.
-    First(Source),
-    /// A placed recapture: it replaces the session's archive only when it
-    /// extends the archived copy byte for byte, so every recorded row's span
-    /// still reads its own bytes; otherwise it is kept on its own.
-    Grown(Source),
-    /// An unplaced recapture: kept on its own, the session's archive left
-    /// as it is.
-    Own(Source),
+    /// A first capture: the transcript becomes the session's archive, and
+    /// the first row's span covers its `messages` messages.
+    First { row: String, messages: usize },
+    /// A continuation row made from the transcript messages at `indexes`.
+    Continuation {
+        row: String,
+        indexes: Vec<usize>,
+        /// Whether the messages were placed. Only a placed transcript may
+        /// replace the session's archive, and only when it extends it.
+        placed: bool,
+    },
 }
 
-/// One written row and the transcript messages it was made from.
-struct Source {
-    row: String,
-    /// The row's continuation sequence; `0` for the first row.
-    sequence: usize,
-    messages: Range<usize>,
-}
-
-/// Archive what `keep` asks for and record the written row's exact span:
-/// the bytes of the lines its messages came from. The transcript is
-/// scrubbed like the dialog, so the source never returns what the dialog
-/// redacted.
+/// Archive what `keep` asks for and record the written row's span. The
+/// transcript is scrubbed like the dialog, so a source never returns what
+/// the dialog redacted.
+///
+/// The session's archive (`session:<id>`) holds the transcript the first
+/// row came from. It is replaced only by a placed transcript that extends
+/// it byte for byte, so the first row's span keeps reading its own bytes.
+/// A continuation's source is kept under its own row
+/// ([`crate::archive::row_import_id`]): exactly the lines its messages came
+/// from, or no source at all when a line it needs also holds a message it
+/// does not (fail closed).
 fn keep_source(
     store: &Store<'_>,
     session_id: &str,
@@ -618,25 +668,40 @@ fn keep_source(
         return Ok(());
     }
     let kept = crate::boundary::scrub_jsonl(raw);
-    let session = archive::session_import_id(session_id);
-    let (source, import_id) = match keep {
-        Keep::Nothing => return Ok(()),
-        Keep::First(source) => (source, session),
-        Keep::Grown(source) if extends(store, &session, &kept)? => (source, session),
-        Keep::Grown(source) | Keep::Own(source) => {
-            (source, format!("{session}#{}", source.sequence))
-        }
-    };
-    archive::replace(store, &import_id, kept.as_bytes())?;
     let spans: Vec<Range<usize>> = message_lines(&kept).map(|(span, _)| span).collect();
-    let Some(span) = cover(&spans, &source.messages) else {
-        return Err(archive::ArchiveError::Io(std::io::Error::other(format!(
-            "messages {:?} of row {} are not in its transcript",
-            source.messages, source.row
-        ))));
-    };
-    archive::record_span(store, &source.row, &import_id, span.start, span.end)?;
-    Ok(())
+    let session = archive::session_import_id(session_id);
+    match keep {
+        Keep::Nothing => Ok(()),
+        Keep::First { row, messages } => {
+            archive::replace(store, &session, kept.as_bytes())?;
+            let Some(span) = cover(&spans, *messages) else {
+                return Ok(()); // No messages: nothing to point at.
+            };
+            archive::record_span(store, row, &session, span.start, span.end)?;
+            Ok(())
+        }
+        Keep::Continuation {
+            row,
+            indexes,
+            placed,
+        } => {
+            if *placed && extends(store, &session, &kept)? {
+                archive::replace(store, &session, kept.as_bytes())?;
+            }
+            let Some(slices) = slices(&spans, indexes) else {
+                return Err(archive::ArchiveError::Io(std::io::Error::other(format!(
+                    "row {row}: a source line also holds a message the row does not; \
+                     no source recorded"
+                ))));
+            };
+            let own: Vec<&str> = slices.iter().map(|r| &kept[r.clone()]).collect();
+            let own = own.join("\n");
+            let import_id = archive::row_import_id(row);
+            archive::replace(store, &import_id, own.as_bytes())?;
+            archive::record_span(store, row, &import_id, 0, own.len())?;
+            Ok(())
+        }
+    }
 }
 
 /// Whether `kept` starts with the bytes archived under `import_id`. An
@@ -651,11 +716,33 @@ fn extends(
         .is_some_and(|old| kept.as_bytes().starts_with(&old)))
 }
 
-/// The bytes from the first to the last of `messages`' lines.
-fn cover(spans: &[Range<usize>], messages: &Range<usize>) -> Option<Range<usize>> {
-    let first = spans.get(messages.start)?;
-    let last = spans.get(messages.end.checked_sub(1)?)?;
+/// The bytes from the first line to the line of the `count`th message.
+fn cover(spans: &[Range<usize>], count: usize) -> Option<Range<usize>> {
+    let first = spans.first()?;
+    let last = spans.get(count.checked_sub(1)?)?;
     Some(first.start..last.end)
+}
+
+/// The distinct source lines of the messages at `indexes`, in order, or
+/// `None` when one of them also holds a message not selected: those bytes
+/// would claim a turn the row does not hold.
+fn slices(spans: &[Range<usize>], indexes: &[usize]) -> Option<Vec<Range<usize>>> {
+    let selected: HashSet<usize> = indexes.iter().copied().collect();
+    let mut lines: Vec<Range<usize>> = Vec::new();
+    for &i in indexes {
+        let span = spans.get(i)?;
+        let shared = spans
+            .iter()
+            .enumerate()
+            .any(|(j, other)| other == span && !selected.contains(&j));
+        if shared {
+            return None;
+        }
+        if lines.last() != Some(span) {
+            lines.push(span.clone());
+        }
+    }
+    Some(lines)
 }
 
 /// Where the session ran: the caller's own context when given, else what
@@ -718,6 +805,10 @@ fn first_capture(
                 ("messages", parsed.messages.into()),
                 ("reason", request.reason.into()),
                 (MESSAGE_IDS_KEY, whole_ids(raw, parsed).into()),
+                (
+                    ROLES_KEY,
+                    roles_of(&messages_of(raw).iter().collect::<Vec<_>>()).into(),
+                ),
             ],
         ),
         // The stamp carries the session's project.
@@ -730,11 +821,10 @@ fn first_capture(
         authoritative: request.context.is_some(),
     };
     let made = auto_capture_stamped(store, &input, &stamp)?;
-    let keep = Keep::First(Source {
+    let keep = Keep::First {
         row: made.dialog_id.clone(),
-        sequence: 0,
-        messages: 0..parsed.messages,
-    });
+        messages: parsed.messages,
+    };
     let outcome = TranscriptOutcome {
         capture_id: made.capture_id,
         dialog_id: made.dialog_id,
@@ -810,11 +900,21 @@ fn recapture_in(
     let tools = MessageTools::from_env();
     let messages = messages_of(raw);
     let blocks = stored_blocks(&messages, &tools);
-    let roles = roles(&blocks);
-    let recorded: Vec<Block<'_>> = rows
+    let record_roles = record_roles(&rows);
+    let roles: HashSet<&str> = record_roles
+        .iter()
+        .map(String::as_str)
+        .chain(roles(&blocks))
+        .collect();
+    // An unplaced row sits outside the placed sequence: text placement
+    // compares against placed rows only. Its ids still count as held.
+    let placed_rows: Vec<&crate::models::Memory> =
+        rows.iter().filter(|row| !is_unplaced(row)).collect();
+    let recorded: Vec<Block<'_>> = placed_rows
         .iter()
         .flat_map(|row| row_blocks(row, &roles))
         .collect();
+    let placed_count: usize = placed_rows.iter().map(|row| held_messages(row)).sum();
     let held_ids = recorded_ids(&rows);
     let ids = message_ids(&messages);
     let placement = place(
@@ -848,22 +948,19 @@ fn recapture_in(
     // The first row is 0, so the next continuation is the row count.
     let sequence = rows.len();
     let continuation = Continuation {
+        roles: roles_of(&new),
         sequence,
-        from: held,
+        from: placed_count,
         count: new.len(),
         ids: new.iter().map(|m| m.uuid.clone()).collect(),
         placement: placement.label(),
         reason,
     };
     let (row, stored) = append_continuation(store, dialog, &text, &continuation)?;
-    let source = Source {
+    let keep = Keep::Continuation {
         row: row.clone(),
-        sequence,
-        messages: indexes.first().map_or(0, |&i| i)..indexes.last().map_or(0, |&i| i + 1),
-    };
-    let keep = match placement {
-        Placement::New { .. } => Keep::Grown(source),
-        _ => Keep::Own(source),
+        placed: matches!(placement, Placement::New { .. }),
+        indexes,
     };
     written.push((row, stored));
     let total = held + new.len();
@@ -914,6 +1011,8 @@ pub use crate::models::CONTINUATION_TYPE;
 
 /// Where a continuation row sits in its session's record.
 struct Continuation<'a> {
+    /// The distinct roles of its messages.
+    roles: Vec<String>,
     /// Its place among the session's dialog rows: the first row is 0, each
     /// continuation one more than the last. Rows are read back in this
     /// order, never by timestamp.
@@ -950,6 +1049,7 @@ fn append_continuation(
         "type": CONTINUATION_TYPE,
         "continues": first.id,
         crate::models::SEQUENCE_KEY: at.sequence,
+        ROLES_KEY: at.roles,
         "from_message": at.from,
         "messages": at.count,
         "placement": at.placement,
@@ -1021,6 +1121,17 @@ fn replace_text(
 mod tests {
     use super::*;
     use crate::db::Database;
+
+    #[test]
+    fn slices_keep_selected_lines_and_fail_closed_on_a_shared_line() {
+        // Messages 0..4 on lines a, b, b, c: line b holds messages 1 and 2.
+        let spans = [0..1, 2..3, 2..3, 4..5];
+        assert_eq!(slices(&spans, &[0, 3]), Some(vec![0..1, 4..5]));
+        assert_eq!(slices(&spans, &[1, 2]), Some(vec![2..3]));
+        // Message 1 alone would claim message 2's bytes too.
+        assert_eq!(slices(&spans, &[1]), None);
+        assert_eq!(slices(&spans, &[9]), None);
+    }
 
     fn line(role: &str, session: &str, text: &str) -> String {
         serde_json::json!({
