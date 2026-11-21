@@ -75,8 +75,16 @@ impl SqliteTables {
         std::fs::create_dir_all(dir)
             .map_err(|e| StoreError::Engine(format!("sqlite: {}: {e}", dir.display())))?;
         let conn = Connection::open(dir.join(FILE)).map_err(sqlite_error)?;
-        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;")
+        conn.busy_timeout(std::time::Duration::ZERO)
             .map_err(sqlite_error)?;
+        // One process owns a node's store, as on the engine: the daemon
+        // and its fallback rely on a second opener being refused. Exclusive
+        // locking, set before WAL, holds the file lock from here on.
+        conn.execute_batch(
+            "PRAGMA locking_mode = EXCLUSIVE; PRAGMA journal_mode = WAL; \
+             PRAGMA synchronous = FULL; BEGIN EXCLUSIVE; COMMIT;",
+        )
+        .map_err(held_error)?;
         Self::with_schema(conn)
     }
 
@@ -147,15 +155,13 @@ impl Backend for SqliteTables {
         self.rebuild_wiki_index()
     }
 
-    /// Checkpoint the WAL, and `VACUUM` when a quarter or more of the file
-    /// is free pages. `1` when it vacuumed. Skipped inside a transaction.
+    /// `VACUUM` when a quarter or more of the file is free pages, then fold
+    /// the WAL into the file. Counts each that did work (the WAL as the
+    /// engine counts a folded log). Skipped inside a transaction.
     fn compact(&mut self) -> Result<usize> {
         if !self.conn.is_autocommit() {
             return Ok(0);
         }
-        self.conn
-            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
-            .map_err(sqlite_error)?;
         let (free, total): (i64, i64) = self
             .one(
                 "SELECT freelist_count, page_count FROM pragma_freelist_count(), pragma_page_count()",
@@ -163,11 +169,18 @@ impl Backend for SqliteTables {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?
             .unwrap_or((0, 0));
-        if total == 0 || free * 4 < total {
-            return Ok(0);
+        let vacuum = total > 0 && free * 4 >= total;
+        if vacuum {
+            self.conn.execute_batch("VACUUM").map_err(sqlite_error)?;
         }
-        self.conn.execute_batch("VACUUM").map_err(sqlite_error)?;
-        Ok(1)
+        // `TRUNCATE` reports no frames, so `PASSIVE` counts them first.
+        let folded: i64 = self
+            .one("PRAGMA wal_checkpoint(PASSIVE)", [], |r| r.get(1))?
+            .unwrap_or(0);
+        self.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .map_err(sqlite_error)?;
+        Ok(usize::from(folded > 0) + usize::from(vacuum))
     }
 
     /// A consistent copy by `VACUUM INTO`, as a directory [`Self::open`]
@@ -244,6 +257,18 @@ pub(crate) fn all<T>(
     rows.collect::<rusqlite::Result<_>>().map_err(sqlite_error)
 }
 
+/// The error for a store another connection holds, worded as the engine's
+/// so the daemon's fallback names the same remedy.
+fn held_error(e: rusqlite::Error) -> StoreError {
+    if e.sqlite_error_code() != Some(rusqlite::ErrorCode::DatabaseBusy) {
+        return sqlite_error(e);
+    }
+    StoreError::Engine(format!(
+        "sqlite: {e}. Another rusty-remind-me process holds this node's store, usually the \
+         store daemon; `rusty-remind-me daemon stop` releases it"
+    ))
+}
+
 /// A SQLite failure as the store's error. `Engine` names the storage
 /// backend that failed; adding a variant would change the public enum.
 pub(crate) fn sqlite_error(e: rusqlite::Error) -> StoreError {
@@ -289,6 +314,17 @@ mod tests {
     }
 
     #[test]
+    fn a_second_opener_is_refused_until_the_first_closes() {
+        let dir = scratch("held");
+        let first = SqliteTables::open(&dir).unwrap();
+        let refused = SqliteTables::open(&dir).err().unwrap().to_string();
+        assert!(refused.contains("daemon stop"), "{refused}");
+        drop(first);
+        SqliteTables::open(&dir).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn transaction_state_follows_the_connection() {
         let mut t = SqliteTables::open_in_memory().unwrap();
         assert_eq!(t.transaction_state(), TransactionState::Closed);
@@ -316,16 +352,18 @@ mod tests {
     }
 
     #[test]
-    fn compact_vacuums_only_a_mostly_free_file() {
+    fn compact_folds_the_wal_and_vacuums_only_a_mostly_free_file() {
         let dir = scratch("compact");
         let mut t = SqliteTables::open(&dir).unwrap();
-        assert_eq!(t.compact().unwrap(), 0, "nothing free");
+        assert_eq!(t.compact().unwrap(), 1, "the schema's writes folded");
+        assert_eq!(t.compact().unwrap(), 0, "nothing written since");
         let body = "x".repeat(4096);
         for i in 0..200 {
             MemoryStore::insert(&mut t, &NewMemory::new(&format!("m{i}"), &body, NOW)).unwrap();
         }
         t.exec("DELETE FROM memories", []).unwrap();
-        assert_eq!(t.compact().unwrap(), 1, "vacuumed");
+        assert_eq!(t.compact().unwrap(), 2, "folded and vacuumed");
+        assert_eq!(t.compact().unwrap(), 0);
         drop(t);
         std::fs::remove_dir_all(&dir).unwrap();
     }
