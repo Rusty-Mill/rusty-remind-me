@@ -521,7 +521,7 @@ fn a_tail_sent_mid_session_records_only_the_turns_after_the_overlap() {
     );
     assert_eq!(added[0].metadata["from_message"], json!(5));
     assert_eq!(added[0].metadata["messages"], json!(2));
-    assert_eq!(added[0].metadata["overlapped"], json!(true));
+    assert_eq!(added[0].metadata["placement"], json!("id"));
     // The count comes from the dialog rows: 5 + 2.
     assert_eq!(made.messages, 7);
     assert_eq!(captured_messages(&store, "s-frozen").unwrap(), Some(7));
@@ -555,19 +555,136 @@ fn the_recorded_count_ignores_what_the_summary_claims() {
         .any(|m| m.content.contains("turn 5")));
 }
 
+/// A transcript line with no `uuid`, so placement can only use text.
+fn bare_line(role: &str, text: &str) -> String {
+    json!({
+        "type": role, "sessionId": "s-frozen",
+        "timestamp": "2026-11-21T10:00:00.000Z",
+        "message": {"role": role, "content": text}
+    })
+    .to_string()
+}
+
+fn bare(texts: &[&str]) -> String {
+    texts
+        .iter()
+        .enumerate()
+        .map(|(i, t)| bare_line(if i % 2 == 0 { "user" } else { "assistant" }, t))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[test]
-fn a_transcript_with_no_recorded_turn_is_kept_whole_and_flagged() {
+fn a_resent_older_copy_adds_nothing_by_id_or_by_text() {
+    use remind_me_core::transcript::{capture_transcript, captured_messages};
+    for (first, grown, older) in [
+        (turns(1..=4), turns(1..=6), turns(1..=3)),
+        (
+            bare(&["a1", "b1", "a2", "b2"]),
+            bare(&["a1", "b1", "a2", "b2", "a3", "b3"]),
+            bare(&["a1", "b1", "a2"]),
+        ),
+    ] {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        let made = capture_transcript(&store, &first, &frozen_request("stop")).unwrap();
+        capture_transcript(&store, &grown, &frozen_request("stop")).unwrap();
+        let summary = queries::get_memory_by_id(&store, &made.summary_id)
+            .unwrap()
+            .unwrap();
+
+        // The older, shorter copy arrives late.
+        let late = capture_transcript(&store, &older, &frozen_request("stop")).unwrap();
+
+        assert_eq!(
+            continuations(&store).len(),
+            1,
+            "only the grown copy added rows"
+        );
+        assert_eq!(late.messages, 6);
+        assert_eq!(captured_messages(&store, "s-frozen").unwrap(), Some(6));
+        let after = queries::get_memory_by_id(&store, &made.summary_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.content, summary.content,
+            "the summary still describes 6"
+        );
+    }
+}
+
+#[test]
+fn repeated_short_turns_by_text_are_kept_whole_and_flagged_ambiguous() {
     use remind_me_core::transcript::capture_transcript;
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
-    capture_transcript(&store, &turns(1..=3), &frozen_request("stop")).unwrap();
+    capture_transcript(
+        &store,
+        &bare(&["q1", "yes", "q2", "yes"]),
+        &frozen_request("stop"),
+    )
+    .unwrap();
 
-    capture_transcript(&store, &turns(10..=11), &frozen_request("stop")).unwrap();
+    // A tail that starts at "yes": which "yes" it is cannot be shown.
+    let tail = [bare_line("assistant", "yes"), bare_line("user", "q3")].join("\n");
+    capture_transcript(&store, &tail, &frozen_request("stop")).unwrap();
 
     let added = continuations(&store);
     assert_eq!(added.len(), 1);
-    assert!(added[0].content.contains("turn 10") && added[0].content.contains("turn 11"));
-    assert_eq!(added[0].metadata["overlapped"], json!(false));
+    assert_eq!(added[0].metadata["placement"], json!("unplaced_ambiguous"));
+    assert_eq!(
+        added[0].metadata["messages"],
+        json!(2),
+        "kept whole, not guessed"
+    );
+    assert!(added[0].content.contains("yes") && added[0].content.contains("q3"));
+}
+
+#[test]
+fn repeated_short_turns_with_ids_are_placed_exactly() {
+    use remind_me_core::transcript::capture_transcript;
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let line = |i: usize, role: &str, text: &str| {
+        json!({
+            "type": role, "sessionId": "s-frozen", "uuid": format!("u{i}"),
+            "timestamp": "2026-11-21T10:00:00.000Z",
+            "message": {"role": role, "content": text}
+        })
+        .to_string()
+    };
+    let session = [
+        line(1, "user", "q1"),
+        line(2, "assistant", "yes"),
+        line(3, "user", "q2"),
+        line(4, "assistant", "yes"),
+        line(5, "user", "q3"),
+        line(6, "assistant", "yes"),
+    ];
+    capture_transcript(&store, &session[..4].join("\n"), &frozen_request("stop")).unwrap();
+
+    capture_transcript(&store, &session[3..].join("\n"), &frozen_request("stop")).unwrap();
+
+    let added = continuations(&store);
+    assert_eq!(added.len(), 1);
+    assert_eq!(added[0].metadata["placement"], json!("id"));
+    assert_eq!(added[0].metadata["message_ids"], json!(["u5", "u6"]));
+    assert_eq!(added[0].metadata["from_message"], json!(4));
+}
+
+#[test]
+fn a_text_transcript_with_no_recorded_turn_is_kept_whole_and_flagged() {
+    use remind_me_core::transcript::capture_transcript;
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    capture_transcript(&store, &bare(&["a1", "b1", "a2"]), &frozen_request("stop")).unwrap();
+
+    capture_transcript(&store, &bare(&["x1", "y1"]), &frozen_request("stop")).unwrap();
+
+    let added = continuations(&store);
+    assert_eq!(added.len(), 1);
+    assert!(added[0].content.contains("x1") && added[0].content.contains("y1"));
+    assert_eq!(added[0].metadata["placement"], json!("unplaced_no_overlap"));
 }
 
 #[test]

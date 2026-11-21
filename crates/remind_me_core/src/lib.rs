@@ -91,6 +91,7 @@ pub mod topic_assign;
 pub mod topic_curate;
 pub mod topic_seed;
 pub mod transcript;
+pub mod transcript_placement;
 pub mod undo_import;
 pub mod updater;
 pub mod vectors;
