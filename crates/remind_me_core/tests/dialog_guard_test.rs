@@ -361,3 +361,51 @@ fn default_search_leaves_dialogs_out_and_include_raw_brings_them_back() {
     );
     assert!(search(true).contains(&id));
 }
+
+fn add_triple(store: &Store<'_>, category: &str, object: &str) -> String {
+    queries::add_memory(
+        store,
+        MemoryAddInput {
+            content: format!("the store is {object}"),
+            category: category.to_string(),
+            source: "manual".into(),
+            subject: Some("remind-me store".into()),
+            predicate: Some("is".into()),
+            object: Some(object.into()),
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .id
+}
+
+#[test]
+fn a_contradicting_fact_supersedes_a_fact_but_never_a_dialog() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let said = add_triple(&store, DIALOG_CATEGORY, "sqlite");
+    let fact = add_triple(&store, "fact", "sqlite");
+
+    let newer = add_triple(&store, "fact", "attest");
+    // What a capture's facts and an annotation run after writing a triple.
+    let superseded = remind_me_core::entity::supersede_contradicting_facts(
+        &store,
+        &newer,
+        Some("remind-me store"),
+        Some("is"),
+        Some("attest"),
+    )
+    .unwrap();
+    assert_eq!(superseded, vec![fact.clone()]);
+
+    let superseded_by = |id: &str| {
+        Memories::new(&store)
+            .get_many(&[id.to_string()])
+            .unwrap()
+            .remove(0)
+            .superseded_by
+    };
+    assert_eq!(superseded_by(&fact).as_deref(), Some(newer.as_str()));
+    assert_eq!(superseded_by(&said), None);
+    assert!(queries::get_memory_by_id(&store, &said).unwrap().is_some());
+}

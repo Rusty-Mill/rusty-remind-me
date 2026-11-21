@@ -430,7 +430,8 @@ pub trait MemoryStore {
     ) -> Result<()>;
 
     /// The triple of every live, unsuperseded memory other than `except_id`
-    /// that has all three parts.
+    /// that has all three parts. Dialog rows are left out: they are never
+    /// superseded by a contradicting fact (D13).
     fn live_triples_except(&self, except_id: &str) -> Result<Vec<Triple>>;
 
     /// Live, unsuperseded memories after (`cutoff`, `after_id`) in

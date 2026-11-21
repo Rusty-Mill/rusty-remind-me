@@ -943,6 +943,9 @@ pub(crate) fn access_inputs(tables: &EngineTables, ids: &[String]) -> Result<Vec
 pub(crate) fn live_triples_except(tables: &EngineTables, except_id: &str) -> Result<Vec<Triple>> {
     let mut triples: Vec<Triple> = rows(core_ref(tables)?)
         .filter(|row| row.id != except_id && row.is_live())
+        // A dialog is the verbatim record (D13): never a contradiction
+        // candidate, so a new fact cannot supersede it.
+        .filter(|row| row.category != crate::models::DIALOG_CATEGORY)
         .filter_map(|row| {
             Some(Triple {
                 subject: row.subject?,
