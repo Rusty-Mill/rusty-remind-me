@@ -78,8 +78,8 @@ impl FeedbackStore for SqliteTables {
         event: &FeedbackEvent,
         created_at: &str,
     ) -> Result<()> {
-        self.conn
-            .execute(
+        self.atomic(|c| {
+            c.execute(
                 "INSERT INTO memory_feedback VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     id,
@@ -100,6 +100,7 @@ impl FeedbackStore for SqliteTables {
                 }
                 e => sqlite_error(e),
             })
+        })
     }
 
     fn events(&self, memory_id: &str) -> Result<Vec<FeedbackEvent>> {

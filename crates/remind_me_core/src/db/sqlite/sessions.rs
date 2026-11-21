@@ -35,7 +35,7 @@ fn session(r: &Row<'_>) -> rusqlite::Result<SessionRecord> {
 }
 
 impl SqliteTables {
-    fn put_session(&self, s: &SessionRecord) -> Result<()> {
+    fn put_session(&mut self, s: &SessionRecord) -> Result<()> {
         self.exec(
             &format!("INSERT OR REPLACE INTO sessions ({COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"),
             params![

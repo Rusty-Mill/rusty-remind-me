@@ -40,13 +40,14 @@ impl SqliteTables {
 
 impl ReferenceStore for SqliteTables {
     fn insert(&mut self, r: &NewReference) -> Result<()> {
-        self.conn
-            .execute(
+        self.atomic(|c| {
+            c.execute(
                 "INSERT INTO memory_references VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![r.id, r.memory_id, r.kind, r.value, r.label, r.created_at],
             )
             .map(drop)
             .map_err(sqlite_error)
+        })
     }
 
     fn for_memory(&self, memory_id: &str) -> Result<Vec<MemoryReference>> {

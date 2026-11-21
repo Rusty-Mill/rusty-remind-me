@@ -43,8 +43,8 @@ impl ImportStore for SqliteTables {
         at: &str,
         stats: &str,
     ) -> Result<()> {
-        self.conn
-            .execute(
+        self.atomic(|c| {
+            c.execute(
                 "INSERT INTO chat_imports VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![id, filename, hash, at, stats],
             )
@@ -57,6 +57,7 @@ impl ImportStore for SqliteTables {
                 }
                 e => sqlite_error(e),
             })
+        })
     }
 
     fn chat_import_with_hash(&self, hash: &str) -> Result<Option<String>> {

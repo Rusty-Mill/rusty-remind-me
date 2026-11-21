@@ -274,9 +274,14 @@ impl Backend for SqliteTables {
 /// Statement helpers shared by every adapter, so each port method is its
 /// SQL and nothing else.
 impl SqliteTables {
-    /// Run one statement; how many rows it changed.
-    pub(crate) fn exec(&self, sql: &str, params: impl Params) -> Result<usize> {
-        exec(&self.conn, sql, params)
+    /// Run one write statement; how many rows it changed.
+    ///
+    /// It runs in [`Self::atomic`], so a standalone write gets the same
+    /// settlement as any other: outside a transaction its implicit commit
+    /// is an explicit `RELEASE`, and one that fails marks the store
+    /// `NeedsRecovery` rather than leaving it `Closed`.
+    pub(crate) fn exec(&mut self, sql: &str, params: impl Params) -> Result<usize> {
+        self.atomic(|c| exec(c, sql, params))
     }
 
     /// Every row `sql` selects, each read by `f`.
@@ -445,6 +450,25 @@ mod tests {
         assert!(
             Memories::new(&store).exists("m").is_err(),
             "the lock refuses reads once the store needs recovery"
+        );
+    }
+
+    /// A standalone `exec` settles like `atomic`: a statement that fails
+    /// is put back and the store stays usable, and a commit that cannot be
+    /// confirmed (here the statement releases the savepoint, so the final
+    /// `RELEASE` fails) leaves it `NeedsRecovery`.
+    #[test]
+    fn a_standalone_exec_settles_like_atomic() {
+        let mut t = SqliteTables::open_in_memory().unwrap();
+        assert!(t.exec("INSERT INTO no_such_table VALUES (1)", []).is_err());
+        assert_eq!(t.transaction_state(), TransactionState::Closed);
+        MemoryStore::insert(&mut t, &NewMemory::new("m", "x", NOW)).unwrap();
+
+        assert!(t.exec("RELEASE atomic", []).is_err());
+        assert_eq!(t.transaction_state(), TransactionState::NeedsRecovery);
+        assert!(
+            t.exec("DELETE FROM memories", []).is_err(),
+            "later writes are refused"
         );
     }
 

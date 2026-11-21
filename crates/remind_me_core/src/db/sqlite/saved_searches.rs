@@ -61,8 +61,8 @@ impl SavedSearchStore for SqliteTables {
                 s.name
             )));
         }
-        self.conn
-            .execute(
+        self.atomic(|c| {
+            c.execute(
                 &format!(
                     "INSERT INTO saved_searches ({COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
                 ),
@@ -78,16 +78,18 @@ impl SavedSearchStore for SqliteTables {
             )
             .map(drop)
             .map_err(sqlite_error)
+        })
     }
 
     fn update(&mut self, s: &SavedSearch) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE saved_searches SET query = ?2, filters = ?3, watch = ?4, updated_at = ?5 WHERE id = ?1",
-                params![s.id, s.query, encode_filters(&s.filters), i64::from(s.watch), s.updated_at],
-            )
-            .map(drop)
-            .map_err(sqlite_error)
+        self.atomic(|c| {
+            c.execute(
+                    "UPDATE saved_searches SET query = ?2, filters = ?3, watch = ?4, updated_at = ?5 WHERE id = ?1",
+                    params![s.id, s.query, encode_filters(&s.filters), i64::from(s.watch), s.updated_at],
+                )
+                .map(drop)
+                .map_err(sqlite_error)
+        })
     }
 
     fn get(&self, id: &str) -> Result<SavedSearch> {
