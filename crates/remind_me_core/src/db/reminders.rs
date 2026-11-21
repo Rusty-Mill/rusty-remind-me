@@ -7,7 +7,7 @@
 //! [`crate::reminders`] and [`crate::scheduler`]: what a valid `remind_at`
 //! is, that a reminder must be in the future, and when a delivery counts.
 
-use super::engine::EngineLock;
+use super::backend::BackendLock;
 use super::{Result, Store};
 use crate::models::{Memory, ReminderWindow};
 
@@ -49,17 +49,19 @@ pub trait ReminderStore {
 /// The reminder columns and tables of a [`Store`], one locked call at a
 /// time.
 pub struct Reminders<'c> {
-    core: &'c EngineLock,
+    backend: &'c BackendLock,
 }
 
 impl<'c> Reminders<'c> {
     pub fn new(store: &'c Store<'_>) -> Self {
-        Self { core: store.core() }
+        Self {
+            backend: store.backend(),
+        }
     }
 
     /// See [`ReminderStore::is_live`].
     pub fn is_live(&self, memory_id: &str) -> Result<bool> {
-        ReminderStore::is_live(&*self.core.lock(), memory_id)
+        ReminderStore::is_live(&*self.backend.lock()?, memory_id)
     }
 
     /// See [`ReminderStore::set_remind_at`]. The stamp is what LWW compares.
@@ -69,13 +71,13 @@ impl<'c> Reminders<'c> {
         remind_at: Option<&str>,
         updated_at: &str,
     ) -> Result<()> {
-        ReminderStore::set_remind_at(&mut *self.core.lock(), memory_id, remind_at, updated_at)
+        ReminderStore::set_remind_at(&mut *self.backend.lock()?, memory_id, remind_at, updated_at)
     }
 
     /// See [`ReminderStore::in_window`]. A negative `limit` returns nothing.
     pub fn in_window(&self, window: ReminderWindow, now: &str, limit: i64) -> Result<Vec<Memory>> {
         let limit = usize::try_from(limit).unwrap_or(0);
-        ReminderStore::in_window(&*self.core.lock(), window, now, limit)
+        ReminderStore::in_window(&*self.backend.lock()?, window, now, limit)
     }
 
     /// See [`ReminderStore::record_delivery`]: two racing pollers must
@@ -86,7 +88,12 @@ impl<'c> Reminders<'c> {
         remind_at: &str,
         delivered_at: &str,
     ) -> Result<()> {
-        ReminderStore::record_delivery(&mut *self.core.lock(), memory_id, remind_at, delivered_at)
+        ReminderStore::record_delivery(
+            &mut *self.backend.lock()?,
+            memory_id,
+            remind_at,
+            delivered_at,
+        )
     }
 }
 

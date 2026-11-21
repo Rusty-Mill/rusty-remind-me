@@ -11,7 +11,7 @@
 //! seeding a first poll, which matches are new) stay in
 //! [`crate::saved_searches`].
 
-use super::engine::EngineLock;
+use super::backend::BackendLock;
 use super::{Result, Store};
 use crate::models::{SavedSearch, SavedSearchFilters};
 use std::collections::HashSet;
@@ -60,64 +60,64 @@ pub trait SavedSearchStore {
 
 /// The saved-search tables of a [`Store`], one locked call at a time.
 pub struct SavedSearches<'c> {
-    engine: &'c EngineLock,
+    backend: &'c BackendLock,
 }
 
 impl<'c> SavedSearches<'c> {
     pub fn new(store: &'c Store<'_>) -> Self {
         Self {
-            engine: store.engine(),
+            backend: store.backend(),
         }
     }
 
     /// See [`SavedSearchStore::id_for_name`].
     pub fn id_for_name(&self, name: &str) -> Result<Option<String>> {
-        SavedSearchStore::id_for_name(&*self.engine.lock(), name)
+        SavedSearchStore::id_for_name(&*self.backend.lock()?, name)
     }
 
     /// See [`SavedSearchStore::insert`].
     pub fn insert(&self, saved: &SavedSearch) -> Result<()> {
-        SavedSearchStore::insert(&mut *self.engine.lock(), saved)
+        SavedSearchStore::insert(&mut *self.backend.lock()?, saved)
     }
 
     /// See [`SavedSearchStore::update`].
     pub fn update(&self, saved: &SavedSearch) -> Result<()> {
-        SavedSearchStore::update(&mut *self.engine.lock(), saved)
+        SavedSearchStore::update(&mut *self.backend.lock()?, saved)
     }
 
     /// See [`SavedSearchStore::get`].
     pub fn get(&self, id: &str) -> Result<SavedSearch> {
-        SavedSearchStore::get(&*self.engine.lock(), id)
+        SavedSearchStore::get(&*self.backend.lock()?, id)
     }
 
     /// See [`SavedSearchStore::get_by_name`].
     pub fn get_by_name(&self, name: &str) -> Result<Option<SavedSearch>> {
-        SavedSearchStore::get_by_name(&*self.engine.lock(), name)
+        SavedSearchStore::get_by_name(&*self.backend.lock()?, name)
     }
 
     /// See [`SavedSearchStore::list`].
     pub fn list(&self) -> Result<Vec<SavedSearch>> {
-        SavedSearchStore::list(&*self.engine.lock())
+        SavedSearchStore::list(&*self.backend.lock()?)
     }
 
     /// See [`SavedSearchStore::delete`].
     pub fn delete(&self, id: &str) -> Result<()> {
-        SavedSearchStore::delete(&mut *self.engine.lock(), id)
+        SavedSearchStore::delete(&mut *self.backend.lock()?, id)
     }
 
     /// See [`SavedSearchStore::seen_ids`].
     pub fn seen_ids(&self, saved_search_id: &str) -> Result<HashSet<String>> {
-        SavedSearchStore::seen_ids(&*self.engine.lock(), saved_search_id)
+        SavedSearchStore::seen_ids(&*self.backend.lock()?, saved_search_id)
     }
 
     /// See [`SavedSearchStore::has_any_seen`].
     pub fn has_any_seen(&self, saved_search_id: &str) -> Result<bool> {
-        SavedSearchStore::has_any_seen(&*self.engine.lock(), saved_search_id)
+        SavedSearchStore::has_any_seen(&*self.backend.lock()?, saved_search_id)
     }
 
     /// See [`SavedSearchStore::mark_seen`].
     pub fn mark_seen(&self, saved_search_id: &str, memory_ids: &[String], now: &str) -> Result<()> {
-        SavedSearchStore::mark_seen(&mut *self.engine.lock(), saved_search_id, memory_ids, now)
+        SavedSearchStore::mark_seen(&mut *self.backend.lock()?, saved_search_id, memory_ids, now)
     }
 }
 

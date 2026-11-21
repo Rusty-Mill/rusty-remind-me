@@ -12,7 +12,7 @@
 //! [`SessionStore`] is the port (ADR-0035); the engine's adapter is in
 //! `db::engine::sessions`. [`Sessions`] is what callers take.
 
-use super::engine::EngineLock;
+use super::backend::BackendLock;
 use super::{Result, Store};
 use serde::{Deserialize, Serialize};
 
@@ -142,17 +142,19 @@ pub trait SessionStore {
 
 /// The `sessions` table of a [`Store`], one locked call at a time.
 pub struct Sessions<'c> {
-    core: &'c EngineLock,
+    backend: &'c BackendLock,
 }
 
 impl<'c> Sessions<'c> {
     pub fn new(store: &'c Store<'_>) -> Self {
-        Self { core: store.core() }
+        Self {
+            backend: store.backend(),
+        }
     }
 
     /// See [`SessionStore::upsert_start`].
     pub fn upsert_start(&self, start: &SessionStart) -> Result<()> {
-        SessionStore::upsert_start(&mut *self.core.lock(), start)
+        SessionStore::upsert_start(&mut *self.backend.lock()?, start)
     }
 
     /// See [`SessionStore::end`].
@@ -164,7 +166,7 @@ impl<'c> Sessions<'c> {
         work_log_memory_id: Option<&str>,
     ) -> Result<bool> {
         SessionStore::end(
-            &mut *self.core.lock(),
+            &mut *self.backend.lock()?,
             session_id,
             ended_at,
             end_sha,
@@ -174,12 +176,12 @@ impl<'c> Sessions<'c> {
 
     /// See [`SessionStore::get`].
     pub fn get(&self, session_id: &str) -> Result<Option<SessionRecord>> {
-        SessionStore::get(&*self.core.lock(), session_id)
+        SessionStore::get(&*self.backend.lock()?, session_id)
     }
 
     /// See [`SessionStore::recent`].
     pub fn recent(&self, limit: usize, project: Option<&str>) -> Result<Vec<SessionRecord>> {
-        SessionStore::recent(&*self.core.lock(), limit, project)
+        SessionStore::recent(&*self.backend.lock()?, limit, project)
     }
 }
 

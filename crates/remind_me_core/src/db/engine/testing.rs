@@ -3,10 +3,20 @@
 use super::core::{Change, CoreTables};
 use super::memories::{self, MemoryRecord, MemoryRow};
 use super::{core_ref, engine_id, EngineTables};
+use crate::db::backend::BackendGuard;
 use crate::db::{Result, StoreError};
 use crate::testing::Table;
 use rusty_multimodal_db_engine::generic::query::{AllIds, GetById};
 use serde_json::Value;
+
+/// The engine behind `guard`: raw rows are the engine's own, so code that
+/// reads or plants them refuses, naming why, on any other backend.
+pub(crate) fn tables<'g>(guard: &'g mut BackendGuard<'_>) -> Result<&'g mut EngineTables> {
+    let backend: &mut dyn std::any::Any = &mut **guard;
+    backend.downcast_mut::<EngineTables>().ok_or_else(|| {
+        StoreError::Invalid("raw engine rows were asked of a store that is not the engine".into())
+    })
+}
 
 /// The row's columns as JSON, with the flag as 0 or 1 as SQLite stores it.
 fn columns(row: &MemoryRow) -> Result<serde_json::Map<String, Value>> {

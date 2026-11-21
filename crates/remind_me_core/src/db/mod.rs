@@ -7,6 +7,7 @@
 //! (`db::legacy_sqlite`, `db::engine::copy`), then never opened again.
 
 pub mod archives;
+pub mod backend;
 pub mod curation;
 pub mod derived;
 pub mod engine;
@@ -33,7 +34,8 @@ pub mod wiki;
 pub use legacy_sqlite::SCHEMA_VERSION;
 pub use store::{Result, SecondarySource, Store, StoreError};
 
-use engine::{EngineHandle, EngineLock, EngineTables};
+use backend::{Backend, BackendHandle, BackendLock};
+use engine::EngineTables;
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -244,14 +246,14 @@ fn copy_logging_progress(file: &Path, dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The node's store: the engine tables, their process-wide lock, and the
-/// file they stand beside.
+/// The node's store: its backend (the engine tables, in production), the
+/// process-wide lock, and the file it stands beside.
 pub struct Database {
     /// Taken by [`Database::store`], so one caller runs at a time, as the
     /// SQLite connection's mutex once ordered them. Background threads use
     /// a [`SecondarySource`] and take no part in it.
     lock: Mutex<()>,
-    engine: EngineHandle,
+    backend: BackendHandle,
     /// `None` for an in-memory database. Kept so [`Database::secondary_source`]
     /// can name the file without every caller carrying the path around.
     path: Option<PathBuf>,
@@ -261,7 +263,7 @@ impl Database {
     /// A database that lives only as long as this value: temporary engine
     /// tables, removed when it is dropped.
     pub fn open_in_memory() -> Result<Self> {
-        Self::from_tables(EngineTables::open_temporary()?, None)
+        Self::open_backend(Box::new(EngineTables::open_temporary()?), None)
     }
 
     /// The database named by `path`, the old SQLite file's path: its store
@@ -288,7 +290,10 @@ impl Database {
         if copied {
             copy_logging_progress(path, &dir)?;
         }
-        let db = Self::from_tables(EngineTables::open(&dir)?, Some(path.to_path_buf()))?;
+        let db = Self::open_backend(
+            Box::new(EngineTables::open(&dir)?),
+            Some(path.to_path_buf()),
+        )?;
         if copied {
             // The SQLite store's open used to rewrite entity ids an earlier
             // build derived differently; a copied store gets that once.
@@ -297,10 +302,18 @@ impl Database {
         Ok(db)
     }
 
-    fn from_tables(tables: EngineTables, path: Option<PathBuf>) -> Result<Self> {
+    /// A database over `backend`, any store that implements every port
+    /// (ADR-0035, step 6), standing beside `path` (`None` in memory). Runs
+    /// the same start-up reconciliation as [`Database::open`], so a test
+    /// suite or benchmark sees the store as a real open would leave it.
+    ///
+    /// # Errors
+    ///
+    /// The backend's error if a start-up write fails.
+    pub fn open_backend(backend: Box<dyn Backend>, path: Option<PathBuf>) -> Result<Self> {
         let db = Self {
             lock: Mutex::new(()),
-            engine: Arc::new(EngineLock::new(tables)),
+            backend: Arc::new(BackendLock::new(backend)),
             path,
         };
         // Every outbox write is gated on the `sync_enabled` flag: align it
@@ -320,16 +333,17 @@ impl Database {
         Ok(db)
     }
 
-    /// Compact the engine tables that have something to reclaim (see
-    /// [`EngineTables::compact_needed`]). How many were compacted.
+    /// Compact whatever the backend has to reclaim (on the engine, the
+    /// tables `EngineTables::compact_needed` picks). How many were
+    /// compacted.
     pub fn compact_store(&self) -> Result<usize> {
-        self.engine.lock().compact_needed()
+        self.backend.lock()?.compact()
     }
 
     /// The store, holding the database's lock for as long as the handle
     /// lives.
     pub fn store(&self) -> Store<'_> {
-        Store::locked(self.lock.lock(), self.engine.clone(), self.path.clone())
+        Store::locked(self.lock.lock(), self.backend.clone(), self.path.clone())
     }
 
     /// Where a background thread reaches this database's tables without
@@ -337,14 +351,14 @@ impl Database {
     pub fn secondary_source(&self) -> Option<SecondarySource> {
         Some(SecondarySource::new(
             self.path.clone()?,
-            self.engine.clone(),
+            self.backend.clone(),
         ))
     }
 
-    /// The shared engine tables, for a test that builds its own
+    /// The shared backend, for a test that builds its own
     /// [`SecondarySource`].
     #[cfg(test)]
-    pub(crate) fn engine_handle(&self) -> EngineHandle {
-        self.engine.clone()
+    pub(crate) fn backend_handle(&self) -> BackendHandle {
+        self.backend.clone()
     }
 }

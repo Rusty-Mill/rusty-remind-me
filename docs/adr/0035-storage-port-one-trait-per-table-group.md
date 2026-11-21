@@ -1,6 +1,6 @@
 # ADR-0035: The storage port is one trait per table group
 
-Status: Accepted (2026-11-16, confirmed by Nano); every table group has a port (saved searches, reminders, history, feedback, stats, snapshots, the memories core, archives, entities, curation, promotions, sync state, outbox, imports, references, related, sessions, vectors, wiki); step 6 not started
+Status: Accepted (2026-11-16, confirmed by Nano); every table group has a port (saved searches, reminders, history, feedback, stats, snapshots, the memories core, archives, entities, curation, promotions, sync state, outbox, imports, references, related, sessions, vectors, wiki); step 6 done (2026-11-21): the store holds a `db::backend::Backend`
 Date: 2026-11-16
 
 Continues ADR-0022, whose "extract traits only when a second backend is
@@ -73,25 +73,53 @@ gates on `baseline.json`, and runs in every CI test job. It opens its store
 with `Database::open_in_memory`, so after step 6 it runs unchanged on any
 backend. R3 measures on real data; this set stays the regression gate.
 
-## What remains before a second backend runs the suites
+## Step 6, as built (2026-11-21)
 
-Every group has a port and a conformance suite (2026-11-21). A second
-backend can already implement one port and run that port's suite on its
-own. Running the whole test suite on it still needs step 6:
+- **`db::backend::Backend`** is the supertrait of all nineteen ports, plus
+  `Send + Any` and six whole-store operations: `begin_transaction`,
+  `commit_transaction`, `rollback_transaction`, `rebuild_indexes`,
+  `compact` and `backup_to`. The engine implements it (`EngineTables`;
+  a transaction is one page).
+- **The store holds a backend.** `BackendLock` (the old `EngineLock`, with
+  its transaction gate) holds a `Box<dyn Backend>`; its guard derefs to
+  `dyn Backend`, so each repository calls its port on it unchanged.
+  `Store::engine()` and `Store::core()` became one `Store::backend()`.
+- **The transaction is the backend's.** `Store::transaction` opens a
+  `backend::Transaction`, which calls the three transaction methods and
+  rolls back when dropped uncommitted. The engine's page stays the
+  engine's.
+- **Transactions do not nest, and an unsettled transaction fails the
+  store closed.** A begin on a thread that already holds a transaction is
+  refused before it reaches the backend and leaves the outer transaction's
+  gate alone (before step 6 the engine's gate let a nested begin release
+  the outer ownership). `Backend::commit_transaction` names the four
+  states a failed commit may leave, and `Backend::transaction_state`
+  reports `Closed`, `Open` or `NeedsRecovery`. After a commit or a
+  rollback the wrapper rolls back anything still open and opens the gate
+  only on `Closed`; anything else fails the `BackendLock` closed, so
+  `lock()` (now fallible) refuses every read and write on every thread
+  until the database is reopened. On the engine a redo-journal error is
+  indeterminate (the journal can fail after a whole frame, when its sync
+  fails), so the page and the undo log are left in place for reopening
+  to settle; only a batch that never reached the journal is put back at
+  once.
+- **`Database::open_backend(Box<dyn Backend>, path)`** opens a database on
+  any backend and runs the same start-up work as `Database::open`. This is
+  what R3 calls to run the suite on SQLite or Attest.
+- **The four reaches.** `derived::rebuild_indexes`, `backup` and
+  `Database::compact_store` go through the backend. The vitality rule is
+  `KeywordFilter::vital_enough`, pure logic beside the filter. Only
+  `crate::testing` (and engine-only tests) still reach engine rows: they
+  find the engine through `Any` (`engine::testing::tables`) and refuse
+  with `StoreError::Invalid` on any other backend. Opening and upgrading
+  an old `memory.db` stays engine-only.
 
-- **The store holds a backend.** Each repository takes `&EngineLock` from
-  `Store::engine()` or `Store::core()`. Both become one handle to a
-  backend that implements every port.
-- **The transaction becomes the backend's.** `Store::transaction` opens
-  the engine's page (`db::engine::page`), so a second backend needs its
-  own way to make several writes land whole.
-- **Four reaches still go past the ports.** `derived::rebuild_indexes`
-  calls `engine::memories::rebuild`, `backup` calls
-  `EngineTables::copy_files_to`, `queries` reads the vitality rule
-  `engine::memories::vital_enough` (pure logic, which belongs outside the
-  engine), and `crate::testing` reads and plants raw engine rows for
-  tests. Opening and upgrading an old `memory.db` (`db::engine::copy`,
-  `legacy_upgrade`) is engine-only by nature and stays.
+**What a second backend still needs before the whole suite runs on it:**
+an adapter for every port, and a choice for the tests that plant raw rows
+through `crate::testing` (they will refuse, so R3 either gives those
+helpers a port or reports those tests as engine-only). The integration
+tests open `Database::open_in_memory`, which is the engine; R3's harness
+picks the backend.
 
 ## Not decided here
 
@@ -105,5 +133,5 @@ own. Running the whole test suite on it still needs step 6:
 - No schema, data or API change. The MCP, API and CLI crates are untouched.
 - A group's port can be implemented on another store before the rest are,
   and checked against the conformance suite in isolation.
-- Until step 6, `Store` still hands repositories the engine lock, so only
-  the engine can back a running `Database`.
+- Since step 6, any `Backend` can back a running `Database`
+  (`Database::open_backend`); production still opens the engine.

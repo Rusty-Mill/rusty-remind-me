@@ -10,7 +10,7 @@
 //! count as raw imports, the entity fan-out ceiling, and the keyset
 //! cursor's meaning.
 
-use super::engine::EngineLock;
+use super::backend::BackendLock;
 use super::{Result, Store};
 use crate::models::{ContradictionSide, Memory};
 
@@ -138,22 +138,24 @@ pub trait CurationStore {
 
 /// The curation reads, on the engine's memories core.
 pub struct Curation<'c> {
-    core: &'c EngineLock,
+    backend: &'c BackendLock,
 }
 
 impl<'c> Curation<'c> {
     pub fn new(store: &'c Store<'_>) -> Self {
-        Self { core: store.core() }
+        Self {
+            backend: store.backend(),
+        }
     }
 
     /// See [`CurationStore::capture_rows`].
     pub fn capture_rows(&self, capture_id: &str) -> Result<Vec<Memory>> {
-        CurationStore::capture_rows(&*self.core.lock(), capture_id)
+        CurationStore::capture_rows(&*self.backend.lock()?, capture_id)
     }
 
     /// See [`CurationStore::capture_tags`].
     pub fn capture_tags(&self, capture_id: &str) -> Result<Option<Vec<String>>> {
-        CurationStore::capture_tags(&*self.core.lock(), capture_id)
+        CurationStore::capture_tags(&*self.backend.lock()?, capture_id)
     }
 
     /// See [`CurationStore::undecomposed`].
@@ -162,42 +164,42 @@ impl<'c> Curation<'c> {
         limit: usize,
         settled_before: Option<&str>,
     ) -> Result<Vec<CaptureRow>> {
-        CurationStore::undecomposed(&*self.core.lock(), limit, settled_before)
+        CurationStore::undecomposed(&*self.backend.lock()?, limit, settled_before)
     }
 
     /// See [`CurationStore::count_undecomposed`].
     pub fn count_undecomposed(&self, settled_before: Option<&str>) -> Result<i64> {
-        CurationStore::count_undecomposed(&*self.core.lock(), settled_before)
+        CurationStore::count_undecomposed(&*self.backend.lock()?, settled_before)
     }
 
     /// See [`CurationStore::capture_activity`].
     pub fn capture_activity(&self) -> Result<CaptureActivity> {
-        CurationStore::capture_activity(&*self.core.lock())
+        CurationStore::capture_activity(&*self.backend.lock()?)
     }
 
     /// See [`CurationStore::unnormalized`].
     pub fn unnormalized(&self, sources: &[&str], limit: usize) -> Result<Vec<ImportRow>> {
-        CurationStore::unnormalized(&*self.core.lock(), sources, limit)
+        CurationStore::unnormalized(&*self.backend.lock()?, sources, limit)
     }
 
     /// See [`CurationStore::count_unnormalized`].
     pub fn count_unnormalized(&self, sources: &[&str]) -> Result<i64> {
-        CurationStore::count_unnormalized(&*self.core.lock(), sources)
+        CurationStore::count_unnormalized(&*self.backend.lock()?, sources)
     }
 
     /// See [`CurationStore::normalization_source`].
     pub fn normalization_source(&self, memory_id: &str) -> Result<Option<NormalizationSource>> {
-        CurationStore::normalization_source(&*self.core.lock(), memory_id)
+        CurationStore::normalization_source(&*self.backend.lock()?, memory_id)
     }
 
     /// See [`CurationStore::backlog_depth`].
     pub fn backlog_depth(&self, backlog: Backlog) -> Result<i64> {
-        CurationStore::backlog_depth(&*self.core.lock(), backlog)
+        CurationStore::backlog_depth(&*self.backend.lock()?, backlog)
     }
 
     /// See [`CurationStore::count_contradiction_pairs`].
     pub fn count_contradiction_pairs(&self, max_fanout: i64) -> Result<i64> {
-        CurationStore::count_contradiction_pairs(&*self.core.lock(), max_fanout)
+        CurationStore::count_contradiction_pairs(&*self.backend.lock()?, max_fanout)
     }
 
     /// See [`CurationStore::contradiction_pairs`].
@@ -207,7 +209,7 @@ impl<'c> Curation<'c> {
         cursor: Option<(&str, &str)>,
         limit: usize,
     ) -> Result<Vec<(String, String)>> {
-        CurationStore::contradiction_pairs(&*self.core.lock(), max_fanout, cursor, limit)
+        CurationStore::contradiction_pairs(&*self.backend.lock()?, max_fanout, cursor, limit)
     }
 
     /// See [`CurationStore::decision_neighbours`].
@@ -216,12 +218,12 @@ impl<'c> Curation<'c> {
         memory_id: &str,
         max_fanout: i64,
     ) -> Result<Vec<(String, Vec<String>)>> {
-        CurationStore::decision_neighbours(&*self.core.lock(), memory_id, max_fanout)
+        CurationStore::decision_neighbours(&*self.backend.lock()?, memory_id, max_fanout)
     }
 
     /// See [`CurationStore::shared_entity_names`].
     pub fn shared_entity_names(&self, id_a: &str, id_b: &str) -> Result<Vec<String>> {
-        CurationStore::shared_entity_names(&*self.core.lock(), id_a, id_b)
+        CurationStore::shared_entity_names(&*self.backend.lock()?, id_a, id_b)
     }
 
     /// See [`CurationStore::contradiction_side`].
@@ -230,7 +232,7 @@ impl<'c> Curation<'c> {
         memory_id: &str,
         snippet_chars: usize,
     ) -> Result<ContradictionSide> {
-        CurationStore::contradiction_side(&*self.core.lock(), memory_id, snippet_chars)
+        CurationStore::contradiction_side(&*self.backend.lock()?, memory_id, snippet_chars)
     }
 }
 
@@ -254,7 +256,7 @@ pub(crate) mod conformance {
 
     /// Captures, imports, facts with triples, scenarios and personas, linked
     /// to three entities, with `f2` superseded by `f1`.
-    pub(crate) fn seed_corpus<S: MemoryStore + EntityStore>(store: &mut S) {
+    pub(crate) fn seed_corpus<S: MemoryStore + EntityStore + ?Sized>(store: &mut S) {
         let text = |s: &str| Some(s.to_string());
         let rows: Vec<NewMemory> = vec![
             NewMemory {
@@ -611,7 +613,7 @@ mod tests {
     fn the_facade_reads_through_the_port() {
         let db = Database::open_in_memory().unwrap();
         let store = db.store();
-        conformance::seed_corpus(&mut *store.core().lock());
+        conformance::seed_corpus(&mut *store.backend().lock().unwrap());
         let curation = Curation::new(&store);
         assert_eq!(curation.count_undecomposed(None).unwrap(), 2);
         assert_eq!(curation.backlog_depth(Backlog::Unnormalized).unwrap(), 1);

@@ -24,7 +24,7 @@
 //! it did not ask for.
 
 use super::core::{apply, decode, encode, Change, CoreTables};
-use super::{engine_error, EngineLock, EngineTables};
+use super::{engine_error, EngineTables};
 use crate::db::{Result, StoreError};
 use rusty_multimodal_db_engine::generic::query::GetById;
 use rusty_multimodal_db_engine::journal::Batch;
@@ -131,11 +131,17 @@ impl EngineTables {
 
     /// Finish the open page: its writes become one redo batch.
     ///
+    /// On failure the page is always closed, in one of the states
+    /// `Backend::commit_transaction` allows: rolled back (a failed write,
+    /// or a batch that never reached the journal), or needing recovery
+    /// (`failed`): a journal error, whose outcome is indeterminate, or a
+    /// checkpoint failure after the commit point. Reopening settles both
+    /// from the undo log and the redo journal.
+    ///
     /// # Errors
     ///
-    /// [`StoreError::Engine`] if no page is open or a journal fails. A
-    /// failure leaves the tables refusing writes until they are reopened,
-    /// which settles the page one way or the other.
+    /// [`StoreError::Engine`] if no page is open, a write in it failed, or
+    /// a journal fails.
     pub(crate) fn finish_page(&mut self) -> Result<()> {
         let Some(page) = self.page.take() else {
             return Err(StoreError::Engine("no page is open".to_string()));
@@ -147,19 +153,44 @@ impl EngineTables {
                 "a write in the page failed; the page was rolled back".to_string(),
             ));
         }
-        let settled = self.settle(&page);
-        if settled.is_err() {
+        let batch = match encode(&page.changes) {
+            Ok(batch) => batch,
+            Err(e) => {
+                // Nothing reached the journal: definitely not durable, so
+                // put the page back as reopening would.
+                if self.put_back(page.before).is_err() {
+                    self.failed = true;
+                }
+                return Err(e);
+            }
+        };
+        if let Err(e) = self.commit_redo(&page, &batch) {
+            // Indeterminate: the journal can fail after writing a whole
+            // frame (its sync failed), so the batch may or may not replay.
+            // Leave the stores and the undo log as they are and refuse
+            // further use; reopening undoes the page from the undo log,
+            // then replays the redo frame if it is whole.
+            self.failed = true;
+            return Err(e);
+        }
+        let checkpointed = self.checkpoint_after_commit();
+        if checkpointed.is_err() {
             self.failed = true;
         }
-        settled
+        checkpointed
     }
 
-    fn settle(&mut self, page: &OpenPage) -> Result<()> {
-        if !page.changes.is_empty() {
-            self.journal
-                .commit(&encode(&page.changes)?)
-                .map_err(engine_error)?;
+    /// The commit point: the page's writes, encoded as `batch`, as one redo
+    /// entry.
+    fn commit_redo(&mut self, page: &OpenPage, batch: &Batch) -> Result<()> {
+        if page.changes.is_empty() {
+            return Ok(());
         }
+        self.journal.commit(batch).map_err(engine_error)
+    }
+
+    /// Housekeeping once the redo batch is durable.
+    fn checkpoint_after_commit(&mut self) -> Result<()> {
         self.undo.checkpoint().map_err(engine_error)?;
         self.journal.checkpoint().map_err(engine_error)
     }
@@ -203,46 +234,6 @@ impl EngineTables {
             }
         }
         self.undo.checkpoint().map_err(engine_error)
-    }
-}
-
-/// An open page on shared tables: finished by [`Page::finish`], abandoned
-/// when dropped unfinished (an error or a panic in the work it wraps).
-/// While it is open, every other thread waits at the tables' lock.
-pub(crate) struct Page<'t> {
-    tables: &'t EngineLock,
-    open: bool,
-}
-
-impl<'t> Page<'t> {
-    pub(crate) fn begin(tables: &'t EngineLock) -> Result<Self> {
-        tables.claim_page();
-        if let Err(e) = tables.lock().begin_page() {
-            tables.release_page();
-            return Err(e);
-        }
-        Ok(Self { tables, open: true })
-    }
-
-    pub(crate) fn finish(mut self) -> Result<()> {
-        self.open = false;
-        let finished = self.tables.lock().finish_page();
-        self.tables.release_page();
-        finished
-    }
-}
-
-impl Drop for Page<'_> {
-    fn drop(&mut self) {
-        if !self.open {
-            return;
-        }
-        if let Err(e) = self.tables.lock().abandon_page() {
-            // Nothing to return it to: the tables now refuse writes, and
-            // reopening them finishes the rollback from the undo log.
-            eprintln!("memories core: abandoning a page failed: {e}");
-        }
-        self.tables.release_page();
     }
 }
 
@@ -342,44 +333,5 @@ mod tests {
         assert_eq!(landed(&tables), (Some(vec![2]), true, 1));
         drop(tables);
         std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn another_thread_waits_for_the_page_and_then_sees_it_whole() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let tables = EngineLock::new(EngineTables::open_temporary().unwrap());
-        let page = Page::begin(&tables).unwrap();
-        VectorStore::put(&mut *tables.lock(), "a", 0, &[1]).unwrap();
-        let wrote = AtomicBool::new(false);
-        std::thread::scope(|scope| {
-            let other = scope.spawn(|| {
-                // Waits at the lock until the page is finished, then sees
-                // both of its writes.
-                let seen = VectorStore::count(&*tables.lock()).unwrap();
-                VectorStore::put(&mut *tables.lock(), "x", 0, &[1]).unwrap();
-                wrote.store(true, Ordering::SeqCst);
-                seen
-            });
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            assert!(!wrote.load(Ordering::SeqCst), "the other thread waited");
-            VectorStore::put(&mut *tables.lock(), "b", 0, &[1]).unwrap();
-            page.finish().unwrap();
-            assert_eq!(other.join().unwrap(), 2, "it saw the page whole");
-        });
-        assert_eq!(VectorStore::count(&*tables.lock()).unwrap(), 3);
-    }
-
-    #[test]
-    fn a_page_dropped_unfinished_is_abandoned() {
-        let tables = EngineLock::new(EngineTables::open_temporary().unwrap());
-        {
-            let _page = Page::begin(&tables).unwrap();
-            VectorStore::put(&mut *tables.lock(), "y", 0, &[1]).unwrap();
-        }
-        assert_eq!(VectorStore::count(&*tables.lock()).unwrap(), 0);
-        assert!(
-            tables.lock().begin_page().is_ok(),
-            "the page is closed and the tables take a new one"
-        );
     }
 }

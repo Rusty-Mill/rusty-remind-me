@@ -9,7 +9,7 @@
 //! threshold in [`crate::vitality`], and what makes a memory due for review
 //! in [`crate::recalibrate`], which passes its thresholds in.
 
-use super::engine::EngineLock;
+use super::backend::BackendLock;
 use super::{Result, Store};
 use crate::models::RecalibrateCandidate;
 
@@ -98,17 +98,19 @@ pub trait FeedbackStore {
 
 /// The feedback tables of a [`Store`], one locked call at a time.
 pub struct Feedback<'c> {
-    core: &'c EngineLock,
+    backend: &'c BackendLock,
 }
 
 impl<'c> Feedback<'c> {
     pub fn new(store: &'c Store<'_>) -> Self {
-        Self { core: store.core() }
+        Self {
+            backend: store.backend(),
+        }
     }
 
     /// See [`FeedbackStore::importance`].
     pub fn importance(&self, memory_id: &str) -> Result<Option<Importance>> {
-        FeedbackStore::importance(&*self.core.lock(), memory_id)
+        FeedbackStore::importance(&*self.backend.lock()?, memory_id)
     }
 
     /// See [`FeedbackStore::set_importance`].
@@ -120,7 +122,7 @@ impl<'c> Feedback<'c> {
         status: &str,
     ) -> Result<()> {
         FeedbackStore::set_importance(
-            &mut *self.core.lock(),
+            &mut *self.backend.lock()?,
             memory_id,
             base_weight,
             vitality,
@@ -138,7 +140,7 @@ impl<'c> Feedback<'c> {
         created_at: &str,
     ) -> Result<()> {
         FeedbackStore::log_event(
-            &mut *self.core.lock(),
+            &mut *self.backend.lock()?,
             id,
             memory_id,
             query,
@@ -149,17 +151,17 @@ impl<'c> Feedback<'c> {
 
     /// See [`FeedbackStore::events`].
     pub fn events(&self, memory_id: &str) -> Result<Vec<FeedbackEvent>> {
-        FeedbackStore::events(&*self.core.lock(), memory_id)
+        FeedbackStore::events(&*self.backend.lock()?, memory_id)
     }
 
     /// See [`FeedbackStore::delete_for`]: part of deleting a memory.
     pub fn delete_for(&self, memory_id: &str) -> Result<()> {
-        FeedbackStore::delete_for(&mut *self.core.lock(), memory_id)
+        FeedbackStore::delete_for(&mut *self.backend.lock()?, memory_id)
     }
 
     /// See [`FeedbackStore::review_count`].
     pub fn review_count(&self, filter: &ReviewFilter<'_>) -> Result<i64> {
-        FeedbackStore::review_count(&*self.core.lock(), filter)
+        FeedbackStore::review_count(&*self.backend.lock()?, filter)
     }
 
     /// See [`FeedbackStore::review_batch`]. A negative `limit` returns
@@ -171,7 +173,7 @@ impl<'c> Feedback<'c> {
         limit: i64,
     ) -> Result<Vec<RecalibrateCandidate>> {
         let limit = usize::try_from(limit).unwrap_or(0);
-        FeedbackStore::review_batch(&*self.core.lock(), filter, snippet_chars, limit)
+        FeedbackStore::review_batch(&*self.backend.lock()?, filter, snippet_chars, limit)
     }
 }
 

@@ -15,7 +15,7 @@
 //! imported, when a changed dbs item supersedes its memory, and that a chat
 //! import loses its tracking row only once nothing of it is left.
 
-use super::engine::EngineLock;
+use super::backend::BackendLock;
 use super::{Result, Store};
 use std::collections::HashMap;
 
@@ -116,12 +116,14 @@ pub trait ImportStore {
 
 /// The import bookkeeping tables, on the engine's memories core.
 pub struct ImportLedger<'c> {
-    core: &'c EngineLock,
+    backend: &'c BackendLock,
 }
 
 impl<'c> ImportLedger<'c> {
     pub fn new(store: &'c Store<'_>) -> Self {
-        Self { core: store.core() }
+        Self {
+            backend: store.backend(),
+        }
     }
 
     /// See [`ImportStore::record_chat`].
@@ -134,7 +136,7 @@ impl<'c> ImportLedger<'c> {
         stats_json: &str,
     ) -> Result<()> {
         ImportStore::record_chat(
-            &mut *self.core.lock(),
+            &mut *self.backend.lock()?,
             import_id,
             filename,
             hash,
@@ -145,22 +147,22 @@ impl<'c> ImportLedger<'c> {
 
     /// See [`ImportStore::chat_import_with_hash`].
     pub fn chat_import_with_hash(&self, hash: &str) -> Result<Option<String>> {
-        ImportStore::chat_import_with_hash(&*self.core.lock(), hash)
+        ImportStore::chat_import_with_hash(&*self.backend.lock()?, hash)
     }
 
     /// See [`ImportStore::live_chat_memories`].
     pub fn live_chat_memories(&self, import_id: Option<&str>) -> Result<Vec<String>> {
-        ImportStore::live_chat_memories(&*self.core.lock(), import_id)
+        ImportStore::live_chat_memories(&*self.backend.lock()?, import_id)
     }
 
     /// See [`ImportStore::chat_imports_with_nothing_left`].
     pub fn chat_imports_with_nothing_left(&self, import_ids: &[String]) -> Result<Vec<String>> {
-        ImportStore::chat_imports_with_nothing_left(&*self.core.lock(), import_ids)
+        ImportStore::chat_imports_with_nothing_left(&*self.backend.lock()?, import_ids)
     }
 
     /// See [`ImportStore::forget_chat_imports_with_nothing_left`].
     pub fn forget_chat_imports_with_nothing_left(&self, import_ids: &[String]) -> Result<usize> {
-        ImportStore::forget_chat_imports_with_nothing_left(&mut *self.core.lock(), import_ids)
+        ImportStore::forget_chat_imports_with_nothing_left(&mut *self.backend.lock()?, import_ids)
     }
 
     /// See [`ImportStore::dbs_tracked`].
@@ -169,7 +171,7 @@ impl<'c> ImportLedger<'c> {
         source: &str,
         external_ids: &[&str],
     ) -> Result<HashMap<DbsKey, DbsTracked>> {
-        ImportStore::dbs_tracked(&*self.core.lock(), source, external_ids)
+        ImportStore::dbs_tracked(&*self.backend.lock()?, source, external_ids)
     }
 
     /// See [`ImportStore::record_dbs`].
@@ -182,7 +184,7 @@ impl<'c> ImportLedger<'c> {
         imported_at: &str,
     ) -> Result<()> {
         ImportStore::record_dbs(
-            &mut *self.core.lock(),
+            &mut *self.backend.lock()?,
             source,
             external_id,
             memory_id,
@@ -193,12 +195,12 @@ impl<'c> ImportLedger<'c> {
 
     /// See [`ImportStore::live_dbs_memories`].
     pub fn live_dbs_memories(&self, source_prefix: Option<&str>) -> Result<Vec<String>> {
-        ImportStore::live_dbs_memories(&*self.core.lock(), source_prefix)
+        ImportStore::live_dbs_memories(&*self.backend.lock()?, source_prefix)
     }
 
     /// See [`ImportStore::imported_drawers`].
     pub fn imported_drawers(&self, drawer_ids: &[&str]) -> Result<Vec<String>> {
-        ImportStore::imported_drawers(&*self.core.lock(), drawer_ids)
+        ImportStore::imported_drawers(&*self.backend.lock()?, drawer_ids)
     }
 
     /// See [`ImportStore::record_mempalace`].
@@ -208,7 +210,12 @@ impl<'c> ImportLedger<'c> {
         memory_id: &str,
         imported_at: &str,
     ) -> Result<()> {
-        ImportStore::record_mempalace(&mut *self.core.lock(), drawer_id, memory_id, imported_at)
+        ImportStore::record_mempalace(
+            &mut *self.backend.lock()?,
+            drawer_id,
+            memory_id,
+            imported_at,
+        )
     }
 
     /// See [`ImportStore::live_tracked_mempalace_memories`].
@@ -216,7 +223,7 @@ impl<'c> ImportLedger<'c> {
         &self,
         drawer_prefix: Option<&str>,
     ) -> Result<Vec<String>> {
-        ImportStore::live_tracked_mempalace_memories(&*self.core.lock(), drawer_prefix)
+        ImportStore::live_tracked_mempalace_memories(&*self.backend.lock()?, drawer_prefix)
     }
 
     /// See [`ImportStore::live_mempalace_shaped_memories`].
@@ -224,22 +231,22 @@ impl<'c> ImportLedger<'c> {
         &self,
         drawer_prefix: Option<&str>,
     ) -> Result<Vec<String>> {
-        ImportStore::live_mempalace_shaped_memories(&*self.core.lock(), drawer_prefix)
+        ImportStore::live_mempalace_shaped_memories(&*self.backend.lock()?, drawer_prefix)
     }
 
     /// See [`ImportStore::doc_ids_of`].
     pub fn doc_ids_of(&self, memory_ids: &[String]) -> Result<Vec<String>> {
-        ImportStore::doc_ids_of(&*self.core.lock(), memory_ids)
+        ImportStore::doc_ids_of(&*self.backend.lock()?, memory_ids)
     }
 
     /// See [`ImportStore::forget_dbs`].
     pub fn forget_dbs(&self, memory_ids: &[String]) -> Result<usize> {
-        ImportStore::forget_dbs(&mut *self.core.lock(), memory_ids)
+        ImportStore::forget_dbs(&mut *self.backend.lock()?, memory_ids)
     }
 
     /// See [`ImportStore::forget_mempalace`].
     pub fn forget_mempalace(&self, memory_ids: &[String]) -> Result<usize> {
-        ImportStore::forget_mempalace(&mut *self.core.lock(), memory_ids)
+        ImportStore::forget_mempalace(&mut *self.backend.lock()?, memory_ids)
     }
 }
 

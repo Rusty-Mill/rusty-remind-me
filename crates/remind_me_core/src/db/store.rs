@@ -2,27 +2,28 @@
 //! returns (ADR-0023, phase 4; ADR-0025).
 //!
 //! Callers used to take a SQLite connection, which tied every one of
-//! them to SQLite. They take a [`Store`] instead. Until phase 6 the store
-//! was an enum over two backends; the engine is the only one now, so a
-//! store is the engine tables plus the file they stand beside.
+//! them to SQLite. They take a [`Store`] instead: a handle on a
+//! [`Backend`](super::backend::Backend), the supertrait of every table
+//! group's port (ADR-0035, step 6), plus the file it stands beside. The
+//! engine is the only backend in production.
 //!
 //! A [`Store`] made by [`crate::db::Database::store`] holds the database's
 //! lock for as long as it lives, as the connection guard it replaced did:
 //! one tool call runs at a time. A background thread's store
-//! ([`SecondarySource::store`]) holds no such lock; the engine tables lock
+//! ([`SecondarySource::store`]) holds no such lock; the backend locks
 //! per call, which is what keeps a long sync cycle from stalling every
 //! other caller.
 
-use super::engine::{page::Page, EngineHandle, EngineLock};
+use super::backend::{BackendHandle, BackendLock, Transaction};
 use parking_lot::MutexGuard;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 /// A handle on the node's store.
 pub struct Store<'a> {
-    engine: EngineHandle,
-    /// The database file the engine directory stands beside; `None` for an
-    /// in-memory store.
+    backend: BackendHandle,
+    /// The database file the store stands beside; `None` for an in-memory
+    /// store.
     path: Option<PathBuf>,
     /// The process-wide lock, when this store came from the database.
     _lock: Option<MutexGuard<'a, ()>>,
@@ -31,35 +32,35 @@ pub struct Store<'a> {
 impl<'a> Store<'a> {
     pub(crate) fn locked(
         guard: MutexGuard<'a, ()>,
-        engine: EngineHandle,
+        backend: BackendHandle,
         path: Option<PathBuf>,
     ) -> Self {
         Self {
-            engine,
+            backend,
             path,
             _lock: Some(guard),
         }
     }
 
-    /// A store over shared engine tables, holding no process lock.
-    pub(crate) fn unlocked(engine: EngineHandle, path: Option<PathBuf>) -> Store<'static> {
+    /// A store over a shared backend, holding no process lock.
+    pub(crate) fn unlocked(backend: BackendHandle, path: Option<PathBuf>) -> Store<'static> {
         Store {
-            engine,
+            backend,
             path,
             _lock: None,
         }
     }
 
     /// Run `work` as one transaction: every write it makes lands, or none
-    /// does. The writes are one page on the engine (`db::engine::page`),
-    /// readable as they go and finished when `work` returns.
+    /// does. The writes are readable as they go and land when `work`
+    /// returns (on the engine, as one page: `db::engine::page`).
     ///
-    /// An error from `work`, or a panic, abandons the page.
+    /// An error from `work`, or a panic, rolls the transaction back.
     ///
     /// # Errors
     ///
-    /// Whatever `work` returns, or [`StoreError`] if the page cannot be
-    /// opened or finished.
+    /// Whatever `work` returns, or [`StoreError`] if the transaction cannot
+    /// be opened or committed.
     pub fn transaction<T, E>(
         &self,
         work: impl FnOnce(&Store<'_>) -> std::result::Result<T, E>,
@@ -67,9 +68,9 @@ impl<'a> Store<'a> {
     where
         E: From<StoreError>,
     {
-        let page = Page::begin(&self.engine)?;
+        let tx = Transaction::begin(&self.backend)?;
         let done = work(self)?;
-        page.finish()?;
+        tx.commit()?;
         Ok(done)
     }
 
@@ -78,7 +79,7 @@ impl<'a> Store<'a> {
     pub fn secondary_source(&self) -> Option<SecondarySource> {
         Some(SecondarySource::new(
             self.path.clone()?,
-            self.engine.clone(),
+            self.backend.clone(),
         ))
     }
 
@@ -87,34 +88,26 @@ impl<'a> Store<'a> {
         self.path.as_deref()
     }
 
-    /// The engine tables.
-    pub(crate) fn engine(&self) -> &EngineLock {
-        &self.engine
-    }
-
-    /// The engine tables, for the memories core's repositories. The same
-    /// tables as [`Store::engine`]; the name says which group a caller is
-    /// after.
-    pub(crate) fn core(&self) -> &EngineLock {
-        &self.engine
+    /// The backend every repository goes through.
+    pub(crate) fn backend(&self) -> &BackendLock {
+        &self.backend
     }
 }
 
 /// Where a background thread reopens the store: the database file, and
-/// the engine tables it shares with the store it came from (ADR-0023,
-/// phase 4d).
+/// the backend it shares with the store it came from (ADR-0023, phase 4d).
 ///
-/// The engine tables lock per call, so a thread that holds no process
+/// The backend locks per call, so a thread that holds no process
 /// lock never holds the store across slow work such as network I/O.
 #[derive(Clone)]
 pub struct SecondarySource {
     path: PathBuf,
-    engine: EngineHandle,
+    backend: BackendHandle,
 }
 
 impl SecondarySource {
-    pub(crate) fn new(path: PathBuf, engine: EngineHandle) -> Self {
-        Self { path, engine }
+    pub(crate) fn new(path: PathBuf, backend: BackendHandle) -> Self {
+        Self { path, backend }
     }
 
     /// The database file the store stands beside.
@@ -122,9 +115,9 @@ impl SecondarySource {
         &self.path
     }
 
-    /// A store over the shared engine tables, holding no process lock.
+    /// A store over the shared backend, holding no process lock.
     pub fn store(&self) -> Store<'static> {
-        Store::unlocked(self.engine.clone(), Some(self.path.clone()))
+        Store::unlocked(self.backend.clone(), Some(self.path.clone()))
     }
 }
 
@@ -266,12 +259,12 @@ mod tests {
         }
     }
 
-    /// A background thread's store shares the database's engine tables:
+    /// A background thread's store shares the database's backend:
     /// what it writes, the main store reads, and the other way round.
     #[test]
-    fn a_secondary_store_shares_the_engine_tables() {
+    fn a_secondary_store_shares_the_backend() {
         let db = Database::open_in_memory().unwrap();
-        let source = SecondarySource::new(PathBuf::from("unused.db"), db.engine_handle());
+        let source = SecondarySource::new(PathBuf::from("unused.db"), db.backend_handle());
 
         SavedSearches::new(&source.store())
             .insert(&saved("from-thread"))

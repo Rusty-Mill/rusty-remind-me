@@ -14,7 +14,7 @@
 //! [`ReferenceStore`] is the port (ADR-0035); the engine's adapter is in
 //! `db::engine::references`. [`References`] is what callers take.
 
-use super::engine::EngineLock;
+use super::backend::BackendLock;
 use super::{Result, Store};
 use serde::{Deserialize, Serialize};
 
@@ -90,42 +90,44 @@ pub trait ReferenceStore {
 
 /// The `memory_references` table of a [`Store`], one locked call at a time.
 pub struct References<'c> {
-    core: &'c EngineLock,
+    backend: &'c BackendLock,
 }
 
 impl<'c> References<'c> {
     pub fn new(store: &'c Store<'_>) -> Self {
-        Self { core: store.core() }
+        Self {
+            backend: store.backend(),
+        }
     }
 
     /// See [`ReferenceStore::insert`].
     pub fn insert(&self, row: &NewReference) -> Result<()> {
-        ReferenceStore::insert(&mut *self.core.lock(), row)
+        ReferenceStore::insert(&mut *self.backend.lock()?, row)
     }
 
     /// See [`ReferenceStore::for_memory`].
     pub fn for_memory(&self, memory_id: &str) -> Result<Vec<MemoryReference>> {
-        ReferenceStore::for_memory(&*self.core.lock(), memory_id)
+        ReferenceStore::for_memory(&*self.backend.lock()?, memory_id)
     }
 
     /// See [`ReferenceStore::for_memories`].
     pub fn for_memories(&self, memory_ids: &[String]) -> Result<Vec<MemoryReference>> {
-        ReferenceStore::for_memories(&*self.core.lock(), memory_ids)
+        ReferenceStore::for_memories(&*self.backend.lock()?, memory_ids)
     }
 
     /// See [`ReferenceStore::of_kind`].
     pub fn of_kind(&self, kind: &str) -> Result<Vec<MemoryReference>> {
-        ReferenceStore::of_kind(&*self.core.lock(), kind)
+        ReferenceStore::of_kind(&*self.backend.lock()?, kind)
     }
 
     /// See [`ReferenceStore::find`].
     pub fn find(&self, kind: &str, value: &str) -> Result<Vec<MemoryReference>> {
-        ReferenceStore::find(&*self.core.lock(), kind, value)
+        ReferenceStore::find(&*self.backend.lock()?, kind, value)
     }
 
     /// See [`ReferenceStore::delete_for_memory`].
     pub fn delete_for_memory(&self, memory_id: &str) -> Result<usize> {
-        ReferenceStore::delete_for_memory(&mut *self.core.lock(), memory_id)
+        ReferenceStore::delete_for_memory(&mut *self.backend.lock()?, memory_id)
     }
 }
 
