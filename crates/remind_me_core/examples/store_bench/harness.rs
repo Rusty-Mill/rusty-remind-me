@@ -23,8 +23,6 @@
 //! nothing leaves the machine.
 
 use remind_me_core::db::backend::Backend;
-use remind_me_core::db::engine::EngineTables;
-use remind_me_core::db::sqlite::SqliteTables;
 use remind_me_core::db::{queries, Store};
 use remind_me_core::embedder::{EmbedError, EmbedRole, Embedder, EmbeddingIdentity};
 use remind_me_core::models::{
@@ -36,7 +34,8 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-type Result<T> = std::result::Result<T, Box<dyn Error>>;
+/// Any error, boxed.
+pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 const VOCABULARY: usize = 6_000;
 const SAMPLES: usize = 500;
@@ -44,44 +43,44 @@ const DIM: usize = 1024;
 const ENTITIES: usize = 500;
 const READERS: usize = 4;
 
+/// Opens a backend's files in a directory.
+pub type Opener = fn(&Path) -> Result<Box<dyn Backend>>;
+
 /// A store backend under test.
 #[derive(Clone, Copy)]
-enum Candidate {
-    Engine,
-    Sqlite,
+pub struct Candidate {
+    /// The name `run` takes on the command line.
+    pub name: &'static str,
+    /// Opens the candidate's store in a directory.
+    pub tables: Opener,
+    /// Opens a backup the candidate wrote, as a fresh store.
+    pub restore: Opener,
 }
 
 impl Candidate {
-    fn parse(name: &str) -> Result<Self> {
-        match name {
-            "engine" => Ok(Self::Engine),
-            "sqlite" => Ok(Self::Sqlite),
-            other => Err(format!("unknown backend {other:?}").into()),
-        }
-    }
-
-    /// The backend's files in `dir`, opened.
-    fn tables(self, dir: &Path) -> Result<Box<dyn Backend>> {
-        Ok(match self {
-            Self::Engine => Box::new(EngineTables::open(dir)?),
-            Self::Sqlite => Box::new(SqliteTables::open(dir)?),
-        })
-    }
-
     /// The database whose store lives in `dir/store`, standing beside
     /// `dir/memory.db` (where backups go, under `dir/backups`).
     fn open(self, dir: &Path) -> Result<Database> {
-        let tables = self.tables(&dir.join("store"))?;
+        let tables = (self.tables)(&dir.join("store"))?;
         Ok(Database::open_backend(tables, Some(dir.join("memory.db")))?)
     }
 }
 
-fn main() -> Result<()> {
+/// Run the benchmark the command line asks for, on one of `candidates`:
+/// `<bench|open> <backend> <n> <dir>`. Prints one JSON line.
+pub fn run(candidates: &[Candidate]) -> Result<()> {
+    let names: Vec<&str> = candidates.iter().map(|c| c.name).collect();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let [mode, backend, n, dir] = args.as_slice() else {
-        return Err("usage: store_bench <bench|open> <engine|sqlite> <n> <dir>".into());
+        return Err(format!(
+            "usage: store_bench <bench|open> <{}> <n> <dir>",
+            names.join("|")
+        )
+        .into());
     };
-    let candidate = Candidate::parse(backend)?;
+    let Some(&candidate) = candidates.iter().find(|c| c.name == backend) else {
+        return Err(format!("unknown backend {backend:?}; one of {names:?}").into());
+    };
     let n: usize = n.parse()?;
     let dir = PathBuf::from(dir).join(format!("{mode}-{backend}-{n}"));
     if dir.exists() {
@@ -363,7 +362,7 @@ fn backup_and_restore(
     report.insert("backup_ms".into(), json!(millis(t.elapsed())));
 
     let t = Instant::now();
-    let restored = Database::open_backend(candidate.tables(Path::new(&backup.path))?, None)?;
+    let restored = Database::open_backend((candidate.restore)(Path::new(&backup.path))?, None)?;
     report.insert("restore_open_ms".into(), json!(millis(t.elapsed())));
     let copy = restored.store();
     let ids = testing::memory_ids(&store)?;
