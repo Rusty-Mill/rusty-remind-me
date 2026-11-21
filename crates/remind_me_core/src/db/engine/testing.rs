@@ -9,8 +9,9 @@ use crate::testing::{OutboxRow, Table, TestRows};
 use rusty_multimodal_db_engine::generic::query::{AllIds, GetById};
 use serde_json::Value;
 
-/// The engine behind `guard`: raw rows are the engine's own, so code that
-/// reads or plants them refuses, naming why, on any other backend.
+/// The engine behind `guard`, for engine-only tests: they refuse, naming
+/// why, on any other backend.
+#[cfg(test)]
 pub(crate) fn tables<'g>(guard: &'g mut BackendGuard<'_>) -> Result<&'g mut EngineTables> {
     let backend: &mut dyn std::any::Any = &mut **guard;
     backend.downcast_mut::<EngineTables>().ok_or_else(|| {
