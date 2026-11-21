@@ -133,10 +133,10 @@ impl EngineTables {
     ///
     /// On failure the page is always closed, in one of the states
     /// `Backend::commit_transaction` allows: rolled back (a failed write,
-    /// or a redo commit that did not land, whose writes are then put back
-    /// as reopening would), or committed with the tables refusing writes
-    /// until reopened (the redo batch landed and a checkpoint after it
-    /// failed; reopening replays it).
+    /// or a batch that never reached the journal), or needing recovery
+    /// (`failed`): a journal error, whose outcome is indeterminate, or a
+    /// checkpoint failure after the commit point. Reopening settles both
+    /// from the undo log and the redo journal.
     ///
     /// # Errors
     ///
@@ -153,12 +153,24 @@ impl EngineTables {
                 "a write in the page failed; the page was rolled back".to_string(),
             ));
         }
-        if let Err(e) = self.commit_redo(&page) {
-            // Not durable: reopening would undo it, so undo it now and keep
-            // what readers see equal to what a reopen recovers.
-            if self.put_back(page.before).is_err() {
-                self.failed = true;
+        let batch = match encode(&page.changes) {
+            Ok(batch) => batch,
+            Err(e) => {
+                // Nothing reached the journal: definitely not durable, so
+                // put the page back as reopening would.
+                if self.put_back(page.before).is_err() {
+                    self.failed = true;
+                }
+                return Err(e);
             }
+        };
+        if let Err(e) = self.commit_redo(&page, &batch) {
+            // Indeterminate: the journal can fail after writing a whole
+            // frame (its sync failed), so the batch may or may not replay.
+            // Leave the stores and the undo log as they are and refuse
+            // further use; reopening undoes the page from the undo log,
+            // then replays the redo frame if it is whole.
+            self.failed = true;
             return Err(e);
         }
         let checkpointed = self.checkpoint_after_commit();
@@ -168,14 +180,13 @@ impl EngineTables {
         checkpointed
     }
 
-    /// The commit point: the page's writes as one redo batch.
-    fn commit_redo(&mut self, page: &OpenPage) -> Result<()> {
+    /// The commit point: the page's writes, encoded as `batch`, as one redo
+    /// entry.
+    fn commit_redo(&mut self, page: &OpenPage, batch: &Batch) -> Result<()> {
         if page.changes.is_empty() {
             return Ok(());
         }
-        self.journal
-            .commit(&encode(&page.changes)?)
-            .map_err(engine_error)
+        self.journal.commit(batch).map_err(engine_error)
     }
 
     /// Housekeeping once the redo batch is durable.

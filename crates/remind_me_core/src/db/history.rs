@@ -84,24 +84,24 @@ impl<'c> Revisions<'c> {
 
     /// See [`HistoryStore::is_live`].
     pub fn is_live(&self, memory_id: &str) -> Result<bool> {
-        HistoryStore::is_live(&*self.backend.lock(), memory_id)
+        HistoryStore::is_live(&*self.backend.lock()?, memory_id)
     }
 
     /// See [`HistoryStore::current`].
     pub fn current(&self, memory_id: &str) -> Result<Option<Tracked>> {
-        HistoryStore::current(&*self.backend.lock(), memory_id)
+        HistoryStore::current(&*self.backend.lock()?, memory_id)
     }
 
     /// See [`HistoryStore::delete_for`]: a deleted memory's text must not
     /// stay readable in its history (ADR-0024).
     pub fn delete_for(&self, memory_id: &str) -> Result<()> {
-        HistoryStore::delete_for(&mut *self.backend.lock(), memory_id)
+        HistoryStore::delete_for(&mut *self.backend.lock()?, memory_id)
     }
 
     /// See [`HistoryStore::delete_of_tombstones`]: for the memories deleted
     /// before a delete took their revisions with it.
     pub fn delete_of_tombstones(&self) -> Result<usize> {
-        HistoryStore::delete_of_tombstones(&mut *self.backend.lock())
+        HistoryStore::delete_of_tombstones(&mut *self.backend.lock()?)
     }
 
     /// See [`HistoryStore::insert`].
@@ -113,7 +113,7 @@ impl<'c> Revisions<'c> {
         reason: Option<&str>,
     ) -> Result<()> {
         HistoryStore::insert(
-            &mut *self.backend.lock(),
+            &mut *self.backend.lock()?,
             memory_id,
             values,
             edited_at,
@@ -124,17 +124,17 @@ impl<'c> Revisions<'c> {
     /// See [`HistoryStore::list`]: the id breaks ties, so revisions captured
     /// within the same clock tick still list in the order they were written.
     pub fn list(&self, memory_id: &str, limit: usize) -> Result<Vec<MemoryRevision>> {
-        HistoryStore::list(&*self.backend.lock(), memory_id, limit)
+        HistoryStore::list(&*self.backend.lock()?, memory_id, limit)
     }
 
     /// See [`HistoryStore::revision`].
     pub fn revision(&self, memory_id: &str, revision_id: i64) -> Result<Option<Tracked>> {
-        HistoryStore::revision(&*self.backend.lock(), memory_id, revision_id)
+        HistoryStore::revision(&*self.backend.lock()?, memory_id, revision_id)
     }
 
     /// See [`HistoryStore::restore`].
     pub fn restore(&self, memory_id: &str, values: &Tracked, updated_at: &str) -> Result<()> {
-        HistoryStore::restore(&mut *self.backend.lock(), memory_id, values, updated_at)
+        HistoryStore::restore(&mut *self.backend.lock()?, memory_id, values, updated_at)
     }
 }
 

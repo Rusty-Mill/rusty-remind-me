@@ -73,6 +73,8 @@ symphonia = { version = "0.6", optional = true, default-features = false, featur
 [dev-dependencies]
 # `json!` for the OAuth state store's `rusty_json` values in tests.
 rusty_json = { workspace = true }
+# The engine's one-shot journal faults, for the transaction fail-closed tests.
+rusty_multimodal_db_engine = { workspace = true, features = ["test-support"] }
 
 [features]
 default = []

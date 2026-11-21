@@ -94,7 +94,7 @@ impl<'c> WikiIndex<'c> {
 
     /// See [`WikiStore::upsert`].
     pub fn upsert(&self, page: &WikiPage) -> Result<()> {
-        WikiStore::upsert(&mut *self.backend.lock(), page)
+        WikiStore::upsert(&mut *self.backend.lock()?, page)
     }
 
     /// See [`WikiStore::upsert_unbacked`].
@@ -107,7 +107,7 @@ impl<'c> WikiIndex<'c> {
         updated_at: &str,
     ) -> Result<()> {
         WikiStore::upsert_unbacked(
-            &mut *self.backend.lock(),
+            &mut *self.backend.lock()?,
             slug,
             title,
             content,
@@ -118,57 +118,57 @@ impl<'c> WikiIndex<'c> {
 
     /// See [`WikiStore::get`].
     pub fn get(&self, slug: &str) -> Result<Option<WikiPage>> {
-        WikiStore::get(&*self.backend.lock(), slug)
+        WikiStore::get(&*self.backend.lock()?, slug)
     }
 
     /// See [`WikiStore::recent_first`].
     pub fn recent_first(&self) -> Result<Vec<WikiPage>> {
-        WikiStore::recent_first(&*self.backend.lock())
+        WikiStore::recent_first(&*self.backend.lock()?)
     }
 
     /// See [`WikiStore::recent_first_then_title`].
     pub fn recent_first_then_title(&self) -> Result<Vec<WikiPage>> {
-        WikiStore::recent_first_then_title(&*self.backend.lock())
+        WikiStore::recent_first_then_title(&*self.backend.lock()?)
     }
 
     /// See [`WikiStore::summaries_by_title`].
     pub fn summaries_by_title(&self) -> Result<Vec<PageSummary>> {
-        WikiStore::summaries_by_title(&*self.backend.lock())
+        WikiStore::summaries_by_title(&*self.backend.lock()?)
     }
 
     /// See [`WikiStore::mtimes`].
     pub fn mtimes(&self) -> Result<HashMap<String, f64>> {
-        WikiStore::mtimes(&*self.backend.lock())
+        WikiStore::mtimes(&*self.backend.lock()?)
     }
 
     /// See [`WikiStore::remove`].
     pub fn remove(&self, slug: &str) -> Result<bool> {
-        WikiStore::remove(&mut *self.backend.lock(), slug)
+        WikiStore::remove(&mut *self.backend.lock()?, slug)
     }
 
     /// See [`WikiStore::replace_links`].
     pub fn replace_links(&self, slug: &str, links: &[(String, String)]) -> Result<()> {
-        WikiStore::replace_links(&mut *self.backend.lock(), slug, links)
+        WikiStore::replace_links(&mut *self.backend.lock()?, slug, links)
     }
 
     /// See [`WikiStore::link_count`].
     pub fn link_count(&self, slug: &str) -> Result<usize> {
-        WikiStore::link_count(&*self.backend.lock(), slug)
+        WikiStore::link_count(&*self.backend.lock()?, slug)
     }
 
     /// See [`WikiStore::search`].
     pub fn search(&self, phrases: &[String], limit: usize) -> Result<Vec<WikiSearchHit>> {
-        WikiStore::search(&*self.backend.lock(), phrases, limit)
+        WikiStore::search(&*self.backend.lock()?, phrases, limit)
     }
 
     /// See [`WikiStore::meta`].
     pub fn meta(&self, key: &str) -> Result<Option<String>> {
-        WikiStore::meta(&*self.backend.lock(), key)
+        WikiStore::meta(&*self.backend.lock()?, key)
     }
 
     /// See [`WikiStore::set_meta`].
     pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
-        WikiStore::set_meta(&mut *self.backend.lock(), key, value)
+        WikiStore::set_meta(&mut *self.backend.lock()?, key, value)
     }
 }
 

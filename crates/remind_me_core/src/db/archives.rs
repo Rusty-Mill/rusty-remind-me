@@ -83,7 +83,7 @@ impl<'c> Archives<'c> {
 
     /// See [`ArchiveStore::record`].
     pub fn record(&self, row: &ArchiveRow) -> Result<()> {
-        ArchiveStore::record(&mut *self.backend.lock(), row)
+        ArchiveStore::record(&mut *self.backend.lock()?, row)
     }
 
     /// See [`ArchiveStore::record_span`].
@@ -95,7 +95,7 @@ impl<'c> Archives<'c> {
         byte_end: i64,
     ) -> Result<()> {
         ArchiveStore::record_span(
-            &mut *self.backend.lock(),
+            &mut *self.backend.lock()?,
             memory_id,
             import_id,
             byte_start,
@@ -105,32 +105,32 @@ impl<'c> Archives<'c> {
 
     /// See [`ArchiveStore::span_source`].
     pub fn span_source(&self, memory_id: &str) -> Result<Option<SpanSource>> {
-        ArchiveStore::span_source(&*self.backend.lock(), memory_id)
+        ArchiveStore::span_source(&*self.backend.lock()?, memory_id)
     }
 
     /// See [`ArchiveStore::blob_of`].
     pub fn blob_of(&self, import_id: &str) -> Result<Option<(String, String)>> {
-        ArchiveStore::blob_of(&*self.backend.lock(), import_id)
+        ArchiveStore::blob_of(&*self.backend.lock()?, import_id)
     }
 
     /// See [`ArchiveStore::remove`].
     pub fn remove(&self, import_id: &str) -> Result<()> {
-        ArchiveStore::remove(&mut *self.backend.lock(), import_id)
+        ArchiveStore::remove(&mut *self.backend.lock()?, import_id)
     }
 
     /// See [`ArchiveStore::count_with_hash`].
     pub fn count_with_hash(&self, hash: &str) -> Result<usize> {
-        ArchiveStore::count_with_hash(&*self.backend.lock(), hash)
+        ArchiveStore::count_with_hash(&*self.backend.lock()?, hash)
     }
 
     /// See [`ArchiveStore::oldest_first`].
     pub fn oldest_first(&self) -> Result<Vec<ArchiveRow>> {
-        ArchiveStore::oldest_first(&*self.backend.lock())
+        ArchiveStore::oldest_first(&*self.backend.lock()?)
     }
 
     /// See [`ArchiveStore::span_count`].
     pub fn span_count(&self, import_id: Option<&str>) -> Result<usize> {
-        ArchiveStore::span_count(&*self.backend.lock(), import_id)
+        ArchiveStore::span_count(&*self.backend.lock()?, import_id)
     }
 }
 

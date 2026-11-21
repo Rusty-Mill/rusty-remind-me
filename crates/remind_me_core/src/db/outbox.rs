@@ -78,42 +78,42 @@ impl<'c> Outbox<'c> {
         after_id: i64,
         limit: usize,
     ) -> Result<Vec<OutboxEntry>> {
-        OutboxStore::unsent_to(&*self.backend.lock(), remote_id, after_id, limit)
+        OutboxStore::unsent_to(&*self.backend.lock()?, remote_id, after_id, limit)
     }
 
     /// See [`OutboxStore::pending_for`].
     pub fn pending_for(&self, remote_id: &str) -> Result<(i64, Option<String>)> {
-        OutboxStore::pending_for(&*self.backend.lock(), remote_id)
+        OutboxStore::pending_for(&*self.backend.lock()?, remote_id)
     }
 
     /// See [`OutboxStore::len`].
     pub fn len(&self) -> Result<i64> {
-        OutboxStore::len(&*self.backend.lock())
+        OutboxStore::len(&*self.backend.lock()?)
     }
 
     /// See [`OutboxStore::unsent_count`].
     pub fn unsent_count(&self) -> Result<i64> {
-        OutboxStore::unsent_count(&*self.backend.lock())
+        OutboxStore::unsent_count(&*self.backend.lock()?)
     }
 
     /// See [`OutboxStore::is_empty`].
     pub fn is_empty(&self) -> Result<bool> {
-        OutboxStore::is_empty(&*self.backend.lock())
+        OutboxStore::is_empty(&*self.backend.lock()?)
     }
 
     /// See [`OutboxStore::prune`].
     pub fn prune(&self, cutoff: &str, done_by: &str) -> Result<usize> {
-        OutboxStore::prune(&mut *self.backend.lock(), cutoff, done_by)
+        OutboxStore::prune(&mut *self.backend.lock()?, cutoff, done_by)
     }
 
     /// See [`OutboxStore::clear`].
     pub fn clear(&self) -> Result<()> {
-        OutboxStore::clear(&mut *self.backend.lock())
+        OutboxStore::clear(&mut *self.backend.lock()?)
     }
 
     /// See [`OutboxStore::backfill_everything`].
     pub fn backfill_everything(&self) -> Result<()> {
-        OutboxStore::backfill_everything(&mut *self.backend.lock())
+        OutboxStore::backfill_everything(&mut *self.backend.lock()?)
     }
 }
 

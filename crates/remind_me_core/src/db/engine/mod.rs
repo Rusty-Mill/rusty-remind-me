@@ -313,8 +313,15 @@ impl super::backend::Backend for EngineTables {
         self.abandon_page()
     }
 
-    fn in_transaction(&self) -> bool {
-        self.page.is_some()
+    fn transaction_state(&self) -> super::backend::TransactionState {
+        use super::backend::TransactionState;
+        if self.failed {
+            TransactionState::NeedsRecovery
+        } else if self.page.is_some() {
+            TransactionState::Open
+        } else {
+            TransactionState::Closed
+        }
     }
 
     fn rebuild_indexes(&mut self) -> super::Result<()> {

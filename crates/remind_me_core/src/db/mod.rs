@@ -337,7 +337,7 @@ impl Database {
     /// tables `EngineTables::compact_needed` picks). How many were
     /// compacted.
     pub fn compact_store(&self) -> Result<usize> {
-        self.backend.lock().compact()
+        self.backend.lock()?.compact()
     }
 
     /// The store, holding the database's lock for as long as the handle

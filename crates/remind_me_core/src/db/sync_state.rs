@@ -127,72 +127,72 @@ impl<'c> SyncState<'c> {
 
     /// See [`SyncStateStore::remote_row`].
     pub fn remote_row(&self, remote_id: &str) -> Result<Option<SyncLogRow>> {
-        SyncStateStore::remote_row(&*self.backend.lock(), remote_id)
+        SyncStateStore::remote_row(&*self.backend.lock()?, remote_id)
     }
 
     /// See [`SyncStateStore::put_remote_row`].
     pub fn put_remote_row(&self, row: &SyncLogRow) -> Result<()> {
-        SyncStateStore::put_remote_row(&mut *self.backend.lock(), row)
+        SyncStateStore::put_remote_row(&mut *self.backend.lock()?, row)
     }
 
     /// See [`SyncStateStore::pull_cursor`].
     pub fn pull_cursor(&self, remote_id: &str) -> Result<Option<(String, String)>> {
-        SyncStateStore::pull_cursor(&*self.backend.lock(), remote_id)
+        SyncStateStore::pull_cursor(&*self.backend.lock()?, remote_id)
     }
 
     /// See [`SyncStateStore::set_pull_cursor`].
     pub fn set_pull_cursor(&self, remote_id: &str, since: &str, since_id: &str) -> Result<()> {
-        SyncStateStore::set_pull_cursor(&mut *self.backend.lock(), remote_id, since, since_id)
+        SyncStateStore::set_pull_cursor(&mut *self.backend.lock()?, remote_id, since, since_id)
     }
 
     /// See [`SyncStateStore::seq_cursor`].
     pub fn seq_cursor(&self, remote_id: &str) -> Result<Option<i64>> {
-        SyncStateStore::seq_cursor(&*self.backend.lock(), remote_id)
+        SyncStateStore::seq_cursor(&*self.backend.lock()?, remote_id)
     }
 
     /// See [`SyncStateStore::set_seq_cursor`].
     pub fn set_seq_cursor(&self, remote_id: &str, seq: i64) -> Result<()> {
-        SyncStateStore::set_seq_cursor(&mut *self.backend.lock(), remote_id, seq)
+        SyncStateStore::set_seq_cursor(&mut *self.backend.lock()?, remote_id, seq)
     }
 
     /// See [`SyncStateStore::reset_pull_cursors`].
     pub fn reset_pull_cursors(&self, remote_id: &str, since: &str, seq: i64) -> Result<bool> {
-        SyncStateStore::reset_pull_cursors(&mut *self.backend.lock(), remote_id, since, seq)
+        SyncStateStore::reset_pull_cursors(&mut *self.backend.lock()?, remote_id, since, seq)
     }
 
     /// See [`SyncStateStore::stamp_push`].
     pub fn stamp_push(&self, remote_id: &str, at: &str) -> Result<()> {
-        SyncStateStore::stamp_push(&mut *self.backend.lock(), remote_id, at)
+        SyncStateStore::stamp_push(&mut *self.backend.lock()?, remote_id, at)
     }
 
     /// See [`SyncStateStore::stamp_pull`].
     pub fn stamp_pull(&self, remote_id: &str, at: &str) -> Result<()> {
-        SyncStateStore::stamp_pull(&mut *self.backend.lock(), remote_id, at)
+        SyncStateStore::stamp_pull(&mut *self.backend.lock()?, remote_id, at)
     }
 
     /// See [`SyncStateStore::last_pull_at`].
     pub fn last_pull_at(&self, remote_id: &str) -> Result<Option<String>> {
-        SyncStateStore::last_pull_at(&*self.backend.lock(), remote_id)
+        SyncStateStore::last_pull_at(&*self.backend.lock()?, remote_id)
     }
 
     /// See [`SyncStateStore::remotes`].
     pub fn remotes(&self) -> Result<Vec<RemoteLog>> {
-        SyncStateStore::remotes(&*self.backend.lock())
+        SyncStateStore::remotes(&*self.backend.lock()?)
     }
 
     /// See [`SyncStateStore::flag`].
     pub fn flag(&self, key: &str) -> Result<Option<String>> {
-        SyncStateStore::flag(&*self.backend.lock(), key)
+        SyncStateStore::flag(&*self.backend.lock()?, key)
     }
 
     /// See [`SyncStateStore::set_flag`].
     pub fn set_flag(&self, key: &str, value: &str) -> Result<()> {
-        SyncStateStore::set_flag(&mut *self.backend.lock(), key, value)
+        SyncStateStore::set_flag(&mut *self.backend.lock()?, key, value)
     }
 
     /// See [`SyncStateStore::record_sends`].
     pub fn record_sends(&self, remote_id: &str, outbox_ids: &[i64], at: &str) -> Result<()> {
-        SyncStateStore::record_sends(&mut *self.backend.lock(), remote_id, outbox_ids, at)
+        SyncStateStore::record_sends(&mut *self.backend.lock()?, remote_id, outbox_ids, at)
     }
 }
 
@@ -332,7 +332,9 @@ mod tests {
             .collect();
         assert_eq!(sent, vec![(1, "t1".into()), (2, "t2".into())]);
         assert_eq!(
-            engine::outbox::sent(engine::testing::tables(&mut store.backend().lock()).unwrap()),
+            engine::outbox::sent(
+                engine::testing::tables(&mut store.backend().lock().unwrap()).unwrap()
+            ),
             vec![(1, "t1".to_string()), (2, "t2".to_string())]
         );
     }

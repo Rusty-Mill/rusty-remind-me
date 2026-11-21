@@ -61,7 +61,7 @@ impl<'c> Reminders<'c> {
 
     /// See [`ReminderStore::is_live`].
     pub fn is_live(&self, memory_id: &str) -> Result<bool> {
-        ReminderStore::is_live(&*self.backend.lock(), memory_id)
+        ReminderStore::is_live(&*self.backend.lock()?, memory_id)
     }
 
     /// See [`ReminderStore::set_remind_at`]. The stamp is what LWW compares.
@@ -71,13 +71,13 @@ impl<'c> Reminders<'c> {
         remind_at: Option<&str>,
         updated_at: &str,
     ) -> Result<()> {
-        ReminderStore::set_remind_at(&mut *self.backend.lock(), memory_id, remind_at, updated_at)
+        ReminderStore::set_remind_at(&mut *self.backend.lock()?, memory_id, remind_at, updated_at)
     }
 
     /// See [`ReminderStore::in_window`]. A negative `limit` returns nothing.
     pub fn in_window(&self, window: ReminderWindow, now: &str, limit: i64) -> Result<Vec<Memory>> {
         let limit = usize::try_from(limit).unwrap_or(0);
-        ReminderStore::in_window(&*self.backend.lock(), window, now, limit)
+        ReminderStore::in_window(&*self.backend.lock()?, window, now, limit)
     }
 
     /// See [`ReminderStore::record_delivery`]: two racing pollers must
@@ -89,7 +89,7 @@ impl<'c> Reminders<'c> {
         delivered_at: &str,
     ) -> Result<()> {
         ReminderStore::record_delivery(
-            &mut *self.backend.lock(),
+            &mut *self.backend.lock()?,
             memory_id,
             remind_at,
             delivered_at,

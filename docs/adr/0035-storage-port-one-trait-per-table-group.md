@@ -88,16 +88,21 @@ backend. R3 measures on real data; this set stays the regression gate.
   `backend::Transaction`, which calls the three transaction methods and
   rolls back when dropped uncommitted. The engine's page stays the
   engine's.
-- **Transactions do not nest, and a failed commit never opens the gate
-  early.** A begin on a thread that already holds a transaction is refused
-  before it reaches the backend and leaves the outer transaction's gate
-  alone. `Backend::commit_transaction` names the four states a failed
-  commit may leave (rolled back, committed, still open, or unavailable
-  pending recovery); the wrapper rolls back a transaction that is still
-  open (`Backend::in_transaction`) before it lets other threads in. On the
-  engine, a redo commit that did not land puts the page back at once, as
-  reopening would. Before step 6 the engine's gate let a nested begin
-  release the outer transaction's ownership; that is fixed here.
+- **Transactions do not nest, and an unsettled transaction fails the
+  store closed.** A begin on a thread that already holds a transaction is
+  refused before it reaches the backend and leaves the outer transaction's
+  gate alone (before step 6 the engine's gate let a nested begin release
+  the outer ownership). `Backend::commit_transaction` names the four
+  states a failed commit may leave, and `Backend::transaction_state`
+  reports `Closed`, `Open` or `NeedsRecovery`. After a commit or a
+  rollback the wrapper rolls back anything still open and opens the gate
+  only on `Closed`; anything else fails the `BackendLock` closed, so
+  `lock()` (now fallible) refuses every read and write on every thread
+  until the database is reopened. On the engine a redo-journal error is
+  indeterminate (the journal can fail after a whole frame, when its sync
+  fails), so the page and the undo log are left in place for reopening
+  to settle; only a batch that never reached the journal is put back at
+  once.
 - **`Database::open_backend(Box<dyn Backend>, path)`** opens a database on
   any backend and runs the same start-up work as `Database::open`. This is
   what R3 calls to run the suite on SQLite or Attest.

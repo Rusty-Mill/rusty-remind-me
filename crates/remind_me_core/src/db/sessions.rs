@@ -154,7 +154,7 @@ impl<'c> Sessions<'c> {
 
     /// See [`SessionStore::upsert_start`].
     pub fn upsert_start(&self, start: &SessionStart) -> Result<()> {
-        SessionStore::upsert_start(&mut *self.backend.lock(), start)
+        SessionStore::upsert_start(&mut *self.backend.lock()?, start)
     }
 
     /// See [`SessionStore::end`].
@@ -166,7 +166,7 @@ impl<'c> Sessions<'c> {
         work_log_memory_id: Option<&str>,
     ) -> Result<bool> {
         SessionStore::end(
-            &mut *self.backend.lock(),
+            &mut *self.backend.lock()?,
             session_id,
             ended_at,
             end_sha,
@@ -176,12 +176,12 @@ impl<'c> Sessions<'c> {
 
     /// See [`SessionStore::get`].
     pub fn get(&self, session_id: &str) -> Result<Option<SessionRecord>> {
-        SessionStore::get(&*self.backend.lock(), session_id)
+        SessionStore::get(&*self.backend.lock()?, session_id)
     }
 
     /// See [`SessionStore::recent`].
     pub fn recent(&self, limit: usize, project: Option<&str>) -> Result<Vec<SessionRecord>> {
-        SessionStore::recent(&*self.backend.lock(), limit, project)
+        SessionStore::recent(&*self.backend.lock()?, limit, project)
     }
 }
 

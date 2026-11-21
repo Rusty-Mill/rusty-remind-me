@@ -102,32 +102,32 @@ impl<'c> References<'c> {
 
     /// See [`ReferenceStore::insert`].
     pub fn insert(&self, row: &NewReference) -> Result<()> {
-        ReferenceStore::insert(&mut *self.backend.lock(), row)
+        ReferenceStore::insert(&mut *self.backend.lock()?, row)
     }
 
     /// See [`ReferenceStore::for_memory`].
     pub fn for_memory(&self, memory_id: &str) -> Result<Vec<MemoryReference>> {
-        ReferenceStore::for_memory(&*self.backend.lock(), memory_id)
+        ReferenceStore::for_memory(&*self.backend.lock()?, memory_id)
     }
 
     /// See [`ReferenceStore::for_memories`].
     pub fn for_memories(&self, memory_ids: &[String]) -> Result<Vec<MemoryReference>> {
-        ReferenceStore::for_memories(&*self.backend.lock(), memory_ids)
+        ReferenceStore::for_memories(&*self.backend.lock()?, memory_ids)
     }
 
     /// See [`ReferenceStore::of_kind`].
     pub fn of_kind(&self, kind: &str) -> Result<Vec<MemoryReference>> {
-        ReferenceStore::of_kind(&*self.backend.lock(), kind)
+        ReferenceStore::of_kind(&*self.backend.lock()?, kind)
     }
 
     /// See [`ReferenceStore::find`].
     pub fn find(&self, kind: &str, value: &str) -> Result<Vec<MemoryReference>> {
-        ReferenceStore::find(&*self.backend.lock(), kind, value)
+        ReferenceStore::find(&*self.backend.lock()?, kind, value)
     }
 
     /// See [`ReferenceStore::delete_for_memory`].
     pub fn delete_for_memory(&self, memory_id: &str) -> Result<usize> {
-        ReferenceStore::delete_for_memory(&mut *self.backend.lock(), memory_id)
+        ReferenceStore::delete_for_memory(&mut *self.backend.lock()?, memory_id)
     }
 }
 

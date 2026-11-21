@@ -112,42 +112,42 @@ impl<'c> Vectors<'c> {
 
     /// See [`VectorStore::put`].
     pub fn put(&self, memory_id: &str, chunk_ix: usize, embedding: &[u8]) -> Result<()> {
-        VectorStore::put(&mut *self.backend.lock(), memory_id, chunk_ix, embedding)
+        VectorStore::put(&mut *self.backend.lock()?, memory_id, chunk_ix, embedding)
     }
 
     /// See [`VectorStore::delete_for`].
     pub fn delete_for(&self, memory_id: &str) -> Result<usize> {
-        VectorStore::delete_for(&mut *self.backend.lock(), memory_id)
+        VectorStore::delete_for(&mut *self.backend.lock()?, memory_id)
     }
 
     /// See [`VectorStore::clear`].
     pub fn clear(&self) -> Result<()> {
-        VectorStore::clear(&mut *self.backend.lock())
+        VectorStore::clear(&mut *self.backend.lock()?)
     }
 
     /// See [`VectorStore::chunk_count`].
     pub fn chunk_count(&self, memory_id: &str) -> Result<usize> {
-        VectorStore::chunk_count(&*self.backend.lock(), memory_id)
+        VectorStore::chunk_count(&*self.backend.lock()?, memory_id)
     }
 
     /// See [`VectorStore::chunks_for`].
     pub fn chunks_for(&self, memory_id: &str) -> Result<Vec<ChunkVector>> {
-        VectorStore::chunks_for(&*self.backend.lock(), memory_id)
+        VectorStore::chunks_for(&*self.backend.lock()?, memory_id)
     }
 
     /// See [`VectorStore::count`].
     pub fn count(&self) -> Result<usize> {
-        VectorStore::count(&*self.backend.lock())
+        VectorStore::count(&*self.backend.lock()?)
     }
 
     /// See [`VectorStore::any_embedding`].
     pub fn any_embedding(&self) -> Result<Option<Vec<u8>>> {
-        VectorStore::any_embedding(&*self.backend.lock())
+        VectorStore::any_embedding(&*self.backend.lock()?)
     }
 
     /// See [`VectorStore::all`].
     pub fn all(&self) -> Result<Vec<ChunkVector>> {
-        VectorStore::all(&*self.backend.lock())
+        VectorStore::all(&*self.backend.lock()?)
     }
 
     /// See [`VectorStore::live_chunks`].
@@ -156,12 +156,12 @@ impl<'c> Vectors<'c> {
         category: Option<&str>,
         among: Option<&[String]>,
     ) -> Result<Vec<ChunkVector>> {
-        VectorStore::live_chunks(&*self.backend.lock(), category, among)
+        VectorStore::live_chunks(&*self.backend.lock()?, category, among)
     }
 
     /// See [`VectorStore::unembedded`].
     pub fn unembedded(&self) -> Result<Vec<Unembedded>> {
-        VectorStore::unembedded(&*self.backend.lock())
+        VectorStore::unembedded(&*self.backend.lock()?)
     }
 
     /// See [`VectorStore::consolidation_candidates`].
@@ -170,17 +170,17 @@ impl<'c> Vectors<'c> {
         category: Option<&str>,
         limit: usize,
     ) -> Result<Vec<ConsolidationCandidate>> {
-        VectorStore::consolidation_candidates(&*self.backend.lock(), category, limit)
+        VectorStore::consolidation_candidates(&*self.backend.lock()?, category, limit)
     }
 
     /// See [`VectorStore::meta`].
     pub fn meta(&self) -> Result<Vec<(String, String)>> {
-        VectorStore::meta(&*self.backend.lock())
+        VectorStore::meta(&*self.backend.lock()?)
     }
 
     /// See [`VectorStore::set_meta`].
     pub fn set_meta(&self, key: &str, value: &str, updated_at: &str) -> Result<()> {
-        VectorStore::set_meta(&mut *self.backend.lock(), key, value, updated_at)
+        VectorStore::set_meta(&mut *self.backend.lock()?, key, value, updated_at)
     }
 }
 

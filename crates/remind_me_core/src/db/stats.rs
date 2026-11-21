@@ -129,57 +129,57 @@ impl<'c> StoreStats<'c> {
 
     /// See [`StatsStore::live_memories`].
     pub fn live_memories(&self) -> Result<i64> {
-        StatsStore::live_memories(&*self.backend.lock())
+        StatsStore::live_memories(&*self.backend.lock()?)
     }
 
     /// See [`StatsStore::imports`].
     pub fn imports(&self) -> Result<i64> {
-        StatsStore::imports(&*self.backend.lock())
+        StatsStore::imports(&*self.backend.lock()?)
     }
 
     /// See [`StatsStore::count_by`].
     pub fn count_by(&self, group: GroupBy) -> Result<BTreeMap<String, i64>> {
-        StatsStore::count_by(&*self.backend.lock(), group)
+        StatsStore::count_by(&*self.backend.lock()?, group)
     }
 
     /// See [`StatsStore::count_by_tag`].
     pub fn count_by_tag(&self) -> Result<BTreeMap<String, i64>> {
-        StatsStore::count_by_tag(&*self.backend.lock())
+        StatsStore::count_by_tag(&*self.backend.lock()?)
     }
 
     /// See [`StatsStore::memory_totals`].
     pub fn memory_totals(&self) -> Result<(i64, i64)> {
-        StatsStore::memory_totals(&*self.backend.lock())
+        StatsStore::memory_totals(&*self.backend.lock()?)
     }
 
     /// See [`StatsStore::tombstones_holding_text`].
     pub fn tombstones_holding_text(&self) -> Result<i64> {
-        StatsStore::tombstones_holding_text(&*self.backend.lock())
+        StatsStore::tombstones_holding_text(&*self.backend.lock()?)
     }
 
     /// See [`StatsStore::all_by_category`].
     pub fn all_by_category(&self) -> Result<BTreeMap<String, i64>> {
-        StatsStore::all_by_category(&*self.backend.lock())
+        StatsStore::all_by_category(&*self.backend.lock()?)
     }
 
     /// See [`StatsStore::shareable_since`].
     pub fn shareable_since(&self, cutoff: &str, limit: usize) -> Result<Vec<DigestRecentMemory>> {
-        StatsStore::shareable_since(&*self.backend.lock(), cutoff, limit)
+        StatsStore::shareable_since(&*self.backend.lock()?, cutoff, limit)
     }
 
     /// See [`StatsStore::count_shareable_since`].
     pub fn count_shareable_since(&self, cutoff: &str) -> Result<i64> {
-        StatsStore::count_shareable_since(&*self.backend.lock(), cutoff)
+        StatsStore::count_shareable_since(&*self.backend.lock()?, cutoff)
     }
 
     /// See [`StatsStore::recent`]. A negative `limit` returns nothing.
     pub fn recent(&self, limit: i64) -> Result<Vec<RecentMemory>> {
-        StatsStore::recent(&*self.backend.lock(), usize::try_from(limit).unwrap_or(0))
+        StatsStore::recent(&*self.backend.lock()?, usize::try_from(limit).unwrap_or(0))
     }
 
     /// The store's file, size and schema version.
     pub fn storage_info(&self) -> Result<StorageInfo> {
-        let size_bytes = StatsStore::size_on_disk(&*self.backend.lock())?;
+        let size_bytes = StatsStore::size_on_disk(&*self.backend.lock()?)?;
         Ok(StorageInfo {
             path: self.path.clone(),
             size_bytes: i64::try_from(size_bytes).unwrap_or(i64::MAX),
@@ -189,17 +189,17 @@ impl<'c> StoreStats<'c> {
 
     /// See [`SnapshotStore::snapshot_on`].
     pub fn snapshot_on(&self, date: &str) -> Result<Option<i64>> {
-        SnapshotStore::snapshot_on(&*self.backend.lock(), date)
+        SnapshotStore::snapshot_on(&*self.backend.lock()?, date)
     }
 
     /// See [`SnapshotStore::insert_snapshot`].
     pub fn insert_snapshot(&self, snapshot: &AnalyticsSnapshot) -> Result<i64> {
-        SnapshotStore::insert_snapshot(&mut *self.backend.lock(), snapshot)
+        SnapshotStore::insert_snapshot(&mut *self.backend.lock()?, snapshot)
     }
 
     /// See [`SnapshotStore::snapshots`].
     pub fn snapshots(&self) -> Result<Vec<AnalyticsSnapshot>> {
-        SnapshotStore::snapshots(&*self.backend.lock())
+        SnapshotStore::snapshots(&*self.backend.lock()?)
     }
 }
 

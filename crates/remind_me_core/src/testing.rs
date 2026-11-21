@@ -100,7 +100,7 @@ fn memory_column_name(column: &str) -> Result<&str> {
 pub fn memory_column(store: &Store<'_>, id: &str, column: &str) -> Result<Option<Value>> {
     let column = memory_column_name(column)?;
     engine::testing::memory_column(
-        engine::testing::tables(&mut store.backend().lock())?,
+        engine::testing::tables(&mut store.backend().lock()?)?,
         id,
         column,
     )
@@ -141,7 +141,7 @@ pub fn set_memory_column(
 ) -> Result<usize> {
     let column = memory_column_name(column)?;
     engine::testing::set_memory_column(
-        engine::testing::tables(&mut store.backend().lock())?,
+        engine::testing::tables(&mut store.backend().lock()?)?,
         id,
         column,
         value.into(),
@@ -150,7 +150,7 @@ pub fn set_memory_column(
 
 /// Every memory id, deleted or not, sorted.
 pub fn memory_ids(store: &Store<'_>) -> Result<Vec<String>> {
-    engine::testing::memory_ids(engine::testing::tables(&mut store.backend().lock())?)
+    engine::testing::memory_ids(engine::testing::tables(&mut store.backend().lock()?)?)
 }
 
 /// Move memory `from` to id `to`, every other column kept, as `UPDATE
@@ -163,7 +163,7 @@ pub fn memory_ids(store: &Store<'_>) -> Result<Vec<String>> {
 /// [`StoreError::Invalid`] when `to` is taken, or the store's own error.
 pub fn relabel_memory(store: &Store<'_>, from: &str, to: &str) -> Result<usize> {
     engine::testing::relabel_memory(
-        engine::testing::tables(&mut store.backend().lock())?,
+        engine::testing::tables(&mut store.backend().lock()?)?,
         from,
         to,
     )
@@ -171,7 +171,10 @@ pub fn relabel_memory(store: &Store<'_>, from: &str, to: &str) -> Result<usize> 
 
 /// How many rows `table` holds.
 pub fn count(store: &Store<'_>, table: Table) -> Result<i64> {
-    engine::testing::count(engine::testing::tables(&mut store.backend().lock())?, table)
+    engine::testing::count(
+        engine::testing::tables(&mut store.backend().lock()?)?,
+        table,
+    )
 }
 
 /// The raw `query` of every feedback event logged for `memory_id`, oldest
@@ -179,7 +182,7 @@ pub fn count(store: &Store<'_>, table: Table) -> Result<i64> {
 /// only the tokens.
 pub fn feedback_queries(store: &Store<'_>, memory_id: &str) -> Result<Vec<String>> {
     engine::testing::feedback_queries(
-        engine::testing::tables(&mut store.backend().lock())?,
+        engine::testing::tables(&mut store.backend().lock()?)?,
         memory_id,
     )
 }
@@ -189,7 +192,11 @@ pub fn feedback_queries(store: &Store<'_>, memory_id: &str) -> Result<Vec<String
 /// [`crate::db::related::Related::co_retrieved`] reads only pairs whose
 /// other memory is stored and live.
 pub fn association_weight(store: &Store<'_>, a: &str, b: &str) -> Result<Option<i64>> {
-    engine::testing::association_weight(engine::testing::tables(&mut store.backend().lock())?, a, b)
+    engine::testing::association_weight(
+        engine::testing::tables(&mut store.backend().lock()?)?,
+        a,
+        b,
+    )
 }
 
 /// One `sync_outbox` row, as [`outbox_rows`] reads it.
@@ -212,7 +219,7 @@ pub fn mark_store_syncing(store: &Store<'_>) -> Result<()> {
 
 /// Every outbox row, oldest id first.
 pub fn outbox_rows(store: &Store<'_>) -> Result<Vec<OutboxRow>> {
-    engine::testing::outbox_rows(engine::testing::tables(&mut store.backend().lock())?)
+    engine::testing::outbox_rows(engine::testing::tables(&mut store.backend().lock()?)?)
 }
 
 /// Overwrite outbox row `id`'s `column` (`created_at` or `sent_at`) with
@@ -228,7 +235,7 @@ pub fn set_outbox_column(store: &Store<'_>, id: i64, column: &str, value: &str) 
         )));
     }
     engine::testing::set_outbox_column(
-        engine::testing::tables(&mut store.backend().lock())?,
+        engine::testing::tables(&mut store.backend().lock()?)?,
         id,
         column,
         value,
@@ -237,7 +244,7 @@ pub fn set_outbox_column(store: &Store<'_>, id: i64, column: &str, value: &str) 
 
 /// Every send marker as `(remote, outbox id, sent at)`, sorted.
 pub fn sends(store: &Store<'_>) -> Result<Vec<(String, i64, String)>> {
-    engine::outbox::send_markers(engine::testing::tables(&mut store.backend().lock())?)
+    engine::outbox::send_markers(engine::testing::tables(&mut store.backend().lock()?)?)
 }
 
 /// Queue a raw outbox entry for `key`, created at `created_at`, as an
@@ -250,7 +257,7 @@ pub fn queue_outbox(
     created_at: &str,
 ) -> Result<i64> {
     engine::outbox::queue_at(
-        engine::testing::tables(&mut store.backend().lock())?,
+        engine::testing::tables(&mut store.backend().lock()?)?,
         key,
         operation,
         payload,

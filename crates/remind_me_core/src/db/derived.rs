@@ -24,5 +24,5 @@ pub enum Origin {
 /// is always safe; it is how rows planted by a test fixture, or an index
 /// that was lost, become searchable.
 pub fn rebuild_indexes(store: &super::Store<'_>) -> super::Result<()> {
-    store.backend().lock().rebuild_indexes()
+    store.backend().lock()?.rebuild_indexes()
 }

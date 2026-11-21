@@ -63,7 +63,7 @@ fn copied_store(source: &Path) -> (Database, CopyReport) {
         let mut done = Vec::new();
         let report = copy_store(
             &source,
-            crate::db::engine::testing::tables(&mut store.backend().lock()).unwrap(),
+            crate::db::engine::testing::tables(&mut store.backend().lock().unwrap()).unwrap(),
             &mut |table| done.push(table),
         )
         .unwrap();
@@ -85,7 +85,7 @@ fn copied_core(source: &Path) -> (Database, CopyReport) {
     let target = Database::open_in_memory().unwrap();
     let report = copy_core(
         &source,
-        crate::db::engine::testing::tables(&mut target.store().backend().lock()).unwrap(),
+        crate::db::engine::testing::tables(&mut target.store().backend().lock().unwrap()).unwrap(),
     )
     .unwrap();
     (target, report)
@@ -497,7 +497,7 @@ fn the_copy_refuses_a_filled_target_and_a_source_it_cannot_read() {
     let source = LegacyDb::open(&fixture_path("legacy_v32.db")).unwrap();
     let again = copy_core(
         &source,
-        crate::db::engine::testing::tables(&mut target.store().backend().lock()).unwrap(),
+        crate::db::engine::testing::tables(&mut target.store().backend().lock().unwrap()).unwrap(),
     );
     assert!(matches!(again, Err(StoreError::Invalid(ref why)) if why.contains("not empty")));
 
@@ -507,7 +507,7 @@ fn the_copy_refuses_a_filled_target_and_a_source_it_cannot_read() {
     let fresh = Database::open_in_memory().unwrap();
     let refused = copy_core(
         &old,
-        crate::db::engine::testing::tables(&mut fresh.store().backend().lock()).unwrap(),
+        crate::db::engine::testing::tables(&mut fresh.store().backend().lock().unwrap()).unwrap(),
     );
     assert!(matches!(refused, Err(StoreError::Invalid(ref why)) if why.contains("schema version")));
 }
@@ -530,7 +530,7 @@ fn the_whole_copy_refuses_a_target_with_any_group_filled() {
     let source = LegacyDb::open(&fixture_path("legacy_v32.db")).unwrap();
     let refused = copy_store(
         &source,
-        crate::db::engine::testing::tables(&mut target.store().backend().lock()).unwrap(),
+        crate::db::engine::testing::tables(&mut target.store().backend().lock().unwrap()).unwrap(),
         &mut |_| {},
     );
     assert!(matches!(refused, Err(StoreError::Invalid(ref why)) if why.contains("not empty")));
