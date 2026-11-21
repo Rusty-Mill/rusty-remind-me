@@ -1,6 +1,6 @@
 //! Feedback events and importance on SQLite: the [`FeedbackStore`] adapter.
 
-use super::memories::{rows_where, text};
+use super::memories::rows_where;
 use super::{sqlite_error, SqliteTables};
 use crate::db::derived::Origin;
 use crate::db::engine::feedback::days_since;
