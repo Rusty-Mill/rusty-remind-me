@@ -11,7 +11,7 @@
 //! [`WikiStore`] is the port (ADR-0035); the engine's adapter is in
 //! `db::engine::wiki`. [`WikiIndex`] is what callers take.
 
-use super::engine::EngineLock;
+use super::backend::BackendLock;
 use super::{Result, Store};
 use crate::wiki::{WikiPage, WikiSearchHit};
 use std::collections::HashMap;
@@ -82,19 +82,19 @@ pub trait WikiStore {
 
 /// The wiki tables of a [`Store`], one locked call at a time.
 pub struct WikiIndex<'c> {
-    engine: &'c EngineLock,
+    backend: &'c BackendLock,
 }
 
 impl<'c> WikiIndex<'c> {
     pub fn new(store: &'c Store<'_>) -> Self {
         Self {
-            engine: store.engine(),
+            backend: store.backend(),
         }
     }
 
     /// See [`WikiStore::upsert`].
     pub fn upsert(&self, page: &WikiPage) -> Result<()> {
-        WikiStore::upsert(&mut *self.engine.lock(), page)
+        WikiStore::upsert(&mut *self.backend.lock(), page)
     }
 
     /// See [`WikiStore::upsert_unbacked`].
@@ -107,7 +107,7 @@ impl<'c> WikiIndex<'c> {
         updated_at: &str,
     ) -> Result<()> {
         WikiStore::upsert_unbacked(
-            &mut *self.engine.lock(),
+            &mut *self.backend.lock(),
             slug,
             title,
             content,
@@ -118,57 +118,57 @@ impl<'c> WikiIndex<'c> {
 
     /// See [`WikiStore::get`].
     pub fn get(&self, slug: &str) -> Result<Option<WikiPage>> {
-        WikiStore::get(&*self.engine.lock(), slug)
+        WikiStore::get(&*self.backend.lock(), slug)
     }
 
     /// See [`WikiStore::recent_first`].
     pub fn recent_first(&self) -> Result<Vec<WikiPage>> {
-        WikiStore::recent_first(&*self.engine.lock())
+        WikiStore::recent_first(&*self.backend.lock())
     }
 
     /// See [`WikiStore::recent_first_then_title`].
     pub fn recent_first_then_title(&self) -> Result<Vec<WikiPage>> {
-        WikiStore::recent_first_then_title(&*self.engine.lock())
+        WikiStore::recent_first_then_title(&*self.backend.lock())
     }
 
     /// See [`WikiStore::summaries_by_title`].
     pub fn summaries_by_title(&self) -> Result<Vec<PageSummary>> {
-        WikiStore::summaries_by_title(&*self.engine.lock())
+        WikiStore::summaries_by_title(&*self.backend.lock())
     }
 
     /// See [`WikiStore::mtimes`].
     pub fn mtimes(&self) -> Result<HashMap<String, f64>> {
-        WikiStore::mtimes(&*self.engine.lock())
+        WikiStore::mtimes(&*self.backend.lock())
     }
 
     /// See [`WikiStore::remove`].
     pub fn remove(&self, slug: &str) -> Result<bool> {
-        WikiStore::remove(&mut *self.engine.lock(), slug)
+        WikiStore::remove(&mut *self.backend.lock(), slug)
     }
 
     /// See [`WikiStore::replace_links`].
     pub fn replace_links(&self, slug: &str, links: &[(String, String)]) -> Result<()> {
-        WikiStore::replace_links(&mut *self.engine.lock(), slug, links)
+        WikiStore::replace_links(&mut *self.backend.lock(), slug, links)
     }
 
     /// See [`WikiStore::link_count`].
     pub fn link_count(&self, slug: &str) -> Result<usize> {
-        WikiStore::link_count(&*self.engine.lock(), slug)
+        WikiStore::link_count(&*self.backend.lock(), slug)
     }
 
     /// See [`WikiStore::search`].
     pub fn search(&self, phrases: &[String], limit: usize) -> Result<Vec<WikiSearchHit>> {
-        WikiStore::search(&*self.engine.lock(), phrases, limit)
+        WikiStore::search(&*self.backend.lock(), phrases, limit)
     }
 
     /// See [`WikiStore::meta`].
     pub fn meta(&self, key: &str) -> Result<Option<String>> {
-        WikiStore::meta(&*self.engine.lock(), key)
+        WikiStore::meta(&*self.backend.lock(), key)
     }
 
     /// See [`WikiStore::set_meta`].
     pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
-        WikiStore::set_meta(&mut *self.engine.lock(), key, value)
+        WikiStore::set_meta(&mut *self.backend.lock(), key, value)
     }
 }
 

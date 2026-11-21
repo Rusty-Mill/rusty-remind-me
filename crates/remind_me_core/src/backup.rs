@@ -183,7 +183,7 @@ pub fn create_backup(store: &Store<'_>, label: &str) -> Result<BackupOutcome> {
     if partial.exists() {
         std::fs::remove_dir_all(&partial).map_err(io(&partial))?;
     }
-    store.engine().lock().copy_files_to(&partial)?;
+    store.backend().lock().backup_to(&partial)?;
     std::fs::rename(&partial, &dest).map_err(io(&dest))?;
     // Strictly after the local backup is finished and on disk. A refused,
     // failed or unconfigured upload is reported alongside the backup, never

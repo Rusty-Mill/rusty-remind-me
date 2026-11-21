@@ -767,7 +767,7 @@ pub fn search_memories_deadlined(
                     ..filter.clone()
                 })?
                 .into_iter()
-                .partition(|m| crate::db::engine::memories::vital_enough(&filter, m, now));
+                .partition(|m| filter.vital_enough(m, now));
             dormant_excluded = dormant
                 .iter()
                 .filter(|m| dormant_only(&filter, input, m, now))
@@ -860,7 +860,7 @@ pub fn search_memories_deadlined(
                 if !eligible {
                     return false;
                 }
-                if crate::db::engine::memories::vital_enough(&filter, m, now) {
+                if filter.vital_enough(m, now) {
                     return true;
                 }
                 if dormant_only(&filter, input, m, now) {
@@ -966,14 +966,13 @@ fn dormant_only(
     memory: &Memory,
     now: chrono::DateTime<Utc>,
 ) -> bool {
-    use crate::db::engine::memories::vital_enough;
     let floor_only = KeywordFilter {
         hide_dormant: false,
         ..filter.clone()
     };
     filter.hide_dormant
-        && !vital_enough(filter, memory, now)
-        && vital_enough(&floor_only, memory, now)
+        && !filter.vital_enough(memory, now)
+        && floor_only.vital_enough(memory, now)
         && crate::retrieval::passes_validity(
             memory,
             now,

@@ -54,70 +54,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use uuid::Uuid;
 
-/// The engine tables, shared by the database, its stores, and the
-/// background threads that work beside it.
-pub type EngineHandle = std::sync::Arc<EngineLock>;
-
-/// The engine tables behind their lock, shared by every thread that uses
-/// them, and the page gate in front of it (see [`page`]).
-///
-/// While one thread holds a page open, every other thread's [`Self::lock`]
-/// waits until the page is finished or abandoned, as a second SQLite writer
-/// waits for a write transaction: its reads and writes then see the page
-/// whole or not at all. The page's own thread passes straight through.
-pub struct EngineLock {
-    tables: parking_lot::Mutex<EngineTables>,
-    /// The thread holding a page open, if any.
-    page_owner: parking_lot::Mutex<Option<std::thread::ThreadId>>,
-    /// Signalled when a page closes.
-    page_closed: parking_lot::Condvar,
-}
-
-impl EngineLock {
-    pub fn new(tables: EngineTables) -> Self {
-        Self {
-            tables: parking_lot::Mutex::new(tables),
-            page_owner: parking_lot::Mutex::new(None),
-            page_closed: parking_lot::Condvar::new(),
-        }
-    }
-
-    /// The tables, once no other thread holds a page open.
-    pub fn lock(&self) -> parking_lot::MutexGuard<'_, EngineTables> {
-        let me = std::thread::current().id();
-        let mut owner = self.page_owner.lock();
-        while owner.is_some_and(|o| o != me) {
-            self.page_closed.wait(&mut owner);
-        }
-        // Taken while still holding the gate, so no page can open between
-        // the check and the lock.
-        self.tables.lock()
-    }
-
-    /// Claim the gate for the calling thread, once no other thread holds
-    /// it.
-    fn claim_page(&self) {
-        let me = std::thread::current().id();
-        let mut owner = self.page_owner.lock();
-        while owner.is_some_and(|o| o != me) {
-            self.page_closed.wait(&mut owner);
-        }
-        *owner = Some(me);
-    }
-
-    /// Release the gate and wake every waiting thread.
-    fn release_page(&self) {
-        *self.page_owner.lock() = None;
-        self.page_closed.notify_all();
-    }
-}
-
-impl fmt::Debug for EngineLock {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("EngineLock").finish_non_exhaustive()
-    }
-}
-
 /// The lock file inside the data directory, held while the tables are open.
 const LOCK_FILE: &str = "node.lock";
 
@@ -359,6 +295,34 @@ impl EngineTables {
 impl fmt::Debug for EngineTables {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EngineTables").finish_non_exhaustive()
+    }
+}
+
+/// The engine as a whole store (ADR-0035, step 6). A transaction is one
+/// page (see [`page`]).
+impl super::backend::Backend for EngineTables {
+    fn begin_transaction(&mut self) -> super::Result<()> {
+        self.begin_page()
+    }
+
+    fn commit_transaction(&mut self) -> super::Result<()> {
+        self.finish_page()
+    }
+
+    fn rollback_transaction(&mut self) -> super::Result<()> {
+        self.abandon_page()
+    }
+
+    fn rebuild_indexes(&mut self) -> super::Result<()> {
+        memories::rebuild(self)
+    }
+
+    fn compact(&mut self) -> super::Result<usize> {
+        self.compact_needed()
+    }
+
+    fn backup_to(&self, dest: &Path) -> super::Result<()> {
+        self.copy_files_to(dest)
     }
 }
 

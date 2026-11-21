@@ -61,9 +61,11 @@ fn copied_store(source: &Path) -> (Database, CopyReport) {
     let report = {
         let store = target.store();
         let mut done = Vec::new();
-        let report = copy_store(&source, &mut store.engine().lock(), &mut |table| {
-            done.push(table)
-        })
+        let report = copy_store(
+            &source,
+            crate::db::engine::testing::tables(&mut store.backend().lock()).unwrap(),
+            &mut |table| done.push(table),
+        )
         .unwrap();
         // Progress names every table the report does, once each and with
         // the same count, as the copy finishes it.
@@ -81,7 +83,11 @@ fn copied_store(source: &Path) -> (Database, CopyReport) {
 fn copied_core(source: &Path) -> (Database, CopyReport) {
     let source = LegacyDb::open(source).unwrap();
     let target = Database::open_in_memory().unwrap();
-    let report = copy_core(&source, &mut target.store().core().lock()).unwrap();
+    let report = copy_core(
+        &source,
+        crate::db::engine::testing::tables(&mut target.store().backend().lock()).unwrap(),
+    )
+    .unwrap();
     (target, report)
 }
 
@@ -489,14 +495,20 @@ fn rows_the_engine_cannot_keep_are_refused_and_reported() {
 fn the_copy_refuses_a_filled_target_and_a_source_it_cannot_read() {
     let (target, _) = copied_core(&fixture_path("legacy_v32.db"));
     let source = LegacyDb::open(&fixture_path("legacy_v32.db")).unwrap();
-    let again = copy_core(&source, &mut target.store().core().lock());
+    let again = copy_core(
+        &source,
+        crate::db::engine::testing::tables(&mut target.store().backend().lock()).unwrap(),
+    );
     assert!(matches!(again, Err(StoreError::Invalid(ref why)) if why.contains("not empty")));
 
     let old = scratch_copy("legacy_v32.db", "old");
     fixture(&old, "PRAGMA user_version = 3;").unwrap();
     let old = LegacyDb::open(&old).unwrap();
     let fresh = Database::open_in_memory().unwrap();
-    let refused = copy_core(&old, &mut fresh.store().core().lock());
+    let refused = copy_core(
+        &old,
+        crate::db::engine::testing::tables(&mut fresh.store().backend().lock()).unwrap(),
+    );
     assert!(matches!(refused, Err(StoreError::Invalid(ref why)) if why.contains("schema version")));
 }
 
@@ -516,6 +528,10 @@ fn the_whole_copy_refuses_a_target_with_any_group_filled() {
         WikiIndex::new(&store).set_meta("k", "v").unwrap();
     }
     let source = LegacyDb::open(&fixture_path("legacy_v32.db")).unwrap();
-    let refused = copy_store(&source, &mut target.store().engine().lock(), &mut |_| {});
+    let refused = copy_store(
+        &source,
+        crate::db::engine::testing::tables(&mut target.store().backend().lock()).unwrap(),
+        &mut |_| {},
+    );
     assert!(matches!(refused, Err(StoreError::Invalid(ref why)) if why.contains("not empty")));
 }

@@ -8,8 +8,8 @@
 //! which kind wins and how a traversal walks. A write queues its outbox
 //! entry as it lands, in a store that syncs (see [`Origin`]).
 
+use super::backend::BackendLock;
 use super::derived::Origin;
-use super::engine::EngineLock;
 use super::{Result, Store};
 use crate::entity::{Entity, EntityFact, EntityLinkedMemory, EntityListItem, RelationEdge};
 use std::collections::HashSet;
@@ -181,37 +181,39 @@ pub trait EntityStore {
 
 /// The knowledge-graph tables, on the engine's memories core.
 pub struct Entities<'c> {
-    core: &'c EngineLock,
+    backend: &'c BackendLock,
 }
 
 impl<'c> Entities<'c> {
     pub fn new(store: &'c Store<'_>) -> Self {
-        Self { core: store.core() }
+        Self {
+            backend: store.backend(),
+        }
     }
 
     /// See [`EntityStore::get`].
     pub fn get(&self, id: &str) -> Result<Option<Entity>> {
-        EntityStore::get(&*self.core.lock(), id)
+        EntityStore::get(&*self.backend.lock(), id)
     }
 
     /// See [`EntityStore::exists`].
     pub fn exists(&self, id: &str) -> Result<bool> {
-        EntityStore::exists(&*self.core.lock(), id)
+        EntityStore::exists(&*self.backend.lock(), id)
     }
 
     /// See [`EntityStore::all_oldest_first`].
     pub fn all_oldest_first(&self) -> Result<Vec<Entity>> {
-        EntityStore::all_oldest_first(&*self.core.lock())
+        EntityStore::all_oldest_first(&*self.backend.lock())
     }
 
     /// See [`EntityStore::all`].
     pub fn all(&self) -> Result<Vec<Entity>> {
-        EntityStore::all(&*self.core.lock())
+        EntityStore::all(&*self.backend.lock())
     }
 
     /// See [`EntityStore::insert`].
     pub fn insert(&self, entity: &Entity, node_id: Option<&str>) -> Result<()> {
-        EntityStore::insert(&mut *self.core.lock(), entity, node_id)
+        EntityStore::insert(&mut *self.backend.lock(), entity, node_id)
     }
 
     /// See [`EntityStore::set_kind_and_aliases`].
@@ -222,22 +224,22 @@ impl<'c> Entities<'c> {
         aliases: &[String],
         updated_at: &str,
     ) -> Result<()> {
-        EntityStore::set_kind_and_aliases(&mut *self.core.lock(), id, kind, aliases, updated_at)
+        EntityStore::set_kind_and_aliases(&mut *self.backend.lock(), id, kind, aliases, updated_at)
     }
 
     /// See [`EntityStore::count`].
     pub fn count(&self) -> Result<usize> {
-        EntityStore::count(&*self.core.lock())
+        EntityStore::count(&*self.backend.lock())
     }
 
     /// See [`EntityStore::page_by_mentions`].
     pub fn page_by_mentions(&self, limit: usize, offset: usize) -> Result<Vec<EntityListItem>> {
-        EntityStore::page_by_mentions(&*self.core.lock(), limit, offset)
+        EntityStore::page_by_mentions(&*self.backend.lock(), limit, offset)
     }
 
     /// See [`EntityStore::rename`].
     pub fn rename(&self, from: &str, to: &str) -> Result<()> {
-        EntityStore::rename(&mut *self.core.lock(), from, to)
+        EntityStore::rename(&mut *self.backend.lock(), from, to)
     }
 
     /// See [`EntityStore::set_merged`].
@@ -248,22 +250,22 @@ impl<'c> Entities<'c> {
         aliases: &[String],
         created_at: &str,
     ) -> Result<()> {
-        EntityStore::set_merged(&mut *self.core.lock(), id, kind, aliases, created_at)
+        EntityStore::set_merged(&mut *self.backend.lock(), id, kind, aliases, created_at)
     }
 
     /// See [`EntityStore::delete`].
     pub fn delete(&self, id: &str) -> Result<()> {
-        EntityStore::delete(&mut *self.core.lock(), id)
+        EntityStore::delete(&mut *self.backend.lock(), id)
     }
 
     /// See [`EntityStore::repoint`].
     pub fn repoint(&self, from: &str, to: &str) -> Result<()> {
-        EntityStore::repoint(&mut *self.core.lock(), from, to)
+        EntityStore::repoint(&mut *self.backend.lock(), from, to)
     }
 
     /// See [`EntityStore::links_oldest_first`].
     pub fn links_oldest_first(&self) -> Result<Vec<(String, String, String)>> {
-        EntityStore::links_oldest_first(&*self.core.lock())
+        EntityStore::links_oldest_first(&*self.backend.lock())
     }
 
     /// See [`EntityStore::link`].
@@ -275,7 +277,7 @@ impl<'c> Entities<'c> {
         origin: Origin,
     ) -> Result<bool> {
         EntityStore::link(
-            &mut *self.core.lock(),
+            &mut *self.backend.lock(),
             memory_id,
             entity_id,
             created_at,
@@ -285,12 +287,12 @@ impl<'c> Entities<'c> {
 
     /// See [`EntityStore::unlink`].
     pub fn unlink(&self, memory_id: &str, entity_id: &str) -> Result<bool> {
-        EntityStore::unlink(&mut *self.core.lock(), memory_id, entity_id)
+        EntityStore::unlink(&mut *self.backend.lock(), memory_id, entity_id)
     }
 
     /// See [`EntityStore::unlink_memory`].
     pub fn unlink_memory(&self, memory_id: &str) -> Result<()> {
-        EntityStore::unlink_memory(&mut *self.core.lock(), memory_id)
+        EntityStore::unlink_memory(&mut *self.backend.lock(), memory_id)
     }
 
     /// See [`EntityStore::linked_memories`].
@@ -299,37 +301,37 @@ impl<'c> Entities<'c> {
         entity_id: &str,
         limit: usize,
     ) -> Result<Vec<EntityLinkedMemory>> {
-        EntityStore::linked_memories(&*self.core.lock(), entity_id, limit)
+        EntityStore::linked_memories(&*self.backend.lock(), entity_id, limit)
     }
 
     /// See [`EntityStore::linked_memories_full`].
     pub fn linked_memories_full(&self, entity_id: &str) -> Result<Vec<crate::models::Memory>> {
-        EntityStore::linked_memories_full(&*self.core.lock(), entity_id)
+        EntityStore::linked_memories_full(&*self.backend.lock(), entity_id)
     }
 
     /// See [`EntityStore::linked_memory_count`].
     pub fn linked_memory_count(&self, entity_id: &str) -> Result<usize> {
-        EntityStore::linked_memory_count(&*self.core.lock(), entity_id)
+        EntityStore::linked_memory_count(&*self.backend.lock(), entity_id)
     }
 
     /// See [`EntityStore::shared_memory_count`].
     pub fn shared_memory_count(&self, a: &str, b: &str) -> Result<usize> {
-        EntityStore::shared_memory_count(&*self.core.lock(), a, b)
+        EntityStore::shared_memory_count(&*self.backend.lock(), a, b)
     }
 
     /// See [`EntityStore::facts_naming`].
     pub fn facts_naming(&self, canonical: &str, limit: usize) -> Result<Vec<EntityFact>> {
-        EntityStore::facts_naming(&*self.core.lock(), canonical, limit)
+        EntityStore::facts_naming(&*self.backend.lock(), canonical, limit)
     }
 
     /// See [`EntityStore::relations_oldest_first`].
     pub fn relations_oldest_first(&self) -> Result<Vec<StoredRelation>> {
-        EntityStore::relations_oldest_first(&*self.core.lock())
+        EntityStore::relations_oldest_first(&*self.backend.lock())
     }
 
     /// See [`EntityStore::insert_relation_or_ignore`].
     pub fn insert_relation_or_ignore(&self, row: &RelationRow<'_>, origin: Origin) -> Result<bool> {
-        EntityStore::insert_relation_or_ignore(&mut *self.core.lock(), row, origin)
+        EntityStore::insert_relation_or_ignore(&mut *self.backend.lock(), row, origin)
     }
 
     /// See [`EntityStore::relations_touching`].
@@ -339,22 +341,22 @@ impl<'c> Entities<'c> {
         relation: Option<&str>,
         hop: u32,
     ) -> Result<Vec<(String, RelationEdge)>> {
-        EntityStore::relations_touching(&*self.core.lock(), entity_ids, relation, hop)
+        EntityStore::relations_touching(&*self.backend.lock(), entity_ids, relation, hop)
     }
 
     /// See [`EntityStore::sync_view`].
     pub fn sync_view(&self, id: &str) -> Result<Option<EntitySyncView>> {
-        EntityStore::sync_view(&*self.core.lock(), id)
+        EntityStore::sync_view(&*self.backend.lock(), id)
     }
 
     /// See [`EntityStore::upsert_synced`].
     pub fn upsert_synced(&self, entity: &Entity, node_id: Option<&str>) -> Result<()> {
-        EntityStore::upsert_synced(&mut *self.core.lock(), entity, node_id)
+        EntityStore::upsert_synced(&mut *self.backend.lock(), entity, node_id)
     }
 
     /// See [`EntityStore::set_aliases`].
     pub fn set_aliases(&self, id: &str, aliases: &[String]) -> Result<()> {
-        EntityStore::set_aliases(&mut *self.core.lock(), id, aliases)
+        EntityStore::set_aliases(&mut *self.backend.lock(), id, aliases)
     }
 }
 
@@ -386,7 +388,9 @@ pub(crate) mod conformance {
 
     /// Every graph write and every read after. Run with sync on, the same
     /// writes are what [`tests`](super::tests) checks the outbox against.
-    pub(crate) fn the_graph_keeps_entities_links_and_relations<S: EntityStore + MemoryStore>(
+    pub(crate) fn the_graph_keeps_entities_links_and_relations<
+        S: EntityStore + MemoryStore + ?Sized,
+    >(
         store: &mut S,
     ) {
         use Origin::{Local, Sync};
@@ -685,7 +689,7 @@ mod tests {
         SyncState::new(&store)
             .set_flag("sync_enabled", "1")
             .unwrap();
-        conformance::the_graph_keeps_entities_links_and_relations(&mut *store.core().lock());
+        conformance::the_graph_keeps_entities_links_and_relations(&mut *store.backend().lock());
 
         let queued = |outbox: &Outbox<'_>| -> Vec<(String, serde_json::Value)> {
             outbox

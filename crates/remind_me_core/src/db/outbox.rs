@@ -8,7 +8,7 @@
 //! stay in [`crate::sync`]: when sync is enabled, the retention window,
 //! batch size, and how a payload decodes.
 
-use super::engine::EngineLock;
+use super::backend::BackendLock;
 use super::{Result, Store};
 
 /// One outbox row as a push reads it.
@@ -61,12 +61,14 @@ pub trait OutboxStore {
 
 /// The outbox, on the engine's memories core.
 pub struct Outbox<'c> {
-    core: &'c EngineLock,
+    backend: &'c BackendLock,
 }
 
 impl<'c> Outbox<'c> {
     pub fn new(store: &'c Store<'_>) -> Self {
-        Self { core: store.core() }
+        Self {
+            backend: store.backend(),
+        }
     }
 
     /// See [`OutboxStore::unsent_to`].
@@ -76,42 +78,42 @@ impl<'c> Outbox<'c> {
         after_id: i64,
         limit: usize,
     ) -> Result<Vec<OutboxEntry>> {
-        OutboxStore::unsent_to(&*self.core.lock(), remote_id, after_id, limit)
+        OutboxStore::unsent_to(&*self.backend.lock(), remote_id, after_id, limit)
     }
 
     /// See [`OutboxStore::pending_for`].
     pub fn pending_for(&self, remote_id: &str) -> Result<(i64, Option<String>)> {
-        OutboxStore::pending_for(&*self.core.lock(), remote_id)
+        OutboxStore::pending_for(&*self.backend.lock(), remote_id)
     }
 
     /// See [`OutboxStore::len`].
     pub fn len(&self) -> Result<i64> {
-        OutboxStore::len(&*self.core.lock())
+        OutboxStore::len(&*self.backend.lock())
     }
 
     /// See [`OutboxStore::unsent_count`].
     pub fn unsent_count(&self) -> Result<i64> {
-        OutboxStore::unsent_count(&*self.core.lock())
+        OutboxStore::unsent_count(&*self.backend.lock())
     }
 
     /// See [`OutboxStore::is_empty`].
     pub fn is_empty(&self) -> Result<bool> {
-        OutboxStore::is_empty(&*self.core.lock())
+        OutboxStore::is_empty(&*self.backend.lock())
     }
 
     /// See [`OutboxStore::prune`].
     pub fn prune(&self, cutoff: &str, done_by: &str) -> Result<usize> {
-        OutboxStore::prune(&mut *self.core.lock(), cutoff, done_by)
+        OutboxStore::prune(&mut *self.backend.lock(), cutoff, done_by)
     }
 
     /// See [`OutboxStore::clear`].
     pub fn clear(&self) -> Result<()> {
-        OutboxStore::clear(&mut *self.core.lock())
+        OutboxStore::clear(&mut *self.backend.lock())
     }
 
     /// See [`OutboxStore::backfill_everything`].
     pub fn backfill_everything(&self) -> Result<()> {
-        OutboxStore::backfill_everything(&mut *self.core.lock())
+        OutboxStore::backfill_everything(&mut *self.backend.lock())
     }
 }
 

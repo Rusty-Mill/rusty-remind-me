@@ -19,10 +19,10 @@ pub enum Origin {
     Sync,
 }
 
-/// Rebuild the engine's derived indexes (the memories' full-text and tag
+/// Rebuild the backend's derived indexes (the memories' full-text and tag
 /// indexes) from the stored rows. Everything here is derived, so a rebuild
 /// is always safe; it is how rows planted by a test fixture, or an index
 /// that was lost, become searchable.
 pub fn rebuild_indexes(store: &super::Store<'_>) -> super::Result<()> {
-    super::engine::memories::rebuild(&mut store.core().lock())
+    store.backend().lock().rebuild_indexes()
 }

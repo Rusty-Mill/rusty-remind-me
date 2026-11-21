@@ -1261,7 +1261,7 @@ pub(crate) fn keyword_hits(
         .filter(|(row, _)| row.admits(filter))
         .map(|(row, score)| (row.to_memory(), score))
         .filter(|(memory, _)| filter.narrowing.admits(memory))
-        .filter(|(memory, _)| vital_enough(filter, memory, now))
+        .filter(|(memory, _)| filter.vital_enough(memory, now))
         .take(limit)
         .collect())
 }
@@ -1281,27 +1281,8 @@ pub(crate) fn window_hits(tables: &EngineTables, filter: &KeywordFilter) -> Resu
         .into_iter()
         .map(|row| row.to_memory())
         .filter(|memory| filter.narrowing.admits(memory))
-        .filter(|memory| vital_enough(filter, memory, now))
+        .filter(|memory| filter.vital_enough(memory, now))
         .collect())
-}
-
-/// `filter`'s effective-vitality floors, as of `now`. Both halves of a search
-/// admit on this, so dormancy means the same thing to each (#564).
-pub(crate) fn vital_enough(
-    filter: &KeywordFilter,
-    memory: &Memory,
-    now: chrono::DateTime<chrono::Utc>,
-) -> bool {
-    use crate::vitality::{effective_vitality, is_dormant, never_dormant};
-    if !filter.hide_dormant && filter.min_effective_vitality.is_none() {
-        return true;
-    }
-    let vitality = effective_vitality(memory, now);
-    let awake = !filter.hide_dormant || !is_dormant(vitality) || never_dormant(memory);
-    awake
-        && filter
-            .min_effective_vitality
-            .is_none_or(|floor| vitality >= floor)
 }
 
 pub(crate) fn sensitive_ids(tables: &EngineTables) -> Result<HashSet<String>> {

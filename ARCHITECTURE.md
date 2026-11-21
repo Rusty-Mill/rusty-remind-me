@@ -217,16 +217,16 @@ actually uses — CLI subcommand processes, the MCP stdio loop, and the
 scheduler/watcher/promotion-nudge background threads (each a
 `std::thread::Builder::spawn` loop, not a `tokio` task; see §1 tenet 4)
 — without lock contention or data races:
-- The `Database` struct holds the engine tables behind an `Arc<EngineLock>`
-  and a `parking_lot::Mutex<()>` that `store()` takes, so one tool call runs
+- The `Database` struct holds its backend (the engine tables, in
+  production; ADR-0035 step 6) behind an `Arc<BackendLock>` and a `parking_lot::Mutex<()>` that `store()` takes, so one tool call runs
   at a time, as the SQLite connection's mutex once ordered them.
   `parking_lot` rather than `std::sync::Mutex`: its `lock()` returns the
   guard directly rather than a `LockResult`, since this codebase has no use
   for poisoning semantics.
 - A background thread takes a `SecondarySource` instead and works on the
-  shared engine tables without that lock; the tables lock per call, and a
-  page (`db::engine::page`) makes every other thread wait until an
-  importer's batch is whole.
+  shared backend without that lock; the backend locks per call, and a
+  transaction (`db::backend::Transaction`, a page on the engine) makes every
+  other thread wait until an importer's batch is whole.
 - Durability is the engine's: records are memory-mapped files, cross-store
   writes go through a redo journal that is fsync'd before it is applied, and
   the directory lock (`node.lock`) keeps a second process out.

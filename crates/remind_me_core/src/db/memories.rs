@@ -11,7 +11,7 @@
 //! writes, and how vitality is seeded, are decided there and handed over as
 //! a [`NewMemory`] or a field value.
 
-use super::engine::EngineLock;
+use super::backend::BackendLock;
 use super::{Result, Store};
 use crate::models::{Memory, UnannotatedMemory, UnclassifiedMemory};
 use crate::sync::TOMBSTONE_CONTENT;
@@ -243,6 +243,24 @@ pub struct KeywordFilter {
     pub exclude_raw: bool,
     pub narrowing: Narrowing,
     pub window: crate::time_window::TimeWindow,
+}
+
+impl KeywordFilter {
+    /// Whether `memory` clears this filter's effective-vitality floors, as
+    /// of `now`. Both halves of a search admit on this, so dormancy means
+    /// the same thing to each (#564). Pure logic: every backend shares it.
+    pub fn vital_enough(&self, memory: &Memory, now: chrono::DateTime<chrono::Utc>) -> bool {
+        use crate::vitality::{effective_vitality, is_dormant, never_dormant};
+        if !self.hide_dormant && self.min_effective_vitality.is_none() {
+            return true;
+        }
+        let vitality = effective_vitality(memory, now);
+        let awake = !self.hide_dormant || !is_dormant(vitality) || never_dormant(memory);
+        awake
+            && self
+                .min_effective_vitality
+                .is_none_or(|floor| vitality >= floor)
+    }
 }
 
 /// Categories holding a session's verbatim record rather than something
@@ -578,37 +596,39 @@ pub trait MemoryStore {
 
 /// The `memories` table of a [`Store`], one locked call at a time.
 pub struct Memories<'c> {
-    core: &'c EngineLock,
+    backend: &'c BackendLock,
 }
 
 impl<'c> Memories<'c> {
     pub fn new(store: &'c Store<'_>) -> Self {
-        Self { core: store.core() }
+        Self {
+            backend: store.backend(),
+        }
     }
 
     /// See [`MemoryStore::insert`].
     pub fn insert(&self, row: &NewMemory) -> Result<()> {
-        MemoryStore::insert(&mut *self.core.lock(), row)
+        MemoryStore::insert(&mut *self.backend.lock(), row)
     }
 
     /// See [`MemoryStore::insert_or_ignore`].
     pub fn insert_or_ignore(&self, row: &NewMemory) -> Result<bool> {
-        MemoryStore::insert_or_ignore(&mut *self.core.lock(), row)
+        MemoryStore::insert_or_ignore(&mut *self.backend.lock(), row)
     }
 
     /// See [`MemoryStore::upsert_synced`].
     pub fn upsert_synced(&self, row: &NewMemory) -> Result<()> {
-        MemoryStore::upsert_synced(&mut *self.core.lock(), row)
+        MemoryStore::upsert_synced(&mut *self.backend.lock(), row)
     }
 
     /// See [`MemoryStore::sync_view`].
     pub fn sync_view(&self, id: &str) -> Result<Option<SyncView>> {
-        MemoryStore::sync_view(&*self.core.lock(), id)
+        MemoryStore::sync_view(&*self.backend.lock(), id)
     }
 
     /// See [`MemoryStore::set_tags_and_metadata`].
     pub fn set_tags_and_metadata(&self, id: &str, tags: &[String], metadata: &Value) -> Result<()> {
-        MemoryStore::set_tags_and_metadata(&mut *self.core.lock(), id, tags, metadata)
+        MemoryStore::set_tags_and_metadata(&mut *self.backend.lock(), id, tags, metadata)
     }
 
     /// See [`MemoryStore::set_superseded_by`].
@@ -618,7 +638,7 @@ impl<'c> Memories<'c> {
         superseded_by: &str,
         updated_at: Option<&str>,
     ) -> Result<()> {
-        MemoryStore::set_superseded_by(&mut *self.core.lock(), id, superseded_by, updated_at)
+        MemoryStore::set_superseded_by(&mut *self.backend.lock(), id, superseded_by, updated_at)
     }
 
     /// See [`MemoryStore::supersede_import`].
@@ -629,7 +649,7 @@ impl<'c> Memories<'c> {
         updated_at: &str,
     ) -> Result<usize> {
         MemoryStore::supersede_import(
-            &mut *self.core.lock(),
+            &mut *self.backend.lock(),
             old_import_id,
             new_import_id,
             updated_at,
@@ -638,7 +658,7 @@ impl<'c> Memories<'c> {
 
     /// See [`MemoryStore::delete_capture_category`].
     pub fn delete_capture_category(&self, capture_id: &str, category: &str) -> Result<usize> {
-        MemoryStore::delete_capture_category(&mut *self.core.lock(), capture_id, category)
+        MemoryStore::delete_capture_category(&mut *self.backend.lock(), capture_id, category)
     }
 
     /// See [`MemoryStore::set_merged`].
@@ -651,7 +671,7 @@ impl<'c> Memories<'c> {
         updated_at: &str,
     ) -> Result<()> {
         MemoryStore::set_merged(
-            &mut *self.core.lock(),
+            &mut *self.backend.lock(),
             id,
             content,
             access_count,
@@ -662,12 +682,12 @@ impl<'c> Memories<'c> {
 
     /// See [`MemoryStore::set_vitality`].
     pub fn set_vitality(&self, id: &str, vitality: f64, status: &str) -> Result<()> {
-        MemoryStore::set_vitality(&mut *self.core.lock(), id, vitality, status)
+        MemoryStore::set_vitality(&mut *self.backend.lock(), id, vitality, status)
     }
 
     /// See [`MemoryStore::access_inputs`].
     pub fn access_inputs(&self, ids: &[String]) -> Result<Vec<AccessInputs>> {
-        MemoryStore::access_inputs(&*self.core.lock(), ids)
+        MemoryStore::access_inputs(&*self.backend.lock(), ids)
     }
 
     /// See [`MemoryStore::record_access`].
@@ -680,7 +700,7 @@ impl<'c> Memories<'c> {
         status: &str,
     ) -> Result<()> {
         MemoryStore::record_access(
-            &mut *self.core.lock(),
+            &mut *self.backend.lock(),
             id,
             accessed_at,
             access_count,
@@ -691,7 +711,7 @@ impl<'c> Memories<'c> {
 
     /// See [`MemoryStore::live_triples_except`].
     pub fn live_triples_except(&self, except_id: &str) -> Result<Vec<Triple>> {
-        MemoryStore::live_triples_except(&*self.core.lock(), except_id)
+        MemoryStore::live_triples_except(&*self.backend.lock(), except_id)
     }
 
     /// See [`MemoryStore::live_created_after`].
@@ -701,27 +721,27 @@ impl<'c> Memories<'c> {
         after_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<CreatedMemory>> {
-        MemoryStore::live_created_after(&*self.core.lock(), cutoff, after_id, limit)
+        MemoryStore::live_created_after(&*self.backend.lock(), cutoff, after_id, limit)
     }
 
     /// See [`MemoryStore::count_live_created_after`].
     pub fn count_live_created_after(&self, cutoff: &str, after_id: Option<&str>) -> Result<usize> {
-        MemoryStore::count_live_created_after(&*self.core.lock(), cutoff, after_id)
+        MemoryStore::count_live_created_after(&*self.backend.lock(), cutoff, after_id)
     }
 
     /// See [`MemoryStore::get_many`].
     pub fn get_many(&self, ids: &[String]) -> Result<Vec<Memory>> {
-        MemoryStore::get_many(&*self.core.lock(), ids)
+        MemoryStore::get_many(&*self.backend.lock(), ids)
     }
 
     /// See [`MemoryStore::exists`].
     pub fn exists(&self, id: &str) -> Result<bool> {
-        MemoryStore::exists(&*self.core.lock(), id)
+        MemoryStore::exists(&*self.backend.lock(), id)
     }
 
     /// See [`MemoryStore::sensitivity`].
     pub fn sensitivity(&self, id: &str) -> Result<Option<bool>> {
-        MemoryStore::sensitivity(&*self.core.lock(), id)
+        MemoryStore::sensitivity(&*self.backend.lock(), id)
     }
 
     /// See [`MemoryStore::exportable`].
@@ -731,27 +751,27 @@ impl<'c> Memories<'c> {
         category: Option<&str>,
         tags: &[String],
     ) -> Result<Vec<Memory>> {
-        MemoryStore::exportable(&*self.core.lock(), include_deleted, category, tags)
+        MemoryStore::exportable(&*self.backend.lock(), include_deleted, category, tags)
     }
 
     /// See [`MemoryStore::all_live`].
     pub fn all_live(&self) -> Result<Vec<Memory>> {
-        MemoryStore::all_live(&*self.core.lock())
+        MemoryStore::all_live(&*self.backend.lock())
     }
 
     /// See [`MemoryStore::live_of_type`].
     pub fn live_of_type(&self, memory_type: &str) -> Result<Vec<Memory>> {
-        MemoryStore::live_of_type(&*self.core.lock(), memory_type)
+        MemoryStore::live_of_type(&*self.backend.lock(), memory_type)
     }
 
     /// See [`MemoryStore::with_predicate_prefix`].
     pub fn with_predicate_prefix(&self, prefix: &str) -> Result<Vec<Memory>> {
-        MemoryStore::with_predicate_prefix(&*self.core.lock(), prefix)
+        MemoryStore::with_predicate_prefix(&*self.backend.lock(), prefix)
     }
 
     /// See [`MemoryStore::get_live`].
     pub fn get_live(&self, id: &str) -> Result<Option<Memory>> {
-        MemoryStore::get_live(&*self.core.lock(), id)
+        MemoryStore::get_live(&*self.backend.lock(), id)
     }
 
     /// See [`MemoryStore::list_page`].
@@ -761,22 +781,22 @@ impl<'c> Memories<'c> {
         limit: usize,
         offset: usize,
     ) -> Result<(usize, Vec<Memory>)> {
-        MemoryStore::list_page(&*self.core.lock(), filter, limit, offset)
+        MemoryStore::list_page(&*self.backend.lock(), filter, limit, offset)
     }
 
     /// See [`MemoryStore::apply_edit`].
     pub fn apply_edit(&self, id: &str, edit: &MemoryEdit) -> Result<()> {
-        MemoryStore::apply_edit(&mut *self.core.lock(), id, edit)
+        MemoryStore::apply_edit(&mut *self.backend.lock(), id, edit)
     }
 
     /// See [`MemoryStore::empty_tombstones`].
     pub fn empty_tombstones(&self) -> Result<usize> {
-        MemoryStore::empty_tombstones(&mut *self.core.lock())
+        MemoryStore::empty_tombstones(&mut *self.backend.lock())
     }
 
     /// See [`MemoryStore::delete_live`].
     pub fn delete_live(&self, id: &str, tombstone_at: Option<&str>) -> Result<bool> {
-        MemoryStore::delete_live(&mut *self.core.lock(), id, tombstone_at)
+        MemoryStore::delete_live(&mut *self.backend.lock(), id, tombstone_at)
     }
 
     /// See [`MemoryStore::of_type_page`].
@@ -785,7 +805,7 @@ impl<'c> Memories<'c> {
         memory_type: &str,
         limit: usize,
     ) -> Result<(usize, Vec<UnclassifiedMemory>)> {
-        MemoryStore::of_type_page(&*self.core.lock(), memory_type, limit)
+        MemoryStore::of_type_page(&*self.backend.lock(), memory_type, limit)
     }
 
     /// See [`MemoryStore::keyword_hits`].
@@ -795,17 +815,17 @@ impl<'c> Memories<'c> {
         filter: &KeywordFilter,
         limit: usize,
     ) -> Result<Vec<(Memory, f64)>> {
-        MemoryStore::keyword_hits(&*self.core.lock(), phrases, filter, limit)
+        MemoryStore::keyword_hits(&*self.backend.lock(), phrases, filter, limit)
     }
 
     /// See [`MemoryStore::window_hits`].
     pub fn window_hits(&self, filter: &KeywordFilter) -> Result<Vec<Memory>> {
-        MemoryStore::window_hits(&*self.core.lock(), filter)
+        MemoryStore::window_hits(&*self.backend.lock(), filter)
     }
 
     /// See [`MemoryStore::sensitive_ids`].
     pub fn sensitive_ids(&self) -> Result<HashSet<String>> {
-        MemoryStore::sensitive_ids(&*self.core.lock())
+        MemoryStore::sensitive_ids(&*self.backend.lock())
     }
 
     /// See [`MemoryStore::keyword_page`].
@@ -816,43 +836,43 @@ impl<'c> Memories<'c> {
         limit: usize,
         offset: usize,
     ) -> Result<(usize, Vec<Memory>)> {
-        MemoryStore::keyword_page(&*self.core.lock(), phrases, filter, limit, offset)
+        MemoryStore::keyword_page(&*self.backend.lock(), phrases, filter, limit, offset)
     }
 
     /// See [`MemoryStore::unannotated_page`].
     pub fn unannotated_page(&self, limit: usize) -> Result<(usize, Vec<UnannotatedMemory>)> {
-        MemoryStore::unannotated_page(&*self.core.lock(), limit)
+        MemoryStore::unannotated_page(&*self.backend.lock(), limit)
     }
 
     /// See [`MemoryStore::with_code_refs`].
     pub fn with_code_refs(&self) -> Result<Vec<(String, String, String)>> {
-        MemoryStore::with_code_refs(&*self.core.lock())
+        MemoryStore::with_code_refs(&*self.backend.lock())
     }
 
     /// See [`MemoryStore::with_valid_until`].
     pub fn with_valid_until(&self) -> Result<Vec<(String, String, String)>> {
-        MemoryStore::with_valid_until(&*self.core.lock())
+        MemoryStore::with_valid_until(&*self.backend.lock())
     }
 
     /// See [`MemoryStore::capture_links`].
     pub fn capture_links(&self, id: &str) -> Result<(Vec<String>, Vec<String>)> {
-        MemoryStore::capture_links(&*self.core.lock(), id)
+        MemoryStore::capture_links(&*self.backend.lock(), id)
     }
 
     /// See [`MemoryStore::set_ingest_marker`].
     pub fn set_ingest_marker(&self, doc_id: &str, marker: &str) -> Result<usize> {
-        MemoryStore::set_ingest_marker(&mut *self.core.lock(), doc_id, marker)
+        MemoryStore::set_ingest_marker(&mut *self.backend.lock(), doc_id, marker)
     }
 
     /// Live memory `id`'s category, or `None` when it is missing or deleted.
     pub fn live_category(&self, id: &str) -> Result<Option<String>> {
-        Ok(MemoryStore::get_live(&*self.core.lock(), id)?.map(|m| m.category))
+        Ok(MemoryStore::get_live(&*self.backend.lock(), id)?.map(|m| m.category))
     }
 
     /// The ids of the memories linked to entity `id`: see
     /// [`EntityStore::linked_ids`](crate::db::entities::EntityStore::linked_ids).
     pub fn linked_ids(&self, entity_id: &str) -> Result<HashSet<String>> {
-        crate::db::entities::EntityStore::linked_ids(&*self.core.lock(), entity_id)
+        crate::db::entities::EntityStore::linked_ids(&*self.backend.lock(), entity_id)
     }
 }
 

@@ -9,6 +9,9 @@
 //!
 //! Not part of the node's API: it exists for this crate's tests and the
 //! integration tests beside it.
+//!
+//! Raw rows are the engine's own, so these helpers reach past the ports
+//! (ADR-0035) and refuse on any other backend.
 
 use crate::db::engine;
 use crate::db::{Result, Store, StoreError};
@@ -96,7 +99,11 @@ fn memory_column_name(column: &str) -> Result<&str> {
 /// store's own error.
 pub fn memory_column(store: &Store<'_>, id: &str, column: &str) -> Result<Option<Value>> {
     let column = memory_column_name(column)?;
-    engine::testing::memory_column(&store.core().lock(), id, column)
+    engine::testing::memory_column(
+        engine::testing::tables(&mut store.backend().lock())?,
+        id,
+        column,
+    )
 }
 
 /// [`memory_column`] as text: `None` for NULL or no such memory.
@@ -133,12 +140,17 @@ pub fn set_memory_column(
     value: impl Into<Value>,
 ) -> Result<usize> {
     let column = memory_column_name(column)?;
-    engine::testing::set_memory_column(&mut store.core().lock(), id, column, value.into())
+    engine::testing::set_memory_column(
+        engine::testing::tables(&mut store.backend().lock())?,
+        id,
+        column,
+        value.into(),
+    )
 }
 
 /// Every memory id, deleted or not, sorted.
 pub fn memory_ids(store: &Store<'_>) -> Result<Vec<String>> {
-    engine::testing::memory_ids(&store.core().lock())
+    engine::testing::memory_ids(engine::testing::tables(&mut store.backend().lock())?)
 }
 
 /// Move memory `from` to id `to`, every other column kept, as `UPDATE
@@ -150,19 +162,26 @@ pub fn memory_ids(store: &Store<'_>) -> Result<Vec<String>> {
 ///
 /// [`StoreError::Invalid`] when `to` is taken, or the store's own error.
 pub fn relabel_memory(store: &Store<'_>, from: &str, to: &str) -> Result<usize> {
-    engine::testing::relabel_memory(&mut store.core().lock(), from, to)
+    engine::testing::relabel_memory(
+        engine::testing::tables(&mut store.backend().lock())?,
+        from,
+        to,
+    )
 }
 
 /// How many rows `table` holds.
 pub fn count(store: &Store<'_>, table: Table) -> Result<i64> {
-    engine::testing::count(&store.core().lock(), table)
+    engine::testing::count(engine::testing::tables(&mut store.backend().lock())?, table)
 }
 
 /// The raw `query` of every feedback event logged for `memory_id`, oldest
 /// first (ties by id). [`crate::db::feedback::Feedback::events`] carries
 /// only the tokens.
 pub fn feedback_queries(store: &Store<'_>, memory_id: &str) -> Result<Vec<String>> {
-    engine::testing::feedback_queries(&store.core().lock(), memory_id)
+    engine::testing::feedback_queries(
+        engine::testing::tables(&mut store.backend().lock())?,
+        memory_id,
+    )
 }
 
 /// The weight of the `memory_associations` row stored under exactly the
@@ -170,7 +189,7 @@ pub fn feedback_queries(store: &Store<'_>, memory_id: &str) -> Result<Vec<String
 /// [`crate::db::related::Related::co_retrieved`] reads only pairs whose
 /// other memory is stored and live.
 pub fn association_weight(store: &Store<'_>, a: &str, b: &str) -> Result<Option<i64>> {
-    engine::testing::association_weight(&store.core().lock(), a, b)
+    engine::testing::association_weight(engine::testing::tables(&mut store.backend().lock())?, a, b)
 }
 
 /// One `sync_outbox` row, as [`outbox_rows`] reads it.
@@ -193,7 +212,7 @@ pub fn mark_store_syncing(store: &Store<'_>) -> Result<()> {
 
 /// Every outbox row, oldest id first.
 pub fn outbox_rows(store: &Store<'_>) -> Result<Vec<OutboxRow>> {
-    engine::testing::outbox_rows(&store.core().lock())
+    engine::testing::outbox_rows(engine::testing::tables(&mut store.backend().lock())?)
 }
 
 /// Overwrite outbox row `id`'s `column` (`created_at` or `sent_at`) with
@@ -208,12 +227,17 @@ pub fn set_outbox_column(store: &Store<'_>, id: i64, column: &str, value: &str) 
             "sync_outbox.{column} cannot be set here"
         )));
     }
-    engine::testing::set_outbox_column(&mut store.core().lock(), id, column, value)
+    engine::testing::set_outbox_column(
+        engine::testing::tables(&mut store.backend().lock())?,
+        id,
+        column,
+        value,
+    )
 }
 
 /// Every send marker as `(remote, outbox id, sent at)`, sorted.
 pub fn sends(store: &Store<'_>) -> Result<Vec<(String, i64, String)>> {
-    engine::outbox::send_markers(&store.core().lock())
+    engine::outbox::send_markers(engine::testing::tables(&mut store.backend().lock())?)
 }
 
 /// Queue a raw outbox entry for `key`, created at `created_at`, as an
@@ -226,7 +250,7 @@ pub fn queue_outbox(
     created_at: &str,
 ) -> Result<i64> {
     engine::outbox::queue_at(
-        &mut store.core().lock(),
+        engine::testing::tables(&mut store.backend().lock())?,
         key,
         operation,
         payload,

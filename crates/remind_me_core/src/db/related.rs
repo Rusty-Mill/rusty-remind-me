@@ -11,7 +11,7 @@
 //! [`RelatedStore`] is the port (ADR-0035); the engine's adapter is in
 //! `db::engine::related`. [`Related`] is what callers take.
 
-use super::engine::EngineLock;
+use super::backend::BackendLock;
 use super::{Result, Store};
 
 /// A live memory another one points at, with the fields expansion shows.
@@ -77,17 +77,19 @@ pub trait RelatedStore {
 
 /// The expansion table and reads of a [`Store`], one locked call at a time.
 pub struct Related<'c> {
-    core: &'c EngineLock,
+    backend: &'c BackendLock,
 }
 
 impl<'c> Related<'c> {
     pub fn new(store: &'c Store<'_>) -> Self {
-        Self { core: store.core() }
+        Self {
+            backend: store.backend(),
+        }
     }
 
     /// See [`RelatedStore::bump_pair`].
     pub fn bump_pair(&self, a: &str, b: &str, now: &str, max_weight: i64) -> Result<()> {
-        RelatedStore::bump_pair(&mut *self.core.lock(), a, b, now, max_weight)
+        RelatedStore::bump_pair(&mut *self.backend.lock(), a, b, now, max_weight)
     }
 
     /// See [`RelatedStore::via_entities`].
@@ -95,17 +97,17 @@ impl<'c> Related<'c> {
         if seed_ids.is_empty() {
             return Ok(Vec::new());
         }
-        RelatedStore::via_entities(&*self.core.lock(), seed_ids)
+        RelatedStore::via_entities(&*self.backend.lock(), seed_ids)
     }
 
     /// See [`RelatedStore::unlink_memory`].
     pub fn unlink_memory(&self, memory_id: &str) -> Result<()> {
-        RelatedStore::unlink_memory(&mut *self.core.lock(), memory_id)
+        RelatedStore::unlink_memory(&mut *self.backend.lock(), memory_id)
     }
 
     /// See [`RelatedStore::document_window`].
     pub fn document_window(&self, doc_id: &str, from: i64, to: i64) -> Result<Vec<DocumentChunk>> {
-        RelatedStore::document_window(&*self.core.lock(), doc_id, from, to)
+        RelatedStore::document_window(&*self.backend.lock(), doc_id, from, to)
     }
 
     /// See [`RelatedStore::co_retrieved`].
@@ -113,7 +115,7 @@ impl<'c> Related<'c> {
         if seed_ids.is_empty() {
             return Ok(Vec::new());
         }
-        RelatedStore::co_retrieved(&*self.core.lock(), seed_ids)
+        RelatedStore::co_retrieved(&*self.backend.lock(), seed_ids)
     }
 }
 

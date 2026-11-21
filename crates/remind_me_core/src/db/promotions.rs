@@ -8,7 +8,7 @@
 //! the persona vitality floor, what makes a source unusable, and that
 //! demotion is a read-time judgement.
 
-use super::engine::EngineLock;
+use super::backend::BackendLock;
 use super::{Result, Store};
 
 /// A memory's id and content.
@@ -132,22 +132,24 @@ pub trait PromotionStore {
 
 /// The promotion table and reads, on the engine's memories core.
 pub struct Promotions<'c> {
-    core: &'c EngineLock,
+    backend: &'c BackendLock,
 }
 
 impl<'c> Promotions<'c> {
     pub fn new(store: &'c Store<'_>) -> Self {
-        Self { core: store.core() }
+        Self {
+            backend: store.backend(),
+        }
     }
 
     /// See [`PromotionStore::undecomposed_dialogs`].
     pub fn undecomposed_dialogs(&self, limit: usize) -> Result<Vec<IdContent>> {
-        PromotionStore::undecomposed_dialogs(&*self.core.lock(), limit)
+        PromotionStore::undecomposed_dialogs(&*self.backend.lock(), limit)
     }
 
     /// See [`PromotionStore::count_undecomposed_dialogs`].
     pub fn count_undecomposed_dialogs(&self) -> Result<usize> {
-        PromotionStore::count_undecomposed_dialogs(&*self.core.lock())
+        PromotionStore::count_undecomposed_dialogs(&*self.backend.lock())
     }
 
     /// See [`PromotionStore::entity_fact_groups`].
@@ -160,7 +162,7 @@ impl<'c> Promotions<'c> {
         limit: usize,
     ) -> Result<Vec<EntityFactGroup>> {
         PromotionStore::entity_fact_groups(
-            &*self.core.lock(),
+            &*self.backend.lock(),
             category,
             rung,
             min_facts,
@@ -178,7 +180,7 @@ impl<'c> Promotions<'c> {
         min_sources: usize,
     ) -> Result<usize> {
         PromotionStore::count_entity_fact_groups(
-            &*self.core.lock(),
+            &*self.backend.lock(),
             category,
             rung,
             min_facts,
@@ -194,32 +196,32 @@ impl<'c> Promotions<'c> {
         rung: &str,
         limit: usize,
     ) -> Result<Vec<ScoredMemory>> {
-        PromotionStore::ready_scenarios(&*self.core.lock(), category, floor, rung, limit)
+        PromotionStore::ready_scenarios(&*self.backend.lock(), category, floor, rung, limit)
     }
 
     /// See [`PromotionStore::count_ready_scenarios`].
     pub fn count_ready_scenarios(&self, category: &str, floor: f64, rung: &str) -> Result<usize> {
-        PromotionStore::count_ready_scenarios(&*self.core.lock(), category, floor, rung)
+        PromotionStore::count_ready_scenarios(&*self.backend.lock(), category, floor, rung)
     }
 
     /// See [`PromotionStore::live_source_sensitivity`].
     pub fn live_source_sensitivity(&self, id: &str) -> Result<Option<bool>> {
-        PromotionStore::live_source_sensitivity(&*self.core.lock(), id)
+        PromotionStore::live_source_sensitivity(&*self.backend.lock(), id)
     }
 
     /// See [`PromotionStore::promoted_from`].
     pub fn promoted_from(&self, source_id: &str, rung: &str) -> Result<Vec<String>> {
-        PromotionStore::promoted_from(&*self.core.lock(), source_id, rung)
+        PromotionStore::promoted_from(&*self.backend.lock(), source_id, rung)
     }
 
     /// See [`PromotionStore::sources_at`].
     pub fn sources_at(&self, promoted_id: &str, rung: &str) -> Result<Vec<String>> {
-        PromotionStore::sources_at(&*self.core.lock(), promoted_id, rung)
+        PromotionStore::sources_at(&*self.backend.lock(), promoted_id, rung)
     }
 
     /// See [`PromotionStore::is_live`].
     pub fn is_live(&self, id: &str) -> Result<bool> {
-        PromotionStore::is_live(&*self.core.lock(), id)
+        PromotionStore::is_live(&*self.backend.lock(), id)
     }
 
     /// See [`PromotionStore::record`].
@@ -231,7 +233,7 @@ impl<'c> Promotions<'c> {
         promoted_at: &str,
     ) -> Result<()> {
         PromotionStore::record(
-            &mut *self.core.lock(),
+            &mut *self.backend.lock(),
             promoted_id,
             source_id,
             rung,
@@ -241,27 +243,27 @@ impl<'c> Promotions<'c> {
 
     /// See [`PromotionStore::sources_of`].
     pub fn sources_of(&self, memory_id: &str) -> Result<Vec<String>> {
-        PromotionStore::sources_of(&*self.core.lock(), memory_id)
+        PromotionStore::sources_of(&*self.backend.lock(), memory_id)
     }
 
     /// See [`PromotionStore::derived_from`].
     pub fn derived_from(&self, memory_id: &str) -> Result<Vec<String>> {
-        PromotionStore::derived_from(&*self.core.lock(), memory_id)
+        PromotionStore::derived_from(&*self.backend.lock(), memory_id)
     }
 
     /// See [`PromotionStore::surviving_sources`].
     pub fn surviving_sources(&self, promoted_id: &str) -> Result<usize> {
-        PromotionStore::surviving_sources(&*self.core.lock(), promoted_id)
+        PromotionStore::surviving_sources(&*self.backend.lock(), promoted_id)
     }
 
     /// See [`PromotionStore::statements_by_vitality`].
     pub fn statements_by_vitality(&self, category: &str) -> Result<Vec<StatementRow>> {
-        PromotionStore::statements_by_vitality(&*self.core.lock(), category)
+        PromotionStore::statements_by_vitality(&*self.backend.lock(), category)
     }
 
     /// See [`PromotionStore::statements_newest_first`].
     pub fn statements_newest_first(&self, category: &str) -> Result<Vec<StatementRow>> {
-        PromotionStore::statements_newest_first(&*self.core.lock(), category)
+        PromotionStore::statements_newest_first(&*self.backend.lock(), category)
     }
 }
 
@@ -473,7 +475,7 @@ mod tests {
     fn the_facade_reads_back_what_it_records() {
         let db = Database::open_in_memory().unwrap();
         let store = db.store();
-        seed_corpus(&mut *store.core().lock());
+        seed_corpus(&mut *store.backend().lock());
         let promotions = Promotions::new(&store);
         promotions.record("sc1", "f4", "scenario", NOW).unwrap();
         assert_eq!(promotions.sources_at("sc1", "scenario").unwrap(), ["f4"]);
