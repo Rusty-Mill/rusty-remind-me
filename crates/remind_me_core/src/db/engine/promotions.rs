@@ -124,6 +124,7 @@ fn column(
 /// by id descending.
 fn undecomposed_dialog_rows(core: &CoreTables) -> Vec<MemoryRow> {
     let mut rows: Vec<MemoryRow> = super::curation::undecomposed_captures(core)
+        .into_iter()
         .filter(|row| row.category == "dialog")
         .collect();
     rows.sort_by(|a, b| (&b.created_at, &b.id).cmp(&(&a.created_at, &a.id)));

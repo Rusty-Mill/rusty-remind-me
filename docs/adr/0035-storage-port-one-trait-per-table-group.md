@@ -109,17 +109,27 @@ backend. R3 measures on real data; this set stays the regression gate.
 - **The four reaches.** `derived::rebuild_indexes`, `backup` and
   `Database::compact_store` go through the backend. The vitality rule is
   `KeywordFilter::vital_enough`, pure logic beside the filter. Only
-  `crate::testing` (and engine-only tests) still reach engine rows: they
-  find the engine through `Any` (`engine::testing::tables`) and refuse
-  with `StoreError::Invalid` on any other backend. Opening and upgrading
-  an old `memory.db` stays engine-only.
+  engine-only tests still reach engine rows, through `Any`
+  (`engine::testing::tables`); `crate::testing` goes through the
+  `TestRows` port (below). Opening and upgrading an old `memory.db` stays
+  engine-only.
 
-**What a second backend still needs before the whole suite runs on it:**
-an adapter for every port, and a choice for the tests that plant raw rows
-through `crate::testing` (they will refuse, so R3 either gives those
-helpers a port or reports those tests as engine-only). The integration
-tests open `Database::open_in_memory`, which is the engine; R3's harness
-picks the backend.
+**The second backend (R3, 2026-11-21).** `db::sqlite::SqliteTables`
+implements every port and `Backend` over one SQLite file (D43, D44); each
+port's conformance suite runs on it. The raw-row helpers in
+`crate::testing` go through a small `testing::TestRows` port that each
+backend implements over its own rows, reached through the defaulted
+`Backend::test_rows` (D42), so the whole suite runs on any backend that
+has it. With `Database::open_in_memory` and a fresh `Database::open`
+pointed at SQLite, 2,710 of 2,725 tests pass; the 15 that fail test the
+engine itself (journal fault injection, the legacy copy, the engine's
+directory layout, one engine internal).
+
+This adapter is scaffolding, not benchmark parity: wiki pages and dialog
+bodies are stored inline in its tables, which is not the blob-store body
+layout D40, D41 and D43 set as the baseline. Before any number is scored,
+every candidate gets the same body layout, and G8 is checked by restoring
+a self-contained backup package in isolation.
 
 ## Not decided here
 

@@ -78,7 +78,7 @@ fn events_of(core: &CoreTables, memory_id: &str) -> Vec<FeedbackRecord> {
 
 /// Days from `timestamp` to `now`, as `julianday('now') - julianday(ts)`
 /// computes them, or `None` where SQLite's `julianday` would be `NULL`.
-fn days_since(timestamp: &str, now: chrono::DateTime<chrono::Utc>) -> Option<f64> {
+pub(crate) fn days_since(timestamp: &str, now: chrono::DateTime<chrono::Utc>) -> Option<f64> {
     use chrono::{NaiveDate, NaiveDateTime};
     let at = chrono::DateTime::parse_from_rfc3339(timestamp)
         .map(|t| t.naive_utc())

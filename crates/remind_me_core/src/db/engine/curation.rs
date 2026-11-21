@@ -14,15 +14,15 @@ use crate::models::{ContradictionSide, Memory};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-fn live(row: &MemoryRow) -> bool {
+pub(crate) fn live(row: &MemoryRow) -> bool {
     row.deleted_at.is_none() && row.superseded_by.is_none()
 }
 
-fn newest_first(rows: &mut [MemoryRow]) {
+pub(crate) fn newest_first(rows: &mut [MemoryRow]) {
     rows.sort_by(|a, b| (&b.created_at, &b.id).cmp(&(&a.created_at, &a.id)));
 }
 
-fn tags(row: &MemoryRow) -> Vec<String> {
+pub(crate) fn tags(row: &MemoryRow) -> Vec<String> {
     serde_json::from_str(&row.tags).unwrap_or_default()
 }
 
@@ -44,9 +44,9 @@ fn drawn_from(row: &MemoryRow) -> String {
 
 /// Up to which revision each capture has been decomposed: the newest
 /// [`drawn_from`] among the memories naming it as their `source_capture_id`.
-fn decomposed_at(core: &CoreTables) -> HashMap<String, String> {
+fn decomposed_at(rows: impl Iterator<Item = MemoryRow>) -> HashMap<String, String> {
     let mut newest: HashMap<String, String> = HashMap::new();
-    for row in memories::rows(core) {
+    for row in rows {
         let Some(capture) = row.source_capture_id.clone() else {
             continue;
         };
@@ -60,9 +60,9 @@ fn decomposed_at(core: &CoreTables) -> HashMap<String, String> {
 }
 
 /// The newest `updated_at` among each capture's own rows.
-fn capture_revisions(core: &CoreTables) -> HashMap<String, String> {
+pub(crate) fn capture_revisions(rows: impl Iterator<Item = MemoryRow>) -> HashMap<String, String> {
     let mut newest: HashMap<String, String> = HashMap::new();
-    for row in memories::rows(core) {
+    for row in rows {
         let (Some(capture), None) = (row.capture_id, row.source_capture_id) else {
             continue;
         };
@@ -85,17 +85,34 @@ pub(crate) fn needs_decomposing(row: &MemoryRow, decomposed: &HashMap<String, St
 }
 
 /// The captures still needing decomposition, as [`needs_decomposing`] says.
-pub(crate) fn undecomposed_captures(core: &CoreTables) -> impl Iterator<Item = MemoryRow> + '_ {
-    let decomposed = decomposed_at(core);
-    memories::rows(core)
+pub(crate) fn undecomposed_captures(core: &CoreTables) -> Vec<MemoryRow> {
+    undecomposed_in(|| memories::rows(core))
+}
+
+/// [`undecomposed_captures`] over any backend's rows, read twice.
+pub(crate) fn undecomposed_in<I: Iterator<Item = MemoryRow>>(
+    rows: impl Fn() -> I,
+) -> Vec<MemoryRow> {
+    let decomposed = decomposed_at(rows());
+    rows()
         .filter(|row| row.deleted_at.is_none() && row.source_capture_id.is_none())
-        .filter(move |row| needs_decomposing(row, &decomposed))
+        .filter(|row| needs_decomposing(row, &decomposed))
+        .collect()
 }
 
 /// Captures, not themselves decomposed facts and not deleted, that need
 /// decomposing and last changed at or before `settled_before`, newest first.
 fn undecomposed_rows(core: &CoreTables, settled_before: Option<&str>) -> Vec<MemoryRow> {
-    let mut rows: Vec<MemoryRow> = undecomposed_captures(core)
+    undecomposed_rows_in(|| memories::rows(core), settled_before)
+}
+
+/// [`undecomposed_rows`] over any backend's rows.
+pub(crate) fn undecomposed_rows_in<I: Iterator<Item = MemoryRow>>(
+    rows: impl Fn() -> I,
+    settled_before: Option<&str>,
+) -> Vec<MemoryRow> {
+    let mut rows: Vec<MemoryRow> = undecomposed_in(rows)
+        .into_iter()
         .filter(|row| settled_before.is_none_or(|cutoff| row.updated_at.as_str() <= cutoff))
         .collect();
     newest_first(&mut rows);
@@ -106,21 +123,28 @@ fn undecomposed_rows(core: &CoreTables, settled_before: Option<&str>) -> Vec<Mem
 
 /// The ids memories name as `metadata.normalized_from` (text only, as
 /// `json_extract(…) = m.id` compares).
-fn normalized_ids(core: &CoreTables) -> HashSet<String> {
-    memories::rows(core)
-        .filter_map(|row| {
-            let metadata: Value = serde_json::from_str(&row.metadata).ok()?;
-            metadata
-                .get("normalized_from")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .collect()
+fn normalized_ids(rows: impl Iterator<Item = MemoryRow>) -> HashSet<String> {
+    rows.filter_map(|row| {
+        let metadata: Value = serde_json::from_str(&row.metadata).ok()?;
+        metadata
+            .get("normalized_from")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    })
+    .collect()
 }
 
 fn unnormalized_rows(core: &CoreTables, sources: &[&str]) -> Vec<MemoryRow> {
-    let normalized = normalized_ids(core);
-    let mut rows: Vec<MemoryRow> = memories::rows(core)
+    unnormalized_in(|| memories::rows(core), sources)
+}
+
+/// [`unnormalized_rows`] over any backend's rows.
+pub(crate) fn unnormalized_in<I: Iterator<Item = MemoryRow>>(
+    rows: impl Fn() -> I,
+    sources: &[&str],
+) -> Vec<MemoryRow> {
+    let normalized = normalized_ids(rows());
+    let mut rows: Vec<MemoryRow> = rows()
         .filter(|row| live(row) && sources.contains(&row.source.as_str()))
         .filter(|row| !normalized.contains(&row.id))
         .collect();
@@ -136,7 +160,7 @@ fn folded(text: &str) -> String {
 }
 
 /// Whether both rows have a subject and predicate and they match folded.
-fn same_claim(a: &MemoryRow, b: &MemoryRow) -> bool {
+pub(crate) fn same_claim(a: &MemoryRow, b: &MemoryRow) -> bool {
     match (&a.subject, &a.predicate, &b.subject, &b.predicate) {
         (Some(sa), Some(pa), Some(sb), Some(pb)) => {
             folded(sa) == folded(sb) && folded(pa) == folded(pb)
@@ -157,12 +181,24 @@ fn conflicting_objects(a: &MemoryRow, b: &MemoryRow) -> bool {
 
 /// Every candidate pair `(id_a, id_b)` with `id_a < id_b`, in order.
 fn pairs(core: &CoreTables, max_fanout: i64) -> BTreeSet<(String, String)> {
+    pairs_in(
+        super::graph::link_pairs(core),
+        |id| memories::row(core, id),
+        max_fanout,
+    )
+}
+
+/// [`pairs`] over any backend's links `(memory id, entity id)` and rows.
+pub(crate) fn pairs_in(
+    links: Vec<(String, String)>,
+    row: impl Fn(&str) -> Option<MemoryRow>,
+    max_fanout: i64,
+) -> BTreeSet<(String, String)> {
     let mut by_entity: HashMap<String, Vec<String>> = HashMap::new();
-    for (memory_id, entity_id) in super::graph::link_pairs(core) {
+    for (memory_id, entity_id) in links {
         by_entity.entry(entity_id).or_default().push(memory_id);
     }
-    let eligible =
-        |id: &str| memories::row(core, id).filter(|row| live(row) && row.category != "dialog");
+    let eligible = |id: &str| row(id).filter(|row| live(row) && row.category != "dialog");
     let mut found = BTreeSet::new();
     for ids in by_entity.values() {
         if i64::try_from(ids.len()).unwrap_or(i64::MAX) > max_fanout {
@@ -186,7 +222,7 @@ fn pairs(core: &CoreTables, max_fanout: i64) -> BTreeSet<(String, String)> {
 /// resolved as reverted, abandoned or superseded. Sensitive rows are left
 /// out because the result rides an ordinary write's response, which must not
 /// surface them unasked.
-fn standing_decision(row: &MemoryRow) -> bool {
+pub(crate) fn standing_decision(row: &MemoryRow) -> bool {
     live(row)
         && !row.sensitive
         && row.memory_type == "decision"
@@ -200,7 +236,7 @@ fn standing_decision(row: &MemoryRow) -> bool {
 /// Two rows with no project are in the same (unnamed) one; a row with a
 /// project and one without are not, so a claim in one repository is never
 /// matched against a same-named claim in another.
-fn same_project(a: &MemoryRow, b: &MemoryRow) -> bool {
+pub(crate) fn same_project(a: &MemoryRow, b: &MemoryRow) -> bool {
     match (&a.project, &b.project) {
         (Some(pa), Some(pb)) => pa.eq_ignore_ascii_case(pb),
         (None, None) => true,
@@ -232,7 +268,7 @@ impl CurationStore for EngineTables {
 
     fn undecomposed(&self, limit: usize, settled_before: Option<&str>) -> Result<Vec<CaptureRow>> {
         let core = core_ref(self)?;
-        let revisions = capture_revisions(core);
+        let revisions = capture_revisions(memories::rows(core));
         Ok(undecomposed_rows(core, settled_before)
             .into_iter()
             .take(limit)

@@ -125,7 +125,7 @@ record!(
 
 /// Now, in the shape SQLite's `strftime('%Y-%m-%dT%H:%M:%f000', 'now') ||
 /// '+00:00'` gives every outbox stamp.
-fn now_iso() -> String {
+pub(crate) fn now_iso() -> String {
     chrono::Utc::now()
         .format("%Y-%m-%dT%H:%M:%S%.3f000+00:00")
         .to_string()

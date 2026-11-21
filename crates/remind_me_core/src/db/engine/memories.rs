@@ -297,7 +297,7 @@ impl MemoryRow {
     /// The tags `memory_tags` holds for this row: every text value
     /// `json_each(tags)` yields, which for an object is its values and for
     /// a lone string is itself. None when the text is not JSON.
-    fn tag_values(&self) -> Vec<String> {
+    pub(crate) fn tag_values(&self) -> Vec<String> {
         let text = |v: &Value| v.as_str().map(str::to_string);
         match serde_json::from_str::<Value>(&self.tags) {
             Ok(Value::Array(items)) => items.iter().filter_map(text).collect(),
@@ -329,13 +329,13 @@ impl MemoryRow {
             && self.object.is_none()
     }
 
-    fn is_live(&self) -> bool {
+    pub(crate) fn is_live(&self) -> bool {
         self.deleted_at.is_none() && self.superseded_by.is_none()
     }
 
     /// The parsed metadata, or `None` when it is not JSON: where SQLite's
     /// `json_extract` would fail, the engine reads no value.
-    fn metadata_value(&self) -> Option<Value> {
+    pub(crate) fn metadata_value(&self) -> Option<Value> {
         serde_json::from_str(&self.metadata).ok()
     }
 }
@@ -517,7 +517,7 @@ pub(crate) fn write(
 
 /// The outbox operation a write from `origin` that turns `before` into
 /// `after` queues, if any.
-fn queued_operation(
+pub(crate) fn queued_operation(
     before: Option<&MemoryRow>,
     after: &MemoryRow,
     origin: Origin,
@@ -719,75 +719,85 @@ pub(crate) fn set_ingest_marker(
         .map(|record| record.row.id)
         .collect();
     for id in &ids {
-        update(tables, id, Origin::Local, |row| {
-            let mut metadata: Value = serde_json::from_str(&row.metadata)
-                .map_err(|e| engine_error(format!("memory {:?} metadata: {e}", row.id)))?;
-            // The marker is the webhook's own stamp, so it credits the writer
-            // too: a pushed import is `importer:webhook`, not the connector.
-            row.written_by = "importer:webhook".to_string();
-            if let Value::Object(fields) = &mut metadata {
-                fields.insert("ingest".to_string(), Value::String(marker.to_string()));
-                row.metadata = metadata.to_string();
-            }
-            Ok(())
-        })?;
+        update(tables, id, Origin::Local, |row| stamp_ingest(row, marker))?;
     }
     Ok(ids.len())
+}
+
+/// Set `metadata.ingest` on `row` and credit the webhook, as `json_set`
+/// does: a metadata object gains or replaces the key, any other JSON value
+/// is left as it is, and text that is not JSON is an error.
+pub(crate) fn stamp_ingest(row: &mut MemoryRow, marker: &str) -> Result<()> {
+    let mut metadata: Value = serde_json::from_str(&row.metadata)
+        .map_err(|e| engine_error(format!("memory {:?} metadata: {e}", row.id)))?;
+    // The marker is the webhook's own stamp, so it credits the writer
+    // too: a pushed import is `importer:webhook`, not the connector.
+    row.written_by = "importer:webhook".to_string();
+    if let Value::Object(fields) = &mut metadata {
+        fields.insert("ingest".to_string(), Value::String(marker.to_string()));
+        row.metadata = metadata.to_string();
+    }
+    Ok(())
 }
 
 /// Apply `edit` to memory `id`, as `Memories::apply_edit`'s `UPDATE`.
 pub(crate) fn apply_edit(tables: &mut EngineTables, id: &str, edit: &MemoryEdit) -> Result<()> {
     update(tables, id, Origin::Local, |row| {
-        let set = |field: &mut String, value: &Option<String>| {
-            if let Some(v) = value {
-                field.clone_from(v);
-            }
-        };
-        set(&mut row.content, &edit.content);
-        set(&mut row.category, &edit.category);
-        set(&mut row.memory_type, &edit.memory_type);
-        set(&mut row.written_by, &edit.written_by);
-        set(&mut row.capture_method, &edit.capture_method);
-        if let Some(tags) = &edit.tags {
-            row.tags = tags_json(tags);
-        }
-        if let Some(metadata) = &edit.metadata {
-            row.metadata = metadata.to_string();
-        }
-        for (field, value) in [
-            (&mut row.subject, &edit.subject),
-            (&mut row.predicate, &edit.predicate),
-            (&mut row.object, &edit.object),
-            (&mut row.project, &edit.project),
-            (&mut row.session_id, &edit.session_id),
-            (&mut row.git_remote, &edit.git_remote),
-            (&mut row.git_branch, &edit.git_branch),
-            (&mut row.git_sha, &edit.git_sha),
-            (&mut row.cwd, &edit.cwd),
-            (&mut row.valid_from, &edit.valid_from),
-            (&mut row.valid_until, &edit.valid_until),
-            (&mut row.verified_at, &edit.verified_at),
-            (&mut row.outcome, &edit.outcome),
-        ] {
-            if value.is_some() {
-                field.clone_from(value);
-            }
-        }
-        if let Some(sensitive) = edit.sensitive {
-            row.sensitive = sensitive;
-        }
-        if let Some(rate) = edit.decay_rate {
-            row.decay_rate = rate;
-        }
-        if let Some(confidence) = edit.confidence {
-            row.confidence = confidence;
-        }
-        if edit.clear_superseded {
-            row.superseded_by = None;
-        }
-        row.updated_at.clone_from(&edit.updated_at);
+        apply_edit_to(row, edit);
         Ok(())
     })
+}
+
+/// Write the columns `edit` sets into `row`, stamping its `updated_at`.
+pub(crate) fn apply_edit_to(row: &mut MemoryRow, edit: &MemoryEdit) {
+    let set = |field: &mut String, value: &Option<String>| {
+        if let Some(v) = value {
+            field.clone_from(v);
+        }
+    };
+    set(&mut row.content, &edit.content);
+    set(&mut row.category, &edit.category);
+    set(&mut row.memory_type, &edit.memory_type);
+    set(&mut row.written_by, &edit.written_by);
+    set(&mut row.capture_method, &edit.capture_method);
+    if let Some(tags) = &edit.tags {
+        row.tags = tags_json(tags);
+    }
+    if let Some(metadata) = &edit.metadata {
+        row.metadata = metadata.to_string();
+    }
+    for (field, value) in [
+        (&mut row.subject, &edit.subject),
+        (&mut row.predicate, &edit.predicate),
+        (&mut row.object, &edit.object),
+        (&mut row.project, &edit.project),
+        (&mut row.session_id, &edit.session_id),
+        (&mut row.git_remote, &edit.git_remote),
+        (&mut row.git_branch, &edit.git_branch),
+        (&mut row.git_sha, &edit.git_sha),
+        (&mut row.cwd, &edit.cwd),
+        (&mut row.valid_from, &edit.valid_from),
+        (&mut row.valid_until, &edit.valid_until),
+        (&mut row.verified_at, &edit.verified_at),
+        (&mut row.outcome, &edit.outcome),
+    ] {
+        if value.is_some() {
+            field.clone_from(value);
+        }
+    }
+    if let Some(sensitive) = edit.sensitive {
+        row.sensitive = sensitive;
+    }
+    if let Some(rate) = edit.decay_rate {
+        row.decay_rate = rate;
+    }
+    if let Some(confidence) = edit.confidence {
+        row.confidence = confidence;
+    }
+    if edit.clear_superseded {
+        row.superseded_by = None;
+    }
+    row.updated_at.clone_from(&edit.updated_at);
 }
 
 /// Write `values` into memory `id`'s tracked columns as stored text,
@@ -971,7 +981,7 @@ pub(crate) fn live_triples_except(tables: &EngineTables, except_id: &str) -> Res
 /// Whether `row` comes after (`cutoff`, `after_id`) in (created_at, id)
 /// order, comparing text as SQLite does. With no `after_id`, the whole of
 /// `cutoff` is behind.
-fn is_after(row: &MemoryRow, cutoff: &str, after_id: Option<&str>) -> bool {
+pub(crate) fn is_after(row: &MemoryRow, cutoff: &str, after_id: Option<&str>) -> bool {
     match row.created_at.as_str().cmp(cutoff) {
         std::cmp::Ordering::Greater => true,
         std::cmp::Ordering::Less => false,
@@ -1137,7 +1147,7 @@ pub(crate) fn capture_links(tables: &EngineTables, id: &str) -> Result<(Vec<Stri
 
 /// `ids` without repeats, first occurrence first: an `IN (…)` list matches
 /// each row once however often it is named.
-fn distinct(ids: &[String]) -> impl Iterator<Item = &str> {
+pub(crate) fn distinct(ids: &[String]) -> impl Iterator<Item = &str> {
     let mut seen = HashSet::new();
     ids.iter()
         .map(String::as_str)

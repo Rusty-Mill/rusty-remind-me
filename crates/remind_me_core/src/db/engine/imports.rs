@@ -215,7 +215,7 @@ fn drawer(core: &CoreTables, drawer_id: &str) -> Option<MempalaceImportRecord> {
 /// itself, a number as its digits, a boolean as 1 or 0, a container as its
 /// JSON; `None` for null or a missing key. Malformed JSON fails, as
 /// `json_extract` does.
-fn extracted_text(metadata: &str, key: &str) -> Result<Option<String>> {
+pub(crate) fn extracted_text(metadata: &str, key: &str) -> Result<Option<String>> {
     let parsed: Value = serde_json::from_str(metadata)
         .map_err(|e| StoreError::Engine(format!("malformed JSON: {e}")))?;
     Ok(match parsed.get(key) {

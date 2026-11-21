@@ -10,10 +10,10 @@
 //! Not part of the node's API: it exists for this crate's tests and the
 //! integration tests beside it.
 //!
-//! Raw rows are the engine's own, so these helpers reach past the ports
-//! (ADR-0035) and refuse on any other backend.
+//! These helpers reach past the ports (ADR-0035) through [`TestRows`],
+//! which each backend implements over its own rows (D42), so the whole
+//! suite runs on every backend. A backend without it makes them refuse.
 
-use crate::db::engine;
 use crate::db::{Result, Store, StoreError};
 pub use serde_json::Value;
 
@@ -89,6 +89,54 @@ fn memory_column_name(column: &str) -> Result<&str> {
         .ok_or_else(|| StoreError::Invalid(format!("memories has no column {column:?}")))
 }
 
+/// The raw rows a backend keeps, for the helpers below (D42). Each method
+/// is the raw statement named in its helper's doc: it reaches past the
+/// ports, so it writes no outbox entry and no revision. A backend offers it
+/// through [`crate::db::backend::Backend::test_rows`]; one that does not
+/// makes every helper refuse.
+///
+/// Column names are checked before a call gets here.
+#[doc(hidden)]
+pub trait TestRows {
+    /// See [`memory_column`].
+    fn memory_column(&self, id: &str, column: &str) -> Result<Option<Value>>;
+    /// See [`set_memory_column`].
+    fn set_memory_column(&mut self, id: &str, column: &str, value: Value) -> Result<usize>;
+    /// See [`relabel_memory`].
+    fn relabel_memory(&mut self, from: &str, to: &str) -> Result<usize>;
+    /// See [`memory_ids`].
+    fn memory_ids(&self) -> Result<Vec<String>>;
+    /// See [`count`].
+    fn count(&self, table: Table) -> Result<i64>;
+    /// See [`feedback_queries`].
+    fn feedback_queries(&self, memory_id: &str) -> Result<Vec<String>>;
+    /// See [`association_weight`].
+    fn association_weight(&self, a: &str, b: &str) -> Result<Option<i64>>;
+    /// See [`outbox_rows`].
+    fn outbox_rows(&self) -> Result<Vec<OutboxRow>>;
+    /// See [`set_outbox_column`]; `column` is `created_at` or `sent_at`.
+    fn set_outbox_column(&mut self, id: i64, column: &str, value: &str) -> Result<usize>;
+    /// See [`sends`].
+    fn sends(&self) -> Result<Vec<(String, i64, String)>>;
+    /// See [`queue_outbox`].
+    fn queue_outbox(
+        &mut self,
+        key: &str,
+        operation: &str,
+        payload: &str,
+        created_at: &str,
+    ) -> Result<i64>;
+}
+
+/// Run `f` on the store's raw rows, or refuse when its backend has none.
+fn with_rows<T>(store: &Store<'_>, f: impl FnOnce(&mut dyn TestRows) -> Result<T>) -> Result<T> {
+    let mut backend = store.backend().lock()?;
+    let rows = backend.test_rows().ok_or_else(|| {
+        StoreError::Invalid("raw rows were asked of a store whose backend has none".into())
+    })?;
+    f(rows)
+}
+
 /// Memory `id`'s `column` as JSON: text as a string, an integer or real as
 /// a number (a flag as 0 or 1), NULL as null. `None` when there is no such
 /// memory.
@@ -99,11 +147,7 @@ fn memory_column_name(column: &str) -> Result<&str> {
 /// store's own error.
 pub fn memory_column(store: &Store<'_>, id: &str, column: &str) -> Result<Option<Value>> {
     let column = memory_column_name(column)?;
-    engine::testing::memory_column(
-        engine::testing::tables(&mut store.backend().lock()?)?,
-        id,
-        column,
-    )
+    with_rows(store, |rows| rows.memory_column(id, column))
 }
 
 /// [`memory_column`] as text: `None` for NULL or no such memory.
@@ -140,17 +184,13 @@ pub fn set_memory_column(
     value: impl Into<Value>,
 ) -> Result<usize> {
     let column = memory_column_name(column)?;
-    engine::testing::set_memory_column(
-        engine::testing::tables(&mut store.backend().lock()?)?,
-        id,
-        column,
-        value.into(),
-    )
+    let value = value.into();
+    with_rows(store, |rows| rows.set_memory_column(id, column, value))
 }
 
 /// Every memory id, deleted or not, sorted.
 pub fn memory_ids(store: &Store<'_>) -> Result<Vec<String>> {
-    engine::testing::memory_ids(engine::testing::tables(&mut store.backend().lock()?)?)
+    with_rows(store, |rows| rows.memory_ids())
 }
 
 /// Move memory `from` to id `to`, every other column kept, as `UPDATE
@@ -162,29 +202,19 @@ pub fn memory_ids(store: &Store<'_>) -> Result<Vec<String>> {
 ///
 /// [`StoreError::Invalid`] when `to` is taken, or the store's own error.
 pub fn relabel_memory(store: &Store<'_>, from: &str, to: &str) -> Result<usize> {
-    engine::testing::relabel_memory(
-        engine::testing::tables(&mut store.backend().lock()?)?,
-        from,
-        to,
-    )
+    with_rows(store, |rows| rows.relabel_memory(from, to))
 }
 
 /// How many rows `table` holds.
 pub fn count(store: &Store<'_>, table: Table) -> Result<i64> {
-    engine::testing::count(
-        engine::testing::tables(&mut store.backend().lock()?)?,
-        table,
-    )
+    with_rows(store, |rows| rows.count(table))
 }
 
 /// The raw `query` of every feedback event logged for `memory_id`, oldest
 /// first (ties by id). [`crate::db::feedback::Feedback::events`] carries
 /// only the tokens.
 pub fn feedback_queries(store: &Store<'_>, memory_id: &str) -> Result<Vec<String>> {
-    engine::testing::feedback_queries(
-        engine::testing::tables(&mut store.backend().lock()?)?,
-        memory_id,
-    )
+    with_rows(store, |rows| rows.feedback_queries(memory_id))
 }
 
 /// The weight of the `memory_associations` row stored under exactly the
@@ -192,11 +222,7 @@ pub fn feedback_queries(store: &Store<'_>, memory_id: &str) -> Result<Vec<String
 /// [`crate::db::related::Related::co_retrieved`] reads only pairs whose
 /// other memory is stored and live.
 pub fn association_weight(store: &Store<'_>, a: &str, b: &str) -> Result<Option<i64>> {
-    engine::testing::association_weight(
-        engine::testing::tables(&mut store.backend().lock()?)?,
-        a,
-        b,
-    )
+    with_rows(store, |rows| rows.association_weight(a, b))
 }
 
 /// One `sync_outbox` row, as [`outbox_rows`] reads it.
@@ -219,7 +245,7 @@ pub fn mark_store_syncing(store: &Store<'_>) -> Result<()> {
 
 /// Every outbox row, oldest id first.
 pub fn outbox_rows(store: &Store<'_>) -> Result<Vec<OutboxRow>> {
-    engine::testing::outbox_rows(engine::testing::tables(&mut store.backend().lock()?)?)
+    with_rows(store, |rows| rows.outbox_rows())
 }
 
 /// Overwrite outbox row `id`'s `column` (`created_at` or `sent_at`) with
@@ -234,17 +260,12 @@ pub fn set_outbox_column(store: &Store<'_>, id: i64, column: &str, value: &str) 
             "sync_outbox.{column} cannot be set here"
         )));
     }
-    engine::testing::set_outbox_column(
-        engine::testing::tables(&mut store.backend().lock()?)?,
-        id,
-        column,
-        value,
-    )
+    with_rows(store, |rows| rows.set_outbox_column(id, column, value))
 }
 
 /// Every send marker as `(remote, outbox id, sent at)`, sorted.
 pub fn sends(store: &Store<'_>) -> Result<Vec<(String, i64, String)>> {
-    engine::outbox::send_markers(engine::testing::tables(&mut store.backend().lock()?)?)
+    with_rows(store, |rows| rows.sends())
 }
 
 /// Queue a raw outbox entry for `key`, created at `created_at`, as an
@@ -256,13 +277,9 @@ pub fn queue_outbox(
     payload: &str,
     created_at: &str,
 ) -> Result<i64> {
-    engine::outbox::queue_at(
-        engine::testing::tables(&mut store.backend().lock()?)?,
-        key,
-        operation,
-        payload,
-        created_at,
-    )
+    with_rows(store, |rows| {
+        rows.queue_outbox(key, operation, payload, created_at)
+    })
 }
 
 /// Make this thread see every MCP tool, as before the default profile became
@@ -287,8 +304,20 @@ mod tests {
     const NOW: &str = "2026-09-27T00:00:00+00:00";
 
     #[test]
-    fn raw_access_reads_and_writes_stored_rows() {
-        let db = Database::open_in_memory().unwrap();
+    fn raw_access_reads_and_writes_engine_rows() {
+        raw_access_reads_and_writes_stored_rows(&Database::open_in_memory().unwrap());
+    }
+
+    #[test]
+    fn raw_access_reads_and_writes_sqlite_rows() {
+        let sqlite = crate::db::sqlite::SqliteTables::open_in_memory().unwrap();
+        raw_access_reads_and_writes_stored_rows(
+            &Database::open_backend(Box::new(sqlite), None).unwrap(),
+        );
+    }
+
+    /// The same raw reads and writes on any backend.
+    fn raw_access_reads_and_writes_stored_rows(db: &Database) {
         let store = db.store();
         Memories::new(&store)
             .insert(&NewMemory {

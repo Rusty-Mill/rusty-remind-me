@@ -25,6 +25,7 @@ pub mod related;
 pub mod reminders;
 pub mod saved_searches;
 pub mod sessions;
+pub mod sqlite;
 pub mod stats;
 pub mod store;
 pub mod sync_state;
