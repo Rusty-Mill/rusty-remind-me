@@ -709,6 +709,10 @@ pub const RECLASSIFY_BATCH_MAX: usize = 100;
 pub struct ReclassifyResult {
     pub updated: usize,
     pub not_found: Vec<String>,
+    /// Dialog rows left as they were: the verbatim record is not retyped
+    /// ([`crate::dialog`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refused: Vec<String>,
     pub total: usize,
 }
 

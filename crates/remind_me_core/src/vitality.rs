@@ -383,6 +383,10 @@ pub fn is_dormant(vitality: f64) -> bool {
 /// resolved as reverted or abandoned was demoted on purpose and ages out like
 /// anything else.
 pub fn never_dormant(memory: &Memory) -> bool {
+    // A dialog is the verbatim record and does not decay (D13).
+    if crate::dialog::is_dialog(memory) {
+        return true;
+    }
     let kept = |kind: &str| matches!(kind, "decision" | "preference");
     let is_kept = memory.memory_type.as_deref().is_some_and(kept) || kept(&memory.category);
     is_kept
@@ -441,7 +445,13 @@ pub fn build_vitality_report(store: &Store<'_>) -> Result<VitalityReport> {
     // `deleted_at IS NULL` is a no-op while deletes are hard, but keeps the
     // report correct once sync introduces tombstones. The reference omits this
     // filter and would count tombstoned rows.
-    let rows = Memories::new(store).all_live()?;
+    // Dialogs are the verbatim record, not memories that age (D13): they are
+    // left out of the vault's health, so its numbers describe what decays.
+    let rows: Vec<Memory> = Memories::new(store)
+        .all_live()?
+        .into_iter()
+        .filter(|m| !crate::dialog::is_dialog(m))
+        .collect();
 
     let now = Utc::now();
     let mut vitalities = Vec::new();

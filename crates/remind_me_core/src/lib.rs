@@ -28,6 +28,7 @@ pub mod db;
 pub mod dbs_import;
 pub mod decisions_backfill;
 pub mod decisions_log;
+pub mod dialog;
 pub mod digest;
 pub mod duplicates;
 pub mod embedder;

@@ -2,6 +2,16 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-21 — Dialog rows protected in place (Mill Board #1616)
+
+### Changed
+- A dialog row (category `dialog`, the verbatim record) can no longer be edited or deleted through the generic write paths: `remind_me_update` and `PUT /api/memories/:id`, `remind_me_delete` and `DELETE`, `POST /api/memories/bulk/delete` and `bulk/tag` (a dialog anywhere in the batch refuses the batch before anything is written), `remind_me_annotate` (that item reports the refusal), and `supersedes` on `remind_me_add`. Each refusal is `memory <id> is a dialog (the verbatim record) and cannot be edited or deleted`. Updating a non-dialog memory into the `dialog` category still works, and protects it from then on.
+- `remind_me_undo_import` refuses an import that holds dialog rows, dry run included, and removes nothing.
+- `remind_me_reclassify` leaves dialogs as they are and lists them in a new `refused` field; `remind_me_reclassify_batch` no longer offers them.
+- `remind_me_consolidate` never takes a dialog as a merge candidate (it could before), and a changed-file re-import no longer supersedes the old import's dialog rows (pack D13).
+- Dialogs never go dormant, and `remind_me_vitality_report` leaves them out of its counts. Default search already left them out unless `include_raw` (ADR-0029); a test now pins it.
+- Unchanged: captures write dialogs, and a session transcript's recapture still grows its dialog in place with a `recapture` revision (pack Q14). No schema change, no data migration; no row is touched by this change.
+
 ## 2026-11-19 — Decisions normalise apply
 
 ### Added

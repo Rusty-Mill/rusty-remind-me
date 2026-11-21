@@ -618,8 +618,11 @@ pub(crate) fn supersede_import(
     new_import_id: &str,
     updated_at: &str,
 ) -> Result<usize> {
+    // A dialog is the verbatim record and is never retired automatically
+    // (D13): a re-import leaves the old copy live beside the new one.
     let ids = matching(core_ref(tables)?, |row| {
         row.is_live()
+            && row.category != crate::models::DIALOG_CATEGORY
             && row
                 .metadata_value()
                 .is_some_and(|m| m.get("import_id").and_then(Value::as_str) == Some(old_import_id))
@@ -1197,6 +1200,9 @@ pub(crate) fn of_type_page(
 ) -> Result<(usize, Vec<UnclassifiedMemory>)> {
     let mut rows: Vec<MemoryRow> = rows(core_ref(tables)?)
         .filter(|row| row.deleted_at.is_none() && row.memory_type == memory_type)
+        // A dialog is never retyped (`crate::dialog`), so offering one would
+        // only ask for a classification that is then refused.
+        .filter(|row| row.category != crate::models::DIALOG_CATEGORY)
         .collect();
     rows.sort_by(|a, b| (&a.created_at, &a.id).cmp(&(&b.created_at, &b.id)));
     let total = rows.len();
