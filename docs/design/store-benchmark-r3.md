@@ -1,12 +1,13 @@
 # Store benchmark spec (Millwright R3, card #1618)
 
-Status: **revised after review; needs Nano's sign-off again.** He approved
-the first version on 2026-11-21 ("Approve as written", decision card
-`cmsg_012spbR8vYb6jWVUuV6ALzxuHfQhCeUcyFwPpCFLQdtBQ9`, D40). Review then
-tightened G6 (row and revision checked together) and G8 (restored bodies
-compared, not just a restore that succeeds), and corrected the blob store to
-audit seam 3. The run waits for that sign-off and for the storage port
-(#1617, ADR-0035 step 6).
+Status: **signed off by Nano, 2026-11-21** (D40, confirmed for the revision by D41). He approved the first
+version ("Approve as written", decision card
+`cmsg_012spbR8vYb6jWVUuV6ALzxuHfQhCeUcyFwPpCFLQdtBQ9`), then the version
+revised after review, which tightened G6 (row and revision checked together)
+and G8 (restored bodies compared by hash) and named the blob store audit
+seam 3 ("Approve revised spec", decision card
+`cmsg_012spbR8vYb6jWVUuV6ALzxuY44s54JFEifR7ohEYo5N5w`). The run waits for
+the storage port (#1617, ADR-0035 step 6).
 
 ## Question
 
