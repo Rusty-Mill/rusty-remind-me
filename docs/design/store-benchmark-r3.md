@@ -1,7 +1,7 @@
 # Store benchmark spec (Millwright R3, card #1618)
 
 Status: **signed off by Nano, 2026-11-21** ("Approve as written", decision
-card `cmsg_012spbR8vYb6jWVUuV6ALzxuHfQhCeUcyFwPpCFLQdtBQ9`): gates,
+card `cmsg_012spbR8vYb6jWVUuV6ALzxuHfQhCeUcyFwPpCFLQdtBQ9`, D40): gates,
 targets, the choosing rule and the raw-bodies rule below are fixed. The run
 waits for the storage port to finish (#1617, ADR-0035 step 6).
 
@@ -50,7 +50,7 @@ Not the remindme host, and never the live store. BaileyAi, with the benchmark
 process inside a cgroup that matches remindme: `systemd-run --scope -p
 MemoryMax=4G -p CPUQuota=200%`. Release build, one candidate per process, the
 page cache dropped before each cold-open run, and no local-model job running
-alongside (BaileyAi has one model slot; D16, D37).
+alongside (BaileyAi has one model slot; D16, D38).
 
 ## Datasets
 
@@ -139,5 +139,5 @@ run" with the reason instead of a number.
 `docs/research/store-benchmark-r3.md`: method, aggregate results per
 dataset, and the recommendation with its tradeoffs. The raw JSON lines and the
 #1563 query set hold real text and live ids, so they stay out of the repo, in
-the project files under `remind-me/1618-store-bench/` (D38).
+the project files under `remind-me/1618-store-bench/` (D39).
 The harness extends `examples/store_bench.rs`.
