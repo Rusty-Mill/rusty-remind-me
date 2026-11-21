@@ -88,6 +88,16 @@ backend. R3 measures on real data; this set stays the regression gate.
   `backend::Transaction`, which calls the three transaction methods and
   rolls back when dropped uncommitted. The engine's page stays the
   engine's.
+- **Transactions do not nest, and a failed commit never opens the gate
+  early.** A begin on a thread that already holds a transaction is refused
+  before it reaches the backend and leaves the outer transaction's gate
+  alone. `Backend::commit_transaction` names the four states a failed
+  commit may leave (rolled back, committed, still open, or unavailable
+  pending recovery); the wrapper rolls back a transaction that is still
+  open (`Backend::in_transaction`) before it lets other threads in. On the
+  engine, a redo commit that did not land puts the page back at once, as
+  reopening would. Before step 6 the engine's gate let a nested begin
+  release the outer transaction's ownership; that is fixed here.
 - **`Database::open_backend(Box<dyn Backend>, path)`** opens a database on
   any backend and runs the same start-up work as `Database::open`. This is
   what R3 calls to run the suite on SQLite or Attest.

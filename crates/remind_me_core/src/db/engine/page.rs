@@ -131,11 +131,17 @@ impl EngineTables {
 
     /// Finish the open page: its writes become one redo batch.
     ///
+    /// On failure the page is always closed, in one of the states
+    /// `Backend::commit_transaction` allows: rolled back (a failed write,
+    /// or a redo commit that did not land, whose writes are then put back
+    /// as reopening would), or committed with the tables refusing writes
+    /// until reopened (the redo batch landed and a checkpoint after it
+    /// failed; reopening replays it).
+    ///
     /// # Errors
     ///
-    /// [`StoreError::Engine`] if no page is open or a journal fails. A
-    /// failure leaves the tables refusing writes until they are reopened,
-    /// which settles the page one way or the other.
+    /// [`StoreError::Engine`] if no page is open, a write in it failed, or
+    /// a journal fails.
     pub(crate) fn finish_page(&mut self) -> Result<()> {
         let Some(page) = self.page.take() else {
             return Err(StoreError::Engine("no page is open".to_string()));
@@ -147,19 +153,33 @@ impl EngineTables {
                 "a write in the page failed; the page was rolled back".to_string(),
             ));
         }
-        let settled = self.settle(&page);
-        if settled.is_err() {
+        if let Err(e) = self.commit_redo(&page) {
+            // Not durable: reopening would undo it, so undo it now and keep
+            // what readers see equal to what a reopen recovers.
+            if self.put_back(page.before).is_err() {
+                self.failed = true;
+            }
+            return Err(e);
+        }
+        let checkpointed = self.checkpoint_after_commit();
+        if checkpointed.is_err() {
             self.failed = true;
         }
-        settled
+        checkpointed
     }
 
-    fn settle(&mut self, page: &OpenPage) -> Result<()> {
-        if !page.changes.is_empty() {
-            self.journal
-                .commit(&encode(&page.changes)?)
-                .map_err(engine_error)?;
+    /// The commit point: the page's writes as one redo batch.
+    fn commit_redo(&mut self, page: &OpenPage) -> Result<()> {
+        if page.changes.is_empty() {
+            return Ok(());
         }
+        self.journal
+            .commit(&encode(&page.changes)?)
+            .map_err(engine_error)
+    }
+
+    /// Housekeeping once the redo batch is durable.
+    fn checkpoint_after_commit(&mut self) -> Result<()> {
         self.undo.checkpoint().map_err(engine_error)?;
         self.journal.checkpoint().map_err(engine_error)
     }

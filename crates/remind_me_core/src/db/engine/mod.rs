@@ -313,6 +313,10 @@ impl super::backend::Backend for EngineTables {
         self.abandon_page()
     }
 
+    fn in_transaction(&self) -> bool {
+        self.page.is_some()
+    }
+
     fn rebuild_indexes(&mut self) -> super::Result<()> {
         memories::rebuild(self)
     }

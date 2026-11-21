@@ -31,7 +31,7 @@ use super::stats::{SnapshotStore, StatsStore};
 use super::sync_state::SyncStateStore;
 use super::vectors::VectorStore;
 use super::wiki::WikiStore;
-use super::Result;
+use super::{Result, StoreError};
 use parking_lot::{Condvar, MappedMutexGuard, Mutex, MutexGuard};
 use std::any::Any;
 use std::fmt;
@@ -68,7 +68,9 @@ pub trait Backend:
 {
     /// Open a transaction for the calling thread. Its writes are readable
     /// at once, by this thread, and land together at
-    /// [`Self::commit_transaction`] or not at all.
+    /// [`Self::commit_transaction`] or not at all. Transactions do not
+    /// nest; [`Transaction::begin`] refuses a nested one before it gets
+    /// here.
     ///
     /// # Errors
     ///
@@ -77,11 +79,30 @@ pub trait Backend:
 
     /// Make every write of the open transaction durable, as one.
     ///
+    /// **When it fails**, the backend must leave one of these states, and
+    /// nothing else, before it returns:
+    ///
+    /// 1. rolled back: none of the transaction's writes is visible;
+    /// 2. committed: all of them are visible and will survive a reopen,
+    ///    and only housekeeping after the commit point failed;
+    /// 3. still open ([`Self::in_transaction`] is `true`): the caller
+    ///    then calls [`Self::rollback_transaction`];
+    /// 4. unavailable pending recovery: the backend refuses writes until
+    ///    it is reopened, and reopening settles the transaction whole one
+    ///    way or the other.
+    ///
+    /// The wrapper does not take an error to mean the transaction closed:
+    /// it holds the gate, rolls back in state 3, and only then lets other
+    /// threads in. So other threads see the whole batch or none of it.
+    ///
     /// # Errors
     ///
-    /// The backend's error if none is open, a write in it failed (the
-    /// transaction is then rolled back), or it cannot be made durable.
+    /// The backend's error if none is open, a write in it failed, or it
+    /// cannot be made durable.
     fn commit_transaction(&mut self) -> Result<()>;
+
+    /// Whether a transaction is open on this backend.
+    fn in_transaction(&self) -> bool;
 
     /// Put back everything the open transaction wrote.
     ///
@@ -163,11 +184,21 @@ impl BackendLock {
         }
     }
 
-    /// Claim the gate for the calling thread.
-    fn claim(&self) {
+    /// Claim the gate for the calling thread. A thread that already holds
+    /// it is refused, and keeps it: transactions do not nest, and a nested
+    /// begin must not touch the outer transaction's ownership.
+    fn claim(&self) -> Result<()> {
+        let me = std::thread::current().id();
         let mut owner = self.owner.lock();
+        if *owner == Some(me) {
+            return Err(StoreError::Invalid(
+                "a transaction is already open on this thread; transactions do not nest"
+                    .to_string(),
+            ));
+        }
         self.wait_for_gate(&mut owner);
-        *owner = Some(std::thread::current().id());
+        *owner = Some(me);
+        Ok(())
     }
 
     /// Release the gate and wake every waiting thread.
@@ -194,7 +225,7 @@ pub(crate) struct Transaction<'t> {
 
 impl<'t> Transaction<'t> {
     pub(crate) fn begin(backend: &'t BackendLock) -> Result<Self> {
-        backend.claim();
+        backend.claim()?;
         if let Err(e) = backend.lock().begin_transaction() {
             backend.release();
             return Err(e);
@@ -205,9 +236,22 @@ impl<'t> Transaction<'t> {
         })
     }
 
+    /// Commit, then let other threads in. A failed commit that leaves the
+    /// transaction open is rolled back first (see
+    /// [`Backend::commit_transaction`]), so the gate never opens on a
+    /// half-settled batch.
     pub(crate) fn commit(mut self) -> Result<()> {
         self.open = false;
-        let committed = self.backend.lock().commit_transaction();
+        let committed = {
+            let mut backend = self.backend.lock();
+            let committed = backend.commit_transaction();
+            if committed.is_err() && backend.in_transaction() {
+                if let Err(e) = backend.rollback_transaction() {
+                    eprintln!("store: rolling back after a failed commit failed: {e}");
+                }
+            }
+            committed
+        };
         self.backend.release();
         committed
     }
@@ -288,6 +332,101 @@ mod tests {
                 .join()
                 .unwrap();
         });
+    }
+
+    /// A begin on a thread that already holds a transaction is refused,
+    /// and the outer transaction keeps the gate: no other thread gets in
+    /// until it commits.
+    #[test]
+    fn a_nested_begin_is_refused_and_the_outer_keeps_the_gate() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let backend = engine();
+        let outer = Transaction::begin(&backend).unwrap();
+        VectorStore::put(&mut *backend.lock(), "a", 0, &[1]).unwrap();
+        let nested = Transaction::begin(&backend);
+        assert!(
+            matches!(&nested, Err(StoreError::Invalid(why)) if why.contains("do not nest")),
+            "{:?}",
+            nested.as_ref().err()
+        );
+        drop(nested);
+        let got_in = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let other = scope.spawn(|| {
+                let seen = VectorStore::count(&*backend.lock()).unwrap();
+                got_in.store(true, Ordering::SeqCst);
+                seen
+            });
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(!got_in.load(Ordering::SeqCst), "the gate stayed shut");
+            VectorStore::put(&mut *backend.lock(), "b", 0, &[1]).unwrap();
+            outer.commit().unwrap();
+            assert_eq!(other.join().unwrap(), 2, "it saw the outer batch whole");
+        });
+    }
+
+    /// Readers on other threads, through the shared store wrapper, see a
+    /// committed batch whole and a rolled-back one not at all, even when
+    /// the writer tries a nested transaction part-way through.
+    #[test]
+    fn readers_see_a_whole_batch_or_none_of_a_rollback() {
+        use crate::db::vectors::Vectors;
+        use crate::db::{Database, Store};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        const BATCH: usize = 5;
+        let db = Database::open_in_memory().unwrap();
+        let handle = db.backend_handle();
+        let done = AtomicBool::new(false);
+        let pause = || std::thread::sleep(std::time::Duration::from_millis(5));
+        let batch = |page: &Store<'_>, prefix: &str| -> Result<()> {
+            for i in 0..BATCH {
+                Vectors::new(page).put(&format!("{prefix}{i}"), 0, &[1])?;
+                if i == 2 {
+                    let nested = page.transaction(|_| Ok::<_, StoreError>(()));
+                    assert!(nested.is_err(), "a nested transaction is refused");
+                }
+                pause();
+            }
+            Ok(())
+        };
+        let seen: Vec<usize> = std::thread::scope(|scope| {
+            let readers: Vec<_> = (0..3)
+                .map(|_| {
+                    let handle = handle.clone();
+                    let done = &done;
+                    scope.spawn(move || {
+                        let store = Store::unlocked(handle, None);
+                        let mut seen = Vec::new();
+                        loop {
+                            seen.push(VectorStore::count(&*store.backend().lock()).unwrap());
+                            if done.load(Ordering::SeqCst) {
+                                return seen;
+                            }
+                            std::thread::yield_now();
+                        }
+                    })
+                })
+                .collect();
+            let writer = Store::unlocked(handle.clone(), None);
+            writer.transaction(|page| batch(page, "kept")).unwrap();
+            let rolled_back: Result<()> = writer.transaction(|page| {
+                batch(page, "dropped")?;
+                Err(StoreError::Invalid("give up".into()))
+            });
+            assert!(rolled_back.is_err());
+            done.store(true, Ordering::SeqCst);
+            readers
+                .into_iter()
+                .flat_map(|r| r.join().unwrap())
+                .collect()
+        });
+        assert!(!seen.is_empty());
+        let partial: Vec<&usize> = seen.iter().filter(|n| **n != 0 && **n != BATCH).collect();
+        assert!(
+            partial.is_empty(),
+            "a reader saw a partial batch: {partial:?}"
+        );
+        assert_eq!(VectorStore::count(&*handle.lock()).unwrap(), BATCH);
     }
 
     /// A database opened on a backend handed in from outside runs the

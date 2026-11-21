@@ -8,10 +8,13 @@ Dated entries, newest first. One entry per merged pull request.
 - `db::backend::Backend` is the supertrait of every storage port plus the whole-store operations (transaction begin, commit and rollback; rebuilding derived indexes; compaction; backup). The engine implements it. `Store` now holds a `BackendLock` over a `Box<dyn Backend>` instead of the engine lock, `Store::transaction` runs through the backend, and repositories reach their port through `Store::backend()`.
 - `Database::open_backend` opens a database on any `Backend`, with the same start-up work as `open`; R3's store benchmark uses it to run the suites on other stores.
 - Rebuilding indexes, backups and compaction go through the backend; the vitality floor check is `KeywordFilter::vital_enough`. `crate::testing`'s raw-row helpers refuse with an error on a backend that is not the engine.
-- No behaviour, schema, data or MCP/API change.
+### Fixed
+- A nested transaction on the same thread is refused with `StoreError::Invalid` and no longer releases the outer transaction's gate, which could let another thread read or write while the outer one was still open. A failed commit that leaves the transaction open is rolled back before other threads get in, and on the engine a redo commit that did not land is put back at once, as reopening would.
+- Otherwise no behaviour, schema, data or MCP/API change.
 
 ### Tests
 - The transaction-gate tests move to `db::backend`; a new test opens a database on a handed-in backend and checks rollback, commit, index rebuild and compaction through it.
+- Two concurrency tests: a nested begin is refused while the outer transaction keeps the gate, and readers on other threads, through the store wrapper, see a committed batch whole and none of a rolled-back one, with a nested attempt part-way through. Both fail on the old gate.
 
 ## 2026-11-21 — Storage port: references, related, sessions, vectors and wiki (ADR-0035, Millwright R2, Mill Board #1617)
 
