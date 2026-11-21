@@ -341,7 +341,7 @@ mod tests {
         for i in 0..50 {
             MemoryStore::insert(
                 &mut t,
-                &NewMemory::new(format!("m{i}"), &"x".repeat(2000), NOW),
+                &NewMemory::new(format!("m{i}"), "x".repeat(2000), NOW),
             )
             .unwrap();
         }
