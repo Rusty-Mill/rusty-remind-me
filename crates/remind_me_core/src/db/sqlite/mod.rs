@@ -8,10 +8,12 @@
 //! ([`SqliteTables::atomic`]), so it lands whole inside or outside a
 //! [`super::backend::Backend`] transaction.
 
+mod entities;
 mod feedback;
 mod history;
 mod imports;
 mod memories;
+mod outbox;
 mod reminders;
 mod saved_searches;
 mod stats;
@@ -24,9 +26,11 @@ use std::path::Path;
 /// reopen leaves existing tables alone.
 const SCHEMAS: &[&str] = &[
     memories::SCHEMA,
+    entities::SCHEMA,
     feedback::SCHEMA,
     history::SCHEMA,
     imports::SCHEMA,
+    outbox::SCHEMA,
     reminders::SCHEMA,
     saved_searches::SCHEMA,
     stats::SCHEMA,

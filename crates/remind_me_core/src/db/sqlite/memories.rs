@@ -60,7 +60,7 @@ CREATE TABLE IF NOT EXISTS sync_outbox (
     sent_at TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS flags (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS memory_entities (
-    memory_id TEXT NOT NULL, entity_id TEXT NOT NULL,
+    memory_id TEXT NOT NULL, entity_id TEXT NOT NULL, created_at TEXT NOT NULL,
     PRIMARY KEY (memory_id, entity_id)) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS memory_entities_entity ON memory_entities (entity_id);
 ";
