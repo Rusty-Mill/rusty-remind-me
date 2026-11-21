@@ -16,12 +16,15 @@ mod history;
 mod imports;
 mod memories;
 mod outbox;
+mod promotions;
 mod references;
 mod related;
 mod reminders;
 mod saved_searches;
 mod sessions;
 mod stats;
+mod vectors;
+mod wiki;
 
 use super::{Result, StoreError};
 use rusqlite::{Connection, OptionalExtension, Params, Row};
@@ -37,12 +40,15 @@ const SCHEMAS: &[&str] = &[
     history::SCHEMA,
     imports::SCHEMA,
     outbox::SCHEMA,
+    promotions::SCHEMA,
     references::SCHEMA,
     related::SCHEMA,
     reminders::SCHEMA,
     saved_searches::SCHEMA,
     sessions::SCHEMA,
     stats::SCHEMA,
+    vectors::SCHEMA,
+    wiki::SCHEMA,
 ];
 
 /// Every table group's rows in one SQLite database.
