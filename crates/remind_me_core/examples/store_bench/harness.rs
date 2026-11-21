@@ -81,6 +81,32 @@ impl Candidate {
     }
 }
 
+/// What a run measures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// Fill a store and time each workload.
+    Bench,
+    /// Fill a store and time reopening it.
+    Open,
+}
+
+impl Mode {
+    fn parse(name: &str) -> Result<Self> {
+        match name {
+            "bench" => Ok(Self::Bench),
+            "open" => Ok(Self::Open),
+            other => Err(format!("unknown mode {other:?}; one of bench, open").into()),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Bench => "bench",
+            Self::Open => "open",
+        }
+    }
+}
+
 /// Run the benchmark the command line asks for, on one of `candidates`:
 /// `<bench|open> <backend> <n> <dir>`. Prints one JSON line.
 pub fn run(candidates: &[Candidate]) -> Result<()> {
@@ -93,40 +119,48 @@ pub fn run(candidates: &[Candidate]) -> Result<()> {
         )
         .into());
     };
-    // Every argument is checked before anything touches the filesystem.
-    if !matches!(mode.as_str(), "bench" | "open") {
-        return Err(format!("unknown mode {mode:?}; one of bench, open").into());
-    }
+    let mode = Mode::parse(mode)?;
     let Some(&candidate) = candidates.iter().find(|c| c.name == backend) else {
         return Err(format!("unknown backend {backend:?}; one of {names:?}").into());
     };
-    let n: usize = n.parse()?;
+    let report = measure(candidate, mode, n.parse()?, Path::new(dir))?;
+    println!("{}", Value::Object(report));
+    Ok(())
+}
+
+/// One run of `candidate` in a new directory under `root`; its report.
+/// `n` and the environment are checked before the filesystem is touched.
+pub fn measure(
+    candidate: Candidate,
+    mode: Mode,
+    n: usize,
+    root: &Path,
+) -> Result<Map<String, Value>> {
     if n == 0 {
         return Err("n must be at least 1".into());
     }
     refuse_model_config()?;
-    let dir = fresh_run_dir(Path::new(dir), &format!("{mode}-{backend}-{n}"))?;
+    let dir = fresh_run_dir(root, &format!("{}-{}-{n}", mode.name(), candidate.name))?;
 
     let mut report = Map::new();
-    report.insert("mode".into(), json!(mode));
-    report.insert("backend".into(), json!(backend));
+    report.insert("mode".into(), json!(mode.name()));
+    report.insert("backend".into(), json!(candidate.name));
     report.insert("n".into(), json!(n));
     report.insert("run_dir".into(), json!(dir));
     report.insert(
         "note".into(),
         json!("smoke run: warm reopen and the restore check are not G7 or G8 evidence"),
     );
-    match mode.as_str() {
-        "bench" => workload(candidate, &dir, n, &mut report)?,
-        _ => reopen(candidate, &dir, n, &mut report)?,
+    match mode {
+        Mode::Bench => workload(candidate, &dir, n, &mut report)?,
+        Mode::Open => reopen(candidate, &dir, n, &mut report)?,
     }
     report.insert(
         "disk_mb".into(),
         json!(megabytes(dir_size(&dir.join("store"))?)),
     );
     report.insert("peak_rss_mb".into(), json!(peak_rss_mb()));
-    println!("{}", Value::Object(report));
-    Ok(())
+    Ok(report)
 }
 
 /// A new directory under `root` that this run alone owns: `create_dir`
@@ -338,8 +372,11 @@ fn workload(
         report.insert(format!("entity_{hops}_hop"), walk);
     }
 
-    report.insert(
-        "update".into(),
+    // A small store can have no editable rows (n = 1 draws a dialog):
+    // updates and deletes then report zero samples rather than failing.
+    let update = if editable.is_empty() {
+        skipped("no editable (non-dialog) rows")
+    } else {
         timed(|_| {
             let input: MemoryUpdateInput = serde_json::from_value(json!({
                 "memory_id": pick_editable(&mut rng),
@@ -347,8 +384,9 @@ fn workload(
             }))?;
             queries::update_memory(&store, &input)?;
             Ok(())
-        })?,
-    );
+        })?
+    };
+    report.insert("update".into(), update);
 
     report.insert(
         "search_hybrid_beside_writer".into(),
@@ -370,7 +408,12 @@ fn workload(
             return Err(format!("delete of live memory {id} did nothing").into());
         }
     }
-    report.insert("delete".into(), summary(times));
+    let delete = if times.is_empty() {
+        skipped("no editable (non-dialog) rows")
+    } else {
+        summary(times)
+    };
+    report.insert("delete".into(), delete);
 
     drop(store);
     backup_and_restore(candidate, &db, report)
@@ -757,7 +800,13 @@ impl Rng {
     }
 }
 
-/// Mean and percentiles of `times`, in milliseconds.
+/// A metric with no samples, and why.
+fn skipped(why: &str) -> Value {
+    json!({ "count": 0, "skipped": why })
+}
+
+/// Mean and percentiles of `times`, in milliseconds. `times` must not be
+/// empty; a metric with nothing to time reports [`skipped`] instead.
 fn summary(mut times: Vec<Duration>) -> Value {
     times.sort();
     let at = |q: f64| millis(times[((times.len() - 1) as f64 * q) as usize]);
