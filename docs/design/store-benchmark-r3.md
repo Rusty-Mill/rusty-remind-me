@@ -1,8 +1,9 @@
 # Store benchmark spec (Millwright R3, card #1618)
 
-Status: **draft, thresholds proposed, awaiting Nano's sign-off.** Nothing here
-runs until he signs off and the storage port is finished (#1617, ADR-0035
-step 6).
+Status: **signed off by Nano, 2026-11-21** ("Approve as written", decision
+card `cmsg_012spbR8vYb6jWVUuV6ALzxuHfQhCeUcyFwPpCFLQdtBQ9`): gates,
+targets, the choosing rule and the raw-bodies rule below are fixed. The run
+waits for the storage port to finish (#1617, ADR-0035 step 6).
 
 ## Question
 
@@ -32,7 +33,7 @@ suites before any number counts. Updates and deletes on Attest are written as
 superseding records; that growth, and the cost of rebuilding its indexes
 from the log at open and of reclaiming space, is measured, not hidden.
 
-**Raw bodies (proposed).** Every adapter, the engine included, may keep raw
+**Raw bodies.** Every adapter, the engine included, may keep raw
 page and dialog bodies outside its RAM-resident tables, in the reusable blob
 store (audit seam 4), and only metadata in the tables. That follows the
 audit's option A ("raw bodies stay off the RAM-resident tables whichever
@@ -79,15 +80,15 @@ timed path. Relevance is checked on the CI golden set
 9. **Backup:** take a backup of D3 and restore it to a fresh directory,
    verified (D36).
 
-## Thresholds (proposed)
+## Thresholds
 
 A candidate that misses any **gate** is out. Store-side time only; the MCP
 round trip is not measured.
 
-| # | Gate | Proposed threshold | Why this number |
+| # | Gate | Threshold | Why this number |
 |---|---|---|---|
 | G1 | Conformance | 100% of port conformance suites pass | same behaviour or no comparison |
-| G2 | Relevance | recall@10 and MRR on both query sets no more than 2 points below the engine | proposed; borrows the 2-point tolerance Nano set for #1563 (D23) |
+| G2 | Relevance | recall@10 and MRR on both query sets no more than 2 points below the engine | borrows the 2-point tolerance Nano set for #1563 (D23) |
 | G3 | Steady memory | resident at most 1.0 GB with D3 loaded and idle | leaves about 3 GB for the connector, UI, OS and the release build that OOM'd the host on 2026-11-06 |
 | G4 | Peak memory | resident at most 1.5 GB at any point in workloads 1 to 7 | same budget, with room for ingest bursts |
 | G5 | Raw text stays off RAM | resident with D3 at most 1.25x resident with D1 | the reason for R3: 1.5 GB of raw text must not become 1.5 GB of RAM |
@@ -118,8 +119,8 @@ Scored, not gating (reported for every candidate that passes the gates):
    also covers the case where none meets them all).
 3. Ties go to the one with less storage code for us to own (adapter plus
    engine lines), because D6/D14 say Nano would trade "pure Rust" for not
-   maintaining storage code. This rule is proposed and leans toward SQLite;
-   Nano signs it off with the thresholds.
+   maintaining storage code. This rule leans toward SQLite, and Nano
+   approved it knowing that.
 
 The write-up recommends; Nano picks the store. Migrating the live store is a
 separate decision and card (R4).
