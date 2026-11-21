@@ -10,9 +10,11 @@
 
 mod feedback;
 mod history;
+mod imports;
 mod memories;
 mod reminders;
 mod saved_searches;
+mod stats;
 
 use super::{Result, StoreError};
 use rusqlite::{Connection, OptionalExtension, Params, Row};
@@ -24,8 +26,10 @@ const SCHEMAS: &[&str] = &[
     memories::SCHEMA,
     feedback::SCHEMA,
     history::SCHEMA,
+    imports::SCHEMA,
     reminders::SCHEMA,
     saved_searches::SCHEMA,
+    stats::SCHEMA,
 ];
 
 /// Every table group's rows in one SQLite database.
