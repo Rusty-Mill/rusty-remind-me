@@ -106,7 +106,12 @@ fn content(change: &CapturedChange) -> Result<Value> {
 
 /// A stored record back as the write it holds.
 fn captured(record: &Record) -> Result<CapturedChange> {
-    let malformed = || StoreError::Engine(format!("attest: record {} is malformed", record.envelope.lsn));
+    let malformed = || {
+        StoreError::Engine(format!(
+            "attest: record {} is malformed",
+            record.envelope.lsn
+        ))
+    };
     let body = record.content.as_ref().ok_or_else(malformed)?;
     let field = |k: &str| body.get(k).and_then(Value::as_str).map(str::to_string);
     Ok(CapturedChange {
