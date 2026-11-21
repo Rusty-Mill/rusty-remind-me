@@ -1,0 +1,19 @@
+# R3's Attest adapter (D45, D47, D48): outside the remind-me workspace, with
+# its own lockfile, so Attest and its rusty_mill tag never enter remind-me's
+# dependency graph or CI. Benchmark-only; nothing ships from here.
+[package]
+name = "attest_store"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.98.1"
+publish = false
+
+[workspace]
+
+[dependencies]
+remind_me_core = { path = "../../crates/remind_me_core" }
+attest = { git = "https://github.com/Rusty-Mill/rusty_attest", rev = "1711d0c76925a6e1858157cdc2b9d9c4c7526a05" }
+rusty_serde = { git = "https://github.com/Rusty-Mill/rusty_mill", tag = "libs-2026.11.0" }
+
+[dev-dependencies]
+serde_json = "1.0"
