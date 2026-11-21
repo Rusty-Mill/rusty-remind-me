@@ -3,6 +3,7 @@
 use super::core::{Change, CoreTables};
 use super::memories::{self, MemoryRecord, MemoryRow};
 use super::{core_ref, engine_id, EngineTables};
+#[cfg(test)]
 use crate::db::backend::BackendGuard;
 use crate::db::{Result, StoreError};
 use crate::testing::{OutboxRow, Table, TestRows};
