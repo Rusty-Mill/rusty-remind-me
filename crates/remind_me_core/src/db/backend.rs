@@ -326,7 +326,19 @@ pub(crate) struct Transaction<'t> {
 impl<'t> Transaction<'t> {
     pub(crate) fn begin(backend: &'t BackendLock) -> Result<Self> {
         backend.claim()?;
-        if let Err(e) = backend.backend_guard().begin_transaction() {
+        let mut guard = backend.backend_guard();
+        // A write outside any transaction may have left the backend
+        // unsettled; `claim` sees only the gate, so check the backend too.
+        if guard.transaction_state() == TransactionState::NeedsRecovery {
+            drop(guard);
+            let why = "a write outside a transaction did not settle".to_string();
+            let refused = needs_recovery(&why);
+            backend.release(Some(why));
+            return Err(refused);
+        }
+        let begun = guard.begin_transaction();
+        drop(guard);
+        if let Err(e) = begun {
             backend.release(None);
             return Err(e);
         }
@@ -339,7 +351,8 @@ impl<'t> Transaction<'t> {
     /// Commit, then let other threads in. A failed commit that leaves the
     /// transaction open is rolled back first, and one that leaves it
     /// unsettled fails the lock closed (see [`Backend::commit_transaction`]),
-    /// so the gate never opens on a half-settled batch.
+    /// so the gate never opens on a half-settled batch. A commit that
+    /// reports success but leaves the backend unsettled is an error too.
     pub(crate) fn commit(mut self) -> Result<()> {
         self.open = false;
         let (committed, failed) = {
@@ -351,8 +364,9 @@ impl<'t> Transaction<'t> {
             );
             (committed, failed)
         };
+        let unsettled = failed.as_deref().map(needs_recovery);
         self.backend.release(failed);
-        committed
+        committed.and(unsettled.map_or(Ok(()), Err))
     }
 }
 
