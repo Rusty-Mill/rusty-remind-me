@@ -45,6 +45,9 @@ pub enum Reason {
     /// More than one place fits, or the fitting run occurs more than once in
     /// the record.
     Ambiguous,
+    /// The text fits, but a turn's known id differs from the recorded one
+    /// at the same place: equal text, different turns.
+    IdConflict,
 }
 
 impl Placement {
@@ -59,6 +62,7 @@ impl Placement {
             } => "overlap",
             Placement::Unplaced(Reason::NoOverlap) => "unplaced_no_overlap",
             Placement::Unplaced(Reason::Ambiguous) => "unplaced_ambiguous",
+            Placement::Unplaced(Reason::IdConflict) => "unplaced_id_conflict",
         }
     }
 }
@@ -74,6 +78,8 @@ pub struct Record<'a> {
     pub blocks: &'a [Block<'a>],
     /// Every message id the rows hold, when every row lists its ids.
     pub ids: Option<&'a HashSet<String>>,
+    /// The id of each of `blocks`, where known: empty, or one per block.
+    pub block_ids: &'a [Option<&'a str>],
 }
 
 /// A transcript's messages as the record would store them.
@@ -82,6 +88,8 @@ pub struct Incoming<'a> {
     pub blocks: &'a [String],
     /// Each message's id, when every message has one.
     pub ids: Option<&'a [String]>,
+    /// Each message's id, where known: empty, or one per block.
+    pub position_ids: &'a [Option<String>],
 }
 
 /// Place `incoming` against `record`.
@@ -92,7 +100,7 @@ pub fn place(record: &Record<'_>, incoming: &Incoming<'_>) -> Placement {
     if let (Some(held), Some(ids)) = (record.ids, incoming.ids) {
         return by_id(held, ids);
     }
-    by_text(record.blocks, incoming.blocks)
+    by_text(record, incoming)
 }
 
 /// The roles that open `blocks` (`**role:** …`), for [`split_row`].
@@ -179,18 +187,40 @@ fn by_id(held: &HashSet<String>, ids: &[String]) -> Placement {
     }
 }
 
+/// Most whole occurrences whose ids are checked before a copy is called
+/// held: bounds the work on a record of repeated short turns.
+const CHECKED_OCCURRENCES: usize = 16;
+
 /// Whole-message placement in linear time: one KMP pass of the transcript
 /// over the record finds whether the record holds it whole and every
 /// transcript prefix the record ends with; a second pass counts the one
 /// candidate prefix.
-fn by_text(record: &[Block<'_>], blocks: &[String]) -> Placement {
-    let pattern: Vec<&str> = blocks.iter().map(String::as_str).collect();
+///
+/// Equal text is not enough where ids are known on both sides: an
+/// alignment is accepted only when no turn's known id differs from the
+/// recorded one it lines up with.
+fn by_text(record: &Record<'_>, incoming: &Incoming<'_>) -> Placement {
+    let pattern: Vec<&str> = incoming.blocks.iter().map(String::as_str).collect();
     let fail = failure(&pattern);
-    let (whole, end) = scan(record, &pattern, &fail);
+    let mut ends = Vec::new();
+    let (whole, end) = scan(record.blocks, &pattern, &fail, &mut ends);
+    // Ids agree when the run of `len` turns ending before `at` matches the
+    // transcript's first `len` turns wherever both ids are known.
+    let agrees = |at: usize, len: usize| {
+        (0..len).all(|k| {
+            let held = record.block_ids.get(at - len + k).copied().flatten();
+            let sent = incoming.position_ids.get(k).and_then(|id| id.as_deref());
+            !matches!((held, sent), (Some(a), Some(b)) if a != b)
+        })
+    };
     // A copy the record already holds whole, such as an older shorter one.
-    if whole > 0 {
+    if ends.iter().any(|&at| agrees(at, pattern.len())) {
         return Placement::Held;
     }
+    if whole > ends.len() {
+        return Placement::Unplaced(Reason::Ambiguous);
+    }
+    let conflicted = whole > 0;
     // Every j where the transcript's first j messages are how the record
     // ends: the final state and its failure chain. Placed only when one such
     // j exists and its run occurs nowhere else in the record.
@@ -198,11 +228,17 @@ fn by_text(record: &[Block<'_>], blocks: &[String]) -> Placement {
         .take_while(|&j| j > 0)
         .collect();
     match fits.as_slice() {
+        [] if conflicted => Placement::Unplaced(Reason::IdConflict),
         [] => Placement::Unplaced(Reason::NoOverlap),
-        [j] if count(record, &pattern[..*j]) == 1 => Placement::New {
-            indexes: (*j..blocks.len()).collect(),
-            by: Method::Overlap,
-        },
+        [j] if count(record.blocks, &pattern[..*j]) == 1 => {
+            if !agrees(record.blocks.len(), *j) {
+                return Placement::Unplaced(Reason::IdConflict);
+            }
+            Placement::New {
+                indexes: (*j..pattern.len()).collect(),
+                by: Method::Overlap,
+            }
+        }
         _ => Placement::Unplaced(Reason::Ambiguous),
     }
 }
@@ -225,10 +261,17 @@ fn failure(pattern: &[&str]) -> Vec<usize> {
 }
 
 /// Run `pattern` over `record`: how many times it occurs whole, and the
-/// length of the longest prefix of it the record ends with.
-fn scan(record: &[Block<'_>], pattern: &[&str], fail: &[usize]) -> (usize, usize) {
+/// length of the longest prefix of it the record ends with. The end of each
+/// whole occurrence (exclusive) is pushed to `ends`, up to
+/// [`CHECKED_OCCURRENCES`].
+fn scan(
+    record: &[Block<'_>],
+    pattern: &[&str],
+    fail: &[usize],
+    ends: &mut Vec<usize>,
+) -> (usize, usize) {
     let (mut found, mut k) = (0, 0);
-    for block in record {
+    for (at, block) in record.iter().enumerate() {
         let Some(block) = *block else {
             k = 0;
             continue;
@@ -241,6 +284,9 @@ fn scan(record: &[Block<'_>], pattern: &[&str], fail: &[usize]) -> (usize, usize
         }
         if k == pattern.len() {
             found += 1;
+            if ends.len() < CHECKED_OCCURRENCES {
+                ends.push(at + 1);
+            }
             k = fail[k - 1];
         }
     }
@@ -249,7 +295,7 @@ fn scan(record: &[Block<'_>], pattern: &[&str], fail: &[usize]) -> (usize, usize
 
 /// How many times the run `pattern` occurs in `record`, overlaps included.
 fn count(record: &[Block<'_>], pattern: &[&str]) -> usize {
-    scan(record, pattern, &failure(pattern)).0
+    scan(record, pattern, &failure(pattern), &mut Vec::new()).0
 }
 
 #[cfg(test)]
@@ -268,10 +314,12 @@ mod tests {
             &Record {
                 blocks: &recorded,
                 ids: None,
+                block_ids: &[],
             },
             &Incoming {
                 blocks: &sent,
                 ids: None,
+                position_ids: &[],
             },
         )
     }
@@ -365,10 +413,12 @@ mod tests {
                 &Record {
                     blocks: &[],
                     ids: Some(&held),
+                    block_ids: &[],
                 },
                 &Incoming {
                     blocks: &sent[..ids.len()],
                     ids: Some(&ids),
+                    position_ids: &[],
                 },
             )
         };
@@ -434,13 +484,67 @@ mod tests {
             &Record {
                 blocks: &recorded,
                 ids: None,
+                block_ids: &[],
             },
             &Incoming {
                 blocks: &sent,
                 ids: None,
+                position_ids: &[],
             },
         );
         assert_eq!(placed, Placement::Unplaced(Reason::NoOverlap));
+    }
+
+    /// Text placement with ids known at some positions on each side.
+    fn with_ids(record: &[(&str, Option<&str>)], sent: &[(&str, Option<&str>)]) -> Placement {
+        let texts: Vec<&str> = record.iter().map(|(t, _)| *t).collect();
+        let recorded_text = blocks(&texts);
+        let recorded: Vec<Block<'_>> = recorded_text.iter().map(|b| Some(b.as_str())).collect();
+        let block_ids: Vec<Option<&str>> = record.iter().map(|(_, id)| *id).collect();
+        let sent_texts: Vec<&str> = sent.iter().map(|(t, _)| *t).collect();
+        let sent_blocks = blocks(&sent_texts);
+        let position: Vec<Option<String>> =
+            sent.iter().map(|(_, id)| id.map(str::to_string)).collect();
+        place(
+            &Record {
+                blocks: &recorded,
+                // One id-less row: no id set, so placement falls to text.
+                ids: None,
+                block_ids: &block_ids,
+            },
+            &Incoming {
+                blocks: &sent_blocks,
+                ids: None,
+                position_ids: &position,
+            },
+        )
+    }
+
+    #[test]
+    fn equal_text_with_a_known_different_id_is_never_held_or_placed() {
+        let record = [("a", Some("u1")), ("b", Some("u2")), ("c", None)];
+        // Same text, same or unknown ids: held.
+        assert_eq!(
+            with_ids(&record, &[("b", Some("u2")), ("c", Some("u3"))]),
+            Placement::Held
+        );
+        assert_eq!(
+            with_ids(&record, &[("a", None), ("b", None)]),
+            Placement::Held
+        );
+        // Same text, a known different id: a different turn.
+        assert_eq!(
+            with_ids(&record, &[("a", Some("u1")), ("b", Some("u9"))]),
+            Placement::Unplaced(Reason::IdConflict)
+        );
+        // An unknown id never blocks an overlap.
+        assert_eq!(with_ids(&record, &[("c", None), ("d", None)]), new_at([1]));
+        // The overlap fits by text but not by id.
+        let record = [("a", Some("u1")), ("b", Some("u2"))];
+        assert_eq!(
+            with_ids(&record, &[("b", Some("u9")), ("c", Some("u3"))]),
+            Placement::Unplaced(Reason::IdConflict)
+        );
     }
 
     #[test]

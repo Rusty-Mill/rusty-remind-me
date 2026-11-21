@@ -935,3 +935,34 @@ fn a_legacy_row_with_a_count_places_a_tail_on_checked_boundaries() {
     assert_eq!(rows[0].metadata["placement"], "overlap");
     assert_eq!(rows[0].content, "**assistant:** c1");
 }
+
+#[test]
+fn a_text_match_never_holds_a_turn_with_a_known_different_id() {
+    use remind_me_core::transcript::{capture_transcript, captured_messages};
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let first = [session_line("user", "a1"), session_line("assistant", "b1")];
+    capture_transcript(&store, &first.join("\n"), &frozen_request("stop")).unwrap();
+    // An id-less unplaced row: the record no longer lists every id, so
+    // placement falls back to text.
+    capture_transcript(&store, &bare(&["x1", "y1"]), &frozen_request("stop")).unwrap();
+
+    // The same turns again, ids and all: held.
+    capture_transcript(&store, &first.join("\n"), &frozen_request("stop")).unwrap();
+    assert_eq!(continuations(&store).len(), 1);
+
+    // The same text, but the second turn is another one.
+    let mut other: serde_json::Value = serde_json::from_str(&first[1]).unwrap();
+    other["uuid"] = "u-another-b1".into();
+    let sent = [first[0].clone(), other.to_string()].join("\n");
+    capture_transcript(&store, &sent, &frozen_request("stop")).unwrap();
+
+    let rows = continuations(&store);
+    assert_eq!(rows.len(), 2, "a known different id is a new turn");
+    assert_eq!(rows[1].metadata["placement"], "unplaced_id_conflict");
+    assert_eq!(
+        rows[1].metadata["message_ids"],
+        json!(["u-a1", "u-another-b1"])
+    );
+    assert_eq!(captured_messages(&store, "s-frozen").unwrap(), Some(6));
+}

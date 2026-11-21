@@ -351,3 +351,46 @@ fn a_normalized_memory_is_stamped() {
     // The raw memory plus its distillation.
     assert_all_stamped(&store, "apply_normalizations", 2);
 }
+
+#[test]
+fn a_continuation_row_is_stamped_and_keeps_its_session() {
+    use remind_me_core::transcript::{capture_transcript, TranscriptRequest};
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _ident = Ident::set();
+    let db = db("continuation");
+    let store = db.store();
+    let line = |role: &str, text: &str| {
+        serde_json::json!({
+            "type": role, "sessionId": "s-prov", "uuid": format!("u-{text}"),
+            "timestamp": "2026-11-21T10:00:00.000Z",
+            "message": {"role": role, "content": text}
+        })
+        .to_string()
+    };
+    let request = TranscriptRequest {
+        session_id: "s-prov",
+        cwd: None,
+        reason: Some("stop"),
+        context: None,
+    };
+    let first = [line("user", "ask"), line("assistant", "reply")];
+    let made = capture_transcript(&store, &first.join("\n"), &request).unwrap();
+    let grown = [first.join("\n"), line("user", "later")].join("\n");
+    capture_transcript(&store, &grown, &request).unwrap();
+
+    // The dialog, the summary and the continuation.
+    assert_all_stamped(&store, "transcript recapture", 3);
+    let dialog = queries::get_memory_by_id(&store, &made.dialog_id)
+        .unwrap()
+        .unwrap();
+    let continuation = remind_me_core::episodes::session_memories(&store, "s-prov")
+        .unwrap()
+        .into_iter()
+        .find(|m| m.metadata["type"] == remind_me_core::transcript::CONTINUATION_TYPE)
+        .unwrap();
+    assert_eq!(continuation.session_id, dialog.session_id);
+    assert_eq!(continuation.session_id.as_deref(), Some("s-prov"));
+    assert_eq!(continuation.project, dialog.project);
+    assert_eq!(continuation.written_by, "hook");
+    assert_eq!(continuation.capture_method, "auto");
+}

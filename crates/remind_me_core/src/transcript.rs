@@ -837,14 +837,16 @@ fn session_context(
     }
 }
 
-/// The ids of every message in `raw`, when each has one and the dialog holds
-/// them all: a dialog cut to [`MAX_DIALOG_CHARS`] lists none, so placement
-/// falls back to text rather than trust ids whose turns were cut.
-fn whole_ids(raw: &str, parsed: &TranscriptSummary) -> Option<Vec<String>> {
+/// Each message's id in `raw` (`None` where it has none), when the dialog
+/// holds every message: a dialog cut to [`MAX_DIALOG_CHARS`] lists none, so
+/// ids are never trusted for turns that were cut. Placement by id needs
+/// every entry known; text placement uses the known ones to refuse a match
+/// between different turns.
+fn whole_ids(raw: &str, parsed: &TranscriptSummary) -> Option<Vec<Option<String>>> {
     if parsed.dialog.starts_with(TRUNCATION_MARKER) {
         return None;
     }
-    message_ids(&messages_of(raw))
+    Some(messages_of(raw).into_iter().map(|m| m.uuid).collect())
 }
 
 /// Create the session's dialog and summary pair.
@@ -976,10 +978,19 @@ fn recapture_in(
     // compares against placed rows only. Its ids still count as held.
     let placed_rows: Vec<&crate::models::Memory> =
         rows.iter().filter(|row| !is_unplaced(row)).collect();
-    let recorded: Vec<Block<'_>> = placed_rows
-        .iter()
-        .flat_map(|row| row_blocks(row, &roles))
-        .collect();
+    let mut recorded: Vec<Block<'_>> = Vec::new();
+    let mut recorded_positions: Vec<Option<String>> = Vec::new();
+    for row in &placed_rows {
+        let row_split = row_blocks(row, &roles);
+        let mut row_ids = position_ids(row);
+        // Ids that do not line up one per message say nothing about any.
+        if row_ids.len() != row_split.len() {
+            row_ids = vec![None; row_split.len()];
+        }
+        recorded.extend(row_split);
+        recorded_positions.extend(row_ids);
+    }
+    let block_ids: Vec<Option<&str>> = recorded_positions.iter().map(|id| id.as_deref()).collect();
     let placed_count: usize = placed_rows.iter().map(|row| held_messages(row)).sum();
     let held_ids = recorded_ids(&rows);
     let ids = message_ids(&messages);
@@ -987,11 +998,13 @@ fn recapture_in(
     let incoming = Incoming {
         blocks: &blocks,
         ids: ids.as_deref(),
+        position_ids: &position,
     };
     let placement = place(
         &Record {
             blocks: &recorded,
             ids: held_ids.as_ref(),
+            block_ids: &block_ids,
         },
         &incoming,
     );
@@ -1135,6 +1148,10 @@ fn append_continuation(
         "reason": at.reason,
     });
     let content = crate::boundary::scrub(text, &mut tags, &mut metadata);
+    // Stamped as the first capture is (node, client, writer), then given
+    // the first row's session fields, so a continuation is attributed
+    // where its record is.
+    let provenance = crate::context::default_provenance().auto();
     let row = NewMemory {
         category: crate::models::DIALOG_CATEGORY.to_string(),
         tags,
@@ -1155,7 +1172,7 @@ fn append_continuation(
         sensitive: first.sensitive,
         written_by: "hook".into(),
         capture_method: "auto".into(),
-        ..NewMemory::new(id.clone(), content.clone(), &now)
+        ..provenance.stamp(NewMemory::new(id.clone(), content.clone(), &now))
     };
     Memories::new(store).insert(&row)?;
     Ok((id, content))
