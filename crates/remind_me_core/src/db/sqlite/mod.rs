@@ -545,6 +545,46 @@ mod tests {
         assert!(!MemoryStore::exists(&t, "alone").unwrap());
     }
 
+    /// The same loss through the shared wrapper: the owning thread's own
+    /// reads and writes are refused before it leaves the transaction, the
+    /// transaction returns an error even though its work returned Ok, and
+    /// the store refuses everyone until it is reopened.
+    #[test]
+    fn a_lost_outer_transaction_is_refused_to_its_owner_until_reopen() {
+        let dir = scratch("lost_outer");
+        let db = Database::open_backend(Box::new(SqliteTables::open(&dir).unwrap()), None).unwrap();
+        let store = db.store();
+        let outcome = store.transaction(|store| {
+            MemoryStore::insert(
+                &mut *store.backend().lock()?,
+                &NewMemory::new("gone", "x", NOW),
+            )?;
+            let lost = sqlite(&mut store.backend().lock()?).atomic(|c| {
+                exec(c, "ROLLBACK", [])?;
+                Err::<(), _>(StoreError::Invalid("give up".into()))
+            });
+            assert!(lost.is_err());
+            assert!(
+                Memories::new(store).exists("gone").is_err(),
+                "the owner's reads are refused"
+            );
+            assert!(store.backend().lock().is_err(), "and so are its writes");
+            Ok::<(), StoreError>(())
+        });
+        assert!(outcome.is_err(), "the transaction reports the loss");
+        assert!(Memories::new(&store).exists("gone").is_err());
+        assert!(store.transaction(|_| Ok::<(), StoreError>(())).is_err());
+        drop(store);
+        drop(db);
+
+        let db = Database::open_backend(Box::new(SqliteTables::open(&dir).unwrap()), None).unwrap();
+        let store = db.store();
+        assert!(!Memories::new(&store).exists("gone").unwrap(), "reopened");
+        drop(store);
+        drop(db);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// A poisoned transaction refuses further writes, not only its commit.
     #[test]
     fn a_poisoned_transaction_refuses_further_writes() {
