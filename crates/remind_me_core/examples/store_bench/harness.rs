@@ -22,7 +22,7 @@
 //! G7 or G8 evidence. A restore that differs fails the run.
 //!
 //! The run is offline. It refuses to start when the environment configures
-//! an embedder, query expansion or reranking, rather than letting them
+//! an embedder, query expansion or a reranking model, rather than letting them
 //! clear the bench vectors or call a model inside a timed search. Searches
 //! run without a deadline, and one that skipped a stage, or a hybrid search
 //! whose semantic stage did not run, fails the run.
@@ -195,13 +195,15 @@ fn refuse_model_config() -> Result<()> {
         )
         .into());
     }
-    if reranker::available() && reranker::enabled() {
+    // Reranking is on by default but runs only with a model configured.
+    if matches!(reranker::status(), reranker::Status::Ready) {
         return Err(format!(
-            "reranking is on; set {}= (empty) to turn it off",
+            "a reranking model is configured; set {}= (empty) to turn reranking off",
             reranker::BACKEND_ENV
         )
         .into());
     }
+
     Ok(())
 }
 
