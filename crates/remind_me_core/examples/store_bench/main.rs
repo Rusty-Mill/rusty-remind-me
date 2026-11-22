@@ -81,6 +81,8 @@ mod tests {
 
     /// Memories in the D1 fixture: enough for 500 distinct queries.
     const FIXTURE: usize = 520;
+    /// The memories the fixture's project claim adds (stage and status).
+    const CLAIMS: usize = 2;
 
     /// A small engine store backed up as `manual-*.engine`: D1's source.
     fn small_backup(root: &Path) -> std::path::PathBuf {
@@ -145,6 +147,23 @@ mod tests {
                 "2026-11-22",
             ))
             .unwrap();
+        // A project claim: append-only, so the edit samples must skip it.
+        use remind_me_core::project::{self, ClaimValue, SetInput, Stage, Status};
+        project::set(
+            &store,
+            &SetInput {
+                project: "a".into(),
+                claims: vec![
+                    ClaimValue::Stage(Stage::Idea),
+                    ClaimValue::Status(Status::Active),
+                ],
+                evidence: vec![ids[3].clone()],
+                because: None,
+                confirmed_by: "human".into(),
+                proposal: None,
+            },
+        )
+        .unwrap();
         remind_me_core::backup::create_backup(&store, "manual")
             .unwrap()
             .path
@@ -180,7 +199,7 @@ mod tests {
             }
             let loaded = &report["loaded"];
             for (kind, n) in [
-                ("memories", FIXTURE),
+                ("memories", FIXTURE + CLAIMS),
                 ("vectors", FIXTURE),
                 ("entities", 2),
                 ("links", 1),
@@ -191,6 +210,15 @@ mod tests {
             }
             assert_eq!(report["restore"]["matched"], true, "{}", candidate.name);
             assert_eq!(report["parity"]["matched"], true, "{}", candidate.name);
+            // The claim (and the dialogs) stay loaded but out of the edits.
+            assert_eq!(
+                report["edit_pool"]["append_only"],
+                FIXTURE.div_ceil(3) + CLAIMS,
+                "every dialog and both claims"
+            );
+            for metric in ["update", "delete"] {
+                assert!(report[metric]["count"].as_u64().unwrap() > 0, "{metric}");
+            }
             assert_eq!(report["embedding_identity"]["unchanged"], true);
             assert_eq!(report["embedding_identity"]["after_reopen"], true);
             assert!(report["cold_open"]["cache"]
@@ -215,7 +243,7 @@ mod tests {
         let backup = small_backup(&root);
         let dataset = Dataset::D2 {
             backup,
-            total: FIXTURE + 20,
+            total: FIXTURE + CLAIMS + 20,
         };
         let report = measure(
             ENGINE,
@@ -226,7 +254,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(report["grown"]["memories"], 20);
-        assert_eq!(report["memories"], FIXTURE + 20);
+        assert_eq!(report["memories"], FIXTURE + CLAIMS + 20);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -251,6 +279,20 @@ mod tests {
             assert!(measure(ENGINE, Mode::Bench, &dataset, runs, Isolation::InProcess).is_err());
         }
         assert!(!inside.exists());
+        // A root reached through a symlink into the backup, existing or not.
+        #[cfg(unix)]
+        {
+            let link = root.join("link");
+            std::os::unix::fs::symlink(&backup, &link).unwrap();
+            for runs in [link.clone(), link.join("runs")] {
+                assert!(
+                    measure(ENGINE, Mode::Bench, &dataset, &runs, Isolation::InProcess).is_err(),
+                    "{}",
+                    runs.display()
+                );
+            }
+            assert!(!backup.join("runs").exists());
+        }
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

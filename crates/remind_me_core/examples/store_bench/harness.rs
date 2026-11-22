@@ -303,7 +303,7 @@ pub fn measure(
                 return Err(format!("backup {} is not a directory", backup.display()).into());
             }
             let backup = backup.canonicalize()?;
-            let root = std::path::absolute(root)?;
+            let root = resolved(root)?;
             if backup.starts_with(&root) || root.starts_with(&backup) {
                 return Err(format!(
                     "the run root {} and the backup {} overlap",
@@ -359,6 +359,28 @@ fn disk(dir: &Path) -> Result<Value> {
         "blobs": megabytes(blobs),
         "total": megabytes(store + temp + blobs),
     }))
+}
+
+/// `path` with every symlink resolved, even where it does not exist yet:
+/// its nearest existing ancestor canonicalized, the rest appended.
+fn resolved(path: &Path) -> Result<PathBuf> {
+    let path = std::path::absolute(path)?;
+    let mut rest = Vec::new();
+    let mut base = path.as_path();
+    while !base.exists() {
+        rest.push(
+            base.file_name()
+                .ok_or("the run root has no existing ancestor")?,
+        );
+        base = base
+            .parent()
+            .ok_or("the run root has no existing ancestor")?;
+    }
+    let mut out = base.canonicalize()?;
+    for part in rest.iter().rev() {
+        out.push(part);
+    }
+    Ok(out)
 }
 
 /// A new run directory, `run`, inside a private (0700) directory under
@@ -544,16 +566,23 @@ fn workload(
     report.insert("reopen_warm_ms".into(), json!(millis(started.elapsed())));
     let store = db.store();
 
-    // Dialogs are the verbatim record and refuse edits (#1616), so updates
-    // and deletes take the other memories.
+    // Dialogs (#1616) and claims are append-only and refuse edits, so
+    // updates and deletes take only the rows the store would let them
+    // change, by the same check the edits make.
     let (mut editable, mut dialog) = (Vec::new(), None);
     for id in &ids {
-        if testing::memory_text(&store, id, "category")?.as_deref() != Some(DIALOG) {
+        let memory = queries::get_memory_by_id(&store, id)?
+            .ok_or_else(|| format!("memory {id} vanished after seeding"))?;
+        if remind_me_core::dialog::refuse_protected_edit(&memory).is_ok() {
             editable.push(id.clone());
-        } else if dialog.is_none() {
+        } else if dialog.is_none() && memory.category == DIALOG {
             dialog = Some(id.clone());
         }
     }
+    report.insert(
+        "edit_pool".into(),
+        json!({ "editable": editable.len(), "append_only": ids.len() - editable.len() }),
+    );
     let pick = |rng: &mut Rng| ids[rng.below(ids.len())].clone();
     let pick_editable = |rng: &mut Rng| editable[rng.below(editable.len())].clone();
     report.insert(
@@ -629,7 +658,7 @@ fn workload(
     // A small store can have no editable rows (n = 1 draws a dialog):
     // updates and deletes then report zero samples rather than failing.
     let update = if editable.is_empty() {
-        skipped("no editable (non-dialog) rows")
+        skipped("no editable rows (dialogs and claims are append-only)")
     } else {
         timed(|_| {
             let input: MemoryUpdateInput = serde_json::from_value(json!({
@@ -682,7 +711,7 @@ fn workload(
         }
     }
     let delete = if times.is_empty() {
-        skipped("no editable (non-dialog) rows")
+        skipped("no editable rows (dialogs and claims are append-only)")
     } else {
         summary(times)
     };
