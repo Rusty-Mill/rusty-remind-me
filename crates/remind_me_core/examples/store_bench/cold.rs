@@ -227,6 +227,7 @@ mod tests {
     /// until the held value is dropped, after the idle sample.
     #[test]
     fn the_store_stays_open_until_the_held_query_is_dropped() {
+        let _serial = super::super::serial();
         let dir = std::env::temp_dir().join(format!("store_bench_held_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

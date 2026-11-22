@@ -434,6 +434,7 @@ mod tests {
     /// A loaded copy passes parity; a row changed afterwards fails it.
     #[test]
     fn parity_catches_a_row_the_load_did_not_carry() {
+        let _serial = super::super::serial();
         let root = std::env::temp_dir().join(format!("d1_parity_{}", std::process::id()));
         let bodies = Bodies::new(&root);
         let (source, target) = (engine(), {
@@ -466,6 +467,7 @@ mod tests {
     /// texts overwriting one vector.
     #[test]
     fn a_shared_query_text_is_used_once() {
+        let _serial = super::super::serial();
         let db = engine();
         let store = db.store();
         let ids = [

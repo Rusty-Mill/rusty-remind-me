@@ -271,6 +271,19 @@ fn find(candidates: &[Candidate], name: &str) -> Result<Candidate> {
         .ok_or_else(|| format!("unknown backend {name:?}; one of {names:?}").into())
 }
 
+/// Taken by every test that opens a store. A write stamps its context by
+/// running `git`, and a child spawned while another test holds a store
+/// lock inherits that lock's open file until it execs, so a reopen in the
+/// other test can find the store "in use by another process". Tests that
+/// open stores therefore run one at a time.
+#[cfg(test)]
+pub fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// The file every run directory holds, so a child refuses any other.
 const RUN_MARK: &str = ".store_bench_run";
 
@@ -1545,6 +1558,7 @@ mod tests {
     /// bounded time, instead of leaving the readers at the barrier.
     #[test]
     fn a_failed_first_write_fails_the_run_instead_of_hanging() {
+        let _serial = serial();
         let dir = std::env::temp_dir().join(format!("store_bench_hang_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

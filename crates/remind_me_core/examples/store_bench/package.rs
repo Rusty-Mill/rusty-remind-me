@@ -330,6 +330,7 @@ mod tests {
     /// changes the manifest.
     #[test]
     fn a_read_covers_the_graph_and_catches_a_changed_relation() {
+        let _serial = super::super::serial();
         use remind_me_core::db::engine::EngineTables;
         use remind_me_core::db::entities::Entities;
         use remind_me_core::db::references::NewReference;
@@ -404,6 +405,7 @@ mod tests {
     /// The same entity content written by another node is a changed row.
     #[test]
     fn a_changed_node_id_differs() {
+        let _serial = super::super::serial();
         use remind_me_core::db::entities::Entities;
         use remind_me_core::entity::Entity;
         let db = engine();
@@ -430,6 +432,7 @@ mod tests {
     /// One embedding stored at another chunk index is a different row.
     #[test]
     fn the_same_vector_at_another_chunk_index_differs() {
+        let _serial = super::super::serial();
         use remind_me_core::db::memories::{Memories, NewMemory};
         use remind_me_core::db::vectors::Vectors;
         let manifest_with_chunk_at = |ix: usize| {

@@ -48,6 +48,7 @@ mod tests {
     /// the run still completes.
     #[test]
     fn the_minimum_size_reports_skipped_edits() {
+        let _serial = harness::serial();
         let root = std::env::temp_dir().join(format!("store_bench_min_{}", std::process::id()));
         let report = measure(
             SQLITE,
@@ -174,6 +175,7 @@ mod tests {
     /// the run completes with an isolated restore and a cold open.
     #[test]
     fn d1_loads_the_backup_into_each_candidate() {
+        let _serial = harness::serial();
         let root = std::env::temp_dir().join(format!("store_bench_d1_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let backup = small_backup(&root);
@@ -238,6 +240,7 @@ mod tests {
     /// D2 grows the loaded store to its total.
     #[test]
     fn d2_grows_d1_to_its_total() {
+        let _serial = harness::serial();
         let root = std::env::temp_dir().join(format!("store_bench_d2_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let backup = small_backup(&root);
@@ -270,6 +273,7 @@ mod tests {
     /// refused before anything is written.
     #[test]
     fn a_root_overlapping_the_backup_is_refused() {
+        let _serial = harness::serial();
         let root = std::env::temp_dir().join(format!("store_bench_overlap_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let backup = small_backup(&root);
