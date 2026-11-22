@@ -189,14 +189,14 @@ impl<'c> Vectors<'c> {
 ///
 /// Liveness and candidates are read from memories, so a backend under test
 /// implements [`MemoryStore`] too.
-#[cfg(test)]
-pub(crate) mod conformance {
+#[doc(hidden)]
+pub mod conformance {
     use super::{ChunkVector, VectorStore};
     use crate::db::memories::{MemoryStore, NewMemory};
 
     const NOW: &str = "2026-09-26T00:00:00+00:00";
 
-    pub(crate) fn live_chunks_skip_deleted_memories_and_respect_the_narrowing<
+    pub fn live_chunks_skip_deleted_memories_and_respect_the_narrowing<
         S: VectorStore + MemoryStore,
     >(
         store: &mut S,
@@ -226,7 +226,7 @@ pub(crate) mod conformance {
     }
 
     /// Every read and write of the vector tables on a fixed corpus.
-    pub(crate) fn the_vector_tables_read_back_what_was_written<S: VectorStore + MemoryStore>(
+    pub fn the_vector_tables_read_back_what_was_written<S: VectorStore + MemoryStore>(
         store: &mut S,
     ) {
         let memory = |id: &str, created: &str| NewMemory {
@@ -387,9 +387,7 @@ pub(crate) mod conformance {
         assert_eq!(store.any_embedding().unwrap(), None);
     }
 
-    pub(crate) fn a_memory_with_a_chunk_is_not_unembedded<S: VectorStore + MemoryStore>(
-        store: &mut S,
-    ) {
+    pub fn a_memory_with_a_chunk_is_not_unembedded<S: VectorStore + MemoryStore>(store: &mut S) {
         MemoryStore::insert(store, &NewMemory::new("a", "x", NOW)).unwrap();
         MemoryStore::insert(store, &NewMemory::new("b", "y", NOW)).unwrap();
         store.put("a", 0, &[1, 0, 0, 0]).unwrap();
@@ -406,7 +404,8 @@ pub(crate) mod conformance {
 
 /// One `#[test]` per [`conformance`] check, each on a fresh store from
 /// `$make`. A backend's adapter invokes it in its own test module.
-#[cfg(test)]
+#[doc(hidden)]
+#[macro_export]
 macro_rules! vector_conformance {
     ($make:expr) => {
         use $crate::db::vectors::conformance;
@@ -425,8 +424,8 @@ macro_rules! vector_conformance {
         }
     };
 }
-#[cfg(test)]
-pub(crate) use vector_conformance;
+#[doc(hidden)]
+pub use crate::vector_conformance;
 
 #[cfg(test)]
 mod tests {

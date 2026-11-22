@@ -365,15 +365,15 @@ impl<'c> Entities<'c> {
 ///
 /// Mention links point at memories, so a backend under test implements
 /// [`MemoryStore`] too, and the checks seed memories through it.
-#[cfg(test)]
-pub(crate) mod conformance {
+#[doc(hidden)]
+pub mod conformance {
     use super::{EntityStore, EntitySyncView, RelationRow};
     use crate::db::derived::Origin;
     use crate::db::memories::{MemoryStore, NewMemory};
     use crate::entity::Entity;
 
-    pub(crate) const T1: &str = "2026-09-26T00:00:00+00:00";
-    pub(crate) const T2: &str = "2026-09-27T00:00:00+00:00";
+    pub const T1: &str = "2026-09-26T00:00:00+00:00";
+    pub const T2: &str = "2026-09-27T00:00:00+00:00";
 
     fn entity(id: &str, name: &str, created_at: &str) -> Entity {
         Entity {
@@ -388,9 +388,7 @@ pub(crate) mod conformance {
 
     /// Every graph write and every read after. Run with sync on, the same
     /// writes are what [`tests`](super::tests) checks the outbox against.
-    pub(crate) fn the_graph_keeps_entities_links_and_relations<
-        S: EntityStore + MemoryStore + ?Sized,
-    >(
+    pub fn the_graph_keeps_entities_links_and_relations<S: EntityStore + MemoryStore + ?Sized>(
         store: &mut S,
     ) {
         use Origin::{Local, Sync};
@@ -605,7 +603,7 @@ pub(crate) mod conformance {
         );
     }
 
-    pub(crate) fn a_synced_overwrite_keeps_created_at(store: &mut dyn EntityStore) {
+    pub fn a_synced_overwrite_keeps_created_at(store: &mut dyn EntityStore) {
         EntityStore::insert(store, &entity("e1", "Local", T1), None).unwrap();
         EntityStore::upsert_synced(store, &entity("e1", "Remote", T2), Some("peer")).unwrap();
 
@@ -615,7 +613,7 @@ pub(crate) mod conformance {
         assert_eq!(stored.updated_at, T2);
     }
 
-    pub(crate) fn repoint_drops_a_link_the_target_already_has(store: &mut dyn EntityStore) {
+    pub fn repoint_drops_a_link_the_target_already_has(store: &mut dyn EntityStore) {
         assert!(EntityStore::link(store, "m1", "old", T1, Origin::Local).unwrap());
         assert!(EntityStore::link(store, "m1", "new", T1, Origin::Local).unwrap());
         assert!(EntityStore::link(store, "m2", "old", T1, Origin::Local).unwrap());
@@ -638,14 +636,15 @@ pub(crate) mod conformance {
         );
     }
 
-    pub(crate) fn relations_touching_nothing_is_empty(store: &mut dyn EntityStore) {
+    pub fn relations_touching_nothing_is_empty(store: &mut dyn EntityStore) {
         assert!(store.relations_touching(&[], None, 1).unwrap().is_empty());
     }
 }
 
 /// One `#[test]` per [`conformance`] check, each on a fresh store from
 /// `$make`.
-#[cfg(test)]
+#[doc(hidden)]
+#[macro_export]
 macro_rules! entity_conformance {
     ($make:expr) => {
         use $crate::db::entities::conformance;
@@ -668,8 +667,8 @@ macro_rules! entity_conformance {
         }
     };
 }
-#[cfg(test)]
-pub(crate) use entity_conformance;
+#[doc(hidden)]
+pub use crate::entity_conformance;
 
 #[cfg(test)]
 mod tests {

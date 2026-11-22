@@ -123,8 +123,8 @@ impl<'c> Outbox<'c> {
 /// Rows are queued by memory and entity writes, and marked sent through the
 /// sync state, so a backend under test implements [`MemoryStore`],
 /// [`EntityStore`] and [`SyncStateStore`] too.
-#[cfg(test)]
-pub(crate) mod conformance {
+#[doc(hidden)]
+pub mod conformance {
     use super::OutboxStore;
     use crate::db::entities::EntityStore;
     use crate::db::memories::{MemoryStore, NewMemory};
@@ -135,7 +135,7 @@ pub(crate) mod conformance {
 
     /// Sync off queues nothing; sync on queues memory and entity writes,
     /// which sends, clearing, backfill and pruning then account for.
-    pub(crate) fn the_outbox_sends_and_backfill_agree<
+    pub fn the_outbox_sends_and_backfill_agree<
         S: OutboxStore + SyncStateStore + MemoryStore + EntityStore,
     >(
         store: &mut S,
@@ -200,9 +200,7 @@ pub(crate) mod conformance {
 
     /// A row the remote has taken goes at a prune, however new; the rest
     /// stay until the cutoff passes them.
-    pub(crate) fn prune_drops_rows_the_remote_has_taken<
-        S: OutboxStore + SyncStateStore + MemoryStore,
-    >(
+    pub fn prune_drops_rows_the_remote_has_taken<S: OutboxStore + SyncStateStore + MemoryStore>(
         store: &mut S,
     ) {
         store.set_flag("sync_enabled", "1").unwrap();
@@ -225,7 +223,8 @@ pub(crate) mod conformance {
 
 /// One `#[test]` per [`conformance`] check, each on a fresh store from
 /// `$make`.
-#[cfg(test)]
+#[doc(hidden)]
+#[macro_export]
 macro_rules! outbox_conformance {
     ($make:expr) => {
         use $crate::db::outbox::conformance;
@@ -240,8 +239,8 @@ macro_rules! outbox_conformance {
         }
     };
 }
-#[cfg(test)]
-pub(crate) use outbox_conformance;
+#[doc(hidden)]
+pub use crate::outbox_conformance;
 
 #[cfg(test)]
 mod tests {

@@ -137,8 +137,8 @@ pub(crate) fn decode_filters(json: &str) -> SavedSearchFilters {
 
 /// The behaviour every [`SavedSearchStore`] must show, written once and run
 /// against each backend by [`saved_search_conformance`] (ADR-0035).
-#[cfg(test)]
-pub(crate) mod conformance {
+#[doc(hidden)]
+pub mod conformance {
     use super::SavedSearchStore;
     use crate::db::StoreError;
     use crate::models::{SavedSearch, SavedSearchFilters};
@@ -156,7 +156,7 @@ pub(crate) mod conformance {
         }
     }
 
-    pub(crate) fn round_trips_every_field(store: &mut dyn SavedSearchStore) {
+    pub fn round_trips_every_field(store: &mut dyn SavedSearchStore) {
         let mut one = saved("ss_1", "one");
         one.filters.category = Some("decision".to_string());
         one.filters.tags = Some(vec!["t".to_string()]);
@@ -166,7 +166,7 @@ pub(crate) mod conformance {
         assert_eq!(store.get_by_name("one").unwrap(), Some(one));
     }
 
-    pub(crate) fn update_keeps_the_stored_name_and_created_at(store: &mut dyn SavedSearchStore) {
+    pub fn update_keeps_the_stored_name_and_created_at(store: &mut dyn SavedSearchStore) {
         store.insert(&saved("ss_1", "one")).unwrap();
 
         let mut changed = saved("ss_1", "renamed");
@@ -184,12 +184,12 @@ pub(crate) mod conformance {
         assert_eq!(stored.updated_at, "2026-09-26T00:00:00+00:00");
     }
 
-    pub(crate) fn updating_a_missing_id_changes_nothing(store: &mut dyn SavedSearchStore) {
+    pub fn updating_a_missing_id_changes_nothing(store: &mut dyn SavedSearchStore) {
         store.update(&saved("ss_missing", "ghost")).unwrap();
         assert!(store.list().unwrap().is_empty());
     }
 
-    pub(crate) fn a_name_in_use_is_refused(store: &mut dyn SavedSearchStore) {
+    pub fn a_name_in_use_is_refused(store: &mut dyn SavedSearchStore) {
         store.insert(&saved("ss_1", "one")).unwrap();
         assert!(matches!(
             store.insert(&saved("ss_2", "one")),
@@ -198,13 +198,13 @@ pub(crate) mod conformance {
         assert_eq!(store.id_for_name("one").unwrap().as_deref(), Some("ss_1"));
     }
 
-    pub(crate) fn a_missing_id_is_not_found(store: &mut dyn SavedSearchStore) {
+    pub fn a_missing_id_is_not_found(store: &mut dyn SavedSearchStore) {
         assert!(matches!(store.get("nope"), Err(StoreError::NotFound)));
         assert!(store.get_by_name("nope").unwrap().is_none());
         assert!(store.id_for_name("nope").unwrap().is_none());
     }
 
-    pub(crate) fn list_orders_names_by_byte_value(store: &mut dyn SavedSearchStore) {
+    pub fn list_orders_names_by_byte_value(store: &mut dyn SavedSearchStore) {
         for (id, name) in [("1", "beta"), ("2", "Alpha"), ("3", "alpha")] {
             store.insert(&saved(id, name)).unwrap();
         }
@@ -212,7 +212,7 @@ pub(crate) mod conformance {
         assert_eq!(names, ["Alpha", "alpha", "beta"]);
     }
 
-    pub(crate) fn delete_takes_the_seen_rows_with_it(store: &mut dyn SavedSearchStore) {
+    pub fn delete_takes_the_seen_rows_with_it(store: &mut dyn SavedSearchStore) {
         store.insert(&saved("ss_1", "one")).unwrap();
         store
             .mark_seen("ss_1", &["m1".to_string()], "2026-09-25T00:00:00+00:00")
@@ -224,7 +224,7 @@ pub(crate) mod conformance {
         store.delete("ss_1").unwrap();
     }
 
-    pub(crate) fn mark_seen_keeps_the_first_sighting(store: &mut dyn SavedSearchStore) {
+    pub fn mark_seen_keeps_the_first_sighting(store: &mut dyn SavedSearchStore) {
         assert!(!store.has_any_seen("ss_1").unwrap());
         store
             .mark_seen("ss_1", &["m1".to_string()], "2026-09-25T00:00:00+00:00")
@@ -247,7 +247,8 @@ pub(crate) mod conformance {
 
 /// One `#[test]` per [`conformance`] check, each on a fresh store from
 /// `$make`. A backend's adapter invokes it in its own test module.
-#[cfg(test)]
+#[doc(hidden)]
+#[macro_export]
 macro_rules! saved_search_conformance {
     ($make:expr) => {
         use $crate::db::saved_searches::conformance;
@@ -286,8 +287,8 @@ macro_rules! saved_search_conformance {
         }
     };
 }
-#[cfg(test)]
-pub(crate) use saved_search_conformance;
+#[doc(hidden)]
+pub use crate::saved_search_conformance;
 
 #[cfg(test)]
 mod tests {

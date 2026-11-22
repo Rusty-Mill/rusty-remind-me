@@ -256,8 +256,8 @@ impl<'c> ImportLedger<'c> {
 /// An import's reads are over the memories it wrote, so a backend under
 /// test implements [`MemoryStore`] and, for the import count,
 /// [`StatsStore`] too.
-#[cfg(test)]
-pub(crate) mod conformance {
+#[doc(hidden)]
+pub mod conformance {
     use super::{DbsTracked, ImportStore};
     use crate::db::memories::{MemoryStore, NewMemory};
     use crate::db::stats::StatsStore;
@@ -265,7 +265,7 @@ pub(crate) mod conformance {
     const NOW: &str = "2026-09-26T00:00:00+00:00";
 
     /// Every read and write of the import ledger on a fixed corpus.
-    pub(crate) fn the_ledger_tracks_chat_dbs_and_mempalace_imports<
+    pub fn the_ledger_tracks_chat_dbs_and_mempalace_imports<
         S: ImportStore + MemoryStore + StatsStore,
     >(
         store: &mut S,
@@ -437,7 +437,7 @@ pub(crate) mod conformance {
         assert_eq!(StatsStore::imports(store).unwrap(), 2);
     }
 
-    pub(crate) fn a_chat_import_is_forgotten_only_once_nothing_of_it_is_left<
+    pub fn a_chat_import_is_forgotten_only_once_nothing_of_it_is_left<
         S: ImportStore + MemoryStore,
     >(
         store: &mut S,
@@ -473,7 +473,7 @@ pub(crate) mod conformance {
         assert_eq!(store.chat_import_with_hash("hb").unwrap(), None);
     }
 
-    pub(crate) fn a_dbs_rerun_replaces_the_tracked_memory(store: &mut dyn ImportStore) {
+    pub fn a_dbs_rerun_replaces_the_tracked_memory(store: &mut dyn ImportStore) {
         store.record_dbs("src", "e1", "m1", "h1", NOW).unwrap();
         store.record_dbs("src", "e1", "m2", "h2", NOW).unwrap();
 
@@ -489,7 +489,7 @@ pub(crate) mod conformance {
         assert!(store.dbs_tracked("src", &[]).unwrap().is_empty());
     }
 
-    pub(crate) fn a_recorded_drawer_is_not_rerecorded(store: &mut dyn ImportStore) {
+    pub fn a_recorded_drawer_is_not_rerecorded(store: &mut dyn ImportStore) {
         store.record_mempalace("d1", "m1", NOW).unwrap();
         store.record_mempalace("d1", "m2", NOW).unwrap();
         assert_eq!(store.imported_drawers(&["d1", "d2"]).unwrap(), vec!["d1"]);
@@ -499,7 +499,8 @@ pub(crate) mod conformance {
 
 /// One `#[test]` per [`conformance`] check, each on a fresh store from
 /// `$make`.
-#[cfg(test)]
+#[doc(hidden)]
+#[macro_export]
 macro_rules! import_conformance {
     ($make:expr) => {
         use $crate::db::imports::conformance;
@@ -522,8 +523,8 @@ macro_rules! import_conformance {
         }
     };
 }
-#[cfg(test)]
-pub(crate) use import_conformance;
+#[doc(hidden)]
+pub use crate::import_conformance;
 
 #[cfg(test)]
 mod tests {

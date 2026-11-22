@@ -2,6 +2,15 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-22 — Port conformance suites exported; Attest runs them (Millwright R3, Mill Board #1618)
+
+### Added
+- The 19 port conformance suites are exported for crates outside the workspace (D46): each `db::<group>::conformance` module is `pub`, and each `*_conformance!` macro is `#[macro_export]` at the crate root (`remind_me_core::memory_conformance!` and so on), all hidden from the docs. They are always compiled and need no dev-dependency. The in-crate runs on the engine and SQLite are unchanged.
+- `bench/attest_store/tests/conformance.rs`: every suite on the Attest candidate, each test on a fresh Attest log, so Attest G1 can be assessed (D45). All 69 pass locally; the bench crate stays outside CI.
+
+### Docs
+- Pack defaults D50 to D54 (R3 body layout in the blob store, 512-byte head, isolated G8 restore package, disk accounting, writer-overlap validity) and open question Q20.
+
 ## 2026-11-22 — Attest candidate for the store benchmark (Millwright R3, Mill Board #1618)
 
 ### Added

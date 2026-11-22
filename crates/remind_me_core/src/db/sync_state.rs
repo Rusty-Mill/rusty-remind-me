@@ -199,13 +199,11 @@ impl<'c> SyncState<'c> {
 /// The behaviour every [`SyncStateStore`] must show, run against each
 /// backend by [`sync_state_conformance`] (ADR-0035). Which outbox rows a
 /// send marks is checked with the outbox, in its own suite.
-#[cfg(test)]
-pub(crate) mod conformance {
+#[doc(hidden)]
+pub mod conformance {
     use super::{RemoteLog, SyncLogRow, SyncStateStore};
 
-    pub(crate) fn a_whole_row_round_trips_and_new_rows_take_the_defaults(
-        store: &mut dyn SyncStateStore,
-    ) {
+    pub fn a_whole_row_round_trips_and_new_rows_take_the_defaults(store: &mut dyn SyncStateStore) {
         store.set_seq_cursor("hub", 3).unwrap();
         assert_eq!(
             store.remote_row("hub").unwrap(),
@@ -231,7 +229,7 @@ pub(crate) mod conformance {
         assert_eq!(store.remote_row("nowhere").unwrap(), None);
     }
 
-    pub(crate) fn cursor_writes_touch_only_their_own_columns(store: &mut dyn SyncStateStore) {
+    pub fn cursor_writes_touch_only_their_own_columns(store: &mut dyn SyncStateStore) {
         assert_eq!(store.pull_cursor("hub").unwrap(), None);
         assert_eq!(store.seq_cursor("hub").unwrap(), None);
 
@@ -273,7 +271,7 @@ pub(crate) mod conformance {
         assert!(!store.reset_pull_cursors("nowhere", "x", -1).unwrap());
     }
 
-    pub(crate) fn flags_overwrite(store: &mut dyn SyncStateStore) {
+    pub fn flags_overwrite(store: &mut dyn SyncStateStore) {
         assert_eq!(store.flag("k").unwrap(), None);
         store.set_flag("k", "1").unwrap();
         store.set_flag("k", "2").unwrap();
@@ -283,7 +281,8 @@ pub(crate) mod conformance {
 
 /// One `#[test]` per [`conformance`] check, each on a fresh store from
 /// `$make`.
-#[cfg(test)]
+#[doc(hidden)]
+#[macro_export]
 macro_rules! sync_state_conformance {
     ($make:expr) => {
         use $crate::db::sync_state::conformance;
@@ -302,8 +301,8 @@ macro_rules! sync_state_conformance {
         }
     };
 }
-#[cfg(test)]
-pub(crate) use sync_state_conformance;
+#[doc(hidden)]
+pub use crate::sync_state_conformance;
 
 #[cfg(test)]
 mod tests {

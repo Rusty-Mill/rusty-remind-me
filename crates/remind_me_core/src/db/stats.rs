@@ -212,16 +212,16 @@ use std::path::Path;
 /// The counts are over memories, so a backend under [`stats_conformance`]
 /// implements [`MemoryStore`](crate::db::memories::MemoryStore) too, and the
 /// check seeds and tombstones memories through it.
-#[cfg(test)]
-pub(crate) mod conformance {
+#[doc(hidden)]
+pub mod conformance {
     use super::{GroupBy, SnapshotStore, StatsStore};
     use crate::db::memories::{MemoryStore, NewMemory};
     use crate::models::AnalyticsSnapshot;
     use std::collections::BTreeMap;
 
-    pub(crate) const T1: &str = "2026-09-25T00:00:00+00:00";
-    pub(crate) const T2: &str = "2026-09-26T00:00:00+00:00";
-    pub(crate) const T3: &str = "2026-09-27T00:00:00+00:00";
+    pub const T1: &str = "2026-09-25T00:00:00+00:00";
+    pub const T2: &str = "2026-09-26T00:00:00+00:00";
+    pub const T3: &str = "2026-09-27T00:00:00+00:00";
 
     /// Add memory `new`.
     fn add<S: MemoryStore>(store: &mut S, new: &NewMemory) {
@@ -234,7 +234,7 @@ pub(crate) mod conformance {
     }
 
     /// Memories of every kind, and every count over them.
-    pub(crate) fn counts_cover_live_memories_tombstones_and_tags<S: StatsStore + MemoryStore>(
+    pub fn counts_cover_live_memories_tombstones_and_tags<S: StatsStore + MemoryStore>(
         store: &mut S,
     ) {
         for (id, category, source, tags, at, sensitive, project) in [
@@ -338,7 +338,7 @@ pub(crate) mod conformance {
         }
     }
 
-    pub(crate) fn snapshots_round_trip_oldest_first(store: &mut dyn SnapshotStore) {
+    pub fn snapshots_round_trip_oldest_first(store: &mut dyn SnapshotStore) {
         let second = store
             .insert_snapshot(&snap("2026-09-25T10:00:00+00:00", 2))
             .unwrap();
@@ -359,7 +359,7 @@ pub(crate) mod conformance {
 
     /// A snapshot's day is its UTC day, so a capture early in the day east
     /// of UTC belongs to the day before.
-    pub(crate) fn a_snapshot_belongs_to_its_utc_day(store: &mut dyn SnapshotStore) {
+    pub fn a_snapshot_belongs_to_its_utc_day(store: &mut dyn SnapshotStore) {
         let id = store
             .insert_snapshot(&snap("2026-09-27T01:00:00+05:00", 3))
             .unwrap();
@@ -367,7 +367,7 @@ pub(crate) mod conformance {
         assert_eq!(store.snapshot_on("2026-09-27").unwrap(), None);
     }
 
-    pub(crate) fn the_first_snapshot_of_a_day_is_found(store: &mut dyn SnapshotStore) {
+    pub fn the_first_snapshot_of_a_day_is_found(store: &mut dyn SnapshotStore) {
         let first = store
             .insert_snapshot(&snap("2026-09-25T10:00:00+00:00", 1))
             .unwrap();
@@ -380,7 +380,8 @@ pub(crate) mod conformance {
 
 /// One `#[test]` per [`StatsStore`] check in [`conformance`], each on a
 /// fresh store from `$make`.
-#[cfg(test)]
+#[doc(hidden)]
+#[macro_export]
 macro_rules! stats_conformance {
     ($make:expr) => {
         #[test]
@@ -391,12 +392,13 @@ macro_rules! stats_conformance {
         }
     };
 }
-#[cfg(test)]
-pub(crate) use stats_conformance;
+#[doc(hidden)]
+pub use crate::stats_conformance;
 
 /// One `#[test]` per [`SnapshotStore`] check in [`conformance`], each on a
 /// fresh store from `$make`.
-#[cfg(test)]
+#[doc(hidden)]
+#[macro_export]
 macro_rules! snapshot_conformance {
     ($make:expr) => {
         use $crate::db::stats::conformance;
@@ -415,8 +417,8 @@ macro_rules! snapshot_conformance {
         }
     };
 }
-#[cfg(test)]
-pub(crate) use snapshot_conformance;
+#[doc(hidden)]
+pub use crate::snapshot_conformance;
 
 #[cfg(test)]
 mod tests {
