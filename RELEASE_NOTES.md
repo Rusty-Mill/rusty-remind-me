@@ -2,6 +2,15 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-22 — Attest candidate for the store benchmark (Millwright R3, Mill Board #1618)
+
+### Added
+- `bench/attest_store`: R3's Attest candidate (D45, D47), a bench-only crate outside the workspace with its own lockfile, so Attest and its rusty_mill tag never enter remind-me's dependency graph or CI. Attest's append-only log is the durable store; the engine's tables and indexes live in a temporary directory, rebuilt from the log at open. Every durable write reaches the log as one Attest transaction before it is acknowledged. Its `store_bench` example runs the shared harness on `attest`, `engine` and `sqlite`. Smoke runs only, as for #412. Known gaps before scoring: the temporary engine's files are not counted in `disk_mb`, a backup copies the temporary tables rather than the log (so `restore` is not G8 evidence), and Attest G1 needs the conformance export (D46).
+- `EngineTables::set_change_sink` and `apply_captured` (D48), hidden from the docs: a sink receives every durable write as table, key and record JSON, and captured writes replay onto fresh tables. A failing sink leaves the tables refusing writes until reopened. With no sink set, nothing is serialised; production sets none.
+
+### Tests
+- Captured writes replay onto fresh tables; with no sink nothing is noted, and a failing sink fails the tables closed. In `bench/attest_store`: writes and a delete survive a reopen built from the log alone, the full-text index comes back, and a second opener is refused by Attest's lock.
+
 ## 2026-11-21 — Store benchmark harness on any backend (Millwright R3, Mill Board #1618)
 
 ### Added
