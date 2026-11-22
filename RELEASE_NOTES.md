@@ -2,6 +2,23 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-22 — Store benchmark: same body layout, isolated G8 restore, overlap and G1 checks (Millwright R3, Mill Board #1618)
+
+### Added
+- `blobs::BlobStore` (audit seam 3, D50): content-addressed blobs at `<root>/<key[0..2]>/<key>`, written idempotently by rename, with `put`, `put_keyed`, `get` and `verify`. It's hidden from the docs. `archive.rs` writes through it with the same root, 16-hex keys and layout, so nothing on disk changes. Production backups are unchanged (Q20).
+- `store_bench` closes the gaps #413 listed before any scoring:
+  - **Body layout (D50, D51):** every dialog and wiki page body goes whole to a blob store under the run. Each row keeps a 512-byte head and a link (`metadata.source_artifact`, or a `blob:` page summary). The harness does this, so the layout is the same on every candidate. It also adds 10 to 30 KB pages, one per ten memories.
+  - **Disk (D53):** reported for the store, the candidate's temporary files (`store.temp`, Attest's engine tables) and the blobs, with their total, after fill and at the end.
+  - **Writer overlap (D54):** the same four readers run idle and beside the writer. Every window and the rows added inside it are recorded, and a run where the writer covers less than 95% of any reader's window, or adds no row inside it, fails as invalid.
+  - **G8 (D52):** the package holds the candidate's own backup, a copy of the blobs and a manifest. The source run is moved away, and a child process restores the package into a fresh directory and reads every row, page, vector set and linked body back by content hash. Any difference, or a missing or altered body, fails the run.
+  - **G1 beyond the port suites:** an update or delete of a dialog is refused and leaves the row unchanged, and readers only ever see whole transactions while a writer commits.
+  - The run refuses a configured cloud backup upload.
+- `attest_store::open_at` keeps the engine tables in a directory the caller names, rebuilt from the log at every open. `attest_store::package` copies the log alone, without the lock.
+
+### Tests
+- Blob keys, sharding, idempotence, tamper detection and refused path keys. Head cut on a char boundary, body links, manifest comparison (including a body altered on both sides). Attest `open_at` rebuild and second-opener refusal, a package restored from the log alone, and a forced collision on the conformance fixtures' directory.
+- Smoke runs at 2,000 memories on all three candidates pass every check, with restore isolated in a child process. These are not scores.
+
 ## 2026-11-22 — Port conformance suites exported; Attest runs them (Millwright R3, Mill Board #1618)
 
 ### Added
