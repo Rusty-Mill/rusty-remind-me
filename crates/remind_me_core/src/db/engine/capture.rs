@@ -598,4 +598,20 @@ mod tests {
         assert!(!MemoryStore::exists(&b, "lost").unwrap());
         assert!(HistoryStore::list(&b, "kept", 10).unwrap().is_empty());
     }
+
+    /// An undo-log failure inside a page, even one the caller handles,
+    /// publishes nothing: finishing the page fails, and the revision the
+    /// page wrote before it does not reach the sink.
+    #[test]
+    fn an_undo_failure_in_a_page_publishes_nothing() {
+        use rusty_multimodal_db_engine::test_support::{arm_fault, Fault};
+        let (mut t, log) = collecting();
+        t.begin_page().unwrap();
+        HistoryStore::insert(&mut t, "m", &tracked(), NOW, None).unwrap();
+        arm_fault(Fault::JournalSync);
+        assert!(MemoryStore::insert(&mut t, &NewMemory::new("m", "x", NOW)).is_err());
+        assert!(t.finish_page().is_err(), "no false success");
+        assert!(log.lock().unwrap().is_empty(), "no partial unit");
+        assert!(HistoryStore::list(&t, "m", 10).unwrap().is_empty());
+    }
 }

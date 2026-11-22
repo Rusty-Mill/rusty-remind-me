@@ -115,7 +115,14 @@ impl EngineTables {
             return Err(StoreError::Engine("no page is open".to_string()));
         };
         let before: Vec<Change> = changes.iter().map(|c| before_image(core, c)).collect();
-        self.undo.commit(&encode(&before)?).map_err(engine_error)?;
+        if let Err(e) = self.undo.commit(&encode(&before)?) {
+            // With a sink set, the page may already hold other tables'
+            // writes: it can then only be abandoned, so none is published.
+            if self.sink.is_some() {
+                page.broken = true;
+            }
+            return Err(engine_error(e));
+        }
         page.before.extend(before);
         for change in changes {
             page.changes.push(change.clone());
