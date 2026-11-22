@@ -162,13 +162,22 @@ fn open_at_keeps_the_tables_beside_the_log_and_rebuilds_them() {
     let id = {
         let db = open_at(&log);
         let id = add(&db, "kept beside the log");
-        assert!(std::fs::read_dir(log.with_extension("temp")).unwrap().count() > 0);
+        assert!(
+            std::fs::read_dir(log.with_extension("temp"))
+                .unwrap()
+                .count()
+                > 0
+        );
         assert!(attest_store::open_at(&log, &log.with_extension("temp")).is_err());
-        assert!(testing::memory_text(&db.store(), &id, "id").unwrap().is_some());
+        assert!(testing::memory_text(&db.store(), &id, "id")
+            .unwrap()
+            .is_some());
         id
     };
     let db = open_at(&log);
-    assert!(testing::memory_text(&db.store(), &id, "id").unwrap().is_some());
+    assert!(testing::memory_text(&db.store(), &id, "id")
+        .unwrap()
+        .is_some());
     drop(db);
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -193,5 +202,21 @@ fn a_package_restores_from_the_log_alone() {
         Some("packaged")
     );
     drop(restored);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// An engine path that exists but was not made by `open_at` is refused
+/// and left as it was.
+#[test]
+fn open_at_refuses_to_clear_a_directory_it_did_not_make() {
+    let dir = scratch("foreign");
+    let foreign = dir.join("someone-elses");
+    std::fs::create_dir_all(&foreign).unwrap();
+    std::fs::write(foreign.join("keep.txt"), b"precious").unwrap();
+    assert!(attest_store::open_at(&dir.join("store"), &foreign).is_err());
+    assert_eq!(
+        std::fs::read(foreign.join("keep.txt")).unwrap(),
+        b"precious"
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }

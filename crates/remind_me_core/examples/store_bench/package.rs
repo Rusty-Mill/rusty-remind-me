@@ -31,6 +31,7 @@ use std::path::Path;
 
 use super::bodies::{memory_link, page_link};
 use super::Result;
+use super::DIALOG;
 
 /// Memory columns a read changes, left out of a row's hash.
 const VOLATILE: [&str; 3] = ["access_count", "accessed_at", "vitality"];
@@ -38,7 +39,7 @@ const VOLATILE: [&str; 3] = ["access_count", "accessed_at", "vitality"];
 const BATCH: usize = 500;
 
 /// What a store holds, by content hash.
-#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
     /// Memory id to the hash of its row.
     pub memories: BTreeMap<String, String>,
@@ -54,6 +55,9 @@ pub struct Manifest {
     pub relations: BTreeMap<String, String>,
     /// Reference id to the hash of its row.
     pub references: BTreeMap<String, String>,
+    /// Dialogs and pages with no link to an external body, which the body
+    /// layout requires of every one (D50): `memory:<id>` or `page:<slug>`.
+    pub unlinked: Vec<String>,
     /// Blob key a row links to, to the hash and size of its bytes, or
     /// `missing`.
     pub bodies: BTreeMap<String, String>,
@@ -73,14 +77,23 @@ impl Manifest {
                         columns.remove(column);
                     }
                 }
-                links.extend(memory_link(&memory.metadata));
+                match memory_link(&memory.metadata) {
+                    Some(key) => links.push(key),
+                    None if memory.category == DIALOG => {
+                        manifest.unlinked.push(format!("memory:{}", memory.id))
+                    }
+                    None => {}
+                }
                 manifest
                     .memories
                     .insert(memory.id, content_key(row.to_string().as_bytes()));
             }
         }
         for page in WikiIndex::new(store).recent_first()? {
-            links.extend(page_link(&page.summary));
+            match page_link(&page.summary) {
+                Some(key) => links.push(key),
+                None => manifest.unlinked.push(format!("page:{}", page.slug)),
+            }
             let row = serde_json::to_string(&page)?;
             manifest
                 .pages
@@ -177,6 +190,10 @@ impl Manifest {
             .iter()
             .filter(|(key, hash)| !hash.starts_with(key.as_str()))
             .count();
+        let unlinked = self.unlinked.len().max(other.unlinked.len());
+        if unlinked > 0 {
+            found.push(format!("{unlinked} dialogs or pages have no body link"));
+        }
         if unverified > 0 {
             found.push(format!("bodies: {unverified} missing or altered"));
         }
@@ -233,6 +250,17 @@ mod tests {
         );
         assert!(
             found.iter().any(|d| d.contains("missing or altered")),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn a_dialog_without_its_body_link_fails_on_both_sides() {
+        let mut m = manifest("abc 3");
+        m.unlinked.push("memory:d1".into());
+        let found = m.differences(&m.clone());
+        assert!(
+            found.iter().any(|d| d.contains("no body link")),
             "{found:?}"
         );
     }

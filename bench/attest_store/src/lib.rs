@@ -21,6 +21,9 @@ use std::path::Path;
 /// The record kind every captured write is stored under.
 pub const KIND: &str = "remind_me.write";
 const WRITER: &str = "remind-me-r3";
+/// The file [`open_at`] leaves in an engine directory it made, and requires
+/// before clearing one.
+pub const SCRATCH_MARK: &str = "ATTEST_R3_SCRATCH";
 /// The lock file Attest keeps in its directory.
 const LOCK: &str = "LOCK";
 
@@ -36,19 +39,29 @@ pub fn open(dir: &Path) -> Result<EngineTables> {
 
 /// As [`open`], with the engine's tables in `engine` instead of a hidden
 /// temporary directory, so the benchmark can count their disk (D48, D53).
-/// Whatever `engine` held is removed first: the tables are always rebuilt
-/// from the log alone.
+/// The tables are always rebuilt from the log alone, so `engine` is
+/// cleared first, but only a directory this function made: one that
+/// exists without its [`SCRATCH_MARK`] is refused and left untouched.
 ///
 /// # Errors
 ///
-/// As [`open`], or the filesystem's error clearing `engine`.
+/// As [`open`]; `engine` existing without the mark; or the filesystem's
+/// error clearing or creating it.
 pub fn open_at(dir: &Path, engine: &Path) -> Result<EngineTables> {
     // Take the log's lock before touching `engine`, so a second opener of
     // the same log is refused before it can clear the first one's tables.
     let log = FileStore::open(dir, StoreConfig::default()).map_err(log_error)?;
     if engine.exists() {
+        if !engine.join(SCRATCH_MARK).is_file() {
+            return Err(StoreError::Engine(format!(
+                "attest: {} exists and is not this adapter's scratch; refusing to clear it",
+                engine.display()
+            )));
+        }
         std::fs::remove_dir_all(engine).map_err(io_error)?;
     }
+    std::fs::create_dir_all(engine).map_err(io_error)?;
+    std::fs::write(engine.join(SCRATCH_MARK), b"").map_err(io_error)?;
     replay_into(log, EngineTables::open(engine)?)
 }
 

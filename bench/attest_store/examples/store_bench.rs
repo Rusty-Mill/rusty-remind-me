@@ -21,7 +21,10 @@ use std::path::Path;
 /// The Attest candidate's tables over the log in `dir`, with the engine
 /// tables beside it in `<dir>.temp`.
 fn attest(dir: &Path) -> Result<Box<dyn remind_me_core::db::backend::Backend>> {
-    Ok(Box::new(attest_store::open_at(dir, &dir.with_extension("temp"))?))
+    Ok(Box::new(attest_store::open_at(
+        dir,
+        &dir.with_extension("temp"),
+    )?))
 }
 
 fn main() -> Result<()> {
