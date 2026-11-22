@@ -197,18 +197,20 @@ impl ArchiveStore for EngineTables {
     }
 
     fn remove(&mut self, import_id: &str) -> Result<()> {
-        for span in spans_of(self, import_id) {
-            let noted = self.note(capture::SPANS, &span, None::<&SpanRecord>)?;
-            deleted(self.spans.delete(span))?;
-            self.emit(noted)?;
-        }
-        if archive(self, import_id).is_some() {
-            let id = engine_id(import_id);
-            let noted = self.note(capture::ARCHIVES, &id, None::<&ArchiveRecord>)?;
-            deleted(self.archives.delete(id))?;
-            self.emit(noted)?;
-        }
-        Ok(())
+        self.logged(|t| {
+            for span in spans_of(t, import_id) {
+                let noted = t.note(capture::SPANS, &span, None::<&SpanRecord>)?;
+                deleted(t.spans.delete(span))?;
+                t.emit(noted)?;
+            }
+            if archive(t, import_id).is_some() {
+                let id = engine_id(import_id);
+                let noted = t.note(capture::ARCHIVES, &id, None::<&ArchiveRecord>)?;
+                deleted(t.archives.delete(id))?;
+                t.emit(noted)?;
+            }
+            Ok(())
+        })
     }
 
     fn count_with_hash(&self, hash: &str) -> Result<usize> {

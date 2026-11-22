@@ -99,6 +99,8 @@ pub struct EngineTables {
     dir: PathBuf,
     /// Where durable writes are handed, when set (see [`capture`]).
     sink: Option<Box<dyn capture::ChangeSink>>,
+    /// Writes held for the sink until their operation or page ends.
+    staging: capture::Staging,
     _lock: DirLock,
     _temporary: Option<TemporaryDir>,
 }
@@ -134,6 +136,7 @@ impl EngineTables {
             failed: false,
             dir: dir.to_path_buf(),
             sink: None,
+            staging: capture::Staging::default(),
             _lock: lock,
             _temporary: None,
         };
@@ -173,7 +176,10 @@ impl EngineTables {
     /// commit: for a record committed in the same batch.
     pub(crate) fn allocate(&mut self, name: &str) -> super::Result<i64> {
         let id = self.journal.allocate(name);
-        i64::try_from(id).map_err(|_| StoreError::Engine(format!("sequence {name} overflowed")))
+        let id = i64::try_from(id)
+            .map_err(|_| StoreError::Engine(format!("sequence {name} overflowed")))?;
+        self.hold_sequence(name, id)?;
+        Ok(id)
     }
 
     /// Refuse writes after a batch failed part-way (see `failed`).

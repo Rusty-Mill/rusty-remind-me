@@ -1,7 +1,8 @@
 //! Writes through a database on the Attest candidate survive a reopen,
 //! which rebuilds the engine tables from the log alone.
 
-use remind_me_core::db::queries;
+use remind_me_core::db::history::Revisions;
+use remind_me_core::db::{queries, StoreError};
 use remind_me_core::models::MemoryAddInput;
 use remind_me_core::{testing, Database};
 use std::path::{Path, PathBuf};
@@ -67,5 +68,73 @@ fn a_second_opener_is_refused() {
     let dir = scratch("locked");
     let _first = open(&dir);
     assert!(attest_store::open(&dir.join("log")).is_err());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+const NOW: &str = "2026-11-22T00:00:00+00:00";
+
+/// A transaction that aborts after writing a revision and a row change
+/// leaves neither in the log: the reopened store has the row as it was and
+/// no revision.
+#[test]
+fn an_aborted_mixed_edit_leaves_nothing_in_the_log() {
+    let dir = scratch("aborted");
+    let id = {
+        let db = open(&dir);
+        let id = add(&db, "before the edit");
+        let store = db.store();
+        let aborted: Result<(), StoreError> = store.transaction(|s| {
+            let revisions = Revisions::new(s);
+            let current = revisions.current(&id)?.expect("live");
+            revisions.insert(&id, &current, NOW, None)?;
+            let edit = serde_json::from_value(
+                serde_json::json!({ "memory_id": id, "content": "after the edit" }),
+            )
+            .unwrap();
+            queries::update_memory(s, &edit).map_err(|e| StoreError::Engine(e.to_string()))?;
+            Err(StoreError::Engine("abort".into()))
+        });
+        assert!(aborted.is_err());
+        id
+    };
+    let db = open(&dir);
+    let store = db.store();
+    assert_eq!(
+        testing::memory_text(&store, &id, "content")
+            .unwrap()
+            .as_deref(),
+        Some("before the edit")
+    );
+    assert!(Revisions::new(&store).list(&id, 10).unwrap().is_empty());
+    drop(store);
+    drop(db);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Deleting the newest revision, then reopening from the log alone, does
+/// not let its id be issued again.
+#[test]
+fn a_reopen_never_reissues_a_deleted_revision_id() {
+    let dir = scratch("sequence");
+    let (id, top) = {
+        let db = open(&dir);
+        let id = add(&db, "tracked");
+        let store = db.store();
+        let revisions = Revisions::new(&store);
+        let current = revisions.current(&id).unwrap().expect("live");
+        revisions.insert(&id, &current, NOW, None).unwrap();
+        let top = revisions.list(&id, 1).unwrap()[0].id;
+        revisions.delete_for(&id).unwrap();
+        (id, top)
+    };
+    let db = open(&dir);
+    let store = db.store();
+    let revisions = Revisions::new(&store);
+    let current = revisions.current(&id).unwrap().expect("live");
+    revisions.insert(&id, &current, NOW, None).unwrap();
+    let next = revisions.list(&id, 1).unwrap()[0].id;
+    assert!(next > top, "{next} reissues {top} or lower");
+    drop(store);
+    drop(db);
     std::fs::remove_dir_all(&dir).unwrap();
 }

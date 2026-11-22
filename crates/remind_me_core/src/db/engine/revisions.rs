@@ -116,30 +116,34 @@ impl HistoryStore for EngineTables {
     }
 
     fn delete_for(&mut self, memory_id: &str) -> Result<()> {
-        for record in of_memory(self, memory_id) {
-            let noted = self.note(capture::REVISIONS, &record.id, None::<&RevisionRecord>)?;
-            deleted(self.revisions.delete(record.id))?;
-            self.emit(noted)?;
-        }
-        Ok(())
+        self.logged(|t| {
+            for record in of_memory(t, memory_id) {
+                let noted = t.note(capture::REVISIONS, &record.id, None::<&RevisionRecord>)?;
+                deleted(t.revisions.delete(record.id))?;
+                t.emit(noted)?;
+            }
+            Ok(())
+        })
     }
 
     fn delete_of_tombstones(&mut self) -> Result<usize> {
-        let core = core_ref(self)?;
-        let doomed: Vec<i64> = self
-            .revisions
-            .all_ids()
-            .into_iter()
-            .filter_map(|id| self.revisions.get(id))
-            .filter(|r| memories::is_tombstone(core, &r.memory_id))
-            .map(|r| r.id)
-            .collect();
-        for id in &doomed {
-            let noted = self.note(capture::REVISIONS, id, None::<&RevisionRecord>)?;
-            deleted(self.revisions.delete(*id))?;
-            self.emit(noted)?;
-        }
-        Ok(doomed.len())
+        self.logged(|t| {
+            let core = core_ref(t)?;
+            let doomed: Vec<i64> = t
+                .revisions
+                .all_ids()
+                .into_iter()
+                .filter_map(|id| t.revisions.get(id))
+                .filter(|r| memories::is_tombstone(core, &r.memory_id))
+                .map(|r| r.id)
+                .collect();
+            for id in &doomed {
+                let noted = t.note(capture::REVISIONS, id, None::<&RevisionRecord>)?;
+                deleted(t.revisions.delete(*id))?;
+                t.emit(noted)?;
+            }
+            Ok(doomed.len())
+        })
     }
 
     fn insert(

@@ -146,6 +146,14 @@ impl EngineTables {
         let Some(page) = self.page.take() else {
             return Err(StoreError::Engine("no page is open".to_string()));
         };
+        if self.sink.is_some() && self.failed {
+            // Something in the page could not be put back or handed over:
+            // publish nothing. Reopening undoes the page from the undo log.
+            self.drop_held();
+            return Err(StoreError::Engine(
+                "the tables need reopening; the page was not committed".to_string(),
+            ));
+        }
         if page.broken {
             self.page = Some(page);
             self.abandon_page()?;
@@ -161,6 +169,7 @@ impl EngineTables {
                 if self.put_back(page.before).is_err() {
                     self.failed = true;
                 }
+                self.undo_held(0);
                 return Err(e);
             }
         };
@@ -171,8 +180,10 @@ impl EngineTables {
             // further use; reopening undoes the page from the undo log,
             // then replays the redo frame if it is whole.
             self.failed = true;
+            self.drop_held();
             return Err(e);
         }
+        // The page's other-table writes and its core batch, as one unit.
         self.emit_batch(&batch)?;
         let checkpointed = self.checkpoint_after_commit();
         if checkpointed.is_err() {
@@ -211,6 +222,8 @@ impl EngineTables {
         if rolled_back.is_err() {
             self.failed = true;
         }
+        // With a sink set: the other tables' writes too, none handed over.
+        self.undo_held(0);
         rolled_back
     }
 

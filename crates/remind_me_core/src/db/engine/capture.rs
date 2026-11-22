@@ -4,11 +4,24 @@
 //! RAM, and replays the log with [`EngineTables::apply_captured`].
 //!
 //! Hidden test and benchmark support: production sets no sink, and then
-//! nothing is serialised. Core writes are handed over once their journal
-//! batch (or their page) is committed; the other tables' writes, which the
-//! engine makes durable at once, right after each write. A sink that fails
-//! leaves the tables refusing writes until reopened, as a batch that did
-//! not reach every store does.
+//! nothing is serialised and nothing below changes how the engine behaves.
+//!
+//! With a sink set, the sink sees whole operations, never part of one:
+//!
+//! - Inside a page (a transaction), every write, core or not, is held and
+//!   handed over with the page's core batch as one unit when the page
+//!   finishes. Abandoning the page hands over nothing and puts back the
+//!   other tables' records it replaced, as the page does for the core.
+//! - Outside a page, a write to the other tables is handed over as soon as
+//!   it lands, or, inside a multi-row operation ([`EngineTables::logged`]),
+//!   when the operation succeeds. An operation that fails puts its records
+//!   back and hands over nothing.
+//! - Every id a sequence issues is handed over too, with the next unit, so
+//!   a replay raises each sequence past every id ever issued, not only
+//!   past the records that survive.
+//! - A sink that fails, or records that cannot be put back, leave the
+//!   tables refusing every write until reopened (`failed`): their RAM state
+//!   may then be ahead of the sink.
 
 use super::core::decode;
 use super::{deleted, engine_error, wiki, EngineTables};
@@ -33,6 +46,9 @@ pub(crate) const REVISIONS: &str = super::revisions::SEQUENCE;
 pub(crate) const WIKI_PAGES: &str = "wiki_pages";
 pub(crate) const WIKI_LINKS: &str = "wiki_links";
 pub(crate) const WIKI_META: &str = "wiki_meta";
+/// Not a table: an id a sequence issued, kept so a replay never reissues
+/// it, even after its record is deleted.
+pub(crate) const SEQUENCES: &str = "sequence";
 
 /// One write: the table, the record's key as JSON, and the record as JSON
 /// (`None` for a delete).
@@ -53,6 +69,22 @@ pub trait ChangeSink: Send {
     ///
     /// The sink's error; the engine then refuses writes until reopened.
     fn committed(&mut self, changes: Vec<CapturedChange>) -> Result<()>;
+}
+
+/// A noted write, with the record it replaces (`None` for a core write,
+/// which the page's undo log covers).
+#[derive(Debug)]
+pub(crate) struct Noted {
+    change: CapturedChange,
+    before: Option<CapturedChange>,
+}
+
+/// Writes held until their operation or page ends.
+#[derive(Debug, Default)]
+pub(crate) struct Staging {
+    held: Vec<Noted>,
+    /// How many [`EngineTables::logged`] operations are running.
+    depth: u32,
 }
 
 /// `table`'s write of `record` under `key`.
@@ -77,40 +109,122 @@ impl EngineTables {
         self.sink = sink;
     }
 
-    /// The write `table` is about to make, when a sink wants it.
+    /// The write `table` is about to make, when a sink wants it. Call it
+    /// before the write: with a sink set, it refuses once the tables need
+    /// reopening, or while another thread holds a page open.
     pub(crate) fn note<K: Serialize, R: Serialize>(
         &self,
         table: &str,
         key: &K,
         record: Option<&R>,
-    ) -> Result<Option<CapturedChange>> {
+    ) -> Result<Option<Noted>> {
         if self.sink.is_none() {
             return Ok(None);
         }
-        change(table, key, record).map(Some)
+        self.ensure_writable()?;
+        self.in_page()?;
+        let change = change(table, key, record)?;
+        let before = CapturedChange {
+            value: self.stored(table, &change.key)?,
+            ..change.clone()
+        };
+        Ok(Some(Noted {
+            change,
+            before: Some(before),
+        }))
     }
 
-    /// Hand a noted write to the sink.
-    pub(crate) fn emit(&mut self, noted: Option<CapturedChange>) -> Result<()> {
-        match noted {
-            Some(change) => self.hand_over(vec![change]),
-            None => Ok(()),
-        }
+    /// Hold a noted write, and hand it over unless its operation or page
+    /// is still running.
+    pub(crate) fn emit(&mut self, noted: Option<Noted>) -> Result<()> {
+        let Some(noted) = noted else {
+            return Ok(());
+        };
+        self.staging.held.push(noted);
+        self.flush_unless_held()
     }
 
-    /// Hand a committed core batch to the sink.
+    /// Hand a core batch to the sink with whatever its page held: called
+    /// once the batch is committed.
     pub(crate) fn emit_batch(&mut self, batch: &Batch) -> Result<()> {
         if self.sink.is_none() {
             return Ok(());
         }
-        let changes = batch
-            .changes
-            .iter()
-            .map(|c| CapturedChange {
+        let core = batch.changes.iter().map(|c| Noted {
+            change: CapturedChange {
                 table: c.store.clone(),
                 key: c.key.clone(),
                 value: c.value.clone(),
-            })
+            },
+            before: None,
+        });
+        self.staging.held.extend(core);
+        self.flush_unless_held()
+    }
+
+    /// Hold `id`, just issued by sequence `name`, for the next unit.
+    pub(crate) fn hold_sequence(&mut self, name: &str, id: i64) -> Result<()> {
+        if self.sink.is_none() {
+            return Ok(());
+        }
+        self.staging.held.push(Noted {
+            change: change(SEQUENCES, &name, Some(&id))?,
+            before: None,
+        });
+        Ok(())
+    }
+
+    /// Run `write` as one operation: what it writes reaches the sink as
+    /// one unit when it succeeds (or with the open page); when it fails,
+    /// its records are put back and nothing reaches the sink. For writes
+    /// to the tables outside the core only.
+    pub(crate) fn logged<T>(&mut self, write: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        if self.sink.is_none() {
+            return write(self);
+        }
+        let mark = self.staging.held.len();
+        self.staging.depth += 1;
+        let written = write(self);
+        self.staging.depth -= 1;
+        if written.is_err() {
+            self.undo_held(mark);
+            return written;
+        }
+        self.flush_unless_held()?;
+        written
+    }
+
+    /// Put back what the writes held since `mark` replaced, newest first,
+    /// and drop them. Failing to leaves the tables refusing writes.
+    pub(crate) fn undo_held(&mut self, mark: usize) {
+        let undone: Vec<Noted> = self.staging.held.drain(mark..).collect();
+        let mut wiki_pages = false;
+        for noted in undone.into_iter().rev() {
+            let Some(before) = noted.before else {
+                continue;
+            };
+            wiki_pages |= before.table == WIKI_PAGES;
+            if self.apply_row(&before).is_err() {
+                self.failed = true;
+            }
+        }
+        if wiki_pages {
+            self.wiki_search = wiki::index_pages(&self.wiki_pages);
+        }
+    }
+
+    /// Drop every held write: their outcome is settled by reopening.
+    pub(crate) fn drop_held(&mut self) {
+        self.staging.held.clear();
+    }
+
+    fn flush_unless_held(&mut self) -> Result<()> {
+        if self.page.is_some() || self.staging.depth > 0 || self.staging.held.is_empty() {
+            return Ok(());
+        }
+        let changes = std::mem::take(&mut self.staging.held)
+            .into_iter()
+            .map(|n| n.change)
             .collect();
         self.hand_over(changes)
     }
@@ -124,6 +238,23 @@ impl EngineTables {
             self.failed = true;
         }
         handed
+    }
+
+    /// The record `table` holds under `key`, as JSON, if any.
+    fn stored(&self, table: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        match table {
+            SAVED_SEARCHES => read(&self.saved_searches, key),
+            SEEN => read(&self.seen, key),
+            ARCHIVES => read(&self.archives, key),
+            SPANS => read(&self.spans, key),
+            SYNC_LOG => read(&self.sync_log, key),
+            SNAPSHOTS => read(&self.snapshots, key),
+            REVISIONS => read(&self.revisions, key),
+            WIKI_PAGES => read(&self.wiki_pages, key),
+            WIKI_LINKS => read(&self.wiki_links, key),
+            WIKI_META => read(&self.wiki_meta, key),
+            other => Err(StoreError::Engine(format!("no captured table {other}"))),
+        }
     }
 
     /// Apply writes a sink was handed, in order: core writes as one
@@ -152,6 +283,16 @@ impl EngineTables {
         Ok(())
     }
 
+    /// Raise the sequence `c` names past the id it issued.
+    fn replay_sequence(&mut self, c: &CapturedChange) -> Result<()> {
+        let name: String = serde_json::from_slice(&c.key).map_err(engine_error)?;
+        let value = c.value.as_deref().unwrap_or_default();
+        let id: i64 = serde_json::from_slice(value).map_err(engine_error)?;
+        let floor = u64::try_from(id).map_err(engine_error)?;
+        self.journal.raise_to(&name, floor);
+        Ok(())
+    }
+
     /// Apply `c` if it is to a table outside the core; `false` if not.
     fn apply_row(&mut self, c: &CapturedChange) -> Result<bool> {
         match c.table.as_str() {
@@ -165,10 +306,34 @@ impl EngineTables {
             WIKI_PAGES => replay(&mut self.wiki_pages, c)?,
             WIKI_LINKS => replay(&mut self.wiki_links, c)?,
             WIKI_META => replay(&mut self.wiki_meta, c)?,
+            SEQUENCES => self.replay_sequence(c)?,
             _ => return Ok(false),
         }
         Ok(true)
     }
+}
+
+/// `table`'s record under the JSON `key`, as JSON.
+fn read<R, Index, Slot>(
+    table: &GenericMmapStore<R, Index, Slot>,
+    key: &[u8],
+) -> Result<Option<Vec<u8>>>
+where
+    R: Record
+        + IndexedField<Index>
+        + ScannableField<Slot>
+        + Clone
+        + Serialize
+        + DeserializeOwned
+        + SchemaTag,
+    R::Id: MmapFieldValue + Serialize + DeserializeOwned + std::fmt::Debug,
+    R::ScanValue: MmapFieldValue,
+{
+    let id: R::Id = serde_json::from_slice(key).map_err(engine_error)?;
+    table
+        .get(id)
+        .map(|r| serde_json::to_vec(&r).map_err(engine_error))
+        .transpose()
 }
 
 /// Put or delete one record of `table` as `c` says.
@@ -212,14 +377,34 @@ mod tests {
 
     const NOW: &str = "2026-11-21T00:00:00+00:00";
 
-    /// Collects every hand-over.
-    struct Collect(Arc<Mutex<Vec<CapturedChange>>>);
+    type Log = Arc<Mutex<Vec<Vec<CapturedChange>>>>;
+
+    /// Collects every hand-over, one entry per unit.
+    struct Collect(Log);
 
     impl ChangeSink for Collect {
         fn committed(&mut self, changes: Vec<CapturedChange>) -> Result<()> {
-            self.0.lock().unwrap().extend(changes);
+            self.0.lock().unwrap().push(changes);
             Ok(())
         }
+    }
+
+    fn collecting() -> (EngineTables, Log) {
+        let log = Log::default();
+        let mut t = EngineTables::open_temporary().unwrap();
+        t.set_change_sink(Some(Box::new(Collect(log.clone()))));
+        (t, log)
+    }
+
+    /// Fresh tables holding only what the sink was handed.
+    fn rebuilt(log: &Log) -> EngineTables {
+        let mut t = EngineTables::open_temporary().unwrap();
+        t.apply_captured(log.lock().unwrap().concat()).unwrap();
+        t
+    }
+
+    fn tables_of(unit: &[CapturedChange]) -> Vec<&str> {
+        unit.iter().map(|c| c.table.as_str()).collect()
     }
 
     /// Refuses every hand-over.
@@ -246,9 +431,7 @@ mod tests {
     /// back the same, with the id sequences past the replayed ids.
     #[test]
     fn captured_writes_replay_onto_fresh_tables() {
-        let log = Arc::new(Mutex::new(Vec::new()));
-        let mut a = EngineTables::open_temporary().unwrap();
-        a.set_change_sink(Some(Box::new(Collect(log.clone()))));
+        let (mut a, log) = collecting();
         MemoryStore::insert(&mut a, &NewMemory::new("m", "quokka", NOW)).unwrap();
         MemoryStore::insert(&mut a, &NewMemory::new("gone", "x", NOW)).unwrap();
         MemoryStore::delete_live(&mut a, "gone", None).unwrap();
@@ -265,8 +448,7 @@ mod tests {
         HistoryStore::insert(&mut a, "m", &tracked(), NOW, None).unwrap();
         WikiStore::set_meta(&mut a, "k", "v").unwrap();
 
-        let mut b = EngineTables::open_temporary().unwrap();
-        b.apply_captured(log.lock().unwrap().clone()).unwrap();
+        let mut b = rebuilt(&log);
         assert!(MemoryStore::exists(&b, "m").unwrap());
         assert!(!MemoryStore::exists(&b, "gone").unwrap());
         assert_eq!(SavedSearchStore::get(&b, "s").unwrap().name, "quokkas");
@@ -283,7 +465,7 @@ mod tests {
     #[test]
     fn no_sink_notes_nothing_and_a_failing_sink_fails_the_tables_closed() {
         let mut t = EngineTables::open_temporary().unwrap();
-        assert_eq!(t.note(SEEN, &1, Some(&1)).unwrap(), None);
+        assert!(t.note(SEEN, &1, Some(&1)).unwrap().is_none());
         t.set_change_sink(Some(Box::new(Refuse)));
         assert!(MemoryStore::insert(&mut t, &NewMemory::new("m", "x", NOW)).is_err());
         t.set_change_sink(None);
@@ -291,5 +473,129 @@ mod tests {
             MemoryStore::insert(&mut t, &NewMemory::new("n", "x", NOW)).is_err(),
             "refuses writes until reopened"
         );
+    }
+
+    /// A transaction's revision and row change reach the sink as one unit
+    /// when it commits, and rebuild together from the log alone.
+    #[test]
+    fn a_committed_mixed_page_is_handed_over_once() {
+        let (mut t, log) = collecting();
+        t.begin_page().unwrap();
+        HistoryStore::insert(&mut t, "m", &tracked(), NOW, None).unwrap();
+        MemoryStore::insert(&mut t, &NewMemory::new("m", "quokka", NOW)).unwrap();
+        assert!(log.lock().unwrap().is_empty(), "nothing before the commit");
+        t.finish_page().unwrap();
+
+        let units = log.lock().unwrap().clone();
+        assert_eq!(units.len(), 1, "one unit: {units:?}");
+        assert!(tables_of(&units[0]).contains(&REVISIONS));
+        let b = rebuilt(&log);
+        assert!(MemoryStore::exists(&b, "m").unwrap());
+        assert_eq!(HistoryStore::list(&b, "m", 10).unwrap().len(), 1);
+    }
+
+    /// An abandoned transaction hands over nothing and puts back the
+    /// other tables' records it wrote, as it does the core's.
+    #[test]
+    fn an_abandoned_mixed_page_hands_over_nothing_and_puts_back() {
+        let (mut t, log) = collecting();
+        HistoryStore::insert(&mut t, "m", &tracked(), NOW, None).unwrap();
+        WikiStore::set_meta(&mut t, "k", "old").unwrap();
+        let before = log.lock().unwrap().len();
+        t.begin_page().unwrap();
+        HistoryStore::insert(&mut t, "m", &tracked(), NOW, None).unwrap();
+        HistoryStore::delete_for(&mut t, "m").unwrap();
+        WikiStore::set_meta(&mut t, "k", "new").unwrap();
+        MemoryStore::insert(&mut t, &NewMemory::new("m", "quokka", NOW)).unwrap();
+        t.abandon_page().unwrap();
+
+        assert_eq!(log.lock().unwrap().len(), before, "nothing handed over");
+        assert!(!MemoryStore::exists(&t, "m").unwrap());
+        assert_eq!(HistoryStore::list(&t, "m", 10).unwrap().len(), 1);
+        assert_eq!(WikiStore::meta(&t, "k").unwrap().as_deref(), Some("old"));
+        let b = rebuilt(&log);
+        assert_eq!(HistoryStore::list(&b, "m", 10).unwrap().len(), 1);
+        assert_eq!(WikiStore::meta(&b, "k").unwrap().as_deref(), Some("old"));
+    }
+
+    /// A multi-row write outside a transaction is one unit, not one per row.
+    #[test]
+    fn a_multi_row_operation_is_handed_over_once() {
+        let (mut t, log) = collecting();
+        let ids: Vec<String> = ["a", "b", "c"].map(String::from).to_vec();
+        SavedSearchStore::mark_seen(&mut t, "s", &ids, NOW).unwrap();
+        let units = log.lock().unwrap().clone();
+        assert_eq!(units.len(), 1, "{units:?}");
+        assert_eq!(tables_of(&units[0]), [SEEN; 3]);
+    }
+
+    /// Once the tables need reopening, a held handle can neither write to
+    /// the other tables nor commit its open transaction, and the sink gets
+    /// nothing more.
+    #[test]
+    fn tables_that_need_reopening_refuse_writes_and_commits() {
+        let (mut t, log) = collecting();
+        t.begin_page().unwrap();
+        MemoryStore::insert(&mut t, &NewMemory::new("m", "quokka", NOW)).unwrap();
+        t.failed = true;
+        assert!(WikiStore::set_meta(&mut t, "k", "v").is_err());
+        assert!(HistoryStore::insert(&mut t, "m", &tracked(), NOW, None).is_err());
+        assert!(t.finish_page().is_err());
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    /// Deleting the highest revision before a rebuild from the log alone
+    /// does not let its id be issued again.
+    #[test]
+    fn a_rebuild_never_reissues_a_deleted_top_id() {
+        let (mut t, log) = collecting();
+        HistoryStore::insert(&mut t, "m", &tracked(), NOW, None).unwrap();
+        let top = HistoryStore::list(&t, "m", 1).unwrap()[0].id;
+        HistoryStore::delete_for(&mut t, "m").unwrap();
+
+        let mut b = rebuilt(&log);
+        HistoryStore::insert(&mut b, "m", &tracked(), NOW, None).unwrap();
+        let next = HistoryStore::list(&b, "m", 1).unwrap()[0].id;
+        assert!(next > top, "{next} reissues {top} or lower");
+    }
+
+    /// Collects hand-overs until told to fail.
+    struct Flaky(Log, Arc<std::sync::atomic::AtomicBool>);
+
+    impl ChangeSink for Flaky {
+        fn committed(&mut self, changes: Vec<CapturedChange>) -> Result<()> {
+            if self.1.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(StoreError::Engine("full".into()));
+            }
+            self.0.lock().unwrap().push(changes);
+            Ok(())
+        }
+    }
+
+    /// After a failed hand-over the tables refuse writes, and tables
+    /// rebuilt from what the sink holds have every earlier unit and none
+    /// of the failed one.
+    #[test]
+    fn a_failed_hand_over_recovers_from_the_log() {
+        let log = Log::default();
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut t = EngineTables::open_temporary().unwrap();
+        t.set_change_sink(Some(Box::new(Flaky(log.clone(), fail.clone()))));
+        MemoryStore::insert(&mut t, &NewMemory::new("kept", "x", NOW)).unwrap();
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        t.begin_page().unwrap();
+        HistoryStore::insert(&mut t, "kept", &tracked(), NOW, None).unwrap();
+        MemoryStore::insert(&mut t, &NewMemory::new("lost", "x", NOW)).unwrap();
+        assert!(t.finish_page().is_err());
+        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            WikiStore::set_meta(&mut t, "k", "v").is_err(),
+            "fails closed"
+        );
+
+        let b = rebuilt(&log);
+        assert!(MemoryStore::exists(&b, "kept").unwrap());
+        assert!(!MemoryStore::exists(&b, "lost").unwrap());
+        assert!(HistoryStore::list(&b, "kept", 10).unwrap().is_empty());
     }
 }
