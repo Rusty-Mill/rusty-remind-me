@@ -65,7 +65,17 @@ pub fn open_at(dir: &Path, engine: &Path) -> Result<EngineTables> {
         }
         std::fs::remove_dir_all(engine).map_err(io_error)?;
     }
-    std::fs::create_dir_all(engine).map_err(io_error)?;
+    if let Some(parent) = engine.parent() {
+        std::fs::create_dir_all(parent).map_err(io_error)?;
+    }
+    // Create the scratch exclusively: of two logs racing for one absent
+    // path, only the one whose `create_dir` succeeds owns it and marks it.
+    std::fs::create_dir(engine).map_err(|e| {
+        StoreError::Engine(format!(
+            "attest: cannot create scratch {} for {owner}: {e}",
+            engine.display()
+        ))
+    })?;
     std::fs::write(engine.join(SCRATCH_MARK), owner).map_err(io_error)?;
     replay_into(log, EngineTables::open(engine)?)
 }

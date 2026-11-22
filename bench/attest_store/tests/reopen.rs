@@ -237,3 +237,30 @@ fn open_at_refuses_another_logs_marked_scratch() {
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Two logs racing for one absent engine path: exactly one gets it.
+#[test]
+fn two_logs_racing_for_one_scratch_path_get_it_once() {
+    for round in 0..20 {
+        let dir = scratch(&format!("race{round}"));
+        let engine = dir.join("engine");
+        let start = std::sync::Barrier::new(2);
+        let opened: Vec<bool> = std::thread::scope(|scope| {
+            let racers: Vec<_> = ["a", "b"]
+                .map(|log| {
+                    let (dir, engine, start) = (&dir, &engine, &start);
+                    scope.spawn(move || {
+                        let log = dir.join(log);
+                        std::fs::create_dir_all(&log).unwrap();
+                        start.wait();
+                        attest_store::open_at(&log, engine).is_ok()
+                    })
+                })
+                .into_iter()
+                .collect();
+            racers.into_iter().map(|r| r.join().unwrap()).collect()
+        });
+        assert_eq!(opened.iter().filter(|o| **o).count(), 1, "round {round}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

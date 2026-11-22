@@ -25,8 +25,9 @@
 //! every row and body is compared by content hash; a difference fails the
 //! run. Disk is reported for the store, the candidate's temporary files
 //! (`<store>.temp`, Attest's engine tables) and the blob root (D53). The
-//! beside-writer search records how far the writer overlapped each reader
-//! and refuses a run with too little overlap (D54). Each run also checks
+//! beside-writer search times each reader's span and each write's
+//! completion on one clock, and refuses a run where the writer covered
+//! too little of a span or completed no write inside one (D54). Each run also checks
 //! the two G1 behaviours the port suites leave out (`g1.rs`): a dialog row
 //! refuses an in-place rewrite, and readers see whole transactions while
 //! the writer commits.
@@ -626,11 +627,14 @@ type Write<'a> = &'a (dyn Fn(&Store<'_>, &mut Rng) -> Result<()> + Sync);
 /// last reader has finished, so it covers every reader's window by
 /// construction. If that first write fails, the writer still reaches the
 /// barrier, flagged, and the readers return at once: the run fails with
-/// the writer's error instead of hanging. Each reader reads the actual
-/// memory row count at both ends of its window; the report records each
-/// window, the writer's span, their overlap and those counts, and the
-/// run fails as invalid when any reader saw less than [`MIN_OVERLAP`] of
-/// its window covered or no row added inside it (D54).
+/// the writer's error instead of hanging.
+///
+/// One monotonic clock times everything: each successful write's
+/// completion, and each reader's span from the start of its first timed
+/// query to the end of its last. The run fails as invalid when the writer
+/// covers less than [`MIN_OVERLAP`] of any reader's span or no write
+/// completed inside one (D54). The memory row counts each reader reads
+/// just outside its span are reported as diagnostics only.
 fn readers(
     db: &Database,
     store: &Store<'_>,
@@ -642,30 +646,35 @@ fn readers(
     let start = &Barrier::new(READERS + usize::from(writer.is_some()));
     let readers_done = &AtomicBool::new(false);
     let writer_failed = &AtomicBool::new(false);
-    let written = &AtomicUsize::new(0);
     let epoch = Instant::now();
     let rows_before = testing::count(store, testing::Table::Memories)?;
     let mut windows: Vec<Window> = Vec::new();
     let mut span = None;
     std::thread::scope(|scope| -> Result<()> {
         let writing = writer.map(|write| {
-            scope.spawn(move || -> std::result::Result<(f64, f64), String> {
+            scope.spawn(move || -> std::result::Result<Writes, String> {
                 let store = source.store();
                 let mut rng = Rng(0xbeef);
-                let mut add = || -> std::result::Result<(), String> {
+                let mut completed = Vec::new();
+                let mut add = |completed: &mut Vec<f64>| -> std::result::Result<(), String> {
                     write(&store, &mut rng).map_err(|e| e.to_string())?;
-                    written.fetch_add(1, Ordering::SeqCst);
+                    completed.push(epoch.elapsed().as_secs_f64());
                     Ok(())
                 };
                 let first = epoch.elapsed().as_secs_f64();
-                let started = add();
+                let started = add(&mut completed);
                 writer_failed.store(started.is_err(), Ordering::SeqCst);
                 start.wait();
                 started?;
                 while !readers_done.load(Ordering::SeqCst) {
-                    add()?;
+                    add(&mut completed)?;
                 }
-                Ok((first, epoch.elapsed().as_secs_f64()))
+                let last = epoch.elapsed().as_secs_f64();
+                Ok(Writes {
+                    first,
+                    last,
+                    completed,
+                })
             })
         });
         let threads: Vec<_> = (0..READERS)
@@ -681,16 +690,21 @@ fn readers(
                         return Ok(None);
                     }
                     let rows_at_begin = rows()?;
-                    let begin = epoch.elapsed().as_secs_f64();
+                    let mut span: Option<(Instant, Instant)> = None;
                     for i in (r..SAMPLES).step_by(READERS) {
                         let input: MemorySearchInput =
                             serde_json::from_value(json!({ "query": queries_[i] }))
                                 .map_err(|e| e.to_string())?;
                         let t = Instant::now();
                         searched(&store, &input, Some(vectors_)).map_err(|e| e.to_string())?;
-                        times.push(t.elapsed());
+                        let done = Instant::now();
+                        times.push(done - t);
+                        span = Some((span.map_or(t, |(first, _)| first), done));
                     }
-                    let end = epoch.elapsed().as_secs_f64();
+                    let (begin, end) = span.map_or((0.0, 0.0), |(first, last)| {
+                        let since = |at: Instant| (at - epoch).as_secs_f64();
+                        (since(first), since(last))
+                    });
                     Ok(Some(Window {
                         begin,
                         end,
@@ -721,38 +735,61 @@ fn readers(
         .collect();
     let mut value = summary(times);
     value["memory_rows"] = json!({ "before": rows_before, "after": rows_after });
-    let Some((first, last)) = span else {
+    let Some(writes) = span else {
         return Ok(value);
     };
-    let overlaps: Vec<f64> = windows.iter().map(|w| w.overlap(first, last)).collect();
-    value["writer_adds"] = json!(written.load(Ordering::SeqCst));
-    value["writer_s"] = json!({ "first": first, "last": last });
+    value["writer_adds"] = json!(writes.completed.len());
+    value["writer_s"] = json!({ "first": writes.first, "last": writes.last });
     value["readers"] = windows
         .iter()
-        .zip(&overlaps)
-        .map(|(w, o)| {
+        .map(|w| {
             json!({
                 "begin_s": w.begin,
                 "end_s": w.end,
-                "overlap": o,
+                "overlap": w.overlap(writes.first, writes.last),
+                "writes_inside": w.writes_inside(&writes.completed),
                 "rows_at_begin": w.rows_at_begin,
                 "rows_at_end": w.rows_at_end,
             })
         })
         .collect();
-    let starved = windows.iter().any(|w| w.rows_at_end <= w.rows_at_begin);
-    if overlaps.iter().any(|o| *o < MIN_OVERLAP) || starved {
+    let invalid = invalid_readers(&windows, &writes);
+    if !invalid.is_empty() {
         return Err(format!(
-            "invalid run, re-run it: reader overlaps {overlaps:?} (need {MIN_OVERLAP}), \
-             a reader saw no row added: {starved}"
+            "invalid run, re-run it: readers {invalid:?} had under {MIN_OVERLAP} of their \
+             span covered or no write completed inside it: {}",
+            value["readers"]
         )
         .into());
     }
     Ok(value)
 }
 
-/// One reader's span in seconds since the run's epoch, the memory row
-/// count it read at each end, and its samples.
+/// The loaded run's writer: when it started and stopped, and when each
+/// successful write completed, in seconds since the run's epoch.
+struct Writes {
+    first: f64,
+    last: f64,
+    completed: Vec<f64>,
+}
+
+/// The readers (by position) the writer did not load enough: under
+/// [`MIN_OVERLAP`] of the span covered, or no write completed inside it.
+fn invalid_readers(windows: &[Window], writes: &Writes) -> Vec<usize> {
+    windows
+        .iter()
+        .enumerate()
+        .filter(|(_, w)| {
+            w.overlap(writes.first, writes.last) < MIN_OVERLAP
+                || w.writes_inside(&writes.completed) == 0
+        })
+        .map(|(ix, _)| ix)
+        .collect()
+}
+
+/// One reader's span, from the start of its first timed query to the end
+/// of its last, in seconds since the run's epoch; the memory row count it
+/// read just outside each end (a diagnostic); and its samples.
 struct Window {
     begin: f64,
     end: f64,
@@ -769,6 +806,15 @@ impl Window {
             return 1.0;
         }
         ((self.end.min(last) - self.begin.max(first)).max(0.0) / length).min(1.0)
+    }
+
+    /// How many of the write completion times `completed` fall inside
+    /// this span.
+    fn writes_inside(&self, completed: &[f64]) -> usize {
+        completed
+            .iter()
+            .filter(|t| (self.begin..=self.end).contains(*t))
+            .count()
     }
 }
 
@@ -1180,7 +1226,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let (sent, received) = mpsc::channel();
         let run_dir = dir.clone();
-        std::thread::spawn(move || {
+        let run = std::thread::spawn(move || {
             let tables = SqliteTables::open(&run_dir.join("store")).unwrap();
             let db =
                 Database::open_backend(Box::new(tables), Some(run_dir.join("memory.db"))).unwrap();
@@ -1193,6 +1239,51 @@ mod tests {
             .recv_timeout(Duration::from_secs(60))
             .expect("the run returned instead of hanging");
         assert!(outcome.unwrap_err().contains("refused"));
+        // The thread still holds the database until it ends; Windows will
+        // not remove files that are open (OS error 32).
+        run.join().unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn window(begin: f64, end: f64) -> Window {
+        Window {
+            begin,
+            end,
+            rows_at_begin: 0,
+            rows_at_end: 1,
+            times: vec![],
+        }
+    }
+
+    /// A write that completes after a reader's last timed query (before
+    /// its closing row count would see it) does not load that reader.
+    #[test]
+    fn a_write_completing_after_the_last_query_is_rejected() {
+        let writes = Writes {
+            first: 0.0,
+            last: 3.0,
+            completed: vec![0.5, 2.5],
+        };
+        assert_eq!(invalid_readers(&[window(1.0, 2.0)], &writes), [0]);
+    }
+
+    #[test]
+    fn a_write_completing_inside_the_span_is_accepted() {
+        let writes = Writes {
+            first: 0.0,
+            last: 3.0,
+            completed: vec![0.5, 1.5, 2.5],
+        };
+        assert!(invalid_readers(&[window(1.0, 2.0)], &writes).is_empty());
+    }
+
+    #[test]
+    fn a_span_the_writer_barely_covers_is_rejected() {
+        let writes = Writes {
+            first: 1.5,
+            last: 3.0,
+            completed: vec![1.6],
+        };
+        assert_eq!(invalid_readers(&[window(1.0, 2.0)], &writes), [0]);
     }
 }

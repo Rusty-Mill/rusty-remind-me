@@ -10,22 +10,24 @@
 //!
 //! A manifest hashes every row it covers, keyed by the row's identity:
 //! each memory (all columns but the access and vitality counters, which
-//! reads move), wiki page, chunk vector (`<memory>#<chunk>`), entity,
-//! memory-entity link, entity relation and reference, and every body a
-//! row links to, re-hashed from its blob. A changed row differs even when
+//! reads move), wiki page and reference; every entity, memory-entity
+//! link, entity relation and chunk vector as stored, read through
+//! `testing::stored_rows` so columns the ports leave out count too (an
+//! entity's or relation's `node_id`, a chunk's stored `chunk_ix`, which
+//! keys it as `<memory>#<chunk_ix>`); and every body a row links to,
+//! re-hashed from its blob. A changed row differs even when
 //! every count is the same. Tables outside these groups (feedback,
 //! promotions, sessions, outbox and the rest) are not covered; the R3
 //! write-up names that scope.
 
 use remind_me_core::blobs::{content_key, BlobStore};
-use remind_me_core::db::entities::Entities;
 use remind_me_core::db::memories::Memories;
 use remind_me_core::db::references::References;
-use remind_me_core::db::vectors::Vectors;
 use remind_me_core::db::wiki::WikiIndex;
 use remind_me_core::db::Store;
-use remind_me_core::testing;
+use remind_me_core::testing::{self, Table};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -45,14 +47,14 @@ pub struct Manifest {
     pub memories: BTreeMap<String, String>,
     /// Page slug to the hash of its row.
     pub pages: BTreeMap<String, String>,
-    /// `<memory id>#<chunk index>` to the hash of that chunk's row: memory
-    /// id, index and embedding.
+    /// `<memory id>#<stored chunk_ix>` to the hash of that chunk's stored
+    /// row: memory id, chunk index and embedding.
     pub vectors: BTreeMap<String, String>,
-    /// Entity id to the hash of its row.
+    /// Entity id to the hash of its stored row, `node_id` included.
     pub entities: BTreeMap<String, String>,
-    /// `<memory id>|<entity id>` to the hash of the link row.
+    /// `<memory id>#<entity id>` to the hash of the stored link row.
     pub links: BTreeMap<String, String>,
-    /// Relation id to the hash of its row.
+    /// Relation id to the hash of its stored row, `node_id` included.
     pub relations: BTreeMap<String, String>,
     /// Reference id to the hash of its row.
     pub references: BTreeMap<String, String>,
@@ -100,16 +102,6 @@ impl Manifest {
                 .pages
                 .insert(page.slug, content_key(row.as_bytes()));
         }
-        for id in &ids {
-            for (ix, chunk) in Vectors::new(store).chunks_for(id)?.iter().enumerate() {
-                // A chunk row is its memory, its index and its embedding
-                // (all `ChunkVector` holds), hashed as one canonical row.
-                let key = format!("{id}#{ix}");
-                let mut row = format!("{}\u{1f}{ix}\u{1f}", chunk.memory_id).into_bytes();
-                row.extend_from_slice(&chunk.embedding);
-                manifest.vectors.insert(key, content_key(&row));
-            }
-        }
         for chunk in ids.chunks(BATCH) {
             for reference in References::new(store).for_memories(chunk)? {
                 let row = serde_json::to_string(&reference)?;
@@ -118,31 +110,26 @@ impl Manifest {
                     .insert(reference.id, content_key(row.as_bytes()));
             }
         }
-        let entities = Entities::new(store);
-        for entity in entities.all_oldest_first()? {
-            let row = serde_json::to_string(&entity)?;
-            manifest
-                .entities
-                .insert(entity.id, content_key(row.as_bytes()));
-        }
-        for (memory, entity, rest) in entities.links_oldest_first()? {
-            let row = format!("{memory}\u{1f}{entity}\u{1f}{rest}");
-            manifest
-                .links
-                .insert(format!("{memory}|{entity}"), content_key(row.as_bytes()));
-        }
-        for r in entities.relations_oldest_first()? {
-            let row = [
-                &r.id,
-                &r.subject_entity_id,
-                &r.relation,
-                &r.object_entity_id,
-                &r.created_at,
-                &r.updated_at,
-            ]
-            .map(String::as_str)
-            .join("\u{1f}");
-            manifest.relations.insert(r.id, content_key(row.as_bytes()));
+        // The graph and chunk rows as stored, every column included, so a
+        // row's `node_id` or a chunk's stored `chunk_ix` is covered too.
+        let tables = [
+            (Table::Entities, &mut manifest.entities, &["id"][..]),
+            (
+                Table::MemoryEntities,
+                &mut manifest.links,
+                &["memory_id", "entity_id"][..],
+            ),
+            (Table::EntityRelations, &mut manifest.relations, &["id"][..]),
+            (
+                Table::VecChunks,
+                &mut manifest.vectors,
+                &["memory_id", "chunk_ix"][..],
+            ),
+        ];
+        for (table, section, identity) in tables {
+            for row in testing::stored_rows(store, table)? {
+                section.insert(identity_of(&row, identity), row_hash(&row));
+            }
         }
         for key in links {
             let hash = match blobs.get(&key)? {
@@ -203,6 +190,26 @@ impl Manifest {
         }
         found
     }
+}
+
+/// A stored row's identity: its `columns`, joined by `#`
+/// (`<memory>#<chunk index>`, `<memory>#<entity>`).
+fn identity_of(row: &Map<String, Value>, columns: &[&str]) -> String {
+    columns
+        .iter()
+        .map(|c| match row.get(*c) {
+            Some(Value::String(s)) => s.clone(),
+            Some(other) => other.to_string(),
+            None => String::new(),
+        })
+        .collect::<Vec<_>>()
+        .join("#")
+}
+
+/// The hash of a stored row, its columns in name order.
+fn row_hash(row: &Map<String, Value>) -> String {
+    let sorted: BTreeMap<&String, &Value> = row.iter().collect();
+    content_key(json!(sorted).to_string().as_bytes())
 }
 
 /// Copy the directory `from` to `to`, which must not exist, leaving out
@@ -289,6 +296,7 @@ mod tests {
     #[test]
     fn a_read_covers_the_graph_and_catches_a_changed_relation() {
         use remind_me_core::db::engine::EngineTables;
+        use remind_me_core::db::entities::Entities;
         use remind_me_core::db::references::NewReference;
         use remind_me_core::entity;
         use remind_me_core::models::{EntityInput, MemoryAddInput};
@@ -345,5 +353,63 @@ mod tests {
     fn a_body_altered_on_both_sides_still_fails() {
         let altered = manifest("ffff 3");
         assert!(!altered.differences(&manifest("ffff 3")).is_empty());
+    }
+
+    /// An engine store for the stored-row cases below.
+    fn engine() -> remind_me_core::Database {
+        use remind_me_core::db::engine::EngineTables;
+        let tables = EngineTables::open_temporary().unwrap();
+        remind_me_core::Database::open_backend(Box::new(tables), None).unwrap()
+    }
+
+    fn no_blobs() -> BlobStore {
+        BlobStore::new(std::env::temp_dir().join("package_test_no_blobs"))
+    }
+
+    /// The same entity content written by another node is a changed row.
+    #[test]
+    fn a_changed_node_id_differs() {
+        use remind_me_core::db::entities::Entities;
+        use remind_me_core::entity::Entity;
+        let db = engine();
+        let store = db.store();
+        let entity = Entity {
+            id: "e".into(),
+            name: "e".into(),
+            kind: None,
+            aliases: vec![],
+            created_at: "2026-11-22".into(),
+            updated_at: "2026-11-22".into(),
+        };
+        let entities = Entities::new(&store);
+        entities.insert(&entity, Some("node-a")).unwrap();
+        let before = Manifest::read(&store, &no_blobs()).unwrap();
+        entities.upsert_synced(&entity, Some("node-b")).unwrap();
+        let after = Manifest::read(&store, &no_blobs()).unwrap();
+        let seen = entities.get("e").unwrap().unwrap();
+        let json = |e: &Entity| serde_json::to_value(e).unwrap();
+        assert_eq!(json(&seen), json(&entity), "the ports see no change");
+        assert_eq!(before.differences(&after), ["entities: 1 differ"]);
+    }
+
+    /// One embedding stored at another chunk index is a different row.
+    #[test]
+    fn the_same_vector_at_another_chunk_index_differs() {
+        use remind_me_core::db::memories::{Memories, NewMemory};
+        use remind_me_core::db::vectors::Vectors;
+        let manifest_with_chunk_at = |ix: usize| {
+            let db = engine();
+            let store = db.store();
+            Memories::new(&store)
+                .insert(&NewMemory::new("m", "x", "2026-11-22"))
+                .unwrap();
+            Vectors::new(&store).put("m", ix, &[1, 2, 3, 4]).unwrap();
+            Manifest::read(&store, &no_blobs()).unwrap()
+        };
+        let (at_0, at_1) = (manifest_with_chunk_at(0), manifest_with_chunk_at(1));
+        assert_eq!(at_1.vectors.keys().collect::<Vec<_>>(), ["m#1"]);
+        assert!(at_0
+            .differences(&at_1)
+            .contains(&"vectors: 2 differ".to_string()));
     }
 }
