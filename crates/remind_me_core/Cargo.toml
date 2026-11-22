@@ -152,3 +152,8 @@ backtrace = { version = "0.3", optional = true }
 [[bin]]
 name = "watchdog_stack_probe"
 required-features = ["stack-dumps"]
+
+# The R3 store benchmark's tests (the minimum-size run) run with `cargo test`.
+[[example]]
+name = "store_bench"
+test = true

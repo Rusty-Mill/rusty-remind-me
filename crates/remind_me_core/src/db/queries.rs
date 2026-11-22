@@ -868,7 +868,10 @@ pub fn search_memories_deadlined(
                 }
                 false
             };
-            let scored = crate::vectors::semantic_search_admitted(
+            // A failure here still degrades to keyword-only, as before, but
+            // is reported as a failed stage rather than passing for a clean
+            // search that found nothing semantically.
+            let scored = match crate::vectors::semantic_search_admitted(
                 store,
                 semantic,
                 &input.query,
@@ -876,8 +879,16 @@ pub fn search_memories_deadlined(
                 input.limit * 2,
                 input.category.as_deref(),
                 &admit,
-            )
-            .unwrap_or_default();
+            ) {
+                Ok(scored) => scored,
+                // The error itself is not logged: an embedding error can
+                // carry the provider's raw response body.
+                Err(_) => {
+                    eprintln!("rusty-remind-me: a search's semantic stage failed");
+                    timing.failed.push("semantic".to_string());
+                    Vec::new()
+                }
+            };
             let mut memories = Vec::with_capacity(scored.len());
             let mut similarity = std::collections::HashMap::with_capacity(scored.len());
             for (memory, sim) in scored {
@@ -1012,7 +1023,8 @@ fn dormant_keyword_matches(
 /// Nothing refined matched: a session not yet decomposed is still findable
 /// through its dialog, so `input` runs again with raw rows admitted and the
 /// result is marked (ADR-0029). Same embedder and deadline, so the second
-/// pass skips what the first skipped; both passes' skipped stages are kept.
+/// pass skips what the first skipped; both passes' skipped and failed stages
+/// are kept.
 fn raw_fallback(
     store: &Store<'_>,
     input: &MemorySearchInput,
@@ -1029,6 +1041,11 @@ fn raw_fallback(
     for stage in first.skipped {
         if !outcome.timing.skipped.contains(&stage) {
             outcome.timing.skipped.push(stage);
+        }
+    }
+    for stage in first.failed {
+        if !outcome.timing.failed.contains(&stage) {
+            outcome.timing.failed.push(stage);
         }
     }
     Ok(outcome)

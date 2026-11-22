@@ -460,21 +460,35 @@ pub fn vitality_report(report: &remind_me_core::vitality::VitalityReport) -> Str
 /// matches only — so "there is nothing about this topic" is *not* a safe
 /// inference — while no rerank means the ordering is RRF's rather than the
 /// cross-encoder's, which is worse but not misleading.
+///
+/// A stage that failed gets its own line: "skipped after a deadline" would
+/// send the reader to raise the deadline when the embedder or the vector
+/// scan is what broke.
 fn degradation_note(res: &MemorySearchResponse) -> Option<String> {
     if !res.timing.degraded() {
         return None;
     }
-    let limit = res
-        .timing
-        .deadline_ms
-        .map(|ms| format!("{ms}ms deadline"))
-        .unwrap_or_else(|| "deadline".to_string());
-    Some(format!(
-        "⏱ _Degraded: skipped {} after {}ms ({}). Results are incomplete rather than exhaustive._\n",
-        res.timing.skipped.join(" and "),
-        res.timing.elapsed_ms,
-        limit
-    ))
+    let mut note = String::new();
+    if !res.timing.skipped.is_empty() {
+        let limit = res
+            .timing
+            .deadline_ms
+            .map(|ms| format!("{ms}ms deadline"))
+            .unwrap_or_else(|| "deadline".to_string());
+        note.push_str(&format!(
+            "⏱ _Degraded: skipped {} after {}ms ({}). Results are incomplete rather than exhaustive._\n",
+            res.timing.skipped.join(" and "),
+            res.timing.elapsed_ms,
+            limit
+        ));
+    }
+    if !res.timing.failed.is_empty() {
+        note.push_str(&format!(
+            "⚠ _Degraded: the {} stage failed, so results may be incomplete._\n",
+            res.timing.failed.join(" and ")
+        ));
+    }
+    Some(note)
 }
 
 pub fn search_response(res: &MemorySearchResponse, detail: SearchDetail) -> String {
@@ -889,6 +903,7 @@ mod deadline_rendering {
             elapsed_ms: 1200,
             deadline_ms: Some(1000),
             skipped: vec!["semantic".to_string()],
+            ..SearchTiming::default()
         }
     }
 
@@ -918,6 +933,7 @@ mod deadline_rendering {
                     elapsed_ms: 2000,
                     deadline_ms: Some(500),
                     skipped: vec!["semantic".to_string(), "rerank".to_string()],
+                    ..SearchTiming::default()
                 },
                 0,
             ),
@@ -927,6 +943,19 @@ mod deadline_rendering {
         // means "nothing about this topic" is not a safe conclusion, whereas
         // no rerank only means the order is worse.
         assert!(rendered.contains("semantic and rerank"));
+    }
+
+    #[test]
+    fn a_failed_stage_is_not_reported_as_a_deadline() {
+        let failed = SearchTiming {
+            elapsed_ms: 40,
+            failed: vec!["semantic".to_string()],
+            ..SearchTiming::default()
+        };
+        let rendered = search_response(&response(failed, 0), SearchDetail::Full);
+        assert!(rendered.contains("semantic stage failed"));
+        assert!(rendered.contains("may be incomplete"));
+        assert!(!rendered.contains("deadline"));
     }
 }
 
