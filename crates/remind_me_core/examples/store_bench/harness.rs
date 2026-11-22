@@ -17,13 +17,24 @@
 //! run gets a new directory of its own under `<dir>` (never deleted, never
 //! reused) and prints one JSON line.
 //!
-//! These are smoke runs, not scoring: the reopen is warm, and the restore
-//! check compares ids, contents and vector row counts only, so neither is
-//! G7 or G8 evidence. A restore that differs fails the run.
+//! Bodies follow R3's layout (D50, D51, `bodies.rs`): every dialog and
+//! wiki page body goes whole to a blob store under the run, and the
+//! candidate's tables keep a 512-byte head and a link, identically for
+//! every candidate. The backup is a self-contained package restored in a
+//! child process with the source run moved away (D52, `package.rs`), and
+//! every row and body is compared by content hash; a difference fails the
+//! run. Disk is reported for the store, the candidate's temporary files
+//! (`<store>.temp`, Attest's engine tables) and the blob root (D53). The
+//! beside-writer search records how far the writer overlapped each reader
+//! and refuses a run with too little overlap (D54).
+//!
+//! The reopen is still warm, so it is not G7 evidence, and there is no D3
+//! ingest workload yet. These are not scoring runs.
 //!
 //! The run is offline. It refuses to start when the environment configures
-//! an embedder, query expansion or a reranking model, rather than letting them
-//! clear the bench vectors or call a model inside a timed search. Searches
+//! an embedder, query expansion, a reranking model or a cloud backup
+//! upload, rather than letting them clear the bench vectors, call a model
+//! inside a timed search or upload the bench backup. Searches
 //! run without a deadline, and one that skipped a stage, or a hybrid search
 //! whose semantic stage did not run, fails the run.
 //!
@@ -40,6 +51,7 @@ use remind_me_core::models::{
     EntityInput, MemoryAddInput, MemoryListInput, MemorySearchInput, MemoryUpdateInput,
 };
 use remind_me_core::retrieval::Deadline;
+use remind_me_core::wiki;
 use remind_me_core::{entity, testing, vectors, Database};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
@@ -49,6 +61,12 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Barrier;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod bodies;
+mod package;
+
+use bodies::Bodies;
+use package::Manifest;
+
 /// Any error, boxed.
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
@@ -57,9 +75,27 @@ const SAMPLES: usize = 500;
 const DIM: usize = 1024;
 const ENTITIES: usize = 500;
 const READERS: usize = 4;
+/// The category whose bodies are verbatim records (#1616).
+const DIALOG: &str = "dialog";
+/// Pages per this many memories (D3's raw pages, scaled to the run).
+const MEMORIES_PER_PAGE: usize = 10;
+/// The least share of each reader's window the writer must cover (D54).
+const MIN_OVERLAP: f64 = 0.95;
 
 /// Opens a backend's files in a directory.
 pub type Opener = fn(&Path) -> Result<Box<dyn Backend>>;
+
+/// Writes a candidate's own backup of the open database, whose store is in
+/// the first directory, into the second, a new directory.
+pub type Packager = fn(&Database, &Path, &Path) -> Result<()>;
+
+/// A [`Packager`] for a backend whose `backup_to` is the whole store (the
+/// engine, SQLite): its backup, moved into `dest`.
+pub fn backup_package(db: &Database, _store: &Path, dest: &Path) -> Result<()> {
+    let backup = remind_me_core::backup::create_backup(&db.store(), "bench")?;
+    std::fs::rename(&backup.path, dest)?;
+    Ok(())
+}
 
 /// A store backend under test.
 #[derive(Clone, Copy)]
@@ -68,8 +104,10 @@ pub struct Candidate {
     pub name: &'static str,
     /// Opens the candidate's store in a directory.
     pub tables: Opener,
-    /// Opens a backup the candidate wrote, as a fresh store.
+    /// Opens a restored package's `store/`, as a fresh store.
     pub restore: Opener,
+    /// Writes the backup that goes in the package's `store/`.
+    pub package: Packager,
 }
 
 impl Candidate {
@@ -79,6 +117,17 @@ impl Candidate {
         let tables = (self.tables)(&dir.join("store"))?;
         Ok(Database::open_backend(tables, Some(dir.join("memory.db")))?)
     }
+}
+
+/// Where the G8 restore runs (D52).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Isolation {
+    /// A child process: this executable, re-run as `restore`. Scoring runs
+    /// use this.
+    Child,
+    /// This process, for the example's own tests, where the executable is
+    /// the test runner.
+    InProcess,
 }
 
 /// What a run measures.
@@ -119,11 +168,23 @@ pub fn run(candidates: &[Candidate]) -> Result<()> {
         )
         .into());
     };
-    let mode = Mode::parse(mode)?;
     let Some(&candidate) = candidates.iter().find(|c| c.name == backend) else {
         return Err(format!("unknown backend {backend:?}; one of {names:?}").into());
     };
-    let report = measure(candidate, mode, n.parse()?, Path::new(dir))?;
+    // The G8 child (D52): `restore <backend> <package> <fresh dir>`.
+    if mode == "restore" {
+        let restored = restore(candidate, Path::new(n), Path::new(dir))?;
+        println!("{}", serde_json::to_string(&restored)?);
+        return Ok(());
+    }
+    let mode = Mode::parse(mode)?;
+    let report = measure(
+        candidate,
+        mode,
+        n.parse()?,
+        Path::new(dir),
+        Isolation::Child,
+    )?;
     println!("{}", Value::Object(report));
     Ok(())
 }
@@ -135,6 +196,7 @@ pub fn measure(
     mode: Mode,
     n: usize,
     root: &Path,
+    isolation: Isolation,
 ) -> Result<Map<String, Value>> {
     if n == 0 {
         return Err("n must be at least 1".into());
@@ -149,18 +211,35 @@ pub fn measure(
     report.insert("run_dir".into(), json!(dir));
     report.insert(
         "note".into(),
-        json!("smoke run: warm reopen and the restore check are not G7 or G8 evidence"),
+        json!("not a scoring run: the reopen is warm (not G7) and there is no D3 ingest yet"),
     );
     match mode {
-        Mode::Bench => workload(candidate, &dir, n, &mut report)?,
+        Mode::Bench => workload(candidate, &dir, n, &mut report, isolation)?,
         Mode::Open => reopen(candidate, &dir, n, &mut report)?,
     }
-    report.insert(
-        "disk_mb".into(),
-        json!(megabytes(dir_size(&dir.join("store"))?)),
-    );
+    report.insert("disk_mb".into(), disk(&dir)?);
     report.insert("peak_rss_mb".into(), json!(peak_rss_mb()));
     Ok(report)
+}
+
+/// The run's disk use, in MB (D53): the store, the candidate's temporary
+/// files beside it (`store.temp`), the blob root, and their total.
+fn disk(dir: &Path) -> Result<Value> {
+    let size = |name: &str| -> Result<u64> {
+        let path = dir.join(name);
+        if path.exists() {
+            dir_size(&path)
+        } else {
+            Ok(0)
+        }
+    };
+    let (store, temp, blobs) = (size("store")?, size("store.temp")?, size("blobs")?);
+    Ok(json!({
+        "store": megabytes(store),
+        "temp": megabytes(temp),
+        "blobs": megabytes(blobs),
+        "total": megabytes(store + temp + blobs),
+    }))
 }
 
 /// A new directory under `root` that this run alone owns: `create_dir`
@@ -195,6 +274,13 @@ fn refuse_model_config() -> Result<()> {
         )
         .into());
     }
+    if remind_me_core::cloud_backup::enabled() {
+        return Err(format!(
+            "{} is set; unset it, the benchmark's backups must not be uploaded",
+            remind_me_core::cloud_backup::BUCKET_ENV
+        )
+        .into());
+    }
     // Reranking is on by default but runs only with a model configured.
     if matches!(reranker::status(), reranker::Status::Ready) {
         return Err(format!(
@@ -208,8 +294,11 @@ fn refuse_model_config() -> Result<()> {
 }
 
 /// Add `n` memories, each with its vector; their ids, and each add's time.
+/// A dialog's body goes to `bodies` and its row keeps the head and link
+/// (D50); the time includes that blob write.
 fn fill(
     store: &Store<'_>,
+    bodies: &Bodies,
     n: usize,
     corpus: &Corpus,
     rng: &mut Rng,
@@ -217,15 +306,39 @@ fn fill(
     let mut ids = Vec::with_capacity(n);
     let mut adds = Vec::with_capacity(n);
     for _ in 0..n {
-        let input = corpus.memory(rng);
-        let content = input.content.clone();
+        let mut input = corpus.memory(rng);
         let t = Instant::now();
+        if input.category == DIALOG {
+            let stashed = bodies.stash(&input.content)?;
+            input.metadata = stashed.metadata();
+            input.content = stashed.head;
+        }
+        let content = input.content.clone();
         let id = queries::add_memory(store, input)?.id;
         vectors::embed_and_store(store, &BenchEmbedder, &id, &content)?;
         adds.push(t.elapsed());
         ids.push(id);
     }
     Ok((ids, adds))
+}
+
+/// `count` wiki pages of 10 to 30 KB, each body in `bodies` and its row a
+/// head and a link (D50); the total time.
+fn pages(
+    store: &Store<'_>,
+    bodies: &Bodies,
+    count: usize,
+    corpus: &Corpus,
+    rng: &mut Rng,
+) -> Result<Duration> {
+    let t = Instant::now();
+    for i in 0..count {
+        let body = corpus.page(rng);
+        let stashed = bodies.stash(&body)?;
+        let slug = format!("page-{i}");
+        wiki::write_wiki_page(store, &slug, &slug, &stashed.head, &stashed.page_summary())?;
+    }
+    Ok(t.elapsed())
 }
 
 /// `ENTITIES` entities, each related to three others and linked to a few
@@ -280,18 +393,27 @@ fn workload(
     dir: &Path,
     n: usize,
     report: &mut Map<String, Value>,
+    isolation: Isolation,
 ) -> Result<()> {
     let corpus = Corpus::new();
     let mut rng = Rng(0x5eed);
+    let bodies = Bodies::new(dir.join("blobs"));
     let (ids, entities) = {
         let db = candidate.open(dir)?;
         let started = Instant::now();
-        let (ids, adds) = fill(&db.store(), n, &corpus, &mut rng)?;
+        let (ids, adds) = fill(&db.store(), &bodies, n, &corpus, &mut rng)?;
         report.insert("fill_s".into(), json!(started.elapsed().as_secs_f64()));
         report.insert("add".into(), summary(adds));
+        let count = n.div_ceil(MEMORIES_PER_PAGE);
+        let took = pages(&db.store(), &bodies, count, &corpus, &mut rng)?;
+        report.insert(
+            "pages".into(),
+            json!({ "count": count, "ms": millis(took) }),
+        );
         let entities = graph(&db, &ids, &mut rng)?;
         (ids, entities)
     };
+    report.insert("disk_mb_after_fill".into(), disk(dir)?);
 
     let started = Instant::now();
     let db = candidate.open(dir)?;
@@ -302,7 +424,7 @@ fn workload(
     // and deletes take the other memories.
     let mut editable = Vec::new();
     for id in &ids {
-        if testing::memory_text(&store, id, "category")?.as_deref() != Some("dialog") {
+        if testing::memory_text(&store, id, "category")?.as_deref() != Some(DIALOG) {
             editable.push(id.clone());
         }
     }
@@ -390,9 +512,15 @@ fn workload(
     };
     report.insert("update".into(), update);
 
+    // The same readers, inputs and searches with and without the writer,
+    // so the two differ only by the writer (D54).
+    report.insert(
+        "search_hybrid_readers_idle".into(),
+        readers(&db, &store, &bodies, &corpus, &queries_, &vectors_, false)?,
+    );
     report.insert(
         "search_hybrid_beside_writer".into(),
-        beside_writer(&db, &corpus, &queries_, &vectors_)?,
+        readers(&db, &store, &bodies, &corpus, &queries_, &vectors_, true)?,
     );
 
     let t = Instant::now();
@@ -418,7 +546,7 @@ fn workload(
     report.insert("delete".into(), delete);
 
     drop(store);
-    backup_and_restore(candidate, &db, report)
+    backup_and_restore(candidate, db, &bodies, dir, report, isolation)
 }
 
 /// One search, keyword-only (`vectors` is `None`) or hybrid, that fails
@@ -460,40 +588,63 @@ fn searched(
     Ok(())
 }
 
-/// Hybrid search on `READERS` threads while one thread keeps adding
-/// memories; the readers' times. All threads start together at a barrier,
-/// and the writer runs until every reader has finished, so every sample is
-/// taken beside a live writer. Each thread takes a store from the
-/// database's secondary source, as the node's background threads do: a
-/// store from [`Database::store`] holds the process lock.
-fn beside_writer(
+/// Hybrid search on `READERS` threads, all started together at a
+/// barrier; with `writer`, beside one thread that keeps adding memories.
+/// The readers' times. Each thread takes a store from the database's
+/// secondary source, as the node's background threads do: a store from
+/// [`Database::store`] holds the process lock, so the caller's `store`
+/// (which holds it) only counts rows before and after.
+///
+/// The writer adds once before the barrier and stops only after the last
+/// reader has finished, so it covers every reader's window by
+/// construction; the report records each reader's window, the writer's,
+/// their overlap and the rows added inside each window, and the run fails
+/// as invalid when any reader saw less than [`MIN_OVERLAP`] of it covered
+/// or no row added (D54).
+fn readers(
     db: &Database,
+    store: &Store<'_>,
+    bodies: &Bodies,
     corpus: &Corpus,
     queries_: &[String],
     vectors_: &Precomputed,
+    writer: bool,
 ) -> Result<Value> {
     let source = &db.secondary_source().ok_or("an in-memory database")?;
-    let start = &Barrier::new(READERS + 1);
+    let start = &Barrier::new(READERS + usize::from(writer));
     let readers_done = &AtomicBool::new(false);
     let written = &AtomicUsize::new(0);
-    let mut times: Vec<Duration> = Vec::new();
+    let epoch = Instant::now();
+    let rows_before = testing::count(store, testing::Table::Memories)?;
+    let mut windows: Vec<Window> = Vec::new();
+    let mut span = None;
     std::thread::scope(|scope| -> Result<()> {
-        let writer = scope.spawn(move || -> std::result::Result<(), String> {
-            let store = source.store();
-            let mut rng = Rng(0xbeef);
-            start.wait();
-            while !readers_done.load(Ordering::SeqCst) {
-                fill(&store, 1, corpus, &mut rng).map_err(|e| e.to_string())?;
-                written.fetch_add(1, Ordering::SeqCst);
-            }
-            Ok(())
+        let writing = writer.then(|| {
+            scope.spawn(move || -> std::result::Result<(f64, f64), String> {
+                let store = source.store();
+                let mut rng = Rng(0xbeef);
+                let first = epoch.elapsed().as_secs_f64();
+                let mut add = || -> std::result::Result<(), String> {
+                    fill(&store, bodies, 1, corpus, &mut rng).map_err(|e| e.to_string())?;
+                    written.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                };
+                add()?;
+                start.wait();
+                while !readers_done.load(Ordering::SeqCst) {
+                    add()?;
+                }
+                Ok((first, epoch.elapsed().as_secs_f64()))
+            })
         });
-        let readers: Vec<_> = (0..READERS)
+        let threads: Vec<_> = (0..READERS)
             .map(|r| {
-                scope.spawn(move || -> std::result::Result<Vec<Duration>, String> {
+                scope.spawn(move || -> std::result::Result<Window, String> {
                     let store = source.store();
                     let mut times = Vec::with_capacity(SAMPLES / READERS);
                     start.wait();
+                    let added_before = written.load(Ordering::SeqCst);
+                    let begin = epoch.elapsed().as_secs_f64();
                     for i in (r..SAMPLES).step_by(READERS) {
                         let input: MemorySearchInput =
                             serde_json::from_value(json!({ "query": queries_[i] }))
@@ -502,67 +653,174 @@ fn beside_writer(
                         searched(&store, &input, Some(vectors_)).map_err(|e| e.to_string())?;
                         times.push(t.elapsed());
                     }
-                    Ok(times)
+                    Ok(Window {
+                        begin,
+                        end: epoch.elapsed().as_secs_f64(),
+                        added: written.load(Ordering::SeqCst) - added_before,
+                        times,
+                    })
                 })
             })
             .collect();
         let mut joined = Ok(());
-        for reader in readers {
-            match reader.join().map_err(|_| "a reader panicked".to_string()) {
-                Ok(Ok(t)) => times.extend(t),
+        for thread in threads {
+            match thread.join().map_err(|_| "a reader panicked".to_string()) {
+                Ok(Ok(w)) => windows.push(w),
                 Ok(Err(e)) | Err(e) => joined = Err(e),
             }
         }
         readers_done.store(true, Ordering::SeqCst);
-        writer.join().map_err(|_| "the writer panicked")??;
+        if let Some(writing) = writing {
+            span = Some(writing.join().map_err(|_| "the writer panicked")??);
+        }
         Ok(joined?)
     })?;
+    let rows_after = testing::count(store, testing::Table::Memories)?;
+    let times = windows
+        .iter()
+        .flat_map(|w| w.times.iter().copied())
+        .collect();
     let mut value = summary(times);
+    value["memory_rows"] = json!({ "before": rows_before, "after": rows_after });
+    let Some((first, last)) = span else {
+        return Ok(value);
+    };
+    let overlaps: Vec<f64> = windows.iter().map(|w| w.overlap(first, last)).collect();
     value["writer_adds"] = json!(written.load(Ordering::SeqCst));
-    Ok(value)
-}
-
-/// Time a backup, then open it as a fresh store and compare every memory's
-/// content and every vector count with the source.
-fn backup_and_restore(
-    candidate: Candidate,
-    db: &Database,
-    report: &mut Map<String, Value>,
-) -> Result<()> {
-    let store = db.store();
-    let t = Instant::now();
-    let backup = remind_me_core::backup::create_backup(&store, "bench")?;
-    report.insert("backup_ms".into(), json!(millis(t.elapsed())));
-
-    let t = Instant::now();
-    let restored = Database::open_backend((candidate.restore)(Path::new(&backup.path))?, None)?;
-    report.insert("restore_open_ms".into(), json!(millis(t.elapsed())));
-    let copy = restored.store();
-    let ids = testing::memory_ids(&store)?;
-    let same_ids = ids == testing::memory_ids(&copy)?;
-    let mut differing = 0usize;
-    for id in &ids {
-        if testing::memory_column(&store, id, "content")?
-            != testing::memory_column(&copy, id, "content")?
-        {
-            differing += 1;
-        }
-    }
-    // Equal vector row counts only: a smoke check, not G8's content check.
-    let same_vectors = testing::count(&store, testing::Table::VecChunks)?
-        == testing::count(&copy, testing::Table::VecChunks)?;
-    if !same_ids || differing > 0 || !same_vectors {
+    value["writer_s"] = json!({ "first": first, "last": last });
+    value["readers"] = windows
+        .iter()
+        .zip(&overlaps)
+        .map(|(w, o)| json!({ "begin_s": w.begin, "end_s": w.end, "overlap": o, "rows_added": w.added }))
+        .collect();
+    let starved = windows.iter().any(|w| w.added == 0);
+    if overlaps.iter().any(|o| *o < MIN_OVERLAP) || starved {
         return Err(format!(
-            "the restored copy differs: same ids {same_ids}, {differing} differing contents, \
-             same vector row count {same_vectors}"
+            "invalid run, re-run it: reader overlaps {overlaps:?} (need {MIN_OVERLAP}), \
+             a reader saw no row added: {starved}"
         )
         .into());
     }
+    Ok(value)
+}
+
+/// One reader's span in seconds since the run's epoch, the rows the writer
+/// added inside it, and its samples.
+struct Window {
+    begin: f64,
+    end: f64,
+    added: usize,
+    times: Vec<Duration>,
+}
+
+impl Window {
+    /// The share of this window the writer's span `[first, last]` covers.
+    fn overlap(&self, first: f64, last: f64) -> f64 {
+        let length = self.end - self.begin;
+        if length <= 0.0 {
+            return 1.0;
+        }
+        ((self.end.min(last) - self.begin.max(first)).max(0.0) / length).min(1.0)
+    }
+}
+
+/// Write the G8 package (D52), move the run away, restore the package in
+/// isolation into a fresh directory, and compare what it holds with the
+/// source's manifest, row by row and body by body.
+fn backup_and_restore(
+    candidate: Candidate,
+    db: Database,
+    bodies: &Bodies,
+    dir: &Path,
+    report: &mut Map<String, Value>,
+    isolation: Isolation,
+) -> Result<()> {
+    let source = Manifest::read(&db.store(), bodies.blobs())?;
+    let manifest = serde_json::to_vec(&source)?;
+    let package = dir.with_extension("package");
+    std::fs::create_dir(&package)
+        .map_err(|e| format!("cannot create {}: {e}", package.display()))?;
+    let t = Instant::now();
+    (candidate.package)(&db, &dir.join("store"), &package.join("store"))?;
+    package::copy_dir(bodies.blobs().root(), &package.join("blobs"), &[])?;
+    std::fs::write(package.join("manifest.json"), &manifest)?;
+    report.insert("backup_ms".into(), json!(millis(t.elapsed())));
+    std::fs::write(dir.join("manifest.json"), &manifest)?;
+    drop(db);
+
+    let fresh = dir.with_extension("restored");
+    let away = dir.with_extension("away");
+    std::fs::rename(dir, &away)?;
+    let restored = match isolation {
+        Isolation::Child => restore_in_child(candidate, &package, &fresh),
+        Isolation::InProcess => restore(candidate, &package, &fresh),
+    };
+    std::fs::rename(&away, dir)?;
+    let restored = restored?;
+
+    let differences = source.differences(&restored.manifest);
     report.insert(
-        "restore_smoke".into(),
-        json!({ "rows": ids.len(), "matched": true }),
+        "restore".into(),
+        json!({
+            "items": source.size(),
+            "matched": differences.is_empty(),
+            "open_ms": restored.open_ms,
+            "isolation": format!("{isolation:?}"),
+        }),
     );
+    if !differences.is_empty() {
+        return Err(format!("the restored package differs: {differences:?}").into());
+    }
     Ok(())
+}
+
+/// What a restore read back, as the child prints it.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct Restored {
+    manifest: Manifest,
+    open_ms: f64,
+}
+
+/// Restore `package` into `fresh`, a new directory: copy its store and
+/// blobs there, open the store (Attest rebuilds from its log here, and the
+/// time counts), and read its manifest back.
+pub fn restore(candidate: Candidate, package: &Path, fresh: &Path) -> Result<Restored> {
+    refuse_model_config()?;
+    std::fs::create_dir(fresh).map_err(|e| format!("cannot create {}: {e}", fresh.display()))?;
+    package::copy_dir(&package.join("store"), &fresh.join("store"), &[])?;
+    package::copy_dir(&package.join("blobs"), &fresh.join("blobs"), &[])?;
+    let t = Instant::now();
+    let db = Database::open_backend((candidate.restore)(&fresh.join("store"))?, None)?;
+    let open_ms = millis(t.elapsed());
+    let blobs = remind_me_core::blobs::BlobStore::new(fresh.join("blobs"));
+    let manifest = Manifest::read(&db.store(), &blobs)?;
+    Ok(Restored { manifest, open_ms })
+}
+
+/// [`restore`] in a child process: this executable, run as
+/// `restore <backend> <package> <fresh>`. Its last stdout line is the
+/// result.
+fn restore_in_child(candidate: Candidate, package: &Path, fresh: &Path) -> Result<Restored> {
+    let output = std::process::Command::new(std::env::current_exe()?)
+        .arg("restore")
+        .arg(candidate.name)
+        .arg(package)
+        .arg(fresh)
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "the restore child failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    let stdout = String::from_utf8(output.stdout)?;
+    let line = stdout
+        .lines()
+        .last()
+        .ok_or("the restore child printed nothing")?;
+    Ok(serde_json::from_str(line)?)
 }
 
 /// Fill a store, then time reopening it: the cost of rebuilding what the
@@ -575,7 +833,8 @@ fn reopen(
 ) -> Result<()> {
     let corpus = Corpus::new();
     let mut rng = Rng(0x5eed);
-    fill(&candidate.open(dir)?.store(), n, &corpus, &mut rng)?;
+    let bodies = Bodies::new(dir.join("blobs"));
+    fill(&candidate.open(dir)?.store(), &bodies, n, &corpus, &mut rng)?;
     let started = Instant::now();
     let _db = candidate.open(dir)?;
     report.insert("reopen_warm_ms".into(), json!(millis(started.elapsed())));
@@ -756,9 +1015,20 @@ impl Corpus {
         text
     }
 
+    /// A page of 10 to 30 KB, D3's raw page sizes.
+    fn page(&self, rng: &mut Rng) -> String {
+        let target = 10_000 + rng.below(20_001);
+        let mut text = String::with_capacity(target + 16);
+        while text.len() < target {
+            text.push_str(self.word(rng));
+            text.push(if rng.below(12) == 0 { '\n' } else { ' ' });
+        }
+        text
+    }
+
     fn memory(&self, rng: &mut Rng) -> MemoryAddInput {
         let category = match rng.below(100) {
-            0..=76 => "dialog",
+            0..=76 => DIALOG,
             77..=84 => "fact",
             85..=90 => "chat_import",
             91..=95 => "normalized",

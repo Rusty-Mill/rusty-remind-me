@@ -146,3 +146,52 @@ fn a_reopen_never_reissues_a_deleted_revision_id() {
     drop(db);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+fn open_at(log: &Path) -> Database {
+    let tables = attest_store::open_at(log, &log.with_extension("temp")).unwrap();
+    Database::open_backend(Box::new(tables), None).unwrap()
+}
+
+/// The engine tables live where `open_at` puts them, and are rebuilt
+/// there from the log at every open. A second opener of the same log is
+/// refused before it clears the first one's tables.
+#[test]
+fn open_at_keeps_the_tables_beside_the_log_and_rebuilds_them() {
+    let dir = scratch("open_at");
+    let log = dir.join("store");
+    let id = {
+        let db = open_at(&log);
+        let id = add(&db, "kept beside the log");
+        assert!(std::fs::read_dir(log.with_extension("temp")).unwrap().count() > 0);
+        assert!(attest_store::open_at(&log, &log.with_extension("temp")).is_err());
+        assert!(testing::memory_text(&db.store(), &id, "id").unwrap().is_some());
+        id
+    };
+    let db = open_at(&log);
+    assert!(testing::memory_text(&db.store(), &id, "id").unwrap().is_some());
+    drop(db);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A package is the log alone, without the lock or the engine tables,
+/// and opens anywhere as the same store.
+#[test]
+fn a_package_restores_from_the_log_alone() {
+    let dir = scratch("package");
+    let (log, package) = (dir.join("store"), dir.join("package"));
+    let db = open_at(&log);
+    let id = add(&db, "packaged");
+    attest_store::package(&log, &package).unwrap();
+    assert!(!package.join("LOCK").exists());
+    drop(db);
+    std::fs::rename(&log, dir.join("moved")).unwrap();
+    let restored = open_at(&package);
+    assert_eq!(
+        testing::memory_text(&restored.store(), &id, "content")
+            .unwrap()
+            .as_deref(),
+        Some("packaged")
+    );
+    drop(restored);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

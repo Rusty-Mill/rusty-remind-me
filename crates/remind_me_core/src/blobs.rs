@@ -45,7 +45,7 @@ impl BlobStore {
     ///
     /// The filesystem's error.
     pub fn put(&self, bytes: &[u8]) -> io::Result<String> {
-        let key = sha256::digest(bytes);
+        let key = content_key(bytes);
         self.put_keyed(&key, bytes)?;
         Ok(key)
     }
@@ -98,6 +98,12 @@ impl BlobStore {
             .get(key)?
             .is_some_and(|bytes| sha256::digest(&bytes[..]).starts_with(key)))
     }
+}
+
+/// The key [`BlobStore::put`] gives `bytes`: their sha256, 64 hex
+/// characters. Also what a caller hashes content with to compare it.
+pub fn content_key(bytes: &[u8]) -> String {
+    sha256::digest(bytes)
 }
 
 /// A key names a file, so it must be non-empty ASCII alphanumerics: no

@@ -21,6 +21,8 @@ use std::path::Path;
 /// The record kind every captured write is stored under.
 pub const KIND: &str = "remind_me.write";
 const WRITER: &str = "remind-me-r3";
+/// The lock file Attest keeps in its directory.
+const LOCK: &str = "LOCK";
 
 /// Engine tables over an Attest log in `dir`: replays the log onto fresh
 /// temporary tables, then hands every later write to the log.
@@ -29,9 +31,61 @@ const WRITER: &str = "remind-me-r3";
 ///
 /// The log's error (locked, corrupt) or the engine's.
 pub fn open(dir: &Path) -> Result<EngineTables> {
+    replay(dir, EngineTables::open_temporary()?)
+}
+
+/// As [`open`], with the engine's tables in `engine` instead of a hidden
+/// temporary directory, so the benchmark can count their disk (D48, D53).
+/// Whatever `engine` held is removed first: the tables are always rebuilt
+/// from the log alone.
+///
+/// # Errors
+///
+/// As [`open`], or the filesystem's error clearing `engine`.
+pub fn open_at(dir: &Path, engine: &Path) -> Result<EngineTables> {
+    // Take the log's lock before touching `engine`, so a second opener of
+    // the same log is refused before it can clear the first one's tables.
     let log = FileStore::open(dir, StoreConfig::default()).map_err(log_error)?;
+    if engine.exists() {
+        std::fs::remove_dir_all(engine).map_err(io_error)?;
+    }
+    replay_into(log, EngineTables::open(engine)?)
+}
+
+/// Copy the log in `dir` (its segment directories) into `dest`, a new
+/// directory, leaving out the lock file, which only names its holder.
+/// With no write in flight (the caller holds the store), the copy is the
+/// whole durable store; the engine's tables are not in it, since an open
+/// rebuilds them (D52).
+///
+/// # Errors
+///
+/// The filesystem's error.
+pub fn package(dir: &Path, dest: &Path) -> Result<()> {
+    std::fs::create_dir(dest).map_err(io_error)?;
+    for entry in std::fs::read_dir(dir).map_err(io_error)? {
+        let entry = entry.map_err(io_error)?;
+        let target = dest.join(entry.file_name());
+        if entry.file_name() == LOCK {
+            continue;
+        }
+        if entry.file_type().map_err(io_error)?.is_dir() {
+            package(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target).map_err(io_error)?;
+        }
+    }
+    Ok(())
+}
+
+fn replay(dir: &Path, tables: EngineTables) -> Result<EngineTables> {
+    let log = FileStore::open(dir, StoreConfig::default()).map_err(log_error)?;
+    replay_into(log, tables)
+}
+
+/// Replay `log` onto empty `tables`, then hand every later write to it.
+fn replay_into(log: FileStore, mut tables: EngineTables) -> Result<EngineTables> {
     let records = log.scan().map_err(log_error)?;
-    let mut tables = EngineTables::open_temporary()?;
     let mut changes = Vec::with_capacity(records.len());
     for record in &records {
         if record.envelope.kind == KIND {
@@ -119,6 +173,10 @@ fn captured(record: &Record) -> Result<CapturedChange> {
         key: field("key").ok_or_else(malformed)?.into_bytes(),
         value: field("value").map(String::into_bytes),
     })
+}
+
+fn io_error(e: std::io::Error) -> StoreError {
+    StoreError::Engine(format!("attest: {e}"))
 }
 
 fn log_error(e: LogError) -> StoreError {

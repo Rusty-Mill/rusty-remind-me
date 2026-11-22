@@ -39,6 +39,7 @@ dependencies = [
  "attest",
  "remind_me_core",
  "rusty_serde",
+ "serde",
  "serde_json",
 ]
 
