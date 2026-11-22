@@ -12,8 +12,10 @@
 //! and dialog body here with only metadata in the candidate's tables.
 //! Production backups do not include a blob root yet (Q20).
 
-use std::io;
+use std::fs::OpenOptions;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Blobs under one root directory.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -67,10 +69,45 @@ impl BlobStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let partial = path.with_extension(format!("partial-{}", std::process::id()));
-        std::fs::write(&partial, bytes)?;
-        std::fs::rename(&partial, &path)?;
-        Ok(path)
+        let partial = self.stage(&path, bytes)?;
+        match std::fs::rename(&partial, &path) {
+            Ok(()) => Ok(path),
+            // Another writer published the same key first (a rename onto
+            // an existing file fails on Windows): its bytes are these.
+            Err(_) if path.exists() => {
+                std::fs::remove_file(&partial)?;
+                Ok(path)
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&partial);
+                Err(e)
+            }
+        }
+    }
+
+    /// Write `bytes` to a staging file beside `path` that this call alone
+    /// created (`create_new`, a name no other writer in any process is
+    /// given), so concurrent writers of one key never share it.
+    fn stage(&self, path: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        loop {
+            let n = NEXT.fetch_add(1, Ordering::Relaxed);
+            let partial = path.with_extension(format!("partial-{}-{n}", std::process::id()));
+            let mut file = match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&partial)
+            {
+                Ok(file) => file,
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            };
+            if let Err(e) = file.write_all(bytes) {
+                let _ = std::fs::remove_file(&partial);
+                return Err(e);
+            }
+            return Ok(partial);
+        }
     }
 
     /// The bytes stored under `key`, or `None` when there is no such blob.
@@ -165,6 +202,29 @@ mod tests {
         assert!(blobs.verify(key).unwrap());
         blobs.put_keyed(key, b"other").unwrap();
         assert_eq!(std::fs::read(path).unwrap(), b"raw");
+        std::fs::remove_dir_all(blobs.root()).unwrap();
+    }
+
+    /// Many writers of one key at once: every put succeeds, the blob holds
+    /// the bytes, and no staging file is left behind.
+    #[test]
+    fn concurrent_puts_of_one_key_all_succeed() {
+        let blobs = scratch("concurrent");
+        let body = vec![7u8; 64 * 1024];
+        let key = content_key(&body);
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                scope.spawn(|| blobs.put_keyed(&key, &body).unwrap());
+            }
+        });
+        assert_eq!(blobs.get(&key).unwrap().as_deref(), Some(&body[..]));
+        assert!(blobs.verify(&key).unwrap());
+        let shard = blobs.path(&key).parent().unwrap().to_path_buf();
+        let names: Vec<_> = std::fs::read_dir(shard)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, [std::ffi::OsString::from(&key)], "no staging left");
         std::fs::remove_dir_all(blobs.root()).unwrap();
     }
 
