@@ -2,6 +2,20 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-22 — Store benchmark: D1 and D2 datasets, cold open and idle memory (Millwright R3, Mill Board #1618, D55 PR A)
+
+### Added
+- `store_bench` takes a dataset: `<n>` synthetic memories as before, `d1:<backup>` or `d2:<backup>`.
+  - **D1:** a copy of a `manual-*.engine` backup is opened as an engine store, and every memory (tombstones included), chunk vector, entity (with its `node_id`), memory-entity link, relation, reference and the embedding identity are written into the candidate through its ports. Dialog bodies go to the blob store with a head and a link (D50, D51). The backup itself is never opened, and the copy is removed once loaded.
+  - **D2:** D1 grown to 75,000 memories with synthetic ones, their seeded vectors written straight to their chunks so the store's recorded embedding identity stays the real model's.
+  - Queries on D1 and D2 are real: a sampled memory's leading words, with that memory's stored vector as the query vector.
+- **Cold open (G7):** after the restore, a child process opens the run's store and answers one hybrid search, timed from its spawn to its first line. With `R3_DROP_CACHES=1` the page cache is dropped first, and the run fails if it cannot be. The child then idles 2 s and reports its resident memory (`rss_idle_mb`, the G5 baseline on D1).
+- `open` mode is synthetic only. The report's `n` is now `dataset` and `memories`.
+
+### Tests
+- D1 loads every row kind into the engine and SQLite and completes with a matched isolated restore and a cold open; the backup is left alone. D2 grows to its total. A missing backup is refused before any directory is made.
+- Smoke runs with D1 taken from a 2,000-memory synthetic engine store pass on all three candidates. These are not scores.
+
 ## 2026-11-22 — Store benchmark: same body layout, isolated G8 restore, overlap and G1 checks (Millwright R3, Mill Board #1618)
 
 ### Added

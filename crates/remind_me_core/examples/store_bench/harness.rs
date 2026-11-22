@@ -8,11 +8,23 @@
 //! cargo run --release -p remind_me_core --example store_bench -- open  sqlite 15000 /tmp/bench
 //! ```
 //!
-//! `bench` fills a fresh store with `n` synthetic memories, each with a
-//! vector, plus an entity graph, and times what R3 measures: writes,
+//! The dataset is `n` synthetic memories, `d1:<backup>` (the real store,
+//! from a copy of a `manual-*.engine` backup, loaded through the ports;
+//! `d1.rs`) or `d2:<backup>` (D1 grown to 75,000 with synthetic memories).
+//!
+//! ```text
+//! cargo run --release -p remind_me_core --example store_bench -- bench sqlite d1:/data/manual-x.engine /tmp/bench
+//! ```
+//!
+//! `bench` fills a fresh store with the dataset (synthetic data also gets
+//! an entity graph and pages) and times what R3 measures: writes,
 //! keyword, semantic and hybrid search, the vitality pass, one- and two-hop
 //! entity walks, search with four readers beside one writer, and a backup
-//! restored and compared row by row. `open` fills a store and times
+//! restored and compared row by row, then the cold open (G7): a child
+//! process opens the store and answers one query, timed from its spawn,
+//! with the page cache dropped first when `R3_DROP_CACHES=1`, and reports
+//! its resident memory once idle (the G5 baseline). `open` fills a
+//! synthetic store and times
 //! reopening it, which rebuilds whatever the backend derives at open. Each
 //! run gets a new directory of its own under `<dir>` (never deleted, never
 //! reused) and prints one JSON line.
@@ -32,8 +44,8 @@
 //! refuses an in-place rewrite, and readers see whole transactions while
 //! the writer commits.
 //!
-//! The reopen is still warm, so it is not G7 evidence, and there is no D3
-//! ingest workload yet. These are not scoring runs.
+//! There is no D3 ingest, crash or relevance workload yet (D55), so these
+//! are not scoring runs.
 //!
 //! The run is offline. It refuses to start when the environment configures
 //! an embedder, query expansion, a reranking model or a cloud backup
@@ -66,6 +78,7 @@ use std::sync::Barrier;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod bodies;
+mod d1;
 mod g1;
 mod package;
 
@@ -162,14 +175,56 @@ impl Mode {
     }
 }
 
+/// The data a run loads (spec § Datasets).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Dataset {
+    /// `n` synthetic memories with an entity graph and pages: `<n>`.
+    Synthetic(usize),
+    /// D1, the real store, from a copy of a backup: `d1:<backup dir>`.
+    D1(PathBuf),
+    /// D2, D1 grown with synthetic memories to `total`: `d2:<backup dir>`
+    /// (to [`d1::D2_TOTAL`]).
+    D2 { backup: PathBuf, total: usize },
+}
+
+impl Dataset {
+    fn parse(arg: &str) -> Result<Self> {
+        if let Some(path) = arg.strip_prefix("d1:") {
+            return Ok(Self::D1(PathBuf::from(path)));
+        }
+        if let Some(path) = arg.strip_prefix("d2:") {
+            return Ok(Self::D2 {
+                backup: PathBuf::from(path),
+                total: d1::D2_TOTAL,
+            });
+        }
+        let n: usize = arg
+            .parse()
+            .map_err(|_| format!("dataset {arg:?} is not a count, d1:<backup> or d2:<backup>"))?;
+        if n == 0 {
+            return Err("n must be at least 1".into());
+        }
+        Ok(Self::Synthetic(n))
+    }
+
+    fn name(&self) -> String {
+        match self {
+            Self::Synthetic(n) => n.to_string(),
+            Self::D1(_) => "d1".into(),
+            Self::D2 { total, .. } => format!("d2-{total}"),
+        }
+    }
+}
+
 /// Run the benchmark the command line asks for, on one of `candidates`:
-/// `<bench|open> <backend> <n> <dir>`. Prints one JSON line.
+/// `<bench|open> <backend> <n|d1:<backup>|d2:<backup>> <dir>`. Prints one
+/// JSON line.
 pub fn run(candidates: &[Candidate]) -> Result<()> {
     let names: Vec<&str> = candidates.iter().map(|c| c.name).collect();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let [mode, backend, n, dir] = args.as_slice() else {
         return Err(format!(
-            "usage: store_bench <bench|open> <{}> <n> <dir>",
+            "usage: store_bench <bench|open> <{}> <n|d1:<backup>|d2:<backup>> <dir>",
             names.join("|")
         )
         .into());
@@ -183,11 +238,15 @@ pub fn run(candidates: &[Candidate]) -> Result<()> {
         println!("{}", serde_json::to_string(&restored)?);
         return Ok(());
     }
+    // The G7 child: `cold <backend> <run dir> <query file>`.
+    if mode == "cold" {
+        return cold_child(candidate, Path::new(n), Path::new(dir));
+    }
     let mode = Mode::parse(mode)?;
     let report = measure(
         candidate,
         mode,
-        n.parse()?,
+        &Dataset::parse(n)?,
         Path::new(dir),
         Isolation::Child,
     )?;
@@ -195,33 +254,49 @@ pub fn run(candidates: &[Candidate]) -> Result<()> {
     Ok(())
 }
 
-/// One run of `candidate` in a new directory under `root`; its report.
-/// `n` and the environment are checked before the filesystem is touched.
+/// One run of `candidate` on `dataset` in a new directory under `root`;
+/// its report. The dataset and the environment are checked before the
+/// filesystem is touched.
 pub fn measure(
     candidate: Candidate,
     mode: Mode,
-    n: usize,
+    dataset: &Dataset,
     root: &Path,
     isolation: Isolation,
 ) -> Result<Map<String, Value>> {
-    if n == 0 {
-        return Err("n must be at least 1".into());
+    match dataset {
+        Dataset::Synthetic(0) => return Err("n must be at least 1".into()),
+        Dataset::Synthetic(_) => {}
+        Dataset::D1(backup) | Dataset::D2 { backup, .. } => {
+            if mode == Mode::Open {
+                return Err("open mode is synthetic only; bench reports the cold open".into());
+            }
+            if !backup.is_dir() {
+                return Err(format!("backup {} is not a directory", backup.display()).into());
+            }
+        }
     }
     refuse_model_config()?;
-    let dir = fresh_run_dir(root, &format!("{}-{}-{n}", mode.name(), candidate.name))?;
+    let stem = format!("{}-{}-{}", mode.name(), candidate.name, dataset.name());
+    let dir = fresh_run_dir(root, &stem)?;
 
     let mut report = Map::new();
     report.insert("mode".into(), json!(mode.name()));
     report.insert("backend".into(), json!(candidate.name));
-    report.insert("n".into(), json!(n));
+    report.insert("dataset".into(), json!(dataset.name()));
     report.insert("run_dir".into(), json!(dir));
     report.insert(
         "note".into(),
-        json!("not a scoring run: the reopen is warm (not G7) and there is no D3 ingest yet"),
+        json!("not a scoring run: no D3 ingest, crash or relevance workload yet"),
     );
     match mode {
-        Mode::Bench => workload(candidate, &dir, n, &mut report, isolation)?,
-        Mode::Open => reopen(candidate, &dir, n, &mut report)?,
+        Mode::Bench => workload(candidate, &dir, dataset, &mut report, isolation)?,
+        Mode::Open => {
+            let Dataset::Synthetic(n) = dataset else {
+                return Err("open mode is synthetic only".into());
+            };
+            reopen(candidate, &dir, *n, &mut report)?
+        }
     }
     report.insert("disk_mb".into(), disk(&dir)?);
     report.insert("peak_rss_mb".into(), json!(peak_rss_mb()));
@@ -397,28 +472,19 @@ fn query(corpus: &Corpus, rng: &mut Rng, i: usize) -> String {
 fn workload(
     candidate: Candidate,
     dir: &Path,
-    n: usize,
+    dataset: &Dataset,
     report: &mut Map<String, Value>,
     isolation: Isolation,
 ) -> Result<()> {
     let corpus = Corpus::new();
     let mut rng = Rng(0x5eed);
     let bodies = Bodies::new(dir.join("blobs"));
-    let (ids, entities) = {
+    let Seeded { ids, entities } = {
         let db = candidate.open(dir)?;
-        let started = Instant::now();
-        let (ids, adds) = fill(&db.store(), &bodies, n, &corpus, &mut rng)?;
-        report.insert("fill_s".into(), json!(started.elapsed().as_secs_f64()));
-        report.insert("add".into(), summary(adds));
-        let count = n.div_ceil(MEMORIES_PER_PAGE);
-        let took = pages(&db.store(), &bodies, count, &corpus, &mut rng)?;
-        report.insert(
-            "pages".into(),
-            json!({ "count": count, "ms": millis(took) }),
-        );
-        let entities = graph(&db, &ids, &mut rng)?;
-        (ids, entities)
+        seed(&db, dataset, dir, &bodies, &corpus, &mut rng, report)?
     };
+    let n = ids.len();
+    report.insert("memories".into(), json!(n));
     report.insert("disk_mb_after_fill".into(), disk(dir)?);
 
     let started = Instant::now();
@@ -470,10 +536,22 @@ fn workload(
         })?,
     );
 
-    let queries_: Vec<String> = (0..SAMPLES).map(|i| query(&corpus, &mut rng, i)).collect();
     // Query vectors are made before any timed span, so the searches time
-    // retrieval, not embedding.
-    let vectors_ = Precomputed::new(&queries_);
+    // retrieval, not embedding: seeded for synthetic data, the store's own
+    // for D1 and D2.
+    let pairs = match dataset {
+        Dataset::Synthetic(_) => (0..SAMPLES)
+            .map(|i| {
+                let text = query(&corpus, &mut rng, i);
+                let vector = unit_vector(&text);
+                (text, vector)
+            })
+            .collect(),
+        _ => d1::queries(&store, &ids, SAMPLES, |len| rng.below(len))?,
+    };
+    let queries_: Vec<String> = pairs.iter().map(|(t, _)| t.clone()).collect();
+    let cold_query = pairs[0].clone();
+    let vectors_ = Precomputed(pairs.into_iter().collect());
     let search = |i: usize, vectors: Option<&Precomputed>| -> Result<()> {
         let input: MemorySearchInput = serde_json::from_value(json!({ "query": queries_[i] }))?;
         searched(&store, &input, vectors)
@@ -496,11 +574,15 @@ fn workload(
     report.insert("vitality_pass_ms".into(), json!(millis(t.elapsed())));
 
     for hops in [1, 2] {
-        let walk = timed(|_| {
-            let seed = entities[rng.below(entities.len())].clone();
-            entity::traverse_entities(&store, &[seed], hops, None, 1_000)?;
-            Ok(())
-        })?;
+        let walk = if entities.is_empty() {
+            skipped("no entities")
+        } else {
+            timed(|_| {
+                let seed = entities[rng.below(entities.len())].clone();
+                entity::traverse_entities(&store, &[seed], hops, None, 1_000)?;
+                Ok(())
+            })?
+        };
         report.insert(format!("entity_{hops}_hop"), walk);
     }
 
@@ -571,7 +653,183 @@ fn workload(
     );
 
     drop(store);
-    backup_and_restore(candidate, db, &bodies, dir, report, isolation)
+    backup_and_restore(candidate, db, &bodies, dir, report, isolation)?;
+    let cold = cold_open(candidate, dir, &cold_query, isolation)?;
+    report.insert("cold_open".into(), cold);
+    Ok(())
+}
+
+/// What a seeded store holds that the workloads pick from.
+struct Seeded {
+    ids: Vec<String>,
+    entities: Vec<String>,
+}
+
+/// Load `dataset` into `db`, reporting how long it took and what it wrote.
+fn seed(
+    db: &Database,
+    dataset: &Dataset,
+    dir: &Path,
+    bodies: &Bodies,
+    corpus: &Corpus,
+    rng: &mut Rng,
+    report: &mut Map<String, Value>,
+) -> Result<Seeded> {
+    let store = db.store();
+    let started = Instant::now();
+    let (backup, total) = match dataset {
+        Dataset::Synthetic(n) => {
+            let (ids, adds) = fill(&store, bodies, *n, corpus, rng)?;
+            report.insert("fill_s".into(), json!(started.elapsed().as_secs_f64()));
+            report.insert("add".into(), summary(adds));
+            let count = n.div_ceil(MEMORIES_PER_PAGE);
+            let took = pages(&store, bodies, count, corpus, rng)?;
+            report.insert(
+                "pages".into(),
+                json!({ "count": count, "ms": millis(took) }),
+            );
+            drop(store);
+            let entities = graph(db, &ids, rng)?;
+            return Ok(Seeded { ids, entities });
+        }
+        Dataset::D1(backup) => (backup, None),
+        Dataset::D2 { backup, total } => (backup, Some(*total)),
+    };
+    let loaded = d1::load(backup, &dir.with_extension("d1-source"), &store, bodies)?;
+    report.insert("load_s".into(), json!(started.elapsed().as_secs_f64()));
+    report.insert("loaded".into(), Value::Object(loaded.counts));
+    let mut ids = loaded.ids;
+    if let Some(total) = total {
+        let started = Instant::now();
+        let grown = grow(&store, bodies, total.saturating_sub(ids.len()), corpus, rng)?;
+        report.insert(
+            "grown".into(),
+            json!({ "memories": grown.len(), "s": started.elapsed().as_secs_f64() }),
+        );
+        ids.extend(grown);
+    }
+    Ok(Seeded {
+        ids,
+        entities: loaded.entities,
+    })
+}
+
+/// Add `n` synthetic memories to a loaded store (D2), each with a seeded
+/// vector written straight to its chunk, so the store's recorded
+/// embedding identity (the real model's) is left as it is. Their ids.
+fn grow(
+    store: &Store<'_>,
+    bodies: &Bodies,
+    n: usize,
+    corpus: &Corpus,
+    rng: &mut Rng,
+) -> Result<Vec<String>> {
+    let mut ids = Vec::with_capacity(n);
+    for _ in 0..n {
+        let mut input = corpus.memory(rng);
+        if input.category == DIALOG {
+            let stashed = bodies.stash(&input.content)?;
+            input.metadata = stashed.metadata();
+            input.content = stashed.head;
+        }
+        let vector = unit_vector(&input.content);
+        let id = queries::add_memory(store, input)?.id;
+        remind_me_core::db::vectors::Vectors::new(store).put(&id, 0, &d1::to_bytes(&vector))?;
+        ids.push(id);
+    }
+    Ok(ids)
+}
+
+/// How long the store takes from a process's start to its first answered
+/// query (G7), and the process's resident memory once idle after it (the
+/// G5 baseline on D1). In a child process (scoring runs), timed by this
+/// parent from spawn to the child's first line; with
+/// `R3_DROP_CACHES=1` the page cache is dropped first, and the run fails
+/// if it cannot be. In process (the example's own tests), the open and
+/// query alone, with no cache drop.
+fn cold_open(
+    candidate: Candidate,
+    dir: &Path,
+    query: &(String, Vec<f32>),
+    isolation: Isolation,
+) -> Result<Value> {
+    let query_file = dir.with_extension("cold-query.json");
+    std::fs::write(&query_file, serde_json::to_vec(query)?)?;
+    if isolation == Isolation::InProcess {
+        let t = Instant::now();
+        let first = open_and_query(candidate, dir, &query_file)?;
+        return Ok(json!({
+            "ms": millis(t.elapsed()),
+            "isolation": "InProcess",
+            "page_cache_dropped": false,
+            "child": first,
+        }));
+    }
+    let dropped = std::env::var("R3_DROP_CACHES").is_ok_and(|v| v == "1");
+    if dropped {
+        drop_page_cache()?;
+    }
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+    let t = Instant::now();
+    let mut child = Command::new(std::env::current_exe()?)
+        .args(["cold", candidate.name])
+        .arg(dir)
+        .arg(&query_file)
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let mut lines = BufReader::new(child.stdout.take().ok_or("cold child has no stdout")?).lines();
+    let first = lines.next().ok_or("cold child printed nothing")??;
+    let ms = millis(t.elapsed());
+    let idle = lines.next().ok_or("cold child printed no idle line")??;
+    let status = child.wait()?;
+    if !status.success() {
+        return Err(format!("cold child failed: {status}").into());
+    }
+    Ok(json!({
+        "ms": ms,
+        "isolation": "Child",
+        "page_cache_dropped": dropped,
+        "child": serde_json::from_str::<Value>(&first)?,
+        "idle": serde_json::from_str::<Value>(&idle)?,
+    }))
+}
+
+/// How long a resident process is left idle before its memory is read.
+const IDLE_SETTLE: Duration = Duration::from_secs(2);
+
+/// The G7 child: open the store, answer one hybrid search and print a
+/// line; then idle and print its resident memory.
+fn cold_child(candidate: Candidate, dir: &Path, query_file: &Path) -> Result<()> {
+    let first = open_and_query(candidate, dir, query_file)?;
+    println!("{first}");
+    std::thread::sleep(IDLE_SETTLE);
+    println!("{}", json!({ "rss_idle_mb": rss_mb() }));
+    Ok(())
+}
+
+/// Open the store in `dir` and run one hybrid search for the query in
+/// `query_file`; the times, in ms.
+fn open_and_query(candidate: Candidate, dir: &Path, query_file: &Path) -> Result<Value> {
+    let t = Instant::now();
+    let (text, vector): (String, Vec<f32>) = serde_json::from_slice(&std::fs::read(query_file)?)?;
+    let db = candidate.open(dir)?;
+    let open_ms = millis(t.elapsed());
+    let input: MemorySearchInput = serde_json::from_value(json!({ "query": text }))?;
+    let vectors_ = Precomputed([(text, vector)].into_iter().collect());
+    let t = Instant::now();
+    searched(&db.store(), &input, Some(&vectors_))?;
+    Ok(json!({ "open_ms": open_ms, "first_query_ms": millis(t.elapsed()) }))
+}
+
+/// Drop the page cache (Linux, root), so the next open reads from disk.
+fn drop_page_cache() -> Result<()> {
+    let synced = std::process::Command::new("sync").status()?;
+    if !synced.success() {
+        return Err("sync failed before dropping the page cache".into());
+    }
+    std::fs::write("/proc/sys/vm/drop_caches", "3")
+        .map_err(|e| format!("R3_DROP_CACHES=1 but the page cache cannot be dropped: {e}").into())
 }
 
 /// One search, keyword-only (`vectors` is `None`) or hybrid, that fails
@@ -983,12 +1241,6 @@ fn unit_vector(text: &str) -> Vec<f32> {
 /// error, never embedded on the spot.
 struct Precomputed(HashMap<String, Vec<f32>>);
 
-impl Precomputed {
-    fn new(texts: &[String]) -> Self {
-        Self(texts.iter().map(|t| (t.clone(), unit_vector(t))).collect())
-    }
-}
-
 impl Embedder for Precomputed {
     fn embed(
         &self,
@@ -1205,8 +1457,18 @@ fn dir_size(dir: &Path) -> Result<u64> {
 
 /// The process's peak resident memory, from Linux's `VmHWM`; null elsewhere.
 fn peak_rss_mb() -> Option<f64> {
+    status_mb("VmHWM:")
+}
+
+/// The process's resident memory now, from Linux's `VmRSS`; null elsewhere.
+fn rss_mb() -> Option<f64> {
+    status_mb("VmRSS:")
+}
+
+/// A `/proc/self/status` field given in kB, in MB.
+fn status_mb(field: &str) -> Option<f64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    let line = status.lines().find(|l| l.starts_with("VmHWM:"))?;
+    let line = status.lines().find(|l| l.starts_with(field))?;
     let kb: f64 = line.split_whitespace().nth(1)?.parse().ok()?;
     Some((kb / 10.24).round() / 100.0)
 }
@@ -1232,7 +1494,7 @@ mod tests {
                 Database::open_backend(Box::new(tables), Some(run_dir.join("memory.db"))).unwrap();
             let store = db.store();
             let fail = |_: &Store<'_>, _: &mut Rng| -> Result<()> { Err("refused".into()) };
-            let outcome = readers(&db, &store, &[], &Precomputed::new(&[]), Some(&fail));
+            let outcome = readers(&db, &store, &[], &Precomputed(HashMap::new()), Some(&fail));
             let _ = sent.send(outcome.map_err(|e| e.to_string()));
         });
         let outcome = received
