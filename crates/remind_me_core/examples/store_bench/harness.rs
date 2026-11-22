@@ -521,13 +521,17 @@ fn workload(
 
     // The same readers, inputs and searches with and without the writer,
     // so the two differ only by the writer (D54).
+    let add_one = |s: &Store<'_>, rng: &mut Rng| -> Result<()> {
+        fill(s, &bodies, 1, &corpus, rng)?;
+        Ok(())
+    };
     report.insert(
         "search_hybrid_readers_idle".into(),
-        readers(&db, &store, &bodies, &corpus, &queries_, &vectors_, false)?,
+        readers(&db, &store, &queries_, &vectors_, None)?,
     );
     report.insert(
         "search_hybrid_beside_writer".into(),
-        readers(&db, &store, &bodies, &corpus, &queries_, &vectors_, true)?,
+        readers(&db, &store, &queries_, &vectors_, Some(&add_one))?,
     );
 
     let t = Instant::now();
@@ -608,49 +612,56 @@ fn searched(
     Ok(())
 }
 
+/// One write the loaded run's writer repeats.
+type Write<'a> = &'a (dyn Fn(&Store<'_>, &mut Rng) -> Result<()> + Sync);
+
 /// Hybrid search on `READERS` threads, all started together at a
-/// barrier; with `writer`, beside one thread that keeps adding memories.
+/// barrier; with a `writer`, beside one thread that keeps repeating it.
 /// The readers' times. Each thread takes a store from the database's
 /// secondary source, as the node's background threads do: a store from
 /// [`Database::store`] holds the process lock, so the caller's `store`
 /// (which holds it) only counts rows before and after.
 ///
-/// The writer adds once before the barrier and stops only after the last
-/// reader has finished, so it covers every reader's window by
-/// construction; the report records each reader's window, the writer's,
-/// their overlap and the rows added inside each window, and the run fails
-/// as invalid when any reader saw less than [`MIN_OVERLAP`] of it covered
-/// or no row added (D54).
+/// The writer writes once before the barrier and stops only after the
+/// last reader has finished, so it covers every reader's window by
+/// construction. If that first write fails, the writer still reaches the
+/// barrier, flagged, and the readers return at once: the run fails with
+/// the writer's error instead of hanging. Each reader reads the actual
+/// memory row count at both ends of its window; the report records each
+/// window, the writer's span, their overlap and those counts, and the
+/// run fails as invalid when any reader saw less than [`MIN_OVERLAP`] of
+/// its window covered or no row added inside it (D54).
 fn readers(
     db: &Database,
     store: &Store<'_>,
-    bodies: &Bodies,
-    corpus: &Corpus,
     queries_: &[String],
     vectors_: &Precomputed,
-    writer: bool,
+    writer: Option<Write<'_>>,
 ) -> Result<Value> {
     let source = &db.secondary_source().ok_or("an in-memory database")?;
-    let start = &Barrier::new(READERS + usize::from(writer));
+    let start = &Barrier::new(READERS + usize::from(writer.is_some()));
     let readers_done = &AtomicBool::new(false);
+    let writer_failed = &AtomicBool::new(false);
     let written = &AtomicUsize::new(0);
     let epoch = Instant::now();
     let rows_before = testing::count(store, testing::Table::Memories)?;
     let mut windows: Vec<Window> = Vec::new();
     let mut span = None;
     std::thread::scope(|scope| -> Result<()> {
-        let writing = writer.then(|| {
+        let writing = writer.map(|write| {
             scope.spawn(move || -> std::result::Result<(f64, f64), String> {
                 let store = source.store();
                 let mut rng = Rng(0xbeef);
-                let first = epoch.elapsed().as_secs_f64();
                 let mut add = || -> std::result::Result<(), String> {
-                    fill(&store, bodies, 1, corpus, &mut rng).map_err(|e| e.to_string())?;
+                    write(&store, &mut rng).map_err(|e| e.to_string())?;
                     written.fetch_add(1, Ordering::SeqCst);
                     Ok(())
                 };
-                add()?;
+                let first = epoch.elapsed().as_secs_f64();
+                let started = add();
+                writer_failed.store(started.is_err(), Ordering::SeqCst);
                 start.wait();
+                started?;
                 while !readers_done.load(Ordering::SeqCst) {
                     add()?;
                 }
@@ -659,11 +670,17 @@ fn readers(
         });
         let threads: Vec<_> = (0..READERS)
             .map(|r| {
-                scope.spawn(move || -> std::result::Result<Window, String> {
+                scope.spawn(move || -> std::result::Result<Option<Window>, String> {
                     let store = source.store();
+                    let rows = || {
+                        testing::count(&store, testing::Table::Memories).map_err(|e| e.to_string())
+                    };
                     let mut times = Vec::with_capacity(SAMPLES / READERS);
                     start.wait();
-                    let added_before = written.load(Ordering::SeqCst);
+                    if writer_failed.load(Ordering::SeqCst) {
+                        return Ok(None);
+                    }
+                    let rows_at_begin = rows()?;
                     let begin = epoch.elapsed().as_secs_f64();
                     for i in (r..SAMPLES).step_by(READERS) {
                         let input: MemorySearchInput =
@@ -673,19 +690,21 @@ fn readers(
                         searched(&store, &input, Some(vectors_)).map_err(|e| e.to_string())?;
                         times.push(t.elapsed());
                     }
-                    Ok(Window {
+                    let end = epoch.elapsed().as_secs_f64();
+                    Ok(Some(Window {
                         begin,
-                        end: epoch.elapsed().as_secs_f64(),
-                        added: written.load(Ordering::SeqCst) - added_before,
+                        end,
+                        rows_at_begin,
+                        rows_at_end: rows()?,
                         times,
-                    })
+                    }))
                 })
             })
             .collect();
         let mut joined = Ok(());
         for thread in threads {
             match thread.join().map_err(|_| "a reader panicked".to_string()) {
-                Ok(Ok(w)) => windows.push(w),
+                Ok(Ok(w)) => windows.extend(w),
                 Ok(Err(e)) | Err(e) => joined = Err(e),
             }
         }
@@ -711,9 +730,17 @@ fn readers(
     value["readers"] = windows
         .iter()
         .zip(&overlaps)
-        .map(|(w, o)| json!({ "begin_s": w.begin, "end_s": w.end, "overlap": o, "rows_added": w.added }))
+        .map(|(w, o)| {
+            json!({
+                "begin_s": w.begin,
+                "end_s": w.end,
+                "overlap": o,
+                "rows_at_begin": w.rows_at_begin,
+                "rows_at_end": w.rows_at_end,
+            })
+        })
         .collect();
-    let starved = windows.iter().any(|w| w.added == 0);
+    let starved = windows.iter().any(|w| w.rows_at_end <= w.rows_at_begin);
     if overlaps.iter().any(|o| *o < MIN_OVERLAP) || starved {
         return Err(format!(
             "invalid run, re-run it: reader overlaps {overlaps:?} (need {MIN_OVERLAP}), \
@@ -724,12 +751,13 @@ fn readers(
     Ok(value)
 }
 
-/// One reader's span in seconds since the run's epoch, the rows the writer
-/// added inside it, and its samples.
+/// One reader's span in seconds since the run's epoch, the memory row
+/// count it read at each end, and its samples.
 struct Window {
     begin: f64,
     end: f64,
-    added: usize,
+    rows_at_begin: i64,
+    rows_at_end: i64,
     times: Vec<Duration>,
 }
 
@@ -1135,4 +1163,36 @@ fn peak_rss_mb() -> Option<f64> {
     let line = status.lines().find(|l| l.starts_with("VmHWM:"))?;
     let kb: f64 = line.split_whitespace().nth(1)?.parse().ok()?;
     Some((kb / 10.24).round() / 100.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use remind_me_core::db::sqlite::SqliteTables;
+    use std::sync::mpsc;
+
+    /// A writer whose first write fails ends the run with its error, in
+    /// bounded time, instead of leaving the readers at the barrier.
+    #[test]
+    fn a_failed_first_write_fails_the_run_instead_of_hanging() {
+        let dir = std::env::temp_dir().join(format!("store_bench_hang_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (sent, received) = mpsc::channel();
+        let run_dir = dir.clone();
+        std::thread::spawn(move || {
+            let tables = SqliteTables::open(&run_dir.join("store")).unwrap();
+            let db =
+                Database::open_backend(Box::new(tables), Some(run_dir.join("memory.db"))).unwrap();
+            let store = db.store();
+            let fail = |_: &Store<'_>, _: &mut Rng| -> Result<()> { Err("refused".into()) };
+            let outcome = readers(&db, &store, &[], &Precomputed::new(&[]), Some(&fail));
+            let _ = sent.send(outcome.map_err(|e| e.to_string()));
+        });
+        let outcome = received
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the run returned instead of hanging");
+        assert!(outcome.unwrap_err().contains("refused"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
