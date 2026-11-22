@@ -484,7 +484,7 @@ fn degradation_note(res: &MemorySearchResponse) -> Option<String> {
     }
     if !res.timing.failed.is_empty() {
         note.push_str(&format!(
-            "⚠ _Degraded: the {} stage failed, so these are keyword matches only. Results are incomplete rather than exhaustive._\n",
+            "⚠ _Degraded: the {} stage failed, so results may be incomplete._\n",
             res.timing.failed.join(" and ")
         ));
     }
@@ -954,7 +954,7 @@ mod deadline_rendering {
         };
         let rendered = search_response(&response(failed, 0), SearchDetail::Full);
         assert!(rendered.contains("semantic stage failed"));
-        assert!(rendered.contains("keyword matches only"));
+        assert!(rendered.contains("may be incomplete"));
         assert!(!rendered.contains("deadline"));
     }
 }

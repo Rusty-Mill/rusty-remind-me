@@ -881,8 +881,10 @@ pub fn search_memories_deadlined(
                 &admit,
             ) {
                 Ok(scored) => scored,
-                Err(e) => {
-                    eprintln!("rusty-remind-me: semantic search failed, keyword results only: {e}");
+                // The error itself is not logged: an embedding error can
+                // carry the provider's raw response body.
+                Err(_) => {
+                    eprintln!("rusty-remind-me: a search's semantic stage failed");
                     timing.failed.push("semantic".to_string());
                     Vec::new()
                 }
