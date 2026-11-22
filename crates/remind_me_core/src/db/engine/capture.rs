@@ -195,12 +195,17 @@ impl EngineTables {
     }
 
     /// Put back what the writes held since `mark` replaced, newest first,
-    /// and drop them. Failing to leaves the tables refusing writes.
+    /// and drop them, keeping the ids sequences issued meanwhile for the
+    /// next unit. Failing to put back leaves the tables refusing writes.
     pub(crate) fn undo_held(&mut self, mark: usize) {
         let undone: Vec<Noted> = self.staging.held.drain(mark..).collect();
         let mut wiki_pages = false;
+        let mut issued = Vec::new();
         for noted in undone.into_iter().rev() {
             let Some(before) = noted.before else {
+                if noted.change.table == SEQUENCES {
+                    issued.push(noted);
+                }
                 continue;
             };
             wiki_pages |= before.table == WIKI_PAGES;
@@ -211,11 +216,13 @@ impl EngineTables {
         if wiki_pages {
             self.wiki_search = wiki::index_pages(&self.wiki_pages);
         }
+        self.staging.held.extend(issued.into_iter().rev());
     }
 
-    /// Drop every held write: their outcome is settled by reopening.
+    /// Drop every held write but the issued ids: their outcome is settled
+    /// by reopening.
     pub(crate) fn drop_held(&mut self) {
-        self.staging.held.clear();
+        self.staging.held.retain(|n| n.change.table == SEQUENCES);
     }
 
     fn flush_unless_held(&mut self) -> Result<()> {
@@ -613,5 +620,23 @@ mod tests {
         assert!(t.finish_page().is_err(), "no false success");
         assert!(log.lock().unwrap().is_empty(), "no partial unit");
         assert!(HistoryStore::list(&t, "m", 10).unwrap().is_empty());
+    }
+
+    /// An id issued inside an abandoned page is not issued again after a
+    /// rebuild, once a later unit reaches the sink.
+    #[test]
+    fn an_abandoned_page_keeps_its_issued_ids() {
+        let (mut t, log) = collecting();
+        HistoryStore::insert(&mut t, "m", &tracked(), NOW, None).unwrap();
+        t.begin_page().unwrap();
+        HistoryStore::insert(&mut t, "m", &tracked(), NOW, None).unwrap();
+        let abandoned = HistoryStore::list(&t, "m", 1).unwrap()[0].id;
+        t.abandon_page().unwrap();
+        WikiStore::set_meta(&mut t, "k", "v").unwrap();
+
+        let mut b = rebuilt(&log);
+        HistoryStore::insert(&mut b, "m", &tracked(), NOW, None).unwrap();
+        let next = HistoryStore::list(&b, "m", 1).unwrap()[0].id;
+        assert!(next > abandoned, "{next} reissues {abandoned} or lower");
     }
 }
