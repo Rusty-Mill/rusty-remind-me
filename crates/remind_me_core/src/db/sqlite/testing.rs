@@ -5,8 +5,9 @@ use super::memories::{replace, stored};
 use super::{all, SqliteTables};
 use crate::db::engine::testing::{columns, with_column};
 use crate::db::{Result, StoreError};
-use crate::testing::{OutboxRow, Table, TestRows};
+use crate::testing::{stored_columns, OutboxRow, Table, TestRows};
 use rusqlite::params;
+use rusqlite::types::ValueRef;
 use serde_json::Value;
 
 /// The table `table` names.
@@ -26,6 +27,18 @@ fn table_name(table: Table) -> &'static str {
         Table::ChatImports => "chat_imports",
         Table::DbsImports => "dbs_imports",
         Table::MempalaceImports => "mempalace_imports",
+    }
+}
+
+/// A stored value as JSON: a blob as an array of bytes, as the engine's
+/// records serialize one.
+fn json_of(value: ValueRef<'_>) -> Value {
+    match value {
+        ValueRef::Null => Value::Null,
+        ValueRef::Integer(i) => Value::from(i),
+        ValueRef::Real(f) => Value::from(f),
+        ValueRef::Text(t) => Value::from(String::from_utf8_lossy(t).into_owned()),
+        ValueRef::Blob(b) => Value::from(b.to_vec()),
     }
 }
 
@@ -119,6 +132,19 @@ impl TestRows for SqliteTables {
             [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
+    }
+
+    fn stored_rows(&self, table: Table) -> Result<Vec<serde_json::Map<String, Value>>> {
+        let names = stored_columns(table)
+            .ok_or_else(|| StoreError::Invalid(format!("{table:?} rows are not read here")))?;
+        let sql = format!("SELECT {} FROM {}", names.join(", "), table_name(table));
+        self.all(&sql, [], |r| {
+            names
+                .iter()
+                .enumerate()
+                .map(|(ix, name)| Ok((name.to_string(), json_of(r.get_ref(ix)?))))
+                .collect()
+        })
     }
 
     fn queue_outbox(

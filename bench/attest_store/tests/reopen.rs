@@ -146,3 +146,121 @@ fn a_reopen_never_reissues_a_deleted_revision_id() {
     drop(db);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+fn open_at(log: &Path) -> Database {
+    let tables = attest_store::open_at(log, &log.with_extension("temp")).unwrap();
+    Database::open_backend(Box::new(tables), None).unwrap()
+}
+
+/// The engine tables live where `open_at` puts them, and are rebuilt
+/// there from the log at every open. A second opener of the same log is
+/// refused before it clears the first one's tables.
+#[test]
+fn open_at_keeps_the_tables_beside_the_log_and_rebuilds_them() {
+    let dir = scratch("open_at");
+    let log = dir.join("store");
+    let id = {
+        let db = open_at(&log);
+        let id = add(&db, "kept beside the log");
+        assert!(
+            std::fs::read_dir(log.with_extension("temp"))
+                .unwrap()
+                .count()
+                > 0
+        );
+        assert!(attest_store::open_at(&log, &log.with_extension("temp")).is_err());
+        assert!(testing::memory_text(&db.store(), &id, "id")
+            .unwrap()
+            .is_some());
+        id
+    };
+    let db = open_at(&log);
+    assert!(testing::memory_text(&db.store(), &id, "id")
+        .unwrap()
+        .is_some());
+    drop(db);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A package is the log alone, without the lock or the engine tables,
+/// and opens anywhere as the same store.
+#[test]
+fn a_package_restores_from_the_log_alone() {
+    let dir = scratch("package");
+    let (log, package) = (dir.join("store"), dir.join("package"));
+    let db = open_at(&log);
+    let id = add(&db, "packaged");
+    attest_store::package(&log, &package).unwrap();
+    assert!(!package.join("LOCK").exists());
+    drop(db);
+    std::fs::rename(&log, dir.join("moved")).unwrap();
+    let restored = open_at(&package);
+    assert_eq!(
+        testing::memory_text(&restored.store(), &id, "content")
+            .unwrap()
+            .as_deref(),
+        Some("packaged")
+    );
+    drop(restored);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// An engine path that exists but was not made by `open_at` is refused
+/// and left as it was.
+#[test]
+fn open_at_refuses_to_clear_a_directory_it_did_not_make() {
+    let dir = scratch("foreign");
+    let foreign = dir.join("someone-elses");
+    std::fs::create_dir_all(&foreign).unwrap();
+    std::fs::write(foreign.join("keep.txt"), b"precious").unwrap();
+    assert!(attest_store::open_at(&dir.join("store"), &foreign).is_err());
+    assert_eq!(
+        std::fs::read(foreign.join("keep.txt")).unwrap(),
+        b"precious"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Scratch another run's log made, mark and all, is not this log's to clear.
+#[test]
+fn open_at_refuses_another_logs_marked_scratch() {
+    let dir = scratch("other-run");
+    let engine = dir.join("engine");
+    drop(attest_store::open_at(&dir.join("first"), &engine).unwrap());
+    std::fs::write(engine.join("keep.txt"), b"precious").unwrap();
+    assert!(attest_store::open_at(&dir.join("second"), &engine).is_err());
+    assert_eq!(std::fs::read(engine.join("keep.txt")).unwrap(), b"precious");
+    drop(attest_store::open_at(&dir.join("first"), &engine).unwrap());
+    assert!(
+        !engine.join("keep.txt").exists(),
+        "its own log may rebuild it"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Two logs racing for one absent engine path: exactly one gets it.
+#[test]
+fn two_logs_racing_for_one_scratch_path_get_it_once() {
+    for round in 0..20 {
+        let dir = scratch(&format!("race{round}"));
+        let engine = dir.join("engine");
+        let start = std::sync::Barrier::new(2);
+        let opened: Vec<bool> = std::thread::scope(|scope| {
+            let racers: Vec<_> = ["a", "b"]
+                .map(|log| {
+                    let (dir, engine, start) = (&dir, &engine, &start);
+                    scope.spawn(move || {
+                        let log = dir.join(log);
+                        std::fs::create_dir_all(&log).unwrap();
+                        start.wait();
+                        attest_store::open_at(&log, engine).is_ok()
+                    })
+                })
+                .into_iter()
+                .collect();
+            racers.into_iter().map(|r| r.join().unwrap()).collect()
+        });
+        assert_eq!(opened.iter().filter(|o| **o).count(), 1, "round {round}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

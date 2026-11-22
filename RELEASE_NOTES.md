@@ -2,6 +2,27 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-22 — Store benchmark: same body layout, isolated G8 restore, overlap and G1 checks (Millwright R3, Mill Board #1618)
+
+### Added
+- `blobs::BlobStore` (audit seam 3, D50): content-addressed blobs at `<root>/<key[0..2]>/<key>`, written idempotently by rename from a staging file each writer creates for itself (a writer that loses a publish race for the same key succeeds), with `put`, `put_keyed`, `get` and `verify`. It's hidden from the docs. `archive.rs` writes through it with the same root, 16-hex keys and layout, so nothing on disk changes. Production backups are unchanged (Q20).
+- `store_bench` closes the gaps #413 listed before any scoring:
+  - **Body layout (D50, D51):** every dialog and wiki page body goes whole to a blob store under the run. Each row keeps a 512-byte head and a link (`metadata.source_artifact`, or a `blob:` page summary). The harness does this, so the layout is the same on every candidate. It also adds 10 to 30 KB pages, one per ten memories.
+  - **Disk (D53):** reported for the store, the candidate's temporary files (`store.temp`, Attest's engine tables) and the blobs, with their total, after fill and at the end.
+  - **Writer overlap (D54):** the same four readers run idle and beside the writer. One monotonic clock times each successful write's completion and each reader's span, from its first timed query to its last. A run where the writer covers less than 95% of any span, or completes no write inside one, fails as invalid. The memory row counts just outside each span are reported as diagnostics. If the writer's first write fails, the run fails with that error instead of hanging.
+  - **G8 (D52):** the package holds the candidate's own backup, a copy of the blobs and a manifest. The source run is moved away, and a child process restores the package into a fresh directory and reads back, by content hash keyed by identity, every memory, page, reference and linked body, plus every entity, memory-entity link, relation and chunk vector as stored (`node_id` and the stored `chunk_ix` included). Any difference, even at the same row count, or a missing or altered body, fails the run. Other tables (feedback, promotions, sessions, outbox and the rest) are outside the manifest.
+  - **G1 beyond the port suites:** an update or delete of a dialog is refused and leaves the row unchanged. Readers counting rows while a writer commits must only ever see whole transactions; this is reported as scoped smoke (counts, not each transaction or a content snapshot).
+  - The run refuses a configured cloud backup upload.
+- `testing::stored_rows` and `testing::stored_columns` (hidden, like the rest of `testing`) read the graph and chunk tables as stored, with the columns the ports leave out. `TestRows` gains `stored_rows`, on the engine and SQLite. The public row structs are unchanged.
+- `attest_store::open_at` keeps the engine tables in a directory the caller names, rebuilt from the log at every open; it clears only scratch whose `ATTEST_R3_SCRATCH` mark names the same log, and refuses an unmarked directory or another run's. It creates the scratch exclusively, so of two logs racing for one absent path only one gets it. `attest_store::package` copies the log alone, without the lock.
+
+### Security
+- `url` 2.5.8 to 2.5.9 (and `form_urlencoded` 1.2.3) in the lockfile, for RUSTSEC-2026-0592 (unbounded `blob:` recursion in `Url::origin()`), which `cargo-deny` began failing on `main` as well.
+
+### Tests
+- Blob keys, sharding, idempotence, tamper detection, refused path keys and 16 concurrent puts of one key. A failed first write ends the loaded-reader run within a bounded wait. A write completing after a reader's last query is rejected and one inside its span accepted. Head cut on a char boundary, body links, manifest comparison (including a body altered on both sides, and a relation changed at the same count, from a real store; a changed `node_id` and one embedding at another chunk index). Stored rows carry `node_id` and `chunk_ix` on both backends. Attest `open_at` rebuild, second-opener refusal and refusal to clear an unmarked directory or another log's marked scratch, two logs racing for one scratch path, a dialog without its body link failing G8, a package restored from the log alone, and a forced collision on the conformance fixtures' directory.
+- Smoke runs at 1,000 and 2,000 memories on all three candidates pass every check, with restore isolated in a child process. These are not scores.
+
 ## 2026-11-22 — Port conformance suites exported; Attest runs them (Millwright R3, Mill Board #1618)
 
 ### Added

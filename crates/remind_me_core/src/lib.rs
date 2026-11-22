@@ -12,6 +12,8 @@ pub mod archive;
 pub mod attachments;
 pub mod audio_import;
 pub mod backup;
+#[doc(hidden)]
+pub mod blobs;
 pub mod boundary;
 pub mod capture;
 pub mod cloud_backup;

@@ -81,6 +81,34 @@ pub enum Table {
     MempalaceImports,
 }
 
+/// The stored columns [`stored_rows`] reads from `table`, or `None` for a
+/// table it does not read: the graph and chunk tables only.
+pub fn stored_columns(table: Table) -> Option<&'static [&'static str]> {
+    Some(match table {
+        Table::Entities => &[
+            "id",
+            "name",
+            "kind",
+            "aliases",
+            "created_at",
+            "updated_at",
+            "node_id",
+        ],
+        Table::MemoryEntities => &["memory_id", "entity_id", "created_at"],
+        Table::EntityRelations => &[
+            "id",
+            "subject_entity_id",
+            "relation",
+            "object_entity_id",
+            "created_at",
+            "updated_at",
+            "node_id",
+        ],
+        Table::VecChunks => &["memory_id", "chunk_ix", "embedding"],
+        _ => return None,
+    })
+}
+
 fn memory_column_name(column: &str) -> Result<&str> {
     MEMORY_COLUMNS
         .iter()
@@ -118,6 +146,8 @@ pub trait TestRows {
     fn set_outbox_column(&mut self, id: i64, column: &str, value: &str) -> Result<usize>;
     /// See [`sends`].
     fn sends(&self) -> Result<Vec<(String, i64, String)>>;
+    /// See [`stored_rows`]; `table` is one [`stored_columns`] names.
+    fn stored_rows(&self, table: Table) -> Result<Vec<serde_json::Map<String, Value>>>;
     /// See [`queue_outbox`].
     fn queue_outbox(
         &mut self,
@@ -263,6 +293,24 @@ pub fn set_outbox_column(store: &Store<'_>, id: i64, column: &str, value: &str) 
     with_rows(store, |rows| rows.set_outbox_column(id, column, value))
 }
 
+/// Every row of `table` as stored, as `SELECT <stored_columns> FROM table`
+/// reads it: columns the ports do not return, such as `node_id` and
+/// `chunk_ix`, included. Text is a string, an integer a number, a blob an
+/// array of bytes, NULL null. Unordered.
+///
+/// # Errors
+///
+/// [`StoreError::Invalid`] for a table [`stored_columns`] does not name,
+/// or the backend's error.
+pub fn stored_rows(store: &Store<'_>, table: Table) -> Result<Vec<serde_json::Map<String, Value>>> {
+    if stored_columns(table).is_none() {
+        return Err(StoreError::Invalid(format!(
+            "{table:?} rows are not read here"
+        )));
+    }
+    with_rows(store, |rows| rows.stored_rows(table))
+}
+
 /// Every send marker as `(remote, outbox id, sent at)`, sorted.
 pub fn sends(store: &Store<'_>) -> Result<Vec<(String, i64, String)>> {
     with_rows(store, |rows| rows.sends())
@@ -314,6 +362,75 @@ mod tests {
         raw_access_reads_and_writes_stored_rows(
             &Database::open_backend(Box::new(sqlite), None).unwrap(),
         );
+    }
+
+    #[test]
+    fn stored_rows_carry_node_id_and_chunk_ix_on_the_engine() {
+        stored_rows_carry_node_id_and_chunk_ix(&Database::open_in_memory().unwrap());
+    }
+
+    #[test]
+    fn stored_rows_carry_node_id_and_chunk_ix_on_sqlite() {
+        let sqlite = crate::db::sqlite::SqliteTables::open_in_memory().unwrap();
+        stored_rows_carry_node_id_and_chunk_ix(
+            &Database::open_backend(Box::new(sqlite), None).unwrap(),
+        );
+    }
+
+    /// Columns the ports leave out come back, in the same shape on any
+    /// backend; a table outside the graph and chunk tables is refused.
+    fn stored_rows_carry_node_id_and_chunk_ix(db: &Database) {
+        use crate::db::derived::Origin;
+        use crate::db::entities::{Entities, RelationRow};
+        use crate::db::vectors::Vectors;
+        use crate::entity::Entity;
+        use serde_json::json;
+
+        let store = db.store();
+        let entities = Entities::new(&store);
+        for id in ["e1", "e2"] {
+            let entity = Entity {
+                id: id.into(),
+                name: id.into(),
+                kind: None,
+                aliases: vec![],
+                created_at: NOW.into(),
+                updated_at: NOW.into(),
+            };
+            entities.insert(&entity, Some("node-a")).unwrap();
+        }
+        let relation = RelationRow {
+            id: "r1",
+            subject_entity_id: "e1",
+            relation: "knows",
+            object_entity_id: "e2",
+            created_at: NOW,
+            updated_at: NOW,
+            node_id: Some("node-b"),
+        };
+        entities
+            .insert_relation_or_ignore(&relation, Origin::Local)
+            .unwrap();
+        Memories::new(&store)
+            .insert(&NewMemory::new("m", "x", NOW))
+            .unwrap();
+        Vectors::new(&store).put("m", 3, &[1, 2]).unwrap();
+
+        let node = |table| -> Vec<Value> {
+            stored_rows(&store, table)
+                .unwrap()
+                .into_iter()
+                .map(|r| r["node_id"].clone())
+                .collect()
+        };
+        assert_eq!(node(Table::Entities), [json!("node-a"), json!("node-a")]);
+        assert_eq!(node(Table::EntityRelations), [json!("node-b")]);
+        let chunks = stored_rows(&store, Table::VecChunks).unwrap();
+        assert_eq!(
+            Value::Object(chunks[0].clone()),
+            json!({"memory_id": "m", "chunk_ix": 3, "embedding": [1, 2]})
+        );
+        assert!(stored_rows(&store, Table::Memories).is_err());
     }
 
     /// The same raw reads and writes on any backend.
