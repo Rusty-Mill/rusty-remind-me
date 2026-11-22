@@ -229,9 +229,10 @@ impl EngineTables {
         if rolled_back.is_err() {
             self.failed = true;
         }
-        // With a sink set: the other tables' writes too, none handed over.
+        // With a sink set: the other tables' writes too, none handed over
+        // but the ids the page issued.
         self.undo_held(0);
-        rolled_back
+        rolled_back.and(self.ensure_writable())
     }
 
     fn put_back(&mut self, before: Vec<Change>) -> Result<()> {

@@ -217,12 +217,24 @@ impl EngineTables {
             self.wiki_search = wiki::index_pages(&self.wiki_pages);
         }
         self.staging.held.extend(issued.into_iter().rev());
+        self.hand_over_issued();
     }
 
-    /// Drop every held write but the issued ids: their outcome is settled
-    /// by reopening.
+    /// Drop every held write but the issued ids, and hand those over: the
+    /// rest's outcome is settled by reopening.
     pub(crate) fn drop_held(&mut self) {
         self.staging.held.retain(|n| n.change.table == SEQUENCES);
+        self.hand_over_issued();
+    }
+
+    /// Hand over what is held, now only issued ids, unless an operation or
+    /// page still runs: a reopen straight after a rollback must not reissue
+    /// them. A failure is recorded in `failed` by `hand_over`, which then
+    /// refuses writes, so the result needs no other handling here.
+    fn hand_over_issued(&mut self) {
+        if self.flush_unless_held().is_err() {
+            debug_assert!(self.failed, "hand_over records a failed sink");
+        }
     }
 
     fn flush_unless_held(&mut self) -> Result<()> {
@@ -410,6 +422,15 @@ mod tests {
         t
     }
 
+    /// The rows, not issued ids, in the units after the first `skip`.
+    fn rows_after(log: &Log, skip: usize) -> Vec<CapturedChange> {
+        log.lock().unwrap()[skip..]
+            .concat()
+            .into_iter()
+            .filter(|c| c.table != SEQUENCES)
+            .collect()
+    }
+
     fn tables_of(unit: &[CapturedChange]) -> Vec<&str> {
         unit.iter().map(|c| c.table.as_str()).collect()
     }
@@ -516,7 +537,7 @@ mod tests {
         MemoryStore::insert(&mut t, &NewMemory::new("m", "quokka", NOW)).unwrap();
         t.abandon_page().unwrap();
 
-        assert_eq!(log.lock().unwrap().len(), before, "nothing handed over");
+        assert!(rows_after(&log, before).is_empty(), "no rows handed over");
         assert!(!MemoryStore::exists(&t, "m").unwrap());
         assert_eq!(HistoryStore::list(&t, "m", 10).unwrap().len(), 1);
         assert_eq!(WikiStore::meta(&t, "k").unwrap().as_deref(), Some("old"));
@@ -618,12 +639,57 @@ mod tests {
         arm_fault(Fault::JournalSync);
         assert!(MemoryStore::insert(&mut t, &NewMemory::new("m", "x", NOW)).is_err());
         assert!(t.finish_page().is_err(), "no false success");
-        assert!(log.lock().unwrap().is_empty(), "no partial unit");
+        assert!(rows_after(&log, 0).is_empty(), "no partial unit");
         assert!(HistoryStore::list(&t, "m", 10).unwrap().is_empty());
     }
 
     /// An id issued inside an abandoned page is not issued again after a
     /// rebuild, once a later unit reaches the sink.
+    #[test]
+    fn an_abandoned_page_hands_over_its_issued_ids_at_once() {
+        let (mut t, log) = collecting();
+        t.begin_page().unwrap();
+        HistoryStore::insert(&mut t, "m", &tracked(), NOW, None).unwrap();
+        let abandoned = HistoryStore::list(&t, "m", 1).unwrap()[0].id;
+        t.abandon_page().unwrap();
+        let units = log.lock().unwrap().clone();
+        assert!(
+            units.concat().iter().all(|c| c.table == SEQUENCES),
+            "only issued ids: {units:?}"
+        );
+
+        let mut b = rebuilt(&log);
+        HistoryStore::insert(&mut b, "m", &tracked(), NOW, None).unwrap();
+        let next = HistoryStore::list(&b, "m", 1).unwrap()[0].id;
+        assert!(next > abandoned, "{next} reissues {abandoned} or lower");
+    }
+
+    /// A commit whose outcome is indeterminate still hands over the ids
+    /// the page issued, and none of its rows.
+    #[test]
+    fn an_indeterminate_commit_hands_over_only_its_issued_ids() {
+        use rusty_multimodal_db_engine::test_support::{arm_fault, Fault};
+        let (mut t, log) = collecting();
+        t.begin_page().unwrap();
+        HistoryStore::insert(&mut t, "m", &tracked(), NOW, None).unwrap();
+        let issued = HistoryStore::list(&t, "m", 1).unwrap()[0].id;
+        MemoryStore::insert(&mut t, &NewMemory::new("m", "x", NOW)).unwrap();
+        arm_fault(Fault::JournalSync);
+        assert!(t.finish_page().is_err());
+        assert!(log
+            .lock()
+            .unwrap()
+            .concat()
+            .iter()
+            .all(|c| c.table == SEQUENCES));
+
+        let mut b = rebuilt(&log);
+        assert!(!MemoryStore::exists(&b, "m").unwrap());
+        HistoryStore::insert(&mut b, "m", &tracked(), NOW, None).unwrap();
+        let next = HistoryStore::list(&b, "m", 1).unwrap()[0].id;
+        assert!(next > issued, "{next} reissues {issued} or lower");
+    }
+
     #[test]
     fn an_abandoned_page_keeps_its_issued_ids() {
         let (mut t, log) = collecting();

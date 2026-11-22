@@ -74,19 +74,21 @@ fn a_second_opener_is_refused() {
 const NOW: &str = "2026-11-22T00:00:00+00:00";
 
 /// A transaction that aborts after writing a revision and a row change
-/// leaves neither in the log: the reopened store has the row as it was and
-/// no revision.
+/// leaves neither in the log: the reopened store has the row as it was, no
+/// revision, and does not issue the aborted revision's id again.
 #[test]
 fn an_aborted_mixed_edit_leaves_nothing_in_the_log() {
     let dir = scratch("aborted");
-    let id = {
+    let (id, issued) = {
         let db = open(&dir);
         let id = add(&db, "before the edit");
         let store = db.store();
+        let mut issued = 0;
         let aborted: Result<(), StoreError> = store.transaction(|s| {
             let revisions = Revisions::new(s);
             let current = revisions.current(&id)?.expect("live");
             revisions.insert(&id, &current, NOW, None)?;
+            issued = revisions.list(&id, 1)?[0].id;
             let edit = serde_json::from_value(
                 serde_json::json!({ "memory_id": id, "content": "after the edit" }),
             )
@@ -95,7 +97,7 @@ fn an_aborted_mixed_edit_leaves_nothing_in_the_log() {
             Err(StoreError::Engine("abort".into()))
         });
         assert!(aborted.is_err());
-        id
+        (id, issued)
     };
     let db = open(&dir);
     let store = db.store();
@@ -105,7 +107,13 @@ fn an_aborted_mixed_edit_leaves_nothing_in_the_log() {
             .as_deref(),
         Some("before the edit")
     );
-    assert!(Revisions::new(&store).list(&id, 10).unwrap().is_empty());
+    let revisions = Revisions::new(&store);
+    assert!(revisions.list(&id, 10).unwrap().is_empty());
+    // Reopened straight after the rollback: its issued id is not reused.
+    let current = revisions.current(&id).unwrap().expect("live");
+    revisions.insert(&id, &current, NOW, None).unwrap();
+    let next = revisions.list(&id, 1).unwrap()[0].id;
+    assert!(next > issued, "{next} reissues {issued} or lower");
     drop(store);
     drop(db);
     std::fs::remove_dir_all(&dir).unwrap();
