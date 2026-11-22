@@ -16,6 +16,9 @@ Dated entries, newest first. One entry per merged pull request.
 - `testing::stored_rows` and `testing::stored_columns` (hidden, like the rest of `testing`) read the graph and chunk tables as stored, with the columns the ports leave out. `TestRows` gains `stored_rows`, on the engine and SQLite. The public row structs are unchanged.
 - `attest_store::open_at` keeps the engine tables in a directory the caller names, rebuilt from the log at every open; it clears only scratch whose `ATTEST_R3_SCRATCH` mark names the same log, and refuses an unmarked directory or another run's. It creates the scratch exclusively, so of two logs racing for one absent path only one gets it. `attest_store::package` copies the log alone, without the lock.
 
+### Security
+- `url` 2.5.8 to 2.5.9 (and `form_urlencoded` 1.2.3) in the lockfile, for RUSTSEC-2026-0592 (unbounded `blob:` recursion in `Url::origin()`), which `cargo-deny` began failing on `main` as well.
+
 ### Tests
 - Blob keys, sharding, idempotence, tamper detection, refused path keys and 16 concurrent puts of one key. A failed first write ends the loaded-reader run within a bounded wait. A write completing after a reader's last query is rejected and one inside its span accepted. Head cut on a char boundary, body links, manifest comparison (including a body altered on both sides, and a relation changed at the same count, from a real store; a changed `node_id` and one embedding at another chunk index). Stored rows carry `node_id` and `chunk_ix` on both backends. Attest `open_at` rebuild, second-opener refusal and refusal to clear an unmarked directory or another log's marked scratch, two logs racing for one scratch path, a dialog without its body link failing G8, a package restored from the log alone, and a forced collision on the conformance fixtures' directory.
 - Smoke runs at 1,000 and 2,000 memories on all three candidates pass every check, with restore isolated in a child process. These are not scores.
