@@ -11,6 +11,7 @@ use remind_me_core::Database;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Barrier;
+use std::time::Duration;
 
 use super::Result;
 
@@ -20,6 +21,9 @@ const BATCH: i64 = 5;
 const TRANSACTIONS: usize = 40;
 /// Threads reading while it does.
 const READERS: usize = 4;
+/// The writer's pause between transactions, so readers get in between
+/// them (the gate makes them wait out each open transaction).
+const PAUSE: Duration = Duration::from_millis(2);
 
 /// An update and a delete of the dialog `id` are both refused, and its
 /// row reads back unchanged.
@@ -44,7 +48,9 @@ pub fn dialog_rewrite_refused(store: &Store<'_>, id: &str) -> Result<Value> {
 
 /// One writer commits [`TRANSACTIONS`] transactions of [`BATCH`] memories
 /// while [`READERS`] threads count memories; every count must be the
-/// starting count plus whole transactions. `store` holds the process lock
+/// starting count plus whole transactions, and the readers must have seen
+/// at least [`TRANSACTIONS`] reads and some count strictly between the
+/// first and the last, or the check proved nothing. `store` holds the process lock
 /// and only takes the counts before and after; the threads read through
 /// the database's secondary source.
 pub fn readers_see_whole_transactions(db: &Database, store: &Store<'_>) -> Result<Value> {
@@ -54,11 +60,15 @@ pub fn readers_see_whole_transactions(db: &Database, store: &Store<'_>) -> Resul
     let done = &AtomicBool::new(false);
     let reads = &AtomicUsize::new(0);
     let torn = &AtomicUsize::new(0);
+    let between = &AtomicUsize::new(0);
     std::thread::scope(|scope| -> Result<()> {
         let writer = scope.spawn(move || -> std::result::Result<(), String> {
             let store = source.store();
             start.wait();
-            let written = (0..TRANSACTIONS).try_for_each(|t| batch(&store, t));
+            let written = (0..TRANSACTIONS).try_for_each(|t| {
+                std::thread::sleep(PAUSE);
+                batch(&store, t)
+            });
             done.store(true, Ordering::SeqCst);
             written.map_err(|e| e.to_string())
         });
@@ -73,6 +83,9 @@ pub fn readers_see_whole_transactions(db: &Database, store: &Store<'_>) -> Resul
                         reads.fetch_add(1, Ordering::SeqCst);
                         if (seen - base) % BATCH != 0 {
                             torn.fetch_add(1, Ordering::SeqCst);
+                        }
+                        if seen > base && seen < base + BATCH * TRANSACTIONS as i64 {
+                            between.fetch_add(1, Ordering::SeqCst);
                         }
                     }
                     Ok(())
@@ -89,16 +102,22 @@ pub fn readers_see_whole_transactions(db: &Database, store: &Store<'_>) -> Resul
         Ok(joined?)
     })?;
     let after = testing::count(store, Table::Memories)?;
-    let (reads, torn) = (reads.load(Ordering::SeqCst), torn.load(Ordering::SeqCst));
+    let [reads, torn, between] = [reads, torn, between].map(|c| c.load(Ordering::SeqCst));
     let expected = base + BATCH * TRANSACTIONS as i64;
-    if torn > 0 || after != expected || reads == 0 {
+    if torn > 0 || after != expected || reads < TRANSACTIONS || between == 0 {
         return Err(format!(
-            "G1: readers saw {torn} partial transactions in {reads} reads; \
-             {after} rows after, {expected} expected"
+            "G1: readers saw {torn} partial transactions in {reads} reads \
+             ({between} mid-run); {after} rows after, {expected} expected"
         )
         .into());
     }
-    Ok(json!({ "transactions": TRANSACTIONS, "batch": BATCH, "reads": reads, "torn": 0 }))
+    Ok(json!({
+        "transactions": TRANSACTIONS,
+        "batch": BATCH,
+        "reads": reads,
+        "mid_run_reads": between,
+        "torn": 0,
+    }))
 }
 
 /// The `t`th transaction: [`BATCH`] memories, committed together.
