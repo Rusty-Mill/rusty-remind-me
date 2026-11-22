@@ -168,6 +168,16 @@ mod tests {
                 Isolation::InProcess,
             )
             .unwrap();
+            let run = Path::new(report["run_dir"].as_str().unwrap());
+            let owned = run.parent().unwrap();
+            assert!(owned.join("run.package").is_dir(), "package inside");
+            assert!(owned.join("run.restored").is_dir(), "restore inside");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(owned).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o700, "{}", candidate.name);
+            }
             let loaded = &report["loaded"];
             for (kind, n) in [
                 ("memories", FIXTURE),
@@ -182,6 +192,11 @@ mod tests {
             assert_eq!(report["restore"]["matched"], true, "{}", candidate.name);
             assert_eq!(report["parity"]["matched"], true, "{}", candidate.name);
             assert_eq!(report["embedding_identity"]["unchanged"], true);
+            assert_eq!(report["embedding_identity"]["after_reopen"], true);
+            assert!(report["cold_open"]["cache"]
+                .as_str()
+                .unwrap()
+                .starts_with("warm"));
             assert!(
                 report["add"]["count"].as_u64().unwrap() > 0,
                 "real adds timed"

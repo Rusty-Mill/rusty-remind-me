@@ -55,6 +55,7 @@ pub fn cold_open(
             "ms": ms,
             "isolation": "InProcess",
             "page_cache_dropped": false,
+            "cache": cache_label(false),
             "cgroup": limits,
             "child": held.timing,
         }));
@@ -83,6 +84,7 @@ pub fn cold_open(
         "ms": ms,
         "isolation": "Child",
         "page_cache_dropped": dropped,
+        "cache": cache_label(dropped),
         "cgroup": limits,
         "child": first,
         "idle": idle,
@@ -176,6 +178,15 @@ fn cgroup_limits() -> Value {
     json!({ "path": path, "memory_max": read("memory.max"), "cpu_max": read("cpu.max") })
 }
 
+/// What the open measured: a cold cache only when it was dropped first.
+fn cache_label(dropped: bool) -> &'static str {
+    if dropped {
+        "cold: page cache dropped before the open"
+    } else {
+        "warm: page cache not dropped, not G7 cold-cache evidence"
+    }
+}
+
 /// Whether `limits` are remindme's.
 fn limits_match(limits: &Value) -> bool {
     limits["memory_max"] == MEMORY_MAX && limits["cpu_max"] == CPU_MAX
@@ -198,6 +209,41 @@ fn drop_page_cache() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use remind_me_core::db::backend::Backend;
+    use remind_me_core::db::engine::EngineTables;
+
+    fn engine(dir: &Path) -> Result<Box<dyn Backend>> {
+        Ok(Box::new(EngineTables::open(dir)?))
+    }
+
+    const ENGINE: Candidate = Candidate {
+        name: "engine",
+        tables: engine,
+        restore: engine,
+        package: super::super::backup_package,
+    };
+
+    /// The child's store stays open (its lock held) from the first answer
+    /// until the held value is dropped, after the idle sample.
+    #[test]
+    fn the_store_stays_open_until_the_held_query_is_dropped() {
+        let dir = std::env::temp_dir().join(format!("store_bench_held_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let query = ("rust storage".to_string(), vec![0.5; super::super::DIM]);
+        let held = Held::open(ENGINE, &dir, &query).unwrap();
+        assert!(held.timing["first_query_ms"].is_number());
+        assert!(ENGINE.open(&dir).is_err(), "a second open while held");
+        drop(held);
+        drop(ENGINE.open(&dir).unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn only_a_dropped_cache_is_labelled_cold() {
+        assert!(cache_label(true).starts_with("cold"));
+        assert!(cache_label(false).contains("not G7 cold-cache evidence"));
+    }
 
     #[test]
     fn only_remindmes_limits_match() {

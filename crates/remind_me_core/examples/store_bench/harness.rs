@@ -230,9 +230,7 @@ pub fn run(candidates: &[Candidate]) -> Result<()> {
             let candidate = find(candidates, backend)?;
             refuse_model_config()?;
             let dir = Path::new(dir);
-            if !dir.join(RUN_MARK).is_file() {
-                return Err(format!("{} is not a store_bench run directory", dir.display()).into());
-            }
+            owned_run(dir)?;
             return cold::cold_child(candidate, dir);
         }
     }
@@ -275,6 +273,14 @@ fn find(candidates: &[Candidate], name: &str) -> Result<Candidate> {
 
 /// The file every run directory holds, so a child refuses any other.
 const RUN_MARK: &str = ".store_bench_run";
+
+/// Refuse `dir` unless a run made it: a child never opens another store.
+fn owned_run(dir: &Path) -> Result<()> {
+    if dir.join(RUN_MARK).is_file() {
+        return Ok(());
+    }
+    Err(format!("{} is not a store_bench run directory", dir.display()).into())
+}
 
 /// One run of `candidate` on `dataset` in a new directory under `root`;
 /// its report. The dataset and the environment are checked before the
@@ -355,13 +361,17 @@ fn disk(dir: &Path) -> Result<Value> {
     }))
 }
 
-/// A new directory under `root` that this run alone owns: `create_dir`
-/// fails if the name is taken, and nothing is ever deleted.
+/// A new run directory, `run`, inside a private (0700) directory under
+/// `root` that this run alone owns, so everything the run writes beside
+/// it (the D1 copy, the package, the restore) is private too.
+/// `create_dir` fails if a name is taken, and nothing is ever deleted.
 fn fresh_run_dir(root: &Path, stem: &str) -> Result<PathBuf> {
     std::fs::create_dir_all(root)?;
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let dir = root.join(format!("{stem}-{}-{nanos}", std::process::id()));
-    package::private_dir(&dir)?;
+    let owned = root.join(format!("{stem}-{}-{nanos}", std::process::id()));
+    package::private_dir(&owned)?;
+    let dir = owned.join("run");
+    std::fs::create_dir(&dir)?;
     std::fs::write(dir.join(RUN_MARK), b"")?;
     Ok(dir)
 }
@@ -691,19 +701,24 @@ fn workload(
         }),
     );
 
+    drop(store);
+    // Reopen, so the identity check covers what the store persisted.
+    drop(db);
+    let db = candidate.open(dir)?;
     if real {
-        let now = Vectors::new(&store).meta()?;
+        let now = Vectors::new(&db.store()).meta()?;
         if now != identity {
-            return Err(
-                format!("the embedding identity changed: {identity:?} became {now:?}").into(),
-            );
+            return Err(format!(
+                "the embedding identity changed across the workloads and a reopen: \
+                 {identity:?} became {now:?}"
+            )
+            .into());
         }
         report.insert(
             "embedding_identity".into(),
-            json!({ "unchanged": true, "dim": identity_dim(&identity) }),
+            json!({ "unchanged": true, "after_reopen": true, "dim": identity_dim(&identity) }),
         );
     }
-    drop(store);
     backup_and_restore(candidate, db, &bodies, dir, report, isolation)
 }
 
@@ -1523,6 +1538,19 @@ mod tests {
         // not remove files that are open (OS error 32).
         run.join().unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The cold child refuses a directory no run made, such as a live
+    /// store, and accepts a fresh run directory.
+    #[test]
+    fn the_cold_child_opens_only_a_run_directory() {
+        let root = std::env::temp_dir().join(format!("store_bench_owned_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("live")).unwrap();
+        assert!(owned_run(&root.join("live")).is_err());
+        let run = fresh_run_dir(&root, "t").unwrap();
+        owned_run(&run).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     fn window(begin: f64, end: f64) -> Window {
