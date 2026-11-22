@@ -13,8 +13,10 @@
 //!
 //! The copy is opened as any node opens its store, which applies that
 //! open's normal housekeeping (the sync flag, the outbox prune, emptying
-//! tombstones' text); what is loaded is that opened source. Before any
-//! timing, a parity check compares the candidate with it row by row:
+//! tombstones' text); what is loaded is that opened, normalized copy, not
+//! the untouched backup. Before any timing, a parity check compares the
+//! candidate with that copy row by row (so it shows the load is faithful
+//! to the copy, not that the copy equals the backup byte for byte):
 //! every memory (a dialog with its body stashed), every stored entity,
 //! link, relation and chunk row, every reference and the embedding
 //! identity. Any difference fails the run.
@@ -164,13 +166,18 @@ fn parity(source: &Store<'_>, target: &Store<'_>, bodies: &Bodies) -> Result<Val
     }
     if !differ.is_empty() {
         return Err(format!(
-            "D1 parity: the candidate differs from the source in {}",
+            "D1 parity: the candidate differs from the opened copy in {}",
             differ.join(", ")
         )
         .into());
     }
     counts.insert("memories".into(), ids.len().into());
     counts.insert("matched".into(), true.into());
+    counts.insert(
+        "against".into(),
+        "the opened copy of the backup, after normal startup's housekeeping; not the untouched backup"
+            .into(),
+    );
     Ok(Value::Object(counts))
 }
 

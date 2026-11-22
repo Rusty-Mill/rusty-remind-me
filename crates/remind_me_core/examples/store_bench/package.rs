@@ -226,14 +226,35 @@ pub fn copy_dir(from: &Path, to: &Path, skip: &[&str]) -> Result<()> {
 /// Make the directory `dir`, which must not exist, readable by this user
 /// only (on Unix).
 pub fn private_dir(dir: &Path) -> Result<()> {
-    std::fs::create_dir(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    // Created 0700, so it is never readable by others, not even briefly;
+    // then checked, so a filesystem that widened it fails the run.
+    #[cfg(unix)]
+    let builder = {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder
+    };
+    #[cfg(not(unix))]
+    let builder = std::fs::DirBuilder::new();
+    builder
+        .create(dir)
+        .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        let mode = std::fs::metadata(dir)?.permissions().mode() & 0o777;
+        if mode != 0o700 {
+            return Err(format!("{} was created {mode:o}, not 700", dir.display()).into());
+        }
     }
     Ok(())
 }
+
+/// Whether [`private_dir`] can verify that what it creates is private.
+/// Real datasets are refused where it cannot (fail closed): checking a
+/// Windows ACL is not implemented.
+pub const PRIVACY_VERIFIABLE: bool = cfg!(unix);
 
 /// Refuse a tree holding anything but plain files and directories.
 fn check_tree(dir: &Path) -> Result<()> {

@@ -83,6 +83,7 @@ mod tests {
     /// Memories in the D1 fixture: enough for 500 distinct queries.
     const FIXTURE: usize = 520;
     /// The memories the fixture's project claim adds (stage and status).
+    #[cfg(unix)]
     const CLAIMS: usize = 2;
 
     /// A small engine store backed up as `manual-*.engine`: D1's source.
@@ -173,6 +174,7 @@ mod tests {
 
     /// D1 loads every row kind through the ports into each candidate, and
     /// the run completes with an isolated restore and a cold open.
+    #[cfg(unix)] // real datasets need a verifiable private root
     #[test]
     fn d1_loads_the_backup_into_each_candidate() {
         let _serial = harness::serial();
@@ -212,6 +214,10 @@ mod tests {
             }
             assert_eq!(report["restore"]["matched"], true, "{}", candidate.name);
             assert_eq!(report["parity"]["matched"], true, "{}", candidate.name);
+            assert!(report["parity"]["against"]
+                .as_str()
+                .unwrap()
+                .contains("not the untouched backup"));
             // The claim (and the dialogs) stay loaded but out of the edits.
             assert_eq!(
                 report["edit_pool"]["append_only"],
@@ -238,6 +244,7 @@ mod tests {
     }
 
     /// D2 grows the loaded store to its total.
+    #[cfg(unix)] // real datasets need a verifiable private root
     #[test]
     fn d2_grows_d1_to_its_total() {
         let _serial = harness::serial();

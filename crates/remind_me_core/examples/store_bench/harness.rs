@@ -312,6 +312,13 @@ pub fn measure(
             if mode == Mode::Open {
                 return Err("open mode is synthetic only; bench reports the cold open".into());
             }
+            if !package::PRIVACY_VERIFIABLE {
+                return Err(
+                    "real datasets need a run root verified private from creation, which this \
+                     platform cannot check; run D1 and D2 on Unix"
+                        .into(),
+                );
+            }
             if !backup.is_dir() {
                 return Err(format!("backup {} is not a directory", backup.display()).into());
             }
@@ -795,6 +802,21 @@ fn synthetic_queries(corpus: &Corpus, rng: &mut Rng) -> Result<Vec<(String, Vec<
     Ok(pairs)
 }
 
+/// Refuse query vectors whose dimension is not the store's `dim`. The
+/// error names the query by its ordinal, never its text (real content).
+fn check_query_dims(pairs: &[(String, Vec<f32>)], dim: usize) -> Result<()> {
+    match pairs.iter().position(|(_, v)| v.len() != dim) {
+        Some(i) => Err(format!(
+            "query {} of {} has a {}-dim vector; the store's are {dim}",
+            i + 1,
+            pairs.len(),
+            pairs[i].1.len()
+        )
+        .into()),
+        None => Ok(()),
+    }
+}
+
 /// The dimension an embedding identity records, if it does.
 fn identity_dim(identity: &[(String, String)]) -> Option<usize> {
     identity
@@ -861,13 +883,7 @@ fn seed(
     }
     let pairs = d1::queries(&store, &ids, SAMPLES, |len| rng.below(len))?;
     if let Some(d) = dim {
-        if let Some((text, v)) = pairs.iter().find(|(_, v)| v.len() != d) {
-            return Err(format!(
-                "query {text:?} has a {}-dim vector; the store's are {d}",
-                v.len()
-            )
-            .into());
-        }
+        check_query_dims(&pairs, d)?;
     }
     report.insert(
         "queries".into(),
@@ -1594,6 +1610,49 @@ mod tests {
         let run = fresh_run_dir(&root, "t").unwrap();
         owned_run(&run).unwrap();
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A mismatched query is named by its ordinal, never by its text.
+    #[test]
+    fn a_query_dimension_error_carries_no_query_text() {
+        let pairs = vec![
+            ("first secret words".to_string(), vec![0.0; 4]),
+            ("second secret words".to_string(), vec![0.0; 3]),
+        ];
+        check_query_dims(&pairs, 4).unwrap_err();
+        let error = check_query_dims(&pairs, 4).unwrap_err().to_string();
+        assert!(!error.contains("secret"), "{error}");
+        assert!(
+            error.contains("query 2 of 2") && error.contains("3-dim"),
+            "{error}"
+        );
+        check_query_dims(&pairs[..1], 4).unwrap();
+    }
+
+    /// Off Unix, a real dataset is refused before anything is written.
+    #[cfg(not(unix))]
+    #[test]
+    fn a_real_dataset_is_refused_where_privacy_cannot_be_verified() {
+        let root = std::env::temp_dir().join(format!("store_bench_acl_{}", std::process::id()));
+        let backup = std::env::temp_dir();
+        let dataset = Dataset::D1(backup);
+        let candidate = Candidate {
+            name: "none",
+            tables: |_| Err("unused".into()),
+            restore: |_| Err("unused".into()),
+            package: backup_package,
+        };
+        let error = measure(
+            candidate,
+            Mode::Bench,
+            &dataset,
+            &root,
+            Isolation::InProcess,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("verified private"), "{error}");
+        assert!(!root.exists());
     }
 
     fn window(begin: f64, end: f64) -> Window {
