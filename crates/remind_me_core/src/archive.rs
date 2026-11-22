@@ -34,8 +34,9 @@
 //!
 //! Blobs are stored at `<root>/<hash[0..2]>/<hash>` keyed on the same content
 //! hash `chat_imports.hash` already uses. Importing the same file twice writes
-//! one blob. That also makes the write idempotent, which matters because the
-//! folder watcher re-scans the same directory forever.
+//! one blob, through [`crate::blobs::BlobStore`]. That also makes the write
+//! idempotent, which matters because the folder watcher re-scans the same
+//! directory forever.
 //!
 //! # Not synced
 //!
@@ -44,6 +45,7 @@
 //! outbox — these tables carry no triggers, and `sync/` enumerates the
 //! reference's tables, not this one's.
 
+use crate::blobs::BlobStore;
 use crate::db::archives::{ArchiveRow, Archives, SpanSource};
 use crate::db::memories::Memories;
 use crate::db::Result as SqlResult;
@@ -114,15 +116,6 @@ impl From<crate::db::StoreError> for ArchiveError {
     }
 }
 
-/// Where a blob for `hash` lives under `root`.
-///
-/// Two-character shard prefix, so a directory listing stays usable after a few
-/// thousand imports.
-fn blob_path(root: &Path, hash: &str) -> PathBuf {
-    let shard = hash.get(..2).unwrap_or("__");
-    root.join(shard).join(hash)
-}
-
 /// Retain `raw` as the source of `import_id`, if retention is on.
 ///
 /// Returns the blob path when something was retained, `None` when retention is
@@ -139,13 +132,7 @@ pub fn store(
         return Ok(None);
     };
 
-    let path = blob_path(&root, hash);
-    if !path.exists() {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&path, raw)?;
-    }
+    let path = BlobStore::new(root).put_keyed(hash, raw)?;
 
     Archives::new(store).record(&ArchiveRow {
         import_id: import_id.to_string(),
@@ -500,25 +487,4 @@ fn distinct_bytes<'a>(rows: impl Iterator<Item = &'a Retained>) -> u64 {
     rows.filter(|r| seen.insert(r.hash.clone()))
         .map(|r| r.byte_len)
         .sum()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn blob_path_shards_on_the_first_two_hash_characters() {
-        let path = blob_path(Path::new("/archive"), "ab12cd34");
-        assert_eq!(path, Path::new("/archive/ab/ab12cd34"));
-    }
-
-    #[test]
-    fn a_short_hash_still_yields_a_path_rather_than_panicking() {
-        // `hash_bytes` is 16 characters, so this is defensive rather than
-        // reachable -- but `get(..2)` on a one-character hash returning None
-        // would panic under indexing, and a panic in the write path would
-        // fail an import that archiving is only supposed to decorate.
-        let path = blob_path(Path::new("/archive"), "a");
-        assert_eq!(path, Path::new("/archive/__/a"));
-    }
 }
