@@ -50,7 +50,7 @@ use crate::db::archives::{ArchiveRow, Archives, SpanSource};
 use crate::db::memories::Memories;
 use crate::db::Result as SqlResult;
 use crate::db::Store;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Directory raw transcripts are retained under. Unset disables retention.
 pub const ARCHIVE_DIR_ENV: &str = "REMIND_ME_ARCHIVE_DIR";

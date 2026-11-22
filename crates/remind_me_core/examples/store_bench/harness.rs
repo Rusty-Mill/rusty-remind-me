@@ -26,7 +26,10 @@
 //! run. Disk is reported for the store, the candidate's temporary files
 //! (`<store>.temp`, Attest's engine tables) and the blob root (D53). The
 //! beside-writer search records how far the writer overlapped each reader
-//! and refuses a run with too little overlap (D54).
+//! and refuses a run with too little overlap (D54). Each run also checks
+//! the two G1 behaviours the port suites leave out (`g1.rs`): a dialog row
+//! refuses an in-place rewrite, and readers see whole transactions while
+//! the writer commits.
 //!
 //! The reopen is still warm, so it is not G7 evidence, and there is no D3
 //! ingest workload yet. These are not scoring runs.
@@ -62,6 +65,7 @@ use std::sync::Barrier;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod bodies;
+mod g1;
 mod package;
 
 use bodies::Bodies;
@@ -126,7 +130,8 @@ pub enum Isolation {
     /// use this.
     Child,
     /// This process, for the example's own tests, where the executable is
-    /// the test runner.
+    /// the test runner (so no binary constructs it).
+    #[cfg_attr(not(test), allow(dead_code))]
     InProcess,
 }
 
@@ -422,10 +427,12 @@ fn workload(
 
     // Dialogs are the verbatim record and refuse edits (#1616), so updates
     // and deletes take the other memories.
-    let mut editable = Vec::new();
+    let (mut editable, mut dialog) = (Vec::new(), None);
     for id in &ids {
         if testing::memory_text(&store, id, "category")?.as_deref() != Some(DIALOG) {
             editable.push(id.clone());
+        } else if dialog.is_none() {
+            dialog = Some(id.clone());
         }
     }
     let pick = |rng: &mut Rng| ids[rng.below(ids.len())].clone();
@@ -544,6 +551,19 @@ fn workload(
         summary(times)
     };
     report.insert("delete".into(), delete);
+
+    // G1's checks beyond the port suites, on this candidate.
+    let rewrite = match &dialog {
+        Some(id) => g1::dialog_rewrite_refused(&store, id)?,
+        None => skipped("no dialog rows"),
+    };
+    report.insert(
+        "g1".into(),
+        json!({
+            "dialog_rewrite": rewrite,
+            "whole_transactions": g1::readers_see_whole_transactions(&db, &store)?,
+        }),
+    );
 
     drop(store);
     backup_and_restore(candidate, db, &bodies, dir, report, isolation)
