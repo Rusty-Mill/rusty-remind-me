@@ -6,15 +6,16 @@ Dated entries, newest first. One entry per merged pull request.
 
 ### Added
 - `store_bench` takes a dataset: `<n>` synthetic memories as before, `d1:<backup>` or `d2:<backup>`.
-  - **D1:** a copy of a `manual-*.engine` backup is opened as an engine store, and every memory (tombstones included), chunk vector, entity (with its `node_id`), memory-entity link, relation, reference and the embedding identity are written into the candidate through its ports. Dialog bodies go to the blob store with a head and a link (D50, D51). The backup itself is never opened, and the copy is removed once loaded.
-  - **D2:** D1 grown to 75,000 memories with synthetic ones, their seeded vectors written straight to their chunks so the store's recorded embedding identity stays the real model's.
-  - Queries on D1 and D2 are real: a sampled memory's leading words, with that memory's stored vector as the query vector.
-- **Cold open (G7):** after the restore, a child process opens the run's store and answers one hybrid search, timed from its spawn to its first line. With `R3_DROP_CACHES=1` the page cache is dropped first, and the run fails if it cannot be. The child then idles 2 s and reports its resident memory (`rss_idle_mb`, the G5 baseline on D1).
+  - **D1:** a private copy of a `manual-*.engine` backup is opened as any node opens its store, and every memory (tombstones included), chunk vector, entity (with its `node_id`), memory-entity link, relation, reference and the embedding identity are written into the candidate through its ports. Dialog bodies go to the blob store with a head and a link (D50, D51). The backup itself is never opened. The copy refuses anything but plain files and directories before writing, is private to the user, and is removed on every exit. A backup and a run root that overlap are refused.
+  - **Parity:** before any timing, the candidate is compared with the opened source row by row (each memory as the loader writes it, each stored graph and chunk row, each reference, the embedding identity); any difference fails the run.
+  - **D2:** D1 grown to 75,000 memories with synthetic ones, their seeded vectors written straight to their chunks; refused when the store's vectors are not 1024-dim.
+  - Queries on D1 and D2 are document-derived and serve timing only, not G2: a sampled memory's leading words with its stored vector, each text used once. Timed adds and the loaded writer keep the inherited embedding identity, which the run checks is unchanged at the end.
+- **Cold open (G7) and idle memory (G5 baseline):** right after the dataset is loaded, before any workload changes the store, a child process opens it and answers one hybrid search, timed from spawn to its first line. The query reaches the child on stdin. With the store still open the child idles 2 s and reports its resident and peak memory; the parent's workload peak is reported separately. Each read of the child is bounded, and a child that overruns or fails is killed and reaped. `R3_DROP_CACHES=1` drops the page cache first (refused under CI), and the report says whether it was dropped. The report carries the run's cgroup `memory.max` and `cpu.max`; `R3_REQUIRE_CGROUP=1` fails a run without remindme's limits.
+- Run directories are private and carry a marker; the `cold` child refuses any other directory, and the `cold` and `restore` children refuse a configured model or cloud upload as the parent does.
 - `open` mode is synthetic only. The report's `n` is now `dataset` and `memories`.
 
 ### Tests
-- D1 loads every row kind into the engine and SQLite and completes with a matched isolated restore and a cold open; the backup is left alone. D2 grows to its total. A missing backup is refused before any directory is made.
-- Smoke runs with D1 taken from a 2,000-memory synthetic engine store pass on all three candidates. These are not scores.
+- D1 loads every row kind into the engine and SQLite with parity matched, real adds timed, the embedding identity unchanged, a matched isolated restore and a cold open; the backup is left alone. D2 grows to its total. A missing backup, and a root overlapping the backup, are refused before anything is written. Parity catches a row changed after the load. A shared query text is used once. A copy refuses a symlink before writing and is private. Only remindme's cgroup limits match.
 
 ## 2026-11-22 — Store benchmark: same body layout, isolated G8 restore, overlap and G1 checks (Millwright R3, Mill Board #1618)
 

@@ -61,6 +61,7 @@
 //! nothing leaves the machine.
 
 use remind_me_core::db::backend::Backend;
+use remind_me_core::db::vectors::Vectors;
 use remind_me_core::db::{queries, Store};
 use remind_me_core::embedder::{EmbedError, EmbedRole, Embedder, EmbeddingIdentity};
 use remind_me_core::models::{
@@ -78,6 +79,7 @@ use std::sync::Barrier;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod bodies;
+mod cold;
 mod d1;
 mod g1;
 mod package;
@@ -222,6 +224,18 @@ impl Dataset {
 pub fn run(candidates: &[Candidate]) -> Result<()> {
     let names: Vec<&str> = candidates.iter().map(|c| c.name).collect();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // The G7 child: `cold <backend> <run dir>`, its query on stdin.
+    if let [mode, backend, dir] = args.as_slice() {
+        if mode == "cold" {
+            let candidate = find(candidates, backend)?;
+            refuse_model_config()?;
+            let dir = Path::new(dir);
+            if !dir.join(RUN_MARK).is_file() {
+                return Err(format!("{} is not a store_bench run directory", dir.display()).into());
+            }
+            return cold::cold_child(candidate, dir);
+        }
+    }
     let [mode, backend, n, dir] = args.as_slice() else {
         return Err(format!(
             "usage: store_bench <bench|open> <{}> <n|d1:<backup>|d2:<backup>> <dir>",
@@ -229,18 +243,13 @@ pub fn run(candidates: &[Candidate]) -> Result<()> {
         )
         .into());
     };
-    let Some(&candidate) = candidates.iter().find(|c| c.name == backend) else {
-        return Err(format!("unknown backend {backend:?}; one of {names:?}").into());
-    };
+    let candidate = find(candidates, backend)?;
     // The G8 child (D52): `restore <backend> <package> <fresh dir>`.
     if mode == "restore" {
+        refuse_model_config()?;
         let restored = restore(candidate, Path::new(n), Path::new(dir))?;
         println!("{}", serde_json::to_string(&restored)?);
         return Ok(());
-    }
-    // The G7 child: `cold <backend> <run dir> <query file>`.
-    if mode == "cold" {
-        return cold_child(candidate, Path::new(n), Path::new(dir));
     }
     let mode = Mode::parse(mode)?;
     let report = measure(
@@ -253,6 +262,19 @@ pub fn run(candidates: &[Candidate]) -> Result<()> {
     println!("{}", Value::Object(report));
     Ok(())
 }
+
+/// The candidate named `name`.
+fn find(candidates: &[Candidate], name: &str) -> Result<Candidate> {
+    let names: Vec<&str> = candidates.iter().map(|c| c.name).collect();
+    candidates
+        .iter()
+        .find(|c| c.name == name)
+        .copied()
+        .ok_or_else(|| format!("unknown backend {name:?}; one of {names:?}").into())
+}
+
+/// The file every run directory holds, so a child refuses any other.
+const RUN_MARK: &str = ".store_bench_run";
 
 /// One run of `candidate` on `dataset` in a new directory under `root`;
 /// its report. The dataset and the environment are checked before the
@@ -273,6 +295,16 @@ pub fn measure(
             }
             if !backup.is_dir() {
                 return Err(format!("backup {} is not a directory", backup.display()).into());
+            }
+            let backup = backup.canonicalize()?;
+            let root = std::path::absolute(root)?;
+            if backup.starts_with(&root) || root.starts_with(&backup) {
+                return Err(format!(
+                    "the run root {} and the backup {} overlap",
+                    root.display(),
+                    backup.display()
+                )
+                .into());
             }
         }
     }
@@ -329,7 +361,8 @@ fn fresh_run_dir(root: &Path, stem: &str) -> Result<PathBuf> {
     std::fs::create_dir_all(root)?;
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let dir = root.join(format!("{stem}-{}-{nanos}", std::process::id()));
-    std::fs::create_dir(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    package::private_dir(&dir)?;
+    std::fs::write(dir.join(RUN_MARK), b"")?;
     Ok(dir)
 }
 
@@ -479,13 +512,22 @@ fn workload(
     let corpus = Corpus::new();
     let mut rng = Rng(0x5eed);
     let bodies = Bodies::new(dir.join("blobs"));
-    let Seeded { ids, entities } = {
+    let Seeded {
+        ids,
+        entities,
+        pairs,
+        identity,
+    } = {
         let db = candidate.open(dir)?;
         seed(&db, dataset, dir, &bodies, &corpus, &mut rng, report)?
     };
+    let real = !matches!(dataset, Dataset::Synthetic(_));
     let n = ids.len();
     report.insert("memories".into(), json!(n));
     report.insert("disk_mb_after_fill".into(), disk(dir)?);
+    // G7 and the idle baseline on the store exactly as the dataset left it.
+    let cold = cold::cold_open(candidate, dir, &pairs[0], isolation)?;
+    report.insert("cold_open".into(), cold);
 
     let started = Instant::now();
     let db = candidate.open(dir)?;
@@ -536,21 +578,9 @@ fn workload(
         })?,
     );
 
-    // Query vectors are made before any timed span, so the searches time
-    // retrieval, not embedding: seeded for synthetic data, the store's own
-    // for D1 and D2.
-    let pairs = match dataset {
-        Dataset::Synthetic(_) => (0..SAMPLES)
-            .map(|i| {
-                let text = query(&corpus, &mut rng, i);
-                let vector = unit_vector(&text);
-                (text, vector)
-            })
-            .collect(),
-        _ => d1::queries(&store, &ids, SAMPLES, |len| rng.below(len))?,
-    };
+    // Query vectors were made before any timed span (in `seed`), so the
+    // searches time retrieval, not embedding.
     let queries_: Vec<String> = pairs.iter().map(|(t, _)| t.clone()).collect();
-    let cold_query = pairs[0].clone();
     let vectors_ = Precomputed(pairs.into_iter().collect());
     let search = |i: usize, vectors: Option<&Precomputed>| -> Result<()> {
         let input: MemorySearchInput = serde_json::from_value(json!({ "query": queries_[i] }))?;
@@ -605,9 +635,18 @@ fn workload(
     // The same readers, inputs and searches with and without the writer,
     // so the two differ only by the writer (D54).
     let add_one = |s: &Store<'_>, rng: &mut Rng| -> Result<()> {
-        fill(s, &bodies, 1, &corpus, rng)?;
+        if real {
+            grow(s, &bodies, 1, &corpus, rng)?;
+        } else {
+            fill(s, &bodies, 1, &corpus, rng)?;
+        }
         Ok(())
     };
+    if real {
+        // Single adds on the real store, each with its vector written as
+        // `grow` does, so the inherited embedding identity is kept.
+        report.insert("add".into(), timed(|_| add_one(&store, &mut rng))?);
+    }
     report.insert(
         "search_hybrid_readers_idle".into(),
         readers(&db, &store, &queries_, &vectors_, None)?,
@@ -652,17 +691,59 @@ fn workload(
         }),
     );
 
+    if real {
+        let now = Vectors::new(&store).meta()?;
+        if now != identity {
+            return Err(
+                format!("the embedding identity changed: {identity:?} became {now:?}").into(),
+            );
+        }
+        report.insert(
+            "embedding_identity".into(),
+            json!({ "unchanged": true, "dim": identity_dim(&identity) }),
+        );
+    }
     drop(store);
-    backup_and_restore(candidate, db, &bodies, dir, report, isolation)?;
-    let cold = cold_open(candidate, dir, &cold_query, isolation)?;
-    report.insert("cold_open".into(), cold);
-    Ok(())
+    backup_and_restore(candidate, db, &bodies, dir, report, isolation)
 }
 
 /// What a seeded store holds that the workloads pick from.
 struct Seeded {
     ids: Vec<String>,
     entities: Vec<String>,
+    /// Query texts and their vectors, each text once.
+    pairs: Vec<(String, Vec<f32>)>,
+    /// The loaded embedding identity (empty for synthetic data).
+    identity: Vec<(String, String)>,
+}
+
+/// `SAMPLES` distinct synthetic queries, each with its seeded vector, in
+/// the order drawn.
+fn synthetic_queries(corpus: &Corpus, rng: &mut Rng) -> Result<Vec<(String, Vec<f32>)>> {
+    let mut seen = std::collections::HashSet::new();
+    let mut pairs = Vec::with_capacity(SAMPLES);
+    for i in 0..SAMPLES * 20 {
+        if pairs.len() == SAMPLES {
+            break;
+        }
+        let text = query(corpus, rng, i);
+        if seen.insert(text.clone()) {
+            let vector = unit_vector(&text);
+            pairs.push((text, vector));
+        }
+    }
+    if pairs.len() < SAMPLES {
+        return Err(format!("only {} distinct queries drawn", pairs.len()).into());
+    }
+    Ok(pairs)
+}
+
+/// The dimension an embedding identity records, if it does.
+fn identity_dim(identity: &[(String, String)]) -> Option<usize> {
+    identity
+        .iter()
+        .find(|(k, _)| k == "dim")
+        .and_then(|(_, v)| v.parse().ok())
 }
 
 /// Load `dataset` into `db`, reporting how long it took and what it wrote.
@@ -690,7 +771,13 @@ fn seed(
             );
             drop(store);
             let entities = graph(db, &ids, rng)?;
-            return Ok(Seeded { ids, entities });
+            let pairs = synthetic_queries(corpus, rng)?;
+            return Ok(Seeded {
+                ids,
+                entities,
+                pairs,
+                identity: Vec::new(),
+            });
         }
         Dataset::D1(backup) => (backup, None),
         Dataset::D2 { backup, total } => (backup, Some(*total)),
@@ -698,8 +785,15 @@ fn seed(
     let loaded = d1::load(backup, &dir.with_extension("d1-source"), &store, bodies)?;
     report.insert("load_s".into(), json!(started.elapsed().as_secs_f64()));
     report.insert("loaded".into(), Value::Object(loaded.counts));
+    report.insert("parity".into(), loaded.parity);
+    let dim = identity_dim(&loaded.identity);
     let mut ids = loaded.ids;
     if let Some(total) = total {
+        if dim.is_some_and(|d| d != DIM) {
+            return Err(
+                format!("D2's synthetic vectors are {DIM}-dim; the store's are {dim:?}").into(),
+            );
+        }
         let started = Instant::now();
         let grown = grow(&store, bodies, total.saturating_sub(ids.len()), corpus, rng)?;
         report.insert(
@@ -708,9 +802,25 @@ fn seed(
         );
         ids.extend(grown);
     }
+    let pairs = d1::queries(&store, &ids, SAMPLES, |len| rng.below(len))?;
+    if let Some(d) = dim {
+        if let Some((text, v)) = pairs.iter().find(|(_, v)| v.len() != d) {
+            return Err(format!(
+                "query {text:?} has a {}-dim vector; the store's are {d}",
+                v.len()
+            )
+            .into());
+        }
+    }
+    report.insert(
+        "queries".into(),
+        json!("document-derived, each text once: timing only, not relevance (G2)"),
+    );
     Ok(Seeded {
         ids,
         entities: loaded.entities,
+        pairs,
+        identity: loaded.identity,
     })
 }
 
@@ -734,102 +844,10 @@ fn grow(
         }
         let vector = unit_vector(&input.content);
         let id = queries::add_memory(store, input)?.id;
-        remind_me_core::db::vectors::Vectors::new(store).put(&id, 0, &d1::to_bytes(&vector))?;
+        Vectors::new(store).put(&id, 0, &d1::to_bytes(&vector))?;
         ids.push(id);
     }
     Ok(ids)
-}
-
-/// How long the store takes from a process's start to its first answered
-/// query (G7), and the process's resident memory once idle after it (the
-/// G5 baseline on D1). In a child process (scoring runs), timed by this
-/// parent from spawn to the child's first line; with
-/// `R3_DROP_CACHES=1` the page cache is dropped first, and the run fails
-/// if it cannot be. In process (the example's own tests), the open and
-/// query alone, with no cache drop.
-fn cold_open(
-    candidate: Candidate,
-    dir: &Path,
-    query: &(String, Vec<f32>),
-    isolation: Isolation,
-) -> Result<Value> {
-    let query_file = dir.with_extension("cold-query.json");
-    std::fs::write(&query_file, serde_json::to_vec(query)?)?;
-    if isolation == Isolation::InProcess {
-        let t = Instant::now();
-        let first = open_and_query(candidate, dir, &query_file)?;
-        return Ok(json!({
-            "ms": millis(t.elapsed()),
-            "isolation": "InProcess",
-            "page_cache_dropped": false,
-            "child": first,
-        }));
-    }
-    let dropped = std::env::var("R3_DROP_CACHES").is_ok_and(|v| v == "1");
-    if dropped {
-        drop_page_cache()?;
-    }
-    use std::io::{BufRead, BufReader};
-    use std::process::{Command, Stdio};
-    let t = Instant::now();
-    let mut child = Command::new(std::env::current_exe()?)
-        .args(["cold", candidate.name])
-        .arg(dir)
-        .arg(&query_file)
-        .stdout(Stdio::piped())
-        .spawn()?;
-    let mut lines = BufReader::new(child.stdout.take().ok_or("cold child has no stdout")?).lines();
-    let first = lines.next().ok_or("cold child printed nothing")??;
-    let ms = millis(t.elapsed());
-    let idle = lines.next().ok_or("cold child printed no idle line")??;
-    let status = child.wait()?;
-    if !status.success() {
-        return Err(format!("cold child failed: {status}").into());
-    }
-    Ok(json!({
-        "ms": ms,
-        "isolation": "Child",
-        "page_cache_dropped": dropped,
-        "child": serde_json::from_str::<Value>(&first)?,
-        "idle": serde_json::from_str::<Value>(&idle)?,
-    }))
-}
-
-/// How long a resident process is left idle before its memory is read.
-const IDLE_SETTLE: Duration = Duration::from_secs(2);
-
-/// The G7 child: open the store, answer one hybrid search and print a
-/// line; then idle and print its resident memory.
-fn cold_child(candidate: Candidate, dir: &Path, query_file: &Path) -> Result<()> {
-    let first = open_and_query(candidate, dir, query_file)?;
-    println!("{first}");
-    std::thread::sleep(IDLE_SETTLE);
-    println!("{}", json!({ "rss_idle_mb": rss_mb() }));
-    Ok(())
-}
-
-/// Open the store in `dir` and run one hybrid search for the query in
-/// `query_file`; the times, in ms.
-fn open_and_query(candidate: Candidate, dir: &Path, query_file: &Path) -> Result<Value> {
-    let t = Instant::now();
-    let (text, vector): (String, Vec<f32>) = serde_json::from_slice(&std::fs::read(query_file)?)?;
-    let db = candidate.open(dir)?;
-    let open_ms = millis(t.elapsed());
-    let input: MemorySearchInput = serde_json::from_value(json!({ "query": text }))?;
-    let vectors_ = Precomputed([(text, vector)].into_iter().collect());
-    let t = Instant::now();
-    searched(&db.store(), &input, Some(&vectors_))?;
-    Ok(json!({ "open_ms": open_ms, "first_query_ms": millis(t.elapsed()) }))
-}
-
-/// Drop the page cache (Linux, root), so the next open reads from disk.
-fn drop_page_cache() -> Result<()> {
-    let synced = std::process::Command::new("sync").status()?;
-    if !synced.success() {
-        return Err("sync failed before dropping the page cache".into());
-    }
-    std::fs::write("/proc/sys/vm/drop_caches", "3")
-        .map_err(|e| format!("R3_DROP_CACHES=1 but the page cache cannot be dropped: {e}").into())
 }
 
 /// One search, keyword-only (`vectors` is `None`) or hybrid, that fails

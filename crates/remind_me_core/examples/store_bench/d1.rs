@@ -8,11 +8,22 @@
 //! ports, so each candidate stores the same rows its own way. Dialog
 //! bodies follow R3's layout (D50, D51): the body goes to the blob store
 //! and the row keeps the head and a link. The backup itself is never
-//! opened, only the copy, which is removed once loaded.
+//! opened, only a private copy (refused if it holds anything but plain
+//! files and directories), removed on every exit.
 //!
-//! Queries on D1 are real: a sampled memory's leading words, with that
-//! memory's stored vector as the query vector, so no model is needed and
-//! the vectors searched have the store's own distribution.
+//! The copy is opened as any node opens its store, which applies that
+//! open's normal housekeeping (the sync flag, the outbox prune, emptying
+//! tombstones' text); what is loaded is that opened source. Before any
+//! timing, a parity check compares the candidate with it row by row:
+//! every memory (a dialog with its body stashed), every stored entity,
+//! link, relation and chunk row, every reference and the embedding
+//! identity. Any difference fails the run.
+//!
+//! Queries on D1 are real but serve timing only, not relevance (G2): a
+//! sampled memory's leading words, with that memory's stored vector as
+//! the query vector, so no model is needed and the vectors searched have
+//! the store's own distribution. A text two memories share is used once,
+//! so each query text names exactly one vector.
 
 use remind_me_core::db::derived::{rebuild_indexes, Origin};
 use remind_me_core::db::engine::EngineTables;
@@ -28,7 +39,7 @@ use serde_json::{Map, Value};
 use std::path::Path;
 
 use super::bodies::Bodies;
-use super::package::copy_dir;
+use super::package::{copy_dir, row_hash};
 use super::{Result, DIALOG};
 
 /// Memories read from the source per batch.
@@ -46,6 +57,10 @@ pub struct Loaded {
     pub entities: Vec<String>,
     /// Rows written, by kind, for the report.
     pub counts: Map<String, Value>,
+    /// The parity check's result.
+    pub parity: Value,
+    /// The embedding identity loaded, which no run may change.
+    pub identity: Vec<(String, String)>,
 }
 
 /// Load the backup at `backup` into `target`, by way of a copy at
@@ -54,17 +69,109 @@ pub fn load(backup: &Path, scratch: &Path, target: &Store<'_>, bodies: &Bodies) 
     if !backup.is_dir() {
         return Err(format!("D1 backup {} is not a directory", backup.display()).into());
     }
+    if scratch.exists() {
+        return Err(format!("D1 copy {} already exists", scratch.display()).into());
+    }
+    let _scratch = Scratch(scratch);
     copy_dir(backup, scratch, &[])?;
-    let loaded = {
-        let source = Database::open_backend(Box::new(EngineTables::open(scratch)?), None)?;
-        let store = source.store();
-        let loaded = copy_rows(&store, target, bodies)?;
-        drop(store);
-        loaded
-    };
-    std::fs::remove_dir_all(scratch)?;
+    let source = Database::open_backend(Box::new(EngineTables::open(scratch)?), None)?;
+    let store = source.store();
+    let mut loaded = copy_rows(&store, target, bodies)?;
     rebuild_indexes(target)?;
+    loaded.parity = parity(&store, target, bodies)?;
+    loaded.identity = Vectors::new(&store).meta()?;
     Ok(loaded)
+}
+
+/// The private copy, removed when the load ends, however it ends.
+struct Scratch<'p>(&'p Path);
+
+impl Drop for Scratch<'_> {
+    fn drop(&mut self) {
+        if self.0.exists() {
+            if let Err(e) = std::fs::remove_dir_all(self.0) {
+                eprintln!(
+                    "store_bench: cannot remove the D1 copy {}: {e}",
+                    self.0.display()
+                );
+            }
+        }
+    }
+}
+
+/// Compare `target` with `source` row by row: each memory as the loader
+/// writes it, each stored graph and chunk row, each reference and the
+/// embedding identity. The counts compared, or an error naming what
+/// differs.
+fn parity(source: &Store<'_>, target: &Store<'_>, bodies: &Bodies) -> Result<Value> {
+    let mut differ = Vec::new();
+    let ids = testing::memory_ids(source)?;
+    if testing::memory_ids(target)? != ids {
+        differ.push("memory ids".to_string());
+    }
+    let mut memories = 0;
+    for chunk in ids.chunks(BATCH) {
+        let expected = Memories::new(source).get_many(chunk)?;
+        let found = Memories::new(target).get_many(chunk)?;
+        for (want, got) in expected.into_iter().zip(found) {
+            if stashed(row(want), bodies)? != row(got) {
+                memories += 1;
+            }
+        }
+    }
+    if memories > 0 {
+        differ.push(format!("{memories} memories"));
+    }
+    let mut counts = Map::new();
+    for table in [
+        Table::Entities,
+        Table::MemoryEntities,
+        Table::EntityRelations,
+        Table::VecChunks,
+    ] {
+        let rows = |store: &Store<'_>| -> Result<Vec<String>> {
+            let mut hashes: Vec<String> = testing::stored_rows(store, table)?
+                .iter()
+                .map(row_hash)
+                .collect();
+            hashes.sort();
+            Ok(hashes)
+        };
+        let want = rows(source)?;
+        if rows(target)? != want {
+            differ.push(format!("{table:?} rows"));
+        }
+        counts.insert(format!("{table:?}"), want.len().into());
+    }
+    let references = |store: &Store<'_>| -> Result<Vec<String>> {
+        let mut all = Vec::new();
+        for chunk in ids.chunks(BATCH) {
+            for r in References::new(store).for_memories(chunk)? {
+                all.push(format!(
+                    "{}|{}|{}|{}|{:?}|{}",
+                    r.id, r.memory_id, r.kind, r.value, r.label, r.created_at
+                ));
+            }
+        }
+        all.sort();
+        Ok(all)
+    };
+    if references(target)? != references(source)? {
+        differ.push("references".into());
+    }
+    if Vectors::new(target).meta()? != Vectors::new(source).meta()? {
+        differ.push("embedding identity".into());
+    }
+    if !differ.is_empty() {
+        return Err(format!(
+            "D1 parity: the candidate differs from the source in {}",
+            differ.join(", ")
+        )
+        .into());
+    }
+    counts.insert("memories".into(), ids.len().into());
+    counts.insert("matched".into(), true.into());
+    Ok(Value::Object(counts))
 }
 
 /// Every row D1 covers, from `source` into `target`.
@@ -157,6 +264,8 @@ fn copy_rows(source: &Store<'_>, target: &Store<'_>, bodies: &Bodies) -> Result<
         ids,
         entities,
         counts,
+        parity: Value::Null,
+        identity: Vec::new(),
     })
 }
 
@@ -237,7 +346,8 @@ pub fn queries(
     count: usize,
     mut pick: impl FnMut(usize) -> usize,
 ) -> Result<Vec<(String, Vec<f32>)>> {
-    let mut found = Vec::with_capacity(count);
+    let mut found: Vec<(String, Vec<f32>)> = Vec::with_capacity(count);
+    let mut seen = std::collections::HashSet::new();
     let mut tries = 0;
     while found.len() < count && tries < count * 20 && !ids.is_empty() {
         tries += 1;
@@ -251,10 +361,11 @@ pub fn queries(
             .filter(|w| w.chars().all(char::is_alphanumeric))
             .take(QUERY_WORDS)
             .collect();
-        if words.is_empty() {
+        let text = words.join(" ");
+        if words.is_empty() || !seen.insert(text.clone()) {
             continue;
         }
-        found.push((words.join(" "), floats(&chunk.embedding)));
+        found.push((text, floats(&chunk.embedding)));
     }
     if found.len() < count {
         return Err(format!("only {} of {count} queries found in the store", found.len()).into());
@@ -294,4 +405,85 @@ fn bytes(row: &Map<String, Value>) -> Result<Vec<u8>> {
                 .ok_or_else(|| "embedding byte out of range".into())
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use remind_me_core::db::queries;
+    use remind_me_core::db::sqlite::SqliteTables;
+    use remind_me_core::models::MemoryAddInput;
+
+    fn engine() -> Database {
+        Database::open_backend(Box::new(EngineTables::open_temporary().unwrap()), None).unwrap()
+    }
+
+    fn add(store: &Store<'_>, content: &str, category: &str) -> String {
+        let input = MemoryAddInput {
+            content: content.into(),
+            category: category.into(),
+            ..Default::default()
+        };
+        let id = queries::add_memory(store, input).unwrap().id;
+        Vectors::new(store)
+            .put(&id, 0, &to_bytes(&[0.5, 0.5]))
+            .unwrap();
+        id
+    }
+
+    /// A loaded copy passes parity; a row changed afterwards fails it.
+    #[test]
+    fn parity_catches_a_row_the_load_did_not_carry() {
+        let root = std::env::temp_dir().join(format!("d1_parity_{}", std::process::id()));
+        let bodies = Bodies::new(&root);
+        let (source, target) = (engine(), {
+            let tables = SqliteTables::open_in_memory().unwrap();
+            Database::open_backend(Box::new(tables), None).unwrap()
+        });
+        let (s, t) = (source.store(), target.store());
+        add(&s, "a fact worth keeping", "fact");
+        let dialog = add(&s, &"a long dialog body ".repeat(100), DIALOG);
+        copy_rows(&s, &t, &bodies).unwrap();
+        assert_eq!(parity(&s, &t, &bodies).unwrap()["matched"], true);
+        let stored = testing::memory_text(&t, &dialog, "content")
+            .unwrap()
+            .unwrap();
+        assert!(
+            stored.len() <= super::super::bodies::HEAD_BYTES,
+            "the dialog keeps its head only"
+        );
+        let fact = testing::memory_ids(&t)
+            .unwrap()
+            .into_iter()
+            .find(|id| *id != dialog)
+            .unwrap();
+        testing::set_memory_column(&t, &fact, "content", "changed").unwrap();
+        assert!(parity(&s, &t, &bodies).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Two memories sharing their leading words give one query, not two
+    /// texts overwriting one vector.
+    #[test]
+    fn a_shared_query_text_is_used_once() {
+        let db = engine();
+        let store = db.store();
+        let ids = [
+            add(&store, "same words here", "fact"),
+            add(&store, "same words here", "fact"),
+            add(&store, "other words", "fact"),
+        ];
+        let mut next = 0;
+        let pairs = queries(&store, &ids, 2, |len| {
+            next += 1;
+            (next - 1) % len
+        })
+        .unwrap();
+        let texts: Vec<&str> = pairs.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(texts, ["same words here", "other words"]);
+        assert!(
+            queries(&store, &ids, 3, |len| len - 1).is_err(),
+            "only two distinct"
+        );
+    }
 }

@@ -79,6 +79,9 @@ mod tests {
         assert!(!root.exists());
     }
 
+    /// Memories in the D1 fixture: enough for 500 distinct queries.
+    const FIXTURE: usize = 520;
+
     /// A small engine store backed up as `manual-*.engine`: D1's source.
     fn small_backup(root: &Path) -> std::path::PathBuf {
         use remind_me_core::db::derived::Origin;
@@ -96,17 +99,17 @@ mod tests {
         let db = Database::open_backend(Box::new(tables), Some(dir.join("memory.db"))).unwrap();
         let store = db.store();
         let mut ids = Vec::new();
-        for i in 0..30 {
+        for i in 0..FIXTURE {
             let input = MemoryAddInput {
                 content: format!(
                     "memory number {i} about rust storage engines and {}",
-                    "words ".repeat(i)
+                    "words ".repeat(i % 40)
                 ),
                 category: if i % 3 == 0 { "dialog" } else { "fact" }.into(),
                 ..Default::default()
             };
             let id = queries::add_memory(&store, input).unwrap().id;
-            let v: Vec<u8> = (0..4 * 8).map(|b| (b + i) as u8).collect();
+            let v: Vec<u8> = (0..4 * 8).map(|b| (b + i % 200) as u8).collect();
             Vectors::new(&store).put(&id, 0, &v).unwrap();
             ids.push(id);
         }
@@ -161,14 +164,14 @@ mod tests {
                 candidate,
                 Mode::Bench,
                 &dataset,
-                &root,
+                &root.join("runs"),
                 Isolation::InProcess,
             )
             .unwrap();
             let loaded = &report["loaded"];
             for (kind, n) in [
-                ("memories", 30),
-                ("vectors", 30),
+                ("memories", FIXTURE),
+                ("vectors", FIXTURE),
                 ("entities", 2),
                 ("links", 1),
                 ("relations", 1),
@@ -177,6 +180,12 @@ mod tests {
                 assert_eq!(loaded[kind], n, "{} {kind}", candidate.name);
             }
             assert_eq!(report["restore"]["matched"], true, "{}", candidate.name);
+            assert_eq!(report["parity"]["matched"], true, "{}", candidate.name);
+            assert_eq!(report["embedding_identity"]["unchanged"], true);
+            assert!(
+                report["add"]["count"].as_u64().unwrap() > 0,
+                "real adds timed"
+            );
             assert!(report["cold_open"]["child"]["first_query_ms"].is_number());
         }
         assert!(backup.is_dir(), "the backup itself is left alone");
@@ -189,10 +198,20 @@ mod tests {
         let root = std::env::temp_dir().join(format!("store_bench_d2_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let backup = small_backup(&root);
-        let dataset = Dataset::D2 { backup, total: 50 };
-        let report = measure(ENGINE, Mode::Bench, &dataset, &root, Isolation::InProcess).unwrap();
+        let dataset = Dataset::D2 {
+            backup,
+            total: FIXTURE + 20,
+        };
+        let report = measure(
+            ENGINE,
+            Mode::Bench,
+            &dataset,
+            &root.join("runs"),
+            Isolation::InProcess,
+        )
+        .unwrap();
         assert_eq!(report["grown"]["memories"], 20);
-        assert_eq!(report["memories"], 50);
+        assert_eq!(report["memories"], FIXTURE + 20);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -202,5 +221,21 @@ mod tests {
         let dataset = Dataset::D1(root.join("no-such-backup"));
         assert!(measure(ENGINE, Mode::Bench, &dataset, &root, Isolation::InProcess).is_err());
         assert!(!root.exists());
+    }
+
+    /// A run root inside the backup, or a backup inside the root, is
+    /// refused before anything is written.
+    #[test]
+    fn a_root_overlapping_the_backup_is_refused() {
+        let root = std::env::temp_dir().join(format!("store_bench_overlap_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let backup = small_backup(&root);
+        let inside = backup.join("runs");
+        let dataset = Dataset::D1(backup.clone());
+        for runs in [&root, &inside] {
+            assert!(measure(ENGINE, Mode::Bench, &dataset, runs, Isolation::InProcess).is_err());
+        }
+        assert!(!inside.exists());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
