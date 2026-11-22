@@ -174,8 +174,8 @@ impl<'c> WikiIndex<'c> {
 
 /// The behaviour every [`WikiStore`] must show, run against each backend by
 /// [`wiki_conformance`] (ADR-0035).
-#[cfg(test)]
-pub(crate) mod conformance {
+#[doc(hidden)]
+pub mod conformance {
     use super::WikiStore;
     use crate::wiki::WikiPage;
 
@@ -193,7 +193,7 @@ pub(crate) mod conformance {
         }
     }
 
-    pub(crate) fn an_unbacked_write_keeps_the_cached_mtime(wiki: &mut dyn WikiStore) {
+    pub fn an_unbacked_write_keeps_the_cached_mtime(wiki: &mut dyn WikiStore) {
         wiki.upsert(&page("a", 42.0, T1)).unwrap();
         wiki.upsert_unbacked("a", "A", "new", "", T2).unwrap();
         wiki.upsert_unbacked("b", "B", "body", "", T2).unwrap();
@@ -203,7 +203,7 @@ pub(crate) mod conformance {
         assert_eq!(wiki.get("b").unwrap().unwrap().mtime, 0.0);
     }
 
-    pub(crate) fn remove_takes_the_links_and_reports_a_missing_page(wiki: &mut dyn WikiStore) {
+    pub fn remove_takes_the_links_and_reports_a_missing_page(wiki: &mut dyn WikiStore) {
         wiki.upsert(&page("a", 1.0, T1)).unwrap();
         wiki.replace_links(
             "a",
@@ -226,14 +226,14 @@ pub(crate) mod conformance {
         assert!(wiki.get("a").unwrap().is_none());
     }
 
-    pub(crate) fn meta_round_trips_and_overwrites(wiki: &mut dyn WikiStore) {
+    pub fn meta_round_trips_and_overwrites(wiki: &mut dyn WikiStore) {
         assert_eq!(wiki.meta("k").unwrap(), None);
         wiki.set_meta("k", "1").unwrap();
         wiki.set_meta("k", "2").unwrap();
         assert_eq!(wiki.meta("k").unwrap().as_deref(), Some("2"));
     }
 
-    pub(crate) fn listings_order_by_recency_then_title_ignoring_case(wiki: &mut dyn WikiStore) {
+    pub fn listings_order_by_recency_then_title_ignoring_case(wiki: &mut dyn WikiStore) {
         let titled = |slug: &str, title: &str, at: &str| WikiPage {
             title: title.to_string(),
             ..page(slug, 1.0, at)
@@ -261,9 +261,7 @@ pub(crate) mod conformance {
 
     /// The full-text index on one corpus: the matching pages, best first,
     /// with bracketed snippets, and a rewrite replacing a page's entry.
-    pub(crate) fn search_finds_and_ranks_pages_and_a_rewrite_replaces_the_entry(
-        wiki: &mut dyn WikiStore,
-    ) {
+    pub fn search_finds_and_ranks_pages_and_a_rewrite_replaces_the_entry(wiki: &mut dyn WikiStore) {
         let corpus = [
             ("ownership", "Ownership", "Rust ownership rules: each value has one owner. Borrowing lends it without moving."),
             ("borrowing", "Borrowing", "Borrowing and borrowing again: shared borrows and mutable borrows."),
@@ -319,7 +317,8 @@ pub(crate) mod conformance {
 
 /// One `#[test]` per [`conformance`] check, each on a fresh store from
 /// `$make`. A backend's adapter invokes it in its own test module.
-#[cfg(test)]
+#[doc(hidden)]
+#[macro_export]
 macro_rules! wiki_conformance {
     ($make:expr) => {
         use $crate::db::wiki::conformance;
@@ -346,8 +345,8 @@ macro_rules! wiki_conformance {
         }
     };
 }
-#[cfg(test)]
-pub(crate) use wiki_conformance;
+#[doc(hidden)]
+pub use crate::wiki_conformance;
 
 #[cfg(test)]
 mod tests {

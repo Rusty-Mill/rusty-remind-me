@@ -183,8 +183,8 @@ impl<'c> Feedback<'c> {
 /// Feedback hangs off memories, so a backend under test implements
 /// [`MemoryStore`](crate::db::memories::MemoryStore) too, and the checks seed
 /// memories through it.
-#[cfg(test)]
-pub(crate) mod conformance {
+#[doc(hidden)]
+pub mod conformance {
     use super::{FeedbackEvent, FeedbackStore, Importance, ReviewFilter};
     use crate::db::memories::{MemoryStore, NewMemory};
 
@@ -222,7 +222,7 @@ pub(crate) mod conformance {
     }
 
     /// Feedback and importance writes, and the review reads after each.
-    pub(crate) fn feedback_settles_a_memory<S: FeedbackStore + MemoryStore>(store: &mut S) {
+    pub fn feedback_settles_a_memory<S: FeedbackStore + MemoryStore>(store: &mut S) {
         for (id, weight, kind) in [
             ("heavy", 2.0, "note"),
             ("heavier", 3.0, "note"),
@@ -305,9 +305,7 @@ pub(crate) mod conformance {
         );
     }
 
-    pub(crate) fn review_needs_weight_or_a_durable_type<S: FeedbackStore + MemoryStore>(
-        store: &mut S,
-    ) {
+    pub fn review_needs_weight_or_a_durable_type<S: FeedbackStore + MemoryStore>(store: &mut S) {
         for (id, weight, kind) in [
             ("heavy", 2.0, "note"),
             ("fact", 0.5, "fact"),
@@ -341,7 +339,8 @@ pub(crate) mod conformance {
 
 /// One `#[test]` per [`conformance`] check, each on a fresh store from
 /// `$make`.
-#[cfg(test)]
+#[doc(hidden)]
+#[macro_export]
 macro_rules! feedback_conformance {
     ($make:expr) => {
         use $crate::db::feedback::conformance;
@@ -356,8 +355,8 @@ macro_rules! feedback_conformance {
         }
     };
 }
-#[cfg(test)]
-pub(crate) use feedback_conformance;
+#[doc(hidden)]
+pub use crate::feedback_conformance;
 
 #[cfg(test)]
 mod tests {

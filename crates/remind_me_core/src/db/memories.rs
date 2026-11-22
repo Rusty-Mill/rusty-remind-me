@@ -878,12 +878,12 @@ impl<'c> Memories<'c> {
 
 /// The behaviour every [`MemoryStore`] must show, run against each backend
 /// by [`memory_conformance`] (ADR-0035).
-#[cfg(test)]
-pub(crate) mod conformance {
+#[doc(hidden)]
+pub mod conformance {
     use super::{AccessInputs, Memory, MemoryEdit, MemoryStore, NewMemory};
     use serde_json::Value;
 
-    pub(crate) const NOW: &str = "2026-09-26T00:00:00+00:00";
+    pub const NOW: &str = "2026-09-26T00:00:00+00:00";
 
     /// The one memory `id`, which must exist.
     fn get<S: MemoryStore>(store: &S, id: &str) -> Memory {
@@ -892,7 +892,7 @@ pub(crate) mod conformance {
         found.remove(0)
     }
 
-    pub(crate) fn insert_refuses_a_taken_id_and_insert_or_ignore_reports_it<S: MemoryStore>(
+    pub fn insert_refuses_a_taken_id_and_insert_or_ignore_reports_it<S: MemoryStore>(
         store: &mut S,
     ) {
         let row = NewMemory::new("a", "first", NOW);
@@ -904,7 +904,7 @@ pub(crate) mod conformance {
         assert_eq!(get(store, "a").content, "first");
     }
 
-    pub(crate) fn a_synced_overwrite_keeps_created_at_and_the_chunk_position<S: MemoryStore>(
+    pub fn a_synced_overwrite_keeps_created_at_and_the_chunk_position<S: MemoryStore>(
         store: &mut S,
     ) {
         store
@@ -932,9 +932,7 @@ pub(crate) mod conformance {
         assert_eq!(a.tags, ["peer"]);
     }
 
-    pub(crate) fn access_inputs_skips_unknown_ids_and_takes_an_empty_list<S: MemoryStore>(
-        store: &mut S,
-    ) {
+    pub fn access_inputs_skips_unknown_ids_and_takes_an_empty_list<S: MemoryStore>(store: &mut S) {
         store.insert(&NewMemory::new("a", "x", NOW)).unwrap();
 
         assert!(store.access_inputs(&[]).unwrap().is_empty());
@@ -953,7 +951,7 @@ pub(crate) mod conformance {
     }
 
     /// `row` with every schema v32 column set to a value no default has.
-    pub(crate) fn with_every_v32_column(row: NewMemory) -> NewMemory {
+    pub fn with_every_v32_column(row: NewMemory) -> NewMemory {
         let text = |s: &str| Some(s.to_string());
         NewMemory {
             project: text("quokka"),
@@ -995,7 +993,7 @@ pub(crate) mod conformance {
     /// A row with every v32 column set reads back with every one as
     /// written, one with none set reads back the schema's defaults, and an
     /// edit writes only the columns it sets.
-    pub(crate) fn every_v32_column_reads_back_as_written<S: MemoryStore>(store: &mut S) {
+    pub fn every_v32_column_reads_back_as_written<S: MemoryStore>(store: &mut S) {
         let written = with_every_v32_column(NewMemory::new("ctx", "x", NOW));
         store.insert(&written).unwrap();
         store.insert(&NewMemory::new("plain", "y", NOW)).unwrap();
@@ -1050,7 +1048,8 @@ pub(crate) mod conformance {
 
 /// One `#[test]` per [`conformance`] check, each on a fresh store from
 /// `$make`.
-#[cfg(test)]
+#[doc(hidden)]
+#[macro_export]
 macro_rules! memory_conformance {
     ($make:expr) => {
         use $crate::db::memories::conformance;
@@ -1073,8 +1072,8 @@ macro_rules! memory_conformance {
         }
     };
 }
-#[cfg(test)]
-pub(crate) use memory_conformance;
+#[doc(hidden)]
+pub use crate::memory_conformance;
 
 #[cfg(test)]
 mod tests {

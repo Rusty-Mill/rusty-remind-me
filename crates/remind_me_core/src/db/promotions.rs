@@ -274,8 +274,8 @@ impl<'c> Promotions<'c> {
 /// under test implements [`MemoryStore`] and
 /// [`EntityStore`](crate::db::entities::EntityStore) too, and the checks
 /// seed through them.
-#[cfg(test)]
-pub(crate) mod conformance {
+#[doc(hidden)]
+pub mod conformance {
     use super::PromotionStore;
     use crate::db::curation::conformance::{seed_corpus, NOW};
     use crate::db::entities::EntityStore;
@@ -283,7 +283,7 @@ pub(crate) mod conformance {
 
     /// Every promotion read over the curation corpus, with promotions
     /// recorded across two rungs.
-    pub(crate) fn promotion_reads_see_the_corpus_as_the_rules_say<
+    pub fn promotion_reads_see_the_corpus_as_the_rules_say<
         S: PromotionStore + MemoryStore + EntityStore,
     >(
         store: &mut S,
@@ -380,7 +380,7 @@ pub(crate) mod conformance {
         assert_eq!(newest, ["f1", "f4", "f3"]);
     }
 
-    pub(crate) fn surviving_sources_counts_only_live_unsuperseded_sources<
+    pub fn surviving_sources_counts_only_live_unsuperseded_sources<
         S: PromotionStore + MemoryStore,
     >(
         store: &mut S,
@@ -407,7 +407,7 @@ pub(crate) mod conformance {
         );
     }
 
-    pub(crate) fn live_source_sensitivity_is_none_for_a_superseded_source<
+    pub fn live_source_sensitivity_is_none_for_a_superseded_source<
         S: PromotionStore + MemoryStore,
     >(
         store: &mut S,
@@ -442,7 +442,8 @@ pub(crate) mod conformance {
 
 /// One `#[test]` per [`conformance`] check, each on a fresh store from
 /// `$make`.
-#[cfg(test)]
+#[doc(hidden)]
+#[macro_export]
 macro_rules! promotion_conformance {
     ($make:expr) => {
         use $crate::db::promotions::conformance;
@@ -461,8 +462,8 @@ macro_rules! promotion_conformance {
         }
     };
 }
-#[cfg(test)]
-pub(crate) use promotion_conformance;
+#[doc(hidden)]
+pub use crate::promotion_conformance;
 
 #[cfg(test)]
 mod tests {

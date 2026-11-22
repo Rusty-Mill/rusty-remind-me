@@ -187,8 +187,8 @@ impl<'c> Sessions<'c> {
 
 /// The behaviour every [`SessionStore`] must show, run against each backend
 /// by [`session_conformance`] (ADR-0035).
-#[cfg(test)]
-pub(crate) mod conformance {
+#[doc(hidden)]
+pub mod conformance {
     use super::{SessionRecord, SessionStart, SessionStore};
 
     const T1: &str = "2026-09-26T00:00:00+00:00";
@@ -207,7 +207,7 @@ pub(crate) mod conformance {
         }
     }
 
-    pub(crate) fn a_repeated_start_keeps_the_first_beginning_and_fills_gaps(
+    pub fn a_repeated_start_keeps_the_first_beginning_and_fills_gaps(
         sessions: &mut dyn SessionStore,
     ) {
         assert!(sessions.get("s1").unwrap().is_none());
@@ -249,9 +249,7 @@ pub(crate) mod conformance {
         );
     }
 
-    pub(crate) fn end_sets_the_end_fields_and_reports_a_missing_session(
-        sessions: &mut dyn SessionStore,
-    ) {
+    pub fn end_sets_the_end_fields_and_reports_a_missing_session(sessions: &mut dyn SessionStore) {
         sessions.upsert_start(&start("s1", T1, None)).unwrap();
 
         assert!(sessions.end("s1", T2, Some("sha-end"), None).unwrap());
@@ -277,9 +275,7 @@ pub(crate) mod conformance {
         );
     }
 
-    pub(crate) fn recent_orders_newest_first_and_filters_by_project(
-        sessions: &mut dyn SessionStore,
-    ) {
+    pub fn recent_orders_newest_first_and_filters_by_project(sessions: &mut dyn SessionStore) {
         sessions.upsert_start(&start("a", T1, Some("p1"))).unwrap();
         sessions.upsert_start(&start("b", T3, Some("p2"))).unwrap();
         sessions.upsert_start(&start("c", T2, Some("p1"))).unwrap();
@@ -301,7 +297,8 @@ pub(crate) mod conformance {
 
 /// One `#[test]` per [`conformance`] check, each on a fresh store from
 /// `$make`. A backend's adapter invokes it in its own test module.
-#[cfg(test)]
+#[doc(hidden)]
+#[macro_export]
 macro_rules! session_conformance {
     ($make:expr) => {
         use $crate::db::sessions::conformance;
@@ -320,8 +317,8 @@ macro_rules! session_conformance {
         }
     };
 }
-#[cfg(test)]
-pub(crate) use session_conformance;
+#[doc(hidden)]
+pub use crate::session_conformance;
 
 #[cfg(test)]
 mod tests {

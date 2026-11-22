@@ -144,12 +144,12 @@ impl<'c> Revisions<'c> {
 /// Revisions hang off memories, so a backend under test implements
 /// [`MemoryStore`](crate::db::memories::MemoryStore) too, and the checks that
 /// need a memory seed it through that port.
-#[cfg(test)]
-pub(crate) mod conformance {
+#[doc(hidden)]
+pub mod conformance {
     use super::{HistoryStore, Tracked};
     use crate::db::memories::{MemoryStore, NewMemory};
 
-    pub(crate) const NOW: &str = "2026-09-27T12:00:00+00:00";
+    pub const NOW: &str = "2026-09-27T12:00:00+00:00";
 
     /// Add a live memory `id` with content `"x"`.
     fn add<S: MemoryStore>(store: &mut S, id: &str) {
@@ -172,9 +172,7 @@ pub(crate) mod conformance {
         }
     }
 
-    pub(crate) fn revisions_list_newest_first_and_belong_to_their_memory<S: HistoryStore>(
-        store: &mut S,
-    ) {
+    pub fn revisions_list_newest_first_and_belong_to_their_memory<S: HistoryStore>(store: &mut S) {
         let same_tick = "2026-09-27T00:00:01+00:00";
         store
             .insert("m1", &values("a"), "2026-09-27T00:00:00+00:00", None)
@@ -203,7 +201,7 @@ pub(crate) mod conformance {
         );
     }
 
-    pub(crate) fn delete_for_takes_only_that_memorys_revisions<S: HistoryStore>(store: &mut S) {
+    pub fn delete_for_takes_only_that_memorys_revisions<S: HistoryStore>(store: &mut S) {
         store.insert("m1", &values("a"), NOW, None).unwrap();
         store.insert("m2", &values("b"), NOW, None).unwrap();
         store.delete_for("m1").unwrap();
@@ -212,7 +210,7 @@ pub(crate) mod conformance {
         assert_eq!(store.list("m2", 10).unwrap().len(), 1);
     }
 
-    pub(crate) fn tombstones_lose_their_revisions<S: HistoryStore + MemoryStore>(store: &mut S) {
+    pub fn tombstones_lose_their_revisions<S: HistoryStore + MemoryStore>(store: &mut S) {
         add(store, "kept");
         add(store, "gone");
         for id in ["kept", "gone", "gone"] {
@@ -232,9 +230,7 @@ pub(crate) mod conformance {
         assert_eq!(store.list("kept", 10).unwrap().len(), 1);
     }
 
-    pub(crate) fn restore_writes_the_tracked_columns_back<S: HistoryStore + MemoryStore>(
-        store: &mut S,
-    ) {
+    pub fn restore_writes_the_tracked_columns_back<S: HistoryStore + MemoryStore>(store: &mut S) {
         add(store, "m");
         assert!(store.current("missing").unwrap().is_none());
         let before = store.current("m").unwrap().unwrap();
@@ -263,7 +259,8 @@ pub(crate) mod conformance {
 
 /// One `#[test]` per [`conformance`] check, each on a fresh store from
 /// `$make`.
-#[cfg(test)]
+#[doc(hidden)]
+#[macro_export]
 macro_rules! history_conformance {
     ($make:expr) => {
         use $crate::db::history::conformance;
@@ -286,8 +283,8 @@ macro_rules! history_conformance {
         }
     };
 }
-#[cfg(test)]
-pub(crate) use history_conformance;
+#[doc(hidden)]
+pub use crate::history_conformance;
 
 #[cfg(test)]
 mod tests {

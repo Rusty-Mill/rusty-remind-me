@@ -133,8 +133,8 @@ impl<'c> References<'c> {
 
 /// The behaviour every [`ReferenceStore`] must show, run against each
 /// backend by [`reference_conformance`] (ADR-0035).
-#[cfg(test)]
-pub(crate) mod conformance {
+#[doc(hidden)]
+pub mod conformance {
     use super::{MemoryReference, NewReference, ReferenceStore};
 
     const T1: &str = "2026-09-26T00:00:00+00:00";
@@ -166,7 +166,7 @@ pub(crate) mod conformance {
             .unwrap();
     }
 
-    pub(crate) fn round_trips_every_field(store: &mut dyn ReferenceStore) {
+    pub fn round_trips_every_field(store: &mut dyn ReferenceStore) {
         seed(store);
         assert_eq!(
             store.for_memory("m1").unwrap()[0],
@@ -181,7 +181,7 @@ pub(crate) mod conformance {
         );
     }
 
-    pub(crate) fn a_taken_id_is_refused(store: &mut dyn ReferenceStore) {
+    pub fn a_taken_id_is_refused(store: &mut dyn ReferenceStore) {
         seed(store);
         assert!(store
             .insert(&reference("r1", "m9", "url", "dup", T1))
@@ -189,7 +189,7 @@ pub(crate) mod conformance {
         assert!(store.for_memory("m9").unwrap().is_empty());
     }
 
-    pub(crate) fn reads_are_oldest_first(store: &mut dyn ReferenceStore) {
+    pub fn reads_are_oldest_first(store: &mut dyn ReferenceStore) {
         seed(store);
         assert_eq!(ids(store.for_memory("m1").unwrap()), ["r1", "r2"]);
         assert_eq!(
@@ -202,14 +202,14 @@ pub(crate) mod conformance {
         assert!(store.for_memories(&[]).unwrap().is_empty());
     }
 
-    pub(crate) fn find_matches_kind_and_value_exactly(store: &mut dyn ReferenceStore) {
+    pub fn find_matches_kind_and_value_exactly(store: &mut dyn ReferenceStore) {
         seed(store);
         assert_eq!(ids(store.find("issue", "o/r#1").unwrap()), ["r3", "r2"]);
         assert!(store.find("issue", "o/r#2").unwrap().is_empty());
         assert!(store.find("url", "o/r#1").unwrap().is_empty());
     }
 
-    pub(crate) fn delete_for_memory_counts_what_went(store: &mut dyn ReferenceStore) {
+    pub fn delete_for_memory_counts_what_went(store: &mut dyn ReferenceStore) {
         seed(store);
         assert_eq!(store.delete_for_memory("m1").unwrap(), 2);
         assert_eq!(store.delete_for_memory("m1").unwrap(), 0);
@@ -220,7 +220,8 @@ pub(crate) mod conformance {
 
 /// One `#[test]` per [`conformance`] check, each on a fresh store from
 /// `$make`. A backend's adapter invokes it in its own test module.
-#[cfg(test)]
+#[doc(hidden)]
+#[macro_export]
 macro_rules! reference_conformance {
     ($make:expr) => {
         use $crate::db::references::conformance;
@@ -247,8 +248,8 @@ macro_rules! reference_conformance {
         }
     };
 }
-#[cfg(test)]
-pub(crate) use reference_conformance;
+#[doc(hidden)]
+pub use crate::reference_conformance;
 
 #[cfg(test)]
 mod tests {

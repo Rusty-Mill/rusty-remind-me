@@ -124,8 +124,8 @@ impl<'c> Related<'c> {
 ///
 /// Relatives are memories found through entities, so a backend under test
 /// implements [`MemoryStore`] and [`EntityStore`] too.
-#[cfg(test)]
-pub(crate) mod conformance {
+#[doc(hidden)]
+pub mod conformance {
     use super::RelatedStore;
     use crate::db::derived::Origin;
     use crate::db::entities::EntityStore;
@@ -193,7 +193,7 @@ pub(crate) mod conformance {
         MemoryStore::delete_live(store, "z", Some(T2)).unwrap();
     }
 
-    pub(crate) fn via_entities_is_newest_first_one_row_per_link_pair<
+    pub fn via_entities_is_newest_first_one_row_per_link_pair<
         S: RelatedStore + MemoryStore + EntityStore,
     >(
         store: &mut S,
@@ -234,9 +234,7 @@ pub(crate) mod conformance {
         assert!(store.via_entities(&[]).unwrap().is_empty());
     }
 
-    pub(crate) fn document_window_is_live_chunks_in_order<
-        S: RelatedStore + MemoryStore + EntityStore,
-    >(
+    pub fn document_window_is_live_chunks_in_order<S: RelatedStore + MemoryStore + EntityStore>(
         store: &mut S,
     ) {
         seed(store);
@@ -254,7 +252,7 @@ pub(crate) mod conformance {
         assert!(store.document_window("other", 0, 9).unwrap().is_empty());
     }
 
-    pub(crate) fn co_retrieved_is_capped_strongest_first_and_live<
+    pub fn co_retrieved_is_capped_strongest_first_and_live<
         S: RelatedStore + MemoryStore + EntityStore,
     >(
         store: &mut S,
@@ -275,7 +273,7 @@ pub(crate) mod conformance {
         assert!(store.co_retrieved(&[]).unwrap().is_empty());
     }
 
-    pub(crate) fn a_pair_is_read_from_either_side<S: RelatedStore + MemoryStore + EntityStore>(
+    pub fn a_pair_is_read_from_either_side<S: RelatedStore + MemoryStore + EntityStore>(
         store: &mut S,
     ) {
         seed(store);
@@ -288,7 +286,7 @@ pub(crate) mod conformance {
         assert_eq!(from_b, ["a", "c"]);
     }
 
-    pub(crate) fn unlink_memory_drops_its_pairs<S: RelatedStore + MemoryStore + EntityStore>(
+    pub fn unlink_memory_drops_its_pairs<S: RelatedStore + MemoryStore + EntityStore>(
         store: &mut S,
     ) {
         seed(store);
@@ -306,7 +304,8 @@ pub(crate) mod conformance {
 
 /// One `#[test]` per [`conformance`] check, each on a fresh store from
 /// `$make`. A backend's adapter invokes it in its own test module.
-#[cfg(test)]
+#[doc(hidden)]
+#[macro_export]
 macro_rules! related_conformance {
     ($make:expr) => {
         use $crate::db::related::conformance;
@@ -333,8 +332,8 @@ macro_rules! related_conformance {
         }
     };
 }
-#[cfg(test)]
-pub(crate) use related_conformance;
+#[doc(hidden)]
+pub use crate::related_conformance;
 
 #[cfg(test)]
 mod tests {

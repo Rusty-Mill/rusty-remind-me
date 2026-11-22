@@ -242,8 +242,8 @@ impl<'c> Curation<'c> {
 /// The reads are over memories and their entity links, so a backend under
 /// test implements [`MemoryStore`] and [`EntityStore`] too, and the checks
 /// seed through them.
-#[cfg(test)]
-pub(crate) mod conformance {
+#[doc(hidden)]
+pub mod conformance {
     use super::{Backlog, CaptureActivity, CurationStore, NormalizationSource};
     use crate::db::derived::Origin;
     use crate::db::entities::EntityStore;
@@ -251,12 +251,12 @@ pub(crate) mod conformance {
     use crate::entity::Entity;
     use crate::models::Memory;
 
-    pub(crate) const NOW: &str = "2026-09-26T00:00:00+00:00";
-    pub(crate) const T2: &str = "2026-09-27T00:00:00+00:00";
+    pub const NOW: &str = "2026-09-26T00:00:00+00:00";
+    pub const T2: &str = "2026-09-27T00:00:00+00:00";
 
     /// Captures, imports, facts with triples, scenarios and personas, linked
     /// to three entities, with `f2` superseded by `f1`.
-    pub(crate) fn seed_corpus<S: MemoryStore + EntityStore + ?Sized>(store: &mut S) {
+    pub fn seed_corpus<S: MemoryStore + EntityStore + ?Sized>(store: &mut S) {
         let text = |s: &str| Some(s.to_string());
         let rows: Vec<NewMemory> = vec![
             NewMemory {
@@ -377,7 +377,7 @@ pub(crate) mod conformance {
     }
 
     /// Every curation read over [`seed_corpus`].
-    pub(crate) fn curation_reads_see_the_corpus_as_the_rules_say<
+    pub fn curation_reads_see_the_corpus_as_the_rules_say<
         S: CurationStore + MemoryStore + EntityStore,
     >(
         store: &mut S,
@@ -466,7 +466,7 @@ pub(crate) mod conformance {
         assert!(store.contradiction_side("missing", 5).is_err());
     }
 
-    pub(crate) fn a_capture_leaves_the_backlog_once_a_fact_names_it<
+    pub fn a_capture_leaves_the_backlog_once_a_fact_names_it<
         S: CurationStore + MemoryStore + EntityStore,
     >(
         store: &mut S,
@@ -503,7 +503,7 @@ pub(crate) mod conformance {
         );
     }
 
-    pub(crate) fn an_import_leaves_the_backlog_once_normalized<
+    pub fn an_import_leaves_the_backlog_once_normalized<
         S: CurationStore + MemoryStore + EntityStore,
     >(
         store: &mut S,
@@ -544,9 +544,7 @@ pub(crate) mod conformance {
         );
     }
 
-    pub(crate) fn contradiction_pairs_page_by_keyset<
-        S: CurationStore + MemoryStore + EntityStore,
-    >(
+    pub fn contradiction_pairs_page_by_keyset<S: CurationStore + MemoryStore + EntityStore>(
         store: &mut S,
     ) {
         for id in ["a", "b", "c"] {
@@ -577,7 +575,8 @@ pub(crate) mod conformance {
 
 /// One `#[test]` per [`conformance`] check, each on a fresh store from
 /// `$make`.
-#[cfg(test)]
+#[doc(hidden)]
+#[macro_export]
 macro_rules! curation_conformance {
     ($make:expr) => {
         use $crate::db::curation::conformance;
@@ -600,8 +599,8 @@ macro_rules! curation_conformance {
         }
     };
 }
-#[cfg(test)]
-pub(crate) use curation_conformance;
+#[doc(hidden)]
+pub use crate::curation_conformance;
 
 #[cfg(test)]
 mod tests {

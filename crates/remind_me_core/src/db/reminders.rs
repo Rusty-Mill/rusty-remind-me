@@ -103,13 +103,13 @@ impl<'c> Reminders<'c> {
 /// Reminders hang off memories, so a backend under test implements
 /// [`MemoryStore`](crate::db::memories::MemoryStore) too, and the checks seed
 /// memories through it.
-#[cfg(test)]
-pub(crate) mod conformance {
+#[doc(hidden)]
+pub mod conformance {
     use super::ReminderStore;
     use crate::db::memories::{MemoryStore, NewMemory};
     use crate::models::ReminderWindow;
 
-    pub(crate) const NOW: &str = "2026-09-27T12:00:00+00:00";
+    pub const NOW: &str = "2026-09-27T12:00:00+00:00";
 
     /// Add a live memory `id` with content `"x"`.
     fn add<S: MemoryStore>(store: &mut S, id: &str) {
@@ -132,9 +132,7 @@ pub(crate) mod conformance {
 
     /// Reminders set, cleared, delivered and rescheduled, and what each
     /// window shows after every step.
-    pub(crate) fn windows_follow_delivery_and_rescheduling<S: ReminderStore + MemoryStore>(
-        store: &mut S,
-    ) {
+    pub fn windows_follow_delivery_and_rescheduling<S: ReminderStore + MemoryStore>(store: &mut S) {
         for id in ["past", "past2", "future", "none", "gone"] {
             add(store, id);
         }
@@ -184,7 +182,7 @@ pub(crate) mod conformance {
         assert_eq!(look(store, ReminderWindow::All, 10).len(), 2);
     }
 
-    pub(crate) fn only_undeleted_memories_are_live<S: ReminderStore + MemoryStore>(store: &mut S) {
+    pub fn only_undeleted_memories_are_live<S: ReminderStore + MemoryStore>(store: &mut S) {
         add(store, "kept");
         add(store, "gone");
         delete(store, "gone");
@@ -198,7 +196,8 @@ pub(crate) mod conformance {
 
 /// One `#[test]` per [`conformance`] check, each on a fresh store from
 /// `$make`.
-#[cfg(test)]
+#[doc(hidden)]
+#[macro_export]
 macro_rules! reminder_conformance {
     ($make:expr) => {
         use $crate::db::reminders::conformance;
@@ -213,8 +212,8 @@ macro_rules! reminder_conformance {
         }
     };
 }
-#[cfg(test)]
-pub(crate) use reminder_conformance;
+#[doc(hidden)]
+pub use crate::reminder_conformance;
 
 #[cfg(test)]
 mod tests {

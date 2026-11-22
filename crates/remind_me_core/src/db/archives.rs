@@ -136,8 +136,8 @@ impl<'c> Archives<'c> {
 
 /// The behaviour every [`ArchiveStore`] must show, run against each backend
 /// by [`archive_conformance`] (ADR-0035).
-#[cfg(test)]
-pub(crate) mod conformance {
+#[doc(hidden)]
+pub mod conformance {
     use super::{ArchiveRow, ArchiveStore};
 
     fn row(import_id: &str, hash: &str, archived_at: &str) -> ArchiveRow {
@@ -151,9 +151,7 @@ pub(crate) mod conformance {
         }
     }
 
-    pub(crate) fn remove_takes_the_spans_and_leaves_a_shared_blob_counted(
-        store: &mut dyn ArchiveStore,
-    ) {
+    pub fn remove_takes_the_spans_and_leaves_a_shared_blob_counted(store: &mut dyn ArchiveStore) {
         store.record(&row("a", "h", "2026-09-02")).unwrap();
         store.record(&row("b", "h", "2026-09-01")).unwrap();
         store.record_span("m1", "a", 0, 5).unwrap();
@@ -175,7 +173,7 @@ pub(crate) mod conformance {
         store.remove("a").unwrap();
     }
 
-    pub(crate) fn recording_again_replaces_the_archive_and_the_span(store: &mut dyn ArchiveStore) {
+    pub fn recording_again_replaces_the_archive_and_the_span(store: &mut dyn ArchiveStore) {
         store.record(&row("a", "h1", "2026-09-01")).unwrap();
         store.record(&row("a", "h2", "2026-09-03")).unwrap();
         store.record_span("m1", "a", 0, 5).unwrap();
@@ -191,14 +189,14 @@ pub(crate) mod conformance {
         assert_eq!(store.span_count(None).unwrap(), 1);
     }
 
-    pub(crate) fn a_span_whose_import_has_no_archive_has_no_source(store: &mut dyn ArchiveStore) {
+    pub fn a_span_whose_import_has_no_archive_has_no_source(store: &mut dyn ArchiveStore) {
         store.record_span("m1", "gone", 0, 5).unwrap();
         assert!(store.span_source("m1").unwrap().is_none());
         assert!(store.blob_of("gone").unwrap().is_none());
         assert_eq!(store.span_count(Some("gone")).unwrap(), 1);
     }
 
-    pub(crate) fn blobs_and_order_follow_the_recorded_archives(store: &mut dyn ArchiveStore) {
+    pub fn blobs_and_order_follow_the_recorded_archives(store: &mut dyn ArchiveStore) {
         store.record(&row("late", "h1", "2026-09-03")).unwrap();
         store.record(&row("early", "h2", "2026-09-01")).unwrap();
         assert_eq!(
@@ -218,7 +216,8 @@ pub(crate) mod conformance {
 
 /// One `#[test]` per [`conformance`] check, each on a fresh store from
 /// `$make`.
-#[cfg(test)]
+#[doc(hidden)]
+#[macro_export]
 macro_rules! archive_conformance {
     ($make:expr) => {
         use $crate::db::archives::conformance;
@@ -241,8 +240,8 @@ macro_rules! archive_conformance {
         }
     };
 }
-#[cfg(test)]
-pub(crate) use archive_conformance;
+#[doc(hidden)]
+pub use crate::archive_conformance;
 
 #[cfg(test)]
 mod tests {
