@@ -7,6 +7,7 @@
 //! what the SQL's `INSERT … ON CONFLICT DO UPDATE` does column by column. A
 //! remote with no row starts from the schema's defaults.
 
+use super::capture;
 use super::{core_ref, engine_error, engine_id, ensure_same_id, outbox, EngineTables};
 use crate::db::sync_state::{RemoteLog, SyncLogRow, SyncStateStore};
 use crate::db::Result;
@@ -108,13 +109,15 @@ pub(crate) fn row(tables: &EngineTables, remote_id: &str) -> Option<SyncLogRow> 
 /// Store `row` whole, replacing any row for its remote.
 pub(crate) fn put(tables: &mut EngineTables, row: &SyncLogRow) -> Result<()> {
     let record = SyncLogRecord::new(row);
+    let noted = tables.note(capture::SYNC_LOG, &record.engine_id, Some(&record))?;
     match tables.sync_log.get(record.engine_id) {
         Some(stored) => {
             ensure_same_id(&stored.remote_id, &row.remote_id)?;
-            tables.sync_log.replace(record).map_err(engine_error)
+            tables.sync_log.replace(record).map_err(engine_error)?;
         }
-        None => tables.sync_log.insert(record).map_err(engine_error),
+        None => tables.sync_log.insert(record).map_err(engine_error)?,
     }
+    tables.emit(noted)
 }
 
 /// Apply `change` to `remote_id`'s row, starting from the schema's defaults

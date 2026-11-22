@@ -7,6 +7,7 @@
 //! updates it in the same call, as the SQL's `write_wiki_page` updates
 //! `wiki_fts`.
 
+use super::capture;
 use super::{
     deleted, engine_error, engine_id, ensure_same_id, micros, pair_engine_id, EngineTables,
 };
@@ -241,13 +242,18 @@ impl WikiStore for EngineTables {
     }
 
     fn remove(&mut self, slug: &str) -> Result<bool> {
-        let existed = page_record(self, slug).is_some();
-        if existed {
-            deleted(self.wiki_pages.delete(engine_id(slug)))?;
-            self.wiki_search.remove(&slug.to_string());
-        }
-        delete_links(self, slug)?;
-        Ok(existed)
+        self.logged(|t| {
+            let existed = page_record(t, slug).is_some();
+            if existed {
+                let id = engine_id(slug);
+                let noted = t.note(capture::WIKI_PAGES, &id, None::<&PageRecord>)?;
+                deleted(t.wiki_pages.delete(id))?;
+                t.emit(noted)?;
+                t.wiki_search.remove(&slug.to_string());
+            }
+            delete_links(t, slug)?;
+            Ok(existed)
+        })
     }
 
     // --- links -----------------------------------------------------------
@@ -255,22 +261,26 @@ impl WikiStore for EngineTables {
     /// A destination listed twice keeps its first title, as `INSERT OR
     /// IGNORE` does.
     fn replace_links(&mut self, slug: &str, links: &[(String, String)]) -> Result<()> {
-        delete_links(self, slug)?;
-        for (position, (dst_slug, dst_title)) in links.iter().enumerate() {
-            let key = pair_engine_id(slug, dst_slug);
-            if self.wiki_links.get(key).is_some() {
-                continue;
+        self.logged(|t| {
+            delete_links(t, slug)?;
+            for (position, (dst_slug, dst_title)) in links.iter().enumerate() {
+                let key = pair_engine_id(slug, dst_slug);
+                if t.wiki_links.get(key).is_some() {
+                    continue;
+                }
+                let record = LinkRecord {
+                    engine_id: key,
+                    src_slug: slug.to_string(),
+                    dst_slug: dst_slug.clone(),
+                    dst_title: dst_title.clone(),
+                    position: i64::try_from(position).unwrap_or(i64::MAX),
+                };
+                let noted = t.note(capture::WIKI_LINKS, &key, Some(&record))?;
+                t.wiki_links.insert(record).map_err(engine_error)?;
+                t.emit(noted)?;
             }
-            let record = LinkRecord {
-                engine_id: key,
-                src_slug: slug.to_string(),
-                dst_slug: dst_slug.clone(),
-                dst_title: dst_title.clone(),
-                position: i64::try_from(position).unwrap_or(i64::MAX),
-            };
-            self.wiki_links.insert(record).map_err(engine_error)?;
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     fn link_count(&self, slug: &str) -> Result<usize> {
@@ -322,13 +332,15 @@ impl WikiStore for EngineTables {
             value: value.to_string(),
             slot: 0,
         };
+        let noted = self.note(capture::WIKI_META, &record.engine_id, Some(&record))?;
         match self.wiki_meta.get(record.engine_id) {
             Some(stored) => {
                 ensure_same_id(&stored.key, key)?;
-                self.wiki_meta.replace(record).map_err(engine_error)
+                self.wiki_meta.replace(record).map_err(engine_error)?;
             }
-            None => self.wiki_meta.insert(record).map_err(engine_error),
+            None => self.wiki_meta.insert(record).map_err(engine_error)?,
         }
+        self.emit(noted)
     }
 }
 
@@ -336,16 +348,18 @@ impl WikiStore for EngineTables {
 
 fn put_page(tables: &mut EngineTables, record: PageRecord) -> Result<()> {
     let slug = record.slug.clone();
+    let noted = tables.note(capture::WIKI_PAGES, &record.engine_id, Some(&record))?;
     tables
         .wiki_search
         .upsert(slug.clone(), [&record.title, &record.content]);
     match tables.wiki_pages.get(record.engine_id) {
         Some(stored) => {
             ensure_same_id(&stored.slug, &slug)?;
-            tables.wiki_pages.replace(record).map_err(engine_error)
+            tables.wiki_pages.replace(record).map_err(engine_error)?;
         }
-        None => tables.wiki_pages.insert(record).map_err(engine_error),
+        None => tables.wiki_pages.insert(record).map_err(engine_error)?,
     }
+    tables.emit(noted)
 }
 
 fn page_record(tables: &EngineTables, slug: &str) -> Option<PageRecord> {
@@ -370,7 +384,9 @@ fn links_of(tables: &EngineTables, slug: &str) -> Vec<Uuid> {
 
 fn delete_links(tables: &mut EngineTables, slug: &str) -> Result<()> {
     for link in links_of(tables, slug) {
+        let noted = tables.note(capture::WIKI_LINKS, &link, None::<&LinkRecord>)?;
         deleted(tables.wiki_links.delete(link))?;
+        tables.emit(noted)?;
     }
     Ok(())
 }

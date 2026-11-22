@@ -6,6 +6,7 @@
 //! it, issued by the journal's `analytics_snapshots` sequence so an id is
 //! never issued twice, even across a crash.
 
+use super::capture;
 use super::{engine_error, EngineTables};
 use crate::db::stats::{decode_json, encode_json, SnapshotStore};
 use crate::db::Result;
@@ -102,7 +103,9 @@ impl SnapshotStore for EngineTables {
             vitality_buckets: encode_json(&snapshot.vitality_buckets),
             category_counts: encode_json(&snapshot.category_counts),
         };
+        let noted = self.note(capture::SNAPSHOTS, &id, Some(&record))?;
         self.snapshots.insert(record).map_err(engine_error)?;
+        self.emit(noted)?;
         Ok(id)
     }
 

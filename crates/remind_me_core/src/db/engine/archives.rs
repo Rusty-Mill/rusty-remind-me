@@ -2,6 +2,7 @@
 //! engine's [`ArchiveStore`] adapter (ADR-0035). The behaviour matches the
 //! old SQLite statements one for one.
 
+use super::capture;
 use super::{deleted, engine_error, engine_id, ensure_same_id, micros, EngineTables};
 use crate::db::archives::{ArchiveRow, ArchiveStore, SpanSource};
 use crate::db::Result;
@@ -136,13 +137,15 @@ impl ArchiveStore for EngineTables {
     /// does.
     fn record(&mut self, row: &ArchiveRow) -> Result<()> {
         let record = ArchiveRecord::new(row);
+        let noted = self.note(capture::ARCHIVES, &record.engine_id, Some(&record))?;
         match self.archives.get(record.engine_id) {
             Some(stored) => {
                 ensure_same_id(&stored.import_id, &row.import_id)?;
-                self.archives.replace(record).map_err(engine_error)
+                self.archives.replace(record).map_err(engine_error)?;
             }
-            None => self.archives.insert(record).map_err(engine_error),
+            None => self.archives.insert(record).map_err(engine_error)?,
         }
+        self.emit(noted)
     }
 
     fn record_span(
@@ -159,13 +162,15 @@ impl ArchiveStore for EngineTables {
             byte_start,
             byte_end,
         };
+        let noted = self.note(capture::SPANS, &record.engine_id, Some(&record))?;
         match self.spans.get(record.engine_id) {
             Some(stored) => {
                 ensure_same_id(&stored.memory_id, memory_id)?;
-                self.spans.replace(record).map_err(engine_error)
+                self.spans.replace(record).map_err(engine_error)?;
             }
-            None => self.spans.insert(record).map_err(engine_error),
+            None => self.spans.insert(record).map_err(engine_error)?,
         }
+        self.emit(noted)
     }
 
     /// An inner join, as the SQL is: a span whose import has no archive
@@ -192,13 +197,20 @@ impl ArchiveStore for EngineTables {
     }
 
     fn remove(&mut self, import_id: &str) -> Result<()> {
-        for span in spans_of(self, import_id) {
-            deleted(self.spans.delete(span))?;
-        }
-        if archive(self, import_id).is_some() {
-            deleted(self.archives.delete(engine_id(import_id)))?;
-        }
-        Ok(())
+        self.logged(|t| {
+            for span in spans_of(t, import_id) {
+                let noted = t.note(capture::SPANS, &span, None::<&SpanRecord>)?;
+                deleted(t.spans.delete(span))?;
+                t.emit(noted)?;
+            }
+            if archive(t, import_id).is_some() {
+                let id = engine_id(import_id);
+                let noted = t.note(capture::ARCHIVES, &id, None::<&ArchiveRecord>)?;
+                deleted(t.archives.delete(id))?;
+                t.emit(noted)?;
+            }
+            Ok(())
+        })
     }
 
     fn count_with_hash(&self, hash: &str) -> Result<usize> {

@@ -6,6 +6,7 @@
 //! sequence, as SQLite's `INTEGER PRIMARY KEY` gives it: a caller passes it
 //! back to revert, so it must never be issued twice.
 
+use super::capture;
 use super::{core_ref, deleted, engine_error, memories, micros, EngineTables};
 use crate::db::history::{HistoryStore, Tracked};
 use crate::db::Result;
@@ -115,26 +116,34 @@ impl HistoryStore for EngineTables {
     }
 
     fn delete_for(&mut self, memory_id: &str) -> Result<()> {
-        for record in of_memory(self, memory_id) {
-            deleted(self.revisions.delete(record.id))?;
-        }
-        Ok(())
+        self.logged(|t| {
+            for record in of_memory(t, memory_id) {
+                let noted = t.note(capture::REVISIONS, &record.id, None::<&RevisionRecord>)?;
+                deleted(t.revisions.delete(record.id))?;
+                t.emit(noted)?;
+            }
+            Ok(())
+        })
     }
 
     fn delete_of_tombstones(&mut self) -> Result<usize> {
-        let core = core_ref(self)?;
-        let doomed: Vec<i64> = self
-            .revisions
-            .all_ids()
-            .into_iter()
-            .filter_map(|id| self.revisions.get(id))
-            .filter(|r| memories::is_tombstone(core, &r.memory_id))
-            .map(|r| r.id)
-            .collect();
-        for id in &doomed {
-            deleted(self.revisions.delete(*id))?;
-        }
-        Ok(doomed.len())
+        self.logged(|t| {
+            let core = core_ref(t)?;
+            let doomed: Vec<i64> = t
+                .revisions
+                .all_ids()
+                .into_iter()
+                .filter_map(|id| t.revisions.get(id))
+                .filter(|r| memories::is_tombstone(core, &r.memory_id))
+                .map(|r| r.id)
+                .collect();
+            for id in &doomed {
+                let noted = t.note(capture::REVISIONS, id, None::<&RevisionRecord>)?;
+                deleted(t.revisions.delete(*id))?;
+                t.emit(noted)?;
+            }
+            Ok(doomed.len())
+        })
     }
 
     fn insert(
@@ -158,7 +167,9 @@ impl HistoryStore for EngineTables {
             revision_reason: reason.map(str::to_string),
             project: values.project.clone(),
         };
-        self.revisions.insert(record).map_err(engine_error)
+        let noted = self.note(capture::REVISIONS, &id, Some(&record))?;
+        self.revisions.insert(record).map_err(engine_error)?;
+        self.emit(noted)
     }
 
     /// `edited_at` compared as SQLite compares the text.

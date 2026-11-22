@@ -3,6 +3,7 @@
 //! [`SavedSearchStore`] port (ADR-0035). The behaviour matches the old
 //! SQLite statements one for one.
 
+use super::capture;
 use super::{
     deleted, engine_error, engine_id, ensure_same_id, micros, pair_engine_id, EngineTables,
 };
@@ -156,7 +157,9 @@ impl SavedSearchStore for EngineTables {
         if let Some(stored) = self.saved_searches.get(row.engine_id) {
             ensure_same_id(&stored.id, &saved.id)?;
         }
-        self.saved_searches.insert(row).map_err(engine_error)
+        let noted = self.note(capture::SAVED_SEARCHES, &row.engine_id, Some(&row))?;
+        self.saved_searches.insert(row).map_err(engine_error)?;
+        self.emit(noted)
     }
 
     /// A missing id changes nothing, as an `UPDATE` matching no row does.
@@ -172,7 +175,9 @@ impl SavedSearchStore for EngineTables {
             updated_at: saved.updated_at.clone(),
             ..stored
         };
-        self.saved_searches.replace(row).map_err(engine_error)
+        let noted = self.note(capture::SAVED_SEARCHES, &row.engine_id, Some(&row))?;
+        self.saved_searches.replace(row).map_err(engine_error)?;
+        self.emit(noted)
     }
 
     fn get(&self, id: &str) -> Result<SavedSearch> {
@@ -202,14 +207,23 @@ impl SavedSearchStore for EngineTables {
 
     /// A missing id is not an error, as a `DELETE` matching no row is not.
     fn delete(&mut self, id: &str) -> Result<()> {
-        for seen in seen_rows(self, id) {
-            deleted(self.seen.delete(seen))?;
-        }
-        let target = engine_id(id);
-        match self.saved_searches.get(target) {
-            Some(stored) if stored.id == id => deleted(self.saved_searches.delete(target)),
-            _ => Ok(()),
-        }
+        self.logged(|t| {
+            for seen in seen_rows(t, id) {
+                let noted = t.note(capture::SEEN, &seen, None::<&SeenRow>)?;
+                deleted(t.seen.delete(seen))?;
+                t.emit(noted)?;
+            }
+            let target = engine_id(id);
+            match t.saved_searches.get(target) {
+                Some(stored) if stored.id == id => {
+                    let noted =
+                        t.note(capture::SAVED_SEARCHES, &target, None::<&SavedSearchRow>)?;
+                    deleted(t.saved_searches.delete(target))?;
+                    t.emit(noted)
+                }
+                _ => Ok(()),
+            }
+        })
     }
 
     fn seen_ids(&self, saved_search_id: &str) -> Result<HashSet<String>> {
@@ -227,22 +241,26 @@ impl SavedSearchStore for EngineTables {
     /// An id already recorded keeps its first `first_seen_at`, as
     /// `INSERT OR IGNORE` does.
     fn mark_seen(&mut self, saved_search_id: &str, memory_ids: &[String], now: &str) -> Result<()> {
-        let first_seen_us = micros(now);
-        for memory_id in memory_ids {
-            let key = pair_engine_id(saved_search_id, memory_id);
-            if self.seen.get(key).is_some() {
-                continue;
+        self.logged(|t| {
+            let first_seen_us = micros(now);
+            for memory_id in memory_ids {
+                let key = pair_engine_id(saved_search_id, memory_id);
+                if t.seen.get(key).is_some() {
+                    continue;
+                }
+                let row = SeenRow {
+                    engine_id: key,
+                    saved_search_id: saved_search_id.to_string(),
+                    memory_id: memory_id.clone(),
+                    first_seen_at: now.to_string(),
+                    first_seen_us,
+                };
+                let noted = t.note(capture::SEEN, &key, Some(&row))?;
+                t.seen.insert(row).map_err(engine_error)?;
+                t.emit(noted)?;
             }
-            let row = SeenRow {
-                engine_id: key,
-                saved_search_id: saved_search_id.to_string(),
-                memory_id: memory_id.clone(),
-                first_seen_at: now.to_string(),
-                first_seen_us,
-            };
-            self.seen.insert(row).map_err(engine_error)?;
-        }
-        Ok(())
+            Ok(())
+        })
     }
 }
 

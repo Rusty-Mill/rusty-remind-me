@@ -13,6 +13,8 @@
 
 pub(crate) mod analytics;
 pub(crate) mod archives;
+#[doc(hidden)]
+pub mod capture;
 pub mod copy;
 pub(crate) mod core;
 pub(crate) mod curation;
@@ -95,6 +97,10 @@ pub struct EngineTables {
     failed: bool,
     /// The directory the tables live in, for [`EngineTables::copy_files_to`].
     dir: PathBuf,
+    /// Where durable writes are handed, when set (see [`capture`]).
+    sink: Option<Box<dyn capture::ChangeSink>>,
+    /// Writes held for the sink until their operation or page ends.
+    staging: capture::Staging,
     _lock: DirLock,
     _temporary: Option<TemporaryDir>,
 }
@@ -129,6 +135,8 @@ impl EngineTables {
             page: None,
             failed: false,
             dir: dir.to_path_buf(),
+            sink: None,
+            staging: capture::Staging::default(),
             _lock: lock,
             _temporary: None,
         };
@@ -137,14 +145,19 @@ impl EngineTables {
         tables.replay(opened.replay)?;
         // A table written by something other than this journal (the copy
         // tool, or an older build) must still never see an id reissued.
-        let floor = analytics::max_id(&tables.snapshots);
-        tables.journal.raise_to(analytics::SEQUENCE, floor);
-        let floor = revisions::max_id(&tables.revisions);
-        tables.journal.raise_to(revisions::SEQUENCE, floor);
-        let floor = outbox::max_id(&tables.core.outbox);
-        tables.journal.raise_to(outbox::SEQUENCE, floor);
+        tables.raise_sequences();
         tables.wiki_search = wiki::index_pages(&tables.wiki_pages);
         Ok(tables)
+    }
+
+    /// Raise each id sequence past the highest id its table holds.
+    fn raise_sequences(&mut self) {
+        let floor = analytics::max_id(&self.snapshots);
+        self.journal.raise_to(analytics::SEQUENCE, floor);
+        let floor = revisions::max_id(&self.revisions);
+        self.journal.raise_to(revisions::SEQUENCE, floor);
+        let floor = outbox::max_id(&self.core.outbox);
+        self.journal.raise_to(outbox::SEQUENCE, floor);
     }
 
     /// The next id from the journal sequence `name`, durable before it is
@@ -163,7 +176,10 @@ impl EngineTables {
     /// commit: for a record committed in the same batch.
     pub(crate) fn allocate(&mut self, name: &str) -> super::Result<i64> {
         let id = self.journal.allocate(name);
-        i64::try_from(id).map_err(|_| StoreError::Engine(format!("sequence {name} overflowed")))
+        let id = i64::try_from(id)
+            .map_err(|_| StoreError::Engine(format!("sequence {name} overflowed")))?;
+        self.reserve(name, id)?;
+        Ok(id)
     }
 
     /// Refuse writes after a batch failed part-way (see `failed`).
