@@ -220,3 +220,20 @@ fn open_at_refuses_to_clear_a_directory_it_did_not_make() {
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Scratch another run's log made, mark and all, is not this log's to clear.
+#[test]
+fn open_at_refuses_another_logs_marked_scratch() {
+    let dir = scratch("other-run");
+    let engine = dir.join("engine");
+    drop(attest_store::open_at(&dir.join("first"), &engine).unwrap());
+    std::fs::write(engine.join("keep.txt"), b"precious").unwrap();
+    assert!(attest_store::open_at(&dir.join("second"), &engine).is_err());
+    assert_eq!(std::fs::read(engine.join("keep.txt")).unwrap(), b"precious");
+    drop(attest_store::open_at(&dir.join("first"), &engine).unwrap());
+    assert!(
+        !engine.join("keep.txt").exists(),
+        "its own log may rebuild it"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}

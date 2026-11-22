@@ -45,7 +45,8 @@ pub struct Manifest {
     pub memories: BTreeMap<String, String>,
     /// Page slug to the hash of its row.
     pub pages: BTreeMap<String, String>,
-    /// `<memory id>#<chunk index>` to the hash of that chunk's vector.
+    /// `<memory id>#<chunk index>` to the hash of that chunk's row: memory
+    /// id, index and embedding.
     pub vectors: BTreeMap<String, String>,
     /// Entity id to the hash of its row.
     pub entities: BTreeMap<String, String>,
@@ -101,9 +102,12 @@ impl Manifest {
         }
         for id in &ids {
             for (ix, chunk) in Vectors::new(store).chunks_for(id)?.iter().enumerate() {
-                manifest
-                    .vectors
-                    .insert(format!("{id}#{ix}"), content_key(&chunk.embedding));
+                // A chunk row is its memory, its index and its embedding
+                // (all `ChunkVector` holds), hashed as one canonical row.
+                let key = format!("{id}#{ix}");
+                let mut row = format!("{}\u{1f}{ix}\u{1f}", chunk.memory_id).into_bytes();
+                row.extend_from_slice(&chunk.embedding);
+                manifest.vectors.insert(key, content_key(&row));
             }
         }
         for chunk in ids.chunks(BATCH) {
