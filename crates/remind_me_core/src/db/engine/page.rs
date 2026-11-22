@@ -176,7 +176,9 @@ impl EngineTables {
                 if self.put_back(page.before).is_err() {
                     self.failed = true;
                 }
-                self.undo_held(0);
+                // A failed put-back sets `failed`; the encode error is
+                // the one to report.
+                let _ = self.undo_held(0);
                 return Err(e);
             }
         };
@@ -229,10 +231,9 @@ impl EngineTables {
         if rolled_back.is_err() {
             self.failed = true;
         }
-        // With a sink set: the other tables' writes too, none handed over
-        // but the ids the page issued.
-        self.undo_held(0);
-        rolled_back.and(self.ensure_writable())
+        // With a sink set: the other tables' writes too, none handed over.
+        let undone = self.undo_held(0);
+        rolled_back.and(undone)
     }
 
     fn put_back(&mut self, before: Vec<Change>) -> Result<()> {

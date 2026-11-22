@@ -16,9 +16,13 @@
 //!   it lands, or, inside a multi-row operation ([`EngineTables::logged`]),
 //!   when the operation succeeds. An operation that fails puts its records
 //!   back and hands over nothing.
-//! - Every id a sequence issues is handed over too, with the next unit, so
-//!   a replay raises each sequence past every id ever issued, not only
-//!   past the records that survive.
+//! - Sequence ids are reserved in blocks of [`RESERVED_IDS`]: before a
+//!   sequence issues an id past its last reservation, the next block's
+//!   high-water mark is handed over on its own, as a unit with no rows,
+//!   and the id is issued only once the sink holds it. A replay raises
+//!   each sequence past every reservation, so no id is issued twice, even
+//!   one whose record was deleted or never committed. A failed reservation
+//!   issues nothing.
 //! - A sink that fails, or records that cannot be put back, leave the
 //!   tables refusing every write until reopened (`failed`): their RAM state
 //!   may then be ahead of the sink.
@@ -49,6 +53,8 @@ pub(crate) const WIKI_META: &str = "wiki_meta";
 /// Not a table: an id a sequence issued, kept so a replay never reissues
 /// it, even after its record is deleted.
 pub(crate) const SEQUENCES: &str = "sequence";
+/// How many ids one reservation covers: one extra unit per this many.
+pub(crate) const RESERVED_IDS: i64 = 64;
 
 /// One write: the table, the record's key as JSON, and the record as JSON
 /// (`None` for a delete).
@@ -85,6 +91,8 @@ pub(crate) struct Staging {
     held: Vec<Noted>,
     /// How many [`EngineTables::logged`] operations are running.
     depth: u32,
+    /// The highest id the sink holds a reservation for, by sequence.
+    reserved: std::collections::BTreeMap<String, i64>,
 }
 
 /// `table`'s write of `record` under `key`.
@@ -162,15 +170,30 @@ impl EngineTables {
         self.flush_unless_held()
     }
 
-    /// Hold `id`, just issued by sequence `name`, for the next unit.
-    pub(crate) fn hold_sequence(&mut self, name: &str, id: i64) -> Result<()> {
+    /// Make sure the sink holds a reservation covering `id`, about to be
+    /// issued by sequence `name`, before it is: past the last one, hand
+    /// over the next block's high-water mark as a unit of its own.
+    ///
+    /// # Errors
+    ///
+    /// The sink's error; the tables then refuse writes and `id` must not
+    /// be issued.
+    pub(crate) fn reserve(&mut self, name: &str, id: i64) -> Result<()> {
         if self.sink.is_none() {
             return Ok(());
         }
-        self.staging.held.push(Noted {
-            change: change(SEQUENCES, &name, Some(&id))?,
-            before: None,
-        });
+        if self
+            .staging
+            .reserved
+            .get(name)
+            .is_some_and(|&top| id <= top)
+        {
+            return Ok(());
+        }
+        self.ensure_writable()?;
+        let top = id.saturating_add(RESERVED_IDS - 1);
+        self.hand_over(vec![change(SEQUENCES, &name, Some(&top))?])?;
+        self.staging.reserved.insert(name.to_string(), top);
         Ok(())
     }
 
@@ -187,7 +210,9 @@ impl EngineTables {
         let written = write(self);
         self.staging.depth -= 1;
         if written.is_err() {
-            self.undo_held(mark);
+            // A failed put-back sets `failed`; the write's own error is
+            // the one to report.
+            let _ = self.undo_held(mark);
             return written;
         }
         self.flush_unless_held()?;
@@ -195,46 +220,34 @@ impl EngineTables {
     }
 
     /// Put back what the writes held since `mark` replaced, newest first,
-    /// and drop them, keeping the ids sequences issued meanwhile for the
-    /// next unit. Failing to put back leaves the tables refusing writes.
-    pub(crate) fn undo_held(&mut self, mark: usize) {
+    /// and drop them.
+    ///
+    /// # Errors
+    ///
+    /// A record that could not be put back; the tables then refuse writes.
+    pub(crate) fn undo_held(&mut self, mark: usize) -> Result<()> {
         let undone: Vec<Noted> = self.staging.held.drain(mark..).collect();
         let mut wiki_pages = false;
-        let mut issued = Vec::new();
+        let mut put_back = Ok(());
         for noted in undone.into_iter().rev() {
             let Some(before) = noted.before else {
-                if noted.change.table == SEQUENCES {
-                    issued.push(noted);
-                }
                 continue;
             };
             wiki_pages |= before.table == WIKI_PAGES;
-            if self.apply_row(&before).is_err() {
+            if let Err(e) = self.apply_row(&before) {
                 self.failed = true;
+                put_back = put_back.and(Err(e));
             }
         }
         if wiki_pages {
             self.wiki_search = wiki::index_pages(&self.wiki_pages);
         }
-        self.staging.held.extend(issued.into_iter().rev());
-        self.hand_over_issued();
+        put_back
     }
 
-    /// Drop every held write but the issued ids, and hand those over: the
-    /// rest's outcome is settled by reopening.
+    /// Drop every held write: their outcome is settled by reopening.
     pub(crate) fn drop_held(&mut self) {
-        self.staging.held.retain(|n| n.change.table == SEQUENCES);
-        self.hand_over_issued();
-    }
-
-    /// Hand over what is held, now only issued ids, unless an operation or
-    /// page still runs: a reopen straight after a rollback must not reissue
-    /// them. A failure is recorded in `failed` by `hand_over`, which then
-    /// refuses writes, so the result needs no other handling here.
-    fn hand_over_issued(&mut self) {
-        if self.flush_unless_held().is_err() {
-            debug_assert!(self.failed, "hand_over records a failed sink");
-        }
+        self.staging.held.clear();
     }
 
     fn flush_unless_held(&mut self) -> Result<()> {
@@ -511,10 +524,11 @@ mod tests {
         t.begin_page().unwrap();
         HistoryStore::insert(&mut t, "m", &tracked(), NOW, None).unwrap();
         MemoryStore::insert(&mut t, &NewMemory::new("m", "quokka", NOW)).unwrap();
-        assert!(log.lock().unwrap().is_empty(), "nothing before the commit");
+        assert!(rows_after(&log, 0).is_empty(), "no row before the commit");
+        let before = log.lock().unwrap().len();
         t.finish_page().unwrap();
 
-        let units = log.lock().unwrap().clone();
+        let units = log.lock().unwrap()[before..].to_vec();
         assert_eq!(units.len(), 1, "one unit: {units:?}");
         assert!(tables_of(&units[0]).contains(&REVISIONS));
         let b = rebuilt(&log);
@@ -612,7 +626,7 @@ mod tests {
         MemoryStore::insert(&mut t, &NewMemory::new("kept", "x", NOW)).unwrap();
         fail.store(true, std::sync::atomic::Ordering::SeqCst);
         t.begin_page().unwrap();
-        HistoryStore::insert(&mut t, "kept", &tracked(), NOW, None).unwrap();
+        WikiStore::set_meta(&mut t, "lost", "v").unwrap();
         MemoryStore::insert(&mut t, &NewMemory::new("lost", "x", NOW)).unwrap();
         assert!(t.finish_page().is_err());
         fail.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -624,7 +638,42 @@ mod tests {
         let b = rebuilt(&log);
         assert!(MemoryStore::exists(&b, "kept").unwrap());
         assert!(!MemoryStore::exists(&b, "lost").unwrap());
-        assert!(HistoryStore::list(&b, "kept", 10).unwrap().is_empty());
+        assert!(WikiStore::meta(&b, "lost").unwrap().is_none());
+    }
+
+    /// An id is issued only once the sink holds its reservation: a failed
+    /// reservation issues nothing, and the tables then refuse writes.
+    #[test]
+    fn a_failed_reservation_issues_no_id() {
+        let log = Log::default();
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut t = EngineTables::open_temporary().unwrap();
+        t.set_change_sink(Some(Box::new(Flaky(log.clone(), fail.clone()))));
+        assert!(HistoryStore::insert(&mut t, "m", &tracked(), NOW, None).is_err());
+        assert!(HistoryStore::list(&t, "m", 10).unwrap().is_empty());
+        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            WikiStore::set_meta(&mut t, "k", "v").is_err(),
+            "fails closed"
+        );
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    /// One reservation covers a block of ids: issuing them hands over one
+    /// unit of its own, with no rows, ahead of the rows that use them.
+    #[test]
+    fn ids_are_reserved_in_blocks() {
+        let (mut t, log) = collecting();
+        for _ in 0..3 {
+            HistoryStore::insert(&mut t, "m", &tracked(), NOW, None).unwrap();
+        }
+        let units = log.lock().unwrap().clone();
+        let reservations: Vec<_> = units
+            .iter()
+            .filter(|u| u.iter().all(|c| c.table == SEQUENCES))
+            .collect();
+        assert_eq!(reservations.len(), 1, "{units:?}");
+        assert_eq!(units.len(), 4, "one reservation, then three revisions");
     }
 
     /// An undo-log failure inside a page, even one the caller handles,

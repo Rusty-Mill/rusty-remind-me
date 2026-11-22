@@ -178,7 +178,7 @@ impl EngineTables {
         let id = self.journal.allocate(name);
         let id = i64::try_from(id)
             .map_err(|_| StoreError::Engine(format!("sequence {name} overflowed")))?;
-        self.hold_sequence(name, id)?;
+        self.reserve(name, id)?;
         Ok(id)
     }
 
