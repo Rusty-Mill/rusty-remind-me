@@ -10,7 +10,9 @@
 //!
 //! The dataset is `n` synthetic memories, `d1:<backup>` (the real store,
 //! from a copy of a `manual-*.engine` backup, loaded through the ports;
-//! `d1.rs`) or `d2:<backup>` (D1 grown to 75,000 with synthetic memories).
+//! `d1.rs`), `d2:<backup>` (D1 grown to 75,000 with synthetic memories)
+//! or `d3:<backup>` (D1 plus 50,000 raw pages of 10 to 30 KB,
+//! bulk-ingested with the four readers searching alongside: workload 5).
 //!
 //! ```text
 //! cargo run --release -p remind_me_core --example store_bench -- bench sqlite d1:/data/manual-x.engine /tmp/bench
@@ -44,8 +46,13 @@
 //! refuses an in-place rewrite, and readers see whole transactions while
 //! the writer commits.
 //!
-//! There is no D3 ingest, crash or relevance workload yet (D55), so these
-//! are not scoring runs.
+//! A D3 run takes the cold open twice, each on the store as it stands
+//! before any other workload: once on the loaded D1 and once after the
+//! pages are ingested. The second's idle memory is G3, its time G7 on D3,
+//! and its idle over the first's is G5 (`g5_idle_ratio`). D1's dialogs
+//! already carry their full bodies in the blob store, so D3 adds only the
+//! pages. There is no crash or relevance workload yet (D55), so
+//! these are not scoring runs.
 //!
 //! The run is offline. It refuses to start when the environment configures
 //! an embedder, query expansion, a reranking model or a cloud backup
@@ -187,12 +194,25 @@ pub enum Dataset {
     /// D2, D1 grown with synthetic memories to `total`: `d2:<backup dir>`
     /// (to [`d1::D2_TOTAL`]).
     D2 { backup: PathBuf, total: usize },
+    /// D3, D1 plus `pages` raw pages of 10 to 30 KB, bulk-ingested with
+    /// searches alongside (workload 5): `d3:<backup dir>` (to
+    /// [`D3_PAGES`]).
+    D3 { backup: PathBuf, pages: usize },
 }
+
+/// The raw pages D3 ingests (spec § Datasets).
+pub const D3_PAGES: usize = 50_000;
 
 impl Dataset {
     fn parse(arg: &str) -> Result<Self> {
         if let Some(path) = arg.strip_prefix("d1:") {
             return Ok(Self::D1(PathBuf::from(path)));
+        }
+        if let Some(path) = arg.strip_prefix("d3:") {
+            return Ok(Self::D3 {
+                backup: PathBuf::from(path),
+                pages: D3_PAGES,
+            });
         }
         if let Some(path) = arg.strip_prefix("d2:") {
             return Ok(Self::D2 {
@@ -202,7 +222,7 @@ impl Dataset {
         }
         let n: usize = arg
             .parse()
-            .map_err(|_| format!("dataset {arg:?} is not a count, d1:<backup> or d2:<backup>"))?;
+            .map_err(|_| format!("dataset {arg:?} is not a count or d1:, d2: or d3:<backup>"))?;
         if n == 0 {
             return Err("n must be at least 1".into());
         }
@@ -214,12 +234,13 @@ impl Dataset {
             Self::Synthetic(n) => n.to_string(),
             Self::D1(_) => "d1".into(),
             Self::D2 { total, .. } => format!("d2-{total}"),
+            Self::D3 { pages, .. } => format!("d3-{pages}"),
         }
     }
 }
 
 /// Run the benchmark the command line asks for, on one of `candidates`:
-/// `<bench|open> <backend> <n|d1:<backup>|d2:<backup>> <dir>`. Prints one
+/// `<bench|open> <backend> <n|d1:<backup>|d2:<backup>|d3:<backup>> <dir>`. Prints one
 /// JSON line.
 pub fn run(candidates: &[Candidate]) -> Result<()> {
     let names: Vec<&str> = candidates.iter().map(|c| c.name).collect();
@@ -236,7 +257,7 @@ pub fn run(candidates: &[Candidate]) -> Result<()> {
     }
     let [mode, backend, n, dir] = args.as_slice() else {
         return Err(format!(
-            "usage: store_bench <bench|open> <{}> <n|d1:<backup>|d2:<backup>> <dir>",
+            "usage: store_bench <bench|open> <{}> <n|d1:|d2:|d3:<backup>> <dir>",
             names.join("|")
         )
         .into());
@@ -308,7 +329,7 @@ pub fn measure(
     match dataset {
         Dataset::Synthetic(0) => return Err("n must be at least 1".into()),
         Dataset::Synthetic(_) => {}
-        Dataset::D1(backup) | Dataset::D2 { backup, .. } => {
+        Dataset::D1(backup) | Dataset::D2 { backup, .. } | Dataset::D3 { backup, .. } => {
             if mode == Mode::Open {
                 return Err("open mode is synthetic only; bench reports the cold open".into());
             }
@@ -345,7 +366,7 @@ pub fn measure(
     report.insert("run_dir".into(), json!(dir));
     report.insert(
         "note".into(),
-        json!("not a scoring run: no D3 ingest, crash or relevance workload yet"),
+        json!("not a scoring run: no crash or relevance workload yet"),
     );
     match mode {
         Mode::Bench => workload(candidate, &dir, dataset, &mut report, isolation)?,
@@ -579,6 +600,23 @@ fn workload(
     report.insert("disk_mb_after_fill".into(), disk(dir)?);
     // G7 and the idle baseline on the store exactly as the dataset left it.
     let cold = cold::cold_open(candidate, dir, &pairs[0], isolation)?;
+    if let Dataset::D3 { pages, .. } = dataset {
+        // D3 is D1 plus its pages: ingest them (workload 5), then take G7
+        // and the G3 idle memory on the store as the ingest left it, before
+        // any other workload changes it. G5 is that idle over D1's.
+        let queries_: Vec<String> = pairs.iter().map(|(t, _)| t.clone()).collect();
+        let vectors_ = Precomputed(pairs.iter().cloned().collect());
+        {
+            let db = candidate.open(dir)?;
+            let store = db.store();
+            let ingested = ingest(&db, &store, &bodies, &corpus, *pages, &queries_, &vectors_)?;
+            report.insert("ingest".into(), ingested);
+        }
+        report.insert("disk_mb_after_ingest".into(), disk(dir)?);
+        let after = cold::cold_open(candidate, dir, &pairs[0], isolation)?;
+        report.insert("g5_idle_ratio".into(), idle_ratio(&cold, &after));
+        report.insert("cold_open_after_ingest".into(), after);
+    }
     report.insert("cold_open".into(), cold);
 
     let started = Instant::now();
@@ -771,6 +809,66 @@ fn workload(
     backup_and_restore(candidate, db, &bodies, dir, report, isolation)
 }
 
+/// D3's idle resident memory over D1's (G5), from the two cold opens'
+/// child samples; null when either has none (an in-process run).
+fn idle_ratio(d1: &Value, d3: &Value) -> Value {
+    let idle = |v: &Value| v["idle"]["rss_idle_mb"].as_f64();
+    match (idle(d1), idle(d3)) {
+        (Some(a), Some(b)) if a > 0.0 => json!(b / a),
+        _ => Value::Null,
+    }
+}
+
+/// Workload 5 on D3: bulk-ingest `pages` raw pages (each body to the blob
+/// store, its row a head and a link, D50) with the four readers searching
+/// alongside, after the same readers searched idle on the same inputs
+/// (D54). The ingest keeps going after the readers finish until every
+/// page is in; it must outlast them, or the run fails (raise the page
+/// count). Reports the total ingest time, both reader runs and the ratio
+/// of their p95s.
+fn ingest(
+    db: &Database,
+    store: &Store<'_>,
+    bodies: &Bodies,
+    corpus: &Corpus,
+    pages: usize,
+    queries_: &[String],
+    vectors_: &Precomputed,
+) -> Result<Value> {
+    let next = AtomicUsize::new(0);
+    let page = |s: &Store<'_>, i: usize| -> Result<()> {
+        let mut rng = Rng((i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+        let stashed = bodies.stash(&corpus.page(&mut rng))?;
+        let slug = format!("d3-page-{i}");
+        wiki::write_wiki_page(s, &slug, &slug, &stashed.head, &stashed.page_summary())?;
+        Ok(())
+    };
+    let one = |s: &Store<'_>, _: &mut Rng| -> Result<()> {
+        let i = next.fetch_add(1, Ordering::SeqCst);
+        if i >= pages {
+            return Err(
+                format!("the {pages} pages were all in before the readers finished").into(),
+            );
+        }
+        page(s, i)
+    };
+    let idle = readers(db, store, queries_, vectors_, None)?;
+    let started = Instant::now();
+    let beside = readers(db, store, queries_, vectors_, Some(&one))?;
+    for i in next.load(Ordering::SeqCst)..pages {
+        page(store, i)?;
+    }
+    let total_s = started.elapsed().as_secs_f64();
+    let p95 = |v: &Value| v["p95"].as_f64().unwrap_or(f64::NAN);
+    Ok(json!({
+        "pages": pages,
+        "total_s": total_s,
+        "readers_idle": idle,
+        "readers_beside_ingest": beside,
+        "hybrid_p95_ratio": p95(&beside) / p95(&idle),
+    }))
+}
+
 /// What a seeded store holds that the workloads pick from.
 struct Seeded {
     ids: Vec<String>,
@@ -860,6 +958,7 @@ fn seed(
         }
         Dataset::D1(backup) => (backup, None),
         Dataset::D2 { backup, total } => (backup, Some(*total)),
+        Dataset::D3 { backup, .. } => (backup, None),
     };
     let loaded = d1::load(backup, &dir.with_extension("d1-source"), &store, bodies)?;
     report.insert("load_s".into(), json!(started.elapsed().as_secs_f64()));

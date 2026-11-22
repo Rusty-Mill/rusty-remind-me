@@ -306,4 +306,46 @@ mod tests {
         }
         std::fs::remove_dir_all(&root).unwrap();
     }
+
+    /// D3 ingests its pages with readers alongside, after an idle run on
+    /// the same inputs, and every page body lands in the blob store.
+    #[cfg(unix)] // real datasets need a verifiable private root
+    #[test]
+    fn d3_ingests_its_pages_beside_the_readers() {
+        let _serial = harness::serial();
+        let root = std::env::temp_dir().join(format!("store_bench_d3_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let backup = small_backup(&root);
+        let dataset = Dataset::D3 {
+            backup,
+            pages: 1_500,
+        };
+        let report = measure(
+            SQLITE,
+            Mode::Bench,
+            &dataset,
+            &root.join("runs"),
+            Isolation::InProcess,
+        )
+        .unwrap();
+        let ingest = &report["ingest"];
+        assert_eq!(ingest["pages"], 1_500);
+        assert!(
+            ingest["readers_beside_ingest"]["writer_adds"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert!(ingest["hybrid_p95_ratio"].is_number());
+        // G7 and G3 on the ingested store, before the other workloads.
+        assert!(report["cold_open_after_ingest"]["child"]["first_query_ms"].is_number());
+        assert!(report["cold_open"]["child"]["first_query_ms"].is_number());
+        assert!(
+            report["g5_idle_ratio"].is_null(),
+            "no child sample in process"
+        );
+        assert!(report["disk_mb_after_ingest"]["blobs"].as_f64().unwrap() > 10.0);
+        assert_eq!(report["restore"]["matched"], true);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 }
