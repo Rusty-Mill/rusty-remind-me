@@ -22,14 +22,22 @@ fn fresh() -> EngineTables {
 /// `create_dir` fails on a taken name, and the next name is tried.
 fn exclusive_dir(root: &Path) -> PathBuf {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
-    std::fs::create_dir_all(root).expect("the scratch root");
-    loop {
+    create_first_free(root, || {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("a clock after 1970")
             .as_nanos();
         let n = NEXT.fetch_add(1, Ordering::SeqCst);
-        let dir = root.join(format!("{}-{nanos}-{n}", std::process::id()));
+        format!("{}-{nanos}-{n}", std::process::id())
+    })
+}
+
+/// Create `root/<name>` for the first name `names` gives that is not
+/// taken; the directory made.
+fn create_first_free(root: &Path, mut names: impl FnMut() -> String) -> PathBuf {
+    std::fs::create_dir_all(root).expect("the scratch root");
+    loop {
+        let dir = root.join(names());
         match std::fs::create_dir(&dir) {
             Ok(()) => return dir,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -38,15 +46,26 @@ fn exclusive_dir(root: &Path) -> PathBuf {
     }
 }
 
-/// A fixture is empty even when a directory of the same shape already
-/// holds a log: the name taken is refused and the next one is used.
+/// Two fixtures never share a directory, and each starts empty.
 #[test]
-fn a_fixture_never_reopens_an_existing_log() {
+fn fixtures_get_distinct_empty_directories() {
     let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("conformance");
     let first = exclusive_dir(&root);
     let second = exclusive_dir(&root);
     assert_ne!(first, second);
     assert_eq!(std::fs::read_dir(&second).unwrap().count(), 0);
+}
+
+/// A forced collision: the first name offered already holds a log from an
+/// earlier run, so it is skipped and the fixture gets the next, empty one.
+#[test]
+fn a_taken_name_holding_a_log_is_skipped() {
+    let root = exclusive_dir(&PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("collision"));
+    drop(attest_store::open(&root.join("taken")).expect("an earlier run's log"));
+    let mut names = ["taken", "free"].into_iter().map(String::from);
+    let dir = create_first_free(&root, || names.next().expect("a name"));
+    assert_eq!(dir, root.join("free"));
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
 }
 
 macro_rules! suites {
