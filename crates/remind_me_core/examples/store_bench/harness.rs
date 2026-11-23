@@ -87,6 +87,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod bodies;
 mod cold;
+pub mod crash;
 mod d1;
 mod g1;
 mod package;
@@ -117,6 +118,12 @@ pub type Opener = fn(&Path) -> Result<Box<dyn Backend>>;
 /// the first directory, into the second, a new directory.
 pub type Packager = fn(&Database, &Path, &Path) -> Result<()>;
 
+/// Checks the integrity of a candidate's closed store in a directory, in
+/// the candidate's own terms (D56); what it checked, or why it failed.
+pub type Verifier = fn(&Path) -> Result<Value>;
+
+pub use crash::{verify_engine, verify_sqlite};
+
 /// A [`Packager`] for a backend whose `backup_to` is the whole store (the
 /// engine, SQLite): its backup, moved into `dest`.
 pub fn backup_package(db: &Database, _store: &Path, dest: &Path) -> Result<()> {
@@ -136,6 +143,8 @@ pub struct Candidate {
     pub restore: Opener,
     /// Writes the backup that goes in the package's `store/`.
     pub package: Packager,
+    /// Checks the closed store's integrity after a crash (G6).
+    pub verify: Verifier,
 }
 
 impl Candidate {
@@ -255,6 +264,18 @@ pub fn run(candidates: &[Candidate]) -> Result<()> {
             owned_run(dir)?;
             return cold::cold_child(candidate, dir);
         }
+    }
+    // G6 (D56, D57): `crash <backend> d1:<backup> <dir>`, and its child
+    // `crash-child <backend> <run dir> <stream> <seed>`, its start on stdin.
+    match args.as_slice() {
+        [mode, backend, set, dir] if mode == "crash" => {
+            let candidate = find(candidates, backend)?;
+            let report = crash::run(candidate, set, Path::new(dir), crash::KILLS, crash::exe)?;
+            println!("{}", Value::Object(report));
+            return Ok(());
+        }
+        [mode, rest @ ..] if mode == "crash-child" => return crash::child_from(candidates, rest),
+        _ => {}
     }
     // G2 (D58-D60): `relevance <backend> golden <dir>`, or with D1 and the
     // #1563 set: `relevance <backend> d1:<backup> <dir> <queries> <vectors>`.
@@ -1801,7 +1822,13 @@ fn rss_mb() -> Option<f64> {
 
 /// A `/proc/self/status` field given in kB, in MB.
 fn status_mb(field: &str) -> Option<f64> {
-    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    proc_status_mb("self", field)
+}
+
+/// A `/proc/<process>/status` field given in kB, in MB; `process` is a
+/// pid or `self`.
+fn proc_status_mb(process: &str, field: &str) -> Option<f64> {
+    let status = std::fs::read_to_string(format!("/proc/{process}/status")).ok()?;
     let line = status.lines().find(|l| l.starts_with(field))?;
     let kb: f64 = line.split_whitespace().nth(1)?.parse().ok()?;
     Some((kb / 10.24).round() / 100.0)
@@ -1938,6 +1965,7 @@ mod tests {
             tables: |_| Err("unused".into()),
             restore: |_| Err("unused".into()),
             package: backup_package,
+            verify: |_| Err("unused".into()),
         };
         let error = measure(
             candidate,

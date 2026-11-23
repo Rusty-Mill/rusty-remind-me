@@ -40,6 +40,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "remind_me_core",
+ "rusqlite",
  "rusty_serde",
  "serde",
  "serde_json",

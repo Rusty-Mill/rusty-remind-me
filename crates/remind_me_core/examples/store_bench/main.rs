@@ -25,6 +25,7 @@ const ENGINE: Candidate = Candidate {
     tables: engine,
     restore: engine,
     package: backup_package,
+    verify: harness::verify_engine,
 };
 
 const SQLITE: Candidate = Candidate {
@@ -32,6 +33,7 @@ const SQLITE: Candidate = Candidate {
     tables: sqlite,
     restore: sqlite,
     package: backup_package,
+    verify: harness::verify_sqlite,
 };
 
 fn main() -> Result<()> {
@@ -170,6 +172,73 @@ mod tests {
             .unwrap()
             .path
             .into()
+    }
+
+    /// The variable carrying a crash child's arguments to this test runner.
+    #[cfg(unix)]
+    const CRASH_CHILD: &str = "STORE_BENCH_CRASH_CHILD";
+
+    /// A crash child in this test runner, which has no `crash-child` mode:
+    /// the runner re-run on `crash_child_entry` alone.
+    #[cfg(unix)]
+    fn test_child(args: &[String]) -> Result<std::process::Command> {
+        let mut command = std::process::Command::new(std::env::current_exe()?);
+        command
+            .args(["tests::crash_child_entry", "--exact", "--nocapture"])
+            .args(["--test-threads=1", "-q"])
+            .env(CRASH_CHILD, serde_json::to_string(args)?);
+        Ok(command)
+    }
+
+    /// The crash child when the runner is started as one; else nothing.
+    #[cfg(unix)]
+    #[test]
+    fn crash_child_entry() {
+        let Ok(args) = std::env::var(CRASH_CHILD) else {
+            return;
+        };
+        let args: Vec<String> = serde_json::from_str(&args).unwrap();
+        harness::crash::child_from(&[ENGINE, SQLITE], &args).unwrap();
+    }
+
+    /// G6: writers killed for real, a few rounds of each stream on a copy
+    /// of a small D1. On SQLite they leave only whole writes and every check
+    /// passes, the integrity check included. The engine's run completes
+    /// too, but may fail: its page does not cover `memory_revisions`, so a
+    /// kill inside an update can leave the revision without the row change.
+    #[cfg(unix)]
+    #[test]
+    fn killed_writers_leave_whole_writes_on_sqlite() {
+        let _serial = harness::serial();
+        let root = std::env::temp_dir().join(format!("store_bench_crash_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let backup = small_backup(&root);
+        let set = format!("d1:{}", backup.display());
+        for candidate in [ENGINE, SQLITE] {
+            let report =
+                harness::crash::run(candidate, &set, &root.join("runs"), 3, test_child).unwrap();
+            let report = serde_json::Value::Object(report);
+            assert!(report.get("aborted").is_none(), "{report}");
+            if candidate.name == "sqlite" {
+                assert_eq!(report["passed"], true, "{report}");
+            }
+            let rounds = report["rounds"].as_array().unwrap();
+            assert_eq!(rounds.len(), 6, "{report}");
+            for stream in ["writes", "pages"] {
+                let acked: u64 = rounds
+                    .iter()
+                    .filter(|r| r["stream"] == stream)
+                    .map(|r| r["acked"].as_u64().unwrap())
+                    .sum();
+                assert!(acked > 0, "{stream}: {report}");
+            }
+            assert!(
+                report["final"]["check"]["integrity"].is_object(),
+                "{report}"
+            );
+            assert!(report["memories_tracked"].as_u64().unwrap() > 0, "{report}");
+        }
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// D1 loads every row kind through the ports into each candidate, and

@@ -22,3 +22,6 @@ chrono = "0.4"
 chrono-tz = "0.10"
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
+# For the crash mode's SQLite integrity check; the version and features
+# remind_me_core already takes, so nothing new enters the lockfile.
+rusqlite = { version = "0.41", features = ["bundled"] }
