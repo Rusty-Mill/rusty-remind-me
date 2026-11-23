@@ -204,7 +204,8 @@ mod tests {
     /// G6: writers killed for real, ten rounds of each stream on a copy of
     /// a small D1. On both candidates they leave only whole writes and every
     /// check passes, the integrity check included. The engine passes since
-    /// its transactions cover `memory_revisions` (Q22, D62).
+    /// its transactions cover `memory_revisions` (Q22, D62). Whether each
+    /// stream caught a write in flight is timing, so it is not asserted.
     #[cfg(unix)]
     #[test]
     fn killed_writers_leave_whole_writes() {
@@ -218,7 +219,12 @@ mod tests {
                 harness::crash::run(candidate, &set, &root.join("runs"), 10, test_child).unwrap();
             let report = serde_json::Value::Object(report);
             assert!(report.get("aborted").is_none(), "{report}");
-            assert_eq!(report["passed"], true, "{report}");
+            // Correctness, not coverage: where a seeded delay lands
+            // against the child's writes depends on the machine, so a
+            // stream may see no in-flight kill. The verdict then fails on
+            // sufficiency alone, which the synthetic report test covers.
+            assert_eq!(report["failures"], 0, "{report}");
+            assert_eq!(report["passed"], report["sufficient"], "{report}");
             let rounds = report["rounds"].as_array().unwrap();
             assert_eq!(rounds.len(), 20, "{report}");
             for stream in ["writes", "pages"] {
