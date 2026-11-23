@@ -227,6 +227,29 @@ class Run(unittest.TestCase):
         self.assertEqual(first['message']['content'][0]['input']['pin'], {'token': '[REDACTED:secret]'})
         self.assertEqual(first['message']['content'][0]['input']['user'], 'bob')
 
+    def test_cards_beside_unicode_digits_are_masked_as_the_server_masks_them(self):
+        # remind_me_core::redact::card_numbers reads ASCII digits only: an Arabic-Indic or
+        # full-width digit neither joins a card's digit run nor glues it. Fake test card only.
+        card, mark = '4111111111111111', '[REDACTED:card_number]'
+        cases = {
+            f'a \u0663{card} b': f'a \u0663{mark} b',                 # Arabic-Indic digit before
+            f'a {card}\uff14 b': f'a {mark}\uff14 b',                 # full-width digit after
+            f'a \u0663.{card} b': f'a \u0663.{mark} b',               # not an ASCII decimal point
+            f'a {card}.\u0663 b': f'a {mark}.\u0663 b',
+            'a 4111 1111 1111 1111 \u0663\u0663 b': f'a {mark} \u0663\u0663 b',
+            'a \uff14' + '\uff11' * 15 + ' b': 'a \uff14' + '\uff11' * 15 + ' b',  # full-width card
+            'a \u0664' + '\u0661' * 15 + ' b': 'a \u0664' + '\u0661' * 15 + ' b',  # Arabic-Indic card
+        }
+        lines = [{'type': 'user', 'message': {'content': text}} for text in cases]
+        self.transcript.write_text(''.join(json.dumps(line, ensure_ascii=False) + '\n' for line in lines),
+                                   encoding='utf-8')
+        self.assertEqual(self.run_hook(self.payload()), 'captured')
+        sent = json.loads(FakeServer.bodies[-1].decode('utf-8'))
+        transcript = sent['params']['arguments']['transcript']
+        got = [json.loads(line)['message']['content'] for line in transcript.splitlines()]
+        self.assertEqual(got, list(cases.values()))
+        self.assertNotIn(card, FakeServer.bodies[-1].decode('utf-8'))
+
     def test_the_negotiated_protocol_version_is_used_or_refused(self):
         FakeServer.init_version = '2025-03-26'
         self.assertEqual(self.run_hook(self.payload()), 'captured')

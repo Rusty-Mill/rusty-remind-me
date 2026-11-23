@@ -173,7 +173,9 @@ def mixes_case_and_digits(run):
 
 
 # Digit groups joined by single spaces or hyphens, not glued to a letter, digit or decimal point.
-DIGIT_GROUPS = re.compile(r'(?<![A-Za-z0-9])(?<!\d\.)\d+(?:[ -]\d+)*')
+# ASCII only, as remind_me_core::redact::card_numbers: a Unicode digit (Arabic-Indic, full-width)
+# neither joins a group nor glues one, so the hook masks exactly what the server masks.
+DIGIT_GROUPS = re.compile(r'(?<![A-Za-z0-9])(?<![0-9]\.)[0-9]+(?:[ -][0-9]+)*')
 
 
 def is_card(digits):
@@ -211,8 +213,8 @@ def redact_cards(text, mark):
     """`text` with every card number, written as a run or in separated groups, replaced by `mark`."""
     def windows(m):
         run = m.group(0)
-        groups = [(g.start(), g.end(), g.group(0)) for g in re.finditer(r'\d+', run)]
-        glued = re.match(r'[A-Za-z0-9]|\.\d', text[m.end():m.end() + 2])
+        groups = [(g.start(), g.end(), g.group(0)) for g in re.finditer(r'[0-9]+', run)]
+        glued = re.match(r'[A-Za-z0-9]|\.[0-9]', text[m.end():m.end() + 2])
         spans = []
         for first in range(len(groups)):
             digits, found = '', None
