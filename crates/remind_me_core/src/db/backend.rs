@@ -252,6 +252,11 @@ impl BackendLock {
         }
     }
 
+    /// Whether the calling thread holds the gate: has a transaction open.
+    pub(crate) fn held_here(&self) -> bool {
+        self.gate.lock().owner == Some(std::thread::current().id())
+    }
+
     /// Claim the gate for the calling thread. A thread that already holds
     /// it is refused, and keeps it: transactions do not nest, and a nested
     /// begin must not touch the outer transaction's ownership.

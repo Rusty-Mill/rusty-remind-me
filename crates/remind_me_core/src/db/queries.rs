@@ -301,9 +301,12 @@ pub fn update_memory_with(
         sensitive: input.sensitive,
         project: edit.project.clone().map(Some),
     };
-    crate::history::capture_revision(store, &input.memory_id, &tracked, None)?;
-
-    Memories::new(store).apply_edit(&input.memory_id, &edit)?;
+    // The revision and the edit land together or not at all (Q21): a
+    // revision without its edit would hold the current value as history.
+    store.atomically(|store| -> Result<()> {
+        crate::history::capture_revision(store, &input.memory_id, &tracked, None)?;
+        Memories::new(store).apply_edit(&input.memory_id, &edit)
+    })?;
 
     // Only a content change invalidates the stored embeddings — category,
     // tags and metadata don't change what the text means. Best-effort, same
@@ -351,22 +354,30 @@ pub fn delete_memory(store: &Store<'_>, memory_id: &str) -> Result<bool> {
     };
     refuse_protected(store, &[memory_id.to_string()])?;
 
-    // A tombstoned memory's embeddings are stale the moment it stops being
-    // searchable, same as an incoming sync tombstone's are, so they go on
-    // either path.
-    crate::vectors::delete_chunks_for_memory(store, memory_id)?;
+    // Every part of the delete lands, or none does (Q21): a crash between
+    // them must not leave a deleted memory's revisions holding its text.
+    let deleted = store.atomically(|store| -> Result<bool> {
+        // A tombstoned memory's embeddings are stale the moment it stops
+        // being searchable, same as an incoming sync tombstone's are, so
+        // they go on either path.
+        crate::vectors::delete_chunks_for_memory(store, memory_id)?;
 
-    let tombstone_at = crate::sync::store_syncs(store)?.then(|| Utc::now().to_rfc3339());
-    if !memories.delete_live(memory_id, tombstone_at.as_deref())? {
+        let tombstone_at = crate::sync::store_syncs(store)?.then(|| Utc::now().to_rfc3339());
+        if !Memories::new(store).delete_live(memory_id, tombstone_at.as_deref())? {
+            return Ok(false);
+        }
+
+        // Entities themselves survive — other memories may still mention them.
+        crate::db::entities::Entities::new(store).unlink_memory(memory_id)?;
+        crate::db::feedback::Feedback::new(store).delete_for(memory_id)?;
+        crate::db::related::Related::new(store).unlink_memory(memory_id)?;
+        // Its history would keep the text the delete removes (ADR-0024).
+        crate::db::history::Revisions::new(store).delete_for(memory_id)?;
+        Ok(true)
+    })?;
+    if !deleted {
         return Ok(false);
     }
-
-    // Entities themselves survive — other memories may still mention them.
-    crate::db::entities::Entities::new(store).unlink_memory(memory_id)?;
-    crate::db::feedback::Feedback::new(store).delete_for(memory_id)?;
-    crate::db::related::Related::new(store).unlink_memory(memory_id)?;
-    // Its history would keep the text the delete removes (ADR-0024).
-    crate::db::history::Revisions::new(store).delete_for(memory_id)?;
 
     crate::events::emit(crate::events::Event::Deleted, memory_id, &category);
 

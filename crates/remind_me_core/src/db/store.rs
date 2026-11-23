@@ -74,6 +74,30 @@ impl<'a> Store<'a> {
         Ok(done)
     }
 
+    /// Run `work` atomically: inside the transaction this thread already
+    /// has open, whose outcome its writes then share, or else as a
+    /// transaction of its own ([`Store::transaction`]). For a write that
+    /// must never land in part but may be called from inside a larger one
+    /// (transactions do not nest). Joined, an error from `work` is undone
+    /// only if the caller passes it up so the outer transaction rolls
+    /// back: a caller that swallows it and commits keeps the part written.
+    ///
+    /// # Errors
+    ///
+    /// As [`Store::transaction`].
+    pub(crate) fn atomically<T, E>(
+        &self,
+        work: impl FnOnce(&Store<'_>) -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E>
+    where
+        E: From<StoreError>,
+    {
+        if self.backend.held_here() {
+            return work(self);
+        }
+        self.transaction(work)
+    }
+
     /// Where a background thread can reopen this store. `None` for an
     /// in-memory database, which exists only as long as its `Database`.
     pub fn secondary_source(&self) -> Option<SecondarySource> {
@@ -213,6 +237,80 @@ mod tests {
         assert_eq!(seen[1], "false Some([1]) []", "the failed one left nothing");
         assert_eq!(seen[2], "Ok(1)");
         assert_eq!(seen[3], "true Some([2]) [\"d1\"]", "the other landed whole");
+    }
+
+    #[test]
+    fn atomically_opens_a_transaction_or_joins_the_open_one() {
+        use crate::db::memories::{Memories, NewMemory};
+        use crate::db::queries::get_memory_by_id;
+        const NOW: &str = "2026-11-23T00:00:00+00:00";
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        let insert =
+            |s: &Store<'_>, id: &str| Memories::new(s).insert(&NewMemory::new(id, "x", NOW));
+        let there = |id: &str| get_memory_by_id(&store, id).unwrap().is_some();
+
+        // On its own: a transaction of its own, rolled back by its error.
+        let alone: Result<()> = store.atomically(|s| {
+            insert(s, "alone")?;
+            Err(StoreError::Invalid("gave up".into()))
+        });
+        assert!(alone.is_err());
+        assert!(!there("alone"));
+
+        // Inside a transaction: no nesting error, and the outer outcome
+        // decides.
+        let mut joined = None;
+        let outer: Result<()> = store.transaction(|s| {
+            joined = Some(s.atomically(|s| insert(s, "inner")).is_ok());
+            Err(StoreError::Invalid("outer gave up".into()))
+        });
+        assert!(outer.is_err());
+        assert_eq!(joined, Some(true));
+        assert!(!there("inner"));
+        store
+            .transaction(|s| s.atomically(|s| insert(s, "kept")))
+            .unwrap();
+        assert!(there("kept"));
+    }
+
+    /// An update and a delete join the caller's transaction (Q21): rolled
+    /// back with it, they leave the row and its revisions as they were.
+    #[test]
+    fn an_update_and_a_delete_share_the_callers_transaction() {
+        use crate::db::history::Revisions;
+        use crate::db::queries::{add_memory, delete_memory, get_memory_by_id, update_memory};
+        use crate::models::{MemoryAddInput, MemoryUpdateInput};
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        let input = MemoryAddInput {
+            content: "first".into(),
+            category: "fact".into(),
+            ..MemoryAddInput::default()
+        };
+        let id = add_memory(&store, input).unwrap().id;
+        let edit: MemoryUpdateInput =
+            serde_json::from_value(serde_json::json!({ "memory_id": id, "content": "second" }))
+                .unwrap();
+        let undone: Result<()> = store.transaction(|s| {
+            update_memory(s, &edit)?;
+            assert_eq!(
+                Revisions::new(s).list(&id, 10)?.len(),
+                1,
+                "readable as it goes"
+            );
+            delete_memory(s, &id)?;
+            Err(StoreError::Invalid("rolled back".into()))
+        });
+        assert!(undone.is_err());
+        let memory = get_memory_by_id(&store, &id).unwrap().unwrap();
+        assert_eq!(memory.content, "first");
+        assert!(Revisions::new(&store).list(&id, 10).unwrap().is_empty());
+        // On their own they still land.
+        update_memory(&store, &edit).unwrap();
+        assert_eq!(Revisions::new(&store).list(&id, 10).unwrap().len(), 1);
+        assert!(delete_memory(&store, &id).unwrap());
+        assert!(Revisions::new(&store).list(&id, 10).unwrap().is_empty());
     }
 
     #[test]
