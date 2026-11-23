@@ -743,6 +743,117 @@ fn an_unavailable_archive_fails_no_capture() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A capture whose archive write failed gets its source when the same
+/// transcript is sent again once the archive is back (#1621): the first
+/// row's exact bytes are kept once, and no dialog row is added.
+#[test]
+fn a_resent_capture_repairs_a_first_row_source_lost_to_an_outage() {
+    use remind_me_core::transcript::{capture_transcript, captured_messages};
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_limits();
+
+    let dir = scratch("repair-first");
+    let blocker = dir.join("not-a-dir");
+    std::fs::write(&blocker, b"a file where the archive should go").unwrap();
+    crate::test_env::set_var(ARCHIVE_DIR_ENV, blocker.join("archive"));
+    let db = open();
+    let store = db.store();
+    let full = lines(1..=3).join("\n");
+
+    let made = capture_transcript(&store, &full, &session_request()).unwrap();
+    assert!(archive::source_for(&store, &made.dialog_id, true)
+        .unwrap()
+        .is_none());
+
+    std::fs::remove_file(&blocker).unwrap();
+    let again = capture_transcript(&store, &full, &session_request()).unwrap();
+    assert_eq!(again.dialog_id, made.dialog_id);
+    assert_eq!(source(&store, &made.dialog_id), full);
+    assert_eq!(
+        archived(&store, &archive::session_import_id("sess_abc")),
+        full
+    );
+
+    let check = |label: &str| {
+        assert!(continuation_ids(&store, "sess_abc").is_empty(), "{label}");
+        assert_eq!(captured_messages(&store, "sess_abc").unwrap(), Some(3));
+        assert_eq!(archive_rows(&store), 1, "{label}: kept once");
+    };
+    check("after the repair");
+    capture_transcript(&store, &full, &session_request()).unwrap();
+    check("after a second resend");
+    assert_eq!(source(&store, &made.dialog_id), full);
+
+    crate::test_env::remove_var(ARCHIVE_DIR_ENV);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The same for a continuation row: the grown transcript is recorded while
+/// the archive is down, then resent once it is back. The continuation gets
+/// exactly its own lines; the first row keeps its source.
+#[test]
+fn a_resent_capture_repairs_a_continuation_source_lost_to_an_outage() {
+    use remind_me_core::transcript::capture_transcript;
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_limits();
+
+    let dir = scratch("repair-continuation");
+    let root = dir.join("archive");
+    crate::test_env::set_var(ARCHIVE_DIR_ENV, &root);
+    let db = open();
+    let store = db.store();
+    let all = lines(1..=4);
+    let first = all[..2].join("\n");
+    let grown = all.join("\n");
+    capture_transcript(&store, &first, &session_request()).unwrap();
+
+    let blocker = dir.join("not-a-dir");
+    std::fs::write(&blocker, b"a file where the archive should go").unwrap();
+    crate::test_env::set_var(ARCHIVE_DIR_ENV, blocker.join("archive"));
+    capture_transcript(&store, &grown, &session_request()).unwrap();
+    let continuation = continuation_ids(&store, "sess_abc");
+    assert_eq!(continuation.len(), 1);
+    assert!(archive::source_for(&store, &continuation[0], true)
+        .unwrap()
+        .is_none());
+
+    crate::test_env::set_var(ARCHIVE_DIR_ENV, &root);
+    capture_transcript(&store, &grown, &session_request()).unwrap();
+    assert_sources(&store, "sess_abc", &first, &[all[2..].join("\n")]);
+    assert_eq!(archive_rows(&store), 2, "the session and the row");
+
+    crate::test_env::remove_var(ARCHIVE_DIR_ENV);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A resend that does not hold a row's messages exactly leaves that row
+/// without a source rather than pointing it at other bytes.
+#[test]
+fn a_shorter_resend_does_not_repair_a_row_it_does_not_hold() {
+    use remind_me_core::transcript::capture_transcript;
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_limits();
+
+    let dir = scratch("repair-shorter");
+    let blocker = dir.join("not-a-dir");
+    std::fs::write(&blocker, b"a file where the archive should go").unwrap();
+    crate::test_env::set_var(ARCHIVE_DIR_ENV, blocker.join("archive"));
+    let db = open();
+    let store = db.store();
+    let all = lines(1..=4);
+    let made = capture_transcript(&store, &all.join("\n"), &session_request()).unwrap();
+
+    std::fs::remove_file(&blocker).unwrap();
+    capture_transcript(&store, &all[..2].join("\n"), &session_request()).unwrap();
+    assert!(archive::source_for(&store, &made.dialog_id, true)
+        .unwrap()
+        .is_none());
+    assert_eq!(archive_rows(&store), 0);
+
+    crate::test_env::remove_var(ARCHIVE_DIR_ENV);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The archived transcript is scrubbed as the dialog is: the source of a
 /// capture never returns a secret its dialog redacted.
 #[test]
