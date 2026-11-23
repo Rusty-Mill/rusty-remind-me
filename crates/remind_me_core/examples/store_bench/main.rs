@@ -348,4 +348,109 @@ mod tests {
         assert_eq!(report["restore"]["matched"], true);
         std::fs::remove_dir_all(&root).unwrap();
     }
+
+    /// G2's golden set runs through the eval test's own code on a
+    /// candidate against the engine, and the engine matches its baseline.
+    #[test]
+    fn the_golden_set_scores_a_candidate_against_the_engine() {
+        let _serial = harness::serial();
+        let root = std::env::temp_dir().join(format!("store_bench_g2_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let report = harness::relevance_run(SQLITE, "golden", &root, None).unwrap();
+        let golden = &report["golden"];
+        assert_eq!(golden["valid"], true, "{golden}");
+        assert_eq!(
+            golden["cells"].as_object().unwrap().len(),
+            8,
+            "keyword and hashed, 4 strategies"
+        );
+        assert_eq!(
+            golden["reported"].as_object().unwrap().len(),
+            8,
+            "the +dates modes"
+        );
+        assert!(golden["misses"].is_array() && golden["passed"].is_boolean());
+        assert_eq!(report["gates"], serde_json::json!(["G2"]));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The #1563 set on D1: vectors checked against the store's identity,
+    /// missing relevant ids left out, a query with none dropped by ordinal.
+    #[cfg(unix)]
+    #[test]
+    fn the_real_set_scores_d1_and_drops_queries_it_cannot_hold() {
+        use remind_me_core::db::queries;
+        use remind_me_core::db::vectors::Vectors;
+        use remind_me_core::models::MemoryListInput;
+        let _serial = harness::serial();
+        let root = std::env::temp_dir().join(format!("store_bench_1563_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let backup = small_backup(&root);
+        let picked: Vec<(String, String)> = {
+            let db = remind_me_core::Database::open_backend(
+                Box::new(EngineTables::open(&backup).unwrap()),
+                None,
+            )
+            .unwrap();
+            let store = db.store();
+            let v = Vectors::new(&store);
+            for (k, value) in [("backend", "test"), ("model", "fixture"), ("dim", "8")] {
+                v.set_meta(k, value, "2026-11-23").unwrap();
+            }
+            let input = MemoryListInput {
+                limit: 3,
+                category: Some("fact".into()),
+                ..MemoryListInput::default()
+            };
+            queries::list_memories(&store, &input)
+                .unwrap()
+                .memories
+                .into_iter()
+                .map(|m| (m.id, m.content))
+                .collect()
+        };
+        assert_eq!(picked.len(), 3);
+        let mut q = String::new();
+        let mut v = String::from(
+            "{\"backend\":\"test\",\"model\":\"fixture\",\"dim\":8,\"role\":\"query\",\"backup\":\"small\"}\n",
+        );
+        let lines = picked
+            .iter()
+            .map(|(id, content)| (content.clone(), vec![id.clone()]))
+            .chain([(
+                "no such memory".to_string(),
+                vec!["mem_missing".to_string()],
+            )]);
+        for (n, (text, relevant)) in lines.enumerate() {
+            let row = serde_json::json!({ "query": text, "relevant": relevant, "kind": "real" });
+            q.push_str(&format!("{row}\n"));
+            let vector =
+                serde_json::json!({ "n": n + 1, "query": text, "vector": vec![0.5_f32; 8] });
+            v.push_str(&format!("{vector}\n"));
+        }
+        let files = root.join("files");
+        std::fs::create_dir_all(&files).unwrap();
+        std::fs::write(files.join("q.jsonl"), q).unwrap();
+        std::fs::write(files.join("v.jsonl"), v).unwrap();
+        let set = format!("d1:{}", backup.display());
+        let report = harness::relevance_run(
+            ENGINE,
+            &set,
+            &root.join("runs"),
+            Some((&files.join("q.jsonl"), &files.join("v.jsonl"))),
+        )
+        .unwrap();
+        let real = &report["real_1563"];
+        assert_eq!(real["queries"], 4);
+        assert_eq!(real["scored"], 3);
+        assert_eq!(real["dropped"], serde_json::json!([4]));
+        assert_eq!(real["relevant_ids_missing"], 1);
+        assert_eq!(real["cells"].as_object().unwrap().len(), 8);
+        assert_eq!(real["passed"], true, "the engine against itself");
+        assert!(
+            !real.to_string().contains("no such memory"),
+            "no query text"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 }

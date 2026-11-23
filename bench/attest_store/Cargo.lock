@@ -37,6 +37,8 @@ name = "attest_store"
 version = "0.1.0"
 dependencies = [
  "attest",
+ "chrono",
+ "chrono-tz",
  "remind_me_core",
  "rusty_serde",
  "serde",

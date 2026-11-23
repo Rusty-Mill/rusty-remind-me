@@ -399,13 +399,13 @@ pub struct Report {
     pub violations: Vec<String>,
 }
 
-/// Score every golden query under each strategy in `mode`, on a fresh store
-/// from `open` loaded with the fixture, into `report`; the per-kind lines
-/// and misses go to `out`.
+/// Score every golden query under each strategy in `mode`, on `db` (a
+/// fresh, empty store) loaded with the fixture, into `report`; the per-kind
+/// lines and misses go to `out`.
 pub fn evaluate_in(
     mode: &str,
     embedder: Option<&dyn Embedder>,
-    open: &mut dyn FnMut() -> Database,
+    db: &Database,
     out: &mut dyn Write,
     report: &mut Report,
 ) {
@@ -416,7 +416,6 @@ pub fn evaluate_in(
 
     // Search here does not write (no access or co-retrieval bookkeeping), so
     // one store serves every strategy and query order cannot matter.
-    let db = open();
     let store = db.store();
     load(&store, &memories, embedder);
 

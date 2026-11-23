@@ -66,8 +66,8 @@ fn fixture_dir() -> PathBuf {
 
 /// One mode on an in-memory engine store, its lines printed.
 fn evaluate(mode: &str, embedder: Option<&dyn Embedder>, report: &mut Report) {
-    let mut open = || Database::open_in_memory().unwrap();
-    evaluate_in(mode, embedder, &mut open, &mut std::io::stdout(), report);
+    let db = Database::open_in_memory().unwrap();
+    evaluate_in(mode, embedder, &db, &mut std::io::stdout(), report);
 }
 
 /// Held by every test here that reads or writes the model-stage variables.
