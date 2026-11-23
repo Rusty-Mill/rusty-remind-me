@@ -225,6 +225,22 @@ mod tests {
             // sufficiency alone, which the synthetic report test covers.
             assert_eq!(report["failures"], 0, "{report}");
             assert_eq!(report["passed"], report["sufficient"], "{report}");
+            // `insufficient` names exactly the streams no kill caught
+            // inside a write, by the report's own counts.
+            let caught = |stream: &str| {
+                let k = &report["kills"][stream];
+                k["inside_a_write_not_landed"].as_u64().unwrap()
+                    + k["inside_a_write_landed"].as_u64().unwrap()
+            };
+            let expected: Vec<&str> = ["pages", "writes"]
+                .into_iter()
+                .filter(|s| caught(s) == 0)
+                .collect();
+            assert_eq!(
+                report["insufficient"],
+                serde_json::json!(expected),
+                "{report}"
+            );
             let rounds = report["rounds"].as_array().unwrap();
             assert_eq!(rounds.len(), 20, "{report}");
             for stream in ["writes", "pages"] {
