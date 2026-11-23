@@ -2,6 +2,22 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-23 — Updates and deletes are atomic; an engine transaction covers revisions and the wiki (Q21, Q22, D62)
+
+### Fixed
+- An update now writes its revision and its edit in one transaction, and a delete removes the row, its chunks, links, feedback, associations and revisions in one (Q21). If the caller already has a transaction open, they join it, so `bulk_delete`, undo-import and any other caller inside a larger write keep working. Before this fix, a crash between the steps could leave a revision holding the current value, or a deleted memory's revisions still holding its text.
+- In an engine transaction, writes to the tables outside the memories core now land with the transaction or not at all, as core writes already did. Those tables are revisions, wiki pages, links and meta, saved searches, import archives, the sync log and analytics. Each such write first puts the record it replaces in the undo log, synced, and joins the transaction's redo batch. A crash before the commit, or a rolled-back transaction, now puts those writes back. A crash after the commit keeps them. Before this fix, a process killed inside an update could keep the new revision and lose the change to the memory. R3's crash check found this (Q22).
+- A write to one of those tables that fails inside a transaction now stops the transaction from committing, even if its caller handles the error: committing it would journal a write the tables never took. The transaction can then only be rolled back.
+- A revision whose project was known to be empty keeps that through the undo and redo logs and a change sink. Plain JSON wrote it like an unknown project, so a rolled-back or replayed revision lost the difference, and reverting to it left the project alone. The JSON form for it is now `{"known": null}`; a project name and an unknown project are written as before, and the revisions table's own format is unchanged.
+
+### Downgrading
+- The undo log and the redo journal can now hold writes to those tables, and a build from before this change cannot open a store where either still does. The undo log can hold them after a crash inside a transaction. The redo journal can hold them alone after a crash, or a failed checkpoint, between a commit and its checkpoints, and a transaction error that leaves the store needing reopening leaves them there too, even if the process then stops in an orderly way. Before downgrading, open the store with this build, make sure it opens without error (opening rolls back the undo log, replays the redo journal and empties both), then stop it with no crash or failed transaction after that open.
+
+### Tests
+- `atomically` rolls back on its own error and, inside a transaction, joins it without a nesting error, so the outer outcome decides. An update and a delete inside a rolled-back transaction leave the row and its revisions as they were, and on their own they still land.
+- A crash inside a transaction, a rolled-back transaction, a committed one, and a crash after the commit, each with a revision added, a revision deleted and a wiki page written, leave every table as the transaction's outcome says. The wiki's search follows.
+- A noted write that never lands, or a failed operation, inside a transaction makes the commit fail and roll back. A deleted revision whose project was known to be empty comes back that way after a rollback and after a crash. Revision JSON round-trips all three project states and still reads the older form, and the revisions table keeps every state across a reopen.
+
 ## 2026-11-23 — Store benchmark: D3 bulk ingest with searches alongside (Millwright R3, Mill Board #1618, D55 PR B)
 
 ### Added

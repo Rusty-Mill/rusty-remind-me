@@ -46,8 +46,56 @@ pub struct RevisionRecord {
     pub(super) revision_reason: Option<String>,
     /// The project the edit replaced, or `None` when unknown (a revision
     /// from before v33, or copied from SQLite, which never stored it).
-    #[serde(default)]
+    #[serde(default, with = "known_project")]
     pub(super) project: Option<Option<String>>,
+}
+
+/// `RevisionRecord::project` in JSON (the undo log, the redo journal and
+/// a change sink) without losing "known: no project" (Q22).
+///
+/// Plain JSON writes `Some(None)` and `None` both as `null`, and reads
+/// `null` back as `None`, so a revision that cleared its project would
+/// come back as one whose project is unknown, and revert would then leave
+/// the project alone. JSON writes it as `{"known": null}` instead; a name
+/// and an unknown project are written as before, so older JSON reads the
+/// same. Bincode, the table's own format, is not human-readable and keeps
+/// the derived encoding, so the table's layout does not change.
+mod known_project {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(untagged)]
+    enum Json {
+        Name(String),
+        Known { known: Option<String> },
+    }
+
+    pub(super) fn serialize<S: Serializer>(
+        project: &Option<Option<String>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        if !serializer.is_human_readable() {
+            return project.serialize(serializer);
+        }
+        match project {
+            None => serializer.serialize_none(),
+            Some(Some(name)) => serializer.serialize_some(&Json::Name(name.clone())),
+            Some(None) => serializer.serialize_some(&Json::Known { known: None }),
+        }
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Option<String>>, D::Error> {
+        if !deserializer.is_human_readable() {
+            return Option::<Option<String>>::deserialize(deserializer);
+        }
+        Ok(match Option::<Json>::deserialize(deserializer)? {
+            None => None,
+            Some(Json::Name(name)) => Some(Some(name)),
+            Some(Json::Known { known }) => Some(known),
+        })
+    }
 }
 
 impl RevisionRecord {
@@ -216,6 +264,81 @@ fn of_memory(tables: &EngineTables, memory_id: &str) -> Vec<RevisionRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn record(project: Option<Option<String>>) -> RevisionRecord {
+        RevisionRecord {
+            id: 1,
+            memory_id: "m".into(),
+            content: "c".into(),
+            category: "fact".into(),
+            tags: "[]".into(),
+            metadata: "{}".into(),
+            sensitive: None,
+            edited_at: "2026-09-27T00:00:00+00:00".into(),
+            edited_us: 0,
+            revision_reason: None,
+            project,
+        }
+    }
+
+    #[test]
+    fn json_keeps_a_known_empty_project_apart_from_an_unknown_one() {
+        for project in [None, Some(None), Some(Some("p".to_string()))] {
+            let json = serde_json::to_vec(&record(project.clone())).unwrap();
+            let back: RevisionRecord = serde_json::from_slice(&json).unwrap();
+            assert_eq!(back.project, project);
+        }
+        let known_none = serde_json::to_value(record(Some(None))).unwrap();
+        assert_eq!(known_none["project"], serde_json::json!({ "known": null }));
+    }
+
+    #[test]
+    fn json_from_before_the_known_form_reads_as_it_did() {
+        let mut json = serde_json::to_value(record(None)).unwrap();
+        json["project"] = serde_json::json!("p");
+        let named: RevisionRecord = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(named.project, Some(Some("p".to_string())));
+        json["project"] = serde_json::Value::Null;
+        let unknown: RevisionRecord = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(unknown.project, None);
+        json.as_object_mut().unwrap().remove("project");
+        let absent: RevisionRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(absent.project, None);
+    }
+
+    #[test]
+    fn every_project_state_survives_the_tables_own_format() {
+        let dir = std::env::temp_dir().join(format!(
+            "remind_me_engine_revisions_project_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let states = [None, Some(None), Some(Some("p".to_string()))];
+        {
+            let mut tables = EngineTables::open(&dir).unwrap();
+            for (i, project) in states.iter().enumerate() {
+                let tracked = Tracked {
+                    project: project.clone(),
+                    ..values("a")
+                };
+                HistoryStore::insert(
+                    &mut tables,
+                    &format!("m{i}"),
+                    &tracked,
+                    "2026-09-27T00:00:00+00:00",
+                    None,
+                )
+                .unwrap();
+            }
+        }
+        let tables = crate::db::engine::reopen(&dir);
+        for (i, project) in states.iter().enumerate() {
+            let listed = HistoryStore::list(&tables, &format!("m{i}"), 10).unwrap();
+            assert_eq!(&listed[0].project, project);
+        }
+        drop(tables);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     fn values(content: &str) -> Tracked {
         Tracked {

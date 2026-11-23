@@ -379,8 +379,18 @@ impl EngineTables {
             return Ok(());
         }
         for batch in &batches {
-            for change in decode(batch)? {
+            // A page's batch also holds its writes to the tables outside
+            // the core (`page`), which go back table by table.
+            let (rows, core): (Vec<_>, Vec<_>) = batch
+                .changes
+                .iter()
+                .cloned()
+                .partition(|c| super::capture::is_row_table(&c.store));
+            for change in decode(&Batch { changes: core })? {
                 apply(&mut self.core, change)?;
+            }
+            for row in &rows {
+                self.apply_row(&super::capture::row_of(row))?;
             }
         }
         self.journal.checkpoint().map_err(engine_error)
