@@ -854,6 +854,77 @@ fn a_shorter_resend_does_not_repair_a_row_it_does_not_hold() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A resend whose ids match a row but whose text does not is not the row's
+/// source: matching ids alone never attach bytes to a locked dialog.
+#[test]
+fn a_resend_with_matching_ids_but_other_text_does_not_repair() {
+    use remind_me_core::transcript::capture_transcript;
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_limits();
+
+    let dir = scratch("repair-other-text");
+    let blocker = dir.join("not-a-dir");
+    std::fs::write(&blocker, b"a file where the archive should go").unwrap();
+    crate::test_env::set_var(ARCHIVE_DIR_ENV, blocker.join("archive"));
+    let db = open();
+    let store = db.store();
+    let all = lines(1..=3);
+    let made = capture_transcript(&store, &all.join("\n"), &session_request()).unwrap();
+
+    std::fs::remove_file(&blocker).unwrap();
+    let mut changed: serde_json::Value = serde_json::from_str(&all[1]).unwrap();
+    changed["message"]["content"][1]["text"] = serde_json::json!("not what was said");
+    let resent = [all[0].clone(), changed.to_string(), all[2].clone()].join("\n");
+    capture_transcript(&store, &resent, &session_request()).unwrap();
+    assert!(archive::source_for(&store, &made.dialog_id, true)
+        .unwrap()
+        .is_none());
+    assert_eq!(archive_rows(&store), 0);
+
+    crate::test_env::remove_var(ARCHIVE_DIR_ENV);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A continuation of interleaved turns lost to an outage is repaired from
+/// the same resend: its messages are found by id, not as one run.
+#[test]
+fn a_resent_capture_repairs_an_interleaved_continuation() {
+    use remind_me_core::transcript::capture_transcript;
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_limits();
+
+    let dir = scratch("repair-interleaved");
+    let root = dir.join("archive");
+    crate::test_env::set_var(ARCHIVE_DIR_ENV, &root);
+    let db = open();
+    let store = db.store();
+    let all = lines(1..=5);
+    capture_transcript(&store, &all[..3].join("\n"), &session_request()).unwrap();
+
+    let blocker = dir.join("not-a-dir");
+    std::fs::write(&blocker, b"a file where the archive should go").unwrap();
+    crate::test_env::set_var(ARCHIVE_DIR_ENV, blocker.join("archive"));
+    // Held 1, new 4, held 2, new 5, held 3.
+    let mixed = [&all[0], &all[3], &all[1], &all[4], &all[2]].map(String::as_str);
+    let mixed = mixed.join("\n");
+    capture_transcript(&store, &mixed, &session_request()).unwrap();
+    let continuation = continuation_ids(&store, "sess_abc");
+    assert_eq!(continuation.len(), 1);
+    assert!(archive::source_for(&store, &continuation[0], true)
+        .unwrap()
+        .is_none());
+
+    crate::test_env::set_var(ARCHIVE_DIR_ENV, &root);
+    capture_transcript(&store, &mixed, &session_request()).unwrap();
+    assert_eq!(
+        source(&store, &continuation[0]),
+        format!("{}\n{}", all[3], all[4])
+    );
+
+    crate::test_env::remove_var(ARCHIVE_DIR_ENV);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The archived transcript is scrubbed as the dialog is: the source of a
 /// capture never returns a secret its dialog redacted.
 #[test]

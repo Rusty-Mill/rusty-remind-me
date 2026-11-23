@@ -817,6 +817,12 @@ fn repair(
     }
     match keep {
         Keep::First { row, messages } => {
+            // A line shared with a message past the row would claim a turn
+            // the row does not hold.
+            let own: Vec<usize> = (0..*messages).collect();
+            if slices(&source.spans, &own).is_none() {
+                return Ok(());
+            }
             let archived = crate::archive::archived_bytes(store, &source.session)?;
             if archived.is_some_and(|old| !source.kept.as_bytes().starts_with(&old)) {
                 return Ok(());
@@ -1147,10 +1153,13 @@ fn recapture_in(
 
 /// The rows of the record that `blocks` holds exactly, message for message,
 /// with where in it they sit: what a held copy may repair a lost source
-/// from. A row sits where its first listed id is, else at its recorded
-/// start (the first row at 0, an unplaced row at 0, a placed continuation
-/// at `from_message`); [`holds_exactly`] then decides. A row it does not
-/// show is left out, never guessed.
+/// from. A row's messages are found by the ids it lists, each wherever it
+/// sits (a continuation of interleaved turns is not contiguous), else from
+/// its recorded start (the first row at 0, an unplaced row at 0, a placed
+/// continuation at `from_message`). The ids must agree and the text must
+/// equal the row's, message for message: matching ids alone do not prove
+/// the bytes are the row's. A row it does not show is left out, never
+/// guessed.
 fn held_rows(
     rows: &[crate::models::Memory],
     roles: &HashSet<&str>,
@@ -1160,20 +1169,30 @@ fn held_rows(
     rows.iter()
         .enumerate()
         .filter_map(|(sequence, row)| {
-            let count = held_messages(row);
-            let start = row_start(row, sequence, ids)?;
-            let at = start..start.checked_add(count)?;
-            let fits = count > 0
-                && holds_exactly(row, roles, blocks.get(at.clone())?, ids.get(at.clone())?);
+            let at = row_positions(row, sequence, ids)?;
+            let held: Vec<String> = at
+                .iter()
+                .map(|&i| blocks.get(i).cloned())
+                .collect::<Option<_>>()?;
+            let held_ids: Vec<Option<String>> = at
+                .iter()
+                .map(|&i| ids.get(i).cloned())
+                .collect::<Option<_>>()?;
+            let fits = !at.is_empty()
+                && holds_exactly(row, roles, &held, &held_ids)
+                && same_text(row, roles, &held);
+            if !fits {
+                return None;
+            }
             let id = row.id.clone();
-            fits.then(|| match sequence {
+            Some(match sequence {
                 0 => Keep::First {
                     row: id,
-                    messages: count,
+                    messages: at.len(),
                 },
                 _ => Keep::Continuation {
                     row: id,
-                    indexes: at.collect(),
+                    indexes: at,
                     placed: false,
                 },
             })
@@ -1181,26 +1200,28 @@ fn held_rows(
         .collect()
 }
 
-/// Where `row`, the `sequence`th of its record, would start in a transcript
-/// whose messages carry `ids`.
-fn row_start(
+/// Where the messages of `row`, the `sequence`th of its record, sit in a
+/// transcript whose messages carry `ids`, in order.
+fn row_positions(
     row: &crate::models::Memory,
     sequence: usize,
     ids: &[Option<String>],
-) -> Option<usize> {
-    if sequence == 0 {
-        return Some(0);
+) -> Option<Vec<usize>> {
+    let count = held_messages(row);
+    let listed = position_ids(row);
+    if sequence > 0 && !listed.is_empty() && listed.iter().all(Option::is_some) {
+        let at: Vec<usize> = listed
+            .iter()
+            .map(|want| ids.iter().position(|id| id == want))
+            .collect::<Option<_>>()?;
+        return at.windows(2).all(|w| w[0] < w[1]).then_some(at);
     }
-    if let Some(Some(first)) = position_ids(row).first() {
-        return ids.iter().position(|id| id.as_ref() == Some(first));
-    }
-    if is_unplaced(row) {
-        return Some(0);
-    }
-    row.metadata
-        .get("from_message")
-        .and_then(serde_json::Value::as_u64)
-        .map(|n| n as usize)
+    let start = match sequence {
+        0 => 0,
+        _ if is_unplaced(row) => 0,
+        _ => row.metadata.get("from_message")?.as_u64()? as usize,
+    };
+    Some((start..start.checked_add(count)?).collect())
 }
 
 /// What a recapture of a copy the record already holds reports: the capture
