@@ -1337,7 +1337,12 @@ mod tests {
             None,
         )
         .unwrap();
-        let sqlite = Database::open_in_memory().unwrap();
+        // Not `Database::open_in_memory`: that is the engine again.
+        let sqlite = Database::open_backend(
+            Box::new(remind_me_core::db::sqlite::SqliteTables::open_in_memory().unwrap()),
+            None,
+        )
+        .unwrap();
         for (backend, db) in [("engine", &engine), ("sqlite", &sqlite)] {
             let store = db.store();
             remind_me_core::testing::mark_store_syncing(&store).unwrap();
