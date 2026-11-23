@@ -2,14 +2,14 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
-## 2026-11-22 — Store benchmark: D3 bulk ingest with searches alongside (Millwright R3, Mill Board #1618, D55 PR B)
+## 2026-11-23 — Store benchmark: D3 bulk ingest with searches alongside (Millwright R3, Mill Board #1618, D55 PR B)
 
 ### Added
 - `store_bench` takes `d3:<backup>`: D1, then 50,000 raw pages of 10 to 30 KB bulk-ingested (workload 5), each body to the blob store and its row a head and a link (D50). The four readers search idle first and then beside the ingest, on the same inputs, under D54's validity rule; the ingest keeps going after them until every page is in, and fails the run if it would end first. The report has the total ingest time (the 30-minute target), both reader runs and their hybrid p95 ratio (the 2x target), and the disk after ingest.
-- On a D3 run the cold open's idle memory is G3 and the cold open itself is G7 on D3; against a D1 run's idle memory it gives G5.
+- A D3 run ingests its pages right after the D1 cold open, before any other workload, then takes a second cold open on the store as the ingest left it (`cold_open_after_ingest`): its time is G7 on D3, its child idle memory G3, and that idle over the first cold open's is G5 (`g5_idle_ratio`, null in an in-process run). D1's dialogs already carry their full bodies in the blob store, so D3 adds only the pages. Real datasets need Unix, as D1 and D2 do.
 
 ### Tests
-- D3 ingests its pages beside the readers after an idle run, its bodies land in the blob store, and the restore matches.
+- D3 ingests 6,000 pages beside the readers after an idle run, its bodies land in the blob store, both cold opens run, and the restore matches.
 
 ## 2026-11-22 — Store benchmark: D1 and D2 datasets, cold open and idle memory (Millwright R3, Mill Board #1618, D55 PR A)
 

@@ -318,7 +318,7 @@ mod tests {
         let backup = small_backup(&root);
         let dataset = Dataset::D3 {
             backup,
-            pages: 1_500,
+            pages: 6_000,
         };
         let report = measure(
             SQLITE,
@@ -329,7 +329,7 @@ mod tests {
         )
         .unwrap();
         let ingest = &report["ingest"];
-        assert_eq!(ingest["pages"], 1_500);
+        assert_eq!(ingest["pages"], 6_000);
         assert!(
             ingest["readers_beside_ingest"]["writer_adds"]
                 .as_u64()
