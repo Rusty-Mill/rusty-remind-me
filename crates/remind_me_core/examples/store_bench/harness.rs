@@ -51,8 +51,15 @@
 //! pages are ingested. The second's idle memory is G3, its time G7 on D3,
 //! and its idle over the first's is G5 (`g5_idle_ratio`). D1's dialogs
 //! already carry their full bodies in the blob store, so D3 adds only the
-//! pages. There is no crash or relevance workload yet (D55), so
-//! these are not scoring runs.
+//! pages.
+//!
+//! Two more modes complete R3 (D60). `crash <backend> d1:<backup> <dir>`
+//! is G6 (`crash.rs`): a writer killed 200 times on one copy of D1, the
+//! store reopened and checked after each kill. `relevance <backend>
+//! golden <dir>` is G2 on the #59 golden set, and `relevance <backend>
+//! d1:<backup> <dir> <queries> <vectors>` adds the #1563 set on D1, its
+//! query vectors made beforehand by the `embed_queries` example
+//! (`relevance.rs`).
 //!
 //! The run is offline. It refuses to start when the environment configures
 //! an embedder, query expansion, a reranking model or a cloud backup
@@ -476,10 +483,6 @@ pub fn measure(
     report.insert("backend".into(), json!(candidate.name));
     report.insert("dataset".into(), json!(dataset.name()));
     report.insert("run_dir".into(), json!(dir));
-    report.insert(
-        "note".into(),
-        json!("not a scoring run: no crash or relevance workload yet"),
-    );
     match mode {
         Mode::Bench => workload(candidate, &dir, dataset, &mut report, isolation)?,
         Mode::Open => {

@@ -2,6 +2,28 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-23 — Store benchmark: crash check (G6) and relevance (G2) (Millwright R3, Mill Board #1618, D55 PR C)
+
+### Added
+- `store_bench crash <backend> d1:<backup> <dir>` (G6, with G4's memory; D56, D57). It loads D1 once into a private store, then kills a writer child with SIGKILL 200 times on it, accumulating: 100 kills in a stream of adds, updates and deletes, and 100 in a stream of pages sized like D3's. The child prints a `begin` line before each write and an `ack` line after its transaction commits, both flushed. It warms its write context before opening the store, so no `git` child inherits the store's lock. After each kill the parent reopens the store through the normal open and checks:
+  - every acked memory against its model (state, tracked-column hash, revisions);
+  - that the in-flight write landed whole or not at all;
+  - that no live memory is missing from the model;
+  - a keyword search for each live nonce;
+  - each acked page's blob (orphan blobs are counted);
+  - the backend's own integrity check on the closed store: SQLite `PRAGMA integrity_check` plus FTS5 `integrity-check`, Attest's log verify, and for the engine a clean open plus a full read.
+
+  The report gives each round's in-flight write, the child's peak memory before the kill, the reopen's peak, every failure, and `passed`.
+- `store_bench relevance <backend> golden <dir>` (G2, D58): the #59 golden set on the candidate against the engine in the same run. `keyword` and `hashed` across the four strategies are gated at recall@10 and MRR within 0.02. The `+dates` modes are reported only. Engine drift from the blessed baseline over 0.02 makes the run invalid. `relevance <backend> d1:<backup> <dir> <queries> <vectors>` adds the #1563 set on D1 (D59) in keyword and vector modes. Relevant ids D1 lacks are left out of the denominator, and queries left with none are dropped and listed by ordinal. No query text appears in the report.
+- Example `embed_queries` (D59): embeds the #1563 queries once, as queries, with the configured embedder. The file's header names the backend, model, dimension, role and backup, and relevance refuses vectors whose header does not match D1's identity. The output is created new and 0600.
+- `Candidate` takes a `verify` (the integrity check above). The #59 eval's fixture, ranker and scores move to `tests/retrieval_eval/shared.rs`, shared by the test and the relevance mode.
+- The "not a scoring run" label is gone: every R3 workload is in.
+
+### Found
+- The crash mode found that the engine could fail G6: its transaction covered memory rows but not `memory_revisions`, so a kill inside an update could leave the revision without its row change (Q22). Nano decided to fix the engine before the scoring run (D62), and #418 did, so the crash test now asserts a pass for every candidate.
+
+### Tests
+- Real kills on a small D1, ten rounds of each stream on the engine and SQLite; both pass every check. The check finds a revision left without its row change, an edit made behind the model's back, and an orphan blob. A cut or foreign output line is not a protocol line. An update must add exactly the old row as a revision. The golden set scores a candidate against the engine. The #1563 set drops queries D1 cannot hold and reports no query text. `embed_queries` numbers the set from 1, embeds as queries, refuses a wrong-size vector without naming its text, and refuses an existing output.
 ## 2026-11-23 — Updates and deletes are atomic; an engine transaction covers revisions and the wiki (Q21, Q22, D62)
 
 ### Fixed

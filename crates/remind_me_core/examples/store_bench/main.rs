@@ -201,14 +201,13 @@ mod tests {
         harness::crash::child_from(&[ENGINE, SQLITE], &args).unwrap();
     }
 
-    /// G6: writers killed for real, a few rounds of each stream on a copy
-    /// of a small D1. On SQLite they leave only whole writes and every check
-    /// passes, the integrity check included. The engine's run completes
-    /// too, but may fail: its page does not cover `memory_revisions`, so a
-    /// kill inside an update can leave the revision without the row change.
+    /// G6: writers killed for real, ten rounds of each stream on a copy of
+    /// a small D1. On both candidates they leave only whole writes and every
+    /// check passes, the integrity check included. The engine passes since
+    /// its transactions cover `memory_revisions` (Q22, D62).
     #[cfg(unix)]
     #[test]
-    fn killed_writers_leave_whole_writes_on_sqlite() {
+    fn killed_writers_leave_whole_writes() {
         let _serial = harness::serial();
         let root = std::env::temp_dir().join(format!("store_bench_crash_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -216,14 +215,12 @@ mod tests {
         let set = format!("d1:{}", backup.display());
         for candidate in [ENGINE, SQLITE] {
             let report =
-                harness::crash::run(candidate, &set, &root.join("runs"), 3, test_child).unwrap();
+                harness::crash::run(candidate, &set, &root.join("runs"), 10, test_child).unwrap();
             let report = serde_json::Value::Object(report);
             assert!(report.get("aborted").is_none(), "{report}");
-            if candidate.name == "sqlite" {
-                assert_eq!(report["passed"], true, "{report}");
-            }
+            assert_eq!(report["passed"], true, "{report}");
             let rounds = report["rounds"].as_array().unwrap();
-            assert_eq!(rounds.len(), 6, "{report}");
+            assert_eq!(rounds.len(), 20, "{report}");
             for stream in ["writes", "pages"] {
                 let acked: u64 = rounds
                     .iter()
@@ -455,6 +452,16 @@ mod tests {
         let root = std::env::temp_dir().join(format!("store_bench_1563_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let backup = small_backup(&root);
+        // Each memory's vector points its own way (distinct angles in a
+        // plane), and each query's is its memory's, so no two memories tie
+        // in the vector stage and the engine ranks the same way twice.
+        let unit = |j: usize| -> Vec<f32> {
+            let a = (j as f32).sqrt() * 0.1;
+            let mut v = vec![0.0_f32; 8];
+            (v[0], v[1]) = (a.cos(), a.sin());
+            v
+        };
+        let mut vectors = std::collections::HashMap::new();
         let picked: Vec<(String, String)> = {
             let db = remind_me_core::Database::open_backend(
                 Box::new(EngineTables::open(&backup).unwrap()),
@@ -465,6 +472,24 @@ mod tests {
             let v = Vectors::new(&store);
             for (k, value) in [("backend", "test"), ("model", "fixture"), ("dim", "8")] {
                 v.set_meta(k, value, "2026-11-23").unwrap();
+            }
+            let mut ids = Vec::new();
+            loop {
+                let input = MemoryListInput {
+                    limit: 100,
+                    offset: ids.len(),
+                    ..MemoryListInput::default()
+                };
+                let page = queries::list_memories(&store, &input).unwrap().memories;
+                if page.is_empty() {
+                    break;
+                }
+                ids.extend(page.into_iter().map(|m| m.id));
+            }
+            for (j, id) in ids.into_iter().enumerate() {
+                let bytes: Vec<u8> = unit(j).iter().flat_map(|x| x.to_le_bytes()).collect();
+                v.put(&id, 0, &bytes).unwrap();
+                vectors.insert(id, unit(j));
             }
             let input = MemoryListInput {
                 limit: 3,
@@ -485,16 +510,16 @@ mod tests {
         );
         let lines = picked
             .iter()
-            .map(|(id, content)| (content.clone(), vec![id.clone()]))
+            .map(|(id, content)| (content.clone(), vec![id.clone()], vectors[id].clone()))
             .chain([(
                 "no such memory".to_string(),
                 vec!["mem_missing".to_string()],
+                unit(10_000),
             )]);
-        for (n, (text, relevant)) in lines.enumerate() {
+        for (n, (text, relevant, vector)) in lines.enumerate() {
             let row = serde_json::json!({ "query": text, "relevant": relevant, "kind": "real" });
             q.push_str(&format!("{row}\n"));
-            let vector =
-                serde_json::json!({ "n": n + 1, "query": text, "vector": vec![0.5_f32; 8] });
+            let vector = serde_json::json!({ "n": n + 1, "query": text, "vector": vector });
             v.push_str(&format!("{vector}\n"));
         }
         let files = root.join("files");
@@ -515,7 +540,7 @@ mod tests {
         assert_eq!(real["dropped"], serde_json::json!([4]));
         assert_eq!(real["relevant_ids_missing"], 1);
         assert_eq!(real["cells"].as_object().unwrap().len(), 8);
-        assert_eq!(real["passed"], true, "the engine against itself");
+        assert_eq!(real["passed"], true, "the engine against itself: {real}");
         assert!(
             !real.to_string().contains("no such memory"),
             "no query text"
