@@ -207,15 +207,70 @@ fn identity_of(row: &Map<String, Value>, columns: &[&str]) -> String {
 }
 
 /// The hash of a stored row, its columns in name order.
-fn row_hash(row: &Map<String, Value>) -> String {
+pub fn row_hash(row: &Map<String, Value>) -> String {
     let sorted: BTreeMap<&String, &Value> = row.iter().collect();
     content_key(json!(sorted).to_string().as_bytes())
 }
 
-/// Copy the directory `from` to `to`, which must not exist, leaving out
-/// files named in `skip` (a lock file that names its holder).
+/// Copy the directory `from` to `to`, which must not exist and is made
+/// private to this user, leaving out files named in `skip` (a lock file
+/// that names its holder). The whole of `from` is checked first: anything
+/// but plain files and directories (a symlink, a device) is refused before
+/// anything is written, so a copy never follows a link out of its source.
 pub fn copy_dir(from: &Path, to: &Path, skip: &[&str]) -> Result<()> {
-    std::fs::create_dir(to).map_err(|e| format!("cannot create {}: {e}", to.display()))?;
+    check_tree(from)?;
+    private_dir(to)?;
+    copy_tree(from, to, skip)
+}
+
+/// Make the directory `dir`, which must not exist, readable by this user
+/// only (on Unix).
+pub fn private_dir(dir: &Path) -> Result<()> {
+    // Created 0700, so it is never readable by others, not even briefly;
+    // then checked, so a filesystem that widened it fails the run.
+    #[cfg(unix)]
+    let builder = {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder
+    };
+    #[cfg(not(unix))]
+    let builder = std::fs::DirBuilder::new();
+    builder
+        .create(dir)
+        .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(dir)?.permissions().mode() & 0o777;
+        if mode != 0o700 {
+            return Err(format!("{} was created {mode:o}, not 700", dir.display()).into());
+        }
+    }
+    Ok(())
+}
+
+/// Whether [`private_dir`] can verify that what it creates is private.
+/// Real datasets are refused where it cannot (fail closed): checking a
+/// Windows ACL is not implemented.
+pub const PRIVACY_VERIFIABLE: bool = cfg!(unix);
+
+/// Refuse a tree holding anything but plain files and directories.
+fn check_tree(dir: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        let kind = std::fs::symlink_metadata(&path)?.file_type();
+        if kind.is_dir() {
+            check_tree(&path)?;
+        } else if !kind.is_file() {
+            return Err(format!("{} is not a plain file or directory", path.display()).into());
+        }
+    }
+    Ok(())
+}
+
+fn copy_tree(from: &Path, to: &Path, skip: &[&str]) -> Result<()> {
     for entry in std::fs::read_dir(from)? {
         let entry = entry?;
         let name = entry.file_name();
@@ -224,7 +279,8 @@ pub fn copy_dir(from: &Path, to: &Path, skip: &[&str]) -> Result<()> {
         }
         let target = to.join(&name);
         if entry.file_type()?.is_dir() {
-            copy_dir(&entry.path(), &target, skip)?;
+            std::fs::create_dir(&target)?;
+            copy_tree(&entry.path(), &target, skip)?;
         } else {
             std::fs::copy(entry.path(), &target)?;
         }
@@ -295,6 +351,7 @@ mod tests {
     /// changes the manifest.
     #[test]
     fn a_read_covers_the_graph_and_catches_a_changed_relation() {
+        let _serial = super::super::serial();
         use remind_me_core::db::engine::EngineTables;
         use remind_me_core::db::entities::Entities;
         use remind_me_core::db::references::NewReference;
@@ -369,6 +426,7 @@ mod tests {
     /// The same entity content written by another node is a changed row.
     #[test]
     fn a_changed_node_id_differs() {
+        let _serial = super::super::serial();
         use remind_me_core::db::entities::Entities;
         use remind_me_core::entity::Entity;
         let db = engine();
@@ -395,6 +453,7 @@ mod tests {
     /// One embedding stored at another chunk index is a different row.
     #[test]
     fn the_same_vector_at_another_chunk_index_differs() {
+        let _serial = super::super::serial();
         use remind_me_core::db::memories::{Memories, NewMemory};
         use remind_me_core::db::vectors::Vectors;
         let manifest_with_chunk_at = |ix: usize| {
@@ -411,5 +470,27 @@ mod tests {
         assert!(at_0
             .differences(&at_1)
             .contains(&"vectors: 2 differ".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_copy_refuses_a_symlink_before_writing_and_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("package_copy_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let from = root.join("from");
+        std::fs::create_dir_all(from.join("sub")).unwrap();
+        std::fs::write(from.join("sub/file"), b"x").unwrap();
+        copy_dir(&from, &root.join("ok"), &[]).unwrap();
+        assert_eq!(std::fs::read(root.join("ok/sub/file")).unwrap(), b"x");
+        let mode = std::fs::metadata(root.join("ok"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+        std::os::unix::fs::symlink("/etc/hostname", from.join("sub/link")).unwrap();
+        assert!(copy_dir(&from, &root.join("refused"), &[]).is_err());
+        assert!(!root.join("refused").exists(), "nothing written");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

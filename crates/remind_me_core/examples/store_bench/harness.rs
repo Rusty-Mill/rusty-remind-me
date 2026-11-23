@@ -8,11 +8,23 @@
 //! cargo run --release -p remind_me_core --example store_bench -- open  sqlite 15000 /tmp/bench
 //! ```
 //!
-//! `bench` fills a fresh store with `n` synthetic memories, each with a
-//! vector, plus an entity graph, and times what R3 measures: writes,
+//! The dataset is `n` synthetic memories, `d1:<backup>` (the real store,
+//! from a copy of a `manual-*.engine` backup, loaded through the ports;
+//! `d1.rs`) or `d2:<backup>` (D1 grown to 75,000 with synthetic memories).
+//!
+//! ```text
+//! cargo run --release -p remind_me_core --example store_bench -- bench sqlite d1:/data/manual-x.engine /tmp/bench
+//! ```
+//!
+//! `bench` fills a fresh store with the dataset (synthetic data also gets
+//! an entity graph and pages) and times what R3 measures: writes,
 //! keyword, semantic and hybrid search, the vitality pass, one- and two-hop
 //! entity walks, search with four readers beside one writer, and a backup
-//! restored and compared row by row. `open` fills a store and times
+//! restored and compared row by row, then the cold open (G7): a child
+//! process opens the store and answers one query, timed from its spawn,
+//! with the page cache dropped first when `R3_DROP_CACHES=1`, and reports
+//! its resident memory once idle (the G5 baseline). `open` fills a
+//! synthetic store and times
 //! reopening it, which rebuilds whatever the backend derives at open. Each
 //! run gets a new directory of its own under `<dir>` (never deleted, never
 //! reused) and prints one JSON line.
@@ -32,8 +44,8 @@
 //! refuses an in-place rewrite, and readers see whole transactions while
 //! the writer commits.
 //!
-//! The reopen is still warm, so it is not G7 evidence, and there is no D3
-//! ingest workload yet. These are not scoring runs.
+//! There is no D3 ingest, crash or relevance workload yet (D55), so these
+//! are not scoring runs.
 //!
 //! The run is offline. It refuses to start when the environment configures
 //! an embedder, query expansion, a reranking model or a cloud backup
@@ -49,6 +61,7 @@
 //! nothing leaves the machine.
 
 use remind_me_core::db::backend::Backend;
+use remind_me_core::db::vectors::Vectors;
 use remind_me_core::db::{queries, Store};
 use remind_me_core::embedder::{EmbedError, EmbedRole, Embedder, EmbeddingIdentity};
 use remind_me_core::models::{
@@ -66,6 +79,8 @@ use std::sync::Barrier;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod bodies;
+mod cold;
+mod d1;
 mod g1;
 mod package;
 
@@ -162,23 +177,74 @@ impl Mode {
     }
 }
 
+/// The data a run loads (spec § Datasets).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Dataset {
+    /// `n` synthetic memories with an entity graph and pages: `<n>`.
+    Synthetic(usize),
+    /// D1, the real store, from a copy of a backup: `d1:<backup dir>`.
+    D1(PathBuf),
+    /// D2, D1 grown with synthetic memories to `total`: `d2:<backup dir>`
+    /// (to [`d1::D2_TOTAL`]).
+    D2 { backup: PathBuf, total: usize },
+}
+
+impl Dataset {
+    fn parse(arg: &str) -> Result<Self> {
+        if let Some(path) = arg.strip_prefix("d1:") {
+            return Ok(Self::D1(PathBuf::from(path)));
+        }
+        if let Some(path) = arg.strip_prefix("d2:") {
+            return Ok(Self::D2 {
+                backup: PathBuf::from(path),
+                total: d1::D2_TOTAL,
+            });
+        }
+        let n: usize = arg
+            .parse()
+            .map_err(|_| format!("dataset {arg:?} is not a count, d1:<backup> or d2:<backup>"))?;
+        if n == 0 {
+            return Err("n must be at least 1".into());
+        }
+        Ok(Self::Synthetic(n))
+    }
+
+    fn name(&self) -> String {
+        match self {
+            Self::Synthetic(n) => n.to_string(),
+            Self::D1(_) => "d1".into(),
+            Self::D2 { total, .. } => format!("d2-{total}"),
+        }
+    }
+}
+
 /// Run the benchmark the command line asks for, on one of `candidates`:
-/// `<bench|open> <backend> <n> <dir>`. Prints one JSON line.
+/// `<bench|open> <backend> <n|d1:<backup>|d2:<backup>> <dir>`. Prints one
+/// JSON line.
 pub fn run(candidates: &[Candidate]) -> Result<()> {
     let names: Vec<&str> = candidates.iter().map(|c| c.name).collect();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // The G7 child: `cold <backend> <run dir>`, its query on stdin.
+    if let [mode, backend, dir] = args.as_slice() {
+        if mode == "cold" {
+            let candidate = find(candidates, backend)?;
+            refuse_model_config()?;
+            let dir = Path::new(dir);
+            owned_run(dir)?;
+            return cold::cold_child(candidate, dir);
+        }
+    }
     let [mode, backend, n, dir] = args.as_slice() else {
         return Err(format!(
-            "usage: store_bench <bench|open> <{}> <n> <dir>",
+            "usage: store_bench <bench|open> <{}> <n|d1:<backup>|d2:<backup>> <dir>",
             names.join("|")
         )
         .into());
     };
-    let Some(&candidate) = candidates.iter().find(|c| c.name == backend) else {
-        return Err(format!("unknown backend {backend:?}; one of {names:?}").into());
-    };
+    let candidate = find(candidates, backend)?;
     // The G8 child (D52): `restore <backend> <package> <fresh dir>`.
     if mode == "restore" {
+        refuse_model_config()?;
         let restored = restore(candidate, Path::new(n), Path::new(dir))?;
         println!("{}", serde_json::to_string(&restored)?);
         return Ok(());
@@ -187,7 +253,7 @@ pub fn run(candidates: &[Candidate]) -> Result<()> {
     let report = measure(
         candidate,
         mode,
-        n.parse()?,
+        &Dataset::parse(n)?,
         Path::new(dir),
         Isolation::Child,
     )?;
@@ -195,33 +261,100 @@ pub fn run(candidates: &[Candidate]) -> Result<()> {
     Ok(())
 }
 
-/// One run of `candidate` in a new directory under `root`; its report.
-/// `n` and the environment are checked before the filesystem is touched.
+/// The candidate named `name`.
+fn find(candidates: &[Candidate], name: &str) -> Result<Candidate> {
+    let names: Vec<&str> = candidates.iter().map(|c| c.name).collect();
+    candidates
+        .iter()
+        .find(|c| c.name == name)
+        .copied()
+        .ok_or_else(|| format!("unknown backend {name:?}; one of {names:?}").into())
+}
+
+/// Taken by every test that opens a store. A write stamps its context by
+/// running `git`, and a child spawned while another test holds a store
+/// lock inherits that lock's open file until it execs, so a reopen in the
+/// other test can find the store "in use by another process". Tests that
+/// open stores therefore run one at a time.
+#[cfg(test)]
+pub fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The file every run directory holds, so a child refuses any other.
+const RUN_MARK: &str = ".store_bench_run";
+
+/// Refuse `dir` unless a run made it: a child never opens another store.
+fn owned_run(dir: &Path) -> Result<()> {
+    if dir.join(RUN_MARK).is_file() {
+        return Ok(());
+    }
+    Err(format!("{} is not a store_bench run directory", dir.display()).into())
+}
+
+/// One run of `candidate` on `dataset` in a new directory under `root`;
+/// its report. The dataset and the environment are checked before the
+/// filesystem is touched.
 pub fn measure(
     candidate: Candidate,
     mode: Mode,
-    n: usize,
+    dataset: &Dataset,
     root: &Path,
     isolation: Isolation,
 ) -> Result<Map<String, Value>> {
-    if n == 0 {
-        return Err("n must be at least 1".into());
+    match dataset {
+        Dataset::Synthetic(0) => return Err("n must be at least 1".into()),
+        Dataset::Synthetic(_) => {}
+        Dataset::D1(backup) | Dataset::D2 { backup, .. } => {
+            if mode == Mode::Open {
+                return Err("open mode is synthetic only; bench reports the cold open".into());
+            }
+            if !package::PRIVACY_VERIFIABLE {
+                return Err(
+                    "real datasets need a run root verified private from creation, which this \
+                     platform cannot check; run D1 and D2 on Unix"
+                        .into(),
+                );
+            }
+            if !backup.is_dir() {
+                return Err(format!("backup {} is not a directory", backup.display()).into());
+            }
+            let backup = backup.canonicalize()?;
+            let root = resolved(root)?;
+            if backup.starts_with(&root) || root.starts_with(&backup) {
+                return Err(format!(
+                    "the run root {} and the backup {} overlap",
+                    root.display(),
+                    backup.display()
+                )
+                .into());
+            }
+        }
     }
     refuse_model_config()?;
-    let dir = fresh_run_dir(root, &format!("{}-{}-{n}", mode.name(), candidate.name))?;
+    let stem = format!("{}-{}-{}", mode.name(), candidate.name, dataset.name());
+    let dir = fresh_run_dir(root, &stem)?;
 
     let mut report = Map::new();
     report.insert("mode".into(), json!(mode.name()));
     report.insert("backend".into(), json!(candidate.name));
-    report.insert("n".into(), json!(n));
+    report.insert("dataset".into(), json!(dataset.name()));
     report.insert("run_dir".into(), json!(dir));
     report.insert(
         "note".into(),
-        json!("not a scoring run: the reopen is warm (not G7) and there is no D3 ingest yet"),
+        json!("not a scoring run: no D3 ingest, crash or relevance workload yet"),
     );
     match mode {
-        Mode::Bench => workload(candidate, &dir, n, &mut report, isolation)?,
-        Mode::Open => reopen(candidate, &dir, n, &mut report)?,
+        Mode::Bench => workload(candidate, &dir, dataset, &mut report, isolation)?,
+        Mode::Open => {
+            let Dataset::Synthetic(n) = dataset else {
+                return Err("open mode is synthetic only".into());
+            };
+            reopen(candidate, &dir, *n, &mut report)?
+        }
     }
     report.insert("disk_mb".into(), disk(&dir)?);
     report.insert("peak_rss_mb".into(), json!(peak_rss_mb()));
@@ -248,13 +381,40 @@ fn disk(dir: &Path) -> Result<Value> {
     }))
 }
 
-/// A new directory under `root` that this run alone owns: `create_dir`
-/// fails if the name is taken, and nothing is ever deleted.
+/// `path` with every symlink resolved, even where it does not exist yet:
+/// its nearest existing ancestor canonicalized, the rest appended.
+fn resolved(path: &Path) -> Result<PathBuf> {
+    let path = std::path::absolute(path)?;
+    let mut rest = Vec::new();
+    let mut base = path.as_path();
+    while !base.exists() {
+        rest.push(
+            base.file_name()
+                .ok_or("the run root has no existing ancestor")?,
+        );
+        base = base
+            .parent()
+            .ok_or("the run root has no existing ancestor")?;
+    }
+    let mut out = base.canonicalize()?;
+    for part in rest.iter().rev() {
+        out.push(part);
+    }
+    Ok(out)
+}
+
+/// A new run directory, `run`, inside a private (0700) directory under
+/// `root` that this run alone owns, so everything the run writes beside
+/// it (the D1 copy, the package, the restore) is private too.
+/// `create_dir` fails if a name is taken, and nothing is ever deleted.
 fn fresh_run_dir(root: &Path, stem: &str) -> Result<PathBuf> {
     std::fs::create_dir_all(root)?;
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let dir = root.join(format!("{stem}-{}-{nanos}", std::process::id()));
-    std::fs::create_dir(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let owned = root.join(format!("{stem}-{}-{nanos}", std::process::id()));
+    package::private_dir(&owned)?;
+    let dir = owned.join("run");
+    std::fs::create_dir(&dir)?;
+    std::fs::write(dir.join(RUN_MARK), b"")?;
     Ok(dir)
 }
 
@@ -397,45 +557,52 @@ fn query(corpus: &Corpus, rng: &mut Rng, i: usize) -> String {
 fn workload(
     candidate: Candidate,
     dir: &Path,
-    n: usize,
+    dataset: &Dataset,
     report: &mut Map<String, Value>,
     isolation: Isolation,
 ) -> Result<()> {
     let corpus = Corpus::new();
     let mut rng = Rng(0x5eed);
     let bodies = Bodies::new(dir.join("blobs"));
-    let (ids, entities) = {
+    let Seeded {
+        ids,
+        entities,
+        pairs,
+        identity,
+    } = {
         let db = candidate.open(dir)?;
-        let started = Instant::now();
-        let (ids, adds) = fill(&db.store(), &bodies, n, &corpus, &mut rng)?;
-        report.insert("fill_s".into(), json!(started.elapsed().as_secs_f64()));
-        report.insert("add".into(), summary(adds));
-        let count = n.div_ceil(MEMORIES_PER_PAGE);
-        let took = pages(&db.store(), &bodies, count, &corpus, &mut rng)?;
-        report.insert(
-            "pages".into(),
-            json!({ "count": count, "ms": millis(took) }),
-        );
-        let entities = graph(&db, &ids, &mut rng)?;
-        (ids, entities)
+        seed(&db, dataset, dir, &bodies, &corpus, &mut rng, report)?
     };
+    let real = !matches!(dataset, Dataset::Synthetic(_));
+    let n = ids.len();
+    report.insert("memories".into(), json!(n));
     report.insert("disk_mb_after_fill".into(), disk(dir)?);
+    // G7 and the idle baseline on the store exactly as the dataset left it.
+    let cold = cold::cold_open(candidate, dir, &pairs[0], isolation)?;
+    report.insert("cold_open".into(), cold);
 
     let started = Instant::now();
     let db = candidate.open(dir)?;
     report.insert("reopen_warm_ms".into(), json!(millis(started.elapsed())));
     let store = db.store();
 
-    // Dialogs are the verbatim record and refuse edits (#1616), so updates
-    // and deletes take the other memories.
+    // Dialogs (#1616) and claims are append-only and refuse edits, so
+    // updates and deletes take only the rows the store would let them
+    // change, by the same check the edits make.
     let (mut editable, mut dialog) = (Vec::new(), None);
     for id in &ids {
-        if testing::memory_text(&store, id, "category")?.as_deref() != Some(DIALOG) {
+        let memory = queries::get_memory_by_id(&store, id)?
+            .ok_or_else(|| format!("memory {id} vanished after seeding"))?;
+        if remind_me_core::dialog::refuse_protected_edit(&memory).is_ok() {
             editable.push(id.clone());
-        } else if dialog.is_none() {
+        } else if dialog.is_none() && memory.category == DIALOG {
             dialog = Some(id.clone());
         }
     }
+    report.insert(
+        "edit_pool".into(),
+        json!({ "editable": editable.len(), "append_only": ids.len() - editable.len() }),
+    );
     let pick = |rng: &mut Rng| ids[rng.below(ids.len())].clone();
     let pick_editable = |rng: &mut Rng| editable[rng.below(editable.len())].clone();
     report.insert(
@@ -470,10 +637,10 @@ fn workload(
         })?,
     );
 
-    let queries_: Vec<String> = (0..SAMPLES).map(|i| query(&corpus, &mut rng, i)).collect();
-    // Query vectors are made before any timed span, so the searches time
-    // retrieval, not embedding.
-    let vectors_ = Precomputed::new(&queries_);
+    // Query vectors were made before any timed span (in `seed`), so the
+    // searches time retrieval, not embedding.
+    let queries_: Vec<String> = pairs.iter().map(|(t, _)| t.clone()).collect();
+    let vectors_ = Precomputed(pairs.into_iter().collect());
     let search = |i: usize, vectors: Option<&Precomputed>| -> Result<()> {
         let input: MemorySearchInput = serde_json::from_value(json!({ "query": queries_[i] }))?;
         searched(&store, &input, vectors)
@@ -496,18 +663,22 @@ fn workload(
     report.insert("vitality_pass_ms".into(), json!(millis(t.elapsed())));
 
     for hops in [1, 2] {
-        let walk = timed(|_| {
-            let seed = entities[rng.below(entities.len())].clone();
-            entity::traverse_entities(&store, &[seed], hops, None, 1_000)?;
-            Ok(())
-        })?;
+        let walk = if entities.is_empty() {
+            skipped("no entities")
+        } else {
+            timed(|_| {
+                let seed = entities[rng.below(entities.len())].clone();
+                entity::traverse_entities(&store, &[seed], hops, None, 1_000)?;
+                Ok(())
+            })?
+        };
         report.insert(format!("entity_{hops}_hop"), walk);
     }
 
     // A small store can have no editable rows (n = 1 draws a dialog):
     // updates and deletes then report zero samples rather than failing.
     let update = if editable.is_empty() {
-        skipped("no editable (non-dialog) rows")
+        skipped("no editable rows (dialogs and claims are append-only)")
     } else {
         timed(|_| {
             let input: MemoryUpdateInput = serde_json::from_value(json!({
@@ -523,9 +694,18 @@ fn workload(
     // The same readers, inputs and searches with and without the writer,
     // so the two differ only by the writer (D54).
     let add_one = |s: &Store<'_>, rng: &mut Rng| -> Result<()> {
-        fill(s, &bodies, 1, &corpus, rng)?;
+        if real {
+            grow(s, &bodies, 1, &corpus, rng)?;
+        } else {
+            fill(s, &bodies, 1, &corpus, rng)?;
+        }
         Ok(())
     };
+    if real {
+        // Single adds on the real store, each with its vector written as
+        // `grow` does, so the inherited embedding identity is kept.
+        report.insert("add".into(), timed(|_| add_one(&store, &mut rng))?);
+    }
     report.insert(
         "search_hybrid_readers_idle".into(),
         readers(&db, &store, &queries_, &vectors_, None)?,
@@ -551,7 +731,7 @@ fn workload(
         }
     }
     let delete = if times.is_empty() {
-        skipped("no editable (non-dialog) rows")
+        skipped("no editable rows (dialogs and claims are append-only)")
     } else {
         summary(times)
     };
@@ -571,7 +751,176 @@ fn workload(
     );
 
     drop(store);
+    // Reopen, so the identity check covers what the store persisted.
+    drop(db);
+    let db = candidate.open(dir)?;
+    if real {
+        let now = Vectors::new(&db.store()).meta()?;
+        if now != identity {
+            return Err(format!(
+                "the embedding identity changed across the workloads and a reopen: \
+                 {identity:?} became {now:?}"
+            )
+            .into());
+        }
+        report.insert(
+            "embedding_identity".into(),
+            json!({ "unchanged": true, "after_reopen": true, "dim": identity_dim(&identity) }),
+        );
+    }
     backup_and_restore(candidate, db, &bodies, dir, report, isolation)
+}
+
+/// What a seeded store holds that the workloads pick from.
+struct Seeded {
+    ids: Vec<String>,
+    entities: Vec<String>,
+    /// Query texts and their vectors, each text once.
+    pairs: Vec<(String, Vec<f32>)>,
+    /// The loaded embedding identity (empty for synthetic data).
+    identity: Vec<(String, String)>,
+}
+
+/// `SAMPLES` distinct synthetic queries, each with its seeded vector, in
+/// the order drawn.
+fn synthetic_queries(corpus: &Corpus, rng: &mut Rng) -> Result<Vec<(String, Vec<f32>)>> {
+    let mut seen = std::collections::HashSet::new();
+    let mut pairs = Vec::with_capacity(SAMPLES);
+    for i in 0..SAMPLES * 20 {
+        if pairs.len() == SAMPLES {
+            break;
+        }
+        let text = query(corpus, rng, i);
+        if seen.insert(text.clone()) {
+            let vector = unit_vector(&text);
+            pairs.push((text, vector));
+        }
+    }
+    if pairs.len() < SAMPLES {
+        return Err(format!("only {} distinct queries drawn", pairs.len()).into());
+    }
+    Ok(pairs)
+}
+
+/// Refuse query vectors whose dimension is not the store's `dim`. The
+/// error names the query by its ordinal, never its text (real content).
+fn check_query_dims(pairs: &[(String, Vec<f32>)], dim: usize) -> Result<()> {
+    match pairs.iter().position(|(_, v)| v.len() != dim) {
+        Some(i) => Err(format!(
+            "query {} of {} has a {}-dim vector; the store's are {dim}",
+            i + 1,
+            pairs.len(),
+            pairs[i].1.len()
+        )
+        .into()),
+        None => Ok(()),
+    }
+}
+
+/// The dimension an embedding identity records, if it does.
+fn identity_dim(identity: &[(String, String)]) -> Option<usize> {
+    identity
+        .iter()
+        .find(|(k, _)| k == "dim")
+        .and_then(|(_, v)| v.parse().ok())
+}
+
+/// Load `dataset` into `db`, reporting how long it took and what it wrote.
+fn seed(
+    db: &Database,
+    dataset: &Dataset,
+    dir: &Path,
+    bodies: &Bodies,
+    corpus: &Corpus,
+    rng: &mut Rng,
+    report: &mut Map<String, Value>,
+) -> Result<Seeded> {
+    let store = db.store();
+    let started = Instant::now();
+    let (backup, total) = match dataset {
+        Dataset::Synthetic(n) => {
+            let (ids, adds) = fill(&store, bodies, *n, corpus, rng)?;
+            report.insert("fill_s".into(), json!(started.elapsed().as_secs_f64()));
+            report.insert("add".into(), summary(adds));
+            let count = n.div_ceil(MEMORIES_PER_PAGE);
+            let took = pages(&store, bodies, count, corpus, rng)?;
+            report.insert(
+                "pages".into(),
+                json!({ "count": count, "ms": millis(took) }),
+            );
+            drop(store);
+            let entities = graph(db, &ids, rng)?;
+            let pairs = synthetic_queries(corpus, rng)?;
+            return Ok(Seeded {
+                ids,
+                entities,
+                pairs,
+                identity: Vec::new(),
+            });
+        }
+        Dataset::D1(backup) => (backup, None),
+        Dataset::D2 { backup, total } => (backup, Some(*total)),
+    };
+    let loaded = d1::load(backup, &dir.with_extension("d1-source"), &store, bodies)?;
+    report.insert("load_s".into(), json!(started.elapsed().as_secs_f64()));
+    report.insert("loaded".into(), Value::Object(loaded.counts));
+    report.insert("parity".into(), loaded.parity);
+    let dim = identity_dim(&loaded.identity);
+    let mut ids = loaded.ids;
+    if let Some(total) = total {
+        if dim.is_some_and(|d| d != DIM) {
+            return Err(
+                format!("D2's synthetic vectors are {DIM}-dim; the store's are {dim:?}").into(),
+            );
+        }
+        let started = Instant::now();
+        let grown = grow(&store, bodies, total.saturating_sub(ids.len()), corpus, rng)?;
+        report.insert(
+            "grown".into(),
+            json!({ "memories": grown.len(), "s": started.elapsed().as_secs_f64() }),
+        );
+        ids.extend(grown);
+    }
+    let pairs = d1::queries(&store, &ids, SAMPLES, |len| rng.below(len))?;
+    if let Some(d) = dim {
+        check_query_dims(&pairs, d)?;
+    }
+    report.insert(
+        "queries".into(),
+        json!("document-derived, each text once: timing only, not relevance (G2)"),
+    );
+    Ok(Seeded {
+        ids,
+        entities: loaded.entities,
+        pairs,
+        identity: loaded.identity,
+    })
+}
+
+/// Add `n` synthetic memories to a loaded store (D2), each with a seeded
+/// vector written straight to its chunk, so the store's recorded
+/// embedding identity (the real model's) is left as it is. Their ids.
+fn grow(
+    store: &Store<'_>,
+    bodies: &Bodies,
+    n: usize,
+    corpus: &Corpus,
+    rng: &mut Rng,
+) -> Result<Vec<String>> {
+    let mut ids = Vec::with_capacity(n);
+    for _ in 0..n {
+        let mut input = corpus.memory(rng);
+        if input.category == DIALOG {
+            let stashed = bodies.stash(&input.content)?;
+            input.metadata = stashed.metadata();
+            input.content = stashed.head;
+        }
+        let vector = unit_vector(&input.content);
+        let id = queries::add_memory(store, input)?.id;
+        Vectors::new(store).put(&id, 0, &d1::to_bytes(&vector))?;
+        ids.push(id);
+    }
+    Ok(ids)
 }
 
 /// One search, keyword-only (`vectors` is `None`) or hybrid, that fails
@@ -983,12 +1332,6 @@ fn unit_vector(text: &str) -> Vec<f32> {
 /// error, never embedded on the spot.
 struct Precomputed(HashMap<String, Vec<f32>>);
 
-impl Precomputed {
-    fn new(texts: &[String]) -> Self {
-        Self(texts.iter().map(|t| (t.clone(), unit_vector(t))).collect())
-    }
-}
-
 impl Embedder for Precomputed {
     fn embed(
         &self,
@@ -1205,8 +1548,18 @@ fn dir_size(dir: &Path) -> Result<u64> {
 
 /// The process's peak resident memory, from Linux's `VmHWM`; null elsewhere.
 fn peak_rss_mb() -> Option<f64> {
+    status_mb("VmHWM:")
+}
+
+/// The process's resident memory now, from Linux's `VmRSS`; null elsewhere.
+fn rss_mb() -> Option<f64> {
+    status_mb("VmRSS:")
+}
+
+/// A `/proc/self/status` field given in kB, in MB.
+fn status_mb(field: &str) -> Option<f64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    let line = status.lines().find(|l| l.starts_with("VmHWM:"))?;
+    let line = status.lines().find(|l| l.starts_with(field))?;
     let kb: f64 = line.split_whitespace().nth(1)?.parse().ok()?;
     Some((kb / 10.24).round() / 100.0)
 }
@@ -1221,6 +1574,7 @@ mod tests {
     /// bounded time, instead of leaving the readers at the barrier.
     #[test]
     fn a_failed_first_write_fails_the_run_instead_of_hanging() {
+        let _serial = serial();
         let dir = std::env::temp_dir().join(format!("store_bench_hang_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1232,7 +1586,7 @@ mod tests {
                 Database::open_backend(Box::new(tables), Some(run_dir.join("memory.db"))).unwrap();
             let store = db.store();
             let fail = |_: &Store<'_>, _: &mut Rng| -> Result<()> { Err("refused".into()) };
-            let outcome = readers(&db, &store, &[], &Precomputed::new(&[]), Some(&fail));
+            let outcome = readers(&db, &store, &[], &Precomputed(HashMap::new()), Some(&fail));
             let _ = sent.send(outcome.map_err(|e| e.to_string()));
         });
         let outcome = received
@@ -1243,6 +1597,62 @@ mod tests {
         // not remove files that are open (OS error 32).
         run.join().unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The cold child refuses a directory no run made, such as a live
+    /// store, and accepts a fresh run directory.
+    #[test]
+    fn the_cold_child_opens_only_a_run_directory() {
+        let root = std::env::temp_dir().join(format!("store_bench_owned_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("live")).unwrap();
+        assert!(owned_run(&root.join("live")).is_err());
+        let run = fresh_run_dir(&root, "t").unwrap();
+        owned_run(&run).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A mismatched query is named by its ordinal, never by its text.
+    #[test]
+    fn a_query_dimension_error_carries_no_query_text() {
+        let pairs = vec![
+            ("first secret words".to_string(), vec![0.0; 4]),
+            ("second secret words".to_string(), vec![0.0; 3]),
+        ];
+        check_query_dims(&pairs, 4).unwrap_err();
+        let error = check_query_dims(&pairs, 4).unwrap_err().to_string();
+        assert!(!error.contains("secret"), "{error}");
+        assert!(
+            error.contains("query 2 of 2") && error.contains("3-dim"),
+            "{error}"
+        );
+        check_query_dims(&pairs[..1], 4).unwrap();
+    }
+
+    /// Off Unix, a real dataset is refused before anything is written.
+    #[cfg(not(unix))]
+    #[test]
+    fn a_real_dataset_is_refused_where_privacy_cannot_be_verified() {
+        let root = std::env::temp_dir().join(format!("store_bench_acl_{}", std::process::id()));
+        let backup = std::env::temp_dir();
+        let dataset = Dataset::D1(backup);
+        let candidate = Candidate {
+            name: "none",
+            tables: |_| Err("unused".into()),
+            restore: |_| Err("unused".into()),
+            package: backup_package,
+        };
+        let error = measure(
+            candidate,
+            Mode::Bench,
+            &dataset,
+            &root,
+            Isolation::InProcess,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("verified private"), "{error}");
+        assert!(!root.exists());
     }
 
     fn window(begin: f64, end: f64) -> Window {
