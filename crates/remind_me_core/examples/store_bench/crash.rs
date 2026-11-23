@@ -1331,6 +1331,7 @@ mod tests {
     /// text or tags is refused.
     #[test]
     fn a_synced_delete_leaves_a_canonical_tombstone() {
+        let _serial = super::super::serial();
         let (dir, bodies) = bodies("tombstone");
         let engine = Database::open_backend(
             Box::new(remind_me_core::db::engine::EngineTables::open(&dir.join("engine")).unwrap()),
@@ -1384,6 +1385,7 @@ mod tests {
     /// row, fails though its nonce is there.
     #[test]
     fn an_add_must_land_exactly_its_intended_row() {
+        let _serial = super::super::serial();
         let db = Database::open_in_memory().unwrap();
         let store = db.store();
         let (dir, bodies) = bodies("exact");

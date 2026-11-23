@@ -492,6 +492,7 @@ mod tests {
     /// vector result.
     #[test]
     fn a_degraded_search_is_counted_not_scored_as_a_full_one() {
+        let _serial = super::super::serial();
         let db = Database::open_in_memory().unwrap();
         let store = db.store();
         let input = remind_me_core::models::MemoryAddInput {
