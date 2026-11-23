@@ -159,6 +159,7 @@ impl EngineTables {
     /// Hold a noted write, and hand it over unless its operation or page
     /// is still running.
     pub(crate) fn emit(&mut self, noted: Option<Noted>) -> Result<()> {
+        self.confirm_in_page();
         let Some(noted) = noted else {
             return Ok(());
         };
@@ -215,15 +216,24 @@ impl EngineTables {
     /// one unit when it succeeds (or with the open page); when it fails,
     /// its records are put back and nothing reaches the sink. For writes
     /// to the tables outside the core only.
+    ///
+    /// Inside this thread's page, a failed `write` also breaks the page
+    /// (Q22): the writes it made before failing may be put back here, so
+    /// the page's redo batch no longer matches the stores.
     pub(crate) fn logged<T>(&mut self, write: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
         if self.sink.is_none() {
-            return write(self);
+            let written = write(self);
+            if written.is_err() {
+                self.break_page();
+            }
+            return written;
         }
         let mark = self.staging.held.len();
         self.staging.depth += 1;
         let written = write(self);
         self.staging.depth -= 1;
         if written.is_err() {
+            self.break_page();
             // A failed put-back sets `failed`; the write's own error is
             // the one to report.
             let _ = self.undo_held(mark);

@@ -54,6 +54,12 @@ pub(super) struct OpenPage {
     /// Set when a write failed part-way: the page can then only be
     /// abandoned.
     broken: bool,
+    /// Set while the last noted write to a table outside the core has not
+    /// yet landed ([`EngineTables::confirm_in_page`]). Still set at the
+    /// next note or at finish, that write failed: its redo entry would
+    /// replay a write the stores never took, so the page can only be
+    /// abandoned.
+    unconfirmed: bool,
 }
 
 /// The change that puts back what `change` is about to replace.
@@ -105,6 +111,7 @@ impl EngineTables {
             rows: Vec::new(),
             rows_before: Vec::new(),
             broken: false,
+            unconfirmed: false,
         });
         Ok(())
     }
@@ -169,9 +176,32 @@ impl EngineTables {
         let mut undo = Batch::default();
         put_row(&mut undo, before);
         self.undo.commit(&undo).map_err(engine_error)?;
+        page.broken |= page.unconfirmed;
         page.rows_before.push(before.clone());
         page.rows.push(change.clone());
+        page.unconfirmed = true;
         Ok(())
+    }
+
+    /// The write noted last in this thread's page landed. Every write to a
+    /// table outside the core confirms through [`EngineTables::emit`].
+    pub(super) fn confirm_in_page(&mut self) {
+        if let Some(page) = self.page.as_mut() {
+            if page.owner == std::thread::current().id() {
+                page.unconfirmed = false;
+            }
+        }
+    }
+
+    /// Refuse to commit this thread's open page: a write in it failed, and
+    /// whatever its caller does with the error, the page can now only be
+    /// abandoned.
+    pub(super) fn break_page(&mut self) {
+        if let Some(page) = self.page.as_mut() {
+            if page.owner == std::thread::current().id() {
+                page.broken = true;
+            }
+        }
     }
 
     /// Finish the open page: its writes become one redo batch.
@@ -199,7 +229,7 @@ impl EngineTables {
                 "the tables need reopening; the page was not committed".to_string(),
             ));
         }
-        if page.broken {
+        if page.broken || page.unconfirmed {
             self.page = Some(page);
             self.abandon_page()?;
             return Err(StoreError::Engine(
@@ -502,6 +532,86 @@ mod tests {
         }
         let tables = reopen(&dir);
         assert_eq!(rows_landed(&tables), (1, 0, true, true));
+        drop(tables);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A page that deletes the revisions of "known".
+    fn delete_known_in_a_page(tables: &mut EngineTables) {
+        use crate::db::history::HistoryStore;
+        tables.begin_page().unwrap();
+        HistoryStore::delete_for(tables, "known").unwrap();
+    }
+
+    fn known_projects(tables: &EngineTables) -> Vec<Option<Option<String>>> {
+        use crate::db::history::HistoryStore;
+        HistoryStore::list(tables, "known", 10)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.project)
+            .collect()
+    }
+
+    #[test]
+    fn a_put_back_revision_keeps_its_known_empty_project() {
+        let dir = fresh_dir("known_project");
+        {
+            use crate::db::history::HistoryStore;
+            let mut tables = EngineTables::open(&dir).unwrap();
+            // Its project was known to be none.
+            HistoryStore::insert(&mut tables, "known", &tracked("no project"), NOW, None).unwrap();
+            delete_known_in_a_page(&mut tables);
+            tables.abandon_page().unwrap();
+            assert_eq!(known_projects(&tables), vec![Some(None)]);
+            delete_known_in_a_page(&mut tables);
+            // Dropped with the page open: the process died here.
+        }
+        let tables = reopen(&dir);
+        assert_eq!(known_projects(&tables), vec![Some(None)]);
+        drop(tables);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_noted_write_that_never_lands_cannot_be_committed() {
+        use crate::db::wiki::WikiStore;
+        let dir = fresh_dir("unlanded");
+        {
+            let mut tables = EngineTables::open(&dir).unwrap();
+            tables.begin_page().unwrap();
+            WikiStore::upsert_unbacked(&mut tables, "wallaby", "Wallaby", "text", "", NOW).unwrap();
+            // Noted, then the write failed and its caller went on.
+            tables
+                .note(
+                    super::super::capture::REVISIONS,
+                    &99_i64,
+                    Some(&"never landed"),
+                )
+                .unwrap();
+            assert!(tables.finish_page().is_err());
+            assert!(WikiStore::get(&tables, "wallaby").unwrap().is_none());
+        }
+        let tables = reopen(&dir);
+        assert!(WikiStore::get(&tables, "wallaby").unwrap().is_none());
+        drop(tables);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_operation_cannot_be_committed_with_its_page() {
+        use crate::db::wiki::WikiStore;
+        let dir = fresh_dir("failed_operation");
+        {
+            let mut tables = EngineTables::open(&dir).unwrap();
+            tables.begin_page().unwrap();
+            WikiStore::upsert_unbacked(&mut tables, "wallaby", "Wallaby", "text", "", NOW).unwrap();
+            let failed: Result<()> = tables.logged(|_| Err(StoreError::Engine("boom".into())));
+            assert!(failed.is_err());
+            assert!(tables.finish_page().is_err());
+            assert!(WikiStore::get(&tables, "wallaby").unwrap().is_none());
+        }
+        let tables = reopen(&dir);
+        assert!(WikiStore::get(&tables, "wallaby").unwrap().is_none());
         drop(tables);
         std::fs::remove_dir_all(&dir).unwrap();
     }
