@@ -117,25 +117,39 @@ impl EngineTables {
         self.sink = sink;
     }
 
-    /// The write `table` is about to make, when a sink wants it. Call it
-    /// before the write: with a sink set, it refuses once the tables need
-    /// reopening, or while another thread holds a page open.
+    /// The write `table` is about to make. Call it before the write.
+    ///
+    /// Inside this thread's page it always goes to the page: the record it
+    /// replaces to the undo log, synced, and the write to the page's redo
+    /// batch, so a crash or an abandoned page puts it back (Q22, D62).
+    /// It is returned for the sink when one is set: with a sink, it refuses
+    /// once the tables need reopening, or while another thread holds a
+    /// page open.
     pub(crate) fn note<K: Serialize, R: Serialize>(
-        &self,
+        &mut self,
         table: &str,
         key: &K,
         record: Option<&R>,
     ) -> Result<Option<Noted>> {
-        if self.sink.is_none() {
+        let paged = matches!(self.in_page(), Ok(true));
+        if self.sink.is_none() && !paged {
             return Ok(None);
         }
         self.ensure_writable()?;
-        self.in_page()?;
+        if self.sink.is_some() {
+            self.in_page()?;
+        }
         let change = change(table, key, record)?;
         let before = CapturedChange {
             value: self.stored(table, &change.key)?,
             ..change.clone()
         };
+        if paged {
+            self.hold_in_page(&change, &before)?;
+        }
+        if self.sink.is_none() {
+            return Ok(None);
+        }
         Ok(Some(Noted {
             change,
             before: Some(before),
@@ -326,7 +340,7 @@ impl EngineTables {
     }
 
     /// Apply `c` if it is to a table outside the core; `false` if not.
-    fn apply_row(&mut self, c: &CapturedChange) -> Result<bool> {
+    pub(super) fn apply_row(&mut self, c: &CapturedChange) -> Result<bool> {
         match c.table.as_str() {
             SAVED_SEARCHES => replay(&mut self.saved_searches, c)?,
             SEEN => replay(&mut self.seen, c)?,
@@ -342,6 +356,41 @@ impl EngineTables {
             _ => return Ok(false),
         }
         Ok(true)
+    }
+}
+
+/// Whether `store` is one of the tables outside the core, which a page
+/// covers through [`EngineTables::note`].
+pub(super) fn is_row_table(store: &str) -> bool {
+    matches!(
+        store,
+        SAVED_SEARCHES
+            | SEEN
+            | ARCHIVES
+            | SPANS
+            | SYNC_LOG
+            | SNAPSHOTS
+            | REVISIONS
+            | WIKI_PAGES
+            | WIKI_LINKS
+            | WIKI_META
+    )
+}
+
+/// `c` as a write in `batch`.
+pub(super) fn put_row(batch: &mut Batch, c: &CapturedChange) {
+    match &c.value {
+        Some(value) => batch.put(&c.table, c.key.clone(), value.clone()),
+        None => batch.delete(&c.table, c.key.clone()),
+    };
+}
+
+/// A batch write to a table outside the core, as a captured change.
+pub(super) fn row_of(change: &rusty_multimodal_db_engine::journal::Change) -> CapturedChange {
+    CapturedChange {
+        table: change.store.clone(),
+        key: change.key.clone(),
+        value: change.value.clone(),
     }
 }
 
