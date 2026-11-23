@@ -17,8 +17,10 @@ guard against directories changed concurrently. Files are staged beside their
 destination with recovery copies of the originals and replaced atomically; if
 the second replacement fails, the first is put back.
 
-The hook lives in the rusty_mill repository, not here, so its path is always
-passed with --source; the installer never guesses one.
+The hook now lives in this repository, at
+plugins/cloud-capture/hooks/remind-me-capture.py (ADR-0036; rusty_mill's copy
+is removed separately). Its path is still always passed with --source; the
+installer never guesses one.
 
 Usage: install_cloud_capture.py [--check] [--home DIR] --source HOOK
 """

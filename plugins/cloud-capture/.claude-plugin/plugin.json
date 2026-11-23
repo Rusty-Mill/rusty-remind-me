@@ -1,0 +1,10 @@
+{
+  "name": "remind-me-cloud-capture",
+  "version": "0.1.0",
+  "description": "Saves cloud Claude Code sessions (claude.ai, Claude Duet) to remind-me with a capture-only token. Private: upload it with your own config.json; never publish it.",
+  "author": {
+    "name": "rusty_remind_me contributors"
+  },
+  "repository": "https://github.com/Rusty-Mill/rusty-remind-me",
+  "license": "MIT"
+}

@@ -15,6 +15,14 @@
 //!   pointing at the resource metadata, which is how clients discover the
 //!   authorization server).
 //!
+//! A third credential, the optional capture-only token (ADR-0036), is
+//! accepted only as `Authorization: Bearer` on `POST /mcp`, and only for a
+//! single JSON-RPC message that opens a session or calls
+//! `remind_me_capture_transcript` in one ([`capture_body`]). Anything else
+//! it is sent with is answered 403. An admitted request is passed on with
+//! its body re-serialised and the connector token, so the routes behind the
+//! gate need no third case.
+//!
 //! `/health` always passes through unauthenticated (SE-04 parity).
 //! [`GateConfig::extra_allow_paths`]/[`GateConfig::allow_prefixes`] (OAuth's
 //! `/authorize`, `/token`, `/register`, `/revoke`, `/consent`, and the
@@ -41,8 +49,8 @@ use std::sync::Arc;
 
 use remind_me_core::webhook::constant_time_eq;
 use rusty_axum::middleware::Next;
-use rusty_axum::{IntoResponse, Json, Request, Response, StatusCode};
-use serde_json::json;
+use rusty_axum::{IntoResponse, Json, Method, Request, Response, StatusCode};
+use serde_json::{json, Value};
 
 /// The one path the MCP transport is mounted at. Not configurable: nothing
 /// in this crate exposes a different mount point, unlike the reference
@@ -52,8 +60,18 @@ pub const MCP_PATH: &str = "/mcp";
 /// The health probe path, always unauthenticated.
 pub const HEALTH_PATH: &str = "/health";
 
+pub use remind_me_mcp::{CAPTURE_CLIENT, CAPTURE_TOOL};
+
+/// JSON-RPC methods the capture-only credential may send besides
+/// `tools/call`: what a client needs to open a session and keep it alive.
+const CAPTURE_SESSION_METHODS: [&str; 3] = ["initialize", "notifications/initialized", "ping"];
+
 fn not_found() -> Response {
     (StatusCode::NOT_FOUND, Json(json!({ "error": "Not found" }))).into_response()
+}
+
+fn forbidden() -> Response {
+    (StatusCode::FORBIDDEN, Json(json!({ "error": "Forbidden" }))).into_response()
 }
 
 fn unauthorized() -> Response {
@@ -101,18 +119,103 @@ pub struct GateConfig {
     /// Path prefixes that pass through unauthenticated — OAuth's
     /// `/.well-known/` metadata documents. Empty in legacy mode.
     pub allow_prefixes: &'static [&'static str],
+    /// The capture-only credential (ADR-0036), when one is configured and
+    /// usable. Never logged, never included in a response.
+    pub capture_token: Option<String>,
 }
 
 impl GateConfig {
     /// Legacy (FT-05, no OAuth) configuration: only `/health` is exempt.
-    pub fn legacy(token: String) -> Self {
+    pub fn legacy(token: String, capture_token: Option<String>) -> Self {
         Self {
             token,
             oauth_mode: false,
             extra_allow_paths: &[],
             allow_prefixes: &[],
+            capture_token,
         }
     }
+
+    /// Whether `presented` is the capture-only credential.
+    fn is_capture(&self, presented: &str) -> bool {
+        self.capture_token.as_deref().is_some_and(|capture| {
+            !presented.is_empty() && constant_time_eq(presented.as_bytes(), capture.as_bytes())
+        })
+    }
+}
+
+/// The body the capture-only credential may send, as it will be forwarded,
+/// or `None` to refuse. Admitted: a `POST /mcp` carrying one JSON-RPC 2.0
+/// message (no batch) that opens or keeps a session, or calls
+/// [`CAPTURE_TOOL`] within one (`Mcp-Session-Id`), so the caller's identity
+/// always comes from a handshake this gate saw.
+///
+/// The parsed message is re-serialised, so what was checked is exactly what
+/// the server reads (no duplicate-key differential). On `initialize` the
+/// client's name is pinned to [`CAPTURE_CLIENT`], so every write in that
+/// session is marked as made with this credential. `Mcp-Method` and
+/// `Mcp-Name` headers, when present, must agree with the body.
+pub fn capture_body(request: &Request) -> Option<Vec<u8>> {
+    if *request.method() != Method::Post || request.path() != MCP_PATH {
+        return None;
+    }
+    let mut message = serde_json::from_slice::<Value>(request.body()).ok()?;
+    if message.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return None;
+    }
+    let method = message.get("method").and_then(Value::as_str)?.to_string();
+    let headers = request.headers();
+    if headers.get("mcp-method").is_some_and(|h| h != method) {
+        return None;
+    }
+    let mcp_name = headers.get("mcp-name");
+    if CAPTURE_SESSION_METHODS.contains(&method.as_str()) {
+        if mcp_name.is_some() {
+            return None;
+        }
+        if method == "initialize" {
+            pin_client(&mut message)?;
+        }
+        return serde_json::to_vec(&message).ok();
+    }
+    let tool = message.pointer("/params/name").and_then(Value::as_str);
+    let allowed = method == "tools/call"
+        && tool == Some(CAPTURE_TOOL)
+        && mcp_name.is_none_or(|h| h == CAPTURE_TOOL)
+        && headers.get("mcp-session-id").is_some();
+    allowed.then(|| serde_json::to_vec(&message).ok()).flatten()
+}
+
+/// Set an `initialize` message's `params.clientInfo.name` to
+/// [`CAPTURE_CLIENT`], keeping its version.
+fn pin_client(message: &mut Value) -> Option<()> {
+    let params = message.get_mut("params")?.as_object_mut()?;
+    let info = params
+        .entry("clientInfo")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()?;
+    info.insert("name".to_string(), json!(CAPTURE_CLIENT));
+    info.entry("version").or_insert_with(|| json!("0"));
+    Some(())
+}
+
+/// A request presenting the capture-only credential: refused unless
+/// [`capture_body`] admits it, then passed on with that body and the
+/// connector token, as a connector-token request would be.
+async fn admit_capture(config: &GateConfig, request: Request, next: Next) -> Response {
+    let Some(body) = capture_body(&request) else {
+        return forbidden();
+    };
+    let mut request = request.with_body(body);
+    let bearer = format!("Bearer {}", config.token);
+    if request
+        .headers_mut()
+        .insert_sensitive("authorization", &bearer)
+        .is_err()
+    {
+        return forbidden();
+    }
+    next.run(request).await
 }
 
 /// Whatever credential this request would be authenticated by: the secret
@@ -172,8 +275,12 @@ pub async fn secret_gate(config: Arc<GateConfig>, request: Request, next: Next) 
         .peer_addr()
         .map(|addr| addr.ip().to_string())
         .unwrap_or_default();
-    let bucket =
-        remind_me_core::rate_limit::resolve_key(&presented, &peer, Some(config.token.as_str()));
+    let capture = config.is_capture(&presented);
+    let bucket = if capture {
+        "auth:capture".to_string()
+    } else {
+        remind_me_core::rate_limit::resolve_key(&presented, &peer, Some(config.token.as_str()))
+    };
     // Synchronous, and safe to call from this async context: the critical
     // section is a map update with no I/O and nothing awaited while the lock
     // is held, so it cannot block the executor for longer than that.
@@ -183,6 +290,10 @@ pub async fn secret_gate(config: Arc<GateConfig>, request: Request, next: Next) 
                 verdict.retry_after,
             ));
         }
+    }
+
+    if capture {
+        return admit_capture(&config, request, next).await;
     }
 
     let prefix = format!("{MCP_PATH}/");
@@ -240,6 +351,130 @@ mod tests {
     use super::*;
 
     use rusty_axum::Method;
+
+    fn capture_request(body: Value, session: bool) -> Request {
+        let request =
+            Request::new(Method::Post, MCP_PATH).with_body(serde_json::to_vec(&body).unwrap());
+        if session {
+            request.with_header("mcp-session-id", "s1").unwrap()
+        } else {
+            request
+        }
+    }
+
+    fn message(method: &str, params: Value) -> Value {
+        json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params })
+    }
+
+    fn forwarded(request: &Request) -> Option<Value> {
+        capture_body(request).map(|body| serde_json::from_slice(&body).unwrap())
+    }
+
+    #[test]
+    fn capture_admits_a_session_and_the_capture_tool_within_it() {
+        for method in CAPTURE_SESSION_METHODS {
+            assert!(
+                forwarded(&capture_request(message(method, json!({})), false)).is_some(),
+                "{method}"
+            );
+        }
+        let call = message(
+            "tools/call",
+            json!({ "name": CAPTURE_TOOL, "arguments": {} }),
+        );
+        assert!(forwarded(&capture_request(call.clone(), true)).is_some());
+        let headed = capture_request(call, true)
+            .with_header("mcp-method", "tools/call")
+            .unwrap()
+            .with_header("mcp-name", CAPTURE_TOOL)
+            .unwrap();
+        assert!(forwarded(&headed).is_some());
+    }
+
+    #[test]
+    fn capture_pins_the_client_name_on_initialize() {
+        let init = message(
+            "initialize",
+            json!({ "clientInfo": { "name": "claude-ai", "version": "2" } }),
+        );
+        let sent = forwarded(&capture_request(init, false)).unwrap();
+        assert_eq!(
+            sent["params"]["clientInfo"],
+            json!({ "name": CAPTURE_CLIENT, "version": "2" })
+        );
+        let bare = forwarded(&capture_request(message("initialize", json!({})), false)).unwrap();
+        assert_eq!(bare["params"]["clientInfo"]["name"], json!(CAPTURE_CLIENT));
+    }
+
+    #[test]
+    fn capture_refuses_every_other_call_and_shape() {
+        let refused = [
+            message(
+                "tools/call",
+                json!({ "name": "remind_me_search", "arguments": {} }),
+            ),
+            message(
+                "tools/call",
+                json!({ "name": "remind_me_delete", "arguments": {} }),
+            ),
+            message("tools/call", json!({})),
+            message("tools/list", json!({})),
+            message("resources/read", json!({ "uri": "remind-me://stats" })),
+            json!({ "id": 1, "method": "ping" }),
+            json!([message("ping", json!({}))]),
+        ];
+        for body in refused {
+            assert!(
+                capture_body(&capture_request(body.clone(), true)).is_none(),
+                "{body}"
+            );
+        }
+        let raw = Request::new(Method::Post, MCP_PATH).with_body(b"not json".to_vec());
+        assert!(capture_body(&raw).is_none());
+    }
+
+    #[test]
+    fn capture_refuses_a_call_outside_a_session_and_other_routes() {
+        let call = message("tools/call", json!({ "name": CAPTURE_TOOL }));
+        assert!(capture_body(&capture_request(call.clone(), false)).is_none());
+        let get = Request::new(Method::Get, MCP_PATH)
+            .with_header("mcp-session-id", "s1")
+            .unwrap();
+        assert!(capture_body(&get).is_none());
+        let deeper = Request::new(Method::Post, "/mcp/x")
+            .with_body(serde_json::to_vec(&message("ping", json!({}))).unwrap());
+        assert!(capture_body(&deeper).is_none());
+    }
+
+    #[test]
+    fn capture_forwards_what_it_checked_not_duplicate_keys() {
+        let raw = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"remind_me_delete","name":"remind_me_capture_transcript"}}"#;
+        let request = Request::new(Method::Post, MCP_PATH)
+            .with_body(raw.to_vec())
+            .with_header("mcp-session-id", "s1")
+            .unwrap();
+        if let Some(body) = capture_body(&request) {
+            let text = String::from_utf8(body).unwrap();
+            assert!(!text.contains("remind_me_delete"), "{text}");
+        }
+    }
+
+    #[test]
+    fn capture_refuses_headers_that_disagree_with_the_body() {
+        let call = message("tools/call", json!({ "name": CAPTURE_TOOL }));
+        let wrong_method = capture_request(call.clone(), true)
+            .with_header("mcp-method", "tools/list")
+            .unwrap();
+        assert!(capture_body(&wrong_method).is_none());
+        let wrong_name = capture_request(call, true)
+            .with_header("mcp-name", "remind_me_delete")
+            .unwrap();
+        assert!(capture_body(&wrong_name).is_none());
+        let ping = capture_request(message("ping", json!({})), false)
+            .with_header("mcp-name", CAPTURE_TOOL)
+            .unwrap();
+        assert!(capture_body(&ping).is_none());
+    }
 
     #[test]
     fn rewrite_path_preserves_an_existing_query_string() {

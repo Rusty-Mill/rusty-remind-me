@@ -149,6 +149,17 @@ jobs:
       - name: Compare .claude-plugin/plugin.json against the crates' Cargo.toml
         run: scripts/check_plugin_version.sh
 
+  cloud-capture-hook:
+    # The cloud capture hook's offline tests, including card-redaction parity
+    # with remind_me_core::redact. Stdlib only, against a local fake server;
+    # no credentials and no network. In required-gate so a drift can't merge.
+    name: cloud-capture hook tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: python3 -m unittest
+        run: python3 -m unittest discover -s plugins/cloud-capture/tests -v
+
   # remind_me_core's cfg(windows) FFI (sidecar job objects, `\\?\` stripping)
   # compiles on no Linux leg above.
   windows:
@@ -188,7 +199,7 @@ jobs:
     # The one check branch protection requires. A failed or cancelled job fails it.
     name: required-gate
     if: always()
-    needs: [fmt, cargo-deny, check, features, combined-features, plugin-version, windows]
+    needs: [fmt, cargo-deny, check, features, combined-features, plugin-version, cloud-capture-hook, windows]
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any job failed or was cancelled
