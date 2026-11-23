@@ -267,21 +267,14 @@ pub fn record_review(
     }
 
     let now = Utc::now().to_rfc3339();
-    crate::resolve::record_revision(store, memory_id, &now, REVIEW_REASON)?;
-
     let newly_reverted =
         outcome == ReviewOutcome::Reverted && memory.outcome.as_deref() != Some("reverted");
-    Memories::new(store).apply_edit(
-        memory_id,
-        &MemoryEdit {
-            metadata: Some(with_review(&memory.metadata, outcome, note, &now)),
-            outcome: newly_reverted.then(|| "reverted".to_string()),
-            ..MemoryEdit::at(now.as_str())
-        },
-    )?;
-    if newly_reverted {
-        crate::resolve::demote(store, memory_id)?;
-    }
+    let edit = MemoryEdit {
+        metadata: Some(with_review(&memory.metadata, outcome, note, &now)),
+        outcome: newly_reverted.then(|| "reverted".to_string()),
+        ..MemoryEdit::at(now.as_str())
+    };
+    crate::resolve::write_outcome(store, memory_id, &now, REVIEW_REASON, &edit, newly_reverted)?;
     Memories::new(store).get_live(memory_id)
 }
 

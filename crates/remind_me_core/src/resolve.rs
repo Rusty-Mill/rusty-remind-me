@@ -60,23 +60,56 @@ pub fn resolve_memory(
     }
 
     let now = Utc::now().to_rfc3339();
-    record_revision(store, memory_id, &now, RESOLVE_REASON)?;
-
     let metadata = note
         .filter(|n| !n.trim().is_empty())
         .map(|n| with_note(&memory.metadata, n));
-    Memories::new(store).apply_edit(
+    let edit = MemoryEdit {
+        outcome: Some(outcome.to_string()),
+        metadata,
+        ..MemoryEdit::at(now.as_str())
+    };
+    write_outcome(
+        store,
         memory_id,
-        &MemoryEdit {
-            outcome: Some(outcome.to_string()),
-            metadata,
-            ..MemoryEdit::at(now)
-        },
+        &now,
+        RESOLVE_REASON,
+        &edit,
+        demotes(outcome),
     )?;
-    if demotes(outcome) {
-        demote(store, memory_id)?;
-    }
     Memories::new(store).get_live(memory_id)
+}
+
+/// Record the revision `reason` leaves, apply `edit`, and [`demote`] the
+/// memory when `demote_it`, all in one transaction (joining the caller's,
+/// if one is open): an edit that fails leaves no revision of a change that
+/// never happened (#1595). Shared with [`crate::review`].
+pub(crate) fn write_outcome(
+    store: &Store<'_>,
+    memory_id: &str,
+    now: &str,
+    reason: &str,
+    edit: &MemoryEdit,
+    demote_it: bool,
+) -> Result<()> {
+    store.atomically(|store| {
+        record_revision(store, memory_id, now, reason)?;
+        #[cfg(test)]
+        if FAIL_EDIT.with(|fail| fail.replace(false)) {
+            return Err(StoreError::Engine("injected outcome edit failure".into()));
+        }
+        Memories::new(store).apply_edit(memory_id, edit)?;
+        if demote_it {
+            demote(store, memory_id)?;
+        }
+        Ok(())
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Fail the next [`write_outcome`] on this thread after its revision is
+    /// written and before its edit, to prove neither lands (#1595).
+    pub(crate) static FAIL_EDIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Keep the state being replaced in history. Written directly rather than
@@ -159,4 +192,92 @@ pub fn validate_facts(facts: &[crate::models::AtomicFact]) -> Result<()> {
         checked.map_err(|e| StoreError::Invalid(format!("facts[{i}]: {e}")))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::memories::NewMemory;
+    use crate::db::Database;
+
+    fn decision(store: &Store<'_>, id: &str) {
+        let mut row = NewMemory::new(id, "we chose the engine", "2026-11-01T00:00:00Z");
+        row.memory_type = "decision".into();
+        row.metadata = json!({ "rationale": "benchmark" });
+        Memories::new(store).insert(&row).unwrap();
+    }
+
+    fn revisions(store: &Store<'_>, id: &str) -> usize {
+        crate::history::history(store, id, 100).unwrap().len()
+    }
+
+    /// The memory as `resolve` or `review` found it, and its history.
+    fn unchanged(store: &Store<'_>, id: &str, before: usize) {
+        let memory = Memories::new(store).get_live(id).unwrap().unwrap();
+        assert_eq!(memory.outcome, None);
+        assert!(memory.metadata.get("review").is_none());
+        assert!(memory.metadata.get("outcome_note").is_none());
+        assert_eq!(
+            revisions(store, id),
+            before,
+            "no revision of a change that never happened"
+        );
+    }
+
+    #[test]
+    fn a_resolve_whose_edit_fails_leaves_no_revision() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        decision(&store, "d1");
+        let before = revisions(&store, "d1");
+
+        FAIL_EDIT.with(|fail| fail.set(true));
+        assert!(resolve_memory(&store, "d1", "reverted", Some("backed out")).is_err());
+        unchanged(&store, "d1", before);
+    }
+
+    #[test]
+    fn a_review_whose_edit_fails_leaves_no_revision() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        decision(&store, "d1");
+        let before = revisions(&store, "d1");
+
+        FAIL_EDIT.with(|fail| fail.set(true));
+        assert!(crate::review::record_review(&store, "d1", "reverted", None).is_err());
+        unchanged(&store, "d1", before);
+    }
+
+    #[test]
+    fn a_review_then_a_resolve_each_land_one_revision_with_their_edit() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        decision(&store, "d1");
+        let before = revisions(&store, "d1");
+
+        let reviewed = crate::review::record_review(&store, "d1", "held", None)
+            .unwrap()
+            .unwrap();
+        assert!(reviewed.metadata.get("review").is_some());
+        assert_eq!(revisions(&store, "d1"), before + 1);
+
+        let resolved = resolve_memory(&store, "d1", "done", None).unwrap().unwrap();
+        assert_eq!(resolved.outcome.as_deref(), Some("done"));
+        assert_eq!(revisions(&store, "d1"), before + 2);
+    }
+
+    #[test]
+    fn inside_a_failed_transaction_a_resolve_is_undone_with_it() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        decision(&store, "d1");
+        let before = revisions(&store, "d1");
+
+        let outer: Result<()> = store.transaction(|page| {
+            resolve_memory(page, "d1", "abandoned", None)?;
+            Err(StoreError::Invalid("caller gives up".into()))
+        });
+        assert!(outer.is_err());
+        unchanged(&store, "d1", before);
+    }
 }
