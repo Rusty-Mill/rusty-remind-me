@@ -559,7 +559,16 @@ mod tests {
         assert_eq!(real["dropped"], serde_json::json!([4]));
         assert_eq!(real["relevant_ids_missing"], 1);
         assert_eq!(real["cells"].as_object().unwrap().len(), 8);
-        assert_eq!(real["passed"], true, "the engine against itself: {real}");
+        assert_eq!(
+            real["misses"],
+            serde_json::json!([]),
+            "the engine against itself: {real}"
+        );
+        // A 4-query fixture is not the 50-query source set (D55): scored,
+        // but never a pass.
+        assert_eq!(real["scoring_input"], false);
+        assert_eq!(real["source_queries_required"], 50);
+        assert_eq!(real["passed"], false);
         assert!(
             !real.to_string().contains("no such memory"),
             "no query text"

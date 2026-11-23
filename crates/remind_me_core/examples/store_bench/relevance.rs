@@ -17,11 +17,15 @@
 //!   must be the loaded backup's, and its model, role and dimension, which
 //!   must be the loaded store's. Errors reading either file name a line or
 //!   a query's ordinal and a fixed class, never a path, a parser's message
-//!   or anything the files hold. `keyword` and
-//!   `vector` under every strategy are gated. Relevant ids the D1 copy
-//!   lacks are left out of every candidate's denominator alike; a query
-//!   with none left is dropped. Only counts and ordinals are reported,
-//!   never query text.
+//!   or anything the files hold. `keyword` and `vector` under every
+//!   strategy are gated. Every query must have exactly one vector, keyed
+//!   by its ordinal, and no vector may name an ordinal the set lacks. A
+//!   run counts for scoring only with all [`SOURCE_QUERIES`] source
+//!   queries (D55), reported as `scoring_input`; a shorter set, such as a
+//!   synthetic fixture, is scored but never passes. Relevant ids the D1
+//!   copy lacks are left out of every candidate's denominator alike, after
+//!   that count; a query with none left is dropped. Only counts and
+//!   ordinals are reported, never query text.
 
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -153,6 +157,10 @@ fn cells(engine: &BTreeMap<String, Scores>, cand: &BTreeMap<String, Scores>) -> 
     Value::Object(rows)
 }
 
+/// How many source queries the #1563 set holds (D55). A scoring run
+/// needs every one of them, before D59's missing-id exclusions.
+pub const SOURCE_QUERIES: usize = 50;
+
 /// One #1563 query, in the #59 harness line format.
 #[derive(Deserialize)]
 struct RealQuery {
@@ -230,7 +238,15 @@ impl RealSet {
                 )
                 .into());
             }
-            by_n.insert(v.n, v);
+            if v.n == 0 || v.n > set.len() {
+                return Err(
+                    format!("{VECTORS}, line {}: no query {} in the set", i + 2, v.n).into(),
+                );
+            }
+            let n = v.n;
+            if by_n.insert(n, v).is_some() {
+                return Err(format!("query {n} has two vectors").into());
+            }
         }
         let mut map = HashMap::new();
         for (i, q) in set.iter().enumerate() {
@@ -316,6 +332,16 @@ fn jsonl<T: for<'de> Deserialize<'de>>(path: &Path, file: &'static str) -> Resul
     Ok(rows)
 }
 
+impl RealSet {
+    /// Whether this set can score G2: all [`SOURCE_QUERIES`] source
+    /// queries, each with its one vector (`read` refuses any gap), counted
+    /// before D59 drops any (D55). A shorter set, such as a synthetic
+    /// fixture, still runs but its report never passes.
+    pub fn scoring_input(&self) -> bool {
+        self.queries.len() == SOURCE_QUERIES
+    }
+}
+
 /// The #1563 set on the candidate's D1 store against the engine's; its
 /// report (counts and ordinals only).
 pub fn real(set: &RealSet, cand: &Store<'_>, engine: &Store<'_>) -> Result<Value> {
@@ -368,10 +394,13 @@ pub fn real(set: &RealSet, cand: &Store<'_>, engine: &Store<'_>) -> Result<Value
     }
     let misses = cell_misses(&e, &c);
     let degraded = degraded_cells(&e_degraded, &c_degraded);
-    let valid = e_degraded.is_empty() && c_degraded.is_empty();
+    let scoring_input = set.scoring_input();
+    let valid = scoring_input && e_degraded.is_empty() && c_degraded.is_empty();
     Ok(json!({
         "vectors_for_backup": set.for_backup,
         "queries": set.queries.len(),
+        "source_queries_required": SOURCE_QUERIES,
+        "scoring_input": scoring_input,
         "scored": kept.len(),
         "dropped": dropped,
         "relevant_ids_missing": missing,
@@ -561,6 +590,68 @@ mod tests {
         assert!(
             RealSet::read(&q, &v, &meta, "fp").is_err(),
             "wrong dimension"
+        );
+        std::fs::write(&v, format!("{head}\n{{\"n\":1,\"query\":\"a\",\"vector\":[1,0]}}\n{{\"n\":1,\"query\":\"a\",\"vector\":[1,0]}}\n{{\"n\":2,\"query\":\"b\",\"vector\":[0,1]}}\n")).unwrap();
+        let error = refused(RealSet::read(&q, &v, &meta, "fp"));
+        assert_eq!(error, "query 1 has two vectors");
+        std::fs::write(&v, format!("{head}\n{{\"n\":1,\"query\":\"a\",\"vector\":[1,0]}}\n{{\"n\":2,\"query\":\"b\",\"vector\":[0,1]}}\n{{\"n\":3,\"query\":\"c\",\"vector\":[1,1]}}\n")).unwrap();
+        let error = refused(RealSet::read(&q, &v, &meta, "fp"));
+        assert_eq!(error, "the vectors file, line 4: no query 3 in the set");
+        std::fs::write(
+            &v,
+            format!("{head}\n{{\"n\":0,\"query\":\"a\",\"vector\":[1,0]}}\n"),
+        )
+        .unwrap();
+        assert!(RealSet::read(&q, &v, &meta, "fp").is_err(), "ordinal 0");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A 49-query set reads but is not a scoring input; the full 50 is.
+    /// A gap in the vectors' ordinals, or one past 50, is refused.
+    #[test]
+    fn only_the_full_fifty_query_set_is_a_scoring_input() {
+        let root = std::env::temp_dir().join(format!("store_bench_rel50_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let meta = vec![
+            ("backend".to_string(), "openai".to_string()),
+            ("model".to_string(), "m".to_string()),
+            ("dim".to_string(), "2".to_string()),
+        ];
+        let head = "{\"backend\":\"openai\",\"model\":\"m\",\"dim\":2,\"role\":\"query\",\"backup\":\"b\",\"backup_sha256\":\"fp\"}";
+        let (q, v) = (root.join("q.jsonl"), root.join("v.jsonl"));
+        let write = |queries: usize, vectors: &[usize]| {
+            let set: String = (1..=queries)
+                .map(|n| format!("{{\"query\":\"q{n}\",\"relevant\":[\"x\"]}}\n"))
+                .collect();
+            std::fs::write(&q, set).unwrap();
+            let lines: String = vectors
+                .iter()
+                .map(|n| format!("{{\"n\":{n},\"query\":\"q{n}\",\"vector\":[1,0]}}\n"))
+                .collect();
+            std::fs::write(&v, format!("{head}\n{lines}")).unwrap();
+        };
+        let all: Vec<usize> = (1..=SOURCE_QUERIES).collect();
+        write(SOURCE_QUERIES - 1, &all[..SOURCE_QUERIES - 1]);
+        assert!(
+            !RealSet::read(&q, &v, &meta, "fp").unwrap().scoring_input(),
+            "49 queries"
+        );
+        write(SOURCE_QUERIES, &all);
+        assert!(
+            RealSet::read(&q, &v, &meta, "fp").unwrap().scoring_input(),
+            "the full set"
+        );
+        let gap: Vec<usize> = all.iter().copied().filter(|&n| n != 25).collect();
+        write(SOURCE_QUERIES, &gap);
+        assert_eq!(
+            refused(RealSet::read(&q, &v, &meta, "fp")),
+            "query 25 has no vector"
+        );
+        write(SOURCE_QUERIES, &[all.as_slice(), &[51]].concat());
+        assert_eq!(
+            refused(RealSet::read(&q, &v, &meta, "fp")),
+            "the vectors file, line 52: no query 51 in the set"
         );
         std::fs::remove_dir_all(&root).unwrap();
     }

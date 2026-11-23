@@ -21,8 +21,8 @@
 //! checks:
 //! - every acked write left exactly what it intended: an add, its row and
 //!   no revisions; an update, its row and the old revisions plus the old
-//!   row; a delete, no live row and no revisions, and a tombstone's text
-//!   empty;
+//!   row; a delete, no live row and no revisions, and a tombstone in the
+//!   canonical emptied form (ADR-0024);
 //! - every acked memory still matches its model, revisions included, so
 //!   none survives on a hard-deleted or tombstoned memory;
 //! - the one in-flight write is all or nothing: the state it read before
@@ -40,7 +40,10 @@
 //! failure; the run passes with none. Per stream it counts where the kills
 //! fell (`kills`): between writes, inside a write before its commit (the
 //! write did not land), or after the commit and before its ack (it
-//! landed), so a reader can judge how many kills hit a write.
+//! landed), so a reader can judge how many kills hit a write. A stream
+//! whose kills never caught a write in flight gives no evidence for the
+//! all-or-nothing check: the run is then `insufficient` for it and does
+//! not pass, whatever else it found.
 //!
 //! The child wraps each write in `Store::transaction`: G6 judges the
 //! store's atomicity, not production's call sites (Q21). It also warms
@@ -55,6 +58,7 @@ use remind_me_core::db::history::{Revisions, Tracked};
 use remind_me_core::db::memories::{KeywordFilter, Memories};
 use remind_me_core::db::{queries, Store};
 use remind_me_core::models::{MemoryAddInput, MemoryListInput, MemoryUpdateInput, UpdateOutcome};
+use remind_me_core::sync::TOMBSTONE_CONTENT;
 use remind_me_core::{wiki, Database};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -150,8 +154,10 @@ enum State {
 struct Snapshot {
     state: State,
     row: Option<String>,
-    /// Whether the row's text is empty, as a tombstone's must be.
-    blank: bool,
+    /// Whether the row is in the canonical emptied form a tombstone must
+    /// take (ADR-0024): content [`TOMBSTONE_CONTENT`], no tags, and no
+    /// subject, predicate or object.
+    emptied: bool,
     revisions: Vec<String>,
 }
 
@@ -300,9 +306,13 @@ pub fn run(
             false
         }
     };
-    report.insert("kills".into(), where_kills_fell(&rounds));
+    let kills = where_kills_fell(&rounds);
+    let insufficient = insufficient(&kills);
+    report.insert("kills".into(), kills);
+    report.insert("insufficient".into(), json!(insufficient));
+    report.insert("sufficient".into(), json!(insufficient.is_empty()));
     report.insert("rounds".into(), json!(rounds));
-    report.insert("passed".into(), json!(passed));
+    report.insert("passed".into(), json!(passed && insufficient.is_empty()));
     report.insert("peak_rss_mb".into(), json!(peak_rss_mb()));
     Ok(report)
 }
@@ -336,6 +346,23 @@ fn where_kills_fell(rounds: &[Value]) -> Value {
         );
     }
     Value::Object(by_stream)
+}
+
+/// The streams whose kills never caught a write in flight: they give no
+/// evidence for the all-or-nothing check (D57), so the run cannot score
+/// G6 however few failures it found. Their counts stay in the report.
+fn insufficient(kills: &Value) -> Vec<String> {
+    let Some(streams) = kills.as_object() else {
+        return vec!["no kill counts".into()];
+    };
+    streams
+        .iter()
+        .filter(|(_, k)| {
+            let n = |key: &str| k[key].as_u64().unwrap_or(0);
+            n("inside_a_write_not_landed") + n("inside_a_write_landed") == 0
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
 }
 
 /// One kill: start a child on `stream`, kill it a seeded delay after it
@@ -737,7 +764,7 @@ fn added(row: &str) -> Snapshot {
     Snapshot {
         state: State::Live,
         row: Some(row.to_string()),
-        blank: false,
+        emptied: false,
         revisions: Vec::new(),
     }
 }
@@ -759,14 +786,14 @@ fn unlike(intended: &Snapshot, found: &Snapshot) -> Option<String> {
 }
 
 /// Why `after` is not what a delete leaves: no live row, no revisions,
-/// and a tombstone's text empty. Whether the row stays as a tombstone or
-/// goes is the store's to choose (it syncs or it does not).
+/// and a tombstone in the canonical emptied form. Whether the row stays
+/// as a tombstone (a store that syncs) or goes is the store's setting.
 fn deleted(after: &Snapshot) -> Option<String> {
     if after.state == State::Live {
         return Some("left the memory live".into());
     }
-    if after.state == State::Tombstone && !after.blank {
-        return Some("left a tombstone holding text".into());
+    if after.state == State::Tombstone && !after.emptied {
+        return Some("left a tombstone not in the emptied form".into());
     }
     (!after.revisions.is_empty()).then(|| format!("left {} revisions", after.revisions.len()))
 }
@@ -779,7 +806,7 @@ fn differ(expected: &Snapshot, found: &Snapshot) -> String {
         expected.revisions.len(),
         found.state,
         found.revisions.len(),
-        if expected.row == found.row && expected.blank == found.blank {
+        if expected.row == found.row && expected.emptied == found.emptied {
             ""
         } else {
             ", and its row differs"
@@ -814,7 +841,7 @@ fn snapshot(store: &Store<'_>, id: &str) -> Result<Snapshot> {
         return Ok(Snapshot {
             state: State::Absent,
             row: None,
-            blank: false,
+            emptied: false,
             revisions,
         });
     };
@@ -825,10 +852,22 @@ fn snapshot(store: &Store<'_>, id: &str) -> Result<Snapshot> {
     };
     Ok(Snapshot {
         state,
-        blank: current.content.is_empty(),
+        emptied: emptied(store, id)?,
         row: Some(hash(&current)),
         revisions,
     })
+}
+
+/// Whether `id`'s row is in the canonical emptied form (ADR-0024).
+fn emptied(store: &Store<'_>, id: &str) -> Result<bool> {
+    let rows = Memories::new(store).get_many(&[id.to_string()])?;
+    Ok(rows.first().is_some_and(|m| {
+        m.content == TOMBSTONE_CONTENT
+            && m.tags.is_empty()
+            && m.subject.is_none()
+            && m.predicate.is_none()
+            && m.object.is_none()
+    }))
 }
 
 /// The hash of tracked columns, stable within a run.
@@ -1227,24 +1266,53 @@ mod tests {
         );
     }
 
+    /// A stream with no in-flight kill makes the run insufficient; its
+    /// counts stay as they were.
+    #[test]
+    fn a_stream_without_an_in_flight_kill_is_insufficient() {
+        let round = |stream: &str, in_flight: Option<&str>, landed: Option<bool>| {
+            json!({
+                "stream": stream,
+                "in_flight": in_flight,
+                "check": { "in_flight_landed": landed },
+            })
+        };
+        let rounds = vec![
+            round("writes", Some("update"), Some(false)),
+            round("writes", None, None),
+            round("pages", None, None),
+            round("pages", None, None),
+        ];
+        let kills = where_kills_fell(&rounds);
+        assert_eq!(kills["pages"]["total"], 2);
+        assert_eq!(kills["pages"]["between_writes"], 2);
+        assert_eq!(kills["writes"]["inside_a_write_not_landed"], 1);
+        assert_eq!(insufficient(&kills), ["pages"]);
+        let landed = vec![
+            round("writes", Some("add"), Some(true)),
+            round("pages", Some("page"), Some(false)),
+        ];
+        assert!(insufficient(&where_kills_fell(&landed)).is_empty());
+    }
+
     #[test]
     fn a_delete_leaves_no_live_row_no_revisions_and_no_text() {
         let gone = Snapshot {
             state: State::Absent,
             row: None,
-            blank: false,
+            emptied: false,
             revisions: vec![],
         };
         assert_eq!(deleted(&gone), None);
         let tombstone = Snapshot {
             state: State::Tombstone,
             row: Some("t".into()),
-            blank: true,
+            emptied: true,
             revisions: vec![],
         };
         assert_eq!(deleted(&tombstone), None);
         let holding_text = Snapshot {
-            blank: false,
+            emptied: false,
             ..tombstone
         };
         assert!(deleted(&holding_text).is_some());
@@ -1254,6 +1322,56 @@ mod tests {
         })
         .is_some());
         assert!(deleted(&added("a")).is_some());
+    }
+
+    /// On a store that syncs, a delete leaves a tombstone. Through the
+    /// crash stream's own delete (`queries::delete_memory`) it is in the
+    /// canonical emptied form on the engine and on SQLite, the acked
+    /// delete passes and the model checks clean; a tombstone still holding
+    /// text or tags is refused.
+    #[test]
+    fn a_synced_delete_leaves_a_canonical_tombstone() {
+        let (dir, bodies) = bodies("tombstone");
+        let engine = Database::open_backend(
+            Box::new(remind_me_core::db::engine::EngineTables::open(&dir.join("engine")).unwrap()),
+            None,
+        )
+        .unwrap();
+        let sqlite = Database::open_in_memory().unwrap();
+        for (backend, db) in [("engine", &engine), ("sqlite", &sqlite)] {
+            let store = db.store();
+            remind_me_core::testing::mark_store_syncing(&store).unwrap();
+            let mut model = Model::default();
+            let id = add(&store, &mut model, 0);
+            let op = Op::Delete {
+                id: id.clone(),
+                before: snapshot(&store, &id).unwrap(),
+            };
+            let landed = write(&store, &op, None).unwrap();
+            assert_eq!(landed.after.state, State::Tombstone, "{backend}");
+            assert!(landed.after.emptied, "{backend}: {:?}", landed.after);
+            assert_eq!(deleted(&landed.after), None, "{backend}");
+            let mut failures = Vec::new();
+            model.acked(op, Some(landed), &mut failures);
+            model.check(&store, &bodies, &mut failures).unwrap();
+            assert!(failures.is_empty(), "{backend}: {failures:?}");
+            for (column, value) in [("content", "still here"), ("tags", "[\"kept\"]")] {
+                remind_me_core::testing::set_memory_column(&store, &id, column, value).unwrap();
+                let after = snapshot(&store, &id).unwrap();
+                assert!(
+                    deleted(&after).is_some(),
+                    "{backend}: a tombstone with {column}"
+                );
+                let canonical = if column == "content" {
+                    TOMBSTONE_CONTENT
+                } else {
+                    "[]"
+                };
+                remind_me_core::testing::set_memory_column(&store, &id, column, canonical).unwrap();
+                assert_eq!(deleted(&snapshot(&store, &id).unwrap()), None, "{backend}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// An add's row is exactly the one its `begin` line names; a write
