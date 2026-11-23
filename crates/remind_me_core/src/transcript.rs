@@ -689,8 +689,6 @@ fn write_capture(
 
 /// Where the row a capture wrote takes its raw source from.
 enum Keep {
-    /// Nothing was written: a copy the record already holds.
-    Nothing,
     /// A first capture: the transcript becomes the session's archive, and
     /// the first row's span covers its `messages` messages.
     First { row: String, messages: usize },
@@ -702,6 +700,11 @@ enum Keep {
         /// replace the session's archive, and only when it extends it.
         placed: bool,
     },
+    /// A copy the record already holds: nothing was written. These rows
+    /// (each a `First`, or a `Continuation` with `placed` false) hold exactly
+    /// what the copy holds at those places, so a row whose source was lost
+    /// to an archive outage takes it from the copy (#1621).
+    Repair(Vec<Keep>),
 }
 
 /// Archive what `keep` asks for and record the written row's span. The
@@ -721,44 +724,113 @@ fn keep_source(
     raw: &str,
     keep: &Keep,
 ) -> std::result::Result<(), crate::archive::ArchiveError> {
-    use crate::archive;
-    if !archive::is_enabled() {
+    if !crate::archive::is_enabled() {
         return Ok(());
     }
     let kept = crate::boundary::scrub_jsonl(raw);
-    let spans: Vec<Range<usize>> = message_lines(&kept).map(|(span, _)| span).collect();
-    let session = archive::session_import_id(session_id);
+    let source = Source {
+        session: crate::archive::session_import_id(session_id),
+        spans: message_lines(&kept).map(|(span, _)| span).collect(),
+        kept,
+    };
     match keep {
-        Keep::Nothing => Ok(()),
-        Keep::First { row, messages } => {
-            archive::replace(store, &session, kept.as_bytes())?;
-            let Some(span) = cover(&spans, *messages) else {
-                return Ok(()); // No messages: nothing to point at.
-            };
-            archive::record_span(store, row, &session, span.start, span.end)?;
-            Ok(())
-        }
+        Keep::First { row, messages } => keep_first(store, &source, row, *messages),
         Keep::Continuation {
             row,
             indexes,
             placed,
         } => {
-            if *placed && extends(store, &session, &kept)? {
-                archive::replace(store, &session, kept.as_bytes())?;
+            if *placed && extends(store, &source.session, &source.kept)? {
+                crate::archive::replace(store, &source.session, source.kept.as_bytes())?;
             }
-            let Some(slices) = slices(&spans, indexes) else {
-                return Err(archive::ArchiveError::Io(std::io::Error::other(format!(
-                    "row {row}: a source line also holds a message the row does not; \
-                     no source recorded"
-                ))));
-            };
-            let own: Vec<&str> = slices.iter().map(|r| &kept[r.clone()]).collect();
-            let own = own.join("\n");
-            let import_id = archive::row_import_id(row);
-            archive::replace(store, &import_id, own.as_bytes())?;
-            archive::record_span(store, row, &import_id, 0, own.len())?;
-            Ok(())
+            keep_own(store, &source, row, indexes)
         }
+        Keep::Repair(rows) => rows
+            .iter()
+            .try_for_each(|keep| repair(store, &source, keep)),
+    }
+}
+
+/// A transcript as it is archived: scrubbed, with each message's line span.
+struct Source {
+    session: String,
+    kept: String,
+    spans: Vec<Range<usize>>,
+}
+
+/// Make the transcript the session's archive and point the first row at
+/// its first `messages` messages.
+fn keep_first(
+    store: &Store<'_>,
+    source: &Source,
+    row: &str,
+    messages: usize,
+) -> std::result::Result<(), crate::archive::ArchiveError> {
+    crate::archive::replace(store, &source.session, source.kept.as_bytes())?;
+    let Some(span) = cover(&source.spans, messages) else {
+        return Ok(()); // No messages: nothing to point at.
+    };
+    crate::archive::record_span(store, row, &source.session, span.start, span.end)?;
+    Ok(())
+}
+
+/// Keep exactly the lines of the messages at `indexes` under `row`'s own
+/// archive, and point the row at them.
+fn keep_own(
+    store: &Store<'_>,
+    source: &Source,
+    row: &str,
+    indexes: &[usize],
+) -> std::result::Result<(), crate::archive::ArchiveError> {
+    let Some(slices) = slices(&source.spans, indexes) else {
+        return Err(crate::archive::ArchiveError::Io(std::io::Error::other(
+            format!(
+                "row {row}: a source line also holds a message the row does not; \
+                 no source recorded"
+            ),
+        )));
+    };
+    let own: Vec<&str> = slices.iter().map(|r| &source.kept[r.clone()]).collect();
+    let own = own.join("\n");
+    let import_id = crate::archive::row_import_id(row);
+    crate::archive::replace(store, &import_id, own.as_bytes())?;
+    crate::archive::record_span(store, row, &import_id, 0, own.len())?;
+    Ok(())
+}
+
+/// Give a held row that has no source one from the resent copy (#1621). A
+/// row with a source is left alone. The first row takes the copy as the
+/// session's archive only where that archive is missing or the copy
+/// extends it byte for byte, so every span already recorded keeps reading
+/// its own bytes; a continuation takes its own lines, as when written.
+fn repair(
+    store: &Store<'_>,
+    source: &Source,
+    keep: &Keep,
+) -> std::result::Result<(), crate::archive::ArchiveError> {
+    let row = match keep {
+        Keep::First { row, .. } | Keep::Continuation { row, .. } => row,
+        Keep::Repair(_) => return Ok(()),
+    };
+    if crate::archive::source_for(store, row, true)?.is_some() {
+        return Ok(());
+    }
+    match keep {
+        Keep::First { row, messages } => {
+            // A line shared with a message past the row would claim a turn
+            // the row does not hold.
+            let own: Vec<usize> = (0..*messages).collect();
+            if slices(&source.spans, &own).is_none() {
+                return Ok(());
+            }
+            let archived = crate::archive::archived_bytes(store, &source.session)?;
+            if archived.is_some_and(|old| !source.kept.as_bytes().starts_with(&old)) {
+                return Ok(());
+            }
+            keep_first(store, source, row, *messages)
+        }
+        Keep::Continuation { row, indexes, .. } => keep_own(store, source, row, indexes),
+        Keep::Repair(_) => Ok(()),
     }
 }
 
@@ -1022,7 +1094,8 @@ fn recapture_in(
         // describing the longer record rather than this copy.
         Placement::Held => {
             let outcome = held_outcome(store, dialog, &capture_id, held)?;
-            return Ok((outcome, written, Keep::Nothing));
+            let keep = Keep::Repair(held_rows(&rows, &roles, &blocks, &position));
+            return Ok((outcome, written, keep));
         }
         Placement::New { indexes, .. } => indexes.clone(),
         // Not shown where it fits: kept whole and flagged, never skipped.
@@ -1076,6 +1149,79 @@ fn recapture_in(
         messages: total,
     };
     Ok((outcome, written, keep))
+}
+
+/// The rows of the record that `blocks` holds exactly, message for message,
+/// with where in it they sit: what a held copy may repair a lost source
+/// from. A row's messages are found by the ids it lists, each wherever it
+/// sits (a continuation of interleaved turns is not contiguous), else from
+/// its recorded start (the first row at 0, an unplaced row at 0, a placed
+/// continuation at `from_message`). The ids must agree and the text must
+/// equal the row's, message for message: matching ids alone do not prove
+/// the bytes are the row's. A row it does not show is left out, never
+/// guessed.
+fn held_rows(
+    rows: &[crate::models::Memory],
+    roles: &HashSet<&str>,
+    blocks: &[String],
+    ids: &[Option<String>],
+) -> Vec<Keep> {
+    rows.iter()
+        .enumerate()
+        .filter_map(|(sequence, row)| {
+            let at = row_positions(row, sequence, ids)?;
+            let held: Vec<String> = at
+                .iter()
+                .map(|&i| blocks.get(i).cloned())
+                .collect::<Option<_>>()?;
+            let held_ids: Vec<Option<String>> = at
+                .iter()
+                .map(|&i| ids.get(i).cloned())
+                .collect::<Option<_>>()?;
+            let fits = !at.is_empty()
+                && holds_exactly(row, roles, &held, &held_ids)
+                && same_text(row, roles, &held);
+            if !fits {
+                return None;
+            }
+            let id = row.id.clone();
+            Some(match sequence {
+                0 => Keep::First {
+                    row: id,
+                    messages: at.len(),
+                },
+                _ => Keep::Continuation {
+                    row: id,
+                    indexes: at,
+                    placed: false,
+                },
+            })
+        })
+        .collect()
+}
+
+/// Where the messages of `row`, the `sequence`th of its record, sit in a
+/// transcript whose messages carry `ids`, in order.
+fn row_positions(
+    row: &crate::models::Memory,
+    sequence: usize,
+    ids: &[Option<String>],
+) -> Option<Vec<usize>> {
+    let count = held_messages(row);
+    let listed = position_ids(row);
+    if sequence > 0 && !listed.is_empty() && listed.iter().all(Option::is_some) {
+        let at: Vec<usize> = listed
+            .iter()
+            .map(|want| ids.iter().position(|id| id == want))
+            .collect::<Option<_>>()?;
+        return at.windows(2).all(|w| w[0] < w[1]).then_some(at);
+    }
+    let start = match sequence {
+        0 => 0,
+        _ if is_unplaced(row) => 0,
+        _ => row.metadata.get("from_message")?.as_u64()? as usize,
+    };
+    Some((start..start.checked_add(count)?).collect())
 }
 
 /// What a recapture of a copy the record already holds reports: the capture
