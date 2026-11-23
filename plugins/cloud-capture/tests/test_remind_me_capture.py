@@ -9,6 +9,7 @@ import importlib.util
 import io
 import json
 import pathlib
+import re
 import shutil
 import tempfile
 import threading
@@ -340,11 +341,40 @@ class Helpers(unittest.TestCase):
             'AKIAABCDEFGHIJKLMNOP': 'aws_access_key',
             GHP: 'github_token',
             'xoxb-1234567890-abc': 'slack_token',
+            'github_pat_' + 'A1_' * 20: 'github_token',
+            'glpat-' + 'aB3-' * 5: 'gitlab_token',
+            'key sk-ant-' + 'aB3' * 11 + ' here': 'llm_api_key',
+            'sk_live_' + 'aB3' * 6: 'stripe_key',
+            'whsec_' + 'aB3' * 6: 'stripe_key',
+            'npm_' + 'aB3' * 12: 'npm_token',
+            'pypi-AgEIcHlwaS5vcmc' + 'aB3' * 10: 'pypi_token',
+            'AIza' + 'aB3_-' * 7: 'google_api_key',
+            'card 4111111111111111.': 'card_number',
+            'card 4111 1111 1111 1111': 'card_number',
+            'amex 3782-822463-10005': 'card_number',
             'token: abcdefgh12': 'secret',
         }
         for text, kind in cases.items():
             self.assertIn(f'[REDACTED:{kind}]', hook.redact(text), text)
         self.assertEqual(hook.redact('a token is fine'), 'a token is fine')
+
+    def test_redact_leaves_lookalikes_the_server_leaves(self):
+        kept = [
+            'pip install sk-learn-' + 'x' * 40,          # a slug, not a random key
+            'id 4111111111111112',                       # fails the Luhn sum
+            'pi is 3.4111111111111111',                  # a decimal fraction
+            'build 41111111111111110',                   # too long for a card
+            'uuid 41111111-1111-4111-1111-111111111111',  # an all-digit UUID
+            'AIza' + 'a' * 36,                           # one character too long
+        ]
+        for text in kept:
+            self.assertEqual(hook.redact(text), text)
+
+    def test_every_server_rule_has_a_hook_rule(self):
+        server = pathlib.Path(__file__).resolve().parents[3] / 'crates/remind_me_core/src/redact.rs'
+        kinds = set(re.findall(r'^\s*\("(\w+)", \w+\),$', server.read_text(), re.M))
+        self.assertTrue(kinds)
+        self.assertLessEqual(kinds, {kind for kind, _ in hook.RULES})
 
     def test_bare_remote_strips_credentials_query_and_fragment(self):
         self.assertEqual(hook.bare_remote('http://proxy:s3cret@127.0.0.1:9/git/o/r?t=1#f'),

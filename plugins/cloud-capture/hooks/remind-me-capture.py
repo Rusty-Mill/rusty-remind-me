@@ -143,24 +143,136 @@ SECRET_KEY = re.compile(r'(?i)(?:' + SECRET_WORDS + r')')
 # Usage counts named like secrets: `input_tokens`, `cache_read_input_tokens`, `max_tokens`.
 USAGE_COUNTER = re.compile(r'[a-z0-9_]+_tokens')
 
-# The shapes remind_me_core::redact scrubs, as (kind, pattern, group kept before
-# the secret). Bearer values are added here: a transcript can quote a header.
+def rule(pattern, keep=None, valid=None):
+    """A redaction rule: replace each match of `pattern` with `[REDACTED:<kind>]`, keeping
+    group `keep` before the mark and skipping a match whose secret `valid` rejects."""
+    def apply(text, mark):
+        def sub(m):
+            if valid and not valid(m.group(m.lastindex or 0)):
+                return m.group(0)
+            return (m.group(keep) if keep else '') + mark
+        return pattern.sub(sub, text)
+    return apply
+
+
+def prefixed(prefixes, body, least):
+    """`prefix` + at least `least` characters of `body`, not glued to a preceding letter or digit;
+    the run is group 1."""
+    alternatives = '|'.join(re.escape(p) for p in prefixes)
+    return re.compile(rf'(?<![A-Za-z0-9])(?:{alternatives})({body}{{{least},}})')
+
+
+B64URL = r'[A-Za-z0-9_-]'
+ALNUM = r'[A-Za-z0-9]'
+
+
+def mixes_case_and_digits(run):
+    """Whether `run` reads as random: upper case, lower case and digits all present."""
+    return (any(c.isupper() for c in run) and any(c.islower() for c in run)
+            and any(c.isdigit() for c in run))
+
+
+# Digit groups joined by single spaces or hyphens, not glued to a letter, digit or decimal point.
+DIGIT_GROUPS = re.compile(r'(?<![A-Za-z0-9])(?<!\d\.)\d+(?:[ -]\d+)*')
+
+
+def is_card(digits):
+    """Whether `digits` is a card number: a known network's prefix and length, and the Luhn sum."""
+    n = len(digits)
+    if not 13 <= n <= 19:
+        return False
+    def head(k):
+        return int(digits[:k])
+    first = digits[0]
+    network = (
+        (first == '4' and n in (13, 16, 19))
+        or (first == '3' and ((n == 15 and head(2) in (34, 37))
+                              or (n == 14 and (head(2) in (36, 38) or 300 <= head(3) <= 305))))
+        or (first == '5' and n == 16 and 51 <= head(2) <= 55)
+        or (first == '2' and n == 16 and 2221 <= head(4) <= 2720)
+        or (first == '6' and 16 <= n <= 19
+            and (head(4) == 6011 or head(2) == 65 or 644 <= head(3) <= 649))
+    )
+    if not network:
+        return False
+    total = sum(d if i % 2 == 0 else (d * 2 - 9 if d > 4 else d * 2)
+                for i, d in enumerate(int(c) for c in reversed(digits)))
+    return total % 10 == 0
+
+
+def card_shaped(lens):
+    """How a card is written: one run, fours with a short tail, or Amex/Diners 4-6-5 / 4-6-4."""
+    if len(lens) == 1 or lens in ([4, 6, 5], [4, 6, 4]):
+        return True
+    return all(n == 4 for n in lens[:-1]) and 1 <= lens[-1] <= 4
+
+
+def redact_cards(text, mark):
+    """`text` with every card number, written as a run or in separated groups, replaced by `mark`."""
+    def windows(m):
+        run = m.group(0)
+        groups = [(g.start(), g.end(), g.group(0)) for g in re.finditer(r'\d+', run)]
+        glued = re.match(r'[A-Za-z0-9]|\.\d', text[m.end():m.end() + 2])
+        spans = []
+        for first in range(len(groups)):
+            digits, found = '', None
+            for last in range(first, len(groups)):
+                digits += groups[last][2]
+                if len(digits) > 19:
+                    break
+                if len(digits) < 13:
+                    continue
+                bounded = last < len(groups) - 1 or not glued
+                lens = [len(g[2]) for g in groups[first:last + 1]]
+                if bounded and card_shaped(lens) and is_card(digits):
+                    found = last
+            if found is not None:
+                spans.append((groups[first][0], groups[found][1]))
+        out, at = [], 0
+        for start, end in merge(spans):
+            out += [run[at:start], mark]
+            at = end
+        return ''.join(out) + run[at:]
+    return DIGIT_GROUPS.sub(windows, text)
+
+
+def merge(spans):
+    """`spans` sorted, overlapping or touching ones joined."""
+    out = []
+    for a, b in sorted(spans):
+        if out and a <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], b))
+        else:
+            out.append((a, b))
+    return out
+
+
+# The shapes remind_me_core::redact scrubs, in its order, as (kind, rule). Bearer
+# values are added here: a transcript can quote a header.
 RULES = [
-    ('private_key', re.compile(r'-----BEGIN [A-Z ]*PRIVATE KEY-----.*?'
-                               r'(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)', re.S), None),
-    ('jwt', re.compile(r'(?<![A-Za-z0-9])eyJ[A-Za-z0-9_-]{7,}\.eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*'), None),
-    ('url_credentials', re.compile(r'(://[^\s/@:]*:)(?!\[REDACTED:)[^\s/@]+(?=@)'), 1),
-    ('aws_access_key', re.compile(r'(?<![A-Za-z0-9])AKIA[0-9A-Z]{16}(?![A-Za-z0-9])'), None),
-    ('github_token', re.compile(r'(?<![A-Za-z0-9])gh[pousr]_[A-Za-z0-9]{36,}'), None),
-    ('slack_token', re.compile(r'(?<![A-Za-z0-9])xox[baprs]-[A-Za-z0-9_-]{10,}'), None),
-    ('bearer', re.compile(r'(?i)(\bbearer[ \t]+)(?!\[REDACTED:)[A-Za-z0-9._~+/=-]{8,}'), 1),
+    ('private_key', rule(re.compile(r'-----BEGIN [A-Z ]*PRIVATE KEY-----.*?'
+                                    r'(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)', re.S))),
+    ('jwt', rule(re.compile(r'(?<![A-Za-z0-9])eyJ[A-Za-z0-9_-]{7,}\.eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*'))),
+    ('url_credentials', rule(re.compile(r'(://[^\s/@:]*:)(?!\[REDACTED:)[^\s/@]+(?=@)'), keep=1)),
+    ('aws_access_key', rule(re.compile(r'(?<![A-Za-z0-9])AKIA[0-9A-Z]{16}(?![A-Za-z0-9])'))),
+    ('github_token', rule(prefixed(['ghp_', 'gho_', 'ghu_', 'ghs_', 'ghr_'], ALNUM, 36))),
+    ('github_token', rule(prefixed(['github_pat_'], r'\w', 60))),
+    ('gitlab_token', rule(prefixed(['glpat-', 'gldt-', 'glrt-'], B64URL, 20))),
+    ('slack_token', rule(prefixed(['xoxb-', 'xoxa-', 'xoxp-', 'xoxr-', 'xoxs-'], B64URL, 10))),
+    ('llm_api_key', rule(prefixed(['sk-'], B64URL, 32), valid=mixes_case_and_digits)),
+    ('stripe_key', rule(prefixed(['sk_live_', 'sk_test_', 'rk_live_', 'rk_test_', 'whsec_'], ALNUM, 16))),
+    ('npm_token', rule(prefixed(['npm_'], ALNUM, 36))),
+    ('pypi_token', rule(prefixed(['pypi-AgEIcHlwaS5vcmc'], B64URL, 30))),
+    ('google_api_key', rule(re.compile(r'(?<![A-Za-z0-9])AIza[A-Za-z0-9_-]{35}(?![A-Za-z0-9_-])'))),
+    ('card_number', redact_cards),
+    ('bearer', rule(re.compile(r'(?i)(\bbearer[ \t]+)(?!\[REDACTED:)[A-Za-z0-9._~+/=-]{8,}'), keep=1)),
     # `key: "value"`, `"key": "value"` and their escaped forms inside serialized
     # JSON: the whole quoted value, however short.
-    ('secret', re.compile(r'(?i)((?:' + SECRET_WORDS + r')[\w-]*\\?["\']?[ \t]*[:=][ \t]*\\?(["\']))'
-                          r'(?!\[REDACTED:)(?:(?!\\?\2).)+'), 1),
+    ('secret', rule(re.compile(r'(?i)((?:' + SECRET_WORDS + r')[\w-]*\\?["\']?[ \t]*[:=][ \t]*\\?(["\']))'
+                               r'(?!\[REDACTED:)(?:(?!\\?\2).)+'), keep=1)),
     # `key=value`, `key: value`: an unquoted value of eight or more characters.
-    ('secret', re.compile(r'(?i)((?:' + SECRET_WORDS + r')[\w-]*["\']?[ \t]*[:=][ \t]*)'
-                          r'(?![\\"\']|\[REDACTED:)\S{8,}'), 1),
+    ('secret', rule(re.compile(r'(?i)((?:' + SECRET_WORDS + r')[\w-]*["\']?[ \t]*[:=][ \t]*)'
+                               r'(?![\\"\']|\[REDACTED:)\S{8,}'), keep=1)),
 ]
 
 
@@ -168,9 +280,8 @@ def redact(text, token=None):
     """`text` with every secret shape, and `token` itself, replaced by `[REDACTED:<kind>]`."""
     if token:
         text = text.replace(token, '[REDACTED:token]')
-    for kind, pattern, keep in RULES:
-        mark = f'[REDACTED:{kind}]'
-        text = pattern.sub((lambda m, mark=mark, keep=keep: m.group(keep) + mark) if keep else mark, text)
+    for kind, apply in RULES:
+        text = apply(text, f'[REDACTED:{kind}]')
     return text
 
 
