@@ -234,6 +234,19 @@ mod tests {
                 "{report}"
             );
             assert!(report["memories_tracked"].as_u64().unwrap() > 0, "{report}");
+            for stream in ["writes", "pages"] {
+                let kills = &report["kills"][stream];
+                let fell: u64 = [
+                    "between_writes",
+                    "inside_a_write_not_landed",
+                    "inside_a_write_landed",
+                ]
+                .iter()
+                .map(|k| kills[*k].as_u64().unwrap())
+                .sum();
+                assert_eq!(kills["total"], 10, "{report}");
+                assert_eq!(fell, 10, "every kill falls somewhere: {report}");
+            }
         }
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -505,9 +518,15 @@ mod tests {
         };
         assert_eq!(picked.len(), 3);
         let mut q = String::new();
-        let mut v = String::from(
-            "{\"backend\":\"test\",\"model\":\"fixture\",\"dim\":8,\"role\":\"query\",\"backup\":\"small\"}\n",
-        );
+        let fingerprint = harness::fingerprint::backup_fingerprint(&backup).unwrap();
+        let header = |sha256: &str| {
+            let header = serde_json::json!({
+                "backend": "test", "model": "fixture", "dim": 8, "role": "query",
+                "backup": "small", "backup_sha256": sha256,
+            });
+            format!("{header}\n")
+        };
+        let mut v = header(&fingerprint);
         let lines = picked
             .iter()
             .map(|(id, content)| (content.clone(), vec![id.clone()], vectors[id].clone()))
@@ -545,6 +564,20 @@ mod tests {
             !real.to_string().contains("no such memory"),
             "no query text"
         );
+        assert_eq!(report["backup_sha256"], fingerprint.as_str());
+
+        // Vectors made for another backup are refused before scoring.
+        let ours = std::fs::read_to_string(files.join("v.jsonl")).unwrap();
+        let theirs = ours.replacen(&fingerprint, "0".repeat(64).as_str(), 1);
+        std::fs::write(files.join("other.jsonl"), theirs).unwrap();
+        let refused = harness::relevance_run(
+            ENGINE,
+            &set,
+            &root.join("runs"),
+            Some((&files.join("q.jsonl"), &files.join("other.jsonl"))),
+        )
+        .unwrap_err();
+        assert!(refused.to_string().contains("another backup"), "{refused}");
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

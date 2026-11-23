@@ -96,6 +96,7 @@ mod bodies;
 mod cold;
 pub mod crash;
 mod d1;
+pub mod fingerprint;
 mod g1;
 mod package;
 mod relevance;
@@ -367,6 +368,8 @@ pub fn relevance_run(
     let (Some(backup), Some((queries, vectors))) = (backup, files) else {
         return Ok(report);
     };
+    // The vectors are bound to this very backup, checked before any load.
+    let fingerprint = fingerprint::backup_fingerprint(&backup)?;
     let cand = candidate.open(&dir.join("d1"))?;
     let engine = Database::open_backend(
         Box::new(remind_me_core::db::engine::EngineTables::open(
@@ -387,8 +390,9 @@ pub fn relevance_run(
         &es,
         &Bodies::new(dir.join("engine").join("blobs")),
     )?;
-    let set = relevance::RealSet::read(queries, vectors, &relevance::identity(&es)?)?;
+    let set = relevance::RealSet::read(queries, vectors, &relevance::identity(&es)?, &fingerprint)?;
     report.insert("dataset".into(), json!("d1"));
+    report.insert("backup_sha256".into(), json!(fingerprint));
     report.insert("real_1563".into(), relevance::real(&set, &cs, &es)?);
     Ok(report)
 }

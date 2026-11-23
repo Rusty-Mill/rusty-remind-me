@@ -3,21 +3,24 @@
 //!
 //! ```text
 //! cargo run --release -p remind_me_core --example embed_queries -- \
-//!     <backup name> <queries.jsonl> <vectors.jsonl>
+//!     <backup> <queries.jsonl> <vectors.jsonl>
 //! ```
 //!
 //! Configure the embedder that made D1's vectors, as the node does
 //! (`REMIND_ME_EMBEDDING_BACKEND` and its settings). Each query is
 //! embedded as a query (`EmbedRole::Query`), in set order. The output's
 //! first line names the backend, model, dimension and role, and the backup
-//! it is for; each later line is `{"n", "query", "vector"}`, where `n` is
+//! it is for: the directory's name and its fingerprint (`backup_sha256`,
+//! the SHA-256 of its tree; the backup is only read); each later line is `{"n", "query", "vector"}`, where `n` is
 //! the query's ordinal in the set from 1 (blank lines skipped).
-//! `store_bench relevance` refuses vectors whose header does not match the
-//! loaded D1's embedding identity.
+//! `store_bench relevance` refuses vectors whose fingerprint is not the
+//! backup it loads, or whose header does not match the loaded D1's
+//! embedding identity.
 //!
 //! The output holds the private query texts, so it is created new, never
 //! overwritten, and on Unix readable by its owner only. No error names a
-//! query's text.
+//! query's text, a path, or what a parser or the embedding provider said:
+//! only a line or a query's ordinal and a fixed class.
 
 use remind_me_core::embedder::{configured_embedder, ConfiguredEmbedder, EmbedRole, Embedder};
 use serde::Deserialize;
@@ -26,6 +29,9 @@ use std::error::Error;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
+
+#[path = "store_bench/fingerprint.rs"]
+mod fingerprint;
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
@@ -41,7 +47,7 @@ struct Query {
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let [backup, queries, out] = args.as_slice() else {
-        return Err("usage: embed_queries <backup name> <queries.jsonl> <vectors.jsonl>".into());
+        return Err("usage: embed_queries <backup> <queries.jsonl> <vectors.jsonl>".into());
     };
     let embedder = match configured_embedder() {
         ConfiguredEmbedder::Ready(embedder) => embedder,
@@ -52,23 +58,38 @@ fn main() -> Result<()> {
             return Err(format!("the configured embedder cannot embed: {reason}").into())
         }
     };
+    let backup = Path::new(backup);
+    let for_backup = ForBackup {
+        name: backup
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .ok_or("the backup has no directory name")?,
+        sha256: fingerprint::backup_fingerprint(backup)?,
+    };
     let texts = read_queries(Path::new(queries))?;
     let file = create_private(Path::new(out))?;
-    write_vectors(&*embedder, backup, &texts, file)?;
+    write_vectors(&*embedder, &for_backup, &texts, file)?;
     eprintln!("embedded {} queries", texts.len());
     Ok(())
 }
 
+/// The backup the vectors are for: its directory's name and fingerprint.
+struct ForBackup {
+    name: String,
+    sha256: String,
+}
+
 /// The set's query texts, in order, blank lines skipped.
 fn read_queries(path: &Path) -> Result<Vec<String>> {
-    let text = std::fs::read_to_string(path)?;
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read the queries file ({:?})", e.kind()))?;
     let mut texts = Vec::new();
     for (i, line) in text.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
         let query: Query = serde_json::from_str(line)
-            .map_err(|e| format!("{} line {}: {e}", path.display(), i + 1))?;
+            .map_err(|_| format!("the queries file, line {}: not a valid line", i + 1))?;
         texts.push(query.query);
     }
     Ok(texts)
@@ -83,13 +104,13 @@ fn create_private(path: &Path) -> Result<File> {
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
     options
         .open(path)
-        .map_err(|e| format!("{}: {e}", path.display()).into())
+        .map_err(|e| format!("cannot create the vectors file ({:?})", e.kind()).into())
 }
 
 /// The header, then each text's query vector, to `out`.
 fn write_vectors(
     embedder: &dyn Embedder,
-    backup: &str,
+    backup: &ForBackup,
     texts: &[String],
     mut out: impl Write,
 ) -> Result<()> {
@@ -99,14 +120,16 @@ fn write_vectors(
         "model": id.model,
         "dim": id.dim,
         "role": "query",
-        "backup": backup,
+        "backup": backup.name,
+        "backup_sha256": backup.sha256,
     });
     writeln!(out, "{header}")?;
     for (b, chunk) in texts.chunks(BATCH).enumerate() {
         let first = b * BATCH + 1;
         let vectors = embedder
             .embed(chunk, EmbedRole::Query)
-            .map_err(|e| format!("queries {first} on: {e}"))?;
+            // The provider's message may quote the input: name the batch only.
+            .map_err(|_| format!("queries {first} on: the embedder failed"))?;
         if vectors.len() != chunk.len() {
             return Err(format!(
                 "queries {first} on: {} vectors for {} queries",
@@ -168,6 +191,59 @@ mod tests {
         }
     }
 
+    fn backup() -> ForBackup {
+        ForBackup {
+            name: "manual-x.engine".into(),
+            sha256: "fp".into(),
+        }
+    }
+
+    /// Fails quoting its input, as a provider's message may.
+    struct Quoting;
+
+    impl Embedder for Quoting {
+        fn embed(
+            &self,
+            texts: &[String],
+            _role: EmbedRole,
+        ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+            Err(EmbedError(format!("bad input: {}", texts.join(" "))))
+        }
+
+        fn dim(&self) -> usize {
+            2
+        }
+
+        fn identity(&self) -> EmbeddingIdentity {
+            fake(2).identity()
+        }
+    }
+
+    #[test]
+    fn a_provider_error_is_named_by_its_batch_only() {
+        let error = write_vectors(&Quoting, &backup(), &["secret".into()], Vec::new()).unwrap_err();
+        assert_eq!(error.to_string(), "queries 1 on: the embedder failed");
+    }
+
+    #[test]
+    fn a_malformed_query_line_is_named_by_its_number_only() {
+        let dir = std::env::temp_dir().join(format!("embed_queries_secret_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let set = dir.join("set.jsonl");
+        std::fs::write(&set, "{\"query\": secret text\n").unwrap();
+        let error = read_queries(&set).unwrap_err().to_string();
+        assert_eq!(error, "the queries file, line 1: not a valid line");
+        let error = read_queries(&dir.join("missing")).unwrap_err().to_string();
+        assert!(
+            !error.contains("secret") && !error.contains("missing"),
+            "{error}"
+        );
+        let error = create_private(&set).unwrap_err().to_string();
+        assert!(!error.contains("secret"), "{error}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     fn fake(dim: usize) -> Fake {
         Fake {
             dim,
@@ -180,7 +256,7 @@ mod tests {
         let texts: Vec<String> = (0..20).map(|i| "q".repeat(i + 1)).collect();
         let embedder = fake(2);
         let mut out = Vec::new();
-        write_vectors(&embedder, "manual-x.engine", &texts, &mut out).unwrap();
+        write_vectors(&embedder, &backup(), &texts, &mut out).unwrap();
         let lines: Vec<Value> = String::from_utf8(out)
             .unwrap()
             .lines()
@@ -188,7 +264,7 @@ mod tests {
             .collect();
         assert_eq!(
             lines[0],
-            json!({ "backend": "fake", "model": "m", "dim": 2, "role": "query", "backup": "manual-x.engine" })
+            json!({ "backend": "fake", "model": "m", "dim": 2, "role": "query", "backup": "manual-x.engine", "backup_sha256": "fp" })
         );
         assert_eq!(lines.len(), 21);
         assert_eq!(lines[20]["n"], 20);
@@ -200,7 +276,7 @@ mod tests {
 
     #[test]
     fn a_vector_of_the_wrong_size_is_refused_without_its_text() {
-        let error = write_vectors(&fake(3), "b", &["secret".into()], Vec::new()).unwrap_err();
+        let error = write_vectors(&fake(3), &backup(), &["secret".into()], Vec::new()).unwrap_err();
         assert!(error.to_string().contains("query 1"), "{error}");
         assert!(!error.to_string().contains("secret"), "{error}");
     }

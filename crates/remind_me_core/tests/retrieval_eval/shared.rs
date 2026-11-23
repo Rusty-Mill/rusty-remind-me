@@ -233,6 +233,18 @@ pub fn ranked(
     embedder: Option<&dyn Embedder>,
     dates: bool,
 ) -> Vec<String> {
+    ranked_outcome(store, g, strategy, embedder, dates).0
+}
+
+/// [`ranked`], and whether the search degraded (a stage skipped or
+/// failed, so its ranking is a fallback's, not the full search's).
+pub fn ranked_outcome(
+    store: &Store<'_>,
+    g: &GoldenQuery,
+    strategy: RetrievalStrategy,
+    embedder: Option<&dyn Embedder>,
+    dates: bool,
+) -> (Vec<String>, bool) {
     let input = MemorySearchInput {
         query: g.query.clone(),
         limit: DEPTH,
@@ -256,12 +268,11 @@ pub fn ranked(
     } else {
         input
     };
-    queries::search_memories_deadlined(store, &input, embedder, Deadline::unbounded())
-        .unwrap()
-        .results
-        .into_iter()
-        .map(|r| r.memory.id)
-        .collect()
+    let outcome =
+        queries::search_memories_deadlined(store, &input, embedder, Deadline::unbounded()).unwrap();
+    let degraded = outcome.timing.degraded();
+    let ids = outcome.results.into_iter().map(|r| r.memory.id).collect();
+    (ids, degraded)
 }
 
 // ---------------------------------------------------------------------------
@@ -397,6 +408,8 @@ pub struct Report {
     /// `mode/strategy/kind`, for the `+dates` lift lines; not gated.
     pub kinds: BTreeMap<String, Scores>,
     pub violations: Vec<String>,
+    /// `mode/strategy` of each search that degraded, once per search.
+    pub degraded: Vec<String>,
 }
 
 /// Score every golden query under each strategy in `mode`, on `db` (a
@@ -423,7 +436,10 @@ pub fn evaluate_in(
         let mut all = Vec::new();
         let mut by_kind: BTreeMap<&str, Vec<(f64, f64, f64)>> = BTreeMap::new();
         for g in &golden {
-            let ranking = ranked(&store, g, strategy, embedder, dates);
+            let (ranking, degraded) = ranked_outcome(&store, g, strategy, embedder, dates);
+            if degraded {
+                report.degraded.push(format!("{mode}/{name}"));
+            }
             for leak in g.must_not.iter().filter(|id| ranking.contains(id)) {
                 report
                     .violations

@@ -12,7 +12,12 @@
 //!   invalid (not a miss).
 //! - **#1563 set** (D59), on D1 runs only: real queries and their vectors,
 //!   embedded once beforehand by `embed_queries` with the model that made
-//!   D1's vectors, both read from outside the repo (D39). `keyword` and
+//!   D1's vectors, both read from outside the repo (D39). The vectors'
+//!   header names the backup's fingerprint ([`super::fingerprint`]), which
+//!   must be the loaded backup's, and its model, role and dimension, which
+//!   must be the loaded store's. Errors reading either file name a line or
+//!   a query's ordinal and a fixed class, never a path, a parser's message
+//!   or anything the files hold. `keyword` and
 //!   `vector` under every strategy are gated. Relevant ids the D1 copy
 //!   lacks are left out of every candidate's denominator alike; a query
 //!   with none left is dropped. Only counts and ordinals are reported,
@@ -61,14 +66,36 @@ pub fn golden(open: &mut dyn FnMut(&str) -> Result<Database>) -> Result<Value> {
     let drift = drift_from(&baseline, &engine.scores);
     let mut misses = cand.violations.clone();
     misses.extend(cell_misses(&engine.scores, &cand.scores));
+    let degraded = degraded_cells(&engine.degraded, &cand.degraded);
+    let valid = drift.is_empty() && engine.degraded.is_empty() && cand.degraded.is_empty();
     Ok(json!({
         "cells": cells(&engine.scores, &cand.scores),
         "reported": cells(&engine.measured, &cand.measured),
         "misses": misses,
         "engine_baseline_drift": drift,
-        "valid": drift.is_empty(),
-        "passed": drift.is_empty() && misses.is_empty(),
+        "degraded_searches": degraded,
+        "valid": valid,
+        "passed": valid && misses.is_empty(),
     }))
+}
+
+/// How many searches degraded in each cell, by side: a degraded search
+/// ranks a fallback's results (a failed semantic stage leaves keyword
+/// only), so a cell holding one is not a comparison of full searches and
+/// the run is invalid.
+fn degraded_cells(engine: &[String], cand: &[String]) -> Value {
+    let mut cells: BTreeMap<String, Map<String, Value>> = BTreeMap::new();
+    for (side, list) in [("engine", engine), ("candidate", cand)] {
+        for key in list {
+            let n = cells
+                .entry(key.clone())
+                .or_default()
+                .entry(side)
+                .or_insert(json!(0));
+            *n = json!(n.as_u64().unwrap_or(0) + 1);
+        }
+    }
+    json!(cells)
 }
 
 /// Each cell of `cand` whose recall@10 or MRR is more than [`TOLERANCE`]
@@ -141,7 +168,10 @@ pub struct VectorsHeader {
     pub model: String,
     pub dim: usize,
     pub role: String,
+    /// The backup directory's name, for the report.
     pub backup: String,
+    /// The backup's fingerprint ([`super::fingerprint::backup_fingerprint`]).
+    pub backup_sha256: String,
 }
 
 /// One query vector, keyed by the query's line number in the set (from
@@ -164,21 +194,33 @@ pub struct RealSet {
 
 impl RealSet {
     /// Read `queries` and `vectors`, refusing a missing or mismatched
-    /// vector, or vectors from another model, role or dimension than
+    /// vector, vectors made for another backup than the one fingerprinted
+    /// `backup_sha256`, or from another model, role or dimension than
     /// `identity` (the D1 store's embedding meta).
-    pub fn read(queries: &Path, vectors: &Path, identity: &[(String, String)]) -> Result<Self> {
-        let set: Vec<RealQuery> = jsonl(queries)?;
-        let mut lines = std::io::BufReader::new(std::fs::File::open(vectors)?).lines();
+    pub fn read(
+        queries: &Path,
+        vectors: &Path,
+        identity: &[(String, String)],
+        backup_sha256: &str,
+    ) -> Result<Self> {
+        let set: Vec<RealQuery> = jsonl(queries, QUERIES)?;
+        let file = std::fs::File::open(vectors).map_err(unreadable(VECTORS))?;
+        let mut lines = std::io::BufReader::new(file).lines();
+        let first = lines
+            .next()
+            .ok_or("the vectors file is empty")?
+            .map_err(unreadable(VECTORS))?;
         let header: VectorsHeader =
-            serde_json::from_str(&lines.next().ok_or("empty vectors file")??)?;
-        check_header(&header, identity)?;
+            serde_json::from_str(&first).map_err(|_| malformed(VECTORS, 1))?;
+        check_header(&header, identity, backup_sha256)?;
         let mut by_n = HashMap::new();
-        for line in lines {
-            let line = line?;
+        for (i, line) in lines.enumerate() {
+            let line = line.map_err(unreadable(VECTORS))?;
             if line.trim().is_empty() {
                 continue;
             }
-            let v: QueryVector = serde_json::from_str(&line)?;
+            let v: QueryVector =
+                serde_json::from_str(&line).map_err(|_| malformed(VECTORS, i + 2))?;
             if v.vector.len() != header.dim {
                 return Err(format!(
                     "query {} has a {}-dim vector, not {}",
@@ -215,11 +257,19 @@ impl RealSet {
     }
 }
 
-/// Refuse vectors not made by the store's model, for queries, at its
-/// dimension.
-fn check_header(header: &VectorsHeader, identity: &[(String, String)]) -> Result<()> {
+/// Refuse vectors not made for the loaded backup, by the store's model,
+/// for queries, at its dimension. The errors name the field, never a
+/// value from either side.
+fn check_header(
+    header: &VectorsHeader,
+    identity: &[(String, String)],
+    backup_sha256: &str,
+) -> Result<()> {
+    if header.backup_sha256 != backup_sha256 {
+        return Err("the vectors were made for another backup than the one loaded".into());
+    }
     if header.role != "query" {
-        return Err(format!("the vectors were embedded as {:?}, not query", header.role).into());
+        return Err("the vectors were not embedded as queries".into());
     }
     let meta = |key: &str| {
         identity
@@ -234,27 +284,34 @@ fn check_header(header: &VectorsHeader, identity: &[(String, String)]) -> Result
         ("dim", dim.as_str()),
     ] {
         if meta(key) != Some(want) {
-            return Err(format!(
-                "the vectors' {key} is {want:?}; the store's is {:?}",
-                meta(key)
-            )
-            .into());
+            return Err(format!("the vectors' {key} is not the loaded store's").into());
         }
     }
     Ok(())
 }
 
-fn jsonl<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Vec<T>> {
-    let text = std::fs::read_to_string(path)?;
+/// The input files, as errors name them.
+const QUERIES: &str = "the queries file";
+const VECTORS: &str = "the vectors file";
+
+/// An I/O error reading `file`, as its kind only.
+fn unreadable(file: &'static str) -> impl Fn(std::io::Error) -> Box<dyn std::error::Error> {
+    move |e| format!("cannot read {file} ({:?})", e.kind()).into()
+}
+
+/// A line of `file` that does not parse, by its number from 1.
+fn malformed(file: &str, line: usize) -> String {
+    format!("{file}, line {line}: not a valid line")
+}
+
+fn jsonl<T: for<'de> Deserialize<'de>>(path: &Path, file: &'static str) -> Result<Vec<T>> {
+    let text = std::fs::read_to_string(path).map_err(unreadable(file))?;
     let mut rows = Vec::new();
     for (i, line) in text.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
-        rows.push(
-            serde_json::from_str(line)
-                .map_err(|e| format!("{} line {}: {e}", path.display(), i + 1))?,
-        );
+        rows.push(serde_json::from_str(line).map_err(|_| malformed(file, i + 1))?);
     }
     Ok(rows)
 }
@@ -294,17 +351,24 @@ pub fn real(set: &RealSet, cand: &Store<'_>, engine: &Store<'_>) -> Result<Value
         return Err("no #1563 query has a relevant id in this D1 copy".into());
     }
     let (mut e, mut c) = (BTreeMap::new(), BTreeMap::new());
+    let (mut e_degraded, mut c_degraded) = (Vec::new(), Vec::new());
     for (mode, embedder) in [
         ("keyword", None),
         ("vector", Some(&set.vectors as &dyn Embedder)),
     ] {
         for (name, strategy) in STRATEGIES {
             let key = format!("{mode}/{name}");
-            e.insert(key.clone(), score(engine, &kept, strategy, embedder));
-            c.insert(key, score(cand, &kept, strategy, embedder));
+            let (scores, degraded) = score(engine, &kept, strategy, embedder);
+            e_degraded.extend(std::iter::repeat_n(key.clone(), degraded));
+            e.insert(key.clone(), scores);
+            let (scores, degraded) = score(cand, &kept, strategy, embedder);
+            c_degraded.extend(std::iter::repeat_n(key.clone(), degraded));
+            c.insert(key, scores);
         }
     }
     let misses = cell_misses(&e, &c);
+    let degraded = degraded_cells(&e_degraded, &c_degraded);
+    let valid = e_degraded.is_empty() && c_degraded.is_empty();
     Ok(json!({
         "vectors_for_backup": set.for_backup,
         "queries": set.queries.len(),
@@ -313,21 +377,26 @@ pub fn real(set: &RealSet, cand: &Store<'_>, engine: &Store<'_>) -> Result<Value
         "relevant_ids_missing": missing,
         "cells": cells(&e, &c),
         "misses": misses,
-        "passed": misses.is_empty(),
+        "degraded_searches": degraded,
+        "valid": valid,
+        "passed": valid && misses.is_empty(),
     }))
 }
 
-/// Mean recall@5, recall@10 and MRR of `golden` on `store`.
+/// Mean recall@5, recall@10 and MRR of `golden` on `store`, and how many
+/// of its searches degraded.
 fn score(
     store: &Store<'_>,
     golden: &[eval::GoldenQuery],
     strategy: remind_me_core::RetrievalStrategy,
     embedder: Option<&dyn Embedder>,
-) -> Scores {
+) -> (Scores, usize) {
+    let mut degraded = 0;
     let rows: Vec<(f64, f64, f64)> = golden
         .iter()
         .map(|g| {
-            let ranking = eval::ranked(store, g, strategy, embedder, false);
+            let (ranking, failed) = eval::ranked_outcome(store, g, strategy, embedder, false);
+            degraded += usize::from(failed);
             (
                 eval::recall_at(&ranking, &g.relevant, 5),
                 eval::recall_at(&ranking, &g.relevant, eval::DEPTH),
@@ -335,7 +404,7 @@ fn score(
             )
         })
         .collect();
-    Scores::mean(&rows)
+    (Scores::mean(&rows), degraded)
 }
 
 /// The D1 store's embedding identity, as `RealSet::read` checks it.
@@ -367,6 +436,59 @@ mod tests {
         assert!(cell_misses(&engine, &BTreeMap::new())[0].contains("no candidate"));
     }
 
+    /// An embedder that always fails, as a precomputed set missing a
+    /// query would.
+    struct Failing;
+
+    impl Embedder for Failing {
+        fn embed(
+            &self,
+            _texts: &[String],
+            _role: remind_me_core::embedder::EmbedRole,
+        ) -> std::result::Result<Vec<Vec<f32>>, remind_me_core::embedder::EmbedError> {
+            Err(remind_me_core::embedder::EmbedError("down".into()))
+        }
+
+        fn dim(&self) -> usize {
+            eval::HashedEmbedder.dim()
+        }
+
+        fn identity(&self) -> remind_me_core::embedder::EmbeddingIdentity {
+            eval::HashedEmbedder.identity()
+        }
+    }
+
+    /// A vector search whose semantic stage fails falls back to keyword
+    /// results; the cell counts it as degraded instead of scoring it as a
+    /// vector result.
+    #[test]
+    fn a_degraded_search_is_counted_not_scored_as_a_full_one() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        let input = remind_me_core::models::MemoryAddInput {
+            content: "wombat burrows".into(),
+            extract: false,
+            ..Default::default()
+        };
+        let id = queries::add_memory(&store, input).unwrap().id;
+        let golden = vec![eval::GoldenQuery {
+            query: "wombat".into(),
+            relevant: vec![id],
+            kind: "real".into(),
+            must_not: Vec::new(),
+            project: None,
+            entity: None,
+            topic: None,
+        }];
+        let strategy = remind_me_core::RetrievalStrategy::Balanced;
+        let (_, degraded) = score(&store, &golden, strategy, Some(&Failing));
+        assert_eq!(degraded, 1);
+        let (_, clean) = score(&store, &golden, strategy, None);
+        assert_eq!(clean, 0);
+        let cells = degraded_cells(&[], &["vector/balanced".into()]);
+        assert_eq!(cells["vector/balanced"]["candidate"], 1);
+    }
+
     #[test]
     fn engine_drift_either_way_invalidates_the_run() {
         let base = BTreeMap::from([("hashed/auto".to_string(), s(0.80, 0.70))]);
@@ -383,6 +505,7 @@ mod tests {
             dim,
             role: role.into(),
             backup: "manual-x.engine".into(),
+            backup_sha256: "fp".into(),
         }
     }
 
@@ -393,10 +516,14 @@ mod tests {
             ("model".to_string(), "m".to_string()),
             ("dim".to_string(), "4".to_string()),
         ];
-        check_header(&header("m", 4, "query"), &meta).unwrap();
-        assert!(check_header(&header("other", 4, "query"), &meta).is_err());
-        assert!(check_header(&header("m", 8, "query"), &meta).is_err());
-        assert!(check_header(&header("m", 4, "document"), &meta).is_err());
+        check_header(&header("m", 4, "query"), &meta, "fp").unwrap();
+        assert!(check_header(&header("other", 4, "query"), &meta, "fp").is_err());
+        assert!(check_header(&header("m", 8, "query"), &meta, "fp").is_err());
+        assert!(check_header(&header("m", 4, "document"), &meta, "fp").is_err());
+        let error = check_header(&header("m", 4, "query"), &meta, "another").unwrap_err();
+        assert!(error.to_string().contains("another backup"), "{error}");
+        let error = check_header(&header("secret-model", 4, "query"), &meta, "fp").unwrap_err();
+        assert!(!error.to_string().contains("secret"), "{error}");
     }
 
     #[test]
@@ -411,24 +538,73 @@ mod tests {
         ];
         let q = root.join("q.jsonl");
         std::fs::write(&q, "{\"query\":\"a\",\"relevant\":[\"x\"],\"kind\":\"k\"}\n{\"query\":\"b\",\"relevant\":[\"y\"],\"kind\":\"k\"}\n").unwrap();
-        let head = "{\"backend\":\"openai\",\"model\":\"m\",\"dim\":2,\"role\":\"query\",\"backup\":\"b\"}";
+        let head = "{\"backend\":\"openai\",\"model\":\"m\",\"dim\":2,\"role\":\"query\",\"backup\":\"b\",\"backup_sha256\":\"fp\"}";
         let v = root.join("v.jsonl");
         std::fs::write(&v, format!("{head}\n{{\"n\":1,\"query\":\"a\",\"vector\":[1,0]}}\n{{\"n\":2,\"query\":\"b\",\"vector\":[0,1]}}\n")).unwrap();
-        RealSet::read(&q, &v, &meta).unwrap();
+        RealSet::read(&q, &v, &meta, "fp").unwrap();
         std::fs::write(
             &v,
             format!("{head}\n{{\"n\":1,\"query\":\"a\",\"vector\":[1,0]}}\n"),
         )
         .unwrap();
-        assert!(RealSet::read(&q, &v, &meta).is_err(), "missing vector");
+        assert!(
+            RealSet::read(&q, &v, &meta, "fp").is_err(),
+            "missing vector"
+        );
         std::fs::write(&v, format!("{head}\n{{\"n\":1,\"query\":\"a\",\"vector\":[1,0]}}\n{{\"n\":2,\"query\":\"z\",\"vector\":[0,1]}}\n")).unwrap();
-        assert!(RealSet::read(&q, &v, &meta).is_err(), "reordered set");
+        assert!(RealSet::read(&q, &v, &meta, "fp").is_err(), "reordered set");
         std::fs::write(
             &v,
             format!("{head}\n{{\"n\":1,\"query\":\"a\",\"vector\":[1,0,0]}}\n"),
         )
         .unwrap();
-        assert!(RealSet::read(&q, &v, &meta).is_err(), "wrong dimension");
+        assert!(
+            RealSet::read(&q, &v, &meta, "fp").is_err(),
+            "wrong dimension"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Why `read` refused: `RealSet` has no `Debug`, as it holds the
+    /// private queries.
+    fn refused(read: Result<RealSet>) -> String {
+        match read {
+            Ok(_) => panic!("the set was read"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// A line that does not parse is named by its file and number only:
+    /// no path, no parser message, nothing the line holds.
+    #[test]
+    fn a_malformed_private_line_is_named_by_its_number_only() {
+        let root =
+            std::env::temp_dir().join(format!("store_bench_rel_secret_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let meta = vec![
+            ("backend".to_string(), "openai".to_string()),
+            ("model".to_string(), "m".to_string()),
+            ("dim".to_string(), "2".to_string()),
+        ];
+        let q = root.join("q.jsonl");
+        let v = root.join("v.jsonl");
+        std::fs::write(
+            &q,
+            "{\"query\":\"a\",\"relevant\":[\"x\"]}\n{\"query\": secret text\n",
+        )
+        .unwrap();
+        std::fs::write(&v, "{\"backend\":\"openai\"}\n").unwrap();
+        let error = refused(RealSet::read(&q, &v, &meta, "fp"));
+        assert_eq!(error, "the queries file, line 2: not a valid line");
+        std::fs::write(&q, "{\"query\":\"a\",\"relevant\":[\"x\"]}\n").unwrap();
+        let error = refused(RealSet::read(&q, &v, &meta, "fp"));
+        assert_eq!(error, "the vectors file, line 1: not a valid line");
+        let error = refused(RealSet::read(&root.join("missing"), &v, &meta, "fp"));
+        assert!(
+            !error.contains("secret") && !error.contains("missing"),
+            "{error}"
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

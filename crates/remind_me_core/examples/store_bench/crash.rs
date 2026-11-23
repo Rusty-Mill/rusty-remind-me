@@ -12,13 +12,21 @@
 //! unacked.
 //!
 //! The parent keeps the expected model: for each memory the hash of its
-//! tracked columns, its state and the hashes of its revisions, oldest
-//! first; for each page the blob its row links. After each kill it
-//! reopens the store through the candidate's normal open and checks:
-//! - every acked memory matches its model, revisions included, so none
-//!   survives on a hard-deleted or tombstoned memory;
-//! - the one in-flight write is all or nothing: the old row and its
-//!   revisions, or the new row with exactly one new revision;
+//! tracked columns, its state, whether its text is empty, and the hashes
+//! of its revisions, oldest first; for each page the blob its row links.
+//! What a write should leave comes from its `begin` line, not from what
+//! the store then holds: an add or an update names the hash of the exact
+//! row it intends, built from its input before it writes. After each kill
+//! the parent reopens the store through the candidate's normal open and
+//! checks:
+//! - every acked write left exactly what it intended: an add, its row and
+//!   no revisions; an update, its row and the old revisions plus the old
+//!   row; a delete, no live row and no revisions, and a tombstone's text
+//!   empty;
+//! - every acked memory still matches its model, revisions included, so
+//!   none survives on a hard-deleted or tombstoned memory;
+//! - the one in-flight write is all or nothing: the state it read before
+//!   (unchanged), or exactly what an acked write of it would leave;
 //! - no live memory of the writer's category is missing from the model;
 //! - a keyword search for each live acked nonce finds its memory;
 //! - every acked page's row links a blob that verifies; an in-flight page
@@ -29,7 +37,10 @@
 //! A final reopen and check follows the last round. The report gives each
 //! round's in-flight write, the child's peak memory before the kill and
 //! the parent's peak over the reopen and check (both G4), and every
-//! failure; the run passes with none.
+//! failure; the run passes with none. Per stream it counts where the kills
+//! fell (`kills`): between writes, inside a write before its commit (the
+//! write did not land), or after the commit and before its ack (it
+//! landed), so a reader can judge how many kills hit a write.
 //!
 //! The child wraps each write in `Store::transaction`: G6 judges the
 //! store's atomicity, not production's call sites (Q21). It also warms
@@ -64,6 +75,8 @@ use super::{
 pub const KILLS: usize = 100;
 /// The category the writer's memories take, so a check can list them.
 const CATEGORY: &str = "crash_bench";
+/// The project the writer's memories name, so none is detected.
+const PROJECT: &str = "crash_bench";
 /// How long the child may take to open the store and say `ready`.
 const READY: Duration = Duration::from_secs(300);
 /// How long the child's output may take to end once it is killed.
@@ -137,6 +150,8 @@ enum State {
 struct Snapshot {
     state: State,
     row: Option<String>,
+    /// Whether the row's text is empty, as a tombstone's must be.
+    blank: bool,
     revisions: Vec<String>,
 }
 
@@ -144,13 +159,17 @@ struct Snapshot {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 enum Op {
+    /// `row`: the hash of the row the add intends.
     Add {
         nonce: String,
+        row: String,
     },
+    /// `row`: the hash of the row the update intends.
     Update {
         id: String,
         nonce: String,
         before: Snapshot,
+        row: String,
     },
     Delete {
         id: String,
@@ -281,10 +300,42 @@ pub fn run(
             false
         }
     };
+    report.insert("kills".into(), where_kills_fell(&rounds));
     report.insert("rounds".into(), json!(rounds));
     report.insert("passed".into(), json!(passed));
     report.insert("peak_rss_mb".into(), json!(peak_rss_mb()));
     Ok(report)
+}
+
+/// Per stream, where its kills fell: between writes, inside a write
+/// before its commit (it did not land), or after the commit and before
+/// its ack (it landed).
+fn where_kills_fell(rounds: &[Value]) -> Value {
+    let mut by_stream = Map::new();
+    for stream in [Stream::Writes, Stream::Pages] {
+        let mine: Vec<&Value> = rounds
+            .iter()
+            .filter(|r| r["stream"] == stream.name())
+            .collect();
+        let count = |landed: Option<bool>| {
+            mine.iter()
+                .filter(|r| match landed {
+                    None => r["in_flight"].is_null(),
+                    Some(l) => r["check"]["in_flight_landed"] == l,
+                })
+                .count()
+        };
+        by_stream.insert(
+            stream.name().into(),
+            json!({
+                "total": mine.len(),
+                "between_writes": count(None),
+                "inside_a_write_not_landed": count(Some(false)),
+                "inside_a_write_landed": count(Some(true)),
+            }),
+        );
+    }
+    Value::Object(by_stream)
 }
 
 /// One kill: start a child on `stream`, kill it a seeded delay after it
@@ -506,7 +557,9 @@ impl Model {
         begun.map(|(_, op)| op)
     }
 
-    /// Take an acked write into the model, checking what it left.
+    /// Take an acked write into the model, checking what it left against
+    /// what it intended. The model takes what the write left, so a wrong
+    /// write is reported once, not again each round.
     fn acked(&mut self, op: Op, landed: Option<Landed>, failures: &mut Vec<String>) {
         let kind = op.kind();
         let problem = match (op, landed) {
@@ -514,17 +567,26 @@ impl Model {
                 self.pages.insert(slug, key);
                 None
             }
-            (Op::Add { nonce }, Some(Landed { id, after })) => {
-                let problem = added(&after).map(|why| format!("{id}: acked add {why}"));
+            (Op::Add { nonce, row }, Some(Landed { id, after })) => {
+                let problem =
+                    unlike(&added(&row), &after).map(|why| format!("{id}: acked add {why}"));
                 if self.memories.contains_key(&id) {
                     failures.push(format!("{id}: an add reused an id"));
                 }
                 self.adopt(id, after, nonce);
                 problem
             }
-            (Op::Update { id, nonce, before }, Some(landed)) if landed.id == id => {
-                let problem =
-                    updated(&before, &landed.after).map(|why| format!("{id}: acked update {why}"));
+            (
+                Op::Update {
+                    id,
+                    nonce,
+                    before,
+                    row,
+                },
+                Some(landed),
+            ) if landed.id == id => {
+                let problem = unlike(&updated(&before, &row), &landed.after)
+                    .map(|why| format!("{id}: acked update {why}"));
                 self.adopt(id, landed.after, nonce);
                 problem
             }
@@ -561,7 +623,7 @@ impl Model {
         failures: &mut Vec<String>,
     ) -> Result<bool> {
         match op {
-            Op::Add { nonce } => {
+            Op::Add { nonce, row } => {
                 let phantoms = self.phantoms(store)?;
                 let [id] = phantoms.as_slice() else {
                     if !phantoms.is_empty() {
@@ -570,23 +632,29 @@ impl Model {
                     return Ok(false);
                 };
                 let snapshot = snapshot(store, id)?;
-                if !holds(store, id, &nonce)? || added(&snapshot).is_some() {
-                    failures.push(format!("{id}: the in-flight add is partial"));
+                if let Some(why) = unlike(&added(&row), &snapshot) {
+                    failures.push(format!("{id}: the in-flight add is partial: {why}"));
                 }
                 self.adopt(id.clone(), snapshot, nonce);
                 Ok(true)
             }
-            Op::Update { id, nonce, before } => {
+            Op::Update {
+                id,
+                nonce,
+                before,
+                row,
+            } => {
                 let now = snapshot(store, &id)?;
                 if now == before {
                     return Ok(false);
                 }
-                let landed = holds(store, &id, &nonce)?;
-                if !landed || updated(&before, &now).is_some() {
-                    failures.push(format!("{id}: the in-flight update is partial"));
+                let intended = updated(&before, &row);
+                let whole = now == intended;
+                if let Some(why) = unlike(&intended, &now) {
+                    failures.push(format!("{id}: the in-flight update is partial: {why}"));
                 }
                 self.set(&id, now);
-                if landed {
+                if whole {
                     self.memories.entry(id).and_modify(|e| e.nonce = nonce);
                 }
                 Ok(true)
@@ -596,8 +664,8 @@ impl Model {
                 if now == before {
                     return Ok(false);
                 }
-                if deleted(&now).is_some() {
-                    failures.push(format!("{id}: the in-flight delete is partial"));
+                if let Some(why) = deleted(&now) {
+                    failures.push(format!("{id}: the in-flight delete is partial: {why}"));
                 }
                 self.set(&id, now);
                 Ok(true)
@@ -664,35 +732,41 @@ impl Model {
     }
 }
 
-/// Why `after` is not what an add leaves: a live row with no revisions.
-fn added(after: &Snapshot) -> Option<String> {
-    if after.state != State::Live {
-        return Some(format!("left the memory {:?}", after.state));
+/// What an add of `row` leaves: that row, live, with no revisions.
+fn added(row: &str) -> Snapshot {
+    Snapshot {
+        state: State::Live,
+        row: Some(row.to_string()),
+        blank: false,
+        revisions: Vec::new(),
     }
-    (!after.revisions.is_empty()).then(|| format!("wrote {} revisions", after.revisions.len()))
 }
 
-/// Why `after` is not what an update of `before` leaves: a live row whose
-/// revisions are `before`'s plus one holding `before`'s row.
-fn updated(before: &Snapshot, after: &Snapshot) -> Option<String> {
-    if after.state != State::Live {
-        return Some(format!("left the memory {:?}", after.state));
+/// What an update of `before` to `row` leaves: that row, live, with
+/// `before`'s revisions plus one holding `before`'s row.
+fn updated(before: &Snapshot, row: &str) -> Snapshot {
+    let mut revisions = before.revisions.clone();
+    revisions.extend(before.row.clone());
+    Snapshot {
+        revisions,
+        ..added(row)
     }
-    let mut expected = before.revisions.clone();
-    expected.extend(before.row.clone());
-    (after.revisions != expected).then(|| {
-        format!(
-            "left {} revisions where {} hold the history",
-            after.revisions.len(),
-            expected.len()
-        )
-    })
 }
 
-/// Why `after` is not what a delete leaves: no live row, no revisions.
+/// How `found` differs from what the write intended, if it does.
+fn unlike(intended: &Snapshot, found: &Snapshot) -> Option<String> {
+    (found != intended).then(|| differ(intended, found))
+}
+
+/// Why `after` is not what a delete leaves: no live row, no revisions,
+/// and a tombstone's text empty. Whether the row stays as a tombstone or
+/// goes is the store's to choose (it syncs or it does not).
 fn deleted(after: &Snapshot) -> Option<String> {
     if after.state == State::Live {
         return Some("left the memory live".into());
+    }
+    if after.state == State::Tombstone && !after.blank {
+        return Some("left a tombstone holding text".into());
     }
     (!after.revisions.is_empty()).then(|| format!("left {} revisions", after.revisions.len()))
 }
@@ -705,7 +779,7 @@ fn differ(expected: &Snapshot, found: &Snapshot) -> String {
         expected.revisions.len(),
         found.state,
         found.revisions.len(),
-        if expected.row == found.row {
+        if expected.row == found.row && expected.blank == found.blank {
             ""
         } else {
             ", and its row differs"
@@ -740,6 +814,7 @@ fn snapshot(store: &Store<'_>, id: &str) -> Result<Snapshot> {
         return Ok(Snapshot {
             state: State::Absent,
             row: None,
+            blank: false,
             revisions,
         });
     };
@@ -750,6 +825,7 @@ fn snapshot(store: &Store<'_>, id: &str) -> Result<Snapshot> {
     };
     Ok(Snapshot {
         state,
+        blank: current.content.is_empty(),
         row: Some(hash(&current)),
         revisions,
     })
@@ -758,13 +834,6 @@ fn snapshot(store: &Store<'_>, id: &str) -> Result<Snapshot> {
 /// The hash of tracked columns, stable within a run.
 fn hash(tracked: &Tracked) -> String {
     content_key(format!("{tracked:?}").as_bytes())
-}
-
-/// Whether `id`'s stored content carries `nonce`.
-fn holds(store: &Store<'_>, id: &str, nonce: &str) -> Result<bool> {
-    Ok(Revisions::new(store)
-        .current(id)?
-        .is_some_and(|t| t.content.contains(nonce)))
 }
 
 /// Whether a keyword search for `nonce` returns `id`.
@@ -836,9 +905,9 @@ fn child(candidate: Candidate, dir: &Path, stream: Stream, seed: u64) -> Result<
         }
         let landed = match stream {
             Stream::Writes => {
-                let op = next_write(&store, &live, seed, n, &mut rng)?;
+                let (op, content) = next_write(&store, &live, seed, n, &corpus, &mut rng)?;
                 emit(&mut out, &Line::Begin { n, op: op.clone() })?;
-                let landed = write(&store, &op, &corpus, &mut rng)?;
+                let landed = write(&store, &op, content)?;
                 match &op {
                     Op::Add { .. } => live.push(landed.id.clone()),
                     Op::Delete { id, .. } => live.retain(|l| l != id),
@@ -869,45 +938,82 @@ fn child(candidate: Candidate, dir: &Path, stream: Stream, seed: u64) -> Result<
 }
 
 /// The writer's next write: an add while few memories are live, else an
-/// add, update or delete (4:4:2) of a live one.
+/// add, update or delete (4:4:2) of a live one. With it, the content an
+/// add or update writes; its `begin` line names the hash of the exact row
+/// it intends, built from that content and, for an update, the row it
+/// replaces.
 fn next_write(
     store: &Store<'_>,
     live: &[String],
     seed: u64,
     n: usize,
+    corpus: &Corpus,
     rng: &mut Rng,
-) -> Result<Op> {
+) -> Result<(Op, Option<String>)> {
     let nonce = format!("crashnonce{seed:016x}{n:08x}");
     let roll = rng.below(10);
     if live.len() < MIN_LIVE || roll < 4 {
-        return Ok(Op::Add { nonce });
+        let content = format!("{nonce} {}", corpus.content(rng));
+        let row = hash(&add_row(&content));
+        return Ok((Op::Add { nonce, row }, Some(content)));
     }
     let id = live[rng.below(live.len())].clone();
     let before = snapshot(store, &id)?;
-    Ok(if roll < 8 {
-        Op::Update { id, nonce, before }
-    } else {
-        Op::Delete { id, before }
-    })
+    if roll >= 8 {
+        return Ok((Op::Delete { id, before }, None));
+    }
+    let content = format!("{nonce} {}", corpus.content(rng));
+    let current = Revisions::new(store)
+        .current(&id)?
+        .ok_or_else(|| format!("{id} is live but has no row"))?;
+    let row = hash(&Tracked {
+        content: content.clone(),
+        ..current
+    });
+    let op = Op::Update {
+        id,
+        nonce,
+        before,
+        row,
+    };
+    Ok((op, Some(content)))
 }
 
-/// Make `op`, a memory write, in one transaction; the memory as it then
-/// reads.
-fn write(store: &Store<'_>, op: &Op, corpus: &Corpus, rng: &mut Rng) -> Result<Landed> {
+/// The row an add of `content` intends: its input sets every tracked
+/// column, so none is defaulted or detected.
+fn add_row(content: &str) -> Tracked {
+    Tracked {
+        content: content.to_string(),
+        category: CATEGORY.into(),
+        tags: "[]".into(),
+        metadata: "{}".into(),
+        sensitive: Some(false),
+        project: Some(Some(PROJECT.into())),
+    }
+}
+
+/// Make `op`, a memory write, in one transaction, writing `content` for
+/// an add or update; the memory as it then reads.
+fn write(store: &Store<'_>, op: &Op, content: Option<String>) -> Result<Landed> {
+    let text = || content.clone().ok_or("an add or update needs its content");
     let id = match op {
-        Op::Add { nonce } => {
+        Op::Add { .. } => {
             let input = MemoryAddInput {
-                content: format!("{nonce} {}", corpus.content(rng)),
+                content: text()?,
                 category: CATEGORY.into(),
+                tags: Vec::new(),
+                metadata: json!({}),
+                sensitive: false,
+                project: Some(PROJECT.into()),
                 extract: false,
                 ..MemoryAddInput::default()
             };
             store.transaction(|s| queries::add_memory(s, input))?.id
         }
-        Op::Update { id, nonce, .. } => {
+        Op::Update { id, .. } => {
             let input: MemoryUpdateInput = serde_json::from_value(json!({
                 "memory_id": id,
-                "content": format!("{nonce} {}", corpus.content(rng)),
+                "content": text()?,
             }))?;
             let outcome = store.transaction(|s| queries::update_memory(s, &input))?;
             if !matches!(outcome, UpdateOutcome::Updated(_)) {
@@ -998,8 +1104,8 @@ mod tests {
 
     /// An acked add, as the child reports it, from the in-memory store.
     fn add(store: &Store<'_>, model: &mut Model, n: usize) -> String {
-        let op = next_write(store, &[], 7, n, &mut Rng(3)).unwrap();
-        let landed = write(store, &op, &Corpus::new(), &mut Rng(5)).unwrap();
+        let (op, content) = next_write(store, &[], 7, n, &Corpus::new(), &mut Rng(3)).unwrap();
+        let landed = write(store, &op, content).unwrap();
         let id = landed.id.clone();
         let mut failures = Vec::new();
         model.acked(op, Some(landed), &mut failures);
@@ -1069,6 +1175,7 @@ mod tests {
             id: first.clone(),
             nonce: "crashnonceneverwritten".into(),
             before,
+            row: "the row it never wrote".into(),
         };
         assert!(model.settle(&store, &bodies, op, &mut failures).unwrap());
         assert_eq!(failures.len(), 1, "{failures:?}");
@@ -1101,29 +1208,82 @@ mod tests {
     #[test]
     fn an_update_must_add_exactly_the_old_row_as_a_revision() {
         let before = Snapshot {
-            state: State::Live,
-            row: Some("a".into()),
             revisions: vec!["x".into()],
+            ..added("a")
         };
         let mut after = Snapshot {
-            state: State::Live,
-            row: Some("b".into()),
             revisions: vec!["x".into(), "a".into()],
+            ..added("b")
         };
-        assert_eq!(updated(&before, &after), None);
+        assert_eq!(unlike(&updated(&before, "b"), &after), None);
+        assert!(
+            unlike(&updated(&before, "c"), &after).is_some(),
+            "another row"
+        );
         after.revisions.push("a".into());
-        assert!(updated(&before, &after).is_some());
+        assert!(
+            unlike(&updated(&before, "b"), &after).is_some(),
+            "a revision too many"
+        );
+    }
+
+    #[test]
+    fn a_delete_leaves_no_live_row_no_revisions_and_no_text() {
         let gone = Snapshot {
             state: State::Absent,
             row: None,
+            blank: false,
             revisions: vec![],
         };
         assert_eq!(deleted(&gone), None);
+        let tombstone = Snapshot {
+            state: State::Tombstone,
+            row: Some("t".into()),
+            blank: true,
+            revisions: vec![],
+        };
+        assert_eq!(deleted(&tombstone), None);
+        let holding_text = Snapshot {
+            blank: false,
+            ..tombstone
+        };
+        assert!(deleted(&holding_text).is_some());
         assert!(deleted(&Snapshot {
             revisions: vec!["x".into()],
             ..gone.clone()
         })
         .is_some());
-        assert!(added(&gone).is_some());
+        assert!(deleted(&added("a")).is_some());
+    }
+
+    /// An add's row is exactly the one its `begin` line names; a write
+    /// that lands another row, or an in-flight one left with another
+    /// row, fails though its nonce is there.
+    #[test]
+    fn an_add_must_land_exactly_its_intended_row() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        let (dir, bodies) = bodies("exact");
+        let mut model = Model::default();
+        let (op, content) = next_write(&store, &[], 7, 0, &Corpus::new(), &mut Rng(3)).unwrap();
+        let Op::Add { nonce, .. } = op.clone() else {
+            panic!("an empty store starts with an add");
+        };
+        let landed = write(&store, &op, content.clone()).unwrap();
+        let mut failures = Vec::new();
+        model.acked(op.clone(), Some(landed), &mut failures);
+        assert!(failures.is_empty(), "{failures:?}");
+
+        // The same nonce, another row.
+        let wrong = Op::Add {
+            nonce: nonce.clone(),
+            row: hash(&add_row(&format!("{nonce} other text"))),
+        };
+        let landed = write(&store, &wrong, content).unwrap();
+        model.acked(wrong, Some(landed), &mut failures);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].contains("acked add"), "{failures:?}");
+        let _ = std::fs::remove_dir_all(dir);
+        drop(bodies);
     }
 }
