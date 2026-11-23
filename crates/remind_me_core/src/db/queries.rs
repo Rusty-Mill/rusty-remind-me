@@ -52,54 +52,88 @@ pub(crate) enum Review {
 /// says.
 pub(crate) fn add_memory_reviewing(
     store: &Store<'_>,
-    mut input: MemoryAddInput,
+    input: MemoryAddInput,
     fields: &StructuredFields,
     review: Review,
 ) -> Result<Memory> {
-    // The evidence count is the system's (#354): a client cannot seed one.
-    input.metadata = crate::consolidation::keep_evidence(std::mem::take(&mut input.metadata), None);
-    fields.validate(&input.metadata, None)?;
-    crate::project::refuse_reserved_predicate(input.predicate.as_deref())?;
-    crate::topic::refuse_topic_entities(&input.entities)?;
-    let project = crate::context::explicit_project(input.project.as_deref())?;
-    let scheduled = match review {
-        Review::Schedule => {
-            crate::review::schedule_if_decision(fields.memory_type.as_deref(), &input.metadata)
+    let supersedes = input.supersedes.clone();
+    let add = PreparedAdd::new(input, fields, review)?;
+    // With `supersedes`, one transaction: the insert, its index and every
+    // retirement land together or not at all, and each target is checked
+    // inside it, so no other writer can change it between check and write.
+    // Without, the add stays the plain write it always was.
+    if supersedes.is_empty() {
+        add.write(store, &[])?;
+    } else {
+        store.transaction(|tx| add.write(tx, &supersedes))?;
+    }
+    add.finish(store)
+}
+
+/// An add, validated and scrubbed, split into its write and what follows
+/// it, so a caller can make the write one step of a larger transaction and
+/// run the rest once that commits.
+pub(crate) struct PreparedAdd {
+    id: String,
+    content: String,
+    row: NewMemory,
+    input: MemoryAddInput,
+    attachments: Vec<crate::attachments::ResolvedAttachment>,
+    now_iso: String,
+}
+
+impl PreparedAdd {
+    /// Validate and scrub `input`; nothing is written. Its `supersedes` is
+    /// ignored: [`PreparedAdd::write`] takes the targets.
+    pub(crate) fn new(
+        mut input: MemoryAddInput,
+        fields: &StructuredFields,
+        review: Review,
+    ) -> Result<Self> {
+        // The evidence count is the system's (#354): a client cannot seed one.
+        input.metadata =
+            crate::consolidation::keep_evidence(std::mem::take(&mut input.metadata), None);
+        fields.validate(&input.metadata, None)?;
+        crate::project::refuse_reserved_predicate(input.predicate.as_deref())?;
+        crate::topic::refuse_topic_entities(&input.entities)?;
+        let project = crate::context::explicit_project(input.project.as_deref())?;
+        let scheduled = match review {
+            Review::Schedule => {
+                crate::review::schedule_if_decision(fields.memory_type.as_deref(), &input.metadata)
+            }
+            Review::Unscheduled => None,
+        };
+        if let Some(scheduled) = scheduled {
+            input.metadata = scheduled;
         }
-        Review::Unscheduled => None,
-    };
-    if let Some(scheduled) = scheduled {
-        input.metadata = scheduled;
-    }
-    let now = Utc::now();
-    let now_iso = now.to_rfc3339();
-    let id = format!("mem_{}", uuid::Uuid::new_v4().simple());
+        let now = Utc::now();
+        let now_iso = now.to_rfc3339();
+        let id = format!("mem_{}", uuid::Uuid::new_v4().simple());
 
-    // #260: a no-op unless REMIND_ME_CODE_ROOTS is configured.
-    let code_refs = crate::code_refs::detect_code_refs(&input.content);
-    crate::code_refs::merge_code_refs(&mut input.metadata, &code_refs);
+        // #260: a no-op unless REMIND_ME_CODE_ROOTS is configured.
+        let code_refs = crate::code_refs::detect_code_refs(&input.content);
+        crate::code_refs::merge_code_refs(&mut input.metadata, &code_refs);
 
-    // Write boundary: scrub secrets first (so nothing downstream sees them),
-    // and resolve attachments before the insert so a bad path fails the add.
-    let content = crate::boundary::scrub(&input.content, &mut input.tags, &mut input.metadata);
-    let attachments = crate::attachments::resolve(&input.attachments)?;
-    crate::attachments::merge_metadata(&mut input.metadata, &attachments);
+        // Write boundary: scrub secrets first (so nothing downstream sees them),
+        // and resolve attachments before the insert so a bad path fails the add.
+        let content = crate::boundary::scrub(&input.content, &mut input.tags, &mut input.metadata);
+        let attachments = crate::attachments::resolve(&input.attachments)?;
+        crate::attachments::merge_metadata(&mut input.metadata, &attachments);
 
-    // A stated kind drives decay and weight; otherwise the category does, as
-    // it always has.
-    let kind = fields.memory_type.as_deref().unwrap_or(&input.category);
-    let decay_rate = get_decay_rate(kind);
-    let type_prior = get_type_prior(kind);
-    let source_prior = get_source_prior(&input.source);
-    let base_weight = type_prior * source_prior;
-    let initial_vitality = calculate_vitality(base_weight, 0, decay_rate, &now_iso, now);
+        // A stated kind drives decay and weight; otherwise the category does, as
+        // it always has.
+        let kind = fields.memory_type.as_deref().unwrap_or(&input.category);
+        let decay_rate = get_decay_rate(kind);
+        let type_prior = get_type_prior(kind);
+        let source_prior = get_source_prior(&input.source);
+        let base_weight = type_prior * source_prior;
+        let initial_vitality = calculate_vitality(base_weight, 0, decay_rate, &now_iso, now);
 
-    let mut provenance = crate::context::default_provenance();
-    if project.is_some() {
-        provenance.context.project = project;
-    }
-    let write = |tx: &Store<'_>| -> Result<()> {
-        Memories::new(tx).insert(&NewMemory {
+        let mut provenance = crate::context::default_provenance();
+        if project.is_some() {
+            provenance.context.project = project;
+        }
+        let row = NewMemory {
             category: input.category.clone(),
             tags: input.tags.clone(),
             source: input.source.clone(),
@@ -124,56 +158,68 @@ pub(crate) fn add_memory_reviewing(
             verified_at: fields.verified_at.clone(),
             outcome: fields.outcome.clone(),
             ..provenance.stamp(NewMemory::new(id.clone(), content.clone(), &now_iso))
-        })?;
+        };
+        Ok(Self {
+            id,
+            content,
+            row,
+            input,
+            attachments,
+            now_iso,
+        })
+    }
 
+    /// The new memory's id.
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Insert the memory and its index, and retire `supersedes`, each
+    /// checked to be a live memory. Joins the caller's transaction.
+    pub(crate) fn write(&self, tx: &Store<'_>, supersedes: &[String]) -> Result<()> {
+        Memories::new(tx).insert(&self.row)?;
         // `MemoryAddInput::entities` was previously parsed and then dropped, so a
         // caller supplying entity mentions got a silent no-op. Same path as
         // `annotate_memories` so both behave identically.
         crate::boundary::index(
             tx,
-            &id,
-            &content,
-            &input.entities,
-            input.extract,
-            &attachments,
-            &now_iso,
+            &self.id,
+            &self.content,
+            &self.input.entities,
+            self.input.extract,
+            &self.attachments,
+            &self.now_iso,
         )?;
-
         // Stamped, so the change reaches the sync outbox.
-        for old in &input.supersedes {
-            retire(tx, old, &id, &now_iso)?;
+        for old in supersedes {
+            retire(tx, old, &self.id, &self.now_iso)?;
         }
         Ok(())
-    };
-    // With `supersedes`, one transaction: the insert, its index and every
-    // retirement land together or not at all, and each target is checked
-    // inside it, so no other writer can change it between check and write.
-    // Without, the add stays the plain write it always was.
-    if input.supersedes.is_empty() {
-        write(store)?;
-    } else {
-        store.transaction(write)?;
     }
 
-    // Best-effort: no embedder configured, or one that fails mid-request,
-    // leaves this memory keyword-searchable only — never a reason to fail
-    // the write that already succeeded. `remind_me_reindex` is the backstop
-    // for anything that lands here without an embedder available.
-    if let Some(embedder) = crate::embedder::available_embedder() {
-        let _ = crate::vectors::embed_and_store(store, &*embedder, &id, &content);
+    /// What follows a committed write: embedding, topic, session, event.
+    /// Run outside any transaction.
+    pub(crate) fn finish(&self, store: &Store<'_>) -> Result<Memory> {
+        // Best-effort: no embedder configured, or one that fails mid-request,
+        // leaves this memory keyword-searchable only — never a reason to fail
+        // the write that already succeeded. `remind_me_reindex` is the backstop
+        // for anything that lands here without an embedder available.
+        if let Some(embedder) = crate::embedder::available_embedder() {
+            let _ = crate::vectors::embed_and_store(store, &*embedder, &self.id, &self.content);
+        }
+        // Best-effort like the embedding above: a write never fails for want of
+        // a topic. Reads the saved centroids only; a store without topics pays a
+        // file-existence check.
+        crate::topic_assign::assign_on_write(store, &self.id);
+
+        let memory = get_memory_by_id(store, &self.id)?.ok_or(StoreError::NotFound)?;
+        crate::episodes::ensure_session_for(store, &memory)?;
+
+        // Local mutation, so automation hears about it.
+        crate::events::emit(crate::events::Event::Created, &memory.id, &memory.category);
+
+        Ok(memory)
     }
-    // Best-effort like the embedding above: a write never fails for want of
-    // a topic. Reads the saved centroids only; a store without topics pays a
-    // file-existence check.
-    crate::topic_assign::assign_on_write(store, &id);
-
-    let memory = get_memory_by_id(store, &id)?.ok_or(StoreError::NotFound)?;
-    crate::episodes::ensure_session_for(store, &memory)?;
-
-    // Local mutation, so automation hears about it.
-    crate::events::emit(crate::events::Event::Created, &memory.id, &memory.category);
-
-    Ok(memory)
 }
 
 /// Mark live memory `old` superseded by `new`, refusing one that is missing,

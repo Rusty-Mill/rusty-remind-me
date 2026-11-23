@@ -17,10 +17,12 @@
 
 use crate::db::history::{Revisions, Tracked};
 use crate::db::memories::{Memories, MemoryEdit};
-use crate::db::{queries, Store, StoreError};
+use crate::db::queries::{self, PreparedAdd};
+use crate::db::{Store, StoreError};
 use crate::kinds::StructuredFields;
 use crate::models::Memory;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 
 // -- refs -----------------------------------------------------------------
 
@@ -1347,14 +1349,21 @@ pub struct ImportApplied {
 /// Plan `log` against the store, then add every `new` entry as a decision
 /// of `project` and carry out the supersedes links the file states. Nothing
 /// else is written: `changed`, `needs_rationale`, `conflicts` and
-/// `ambiguous` rows stay for a person, and a stored decision is never
-/// overwritten (D30). A second run finds every entry unchanged.
+/// `ambiguous` rows stay for a person (a row with any ambiguous link
+/// wording is not written, even with a plain link beside it), and a stored
+/// decision is never overwritten (D30). A second run finds every entry
+/// unchanged.
 ///
-/// Each entry is its own write ([`queries::add_memory_with`]). The older
-/// decisions it supersedes are retired in the same transaction; a link whose
-/// target is not exactly one live decision of the project is listed under
-/// `unlinked`, never guessed. Links point back, so file order adds a target
-/// before the entry that supersedes it.
+/// Rows go in supersession order: an entry that supersedes another entry of
+/// the same file is written after it, wherever the two sit. Links that form
+/// a cycle refuse the whole import before anything is written.
+///
+/// Each entry is its own transaction: the recheck that its ref is still
+/// absent, the choice of its link targets, its insert and the retiring of
+/// those targets. A failed row leaves nothing behind. A link whose target
+/// is another entry of the file that this run did not write holds the row
+/// back (`skipped`); a link whose target is not exactly one live decision of
+/// the project whose refs agree is listed under `unlinked`, never guessed.
 ///
 /// # Errors
 ///
@@ -1366,52 +1375,172 @@ pub fn apply_import(
     source: &str,
 ) -> crate::db::Result<ImportApplied> {
     let plan = plan_import(log, project, source, &live_decisions(store)?);
+    Ok(apply_plan(store, log, plan, &|tx, add, targets| {
+        add.write(tx, targets)
+    }))
+}
+
+/// Writes a prepared row and retires its targets, inside the row's
+/// transaction: [`PreparedAdd::write`], or a stand-in in tests.
+type WriteRow<'f> = dyn Fn(&Store<'_>, &PreparedAdd, &[String]) -> crate::db::Result<()> + 'f;
+
+/// What every row of one import shares.
+struct ImportBatch<'a> {
+    project: &'a str,
+    source: &'a str,
+    /// Every ref the file defines: a link to one of these waits for it.
+    in_file: HashSet<&'a str>,
+}
+
+/// Write `plan`'s `new` rows, each in its own transaction (see
+/// [`apply_import`]).
+fn apply_plan(
+    store: &Store<'_>,
+    log: &ParsedLog,
+    plan: ImportPlan,
+    write: &WriteRow<'_>,
+) -> ImportApplied {
     let mut applied = ImportApplied::default();
-    for row in &plan.new {
-        let stored = live_decisions(store)?;
-        if project_refs(&stored, project, Retired::Include).contains_key(&row.decision_ref) {
-            applied.skipped.push(ImportRow {
-                note: "already in the store".into(),
-                ..row.clone()
-            });
-            continue;
-        }
-        let links: Vec<&SupersedesRow> = plan
+    let batch = ImportBatch {
+        project: &plan.project,
+        source: &plan.source,
+        in_file: log
+            .entries
+            .iter()
+            .map(|e| e.decision_ref.as_str())
+            .collect(),
+    };
+    let ambiguous: HashSet<&str> = plan
+        .ambiguous
+        .iter()
+        .map(|r| r.decision_ref.as_str())
+        .collect();
+    let rows: Vec<&ImportRow> = plan
+        .new
+        .iter()
+        .filter(|r| !ambiguous.contains(r.decision_ref.as_str()))
+        .collect();
+    let Some(order) = supersession_order(&rows, &plan.supersedes) else {
+        applied.skipped = rows
+            .iter()
+            .map(|r| ImportRow {
+                note: "supersedes links form a cycle: nothing written".into(),
+                ..(*r).clone()
+            })
+            .collect();
+        applied.plan = plan;
+        return applied;
+    };
+    for row in order {
+        let links: Vec<SupersedesRow> = plan
             .supersedes
             .iter()
             .filter(|l| l.decision_ref == row.decision_ref)
+            .cloned()
             .collect();
-        let live = project_refs(&stored, project, Retired::Exclude);
-        let (targets, missing) = link_targets(&links, &live);
-        let confirms = plan
+        let confirms: Vec<String> = plan
             .confirms
             .iter()
             .filter(|l| l.decision_ref == row.decision_ref)
             .map(|l| l.supersedes.clone())
             .collect();
-        match add_imported(store, project, source, row, confirms, targets) {
-            Ok(id) => {
+        let written = store.atomically(|s| write_row(s, &batch, row, &links, confirms, write));
+        let noted = |note: String| ImportRow {
+            note,
+            ..row.clone()
+        };
+        match written {
+            Ok(RowWrite::Added { add, unlinked }) => {
+                // Committed: what follows the write cannot undo it, so a
+                // failure there is reported on the row, not as a failed row.
+                let note = match add.finish(store) {
+                    Ok(_) => row.note.clone(),
+                    Err(e) => format!("added; embedding or indexing after the write failed: {e}"),
+                };
+                applied
+                    .linked
+                    .extend(links.into_iter().filter(|l| !unlinked.contains(l)));
+                applied.unlinked.extend(unlinked);
                 applied.added.push(ImportRow {
-                    memory_id: Some(id),
+                    memory_id: Some(add.id().to_string()),
+                    note,
                     ..row.clone()
                 });
-                applied.linked.extend(
-                    links
-                        .iter()
-                        .filter(|l| !missing.contains(l))
-                        .cloned()
-                        .cloned(),
-                );
-                applied.unlinked.extend(missing.into_iter().cloned());
             }
-            Err(e) => applied.failed.push(ImportRow {
-                note: e.to_string(),
-                ..row.clone()
-            }),
+            Ok(RowWrite::Skipped(note)) => applied.skipped.push(noted(note)),
+            Err(e) => applied.failed.push(noted(e.to_string())),
         }
     }
     applied.plan = plan;
-    Ok(applied)
+    applied
+}
+
+/// `rows` in file order, except that a row comes after every row of the
+/// batch it supersedes. `None` when the links form a cycle.
+fn supersession_order<'a>(
+    rows: &[&'a ImportRow],
+    links: &[SupersedesRow],
+) -> Option<Vec<&'a ImportRow>> {
+    let batch: HashSet<&str> = rows.iter().map(|r| r.decision_ref.as_str()).collect();
+    let ready = |row: &ImportRow, placed: &HashSet<&str>| {
+        links
+            .iter()
+            .filter(|l| l.decision_ref == row.decision_ref)
+            .filter(|l| batch.contains(l.supersedes.as_str()))
+            .all(|l| placed.contains(l.supersedes.as_str()))
+    };
+    let mut waiting = rows.to_vec();
+    let mut placed: HashSet<&str> = HashSet::new();
+    let mut order = Vec::with_capacity(rows.len());
+    while !waiting.is_empty() {
+        let at = waiting.iter().position(|r| ready(r, &placed))?;
+        let row = waiting.remove(at);
+        placed.insert(row.decision_ref.as_str());
+        order.push(row);
+    }
+    Some(order)
+}
+
+/// What one row's transaction did.
+enum RowWrite {
+    Added {
+        add: Box<PreparedAdd>,
+        unlinked: Vec<SupersedesRow>,
+    },
+    Skipped(String),
+}
+
+/// One row, inside its transaction: recheck, pick targets, add, retire.
+fn write_row(
+    store: &Store<'_>,
+    batch: &ImportBatch<'_>,
+    row: &ImportRow,
+    links: &[SupersedesRow],
+    confirms: Vec<String>,
+    write: &WriteRow<'_>,
+) -> crate::db::Result<RowWrite> {
+    let stored = live_decisions(store)?;
+    let held = project_refs(&stored, batch.project, Retired::Include);
+    if held.contains_key(&row.decision_ref) {
+        return Ok(RowWrite::Skipped("already in the store".into()));
+    }
+    let pending = links.iter().find(|l| {
+        batch.in_file.contains(l.supersedes.as_str()) && !held.contains_key(&l.supersedes)
+    });
+    if let Some(link) = pending {
+        return Ok(RowWrite::Skipped(format!(
+            "supersedes {}, an entry of this file not in the store",
+            link.supersedes
+        )));
+    }
+    let live = project_refs(&stored, batch.project, Retired::Exclude);
+    let (targets, unlinked) = link_targets(links, &live);
+    let add = prepare_imported(batch, row, confirms)?;
+    write(store, &add, &targets)?;
+    Ok(RowWrite::Added {
+        add: Box::new(add),
+        unlinked,
+    })
 }
 
 fn live_decisions(store: &Store<'_>) -> crate::db::Result<Vec<Memory>> {
@@ -1425,13 +1554,13 @@ enum Retired {
     Exclude,
 }
 
-/// Each ref `project`'s decisions carry, with the ids carrying it.
-fn project_refs(
-    memories: &[Memory],
+/// Each ref `project`'s decisions carry, with the memories carrying it.
+fn project_refs<'m>(
+    memories: &'m [Memory],
     project: &str,
     retired: Retired,
-) -> std::collections::HashMap<String, Vec<String>> {
-    let mut refs: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+) -> HashMap<String, Vec<&'m Memory>> {
+    let mut refs: HashMap<String, Vec<&Memory>> = HashMap::new();
     let ours = memories
         .iter()
         .filter(|m| m.deleted_at.is_none())
@@ -1444,45 +1573,55 @@ fn project_refs(
         });
     for memory in ours {
         if let Some((r, _)) = carried_ref(memory) {
-            refs.entry(r).or_default().push(memory.id.clone());
+            refs.entry(r).or_default().push(memory);
         }
     }
     refs
 }
 
-/// The memory ids `links` retire, and the links whose target is not exactly
-/// one live decision.
-fn link_targets<'a>(
-    links: &[&'a SupersedesRow],
-    held: &std::collections::HashMap<String, Vec<String>>,
-) -> (Vec<String>, Vec<&'a SupersedesRow>) {
-    let mut targets = Vec::new();
-    let mut missing = Vec::new();
-    for link in links {
-        match held.get(&link.supersedes).map(Vec::as_slice) {
-            Some([id]) => targets.push(id.clone()),
-            _ => missing.push(*link),
+/// Whether a memory's refs agree, project qualifiers included, as
+/// normalize requires before trusting one ([`ref_disagreement`]).
+fn identity_agrees(memory: &Memory) -> bool {
+    let defined = defined_ref(&memory.content);
+    if let Some((Some(named), _)) = &defined {
+        let field = memory.project.as_deref().unwrap_or("");
+        if field.is_empty() || !same_project(named, field) {
+            return false;
         }
     }
-    (targets, missing)
+    ref_disagreement(memory, defined.as_ref().map(|(_, r)| r.as_str())).is_none()
 }
 
-/// Add `row` as a decision of `project`, retiring `supersedes`. Its text is
+/// The memory ids `links` retire, and the links whose target is not exactly
+/// one live decision whose refs agree.
+fn link_targets(
+    links: &[SupersedesRow],
+    live: &HashMap<String, Vec<&Memory>>,
+) -> (Vec<String>, Vec<SupersedesRow>) {
+    let mut targets = Vec::new();
+    let mut unlinked = Vec::new();
+    for link in links {
+        match live.get(&link.supersedes).map(Vec::as_slice) {
+            Some([one]) if identity_agrees(one) => targets.push(one.id.clone()),
+            _ => unlinked.push(link.clone()),
+        }
+    }
+    (targets, unlinked)
+}
+
+/// `row` as a decision of the batch's project, ready to write. Its text is
 /// the entry's statement, so a re-plan reads it as unchanged; the ref, why,
 /// date, tag and where it came from go in `metadata`. No review date is
 /// set: these were decided before they were written down (pack D69).
-fn add_imported(
-    store: &Store<'_>,
-    project: &str,
-    source: &str,
+fn prepare_imported(
+    batch: &ImportBatch<'_>,
     row: &ImportRow,
     confirms: Vec<String>,
-    supersedes: Vec<String>,
-) -> crate::db::Result<String> {
+) -> crate::db::Result<PreparedAdd> {
     let mut metadata = serde_json::json!({
         "decision_ref": row.decision_ref,
         "rationale": row.rationale,
-        "imported": { "source": source, "line": row.line },
+        "imported": { "source": batch.source, "line": row.line },
     });
     for (key, value) in [("date", &row.date), ("tag", &row.tag)] {
         if let Some(value) = value {
@@ -1497,15 +1636,14 @@ fn add_imported(
         category: "decision".into(),
         source: IMPORT_SOURCE.into(),
         metadata,
-        supersedes,
-        project: Some(project.to_string()),
+        project: Some(batch.project.to_string()),
         ..Default::default()
     };
     let fields = StructuredFields {
         memory_type: Some("decision".into()),
         ..Default::default()
     };
-    Ok(queries::add_memory_reviewing(store, input, &fields, queries::Review::Unscheduled)?.id)
+    PreparedAdd::new(input, &fields, queries::Review::Unscheduled)
 }
 
 /// `source` an imported decision is stored with.
@@ -1833,6 +1971,67 @@ mod apply_tests {
                 .expect("history")
                 .len(),
             1
+        );
+    }
+
+    const LOG: &str = "| # | Decision | Why |\n|---|---|---|\n| D1 | Old | x |\n| D2 | Supersedes D1. New | y |\n";
+
+    fn ids_of(rows: &[ImportRow]) -> Vec<&str> {
+        rows.iter().map(|r| r.decision_ref.as_str()).collect()
+    }
+
+    /// A row whose write fails after its insert and retirement are in the
+    /// page leaves neither behind: its target stays live and no memory of
+    /// it is stored.
+    #[test]
+    fn a_failed_row_write_rolls_back_its_insert_and_retirement() {
+        let db = Database::open_in_memory().expect("database");
+        let store = db.store();
+        let log = parse_log(LOG);
+        let plan = plan_import(&log, "mill", "d.md", &[]);
+        let write = |tx: &Store<'_>, add: &PreparedAdd, targets: &[String]| {
+            add.write(tx, targets)?;
+            if targets.is_empty() {
+                return Ok(());
+            }
+            Err(StoreError::Engine("write failed after the retire".into()))
+        };
+        let applied = apply_plan(&store, &log, plan, &write);
+
+        assert_eq!(ids_of(&applied.added), ["D1"]);
+        assert_eq!(ids_of(&applied.failed), ["D2"]);
+        assert!(applied.linked.is_empty());
+        let live = Memories::new(&store).all_live().expect("read");
+        assert_eq!(live.len(), 1, "D2 left nothing behind");
+        assert!(live[0].superseded_by.is_none(), "D1 is not retired");
+    }
+
+    /// A write that lands between planning and a row's turn is seen by
+    /// the row's own transaction: the ref is not added twice.
+    #[test]
+    fn a_ref_written_after_planning_is_not_added_again() {
+        let db = Database::open_in_memory().expect("database");
+        let store = db.store();
+        let log = parse_log(LOG);
+        let plan = plan_import(&log, "mill", "d.md", &[]);
+        assert_eq!(ids_of(&plan.new), ["D1", "D2"]);
+        Memories::new(&store)
+            .insert(&decision("m-elsewhere", "D1"))
+            .expect("insert");
+
+        let applied = apply_plan(&store, &log, plan, &|tx, add, targets| {
+            add.write(tx, targets)
+        });
+
+        assert_eq!(ids_of(&applied.skipped), ["D1"]);
+        assert_eq!(ids_of(&applied.added), ["D2"]);
+        let held = Memories::new(&store)
+            .get_live("m-elsewhere")
+            .expect("read")
+            .expect("live");
+        assert!(
+            held.superseded_by.is_some(),
+            "D2 retires the D1 that is there"
         );
     }
 }

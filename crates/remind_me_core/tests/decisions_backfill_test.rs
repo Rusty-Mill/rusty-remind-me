@@ -1131,3 +1131,133 @@ fn apply_never_overwrites_a_stored_decision_and_leaves_an_unknown_target_unlinke
     assert_eq!(applied.added.len(), 1, "D9 still imports");
     assert_eq!(applied.unlinked.len(), 1, "D8 is not stored: not guessed");
 }
+
+/// Each added row's ref, in the order the run wrote them.
+fn added_refs(applied: &remind_me_core::decisions_backfill::ImportApplied) -> Vec<&str> {
+    applied
+        .added
+        .iter()
+        .map(|r| r.decision_ref.as_str())
+        .collect()
+}
+
+/// The stored decision `applied` added for `reference`.
+fn added_memory(
+    store: &remind_me_core::db::Store<'_>,
+    applied: &remind_me_core::decisions_backfill::ImportApplied,
+    reference: &str,
+) -> Memory {
+    let id = applied
+        .added
+        .iter()
+        .find(|r| r.decision_ref == reference)
+        .and_then(|r| r.memory_id.clone())
+        .expect("added");
+    Memories::new(store)
+        .get_live(&id)
+        .expect("read")
+        .expect("stored")
+}
+
+#[test]
+fn apply_writes_a_target_before_the_entry_that_supersedes_it_in_any_file_order() {
+    let reversed = "\
+| # | Decision | Why |
+|---|---|---|
+| D2 | Supersedes D1. Use SQLite | Benchmark |
+| D1 | Use the engine store | Measured |
+";
+    let mixed = "\
+| # | Decision | Why |
+|---|---|---|
+| D2 | Supersedes D3. Use SQLite | Benchmark |
+
+## D3. Use the engine store
+
+**Decision.** Keep it.
+**Why.** Measured.
+";
+    for (text, target) in [(reversed, "D1"), (mixed, "D3")] {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        let applied = apply_import(&store, &parse_log(text), "rusty-remind-me", "d.md").unwrap();
+        assert_eq!(added_refs(&applied), [target, "D2"], "{target}");
+        assert_eq!(applied.linked.len(), 1, "{target}");
+        assert!(applied.unlinked.is_empty() && applied.skipped.is_empty());
+        let older = added_memory(&store, &applied, target);
+        let newer = added_memory(&store, &applied, "D2");
+        assert_eq!(older.superseded_by.as_deref(), Some(newer.id.as_str()));
+        assert!(newer.superseded_by.is_none());
+    }
+}
+
+#[test]
+fn apply_refuses_a_supersedes_cycle_before_writing_anything() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let log = parse_log(
+        "| # | Decision | Why |\n|---|---|---|\n| D1 | Supersedes D2. A | x |\n| D2 | Supersedes D1. B | y |\n",
+    );
+    let applied = apply_import(&store, &log, "rusty-remind-me", "d.md").unwrap();
+    assert!(applied.added.is_empty());
+    assert_eq!(applied.skipped.len(), 2);
+    assert!(applied.skipped[0].note.contains("cycle"));
+    assert!(Memories::new(&store).all_live().unwrap().is_empty());
+}
+
+#[test]
+fn apply_holds_back_an_entry_whose_target_in_the_file_was_not_written() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    // D1 has no rationale, so it is left for a person; D2 must not go in
+    // without its link and leave both live once D1 is imported later.
+    let log = parse_log(
+        "| # | Decision | Why |\n|---|---|---|\n| D1 | Old |  |\n| D2 | Supersedes D1. New | Why |\n",
+    );
+    let applied = apply_import(&store, &log, "rusty-remind-me", "d.md").unwrap();
+    assert!(applied.added.is_empty());
+    assert_eq!(applied.skipped.len(), 1);
+    assert_eq!(applied.skipped[0].decision_ref, "D2");
+    assert!(applied.skipped[0].note.contains("D1"));
+}
+
+#[test]
+fn apply_leaves_a_target_whose_refs_disagree_unlinked_and_live() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let mut odd = NewMemory::new("mem_odd", "An older call", "2026-11-01T00:00:00Z");
+    odd.memory_type = "decision".into();
+    odd.project = Some("rusty-remind-me".into());
+    odd.metadata = json!({ "decision_ref": "D1", "decision_id": "D2", "rationale": "x" });
+    Memories::new(&store).insert(&odd).unwrap();
+    let log =
+        parse_log("| # | Decision | Why |\n|---|---|---|\n| D5 | Supersedes D1. New | Why |\n");
+
+    let applied = apply_import(&store, &log, "rusty-remind-me", "d.md").unwrap();
+    assert_eq!(added_refs(&applied), ["D5"]);
+    assert_eq!(applied.unlinked.len(), 1);
+    assert!(applied.linked.is_empty());
+    let kept = Memories::new(&store).get_live("mem_odd").unwrap().unwrap();
+    assert!(
+        kept.superseded_by.is_none(),
+        "an untrusted identity is never retired"
+    );
+}
+
+#[test]
+fn apply_writes_nothing_for_a_row_with_a_plain_and_an_ambiguous_link() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let first = parse_log("| # | Decision | Why |\n|---|---|---|\n| D1 | Old | x |\n");
+    apply_import(&store, &first, "rusty-remind-me", "d.md").unwrap();
+    let log = parse_log(
+        "| # | Decision | Why |\n|---|---|---|\n| D1 | Old | x |\n| D5 | Supersedes D1; not supersedes D2. New | Why |\n",
+    );
+
+    let applied = apply_import(&store, &log, "rusty-remind-me", "d.md").unwrap();
+    assert_eq!(applied.plan.ambiguous.len(), 1);
+    assert!(applied.added.is_empty() && applied.linked.is_empty());
+    let live = Memories::new(&store).all_live().unwrap();
+    assert_eq!(live.len(), 1);
+    assert!(live[0].superseded_by.is_none(), "D1 is not retired");
+}
