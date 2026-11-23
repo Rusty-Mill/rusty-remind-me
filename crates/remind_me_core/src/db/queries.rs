@@ -32,8 +32,29 @@ pub fn add_memory(store: &Store<'_>, input: MemoryAddInput) -> Result<Memory> {
 /// malformed kind is refused with an error naming the field, nothing stored.
 pub fn add_memory_with(
     store: &Store<'_>,
+    input: MemoryAddInput,
+    fields: &StructuredFields,
+) -> Result<Memory> {
+    add_memory_reviewing(store, input, fields, Review::Schedule)
+}
+
+/// Whether a new decision gets a review date.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Review {
+    /// The configured interval from now (ADR-0031 §1).
+    Schedule,
+    /// None: a decision made before it was written down, such as one
+    /// imported from a repo log (pack D69).
+    Unscheduled,
+}
+
+/// [`add_memory_with`], scheduling a decision's review only as `review`
+/// says.
+pub(crate) fn add_memory_reviewing(
+    store: &Store<'_>,
     mut input: MemoryAddInput,
     fields: &StructuredFields,
+    review: Review,
 ) -> Result<Memory> {
     // The evidence count is the system's (#354): a client cannot seed one.
     input.metadata = crate::consolidation::keep_evidence(std::mem::take(&mut input.metadata), None);
@@ -41,9 +62,13 @@ pub fn add_memory_with(
     crate::project::refuse_reserved_predicate(input.predicate.as_deref())?;
     crate::topic::refuse_topic_entities(&input.entities)?;
     let project = crate::context::explicit_project(input.project.as_deref())?;
-    if let Some(scheduled) =
-        crate::review::schedule_if_decision(fields.memory_type.as_deref(), &input.metadata)
-    {
+    let scheduled = match review {
+        Review::Schedule => {
+            crate::review::schedule_if_decision(fields.memory_type.as_deref(), &input.metadata)
+        }
+        Review::Unscheduled => None,
+    };
+    if let Some(scheduled) = scheduled {
         input.metadata = scheduled;
     }
     let now = Utc::now();

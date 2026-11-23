@@ -2,6 +2,16 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-23 — `decisions import --apply`: import a repo decisions log (Mill Board #1564, D64 to D69)
+
+### Added
+- `rusty-remind-me decisions import <DECISIONS.md> --project <P> --apply` adds the plan's new entries as decisions of the project, re-planned at that moment, and prints what it wrote. Each entry's text is its statement; `metadata` holds `decision_ref`, `rationale`, `date`, `tag`, `confirms` and `imported: {source, line}`. Each entry gets `source` `decisions-import`. The decisions an entry supersedes (stated outright, same project) are retired in the same write; a link whose target is not exactly one live decision is listed as unlinked, never guessed. Changed, needs-rationale, conflicting and ambiguous rows are left for a person; a stored decision is never overwritten. A second run adds nothing, superseded imports included. Imported decisions get no review date (D69). This is a data migration (D3, D30): Nano runs it, after approving a dry run against the live store and after the restore drill (#1622, D68).
+- `--ref-prefix P` reads every ref and every ref a link names as `P <ref>`, for two logs of one project that both number from D1 (`gui-design D93`, D64). `--generate-refs P` gives a table with a `Date` column and no ref column the refs `P-<date>-<n>`, numbered per date in file order with struck rows counted (`mux-2026-10-21-1`, D65). `--rename-duplicates` imports a repeated ref as `<ref>b`, `<ref>c`, ... and lists each under "Renamed repeats" instead of making every copy a conflict. All three apply to dry runs too.
+- The daemon op `decisions_import_apply`; `decisions_import_plan` takes the same optional `refs`.
+
+### Tests
+- Generated refs per date with a struck row keeping its number and an undated row left unparsed; prefixed refs and link targets with a renamed repeat, and the conflict without the flag; an apply that adds, links, confirms and leaves no review date, then a second run that adds nothing; a stored decision with other text is reported as changed and left alone, and a link to an unknown ref stays unlinked.
+
 ## 2026-11-23 — Updates and deletes are atomic; an engine transaction covers revisions and the wiki (Q21, Q22, D62)
 
 ### Fixed

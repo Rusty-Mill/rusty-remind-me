@@ -944,3 +944,190 @@ fn apply_skips_claim_rows() {
         .expect("history")
         .is_empty());
 }
+
+// -- ref options and import apply (pack D64, D65, D69) -------------------------
+
+use remind_me_core::decisions_backfill::{
+    apply_import, parse_log_with, render_import_applied, RefOptions, IMPORT_SOURCE,
+};
+
+const DATED: &str = "\
+| Date | Decision | Why | Owner |
+|---|---|---|---|
+| 2026-10-21 | Build fresh | Structural gap | Owner |
+| 2026-10-21 | ~~tokio is the runtime~~ | Superseded | Owner |
+| 2026-10-21 | One VT engine | Reuse | Owner |
+| 2026-10-22 | Crate prefix rusty_mux | Confirmed | Owner |
+| soon | Undated row | None | Owner |
+";
+
+#[test]
+fn a_dated_table_gets_generated_refs_counted_per_date_in_file_order() {
+    let options = RefOptions {
+        generate: Some("mux".into()),
+        ..RefOptions::default()
+    };
+    let log = parse_log_with(DATED, &options);
+    let refs: Vec<(&str, bool)> = log
+        .entries
+        .iter()
+        .map(|e| (e.decision_ref.as_str(), e.struck))
+        .collect();
+    assert_eq!(
+        refs,
+        [
+            ("mux-2026-10-21-1", false),
+            ("mux-2026-10-21-2", true),
+            ("mux-2026-10-21-3", false),
+            ("mux-2026-10-22-1", false),
+        ],
+        "a struck row keeps its number, so later refs never shift"
+    );
+    assert_eq!(log.unparsed.len(), 1, "a row with no date is not guessed");
+
+    let plain = parse_log(DATED);
+    assert!(plain.entries.is_empty(), "no refs are made up unless asked");
+    assert_eq!(plain.unparsed.len(), 5);
+}
+
+const GUI: &str = "\
+| # | Decision | Why |
+|---|---|---|
+| D1 | Dark theme first | Taste |
+| D2 | Supersedes D1. Light theme first | Changed mind |
+| D2 | Tabs on top | Habit |
+";
+
+#[test]
+fn a_prefix_qualifies_refs_and_links_and_a_repeat_gets_a_letter() {
+    let options = RefOptions {
+        prefix: Some("gui-design".into()),
+        rename_duplicates: true,
+        ..RefOptions::default()
+    };
+    let log = parse_log_with(GUI, &options);
+    let refs: Vec<&str> = log
+        .entries
+        .iter()
+        .map(|e| e.decision_ref.as_str())
+        .collect();
+    assert_eq!(refs, ["gui-design D1", "gui-design D2", "gui-design D2b"]);
+    assert_eq!(log.renamed.len(), 1);
+    assert_eq!(log.renamed[0].from, "gui-design D2");
+    assert_eq!(log.renamed[0].to, "gui-design D2b");
+    assert_eq!(log.renamed[0].line, 5);
+
+    let plan = plan_import(&log, "rusty_term", "gui.md", &[]);
+    assert_eq!(plan.new.len(), 3);
+    assert!(plan.conflicts.is_empty());
+    assert_eq!(plan.supersedes.len(), 1);
+    assert_eq!(plan.supersedes[0].supersedes, "gui-design D1");
+    assert!(render_import(&plan).contains("gui-design D2 -> gui-design D2b"));
+
+    let strict = parse_log_with(
+        GUI,
+        &RefOptions {
+            prefix: Some("gui-design".into()),
+            ..RefOptions::default()
+        },
+    );
+    let plan = plan_import(&strict, "rusty_term", "gui.md", &[]);
+    assert_eq!(
+        plan.conflicts.len(),
+        2,
+        "without the flag a repeat imports neither"
+    );
+}
+
+const SMALL: &str = "\
+| # | Decision | Why | Tag |
+|---|---|---|---|
+| D1 | Use the engine store | Measured | [stated] |
+| D2 | Supersedes D1. Use SQLite | Benchmark | [stated] |
+| D3 | Confirms D2 | Checked again | [default] |
+| D4 | No rationale |  | [default] |
+";
+
+#[test]
+fn apply_adds_new_entries_links_them_and_a_second_run_adds_nothing() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let log = parse_log(SMALL);
+
+    let applied = apply_import(&store, &log, "rusty-remind-me", "docs/DECISIONS.md").unwrap();
+    let added: Vec<&str> = applied
+        .added
+        .iter()
+        .map(|r| r.decision_ref.as_str())
+        .collect();
+    assert_eq!(added, ["D1", "D2", "D3"]);
+    assert!(applied.failed.is_empty() && applied.skipped.is_empty());
+    assert_eq!(applied.linked.len(), 1);
+    assert!(applied.unlinked.is_empty());
+    assert_eq!(
+        applied.plan.needs_rationale.len(),
+        1,
+        "D4 is left for a person"
+    );
+    assert!(render_import_applied(&applied).contains("Added 3 decisions"));
+
+    let id = |r: &str| {
+        applied
+            .added
+            .iter()
+            .find(|a| a.decision_ref == r)
+            .and_then(|a| a.memory_id.clone())
+            .unwrap()
+    };
+    let memories = Memories::new(&store);
+    let d1 = memories.get_live(&id("D1")).unwrap().unwrap();
+    let d2 = memories.get_live(&id("D2")).unwrap().unwrap();
+    let d3 = memories.get_live(&id("D3")).unwrap().unwrap();
+    assert_eq!(d1.superseded_by.as_deref(), Some(id("D2").as_str()));
+    assert_eq!(d2.memory_type.as_deref(), Some("decision"));
+    assert_eq!(d2.category, "decision");
+    assert_eq!(d2.source, IMPORT_SOURCE);
+    assert_eq!(d2.project.as_deref(), Some("rusty-remind-me"));
+    assert_eq!(d2.content, "Supersedes D1. Use SQLite");
+    assert_eq!(d2.metadata["decision_ref"], "D2");
+    assert_eq!(d2.metadata["rationale"], "Benchmark");
+    assert_eq!(d2.metadata["tag"], "[stated]");
+    assert_eq!(
+        d2.metadata["imported"],
+        json!({ "source": "docs/DECISIONS.md", "line": 4 })
+    );
+    assert!(
+        d2.metadata.get("review").is_none(),
+        "an imported decision gets no review date (D69)"
+    );
+    assert_eq!(d3.metadata["confirms"], json!(["D2"]));
+
+    let again = apply_import(&store, &log, "rusty-remind-me", "docs/DECISIONS.md").unwrap();
+    assert!(again.added.is_empty() && again.linked.is_empty());
+    assert_eq!(
+        again.plan.unchanged.len(),
+        3,
+        "the retired D1 counts as stored, never as new again"
+    );
+}
+
+#[test]
+fn apply_never_overwrites_a_stored_decision_and_leaves_an_unknown_target_unlinked() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let mut stored = NewMemory::new("mem_d1", "Something else entirely", "2026-11-01T00:00:00Z");
+    stored.memory_type = "decision".into();
+    stored.project = Some("rusty-remind-me".into());
+    stored.metadata = json!({ "decision_ref": "D1", "rationale": "older" });
+    Memories::new(&store).insert(&stored).unwrap();
+    let log = parse_log(
+        "| # | Decision | Why |\n|---|---|---|\n| D1 | Use the engine store | Measured |\n| D9 | Supersedes D8. New | Why |\n",
+    );
+
+    let applied = apply_import(&store, &log, "rusty-remind-me", "d.md").unwrap();
+    assert_eq!(applied.plan.changed.len(), 1);
+    let kept = Memories::new(&store).get_live("mem_d1").unwrap().unwrap();
+    assert_eq!(kept.content, "Something else entirely");
+    assert_eq!(applied.added.len(), 1, "D9 still imports");
+    assert_eq!(applied.unlinked.len(), 1, "D8 is not stored: not guessed");
+}

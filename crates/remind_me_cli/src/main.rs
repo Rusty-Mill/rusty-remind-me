@@ -768,14 +768,23 @@ fn parse_search_args(args: &[String]) -> Result<SearchArgs, String> {
 
 const DECISIONS_USAGE: &str = "\
 Usage: rusty-remind-me decisions normalize [--project <PROJECT>] [--apply] [--json]
-       rusty-remind-me decisions import <DECISIONS.md> --project <PROJECT> [--json]
+       rusty-remind-me decisions import <DECISIONS.md> --project <PROJECT>
+           [--ref-prefix <P>] [--generate-refs <P>] [--rename-duplicates]
+           [--apply] [--json]
   By default a dry run: print what normalising decision memories, or
   importing a repo decisions log, would change, writing nothing.
   normalize --apply writes metadata.decision_ref on the memories the plan
   lists under \"add ref\", re-planned at that moment, and prints what it
-  wrote; nothing else is changed. Both run in the remind-me daemon, which
-  must already be running; with no daemon they fail without reading or
-  writing the store.";
+  wrote; nothing else is changed.
+  import --apply adds the plan's new entries as decisions of the project,
+  re-planned at that moment, retires the decisions they supersede, and
+  prints what it wrote; a stored decision is never overwritten.
+  --ref-prefix P reads every ref as \"P <ref>\" (two logs of one project
+  that both number from D1). --generate-refs P gives a table with a Date
+  column and no ref column the refs P-<date>-<n>. --rename-duplicates
+  imports a repeated ref as <ref>b, <ref>c, ... instead of as a conflict.
+  Both run in the remind-me daemon, which must already be running; with
+  no daemon they fail without reading or writing the store.";
 
 /// A parsed `decisions` command.
 #[derive(Debug, PartialEq, Eq)]
@@ -788,6 +797,8 @@ enum DecisionsArgs {
     Import {
         path: std::path::PathBuf,
         project: String,
+        refs: remind_me_core::decisions_backfill::RefOptions,
+        apply: bool,
         json: bool,
     },
 }
@@ -800,14 +811,26 @@ fn parse_decisions_args(args: &[String]) -> Result<DecisionsArgs, String> {
     let mut project: Option<String> = None;
     let mut json = false;
     let mut apply = false;
+    let mut refs = remind_me_core::decisions_backfill::RefOptions::default();
     let mut words: Vec<String> = Vec::new();
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
             "--json" => json = true,
             "--apply" => apply = true,
+            "--rename-duplicates" => refs.rename_duplicates = true,
             "--project" => {
                 project = Some(flag_value(rest, i, "--project", DECISIONS_USAGE)?);
+                i += 1;
+            }
+            "--ref-prefix" => {
+                let value = flag_value(rest, i, "--ref-prefix", DECISIONS_USAGE)?;
+                refs.prefix = Some(non_blank(value, "--ref-prefix").map_err(|e| usage(&e))?);
+                i += 1;
+            }
+            "--generate-refs" => {
+                let value = flag_value(rest, i, "--generate-refs", DECISIONS_USAGE)?;
+                refs.generate = Some(non_blank(value, "--generate-refs").map_err(|e| usage(&e))?);
                 i += 1;
             }
             flag if flag.starts_with("--") => {
@@ -823,16 +846,21 @@ fn parse_decisions_args(args: &[String]) -> Result<DecisionsArgs, String> {
         Some(p) if p.is_empty() => return Err(usage("--project must not be blank.")),
         other => other,
     };
+    let reads_refs = refs != remind_me_core::decisions_backfill::RefOptions::default();
     match (verb.as_str(), words.as_slice()) {
+        ("normalize", _) if reads_refs => Err(usage(
+            "--ref-prefix, --generate-refs and --rename-duplicates are import flags.",
+        )),
         ("normalize", []) => Ok(DecisionsArgs::Normalize {
             project,
             apply,
             json,
         }),
-        ("import", _) if apply => Err(usage("only normalize takes --apply.")),
         ("import", [path]) => Ok(DecisionsArgs::Import {
             path: path.into(),
             project: project.ok_or_else(|| usage("import needs --project."))?,
+            refs,
+            apply,
             json,
         }),
         ("import", _) => Err(usage("import takes exactly one file.")),
@@ -841,14 +869,24 @@ fn parse_decisions_args(args: &[String]) -> Result<DecisionsArgs, String> {
     }
 }
 
+/// `value` trimmed, refused when blank: a blank prefix would silently read
+/// every ref as written.
+fn non_blank(value: String, flag: &str) -> Result<String, String> {
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        return Err(format!("{flag} must not be blank."));
+    }
+    Ok(value)
+}
+
 /// Run a `decisions` command and print its report.
 fn run_decisions(
     db_path: &std::path::Path,
     args: DecisionsArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use remind_me_core::decisions_backfill::{
-        render_import, render_normalize, render_normalize_applied, ImportPlan, NormalizeApplied,
-        NormalizePlan,
+        render_import, render_import_applied, render_normalize, render_normalize_applied,
+        ImportApplied, ImportPlan, NormalizeApplied, NormalizePlan,
     };
     // Read the log before any store contact. The plan runs only in an
     // already-running daemon: starting one, or opening the store here, runs
@@ -897,6 +935,33 @@ fn run_decisions(
         DecisionsArgs::Import {
             path,
             project,
+            refs,
+            apply: true,
+            json,
+        } => {
+            let applied: ImportApplied = daemon_plan(
+                &mut store,
+                Op::DecisionsImportApply {
+                    project,
+                    source: path.display().to_string(),
+                    text: log.unwrap_or_default(),
+                    refs,
+                },
+            )?;
+            (
+                if json {
+                    serde_json::to_string_pretty(&applied)?
+                } else {
+                    render_import_applied(&applied)
+                },
+                json,
+            )
+        }
+        DecisionsArgs::Import {
+            path,
+            project,
+            refs,
+            apply: false,
             json,
         } => {
             let plan: ImportPlan = daemon_plan(
@@ -905,6 +970,7 @@ fn run_decisions(
                     project,
                     source: path.display().to_string(),
                     text: log.unwrap_or_default(),
+                    refs,
                 },
             )?;
             (
@@ -1662,6 +1728,7 @@ mod tests {
 
     #[test]
     fn decisions_takes_normalize_and_import() {
+        use remind_me_core::decisions_backfill::RefOptions;
         assert_eq!(
             parse_decisions_args(&args(&["normalize", "--json"])),
             Ok(DecisionsArgs::Normalize {
@@ -1683,6 +1750,51 @@ mod tests {
             Ok(DecisionsArgs::Import {
                 path: "D.md".into(),
                 project: "mill".into(),
+                refs: RefOptions::default(),
+                apply: false,
+                json: false
+            })
+        );
+        assert_eq!(
+            parse_decisions_args(&args(&[
+                "import",
+                "gui.md",
+                "--project",
+                "rusty_term",
+                "--ref-prefix",
+                " gui-design ",
+                "--rename-duplicates",
+                "--apply",
+            ])),
+            Ok(DecisionsArgs::Import {
+                path: "gui.md".into(),
+                project: "rusty_term".into(),
+                refs: RefOptions {
+                    prefix: Some("gui-design".into()),
+                    generate: None,
+                    rename_duplicates: true,
+                },
+                apply: true,
+                json: false
+            })
+        );
+        assert_eq!(
+            parse_decisions_args(&args(&[
+                "import",
+                "mux.md",
+                "--project",
+                "rusty_mux",
+                "--generate-refs",
+                "mux",
+            ])),
+            Ok(DecisionsArgs::Import {
+                path: "mux.md".into(),
+                project: "rusty_mux".into(),
+                refs: RefOptions {
+                    generate: Some("mux".into()),
+                    ..RefOptions::default()
+                },
+                apply: false,
                 json: false
             })
         );
@@ -1713,7 +1825,10 @@ mod tests {
             &["import", "--project", "mill"],
             &["normalize", "D.md"],
             &["apply"],
-            &["import", "D.md", "--project", "mill", "--apply"],
+            &["import", "D.md", "--project", "mill", "--ref-prefix", " "],
+            &["import", "D.md", "--project", "mill", "--generate-refs"],
+            &["normalize", "--rename-duplicates"],
+            &["normalize", "--ref-prefix", "gui-design"],
         ] {
             assert!(parse_decisions_args(&args(bad)).is_err(), "{bad:?}");
         }
