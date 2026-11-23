@@ -1080,7 +1080,9 @@ type Write<'a> = &'a (dyn Fn(&Store<'_>, &mut Rng) -> Result<()> + Sync);
 /// last reader has finished, so it covers every reader's window by
 /// construction. If that first write fails, the writer still reaches the
 /// barrier, flagged, and the readers return at once: the run fails with
-/// the writer's error instead of hanging.
+/// the writer's error instead of hanging. A later write that fails stops
+/// the writer, which stops cycling readers too; the run fails with that
+/// write's error.
 ///
 /// One monotonic clock times everything: each successful write's
 /// completion, and each reader's span from the start of its first timed
@@ -1100,6 +1102,10 @@ fn readers(
     let start = &Barrier::new(READERS + usize::from(writer.is_some()));
     let readers_done = &AtomicBool::new(false);
     let writer_failed = &AtomicBool::new(false);
+    // Set when the writer stops, however it stops: cycling readers end on
+    // it, so a write that fails mid-run ends the run instead of leaving
+    // them searching for an end that never comes.
+    let writer_stopped = &AtomicBool::new(false);
     let epoch = Instant::now();
     let rows_before = testing::count(store, testing::Table::Memories)?;
     let mut windows: Vec<Window> = Vec::new();
@@ -1119,10 +1125,14 @@ fn readers(
                 let started = add(&mut completed);
                 writer_failed.store(started.is_err(), Ordering::SeqCst);
                 start.wait();
-                started?;
-                while !readers_done.load(Ordering::SeqCst) && !finished(until) {
-                    add(&mut completed)?;
-                }
+                let written = started.and_then(|()| {
+                    while !readers_done.load(Ordering::SeqCst) && !finished(until) {
+                        add(&mut completed)?;
+                    }
+                    Ok(())
+                });
+                writer_stopped.store(true, Ordering::SeqCst);
+                written?;
                 let last = epoch.elapsed().as_secs_f64();
                 Ok(Writes {
                     first,
@@ -1153,7 +1163,8 @@ fn readers(
                         .cycle()
                         .take(mine.len().saturating_mul(cycles))
                     {
-                        if finished(until) {
+                        let cycling = until.is_some();
+                        if finished(until) || (cycling && writer_stopped.load(Ordering::SeqCst)) {
                             break;
                         }
                         let input: MemorySearchInput =
@@ -1743,6 +1754,53 @@ mod tests {
         assert!(outcome.unwrap_err().contains("refused"));
         // The thread still holds the database until it ends; Windows will
         // not remove files that are open (OS error 32).
+        run.join().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A writer that fails after its first write, beside readers cycling
+    /// until a job that never finishes, ends the run with its error in
+    /// bounded time: the readers stop when the writer does.
+    #[test]
+    fn a_late_failed_write_stops_cycling_readers_and_fails_the_run() {
+        let _serial = serial();
+        let dir = std::env::temp_dir().join(format!("store_bench_late_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (sent, received) = mpsc::channel();
+        let run_dir = dir.clone();
+        let run = std::thread::spawn(move || {
+            let tables = SqliteTables::open(&run_dir.join("store")).unwrap();
+            let db =
+                Database::open_backend(Box::new(tables), Some(run_dir.join("memory.db"))).unwrap();
+            let store = db.store();
+            let corpus = Corpus::new();
+            let pairs = synthetic_queries(&corpus, &mut Rng(9)).unwrap();
+            let queries_: Vec<String> = pairs.iter().map(|(t, _)| t.clone()).collect();
+            let vectors_ = Precomputed(pairs.into_iter().collect());
+            let calls = AtomicUsize::new(0);
+            let fail_late = |_: &Store<'_>, _: &mut Rng| -> Result<()> {
+                if calls.fetch_add(1, Ordering::SeqCst) < 3 {
+                    std::thread::sleep(Duration::from_millis(5));
+                    return Ok(());
+                }
+                Err("refused late".into())
+            };
+            let never = AtomicBool::new(false);
+            let outcome = readers(
+                &db,
+                &store,
+                &queries_,
+                &vectors_,
+                Some(&fail_late),
+                Some(&never),
+            );
+            let _ = sent.send(outcome.map_err(|e| e.to_string()));
+        });
+        let outcome = received
+            .recv_timeout(Duration::from_secs(120))
+            .expect("the run returned instead of hanging");
+        assert!(outcome.unwrap_err().contains("refused late"));
         run.join().unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
