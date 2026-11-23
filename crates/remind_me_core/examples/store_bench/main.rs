@@ -307,8 +307,9 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// D3 ingests its pages with readers alongside, after an idle run on
-    /// the same inputs, and every page body lands in the blob store.
+    /// D3 ingests its pages with readers searching alongside from the first
+    /// page to the last, after an idle run on the same inputs, and every
+    /// page body lands in the blob store.
     #[cfg(unix)] // real datasets need a verifiable private root
     #[test]
     fn d3_ingests_its_pages_beside_the_readers() {
@@ -318,7 +319,7 @@ mod tests {
         let backup = small_backup(&root);
         let dataset = Dataset::D3 {
             backup,
-            pages: 6_000,
+            pages: 1_500,
         };
         let report = measure(
             SQLITE,
@@ -329,13 +330,12 @@ mod tests {
         )
         .unwrap();
         let ingest = &report["ingest"];
-        assert_eq!(ingest["pages"], 6_000);
-        assert!(
-            ingest["readers_beside_ingest"]["writer_adds"]
-                .as_u64()
-                .unwrap()
-                > 0
-        );
+        assert_eq!(ingest["pages"], 1_500);
+        // Every page went in beside the readers, and they searched to the
+        // last page: no part of the timed ingest ran without search load.
+        assert_eq!(ingest["readers_beside_ingest"]["writer_adds"], 1_500);
+        let coverage = ingest["reader_coverage_of_ingest"].as_f64().unwrap();
+        assert!(coverage >= 0.95, "{coverage}");
         assert!(ingest["hybrid_p95_ratio"].is_number());
         // G7 and G3 on the ingested store, before the other workloads.
         assert!(report["cold_open_after_ingest"]["child"]["first_query_ms"].is_number());

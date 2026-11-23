@@ -746,11 +746,11 @@ fn workload(
     }
     report.insert(
         "search_hybrid_readers_idle".into(),
-        readers(&db, &store, &queries_, &vectors_, None)?,
+        readers(&db, &store, &queries_, &vectors_, None, None)?,
     );
     report.insert(
         "search_hybrid_beside_writer".into(),
-        readers(&db, &store, &queries_, &vectors_, Some(&add_one))?,
+        readers(&db, &store, &queries_, &vectors_, Some(&add_one), None)?,
     );
 
     let t = Instant::now();
@@ -821,11 +821,11 @@ fn idle_ratio(d1: &Value, d3: &Value) -> Value {
 
 /// Workload 5 on D3: bulk-ingest `pages` raw pages (each body to the blob
 /// store, its row a head and a link, D50) with the four readers searching
-/// alongside, after the same readers searched idle on the same inputs
-/// (D54). The ingest keeps going after the readers finish until every
-/// page is in; it must outlast them, or the run fails (raise the page
-/// count). Reports the total ingest time, both reader runs and the ratio
-/// of their p95s.
+/// alongside from the first page to the last, after the same readers
+/// searched idle on the same inputs (D54). Beside the ingest each reader
+/// cycles through its queries until the last page is in, so no part of
+/// the timed ingest runs without search load. Reports the total ingest
+/// time, both reader runs and the ratio of their p95s.
 fn ingest(
     db: &Database,
     store: &Store<'_>,
@@ -836,33 +836,34 @@ fn ingest(
     vectors_: &Precomputed,
 ) -> Result<Value> {
     let next = AtomicUsize::new(0);
-    let page = |s: &Store<'_>, i: usize| -> Result<()> {
+    let done = AtomicBool::new(false);
+    let one = |s: &Store<'_>, _: &mut Rng| -> Result<()> {
+        let i = next.fetch_add(1, Ordering::SeqCst);
+        if i >= pages {
+            return Err(format!("page {i} of {pages} was asked for after the last").into());
+        }
         let mut rng = Rng((i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
         let stashed = bodies.stash(&corpus.page(&mut rng))?;
         let slug = format!("d3-page-{i}");
         wiki::write_wiki_page(s, &slug, &slug, &stashed.head, &stashed.page_summary())?;
+        if i + 1 == pages {
+            done.store(true, Ordering::SeqCst);
+        }
         Ok(())
     };
-    let one = |s: &Store<'_>, _: &mut Rng| -> Result<()> {
-        let i = next.fetch_add(1, Ordering::SeqCst);
-        if i >= pages {
-            return Err(
-                format!("the {pages} pages were all in before the readers finished").into(),
-            );
-        }
-        page(s, i)
-    };
-    let idle = readers(db, store, queries_, vectors_, None)?;
+    let idle = readers(db, store, queries_, vectors_, None, None)?;
     let started = Instant::now();
-    let beside = readers(db, store, queries_, vectors_, Some(&one))?;
-    for i in next.load(Ordering::SeqCst)..pages {
-        page(store, i)?;
-    }
+    let beside = readers(db, store, queries_, vectors_, Some(&one), Some(&done))?;
     let total_s = started.elapsed().as_secs_f64();
+    let written = next.load(Ordering::SeqCst);
+    if written != pages {
+        return Err(format!("{written} of {pages} pages were ingested").into());
+    }
     let p95 = |v: &Value| v["p95"].as_f64().unwrap_or(f64::NAN);
     Ok(json!({
         "pages": pages,
         "total_s": total_s,
+        "reader_coverage_of_ingest": coverage(&beside),
         "readers_idle": idle,
         "readers_beside_ingest": beside,
         "hybrid_p95_ratio": p95(&beside) / p95(&idle),
@@ -1071,6 +1072,10 @@ type Write<'a> = &'a (dyn Fn(&Store<'_>, &mut Rng) -> Result<()> + Sync);
 /// [`Database::store`] holds the process lock, so the caller's `store`
 /// (which holds it) only counts rows before and after.
 ///
+/// With `until`, each reader cycles through its queries, and the writer
+/// keeps writing, until that flag is set (the writer's job is done);
+/// without it, each reader runs its share of the queries once.
+///
 /// The writer writes once before the barrier and stops only after the
 /// last reader has finished, so it covers every reader's window by
 /// construction. If that first write fails, the writer still reaches the
@@ -1089,6 +1094,7 @@ fn readers(
     queries_: &[String],
     vectors_: &Precomputed,
     writer: Option<Write<'_>>,
+    until: Option<&AtomicBool>,
 ) -> Result<Value> {
     let source = &db.secondary_source().ok_or("an in-memory database")?;
     let start = &Barrier::new(READERS + usize::from(writer.is_some()));
@@ -1114,7 +1120,7 @@ fn readers(
                 writer_failed.store(started.is_err(), Ordering::SeqCst);
                 start.wait();
                 started?;
-                while !readers_done.load(Ordering::SeqCst) {
+                while !readers_done.load(Ordering::SeqCst) && !finished(until) {
                     add(&mut completed)?;
                 }
                 let last = epoch.elapsed().as_secs_f64();
@@ -1139,7 +1145,17 @@ fn readers(
                     }
                     let rows_at_begin = rows()?;
                     let mut span: Option<(Instant, Instant)> = None;
-                    for i in (r..SAMPLES).step_by(READERS) {
+                    let mine: Vec<usize> = (r..SAMPLES).step_by(READERS).collect();
+                    let cycles = if until.is_some() { usize::MAX } else { 1 };
+                    for i in mine
+                        .iter()
+                        .copied()
+                        .cycle()
+                        .take(mine.len().saturating_mul(cycles))
+                    {
+                        if finished(until) {
+                            break;
+                        }
                         let input: MemorySearchInput =
                             serde_json::from_value(json!({ "query": queries_[i] }))
                                 .map_err(|e| e.to_string())?;
@@ -1211,6 +1227,32 @@ fn readers(
         .into());
     }
     Ok(value)
+}
+
+/// The least share of the writer's span any reader's span covers, from a
+/// loaded [`readers`] report; null without one.
+fn coverage(loaded: &Value) -> Value {
+    let (Some(first), Some(last)) = (
+        loaded["writer_s"]["first"].as_f64(),
+        loaded["writer_s"]["last"].as_f64(),
+    ) else {
+        return Value::Null;
+    };
+    let Some(readers) = loaded["readers"].as_array() else {
+        return Value::Null;
+    };
+    let length = (last - first).max(f64::EPSILON);
+    let least = readers
+        .iter()
+        .filter_map(|r| Some((r["begin_s"].as_f64()?, r["end_s"].as_f64()?)))
+        .map(|(begin, end)| ((end.min(last) - begin.max(first)).max(0.0) / length).min(1.0))
+        .fold(f64::INFINITY, f64::min);
+    json!(least)
+}
+
+/// Whether the job `until` marks (if any) is finished.
+fn finished(until: Option<&AtomicBool>) -> bool {
+    until.is_some_and(|done| done.load(Ordering::SeqCst))
 }
 
 /// The loaded run's writer: when it started and stopped, and when each
@@ -1685,7 +1727,14 @@ mod tests {
                 Database::open_backend(Box::new(tables), Some(run_dir.join("memory.db"))).unwrap();
             let store = db.store();
             let fail = |_: &Store<'_>, _: &mut Rng| -> Result<()> { Err("refused".into()) };
-            let outcome = readers(&db, &store, &[], &Precomputed(HashMap::new()), Some(&fail));
+            let outcome = readers(
+                &db,
+                &store,
+                &[],
+                &Precomputed(HashMap::new()),
+                Some(&fail),
+                None,
+            );
             let _ = sent.send(outcome.map_err(|e| e.to_string()));
         });
         let outcome = received
