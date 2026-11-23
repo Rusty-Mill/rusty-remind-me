@@ -21,3 +21,7 @@ Thumbs.db
 
 # Claude Code agent worktree bookkeeping (not part of this repo's project)
 /.claude/worktrees/
+
+# The cloud capture plugin is filled in locally and uploaded privately: never commit its token
+/plugins/cloud-capture/config.json
+__pycache__/

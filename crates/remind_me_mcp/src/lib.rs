@@ -444,6 +444,26 @@ fn client_identity(req: &serde_json::Value) -> Option<String> {
 /// Advisory, like `clientInfo`: whoever sends a line can set it.
 pub const CALLER_META_KEY: &str = "rusty-remind-me/caller";
 
+/// The tool a capture-only caller may call (ADR-0036).
+pub const CAPTURE_TOOL: &str = "remind_me_capture_transcript";
+
+/// The client name the remote gate gives every session opened with the
+/// capture-only credential (ADR-0036, D67): the mark on its writes, and the
+/// caller [`capture_caller_call`] lets reach [`CAPTURE_TOOL`].
+pub const CAPTURE_CLIENT: &str = "remind-me-capture-token";
+
+/// Whether this call is the capture-only caller calling [`CAPTURE_TOOL`],
+/// which it may do under any tool profile (D68). The tool stays out of
+/// `tools/list` wherever the profile hides it, and every other tool, alias
+/// included, keeps the profile check. A connector-token client that names
+/// itself [`CAPTURE_CLIENT`] reaches this one tool too; it already holds
+/// full access.
+fn capture_caller_call(tool: &str) -> bool {
+    tool == CAPTURE_TOOL
+        && remind_me_core::sync::handshake_client()
+            .is_some_and(|client| client.split('/').next() == Some(CAPTURE_CLIENT))
+}
+
 /// The caller a request names under [`CALLER_META_KEY`]: `Some(None)` for a
 /// caller that named nobody, `None` for a request that does not say.
 fn forwarded_caller(request_json: &str) -> Option<Option<String>> {
@@ -1705,7 +1725,9 @@ impl McpServer {
                 // caller who trimmed their surface would never know it was
                 // porous.
                 let profile = request_profile();
-                if !remind_me_core::tool_profiles::tool_allowed(&profile, tool_name) {
+                if !remind_me_core::tool_profiles::tool_allowed(&profile, tool_name)
+                    && !capture_caller_call(tool_name)
+                {
                     return Some(json!({
                         "jsonrpc": "2.0",
                         "id": req_id,

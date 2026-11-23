@@ -242,3 +242,37 @@ fn every_description_leads_with_remind_me_and_non_core_names_its_group() {
         }
     }
 }
+
+/// D68: under `core`, the capture-only caller (the name the remote gate pins)
+/// reaches `remind_me_capture_transcript`, nobody else does, and the tool
+/// stays unlisted.
+#[test]
+fn only_the_capture_caller_reaches_the_capture_tool_under_core() {
+    use remind_me_mcp::{CALLER_META_KEY, CAPTURE_CLIENT, CAPTURE_TOOL};
+    let call = |s: &McpServer, caller: &str, tool: &str| {
+        let line = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+            "name": tool,
+            "arguments": { "session_id": "s1", "transcript": "{\"type\":\"user\"}\n" },
+            "_meta": { CALLER_META_KEY: caller }
+        }});
+        let reply = s.handle_request(&line.to_string()).expect("an answer");
+        let text = reply["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        !text.contains("not available under")
+    };
+    with_profile(Some("core"), || {
+        let s = server();
+        let capture = format!("{CAPTURE_CLIENT}/2");
+        assert!(call(&s, &capture, CAPTURE_TOOL));
+        assert!(!call(&s, "claude-ai/1.0", CAPTURE_TOOL));
+        assert!(!call(&s, &format!("{CAPTURE_CLIENT}-not/2"), CAPTURE_TOOL));
+        assert!(!call(&s, &capture, "remind_me_import"));
+        let names: Vec<String> = listed(&s)
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(str::to_string))
+            .collect();
+        assert!(!names.iter().any(|n| n == CAPTURE_TOOL), "{names:?}");
+    });
+}

@@ -32,7 +32,7 @@ const TOKEN: &str = "test-connector-token";
 async fn spawn_server() -> SocketAddr {
     let db = Database::open_in_memory().unwrap();
     let mcp = Arc::new(McpServer::new(db));
-    let router = remind_me_remote::build_router(mcp, TOKEN.to_string(), None).unwrap();
+    let router = remind_me_remote::build_router(mcp, TOKEN.to_string(), None, None).unwrap();
     common::serve(router)
 }
 
@@ -79,7 +79,8 @@ async fn spawn_daemon_backed_server() -> SocketAddr {
     std::thread::spawn(move || daemon.serve(Arc::new(store)));
     // The daemon is already running, so the executable is never started.
     let proxy = DaemonProxy::connect(endpoint, PathBuf::from("unused")).unwrap();
-    let router = remind_me_remote::build_router(Arc::new(proxy), TOKEN.to_string(), None).unwrap();
+    let router =
+        remind_me_remote::build_router(Arc::new(proxy), TOKEN.to_string(), None, None).unwrap();
     common::serve(router)
 }
 

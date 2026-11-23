@@ -169,21 +169,11 @@ pub fn generate_token() -> String {
 /// A token file that can be neither read nor written yields an ephemeral
 /// per-process token instead of ever leaving the endpoint unauthenticated.
 pub fn resolve_connector_token() -> String {
-    if let Ok(env_token) = std::env::var(REMOTE_TOKEN_ENV) {
-        let env_token = env_token.trim().to_string();
-        if !env_token.is_empty() {
-            return env_token;
-        }
+    if let Some(existing) = existing_connector_token() {
+        return existing;
     }
 
     let file = token_file_path();
-    if let Ok(existing) = fs::read_to_string(&file) {
-        let existing = existing.trim().to_string();
-        if !existing.is_empty() {
-            return existing;
-        }
-    }
-
     let token = generate_token();
     if let Some(parent) = file.parent() {
         let _ = fs::create_dir_all(parent);
@@ -196,6 +186,107 @@ pub fn resolve_connector_token() -> String {
         }
     }
     token
+}
+
+/// Capture-only connector credential (ADR-0036). Unset means there is
+/// none. A request carrying it may only open an MCP session and call
+/// `remind_me_capture_transcript`; `remind_me_remote::auth` enforces that.
+/// It exists for hooks in places that cannot hold the full connector token,
+/// such as a plugin uploaded to claude.ai.
+pub const REMOTE_CAPTURE_TOKEN_ENV: &str = "REMIND_ME_REMOTE_CAPTURE_TOKEN";
+
+/// Shortest capture token accepted. It is a bearer credential reachable
+/// from the internet, so a short one is refused rather than trusted.
+pub const MIN_CAPTURE_TOKEN_LEN: usize = 32;
+
+/// The capture-only credential as configured. A credential that gates
+/// access resolves to off, unusable or ready, never to a default.
+#[derive(Clone, PartialEq, Eq)]
+pub enum CaptureToken {
+    /// [`REMOTE_CAPTURE_TOKEN_ENV`] is unset.
+    Off,
+    /// Set, but refused; capture-only access stays closed.
+    Unusable { reason: &'static str },
+    /// Set and usable.
+    Ready(String),
+}
+
+impl std::fmt::Debug for CaptureToken {
+    /// Never prints the token itself.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Off => f.write_str("Off"),
+            Self::Unusable { reason } => write!(f, "Unusable({reason})"),
+            Self::Ready(_) => f.write_str("Ready(<redacted>)"),
+        }
+    }
+}
+
+impl CaptureToken {
+    /// Judge `raw` as a capture token beside the full `connector_token`.
+    pub fn parse(raw: &str, connector_token: &str) -> Self {
+        let token = raw.trim();
+        if token.is_empty() {
+            return Self::Unusable { reason: "is blank" };
+        }
+        if token.len() < MIN_CAPTURE_TOKEN_LEN {
+            return Self::Unusable {
+                reason: "is shorter than 32 characters",
+            };
+        }
+        if !token.bytes().all(|b| b.is_ascii_graphic()) {
+            return Self::Unusable {
+                reason: "has characters other than visible ASCII",
+            };
+        }
+        if crate::webhook::constant_time_eq(token.as_bytes(), connector_token.trim().as_bytes()) {
+            return Self::Unusable {
+                reason: "is the full connector token",
+            };
+        }
+        Self::Ready(token.to_string())
+    }
+
+    /// `off`, `ready` or `unusable: <reason>`, for a status report.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Off => "off".to_string(),
+            Self::Unusable { reason } => format!("unusable: {REMOTE_CAPTURE_TOKEN_ENV} {reason}"),
+            Self::Ready(_) => "ready".to_string(),
+        }
+    }
+
+    /// The token, when it is ready.
+    pub fn ready(&self) -> Option<&str> {
+        match self {
+            Self::Ready(token) => Some(token),
+            _ => None,
+        }
+    }
+}
+
+/// [`REMOTE_CAPTURE_TOKEN_ENV`], judged beside `connector_token`. Unlike the
+/// connector token it is never generated or persisted: off is a valid state.
+pub fn resolve_capture_token(connector_token: &str) -> CaptureToken {
+    match std::env::var(REMOTE_CAPTURE_TOKEN_ENV) {
+        Ok(raw) => CaptureToken::parse(&raw, connector_token),
+        Err(_) => CaptureToken::Off,
+    }
+}
+
+/// The connector token from [`REMOTE_TOKEN_ENV`] or the token file, without
+/// generating one: steps 1 and 2 of [`resolve_connector_token`].
+fn existing_connector_token() -> Option<String> {
+    let from_env = std::env::var(REMOTE_TOKEN_ENV)
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+    from_env.or_else(|| {
+        fs::read_to_string(token_file_path())
+            .ok()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+    })
 }
 
 /// What `remind_me_server_status` reports for the remote MCP connector.
@@ -215,6 +306,9 @@ pub struct RemoteStatus {
     pub issuer: Option<String>,
     pub oauth_state_file: String,
     pub oauth_clients: usize,
+    /// The capture-only credential's state (`off`, `ready` or
+    /// `unusable: <reason>`), never its value.
+    pub capture_token: String,
 }
 
 /// Gather [`RemoteStatus`]. Reads env vars and stats the token/state files
@@ -241,6 +335,8 @@ pub fn remote_status() -> RemoteStatus {
         issuer: config.issuer,
         oauth_state_file: oauth_state_file.to_string_lossy().to_string(),
         oauth_clients,
+        capture_token: resolve_capture_token(&existing_connector_token().unwrap_or_default())
+            .label(),
     }
 }
 
@@ -276,6 +372,76 @@ mod tests {
         crate::test_env::remove_var(REMOTE_TOKEN_FILE_ENV);
         crate::test_env::remove_var(REMOTE_ISSUER_ENV);
         crate::test_env::remove_var(REMOTE_OAUTH_STATE_FILE_ENV);
+        crate::test_env::remove_var(REMOTE_CAPTURE_TOKEN_ENV);
+    }
+
+    const CONNECTOR: &str = "connector-token-0123456789abcdef0123456789";
+    const CAPTURE: &str = "capture-token-0123456789abcdef0123456789ab";
+
+    #[test]
+    fn a_capture_token_is_ready_only_when_long_visible_and_distinct() {
+        assert_eq!(
+            CaptureToken::parse(&format!("  {CAPTURE}\n"), CONNECTOR).ready(),
+            Some(CAPTURE)
+        );
+        for (raw, reason) in [
+            ("   ", "is blank"),
+            ("short-token", "is shorter than 32 characters"),
+            (
+                "capture token 0123456789abcdef0123456789",
+                "has characters other than visible ASCII",
+            ),
+            (CONNECTOR, "is the full connector token"),
+        ] {
+            assert_eq!(
+                CaptureToken::parse(raw, CONNECTOR),
+                CaptureToken::Unusable { reason },
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_capture_token_is_off_when_unset_and_judged_when_set() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        assert_eq!(resolve_capture_token(CONNECTOR), CaptureToken::Off);
+        crate::test_env::set_var(REMOTE_CAPTURE_TOKEN_ENV, "");
+        assert_eq!(
+            resolve_capture_token(CONNECTOR),
+            CaptureToken::Unusable { reason: "is blank" }
+        );
+        crate::test_env::set_var(REMOTE_CAPTURE_TOKEN_ENV, CAPTURE);
+        assert_eq!(resolve_capture_token(CONNECTOR).ready(), Some(CAPTURE));
+        clear_env();
+    }
+
+    #[test]
+    fn remote_status_reports_the_capture_token_state_never_its_value() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        crate::test_env::set_var(REMOTE_TOKEN_ENV, CONNECTOR);
+        crate::test_env::set_var(
+            REMOTE_OAUTH_STATE_FILE_ENV,
+            std::env::temp_dir().join(format!("rrm_capture_status_{}.json", std::process::id())),
+        );
+        assert_eq!(remote_status().capture_token, "off");
+        crate::test_env::set_var(REMOTE_CAPTURE_TOKEN_ENV, CONNECTOR);
+        assert_eq!(
+            remote_status().capture_token,
+            "unusable: REMIND_ME_REMOTE_CAPTURE_TOKEN is the full connector token"
+        );
+        crate::test_env::set_var(REMOTE_CAPTURE_TOKEN_ENV, CAPTURE);
+        let status = remote_status();
+        assert_eq!(status.capture_token, "ready");
+        assert!(!serde_json::to_string(&status).unwrap().contains(CAPTURE));
+        clear_env();
+    }
+
+    #[test]
+    fn a_ready_capture_token_never_prints() {
+        let shown = format!("{:?}", CaptureToken::Ready(CAPTURE.to_string()));
+        assert!(!shown.contains(CAPTURE), "{shown}");
     }
 
     #[test]
