@@ -16,5 +16,12 @@ attest = { git = "https://github.com/Rusty-Mill/rusty_attest", rev = "1711d0c769
 rusty_serde = { git = "https://github.com/Rusty-Mill/rusty_mill", tag = "libs-2026.11.0" }
 
 [dev-dependencies]
+# For R3's relevance mode, which includes the #59 eval's shared code; both
+# are already in this lockfile through remind_me_core.
+chrono = "0.4"
+chrono-tz = "0.10"
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
+# For the crash mode's SQLite integrity check; the version and features
+# remind_me_core already takes, so nothing new enters the lockfile.
+rusqlite = { version = "0.41", features = ["bundled"] }

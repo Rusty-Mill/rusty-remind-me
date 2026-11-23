@@ -51,8 +51,15 @@
 //! pages are ingested. The second's idle memory is G3, its time G7 on D3,
 //! and its idle over the first's is G5 (`g5_idle_ratio`). D1's dialogs
 //! already carry their full bodies in the blob store, so D3 adds only the
-//! pages. There is no crash or relevance workload yet (D55), so
-//! these are not scoring runs.
+//! pages.
+//!
+//! Two more modes complete R3 (D60). `crash <backend> d1:<backup> <dir>`
+//! is G6 (`crash.rs`): a writer killed 200 times on one copy of D1, the
+//! store reopened and checked after each kill. `relevance <backend>
+//! golden <dir>` is G2 on the #59 golden set, and `relevance <backend>
+//! d1:<backup> <dir> <queries> <vectors>` adds the #1563 set on D1, its
+//! query vectors made beforehand by the `embed_queries` example
+//! (`relevance.rs`).
 //!
 //! The run is offline. It refuses to start when the environment configures
 //! an embedder, query expansion, a reranking model or a cloud backup
@@ -87,9 +94,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod bodies;
 mod cold;
+pub mod crash;
 mod d1;
+pub mod fingerprint;
 mod g1;
 mod package;
+mod relevance;
 
 use bodies::Bodies;
 use package::Manifest;
@@ -116,6 +126,12 @@ pub type Opener = fn(&Path) -> Result<Box<dyn Backend>>;
 /// the first directory, into the second, a new directory.
 pub type Packager = fn(&Database, &Path, &Path) -> Result<()>;
 
+/// Checks the integrity of a candidate's closed store in a directory, in
+/// the candidate's own terms (D56); what it checked, or why it failed.
+pub type Verifier = fn(&Path) -> Result<Value>;
+
+pub use crash::{verify_engine, verify_sqlite};
+
 /// A [`Packager`] for a backend whose `backup_to` is the whole store (the
 /// engine, SQLite): its backup, moved into `dest`.
 pub fn backup_package(db: &Database, _store: &Path, dest: &Path) -> Result<()> {
@@ -135,6 +151,8 @@ pub struct Candidate {
     pub restore: Opener,
     /// Writes the backup that goes in the package's `store/`.
     pub package: Packager,
+    /// Checks the closed store's integrity after a crash (G6).
+    pub verify: Verifier,
 }
 
 impl Candidate {
@@ -255,6 +273,35 @@ pub fn run(candidates: &[Candidate]) -> Result<()> {
             return cold::cold_child(candidate, dir);
         }
     }
+    // G6 (D56, D57): `crash <backend> d1:<backup> <dir>`, and its child
+    // `crash-child <backend> <run dir> <stream> <seed>`, its start on stdin.
+    match args.as_slice() {
+        [mode, backend, set, dir] if mode == "crash" => {
+            let candidate = find(candidates, backend)?;
+            let report = crash::run(candidate, set, Path::new(dir), crash::KILLS, crash::exe)?;
+            println!("{}", Value::Object(report));
+            return Ok(());
+        }
+        [mode, rest @ ..] if mode == "crash-child" => return crash::child_from(candidates, rest),
+        _ => {}
+    }
+    // G2 (D58-D60): `relevance <backend> golden <dir>`, or with D1 and the
+    // #1563 set: `relevance <backend> d1:<backup> <dir> <queries> <vectors>`.
+    match args.as_slice() {
+        [mode, backend, set, dir] if mode == "relevance" => {
+            let report = relevance_run(find(candidates, backend)?, set, Path::new(dir), None)?;
+            println!("{}", Value::Object(report));
+            return Ok(());
+        }
+        [mode, backend, set, dir, queries, vectors] if mode == "relevance" => {
+            let files = (Path::new(queries.as_str()), Path::new(vectors.as_str()));
+            let report =
+                relevance_run(find(candidates, backend)?, set, Path::new(dir), Some(files))?;
+            println!("{}", Value::Object(report));
+            return Ok(());
+        }
+        _ => {}
+    }
     let [mode, backend, n, dir] = args.as_slice() else {
         return Err(format!(
             "usage: store_bench <bench|open> <{}> <n|d1:|d2:|d3:<backup>> <dir>",
@@ -280,6 +327,74 @@ pub fn run(candidates: &[Candidate]) -> Result<()> {
     )?;
     println!("{}", Value::Object(report));
     Ok(())
+}
+
+/// G2 on `candidate`: the golden set, and with D1 and the #1563 files the
+/// real set too; its report (D60).
+pub fn relevance_run(
+    candidate: Candidate,
+    set: &str,
+    root: &Path,
+    files: Option<(&Path, &Path)>,
+) -> Result<Map<String, Value>> {
+    let backup = match (set.strip_prefix("d1:"), files) {
+        (None, None) if set == "golden" => None,
+        (Some(backup), Some(_)) => Some(PathBuf::from(backup)),
+        _ => {
+            return Err("usage: store_bench relevance <backend> golden <dir>, or \
+                 relevance <backend> d1:<backup> <dir> <queries.jsonl> <vectors.jsonl>"
+                .into())
+        }
+    };
+    if let Some(backup) = &backup {
+        check_real_input(backup, root)?;
+    }
+    refuse_model_config()?;
+    let stem = format!(
+        "relevance-{}-{}",
+        candidate.name,
+        if backup.is_some() { "d1" } else { "golden" }
+    );
+    let dir = fresh_run_dir(root, &stem)?;
+    let mut report = Map::new();
+    report.insert("mode".into(), json!("relevance"));
+    report.insert("backend".into(), json!(candidate.name));
+    report.insert("gates".into(), json!(["G2"]));
+    report.insert("git_sha".into(), json!(std::env::var("R3_GIT_SHA").ok()));
+    report.insert("run_dir".into(), json!(dir));
+    let mut open =
+        |mode: &str| candidate.open(&dir.join(format!("golden-{}", mode.replace('+', "-"))));
+    report.insert("golden".into(), relevance::golden(&mut open)?);
+    let (Some(backup), Some((queries, vectors))) = (backup, files) else {
+        return Ok(report);
+    };
+    // The vectors are bound to this very backup, checked before any load.
+    let fingerprint = fingerprint::backup_fingerprint(&backup)?;
+    let cand = candidate.open(&dir.join("d1"))?;
+    let engine = Database::open_backend(
+        Box::new(remind_me_core::db::engine::EngineTables::open(
+            &dir.join("engine").join("store"),
+        )?),
+        None,
+    )?;
+    let (cs, es) = (cand.store(), engine.store());
+    d1::load(
+        &backup,
+        &dir.join("d1-source"),
+        &cs,
+        &Bodies::new(dir.join("d1").join("blobs")),
+    )?;
+    d1::load(
+        &backup,
+        &dir.join("engine-source"),
+        &es,
+        &Bodies::new(dir.join("engine").join("blobs")),
+    )?;
+    let set = relevance::RealSet::read(queries, vectors, &relevance::identity(&es)?, &fingerprint)?;
+    report.insert("dataset".into(), json!("d1"));
+    report.insert("backup_sha256".into(), json!(fingerprint));
+    report.insert("real_1563".into(), relevance::real(&set, &cs, &es)?);
+    Ok(report)
 }
 
 /// The candidate named `name`.
@@ -316,6 +431,33 @@ fn owned_run(dir: &Path) -> Result<()> {
     Err(format!("{} is not a store_bench run directory", dir.display()).into())
 }
 
+/// Refuse a real backup before anything is written: where the run root
+/// cannot be verified private, when `backup` is not a directory, or when
+/// it and `root` overlap (symlinks resolved).
+fn check_real_input(backup: &Path, root: &Path) -> Result<()> {
+    if !package::PRIVACY_VERIFIABLE {
+        return Err(
+            "real datasets need a run root verified private from creation, which this \
+             platform cannot check; run them on Unix"
+                .into(),
+        );
+    }
+    if !backup.is_dir() {
+        return Err(format!("backup {} is not a directory", backup.display()).into());
+    }
+    let backup = backup.canonicalize()?;
+    let root = resolved(root)?;
+    if backup.starts_with(&root) || root.starts_with(&backup) {
+        return Err(format!(
+            "the run root {} and the backup {} overlap",
+            root.display(),
+            backup.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// One run of `candidate` on `dataset` in a new directory under `root`;
 /// its report. The dataset and the environment are checked before the
 /// filesystem is touched.
@@ -333,26 +475,7 @@ pub fn measure(
             if mode == Mode::Open {
                 return Err("open mode is synthetic only; bench reports the cold open".into());
             }
-            if !package::PRIVACY_VERIFIABLE {
-                return Err(
-                    "real datasets need a run root verified private from creation, which this \
-                     platform cannot check; run D1 and D2 on Unix"
-                        .into(),
-                );
-            }
-            if !backup.is_dir() {
-                return Err(format!("backup {} is not a directory", backup.display()).into());
-            }
-            let backup = backup.canonicalize()?;
-            let root = resolved(root)?;
-            if backup.starts_with(&root) || root.starts_with(&backup) {
-                return Err(format!(
-                    "the run root {} and the backup {} overlap",
-                    root.display(),
-                    backup.display()
-                )
-                .into());
-            }
+            check_real_input(backup, root)?;
         }
     }
     refuse_model_config()?;
@@ -364,10 +487,6 @@ pub fn measure(
     report.insert("backend".into(), json!(candidate.name));
     report.insert("dataset".into(), json!(dataset.name()));
     report.insert("run_dir".into(), json!(dir));
-    report.insert(
-        "note".into(),
-        json!("not a scoring run: no crash or relevance workload yet"),
-    );
     match mode {
         Mode::Bench => workload(candidate, &dir, dataset, &mut report, isolation)?,
         Mode::Open => {
@@ -1710,7 +1829,13 @@ fn rss_mb() -> Option<f64> {
 
 /// A `/proc/self/status` field given in kB, in MB.
 fn status_mb(field: &str) -> Option<f64> {
-    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    proc_status_mb("self", field)
+}
+
+/// A `/proc/<process>/status` field given in kB, in MB; `process` is a
+/// pid or `self`.
+fn proc_status_mb(process: &str, field: &str) -> Option<f64> {
+    let status = std::fs::read_to_string(format!("/proc/{process}/status")).ok()?;
     let line = status.lines().find(|l| l.starts_with(field))?;
     let kb: f64 = line.split_whitespace().nth(1)?.parse().ok()?;
     Some((kb / 10.24).round() / 100.0)
@@ -1847,6 +1972,7 @@ mod tests {
             tables: |_| Err("unused".into()),
             restore: |_| Err("unused".into()),
             package: backup_package,
+            verify: |_| Err("unused".into()),
         };
         let error = measure(
             candidate,

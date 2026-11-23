@@ -27,6 +27,15 @@ fn attest(dir: &Path) -> Result<Box<dyn remind_me_core::db::backend::Backend>> {
     )?))
 }
 
+/// Attest's check on its closed log in `dir` (D56): the log's own verify.
+/// The candidate's next open then rebuilds the tables from it.
+fn verify_attest(dir: &Path) -> Result<serde_json::Value> {
+    use attest::store::file::{FileStore, StoreConfig};
+    use attest::Log;
+    let records = FileStore::open(dir, StoreConfig::default())?.verify()?;
+    Ok(serde_json::json!({ "check": "attest log verify", "records": records }))
+}
+
 fn main() -> Result<()> {
     harness::run(&[
         Candidate {
@@ -34,18 +43,21 @@ fn main() -> Result<()> {
             tables: attest,
             restore: attest,
             package: |_, store, dest| Ok(attest_store::package(store, dest)?),
+            verify: verify_attest,
         },
         Candidate {
             name: "engine",
             tables: |dir| Ok(Box::new(EngineTables::open(dir)?)),
             restore: |dir| Ok(Box::new(EngineTables::open(dir)?)),
             package: backup_package,
+            verify: harness::verify_engine,
         },
         Candidate {
             name: "sqlite",
             tables: |dir| Ok(Box::new(SqliteTables::open(dir)?)),
             restore: |dir| Ok(Box::new(SqliteTables::open(dir)?)),
             package: backup_package,
+            verify: harness::verify_sqlite,
         },
     ])
 }
