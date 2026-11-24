@@ -161,8 +161,9 @@ pub fn verdict_from_files(paths: &[String]) -> super::Result<Value> {
     let mut reports = Vec::new();
     for path in paths {
         let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
-        let report: Value =
+        let mut report: Value =
             serde_json::from_str(text.trim()).map_err(|e| format!("{path}: {e}"))?;
+        derive_crash_g4(&mut report);
         reports.push(report);
     }
     let backends: std::collections::BTreeSet<&str> = reports
@@ -175,6 +176,20 @@ pub fn verdict_from_files(paths: &[String]) -> super::Result<Value> {
     let mut v = verdict(&reports);
     v["backend"] = json!(backends.into_iter().next());
     Ok(v)
+}
+
+/// A crash report from before `g4` was recorded still has every round's
+/// peaks: build its `g4` from them, the same way `crash` does, and say so.
+fn derive_crash_g4(report: &mut Value) {
+    if report["mode"] != "crash" || !report["g4"].is_null() {
+        return;
+    }
+    let Some(rounds) = report["rounds"].as_array() else {
+        return;
+    };
+    let mut g4 = crash(rounds);
+    g4["derived_from_rounds"] = json!(true);
+    report["g4"] = g4;
 }
 
 /// One candidate's G4 under `RULE`, from its bench and crash reports.
@@ -344,6 +359,19 @@ mod tests {
             json!(["1 rounds without a reopen's restarted peak"])
         );
         assert_eq!(crash(&[])["scoring"], false);
+    }
+
+    #[test]
+    fn an_older_crash_report_gets_its_g4_from_its_rounds() {
+        let rounds = json!([{ "child_peak_mb": 300.0, "reopen_peak_mb": 700.0 }]);
+        let mut old = json!({ "mode": "crash", "rounds": rounds });
+        derive_crash_g4(&mut old);
+        assert_eq!(old["g4"]["scoring"], true, "{old}");
+        assert_eq!(old["g4"]["peak_mb"], 700.0);
+        assert_eq!(old["g4"]["derived_from_rounds"], true);
+        let mut bench = json!({ "mode": "bench" });
+        derive_crash_g4(&mut bench);
+        assert!(bench["g4"].is_null(), "only crash reports");
     }
 
     fn report(mode: &str, dataset: &str, scoring: bool, peak: f64) -> Value {
