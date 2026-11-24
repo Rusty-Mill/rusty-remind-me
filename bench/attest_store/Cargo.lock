@@ -44,6 +44,7 @@ dependencies = [
  "rusty_serde",
  "serde",
  "serde_json",
+ "sha256",
 ]
 
 [[package]]

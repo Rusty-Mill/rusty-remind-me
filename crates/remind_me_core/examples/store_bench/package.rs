@@ -127,9 +127,10 @@ impl Manifest {
             ),
         ];
         for (table, section, identity) in tables {
-            for row in testing::stored_rows(store, table)? {
+            testing::each_stored_row(store, table, |row| {
                 section.insert(identity_of(&row, identity), row_hash(&row));
-            }
+                Ok(())
+            })?;
         }
         for key in links {
             let hash = match blobs.get(&key)? {

@@ -124,6 +124,9 @@ fn memory_column_name(column: &str) -> Result<&str> {
 /// makes every helper refuse.
 ///
 /// Column names are checked before a call gets here.
+/// What [`TestRows::each_stored_row`] calls with each row.
+pub type RowVisitor<'a> = dyn FnMut(serde_json::Map<String, Value>) -> Result<()> + 'a;
+
 #[doc(hidden)]
 pub trait TestRows {
     /// See [`memory_column`].
@@ -146,8 +149,8 @@ pub trait TestRows {
     fn set_outbox_column(&mut self, id: i64, column: &str, value: &str) -> Result<usize>;
     /// See [`sends`].
     fn sends(&self) -> Result<Vec<(String, i64, String)>>;
-    /// See [`stored_rows`]; `table` is one [`stored_columns`] names.
-    fn stored_rows(&self, table: Table) -> Result<Vec<serde_json::Map<String, Value>>>;
+    /// See [`each_stored_row`]; `table` is one [`stored_columns`] names.
+    fn each_stored_row(&self, table: Table, f: &mut RowVisitor<'_>) -> Result<()>;
     /// See [`queue_outbox`].
     fn queue_outbox(
         &mut self,
@@ -303,12 +306,33 @@ pub fn set_outbox_column(store: &Store<'_>, id: i64, column: &str, value: &str) 
 /// [`StoreError::Invalid`] for a table [`stored_columns`] does not name,
 /// or the backend's error.
 pub fn stored_rows(store: &Store<'_>, table: Table) -> Result<Vec<serde_json::Map<String, Value>>> {
+    let mut found = Vec::new();
+    each_stored_row(store, table, |row| {
+        found.push(row);
+        Ok(())
+    })?;
+    Ok(found)
+}
+
+/// [`stored_rows`] one row at a time: `f` sees each row and none is kept,
+/// so a table too large to hold as JSON (a real store's chunk vectors,
+/// each blob an array of numbers) can still be read in full. Stops at the
+/// first error `f` returns.
+///
+/// # Errors
+///
+/// As [`stored_rows`], or the first error from `f`.
+pub fn each_stored_row(
+    store: &Store<'_>,
+    table: Table,
+    mut f: impl FnMut(serde_json::Map<String, Value>) -> Result<()>,
+) -> Result<()> {
     if stored_columns(table).is_none() {
         return Err(StoreError::Invalid(format!(
             "{table:?} rows are not read here"
         )));
     }
-    with_rows(store, |rows| rows.stored_rows(table))
+    with_rows(store, |rows| rows.each_stored_row(table, &mut f))
 }
 
 /// Every send marker as `(remote, outbox id, sent at)`, sorted.

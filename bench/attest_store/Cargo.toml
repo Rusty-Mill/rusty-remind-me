@@ -14,6 +14,7 @@ publish = false
 remind_me_core = { path = "../../crates/remind_me_core" }
 attest = { git = "https://github.com/Rusty-Mill/rusty_attest", rev = "1711d0c76925a6e1858157cdc2b9d9c4c7526a05" }
 rusty_serde = { git = "https://github.com/Rusty-Mill/rusty_mill", tag = "libs-2026.11.0" }
+sha256 = "1.6.0"
 
 [dev-dependencies]
 # For R3's relevance mode, which includes the #59 eval's shared code; both
