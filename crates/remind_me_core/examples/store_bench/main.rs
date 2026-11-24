@@ -339,12 +339,21 @@ mod tests {
                 "real adds timed"
             );
             assert!(report["cold_open"]["child"]["first_query_ms"].is_number());
-            // G4's peak restarts after the fill (it covers workloads 1 to 7).
+            // G4's parent peak restarts after the fill; in process there is
+            // no cold-open child, so the evidence is present but not scoring.
             #[cfg(target_os = "linux")]
             {
+                let g4 = &report["g4"];
                 assert!(report["fill_peak_rss_mb"].is_number(), "{}", candidate.name);
-                assert_eq!(report["peak_rss_scope"]["from"], "workloads");
-                assert!(report["peak_rss_mb"].is_number(), "{}", candidate.name);
+                assert_eq!(report["peak_restart"]["restarted"], true);
+                assert!(g4["parent_since_fill_mb"].is_number(), "{g4}");
+                assert_eq!(g4["scoring"], false, "{g4}");
+                assert_eq!(
+                    g4["missing"],
+                    serde_json::json!(["the cold-open child's peak (workload 6)"])
+                );
+                let process = report["peak_rss_mb"].as_f64().unwrap();
+                assert!(process >= report["fill_peak_rss_mb"].as_f64().unwrap());
             }
         }
         assert!(backup.is_dir(), "the backup itself is left alone");
