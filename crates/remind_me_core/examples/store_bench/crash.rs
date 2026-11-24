@@ -71,8 +71,8 @@ use std::time::{Duration, Instant};
 
 use super::bodies::PAGE_LINK;
 use super::{
-    check_real_input, d1, find, fresh_run_dir, max_mb, millis, owned_run, peak_rss_mb,
-    proc_status_mb, refuse_model_config, Bodies, Candidate, Corpus, Result, Rng,
+    check_real_input, d1, find, fresh_run_dir, g4, millis, owned_run, peak_rss_mb, proc_status_mb,
+    refuse_model_config, Bodies, Candidate, Corpus, Result, Rng,
 };
 
 /// Kills in each stream (D57).
@@ -284,10 +284,10 @@ pub fn run(
         Ok(json!({ "check": value, "failures": failed }))
     };
     let last = finished();
-    let max = |key: &str| max_mb(rounds.iter().map(|r| r[key].as_f64()));
+    let max = |key: &str| g4::max_mb(rounds.iter().map(|r| r[key].as_f64()));
     report.insert("child_peak_max_mb".into(), json!(max("child_peak_mb")));
     report.insert("reopen_peak_max_mb".into(), json!(max("reopen_peak_mb")));
-    report.insert("g4".into(), g4_crash(&rounds));
+    report.insert("g4".into(), g4::crash(&rounds));
     report.insert("memories_tracked".into(), json!(model.memories.len()));
     report.insert("pages_tracked".into(), json!(model.pages.len()));
     report.insert("orphan_blobs".into(), json!(model.orphan_blobs));
@@ -312,34 +312,6 @@ pub fn run(
     // The parent's whole peak, D1's load included: reported, never G4.
     report.insert("peak_rss_mb".into(), json!(peak_rss_mb()));
     Ok(report)
-}
-
-/// Workload 7's G4 evidence: each killed child's peak up to its kill and
-/// each reopen-and-check's (its peak restarted first). It scores only when
-/// every round has both; `missing` counts the rounds that lack one.
-fn g4_crash(rounds: &[Value]) -> Value {
-    let lacking = |key: &str| rounds.iter().filter(|r| r[key].as_f64().is_none()).count();
-    let mut missing = Vec::new();
-    for (key, what) in [
-        ("child_peak_mb", "a killed child's peak"),
-        ("reopen_peak_mb", "a reopen's restarted peak"),
-    ] {
-        let n = lacking(key);
-        if n > 0 {
-            missing.push(format!("{n} rounds without {what}"));
-        }
-    }
-    if rounds.is_empty() {
-        missing.push("no rounds".into());
-    }
-    let max = |key: &str| max_mb(rounds.iter().map(|r| r[key].as_f64()));
-    json!({
-        "scoring": missing.is_empty(),
-        "peak_mb": max_mb([max("child_peak_mb"), max("reopen_peak_mb")]),
-        "covers": "workload 7: each killed child up to its kill, each reopen and check",
-        "conditions": ["each reopen's peak restarted first (clear_refs)"],
-        "missing": missing,
-    })
 }
 
 /// Per stream, where its kills fell: between writes, inside a write
@@ -1158,25 +1130,6 @@ pub fn verify_engine(dir: &Path) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn crash_g4_scores_only_when_every_round_has_both_peaks() {
-        let full = [
-            json!({ "child_peak_mb": 300.0, "reopen_peak_mb": 700.0 }),
-            json!({ "child_peak_mb": 800.0, "reopen_peak_mb": 600.0 }),
-        ];
-        let g4 = g4_crash(&full);
-        assert_eq!(g4["scoring"], true, "{g4}");
-        assert_eq!(g4["peak_mb"], 800.0);
-        let gap = [full[0].clone(), json!({ "child_peak_mb": 800.0 })];
-        let g4 = g4_crash(&gap);
-        assert_eq!(g4["scoring"], false);
-        assert_eq!(
-            g4["missing"],
-            json!(["1 rounds without a reopen's restarted peak"])
-        );
-        assert_eq!(g4_crash(&[])["scoring"], false);
-    }
 
     fn bodies(name: &str) -> (std::path::PathBuf, Bodies) {
         let dir =

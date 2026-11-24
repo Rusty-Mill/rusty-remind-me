@@ -339,15 +339,27 @@ mod tests {
                 "real adds timed"
             );
             assert!(report["cold_open"]["child"]["first_query_ms"].is_number());
-            // G4's parent peak restarts after the fill; in process there is
-            // no cold-open child, so the evidence is present but not scoring.
+            // G4's parent samples skip the fill and the readers; in process
+            // there is no cold-open child, so the evidence does not score.
             #[cfg(target_os = "linux")]
             {
                 let g4 = &report["g4"];
                 assert!(report["fill_peak_rss_mb"].is_number(), "{}", candidate.name);
-                assert_eq!(report["peak_restart"]["restarted"], true);
-                assert!(g4["parent_since_fill_mb"].is_number(), "{g4}");
+                let restarts = report["peak_restarts"].as_array().unwrap();
+                assert_eq!(restarts.len(), 2, "after the fill and before the deletes");
+                assert!(restarts.iter().all(|r| r["restarted"] == true));
+                for key in [
+                    "workloads_1_to_5",
+                    "concurrency",
+                    "deletes",
+                    "after_deletes",
+                ] {
+                    assert!(report["parent_peaks"][key].is_number(), "{key}");
+                }
+                assert!(g4["parent_workloads_1_to_5_mb"].is_number(), "{g4}");
+                assert!(g4["parent_deletes_mb"].is_number(), "{g4}");
                 assert_eq!(g4["scoring"], false, "{g4}");
+                assert_eq!(g4["peak_mb"], serde_json::Value::Null);
                 assert_eq!(
                     g4["missing"],
                     serde_json::json!(["the cold-open child's peak (workload 6)"])

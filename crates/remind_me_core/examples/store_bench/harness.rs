@@ -98,6 +98,7 @@ pub mod crash;
 mod d1;
 pub mod fingerprint;
 mod g1;
+pub mod g4;
 mod package;
 mod relevance;
 
@@ -271,6 +272,13 @@ pub fn run(candidates: &[Candidate]) -> Result<()> {
             let dir = Path::new(dir);
             owned_run(dir)?;
             return cold::cold_child(candidate, dir);
+        }
+    }
+    // G4's verdict for one candidate: `g4 <report.json>...` (`g4::RULE`).
+    if let [mode, files @ ..] = args.as_slice() {
+        if mode == "g4" && !files.is_empty() {
+            println!("{}", g4::verdict_from_files(files)?);
+            return Ok(());
         }
     }
     // G6 (D56, D57): `crash <backend> d1:<backup> <dir>`, and its child
@@ -497,67 +505,16 @@ pub fn measure(
         }
     }
     report.insert("disk_mb".into(), disk(&dir)?);
-    let parent = peak_rss_mb();
     if mode == Mode::Bench {
-        let g4 = g4_bench(&report, parent);
+        // The parent since the last restart: the G1 checks, the reopen and
+        // the backup's side of workload 9 (not G4).
+        g4::note_peak(&mut report, "after_deletes");
+        let g4 = g4::bench(&report);
         report.insert("g4".into(), g4);
     }
     // The whole process's peak, fill included: reported, never G4.
-    let fill = report.get("fill_peak_rss_mb").and_then(Value::as_f64);
-    report.insert("peak_rss_mb".into(), json!(max_mb([fill, parent])));
+    report.insert("peak_rss_mb".into(), json!(g4::process_peak(&report)));
     Ok(report)
-}
-
-/// The larger of the values present; `None` when none is.
-pub fn max_mb(values: impl IntoIterator<Item = Option<f64>>) -> Option<f64> {
-    values
-        .into_iter()
-        .flatten()
-        .fold(None, |m: Option<f64>, v| Some(m.map_or(v, |m| m.max(v))))
-}
-
-/// A bench run's G4 evidence: the parent's peak since the fill (workloads
-/// 1 to 5, and 8 and the backup's side of 9, which can only overstate it)
-/// and every cold-open child's (workload 6). Workload 7 is the crash
-/// report's own `g4`. It scores only when the parent's peak was restarted
-/// and both peaks are present; otherwise `missing` says what is not.
-fn g4_bench(report: &Map<String, Value>, parent: Option<f64>) -> Value {
-    let restart = report.get("peak_restart").unwrap_or(&Value::Null);
-    let restarted = restart["restarted"].as_bool() == Some(true);
-    let parent = parent.filter(|_| restarted);
-    // Every cold open's child: D1's, and on D3 the one after the ingest.
-    let child = |key: &str| report.get(key).map(|c| c["idle"]["rss_peak_mb"].as_f64());
-    let opens: Vec<Option<f64>> = ["cold_open", "cold_open_after_ingest"]
-        .into_iter()
-        .filter_map(child)
-        .collect();
-    let cold = if opens.iter().all(Option::is_some) {
-        max_mb(opens)
-    } else {
-        None
-    };
-    let mut missing = Vec::new();
-    if !restarted {
-        missing.push("the parent's peak was not restarted after the fill");
-    } else if parent.is_none() {
-        missing.push("the parent's peak (workloads 1 to 5)");
-    }
-    if cold.is_none() {
-        missing.push("the cold-open child's peak (workload 6)");
-    }
-    let mut conditions = vec!["the parent's peak restarted after the fill (clear_refs)"];
-    if restart["heap_trimmed"].as_bool() == Some(true) {
-        conditions.push("the parent's free heap returned to the OS first (glibc malloc_trim)");
-    }
-    json!({
-        "scoring": missing.is_empty(),
-        "peak_mb": max_mb([parent, cold]),
-        "parent_since_fill_mb": parent,
-        "cold_open_child_mb": cold,
-        "covers": "workloads 1 to 6; the parent also runs 8 and the backup's side of 9, so its peak can only overstate; workload 7 is the crash report's g4",
-        "conditions": conditions,
-        "missing": missing,
-    })
 }
 
 /// The run's disk use, in MB (D53): the store, the candidate's temporary
@@ -775,9 +732,9 @@ fn workload(
     // G4 is the peak over workloads 1 to 7, not over the fill, which holds
     // a second store (D1's source copy) and a row-by-row parity check.
     // Keep the fill's peak, then restart the parent's peak from here; the
-    // report's `g4` (see `g4_bench`) says what that covers.
+    // report's `g4` (`g4::bench`) says what each sample covers.
     report.insert("fill_peak_rss_mb".into(), json!(peak_rss_mb()));
-    report.insert("peak_restart".into(), restart_peak());
+    g4::restart(report);
     let real = !matches!(dataset, Dataset::Synthetic(_));
     let n = ids.len();
     report.insert("memories".into(), json!(n));
@@ -928,6 +885,8 @@ fn workload(
         // `grow` does, so the inherited embedding identity is kept.
         report.insert("add".into(), timed(|_| add_one(&store, &mut rng))?);
     }
+    // Workloads 1 to 5 end here; 8 (the readers) is not G4's.
+    g4::note_peak(report, "workloads_1_to_5");
     report.insert(
         "search_hybrid_readers_idle".into(),
         readers(&db, &store, &queries_, &vectors_, None, None)?,
@@ -941,6 +900,10 @@ fn workload(
     remind_me_core::stats::collect(&store)?;
     report.insert("stats_ms".into(), json!(millis(t.elapsed())));
 
+    // The readers' peak (workload 8) is kept but not G4's; restart for
+    // the deletes (workload 4).
+    g4::note_peak(report, "concurrency");
+    g4::restart(report);
     // Distinct live rows, each deleted once; a delete that finds nothing is
     // an error, not a fast sample.
     let mut times = Vec::new();
@@ -958,6 +921,7 @@ fn workload(
         summary(times)
     };
     report.insert("delete".into(), delete);
+    g4::note_peak(report, "deletes");
 
     // G1's checks beyond the port suites, on this candidate.
     let rewrite = match &dialog {
@@ -1883,42 +1847,12 @@ fn dir_size(dir: &Path) -> Result<u64> {
 }
 
 /// The process's peak resident memory, from Linux's `VmHWM`; null elsewhere.
-fn peak_rss_mb() -> Option<f64> {
+pub fn peak_rss_mb() -> Option<f64> {
     status_mb("VmHWM:")
 }
 
-/// Hand freed heap back to the OS, then restart the process's peak
-/// (`VmHWM`) from its resident memory now. Says whether each happened,
-/// and the resident memory the peak restarted from.
-fn restart_peak() -> Value {
-    let heap_trimmed = trim_heap();
-    // Writing 5 resets VmHWM to the current resident size (Linux only).
-    let restarted = std::fs::write("/proc/self/clear_refs", "5").is_ok();
-    json!({ "restarted": restarted, "heap_trimmed": heap_trimmed, "rss_mb": rss_mb() })
-}
-
-/// Return the allocator's free pages to the OS, so memory the fill freed
-/// does not count as the workloads' (glibc keeps it otherwise).
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
-fn trim_heap() -> bool {
-    extern "C" {
-        fn malloc_trim(pad: usize) -> std::os::raw::c_int;
-    }
-    // SAFETY: glibc's malloc_trim takes no pointers and only releases
-    // pages the allocator already holds free.
-    unsafe {
-        malloc_trim(0);
-    }
-    true
-}
-
-#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-fn trim_heap() -> bool {
-    false
-}
-
 /// The process's resident memory now, from Linux's `VmRSS`; null elsewhere.
-fn rss_mb() -> Option<f64> {
+pub fn rss_mb() -> Option<f64> {
     status_mb("VmRSS:")
 }
 
@@ -1941,53 +1875,6 @@ mod tests {
     use super::*;
     use remind_me_core::db::sqlite::SqliteTables;
     use std::sync::mpsc;
-
-    fn bench_report(restarted: bool, cold: &[Option<f64>]) -> Map<String, Value> {
-        let mut r = Map::new();
-        r.insert(
-            "peak_restart".into(),
-            json!({ "restarted": restarted, "heap_trimmed": true, "rss_mb": 100.0 }),
-        );
-        for (key, peak) in ["cold_open", "cold_open_after_ingest"].iter().zip(cold) {
-            r.insert((*key).into(), json!({ "idle": { "rss_peak_mb": peak } }));
-        }
-        r
-    }
-
-    #[test]
-    fn g4_scores_the_larger_of_the_parent_and_every_cold_child() {
-        let g4 = g4_bench(
-            &bench_report(true, &[Some(900.0), Some(1_300.0)]),
-            Some(1_200.0),
-        );
-        assert_eq!(g4["scoring"], true, "{g4}");
-        assert_eq!(g4["peak_mb"], 1_300.0);
-        assert_eq!(g4["cold_open_child_mb"], 1_300.0);
-        assert_eq!(g4["missing"], json!([]));
-        assert_eq!(
-            g4["conditions"].as_array().unwrap().len(),
-            2,
-            "trim is labelled"
-        );
-    }
-
-    #[test]
-    fn g4_does_not_score_without_a_restart_or_a_child_peak() {
-        let g4 = g4_bench(&bench_report(false, &[Some(900.0)]), Some(2_000.0));
-        assert_eq!(g4["scoring"], false);
-        assert_eq!(
-            g4["parent_since_fill_mb"],
-            Value::Null,
-            "an unscoped peak is not used"
-        );
-        let g4 = g4_bench(&bench_report(true, &[Some(900.0), None]), Some(1_000.0));
-        assert_eq!(g4["scoring"], false);
-        assert_eq!(g4["cold_open_child_mb"], Value::Null);
-        assert_eq!(
-            g4["missing"],
-            json!(["the cold-open child's peak (workload 6)"])
-        );
-    }
 
     /// A writer whose first write fails ends the run with its error, in
     /// bounded time, instead of leaving the readers at the barrier.
