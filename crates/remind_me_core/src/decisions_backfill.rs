@@ -40,6 +40,19 @@ fn d_refs(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// Whether the word before a ref is a link keyword (`Supersedes D1: ...`,
+/// `confirms D7 (...)`), read as [`links`] reads it: the ref is a link's
+/// target, never the content defining it.
+fn follows_link_keyword(before: &[&str]) -> bool {
+    before.last().is_some_and(|word| {
+        let keyword = word
+            .trim_start_matches(QUOTES)
+            .trim_start_matches('(')
+            .to_ascii_lowercase();
+        matches!(keyword.as_str(), "supersedes" | "confirms")
+    })
+}
+
 /// The ref a memory's content opens by defining: `D22: ...`, `D22 [stated]`,
 /// `D22 (...)`, or the same after a project of up to three words. `None` when the
 /// content only mentions a ref later on.
@@ -55,7 +68,7 @@ fn defined_ref(content: &str) -> Option<(Option<String>, String)> {
             || words
                 .get(i + 1)
                 .is_some_and(|next| next.starts_with(['[', '(']) || *next == "—" || *next == "-");
-        if !marked {
+        if !marked || follows_link_keyword(&words[..i]) {
             return None;
         }
         let project = (i > 0).then(|| words[..i].join(" "));
@@ -1884,6 +1897,8 @@ mod tests {
         );
         assert_eq!(defined_ref("We followed D50 here"), None);
         assert_eq!(defined_ref("Per D50, nothing"), None);
+        assert_eq!(defined_ref("Supersedes D1: New policy"), None);
+        assert_eq!(defined_ref("Confirms D7 (still holds)"), None);
     }
 
     #[test]

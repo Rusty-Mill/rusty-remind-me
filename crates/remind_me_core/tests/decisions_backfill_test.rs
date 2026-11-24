@@ -1292,3 +1292,50 @@ fn apply_retires_a_target_named_twice_by_one_entry_once() {
         assert_eq!(older.superseded_by.as_deref(), Some(newer.id.as_str()));
     }
 }
+
+const LINK_FIRST: &str = "\
+| # | Decision | Why |
+|---|---|---|
+| D1 | Old policy | x |
+| D2 | Supersedes D1: New policy | y |
+";
+const LINK_THIRD: &str = "| D3 | Supersedes D2. Newer policy | z |\n";
+
+/// D1 and D2 retired, D3 live: `Supersedes D1:` opening D2 was read as a
+/// link, never as D2 defining D1.
+fn assert_chain_retired(store: &remind_me_core::db::Store<'_>) {
+    let live = Memories::new(store).all_live().unwrap();
+    let retired = |r: &str| {
+        live.iter()
+            .find(|m| m.metadata["decision_ref"] == r)
+            .map(|m| m.superseded_by.is_some())
+            .expect(r)
+    };
+    assert!(retired("D1") && retired("D2"), "D1 and D2 are retired");
+    assert!(!retired("D3"), "D3 is live");
+}
+
+#[test]
+fn a_link_clause_opening_an_entry_is_not_its_identity_in_one_import() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let log = parse_log(&format!("{LINK_FIRST}{LINK_THIRD}"));
+    let applied = apply_import(&store, &log, "rusty-remind-me", "d.md").unwrap();
+    assert_eq!(added_refs(&applied), ["D1", "D2", "D3"]);
+    assert_eq!(applied.linked.len(), 2);
+    assert!(applied.unlinked.is_empty(), "{:?}", applied.unlinked);
+    assert_chain_retired(&store);
+}
+
+#[test]
+fn a_link_clause_opening_an_entry_is_not_its_identity_across_two_imports() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    apply_import(&store, &parse_log(LINK_FIRST), "rusty-remind-me", "d.md").unwrap();
+    let log = parse_log(&format!("{LINK_FIRST}{LINK_THIRD}"));
+    let applied = apply_import(&store, &log, "rusty-remind-me", "d.md").unwrap();
+    assert_eq!(added_refs(&applied), ["D3"]);
+    assert_eq!(applied.linked.len(), 1, "D3 -> D2 is linked");
+    assert!(applied.unlinked.is_empty(), "{:?}", applied.unlinked);
+    assert_chain_retired(&store);
+}
