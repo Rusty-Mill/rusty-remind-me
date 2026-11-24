@@ -33,7 +33,7 @@ use remind_me_core::db::entities::{Entities, RelationRow};
 use remind_me_core::db::memories::{Memories, NewMemory};
 use remind_me_core::db::references::{NewReference, References};
 use remind_me_core::db::vectors::Vectors;
-use remind_me_core::db::Store;
+use remind_me_core::db::{Store, StoreError};
 use remind_me_core::models::Memory;
 use remind_me_core::testing::{self, Table};
 use remind_me_core::Database;
@@ -132,10 +132,11 @@ fn parity(source: &Store<'_>, target: &Store<'_>, bodies: &Bodies) -> Result<Val
         Table::VecChunks,
     ] {
         let rows = |store: &Store<'_>| -> Result<Vec<String>> {
-            let mut hashes: Vec<String> = testing::stored_rows(store, table)?
-                .iter()
-                .map(row_hash)
-                .collect();
+            let mut hashes: Vec<String> = Vec::new();
+            testing::each_stored_row(store, table, |row| {
+                hashes.push(row_hash(&row));
+                Ok(())
+            })?;
             hashes.sort();
             Ok(hashes)
         };
@@ -204,12 +205,15 @@ fn copy_rows(source: &Store<'_>, target: &Store<'_>, bodies: &Bodies) -> Result<
     }
     count("memories", all.len());
 
-    let chunks = testing::stored_rows(source, Table::VecChunks)?;
-    for chunk in &chunks {
-        let ix = usize::try_from(chunk["chunk_ix"].as_u64().ok_or("chunk_ix")?)?;
-        Vectors::new(target).put(text(chunk, "memory_id")?, ix, &bytes(chunk)?)?;
-    }
-    count("vectors", chunks.len());
+    // One row at a time: as JSON each 4 KB vector is ~128 KB, so the real
+    // store's chunks held at once overran remindme's 4 GB (#1618).
+    let mut chunks = 0;
+    testing::each_stored_row(source, Table::VecChunks, |chunk| {
+        put_chunk(target, &chunk).map_err(|e| StoreError::Invalid(e.to_string()))?;
+        chunks += 1;
+        Ok(())
+    })?;
+    count("vectors", chunks);
     for (key, value) in Vectors::new(source).meta()? {
         Vectors::new(target).set_meta(&key, &value, &newest)?;
     }
@@ -399,6 +403,13 @@ fn text<'r>(row: &'r Map<String, Value>, column: &str) -> Result<&'r str> {
     row.get(column)
         .and_then(Value::as_str)
         .ok_or_else(|| format!("stored row has no text {column}").into())
+}
+
+/// Write one stored chunk row into `target` through its port.
+fn put_chunk(target: &Store<'_>, chunk: &Map<String, Value>) -> Result<()> {
+    let ix = usize::try_from(chunk["chunk_ix"].as_u64().ok_or("chunk_ix")?)?;
+    Vectors::new(target).put(text(chunk, "memory_id")?, ix, &bytes(chunk)?)?;
+    Ok(())
 }
 
 fn bytes(row: &Map<String, Value>) -> Result<Vec<u8>> {

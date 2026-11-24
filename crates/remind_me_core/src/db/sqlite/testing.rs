@@ -2,10 +2,10 @@
 //! `crate::testing`'s helpers stand for.
 
 use super::memories::{replace, stored};
-use super::{all, SqliteTables};
+use super::{all, sqlite_error, SqliteTables};
 use crate::db::engine::testing::{columns, with_column};
 use crate::db::{Result, StoreError};
-use crate::testing::{stored_columns, OutboxRow, Table, TestRows};
+use crate::testing::{stored_columns, OutboxRow, RowVisitor, Table, TestRows};
 use rusqlite::params;
 use rusqlite::types::ValueRef;
 use serde_json::Value;
@@ -134,17 +134,22 @@ impl TestRows for SqliteTables {
         )
     }
 
-    fn stored_rows(&self, table: Table) -> Result<Vec<serde_json::Map<String, Value>>> {
+    fn each_stored_row(&self, table: Table, f: &mut RowVisitor<'_>) -> Result<()> {
         let names = stored_columns(table)
             .ok_or_else(|| StoreError::Invalid(format!("{table:?} rows are not read here")))?;
         let sql = format!("SELECT {} FROM {}", names.join(", "), table_name(table));
-        self.all(&sql, [], |r| {
-            names
+        let mut stmt = self.conn.prepare(&sql).map_err(sqlite_error)?;
+        let mut rows = stmt.query([]).map_err(sqlite_error)?;
+        while let Some(r) = rows.next().map_err(sqlite_error)? {
+            let row = names
                 .iter()
                 .enumerate()
                 .map(|(ix, name)| Ok((name.to_string(), json_of(r.get_ref(ix)?))))
-                .collect()
-        })
+                .collect::<rusqlite::Result<_>>()
+                .map_err(sqlite_error)?;
+            f(row)?;
+        }
+        Ok(())
     }
 
     fn queue_outbox(
