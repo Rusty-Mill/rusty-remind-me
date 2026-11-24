@@ -1261,3 +1261,34 @@ fn apply_writes_nothing_for_a_row_with_a_plain_and_an_ambiguous_link() {
     assert_eq!(live.len(), 1);
     assert!(live[0].superseded_by.is_none(), "D1 is not retired");
 }
+
+#[test]
+fn apply_retires_a_target_named_twice_by_one_entry_once() {
+    let same_sentence = "\
+| # | Decision | Why |
+|---|---|---|
+| D1 | Old policy | x |
+| D2 | Supersedes D1. New policy supersedes D1. | y |
+";
+    let title_and_body = "\
+| # | Decision | Why |
+|---|---|---|
+| D1 | Old policy | x |
+
+## D2. Supersedes D1.
+
+**Decision.** This supersedes D1.
+**Why.** y
+";
+    for text in [same_sentence, title_and_body] {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        let applied = apply_import(&store, &parse_log(text), "rusty-remind-me", "d.md").unwrap();
+        assert!(applied.failed.is_empty(), "{:?}", applied.failed);
+        assert_eq!(added_refs(&applied), ["D1", "D2"]);
+        assert_eq!(applied.linked.len(), 1, "the link is reported once");
+        let older = added_memory(&store, &applied, "D1");
+        let newer = added_memory(&store, &applied, "D2");
+        assert_eq!(older.superseded_by.as_deref(), Some(newer.id.as_str()));
+    }
+}

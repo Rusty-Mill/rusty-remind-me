@@ -1432,17 +1432,10 @@ fn apply_plan(
         return applied;
     };
     for row in order {
-        let links: Vec<SupersedesRow> = plan
-            .supersedes
-            .iter()
-            .filter(|l| l.decision_ref == row.decision_ref)
-            .cloned()
-            .collect();
-        let confirms: Vec<String> = plan
-            .confirms
-            .iter()
-            .filter(|l| l.decision_ref == row.decision_ref)
-            .map(|l| l.supersedes.clone())
+        let links = links_of(&plan.supersedes, &row.decision_ref);
+        let confirms: Vec<String> = links_of(&plan.confirms, &row.decision_ref)
+            .into_iter()
+            .map(|l| l.supersedes)
             .collect();
         let written = store.atomically(|s| write_row(s, &batch, row, &links, confirms, write));
         let noted = |note: String| ImportRow {
@@ -1473,6 +1466,19 @@ fn apply_plan(
     }
     applied.plan = plan;
     applied
+}
+
+/// The links `reference` states, each target once: an entry may name the
+/// same target twice (in its title and its body), and retiring a target
+/// twice would refuse the second and roll the row back.
+fn links_of(links: &[SupersedesRow], reference: &str) -> Vec<SupersedesRow> {
+    let mut seen = HashSet::new();
+    links
+        .iter()
+        .filter(|l| l.decision_ref == reference)
+        .filter(|l| seen.insert(l.supersedes.clone()))
+        .cloned()
+        .collect()
 }
 
 /// `rows` in file order, except that a row comes after every row of the
@@ -1602,7 +1608,11 @@ fn link_targets(
     let mut unlinked = Vec::new();
     for link in links {
         match live.get(&link.supersedes).map(Vec::as_slice) {
-            Some([one]) if identity_agrees(one) => targets.push(one.id.clone()),
+            Some([one]) if identity_agrees(one) => {
+                if !targets.contains(&one.id) {
+                    targets.push(one.id.clone());
+                }
+            }
             _ => unlinked.push(link.clone()),
         }
     }
