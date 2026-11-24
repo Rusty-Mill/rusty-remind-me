@@ -713,6 +713,11 @@ fn workload(
         let db = candidate.open(dir)?;
         seed(&db, dataset, dir, &bodies, &corpus, &mut rng, report)?
     };
+    // G4 is the peak over workloads 1 to 7, not over the fill, which holds
+    // a second store (D1's source copy) and a row-by-row parity check.
+    // Keep the fill's peak, then restart the peak from here.
+    report.insert("fill_peak_rss_mb".into(), json!(peak_rss_mb()));
+    report.insert("peak_rss_scope".into(), json!(restart_peak()));
     let real = !matches!(dataset, Dataset::Synthetic(_));
     let n = ids.len();
     report.insert("memories".into(), json!(n));
@@ -1821,6 +1826,36 @@ fn dir_size(dir: &Path) -> Result<u64> {
 fn peak_rss_mb() -> Option<f64> {
     status_mb("VmHWM:")
 }
+
+/// Hand freed heap back to the OS, then restart the process's peak
+/// (`VmHWM`) from its resident memory now; what the report's later
+/// `peak_rss_mb` covers: `{"from": "workloads", "rss_mb": ..}` once
+/// restarted, `"process"` where Linux's `clear_refs` is unavailable.
+fn restart_peak() -> Value {
+    trim_heap();
+    // Writing 5 resets VmHWM to the current resident size.
+    if std::fs::write("/proc/self/clear_refs", "5").is_err() {
+        return json!("process");
+    }
+    json!({ "from": "workloads", "rss_mb": rss_mb() })
+}
+
+/// Return the allocator's free pages to the OS, so memory the fill freed
+/// does not count as the workloads' (glibc keeps it otherwise).
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn trim_heap() {
+    extern "C" {
+        fn malloc_trim(pad: usize) -> std::os::raw::c_int;
+    }
+    // SAFETY: glibc's malloc_trim takes no pointers and only releases
+    // pages the allocator already holds free.
+    unsafe {
+        malloc_trim(0);
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn trim_heap() {}
 
 /// The process's resident memory now, from Linux's `VmRSS`; null elsewhere.
 fn rss_mb() -> Option<f64> {
