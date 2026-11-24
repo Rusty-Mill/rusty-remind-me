@@ -132,3 +132,11 @@ On BaileyAi: `/home/baileyrd/r3/reports` (one JSON line per command, its
 stderr log and the run log `summary.txt`), `/home/baileyrd/r3/runs` (run
 directories) and `/home/baileyrd/r3/vectors.jsonl`. Attempt 1 is kept
 beside them as `reports-attempt-1` and `runs-attempt-1`.
+
+## Decision
+
+Nano picked SQLite ("SQLite it is", 2026-11-24), recorded as D69 in
+`docs/handoff/DECISIONS.md`. He picked it although the § Choosing rule
+names no winner: the G4 miss is waived by his pick, not re-measured.
+The pick does not approve migrating the live store; that is R4, a separate
+decision and card.
