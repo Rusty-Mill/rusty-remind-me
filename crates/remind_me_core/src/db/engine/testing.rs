@@ -6,7 +6,7 @@ use super::{core_ref, engine_id, EngineTables};
 #[cfg(test)]
 use crate::db::backend::BackendGuard;
 use crate::db::{Result, StoreError};
-use crate::testing::{stored_columns, OutboxRow, Table, TestRows};
+use crate::testing::{stored_columns, OutboxRow, RowVisitor, Table, TestRows};
 use rusty_multimodal_db_engine::generic::query::{AllIds, GetById};
 use rusty_multimodal_db_engine::generic::traits::Record;
 use serde_json::Value;
@@ -170,29 +170,24 @@ impl TestRows for EngineTables {
         super::outbox::send_markers(self)
     }
 
-    fn stored_rows(&self, table: Table) -> Result<Vec<serde_json::Map<String, Value>>> {
+    fn each_stored_row(&self, table: Table, f: &mut RowVisitor<'_>) -> Result<()> {
         let core: &CoreTables = core_ref(self)?;
-        let records = match table {
-            Table::Entities => every(&core.entities)?,
-            Table::MemoryEntities => every(&core.links)?,
-            Table::EntityRelations => every(&core.relations)?,
-            Table::VecChunks => every(&core.chunks)?,
-            other => {
-                return Err(StoreError::Invalid(format!(
-                    "{other:?} rows are not read here"
-                )))
-            }
-        };
         let names = stored_columns(table).unwrap_or(&[]);
         // Keep the stored columns only: `engine_id` and `slot` are the
         // engine's own bookkeeping, not row content.
-        Ok(records
-            .into_iter()
-            .map(|mut record| {
-                record.retain(|k, _| names.contains(&k.as_str()));
-                record
-            })
-            .collect())
+        let mut keep = |mut record: serde_json::Map<String, Value>| {
+            record.retain(|k, _| names.contains(&k.as_str()));
+            f(record)
+        };
+        match table {
+            Table::Entities => each(&core.entities, &mut keep),
+            Table::MemoryEntities => each(&core.links, &mut keep),
+            Table::EntityRelations => each(&core.relations, &mut keep),
+            Table::VecChunks => each(&core.chunks, &mut keep),
+            other => Err(StoreError::Invalid(format!(
+                "{other:?} rows are not read here"
+            ))),
+        }
     }
 
     fn queue_outbox(
@@ -206,20 +201,22 @@ impl TestRows for EngineTables {
     }
 }
 
-/// Every record in `table`, each as a JSON object of its fields.
-fn every<R, T>(table: &T) -> Result<Vec<serde_json::Map<String, Value>>>
+/// Call `f` with every record in `table`, each as a JSON object of its
+/// fields, one at a time.
+fn each<R, T>(
+    table: &T,
+    f: &mut dyn FnMut(serde_json::Map<String, Value>) -> Result<()>,
+) -> Result<()>
 where
     R: Record + serde::Serialize,
     T: AllIds<R> + GetById<R>,
 {
-    table
-        .all_ids()
-        .into_iter()
-        .filter_map(|id| table.get(id))
-        .map(|record| match serde_json::to_value(record) {
-            Ok(Value::Object(map)) => Ok(map),
-            Ok(_) => Err(StoreError::Engine("a record is not an object".into())),
-            Err(e) => Err(super::engine_error(e)),
-        })
-        .collect()
+    for record in table.all_ids().into_iter().filter_map(|id| table.get(id)) {
+        match serde_json::to_value(record) {
+            Ok(Value::Object(map)) => f(map)?,
+            Ok(_) => return Err(StoreError::Engine("a record is not an object".into())),
+            Err(e) => return Err(super::engine_error(e)),
+        }
+    }
+    Ok(())
 }

@@ -492,7 +492,7 @@ pub struct Renamed {
     pub to: String,
 }
 
-/// How a log's refs are read, chosen per log (pack D64, D65).
+/// How a log's refs are read, chosen per log (pack D69, D70).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RefOptions {
     /// Put before every ref and every ref a link names, after a space:
@@ -1612,7 +1612,7 @@ fn link_targets(
 /// `row` as a decision of the batch's project, ready to write. Its text is
 /// the entry's statement, so a re-plan reads it as unchanged; the ref, why,
 /// date, tag and where it came from go in `metadata`. No review date is
-/// set: these were decided before they were written down (pack D69).
+/// set: these were decided before they were written down (pack D74).
 fn prepare_imported(
     batch: &ImportBatch<'_>,
     row: &ImportRow,

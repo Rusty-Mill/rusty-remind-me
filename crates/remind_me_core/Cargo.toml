@@ -157,3 +157,8 @@ required-features = ["stack-dumps"]
 [[example]]
 name = "store_bench"
 test = true
+
+# R3's query embedder for G2 on D1 (D59); its tests run with `cargo test`.
+[[example]]
+name = "embed_queries"
+test = true

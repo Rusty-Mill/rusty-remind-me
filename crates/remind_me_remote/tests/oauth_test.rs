@@ -96,9 +96,13 @@ async fn isolated_oauth_state_file(label: &str) -> tokio::sync::MutexGuard<'stat
 async fn spawn_oauth_server() -> SocketAddr {
     let db = Database::open_in_memory().unwrap();
     let mcp = Arc::new(McpServer::new(db));
-    let router =
-        remind_me_remote::build_router(mcp, OWNER_TOKEN.to_string(), Some(ISSUER.to_string()))
-            .expect("a plain http://localhost issuer must validate");
+    let router = remind_me_remote::build_router(
+        mcp,
+        OWNER_TOKEN.to_string(),
+        None,
+        Some(ISSUER.to_string()),
+    )
+    .expect("a plain http://localhost issuer must validate");
     common::serve(router)
 }
 
@@ -774,6 +778,7 @@ async fn build_router_rejects_an_issuer_with_a_path_or_plain_http_on_a_non_local
     assert!(remind_me_remote::build_router(
         mcp,
         OWNER_TOKEN.to_string(),
+        None,
         Some("https://machine.example/path".to_string()),
     )
     .is_err());
@@ -783,6 +788,7 @@ async fn build_router_rejects_an_issuer_with_a_path_or_plain_http_on_a_non_local
     assert!(remind_me_remote::build_router(
         mcp2,
         OWNER_TOKEN.to_string(),
+        None,
         Some("http://machine.example".to_string()),
     )
     .is_err());
@@ -792,7 +798,7 @@ async fn build_router_rejects_an_issuer_with_a_path_or_plain_http_on_a_non_local
 async fn build_router_without_an_issuer_serves_the_plain_ft05_app_with_no_oauth_routes() {
     let db = Database::open_in_memory().unwrap();
     let mcp = Arc::new(McpServer::new(db));
-    let router = remind_me_remote::build_router(mcp, OWNER_TOKEN.to_string(), None).unwrap();
+    let router = remind_me_remote::build_router(mcp, OWNER_TOKEN.to_string(), None, None).unwrap();
     let addr = common::serve(router);
 
     for path in [

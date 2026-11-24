@@ -29,7 +29,7 @@ const LIMIT: u32 = 3;
 async fn spawn_server() -> SocketAddr {
     let db = Database::open_in_memory().unwrap();
     let mcp = Arc::new(McpServer::new(db));
-    let router = remind_me_remote::build_router(mcp, "test-token".to_string(), None).unwrap();
+    let router = remind_me_remote::build_router(mcp, "test-token".to_string(), None, None).unwrap();
     common::serve(router)
 }
 

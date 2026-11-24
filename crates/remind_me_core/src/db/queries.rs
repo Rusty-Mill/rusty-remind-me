@@ -44,7 +44,7 @@ pub(crate) enum Review {
     /// The configured interval from now (ADR-0031 §1).
     Schedule,
     /// None: a decision made before it was written down, such as one
-    /// imported from a repo log (pack D69).
+    /// imported from a repo log (pack D74).
     Unscheduled,
 }
 

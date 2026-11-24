@@ -4,7 +4,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use remind_me_core::remote::RemoteConfig;
+use remind_me_core::remote::{CaptureToken, RemoteConfig, REMOTE_CAPTURE_TOKEN_ENV};
 use remind_me_mcp::Handler;
 use rusty_axum::middleware::from_fn;
 use rusty_axum::routing::get;
@@ -13,7 +13,7 @@ use rusty_mcp_server::{HttpConfig, HttpHandler, Mount};
 use rusty_tokio::io::TcpListener;
 use serde_json::json;
 
-use crate::auth::{secret_gate, GateConfig, HEALTH_PATH, MCP_PATH};
+use crate::auth::{secret_gate, GateConfig, CAPTURE_TOOL, HEALTH_PATH, MCP_PATH};
 use crate::handler;
 use crate::oauth::{self, IssuerError, OAuthAppState};
 
@@ -116,6 +116,9 @@ async fn health() -> impl IntoResponse {
 /// access token, itself bound to the explicitly configured `issuer` — never
 /// to `Host`), not the `Host` header.
 ///
+/// `capture_token`, when `Some`, is the capture-only credential (ADR-0036):
+/// accepted in both modes, and only for saving a session transcript.
+///
 /// Every request body, MCP or OAuth, is limited to the server's
 /// `max_body_bytes` (see [`serve`]); a larger one is answered 413.
 ///
@@ -128,12 +131,13 @@ async fn health() -> impl IntoResponse {
 pub fn build_router(
     mcp: Arc<dyn Handler>,
     token: String,
+    capture_token: Option<String>,
     issuer: Option<String>,
 ) -> Result<Router, BuildError> {
     let mount = mcp_mount(&mcp)?;
 
     let Some(raw_issuer) = issuer else {
-        let gate = Arc::new(GateConfig::legacy(token));
+        let gate = Arc::new(GateConfig::legacy(token, capture_token));
         let mcp = move |request: Request| {
             let mount = mount.clone();
             async move {
@@ -180,6 +184,7 @@ pub fn build_router(
             oauth::CONSENT_PATH,
         ],
         allow_prefixes: &["/.well-known/"],
+        capture_token,
     });
 
     Ok(Router::new()
@@ -204,6 +209,7 @@ pub async fn run(
     mcp: Arc<dyn Handler>,
     config: RemoteConfig,
     token: String,
+    capture: CaptureToken,
 ) -> std::io::Result<()> {
     warn_if_widened(&config.host, config.port);
     let addr: SocketAddr = format!("{}:{}", config.host, config.port)
@@ -226,7 +232,18 @@ pub async fn run(
              REMIND_ME_REMOTE_ISSUER to serve OAuth (FT-07) instead."
         ),
     }
-    let router = build_router(mcp, token, config.issuer.clone())
+    match &capture {
+        CaptureToken::Off => {}
+        CaptureToken::Ready(_) => eprintln!(
+            "Capture-only token configured: it may only save session transcripts \
+             ({CAPTURE_TOOL})."
+        ),
+        CaptureToken::Unusable { reason } => {
+            eprintln!("{REMOTE_CAPTURE_TOKEN_ENV} {reason}, so capture-only access stays closed.")
+        }
+    }
+    let capture_token = capture.ready().map(str::to_string);
+    let router = build_router(mcp, token, capture_token, config.issuer.clone())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
     let server = serve(listener, router)?;
     server.shutdown_on(std::future::pending()).await;
@@ -263,10 +280,11 @@ pub fn serve(listener: TcpListener, router: Router) -> std::io::Result<Server> {
 pub fn run_blocking(mcp: Arc<dyn Handler>) -> std::io::Result<()> {
     let config = RemoteConfig::from_env();
     let token = remind_me_core::remote::resolve_connector_token();
+    let capture = remind_me_core::remote::resolve_capture_token(&token);
     let runtime = rusty_tokio::Builder::new_multi_thread()
         .thread_name("remind-me-remote")
         .build()?;
-    runtime.block_on(run(mcp, config, token))
+    runtime.block_on(run(mcp, config, token, capture))
 }
 
 #[cfg(test)]

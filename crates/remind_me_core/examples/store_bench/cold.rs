@@ -221,6 +221,7 @@ mod tests {
         tables: engine,
         restore: engine,
         package: super::super::backup_package,
+        verify: super::super::verify_engine,
     };
 
     /// The child's store stays open (its lock held) from the first answer

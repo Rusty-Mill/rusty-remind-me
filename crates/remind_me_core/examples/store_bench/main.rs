@@ -25,6 +25,7 @@ const ENGINE: Candidate = Candidate {
     tables: engine,
     restore: engine,
     package: backup_package,
+    verify: harness::verify_engine,
 };
 
 const SQLITE: Candidate = Candidate {
@@ -32,6 +33,7 @@ const SQLITE: Candidate = Candidate {
     tables: sqlite,
     restore: sqlite,
     package: backup_package,
+    verify: harness::verify_sqlite,
 };
 
 fn main() -> Result<()> {
@@ -170,6 +172,105 @@ mod tests {
             .unwrap()
             .path
             .into()
+    }
+
+    /// The variable carrying a crash child's arguments to this test runner.
+    #[cfg(unix)]
+    const CRASH_CHILD: &str = "STORE_BENCH_CRASH_CHILD";
+
+    /// A crash child in this test runner, which has no `crash-child` mode:
+    /// the runner re-run on `crash_child_entry` alone.
+    #[cfg(unix)]
+    fn test_child(args: &[String]) -> Result<std::process::Command> {
+        let mut command = std::process::Command::new(std::env::current_exe()?);
+        command
+            .args(["tests::crash_child_entry", "--exact", "--nocapture"])
+            .args(["--test-threads=1", "-q"])
+            .env(CRASH_CHILD, serde_json::to_string(args)?);
+        Ok(command)
+    }
+
+    /// The crash child when the runner is started as one; else nothing.
+    #[cfg(unix)]
+    #[test]
+    fn crash_child_entry() {
+        let Ok(args) = std::env::var(CRASH_CHILD) else {
+            return;
+        };
+        let args: Vec<String> = serde_json::from_str(&args).unwrap();
+        harness::crash::child_from(&[ENGINE, SQLITE], &args).unwrap();
+    }
+
+    /// G6: writers killed for real, ten rounds of each stream on a copy of
+    /// a small D1. On both candidates they leave only whole writes and every
+    /// check passes, the integrity check included. The engine passes since
+    /// its transactions cover `memory_revisions` (Q22, D62). Whether each
+    /// stream caught a write in flight is timing, so it is not asserted.
+    #[cfg(unix)]
+    #[test]
+    fn killed_writers_leave_whole_writes() {
+        let _serial = harness::serial();
+        let root = std::env::temp_dir().join(format!("store_bench_crash_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let backup = small_backup(&root);
+        let set = format!("d1:{}", backup.display());
+        for candidate in [ENGINE, SQLITE] {
+            let report =
+                harness::crash::run(candidate, &set, &root.join("runs"), 10, test_child).unwrap();
+            let report = serde_json::Value::Object(report);
+            assert!(report.get("aborted").is_none(), "{report}");
+            // Correctness, not coverage: where a seeded delay lands
+            // against the child's writes depends on the machine, so a
+            // stream may see no in-flight kill. The verdict then fails on
+            // sufficiency alone, which the synthetic report test covers.
+            assert_eq!(report["failures"], 0, "{report}");
+            assert_eq!(report["passed"], report["sufficient"], "{report}");
+            // `insufficient` names exactly the streams no kill caught
+            // inside a write, by the report's own counts.
+            let caught = |stream: &str| {
+                let k = &report["kills"][stream];
+                k["inside_a_write_not_landed"].as_u64().unwrap()
+                    + k["inside_a_write_landed"].as_u64().unwrap()
+            };
+            let expected: Vec<&str> = ["pages", "writes"]
+                .into_iter()
+                .filter(|s| caught(s) == 0)
+                .collect();
+            assert_eq!(
+                report["insufficient"],
+                serde_json::json!(expected),
+                "{report}"
+            );
+            let rounds = report["rounds"].as_array().unwrap();
+            assert_eq!(rounds.len(), 20, "{report}");
+            for stream in ["writes", "pages"] {
+                let acked: u64 = rounds
+                    .iter()
+                    .filter(|r| r["stream"] == stream)
+                    .map(|r| r["acked"].as_u64().unwrap())
+                    .sum();
+                assert!(acked > 0, "{stream}: {report}");
+            }
+            assert!(
+                report["final"]["check"]["integrity"].is_object(),
+                "{report}"
+            );
+            assert!(report["memories_tracked"].as_u64().unwrap() > 0, "{report}");
+            for stream in ["writes", "pages"] {
+                let kills = &report["kills"][stream];
+                let fell: u64 = [
+                    "between_writes",
+                    "inside_a_write_not_landed",
+                    "inside_a_write_landed",
+                ]
+                .iter()
+                .map(|k| kills[*k].as_u64().unwrap())
+                .sum();
+                assert_eq!(kills["total"], 10, "{report}");
+                assert_eq!(fell, 10, "every kill falls somewhere: {report}");
+            }
+        }
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// D1 loads every row kind through the ports into each candidate, and
@@ -346,6 +447,168 @@ mod tests {
         );
         assert!(report["disk_mb_after_ingest"]["blobs"].as_f64().unwrap() > 10.0);
         assert_eq!(report["restore"]["matched"], true);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// G2's golden set runs through the eval test's own code on a
+    /// candidate against the engine, and the engine matches its baseline.
+    #[test]
+    fn the_golden_set_scores_a_candidate_against_the_engine() {
+        let _serial = harness::serial();
+        let root = std::env::temp_dir().join(format!("store_bench_g2_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let report = harness::relevance_run(SQLITE, "golden", &root, None).unwrap();
+        let golden = &report["golden"];
+        assert_eq!(golden["valid"], true, "{golden}");
+        assert_eq!(
+            golden["cells"].as_object().unwrap().len(),
+            8,
+            "keyword and hashed, 4 strategies"
+        );
+        assert_eq!(
+            golden["reported"].as_object().unwrap().len(),
+            8,
+            "the +dates modes"
+        );
+        assert!(golden["misses"].is_array() && golden["passed"].is_boolean());
+        assert_eq!(report["gates"], serde_json::json!(["G2"]));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The #1563 set on D1: vectors checked against the store's identity,
+    /// missing relevant ids left out, a query with none dropped by ordinal.
+    #[cfg(unix)]
+    #[test]
+    fn the_real_set_scores_d1_and_drops_queries_it_cannot_hold() {
+        use remind_me_core::db::queries;
+        use remind_me_core::db::vectors::Vectors;
+        use remind_me_core::models::MemoryListInput;
+        let _serial = harness::serial();
+        let root = std::env::temp_dir().join(format!("store_bench_1563_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let backup = small_backup(&root);
+        // Each memory's vector points its own way (distinct angles in a
+        // plane), and each query's is its memory's, so no two memories tie
+        // in the vector stage and the engine ranks the same way twice.
+        let unit = |j: usize| -> Vec<f32> {
+            let a = (j as f32).sqrt() * 0.1;
+            let mut v = vec![0.0_f32; 8];
+            (v[0], v[1]) = (a.cos(), a.sin());
+            v
+        };
+        let mut vectors = std::collections::HashMap::new();
+        let picked: Vec<(String, String)> = {
+            let db = remind_me_core::Database::open_backend(
+                Box::new(EngineTables::open(&backup).unwrap()),
+                None,
+            )
+            .unwrap();
+            let store = db.store();
+            let v = Vectors::new(&store);
+            for (k, value) in [("backend", "test"), ("model", "fixture"), ("dim", "8")] {
+                v.set_meta(k, value, "2026-11-23").unwrap();
+            }
+            let mut ids = Vec::new();
+            loop {
+                let input = MemoryListInput {
+                    limit: 100,
+                    offset: ids.len(),
+                    ..MemoryListInput::default()
+                };
+                let page = queries::list_memories(&store, &input).unwrap().memories;
+                if page.is_empty() {
+                    break;
+                }
+                ids.extend(page.into_iter().map(|m| m.id));
+            }
+            for (j, id) in ids.into_iter().enumerate() {
+                let bytes: Vec<u8> = unit(j).iter().flat_map(|x| x.to_le_bytes()).collect();
+                v.put(&id, 0, &bytes).unwrap();
+                vectors.insert(id, unit(j));
+            }
+            let input = MemoryListInput {
+                limit: 3,
+                category: Some("fact".into()),
+                ..MemoryListInput::default()
+            };
+            queries::list_memories(&store, &input)
+                .unwrap()
+                .memories
+                .into_iter()
+                .map(|m| (m.id, m.content))
+                .collect()
+        };
+        assert_eq!(picked.len(), 3);
+        let mut q = String::new();
+        let fingerprint = harness::fingerprint::backup_fingerprint(&backup).unwrap();
+        let header = |sha256: &str| {
+            let header = serde_json::json!({
+                "backend": "test", "model": "fixture", "dim": 8, "role": "query",
+                "backup": "small", "backup_sha256": sha256,
+            });
+            format!("{header}\n")
+        };
+        let mut v = header(&fingerprint);
+        let lines = picked
+            .iter()
+            .map(|(id, content)| (content.clone(), vec![id.clone()], vectors[id].clone()))
+            .chain([(
+                "no such memory".to_string(),
+                vec!["mem_missing".to_string()],
+                unit(10_000),
+            )]);
+        for (n, (text, relevant, vector)) in lines.enumerate() {
+            let row = serde_json::json!({ "query": text, "relevant": relevant, "kind": "real" });
+            q.push_str(&format!("{row}\n"));
+            let vector = serde_json::json!({ "n": n + 1, "query": text, "vector": vector });
+            v.push_str(&format!("{vector}\n"));
+        }
+        let files = root.join("files");
+        std::fs::create_dir_all(&files).unwrap();
+        std::fs::write(files.join("q.jsonl"), q).unwrap();
+        std::fs::write(files.join("v.jsonl"), v).unwrap();
+        let set = format!("d1:{}", backup.display());
+        let report = harness::relevance_run(
+            ENGINE,
+            &set,
+            &root.join("runs"),
+            Some((&files.join("q.jsonl"), &files.join("v.jsonl"))),
+        )
+        .unwrap();
+        let real = &report["real_1563"];
+        assert_eq!(real["queries"], 4);
+        assert_eq!(real["scored"], 3);
+        assert_eq!(real["dropped"], serde_json::json!([4]));
+        assert_eq!(real["relevant_ids_missing"], 1);
+        assert_eq!(real["cells"].as_object().unwrap().len(), 8);
+        assert_eq!(
+            real["misses"],
+            serde_json::json!([]),
+            "the engine against itself: {real}"
+        );
+        // A 4-query fixture is not the 50-query source set (D55): scored,
+        // but never a pass.
+        assert_eq!(real["scoring_input"], false);
+        assert_eq!(real["source_queries_required"], 50);
+        assert_eq!(real["passed"], false);
+        assert!(
+            !real.to_string().contains("no such memory"),
+            "no query text"
+        );
+        assert_eq!(report["backup_sha256"], fingerprint.as_str());
+
+        // Vectors made for another backup are refused before scoring.
+        let ours = std::fs::read_to_string(files.join("v.jsonl")).unwrap();
+        let theirs = ours.replacen(&fingerprint, "0".repeat(64).as_str(), 1);
+        std::fs::write(files.join("other.jsonl"), theirs).unwrap();
+        let refused = harness::relevance_run(
+            ENGINE,
+            &set,
+            &root.join("runs"),
+            Some((&files.join("q.jsonl"), &files.join("other.jsonl"))),
+        )
+        .unwrap_err();
+        assert!(refused.to_string().contains("another backup"), "{refused}");
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

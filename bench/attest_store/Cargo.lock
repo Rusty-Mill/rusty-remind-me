@@ -37,10 +37,14 @@ name = "attest_store"
 version = "0.1.0"
 dependencies = [
  "attest",
+ "chrono",
+ "chrono-tz",
  "remind_me_core",
+ "rusqlite",
  "rusty_serde",
  "serde",
  "serde_json",
+ "sha256",
 ]
 
 [[package]]

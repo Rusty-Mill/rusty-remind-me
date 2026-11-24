@@ -945,7 +945,7 @@ fn apply_skips_claim_rows() {
         .is_empty());
 }
 
-// -- ref options and import apply (pack D64, D65, D69) -------------------------
+// -- ref options and import apply (pack D69, D70, D74) -------------------------
 
 use remind_me_core::decisions_backfill::{
     apply_import, parse_log_with, render_import_applied, RefOptions, IMPORT_SOURCE,
@@ -1098,7 +1098,7 @@ fn apply_adds_new_entries_links_them_and_a_second_run_adds_nothing() {
     );
     assert!(
         d2.metadata.get("review").is_none(),
-        "an imported decision gets no review date (D69)"
+        "an imported decision gets no review date (D74)"
     );
     assert_eq!(d3.metadata["confirms"], json!(["D2"]));
 
