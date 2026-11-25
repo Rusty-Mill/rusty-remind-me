@@ -1452,3 +1452,60 @@ fn an_entry_superseding_a_row_rejected_for_its_date_waits_for_it() {
         .collect();
     assert_eq!(live, ["D2"], "only D2 is live");
 }
+
+fn mux_log(first_text: &str) -> String {
+    format!(
+        "| Date | Decision | Why |\n|---|---|---|\n| 2026-10-21 | {first_text} | a |\n| 2026-10-21 | Decision B | b |\n| 2026-10-22 | Other day | c |\n"
+    )
+}
+
+fn mux_options() -> RefOptions {
+    RefOptions {
+        generate: Some("mux".into()),
+        ..RefOptions::default()
+    }
+}
+
+#[test]
+fn a_rejected_generated_row_keeps_its_place_in_the_date_sequence() {
+    let log = parse_log_with(&mux_log(""), &mux_options());
+    let refs: Vec<&str> = log
+        .entries
+        .iter()
+        .map(|e| e.decision_ref.as_str())
+        .collect();
+    assert_eq!(refs, ["mux-2026-10-21-2", "mux-2026-10-22-1"]);
+    let rejected: Vec<&str> = log
+        .rejected_refs
+        .iter()
+        .map(|r| r.decision_ref.as_str())
+        .collect();
+    assert_eq!(rejected, ["mux-2026-10-21-1"]);
+}
+
+#[test]
+fn mending_a_rejected_generated_row_imports_it_and_leaves_the_rest_unchanged() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let first = parse_log_with(&mux_log(""), &mux_options());
+    let applied = apply_import(&store, &first, "rusty_mux", "mux.md").unwrap();
+    assert_eq!(
+        added_refs(&applied),
+        ["mux-2026-10-21-2", "mux-2026-10-22-1"]
+    );
+
+    let mended = parse_log_with(&mux_log("Decision A"), &mux_options());
+    let again = apply_import(&store, &mended, "rusty_mux", "mux.md").unwrap();
+    assert_eq!(added_refs(&again), ["mux-2026-10-21-1"]);
+    assert_eq!(
+        again.plan.unchanged.len(),
+        2,
+        "B and the other day are unchanged"
+    );
+    assert!(again.plan.changed.is_empty());
+    assert_eq!(
+        Memories::new(&store).all_live().unwrap().len(),
+        3,
+        "no second copy of B"
+    );
+}

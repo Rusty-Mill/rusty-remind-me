@@ -499,7 +499,15 @@ pub struct ParsedLog {
     /// decision text): still entries of the file, so a row superseding one
     /// waits for it instead of going in unlinked.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub rejected_refs: Vec<String>,
+    pub rejected_refs: Vec<RejectedRef>,
+}
+
+/// The ref of a row rejected after it was read, and where it sits. A
+/// generated ref is numbered in the same sequence as accepted rows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RejectedRef {
+    pub line: usize,
+    pub decision_ref: String,
 }
 
 /// An entry whose ref repeats an earlier one, renamed so both import.
@@ -557,7 +565,7 @@ pub fn parse_log_with(text: &str, options: &RefOptions) -> ParsedLog {
         .retain(|e| !sections.iter().any(|s| s.decision_ref == e.decision_ref));
     log.entries.extend(sections);
     log.entries.sort_by_key(|e| e.line);
-    number_dated(&mut log.entries, &dated);
+    number_dated(&mut log.entries, &mut log.rejected_refs, &dated);
     if options.rename_duplicates {
         log.renamed = rename_duplicates(&mut log.entries);
     }
@@ -566,7 +574,7 @@ pub fn parse_log_with(text: &str, options: &RefOptions) -> ParsedLog {
             entry.decision_ref = prefixed(Some(prefix), &entry.decision_ref);
         }
         for rejected in &mut log.rejected_refs {
-            *rejected = prefixed(Some(prefix), rejected);
+            rejected.decision_ref = prefixed(Some(prefix), &rejected.decision_ref);
         }
         for renamed in &mut log.renamed {
             renamed.from = prefixed(Some(prefix), &renamed.from);
@@ -585,14 +593,23 @@ fn prefixed(prefix: Option<&str>, reference: &str) -> String {
     }
 }
 
-/// Append each dated entry's ordinal within its date (entries at the lines
-/// in `dated`, whose refs are `<prefix>-<date>` so far), in file order.
-fn number_dated(entries: &mut [LogEntry], dated: &[usize]) {
-    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for entry in entries.iter_mut().filter(|e| dated.contains(&e.line)) {
-        let n = seen.entry(entry.decision_ref.clone()).or_default();
+/// Append each dated row's ordinal within its date (rows at the lines in
+/// `dated`, whose refs are `<prefix>-<date>` so far), in file order. Rejected
+/// rows count in the same sequence, so mending one later never shifts the
+/// refs of the rows after it.
+fn number_dated(entries: &mut [LogEntry], rejected: &mut [RejectedRef], dated: &[usize]) {
+    let mut refs: Vec<(usize, &mut String)> = entries
+        .iter_mut()
+        .map(|e| (e.line, &mut e.decision_ref))
+        .chain(rejected.iter_mut().map(|r| (r.line, &mut r.decision_ref)))
+        .filter(|(line, _)| dated.contains(line))
+        .collect();
+    refs.sort_by_key(|(line, _)| *line);
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for (_, reference) in refs {
+        let n = seen.entry(reference.clone()).or_default();
         *n += 1;
-        entry.decision_ref = format!("{}-{n}", entry.decision_ref);
+        *reference = format!("{reference}-{n}");
     }
 }
 
@@ -761,20 +778,21 @@ fn read_row(
         let i = cols.reference.map_or(1, |r| r + 1);
         row.get(i).map(|s| clean(s))
     });
+    if from_date {
+        dated.push(line);
+    }
+    let rejected = |decision_ref: String| RejectedRef { line, decision_ref };
     let Some((title, title_struck)) = decision.filter(|(t, _)| !t.is_empty()) else {
         log.unparsed.push(unparsed("no decision text"));
-        log.rejected_refs.push(reference);
+        log.rejected_refs.push(rejected(reference));
         return;
     };
     let some = |c: Option<usize>| at(c).map(|(t, _)| t).filter(|t| !t.is_empty());
     let date = some(cols.date);
     if date.as_deref().is_some_and(|d| !is_date(d)) {
         log.unparsed.push(unparsed("date is not a YYYY-MM-DD day"));
-        log.rejected_refs.push(reference);
+        log.rejected_refs.push(rejected(reference));
         return;
-    }
-    if from_date {
-        dated.push(line);
     }
     log.entries.push(LogEntry {
         decision_ref: reference,
@@ -1436,9 +1454,13 @@ fn apply_plan(
             .entries
             .iter()
             .map(|e| e.decision_ref.as_str())
-            .chain(log.rejected_refs.iter().map(String::as_str))
+            .chain(log.rejected_refs.iter().map(|r| r.decision_ref.as_str()))
             .collect(),
-        rejected: log.rejected_refs.iter().map(String::as_str).collect(),
+        rejected: log
+            .rejected_refs
+            .iter()
+            .map(|r| r.decision_ref.as_str())
+            .collect(),
     };
     let ambiguous: HashSet<&str> = plan
         .ambiguous
