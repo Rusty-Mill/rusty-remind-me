@@ -561,13 +561,14 @@ pub fn parse_log_with(text: &str, options: &RefOptions) -> ParsedLog {
             i += 1;
         }
     }
-    log.entries
-        .retain(|e| !sections.iter().any(|s| s.decision_ref == e.decision_ref));
+    let in_section = |reference: &str| sections.iter().any(|s| s.decision_ref == reference);
+    log.entries.retain(|e| !in_section(&e.decision_ref));
+    log.rejected_refs.retain(|r| !in_section(&r.decision_ref));
     log.entries.extend(sections);
     log.entries.sort_by_key(|e| e.line);
     number_dated(&mut log.entries, &mut log.rejected_refs, &dated);
     if options.rename_duplicates {
-        log.renamed = rename_duplicates(&mut log.entries);
+        log.renamed = rename_duplicates(&mut log.entries, &mut log.rejected_refs);
     }
     if let Some(prefix) = options.prefix.as_deref().map(str::trim) {
         for entry in &mut log.entries {
@@ -614,27 +615,34 @@ fn number_dated(entries: &mut [LogEntry], rejected: &mut [RejectedRef], dated: &
 }
 
 /// Give each repeat of a ref the next letter from `b`, in file order.
-fn rename_duplicates(entries: &mut [LogEntry]) -> Vec<Renamed> {
-    let mut seen: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
+/// Rejected rows count in file order like accepted ones, so mending one
+/// later never moves a letter from the row after it.
+fn rename_duplicates(entries: &mut [LogEntry], rejected: &mut [RejectedRef]) -> Vec<Renamed> {
+    let mut refs: Vec<(usize, &mut String)> = entries
+        .iter_mut()
+        .map(|e| (e.line, &mut e.decision_ref))
+        .chain(rejected.iter_mut().map(|r| (r.line, &mut r.decision_ref)))
+        .collect();
+    refs.sort_by_key(|(line, _)| *line);
+    let mut seen: HashMap<String, u8> = HashMap::new();
     let mut renamed = Vec::new();
-    for entry in entries.iter_mut() {
-        let count = seen.entry(entry.decision_ref.clone()).or_default();
+    for (line, reference) in refs {
+        let count = seen.entry(reference.clone()).or_default();
         *count += 1;
         if *count == 1 {
             continue;
         }
         let letter = char::from(b'a' + (*count - 1).min(25));
-        let to = format!("{}{letter}", entry.decision_ref);
+        let to = format!("{reference}{letter}");
         renamed.push(Renamed {
-            line: entry.line,
-            from: std::mem::replace(&mut entry.decision_ref, to.clone()),
+            line,
+            from: std::mem::replace(reference, to.clone()),
             to,
         });
     }
     renamed
 }
 
-/// `YYYY-MM-DD`, digits where digits go.
 /// A calendar day written `YYYY-MM-DD`, the one form the log export reads
 /// back ([`crate::decisions_log`]).
 fn is_date(text: &str) -> bool {
@@ -1031,10 +1039,14 @@ fn place(
     plan: &mut ImportPlan,
 ) -> bool {
     let row = |memory_id: Option<String>, note: &str| ImportRow::of(entry, memory_id, note);
+    // A rejected row that shares the ref counts: once mended it would make
+    // this a conflict, so it is one now, before any copy is stored.
     let twins = log
         .entries
         .iter()
-        .filter(|e| e.decision_ref == entry.decision_ref)
+        .map(|e| &e.decision_ref)
+        .chain(log.rejected_refs.iter().map(|r| &r.decision_ref))
+        .filter(|r| **r == entry.decision_ref)
         .count();
     if twins > 1 {
         plan.conflicts.push(row(None, "ref appears more than once"));

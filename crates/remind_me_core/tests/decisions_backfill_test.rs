@@ -1509,3 +1509,79 @@ fn mending_a_rejected_generated_row_imports_it_and_leaves_the_rest_unchanged() {
         "no second copy of B"
     );
 }
+
+fn repeat_log(first_text: &str) -> String {
+    format!(
+        "| # | Decision | Why |\n|---|---|---|\n| D1 | {first_text} | a |\n| D1 | Decision B | b |\n"
+    )
+}
+
+fn renaming() -> RefOptions {
+    RefOptions {
+        rename_duplicates: true,
+        ..RefOptions::default()
+    }
+}
+
+fn rejected_refs(log: &remind_me_core::decisions_backfill::ParsedLog) -> Vec<&str> {
+    log.rejected_refs
+        .iter()
+        .map(|r| r.decision_ref.as_str())
+        .collect()
+}
+
+#[test]
+fn a_rejected_repeat_takes_its_letter_in_file_order() {
+    let log = parse_log_with(&repeat_log(""), &renaming());
+    assert_eq!(rejected_refs(&log), ["D1"]);
+    let refs: Vec<&str> = log
+        .entries
+        .iter()
+        .map(|e| e.decision_ref.as_str())
+        .collect();
+    assert_eq!(refs, ["D1b"]);
+    assert_eq!(log.renamed.len(), 1);
+
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let applied = apply_import(&store, &log, "rusty-remind-me", "d.md").unwrap();
+    assert_eq!(added_refs(&applied), ["D1b"]);
+
+    let mended = parse_log_with(&repeat_log("Decision A"), &renaming());
+    let again = apply_import(&store, &mended, "rusty-remind-me", "d.md").unwrap();
+    assert_eq!(added_refs(&again), ["D1"]);
+    assert_eq!(again.plan.unchanged.len(), 1, "B stays D1b, unchanged");
+    assert!(again.plan.changed.is_empty());
+    assert_eq!(
+        Memories::new(&store).all_live().unwrap().len(),
+        2,
+        "no second copy"
+    );
+}
+
+#[test]
+fn without_renaming_a_rejected_repeat_makes_the_ref_a_conflict() {
+    let log = parse_log(&repeat_log(""));
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let applied = apply_import(&store, &log, "rusty-remind-me", "d.md").unwrap();
+    assert_eq!(applied.plan.conflicts.len(), 1);
+    assert_eq!(applied.plan.conflicts[0].note, "ref appears more than once");
+    assert!(applied.added.is_empty());
+    assert!(Memories::new(&store).all_live().unwrap().is_empty());
+}
+
+#[test]
+fn a_rejected_row_after_an_accepted_one_takes_the_letter() {
+    let log = parse_log_with(
+        "| # | Decision | Why |\n|---|---|---|\n| D1 | Decision A | a |\n| D1 |  | b |\n",
+        &renaming(),
+    );
+    let refs: Vec<&str> = log
+        .entries
+        .iter()
+        .map(|e| e.decision_ref.as_str())
+        .collect();
+    assert_eq!(refs, ["D1"]);
+    assert_eq!(rejected_refs(&log), ["D1b"]);
+}
