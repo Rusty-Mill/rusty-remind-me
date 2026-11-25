@@ -13,7 +13,7 @@ const FILE: &str = "dialogs.sqlite3";
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS dialogs (
-    id TEXT PRIMARY KEY, capture_id TEXT NOT NULL, session_id TEXT,
+    id TEXT NOT NULL PRIMARY KEY, capture_id TEXT NOT NULL, session_id TEXT,
     project TEXT, created_at TEXT NOT NULL, head TEXT NOT NULL,
     body_hash TEXT NOT NULL, body_bytes INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS dialogs_capture ON dialogs (capture_id, created_at, id);
@@ -56,6 +56,10 @@ impl SqliteDialogs {
     }
 
     fn with_schema(conn: Connection) -> Result<Self> {
+        // REPLACE deletes the old row without firing delete triggers unless
+        // recursive triggers are on; on, the delete trigger below refuses it.
+        conn.execute_batch("PRAGMA recursive_triggers = ON;")
+            .map_err(sqlite_error)?;
         conn.execute_batch(SCHEMA).map_err(sqlite_error)?;
         Ok(Self { conn })
     }
@@ -179,6 +183,36 @@ mod tests {
         assert!(upd.unwrap_err().to_string().contains("append-only"));
         assert!(del.unwrap_err().to_string().contains("append-only"));
         assert_eq!(s.get("d1").unwrap().unwrap().head, "hi");
+    }
+
+    #[test]
+    fn a_null_id_is_refused() {
+        let s = SqliteDialogs::open_in_memory().unwrap();
+        let null_id =
+            "INSERT INTO dialogs (id, capture_id, created_at, head, body_hash, body_bytes) \
+                       VALUES (NULL, 'c', 't', 'h', 'x', 1)";
+        assert!(s.conn.execute(null_id, []).is_err());
+        assert!(s.conn.execute(null_id, []).is_err());
+        assert_eq!(s.count().unwrap(), 0);
+    }
+
+    #[test]
+    fn update_delete_and_replace_leave_a_row_unchanged() {
+        let mut s = SqliteDialogs::open_in_memory().unwrap();
+        let r = crate::db::dialogs::conformance::record("d1", "c1", "2026-11-25T00:00:00Z", "hi");
+        s.append(&r).unwrap();
+        for sql in [
+            "UPDATE dialogs SET head = 'x' WHERE id = 'd1'",
+            "DELETE FROM dialogs WHERE id = 'd1'",
+            "INSERT OR REPLACE INTO dialogs (id, capture_id, created_at, head, body_hash, body_bytes) \
+             VALUES ('d1', 'other', 't', 'changed', 'y', 9)",
+            "REPLACE INTO dialogs (id, capture_id, created_at, head, body_hash, body_bytes) \
+             VALUES ('d1', 'other', 't', 'changed', 'y', 9)",
+        ] {
+            assert!(s.conn.execute(sql, []).is_err(), "{sql} was not refused");
+            assert_eq!(s.get("d1").unwrap(), Some(r.clone()), "{sql} changed the row");
+        }
+        assert_eq!(s.count().unwrap(), 1);
     }
 
     #[test]

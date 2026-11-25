@@ -6,14 +6,14 @@ Dated entries, newest first. One entry per merged pull request.
 
 ### Added
 - `db::dialogs::DialogStore`: an append-and-read-only port for verbatim dialogs, with a conformance suite (`dialog_conformance!`). The same id with identical content is a duplicate; the same id with different content is refused.
-- `db::sqlite::SqliteDialogs`: the adapter, one `dialogs.sqlite3` file whose triggers abort any UPDATE or DELETE.
+- `db::sqlite::SqliteDialogs`: the adapter, one `dialogs.sqlite3` file whose triggers (with recursive triggers on, so REPLACE is refused too) abort any UPDATE, DELETE or REPLACE, and the id is NOT NULL.
 - `db::dialogs::DialogLog`: publishes the body with the new `BlobStore::put_durable` (synced file; an existing blob is verified and replaced if corrupt; the shard, root and root's parent flushed on every call; the root's parent must exist), then appends the row (512-byte head, sha256, byte count); a failed publication appends nothing. Reads a body back verified against its hash. `append` is one conflict-ignoring insert, so two connections racing on an id classify correctly.
 
 ### Not yet
 - Nothing calls it: captures still write to `memories`, and no existing dialog is moved. The wiring, the backup package, the reconcile on open, the rebuild check and the migration (a data migration, D3, run by Nano after a dry run) are separate pull requests.
 
 ### Tests
-- The four port checks on SQLite; UPDATE and DELETE refused by the file; two connections on one file (same id same content, same id different content); a corrupt pre-existing blob replaced; a missing anchor refused; a retry over directories left by an earlier attempt; a failed publication appends no row; head cut on a character boundary; body stored once, idempotent on a rerun, read back verified; a missing or altered blob is an error.
+- The four port checks on SQLite; UPDATE, DELETE and REPLACE refused by the file, and a NULL id refused; two connections on one file (same id same content, same id different content); a corrupt pre-existing blob replaced; a missing anchor refused; a retry over directories left by an earlier attempt; a failed publication appends no row; head cut on a character boundary; body stored once, idempotent on a rerun, read back verified; a missing or altered blob is an error.
 
 ## 2026-11-23 — `decisions import --apply`: import a repo decisions log (Mill Board #1564, D69 to D74)
 
