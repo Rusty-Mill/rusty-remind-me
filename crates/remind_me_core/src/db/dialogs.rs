@@ -6,11 +6,18 @@
 //! sha256 of the full body, which lives in a [`BlobStore`] (D50).
 //!
 //! [`DialogLog`] is the one write path: body to the blob store first, then
-//! the row, and only after the blob is durable and verified
-//! ([`BlobStore::put_durable`]: synced file, the shard, root and anchor directories flushed on every call, an existing blob
-//! checked against its hash and replaced if it fails). A crash between the
-//! two leaves an orphan blob and no dangling row; a failed publication
-//! appends nothing. A rerun is idempotent by body hash.
+//! the row, and only after the blob is published and verified
+//! ([`BlobStore::put_durable`]: synced file; the shard, root and anchor
+//! directories flushed on every call; an existing blob checked against its
+//! hash and replaced if it fails). A failed publication appends nothing. A
+//! rerun is idempotent by body hash.
+//!
+//! Crash guarantee, on Unix: a crash between the two steps leaves an orphan
+//! blob and no dangling row, and a power loss after the row commits does
+//! not lose the blob. Elsewhere there is no directory sync, so a lost
+//! rename can leave a committed row whose blob is missing; [`DialogLog::body`]
+//! then reports it as an error and never returns wrong bytes. See ADR-0037
+//! item 3 for the boundary.
 
 use crate::blobs::{content_key, BlobStore};
 use crate::db::{Result, StoreError};
