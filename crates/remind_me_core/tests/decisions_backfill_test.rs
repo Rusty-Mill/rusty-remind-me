@@ -1339,3 +1339,80 @@ fn a_link_clause_opening_an_entry_is_not_its_identity_across_two_imports() {
     assert!(applied.unlinked.is_empty(), "{:?}", applied.unlinked);
     assert_chain_retired(&store);
 }
+
+/// The exported log's rows as (ref, date) pairs, in log order.
+fn exported_dates(store: &remind_me_core::db::Store<'_>) -> Vec<(String, String)> {
+    use remind_me_core::decisions_log::{export, DecisionsQuery};
+    let log = export(
+        store,
+        &DecisionsQuery {
+            project: "rusty-remind-me".into(),
+            include_superseded: true,
+        },
+    )
+    .unwrap();
+    log.markdown
+        .lines()
+        .filter(|l| l.starts_with("| D"))
+        .skip(1) // the header row
+        .map(|l| {
+            let cells: Vec<&str> = l.split('|').map(str::trim).collect();
+            (cells[1].to_string(), cells[2].to_string())
+        })
+        .collect()
+}
+
+#[test]
+fn an_imported_entry_exports_with_its_logged_date() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let log = parse_log("| # | Date | Decision | Why |\n|---|---|---|---|\n| D1 | 2026-10-21 | Build fresh | Gap |\n");
+    apply_import(&store, &log, "rusty-remind-me", "d.md").unwrap();
+    assert_eq!(exported_dates(&store), [("D1".into(), "2026-10-21".into())]);
+}
+
+#[test]
+fn imported_entries_export_in_logged_date_order() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let log = parse_log(
+        "| # | Date | Decision | Why |\n|---|---|---|---|\n| D1 | 2026-10-21 | Later | x |\n| D2 | 2026-09-02 | Earlier | y |\n",
+    );
+    apply_import(&store, &log, "rusty-remind-me", "d.md").unwrap();
+    assert_eq!(
+        exported_dates(&store),
+        [
+            ("D2".into(), "2026-09-02".into()),
+            ("D1".into(), "2026-10-21".into())
+        ]
+    );
+}
+
+#[test]
+fn an_undated_import_exports_its_created_day() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let log = parse_log("| # | Decision | Why |\n|---|---|---|\n| D1 | Build fresh | Gap |\n");
+    let applied = apply_import(&store, &log, "rusty-remind-me", "d.md").unwrap();
+    let created = added_memory(&store, &applied, "D1").created_at;
+    assert_eq!(
+        exported_dates(&store),
+        [("D1".into(), created[..10].to_string())]
+    );
+}
+
+#[test]
+fn a_malformed_date_is_reported_not_stored() {
+    let log = parse_log(
+        "| # | Date | Decision | Why |\n|---|---|---|---|\n| D1 | Oct 21 | Build fresh | Gap |\n| D2 | 2026-02-30 | Other | x |\n",
+    );
+    assert!(log.entries.is_empty(), "{:?}", log.entries);
+    assert_eq!(log.unparsed.len(), 2);
+    assert!(log.unparsed.iter().all(|u| u.reason.contains("YYYY-MM-DD")));
+
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let applied = apply_import(&store, &log, "rusty-remind-me", "d.md").unwrap();
+    assert!(applied.added.is_empty());
+    assert!(Memories::new(&store).all_live().unwrap().is_empty());
+}

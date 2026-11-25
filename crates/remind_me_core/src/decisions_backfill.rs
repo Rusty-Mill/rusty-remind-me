@@ -610,13 +610,10 @@ fn rename_duplicates(entries: &mut [LogEntry]) -> Vec<Renamed> {
 }
 
 /// `YYYY-MM-DD`, digits where digits go.
+/// A calendar day written `YYYY-MM-DD`, the one form the log export reads
+/// back ([`crate::decisions_log`]).
 fn is_date(text: &str) -> bool {
-    let b = text.as_bytes();
-    b.len() == 10
-        && b.iter().enumerate().all(|(i, c)| match i {
-            4 | 7 => *c == b'-',
-            _ => c.is_ascii_digit(),
-        })
+    crate::decisions_log::is_day(text)
 }
 
 fn cells(line: &str) -> Vec<String> {
@@ -761,6 +758,11 @@ fn read_row(
         return;
     };
     let some = |c: Option<usize>| at(c).map(|(t, _)| t).filter(|t| !t.is_empty());
+    let date = some(cols.date);
+    if date.as_deref().is_some_and(|d| !is_date(d)) {
+        log.unparsed.push(unparsed("date is not a YYYY-MM-DD day"));
+        return;
+    }
     if from_date {
         dated.push(line);
     }
@@ -768,7 +770,7 @@ fn read_row(
         decision_ref: reference,
         title,
         rationale: some(cols.why),
-        date: some(cols.date),
+        date,
         tag: some(cols.tag),
         line,
         struck: ref_struck || title_struck,
