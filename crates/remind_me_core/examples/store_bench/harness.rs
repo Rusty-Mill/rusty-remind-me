@@ -98,6 +98,7 @@ pub mod crash;
 mod d1;
 pub mod fingerprint;
 mod g1;
+pub mod g4;
 mod package;
 mod relevance;
 
@@ -247,6 +248,14 @@ impl Dataset {
         Ok(Self::Synthetic(n))
     }
 
+    /// The real backup it loads from; `None` for a synthetic set.
+    fn backup(&self) -> Option<&Path> {
+        match self {
+            Self::Synthetic(_) => None,
+            Self::D1(backup) | Self::D2 { backup, .. } | Self::D3 { backup, .. } => Some(backup),
+        }
+    }
+
     fn name(&self) -> String {
         match self {
             Self::Synthetic(n) => n.to_string(),
@@ -271,6 +280,13 @@ pub fn run(candidates: &[Candidate]) -> Result<()> {
             let dir = Path::new(dir);
             owned_run(dir)?;
             return cold::cold_child(candidate, dir);
+        }
+    }
+    // G4's verdict for one candidate: `g4 <report.json>...` (`g4::RULE`).
+    if let [mode, files @ ..] = args.as_slice() {
+        if mode == "g4" && !files.is_empty() {
+            println!("{}", g4::verdict_from_files(files)?);
+            return Ok(());
         }
     }
     // G6 (D56, D57): `crash <backend> d1:<backup> <dir>`, and its child
@@ -486,6 +502,7 @@ pub fn measure(
     report.insert("mode".into(), json!(mode.name()));
     report.insert("backend".into(), json!(candidate.name));
     report.insert("dataset".into(), json!(dataset.name()));
+    report.insert("provenance".into(), provenance(dataset.backup())?);
     report.insert("run_dir".into(), json!(dir));
     match mode {
         Mode::Bench => workload(candidate, &dir, dataset, &mut report, isolation)?,
@@ -497,8 +514,35 @@ pub fn measure(
         }
     }
     report.insert("disk_mb".into(), disk(&dir)?);
-    report.insert("peak_rss_mb".into(), json!(peak_rss_mb()));
+    if mode == Mode::Bench {
+        // The parent since the last restart: the G1 checks, the reopen and
+        // the backup's side of workload 9 (not G4).
+        g4::note_peak(&mut report, "after_deletes");
+        let g4 = g4::bench(&report);
+        report.insert("g4".into(), g4);
+    }
+    // The whole process's peak, fill included: reported, never G4.
+    report.insert("peak_rss_mb".into(), json!(g4::process_peak(&report)));
     Ok(report)
+}
+
+/// Where a report's numbers come from: the code (`R3_GIT_SHA`), the
+/// backup's fingerprint, the host and the cgroup's limits. `g4` refuses
+/// to score a set of reports whose provenance is missing or differs.
+pub fn provenance(backup: Option<&Path>) -> Result<Value> {
+    let backup_sha256 = backup.map(fingerprint::backup_fingerprint).transpose()?;
+    let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|s| s.trim().to_string());
+    let limits = cold::cgroup_limits();
+    Ok(json!({
+        "git_sha": std::env::var("R3_GIT_SHA").ok(),
+        "backup_sha256": backup_sha256,
+        "host": host,
+        // The limits, not the cgroup's path: each run gets its own scope.
+        "memory_max": limits["memory_max"],
+        "cpu_max": limits["cpu_max"],
+    }))
 }
 
 /// The run's disk use, in MB (D53): the store, the candidate's temporary
@@ -713,6 +757,12 @@ fn workload(
         let db = candidate.open(dir)?;
         seed(&db, dataset, dir, &bodies, &corpus, &mut rng, report)?
     };
+    // G4 is the peak over workloads 1 to 7, not over the fill, which holds
+    // a second store (D1's source copy) and a row-by-row parity check.
+    // Keep the fill's peak, then restart the parent's peak from here; the
+    // report's `g4` (`g4::bench`) says what each sample covers.
+    report.insert("fill_peak_rss_mb".into(), json!(peak_rss_mb()));
+    g4::restart(report);
     let real = !matches!(dataset, Dataset::Synthetic(_));
     let n = ids.len();
     report.insert("memories".into(), json!(n));
@@ -863,6 +913,8 @@ fn workload(
         // `grow` does, so the inherited embedding identity is kept.
         report.insert("add".into(), timed(|_| add_one(&store, &mut rng))?);
     }
+    // Workloads 1 to 5 end here; 8 (the readers) is not G4's.
+    g4::note_peak(report, "workloads_1_to_5");
     report.insert(
         "search_hybrid_readers_idle".into(),
         readers(&db, &store, &queries_, &vectors_, None, None)?,
@@ -876,6 +928,10 @@ fn workload(
     remind_me_core::stats::collect(&store)?;
     report.insert("stats_ms".into(), json!(millis(t.elapsed())));
 
+    // The readers' peak (workload 8) is kept but not G4's; restart for
+    // the deletes (workload 4).
+    g4::note_peak(report, "concurrency");
+    g4::restart(report);
     // Distinct live rows, each deleted once; a delete that finds nothing is
     // an error, not a fast sample.
     let mut times = Vec::new();
@@ -893,6 +949,7 @@ fn workload(
         summary(times)
     };
     report.insert("delete".into(), delete);
+    g4::note_peak(report, "deletes");
 
     // G1's checks beyond the port suites, on this candidate.
     let rewrite = match &dialog {
@@ -1818,12 +1875,12 @@ fn dir_size(dir: &Path) -> Result<u64> {
 }
 
 /// The process's peak resident memory, from Linux's `VmHWM`; null elsewhere.
-fn peak_rss_mb() -> Option<f64> {
+pub fn peak_rss_mb() -> Option<f64> {
     status_mb("VmHWM:")
 }
 
 /// The process's resident memory now, from Linux's `VmRSS`; null elsewhere.
-fn rss_mb() -> Option<f64> {
+pub fn rss_mb() -> Option<f64> {
     status_mb("VmRSS:")
 }
 

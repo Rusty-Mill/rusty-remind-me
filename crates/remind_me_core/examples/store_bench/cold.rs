@@ -159,7 +159,7 @@ impl Held {
 
 /// This process's cgroup (v2) and its `memory.max` and `cpu.max`, or
 /// nulls where they cannot be read.
-fn cgroup_limits() -> Value {
+pub(super) fn cgroup_limits() -> Value {
     let path = std::fs::read_to_string("/proc/self/cgroup")
         .ok()
         .and_then(|s| {

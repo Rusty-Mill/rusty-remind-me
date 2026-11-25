@@ -243,6 +243,17 @@ mod tests {
             );
             let rounds = report["rounds"].as_array().unwrap();
             assert_eq!(rounds.len(), 20, "{report}");
+            let fingerprint = harness::fingerprint::backup_fingerprint(&backup).unwrap();
+            assert_eq!(report["provenance"]["backup_sha256"], fingerprint.as_str());
+            // Every round ran and none aborted, so only a missing peak
+            // could keep G4 from scoring.
+            let missing = report["g4"]["missing"].as_array().unwrap();
+            assert!(
+                missing
+                    .iter()
+                    .all(|m| m.as_str().unwrap().contains("without")),
+                "{report}"
+            );
             for stream in ["writes", "pages"] {
                 let acked: u64 = rounds
                     .iter()
@@ -292,6 +303,12 @@ mod tests {
                 Isolation::InProcess,
             )
             .unwrap();
+            let fingerprint = harness::fingerprint::backup_fingerprint(&backup).unwrap();
+            assert_eq!(
+                report["provenance"]["backup_sha256"],
+                fingerprint.as_str(),
+                "the bench report names its backup"
+            );
             let run = Path::new(report["run_dir"].as_str().unwrap());
             let owned = run.parent().unwrap();
             assert!(owned.join("run.package").is_dir(), "package inside");
@@ -339,6 +356,34 @@ mod tests {
                 "real adds timed"
             );
             assert!(report["cold_open"]["child"]["first_query_ms"].is_number());
+            // G4's parent samples skip the fill and the readers; in process
+            // there is no cold-open child, so the evidence does not score.
+            #[cfg(target_os = "linux")]
+            {
+                let g4 = &report["g4"];
+                assert!(report["fill_peak_rss_mb"].is_number(), "{}", candidate.name);
+                let restarts = report["peak_restarts"].as_array().unwrap();
+                assert_eq!(restarts.len(), 2, "after the fill and before the deletes");
+                assert!(restarts.iter().all(|r| r["restarted"] == true));
+                for key in [
+                    "workloads_1_to_5",
+                    "concurrency",
+                    "deletes",
+                    "after_deletes",
+                ] {
+                    assert!(report["parent_peaks"][key].is_number(), "{key}");
+                }
+                assert!(g4["parent_workloads_1_to_5_mb"].is_number(), "{g4}");
+                assert!(g4["parent_deletes_mb"].is_number(), "{g4}");
+                assert_eq!(g4["scoring"], false, "{g4}");
+                assert_eq!(g4["peak_mb"], serde_json::Value::Null);
+                assert_eq!(
+                    g4["missing"],
+                    serde_json::json!(["the cold-open child's peak (workload 6)"])
+                );
+                let process = report["peak_rss_mb"].as_f64().unwrap();
+                assert!(process >= report["fill_peak_rss_mb"].as_f64().unwrap());
+            }
         }
         assert!(backup.is_dir(), "the backup itself is left alone");
         std::fs::remove_dir_all(&root).unwrap();
