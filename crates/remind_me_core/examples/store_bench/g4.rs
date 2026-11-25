@@ -27,8 +27,8 @@ pub const RULE: &str = "G4 covers workloads 1 to 7. It fails when any \
     the crash report all have a scoring peak at or below 1500 MB. Otherwise \
     it is insufficient: a non-scoring sample, which may cover more than \
     workloads 1 to 7 or miss part of them, never decides a pass or a fail. \
-    A set whose reports lack or differ in provenance (code, backup, host, \
-    cgroup limits) is insufficient whatever its peaks.";
+    A set whose reports lack or differ in backend or provenance (code, \
+    backup, host, cgroup limits) is insufficient whatever its peaks.";
 
 /// The larger of the values present; `None` when none is.
 pub fn max_mb(values: impl IntoIterator<Item = Option<f64>>) -> Option<f64> {
@@ -172,16 +172,7 @@ pub fn verdict_from_files(paths: &[String]) -> super::Result<Value> {
         derive_crash_g4(&mut report);
         reports.push(report);
     }
-    let backends: std::collections::BTreeSet<&str> = reports
-        .iter()
-        .filter_map(|r| r["backend"].as_str())
-        .collect();
-    if backends.len() != 1 {
-        return Err(format!("the reports must be one candidate's; they name {backends:?}").into());
-    }
-    let mut v = verdict(&reports);
-    v["backend"] = json!(backends.into_iter().next());
-    Ok(v)
+    Ok(verdict(&reports))
 }
 
 /// A crash report from before `g4` was recorded still has every round's
@@ -221,13 +212,21 @@ fn derive_crash_g4(report: &mut Value) {
 /// What every report in a scored set must share.
 pub const PROVENANCE: [&str; 5] = ["git_sha", "backup_sha256", "host", "memory_max", "cpu_max"];
 
-/// Why `reports` are not one run set: a provenance field that a report
-/// lacks, or that differs between them. Empty when they agree.
+/// Why `reports` are not one candidate's run set: a backend or provenance
+/// field that a report lacks, or that differs between them. Empty when
+/// they agree.
 fn provenance_gaps(reports: &[Value]) -> Vec<String> {
     let mut gaps = Vec::new();
-    for field in PROVENANCE {
-        let values: Vec<&Value> = reports.iter().map(|r| &r["provenance"][field]).collect();
-        if values.iter().any(|v| v.is_null()) {
+    let backend = std::iter::once(("backend", None));
+    let fields = PROVENANCE.into_iter().map(|f| (f, Some("provenance")));
+    for (field, parent) in backend.chain(fields) {
+        let values: Vec<&Value> = reports
+            .iter()
+            .map(|r| parent.map_or(&r[field], |p| &r[p][field]))
+            .collect();
+        // Every field is a string; anything else names no run.
+        let blank = |v: &&Value| v.as_str().is_none_or(str::is_empty);
+        if values.iter().any(blank) {
             gaps.push(format!("a report has no {field}"));
         } else if values.windows(2).any(|w| w[0] != w[1]) {
             gaps.push(format!("the reports' {field} differs"));
@@ -286,6 +285,7 @@ pub fn verdict(reports: &[Value]) -> Value {
         "over": over,
         "missing": missing,
         "provenance": provenance,
+        "backend": reports.first().map(|r| &r["backend"]),
         "rule": RULE,
     })
 }
@@ -452,7 +452,7 @@ mod tests {
     }
 
     fn report(mode: &str, dataset: &str, scoring: bool, peak: f64) -> Value {
-        json!({ "mode": mode, "dataset": dataset, "provenance": provenance(),
+        json!({ "mode": mode, "dataset": dataset, "backend": "sqlite", "provenance": provenance(),
                 "g4": { "scoring": scoring, "peak_mb": peak } })
     }
 
@@ -515,6 +515,22 @@ mod tests {
             assert_eq!(v["provenance"], json!([why]));
             assert_eq!(v["over"], json!(["bench d3-50000: 1600 MB"]), "still shown");
         }
+        // A report with no backend cannot fill a slot, even with
+        // matching provenance and every other report in order.
+        for backend in [Value::Null, json!(""), json!(7)] {
+            let mut reports = set();
+            reports[1]["backend"] = backend.clone();
+            reports[2]["g4"]["peak_mb"] = json!(1_000.0);
+            let v = verdict(&reports);
+            assert_eq!(v["verdict"], "insufficient", "{backend}: {v}");
+            assert_eq!(v["provenance"], json!(["a report has no backend"]));
+        }
+        let mut reports = set();
+        reports[1]["backend"] = json!("engine");
+        assert_eq!(
+            verdict(&reports)["provenance"],
+            json!(["the reports' backend differs"])
+        );
         let mut reports = set();
         reports[0].as_object_mut().unwrap().remove("provenance");
         assert_eq!(verdict(&reports)["verdict"], "insufficient");
