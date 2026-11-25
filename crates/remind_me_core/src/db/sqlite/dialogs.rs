@@ -19,6 +19,9 @@ CREATE TABLE IF NOT EXISTS dialogs (
 CREATE INDEX IF NOT EXISTS dialogs_capture ON dialogs (capture_id, created_at, id);
 CREATE TRIGGER IF NOT EXISTS dialogs_no_update BEFORE UPDATE ON dialogs
     BEGIN SELECT RAISE(ABORT, 'dialogs are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS dialogs_no_replace BEFORE INSERT ON dialogs
+    WHEN EXISTS (SELECT 1 FROM dialogs WHERE id = NEW.id)
+    BEGIN SELECT RAISE(IGNORE); END;
 CREATE TRIGGER IF NOT EXISTS dialogs_no_delete BEFORE DELETE ON dialogs
     BEGIN SELECT RAISE(ABORT, 'dialogs are append-only'); END;
 ";
@@ -56,8 +59,10 @@ impl SqliteDialogs {
     }
 
     fn with_schema(conn: Connection) -> Result<Self> {
-        // REPLACE deletes the old row without firing delete triggers unless
-        // recursive triggers are on; on, the delete trigger below refuses it.
+        // The file refuses REPLACE by itself (`dialogs_no_replace`, which
+        // does not depend on any connection setting). This pragma is a
+        // second line: with it on, REPLACE's implicit delete also fires
+        // the delete trigger below.
         conn.execute_batch("PRAGMA recursive_triggers = ON;")
             .map_err(sqlite_error)?;
         conn.execute_batch(SCHEMA).map_err(sqlite_error)?;
@@ -209,10 +214,39 @@ mod tests {
             "REPLACE INTO dialogs (id, capture_id, created_at, head, body_hash, body_bytes) \
              VALUES ('d1', 'other', 't', 'changed', 'y', 9)",
         ] {
-            assert!(s.conn.execute(sql, []).is_err(), "{sql} was not refused");
+            // UPDATE and DELETE abort; REPLACE is ignored (zero rows).
+            if let Ok(changed) = s.conn.execute(sql, []) {
+                assert_eq!(changed, 0, "{sql} wrote a row");
+            }
             assert_eq!(s.get("d1").unwrap(), Some(r.clone()), "{sql} changed the row");
         }
         assert_eq!(s.count().unwrap(), 1);
+    }
+
+    #[test]
+    fn a_plain_second_connection_cannot_replace_a_dialog() {
+        let dir = scratch("plain");
+        let mut s = SqliteDialogs::open(&dir).unwrap();
+        let r = crate::db::dialogs::conformance::record("d1", "c1", "2026-11-25T00:00:00Z", "hi");
+        s.append(&r).unwrap();
+        // A default-settings connection: recursive triggers off, no pragmas.
+        let plain = Connection::open(dir.join(FILE)).unwrap();
+        for sql in [
+            "INSERT OR REPLACE INTO dialogs (id, capture_id, created_at, head, body_hash, body_bytes) \
+             VALUES ('d1', 'other', 't', 'changed', 'y', 9)",
+            "REPLACE INTO dialogs (id, capture_id, created_at, head, body_hash, body_bytes) \
+             VALUES ('d1', 'other', 't', 'changed', 'y', 9)",
+        ] {
+            // The trigger ignores the insert (zero rows) rather than erroring;
+            // either way the stored row must be untouched.
+            if let Ok(changed) = plain.execute(sql, []) {
+                assert_eq!(changed, 0, "{sql} wrote a row");
+            }
+            assert_eq!(s.get("d1").unwrap(), Some(r.clone()), "{sql} changed the row");
+        }
+        assert_eq!(s.count().unwrap(), 1);
+        drop(plain);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
