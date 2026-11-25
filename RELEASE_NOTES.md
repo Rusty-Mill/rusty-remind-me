@@ -2,6 +2,19 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-25 — Append-only dialog store: port and SQLite adapter (Mill Board #528, D75 to D81, ADR-0037)
+
+### Added
+- `db::dialogs::DialogStore`: an append-and-read-only port for verbatim dialogs, with a conformance suite (`dialog_conformance!`). The same id with identical content is a duplicate; the same id with different content is refused.
+- `db::sqlite::SqliteDialogs`: the adapter, one `dialogs.sqlite3` file whose triggers abort any UPDATE or DELETE.
+- `db::dialogs::DialogLog`: writes the body to the blob store, then the row (512-byte head, sha256, byte count), and reads a body back verified against its hash.
+
+### Not yet
+- Nothing calls it: captures still write to `memories`, and no existing dialog is moved. The wiring, the backup package, the reconcile on open, the rebuild check and the migration (a data migration, D3, run by Nano after a dry run) are separate pull requests.
+
+### Tests
+- The four port checks on SQLite; UPDATE and DELETE refused by the file; head cut on a character boundary; body stored once, idempotent on a rerun, read back verified; a missing or altered blob is an error.
+
 ## 2026-11-23 — `decisions import --apply`: import a repo decisions log (Mill Board #1564, D69 to D74)
 
 ### Added
