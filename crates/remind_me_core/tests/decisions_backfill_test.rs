@@ -1585,3 +1585,76 @@ fn a_rejected_row_after_an_accepted_one_takes_the_letter() {
     assert_eq!(refs, ["D1"]);
     assert_eq!(rejected_refs(&log), ["D1b"]);
 }
+
+fn gui() -> RefOptions {
+    RefOptions {
+        prefix: Some("gui".into()),
+        ..RefOptions::default()
+    }
+}
+
+const GUI_FIRST: &str = "| # | Decision | Why |\n|---|---|---|\n| D1 | D1: Old policy | a |\n";
+const GUI_SECOND: &str = "| D2 | Supersedes D1. New policy | b |\n";
+
+fn live_refs(store: &remind_me_core::db::Store<'_>) -> Vec<String> {
+    Memories::new(store)
+        .all_live()
+        .unwrap()
+        .into_iter()
+        .filter(|m| m.superseded_by.is_none())
+        .map(|m| m.metadata["decision_ref"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn a_prefixed_row_defining_its_own_ref_can_be_superseded() {
+    let both = format!("{GUI_FIRST}{GUI_SECOND}");
+    // One import.
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let applied =
+        apply_import(&store, &parse_log_with(&both, &gui()), "rusty_term", "g.md").unwrap();
+    assert_eq!(added_refs(&applied), ["gui D1", "gui D2"]);
+    assert!(applied.unlinked.is_empty(), "{:?}", applied.unlinked);
+    assert_eq!(live_refs(&store), ["gui D2"]);
+    assert_eq!(
+        added_memory(&store, &applied, "gui D1").content,
+        "Old policy"
+    );
+
+    let again = apply_import(&store, &parse_log_with(&both, &gui()), "rusty_term", "g.md").unwrap();
+    assert_eq!(
+        again.plan.unchanged.len(),
+        2,
+        "a rerun reads both as unchanged"
+    );
+    assert!(again.added.is_empty() && again.plan.changed.is_empty());
+
+    // Two imports.
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    apply_import(
+        &store,
+        &parse_log_with(GUI_FIRST, &gui()),
+        "rusty_term",
+        "g.md",
+    )
+    .unwrap();
+    let applied =
+        apply_import(&store, &parse_log_with(&both, &gui()), "rusty_term", "g.md").unwrap();
+    assert_eq!(added_refs(&applied), ["gui D2"]);
+    assert!(applied.unlinked.is_empty(), "{:?}", applied.unlinked);
+    assert_eq!(live_refs(&store), ["gui D2"]);
+}
+
+#[test]
+fn an_opening_definition_stays_without_a_prefix_or_for_another_ref() {
+    let plain = parse_log(GUI_FIRST);
+    assert_eq!(plain.entries[0].title, "D1: Old policy");
+    let other = parse_log_with(
+        "| # | Decision | Why |\n|---|---|---|\n| D2 | D1: Old policy | a |\n",
+        &gui(),
+    );
+    assert_eq!(other.entries[0].title, "D1: Old policy");
+    assert_eq!(other.entries[0].decision_ref, "gui D2");
+}

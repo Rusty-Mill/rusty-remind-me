@@ -523,7 +523,9 @@ pub struct Renamed {
 pub struct RefOptions {
     /// Put before every ref and every ref a link names, after a space:
     /// `gui-design` reads `D93` as `gui-design D93`. For two logs of one
-    /// project that number from the same D1.
+    /// project that number from the same D1. A row's text that opens by
+    /// defining its own bare ref (`D93: ...`) loses that opening, so the
+    /// stored content never names a ref other than the prefixed one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix: Option<String>,
     /// For a table with a `Date` column and no ref column: each row's ref is
@@ -572,6 +574,7 @@ pub fn parse_log_with(text: &str, options: &RefOptions) -> ParsedLog {
     }
     if let Some(prefix) = options.prefix.as_deref().map(str::trim) {
         for entry in &mut log.entries {
+            entry.title = without_own_definition(&entry.title, &entry.decision_ref);
             entry.decision_ref = prefixed(Some(prefix), &entry.decision_ref);
         }
         for rejected in &mut log.rejected_refs {
@@ -584,6 +587,21 @@ pub fn parse_log_with(text: &str, options: &RefOptions) -> ParsedLog {
         log.ref_prefix = Some(prefix.to_string());
     }
     log
+}
+
+/// `title` without an unqualified opening definition of the row's own
+/// `reference` (`D1: ...`, `D1 [stated] ...`, `D1 — ...`). Under a prefix the
+/// row is stored as `<prefix> D1`, and a content that still defined a bare
+/// `D1` would disagree with it, so no link could ever retire the row. A
+/// definition of another ref, or one with its own project, is kept as
+/// written, and so is a title that would be left empty.
+fn without_own_definition(title: &str, reference: &str) -> String {
+    let own = matches!(defined_ref(title), Some((None, defined)) if defined == reference);
+    let rest = without_ref(title, reference, "");
+    match own && !rest.trim().is_empty() {
+        true => rest.trim().to_string(),
+        false => title.to_string(),
+    }
 }
 
 /// `reference` with `prefix` before it, when there is one.
