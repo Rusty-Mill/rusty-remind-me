@@ -30,7 +30,8 @@ pub enum Op {
     /// Write `metadata.decision_ref` for the normalise plan's `add_ref` rows,
     /// re-planned at apply time; see
     /// [`crate::decisions_backfill::apply_normalize`]. The only decisions op
-    /// that writes. It needs no authorization beyond the daemon token every
+    /// that writes besides `DecisionsImportApply`. It needs no authorization
+    /// beyond the daemon token every
     /// op presents, as `Add`, `Resolve` and `TopicsApply` do. Claim rows
     /// are skipped, as every generic edit refuses them.
     DecisionsNormalizeApply {
@@ -42,6 +43,19 @@ pub enum Op {
         project: String,
         source: String,
         text: String,
+        #[serde(default)]
+        refs: crate::decisions_backfill::RefOptions,
+    },
+    /// Add the import plan's `new` entries as decisions and carry out the
+    /// supersedes links the file states, re-planned at apply time; see
+    /// [`crate::decisions_backfill::apply_import`]. Never overwrites a
+    /// stored decision. Authorized as `DecisionsNormalizeApply` is.
+    DecisionsImportApply {
+        project: String,
+        source: String,
+        text: String,
+        #[serde(default)]
+        refs: crate::decisions_backfill::RefOptions,
     },
     /// One project's decisions as a markdown log; see [`crate::decisions_log`].
     DecisionsLog {
@@ -254,14 +268,26 @@ fn run(store: &Store<'_>, op: &Op) -> Result<Value, String> {
             project,
             source,
             text,
+            refs,
         } => to_value(
             crate::db::memories::Memories::new(store)
                 .live_of_type("decision")
                 .map(|all| {
-                    let log = crate::decisions_backfill::parse_log(text);
+                    let log = crate::decisions_backfill::parse_log_with(text, refs);
                     crate::decisions_backfill::plan_import(&log, project, source, &all)
                 }),
         ),
+        Op::DecisionsImportApply {
+            project,
+            source,
+            text,
+            refs,
+        } => to_value(crate::decisions_backfill::apply_import(
+            store,
+            &crate::decisions_backfill::parse_log_with(text, refs),
+            project,
+            source,
+        )),
         Op::DecisionsLog {
             project,
             include_superseded,

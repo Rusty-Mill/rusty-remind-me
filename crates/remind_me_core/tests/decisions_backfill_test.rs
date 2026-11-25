@@ -944,3 +944,969 @@ fn apply_skips_claim_rows() {
         .expect("history")
         .is_empty());
 }
+
+// -- ref options and import apply (pack D69, D70, D74) -------------------------
+
+use remind_me_core::decisions_backfill::{
+    apply_import, parse_log_with, render_import_applied, RefOptions, IMPORT_SOURCE,
+};
+
+const DATED: &str = "\
+| Date | Decision | Why | Owner |
+|---|---|---|---|
+| 2026-10-21 | Build fresh | Structural gap | Owner |
+| 2026-10-21 | ~~tokio is the runtime~~ | Superseded | Owner |
+| 2026-10-21 | One VT engine | Reuse | Owner |
+| 2026-10-22 | Crate prefix rusty_mux | Confirmed | Owner |
+| soon | Undated row | None | Owner |
+";
+
+#[test]
+fn a_dated_table_gets_generated_refs_counted_per_date_in_file_order() {
+    let options = RefOptions {
+        generate: Some("mux".into()),
+        ..RefOptions::default()
+    };
+    let log = parse_log_with(DATED, &options);
+    let refs: Vec<(&str, bool)> = log
+        .entries
+        .iter()
+        .map(|e| (e.decision_ref.as_str(), e.struck))
+        .collect();
+    assert_eq!(
+        refs,
+        [
+            ("mux-2026-10-21-1", false),
+            ("mux-2026-10-21-2", true),
+            ("mux-2026-10-21-3", false),
+            ("mux-2026-10-22-1", false),
+        ],
+        "a struck row keeps its number, so later refs never shift"
+    );
+    assert_eq!(log.unparsed.len(), 1, "a row with no date is not guessed");
+
+    let plain = parse_log(DATED);
+    assert!(plain.entries.is_empty(), "no refs are made up unless asked");
+    assert_eq!(plain.unparsed.len(), 5);
+}
+
+const GUI: &str = "\
+| # | Decision | Why |
+|---|---|---|
+| D1 | Dark theme first | Taste |
+| D2 | Supersedes D1. Light theme first | Changed mind |
+| D2 | Tabs on top | Habit |
+";
+
+#[test]
+fn a_prefix_qualifies_refs_and_links_and_a_repeat_gets_a_letter() {
+    let options = RefOptions {
+        prefix: Some("gui-design".into()),
+        rename_duplicates: true,
+        ..RefOptions::default()
+    };
+    let log = parse_log_with(GUI, &options);
+    let refs: Vec<&str> = log
+        .entries
+        .iter()
+        .map(|e| e.decision_ref.as_str())
+        .collect();
+    assert_eq!(refs, ["gui-design D1", "gui-design D2", "gui-design D2b"]);
+    assert_eq!(log.renamed.len(), 1);
+    assert_eq!(log.renamed[0].from, "gui-design D2");
+    assert_eq!(log.renamed[0].to, "gui-design D2b");
+    assert_eq!(log.renamed[0].line, 5);
+
+    let plan = plan_import(&log, "rusty_term", "gui.md", &[]);
+    assert_eq!(plan.new.len(), 3);
+    assert!(plan.conflicts.is_empty());
+    assert_eq!(plan.supersedes.len(), 1);
+    assert_eq!(plan.supersedes[0].supersedes, "gui-design D1");
+    assert!(render_import(&plan).contains("gui-design D2 -> gui-design D2b"));
+
+    let strict = parse_log_with(
+        GUI,
+        &RefOptions {
+            prefix: Some("gui-design".into()),
+            ..RefOptions::default()
+        },
+    );
+    let plan = plan_import(&strict, "rusty_term", "gui.md", &[]);
+    assert_eq!(
+        plan.conflicts.len(),
+        2,
+        "without the flag a repeat imports neither"
+    );
+}
+
+const SMALL: &str = "\
+| # | Decision | Why | Tag |
+|---|---|---|---|
+| D1 | Use the engine store | Measured | [stated] |
+| D2 | Supersedes D1. Use SQLite | Benchmark | [stated] |
+| D3 | Confirms D2 | Checked again | [default] |
+| D4 | No rationale |  | [default] |
+";
+
+#[test]
+fn apply_adds_new_entries_links_them_and_a_second_run_adds_nothing() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let log = parse_log(SMALL);
+
+    let applied = apply_import(&store, &log, "rusty-remind-me", "docs/DECISIONS.md").unwrap();
+    let added: Vec<&str> = applied
+        .added
+        .iter()
+        .map(|r| r.decision_ref.as_str())
+        .collect();
+    assert_eq!(added, ["D1", "D2", "D3"]);
+    assert!(applied.failed.is_empty() && applied.skipped.is_empty());
+    assert_eq!(applied.linked.len(), 1);
+    assert!(applied.unlinked.is_empty());
+    assert_eq!(
+        applied.plan.needs_rationale.len(),
+        1,
+        "D4 is left for a person"
+    );
+    assert!(render_import_applied(&applied).contains("Added 3 decisions"));
+
+    let id = |r: &str| {
+        applied
+            .added
+            .iter()
+            .find(|a| a.decision_ref == r)
+            .and_then(|a| a.memory_id.clone())
+            .unwrap()
+    };
+    let memories = Memories::new(&store);
+    let d1 = memories.get_live(&id("D1")).unwrap().unwrap();
+    let d2 = memories.get_live(&id("D2")).unwrap().unwrap();
+    let d3 = memories.get_live(&id("D3")).unwrap().unwrap();
+    assert_eq!(d1.superseded_by.as_deref(), Some(id("D2").as_str()));
+    assert_eq!(d2.memory_type.as_deref(), Some("decision"));
+    assert_eq!(d2.category, "decision");
+    assert_eq!(d2.source, IMPORT_SOURCE);
+    assert_eq!(d2.project.as_deref(), Some("rusty-remind-me"));
+    assert_eq!(d2.content, "Supersedes D1. Use SQLite");
+    assert_eq!(d2.metadata["decision_ref"], "D2");
+    assert_eq!(d2.metadata["rationale"], "Benchmark");
+    assert_eq!(d2.metadata["tag"], "[stated]");
+    assert_eq!(
+        d2.metadata["imported"],
+        json!({ "source": "docs/DECISIONS.md", "line": 4 })
+    );
+    assert!(
+        d2.metadata.get("review").is_none(),
+        "an imported decision gets no review date (D74)"
+    );
+    assert_eq!(d3.metadata["confirms"], json!(["D2"]));
+
+    let again = apply_import(&store, &log, "rusty-remind-me", "docs/DECISIONS.md").unwrap();
+    assert!(again.added.is_empty() && again.linked.is_empty());
+    assert_eq!(
+        again.plan.unchanged.len(),
+        3,
+        "the retired D1 counts as stored, never as new again"
+    );
+}
+
+#[test]
+fn apply_never_overwrites_a_stored_decision_and_leaves_an_unknown_target_unlinked() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let mut stored = NewMemory::new("mem_d1", "Something else entirely", "2026-11-01T00:00:00Z");
+    stored.memory_type = "decision".into();
+    stored.project = Some("rusty-remind-me".into());
+    stored.metadata = json!({ "decision_ref": "D1", "rationale": "older" });
+    Memories::new(&store).insert(&stored).unwrap();
+    let log = parse_log(
+        "| # | Decision | Why |\n|---|---|---|\n| D1 | Use the engine store | Measured |\n| D9 | Supersedes D8. New | Why |\n",
+    );
+
+    let applied = apply_import(&store, &log, "rusty-remind-me", "d.md").unwrap();
+    assert_eq!(applied.plan.changed.len(), 1);
+    let kept = Memories::new(&store).get_live("mem_d1").unwrap().unwrap();
+    assert_eq!(kept.content, "Something else entirely");
+    assert_eq!(applied.added.len(), 1, "D9 still imports");
+    assert_eq!(applied.unlinked.len(), 1, "D8 is not stored: not guessed");
+}
+
+/// Each added row's ref, in the order the run wrote them.
+fn added_refs(applied: &remind_me_core::decisions_backfill::ImportApplied) -> Vec<&str> {
+    applied
+        .added
+        .iter()
+        .map(|r| r.decision_ref.as_str())
+        .collect()
+}
+
+/// The stored decision `applied` added for `reference`.
+fn added_memory(
+    store: &remind_me_core::db::Store<'_>,
+    applied: &remind_me_core::decisions_backfill::ImportApplied,
+    reference: &str,
+) -> Memory {
+    let id = applied
+        .added
+        .iter()
+        .find(|r| r.decision_ref == reference)
+        .and_then(|r| r.memory_id.clone())
+        .expect("added");
+    Memories::new(store)
+        .get_live(&id)
+        .expect("read")
+        .expect("stored")
+}
+
+#[test]
+fn apply_writes_a_target_before_the_entry_that_supersedes_it_in_any_file_order() {
+    let reversed = "\
+| # | Decision | Why |
+|---|---|---|
+| D2 | Supersedes D1. Use SQLite | Benchmark |
+| D1 | Use the engine store | Measured |
+";
+    let mixed = "\
+| # | Decision | Why |
+|---|---|---|
+| D2 | Supersedes D3. Use SQLite | Benchmark |
+
+## D3. Use the engine store
+
+**Decision.** Keep it.
+**Why.** Measured.
+";
+    for (text, target) in [(reversed, "D1"), (mixed, "D3")] {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        let applied = apply_import(&store, &parse_log(text), "rusty-remind-me", "d.md").unwrap();
+        assert_eq!(added_refs(&applied), [target, "D2"], "{target}");
+        assert_eq!(applied.linked.len(), 1, "{target}");
+        assert!(applied.unlinked.is_empty() && applied.skipped.is_empty());
+        let older = added_memory(&store, &applied, target);
+        let newer = added_memory(&store, &applied, "D2");
+        assert_eq!(older.superseded_by.as_deref(), Some(newer.id.as_str()));
+        assert!(newer.superseded_by.is_none());
+    }
+}
+
+#[test]
+fn apply_refuses_a_supersedes_cycle_before_writing_anything() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let log = parse_log(
+        "| # | Decision | Why |\n|---|---|---|\n| D1 | Supersedes D2. A | x |\n| D2 | Supersedes D1. B | y |\n",
+    );
+    let applied = apply_import(&store, &log, "rusty-remind-me", "d.md").unwrap();
+    assert!(applied.added.is_empty());
+    assert_eq!(applied.skipped.len(), 2);
+    assert!(applied.skipped[0].note.contains("cycle"));
+    assert!(Memories::new(&store).all_live().unwrap().is_empty());
+}
+
+#[test]
+fn apply_holds_back_an_entry_whose_target_in_the_file_was_not_written() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    // D1 has no rationale, so it is left for a person; D2 must not go in
+    // without its link and leave both live once D1 is imported later.
+    let log = parse_log(
+        "| # | Decision | Why |\n|---|---|---|\n| D1 | Old |  |\n| D2 | Supersedes D1. New | Why |\n",
+    );
+    let applied = apply_import(&store, &log, "rusty-remind-me", "d.md").unwrap();
+    assert!(applied.added.is_empty());
+    assert_eq!(applied.skipped.len(), 1);
+    assert_eq!(applied.skipped[0].decision_ref, "D2");
+    assert!(applied.skipped[0].note.contains("D1"));
+}
+
+#[test]
+fn apply_leaves_a_target_whose_refs_disagree_unlinked_and_live() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let mut odd = NewMemory::new("mem_odd", "An older call", "2026-11-01T00:00:00Z");
+    odd.memory_type = "decision".into();
+    odd.project = Some("rusty-remind-me".into());
+    odd.metadata = json!({ "decision_ref": "D1", "decision_id": "D2", "rationale": "x" });
+    Memories::new(&store).insert(&odd).unwrap();
+    let log =
+        parse_log("| # | Decision | Why |\n|---|---|---|\n| D5 | Supersedes D1. New | Why |\n");
+
+    let applied = apply_import(&store, &log, "rusty-remind-me", "d.md").unwrap();
+    assert_eq!(added_refs(&applied), ["D5"]);
+    assert_eq!(applied.unlinked.len(), 1);
+    assert!(applied.linked.is_empty());
+    let kept = Memories::new(&store).get_live("mem_odd").unwrap().unwrap();
+    assert!(
+        kept.superseded_by.is_none(),
+        "an untrusted identity is never retired"
+    );
+}
+
+#[test]
+fn apply_writes_nothing_for_a_row_with_a_plain_and_an_ambiguous_link() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let first = parse_log("| # | Decision | Why |\n|---|---|---|\n| D1 | Old | x |\n");
+    apply_import(&store, &first, "rusty-remind-me", "d.md").unwrap();
+    let log = parse_log(
+        "| # | Decision | Why |\n|---|---|---|\n| D1 | Old | x |\n| D5 | Supersedes D1; not supersedes D2. New | Why |\n",
+    );
+
+    let applied = apply_import(&store, &log, "rusty-remind-me", "d.md").unwrap();
+    assert_eq!(applied.plan.ambiguous.len(), 1);
+    assert!(applied.added.is_empty() && applied.linked.is_empty());
+    let live = Memories::new(&store).all_live().unwrap();
+    assert_eq!(live.len(), 1);
+    assert!(live[0].superseded_by.is_none(), "D1 is not retired");
+}
+
+#[test]
+fn apply_retires_a_target_named_twice_by_one_entry_once() {
+    let same_sentence = "\
+| # | Decision | Why |
+|---|---|---|
+| D1 | Old policy | x |
+| D2 | Supersedes D1. New policy supersedes D1. | y |
+";
+    let title_and_body = "\
+| # | Decision | Why |
+|---|---|---|
+| D1 | Old policy | x |
+
+## D2. Supersedes D1.
+
+**Decision.** This supersedes D1.
+**Why.** y
+";
+    for text in [same_sentence, title_and_body] {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        let applied = apply_import(&store, &parse_log(text), "rusty-remind-me", "d.md").unwrap();
+        assert!(applied.failed.is_empty(), "{:?}", applied.failed);
+        assert_eq!(added_refs(&applied), ["D1", "D2"]);
+        assert_eq!(applied.linked.len(), 1, "the link is reported once");
+        let older = added_memory(&store, &applied, "D1");
+        let newer = added_memory(&store, &applied, "D2");
+        assert_eq!(older.superseded_by.as_deref(), Some(newer.id.as_str()));
+    }
+}
+
+const LINK_FIRST: &str = "\
+| # | Decision | Why |
+|---|---|---|
+| D1 | Old policy | x |
+| D2 | Supersedes D1: New policy | y |
+";
+const LINK_THIRD: &str = "| D3 | Supersedes D2. Newer policy | z |\n";
+
+/// D1 and D2 retired, D3 live: `Supersedes D1:` opening D2 was read as a
+/// link, never as D2 defining D1.
+fn assert_chain_retired(store: &remind_me_core::db::Store<'_>) {
+    let live = Memories::new(store).all_live().unwrap();
+    let retired = |r: &str| {
+        live.iter()
+            .find(|m| m.metadata["decision_ref"] == r)
+            .map(|m| m.superseded_by.is_some())
+            .expect(r)
+    };
+    assert!(retired("D1") && retired("D2"), "D1 and D2 are retired");
+    assert!(!retired("D3"), "D3 is live");
+}
+
+#[test]
+fn a_link_clause_opening_an_entry_is_not_its_identity_in_one_import() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let log = parse_log(&format!("{LINK_FIRST}{LINK_THIRD}"));
+    let applied = apply_import(&store, &log, "rusty-remind-me", "d.md").unwrap();
+    assert_eq!(added_refs(&applied), ["D1", "D2", "D3"]);
+    assert_eq!(applied.linked.len(), 2);
+    assert!(applied.unlinked.is_empty(), "{:?}", applied.unlinked);
+    assert_chain_retired(&store);
+}
+
+#[test]
+fn a_link_clause_opening_an_entry_is_not_its_identity_across_two_imports() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    apply_import(&store, &parse_log(LINK_FIRST), "rusty-remind-me", "d.md").unwrap();
+    let log = parse_log(&format!("{LINK_FIRST}{LINK_THIRD}"));
+    let applied = apply_import(&store, &log, "rusty-remind-me", "d.md").unwrap();
+    assert_eq!(added_refs(&applied), ["D3"]);
+    assert_eq!(applied.linked.len(), 1, "D3 -> D2 is linked");
+    assert!(applied.unlinked.is_empty(), "{:?}", applied.unlinked);
+    assert_chain_retired(&store);
+}
+
+/// The exported log's rows as (ref, date) pairs, in log order.
+fn exported_dates(store: &remind_me_core::db::Store<'_>) -> Vec<(String, String)> {
+    use remind_me_core::decisions_log::{export, DecisionsQuery};
+    let log = export(
+        store,
+        &DecisionsQuery {
+            project: "rusty-remind-me".into(),
+            include_superseded: true,
+        },
+    )
+    .unwrap();
+    log.markdown
+        .lines()
+        .filter(|l| l.starts_with("| D"))
+        .skip(1) // the header row
+        .map(|l| {
+            let cells: Vec<&str> = l.split('|').map(str::trim).collect();
+            (cells[1].to_string(), cells[2].to_string())
+        })
+        .collect()
+}
+
+#[test]
+fn an_imported_entry_exports_with_its_logged_date() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let log = parse_log("| # | Date | Decision | Why |\n|---|---|---|---|\n| D1 | 2026-10-21 | Build fresh | Gap |\n");
+    apply_import(&store, &log, "rusty-remind-me", "d.md").unwrap();
+    assert_eq!(exported_dates(&store), [("D1".into(), "2026-10-21".into())]);
+}
+
+#[test]
+fn imported_entries_export_in_logged_date_order() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let log = parse_log(
+        "| # | Date | Decision | Why |\n|---|---|---|---|\n| D1 | 2026-10-21 | Later | x |\n| D2 | 2026-09-02 | Earlier | y |\n",
+    );
+    apply_import(&store, &log, "rusty-remind-me", "d.md").unwrap();
+    assert_eq!(
+        exported_dates(&store),
+        [
+            ("D2".into(), "2026-09-02".into()),
+            ("D1".into(), "2026-10-21".into())
+        ]
+    );
+}
+
+#[test]
+fn an_undated_import_exports_its_created_day() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let log = parse_log("| # | Decision | Why |\n|---|---|---|\n| D1 | Build fresh | Gap |\n");
+    let applied = apply_import(&store, &log, "rusty-remind-me", "d.md").unwrap();
+    let created = added_memory(&store, &applied, "D1").created_at;
+    assert_eq!(
+        exported_dates(&store),
+        [("D1".into(), created[..10].to_string())]
+    );
+}
+
+#[test]
+fn a_malformed_date_is_reported_not_stored() {
+    let log = parse_log(
+        "| # | Date | Decision | Why |\n|---|---|---|---|\n| D1 | Oct 21 | Build fresh | Gap |\n| D2 | 2026-02-30 | Other | x |\n",
+    );
+    assert!(log.entries.is_empty(), "{:?}", log.entries);
+    assert_eq!(log.unparsed.len(), 2);
+    assert!(log.unparsed.iter().all(|u| u.reason.contains("YYYY-MM-DD")));
+
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let applied = apply_import(&store, &log, "rusty-remind-me", "d.md").unwrap();
+    assert!(applied.added.is_empty());
+    assert!(Memories::new(&store).all_live().unwrap().is_empty());
+}
+
+#[test]
+fn an_entry_superseding_a_row_rejected_for_its_date_waits_for_it() {
+    let log_with = |date: &str| {
+        parse_log(&format!(
+            "| # | Date | Decision | Why |\n|---|---|---|---|\n| D1 | {date} | Old | x |\n| D2 | 2026-10-22 | Supersedes D1. New | y |\n"
+        ))
+    };
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+
+    let bad = log_with("Oct 21");
+    assert_eq!(bad.unparsed.len(), 1, "D1 is reported");
+    let applied = apply_import(&store, &bad, "rusty-remind-me", "d.md").unwrap();
+    assert!(applied.added.is_empty());
+    assert_eq!(applied.skipped.len(), 1);
+    assert_eq!(applied.skipped[0].decision_ref, "D2");
+    assert!(
+        applied.skipped[0].note.contains("D1") && applied.skipped[0].note.contains("rejected"),
+        "{}",
+        applied.skipped[0].note
+    );
+    assert!(Memories::new(&store).all_live().unwrap().is_empty());
+
+    let fixed = apply_import(&store, &log_with("2026-10-21"), "rusty-remind-me", "d.md").unwrap();
+    assert_eq!(added_refs(&fixed), ["D1", "D2"]);
+    assert_eq!(fixed.linked.len(), 1);
+    let live: Vec<_> = Memories::new(&store)
+        .all_live()
+        .unwrap()
+        .into_iter()
+        .filter(|m| m.superseded_by.is_none())
+        .map(|m| m.metadata["decision_ref"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(live, ["D2"], "only D2 is live");
+}
+
+fn mux_log(first_text: &str) -> String {
+    format!(
+        "| Date | Decision | Why |\n|---|---|---|\n| 2026-10-21 | {first_text} | a |\n| 2026-10-21 | Decision B | b |\n| 2026-10-22 | Other day | c |\n"
+    )
+}
+
+fn mux_options() -> RefOptions {
+    RefOptions {
+        generate: Some("mux".into()),
+        ..RefOptions::default()
+    }
+}
+
+#[test]
+fn a_rejected_generated_row_keeps_its_place_in_the_date_sequence() {
+    let log = parse_log_with(&mux_log(""), &mux_options());
+    let refs: Vec<&str> = log
+        .entries
+        .iter()
+        .map(|e| e.decision_ref.as_str())
+        .collect();
+    assert_eq!(refs, ["mux-2026-10-21-2", "mux-2026-10-22-1"]);
+    let rejected: Vec<&str> = log
+        .rejected_refs
+        .iter()
+        .map(|r| r.decision_ref.as_str())
+        .collect();
+    assert_eq!(rejected, ["mux-2026-10-21-1"]);
+}
+
+#[test]
+fn mending_a_rejected_generated_row_imports_it_and_leaves_the_rest_unchanged() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let first = parse_log_with(&mux_log(""), &mux_options());
+    let applied = apply_import(&store, &first, "rusty_mux", "mux.md").unwrap();
+    assert_eq!(
+        added_refs(&applied),
+        ["mux-2026-10-21-2", "mux-2026-10-22-1"]
+    );
+
+    let mended = parse_log_with(&mux_log("Decision A"), &mux_options());
+    let again = apply_import(&store, &mended, "rusty_mux", "mux.md").unwrap();
+    assert_eq!(added_refs(&again), ["mux-2026-10-21-1"]);
+    assert_eq!(
+        again.plan.unchanged.len(),
+        2,
+        "B and the other day are unchanged"
+    );
+    assert!(again.plan.changed.is_empty());
+    assert_eq!(
+        Memories::new(&store).all_live().unwrap().len(),
+        3,
+        "no second copy of B"
+    );
+}
+
+fn repeat_log(first_text: &str) -> String {
+    format!(
+        "| # | Decision | Why |\n|---|---|---|\n| D1 | {first_text} | a |\n| D1 | Decision B | b |\n"
+    )
+}
+
+fn renaming() -> RefOptions {
+    RefOptions {
+        rename_duplicates: true,
+        ..RefOptions::default()
+    }
+}
+
+fn rejected_refs(log: &remind_me_core::decisions_backfill::ParsedLog) -> Vec<&str> {
+    log.rejected_refs
+        .iter()
+        .map(|r| r.decision_ref.as_str())
+        .collect()
+}
+
+#[test]
+fn a_rejected_repeat_takes_its_letter_in_file_order() {
+    let log = parse_log_with(&repeat_log(""), &renaming());
+    assert_eq!(rejected_refs(&log), ["D1"]);
+    let refs: Vec<&str> = log
+        .entries
+        .iter()
+        .map(|e| e.decision_ref.as_str())
+        .collect();
+    assert_eq!(refs, ["D1b"]);
+    assert_eq!(log.renamed.len(), 1);
+
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let applied = apply_import(&store, &log, "rusty-remind-me", "d.md").unwrap();
+    assert_eq!(added_refs(&applied), ["D1b"]);
+
+    let mended = parse_log_with(&repeat_log("Decision A"), &renaming());
+    let again = apply_import(&store, &mended, "rusty-remind-me", "d.md").unwrap();
+    assert_eq!(added_refs(&again), ["D1"]);
+    assert_eq!(again.plan.unchanged.len(), 1, "B stays D1b, unchanged");
+    assert!(again.plan.changed.is_empty());
+    assert_eq!(
+        Memories::new(&store).all_live().unwrap().len(),
+        2,
+        "no second copy"
+    );
+}
+
+#[test]
+fn without_renaming_a_rejected_repeat_makes_the_ref_a_conflict() {
+    let log = parse_log(&repeat_log(""));
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let applied = apply_import(&store, &log, "rusty-remind-me", "d.md").unwrap();
+    assert_eq!(applied.plan.conflicts.len(), 1);
+    assert_eq!(applied.plan.conflicts[0].note, "ref appears more than once");
+    assert!(applied.added.is_empty());
+    assert!(Memories::new(&store).all_live().unwrap().is_empty());
+}
+
+#[test]
+fn a_rejected_row_after_an_accepted_one_takes_the_letter() {
+    let log = parse_log_with(
+        "| # | Decision | Why |\n|---|---|---|\n| D1 | Decision A | a |\n| D1 |  | b |\n",
+        &renaming(),
+    );
+    let refs: Vec<&str> = log
+        .entries
+        .iter()
+        .map(|e| e.decision_ref.as_str())
+        .collect();
+    assert_eq!(refs, ["D1"]);
+    assert_eq!(rejected_refs(&log), ["D1b"]);
+}
+
+fn gui() -> RefOptions {
+    RefOptions {
+        prefix: Some("gui".into()),
+        ..RefOptions::default()
+    }
+}
+
+const GUI_FIRST: &str = "| # | Decision | Why |\n|---|---|---|\n| D1 | D1: Old policy | a |\n";
+const GUI_SECOND: &str = "| D2 | Supersedes D1. New policy | b |\n";
+
+fn live_refs(store: &remind_me_core::db::Store<'_>) -> Vec<String> {
+    Memories::new(store)
+        .all_live()
+        .unwrap()
+        .into_iter()
+        .filter(|m| m.superseded_by.is_none())
+        .map(|m| m.metadata["decision_ref"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn a_prefixed_row_defining_its_own_ref_can_be_superseded() {
+    let both = format!("{GUI_FIRST}{GUI_SECOND}");
+    // One import.
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let applied =
+        apply_import(&store, &parse_log_with(&both, &gui()), "rusty_term", "g.md").unwrap();
+    assert_eq!(added_refs(&applied), ["gui D1", "gui D2"]);
+    assert!(applied.unlinked.is_empty(), "{:?}", applied.unlinked);
+    assert_eq!(live_refs(&store), ["gui D2"]);
+    assert_eq!(
+        added_memory(&store, &applied, "gui D1").content,
+        "Old policy"
+    );
+
+    let again = apply_import(&store, &parse_log_with(&both, &gui()), "rusty_term", "g.md").unwrap();
+    assert_eq!(
+        again.plan.unchanged.len(),
+        2,
+        "a rerun reads both as unchanged"
+    );
+    assert!(again.added.is_empty() && again.plan.changed.is_empty());
+
+    // Two imports.
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    apply_import(
+        &store,
+        &parse_log_with(GUI_FIRST, &gui()),
+        "rusty_term",
+        "g.md",
+    )
+    .unwrap();
+    let applied =
+        apply_import(&store, &parse_log_with(&both, &gui()), "rusty_term", "g.md").unwrap();
+    assert_eq!(added_refs(&applied), ["gui D2"]);
+    assert!(applied.unlinked.is_empty(), "{:?}", applied.unlinked);
+    assert_eq!(live_refs(&store), ["gui D2"]);
+}
+
+#[test]
+fn an_opening_definition_stays_without_a_prefix_or_for_another_ref() {
+    let plain = parse_log(GUI_FIRST);
+    assert_eq!(plain.entries[0].title, "D1: Old policy");
+    let other = parse_log_with(
+        "| # | Decision | Why |\n|---|---|---|\n| D2 | D1: Old policy | a |\n",
+        &gui(),
+    );
+    assert_eq!(other.entries[0].title, "D1: Old policy");
+    assert_eq!(other.entries[0].decision_ref, "gui D2");
+}
+
+#[test]
+fn an_unprefixed_row_opening_with_its_ref_reruns_unchanged_until_its_text_changes() {
+    let log = |text: &str| {
+        parse_log(&format!(
+            "| # | Decision | Why |\n|---|---|---|\n| D1 | {text} | a |\n"
+        ))
+    };
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let applied = apply_import(&store, &log("D1: Old policy"), "rusty-remind-me", "d.md").unwrap();
+    assert_eq!(
+        added_memory(&store, &applied, "D1").content,
+        "D1: Old policy"
+    );
+
+    let again = apply_import(&store, &log("D1: Old policy"), "rusty-remind-me", "d.md").unwrap();
+    assert_eq!(again.plan.unchanged.len(), 1, "{:?}", again.plan.changed);
+    assert!(again.plan.changed.is_empty());
+
+    let edited = apply_import(&store, &log("D1: New policy"), "rusty-remind-me", "d.md").unwrap();
+    assert_eq!(edited.plan.changed.len(), 1);
+    assert!(edited.plan.unchanged.is_empty());
+}
+
+fn repeat_with(third: &str) -> String {
+    format!(
+        "| # | Decision | Why |\n|---|---|---|\n| D1 | D1: Old policy | a |\n| D1 | D1: Other policy | b |\n| D2 | {third} | c |\n"
+    )
+}
+
+fn renaming_with(prefix: Option<&str>) -> RefOptions {
+    RefOptions {
+        rename_duplicates: true,
+        prefix: prefix.map(str::to_string),
+        ..RefOptions::default()
+    }
+}
+
+#[test]
+fn a_renamed_repeat_can_be_superseded_and_reruns_unchanged() {
+    let text = repeat_with("Supersedes D1b. Newer policy");
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let log = parse_log_with(&text, &renaming_with(None));
+    let applied = apply_import(&store, &log, "rusty-remind-me", "d.md").unwrap();
+    assert_eq!(added_refs(&applied), ["D1", "D1b", "D2"]);
+    assert!(applied.unlinked.is_empty(), "{:?}", applied.unlinked);
+    assert_eq!(
+        added_memory(&store, &applied, "D1b").content,
+        "Other policy"
+    );
+    let mut live = live_refs(&store);
+    live.sort();
+    assert_eq!(live, ["D1", "D2"], "D1b is retired, D1 stays live");
+
+    let again = apply_import(
+        &store,
+        &parse_log_with(&text, &renaming_with(None)),
+        "rusty-remind-me",
+        "d.md",
+    )
+    .unwrap();
+    assert!(again.added.is_empty());
+    assert_eq!(again.plan.unchanged.len(), 3, "{:?}", again.plan.changed);
+}
+
+#[test]
+fn a_renamed_repeat_can_be_confirmed() {
+    let text = repeat_with("Confirms D1b. Still holds");
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let log = parse_log_with(&text, &renaming_with(None));
+    let applied = apply_import(&store, &log, "rusty-remind-me", "d.md").unwrap();
+    assert_eq!(
+        added_memory(&store, &applied, "D2").metadata["confirms"],
+        json!(["D1b"])
+    );
+    let mut live = live_refs(&store);
+    live.sort();
+    assert_eq!(live, ["D1", "D1b", "D2"]);
+}
+
+#[test]
+fn a_prefixed_renamed_repeat_can_be_superseded() {
+    let text = repeat_with("Supersedes D1b. Newer policy");
+    let options = renaming_with(Some("gui"));
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let applied = apply_import(
+        &store,
+        &parse_log_with(&text, &options),
+        "rusty_term",
+        "g.md",
+    )
+    .unwrap();
+    assert!(applied.unlinked.is_empty(), "{:?}", applied.unlinked);
+    let mut live = live_refs(&store);
+    live.sort();
+    assert_eq!(live, ["gui D1", "gui D2"], "gui D1b is retired");
+    let again = apply_import(
+        &store,
+        &parse_log_with(&text, &options),
+        "rusty_term",
+        "g.md",
+    )
+    .unwrap();
+    assert!(again.added.is_empty());
+    assert!(again.plan.changed.is_empty());
+}
+
+#[test]
+fn a_renamed_repeat_opening_with_another_ref_keeps_its_text() {
+    let log = parse_log_with(
+        "| # | Decision | Why |\n|---|---|---|\n| D1 | Old | a |\n| D1 | D7: Other | b |\n",
+        &renaming_with(None),
+    );
+    assert_eq!(log.entries[1].decision_ref, "D1b");
+    assert_eq!(log.entries[1].title, "D7: Other");
+}
+
+fn copies_of_d1(accepted: usize, rejected: usize) -> String {
+    let mut text = String::from("| # | Decision | Why |\n|---|---|---|\n");
+    for n in 0..accepted {
+        text.push_str(&format!("| D1 | Copy {n} | why |\n"));
+    }
+    for _ in 0..rejected {
+        text.push_str("| D1 |  | why |\n");
+    }
+    text.push_str("| D2 | Another | why |\n");
+    text
+}
+
+#[test]
+fn twenty_six_copies_all_import_with_letters_up_to_z() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let log = parse_log_with(&copies_of_d1(26, 0), &renaming_with(None));
+    let applied = apply_import(&store, &log, "rusty-remind-me", "d.md").unwrap();
+    let refs = added_refs(&applied);
+    assert_eq!(refs.len(), 27);
+    assert_eq!(refs[0], "D1");
+    assert_eq!(refs[1], "D1b");
+    assert_eq!(refs[25], "D1z");
+}
+
+#[test]
+fn more_copies_than_letters_make_the_group_a_conflict() {
+    for (accepted, rejected) in [(27, 0), (26, 1)] {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        let log = parse_log_with(&copies_of_d1(accepted, rejected), &renaming_with(None));
+        assert!(log.renamed.is_empty(), "{accepted}+{rejected}");
+        let applied = apply_import(&store, &log, "rusty-remind-me", "d.md").unwrap();
+        assert_eq!(added_refs(&applied), ["D2"], "{accepted}+{rejected}");
+        assert_eq!(applied.plan.conflicts.len(), accepted);
+        assert!(applied.plan.conflicts[0].note.contains("more than 26"));
+    }
+}
+
+/// Each live, unretired decision as `(ref, content)`, sorted.
+fn live_contents(store: &remind_me_core::db::Store<'_>) -> Vec<(String, String)> {
+    let mut rows: Vec<(String, String)> = Memories::new(store)
+        .all_live()
+        .unwrap()
+        .into_iter()
+        .filter(|m| m.superseded_by.is_none())
+        .map(|m| {
+            let r = m.metadata["decision_ref"].as_str().unwrap().to_string();
+            (r, m.content)
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+fn two_d1s(first: &str, second: &str, extra: &str) -> String {
+    format!(
+        "| # | Decision | Why |\n|---|---|---|\n| D1 | {first} | a |\n| D1 | {second} | a |\n{extra}"
+    )
+}
+
+fn pairs(rows: &[(&str, &str)]) -> Vec<(String, String)> {
+    rows.iter()
+        .map(|(r, c)| (r.to_string(), c.to_string()))
+        .collect()
+}
+
+#[test]
+fn a_link_to_a_renamed_repeat_the_file_now_means_differently_is_held_back() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let options = renaming_with(None);
+    let first = parse_log_with(&two_d1s("A", "B", ""), &options);
+    apply_import(&store, &first, "rusty-remind-me", "d.md").unwrap();
+    let stored = pairs(&[("D1", "A"), ("D1b", "B")]);
+    assert_eq!(live_contents(&store), stored);
+
+    let swapped = two_d1s("B", "A", "| D2 | Supersedes D1b. Newer | c |\n");
+    let applied = apply_import(
+        &store,
+        &parse_log_with(&swapped, &options),
+        "rusty-remind-me",
+        "d.md",
+    )
+    .unwrap();
+    assert!(applied.added.is_empty(), "{:?}", added_refs(&applied));
+    assert_eq!(applied.plan.changed.len(), 2);
+    assert_eq!(applied.skipped.len(), 1);
+    assert_eq!(applied.skipped[0].decision_ref, "D2");
+    assert!(
+        applied.skipped[0].note.contains("D1b"),
+        "{}",
+        applied.skipped[0].note
+    );
+    assert!(applied.linked.is_empty());
+    assert_eq!(live_contents(&store), stored, "D1 and D1b untouched");
+}
+
+#[test]
+fn a_link_to_a_renamed_repeat_the_file_still_means_retires_it() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let options = renaming_with(None);
+    let first = parse_log_with(&two_d1s("A", "B", ""), &options);
+    apply_import(&store, &first, "rusty-remind-me", "d.md").unwrap();
+
+    let text = two_d1s("A", "B", "| D2 | Supersedes D1b. Newer | c |\n");
+    let applied = apply_import(
+        &store,
+        &parse_log_with(&text, &options),
+        "rusty-remind-me",
+        "d.md",
+    )
+    .unwrap();
+    assert_eq!(added_refs(&applied), ["D2"]);
+    assert_eq!(applied.linked.len(), 1);
+    assert_eq!(
+        live_contents(&store),
+        pairs(&[("D1", "A"), ("D2", "Supersedes D1b. Newer")]),
+        "the stored D1b (B) is retired"
+    );
+    let again = apply_import(
+        &store,
+        &parse_log_with(&text, &options),
+        "rusty-remind-me",
+        "d.md",
+    )
+    .unwrap();
+    assert!(again.added.is_empty());
+    assert!(again.plan.changed.is_empty(), "{:?}", again.plan.changed);
+}

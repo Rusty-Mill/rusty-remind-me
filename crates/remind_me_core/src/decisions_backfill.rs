@@ -17,10 +17,12 @@
 
 use crate::db::history::{Revisions, Tracked};
 use crate::db::memories::{Memories, MemoryEdit};
-use crate::db::{queries, Store, StoreError};
+use crate::db::queries::{self, PreparedAdd};
+use crate::db::{Store, StoreError};
 use crate::kinds::StructuredFields;
 use crate::models::Memory;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 
 // -- refs -----------------------------------------------------------------
 
@@ -30,12 +32,34 @@ fn is_d_ref(token: &str) -> bool {
     (1..=4).contains(&digits.len()) && digits.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// A ref a link may name: `D<n>`, or a renamed repeat `D<n>b` to `D<n>z`
+/// ([`RefOptions::rename_duplicates`]).
+fn is_link_target(token: &str) -> bool {
+    match token.strip_suffix(|c: char| ('b'..='z').contains(&c)) {
+        Some(base) if is_d_ref(base) => true,
+        _ => is_d_ref(token),
+    }
+}
+
 /// Every `D<n>` token in `text`, in order.
 fn d_refs(text: &str) -> Vec<String> {
     text.split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|t| is_d_ref(t))
         .map(str::to_string)
         .collect()
+}
+
+/// Whether the word before a ref is a link keyword (`Supersedes D1: ...`,
+/// `confirms D7 (...)`), read as [`links`] reads it: the ref is a link's
+/// target, never the content defining it.
+fn follows_link_keyword(before: &[&str]) -> bool {
+    before.last().is_some_and(|word| {
+        let keyword = word
+            .trim_start_matches(QUOTES)
+            .trim_start_matches('(')
+            .to_ascii_lowercase();
+        matches!(keyword.as_str(), "supersedes" | "confirms")
+    })
 }
 
 /// The ref a memory's content opens by defining: `D22: ...`, `D22 [stated]`,
@@ -53,7 +77,7 @@ fn defined_ref(content: &str) -> Option<(Option<String>, String)> {
             || words
                 .get(i + 1)
                 .is_some_and(|next| next.starts_with(['[', '(']) || *next == "—" || *next == "-");
-        if !marked {
+        if !marked || follows_link_keyword(&words[..i]) {
             return None;
         }
         let project = (i > 0).then(|| words[..i].join(" "));
@@ -474,28 +498,229 @@ pub struct Unparsed {
 pub struct ParsedLog {
     pub entries: Vec<LogEntry>,
     pub unparsed: Vec<Unparsed>,
+    /// Repeated refs given a letter ([`RefOptions::rename_duplicates`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub renamed: Vec<Renamed>,
+    /// The prefix every ref carries, links included ([`RefOptions::prefix`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_prefix: Option<String>,
+    /// Refs of rows rejected after their ref was read (a bad Date, no
+    /// decision text): still entries of the file, so a row superseding one
+    /// waits for it instead of going in unlinked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rejected_refs: Vec<RejectedRef>,
+    /// Refs repeated more often than `--rename-duplicates` can letter
+    /// (more than 26 copies): left as they are, so every copy is a conflict.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub too_repeated: Vec<String>,
+}
+
+/// The ref of a row rejected after it was read, and where it sits. A
+/// generated ref is numbered in the same sequence as accepted rows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RejectedRef {
+    pub line: usize,
+    pub decision_ref: String,
+}
+
+/// An entry whose ref repeats an earlier one, renamed so both import.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Renamed {
+    pub line: usize,
+    pub from: String,
+    pub to: String,
+}
+
+/// How a log's refs are read, chosen per log (pack D69, D70).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefOptions {
+    /// Put before every ref and every ref a link names, after a space:
+    /// `gui-design` reads `D93` as `gui-design D93`. For two logs of one
+    /// project that number from the same D1. A row's text that opens by
+    /// defining its own bare ref (`D93: ...`) loses that opening, so the
+    /// stored content never names a ref other than the prefixed one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    /// For a table with a `Date` column and no ref column: each row's ref is
+    /// `<generate>-<date>-<n>`, `n` counting that date's rows from 1 in file
+    /// order, struck rows included, so a ref never depends on what else is
+    /// imported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generate: Option<String>,
+    /// A ref the log repeats keeps its first entry; each later one gets
+    /// `b`, `c`, ... and is listed under [`ParsedLog::renamed`]. A renamed
+    /// row's text loses an opening definition of the old ref (`D1: ...`),
+    /// and links may name the new ref (`Supersedes D1b`). A ref with more
+    /// than 26 copies is not renamed. Without it every copy is a conflict
+    /// and none imports.
+    #[serde(default)]
+    pub rename_duplicates: bool,
 }
 
 /// Parse a `DECISIONS.md`: markdown tables mapped by header name, and
 /// `## D<n>. Title` sections. A ref in both a table and a section is read
 /// from the section, which carries the fuller text.
 pub fn parse_log(text: &str) -> ParsedLog {
+    parse_log_with(text, &RefOptions::default())
+}
+
+/// [`parse_log`], reading refs as `options` says.
+pub fn parse_log_with(text: &str, options: &RefOptions) -> ParsedLog {
     let lines: Vec<&str> = text.lines().collect();
     let mut log = ParsedLog::default();
     let sections = parse_sections(&lines);
+    let mut dated = Vec::new();
     let mut i = 0;
     while i < lines.len() {
         if is_table_start(&lines, i) {
-            i = parse_table(&lines, i, &mut log);
+            let generate = options.generate.as_deref();
+            i = parse_table(&lines, i, generate, &mut dated, &mut log);
         } else {
             i += 1;
         }
     }
-    log.entries
-        .retain(|e| !sections.iter().any(|s| s.decision_ref == e.decision_ref));
+    let in_section = |reference: &str| sections.iter().any(|s| s.decision_ref == reference);
+    log.entries.retain(|e| !in_section(&e.decision_ref));
+    log.rejected_refs.retain(|r| !in_section(&r.decision_ref));
     log.entries.extend(sections);
     log.entries.sort_by_key(|e| e.line);
+    number_dated(&mut log.entries, &mut log.rejected_refs, &dated);
+    if options.rename_duplicates {
+        log.renamed = rename_duplicates(&mut log);
+    }
+    if let Some(prefix) = options.prefix.as_deref().map(str::trim) {
+        for entry in &mut log.entries {
+            entry.title = without_own_definition(&entry.title, &entry.decision_ref);
+            entry.decision_ref = prefixed(Some(prefix), &entry.decision_ref);
+        }
+        for rejected in &mut log.rejected_refs {
+            rejected.decision_ref = prefixed(Some(prefix), &rejected.decision_ref);
+        }
+        for renamed in &mut log.renamed {
+            renamed.from = prefixed(Some(prefix), &renamed.from);
+            renamed.to = prefixed(Some(prefix), &renamed.to);
+        }
+        log.ref_prefix = Some(prefix.to_string());
+    }
     log
+}
+
+/// `title` without an unqualified opening definition of the row's own
+/// `reference` (`D1: ...`, `D1 [stated] ...`, `D1 — ...`). Under a prefix the
+/// row is stored as `<prefix> D1`, and a content that still defined a bare
+/// `D1` would disagree with it, so no link could ever retire the row. A
+/// definition of another ref, or one with its own project, is kept as
+/// written, and so is a title that would be left empty.
+fn without_own_definition(title: &str, reference: &str) -> String {
+    let own = matches!(defined_ref(title), Some((None, defined)) if defined == reference);
+    let rest = without_ref(title, reference, "");
+    match own && !rest.trim().is_empty() {
+        true => rest.trim().to_string(),
+        false => title.to_string(),
+    }
+}
+
+/// `reference` with `prefix` before it, when there is one.
+fn prefixed(prefix: Option<&str>, reference: &str) -> String {
+    match prefix {
+        Some(p) => format!("{p} {reference}"),
+        None => reference.to_string(),
+    }
+}
+
+/// Append each dated row's ordinal within its date (rows at the lines in
+/// `dated`, whose refs are `<prefix>-<date>` so far), in file order. Rejected
+/// rows count in the same sequence, so mending one later never shifts the
+/// refs of the rows after it.
+fn number_dated(entries: &mut [LogEntry], rejected: &mut [RejectedRef], dated: &[usize]) {
+    let mut refs: Vec<(usize, &mut String)> = entries
+        .iter_mut()
+        .map(|e| (e.line, &mut e.decision_ref))
+        .chain(rejected.iter_mut().map(|r| (r.line, &mut r.decision_ref)))
+        .filter(|(line, _)| dated.contains(line))
+        .collect();
+    refs.sort_by_key(|(line, _)| *line);
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for (_, reference) in refs {
+        let n = seen.entry(reference.clone()).or_default();
+        *n += 1;
+        *reference = format!("{reference}-{n}");
+    }
+}
+
+/// Give each repeat of a ref the next letter from `b`, in file order.
+/// Rejected rows count in file order like accepted ones, so mending one
+/// later never moves a letter from the row after it.
+fn rename_duplicates(log: &mut ParsedLog) -> Vec<Renamed> {
+    /// Where a ref sits: an accepted entry or a rejected row, by index.
+    #[derive(Clone, Copy)]
+    enum Slot {
+        Entry(usize),
+        Rejected(usize),
+    }
+    let mut slots: Vec<(usize, Slot)> = (log.entries.iter().enumerate())
+        .map(|(i, e)| (e.line, Slot::Entry(i)))
+        .chain(
+            log.rejected_refs
+                .iter()
+                .enumerate()
+                .map(|(i, r)| (r.line, Slot::Rejected(i))),
+        )
+        .collect();
+    slots.sort_by_key(|(line, _)| *line);
+    let reference = |log: &ParsedLog, slot: Slot| match slot {
+        Slot::Entry(i) => log.entries[i].decision_ref.clone(),
+        Slot::Rejected(i) => log.rejected_refs[i].decision_ref.clone(),
+    };
+    let mut copies: HashMap<String, usize> = HashMap::new();
+    for (_, slot) in &slots {
+        *copies.entry(reference(log, *slot)).or_default() += 1;
+    }
+    // More copies than b to z can name: none of the group is renamed, so
+    // the repeated-ref check makes every copy a conflict.
+    log.too_repeated = copies
+        .iter()
+        .filter(|(_, n)| **n > MAX_COPIES)
+        .map(|(r, _)| r.clone())
+        .collect();
+    log.too_repeated.sort();
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut renamed = Vec::new();
+    for (line, slot) in slots {
+        let from = reference(log, slot);
+        if copies[&from] > MAX_COPIES {
+            continue;
+        }
+        let count = seen.entry(from.clone()).or_default();
+        *count += 1;
+        if *count == 1 {
+            continue;
+        }
+        let letter = char::from(b'a' + u8::try_from(*count - 1).unwrap_or(25));
+        let to = format!("{from}{letter}");
+        match slot {
+            Slot::Entry(i) => {
+                let entry = &mut log.entries[i];
+                // The row is stored as `to`: a content still defining
+                // `from` would disagree with it.
+                entry.title = without_own_definition(&entry.title, &from);
+                entry.decision_ref = to.clone();
+            }
+            Slot::Rejected(i) => log.rejected_refs[i].decision_ref = to.clone(),
+        }
+        renamed.push(Renamed { line, from, to });
+    }
+    renamed
+}
+
+/// The most copies of one ref `--rename-duplicates` can name: the ref
+/// itself and `b` to `z`.
+const MAX_COPIES: usize = 26;
+
+/// A calendar day written `YYYY-MM-DD`, the one form the log export reads
+/// back ([`crate::decisions_log`]).
+fn is_date(text: &str) -> bool {
+    crate::decisions_log::is_day(text)
 }
 
 fn cells(line: &str) -> Vec<String> {
@@ -553,8 +778,16 @@ fn columns(header: &[String]) -> Columns {
     cols
 }
 
-/// Parse the table starting at `start`; returns the line after it.
-fn parse_table(lines: &[&str], start: usize, log: &mut ParsedLog) -> usize {
+/// Parse the table starting at `start`; returns the line after it. With
+/// `generate`, a table with a date but no ref column takes `<generate>-<date>`
+/// refs, and their lines go into `dated` for [`number_dated`].
+fn parse_table(
+    lines: &[&str],
+    start: usize,
+    generate: Option<&str>,
+    dated: &mut Vec<usize>,
+    log: &mut ParsedLog,
+) -> usize {
     let header = cells(lines[start]);
     let mut cols = columns(&header);
     let mut i = start + 2;
@@ -568,7 +801,7 @@ fn parse_table(lines: &[&str], start: usize, log: &mut ParsedLog) -> usize {
     loop {
         while i < lines.len() && lines[i].trim().starts_with('|') {
             let row = cells(lines[i]);
-            read_row(&row, &cols, i + 1, lines[i], log);
+            read_row(&row, &cols, i + 1, lines[i], generate, dated, log);
             i += 1;
         }
         // Rows after a stray blank line, with no header of their own, still
@@ -597,14 +830,29 @@ fn clean(cell: &str) -> (String, bool) {
     (text.trim().to_string(), struck)
 }
 
-fn read_row(row: &[String], cols: &Columns, line: usize, raw: &str, log: &mut ParsedLog) {
+fn read_row(
+    row: &[String],
+    cols: &Columns,
+    line: usize,
+    raw: &str,
+    generate: Option<&str>,
+    dated: &mut Vec<usize>,
+    log: &mut ParsedLog,
+) {
     let at = |c: Option<usize>| c.and_then(|i| row.get(i)).map(|s| clean(s));
     let unparsed = |reason: &str| Unparsed {
         line,
         reason: reason.to_string(),
         snippet: snippet(raw),
     };
-    let Some((reference, ref_struck)) = at(cols.reference).filter(|(r, _)| !r.is_empty()) else {
+    let generated = || {
+        let prefix = generate.filter(|_| cols.reference.is_none())?;
+        let (date, _) = at(cols.date).filter(|(d, _)| is_date(d))?;
+        Some((format!("{prefix}-{date}"), false))
+    };
+    let reference = at(cols.reference).filter(|(r, _)| !r.is_empty());
+    let from_date = reference.is_none();
+    let Some((reference, ref_struck)) = reference.or_else(generated) else {
         log.unparsed.push(unparsed("no ref column"));
         return;
     };
@@ -612,16 +860,27 @@ fn read_row(row: &[String], cols: &Columns, line: usize, raw: &str, log: &mut Pa
         let i = cols.reference.map_or(1, |r| r + 1);
         row.get(i).map(|s| clean(s))
     });
+    if from_date {
+        dated.push(line);
+    }
+    let rejected = |decision_ref: String| RejectedRef { line, decision_ref };
     let Some((title, title_struck)) = decision.filter(|(t, _)| !t.is_empty()) else {
         log.unparsed.push(unparsed("no decision text"));
+        log.rejected_refs.push(rejected(reference));
         return;
     };
     let some = |c: Option<usize>| at(c).map(|(t, _)| t).filter(|t| !t.is_empty());
+    let date = some(cols.date);
+    if date.as_deref().is_some_and(|d| !is_date(d)) {
+        log.unparsed.push(unparsed("date is not a YYYY-MM-DD day"));
+        log.rejected_refs.push(rejected(reference));
+        return;
+    }
     log.entries.push(LogEntry {
         decision_ref: reference,
         title,
         rationale: some(cols.why),
-        date: some(cols.date),
+        date,
         tag: some(cols.tag),
         line,
         struck: ref_struck || title_struck,
@@ -749,6 +1008,14 @@ pub struct ImportRow {
 }
 
 impl ImportRow {
+    /// What the entry decides, as [`LogEntry::statement`] reads it.
+    fn statement(&self) -> String {
+        match &self.decision {
+            Some(body) => format!("{} {body}", self.title),
+            None => self.title.clone(),
+        }
+    }
+
     fn of(entry: &LogEntry, memory_id: Option<String>, note: &str) -> Self {
         Self {
             decision_ref: entry.decision_ref.clone(),
@@ -793,6 +1060,9 @@ pub struct ImportPlan {
     /// Supersede wording the plan will not act on (cross-project, prose).
     pub ambiguous: Vec<ImportRow>,
     pub unparsed: Vec<Unparsed>,
+    /// Repeated refs imported under a letter (`--rename-duplicates`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub renamed: Vec<Renamed>,
 }
 
 /// Plan importing `log` (read from `source`) into `project`, against the
@@ -807,11 +1077,14 @@ pub fn plan_import(
         project: project.to_string(),
         source: source.to_string(),
         unparsed: log.unparsed.clone(),
+        renamed: log.renamed.clone(),
         ..Default::default()
     };
+    // Superseded decisions count too: an entry the store holds only as a
+    // retired decision is already imported, never new again.
     let existing: Vec<(&Memory, String)> = memories
         .iter()
-        .filter(|m| m.deleted_at.is_none() && m.superseded_by.is_none())
+        .filter(|m| m.deleted_at.is_none())
         .filter(|m| m.memory_type.as_deref() == Some("decision"))
         .filter(|m| {
             m.project
@@ -822,7 +1095,7 @@ pub fn plan_import(
         .collect();
     for entry in &log.entries {
         if place(entry, log, &existing, &mut plan) {
-            links(entry, &mut plan);
+            links(entry, log.ref_prefix.as_deref(), &mut plan);
         } else if has_link_wording(&entry.statement()) {
             plan.ambiguous
                 .push(ambiguous_row(entry, "link wording on a conflicting entry"));
@@ -840,11 +1113,20 @@ fn place(
     plan: &mut ImportPlan,
 ) -> bool {
     let row = |memory_id: Option<String>, note: &str| ImportRow::of(entry, memory_id, note);
+    // A rejected row that shares the ref counts: once mended it would make
+    // this a conflict, so it is one now, before any copy is stored.
     let twins = log
         .entries
         .iter()
-        .filter(|e| e.decision_ref == entry.decision_ref)
+        .map(|e| &e.decision_ref)
+        .chain(log.rejected_refs.iter().map(|r| &r.decision_ref))
+        .filter(|r| **r == entry.decision_ref)
         .count();
+    if log.too_repeated.contains(&entry.decision_ref) {
+        let note = "ref repeats more than 26 times: too many to rename";
+        plan.conflicts.push(row(None, note));
+        return false;
+    }
     if twins > 1 {
         plan.conflicts.push(row(None, "ref appears more than once"));
         return false;
@@ -853,11 +1135,21 @@ fn place(
         plan.conflicts.push(row(None, "struck through"));
         return false;
     }
-    let matches: Vec<&&Memory> = existing
-        .iter()
-        .filter(|(_, r)| *r == entry.decision_ref)
-        .map(|(m, _)| m)
-        .collect();
+    let carrying = |live: bool| -> Vec<&&Memory> {
+        existing
+            .iter()
+            .filter(|(m, r)| *r == entry.decision_ref && m.superseded_by.is_none() == live)
+            .map(|(m, _)| m)
+            .collect()
+    };
+    // The live decision is the one to compare; a retired one only when
+    // nothing live carries the ref.
+    let live = carrying(true);
+    let matches = if live.is_empty() {
+        carrying(false)
+    } else {
+        live
+    };
     match matches.as_slice() {
         [] if entry.rationale.is_none() => plan
             .needs_rationale
@@ -886,12 +1178,12 @@ fn place(
 /// when the words match exactly. Anything short of that counts as changed: a
 /// false "unchanged" would hide an edit from the person approving the plan.
 fn difference(memory: &Memory, entry: &LogEntry) -> Option<&'static str> {
-    let stored = words(without_ref(
-        &memory.content,
-        &entry.decision_ref,
-        memory.project.as_deref().unwrap_or(""),
-    ));
-    if stored != words(&entry.statement()) {
+    // Both sides drop the same validated opening definition, so a row the
+    // file writes as `D1: ...` reads as unchanged once stored that way.
+    let project = memory.project.as_deref().unwrap_or("");
+    let stored = words(without_ref(&memory.content, &entry.decision_ref, project));
+    let statement = entry.statement();
+    if stored != words(without_ref(&statement, &entry.decision_ref, project)) {
         return Some("decision text differs");
     }
     let stored_why = metadata_rationale(memory)
@@ -1082,7 +1374,7 @@ const NEGATIONS: [&str; 6] = ["not", "never", "no", "nor", "doesn't", "don't"];
 /// `supersedes D<n>` / `confirms D<n>` stated outright in the entry's own
 /// decision. Negated, quoted or partial links, and other supersede wording,
 /// are ambiguous: reported, never proposed (D34).
-fn links(entry: &LogEntry, plan: &mut ImportPlan) {
+fn links(entry: &LogEntry, prefix: Option<&str>, plan: &mut ImportPlan) {
     let text = entry.statement();
     let words: Vec<&str> = text.split_whitespace().collect();
     let mut explicit = false;
@@ -1093,7 +1385,7 @@ fn links(entry: &LogEntry, plan: &mut ImportPlan) {
             .trim_start_matches('(')
             .to_ascii_lowercase();
         let target = pair[1].trim_end_matches([',', '.', ';', ':', ')', '"', '”', '`']);
-        if !matches!(keyword.as_str(), "supersedes" | "confirms") || !is_d_ref(target) {
+        if !matches!(keyword.as_str(), "supersedes" | "confirms") || !is_link_target(target) {
             continue;
         }
         if let Some(why) = hedged(&words, i) {
@@ -1102,7 +1394,7 @@ fn links(entry: &LogEntry, plan: &mut ImportPlan) {
         }
         let link = SupersedesRow {
             decision_ref: entry.decision_ref.clone(),
-            supersedes: target.to_string(),
+            supersedes: prefixed(prefix, target),
             line: entry.line,
         };
         if keyword == "supersedes" {
@@ -1165,6 +1457,405 @@ fn has_link_wording(text: &str) -> bool {
 fn ambiguous_row(entry: &LogEntry, note: &str) -> ImportRow {
     ImportRow::of(entry, None, note)
 }
+
+// -- import apply -------------------------------------------------------------
+
+/// What [`apply_import`] wrote, and what it did not.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportApplied {
+    /// `new` rows now in the store, each with its `memory_id`.
+    pub added: Vec<ImportRow>,
+    /// Supersedes links carried out: the older decision now points at the
+    /// newer one.
+    pub linked: Vec<SupersedesRow>,
+    /// Links whose target is not a live decision of the project, or not
+    /// one only: left for a person.
+    pub unlinked: Vec<SupersedesRow>,
+    /// Planned rows that no longer qualified when their turn came (the ref
+    /// arrived meanwhile); `note` says why. Untouched.
+    pub skipped: Vec<ImportRow>,
+    /// Rows whose write failed, with the error in `note`. Untouched.
+    pub failed: Vec<ImportRow>,
+    /// The plan this run applied, planned against the store as it stood.
+    pub plan: ImportPlan,
+}
+
+/// Plan `log` against the store, then add every `new` entry as a decision
+/// of `project` and carry out the supersedes links the file states. Nothing
+/// else is written: `changed`, `needs_rationale`, `conflicts` and
+/// `ambiguous` rows stay for a person (a row with any ambiguous link
+/// wording is not written, even with a plain link beside it), and a stored
+/// decision is never overwritten (D30). A second run finds every entry
+/// unchanged.
+///
+/// Rows go in supersession order: an entry that supersedes another entry of
+/// the same file is written after it, wherever the two sit. Links that form
+/// a cycle refuse the whole import before anything is written.
+///
+/// Each entry is its own transaction: the recheck that its ref is still
+/// absent, the choice of its link targets, its insert and the retiring of
+/// those targets. A failed row leaves nothing behind. A link whose target
+/// is another entry of the file that this run did not write holds the row
+/// back (`skipped`), and so does one whose target the plan did not read as
+/// unchanged, or whose stored copy no longer matches the file's entry: the
+/// ref may now mean another decision. A link whose target is not exactly one live decision of
+/// the project whose refs agree is listed under `unlinked`, never guessed.
+///
+/// # Errors
+///
+/// A store error reading the memories. Per-row outcomes are in the result.
+pub fn apply_import(
+    store: &Store<'_>,
+    log: &ParsedLog,
+    project: &str,
+    source: &str,
+) -> crate::db::Result<ImportApplied> {
+    let plan = plan_import(log, project, source, &live_decisions(store)?);
+    Ok(apply_plan(store, log, plan, &|tx, add, targets| {
+        add.write(tx, targets)
+    }))
+}
+
+/// Writes a prepared row and retires its targets, inside the row's
+/// transaction: [`PreparedAdd::write`], or a stand-in in tests.
+type WriteRow<'f> = dyn Fn(&Store<'_>, &PreparedAdd, &[String]) -> crate::db::Result<()> + 'f;
+
+/// What every row of one import shares.
+struct ImportBatch<'a> {
+    project: &'a str,
+    source: &'a str,
+    /// Every ref the file defines: a link to one of these waits for it.
+    in_file: HashSet<&'a str>,
+    /// The refs of rows the parse rejected, also in `in_file`: named in
+    /// the reason a row superseding one is held back.
+    rejected: HashSet<&'a str>,
+    /// The file's parsed entries by ref, to recheck a target against.
+    entries: HashMap<&'a str, &'a LogEntry>,
+    /// The in-file refs a link may retire: those the plan read as
+    /// unchanged against one stored decision, and those this run wrote.
+    retirable: HashSet<String>,
+}
+
+/// Write `plan`'s `new` rows, each in its own transaction (see
+/// [`apply_import`]).
+fn apply_plan(
+    store: &Store<'_>,
+    log: &ParsedLog,
+    plan: ImportPlan,
+    write: &WriteRow<'_>,
+) -> ImportApplied {
+    let mut applied = ImportApplied::default();
+    let mut batch = ImportBatch {
+        project: &plan.project,
+        source: &plan.source,
+        in_file: log
+            .entries
+            .iter()
+            .map(|e| e.decision_ref.as_str())
+            .chain(log.rejected_refs.iter().map(|r| r.decision_ref.as_str()))
+            .collect(),
+        rejected: log
+            .rejected_refs
+            .iter()
+            .map(|r| r.decision_ref.as_str())
+            .collect(),
+        entries: log
+            .entries
+            .iter()
+            .map(|e| (e.decision_ref.as_str(), e))
+            .collect(),
+        retirable: plan
+            .unchanged
+            .iter()
+            .map(|r| r.decision_ref.clone())
+            .collect(),
+    };
+    let ambiguous: HashSet<&str> = plan
+        .ambiguous
+        .iter()
+        .map(|r| r.decision_ref.as_str())
+        .collect();
+    let rows: Vec<&ImportRow> = plan
+        .new
+        .iter()
+        .filter(|r| !ambiguous.contains(r.decision_ref.as_str()))
+        .collect();
+    let Some(order) = supersession_order(&rows, &plan.supersedes) else {
+        applied.skipped = rows
+            .iter()
+            .map(|r| ImportRow {
+                note: "supersedes links form a cycle: nothing written".into(),
+                ..(*r).clone()
+            })
+            .collect();
+        applied.plan = plan;
+        return applied;
+    };
+    for row in order {
+        let links = links_of(&plan.supersedes, &row.decision_ref);
+        let confirms: Vec<String> = links_of(&plan.confirms, &row.decision_ref)
+            .into_iter()
+            .map(|l| l.supersedes)
+            .collect();
+        let written = store.atomically(|s| write_row(s, &batch, row, &links, confirms, write));
+        let noted = |note: String| ImportRow {
+            note,
+            ..row.clone()
+        };
+        match written {
+            Ok(RowWrite::Added { add, unlinked }) => {
+                // Committed: what follows the write cannot undo it, so a
+                // failure there is reported on the row, not as a failed row.
+                let note = match add.finish(store) {
+                    Ok(_) => row.note.clone(),
+                    Err(e) => format!("added; embedding or indexing after the write failed: {e}"),
+                };
+                applied
+                    .linked
+                    .extend(links.into_iter().filter(|l| !unlinked.contains(l)));
+                applied.unlinked.extend(unlinked);
+                batch.retirable.insert(row.decision_ref.clone());
+                applied.added.push(ImportRow {
+                    memory_id: Some(add.id().to_string()),
+                    note,
+                    ..row.clone()
+                });
+            }
+            Ok(RowWrite::Skipped(note)) => applied.skipped.push(noted(note)),
+            Err(e) => applied.failed.push(noted(e.to_string())),
+        }
+    }
+    applied.plan = plan;
+    applied
+}
+
+/// The links `reference` states, each target once: an entry may name the
+/// same target twice (in its title and its body), and retiring a target
+/// twice would refuse the second and roll the row back.
+fn links_of(links: &[SupersedesRow], reference: &str) -> Vec<SupersedesRow> {
+    let mut seen = HashSet::new();
+    links
+        .iter()
+        .filter(|l| l.decision_ref == reference)
+        .filter(|l| seen.insert(l.supersedes.clone()))
+        .cloned()
+        .collect()
+}
+
+/// `rows` in file order, except that a row comes after every row of the
+/// batch it supersedes. `None` when the links form a cycle.
+fn supersession_order<'a>(
+    rows: &[&'a ImportRow],
+    links: &[SupersedesRow],
+) -> Option<Vec<&'a ImportRow>> {
+    let batch: HashSet<&str> = rows.iter().map(|r| r.decision_ref.as_str()).collect();
+    let ready = |row: &ImportRow, placed: &HashSet<&str>| {
+        links
+            .iter()
+            .filter(|l| l.decision_ref == row.decision_ref)
+            .filter(|l| batch.contains(l.supersedes.as_str()))
+            .all(|l| placed.contains(l.supersedes.as_str()))
+    };
+    let mut waiting = rows.to_vec();
+    let mut placed: HashSet<&str> = HashSet::new();
+    let mut order = Vec::with_capacity(rows.len());
+    while !waiting.is_empty() {
+        let at = waiting.iter().position(|r| ready(r, &placed))?;
+        let row = waiting.remove(at);
+        placed.insert(row.decision_ref.as_str());
+        order.push(row);
+    }
+    Some(order)
+}
+
+/// What one row's transaction did.
+enum RowWrite {
+    Added {
+        add: Box<PreparedAdd>,
+        unlinked: Vec<SupersedesRow>,
+    },
+    Skipped(String),
+}
+
+/// One row, inside its transaction: recheck, pick targets, add, retire.
+fn write_row(
+    store: &Store<'_>,
+    batch: &ImportBatch<'_>,
+    row: &ImportRow,
+    links: &[SupersedesRow],
+    confirms: Vec<String>,
+    write: &WriteRow<'_>,
+) -> crate::db::Result<RowWrite> {
+    let stored = live_decisions(store)?;
+    let held = project_refs(&stored, batch.project, Retired::Include);
+    if held.contains_key(&row.decision_ref) {
+        return Ok(RowWrite::Skipped("already in the store".into()));
+    }
+    let pending = links.iter().find(|l| {
+        batch.in_file.contains(l.supersedes.as_str()) && !held.contains_key(&l.supersedes)
+    });
+    if let Some(link) = pending {
+        let why = match batch.rejected.contains(link.supersedes.as_str()) {
+            true => "an entry of this file rejected as unparsed",
+            false => "an entry of this file not in the store",
+        };
+        return Ok(RowWrite::Skipped(format!(
+            "supersedes {}, {why}",
+            link.supersedes
+        )));
+    }
+    let live = project_refs(&stored, batch.project, Retired::Exclude);
+    if let Some(link) = links
+        .iter()
+        .find(|l| !matches_file(batch, &live, &l.supersedes))
+    {
+        return Ok(RowWrite::Skipped(format!(
+            "supersedes {}, whose stored copy does not match the file",
+            link.supersedes
+        )));
+    }
+    let (targets, unlinked) = link_targets(links, &live);
+    let add = prepare_imported(batch, row, confirms)?;
+    write(store, &add, &targets)?;
+    Ok(RowWrite::Added {
+        add: Box::new(add),
+        unlinked,
+    })
+}
+
+/// Whether a link may retire `target`: always for a ref outside the file;
+/// for an entry of the file, only when it is retirable and exactly one live
+/// decision carries it with the file's text and rationale, so a stored
+/// copy the file now means differently is never retired.
+fn matches_file(
+    batch: &ImportBatch<'_>,
+    live: &HashMap<String, Vec<&Memory>>,
+    target: &str,
+) -> bool {
+    if !batch.in_file.contains(target) {
+        return true;
+    }
+    if !batch.retirable.contains(target) {
+        return false;
+    }
+    let Some(entry) = batch.entries.get(target) else {
+        return false;
+    };
+    match live.get(target).map(Vec::as_slice) {
+        Some([one]) => difference(one, entry).is_none(),
+        _ => false,
+    }
+}
+
+fn live_decisions(store: &Store<'_>) -> crate::db::Result<Vec<Memory>> {
+    Memories::new(store).live_of_type("decision")
+}
+
+/// Whether [`project_refs`] counts superseded decisions.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Retired {
+    Include,
+    Exclude,
+}
+
+/// Each ref `project`'s decisions carry, with the memories carrying it.
+fn project_refs<'m>(
+    memories: &'m [Memory],
+    project: &str,
+    retired: Retired,
+) -> HashMap<String, Vec<&'m Memory>> {
+    let mut refs: HashMap<String, Vec<&Memory>> = HashMap::new();
+    let ours = memories
+        .iter()
+        .filter(|m| m.deleted_at.is_none())
+        .filter(|m| retired == Retired::Include || m.superseded_by.is_none())
+        .filter(|m| m.memory_type.as_deref() == Some("decision"))
+        .filter(|m| {
+            m.project
+                .as_deref()
+                .is_some_and(|p| same_project(p, project))
+        });
+    for memory in ours {
+        if let Some((r, _)) = carried_ref(memory) {
+            refs.entry(r).or_default().push(memory);
+        }
+    }
+    refs
+}
+
+/// Whether a memory's refs agree, project qualifiers included, as
+/// normalize requires before trusting one ([`ref_disagreement`]).
+fn identity_agrees(memory: &Memory) -> bool {
+    let defined = defined_ref(&memory.content);
+    if let Some((Some(named), _)) = &defined {
+        let field = memory.project.as_deref().unwrap_or("");
+        if field.is_empty() || !same_project(named, field) {
+            return false;
+        }
+    }
+    ref_disagreement(memory, defined.as_ref().map(|(_, r)| r.as_str())).is_none()
+}
+
+/// The memory ids `links` retire, and the links whose target is not exactly
+/// one live decision whose refs agree.
+fn link_targets(
+    links: &[SupersedesRow],
+    live: &HashMap<String, Vec<&Memory>>,
+) -> (Vec<String>, Vec<SupersedesRow>) {
+    let mut targets = Vec::new();
+    let mut unlinked = Vec::new();
+    for link in links {
+        match live.get(&link.supersedes).map(Vec::as_slice) {
+            Some([one]) if identity_agrees(one) => {
+                if !targets.contains(&one.id) {
+                    targets.push(one.id.clone());
+                }
+            }
+            _ => unlinked.push(link.clone()),
+        }
+    }
+    (targets, unlinked)
+}
+
+/// `row` as a decision of the batch's project, ready to write. Its text is
+/// the entry's statement, so a re-plan reads it as unchanged; the ref, why,
+/// date, tag and where it came from go in `metadata`. No review date is
+/// set: these were decided before they were written down (pack D74).
+fn prepare_imported(
+    batch: &ImportBatch<'_>,
+    row: &ImportRow,
+    confirms: Vec<String>,
+) -> crate::db::Result<PreparedAdd> {
+    let mut metadata = serde_json::json!({
+        "decision_ref": row.decision_ref,
+        "rationale": row.rationale,
+        "imported": { "source": batch.source, "line": row.line },
+    });
+    for (key, value) in [("date", &row.date), ("tag", &row.tag)] {
+        if let Some(value) = value {
+            metadata[key] = value.clone().into();
+        }
+    }
+    if !confirms.is_empty() {
+        metadata["confirms"] = confirms.into();
+    }
+    let input = crate::models::MemoryAddInput {
+        content: row.statement(),
+        category: "decision".into(),
+        source: IMPORT_SOURCE.into(),
+        metadata,
+        project: Some(batch.project.to_string()),
+        ..Default::default()
+    };
+    let fields = StructuredFields {
+        memory_type: Some("decision".into()),
+        ..Default::default()
+    };
+    PreparedAdd::new(input, &fields, queries::Review::Unscheduled)
+}
+
+/// `source` an imported decision is stored with.
+pub const IMPORT_SOURCE: &str = "decisions-import";
 
 // -- report -------------------------------------------------------------------
 
@@ -1328,9 +2019,42 @@ pub fn render_import(plan: &ImportPlan) -> String {
     section(&mut out, "Supersedes", &plan.supersedes, link_line);
     section(&mut out, "Confirms", &plan.confirms, link_line);
     section(&mut out, "Ambiguous", &plan.ambiguous, import_line);
+    if !plan.renamed.is_empty() {
+        section(&mut out, "Renamed repeats", &plan.renamed, |r| {
+            format!("line {}: {} -> {}", r.line, r.from, r.to)
+        });
+    }
     section(&mut out, "Unparsed", &plan.unparsed, |u| {
         format!("line {} — {}: {}", u.line, u.reason, u.snippet)
     });
+    out
+}
+
+/// What an import apply wrote, as markdown: the decisions it added and the
+/// links it made, then what it could not, then the buckets it leaves for a
+/// person.
+pub fn render_import_applied(applied: &ImportApplied) -> String {
+    let plan = &applied.plan;
+    let mut out = format!(
+        "# Decisions import applied: {} from {}\n\nAdded {} decisions and made {} supersedes links; {} links left unmade, {} skipped as already stored, {} failed. Left for a person: {} changed, {} need rationale, {} conflicts, {} ambiguous, {} unparsed.\n",
+        plan.project,
+        plan.source,
+        applied.added.len(),
+        applied.linked.len(),
+        applied.unlinked.len(),
+        applied.skipped.len(),
+        applied.failed.len(),
+        plan.changed.len(),
+        plan.needs_rationale.len(),
+        plan.conflicts.len(),
+        plan.ambiguous.len(),
+        plan.unparsed.len()
+    );
+    section(&mut out, "Added", &applied.added, import_line);
+    section(&mut out, "Linked", &applied.linked, link_line);
+    section(&mut out, "Unlinked", &applied.unlinked, link_line);
+    section(&mut out, "Skipped", &applied.skipped, import_line);
+    section(&mut out, "Failed", &applied.failed, import_line);
     out
 }
 
@@ -1358,6 +2082,8 @@ mod tests {
         );
         assert_eq!(defined_ref("We followed D50 here"), None);
         assert_eq!(defined_ref("Per D50, nothing"), None);
+        assert_eq!(defined_ref("Supersedes D1: New policy"), None);
+        assert_eq!(defined_ref("Confirms D7 (still holds)"), None);
     }
 
     #[test]
@@ -1455,6 +2181,70 @@ mod apply_tests {
                 .expect("history")
                 .len(),
             1
+        );
+    }
+
+    const LOG: &str = "| # | Decision | Why |\n|---|---|---|\n| D1 | Old | x |\n| D2 | Supersedes D1. New | y |\n";
+
+    fn ids_of(rows: &[ImportRow]) -> Vec<&str> {
+        rows.iter().map(|r| r.decision_ref.as_str()).collect()
+    }
+
+    /// A row whose write fails after its insert and retirement are in the
+    /// page leaves neither behind: its target stays live and no memory of
+    /// it is stored.
+    #[test]
+    fn a_failed_row_write_rolls_back_its_insert_and_retirement() {
+        let db = Database::open_in_memory().expect("database");
+        let store = db.store();
+        let log = parse_log(LOG);
+        let plan = plan_import(&log, "mill", "d.md", &[]);
+        let write = |tx: &Store<'_>, add: &PreparedAdd, targets: &[String]| {
+            add.write(tx, targets)?;
+            if targets.is_empty() {
+                return Ok(());
+            }
+            Err(StoreError::Engine("write failed after the retire".into()))
+        };
+        let applied = apply_plan(&store, &log, plan, &write);
+
+        assert_eq!(ids_of(&applied.added), ["D1"]);
+        assert_eq!(ids_of(&applied.failed), ["D2"]);
+        assert!(applied.linked.is_empty());
+        let live = Memories::new(&store).all_live().expect("read");
+        assert_eq!(live.len(), 1, "D2 left nothing behind");
+        assert!(live[0].superseded_by.is_none(), "D1 is not retired");
+    }
+
+    /// A write that lands between planning and a row's turn is seen by
+    /// the row's own transaction: the ref is not added twice, and a row
+    /// superseding it is held back, since this run neither read nor wrote
+    /// the decision now under that ref.
+    #[test]
+    fn a_ref_written_after_planning_is_not_added_again() {
+        let db = Database::open_in_memory().expect("database");
+        let store = db.store();
+        let log = parse_log(LOG);
+        let plan = plan_import(&log, "mill", "d.md", &[]);
+        assert_eq!(ids_of(&plan.new), ["D1", "D2"]);
+        Memories::new(&store)
+            .insert(&decision("m-elsewhere", "D1"))
+            .expect("insert");
+
+        let applied = apply_plan(&store, &log, plan, &|tx, add, targets| {
+            add.write(tx, targets)
+        });
+
+        assert_eq!(ids_of(&applied.skipped), ["D1", "D2"]);
+        assert!(applied.skipped[1].note.contains("D1"));
+        assert!(applied.added.is_empty());
+        let held = Memories::new(&store)
+            .get_live("m-elsewhere")
+            .expect("read")
+            .expect("live");
+        assert!(
+            held.superseded_by.is_none(),
+            "the D1 that is there stays live"
         );
     }
 }

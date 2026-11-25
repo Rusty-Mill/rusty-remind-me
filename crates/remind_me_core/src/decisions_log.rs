@@ -7,7 +7,9 @@
 //! newest `updated_at` among the rendered rows instead.
 //!
 //! Field sources (D19): number `metadata.decision_ref`, kept as written and
-//! never generated; date `valid_from`, else `created_at`; title
+//! never generated; date `valid_from`, else `metadata.date` when it is a
+//! `YYYY-MM-DD` day (an imported log entry's Date, #1564), else
+//! `created_at`; title
 //! `metadata.title`, else the first line of `content`; status `outcome`, else
 //! `superseded` when superseded, else `open`.
 
@@ -108,9 +110,22 @@ fn row(memory: &Memory, all: &[&Memory]) -> String {
     )
 }
 
-/// `valid_from` if set, else `created_at`, as a UTC `YYYY-MM-DD`.
+/// `valid_from` if set, else `metadata.date` when it is a calendar day,
+/// else `created_at`, as a UTC `YYYY-MM-DD`. An imported entry keeps the
+/// day its source log gave it, not the day it was imported.
 fn date(memory: &Memory) -> String {
-    day(memory.valid_from.as_deref().unwrap_or(&memory.created_at))
+    if let Some(valid_from) = memory.valid_from.as_deref() {
+        return day(valid_from);
+    }
+    match metadata_str(memory, "date").filter(|d| is_day(d)) {
+        Some(logged) => logged.to_string(),
+        None => day(&memory.created_at),
+    }
+}
+
+/// Whether `text` is a calendar day written `YYYY-MM-DD`.
+pub(crate) fn is_day(text: &str) -> bool {
+    text.len() == 10 && chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").is_ok()
 }
 
 /// The UTC calendar day of an RFC 3339 time; the first ten characters of
@@ -218,6 +233,21 @@ mod tests {
         assert_eq!(truncate_on_word("short", 10), "short");
         assert_eq!(truncate_on_word("alpha beta gamma", 12), "alpha beta…");
         assert_eq!(truncate_on_word("abcdefghijkl", 5), "abcde…");
+    }
+
+    #[test]
+    fn is_day_takes_only_real_calendar_days() {
+        assert!(is_day("2026-10-21") && is_day("2024-02-29"));
+        for text in [
+            "2026-13-01",
+            "2026-02-30",
+            "2026-1-21",
+            "21/10/2026",
+            "2026-10-21T00:00:00Z",
+            "",
+        ] {
+            assert!(!is_day(text), "{text}");
+        }
     }
 
     #[test]
