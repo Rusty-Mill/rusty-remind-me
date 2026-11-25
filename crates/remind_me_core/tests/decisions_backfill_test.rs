@@ -1682,3 +1682,138 @@ fn an_unprefixed_row_opening_with_its_ref_reruns_unchanged_until_its_text_change
     assert_eq!(edited.plan.changed.len(), 1);
     assert!(edited.plan.unchanged.is_empty());
 }
+
+fn repeat_with(third: &str) -> String {
+    format!(
+        "| # | Decision | Why |\n|---|---|---|\n| D1 | D1: Old policy | a |\n| D1 | D1: Other policy | b |\n| D2 | {third} | c |\n"
+    )
+}
+
+fn renaming_with(prefix: Option<&str>) -> RefOptions {
+    RefOptions {
+        rename_duplicates: true,
+        prefix: prefix.map(str::to_string),
+        ..RefOptions::default()
+    }
+}
+
+#[test]
+fn a_renamed_repeat_can_be_superseded_and_reruns_unchanged() {
+    let text = repeat_with("Supersedes D1b. Newer policy");
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let log = parse_log_with(&text, &renaming_with(None));
+    let applied = apply_import(&store, &log, "rusty-remind-me", "d.md").unwrap();
+    assert_eq!(added_refs(&applied), ["D1", "D1b", "D2"]);
+    assert!(applied.unlinked.is_empty(), "{:?}", applied.unlinked);
+    assert_eq!(
+        added_memory(&store, &applied, "D1b").content,
+        "Other policy"
+    );
+    let mut live = live_refs(&store);
+    live.sort();
+    assert_eq!(live, ["D1", "D2"], "D1b is retired, D1 stays live");
+
+    let again = apply_import(
+        &store,
+        &parse_log_with(&text, &renaming_with(None)),
+        "rusty-remind-me",
+        "d.md",
+    )
+    .unwrap();
+    assert!(again.added.is_empty());
+    assert_eq!(again.plan.unchanged.len(), 3, "{:?}", again.plan.changed);
+}
+
+#[test]
+fn a_renamed_repeat_can_be_confirmed() {
+    let text = repeat_with("Confirms D1b. Still holds");
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let log = parse_log_with(&text, &renaming_with(None));
+    let applied = apply_import(&store, &log, "rusty-remind-me", "d.md").unwrap();
+    assert_eq!(
+        added_memory(&store, &applied, "D2").metadata["confirms"],
+        json!(["D1b"])
+    );
+    let mut live = live_refs(&store);
+    live.sort();
+    assert_eq!(live, ["D1", "D1b", "D2"]);
+}
+
+#[test]
+fn a_prefixed_renamed_repeat_can_be_superseded() {
+    let text = repeat_with("Supersedes D1b. Newer policy");
+    let options = renaming_with(Some("gui"));
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let applied = apply_import(
+        &store,
+        &parse_log_with(&text, &options),
+        "rusty_term",
+        "g.md",
+    )
+    .unwrap();
+    assert!(applied.unlinked.is_empty(), "{:?}", applied.unlinked);
+    let mut live = live_refs(&store);
+    live.sort();
+    assert_eq!(live, ["gui D1", "gui D2"], "gui D1b is retired");
+    let again = apply_import(
+        &store,
+        &parse_log_with(&text, &options),
+        "rusty_term",
+        "g.md",
+    )
+    .unwrap();
+    assert!(again.added.is_empty());
+    assert!(again.plan.changed.is_empty());
+}
+
+#[test]
+fn a_renamed_repeat_opening_with_another_ref_keeps_its_text() {
+    let log = parse_log_with(
+        "| # | Decision | Why |\n|---|---|---|\n| D1 | Old | a |\n| D1 | D7: Other | b |\n",
+        &renaming_with(None),
+    );
+    assert_eq!(log.entries[1].decision_ref, "D1b");
+    assert_eq!(log.entries[1].title, "D7: Other");
+}
+
+fn copies_of_d1(accepted: usize, rejected: usize) -> String {
+    let mut text = String::from("| # | Decision | Why |\n|---|---|---|\n");
+    for n in 0..accepted {
+        text.push_str(&format!("| D1 | Copy {n} | why |\n"));
+    }
+    for _ in 0..rejected {
+        text.push_str("| D1 |  | why |\n");
+    }
+    text.push_str("| D2 | Another | why |\n");
+    text
+}
+
+#[test]
+fn twenty_six_copies_all_import_with_letters_up_to_z() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let log = parse_log_with(&copies_of_d1(26, 0), &renaming_with(None));
+    let applied = apply_import(&store, &log, "rusty-remind-me", "d.md").unwrap();
+    let refs = added_refs(&applied);
+    assert_eq!(refs.len(), 27);
+    assert_eq!(refs[0], "D1");
+    assert_eq!(refs[1], "D1b");
+    assert_eq!(refs[25], "D1z");
+}
+
+#[test]
+fn more_copies_than_letters_make_the_group_a_conflict() {
+    for (accepted, rejected) in [(27, 0), (26, 1)] {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        let log = parse_log_with(&copies_of_d1(accepted, rejected), &renaming_with(None));
+        assert!(log.renamed.is_empty(), "{accepted}+{rejected}");
+        let applied = apply_import(&store, &log, "rusty-remind-me", "d.md").unwrap();
+        assert_eq!(added_refs(&applied), ["D2"], "{accepted}+{rejected}");
+        assert_eq!(applied.plan.conflicts.len(), accepted);
+        assert!(applied.plan.conflicts[0].note.contains("more than 26"));
+    }
+}

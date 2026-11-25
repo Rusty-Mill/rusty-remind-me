@@ -32,6 +32,15 @@ fn is_d_ref(token: &str) -> bool {
     (1..=4).contains(&digits.len()) && digits.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// A ref a link may name: `D<n>`, or a renamed repeat `D<n>b` to `D<n>z`
+/// ([`RefOptions::rename_duplicates`]).
+fn is_link_target(token: &str) -> bool {
+    match token.strip_suffix(|c: char| ('b'..='z').contains(&c)) {
+        Some(base) if is_d_ref(base) => true,
+        _ => is_d_ref(token),
+    }
+}
+
 /// Every `D<n>` token in `text`, in order.
 fn d_refs(text: &str) -> Vec<String> {
     text.split(|c: char| !c.is_ascii_alphanumeric())
@@ -500,6 +509,10 @@ pub struct ParsedLog {
     /// waits for it instead of going in unlinked.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rejected_refs: Vec<RejectedRef>,
+    /// Refs repeated more often than `--rename-duplicates` can letter
+    /// (more than 26 copies): left as they are, so every copy is a conflict.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub too_repeated: Vec<String>,
 }
 
 /// The ref of a row rejected after it was read, and where it sits. A
@@ -535,8 +548,11 @@ pub struct RefOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generate: Option<String>,
     /// A ref the log repeats keeps its first entry; each later one gets
-    /// `b`, `c`, ... and is listed under [`ParsedLog::renamed`]. Without it
-    /// every copy is a conflict and none imports.
+    /// `b`, `c`, ... and is listed under [`ParsedLog::renamed`]. A renamed
+    /// row's text loses an opening definition of the old ref (`D1: ...`),
+    /// and links may name the new ref (`Supersedes D1b`). A ref with more
+    /// than 26 copies is not renamed. Without it every copy is a conflict
+    /// and none imports.
     #[serde(default)]
     pub rename_duplicates: bool,
 }
@@ -570,7 +586,7 @@ pub fn parse_log_with(text: &str, options: &RefOptions) -> ParsedLog {
     log.entries.sort_by_key(|e| e.line);
     number_dated(&mut log.entries, &mut log.rejected_refs, &dated);
     if options.rename_duplicates {
-        log.renamed = rename_duplicates(&mut log.entries, &mut log.rejected_refs);
+        log.renamed = rename_duplicates(&mut log);
     }
     if let Some(prefix) = options.prefix.as_deref().map(str::trim) {
         for entry in &mut log.entries {
@@ -635,31 +651,71 @@ fn number_dated(entries: &mut [LogEntry], rejected: &mut [RejectedRef], dated: &
 /// Give each repeat of a ref the next letter from `b`, in file order.
 /// Rejected rows count in file order like accepted ones, so mending one
 /// later never moves a letter from the row after it.
-fn rename_duplicates(entries: &mut [LogEntry], rejected: &mut [RejectedRef]) -> Vec<Renamed> {
-    let mut refs: Vec<(usize, &mut String)> = entries
-        .iter_mut()
-        .map(|e| (e.line, &mut e.decision_ref))
-        .chain(rejected.iter_mut().map(|r| (r.line, &mut r.decision_ref)))
+fn rename_duplicates(log: &mut ParsedLog) -> Vec<Renamed> {
+    /// Where a ref sits: an accepted entry or a rejected row, by index.
+    #[derive(Clone, Copy)]
+    enum Slot {
+        Entry(usize),
+        Rejected(usize),
+    }
+    let mut slots: Vec<(usize, Slot)> = (log.entries.iter().enumerate())
+        .map(|(i, e)| (e.line, Slot::Entry(i)))
+        .chain(
+            log.rejected_refs
+                .iter()
+                .enumerate()
+                .map(|(i, r)| (r.line, Slot::Rejected(i))),
+        )
         .collect();
-    refs.sort_by_key(|(line, _)| *line);
-    let mut seen: HashMap<String, u8> = HashMap::new();
+    slots.sort_by_key(|(line, _)| *line);
+    let reference = |log: &ParsedLog, slot: Slot| match slot {
+        Slot::Entry(i) => log.entries[i].decision_ref.clone(),
+        Slot::Rejected(i) => log.rejected_refs[i].decision_ref.clone(),
+    };
+    let mut copies: HashMap<String, usize> = HashMap::new();
+    for (_, slot) in &slots {
+        *copies.entry(reference(log, *slot)).or_default() += 1;
+    }
+    // More copies than b to z can name: none of the group is renamed, so
+    // the repeated-ref check makes every copy a conflict.
+    log.too_repeated = copies
+        .iter()
+        .filter(|(_, n)| **n > MAX_COPIES)
+        .map(|(r, _)| r.clone())
+        .collect();
+    log.too_repeated.sort();
+    let mut seen: HashMap<String, usize> = HashMap::new();
     let mut renamed = Vec::new();
-    for (line, reference) in refs {
-        let count = seen.entry(reference.clone()).or_default();
+    for (line, slot) in slots {
+        let from = reference(log, slot);
+        if copies[&from] > MAX_COPIES {
+            continue;
+        }
+        let count = seen.entry(from.clone()).or_default();
         *count += 1;
         if *count == 1 {
             continue;
         }
-        let letter = char::from(b'a' + (*count - 1).min(25));
-        let to = format!("{reference}{letter}");
-        renamed.push(Renamed {
-            line,
-            from: std::mem::replace(reference, to.clone()),
-            to,
-        });
+        let letter = char::from(b'a' + u8::try_from(*count - 1).unwrap_or(25));
+        let to = format!("{from}{letter}");
+        match slot {
+            Slot::Entry(i) => {
+                let entry = &mut log.entries[i];
+                // The row is stored as `to`: a content still defining
+                // `from` would disagree with it.
+                entry.title = without_own_definition(&entry.title, &from);
+                entry.decision_ref = to.clone();
+            }
+            Slot::Rejected(i) => log.rejected_refs[i].decision_ref = to.clone(),
+        }
+        renamed.push(Renamed { line, from, to });
     }
     renamed
 }
+
+/// The most copies of one ref `--rename-duplicates` can name: the ref
+/// itself and `b` to `z`.
+const MAX_COPIES: usize = 26;
 
 /// A calendar day written `YYYY-MM-DD`, the one form the log export reads
 /// back ([`crate::decisions_log`]).
@@ -1066,6 +1122,11 @@ fn place(
         .chain(log.rejected_refs.iter().map(|r| &r.decision_ref))
         .filter(|r| **r == entry.decision_ref)
         .count();
+    if log.too_repeated.contains(&entry.decision_ref) {
+        let note = "ref repeats more than 26 times: too many to rename";
+        plan.conflicts.push(row(None, note));
+        return false;
+    }
     if twins > 1 {
         plan.conflicts.push(row(None, "ref appears more than once"));
         return false;
@@ -1324,7 +1385,7 @@ fn links(entry: &LogEntry, prefix: Option<&str>, plan: &mut ImportPlan) {
             .trim_start_matches('(')
             .to_ascii_lowercase();
         let target = pair[1].trim_end_matches([',', '.', ';', ':', ')', '"', '”', '`']);
-        if !matches!(keyword.as_str(), "supersedes" | "confirms") || !is_d_ref(target) {
+        if !matches!(keyword.as_str(), "supersedes" | "confirms") || !is_link_target(target) {
             continue;
         }
         if let Some(why) = hedged(&words, i) {
