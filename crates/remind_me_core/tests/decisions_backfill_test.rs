@@ -1658,3 +1658,27 @@ fn an_opening_definition_stays_without_a_prefix_or_for_another_ref() {
     assert_eq!(other.entries[0].title, "D1: Old policy");
     assert_eq!(other.entries[0].decision_ref, "gui D2");
 }
+
+#[test]
+fn an_unprefixed_row_opening_with_its_ref_reruns_unchanged_until_its_text_changes() {
+    let log = |text: &str| {
+        parse_log(&format!(
+            "| # | Decision | Why |\n|---|---|---|\n| D1 | {text} | a |\n"
+        ))
+    };
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let applied = apply_import(&store, &log("D1: Old policy"), "rusty-remind-me", "d.md").unwrap();
+    assert_eq!(
+        added_memory(&store, &applied, "D1").content,
+        "D1: Old policy"
+    );
+
+    let again = apply_import(&store, &log("D1: Old policy"), "rusty-remind-me", "d.md").unwrap();
+    assert_eq!(again.plan.unchanged.len(), 1, "{:?}", again.plan.changed);
+    assert!(again.plan.changed.is_empty());
+
+    let edited = apply_import(&store, &log("D1: New policy"), "rusty-remind-me", "d.md").unwrap();
+    assert_eq!(edited.plan.changed.len(), 1);
+    assert!(edited.plan.unchanged.is_empty());
+}

@@ -1117,12 +1117,12 @@ fn place(
 /// when the words match exactly. Anything short of that counts as changed: a
 /// false "unchanged" would hide an edit from the person approving the plan.
 fn difference(memory: &Memory, entry: &LogEntry) -> Option<&'static str> {
-    let stored = words(without_ref(
-        &memory.content,
-        &entry.decision_ref,
-        memory.project.as_deref().unwrap_or(""),
-    ));
-    if stored != words(&entry.statement()) {
+    // Both sides drop the same validated opening definition, so a row the
+    // file writes as `D1: ...` reads as unchanged once stored that way.
+    let project = memory.project.as_deref().unwrap_or("");
+    let stored = words(without_ref(&memory.content, &entry.decision_ref, project));
+    let statement = entry.statement();
+    if stored != words(without_ref(&statement, &entry.decision_ref, project)) {
         return Some("decision text differs");
     }
     let stored_why = metadata_rationale(memory)
