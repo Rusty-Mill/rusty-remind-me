@@ -248,6 +248,14 @@ impl Dataset {
         Ok(Self::Synthetic(n))
     }
 
+    /// The real backup it loads from; `None` for a synthetic set.
+    fn backup(&self) -> Option<&Path> {
+        match self {
+            Self::Synthetic(_) => None,
+            Self::D1(backup) | Self::D2 { backup, .. } | Self::D3 { backup, .. } => Some(backup),
+        }
+    }
+
     fn name(&self) -> String {
         match self {
             Self::Synthetic(n) => n.to_string(),
@@ -494,6 +502,7 @@ pub fn measure(
     report.insert("mode".into(), json!(mode.name()));
     report.insert("backend".into(), json!(candidate.name));
     report.insert("dataset".into(), json!(dataset.name()));
+    report.insert("provenance".into(), provenance(dataset.backup())?);
     report.insert("run_dir".into(), json!(dir));
     match mode {
         Mode::Bench => workload(candidate, &dir, dataset, &mut report, isolation)?,
@@ -515,6 +524,25 @@ pub fn measure(
     // The whole process's peak, fill included: reported, never G4.
     report.insert("peak_rss_mb".into(), json!(g4::process_peak(&report)));
     Ok(report)
+}
+
+/// Where a report's numbers come from: the code (`R3_GIT_SHA`), the
+/// backup's fingerprint, the host and the cgroup's limits. `g4` refuses
+/// to score a set of reports whose provenance is missing or differs.
+pub fn provenance(backup: Option<&Path>) -> Result<Value> {
+    let backup_sha256 = backup.map(fingerprint::backup_fingerprint).transpose()?;
+    let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|s| s.trim().to_string());
+    let limits = cold::cgroup_limits();
+    Ok(json!({
+        "git_sha": std::env::var("R3_GIT_SHA").ok(),
+        "backup_sha256": backup_sha256,
+        "host": host,
+        // The limits, not the cgroup's path: each run gets its own scope.
+        "memory_max": limits["memory_max"],
+        "cpu_max": limits["cpu_max"],
+    }))
 }
 
 /// The run's disk use, in MB (D53): the store, the candidate's temporary

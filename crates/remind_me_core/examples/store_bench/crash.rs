@@ -72,7 +72,7 @@ use std::time::{Duration, Instant};
 use super::bodies::PAGE_LINK;
 use super::{
     check_real_input, d1, find, fresh_run_dir, g4, millis, owned_run, peak_rss_mb, proc_status_mb,
-    refuse_model_config, Bodies, Candidate, Corpus, Result, Rng,
+    provenance, refuse_model_config, Bodies, Candidate, Corpus, Result, Rng,
 };
 
 /// Kills in each stream (D57).
@@ -264,6 +264,7 @@ pub fn run(
     report.insert("dataset".into(), json!("d1"));
     report.insert("gates".into(), json!(["G6", "G4"]));
     report.insert("git_sha".into(), json!(std::env::var("R3_GIT_SHA").ok()));
+    report.insert("provenance".into(), provenance(Some(backup))?);
     report.insert("run_dir".into(), json!(dir));
     report.insert("kills_per_stream".into(), json!(kills));
 
@@ -287,7 +288,6 @@ pub fn run(
     let max = |key: &str| g4::max_mb(rounds.iter().map(|r| r[key].as_f64()));
     report.insert("child_peak_max_mb".into(), json!(max("child_peak_mb")));
     report.insert("reopen_peak_max_mb".into(), json!(max("reopen_peak_mb")));
-    report.insert("g4".into(), g4::crash(&rounds));
     report.insert("memories_tracked".into(), json!(model.memories.len()));
     report.insert("pages_tracked".into(), json!(model.pages.len()));
     report.insert("orphan_blobs".into(), json!(model.orphan_blobs));
@@ -302,6 +302,8 @@ pub fn run(
             false
         }
     };
+    let aborted = report.contains_key("aborted");
+    report.insert("g4".into(), g4::crash(&rounds, 2 * kills, aborted));
     let kills = where_kills_fell(&rounds);
     let insufficient = insufficient(&kills);
     report.insert("kills".into(), kills);

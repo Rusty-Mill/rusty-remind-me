@@ -26,7 +26,9 @@ pub const RULE: &str = "G4 covers workloads 1 to 7. It fails when any \
     is above 1500 MB. It passes when the bench reports for D1, D2 and D3 and \
     the crash report all have a scoring peak at or below 1500 MB. Otherwise \
     it is insufficient: a non-scoring sample, which may cover more than \
-    workloads 1 to 7 or miss part of them, never decides a pass or a fail.";
+    workloads 1 to 7 or miss part of them, never decides a pass or a fail. \
+    A set whose reports lack or differ in provenance (code, backup, host, \
+    cgroup limits) is insufficient whatever its peaks.";
 
 /// The larger of the values present; `None` when none is.
 pub fn max_mb(values: impl IntoIterator<Item = Option<f64>>) -> Option<f64> {
@@ -127,10 +129,17 @@ pub fn bench(report: &Map<String, Value>) -> Value {
 
 /// Workload 7's G4 evidence: each killed child's peak up to its kill and
 /// each reopen-and-check's (its peak restarted first). It scores only
-/// when every round has both; `missing` counts the rounds that lack one.
-pub fn crash(rounds: &[Value]) -> Value {
+/// when the run finished all `expected` rounds and every round has both;
+/// `missing` says what falls short.
+pub fn crash(rounds: &[Value], expected: usize, aborted: bool) -> Value {
     let lacking = |key: &str| rounds.iter().filter(|r| r[key].as_f64().is_none()).count();
     let mut missing = Vec::new();
+    if aborted {
+        missing.push("the run aborted before its final check".to_string());
+    }
+    if rounds.len() != expected || expected == 0 {
+        missing.push(format!("{} of {expected} rounds", rounds.len()));
+    }
     for (key, what) in [
         ("child_peak_mb", "a killed child's peak"),
         ("reopen_peak_mb", "a reopen's restarted peak"),
@@ -139,9 +148,6 @@ pub fn crash(rounds: &[Value]) -> Value {
         if n > 0 {
             missing.push(format!("{n} rounds without {what}"));
         }
-    }
-    if rounds.is_empty() {
-        missing.push("no rounds".into());
     }
     let max = |key: &str| max_mb(rounds.iter().map(|r| r[key].as_f64()));
     let scoring = missing.is_empty();
@@ -179,7 +185,9 @@ pub fn verdict_from_files(paths: &[String]) -> super::Result<Value> {
 }
 
 /// A crash report from before `g4` was recorded still has every round's
-/// peaks: build its `g4` from them, the same way `crash` does, and say so.
+/// peaks. Its G4 is built from them, the same way `crash` does, but kept
+/// as a diagnostic: it never scores, since nothing ties it to the bench
+/// reports' code, backup or host.
 fn derive_crash_g4(report: &mut Value) {
     if report["mode"] != "crash" || !report["g4"].is_null() {
         return;
@@ -187,9 +195,45 @@ fn derive_crash_g4(report: &mut Value) {
     let Some(rounds) = report["rounds"].as_array() else {
         return;
     };
-    let mut g4 = crash(rounds);
+    let expected = report["kills_per_stream"]
+        .as_u64()
+        .map_or(0, |k| 2 * k as usize);
+    let aborted = !report["aborted"].is_null();
+    let mut g4 = crash(rounds, expected, aborted);
+    let peak = max_mb(
+        ["child_peak_mb", "reopen_peak_mb"]
+            .iter()
+            .flat_map(|key| rounds.iter().map(|r| r[*key].as_f64())),
+    );
+    g4["scoring"] = json!(false);
+    g4["peak_mb"] = Value::Null;
+    g4["diagnostic_peak_mb"] = json!(peak);
     g4["derived_from_rounds"] = json!(true);
+    if let Value::Array(missing) = &mut g4["missing"] {
+        missing.insert(
+            0,
+            json!("derived from an older report's rounds: a diagnostic, not scoring"),
+        );
+    }
     report["g4"] = g4;
+}
+
+/// What every report in a scored set must share.
+pub const PROVENANCE: [&str; 5] = ["git_sha", "backup_sha256", "host", "memory_max", "cpu_max"];
+
+/// Why `reports` are not one run set: a provenance field that a report
+/// lacks, or that differs between them. Empty when they agree.
+fn provenance_gaps(reports: &[Value]) -> Vec<String> {
+    let mut gaps = Vec::new();
+    for field in PROVENANCE {
+        let values: Vec<&Value> = reports.iter().map(|r| &r["provenance"][field]).collect();
+        if values.iter().any(|v| v.is_null()) {
+            gaps.push(format!("a report has no {field}"));
+        } else if values.windows(2).any(|w| w[0] != w[1]) {
+            gaps.push(format!("the reports' {field} differs"));
+        }
+    }
+    gaps
 }
 
 /// One candidate's G4 under `RULE`, from its bench and crash reports.
@@ -225,7 +269,10 @@ pub fn verdict(reports: &[Value]) -> Value {
             _ => missing.push(format!("{what}: no scoring G4 evidence")),
         }
     }
-    let verdict = if !over.is_empty() {
+    let provenance = provenance_gaps(reports);
+    let verdict = if !provenance.is_empty() {
+        "insufficient"
+    } else if !over.is_empty() {
         "fail"
     } else if missing.is_empty() {
         "pass"
@@ -238,6 +285,7 @@ pub fn verdict(reports: &[Value]) -> Value {
         "peak_mb": max_mb(peaks),
         "over": over,
         "missing": missing,
+        "provenance": provenance,
         "rule": RULE,
     })
 }
@@ -348,34 +396,64 @@ mod tests {
             json!({ "child_peak_mb": 300.0, "reopen_peak_mb": 700.0 }),
             json!({ "child_peak_mb": 800.0, "reopen_peak_mb": 600.0 }),
         ];
-        let g4 = crash(&full);
+        let g4 = crash(&full, 2, false);
         assert_eq!(g4["scoring"], true, "{g4}");
         assert_eq!(g4["peak_mb"], 800.0);
         let gap = [full[0].clone(), json!({ "child_peak_mb": 800.0 })];
-        let g4 = crash(&gap);
+        let g4 = crash(&gap, 2, false);
         assert_eq!(g4["scoring"], false);
         assert_eq!(
             g4["missing"],
             json!(["1 rounds without a reopen's restarted peak"])
         );
-        assert_eq!(crash(&[])["scoring"], false);
+        assert_eq!(crash(&[], 0, false)["scoring"], false);
     }
 
     #[test]
-    fn an_older_crash_report_gets_its_g4_from_its_rounds() {
+    fn crash_does_not_score_a_short_or_aborted_run() {
+        let one = [json!({ "child_peak_mb": 300.0, "reopen_peak_mb": 700.0 })];
+        let g4 = crash(&one, 200, false);
+        assert_eq!(g4["scoring"], false, "{g4}");
+        assert_eq!(g4["peak_mb"], Value::Null);
+        assert_eq!(g4["missing"], json!(["1 of 200 rounds"]));
+        let g4 = crash(&one, 1, true);
+        assert_eq!(g4["scoring"], false, "{g4}");
+        assert_eq!(
+            g4["missing"],
+            json!(["the run aborted before its final check"])
+        );
+    }
+
+    #[test]
+    fn an_older_crash_report_keeps_its_rounds_as_a_diagnostic() {
         let rounds = json!([{ "child_peak_mb": 300.0, "reopen_peak_mb": 700.0 }]);
-        let mut old = json!({ "mode": "crash", "rounds": rounds });
+        let mut old = json!({ "mode": "crash", "kills_per_stream": 1, "rounds": rounds });
         derive_crash_g4(&mut old);
-        assert_eq!(old["g4"]["scoring"], true, "{old}");
-        assert_eq!(old["g4"]["peak_mb"], 700.0);
-        assert_eq!(old["g4"]["derived_from_rounds"], true);
+        let g4 = &old["g4"];
+        assert_eq!(g4["scoring"], false, "{old}");
+        assert_eq!(g4["peak_mb"], Value::Null, "never a peak to score");
+        assert_eq!(g4["diagnostic_peak_mb"], 700.0);
+        assert_eq!(g4["derived_from_rounds"], true);
+        assert_eq!(
+            g4["missing"],
+            json!([
+                "derived from an older report's rounds: a diagnostic, not scoring",
+                "1 of 2 rounds"
+            ])
+        );
         let mut bench = json!({ "mode": "bench" });
         derive_crash_g4(&mut bench);
         assert!(bench["g4"].is_null(), "only crash reports");
     }
 
+    fn provenance() -> Value {
+        json!({ "git_sha": "abc", "backup_sha256": "fp", "host": "ai",
+                "memory_max": "4294967296", "cpu_max": "200000 100000" })
+    }
+
     fn report(mode: &str, dataset: &str, scoring: bool, peak: f64) -> Value {
-        json!({ "mode": mode, "dataset": dataset, "g4": { "scoring": scoring, "peak_mb": peak } })
+        json!({ "mode": mode, "dataset": dataset, "provenance": provenance(),
+                "g4": { "scoring": scoring, "peak_mb": peak } })
     }
 
     #[test]
@@ -403,5 +481,43 @@ mod tests {
         three.push(report("crash", "d1", true, 1_700.0));
         three.remove(0);
         assert_eq!(verdict(&three)["verdict"], "fail");
+    }
+
+    #[test]
+    fn a_mixed_or_unattributed_set_is_insufficient_whatever_its_peaks() {
+        let set = || {
+            vec![
+                report("bench", "d1", true, 900.0),
+                report("bench", "d2-75000", true, 1_100.0),
+                report("bench", "d3-50000", true, 1_600.0),
+                report("crash", "d1", true, 700.0),
+            ]
+        };
+        for (field, value, why) in [
+            ("git_sha", json!("def"), "the reports' git_sha differs"),
+            (
+                "backup_sha256",
+                json!("other"),
+                "the reports' backup_sha256 differs",
+            ),
+            ("host", json!("elsewhere"), "the reports' host differs"),
+            (
+                "memory_max",
+                json!("max"),
+                "the reports' memory_max differs",
+            ),
+            ("cpu_max", Value::Null, "a report has no cpu_max"),
+        ] {
+            let mut reports = set();
+            reports[3]["provenance"][field] = value;
+            let v = verdict(&reports);
+            assert_eq!(v["verdict"], "insufficient", "{field}: {v}");
+            assert_eq!(v["provenance"], json!([why]));
+            assert_eq!(v["over"], json!(["bench d3-50000: 1600 MB"]), "still shown");
+        }
+        let mut reports = set();
+        reports[0].as_object_mut().unwrap().remove("provenance");
+        assert_eq!(verdict(&reports)["verdict"], "insufficient");
+        assert_eq!(verdict(&set())["verdict"], "fail", "one run set decides");
     }
 }

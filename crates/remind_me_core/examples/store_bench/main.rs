@@ -243,6 +243,17 @@ mod tests {
             );
             let rounds = report["rounds"].as_array().unwrap();
             assert_eq!(rounds.len(), 20, "{report}");
+            let fingerprint = harness::fingerprint::backup_fingerprint(&backup).unwrap();
+            assert_eq!(report["provenance"]["backup_sha256"], fingerprint.as_str());
+            // Every round ran and none aborted, so only a missing peak
+            // could keep G4 from scoring.
+            let missing = report["g4"]["missing"].as_array().unwrap();
+            assert!(
+                missing
+                    .iter()
+                    .all(|m| m.as_str().unwrap().contains("without")),
+                "{report}"
+            );
             for stream in ["writes", "pages"] {
                 let acked: u64 = rounds
                     .iter()
@@ -292,6 +303,12 @@ mod tests {
                 Isolation::InProcess,
             )
             .unwrap();
+            let fingerprint = harness::fingerprint::backup_fingerprint(&backup).unwrap();
+            assert_eq!(
+                report["provenance"]["backup_sha256"],
+                fingerprint.as_str(),
+                "the bench report names its backup"
+            );
             let run = Path::new(report["run_dir"].as_str().unwrap());
             let owned = run.parent().unwrap();
             assert!(owned.join("run.package").is_dir(), "package inside");
