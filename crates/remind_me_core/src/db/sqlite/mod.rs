@@ -10,6 +10,7 @@
 
 mod archives;
 mod curation;
+mod dialogs;
 mod entities;
 mod feedback;
 mod history;
@@ -31,6 +32,8 @@ use super::backend::{Backend, TransactionState};
 use super::{Result, StoreError};
 use rusqlite::{Connection, OptionalExtension, Params, Row};
 use std::path::Path;
+
+pub use dialogs::SqliteDialogs;
 
 /// The DDL of every group, run on open. `IF NOT EXISTS` throughout, so a
 /// reopen leaves existing tables alone.

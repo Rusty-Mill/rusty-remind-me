@@ -10,6 +10,7 @@ pub mod archives;
 pub mod backend;
 pub mod curation;
 pub mod derived;
+pub mod dialogs;
 pub mod engine;
 pub mod entities;
 pub mod feedback;

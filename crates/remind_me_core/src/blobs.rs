@@ -110,6 +110,70 @@ impl BlobStore {
         }
     }
 
+    /// Store `bytes` under their sha256 and return once the blob is durable
+    /// and verified: the staged file is synced before it is renamed into
+    /// place, a blob already at the key is checked against its hash first
+    /// (and replaced if it fails, since these bytes are what the key
+    /// names), and then the links that lead to it are flushed on every
+    /// call, not only when this call created them: the shard directory,
+    /// the blob root, and the root's parent. For a caller that commits a
+    /// row pointing at the blob next (the dialog log); [`Self::put`] stays
+    /// as it was for archive.
+    ///
+    /// Durability boundary: the blob root's parent must already exist and
+    /// is the durably provisioned anchor (the node's data directory); it
+    /// is not created here, and a missing one is an error. Its own entry in
+    /// its parent is the caller's. Flushing the three links on every call
+    /// means a retry after a failed or concurrent earlier write cannot
+    /// return on the strength of directories another writer left unsynced.
+    /// On Unix a corrupt blob is replaced by one atomic `rename`. Elsewhere
+    /// there is no directory sync, and the replacement removes the corrupt
+    /// file before the rename (a reader in that window sees it missing); a
+    /// lost rename there shows as a missing blob on read
+    /// ([`crate::db::dialogs::DialogLog::body`]), never as wrong bytes.
+    ///
+    /// # Errors
+    ///
+    /// The filesystem's error, including `NotFound` for a missing anchor;
+    /// nothing is claimed durable on `Err`.
+    pub fn put_durable(&self, bytes: &[u8]) -> io::Result<String> {
+        let key = content_key(bytes);
+        let path = self.path(&key);
+        let shard = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        for dir in [self.root.as_path(), shard.as_path()] {
+            match std::fs::create_dir(dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e),
+            }
+        }
+        if self.verify(&key)? {
+            // `FlushFileBuffers` needs write access; no truncate.
+            OpenOptions::new().write(true).open(&path)?.sync_all()?;
+        } else {
+            let partial = self.stage(&path, bytes)?;
+            let published = OpenOptions::new()
+                .write(true)
+                .open(&partial)
+                .and_then(|f| f.sync_all())
+                .and_then(|()| {
+                    // Unix renames over a corrupt blob atomically; elsewhere
+                    // a rename onto an existing file fails, so clear it.
+                    #[cfg(not(unix))]
+                    if path.exists() {
+                        std::fs::remove_file(&path)?;
+                    }
+                    std::fs::rename(&partial, &path)
+                });
+            if let Err(e) = published {
+                let _ = std::fs::remove_file(&partial);
+                return Err(e);
+            }
+        }
+        sync_links(&self.root, &shard)?;
+        Ok(key)
+    }
+
     /// The bytes stored under `key`, or `None` when there is no such blob.
     ///
     /// # Errors
@@ -135,6 +199,25 @@ impl BlobStore {
             .get(key)?
             .is_some_and(|bytes| sha256::digest(&bytes[..]).starts_with(key)))
     }
+}
+
+/// Flush the shard, the blob root and the root's parent: each holds the
+/// entry that names the next. A no-op where directories cannot be synced.
+#[cfg(unix)]
+fn sync_links(root: &Path, shard: &Path) -> io::Result<()> {
+    let anchor = root.parent().filter(|p| !p.as_os_str().is_empty());
+    for dir in [Some(shard), Some(root), anchor.or(Some(Path::new(".")))]
+        .into_iter()
+        .flatten()
+    {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_links(_root: &Path, _shard: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 /// The key [`BlobStore::put`] gives `bytes`: their sha256, 64 hex
