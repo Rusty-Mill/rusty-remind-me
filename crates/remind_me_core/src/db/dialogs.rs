@@ -7,7 +7,7 @@
 //!
 //! [`DialogLog`] is the one write path: body to the blob store first, then
 //! the row, and only after the blob is durable and verified
-//! ([`BlobStore::put_durable`]: synced file, synced new directories, an existing blob
+//! ([`BlobStore::put_durable`]: synced file, the shard, root and anchor directories flushed on every call, an existing blob
 //! checked against its hash and replaced if it fails). A crash between the
 //! two leaves an orphan blob and no dangling row; a failed publication
 //! appends nothing. A rerun is idempotent by body hash.

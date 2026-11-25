@@ -112,32 +112,44 @@ impl BlobStore {
 
     /// Store `bytes` under their sha256 and return once the blob is durable
     /// and verified: the staged file is synced before it is renamed into
-    /// place, every directory this call created is synced along with the
-    /// entry that names it in its existing parent, and a blob already at
-    /// the key is checked against its hash first. An existing blob that
-    /// does not match (torn or altered) is replaced, since these bytes are
-    /// what the key names. For a caller that commits a row pointing at the
-    /// blob next (the dialog log); [`Self::put`] stays as it was for
-    /// archive.
+    /// place, a blob already at the key is checked against its hash first
+    /// (and replaced if it fails, since these bytes are what the key
+    /// names), and then the links that lead to it are flushed on every
+    /// call, not only when this call created them: the shard directory,
+    /// the blob root, and the root's parent. For a caller that commits a
+    /// row pointing at the blob next (the dialog log); [`Self::put`] stays
+    /// as it was for archive.
     ///
-    /// Durability boundary: the nearest ancestor that already existed
-    /// before the call is taken to be durable. On Unix the replacement of a
-    /// corrupt blob is one atomic `rename`, so a concurrent reader never
-    /// sees a missing blob. On other platforms there is no directory sync,
-    /// and replacing a corrupt blob removes it before the rename (a
-    /// reader in that window sees it missing); a lost rename there shows as
-    /// a missing blob on read ([`crate::db::dialogs::DialogLog::body`]),
-    /// never as wrong bytes.
+    /// Durability boundary: the blob root's parent must already exist and
+    /// is the durably provisioned anchor (the node's data directory); it
+    /// is not created here, and a missing one is an error. Its own entry in
+    /// its parent is the caller's. Flushing the three links on every call
+    /// means a retry after a failed or concurrent earlier write cannot
+    /// return on the strength of directories another writer left unsynced.
+    /// On Unix a corrupt blob is replaced by one atomic `rename`. Elsewhere
+    /// there is no directory sync, and the replacement removes the corrupt
+    /// file before the rename (a reader in that window sees it missing); a
+    /// lost rename there shows as a missing blob on read
+    /// ([`crate::db::dialogs::DialogLog::body`]), never as wrong bytes.
     ///
     /// # Errors
     ///
-    /// The filesystem's error; nothing is claimed durable on `Err`.
+    /// The filesystem's error, including `NotFound` for a missing anchor;
+    /// nothing is claimed durable on `Err`.
     pub fn put_durable(&self, bytes: &[u8]) -> io::Result<String> {
         let key = content_key(bytes);
         let path = self.path(&key);
-        let created = self.create_parents(&path)?;
+        let shard = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        for dir in [self.root.as_path(), shard.as_path()] {
+            match std::fs::create_dir(dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e),
+            }
+        }
         if self.verify(&key)? {
-            OpenOptions::new().read(true).open(&path)?.sync_all()?;
+            // `FlushFileBuffers` needs write access; no truncate.
+            OpenOptions::new().write(true).open(&path)?.sync_all()?;
         } else {
             let partial = self.stage(&path, bytes)?;
             let published = OpenOptions::new()
@@ -158,24 +170,8 @@ impl BlobStore {
                 return Err(e);
             }
         }
-        sync_dirs(&created, &path)?;
+        sync_links(&self.root, &shard)?;
         Ok(key)
-    }
-
-    /// Create the directories above `path`, returning those that did not
-    /// exist, outermost first.
-    fn create_parents(&self, path: &Path) -> io::Result<Vec<PathBuf>> {
-        let mut missing: Vec<PathBuf> = path
-            .ancestors()
-            .skip(1)
-            .take_while(|d| !d.as_os_str().is_empty() && !d.exists())
-            .map(Path::to_path_buf)
-            .collect();
-        missing.reverse();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        Ok(missing)
     }
 
     /// The bytes stored under `key`, or `None` when there is no such blob.
@@ -205,28 +201,22 @@ impl BlobStore {
     }
 }
 
-/// Flush the directory holding `path`, and each directory in `created` and
-/// the entry naming the outermost of them in its (previously existing)
-/// parent. A no-op where directories cannot be synced.
+/// Flush the shard, the blob root and the root's parent: each holds the
+/// entry that names the next. A no-op where directories cannot be synced.
 #[cfg(unix)]
-fn sync_dirs(created: &[PathBuf], path: &Path) -> io::Result<()> {
-    let mut dirs: Vec<&Path> = created.iter().map(PathBuf::as_path).collect();
-    if let Some(first) = created.first().and_then(|d| d.parent()) {
-        dirs.insert(0, first);
-    }
-    if let Some(shard) = path.parent() {
-        if !dirs.contains(&shard) {
-            dirs.push(shard);
-        }
-    }
-    for dir in dirs {
+fn sync_links(root: &Path, shard: &Path) -> io::Result<()> {
+    let anchor = root.parent().filter(|p| !p.as_os_str().is_empty());
+    for dir in [Some(shard), Some(root), anchor.or(Some(Path::new(".")))]
+        .into_iter()
+        .flatten()
+    {
         std::fs::File::open(dir)?.sync_all()?;
     }
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn sync_dirs(_created: &[PathBuf], _path: &Path) -> io::Result<()> {
+fn sync_links(_root: &Path, _shard: &Path) -> io::Result<()> {
     Ok(())
 }
 
