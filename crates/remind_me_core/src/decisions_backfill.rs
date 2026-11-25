@@ -1496,7 +1496,9 @@ pub struct ImportApplied {
 /// absent, the choice of its link targets, its insert and the retiring of
 /// those targets. A failed row leaves nothing behind. A link whose target
 /// is another entry of the file that this run did not write holds the row
-/// back (`skipped`); a link whose target is not exactly one live decision of
+/// back (`skipped`), and so does one whose target the plan did not read as
+/// unchanged, or whose stored copy no longer matches the file's entry: the
+/// ref may now mean another decision. A link whose target is not exactly one live decision of
 /// the project whose refs agree is listed under `unlinked`, never guessed.
 ///
 /// # Errors
@@ -1527,6 +1529,11 @@ struct ImportBatch<'a> {
     /// The refs of rows the parse rejected, also in `in_file`: named in
     /// the reason a row superseding one is held back.
     rejected: HashSet<&'a str>,
+    /// The file's parsed entries by ref, to recheck a target against.
+    entries: HashMap<&'a str, &'a LogEntry>,
+    /// The in-file refs a link may retire: those the plan read as
+    /// unchanged against one stored decision, and those this run wrote.
+    retirable: HashSet<String>,
 }
 
 /// Write `plan`'s `new` rows, each in its own transaction (see
@@ -1538,7 +1545,7 @@ fn apply_plan(
     write: &WriteRow<'_>,
 ) -> ImportApplied {
     let mut applied = ImportApplied::default();
-    let batch = ImportBatch {
+    let mut batch = ImportBatch {
         project: &plan.project,
         source: &plan.source,
         in_file: log
@@ -1551,6 +1558,16 @@ fn apply_plan(
             .rejected_refs
             .iter()
             .map(|r| r.decision_ref.as_str())
+            .collect(),
+        entries: log
+            .entries
+            .iter()
+            .map(|e| (e.decision_ref.as_str(), e))
+            .collect(),
+        retirable: plan
+            .unchanged
+            .iter()
+            .map(|r| r.decision_ref.clone())
             .collect(),
     };
     let ambiguous: HashSet<&str> = plan
@@ -1597,6 +1614,7 @@ fn apply_plan(
                     .linked
                     .extend(links.into_iter().filter(|l| !unlinked.contains(l)));
                 applied.unlinked.extend(unlinked);
+                batch.retirable.insert(row.decision_ref.clone());
                 applied.added.push(ImportRow {
                     memory_id: Some(add.id().to_string()),
                     note,
@@ -1687,6 +1705,15 @@ fn write_row(
         )));
     }
     let live = project_refs(&stored, batch.project, Retired::Exclude);
+    if let Some(link) = links
+        .iter()
+        .find(|l| !matches_file(batch, &live, &l.supersedes))
+    {
+        return Ok(RowWrite::Skipped(format!(
+            "supersedes {}, whose stored copy does not match the file",
+            link.supersedes
+        )));
+    }
     let (targets, unlinked) = link_targets(links, &live);
     let add = prepare_imported(batch, row, confirms)?;
     write(store, &add, &targets)?;
@@ -1694,6 +1721,30 @@ fn write_row(
         add: Box::new(add),
         unlinked,
     })
+}
+
+/// Whether a link may retire `target`: always for a ref outside the file;
+/// for an entry of the file, only when it is retirable and exactly one live
+/// decision carries it with the file's text and rationale, so a stored
+/// copy the file now means differently is never retired.
+fn matches_file(
+    batch: &ImportBatch<'_>,
+    live: &HashMap<String, Vec<&Memory>>,
+    target: &str,
+) -> bool {
+    if !batch.in_file.contains(target) {
+        return true;
+    }
+    if !batch.retirable.contains(target) {
+        return false;
+    }
+    let Some(entry) = batch.entries.get(target) else {
+        return false;
+    };
+    match live.get(target).map(Vec::as_slice) {
+        Some([one]) => difference(one, entry).is_none(),
+        _ => false,
+    }
 }
 
 fn live_decisions(store: &Store<'_>) -> crate::db::Result<Vec<Memory>> {
@@ -2166,7 +2217,9 @@ mod apply_tests {
     }
 
     /// A write that lands between planning and a row's turn is seen by
-    /// the row's own transaction: the ref is not added twice.
+    /// the row's own transaction: the ref is not added twice, and a row
+    /// superseding it is held back, since this run neither read nor wrote
+    /// the decision now under that ref.
     #[test]
     fn a_ref_written_after_planning_is_not_added_again() {
         let db = Database::open_in_memory().expect("database");
@@ -2182,15 +2235,16 @@ mod apply_tests {
             add.write(tx, targets)
         });
 
-        assert_eq!(ids_of(&applied.skipped), ["D1"]);
-        assert_eq!(ids_of(&applied.added), ["D2"]);
+        assert_eq!(ids_of(&applied.skipped), ["D1", "D2"]);
+        assert!(applied.skipped[1].note.contains("D1"));
+        assert!(applied.added.is_empty());
         let held = Memories::new(&store)
             .get_live("m-elsewhere")
             .expect("read")
             .expect("live");
         assert!(
-            held.superseded_by.is_some(),
-            "D2 retires the D1 that is there"
+            held.superseded_by.is_none(),
+            "the D1 that is there stays live"
         );
     }
 }

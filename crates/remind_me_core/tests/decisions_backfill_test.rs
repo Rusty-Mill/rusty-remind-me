@@ -1817,3 +1817,96 @@ fn more_copies_than_letters_make_the_group_a_conflict() {
         assert!(applied.plan.conflicts[0].note.contains("more than 26"));
     }
 }
+
+/// Each live, unretired decision as `(ref, content)`, sorted.
+fn live_contents(store: &remind_me_core::db::Store<'_>) -> Vec<(String, String)> {
+    let mut rows: Vec<(String, String)> = Memories::new(store)
+        .all_live()
+        .unwrap()
+        .into_iter()
+        .filter(|m| m.superseded_by.is_none())
+        .map(|m| {
+            let r = m.metadata["decision_ref"].as_str().unwrap().to_string();
+            (r, m.content)
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+fn two_d1s(first: &str, second: &str, extra: &str) -> String {
+    format!(
+        "| # | Decision | Why |\n|---|---|---|\n| D1 | {first} | a |\n| D1 | {second} | a |\n{extra}"
+    )
+}
+
+fn pairs(rows: &[(&str, &str)]) -> Vec<(String, String)> {
+    rows.iter()
+        .map(|(r, c)| (r.to_string(), c.to_string()))
+        .collect()
+}
+
+#[test]
+fn a_link_to_a_renamed_repeat_the_file_now_means_differently_is_held_back() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let options = renaming_with(None);
+    let first = parse_log_with(&two_d1s("A", "B", ""), &options);
+    apply_import(&store, &first, "rusty-remind-me", "d.md").unwrap();
+    let stored = pairs(&[("D1", "A"), ("D1b", "B")]);
+    assert_eq!(live_contents(&store), stored);
+
+    let swapped = two_d1s("B", "A", "| D2 | Supersedes D1b. Newer | c |\n");
+    let applied = apply_import(
+        &store,
+        &parse_log_with(&swapped, &options),
+        "rusty-remind-me",
+        "d.md",
+    )
+    .unwrap();
+    assert!(applied.added.is_empty(), "{:?}", added_refs(&applied));
+    assert_eq!(applied.plan.changed.len(), 2);
+    assert_eq!(applied.skipped.len(), 1);
+    assert_eq!(applied.skipped[0].decision_ref, "D2");
+    assert!(
+        applied.skipped[0].note.contains("D1b"),
+        "{}",
+        applied.skipped[0].note
+    );
+    assert!(applied.linked.is_empty());
+    assert_eq!(live_contents(&store), stored, "D1 and D1b untouched");
+}
+
+#[test]
+fn a_link_to_a_renamed_repeat_the_file_still_means_retires_it() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let options = renaming_with(None);
+    let first = parse_log_with(&two_d1s("A", "B", ""), &options);
+    apply_import(&store, &first, "rusty-remind-me", "d.md").unwrap();
+
+    let text = two_d1s("A", "B", "| D2 | Supersedes D1b. Newer | c |\n");
+    let applied = apply_import(
+        &store,
+        &parse_log_with(&text, &options),
+        "rusty-remind-me",
+        "d.md",
+    )
+    .unwrap();
+    assert_eq!(added_refs(&applied), ["D2"]);
+    assert_eq!(applied.linked.len(), 1);
+    assert_eq!(
+        live_contents(&store),
+        pairs(&[("D1", "A"), ("D2", "Supersedes D1b. Newer")]),
+        "the stored D1b (B) is retired"
+    );
+    let again = apply_import(
+        &store,
+        &parse_log_with(&text, &options),
+        "rusty-remind-me",
+        "d.md",
+    )
+    .unwrap();
+    assert!(again.added.is_empty());
+    assert!(again.plan.changed.is_empty(), "{:?}", again.plan.changed);
+}
