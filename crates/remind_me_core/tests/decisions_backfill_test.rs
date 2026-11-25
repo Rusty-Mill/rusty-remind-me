@@ -1416,3 +1416,39 @@ fn a_malformed_date_is_reported_not_stored() {
     assert!(applied.added.is_empty());
     assert!(Memories::new(&store).all_live().unwrap().is_empty());
 }
+
+#[test]
+fn an_entry_superseding_a_row_rejected_for_its_date_waits_for_it() {
+    let log_with = |date: &str| {
+        parse_log(&format!(
+            "| # | Date | Decision | Why |\n|---|---|---|---|\n| D1 | {date} | Old | x |\n| D2 | 2026-10-22 | Supersedes D1. New | y |\n"
+        ))
+    };
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+
+    let bad = log_with("Oct 21");
+    assert_eq!(bad.unparsed.len(), 1, "D1 is reported");
+    let applied = apply_import(&store, &bad, "rusty-remind-me", "d.md").unwrap();
+    assert!(applied.added.is_empty());
+    assert_eq!(applied.skipped.len(), 1);
+    assert_eq!(applied.skipped[0].decision_ref, "D2");
+    assert!(
+        applied.skipped[0].note.contains("D1") && applied.skipped[0].note.contains("rejected"),
+        "{}",
+        applied.skipped[0].note
+    );
+    assert!(Memories::new(&store).all_live().unwrap().is_empty());
+
+    let fixed = apply_import(&store, &log_with("2026-10-21"), "rusty-remind-me", "d.md").unwrap();
+    assert_eq!(added_refs(&fixed), ["D1", "D2"]);
+    assert_eq!(fixed.linked.len(), 1);
+    let live: Vec<_> = Memories::new(&store)
+        .all_live()
+        .unwrap()
+        .into_iter()
+        .filter(|m| m.superseded_by.is_none())
+        .map(|m| m.metadata["decision_ref"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(live, ["D2"], "only D2 is live");
+}

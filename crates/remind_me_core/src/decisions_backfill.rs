@@ -495,6 +495,11 @@ pub struct ParsedLog {
     /// The prefix every ref carries, links included ([`RefOptions::prefix`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ref_prefix: Option<String>,
+    /// Refs of rows rejected after their ref was read (a bad Date, no
+    /// decision text): still entries of the file, so a row superseding one
+    /// waits for it instead of going in unlinked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rejected_refs: Vec<String>,
 }
 
 /// An entry whose ref repeats an earlier one, renamed so both import.
@@ -559,6 +564,9 @@ pub fn parse_log_with(text: &str, options: &RefOptions) -> ParsedLog {
     if let Some(prefix) = options.prefix.as_deref().map(str::trim) {
         for entry in &mut log.entries {
             entry.decision_ref = prefixed(Some(prefix), &entry.decision_ref);
+        }
+        for rejected in &mut log.rejected_refs {
+            *rejected = prefixed(Some(prefix), rejected);
         }
         for renamed in &mut log.renamed {
             renamed.from = prefixed(Some(prefix), &renamed.from);
@@ -755,12 +763,14 @@ fn read_row(
     });
     let Some((title, title_struck)) = decision.filter(|(t, _)| !t.is_empty()) else {
         log.unparsed.push(unparsed("no decision text"));
+        log.rejected_refs.push(reference);
         return;
     };
     let some = |c: Option<usize>| at(c).map(|(t, _)| t).filter(|t| !t.is_empty());
     let date = some(cols.date);
     if date.as_deref().is_some_and(|d| !is_date(d)) {
         log.unparsed.push(unparsed("date is not a YYYY-MM-DD day"));
+        log.rejected_refs.push(reference);
         return;
     }
     if from_date {
@@ -1405,6 +1415,9 @@ struct ImportBatch<'a> {
     source: &'a str,
     /// Every ref the file defines: a link to one of these waits for it.
     in_file: HashSet<&'a str>,
+    /// The refs of rows the parse rejected, also in `in_file`: named in
+    /// the reason a row superseding one is held back.
+    rejected: HashSet<&'a str>,
 }
 
 /// Write `plan`'s `new` rows, each in its own transaction (see
@@ -1423,7 +1436,9 @@ fn apply_plan(
             .entries
             .iter()
             .map(|e| e.decision_ref.as_str())
+            .chain(log.rejected_refs.iter().map(String::as_str))
             .collect(),
+        rejected: log.rejected_refs.iter().map(String::as_str).collect(),
     };
     let ambiguous: HashSet<&str> = plan
         .ambiguous
@@ -1549,8 +1564,12 @@ fn write_row(
         batch.in_file.contains(l.supersedes.as_str()) && !held.contains_key(&l.supersedes)
     });
     if let Some(link) = pending {
+        let why = match batch.rejected.contains(link.supersedes.as_str()) {
+            true => "an entry of this file rejected as unparsed",
+            false => "an entry of this file not in the store",
+        };
         return Ok(RowWrite::Skipped(format!(
-            "supersedes {}, an entry of this file not in the store",
+            "supersedes {}, {why}",
             link.supersedes
         )));
     }
