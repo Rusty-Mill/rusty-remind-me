@@ -5,7 +5,8 @@ method and aggregate results only. The raw JSON lines, the #1563 query set
 and its vectors hold real text and live ids, so they stay off the repo (D39).
 
 **Result: the § Choosing rule names no store from this run.** Attest
-misses G3 and G7 as observed; its G2 and G6 did not run. The G4 figures
+misses G3 and G7 as observed; its G6 crash run started but did not
+complete (no valid G6 result), and its G2 did not run. The G4 figures
 here are each process's observed whole-run `VmHWM` (its lifetime
 high-water, the D1 load included), reported as a diagnostic. They do not
 establish the signed G4 verdict for workloads 1 to 7, so this page does not
@@ -22,7 +23,7 @@ the live store (R4) is a separate decision.
 | `R3_GIT_SHA` | the sha above. The crash and relevance reports carry it. The bench reports have no `git_sha` field; their provenance is the run log's start line and their run directories. |
 | Host | BaileyAi, never the remindme host or the live store. Each command ran as root, alone, under `systemd-run --scope -p MemoryMax=4G -p CPUQuota=200%`, with `R3_REQUIRE_CGROUP=1` and `R3_DROP_CACHES=1`. Every cold-open report has cache `cold: page cache dropped before the open` and cgroup `memory_max 4294967296`, `cpu_max 200000 100000`. |
 | D1 source | a fresh `manual-*.engine` backup (2026-11-23 22:23 UTC, 487 MB) taken through the store daemon (`rusty-remind-me admin backup`), copied read-only. D1 loaded 25,232 memories, 2,575 entities, 3 relations, 4,575 references and 31,940 stored 1024-dim vectors. |
-| Query vectors | the 50 #1563 queries embedded once before any benchmark (D59), with `qwen3-embedding:0.6b`, role `query`, dim 1024, bound to that backup. No candidate refused them; all 50 were scored with no relevant ids missing. |
+| Query vectors | the 50 #1563 queries embedded once before any benchmark (D59), with `qwen3-embedding:0.6b`, role `query`, dim 1024, bound to that backup. Neither the engine nor SQLite refused them; for both, all 50 were scored with no relevant ids missing. Attest's G2 did not run. |
 | Model slot (D38) | no local-model job ran alongside a benchmark command. The live remind-me embedder (ollama on BaileyAi) was unloaded before the run and before every step (Nano's OK); it reloaded for live traffic between steps 9 times and was unloaded again each time. The script found the slot busy before a step 0 times. |
 | G1 | the port conformance suites are covered by CI on this sha (CI run 45307874715, success) and by #414's Attest conformance run. Every bench report also passed the two in-run G1 checks (dialog rows refuse an in-place rewrite; readers saw no torn transaction). |
 
@@ -42,8 +43,10 @@ the live store (R4) is a separate decision.
   harness's 300 s limit. No D2 numbers exist for Attest.
 - **Stopped early:** the run was stopped during the Attest crash run
   (started 2026-11-24 11:22 UTC, about 3.5 h in, no report). Attest's G6
-  and both G2 runs did not run. Attest had already missed G3 and G7, so
-  those runs could not change the outcome.
+  run started but did not complete, so there is no valid G6 result, and
+  both its G2 runs did not run. Its observed G3 and G7 misses already keep
+  Attest from qualifying; the missing runs could not have qualified it,
+  and they do not settle the overall result.
 - Every other command (all 12 engine and SQLite commands, Attest bench D1
   and D3) exited 0 first time with a valid report: no `valid:false`, no
   `scoring_input:false`, no non-empty `insufficient`.
@@ -59,7 +62,7 @@ A miss on any gate drops the candidate (§ Thresholds).
 | G3 Steady memory | idle with D3 at most 1.0 GB | **pass** 526 MB | **pass** 42 MB | **miss** 2,512 MB |
 | G4 Peak memory | at most 1.5 GB in workloads 1-7 | not established. Observed whole-run `VmHWM` (diagnostic): 2,735 MB (D1 2,071, D2 2,735, D3 2,046, crash 907, crash child 740, crash reopen 1,131) | not established. Observed whole-run `VmHWM` (diagnostic): 2,392 MB (D1 1,715, D2 2,392, D3 1,774, crash 904, crash child 80, crash reopen 904) | not established. Observed whole-run `VmHWM` (diagnostic): 4,082 MB (D1 4,065, D3 4,082) |
 | G5 Raw text off RAM | idle D3 / idle D1 at most 1.25x | **pass** 1.06x | **pass** 1.00x | **pass** 0.93x |
-| G6 Crash safety | 200/200 kills clean | **pass** 200/200, 0 failures | **pass** 200/200, 0 failures | did not run (stopped) |
+| G6 Crash safety | 200/200 kills clean | **pass** 200/200, 0 failures | **pass** 200/200, 0 failures | started, did not complete: no valid G6 result (stopped) |
 | G7 Cold open | D1 at most 3 s, D3 at most 5 s | **pass** 2.59 s / 2.96 s | **pass** 1.83 s / 1.74 s | **miss** 174.8 s / 298.4 s; D2 gave no answer in 300 s |
 | G8 Backup | D3 restore byte-identical | match within the manifest's scope (284,940 items) | match within the manifest's scope (291,054 items) | match within the manifest's scope (285,882 items) |
 
@@ -129,7 +132,8 @@ over D1, `vector/balanced` recall@10 0.940 and MRR 0.827; `keyword/balanced`
 ## Choosing (§ Choosing, applied exactly)
 
 1. Drop every candidate that misses a gate: Attest (G3, G7, as observed;
-   its G2 and G6 did not run). For the engine and SQLite this step cannot
+   no valid G6 result, as its crash run did not complete; its G2 did not
+   run). For the engine and SQLite this step cannot
    be completed, because the run does not establish their G4 verdict.
 2. Most scored targets met: not reached.
 3. Ties to least storage code we own: not reached.
