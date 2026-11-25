@@ -25,18 +25,21 @@ host cannot afford for full dialog bodies.
    is append-only. There is no delete path, including the owner's (D80).
 3. A row holds metadata and a 512-byte head (D51). The body is a
    `BlobStore` blob named by its sha256 (D50). `DialogLog` publishes the
-   blob first with `BlobStore::put_durable` (synced file and directory, an
+   blob first with `BlobStore::put_durable` (synced file; every directory
+   it created synced, with the entry naming it in its existing parent; an
    existing blob verified and replaced if it fails its hash), then appends
    the row; a failed publication appends nothing, and a rerun is
-   idempotent by hash. Durability boundary: the blob is flushed before the
-   row's `synchronous = FULL` commit on Unix; Windows has no directory
-   sync, so a lost rename there shows as a missing blob on read, never as
+   idempotent by hash. Durability boundary: the nearest ancestor that
+   existed before the write is taken to be durable. On Unix a corrupt blob
+   is replaced by one atomic rename, never unlinked first. Elsewhere there
+   is no directory sync and the replacement removes before it renames, so a
+   lost rename or a concurrent reader shows a missing blob on read, never
    wrong bytes.
-5. `append` is one `INSERT ... ON CONFLICT DO NOTHING` followed by a read
+4. `append` is one `INSERT ... ON CONFLICT DO NOTHING` followed by a read
    of the winner's row, so two connections racing on an id get
    `Duplicate` for identical content and `Invalid` for different content,
    and the original row is never changed.
-4. ADR-0025's rule that `rusqlite` appears only in `legacy_sqlite` becomes:
+5. ADR-0025's rule that `rusqlite` appears only in `legacy_sqlite` becomes:
    only in `legacy_sqlite` and `db::sqlite`.
 
 ## Not in this change

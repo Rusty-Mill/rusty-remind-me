@@ -247,6 +247,32 @@ mod tests {
     }
 
     #[test]
+    fn a_first_write_creates_and_syncs_a_fresh_blob_hierarchy() {
+        let dir = scratch("fresh");
+        // Neither the blob root nor its parent exists yet.
+        let root = dir.join("deep").join("blobs");
+        let mut log = DialogLog::new(
+            SqliteDialogs::open_in_memory().unwrap(),
+            BlobStore::new(&root),
+        );
+        let d = NewDialog {
+            id: "d1",
+            capture_id: "c1",
+            session_id: None,
+            project: None,
+            created_at: "2026-11-25T00:00:00Z",
+            body: "hello",
+        };
+        assert_eq!(log.record(&d).unwrap(), Appended::Inserted);
+        let rec = log.store().get("d1").unwrap().unwrap();
+        assert_eq!(log.body(&rec).unwrap(), "hello");
+        // A second write into the now-existing hierarchy still succeeds.
+        let again = NewDialog { id: "d2", ..d };
+        assert_eq!(log.record(&again).unwrap(), Appended::Inserted);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_failed_publication_appends_no_row() {
         let dir = scratch("nopublish");
         std::fs::create_dir_all(&dir).unwrap();
