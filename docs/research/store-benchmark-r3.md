@@ -4,11 +4,15 @@ Spec: `docs/design/store-benchmark-r3.md` (D40, D41). This page reports the
 method and aggregate results only. The raw JSON lines, the #1563 query set
 and its vectors hold real text and live ids, so they stay off the repo (D39).
 
-**Result: none passes every gate.** Every candidate misses G4 (peak
-resident memory at most 1.5 GB). Attest also misses G3 and G7. Under
-§ Choosing step 1 every candidate is dropped, so the rule names no winner.
-The scored tables are below for the record; Nano picks what happens next.
-Migrating the live store (R4) is a separate decision.
+**Result: the § Choosing rule names no store from this run.** Attest
+misses G3 and G7 as observed; its G2 and G6 did not run. The G4 figures
+here are each process's observed whole-run `VmHWM` (its lifetime
+high-water, the D1 load included), reported as a diagnostic. They do not
+establish the signed G4 verdict for workloads 1 to 7, so this page does not
+use them to say any candidate passes or misses G4. Without a G4 verdict,
+§ Choosing step 1 cannot be completed for the engine or SQLite. The scored
+tables are below for the record. Nano's choice is in § Decision; migrating
+the live store (R4) is a separate decision.
 
 ## Run
 
@@ -38,7 +42,7 @@ Migrating the live store (R4) is a separate decision.
   harness's 300 s limit. No D2 numbers exist for Attest.
 - **Stopped early:** the run was stopped during the Attest crash run
   (started 2026-11-24 11:22 UTC, about 3.5 h in, no report). Attest's G6
-  and both G2 runs did not run. Attest had already missed G3, G4 and G7, so
+  and both G2 runs did not run. Attest had already missed G3 and G7, so
   those runs could not change the outcome.
 - Every other command (all 12 engine and SQLite commands, Attest bench D1
   and D3) exited 0 first time with a valid report: no `valid:false`, no
@@ -51,21 +55,32 @@ A miss on any gate drops the candidate (§ Thresholds).
 | Gate | Threshold | Engine | SQLite | Attest |
 |---|---|---|---|---|
 | G1 Conformance | 100% | pass (CI; in-run checks 3/3) | pass (CI; in-run checks 3/3) | pass by #414; in-run checks clean on D1 and D3 (D2 did not finish) |
-| G2 Relevance | recall@10 and MRR within 2 pt of the engine on both sets | pass (it is the baseline) | **pass**: golden and #1563 identical to the engine in every cell (0.0 pt drop) | did not run (stopped) |
+| G2 Relevance | recall@10 and MRR within 2 pt of the engine on both sets | pass (it is the baseline) | **pass**, engine and SQLite only: golden and #1563 identical to the engine in every cell (0.0 pt drop) | did not run (stopped) |
 | G3 Steady memory | idle with D3 at most 1.0 GB | **pass** 526 MB | **pass** 42 MB | **miss** 2,512 MB |
-| G4 Peak memory | at most 1.5 GB in workloads 1-7 | **miss** 2,735 MB (D1 2,071, D2 2,735, D3 2,046, crash 907, crash child 740, crash reopen 1,131) | **miss** 2,392 MB (D1 1,715, D2 2,392, D3 1,774, crash 904, crash child 80, crash reopen 904) | **miss** 4,082 MB (D1 4,065, D3 4,082) |
+| G4 Peak memory | at most 1.5 GB in workloads 1-7 | not established. Observed whole-run `VmHWM` (diagnostic): 2,735 MB (D1 2,071, D2 2,735, D3 2,046, crash 907, crash child 740, crash reopen 1,131) | not established. Observed whole-run `VmHWM` (diagnostic): 2,392 MB (D1 1,715, D2 2,392, D3 1,774, crash 904, crash child 80, crash reopen 904) | not established. Observed whole-run `VmHWM` (diagnostic): 4,082 MB (D1 4,065, D3 4,082) |
 | G5 Raw text off RAM | idle D3 / idle D1 at most 1.25x | **pass** 1.06x | **pass** 1.00x | **pass** 0.93x |
 | G6 Crash safety | 200/200 kills clean | **pass** 200/200, 0 failures | **pass** 200/200, 0 failures | did not run (stopped) |
 | G7 Cold open | D1 at most 3 s, D3 at most 5 s | **pass** 2.59 s / 2.96 s | **pass** 1.83 s / 1.74 s | **miss** 174.8 s / 298.4 s; D2 gave no answer in 300 s |
-| G8 Backup | D3 restore byte-identical | **pass** (284,940 items matched) | **pass** (291,054 items matched) | **pass** (285,882 items matched) |
+| G8 Backup | D3 restore byte-identical | match within the manifest's scope (284,940 items) | match within the manifest's scope (291,054 items) | match within the manifest's scope (285,882 items) |
 
-**G4 measurement.** `peak_rss_mb` is the bench process's high-water mark
-(`VmHWM`) for the whole run. That includes loading D1 through the ports and
-the harness's own working set, not only the store at rest. The spec applies
-G4 to resident memory "at any point in workloads 1 to 7" and D40 fixes
-thresholds before the run, so the numbers are applied as measured. Even the
-crash runs' reopen peaks (engine 1,131 MB, SQLite 904 MB) stay under 1.5 GB;
-the misses come from the bench processes.
+**G4 measurement.** `peak_rss_mb` is each process's observed high-water
+mark (`VmHWM`) over its whole life. For a bench process that includes
+loading D1 through the ports and the harness's own working set, not only
+workloads 1 to 7. These figures are a diagnostic. They do not establish the
+signed G4 verdict ("at any point in workloads 1 to 7"), and they are not
+used here to say that any candidate passes or misses G4. The crash runs'
+reopen peaks (engine 1,131 MB, SQLite 904 MB) are under 1.5 GB; the larger
+figures come from the bench processes.
+
+**G8 scope.** The restore check compares two manifests (see
+`crates/remind_me_core/examples/store_bench/package.rs`). A manifest hashes
+the rows it defines: memories (without the volatile access and vitality
+counters), wiki pages, references, entities, memory-entity links, entity
+relations and chunk vectors. It also hashes every body those rows link to,
+re-read from its blob. It leaves out the volatile memory counters, the
+feedback, promotions, sessions and outbox tables, and revision history. The
+item counts above are matches within that scope, not full coverage of the
+signed G8 criterion.
 
 **Engine G6 before the fix (D62).** Before the scoring run, the engine
 missed G6: a kill inside an update could leave a new `memory_revisions`
@@ -76,7 +91,8 @@ the one scored here. It passed 200/200 kills.
 ## Scored targets
 
 Reported for the record. § Choosing step 2 counts these only among
-candidates that pass every gate, and none does. A row needing two datasets
+candidates that pass every gate, which this run does not establish for any
+candidate. A row needing two datasets
 counts as met only when both meet it.
 
 | Target | Engine | SQLite | Attest |
@@ -112,19 +128,19 @@ over D1, `vector/balanced` recall@10 0.940 and MRR 0.827; `keyword/balanced`
 
 ## Choosing (§ Choosing, applied exactly)
 
-1. Drop every candidate that misses a gate: the engine (G4), SQLite (G4)
-   and Attest (G3, G4, G7). None is left.
-2. Most scored targets met: does not apply, no candidate is left.
-3. Ties to least storage code we own: does not apply.
+1. Drop every candidate that misses a gate: Attest (G3, G7, as observed;
+   its G2 and G6 did not run). For the engine and SQLite this step cannot
+   be completed, because the run does not establish their G4 verdict.
+2. Most scored targets met: not reached.
+3. Ties to least storage code we own: not reached.
 
-**Recommendation: none passes every gate, so the rule picks no store.**
-For context only, not as a rule result: SQLite misses only G4, on the
-bench process's peak, and beats the engine on G3 (42 vs 526 MB idle with
-D3), G7 and crash reopen. The engine meets one more scored target, the
-ingest-time hybrid ratio. Attest is far outside G3, G4 and G7, consistent
-with § Attest readiness (in-memory indexes rebuilt from the log at open).
-Whether to tighten what G4 measures, rerun, or decide on these numbers is
-Nano's call.
+**Recommendation: the rule names no store on this evidence.** For context
+only, not as a rule result: SQLite beats the engine on G3 (42 vs 526 MB
+idle with D3), G7 and crash reopen, and its observed whole-run `VmHWM` is
+lower. The engine meets one more scored target, the ingest-time hybrid
+ratio. Attest is far outside G3 and G7, consistent with § Attest readiness
+(in-memory indexes rebuilt from the log at open). Whether to establish G4
+by a rerun or decide on these numbers is Nano's call.
 
 ## Where the data is
 
@@ -135,8 +151,9 @@ beside them as `reports-attempt-1` and `runs-attempt-1`.
 
 ## Decision
 
-Nano picked SQLite ("SQLite it is", 2026-11-24), recorded as D69 in
-`docs/handoff/DECISIONS.md`. He picked it although the § Choosing rule
-names no winner: the G4 miss is waived by his pick, not re-measured.
+Nano picked SQLite ("SQLite it is", 2026-11-24), recorded as D75 in
+`docs/handoff/DECISIONS.md`. It is his choice, not a gate result: the
+§ Choosing rule names no store on this evidence, and G4 was not
+re-measured.
 The pick does not approve migrating the live store; that is R4, a separate
 decision and card.
