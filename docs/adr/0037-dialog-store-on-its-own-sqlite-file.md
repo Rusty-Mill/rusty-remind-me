@@ -9,8 +9,10 @@ on ADR-0035 (one port per table group).
 ## Context
 
 Mill Board #528: verbatim dialogs are the source of truth and must never be
-cleaned; everything else is a projection. The R3 store benchmark (#1618)
-came out SQLite (D75), and the engine holds every row in RAM, which a 4 GB
+cleaned; everything else is a projection. The R3 store question (#1618)
+was settled by Nano choosing SQLite (D75). That is the owner's choice, not a
+gate result: the scoring run (draft #425) finds no candidate passing every
+gate, SQLite included (it misses G4), and leaves the pick to him. The engine holds every row in RAM, which a 4 GB
 host cannot afford for full dialog bodies.
 
 ## Decision
@@ -22,8 +24,18 @@ host cannot afford for full dialog bodies.
    adapter also refuses UPDATE and DELETE with triggers, so the file itself
    is append-only. There is no delete path, including the owner's (D80).
 3. A row holds metadata and a 512-byte head (D51). The body is a
-   `BlobStore` blob named by its sha256 (D50). `DialogLog` writes the blob
-   first, then the row; a rerun is idempotent by hash.
+   `BlobStore` blob named by its sha256 (D50). `DialogLog` publishes the
+   blob first with `BlobStore::put_durable` (synced file and directory, an
+   existing blob verified and replaced if it fails its hash), then appends
+   the row; a failed publication appends nothing, and a rerun is
+   idempotent by hash. Durability boundary: the blob is flushed before the
+   row's `synchronous = FULL` commit on Unix; Windows has no directory
+   sync, so a lost rename there shows as a missing blob on read, never as
+   wrong bytes.
+5. `append` is one `INSERT ... ON CONFLICT DO NOTHING` followed by a read
+   of the winner's row, so two connections racing on an id get
+   `Duplicate` for identical content and `Invalid` for different content,
+   and the original row is never changed.
 4. ADR-0025's rule that `rusqlite` appears only in `legacy_sqlite` becomes:
    only in `legacy_sqlite` and `db::sqlite`.
 

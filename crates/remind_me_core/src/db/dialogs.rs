@@ -6,8 +6,11 @@
 //! sha256 of the full body, which lives in a [`BlobStore`] (D50).
 //!
 //! [`DialogLog`] is the one write path: body to the blob store first, then
-//! the row, so a crash between them leaves an orphan blob and no dangling
-//! row. A rerun is idempotent by body hash.
+//! the row, and only after the blob is durable and verified
+//! ([`BlobStore::put_durable`]: synced file and directory, an existing blob
+//! checked against its hash and replaced if it fails). A crash between the
+//! two leaves an orphan blob and no dangling row; a failed publication
+//! appends nothing. A rerun is idempotent by body hash.
 
 use crate::blobs::{content_key, BlobStore};
 use crate::db::{Result, StoreError};
@@ -106,7 +109,7 @@ impl<S: DialogStore> DialogLog<S> {
     pub fn record(&mut self, dialog: &NewDialog<'_>) -> Result<Appended> {
         let hash = self
             .blobs
-            .put(dialog.body.as_bytes())
+            .put_durable(dialog.body.as_bytes())
             .map_err(|e| StoreError::Engine(format!("dialog blob: {e}")))?;
         self.store.append(&DialogRecord {
             id: dialog.id.to_owned(),

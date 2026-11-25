@@ -76,21 +76,17 @@ fn record(row: &Row<'_>) -> rusqlite::Result<DialogRecord> {
 
 impl DialogStore for SqliteDialogs {
     fn append(&mut self, r: &DialogRecord) -> Result<Appended> {
-        if let Some(existing) = self.get(&r.id)? {
-            return if existing == *r {
-                Ok(Appended::Duplicate)
-            } else {
-                Err(StoreError::Invalid(format!(
-                    "dialog {} already exists with different content",
-                    r.id
-                )))
-            };
-        }
         let bytes = i64::try_from(r.body_bytes)
             .map_err(|_| StoreError::Invalid("dialog body is too large".into()))?;
-        self.conn
+        // One statement decides insert-or-not, so two connections racing on
+        // an id cannot both miss it; the loser reads the winner's row.
+        let inserted = self
+            .conn
             .execute(
-                &format!("INSERT INTO dialogs ({COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"),
+                &format!(
+                    "INSERT INTO dialogs ({COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                     ON CONFLICT(id) DO NOTHING"
+                ),
                 params![
                     r.id,
                     r.capture_id,
@@ -103,7 +99,20 @@ impl DialogStore for SqliteDialogs {
                 ],
             )
             .map_err(sqlite_error)?;
-        Ok(Appended::Inserted)
+        if inserted == 1 {
+            return Ok(Appended::Inserted);
+        }
+        match self.get(&r.id)? {
+            Some(existing) if existing == *r => Ok(Appended::Duplicate),
+            Some(_) => Err(StoreError::Invalid(format!(
+                "dialog {} already exists with different content",
+                r.id
+            ))),
+            None => Err(StoreError::Engine(format!(
+                "dialog {} conflicted but is not readable",
+                r.id
+            ))),
+        }
     }
 
     fn get(&self, id: &str) -> Result<Option<DialogRecord>> {
@@ -192,6 +201,72 @@ mod tests {
         assert_eq!(rec.head.len(), 512);
         assert_eq!(rec.body_bytes, 2000);
         assert_eq!(log.body(&rec).unwrap(), body);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_connections_racing_on_one_id_classify_correctly() {
+        let dir = scratch("race");
+        let mut a = SqliteDialogs::open(&dir).unwrap();
+        let mut b = SqliteDialogs::open(&dir).unwrap();
+        let first =
+            crate::db::dialogs::conformance::record("d1", "c1", "2026-11-25T00:00:00Z", "one");
+        let other =
+            crate::db::dialogs::conformance::record("d1", "c1", "2026-11-25T00:00:00Z", "two");
+        assert_eq!(a.append(&first).unwrap(), Appended::Inserted);
+        // `b` never saw the row before its own append: identical is a
+        // duplicate, different is refused, and the original is untouched.
+        assert_eq!(b.append(&first).unwrap(), Appended::Duplicate);
+        assert!(matches!(b.append(&other), Err(StoreError::Invalid(_))));
+        assert_eq!(a.get("d1").unwrap(), Some(first));
+        assert_eq!(a.count().unwrap(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_corrupt_pre_existing_blob_is_replaced_before_the_row_commits() {
+        let dir = scratch("corrupt");
+        let blobs = BlobStore::new(dir.join("blobs"));
+        let key = crate::blobs::content_key(b"hello");
+        std::fs::create_dir_all(blobs.path(&key).parent().unwrap()).unwrap();
+        std::fs::write(blobs.path(&key), b"torn").unwrap();
+        let mut log = DialogLog::new(SqliteDialogs::open_in_memory().unwrap(), blobs.clone());
+        let d = NewDialog {
+            id: "d1",
+            capture_id: "c1",
+            session_id: None,
+            project: None,
+            created_at: "2026-11-25T00:00:00Z",
+            body: "hello",
+        };
+        assert_eq!(log.record(&d).unwrap(), Appended::Inserted);
+        let rec = log.store().get("d1").unwrap().unwrap();
+        assert_eq!(log.body(&rec).unwrap(), "hello");
+        assert!(blobs.verify(&key).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_publication_appends_no_row() {
+        let dir = scratch("nopublish");
+        std::fs::create_dir_all(&dir).unwrap();
+        // The blob root is a file, so no blob can be created under it.
+        let root = dir.join("blobs");
+        std::fs::write(&root, b"not a directory").unwrap();
+        let mut log = DialogLog::new(
+            SqliteDialogs::open_in_memory().unwrap(),
+            BlobStore::new(&root),
+        );
+        let d = NewDialog {
+            id: "d1",
+            capture_id: "c1",
+            session_id: None,
+            project: None,
+            created_at: "2026-11-25T00:00:00Z",
+            body: "hello",
+        };
+        assert!(log.record(&d).is_err());
+        assert_eq!(log.store().count().unwrap(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

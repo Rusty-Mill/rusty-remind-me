@@ -110,6 +110,58 @@ impl BlobStore {
         }
     }
 
+    /// Store `bytes` under their sha256 and return once the blob is durable
+    /// and verified: the staged file is synced before it is renamed into
+    /// place, the directory is synced after, and a blob already at the key
+    /// is checked against its hash first. An existing blob that does not
+    /// match (torn or altered) is replaced, since these bytes are what the
+    /// key names. For a caller that commits a row pointing at the blob next
+    /// (the dialog log); [`Self::put`] stays as it was for archive.
+    ///
+    /// Durability boundary: data and the directory entry are flushed with
+    /// `sync_all` on the file and, on Unix, its directory. Windows has no
+    /// directory sync, so there a power loss may still lose the rename; the
+    /// row's own read-back check ([`crate::db::dialogs::DialogLog::body`])
+    /// then reports the blob missing rather than returning wrong bytes.
+    ///
+    /// # Errors
+    ///
+    /// The filesystem's error; nothing is claimed durable on `Err`.
+    pub fn put_durable(&self, bytes: &[u8]) -> io::Result<String> {
+        let key = content_key(bytes);
+        let path = self.path(&key);
+        let parent = path.parent().map(Path::to_path_buf);
+        if let Some(dir) = &parent {
+            std::fs::create_dir_all(dir)?;
+        }
+        if self.verify(&key)? {
+            OpenOptions::new().read(true).open(&path)?.sync_all()?;
+        } else {
+            let partial = self.stage(&path, bytes)?;
+            let published = OpenOptions::new()
+                .write(true)
+                .open(&partial)
+                .and_then(|f| f.sync_all())
+                .and_then(|()| {
+                    // A rename onto an existing file fails on Windows, and
+                    // here the existing file is the corrupt one.
+                    if path.exists() {
+                        std::fs::remove_file(&path)?;
+                    }
+                    std::fs::rename(&partial, &path)
+                });
+            if let Err(e) = published {
+                let _ = std::fs::remove_file(&partial);
+                return Err(e);
+            }
+        }
+        #[cfg(unix)]
+        if let Some(dir) = &parent {
+            std::fs::File::open(dir)?.sync_all()?;
+        }
+        Ok(key)
+    }
+
     /// The bytes stored under `key`, or `None` when there is no such blob.
     ///
     /// # Errors
