@@ -58,6 +58,13 @@ pub trait HistoryStore {
     /// then highest id first, at most `limit`.
     fn list(&self, memory_id: &str, limit: usize) -> Result<Vec<MemoryRevision>>;
 
+    /// When `memory_id`'s content last changed, given its `content` now:
+    /// the `edited_at` of the newest revision (highest id, so write order)
+    /// whose snapshot differs from the content that replaced it, or `None`
+    /// if no revision changed it. Walks newest first and stops at the first
+    /// change, so it reads only the revisions after that change.
+    fn content_revised_at(&self, memory_id: &str, content: &str) -> Result<Option<String>>;
+
     /// The tracked values revision `revision_id` holds, if it belongs to
     /// `memory_id`.
     fn revision(&self, memory_id: &str, revision_id: i64) -> Result<Option<Tracked>>;
@@ -125,6 +132,11 @@ impl<'c> Revisions<'c> {
     /// within the same clock tick still list in the order they were written.
     pub fn list(&self, memory_id: &str, limit: usize) -> Result<Vec<MemoryRevision>> {
         HistoryStore::list(&*self.backend.lock()?, memory_id, limit)
+    }
+
+    /// See [`HistoryStore::content_revised_at`].
+    pub fn content_revised_at(&self, memory_id: &str, content: &str) -> Result<Option<String>> {
+        HistoryStore::content_revised_at(&*self.backend.lock()?, memory_id, content)
     }
 
     /// See [`HistoryStore::revision`].
@@ -201,6 +213,31 @@ pub mod conformance {
         );
     }
 
+    pub fn content_revised_at_skips_revisions_that_kept_the_content<S: HistoryStore>(
+        store: &mut S,
+    ) {
+        let at = |s: u32| format!("2026-09-27T00:00:0{s}+00:00");
+        assert_eq!(
+            store.content_revised_at("m", "a").unwrap(),
+            None,
+            "no revisions"
+        );
+        // "a" became "b" at 1, then a tag edit at 2 and 3 kept "b".
+        store.insert("m", &values("a"), &at(1), None).unwrap();
+        store.insert("m", &values("b"), &at(2), None).unwrap();
+        store.insert("m", &values("b"), &at(3), None).unwrap();
+        store.insert("other", &values("z"), &at(4), None).unwrap();
+        assert_eq!(store.content_revised_at("m", "b").unwrap(), Some(at(1)));
+        // Reverted to "a" at 5: a reversion is a content change too.
+        store.insert("m", &values("b"), &at(5), None).unwrap();
+        assert_eq!(store.content_revised_at("m", "a").unwrap(), Some(at(5)));
+        assert_eq!(
+            store.content_revised_at("missing", "t").unwrap(),
+            None,
+            "unknown memory"
+        );
+    }
+
     pub fn delete_for_takes_only_that_memorys_revisions<S: HistoryStore>(store: &mut S) {
         store.insert("m1", &values("a"), NOW, None).unwrap();
         store.insert("m2", &values("b"), NOW, None).unwrap();
@@ -268,6 +305,10 @@ macro_rules! history_conformance {
         #[test]
         fn revisions_list_newest_first_and_belong_to_their_memory() {
             conformance::revisions_list_newest_first_and_belong_to_their_memory(&mut $make);
+        }
+        #[test]
+        fn content_revised_at_skips_revisions_that_kept_the_content() {
+            conformance::content_revised_at_skips_revisions_that_kept_the_content(&mut $make);
         }
         #[test]
         fn delete_for_takes_only_that_memorys_revisions() {
