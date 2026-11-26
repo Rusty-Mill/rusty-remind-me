@@ -2,7 +2,7 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
-## 2026-11-26 — Event time separate from record time (Mill Board #62, D85, D90)
+## 2026-11-26 — Event time separate from record time (Mill Board #62, D86, D91)
 
 ### Added
 - `metadata.occurred_at`: when a memory's event happened, as an RFC 3339 timestamp or `{from, to}` (both RFC 3339, `from < to`). "We shipped X on Oct 3" written on Oct 20 sorts and filters as Oct 3. It never replaces `created_at`.
@@ -12,7 +12,7 @@ Dated entries, newest first. One entry per merged pull request.
 
 ### Changed
 - The recency signal reads `occurred_at` (a span's `to`), else `created_at`, and compares parsed instants rather than strings. Vitality decay stays on `created_at`.
-- With `REMIND_ME_DATE_PHRASES=on`, an inferred window reads `occurred` when the caller passed no `time_field`; an explicit `created` or `updated` is kept (D93). `RawTimeWindow.time_field` is now an `Option`, so an explicit `created` is told apart from absent; on the wire, absent still means `created`. The default `time_field` stays `created`, so existing since/until searches, digest, export and brief are unchanged.
+- With `REMIND_ME_DATE_PHRASES=on`, an inferred window reads `occurred` when the caller passed no `time_field`; an explicit `created` or `updated` is kept (D94). `RawTimeWindow.time_field` is now an `Option`, so an explicit `created` is told apart from absent; on the wire, absent still means `created`. The default `time_field` stays `created`, so existing since/until searches, digest, export and brief are unchanged.
 - The #59 eval fixture gains six rows with `occurred` (days back, a `during` phrase, or a `span_days` span) and four `occurred` queries; `baseline.json` is re-blessed. On those queries, old code against new code on the same fixture and clock: plain modes MRR 0.875 to 0.833-0.875 (recency now picks the later event, and ranks a row about last month lower on a plain "last month" query), `+dates` modes recall@10 0.25 to 1.0 and MRR 0.125 to 0.80-0.875.
 
 ### Tests

@@ -346,7 +346,7 @@ fn validate_review(review: Option<&Value>) -> Result<(), KindError> {
 }
 
 /// When the event a memory records happened (`metadata.occurred_at`, card
-/// #62, pack D85 and D90): "we shipped X on Oct 3" written on Oct 20 occurred
+/// #62, pack D86 and D91): "we shipped X on Oct 3" written on Oct 20 occurred
 /// on Oct 3. It never replaces the record time, `created_at`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OccurredAt {

@@ -117,7 +117,7 @@ pub fn infer(
 
 /// The timestamp an inferred window reads: the caller's explicit
 /// `time_field`, else when the event happened ([`TimeField::Occurred`],
-/// card #62, pack D93), so "what we shipped last month" finds a row written
+/// card #62, pack D94), so "what we shipped last month" finds a row written
 /// this week about last month.
 fn phrase_field(explicit: Option<TimeField>) -> TimeField {
     explicit.unwrap_or(TimeField::Occurred)

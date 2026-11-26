@@ -316,7 +316,7 @@ pub fn update_memory_with(
     let metadata = client_metadata.as_ref().unwrap_or(&stored.metadata);
     fields.validate(metadata, stored.memory_type.as_deref())?;
     // Only metadata this edit supplies: a stored value is never revalidated,
-    // so an edit that leaves metadata alone cannot fail on it (pack D85).
+    // so an edit that leaves metadata alone cannot fail on it (pack D86).
     if let Some(supplied) = &client_metadata {
         crate::kinds::validate_occurred_at(supplied)?;
     }

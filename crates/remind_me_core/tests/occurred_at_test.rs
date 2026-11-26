@@ -1,5 +1,5 @@
 //! Coverage for `metadata.occurred_at`, when a memory's event happened as
-//! distinct from when it was recorded (card #62, pack D85 and D90): checked
+//! distinct from when it was recorded (card #62, pack D86 and D91): checked
 //! on every write that supplies metadata, read by `time_field: occurred`.
 
 use chrono::{Duration, Utc};

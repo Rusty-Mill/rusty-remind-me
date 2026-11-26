@@ -49,7 +49,7 @@ pub struct RawTimeWindow {
     pub until: Option<String>,
     /// `None` when the caller passed none, which reads as
     /// [`TimeField::default`]; kept apart from an explicit `created` so date
-    /// inference can tell them apart (pack D93).
+    /// inference can tell them apart (pack D94).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time_field: Option<TimeField>,
 }
