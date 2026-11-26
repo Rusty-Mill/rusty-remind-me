@@ -861,6 +861,9 @@ fn parse_decisions_args(args: &[String]) -> Result<DecisionsArgs, String> {
         Some(p) if p.is_empty() => return Err(usage("--project must not be blank.")),
         other => other,
     };
+    // The daemon validates the set again; refusing here names the flag.
+    remind_me_core::decisions_backfill::Folds::new(folds.clone())
+        .map_err(|e| usage(&format!("--fold: {e}.")))?;
     let reads_refs = refs != remind_me_core::decisions_backfill::RefOptions::default();
     match (verb.as_str(), words.as_slice()) {
         ("normalize", _) if reads_refs => Err(usage(
@@ -1875,6 +1878,8 @@ mod tests {
             &["normalize", "--fold", "mill"],
             &["normalize", "--fold", "mill=mill"],
             &["normalize", "--fold", "=mill"],
+            &["normalize", "--fold", "a_b=a-b", "--fold", "a-b=a_b"],
+            &["normalize", "--fold", "a_b=a-b", "--fold", "a_b=A-B"],
             &["import", "D.md", "--project", "mill", "--fold", "a_b=a-b"],
         ] {
             assert!(parse_decisions_args(&args(bad)).is_err(), "{bad:?}");

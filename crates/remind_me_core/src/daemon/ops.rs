@@ -26,7 +26,7 @@ pub enum Op {
     /// Dry-run normalise plan; see [`crate::decisions_backfill`]. Writes nothing.
     DecisionsNormalizePlan {
         project: Option<String>,
-        /// Project folds (`--fold FROM=TO`, pack D82); absent from older
+        /// Project folds (`--fold FROM=TO`, pack D83); absent from older
         /// clients, which then plan none.
         #[serde(default)]
         folds: Vec<crate::decisions_backfill::Fold>,
@@ -263,16 +263,28 @@ pub fn execute(store: &Store<'_>, op: &Op) -> OpReply {
 fn run(store: &Store<'_>, op: &Op) -> Result<Value, String> {
     match op {
         Op::ImpactExport { query } => crate::export::impact_snapshot(store, query.as_deref()),
-        Op::DecisionsNormalizePlan { project, folds } => to_value(
-            crate::db::memories::Memories::new(store)
-                .all_live()
-                .map(|all| {
-                    crate::decisions_backfill::plan_normalize_with(&all, project.as_deref(), folds)
-                }),
-        ),
-        Op::DecisionsNormalizeApply { project, folds } => to_value(
-            crate::decisions_backfill::apply_normalize_with(store, project.as_deref(), folds),
-        ),
+        Op::DecisionsNormalizePlan { project, folds } => {
+            let folds = crate::decisions_backfill::Folds::new(folds.clone())?;
+            to_value(
+                crate::db::memories::Memories::new(store)
+                    .all_live()
+                    .map(|all| {
+                        crate::decisions_backfill::plan_normalize_with(
+                            &all,
+                            project.as_deref(),
+                            &folds,
+                        )
+                    }),
+            )
+        }
+        Op::DecisionsNormalizeApply { project, folds } => {
+            let folds = crate::decisions_backfill::Folds::new(folds.clone())?;
+            to_value(crate::decisions_backfill::apply_normalize_with(
+                store,
+                project.as_deref(),
+                &folds,
+            ))
+        }
         Op::DecisionsImportPlan {
             project,
             source,

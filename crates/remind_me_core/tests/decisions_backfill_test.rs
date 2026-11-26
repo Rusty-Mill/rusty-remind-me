@@ -945,9 +945,13 @@ fn apply_skips_claim_rows() {
         .is_empty());
 }
 
-// -- project folds and retype (pack D71, D72, D82) -----------------------------
+// -- project folds and retype (pack D71, D72, D83) -----------------------------
 
-use remind_me_core::decisions_backfill::{apply_normalize_with, plan_normalize_with, Fold};
+use remind_me_core::decisions_backfill::{apply_normalize_with, plan_normalize_with, Fold, Folds};
+
+fn folds(raw: &[&str]) -> Folds {
+    Folds::new(raw.iter().map(|f| Fold::parse(f).expect("fold")).collect()).expect("folds")
+}
 
 fn untyped(id: &str, project: Option<&str>, metadata: serde_json::Value) -> NewMemory {
     let mut row = NewMemory::new(id, "homelab: keep backups offsite", "2026-09-01T00:00:00Z");
@@ -970,6 +974,50 @@ fn folds_take_two_spellings_of_one_name_only() {
     }
 }
 
+/// A set may fold several spellings into one, but never a spelling twice,
+/// and never into a spelling another fold renames (inverse pair, chain or
+/// cycle): those would make a second apply rename rows again.
+#[test]
+fn fold_sets_refuse_ambiguous_chained_and_cyclic_mappings() {
+    let set =
+        |raw: &[&str]| Folds::new(raw.iter().map(|f| Fold::parse(f).expect("fold")).collect());
+    assert!(set(&["let_em_loose=let-em-loose", "Let_Em_Loose=let-em-loose"]).is_ok());
+    for bad in [
+        &["a_b=a-b", "a-b=a_b"][..],
+        &["a_b=a-b", "a_b=A-B"],
+        &["a_b=a-b", "a-b=A-B"],
+        &["a_b=a-b", "a-b=A_B", "A_B=a_b"],
+    ] {
+        assert!(set(bad).is_err(), "{bad:?}");
+    }
+}
+
+/// Planned against an inverse pair, an apply would flip rows back and forth
+/// on every run. The set is refused before anything is read, and a valid
+/// set's second apply changes nothing.
+#[test]
+fn a_second_apply_with_the_same_folds_renames_nothing() {
+    let db = Database::open_in_memory().expect("database");
+    let store = db.store();
+    let memories = Memories::new(&store);
+    for (id, project) in [("m-1", "a_b"), ("m-2", "A_B"), ("m-3", "a-b")] {
+        let mut row = NewMemory::new(id, "worklog", "2026-11-01T00:00:00Z");
+        row.project = Some(project.into());
+        memories.insert(&row).expect("insert");
+    }
+    let set = folds(&["a_b=a-b", "A_B=a-b"]);
+    let first = apply_normalize_with(&store, None, &set).expect("apply");
+    assert_eq!(first.respelled.len(), 2);
+    let second = apply_normalize_with(&store, None, &set).expect("apply");
+    assert!(second.respelled.is_empty() && second.plan.respell.is_empty());
+    for id in ["m-1", "m-2", "m-3"] {
+        let m = remind_me_core::db::queries::get_memory_by_id(&store, id)
+            .expect("read")
+            .expect("live");
+        assert_eq!(m.project.as_deref(), Some("a-b"), "{id}");
+    }
+}
+
 /// Folds match the exact spelling and respect `--project`; without a fold
 /// nothing is respelled, so a plain run keeps its old behaviour.
 #[test]
@@ -982,7 +1030,7 @@ fn respell_proposes_exact_spellings_of_any_type() {
         decision("m-canon", "let-em-loose", "x", json!({"rationale": "x"})),
         decision("m-term", "rusty_term", "x", json!({"rationale": "x"})),
     ]);
-    let folds = [Fold::parse("let_em_loose=let-em-loose").expect("fold")];
+    let folds = folds(&["let_em_loose=let-em-loose"]);
     let ids = |plan: &remind_me_core::decisions_backfill::NormalizePlan| {
         plan.respell
             .iter()
@@ -1040,7 +1088,7 @@ fn apply_respells_retypes_and_adds_refs_in_one_run() {
         memories.insert(&row).expect("insert");
     }
 
-    let folds = [Fold::parse("let_em_loose=let-em-loose").expect("fold")];
+    let folds = folds(&["let_em_loose=let-em-loose"]);
     let applied = apply_normalize_with(&store, None, &folds).expect("apply");
     let ids = |rows: &[remind_me_core::decisions_backfill::NormalizeRow]| {
         rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>()

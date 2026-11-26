@@ -191,6 +191,10 @@ pub struct NormalizeRow {
     pub project: Option<String>,
     /// The ref to write to `metadata.decision_ref`, when one is known.
     pub decision_ref: Option<String>,
+    /// For a `respell` row, the fold planned for it: the write skips the
+    /// row if its project no longer matches this fold's source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fold: Option<Fold>,
     /// Why the row is in its bucket.
     pub note: String,
     pub snippet: String,
@@ -220,7 +224,7 @@ pub struct NormalizePlan {
 }
 
 /// A project fold: memories whose project is exactly `from` are renamed to
-/// `to` (pack D71, D82). Only two spellings of one name may be folded.
+/// `to` (pack D71, D83). Only two spellings of one name may be folded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Fold {
     pub from: String,
@@ -257,10 +261,52 @@ impl Fold {
     }
 }
 
+/// A validated set of folds: each spelling is folded at most once, and no
+/// fold's target is another fold's source. So an apply is idempotent: what
+/// one run renames, no fold of the same set renames again (an inverse pair
+/// `a=b`, `b=a` would flip rows on every run).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Folds(Vec<Fold>);
+
+impl Folds {
+    /// Validate `folds` as one set.
+    ///
+    /// # Errors
+    ///
+    /// A spelling folded twice, or a fold whose target another fold renames
+    /// (a chain, an inverse pair or a cycle).
+    pub fn new(folds: Vec<Fold>) -> Result<Self, String> {
+        let mut sources: HashSet<&str> = HashSet::new();
+        for fold in &folds {
+            if !sources.insert(&fold.from) {
+                return Err(format!("{:?} is folded more than once", fold.from));
+            }
+        }
+        if let Some(fold) = folds.iter().find(|f| sources.contains(f.to.as_str())) {
+            return Err(format!(
+                "fold {}={} targets a spelling another fold renames; folds may not chain or cycle",
+                fold.from, fold.to
+            ));
+        }
+        Ok(Self(folds))
+    }
+
+    /// The folds, in the order given.
+    pub fn as_slice(&self) -> &[Fold] {
+        &self.0
+    }
+
+    /// The fold that renames `memory`'s project, if any.
+    fn for_memory(&self, memory: &Memory) -> Option<&Fold> {
+        let project = memory.project.as_deref()?;
+        self.0.iter().find(|f| f.from == project)
+    }
+}
+
 /// Plan the normalisation of `memories`, limited to `project` when given.
 /// Deleted, superseded and sensitive memories are left out. No folds.
 pub fn plan_normalize(memories: &[Memory], project: Option<&str>) -> NormalizePlan {
-    plan_normalize_with(memories, project, &[])
+    plan_normalize_with(memories, project, &Folds::default())
 }
 
 /// [`plan_normalize`] with project `folds`: every memory, of any type, whose
@@ -268,11 +314,11 @@ pub fn plan_normalize(memories: &[Memory], project: Option<&str>) -> NormalizePl
 pub fn plan_normalize_with(
     memories: &[Memory],
     project: Option<&str>,
-    folds: &[Fold],
+    folds: &Folds,
 ) -> NormalizePlan {
     let mut plan = NormalizePlan {
         project: project.map(str::to_string),
-        folds: folds.to_vec(),
+        folds: folds.as_slice().to_vec(),
         ..Default::default()
     };
     let mut live: Vec<&Memory> = memories
@@ -290,20 +336,15 @@ pub fn plan_normalize_with(
     plan
 }
 
-/// The fold that renames `memory`'s project, if any.
-fn fold_for<'f>(memory: &Memory, folds: &'f [Fold]) -> Option<&'f Fold> {
-    let project = memory.project.as_deref()?;
-    folds.iter().find(|f| f.from == project)
-}
-
-fn respell(memory: &Memory, folds: &[Fold], plan: &mut NormalizePlan) {
-    let Some(fold) = fold_for(memory, folds) else {
+fn respell(memory: &Memory, folds: &Folds, plan: &mut NormalizePlan) {
+    let Some(fold) = folds.for_memory(memory) else {
         return;
     };
     plan.respell.push(NormalizeRow {
         id: memory.id.clone(),
         project: memory.project.clone(),
         decision_ref: None,
+        fold: Some(fold.clone()),
         note: format!("project {} -> {}", fold.from, fold.to),
         snippet: snippet(&memory.content),
     });
@@ -317,6 +358,7 @@ fn classify(memory: &Memory, plan: &mut NormalizePlan) {
         id: memory.id.clone(),
         project: memory.project.clone(),
         decision_ref,
+        fold: None,
         note,
         snippet: snippet(&memory.content),
     };
@@ -407,11 +449,11 @@ pub fn apply_normalize(
     store: &Store<'_>,
     project: Option<&str>,
 ) -> crate::db::Result<NormalizeApplied> {
-    apply_normalize_with(store, project, &[])
+    apply_normalize_with(store, project, &Folds::default())
 }
 
 /// Plan afresh from `store`, then write the plan's proposals in order:
-/// `respell`, then `retype`, then `add_ref` (pack D82). Each row is re-read
+/// `respell`, then `retype`, then `add_ref` (pack D83). Each row is re-read
 /// and re-planned in its own transaction, so a row the earlier steps
 /// changed is judged as it now stands. A second run finds nothing to do.
 ///
@@ -424,7 +466,7 @@ pub fn apply_normalize(
 pub fn apply_normalize_with(
     store: &Store<'_>,
     project: Option<&str>,
-    folds: &[Fold],
+    folds: &Folds,
 ) -> crate::db::Result<NormalizeApplied> {
     let plan = plan_normalize_with(&Memories::new(store).all_live()?, project, folds);
     let scope = Scope { project, folds };
@@ -467,9 +509,10 @@ pub fn apply_planned(
         project: project.map(str::to_string),
         ..Default::default()
     };
+    let folds = Folds::default();
     let scope = Scope {
         project,
-        folds: &[],
+        folds: &folds,
     };
     apply_rows(
         store,
@@ -492,7 +535,7 @@ fn record_revision(store: &Store<'_>, id: &str, before: &Tracked) -> crate::db::
 /// What a plan was made with, so a row can be planned again at write time.
 struct Scope<'a> {
     project: Option<&'a str>,
-    folds: &'a [Fold],
+    folds: &'a Folds,
 }
 
 /// One kind of proposal [`apply_normalize_with`] carries out.
@@ -578,7 +621,13 @@ fn write_normalized(
             wanted.decision_ref.as_deref().unwrap_or("none")
         )));
     }
-    let edit = match edit_for(step, &current, wanted, scope.folds)? {
+    if wanted.fold != row.fold {
+        return Ok(NormWrite::Skipped(format!(
+            "project changed to {} since planning",
+            current.project.as_deref().unwrap_or("none")
+        )));
+    }
+    let edit = match edit_for(step, &current, wanted)? {
         Ok(edit) => edit,
         Err(why) => return Ok(NormWrite::Skipped(why)),
     };
@@ -608,11 +657,10 @@ fn edit_for(
     step: Step,
     current: &Memory,
     wanted: &NormalizeRow,
-    folds: &[Fold],
 ) -> crate::db::Result<Result<MemoryEdit, String>> {
     let at = MemoryEdit::at(chrono::Utc::now().to_rfc3339());
     if step == Step::Respell {
-        let Some(fold) = fold_for(current, folds) else {
+        let Some(fold) = &wanted.fold else {
             return Ok(Err("no fold matches its project".into()));
         };
         return Ok(Ok(MemoryEdit {
@@ -2365,9 +2413,10 @@ mod apply_tests {
             record_revision(s, id, before)
         };
         let mut applied = NormalizeApplied::default();
+        let folds = Folds::default();
         let scope = Scope {
             project: None,
-            folds: &[],
+            folds: &folds,
         };
         apply_rows(
             &store,
@@ -2399,6 +2448,70 @@ mod apply_tests {
                 .len(),
             1
         );
+    }
+
+    /// A row planned under one fold whose project is edited before the
+    /// write to a spelling another fold of the set renames is skipped: the
+    /// write compares the planned fold, not just "some fold matches".
+    #[test]
+    fn a_respell_skips_a_row_whose_project_moved_to_another_fold() {
+        let db = Database::open_in_memory().expect("database");
+        let store = db.store();
+        let memories = Memories::new(&store);
+        let mut row = NewMemory::new("m-1", "worklog", "2026-11-01T00:00:00Z");
+        row.project = Some("a_b".into());
+        memories.insert(&row).expect("insert");
+        let folds = Folds::new(vec![
+            Fold::parse("a_b=a-b").expect("fold"),
+            Fold::parse("A_B=a-b").expect("fold"),
+        ])
+        .expect("folds");
+        let plan = plan_normalize_with(&memories.all_live().expect("read"), None, &folds);
+        assert_eq!(plan.respell.len(), 1);
+        assert_eq!(
+            plan.respell[0].fold.as_ref().map(|f| f.from.as_str()),
+            Some("a_b")
+        );
+
+        // After planning, before the write: another writer moves the row.
+        let edit = MemoryEdit {
+            project: Some("A_B".into()),
+            ..MemoryEdit::at("2026-11-02T00:00:00Z")
+        };
+        memories.apply_edit("m-1", &edit).expect("edit");
+
+        let mut applied = NormalizeApplied::default();
+        let scope = Scope {
+            project: None,
+            folds: &folds,
+        };
+        apply_rows(
+            &store,
+            &scope,
+            Step::Respell,
+            &plan.respell,
+            &record_revision,
+            &mut applied,
+        );
+        assert!(applied.respelled.is_empty());
+        assert_eq!(applied.skipped.len(), 1);
+        assert!(
+            applied.skipped[0].note.contains("A_B"),
+            "{}",
+            applied.skipped[0].note
+        );
+        let read = queries::get_memory_by_id(&store, "m-1")
+            .expect("read")
+            .expect("live");
+        assert_eq!(
+            read.project.as_deref(),
+            Some("A_B"),
+            "the newer edit stands"
+        );
+        assert!(Revisions::new(&store)
+            .list("m-1", 10)
+            .expect("history")
+            .is_empty());
     }
 
     const LOG: &str = "| # | Decision | Why |\n|---|---|---|\n| D1 | Old | x |\n| D2 | Supersedes D1. New | y |\n";
