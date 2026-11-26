@@ -1,4 +1,4 @@
-//! Read-time stale flags on derived knowledge (card #60, D83, D87, D88).
+//! Read-time stale flags on derived knowledge (card #60, D84, D88, D89).
 //!
 //! An artifact is stale when a newer, live, related memory exists, where
 //! related means sharing a non-project, non-hub entity with its sources.
@@ -98,7 +98,7 @@ fn sharing_only_the_project_does_not_flag() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
     let (_, written) = base(&store);
-    // Same project, an unrelated entity: D87 leaves project out.
+    // Same project, an unrelated entity: D88 leaves project out.
     let other = entity(&store, "Quokka", None);
     seed(&store, "mem_same_project", &ago(1), Some("home"));
     link(&store, "mem_same_project", &other);
@@ -411,7 +411,7 @@ fn refreshes_must_name_a_live_promotion_at_the_rung() {
     ));
 }
 
-/// Latency on a 25k-memory store with 50k links (D83 asks for the number).
+/// Latency on a 25k-memory store with 50k links (D84 asks for the number).
 /// Run with `cargo test --release -p remind_me_core --test staleness_test
 /// -- --ignored --nocapture`.
 #[test]
