@@ -539,22 +539,72 @@ fn a_statement_built_on_discredited_decisions_is_not_a_refresh_candidate() {
     assert!(refresh_of(&candidates, &statement).is_none());
 }
 
+/// A scenario made 5 hours ago with related evidence from 3 hours ago, so
+/// any write made now postdates the evidence.
+fn backdated_stale_scenario(store: &Store<'_>) -> String {
+    let (perth, _, old) = scenario(store);
+    for column in ["created_at", "updated_at"] {
+        remind_me_core::testing::set_memory_column(store, &old, column, ago(5).as_str()).unwrap();
+    }
+    seed(store, "mem_moved", &ago(3), None);
+    link(store, "mem_moved", &perth);
+    let candidates = promotion_candidates(store, Rung::FactToScenario, 20).unwrap();
+    assert!(
+        refresh_of(&candidates, &old).is_some(),
+        "stale before the write"
+    );
+    old
+}
+
+fn is_refresh_candidate(store: &Store<'_>, id: &str) -> bool {
+    let candidates = promotion_candidates(store, Rung::FactToScenario, 20).unwrap();
+    refresh_of(&candidates, id).is_some()
+}
+
+fn update(store: &Store<'_>, fields: serde_json::Value) {
+    let input: remind_me_core::MemoryUpdateInput = serde_json::from_value(fields).unwrap();
+    remind_me_core::db::queries::update_memory(store, &input).unwrap();
+}
+
 #[test]
 fn an_artifact_revised_after_the_evidence_is_not_stale() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
-    let (perth, _, old) = scenario(&store);
-    make_stale(&store, &perth);
-    let candidates = promotion_candidates(&store, Rung::FactToScenario, 20).unwrap();
-    assert!(
-        refresh_of(&candidates, &old).is_some(),
-        "stale before the revision"
+    let old = backdated_stale_scenario(&store);
+    update(
+        &store,
+        serde_json::json!({"memory_id": old, "content": "Perth, revised"}),
     );
+    assert!(!is_refresh_candidate(&store, &old));
+}
 
-    // Revised in place after the evidence, as update_memory stamps it.
-    let revised = (now() + Duration::minutes(2)).to_rfc3339();
-    remind_me_core::testing::set_memory_column(&store, &old, "updated_at", revised.as_str())
-        .unwrap();
-    let candidates = promotion_candidates(&store, Rung::FactToScenario, 20).unwrap();
-    assert!(refresh_of(&candidates, &old).is_none());
+#[test]
+fn operational_writes_do_not_reset_staleness() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let old = backdated_stale_scenario(&store);
+    let soon = (now() + Duration::days(1)).to_rfc3339();
+    remind_me_core::reminders::set_reminder(&store, &old, Some(&soon)).unwrap();
+    assert!(
+        is_refresh_candidate(&store, &old),
+        "a reminder is not a revision"
+    );
+    let tag = remind_me_core::BulkTagInput {
+        ids: vec![old.clone()],
+        tags: vec!["perth".to_string()],
+        mode: Default::default(),
+    };
+    remind_me_core::db::queries::bulk_tag(&store, &tag).unwrap();
+    assert!(
+        is_refresh_candidate(&store, &old),
+        "a tag edit is not a revision"
+    );
+    update(
+        &store,
+        serde_json::json!({"memory_id": old, "tags": ["perth", "wa"]}),
+    );
+    assert!(
+        is_refresh_candidate(&store, &old),
+        "nor is a tag-only update"
+    );
 }

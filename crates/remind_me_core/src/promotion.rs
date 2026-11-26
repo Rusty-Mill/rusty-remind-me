@@ -375,8 +375,8 @@ pub fn sources_down_to_facts(store: &Store<'_>, promoted_id: &str) -> SqlResult<
     Ok(out)
 }
 
-/// [`crate::staleness::stale_check`] for a promoted memory, against its
-/// last write (`updated_at`, D84): an artifact revised in place after the
+/// [`crate::staleness::stale_check`] for a promoted memory, against the
+/// last revision of its content (D84): an artifact rewritten after the
 /// evidence arrived is not stale for it. Unchecked when the memory is gone.
 pub fn staleness_of(
     store: &Store<'_>,
@@ -387,8 +387,32 @@ pub fn staleness_of(
     let Some(row) = rows.first() else {
         return Ok(crate::staleness::Staleness::unchecked());
     };
+    let revised = content_revised_at(store, &row.id, &row.content, &row.created_at)?;
     let sources = sources_down_to_facts(store, promoted_id)?;
-    crate::staleness::stale_check(store, &sources, &row.updated_at, now)
+    crate::staleness::stale_check(store, &sources, &revised, now)
+}
+
+/// When memory `id`'s content last changed: the newest revision whose
+/// snapshot differs from the content that replaced it, else `created_at`.
+///
+/// Not `updated_at`, which reminders, tag edits and sync bookkeeping stamp
+/// without touching what the artifact says; an operational write must not
+/// hide the evidence it predates.
+fn content_revised_at(
+    store: &Store<'_>,
+    id: &str,
+    content: &str,
+    created_at: &str,
+) -> SqlResult<String> {
+    let revisions = crate::history::history(store, id, usize::MAX)?;
+    let mut replaced_by = content;
+    for revision in &revisions {
+        if revision.content != replaced_by {
+            return Ok(revision.edited_at.clone());
+        }
+        replaced_by = &revision.content;
+    }
+    Ok(created_at.to_string())
 }
 
 /// [`persona`], each statement with its stale flag (card #60).
