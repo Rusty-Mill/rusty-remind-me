@@ -1,0 +1,20 @@
+{"query": "Mira schema change review", "relevant": ["e-mira-schema"], "kind": "entity"}
+{"query": "who covers on-call for Mira Castellanos", "relevant": ["e-mira-rota"], "kind": "entity"}
+{"query": "who takes Mira's review queue during her leave", "relevant": ["e-mira-leave"], "kind": "entity"}
+{"query": "Toby deploy checklist", "relevant": ["e-toby-deploy"], "kind": "entity"}
+{"query": "Tobias Wren pager alerts", "relevant": ["e-toby-pager"], "kind": "entity"}
+{"query": "ledger retries a failed posting", "relevant": ["e-ledger-retry"], "kind": "entity"}
+{"query": "ledger idempotency", "relevant": ["e-ledger-idempotency"], "kind": "entity"}
+{"query": "Quill timeout 504", "relevant": ["e-quill-timeout"], "kind": "entity"}
+{"query": "Quill rate limit", "relevant": ["e-quill-ratelimit"], "kind": "entity"}
+{"query": "Quill certificate rotation", "relevant": ["e-quill-tls"], "kind": "entity"}
+{"query": "when does Northwind settle payouts", "relevant": ["e-northwind-settle"], "kind": "entity"}
+{"query": "Northwind account manager", "relevant": ["e-northwind-contact"], "kind": "entity"}
+{"query": "Northwind settlement files SFTP", "relevant": ["e-northwind-sftp"], "kind": "entity"}
+{"query": "Sable CPU capacity", "relevant": ["e-sable-capacity"], "kind": "entity"}
+{"query": "Sable kubernetes upgrade", "relevant": ["e-sable-upgrade"], "kind": "entity"}
+{"query": "Sable snapshots backup", "relevant": ["e-sable-backup"], "kind": "entity"}
+{"query": "Quill gateway", "relevant": ["e-quill-timeout", "e-quill-ratelimit", "e-quill-tls"], "kind": "entity"}
+{"query": "Mira's team parental leave policy", "relevant": ["d-parental-leave"], "kind": "entity-adversarial"}
+{"query": "ledger of petty cash", "relevant": ["d-ledger-word"], "kind": "entity-adversarial"}
+{"query": "Sable staging cluster upgrade order", "relevant": ["d-kube-upgrade"], "kind": "entity-adversarial"}

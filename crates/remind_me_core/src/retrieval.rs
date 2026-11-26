@@ -18,6 +18,7 @@ const ENV_RRF_W_SEMANTIC: &str = "REMIND_ME_RRF_W_SEMANTIC";
 const ENV_RRF_W_RECENCY: &str = "REMIND_ME_RRF_W_RECENCY";
 const ENV_RRF_W_VITALITY: &str = "REMIND_ME_RRF_W_VITALITY";
 const ENV_RRF_W_IDF: &str = "REMIND_ME_RRF_W_IDF";
+const ENV_RRF_W_ENTITY: &str = "REMIND_ME_RRF_W_ENTITY";
 const ENV_RRF_FUSION: &str = "REMIND_ME_RRF_FUSION";
 
 /// Reciprocal Rank Fusion smoothing constant. Higher values produce more
@@ -51,6 +52,7 @@ pub fn rrf_k_from_env() -> f64 {
     env_f64(ENV_RRF_K, RRF_K_DEFAULT)
 }
 
+/// Per-signal weights for [`rank_rrf`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RrfWeights {
     pub w_keyword: f64,
@@ -58,6 +60,9 @@ pub struct RrfWeights {
     pub w_recency: f64,
     pub w_vitality: f64,
     pub w_idf: f64,
+    /// Entity overlap: how many of the entities the query names a candidate
+    /// is linked to (card #64). Off by default, like `w_idf`.
+    pub w_entity: f64,
 }
 
 impl Default for RrfWeights {
@@ -65,6 +70,7 @@ impl Default for RrfWeights {
     /// `idf` at 0.0 since it's a newer, opt-in lever layered on top of
     /// already-tuned defaults — flipping it on by default would silently
     /// shift existing search behavior for anyone who hasn't opted in.
+    /// `entity` is 0.0 for the same reason.
     fn default() -> Self {
         Self {
             w_keyword: 1.0,
@@ -72,12 +78,13 @@ impl Default for RrfWeights {
             w_recency: 1.0,
             w_vitality: 1.0,
             w_idf: 0.0,
+            w_entity: 0.0,
         }
     }
 }
 
 impl RrfWeights {
-    /// Read the five `REMIND_ME_RRF_W_*` weights fresh from the environment.
+    /// Read the six `REMIND_ME_RRF_W_*` weights fresh from the environment.
     /// Each falls back to [`RrfWeights::default`]'s corresponding field when
     /// unset, unparseable, or non-finite — see [`env_f64`] for why this
     /// degrades gracefully rather than mirroring the reference's hard crash.
@@ -94,6 +101,7 @@ impl RrfWeights {
             w_recency: env_f64(ENV_RRF_W_RECENCY, default.w_recency),
             w_vitality: env_f64(ENV_RRF_W_VITALITY, default.w_vitality),
             w_idf: env_f64(ENV_RRF_W_IDF, default.w_idf),
+            w_entity: env_f64(ENV_RRF_W_ENTITY, default.w_entity),
         }
     }
 
@@ -109,6 +117,7 @@ impl RrfWeights {
             w_recency: self.w_recency * m.w_recency,
             w_vitality: self.w_vitality * m.w_vitality,
             w_idf: self.w_idf * m.w_idf,
+            w_entity: self.w_entity * m.w_entity,
         }
     }
 }
@@ -172,6 +181,10 @@ pub struct RrfSignals {
     /// Cosine similarity per memory id that had a semantic hit — higher is
     /// a better match. Absent for a keyword-only hit.
     pub semantic_similarity: HashMap<String, f64>,
+    /// How many of the entities the query names each candidate is linked
+    /// to. Absent (or 0) means no overlap. Read in both fusion modes; left
+    /// empty when `w_entity` is 0, so the lookup costs nothing then.
+    pub entity_overlap: HashMap<String, usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -189,6 +202,7 @@ struct StrategyMultipliers {
     w_recency: f64,
     w_vitality: f64,
     w_idf: f64,
+    w_entity: f64,
 }
 
 impl StrategyMultipliers {
@@ -198,6 +212,7 @@ impl StrategyMultipliers {
         w_recency: 1.0,
         w_vitality: 1.0,
         w_idf: 1.0,
+        w_entity: 1.0,
     };
 
     /// Quoted phrases, prefix* wildcards, and short/structured queries are
@@ -330,7 +345,9 @@ fn recency_epoch(created_at: &str) -> f64 {
 /// Fuse a keyword-ranked list and a semantic-ranked list via [`RrfConfig::fusion`].
 ///
 /// Every result carries five signals: keyword, semantic, recency, vitality,
-/// and IDF (`w_idf`, off by default — see [`RrfWeights::default`]).
+/// and IDF (`w_idf`, off by default — see [`RrfWeights::default`]). A sixth,
+/// entity overlap (`w_entity`, also off by default), is added to `score`
+/// only: see [`entity_contribution`].
 ///
 /// - [`RrfFusion::Rank`] (default): each signal contributes `weight / (k +
 ///   rank)`, where `rank` is that memory's 1-indexed position once the
@@ -473,6 +490,7 @@ pub fn rank_rrf(
 
     let w = config.weights;
     let k = config.k;
+    let overlaps: Vec<usize> = union.iter().map(|m| overlap_of(signals, &m.id)).collect();
 
     let mut ranked: Vec<MemorySearchResult> = union
         .into_iter()
@@ -515,11 +533,15 @@ pub fn rank_rrf(
                     }
                 };
 
+            let entity_contrib =
+                entity_contribution(overlap_of(signals, &memory.id), &overlaps, config);
+
             let total = fts_score
                 + if semantic_ran { vec_score } else { 0.0 }
                 + recency_contrib
                 + vitality_contrib
-                + idf_contrib;
+                + idf_contrib
+                + entity_contrib;
 
             MemorySearchResult {
                 score: total,
@@ -553,6 +575,40 @@ pub fn rank_rrf(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     ranked
+}
+
+/// How many query entities `id` is linked to; 0 when it has no entry.
+fn overlap_of(signals: &RrfSignals, id: &str) -> usize {
+    signals.entity_overlap.get(id).copied().unwrap_or(0)
+}
+
+/// The entity-overlap signal's share of the fused score of a candidate with
+/// `overlap`, among candidates whose overlaps are `all` (#64).
+///
+/// A candidate linked to none of the query's entities contributes 0, in both
+/// modes, so a query that names no entity, or a weight of 0, leaves every
+/// score exactly as it was. That is a deliberate difference from recency and
+/// vitality, which rank every candidate: here no overlap means no signal,
+/// as an empty semantic list means no semantic signal.
+///
+/// - Rank mode: `w_entity / (k + rank)`, where `rank` is 1 plus the number of
+///   candidates linked to strictly more query entities (ties share a rank).
+/// - Score mode: `w_entity * overlap / max(all)`.
+fn entity_contribution(overlap: usize, all: &[usize], config: RrfConfig) -> f64 {
+    let w = config.weights.w_entity;
+    if overlap == 0 || w == 0.0 {
+        return 0.0;
+    }
+    match config.fusion {
+        RrfFusion::Rank => {
+            let better = all.iter().filter(|o| **o > overlap).count();
+            w / (config.k + (better + 1) as f64)
+        }
+        RrfFusion::Score => {
+            let max = all.iter().copied().max().unwrap_or(overlap).max(overlap);
+            w * overlap as f64 / max as f64
+        }
+    }
 }
 
 /// What a token-budget trim kept, and what it cost.
@@ -869,6 +925,7 @@ mod tests {
         crate::test_env::remove_var(ENV_RRF_W_RECENCY);
         crate::test_env::remove_var(ENV_RRF_W_VITALITY);
         crate::test_env::remove_var(ENV_RRF_W_IDF);
+        crate::test_env::remove_var(ENV_RRF_W_ENTITY);
         crate::test_env::remove_var(ENV_RRF_FUSION);
     }
 
@@ -948,6 +1005,24 @@ mod tests {
         assert_eq!(w.w_recency, 1.0);
         assert_eq!(w.w_vitality, 1.0);
         assert_eq!(w.w_idf, 0.0);
+        assert_eq!(w.w_entity, 0.0);
+        clear_env();
+    }
+
+    #[test]
+    fn the_entity_weight_reads_its_variable_and_every_preset_keeps_it() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        crate::test_env::set_var(ENV_RRF_W_ENTITY, "0.5");
+        assert_eq!(RrfWeights::from_env().w_entity, 0.5);
+        for strategy in [
+            RetrievalStrategy::Auto,
+            RetrievalStrategy::Balanced,
+            RetrievalStrategy::KeywordFavored,
+            RetrievalStrategy::SemanticFavored,
+        ] {
+            assert_eq!(choose_rrf_weights("id", strategy).w_entity, 0.5);
+        }
         clear_env();
     }
 
@@ -1256,6 +1331,7 @@ mod tests {
                 w_recency: 0.0,
                 w_vitality: 0.0,
                 w_idf: 0.0,
+                w_entity: 0.0,
             }),
             &RrfSignals::default(),
         );
@@ -1268,6 +1344,7 @@ mod tests {
                 w_recency: 0.0,
                 w_vitality: 0.0,
                 w_idf: 0.0,
+                w_entity: 0.0,
             }),
             &RrfSignals::default(),
         );
@@ -1293,6 +1370,7 @@ mod tests {
                 w_recency: 0.0,
                 w_vitality: 1.0,
                 w_idf: 0.0,
+                w_entity: 0.0,
             }),
             &RrfSignals::default(),
         );
@@ -1317,6 +1395,7 @@ mod tests {
             w_recency: 0.0,
             w_vitality: 0.0,
             w_idf: 0.0,
+            w_entity: 0.0,
         };
 
         let rank_mode = rank_rrf(
@@ -1365,6 +1444,7 @@ mod tests {
                     w_recency: 0.0,
                     w_vitality: 0.0,
                     w_idf: 0.0,
+                    w_entity: 0.0,
                 },
                 fusion: RrfFusion::Score,
             },
@@ -1393,6 +1473,7 @@ mod tests {
                     w_recency: 0.0,
                     w_vitality: 0.0,
                     w_idf: 1.0,
+                    w_entity: 0.0,
                 },
                 fusion: RrfFusion::Score,
             },
@@ -1420,12 +1501,86 @@ mod tests {
                 w_recency: 0.0,
                 w_vitality: 0.0,
                 w_idf: 0.0,
+                w_entity: 0.0,
             }),
             &signals,
         );
 
         assert_eq!(find(&ranked, "a").idf_score, Some(0.0));
         assert_eq!(find(&ranked, "b").idf_score, Some(0.0));
+    }
+
+    fn entity_weighted(fusion: RrfFusion) -> RrfConfig {
+        RrfConfig {
+            k: RRF_K_DEFAULT,
+            weights: RrfWeights {
+                w_keyword: 1.0,
+                w_semantic: 0.0,
+                w_recency: 0.0,
+                w_vitality: 0.0,
+                w_idf: 0.0,
+                w_entity: 1.0,
+            },
+            fusion,
+        }
+    }
+
+    #[test]
+    fn entity_overlap_lifts_a_linked_candidate_in_both_modes() {
+        let keyword = vec![mem("a", 0.0), mem("b", 0.0), mem("c", 0.0), mem("d", 0.0)];
+        let mut signals = RrfSignals::default();
+        signals.keyword_bm25.insert("a".to_string(), -3.0);
+        signals.keyword_bm25.insert("b".to_string(), -2.9);
+        signals.keyword_bm25.insert("c".to_string(), -2.8);
+        signals.keyword_bm25.insert("d".to_string(), -1.0);
+        signals.entity_overlap.insert("c".to_string(), 2);
+        signals.entity_overlap.insert("b".to_string(), 1);
+        for fusion in [RrfFusion::Rank, RrfFusion::Score] {
+            let ranked = rank_rrf(keyword.clone(), vec![], entity_weighted(fusion), &signals);
+            assert_eq!(ranked[0].memory.id, "c", "{fusion:?}");
+        }
+    }
+
+    #[test]
+    fn no_entity_overlap_leaves_every_score_unchanged() {
+        let keyword = vec![mem("a", 0.0), mem("b", 0.0)];
+        let mut signals = RrfSignals::default();
+        signals.keyword_bm25.insert("a".to_string(), -3.0);
+        signals.keyword_bm25.insert("b".to_string(), -1.0);
+        for fusion in [RrfFusion::Rank, RrfFusion::Score] {
+            let mut off = entity_weighted(fusion);
+            off.weights.w_entity = 0.0;
+            let with = rank_rrf(keyword.clone(), vec![], entity_weighted(fusion), &signals);
+            let without = rank_rrf(keyword.clone(), vec![], off, &signals);
+            let scores = |r: &[MemorySearchResult]| r.iter().map(|x| x.score).collect::<Vec<_>>();
+            assert_eq!(scores(&with), scores(&without), "{fusion:?}");
+        }
+    }
+
+    #[test]
+    fn a_zero_entity_weight_ignores_any_overlap() {
+        let keyword = vec![mem("a", 0.0), mem("b", 0.0)];
+        let mut signals = RrfSignals::default();
+        signals.entity_overlap.insert("b".to_string(), 3);
+        let mut config = entity_weighted(RrfFusion::Rank);
+        config.weights.w_entity = 0.0;
+        let ranked = rank_rrf(keyword, vec![], config, &signals);
+        assert_eq!(ranked[0].memory.id, "a");
+    }
+
+    #[test]
+    fn tied_entity_overlaps_share_a_rank() {
+        let config = entity_weighted(RrfFusion::Rank);
+        let all = [2, 2, 1, 0];
+        assert_eq!(
+            entity_contribution(2, &all, config),
+            1.0 / (RRF_K_DEFAULT + 1.0)
+        );
+        assert_eq!(
+            entity_contribution(1, &all, config),
+            1.0 / (RRF_K_DEFAULT + 3.0)
+        );
+        assert_eq!(entity_contribution(0, &all, config), 0.0);
     }
 }
 

@@ -987,9 +987,20 @@ pub fn search_memories_deadlined(
         weights,
         fusion: RrfFusion::from_env(),
     };
+    // Only re-ranks what the two halves already found: no new hits (#64).
+    let entity_overlap = if weights.w_entity == 0.0 {
+        std::collections::HashMap::new()
+    } else {
+        query_entity_overlap(
+            store,
+            &input.query,
+            keyword_memories.iter().chain(&semantic_memories),
+        )?
+    };
     let signals = RrfSignals {
         keyword_bm25,
         semantic_similarity,
+        entity_overlap,
     };
 
     let ranked = rank_rrf(keyword_memories, semantic_memories, config, &signals);
@@ -1047,6 +1058,34 @@ pub fn search_memories_deadlined(
     outcome.timing = timing;
     outcome.dormant_excluded = dormant_ids.into_inner().len();
     Ok(outcome)
+}
+
+/// For each of `candidates` linked to at least one entity `query` names
+/// ([`crate::entity::resolve_query_entities`]), how many of those entities
+/// it is linked to, through the link index. Candidates with none are left
+/// out.
+fn query_entity_overlap<'m>(
+    store: &Store<'_>,
+    query: &str,
+    candidates: impl Iterator<Item = &'m Memory>,
+) -> Result<std::collections::HashMap<String, usize>> {
+    let mut overlap = std::collections::HashMap::new();
+    let entities = crate::entity::resolve_query_entities(store, query)?;
+    if entities.is_empty() {
+        return Ok(overlap);
+    }
+    let memories = Memories::new(store);
+    let mut linked = Vec::with_capacity(entities.len());
+    for entity in &entities {
+        linked.push(memories.linked_ids(&entity.id)?);
+    }
+    for memory in candidates {
+        let count = linked.iter().filter(|ids| ids.contains(&memory.id)).count();
+        if count > 0 {
+            overlap.insert(memory.id.clone(), count);
+        }
+    }
+    Ok(overlap)
 }
 
 /// Whether the dormancy floor alone keeps `memory` out: it is dormant, yet

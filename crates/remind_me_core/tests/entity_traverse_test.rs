@@ -329,3 +329,51 @@ fn the_seed_is_first_and_entities_are_unique() {
     assert_eq!(result.entities.len(), 2);
     assert_eq!(result.entities[0].name, "Ada", "the seed comes first");
 }
+
+// ---------------------------------------------------------------------------
+// resolve_query_entities (card #64)
+// ---------------------------------------------------------------------------
+
+fn query_entity_names(store: &Store<'_>, query: &str) -> Vec<String> {
+    let mut names: Vec<String> = remind_me_core::entity::resolve_query_entities(store, query)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn a_query_names_entities_by_runs_of_up_to_three_words() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    entity(&store, "Rafa Lind", &[]);
+    entity(&store, "Kestrel Dock Controller", &[]);
+    entity(&store, "Harbor", &[]);
+    entity(&store, "Four Word Entity Name", &[]);
+
+    assert_eq!(
+        query_entity_names(
+            &store,
+            "who is rafa  LIND's backup for the kestrel dock controller?"
+        ),
+        ["Kestrel Dock Controller", "Rafa Lind"]
+    );
+    assert_eq!(query_entity_names(&store, "harbor, rollback"), ["Harbor"]);
+    assert!(query_entity_names(&store, "four word entity name").is_empty());
+    assert!(query_entity_names(&store, "rafa").is_empty());
+}
+
+#[test]
+fn a_query_names_an_entity_by_its_alias() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    entity(&store, "Juniper Okafor", &["JO"]);
+
+    assert_eq!(
+        query_entity_names(&store, "pricing sign-off from jo"),
+        ["Juniper Okafor"]
+    );
+    assert!(query_entity_names(&store, "   ").is_empty());
+}

@@ -213,6 +213,63 @@ pub fn resolve_entity(store: &Store<'_>, query: &str) -> Result<Option<Entity>> 
     Ok(alias_hit)
 }
 
+/// The longest run of query words matched against an entity name (#64).
+pub const QUERY_ENTITY_MAX_WORDS: usize = 3;
+
+/// Every entity whose name or alias is a run of up to
+/// [`QUERY_ENTITY_MAX_WORDS`] words of free-text `query`, by id.
+///
+/// [`resolve_entity`] takes the whole query as one name; this finds the
+/// entities named *inside* a search query ("Rafa Lind firmware" names Rafa
+/// Lind). Words are split on whitespace, with punctuation trimmed from their
+/// ends and a trailing possessive `'s` dropped, then each run is compared in
+/// [`normalize_entity_name`] form, so case and spacing do not matter. Topic
+/// entities are skipped: topic membership is not a mention.
+///
+/// One pass over every entity, as `resolve_entity`'s fallback makes; the
+/// caller runs it only when the entity signal is weighted.
+pub fn resolve_query_entities(store: &Store<'_>, query: &str) -> Result<Vec<Entity>> {
+    let grams = query_ngrams(query, QUERY_ENTITY_MAX_WORDS);
+    if grams.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut found = Vec::new();
+    for entity in Entities::new(store).all()? {
+        if crate::topic::is_topic_name(&entity.name) {
+            continue;
+        }
+        let named = std::iter::once(&entity.name)
+            .chain(&entity.aliases)
+            .any(|name| grams.contains(&normalize_entity_name(name)));
+        if named {
+            found.push(entity);
+        }
+    }
+    Ok(found)
+}
+
+/// Every run of 1 to `max_words` consecutive words of `query`, normalised.
+fn query_ngrams(query: &str, max_words: usize) -> std::collections::HashSet<String> {
+    let words: Vec<&str> = query
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
+        .map(|w| {
+            w.strip_suffix("'s")
+                .or_else(|| w.strip_suffix("\u{2019}s"))
+                .unwrap_or(w)
+        })
+        .filter(|w| !w.is_empty())
+        .collect();
+    let mut grams = std::collections::HashSet::new();
+    for start in 0..words.len() {
+        let end_max = (start + max_words).min(words.len());
+        for end in start + 1..=end_max {
+            grams.insert(normalize_entity_name(&words[start..end].join(" ")));
+        }
+    }
+    grams
+}
+
 /// A memory whose subject or object equals an entity's canonical name.
 ///
 /// SPO fields are written verbatim by the caller (part 1 of annotation), so
