@@ -298,6 +298,10 @@ pub struct StalePinned {
     /// newest results first.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub new_evidence: Vec<String>,
+    /// Evidence ids that are now deleted or superseded (D94). A superseding
+    /// memory is not followed: it shows only if the query matches it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_gone: Vec<String>,
 }
 
 /// Every pinned question that needs a new answer, by name.
@@ -331,6 +335,7 @@ fn check_pinned(
         answer_slug: pin.answer_slug.clone(),
         reasons: Vec::new(),
         new_evidence: Vec::new(),
+        evidence_gone: Vec::new(),
     };
     let (Some(slug), Some(answered_at)) = (&pin.answer_slug, &pin.answered_at) else {
         stale.reasons.push(StaleReason::Unanswered);
@@ -342,7 +347,14 @@ fn check_pinned(
     if crate::wiki::get_wiki_page(store, slug)?.is_none() {
         stale.reasons.push(StaleReason::AnswerMissing);
     }
-    if live_ids(store, &pin.evidence_ids)?.len() < pin.evidence_ids.len() {
+    let live = live_ids(store, &pin.evidence_ids)?;
+    stale.evidence_gone = pin
+        .evidence_ids
+        .iter()
+        .filter(|id| !live.contains(*id))
+        .cloned()
+        .collect();
+    if !stale.evidence_gone.is_empty() {
         stale.reasons.push(StaleReason::EvidenceGone);
     }
 

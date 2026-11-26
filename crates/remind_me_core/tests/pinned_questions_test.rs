@@ -122,7 +122,9 @@ fn deleted_evidence_makes_it_stale() {
     let store = db.store();
     answered(&store);
     remind_me_core::testing::set_memory_column(&store, "mem_b", "superseded_by", "mem_x").unwrap();
-    assert_eq!(reasons(&store), vec![StaleReason::EvidenceGone]);
+    let stale = stale_pinned(&store).unwrap();
+    assert_eq!(stale[0].reasons, vec![StaleReason::EvidenceGone]);
+    assert_eq!(stale[0].evidence_gone, vec!["mem_b".to_string()]);
 }
 
 #[test]

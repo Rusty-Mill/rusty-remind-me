@@ -1375,7 +1375,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_list_stale_pinned",
-                                "description": "List pinned questions whose answer is out of date, each with its reasons and up to 5 new memory ids to read before answering again.",
+                                "description": "List pinned questions whose answer is out of date, each with its reasons, up to 5 new memory ids to read before answering again, and any evidence ids now deleted or superseded.",
                                 "inputSchema": { "type": "object", "properties": {} }
                             },
                             {
