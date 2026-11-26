@@ -9,7 +9,7 @@
 
 use crate::date_phrase::{self, Span};
 use crate::models::MemorySearchInput;
-use crate::time_window::TimeWindow;
+use crate::time_window::{TimeField, TimeWindow};
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
@@ -109,10 +109,18 @@ pub fn infer(
     let query = &input.query;
     let narrowed = MemorySearchInput {
         query: without_phrase(query, range.clone()),
-        window: TimeWindow::from_span(input.window.field(), span),
+        window: TimeWindow::from_span(phrase_field(input.window.explicit_field()), span),
         ..input.clone()
     };
     Ok(Some((narrowed, applied(&query[range], span, tz))))
+}
+
+/// The timestamp an inferred window reads: the caller's explicit
+/// `time_field`, else when the event happened ([`TimeField::Occurred`],
+/// card #62, pack D94), so "what we shipped last month" finds a row written
+/// this week about last month.
+fn phrase_field(explicit: Option<TimeField>) -> TimeField {
+    explicit.unwrap_or(TimeField::Occurred)
 }
 
 /// `query` without the phrase at `range` or the fillers that led into it
@@ -145,7 +153,7 @@ fn applied(phrase: &str, span: Span, tz: Tz) -> InferredWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::time_window::{RawTimeWindow, TimeField};
+    use crate::time_window::RawTimeWindow;
 
     /// Wednesday 2026-10-28 09:00 UTC.
     fn now() -> DateTime<Utc> {
@@ -255,7 +263,27 @@ mod tests {
     }
 
     #[test]
-    fn the_time_field_is_kept() {
+    fn an_inferred_window_reads_when_the_event_happened() {
+        let (narrowed, _) = infer_utc("deploys last week").unwrap();
+        assert_eq!(narrowed.window.field(), TimeField::Occurred);
+        let mut input = search("deploys last week");
+        input.window =
+            serde_json::from_value(serde_json::json!({ "time_field": "occurred" })).unwrap();
+        let (narrowed, _) = infer(&input, now(), utc).unwrap().unwrap();
+        assert_eq!(narrowed.window.field(), TimeField::Occurred);
+    }
+
+    #[test]
+    fn an_explicit_created_field_is_kept() {
+        let mut input = search("deploys last week");
+        input.window =
+            serde_json::from_value(serde_json::json!({ "time_field": "created" })).unwrap();
+        let (narrowed, _) = infer(&input, now(), utc).unwrap().unwrap();
+        assert_eq!(narrowed.window.field(), TimeField::Created);
+    }
+
+    #[test]
+    fn an_explicit_updated_field_is_kept() {
         let mut input = search("edits yesterday");
         input.window =
             serde_json::from_value(serde_json::json!({ "time_field": "updated" })).unwrap();

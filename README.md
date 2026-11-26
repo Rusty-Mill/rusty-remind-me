@@ -452,6 +452,20 @@ and Markdown opens with a line naming it. Only the search tool infers: saved
 searches, the brief, export and the CLI search their text as written. It is
 off by default until the retrieval eval's `+dates` modes show it helps.
 
+### Event time (`metadata.occurred_at`)
+
+A memory can say when its event happened, apart from when it was recorded:
+`metadata.occurred_at` is an RFC 3339 timestamp or `{"from": ..., "to": ...}`
+(both RFC 3339, `from` before `to`, no other key). Add, update, decompose and auto_capture
+refuse a malformed value, naming the key; update sets or clears it with the
+metadata it writes. Search's `time_field: occurred` reads it, else
+`created_at`, and admits a span that overlaps the window. The recency signal
+reads it too (a span's `to`); vitality decay stays on `created_at`. An
+inferred date-phrase window reads `occurred` unless the caller passed a
+`time_field`, which is kept. The default `time_field` stays `created`, so existing windows,
+digest, export and brief are unchanged. Stored rows are never revalidated: a
+malformed stored value reads as absent.
+
 | Variable | Purpose | Default |
 | --- | --- | --- |
 | `REMIND_ME_TZ` | IANA zone whose calendar phrases mean (`Australia/Sydney`); an unknown name fails phrases, never RFC 3339 or ages | UTC |

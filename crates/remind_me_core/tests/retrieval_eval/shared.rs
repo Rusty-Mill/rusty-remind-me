@@ -68,6 +68,23 @@ pub struct FixtureMemory {
     /// path is created under the one before it.
     #[serde(default)]
     pub topics: Vec<String>,
+    /// When the row's event happened, stored as `metadata.occurred_at`
+    /// (card #62); unset, it happened when it was recorded.
+    pub occurred: Option<FixtureOccurred>,
+}
+
+/// A fixture row's `occurred_at`, resolved against the clock at load time.
+/// Exactly one field is set.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FixtureOccurred {
+    /// An instant this many days back.
+    pub days: Option<i64>,
+    /// An instant mid-way through the window this date phrase names, as
+    /// [`FixtureMemory::during`] places `created_at`.
+    pub during: Option<String>,
+    /// A `{from, to}` span, `[from, to]` days back, `from > to`.
+    pub span_days: Option<[i64; 2]>,
 }
 
 /// One golden query: what it should find, and what it must never surface.
@@ -117,6 +134,18 @@ pub fn validate(memories: &[FixtureMemory], golden: &[GoldenQuery]) -> Result<()
         if m.during.is_some() && m.age_days != 0 {
             return Err(format!("{}: both during and age_days", m.id));
         }
+        if let Some(o) = &m.occurred {
+            let set = [o.days.is_some(), o.during.is_some(), o.span_days.is_some()];
+            if set.iter().filter(|s| **s).count() != 1 {
+                return Err(format!("{}: occurred needs exactly one field", m.id));
+            }
+            if o.span_days.is_some_and(|[from, to]| from <= to || to < 0) {
+                return Err(format!(
+                    "{}: occurred span_days must run back to front",
+                    m.id
+                ));
+            }
+        }
         if let Some(next) = &m.superseded_by {
             if !known.contains(next.as_str()) {
                 return Err(format!(
@@ -152,7 +181,12 @@ pub fn load(store: &Store<'_>, memories: &[FixtureMemory], embedder: Option<&dyn
     let repo = Memories::new(store);
     for m in memories {
         let at = created_at(m, now).to_rfc3339();
+        let metadata = match &m.occurred {
+            Some(o) => serde_json::json!({ "occurred_at": occurred_at(m, o, now) }),
+            None => serde_json::json!({}),
+        };
         repo.insert(&NewMemory {
+            metadata,
             category: m.category.clone(),
             memory_type: m.memory_type.clone(),
             tags: m.tags.clone(),
@@ -224,6 +258,26 @@ pub fn created_at(m: &FixtureMemory, now: DateTime<Utc>) -> DateTime<Utc> {
         .unwrap_or_else(|| panic!("{}: during {phrase:?} is not a date phrase", m.id));
     let end = span.end.map_or(now, |e| e.min(now));
     span.start + (end - span.start) / 2
+}
+
+/// `o` as the `metadata.occurred_at` value it stands for, at `now`.
+pub fn occurred_at(
+    m: &FixtureMemory,
+    o: &FixtureOccurred,
+    now: DateTime<Utc>,
+) -> serde_json::Value {
+    let back = |days: i64| (now - Duration::days(days)).to_rfc3339();
+    if let Some(days) = o.days {
+        return serde_json::json!(back(days));
+    }
+    if let Some([from, to]) = o.span_days {
+        return serde_json::json!({ "from": back(from), "to": back(to) });
+    }
+    let phrase = o.during.as_deref().unwrap_or_default();
+    let span = date_phrase::parse(phrase, now.with_timezone(&Tz::UTC))
+        .unwrap_or_else(|| panic!("{}: occurred during {phrase:?} is not a date phrase", m.id));
+    let end = span.end.map_or(now, |e| e.min(now));
+    serde_json::json!((span.start + (end - span.start) / 2).to_rfc3339())
 }
 
 pub fn ranked(

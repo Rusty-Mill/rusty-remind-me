@@ -135,7 +135,15 @@ impl MemoryRow {
             && filter.category.as_ref().is_none_or(|c| &self.category == c)
             && !(filter.exclude_raw && crate::db::memories::is_raw_category(&self.category))
             && self.in_scope(&filter.scope)
-            && filter.window.contains(&self.created_at, &self.updated_at)
+            && filter
+                .window
+                .contains(&self.created_at, &self.updated_at, || self.occurred_at())
+    }
+
+    /// This row's `metadata.occurred_at`, if it holds a valid one. The
+    /// metadata is parsed only when its text names the key (card #62).
+    pub(crate) fn occurred_at(&self) -> Option<crate::kinds::OccurredAt> {
+        crate::kinds::OccurredAt::of_json(&self.metadata)
     }
 
     /// `row` as an `INSERT` of it stores it.
@@ -1279,20 +1287,34 @@ pub(crate) fn keyword_hits(
 /// What `Memories::window_hits` selects: every live, unsuperseded row
 /// `filter` admits, newest first on the window's timestamp (ties by id).
 pub(crate) fn window_hits(tables: &EngineTables, filter: &KeywordFilter) -> Result<Vec<Memory>> {
-    let now = chrono::Utc::now();
-    let field = |row: &MemoryRow| {
-        crate::time_window::parse_rfc3339(filter.window.pick(&row.created_at, &row.updated_at))
-    };
-    let mut hits: Vec<MemoryRow> = rows(core_ref(tables)?)
+    let hits: Vec<MemoryRow> = rows(core_ref(tables)?)
         .filter(|row| row.is_live() && row.admits(filter))
         .collect();
-    hits.sort_by(|a, b| field(b).cmp(&field(a)).then_with(|| a.id.cmp(&b.id)));
-    Ok(hits
+    Ok(newest_in_window(hits, filter))
+}
+
+/// `admitted` (rows `filter` already admits) ordered newest first on the
+/// window's timestamp, ties by id, then held to the narrowing and vitality
+/// floor: the tail of `window_hits` both backends share. Each row's key is
+/// read once, so its metadata is parsed at most once.
+pub(crate) fn newest_in_window(admitted: Vec<MemoryRow>, filter: &KeywordFilter) -> Vec<Memory> {
+    let now = chrono::Utc::now();
+    let mut keyed: Vec<(Option<chrono::DateTime<chrono::Utc>>, MemoryRow)> = admitted
         .into_iter()
-        .map(|row| row.to_memory())
+        .map(|row| {
+            let key = filter
+                .window
+                .sort_key(&row.created_at, &row.updated_at, || row.occurred_at());
+            (key, row)
+        })
+        .collect();
+    keyed.sort_by(|(ka, a), (kb, b)| kb.cmp(ka).then_with(|| a.id.cmp(&b.id)));
+    keyed
+        .into_iter()
+        .map(|(_, row)| row.to_memory())
         .filter(|memory| filter.narrowing.admits(memory))
         .filter(|memory| filter.vital_enough(memory, now))
-        .collect())
+        .collect()
 }
 
 pub(crate) fn sensitive_ids(tables: &EngineTables) -> Result<HashSet<String>> {
