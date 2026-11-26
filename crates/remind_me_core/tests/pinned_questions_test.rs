@@ -314,3 +314,26 @@ fn an_answer_for_a_scope_changed_after_the_check_is_refused() {
     answer_pinned(&store, &fresh).unwrap();
     assert!(stale_pinned(&store).unwrap().is_empty());
 }
+
+#[test]
+fn a_blank_category_is_a_different_scope_from_none() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    answered(&store);
+    let mut input = SaveSearchInput {
+        name: "deploys".to_string(),
+        query: "deploy".to_string(),
+        category: Some(String::new()),
+        tags: None,
+        include_sensitive: false,
+        watch: false,
+    };
+    save_search(&store, &input).unwrap();
+    answer(&store, &["mem_a", "mem_b"]).unwrap();
+    assert!(stale_pinned(&store).unwrap().is_empty());
+    // Search compares the category literally, so dropping it widens the
+    // results.
+    input.category = None;
+    save_search(&store, &input).unwrap();
+    assert!(reasons(&store).contains(&StaleReason::QueryChanged));
+}

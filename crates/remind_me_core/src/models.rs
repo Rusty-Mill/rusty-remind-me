@@ -2000,15 +2000,11 @@ pub struct AnsweredScope {
 
 impl AnsweredScope {
     /// The scope `filters` currently select, in the form search reads it:
-    /// trimmed, blank values dropped, tags as a sorted set. Two spellings
-    /// of one scope compare equal.
+    /// the category as written (search compares it literally), tags as a
+    /// trimmed set with blanks dropped. Two spellings of one scope compare
+    /// equal.
     pub fn of(filters: &SavedSearchFilters) -> Self {
-        let category = filters
-            .category
-            .as_deref()
-            .map(str::trim)
-            .filter(|c| !c.is_empty())
-            .map(str::to_string);
+        let category = filters.category.clone();
         let tags: std::collections::BTreeSet<String> = filters
             .tags
             .iter()
