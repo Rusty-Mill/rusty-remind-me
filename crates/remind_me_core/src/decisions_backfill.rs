@@ -8,9 +8,9 @@
 //! - [`plan_import`]: which entries of a repo `DECISIONS.md` are new, already
 //!   in the store, or changed, plus supersedes links the file states outright.
 //!
-//! One writer, [`apply_normalize`], carries out the `add_ref` proposals only:
-//! it copies each ref into `metadata.decision_ref`. Every other bucket still
-//! needs a person.
+//! One writer, [`apply_normalize_with`], carries out the plan's proposals:
+//! `respell` (an explicit project fold, D71), then `retype` (D72), then
+//! `add_ref`. Every other bucket still needs a person.
 //!
 //! Anything ambiguous is reported, never guessed (D32 to D34). Plans are
 //! deterministic: same input, same report (D35).
@@ -201,6 +201,12 @@ pub struct NormalizeRow {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NormalizePlan {
     pub project: Option<String>,
+    /// The folds this plan was made with (`--fold FROM=TO`).
+    #[serde(default)]
+    pub folds: Vec<Fold>,
+    /// Rename `project` from a fold's `from` to its `to` (D71). Any type.
+    #[serde(default)]
+    pub respell: Vec<NormalizeRow>,
     /// Set `memory_type: decision` (and `decision_ref` when known).
     pub retype: Vec<NormalizeRow>,
     /// Already a decision: copy its ref into `metadata.decision_ref`.
@@ -213,11 +219,60 @@ pub struct NormalizePlan {
     pub mentions: Vec<NormalizeRow>,
 }
 
+/// A project fold: memories whose project is exactly `from` are renamed to
+/// `to` (pack D71, D82). Only two spellings of one name may be folded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Fold {
+    pub from: String,
+    pub to: String,
+}
+
+impl Fold {
+    /// Parse `FROM=TO`.
+    ///
+    /// # Errors
+    ///
+    /// No `=`, a blank side, the same spelling twice, or two names that are
+    /// not spellings of one project (`same_project`).
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let (from, to) = raw
+            .split_once('=')
+            .ok_or_else(|| format!("fold {raw:?} is not FROM=TO"))?;
+        let (from, to) = (from.trim(), to.trim());
+        if from.is_empty() || to.is_empty() {
+            return Err(format!("fold {raw:?} has a blank side"));
+        }
+        if from == to {
+            return Err(format!("fold {raw:?} changes nothing"));
+        }
+        if !same_project(from, to) {
+            return Err(format!(
+                "fold {raw:?}: {from:?} and {to:?} are different projects, not two spellings"
+            ));
+        }
+        Ok(Self {
+            from: from.to_string(),
+            to: to.to_string(),
+        })
+    }
+}
+
 /// Plan the normalisation of `memories`, limited to `project` when given.
-/// Deleted, superseded and sensitive memories are left out.
+/// Deleted, superseded and sensitive memories are left out. No folds.
 pub fn plan_normalize(memories: &[Memory], project: Option<&str>) -> NormalizePlan {
+    plan_normalize_with(memories, project, &[])
+}
+
+/// [`plan_normalize`] with project `folds`: every memory, of any type, whose
+/// project is exactly a fold's `from` is proposed for `respell`.
+pub fn plan_normalize_with(
+    memories: &[Memory],
+    project: Option<&str>,
+    folds: &[Fold],
+) -> NormalizePlan {
     let mut plan = NormalizePlan {
         project: project.map(str::to_string),
+        folds: folds.to_vec(),
         ..Default::default()
     };
     let mut live: Vec<&Memory> = memories
@@ -229,9 +284,29 @@ pub fn plan_normalize(memories: &[Memory], project: Option<&str>) -> NormalizePl
         .collect();
     live.sort_by(|a, b| (&a.created_at, &a.id).cmp(&(&b.created_at, &b.id)));
     for memory in live {
+        respell(memory, folds, &mut plan);
         classify(memory, &mut plan);
     }
     plan
+}
+
+/// The fold that renames `memory`'s project, if any.
+fn fold_for<'f>(memory: &Memory, folds: &'f [Fold]) -> Option<&'f Fold> {
+    let project = memory.project.as_deref()?;
+    folds.iter().find(|f| f.from == project)
+}
+
+fn respell(memory: &Memory, folds: &[Fold], plan: &mut NormalizePlan) {
+    let Some(fold) = fold_for(memory, folds) else {
+        return;
+    };
+    plan.respell.push(NormalizeRow {
+        id: memory.id.clone(),
+        project: memory.project.clone(),
+        decision_ref: None,
+        note: format!("project {} -> {}", fold.from, fold.to),
+        snippet: snippet(&memory.content),
+    });
 }
 
 fn classify(memory: &Memory, plan: &mut NormalizePlan) {
@@ -302,10 +377,16 @@ fn classify(memory: &Memory, plan: &mut NormalizePlan) {
     }
 }
 
-/// What [`apply_normalize`] wrote, and what it did not.
+/// What [`apply_normalize_with`] wrote, and what it did not.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NormalizeApplied {
     pub project: Option<String>,
+    /// `respell` rows now carrying their fold's project.
+    #[serde(default)]
+    pub respelled: Vec<NormalizeRow>,
+    /// `retype` rows now typed `decision`.
+    #[serde(default)]
+    pub retyped: Vec<NormalizeRow>,
     /// `add_ref` rows now carrying `metadata.decision_ref`.
     pub updated: Vec<NormalizeRow>,
     /// Planned rows that no longer qualified when their turn came (edited,
@@ -317,8 +398,7 @@ pub struct NormalizeApplied {
     pub plan: NormalizePlan,
 }
 
-/// Plan afresh from `store`, then apply the plan's `add_ref` rows with
-/// [`apply_planned`]. A second run finds nothing to add.
+/// [`apply_normalize_with`] without folds.
 ///
 /// # Errors
 ///
@@ -327,8 +407,38 @@ pub fn apply_normalize(
     store: &Store<'_>,
     project: Option<&str>,
 ) -> crate::db::Result<NormalizeApplied> {
-    let plan = plan_normalize(&Memories::new(store).all_live()?, project);
-    let mut applied = apply_planned(store, project, &plan.add_ref);
+    apply_normalize_with(store, project, &[])
+}
+
+/// Plan afresh from `store`, then write the plan's proposals in order:
+/// `respell`, then `retype`, then `add_ref` (pack D82). Each row is re-read
+/// and re-planned in its own transaction, so a row the earlier steps
+/// changed is judged as it now stands. A second run finds nothing to do.
+///
+/// Retyped rows get no review scheduled (D74): the write goes through the
+/// storage edit, not `update_memory`.
+///
+/// # Errors
+///
+/// A store error reading the memories. Per-row outcomes are in the result.
+pub fn apply_normalize_with(
+    store: &Store<'_>,
+    project: Option<&str>,
+    folds: &[Fold],
+) -> crate::db::Result<NormalizeApplied> {
+    let plan = plan_normalize_with(&Memories::new(store).all_live()?, project, folds);
+    let scope = Scope { project, folds };
+    let mut applied = NormalizeApplied {
+        project: project.map(str::to_string),
+        ..Default::default()
+    };
+    for (step, rows) in [
+        (Step::Respell, &plan.respell),
+        (Step::Retype, &plan.retype),
+        (Step::AddRef, &plan.add_ref),
+    ] {
+        apply_rows(store, &scope, step, rows, &record_revision, &mut applied);
+    }
     applied.plan = plan;
     Ok(applied)
 }
@@ -337,8 +447,8 @@ pub fn apply_normalize(
 /// row's metadata as it stands at write time.
 ///
 /// Each row is one transaction: re-read the memory, plan it again, and write
-/// only if it still wants the same ref, merging into the metadata just read.
-/// The engine's page gate keeps every other writer, background sync
+/// only if it still wants the same change, merging into the metadata just
+/// read. The engine's page gate keeps every other writer, background sync
 /// included, out between that read and the write, so a newer edit is never
 /// discarded and a row that stopped qualifying is skipped. A project or
 /// topic claim row is skipped too, as every generic edit refuses it.
@@ -353,7 +463,23 @@ pub fn apply_planned(
     project: Option<&str>,
     rows: &[NormalizeRow],
 ) -> NormalizeApplied {
-    apply_rows(store, project, rows, &record_revision)
+    let mut applied = NormalizeApplied {
+        project: project.map(str::to_string),
+        ..Default::default()
+    };
+    let scope = Scope {
+        project,
+        folds: &[],
+    };
+    apply_rows(
+        store,
+        &scope,
+        Step::AddRef,
+        rows,
+        &record_revision,
+        &mut applied,
+    );
+    applied
 }
 
 /// Writes the revision of a row's replaced values.
@@ -363,87 +489,102 @@ fn record_revision(store: &Store<'_>, id: &str, before: &Tracked) -> crate::db::
     Revisions::new(store).insert(id, before, &chrono::Utc::now().to_rfc3339(), None)
 }
 
+/// What a plan was made with, so a row can be planned again at write time.
+struct Scope<'a> {
+    project: Option<&'a str>,
+    folds: &'a [Fold],
+}
+
+/// One kind of proposal [`apply_normalize_with`] carries out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    Respell,
+    Retype,
+    AddRef,
+}
+
+impl Step {
+    fn bucket(self, plan: &NormalizePlan) -> &[NormalizeRow] {
+        match self {
+            Self::Respell => &plan.respell,
+            Self::Retype => &plan.retype,
+            Self::AddRef => &plan.add_ref,
+        }
+    }
+
+    fn done(self, applied: &mut NormalizeApplied) -> &mut Vec<NormalizeRow> {
+        match self {
+            Self::Respell => &mut applied.respelled,
+            Self::Retype => &mut applied.retyped,
+            Self::AddRef => &mut applied.updated,
+        }
+    }
+}
+
 fn apply_rows(
     store: &Store<'_>,
-    project: Option<&str>,
+    scope: &Scope<'_>,
+    step: Step,
     rows: &[NormalizeRow],
     record: &Recorder,
-) -> NormalizeApplied {
-    let mut applied = NormalizeApplied {
-        project: project.map(str::to_string),
-        ..Default::default()
-    };
+    applied: &mut NormalizeApplied,
+) {
     for row in rows {
         let noted = |note: String| NormalizeRow {
             note,
             ..row.clone()
         };
-        match store.transaction(|page| write_ref(page, project, row, record)) {
-            Ok(RefWrite::Written) => applied.updated.push(row.clone()),
-            Ok(RefWrite::Skipped(why)) => applied.skipped.push(noted(why)),
+        match store.transaction(|page| write_normalized(page, scope, step, row, record)) {
+            Ok(NormWrite::Written) => step.done(applied).push(row.clone()),
+            Ok(NormWrite::Skipped(why)) => applied.skipped.push(noted(why)),
             Err(e) => applied.failed.push(noted(e.to_string())),
         }
     }
-    applied
 }
 
-enum RefWrite {
+enum NormWrite {
     Written,
     Skipped(String),
 }
 
-/// Revalidate `row` against the memory as stored now and, if it still
-/// qualifies for the same ref, merge that ref into its current metadata,
-/// then record the replaced values as a revision.
-fn write_ref(
+/// Revalidate `row` against the memory as stored now and, if it is still
+/// proposed for `step` with the same ref, write that change, then record
+/// the replaced values as a revision.
+fn write_normalized(
     store: &Store<'_>,
-    project: Option<&str>,
+    scope: &Scope<'_>,
+    step: Step,
     row: &NormalizeRow,
     record: &Recorder,
-) -> crate::db::Result<RefWrite> {
+) -> crate::db::Result<NormWrite> {
     let Some(current) = queries::get_memory_by_id(store, &row.id)? else {
-        return Ok(RefWrite::Skipped("no longer live".into()));
+        return Ok(NormWrite::Skipped("no longer live".into()));
     };
     // Claim rows are written only by their own commands; refuse them as any
     // generic edit does.
     if let Err(refused) = crate::project::refuse_claim_edit(&current) {
-        return Ok(RefWrite::Skipped(refused.to_string()));
+        return Ok(NormWrite::Skipped(refused.to_string()));
     }
-    let replan = plan_normalize(std::slice::from_ref(&current), project);
-    let Some(wanted) = replan.add_ref.first() else {
-        return Ok(RefWrite::Skipped("no longer needs a ref".into()));
+    let replan = plan_normalize_with(std::slice::from_ref(&current), scope.project, scope.folds);
+    let Some(wanted) = step.bucket(&replan).first() else {
+        return Ok(NormWrite::Skipped(format!(
+            "no longer needs {}",
+            step_name(step)
+        )));
     };
     if wanted.decision_ref != row.decision_ref {
-        return Ok(RefWrite::Skipped(format!(
+        return Ok(NormWrite::Skipped(format!(
             "ref changed to {} since planning",
             wanted.decision_ref.as_deref().unwrap_or("none")
         )));
     }
-    let Some(reference) = wanted.decision_ref.as_deref() else {
-        return Ok(RefWrite::Skipped("no ref to write".into()));
+    let edit = match edit_for(step, &current, wanted, scope.folds)? {
+        Ok(edit) => edit,
+        Err(why) => return Ok(NormWrite::Skipped(why)),
     };
-    let mut metadata = match &current.metadata {
-        serde_json::Value::Object(map) => map.clone(),
-        serde_json::Value::Null => serde_json::Map::new(),
-        _ => {
-            return Ok(RefWrite::Skipped(
-                "metadata is not an object, so there is nothing to merge into".into(),
-            ))
-        }
-    };
-    metadata.insert("decision_ref".into(), reference.into());
-    let metadata = serde_json::Value::Object(metadata);
-    // The same check an update makes on metadata alone; the type is unchanged.
-    StructuredFields::default()
-        .validate(&metadata, current.memory_type.as_deref())
-        .map_err(|e| StoreError::Invalid(e.to_string()))?;
     let before = Revisions::new(store)
         .current(&current.id)?
         .ok_or(StoreError::NotFound)?;
-    let edit = MemoryEdit {
-        metadata: Some(metadata),
-        ..MemoryEdit::at(chrono::Utc::now().to_rfc3339())
-    };
     Memories::new(store).apply_edit(&current.id, &edit)?;
     record(store, &current.id, &before)?;
     crate::events::emit(
@@ -451,7 +592,66 @@ fn write_ref(
         &current.id,
         &current.category,
     );
-    Ok(RefWrite::Written)
+    Ok(NormWrite::Written)
+}
+
+fn step_name(step: Step) -> &'static str {
+    match step {
+        Step::Respell => "a respell",
+        Step::Retype => "a retype",
+        Step::AddRef => "a ref",
+    }
+}
+
+/// The edit `step` makes to `current`; the inner `Err` is a reason to skip.
+fn edit_for(
+    step: Step,
+    current: &Memory,
+    wanted: &NormalizeRow,
+    folds: &[Fold],
+) -> crate::db::Result<Result<MemoryEdit, String>> {
+    let at = MemoryEdit::at(chrono::Utc::now().to_rfc3339());
+    if step == Step::Respell {
+        let Some(fold) = fold_for(current, folds) else {
+            return Ok(Err("no fold matches its project".into()));
+        };
+        return Ok(Ok(MemoryEdit {
+            project: Some(fold.to.clone()),
+            ..at
+        }));
+    }
+    let mut metadata = match &current.metadata {
+        serde_json::Value::Object(map) => map.clone(),
+        serde_json::Value::Null => serde_json::Map::new(),
+        _ => {
+            return Ok(Err(
+                "metadata is not an object, so there is nothing to merge into".into(),
+            ))
+        }
+    };
+    match (step, wanted.decision_ref.as_deref()) {
+        (_, Some(reference)) => {
+            metadata.insert("decision_ref".into(), reference.into());
+        }
+        (Step::AddRef, None) => return Ok(Err("no ref to write".into())),
+        _ => {}
+    }
+    let metadata = serde_json::Value::Object(metadata);
+    let memory_type = match step {
+        Step::Retype => Some("decision".to_string()),
+        _ => None,
+    };
+    // The check an update makes, for the type the row will have: a retype
+    // without a rationale is refused here (D32).
+    let checked_type = memory_type.as_deref().or(current.memory_type.as_deref());
+    StructuredFields::default()
+        .validate(&metadata, checked_type)
+        .map_err(|e| StoreError::Invalid(e.to_string()))?;
+    Ok(Ok(MemoryEdit {
+        metadata: Some(metadata),
+        memory_type,
+        ..at
+    }))
 }
 
 // -- DECISIONS.md parsing -----------------------------------------------------
@@ -1887,15 +2087,18 @@ pub fn render_normalize_applied(applied: &NormalizeApplied) -> String {
     let plan = &applied.plan;
     let scope = applied.project.as_deref().unwrap_or("all projects");
     let mut out = format!(
-        "# Decisions normalise applied: {scope}\n\nWrote metadata.decision_ref on {} memories; {} skipped as changed since planning, {} failed. Left unchanged: {} retype, {} need rationale, {} conflicts, {} mentions.\n",
+        "# Decisions normalise applied: {scope}\n\nRenamed the project of {} memories, typed {} as decisions, wrote metadata.decision_ref on {}; {} skipped as changed since planning, {} failed. Left unchanged: {} need rationale, {} conflicts, {} mentions.\n",
+        applied.respelled.len(),
+        applied.retyped.len(),
         applied.updated.len(),
         applied.skipped.len(),
         applied.failed.len(),
-        plan.retype.len(),
         plan.needs_rationale.len(),
         plan.conflicts.len(),
         plan.mentions.len()
     );
+    section(&mut out, "Respelled", &applied.respelled, norm_line);
+    section(&mut out, "Retyped", &applied.retyped, norm_line);
     section(&mut out, "Updated", &applied.updated, norm_line);
     section(&mut out, "Skipped", &applied.skipped, norm_line);
     section(&mut out, "Failed", &applied.failed, norm_line);
@@ -1906,13 +2109,15 @@ pub fn render_normalize_applied(applied: &NormalizeApplied) -> String {
 pub fn render_normalize(plan: &NormalizePlan) -> String {
     let scope = plan.project.as_deref().unwrap_or("all projects");
     let mut out = format!(
-        "# Decisions normalise dry run: {scope}\n\nNothing was written to the store. Proposed: {} retype, {} add ref. Needs a person: {} need rationale, {} conflicts. Report only: {} mentions.\n",
+        "# Decisions normalise dry run: {scope}\n\nNothing was written to the store. Proposed: {} respell, {} retype, {} add ref. Needs a person: {} need rationale, {} conflicts. Report only: {} mentions.\n",
+        plan.respell.len(),
         plan.retype.len(),
         plan.add_ref.len(),
         plan.needs_rationale.len(),
         plan.conflicts.len(),
         plan.mentions.len()
     );
+    section(&mut out, "Respell project", &plan.respell, norm_line);
     section(&mut out, "Retype to decision", &plan.retype, norm_line);
     section(
         &mut out,
@@ -2159,7 +2364,19 @@ mod apply_tests {
             }
             record_revision(s, id, before)
         };
-        let applied = apply_rows(&store, None, &plan.add_ref, &record);
+        let mut applied = NormalizeApplied::default();
+        let scope = Scope {
+            project: None,
+            folds: &[],
+        };
+        apply_rows(
+            &store,
+            &scope,
+            Step::AddRef,
+            &plan.add_ref,
+            &record,
+            &mut applied,
+        );
 
         let ids = |rows: &[NormalizeRow]| rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
         assert_eq!(ids(&applied.failed), ["m-bad"]);

@@ -767,15 +767,20 @@ fn parse_search_args(args: &[String]) -> Result<SearchArgs, String> {
 }
 
 const DECISIONS_USAGE: &str = "\
-Usage: rusty-remind-me decisions normalize [--project <PROJECT>] [--apply] [--json]
+Usage: rusty-remind-me decisions normalize [--project <PROJECT>] [--fold <FROM=TO>]...
+           [--apply] [--json]
        rusty-remind-me decisions import <DECISIONS.md> --project <PROJECT>
            [--ref-prefix <P>] [--generate-refs <P>] [--rename-duplicates]
            [--apply] [--json]
   By default a dry run: print what normalising decision memories, or
   importing a repo decisions log, would change, writing nothing.
-  normalize --apply writes metadata.decision_ref on the memories the plan
-  lists under \"add ref\", re-planned at that moment, and prints what it
-  wrote; nothing else is changed.
+  normalize --apply carries out the plan, re-planned at that moment, in
+  this order: renames the project of the \"respell\" rows, types the
+  \"retype\" rows as decisions, writes metadata.decision_ref on the
+  \"add ref\" rows, and prints what it wrote; nothing else is changed.
+  --fold FROM=TO (repeatable) proposes renaming the project of every
+  memory whose project is exactly FROM to TO; FROM and TO must be two
+  spellings of one name (let_em_loose=let-em-loose).
   import --apply adds the plan's new entries as decisions of the project,
   re-planned at that moment, retires the decisions they supersede, and
   prints what it wrote; a stored decision is never overwritten.
@@ -791,6 +796,7 @@ Usage: rusty-remind-me decisions normalize [--project <PROJECT>] [--apply] [--js
 enum DecisionsArgs {
     Normalize {
         project: Option<String>,
+        folds: Vec<remind_me_core::decisions_backfill::Fold>,
         apply: bool,
         json: bool,
     },
@@ -812,6 +818,7 @@ fn parse_decisions_args(args: &[String]) -> Result<DecisionsArgs, String> {
     let mut json = false;
     let mut apply = false;
     let mut refs = remind_me_core::decisions_backfill::RefOptions::default();
+    let mut folds: Vec<remind_me_core::decisions_backfill::Fold> = Vec::new();
     let mut words: Vec<String> = Vec::new();
     let mut i = 0;
     while i < rest.len() {
@@ -821,6 +828,14 @@ fn parse_decisions_args(args: &[String]) -> Result<DecisionsArgs, String> {
             "--rename-duplicates" => refs.rename_duplicates = true,
             "--project" => {
                 project = Some(flag_value(rest, i, "--project", DECISIONS_USAGE)?);
+                i += 1;
+            }
+            "--fold" => {
+                let value = flag_value(rest, i, "--fold", DECISIONS_USAGE)?;
+                folds.push(
+                    remind_me_core::decisions_backfill::Fold::parse(&value)
+                        .map_err(|e| usage(&format!("{e}.")))?,
+                );
                 i += 1;
             }
             "--ref-prefix" => {
@@ -851,8 +866,10 @@ fn parse_decisions_args(args: &[String]) -> Result<DecisionsArgs, String> {
         ("normalize", _) if reads_refs => Err(usage(
             "--ref-prefix, --generate-refs and --rename-duplicates are import flags.",
         )),
+        ("import", _) if !folds.is_empty() => Err(usage("--fold is a normalize flag.")),
         ("normalize", []) => Ok(DecisionsArgs::Normalize {
             project,
+            folds,
             apply,
             json,
         }),
@@ -902,11 +919,12 @@ fn run_decisions(
     let (report, json) = match args {
         DecisionsArgs::Normalize {
             project,
+            folds,
             apply: true,
             json,
         } => {
             let applied: NormalizeApplied =
-                daemon_plan(&mut store, Op::DecisionsNormalizeApply { project })?;
+                daemon_plan(&mut store, Op::DecisionsNormalizeApply { project, folds })?;
             (
                 if json {
                     serde_json::to_string_pretty(&applied)?
@@ -918,11 +936,12 @@ fn run_decisions(
         }
         DecisionsArgs::Normalize {
             project,
+            folds,
             apply: false,
             json,
         } => {
             let plan: NormalizePlan =
-                daemon_plan(&mut store, Op::DecisionsNormalizePlan { project })?;
+                daemon_plan(&mut store, Op::DecisionsNormalizePlan { project, folds })?;
             (
                 if json {
                     serde_json::to_string_pretty(&plan)?
@@ -1728,11 +1747,12 @@ mod tests {
 
     #[test]
     fn decisions_takes_normalize_and_import() {
-        use remind_me_core::decisions_backfill::RefOptions;
+        use remind_me_core::decisions_backfill::{Fold, RefOptions};
         assert_eq!(
             parse_decisions_args(&args(&["normalize", "--json"])),
             Ok(DecisionsArgs::Normalize {
                 project: None,
+                folds: Vec::new(),
                 apply: false,
                 json: true
             })
@@ -1741,9 +1761,29 @@ mod tests {
             parse_decisions_args(&args(&["normalize", "--apply", "--project", "mill"])),
             Ok(DecisionsArgs::Normalize {
                 project: Some("mill".into()),
+                folds: Vec::new(),
                 apply: true,
                 json: false
             })
+        );
+        assert_eq!(
+            parse_decisions_args(&args(&[
+                "normalize",
+                "--fold",
+                " let_em_loose = let-em-loose ",
+                "--fold",
+                "Rusty_Term=rusty_term",
+            ])),
+            Ok(DecisionsArgs::Normalize {
+                project: None,
+                folds: vec![
+                    Fold::parse("let_em_loose=let-em-loose").expect("fold"),
+                    Fold::parse("Rusty_Term=rusty_term").expect("fold"),
+                ],
+                apply: false,
+                json: false
+            }),
+            "--fold repeats and trims each side"
         );
         assert_eq!(
             parse_decisions_args(&args(&["import", "D.md", "--project", "mill"])),
@@ -1802,6 +1842,7 @@ mod tests {
             parse_decisions_args(&args(&["normalize", "--apply"])),
             Ok(DecisionsArgs::Normalize {
                 project: None,
+                folds: Vec::new(),
                 apply: true,
                 json: false
             }),
@@ -1811,6 +1852,7 @@ mod tests {
             parse_decisions_args(&args(&["normalize", "--apply", "--project", " mill "])),
             Ok(DecisionsArgs::Normalize {
                 project: Some("mill".into()),
+                folds: Vec::new(),
                 apply: true,
                 json: false
             })
@@ -1829,6 +1871,11 @@ mod tests {
             &["import", "D.md", "--project", "mill", "--generate-refs"],
             &["normalize", "--rename-duplicates"],
             &["normalize", "--ref-prefix", "gui-design"],
+            &["normalize", "--fold", "mill=millwright"],
+            &["normalize", "--fold", "mill"],
+            &["normalize", "--fold", "mill=mill"],
+            &["normalize", "--fold", "=mill"],
+            &["import", "D.md", "--project", "mill", "--fold", "a_b=a-b"],
         ] {
             assert!(parse_decisions_args(&args(bad)).is_err(), "{bad:?}");
         }

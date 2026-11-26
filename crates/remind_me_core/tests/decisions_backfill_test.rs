@@ -945,6 +945,143 @@ fn apply_skips_claim_rows() {
         .is_empty());
 }
 
+// -- project folds and retype (pack D71, D72, D82) -----------------------------
+
+use remind_me_core::decisions_backfill::{apply_normalize_with, plan_normalize_with, Fold};
+
+fn untyped(id: &str, project: Option<&str>, metadata: serde_json::Value) -> NewMemory {
+    let mut row = NewMemory::new(id, "homelab: keep backups offsite", "2026-09-01T00:00:00Z");
+    row.memory_type = "unclassified".into();
+    row.category = "decision".into();
+    row.project = project.map(str::to_string);
+    row.metadata = metadata;
+    row
+}
+
+#[test]
+fn folds_take_two_spellings_of_one_name_only() {
+    let fold = Fold::parse(" let_em_loose = let-em-loose ").expect("fold");
+    assert_eq!(
+        (fold.from.as_str(), fold.to.as_str()),
+        ("let_em_loose", "let-em-loose")
+    );
+    for bad in ["let_em_loose", "=x", "x=", "mill=mill", "mill=millwright"] {
+        assert!(Fold::parse(bad).is_err(), "{bad}");
+    }
+}
+
+/// Folds match the exact spelling and respect `--project`; without a fold
+/// nothing is respelled, so a plain run keeps its old behaviour.
+#[test]
+fn respell_proposes_exact_spellings_of_any_type() {
+    let mut fact = NewMemory::new("m-fact", "worklog", "2026-11-01T00:00:00Z");
+    fact.memory_type = "fact".into();
+    fact.project = Some("let_em_loose".into());
+    let memories = stored(vec![
+        fact,
+        decision("m-canon", "let-em-loose", "x", json!({"rationale": "x"})),
+        decision("m-term", "rusty_term", "x", json!({"rationale": "x"})),
+    ]);
+    let folds = [Fold::parse("let_em_loose=let-em-loose").expect("fold")];
+    let ids = |plan: &remind_me_core::decisions_backfill::NormalizePlan| {
+        plan.respell
+            .iter()
+            .map(|r| r.id.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        ids(&plan_normalize_with(&memories, None, &folds)),
+        ["m-fact"]
+    );
+    assert_eq!(
+        ids(&plan_normalize_with(
+            &memories,
+            Some("Let Em Loose"),
+            &folds
+        )),
+        ["m-fact"]
+    );
+    assert!(ids(&plan_normalize_with(&memories, Some("rusty_term"), &folds)).is_empty());
+    assert!(plan_normalize(&memories, None).respell.is_empty());
+}
+
+/// One apply run respells, then retypes, then adds refs. A row folded first
+/// still gets its ref; a retyped row gets no review (D74); rows without a
+/// rationale and claim rows are left alone; a second run does nothing.
+#[test]
+fn apply_respells_retypes_and_adds_refs_in_one_run() {
+    let db = Database::open_in_memory().expect("database");
+    let store = db.store();
+    let memories = Memories::new(&store);
+    let mut fact = NewMemory::new("m-fact", "worklog", "2026-11-01T00:00:00Z");
+    fact.memory_type = "fact".into();
+    fact.project = Some("let_em_loose".into());
+    let mut claim = NewMemory::new("m-claim", "stage", "2026-11-01T00:00:00Z");
+    claim.project = Some("let_em_loose".into());
+    claim.subject = Some("let_em_loose".into());
+    claim.predicate = Some("project.stage".into());
+    claim.object = Some("built".into());
+    for row in [
+        fact,
+        claim,
+        decision(
+            "m-dec",
+            "let_em_loose",
+            "x",
+            json!({"decision_id": "D5", "rationale": "x"}),
+        ),
+        untyped(
+            "m-legacy",
+            None,
+            json!({"rationale": "offsite survives a fire"}),
+        ),
+        untyped("m-norat", None, json!({})),
+    ] {
+        memories.insert(&row).expect("insert");
+    }
+
+    let folds = [Fold::parse("let_em_loose=let-em-loose").expect("fold")];
+    let applied = apply_normalize_with(&store, None, &folds).expect("apply");
+    let ids = |rows: &[remind_me_core::decisions_backfill::NormalizeRow]| {
+        rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>()
+    };
+    assert_eq!(
+        ids(&applied.respelled),
+        ["m-dec", "m-fact"],
+        "planned oldest first, ties by id"
+    );
+    assert_eq!(ids(&applied.retyped), ["m-legacy"]);
+    assert_eq!(ids(&applied.updated), ["m-dec"]);
+    assert_eq!(ids(&applied.skipped), ["m-claim"]);
+    assert!(applied.failed.is_empty(), "{:?}", applied.failed);
+    assert_eq!(ids(&applied.plan.needs_rationale), ["m-norat"]);
+
+    let got = |id: &str| {
+        remind_me_core::db::queries::get_memory_by_id(&store, id)
+            .expect("read")
+            .expect("live")
+    };
+    assert_eq!(got("m-fact").project.as_deref(), Some("let-em-loose"));
+    assert_eq!(got("m-fact").memory_type.as_deref(), Some("fact"));
+    let dec = got("m-dec");
+    assert_eq!(dec.project.as_deref(), Some("let-em-loose"));
+    assert_eq!(dec.metadata["decision_ref"], "D5");
+    let legacy = got("m-legacy");
+    assert_eq!(legacy.memory_type.as_deref(), Some("decision"));
+    assert_eq!(legacy.project, None, "D72: no project is assigned");
+    assert_eq!(legacy.metadata["rationale"], "offsite survives a fire");
+    assert_eq!(legacy.metadata.get("review"), None, "D74: no review");
+    assert_eq!(got("m-norat").memory_type.as_deref(), Some("unclassified"));
+    assert_eq!(got("m-claim").project.as_deref(), Some("let_em_loose"));
+
+    let revisions = remind_me_core::history::history(&store, "m-fact", 10).expect("history");
+    assert_eq!(revisions.len(), 1, "the respell recorded what it replaced");
+
+    let again = apply_normalize_with(&store, None, &folds).expect("apply");
+    assert!(again.respelled.is_empty() && again.retyped.is_empty() && again.updated.is_empty());
+    assert_eq!(ids(&again.skipped), ["m-claim"]);
+}
+
 // -- ref options and import apply (pack D69, D70, D74) -------------------------
 
 use remind_me_core::decisions_backfill::{
