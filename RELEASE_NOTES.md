@@ -2,6 +2,11 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-26 — `--version` / `-V` on the CLI
+
+### Added
+- `rusty-remind-me --version` (or `-V`) prints `rusty-remind-me <crate version>` and exits, without opening or creating a store. Deploys no longer need `server_status` to confirm which build is installed.
+
 ## 2026-11-26 — 0.5.0: release
 
 ### Changed
