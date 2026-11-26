@@ -231,6 +231,27 @@ impl HistoryStore for EngineTables {
             .collect())
     }
 
+    /// Ids from the memory index, newest first; each record is read only
+    /// when the walk reaches it.
+    fn content_revised_at(&self, memory_id: &str, content: &str) -> Result<Option<String>> {
+        let mut ids = FilterEq::<RevisionRecord, ByMemory>::filter_eq(
+            &self.revisions,
+            &memory_id.to_string(),
+        );
+        ids.sort_unstable_by(|a, b| b.cmp(a));
+        let mut replaced_by = content.to_string();
+        for id in ids {
+            let Some(record) = self.revisions.get(id) else {
+                continue;
+            };
+            if record.content != replaced_by {
+                return Ok(Some(record.edited_at));
+            }
+            replaced_by = record.content;
+        }
+        Ok(None)
+    }
+
     fn revision(&self, memory_id: &str, revision_id: i64) -> Result<Option<Tracked>> {
         Ok(self
             .revisions

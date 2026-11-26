@@ -404,15 +404,8 @@ fn content_revised_at(
     content: &str,
     created_at: &str,
 ) -> SqlResult<String> {
-    let revisions = crate::history::history(store, id, usize::MAX)?;
-    let mut replaced_by = content;
-    for revision in &revisions {
-        if revision.content != replaced_by {
-            return Ok(revision.edited_at.clone());
-        }
-        replaced_by = &revision.content;
-    }
-    Ok(created_at.to_string())
+    let revised = crate::db::history::Revisions::new(store).content_revised_at(id, content)?;
+    Ok(revised.unwrap_or_else(|| created_at.to_string()))
 }
 
 /// [`persona`], each statement with its stale flag (card #60).
