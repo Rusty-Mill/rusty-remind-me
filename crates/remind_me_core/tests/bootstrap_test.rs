@@ -62,6 +62,7 @@ fn persona_from(store: &Store<'_>, source_id: &str, content: &str) -> String {
             rung: Rung::ScenarioToPersona,
             source_ids: vec![source_id.to_string()],
             content: content.to_string(),
+            refreshes: None,
         },
     )
     .unwrap()

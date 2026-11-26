@@ -124,6 +124,7 @@ fn a_promotion_records_its_sources_as_premises() {
                 rung,
                 source_ids: sources.clone(),
                 content: format!("a {basis} distillation"),
+                refreshes: None,
             },
         )
         .unwrap();
@@ -147,6 +148,7 @@ fn a_source_named_twice_is_one_premise() {
             rung: Rung::FactToScenario,
             source_ids: vec![a.clone(), a.clone()],
             content: "a distillation of one source".into(),
+            refreshes: None,
         },
     )
     .unwrap();

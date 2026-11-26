@@ -96,6 +96,8 @@ pub enum PromotionError {
     EmptyContent,
     /// This exact source set already has a live promotion at this rung.
     DuplicateSources(String),
+    /// `refreshes` names no live promoted memory at the rung promoted to.
+    UnusableRefresh(String),
 }
 
 impl std::fmt::Display for PromotionError {
@@ -133,6 +135,12 @@ impl std::fmt::Display for PromotionError {
                  same evidence rather than the one that already exists",
                 id
             ),
+            Self::UnusableRefresh(id) => write!(
+                f,
+                "refreshes {:?} names no live promoted memory at the rung promoted to, \
+                 so there is nothing for this promotion to replace",
+                id
+            ),
         }
     }
 }
@@ -164,6 +172,8 @@ fn capture_candidates(store: &Store<'_>, limit: usize) -> SqlResult<Vec<Promotio
             snippet: snippet(&row.content),
             reason: "captured but never decomposed into facts".to_string(),
             grouped_by: None,
+            refresh_of: None,
+            new_evidence: Vec::new(),
         })
         .collect())
 }
@@ -197,6 +207,8 @@ fn scenario_candidates(store: &Store<'_>, limit: usize) -> SqlResult<Vec<Promoti
                 ),
                 grouped_by: Some(name),
                 source_ids: group.memory_ids,
+                refresh_of: None,
+                new_evidence: Vec::new(),
             }
         })
         .collect())
@@ -221,6 +233,8 @@ fn persona_candidates(store: &Store<'_>, limit: usize) -> SqlResult<Vec<Promotio
                 row.vitality, PERSONA_VITALITY_FLOOR
             ),
             grouped_by: None,
+            refresh_of: None,
+            new_evidence: Vec::new(),
         })
         .collect())
 }
@@ -237,11 +251,124 @@ pub fn promotion_candidates(
     limit: usize,
 ) -> SqlResult<Vec<PromotionCandidate>> {
     let limit = limit.clamp(PROMOTION_LIMIT_MIN, PROMOTION_LIMIT_MAX);
-    match rung {
+    let fresh = |limit: usize| match rung {
         Rung::CaptureToFact => capture_candidates(store, limit),
         Rung::FactToScenario => scenario_candidates(store, limit),
         Rung::ScenarioToPersona => persona_candidates(store, limit),
+    };
+    if rung == Rung::CaptureToFact {
+        return fresh(limit);
     }
+    let mut out = refresh_candidates(store, rung, limit.div_ceil(2), Utc::now())?;
+    out.extend(fresh(limit - out.len())?);
+    Ok(out)
+}
+
+/// Stale artifacts at `rung`'s target, as `refresh` candidates, newest
+/// first, at most `limit` (card #60).
+///
+/// They come before new promotions but take at most half the page, so a
+/// store with many stale scenarios still shows what is new. A scenario's
+/// candidate carries its facts plus the new evidence, ready to promote; a
+/// persona statement's carries its scenarios, as new facts reach it only
+/// through a refreshed scenario. [`count_candidates`] counts new promotions
+/// only.
+fn refresh_candidates(
+    store: &Store<'_>,
+    rung: Rung,
+    limit: usize,
+    now: chrono::DateTime<Utc>,
+) -> SqlResult<Vec<PromotionCandidate>> {
+    let category = match rung {
+        Rung::FactToScenario => SCENARIO_CATEGORY,
+        Rung::ScenarioToPersona => PERSONA_CATEGORY,
+        Rung::CaptureToFact => return Ok(Vec::new()),
+    };
+    let promotions = Promotions::new(store);
+    let mut out = Vec::new();
+    let statements = promotions.statements_newest_first(category)?;
+    for row in statements.into_iter().take(REFRESH_CHECK_MAX) {
+        if out.len() >= limit {
+            break;
+        }
+        let sources = promotions.sources_of(&row.id)?;
+        if surviving_sources(store, &row.id)? == 0 {
+            continue;
+        }
+        let staleness = staleness_of(store, &row.id, &row.created_at, now)?;
+        if !staleness.is_stale() {
+            continue;
+        }
+        let mut source_ids = sources;
+        if rung == Rung::FactToScenario {
+            source_ids.extend(staleness.new_evidence.iter().cloned());
+        }
+        out.push(PromotionCandidate {
+            rung,
+            source_ids,
+            snippet: snippet(&row.content),
+            reason: format!(
+                "refresh: {} newer memories share an entity with what this was built from",
+                staleness.new_evidence.len()
+            ),
+            grouped_by: None,
+            refresh_of: Some(row.id),
+            new_evidence: staleness.new_evidence,
+        });
+    }
+    Ok(out)
+}
+
+/// Most promoted statements one candidate listing checks for staleness.
+const REFRESH_CHECK_MAX: usize = PROMOTION_LIMIT_MAX;
+
+/// Everything a promoted memory was built from, down to the fact rung: a
+/// scenario's facts, or a persona statement's scenarios and their facts.
+pub fn sources_down_to_facts(store: &Store<'_>, promoted_id: &str) -> SqlResult<Vec<String>> {
+    let promotions = Promotions::new(store);
+    let mut out: Vec<String> = Vec::new();
+    let mut frontier = vec![promoted_id.to_string()];
+    // Two hops cover the ladder: persona → scenario → fact.
+    for _ in 0..2 {
+        let mut next = Vec::new();
+        for id in &frontier {
+            for source in promotions.sources_of(id)? {
+                if !out.contains(&source) {
+                    out.push(source.clone());
+                    next.push(source);
+                }
+            }
+        }
+        frontier = next;
+    }
+    Ok(out)
+}
+
+/// [`crate::staleness::stale_check`] for a promoted memory written at
+/// `written`.
+pub fn staleness_of(
+    store: &Store<'_>,
+    promoted_id: &str,
+    written: &str,
+    now: chrono::DateTime<Utc>,
+) -> SqlResult<crate::staleness::Staleness> {
+    let sources = sources_down_to_facts(store, promoted_id)?;
+    crate::staleness::stale_check(store, &sources, written, now)
+}
+
+/// [`persona`], each statement with its stale flag (card #60).
+///
+/// A separate call so the search bootstrap and the brief, which read the
+/// persona on every request, do not pay for the check.
+pub fn persona_with_staleness(store: &Store<'_>) -> SqlResult<Vec<PersonaStatement>> {
+    let now = Utc::now();
+    let mut statements = persona(store)?;
+    for statement in &mut statements {
+        let staleness = staleness_of(store, &statement.id, &statement.created_at, now)?;
+        statement.stale = staleness.stale;
+        statement.new_evidence = staleness.new_evidence;
+    }
+    Ok(statements)
 }
 
 /// The true, uncapped count of what is ready at one rung.
@@ -339,11 +466,18 @@ pub fn promote(store: &Store<'_>, input: &PromoteInput) -> Result<PromotionResul
         }
     }
 
+    if let Some(old) = &input.refreshes {
+        check_refresh(store, old, category)?;
+    }
+
     // Same evidence, promoted twice, is not a new promotion — see
     // `existing_live_promotion` for why "live" is the bar rather than "ever
-    // promoted".
+    // promoted". Refreshing that very promotion is the exception: a persona
+    // statement refreshed for new facts keeps the same scenarios.
     if let Some(promoted_id) = existing_live_promotion(store, input.rung, &input.source_ids)? {
-        return Err(PromotionError::DuplicateSources(promoted_id));
+        if input.refreshes.as_deref() != Some(promoted_id.as_str()) {
+            return Err(PromotionError::DuplicateSources(promoted_id));
+        }
     }
 
     let now_iso = Utc::now().to_rfc3339();
@@ -376,25 +510,31 @@ pub fn promote(store: &Store<'_>, input: &PromoteInput) -> Result<PromotionResul
     let vitality = calculate_vitality(base_weight, 0, decay_rate, &now_iso, now);
 
     let provenance = crate::context::default_provenance().auto();
-    Memories::new(store).insert(&NewMemory {
-        category: category.to_string(),
-        source: PROMOTION_SOURCE.to_string(),
-        metadata,
-        decay_rate,
-        vitality,
-        base_weight,
-        accessed_at: Some(now_iso.clone()),
-        ..provenance.stamp(NewMemory::new(
-            promoted_id.clone(),
-            input.content.clone(),
-            &now_iso,
-        ))
-    })?;
+    store.transaction(|store| -> Result<(), PromotionError> {
+        Memories::new(store).insert(&NewMemory {
+            category: category.to_string(),
+            source: PROMOTION_SOURCE.to_string(),
+            metadata,
+            decay_rate,
+            vitality,
+            base_weight,
+            accessed_at: Some(now_iso.clone()),
+            ..provenance.stamp(NewMemory::new(
+                promoted_id.clone(),
+                input.content.clone(),
+                &now_iso,
+            ))
+        })?;
 
-    let promotions = Promotions::new(store);
-    for source_id in &input.source_ids {
-        promotions.record(&promoted_id, source_id, input.rung.as_str(), &now_iso)?;
-    }
+        let promotions = Promotions::new(store);
+        for source_id in &input.source_ids {
+            promotions.record(&promoted_id, source_id, input.rung.as_str(), &now_iso)?;
+        }
+        if let Some(old) = &input.refreshes {
+            Memories::new(store).set_superseded_by(old, &promoted_id, Some(&now_iso))?;
+        }
+        Ok(())
+    })?;
 
     Ok(PromotionResult {
         promoted_id,
@@ -402,6 +542,18 @@ pub fn promote(store: &Store<'_>, input: &PromoteInput) -> Result<PromotionResul
         category: category.to_string(),
         source_ids: input.source_ids.clone(),
     })
+}
+
+/// Refuse a `refreshes` that names no live promoted memory in `category`.
+fn check_refresh(store: &Store<'_>, old: &str, category: &str) -> Result<(), PromotionError> {
+    let unusable = || PromotionError::UnusableRefresh(old.to_string());
+    let rows = load_memories(store, &[old.to_string()])?;
+    let row = rows.first().ok_or_else(unusable)?;
+    let live = row.superseded_by.is_none() && row.deleted_at.is_none();
+    if !live || row.category != category || row.source != PROMOTION_SOURCE {
+        return Err(unusable());
+    }
+    Ok(())
 }
 
 /// What a memory was built from, and what was built on it.
@@ -473,6 +625,8 @@ pub fn persona(store: &Store<'_>) -> SqlResult<Vec<PersonaStatement>> {
             vitality,
             created_at,
             surviving_sources: surviving,
+            stale: None,
+            new_evidence: Vec::new(),
         });
     }
     Ok(out)
@@ -502,6 +656,8 @@ pub fn demoted(store: &Store<'_>) -> SqlResult<Vec<PersonaStatement>> {
                 vitality,
                 created_at,
                 surviving_sources: 0,
+                stale: None,
+                new_evidence: Vec::new(),
             });
         }
     }

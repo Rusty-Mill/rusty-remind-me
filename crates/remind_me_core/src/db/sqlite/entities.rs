@@ -390,6 +390,19 @@ impl EntityStore for SqliteTables {
         Ok(self.linked_rows(entity_id)?.len())
     }
 
+    fn entities_of(&self, memory_ids: &[String]) -> Result<Vec<String>> {
+        let mut found = std::collections::BTreeSet::new();
+        for id in memory_ids {
+            // The primary key leads with `memory_id`, so each is a seek.
+            found.extend(self.all(
+                "SELECT entity_id FROM memory_entities WHERE memory_id = ?1",
+                [id],
+                |r| r.get::<_, String>(0),
+            )?);
+        }
+        Ok(found.into_iter().collect())
+    }
+
     fn shared_memory_count(&self, a: &str, b: &str) -> Result<usize> {
         let of_a: HashSet<String> = self.linked_rows(a)?.into_iter().map(|r| r.id).collect();
         Ok(self

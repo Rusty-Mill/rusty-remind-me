@@ -31,6 +31,7 @@ use remind_me_core::models::{
     CaptureResult, DuplicateCheck, Memory, RevertOutcome, SaveCheck, SavedSearch, SearchDetail,
     SetReminderOutcome,
 };
+use remind_me_core::staleness::Staleness;
 use remind_me_core::updater::UpdateStatus;
 use remind_me_core::vectors::ReindexResult;
 use remind_me_core::wiki::WikiPage;
@@ -244,8 +245,16 @@ pub fn wiki_auto_compile(report: &AutoReport) -> String {
     out
 }
 
-pub fn wiki_page(page: &WikiPage) -> String {
-    format!("# {}\n\n{}", page.title, page.content)
+pub fn wiki_page(page: &WikiPage, staleness: &Staleness) -> String {
+    let page_text = format!("# {}\n\n{}", page.title, page.content);
+    if !staleness.is_stale() {
+        return page_text;
+    }
+    format!(
+        "> **Stale:** newer memories share an entity with this page's sources: {}\n\n{}",
+        staleness.new_evidence.join(", "),
+        page_text
+    )
 }
 
 /// Renders the **enriched** status value, not the bare `ServerStatus`.
@@ -752,6 +761,8 @@ mod bootstrap_rendering {
             vitality: 1.0,
             created_at: "2026-08-10T00:00:00Z".to_string(),
             surviving_sources: 1,
+            stale: None,
+            new_evidence: Vec::new(),
         }
     }
 
