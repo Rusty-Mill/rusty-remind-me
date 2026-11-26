@@ -296,6 +296,12 @@ fn refresh_candidates(
         if promotions.live_source_sensitivity(&row.id)? != Some(false) {
             continue;
         }
+        // `persona` withholds an artifact with no surviving source (all
+        // deleted, superseded, or reverted or abandoned decisions), so a
+        // refresh of it would be withheld too.
+        if surviving_sources(store, &row.id)? == 0 {
+            continue;
+        }
         let mut source_ids = usable_sources(&promotions, &row.id, rung)?;
         if source_ids.is_empty() {
             continue;
