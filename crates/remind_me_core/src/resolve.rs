@@ -178,7 +178,8 @@ pub fn validate_reclassify(
 }
 
 /// Check each decomposed fact's `memory_type` and metadata. A fact with no
-/// type is `unclassified`; only its `basis` is checked.
+/// type is `unclassified`; only its `basis` is checked. Every fact's
+/// `occurred_at` is checked whatever its type.
 pub fn validate_facts(facts: &[crate::models::AtomicFact]) -> Result<()> {
     for (i, fact) in facts.iter().enumerate() {
         let empty = json!({});
@@ -189,6 +190,7 @@ pub fn validate_facts(facts: &[crate::models::AtomicFact]) -> Result<()> {
                 .and_then(|k| crate::kinds::validate_metadata(k, metadata)),
             None => crate::kinds::validate_basis(metadata),
         };
+        let checked = checked.and_then(|()| crate::kinds::validate_occurred_at(metadata));
         checked.map_err(|e| StoreError::Invalid(format!("facts[{i}]: {e}")))?;
     }
     Ok(())

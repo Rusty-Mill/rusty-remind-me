@@ -80,3 +80,7 @@
 {"query": "testing", "relevant": ["m-test-dock-burnin", "m-test-lock-cycle"], "kind": "topic", "must_not": ["m-test-app-e2e", "m-test-api-contract"], "topic": "Hardware Testing"}
 {"query": "testing", "relevant": ["m-test-app-e2e", "m-test-api-contract"], "kind": "topic", "must_not": ["m-test-dock-burnin", "m-test-lock-cycle"], "topic": "Software"}
 {"query": "dock testing", "relevant": ["m-test-dock-burnin"], "kind": "topic", "must_not": ["m-test-app-e2e"], "topic": "Hardware"}
+{"query": "lantern vendor swap recently", "relevant": ["m-occ-lantern-voltra"], "kind": "occurred"}
+{"query": "ticket kiosk software went live last month", "relevant": ["m-occ-kiosk-v4"], "kind": "occurred"}
+{"query": "carnival complimentary wristbands last week", "relevant": ["m-occ-carnival"], "kind": "occurred"}
+{"query": "fire inspection last week", "relevant": ["m-occ-inspection"], "kind": "occurred"}

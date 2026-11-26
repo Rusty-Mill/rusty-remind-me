@@ -9,7 +9,9 @@
 
 use super::{sqlite_error, SqliteTables};
 use crate::db::derived::Origin;
-use crate::db::engine::memories::{distinct, is_after, queued_operation, Edit, MemoryRow};
+use crate::db::engine::memories::{
+    distinct, is_after, newest_in_window, queued_operation, Edit, MemoryRow,
+};
 use crate::db::engine::outbox::now_iso;
 use crate::db::memories::{
     tags_json, AccessInputs, CreatedMemory, KeywordFilter, ListFilter, MemoryEdit, MemoryStore,
@@ -829,22 +831,12 @@ impl MemoryStore for SqliteTables {
     }
 
     fn window_hits(&self, filter: &KeywordFilter) -> Result<Vec<Memory>> {
-        let now = chrono::Utc::now();
-        let field = |row: &MemoryRow| {
-            crate::time_window::parse_rfc3339(filter.window.pick(&row.created_at, &row.updated_at))
-        };
-        let mut hits: Vec<MemoryRow> = self
+        let hits: Vec<MemoryRow> = self
             .rows("deleted_at IS NULL AND superseded_by IS NULL", "id", &[])?
             .into_iter()
             .filter(|row| row.admits(filter))
             .collect();
-        hits.sort_by(|a, b| field(b).cmp(&field(a)).then_with(|| a.id.cmp(&b.id)));
-        Ok(hits
-            .into_iter()
-            .map(|row| row.to_memory())
-            .filter(|memory| filter.narrowing.admits(memory))
-            .filter(|memory| filter.vital_enough(memory, now))
-            .collect())
+        Ok(newest_in_window(hits, filter))
     }
 
     fn sensitive_ids(&self) -> Result<HashSet<String>> {

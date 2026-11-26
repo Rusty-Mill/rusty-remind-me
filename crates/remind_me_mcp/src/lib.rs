@@ -337,7 +337,7 @@ fn decompose_input_schema() -> Value {
             "predicate": { "type": "string", "maxLength": 200 },
             "object": { "type": "string", "maxLength": 500 },
             "entities": { "type": "array", "items": entity, "maxItems": 20 },
-            "metadata": { "type": "object", "description": "basis: stated, inferred or pattern; premises: the memory ids an inferred (1+) or pattern (2+) fact rests on. A decision also needs rationale" }
+            "metadata": { "type": "object", "description": "basis: stated, inferred or pattern; premises: the memory ids an inferred (1+) or pattern (2+) fact rests on. A decision also needs rationale. occurred_at: when the event happened, RFC 3339 or {from, to}" }
         },
         "required": ["content"]
     });
@@ -704,7 +704,7 @@ impl McpServer {
                         "tools": [
                             {
                                 "name": "remind_me_add",
-                                "description": "Save a fact, decision, preference or note to remind-me memory; call this whenever the user states something durable. A decision needs metadata.rationale. Saving a decision checks it against the standing, non-sensitive decisions in the same project on the same claim or a shared entity and returns likely conflicts as contradiction_candidates. Any memory returns likely near-duplicates in its project as duplicate_candidates. Nothing is blocked or superseded automatically. Pass supersedes to retire the old decision in the same call.",
+                                "description": "Save a fact, decision, preference or note to remind-me memory; call this whenever the user states something durable. A decision needs metadata.rationale. Saving a decision checks it against the standing, non-sensitive decisions in the same project on the same claim or a shared entity and returns likely conflicts as contradiction_candidates. Any memory returns likely near-duplicates in its project as duplicate_candidates. Nothing is blocked or superseded automatically. Pass supersedes to retire the old decision in the same call. When the event happened at another time than now, set metadata.occurred_at (RFC 3339, or {from, to}), resolving relative dates to absolute ones.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -728,7 +728,7 @@ impl McpServer {
                                             }
                                         },
                                         "project": { "type": "string", "maxLength": 200, "description": "The project this memory belongs to, e.g. a registered project name. Replaces the project detected from the writer's directory; blank is unset." },
-                                        "metadata": { "type": "object", "description": "Free-form JSON stored with the memory; a decision requires a `rationale` string here, an action_item may hold due, owner and status." },
+                                        "metadata": { "type": "object", "description": "Free-form JSON stored with the memory; a decision requires a `rationale` string here, an action_item may hold due, owner and status. occurred_at: when the event happened, RFC 3339 or {from, to}." },
                                         "subject": { "type": "string", "description": "Subject of a subject-predicate-object fact. remind_me_add does not supersede a live triple with the same subject and predicate; name it in supersedes to do so." },
                                         "predicate": { "type": "string", "description": "Predicate of the fact triple." },
                                         "object": { "type": "string", "description": "Object of the fact triple." },
@@ -861,7 +861,7 @@ impl McpServer {
                                         "include_raw": { "type": "boolean", "default": false, "description": "Rank raw session dialogs and skeletons too. Off by default: facts and summaries rank, and each carries the capture_id of its dialog. A dialog category or a session_id filter turns it on, and when nothing refined matches the best dialogs come back marked as raw." },
                                         "since": { "type": "string", "description": "Only memories at or after this time (inclusive): RFC 3339, an age back from now like 30m, 12h, 2d, 1w, or a date phrase like yesterday, last week, past 3 days, since monday, in march, Q3, 2026-10 or 2026-01 to 2026-03. A phrase naming a whole period (yesterday, last week, Q3) also ends the window at that period's end unless until is given. Phrases use the server's REMIND_ME_TZ calendar (UTC if unset)." },
                                         "until": { "type": "string", "description": "Only memories before this time (exclusive): RFC 3339, an age back from now like 30m, 12h, 2d, 1w, or a date phrase naming a period, which ends the window at that period's end (today, last month, Q3). Must be after since." },
-                                        "time_field": { "type": "string", "enum": ["created", "updated"], "default": "created", "description": "Which timestamp since/until apply to." },
+                                        "time_field": { "type": "string", "enum": ["created", "updated", "occurred"], "default": "created", "description": "Which timestamp since/until apply to. occurred: metadata.occurred_at, else created; a {from, to} span counts when it overlaps the window." },
                                         "strategy": { "type": "string", "enum": ["auto", "balanced", "keyword_favored", "semantic_favored"], "default": "auto", "description": "RRF weight profile. Leave at auto (routes by query shape: quoted phrases, prefix* wildcards and very short queries favour keyword relevance; long or question-shaped queries favour semantic similarity) unless deliberately A/B testing a pinned preset." }
                                     },
                                     "required": ["query"]
@@ -1024,7 +1024,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_decompose",
-                                "description": "remind-me pipeline: break a captured conversation into individually searchable atomic facts, each linked to the capture. Write 2-5 per conversation, each self-contained for a reader with no other context: who, what, when and why, with relative dates resolved to absolute ones (2026-10-03, not 'last Friday'). Set metadata.basis: stated if someone said it, inferred if you concluded it (list the memory ids it rests on in metadata.premises). A fact whose subject/predicate match an existing fact but whose object differs supersedes it.",
+                                "description": "remind-me pipeline: break a captured conversation into individually searchable atomic facts, each linked to the capture. Write 2-5 per conversation, each self-contained for a reader with no other context: who, what, when and why, with relative dates resolved to absolute ones (2026-10-03, not 'last Friday'). Set metadata.basis: stated if someone said it, inferred if you concluded it (list the memory ids it rests on in metadata.premises). Set metadata.occurred_at (RFC 3339, or {from, to}) when the fact's event happened at another time than now. A fact whose subject/predicate match an existing fact but whose object differs supersedes it.",
                                 "inputSchema": decompose_input_schema()
                             },
                             {
@@ -1050,7 +1050,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_auto_capture",
-                                "description": "Save a whole conversation to remind-me as two linked memories, the verbatim dialog and a concise summary; call this at the end of any substantive conversation. Write the summary to stand alone: who decided or learned what, when (absolute dates, never 'today' or 'yesterday') and why. They share a capture_id, which remind_me_get retrieves both by and remind_me_decompose breaks into atomic facts.",
+                                "description": "Save a whole conversation to remind-me as two linked memories, the verbatim dialog and a concise summary; call this at the end of any substantive conversation. Write the summary to stand alone: who decided or learned what, when (absolute dates, never 'today' or 'yesterday') and why. They share a capture_id, which remind_me_get retrieves both by and remind_me_decompose breaks into atomic facts. When the conversation is about an event at another time than now, set metadata.occurred_at (RFC 3339, or {from, to}), resolving relative dates to absolute ones.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {

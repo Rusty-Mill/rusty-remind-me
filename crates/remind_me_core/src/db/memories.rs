@@ -1044,6 +1044,71 @@ pub mod conformance {
         assert_eq!(edited.capture_method, "manual");
         assert_eq!(edited.session_id, None);
     }
+
+    /// A window over `occurred` reads `metadata.occurred_at`, else
+    /// `created_at`: an instant inside it and a span overlapping it are
+    /// admitted, newest first on the instant or the span's `to`; a malformed
+    /// stored value reads as absent (card #62).
+    pub fn window_hits_read_occurred_at<S: MemoryStore>(store: &mut S) {
+        use crate::date_phrase::Span;
+        use crate::time_window::{parse_rfc3339, TimeField, TimeWindow};
+        let with = |id: &str, created: &str, metadata: Value| NewMemory {
+            metadata,
+            ..NewMemory::new(id, id, created)
+        };
+        for row in [
+            with(
+                "point",
+                NOW,
+                serde_json::json!({ "occurred_at": "2026-09-03T00:00:00Z" }),
+            ),
+            with(
+                "span",
+                NOW,
+                serde_json::json!({ "occurred_at": {
+                    "from": "2026-08-28T00:00:00Z", "to": "2026-09-02T00:00:00Z"
+                } }),
+            ),
+            with("plain", "2026-09-04T00:00:00+00:00", serde_json::json!({})),
+            with(
+                "mention",
+                "2026-09-05T00:00:00+00:00",
+                serde_json::json!({ "note": "occurred_at" }),
+            ),
+            with(
+                "bad",
+                NOW,
+                serde_json::json!({ "occurred_at": "last week" }),
+            ),
+            with(
+                "before",
+                NOW,
+                serde_json::json!({ "occurred_at": {
+                    "from": "2026-08-01T00:00:00Z", "to": "2026-09-01T00:00:00Z"
+                } }),
+            ),
+        ] {
+            store.insert(&row).unwrap();
+        }
+        let ids = |field: TimeField| -> Vec<String> {
+            let span = Span {
+                start: parse_rfc3339("2026-09-01T00:00:00Z").unwrap(),
+                end: parse_rfc3339("2026-09-10T00:00:00Z"),
+            };
+            let filter = super::KeywordFilter {
+                window: TimeWindow::from_span(field, span),
+                ..Default::default()
+            };
+            let hits = store.window_hits(&filter).unwrap();
+            hits.into_iter().map(|m| m.id).collect()
+        };
+        // `before` ends exactly at `since`: a half-open span does not reach it.
+        assert_eq!(
+            ids(TimeField::Occurred),
+            ["mention", "plain", "point", "span"]
+        );
+        assert_eq!(ids(TimeField::Created), ["mention", "plain"]);
+    }
 }
 
 /// One `#[test]` per [`conformance`] check, each on a fresh store from
@@ -1069,6 +1134,10 @@ macro_rules! memory_conformance {
         #[test]
         fn every_v32_column_reads_back_as_written() {
             conformance::every_v32_column_reads_back_as_written(&mut $make);
+        }
+        #[test]
+        fn window_hits_read_occurred_at() {
+            conformance::window_hits_read_occurred_at(&mut $make);
         }
     };
 }

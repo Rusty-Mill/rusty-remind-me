@@ -7,6 +7,7 @@
 //! thing when it arrives.
 
 use crate::date_phrase::{self, Span};
+use crate::kinds::OccurredAt;
 use chrono::{DateTime, TimeDelta, Utc};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
@@ -15,9 +16,14 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TimeField {
+    /// When the memory was recorded.
     #[default]
     Created,
+    /// When the memory was last edited.
     Updated,
+    /// When its event happened: `metadata.occurred_at` (an instant or a
+    /// span; see [`OccurredAt`]), else `created_at` (card #62).
+    Occurred,
 }
 
 /// A half-open `[since, until)` window over one timestamp.
@@ -123,28 +129,58 @@ impl TimeWindow {
         self.since.is_none() && self.until.is_none()
     }
 
-    /// Whether a memory with these timestamps falls inside. A bounded window
-    /// cannot place an unparseable timestamp, so it excludes it.
-    pub fn contains(&self, created_at: &str, updated_at: &str) -> bool {
+    /// Whether a memory with these timestamps falls inside: an instant inside
+    /// `[since, until)`, or a span that overlaps it. `occurred` gives the
+    /// memory's `metadata.occurred_at` and is called only for
+    /// [`TimeField::Occurred`]. A bounded window cannot place an unparseable
+    /// timestamp, so it excludes it.
+    pub fn contains(
+        &self,
+        created_at: &str,
+        updated_at: &str,
+        occurred: impl FnOnce() -> Option<OccurredAt>,
+    ) -> bool {
         if self.is_unbounded() {
             return true;
         }
-        let Some(at) = parse_rfc3339(self.pick(created_at, updated_at)) else {
-            return false;
-        };
-        self.since.is_none_or(|s| at >= s) && self.until.is_none_or(|u| at < u)
+        let after_since = |at: DateTime<Utc>| self.since.is_none_or(|s| at > s);
+        let before_until = |at: DateTime<Utc>| self.until.is_none_or(|u| at < u);
+        match self.place(created_at, updated_at, occurred) {
+            None => false,
+            Some(OccurredAt::At(at)) => self.since.is_none_or(|s| at >= s) && before_until(at),
+            Some(OccurredAt::Span { from, to }) => before_until(from) && after_since(to),
+        }
     }
 
     /// [`Self::contains`] over a [`crate::models::Memory`].
     pub fn contains_memory(&self, m: &crate::models::Memory) -> bool {
-        self.contains(&m.created_at, &m.updated_at)
+        self.contains(&m.created_at, &m.updated_at, || OccurredAt::of(&m.metadata))
     }
 
-    /// The timestamp this window reads, of the two given.
-    pub(crate) fn pick<'a>(&self, created_at: &'a str, updated_at: &'a str) -> &'a str {
+    /// The instant this window orders a memory by, newest first: the
+    /// timestamp it reads, or a span's `to`. `None` when unparseable.
+    pub(crate) fn sort_key(
+        &self,
+        created_at: &str,
+        updated_at: &str,
+        occurred: impl FnOnce() -> Option<OccurredAt>,
+    ) -> Option<DateTime<Utc>> {
+        self.place(created_at, updated_at, occurred)
+            .map(OccurredAt::latest)
+    }
+
+    /// Where this window's field puts a memory on the timeline.
+    fn place(
+        &self,
+        created_at: &str,
+        updated_at: &str,
+        occurred: impl FnOnce() -> Option<OccurredAt>,
+    ) -> Option<OccurredAt> {
+        let at = |ts: &str| parse_rfc3339(ts).map(OccurredAt::At);
         match self.field {
-            TimeField::Created => created_at,
-            TimeField::Updated => updated_at,
+            TimeField::Created => at(created_at),
+            TimeField::Updated => at(updated_at),
+            TimeField::Occurred => occurred().or_else(|| at(created_at)),
         }
     }
 }
@@ -297,7 +333,7 @@ mod tests {
             now(),
         )
         .unwrap();
-        let has = |ts: &str| w.contains(ts, "");
+        let has = |ts: &str| w.contains(ts, "", || None);
         assert!(has("2026-10-25T00:00:00Z"), "since is inclusive");
         assert!(has("2026-10-25T23:59:59.999Z"));
         assert!(!has("2026-10-26T00:00:00Z"), "until is exclusive");
@@ -312,13 +348,103 @@ mod tests {
         let w = TimeWindow::resolve(&r, now()).unwrap();
         let old = "2026-01-01T00:00:00Z";
         let new = "2026-10-26T11:00:00Z";
-        assert!(w.contains(old, new));
-        assert!(!w.contains(new, old));
+        assert!(w.contains(old, new, || None));
+        assert!(!w.contains(new, old, || None));
+    }
+
+    #[test]
+    fn occurred_reads_occurred_at_else_created_at() {
+        let mut r = raw(Some("2026-10-01T00:00:00Z"), Some("2026-10-08T00:00:00Z"));
+        r.time_field = TimeField::Occurred;
+        let w = in_utc(&r).unwrap();
+        let point = |ts: &str| Some(OccurredAt::At(at(ts).unwrap()));
+        let written = "2026-10-20T00:00:00Z";
+        assert!(w.contains(written, written, || point("2026-10-03T00:00:00Z")));
+        assert!(!w.contains(written, written, || point("2026-10-08T00:00:00Z")));
+        // No occurred_at: created_at decides.
+        assert!(w.contains("2026-10-02T00:00:00Z", written, || None));
+        assert!(!w.contains(written, "2026-10-02T00:00:00Z", || None));
+        assert_eq!(
+            w.sort_key(written, written, || point("2026-10-03T00:00:00Z")),
+            at("2026-10-03T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn a_span_is_inside_when_it_overlaps_the_window() {
+        let mut r = raw(Some("2026-10-01T00:00:00Z"), Some("2026-10-08T00:00:00Z"));
+        r.time_field = TimeField::Occurred;
+        let w = in_utc(&r).unwrap();
+        let written = "2026-10-20T00:00:00Z";
+        let overlaps = |from: &str, to: &str| {
+            let span = OccurredAt::Span {
+                from: at(from).unwrap(),
+                to: at(to).unwrap(),
+            };
+            w.contains(written, written, || Some(span))
+        };
+        assert!(
+            overlaps("2026-09-28T00:00:00Z", "2026-10-02T00:00:00Z"),
+            "across since"
+        );
+        assert!(
+            overlaps("2026-10-07T00:00:00Z", "2026-10-12T00:00:00Z"),
+            "across until"
+        );
+        assert!(
+            overlaps("2026-10-02T00:00:00Z", "2026-10-03T00:00:00Z"),
+            "inside"
+        );
+        assert!(
+            overlaps("2026-09-01T00:00:00Z", "2026-11-01T00:00:00Z"),
+            "around"
+        );
+        assert!(
+            !overlaps("2026-09-01T00:00:00Z", "2026-10-01T00:00:00Z"),
+            "ends at since"
+        );
+        assert!(
+            !overlaps("2026-10-08T00:00:00Z", "2026-10-09T00:00:00Z"),
+            "starts at until"
+        );
+        let span = OccurredAt::Span {
+            from: at("2026-09-28T00:00:00Z").unwrap(),
+            to: at("2026-10-02T00:00:00Z").unwrap(),
+        };
+        assert_eq!(
+            w.sort_key(written, written, || Some(span)),
+            at("2026-10-02T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn created_and_updated_never_read_occurred_at() {
+        let w = in_utc(&raw(Some("2026-10-01T00:00:00Z"), None)).unwrap();
+        let called = std::cell::Cell::new(false);
+        assert!(w.contains("2026-10-20T00:00:00Z", "", || {
+            called.set(true);
+            None
+        }));
+        assert!(!called.get());
+    }
+
+    #[test]
+    fn time_field_occurred_parses() {
+        let w: TimeWindow =
+            serde_json::from_value(serde_json::json!({ "since": "2d", "time_field": "occurred" }))
+                .unwrap();
+        assert_eq!(w.field(), TimeField::Occurred);
+        let back = serde_json::to_value(w).unwrap();
+        assert_eq!(back["time_field"], "occurred");
+        assert!(serde_json::from_value::<TimeWindow>(
+            serde_json::json!({ "time_field": "happened" })
+        )
+        .is_err());
     }
 
     #[test]
     fn unbounded_admits_everything() {
-        assert!(TimeWindow::default().contains("garbage", "garbage"));
+        assert!(TimeWindow::default().contains("garbage", "garbage", || None));
     }
 
     #[test]

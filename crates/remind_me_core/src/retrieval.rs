@@ -317,14 +317,21 @@ fn minmax_normalize(raw: &HashMap<String, f64>, invert: bool) -> HashMap<String,
         .collect()
 }
 
-/// Parse `created_at` into a Unix timestamp for score-mode recency
+/// The instant the recency signal reads for `m`: when its event happened
+/// (`metadata.occurred_at`, a span's `to`), else `created_at` (card #62).
+/// `None` when neither parses. Vitality decay stays on `created_at`.
+fn recency_instant(m: &Memory) -> Option<chrono::DateTime<chrono::Utc>> {
+    crate::kinds::OccurredAt::of(&m.metadata)
+        .map(crate::kinds::OccurredAt::latest)
+        .or_else(|| crate::time_window::parse_rfc3339(&m.created_at))
+}
+
+/// [`recency_instant`] as a Unix timestamp for score-mode recency
 /// normalization. A missing or unparseable value is treated as the epoch
 /// (the oldest possible value) — matching the reference, which does the same
 /// on a `ValueError`/`TypeError` from `datetime.fromisoformat`.
-fn recency_epoch(created_at: &str) -> f64 {
-    chrono::DateTime::parse_from_rfc3339(created_at)
-        .map(|dt| dt.timestamp() as f64)
-        .unwrap_or(0.0)
+fn recency_epoch(instant: Option<chrono::DateTime<chrono::Utc>>) -> f64 {
+    instant.map_or(0.0, |dt| dt.timestamp() as f64)
 }
 
 /// Fuse a keyword-ranked list and a semantic-ranked list via [`RrfConfig::fusion`].
@@ -336,14 +343,15 @@ fn recency_epoch(created_at: &str) -> f64 {
 ///   rank)`, where `rank` is that memory's 1-indexed position once the
 ///   candidate pool is ordered by the signal (keyword/semantic use the
 ///   caller-supplied list order directly; recency/vitality/IDF are ranked by
-///   sorting the deduplicated union by `created_at` descending, `vitality`
+///   sorting the deduplicated union by when each memory's event happened
+///   (`metadata.occurred_at`, else `created_at`) descending, `vitality`
 ///   descending, and `bm25` ascending respectively). A memory missing from
 ///   the keyword or semantic list gets a *penalty rank* one past that list's
 ///   length — the same treatment recency/vitality/IDF give a memory with no
 ///   signal at all (e.g. no `created_at`), and consistent with the
 ///   reference's own reciprocal-rank-fusion.
 /// - [`RrfFusion::Score`] (issue #49 in the reference): min-max normalizes
-///   the real underlying magnitudes (`RrfSignals`, `created_at`, `vitality`)
+///   the real underlying magnitudes (`RrfSignals`, the recency instant, `vitality`)
 ///   into `[0, 1]` and sums `weight * normalized_score`. A memory missing a
 ///   signal gets 0.0 for it — the worst possible score, mirroring rank
 ///   mode's penalty-rank treatment. `w_idf` reuses the keyword signal's
@@ -398,12 +406,16 @@ pub fn rank_rrf(
         return Vec::new();
     }
 
-    // Recency ranking: sort all unique memories by created_at DESC. String
-    // comparison, not a parsed timestamp — matching the reference, and
-    // correct as long as `created_at` is a consistently-formatted ISO 8601
-    // string, which it always is here.
+    // Recency ranking: sort all unique memories by `recency_instant` DESC,
+    // read once per memory. Parsed rather than compared as strings, since
+    // `occurred_at` may carry any offset; an unparseable instant sorts last,
+    // and the stable sort keeps ties in union order.
+    let instants: HashMap<&str, Option<chrono::DateTime<chrono::Utc>>> = union
+        .iter()
+        .map(|m| (m.id.as_str(), recency_instant(m)))
+        .collect();
     let mut by_recency: Vec<&Memory> = union.iter().collect();
-    by_recency.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    by_recency.sort_by(|a, b| instants[b.id.as_str()].cmp(&instants[a.id.as_str()]));
     let recency_rank: HashMap<String, usize> = by_recency
         .iter()
         .enumerate()
@@ -452,7 +464,7 @@ pub fn rank_rrf(
         if config.fusion == RrfFusion::Score {
             let recency_raw: HashMap<String, f64> = union
                 .iter()
-                .map(|m| (m.id.clone(), recency_epoch(&m.created_at)))
+                .map(|m| (m.id.clone(), recency_epoch(instants[m.id.as_str()])))
                 .collect();
             let vitality_raw: HashMap<String, f64> =
                 union.iter().map(|m| (m.id.clone(), m.vitality)).collect();
@@ -1298,6 +1310,59 @@ mod tests {
         );
 
         assert_eq!(ranked[0].memory.id, "vital");
+    }
+
+    fn recorded(id: &str, created_at: &str, metadata: serde_json::Value) -> Memory {
+        Memory {
+            created_at: created_at.to_string(),
+            metadata,
+            ..mem(id, 0.0)
+        }
+    }
+
+    const RECENCY_ONLY: RrfWeights = RrfWeights {
+        w_keyword: 0.0,
+        w_semantic: 0.0,
+        w_recency: 1.0,
+        w_vitality: 0.0,
+        w_idf: 0.0,
+    };
+
+    #[test]
+    fn recency_reads_when_the_event_happened() {
+        // Written today about October 3rd, against one written and done on
+        // October 10th: the later event is the more recent (card #62).
+        let backfilled = recorded(
+            "backfilled",
+            "2026-10-20T00:00:00+00:00",
+            serde_json::json!({ "occurred_at": "2026-10-03T00:00:00Z" }),
+        );
+        let fresh = recorded("fresh", "2026-10-10T00:00:00+00:00", serde_json::json!({}));
+        let span = recorded(
+            "span",
+            "2026-10-20T00:00:00+00:00",
+            serde_json::json!({ "occurred_at": {
+                "from": "2026-10-01T00:00:00Z", "to": "2026-10-05T00:00:00Z"
+            } }),
+        );
+        let bad = recorded(
+            "bad",
+            "2026-10-15T00:00:00+00:00",
+            serde_json::json!({ "occurred_at": "last week" }),
+        );
+        let pool = vec![backfilled, fresh, span, bad];
+        for fusion in [RrfFusion::Rank, RrfFusion::Score] {
+            let config = RrfConfig {
+                k: RRF_K_DEFAULT,
+                weights: RECENCY_ONLY,
+                fusion,
+            };
+            let ranked = rank_rrf(pool.clone(), vec![], config, &RrfSignals::default());
+            let ids: Vec<&str> = ranked.iter().map(|r| r.memory.id.as_str()).collect();
+            // A malformed value reads as absent, so `bad` ranks on created_at;
+            // a span ranks on its `to`.
+            assert_eq!(ids, ["bad", "fresh", "span", "backfilled"], "{fusion:?}");
+        }
     }
 
     #[test]

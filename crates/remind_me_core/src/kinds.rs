@@ -7,7 +7,7 @@
 //! store access, so every rule is unit-tested here.
 
 use crate::db::StoreError;
-use chrono::DateTime;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
@@ -343,6 +343,84 @@ fn validate_review(review: Option<&Value>) -> Result<(), KindError> {
     }
     field("note", "review.note")?;
     Ok(())
+}
+
+/// When the event a memory records happened (`metadata.occurred_at`, card
+/// #62, pack D85 and D90): "we shipped X on Oct 3" written on Oct 20 occurred
+/// on Oct 3. It never replaces the record time, `created_at`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OccurredAt {
+    /// One instant.
+    At(DateTime<Utc>),
+    /// A span, `from < to`.
+    Span {
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    },
+}
+
+impl OccurredAt {
+    /// The value `metadata` holds, or `None` when it holds none or a
+    /// malformed one: a stored row is never revalidated, so a bad value reads
+    /// as absent.
+    pub fn of(metadata: &Value) -> Option<Self> {
+        Self::parse(metadata.get("occurred_at")).ok().flatten()
+    }
+
+    /// [`Self::of`] over a row's metadata as stored JSON text, parsed only
+    /// when the text mentions the key, so a scan over every row pays for the
+    /// rows that carry one.
+    pub fn of_json(metadata: &str) -> Option<Self> {
+        if !metadata.contains("occurred_at") {
+            return None;
+        }
+        let value: Value = serde_json::from_str(metadata).ok()?;
+        Self::of(&value)
+    }
+
+    /// The latest instant it covers: the point, or a span's `to`.
+    pub fn latest(self) -> DateTime<Utc> {
+        match self {
+            Self::At(at) => at,
+            Self::Span { to, .. } => to,
+        }
+    }
+
+    /// Parse a `metadata.occurred_at` value; `None` when absent or null.
+    fn parse(value: Option<&Value>) -> Result<Option<Self>, KindError> {
+        const K: &str = "memory";
+        const SHAPE: &str = "must be an RFC 3339 timestamp or {from, to}";
+        let instant = |field: &'static str, value: Option<&Value>| {
+            value
+                .and_then(Value::as_str)
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|t| t.with_timezone(&Utc))
+                .ok_or_else(|| bad(K, field, "must be an RFC 3339 timestamp"))
+        };
+        match value {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(_)) => instant("occurred_at", value)
+                .map(|at| Some(Self::At(at)))
+                .map_err(|_| bad(K, "occurred_at", SHAPE)),
+            Some(span @ Value::Object(_)) => {
+                let from = instant("occurred_at.from", span.get("from"))?;
+                let to = instant("occurred_at.to", span.get("to"))?;
+                if from >= to {
+                    return Err(bad(K, "occurred_at.to", "must be after occurred_at.from"));
+                }
+                Ok(Some(Self::Span { from, to }))
+            }
+            Some(_) => Err(bad(K, "occurred_at", SHAPE)),
+        }
+    }
+}
+
+/// Check `metadata.occurred_at`, on any kind: absent, null, an RFC 3339
+/// timestamp, or `{from, to}` with both RFC 3339 and `from < to`. Called on
+/// the metadata a write supplies (add, update, decompose, auto_capture), never
+/// on a stored row.
+pub fn validate_occurred_at(metadata: &Value) -> Result<(), KindError> {
+    OccurredAt::parse(metadata.get("occurred_at")).map(|_| ())
 }
 
 fn validate_action_item(meta: &Value) -> Result<(), KindError> {
@@ -754,5 +832,100 @@ mod tests {
         assert!(f.validate(&json!({}), None).is_err());
         let f = fields(json!({"memory_type": "bogus"}));
         assert!(f.validate(&json!({}), None).is_err());
+    }
+
+    #[test]
+    fn occurred_at_takes_an_instant_or_a_span() {
+        for meta in [
+            json!({}),
+            json!({ "occurred_at": null }),
+            json!({ "occurred_at": "2026-10-03T00:00:00Z" }),
+            json!({ "occurred_at": "2026-10-03T09:30:00+02:00" }),
+            json!({ "occurred_at": {
+                "from": "2026-10-01T00:00:00Z", "to": "2026-10-03T00:00:00Z"
+            } }),
+        ] {
+            assert!(validate_occurred_at(&meta).is_ok(), "{meta}");
+        }
+        let at = |ts: &str| {
+            DateTime::parse_from_rfc3339(ts)
+                .unwrap()
+                .with_timezone(&Utc)
+        };
+        assert_eq!(
+            OccurredAt::of(&json!({ "occurred_at": "2026-10-03T09:30:00+02:00" })),
+            Some(OccurredAt::At(at("2026-10-03T07:30:00Z")))
+        );
+        let span = OccurredAt::of(&json!({ "occurred_at": {
+            "from": "2026-10-01T00:00:00Z", "to": "2026-10-03T00:00:00Z"
+        } }))
+        .unwrap();
+        assert_eq!(span.latest(), at("2026-10-03T00:00:00Z"));
+    }
+
+    #[test]
+    fn a_malformed_occurred_at_is_refused_naming_the_key() {
+        for (meta, field, says) in [
+            (
+                json!({ "occurred_at": "last week" }),
+                "`occurred_at`",
+                "RFC 3339",
+            ),
+            (
+                json!({ "occurred_at": "2026-10-03" }),
+                "`occurred_at`",
+                "RFC 3339",
+            ),
+            (
+                json!({ "occurred_at": 1_759_449_600 }),
+                "`occurred_at`",
+                "{from, to}",
+            ),
+            (
+                json!({ "occurred_at": ["2026-10-03T00:00:00Z"] }),
+                "`occurred_at`",
+                "{from, to}",
+            ),
+            (
+                json!({ "occurred_at": { "to": "2026-10-03T00:00:00Z" } }),
+                "`occurred_at.from`",
+                "RFC 3339",
+            ),
+            (
+                json!({ "occurred_at": { "from": "2026-10-03T00:00:00Z", "to": "soon" } }),
+                "`occurred_at.to`",
+                "RFC 3339",
+            ),
+            (
+                json!({ "occurred_at": {
+                    "from": "2026-10-03T00:00:00Z", "to": "2026-10-03T00:00:00Z"
+                } }),
+                "`occurred_at.to`",
+                "after occurred_at.from",
+            ),
+            (
+                json!({ "occurred_at": {
+                    "from": "2026-10-04T00:00:00Z", "to": "2026-10-03T00:00:00Z"
+                } }),
+                "`occurred_at.to`",
+                "after occurred_at.from",
+            ),
+        ] {
+            let e = validate_occurred_at(&meta).unwrap_err().to_string();
+            assert!(e.contains(field) && e.contains(says), "{meta}: {e}");
+            assert_eq!(
+                OccurredAt::of(&meta),
+                None,
+                "a stored {meta} reads as absent"
+            );
+        }
+    }
+
+    #[test]
+    fn occurred_at_in_stored_text_is_parsed_only_when_named() {
+        assert_eq!(OccurredAt::of_json("{}"), None);
+        assert_eq!(OccurredAt::of_json("not json"), None);
+        assert_eq!(OccurredAt::of_json(r#"{"note":"occurred_at"}"#), None);
+        assert!(OccurredAt::of_json(r#"{"occurred_at":"2026-10-03T00:00:00Z"}"#).is_some());
     }
 }

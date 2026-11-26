@@ -190,6 +190,9 @@ pub fn auto_capture_stamped(
     input: &AutoCaptureInput,
     stamp: &CaptureStamp,
 ) -> Result<CaptureResult> {
+    // Both halves carry the caller's metadata, so a bad `occurred_at` is
+    // refused before either is written.
+    crate::kinds::validate_occurred_at(&input.metadata)?;
     // The caller's explicit project wins over the hook's and the detected.
     let mut stamp = stamp.clone();
     if let Some(project) = crate::context::explicit_project(input.project.as_deref())? {

@@ -94,6 +94,7 @@ impl PreparedAdd {
         input.metadata =
             crate::consolidation::keep_evidence(std::mem::take(&mut input.metadata), None);
         fields.validate(&input.metadata, None)?;
+        crate::kinds::validate_occurred_at(&input.metadata)?;
         crate::project::refuse_reserved_predicate(input.predicate.as_deref())?;
         crate::topic::refuse_topic_entities(&input.entities)?;
         let project = crate::context::explicit_project(input.project.as_deref())?;
@@ -314,6 +315,11 @@ pub fn update_memory_with(
         .map(|m| crate::consolidation::keep_evidence(m, Some(&stored.metadata)));
     let metadata = client_metadata.as_ref().unwrap_or(&stored.metadata);
     fields.validate(metadata, stored.memory_type.as_deref())?;
+    // Only metadata this edit supplies: a stored value is never revalidated,
+    // so an edit that leaves metadata alone cannot fail on it (pack D85).
+    if let Some(supplied) = &client_metadata {
+        crate::kinds::validate_occurred_at(supplied)?;
+    }
     // Becoming a decision schedules its follow-up; staying one does not.
     let scheduled = if stored.memory_type.as_deref() == Some("decision") {
         None

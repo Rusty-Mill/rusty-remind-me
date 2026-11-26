@@ -38,8 +38,11 @@
 //! placed mid-way through that window at load time, so a calendar phrase finds
 //! the same rows whatever weekday the test runs on. A row is last
 //! read at load time unless it sets `accessed_days`; the few that do are
-//! dormant, and the `dormant` queries check that no stage surfaces them. The env-reading
-//! parts keep this file its own test binary.
+//! dormant, and the `dormant` queries check that no stage surfaces them. A row
+//! may also say when its event happened (`occurred`: days back, a `during`
+//! phrase, or a `span_days` span), stored as `metadata.occurred_at` (card
+//! #62); the `occurred` queries check that recency and an inferred window
+//! read it. The env-reading parts keep this file its own test binary.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -283,6 +286,19 @@ fn validate_refuses_a_golden_set_that_cannot_hold() {
     }))
     .unwrap()];
     assert!(validate(&both, &[golden(&["a"], &[])]).is_err());
+    let occurred = |o: serde_json::Value| -> Vec<FixtureMemory> {
+        vec![serde_json::from_value(serde_json::json!({
+            "id": "a", "content": "x", "category": "general", "memory_type": "fact",
+            "project": null, "occurred": o
+        }))
+        .unwrap()]
+    };
+    let check = |o: serde_json::Value| validate(&occurred(o), &[golden(&["a"], &[])]);
+    assert!(check(serde_json::json!({ "days": 3 })).is_ok());
+    assert!(check(serde_json::json!({ "span_days": [9, 3] })).is_ok());
+    assert!(check(serde_json::json!({})).is_err());
+    assert!(check(serde_json::json!({ "days": 3, "during": "last week" })).is_err());
+    assert!(check(serde_json::json!({ "span_days": [3, 9] })).is_err());
 }
 
 #[test]
