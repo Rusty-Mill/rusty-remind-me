@@ -57,7 +57,30 @@ fn make_id(name: &str) -> String {
 /// name is how a caller changes a saved search's query, filters or watch flag.
 /// The same "one name is one logical thing" convention `remind_me_wiki_write`
 /// already uses for pages, and what the table's `UNIQUE` on `name` implies.
+///
+/// The read of the existing row and the write are one transaction, so a
+/// pin or answer recorded meanwhile is never discarded.
 pub fn save_search(store: &Store<'_>, input: &SaveSearchInput) -> Result<SavedSearch> {
+    save_search_pausing(store, input, &|| {})
+}
+
+/// [`save_search`], calling `after_read` between reading the existing row
+/// and writing: where a concurrent writer would otherwise slip in. For
+/// tests that put one there.
+#[doc(hidden)]
+pub fn save_search_pausing(
+    store: &Store<'_>,
+    input: &SaveSearchInput,
+    after_read: &dyn Fn(),
+) -> Result<SavedSearch> {
+    store.atomically(|store| save_in(store, input, after_read))
+}
+
+fn save_in(
+    store: &Store<'_>,
+    input: &SaveSearchInput,
+    after_read: &dyn Fn(),
+) -> Result<SavedSearch> {
     let repo = SavedSearches::new(store);
     let now = Utc::now().to_rfc3339();
     let existing = repo.id_for_name(&input.name)?;
@@ -67,6 +90,7 @@ pub fn save_search(store: &Store<'_>, input: &SaveSearchInput) -> Result<SavedSe
         Some(id) => repo.get(id)?.filters.pin,
         None => None,
     };
+    after_read();
     let saved = SavedSearch {
         id: existing.clone().unwrap_or_else(|| make_id(&input.name)),
         name: input.name.clone(),
@@ -211,6 +235,10 @@ pub fn poll_watched_searches(store: &Store<'_>) -> Result<Vec<(String, PollOutco
 /// Mark the saved search `name` as a pinned question. `None` if no saved
 /// search has that name. Pinning an already pinned search keeps its answer.
 pub fn pin_saved_search(store: &Store<'_>, name: &str) -> Result<Option<SavedSearch>> {
+    store.atomically(|store| pin_in(store, name))
+}
+
+fn pin_in(store: &Store<'_>, name: &str) -> Result<Option<SavedSearch>> {
     let repo = SavedSearches::new(store);
     let Some(mut saved) = repo.get_by_name(name)? else {
         return Ok(None);
@@ -238,7 +266,29 @@ pub fn pin_saved_search(store: &Store<'_>, name: &str) -> Result<Option<SavedSea
 /// [`StoreError::Invalid`] when the saved search or the page does not
 /// exist, no or too many ids are given, an id is not a live memory, or
 /// `as_of` is not RFC 3339 or predates the saved search's last change.
+///
+/// The read, checks and write are one transaction, so the answer never
+/// restores a query, filters or watch flag saved meanwhile.
 pub fn answer_pinned(store: &Store<'_>, input: &AnswerPinnedInput) -> Result<SavedSearch> {
+    answer_pinned_pausing(store, input, &|| {})
+}
+
+/// [`answer_pinned`], calling `after_read` between its checks and its
+/// write. For tests that put a concurrent writer there.
+#[doc(hidden)]
+pub fn answer_pinned_pausing(
+    store: &Store<'_>,
+    input: &AnswerPinnedInput,
+    after_read: &dyn Fn(),
+) -> Result<SavedSearch> {
+    store.atomically(|store| answer_in(store, input, after_read))
+}
+
+fn answer_in(
+    store: &Store<'_>,
+    input: &AnswerPinnedInput,
+    after_read: &dyn Fn(),
+) -> Result<SavedSearch> {
     let repo = SavedSearches::new(store);
     let Some(mut saved) = repo.get_by_name(&input.name)? else {
         return Err(invalid(format!(
@@ -268,6 +318,7 @@ pub fn answer_pinned(store: &Store<'_>, input: &AnswerPinnedInput) -> Result<Sav
         None => now,
         Some(raw) => read_time(&saved, raw)?.min(now),
     };
+    after_read();
 
     saved.filters.pin = Some(PinnedAnswer {
         answer_slug: Some(input.answer_slug.clone()),
