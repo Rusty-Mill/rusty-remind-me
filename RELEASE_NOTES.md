@@ -2,6 +2,14 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-26 — Entity overlap ranking signal measured and dropped (Mill Board #64, D92)
+
+### Added
+- `docs/research/64-entity-signal-spike.md`: the spike write-up. On the #59 fixture the signal passed D92, but only on a synthetic entity set written for the spike. On the #1563 real-query set, its best weight (0.5) lifted entity-query MRR by 0.002 and lowered recall@10 by 0.018, short of the 0.02 bar, so the verdict is drop. Aggregates only; the query set stays off-repo.
+
+### Not merged
+- The signal itself (`REMIND_ME_RRF_W_ENTITY`, `entity::resolve_query_entities`) and its runners stay on branch `claude/project-thread-q37cqo-64`. No code, config or ranking change ships.
+
 ## 2026-11-26 — Event time separate from record time (Mill Board #62, D86, D91)
 
 ### Added
