@@ -29,7 +29,13 @@ How to back up the remind-me store and how to restore it. The drill steps below 
 
 ## Drill: restore into a scratch copy
 
-This never touches the live store or the services.
+The drill compares a snapshot: it restores a backup into a scratch folder and checks the copy against the live store. It does **not** rehearse a full service restore. The units keep running on the live store throughout, and the steps under "Restore the live store" are not exercised.
+
+Only the restore and the scratch daemon are isolated from the live store. Two steps do touch it:
+- **The backup (step 2) reads the live engine and holds its tables while it copies.** It also **prunes the oldest backup** beyond the newest 10. The 2026-11-26 run deleted `manual-20261102T232736735607Z.engine`.
+- **The live export (step 3) reads the live store** through the running daemon.
+
+**Before you start,** copy any backup in `backups/` that you need to keep somewhere outside that folder.
 
 1. Make a folder: `D=~/restore-drill/$(date -u +%Y%m%dT%H%M%SZ); mkdir -p "$D/store"`.
 2. With the node env sourced, run `rusty-remind-me admin backup`. Record the path and the time.
@@ -37,7 +43,7 @@ This never touches the live store or the services.
 4. Copy the backup: `cp -a <backup>.engine "$D/store/memory.engine"`.
 5. In a fresh shell without the node env, set `REMIND_ME_DB_PATH="$D/store/memory.db"`. Run `rusty-remind-me daemon start` for that path, then `rusty-remind-me impact-export > "$D/restored.json"`, then stop that daemon. Its `.daemon.json` sits under `$D/store/`, apart from the live one.
 6. Compare the `records` arrays of the two exports. Check totals; counts by category, `memory_type` and project; and, per id, the content sha256, category, type, project, `deleted_at` and `superseded_by`. Ignore vitality and access fields. A record created or updated after the backup time is drift, not a failure.
-7. Pass means every non-drift id matches, the counts agree, and the live units still have the same PIDs.
+7. Pass means every non-drift id matches, the counts agree, and the live units still have the same PIDs. Those PIDs show that the services kept running; they don't show that a full service restore works.
 
 The export doesn't include revision history, so revisions are checked only as files: the copy is byte-identical to the backup.
 
