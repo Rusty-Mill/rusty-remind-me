@@ -5,12 +5,26 @@ Dated entries, newest first. One entry per merged pull request.
 ## 2026-11-26 — 0.5.0: release
 
 ### Changed
-- All five workspace crates and the plugin manifest are now 0.5.0. Merging this publishes the `v0.5.0` GitHub Release (release.yml). It collects the 65 pull requests merged since 0.4.2 (#361 to #427, the entries below); this change adds no code.
+- All five workspace crates and the plugin manifest are now 0.5.0. Merging this publishes the `v0.5.0` GitHub Release (release.yml). It collects the 66 pull requests merged since 0.4.2 (#361 to #428, the entries below); this change adds no code.
 - Minor, not patch, because 0.4.2's surface changed: multi-node sync and the hub are removed (#372), the default MCP tool profile is `core` with admin tools moved to the CLI (ADR-0030 step 2), and `MemoryListInput::default()` lists 20 rows with `limit: 0` an error (#223).
 - Upgrading from 0.4.2: the store moves to schema v33 (#367), which is one-way; keep a backup to roll back to a 0.4.2 binary.
-- Highlights: the storage port (ADR-0035) with a SQLite backend and the R3 store benchmark; the append-only dialog store with opt-in shadow writes of captured dialogs (`REMIND_ME_DIALOG_SHADOW=1`, off by default; #528); dialog rows protected in place (#1616); decisions-log export, normalise, and `decisions import --apply` (#1564, #1565); atomic updates and deletes (D62); duplicate warnings on save; search says how it ran; decisions and preferences never go dormant; the wiki compiles with a local model.
-- Not included, still open: #428 (`decisions normalize --fold`).
+- Highlights: the storage port (ADR-0035) with a SQLite backend and the R3 store benchmark; the append-only dialog store with opt-in shadow writes of captured dialogs (`REMIND_ME_DIALOG_SHADOW=1`, off by default; #528); dialog rows protected in place (#1616); decisions-log export, `decisions normalize --apply` with `--fold` project respelling and retype, and `decisions import --apply` (#1564, #1565); atomic updates and deletes (D62); duplicate warnings on save; search says how it ran; decisions and preferences never go dormant; the wiki compiles with a local model.
+- Limits that still hold in 0.5.0: `decisions import --apply` and `decisions normalize --apply` are data migrations Nano runs against the live store only after a dry run (D3, D30; import also after the restore drill, D73); dialog shadow writes are off unless `REMIND_ME_DIALOG_SHADOW=1`, and nothing reads the dialog store yet; a retype's revision does not record the old `memory_type`.
+- Every pull request merged since 0.4.2 is included; none is held back.
 
+## 2026-11-26 — `decisions normalize --apply`: project folds and retype (Mill Board #1564, D71, D72, D83)
+
+### Added
+- `--fold FROM=TO` on `decisions normalize` (repeatable): a new `respell` bucket lists every live, non-sensitive, unsuperseded memory of any type whose project is exactly `FROM`, and `--apply` renames it to `TO` (D71: `--fold let_em_loose=let-em-loose`). Refused unless `FROM` and `TO` are two spellings of one name. The folds are validated as one set: a spelling folded twice, or a fold targeting a spelling another fold renames (inverse pair, chain, cycle), is refused, so a second apply renames nothing. Each respell row carries its planned fold; the write skips a row whose project has since moved to another fold's spelling. Without `--fold`, nothing is respelled.
+- `decisions normalize --apply` now also applies the `retype` bucket (D72, D83): rows with `category: decision`, or whose content opens by defining a ref, that carry a rationale become `memory_type: decision`, with `metadata.decision_ref` when the ref is known. No project is assigned, no review is scheduled (D74), and a row without a rationale stays in "needs rationale" (D32).
+- Order within one run: respell, retype, add ref; every row is re-read and re-planned in its own transaction, revision written last; claim rows skipped.
+- `plan_normalize_with`, `apply_normalize_with`, `Fold` and `Folds` (the validated set) in `decisions_backfill`; the daemon ops `decisions_normalize_plan` and `decisions_normalize_apply` take an optional `folds` (serde default, so older clients work). `NormalizeApplied` gains `respelled` and `retyped`.
+
+### Not yet
+- Running it on the live store is Nano's (D3, D30): dry run with `--fold let_em_loose=let-em-loose` first. The revision log does not track `memory_type`, so a retype's revision records the metadata it replaced but not the old type (unchanged history format).
+
+### Tests
+- Fold parsing (blank side, same spelling, two different projects refused); fold sets (ambiguous, inverse, chained, cyclic refused) and a second apply that renames nothing; a respell skipped after an intervening project edit to another fold's spelling; respell matches the exact spelling, any type, and honours `--project`; one apply run respells, retypes and adds a ref to a row folded in the same run, leaves no-rationale and claim rows alone, schedules no review, records a revision, and a second run does nothing; CLI parsing of repeated `--fold` and its refusals.
 ## 2026-11-26 — Shadow-write captured dialogs to the dialog store (Mill Board #528, D82)
 
 ### Added
