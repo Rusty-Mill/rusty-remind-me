@@ -306,7 +306,7 @@ fn refresh_candidates(
         if source_ids.is_empty() {
             continue;
         }
-        let staleness = staleness_of(store, &row.id, &row.created_at, now)?;
+        let staleness = staleness_of(store, &row.id, now)?;
         if !staleness.is_stale() {
             continue;
         }
@@ -375,16 +375,20 @@ pub fn sources_down_to_facts(store: &Store<'_>, promoted_id: &str) -> SqlResult<
     Ok(out)
 }
 
-/// [`crate::staleness::stale_check`] for a promoted memory written at
-/// `written`.
+/// [`crate::staleness::stale_check`] for a promoted memory, against its
+/// last write (`updated_at`, D84): an artifact revised in place after the
+/// evidence arrived is not stale for it. Unchecked when the memory is gone.
 pub fn staleness_of(
     store: &Store<'_>,
     promoted_id: &str,
-    written: &str,
     now: chrono::DateTime<Utc>,
 ) -> SqlResult<crate::staleness::Staleness> {
+    let rows = load_memories(store, &[promoted_id.to_string()])?;
+    let Some(row) = rows.first() else {
+        return Ok(crate::staleness::Staleness::unchecked());
+    };
     let sources = sources_down_to_facts(store, promoted_id)?;
-    crate::staleness::stale_check(store, &sources, written, now)
+    crate::staleness::stale_check(store, &sources, &row.updated_at, now)
 }
 
 /// [`persona`], each statement with its stale flag (card #60).
@@ -395,7 +399,7 @@ pub fn persona_with_staleness(store: &Store<'_>) -> SqlResult<Vec<PersonaStateme
     let now = Utc::now();
     let mut statements = persona(store)?;
     for statement in &mut statements {
-        let staleness = staleness_of(store, &statement.id, &statement.created_at, now)?;
+        let staleness = staleness_of(store, &statement.id, now)?;
         statement.stale = staleness.stale;
         statement.new_evidence = staleness.new_evidence;
     }

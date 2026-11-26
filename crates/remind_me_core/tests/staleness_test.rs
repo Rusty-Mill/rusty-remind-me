@@ -538,3 +538,23 @@ fn a_statement_built_on_discredited_decisions_is_not_a_refresh_candidate() {
     let candidates = promotion_candidates(&store, Rung::ScenarioToPersona, 20).unwrap();
     assert!(refresh_of(&candidates, &statement).is_none());
 }
+
+#[test]
+fn an_artifact_revised_after_the_evidence_is_not_stale() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let (perth, _, old) = scenario(&store);
+    make_stale(&store, &perth);
+    let candidates = promotion_candidates(&store, Rung::FactToScenario, 20).unwrap();
+    assert!(
+        refresh_of(&candidates, &old).is_some(),
+        "stale before the revision"
+    );
+
+    // Revised in place after the evidence, as update_memory stamps it.
+    let revised = (now() + Duration::minutes(2)).to_rfc3339();
+    remind_me_core::testing::set_memory_column(&store, &old, "updated_at", revised.as_str())
+        .unwrap();
+    let candidates = promotion_candidates(&store, Rung::FactToScenario, 20).unwrap();
+    assert!(refresh_of(&candidates, &old).is_none());
+}
