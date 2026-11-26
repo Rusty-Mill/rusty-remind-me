@@ -44,7 +44,7 @@ fn since(value: &str) -> RawTimeWindow {
     RawTimeWindow {
         since: Some(value.into()),
         until: None,
-        time_field: TimeField::Created,
+        time_field: Some(TimeField::Created),
     }
 }
 

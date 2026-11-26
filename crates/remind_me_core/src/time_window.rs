@@ -34,7 +34,8 @@ pub enum TimeField {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "RawTimeWindow", into = "RawTimeWindow")]
 pub struct TimeWindow {
-    field: TimeField,
+    /// `None`: the caller named no field, so [`TimeField::default`] applies.
+    field: Option<TimeField>,
     since: Option<DateTime<Utc>>,
     until: Option<DateTime<Utc>>,
 }
@@ -46,8 +47,11 @@ pub struct RawTimeWindow {
     pub since: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub until: Option<String>,
-    #[serde(default)]
-    pub time_field: TimeField,
+    /// `None` when the caller passed none, which reads as
+    /// [`TimeField::default`]; kept apart from an explicit `created` so date
+    /// inference can tell them apart (pack D93).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_field: Option<TimeField>,
 }
 
 impl TimeWindow {
@@ -109,6 +113,11 @@ impl TimeWindow {
 
     /// Which timestamp this window reads.
     pub fn field(&self) -> TimeField {
+        self.field.unwrap_or_default()
+    }
+
+    /// The field the caller named, if any.
+    pub fn explicit_field(&self) -> Option<TimeField> {
         self.field
     }
 
@@ -118,7 +127,7 @@ impl TimeWindow {
     /// holds without a check.
     pub fn from_span(field: TimeField, span: Span) -> Self {
         Self {
-            field,
+            field: Some(field),
             since: Some(span.start),
             until: span.end,
         }
@@ -177,7 +186,7 @@ impl TimeWindow {
         occurred: impl FnOnce() -> Option<OccurredAt>,
     ) -> Option<OccurredAt> {
         let at = |ts: &str| parse_rfc3339(ts).map(OccurredAt::At);
-        match self.field {
+        match self.field() {
             TimeField::Created => at(created_at),
             TimeField::Updated => at(updated_at),
             TimeField::Occurred => occurred().or_else(|| at(created_at)),
@@ -277,7 +286,7 @@ mod tests {
         RawTimeWindow {
             since: since.map(str::to_string),
             until: until.map(str::to_string),
-            time_field: TimeField::Created,
+            time_field: None,
         }
     }
 
@@ -344,7 +353,7 @@ mod tests {
     #[test]
     fn time_field_picks_the_timestamp() {
         let mut r = raw(Some("1d"), None);
-        r.time_field = TimeField::Updated;
+        r.time_field = Some(TimeField::Updated);
         let w = TimeWindow::resolve(&r, now()).unwrap();
         let old = "2026-01-01T00:00:00Z";
         let new = "2026-10-26T11:00:00Z";
@@ -355,7 +364,7 @@ mod tests {
     #[test]
     fn occurred_reads_occurred_at_else_created_at() {
         let mut r = raw(Some("2026-10-01T00:00:00Z"), Some("2026-10-08T00:00:00Z"));
-        r.time_field = TimeField::Occurred;
+        r.time_field = Some(TimeField::Occurred);
         let w = in_utc(&r).unwrap();
         let point = |ts: &str| Some(OccurredAt::At(at(ts).unwrap()));
         let written = "2026-10-20T00:00:00Z";
@@ -373,7 +382,7 @@ mod tests {
     #[test]
     fn a_span_is_inside_when_it_overlaps_the_window() {
         let mut r = raw(Some("2026-10-01T00:00:00Z"), Some("2026-10-08T00:00:00Z"));
-        r.time_field = TimeField::Occurred;
+        r.time_field = Some(TimeField::Occurred);
         let w = in_utc(&r).unwrap();
         let written = "2026-10-20T00:00:00Z";
         let overlaps = |from: &str, to: &str| {
@@ -440,6 +449,25 @@ mod tests {
             serde_json::json!({ "time_field": "happened" })
         )
         .is_err());
+    }
+
+    #[test]
+    fn an_absent_time_field_is_kept_apart_from_an_explicit_one() {
+        let absent: TimeWindow =
+            serde_json::from_value(serde_json::json!({ "since": "2d" })).unwrap();
+        assert_eq!(absent.field(), TimeField::Created);
+        assert_eq!(absent.explicit_field(), None);
+        assert!(serde_json::to_value(absent)
+            .unwrap()
+            .get("time_field")
+            .is_none());
+        let created: TimeWindow =
+            serde_json::from_value(serde_json::json!({ "since": "2d", "time_field": "created" }))
+                .unwrap();
+        assert_eq!(created.explicit_field(), Some(TimeField::Created));
+        let back: TimeWindow =
+            serde_json::from_value(serde_json::to_value(created).unwrap()).unwrap();
+        assert_eq!(back, created);
     }
 
     #[test]

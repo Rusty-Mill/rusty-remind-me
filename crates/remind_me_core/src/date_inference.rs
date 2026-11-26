@@ -109,22 +109,18 @@ pub fn infer(
     let query = &input.query;
     let narrowed = MemorySearchInput {
         query: without_phrase(query, range.clone()),
-        window: TimeWindow::from_span(phrase_field(input.window.field()), span),
+        window: TimeWindow::from_span(phrase_field(input.window.explicit_field()), span),
         ..input.clone()
     };
     Ok(Some((narrowed, applied(&query[range], span, tz))))
 }
 
-/// The timestamp an inferred window reads: when the event happened
-/// ([`TimeField::Occurred`], card #62), so "what we shipped last month"
-/// finds a row written this week about last month. A caller's explicit
-/// `updated` is kept; `created`, the default, cannot be told apart from
-/// unset, so it reads `occurred` too, which falls back to `created_at`.
-fn phrase_field(field: TimeField) -> TimeField {
-    match field {
-        TimeField::Updated => TimeField::Updated,
-        TimeField::Created | TimeField::Occurred => TimeField::Occurred,
-    }
+/// The timestamp an inferred window reads: the caller's explicit
+/// `time_field`, else when the event happened ([`TimeField::Occurred`],
+/// card #62, pack D93), so "what we shipped last month" finds a row written
+/// this week about last month.
+fn phrase_field(explicit: Option<TimeField>) -> TimeField {
+    explicit.unwrap_or(TimeField::Occurred)
 }
 
 /// `query` without the phrase at `range` or the fillers that led into it
@@ -275,6 +271,15 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "time_field": "occurred" })).unwrap();
         let (narrowed, _) = infer(&input, now(), utc).unwrap().unwrap();
         assert_eq!(narrowed.window.field(), TimeField::Occurred);
+    }
+
+    #[test]
+    fn an_explicit_created_field_is_kept() {
+        let mut input = search("deploys last week");
+        input.window =
+            serde_json::from_value(serde_json::json!({ "time_field": "created" })).unwrap();
+        let (narrowed, _) = infer(&input, now(), utc).unwrap().unwrap();
+        assert_eq!(narrowed.window.field(), TimeField::Created);
     }
 
     #[test]

@@ -216,7 +216,7 @@ fn last_day() -> remind_me_core::time_window::TimeWindow {
     let raw = RawTimeWindow {
         since: Some("1d".into()),
         until: None,
-        time_field: TimeField::Created,
+        time_field: Some(TimeField::Created),
     };
     TimeWindow::resolve(&raw, chrono::Utc::now()).unwrap()
 }

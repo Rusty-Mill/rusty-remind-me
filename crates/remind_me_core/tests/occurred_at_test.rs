@@ -56,7 +56,7 @@ fn search(store: &Store<'_>, query: &str, field: TimeField) -> Vec<String> {
     let raw = RawTimeWindow {
         since: Some("40d".into()),
         until: Some("20d".into()),
-        time_field: field,
+        time_field: Some(field),
     };
     let input = MemorySearchInput {
         query: query.to_string(),

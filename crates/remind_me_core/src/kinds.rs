@@ -402,7 +402,14 @@ impl OccurredAt {
             Some(Value::String(_)) => instant("occurred_at", value)
                 .map(|at| Some(Self::At(at)))
                 .map_err(|_| bad(K, "occurred_at", SHAPE)),
-            Some(span @ Value::Object(_)) => {
+            Some(span @ Value::Object(keys)) => {
+                if let Some(extra) = keys.keys().find(|k| *k != "from" && *k != "to") {
+                    return Err(KindError::Field {
+                        kind: K,
+                        field: "occurred_at",
+                        problem: format!("may hold only from and to, not `occurred_at.{extra}`"),
+                    });
+                }
                 let from = instant("occurred_at.from", span.get("from"))?;
                 let to = instant("occurred_at.to", span.get("to"))?;
                 if from >= to {
@@ -919,6 +926,16 @@ mod tests {
                 "a stored {meta} reads as absent"
             );
         }
+    }
+
+    #[test]
+    fn a_span_with_another_key_is_refused_naming_it() {
+        let meta = json!({ "occurred_at": {
+            "from": "2026-10-01T00:00:00Z", "to": "2026-10-03T00:00:00Z", "extra": 1
+        } });
+        let e = validate_occurred_at(&meta).unwrap_err().to_string();
+        assert!(e.contains("`occurred_at.extra`"), "{e}");
+        assert_eq!(OccurredAt::of(&meta), None);
     }
 
     #[test]

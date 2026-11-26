@@ -34,7 +34,7 @@ fn window(since: Option<&str>, until: Option<&str>, field: TimeField) -> TimeWin
     let raw = RawTimeWindow {
         since: since.map(str::to_string),
         until: until.map(str::to_string),
-        time_field: field,
+        time_field: Some(field),
     };
     TimeWindow::resolve(&raw, Utc::now()).unwrap()
 }
