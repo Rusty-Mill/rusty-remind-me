@@ -510,3 +510,31 @@ fn a_withdrawn_source_is_left_out_so_the_refresh_still_promotes() {
     )
     .unwrap();
 }
+
+#[test]
+fn a_statement_built_on_discredited_decisions_is_not_a_refresh_candidate() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let (perth, facts, _) = scenario(&store);
+    for id in &facts {
+        remind_me_core::testing::set_memory_column(&store, id, "memory_type", "decision").unwrap();
+    }
+    let statement = promote(
+        &store,
+        &PromoteInput {
+            rung: Rung::ScenarioToPersona,
+            source_ids: facts.clone(),
+            content: "Perth-based".into(),
+            refreshes: None,
+        },
+    )
+    .unwrap()
+    .promoted_id;
+    for id in &facts {
+        remind_me_core::testing::set_memory_column(&store, id, "outcome", "reverted").unwrap();
+    }
+    make_stale(&store, &perth);
+
+    let candidates = promotion_candidates(&store, Rung::ScenarioToPersona, 20).unwrap();
+    assert!(refresh_of(&candidates, &statement).is_none());
+}

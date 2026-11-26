@@ -26,7 +26,7 @@ Dated entries, newest first. One entry per merged pull request.
 - 25k memories, 50k links, release build: p50 21 ms, p95 30 ms per check, dominated by the engine's scan for the sources' links (links are indexed by entity only). `remind_me_persona` pays it once per statement.
 
 ### Tests
-- Fresh; stale by entity; shared project only does not flag; project entity does not flag; other project does not flag; projectless evidence does not flag project sources; unrelated new memory does not flag; a new memory already a source does not flag; sensitive and superseded do not flag; hub skipped; evidence capped and newest first; candidate cap; no sources is unchecked; wiki page by cited ids; refresh candidate and supersede; persona refresh with the same sources; a bad `refreshes` refused; a sensitive artifact is not a refresh candidate; a withdrawn source is left out and the refresh still promotes.
+- Fresh; stale by entity; shared project only does not flag; project entity does not flag; other project does not flag; projectless evidence does not flag project sources; unrelated new memory does not flag; a new memory already a source does not flag; sensitive and superseded do not flag; hub skipped; evidence capped and newest first; candidate cap; no sources is unchecked; wiki page by cited ids; refresh candidate and supersede; persona refresh with the same sources; a bad `refreshes` refused; a sensitive artifact is not a refresh candidate; a withdrawn source is left out and the refresh still promotes; a statement on reverted decisions is not offered.
 
 ## 2026-11-26 — `decisions normalize --apply`: project folds and retype (Mill Board #1564, D71, D72, D83)
 
