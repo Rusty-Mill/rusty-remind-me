@@ -491,6 +491,18 @@ fn existing_live_promotion(
 
 /// Accept a distillation and record what it was built from.
 pub fn promote(store: &Store<'_>, input: &PromoteInput) -> Result<PromotionResult, PromotionError> {
+    promote_pausing(store, input, &|| {})
+}
+
+/// [`promote`], calling `after_checks` once every check has passed and
+/// before anything is written: where a concurrent promotion would otherwise
+/// slip in. For tests that put one there.
+#[doc(hidden)]
+pub fn promote_pausing(
+    store: &Store<'_>,
+    input: &PromoteInput,
+    after_checks: &dyn Fn(),
+) -> Result<PromotionResult, PromotionError> {
     if input.rung == Rung::CaptureToFact {
         return Err(PromotionError::UseDecompose);
     }
@@ -506,7 +518,19 @@ pub fn promote(store: &Store<'_>, input: &PromoteInput) -> Result<PromotionResul
         Rung::ScenarioToPersona => PERSONA_CATEGORY,
         Rung::CaptureToFact => unreachable!("refused above"),
     };
+    store.atomically(|store| promote_in(store, input, category, after_checks))
+}
 
+/// [`promote`]'s checks and writes, inside one transaction: the sources,
+/// the refresh target and the duplicate-evidence check are read under the
+/// same lock as the write, so two concurrent promotions cannot both pass
+/// them and leave two live artifacts.
+fn promote_in(
+    store: &Store<'_>,
+    input: &PromoteInput,
+    category: &str,
+    after_checks: &dyn Fn(),
+) -> Result<PromotionResult, PromotionError> {
     // Validated before anything is written, so a promotion naming one bad
     // source does not leave a partially-linked artifact behind.
     for id in &input.source_ids {
@@ -562,31 +586,29 @@ pub fn promote(store: &Store<'_>, input: &PromoteInput) -> Result<PromotionResul
     let vitality = calculate_vitality(base_weight, 0, decay_rate, &now_iso, now);
 
     let provenance = crate::context::default_provenance().auto();
-    store.transaction(|store| -> Result<(), PromotionError> {
-        Memories::new(store).insert(&NewMemory {
-            category: category.to_string(),
-            source: PROMOTION_SOURCE.to_string(),
-            metadata,
-            decay_rate,
-            vitality,
-            base_weight,
-            accessed_at: Some(now_iso.clone()),
-            ..provenance.stamp(NewMemory::new(
-                promoted_id.clone(),
-                input.content.clone(),
-                &now_iso,
-            ))
-        })?;
-
-        let promotions = Promotions::new(store);
-        for source_id in &input.source_ids {
-            promotions.record(&promoted_id, source_id, input.rung.as_str(), &now_iso)?;
-        }
-        if let Some(old) = &input.refreshes {
-            Memories::new(store).set_superseded_by(old, &promoted_id, Some(&now_iso))?;
-        }
-        Ok(())
+    after_checks();
+    Memories::new(store).insert(&NewMemory {
+        category: category.to_string(),
+        source: PROMOTION_SOURCE.to_string(),
+        metadata,
+        decay_rate,
+        vitality,
+        base_weight,
+        accessed_at: Some(now_iso.clone()),
+        ..provenance.stamp(NewMemory::new(
+            promoted_id.clone(),
+            input.content.clone(),
+            &now_iso,
+        ))
     })?;
+
+    let promotions = Promotions::new(store);
+    for source_id in &input.source_ids {
+        promotions.record(&promoted_id, source_id, input.rung.as_str(), &now_iso)?;
+    }
+    if let Some(old) = &input.refreshes {
+        Memories::new(store).set_superseded_by(old, &promoted_id, Some(&now_iso))?;
+    }
 
     Ok(PromotionResult {
         promoted_id,

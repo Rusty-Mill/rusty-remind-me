@@ -19,7 +19,7 @@ Dated entries, newest first. One entry per merged pull request.
 - `remind_me_wiki_read` returns `stale` and `new_evidence`, judged against the `mem_` ids the page cites; the markdown form opens with a stale note when stale.
 - `remind_me_persona` gives each statement `stale` and `new_evidence`, judged against its scenarios and their facts since its content last changed (the newest revision that rewrote it, else `created_at`), so a statement revised in place is fresh, while a reminder, a tag edit or other bookkeeping that stamps `updated_at` does not hide older evidence; refresh candidates use the same watermark. The search bootstrap and the brief stay unflagged (they read `promotion::persona`, unchanged).
 - `remind_me_promotion_candidates` lists stale scenarios (fact_to_scenario) and persona statements (scenario_to_persona) first as `refresh` candidates with `refresh_of` and `new_evidence`, taking at most half the page; a scenario's candidate carries its live facts plus the new evidence. Sensitive artifacts are never offered, and deleted or superseded sources are left out. `total_candidates` still counts new promotions only.
-- `remind_me_promote` takes optional `refreshes`: the live promoted memory at the target rung that the promotion replaces, superseded in the same transaction. A refresh may reuse the replaced statement's exact sources.
+- `remind_me_promote` takes optional `refreshes`: the live promoted memory at the target rung that the promotion replaces, superseded in the same transaction. A refresh may reuse the replaced statement's exact sources. The source, refresh-target and duplicate-evidence checks now run inside that transaction too, so two concurrent refreshes of one artifact (or two promotions of the same evidence) leave one live result and the other is refused.
 - `EntityStore::entities_of` (engine and SQLite, with a conformance check).
 
 ### Latency
@@ -27,6 +27,11 @@ Dated entries, newest first. One entry per merged pull request.
 
 ### Tests
 - Fresh; stale by entity; shared project only does not flag; project entity does not flag; other project does not flag; projectless evidence does not flag project sources; unrelated new memory does not flag; a new memory already a source does not flag; sensitive and superseded do not flag; hub skipped; evidence capped and newest first; candidate cap; no sources is unchecked; wiki page by cited ids; refresh candidate and supersede; persona refresh with the same sources; a bad `refreshes` refused; a sensitive artifact is not a refresh candidate; a withdrawn source is left out and the refresh still promotes; a statement on reverted decisions is not offered.
+
+## 2026-11-26 — `--version` / `-V` on the CLI
+
+### Added
+- `rusty-remind-me --version` (or `-V`) prints `rusty-remind-me <crate version>` and exits, without opening or creating a store. Deploys no longer need `server_status` to confirm which build is installed.
 
 ## 2026-11-26 — 0.5.0: release
 
