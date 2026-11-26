@@ -1107,7 +1107,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_promotion_candidates",
-                                "description": "List what is ready to move up a rung of the refinement ladder (capture -> fact -> scenario -> persona). Each entry names the source memories, a snippet, and why it qualifies. Already-promoted sources are excluded, so re-running after promoting returns a shorter list rather than the same one.",
+                                "description": "List what is ready to move up a rung of the refinement ladder (capture -> fact -> scenario -> persona). Each entry names the source memories, a snippet, and why it qualifies. Already-promoted sources are excluded, so re-running after promoting returns a shorter list rather than the same one. Stale scenarios and persona statements come first as `refresh` candidates with refresh_of and new_evidence.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -1125,7 +1125,8 @@ impl McpServer {
                                     "properties": {
                                         "rung": { "type": "string", "enum": ["fact_to_scenario", "scenario_to_persona"] },
                                         "source_ids": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "The memories this was distilled from" },
-                                        "content": { "type": "string", "minLength": 1, "maxLength": 50000, "description": "The distillation" }
+                                        "content": { "type": "string", "minLength": 1, "maxLength": 50000, "description": "The distillation" },
+                                        "refreshes": { "type": "string", "description": "A refresh candidate's refresh_of: the stale promoted memory this replaces, superseded in the same write" }
                                     },
                                     "required": ["rung", "source_ids", "content"]
                                 }
@@ -1142,7 +1143,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_persona",
-                                "description": "remind-me pipeline: the current persona: durable statements about the user whose grounds still hold. A statement whose sources have all been superseded or deleted is withheld automatically, so a contradicted fact demotes what was built on it. Set include_demoted to also see what is currently withheld and why.",
+                                "description": "remind-me pipeline: the current persona: durable statements about the user whose grounds still hold. A statement whose sources have all been superseded or deleted is withheld automatically, so a contradicted fact demotes what was built on it. Set include_demoted to also see what is currently withheld and why. A statement with newer related memories says stale, with new_evidence.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -1416,7 +1417,7 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_wiki_read",
-                                "description": "Read a wiki page by slug.",
+                                "description": "Read a wiki page by slug. stale and new_evidence say whether newer memories share an entity with the ids it cites (null: it cites none).",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -2561,7 +2562,7 @@ impl McpServer {
                             .get("include_demoted")
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
-                        match remind_me_core::promotion::persona(&store) {
+                        match remind_me_core::promotion::persona_with_staleness(&store) {
                             Ok(statements) => {
                                 let demoted = if include_demoted {
                                     remind_me_core::promotion::demoted(&store).unwrap_or_default()
@@ -3162,9 +3163,20 @@ impl McpServer {
                         let slug = args.get("slug").and_then(|v| v.as_str()).unwrap_or("");
                         match self.wiki.read_page(&store, slug) {
                             Ok(Some(page)) => {
+                                // A failed check reads as unchecked rather than
+                                // failing the read: the page itself is fine.
+                                let staleness =
+                                    remind_me_core::staleness::wiki_page_staleness(&store, &page)
+                                        .unwrap_or_else(|e| {
+                                            eprintln!("wiki stale check failed for {slug}: {e}");
+                                            remind_me_core::staleness::Staleness::unchecked()
+                                        });
+                                let mut body = json!(page);
+                                body["stale"] = json!(staleness.stale);
+                                body["new_evidence"] = json!(staleness.new_evidence);
                                 json!({ "content": [{ "type": "text", "text": match format {
-    ResponseFormat::Json => serde_json::to_string_pretty(&page).unwrap(),
-    ResponseFormat::Markdown => render::wiki_page(&page),
+    ResponseFormat::Json => serde_json::to_string_pretty(&body).unwrap(),
+    ResponseFormat::Markdown => render::wiki_page(&page, &staleness),
 } }] })
                             }
                             Ok(None) => {

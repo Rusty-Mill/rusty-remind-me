@@ -116,6 +116,7 @@ fn promoting_removes_the_sources_from_the_candidate_list() {
             rung: Rung::FactToScenario,
             source_ids: facts.clone(),
             content: "Perth is where the user lives and works".into(),
+            refreshes: None,
         },
     )
     .unwrap();
@@ -142,6 +143,7 @@ fn provenance_walks_both_directions() {
             rung: Rung::FactToScenario,
             source_ids: facts.clone(),
             content: "The user writes Rust for low-level servers".into(),
+            refreshes: None,
         },
     )
     .unwrap();
@@ -152,6 +154,7 @@ fn provenance_walks_both_directions() {
             rung: Rung::ScenarioToPersona,
             source_ids: vec![scenario.promoted_id.clone()],
             content: "Prefers systems languages".into(),
+            refreshes: None,
         },
     )
     .unwrap();
@@ -189,6 +192,7 @@ fn superseding_the_last_source_withdraws_the_persona_built_on_it() {
             rung: Rung::ScenarioToPersona,
             source_ids: vec!["mem_scenario".into()],
             content: "Believed durably true".into(),
+            refreshes: None,
         },
     )
     .unwrap();
@@ -225,6 +229,7 @@ fn one_surviving_source_is_enough_to_keep_a_statement() {
             rung: Rung::ScenarioToPersona,
             source_ids: vec!["mem_s1".into(), "mem_s2".into()],
             content: "Rests on two things".into(),
+            refreshes: None,
         },
     )
     .unwrap();
@@ -254,6 +259,7 @@ fn a_sensitive_source_cannot_become_persona() {
             rung: Rung::ScenarioToPersona,
             source_ids: vec!["mem_private".into()],
             content: "Should never be assembled".into(),
+            refreshes: None,
         },
     )
     .unwrap_err();
@@ -303,6 +309,7 @@ fn rung_one_reports_a_backlog_but_refuses_to_promote() {
             rung: Rung::CaptureToFact,
             source_ids: vec!["mem_anything".into()],
             content: "a fact".into(),
+            refreshes: None,
         },
     )
     .unwrap_err();
@@ -328,6 +335,7 @@ fn a_promotion_with_an_unusable_source_is_refused_whole() {
             rung: Rung::ScenarioToPersona,
             source_ids: vec!["mem_good".into(), "mem_missing".into()],
             content: "Half-grounded".into(),
+            refreshes: None,
         },
     )
     .unwrap_err();
@@ -363,6 +371,7 @@ fn promoting_the_same_sources_twice_is_rejected() {
             rung: Rung::FactToScenario,
             source_ids: facts.clone(),
             content: "First telling of the same evidence".into(),
+            refreshes: None,
         },
     )
     .unwrap();
@@ -381,6 +390,7 @@ fn promoting_the_same_sources_twice_is_rejected() {
             rung: Rung::FactToScenario,
             source_ids: reordered,
             content: "Second telling of the same evidence".into(),
+            refreshes: None,
         },
     )
     .unwrap_err();
@@ -417,6 +427,7 @@ fn a_superseded_promotion_no_longer_blocks_re_promoting_its_sources() {
             rung: Rung::FactToScenario,
             source_ids: facts.clone(),
             content: "Original telling".into(),
+            refreshes: None,
         },
     )
     .unwrap();
@@ -432,6 +443,7 @@ fn a_superseded_promotion_no_longer_blocks_re_promoting_its_sources() {
             rung: Rung::FactToScenario,
             source_ids: facts,
             content: "Re-told after the original was superseded".into(),
+            refreshes: None,
         },
     )
     .unwrap();
@@ -452,6 +464,7 @@ fn a_promotion_needs_sources_and_content() {
                 rung: Rung::ScenarioToPersona,
                 source_ids: vec![],
                 content: "ungrounded".into(),
+                refreshes: None,
             }
         )
         .unwrap_err(),
@@ -465,6 +478,7 @@ fn a_promotion_needs_sources_and_content() {
                 rung: Rung::ScenarioToPersona,
                 source_ids: vec!["mem_s".into()],
                 content: "   ".into(),
+                refreshes: None,
             }
         )
         .unwrap_err(),
@@ -577,6 +591,7 @@ fn clearing_the_backlog_does_not_send_an_empty_nudge() {
             rung: Rung::FactToScenario,
             source_ids: facts,
             content: "Somewhere the user knows".into(),
+            refreshes: None,
         },
     )
     .unwrap();

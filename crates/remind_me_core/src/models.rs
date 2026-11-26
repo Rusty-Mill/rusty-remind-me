@@ -1273,6 +1273,15 @@ pub struct PromotionCandidate {
     /// The entity or topic the group formed around, where one applies.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub grouped_by: Option<String>,
+    /// For a `refresh` candidate: the stale scenario or persona statement a
+    /// promotion from this candidate would replace (pass it as
+    /// [`PromoteInput::refreshes`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_of: Option<String>,
+    /// For a `refresh` candidate: the newer related memories that made it
+    /// stale, newest first (see [`crate::staleness`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub new_evidence: Vec<String>,
 }
 
 /// Inclusive bounds and default on a `remind_me_promotion_candidates` limit.
@@ -1293,6 +1302,11 @@ pub struct PromoteInput {
     pub source_ids: Vec<String>,
     /// The distilled text.
     pub content: String,
+    /// A live promoted memory at this rung that this promotion replaces: it
+    /// is superseded by the new one in the same transaction. Set it when
+    /// acting on a `refresh` candidate's `refresh_of`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refreshes: Option<String>,
 }
 
 /// What a promotion produced.
@@ -1324,6 +1338,13 @@ pub struct PersonaStatement {
     /// How many of its sources still stand. Zero means withheld — see
     /// [`crate::promotion::persona`].
     pub surviving_sources: usize,
+    /// Whether newer related evidence has arrived since it was written;
+    /// absent where it was not checked (see [`crate::staleness`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale: Option<bool>,
+    /// The newer related memories, newest first, when stale.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub new_evidence: Vec<String>,
 }
 /// `source` every decomposed fact is stored under.
 pub const DECOMPOSITION_SOURCE: &str = "decomposition";
