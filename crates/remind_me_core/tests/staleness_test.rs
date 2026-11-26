@@ -138,6 +138,18 @@ fn evidence_from_another_project_does_not_flag() {
 }
 
 #[test]
+fn projectless_evidence_does_not_flag_sources_in_a_project() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let (perth, written) = base(&store);
+    seed(&store, "mem_unscoped", &ago(1), None);
+    link(&store, "mem_unscoped", &perth);
+
+    let s = stale_check(&store, &ids(&["mem_src"]), &written, now()).unwrap();
+    assert_eq!(s.stale, Some(false));
+}
+
+#[test]
 fn an_unrelated_new_memory_does_not_flag() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
@@ -445,4 +457,56 @@ fn latency_on_a_25k_store() {
         times[times.len() / 2],
         times[times.len() * 95 / 100]
     );
+}
+
+/// `old` gets newer related evidence.
+fn make_stale(store: &Store<'_>, perth: &str) {
+    let later = (now() + Duration::minutes(1)).to_rfc3339();
+    seed(store, "mem_moved", &later, None);
+    link(store, "mem_moved", perth);
+}
+
+fn refresh_of<'a>(
+    candidates: &'a [remind_me_core::PromotionCandidate],
+    old: &str,
+) -> Option<&'a remind_me_core::PromotionCandidate> {
+    candidates
+        .iter()
+        .find(|c| c.refresh_of.as_deref() == Some(old))
+}
+
+#[test]
+fn a_sensitive_artifact_is_not_a_refresh_candidate() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let (perth, _, old) = scenario(&store);
+    make_stale(&store, &perth);
+    remind_me_core::testing::set_memory_column(&store, &old, "sensitive", true).unwrap();
+
+    let candidates = promotion_candidates(&store, Rung::FactToScenario, 20).unwrap();
+    assert!(refresh_of(&candidates, &old).is_none());
+}
+
+#[test]
+fn a_withdrawn_source_is_left_out_so_the_refresh_still_promotes() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let (perth, facts, old) = scenario(&store);
+    make_stale(&store, &perth);
+    remind_me_core::testing::set_memory_column(&store, &facts[0], "superseded_by", "mem_x")
+        .unwrap();
+
+    let candidates = promotion_candidates(&store, Rung::FactToScenario, 20).unwrap();
+    let refresh = refresh_of(&candidates, &old).expect("a refresh candidate");
+    assert!(!refresh.source_ids.contains(&facts[0]));
+    promote(
+        &store,
+        &PromoteInput {
+            rung: Rung::FactToScenario,
+            source_ids: refresh.source_ids.clone(),
+            content: "The user moved away from Perth".into(),
+            refreshes: Some(old.clone()),
+        },
+    )
+    .unwrap();
 }

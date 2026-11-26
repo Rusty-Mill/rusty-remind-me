@@ -291,15 +291,19 @@ fn refresh_candidates(
         if out.len() >= limit {
             break;
         }
-        let sources = promotions.sources_of(&row.id)?;
-        if surviving_sources(store, &row.id)? == 0 {
+        // The listing has no sensitivity opt-in, so a sensitive artifact
+        // is never offered, as in `persona`.
+        if promotions.live_source_sensitivity(&row.id)? != Some(false) {
+            continue;
+        }
+        let mut source_ids = usable_sources(&promotions, &row.id, rung)?;
+        if source_ids.is_empty() {
             continue;
         }
         let staleness = staleness_of(store, &row.id, &row.created_at, now)?;
         if !staleness.is_stale() {
             continue;
         }
-        let mut source_ids = sources;
         if rung == Rung::FactToScenario {
             source_ids.extend(staleness.new_evidence.iter().cloned());
         }
@@ -315,6 +319,27 @@ fn refresh_candidates(
             refresh_of: Some(row.id),
             new_evidence: staleness.new_evidence,
         });
+    }
+    Ok(out)
+}
+
+/// The sources of `promoted_id` that [`promote`] would accept at `rung`:
+/// live and unsuperseded, and not sensitive for a persona statement. A
+/// withdrawn source is left out, so the candidate stays promotable.
+fn usable_sources(
+    promotions: &Promotions<'_>,
+    promoted_id: &str,
+    rung: Rung,
+) -> SqlResult<Vec<String>> {
+    let mut out = Vec::new();
+    for id in promotions.sources_of(promoted_id)? {
+        let usable = match promotions.live_source_sensitivity(&id)? {
+            None => false,
+            Some(sensitive) => !(sensitive && rung == Rung::ScenarioToPersona),
+        };
+        if usable {
+            out.push(id);
+        }
     }
     Ok(out)
 }

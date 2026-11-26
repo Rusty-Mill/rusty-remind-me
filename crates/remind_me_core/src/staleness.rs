@@ -90,8 +90,11 @@ pub fn stale_check(
     }
     let written = parse_time(last_write).unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
     let source_rows = crate::promotion::load_memories(store, sources)?;
+    // A promoted source's project is its writer's directory, not its
+    // knowledge's, so only the memories it was built from set the scope.
     let projects: HashSet<String> = source_rows
         .iter()
+        .filter(|m| m.source != crate::promotion::PROMOTION_SOURCE)
         .filter_map(|m| m.project.clone())
         .collect();
     let source_ids: HashSet<&str> = sources.iter().map(String::as_str).collect();
@@ -166,10 +169,11 @@ fn newer_evidence(
     if is_dormant(effective_vitality(memory, now)) && !never_dormant(memory) {
         return None;
     }
-    if let (false, Some(project)) = (projects.is_empty(), memory.project.as_ref()) {
-        if !projects.contains(project) {
-            return None;
-        }
+    // Sources in a project admit only evidence in one of their projects;
+    // projectless evidence does not count for them.
+    let in_scope = |project: &String| projects.contains(project);
+    if !projects.is_empty() && !memory.project.as_ref().is_some_and(in_scope) {
+        return None;
     }
     let created = parse_time(&memory.created_at)?;
     (created > written).then_some(created)
