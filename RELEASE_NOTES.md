@@ -18,6 +18,11 @@ Dated entries, newest first. One entry per merged pull request.
 ### Tests
 - Fresh; stale by entity; shared project only does not flag; project entity does not flag; other project does not flag; projectless evidence does not flag project sources; unrelated new memory does not flag; a new memory already a source does not flag; sensitive and superseded do not flag; hub skipped; evidence capped and newest first; candidate cap; no sources is unchecked; wiki page by cited ids; refresh candidate and supersede; persona refresh with the same sources; a bad `refreshes` refused; a sensitive artifact is not a refresh candidate; a withdrawn source is left out and the refresh still promotes; a statement on reverted decisions is not offered.
 
+## 2026-11-26 — Backup and restore runbook (Mill Board #1622, D73)
+
+### Added
+- `docs/backup-restore.md`: what an engine backup holds and what it leaves out (the archive blob root, OAuth and API key files, the wiki, env files), how to restore the live store, and the scratch restore drill that passed on remindme on 2026-11-26 (72,765 records, 0 mismatches). It notes that `admin backup` keeps only the newest 10 backups. Docs only.
+
 ## 2026-11-26 — `--version` / `-V` on the CLI
 
 ### Added
