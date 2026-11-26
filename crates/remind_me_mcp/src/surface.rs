@@ -105,6 +105,9 @@ const SAVED_SEARCH: Choices = &[
     ("list", "remind_me_list_saved_searches"),
     ("run", "remind_me_run_saved_search"),
     ("delete", "remind_me_delete_saved_search"),
+    ("pin", "remind_me_pin_saved_search"),
+    ("answer", "remind_me_answer_pinned"),
+    ("list_stale", "remind_me_list_stale_pinned"),
 ];
 
 /// A non-empty string argument.
@@ -478,7 +481,9 @@ fn definition(name: &str, catalog: &[Value]) -> Option<Value> {
         ),
         "remind_me_saved_searches" => merged(
             "remind-me extras: keep a saved query by name. `action=save` stores one, `list` shows \
-             them, `run` re-runs one and `delete` removes it.",
+             them, `run` re-runs one and `delete` removes it. `pin` makes one a standing \
+             question, `answer` records its answer page and evidence ids, `list_stale` lists \
+             questions whose answer is out of date.",
             &handlers(SAVED_SEARCH),
             &[],
             json!({ "action": choice(SAVED_SEARCH, None) }),

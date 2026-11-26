@@ -199,9 +199,9 @@ use remind_me_core::{
     dbs_import, digest, duplicates, entity, entity_duplicates, export, history, importer,
     mempalace_import, normalize, recalibrate, saved_searches, stats, status, undo_import, updater,
     vectors, vitality, watcher, webhook::Webhook, wiki, wiki_fs::Wiki, wiki_import, AnnotateInput,
-    AutoCaptureInput, BriefInput, BulkImportDirInput, ChatImportInput, ConsolidateInput,
-    ContradictionCandidatesInput, Database, DbsImportInput, DecomposeBatchInput, DecomposeInput,
-    DigestInput, EntityInput, EntityLookupInput, EntityTraverseInput, ExportInput,
+    AnswerPinnedInput, AutoCaptureInput, BriefInput, BulkImportDirInput, ChatImportInput,
+    ConsolidateInput, ContradictionCandidatesInput, Database, DbsImportInput, DecomposeBatchInput,
+    DecomposeInput, DigestInput, EntityInput, EntityLookupInput, EntityTraverseInput, ExportInput,
     ExtractBatchInput, FeedbackInput, HistoryInput, ListRemindersInput, MemoryAddInput,
     MemoryListInput, MemorySearchInput, MemoryStatsInput, MemoryUpdateInput, MempalaceImportInput,
     NormalizeApplyInput, NormalizeBatchInput, RecalibrateCandidatesInput, ReclassifyBatchInput,
@@ -215,10 +215,11 @@ use remind_me_core::{
     EXTRACT_MODES, HISTORY_LIMIT_MAX, HISTORY_LIMIT_MIN, IMPORT_MAX_LENGTH_MAX,
     IMPORT_MAX_LENGTH_MIN, MEMPALACE_IMPORT_LIMIT_MAX, MEMPALACE_IMPORT_LIMIT_MIN,
     NORMALIZE_APPLY_MAX, NORMALIZE_APPLY_MIN, NORMALIZE_BATCH_MAX, NORMALIZE_BATCH_MIN,
-    PROMOTION_LIMIT_DEFAULT, PROMOTION_LIMIT_MAX, PROMOTION_LIMIT_MIN, RECALIBRATE_LIMIT_MAX,
-    RECALIBRATE_LIMIT_MIN, RECLASSIFY_BATCH_MAX, RECLASSIFY_BATCH_MIN, REMINDER_LIMIT_MAX,
-    REMINDER_LIMIT_MIN, STALE_CANDIDATES_LIMIT_DEFAULT, STALE_CANDIDATES_LIMIT_MAX,
-    STALE_CANDIDATES_LIMIT_MIN, UNDO_IMPORT_LIMIT_MAX, UNDO_IMPORT_LIMIT_MIN,
+    PIN_EVIDENCE_MAX, PROMOTION_LIMIT_DEFAULT, PROMOTION_LIMIT_MAX, PROMOTION_LIMIT_MIN,
+    RECALIBRATE_LIMIT_MAX, RECALIBRATE_LIMIT_MIN, RECLASSIFY_BATCH_MAX, RECLASSIFY_BATCH_MIN,
+    REMINDER_LIMIT_MAX, REMINDER_LIMIT_MIN, STALE_CANDIDATES_LIMIT_DEFAULT,
+    STALE_CANDIDATES_LIMIT_MAX, STALE_CANDIDATES_LIMIT_MIN, UNDO_IMPORT_LIMIT_MAX,
+    UNDO_IMPORT_LIMIT_MIN,
 };
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
@@ -1347,6 +1348,36 @@ impl McpServer {
                                     },
                                     "required": ["name"]
                                 }
+                            },
+                            {
+                                "name": "remind_me_pin_saved_search",
+                                "description": "Make a saved search a pinned question: a standing answer that is flagged when it goes out of date.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": { "type": "string", "description": "Name of the saved search to pin" }
+                                    },
+                                    "required": ["name"]
+                                }
+                            },
+                            {
+                                "name": "remind_me_answer_pinned",
+                                "description": "Record a pinned question's answer: an existing wiki page and the live memory ids it was written from. Pins the search if needed.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": { "type": "string", "description": "Name of the saved search" },
+                                        "answer_slug": { "type": "string", "description": "Slug of the wiki page holding the answer" },
+                                        "evidence_ids": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": PIN_EVIDENCE_MAX, "description": "The memories the answer was written from" },
+                                        "as_of": { "type": "string", "description": "RFC 3339 time the evidence was read: checked_at from list_stale, or when you ran the search. Stamped as answered_at, capped at now; refused if the saved search changed after it; omitted means now" }
+                                    },
+                                    "required": ["name", "answer_slug", "evidence_ids"]
+                                }
+                            },
+                            {
+                                "name": "remind_me_list_stale_pinned",
+                                "description": "List pinned questions whose answer is out of date, with checked_at (pass it to answer as as_of), each with its reasons, up to 5 new memory ids to read before answering again, and any evidence ids now deleted or superseded.",
+                                "inputSchema": { "type": "object", "properties": {} }
                             },
                             {
                                 "name": "remind_me_delete_saved_search",
@@ -3030,6 +3061,53 @@ impl McpServer {
                             }
                         }
                     }
+                    "remind_me_pin_saved_search" => {
+                        match serde_json::from_value::<SavedSearchNameInput>(args) {
+                            Ok(input) => {
+                                match saved_searches::pin_saved_search(&store, &input.name) {
+                                    Ok(Some(saved)) => {
+                                        json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&saved).unwrap() }] })
+                                    }
+                                    Ok(None) => {
+                                        json!({ "content": [{ "type": "text", "text": format!("Saved search '{}' not found.", input.name) }] })
+                                    }
+                                    Err(e) => {
+                                        json!({ "isError": true, "content": [{ "type": "text", "text": format!("Pin saved search error: {}", e) }] })
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                json!({ "isError": true, "content": [{ "type": "text", "text": format!("Invalid pin input: {}", e) }] })
+                            }
+                        }
+                    }
+                    "remind_me_answer_pinned" => {
+                        match serde_json::from_value::<AnswerPinnedInput>(args) {
+                            Ok(input) => match saved_searches::answer_pinned(&store, &input) {
+                                Ok(saved) => {
+                                    json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&saved).unwrap() }] })
+                                }
+                                Err(e) => {
+                                    json!({ "isError": true, "content": [{ "type": "text", "text": format!("Answer pinned question error: {}", e) }] })
+                                }
+                            },
+                            Err(e) => {
+                                json!({ "isError": true, "content": [{ "type": "text", "text": format!("Invalid answer input: {}", e) }] })
+                            }
+                        }
+                    }
+                    "remind_me_list_stale_pinned" => match saved_searches::stale_report(&store) {
+                        Ok(report) => {
+                            json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&json!({
+                                "count": report.stale.len(),
+                                "checked_at": report.checked_at,
+                                "stale": report.stale,
+                            })).unwrap() }] })
+                        }
+                        Err(e) => {
+                            json!({ "isError": true, "content": [{ "type": "text", "text": format!("List stale pinned error: {}", e) }] })
+                        }
+                    },
                     "remind_me_delete_saved_search" => {
                         match serde_json::from_value::<SavedSearchNameInput>(args) {
                             Ok(input) => {
