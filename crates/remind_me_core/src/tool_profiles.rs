@@ -117,7 +117,7 @@ pub const GROUPS: [(&str, &[&str]); 6] = [
 ];
 
 /// Old name, and the public tool it merged into. Callable, never listed.
-pub const ALIASES: [(&str, &str); 34] = [
+pub const ALIASES: [(&str, &str); 37] = [
     ("remind_me_list", "remind_me_search"),
     ("remind_me_references", "remind_me_search"),
     ("remind_me_get_capture", "remind_me_get"),
@@ -152,6 +152,9 @@ pub const ALIASES: [(&str, &str); 34] = [
     ("remind_me_list_saved_searches", "remind_me_saved_searches"),
     ("remind_me_run_saved_search", "remind_me_saved_searches"),
     ("remind_me_delete_saved_search", "remind_me_saved_searches"),
+    ("remind_me_pin_saved_search", "remind_me_saved_searches"),
+    ("remind_me_answer_pinned", "remind_me_saved_searches"),
+    ("remind_me_list_stale_pinned", "remind_me_saved_searches"),
 ];
 
 /// Prompts driving [`PIPELINE`], hidden unless that group is on.

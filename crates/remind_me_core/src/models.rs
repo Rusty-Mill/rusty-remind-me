@@ -1273,6 +1273,15 @@ pub struct PromotionCandidate {
     /// The entity or topic the group formed around, where one applies.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub grouped_by: Option<String>,
+    /// For a `refresh` candidate: the stale scenario or persona statement a
+    /// promotion from this candidate would replace (pass it as
+    /// [`PromoteInput::refreshes`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_of: Option<String>,
+    /// For a `refresh` candidate: the newer related memories that made it
+    /// stale, newest first (see [`crate::staleness`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub new_evidence: Vec<String>,
 }
 
 /// Inclusive bounds and default on a `remind_me_promotion_candidates` limit.
@@ -1293,6 +1302,11 @@ pub struct PromoteInput {
     pub source_ids: Vec<String>,
     /// The distilled text.
     pub content: String,
+    /// A live promoted memory at this rung that this promotion replaces: it
+    /// is superseded by the new one in the same transaction. Set it when
+    /// acting on a `refresh` candidate's `refresh_of`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refreshes: Option<String>,
 }
 
 /// What a promotion produced.
@@ -1324,6 +1338,13 @@ pub struct PersonaStatement {
     /// How many of its sources still stand. Zero means withheld — see
     /// [`crate::promotion::persona`].
     pub surviving_sources: usize,
+    /// Whether newer related evidence has arrived since it was written;
+    /// absent where it was not checked (see [`crate::staleness`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale: Option<bool>,
+    /// The newer related memories, newest first, when stale.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub new_evidence: Vec<String>,
 }
 /// `source` every decomposed fact is stored under.
 pub const DECOMPOSITION_SOURCE: &str = "decomposition";
@@ -1936,6 +1957,90 @@ pub struct SavedSearchFilters {
     pub tags: Option<Vec<String>>,
     #[serde(default)]
     pub include_sensitive: bool,
+    /// Set when the saved search is a pinned question (card #61): the
+    /// answer and the evidence it was built from. Kept in the `filters`
+    /// JSON, so no column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin: Option<PinnedAnswer>,
+}
+
+/// A pinned question's current answer: a wiki page and the memory ids it
+/// was written from (card #61, D85).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PinnedAnswer {
+    /// The answer's wiki page. `None` until the question is answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_slug: Option<String>,
+    /// The memories the answer was written from.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_ids: Vec<String>,
+    /// When the answer was recorded (RFC 3339, server time).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answered_at: Option<String>,
+    /// The saved query the answer was written for; a changed query makes
+    /// the question stale until it is answered again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answered_query: Option<String>,
+    /// The filters the answer was written for; a changed scope is stale
+    /// like a changed query.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answered_scope: Option<AnsweredScope>,
+}
+
+/// A saved search's filters without its pin: the scope an answer covers.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AnsweredScope {
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    #[serde(default)]
+    pub include_sensitive: bool,
+}
+
+impl AnsweredScope {
+    /// The scope `filters` currently select, in the form search reads it:
+    /// the category as written (search compares it literally), tags as a
+    /// trimmed set with blanks dropped. Two spellings of one scope compare
+    /// equal.
+    pub fn of(filters: &SavedSearchFilters) -> Self {
+        let category = filters.category.clone();
+        let tags: std::collections::BTreeSet<String> = filters
+            .tags
+            .iter()
+            .flatten()
+            .map(|t| t.trim())
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect();
+        Self {
+            category,
+            tags: (!tags.is_empty()).then(|| tags.into_iter().collect()),
+            include_sensitive: filters.include_sensitive,
+        }
+    }
+}
+
+/// Most evidence ids one answer may record.
+pub const PIN_EVIDENCE_MAX: usize = 100;
+
+/// Request to record a pinned question's answer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnswerPinnedInput {
+    /// The saved search's name.
+    pub name: String,
+    /// Slug of the wiki page holding the answer; it must exist.
+    pub answer_slug: String,
+    /// The live memories the answer was written from, at most
+    /// [`PIN_EVIDENCE_MAX`].
+    pub evidence_ids: Vec<String>,
+    /// RFC 3339 time the evidence was read: `checked_at` from the stale
+    /// list, or when the client ran the search. Stamped as `answered_at`,
+    /// capped at now; omitted means now (D96). Refused when the saved
+    /// search changed after it, since the answer was drafted for the old
+    /// query or scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub as_of: Option<String>,
 }
 
 /// A stored query plus its filters, under a unique name.

@@ -348,6 +348,22 @@ pub(crate) fn entities_of(core: &CoreTables, memory_id: &str) -> Vec<String> {
         .collect()
 }
 
+/// The ids of the entities any of `memory_ids` is linked to, sorted, without
+/// repeats: one scan of the links, as they are indexed by entity only.
+#[allow(clippy::unnecessary_wraps)]
+fn entities_of_many(core: &CoreTables, memory_ids: &[String]) -> Result<Vec<String>> {
+    if memory_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let wanted: HashSet<&str> = memory_ids.iter().map(String::as_str).collect();
+    let found: std::collections::BTreeSet<String> = links(core)
+        .into_iter()
+        .filter(|l| wanted.contains(l.memory_id.as_str()))
+        .map(|l| l.entity_id)
+        .collect();
+    Ok(found.into_iter().collect())
+}
+
 /// Whether memory `memory_id` has any entity link.
 pub(crate) fn has_links(core: &CoreTables, memory_id: &str) -> bool {
     links(core).iter().any(|l| l.memory_id == memory_id)
@@ -903,6 +919,10 @@ impl EntityStore for EngineTables {
 
     fn linked_memory_count(&self, entity_id: &str) -> Result<usize> {
         linked_memory_count(self, entity_id)
+    }
+
+    fn entities_of(&self, memory_ids: &[String]) -> Result<Vec<String>> {
+        entities_of_many(core_ref(self)?, memory_ids)
     }
 
     fn shared_memory_count(&self, a: &str, b: &str) -> Result<usize> {

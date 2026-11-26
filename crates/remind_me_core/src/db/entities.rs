@@ -137,6 +137,10 @@ pub trait EntityStore {
     /// How many live memories are linked to `entity_id`.
     fn linked_memory_count(&self, entity_id: &str) -> Result<usize>;
 
+    /// The ids of the entities any of `memory_ids` is linked to, sorted and
+    /// without repeats. No ids give none.
+    fn entities_of(&self, memory_ids: &[String]) -> Result<Vec<String>>;
+
     /// How many live memories are linked to both `a` and `b`.
     fn shared_memory_count(&self, a: &str, b: &str) -> Result<usize>;
 
@@ -312,6 +316,11 @@ impl<'c> Entities<'c> {
     /// See [`EntityStore::linked_memory_count`].
     pub fn linked_memory_count(&self, entity_id: &str) -> Result<usize> {
         EntityStore::linked_memory_count(&*self.backend.lock()?, entity_id)
+    }
+
+    /// See [`EntityStore::entities_of`].
+    pub fn entities_of(&self, memory_ids: &[String]) -> Result<Vec<String>> {
+        EntityStore::entities_of(&*self.backend.lock()?, memory_ids)
     }
 
     /// See [`EntityStore::shared_memory_count`].
@@ -636,6 +645,20 @@ pub mod conformance {
         );
     }
 
+    pub fn entities_of_unions_the_links_of_the_named_memories(store: &mut dyn EntityStore) {
+        EntityStore::link(store, "m1", "b", T1, Origin::Local).unwrap();
+        EntityStore::link(store, "m1", "a", T1, Origin::Local).unwrap();
+        EntityStore::link(store, "m2", "a", T1, Origin::Local).unwrap();
+        EntityStore::link(store, "m3", "c", T1, Origin::Local).unwrap();
+
+        let ids = |names: &[&str]| -> Vec<String> { names.iter().map(|n| n.to_string()).collect() };
+        assert_eq!(
+            EntityStore::entities_of(store, &ids(&["m1", "m2", "missing"])).unwrap(),
+            ids(&["a", "b"])
+        );
+        assert!(EntityStore::entities_of(store, &[]).unwrap().is_empty());
+    }
+
     pub fn relations_touching_nothing_is_empty(store: &mut dyn EntityStore) {
         assert!(store.relations_touching(&[], None, 1).unwrap().is_empty());
     }
@@ -660,6 +683,10 @@ macro_rules! entity_conformance {
         #[test]
         fn repoint_drops_a_link_the_target_already_has() {
             conformance::repoint_drops_a_link_the_target_already_has(&mut $make);
+        }
+        #[test]
+        fn entities_of_unions_the_links_of_the_named_memories() {
+            conformance::entities_of_unions_the_links_of_the_named_memories(&mut $make);
         }
         #[test]
         fn relations_touching_nothing_is_empty() {

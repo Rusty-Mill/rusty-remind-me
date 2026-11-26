@@ -119,6 +119,20 @@ impl HistoryStore for SqliteTables {
         )
     }
 
+    /// Walks the memory's revisions by id, newest first, comparing each
+    /// with the next newer one's content (or `?2` for the newest), and
+    /// stops at the first that differs.
+    fn content_revised_at(&self, memory_id: &str, content: &str) -> Result<Option<String>> {
+        self.one(
+            "SELECT edited_at FROM memory_revisions r WHERE r.memory_id = ?1 \
+             AND r.content != COALESCE((SELECT n.content FROM memory_revisions n \
+                 WHERE n.memory_id = ?1 AND n.id > r.id ORDER BY n.id LIMIT 1), ?2) \
+             ORDER BY r.id DESC LIMIT 1",
+            params![memory_id, content],
+            |r| r.get(0),
+        )
+    }
+
     fn revision(&self, memory_id: &str, revision_id: i64) -> Result<Option<Tracked>> {
         Ok(self
             .one(

@@ -18,6 +18,32 @@ Dated entries, newest first. One entry per merged pull request.
 ### Tests
 - Valid and malformed values on each write path, naming the key; update sets, clears and refuses; a malformed stored value read as absent and not blocking an edit; a row written today about last month found by `occurred` and not by `created`; instant and span placement, span overlap at each edge, fallback to `created_at`; `time_field: occurred` parsing; recency ordering in rank and score fusion; inferred windows reading `occurred`; the conformance check on both backends.
 
+## 2026-11-26 — Pinned questions: standing answers that know when they are out of date (Mill Board #61, D85, D90)
+
+### Added
+- `remind_me_saved_searches` gains three actions. `pin` makes a saved search a pinned question. `answer` records its answer: an existing wiki page's slug and the 1 to 100 live memory ids it was written from; the server stamps `answered_at` and keeps the query and filters it answered (and pins the search if needed). An optional `as_of` (RFC 3339) sets `answered_at` to when the evidence was read, capped at now, and is refused when the saved search changed after it (D96). `list_stale` returns `checked_at` and lists pinned questions whose answer is out of date, each with `reasons`, up to 5 `new_evidence` ids and the `evidence_gone` ids (deleted or superseded evidence, D95). Reasons: `unanswered`, `query_changed`, `answer_missing`, `evidence_gone`, `new_results` (the query now returns memories outside the evidence that were written or changed after the answer, read at 100 results with dormant memories included) and `related_evidence` (#60's stale check over the evidence). `query_changed` also covers a changed category, tags or include_sensitive, compared as search reads them (category literally, tags as a trimmed set). Saving, pinning and answering each read and write in one transaction, so a save racing an answer keeps both. Refresh is two-phase with no lock between calls: pass `list_stale`'s `checked_at` to `answer` as `as_of`, and evidence that lands in between shows on the next `list_stale`.
+- The pin lives in the saved search's `filters` JSON as `pin`; no column. Re-saving a search keeps its pin.
+- The session-start brief (`remind_me_brief`, session mode) gets a "Pinned questions to refresh" line with the count and up to 3 names, only when any are stale (D90); names longer than 24 characters are cut so the line fits a 2000-token SessionStart budget. Project briefs do not show it.
+
+### Tests
+- Unanswered pin is stale; fresh answer is not; a new result makes it stale and answering again clears it; an older memory entering the results does not flag; superseded evidence; missing answer page; re-save keeps the pin and a changed query is stale; answer input validation; the session brief line and its absence from a project brief.
+
+## 2026-11-26 — Stale flags on wiki pages, persona and scenarios (Mill Board #60, D84, D88, D89)
+
+### Added
+- `staleness::stale_check`: an artifact is stale when a live, unsuperseded, non-dormant, non-sensitive memory created after its last write shares an entity with its sources and is not one of them. Project entities (kind `project`, or named like a source's project) and hub entities linked to more than 250 memories are skipped; tags and a shared project do not count (D88); when the sources have a project, evidence from another project or with none does not count, and a promoted source's own project does not set the scope. Returns `stale` (null when there are no sources) and up to 5 `new_evidence` ids, newest first. At most 500 candidate rows per check. Computed at read time; no schema change. #61 reuses it.
+- `remind_me_wiki_read` returns `stale` and `new_evidence`, judged against the `mem_` ids the page cites; the markdown form opens with a stale note when stale.
+- `remind_me_persona` gives each statement `stale` and `new_evidence`, judged against its scenarios and their facts since its content last changed (the newest revision that rewrote it, else `created_at`), so a statement revised in place is fresh, while a reminder, a tag edit or other bookkeeping that stamps `updated_at` does not hide older evidence; refresh candidates use the same watermark. The search bootstrap and the brief stay unflagged (they read `promotion::persona`, unchanged).
+- `remind_me_promotion_candidates` lists stale scenarios (fact_to_scenario) and persona statements (scenario_to_persona) first as `refresh` candidates with `refresh_of` and `new_evidence`, taking at most half the page; a scenario's candidate carries its live facts plus the new evidence. Sensitive artifacts are never offered, and deleted or superseded sources are left out. `total_candidates` still counts new promotions only.
+- `remind_me_promote` takes optional `refreshes`: the live promoted memory at the target rung that the promotion replaces, superseded in the same transaction. A refresh may reuse the replaced statement's exact sources. The source, refresh-target and duplicate-evidence checks now run inside that transaction too, so two concurrent refreshes of one artifact (or two promotions of the same evidence) leave one live result and the other is refused.
+- `EntityStore::entities_of` (engine and SQLite, with a conformance check).
+
+### Latency
+- 25k memories, 50k links, release build: p50 21 ms, p95 30 ms per check, dominated by the engine's scan for the sources' links (links are indexed by entity only). `remind_me_persona` pays it once per statement.
+
+### Tests
+- Fresh; stale by entity; shared project only does not flag; project entity does not flag; other project does not flag; projectless evidence does not flag project sources; unrelated new memory does not flag; a new memory already a source does not flag; sensitive and superseded do not flag; hub skipped; evidence capped and newest first; candidate cap; no sources is unchecked; wiki page by cited ids; refresh candidate and supersede; persona refresh with the same sources; a bad `refreshes` refused; a sensitive artifact is not a refresh candidate; a withdrawn source is left out and the refresh still promotes; a statement on reverted decisions is not offered.
+
 ## 2026-11-26 — Backup and restore runbook (Mill Board #1622, D73)
 
 ### Added

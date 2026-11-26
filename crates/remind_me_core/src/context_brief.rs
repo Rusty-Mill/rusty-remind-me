@@ -297,6 +297,7 @@ pub fn build(store: &Store<'_>, request: &ContextRequest<'_>) -> Result<Outcome>
     if request.mode == Mode::Session {
         drafts.push(persona_draft(store)?);
         drafts.push(reminders_draft(store, now)?);
+        drafts.push(pinned_draft(store, now));
         let shown: HashSet<&str> = rest.iter().map(|m| m.id.as_str()).collect();
         let reviews = reviews_draft(&memories, &shown, now);
         let listed: HashSet<&str> = reviews.items.iter().map(|i| i.id.as_str()).collect();
@@ -642,6 +643,65 @@ fn reminders_draft(store: &Store<'_>, now: DateTime<Utc>) -> Result<Draft> {
     })
 }
 
+/// Most pinned-question names the session brief lists (D90).
+const PINNED_NAMES: usize = 3;
+
+/// Longest pinned-question name the brief shows, in characters; longer ones
+/// are cut with an ellipsis, so the one line fits its share of the budget.
+const PINNED_NAME_CHARS: usize = 24;
+
+fn short_name(name: &str) -> String {
+    match name.char_indices().nth(PINNED_NAME_CHARS) {
+        None => name.to_string(),
+        Some((cut, _)) => format!("{}…", &name[..cut]),
+    }
+}
+
+/// One line naming the pinned questions that need a new answer, only when
+/// any do (card #61, D90). Session briefs only: saved searches are global,
+/// so a project brief has nothing to match them on.
+///
+/// A failed check leaves the line out rather than failing the brief, which
+/// a SessionStart hook must always get.
+fn pinned_draft(store: &Store<'_>, now: DateTime<Utc>) -> Draft {
+    let stale = crate::saved_searches::stale_pinned(store).unwrap_or_else(|e| {
+        eprintln!("pinned question check failed: {e}");
+        Vec::new()
+    });
+    let items = match stale.is_empty() {
+        true => Vec::new(),
+        false => {
+            let names: Vec<String> = stale
+                .iter()
+                .take(PINNED_NAMES)
+                .map(|p| short_name(&p.name))
+                .collect();
+            let more = stale.len().saturating_sub(PINNED_NAMES);
+            let tail = match more {
+                0 => String::new(),
+                n => format!(" and {n} more"),
+            };
+            vec![Item {
+                id: "saved_searches".to_string(),
+                kind: "pinned".to_string(),
+                text: format!(
+                    "{} pinned question(s) need a new answer: {}{tail}. See remind_me_saved_searches action=list_stale.",
+                    stale.len(),
+                    names.join(", ")
+                ),
+                at: now.to_rfc3339(),
+            }]
+        }
+    };
+    // Weight 10 leaves room for the bounded line (three short names) at a
+    // SessionStart hook's 2000-token budget; an empty draft spends nothing.
+    Draft {
+        name: "pinned",
+        weight: 10,
+        items,
+    }
+}
+
 /// Decisions in scope due for a follow-up review (`crate::review`), oldest
 /// due date first. Listed here, they are left out of the project sections.
 /// The decisions due for review among `memories`, keeping only the `shown`
@@ -841,6 +901,7 @@ fn heading(name: &str) -> &'static str {
         "persona" => "Persona",
         "reminders" => "Reminders due within 7 days",
         "reviews" => "Decisions to review: did they hold up?",
+        "pinned" => "Pinned questions to refresh",
         "state" => "Current state",
         "open" => "Open: blockers, decisions, action items",
         "activity" => "Recent activity",
@@ -850,7 +911,7 @@ fn heading(name: &str) -> &'static str {
 
 fn line(section: &str, item: &Item) -> String {
     match section {
-        "persona" => format!("- {}", item.text),
+        "persona" | "pinned" => format!("- {}", item.text),
         "reminders" | "reviews" => format!("- due {}: {} ({})", item.at, item.text, item.id),
         _ => format!("- [{}] {} ({})", item.kind, item.text, item.id),
     }
@@ -1161,6 +1222,70 @@ mod tests {
         );
         assert!(text.starts_with("# Memory context (project: quokka, branch: feat)"));
         assert_eq!(brief.budget.limit, 0);
+    }
+
+    #[test]
+    fn the_session_brief_names_stale_pinned_questions_and_a_project_brief_does_not() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        for name in ["alpha", "beta", "gamma", "delta"] {
+            crate::saved_searches::save_search(
+                &store,
+                &crate::models::SaveSearchInput {
+                    name: name.to_string(),
+                    query: name.to_string(),
+                    category: None,
+                    tags: None,
+                    include_sensitive: false,
+                    watch: false,
+                },
+            )
+            .unwrap();
+            crate::saved_searches::pin_saved_search(&store, name).unwrap();
+        }
+        let session = brief(&store, &session(2000));
+        let rendered = render_markdown(&session);
+        assert_eq!(ids(&session, "pinned"), vec!["saved_searches".to_string()]);
+        assert!(rendered.contains("4 pinned question(s)"), "{rendered}");
+        assert!(
+            rendered.contains("alpha, beta, delta and 1 more"),
+            "{rendered}"
+        );
+
+        add(&store, "mem_q", |m| m.project = Some("quokka".to_string()));
+        assert!(ids(&brief(&store, &project("quokka")), "pinned").is_empty());
+    }
+
+    #[test]
+    fn long_pinned_names_still_fit_the_session_hook_budget() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        for i in 0..3 {
+            let name = format!("what does the deploy pipeline need before release {i}");
+            crate::saved_searches::save_search(
+                &store,
+                &crate::models::SaveSearchInput {
+                    name: name.clone(),
+                    query: "deploy".to_string(),
+                    category: None,
+                    tags: None,
+                    include_sensitive: false,
+                    watch: false,
+                },
+            )
+            .unwrap();
+            crate::saved_searches::pin_saved_search(&store, &name).unwrap();
+        }
+        for i in 0..40 {
+            add(&store, &format!("mem_r{i}"), |m| {
+                m.remind_at = Some(Utc::now().to_rfc3339());
+                m.content = format!("reminder number {i} with some words to take up space");
+            });
+        }
+        let session = brief(&store, &session(2000));
+        assert_eq!(ids(&session, "pinned"), vec!["saved_searches".to_string()]);
+        let rendered = render_markdown(&session);
+        assert!(rendered.contains("what does the deploy pip…"), "{rendered}");
     }
 
     #[test]
