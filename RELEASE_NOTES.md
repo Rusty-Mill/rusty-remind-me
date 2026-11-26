@@ -2,6 +2,16 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-26 — Pinned questions: standing answers that know when they are out of date (Mill Board #61, D84, D89)
+
+### Added
+- `remind_me_saved_searches` gains three actions. `pin` makes a saved search a pinned question. `answer` records its answer: an existing wiki page's slug and the 1 to 100 live memory ids it was written from; the server stamps `answered_at` and keeps the query it answered (and pins the search if needed). `list_stale` lists pinned questions whose answer is out of date, each with `reasons` and up to 5 `new_evidence` ids. Reasons: `unanswered`, `query_changed`, `answer_missing`, `evidence_gone`, `new_results` (the query now returns memories outside the evidence that were written or changed after the answer, read at 100 results with dormant memories included) and `related_evidence` (#60's stale check over the evidence). Refresh is two-phase with no lock: evidence that lands between `list_stale` and `answer` shows on the next `list_stale`.
+- The pin lives in the saved search's `filters` JSON as `pin`; no column. Re-saving a search keeps its pin.
+- The session-start brief (`remind_me_brief`, session mode) gets a "Pinned questions to refresh" line with the count and up to 3 names, only when any are stale (D89). Project briefs do not show it.
+
+### Tests
+- Unanswered pin is stale; fresh answer is not; a new result makes it stale and answering again clears it; an older memory entering the results does not flag; superseded evidence; missing answer page; re-save keeps the pin and a changed query is stale; answer input validation; the session brief line and its absence from a project brief.
+
 ## 2026-11-26 — Stale flags on wiki pages, persona and scenarios (Mill Board #60, D83, D87, D88)
 
 ### Added

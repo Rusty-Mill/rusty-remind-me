@@ -1957,6 +1957,45 @@ pub struct SavedSearchFilters {
     pub tags: Option<Vec<String>>,
     #[serde(default)]
     pub include_sensitive: bool,
+    /// Set when the saved search is a pinned question (card #61): the
+    /// answer and the evidence it was built from. Kept in the `filters`
+    /// JSON, so no column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin: Option<PinnedAnswer>,
+}
+
+/// A pinned question's current answer: a wiki page and the memory ids it
+/// was written from (card #61, D84).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PinnedAnswer {
+    /// The answer's wiki page. `None` until the question is answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_slug: Option<String>,
+    /// The memories the answer was written from.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_ids: Vec<String>,
+    /// When the answer was recorded (RFC 3339, server time).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answered_at: Option<String>,
+    /// The saved query the answer was written for; a changed query makes
+    /// the question stale until it is answered again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answered_query: Option<String>,
+}
+
+/// Most evidence ids one answer may record.
+pub const PIN_EVIDENCE_MAX: usize = 100;
+
+/// Request to record a pinned question's answer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnswerPinnedInput {
+    /// The saved search's name.
+    pub name: String,
+    /// Slug of the wiki page holding the answer; it must exist.
+    pub answer_slug: String,
+    /// The live memories the answer was written from, at most
+    /// [`PIN_EVIDENCE_MAX`].
+    pub evidence_ids: Vec<String>,
 }
 
 /// A stored query plus its filters, under a unique name.

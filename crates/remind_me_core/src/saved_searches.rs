@@ -33,9 +33,12 @@ use crate::db::saved_searches::SavedSearches;
 use crate::db::Result;
 use crate::db::Store;
 use crate::models::{
-    MemorySearchInput, SaveSearchInput, SavedSearch, SavedSearchFilters, POLL_RESULT_LIMIT,
+    AnswerPinnedInput, MemorySearchInput, PinnedAnswer, SaveSearchInput, SavedSearch,
+    SavedSearchFilters, PIN_EVIDENCE_MAX, POLL_RESULT_LIMIT,
 };
-use chrono::Utc;
+use crate::staleness::{stale_check, NEW_EVIDENCE_MAX};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 /// Stable id for a saved search, derived from its name.
 ///
@@ -58,6 +61,12 @@ pub fn save_search(store: &Store<'_>, input: &SaveSearchInput) -> Result<SavedSe
     let repo = SavedSearches::new(store);
     let now = Utc::now().to_rfc3339();
     let existing = repo.id_for_name(&input.name)?;
+    // Re-saving keeps a pinned question's answer (#61); a changed query
+    // then reads as stale until it is answered again.
+    let pin = match &existing {
+        Some(id) => repo.get(id)?.filters.pin,
+        None => None,
+    };
     let saved = SavedSearch {
         id: existing.clone().unwrap_or_else(|| make_id(&input.name)),
         name: input.name.clone(),
@@ -66,6 +75,7 @@ pub fn save_search(store: &Store<'_>, input: &SaveSearchInput) -> Result<SavedSe
             category: input.category.clone(),
             tags: input.tags.clone(),
             include_sensitive: input.include_sensitive,
+            pin,
         },
         watch: input.watch,
         created_at: now.clone(),
@@ -194,4 +204,223 @@ pub fn poll_watched_searches(store: &Store<'_>) -> Result<Vec<(String, PollOutco
         outcomes.push((saved.name, outcome));
     }
     Ok(outcomes)
+}
+
+// -- pinned questions (card #61, D84, D89) -----------------------------------
+
+/// Mark the saved search `name` as a pinned question. `None` if no saved
+/// search has that name. Pinning an already pinned search keeps its answer.
+pub fn pin_saved_search(store: &Store<'_>, name: &str) -> Result<Option<SavedSearch>> {
+    let repo = SavedSearches::new(store);
+    let Some(mut saved) = repo.get_by_name(name)? else {
+        return Ok(None);
+    };
+    if saved.filters.pin.is_none() {
+        saved.filters.pin = Some(PinnedAnswer::default());
+        saved.updated_at = Utc::now().to_rfc3339();
+        repo.update(&saved)?;
+    }
+    repo.get(&saved.id).map(Some)
+}
+
+/// Record a pinned question's answer: the wiki page and the live memories
+/// it was written from. Pins the search if it was not pinned. The server
+/// stamps `answered_at`; the query is recorded with it.
+///
+/// # Errors
+///
+/// [`StoreError::Invalid`] when the saved search or the page does not
+/// exist, no or too many ids are given, or an id is not a live memory.
+pub fn answer_pinned(store: &Store<'_>, input: &AnswerPinnedInput) -> Result<SavedSearch> {
+    let repo = SavedSearches::new(store);
+    let Some(mut saved) = repo.get_by_name(&input.name)? else {
+        return Err(invalid(format!(
+            "no saved search is named {:?}",
+            input.name
+        )));
+    };
+    if crate::wiki::get_wiki_page(store, &input.answer_slug)?.is_none() {
+        return Err(invalid(format!(
+            "no wiki page has slug {:?}",
+            input.answer_slug
+        )));
+    }
+    let evidence = dedup(&input.evidence_ids);
+    if evidence.is_empty() || evidence.len() > PIN_EVIDENCE_MAX {
+        return Err(invalid(format!(
+            "evidence_ids needs 1 to {PIN_EVIDENCE_MAX} memory ids, got {}",
+            evidence.len()
+        )));
+    }
+    let live = live_ids(store, &evidence)?;
+    if let Some(gone) = evidence.iter().find(|id| !live.contains(*id)) {
+        return Err(invalid(format!("{gone:?} is not a live memory")));
+    }
+
+    let now = Utc::now().to_rfc3339();
+    saved.filters.pin = Some(PinnedAnswer {
+        answer_slug: Some(input.answer_slug.clone()),
+        evidence_ids: evidence,
+        answered_at: Some(now.clone()),
+        answered_query: Some(saved.query.clone()),
+    });
+    saved.updated_at = now;
+    repo.update(&saved)?;
+    repo.get(&saved.id)
+}
+
+/// Why a pinned question needs a new answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StaleReason {
+    /// Pinned but never answered.
+    Unanswered,
+    /// The saved query changed since the answer was written.
+    QueryChanged,
+    /// The answer's wiki page no longer exists.
+    AnswerMissing,
+    /// A memory the answer was written from is deleted or superseded.
+    EvidenceGone,
+    /// The query now returns memories written or changed since the answer.
+    NewResults,
+    /// Newer memories share an entity with the evidence ([`stale_check`]).
+    RelatedEvidence,
+}
+
+/// A pinned question whose answer is out of date.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StalePinned {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_slug: Option<String>,
+    pub reasons: Vec<StaleReason>,
+    /// Up to [`NEW_EVIDENCE_MAX`] memories to read before answering again,
+    /// newest results first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub new_evidence: Vec<String>,
+}
+
+/// Every pinned question that needs a new answer, by name.
+///
+/// Phase one of the two-phase refresh: the client reads the new evidence,
+/// writes the answer page and records it with [`answer_pinned`]. Nothing is
+/// locked in between; evidence that lands meanwhile shows on the next call.
+pub fn stale_pinned(store: &Store<'_>) -> Result<Vec<StalePinned>> {
+    let now = Utc::now();
+    let mut out = Vec::new();
+    for saved in list_saved_searches(store)? {
+        let Some(pin) = &saved.filters.pin else {
+            continue;
+        };
+        if let Some(stale) = check_pinned(store, &saved, pin, now)? {
+            out.push(stale);
+        }
+    }
+    Ok(out)
+}
+
+/// `saved`'s staleness, `None` when its answer is current.
+fn check_pinned(
+    store: &Store<'_>,
+    saved: &SavedSearch,
+    pin: &PinnedAnswer,
+    now: DateTime<Utc>,
+) -> Result<Option<StalePinned>> {
+    let mut stale = StalePinned {
+        name: saved.name.clone(),
+        answer_slug: pin.answer_slug.clone(),
+        reasons: Vec::new(),
+        new_evidence: Vec::new(),
+    };
+    let (Some(slug), Some(answered_at)) = (&pin.answer_slug, &pin.answered_at) else {
+        stale.reasons.push(StaleReason::Unanswered);
+        return Ok(Some(stale));
+    };
+    if pin.answered_query.as_deref() != Some(saved.query.as_str()) {
+        stale.reasons.push(StaleReason::QueryChanged);
+    }
+    if crate::wiki::get_wiki_page(store, slug)?.is_none() {
+        stale.reasons.push(StaleReason::AnswerMissing);
+    }
+    if live_ids(store, &pin.evidence_ids)?.len() < pin.evidence_ids.len() {
+        stale.reasons.push(StaleReason::EvidenceGone);
+    }
+
+    let answered = parse_time(answered_at);
+    let new_results = new_results(store, saved, pin, answered)?;
+    if !new_results.is_empty() {
+        stale.reasons.push(StaleReason::NewResults);
+    }
+    let related = stale_check(store, &pin.evidence_ids, answered_at, now)?;
+    if related.is_stale() {
+        stale.reasons.push(StaleReason::RelatedEvidence);
+    }
+    stale.new_evidence = dedup(
+        &new_results
+            .into_iter()
+            .chain(related.new_evidence)
+            .collect::<Vec<_>>(),
+    );
+    stale.new_evidence.truncate(NEW_EVIDENCE_MAX);
+
+    Ok((!stale.reasons.is_empty()).then_some(stale))
+}
+
+/// Results of `saved` outside the answer's evidence that were written or
+/// changed after the answer, newest first.
+///
+/// Membership alone would flag questions when nothing new arrived: ranking
+/// moves with vitality and access counts, so an older memory can enter the
+/// top results on its own.
+fn new_results(
+    store: &Store<'_>,
+    saved: &SavedSearch,
+    pin: &PinnedAnswer,
+    answered: Option<DateTime<Utc>>,
+) -> Result<Vec<String>> {
+    let results = search_memories(store, &build_search_input(saved, Some(POLL_RESULT_LIMIT)))?;
+    let mut fresh: Vec<(DateTime<Utc>, String)> = results
+        .into_iter()
+        .map(|r| r.memory)
+        .filter(|m| !pin.evidence_ids.contains(&m.id))
+        .filter_map(|m| {
+            let touched = [&m.created_at, &m.updated_at]
+                .into_iter()
+                .filter_map(|t| parse_time(t))
+                .max()?;
+            let after = answered.is_none_or(|a| touched > a);
+            after.then_some((touched, m.id))
+        })
+        .collect();
+    fresh.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    Ok(fresh.into_iter().map(|(_, id)| id).collect())
+}
+
+/// The ids among `ids` that name live, unsuperseded memories.
+fn live_ids(store: &Store<'_>, ids: &[String]) -> Result<Vec<String>> {
+    Ok(crate::promotion::load_memories(store, ids)?
+        .into_iter()
+        .filter(|m| m.deleted_at.is_none() && m.superseded_by.is_none())
+        .map(|m| m.id)
+        .collect())
+}
+
+fn dedup(ids: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(ids.len());
+    for id in ids {
+        if !out.contains(id) {
+            out.push(id.clone());
+        }
+    }
+    out
+}
+
+fn parse_time(raw: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|t| t.with_timezone(&Utc))
+}
+
+fn invalid(message: String) -> crate::db::StoreError {
+    crate::db::StoreError::Invalid(message)
 }

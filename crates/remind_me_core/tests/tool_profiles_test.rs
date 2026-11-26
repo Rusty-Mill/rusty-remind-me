@@ -127,8 +127,9 @@ fn every_alias_points_at_a_public_tool_and_is_not_one_itself() {
     }
     // 78 tools before ADR-0030: 46 public names, 4 of them new, plus 36
     // aliases. ADR-0032 retired two sync tools and two sync aliases; step 2
-    // moved `self_update` to the CLI.
-    assert_eq!(public.len() - 4 + ALIASES.len(), 73);
+    // moved `self_update` to the CLI. #61 added three saved-search actions
+    // (pin, answer, list_stale) as handlers behind `remind_me_saved_searches`.
+    assert_eq!(public.len() - 4 + ALIASES.len(), 76);
 }
 
 #[test]
