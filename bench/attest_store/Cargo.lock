@@ -651,7 +651,7 @@ dependencies = [
 
 [[package]]
 name = "remind_me_core"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "chrono",
  "chrono-tz",
