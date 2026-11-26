@@ -643,11 +643,11 @@ fn reminders_draft(store: &Store<'_>, now: DateTime<Utc>) -> Result<Draft> {
     })
 }
 
-/// Most pinned-question names the session brief lists (D89).
+/// Most pinned-question names the session brief lists (D90).
 const PINNED_NAMES: usize = 3;
 
 /// One line naming the pinned questions that need a new answer, only when
-/// any do (card #61, D89). Session briefs only: saved searches are global,
+/// any do (card #61, D90). Session briefs only: saved searches are global,
 /// so a project brief has nothing to match them on.
 ///
 /// A failed check leaves the line out rather than failing the brief, which

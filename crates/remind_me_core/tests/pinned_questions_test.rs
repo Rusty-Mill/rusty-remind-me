@@ -1,5 +1,5 @@
 //! Pinned questions: standing answers that know when they are out of date
-//! (card #61, D84, D89).
+//! (card #61, D85, D90).
 
 #[path = "../src/test_env.rs"]
 mod test_env;

@@ -1965,7 +1965,7 @@ pub struct SavedSearchFilters {
 }
 
 /// A pinned question's current answer: a wiki page and the memory ids it
-/// was written from (card #61, D84).
+/// was written from (card #61, D85).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PinnedAnswer {
     /// The answer's wiki page. `None` until the question is answered.

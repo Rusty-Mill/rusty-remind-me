@@ -206,7 +206,7 @@ pub fn poll_watched_searches(store: &Store<'_>) -> Result<Vec<(String, PollOutco
     Ok(outcomes)
 }
 
-// -- pinned questions (card #61, D84, D89) -----------------------------------
+// -- pinned questions (card #61, D85, D90) -----------------------------------
 
 /// Mark the saved search `name` as a pinned question. `None` if no saved
 /// search has that name. Pinning an already pinned search keeps its answer.
@@ -298,7 +298,7 @@ pub struct StalePinned {
     /// newest results first.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub new_evidence: Vec<String>,
-    /// Evidence ids that are now deleted or superseded (D94). A superseding
+    /// Evidence ids that are now deleted or superseded (D95). A superseding
     /// memory is not followed: it shows only if the query matches it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence_gone: Vec<String>,

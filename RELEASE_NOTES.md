@@ -2,20 +2,20 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
-## 2026-11-26 — Pinned questions: standing answers that know when they are out of date (Mill Board #61, D84, D89)
+## 2026-11-26 — Pinned questions: standing answers that know when they are out of date (Mill Board #61, D85, D90)
 
 ### Added
-- `remind_me_saved_searches` gains three actions. `pin` makes a saved search a pinned question. `answer` records its answer: an existing wiki page's slug and the 1 to 100 live memory ids it was written from; the server stamps `answered_at` and keeps the query it answered (and pins the search if needed). `list_stale` lists pinned questions whose answer is out of date, each with `reasons`, up to 5 `new_evidence` ids and the `evidence_gone` ids (deleted or superseded evidence, D94). Reasons: `unanswered`, `query_changed`, `answer_missing`, `evidence_gone`, `new_results` (the query now returns memories outside the evidence that were written or changed after the answer, read at 100 results with dormant memories included) and `related_evidence` (#60's stale check over the evidence). Refresh is two-phase with no lock: evidence that lands between `list_stale` and `answer` shows on the next `list_stale`.
+- `remind_me_saved_searches` gains three actions. `pin` makes a saved search a pinned question. `answer` records its answer: an existing wiki page's slug and the 1 to 100 live memory ids it was written from; the server stamps `answered_at` and keeps the query it answered (and pins the search if needed). `list_stale` lists pinned questions whose answer is out of date, each with `reasons`, up to 5 `new_evidence` ids and the `evidence_gone` ids (deleted or superseded evidence, D95). Reasons: `unanswered`, `query_changed`, `answer_missing`, `evidence_gone`, `new_results` (the query now returns memories outside the evidence that were written or changed after the answer, read at 100 results with dormant memories included) and `related_evidence` (#60's stale check over the evidence). Refresh is two-phase with no lock: evidence that lands between `list_stale` and `answer` shows on the next `list_stale`.
 - The pin lives in the saved search's `filters` JSON as `pin`; no column. Re-saving a search keeps its pin.
-- The session-start brief (`remind_me_brief`, session mode) gets a "Pinned questions to refresh" line with the count and up to 3 names, only when any are stale (D89). Project briefs do not show it.
+- The session-start brief (`remind_me_brief`, session mode) gets a "Pinned questions to refresh" line with the count and up to 3 names, only when any are stale (D90). Project briefs do not show it.
 
 ### Tests
 - Unanswered pin is stale; fresh answer is not; a new result makes it stale and answering again clears it; an older memory entering the results does not flag; superseded evidence; missing answer page; re-save keeps the pin and a changed query is stale; answer input validation; the session brief line and its absence from a project brief.
 
-## 2026-11-26 — Stale flags on wiki pages, persona and scenarios (Mill Board #60, D83, D87, D88)
+## 2026-11-26 — Stale flags on wiki pages, persona and scenarios (Mill Board #60, D84, D88, D89)
 
 ### Added
-- `staleness::stale_check`: an artifact is stale when a live, unsuperseded, non-dormant, non-sensitive memory created after its last write shares an entity with its sources and is not one of them. Project entities (kind `project`, or named like a source's project) and hub entities linked to more than 250 memories are skipped; tags and a shared project do not count (D87); evidence from another project does not count. Returns `stale` (null when there are no sources) and up to 5 `new_evidence` ids, newest first. At most 500 candidate rows per check. Computed at read time; no schema change. #61 reuses it.
+- `staleness::stale_check`: an artifact is stale when a live, unsuperseded, non-dormant, non-sensitive memory created after its last write shares an entity with its sources and is not one of them. Project entities (kind `project`, or named like a source's project) and hub entities linked to more than 250 memories are skipped; tags and a shared project do not count (D88); evidence from another project does not count. Returns `stale` (null when there are no sources) and up to 5 `new_evidence` ids, newest first. At most 500 candidate rows per check. Computed at read time; no schema change. #61 reuses it.
 - `remind_me_wiki_read` returns `stale` and `new_evidence`, judged against the `mem_` ids the page cites; the markdown form opens with a stale note when stale.
 - `remind_me_persona` gives each statement `stale` and `new_evidence`, judged against its scenarios and their facts. The search bootstrap and the brief stay unflagged (they read `promotion::persona`, unchanged).
 - `remind_me_promotion_candidates` lists stale scenarios (fact_to_scenario) and persona statements (scenario_to_persona) first as `refresh` candidates with `refresh_of` and `new_evidence`, taking at most half the page; a scenario's candidate carries its facts plus the new evidence. `total_candidates` still counts new promotions only.
@@ -28,6 +28,19 @@ Dated entries, newest first. One entry per merged pull request.
 ### Tests
 - Fresh; stale by entity; shared project only does not flag; project entity does not flag; other project does not flag; unrelated new memory does not flag; a new memory already a source does not flag; sensitive and superseded do not flag; hub skipped; evidence capped and newest first; candidate cap; no sources is unchecked; wiki page by cited ids; refresh candidate and supersede; persona refresh with the same sources; a bad `refreshes` refused.
 
+## 2026-11-26 — `decisions normalize --apply`: project folds and retype (Mill Board #1564, D71, D72, D83)
+
+### Added
+- `--fold FROM=TO` on `decisions normalize` (repeatable): a new `respell` bucket lists every live, non-sensitive, unsuperseded memory of any type whose project is exactly `FROM`, and `--apply` renames it to `TO` (D71: `--fold let_em_loose=let-em-loose`). Refused unless `FROM` and `TO` are two spellings of one name. The folds are validated as one set: a spelling folded twice, or a fold targeting a spelling another fold renames (inverse pair, chain, cycle), is refused, so a second apply renames nothing. Each respell row carries its planned fold; the write skips a row whose project has since moved to another fold's spelling. Without `--fold`, nothing is respelled.
+- `decisions normalize --apply` now also applies the `retype` bucket (D72, D83): rows with `category: decision`, or whose content opens by defining a ref, that carry a rationale become `memory_type: decision`, with `metadata.decision_ref` when the ref is known. No project is assigned, no review is scheduled (D74), and a row without a rationale stays in "needs rationale" (D32).
+- Order within one run: respell, retype, add ref; every row is re-read and re-planned in its own transaction, revision written last; claim rows skipped.
+- `plan_normalize_with`, `apply_normalize_with`, `Fold` and `Folds` (the validated set) in `decisions_backfill`; the daemon ops `decisions_normalize_plan` and `decisions_normalize_apply` take an optional `folds` (serde default, so older clients work). `NormalizeApplied` gains `respelled` and `retyped`.
+
+### Not yet
+- Running it on the live store is Nano's (D3, D30): dry run with `--fold let_em_loose=let-em-loose` first. The revision log does not track `memory_type`, so a retype's revision records the metadata it replaced but not the old type (unchanged history format).
+
+### Tests
+- Fold parsing (blank side, same spelling, two different projects refused); fold sets (ambiguous, inverse, chained, cyclic refused) and a second apply that renames nothing; a respell skipped after an intervening project edit to another fold's spelling; respell matches the exact spelling, any type, and honours `--project`; one apply run respells, retypes and adds a ref to a row folded in the same run, leaves no-rationale and claim rows alone, schedules no review, records a revision, and a second run does nothing; CLI parsing of repeated `--fold` and its refusals.
 ## 2026-11-26 — Shadow-write captured dialogs to the dialog store (Mill Board #528, D82)
 
 ### Added

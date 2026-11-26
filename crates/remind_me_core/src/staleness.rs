@@ -1,4 +1,4 @@
-//! Read-time stale flags on derived knowledge (card #60, D83, D87, D88).
+//! Read-time stale flags on derived knowledge (card #60, D84, D88, D89).
 //!
 //! A wiki page, scenario or persona statement is written from some source
 //! memories and then left alone. Nothing told a reader when newer evidence
@@ -7,7 +7,7 @@
 //! schema change: the artifact is stale when a newer memory shares an entity
 //! with its sources.
 //!
-//! # What counts as related (D87)
+//! # What counts as related (D88)
 //!
 //! Only a shared entity. Tags do not count, and neither does sharing a
 //! project: in an active project nearly every page would read as stale within
@@ -43,7 +43,7 @@ use std::collections::HashSet;
 pub const NEW_EVIDENCE_MAX: usize = 5;
 
 /// An entity linked to more memories than this is a hub and is skipped
-/// (D88): it relates everything, so it says nothing about one artifact.
+/// (D89): it relates everything, so it says nothing about one artifact.
 pub const HUB_LINK_CAP: usize = 250;
 
 /// Most candidate rows one check reads across all its entities.
