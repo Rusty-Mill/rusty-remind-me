@@ -1,10 +1,10 @@
 # Spike: entity overlap as a ranking signal (Mill Board #64)
 
-Status: **measured 2026-11-26** on the #59 eval fixture in a cloud session.
-Verdict under D92: **pending the #1563 run**. The fixture half passes, but
-all of its lift comes from synthetic queries this spike wrote, and the
-real-query half of the keep rule (the #1563 set, on Nano's host) is **not yet
-measured** (D93). The weight stays 0 by default.
+Status: **measured 2026-11-26**, fixture half in a cloud session, real-query
+half on Nano's host against a copy of the live store.
+Verdict under D92: **drop**. The fixture lift came from synthetic queries; on
+the #1563 real-query set the best non-zero weight lifts entity-query MRR by
+only 0.002 and lowers their recall@10. The weight stays 0 by default.
 
 ## Question
 
@@ -127,7 +127,7 @@ of entities should be timed before the weight is turned on.
 | 0.5 | +0.204 MRR | 0.000 | yes |
 | 1.0 | +0.194 MRR | 0.000 | yes |
 
-**Fixture half passes; verdict pending the #1563 run (D93).** The best
+**Fixture half passes; the real-query half fails (below), so the verdict is drop.** The best
 non-zero weight is 0.5. Adversarial queries count in the entity pool, not as
 an "other kind" in the drop check (D93), and their losses are listed below.
 On keep, a draft PR opens with this code; on drop, a docs-only PR carries this
@@ -148,14 +148,56 @@ Caveats that limit this result:
 - Resolution is exact: no fuzzy, hyphen or plural matching. "dock
   controller" does not find `dock-controller`.
 
-## Not yet measured: the real-query half
+## Real queries (#1563 set)
 
-The #1563 real-query set (50 labelled questions, 13 of them entity questions)
-lives on Nano's host, outside the repo (D27), and cannot be reached from a
-cloud session. That half of D92 is **not yet measured**. To run it, point
-the runner at that set and a copy of the live store with
-`REMIND_ME_RRF_W_ENTITY` at 0 and 0.5, and apply the same rule. Until then
-the default stays 0.0, so production behaviour is unchanged.
+Measured 2026-11-26 on BaileyAi, against a copy of the newest remind-me
+backup (2026-11-26), with the store's own embedder (ollama
+`qwen3-embedding:0.6b`, 1024 dims, matching the stored vectors). The query
+set and raw outputs stay on that host (D27); only aggregates are here.
+
+- **Path.** `search_with_expansions`, the `remind_me_search` path: top 10,
+  no token budget (0), compact detail, HyDE and rerank off, default strategy,
+  `REMIND_ME_DAEMON=0`. Runner: `tests/entity_signal_real_queries_test.rs`,
+  ignored, reading the store, query file and output path from the
+  environment.
+- **Entity pool.** A query is in the pool when
+  `entity::resolve_query_entities` resolves at least one entity from it on
+  the copy: **37 of 50**. That takes 12 of the 13 labelled `entity` queries,
+  15 of 22 `exact` and 10 of 15 `paraphrase`. The rest keep their kind.
+- **Search writes.** The search path records accesses and co-retrieval
+  pairs, and those writes move later rankings: a first pass on one shared
+  copy changed the top 10 of every query, non-entity ones included. So each
+  weight starts from a fresh copy, and only the first search of each query
+  is scored. A second weight-0 run on a fresh copy matched the first exactly
+  (0 of 50 rankings differed), so the deltas below are the signal, not drift.
+
+| group | n | weight | recall@10 | MRR | recall@10 change | MRR change | wins/losses |
+|---|---|---|---|---|---|---|---|
+| entity pool | 37 | 0 | 0.890 | 0.826 | | | |
+| entity pool | 37 | 0.5 | 0.872 | 0.829 | -0.018 | +0.002 | 5/4 |
+| entity pool | 37 | 1.0 | 0.863 | 0.821 | -0.027 | -0.005 | 5/4 |
+| exact (unresolved) | 7 | 0, 0.5, 1.0 | 0.952 | 0.929 | 0.000 | 0.000 | 0/0 |
+| paraphrase (unresolved) | 5 | 0, 0.5, 1.0 | 0.733 | 0.800 | 0.000 | 0.000 | 0/0 |
+| entity (unresolved) | 1 | 0, 0.5, 1.0 | 1.000 | 1.000 | 0.000 | 0.000 | 0/0 |
+| all | 50 | 0 | 0.885 | 0.841 | | | |
+| all | 50 | 0.5 | 0.872 | 0.843 | -0.013 | +0.002 | 5/4 |
+| all | 50 | 1.0 | 0.865 | 0.838 | -0.020 | -0.004 | 5/4 |
+
+Latency per search (5 searches per query, 250 per weight, release build), in
+milliseconds: weight 0 p50 561 / p95 663, 0.5 565 / 664, 1.0 561 / 660; the
+weight-0 rerun gave 559 / 672. The added cost is within run-to-run noise. Most
+of the time is the query embedding and the store's size, not the signal.
+
+Recall@10 falls even though the signal adds no hits: it reorders the whole
+keyword and semantic union before the cut at 10, so a relevant row with no
+entity link can drop out of the top 10 behind linked rows. Over a third of
+the entity pool (15 of 37) are queries labelled `exact` or `paraphrase`,
+where the words that resolve to an entity are incidental, the real-world
+case of the fixture's adversarial queries.
+
+**Drop under D92:** the best non-zero weight (0.5) lifts entity-pool MRR by
+0.002 and recall@10 by -0.018, short of the 0.02 lift, while no other kind
+moves. The fixture half passed only on queries this spike wrote.
 
 ## Open questions
 
