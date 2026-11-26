@@ -18,6 +18,17 @@ Dated entries, newest first. One entry per merged pull request.
 ### Tests
 - Valid and malformed values on each write path, naming the key; update sets, clears and refuses; a malformed stored value read as absent and not blocking an edit; a row written today about last month found by `occurred` and not by `created`; instant and span placement, span overlap at each edge, fallback to `created_at`; `time_field: occurred` parsing; recency ordering in rank and score fusion; inferred windows reading `occurred`; the conformance check on both backends.
 
+## 2026-11-26 — 0.5.0: release
+
+### Changed
+- All five workspace crates and the plugin manifest are now 0.5.0. Merging this publishes the `v0.5.0` GitHub Release (release.yml). It collects the 66 pull requests merged since 0.4.2 (#361 to #428, the entries below); this change adds no code.
+- Minor, not patch, because 0.4.2's surface changed: multi-node sync and the hub are removed (#372), the default MCP tool profile is `core` with admin tools moved to the CLI (ADR-0030 step 2), and `MemoryListInput::default()` lists 20 rows with `limit: 0` an error (#223).
+- Upgrading from 0.4.2: the store moves to schema v33 (#367), which is one-way; keep a backup to roll back to a 0.4.2 binary.
+- Highlights: the storage port (ADR-0035) with a SQLite backend and the R3 store benchmark; the append-only dialog store with opt-in shadow writes of captured dialogs (`REMIND_ME_DIALOG_SHADOW=1`, off by default; #528); dialog rows protected in place (#1616); decisions-log export, `decisions normalize --apply` with `--fold` project respelling and retype, and `decisions import --apply` (#1564, #1565); atomic updates and deletes (D62); duplicate warnings on save; search says how it ran; decisions and preferences never go dormant; the wiki compiles with a local model.
+- Limits that still hold in 0.5.0: `decisions import --apply` and `decisions normalize --apply` are data migrations Nano runs against the live store only after a dry run (D3, D30; import also after the restore drill, D73); dialog shadow writes are off unless `REMIND_ME_DIALOG_SHADOW=1`, and nothing reads the dialog store yet; a retype's revision does not record the old `memory_type`.
+- Every pull request merged since 0.4.2 is included; none is held back.
+- Known issue, fix to follow in its own pull request (raised on #428): `decisions normalize --apply` sends its `Updated` events from inside the write transaction, so a configured event receiver can see an update before the row and its revision are committed, or for a write whose commit then fails. This predates #428 for add-ref; #428 extends it to respell and retype. Until the fix ships, don't treat those events as proof of a committed write, or run the apply with no receiver configured.
+
 ## 2026-11-26 — `decisions normalize --apply`: project folds and retype (Mill Board #1564, D71, D72, D83)
 
 ### Added
