@@ -5,11 +5,23 @@ Dated entries, newest first. One entry per merged pull request.
 ## 2026-11-26 — 0.5.0: release
 
 ### Changed
-- All five workspace crates and the plugin manifest are now 0.5.0. Merging this publishes the `v0.5.0` GitHub Release (release.yml). It collects the 64 pull requests merged since 0.4.2 (#361 to #426, the entries below); this change adds no code.
+- All five workspace crates and the plugin manifest are now 0.5.0. Merging this publishes the `v0.5.0` GitHub Release (release.yml). It collects the 65 pull requests merged since 0.4.2 (#361 to #427, the entries below); this change adds no code.
 - Minor, not patch, because 0.4.2's surface changed: multi-node sync and the hub are removed (#372), the default MCP tool profile is `core` with admin tools moved to the CLI (ADR-0030 step 2), and `MemoryListInput::default()` lists 20 rows with `limit: 0` an error (#223).
 - Upgrading from 0.4.2: the store moves to schema v33 (#367), which is one-way; keep a backup to roll back to a 0.4.2 binary.
-- Highlights: the storage port (ADR-0035) with a SQLite backend and the R3 store benchmark; the append-only dialog store, not yet wired (#528); dialog rows protected in place (#1616); decisions-log export, normalise, and `decisions import --apply` (#1564, #1565); atomic updates and deletes (D62); duplicate warnings on save; search says how it ran; decisions and preferences never go dormant; the wiki compiles with a local model.
-- Not included, still open: #427 (shadow-write captured dialogs) and #428 (`decisions normalize --fold`).
+- Highlights: the storage port (ADR-0035) with a SQLite backend and the R3 store benchmark; the append-only dialog store with opt-in shadow writes of captured dialogs (`REMIND_ME_DIALOG_SHADOW=1`, off by default; #528); dialog rows protected in place (#1616); decisions-log export, normalise, and `decisions import --apply` (#1564, #1565); atomic updates and deletes (D62); duplicate warnings on save; search says how it ran; decisions and preferences never go dormant; the wiki compiles with a local model.
+- Not included, still open: #428 (`decisions normalize --fold`).
+
+## 2026-11-26 — Shadow-write captured dialogs to the dialog store (Mill Board #528, D82)
+
+### Added
+- `dialog_shadow`: with `REMIND_ME_DIALOG_SHADOW=1`, each dialog row a capture writes (the first and every continuation) is also appended to `<database file name>.dialogs/` beside the database, keyed by its memory id and carrying its `capture_id`, after redaction. Off by default; production behaviour is unchanged unless the flag is set. The `memories` row stays the record.
+- A failed shadow write is logged and counted (`dialog_shadow::failures()`); the capture succeeds.
+
+### Not yet
+- Showing the failure count in `remind_me_server_status`, backfill of existing rows, reads, search over the store, backup, reconcile on open, the rebuild check and the migration are separate pull requests. No MCP tool name or signature changes.
+
+### Tests
+- Flag off touches no file; two databases in one directory keep separate stores; a first capture and its continuation land together with a token redacted; flag on appends the dialog under its memory id; a blocked store leaves the capture intact and counted; a record twice is one row.
 
 ## 2026-11-25 — Append-only dialog store: port and SQLite adapter (Mill Board #528, D75 to D81, ADR-0037)
 
