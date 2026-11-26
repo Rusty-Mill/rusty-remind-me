@@ -1321,6 +1321,19 @@ fn append_continuation(
         ..provenance.stamp(NewMemory::new(id.clone(), content.clone(), &now))
     };
     Memories::new(store).insert(&row)?;
+    if let Some(capture_id) = row.capture_id.as_deref() {
+        crate::dialog_shadow::record(
+            store,
+            &crate::db::dialogs::NewDialog {
+                id: &id,
+                capture_id,
+                session_id: row.session_id.as_deref(),
+                project: row.project.as_deref(),
+                created_at: &now,
+                body: &content,
+            },
+        );
+    }
     Ok((id, content))
 }
 
