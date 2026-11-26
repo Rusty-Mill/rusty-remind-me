@@ -158,3 +158,34 @@ fn all_ids(db: &Database) -> Vec<String> {
         .map(|m| m.id)
         .collect()
 }
+
+#[test]
+fn a_summary_whose_category_is_dialog_is_not_shadowed_only_the_transcript() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_env::set_var(ENV, "1");
+    let (dir, db) = fresh("role");
+    let mut odd = input();
+    odd.category = "dialog".into();
+    let made = auto_capture(&db.store(), &odd).unwrap();
+    test_env::remove_var(ENV);
+    let dialogs = SqliteDialogs::open(&dir.join("remind_me.db.dialogs")).unwrap();
+    let rows = dialogs.for_capture(&made.capture_id).unwrap();
+    assert_eq!(rows.len(), 1, "the summary is not a transcript");
+    assert_eq!(rows[0].id, made.dialog_id);
+}
+
+#[test]
+fn a_committed_row_that_cannot_be_read_back_is_counted_not_dropped() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_env::set_var(ENV, "1");
+    let (dir, db) = fresh("lookup");
+    let before = failures();
+    remind_me_core::dialog_shadow::record_committed(&db.store(), "mem_missing");
+    test_env::remove_var(ENV);
+    assert_eq!(failures(), before + 1);
+    assert!(!dir.join("remind_me.db.dialogs").exists());
+    // Off: no lookup, no count.
+    let before = failures();
+    remind_me_core::dialog_shadow::record_committed(&db.store(), "mem_missing");
+    assert_eq!(failures(), before);
+}

@@ -142,7 +142,9 @@ fn insert_half(
     };
     crate::episodes::ensure_session(store, &session)?;
     Memories::new(store).insert(&row)?;
-    if category == DIALOG_CATEGORY {
+    // The dialog half only, by role: the summary half carries the caller's category, which
+    // may itself be `dialog`.
+    if !extract {
         crate::dialog_shadow::record(
             store,
             &crate::db::dialogs::NewDialog {

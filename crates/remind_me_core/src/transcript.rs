@@ -1016,9 +1016,7 @@ fn recapture(
     // Shadow-written after the commit, so a rolled-back continuation leaves
     // no row (D82): the committed row is read back as stored.
     if let Keep::Continuation { row, .. } = &keep {
-        if let Ok(Some(memory)) = Memories::new(store).get_live(row) {
-            crate::dialog_shadow::record_memory(store, &memory);
-        }
+        crate::dialog_shadow::record_committed(store, row);
     }
     // Embedded after the commit, best-effort as an update is: a model call
     // never runs inside the write, and its failure undoes nothing.

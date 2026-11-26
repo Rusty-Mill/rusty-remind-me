@@ -9,6 +9,7 @@
 
 use crate::blobs::BlobStore;
 use crate::db::dialogs::{DialogLog, NewDialog};
+use crate::db::memories::Memories;
 use crate::db::sqlite::SqliteDialogs;
 use crate::db::Store;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,7 +24,8 @@ pub fn failures() -> u64 {
     FAILURES.load(Ordering::Relaxed)
 }
 
-fn enabled() -> bool {
+/// Whether the shadow write is on (`REMIND_ME_DIALOG_SHADOW=1`).
+pub fn enabled() -> bool {
     std::env::var(ENV).is_ok_and(|v| v == "1")
 }
 
@@ -33,6 +35,26 @@ fn dir_for(db: &std::path::Path) -> Option<std::path::PathBuf> {
     let mut name = db.file_name()?.to_os_string();
     name.push(".dialogs");
     Some(db.with_file_name(name))
+}
+
+/// Count and report a shadow write that could not be made.
+fn fail(what: &str, e: &dyn std::fmt::Display) {
+    FAILURES.fetch_add(1, Ordering::Relaxed);
+    eprintln!("rusty-remind-me: dialog shadow write of {what} failed: {e}");
+}
+
+/// Append the committed dialog row `id` to the shadow store, if enabled. The row is read back
+/// as stored (already redacted); a row that cannot be read is a counted failure, never a
+/// silent drop.
+pub fn record_committed(store: &Store<'_>, id: &str) {
+    if !enabled() {
+        return;
+    }
+    match Memories::new(store).get_live(id) {
+        Ok(Some(row)) => record_memory(store, &row),
+        Ok(None) => fail(id, &"the committed row is missing"),
+        Err(e) => fail(id, &e),
+    }
 }
 
 /// Append a committed dialog row to the shadow store, if enabled.
@@ -65,11 +87,7 @@ pub fn record(store: &Store<'_>, dialog: &NewDialog<'_>) {
     let result = SqliteDialogs::open(&dir)
         .and_then(|s| DialogLog::new(s, BlobStore::new(dir.join("blobs"))).record(dialog));
     if let Err(e) = result {
-        FAILURES.fetch_add(1, Ordering::Relaxed);
-        eprintln!(
-            "rusty-remind-me: dialog shadow write of {} failed: {e}",
-            dialog.id
-        );
+        fail(dialog.id, &e);
     }
 }
 
