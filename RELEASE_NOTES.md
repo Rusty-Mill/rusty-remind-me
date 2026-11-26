@@ -2,12 +2,12 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
-## 2026-11-26 — Entity overlap ranking signal, off by default (Mill Board #64, D86, D91)
+## 2026-11-26 — Entity overlap ranking signal, off by default (Mill Board #64, D87, D92)
 
 ### Added
 - `REMIND_ME_RRF_W_ENTITY` (`RrfWeights::w_entity`, default 0.0): search re-ranks the candidates it already found by how many of the query's entities each is linked to. Strategy presets scale it as they scale `w_idf`. At 0, nothing is looked up and ranking is unchanged.
 - `entity::resolve_query_entities`: finds the entities whose name or alias is a run of up to three words in a free-text query, ignoring case and spacing.
-- `docs/research/64-entity-signal-spike.md`: the measurement. On the #59 fixture it passes D91: entity-query MRR rises 0.16 to 0.25 at weight 0.5, and no other kind or strategy moves. The gain comes from a synthetic entity set added for the spike. Queries that name an entity which is not what they are after lose MRR. The #1563 real-query half is not yet measured, so the default stays 0.
+- `docs/research/64-entity-signal-spike.md`: the measurement. On the #59 fixture it passes D92: entity-query MRR rises 0.16 to 0.25 at weight 0.5, and no other kind or strategy moves. The gain comes from a synthetic entity set added for the spike. Queries that name an entity which is not what they are after lose MRR. The #1563 real-query half is not yet measured, so the default stays 0.
 
 ### Not yet
 - The real-query measurement on Nano's host, a per-result `entity_score` field, and any change to the default weight.

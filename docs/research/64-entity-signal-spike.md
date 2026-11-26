@@ -1,10 +1,10 @@
 # Spike: entity overlap as a ranking signal (Mill Board #64)
 
 Status: **measured 2026-11-26** on the #59 eval fixture in a cloud session.
-Verdict under D91: **pending the #1563 run**. The fixture half passes, but
+Verdict under D92: **pending the #1563 run**. The fixture half passes, but
 all of its lift comes from synthetic queries this spike wrote, and the
 real-query half of the keep rule (the #1563 set, on Nano's host) is **not yet
-measured** (D92). The weight stays 0 by default.
+measured** (D93). The weight stays 0 by default.
 
 ## Question
 
@@ -13,12 +13,12 @@ entities they are linked to improve search enough to keep?
 
 ## Keep rule
 
-Nano, 2026-11-26 (pack D91): keep if the best non-zero weight lifts recall@10
+Nano, 2026-11-26 (pack D92): keep if the best non-zero weight lifts recall@10
 or MRR by at least 2 points on entity queries, and no other query kind or
 strategy drops more than 0.02. Otherwise drop. The rule has two halves: the
 fixture and the off-repo #1563 real-query set.
 
-## What was built (pack D86)
+## What was built (pack D87)
 
 - `RrfWeights::w_entity`, default 0.0, read from `REMIND_ME_RRF_W_ENTITY` and
   scaled by the strategy presets the way `w_idf` is (multiplier 1.0 in every
@@ -120,16 +120,16 @@ The added cost is within noise on this store. Resolution scans every entity
 once per search, so the cost grows with entity count. A store with thousands
 of entities should be timed before the weight is turned on.
 
-## Verdict under D91
+## Verdict under D92
 
 | weight | entity lift (best of recall@10, MRR) | worst drop elsewhere | passes |
 |---|---|---|---|
 | 0.5 | +0.204 MRR | 0.000 | yes |
 | 1.0 | +0.194 MRR | 0.000 | yes |
 
-**Fixture half passes; verdict pending the #1563 run (D92).** The best
+**Fixture half passes; verdict pending the #1563 run (D93).** The best
 non-zero weight is 0.5. Adversarial queries count in the entity pool, not as
-an "other kind" in the drop check (D92), and their losses are listed below.
+an "other kind" in the drop check (D93), and their losses are listed below.
 On keep, a draft PR opens with this code; on drop, a docs-only PR carries this
 write-up and the code stays unmerged on its branch.
 
@@ -152,14 +152,14 @@ Caveats that limit this result:
 
 The #1563 real-query set (50 labelled questions, 13 of them entity questions)
 lives on Nano's host, outside the repo (D27), and cannot be reached from a
-cloud session. That half of D91 is **not yet measured**. To run it, point
+cloud session. That half of D92 is **not yet measured**. To run it, point
 the runner at that set and a copy of the live store with
 `REMIND_ME_RRF_W_ENTITY` at 0 and 0.5, and apply the same rule. Until then
 the default stays 0.0, so production behaviour is unchanged.
 
 ## Open questions
 
-- Should `entity-adversarial` queries count as an "other kind" in D91's drop
+- Should `entity-adversarial` queries count as an "other kind" in D92's drop
   check? Counting them, the fixture result is drop: they lose more than
   0.02.
 - If the signal is kept, should the result carry its share as its own field

@@ -4,7 +4,7 @@
 //! Runs the #59 harness's gated modes (keyword, hashed) under every strategy
 //! at entity weights 0, 0.5 and 1.0, and prints, per query kind, recall@5,
 //! recall@10 and MRR, the per-query wins and losses against weight 0, the
-//! search latency each weight adds, and the D91 keep rule's verdict.
+//! search latency each weight adds, and the D92 keep rule's verdict.
 //!
 //! Two stores, so the gated baseline is never touched:
 //!
@@ -53,7 +53,7 @@ const ENTITY_WEIGHT_ENV: &str = "REMIND_ME_RRF_W_ENTITY";
 const WEIGHTS: [&str; 3] = ["0", "0.5", "1.0"];
 /// Searches per query per strategy, for the latency percentiles.
 const REPEATS: usize = 5;
-/// D91: the lift that keeps the signal, and the drop that sinks it.
+/// D92: the lift that keeps the signal, and the drop that sinks it.
 const KEEP_LIFT: f64 = 0.02;
 const MAX_DROP: f64 = 0.02;
 
