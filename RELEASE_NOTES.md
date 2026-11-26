@@ -2,6 +2,19 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-26 — `decisions normalize --apply`: project folds and retype (Mill Board #1564, D71, D72, D83)
+
+### Added
+- `--fold FROM=TO` on `decisions normalize` (repeatable): a new `respell` bucket lists every live, non-sensitive, unsuperseded memory of any type whose project is exactly `FROM`, and `--apply` renames it to `TO` (D71: `--fold let_em_loose=let-em-loose`). Refused unless `FROM` and `TO` are two spellings of one name. The folds are validated as one set: a spelling folded twice, or a fold targeting a spelling another fold renames (inverse pair, chain, cycle), is refused, so a second apply renames nothing. Each respell row carries its planned fold; the write skips a row whose project has since moved to another fold's spelling. Without `--fold`, nothing is respelled.
+- `decisions normalize --apply` now also applies the `retype` bucket (D72, D83): rows with `category: decision`, or whose content opens by defining a ref, that carry a rationale become `memory_type: decision`, with `metadata.decision_ref` when the ref is known. No project is assigned, no review is scheduled (D74), and a row without a rationale stays in "needs rationale" (D32).
+- Order within one run: respell, retype, add ref; every row is re-read and re-planned in its own transaction, revision written last; claim rows skipped.
+- `plan_normalize_with`, `apply_normalize_with`, `Fold` and `Folds` (the validated set) in `decisions_backfill`; the daemon ops `decisions_normalize_plan` and `decisions_normalize_apply` take an optional `folds` (serde default, so older clients work). `NormalizeApplied` gains `respelled` and `retyped`.
+
+### Not yet
+- Running it on the live store is Nano's (D3, D30): dry run with `--fold let_em_loose=let-em-loose` first. The revision log does not track `memory_type`, so a retype's revision records the metadata it replaced but not the old type (unchanged history format).
+
+### Tests
+- Fold parsing (blank side, same spelling, two different projects refused); fold sets (ambiguous, inverse, chained, cyclic refused) and a second apply that renames nothing; a respell skipped after an intervening project edit to another fold's spelling; respell matches the exact spelling, any type, and honours `--project`; one apply run respells, retypes and adds a ref to a row folded in the same run, leaves no-rationale and claim rows alone, schedules no review, records a revision, and a second run does nothing; CLI parsing of repeated `--fold` and its refusals.
 ## 2026-11-26 — Shadow-write captured dialogs to the dialog store (Mill Board #528, D82)
 
 ### Added
