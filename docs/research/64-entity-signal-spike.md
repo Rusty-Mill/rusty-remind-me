@@ -1,9 +1,10 @@
 # Spike: entity overlap as a ranking signal (Mill Board #64)
 
 Status: **measured 2026-11-26** on the #59 eval fixture in a cloud session.
-Verdict on the fixture: **keep** under D91. The real-query half of the keep
-rule (the #1563 set) is **not yet measured**, so the weight stays 0 by default
-until it is.
+Verdict under D91: **pending the #1563 run**. The fixture half passes, but
+all of its lift comes from synthetic queries this spike wrote, and the
+real-query half of the keep rule (the #1563 set, on Nano's host) is **not yet
+measured** (D92). The weight stays 0 by default.
 
 ## Question
 
@@ -126,7 +127,11 @@ of entities should be timed before the weight is turned on.
 | 0.5 | +0.204 MRR | 0.000 | yes |
 | 1.0 | +0.194 MRR | 0.000 | yes |
 
-**Fixture half: keep.** The best non-zero weight is 0.5.
+**Fixture half passes; verdict pending the #1563 run (D92).** The best
+non-zero weight is 0.5. Adversarial queries count in the entity pool, not as
+an "other kind" in the drop check (D92), and their losses are listed below.
+On keep, a draft PR opens with this code; on drop, a docs-only PR carries this
+write-up and the code stays unmerged on its branch.
 
 Caveats that limit this result:
 
