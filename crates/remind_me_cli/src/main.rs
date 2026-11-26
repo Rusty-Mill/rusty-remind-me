@@ -1145,6 +1145,11 @@ fn run_admin(db_path: &std::path::Path, rest: &[String]) -> Result<(), Box<dyn s
     Ok(())
 }
 
+/// The `--version` output: binary name and crate version, as Cargo built it.
+fn version_line() -> String {
+    format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // First, before argv or the database. The slow-call watchdog dumps thread
     // stacks by re-executing this binary as a tracer child, and everything
@@ -1154,6 +1159,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     remind_me_core::watchdog::install_stack_dump_hook();
 
     let args: Vec<String> = env::args().collect();
+    // Ahead of the database: asking for the version must not create or open
+    // a store. Deploys had to read it from `server_status` before this.
+    if matches!(args.get(1).map(String::as_str), Some("--version" | "-V")) {
+        println!("{}", version_line());
+        return Ok(());
+    }
     // Resolution lives in the core crate so `configure` below writes the same
     // path this opens. They disagreed before: this defaulted to `remind_me.db`
     // in the *current directory*, so the same command from two directories was

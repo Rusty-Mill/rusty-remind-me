@@ -18,6 +18,11 @@ Dated entries, newest first. One entry per merged pull request.
 ### Tests
 - Valid and malformed values on each write path, naming the key; update sets, clears and refuses; a malformed stored value read as absent and not blocking an edit; a row written today about last month found by `occurred` and not by `created`; instant and span placement, span overlap at each edge, fallback to `created_at`; `time_field: occurred` parsing; recency ordering in rank and score fusion; inferred windows reading `occurred`; the conformance check on both backends.
 
+## 2026-11-26 — `--version` / `-V` on the CLI
+
+### Added
+- `rusty-remind-me --version` (or `-V`) prints `rusty-remind-me <crate version>` and exits, without opening or creating a store. Deploys no longer need `server_status` to confirm which build is installed.
+
 ## 2026-11-26 — 0.5.0: release
 
 ### Changed
