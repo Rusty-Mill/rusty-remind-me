@@ -15,6 +15,17 @@ Dated entries, newest first. One entry per merged pull request.
 
 ### Tests
 - Fold parsing (blank side, same spelling, two different projects refused); fold sets (ambiguous, inverse, chained, cyclic refused) and a second apply that renames nothing; a respell skipped after an intervening project edit to another fold's spelling; respell matches the exact spelling, any type, and honours `--project`; one apply run respells, retypes and adds a ref to a row folded in the same run, leaves no-rationale and claim rows alone, schedules no review, records a revision, and a second run does nothing; CLI parsing of repeated `--fold` and its refusals.
+## 2026-11-26 — Shadow-write captured dialogs to the dialog store (Mill Board #528, D82)
+
+### Added
+- `dialog_shadow`: with `REMIND_ME_DIALOG_SHADOW=1`, each dialog row a capture writes (the first and every continuation) is also appended to `<database file name>.dialogs/` beside the database, keyed by its memory id and carrying its `capture_id`, after redaction. Off by default; production behaviour is unchanged unless the flag is set. The `memories` row stays the record.
+- A failed shadow write is logged and counted (`dialog_shadow::failures()`); the capture succeeds.
+
+### Not yet
+- Showing the failure count in `remind_me_server_status`, backfill of existing rows, reads, search over the store, backup, reconcile on open, the rebuild check and the migration are separate pull requests. No MCP tool name or signature changes.
+
+### Tests
+- Flag off touches no file; two databases in one directory keep separate stores; a first capture and its continuation land together with a token redacted; flag on appends the dialog under its memory id; a blocked store leaves the capture intact and counted; a record twice is one row.
 
 ## 2026-11-25 — Append-only dialog store: port and SQLite adapter (Mill Board #528, D75 to D81, ADR-0037)
 

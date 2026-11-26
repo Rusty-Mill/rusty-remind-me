@@ -1013,6 +1013,11 @@ fn recapture(
 ) -> Result<(TranscriptOutcome, Keep)> {
     let (outcome, written, keep) =
         store.transaction(|page| recapture_in(page, dialog, raw, parsed, reason))?;
+    // Shadow-written after the commit, so a rolled-back continuation leaves
+    // no row (D82): the committed row is read back as stored.
+    if let Keep::Continuation { row, .. } = &keep {
+        crate::dialog_shadow::record_committed(store, row);
+    }
     // Embedded after the commit, best-effort as an update is: a model call
     // never runs inside the write, and its failure undoes nothing.
     if let Some(embedder) = crate::embedder::available_embedder() {
