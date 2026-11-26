@@ -1013,6 +1013,13 @@ fn recapture(
 ) -> Result<(TranscriptOutcome, Keep)> {
     let (outcome, written, keep) =
         store.transaction(|page| recapture_in(page, dialog, raw, parsed, reason))?;
+    // Shadow-written after the commit, so a rolled-back continuation leaves
+    // no row (D82): the committed row is read back as stored.
+    if let Keep::Continuation { row, .. } = &keep {
+        if let Ok(Some(memory)) = Memories::new(store).get_live(row) {
+            crate::dialog_shadow::record_memory(store, &memory);
+        }
+    }
     // Embedded after the commit, best-effort as an update is: a model call
     // never runs inside the write, and its failure undoes nothing.
     if let Some(embedder) = crate::embedder::available_embedder() {
@@ -1321,19 +1328,6 @@ fn append_continuation(
         ..provenance.stamp(NewMemory::new(id.clone(), content.clone(), &now))
     };
     Memories::new(store).insert(&row)?;
-    if let Some(capture_id) = row.capture_id.as_deref() {
-        crate::dialog_shadow::record(
-            store,
-            &crate::db::dialogs::NewDialog {
-                id: &id,
-                capture_id,
-                session_id: row.session_id.as_deref(),
-                project: row.project.as_deref(),
-                created_at: &now,
-                body: &content,
-            },
-        );
-    }
     Ok((id, content))
 }
 

@@ -2,7 +2,8 @@
 //!
 //! The `memories` row stays the record. When `REMIND_ME_DIALOG_SHADOW=1`, each
 //! dialog row a capture writes (the first and every continuation) is also
-//! appended to `dialogs/` beside the database file, so the store can be
+//! appended to `<database file name>.dialogs/` beside the database file (one
+//! store per database, so two databases in one directory never mix), so the store can be
 //! checked against production traffic before anything switches to it. A
 //! failure never fails the capture: it is logged and counted.
 
@@ -26,17 +27,39 @@ fn enabled() -> bool {
     std::env::var(ENV).is_ok_and(|v| v == "1")
 }
 
+/// The shadow store's directory for the database file `db`: its own name
+/// with `.dialogs` appended, so every database has its own store.
+fn dir_for(db: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut name = db.file_name()?.to_os_string();
+    name.push(".dialogs");
+    Some(db.with_file_name(name))
+}
+
+/// Append a committed dialog row to the shadow store, if enabled.
+pub fn record_memory(store: &Store<'_>, row: &crate::models::Memory) {
+    let Some(capture_id) = row.capture_id.as_deref() else {
+        return;
+    };
+    record(
+        store,
+        &NewDialog {
+            id: &row.id,
+            capture_id,
+            session_id: row.session_id.as_deref(),
+            project: row.project.as_deref(),
+            created_at: &row.created_at,
+            body: &row.content,
+        },
+    );
+}
+
 /// Append `dialog` to the dialog store beside `store`'s database, if enabled.
 /// An in-memory database has no directory, so it is skipped.
 pub fn record(store: &Store<'_>, dialog: &NewDialog<'_>) {
     if !enabled() {
         return;
     }
-    let Some(dir) = store
-        .path()
-        .and_then(|p| p.parent())
-        .map(|p| p.join("dialogs"))
-    else {
+    let Some(dir) = store.path().and_then(dir_for) else {
         return;
     };
     let result = SqliteDialogs::open(&dir)

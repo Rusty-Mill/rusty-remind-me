@@ -41,7 +41,7 @@ fn off_by_default_touches_no_dialog_file() {
     test_env::remove_var(ENV);
     let (dir, db) = fresh("off");
     auto_capture(&db.store(), &input()).unwrap();
-    assert!(!dir.join("dialogs").exists());
+    assert!(!dir.join("remind_me.db.dialogs").exists());
 }
 
 #[test]
@@ -51,7 +51,7 @@ fn on_appends_the_dialog_keyed_by_its_memory_id() {
     let (dir, db) = fresh("on");
     let made = auto_capture(&db.store(), &input()).unwrap();
     test_env::remove_var(ENV);
-    let dialogs = SqliteDialogs::open(&dir.join("dialogs")).unwrap();
+    let dialogs = SqliteDialogs::open(&dir.join("remind_me.db.dialogs")).unwrap();
     assert_eq!(dialogs.count().unwrap(), 1);
     let rows = dialogs.for_capture(&made.capture_id).unwrap();
     assert_eq!(rows[0].id, made.dialog_id);
@@ -62,10 +62,99 @@ fn a_failing_store_leaves_the_capture_intact_and_is_counted() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     test_env::set_var(ENV, "1");
     let (dir, db) = fresh("fail");
-    std::fs::write(dir.join("dialogs"), b"in the way").unwrap();
+    std::fs::write(dir.join("remind_me.db.dialogs"), b"in the way").unwrap();
     let before = failures();
     let made = auto_capture(&db.store(), &input()).unwrap();
     test_env::remove_var(ENV);
     assert_eq!(failures(), before + 1);
     assert!(!made.dialog_id.is_empty());
+}
+
+#[test]
+fn two_databases_in_one_directory_keep_separate_shadow_stores() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_env::set_var(ENV, "1");
+    let (dir, a) = fresh("two");
+    let b = Database::open(dir.join("other.db")).unwrap();
+    let made_a = auto_capture(&a.store(), &input()).unwrap();
+    let made_b = auto_capture(&b.store(), &input()).unwrap();
+    test_env::remove_var(ENV);
+    let in_a = SqliteDialogs::open(&dir.join("remind_me.db.dialogs")).unwrap();
+    let in_b = SqliteDialogs::open(&dir.join("other.db.dialogs")).unwrap();
+    assert_eq!(in_a.for_capture(&made_a.capture_id).unwrap().len(), 1);
+    assert!(in_a.for_capture(&made_b.capture_id).unwrap().is_empty());
+    assert_eq!(in_b.for_capture(&made_b.capture_id).unwrap().len(), 1);
+    assert!(in_b.for_capture(&made_a.capture_id).unwrap().is_empty());
+}
+
+fn transcript(session: &str, turns: &[&str]) -> String {
+    turns
+        .iter()
+        .enumerate()
+        .map(|(i, text)| {
+            let role = if i % 2 == 0 { "user" } else { "assistant" };
+            format!(
+                "{}\n",
+                serde_json::json!({"type": role, "sessionId": session,
+                    "message": {"role": role, "content": text}})
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_first_capture_and_its_continuation_land_together_redacted() {
+    use remind_me_core::transcript::{capture_transcript, TranscriptRequest};
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_env::set_var(ENV, "1");
+    let (dir, db) = fresh("cont");
+    let secret = format!("ghp_{}", "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8");
+    let request = TranscriptRequest {
+        session_id: "s1",
+        cwd: None,
+        reason: None,
+        context: None,
+    };
+    let first = transcript("s1", &["hello", "hi there"]);
+    capture_transcript(&db.store(), &first, &request).unwrap();
+    let grown = transcript(
+        "s1",
+        &[
+            "hello",
+            "hi there",
+            &format!("my token is {secret}"),
+            "noted",
+        ],
+    );
+    capture_transcript(&db.store(), &grown, &request).unwrap();
+    test_env::remove_var(ENV);
+
+    let dialogs = SqliteDialogs::open(&dir.join("remind_me.db.dialogs")).unwrap();
+    assert_eq!(
+        dialogs.count().unwrap(),
+        2,
+        "first row and one continuation"
+    );
+    let blobs =
+        remind_me_core::blobs::BlobStore::new(dir.join("remind_me.db.dialogs").join("blobs"));
+    let mut seen = String::new();
+    for id in all_ids(&db) {
+        let rec = dialogs.get(&id).unwrap().unwrap();
+        seen.push_str(&String::from_utf8(blobs.get(&rec.body_hash).unwrap().unwrap()).unwrap());
+    }
+    assert!(
+        !seen.contains(&secret),
+        "the secret never reaches the shadow store"
+    );
+    assert!(seen.contains("REDACTED"));
+}
+
+/// Ids of the dialog rows the engine holds for session `s1`.
+fn all_ids(db: &Database) -> Vec<String> {
+    remind_me_core::episodes::session_memories(&db.store(), "s1")
+        .unwrap()
+        .into_iter()
+        .filter(|m| m.category == remind_me_core::DIALOG_CATEGORY)
+        .map(|m| m.id)
+        .collect()
 }
