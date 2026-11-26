@@ -2,6 +2,15 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-26 — 0.5.0: release
+
+### Changed
+- All five workspace crates and the plugin manifest are now 0.5.0. Merging this publishes the `v0.5.0` GitHub Release (release.yml). It collects the 64 pull requests merged since 0.4.2 (#361 to #426, the entries below); this change adds no code.
+- Minor, not patch, because 0.4.2's surface changed: multi-node sync and the hub are removed (#372), the default MCP tool profile is `core` with admin tools moved to the CLI (ADR-0030 step 2), and `MemoryListInput::default()` lists 20 rows with `limit: 0` an error (#223).
+- Upgrading from 0.4.2: the store moves to schema v33 (#367), which is one-way; keep a backup to roll back to a 0.4.2 binary.
+- Highlights: the storage port (ADR-0035) with a SQLite backend and the R3 store benchmark; the append-only dialog store, not yet wired (#528); dialog rows protected in place (#1616); decisions-log export, normalise, and `decisions import --apply` (#1564, #1565); atomic updates and deletes (D62); duplicate warnings on save; search says how it ran; decisions and preferences never go dormant; the wiki compiles with a local model.
+- Not included, still open: #427 (shadow-write captured dialogs) and #428 (`decisions normalize --fold`).
+
 ## 2026-11-25 — Append-only dialog store: port and SQLite adapter (Mill Board #528, D75 to D81, ADR-0037)
 
 ### Added
