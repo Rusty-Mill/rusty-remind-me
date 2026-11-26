@@ -33,8 +33,8 @@ use crate::db::saved_searches::SavedSearches;
 use crate::db::Result;
 use crate::db::Store;
 use crate::models::{
-    AnswerPinnedInput, MemorySearchInput, PinnedAnswer, SaveSearchInput, SavedSearch,
-    SavedSearchFilters, PIN_EVIDENCE_MAX, POLL_RESULT_LIMIT,
+    AnswerPinnedInput, AnsweredScope, MemorySearchInput, PinnedAnswer, SaveSearchInput,
+    SavedSearch, SavedSearchFilters, PIN_EVIDENCE_MAX, POLL_RESULT_LIMIT,
 };
 use crate::staleness::{stale_check, NEW_EVIDENCE_MAX};
 use chrono::{DateTime, Utc};
@@ -225,12 +225,17 @@ pub fn pin_saved_search(store: &Store<'_>, name: &str) -> Result<Option<SavedSea
 
 /// Record a pinned question's answer: the wiki page and the live memories
 /// it was written from. Pins the search if it was not pinned. The server
-/// stamps `answered_at`; the query is recorded with it.
+/// stamps `answered_at`, with the query and its filters.
+///
+/// `answered_at` is `as_of` when given (the `checked_at` of the
+/// [`stale_report`] the answer was written from), never later than now, so
+/// evidence landing between the check and the answer still flags (D96).
 ///
 /// # Errors
 ///
 /// [`StoreError::Invalid`] when the saved search or the page does not
-/// exist, no or too many ids are given, or an id is not a live memory.
+/// exist, no or too many ids are given, an id is not a live memory, or
+/// `as_of` is not RFC 3339.
 pub fn answer_pinned(store: &Store<'_>, input: &AnswerPinnedInput) -> Result<SavedSearch> {
     let repo = SavedSearches::new(store);
     let Some(mut saved) = repo.get_by_name(&input.name)? else {
@@ -256,15 +261,22 @@ pub fn answer_pinned(store: &Store<'_>, input: &AnswerPinnedInput) -> Result<Sav
     if let Some(gone) = evidence.iter().find(|id| !live.contains(*id)) {
         return Err(invalid(format!("{gone:?} is not a live memory")));
     }
+    let now = Utc::now();
+    let answered_at = match input.as_of.as_deref() {
+        None => now,
+        Some(raw) => parse_time(raw)
+            .ok_or_else(|| invalid(format!("as_of {raw:?} is not an RFC 3339 time")))?
+            .min(now),
+    };
 
-    let now = Utc::now().to_rfc3339();
     saved.filters.pin = Some(PinnedAnswer {
         answer_slug: Some(input.answer_slug.clone()),
         evidence_ids: evidence,
-        answered_at: Some(now.clone()),
+        answered_at: Some(answered_at.to_rfc3339()),
         answered_query: Some(saved.query.clone()),
+        answered_scope: Some(AnsweredScope::of(&saved.filters)),
     });
-    saved.updated_at = now;
+    saved.updated_at = now.to_rfc3339();
     repo.update(&saved)?;
     repo.get(&saved.id)
 }
@@ -275,7 +287,7 @@ pub fn answer_pinned(store: &Store<'_>, input: &AnswerPinnedInput) -> Result<Sav
 pub enum StaleReason {
     /// Pinned but never answered.
     Unanswered,
-    /// The saved query changed since the answer was written.
+    /// The saved query or its filters changed since the answer was written.
     QueryChanged,
     /// The answer's wiki page no longer exists.
     AnswerMissing,
@@ -304,23 +316,41 @@ pub struct StalePinned {
     pub evidence_gone: Vec<String>,
 }
 
-/// Every pinned question that needs a new answer, by name.
+/// The pinned questions that need a new answer, and when that was checked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StaleReport {
+    /// RFC 3339; pass it to [`answer_pinned`] as `as_of` (D96).
+    pub checked_at: String,
+    pub stale: Vec<StalePinned>,
+}
+
+/// Every pinned question that needs a new answer, by name, with the time
+/// of the check.
 ///
 /// Phase one of the two-phase refresh: the client reads the new evidence,
-/// writes the answer page and records it with [`answer_pinned`]. Nothing is
-/// locked in between; evidence that lands meanwhile shows on the next call.
-pub fn stale_pinned(store: &Store<'_>) -> Result<Vec<StalePinned>> {
+/// writes the answer page and records it with [`answer_pinned`], passing
+/// `checked_at` as `as_of`. Nothing is locked in between; evidence that
+/// lands meanwhile is newer than `as_of` and shows on the next call.
+pub fn stale_report(store: &Store<'_>) -> Result<StaleReport> {
     let now = Utc::now();
-    let mut out = Vec::new();
+    let mut stale = Vec::new();
     for saved in list_saved_searches(store)? {
         let Some(pin) = &saved.filters.pin else {
             continue;
         };
-        if let Some(stale) = check_pinned(store, &saved, pin, now)? {
-            out.push(stale);
+        if let Some(found) = check_pinned(store, &saved, pin, now)? {
+            stale.push(found);
         }
     }
-    Ok(out)
+    Ok(StaleReport {
+        checked_at: now.to_rfc3339(),
+        stale,
+    })
+}
+
+/// [`stale_report`] without the check time.
+pub fn stale_pinned(store: &Store<'_>) -> Result<Vec<StalePinned>> {
+    stale_report(store).map(|report| report.stale)
 }
 
 /// `saved`'s staleness, `None` when its answer is current.
@@ -341,7 +371,8 @@ fn check_pinned(
         stale.reasons.push(StaleReason::Unanswered);
         return Ok(Some(stale));
     };
-    if pin.answered_query.as_deref() != Some(saved.query.as_str()) {
+    let scope_changed = pin.answered_scope.as_ref() != Some(&AnsweredScope::of(&saved.filters));
+    if pin.answered_query.as_deref() != Some(saved.query.as_str()) || scope_changed {
         stale.reasons.push(StaleReason::QueryChanged);
     }
     if crate::wiki::get_wiki_page(store, slug)?.is_none() {

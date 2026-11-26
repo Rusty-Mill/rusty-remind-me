@@ -1368,14 +1368,15 @@ impl McpServer {
                                     "properties": {
                                         "name": { "type": "string", "description": "Name of the saved search" },
                                         "answer_slug": { "type": "string", "description": "Slug of the wiki page holding the answer" },
-                                        "evidence_ids": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": PIN_EVIDENCE_MAX, "description": "The memories the answer was written from" }
+                                        "evidence_ids": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": PIN_EVIDENCE_MAX, "description": "The memories the answer was written from" },
+                                        "as_of": { "type": "string", "description": "RFC 3339 time the evidence was read: checked_at from list_stale, or when you ran the search. Stamped as answered_at, capped at now; omitted means now" }
                                     },
                                     "required": ["name", "answer_slug", "evidence_ids"]
                                 }
                             },
                             {
                                 "name": "remind_me_list_stale_pinned",
-                                "description": "List pinned questions whose answer is out of date, each with its reasons, up to 5 new memory ids to read before answering again, and any evidence ids now deleted or superseded.",
+                                "description": "List pinned questions whose answer is out of date, with checked_at (pass it to answer as as_of), each with its reasons, up to 5 new memory ids to read before answering again, and any evidence ids now deleted or superseded.",
                                 "inputSchema": { "type": "object", "properties": {} }
                             },
                             {
@@ -3095,11 +3096,12 @@ impl McpServer {
                             }
                         }
                     }
-                    "remind_me_list_stale_pinned" => match saved_searches::stale_pinned(&store) {
-                        Ok(stale) => {
+                    "remind_me_list_stale_pinned" => match saved_searches::stale_report(&store) {
+                        Ok(report) => {
                             json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&json!({
-                                "count": stale.len(),
-                                "stale": stale,
+                                "count": report.stale.len(),
+                                "checked_at": report.checked_at,
+                                "stale": report.stale,
                             })).unwrap() }] })
                         }
                         Err(e) => {

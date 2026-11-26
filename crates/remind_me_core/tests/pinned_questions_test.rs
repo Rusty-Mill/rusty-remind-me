@@ -8,7 +8,8 @@ use chrono::{Duration, Utc};
 use remind_me_core::db::memories::{Memories, NewMemory};
 use remind_me_core::db::Store;
 use remind_me_core::saved_searches::{
-    answer_pinned, get_saved_search, pin_saved_search, save_search, stale_pinned, StaleReason,
+    answer_pinned, get_saved_search, pin_saved_search, save_search, stale_pinned, stale_report,
+    StaleReason,
 };
 use remind_me_core::wiki::write_wiki_page;
 use remind_me_core::{AnswerPinnedInput, Database, SaveSearchInput};
@@ -45,6 +46,7 @@ fn answer(store: &Store<'_>, ids: &[&str]) -> remind_me_core::db::Result<()> {
             name: "deploys".to_string(),
             answer_slug: "deploys".to_string(),
             evidence_ids: ids.iter().map(|i| i.to_string()).collect(),
+            as_of: None,
         },
     )
     .map(drop)
@@ -151,6 +153,26 @@ fn resaving_keeps_the_pin_and_a_changed_query_is_stale() {
 }
 
 #[test]
+fn a_changed_scope_is_stale_like_a_changed_query() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    answered(&store);
+    save_search(
+        &store,
+        &SaveSearchInput {
+            name: "deploys".to_string(),
+            query: "deploy".to_string(),
+            category: Some("decision".to_string()),
+            tags: None,
+            include_sensitive: false,
+            watch: false,
+        },
+    )
+    .unwrap();
+    assert!(reasons(&store).contains(&StaleReason::QueryChanged));
+}
+
+#[test]
 fn answer_validates_its_input() {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
@@ -166,6 +188,66 @@ fn answer_validates_its_input() {
         name: "deploys".to_string(),
         answer_slug: "nowhere".to_string(),
         evidence_ids: vec!["mem_a".to_string()],
+        as_of: None,
     };
     assert!(answer_pinned(&store, &no_page).is_err(), "missing page");
+    let bad_time = AnswerPinnedInput {
+        answer_slug: "deploys".to_string(),
+        as_of: Some("last tuesday".to_string()),
+        ..no_page
+    };
+    assert!(
+        answer_pinned(&store, &bad_time).is_err(),
+        "unparseable as_of"
+    );
+}
+
+#[test]
+fn evidence_landing_between_the_check_and_the_answer_still_flags() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    answered(&store);
+    seed(&store, "mem_c", "deploy moved to mondays", &ago(-1));
+    let report = stale_report(&store).unwrap();
+    assert_eq!(report.stale[0].new_evidence, vec!["mem_c".to_string()]);
+
+    // Written while the client drafts the answer from the report: after
+    // the check, before the answer is recorded.
+    let checked = chrono::DateTime::parse_from_rfc3339(&report.checked_at).unwrap();
+    let between = (checked + Duration::milliseconds(1)).to_rfc3339();
+    seed(&store, "mem_d", "deploy freeze over the holidays", &between);
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    answer_pinned(
+        &store,
+        &AnswerPinnedInput {
+            name: "deploys".to_string(),
+            answer_slug: "deploys".to_string(),
+            evidence_ids: vec!["mem_a".into(), "mem_b".into(), "mem_c".into()],
+            as_of: Some(report.checked_at),
+        },
+    )
+    .unwrap();
+    let stale = stale_pinned(&store).unwrap();
+    assert_eq!(stale.len(), 1, "mem_d is newer than the check");
+    assert!(stale[0].new_evidence.contains(&"mem_d".to_string()));
+}
+
+#[test]
+fn as_of_is_capped_at_now() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    answered(&store);
+    let future = (Utc::now() + Duration::days(1)).to_rfc3339();
+    let saved = answer_pinned(
+        &store,
+        &AnswerPinnedInput {
+            name: "deploys".to_string(),
+            answer_slug: "deploys".to_string(),
+            evidence_ids: vec!["mem_a".to_string()],
+            as_of: Some(future.clone()),
+        },
+    )
+    .unwrap();
+    let stamped = saved.filters.pin.unwrap().answered_at.unwrap();
+    assert!(stamped < future, "{stamped} should be capped at now");
 }

@@ -1981,6 +1981,32 @@ pub struct PinnedAnswer {
     /// the question stale until it is answered again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answered_query: Option<String>,
+    /// The filters the answer was written for; a changed scope is stale
+    /// like a changed query.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answered_scope: Option<AnsweredScope>,
+}
+
+/// A saved search's filters without its pin: the scope an answer covers.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AnsweredScope {
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    #[serde(default)]
+    pub include_sensitive: bool,
+}
+
+impl AnsweredScope {
+    /// The scope `filters` currently select.
+    pub fn of(filters: &SavedSearchFilters) -> Self {
+        Self {
+            category: filters.category.clone(),
+            tags: filters.tags.clone(),
+            include_sensitive: filters.include_sensitive,
+        }
+    }
 }
 
 /// Most evidence ids one answer may record.
@@ -1996,6 +2022,11 @@ pub struct AnswerPinnedInput {
     /// The live memories the answer was written from, at most
     /// [`PIN_EVIDENCE_MAX`].
     pub evidence_ids: Vec<String>,
+    /// RFC 3339 time the evidence was read: `checked_at` from the stale
+    /// list, or when the client ran the search. Stamped as `answered_at`,
+    /// capped at now; omitted means now (D96).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub as_of: Option<String>,
 }
 
 /// A stored query plus its filters, under a unique name.
