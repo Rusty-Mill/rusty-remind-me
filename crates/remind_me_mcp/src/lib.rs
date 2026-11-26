@@ -1369,7 +1369,7 @@ impl McpServer {
                                         "name": { "type": "string", "description": "Name of the saved search" },
                                         "answer_slug": { "type": "string", "description": "Slug of the wiki page holding the answer" },
                                         "evidence_ids": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": PIN_EVIDENCE_MAX, "description": "The memories the answer was written from" },
-                                        "as_of": { "type": "string", "description": "RFC 3339 time the evidence was read: checked_at from list_stale, or when you ran the search. Stamped as answered_at, capped at now; omitted means now" }
+                                        "as_of": { "type": "string", "description": "RFC 3339 time the evidence was read: checked_at from list_stale, or when you ran the search. Stamped as answered_at, capped at now; refused if the saved search changed after it; omitted means now" }
                                     },
                                     "required": ["name", "answer_slug", "evidence_ids"]
                                 }

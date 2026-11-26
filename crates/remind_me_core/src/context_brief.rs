@@ -646,6 +646,17 @@ fn reminders_draft(store: &Store<'_>, now: DateTime<Utc>) -> Result<Draft> {
 /// Most pinned-question names the session brief lists (D90).
 const PINNED_NAMES: usize = 3;
 
+/// Longest pinned-question name the brief shows, in characters; longer ones
+/// are cut with an ellipsis, so the one line fits its share of the budget.
+const PINNED_NAME_CHARS: usize = 24;
+
+fn short_name(name: &str) -> String {
+    match name.char_indices().nth(PINNED_NAME_CHARS) {
+        None => name.to_string(),
+        Some((cut, _)) => format!("{}…", &name[..cut]),
+    }
+}
+
 /// One line naming the pinned questions that need a new answer, only when
 /// any do (card #61, D90). Session briefs only: saved searches are global,
 /// so a project brief has nothing to match them on.
@@ -660,10 +671,10 @@ fn pinned_draft(store: &Store<'_>, now: DateTime<Utc>) -> Draft {
     let items = match stale.is_empty() {
         true => Vec::new(),
         false => {
-            let names: Vec<&str> = stale
+            let names: Vec<String> = stale
                 .iter()
                 .take(PINNED_NAMES)
-                .map(|p| p.name.as_str())
+                .map(|p| short_name(&p.name))
                 .collect();
             let more = stale.len().saturating_sub(PINNED_NAMES);
             let tail = match more {
@@ -682,9 +693,11 @@ fn pinned_draft(store: &Store<'_>, now: DateTime<Utc>) -> Draft {
             }]
         }
     };
+    // Weight 10 leaves room for the bounded line (three short names) at a
+    // SessionStart hook's 2000-token budget; an empty draft spends nothing.
     Draft {
         name: "pinned",
-        weight: 5,
+        weight: 10,
         items,
     }
 }
@@ -1241,6 +1254,38 @@ mod tests {
 
         add(&store, "mem_q", |m| m.project = Some("quokka".to_string()));
         assert!(ids(&brief(&store, &project("quokka")), "pinned").is_empty());
+    }
+
+    #[test]
+    fn long_pinned_names_still_fit_the_session_hook_budget() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        for i in 0..3 {
+            let name = format!("what does the deploy pipeline need before release {i}");
+            crate::saved_searches::save_search(
+                &store,
+                &crate::models::SaveSearchInput {
+                    name: name.clone(),
+                    query: "deploy".to_string(),
+                    category: None,
+                    tags: None,
+                    include_sensitive: false,
+                    watch: false,
+                },
+            )
+            .unwrap();
+            crate::saved_searches::pin_saved_search(&store, &name).unwrap();
+        }
+        for i in 0..40 {
+            add(&store, &format!("mem_r{i}"), |m| {
+                m.remind_at = Some(Utc::now().to_rfc3339());
+                m.content = format!("reminder number {i} with some words to take up space");
+            });
+        }
+        let session = brief(&store, &session(2000));
+        assert_eq!(ids(&session, "pinned"), vec!["saved_searches".to_string()]);
+        let rendered = render_markdown(&session);
+        assert!(rendered.contains("what does the deploy pip…"), "{rendered}");
     }
 
     #[test]

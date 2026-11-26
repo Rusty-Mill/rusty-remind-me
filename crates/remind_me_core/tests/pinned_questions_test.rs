@@ -251,3 +251,66 @@ fn as_of_is_capped_at_now() {
     let stamped = saved.filters.pin.unwrap().answered_at.unwrap();
     assert!(stamped < future, "{stamped} should be capped at now");
 }
+
+fn save_scoped(store: &Store<'_>, tags: Option<Vec<&str>>) {
+    save_search(
+        store,
+        &SaveSearchInput {
+            name: "deploys".to_string(),
+            query: "deploy".to_string(),
+            category: None,
+            tags: tags.map(|t| t.into_iter().map(str::to_string).collect()),
+            include_sensitive: false,
+            watch: false,
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn respelling_the_same_tags_is_not_a_scope_change() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    answered(&store);
+    save_scoped(&store, Some(vec![]));
+    assert!(
+        stale_pinned(&store).unwrap().is_empty(),
+        "[] reads as no tags"
+    );
+
+    save_scoped(&store, Some(vec!["ops", "infra"]));
+    answer(&store, &["mem_a", "mem_b"]).unwrap();
+    save_scoped(&store, Some(vec![" infra", "ops", "ops", ""]));
+    assert!(stale_pinned(&store).unwrap().is_empty(), "same set of tags");
+    save_scoped(&store, Some(vec!["ops"]));
+    assert!(reasons(&store).contains(&StaleReason::QueryChanged));
+}
+
+#[test]
+fn an_answer_for_a_scope_changed_after_the_check_is_refused() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    answered(&store);
+    seed(&store, "mem_c", "deploy moved to mondays", &ago(-1));
+    let checked_at = stale_report(&store).unwrap().checked_at;
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    // Another client widens the question before the first one answers.
+    save_scoped(&store, Some(vec!["ops"]));
+
+    let late = AnswerPinnedInput {
+        name: "deploys".to_string(),
+        answer_slug: "deploys".to_string(),
+        evidence_ids: vec!["mem_a".into(), "mem_b".into(), "mem_c".into()],
+        as_of: Some(checked_at),
+    };
+    let err = answer_pinned(&store, &late).unwrap_err().to_string();
+    assert!(err.contains("changed after as_of"), "{err}");
+    assert!(reasons(&store).contains(&StaleReason::QueryChanged));
+
+    let fresh = AnswerPinnedInput {
+        as_of: Some(stale_report(&store).unwrap().checked_at),
+        ..late
+    };
+    answer_pinned(&store, &fresh).unwrap();
+    assert!(stale_pinned(&store).unwrap().is_empty());
+}

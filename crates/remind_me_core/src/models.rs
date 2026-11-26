@@ -1999,11 +1999,27 @@ pub struct AnsweredScope {
 }
 
 impl AnsweredScope {
-    /// The scope `filters` currently select.
+    /// The scope `filters` currently select, in the form search reads it:
+    /// trimmed, blank values dropped, tags as a sorted set. Two spellings
+    /// of one scope compare equal.
     pub fn of(filters: &SavedSearchFilters) -> Self {
+        let category = filters
+            .category
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .map(str::to_string);
+        let tags: std::collections::BTreeSet<String> = filters
+            .tags
+            .iter()
+            .flatten()
+            .map(|t| t.trim())
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect();
         Self {
-            category: filters.category.clone(),
-            tags: filters.tags.clone(),
+            category,
+            tags: (!tags.is_empty()).then(|| tags.into_iter().collect()),
             include_sensitive: filters.include_sensitive,
         }
     }
@@ -2024,7 +2040,9 @@ pub struct AnswerPinnedInput {
     pub evidence_ids: Vec<String>,
     /// RFC 3339 time the evidence was read: `checked_at` from the stale
     /// list, or when the client ran the search. Stamped as `answered_at`,
-    /// capped at now; omitted means now (D96).
+    /// capped at now; omitted means now (D96). Refused when the saved
+    /// search changed after it, since the answer was drafted for the old
+    /// query or scope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub as_of: Option<String>,
 }

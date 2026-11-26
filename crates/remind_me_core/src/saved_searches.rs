@@ -230,12 +230,14 @@ pub fn pin_saved_search(store: &Store<'_>, name: &str) -> Result<Option<SavedSea
 /// `answered_at` is `as_of` when given (the `checked_at` of the
 /// [`stale_report`] the answer was written from), never later than now, so
 /// evidence landing between the check and the answer still flags (D96).
+/// A saved search changed after `as_of` is refused: the answer was drafted
+/// for the query and scope the check read.
 ///
 /// # Errors
 ///
 /// [`StoreError::Invalid`] when the saved search or the page does not
 /// exist, no or too many ids are given, an id is not a live memory, or
-/// `as_of` is not RFC 3339.
+/// `as_of` is not RFC 3339 or predates the saved search's last change.
 pub fn answer_pinned(store: &Store<'_>, input: &AnswerPinnedInput) -> Result<SavedSearch> {
     let repo = SavedSearches::new(store);
     let Some(mut saved) = repo.get_by_name(&input.name)? else {
@@ -264,9 +266,7 @@ pub fn answer_pinned(store: &Store<'_>, input: &AnswerPinnedInput) -> Result<Sav
     let now = Utc::now();
     let answered_at = match input.as_of.as_deref() {
         None => now,
-        Some(raw) => parse_time(raw)
-            .ok_or_else(|| invalid(format!("as_of {raw:?} is not an RFC 3339 time")))?
-            .min(now),
+        Some(raw) => read_time(&saved, raw)?.min(now),
     };
 
     saved.filters.pin = Some(PinnedAnswer {
@@ -279,6 +279,20 @@ pub fn answer_pinned(store: &Store<'_>, input: &AnswerPinnedInput) -> Result<Sav
     saved.updated_at = now.to_rfc3339();
     repo.update(&saved)?;
     repo.get(&saved.id)
+}
+
+/// `as_of` parsed, refused when `saved` changed after it: the answer was
+/// drafted for the query and scope the check read, which may differ now.
+fn read_time(saved: &SavedSearch, as_of: &str) -> Result<DateTime<Utc>> {
+    let read = parse_time(as_of)
+        .ok_or_else(|| invalid(format!("as_of {as_of:?} is not an RFC 3339 time")))?;
+    if parse_time(&saved.updated_at).is_some_and(|changed| changed > read) {
+        return Err(invalid(format!(
+            "saved search {:?} changed after as_of {as_of}; check list_stale again",
+            saved.name
+        )));
+    }
+    Ok(read)
 }
 
 /// Why a pinned question needs a new answer.
