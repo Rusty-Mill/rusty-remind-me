@@ -242,16 +242,26 @@ impl Fold {
         let (from, to) = raw
             .split_once('=')
             .ok_or_else(|| format!("fold {raw:?} is not FROM=TO"))?;
+        Self::new(from, to)
+    }
+
+    /// A fold from `from` to `to`, each trimmed.
+    ///
+    /// # Errors
+    ///
+    /// A blank side, the same spelling twice, or two names that are not
+    /// spellings of one project (`same_project`).
+    pub fn new(from: &str, to: &str) -> Result<Self, String> {
         let (from, to) = (from.trim(), to.trim());
         if from.is_empty() || to.is_empty() {
-            return Err(format!("fold {raw:?} has a blank side"));
+            return Err(format!("fold {from}={to} has a blank side"));
         }
         if from == to {
-            return Err(format!("fold {raw:?} changes nothing"));
+            return Err(format!("fold {from}={to} changes nothing"));
         }
         if !same_project(from, to) {
             return Err(format!(
-                "fold {raw:?}: {from:?} and {to:?} are different projects, not two spellings"
+                "fold {from}={to}: {from:?} and {to:?} are different projects, not two spellings"
             ));
         }
         Ok(Self {
@@ -273,9 +283,15 @@ impl Folds {
     ///
     /// # Errors
     ///
-    /// A spelling folded twice, or a fold whose target another fold renames
-    /// (a chain, an inverse pair or a cycle).
+    /// A fold that [`Fold::new`] refuses (a `Fold` deserialized from a
+    /// daemon client or built field by field skips it), a spelling folded
+    /// twice, or a fold whose target another fold renames (a chain, an
+    /// inverse pair or a cycle).
     pub fn new(folds: Vec<Fold>) -> Result<Self, String> {
+        let folds = folds
+            .iter()
+            .map(|f| Fold::new(&f.from, &f.to))
+            .collect::<Result<Vec<_>, _>>()?;
         let mut sources: HashSet<&str> = HashSet::new();
         for fold in &folds {
             if !sources.insert(&fold.from) {
@@ -2453,6 +2469,27 @@ mod apply_tests {
     /// A row planned under one fold whose project is edited before the
     /// write to a spelling another fold of the set renames is skipped: the
     /// write compares the planned fold, not just "some fold matches".
+    /// A fold that never went through `Fold::parse` (deserialized from a
+    /// daemon client, or built field by field) is still checked.
+    #[test]
+    fn a_fold_set_checks_each_fold_however_it_was_built() {
+        let raw = |from: &str, to: &str| Fold {
+            from: from.into(),
+            to: to.into(),
+        };
+        for bad in [raw("mill", "millwright"), raw(" ", "a"), raw("a_b", "a_b")] {
+            assert!(Folds::new(vec![bad.clone()]).is_err(), "{bad:?}");
+        }
+        let wire: Vec<Fold> =
+            serde_json::from_str(r#"[{"from":"mill","to":"rusty_term"}]"#).expect("json");
+        assert!(
+            Folds::new(wire).is_err(),
+            "a daemon client's fold is checked"
+        );
+        let ok = Folds::new(vec![raw(" a_b ", "a-b")]).expect("folds");
+        assert_eq!(ok.as_slice()[0].from, "a_b", "trimmed");
+    }
+
     #[test]
     fn a_respell_skips_a_row_whose_project_moved_to_another_fold() {
         let db = Database::open_in_memory().expect("database");
