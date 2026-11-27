@@ -184,7 +184,7 @@ pub fn write_skeleton(
     memories.insert(&NewMemory {
         category: SKELETON_CATEGORY.to_string(),
         source: CAPTURE_SOURCE.to_string(),
-        metadata,
+        metadata: provenance.metadata(metadata),
         capture_id: Some(input.capture_id.clone()),
         decay_rate,
         vitality,

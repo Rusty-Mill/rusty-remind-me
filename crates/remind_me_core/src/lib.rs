@@ -16,6 +16,7 @@ pub mod backup;
 pub mod blobs;
 pub mod boundary;
 pub mod capture;
+pub mod clients;
 pub mod cloud_backup;
 pub mod code_refs;
 pub mod compaction;

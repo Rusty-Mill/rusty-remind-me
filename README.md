@@ -351,6 +351,7 @@ wrote it:
 | --- | --- | --- |
 | `REMIND_ME_NODE_ID` | This install's identity, stamped on every row it writes | unset |
 | `REMIND_ME_CLIENT` | Human-readable label for the writer, alongside `node_id` | `unknown` |
+| `REMIND_ME_CLIENTS_FILE` | The client registry (ADR-0028 §1): registered client ids with their handshake `aliases`, `oauth_clients` and REST `api_keys` names. With it, `client` resolves credential > `REMIND_ME_CLIENT` > registered alias > `unknown` and the raw handshake goes to `metadata.client_app`; without it the old handshake-first rule stays. `remind_me_server_status` reports it under `clients` | `clients.json` beside the store |
 | `REMIND_ME_SYNC_DISABLE` | `1`/`true`/`yes`/`on`: stop a store that synced before the removal from keeping sync bookkeeping (outbox rows and delete tombstones) and empty its outbox | unset |
 | `REMIND_ME_COMPACT_INTERVAL_SECS` | Seconds between the store daemon's compactions of the engine tables it has written to since the last one; `0` turns them off. Read by the daemon only | `3600` |
 
