@@ -132,6 +132,11 @@ pub enum Op {
     },
     /// Every mute record, on or off.
     Mutes,
+    /// Check the dialog store against `memories`; see
+    /// [`crate::dialog_reconcile`]. `full` re-hashes every blob.
+    DialogsCheck {
+        full: bool,
+    },
     /// The session subcommands (`crate::session_ops`). Paths are absolute.
     SessionStart {
         session_id: String,
@@ -397,6 +402,14 @@ fn run(store: &Store<'_>, op: &Op) -> Result<Value, String> {
                 .and_then(|t| crate::mute::unmute(store, t, value, project.as_deref())),
         ),
         Op::Mutes => to_value(crate::mute::list(store)),
+        Op::DialogsCheck { full } => {
+            let depth = if *full {
+                crate::dialog_reconcile::Depth::Full
+            } else {
+                crate::dialog_reconcile::Depth::Quick
+            };
+            to_value(crate::dialog_reconcile::check(store, depth))
+        }
         Op::SessionStart {
             session_id,
             cwd,
