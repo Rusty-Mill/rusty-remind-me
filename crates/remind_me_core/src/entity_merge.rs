@@ -621,3 +621,114 @@ fn restore_into(store: &Store<'_>, record: &Record, a: &Entity) -> Result<()> {
     };
     Entities::new(store).set_merged(&a.id, kind.as_deref(), &aliases, &created_at)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::entities::{delete_relation_unsupported, NO_DELETE_RELATION};
+    use crate::db::memories::NewMemory;
+    use crate::db::queries;
+    use crate::entity::{
+        get_entity_by_id, link_memory_entity, upsert_entity, upsert_entity_relation,
+    };
+    use crate::{Database, EntityInput, MemoryListInput};
+    use chrono::Utc;
+
+    /// A store without the `delete_relation` override, for the closure.
+    fn without_delete_relation<T>(work: impl FnOnce() -> T) -> T {
+        NO_DELETE_RELATION.with(|flag| flag.set(true));
+        let done = work();
+        NO_DELETE_RELATION.with(|flag| flag.set(false));
+        done
+    }
+
+    fn entity(store: &Store<'_>, name: &str) -> Entity {
+        upsert_entity(
+            store,
+            &EntityInput {
+                name: name.into(),
+                kind: Some("tool".into()),
+                aliases: Vec::new(),
+            },
+        )
+        .unwrap()
+    }
+
+    /// What a failed merge or revert must leave exactly as it was.
+    fn snapshot(store: &Store<'_>, ids: &[&str]) -> String {
+        let entities: Vec<_> = ids
+            .iter()
+            .map(|id| get_entity_by_id(store, id).unwrap())
+            .collect();
+        let links: Vec<_> = ids
+            .iter()
+            .map(|id| {
+                let mut l: Vec<_> = Memories::new(store)
+                    .linked_ids(id)
+                    .unwrap()
+                    .into_iter()
+                    .collect();
+                l.sort();
+                l
+            })
+            .collect();
+        let relations = Entities::new(store).relations_oldest_first().unwrap();
+        let records = queries::list_memories(
+            store,
+            &MemoryListInput {
+                tags: Some(vec![MERGE_TAG.into()]),
+                limit: 100,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .memories
+        .into_iter()
+        .map(|m| (m.id, m.superseded_by))
+        .collect::<Vec<_>>();
+        format!("{entities:?}\n{links:?}\n{relations:?}\n{records:?}")
+    }
+
+    /// A (`hammer`), B (`mallet`) with a link and a relation to C.
+    fn seed(store: &Store<'_>) -> (Entity, Entity, Entity) {
+        let a = entity(store, "hammer");
+        let b = entity(store, "mallet");
+        let c = entity(store, "nail");
+        let when = Utc::now().to_rfc3339();
+        Memories::new(store)
+            .insert(&NewMemory::new("m1", "the mallet drives the nail", &when))
+            .unwrap();
+        link_memory_entity(store, "m1", &b.id).unwrap();
+        upsert_entity_relation(store, &b.id, "drives", &c.id).unwrap();
+        (a, b, c)
+    }
+
+    #[test]
+    fn a_merge_on_a_store_without_delete_relation_refuses_and_writes_nothing() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        let (a, b, c) = seed(&store);
+        let before = snapshot(&store, &[&a.id, &b.id, &c.id]);
+
+        let err = without_delete_relation(|| merge(&store, "mallet", "hammer")).unwrap_err();
+
+        assert_eq!(err.to_string(), delete_relation_unsupported().to_string());
+        assert_eq!(snapshot(&store, &[&a.id, &b.id, &c.id]), before);
+    }
+
+    #[test]
+    fn a_revert_on_a_store_without_delete_relation_refuses_and_writes_nothing() {
+        let db = Database::open_in_memory().unwrap();
+        let store = db.store();
+        let (a, b, c) = seed(&store);
+        let Outcome::Merged { record_id, .. } = merge(&store, "mallet", "hammer").unwrap() else {
+            panic!("expected a merge");
+        };
+        let before = snapshot(&store, &[&a.id, &b.id, &c.id]);
+
+        let err = without_delete_relation(|| revert(&store, &record_id, "mallet")).unwrap_err();
+
+        assert_eq!(err.to_string(), delete_relation_unsupported().to_string());
+        assert_eq!(snapshot(&store, &[&a.id, &b.id, &c.id]), before);
+    }
+}
