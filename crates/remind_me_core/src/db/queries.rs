@@ -853,6 +853,34 @@ pub fn search_memories_deadlined(
     embedder: Option<&dyn crate::embedder::Embedder>,
     deadline: crate::retrieval::Deadline,
 ) -> Result<crate::retrieval::TrimOutcome> {
+    search_ranked(store, input, embedder, deadline, false)
+}
+
+/// [`search_memories`] with dead ends left out of both ranking lanes, before
+/// their limits, so they never take a hit's place and the candidate pool
+/// stays the size `input` asks for. For a caller that shows dead ends apart,
+/// as warnings (card #1484).
+pub fn search_memories_without_dead_ends(
+    store: &Store<'_>,
+    input: &MemorySearchInput,
+) -> Result<Vec<MemorySearchResult>> {
+    let configured = crate::embedder::available_embedder();
+    let embedder = configured
+        .as_ref()
+        .map(|e| &**e as &dyn crate::embedder::Embedder);
+    let deadline = crate::retrieval::Deadline::from_env();
+    Ok(search_ranked(store, input, embedder, deadline, true)?.results)
+}
+
+/// The search behind [`search_memories_deadlined`]; `exclude_dead_ends` is
+/// [`Narrowing::exclude_dead_ends`].
+fn search_ranked(
+    store: &Store<'_>,
+    input: &MemorySearchInput,
+    embedder: Option<&dyn crate::embedder::Embedder>,
+    deadline: crate::retrieval::Deadline,
+    exclude_dead_ends: bool,
+) -> Result<crate::retrieval::TrimOutcome> {
     let memories_repo = Memories::new(store);
     let mut timing = crate::retrieval::SearchTiming {
         deadline_ms: deadline.limit_ms(),
@@ -869,12 +897,13 @@ pub fn search_memories_deadlined(
     // An entity the store has never seen matches nothing: an empty result,
     // not an error, as `search_paginated` answers it.
     let scope = input.scope.resolve(store)?;
-    let Some(narrowing) = resolve_narrowing(store, input)? else {
+    let Some(mut narrowing) = resolve_narrowing(store, input)? else {
         let mut outcome = trim_by_token_budget(Vec::new(), input.token_budget, input.detail);
         timing.elapsed_ms = deadline.elapsed_ms();
         outcome.timing = timing;
         return Ok(outcome);
     };
+    narrowing.exclude_dead_ends = exclude_dead_ends;
 
     // Dormancy is filtered on *effective* vitality, inside the query and before
     // its limit: the stored column never decays, and thinning a page after the
@@ -926,7 +955,7 @@ pub fn search_memories_deadlined(
             listed
         };
         if listed.is_empty() && filter.exclude_raw && !input.window.is_unbounded() {
-            return raw_fallback(store, input, embedder, deadline, timing);
+            return raw_fallback(store, input, embedder, deadline, timing, exclude_dead_ends);
         }
         let mut outcome = trim_by_token_budget(listed, input.token_budget, input.detail);
         timing.elapsed_ms = deadline.elapsed_ms();
@@ -1101,7 +1130,7 @@ pub fn search_memories_deadlined(
     ranked.truncate(input.limit);
 
     if ranked.is_empty() && filter.exclude_raw {
-        return raw_fallback(store, input, embedder, deadline, timing);
+        return raw_fallback(store, input, embedder, deadline, timing, exclude_dead_ends);
     }
 
     let mut outcome = trim_by_token_budget(ranked, input.token_budget, input.detail);
@@ -1175,12 +1204,13 @@ fn raw_fallback(
     embedder: Option<&dyn crate::embedder::Embedder>,
     deadline: crate::retrieval::Deadline,
     first: crate::retrieval::SearchTiming,
+    exclude_dead_ends: bool,
 ) -> Result<crate::retrieval::TrimOutcome> {
     let raw = MemorySearchInput {
         include_raw: true,
         ..input.clone()
     };
-    let mut outcome = search_memories_deadlined(store, &raw, embedder, deadline)?;
+    let mut outcome = search_ranked(store, &raw, embedder, deadline, exclude_dead_ends)?;
     outcome.raw_fallback = !outcome.results.is_empty();
     for stage in first.skipped {
         if !outcome.timing.skipped.contains(&stage) {
@@ -1248,6 +1278,7 @@ fn resolve_narrowing(store: &Store<'_>, input: &MemorySearchInput) -> Result<Opt
         topic,
         repo: clean(&input.filters.repo).and_then(crate::context::normalize_remote),
         projectless: false,
+        exclude_dead_ends: false,
     }))
 }
 

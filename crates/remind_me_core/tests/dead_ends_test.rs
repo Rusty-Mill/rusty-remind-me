@@ -535,3 +535,24 @@ fn many_dead_ends_do_not_crowd_hits_out_of_the_prompt_hook() {
     assert!(section(&b, "warnings").is_empty());
     assert_eq!(section(&b, "hits"), ["fact"]);
 }
+
+#[test]
+fn a_search_leaving_out_dead_ends_fills_its_own_limit_without_them() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    for i in 0..30 {
+        dead_end(&store, &format!("d{i}"), Some("beta"));
+    }
+    for i in 0..12 {
+        let content = format!("note {i}: the musl target and jemalloc");
+        put(&store, &format!("f{i}"), "fact", &content, json!({}), None);
+    }
+    let input = MemorySearchInput {
+        query: TRIED.into(),
+        limit: 10,
+        ..MemorySearchInput::default()
+    };
+    let hits = queries::search_memories_without_dead_ends(&store, &input).unwrap();
+    assert_eq!(hits.len(), 10);
+    assert!(hits.iter().all(|h| h.memory.id.starts_with('f')));
+}
