@@ -1207,7 +1207,15 @@ fn search_ranked(
     // cross-encoder does, which is promote a candidate from just past the
     // cutoff. Feedback runs first so its nudge perturbs the order feeding the
     // cross-encoder, leaving the cross-encoder with the final say.
-    ranked.truncate(crate::reranker::pool_size(input.limit));
+    // Recency (card #568) can lift a hit from past the pool, so it keeps the
+    // tail aside, unreranked, instead of dropping it here.
+    let pool = crate::reranker::pool_size(input.limit).min(ranked.len());
+    let mut tail = if time_buckets == crate::time_buckets::Mode::Off {
+        Vec::new()
+    } else {
+        ranked.split_off(pool)
+    };
+    ranked.truncate(pool);
     // Second gate. The reranker is in-process rather than networked, so this
     // is not about a hung daemon — it is about not spending cross-encoder CPU
     // reordering results for a caller who has already waited longer than they
@@ -1228,10 +1236,11 @@ fn search_ranked(
     } else {
         crate::reranker::maybe_rerank(&input.query, ranked)
     };
-    // Card #568 recency buckets, off unless the caller turns them on: on the
-    // whole pool, after every ranking stage and before the cut, so pages
-    // stay stable.
+    // Card #568 recency buckets, off unless the caller turns them on: on
+    // every candidate (the reranked head, then the tail in rank order), after
+    // every ranking stage and before the cut, so pages stay stable.
     if time_buckets != crate::time_buckets::Mode::Off {
+        ranked.append(&mut tail);
         ranked = crate::time_buckets::apply(
             ranked,
             time_buckets,
@@ -1806,5 +1815,51 @@ mod tests {
         assert_eq!(ids.len(), 3, "{ids:?}");
         assert!(!ids.contains(&"warned"), "{ids:?}");
         assert!(ids.contains(&"fresh2"), "{ids:?}");
+    }
+
+    #[test]
+    fn recency_reaches_past_the_rerank_pool_when_limit_fills_it() {
+        // Codex on #446: with limit >= the rerank pool (20), the pool cut left
+        // exactly `limit` rows, so no missing bucket could be lifted.
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let store = db.store();
+        let limit = crate::reranker::pool_size(1);
+        for n in 0..limit {
+            put(
+                &store,
+                &format!("old{n:02}"),
+                "kestrel kestrel nest survey",
+                20,
+                true,
+            );
+        }
+        put(
+            &store,
+            "fresh",
+            "kestrel nest survey notes from the hide",
+            1,
+            false,
+        );
+        let input = MemorySearchInput {
+            query: "kestrel".into(),
+            limit,
+            ..Default::default()
+        };
+        let ids = |mode| -> Vec<String> {
+            let deadline = crate::retrieval::Deadline::from_env();
+            search_ranked(&store, &input, None, deadline, &|_| false, mode)
+                .unwrap()
+                .results
+                .into_iter()
+                .map(|r| r.memory.id)
+                .collect()
+        };
+
+        let off = ids(crate::time_buckets::Mode::Off);
+        let recency = ids(crate::time_buckets::Mode::Recency);
+
+        assert!(!off.iter().any(|id| id == "fresh"), "{off:?}");
+        assert_eq!(recency.len(), limit, "{recency:?}");
+        assert!(recency.iter().any(|id| id == "fresh"), "{recency:?}");
     }
 }

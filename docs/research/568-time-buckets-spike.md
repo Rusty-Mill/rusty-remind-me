@@ -38,8 +38,10 @@ Do the two flagged modes help enough to keep?
   (`search_with_expansions`) passes the flag's modes, the harness passes
   them directly, and every other caller passes off through
   `search_memories_deadlined`. The modes apply after fusion and rerank, on
-  the whole pool, before `limit` and the token budget. With the flag off,
-  nothing changes.
+  every candidate (the reranked head, then the rest in rank order, so a
+  `limit` as large as the rerank pool can still lift a missing bucket),
+  before `limit` and the token budget. With the flag off, nothing changes.
+  The numbers below were re-run after that change and did not move.
 - The time a row is bucketed by is `occurred_at` (a span's `to`) under
   `time_field: occurred`, otherwise the field the window reads (`created_at`
   by default).
