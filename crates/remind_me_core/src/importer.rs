@@ -187,16 +187,6 @@ impl ToolUseSummary {
         let err = if self.is_error { " (error)" } else { "" };
         format!("tool: {} — {shown}{err}", self.name)
     }
-
-    /// Whether [`Self::input_summary`] is a cut of a longer main argument.
-    pub(crate) fn input_cut(&self) -> bool {
-        main_argument(&self.input).chars().count() > TOOL_INPUT_CHARS
-    }
-
-    /// The call's main argument on one line, uncut.
-    pub(crate) fn main_argument(&self) -> String {
-        main_argument(&self.input)
-    }
 }
 
 /// Cap on [`ToolUseSummary::input_summary`].
@@ -226,17 +216,8 @@ impl ChatMessage {
     }
 }
 
-/// The argument of a `tool_use` input that says what the call did, cut.
+/// The argument of a `tool_use` input that says what the call did.
 fn summarize_tool_input(input: &serde_json::Value) -> String {
-    main_argument(input)
-        .chars()
-        .take(TOOL_INPUT_CHARS)
-        .collect()
-}
-
-/// The argument of a `tool_use` input that says what the call did, on one
-/// line.
-fn main_argument(input: &serde_json::Value) -> String {
     const KEYS: [&str; 7] = [
         "command",
         "file_path",
@@ -251,7 +232,8 @@ fn main_argument(input: &serde_json::Value) -> String {
         .find_map(|k| input.get(k).and_then(|v| v.as_str()))
         .map(str::to_string)
         .unwrap_or_else(|| input.to_string());
-    picked.split_whitespace().collect::<Vec<_>>().join(" ")
+    let one_line = picked.split_whitespace().collect::<Vec<_>>().join(" ");
+    one_line.chars().take(TOOL_INPUT_CHARS).collect()
 }
 
 /// The `tool_use` blocks of a message `content`, summarised. A `tool_result`

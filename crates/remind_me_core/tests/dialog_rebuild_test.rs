@@ -78,14 +78,15 @@ fn posted(n: usize, body: &str) -> String {
 /// An assistant turn that runs `command` through Bash: a capture keeps a
 /// preview of its first `TOOL_INPUT_CHARS`.
 fn bash(n: usize, command: &str) -> String {
+    tool(n, "Bash", serde_json::json!({ "command": command }))
+}
+
+/// An assistant turn that calls `name` with `input`.
+fn tool(n: usize, name: &str, input: serde_json::Value) -> String {
     line(
         n,
         "assistant",
-        serde_json::json!([{
-            "type": "tool_use",
-            "name": "Bash",
-            "input": { "command": command },
-        }]),
+        serde_json::json!([{ "type": "tool_use", "name": name, "input": input }]),
     )
 }
 
@@ -205,7 +206,7 @@ fn a_truncated_transcript_replays_with_its_cut() {
 }
 
 #[test]
-fn a_cut_row_whose_source_was_redacted_is_counted_not_replayed() {
+fn a_cut_row_whose_source_was_redacted_is_listed_not_replayed() {
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (dir, db) = fresh("cut_redacted");
     // The card falls in the kept tail; its replacement has another length,
@@ -219,38 +220,51 @@ fn a_cut_row_whose_source_was_redacted_is_counted_not_replayed() {
     let report = check(&db.store(), Some(&dir.join("scratch")), false).unwrap();
 
     assert_eq!(report.findings(), 0, "{report:?}");
-    assert_eq!((report.replayed, report.cut_after_redaction), (0, 1));
+    assert_eq!(
+        (report.replayed, report.redacted_source_differs.len()),
+        (0, 1)
+    );
     done(&dir);
 }
 
 #[test]
-fn a_cut_tool_preview_whose_argument_was_redacted_is_counted_not_replayed() {
+fn a_tool_line_that_renders_differently_from_a_redacted_source_is_listed() {
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let (dir, db) = fresh("preview_redacted");
-    // The card falls inside the preview; its replacement has another length,
-    // so the archived (redacted) argument would cut elsewhere.
+    let (dir, db) = fresh("tool_redacted");
     let tail = "z".repeat(TOOL_INPUT_CHARS);
-    capture(
-        &db,
-        &[
-            text(1, "user", "run it"),
-            bash(2, &format!("echo {CARD} {tail}")),
-        ],
+    // The card falls inside a cut preview; its replacement has another
+    // length, so the archived (redacted) argument cuts elsewhere.
+    let cut = bash(2, &format!("echo {CARD} {tail}"));
+    // A numeric card in a serialised input: the archive holds it as a
+    // string, so the replayed preview gains quotes.
+    let numeric = tool(
+        2,
+        "Custom",
+        serde_json::json!({ "card": 4111111111111111u64 }),
     );
+    // A token whose replacement is shorter takes the argument from over the
+    // cap to under it: the archive no longer shows that a cut happened.
+    let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abc-DEF_123";
+    let pad = "z".repeat(TOOL_INPUT_CHARS - 30);
+    let shrunk = bash(2, &format!("echo {jwt} {pad}"));
     // A long command with no redaction still replays.
-    capture_as(
-        &db,
-        "sess_plain",
-        &[
-            text(1, "user", "run it"),
-            bash(2, &format!("echo {tail} {tail}")),
-        ],
-    );
+    let plain = bash(2, &format!("echo {tail} {tail}"));
+    for (session, turn) in [
+        ("sess_cut", cut),
+        ("sess_num", numeric),
+        ("sess_shrunk", shrunk),
+        ("sess_plain", plain),
+    ] {
+        capture_as(&db, session, &[text(1, "user", "run it"), turn]);
+    }
 
     let report = check(&db.store(), Some(&dir.join("scratch")), false).unwrap();
 
     assert_eq!(report.findings(), 0, "{report:?}");
-    assert_eq!((report.replayed, report.cut_after_redaction), (1, 1));
+    assert_eq!(
+        (report.replayed, report.redacted_source_differs.len()),
+        (1, 3)
+    );
     done(&dir);
 }
 

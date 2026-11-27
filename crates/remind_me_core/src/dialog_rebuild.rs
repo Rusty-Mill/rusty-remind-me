@@ -52,9 +52,12 @@ pub struct Report {
     pub replayed: u64,
     /// Rows with no archived source span.
     pub not_replayable: u64,
-    /// First rows cut to `MAX_DIALOG_CHARS` whose source holds a
-    /// redaction: the cut cannot be placed again, so they are not replayed.
-    pub cut_after_redaction: u64,
+    /// Rows whose archived source holds a redaction and whose replay
+    /// differs from the live row. The capture rendered the raw text and then
+    /// redacted it, but the archive was redacted first, so a cut (the dialog
+    /// cap, a tool preview) or a re-serialised value can land elsewhere.
+    /// Listed for a look, not counted as findings or as replayed.
+    pub redacted_source_differs: Vec<String>,
     /// Rows whose recorded span is not read (inverted, outside its blob, or
     /// over `archive::MAX_SPAN_BYTES`), each with the reason. Listed for a
     /// look, not counted as findings.
@@ -225,7 +228,7 @@ fn rebuild(store: &Store<'_>, scratch: &Path) -> Result<Report> {
                 }
             }
             Replay::NoSource => report.not_replayable += 1,
-            Replay::CutAfterRedaction => report.cut_after_redaction += 1,
+            Replay::RedactedSourceDiffers => report.redacted_source_differs.push(m.id.clone()),
             Replay::Unsupported(why) => report.unsupported_span.push(format!("{}: {why}", m.id)),
         }
     }
@@ -250,8 +253,8 @@ enum Replay {
     Body(String),
     /// No archived span, or no capture id.
     NoSource,
-    /// See [`Report::cut_after_redaction`].
-    CutAfterRedaction,
+    /// See [`Report::redacted_source_differs`].
+    RedactedSourceDiffers,
     /// See [`Report::unsupported_span`].
     Unsupported(String),
 }
@@ -271,8 +274,20 @@ fn replay(store: &Store<'_>, m: &Memory, tools: &MessageTools) -> Result<Replay>
     let continuation =
         m.metadata.get("type").and_then(serde_json::Value::as_str) == Some(CONTINUATION_TYPE);
     let span = String::from_utf8_lossy(&bytes);
-    Ok(crate::transcript::replay_row(&span, continuation, tools)
-        .map_or(Replay::CutAfterRedaction, Replay::Body))
+    let body = crate::transcript::replay_row(&span, continuation, tools);
+    if span.contains(crate::redact::REDACTED_PREFIX) && !same_row(m, &body) {
+        return Ok(Replay::RedactedSourceDiffers);
+    }
+    Ok(Replay::Body(body))
+}
+
+/// Whether `m` with `body` in place of its own hashes as `m` does.
+fn same_row(m: &Memory, body: &str) -> bool {
+    let replayed = Memory {
+        content: body.to_string(),
+        ..m.clone()
+    };
+    as_record(&replayed).canonical_hash() == as_record(m).canonical_hash()
 }
 
 /// The scratch row for `m`: its own fields, the replayed body.
