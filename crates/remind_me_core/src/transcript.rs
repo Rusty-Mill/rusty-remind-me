@@ -483,6 +483,50 @@ impl TranscriptSummary {
     }
 }
 
+/// One message of a client's transcript as a list (ADR-0028 §5): the shape
+/// `capture-transcript --format messages` reads on stdin.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TranscriptMessage {
+    pub role: String,
+    pub text: String,
+}
+
+/// `input`, a JSON array of [`TranscriptMessage`], as transcript JSONL (one
+/// `{"role","content"}` line per message), ready for [`capture_transcript`].
+/// Messages with blank text are dropped; what is left must not be empty.
+///
+/// # Errors
+/// `Invalid` naming the problem: not such an array, a blank role, input over
+/// [`MAX_TRANSCRIPT_BYTES`], or no message with text.
+pub fn messages_jsonl(input: &str) -> Result<String> {
+    if input.len() > MAX_TRANSCRIPT_BYTES {
+        return Err(StoreError::Invalid(format!(
+            "messages exceed {MAX_TRANSCRIPT_BYTES} bytes"
+        )));
+    }
+    let messages: Vec<TranscriptMessage> = serde_json::from_str(input).map_err(|e| {
+        StoreError::Invalid(format!("expected a JSON array of {{role, text}}: {e}"))
+    })?;
+    let mut jsonl = String::new();
+    for (i, message) in messages.iter().enumerate() {
+        let role = message.role.trim();
+        if role.is_empty() {
+            return Err(StoreError::Invalid(format!("message {i} has a blank role")));
+        }
+        if message.text.trim().is_empty() {
+            continue;
+        }
+        let line = serde_json::json!({ "role": role, "content": message.text });
+        jsonl.push_str(&line.to_string());
+        jsonl.push('\n');
+    }
+    if jsonl.is_empty() {
+        return Err(StoreError::Invalid("transcript has no messages".into()));
+    }
+    Ok(jsonl)
+}
+
 /// Who is capturing, and from where.
 #[derive(Debug, Clone)]
 pub struct TranscriptRequest<'a> {

@@ -85,6 +85,33 @@ pub fn capture_transcript(
     serde_json::to_value(outcome).map_err(|e| StoreError::Invalid(e.to_string()))
 }
 
+/// [`capture_transcript`] for a transcript given as a JSON list of
+/// `{role, text}` (ADR-0028 §5): the same capture, one per session,
+/// replaced in place.
+pub fn capture_messages(
+    store: &Store<'_>,
+    messages: &str,
+    session_id: &str,
+    cwd: Option<&Path>,
+    reason: Option<&str>,
+) -> Result<Value> {
+    if let Some(cwd) = cwd {
+        absolute(cwd, "cwd")?;
+    }
+    let raw = transcript::messages_jsonl(messages)?;
+    let outcome = transcript::capture_transcript(
+        store,
+        &raw,
+        &TranscriptRequest {
+            session_id,
+            cwd,
+            reason,
+            context: None,
+        },
+    )?;
+    serde_json::to_value(outcome).map_err(|e| StoreError::Invalid(e.to_string()))
+}
+
 /// `{"imported", "skipped", "empty", "failed": [{"path", "error"}]}` after a
 /// one-time backfill of a Claude Code `projects` folder: every
 /// `dir/*/*.jsonl` session not captured yet is captured, keyed by the
