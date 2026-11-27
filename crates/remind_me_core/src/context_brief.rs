@@ -253,10 +253,10 @@ pub fn build(store: &Store<'_>, request: &ContextRequest<'_>) -> Result<Outcome>
     let prompt = request.prompt.map(str::trim).filter(|p| !p.is_empty());
     if request.mode == Mode::Prompt {
         let drafts = match prompt {
-            Some(prompt) => vec![
-                prompt_warnings_draft(store, prompt, request.project, now)?,
-                hits_draft(store, prompt, &[], now)?,
-            ],
+            Some(prompt) => prompt_warnings_draft(store, prompt, request.project, now)?
+                .into_iter()
+                .chain([hits_draft(store, prompt, &[], now)?])
+                .collect(),
             None => Vec::new(),
         };
         fit(&mut brief, drafts)?;
@@ -297,7 +297,9 @@ pub fn build(store: &Store<'_>, request: &ContextRequest<'_>) -> Result<Outcome>
 
     // Dead ends go first and only there (card #1484, D103): never again in
     // activity.
-    let mut drafts = vec![scope_warnings_draft(&memories, &scope)];
+    let mut drafts: Vec<Draft> = scope_warnings_draft(&memories, &scope)
+        .into_iter()
+        .collect();
     let mut rest: Vec<&Memory> = in_scope
         .iter()
         .copied()
@@ -773,32 +775,49 @@ fn is_dead_end(memory: &Memory) -> bool {
 
 /// A dead end as one brief item: what was tried and why it failed.
 fn warning_item(warning: &crate::dead_ends::Warning) -> Item {
-    let text = format!("tried: {} — failed: {}", warning.tried, warning.why_failed);
+    // Each field shortened on its own, so a long or multiline `tried` never
+    // pushes out why it failed.
+    let text = format!(
+        "tried: {} — failed: {}",
+        first_line(&warning.tried),
+        first_line(&warning.why_failed)
+    );
     Item {
         id: warning.id.clone(),
         kind: crate::kinds::MemoryKind::DeadEnd.as_str().to_string(),
-        text: first_line(&text),
+        text,
         at: warning.created_at.clone(),
     }
 }
 
-fn warnings_draft(found: crate::dead_ends::Found) -> Draft {
-    Draft {
+/// The warnings section, or none when nothing warns: an empty "dead ends"
+/// heading would only cost tokens.
+fn warnings_draft(found: crate::dead_ends::Found) -> Option<Draft> {
+    if found.warnings.is_empty() {
+        return None;
+    }
+    Some(Draft {
         name: "warnings",
         // First in priority: a warning is worth more than recent activity.
         weight: 20,
         items: found.warnings.iter().map(warning_item).collect(),
         capped: found.omitted,
-    }
+    })
 }
 
 /// The scope's dead ends, newest first, not windowed (D103). `memories` are
 /// already fit to show unasked; a dead end with no project holds everywhere,
-/// so it joins every scope (D102).
-fn scope_warnings_draft(memories: &[Memory], scope: &Scope) -> Draft {
-    let candidates: Vec<Memory> = memories
+/// so it joins every scope (D102). Conflicts are resolved over the scope plus
+/// those projectless dead ends, so a dead end a stronger statement overrules
+/// is not shown as a warning.
+fn scope_warnings_draft(memories: &[Memory], scope: &Scope) -> Option<Draft> {
+    let pool: Vec<&Memory> = memories
         .iter()
-        .filter(|m| is_dead_end(m) && (m.project.is_none() || scope.admits(m)))
+        .filter(|m| scope.admits(m) || (is_dead_end(m) && m.project.is_none()))
+        .collect();
+    let candidates: Vec<Memory> = without_overruled(&pool)
+        .into_iter()
+        .filter(|m| is_dead_end(m))
         .cloned()
         .collect();
     let found = crate::dead_ends::rank(
@@ -817,7 +836,7 @@ fn prompt_warnings_draft(
     prompt: &str,
     project: Option<&str>,
     now: DateTime<Utc>,
-) -> Result<Draft> {
+) -> Result<Option<Draft>> {
     let request = crate::dead_ends::Request {
         query: Some(prompt),
         project,

@@ -1384,21 +1384,11 @@ pub fn search_with_expansions(
         &hit_input
     };
 
-    let outcome = search_memories_budgeted(
-        store,
-        hit_input,
-        configured
-            .as_ref()
-            .map(|e| &**e as &dyn crate::embedder::Embedder),
-    )?;
-    // A dead end shown as a warning is not shown again among the hits.
-    let warned: std::collections::HashSet<&str> =
-        found.warnings.iter().map(|w| w.id.as_str()).collect();
-    let memories: Vec<_> = outcome
-        .results
-        .into_iter()
-        .filter(|r| !warned.contains(r.memory.id.as_str()))
-        .collect();
+    let embedder = configured
+        .as_ref()
+        .map(|e| &**e as &dyn crate::embedder::Embedder);
+    let outcome = hits_without_warned(store, hit_input, embedder, &found.warnings)?;
+    let memories = outcome.results;
     let ids: Vec<String> = memories.iter().map(|r| r.memory.id.clone()).collect();
 
     expansion::record_co_retrieval(store, &ids)?;
@@ -1450,6 +1440,39 @@ pub fn search_with_expansions(
     crate::vitality::record_accesses(store, &ids)?;
 
     Ok(response)
+}
+
+/// The ranked hits less any dead end already shown as a warning (card
+/// #1484). The warned ids are dropped before `limit` and the token budget
+/// apply, so the remaining matches fill the page and the envelope counts only
+/// what is returned.
+fn hits_without_warned(
+    store: &Store<'_>,
+    input: &MemorySearchInput,
+    embedder: Option<&dyn crate::embedder::Embedder>,
+    warnings: &[crate::dead_ends::Warning],
+) -> Result<crate::retrieval::TrimOutcome> {
+    if warnings.is_empty() {
+        return search_memories_budgeted(store, input, embedder);
+    }
+    let warned: std::collections::HashSet<&str> = warnings.iter().map(|w| w.id.as_str()).collect();
+    let wide = MemorySearchInput {
+        limit: input.limit + warned.len(),
+        token_budget: 0,
+        ..input.clone()
+    };
+    let raw = search_memories_budgeted(store, &wide, embedder)?;
+    let mut kept: Vec<_> = raw
+        .results
+        .into_iter()
+        .filter(|r| !warned.contains(r.memory.id.as_str()))
+        .collect();
+    kept.truncate(input.limit);
+    let mut outcome = trim_by_token_budget(kept, input.token_budget, input.detail);
+    outcome.timing = raw.timing;
+    outcome.raw_fallback = raw.raw_fallback;
+    outcome.dormant_excluded = raw.dormant_excluded;
+    Ok(outcome)
 }
 
 /// A search's dead-end warnings and the tokens they spend.
