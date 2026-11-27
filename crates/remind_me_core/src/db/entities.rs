@@ -14,6 +14,22 @@ use super::{Result, Store};
 use crate::entity::{Entity, EntityFact, EntityLinkedMemory, EntityListItem, RelationEdge};
 use std::collections::HashSet;
 
+/// The error a store gives when it cannot delete a relation, which an
+/// entity merge and its revert need (card #567).
+pub fn delete_relation_unsupported() -> super::StoreError {
+    super::StoreError::Invalid(
+        "this store cannot delete relations, which entity merge and its revert need".into(),
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: makes [`Entities::delete_relation`] answer as a store
+    /// without the override does, to cover the provided default end to end.
+    pub(crate) static NO_DELETE_RELATION: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
 /// What a sync merge needs of the local copy of an entity.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EntitySyncView {
@@ -154,6 +170,17 @@ pub trait EntityStore {
     /// Insert `row` unless its id is already taken. Returns whether it was
     /// inserted: relations are immutable.
     fn insert_relation_or_ignore(&mut self, row: &RelationRow<'_>, origin: Origin) -> Result<bool>;
+
+    /// Delete the relation `id`. Whether it existed. Never queued: only an
+    /// entity merge or its revert removes a relation (card #567).
+    ///
+    /// Provided, so an implementation written before #567 still compiles:
+    /// it refuses with [`delete_relation_unsupported`], and a merge or
+    /// revert that needs it rolls back. The engine and SQLite override it.
+    fn delete_relation(&mut self, id: &str) -> Result<bool> {
+        let _ = id;
+        Err(delete_relation_unsupported())
+    }
 
     /// Every relation with either end in `entity_ids`, and `relation` as its
     /// label when one is given, oldest first (ties by id). Each comes with
@@ -341,6 +368,15 @@ impl<'c> Entities<'c> {
     /// See [`EntityStore::insert_relation_or_ignore`].
     pub fn insert_relation_or_ignore(&self, row: &RelationRow<'_>, origin: Origin) -> Result<bool> {
         EntityStore::insert_relation_or_ignore(&mut *self.backend.lock()?, row, origin)
+    }
+
+    /// See [`EntityStore::delete_relation`].
+    pub fn delete_relation(&self, id: &str) -> Result<bool> {
+        #[cfg(test)]
+        if NO_DELETE_RELATION.with(std::cell::Cell::get) {
+            return Err(delete_relation_unsupported());
+        }
+        EntityStore::delete_relation(&mut *self.backend.lock()?, id)
     }
 
     /// See [`EntityStore::relations_touching`].
@@ -659,6 +695,34 @@ pub mod conformance {
         assert!(EntityStore::entities_of(store, &[]).unwrap().is_empty());
     }
 
+    pub fn delete_relation_removes_only_that_row(store: &mut dyn EntityStore) {
+        let row = |id: &'static str, object: &'static str| RelationRow {
+            id,
+            subject_entity_id: "a",
+            relation: "uses",
+            object_entity_id: object,
+            created_at: T1,
+            updated_at: T1,
+            node_id: None,
+        };
+        store
+            .insert_relation_or_ignore(&row("r1", "b"), Origin::Local)
+            .unwrap();
+        store
+            .insert_relation_or_ignore(&row("r2", "c"), Origin::Local)
+            .unwrap();
+
+        assert!(store.delete_relation("r1").unwrap());
+        assert!(!store.delete_relation("r1").unwrap());
+        let left: Vec<String> = store
+            .relations_oldest_first()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(left, vec!["r2".to_string()]);
+    }
+
     pub fn relations_touching_nothing_is_empty(store: &mut dyn EntityStore) {
         assert!(store.relations_touching(&[], None, 1).unwrap().is_empty());
     }
@@ -687,6 +751,10 @@ macro_rules! entity_conformance {
         #[test]
         fn entities_of_unions_the_links_of_the_named_memories() {
             conformance::entities_of_unions_the_links_of_the_named_memories(&mut $make);
+        }
+        #[test]
+        fn delete_relation_removes_only_that_row() {
+            conformance::delete_relation_removes_only_that_row(&mut $make);
         }
         #[test]
         fn relations_touching_nothing_is_empty() {
