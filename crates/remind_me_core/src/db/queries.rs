@@ -71,7 +71,7 @@ pub(crate) fn add_memory_reviewing(
     add.finish(store)
 }
 
-/// A dead end's `metadata.from` names a live memory (card #1484, D109):
+/// A dead end's `metadata.from` names a live memory (card #1484, D123):
 /// the decision or action item it came from. Other kinds are not checked.
 fn check_dead_end_source(
     store: &Store<'_>,
@@ -1370,7 +1370,7 @@ pub fn search_with_expansions(
     // an enormous one. A budget of 0 (unlimited) stays 0 here, which is right
     // — an unlimited search does not become limited by having a bootstrap.
     // Dead-end warnings spend from the budget next, like the bootstrap, and
-    // reserve at most a quarter of it (card #1484, D103).
+    // reserve at most a quarter of it (card #1484, D117).
     let found = search_warnings(store, input)?;
     let spent = bootstrap.as_ref().map_or(0, |b| b.tokens_used) + found.tokens;
     let hit_input;
@@ -1482,7 +1482,7 @@ struct SearchWarnings {
     tokens: usize,
 }
 
-/// The dead ends a search's query repeats (card #1484, D102-D103): at most
+/// The dead ends a search's query repeats (card #1484, D116-D117): at most
 /// [`crate::dead_ends::SEARCH_LIMIT`], within a quarter of the token budget
 /// (none dropped when it is unlimited). A listing (empty query) has none.
 fn search_warnings(store: &Store<'_>, input: &MemorySearchInput) -> Result<SearchWarnings> {

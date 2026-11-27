@@ -31,7 +31,7 @@ pub fn demotes(outcome: &str) -> bool {
 }
 
 /// What resolve's reply suggests after an outcome that may mean an approach
-/// failed (card #1484, D109): record a dead end that links back here. Never
+/// failed (card #1484, D123): record a dead end that links back here. Never
 /// created automatically, since "abandoned" often means deprioritised.
 /// `None` for the other outcomes.
 pub fn dead_end_hint(outcome: &str, memory_id: &str) -> Option<String> {

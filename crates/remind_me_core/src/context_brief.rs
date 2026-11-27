@@ -295,7 +295,7 @@ pub fn build(store: &Store<'_>, request: &ContextRequest<'_>) -> Result<Outcome>
     let in_scope = without_overruled(&in_scope);
     brief.project = scope.project_match(&in_scope);
 
-    // Dead ends go first and only there (card #1484, D103): never again in
+    // Dead ends go first and only there (card #1484, D117): never again in
     // activity.
     let mut drafts: Vec<Draft> = scope_warnings_draft(&memories, &scope)
         .into_iter()
@@ -805,9 +805,9 @@ fn warnings_draft(found: crate::dead_ends::Found) -> Option<Draft> {
     })
 }
 
-/// The scope's dead ends, newest first, not windowed (D103). `memories` are
+/// The scope's dead ends, newest first, not windowed (D117). `memories` are
 /// already fit to show unasked; a dead end with no project holds everywhere,
-/// so it joins every scope (D102). Conflicts are resolved over the scope plus
+/// so it joins every scope (D116). Conflicts are resolved over the scope plus
 /// those projectless dead ends, so a dead end a stronger statement overrules
 /// is not shown as a warning.
 fn scope_warnings_draft(memories: &[Memory], scope: &Scope) -> Option<Draft> {
@@ -830,7 +830,7 @@ fn scope_warnings_draft(memories: &[Memory], scope: &Scope) -> Option<Draft> {
     warnings_draft(found)
 }
 
-/// The dead ends the prompt repeats, in the hook's project (D103).
+/// The dead ends the prompt repeats, in the hook's project (D117).
 fn prompt_warnings_draft(
     store: &Store<'_>,
     prompt: &str,

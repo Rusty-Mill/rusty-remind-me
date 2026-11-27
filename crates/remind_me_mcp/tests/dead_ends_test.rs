@@ -1,5 +1,5 @@
 //! Dead ends through `handle_request` (card #1484): search renders the
-//! warning above the hits, and resolving as abandoned suggests one (D109).
+//! warning above the hits, and resolving as abandoned suggests one (D123).
 
 use remind_me_mcp::McpServer;
 use serde_json::{json, Value};

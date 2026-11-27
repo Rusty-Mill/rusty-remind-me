@@ -299,7 +299,7 @@ pub const DEAD_END_TEXT_MAX: usize = 1000;
 /// The effort words a dead end's `cost` may hold instead of minutes.
 pub const DEAD_END_COSTS: [&str; 3] = ["low", "medium", "high"];
 
-/// A dead end (pack D101): `tried` and `why_failed` required, non-empty, at
+/// A dead end (pack D115): `tried` and `why_failed` required, non-empty, at
 /// most [`DEAD_END_TEXT_MAX`] characters; `cost` optional, a positive whole
 /// number of minutes or one of [`DEAD_END_COSTS`]; `from` optional, the id
 /// of the memory it came from (checked as a live memory where it is

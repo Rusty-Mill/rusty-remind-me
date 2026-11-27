@@ -2,7 +2,7 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
-## 2026-11-27 — Dead ends that warn before they're repeated (Mill Board #1484, D101-D103, D109)
+## 2026-11-27 — Dead ends that warn before they're repeated (Mill Board #1484, D115-D117, D123)
 
 ### Added
 - `memory_type: dead_end`: an approach that was tried and failed. `metadata.tried` and `metadata.why_failed` are required (non-empty, at most 1,000 characters); `cost` is optional (positive minutes, or `low`/`medium`/`high`); `from` is optional and must name a live memory. Decay 0.03, type prior 1.1. Nothing existing is reclassified.
@@ -11,7 +11,7 @@ Dated entries, newest first. One entry per merged pull request.
 - `remind_me_resolve` with `abandoned` or `reverted` adds `dead_end_hint` (JSON) or a closing line (Markdown) suggesting a dead end with `from` set. Nothing is created automatically.
 
 ### Not done
-- No PreToolUse blocking hook (D103: worth adding if repeats persist despite warnings, or once dead ends record an exact command or path). Semantic matching is Q28.
+- No PreToolUse blocking hook (D117: worth adding if repeats persist despite warnings, or once dead ends record an exact command or path). Semantic matching is Q29.
 
 ### Tests
 - Field validation and `from`; match, no match, other project, sensitive, cap and `limit` on search; the project brief's section and its absence from activity; the prompt hook's match, miss and cap; resolve's hint; MCP Markdown and compact JSON.

@@ -1,12 +1,12 @@
 //! Dead ends: approaches that were tried and failed, surfaced as warnings
-//! before someone tries them again (card #1484, pack D101-D103, D109).
+//! before someone tries them again (card #1484, pack D115-D117, D123).
 //!
 //! A dead end is a memory of kind `dead_end` with `metadata.tried` and
 //! `metadata.why_failed` (and optionally `cost`). This module finds the dead
 //! ends a request should be warned about. Search, the brief and the prompt
 //! hook show them in a `warnings` section outside the ranking.
 //!
-//! # Matching (D102)
+//! # Matching (D116)
 //!
 //! Lexical only, so the answer is the same with or without an embedder.
 //! The dead end's words (from `tried` and its content, lowercased, without

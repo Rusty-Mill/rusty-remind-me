@@ -1,5 +1,5 @@
-//! Dead ends that warn before they're repeated (card #1484, pack D101-D103,
-//! D109): written with their fields checked, then surfaced in search, the
+//! Dead ends that warn before they're repeated (card #1484, pack D115-D117,
+//! D123): written with their fields checked, then surfaced in search, the
 //! brief and the prompt hook, outside the ranking.
 
 #[path = "../src/test_env.rs"]
