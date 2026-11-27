@@ -139,6 +139,11 @@ pub struct MemorySearchResponse {
     /// Matching dead ends left out by the cap or the budget.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub warnings_omitted: usize,
+    /// Ids of hits a mute covers (card #1485). An explicit search still
+    /// returns them; renderers mark each with `"muted": true`
+    /// ([`crate::mute::mark_hits`]).
+    #[serde(skip)]
+    pub muted: std::collections::HashSet<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub related_via_entities: Option<Vec<RelatedMemory>>,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -412,10 +412,12 @@ fn fetch_candidates(
     limit: usize,
 ) -> SqlResult<Candidates> {
     let rows = Vectors::new(store).consolidation_candidates(category, limit)?;
+    // Mute records are settings, never merged (card #1485).
+    let mutes = crate::mute::record_ids(store)?;
 
     let mut members = Vec::with_capacity(rows.len());
     let mut embeddings = HashMap::new();
-    for row in rows {
+    for row in rows.into_iter().filter(|r| !mutes.contains(&r.id)) {
         embeddings.insert(
             row.id.clone(),
             crate::vectors::le_bytes_to_f32(&row.embedding),

@@ -272,6 +272,7 @@ fn editing_a_category_no_longer_contradicts_a_classification() {
             project: None,
             sensitive: None,
             memory_id: id.clone(),
+            if_version: None,
             content: None,
             // A fast-decaying category. An earlier version of update_memory
             // recomputed decay_rate from this, silently overriding the

@@ -118,6 +118,25 @@ pub enum Op {
         note: Option<String>,
     },
     Stats,
+    /// Mute an entity, topic or tag; see [`crate::mute`].
+    Mute {
+        target: String,
+        value: String,
+        project: Option<String>,
+    },
+    /// Turn a mute off, keeping its record.
+    Unmute {
+        target: String,
+        value: String,
+        project: Option<String>,
+    },
+    /// Every mute record, on or off.
+    Mutes,
+    /// Check the dialog store against `memories`; see
+    /// [`crate::dialog_reconcile`]. `full` re-hashes every blob.
+    DialogsCheck {
+        full: bool,
+    },
     /// The session subcommands (`crate::session_ops`). Paths are absolute.
     SessionStart {
         session_id: String,
@@ -366,6 +385,31 @@ fn run(store: &Store<'_>, op: &Op) -> Result<Value, String> {
             note.as_deref(),
         )),
         Op::Stats => to_value(stats::collect(store)),
+        Op::Mute {
+            target,
+            value,
+            project,
+        } => to_value(
+            crate::mute::Target::parse(target)
+                .and_then(|t| crate::mute::mute(store, t, value, project.as_deref())),
+        ),
+        Op::Unmute {
+            target,
+            value,
+            project,
+        } => to_value(
+            crate::mute::Target::parse(target)
+                .and_then(|t| crate::mute::unmute(store, t, value, project.as_deref())),
+        ),
+        Op::Mutes => to_value(crate::mute::list(store)),
+        Op::DialogsCheck { full } => {
+            let depth = if *full {
+                crate::dialog_reconcile::Depth::Full
+            } else {
+                crate::dialog_reconcile::Depth::Quick
+            };
+            to_value(crate::dialog_reconcile::check(store, depth))
+        }
         Op::SessionStart {
             session_id,
             cwd,

@@ -50,6 +50,7 @@ use crate::db::{Result, Store, StoreError};
 use crate::dead_ends::is_dead_end;
 use crate::entity::{normalize_entity_name, resolve_entity};
 use crate::models::{Memory, MemorySearchInput, ReminderWindow};
+use crate::mute::MuteSet;
 use crate::text::edit_distance;
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
@@ -68,6 +69,8 @@ pub const REMINDER_DAYS: i64 = 7;
 
 /// Persona lines in the session brief, pinned first (pack D101).
 const PERSONA_LIMIT: usize = 10;
+/// Reminders in the session brief, soonest first.
+const REMINDER_LIMIT: usize = 50;
 const STATE_LIMIT: usize = 3;
 const OPEN_LIMIT: usize = 15;
 const ACTIVITY_LIMIT: usize = 20;
@@ -255,7 +258,10 @@ pub fn build(store: &Store<'_>, request: &ContextRequest<'_>) -> Result<Outcome>
     let prompt = request.prompt.map(str::trim).filter(|p| !p.is_empty());
     if request.mode == Mode::Prompt {
         let drafts = match prompt {
-            Some(prompt) => prompt_drafts(store, prompt, request.project, now)?,
+            Some(prompt) => {
+                let mutes = MuteSet::load(store, request.project, None)?;
+                prompt_drafts(store, prompt, request.project, &mutes, now)?
+            }
             None => Vec::new(),
         };
         fit(&mut brief, drafts)?;
@@ -289,6 +295,15 @@ pub fn build(store: &Store<'_>, request: &ContextRequest<'_>) -> Result<Outcome>
         },
     };
 
+    // Mutes apply once the scope is known (card #1485, D118): mute records
+    // and what they cover leave every section. A brief naming a muted
+    // entity as its project ignores that one mute.
+    let own_entity = scope.project.as_ref().map(|p| p.name.clone());
+    let mutes = MuteSet::load(store, request.project, own_entity.as_deref())?;
+    let memories: Vec<Memory> = memories
+        .into_iter()
+        .filter(|m| !crate::mute::is_record(m) && !mutes.covers(m))
+        .collect();
     // A dead end with no project holds everywhere, so it joins every scope
     // (D116) and takes part in its conflicts.
     let pool: Vec<&Memory> = memories
@@ -313,8 +328,8 @@ pub fn build(store: &Store<'_>, request: &ContextRequest<'_>) -> Result<Outcome>
         .filter(|m| !is_dead_end(m))
         .collect();
     if request.mode == Mode::Session {
-        drafts.push(persona_draft(store)?);
-        drafts.push(reminders_draft(store, now)?);
+        drafts.push(persona_draft(store, &mutes)?);
+        drafts.push(reminders_draft(store, &mutes, now)?);
         drafts.push(pinned_draft(store, now));
         let shown: HashSet<&str> = rest.iter().map(|m| m.id.as_str()).collect();
         let reviews = reviews_draft(&memories, &shown, now);
@@ -325,7 +340,7 @@ pub fn build(store: &Store<'_>, request: &ContextRequest<'_>) -> Result<Outcome>
     drafts.extend(project_drafts(&rest, since, request.branch));
     if request.mode == Mode::Session {
         if let Some(prompt) = prompt {
-            drafts.push(hits_draft(store, prompt, &in_scope, now)?);
+            drafts.push(hits_draft(store, prompt, &in_scope, &mutes, now)?);
         }
     }
     fit(&mut brief, drafts)?;
@@ -638,17 +653,23 @@ fn persona_text(statement: &crate::models::PersonaStatement) -> String {
     }
 }
 
-fn persona_draft(store: &Store<'_>) -> Result<Draft> {
-    let items = crate::promotion::persona(store)?
-        .into_iter()
-        .take(PERSONA_LIMIT)
-        .map(|s| Item {
+fn persona_draft(store: &Store<'_>, mutes: &MuteSet) -> Result<Draft> {
+    let mut items = Vec::new();
+    // Mutes before the cap (card #1485): a muted line never takes a slot.
+    for s in crate::promotion::persona(store)? {
+        if items.len() == PERSONA_LIMIT {
+            break;
+        }
+        if persona_muted(store, mutes, &s.id)? {
+            continue;
+        }
+        items.push(Item {
             text: persona_text(&s),
             id: s.id,
             kind: crate::models::PERSONA_CATEGORY.to_string(),
             at: s.created_at,
-        })
-        .collect();
+        });
+    }
     Ok(Draft {
         name: "persona",
         weight: 15,
@@ -657,15 +678,36 @@ fn persona_draft(store: &Store<'_>) -> Result<Draft> {
     })
 }
 
-fn reminders_draft(store: &Store<'_>, now: DateTime<Utc>) -> Result<Draft> {
+/// Whether the mutes cover the persona line `id`. Read only when a mute is
+/// in force, so a brief with none costs no extra reads.
+fn persona_muted(store: &Store<'_>, mutes: &MuteSet, id: &str) -> Result<bool> {
+    if mutes.is_empty() {
+        return Ok(false);
+    }
+    Ok(crate::db::queries::get_memory_by_id(store, id)?.is_some_and(|m| mutes.covers(&m)))
+}
+
+/// Reminders due by the horizon, soonest first, at most [`REMINDER_LIMIT`].
+///
+/// With no mutes this is the single bounded read it always was. With mutes,
+/// muted and out-of-horizon reminders are rejected inside one pass over the
+/// window, before the cap, so they cannot take its slots (card #1485). The
+/// horizon is checked on the parsed time, not the stored text's order.
+fn reminders_draft(store: &Store<'_>, mutes: &MuteSet, now: DateTime<Utc>) -> Result<Draft> {
     let horizon = now + Duration::days(REMINDER_DAYS);
-    let items = crate::reminders::list_reminders(store, ReminderWindow::All, 50)?
+    let limit = i64::try_from(REMINDER_LIMIT).unwrap_or(i64::MAX);
+    let page = if mutes.is_empty() {
+        crate::reminders::list_reminders(store, ReminderWindow::All, limit)?
+    } else {
+        let keep = |m: &Memory| !mutes.covers(m) && due_by(m, horizon);
+        crate::reminders::list_reminders_where(store, ReminderWindow::All, limit, &keep)?
+    };
+    let items = page
         .iter()
+        .filter(|m| due_by(m, horizon))
         .filter_map(|m| {
-            let due = m.remind_at.as_deref()?;
-            let in_horizon = DateTime::parse_from_rfc3339(due).is_ok_and(|t| t <= horizon);
-            in_horizon.then(|| Item {
-                at: due.to_string(),
+            Some(Item {
+                at: m.remind_at.clone()?,
                 ..item(m)
             })
         })
@@ -676,6 +718,14 @@ fn reminders_draft(store: &Store<'_>, now: DateTime<Utc>) -> Result<Draft> {
         capped: 0,
         items,
     })
+}
+
+/// Whether `m`'s reminder is due at or before `horizon`, by its parsed time.
+fn due_by(m: &Memory, horizon: DateTime<Utc>) -> bool {
+    m.remind_at
+        .as_deref()
+        .and_then(|due| DateTime::parse_from_rfc3339(due).ok())
+        .is_some_and(|t| t <= horizon)
 }
 
 /// Most pinned-question names the session brief lists (D90).
@@ -846,14 +896,17 @@ fn prompt_drafts(
     store: &Store<'_>,
     prompt: &str,
     project: Option<&str>,
+    mutes: &MuteSet,
     now: DateTime<Utc>,
 ) -> Result<Vec<Draft>> {
     let dead_ends: Vec<Memory> = Memories::new(store)
         .live_of_type(crate::kinds::MemoryKind::DeadEnd.as_str())?
         .into_iter()
-        .filter(|m| injectable(m, now) && crate::dead_ends::in_project(project, m))
+        .filter(|m| {
+            injectable(m, now) && crate::dead_ends::in_project(project, m) && !mutes.covers(m)
+        })
         .collect();
-    let hits = prompt_hits(store, prompt, now)?;
+    let hits = prompt_hits(store, prompt, mutes, now)?;
     // Only the hook's project (and projectless memories) may overrule its
     // dead ends: another project's fact must not silence our warning.
     let mut rivals: Vec<&Memory> = dead_ends.iter().collect();
@@ -898,16 +951,22 @@ fn ids<'a>(memories: &[&'a Memory]) -> HashSet<&'a str> {
 }
 
 /// The prompt's search matches fit to show unasked, best first. Dead ends
-/// are left out inside the search, before its limits, so they never take a
-/// hit's place: they warn instead.
-fn prompt_hits(store: &Store<'_>, prompt: &str, now: DateTime<Utc>) -> Result<Vec<Memory>> {
+/// (they warn instead), mute records and muted memories are left out inside
+/// the search, before its limits, so they never take a hit's place.
+fn prompt_hits(
+    store: &Store<'_>,
+    prompt: &str,
+    mutes: &MuteSet,
+    now: DateTime<Utc>,
+) -> Result<Vec<Memory>> {
     let input = MemorySearchInput {
         query: prompt.to_string(),
         limit: HIT_LIMIT * 2,
         ..MemorySearchInput::default()
     };
+    let skip = |m: &Memory| is_dead_end(m) || crate::mute::is_record(m) || mutes.covers(m);
     Ok(
-        crate::db::queries::search_memories_without_dead_ends(store, &input)?
+        crate::db::queries::search_memories_skipping(store, &input, &skip)?
             .into_iter()
             .map(|r| r.memory)
             .filter(|m| injectable(m, now))
@@ -922,9 +981,10 @@ fn hits_draft(
     store: &Store<'_>,
     prompt: &str,
     rivals: &[&Memory],
+    mutes: &MuteSet,
     now: DateTime<Utc>,
 ) -> Result<Draft> {
-    let hits = prompt_hits(store, prompt, now)?;
+    let hits = prompt_hits(store, prompt, mutes, now)?;
     let hits: Vec<&Memory> = hits.iter().collect();
     Ok(hits_section(&hits, rivals))
 }
