@@ -297,7 +297,10 @@ pub fn path() -> PathBuf {
         .unwrap_or_else(|| crate::db::resolve_memory_dir_child(CLIENTS_FILE_NAME))
 }
 
-/// Writes stamped `unknown` since [`COUNTING_SINCE`].
+/// Memory rows inserted stamped `unknown` since [`COUNTING_SINCE`]. Counted
+/// at the insert, so a provenance lookup that writes nothing is not counted
+/// and a batch counts every row; a transaction rolled back after the insert
+/// is not subtracted.
 static UNKNOWN_WRITES: AtomicU64 = AtomicU64::new(0);
 /// When this process started counting: the window `unknown_writes` covers.
 static COUNTING_SINCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -306,7 +309,7 @@ fn counting_since() -> &'static str {
     COUNTING_SINCE.get_or_init(|| chrono::Utc::now().to_rfc3339())
 }
 
-/// Count one write stamped `client`, when it is `unknown`.
+/// Count one inserted memory row stamped `client`, when it is `unknown`.
 pub fn note_write(client: &str) {
     counting_since();
     if client == UNKNOWN {
@@ -323,7 +326,7 @@ pub struct ClientsStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     pub registered: usize,
-    /// Writes this process stamped `unknown` since `counting_since`.
+    /// Memory rows this process inserted stamped `unknown` since `counting_since`.
     pub unknown_writes: u64,
     /// RFC 3339 start of the `unknown_writes` window.
     pub counting_since: String,

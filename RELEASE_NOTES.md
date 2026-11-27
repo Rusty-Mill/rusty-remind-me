@@ -8,7 +8,7 @@ Dated entries, newest first. One entry per merged pull request.
 - `clients.json` beside the store (`REMIND_ME_CLIENTS_FILE` overrides): registered client ids (`[a-z0-9-]{1,40}`, `unknown` reserved) with handshake `aliases`, `oauth_clients` and REST `api_keys` names. A bad id, unknown field, blank value or a value claimed by two clients makes the file unusable, with the reason.
 - With a valid registry, `client` resolves credential > `REMIND_ME_CLIENT` > registered handshake alias (the name before `/`, exactly) > `unknown`, so several bots on one MCP SDK are told apart. The raw handshake is kept in `metadata.client_app` on add, auto_capture and decompose; a value the caller set is never overwritten.
 - REST: the verified API key's name (`default` for the flat key) is the call's credential.
-- `remind_me_server_status` gains a `clients` block: `registry` (`off`, `unusable`, `ready`), `path`, `reason`, `registered`, `unknown_writes` and `counting_since`.
+- `remind_me_server_status` gains a `clients` block: `registry` (`off`, `unusable`, `ready`), `path`, `reason`, `registered`, `unknown_writes` (memory rows this process inserted as `unknown`) and `counting_since`.
 
 ### Unchanged
 - With no `clients.json` (every install today) the old rule holds: handshake, then `REMIND_ME_CLIENT`, then `unknown`. Deploying changes no stamped value until the file is written.

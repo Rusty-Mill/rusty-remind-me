@@ -456,7 +456,16 @@ fn with_a_registry_the_env_beats_the_handshake_and_strangers_are_unknown() {
 
     crate::test_env::remove_var(CLIENT_ENV);
     let before = remind_me_core::clients::status().unknown_writes;
+    // A lookup that writes nothing is not counted; each inserted row is.
     assert_eq!(memory_provenance().1, DEFAULT_CLIENT);
+    assert_eq!(remind_me_core::clients::status().unknown_writes, before);
+    let db = db("unknown_count");
+    let store = db.store();
+    queries::add_memory(
+        &store,
+        serde_json::from_value(serde_json::json!({ "content": "a stranger's fact" })).unwrap(),
+    )
+    .unwrap();
     let status = remind_me_core::clients::status();
     assert_eq!((status.registry.as_str(), status.registered), ("ready", 1));
     assert_eq!(status.unknown_writes, before + 1);
