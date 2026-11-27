@@ -340,3 +340,34 @@ fn a_dead_end_a_stronger_statement_overrules_is_not_a_warning() {
         section(&b, "warnings")
     );
 }
+
+#[test]
+fn an_inference_a_projectless_dead_end_overrules_leaves_activity_too() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let at = chrono::Utc::now().to_rfc3339();
+    let mut dead = NewMemory::new("dead", TRIED, &at);
+    dead.memory_type = "dead_end".into();
+    dead.metadata = json!({ "tried": TRIED, "why_failed": "segfaults" });
+    dead.subject = Some("build".into());
+    dead.predicate = Some("allocator".into());
+    dead.object = Some("not jemalloc".into());
+    Memories::new(&store).insert(&dead).unwrap();
+    let mut guess = NewMemory::new("guess", "the build probably uses jemalloc", &at);
+    guess.memory_type = "fact".into();
+    guess.subject = Some("build".into());
+    guess.predicate = Some("allocator".into());
+    guess.object = Some("jemalloc".into());
+    guess.confidence = 0.4;
+    guess.project = Some("alpha".into());
+    Memories::new(&store).insert(&guess).unwrap();
+
+    let b = brief(&store, Mode::Project, Some("alpha"), None);
+    assert_eq!(section(&b, "warnings"), ["dead"]);
+    let shown: Vec<&str> = b
+        .sections
+        .iter()
+        .flat_map(|s| s.items.iter().map(|i| i.id.as_str()))
+        .collect();
+    assert!(!shown.contains(&"guess"), "{shown:?}");
+}
