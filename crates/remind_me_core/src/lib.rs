@@ -101,6 +101,7 @@ pub mod transcript_placement;
 pub mod undo_import;
 pub mod updater;
 pub mod vectors;
+pub mod version;
 pub mod vitality;
 pub mod watchdog;
 pub mod watcher;

@@ -15,6 +15,7 @@ use crate::db::{Result, Store, StoreError};
 use crate::project::{self, Claim, ClaimValue, Predicate, Project, Stage, Status, WriteOutcome};
 use crate::project_backfill;
 use crate::project_proposals;
+use crate::version::Expect;
 use serde_json::{json, Map, Value};
 use std::str::FromStr;
 
@@ -216,10 +217,15 @@ fn get(store: &Store<'_>, name: &str) -> Result<Value> {
             let mut payload = serde_json::to_value(&project).unwrap_or_else(|_| json!({}));
             if let Some(object) = payload.as_object_mut() {
                 object.insert("found".into(), json!(true));
+                object.insert("version".into(), json!(project::version(store, name)?));
             }
             Ok(payload)
         }
-        None => Ok(json!({ "found": false, "name": name })),
+        None => Ok(json!({
+            "found": false,
+            "name": name,
+            "version": project::version(store, name)?,
+        })),
     }
 }
 
@@ -260,7 +266,8 @@ fn set(store: &Store<'_>, args: &Value) -> Result<Value> {
                 .join(", ")
         )));
     }
-    let outcome = project::set(
+    let expect = if_version(args)?;
+    let outcome = project::set_if(
         store,
         &project::SetInput {
             project,
@@ -270,12 +277,22 @@ fn set(store: &Store<'_>, args: &Value) -> Result<Value> {
             confirmed_by: actor(args),
             proposal: text(args, "proposal"),
         },
+        expect.as_ref(),
     )?;
-    Ok(json!({ "set": outcome_json(&outcome) }))
+    Ok(json!({
+        "set": outcome_json(&outcome),
+        "version": project::version(store, &outcome.project)?,
+    }))
+}
+
+/// The optional `if_version` precondition on `set` and `revert` (#1487).
+fn if_version(args: &Value) -> Result<Option<Expect>> {
+    Expect::parse(crate::version::field(args)?, false)
 }
 
 fn revert(store: &Store<'_>, args: &Value) -> Result<Value> {
-    let outcome = project::revert(
+    let expect = if_version(args)?;
+    let outcome = project::revert_if(
         store,
         &project::RevertInput {
             project: required(args, "project")?,
@@ -283,8 +300,12 @@ fn revert(store: &Store<'_>, args: &Value) -> Result<Value> {
             because: required(args, "because")?,
             confirmed_by: actor(args),
         },
+        expect.as_ref(),
     )?;
-    Ok(json!({ "reverted": outcome_json(&outcome) }))
+    Ok(json!({
+        "reverted": outcome_json(&outcome),
+        "version": project::version(store, &outcome.project)?,
+    }))
 }
 
 fn backfill(store: &Store<'_>, args: &Value) -> Result<Value> {
@@ -340,7 +361,8 @@ pub fn input_schema() -> Value {
             "claim_id": { "type": "string", "description": "The current claim to undo (revert)" },
             "confirmed_by": { "type": "string", "default": "human", "description": "Who decided" },
             "repo_root": { "type": "string", "description": "Checkout to read (backfill)" },
-            "write": { "type": "boolean", "default": false, "description": "backfill: save the evidence memories instead of only reporting them" }
+            "write": { "type": "boolean", "default": false, "description": "backfill: save the evidence memories instead of only reporting them" },
+            "if_version": { "type": "string", "description": "set, revert: write only if the project is unchanged since you read it (the version get returned); otherwise nothing is written" }
         }
     })
 }

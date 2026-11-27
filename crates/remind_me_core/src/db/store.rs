@@ -166,6 +166,10 @@ pub enum StoreError {
     Legacy(String),
     /// The engine failed.
     Engine(String),
+    /// A write's `if_version` no longer matches the target: nothing was
+    /// written (#1487). Carries the version the target has now, or
+    /// [`crate::version::ABSENT`] when it no longer exists.
+    Conflict { current_version: String },
 }
 
 /// What every repository returns.
@@ -180,6 +184,10 @@ impl fmt::Display for StoreError {
             StoreError::Invalid(why) => write!(f, "{why}"),
             StoreError::Legacy(why) => write!(f, "legacy SQLite store: {why}"),
             StoreError::Engine(why) => write!(f, "engine store: {why}"),
+            StoreError::Conflict { current_version } => write!(
+                f,
+                "it changed since you read it (current version {current_version})"
+            ),
         }
     }
 }
