@@ -56,6 +56,12 @@ fn update_refuses_a_stale_version_and_names_the_current_one() {
     let read = added["version"].as_str().unwrap().to_string();
     let got = ok_json(&s, "remind_me_get", json!({"memory_id": id}));
     assert_eq!(got["version"], read.as_str(), "get and add agree");
+    let batch = ok_json(&s, "remind_me_get", json!({"memory_ids": [id]}));
+    assert_eq!(
+        batch["memories"][0]["version"],
+        read.as_str(),
+        "batch get carries it too"
+    );
 
     let updated = ok_json(
         &s,

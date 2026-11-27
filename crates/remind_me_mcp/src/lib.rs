@@ -80,7 +80,10 @@ fn get_memories(store: &remind_me_core::db::Store<'_>, raw: &Value) -> Value {
     for id in ids {
         match queries::get_memory_by_id(store, id) {
             Ok(Some(mem)) => match references::memory_json(store, &mem) {
-                Ok(value) => memories.push(value),
+                Ok(mut value) => {
+                    value["version"] = json!(remind_me_core::version::of_memory(&mem));
+                    memories.push(value);
+                }
                 Err(e) => {
                     return json!({ "isError": true, "content": [{ "type": "text", "text": format!("Error: {e}") }] })
                 }
