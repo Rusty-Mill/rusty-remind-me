@@ -317,6 +317,15 @@ impl fmt::Debug for EngineTables {
 /// The engine as a whole store (ADR-0035, step 6). A transaction is one
 /// page (see [`page`]).
 impl super::backend::Backend for EngineTables {
+    /// One pass over the rows; see [`EngineTables::observe_for_refine`].
+    fn refine_observation(
+        &self,
+        settled_before: Option<&str>,
+        run_category: &str,
+    ) -> super::Result<super::curation::RefineObservation> {
+        self.observe_for_refine(settled_before, run_category)
+    }
+
     fn begin_transaction(&mut self) -> super::Result<()> {
         self.begin_page()
     }

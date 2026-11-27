@@ -242,5 +242,40 @@ pub fn maybe_notice(store: &Store<'_>) -> Option<String> {
     if !due("maintenance", NUDGE_INTERVAL_SECONDS) {
         return None;
     }
-    render_notice(&pending_counts(store))
+    let refine = crate::refine::status(store, chrono::Utc::now());
+    join_notice(
+        render_notice(&pending_counts(store)),
+        crate::refine::notice(&refine),
+    )
+}
+
+/// The queue nudge with the refinement line (#1554) after it; either alone
+/// when the other has nothing to say.
+fn join_notice(queues: Option<String>, refine: Option<String>) -> Option<String> {
+    match (queues, refine) {
+        (Some(q), Some(r)) => Some(format!("{q}\n{r}")),
+        (Some(q), None) => Some(q),
+        (None, Some(r)) => Some(format!(
+            "**Maintenance pending** — run when convenient:\n{r}"
+        )),
+        (None, None) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::join_notice;
+
+    #[test]
+    fn the_refinement_line_joins_or_stands_alone() {
+        let q = Some("**Maintenance pending** — run when convenient:\n- 30 x".to_string());
+        let r = Some("- refinement due: 60 settled captures".to_string());
+        assert_eq!(join_notice(None, None), None);
+        assert_eq!(join_notice(q.clone(), None), q);
+        let both = join_notice(q, r.clone()).unwrap();
+        assert!(both.ends_with("- refinement due: 60 settled captures"));
+        let alone = join_notice(None, r).unwrap();
+        assert!(alone.starts_with("**Maintenance pending**"));
+        assert!(alone.contains("refinement due"));
+    }
 }

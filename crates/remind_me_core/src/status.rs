@@ -110,6 +110,9 @@ pub struct ServerStatus {
     /// in flight right now. Process-wide state, not database state — the
     /// reference reports it from the same tool for the same reason.
     pub watchdog: crate::watchdog::WatchdogStatus,
+    /// Whether a session-ladder run is due, and if not, what it waits on
+    /// (Mill Board #1554, D104). Only a flag: a person starts the run.
+    pub refine: crate::refine::RefineStatus,
     /// The client registry (ADR-0028 §1): its state, and how many writes
     /// this process stamped `unknown`.
     pub clients: crate::clients::ClientsStatus,
@@ -180,6 +183,7 @@ pub fn server_status(store: &Store<'_>) -> Result<ServerStatus> {
             .unwrap_or_else(crate::watcher::disabled_status),
         scheduler: crate::scheduler::live_status(),
         watchdog: crate::watchdog::status(),
+        refine: crate::refine::status(store, chrono::Utc::now()),
         clients: crate::clients::status(),
     })
 }

@@ -455,3 +455,51 @@ fn a_filtered_queryless_fallback_keeps_every_filter_detail_and_deadline() {
     assert!(outcome.raw_fallback);
     assert_eq!(outcome.trimmed, 0);
 }
+
+#[test]
+fn the_raw_fallback_keeps_the_callers_recency_mode() {
+    use remind_me_core::retrieval::Deadline;
+    use remind_me_core::time_buckets::Mode;
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let repo = Memories::new(&store);
+    let now = chrono::Utc::now().to_rfc3339();
+    // Only dialogs match, so the search falls back to raw. The old ones are
+    // heavily read and outrank the fresh one on their own.
+    for n in 0..3 {
+        let id = format!("old{n}");
+        repo.insert(&row(&id, "kestrel kestrel nest survey", "dialog", 20 + n))
+            .unwrap();
+        repo.record_access(&id, &now, 30, 3.0, "active").unwrap();
+    }
+    repo.insert(&row("fresh", "kestrel nest", "dialog", 1))
+        .unwrap();
+    let input = MemorySearchInput {
+        limit: 2,
+        ..query("kestrel")
+    };
+    let top = |mode: Mode| -> (Vec<String>, bool) {
+        let outcome = queries::search_memories_deadlined_with(
+            &store,
+            &input,
+            None,
+            Deadline::unbounded(),
+            mode,
+        )
+        .unwrap();
+        let ids = outcome
+            .results
+            .iter()
+            .map(|r| r.memory.id.clone())
+            .collect();
+        (ids, outcome.raw_fallback)
+    };
+
+    let (off, fell_back) = top(Mode::Off);
+    assert!(fell_back);
+    assert!(!off.contains(&"fresh".to_string()), "{off:?}");
+
+    let (on, fell_back) = top(Mode::Recency);
+    assert!(fell_back);
+    assert!(on.contains(&"fresh".to_string()), "{on:?}");
+}

@@ -9,14 +9,54 @@ Dated entries, newest first. One entry per merged pull request.
 - The merge record is a fact memory (`B entity.merged_into A`, tag `entity-merge`, undo data in `metadata.entity_merge`). `revert_merge: <record id>` with `name` = B restores B exactly (row, links, relations, A's aliases, kind and `created_at`), keeps what A gained since, skips memories deleted since, and writes an `entity.merge_reverted` fact that supersedes the record (the #702 pattern, D113).
 - Refused: merging an entity into itself, a topic on either side, and absorbing a project (kind `project` or the subject of project claims; a project may absorb). A repeat by B's name or id is a no-op; asking to merge an absorbed B into a different entity is refused.
 - A revert is refused while a later live merge into or out of the survivor, or into or out of either end of a restored relation, still stands (revert those first), and when a relation end no longer exists, so a revert never deletes rows a later merge relied on or writes a dangling relation.
-- `EntityStore::delete_relation`, on both backends, conformance-tested.
+- `EntityStore::delete_relation`, on both backends, conformance-tested. It is a provided method (D141): an implementation without it still compiles, and a merge or revert on it refuses with `delete_relation_unsupported()` and writes nothing.
+- Entity mutes also match the entity's aliases in subject and object, so a mute on an absorbed entity keeps covering facts that name it.
 
 ### Changed
 - `upsert_entity`: a name with no row of its own that matches an existing entity's stored name or alias now lands on that entity instead of creating a new one (D112), so a merge sticks when B's name is mentioned again. It adds the name's aliases there but never fills that entity's kind. Alias ties go to the oldest entity, and `resolve_entity` now breaks ties the same way, so lookups and writes agree. A miss costs one scan of the entity table. Restoring an export (`importer`) keeps exact ids through the new `upsert_entity_exact`; the dbs importer counts only truly new entities as created.
 - Relations a merge moves are re-keyed under A's derived id. A B relation that would point A at itself, or whose triple A already has (under any id, since older stores keep pre-derivation ids), is dropped and A's row is left as it was.
 
 ### Tests
-- Core (`tests/entity_merge_test.rs`, 18): preview writes nothing; merge moves links, names and kind; an existing kind is kept; relations both ways with self-loop and duplicate dropped; idempotent repeat; revert restores exactly and refuses a second time; revert keeps later links and skips deleted memories; revert checks the name; self, topic and project refusals; project claims refuse; a later mention lands on the survivor; alias ties and the exact upsert; out-of-order reverts refused; a legacy-id triple blocks a duplicate; repeat by id and a different target; no kind fill through an alias. MCP: preview, confirm, repeat, revert and refused argument mixes. Conformance: `delete_relation` on engine and SQLite.
+- Core (`tests/entity_merge_test.rs`, 19, plus two unit tests for a store without `delete_relation`): preview writes nothing; merge moves links, names and kind; an existing kind is kept; relations both ways with self-loop and duplicate dropped; idempotent repeat; revert restores exactly and refuses a second time; revert keeps later links and skips deleted memories; revert checks the name; self, topic and project refusals; project claims refuse; a later mention lands on the survivor; alias ties and the exact upsert; out-of-order reverts refused; a legacy-id triple blocks a duplicate; repeat by id and a different target; no kind fill through an alias; a mute on the absorbed entity still covers facts naming it. MCP: preview, confirm, repeat, revert and refused argument mixes. Conformance: `delete_relation` on engine and SQLite.
+
+## 2026-11-27 — Opt-in recency buckets for status questions (Mill Board #568, D135–D137)
+
+### Added
+- `REMIND_ME_TIME_BUCKETS=recency` (off by default): a search with no time window lifts the best hit of a bucket missing from the top `limit` (the last 2 days, the 5 days before, older; newest first) into the place of the lowest-ranked hit from a bucket that holds more than one slot there, so heavily read old rows cannot crowd the newest week out of "latest on X". No bucket gives up its last slot, so a bucket gets in only while `limit` has room: at `limit=1` the first hit stays, and at `limit=2` with all three buckets present only the newest missing bucket gets in. Everything else keeps rank order. It runs after rerank and before the cut, so pages stay stable. Unset, blank or any other value is off.
+- `docs/research/568-time-buckets-spike.md`: the spike write-up. On the #59 fixture recency moved no gated query and added no latency; on a generated status set it took hit@10 from 0.02 to 1.00 (hashed mode). It missed D136's 2-point temporal lift, so it ships opt-in only (D137).
+
+### Not merged
+- The `window` mode (spreading a wide window across equal buckets) lowered temporal MRR by 0.025 to 0.092 and was removed.
+
+## 2026-11-27 — Hermes memory provider; `capture-transcript --format messages` (Mill Board #1552 PR C, ADR-0028 step 6, D105, D131, D138-D140)
+
+### Added
+- `remind_me_brief` takes an optional `prompt` in place of `project`: the memories most relevant to that text (Prompt mode, as the per-prompt hook injects them; empty when nothing matches). Send one of the two; both or neither is `invalid_input`. `project` is no longer listed as required in the schema (D138).
+- `plugins/hermes-memory/`: remind-me as a Hermes memory provider (`memory.provider: remind-me`). Each profile writes as `hermes-<profile>`. It opens the system prompt with `remind_me_brief` for the configured project, adds `remind_me_brief {prompt: <turn text>}` before each answer (both Markdown, within the client's registry `brief_budget`), proxies the tools remind-me lists for the client, and captures the transcript once at session end (not for cron jobs or subagents). Local mode runs `rusty-remind-me server` over stdio; remote mode uses the connector URL and `REMIND_ME_TOKEN`. Captures are keyed `<client>:<hermes session id>` (D139); remotely they go through `remind_me_capture_transcript` with the ADR-0036 capture token (`REMIND_ME_CAPTURE_TOKEN`) when it is set, one per session, else through `remind_me_auto_capture` (D140). Standard library only.
+- `rusty-remind-me capture-transcript --format messages --session-id ID` reads a JSON array of `{role, text}` on stdin and stores it like a hook capture: one per session, a later capture of the session replaces the first. Blank messages are dropped; an empty list, a blank role or an oversize input stores nothing. Daemon op `capture_messages`.
+
+### Unchanged
+- No tool is renamed or removed; a `remind_me_brief {project}` call works as before. No migration. Existing `capture-transcript PATH.jsonl` is as before.
+
+### Tests
+- Rust: a brief `prompt` returns the matching memory with its id and is empty with no match; blank prompt, project plus prompt, and a bad budget are refused; the schema lists `prompt` and no `required`. A messages capture stores hook/auto rows, a second capture replaces in place with the same id, bad lists store nothing; two clients with one Hermes session id keep separate captures; the CLI reads and checks stdin first. A flat `{role, content}` capture (the remote Hermes shape) keeps one capture and summary over a retry and a grown transcript, stays apart per client, and archives scrubbed.
+- Python, run by hand (`python3 -m unittest discover -s plugins/hermes-memory/tests -v`; not in CI, per the #1552 design): settings, client id, MCP over a fake server (JSON and SSE replies), stdio and local capture through a fake executable, remote capture with the capture token in its own session over loopback HTTP (escaped-limit tail, session key), every provider method, and failure as empty recall. With `REMIND_ME_TEST_BINARY` set, a round trip against the real server on a throwaway store.
+
+## 2026-11-27 — Refinement runs when there is enough material, and each run leaves a record (Mill Board #1554, D104)
+
+### Added
+- `refine` in `remind_me_server_status`: `state` is `due`, `backlog` (with `needed`), `cooldown` or `active` (with `until`), or `misconfigured` (with `reason`), plus `settled_backlog`, `last_run_at` and `last_run_id`. A run is due when at least `REMIND_ME_REFINE_MIN_BACKLOG` (default 50) captures (distinct sessions, not dialog/summary rows) are undecomposed and unchanged for the idle window, `REMIND_ME_REFINE_COOLDOWN_HOURS` (8) have passed since the newest run record, and nothing was captured for `REMIND_ME_REFINE_IDLE_MINUTES` (60). New captures reset the idle clock, so they cancel a due run. A threshold that is not a whole number, or above its maximum (a year for the cooldown and idle window), is reported by name rather than replaced with the default.
+- The maintenance nudge adds "refinement due: N settled captures" when a run is due.
+- The run record: a `refinement_run` memory whose `metadata.run` holds `decomposed`, `created`, `superseded` and `promoted` id arrays and `started_at`/`finished_at`. Add refuses a record without the object or the two times, or with a non-array id list, naming the key. The newest record starts the cooldown.
+- `docs/routines/session-ladder.md`: started by a person when a run is due, its queue window now matches the idle window (60 minutes, was 120), and a new step writes the record.
+
+- `Backend::refine_observation`, a provided method: what the flag reads (settled-capture count, last capture time, newest run record by `(created_at, id)`) in one call under one lock. Its default composes the existing `undecomposed`, `capture_activity` and `list_page` reads, so other `CurationStore`/`Backend` implementations keep compiling; the engine and SQLite override it with no sorting, revisions or `CaptureRow`s. SQLite selects ids and times only. The engine store has no narrow read, so it makes one pass that still clones each record once before dropping the body; SQLite is the chosen backend (R4), so that gap is left documented.
+
+### Not changed
+- Nothing starts a run: no background model call, and the daily routine stays paused (D104, D16's reason).
+
+### Tests
+- Below the backlog threshold, inside the cooldown, recent activity cancelling, due after a quiet hour, settings from the environment and a named typo, the nudge line, run record validation, and against a store: empty, due with 50 settled captures, cooldown after a record, `server_status` carrying `refine`; on both backends, the settled-capture count equals the distinct capture ids `undecomposed` lists, across duplicates, unsettled, decomposed, recaptured, deleted and 1 MB captures; each backend's override equals the composed default, and the one-call observation's newest run and last capture match a category-filtered `list_page` and `capture_activity` (same-instant ids, sensitive, deleted and non-run rows); on SQLite the count still answers when `content` and `tags` cannot be decoded, which the full listing cannot.
 
 ## 2026-11-27 — Mutes: stop bringing something up unasked (Mill Board #1485, D118, D124)
 

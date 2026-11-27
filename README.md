@@ -465,6 +465,16 @@ and Markdown opens with a line naming it. Only the search tool infers: saved
 searches, the brief, export and the CLI search their text as written. It is
 off by default until the retrieval eval's `+dates` modes show it helps.
 
+With `REMIND_ME_TIME_BUCKETS=recency`, a `remind_me_search` call with no
+window lifts the best hit of a bucket missing from the top `limit` (the
+last 2 days, the 5 days before, older; newest first) into the place of the
+lowest-ranked hit from a bucket that holds more than one slot there, so
+heavily read old rows cannot crowd the newest week out of "latest on X".
+No bucket gives up its last slot, so a bucket gets in only while `limit`
+has room: at `limit=1` the first hit stays. It reorders after rerank and
+before the cut, and otherwise keeps rank order. It is off by default (card
+#568, D137).
+
 ### Event time (`metadata.occurred_at`)
 
 A memory can say when its event happened, apart from when it was recorded:
@@ -483,6 +493,7 @@ malformed stored value reads as absent.
 | --- | --- | --- |
 | `REMIND_ME_TZ` | IANA zone whose calendar phrases mean (`Australia/Sydney`); an unknown name fails phrases, never RFC 3339 or ages | UTC |
 | `REMIND_ME_DATE_PHRASES` | `on` to infer a search window from a date phrase in the query | unset (off) |
+| `REMIND_ME_TIME_BUCKETS` | `recency` to reserve top slots for the newest buckets on an unwindowed search | unset (off) |
 
 ### Query expansion (`remind_me_core::query_expansion`)
 
@@ -584,7 +595,7 @@ One call for what is worth knowing about a project: its current state (the newes
 ```bash
 rusty-remind-me brief rusty_mux --since 2d --budget 1500
 ```
-The name resolves through the entity graph, so an alias works, and a memory is in scope when its project, its git remote's repository, a tag, its subject or object, or an entity link names the project. An unknown name is refused with the closest known names, never guessed. `--since` takes `7d` (the default), `12h`, an RFC 3339 time or a date phrase such as `yesterday` or `last week` (its start); `--budget` is in tokens (200 to 8,000) and bounds the returned text, JSON or Markdown, by the same bytes/4 estimate search uses; items that do not fit are dropped whole and counted, and a budget too small even for the header is refused with the size it needs. `--json` prints the brief's JSON instead of its Markdown. Sensitive, superseded and expired memories never appear, and never make a name known or suggested. The same brief is the MCP tool `remind_me_brief` (in the `core` profile, JSON by default) and `GET /api/brief`.
+The name resolves through the entity graph, so an alias works, and a memory is in scope when its project, its git remote's repository, a tag, its subject or object, or an entity link names the project. An unknown name is refused with the closest known names, never guessed. `--since` takes `7d` (the default), `12h`, an RFC 3339 time or a date phrase such as `yesterday` or `last week` (its start); `--budget` is in tokens (200 to 8,000) and bounds the returned text, JSON or Markdown, by the same bytes/4 estimate search uses; items that do not fit are dropped whole and counted, and a budget too small even for the header is refused with the size it needs. `--json` prints the brief's JSON instead of its Markdown. Sensitive, superseded and expired memories never appear, and never make a name known or suggested. The same brief is the MCP tool `remind_me_brief` (in the `core` profile, JSON by default) and `GET /api/brief`. The MCP tool also takes `prompt` in place of `project`: the memories most relevant to that text, as the per-prompt hook injects them (Prompt mode; empty when nothing matches).
 
 #### Mutes
 Stop an entity, topic or tag from coming up unasked:

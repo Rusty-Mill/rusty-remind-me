@@ -1291,3 +1291,55 @@ fn an_equal_text_tail_with_other_ids_is_kept_and_an_exact_retry_is_not() {
     crate::test_env::remove_var(ARCHIVE_DIR_ENV);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// One flat `{role, content}` line, as the Hermes plugin sends a remote
+/// capture through `remind_me_capture_transcript` (D139 key, capture token).
+fn flat_line(role: &str, content: &str) -> String {
+    serde_json::json!({ "role": role, "content": content }).to_string()
+}
+
+/// A Hermes remote capture: a retried callback and a grown transcript keep
+/// one capture, dialog and summary; another client with the same Hermes
+/// session id keeps its own; the archive is scrubbed.
+#[test]
+fn a_flat_hermes_capture_is_one_per_client_session_and_its_archive_is_scrubbed() {
+    use remind_me_core::transcript::capture_transcript;
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_limits();
+    let dir = scratch("hermes-flat");
+    crate::test_env::set_var(ARCHIVE_DIR_ENV, dir.join("archive"));
+    let db = open();
+    let store = db.store();
+    let token = format!("ghp_{}", "c".repeat(36));
+    let first = format!(
+        "{}\n{}\n",
+        flat_line("user", &format!("deploy with {token}")),
+        flat_line("assistant", "deployed")
+    );
+
+    let made = capture_transcript(&store, &first, &request_for("hermes-jarvis:s1")).unwrap();
+    let retried = capture_transcript(&store, &first, &request_for("hermes-jarvis:s1")).unwrap();
+    assert_eq!(retried.capture_id, made.capture_id, "a retry adds nothing");
+    assert_eq!(retried.summary_id, made.summary_id);
+
+    let grown = format!("{first}{}\n", flat_line("user", "and roll back"));
+    let again = capture_transcript(&store, &grown, &request_for("hermes-jarvis:s1")).unwrap();
+    assert_eq!(again.capture_id, made.capture_id, "grown, not added");
+    assert_eq!(
+        again.summary_id, made.summary_id,
+        "the summary stays linked"
+    );
+    assert_eq!(again.messages, 3);
+
+    let other = capture_transcript(&store, &first, &request_for("hermes-gw:s1")).unwrap();
+    assert_ne!(other.capture_id, made.capture_id, "clients never share");
+    let gw = remind_me_core::episodes::session_memories(&store, "hermes-gw:s1").unwrap();
+    assert!(gw.iter().all(|m| !m.content.contains("roll back")));
+
+    let kept = archived(&store, &archive::session_import_id("hermes-jarvis:s1"));
+    assert!(!kept.contains(&token), "{kept}");
+    assert!(kept.contains("[REDACTED:github_token]"), "{kept}");
+
+    crate::test_env::remove_var(ARCHIVE_DIR_ENV);
+    let _ = std::fs::remove_dir_all(&dir);
+}
