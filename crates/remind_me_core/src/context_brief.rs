@@ -842,9 +842,9 @@ fn scope_warnings_draft(resolved: &[&Memory]) -> Option<Draft> {
 }
 
 /// The prompt hook's sections: the dead ends the prompt repeats, in the
-/// hook's project (D117), then its hits. Conflicts are settled over both at
-/// once, so neither section shows a claim the other's memory overrules; dead
-/// ends are scoped first, so another project's cannot overrule ours.
+/// hook's project (D117), then its hits. Conflicts are settled across both,
+/// so neither section shows a claim the other's memory overrules; only the
+/// hook's project and projectless memories may overrule its dead ends.
 fn prompt_drafts(
     store: &Store<'_>,
     prompt: &str,
@@ -857,16 +857,19 @@ fn prompt_drafts(
         .filter(|m| injectable(m, now) && crate::dead_ends::in_project(project, m))
         .collect();
     let hits = prompt_hits(store, prompt, now)?;
-    let mut pool: Vec<&Memory> = dead_ends.iter().collect();
-    pool.extend(hits.iter());
-    let resolved = without_overruled(&pool);
-    let kept: HashSet<&str> = resolved.iter().map(|m| m.id.as_str()).collect();
-
-    let candidates: Vec<Memory> = dead_ends
+    // Only the hook's project (and projectless memories) may overrule its
+    // dead ends: another project's fact must not silence our warning.
+    let mut rivals: Vec<&Memory> = dead_ends.iter().collect();
+    rivals.extend(
+        hits.iter()
+            .filter(|m| crate::dead_ends::in_project(project, m)),
+    );
+    let kept = ids(&without_overruled(&rivals));
+    let warned: Vec<&Memory> = dead_ends
         .iter()
         .filter(|m| kept.contains(m.id.as_str()))
-        .cloned()
         .collect();
+    let candidates: Vec<Memory> = warned.iter().copied().cloned().collect();
     let request = crate::dead_ends::Request {
         query: Some(prompt),
         project,
@@ -879,14 +882,22 @@ fn prompt_drafts(
         now,
         &|_| true,
     );
+    // A hit a surviving dead end overrules is not shown beside its warning.
+    let mut pool = warned;
+    pool.extend(hits.iter());
+    let shown_ids = ids(&without_overruled(&pool));
     let shown: Vec<&Memory> = hits
         .iter()
-        .filter(|m| kept.contains(m.id.as_str()))
+        .filter(|m| shown_ids.contains(m.id.as_str()))
         .collect();
     Ok(warnings_draft(found)
         .into_iter()
         .chain([hits_section(&shown, &[])])
         .collect())
+}
+
+fn ids<'a>(memories: &[&'a Memory]) -> HashSet<&'a str> {
+    memories.iter().map(|m| m.id.as_str()).collect()
 }
 
 /// The prompt's search matches fit to show unasked, dead ends aside (they
