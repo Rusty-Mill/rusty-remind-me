@@ -1647,8 +1647,8 @@ impl McpServer {
                             .get("include_demoted")
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
-                        match remind_me_core::promotion::persona_with_staleness(&store) {
-                            Ok(statements) => {
+                        match remind_me_core::promotion::persona_card(&store) {
+                            Ok((statements, total)) => {
                                 let demoted = if include_demoted {
                                     remind_me_core::promotion::demoted(&store).unwrap_or_default()
                                 } else {
@@ -1656,6 +1656,7 @@ impl McpServer {
                                 };
                                 let mut payload = json!({
                                     "count": statements.len(),
+                                    "total": total,
                                     "persona": statements,
                                 });
                                 if include_demoted {
@@ -3257,7 +3258,7 @@ fn handler_table(req_id: Value) -> Value {
                 },
                 {
                     "name": "remind_me_persona",
-                    "description": "remind-me pipeline: the current persona: durable statements about the user whose grounds still hold. A statement whose sources have all been superseded or deleted is withheld automatically, so a contradicted fact demotes what was built on it. Set include_demoted to also see what is currently withheld and why. A statement with newer related memories says stale, with new_evidence.",
+                    "description": "remind-me pipeline: the current persona: durable statements about the user whose grounds still hold. A statement whose sources have all been superseded or deleted is withheld automatically, so a contradicted fact demotes what was built on it. Set include_demoted to also see what is currently withheld and why. A statement with newer related memories says stale, with new_evidence. Lines a person pinned (metadata.pinned) come first and are never withheld; at most 40 are listed, total counts all.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {

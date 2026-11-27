@@ -216,9 +216,7 @@ pub fn configured_client() -> String {
 /// tell "unknown because nobody configured one" from "unknown because this
 /// write path forgot".
 pub fn memory_provenance() -> (String, String) {
-    let client = configured_client();
-    crate::clients::note_write(&client);
-    (configured_node_id(), client)
+    (configured_node_id(), configured_client())
 }
 
 /// The `sync_flags` key recording whether the outbox is being filled.

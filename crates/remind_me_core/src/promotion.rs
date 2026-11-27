@@ -98,6 +98,8 @@ pub enum PromotionError {
     DuplicateSources(String),
     /// `refreshes` names no live promoted memory at the rung promoted to.
     UnusableRefresh(String),
+    /// `refreshes` names a line a person pinned (pack D102).
+    PinnedRefresh(String),
 }
 
 impl std::fmt::Display for PromotionError {
@@ -139,6 +141,12 @@ impl std::fmt::Display for PromotionError {
                 f,
                 "refreshes {:?} names no live promoted memory at the rung promoted to, \
                  so there is nothing for this promotion to replace",
+                id
+            ),
+            Self::PinnedRefresh(id) => write!(
+                f,
+                "refreshes {:?} is a pinned persona line; unpin it with remind_me_update \
+                 (metadata.pinned false) before replacing it",
                 id
             ),
         }
@@ -302,6 +310,11 @@ fn refresh_candidates(
         if surviving_sources(store, &row.id)? == 0 {
             continue;
         }
+        // A pin is a person's line: never offered for a rewrite that would
+        // supersede it (pack D102). It still reads as stale.
+        if crate::kinds::is_pinned(&row.metadata) {
+            continue;
+        }
         let mut source_ids = usable_sources(&promotions, &row.id, rung)?;
         if source_ids.is_empty() {
             continue;
@@ -421,6 +434,22 @@ pub fn persona_with_staleness(store: &Store<'_>) -> SqlResult<Vec<PersonaStateme
         statement.new_evidence = staleness.new_evidence;
     }
     Ok(statements)
+}
+
+/// The persona card `remind_me_persona` serves: at most
+/// [`PERSONA_CARD_MAX`] statements of [`persona`], pinned first, each with
+/// its stale flag, and how many stand in all.
+pub fn persona_card(store: &Store<'_>) -> SqlResult<(Vec<PersonaStatement>, usize)> {
+    let now = Utc::now();
+    let mut statements = persona(store)?;
+    let total = statements.len();
+    statements.truncate(PERSONA_CARD_MAX);
+    for statement in &mut statements {
+        let staleness = staleness_of(store, &statement.id, now)?;
+        statement.stale = staleness.stale;
+        statement.new_evidence = staleness.new_evidence;
+    }
+    Ok((statements, total))
 }
 
 /// The true, uncapped count of what is ready at one rung.
@@ -627,6 +656,10 @@ fn check_refresh(store: &Store<'_>, old: &str, category: &str) -> Result<(), Pro
     if !live || row.category != category || row.source != PROMOTION_SOURCE {
         return Err(unusable());
     }
+    // A pinned line is a person's: no refresh supersedes it (pack D102).
+    if crate::kinds::is_pinned(&row.metadata) {
+        return Err(PromotionError::PinnedRefresh(old.to_string()));
+    }
     Ok(())
 }
 
@@ -682,29 +715,52 @@ pub fn persona(store: &Store<'_>) -> SqlResult<Vec<PersonaStatement>> {
     let rows = Promotions::new(store).statements_by_vitality(PERSONA_CATEGORY)?;
 
     let mut out = Vec::new();
-    for StatementRow {
-        id,
-        content,
-        vitality,
-        created_at,
-    } in rows
-    {
-        let surviving = surviving_sources(store, &id)?;
-        if surviving == 0 {
+    for row in rows {
+        let surviving = surviving_sources(store, &row.id)?;
+        if !held(store, &row, surviving)? {
             continue;
         }
-        out.push(PersonaStatement {
-            id,
-            content,
-            vitality,
-            created_at,
-            surviving_sources: surviving,
-            stale: None,
-            new_evidence: Vec::new(),
-        });
+        out.push(statement(row, surviving));
     }
+    // Pinned lines first (#1555); the sort is stable, so each group keeps
+    // the vitality order it was read in.
+    out.sort_by_key(|s| !s.pinned);
     Ok(out)
 }
+
+/// Whether a persona row stands: a promoted line while any source does, a
+/// pinned line regardless of its sources (pack D102). A pinned line with no
+/// sources at all must have been written by a person; one that was not (it
+/// can only predate the check at write time) is withheld.
+fn held(store: &Store<'_>, row: &StatementRow, surviving: usize) -> SqlResult<bool> {
+    if surviving > 0 {
+        return Ok(true);
+    }
+    if !crate::kinds::is_pinned(&row.metadata) {
+        return Ok(false);
+    }
+    if row.written_by == "human" {
+        return Ok(true);
+    }
+    Ok(!Promotions::new(store).sources_of(&row.id)?.is_empty())
+}
+
+fn statement(row: StatementRow, surviving: usize) -> PersonaStatement {
+    PersonaStatement {
+        pinned: crate::kinds::is_pinned(&row.metadata),
+        kind: crate::kinds::PersonaKind::of(&row.metadata),
+        id: row.id,
+        content: row.content,
+        vitality: row.vitality,
+        created_at: row.created_at,
+        surviving_sources: surviving,
+        stale: None,
+        new_evidence: Vec::new(),
+    }
+}
+
+/// Most statements `remind_me_persona` lists, pinned first (pack D101).
+pub const PERSONA_CARD_MAX: usize = 40;
 
 /// Persona statements currently withheld, and why — the other half of
 /// [`persona`].
@@ -716,23 +772,10 @@ pub fn demoted(store: &Store<'_>) -> SqlResult<Vec<PersonaStatement>> {
     let rows = Promotions::new(store).statements_newest_first(PERSONA_CATEGORY)?;
 
     let mut out = Vec::new();
-    for StatementRow {
-        id,
-        content,
-        vitality,
-        created_at,
-    } in rows
-    {
-        if surviving_sources(store, &id)? == 0 {
-            out.push(PersonaStatement {
-                id,
-                content,
-                vitality,
-                created_at,
-                surviving_sources: 0,
-                stale: None,
-                new_evidence: Vec::new(),
-            });
+    for row in rows {
+        let surviving = surviving_sources(store, &row.id)?;
+        if !held(store, &row, surviving)? {
+            out.push(statement(row, surviving));
         }
     }
     Ok(out)
