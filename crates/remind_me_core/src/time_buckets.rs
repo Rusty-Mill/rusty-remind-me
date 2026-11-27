@@ -1,10 +1,13 @@
 //! Recency buckets for status questions (card #568). Off unless
 //! `REMIND_ME_TIME_BUCKETS=recency`.
 //!
-//! A search with no time window keeps at least one slot in the top `limit`
-//! for the best hit of each non-empty bucket: the last 2 days, the 5 days
-//! before, and older. Access boosting then cannot crowd the newest week out
-//! of a status question ("latest on X"). It runs on the whole ranked list
+//! A search with no time window lifts the best hit of each bucket missing
+//! from the top `limit` (the last 2 days, the 5 days before, older; newest
+//! bucket first) into the place of the lowest-ranked hit from a bucket that
+//! holds more than one slot there. Access boosting then cannot crowd the
+//! newest week out of a status question ("latest on X"). No bucket gives up
+//! its last slot, so a bucket gets in only while `limit` has room: at
+//! `limit = 1` the first hit always stays. It runs on the whole ranked list
 //! after fusion and rerank, before `limit` and the token budget, so the same
 //! query pages the same way. The spike also measured a `window` mode, which
 //! spread a wide window across equal buckets; it lowered temporal MRR and was
@@ -125,9 +128,11 @@ fn assign<T>(
         .collect()
 }
 
-/// Make sure the best item of every non-empty recency bucket is in the
-/// first `limit`, displacing the lowest-ranked item of a bucket that already
-/// has more than one there. Everything keeps its rank order.
+/// For each recency bucket missing from the first `limit`, newest first,
+/// move its best item into the place of the lowest-ranked item of a bucket
+/// that holds more than one slot there. A bucket's last slot is never given
+/// up, so when the non-empty buckets outnumber `limit` the older ones stay
+/// out. Everything keeps its rank order.
 pub fn reserve_recent<T>(
     ranked: Vec<T>,
     limit: usize,
@@ -215,6 +220,22 @@ mod tests {
         assert_eq!(
             names(reserve_recent(ranked, 3, now(), at)),
             ["o1", "fresh", "week", "o2", "o3"]
+        );
+    }
+
+    #[test]
+    fn recency_never_takes_a_buckets_last_slot() {
+        let ranked = vec![("old", 20), ("old2", 21), ("fresh", 1), ("week", 5)];
+        // limit 1: the only slot is the old bucket's last, so rank order wins.
+        assert_eq!(
+            names(reserve_recent(ranked.clone(), 1, now(), at)),
+            ["old", "old2", "fresh", "week"]
+        );
+        // limit 2: the newest missing bucket takes old2's place; the week
+        // bucket finds no crowded bucket left to take from.
+        assert_eq!(
+            names(reserve_recent(ranked, 2, now(), at)),
+            ["old", "fresh", "old2", "week"]
         );
     }
 

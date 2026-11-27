@@ -15,8 +15,9 @@ Do the two flagged modes help enough to keep?
   `clamp(days / 7, 3, 6)` equal buckets and the ranked list is interleaved
   round-robin, newest bucket first.
 - **recency** (the 2026-11-18 card comment, "latest on Attest"): a search
-  with no window keeps one top-`limit` slot for the best hit of each
-  non-empty bucket among the last 2 days, the last 7 days and older.
+  with no window lifts the best hit of each non-empty bucket among the
+  last 2 days, the last 7 days and older into the top `limit`, in place of
+  a crowded bucket's lowest-ranked hit, as far as `limit` has room.
 
 ## Keep rule (pre-registered, Nano 2026-11-27, pack D136)
 

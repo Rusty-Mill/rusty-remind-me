@@ -160,6 +160,9 @@ impl PreparedAdd {
             outcome: fields.outcome.clone(),
             ..provenance.stamp(NewMemory::new(id.clone(), content.clone(), &now_iso))
         };
+        if row.category == crate::models::PERSONA_CATEGORY {
+            crate::kinds::validate_new_persona(&row.metadata, &row.written_by)?;
+        }
         Ok(Self {
             id,
             content,
@@ -289,6 +292,29 @@ pub fn update_memory(store: &Store<'_>, input: &MemoryUpdateInput) -> Result<Upd
     update_memory_with(store, input, &StructuredFields::default())
 }
 
+/// Persona rules on an edit (#1555, pack D102): a persona row's metadata
+/// is checked; a row moved into `persona` must meet what a new hand-written
+/// line must, judged by who wrote it.
+fn check_persona_edit(
+    stored: &Memory,
+    new_category: Option<&str>,
+    metadata: &serde_json::Value,
+) -> Result<()> {
+    let persona = crate::models::PERSONA_CATEGORY;
+    let target = new_category
+        .filter(|c| !c.is_empty())
+        .unwrap_or(&stored.category);
+    if target != persona {
+        return Ok(());
+    }
+    if stored.category == persona {
+        crate::kinds::validate_persona(metadata)?;
+    } else {
+        crate::kinds::validate_new_persona(metadata, &stored.written_by)?;
+    }
+    Ok(())
+}
+
 /// [`update_memory`] with the structured fields a writer may set. Validated
 /// against the metadata the memory will hold after this edit and the kind it
 /// will have, so `outcome` on a `fact`, or a `decision` with no rationale, is
@@ -320,6 +346,7 @@ pub fn update_memory_with(
     if let Some(supplied) = &client_metadata {
         crate::kinds::validate_occurred_at(supplied)?;
     }
+    check_persona_edit(&stored, input.category.as_deref(), metadata)?;
     // Becoming a decision schedules its follow-up; staying one does not.
     let scheduled = if stored.memory_type.as_deref() == Some("decision") {
         None
