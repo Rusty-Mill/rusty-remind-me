@@ -967,6 +967,7 @@ fn search_ranked(
                     ..filter.clone()
                 })?
                 .into_iter()
+                .filter(|m| !skip(m))
                 .partition(|m| filter.vital_enough(m, now));
             dormant_excluded = dormant
                 .iter()

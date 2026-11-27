@@ -558,3 +558,32 @@ fn a_search_leaving_out_dead_ends_fills_its_own_limit_without_them() {
     assert_eq!(hits.len(), 10);
     assert!(hits.iter().all(|h| h.memory.id.starts_with('f')));
 }
+
+#[test]
+fn a_window_listing_leaving_out_dead_ends_fills_its_limit_without_them() {
+    use remind_me_core::time_window::{RawTimeWindow, TimeField, TimeWindow};
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    for i in 0..5 {
+        put(&store, &format!("f{i}"), "fact", "a note", json!({}), None);
+    }
+    for i in 0..10 {
+        dead_end(&store, &format!("d{i}"), Some("beta"));
+    }
+    let raw = RawTimeWindow {
+        since: Some("1d".into()),
+        until: None,
+        time_field: Some(TimeField::Created),
+    };
+    let input = MemorySearchInput {
+        limit: 5,
+        window: TimeWindow::resolve(&raw, chrono::Utc::now()).unwrap(),
+        ..MemorySearchInput::default()
+    };
+    let hits =
+        queries::search_memories_skipping(&store, &input, &remind_me_core::dead_ends::is_dead_end)
+            .unwrap();
+    let ids: Vec<&str> = hits.iter().map(|h| h.memory.id.as_str()).collect();
+    assert_eq!(ids.len(), 5, "{ids:?}");
+    assert!(ids.iter().all(|id| id.starts_with('f')), "{ids:?}");
+}
