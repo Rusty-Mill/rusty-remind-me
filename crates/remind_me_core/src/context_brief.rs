@@ -256,10 +256,7 @@ pub fn build(store: &Store<'_>, request: &ContextRequest<'_>) -> Result<Outcome>
         let drafts = match prompt {
             Some(prompt) => {
                 let mutes = MuteSet::load(store, request.project, None)?;
-                prompt_warnings_draft(store, prompt, request.project, &mutes, now)?
-                    .into_iter()
-                    .chain([hits_draft(store, prompt, &[], &mutes, now)?])
-                    .collect()
+                prompt_drafts(store, prompt, request.project, &mutes, now)?
             }
             None => Vec::new(),
         };
@@ -848,23 +845,74 @@ fn scope_warnings_draft(resolved: &[&Memory]) -> Option<Draft> {
 }
 
 /// The dead ends the prompt repeats, in the hook's project (D117).
-fn prompt_warnings_draft(
+/// The prompt hook's sections: the dead ends the prompt repeats, then its
+/// hits. Conflicts are settled over both at once, so neither section shows
+/// a claim the other's memory overrules.
+fn prompt_drafts(
     store: &Store<'_>,
     prompt: &str,
     project: Option<&str>,
     mutes: &MuteSet,
     now: DateTime<Utc>,
-) -> Result<Option<Draft>> {
+) -> Result<Vec<Draft>> {
+    let dead_ends: Vec<Memory> = Memories::new(store)
+        .live_of_type(crate::kinds::MemoryKind::DeadEnd.as_str())?
+        .into_iter()
+        .filter(|m| injectable(m, now) && !mutes.covers(m))
+        .collect();
+    let hits = prompt_hits(store, prompt, mutes, now)?;
+    let mut pool: Vec<&Memory> = dead_ends.iter().collect();
+    pool.extend(hits.iter());
+    let resolved = without_overruled(&pool);
+    let kept: HashSet<&str> = resolved.iter().map(|m| m.id.as_str()).collect();
+
+    let candidates: Vec<Memory> = dead_ends
+        .iter()
+        .filter(|m| kept.contains(m.id.as_str()))
+        .cloned()
+        .collect();
     let request = crate::dead_ends::Request {
         query: Some(prompt),
         project,
         include_sensitive: false,
     };
-    let found =
-        crate::dead_ends::find(store, &request, crate::dead_ends::PROMPT_LIMIT, now, &|m| {
-            injectable(m, now) && !mutes.covers(m)
-        })?;
-    Ok(warnings_draft(found))
+    let found = crate::dead_ends::rank(
+        &candidates,
+        &request,
+        crate::dead_ends::PROMPT_LIMIT,
+        now,
+        &|_| true,
+    );
+    let shown: Vec<&Memory> = hits
+        .iter()
+        .filter(|m| kept.contains(m.id.as_str()))
+        .collect();
+    Ok(warnings_draft(found)
+        .into_iter()
+        .chain([hits_section(&shown, &[])])
+        .collect())
+}
+
+/// The prompt's search matches fit to show unasked, dead ends aside (they
+/// warn instead), best first.
+fn prompt_hits(
+    store: &Store<'_>,
+    prompt: &str,
+    mutes: &MuteSet,
+    now: DateTime<Utc>,
+) -> Result<Vec<Memory>> {
+    let input = MemorySearchInput {
+        query: prompt.to_string(),
+        limit: HIT_LIMIT * 2,
+        ..MemorySearchInput::default()
+    };
+    Ok(crate::db::queries::search_memories(store, &input)?
+        .into_iter()
+        .map(|r| r.memory)
+        .filter(|m| {
+            injectable(m, now) && !is_dead_end(m) && !crate::mute::is_record(m) && !mutes.covers(m)
+        })
+        .collect())
 }
 
 /// The prompt's matches, less any that loses a conflict to another match or
@@ -877,19 +925,15 @@ fn hits_draft(
     mutes: &MuteSet,
     now: DateTime<Utc>,
 ) -> Result<Draft> {
-    let input = MemorySearchInput {
-        query: prompt.to_string(),
-        limit: HIT_LIMIT * 2,
-        ..MemorySearchInput::default()
-    };
-    let results = crate::db::queries::search_memories(store, &input)?;
-    let hits: Vec<&Memory> = results
-        .iter()
-        .map(|r| &r.memory)
-        .filter(|m| {
-            injectable(m, now) && !is_dead_end(m) && !crate::mute::is_record(m) && !mutes.covers(m)
-        })
-        .collect();
+    let hits = prompt_hits(store, prompt, mutes, now)?;
+    let hits: Vec<&Memory> = hits.iter().collect();
+    Ok(hits_section(&hits, rivals))
+}
+
+/// `hits` as a section, less any that loses a conflict to another hit or to
+/// one of `rivals`.
+fn hits_section(hits: &[&Memory], rivals: &[&Memory]) -> Draft {
+    let hits = hits.to_vec();
     let hit_ids: HashSet<&str> = hits.iter().map(|m| m.id.as_str()).collect();
     let mut contenders = hits.clone();
     contenders.extend(rivals.iter().filter(|m| !hit_ids.contains(m.id.as_str())));
@@ -903,12 +947,12 @@ fn hits_draft(
         .take(HIT_LIMIT)
         .map(item)
         .collect();
-    Ok(Draft {
+    Draft {
         name: "hits",
         weight: 25,
         capped: 0,
         items,
-    })
+    }
 }
 
 // -- budget -------------------------------------------------------------------
