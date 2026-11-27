@@ -65,6 +65,7 @@ pub const MAX_TOKEN_BUDGET: usize = 8000;
 /// Days ahead a reminder counts as due.
 pub const REMINDER_DAYS: i64 = 7;
 
+/// Persona lines in the session brief, pinned first (pack D101).
 const PERSONA_LIMIT: usize = 10;
 const STATE_LIMIT: usize = 3;
 const OPEN_LIMIT: usize = 15;
@@ -626,12 +627,22 @@ fn project_drafts(memories: &[&Memory], since: DateTime<Utc>, branch: Option<&st
     ]
 }
 
+/// A persona line for the brief, prefixed with its kind when set, e.g.
+/// `PREFERENCE: terse replies` (#1555).
+fn persona_text(statement: &crate::models::PersonaStatement) -> String {
+    let line = first_line(&statement.content);
+    match statement.kind {
+        Some(kind) => format!("{}: {line}", kind.label()),
+        None => line,
+    }
+}
+
 fn persona_draft(store: &Store<'_>) -> Result<Draft> {
     let items = crate::promotion::persona(store)?
         .into_iter()
         .take(PERSONA_LIMIT)
         .map(|s| Item {
-            text: first_line(&s.content),
+            text: persona_text(&s),
             id: s.id,
             kind: crate::models::PERSONA_CATEGORY.to_string(),
             at: s.created_at,
@@ -1861,5 +1872,23 @@ mod tests {
         assert!(check_token_budget(MAX_TOKEN_BUDGET).is_ok());
         assert!(check_token_budget(MIN_TOKEN_BUDGET - 1).is_err());
         assert!(check_token_budget(MAX_TOKEN_BUDGET + 1).is_err());
+    }
+
+    #[test]
+    fn a_persona_line_carries_its_kind() {
+        let mut statement = crate::models::PersonaStatement {
+            id: "mem_p".into(),
+            content: "terse replies\nmore detail".into(),
+            vitality: 1.0,
+            created_at: "2026-11-27T00:00:00Z".into(),
+            surviving_sources: 0,
+            stale: None,
+            new_evidence: Vec::new(),
+            pinned: true,
+            kind: Some(crate::kinds::PersonaKind::Preference),
+        };
+        assert_eq!(persona_text(&statement), "PREFERENCE: terse replies");
+        statement.kind = None;
+        assert_eq!(persona_text(&statement), "terse replies");
     }
 }

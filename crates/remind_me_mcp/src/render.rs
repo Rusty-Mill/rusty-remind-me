@@ -788,6 +788,8 @@ mod bootstrap_rendering {
             surviving_sources: 1,
             stale: None,
             new_evidence: Vec::new(),
+            pinned: false,
+            kind: None,
         }
     }
 
