@@ -5,7 +5,7 @@ Each Hermes profile (bot) gets its own instance and writes as
 `hermes-<profile>`, so remind-me can tell JARVIS from the gateway.
 
 - system prompt: `remind_me_brief` for the configured project, once.
-- before each call: `remind_me_search` with the turn's text.
+- before each call: `remind_me_brief` Prompt mode with the turn's text (D132).
 - tools: whatever remind-me lists for this client (its registry profile,
   `minimal` for small models), proxied as they are.
 - session end: the transcript is captured, once per session.
@@ -126,8 +126,7 @@ class RemindMeProvider(MemoryProvider):  # type: ignore[misc,valid-type]
         """The configured project's brief, fetched once; "" without a project."""
         if self._prompt_block is None:
             project = self._settings.project if self._settings else None
-            # No token_budget: the registry's brief_budget for this client applies.
-            self._prompt_block = self._call("remind_me_brief", {"project": project}) if project else ""
+            self._prompt_block = self._brief({"project": project}) if project else ""
         return self._prompt_block
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
@@ -136,12 +135,14 @@ class RemindMeProvider(MemoryProvider):  # type: ignore[misc,valid-type]
             return ""
         if self._prefetched and self._prefetched[0] == query:
             return self._prefetched[1]
-        text = self._call(
-            "remind_me_search",
-            {"query": query, "token_budget": self._settings.prefetch_budget, "detail": "compact"},
-        )
+        text = self._brief({"prompt": query})
         self._prefetched = (query, text)
         return text
+
+    def _brief(self, target: dict[str, str]) -> str:
+        """A brief as Markdown for the prompt. No token_budget: the registry's
+        brief_budget for this client applies (D128)."""
+        return self._call("remind_me_brief", {**target, "response_format": "markdown"})
 
     def sync_turn(self, user_content: str, assistant_content: str, **kwargs: Any) -> None:
         """Nothing per turn: the model saves durable facts with remind_me_add."""
@@ -212,7 +213,7 @@ class RemindMeProvider(MemoryProvider):  # type: ignore[misc,valid-type]
                 current = loaded if isinstance(loaded, dict) else {}
             except (OSError, ValueError) as e:
                 log.warning("remind-me: replacing unreadable %s: %s", path.name, type(e).__name__)
-        for key in ("url", "project", "command", "prefetch_budget"):
+        for key in ("url", "project", "command"):
             if key in values:
                 current[key] = values[key]
         temp = path.with_suffix(".tmp")

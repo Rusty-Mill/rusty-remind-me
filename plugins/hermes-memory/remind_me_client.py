@@ -29,7 +29,6 @@ SETTINGS_FILE = "remind-me.json"
 CLIENT_PREFIX = "hermes-"
 CLIENT_ID_MAX = 40
 DEFAULT_COMMAND = "rusty-remind-me"
-DEFAULT_PREFETCH_BUDGET = 600
 REQUEST_SECONDS = 30.0
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 LOOPBACK = frozenset({"127.0.0.1", "::1", "localhost"})
@@ -48,7 +47,6 @@ class Settings:
     url: str | None = None
     token: str | None = field(default=None, repr=False)
     project: str | None = None
-    prefetch_budget: int = DEFAULT_PREFETCH_BUDGET
 
     @property
     def remote(self) -> bool:
@@ -83,15 +81,11 @@ def load_settings(hermes_home: str | None, env: Mapping[str, str]) -> Settings:
             if not isinstance(loaded, dict):
                 raise RemindMeError(f"invalid {SETTINGS_FILE}: not an object")
             stored = loaded
-    budget = stored.get("prefetch_budget", DEFAULT_PREFETCH_BUDGET)
-    if isinstance(budget, bool) or not isinstance(budget, int) or budget < 0:
-        raise RemindMeError("prefetch_budget must be a whole number of tokens")
     return Settings(
         command=_text(stored.get("command")) or DEFAULT_COMMAND,
         url=_text(env.get("REMIND_ME_URL")) or _text(stored.get("url")),
         token=_text(env.get("REMIND_ME_TOKEN")),
         project=_text(stored.get("project")),
-        prefetch_budget=budget,
     )
 
 

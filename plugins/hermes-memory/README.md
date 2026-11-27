@@ -8,8 +8,9 @@ Per session it:
 
 - opens the system prompt with `remind_me_brief` for the configured project,
   once (nothing when no project is set);
-- searches remind-me with each turn's text before the model answers
-  (`remind_me_search`, compact, `prefetch_budget` tokens, default 600);
+- before the model answers, adds the memories most relevant to each turn's
+  text (`remind_me_brief` with `prompt`, the same Prompt mode as Claude
+  Code's per-prompt hook);
 - offers the model the tools remind-me lists for this client, as they are;
 - captures the transcript once at session end. Cron jobs and subagents read
   memory but do not capture.
@@ -33,7 +34,7 @@ failure is logged.
    from `get_config_schema`; every key is optional):
 
    ```json
-   { "project": "rusty_mill", "url": "", "command": "rusty-remind-me", "prefetch_budget": 600 }
+   { "project": "rusty_mill", "url": "", "command": "rusty-remind-me" }
    ```
 
    - **Local** (no `url`): runs `rusty-remind-me server` over stdio, so the

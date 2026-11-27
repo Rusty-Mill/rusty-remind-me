@@ -2983,17 +2983,17 @@ fn handler_table(req_id: Value) -> Value {
                 },
                 {
                     "name": "remind_me_brief",
-                    "description": "Get a remind-me brief for one project: current state, open blockers, decisions and action items, and recent activity, with ids for remind_me_get.",
+                    "description": "Get a remind-me brief: one project's state, open items and recent activity, or with prompt the memories most relevant to that text. Ids for remind_me_get.",
                     "inputSchema": {
                         "type": "object",
                         "additionalProperties": false,
                         "properties": {
-                            "project": { "type": "string", "description": "Project or entity name, or an alias" },
+                            "project": { "type": "string", "description": "Project or entity name, or an alias. Send this or prompt" },
+                            "prompt": { "type": "string", "description": "Text to find relevant memories for, such as the user's message. Send this or project" },
                             "since": { "type": "string", "default": context_brief::DEFAULT_SINCE, "description": "Activity window start: 7d, 12h, an RFC 3339 time or a date phrase such as yesterday or last week (its start), at most 365 days back" },
                             "token_budget": { "type": "integer", "default": context_brief::DEFAULT_TOKEN_BUDGET, "minimum": context_brief::MIN_TOKEN_BUDGET, "maximum": context_brief::MAX_TOKEN_BUDGET },
                             "response_format": { "type": "string", "enum": ["json", "markdown"] }
-                        },
-                        "required": ["project"]
+                        }
                     }
                 },
                 {
@@ -3880,7 +3880,7 @@ fn brief_tool(store: &remind_me_core::db::Store<'_>, mut args: Value) -> Value {
             return contract_error(
                 "invalid_input",
                 &e.to_string(),
-                "send {\"project\": NAME} and optionally since, token_budget, response_format",
+                "send {\"project\": NAME} or {\"prompt\": TEXT}, and optionally since, token_budget, response_format",
                 json!({}),
             )
         }
@@ -3893,9 +3893,20 @@ fn brief_tool(store: &remind_me_core::db::Store<'_>, mut args: Value) -> Value {
             json!({}),
         );
     }
+    let (mode, project, prompt) =
+        match brief_target(&input) {
+            Ok(target) => target,
+            Err(why) => return contract_error(
+                "invalid_input",
+                why,
+                "send project for a project brief, or prompt for the memories relevant to a text",
+                json!({}),
+            ),
+        };
     let request = context_brief::ContextRequest {
-        mode: context_brief::Mode::Project,
-        project: Some(&input.project),
+        mode,
+        project,
+        prompt,
         since: input.since.as_deref(),
         budget: input.token_budget,
         ..Default::default()
@@ -3929,6 +3940,26 @@ fn brief_tool(store: &remind_me_core::db::Store<'_>, mut args: Value) -> Value {
             "retry; report it if it persists",
             json!({}),
         ),
+    }
+}
+
+/// Which brief `input` asks for: Prompt mode for a non-blank `prompt`,
+/// Project mode for a `project`. Both, or neither, is refused: a brief
+/// answers one question.
+fn brief_target(
+    input: &BriefInput,
+) -> Result<(context_brief::Mode, Option<&str>, Option<&str>), &'static str> {
+    let blank = |v: &Option<String>| {
+        v.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_none()
+    };
+    match (blank(&input.project), blank(&input.prompt)) {
+        (false, true) => Ok((context_brief::Mode::Project, input.project.as_deref(), None)),
+        (true, false) => Ok((context_brief::Mode::Prompt, None, input.prompt.as_deref())),
+        (false, false) => Err("send project or prompt, not both"),
+        (true, true) => Err("`project` or `prompt` is required"),
     }
 }
 

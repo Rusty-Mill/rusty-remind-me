@@ -94,10 +94,10 @@ class SettingsTest(unittest.TestCase):
     def test_file_then_env(self) -> None:
         with tempfile.TemporaryDirectory() as home:
             Path(home, rm.SETTINGS_FILE).write_text(
-                json.dumps({"project": "rusty-remind-me", "prefetch_budget": 300, "url": "https://a/mcp"})
+                json.dumps({"project": "rusty-remind-me", "url": "https://a/mcp"})
             )
             s = rm.load_settings(home, {"REMIND_ME_URL": "https://b/mcp", "REMIND_ME_TOKEN": "t"})
-        self.assertEqual((s.url, s.token, s.project, s.prefetch_budget), ("https://b/mcp", "t", "rusty-remind-me", 300))
+        self.assertEqual((s.url, s.token, s.project), ("https://b/mcp", "t", "rusty-remind-me"))
         self.assertTrue(s.remote)
         self.assertIsNone(s.problem())
         self.assertNotIn("'t'", repr(s), "the token never shows in a repr")
@@ -118,7 +118,7 @@ class SettingsTest(unittest.TestCase):
             Path(home, rm.SETTINGS_FILE).write_text("{nope")
             with self.assertRaises(rm.RemindMeError):
                 rm.load_settings(home, {})
-            Path(home, rm.SETTINGS_FILE).write_text(json.dumps({"prefetch_budget": -1}))
+            Path(home, rm.SETTINGS_FILE).write_text("[]")
             with self.assertRaises(rm.RemindMeError):
                 rm.load_settings(home, {})
 
@@ -150,7 +150,7 @@ class WireTest(unittest.TestCase):
 class ProviderTest(unittest.TestCase):
     def setUp(self) -> None:
         self.t = FakeTransport()
-        self.p = provider_with(self.t, rm.Settings(project="rusty-remind-me", prefetch_budget=500), agent_identity="JARVIS")
+        self.p = provider_with(self.t, rm.Settings(project="rusty-remind-me"), agent_identity="JARVIS")
 
     def test_name_and_client(self) -> None:
         self.assertEqual(self.p.name, "remind-me")
@@ -159,7 +159,9 @@ class ProviderTest(unittest.TestCase):
     def test_system_block_is_the_project_brief_once(self) -> None:
         first = self.p.system_prompt_block()
         self.p.system_prompt_block()
-        self.assertEqual(self.t.calls(), [("remind_me_brief", {"project": "rusty-remind-me"})])
+        self.assertEqual(
+            self.t.calls(), [("remind_me_brief", {"project": "rusty-remind-me", "response_format": "markdown"})]
+        )
         self.assertTrue(first.startswith("remind_me_brief"))
 
     def test_no_project_no_block(self) -> None:
@@ -167,17 +169,17 @@ class ProviderTest(unittest.TestCase):
         self.assertEqual(p.system_prompt_block(), "")
         self.assertEqual(self.t.calls(), [])
 
-    def test_prefetch_searches_the_turn_and_caches_it(self) -> None:
+    def test_prefetch_briefs_the_turn_and_caches_it(self) -> None:
         self.p.prefetch("what did we decide about sqlite")
         self.p.prefetch("what did we decide about sqlite")
         self.assertEqual(self.p.prefetch("   "), "")
         self.assertEqual(
             self.t.calls(),
-            [("remind_me_search", {"query": "what did we decide about sqlite", "token_budget": 500, "detail": "compact"})],
+            [("remind_me_brief", {"prompt": "what did we decide about sqlite", "response_format": "markdown"})],
         )
 
     def test_a_failure_is_empty_recall_not_a_crash(self) -> None:
-        p = provider_with(FakeTransport(fail={"remind_me_search"}), rm.Settings())
+        p = provider_with(FakeTransport(fail={"remind_me_brief"}), rm.Settings())
         with self.assertLogs(plugin.log, "WARNING"):
             self.assertEqual(p.prefetch("x"), "")
 
@@ -308,6 +310,8 @@ class LiveTest(unittest.TestCase):
                                              "remind_me_auto_capture", "remind_me_brief"})
                     client.call("remind_me_add", {"content": "the live quokka fact"})
                     self.assertIn("quokka", client.call("remind_me_search", {"query": "quokka"}))
+                    brief = client.call("remind_me_brief", {"prompt": "the quokka", "response_format": "markdown"})
+                    self.assertIn("quokka", brief)
                 finally:
                     client.close()
                 out = rm.capture_local(binary, "hermes-live", "live-1",
