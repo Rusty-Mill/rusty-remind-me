@@ -371,3 +371,41 @@ fn an_inference_a_projectless_dead_end_overrules_leaves_activity_too() {
         .collect();
     assert!(!shown.contains(&"guess"), "{shown:?}");
 }
+
+#[test]
+fn the_prompt_hook_does_not_warn_with_a_dead_end_a_hit_overrules() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let at = chrono::Utc::now().to_rfc3339();
+    let mut weak = NewMemory::new("weak", TRIED, &at);
+    weak.memory_type = "dead_end".into();
+    weak.metadata = json!({ "tried": TRIED, "why_failed": "segfaults" });
+    weak.subject = Some("musl build".into());
+    weak.predicate = Some("allocator".into());
+    weak.object = Some("not jemalloc".into());
+    weak.confidence = 0.4;
+    Memories::new(&store).insert(&weak).unwrap();
+    let mut strong = NewMemory::new(
+        "strong",
+        "rebuild the musl target with jemalloc: it works",
+        &at,
+    );
+    strong.memory_type = "fact".into();
+    strong.subject = Some("musl build".into());
+    strong.predicate = Some("allocator".into());
+    strong.object = Some("jemalloc".into());
+    Memories::new(&store).insert(&strong).unwrap();
+
+    let b = brief(
+        &store,
+        Mode::Prompt,
+        None,
+        Some("rebuild musl with jemalloc"),
+    );
+    assert!(
+        section(&b, "warnings").is_empty(),
+        "{:?}",
+        section(&b, "warnings")
+    );
+    assert!(section(&b, "hits").contains(&"strong"));
+}
