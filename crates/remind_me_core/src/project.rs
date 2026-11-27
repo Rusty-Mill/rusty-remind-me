@@ -1080,17 +1080,18 @@ pub(crate) fn fact_from(
     let now_iso = now.to_rfc3339();
     let decay_rate = get_decay_rate(FACT_CATEGORY);
     let base_weight = get_type_prior(FACT_CATEGORY) * get_source_prior(source);
+    let provenance = crate::context::default_provenance();
     NewMemory {
         category: FACT_CATEGORY.to_string(),
         memory_type: FACT_CATEGORY.to_string(),
         tags,
         source: source.to_string(),
-        metadata,
+        metadata: provenance.metadata(metadata),
         decay_rate,
         vitality: calculate_vitality(base_weight, 0, decay_rate, &now_iso, now),
         base_weight,
         accessed_at: Some(now_iso.clone()),
-        ..crate::context::default_provenance().stamp(NewMemory::new(
+        ..provenance.stamp(NewMemory::new(
             format!("mem_{}", uuid::Uuid::new_v4().simple()),
             content,
             &now_iso,

@@ -152,23 +152,55 @@ pub fn handshake_client() -> Option<String> {
     HANDSHAKE_CLIENT.read().ok().and_then(|s| s.clone())
 }
 
-/// Who is writing, for the `client` column.
-///
-/// Precedence: the MCP handshake identity, then [`CLIENT_ENV`], then
-/// `"unknown"`.
-///
-/// The handshake wins because it is *observed* rather than *configured* — it
-/// says which agent actually made this call, where the environment variable
-/// says only what whoever launched the process typed. On a host running one
-/// server for several clients the env value is the same for all of them, so
-/// preferring it would record the least informative of the two. An operator
-/// who deliberately sets `REMIND_ME_CLIENT` still gets it for every non-MCP
-/// path — the CLI, the dashboard, the importer — none of which handshake.
-pub fn configured_client() -> String {
-    if let Some(identity) = handshake_client() {
-        return identity;
+thread_local! {
+    /// The credential the call running on this thread authenticated with,
+    /// while [`with_call_credential`] runs it.
+    static CALL_CREDENTIAL: std::cell::RefCell<Option<crate::clients::Credential>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Restores the enclosing [`CALL_CREDENTIAL`] when a call ends, even by panic.
+struct CallCredentialGuard(Option<crate::clients::Credential>);
+
+impl Drop for CallCredentialGuard {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        CALL_CREDENTIAL.with(|slot| *slot.borrow_mut() = previous);
     }
-    crate::daemon::session::var(CLIENT_ENV).unwrap_or_else(|| DEFAULT_CLIENT.to_string())
+}
+
+/// Run `f` as one call authenticated by `credential`, for transports that
+/// verify one (the REST API's named keys). The registry may map it to a
+/// client id, which then beats every other source (ADR-0028 §1).
+pub fn with_call_credential<R>(
+    credential: Option<crate::clients::Credential>,
+    f: impl FnOnce() -> R,
+) -> R {
+    let previous = CALL_CREDENTIAL.with(|slot| slot.replace(credential));
+    let _restore = CallCredentialGuard(previous);
+    f()
+}
+
+/// Who is calling, as [`crate::clients::Registry::resolve`] reads it.
+pub fn current_caller() -> crate::clients::Caller {
+    crate::clients::Caller {
+        credential: CALL_CREDENTIAL.with(|slot| slot.borrow().clone()),
+        env: crate::daemon::session::var(CLIENT_ENV),
+        handshake: handshake_client(),
+    }
+}
+
+/// Who is writing, for the `client` column: the client registry's
+/// resolution of [`current_caller`] (see [`crate::clients`]).
+///
+/// With no registry file the old precedence holds: the handshake, then
+/// [`CLIENT_ENV`], then `"unknown"`. With one, a mapped credential, then
+/// [`CLIENT_ENV`], then a registered handshake alias, then `"unknown"`: the
+/// handshake names the app, and several bots share one app. Paths that never
+/// handshake (the CLI, the dashboard, the importer) still get
+/// [`CLIENT_ENV`] either way.
+pub fn configured_client() -> String {
+    crate::clients::Registry::load().resolve(&current_caller())
 }
 
 /// The `(node_id, client)` pair every newly created memory is stamped with.
