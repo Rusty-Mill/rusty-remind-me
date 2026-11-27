@@ -510,3 +510,28 @@ fn another_projects_fact_does_not_silence_a_prompt_warning() {
     // Beta's fact may still show as a hit: prompt hits span projects.
     assert_eq!(section(&b, "warnings"), ["ours"]);
 }
+
+#[test]
+fn many_dead_ends_do_not_crowd_hits_out_of_the_prompt_hook() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    for i in 0..30 {
+        dead_end(&store, &format!("d{i}"), Some("beta"));
+    }
+    put(
+        &store,
+        "fact",
+        "fact",
+        "weekly notes: the office moved, lunch is at noon, and musl came up once",
+        json!({}),
+        None,
+    );
+    let b = brief(
+        &store,
+        Mode::Prompt,
+        Some("alpha"),
+        Some("rebuild the musl target with jemalloc"),
+    );
+    assert!(section(&b, "warnings").is_empty());
+    assert_eq!(section(&b, "hits"), ["fact"]);
+}

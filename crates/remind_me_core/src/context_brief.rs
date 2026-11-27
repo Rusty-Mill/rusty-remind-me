@@ -901,17 +901,25 @@ fn ids<'a>(memories: &[&'a Memory]) -> HashSet<&'a str> {
 }
 
 /// The prompt's search matches fit to show unasked, dead ends aside (they
-/// warn instead), best first.
+/// warn instead), best first. The search is widened by the number of live
+/// dead ends and left unbudgeted, so dead ends dropped here never crowd
+/// ordinary hits out; the brief's own budget trims what is kept.
 fn prompt_hits(store: &Store<'_>, prompt: &str, now: DateTime<Utc>) -> Result<Vec<Memory>> {
+    let dead_ends = Memories::new(store)
+        .live_of_type(crate::kinds::MemoryKind::DeadEnd.as_str())?
+        .len();
+    let limit = HIT_LIMIT * 2;
     let input = MemorySearchInput {
         query: prompt.to_string(),
-        limit: HIT_LIMIT * 2,
+        limit: limit + dead_ends,
+        token_budget: 0,
         ..MemorySearchInput::default()
     };
     Ok(crate::db::queries::search_memories(store, &input)?
         .into_iter()
         .map(|r| r.memory)
         .filter(|m| injectable(m, now) && !is_dead_end(m))
+        .take(limit)
         .collect())
 }
 
