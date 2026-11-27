@@ -1042,6 +1042,17 @@ pub fn search_memories_deadlined(
     } else {
         crate::reranker::maybe_rerank(&input.query, ranked)
     };
+    // Card #568 spike, off unless the caller set a mode: on the whole pool,
+    // after every ranking stage and before the cut, so pages stay stable.
+    if input.time_buckets != crate::time_buckets::Modes::OFF {
+        ranked = crate::time_buckets::apply(
+            ranked,
+            input.time_buckets,
+            &input.window,
+            input.limit,
+            Utc::now(),
+        );
+    }
     ranked.truncate(input.limit);
 
     if ranked.is_empty() && filter.exclude_raw {
@@ -1316,6 +1327,20 @@ pub fn search_with_expansions(
             (&narrowed, Some(applied))
         }
         None => (input, None),
+    };
+
+    // Card #568 spike: the search tool reads its setting here, like date
+    // phrases; the ranker itself only follows the input.
+    let modes = crate::time_buckets::Modes::from_env();
+    let bucketed;
+    let input = if modes == crate::time_buckets::Modes::OFF {
+        input
+    } else {
+        bucketed = MemorySearchInput {
+            time_buckets: modes,
+            ..input.clone()
+        };
+        &bucketed
     };
 
     let configured = crate::embedder::available_embedder();

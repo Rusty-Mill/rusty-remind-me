@@ -88,6 +88,7 @@ pub mod telemetry;
 #[doc(hidden)]
 pub mod testing;
 mod text;
+pub mod time_buckets;
 pub mod time_window;
 pub mod tool_profiles;
 pub mod topic;

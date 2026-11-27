@@ -133,6 +133,11 @@ impl TimeWindow {
         }
     }
 
+    /// The `(since, until)` bounds; `None` is open.
+    pub fn bounds(&self) -> (Option<DateTime<Utc>>, Option<DateTime<Utc>>) {
+        (self.since, self.until)
+    }
+
     /// No bound set, so every memory is inside.
     pub fn is_unbounded(&self) -> bool {
         self.since.is_none() && self.until.is_none()

@@ -14,6 +14,7 @@ Seeded only with questions the sources settle, each citing its source. The exper
 - **Q:** Which tools are in core? **A:** eleven: search, get, add, update, delete, auto_capture, resolve, entity, digest, server_status, brief. [default] (ADR-0030)
 - **Q:** Is HTTP writing open without a key? **A:** No: every mutating method is refused with 401 while `REMIND_ME_API_KEY` is unset. [default] (crates/remind_me_api/src/lib.rs module doc)
 - **Q:** With date phrases off, recency follows `metadata.occurred_at`, so a plain query naming a past event ("ticket kiosk went live last month") ranks it below newer events (keyword MRR on that query 1.0 to 0.33; plain totals 0.781 to 0.779). Does that need Nano? **A:** No. Recency on event time is part of the approved #62 design (D86, approved by D91), the total stays inside the #59 0.02 tolerance, and with `REMIND_ME_DATE_PHRASES=on` the query is right and the `+dates` totals rise. The PR states the trade-off with these numbers. [default] (D86, D91; #62 branch bbd1e94)
+- **Q:** Where does a ranking spike's write-up go, and what may it hold (card #568)? **A:** `docs/research/<card>-<topic>-spike.md`, method and aggregate numbers only; real query text and live ids stay off-repo; fixture queries are synthetic. [default] (D27, D39, D87)
 
 ## Runtime
 - **Q:** May I add async to core? **A:** No; only `remind_me_remote` is async. One async call in core builds a current-thread runtime inside that function. [default] (ARCHITECTURE.md tenet 4; cloud_backup.rs)
