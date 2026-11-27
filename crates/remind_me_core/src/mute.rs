@@ -220,22 +220,58 @@ fn same(a: &str, b: &str) -> bool {
     a.trim().eq_ignore_ascii_case(b.trim())
 }
 
-/// The record for `target` and `value` in `project`, on or off.
+/// `name` as the entity graph spells it, so an alias and its entity name
+/// one mute and one project; a name no entity knows stays as written.
+fn canonical(store: &Store<'_>, name: &str) -> Result<String> {
+    let name = name.trim();
+    Ok(resolve_entity(store, name)?.map_or_else(|| name.to_string(), |e| e.name))
+}
+
+/// A mute's value in its canonical spelling: entities by their graph name,
+/// topics and tags as written.
+fn canonical_value(store: &Store<'_>, target: Target, value: &str) -> Result<String> {
+    match target {
+        Target::Entity => canonical(store, value),
+        Target::Topic | Target::Tag => Ok(value.trim().to_string()),
+    }
+}
+
+/// A project name in its canonical spelling, `None` when blank.
+fn canonical_project(store: &Store<'_>, project: Option<&str>) -> Result<Option<String>> {
+    project
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(|p| canonical(store, p))
+        .transpose()
+}
+
+/// The record for `target` and `value` in `project`, on or off, matched by
+/// canonical spelling on both sides.
 fn find(
     store: &Store<'_>,
     target: Target,
     value: &str,
     project: Option<&str>,
 ) -> Result<Option<Mute>> {
-    Ok(list(store)?.into_iter().find(|m| {
-        m.spec.target == target
-            && same(&m.spec.value, value)
-            && match (&m.spec.project, project) {
-                (None, None) => true,
-                (Some(a), Some(b)) => same(a, b),
-                _ => false,
-            }
-    }))
+    let value = canonical_value(store, target, value)?;
+    let project = canonical_project(store, project)?;
+    for mute in list(store)? {
+        if mute.spec.target != target
+            || !same(&canonical_value(store, target, &mute.spec.value)?, &value)
+        {
+            continue;
+        }
+        let stored = canonical_project(store, mute.spec.project.as_deref())?;
+        let matches = match (stored.as_deref(), project.as_deref()) {
+            (None, None) => true,
+            (Some(a), Some(b)) => same(a, b),
+            _ => false,
+        };
+        if matches {
+            return Ok(Some(mute));
+        }
+    }
+    Ok(None)
 }
 
 /// Mute `value`: turn its record back on, or write a new one.
@@ -246,12 +282,9 @@ fn find(
 pub fn mute(store: &Store<'_>, target: Target, value: &str, project: Option<&str>) -> Result<Mute> {
     let spec = Spec {
         target,
-        value: value.trim().to_string(),
+        value: canonical_value(store, target, value)?,
         on: true,
-        project: project
-            .map(str::trim)
-            .filter(|p| !p.is_empty())
-            .map(str::to_string),
+        project: canonical_project(store, project)?,
     };
     let metadata = json!({ KEY: spec });
     if let Some(existing) = find(store, target, value, spec.project.as_deref())? {
@@ -356,8 +389,10 @@ impl MuteSet {
     ) -> Result<Self> {
         let mut set = Self::default();
         let except = except_entity.map(normalize_entity_name);
+        let project = canonical_project(store, project)?;
         for mute in list(store)?.into_iter().filter(|m| m.spec.on) {
-            let applies = match (&mute.spec.project, project) {
+            let want = canonical_project(store, mute.spec.project.as_deref())?;
+            let applies = match (want.as_deref(), project.as_deref()) {
                 (None, _) => true,
                 (Some(want), Some(have)) => same(want, have),
                 (Some(_), None) => false,

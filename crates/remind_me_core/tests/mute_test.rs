@@ -236,3 +236,71 @@ fn a_mute_must_name_something_that_exists() {
     .to_string();
     assert!(err.contains("preference"), "{err}");
 }
+
+fn add_entity(store: &Store<'_>, name: &str, kind: &str, aliases: &[&str]) {
+    queries::add_memory(
+        store,
+        MemoryAddInput {
+            content: format!("{name} exists"),
+            category: "general".into(),
+            source: "manual".into(),
+            entities: vec![EntityInput {
+                name: name.into(),
+                kind: Some(kind.into()),
+                aliases: aliases.iter().map(|a| a.to_string()).collect(),
+            }],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn an_alias_and_its_entity_name_are_one_mute() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    add_entity(&store, "Robert", "person", &["Bob"]);
+    let first = mute::mute(&store, Target::Entity, "bob", None).unwrap();
+    assert_eq!(first.spec.value, "Robert");
+    let again = mute::mute(&store, Target::Entity, "Robert", None).unwrap();
+    assert_eq!(again.id, first.id);
+    let off = mute::unmute(&store, Target::Entity, "Robert", None)
+        .unwrap()
+        .unwrap();
+    assert!(!off.spec.on);
+    assert_eq!(mute::list(&store).unwrap().len(), 1);
+}
+
+#[test]
+fn a_project_mute_matches_the_project_through_an_alias() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    add_entity(&store, "alpha", "project", &["alpha-repo"]);
+    let (muted, _) = seed(&store);
+    mute::mute(&store, Target::Entity, "Gary", Some("alpha-repo")).unwrap();
+    let set = mute::MuteSet::load(&store, Some("ALPHA"), None).unwrap();
+    let memory = remind_me_core::db::memories::Memories::new(&store)
+        .get_live(&muted)
+        .unwrap()
+        .unwrap();
+    assert!(set.covers(&memory));
+}
+
+#[test]
+fn a_mute_cannot_be_reclassified_out_of_preference() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let record = mute::mute(&store, Target::Tag, "offsite", None).unwrap();
+    let result = queries::reclassify_memories(
+        &store,
+        &remind_me_core::models::ReclassifyInput {
+            classifications: vec![remind_me_core::models::MemoryClassification {
+                memory_id: record.id.clone(),
+                memory_type: "fact".into(),
+            }],
+        },
+    )
+    .unwrap();
+    assert_eq!(result.refused, [record.id]);
+    assert_eq!(mute::list(&store).unwrap().len(), 1);
+}

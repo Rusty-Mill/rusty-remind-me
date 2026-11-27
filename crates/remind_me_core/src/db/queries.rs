@@ -710,6 +710,14 @@ pub fn reclassify_memories(store: &Store<'_>, input: &ReclassifyInput) -> Result
             refused.push(classification.memory_id.clone());
             continue;
         }
+        // A mute stays a preference (card #1485): another kind would drop it
+        // from the mute list silently, with no unmute in its history.
+        if stored.category == crate::mute::CATEGORY
+            && classification.memory_type != crate::mute::KIND.as_str()
+        {
+            refused.push(classification.memory_id.clone());
+            continue;
+        }
         // Becoming a decision schedules its follow-up; staying one does not.
         let metadata = if stored.memory_type.as_deref() == Some("decision") {
             None
