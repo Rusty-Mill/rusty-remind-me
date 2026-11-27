@@ -815,6 +815,16 @@ impl MemoryStore for SqliteTables {
         filter: &KeywordFilter,
         limit: usize,
     ) -> Result<Vec<(Memory, f64)>> {
+        self.keyword_hits_skipping(phrases, filter, limit, &|_| false)
+    }
+
+    fn keyword_hits_skipping(
+        &self,
+        phrases: &[String],
+        filter: &KeywordFilter,
+        limit: usize,
+        skip: &dyn Fn(&Memory) -> bool,
+    ) -> Result<Vec<(Memory, f64)>> {
         if phrases.is_empty() {
             return Ok(Vec::new());
         }
@@ -824,7 +834,7 @@ impl MemoryStore for SqliteTables {
             .into_iter()
             .filter(|(row, _)| row.admits(filter))
             .map(|(row, score)| (row.to_memory(), score))
-            .filter(|(memory, _)| filter.narrowing.admits(memory))
+            .filter(|(memory, _)| filter.narrowing.admits(memory) && !skip(memory))
             .filter(|(memory, _)| filter.vital_enough(memory, now))
             .take(limit)
             .collect())

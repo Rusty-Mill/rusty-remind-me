@@ -288,8 +288,6 @@ pub struct Narrowing {
     /// Only memories with no project. A scope's unset project admits every
     /// project; this admits none.
     pub projectless: bool,
-    /// No dead ends: for a caller that shows them apart, as warnings.
-    pub exclude_dead_ends: bool,
 }
 
 /// The memories an entity covers: linked to it, or naming it as subject or
@@ -319,9 +317,6 @@ impl Narrowing {
                     .is_some_and(|got| got.eq_ignore_ascii_case(want))
             })
             && (!self.projectless || memory.project.is_none())
-            && !(self.exclude_dead_ends
-                && memory.memory_type.as_deref()
-                    == Some(crate::kinds::MemoryKind::DeadEnd.as_str()))
     }
 
     fn admits_tags(&self, tags: &[String]) -> bool {
@@ -551,6 +546,24 @@ pub trait MemoryStore {
         filter: &KeywordFilter,
         limit: usize,
     ) -> Result<Vec<(Memory, f64)>>;
+
+    /// [`MemoryStore::keyword_hits`], also leaving out the memories `skip`
+    /// matches, before `limit`, so they never take a hit's place. Both
+    /// backends override this; the default skips after the limit and so may
+    /// return fewer than `limit`.
+    fn keyword_hits_skipping(
+        &self,
+        phrases: &[String],
+        filter: &KeywordFilter,
+        limit: usize,
+        skip: &dyn Fn(&Memory) -> bool,
+    ) -> Result<Vec<(Memory, f64)>> {
+        Ok(self
+            .keyword_hits(phrases, filter, limit)?
+            .into_iter()
+            .filter(|(memory, _)| !skip(memory))
+            .collect())
+    }
 
     /// Every live, unsuperseded memory `filter` admits, newest first on its
     /// window's timestamp (ties by id). Serves a search with a time window and
@@ -821,6 +834,17 @@ impl<'c> Memories<'c> {
         limit: usize,
     ) -> Result<Vec<(Memory, f64)>> {
         MemoryStore::keyword_hits(&*self.backend.lock()?, phrases, filter, limit)
+    }
+
+    /// See [`MemoryStore::keyword_hits_skipping`].
+    pub fn keyword_hits_skipping(
+        &self,
+        phrases: &[String],
+        filter: &KeywordFilter,
+        limit: usize,
+        skip: &dyn Fn(&Memory) -> bool,
+    ) -> Result<Vec<(Memory, f64)>> {
+        MemoryStore::keyword_hits_skipping(&*self.backend.lock()?, phrases, filter, limit, skip)
     }
 
     /// See [`MemoryStore::window_hits`].

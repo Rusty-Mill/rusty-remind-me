@@ -47,6 +47,7 @@
 use crate::db::entities::Entities;
 use crate::db::memories::Memories;
 use crate::db::{Result, Store, StoreError};
+use crate::dead_ends::is_dead_end;
 use crate::entity::{normalize_entity_name, resolve_entity};
 use crate::models::{Memory, MemorySearchInput, ReminderWindow};
 use crate::mute::MuteSet;
@@ -797,10 +798,6 @@ fn without_overruled<'a>(memories: &[&'a Memory]) -> Vec<&'a Memory> {
         })
     };
     memories.iter().copied().filter(|m| !overruled(m)).collect()
-}
-
-fn is_dead_end(memory: &Memory) -> bool {
-    memory.memory_type.as_deref() == Some(crate::kinds::MemoryKind::DeadEnd.as_str())
 }
 
 /// A dead end as one brief item: what was tried and why it failed.

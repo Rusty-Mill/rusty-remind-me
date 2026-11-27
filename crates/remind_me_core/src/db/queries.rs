@@ -898,8 +898,8 @@ pub fn search_memories_without_dead_ends(
     Ok(search_ranked(store, input, embedder, deadline, true)?.results)
 }
 
-/// The search behind [`search_memories_deadlined`]; `exclude_dead_ends` is
-/// [`Narrowing::exclude_dead_ends`].
+/// The search behind [`search_memories_deadlined`]. `exclude_dead_ends`
+/// leaves dead ends out of both lanes, inside each before its limit.
 fn search_ranked(
     store: &Store<'_>,
     input: &MemorySearchInput,
@@ -923,13 +923,12 @@ fn search_ranked(
     // An entity the store has never seen matches nothing: an empty result,
     // not an error, as `search_paginated` answers it.
     let scope = input.scope.resolve(store)?;
-    let Some(mut narrowing) = resolve_narrowing(store, input)? else {
+    let Some(narrowing) = resolve_narrowing(store, input)? else {
         let mut outcome = trim_by_token_budget(Vec::new(), input.token_budget, input.detail);
         timing.elapsed_ms = deadline.elapsed_ms();
         outcome.timing = timing;
         return Ok(outcome);
     };
-    narrowing.exclude_dead_ends = exclude_dead_ends;
 
     // Dormancy is filtered on *effective* vitality, inside the query and before
     // its limit: the stored column never decays, and thinning a page after the
@@ -993,7 +992,10 @@ fn search_ranked(
     // `RrfFusion::Score` mode needs the raw BM25 magnitude alongside each hit.
     let mut keyword_memories = Vec::new();
     let mut keyword_bm25 = std::collections::HashMap::new();
-    for (memory, bm25_score) in memories_repo.keyword_hits(&phrases, &filter, input.limit * 2)? {
+    let skip = |m: &Memory| exclude_dead_ends && crate::dead_ends::is_dead_end(m);
+    for (memory, bm25_score) in
+        memories_repo.keyword_hits_skipping(&phrases, &filter, input.limit * 2, &skip)?
+    {
         keyword_bm25.insert(memory.id.clone(), bm25_score);
         keyword_memories.push(memory);
     }
@@ -1053,6 +1055,7 @@ fn search_ranked(
                     && scope.matches_memory(m)
                     && input.window.contains_memory(m)
                     && narrowing.admits(m)
+                    && !skip(m)
                     // Raw rows go before the best `limit * 2` are chosen, or
                     // stronger raw hits would take every slot (ADR-0029).
                     && !(filter.exclude_raw && is_raw_category(&m.category));
@@ -1304,7 +1307,6 @@ fn resolve_narrowing(store: &Store<'_>, input: &MemorySearchInput) -> Result<Opt
         topic,
         repo: clean(&input.filters.repo).and_then(crate::context::normalize_remote),
         projectless: false,
-        exclude_dead_ends: false,
     }))
 }
 
