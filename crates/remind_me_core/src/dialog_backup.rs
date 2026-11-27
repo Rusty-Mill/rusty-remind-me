@@ -78,11 +78,20 @@ fn sync_dir(_dir: &Path) -> Result<()> {
 
 /// Rename the finished `partial` to `dest` durably: flush `partial`'s own
 /// entries first, then the parent that holds the new name.
+///
+/// If the parent flush fails, the rename has already happened: `dest` is
+/// complete but its name may not survive a power loss. The error says the
+/// destination exists rather than implying it does not.
 fn publish(partial: &Path, dest: &Path) -> Result<()> {
     sync_dir(partial)?;
     std::fs::rename(partial, dest).map_err(io_error(dest))?;
     let parent = dest.parent().filter(|p| !p.as_os_str().is_empty());
-    sync_dir(parent.unwrap_or(Path::new(".")))
+    sync_dir(parent.unwrap_or(Path::new("."))).map_err(|e| {
+        StoreError::Engine(format!(
+            "{} is complete and in place, but its directory entry could not be flushed: {e}",
+            dest.display()
+        ))
+    })
 }
 
 /// The bytes of `hash` from `blobs`, checked against the full hash.
@@ -106,7 +115,9 @@ fn verified_blob(blobs: &BlobStore, id: &str, hash: &str) -> Result<Vec<u8>> {
 ///
 /// [`StoreError`] if `dest` exists, the store cannot be read, a row's blob
 /// is missing or corrupt, or a file cannot be written. Nothing is left at
-/// `dest` on error.
+/// `dest` on error, with one exception: if the final flush of `dest`'s
+/// parent fails, the complete package is already at `dest` and the error
+/// says so.
 pub fn create(store_dir: &Path, dest: &Path) -> Result<u64> {
     if dest.exists() {
         return Err(StoreError::Invalid(format!(
@@ -220,7 +231,9 @@ pub fn verify(package: &Path) -> Result<u64> {
 ///
 /// [`StoreError::Invalid`] if `store_dir` exists or the package fails
 /// [`verify`]; otherwise the filesystem's error. Nothing is left at
-/// `store_dir` on error.
+/// `store_dir` on error, with the same exception as [`create`]: if the final
+/// flush of its parent fails, the checked store is already in place and the
+/// error says so.
 pub fn restore(package: &Path, store_dir: &Path) -> Result<u64> {
     if store_dir.exists() {
         return Err(StoreError::Invalid(format!(
