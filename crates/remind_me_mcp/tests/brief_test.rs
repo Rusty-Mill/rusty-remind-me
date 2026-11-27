@@ -109,6 +109,9 @@ fn input_is_validated_at_the_boundary() {
         json!({"project": "quokka", "sinse": "2d"}),
         json!({"project": "quokka", "since": "soon"}),
         json!({"project": "quokka", "token_budget": 10}),
+        json!({"prompt": "  "}),
+        json!({"project": "quokka", "prompt": "parser"}),
+        json!({"prompt": "parser", "token_budget": 10}),
     ] {
         let (failed, text) = call(&s, "remind_me_brief", args.clone());
         assert!(failed, "{args} accepted");
@@ -130,7 +133,9 @@ fn the_tool_is_listed_with_a_strict_schema() {
         .expect("remind_me_brief listed")
         .clone();
     assert_eq!(tool["inputSchema"]["additionalProperties"], json!(false));
-    assert_eq!(tool["inputSchema"]["required"], json!(["project"]));
+    // project or prompt: one of the two, checked by the handler.
+    assert!(tool["inputSchema"]["required"].is_null());
+    assert!(tool["inputSchema"]["properties"]["prompt"].is_object());
     assert!(tool["description"].as_str().unwrap().len() <= 160);
 }
 
@@ -175,4 +180,29 @@ fn the_merged_project_tool_is_still_listed_and_callable() {
     assert!(names.contains(&"remind_me_project") && names.contains(&"remind_me_brief"));
     let (failed, text) = call(&s, "remind_me_project", json!({"action": "list"}));
     assert!(!failed, "{text}");
+}
+
+#[test]
+fn a_prompt_returns_the_memories_relevant_to_it() {
+    let (s, id) = seeded();
+    let (failed, text) = call(
+        &s,
+        "remind_me_brief",
+        json!({"prompt": "how is the quokka parser going?", "response_format": "markdown"}),
+    );
+    assert!(!failed, "{text}");
+    assert!(text.contains("quokka parser"), "{text}");
+    assert!(text.contains(&id), "{text}");
+}
+
+#[test]
+fn a_prompt_with_no_match_is_an_empty_brief() {
+    let (s, _) = seeded();
+    let (failed, text) = call(
+        &s,
+        "remind_me_brief",
+        json!({"prompt": "zzyzx", "response_format": "markdown"}),
+    );
+    assert!(!failed, "{text}");
+    assert!(!text.contains("quokka"), "{text}");
 }
