@@ -10,7 +10,8 @@
 //! Two users: raw transcript retention ([`crate::archive`], 16-hex keys,
 //! unchanged on disk) and the R3 store benchmark, which keeps every page
 //! and dialog body here with only metadata in the candidate's tables.
-//! Production backups do not include a blob root yet (Q20).
+//! Engine backups do not include a blob root (Q20); the dialog store's
+//! blobs go in its own package ([`crate::dialog_backup`], D78).
 
 use std::fs::OpenOptions;
 use std::io::{self, Write};

@@ -8,7 +8,7 @@
 //! failure never fails the capture: it is logged and counted.
 
 use crate::blobs::BlobStore;
-use crate::db::dialogs::{DialogLog, NewDialog};
+use crate::db::dialogs::{dir_beside, DialogLog, NewDialog};
 use crate::db::memories::Memories;
 use crate::db::sqlite::SqliteDialogs;
 use crate::db::Store;
@@ -27,14 +27,6 @@ pub fn failures() -> u64 {
 /// Whether the shadow write is on (`REMIND_ME_DIALOG_SHADOW=1`).
 pub fn enabled() -> bool {
     std::env::var(ENV).is_ok_and(|v| v == "1")
-}
-
-/// The shadow store's directory for the database file `db`: its own name
-/// with `.dialogs` appended, so every database has its own store.
-fn dir_for(db: &std::path::Path) -> Option<std::path::PathBuf> {
-    let mut name = db.file_name()?.to_os_string();
-    name.push(".dialogs");
-    Some(db.with_file_name(name))
 }
 
 /// Count and report a shadow write that could not be made.
@@ -81,7 +73,7 @@ pub fn record(store: &Store<'_>, dialog: &NewDialog<'_>) {
     if !enabled() {
         return;
     }
-    let Some(dir) = store.path().and_then(dir_for) else {
+    let Some(dir) = store.path().and_then(dir_beside) else {
         return;
     };
     let result = SqliteDialogs::open(&dir)
