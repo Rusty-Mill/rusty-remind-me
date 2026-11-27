@@ -11,6 +11,7 @@
 //! cursor's meaning.
 
 use super::backend::BackendLock;
+use super::memories::{ListFilter, MemoryStore};
 use super::{Result, Store};
 use crate::models::{ContradictionSide, Memory};
 
@@ -57,6 +58,45 @@ pub enum Backlog {
     Unnormalized,
     /// Live memories whose `memory_type` is still `unclassified`.
     Unclassified,
+}
+
+/// What [`super::backend::Backend::refine_observation`] reads.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RefineObservation {
+    pub settled_captures: i64,
+    pub last_capture_at: Option<String>,
+    /// The newest run record's `(id, created_at)`.
+    pub last_run: Option<(String, String)>,
+}
+
+/// [`super::backend::Backend::refine_observation`] composed from existing
+/// port reads: the default for any backend, and the reference the engine
+/// and SQLite fast paths are checked against.
+///
+/// # Errors
+///
+/// The backend's error from any of the reads.
+pub fn observe_by_parts<S: CurationStore + MemoryStore + ?Sized>(
+    store: &S,
+    settled_before: Option<&str>,
+    run_category: &str,
+) -> Result<RefineObservation> {
+    let settled: std::collections::HashSet<String> = store
+        .undecomposed(usize::MAX, settled_before)?
+        .into_iter()
+        .map(|row| row.capture_id)
+        .collect();
+    let filter = ListFilter {
+        include_sensitive: true,
+        category: Some(run_category.to_string()),
+        ..ListFilter::default()
+    };
+    let (_, newest) = store.list_page(&filter, 1, 0)?;
+    Ok(RefineObservation {
+        settled_captures: i64::try_from(settled.len()).unwrap_or(i64::MAX),
+        last_capture_at: store.capture_activity()?.last_capture_at,
+        last_run: newest.into_iter().next().map(|m| (m.id, m.created_at)),
+    })
 }
 
 /// How many distinct captures there are, and when the newest was written.
@@ -170,6 +210,19 @@ impl<'c> Curation<'c> {
     /// See [`CurationStore::count_undecomposed`].
     pub fn count_undecomposed(&self, settled_before: Option<&str>) -> Result<i64> {
         CurationStore::count_undecomposed(&*self.backend.lock()?, settled_before)
+    }
+
+    /// See [`super::backend::Backend::refine_observation`]; one lock, one call.
+    pub fn refine_observation(
+        &self,
+        settled_before: Option<&str>,
+        run_category: &str,
+    ) -> Result<RefineObservation> {
+        super::backend::Backend::refine_observation(
+            &*self.backend.lock()?,
+            settled_before,
+            run_category,
+        )
     }
 
     /// See [`CurationStore::capture_activity`].
@@ -544,6 +597,141 @@ pub mod conformance {
         );
     }
 
+    /// The settled-capture count matches the distinct `capture_id`s of
+    /// [`CurationStore::undecomposed`] on a corpus with every case it must
+    /// tell apart.
+    pub fn settled_capture_count_matches_the_undecomposed_list<S: crate::db::backend::Backend>(
+        store: &mut S,
+    ) {
+        const OLD: &str = "2026-09-25T00:00:00+00:00";
+        let big = "x".repeat(1 << 20);
+        let capture = |id: &str, cap: &str, at: &str, content: &str| NewMemory {
+            capture_id: Some(cap.to_string()),
+            updated_at: at.to_string(),
+            ..NewMemory::new(id, content, OLD)
+        };
+        let rows = vec![
+            // One session, two rows (dialog and summary), one of them large.
+            capture("dup_d", "dup", OLD, &big),
+            capture("dup_s", "dup", OLD, "summary"),
+            capture("solo", "solo", OLD, "x"),
+            // Changed after the cutoff: not settled.
+            capture("fresh", "fresh", T2, "x"),
+            // Decomposed, and unchanged since.
+            capture("done", "done", OLD, &big),
+            NewMemory {
+                source_capture_id: Some("done".to_string()),
+                ..NewMemory::new("done_fact", "f", NOW)
+            },
+            // Decomposed, then recaptured: due again.
+            capture("again", "again", NOW, "x"),
+            NewMemory {
+                source_capture_id: Some("again".to_string()),
+                ..NewMemory::new("again_fact", "f", OLD)
+            },
+            // Deleted.
+            NewMemory {
+                deleted_at: Some(OLD.to_string()),
+                ..capture("gone", "gone", OLD, "x")
+            },
+        ];
+        for row in &rows {
+            MemoryStore::insert(store, row).unwrap();
+        }
+        let settled = |store: &S, cutoff: Option<&str>| {
+            crate::db::backend::Backend::refine_observation(store, cutoff, "refinement_run")
+                .unwrap()
+                .settled_captures
+        };
+
+        for cutoff in [None, Some(NOW), Some(OLD)] {
+            let listed: std::collections::BTreeSet<String> =
+                CurationStore::undecomposed(store, usize::MAX, cutoff)
+                    .unwrap()
+                    .into_iter()
+                    .map(|row| row.capture_id)
+                    .collect();
+            let counted = settled(store, cutoff);
+            assert_eq!(
+                crate::db::backend::Backend::refine_observation(store, cutoff, "refinement_run")
+                    .unwrap(),
+                super::observe_by_parts(store, cutoff, "refinement_run").unwrap(),
+                "fast path equals the default at cutoff {cutoff:?}"
+            );
+            assert_eq!(
+                counted,
+                listed.len() as i64,
+                "cutoff {cutoff:?}: {listed:?}"
+            );
+        }
+        assert_eq!(settled(store, Some(NOW)), 3, "dup, solo and again");
+        assert_eq!(settled(store, None), 4, "and fresh");
+    }
+
+    /// `last_run` is the newest live run record by `(created_at, id)`,
+    /// sensitive included, as a category-filtered `list_page` orders it;
+    /// `last_capture_at` is `capture_activity`'s.
+    pub fn refine_observation_matches_the_separate_reads<S: crate::db::backend::Backend>(
+        store: &mut S,
+    ) {
+        const RUN: &str = "refinement_run";
+        let run = |id: &str, at: &str| NewMemory {
+            category: RUN.to_string(),
+            ..NewMemory::new(id, "run", at)
+        };
+        let empty = crate::db::backend::Backend::refine_observation(store, None, RUN).unwrap();
+        assert_eq!((empty.settled_captures, empty.last_run), (0, None));
+        assert_eq!(empty.last_capture_at, None);
+
+        let rows = vec![
+            run("run_z", "2026-09-25T00:00:00+00:00"),
+            // Same instant: the larger id is newer.
+            run("run_a", NOW),
+            run("run_b", NOW),
+            NewMemory {
+                sensitive: true,
+                ..run("run_c", NOW)
+            },
+            // Newest, but deleted.
+            NewMemory {
+                deleted_at: Some(T2.to_string()),
+                ..run("run_d", T2)
+            },
+            // Newest overall, but not a run record.
+            NewMemory::new("other", "x", T2),
+            NewMemory {
+                capture_id: Some("cap".to_string()),
+                ..NewMemory::new("cap_d", "x", NOW)
+            },
+        ];
+        for row in &rows {
+            MemoryStore::insert(store, row).unwrap();
+        }
+
+        let seen = crate::db::backend::Backend::refine_observation(store, None, RUN).unwrap();
+        let filter = crate::db::memories::ListFilter {
+            include_sensitive: true,
+            category: Some(RUN.to_string()),
+            ..crate::db::memories::ListFilter::default()
+        };
+        let (_, listed) = MemoryStore::list_page(store, &filter, 1, 0).unwrap();
+        let listed = listed.first().map(|m| (m.id.clone(), m.created_at.clone()));
+        assert_eq!(seen.last_run, Some(("run_c".to_string(), NOW.to_string())));
+        assert_eq!(seen.last_run, listed);
+        assert_eq!(
+            seen.last_capture_at,
+            CurationStore::capture_activity(store)
+                .unwrap()
+                .last_capture_at
+        );
+        assert_eq!(seen.settled_captures, 1);
+        assert_eq!(
+            seen,
+            super::observe_by_parts(store, None, RUN).unwrap(),
+            "fast path equals the default"
+        );
+    }
+
     pub fn contradiction_pairs_page_by_keyset<S: CurationStore + MemoryStore + EntityStore>(
         store: &mut S,
     ) {
@@ -592,6 +780,14 @@ macro_rules! curation_conformance {
         #[test]
         fn an_import_leaves_the_backlog_once_normalized() {
             conformance::an_import_leaves_the_backlog_once_normalized(&mut $make);
+        }
+        #[test]
+        fn settled_capture_count_matches_the_undecomposed_list() {
+            conformance::settled_capture_count_matches_the_undecomposed_list(&mut $make);
+        }
+        #[test]
+        fn refine_observation_matches_the_separate_reads() {
+            conformance::refine_observation_matches_the_separate_reads(&mut $make);
         }
         #[test]
         fn contradiction_pairs_page_by_keyset() {

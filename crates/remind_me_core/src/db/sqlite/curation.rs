@@ -6,10 +6,11 @@ use super::memories::{rows_where, text};
 use super::SqliteTables;
 use crate::db::curation::{
     Backlog, CaptureActivity, CaptureRow, CurationStore, ImportRow, NormalizationSource,
+    RefineObservation,
 };
 use crate::db::engine::curation::{
-    capture_revisions, pairs_in, same_claim, same_project, standing_decision, tags,
-    undecomposed_rows_in, unnormalized_in,
+    capture_revisions, count_settled_captures, drawn_at, pairs_in, same_claim, same_project,
+    standing_decision, tags, undecomposed_rows_in, unnormalized_in,
 };
 use crate::db::engine::memories::MemoryRow;
 use crate::db::{Result, StoreError};
@@ -39,6 +40,31 @@ impl SqliteTables {
             || rows.iter().cloned(),
             settled_before,
         ))
+    }
+
+    /// The settled-capture count over only the columns the rule reads: no
+    /// content, tags or full rows.
+    fn count_settled_captures(&self, settled_before: Option<&str>) -> Result<i64> {
+        let facts: Vec<(String, String)> = self.all(
+            "SELECT source_capture_id, metadata, created_at FROM memories \
+             WHERE source_capture_id IS NOT NULL",
+            [],
+            |r| {
+                let (metadata, created_at): (String, String) = (r.get(1)?, r.get(2)?);
+                Ok((r.get(0)?, drawn_at(&metadata, &created_at)))
+            },
+        )?;
+        let captures: Vec<(String, String)> = self.all(
+            "SELECT capture_id, updated_at FROM memories WHERE capture_id IS NOT NULL \
+             AND source_capture_id IS NULL AND deleted_at IS NULL",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok(count(count_settled_captures(
+            facts.into_iter(),
+            captures.into_iter(),
+            settled_before,
+        )))
     }
 
     fn unnormalized(&self, sources: &[&str]) -> Result<Vec<MemoryRow>> {
@@ -264,8 +290,69 @@ impl CurationStore for SqliteTables {
     }
 }
 
+/// The refinement observation fast path; [`crate::db::backend::Backend`]
+/// overrides its default with it.
+impl SqliteTables {
+    pub(crate) fn observe_for_refine(
+        &self,
+        settled_before: Option<&str>,
+        run_category: &str,
+    ) -> Result<RefineObservation> {
+        let last_run = self.one(
+            "SELECT id, created_at FROM memories WHERE deleted_at IS NULL AND category = ?1 \
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+            [run_category],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok(RefineObservation {
+            settled_captures: self.count_settled_captures(settled_before)?,
+            last_capture_at: CurationStore::capture_activity(self)?.last_capture_at,
+            last_run,
+        })
+    }
+}
+
 #[cfg(test)]
 mod conformance_tests {
     use super::SqliteTables;
     crate::db::curation::curation_conformance!(SqliteTables::open_in_memory().unwrap());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SqliteTables;
+    use crate::db::curation::CurationStore;
+    use crate::db::memories::{MemoryStore, NewMemory};
+
+    const OLD: &str = "2026-09-25T00:00:00+00:00";
+
+    /// The settled-capture count reads no `content` or `tags`: with both
+    /// columns turned into blobs no `String` decodes from, the full-row
+    /// listing fails while the count still answers.
+    #[test]
+    fn the_settled_count_reads_neither_content_nor_tags() {
+        let mut tables = SqliteTables::open_in_memory().unwrap();
+        for (id, cap) in [("d", "cap"), ("s", "cap"), ("o", "other")] {
+            MemoryStore::insert(
+                &mut tables,
+                &NewMemory {
+                    capture_id: Some(cap.to_string()),
+                    ..NewMemory::new(id, "x", OLD)
+                },
+            )
+            .unwrap();
+        }
+        tables
+            .conn
+            .execute("UPDATE memories SET content = X'00', tags = X'00'", [])
+            .unwrap();
+
+        assert!(CurationStore::undecomposed(&tables, 10, None).is_err());
+        assert_eq!(
+            crate::db::backend::Backend::refine_observation(&tables, None, "refinement_run")
+                .unwrap()
+                .settled_captures,
+            2
+        );
+    }
 }

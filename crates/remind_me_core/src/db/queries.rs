@@ -188,6 +188,9 @@ impl PreparedAdd {
             outcome: fields.outcome.clone(),
             ..provenance.stamp(NewMemory::new(id.clone(), content.clone(), &now_iso))
         };
+        if row.category == crate::refine::RUN_CATEGORY {
+            crate::refine::validate_run(&row.metadata)?;
+        }
         if row.category == crate::models::PERSONA_CATEGORY {
             crate::kinds::validate_new_persona(&row.metadata, &row.written_by)?;
         }

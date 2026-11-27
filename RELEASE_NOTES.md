@@ -16,6 +16,22 @@ Dated entries, newest first. One entry per merged pull request.
 - Rust: a brief `prompt` returns the matching memory with its id and is empty with no match; blank prompt, project plus prompt, and a bad budget are refused; the schema lists `prompt` and no `required`. A messages capture stores hook/auto rows, a second capture replaces in place with the same id, bad lists store nothing; two clients with one Hermes session id keep separate captures; the CLI reads and checks stdin first. A flat `{role, content}` capture (the remote Hermes shape) keeps one capture and summary over a retry and a grown transcript, stays apart per client, and archives scrubbed.
 - Python, run by hand (`python3 -m unittest discover -s plugins/hermes-memory/tests -v`; not in CI, per the #1552 design): settings, client id, MCP over a fake server (JSON and SSE replies), stdio and local capture through a fake executable, remote capture with the capture token in its own session over loopback HTTP (escaped-limit tail, session key), every provider method, and failure as empty recall. With `REMIND_ME_TEST_BINARY` set, a round trip against the real server on a throwaway store.
 
+## 2026-11-27 — Refinement runs when there is enough material, and each run leaves a record (Mill Board #1554, D104)
+
+### Added
+- `refine` in `remind_me_server_status`: `state` is `due`, `backlog` (with `needed`), `cooldown` or `active` (with `until`), or `misconfigured` (with `reason`), plus `settled_backlog`, `last_run_at` and `last_run_id`. A run is due when at least `REMIND_ME_REFINE_MIN_BACKLOG` (default 50) captures (distinct sessions, not dialog/summary rows) are undecomposed and unchanged for the idle window, `REMIND_ME_REFINE_COOLDOWN_HOURS` (8) have passed since the newest run record, and nothing was captured for `REMIND_ME_REFINE_IDLE_MINUTES` (60). New captures reset the idle clock, so they cancel a due run. A threshold that is not a whole number, or above its maximum (a year for the cooldown and idle window), is reported by name rather than replaced with the default.
+- The maintenance nudge adds "refinement due: N settled captures" when a run is due.
+- The run record: a `refinement_run` memory whose `metadata.run` holds `decomposed`, `created`, `superseded` and `promoted` id arrays and `started_at`/`finished_at`. Add refuses a record without the object or the two times, or with a non-array id list, naming the key. The newest record starts the cooldown.
+- `docs/routines/session-ladder.md`: started by a person when a run is due, its queue window now matches the idle window (60 minutes, was 120), and a new step writes the record.
+
+- `Backend::refine_observation`, a provided method: what the flag reads (settled-capture count, last capture time, newest run record by `(created_at, id)`) in one call under one lock. Its default composes the existing `undecomposed`, `capture_activity` and `list_page` reads, so other `CurationStore`/`Backend` implementations keep compiling; the engine and SQLite override it with no sorting, revisions or `CaptureRow`s. SQLite selects ids and times only. The engine store has no narrow read, so it makes one pass that still clones each record once before dropping the body; SQLite is the chosen backend (R4), so that gap is left documented.
+
+### Not changed
+- Nothing starts a run: no background model call, and the daily routine stays paused (D104, D16's reason).
+
+### Tests
+- Below the backlog threshold, inside the cooldown, recent activity cancelling, due after a quiet hour, settings from the environment and a named typo, the nudge line, run record validation, and against a store: empty, due with 50 settled captures, cooldown after a record, `server_status` carrying `refine`; on both backends, the settled-capture count equals the distinct capture ids `undecomposed` lists, across duplicates, unsettled, decomposed, recaptured, deleted and 1 MB captures; each backend's override equals the composed default, and the one-call observation's newest run and last capture match a category-filtered `list_page` and `capture_activity` (same-instant ids, sensitive, deleted and non-run rows); on SQLite the count still answers when `content` and `tags` cannot be decoded, which the full listing cannot.
+
 ## 2026-11-27 — Mutes: stop bringing something up unasked (Mill Board #1485, D118, D124)
 
 ### Added
