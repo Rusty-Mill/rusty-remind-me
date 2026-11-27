@@ -21,6 +21,20 @@ Dated entries, newest first. One entry per merged pull request.
 - A first row with a redacted card number, its continuation and a skeleton replay clean, with a plain capture counted as not replayable; a transcript cut to `MAX_DIALOG_CHARS` replays with its cut; a changed `REMIND_ME_MESSAGE_TOOLS` is a mismatch, named, and keeps the scratch; an existing scratch is refused; CLI argument parsing.
 - A skeleton is judged on the replayed lines: a reply that shrinks on replay breaks a node that holds on the live lines. A capture with no source counts as `skeletons_live_only`, and a `source_capture_id` link is counted. Several rows share one synthetic archive and each reads only its range; out-of-blob and inverted spans are unsupported. A kept scratch is 0700, and on Windows the scratch is refused with nothing created. A cut row whose source holds a redaction is counted, not replayed.
 
+## 2026-11-27 — Hermes memory provider; `capture-transcript --format messages` (Mill Board #1552 PR C, ADR-0028 step 6, D105, D131, D138-D140)
+
+### Added
+- `remind_me_brief` takes an optional `prompt` in place of `project`: the memories most relevant to that text (Prompt mode, as the per-prompt hook injects them; empty when nothing matches). Send one of the two; both or neither is `invalid_input`. `project` is no longer listed as required in the schema (D138).
+- `plugins/hermes-memory/`: remind-me as a Hermes memory provider (`memory.provider: remind-me`). Each profile writes as `hermes-<profile>`. It opens the system prompt with `remind_me_brief` for the configured project, adds `remind_me_brief {prompt: <turn text>}` before each answer (both Markdown, within the client's registry `brief_budget`), proxies the tools remind-me lists for the client, and captures the transcript once at session end (not for cron jobs or subagents). Local mode runs `rusty-remind-me server` over stdio; remote mode uses the connector URL and `REMIND_ME_TOKEN`. Captures are keyed `<client>:<hermes session id>` (D139); remotely they go through `remind_me_capture_transcript` with the ADR-0036 capture token (`REMIND_ME_CAPTURE_TOKEN`) when it is set, one per session, else through `remind_me_auto_capture` (D140). Standard library only.
+- `rusty-remind-me capture-transcript --format messages --session-id ID` reads a JSON array of `{role, text}` on stdin and stores it like a hook capture: one per session, a later capture of the session replaces the first. Blank messages are dropped; an empty list, a blank role or an oversize input stores nothing. Daemon op `capture_messages`.
+
+### Unchanged
+- No tool is renamed or removed; a `remind_me_brief {project}` call works as before. No migration. Existing `capture-transcript PATH.jsonl` is as before.
+
+### Tests
+- Rust: a brief `prompt` returns the matching memory with its id and is empty with no match; blank prompt, project plus prompt, and a bad budget are refused; the schema lists `prompt` and no `required`. A messages capture stores hook/auto rows, a second capture replaces in place with the same id, bad lists store nothing; two clients with one Hermes session id keep separate captures; the CLI reads and checks stdin first. A flat `{role, content}` capture (the remote Hermes shape) keeps one capture and summary over a retry and a grown transcript, stays apart per client, and archives scrubbed.
+- Python, run by hand (`python3 -m unittest discover -s plugins/hermes-memory/tests -v`; not in CI, per the #1552 design): settings, client id, MCP over a fake server (JSON and SSE replies), stdio and local capture through a fake executable, remote capture with the capture token in its own session over loopback HTTP (escaped-limit tail, session key), every provider method, and failure as empty recall. With `REMIND_ME_TEST_BINARY` set, a round trip against the real server on a throwaway store.
+
 ## 2026-11-27 — Mutes: stop bringing something up unasked (Mill Board #1485, D118, D124)
 
 ### Added

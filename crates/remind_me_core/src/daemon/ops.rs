@@ -161,6 +161,14 @@ pub enum Op {
         cwd: Option<PathBuf>,
         reason: Option<String>,
     },
+    /// `capture-transcript --format messages`: the transcript as a JSON
+    /// list of `{role, text}` (ADR-0028 §5), not a path.
+    CaptureMessages {
+        messages: String,
+        session_id: String,
+        cwd: Option<PathBuf>,
+        reason: Option<String>,
+    },
     ImportSessions {
         dir: PathBuf,
     },
@@ -442,6 +450,19 @@ fn run(store: &Store<'_>, op: &Op) -> Result<Value, String> {
         } => session_ops::capture_transcript(
             store,
             path,
+            session_id,
+            cwd.as_deref(),
+            reason.as_deref(),
+        )
+        .map_err(|e| e.to_string()),
+        Op::CaptureMessages {
+            messages,
+            session_id,
+            cwd,
+            reason,
+        } => session_ops::capture_messages(
+            store,
+            messages,
             session_id,
             cwd.as_deref(),
             reason.as_deref(),

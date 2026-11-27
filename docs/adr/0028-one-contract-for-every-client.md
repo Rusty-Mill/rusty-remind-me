@@ -4,7 +4,10 @@ Status: Accepted (2026-10-26); step 1 done; step 2 in part (registry, resolution
 `client_app`, `unknown` counter; the `client` filter and OAuth client ids are still
 to do, D107-D108); step 3 in part (per-client `profile`, `format`, `brief_budget`
 and the `minimal` profile, #1552; the section 3 CI test is still to do with #52/#54,
-D130)
+D130); step 6 for Hermes done (`plugins/hermes-memory`, `capture-transcript --format
+messages`, #1552; stored as a hook capture, one per session, not through
+`auto_capture`, D105; remotely the same through the ADR-0036 capture token when set,
+else `auto_capture`, D140; prefetch through `remind_me_brief`'s new `prompt`, D138)
 Date: 2026-10-26
 
 ## Context
