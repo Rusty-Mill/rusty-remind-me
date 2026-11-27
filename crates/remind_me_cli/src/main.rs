@@ -1905,7 +1905,8 @@ fn parse_rebuild_flags(mut rest: &[String]) -> Option<DialogsVerb> {
         match flag.as_str() {
             "--keep" if !keep => keep = true,
             "--scratch" if scratch.is_none() => {
-                let (dir, tail) = rest.split_first()?;
+                // Another option is a missing value, never a directory.
+                let (dir, tail) = rest.split_first().filter(|(d, _)| !d.starts_with("--"))?;
                 scratch = Some(PathBuf::from(dir));
                 rest = tail;
             }
@@ -1966,6 +1967,8 @@ mod tests {
         );
         for bad in [
             &["rebuild-check", "--scratch"][..],
+            &["rebuild-check", "--scratch", "--keep"],
+            &["rebuild-check", "--keep", "--scratch", "--full"],
             &["rebuild-check", "--keep", "--keep"],
             &["rebuild-check", "--scratch", "a", "--scratch", "b"],
             &["rebuild-check", "--full"],

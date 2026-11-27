@@ -11,9 +11,11 @@ Dated entries, newest first. One entry per merged pull request.
 - `rusty-remind-me dialogs rebuild-check [--scratch DIR] [--keep]`: the scratch defaults to a fresh `rebuild-check-<time>` directory beside the database and is removed afterwards unless `--keep` is given or there are findings. An existing directory is refused. Because the scratch holds replayed conversation bodies and may be kept, it is created owner-only (0700, then checked) before anything is written into it. On platforms other than Unix the check is refused and nothing is created, because setting and checking a Windows ACL is not implemented.
 - `archive::span_bytes` reads only a span's own range of its archive blob, up to `MAX_SPAN_BYTES` (twice `MAX_TRANSCRIPT_BYTES`). A span that is inverted, outside its blob or over that bound is not read, and the rebuild check lists it under `unsupported_span` with the reason. Prints JSON and exits 1 on findings.
 
-### Changed
-- `rusty-remind-me dialogs check` and `dialogs rebuild-check` run only in an already-running daemon. They never start one or open the store in-process, because opening it runs housekeeping that writes. This is the rule `decisions` dry runs already follow, and the refusal message now names any read-only command.
+- `by_kind`: memories by kind on both sides, every live memory and the rows the scratch rebuilt (D133 §4). It is a report only, never a finding. This slice rebuilds dialog rows only, so every other kind shows `rebuilt` 0 until the extraction slice.
 - `docs/handoff`: D133 (this slice's shape) and Q36.
+
+### Changed
+- **Compatibility:** `rusty-remind-me dialogs check`, added by #447, no longer opens the store itself or starts a daemon. It now needs the remind-me daemon already running, as `dialogs rebuild-check` does. With no daemon it exits 1 and reads and writes nothing. Opening the store runs housekeeping that writes, and these commands promise to be read only. This is the rule `decisions` dry runs already follow, and the refusal message now names any read-only command.
 
 ### Tests
 - A first row with a redacted card number, its continuation and a skeleton replay clean, with a plain capture counted as not replayable; a transcript cut to `MAX_DIALOG_CHARS` replays with its cut; a changed `REMIND_ME_MESSAGE_TOOLS` is a mismatch, named, and keeps the scratch; an existing scratch is refused; CLI argument parsing.

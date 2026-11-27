@@ -29,10 +29,10 @@ use crate::db::memories::Memories;
 use crate::db::sqlite::SqliteDialogs;
 use crate::db::{Result, Store, StoreError};
 use crate::dialog_reconcile::{as_record, store_file};
-use crate::models::{Memory, CONTINUATION_TYPE, DIALOG_CATEGORY, SKELETON_CATEGORY};
+use crate::models::{Memory, CONTINUATION_TYPE, DIALOG_CATEGORY, SKELETON_CATEGORY, UNCLASSIFIED};
 use crate::transcript::{MessageTools, MESSAGE_TOOLS_ENV};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// What [`check`] found. Lists hold memory ids, except `bad_skeleton`
@@ -78,6 +78,23 @@ pub struct Report {
     /// Memories that name a capture through `source_capture_id`. Counted,
     /// not validated: this check covers `capture_id` links only.
     pub source_capture_links_unchecked: u64,
+    /// Memories by kind (`memory_type`, unset as `unclassified`) on both
+    /// sides: every live memory, and the rows the scratch rebuilt. Report
+    /// only, never a finding. This slice rebuilds dialog rows only, so every
+    /// other kind shows `rebuilt` 0 until the extraction slice (D133).
+    pub by_kind: BTreeMap<String, KindCount>,
+}
+
+/// One kind's count on each side of the rebuild.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KindCount {
+    pub live: u64,
+    pub rebuilt: u64,
+}
+
+/// The kind a memory is counted under in [`Report::by_kind`].
+fn kind_of(m: &Memory) -> &str {
+    m.memory_type.as_deref().unwrap_or(UNCLASSIFIED)
 }
 
 impl Report {
@@ -175,6 +192,13 @@ fn rebuild(store: &Store<'_>, scratch: &Path) -> Result<Report> {
         .all_live()?
         .into_iter()
         .partition(|m| m.category == DIALOG_CATEGORY);
+    for m in dialogs.iter().chain(&derived) {
+        report
+            .by_kind
+            .entry(kind_of(m).to_string())
+            .or_default()
+            .live += 1;
+    }
     let mut log = DialogLog::new(
         SqliteDialogs::open(scratch)?,
         BlobStore::new(scratch.join("blobs")),
@@ -283,13 +307,21 @@ fn compare(
     dialogs: &[Memory],
     stored: &HashMap<String, String>,
 ) -> Result<()> {
-    let live: HashMap<&str, String> = dialogs
+    let live: HashMap<&str, (String, &str)> = dialogs
         .iter()
-        .map(|m| (m.id.as_str(), as_record(m).canonical_hash()))
+        .map(|m| (m.id.as_str(), (as_record(m).canonical_hash(), kind_of(m))))
         .collect();
     scratch.scan(&mut |r| {
         let hash = r.canonical_hash();
-        if live.get(r.id.as_str()) != Some(&hash) {
+        let row = live.get(r.id.as_str());
+        if let Some((_, kind)) = row {
+            report
+                .by_kind
+                .entry((*kind).to_string())
+                .or_default()
+                .rebuilt += 1;
+        }
+        if row.map(|(h, _)| h) != Some(&hash) {
             report.replay_mismatch.push(r.id.clone());
         }
         match stored.get(&r.id) {

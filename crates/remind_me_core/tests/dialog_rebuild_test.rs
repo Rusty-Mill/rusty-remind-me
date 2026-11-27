@@ -155,6 +155,11 @@ fn every_archived_dialog_replays_to_its_stored_body() {
         (1, 1)
     );
     assert_eq!(report.source_capture_links_unchecked, 1);
+    // Both sides by kind: every live memory, and only the replayed rows.
+    let live_total = Memories::new(&db.store()).all_live().unwrap().len() as u64;
+    let sides = report.by_kind.values();
+    assert_eq!(sides.clone().map(|k| k.live).sum::<u64>(), live_total);
+    assert_eq!(sides.map(|k| k.rebuilt).sum::<u64>(), report.replayed);
     assert!(report.redact);
     assert!(!report.kept && !scratch.exists());
     done(&dir);
