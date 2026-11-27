@@ -728,8 +728,8 @@ surfaces):
 | `GET` | `/api/stats` | Dashboard-level memory statistics |
 | `GET` | `/api/memories` | List memories |
 | `POST` | `/api/memories` | Store a new memory (`MemoryAddInput` JSON body) |
-| `GET` | `/api/memories/{memory_id}` | Fetch one memory by ID |
-| `PUT`, `PATCH` | `/api/memories/{memory_id}` | Update a memory |
+| `GET` | `/api/memories/{memory_id}` | Fetch one memory by ID, with its `version` |
+| `PUT`, `PATCH` | `/api/memories/{memory_id}` | Update a memory; optional `if_version` (see below) |
 | `DELETE` | `/api/memories/{memory_id}` | Delete a memory |
 | `GET` | `/api/memories/search?q=...&limit=...` | Search memories — query params, not a POST body |
 | `POST` | `/api/memories/bulk/delete`, `/bulk/tag`, `/bulk/reclassify` | Bulk operations over a set of memory IDs |
@@ -740,7 +740,7 @@ surfaces):
 | `GET` | `/api/export` | Export memories |
 | `GET` | `/api/entity`, `/api/entities`, `/api/entity/traverse` | Knowledge-graph entity endpoints |
 | `GET` | `/api/wiki`, `/api/wiki/search`, `/api/wiki/load`, `/api/wiki/status`, `/api/wiki/{slug}` | Markdown wiki endpoints |
-| `POST` | `/api/wiki` | Create or replace a page — `{"title": ..., "content": ..., "log_note": ...}` (`remind_me_wiki_write`) |
+| `POST` | `/api/wiki` | Create or replace a page — `{"title": ..., "content": ..., "log_note": ..., "if_version": ...}` (`remind_me_wiki_write`) |
 | `DELETE` | `/api/wiki/{slug}` | Delete a page and its index rows (`remind_me_wiki_delete`) |
 | `POST` | `/api/wiki/compile` | Compile brief; `{"mark_integrated": true, "through": <brief's through>}` advances the watermark (`remind_me_wiki_compile`) |
 | `GET` | `/api/wiki/schema` | The maintainer schema the compile brief embeds |
@@ -754,6 +754,14 @@ surfaces):
 | `GET` | `/api/saved-searches/{name}/run` | Re-run a saved search's stored query and filters (`remind_me_run_saved_search`) |
 | `DELETE` | `/api/saved-searches/{name}` | Delete one, with its watch-tracking rows (`remind_me_delete_saved_search`) |
 | `GET` | `/metrics`, `/manifest.json`, `/` | Metrics, PWA manifest, and the dashboard itself |
+
+**Version checks (#1487).** A memory, a wiki page (`GET /api/wiki/{slug}`)
+and a project (`action=get`) are read with a `version`. Pass it back as
+`if_version` on the memory update, the wiki write (where `"absent"` means
+"create only") or a project `set`/`revert`: if the target changed since, the
+answer is 409 with `{"error": {"code": "version_conflict", ...},
+"current_version": ...}` and nothing is written. The MCP tools take the same
+field and return the same body. Without `if_version`, the last write wins.
 
 Each of the reminder, digest, status, saved-search and wiki routes calls the
 same `remind_me_core` function its MCP tool does, so a reminder set from the

@@ -2,6 +2,19 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-27 — Version checks so clients can't overwrite each other (Mill Board #1487, D105-D108, D111)
+
+### Added
+- `version` on reads: `remind_me_get`, the `remind_me_add` and `remind_me_update` replies, `remind_me_wiki_read` and the wiki write reply, `remind_me_project` `get`/`set`/`revert`, and their REST routes (`GET`/`PATCH /api/memories/{id}`, `GET /api/wiki/{slug}`, `POST /api/wiki`, `/api/projects`). It is `v1:` plus 16 hex characters of SHA-256 over what a write can change, computed on read and never stored: no schema or record change.
+- Optional `if_version` on `remind_me_update`, `remind_me_wiki_write` (`"absent"` = create only) and `remind_me_project` `set`/`revert`, and on the same REST routes. On a mismatch nothing is written: MCP returns the ADR-0028 error `version_conflict` with `current_version` (and `updated_at` for a memory or page); REST answers 409 with the same body. A malformed value is refused as invalid input before any read. Without it, the last write wins as before.
+- `StoreError::Conflict { current_version }`, `remind_me_core::version`.
+
+### Changed
+- A memory update now reads, checks and writes in one transaction (it read outside it before). Project `set`/`revert` check inside their existing transaction. A wiki page is written to a temporary file and renamed into place; an edit made in an editor between the check and the rename is the one race a file leaves.
+
+### Tests
+- Match writes, mismatch writes nothing (row, revision count, page, claim chain), absent precondition, malformed value, two writers holding one version on the Engine and SQLite backends (exactly one wins), and the same code and body over MCP and REST.
+
 ## 2026-11-26 — Entity overlap ranking signal measured and dropped (Mill Board #64, D92)
 
 ### Added

@@ -36,6 +36,7 @@ fn edit(store: &Store<'_>, id: &str, content: Option<&str>, project: Option<&str
         store,
         &MemoryUpdateInput {
             memory_id: id.to_string(),
+            if_version: None,
             content: content.map(str::to_string),
             project: project.map(str::to_string),
             category: None,

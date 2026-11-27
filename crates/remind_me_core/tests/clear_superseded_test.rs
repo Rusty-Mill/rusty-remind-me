@@ -45,6 +45,7 @@ fn update(store: &Store<'_>, id: &str, clear_superseded: bool) -> UpdateOutcome 
         &MemoryUpdateInput {
             project: None,
             memory_id: id.to_string(),
+            if_version: None,
             content: None,
             category: None,
             tags: None,
@@ -122,6 +123,7 @@ fn omitting_the_flag_leaves_the_pointer_alone() {
         &MemoryUpdateInput {
             project: None,
             memory_id: first.clone(),
+            if_version: None,
             content: Some("the deploy target is staging (revised)".to_string()),
             category: None,
             tags: None,

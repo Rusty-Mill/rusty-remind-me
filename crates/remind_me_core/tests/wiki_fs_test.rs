@@ -733,6 +733,7 @@ fn an_edit_between_brief_and_mark_cannot_integrate_an_unseen_source() {
         &store,
         &MemoryUpdateInput {
             memory_id: "mem_a".into(),
+            if_version: None,
             content: Some("FIRST, now short".into()),
             category: None,
             tags: None,

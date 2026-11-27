@@ -53,6 +53,33 @@ fn internal_err(e: impl std::fmt::Display) -> (u16, Body) {
     err(500, e.to_string())
 }
 
+/// 409 for a write refused by its `if_version` (#1487): the same body the
+/// MCP tools return (pack D107).
+fn conflict(current_version: &str, updated_at: Option<&str>, read_with: &str) -> (u16, Body) {
+    (
+        409,
+        Body::Json(remind_me_core::version::conflict_body(
+            current_version,
+            updated_at,
+            read_with,
+        )),
+    )
+}
+
+/// `value` as JSON with a `version` field beside its own (#1487).
+fn with_version(value: impl serde::Serialize, version: String) -> (u16, Body) {
+    let mut body = serde_json::to_value(value).unwrap_or(json!({}));
+    if let Some(object) = body.as_object_mut() {
+        object.insert("version".into(), json!(version));
+    }
+    (200, Body::Json(body))
+}
+
+/// The optional `if_version` body field, as a string.
+fn if_version(body: &Value) -> Option<&str> {
+    body.get("if_version").and_then(Value::as_str)
+}
+
 /// Parse the request body as JSON, or `Err` with the 400 response to send.
 fn json_body(request: &Request) -> Result<Value, (u16, Body)> {
     serde_json::from_slice(&request.body).map_err(|e| err(400, format!("Invalid JSON body: {}", e)))
@@ -396,7 +423,10 @@ pub fn api_search(store: &Store<'_>, _wiki: &Wiki, req: &Request, _params: &Para
 pub fn api_get(store: &Store<'_>, _wiki: &Wiki, _req: &Request, params: &Params) -> (u16, Body) {
     let id = &params["memory_id"];
     match queries::get_memory_by_id(store, id) {
-        Ok(Some(memory)) => ok(memory),
+        Ok(Some(memory)) => {
+            let version = remind_me_core::version::of_memory(&memory);
+            with_version(memory, version)
+        }
         Ok(None) => err(404, "Not found"),
         Err(e) => internal_err(e),
     }
@@ -436,11 +466,27 @@ pub fn api_update(store: &Store<'_>, _wiki: &Wiki, req: &Request, params: &Param
                 .collect()
         }),
         metadata: body.get("metadata").cloned(),
+        if_version: if_version(&body).map(str::to_string),
     };
     match queries::update_memory(store, &input) {
-        Ok(UpdateOutcome::Updated(memory)) => ok(*memory),
+        Ok(UpdateOutcome::Updated(memory)) => {
+            let version = remind_me_core::version::of_memory(&memory);
+            with_version(*memory, version)
+        }
         Ok(UpdateOutcome::NotFound) => err(404, "Not found"),
         Ok(UpdateOutcome::NoFields) => err(400, "No fields to update"),
+        Err(StoreError::Conflict { current_version }) => {
+            let updated_at = queries::get_memory_by_id(store, &input.memory_id)
+                .ok()
+                .flatten()
+                .map(|m| m.updated_at);
+            conflict(
+                &current_version,
+                updated_at.as_deref(),
+                "GET /api/memories/{id}",
+            )
+        }
+        Err(StoreError::Invalid(why)) => err(400, why),
         Err(e) => internal_err(e),
     }
 }
@@ -655,6 +701,9 @@ pub fn api_projects(
     }
     match remind_me_core::project_tool::call(store, &args) {
         Ok(payload) => ok(payload),
+        Err(StoreError::Conflict { current_version }) => {
+            conflict(&current_version, None, "GET /api/projects?action=get")
+        }
         Err(remind_me_core::db::StoreError::Invalid(why)) => err(400, why),
         Err(remind_me_core::db::StoreError::NotFound) => err(404, "Not found"),
         Err(e) => internal_err(e),
@@ -951,7 +1000,10 @@ pub fn api_wiki_page(
 ) -> (u16, Body) {
     let slug = &params["slug"];
     match wiki.read_page(store, slug) {
-        Ok(Some(page)) => ok(page),
+        Ok(Some(page)) => {
+            let version = remind_me_core::version::of_text(&page.content);
+            with_version(page, version)
+        }
         Ok(None) => err(404, format!("Wiki page not found: {:?}", slug)),
         Err(e) => internal_err(e),
     }
@@ -1034,8 +1086,26 @@ pub fn api_wiki_write(
         );
     }
 
-    match wiki.write_page(store, title, content, log_note) {
+    let expect = match remind_me_core::version::Expect::parse(if_version(&body), true) {
+        Ok(expect) => expect,
+        Err(e) => return err(400, e.to_string()),
+    };
+    match wiki.write_page_if(store, title, content, log_note, expect.as_ref()) {
         Ok(Ok(outcome)) => ok(outcome),
+        Err(StoreError::Conflict { current_version }) => {
+            let updated_at = remind_me_core::wiki::get_wiki_page(
+                store,
+                &remind_me_core::wiki_import::slugify(title),
+            )
+            .ok()
+            .flatten()
+            .map(|p| p.updated_at);
+            conflict(
+                &current_version,
+                updated_at.as_deref(),
+                "GET /api/wiki/{slug}",
+            )
+        }
         // 403, not 400: the request is well-formed and the page is real, it is
         // simply not the caller's to write. `index`/`log`/`schema` are
         // regenerated from the pages themselves.
