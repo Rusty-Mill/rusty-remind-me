@@ -21,6 +21,8 @@ Usage:
   rusty-remind-me session timeline --session-id ID [--json]
   rusty-remind-me capture-transcript PATH.jsonl --session-id ID [--cwd DIR]
                   [--reason stop|precompact|end] [--json]
+  rusty-remind-me capture-transcript --format messages --session-id ID [--cwd DIR]
+                  [--reason R]   (stdin: a JSON array of {role, text})
   rusty-remind-me import-sessions DIR   (a Claude Code `projects` folder)
   rusty-remind-me context [--cwd DIR] [--project P] [--branch B] [--prompt TEXT]
                   [--budget TOKENS] [--hits-only] [--json]
@@ -45,6 +47,7 @@ struct Flags {
     branch: Option<String>,
     prompt: Option<String>,
     since: Option<String>,
+    format: Option<String>,
     budget: Option<usize>,
     json: bool,
     hits_only: bool,
@@ -84,6 +87,7 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
             "--branch" => flags.branch = Some(value),
             "--prompt" => flags.prompt = Some(value),
             "--since" => flags.since = Some(value),
+            "--format" => flags.format = Some(value),
             "--budget" => {
                 flags.budget = Some(value.parse().map_err(|_| {
                     format!("Error: --budget expects a number of tokens, got {value:?}.")
@@ -146,6 +150,9 @@ fn plan(command: &str, rest: &[String]) -> Result<Plan, String> {
         "session" => plan_session(rest),
         "capture-transcript" => {
             let flags = parse_flags(rest)?;
+            if let Some(format) = flags.format.as_deref() {
+                return plan_capture_messages(format, &flags, read_stdin);
+            }
             let path = flags.positional.clone().ok_or_else(|| {
                 format!("Error: capture-transcript expects a transcript path.\n{USAGE}")
             })?;
@@ -198,6 +205,48 @@ fn plan(command: &str, rest: &[String]) -> Result<Plan, String> {
         }
         other => Err(format!("Error: unknown command {other:?}.\n{USAGE}")),
     }
+}
+
+/// `capture-transcript --format messages`: the transcript is read by
+/// `stdin` (a JSON array of `{role, text}`), checked here so a bad list
+/// fails before the store is opened.
+fn plan_capture_messages(
+    format: &str,
+    flags: &Flags,
+    stdin: impl FnOnce() -> Result<String, String>,
+) -> Result<Plan, String> {
+    if format != "messages" {
+        return Err(format!(
+            "Error: --format takes only `messages`, got {format:?}.\n{USAGE}"
+        ));
+    }
+    if flags.positional.is_some() {
+        return Err(format!(
+            "Error: --format messages reads stdin; drop the path.\n{USAGE}"
+        ));
+    }
+    let session_id = flags.session_id()?;
+    let messages = stdin()?;
+    remind_me_core::transcript::messages_jsonl(&messages).map_err(|e| format!("Error: {e}"))?;
+    Ok(Plan::Json(Op::CaptureMessages {
+        messages,
+        session_id,
+        cwd: Some(flags.cwd()?),
+        reason: flags.reason.clone(),
+    }))
+}
+
+/// All of stdin, capped one byte past the transcript limit so an oversized
+/// list is refused rather than read without end.
+fn read_stdin() -> Result<String, String> {
+    use std::io::Read;
+    let cap = remind_me_core::transcript::MAX_TRANSCRIPT_BYTES as u64 + 1;
+    let mut text = String::new();
+    std::io::stdin()
+        .take(cap)
+        .read_to_string(&mut text)
+        .map_err(|e| format!("Error: cannot read stdin: {e}"))?;
+    Ok(text)
 }
 
 fn plan_session(rest: &[String]) -> Result<Plan, String> {
@@ -281,6 +330,54 @@ mod tests {
 
     fn args(raw: &[&str]) -> Vec<String> {
         raw.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn capture_messages_reads_stdin_and_checks_it_first() {
+        let flags = parse_flags(&args(&[
+            "--format",
+            "messages",
+            "--session-id",
+            "h1",
+            "--cwd",
+            "/work",
+            "--reason",
+            "end",
+        ]))
+        .unwrap();
+        let list = r#"[{"role":"user","text":"hi"},{"role":"assistant","text":"hello"}]"#;
+        let planned = plan_capture_messages("messages", &flags, || Ok(list.to_string())).unwrap();
+        let Plan::Json(Op::CaptureMessages {
+            messages,
+            session_id,
+            cwd,
+            reason,
+        }) = planned
+        else {
+            panic!("not a messages capture");
+        };
+        assert_eq!((messages.as_str(), session_id.as_str()), (list, "h1"));
+        assert_eq!(cwd, Some(PathBuf::from("/work")));
+        assert_eq!(reason.as_deref(), Some("end"));
+
+        for (format, input) in [
+            ("jsonl", list),
+            ("messages", "not json"),
+            ("messages", r#"[{"role":"user","content":"x"}]"#),
+            ("messages", "[]"),
+        ] {
+            let got = plan_capture_messages(format, &flags, || Ok(input.to_string()));
+            assert!(got.is_err(), "{format} {input} accepted");
+        }
+        let with_path = parse_flags(&args(&[
+            "t.jsonl",
+            "--format",
+            "messages",
+            "--session-id",
+            "h",
+        ]))
+        .unwrap();
+        assert!(plan_capture_messages("messages", &with_path, || Ok(list.into())).is_err());
     }
 
     #[test]

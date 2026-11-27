@@ -2,6 +2,19 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-27 — Hermes memory provider; `capture-transcript --format messages` (Mill Board #1552 PR C, ADR-0028 step 6, D105, D115)
+
+### Added
+- `plugins/hermes-memory/`: remind-me as a Hermes memory provider (`memory.provider: remind-me`). Each profile writes as `hermes-<profile>`. It opens the system prompt with `remind_me_brief` for the configured project, searches each turn's text before the model answers, proxies the tools remind-me lists for the client, and captures the transcript once at session end (not for cron jobs or subagents). Local mode runs `rusty-remind-me server` over stdio; remote mode uses the connector URL and `REMIND_ME_TOKEN`. Standard library only.
+- `rusty-remind-me capture-transcript --format messages --session-id ID` reads a JSON array of `{role, text}` on stdin and stores it like a hook capture: one per session, a later capture of the session replaces the first. Blank messages are dropped; an empty list, a blank role or an oversize input stores nothing. Daemon op `capture_messages`.
+
+### Unchanged
+- No MCP tool, schema or migration change. Existing `capture-transcript PATH.jsonl` is as before.
+
+### Tests
+- Rust: a messages capture stores hook/auto rows, a second capture replaces in place with the same id, bad lists store nothing; the CLI reads and checks stdin first.
+- Python (in CI, beside the cloud-capture tests): settings, client id, MCP over a fake server (JSON and SSE replies), stdio and local capture through a fake executable, every provider method, and failure as empty recall. With `REMIND_ME_TEST_BINARY` set, a round trip against the real server on a throwaway store.
+
 ## 2026-11-27 — Per-client tool profile, format and brief budget; the `minimal` profile (Mill Board #1552 PR B, ADR-0028 step 3, D110-D115)
 
 ### Added
