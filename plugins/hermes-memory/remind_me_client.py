@@ -208,7 +208,9 @@ class HttpTransport:
         }
         if self._session:
             headers["Mcp-Session-Id"] = self._session
-        body = json.dumps(message).encode()
+        # UTF-8, not \u escapes: sent as transcript_jsonl sized it, so a
+        # transcript within MAX_TRANSCRIPT_BYTES fits the server's body limit.
+        body = wire_bytes(message)
         request = urllib.request.Request(self._url, body, headers, method="POST")
         try:
             with self._opener.open(request, timeout=REQUEST_SECONDS) as response:
@@ -403,9 +405,16 @@ def capture_local(command: str, client: str, session_id: str, messages: Sequence
     return done.stdout
 
 
+def wire_bytes(value: object) -> bytes:
+    """JSON as sent over HTTP: UTF-8 with non-ASCII unescaped, the policy
+    `escaped_len` sizes transcripts by. A lone surrogate becomes `?`."""
+    return json.dumps(value, ensure_ascii=False).encode("utf-8", "replace")
+
+
 def escaped_len(text: str) -> int:
-    """Bytes `text` costs JSON-escaped, as transcript::encoded_len counts them."""
-    return len(json.dumps(text, ensure_ascii=False).encode()) - 2
+    """Bytes `text` costs JSON-escaped, as transcript::encoded_len counts them
+    and as `wire_bytes` sends it."""
+    return len(wire_bytes(text)) - 2
 
 
 def transcript_jsonl(messages: Sequence[Message], limit: int = MAX_TRANSCRIPT_BYTES) -> str:

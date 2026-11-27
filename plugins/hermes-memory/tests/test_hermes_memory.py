@@ -322,10 +322,13 @@ class CaptureServer:
         import threading
 
         seen = self.seen = []
+        raw = self.raw = []
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_POST(self) -> None:  # noqa: N802 (http.server's name)
-                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                raw_body = self.rfile.read(int(self.headers["Content-Length"]))
+                raw.append(raw_body)
+                body = json.loads(raw_body)
                 seen.append((dict(self.headers), body))
                 if "id" not in body:
                     self.send_response(202)
@@ -335,13 +338,13 @@ class CaptureServer:
                     result: dict[str, Any] = {"protocolVersion": rm.PROTOCOL_VERSION}
                 else:
                     result = {"content": [{"type": "text", "text": "{}"}]}
-                raw = json.dumps({"jsonrpc": "2.0", "id": body["id"], "result": result}).encode()
+                reply = json.dumps({"jsonrpc": "2.0", "id": body["id"], "result": result}).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Mcp-Session-Id", "sess-abc")
-                self.send_header("Content-Length", str(len(raw)))
+                self.send_header("Content-Length", str(len(reply)))
                 self.end_headers()
-                self.wfile.write(raw)
+                self.wfile.write(reply)
 
             def log_message(self, *args: Any) -> None:
                 pass
@@ -373,6 +376,25 @@ class CaptureRemoteTest(unittest.TestCase):
             "transcript": '{"role":"user","content":"hi"}\n',
             "reason": "end",
         }})
+
+    def test_multilingual_text_is_sent_as_it_was_sized(self) -> None:
+        # Server limits: MAX_TRANSCRIPT_BYTES escaped, a 4 MiB request body.
+        text = "Grüße, 東京で会いましょう — до встречи 👋 \"ok\"\n" * 2000
+        messages = [rm.Message("user" if n % 2 else "assistant", text) for n in range(60)]
+        server = CaptureServer()
+        try:
+            settings = rm.Settings(url=server.url, token="connector", capture_token="capture")
+            rm.capture_remote(settings, "hermes-gw", "hermes-gw:s1", messages)
+        finally:
+            server.close()
+        body = server.raw[-1]
+        transcript = server.seen[-1][1]["params"]["arguments"]["transcript"]
+        self.assertNotIn(b"\\u", body, "non-ASCII travels as UTF-8, not escapes")
+        self.assertLessEqual(rm.escaped_len(transcript), rm.MAX_TRANSCRIPT_BYTES)
+        self.assertGreater(rm.escaped_len(transcript), rm.MAX_TRANSCRIPT_BYTES - 2 * len(text.encode()))
+        overhead = len(body) - rm.escaped_len(transcript)
+        self.assertLess(overhead, 1024, "the body is the sized transcript plus a small envelope")
+        self.assertLessEqual(len(body), 4 * 1024 * 1024)
 
     def test_no_capture_token_or_nothing_that_fits_raises(self) -> None:
         with self.assertRaises(rm.RemindMeError):
