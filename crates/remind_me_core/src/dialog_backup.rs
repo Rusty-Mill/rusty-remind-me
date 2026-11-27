@@ -8,7 +8,9 @@
 //!   body hash.
 //!
 //! It is built in `<name>.dialogs.partial` and renamed when complete, so a
-//! crash never leaves something that lists as a package but is not one.
+//! crash never leaves something that lists as a package but is not one. On
+//! Unix the staging directory is flushed before the rename and the parent
+//! after it, so a finished package also survives a power loss.
 //! Only blobs the copy's rows name are copied: a body is published before
 //! its row (ADR-0037), so every row in the copy has its blob, and an orphan
 //! blob from a crashed write is not part of the record.
@@ -60,6 +62,29 @@ fn partial_of(path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// Flush the directory `dir`, so the entries it holds survive a power loss.
+/// A no-op where directories cannot be synced.
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> Result<()> {
+    std::fs::File::open(dir)
+        .and_then(|d| d.sync_all())
+        .map_err(io_error(dir))
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// Rename the finished `partial` to `dest` durably: flush `partial`'s own
+/// entries first, then the parent that holds the new name.
+fn publish(partial: &Path, dest: &Path) -> Result<()> {
+    sync_dir(partial)?;
+    std::fs::rename(partial, dest).map_err(io_error(dest))?;
+    let parent = dest.parent().filter(|p| !p.as_os_str().is_empty());
+    sync_dir(parent.unwrap_or(Path::new(".")))
+}
+
 /// The bytes of `hash` from `blobs`, checked against the full hash.
 fn verified_blob(blobs: &BlobStore, id: &str, hash: &str) -> Result<Vec<u8>> {
     let bytes = blobs
@@ -99,7 +124,7 @@ pub fn create(store_dir: &Path, dest: &Path) -> Result<u64> {
         // is cleared by the next run, so the original error is the one kept.
         let _ = std::fs::remove_dir_all(&partial);
     })?;
-    std::fs::rename(&partial, dest).map_err(io_error(dest))?;
+    publish(&partial, dest)?;
     Ok(rows)
 }
 
@@ -214,7 +239,7 @@ pub fn restore(package: &Path, store_dir: &Path) -> Result<u64> {
         // Best effort, as in `create`: the original error is the one kept.
         let _ = std::fs::remove_dir_all(&partial);
     })?;
-    std::fs::rename(&partial, store_dir).map_err(io_error(store_dir))?;
+    publish(&partial, store_dir)?;
     Ok(restored)
 }
 
