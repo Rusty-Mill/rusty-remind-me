@@ -1272,13 +1272,14 @@ pub(crate) fn keyword_hits(
     phrases: &[String],
     filter: &KeywordFilter,
     limit: usize,
+    skip: &dyn Fn(&Memory) -> bool,
 ) -> Result<Vec<(Memory, f64)>> {
     let now = chrono::Utc::now();
     Ok(ranked(core_ref(tables)?, phrases)
         .into_iter()
         .filter(|(row, _)| row.admits(filter))
         .map(|(row, score)| (row.to_memory(), score))
-        .filter(|(memory, _)| filter.narrowing.admits(memory))
+        .filter(|(memory, _)| filter.narrowing.admits(memory) && !skip(memory))
         .filter(|(memory, _)| filter.vital_enough(memory, now))
         .take(limit)
         .collect())
@@ -1575,10 +1576,20 @@ impl MemoryStore for EngineTables {
         filter: &KeywordFilter,
         limit: usize,
     ) -> Result<Vec<(Memory, f64)>> {
+        self.keyword_hits_skipping(phrases, filter, limit, &|_| false)
+    }
+
+    fn keyword_hits_skipping(
+        &self,
+        phrases: &[String],
+        filter: &KeywordFilter,
+        limit: usize,
+        skip: &dyn Fn(&Memory) -> bool,
+    ) -> Result<Vec<(Memory, f64)>> {
         if phrases.is_empty() {
             return Ok(Vec::new());
         }
-        keyword_hits(self, phrases, filter, limit)
+        keyword_hits(self, phrases, filter, limit, skip)
     }
 
     fn window_hits(&self, filter: &KeywordFilter) -> Result<Vec<Memory>> {

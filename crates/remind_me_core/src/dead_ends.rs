@@ -194,13 +194,18 @@ pub fn rank(
 /// Live, unsuperseded, unexpired, not a dialog, sensitive only when asked,
 /// in the project scope.
 fn showable(memory: &Memory, request: &Request<'_>, now: DateTime<Utc>) -> bool {
-    memory.memory_type.as_deref() == Some(MemoryKind::DeadEnd.as_str())
+    is_dead_end(memory)
         && memory.deleted_at.is_none()
         && memory.superseded_by.is_none()
         && memory.category != crate::models::DIALOG_CATEGORY
         && (request.include_sensitive || !memory.sensitive)
         && !crate::retrieval::is_expired(now, memory.valid_until.as_deref())
         && in_project(request.project, memory)
+}
+
+/// Whether `memory` is a dead end.
+pub fn is_dead_end(memory: &Memory) -> bool {
+    memory.memory_type.as_deref() == Some(MemoryKind::DeadEnd.as_str())
 }
 
 /// Whether `memory` is in the `project` scope: its own project is that one
