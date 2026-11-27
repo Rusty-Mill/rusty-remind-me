@@ -86,7 +86,10 @@ impl SqliteDialogs {
         self.conn
             .execute("VACUUM INTO ?1", [target])
             .map_err(sqlite_error)?;
-        std::fs::File::open(file)
+        // `FlushFileBuffers` needs write access on Windows; no truncate.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(file)
             .and_then(|f| f.sync_all())
             .map_err(|e| StoreError::Engine(format!("dialogs: {}: {e}", file.display())))
     }

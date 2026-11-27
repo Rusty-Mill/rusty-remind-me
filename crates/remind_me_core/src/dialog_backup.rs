@@ -226,7 +226,10 @@ fn put_back(
 ) -> Result<u64> {
     let file = partial.join(DIALOGS_FILE);
     std::fs::copy(package.join(DIALOGS_FILE), &file).map_err(io_error(&file))?;
-    std::fs::File::open(&file)
+    // `FlushFileBuffers` needs write access on Windows; no truncate.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&file)
         .and_then(|f| f.sync_all())
         .map_err(io_error(&file))?;
     let from = BlobStore::new(package.join(BLOBS));
