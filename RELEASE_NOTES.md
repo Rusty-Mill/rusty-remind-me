@@ -2,16 +2,27 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
-## 2026-11-27 — Dead ends that warn before they're repeated (Mill Board #1484, D101-D103, D109)
+## 2026-11-27 — Mutes: stop bringing something up unasked (Mill Board #1485, D118, D124)
+
+### Added
+- Mutes on an entity, a topic (and its subtree) or a tag, global or per project. A mute is a `preference` memory in category `mute` with `metadata.mute = {target: entity|topic|tag, value, on, project?}`; writes in that category are checked (preference kind, valid spec, entity or topic exists, a `topic:` name refused as an entity). No schema change, no new tool.
+- CLI: `rusty-remind-me mute|unmute <entity|topic|tag> <VALUE> [--project NAME]` and `rusty-remind-me mutes`. Muting again re-enables the existing record; unmuting turns it off and keeps it.
+- Muted memories leave the session and project briefs, the prompt hook (hits and dead-end warnings), reminders in the brief and the digest's recent memories (`muted_hidden` counts them; the Markdown says so). Mute records are never listed there and consolidation leaves them alone.
+- An explicit `remind_me_search` still returns muted memories and marks each `"muted": true` (full and compact JSON) with a Markdown note. A project brief never mutes its own project entity.
+
+### Tests
+- Muted entity, tag and topic leave the brief; search still finds and marks; unmute restores and re-muting reuses the record; project scoping; digest count; validation; CLI parsing.
+
+## 2026-11-27 — Dead ends that warn before they're repeated (Mill Board #1484, D115-D117, D123)
 
 ### Added
 - `memory_type: dead_end`: an approach that was tried and failed. `metadata.tried` and `metadata.why_failed` are required (non-empty, at most 1,000 characters); `cost` is optional (positive minutes, or `low`/`medium`/`high`); `from` is optional and must name a live memory. Decay 0.03, type prior 1.1. Nothing existing is reclassified.
-- `warnings` and `warnings_omitted` on `remind_me_search` (and `GET /api/memories/search`): up to 3 dead ends the query repeats, outside the ranking and `limit`, within a quarter of the token budget. Matching is lexical (at least half of the dead end's words, and at least 2, appear in the query; stopwords and words under 3 characters ignored), in the request's project or with none, never sensitive unless asked. A warned dead end is left out of that response's hits. Markdown shows a "Dead ends" block above the hits; compact JSON cuts `tried`/`why_failed` to 200 characters.
+- `warnings` and `warnings_omitted` on `remind_me_search` (MCP only; the REST search page is unchanged): up to 3 dead ends the query repeats, outside the ranking and `limit`, within a quarter of the token budget. Matching is lexical (at least half of the dead end's words, and at least 2, appear in the query; stopwords and words under 3 characters ignored), in the request's project or with none, never sensitive unless asked. A warned dead end is left out of that response's hits. Markdown shows a "Dead ends" block above the hits; compact JSON cuts `tried`/`why_failed` to 200 characters.
 - A `warnings` section first in the project and session briefs (the scope's dead ends plus projectless ones, newest first, up to 3; no longer repeated in activity) and in the prompt hook's brief (dead ends the prompt repeats, up to 2, inside the same 750-token budget; the hook script is unchanged).
 - `remind_me_resolve` with `abandoned` or `reverted` adds `dead_end_hint` (JSON) or a closing line (Markdown) suggesting a dead end with `from` set. Nothing is created automatically.
 
 ### Not done
-- No PreToolUse blocking hook (D103: worth adding if repeats persist despite warnings, or once dead ends record an exact command or path). Semantic matching is Q28.
+- No PreToolUse blocking hook (D117: worth adding if repeats persist despite warnings, or once dead ends record an exact command or path). Semantic matching is Q29.
 
 ### Tests
 - Field validation and `from`; match, no match, other project, sensitive, cap and `limit` on search; the project brief's section and its absence from activity; the prompt hook's match, miss and cap; resolve's hint; MCP Markdown and compact JSON.

@@ -49,6 +49,7 @@ use crate::db::memories::Memories;
 use crate::db::{Result, Store, StoreError};
 use crate::entity::{normalize_entity_name, resolve_entity};
 use crate::models::{Memory, MemorySearchInput, ReminderWindow};
+use crate::mute::MuteSet;
 use crate::text::edit_distance;
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
@@ -253,10 +254,13 @@ pub fn build(store: &Store<'_>, request: &ContextRequest<'_>) -> Result<Outcome>
     let prompt = request.prompt.map(str::trim).filter(|p| !p.is_empty());
     if request.mode == Mode::Prompt {
         let drafts = match prompt {
-            Some(prompt) => vec![
-                prompt_warnings_draft(store, prompt, request.project, now)?,
-                hits_draft(store, prompt, &[], now)?,
-            ],
+            Some(prompt) => {
+                let mutes = MuteSet::load(store, request.project, None)?;
+                vec![
+                    prompt_warnings_draft(store, prompt, request.project, &mutes, now)?,
+                    hits_draft(store, prompt, &[], &mutes, now)?,
+                ]
+            }
             None => Vec::new(),
         };
         fit(&mut brief, drafts)?;
@@ -290,12 +294,21 @@ pub fn build(store: &Store<'_>, request: &ContextRequest<'_>) -> Result<Outcome>
         },
     };
 
+    // Mutes apply once the scope is known (card #1485, D118): mute records
+    // and what they cover leave every section. A brief naming a muted
+    // entity as its project ignores that one mute.
+    let own_entity = scope.project.as_ref().map(|p| p.name.clone());
+    let mutes = MuteSet::load(store, request.project, own_entity.as_deref())?;
+    let memories: Vec<Memory> = memories
+        .into_iter()
+        .filter(|m| !crate::mute::is_record(m) && !mutes.covers(m))
+        .collect();
     let in_scope: Vec<&Memory> = memories.iter().filter(|m| scope.admits(m)).collect();
     // Before any section is drafted, so none shows both sides of one claim.
     let in_scope = without_overruled(&in_scope);
     brief.project = scope.project_match(&in_scope);
 
-    // Dead ends go first and only there (card #1484, D103): never again in
+    // Dead ends go first and only there (card #1484, D117): never again in
     // activity.
     let mut drafts = vec![scope_warnings_draft(&memories, &scope)];
     let mut rest: Vec<&Memory> = in_scope
@@ -305,7 +318,7 @@ pub fn build(store: &Store<'_>, request: &ContextRequest<'_>) -> Result<Outcome>
         .collect();
     if request.mode == Mode::Session {
         drafts.push(persona_draft(store)?);
-        drafts.push(reminders_draft(store, now)?);
+        drafts.push(reminders_draft(store, &mutes, now)?);
         drafts.push(pinned_draft(store, now));
         let shown: HashSet<&str> = rest.iter().map(|m| m.id.as_str()).collect();
         let reviews = reviews_draft(&memories, &shown, now);
@@ -316,7 +329,7 @@ pub fn build(store: &Store<'_>, request: &ContextRequest<'_>) -> Result<Outcome>
     drafts.extend(project_drafts(&rest, since, request.branch));
     if request.mode == Mode::Session {
         if let Some(prompt) = prompt {
-            drafts.push(hits_draft(store, prompt, &in_scope, now)?);
+            drafts.push(hits_draft(store, prompt, &in_scope, &mutes, now)?);
         }
     }
     fit(&mut brief, drafts)?;
@@ -638,10 +651,11 @@ fn persona_draft(store: &Store<'_>) -> Result<Draft> {
     })
 }
 
-fn reminders_draft(store: &Store<'_>, now: DateTime<Utc>) -> Result<Draft> {
+fn reminders_draft(store: &Store<'_>, mutes: &MuteSet, now: DateTime<Utc>) -> Result<Draft> {
     let horizon = now + Duration::days(REMINDER_DAYS);
     let items = crate::reminders::list_reminders(store, ReminderWindow::All, 50)?
         .iter()
+        .filter(|m| !mutes.covers(m))
         .filter_map(|m| {
             let due = m.remind_at.as_deref()?;
             let in_horizon = DateTime::parse_from_rfc3339(due).is_ok_and(|t| t <= horizon);
@@ -792,9 +806,9 @@ fn warnings_draft(found: crate::dead_ends::Found) -> Draft {
     }
 }
 
-/// The scope's dead ends, newest first, not windowed (D103). `memories` are
+/// The scope's dead ends, newest first, not windowed (D117). `memories` are
 /// already fit to show unasked; a dead end with no project holds everywhere,
-/// so it joins every scope (D102).
+/// so it joins every scope (D116).
 fn scope_warnings_draft(memories: &[Memory], scope: &Scope) -> Draft {
     let candidates: Vec<Memory> = memories
         .iter()
@@ -811,11 +825,12 @@ fn scope_warnings_draft(memories: &[Memory], scope: &Scope) -> Draft {
     warnings_draft(found)
 }
 
-/// The dead ends the prompt repeats, in the hook's project (D103).
+/// The dead ends the prompt repeats, in the hook's project (D117).
 fn prompt_warnings_draft(
     store: &Store<'_>,
     prompt: &str,
     project: Option<&str>,
+    mutes: &MuteSet,
     now: DateTime<Utc>,
 ) -> Result<Draft> {
     let request = crate::dead_ends::Request {
@@ -825,7 +840,7 @@ fn prompt_warnings_draft(
     };
     let found =
         crate::dead_ends::find(store, &request, crate::dead_ends::PROMPT_LIMIT, now, &|m| {
-            injectable(m, now)
+            injectable(m, now) && !mutes.covers(m)
         })?;
     Ok(warnings_draft(found))
 }
@@ -837,6 +852,7 @@ fn hits_draft(
     store: &Store<'_>,
     prompt: &str,
     rivals: &[&Memory],
+    mutes: &MuteSet,
     now: DateTime<Utc>,
 ) -> Result<Draft> {
     let input = MemorySearchInput {
@@ -848,7 +864,9 @@ fn hits_draft(
     let hits: Vec<&Memory> = results
         .iter()
         .map(|r| &r.memory)
-        .filter(|m| injectable(m, now) && !is_dead_end(m))
+        .filter(|m| {
+            injectable(m, now) && !is_dead_end(m) && !crate::mute::is_record(m) && !mutes.covers(m)
+        })
         .collect();
     let hit_ids: HashSet<&str> = hits.iter().map(|m| m.id.as_str()).collect();
     let mut contenders = hits.clone();

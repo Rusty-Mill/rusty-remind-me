@@ -25,7 +25,7 @@ pub fn get_decay_rate(category_or_type: &str) -> f64 {
     match category_or_type.to_lowercase().as_str() {
         "decision" => 0.02,
         "preference" => 0.03,
-        // A dead end stays dead (card #1484, D101): slow, like a preference.
+        // A dead end stays dead (card #1484, D115): slow, like a preference.
         "dead_end" => 0.03,
         "fact" => 0.05,
         "insight" => 0.07,

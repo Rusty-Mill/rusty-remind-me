@@ -506,10 +506,33 @@ pub fn search_response(res: &MemorySearchResponse, detail: SearchDetail) -> Stri
         Some(block) => format!("{block}\n\n{body}"),
         None => body,
     };
+    let body = match muted_note(res) {
+        Some(note) => format!("{body}\n\n{note}"),
+        None => body,
+    };
     match res.inferred_window.as_ref() {
         Some(w) => format!("{}\n\n{body}", window_note(w)),
         None => body,
     }
+}
+
+/// Which hits a mute covers, after them (card #1485): shown because the
+/// search asked, left out of briefs and hooks.
+fn muted_note(res: &MemorySearchResponse) -> Option<String> {
+    let ids: Vec<String> = res
+        .memories
+        .iter()
+        .map(|r| r.memory.id.as_str())
+        .filter(|id| res.muted.contains(*id))
+        .map(|id| format!("`{id}`"))
+        .collect();
+    if ids.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "_Muted (shown because you searched; left out of briefs): {}_",
+        ids.join(", ")
+    ))
 }
 
 /// The dead ends this query repeats, above the hits (card #1484).
@@ -737,6 +760,7 @@ pub fn compact_search_json(res: &MemorySearchResponse) -> serde_json::Value {
             .map(|w| serde_json::json!(w.cut(compact)))
             .collect();
     }
+    remind_me_core::mute::mark_hits(&mut value, &res.muted);
     value
 }
 
@@ -805,6 +829,7 @@ mod bootstrap_rendering {
             inferred_window: None,
             warnings: Vec::new(),
             warnings_omitted: 0,
+            muted: Default::default(),
             raw_fallback: false,
             dormant_excluded: 0,
             related_via_entities: None,
@@ -930,6 +955,7 @@ mod deadline_rendering {
             inferred_window: None,
             warnings: Vec::new(),
             warnings_omitted: 0,
+            muted: Default::default(),
             raw_fallback: false,
             dormant_excluded: 0,
             related_via_entities: None,
@@ -1078,6 +1104,7 @@ mod tier_rendering {
             inferred_window: None,
             warnings: Vec::new(),
             warnings_omitted: 0,
+            muted: Default::default(),
             raw_fallback: false,
             dormant_excluded,
             related_via_entities: None,

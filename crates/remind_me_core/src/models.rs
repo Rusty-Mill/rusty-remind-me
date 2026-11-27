@@ -2370,6 +2370,9 @@ pub struct DigestData {
     /// so a digest serialised before follow-ups existed still reads.
     #[serde(default)]
     pub reviews_due: Vec<DigestReview>,
+    /// Recent memories left out because a mute covers them (card #1485).
+    #[serde(default)]
+    pub muted_hidden: usize,
 }
 
 /// One decision due for review, as the digest lists it.

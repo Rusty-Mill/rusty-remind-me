@@ -58,6 +58,12 @@ pub(crate) fn add_memory_reviewing(
 ) -> Result<Memory> {
     let supersedes = input.supersedes.clone();
     check_dead_end_source(store, fields.memory_type.as_deref(), &input.metadata)?;
+    crate::mute::check_write(
+        store,
+        &input.category,
+        fields.memory_type.as_deref(),
+        &input.metadata,
+    )?;
     let add = PreparedAdd::new(input, fields, review)?;
     // With `supersedes`, one transaction: the insert, its index and every
     // retirement land together or not at all, and each target is checked
@@ -71,7 +77,7 @@ pub(crate) fn add_memory_reviewing(
     add.finish(store)
 }
 
-/// A dead end's `metadata.from` names a live memory (card #1484, D109):
+/// A dead end's `metadata.from` names a live memory (card #1484, D123):
 /// the decision or action item it came from. Other kinds are not checked.
 fn check_dead_end_source(
     store: &Store<'_>,
@@ -344,6 +350,18 @@ pub fn update_memory_with(
             .or(stored.memory_type.as_deref());
         check_dead_end_source(store, kind, metadata)?;
     }
+    // Filing a memory as a mute, or editing one, keeps it a valid mute
+    // (card #1485).
+    let category = input.category.as_deref().unwrap_or(&stored.category);
+    crate::mute::check_write(
+        store,
+        category,
+        fields
+            .memory_type
+            .as_deref()
+            .or(stored.memory_type.as_deref()),
+        metadata,
+    )?;
     // Only metadata this edit supplies: a stored value is never revalidated,
     // so an edit that leaves metadata alone cannot fail on it (pack D86).
     if let Some(supplied) = &client_metadata {
@@ -1370,7 +1388,7 @@ pub fn search_with_expansions(
     // an enormous one. A budget of 0 (unlimited) stays 0 here, which is right
     // — an unlimited search does not become limited by having a bootstrap.
     // Dead-end warnings spend from the budget next, like the bootstrap, and
-    // reserve at most a quarter of it (card #1484, D103).
+    // reserve at most a quarter of it (card #1484, D117).
     let found = search_warnings(store, input)?;
     let spent = bootstrap.as_ref().map_or(0, |b| b.tokens_used) + found.tokens;
     let hit_input;
@@ -1433,6 +1451,7 @@ pub fn search_with_expansions(
         inferred_window,
         warnings: found.warnings,
         warnings_omitted: found.omitted,
+        muted: muted_hits(store, input, &memories)?,
         memories,
         total_candidates: outcome.total_candidates,
         returned: outcome.returned,
@@ -1452,6 +1471,24 @@ pub fn search_with_expansions(
     Ok(response)
 }
 
+/// The ids of `hits` a mute in force covers (card #1485): global mutes,
+/// and those of the search's project.
+fn muted_hits(
+    store: &Store<'_>,
+    input: &MemorySearchInput,
+    hits: &[MemorySearchResult],
+) -> Result<std::collections::HashSet<String>> {
+    if hits.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let mutes = crate::mute::MuteSet::load(store, input.scope.project.as_deref(), None)?;
+    Ok(hits
+        .iter()
+        .filter(|r| mutes.covers(&r.memory))
+        .map(|r| r.memory.id.clone())
+        .collect())
+}
+
 /// A search's dead-end warnings and the tokens they spend.
 struct SearchWarnings {
     warnings: Vec<crate::dead_ends::Warning>,
@@ -1459,7 +1496,7 @@ struct SearchWarnings {
     tokens: usize,
 }
 
-/// The dead ends a search's query repeats (card #1484, D102-D103): at most
+/// The dead ends a search's query repeats (card #1484, D116-D117): at most
 /// [`crate::dead_ends::SEARCH_LIMIT`], within a quarter of the token budget
 /// (none dropped when it is unlimited). A listing (empty query) has none.
 fn search_warnings(store: &Store<'_>, input: &MemorySearchInput) -> Result<SearchWarnings> {
