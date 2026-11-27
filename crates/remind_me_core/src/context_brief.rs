@@ -917,8 +917,9 @@ fn ids<'a>(memories: &[&'a Memory]) -> HashSet<&'a str> {
     memories.iter().map(|m| m.id.as_str()).collect()
 }
 
-/// The prompt's search matches fit to show unasked, dead ends aside (they
-/// warn instead), best first.
+/// The prompt's search matches fit to show unasked, best first. Dead ends
+/// are left out inside the search, before its limits, so they never take a
+/// hit's place: they warn instead.
 fn prompt_hits(
     store: &Store<'_>,
     prompt: &str,
@@ -930,13 +931,13 @@ fn prompt_hits(
         limit: HIT_LIMIT * 2,
         ..MemorySearchInput::default()
     };
-    Ok(crate::db::queries::search_memories(store, &input)?
-        .into_iter()
-        .map(|r| r.memory)
-        .filter(|m| {
-            injectable(m, now) && !is_dead_end(m) && !crate::mute::is_record(m) && !mutes.covers(m)
-        })
-        .collect())
+    Ok(
+        crate::db::queries::search_memories_without_dead_ends(store, &input)?
+            .into_iter()
+            .map(|r| r.memory)
+            .filter(|m| injectable(m, now) && !crate::mute::is_record(m) && !mutes.covers(m))
+            .collect(),
+    )
 }
 
 /// The prompt's matches, less any that loses a conflict to another match or
