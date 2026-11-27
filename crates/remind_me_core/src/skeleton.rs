@@ -47,7 +47,7 @@ use crate::models::{
 };
 use crate::vitality::{calculate_vitality, get_decay_rate, get_source_prior, get_type_prior};
 use chrono::Utc;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Why a skeleton could not be written or read.
 #[derive(Debug)]
@@ -117,6 +117,72 @@ fn dialog_lines(content: &str) -> Vec<&str> {
     content.lines().collect()
 }
 
+/// Refuse the first node whose range is not inside a dialog of
+/// `line_count` lines.
+fn check_ranges(
+    nodes: &BTreeMap<String, (usize, usize)>,
+    line_count: usize,
+) -> Result<(), SkeletonError> {
+    for (node, &(start, end)) in nodes {
+        // `start == 0` is caught by the same check: ranges are 1-based, so a
+        // model that emitted 0-based offsets fails loudly on its first node
+        // rather than silently returning one line too many forever.
+        if start == 0 || start > end || end > line_count {
+            return Err(SkeletonError::BadRange {
+                node: node.clone(),
+                start,
+                end,
+                lines: line_count,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// How [`check_rebuilt`] checked a skeleton.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RangeCheck {
+    /// Every node addresses lines of the dialog it was checked against.
+    pub holds: bool,
+    /// It was checked against the replayed dialog; otherwise against the
+    /// live rows, because some row of the capture was not replayed.
+    pub replayed: bool,
+}
+
+/// Check `capture_id`'s skeleton by [`write_skeleton`]'s own range check
+/// (D133): against the whole dialog rebuilt from `replayed` (bodies by row
+/// id) when every dialog row of the capture is there, else against the
+/// live rows. `None` when the capture has no skeleton.
+pub(crate) fn check_rebuilt(
+    store: &Store<'_>,
+    capture_id: &str,
+    replayed: &HashMap<String, String>,
+) -> Result<Option<RangeCheck>, SkeletonError> {
+    let Some(skeleton) = read_skeleton(store, capture_id)? else {
+        return Ok(None);
+    };
+    let capture = get_capture(store, capture_id)?
+        .ok_or_else(|| SkeletonError::NoCapture(capture_id.to_string()))?;
+    let rows: Vec<&crate::models::Memory> = capture
+        .dialog
+        .iter()
+        .chain(capture.continuations())
+        .collect();
+    let rebuilt: Option<Vec<&str>> = rows
+        .iter()
+        .map(|m| replayed.get(&m.id).map(String::as_str))
+        .collect();
+    let (full, replayed) = match rebuilt {
+        Some(bodies) if !bodies.is_empty() => (
+            bodies.join(crate::transcript_placement::MESSAGE_SEPARATOR),
+            true,
+        ),
+        _ => (capture.full_dialog().unwrap_or_default(), false),
+    };
+    let holds = check_ranges(&skeleton.nodes, dialog_lines(&full).len()).is_ok();
+    Ok(Some(RangeCheck { holds, replayed }))
+}
+
 /// Store (or replace) a capture's skeleton.
 ///
 /// Replacing rather than appending: a capture has one shape, and a second
@@ -139,20 +205,7 @@ pub fn write_skeleton(
     // grown session appended after the first row.
     let full = capture.full_dialog().unwrap_or_default();
 
-    let line_count = dialog_lines(&full).len();
-    for (node, (start, end)) in &input.nodes {
-        // `start == 0` is caught by the same check: ranges are 1-based, so a
-        // model that emitted 0-based offsets fails loudly on its first node
-        // rather than silently returning one line too many forever.
-        if *start == 0 || start > end || *end > line_count {
-            return Err(SkeletonError::BadRange {
-                node: node.clone(),
-                start: *start,
-                end: *end,
-                lines: line_count,
-            });
-        }
-    }
+    check_ranges(&input.nodes, dialog_lines(&full).len())?;
 
     // Any previous skeleton goes first, so a replace cannot briefly leave two.
     let memories = Memories::new(store);

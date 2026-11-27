@@ -2,6 +2,25 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-27 — Dialog rebuild check (Mill Board #528, D133)
+
+### Added
+- `dialog_rebuild::check`: replays every live `memories` dialog row into a scratch dialog store and compares, read only. A row with an archived source span re-renders through the capture's own render, cut and scrub; its scratch row keeps the live id and capture id and must have the live canonical hash (D77). Rows with no span are counted as `not_replayable`. A replayed row the dialog store holds must hash the same there; one it lacks is counted. It also lists bodies a second scrub would change and skeletons with a node outside their dialog, using `write_skeleton`'s own range check. A skeleton is checked against the dialog rebuilt from the replayed rows when every row of its capture replayed, and against the live rows otherwise; `skeletons_replayed` and `skeletons_live_only` count each. Finally it lists derived memories whose `capture_id` names no live dialog. Links through `source_capture_id` (facts decomposed from a capture) are not validated, only counted as `source_capture_links_unchecked`.
+- The report names `REMIND_ME_REDACT` and `REMIND_ME_MESSAGE_TOOLS` as they are now, since no row records them at capture (Q36).
+- A row whose archived source holds a redaction and whose replay differs from the live row is listed in `redacted_source_differs`, not counted as a finding or as replayed. The capture rendered the raw text and then redacted it, but the archive is redacted before it is kept, so a cut (the `MAX_DIALOG_CHARS` cap, a `TOOL_INPUT_CHARS` tool preview) or a re-serialised value, such as a numeric card turned into a string, can land differently. A row with a redaction that replays the same is still replayed and compared.
+- `rusty-remind-me dialogs rebuild-check [--scratch DIR] [--keep]`: the scratch defaults to a fresh `rebuild-check-<time>` directory beside the database and is removed afterwards unless `--keep` is given or there are findings. An existing directory is refused. Because the scratch holds replayed conversation bodies and may be kept, it is created owner-only (0700, then checked) before anything is written into it. On platforms other than Unix the check is refused and nothing is created, because setting and checking a Windows ACL is not implemented.
+- `archive::span_bytes` reads only a span's own range of its archive blob, up to `MAX_SPAN_BYTES` (twice `MAX_TRANSCRIPT_BYTES`). A span that is inverted, outside its blob or over that bound is not read, and the rebuild check lists it under `unsupported_span` with the reason. Prints JSON and exits 1 on findings.
+
+- `by_kind`: memories by kind on both sides, every live memory and the rows the scratch rebuilt (D133 §4). It is a report only, never a finding. This slice rebuilds dialog rows only, so every other kind shows `rebuilt` 0 until the extraction slice.
+- `docs/handoff`: D133 (this slice's shape), D143 (redacted sources) and Q36, Q39.
+
+### Changed
+- **Compatibility:** `rusty-remind-me dialogs check`, added by #447, no longer opens the store itself or starts a daemon. It now needs the remind-me daemon already running, as `dialogs rebuild-check` does. With no daemon it exits 1 and reads and writes nothing. Opening the store runs housekeeping that writes, and these commands promise to be read only. This is the rule `decisions` dry runs already follow, and the refusal message now names any read-only command.
+
+### Tests
+- A first row with a redacted card number, its continuation and a skeleton replay clean, with a plain capture counted as not replayable; a transcript cut to `MAX_DIALOG_CHARS` replays with its cut; a changed `REMIND_ME_MESSAGE_TOOLS` is a mismatch, named, and keeps the scratch; an existing scratch is refused; CLI argument parsing.
+- A skeleton is judged on the replayed lines: a reply that shrinks on replay breaks a node that holds on the live lines. A capture with no source counts as `skeletons_live_only`, and a `source_capture_id` link is counted. Several rows share one synthetic archive and each reads only its range; out-of-blob and inverted spans are unsupported. A kept scratch is 0700, and on Windows the scratch is refused with nothing created. A cut row whose source holds a redaction is counted, not replayed.
+
 ## 2026-11-27 — Person-confirmed entity merge, with undo (Mill Board #567, D110-D114)
 
 ### Added

@@ -9,6 +9,7 @@ mod session;
 use daemon::Store;
 use remind_me_api::ApiServer;
 use remind_me_core::daemon::ops::{Op, TopicAction};
+use remind_me_core::dialog_rebuild::Report as RebuildReport;
 use remind_me_core::dialog_reconcile::Report as DialogReport;
 use remind_me_core::entity::Entity;
 use remind_me_core::entity_duplicates::{self, DuplicateCandidate};
@@ -1825,21 +1826,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", serde_json::to_string_pretty(&stats)?);
             }
             "dialogs" => {
-                let full = match parse_dialogs_args(&args[2..]) {
-                    Ok(full) => full,
+                let verb = match parse_dialogs_args(&args[2..]) {
+                    Ok(verb) => verb,
                     Err(message) => {
                         eprintln!("{message}");
                         std::process::exit(1);
                     }
                 };
-                let report: Option<DialogReport> =
-                    Store::open(&db_path)?.call(Op::DialogsCheck { full })?;
-                let Some(report) = report else {
-                    println!("no dialog store beside {}", db_path.display());
-                    return Ok(());
+                // Read only: only an already-running daemon. Starting one, or
+                // opening the store here, runs open-time housekeeping that
+                // writes.
+                let mut store = daemon::existing_daemon(&db_path)?;
+                let findings = match verb {
+                    DialogsVerb::Check { full } => {
+                        let report: Option<DialogReport> =
+                            daemon_plan(&mut store, Op::DialogsCheck { full })?;
+                        let Some(report) = report else {
+                            println!("no dialog store beside {}", db_path.display());
+                            return Ok(());
+                        };
+                        println!("{}", serde_json::to_string_pretty(&report)?);
+                        report.findings()
+                    }
+                    DialogsVerb::RebuildCheck { scratch, keep } => {
+                        // The daemon may run elsewhere: give it an absolute path.
+                        let scratch = scratch.map(std::path::absolute).transpose()?;
+                        let report: RebuildReport =
+                            daemon_plan(&mut store, Op::DialogsRebuildCheck { scratch, keep })?;
+                        println!("{}", serde_json::to_string_pretty(&report)?);
+                        report.findings()
+                    }
                 };
-                println!("{}", serde_json::to_string_pretty(&report)?);
-                if report.findings() > 0 {
+                if findings > 0 {
                     std::process::exit(1);
                 }
             }
@@ -1853,15 +1871,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-const DIALOGS_USAGE: &str = "usage: rusty-remind-me dialogs check [--full]";
+const DIALOGS_USAGE: &str = "usage: rusty-remind-me dialogs check [--full] | \
+                             dialogs rebuild-check [--scratch DIR] [--keep]";
 
-/// `dialogs check [--full]`: whether to re-hash every blob.
-fn parse_dialogs_args(args: &[String]) -> Result<bool, String> {
-    match args {
-        [check] if check == "check" => Ok(false),
-        [check, full] if check == "check" && full == "--full" => Ok(true),
-        _ => Err(DIALOGS_USAGE.to_string()),
+/// A `dialogs` subcommand.
+#[derive(Debug, PartialEq, Eq)]
+enum DialogsVerb {
+    /// `check [--full]`: `full` re-hashes every blob.
+    Check { full: bool },
+    /// `rebuild-check [--scratch DIR] [--keep]`.
+    RebuildCheck {
+        scratch: Option<PathBuf>,
+        keep: bool,
+    },
+}
+
+fn parse_dialogs_args(args: &[String]) -> Result<DialogsVerb, String> {
+    let usage = || DIALOGS_USAGE.to_string();
+    let (verb, rest) = args.split_first().ok_or_else(usage)?;
+    match (verb.as_str(), rest) {
+        ("check", []) => Ok(DialogsVerb::Check { full: false }),
+        ("check", [full]) if full == "--full" => Ok(DialogsVerb::Check { full: true }),
+        ("rebuild-check", _) => parse_rebuild_flags(rest).ok_or_else(usage),
+        _ => Err(usage()),
     }
+}
+
+/// `[--scratch DIR] [--keep]`, each at most once, in any order.
+fn parse_rebuild_flags(mut rest: &[String]) -> Option<DialogsVerb> {
+    let (mut scratch, mut keep) = (None, false);
+    while let Some((flag, tail)) = rest.split_first() {
+        rest = tail;
+        match flag.as_str() {
+            "--keep" if !keep => keep = true,
+            "--scratch" if scratch.is_none() => {
+                // Another option is a missing value, never a directory.
+                let (dir, tail) = rest.split_first().filter(|(d, _)| !d.starts_with("--"))?;
+                scratch = Some(PathBuf::from(dir));
+                rest = tail;
+            }
+            _ => return None,
+        }
+    }
+    Some(DialogsVerb::RebuildCheck { scratch, keep })
 }
 
 #[cfg(test)]
@@ -1889,11 +1941,40 @@ mod tests {
 
     #[test]
     fn dialogs_check_takes_an_optional_full_flag() {
-        assert_eq!(parse_dialogs_args(&args(&["check"])), Ok(false));
-        assert_eq!(parse_dialogs_args(&args(&["check", "--full"])), Ok(true));
+        let check = |full| Ok(DialogsVerb::Check { full });
+        assert_eq!(parse_dialogs_args(&args(&["check"])), check(false));
+        assert_eq!(parse_dialogs_args(&args(&["check", "--full"])), check(true));
         assert!(parse_dialogs_args(&args(&[])).is_err());
         assert!(parse_dialogs_args(&args(&["check", "--fast"])).is_err());
         assert!(parse_dialogs_args(&args(&["repair"])).is_err());
+    }
+
+    #[test]
+    fn dialogs_rebuild_check_takes_scratch_and_keep_once_each() {
+        let rebuild = |scratch: Option<&str>, keep| {
+            Ok(DialogsVerb::RebuildCheck {
+                scratch: scratch.map(PathBuf::from),
+                keep,
+            })
+        };
+        assert_eq!(
+            parse_dialogs_args(&args(&["rebuild-check"])),
+            rebuild(None, false)
+        );
+        assert_eq!(
+            parse_dialogs_args(&args(&["rebuild-check", "--keep", "--scratch", "s"])),
+            rebuild(Some("s"), true)
+        );
+        for bad in [
+            &["rebuild-check", "--scratch"][..],
+            &["rebuild-check", "--scratch", "--keep"],
+            &["rebuild-check", "--keep", "--scratch", "--full"],
+            &["rebuild-check", "--keep", "--keep"],
+            &["rebuild-check", "--scratch", "a", "--scratch", "b"],
+            &["rebuild-check", "--full"],
+        ] {
+            assert!(parse_dialogs_args(&args(bad)).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

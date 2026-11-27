@@ -71,7 +71,7 @@ pub fn last_findings() -> u64 {
 }
 
 /// The dialog file beside `store`'s database, if there is one.
-fn store_file(store: &Store<'_>) -> Option<PathBuf> {
+pub(crate) fn store_file(store: &Store<'_>) -> Option<PathBuf> {
     let file = dir_beside(store.path()?)?.join(DIALOGS_FILE);
     file.is_file().then_some(file)
 }
@@ -79,7 +79,7 @@ fn store_file(store: &Store<'_>) -> Option<PathBuf> {
 /// The row a `memories` dialog row would be in the store: what the shadow
 /// write appends (`dialog_shadow::record_memory`). The head is not part of
 /// the canonical hash, so it is left empty.
-fn as_record(m: &Memory) -> DialogRecord {
+pub(crate) fn as_record(m: &Memory) -> DialogRecord {
     DialogRecord {
         id: m.id.clone(),
         capture_id: m.capture_id.clone().unwrap_or_default(),

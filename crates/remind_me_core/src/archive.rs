@@ -314,6 +314,64 @@ pub fn source_for(
     }))
 }
 
+/// The largest span [`span_bytes`] reads. A transcript is bounded at
+/// [`crate::transcript::MAX_TRANSCRIPT_BYTES`] where it arrives, and its
+/// redacted archive may grow by its replacements, so twice that.
+pub(crate) const MAX_SPAN_BYTES: u64 = 2 * crate::transcript::MAX_TRANSCRIPT_BYTES as u64;
+
+/// What [`span_bytes`] read.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SpanRead {
+    /// The span's bytes, uncut.
+    Bytes(Vec<u8>),
+    /// No span is recorded, or its blob is gone.
+    Missing,
+    /// A span that is not read: inverted, outside its blob, or over
+    /// [`MAX_SPAN_BYTES`]. Says which.
+    Unsupported(String),
+}
+
+/// The span recorded for `memory_id`, reading only its own range of the
+/// archive blob. For internal checks (D133) only: it ignores `sensitive`,
+/// which [`source_for`], the read path, honours.
+pub(crate) fn span_bytes(store: &Store<'_>, memory_id: &str) -> Result<SpanRead, ArchiveError> {
+    use std::io::{Read, Seek, SeekFrom};
+    let Some(span) = Archives::new(store).span_source(memory_id)? else {
+        return Ok(SpanRead::Missing);
+    };
+    let mut file = match std::fs::File::open(&span.archive_path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(SpanRead::Missing),
+        Err(e) => return Err(e.into()),
+    };
+    let blob_len = file.metadata()?.len();
+    let (Ok(start), Ok(end)) = (u64::try_from(span.byte_start), u64::try_from(span.byte_end))
+    else {
+        return Ok(unsupported(&span, "negative offset"));
+    };
+    if start > end || end > blob_len {
+        return Ok(unsupported(
+            &span,
+            &format!("outside a {blob_len}-byte blob"),
+        ));
+    }
+    if end - start > MAX_SPAN_BYTES {
+        return Ok(unsupported(&span, &format!("over {MAX_SPAN_BYTES} bytes")));
+    }
+    file.seek(SeekFrom::Start(start))?;
+    // Bounded above, so the length fits in memory and in usize.
+    let mut bytes = vec![0; (end - start) as usize];
+    file.read_exact(&mut bytes)?;
+    Ok(SpanRead::Bytes(bytes))
+}
+
+fn unsupported(span: &SpanSource, why: &str) -> SpanRead {
+    SpanRead::Unsupported(format!(
+        "span {}..{} of {}: {why}",
+        span.byte_start, span.byte_end, span.import_id
+    ))
+}
+
 /// Drop an import's archive: its spans, its row, and its blob.
 ///
 /// Called from [`crate::undo_import`]. Undoing an import deletes the
@@ -487,4 +545,70 @@ fn distinct_bytes<'a>(rows: impl Iterator<Item = &'a Retained>) -> u64 {
     rows.filter(|r| seen.insert(r.hash.clone()))
         .map(|r| r.byte_len)
         .sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One synthetic archive blob and its row, with spans for `rows`.
+    fn shared_archive(
+        store: &Store<'_>,
+        dir: &std::path::Path,
+        bytes: &[u8],
+        rows: &[(&str, i64, i64)],
+    ) {
+        let path = dir.join("blob");
+        std::fs::write(&path, bytes).unwrap();
+        let archives = Archives::new(store);
+        archives
+            .record(&ArchiveRow {
+                import_id: "session:s".into(),
+                hash: "h".into(),
+                filename: "transcript.jsonl".into(),
+                archive_path: path.to_string_lossy().into_owned(),
+                byte_len: bytes.len() as i64,
+                archived_at: "2026-11-27T00:00:00Z".into(),
+            })
+            .unwrap();
+        for (id, start, end) in rows {
+            archives.record_span(id, "session:s", *start, *end).unwrap();
+        }
+    }
+
+    #[test]
+    fn rows_sharing_an_archive_each_read_only_their_range() {
+        let dir = std::env::temp_dir().join(format!("span_{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = crate::Database::open(dir.join("remind_me.db")).unwrap();
+        let store = db.store();
+        shared_archive(
+            &store,
+            &dir,
+            b"0123456789",
+            &[
+                ("mem_a", 0, 4),
+                ("mem_b", 4, 10),
+                ("mem_out", 6, 11),
+                ("mem_inv", 5, 2),
+            ],
+        );
+
+        assert_eq!(
+            span_bytes(&store, "mem_a").unwrap(),
+            SpanRead::Bytes(b"0123".to_vec())
+        );
+        assert_eq!(
+            span_bytes(&store, "mem_b").unwrap(),
+            SpanRead::Bytes(b"456789".to_vec())
+        );
+        for id in ["mem_out", "mem_inv"] {
+            assert!(
+                matches!(span_bytes(&store, id).unwrap(), SpanRead::Unsupported(_)),
+                "{id}"
+            );
+        }
+        assert_eq!(span_bytes(&store, "mem_none").unwrap(), SpanRead::Missing);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

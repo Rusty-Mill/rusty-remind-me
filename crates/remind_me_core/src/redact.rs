@@ -19,6 +19,9 @@ pub struct Redacted {
 /// Tag added to a memory whose content was redacted.
 pub const REDACTED_TAG: &str = "redacted";
 
+/// How every replacement starts: `[REDACTED:<kind>]`.
+pub const REDACTED_PREFIX: &str = "[REDACTED:";
+
 type Ranges = Vec<(usize, usize)>;
 type Rule = (&'static str, fn(&str) -> Ranges);
 
@@ -104,7 +107,7 @@ fn replace(text: &str, ranges: &[(usize, usize)], kind: &str) -> String {
     let mut at = 0;
     for &(start, end) in ranges {
         out.push_str(&text[at..start]);
-        out.push_str(&format!("[REDACTED:{kind}]"));
+        out.push_str(&format!("{REDACTED_PREFIX}{kind}]"));
         at = end;
     }
     out.push_str(&text[at..]);
