@@ -13,6 +13,7 @@ use remind_me_core::capture::auto_capture;
 use remind_me_core::db::memories::{Memories, NewMemory};
 use remind_me_core::dialog_rebuild::check;
 use remind_me_core::dialog_shadow::ENV as SHADOW_ENV;
+use remind_me_core::importer::TOOL_INPUT_CHARS;
 use remind_me_core::skeleton::write_skeleton;
 use remind_me_core::transcript::{
     capture_transcript, TranscriptRequest, MAX_DIALOG_CHARS, MESSAGE_TOOLS_ENV,
@@ -74,10 +75,28 @@ fn posted(n: usize, body: &str) -> String {
     )
 }
 
+/// An assistant turn that runs `command` through Bash: a capture keeps a
+/// preview of its first `TOOL_INPUT_CHARS`.
+fn bash(n: usize, command: &str) -> String {
+    line(
+        n,
+        "assistant",
+        serde_json::json!([{
+            "type": "tool_use",
+            "name": "Bash",
+            "input": { "command": command },
+        }]),
+    )
+}
+
 fn capture(db: &Database, lines: &[String]) -> String {
+    capture_as(db, "sess_rebuild", lines)
+}
+
+fn capture_as(db: &Database, session_id: &str, lines: &[String]) -> String {
     let raw = lines.join("\n") + "\n";
     let request = TranscriptRequest {
-        session_id: "sess_rebuild",
+        session_id,
         cwd: None,
         reason: Some("stop"),
         context: None,
@@ -201,6 +220,31 @@ fn a_cut_row_whose_source_was_redacted_is_counted_not_replayed() {
 
     assert_eq!(report.findings(), 0, "{report:?}");
     assert_eq!((report.replayed, report.cut_after_redaction), (0, 1));
+    done(&dir);
+}
+
+#[test]
+fn a_cut_tool_preview_whose_argument_was_redacted_is_counted_not_replayed() {
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (dir, db) = fresh("preview_redacted");
+    // The card falls inside the preview; its replacement has another length,
+    // so the archived (redacted) argument would cut elsewhere.
+    let tail = "z".repeat(TOOL_INPUT_CHARS);
+    capture(
+        &db,
+        &[text(1, "user", "run it"), bash(2, &format!("echo {CARD} {tail}"))],
+    );
+    // A long command with no redaction still replays.
+    capture_as(
+        &db,
+        "sess_plain",
+        &[text(1, "user", "run it"), bash(2, &format!("echo {tail} {tail}"))],
+    );
+
+    let report = check(&db.store(), Some(&dir.join("scratch")), false).unwrap();
+
+    assert_eq!(report.findings(), 0, "{report:?}");
+    assert_eq!((report.replayed, report.cut_after_redaction), (1, 1));
     done(&dir);
 }
 

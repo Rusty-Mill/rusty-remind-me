@@ -449,9 +449,12 @@ fn render_dialog(messages: &[ChatMessage], message_tools: &MessageTools) -> Stri
 /// [`MAX_DIALOG_CHARS`]), a continuation as a recapture does (uncut), both
 /// scrubbed as they were when written.
 ///
-/// `None` for a first row that is cut when its source holds a redaction: the
-/// capture cut the raw text and then redacted it, but the archive was
-/// redacted first, so a replacement of another length moves the cut.
+/// `None` when a cut meets a redaction: the capture cut the raw text and
+/// then redacted it, but the archive was redacted first, so a replacement of
+/// another length moves the cut. That is a first row cut to
+/// [`MAX_DIALOG_CHARS`] whose source holds a redaction, or any row with a
+/// tool preview cut to [`crate::importer::TOOL_INPUT_CHARS`] whose argument
+/// holds one.
 pub(crate) fn replay_row(span: &str, continuation: bool, tools: &MessageTools) -> Option<String> {
     let messages = messages_of(span);
     let text = if continuation {
@@ -466,8 +469,21 @@ pub(crate) fn replay_row(span: &str, continuation: bool, tools: &MessageTools) -
     if text.starts_with(TRUNCATION_MARKER) && span.contains(crate::redact::REDACTED_PREFIX) {
         return None;
     }
+    if messages.iter().any(|m| preview_cut_after_redaction(m, tools)) {
+        return None;
+    }
     let (mut tags, mut metadata) = (Vec::new(), serde_json::json!({}));
     Some(crate::boundary::scrub(&text, &mut tags, &mut metadata))
+}
+
+/// Whether a tool line of `message` shows a preview cut from an argument
+/// that holds a redaction (see [`replay_row`]).
+fn preview_cut_after_redaction(message: &ChatMessage, tools: &MessageTools) -> bool {
+    message.tool_use.iter().any(|call| {
+        tools.posted(call).is_none()
+            && call.input_cut()
+            && call.main_argument().contains(crate::redact::REDACTED_PREFIX)
+    })
 }
 
 impl TranscriptSummary {
