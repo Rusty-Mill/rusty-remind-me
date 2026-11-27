@@ -180,14 +180,15 @@ class RemindMeProvider(MemoryProvider):  # type: ignore[misc,valid-type]
         kept = rm.transcript(messages)
         if not kept:
             return
+        session = rm.session_key(self._client_id, self._session_id)
         try:
             if self._settings.remote:
-                args = rm.capture_arguments(self._client_id, self._session_id, kept)
+                args = rm.capture_arguments(self._client_id, session, kept)
                 client = self._client()
                 if client is not None:
                     client.call("remind_me_auto_capture", args)
             else:
-                rm.capture_local(self._settings.command, self._client_id, self._session_id, kept)
+                rm.capture_local(self._settings.command, self._client_id, session, kept)
         except rm.RemindMeError as e:
             log.warning("remind-me: capture: %s", e)
 

@@ -61,6 +61,9 @@ failure is logged.
   ID --reason end` reads `[{role, text}]` on stdin. It is stored like a
   Claude Code hook capture, one per session; a second capture of the same
   session replaces the first.
+- Either way the session is keyed `<client>:<hermes session id>`
+  (`hermes-jarvis:abc`), so two profiles that reuse a session id keep their
+  own captures (D133).
 - Remote: `remind_me_auto_capture` with the conversation and a mechanical
   summary, tagged `hermes` and the client id.
 

@@ -62,3 +62,20 @@ fn a_bad_list_stores_nothing() {
         0
     );
 }
+
+#[test]
+fn distinct_clients_with_one_session_id_keep_their_own_captures() {
+    // The Hermes plugin keys a capture `<client>:<session>` (D133).
+    let db = db("clients");
+    let store = db.store();
+    let list = r#"[{"role":"user","text":"what is a quokka"}]"#;
+    let jarvis = capture_messages(&store, list, "hermes-jarvis:s1", None, Some("end")).unwrap();
+    let gateway = capture_messages(&store, list, "hermes-gw:s1", None, Some("end")).unwrap();
+    assert_ne!(jarvis["capture_id"], gateway["capture_id"]);
+
+    let grown = r#"[{"role":"user","text":"what is a quokka"},{"role":"assistant","text":"a small wallaby"}]"#;
+    let again = capture_messages(&store, grown, "hermes-jarvis:s1", None, Some("end")).unwrap();
+    assert_eq!(again["capture_id"], jarvis["capture_id"]);
+    let gw_rows = remind_me_core::episodes::session_memories(&store, "hermes-gw:s1").unwrap();
+    assert!(gw_rows.iter().all(|m| !m.content.contains("wallaby")));
+}

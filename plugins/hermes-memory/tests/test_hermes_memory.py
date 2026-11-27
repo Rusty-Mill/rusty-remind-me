@@ -208,6 +208,19 @@ class ProviderTest(unittest.TestCase):
         self.assertEqual(args["conversation"], "system: be nice\n\nuser: ship it?\n\nassistant: yes")
         self.assertIn("Opened with: ship it?", args["summary"])
         self.assertEqual(args["tags"], ["hermes", "hermes-gw"])
+        self.assertEqual(args["metadata"]["session_id"], "hermes-gw:sess-1")
+
+    def test_local_capture_keys_the_session_by_client(self) -> None:
+        seen: list[tuple[str, str]] = []
+        original = rm.capture_local
+        rm.capture_local = lambda command, client, session, kept: seen.append((client, session)) or ""
+        try:
+            for identity in ("jarvis", "gw"):
+                p = provider_with(self.t, rm.Settings(), agent_identity=identity)
+                p.on_session_end([{"role": "user", "content": "hi"}])
+        finally:
+            rm.capture_local = original
+        self.assertEqual(seen, [("hermes-jarvis", "hermes-jarvis:sess-1"), ("hermes-gw", "hermes-gw:sess-1")])
 
     def test_subagents_and_empty_sessions_do_not_capture(self) -> None:
         p = provider_with(self.t, rm.Settings(url="https://a/mcp", token="t"), agent_context="subagent")

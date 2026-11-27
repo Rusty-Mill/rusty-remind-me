@@ -364,6 +364,13 @@ def _content_text(content: object) -> str:
     return ""
 
 
+def session_key(client: str, session_id: str) -> str:
+    """The session id a capture is stored under: qualified by the client, so
+    two profiles that reuse a Hermes session id never replace each other's
+    capture (D133)."""
+    return f"{client}:{session_id}"
+
+
 def capture_local(command: str, client: str, session_id: str, messages: Sequence[Message]) -> str:
     """Capture through `rusty-remind-me capture-transcript --format messages`:
     one capture per session, replaced in place, labelled as a machine capture."""
