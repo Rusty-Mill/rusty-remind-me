@@ -217,13 +217,10 @@ fn observe(
     let settled_before = (now - Duration::minutes(i64::from(settings.idle_minutes))).to_rfc3339();
     // One capture writes a dialog and a summary under one `capture_id` (and
     // a continued transcript may add more), so count distinct captures, not
-    // rows: the threshold is in sessions.
-    let settled_backlog = curation
-        .undecomposed(usize::MAX, Some(&settled_before))?
-        .into_iter()
-        .map(|row| row.capture_id)
-        .collect::<std::collections::HashSet<_>>()
-        .len() as u64;
+    // rows: the threshold is in sessions. The count is a projection over ids
+    // and times, so a status read never loads transcript bodies.
+    let settled_backlog =
+        u64::try_from(curation.count_settled_captures(Some(&settled_before))?).unwrap_or(0);
     let last_capture_at = curation
         .capture_activity()?
         .last_capture_at

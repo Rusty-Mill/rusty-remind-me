@@ -33,13 +33,66 @@ pub(crate) fn tags(row: &MemoryRow) -> Vec<String> {
 /// the fact itself, else its own `created_at`. A marker that is not a time,
 /// or lies in the fact's future, was never validated and is ignored.
 fn drawn_from(row: &MemoryRow) -> String {
+    drawn_at(&row.metadata, &row.created_at)
+}
+
+/// [`drawn_from`] over the two columns it reads.
+pub(crate) fn drawn_at(metadata: &str, created_at: &str) -> String {
     let parse = |raw: &str| chrono::DateTime::parse_from_rfc3339(raw.trim()).ok();
-    serde_json::from_str::<serde_json::Value>(&row.metadata)
+    serde_json::from_str::<serde_json::Value>(metadata)
         .ok()
         .and_then(|m| parse(m.get("capture_revision")?.as_str()?))
-        .filter(|at| parse(&row.created_at).is_some_and(|created| *at <= created))
+        .filter(|at| parse(created_at).is_some_and(|created| *at <= created))
         .map(|at| at.with_timezone(&chrono::Utc).to_rfc3339())
-        .unwrap_or_else(|| row.created_at.clone())
+        .unwrap_or_else(|| created_at.to_string())
+}
+
+/// A fact's `source_capture_id` and [`drawn_at`] revision.
+pub(crate) type FactStamp = (String, String);
+/// A live, not-derived capture row's `capture_id` and `updated_at`.
+pub(crate) type CaptureStamp = (String, String);
+
+/// What the settled-capture count reads from a row: nothing but ids and
+/// times, so no body, tags or revision is carried past this point.
+pub(crate) enum Stamp {
+    Fact(FactStamp),
+    Capture(CaptureStamp),
+}
+
+/// The [`Stamp`] row `row` contributes to the settled-capture count, if any.
+pub(crate) fn stamp(row: &MemoryRow) -> Option<Stamp> {
+    if let Some(source) = &row.source_capture_id {
+        return Some(Stamp::Fact((source.clone(), drawn_from(row))));
+    }
+    let capture = row
+        .capture_id
+        .as_ref()
+        .filter(|_| row.deleted_at.is_none())?;
+    Some(Stamp::Capture((capture.clone(), row.updated_at.clone())))
+}
+
+/// How many distinct captures [`undecomposed_rows_in`] lists rows for: the
+/// same eligibility (live, not derived, needing decomposition, last changed
+/// at or before `settled_before`), counted by `capture_id` without sorting
+/// or holding rows.
+pub(crate) fn count_settled_captures(
+    facts: impl Iterator<Item = FactStamp>,
+    captures: impl Iterator<Item = CaptureStamp>,
+    settled_before: Option<&str>,
+) -> usize {
+    let mut decomposed: HashMap<String, String> = HashMap::new();
+    for (capture, at) in facts {
+        let slot = decomposed.entry(capture).or_default();
+        if at > *slot {
+            *slot = at;
+        }
+    }
+    captures
+        .filter(|(_, updated)| settled_before.is_none_or(|cutoff| updated.as_str() <= cutoff))
+        .filter(|(capture, updated)| decomposed.get(capture).is_none_or(|at| updated > at))
+        .map(|(capture, _)| capture)
+        .collect::<HashSet<_>>()
+        .len()
 }
 
 /// Up to which revision each capture has been decomposed: the newest
@@ -291,6 +344,22 @@ impl CurationStore for EngineTables {
         Ok(count(
             undecomposed_rows(core_ref(self)?, settled_before).len(),
         ))
+    }
+
+    fn count_settled_captures(&self, settled_before: Option<&str>) -> Result<i64> {
+        let (mut facts, mut captures) = (Vec::new(), Vec::new());
+        for row in memories::rows(core_ref(self)?) {
+            match stamp(&row) {
+                Some(Stamp::Fact(f)) => facts.push(f),
+                Some(Stamp::Capture(c)) => captures.push(c),
+                None => {}
+            }
+        }
+        Ok(count(count_settled_captures(
+            facts.into_iter(),
+            captures.into_iter(),
+            settled_before,
+        )))
     }
 
     fn capture_activity(&self) -> Result<CaptureActivity> {

@@ -8,8 +8,8 @@ use crate::db::curation::{
     Backlog, CaptureActivity, CaptureRow, CurationStore, ImportRow, NormalizationSource,
 };
 use crate::db::engine::curation::{
-    capture_revisions, pairs_in, same_claim, same_project, standing_decision, tags,
-    undecomposed_rows_in, unnormalized_in,
+    capture_revisions, count_settled_captures, drawn_at, pairs_in, same_claim, same_project,
+    standing_decision, tags, undecomposed_rows_in, unnormalized_in,
 };
 use crate::db::engine::memories::MemoryRow;
 use crate::db::{Result, StoreError};
@@ -105,6 +105,30 @@ impl CurationStore for SqliteTables {
         Ok(count(
             SqliteTables::undecomposed(self, settled_before)?.len(),
         ))
+    }
+
+    fn count_settled_captures(&self, settled_before: Option<&str>) -> Result<i64> {
+        // Only the columns the rule reads: no content, tags or full rows.
+        let facts: Vec<(String, String)> = self.all(
+            "SELECT source_capture_id, metadata, created_at FROM memories \
+             WHERE source_capture_id IS NOT NULL",
+            [],
+            |r| {
+                let (metadata, created_at): (String, String) = (r.get(1)?, r.get(2)?);
+                Ok((r.get(0)?, drawn_at(&metadata, &created_at)))
+            },
+        )?;
+        let captures: Vec<(String, String)> = self.all(
+            "SELECT capture_id, updated_at FROM memories WHERE capture_id IS NOT NULL \
+             AND source_capture_id IS NULL AND deleted_at IS NULL",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok(count(count_settled_captures(
+            facts.into_iter(),
+            captures.into_iter(),
+            settled_before,
+        )))
     }
 
     fn capture_activity(&self) -> Result<CaptureActivity> {

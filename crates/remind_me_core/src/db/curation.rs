@@ -84,6 +84,11 @@ pub trait CurationStore {
     /// How many captures [`CurationStore::undecomposed`] would list.
     fn count_undecomposed(&self, settled_before: Option<&str>) -> Result<i64>;
 
+    /// How many distinct `capture_id`s [`CurationStore::undecomposed`]
+    /// would list rows for: sessions, not rows. A projection over ids and
+    /// times; it reads no bodies and builds no [`CaptureRow`].
+    fn count_settled_captures(&self, settled_before: Option<&str>) -> Result<i64>;
+
     /// How many distinct live captures there are, and the newest one's
     /// `created_at`.
     fn capture_activity(&self) -> Result<CaptureActivity>;
@@ -170,6 +175,11 @@ impl<'c> Curation<'c> {
     /// See [`CurationStore::count_undecomposed`].
     pub fn count_undecomposed(&self, settled_before: Option<&str>) -> Result<i64> {
         CurationStore::count_undecomposed(&*self.backend.lock()?, settled_before)
+    }
+
+    /// See [`CurationStore::count_settled_captures`].
+    pub fn count_settled_captures(&self, settled_before: Option<&str>) -> Result<i64> {
+        CurationStore::count_settled_captures(&*self.backend.lock()?, settled_before)
     }
 
     /// See [`CurationStore::capture_activity`].
@@ -544,6 +554,74 @@ pub mod conformance {
         );
     }
 
+    /// The settled-capture count matches the distinct `capture_id`s of
+    /// [`CurationStore::undecomposed`] on a corpus with every case it must
+    /// tell apart.
+    pub fn settled_capture_count_matches_the_undecomposed_list<S: CurationStore + MemoryStore>(
+        store: &mut S,
+    ) {
+        const OLD: &str = "2026-09-25T00:00:00+00:00";
+        let big = "x".repeat(1 << 20);
+        let capture = |id: &str, cap: &str, at: &str, content: &str| NewMemory {
+            capture_id: Some(cap.to_string()),
+            updated_at: at.to_string(),
+            ..NewMemory::new(id, content, OLD)
+        };
+        let rows = vec![
+            // One session, two rows (dialog and summary), one of them large.
+            capture("dup_d", "dup", OLD, &big),
+            capture("dup_s", "dup", OLD, "summary"),
+            capture("solo", "solo", OLD, "x"),
+            // Changed after the cutoff: not settled.
+            capture("fresh", "fresh", T2, "x"),
+            // Decomposed, and unchanged since.
+            capture("done", "done", OLD, &big),
+            NewMemory {
+                source_capture_id: Some("done".to_string()),
+                ..NewMemory::new("done_fact", "f", NOW)
+            },
+            // Decomposed, then recaptured: due again.
+            capture("again", "again", NOW, "x"),
+            NewMemory {
+                source_capture_id: Some("again".to_string()),
+                ..NewMemory::new("again_fact", "f", OLD)
+            },
+            // Deleted.
+            NewMemory {
+                deleted_at: Some(OLD.to_string()),
+                ..capture("gone", "gone", OLD, "x")
+            },
+        ];
+        for row in &rows {
+            MemoryStore::insert(store, row).unwrap();
+        }
+
+        for cutoff in [None, Some(NOW), Some(OLD)] {
+            let listed: std::collections::BTreeSet<String> =
+                CurationStore::undecomposed(store, usize::MAX, cutoff)
+                    .unwrap()
+                    .into_iter()
+                    .map(|row| row.capture_id)
+                    .collect();
+            let counted = CurationStore::count_settled_captures(store, cutoff).unwrap();
+            assert_eq!(
+                counted,
+                listed.len() as i64,
+                "cutoff {cutoff:?}: {listed:?}"
+            );
+        }
+        assert_eq!(
+            CurationStore::count_settled_captures(store, Some(NOW)).unwrap(),
+            3,
+            "dup, solo and again"
+        );
+        assert_eq!(
+            CurationStore::count_settled_captures(store, None).unwrap(),
+            4,
+            "and fresh"
+        );
+    }
+
     pub fn contradiction_pairs_page_by_keyset<S: CurationStore + MemoryStore + EntityStore>(
         store: &mut S,
     ) {
@@ -592,6 +670,10 @@ macro_rules! curation_conformance {
         #[test]
         fn an_import_leaves_the_backlog_once_normalized() {
             conformance::an_import_leaves_the_backlog_once_normalized(&mut $make);
+        }
+        #[test]
+        fn settled_capture_count_matches_the_undecomposed_list() {
+            conformance::settled_capture_count_matches_the_undecomposed_list(&mut $make);
         }
         #[test]
         fn contradiction_pairs_page_by_keyset() {
