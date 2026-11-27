@@ -65,15 +65,29 @@ fn partial_of(path: &Path) -> PathBuf {
 /// Flush the directory `dir`, so the entries it holds survive a power loss.
 /// A no-op where directories cannot be synced.
 #[cfg(unix)]
-fn sync_dir(dir: &Path) -> Result<()> {
+pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
     std::fs::File::open(dir)
         .and_then(|d| d.sync_all())
         .map_err(io_error(dir))
 }
 
 #[cfg(not(unix))]
-fn sync_dir(_dir: &Path) -> Result<()> {
+pub(crate) fn sync_dir(_dir: &Path) -> Result<()> {
     Ok(())
+}
+
+/// Create the staging directory `partial`. Its parent (the destination's)
+/// must already exist: it is the durable anchor, and creating it here would
+/// leave a new directory entry that no flush covers.
+fn make_staging(partial: &Path) -> Result<()> {
+    let parent = partial.parent().filter(|p| !p.as_os_str().is_empty());
+    if !parent.unwrap_or(Path::new(".")).is_dir() {
+        return Err(StoreError::Invalid(format!(
+            "{}: the destination's directory must already exist",
+            partial.display()
+        )));
+    }
+    std::fs::create_dir(partial).map_err(io_error(partial))
 }
 
 /// Rename the finished `partial` to `dest` durably: flush `partial`'s own
@@ -114,7 +128,9 @@ fn verified_blob(blobs: &BlobStore, id: &str, hash: &str) -> Result<Vec<u8>> {
 /// # Errors
 ///
 /// [`StoreError`] if `dest` exists, the store cannot be read, a row's blob
-/// is missing or corrupt, or a file cannot be written. Nothing is left at
+/// is missing or corrupt, or a file cannot be written;
+/// [`StoreError::Invalid`] if `dest`'s parent directory does not exist (it
+/// is not created here, see [`publish`]). Nothing is left at
 /// `dest` on error, with one exception: if the final flush of `dest`'s
 /// parent fails, the complete package is already at `dest` and the error
 /// says so.
@@ -129,7 +145,7 @@ pub fn create(store_dir: &Path, dest: &Path) -> Result<u64> {
     if partial.exists() {
         std::fs::remove_dir_all(&partial).map_err(io_error(&partial))?;
     }
-    std::fs::create_dir_all(&partial).map_err(io_error(&partial))?;
+    make_staging(&partial)?;
     let rows = fill(store_dir, &partial).inspect_err(|_| {
         // Best effort: a leftover `.partial` never lists as a package and
         // is cleared by the next run, so the original error is the one kept.
@@ -229,7 +245,8 @@ pub fn verify(package: &Path) -> Result<u64> {
 ///
 /// # Errors
 ///
-/// [`StoreError::Invalid`] if `store_dir` exists or the package fails
+/// [`StoreError::Invalid`] if `store_dir` exists, its parent directory does
+/// not, or the package fails
 /// [`verify`]; otherwise the filesystem's error. Nothing is left at
 /// `store_dir` on error, with the same exception as [`create`]: if the final
 /// flush of its parent fails, the checked store is already in place and the
@@ -247,7 +264,7 @@ pub fn restore(package: &Path, store_dir: &Path) -> Result<u64> {
     if partial.exists() {
         std::fs::remove_dir_all(&partial).map_err(io_error(&partial))?;
     }
-    std::fs::create_dir_all(&partial).map_err(io_error(&partial))?;
+    make_staging(&partial)?;
     let restored = put_back(package, &partial, &manifest).inspect_err(|_| {
         // Best effort, as in `create`: the original error is the one kept.
         let _ = std::fs::remove_dir_all(&partial);
@@ -363,6 +380,27 @@ mod tests {
         ));
         assert!(!package.exists());
         assert!(!partial_of(&package).exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_missing_destination_parent_is_refused_not_created() {
+        let root = scratch("noparent");
+        let store = store_with_dialogs(&root);
+        let package = root.join("absent").join("b.dialogs");
+        assert!(matches!(
+            create(&store, &package),
+            Err(StoreError::Invalid(_))
+        ));
+        assert!(!root.join("absent").exists());
+        let good = root.join("b.dialogs");
+        create(&store, &good).unwrap();
+        let restored = root.join("absent").join("restored");
+        assert!(matches!(
+            restore(&good, &restored),
+            Err(StoreError::Invalid(_))
+        ));
+        assert!(!root.join("absent").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 

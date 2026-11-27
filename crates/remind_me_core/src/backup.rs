@@ -262,7 +262,12 @@ fn package_dialogs(store: &Store<'_>, dir: &Path, stem: &str) -> DialogPackage {
         return DialogPackage::NoStore;
     }
     let dest = dir.join(format!("{stem}.{}", crate::dialog_backup::EXTENSION));
-    match crate::dialog_backup::create(&source, &dest) {
+    // `backups/` may have been created by this run: flush the directory
+    // holding it, so a published package cannot vanish with it.
+    let anchor = dir.parent().filter(|p| !p.as_os_str().is_empty());
+    let published = crate::dialog_backup::sync_dir(anchor.unwrap_or(Path::new(".")))
+        .and_then(|()| crate::dialog_backup::create(&source, &dest));
+    match published {
         Ok(dialogs) => DialogPackage::Written {
             path: dest.to_string_lossy().to_string(),
             dialogs,
