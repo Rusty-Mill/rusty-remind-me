@@ -93,14 +93,14 @@ pub(crate) fn as_record(m: &Memory) -> DialogRecord {
 }
 
 /// The state of a row's blob.
-enum Blob {
+pub(crate) enum Blob {
     Intact,
     Missing,
     Mismatch,
 }
 
 /// The state of `r`'s blob at `depth`.
-fn blob_state(blobs: &BlobStore, r: &DialogRecord, depth: Depth) -> Result<Blob> {
+pub(crate) fn blob_state(blobs: &BlobStore, r: &DialogRecord, depth: Depth) -> Result<Blob> {
     let io = |e: std::io::Error| StoreError::Engine(format!("dialog blob {}: {e}", r.body_hash));
     match depth {
         Depth::Quick => match std::fs::metadata(blobs.path(&r.body_hash)) {

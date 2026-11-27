@@ -144,6 +144,8 @@ pub enum Op {
         scratch: Option<PathBuf>,
         keep: bool,
     },
+    /// Dry run of the dialog backfill; see [`crate::dialog_backfill`].
+    DialogsBackfill,
     /// The session subcommands (`crate::session_ops`). Paths are absolute.
     SessionStart {
         session_id: String,
@@ -425,6 +427,7 @@ fn run(store: &Store<'_>, op: &Op) -> Result<Value, String> {
             };
             to_value(crate::dialog_reconcile::check(store, depth))
         }
+        Op::DialogsBackfill => to_value(crate::dialog_backfill::plan(store)),
         Op::DialogsRebuildCheck { scratch, keep } => to_value(crate::dialog_rebuild::check(
             store,
             scratch.as_deref(),
