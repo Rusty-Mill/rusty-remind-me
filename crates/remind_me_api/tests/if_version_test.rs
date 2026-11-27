@@ -51,6 +51,17 @@ fn a_memory_update_with_a_stale_version_is_409_and_writes_nothing() {
         &json!({"content": "x", "if_version": "nope"}).to_string(),
     );
     assert_eq!(bad.status, 400);
+    let wrong_type = authed_json(
+        &server,
+        "PATCH",
+        &path,
+        &json!({"content": "x", "if_version": 123}).to_string(),
+    );
+    assert_eq!(
+        wrong_type.status, 400,
+        "a non-string precondition is refused"
+    );
+    assert_eq!(authed_get(&server, &path).json()["content"], "thursdays");
     std::fs::remove_dir_all(&root).unwrap();
 }
 

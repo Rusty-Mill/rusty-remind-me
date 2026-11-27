@@ -3252,10 +3252,8 @@ impl McpServer {
                         // `slug` argument is still tolerated as the title when
                         // none is given, so an older caller is not broken.
                         let title = if title.is_empty() { slug } else { title };
-                        let expect = remind_me_core::version::Expect::parse(
-                            args.get("if_version").and_then(|v| v.as_str()),
-                            true,
-                        );
+                        let expect = remind_me_core::version::field(&args)
+                            .and_then(|raw| remind_me_core::version::Expect::parse(raw, true));
                         let written = expect.as_ref().map(|expect| {
                             self.wiki.write_page_if(
                                 &store,
@@ -3314,7 +3312,11 @@ impl McpServer {
                                 body["new_evidence"] = json!(staleness.new_evidence);
                                 json!({ "content": [{ "type": "text", "text": match format {
     ResponseFormat::Json => serde_json::to_string_pretty(&body).unwrap(),
-    ResponseFormat::Markdown => render::wiki_page(&page, &staleness),
+    ResponseFormat::Markdown => format!(
+        "{}\n\nversion: `{}`",
+        render::wiki_page(&page, &staleness),
+        body["version"].as_str().unwrap_or_default()
+    ),
 } }] })
                             }
                             Ok(None) => {

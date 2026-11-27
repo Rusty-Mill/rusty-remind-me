@@ -287,7 +287,7 @@ fn set(store: &Store<'_>, args: &Value) -> Result<Value> {
 
 /// The optional `if_version` precondition on `set` and `revert` (#1487).
 fn if_version(args: &Value) -> Result<Option<Expect>> {
-    Expect::parse(text(args, "if_version").as_deref(), false)
+    Expect::parse(crate::version::field(args)?, false)
 }
 
 fn revert(store: &Store<'_>, args: &Value) -> Result<Value> {

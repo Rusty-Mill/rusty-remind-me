@@ -75,9 +75,10 @@ fn with_version(value: impl serde::Serialize, version: String) -> (u16, Body) {
     (200, Body::Json(body))
 }
 
-/// The optional `if_version` body field, as a string.
-fn if_version(body: &Value) -> Option<&str> {
-    body.get("if_version").and_then(Value::as_str)
+/// The optional `if_version` body field, or the 400 for one that is not a
+/// string.
+fn if_version(body: &Value) -> Result<Option<&str>, (u16, Body)> {
+    remind_me_core::version::field(body).map_err(|e| err(400, e.to_string()))
 }
 
 /// Parse the request body as JSON, or `Err` with the 400 response to send.
@@ -439,6 +440,10 @@ pub fn api_update(store: &Store<'_>, _wiki: &Wiki, req: &Request, params: &Param
         Ok(b) => b,
         Err(e) => return e,
     };
+    let raw_version = match if_version(&body) {
+        Ok(raw) => raw,
+        Err(e) => return e,
+    };
     let input = MemoryUpdateInput {
         memory_id: id,
         // Deliberately not read from the body: the reference's own
@@ -466,7 +471,7 @@ pub fn api_update(store: &Store<'_>, _wiki: &Wiki, req: &Request, params: &Param
                 .collect()
         }),
         metadata: body.get("metadata").cloned(),
-        if_version: if_version(&body).map(str::to_string),
+        if_version: raw_version.map(str::to_string),
     };
     match queries::update_memory(store, &input) {
         Ok(UpdateOutcome::Updated(memory)) => {
@@ -1086,7 +1091,11 @@ pub fn api_wiki_write(
         );
     }
 
-    let expect = match remind_me_core::version::Expect::parse(if_version(&body), true) {
+    let raw_version = match if_version(&body) {
+        Ok(raw) => raw,
+        Err(e) => return e,
+    };
+    let expect = match remind_me_core::version::Expect::parse(raw_version, true) {
         Ok(expect) => expect,
         Err(e) => return err(400, e.to_string()),
     };

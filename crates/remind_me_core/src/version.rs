@@ -65,6 +65,23 @@ impl Expect {
     }
 }
 
+/// The raw `if_version` field of a request's arguments: `None` when absent
+/// or null, the string when one is given.
+///
+/// # Errors
+///
+/// [`StoreError::Invalid`] for any other JSON type, so a malformed
+/// precondition is refused rather than read as "no check".
+pub fn field(args: &Value) -> Result<Option<&str>> {
+    match args.get("if_version") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(raw)) => Ok(Some(raw)),
+        Some(other) => Err(StoreError::Invalid(format!(
+            "if_version must be a string, not {other}"
+        ))),
+    }
+}
+
 fn is_token(raw: &str) -> bool {
     raw.strip_prefix(PREFIX).is_some_and(|hex| {
         hex.len() == HEX_LEN

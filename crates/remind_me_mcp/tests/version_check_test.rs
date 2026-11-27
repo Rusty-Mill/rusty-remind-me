@@ -107,6 +107,20 @@ fn wiki_write_checks_and_wiki_read_returns_the_version() {
         json!({"title": "Deploys", "content": "Mondays.", "if_version": "yesterday"}),
     );
     assert!(failed && text.contains("invalid_input"), "{text}");
+    let (failed, text) = call(
+        &s,
+        "remind_me_wiki_write",
+        json!({"title": "Deploys", "content": "Mondays.", "if_version": 7}),
+    );
+    assert!(failed && text.contains("invalid_input"), "{text}");
+
+    let (_, markdown) = call(
+        &s,
+        "remind_me_wiki_read",
+        json!({"slug": "deploys", "response_format": "markdown"}),
+    );
+    let version = written["version"].as_str().unwrap();
+    assert!(markdown.contains(version), "{markdown}");
 }
 
 #[test]
