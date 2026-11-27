@@ -357,7 +357,7 @@ mod tests {
             panic!("not a messages capture");
         };
         assert_eq!((messages.as_str(), session_id.as_str()), (list, "h1"));
-        assert_eq!(cwd, Some(PathBuf::from("/work")));
+        assert_eq!(cwd, Some(std::path::absolute("/work").unwrap()));
         assert_eq!(reason.as_deref(), Some("end"));
 
         for (format, input) in [
