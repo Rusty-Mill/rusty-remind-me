@@ -409,3 +409,68 @@ fn the_prompt_hook_does_not_warn_with_a_dead_end_a_hit_overrules() {
     );
     assert!(section(&b, "hits").contains(&"strong"));
 }
+
+#[test]
+fn a_tight_project_brief_fits_a_long_warning_before_activity() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let meta = json!({ "tried": "t".repeat(240), "why_failed": "w".repeat(240) });
+    put(
+        &store,
+        "long",
+        "dead_end",
+        "a long dead end",
+        meta,
+        Some("alpha"),
+    );
+    for i in 0..5 {
+        let content = format!("alpha note {i} {}", "n".repeat(200));
+        put(
+            &store,
+            &format!("n{i}"),
+            "fact",
+            &content,
+            json!({}),
+            Some("alpha"),
+        );
+    }
+    let request = ContextRequest {
+        mode: Mode::Project,
+        project: Some("alpha"),
+        budget: 400,
+        ..ContextRequest::default()
+    };
+    let Outcome::Brief(b) = context_brief::build(&store, &request).unwrap() else {
+        panic!("unknown project");
+    };
+    assert_eq!(section(&b, "warnings"), ["long"]);
+    assert!(b.budget.used <= 400);
+}
+
+#[test]
+fn another_projects_dead_end_does_not_silence_a_prompt_warning() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let at = chrono::Utc::now().to_rfc3339();
+    let rival = |id: &str, object: &str, confidence: f64, project: &str| {
+        let mut row = NewMemory::new(id, TRIED, &at);
+        row.memory_type = "dead_end".into();
+        row.metadata = json!({ "tried": TRIED, "why_failed": "segfaults" });
+        row.subject = Some("musl build".into());
+        row.predicate = Some("allocator".into());
+        row.object = Some(object.into());
+        row.confidence = confidence;
+        row.project = Some(project.into());
+        Memories::new(&store).insert(&row).unwrap();
+    };
+    rival("ours", "not jemalloc", 0.4, "alpha");
+    rival("theirs", "not mimalloc", 1.0, "beta");
+
+    let b = brief(
+        &store,
+        Mode::Prompt,
+        Some("alpha"),
+        Some("rebuild musl with jemalloc"),
+    );
+    assert_eq!(section(&b, "warnings"), ["ours"]);
+}
