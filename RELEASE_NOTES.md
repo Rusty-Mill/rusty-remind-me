@@ -2,6 +2,16 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-27 — Dialog store check on open (Mill Board #528, D132)
+
+### Added
+- `dialog_reconcile::check`: a read-only check of the dialog store against `memories`. It lists, by id, rows whose body blob is missing or the wrong size (`--full` also re-hashes each blob), rows with no live `memories` dialog row, and rows whose `memories` row has a different canonical hash (D77). It counts `memories` dialog rows the store does not hold yet as `not_migrated`, which is not a finding until the migration runs. Nothing is repaired, appended or deleted (D80).
+- On open, the daemon and the stdio server run the quick check once on a background thread when a dialog store exists, and log one summary line with the counts and the time taken. They never wait for it. Counters `runs()` and `last_findings()` sit beside `dialog_shadow::failures()`.
+- `rusty-remind-me dialogs check [--full]` prints the report as JSON and exits 1 when there are findings.
+- `docs/handoff`: D132 (this slice's shape) and Q35 (whether the counts join `remind_me_server_status`, which is an MCP output change under D3, so it is left out).
+
+### Tests
+- No store means no report, no thread and no file created; a shadowed store is clean, with unshadowed rows only counted; each problem kind is listed by id; only `--full` sees a same-size corruption; the check changes no file; the background pass runs once and counts; CLI argument parsing.
 ## 2026-11-27 — Version checks so clients can't overwrite each other (Mill Board #1487, D119-D122, D125)
 
 ### Added

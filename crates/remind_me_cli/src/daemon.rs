@@ -99,6 +99,9 @@ fn run(db_path: &Path, endpoint: Endpoint) -> Result<()> {
     let watcher = remind_me_core::watcher::start_watcher_for(&db.store());
     let nudge = remind_me_core::promotion::start_nudge_for(&db.store());
     let pruner = remind_me_core::sync::retention::start_pruner_for(&db.store());
+    // One read-only pass over the dialog store, if there is one (D132);
+    // detached, since it never writes and must not hold up the daemon.
+    let _dialog_check = remind_me_core::dialog_reconcile::start_for(&db.store());
     let compactor =
         remind_me_core::compaction::start_compactor(Arc::clone(&db)).unwrap_or_else(|e| {
             eprintln!("rusty-remind-me daemon: {e}");
