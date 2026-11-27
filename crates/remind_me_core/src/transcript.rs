@@ -469,7 +469,10 @@ pub(crate) fn replay_row(span: &str, continuation: bool, tools: &MessageTools) -
     if text.starts_with(TRUNCATION_MARKER) && span.contains(crate::redact::REDACTED_PREFIX) {
         return None;
     }
-    if messages.iter().any(|m| preview_cut_after_redaction(m, tools)) {
+    if messages
+        .iter()
+        .any(|m| preview_cut_after_redaction(m, tools))
+    {
         return None;
     }
     let (mut tags, mut metadata) = (Vec::new(), serde_json::json!({}));
@@ -482,7 +485,9 @@ fn preview_cut_after_redaction(message: &ChatMessage, tools: &MessageTools) -> b
     message.tool_use.iter().any(|call| {
         tools.posted(call).is_none()
             && call.input_cut()
-            && call.main_argument().contains(crate::redact::REDACTED_PREFIX)
+            && call
+                .main_argument()
+                .contains(crate::redact::REDACTED_PREFIX)
     })
 }
 

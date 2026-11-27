@@ -232,13 +232,19 @@ fn a_cut_tool_preview_whose_argument_was_redacted_is_counted_not_replayed() {
     let tail = "z".repeat(TOOL_INPUT_CHARS);
     capture(
         &db,
-        &[text(1, "user", "run it"), bash(2, &format!("echo {CARD} {tail}"))],
+        &[
+            text(1, "user", "run it"),
+            bash(2, &format!("echo {CARD} {tail}")),
+        ],
     );
     // A long command with no redaction still replays.
     capture_as(
         &db,
         "sess_plain",
-        &[text(1, "user", "run it"), bash(2, &format!("echo {tail} {tail}"))],
+        &[
+            text(1, "user", "run it"),
+            bash(2, &format!("echo {tail} {tail}")),
+        ],
     );
 
     let report = check(&db.store(), Some(&dir.join("scratch")), false).unwrap();

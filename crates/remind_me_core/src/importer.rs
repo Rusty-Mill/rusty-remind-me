@@ -228,7 +228,10 @@ impl ChatMessage {
 
 /// The argument of a `tool_use` input that says what the call did, cut.
 fn summarize_tool_input(input: &serde_json::Value) -> String {
-    main_argument(input).chars().take(TOOL_INPUT_CHARS).collect()
+    main_argument(input)
+        .chars()
+        .take(TOOL_INPUT_CHARS)
+        .collect()
 }
 
 /// The argument of a `tool_use` input that says what the call did, on one
