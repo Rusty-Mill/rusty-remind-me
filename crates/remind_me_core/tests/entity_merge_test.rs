@@ -556,3 +556,46 @@ fn a_mute_on_the_absorbed_entity_still_covers_facts_naming_it() {
 
     assert!(covered(&store));
 }
+
+#[test]
+fn unmuting_after_a_merge_turns_off_both_entities_mutes() {
+    // Codex on #437: A and B each muted before B merges into A; both records
+    // then name A, and unmute turned off only the newest, leaving the older
+    // one in force.
+    use remind_me_core::mute::{self, MuteSet, Target};
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    entity(&store, "Gareth", Some("person"), &[]);
+    entity(&store, "Gary", Some("person"), &[]);
+    let fact = queries::add_memory(
+        &store,
+        MemoryAddInput {
+            content: "wants the numbers redone".into(),
+            category: "general".into(),
+            source: "manual".into(),
+            subject: Some("Gary".into()),
+            predicate: Some("wants".into()),
+            object: Some("numbers redone".into()),
+            extract: false,
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .id;
+    mute::mute(&store, Target::Entity, "Gareth", None).unwrap();
+    mute::mute(&store, Target::Entity, "Gary", None).unwrap();
+    entity_merge::merge(&store, "Gary", "Gareth").unwrap();
+    let covered = |store: &Store<'_>| {
+        let memory = queries::get_memory_by_id(store, &fact).unwrap().unwrap();
+        MuteSet::load(store, None, None).unwrap().covers(&memory)
+    };
+    assert!(covered(&store));
+
+    let off = mute::unmute(&store, Target::Entity, "Gary", None)
+        .unwrap()
+        .unwrap();
+
+    assert!(!off.spec.on);
+    assert!(!covered(&store));
+    assert!(mute::list(&store).unwrap().iter().all(|m| !m.spec.on));
+}

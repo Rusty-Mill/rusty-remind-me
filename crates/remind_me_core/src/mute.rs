@@ -246,15 +246,27 @@ fn canonical_project(store: &Store<'_>, project: Option<&str>) -> Result<Option<
 }
 
 /// The record for `target` and `value` in `project`, on or off, matched by
-/// canonical spelling on both sides.
+/// canonical spelling on both sides; the newest when several match.
 fn find(
     store: &Store<'_>,
     target: Target,
     value: &str,
     project: Option<&str>,
 ) -> Result<Option<Mute>> {
+    Ok(matching(store, target, value, project)?.into_iter().next())
+}
+
+/// Every record for `target` and `value` in `project`, newest first. More
+/// than one matches once an entity merge folds two muted names into one.
+fn matching(
+    store: &Store<'_>,
+    target: Target,
+    value: &str,
+    project: Option<&str>,
+) -> Result<Vec<Mute>> {
     let value = canonical_value(store, target, value)?;
     let project = canonical_project(store, project)?;
+    let mut found = Vec::new();
     for mute in list(store)? {
         if mute.spec.target != target
             || !same(&canonical_value(store, target, &mute.spec.value)?, &value)
@@ -268,10 +280,10 @@ fn find(
             _ => false,
         };
         if matches {
-            return Ok(Some(mute));
+            found.push(mute);
         }
     }
-    Ok(None)
+    Ok(found)
 }
 
 /// Mute `value`: turn its record back on, or write a new one.
@@ -316,22 +328,28 @@ pub fn mute(store: &Store<'_>, target: Target, value: &str, project: Option<&str
     })
 }
 
-/// Unmute `value`: turn its record off, keeping it and its history. `None`
-/// when nothing mutes it.
+/// Unmute `value`: turn off every record that mutes it, keeping them and
+/// their history, and return the newest. All of them, because an entity
+/// merge can leave two records naming one entity. `None` when nothing
+/// mutes it.
 ///
 /// # Errors
 ///
-/// A store failure.
+/// A store failure, which writes none of the records.
 pub fn unmute(
     store: &Store<'_>,
     target: Target,
     value: &str,
     project: Option<&str>,
 ) -> Result<Option<Mute>> {
-    match find(store, target, value, project)? {
-        Some(existing) => set_on(store, &existing, false).map(Some),
-        None => Ok(None),
-    }
+    store.atomically(|store| {
+        let mut newest = None;
+        for existing in matching(store, target, value, project)? {
+            let off = set_on(store, &existing, false)?;
+            newest.get_or_insert(off);
+        }
+        Ok(newest)
+    })
 }
 
 fn set_on(store: &Store<'_>, existing: &Mute, on: bool) -> Result<Mute> {
