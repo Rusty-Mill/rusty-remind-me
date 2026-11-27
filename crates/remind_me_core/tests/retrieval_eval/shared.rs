@@ -17,7 +17,7 @@ use remind_me_core::db::{queries, Store};
 use remind_me_core::embedder::{EmbedError, EmbedRole, Embedder, EmbeddingIdentity};
 use remind_me_core::entity::{link_memory_entity, upsert_entity};
 use remind_me_core::retrieval::Deadline;
-use remind_me_core::time_buckets::Modes;
+use remind_me_core::time_buckets::Mode;
 use remind_me_core::topic::{self, Parent, TopicName};
 use remind_me_core::vectors::embed_and_store;
 use remind_me_core::{Database, EntityInput, MemorySearchInput, RetrievalStrategy, SearchFilters};
@@ -300,17 +300,17 @@ pub fn ranked_outcome(
     embedder: Option<&dyn Embedder>,
     dates: bool,
 ) -> (Vec<String>, bool) {
-    ranked_outcome_with(store, g, strategy, embedder, dates, Modes::OFF)
+    ranked_outcome_with(store, g, strategy, embedder, dates, Mode::Off)
 }
 
-/// [`ranked_outcome`] with card #568's time-bucket modes set on the input.
+/// [`ranked_outcome`] with card #568's recency buckets set as given.
 pub fn ranked_outcome_with(
     store: &Store<'_>,
     g: &GoldenQuery,
     strategy: RetrievalStrategy,
     embedder: Option<&dyn Embedder>,
     dates: bool,
-    time_buckets: Modes,
+    time_buckets: Mode,
 ) -> (Vec<String>, bool) {
     let input = MemorySearchInput {
         query: g.query.clone(),

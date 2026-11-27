@@ -1,62 +1,42 @@
-//! Spreading ranked hits across time buckets: the card #568 spike (pack
-//! D102, keep rule D104). Off unless `REMIND_ME_TIME_BUCKETS` names a mode.
+//! Recency buckets for status questions (card #568). Off unless
+//! `REMIND_ME_TIME_BUCKETS=recency`.
 //!
-//! - `window`: a search window wider than [`MIN_WINDOW_DAYS`] is cut into
-//!   equal buckets, `clamp(days / 7, 3, 6)` of them, and the ranked list is
-//!   interleaved round-robin, newest bucket first, score order inside each.
-//!   A wide window ("last month") then cannot come back clustered on one day.
-//! - `recency`: a search with no window keeps at least one slot in the top
-//!   `limit` for the best hit of each non-empty bucket of the last 2 days,
-//!   the last 7 days and older, so access boosting cannot crowd the newest
-//!   week out of a status question ("latest on X").
+//! A search with no time window keeps at least one slot in the top `limit`
+//! for the best hit of each non-empty bucket: the last 2 days, the 5 days
+//! before, and older. Access boosting then cannot crowd the newest week out
+//! of a status question ("latest on X"). It runs on the whole ranked list
+//! after fusion and rerank, before `limit` and the token budget, so the same
+//! query pages the same way. The spike also measured a `window` mode, which
+//! spread a wide window across equal buckets; it lowered temporal MRR and was
+//! dropped (`docs/research/568-time-buckets-spike.md`).
 //!
-//! Both run on the whole ranked list after fusion and rerank, before
-//! `limit` and the token budget, so the same query pages the same way. The
-//! functions here are pure: the clock and the timestamp are passed in.
+//! The bucketing is pure: the clock and the timestamp are passed in.
 
 use crate::models::{Memory, MemorySearchResult};
-use crate::time_window::{parse_rfc3339, TimeField};
+use crate::time_window::{parse_rfc3339, TimeField, TimeWindow};
 use chrono::{DateTime, Duration, Utc};
 
-/// The setting that turns a mode on: `off`, `window`, `recency` or `both`.
+/// The setting that turns recency buckets on: `recency`, or `off`.
 pub const FLAG_ENV: &str = "REMIND_ME_TIME_BUCKETS";
-/// A window this wide or narrower is left alone.
-pub const MIN_WINDOW_DAYS: i64 = 3;
-const MIN_BUCKETS: i64 = 3;
-const MAX_BUCKETS: i64 = 6;
 
-/// Which spreading modes are on.
+/// Whether recency buckets are on.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Modes {
-    pub window: bool,
-    pub recency: bool,
+pub enum Mode {
+    /// Rank order is left alone.
+    #[default]
+    Off,
+    /// Reserve top slots for the newest buckets on an unwindowed search.
+    Recency,
 }
 
-impl Modes {
-    /// Every mode off.
-    pub const OFF: Self = Self {
-        window: false,
-        recency: false,
-    };
-
-    /// Read a setting's value. Unset, blank and anything unrecognised read as
-    /// off, as `REMIND_ME_DATE_PHRASES` does: a spike never turns on by
+impl Mode {
+    /// Read a setting's value. Unset, blank and anything unrecognised read
+    /// as off, as `REMIND_ME_DATE_PHRASES` does, so it never turns on by
     /// accident.
     pub fn parse(raw: &str) -> Self {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "window" => Self {
-                window: true,
-                recency: false,
-            },
-            "recency" => Self {
-                window: false,
-                recency: true,
-            },
-            "both" => Self {
-                window: true,
-                recency: true,
-            },
-            _ => Self::OFF,
+            "recency" => Self::Recency,
+            _ => Self::Off,
         }
     }
 
@@ -78,25 +58,20 @@ pub fn instant_of(m: &Memory, field: TimeField) -> Option<DateTime<Utc>> {
     }
 }
 
-/// Apply the modes `modes` turns on to a whole ranked list. Window mode
-/// needs a `since` (an open `until` is `now`); recency mode needs no window
-/// at all. Anything else is returned unchanged.
+/// Apply `mode` to a whole ranked list. Recency applies only to a search
+/// with no window; anything else is returned unchanged.
 pub fn apply(
     ranked: Vec<MemorySearchResult>,
-    modes: Modes,
-    window: &crate::time_window::TimeWindow,
+    mode: Mode,
+    window: &TimeWindow,
     limit: usize,
     now: DateTime<Utc>,
 ) -> Vec<MemorySearchResult> {
-    let field = window.field();
-    let instant = |r: &MemorySearchResult| instant_of(&r.memory, field);
-    match window.bounds() {
-        (Some(since), until) if modes.window => {
-            spread_window(ranked, since, until.unwrap_or(now), instant)
-        }
-        (None, None) if modes.recency => reserve_recent(ranked, limit, now, instant),
-        _ => ranked,
+    if mode != Mode::Recency || !window.is_unbounded() {
+        return ranked;
     }
+    let field = window.field();
+    reserve_recent(ranked, limit, now, |r| instant_of(&r.memory, field))
 }
 
 /// A half-open `[start, end)` span of time; `None` is unbounded.
@@ -110,28 +85,6 @@ impl Bucket {
     fn holds(&self, at: DateTime<Utc>) -> bool {
         self.start.is_none_or(|s| at >= s) && self.end.is_none_or(|e| at < e)
     }
-}
-
-/// The equal buckets a `[since, until)` window is cut into, newest first, or
-/// none when it is not wider than [`MIN_WINDOW_DAYS`].
-fn window_buckets(since: DateTime<Utc>, until: DateTime<Utc>) -> Vec<Bucket> {
-    let span = until - since;
-    if span <= Duration::days(MIN_WINDOW_DAYS) {
-        return Vec::new();
-    }
-    let count = (span.num_days() / 7).clamp(MIN_BUCKETS, MAX_BUCKETS);
-    let width = span / count as i32;
-    (0..count)
-        .rev()
-        .map(|i| {
-            let start = since + width * i as i32;
-            let end = if i == count - 1 { until } else { start + width };
-            Bucket {
-                start: Some(start),
-                end: Some(end),
-            }
-        })
-        .collect()
 }
 
 /// The recency buckets, newest first: the last 2 days, the 5 before, older.
@@ -172,44 +125,9 @@ fn assign<T>(
         .collect()
 }
 
-/// Window mode: interleave `ranked` across the buckets of `[since, until)`,
-/// newest bucket first, keeping rank order inside each; empty buckets are
-/// skipped. Unchanged when the window is too narrow.
-pub fn spread_window<T>(
-    ranked: Vec<T>,
-    since: DateTime<Utc>,
-    until: DateTime<Utc>,
-    instant: impl Fn(&T) -> Option<DateTime<Utc>>,
-) -> Vec<T> {
-    let buckets = window_buckets(since, until);
-    if buckets.is_empty() {
-        return ranked;
-    }
-    let slots = assign(&ranked, &buckets, &instant);
-    let mut queues: Vec<Vec<T>> = (0..buckets.len()).map(|_| Vec::new()).collect();
-    for (item, slot) in ranked.into_iter().zip(slots) {
-        queues[slot].push(item);
-    }
-    round_robin(queues)
-}
-
-fn round_robin<T>(queues: Vec<Vec<T>>) -> Vec<T> {
-    let total = queues.iter().map(Vec::len).sum();
-    let mut iters: Vec<std::vec::IntoIter<T>> = queues.into_iter().map(Vec::into_iter).collect();
-    let mut out = Vec::with_capacity(total);
-    while out.len() < total {
-        for it in iters.iter_mut() {
-            if let Some(item) = it.next() {
-                out.push(item);
-            }
-        }
-    }
-    out
-}
-
-/// Recency mode: make sure the best item of every non-empty recency bucket is
-/// in the first `limit`, displacing the lowest-ranked items of buckets that
-/// already have more than one there. Everything keeps its rank order.
+/// Make sure the best item of every non-empty recency bucket is in the
+/// first `limit`, displacing the lowest-ranked item of a bucket that already
+/// has more than one there. Everything keeps its rank order.
 pub fn reserve_recent<T>(
     ranked: Vec<T>,
     limit: usize,
@@ -222,24 +140,26 @@ pub fn reserve_recent<T>(
     let buckets = recency_buckets(now);
     let slots = assign(&ranked, &buckets, &instant);
     let mut chosen: Vec<bool> = (0..ranked.len()).map(|i| i < limit).collect();
+    let mut held = [0usize; 3];
+    for &slot in &slots[..limit] {
+        held[slot] += 1;
+    }
     for bucket in 0..buckets.len() {
-        let represented = (0..ranked.len()).any(|i| chosen[i] && slots[i] == bucket);
-        let Some(best) = (0..ranked.len()).find(|&i| !chosen[i] && slots[i] == bucket) else {
-            continue;
-        };
-        if represented {
+        if held[bucket] > 0 {
             continue;
         }
-        let crowded = |i: usize| {
-            (0..ranked.len())
-                .filter(|&j| chosen[j] && slots[j] == slots[i])
-                .count()
-                > 1
-        };
-        let Some(drop) = (0..ranked.len()).rev().find(|&i| chosen[i] && crowded(i)) else {
+        let Some(best) = (limit..ranked.len()).find(|&i| slots[i] == bucket) else {
             continue;
         };
+        let Some(drop) = (0..ranked.len())
+            .rev()
+            .find(|&i| chosen[i] && held[slots[i]] > 1)
+        else {
+            continue;
+        };
+        held[slots[drop]] -= 1;
         chosen[drop] = false;
+        held[bucket] += 1;
         chosen[best] = true;
     }
     let (mut top, mut rest) = (Vec::with_capacity(limit), Vec::new());
@@ -274,74 +194,12 @@ mod tests {
     }
 
     #[test]
-    fn modes_parse_and_default_off() {
-        assert_eq!(Modes::parse(""), Modes::OFF);
-        assert_eq!(Modes::parse("off"), Modes::OFF);
-        assert_eq!(Modes::parse("on"), Modes::OFF);
-        assert_eq!(
-            Modes::parse(" Window "),
-            Modes {
-                window: true,
-                recency: false
-            }
-        );
-        assert_eq!(
-            Modes::parse("recency"),
-            Modes {
-                window: false,
-                recency: true
-            }
-        );
-        assert_eq!(
-            Modes::parse("BOTH"),
-            Modes {
-                window: true,
-                recency: true
-            }
-        );
-    }
-
-    #[test]
-    fn a_narrow_window_is_unchanged() {
-        let ranked = vec![("a", 1), ("b", 1), ("c", 2)];
-        let since = now() - Duration::days(3);
-        assert_eq!(
-            names(spread_window(ranked, since, now(), at)),
-            ["a", "b", "c"]
-        );
-    }
-
-    #[test]
-    fn a_wide_window_interleaves_newest_bucket_first() {
-        // 30 days: 4 buckets of 7.5 days. Three hits on day 28, one on day 2.
-        let ranked = vec![("old1", 28), ("old2", 28), ("old3", 28), ("new", 2)];
-        let since = now() - Duration::days(30);
-        assert_eq!(
-            names(spread_window(ranked, since, now(), at)),
-            ["new", "old1", "old2", "old3"]
-        );
-    }
-
-    #[test]
-    fn empty_buckets_are_skipped_and_rank_order_holds_inside_a_bucket() {
-        let ranked = vec![("a", 25), ("b", 1), ("c", 25), ("d", 1), ("e", 12)];
-        let since = now() - Duration::days(28);
-        // 28 days: 4 buckets of 7 days; 25 is the oldest, 12 the second
-        // oldest, 1 the newest; the bucket 7-14 days old... holds e only.
-        assert_eq!(
-            names(spread_window(ranked, since, now(), at)),
-            ["b", "e", "a", "d", "c"]
-        );
-    }
-
-    #[test]
-    fn bucket_count_is_clamped() {
-        assert_eq!(window_buckets(now() - Duration::days(4), now()).len(), 3);
-        assert_eq!(window_buckets(now() - Duration::days(35), now()).len(), 5);
-        assert_eq!(window_buckets(now() - Duration::days(365), now()).len(), 6);
-        let b = window_buckets(now() - Duration::days(365), now());
-        assert_eq!(b[0].end, Some(now()));
-        assert_eq!(b[5].start, Some(now() - Duration::days(365)));
+    fn mode_parses_and_defaults_off() {
+        assert_eq!(Mode::default(), Mode::Off);
+        for raw in ["", "off", "on", "window", "both"] {
+            assert_eq!(Mode::parse(raw), Mode::Off, "{raw}");
+        }
+        assert_eq!(Mode::parse(" Recency "), Mode::Recency);
     }
 
     #[test]

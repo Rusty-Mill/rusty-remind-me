@@ -1,27 +1,25 @@
-//! Card #568's measurement, fixture half: do the time-bucket modes
-//! (`REMIND_ME_TIME_BUCKETS`) help enough to keep? Keep rule pre-registered
-//! by Nano (pack D104):
+//! Card #568's measurement, fixture half: does recency bucketing
+//! (`REMIND_ME_TIME_BUCKETS=recency`) help? Keep rule pre-registered by Nano
+//! (pack D133): recall@10 or MRR on temporal queries rises 2+ points and no
+//! other kind or strategy drops more than 0.02, plus a status-question set
+//! (10+ "latest on X", clock relative to the run) where a newest-week
+//! relevant hit must reach the top 10.
 //!
-//! - **window**: recall@10 or MRR on temporal queries rises 2+ points and no
-//!   other kind or strategy drops more than 0.02, on this fixture and on the
-//!   off-repo #1563 set.
-//! - **recency**: the same, plus a status-question set (10+ "latest on X",
-//!   clock relative to the run) where a newest-week relevant hit must reach
-//!   the top 10.
+//! The spike measured a `window` mode too; it lowered temporal MRR and was
+//! dropped (`docs/research/568-time-buckets-spike.md`). Recency failed the
+//! lift half but fixed the status set, so it ships opt-in (Nano, 2026-11-27).
+//! This runner stays so the default can be revisited on new numbers.
 //!
-//! Window mode only acts on a search with a window, so it is measured in the
-//! `+dates` modes (date inference makes the window); those move with the
-//! weekday, as in the #59 test, so their numbers are a snapshot. Recency mode
-//! only acts without a window, so it is measured in the plain modes.
+//! Recency only acts on a search without a window, so the `+dates` modes
+//! (date inference makes the window) move only where no date is inferred;
+//! those move with the weekday, as in the #59 test.
 //!
 //! Two stores, so the gated baseline is never touched:
 //!
 //! - **base**: the #59 fixture and its golden set.
-//! - **synthetic**: the #59 fixture plus two generated worlds: `status`
-//!   (12 subjects, ten heavily read rows 8-17 days old that match the query
-//!   well, one fresh row that is the answer) and `window` (6 subjects, eight
-//!   rows bunched on one day of the last month, three spread across it that
-//!   are the answer; reported, not gated: it is built to show the failure).
+//! - **synthetic**: the #59 fixture plus a generated `status` world: 12
+//!   subjects, ten heavily read rows 8-17 days old that match the query
+//!   well, one fresh row that is the answer.
 //!
 //! Ignored: it prints numbers and gates nothing. For latency use --release:
 //!
@@ -37,32 +35,16 @@ use chrono::Utc;
 use remind_me_core::db::memories::Memories;
 use remind_me_core::db::Store;
 use remind_me_core::embedder::Embedder;
-use remind_me_core::time_buckets::Modes;
+use remind_me_core::time_buckets::Mode;
 use remind_me_core::Database;
 
 #[path = "retrieval_eval/shared.rs"]
 mod shared;
 use shared::*;
 
-const FLAGS: [(&str, Modes); 3] = [
-    ("off", Modes::OFF),
-    (
-        "window",
-        Modes {
-            window: true,
-            recency: false,
-        },
-    ),
-    (
-        "recency",
-        Modes {
-            window: false,
-            recency: true,
-        },
-    ),
-];
+const FLAGS: [(&str, Mode); 2] = [("off", Mode::Off), ("recency", Mode::Recency)];
 const TEMPORAL_KINDS: [&str; 3] = ["temporal", "dated", "occurred"];
-/// D104 (as D92): the lift that keeps a mode, and the drop that sinks it.
+/// D133 (as D92): the lift that keeps a mode, and the drop that sinks it.
 const KEEP_LIFT: f64 = 0.02;
 const MAX_DROP: f64 = 0.02;
 /// Searches per query, for the latency percentiles.
@@ -82,15 +64,6 @@ const STATUS_SUBJECTS: [&str; 12] = [
     "Corvane",
     "Lirabel",
 ];
-const WINDOW_SUBJECTS: [&str; 6] = [
-    "Galloway crane",
-    "Ashgrove pump",
-    "Mirelle kiln",
-    "Torvik dam",
-    "Sablecrest mill",
-    "Oakhurst lock",
-];
-
 fn row(id: String, content: String, age_days: i64) -> FixtureMemory {
     serde_json::from_value(serde_json::json!({
         "id": id, "content": content, "category": "general",
@@ -134,38 +107,6 @@ fn status_world() -> (Vec<FixtureMemory>, Vec<String>, Vec<GoldenQuery>) {
     (rows, hot, queries)
 }
 
-/// The window world: eight rows bunched 25 days back, three spread.
-fn window_world() -> (Vec<FixtureMemory>, Vec<GoldenQuery>) {
-    let (mut rows, mut queries) = (Vec::new(), Vec::new());
-    for (w, subject) in WINDOW_SUBJECTS.iter().enumerate() {
-        for k in 0..8 {
-            rows.push(row(
-                format!("w{w}-log{k}"),
-                format!("{subject} log entry {k}: {subject} checked, nothing new."),
-                25,
-            ));
-        }
-        let spread: Vec<String> = [3, 12, 19]
-            .iter()
-            .map(|age| {
-                let id = format!("w{w}-d{age}");
-                rows.push(row(
-                    id.clone(),
-                    format!("{subject} change agreed {age} days back."),
-                    *age,
-                ));
-                id
-            })
-            .collect();
-        queries.push(golden(
-            format!("{subject} in the past 30 days"),
-            spread,
-            "window",
-        ));
-    }
-    (rows, queries)
-}
-
 /// Mark `ids` as read thirty times, today: what crowded the newest week out
 /// on 2026-11-18 was access boosting.
 fn heat(store: &Store<'_>, ids: &[String]) {
@@ -207,13 +148,13 @@ fn run(
     rows: &mut Rows,
     latency_us: &mut BTreeMap<String, Vec<u128>>,
 ) {
-    for (flag, modes) in FLAGS {
+    for (flag, flag_mode) in FLAGS {
         for (strategy_name, strategy) in STRATEGIES {
             for g in golden {
                 let mut ids = Vec::new();
                 for _ in 0..REPEATS {
                     let started = Instant::now();
-                    ids = ranked_outcome_with(store, g, strategy, embedder, dates, modes).0;
+                    ids = ranked_outcome_with(store, g, strategy, embedder, dates, flag_mode).0;
                     latency_us
                         .entry(flag.to_string())
                         .or_default()
@@ -245,7 +186,6 @@ fn run(
 #[ignore = "measurement for card #568: prints numbers, gates nothing"]
 fn time_buckets_spike() {
     let (status_rows, hot, status_queries) = status_world();
-    let (window_rows, window_queries) = window_world();
     let base_golden: Vec<GoldenQuery> = read_jsonl("queries.jsonl");
     let mut rows = Rows::new();
     let mut latency_us = BTreeMap::new();
@@ -259,7 +199,6 @@ fn time_buckets_spike() {
         let synth = synth_db.store();
         let mut all: Vec<FixtureMemory> = read_jsonl("memories.jsonl");
         all.extend(status_rows.iter().map(clone_row));
-        all.extend(window_rows.iter().map(clone_row));
         load(&synth, &all, embedder);
         heat(&synth, &hot);
         for dates in [false, true] {
@@ -286,17 +225,6 @@ fn time_buckets_spike() {
                 &mut rows,
                 &mut latency_us,
             );
-            if dates {
-                run(
-                    &synth,
-                    &window_queries,
-                    embedder,
-                    &mode,
-                    dates,
-                    &mut rows,
-                    &mut latency_us,
-                );
-            }
         }
     }
     report(&rows, &latency_us);
@@ -337,7 +265,7 @@ fn report(rows: &Rows, latency_us: &BTreeMap<String, Vec<u128>>) {
             let lift = verdict_lift.entry(cell.clone()).or_insert(f64::INFINITY);
             *lift = lift.min(d10.max(dmrr));
         }
-        if kind != "status" && kind != "window" {
+        if kind != "status" {
             // Any gated kind, the temporal pool included, counts as a drop.
             let drop = verdict_drop.entry(cell.clone()).or_insert(0.0);
             *drop = drop.min(d10.min(dmrr));
@@ -346,7 +274,7 @@ fn report(rows: &Rows, latency_us: &BTreeMap<String, Vec<u128>>) {
             println!("{cell:24} {strategy:17} {kind:14} recall@10 {d10:+.4}  MRR {dmrr:+.4}");
         }
     }
-    println!("\n== D104 fixture half, per flag and mode");
+    println!("\n== D133 fixture half, per flag and mode");
     for (cell, lift) in &verdict_lift {
         let drop = verdict_drop.get(cell).copied().unwrap_or(0.0);
         let keep = *lift >= KEEP_LIFT && drop >= -MAX_DROP;

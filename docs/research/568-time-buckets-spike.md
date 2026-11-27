@@ -1,7 +1,8 @@
 # Spike: spreading search results across time buckets (Mill Board #568)
 
-Status: **measured 2026-11-27 (a Friday), fixture half, in a cloud session.**
-Verdict under D104: **both modes fail the pre-registered rule on the
+Status: **measured 2026-11-27 (a Friday), fixture half, in a cloud session;
+settled by D134 (recency opt-in, window dropped).**
+Verdict under D133: **both modes fail the pre-registered rule on the
 fixture half**, so neither can be kept on that rule, whatever the #1563 set
 shows. Window mode hurts; recency mode is neutral on every gated query and
 fixes the status-question check.
@@ -17,7 +18,7 @@ Do the two flagged modes help enough to keep?
   with no window keeps one top-`limit` slot for the best hit of each
   non-empty bucket among the last 2 days, the last 7 days and older.
 
-## Keep rule (pre-registered, Nano 2026-11-27, pack D104)
+## Keep rule (pre-registered, Nano 2026-11-27, pack D133)
 
 - window: keep if recall@10 or MRR on temporal queries rises 2+ points and
   no other kind or strategy drops more than 0.02, on the #59 fixture and on
@@ -26,7 +27,7 @@ Do the two flagged modes help enough to keep?
   relative to the run) where a newest-week relevant hit must reach the top
   10.
 
-## What was built (pack D102)
+## What was built (pack D132)
 
 - `remind_me_core::time_buckets`: pure functions (`spread_window`,
   `reserve_recent`) plus `Modes` and `apply`. The flag is
@@ -95,17 +96,19 @@ Temporal pool (kinds temporal, dated, occurred; 20 queries), strategy
 - Window mode is a drop on any reading. The card's worry, results bunched on
   one day, is real only when the bunch is irrelevant. When the bunch holds
   the answer, round-robin interleaving costs MRR.
-- Recency mode fails D104 only because part (a) asks for a lift on the
+- Recency mode fails D133 only because part (a) asks for a lift on the
   fixture's temporal queries. Those queries already rank their answers
   within the top 10, so a reserved slot never changes them. The mode did
   what it was built for, and changed nothing else. Whether that is enough to
   keep it is a change to a [stated] rule, so it is Nano's call, not the
   harness's.
 - The #1563 real-query half was not run. It cannot turn either fixture
-  result into a keep under D104.
+  result into a keep under D133.
 
-## Code
+## Outcome (Nano, 2026-11-27, D134)
 
-All the spike code (module, flag, input field, runner) is on branch
-`claude/project-thread-1yk410-568`. Whether any of it merges waits on Nano's
-answer to the verdict question on the card.
+Window mode is dropped and its code removed. Recency mode merges behind
+`REMIND_ME_TIME_BUCKETS=recency`, off by default, so it can be tried on the
+live store. Making it the default is a separate decision; the ignored runner
+`tests/time_buckets_spike_test.rs` stays so that call can be made on new
+numbers.

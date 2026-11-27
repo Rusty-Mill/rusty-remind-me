@@ -802,18 +802,18 @@ pub fn search_memories_deadlined(
         input,
         embedder,
         deadline,
-        crate::time_buckets::Modes::OFF,
+        crate::time_buckets::Mode::Off,
     )
 }
 
-/// [`search_memories_deadlined`] with card #568's time-bucket modes (a
-/// spike, off unless the search tool's flag or the eval harness sets one).
+/// [`search_memories_deadlined`] with card #568's recency buckets (off
+/// unless the search tool's flag or the eval harness turns them on).
 pub fn search_memories_deadlined_with(
     store: &Store<'_>,
     input: &MemorySearchInput,
     embedder: Option<&dyn crate::embedder::Embedder>,
     deadline: crate::retrieval::Deadline,
-    time_buckets: crate::time_buckets::Modes,
+    time_buckets: crate::time_buckets::Mode,
 ) -> Result<crate::retrieval::TrimOutcome> {
     let memories_repo = Memories::new(store);
     let mut timing = crate::retrieval::SearchTiming {
@@ -1060,9 +1060,10 @@ pub fn search_memories_deadlined_with(
     } else {
         crate::reranker::maybe_rerank(&input.query, ranked)
     };
-    // Card #568 spike, off unless the caller set a mode: on the whole pool,
-    // after every ranking stage and before the cut, so pages stay stable.
-    if time_buckets != crate::time_buckets::Modes::OFF {
+    // Card #568 recency buckets, off unless the caller turns them on: on the
+    // whole pool, after every ranking stage and before the cut, so pages
+    // stay stable.
+    if time_buckets != crate::time_buckets::Mode::Off {
         ranked = crate::time_buckets::apply(
             ranked,
             time_buckets,
@@ -1347,9 +1348,9 @@ pub fn search_with_expansions(
         None => (input, None),
     };
 
-    // Card #568 spike: the search tool reads its setting here, like date
-    // phrases; the ranker itself only follows what it is passed.
-    let time_buckets = crate::time_buckets::Modes::from_env();
+    // Card #568: the search tool reads its setting here, like date phrases;
+    // the ranker itself only follows what it is passed.
+    let time_buckets = crate::time_buckets::Mode::from_env();
 
     let configured = crate::embedder::available_embedder();
 

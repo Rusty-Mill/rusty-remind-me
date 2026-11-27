@@ -452,6 +452,13 @@ and Markdown opens with a line naming it. Only the search tool infers: saved
 searches, the brief, export and the CLI search their text as written. It is
 off by default until the retrieval eval's `+dates` modes show it helps.
 
+With `REMIND_ME_TIME_BUCKETS=recency`, a `remind_me_search` call with no
+window keeps one top-`limit` slot for the best hit of each non-empty bucket
+among the last 2 days, the 5 days before, and older, so heavily read old
+rows cannot crowd the newest week out of "latest on X". It reorders after
+rerank and before the cut, and otherwise keeps rank order. It is off by
+default (card #568, D134).
+
 ### Event time (`metadata.occurred_at`)
 
 A memory can say when its event happened, apart from when it was recorded:
@@ -470,6 +477,7 @@ malformed stored value reads as absent.
 | --- | --- | --- |
 | `REMIND_ME_TZ` | IANA zone whose calendar phrases mean (`Australia/Sydney`); an unknown name fails phrases, never RFC 3339 or ages | UTC |
 | `REMIND_ME_DATE_PHRASES` | `on` to infer a search window from a date phrase in the query | unset (off) |
+| `REMIND_ME_TIME_BUCKETS` | `recency` to reserve top slots for the newest buckets on an unwindowed search | unset (off) |
 
 ### Query expansion (`remind_me_core::query_expansion`)
 
