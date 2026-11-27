@@ -1,11 +1,11 @@
-//! Dry run of the dialog backfill (#528, D138, D139). Read only.
+//! Dry run of the dialog backfill (#528, D141, D142). Read only.
 //!
 //! Plans the copy of every live `memories` dialog row into the dialog store
 //! and reports what it would do, writing nothing: no store, file, blob or
 //! row is created. The apply waits for Nano's go on these counts (D3).
 //!
 //! A row with no `capture_id` cannot be stored and is listed, not a
-//! finding (Q37). A store row whose id has a different canonical hash
+//! finding (Q38). A store row whose id has a different canonical hash
 //! (D77) is drift: the apply would refuse it. The two digests let the
 //! later apply prove it reached exactly the store Nano approved.
 
@@ -33,7 +33,7 @@ pub struct Report {
     pub already_present: u64,
     /// Rows the store holds under the same id with a different hash.
     pub drift: Vec<String>,
-    /// Rows with no `capture_id`: they cannot be stored (Q37).
+    /// Rows with no `capture_id`: they cannot be stored (Q38).
     pub no_capture_id: Vec<String>,
     /// Store rows whose blob is missing or the wrong size.
     pub blob_missing: Vec<String>,

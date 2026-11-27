@@ -1,4 +1,4 @@
-//! The dialog backfill dry run (#528, D138, D139): counts what would move,
+//! The dialog backfill dry run (#528, D141, D142): counts what would move,
 //! writes nothing.
 
 #[path = "../src/test_env.rs"]
