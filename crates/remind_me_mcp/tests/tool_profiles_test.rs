@@ -411,18 +411,8 @@ fn a_registered_format_follows_the_routed_handler() {
             ),
         )
     });
-    assert_ne!(
-        reference["isError"],
-        json!(true),
-        "{}",
-        text(&reference)
-    );
-    assert_ne!(
-        history["isError"],
-        json!(true),
-        "{}",
-        text(&history)
-    );
+    assert_ne!(reference["isError"], json!(true), "{}", text(&reference));
+    assert_ne!(history["isError"], json!(true), "{}", text(&history));
     assert!(
         serde_json::from_str::<Value>(&text(&history)).is_ok(),
         "{}",
