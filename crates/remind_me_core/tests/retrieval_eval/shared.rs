@@ -17,6 +17,7 @@ use remind_me_core::db::{queries, Store};
 use remind_me_core::embedder::{EmbedError, EmbedRole, Embedder, EmbeddingIdentity};
 use remind_me_core::entity::{link_memory_entity, upsert_entity};
 use remind_me_core::retrieval::Deadline;
+use remind_me_core::time_buckets::Mode;
 use remind_me_core::topic::{self, Parent, TopicName};
 use remind_me_core::vectors::embed_and_store;
 use remind_me_core::{Database, EntityInput, MemorySearchInput, RetrievalStrategy, SearchFilters};
@@ -299,6 +300,18 @@ pub fn ranked_outcome(
     embedder: Option<&dyn Embedder>,
     dates: bool,
 ) -> (Vec<String>, bool) {
+    ranked_outcome_with(store, g, strategy, embedder, dates, Mode::Off)
+}
+
+/// [`ranked_outcome`] with card #568's recency buckets set as given.
+pub fn ranked_outcome_with(
+    store: &Store<'_>,
+    g: &GoldenQuery,
+    strategy: RetrievalStrategy,
+    embedder: Option<&dyn Embedder>,
+    dates: bool,
+    time_buckets: Mode,
+) -> (Vec<String>, bool) {
     let input = MemorySearchInput {
         query: g.query.clone(),
         limit: DEPTH,
@@ -322,8 +335,14 @@ pub fn ranked_outcome(
     } else {
         input
     };
-    let outcome =
-        queries::search_memories_deadlined(store, &input, embedder, Deadline::unbounded()).unwrap();
+    let outcome = queries::search_memories_deadlined_with(
+        store,
+        &input,
+        embedder,
+        Deadline::unbounded(),
+        time_buckets,
+    )
+    .unwrap();
     let degraded = outcome.timing.degraded();
     let ids = outcome.results.into_iter().map(|r| r.memory.id).collect();
     (ids, degraded)
