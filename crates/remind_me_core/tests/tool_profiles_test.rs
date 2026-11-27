@@ -8,7 +8,8 @@ mod test_env;
 
 use remind_me_core::tool_profiles::{
     allowed_groups, allowed_tools, configured_profile, group_of, prompt_allowed, replacement,
-    tool_allowed, ALIASES, CORE, GROUPS, MAINTENANCE_PROMPTS, PIPELINE, TOOL_PROFILE_ENV, WIKI,
+    tool_allowed, ALIASES, CORE, GROUPS, MAINTENANCE_PROMPTS, MINIMAL, PIPELINE, TOOL_PROFILE_ENV,
+    WIKI,
 };
 use std::collections::BTreeSet;
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -21,6 +22,9 @@ fn env_lock() -> MutexGuard<'static, ()> {
 }
 
 fn profile_for(raw: &str) -> String {
+    // A real `~/.remind-me/clients.json` must not change what this sees.
+    let missing = std::env::temp_dir().join(format!("rrm_no_clients_{}.json", std::process::id()));
+    crate::test_env::set_var(remind_me_core::clients::CLIENTS_FILE_ENV, missing);
     crate::test_env::set_var(TOOL_PROFILE_ENV, raw);
     let profile = configured_profile();
     crate::test_env::remove_var(TOOL_PROFILE_ENV);
@@ -55,12 +59,27 @@ fn an_unknown_profile_falls_back_to_full_rather_than_failing() {
     // A typo yields the widest surface. Refusing to start over a misspelled
     // optimisation would be worse than the misspelling, and an empty surface
     // would look like a broken server.
-    assert_eq!(profile_for("minimal"), "full");
+    assert_eq!(profile_for("minimul"), "full");
     assert_eq!(
         profile_for("core,wikki"),
         "full",
         "one bad part spoils the list"
     );
+}
+
+#[test]
+fn minimal_is_a_real_profile_now() {
+    let _guard = env_lock();
+    // Before ADR-0028 step 3 it was unrecognised and fell back to `full`.
+    assert_eq!(profile_for(" Minimal "), "minimal");
+    let tools = allowed_tools("minimal").expect("minimal narrows");
+    assert_eq!(tools, MINIMAL.into_iter().collect());
+    assert!(!tool_allowed("minimal", "remind_me_server_status"));
+    assert!(
+        tool_allowed("minimal", "remind_me_list"),
+        "an alias of search"
+    );
+    assert!(allowed_groups("minimal").expect("narrows").is_empty());
 }
 
 #[test]
