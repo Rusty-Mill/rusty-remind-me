@@ -102,6 +102,15 @@ class SettingsTest(unittest.TestCase):
         self.assertIsNone(s.problem())
         self.assertNotIn("'t'", repr(s), "the token never shows in a repr")
 
+    def test_the_capture_token_comes_from_the_environment_only(self) -> None:
+        with tempfile.TemporaryDirectory() as home:
+            Path(home, rm.SETTINGS_FILE).write_text(json.dumps({"capture_token": "from-file"}))
+            s = rm.load_settings(home, {"REMIND_ME_URL": "https://a/mcp", "REMIND_ME_TOKEN": "t"})
+            self.assertIsNone(s.capture_token)
+            s = rm.load_settings(home, {"REMIND_ME_CAPTURE_TOKEN": " c-token "})
+        self.assertEqual(s.capture_token, "c-token")
+        self.assertNotIn("c-token", repr(s))
+
     def test_defaults_are_local(self) -> None:
         s = rm.load_settings(None, {})
         self.assertFalse(s.remote)
@@ -210,6 +219,19 @@ class ProviderTest(unittest.TestCase):
         self.assertEqual(args["tags"], ["hermes", "hermes-gw"])
         self.assertEqual(args["metadata"]["session_id"], "hermes-gw:sess-1")
 
+    def test_remote_capture_with_the_capture_token_is_session_keyed(self) -> None:
+        seen: list[tuple[Any, str, str, list[Any]]] = []
+        original = rm.capture_remote
+        rm.capture_remote = lambda settings, client, session, kept: seen.append((settings, client, session, kept)) or ""
+        settings = rm.Settings(url="https://a/mcp", token="t", capture_token="c")
+        try:
+            p = provider_with(self.t, settings, agent_identity="gw")
+            p.on_session_end([{"role": "user", "content": "ship it?"}])
+        finally:
+            rm.capture_remote = original
+        self.assertEqual(seen, [(settings, "hermes-gw", "hermes-gw:sess-1", [rm.Message("user", "ship it?")])])
+        self.assertEqual(self.t.calls(), [], "no auto_capture beside it")
+
     def test_local_capture_keys_the_session_by_client(self) -> None:
         seen: list[tuple[str, str]] = []
         original = rm.capture_local
@@ -230,7 +252,7 @@ class ProviderTest(unittest.TestCase):
 
     def test_save_config_keeps_secrets_out(self) -> None:
         with tempfile.TemporaryDirectory() as home:
-            self.p.save_config({"url": "https://a/mcp", "token": "secret", "project": "p"}, home)
+            self.p.save_config({"url": "https://a/mcp", "token": "secret", "capture_token": "c", "project": "p"}, home)
             saved = json.loads(Path(home, rm.SETTINGS_FILE).read_text())
         self.assertEqual(saved, {"url": "https://a/mcp", "project": "p"})
 
@@ -268,6 +290,93 @@ FAKE_SERVER = textwrap.dedent(
         print(json.dumps({{"jsonrpc": "2.0", "id": msg["id"], "result": result}}), flush=True)
     """
 )
+
+
+class TranscriptTest(unittest.TestCase):
+    def test_lines_are_flat_role_content_json(self) -> None:
+        got = rm.transcript_jsonl([rm.Message("user", 'say "hi"\nplease'), rm.Message("assistant", "héllo")])
+        lines = got.splitlines()
+        self.assertEqual([json.loads(l) for l in lines], [
+            {"role": "user", "content": 'say "hi"\nplease'},
+            {"role": "assistant", "content": "héllo"},
+        ])
+        self.assertTrue(got.endswith("\n"))
+        self.assertIn("héllo", got, "non-ASCII is not escaped, as on the server")
+
+    def test_the_newest_whole_lines_fit_the_escaped_limit(self) -> None:
+        messages = [rm.Message("user", f"turn {n}") for n in range(5)]
+        line = rm.transcript_jsonl(messages[-1:])
+        limit = 2 * rm.escaped_len(line)
+        got = rm.transcript_jsonl(messages, limit)
+        self.assertEqual([json.loads(l)["content"] for l in got.splitlines()], ["turn 3", "turn 4"])
+        self.assertLessEqual(rm.escaped_len(got), limit)
+        self.assertEqual(rm.escaped_len('"\\\n'), 6, "quote, backslash and newline count twice")
+        self.assertEqual(rm.transcript_jsonl([rm.Message("user", "x" * 50)], 10), "")
+
+
+class CaptureServer:
+    """A loopback MCP endpoint that records each request (headers and body)."""
+
+    def __init__(self) -> None:
+        import http.server
+        import threading
+
+        seen = self.seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802 (http.server's name)
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                seen.append((dict(self.headers), body))
+                if "id" not in body:
+                    self.send_response(202)
+                    self.end_headers()
+                    return
+                if body["method"] == "initialize":
+                    result: dict[str, Any] = {"protocolVersion": rm.PROTOCOL_VERSION}
+                else:
+                    result = {"content": [{"type": "text", "text": "{}"}]}
+                raw = json.dumps({"jsonrpc": "2.0", "id": body["id"], "result": result}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Mcp-Session-Id", "sess-abc")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def log_message(self, *args: Any) -> None:
+                pass
+
+        self.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_port}/mcp"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class CaptureRemoteTest(unittest.TestCase):
+    def test_capture_transcript_goes_with_the_capture_token_in_its_own_session(self) -> None:
+        server = CaptureServer()
+        try:
+            settings = rm.Settings(url=server.url, token="connector", capture_token="capture")
+            rm.capture_remote(settings, "hermes-gw", "hermes-gw:s1", [rm.Message("user", "hi")])
+        finally:
+            server.close()
+        methods = [body.get("method") for _, body in server.seen]
+        self.assertEqual(methods, ["initialize", "notifications/initialized", "tools/call"])
+        self.assertTrue(all(h["Authorization"] == "Bearer capture" for h, _ in server.seen))
+        headers, call = server.seen[-1]
+        self.assertEqual(headers["Mcp-Session-Id"], "sess-abc")
+        self.assertEqual(call["params"], {"name": "remind_me_capture_transcript", "arguments": {
+            "session_id": "hermes-gw:s1",
+            "transcript": '{"role":"user","content":"hi"}\n',
+            "reason": "end",
+        }})
+
+    def test_no_capture_token_or_nothing_that_fits_raises(self) -> None:
+        with self.assertRaises(rm.RemindMeError):
+            rm.capture_remote(rm.Settings(url="https://a/mcp", token="t"), "c", "s", [rm.Message("user", "x")])
 
 
 class ProcessTest(unittest.TestCase):

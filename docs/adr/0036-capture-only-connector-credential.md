@@ -1,6 +1,6 @@
 # ADR-0036: A capture-only connector credential
 
-Status: Proposed (2026-11-23); D64 to D67
+Status: Proposed (2026-11-23); D64 to D67; D134 (Hermes)
 Date: 2026-11-23
 
 Continues ADR-0029, whose cloud hook needs a credential it can carry.
@@ -18,6 +18,14 @@ uploaded to claude.ai do run.
 A plugin is files, so its credential is readable by every agent in every
 container it is installed in, including a prompt-injected one. The connector
 token can read, change and delete every memory; it cannot go there.
+
+The Hermes memory provider (ADR-0028 step 6, `plugins/hermes-memory/`) has
+the same need remotely: one capture per session, replaced on a repeated
+callback, with no verified client credential of its own. It uses this
+credential too when it is set, and falls back to `remind_me_auto_capture`
+without it (D134). Nothing on the server changes for it: the gate, the
+profile exemption and the `remind-me-capture-token` stamp below apply as
+they are.
 
 ## Decision
 

@@ -41,7 +41,10 @@ failure is logged.
      binary must be on `PATH` or named in `command`.
    - **Remote**: set `url` to the connector's MCP URL (ending `/mcp`) and the
      token in `REMIND_ME_TOKEN`. `REMIND_ME_URL` overrides `url`. The token is
-     never written to `remind-me.json`.
+     never written to `remind-me.json`. For one capture per session, also
+     set `REMIND_ME_CAPTURE_TOKEN` to the server's
+     `REMIND_ME_REMOTE_CAPTURE_TOKEN` (ADR-0036); it too stays out of
+     `remind-me.json`.
 
 4. Register each profile in remind-me's `clients.json` (beside the store) so
    it gets its own client id and a small tool list:
@@ -64,8 +67,15 @@ failure is logged.
 - Either way the session is keyed `<client>:<hermes session id>`
   (`hermes-jarvis:abc`), so two profiles that reuse a session id keep their
   own captures (D133).
-- Remote: `remind_me_auto_capture` with the conversation and a mechanical
-  summary, tagged `hermes` and the client id.
+- Remote, capture token set: `remind_me_capture_transcript` with the
+  conversation as `{role, content}` JSONL (its newest lines within the
+  server's 3 MiB escaped limit) and the same session key, in its own MCP
+  session with `REMIND_ME_CAPTURE_TOKEN`. One capture per session, as
+  locally. Its rows carry `client = remind-me-capture-token`, not the Hermes
+  client id (D67), so the bot shows only in the session key (D134).
+- Remote, no capture token: `remind_me_auto_capture` with the conversation
+  and a mechanical summary, tagged `hermes` and the client id. Each callback
+  may write its own capture; this is the documented exception (D134).
 
 Redaction is the server's, either way.
 

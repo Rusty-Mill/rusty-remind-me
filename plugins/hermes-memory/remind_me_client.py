@@ -33,6 +33,10 @@ REQUEST_SECONDS = 30.0
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 LOOPBACK = frozenset({"127.0.0.1", "::1", "localhost"})
 USER_AGENT = "remind-me-hermes/1"
+# transcript::MAX_TRANSCRIPT_BYTES: what remind_me_capture_transcript accepts,
+# counted JSON-escaped.
+MAX_TRANSCRIPT_BYTES = 3 * 1024 * 1024
+CAPTURE_TOOL = "remind_me_capture_transcript"
 
 
 class RemindMeError(Exception):
@@ -47,6 +51,9 @@ class Settings:
     url: str | None = None
     token: str | None = field(default=None, repr=False)
     project: str | None = None
+    # ADR-0036's capture-only credential: remote captures go through
+    # `remind_me_capture_transcript`, one per session (D134).
+    capture_token: str | None = field(default=None, repr=False)
 
     @property
     def remote(self) -> bool:
@@ -69,7 +76,8 @@ class Settings:
 
 def load_settings(hermes_home: str | None, env: Mapping[str, str]) -> Settings:
     """Settings from `$HERMES_HOME/remind-me.json`, then `REMIND_ME_URL` and
-    `REMIND_ME_TOKEN`. A file that exists but does not parse is an error."""
+    `REMIND_ME_TOKEN` and `REMIND_ME_CAPTURE_TOKEN` (environment only). A
+    file that exists but does not parse is an error."""
     stored: dict[str, Any] = {}
     if hermes_home:
         path = Path(hermes_home) / SETTINGS_FILE
@@ -86,6 +94,7 @@ def load_settings(hermes_home: str | None, env: Mapping[str, str]) -> Settings:
         url=_text(env.get("REMIND_ME_URL")) or _text(stored.get("url")),
         token=_text(env.get("REMIND_ME_TOKEN")),
         project=_text(stored.get("project")),
+        capture_token=_text(env.get("REMIND_ME_CAPTURE_TOKEN")),
     )
 
 
@@ -394,8 +403,44 @@ def capture_local(command: str, client: str, session_id: str, messages: Sequence
     return done.stdout
 
 
+def escaped_len(text: str) -> int:
+    """Bytes `text` costs JSON-escaped, as transcript::encoded_len counts them."""
+    return len(json.dumps(text, ensure_ascii=False).encode()) - 2
+
+
+def transcript_jsonl(messages: Sequence[Message], limit: int = MAX_TRANSCRIPT_BYTES) -> str:
+    """One `{role, content}` line per message, as `messages_jsonl` writes them:
+    the newest whole lines whose escaped size fits in `limit`."""
+    kept: list[str] = []
+    used = 0
+    for m in reversed(messages):
+        line = json.dumps({"role": m.role, "content": m.text}, ensure_ascii=False, separators=(",", ":")) + "\n"
+        used += escaped_len(line)
+        if used > limit:
+            break
+        kept.append(line)
+    return "".join(reversed(kept))
+
+
+def capture_remote(settings: Settings, client: str, session_id: str, messages: Sequence[Message]) -> str:
+    """Capture through `remind_me_capture_transcript` with the capture-only
+    token, in its own MCP session: one capture per session, replaced in
+    place (D134). The server pins the writer to `remind-me-capture-token`."""
+    if not settings.url or not settings.capture_token:
+        raise RemindMeError("capture token not configured")
+    transcript = transcript_jsonl(messages)
+    if not transcript:
+        raise RemindMeError("transcript too large")
+    capture = McpClient(HttpTransport(settings.url, settings.capture_token), client)
+    try:
+        return capture.call(CAPTURE_TOOL, {"session_id": session_id, "transcript": transcript, "reason": "end"})
+    finally:
+        capture.close()
+
+
 def capture_arguments(client: str, session_id: str, messages: Sequence[Message]) -> dict[str, Any]:
-    """`remind_me_auto_capture` arguments for a remote capture. The summary is
+    """`remind_me_auto_capture` arguments for a remote capture without a capture
+    token: each callback may write its own capture (D134). The summary is
     mechanical: the tool requires one and the plugin has no model of its own."""
     conversation = "\n\n".join(f"{m.role}: {m.text}" for m in messages)
     first_user = next((m.text for m in messages if m.role == "user"), "")

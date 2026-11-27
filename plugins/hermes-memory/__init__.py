@@ -174,7 +174,8 @@ class RemindMeProvider(MemoryProvider):  # type: ignore[misc,valid-type]
     def on_session_end(self, messages: list[dict[str, Any]]) -> None:
         """Capture the conversation once per session (ADR-0028 §5): locally
         through `capture-transcript --format messages`, remotely through
-        `remind_me_auto_capture`. Redaction is the server's (D15)."""
+        `remind_me_capture_transcript` with the capture token, else
+        `remind_me_auto_capture` (D134). Redaction is the server's (D15)."""
         if not self._primary or self._settings is None or not self._session_id:
             return
         kept = rm.transcript(messages)
@@ -182,7 +183,9 @@ class RemindMeProvider(MemoryProvider):  # type: ignore[misc,valid-type]
             return
         session = rm.session_key(self._client_id, self._session_id)
         try:
-            if self._settings.remote:
+            if self._settings.remote and self._settings.capture_token:
+                rm.capture_remote(self._settings, self._client_id, session, kept)
+            elif self._settings.remote:
                 args = rm.capture_arguments(self._client_id, session, kept)
                 client = self._client()
                 if client is not None:
@@ -200,6 +203,8 @@ class RemindMeProvider(MemoryProvider):  # type: ignore[misc,valid-type]
              "required": False, "default": ""},
             {"key": "token", "description": "Remote connector token", "secret": True,
              "required": False, "env_var": "REMIND_ME_TOKEN"},
+            {"key": "capture_token", "description": "Remote capture-only token, for one capture per session (optional)",
+             "secret": True, "required": False, "env_var": "REMIND_ME_CAPTURE_TOKEN"},
             {"key": "project", "description": "Project whose brief opens each session (optional)",
              "required": False, "default": ""},
         ]
