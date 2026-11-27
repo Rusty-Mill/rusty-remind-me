@@ -11,7 +11,7 @@ Dated entries, newest first. One entry per merged pull request.
 - `DialogStore::scan` (all rows, oldest first) with a conformance check; `DialogRecord::canonical_hash`; `SqliteDialogs::open_read_only` and `snapshot_into`; `db::dialogs::dir_beside` (moved from the shadow write).
 
 ### Changed
-- Dialog packages are pruned to `BACKUP_RETENTION_COUNT` on their own count; `pruned` and `total_backups` still count engine backups only.
+- Dialog packages are pruned to `BACKUP_RETENTION_COUNT` on their own count; `pruned` and `total_backups` still count engine backups only. Pruning is best effort: it lists packages without reading inside them, and a listing failure is logged and reported as `dialog_prune_warning` without failing the backup.
 
 ### Not in this change
 - The cloud upload covers the engine backup only. Uploading the dialog package is a follow-up.

@@ -70,6 +70,10 @@ pub struct BackupOutcome {
     /// output) when the node has no dialog store.
     #[serde(default, skip_serializing_if = "DialogPackage::is_no_store")]
     pub dialogs: DialogPackage,
+    /// Why dialog package retention was skipped, if it was. The backup
+    /// itself still succeeded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dialog_prune_warning: Option<String>,
 }
 
 /// The dialog store's part of a backup run.
@@ -119,21 +123,41 @@ pub fn backup_dir(store: &Store<'_>) -> Result<PathBuf> {
 
 /// List existing backups of the engine, newest first.
 pub fn list_backups(dir: &Path) -> Result<Vec<BackupInfo>> {
-    list_where(dir, |path, extension| {
+    list_where(dir, Sizes::Measured, |path, extension| {
         extension == Some("db") || (extension == Some(ENGINE_BACKUP_EXTENSION) && path.is_dir())
     })
 }
 
 /// List existing dialog packages, newest first.
 pub fn list_dialog_packages(dir: &Path) -> Result<Vec<BackupInfo>> {
-    list_where(dir, |path, extension| {
-        extension == Some(crate::dialog_backup::EXTENSION) && path.is_dir()
-    })
+    list_where(dir, Sizes::Measured, is_dialog_package)
+}
+
+fn is_dialog_package(path: &Path, extension: Option<&str>) -> bool {
+    extension == Some(crate::dialog_backup::EXTENSION) && path.is_dir()
+}
+
+/// Dialog packages for pruning, newest first: nothing inside a package is
+/// read, so an unreadable old package cannot fail the listing.
+fn dialog_packages_unsized(dir: &Path) -> Result<Vec<BackupInfo>> {
+    list_where(dir, Sizes::Skipped, is_dialog_package)
+}
+
+/// Whether [`list_where`] measures each entry's size.
+#[derive(Clone, Copy)]
+enum Sizes {
+    Measured,
+    /// `size_bytes` is 0 and nothing inside a directory is read.
+    Skipped,
 }
 
 /// Entries of `dir` that `keep` accepts (given the path and its extension),
 /// newest first. A directory's size is the bytes of every file under it.
-fn list_where(dir: &Path, keep: impl Fn(&Path, Option<&str>) -> bool) -> Result<Vec<BackupInfo>> {
+fn list_where(
+    dir: &Path,
+    sizes: Sizes,
+    keep: impl Fn(&Path, Option<&str>) -> bool,
+) -> Result<Vec<BackupInfo>> {
     if !dir.exists() {
         return Ok(Vec::new());
     }
@@ -149,10 +173,10 @@ fn list_where(dir: &Path, keep: impl Fn(&Path, Option<&str>) -> bool) -> Result<
         }
         let metadata = entry.metadata().map_err(io(&path))?;
         let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
-        let size_bytes = if path.is_dir() {
-            size_of_tree(&path)?
-        } else {
-            metadata.len()
+        let size_bytes = match sizes {
+            Sizes::Skipped => 0,
+            Sizes::Measured if path.is_dir() => size_of_tree(&path)?,
+            Sizes::Measured => metadata.len(),
         };
         backups.push((
             modified,
@@ -204,6 +228,27 @@ fn prune_old_backups(backups: &[BackupInfo], keep: usize) -> usize {
         }
     }
     removed
+}
+
+/// Prune dialog packages beyond `keep`, listing them with `list`. Never an
+/// error: the engine backup is already done, so a failure is logged and
+/// returned as the warning to report.
+fn prune_dialog_packages(
+    dir: &Path,
+    keep: usize,
+    list: impl Fn(&Path) -> Result<Vec<BackupInfo>>,
+) -> Option<String> {
+    match list(dir) {
+        Ok(packages) => {
+            prune_old_backups(&packages, keep);
+            None
+        }
+        Err(e) => {
+            let warning = format!("dialog package retention skipped: {e}");
+            eprintln!("rusty-remind-me: {warning}");
+            Some(warning)
+        }
+    }
 }
 
 /// Package the dialog store beside `store`'s database as
@@ -260,14 +305,17 @@ pub fn create_backup(store: &Store<'_>, label: &str) -> Result<BackupOutcome> {
     let upload = crate::cloud_backup::upload_backup_dir(&dest);
     let pruned = prune_old_backups(&list_backups(&dir)?, BACKUP_RETENTION_COUNT);
     // Dialog packages are pruned on their own count, not reported as
-    // `pruned`, which keeps meaning engine backups.
-    prune_old_backups(&list_dialog_packages(&dir)?, BACKUP_RETENTION_COUNT);
+    // `pruned`, which keeps meaning engine backups. Best effort, like the
+    // package itself.
+    let dialog_prune_warning =
+        prune_dialog_packages(&dir, BACKUP_RETENTION_COUNT, dialog_packages_unsized);
     Ok(BackupOutcome {
         path: dest.to_string_lossy().to_string(),
         total_backups: list_backups(&dir)?.len(),
         pruned,
         upload,
         dialogs,
+        dialog_prune_warning,
     })
 }
 
@@ -283,5 +331,48 @@ fn safe_label(label: &str) -> String {
         "manual".to_string()
     } else {
         slug.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn package(dir: &Path, name: &str) {
+        std::fs::create_dir_all(dir.join(format!("{name}.dialogs"))).unwrap();
+    }
+
+    #[test]
+    fn a_failed_dialog_listing_is_a_warning_and_prunes_nothing() {
+        let dir = std::env::temp_dir().join(format!("prune_{}", uuid::Uuid::new_v4().simple()));
+        package(&dir, "a");
+        package(&dir, "b");
+        let failing =
+            |p: &Path| -> Result<Vec<BackupInfo>> { Err(io(p)(std::io::Error::other("injected"))) };
+        let warning = prune_dialog_packages(&dir, 0, failing).unwrap();
+        assert!(warning.contains("injected"), "{warning}");
+        assert_eq!(dialog_packages_unsized(&dir).unwrap().len(), 2);
+        assert_eq!(
+            prune_dialog_packages(&dir, 1, dialog_packages_unsized),
+            None
+        );
+        assert_eq!(dialog_packages_unsized(&dir).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pruning_reads_nothing_inside_a_package() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("prune_{}", uuid::Uuid::new_v4().simple()));
+        package(&dir, "old");
+        let inner = dir.join("old.dialogs").join("blobs");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Unsized listing never descends, so the unreadable directory
+        // cannot fail it (as root it is readable anyway; still passes).
+        assert_eq!(dialog_packages_unsized(&dir).unwrap().len(), 1);
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
