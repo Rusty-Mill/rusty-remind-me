@@ -49,7 +49,8 @@ pub fn entity_id(name: &str) -> String {
     sha256::digest(normalize_entity_name(name))[..12].to_string()
 }
 
-/// Insert an entity, or merge into the existing row of the same name.
+/// Insert an entity, or merge into the existing row of the same name, or
+/// into the entity that already carries the name as an alias (card #567).
 ///
 /// Aliases **union-merge**: existing first, then new ones, de-duplicated and
 /// order-preserving. A missing `kind` is filled in, but an existing `kind` is
@@ -60,6 +61,26 @@ pub fn entity_id(name: &str) -> String {
 /// `updated_at` moves only when something actually changed, so a no-op mention
 /// does not churn the row.
 pub fn upsert_entity(store: &Store<'_>, input: &EntityInput) -> Result<Entity> {
+    upsert_with(store, input, Lookup::NameOrAlias)
+}
+
+/// [`upsert_entity`] keyed on the derived id alone: a name that is another
+/// entity's alias still gets its own row. For restoring an export, whose
+/// links name the original ids.
+pub fn upsert_entity_exact(store: &Store<'_>, input: &EntityInput) -> Result<Entity> {
+    upsert_with(store, input, Lookup::Exact)
+}
+
+/// How an upsert finds the row a name already has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lookup {
+    /// The derived id only.
+    Exact,
+    /// The derived id, else a stored name or alias that normalises the same.
+    NameOrAlias,
+}
+
+fn upsert_with(store: &Store<'_>, input: &EntityInput, lookup: Lookup) -> Result<Entity> {
     let now = Utc::now().to_rfc3339();
     let name = input.name.trim();
     let id = entity_id(name);
@@ -78,7 +99,12 @@ pub fn upsert_entity(store: &Store<'_>, input: &EntityInput) -> Result<Entity> {
     // so a casing variant misses the lookup, tries to insert, and collides on
     // the `entities.id` unique constraint.
     let entities = Entities::new(store);
-    match entities.get(&id)? {
+    let existing = match entities.get(&id)? {
+        Some(found) => Some(found),
+        None if lookup == Lookup::NameOrAlias => by_name_or_alias(&entities, name)?,
+        None => None,
+    };
+    match existing {
         None => {
             let entity = Entity {
                 id: id.clone(),
@@ -102,12 +128,37 @@ pub fn upsert_entity(store: &Store<'_>, input: &EntityInput) -> Result<Entity> {
             let new_kind = existing.kind.clone().or_else(|| input.kind.clone());
 
             if merged != existing.aliases || new_kind != existing.kind {
-                entities.set_kind_and_aliases(&id, new_kind.as_deref(), &merged, &now)?;
+                entities.set_kind_and_aliases(&existing.id, new_kind.as_deref(), &merged, &now)?;
             }
+            return entities
+                .get(&existing.id)?
+                .ok_or(crate::db::StoreError::NotFound);
         }
     }
 
     entities.get(&id)?.ok_or(crate::db::StoreError::NotFound)
+}
+
+/// The stored entity a name with no row of its own already means: one
+/// whose stored name normalises to it, else one carrying it as an alias
+/// (card #567, pack D105). Ties go to the oldest, then the smaller id, so
+/// the same name always lands on the same entity. A miss costs one scan.
+fn by_name_or_alias(entities: &Entities<'_>, name: &str) -> Result<Option<Entity>> {
+    let key = normalize_entity_name(name);
+    if key.is_empty() || crate::topic::is_topic_name(name) {
+        return Ok(None);
+    }
+    let all = entities.all_oldest_first()?;
+    let by_name = all
+        .iter()
+        .find(|e| normalize_entity_name(&e.name) == key)
+        .cloned();
+    if by_name.is_some() {
+        return Ok(by_name);
+    }
+    Ok(all
+        .into_iter()
+        .find(|e| e.aliases.iter().any(|a| normalize_entity_name(a) == key)))
 }
 
 /// Fetch an entity by its deterministic id.

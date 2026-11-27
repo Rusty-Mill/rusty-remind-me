@@ -1041,7 +1041,7 @@ pub fn restore_graph_records(
             }
             _ => Vec::new(),
         };
-        upsert_entity(
+        crate::entity::upsert_entity_exact(
             store,
             &EntityInput {
                 name: name.to_string(),

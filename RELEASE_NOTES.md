@@ -2,6 +2,21 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-27 — Person-confirmed entity merge, with undo (Mill Board #567, D101-D107)
+
+### Added
+- `remind_me_entity_upsert` gains `merge_into`, `confirm` and `revert_merge` (D107, the D3 approval). `name` + `merge_into` previews: counts for both sides, links moved and shared, relations moved and dropped, aliases and kind A would gain; nothing is written. Adding `confirm: true` merges in one store transaction: B's links and relations move to A, B's name and aliases join A's aliases, A's kind is kept (B's fills a hole), the earlier `created_at` wins, a merge record is written and B is deleted. A repeat is a no-op naming the earlier merge.
+- The merge record is a fact memory (`B entity.merged_into A`, tag `entity-merge`, undo data in `metadata.entity_merge`). `revert_merge: <record id>` with `name` = B restores B exactly (row, links, relations, A's aliases, kind and `created_at`), keeps what A gained since, skips memories deleted since, and writes an `entity.merge_reverted` fact that supersedes the record (the #702 pattern, D106).
+- Refused: merging an entity into itself, a topic on either side, and absorbing a project (kind `project` or the subject of project claims; a project may absorb).
+- `EntityStore::delete_relation`, on both backends, conformance-tested.
+
+### Changed
+- `upsert_entity`: a name with no row of its own that matches an existing entity's stored name or alias now lands on that entity instead of creating a new one (D105), so a merge sticks when B's name is mentioned again. Alias ties go to the oldest entity. A miss costs one scan of the entity table. Restoring an export (`importer`) keeps exact ids through the new `upsert_entity_exact`; the dbs importer counts only truly new entities as created.
+- Relations a merge moves are re-keyed under A's derived id. A B relation that would point A at itself, or that A already has, is dropped and A's row is left as it was.
+
+### Tests
+- Core (`tests/entity_merge_test.rs`, 12): preview writes nothing; merge moves links, names and kind; an existing kind is kept; relations both ways with self-loop and duplicate dropped; idempotent repeat; revert restores exactly and refuses a second time; revert keeps later links and skips deleted memories; revert checks the name; self, topic and project refusals; project claims refuse; a later mention lands on the survivor; alias ties and the exact upsert. MCP: preview, confirm, repeat, revert and refused argument mixes. Conformance: `delete_relation` on engine and SQLite.
+
 ## 2026-11-26 — Entity overlap ranking signal measured and dropped (Mill Board #64, D92)
 
 ### Added

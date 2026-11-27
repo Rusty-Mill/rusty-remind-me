@@ -630,6 +630,12 @@ fn claims_by_subject(store: &Store<'_>) -> Result<ClaimGroups> {
     Ok((groups, orphans))
 }
 
+/// Whether any project claim, live or not, names `subject`: such an entity
+/// cannot be merged away, since its claims are keyed on its name (card #567).
+pub(crate) fn has_claims(store: &Store<'_>, subject: &str) -> Result<bool> {
+    Ok(!claims_for(store, subject)?.is_empty())
+}
+
 fn claims_for(store: &Store<'_>, subject: &str) -> Result<Vec<Memory>> {
     Ok(claims_by_subject(store)?
         .0

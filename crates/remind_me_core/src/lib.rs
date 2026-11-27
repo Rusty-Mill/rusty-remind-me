@@ -37,6 +37,7 @@ pub mod duplicates;
 pub mod embedder;
 pub mod entity;
 pub mod entity_duplicates;
+pub mod entity_merge;
 pub mod episodes;
 pub mod events;
 pub mod expansion;

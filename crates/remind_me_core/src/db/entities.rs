@@ -155,6 +155,10 @@ pub trait EntityStore {
     /// inserted: relations are immutable.
     fn insert_relation_or_ignore(&mut self, row: &RelationRow<'_>, origin: Origin) -> Result<bool>;
 
+    /// Delete the relation `id`. Whether it existed. Never queued: only an
+    /// entity merge or its revert removes a relation (card #567).
+    fn delete_relation(&mut self, id: &str) -> Result<bool>;
+
     /// Every relation with either end in `entity_ids`, and `relation` as its
     /// label when one is given, oldest first (ties by id). Each comes with
     /// its id, and a relation whose ends are not both stored here is
@@ -341,6 +345,11 @@ impl<'c> Entities<'c> {
     /// See [`EntityStore::insert_relation_or_ignore`].
     pub fn insert_relation_or_ignore(&self, row: &RelationRow<'_>, origin: Origin) -> Result<bool> {
         EntityStore::insert_relation_or_ignore(&mut *self.backend.lock()?, row, origin)
+    }
+
+    /// See [`EntityStore::delete_relation`].
+    pub fn delete_relation(&self, id: &str) -> Result<bool> {
+        EntityStore::delete_relation(&mut *self.backend.lock()?, id)
     }
 
     /// See [`EntityStore::relations_touching`].
@@ -659,6 +668,34 @@ pub mod conformance {
         assert!(EntityStore::entities_of(store, &[]).unwrap().is_empty());
     }
 
+    pub fn delete_relation_removes_only_that_row(store: &mut dyn EntityStore) {
+        let row = |id: &'static str, object: &'static str| RelationRow {
+            id,
+            subject_entity_id: "a",
+            relation: "uses",
+            object_entity_id: object,
+            created_at: T1,
+            updated_at: T1,
+            node_id: None,
+        };
+        store
+            .insert_relation_or_ignore(&row("r1", "b"), Origin::Local)
+            .unwrap();
+        store
+            .insert_relation_or_ignore(&row("r2", "c"), Origin::Local)
+            .unwrap();
+
+        assert!(store.delete_relation("r1").unwrap());
+        assert!(!store.delete_relation("r1").unwrap());
+        let left: Vec<String> = store
+            .relations_oldest_first()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(left, vec!["r2".to_string()]);
+    }
+
     pub fn relations_touching_nothing_is_empty(store: &mut dyn EntityStore) {
         assert!(store.relations_touching(&[], None, 1).unwrap().is_empty());
     }
@@ -687,6 +724,10 @@ macro_rules! entity_conformance {
         #[test]
         fn entities_of_unions_the_links_of_the_named_memories() {
             conformance::entities_of_unions_the_links_of_the_named_memories(&mut $make);
+        }
+        #[test]
+        fn delete_relation_removes_only_that_row() {
+            conformance::delete_relation_removes_only_that_row(&mut $make);
         }
         #[test]
         fn relations_touching_nothing_is_empty() {

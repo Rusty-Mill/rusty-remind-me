@@ -736,6 +736,16 @@ pub(crate) fn insert_relation_or_ignore(
     Ok(true)
 }
 
+/// Delete relation `id`. Whether it existed. Never queued.
+pub(crate) fn delete_relation(tables: &mut EngineTables, id: &str) -> Result<bool> {
+    let key = engine_id(id);
+    if core_ref(tables)?.relations.get(key).is_none() {
+        return Ok(false);
+    }
+    tables.commit(vec![Change::Relation(key, None)])?;
+    Ok(true)
+}
+
 /// Insert a peer's entity, or overwrite everything but the local
 /// `created_at`. Never queued.
 pub(crate) fn upsert_synced(
@@ -939,6 +949,10 @@ impl EntityStore for EngineTables {
 
     fn insert_relation_or_ignore(&mut self, row: &RelationRow<'_>, origin: Origin) -> Result<bool> {
         insert_relation_or_ignore(self, row, origin)
+    }
+
+    fn delete_relation(&mut self, id: &str) -> Result<bool> {
+        delete_relation(self, id)
     }
 
     fn relations_touching(

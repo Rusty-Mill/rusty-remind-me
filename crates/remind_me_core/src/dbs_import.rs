@@ -448,7 +448,7 @@ pub fn pull_dbs(
                         aliases: Vec::new(),
                     },
                 )?;
-                if !before {
+                if !before && entity.id == crate::entity::entity_id(name) {
                     result.entities_created += 1;
                 }
                 if link_memory_entity(page, &memory_id, &entity.id)? {

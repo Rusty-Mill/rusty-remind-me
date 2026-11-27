@@ -56,6 +56,40 @@ fn upserted_entity_payload(store: &remind_me_core::db::Store<'_>, ent: &entity::
     payload
 }
 
+/// `remind_me_entity_upsert`: create or update an entity, or preview, apply
+/// or revert a person-confirmed merge (card #567). An error is the text the
+/// caller sees.
+fn entity_upsert(store: &remind_me_core::db::Store<'_>, args: Value) -> Result<Value, String> {
+    use remind_me_core::entity_merge;
+    use remind_me_core::models::{EntityUpsertAction, EntityUpsertInput};
+    let input: EntityUpsertInput =
+        serde_json::from_value(args).map_err(|e| format!("Invalid entity input: {e}"))?;
+    let action = input
+        .action()
+        .map_err(|why| format!("Invalid input: {why}"))?;
+    let entity_error = |e: remind_me_core::db::StoreError| store_error_text("Entity error", &e);
+    match action {
+        EntityUpsertAction::Upsert(ent_input) => {
+            let ent = remind_me_core::topic::refuse_topic_name(&ent_input.name)
+                .and_then(|()| entity::upsert_entity(store, ent_input))
+                .map_err(entity_error)?;
+            Ok(upserted_entity_payload(store, &ent))
+        }
+        EntityUpsertAction::Preview { from, into } => {
+            serde_json::to_value(entity_merge::preview(store, from, into).map_err(entity_error)?)
+                .map_err(|e| format!("Entity error: {e}"))
+        }
+        EntityUpsertAction::Merge { from, into } => {
+            serde_json::to_value(entity_merge::merge(store, from, into).map_err(entity_error)?)
+                .map_err(|e| format!("Entity error: {e}"))
+        }
+        EntityUpsertAction::Revert { record_id, from } => serde_json::to_value(
+            entity_merge::revert(store, record_id, from).map_err(entity_error)?,
+        )
+        .map_err(|e| format!("Entity error: {e}")),
+    }
+}
+
 /// Most ids one `remind_me_get` call fetches (card #51): enough for a page of
 /// search hits, small enough that a stray call cannot dump the store.
 const GET_IDS_MAX: usize = 20;
@@ -201,7 +235,7 @@ use remind_me_core::{
     vectors, vitality, watcher, webhook::Webhook, wiki, wiki_fs::Wiki, wiki_import, AnnotateInput,
     AnswerPinnedInput, AutoCaptureInput, BriefInput, BulkImportDirInput, ChatImportInput,
     ConsolidateInput, ContradictionCandidatesInput, Database, DbsImportInput, DecomposeBatchInput,
-    DecomposeInput, DigestInput, EntityInput, EntityLookupInput, EntityTraverseInput, ExportInput,
+    DecomposeInput, DigestInput, EntityLookupInput, EntityTraverseInput, ExportInput,
     ExtractBatchInput, FeedbackInput, HistoryInput, ListRemindersInput, MemoryAddInput,
     MemoryListInput, MemorySearchInput, MemoryStatsInput, MemoryUpdateInput, MempalaceImportInput,
     NormalizeApplyInput, NormalizeBatchInput, RecalibrateCandidatesInput, ReclassifyBatchInput,
@@ -902,13 +936,16 @@ impl McpServer {
                             },
                             {
                                 "name": "remind_me_entity_upsert",
-                                "description": "remind-me pipeline: create a knowledge-graph entity, or update its kind. remind_me_entity is read-only, so writing is a separate, explicit call. The answer lists possible_duplicates when the name likely matches an existing entity (rusty_mux vs rusty-mux); nothing is merged. Adding one name as an alias of the other marks a pair reviewed.",
+                                "description": "remind-me pipeline: create a knowledge-graph entity, or update its kind. remind_me_entity is read-only, so writing is a separate, explicit call. The answer lists possible_duplicates when the name likely matches an existing entity (rusty_mux vs rusty-mux). To merge a duplicate, pass merge_into: the answer previews what moves; only confirm: true merges (links, relations and names move to merge_into, the entity named is deleted, and a merge record is kept). revert_merge with that record id undoes it. Merge only when a person has confirmed it.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
-                                        "name": { "type": "string" },
+                                        "name": { "type": "string", "description": "The entity; with merge_into or revert_merge, the one absorbed" },
                                         "kind": { "type": "string" },
-                                        "aliases": { "type": "array", "items": { "type": "string" } }
+                                        "aliases": { "type": "array", "items": { "type": "string" } },
+                                        "merge_into": { "type": "string", "description": "Merge name into this entity. A preview unless confirm is true" },
+                                        "confirm": { "type": "boolean", "default": false, "description": "Apply the merge merge_into previews" },
+                                        "revert_merge": { "type": "string", "description": "Undo the merge this record id names" }
                                     },
                                     "required": ["name"]
                                 }
@@ -2087,27 +2124,16 @@ impl McpServer {
                     // where `remind_me_entity`'s old write behaviour lives, so
                     // the capability is kept rather than dropped -- it is just
                     // no longer reachable by a call that meant to read.
-                    "remind_me_entity_upsert" => {
-                        let input: Result<EntityInput, _> = serde_json::from_value(args);
-                        match input {
-                            Ok(ent_input) => {
-                                match remind_me_core::topic::refuse_topic_name(&ent_input.name)
-                                    .and_then(|()| entity::upsert_entity(&store, &ent_input))
-                                {
-                                    Ok(ent) => {
-                                        let payload = upserted_entity_payload(&store, &ent);
-                                        json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&payload).unwrap() }] })
-                                    }
-                                    Err(e) => {
-                                        json!({ "isError": true, "content": [{ "type": "text", "text": format!("Entity error: {}", e) }] })
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                json!({ "isError": true, "content": [{ "type": "text", "text": format!("Invalid entity input: {}", e) }] })
-                            }
+                    "remind_me_entity_upsert" => match entity_upsert(&store, args) {
+                        Ok(payload) => {
+                            let text = serde_json::to_string_pretty(&payload)
+                                .unwrap_or_else(|e| e.to_string());
+                            json!({ "content": [{ "type": "text", "text": text }] })
                         }
-                    }
+                        Err(text) => {
+                            json!({ "isError": true, "content": [{ "type": "text", "text": text }] })
+                        }
+                    },
                     "remind_me_extract_batch" => {
                         let input: ExtractBatchInput = serde_json::from_value(args)
                             .unwrap_or(ExtractBatchInput { batch_size: 20 });
@@ -5803,6 +5829,50 @@ mod tests {
             report["entity"]["kind"], "place",
             "and carried the kind through"
         );
+    }
+
+    /// `merge_into` previews, `confirm` merges, `revert_merge` undoes, and
+    /// arguments that name no single action are refused (card #567).
+    #[test]
+    fn test_entity_upsert_merges_only_on_confirm_and_reverts() {
+        let db = Database::open_in_memory().unwrap();
+        let server = McpServer::new(db);
+        call(
+            &server,
+            "remind_me_entity_upsert",
+            json!({ "name": "rusty_mux" }),
+        );
+        call(
+            &server,
+            "remind_me_entity_upsert",
+            json!({ "name": "rusty-mux" }),
+        );
+        let reply = |args: Value| -> Value {
+            serde_json::from_str(&text_of(&call(&server, "remind_me_entity_upsert", args))).unwrap()
+        };
+
+        let preview = reply(json!({ "name": "rusty-mux", "merge_into": "rusty_mux" }));
+        assert_eq!(preview["merge"], "preview", "{preview}");
+        let merged =
+            reply(json!({ "name": "rusty-mux", "merge_into": "rusty_mux", "confirm": true }));
+        assert_eq!(merged["merge"], "merged", "{merged}");
+        let record = merged["record_id"].as_str().unwrap().to_string();
+        let again =
+            reply(json!({ "name": "rusty-mux", "merge_into": "rusty_mux", "confirm": true }));
+        assert_eq!(again["merge"], "already_merged", "{again}");
+
+        let reverted = reply(json!({ "name": "rusty-mux", "revert_merge": record }));
+        assert_eq!(reverted["revert"], "reverted", "{reverted}");
+
+        for bad in [
+            json!({ "name": "rusty-mux", "confirm": true }),
+            json!({ "name": "rusty-mux", "merge_into": "rusty_mux", "revert_merge": "x" }),
+            json!({ "name": "rusty-mux", "merge_into": "rusty_mux", "kind": "crate" }),
+            json!({ "name": "rusty-mux", "merge_into": "rusty_mux", "confirm": "yes" }),
+        ] {
+            let result = call(&server, "remind_me_entity_upsert", bad.clone());
+            assert_eq!(result["isError"], true, "{bad} should be refused: {result}");
+        }
     }
 
     /// An upsert names the entities it likely duplicates, a lookup lists them
