@@ -169,6 +169,7 @@ fn write_seed(
         &mut tags,
         &mut metadata,
     );
+    let provenance = crate::context::default_provenance();
     let row = NewMemory {
         category: crate::kinds::MemoryKind::Reference.as_str().to_string(),
         memory_type: crate::kinds::MemoryKind::Reference.as_str().to_string(),
@@ -178,8 +179,8 @@ fn write_seed(
         // `built` and `path` rules read this exactly as they read a session.
         git_remote: Some(repo.as_str().to_string()),
         cwd: Some(dir.display().to_string()),
-        metadata,
-        ..crate::context::default_provenance().stamp(NewMemory::new(
+        metadata: provenance.metadata(metadata),
+        ..provenance.stamp(NewMemory::new(
             format!("mem_{}", uuid::Uuid::new_v4().simple()),
             content,
             &now,
