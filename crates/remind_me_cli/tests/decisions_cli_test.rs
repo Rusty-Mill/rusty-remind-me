@@ -61,8 +61,9 @@ fn with_no_daemon_read_only_commands_fail_closed_and_touch_nothing() {
     let log_arg = log.to_string_lossy().to_string();
     let before = snapshot(&store_dir);
 
-    let runs: [(&[&str], Option<&str>); 6] = [
+    let runs: [(&[&str], Option<&str>); 7] = [
         (&["dialogs", "check"], None),
+        (&["dialogs", "backfill"], None),
         (&["dialogs", "rebuild-check"], Some("0")),
         (&["decisions", "normalize"], None),
         (

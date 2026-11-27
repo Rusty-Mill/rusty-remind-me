@@ -1850,8 +1850,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         report.findings()
                     }
                     DialogsVerb::Backfill => {
-                        let report: BackfillReport =
-                            Store::open(&db_path)?.call(Op::DialogsBackfill)?;
+                        let report: BackfillReport = daemon_plan(&mut store, Op::DialogsBackfill)?;
                         println!("{}", serde_json::to_string_pretty(&report)?);
                         report.findings()
                     }
