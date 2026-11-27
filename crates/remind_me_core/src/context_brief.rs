@@ -687,12 +687,42 @@ fn persona_muted(store: &Store<'_>, mutes: &MuteSet, id: &str) -> Result<bool> {
     Ok(crate::db::queries::get_memory_by_id(store, id)?.is_some_and(|m| mutes.covers(&m)))
 }
 
+/// Reminders due by the horizon, soonest first, muted ones dropped before
+/// the cap so they cannot take its slots (card #1485).
+///
+/// Reads ordered pages that double from [`REMINDER_LIMIT`], and stops once
+/// the cap is filled, the reminders run out, or a page ends past the
+/// horizon. With no mutes the first page always settles it, so a brief
+/// costs the same single bounded read it did before mutes.
 fn reminders_draft(store: &Store<'_>, mutes: &MuteSet, now: DateTime<Utc>) -> Result<Draft> {
     let horizon = now + Duration::days(REMINDER_DAYS);
-    // Every reminder, soonest first, so muted ones are dropped before the
-    // cap rather than taking its slots (card #1485).
-    let items = crate::reminders::list_reminders(store, ReminderWindow::All, i64::MAX)?
-        .iter()
+    let mut limit = REMINDER_LIMIT;
+    loop {
+        let page = crate::reminders::list_reminders(
+            store,
+            ReminderWindow::All,
+            i64::try_from(limit).unwrap_or(i64::MAX),
+        )?;
+        let items = eligible_reminders(&page, mutes, horizon);
+        let settled = items.len() >= REMINDER_LIMIT
+            || page.len() < limit
+            || page.last().is_some_and(|m| due_after(m, horizon));
+        if settled {
+            return Ok(Draft {
+                name: "reminders",
+                weight: 10,
+                capped: 0,
+                items,
+            });
+        }
+        limit = limit.saturating_mul(2);
+    }
+}
+
+/// The unmuted reminders in `page` due by `horizon`, at most
+/// [`REMINDER_LIMIT`].
+fn eligible_reminders(page: &[Memory], mutes: &MuteSet, horizon: DateTime<Utc>) -> Vec<Item> {
+    page.iter()
         .filter(|m| !mutes.covers(m))
         .filter_map(|m| {
             let due = m.remind_at.as_deref()?;
@@ -703,13 +733,16 @@ fn reminders_draft(store: &Store<'_>, mutes: &MuteSet, now: DateTime<Utc>) -> Re
             })
         })
         .take(REMINDER_LIMIT)
-        .collect();
-    Ok(Draft {
-        name: "reminders",
-        weight: 10,
-        capped: 0,
-        items,
-    })
+        .collect()
+}
+
+/// Whether `m` is due after `horizon`. Pages run soonest first, so every
+/// later reminder is past it too.
+fn due_after(m: &Memory, horizon: DateTime<Utc>) -> bool {
+    m.remind_at
+        .as_deref()
+        .and_then(|due| DateTime::parse_from_rfc3339(due).ok())
+        .is_some_and(|t| t > horizon)
 }
 
 /// Most pinned-question names the session brief lists (D90).

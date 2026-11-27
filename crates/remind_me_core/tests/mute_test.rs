@@ -344,16 +344,27 @@ fn muted_matches_do_not_crowd_an_eligible_hit_out_of_the_prompt_hook() {
 
 #[test]
 fn muted_reminders_do_not_crowd_an_eligible_one_out_of_the_session_brief() {
+    assert_muted_reminders_leave_room(60);
+}
+
+#[test]
+fn many_muted_reminders_take_more_than_one_page_and_still_leave_room() {
+    assert_muted_reminders_leave_room(130);
+}
+
+/// `noise` muted reminders due before one eligible reminder: the session
+/// brief's reminders section holds exactly the eligible one.
+fn assert_muted_reminders_leave_room(noise: i64) {
     let db = Database::open_in_memory().unwrap();
     let store = db.store();
     let soon =
         |minutes: i64| (chrono::Utc::now() + chrono::Duration::minutes(minutes)).to_rfc3339();
-    for i in 0..60 {
+    for i in 0..noise {
         let id = add(&store, &format!("noise reminder {i}"), None, &["noise"]);
         remind_me_core::reminders::set_reminder(&store, &id, Some(&soon(10 + i))).unwrap();
     }
     let eligible = add(&store, "renew the passport", None, &[]);
-    remind_me_core::reminders::set_reminder(&store, &eligible, Some(&soon(600))).unwrap();
+    remind_me_core::reminders::set_reminder(&store, &eligible, Some(&soon(600 + noise))).unwrap();
     mute::mute(&store, Target::Tag, "noise", None).unwrap();
 
     let request = ContextRequest {
