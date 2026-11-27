@@ -24,9 +24,9 @@ fn a_brief_scopes_by_tag_and_lists_sections() {
     let response = authed_get(&server, "/api/brief?project=quokka&since=2d");
     assert_eq!(response.status, 200);
     let body = response.json();
-    assert_eq!(body["sections"][3]["name"], "activity");
-    assert_eq!(body["sections"][3]["items"][0]["id"], json!(id));
-    assert_eq!(body["sections"][3]["items"].as_array().unwrap().len(), 1);
+    assert_eq!(body["sections"][2]["name"], "activity");
+    assert_eq!(body["sections"][2]["items"][0]["id"], json!(id));
+    assert_eq!(body["sections"][2]["items"].as_array().unwrap().len(), 1);
     assert_eq!(body["project"]["matched_by"], json!(["tag"]));
     std::fs::remove_dir_all(&root).unwrap();
 }
@@ -64,6 +64,6 @@ fn the_response_body_stays_within_a_minimal_budget() {
     let body = authed_get(&server, "/api/brief?project=quokka&token_budget=200").json();
     let tokens = remind_me_core::retrieval::estimated_content_tokens(&body.to_string());
     assert!(tokens <= 200, "{tokens} tokens");
-    assert!(body["sections"][3]["omitted"].as_u64().unwrap() > 0);
+    assert!(body["sections"][2]["omitted"].as_u64().unwrap() > 0);
     std::fs::remove_dir_all(&root).unwrap();
 }

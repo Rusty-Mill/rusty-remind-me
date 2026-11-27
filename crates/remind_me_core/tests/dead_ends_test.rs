@@ -152,7 +152,13 @@ fn a_search_repeating_a_dead_end_warns_outside_the_ranking() {
         res.memories.iter().all(|r| r.memory.id != "dead"),
         "a warned dead end is not repeated among the hits"
     );
-    assert!(res.memories.len() <= 1, "warnings do not take from limit");
+    let hits: Vec<&str> = res.memories.iter().map(|r| r.memory.id.as_str()).collect();
+    assert_eq!(
+        hits,
+        ["plain"],
+        "the warned dead end leaves its slot to the next hit"
+    );
+    assert_eq!(res.returned, 1);
 }
 
 #[test]
@@ -282,4 +288,55 @@ fn the_prompt_hook_caps_its_warnings() {
         remind_me_core::dead_ends::PROMPT_LIMIT
     );
     assert_eq!(warnings.omitted, 2);
+}
+
+#[test]
+fn a_brief_warning_keeps_why_it_failed_when_tried_is_long() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let tried = format!("{}\nsecond line", "x".repeat(400));
+    let meta = json!({ "tried": tried, "why_failed": "it leaked" });
+    put(&store, "long", "dead_end", "a long dead end", meta, None);
+    let b = brief(&store, Mode::Session, None, None);
+    let warning = b
+        .sections
+        .iter()
+        .find(|s| s.name == "warnings")
+        .and_then(|s| s.items.first())
+        .unwrap();
+    assert!(
+        warning.text.contains("failed: it leaked"),
+        "{}",
+        warning.text
+    );
+    assert!(!warning.text.contains("second line"));
+}
+
+#[test]
+fn a_dead_end_a_stronger_statement_overrules_is_not_a_warning() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let at = chrono::Utc::now().to_rfc3339();
+    let mut weak = NewMemory::new("weak", TRIED, &at);
+    weak.memory_type = "dead_end".into();
+    weak.metadata = json!({ "tried": TRIED, "why_failed": "segfaults" });
+    weak.subject = Some("build".into());
+    weak.predicate = Some("allocator".into());
+    weak.object = Some("jemalloc".into());
+    weak.confidence = 0.4;
+    Memories::new(&store).insert(&weak).unwrap();
+    let mut strong = NewMemory::new("strong", "the build uses mimalloc", &at);
+    strong.memory_type = "fact".into();
+    strong.subject = Some("build".into());
+    strong.predicate = Some("allocator".into());
+    strong.object = Some("mimalloc".into());
+    strong.project = Some("alpha".into());
+    Memories::new(&store).insert(&strong).unwrap();
+
+    let b = brief(&store, Mode::Project, Some("alpha"), None);
+    assert!(
+        section(&b, "warnings").is_empty(),
+        "{:?}",
+        section(&b, "warnings")
+    );
 }
