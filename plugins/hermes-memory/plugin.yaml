@@ -1,0 +1,5 @@
+name: remind-me
+version: 1.0.0
+description: "Shared memory in remind-me: recall each turn, the store's tools, and the session captured at the end."
+hooks:
+  - on_session_end
