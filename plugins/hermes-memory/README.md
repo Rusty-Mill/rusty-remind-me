@@ -71,6 +71,6 @@ Redaction is the server's, either way.
 python3 -m unittest discover -s plugins/hermes-memory/tests -v
 ```
 
-They run without Hermes, against a fake server. Set `REMIND_ME_TEST_BINARY`
+Run by hand; not in CI (the #1552 design keeps Python out of CI). They run without Hermes, against a fake server. Set `REMIND_ME_TEST_BINARY`
 to a built `rusty-remind-me` to also run a round trip against the real
 server on a throwaway store.

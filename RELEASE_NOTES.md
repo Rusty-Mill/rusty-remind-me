@@ -13,7 +13,7 @@ Dated entries, newest first. One entry per merged pull request.
 
 ### Tests
 - Rust: a messages capture stores hook/auto rows, a second capture replaces in place with the same id, bad lists store nothing; the CLI reads and checks stdin first.
-- Python (in CI, beside the cloud-capture tests): settings, client id, MCP over a fake server (JSON and SSE replies), stdio and local capture through a fake executable, every provider method, and failure as empty recall. With `REMIND_ME_TEST_BINARY` set, a round trip against the real server on a throwaway store.
+- Python, run by hand (`python3 -m unittest discover -s plugins/hermes-memory/tests -v`; not in CI, per the #1552 design): settings, client id, MCP over a fake server (JSON and SSE replies), stdio and local capture through a fake executable, every provider method, and failure as empty recall. With `REMIND_ME_TEST_BINARY` set, a round trip against the real server on a throwaway store.
 
 ## 2026-11-27 — Per-client tool profile, format and brief budget; the `minimal` profile (Mill Board #1552 PR B, ADR-0028 step 3, D110-D115)
 

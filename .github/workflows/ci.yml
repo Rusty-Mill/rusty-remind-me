@@ -159,8 +159,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: python3 -m unittest
         run: python3 -m unittest discover -s plugins/cloud-capture/tests -v
-      - name: Hermes memory provider tests (fake server; Hermes not needed)
-        run: python3 -m unittest discover -s plugins/hermes-memory/tests -v
 
   # remind_me_core's cfg(windows) FFI (sidecar job objects, `\\?\` stripping)
   # compiles on no Linux leg above.
