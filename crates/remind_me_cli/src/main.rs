@@ -1883,7 +1883,7 @@ const DIALOGS_USAGE: &str = "usage: rusty-remind-me dialogs check [--full] | \
 
 /// Why `dialogs backfill --apply` is refused.
 const APPLY_NOT_BUILT: &str =
-    "dialogs backfill --apply: not built: waits for Nano's go after the counts (D141, D3)";
+    "dialogs backfill --apply: not built: waits for Nano's go after the counts (D144, D3)";
 
 /// A `dialogs` subcommand.
 #[derive(Debug, PartialEq, Eq)]

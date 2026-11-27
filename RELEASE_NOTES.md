@@ -2,7 +2,7 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
-## 2026-11-27 — Dialog backfill dry run (Mill Board #528, D141, D142)
+## 2026-11-27 — Dialog backfill dry run (Mill Board #528, D144, D145)
 
 ### Added
 - `dialog_backfill::plan`: a read-only dry run of copying every live `memories` dialog row into the dialog store. It writes nothing; with no store, none is created. The report gives:
@@ -13,8 +13,8 @@ Dated entries, newest first. One entry per merged pull request.
   - `no_capture_id` (rows that cannot be stored, listed but not a finding; Q38);
   - the store-side problems D132 lists (blob missing or wrong size, no live memory);
   - `store_digest` and `target_digest`: sha256 over the sorted canonical hashes of the store now and of the store an apply would reach. The later apply must finish on the approved target.
-- `rusty-remind-me dialogs backfill` runs only in an already-running daemon, as the other `dialogs` verbs do. It prints the report as JSON and exits 1 on findings. `--apply` is refused: it is not built and waits for Nano's go after the counts (D141, D3).
-- `docs/handoff`: D141 (Nano: build it, dry run only), D142 (this slice and the planned apply) and Q38.
+- `rusty-remind-me dialogs backfill` runs only in an already-running daemon, as the other `dialogs` verbs do. It prints the report as JSON and exits 1 on findings. `--apply` is refused: it is not built and waits for Nano's go after the counts (D144, D3).
+- `docs/handoff`: D144 (Nano: build it, dry run only), D145 (this slice and the planned apply) and Q38.
 
 ### Tests
 - No store: every row would append and no store is created. A partly shadowed store is counted, and its file and blobs are byte-identical after the run. The target digest equals the store reached by appending the planned rows. Drift, orphans and missing blobs are findings. A dialog with no capture id is listed. CLI parsing refuses `--apply`.
