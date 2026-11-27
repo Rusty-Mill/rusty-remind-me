@@ -2742,7 +2742,7 @@ fn request_profile() -> String {
 
 /// Why `tool` is refused under `profile`, naming the group it is in and the
 /// setting that turns it on: the client's `profile` in `clients.json` when
-/// the profile came from there, else the environment variable (D111).
+/// the profile came from there, else the environment variable (D127).
 fn profile_refusal(tool: &str, profile: &str) -> String {
     let env = remind_me_core::tool_profiles::TOOL_PROFILE_ENV;
     let from_registry =
@@ -2766,7 +2766,7 @@ fn profile_refusal(tool: &str, profile: &str) -> String {
 }
 
 /// Give a call that sends no `response_format` its client's registry
-/// `format` (ADR-0028 §2, D110), on every tool whose schema takes one. An
+/// `format` (ADR-0028 §2, D126), on every tool whose schema takes one. An
 /// explicit value wins; with no registry format nothing changes.
 fn apply_client_format(tool: &str, args: &mut Value) {
     let Some(map) = args.as_object_mut() else {

@@ -2,7 +2,7 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
-## 2026-11-27 — Per-client tool profile, format and brief budget; the `minimal` profile (Mill Board #1552 PR B, ADR-0028 step 3, D110-D115)
+## 2026-11-27 — Per-client tool profile, format and brief budget; the `minimal` profile (Mill Board #1552 PR B, ADR-0028 step 3, D126-D131)
 
 ### Added
 - `minimal` tool profile: search, get, add, auto_capture and brief only, for small local models. Before this, `minimal` was unrecognised and fell back to `full`. `minimal,<group>` adds a group; any part that turns on core (`core`, `standard`, `full`) wins. An alias works exactly when the tool it merged into is listed. A preset, not a group (ADR-0030 amended).
@@ -13,7 +13,7 @@ Dated entries, newest first. One entry per merged pull request.
 
 ### Unchanged
 - With no registry, or a client it does not list, profile and format resolve as before. No tool is renamed or removed; no schema change.
-- Not yet: the ADR-0028 §3 CI test over descriptions and schemas (with #52/#54, D114).
+- Not yet: the ADR-0028 §3 CI test over descriptions and schemas (with #52/#54, D130).
 
 ### Tests
 - `minimal` lists exactly five tools and refuses core ones with the remedy; `minimal,wiki`, `minimal,core`, `minimal,standard`; a registered profile beats the env and its refusal names the registry; an unlisted client keeps the env profile; a registered format becomes search's default and an explicit one wins; a registered brief budget is the default and an explicit one wins; registry field validation.
