@@ -502,10 +502,50 @@ fn degradation_note(res: &MemorySearchResponse) -> Option<String> {
 
 pub fn search_response(res: &MemorySearchResponse, detail: SearchDetail) -> String {
     let body = search_response_body(res, detail);
+    let body = match warnings_block(res) {
+        Some(block) => format!("{block}\n\n{body}"),
+        None => body,
+    };
+    let body = match muted_note(res) {
+        Some(note) => format!("{body}\n\n{note}"),
+        None => body,
+    };
     match res.inferred_window.as_ref() {
         Some(w) => format!("{}\n\n{body}", window_note(w)),
         None => body,
     }
+}
+
+/// Which hits a mute covers, after them (card #1485): shown because the
+/// search asked, left out of briefs and hooks.
+fn muted_note(res: &MemorySearchResponse) -> Option<String> {
+    let ids: Vec<String> = res
+        .memories
+        .iter()
+        .map(|r| r.memory.id.as_str())
+        .filter(|id| res.muted.contains(*id))
+        .map(|id| format!("`{id}`"))
+        .collect();
+    if ids.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "_Muted (shown because you searched; left out of briefs): {}_",
+        ids.join(", ")
+    ))
+}
+
+/// The dead ends this query repeats, above the hits (card #1484).
+fn warnings_block(res: &MemorySearchResponse) -> Option<String> {
+    if res.warnings.is_empty() {
+        return None;
+    }
+    let mut lines = vec!["**Dead ends: tried before, and failed**".to_string()];
+    lines.extend(res.warnings.iter().map(|w| w.markdown()));
+    if res.warnings_omitted > 0 {
+        lines.push(format!("_{} more not shown._", res.warnings_omitted));
+    }
+    Some(lines.join("\n"))
 }
 
 /// The line that says a date phrase narrowed the search, first, so the
@@ -712,6 +752,15 @@ pub fn compact_search_json(res: &MemorySearchResponse) -> serde_json::Value {
         .iter()
         .map(remind_me_core::reminders::compact_hit_json)
         .collect();
+    if !res.warnings.is_empty() {
+        let compact = remind_me_core::dead_ends::COMPACT_CHARS;
+        value["warnings"] = res
+            .warnings
+            .iter()
+            .map(|w| serde_json::json!(w.cut(compact)))
+            .collect();
+    }
+    remind_me_core::mute::mark_hits(&mut value, &res.muted);
     value
 }
 
@@ -780,6 +829,9 @@ mod bootstrap_rendering {
             timing: Default::default(),
             bootstrap,
             inferred_window: None,
+            warnings: Vec::new(),
+            warnings_omitted: 0,
+            muted: Default::default(),
             raw_fallback: false,
             dormant_excluded: 0,
             related_via_entities: None,
@@ -903,6 +955,9 @@ mod deadline_rendering {
             timing,
             bootstrap: None,
             inferred_window: None,
+            warnings: Vec::new(),
+            warnings_omitted: 0,
+            muted: Default::default(),
             raw_fallback: false,
             dormant_excluded: 0,
             related_via_entities: None,
@@ -1049,6 +1104,9 @@ mod tier_rendering {
             timing: Default::default(),
             bootstrap: None,
             inferred_window: None,
+            warnings: Vec::new(),
+            warnings_omitted: 0,
+            muted: Default::default(),
             raw_fallback: false,
             dormant_excluded,
             related_via_entities: None,

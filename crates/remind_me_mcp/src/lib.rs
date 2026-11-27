@@ -80,7 +80,10 @@ fn get_memories(store: &remind_me_core::db::Store<'_>, raw: &Value) -> Value {
     for id in ids {
         match queries::get_memory_by_id(store, id) {
             Ok(Some(mem)) => match references::memory_json(store, &mem) {
-                Ok(value) => memories.push(value),
+                Ok(mut value) => {
+                    value["version"] = json!(remind_me_core::version::of_memory(&mem));
+                    memories.push(value);
+                }
                 Err(e) => {
                     return json!({ "isError": true, "content": [{ "type": "text", "text": format!("Error: {e}") }] })
                 }
@@ -890,7 +893,7 @@ impl McpServer {
                                         let check = contradictions::check_on_save(&store, &mem.id);
                                         let duplicates = duplicates::check_on_save(&store, &mem.id);
                                         json!({ "content": [{ "type": "text", "text": match format {
-    ResponseFormat::Json => serde_json::to_string_pretty(&SavedMemory { memory: &mem, check, duplicates }).unwrap(),
+    ResponseFormat::Json => serde_json::to_string_pretty(&SavedMemory { memory: &mem, check, duplicates, version: remind_me_core::version::of_memory(&mem) }).unwrap(),
     ResponseFormat::Markdown => render::memory_stored(&mem) + &render::save_check(&check) + &render::duplicate_check(&duplicates),
 } }] })
                                     }
@@ -923,7 +926,9 @@ impl McpServer {
                             .unwrap_or("");
                         match queries::get_memory_by_id(&store, id) {
                             Ok(Some(mem)) => match references::memory_json(&store, &mem) {
-                                Ok(with_refs) => {
+                                Ok(mut with_refs) => {
+                                    with_refs["version"] =
+                                        json!(remind_me_core::version::of_memory(&mem));
                                     json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&with_refs).unwrap() }] })
                                 }
                                 Err(e) => {
@@ -983,8 +988,8 @@ impl McpServer {
                                             &fields,
                                         );
                                         json!({ "content": [{ "type": "text", "text": match format {
-    ResponseFormat::Json => serde_json::to_string_pretty(&SavedMemory { memory: &mem, check, duplicates: Default::default() }).unwrap(),
-    ResponseFormat::Markdown => render::memory_updated(&mem) + &render::save_check(&check),
+    ResponseFormat::Json => serde_json::to_string_pretty(&SavedMemory { memory: &mem, check, duplicates: Default::default(), version: remind_me_core::version::of_memory(&mem) }).unwrap(),
+    ResponseFormat::Markdown => render::memory_updated(&mem) + &render::save_check(&check) + &format!("\n\nversion: `{}`", remind_me_core::version::of_memory(&mem)),
 } }] })
                                     }
                                     Ok(UpdateOutcome::NotFound) => {
@@ -992,6 +997,22 @@ impl McpServer {
                                     }
                                     Ok(UpdateOutcome::NoFields) => {
                                         json!({ "isError": true, "content": [{ "type": "text", "text": "Nothing to update — no fields provided" }] })
+                                    }
+                                    Err(remind_me_core::db::StoreError::Conflict {
+                                        current_version,
+                                    }) => {
+                                        let updated_at = queries::get_memory_by_id(
+                                            &store,
+                                            &update_input.memory_id,
+                                        )
+                                        .ok()
+                                        .flatten()
+                                        .map(|m| m.updated_at);
+                                        version_conflict(
+                                            &current_version,
+                                            updated_at.as_deref(),
+                                            "remind_me_get",
+                                        )
                                     }
                                     Err(e) => {
                                         json!({ "isError": true, "content": [{ "type": "text", "text": store_error_text("Update error", &e) }] })
@@ -1046,10 +1067,15 @@ impl McpServer {
                                                 .unwrap()
                                             }
                                             (ResponseFormat::Json, SearchDetail::Full) => {
-                                                serde_json::to_string_pretty(
-                                                    &references::search_json(&store, &res)
-                                                        .unwrap_or_else(|_| json!(res)),
-                                                )
+                                                serde_json::to_string_pretty(&{
+                                                    let mut value =
+                                                        references::search_json(&store, &res)
+                                                            .unwrap_or_else(|_| json!(res));
+                                                    remind_me_core::mute::mark_hits(
+                                                        &mut value, &res.muted,
+                                                    );
+                                                    value
+                                                })
                                                 .unwrap()
                                             }
                                             (ResponseFormat::Markdown, SearchDetail::Compact) => {
@@ -1085,6 +1111,13 @@ impl McpServer {
                         match remind_me_core::project_tool::call(&store, &args) {
                             Ok(payload) => {
                                 json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&payload).unwrap() }] })
+                            }
+                            Err(remind_me_core::db::StoreError::Conflict { current_version }) => {
+                                version_conflict(
+                                    &current_version,
+                                    None,
+                                    "remind_me_project action=get",
+                                )
                             }
                             Err(e) => {
                                 json!({ "isError": true, "content": [{ "type": "text", "text": store_error_text("Project error", &e) }] })
@@ -2280,16 +2313,45 @@ impl McpServer {
                         // `slug` argument is still tolerated as the title when
                         // none is given, so an older caller is not broken.
                         let title = if title.is_empty() { slug } else { title };
-                        match self.wiki.write_page(&store, title, content, log_note) {
+                        let expect = remind_me_core::version::field(&args)
+                            .and_then(|raw| remind_me_core::version::Expect::parse(raw, true));
+                        let written = expect.as_ref().map(|expect| {
+                            self.wiki.write_page_if(
+                                &store,
+                                title,
+                                content,
+                                log_note,
+                                expect.as_ref(),
+                            )
+                        });
+                        match written {
+                            Err(e) => contract_error(
+                                "invalid_input",
+                                &e.to_string(),
+                                "pass the version remind_me_wiki_read returned, or \"absent\" to create only",
+                                json!({}),
+                            ),
+                            Ok(written) => match written {
                             Ok(Ok(outcome)) => {
                                 json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&outcome).unwrap() }] })
                             }
                             Ok(Err(_)) => {
                                 json!({ "isError": true, "content": [{ "type": "text", "text": format!("'{}' is a reserved system page and cannot be written directly", title) }] })
                             }
+                            Err(remind_me_core::db::StoreError::Conflict { current_version }) => {
+                                let updated_at = remind_me_core::wiki::get_wiki_page(
+                                    &store,
+                                    &remind_me_core::wiki_import::slugify(title),
+                                )
+                                .ok()
+                                .flatten()
+                                .map(|p| p.updated_at);
+                                version_conflict(&current_version, updated_at.as_deref(), "remind_me_wiki_read")
+                            }
                             Err(e) => {
                                 json!({ "isError": true, "content": [{ "type": "text", "text": format!("Wiki write error: {}", e) }] })
                             }
+                            },
                         }
                     }
                     "remind_me_wiki_read" => {
@@ -2305,11 +2367,17 @@ impl McpServer {
                                             remind_me_core::staleness::Staleness::unchecked()
                                         });
                                 let mut body = json!(page);
+                                body["version"] =
+                                    json!(remind_me_core::version::of_text(&page.content));
                                 body["stale"] = json!(staleness.stale);
                                 body["new_evidence"] = json!(staleness.new_evidence);
                                 json!({ "content": [{ "type": "text", "text": match format {
     ResponseFormat::Json => serde_json::to_string_pretty(&body).unwrap(),
-    ResponseFormat::Markdown => render::wiki_page(&page, &staleness),
+    ResponseFormat::Markdown => format!(
+        "{}\n\nversion: `{}`",
+        render::wiki_page(&page, &staleness),
+        body["version"].as_str().unwrap_or_default()
+    ),
 } }] })
                             }
                             Ok(None) => {
@@ -2656,10 +2724,24 @@ impl McpServer {
                         };
                         match resolved {
                             Ok(Some((mem, done))) => {
-                                json!({ "content": [{ "type": "text", "text": match format {
-                                    ResponseFormat::Json => serde_json::to_string_pretty(&mem).unwrap(),
-                                    ResponseFormat::Markdown => format!("✓ Memory `{}` {}.", mem.id, done),
-                                } }] })
+                                let hint = outcome.and_then(|o| {
+                                    remind_me_core::resolve::dead_end_hint(o, &mem.id)
+                                });
+                                let text = match format {
+                                    ResponseFormat::Json => {
+                                        let mut body = json!(mem);
+                                        if let Some(hint) = &hint {
+                                            body["dead_end_hint"] = json!(hint);
+                                        }
+                                        serde_json::to_string_pretty(&body).unwrap_or_default()
+                                    }
+                                    ResponseFormat::Markdown => {
+                                        let tail =
+                                            hint.map(|h| format!("\n\n{h}")).unwrap_or_default();
+                                        format!("✓ Memory `{}` {}.{tail}", mem.id, done)
+                                    }
+                                };
+                                json!({ "content": [{ "type": "text", "text": text }] })
                             }
                             Ok(None) => {
                                 json!({ "isError": true, "content": [{ "type": "text", "text": format!("Memory `{}` not found", memory_id) }] })
@@ -2860,7 +2942,7 @@ fn handler_table(req_id: Value) -> Value {
                                     "required": ["name"]
                                 }
                             },
-                            "memory_type": { "type": "string", "enum": ["decision", "action_item", "preference", "fact", "reference", "insight", "learning", "blocker", "work_log", "unclassified"], "description": "What kind of memory this is; a decision requires metadata.rationale." },
+                            "memory_type": { "type": "string", "enum": ["decision", "action_item", "preference", "fact", "reference", "insight", "learning", "blocker", "work_log", "dead_end", "unclassified"], "description": "What kind of memory this is; a decision requires metadata.rationale, a dead_end metadata.tried and metadata.why_failed." },
                             "confidence": { "type": "number", "minimum": 0, "maximum": 1, "default": 1, "description": "How far to trust this memory; scales its search ranking." },
                             "valid_from": { "type": "string", "description": "RFC 3339 time the memory starts to hold; omit for always." },
                             "valid_until": { "type": "string", "description": "RFC 3339 time it stops holding; after it the memory ranks last and is marked expired." },
@@ -2921,12 +3003,13 @@ fn handler_table(req_id: Value) -> Value {
                             "metadata": { "type": "object" },
                             "sensitive": { "type": "boolean", "description": "Set or clear the sensitive flag. Omit to leave it unchanged." },
                             "clear_superseded": { "type": "boolean", "default": false, "description": "Clear this memory's superseded_by flag, un-hiding it from search, entity, and subject/predicate lookups. Recovery path for a false-positive contradiction-supersession. Does not affect the memory that did the superseding." },
-                            "memory_type": { "type": "string", "enum": ["decision", "action_item", "preference", "fact", "reference", "insight", "learning", "blocker", "work_log", "unclassified"], "description": "Reclassify; a decision requires metadata.rationale (in this call or already stored)." },
+                            "memory_type": { "type": "string", "enum": ["decision", "action_item", "preference", "fact", "reference", "insight", "learning", "blocker", "work_log", "dead_end", "unclassified"], "description": "Reclassify; a decision requires metadata.rationale (in this call or already stored)." },
                             "confidence": { "type": "number", "minimum": 0, "maximum": 1, "description": "How far to trust this memory; scales its search ranking." },
                             "valid_from": { "type": "string", "description": "RFC 3339 time the memory starts to hold." },
                             "valid_until": { "type": "string", "description": "RFC 3339 time it stops holding; after it the memory ranks last and is marked expired." },
                             "outcome": { "type": "string", "enum": ["done", "abandoned", "reverted", "superseded", "carded"], "description": "Only for decision and action_item memories." },
-                            "project": { "type": "string", "description": "Set the memory's project (trimmed, one line, at most 200 bytes). Omit or leave blank to keep it; it cannot be cleared." }
+                            "project": { "type": "string", "description": "Set the memory's project (trimmed, one line, at most 200 bytes). Omit or leave blank to keep it; it cannot be cleared." },
+                            "if_version": { "type": "string", "description": "Write only if the memory is unchanged since you read it: the version remind_me_get returned. On a mismatch nothing is written and the error carries current_version. Omit for last-write-wins." }
                         },
                         "required": ["memory_id"]
                     }
@@ -3555,7 +3638,8 @@ fn handler_table(req_id: Value) -> Value {
                         "properties": {
                             "title": { "type": "string", "minLength": 1, "maxLength": 200, "description": "The title's slug is the page's identity — keep titles stable so [[wikilinks]] resolve" },
                             "content": { "type": "string", "minLength": 1, "maxLength": 100000, "description": "Full markdown body, REPLACING any existing content. Open with a one-sentence summary; it becomes the index entry. A leading '# Title' is added if absent." },
-                            "log_note": { "type": "string", "maxLength": 500, "description": "Optional note recorded in log.md alongside the change" }
+                            "log_note": { "type": "string", "maxLength": 500, "description": "Optional note recorded in log.md alongside the change" },
+                            "if_version": { "type": "string", "description": "Write only if the page is unchanged since you read it: the version remind_me_wiki_read returned, or \"absent\" to create only. On a mismatch nothing is written. Omit to overwrite." }
                         },
                         "required": ["title", "content"]
                     }
@@ -3860,6 +3944,14 @@ fn contract_error(code: &str, message: &str, fix: &str, extra: Value) -> Value {
     if let (Some(body), Some(extra)) = (body.as_object_mut(), extra.as_object()) {
         body.extend(extra.clone());
     }
+    json!({ "isError": true, "content": [{ "type": "text", "text": body.to_string() }] })
+}
+
+/// A write refused by its `if_version` (#1487, pack D121): nothing was
+/// written. Carries the current version, and when the target has one, when
+/// it last changed, so the client can re-read with `read_with` and retry.
+fn version_conflict(current_version: &str, updated_at: Option<&str>, read_with: &str) -> Value {
+    let body = remind_me_core::version::conflict_body(current_version, updated_at, read_with);
     json!({ "isError": true, "content": [{ "type": "text", "text": body.to_string() }] })
 }
 

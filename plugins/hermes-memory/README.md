@@ -66,16 +66,16 @@ failure is logged.
   session replaces the first.
 - Either way the session is keyed `<client>:<hermes session id>`
   (`hermes-jarvis:abc`), so two profiles that reuse a session id keep their
-  own captures (D133).
+  own captures (D139).
 - Remote, capture token set: `remind_me_capture_transcript` with the
   conversation as `{role, content}` JSONL (its newest lines within the
   server's 3 MiB escaped limit) and the same session key, in its own MCP
   session with `REMIND_ME_CAPTURE_TOKEN`. One capture per session, as
   locally. Its rows carry `client = remind-me-capture-token`, not the Hermes
-  client id (D67), so the bot shows only in the session key (D134).
+  client id (D67), so the bot shows only in the session key (D140).
 - Remote, no capture token: `remind_me_auto_capture` with the conversation
   and a mechanical summary, tagged `hermes` and the client id. Each callback
-  may write its own capture; this is the documented exception (D134).
+  may write its own capture; this is the documented exception (D140).
 
 Redaction is the server's, either way.
 

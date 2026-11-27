@@ -52,7 +52,7 @@ class Settings:
     token: str | None = field(default=None, repr=False)
     project: str | None = None
     # ADR-0036's capture-only credential: remote captures go through
-    # `remind_me_capture_transcript`, one per session (D134).
+    # `remind_me_capture_transcript`, one per session (D140).
     capture_token: str | None = field(default=None, repr=False)
 
     @property
@@ -378,7 +378,7 @@ def _content_text(content: object) -> str:
 def session_key(client: str, session_id: str) -> str:
     """The session id a capture is stored under: qualified by the client, so
     two profiles that reuse a Hermes session id never replace each other's
-    capture (D133)."""
+    capture (D139)."""
     return f"{client}:{session_id}"
 
 
@@ -434,7 +434,7 @@ def transcript_jsonl(messages: Sequence[Message], limit: int = MAX_TRANSCRIPT_BY
 def capture_remote(settings: Settings, client: str, session_id: str, messages: Sequence[Message]) -> str:
     """Capture through `remind_me_capture_transcript` with the capture-only
     token, in its own MCP session: one capture per session, replaced in
-    place (D134). The server pins the writer to `remind-me-capture-token`."""
+    place (D140). The server pins the writer to `remind-me-capture-token`."""
     if not settings.url or not settings.capture_token:
         raise RemindMeError("capture token not configured")
     transcript = transcript_jsonl(messages)
@@ -449,7 +449,7 @@ def capture_remote(settings: Settings, client: str, session_id: str, messages: S
 
 def capture_arguments(client: str, session_id: str, messages: Sequence[Message]) -> dict[str, Any]:
     """`remind_me_auto_capture` arguments for a remote capture without a capture
-    token: each callback may write its own capture (D134). The summary is
+    token: each callback may write its own capture (D140). The summary is
     mechanical: the tool requires one and the plugin has no model of its own."""
     conversation = "\n\n".join(f"{m.role}: {m.text}" for m in messages)
     first_user = next((m.text for m in messages if m.role == "user"), "")

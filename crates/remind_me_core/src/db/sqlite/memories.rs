@@ -190,6 +190,37 @@ pub(super) fn rows_where(
     rows.collect::<rusqlite::Result<_>>().map_err(sqlite_error)
 }
 
+/// The first `limit` rows of [`rows_where`]'s result that `keep` accepts,
+/// read one at a time and no further than needed.
+pub(super) fn first_rows_where(
+    conn: &Connection,
+    clause: &str,
+    order: &str,
+    bind: &[Sql],
+    limit: usize,
+    keep: &dyn Fn(&MemoryRow) -> bool,
+) -> Result<Vec<MemoryRow>> {
+    let sql = format!(
+        "SELECT {} FROM memories WHERE {clause} ORDER BY {order}",
+        columns()
+    );
+    let mut stmt = conn.prepare_cached(&sql).map_err(sqlite_error)?;
+    let rows = stmt
+        .query_map(params_from_iter(bind), memory_row)
+        .map_err(sqlite_error)?;
+    let mut kept = Vec::new();
+    for row in rows {
+        if kept.len() >= limit {
+            break;
+        }
+        let row = row.map_err(sqlite_error)?;
+        if keep(&row) {
+            kept.push(row);
+        }
+    }
+    Ok(kept)
+}
+
 /// Memory `id`'s row, if there is one.
 pub(super) fn stored(conn: &Connection, id: &str) -> Result<Option<MemoryRow>> {
     Ok(rows_where(conn, "id = ?1", "id", &[Sql::Text(id.to_string())])?.pop())
@@ -815,6 +846,16 @@ impl MemoryStore for SqliteTables {
         filter: &KeywordFilter,
         limit: usize,
     ) -> Result<Vec<(Memory, f64)>> {
+        self.keyword_hits_skipping(phrases, filter, limit, &|_| false)
+    }
+
+    fn keyword_hits_skipping(
+        &self,
+        phrases: &[String],
+        filter: &KeywordFilter,
+        limit: usize,
+        skip: &dyn Fn(&Memory) -> bool,
+    ) -> Result<Vec<(Memory, f64)>> {
         if phrases.is_empty() {
             return Ok(Vec::new());
         }
@@ -824,7 +865,7 @@ impl MemoryStore for SqliteTables {
             .into_iter()
             .filter(|(row, _)| row.admits(filter))
             .map(|(row, score)| (row.to_memory(), score))
-            .filter(|(memory, _)| filter.narrowing.admits(memory))
+            .filter(|(memory, _)| filter.narrowing.admits(memory) && !skip(memory))
             .filter(|(memory, _)| filter.vital_enough(memory, now))
             .take(limit)
             .collect())

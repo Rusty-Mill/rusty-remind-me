@@ -65,7 +65,7 @@ fn a_bad_list_stores_nothing() {
 
 #[test]
 fn distinct_clients_with_one_session_id_keep_their_own_captures() {
-    // The Hermes plugin keys a capture `<client>:<session>` (D133).
+    // The Hermes plugin keys a capture `<client>:<session>` (D139).
     let db = db("clients");
     let store = db.store();
     let list = r#"[{"role":"user","text":"what is a quokka"}]"#;

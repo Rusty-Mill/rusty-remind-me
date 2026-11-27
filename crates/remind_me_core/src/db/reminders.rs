@@ -36,6 +36,23 @@ pub trait ReminderStore {
     /// - `All`: either.
     fn in_window(&self, window: ReminderWindow, now: &str, limit: usize) -> Result<Vec<Memory>>;
 
+    /// [`ReminderStore::in_window`] restricted to the memories `keep`
+    /// accepts, in the same order, at most `limit`. `keep` runs before the
+    /// limit, so rejected memories never take a slot. A backend reads its
+    /// reminders once and holds no more than a bounded batch of the kept
+    /// ones; this default, for a backend that has not done so, reads the
+    /// whole window.
+    fn in_window_where(
+        &self,
+        window: ReminderWindow,
+        now: &str,
+        limit: usize,
+        keep: &dyn Fn(&Memory) -> bool,
+    ) -> Result<Vec<Memory>> {
+        let all = self.in_window(window, now, usize::MAX)?;
+        Ok(all.into_iter().filter(|m| keep(m)).take(limit).collect())
+    }
+
     /// Record that the reminder `memory_id` had at `remind_at` was
     /// delivered. A delivery already recorded is left as it is.
     fn record_delivery(
@@ -78,6 +95,19 @@ impl<'c> Reminders<'c> {
     pub fn in_window(&self, window: ReminderWindow, now: &str, limit: i64) -> Result<Vec<Memory>> {
         let limit = usize::try_from(limit).unwrap_or(0);
         ReminderStore::in_window(&*self.backend.lock()?, window, now, limit)
+    }
+
+    /// See [`ReminderStore::in_window_where`]. A negative `limit` returns
+    /// nothing.
+    pub fn in_window_where(
+        &self,
+        window: ReminderWindow,
+        now: &str,
+        limit: i64,
+        keep: &dyn Fn(&Memory) -> bool,
+    ) -> Result<Vec<Memory>> {
+        let limit = usize::try_from(limit).unwrap_or(0);
+        ReminderStore::in_window_where(&*self.backend.lock()?, window, now, limit, keep)
     }
 
     /// See [`ReminderStore::record_delivery`]: two racing pollers must
@@ -182,6 +212,33 @@ pub mod conformance {
         assert_eq!(look(store, ReminderWindow::All, 10).len(), 2);
     }
 
+    /// `keep` filters before the limit and the order is `in_window`'s.
+    pub fn a_filter_runs_before_the_limit<S: ReminderStore + MemoryStore>(store: &mut S) {
+        for (id, at) in [
+            ("a", "2026-09-28T01:00:00+00:00"),
+            ("b", "2026-09-28T02:00:00+00:00"),
+            ("c", "2026-09-28T03:00:00+00:00"),
+            ("d", "2026-09-28T04:00:00+00:00"),
+            ("e", "2026-09-28T05:00:00+00:00"),
+        ] {
+            add(store, id);
+            store.set_remind_at(id, Some(at), NOW).unwrap();
+        }
+        let ids = |limit: usize, keep: &dyn Fn(&crate::models::Memory) -> bool| -> Vec<String> {
+            store
+                .in_window_where(ReminderWindow::All, NOW, limit, keep)
+                .unwrap()
+                .into_iter()
+                .map(|m| m.id)
+                .collect()
+        };
+        assert_eq!(ids(2, &|m| m.id != "a" && m.id != "b"), ["c", "d"]);
+        assert_eq!(ids(10, &|m| m.id != "c"), ["a", "b", "d", "e"]);
+        assert_eq!(ids(1, &|_| true), ["a"]);
+        assert!(ids(0, &|_| true).is_empty());
+        assert!(ids(10, &|_| false).is_empty());
+    }
+
     pub fn only_undeleted_memories_are_live<S: ReminderStore + MemoryStore>(store: &mut S) {
         add(store, "kept");
         add(store, "gone");
@@ -205,6 +262,10 @@ macro_rules! reminder_conformance {
         #[test]
         fn windows_follow_delivery_and_rescheduling() {
             conformance::windows_follow_delivery_and_rescheduling(&mut $make);
+        }
+        #[test]
+        fn a_filter_runs_before_the_limit() {
+            conformance::a_filter_runs_before_the_limit(&mut $make);
         }
         #[test]
         fn only_undeleted_memories_are_live() {

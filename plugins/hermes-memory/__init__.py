@@ -5,7 +5,7 @@ Each Hermes profile (bot) gets its own instance and writes as
 `hermes-<profile>`, so remind-me can tell JARVIS from the gateway.
 
 - system prompt: `remind_me_brief` for the configured project, once.
-- before each call: `remind_me_brief` Prompt mode with the turn's text (D132).
+- before each call: `remind_me_brief` Prompt mode with the turn's text (D138).
 - tools: whatever remind-me lists for this client (its registry profile,
   `minimal` for small models), proxied as they are.
 - session end: the transcript is captured, once per session.
@@ -175,7 +175,7 @@ class RemindMeProvider(MemoryProvider):  # type: ignore[misc,valid-type]
         """Capture the conversation once per session (ADR-0028 §5): locally
         through `capture-transcript --format messages`, remotely through
         `remind_me_capture_transcript` with the capture token, else
-        `remind_me_auto_capture` (D134). Redaction is the server's (D15)."""
+        `remind_me_auto_capture` (D140). Redaction is the server's (D15)."""
         if not self._primary or self._settings is None or not self._session_id:
             return
         kept = rm.transcript(messages)

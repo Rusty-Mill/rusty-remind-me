@@ -114,11 +114,33 @@ pub struct ClientEntry {
     pub profile: Option<String>,
     /// The fallback response format, in place of
     /// `REMIND_ME_DEFAULT_RESPONSE_FORMAT`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "format_any_case"
+    )]
     pub format: Option<crate::models::ResponseFormat>,
     /// `remind_me_brief`'s `token_budget` when the caller sends none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub brief_budget: Option<usize>,
+}
+
+/// `format` in any case (`"JSON"`, `" Markdown "`), as D126 allows; any
+/// other value is still refused.
+fn format_any_case<'de, D>(de: D) -> Result<Option<crate::models::ResponseFormat>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use crate::models::ResponseFormat;
+    let raw = Option::<String>::deserialize(de)?;
+    raw.map(|v| match v.trim().to_ascii_lowercase().as_str() {
+        "markdown" => Ok(ResponseFormat::Markdown),
+        "json" => Ok(ResponseFormat::Json),
+        _ => Err(serde::de::Error::custom(format!(
+            "format must be markdown or json, not {v:?}"
+        ))),
+    })
+    .transpose()
 }
 
 /// The registry as last read.
@@ -534,7 +556,7 @@ mod tests {
             (r#"{"unknown": {}}"#, "reserved"),
             (r#"{"a": {"profle": "core"}}"#, "unknown field"),
             (r#"{"a": {"profile": "cor"}}"#, "unknown profile"),
-            (r#"{"a": {"format": "xml"}}"#, "not a valid registry"),
+            (r#"{"a": {"format": "xml"}}"#, "markdown or json"),
             (r#"{"a": {"brief_budget": 5}}"#, "brief_budget"),
             (r#"{"a": {"aliases": [" "]}}"#, "blank alias"),
             (
@@ -551,8 +573,8 @@ mod tests {
     fn profile_format_and_budget_are_read_per_client() {
         let reg = ready(
             r#"{
-            "hermes-jarvis": { "profile": " Minimal ", "format": "json", "brief_budget": 600 },
-            "claude-code": { "aliases": ["claude-code"] }
+            "hermes-jarvis": { "profile": " Minimal ", "format": "JSON", "brief_budget": 600 },
+            "claude-code": { "aliases": ["claude-code"], "format": " Markdown " }
         }"#,
         );
         let jarvis = reg
@@ -565,6 +587,7 @@ mod tests {
             .entry_for(&caller(None, None, Some("claude-code/2")))
             .expect("alias");
         assert_eq!(code.profile, None);
+        assert_eq!(code.format, Some(crate::models::ResponseFormat::Markdown));
         assert!(reg.entry_for(&caller(None, Some("other"), None)).is_none());
         let off = Registry::Off {
             path: PathBuf::from("x"),

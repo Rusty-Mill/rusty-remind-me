@@ -24,6 +24,7 @@ use crate::db::memories::{CreatedMemory, Memories};
 use crate::db::wiki::{PageSummary, WikiIndex};
 use crate::db::Result;
 use crate::db::Store;
+use crate::version::{self, Expect};
 use crate::wiki::{WikiDeleteOutcome, WikiPage, WikiSearchHit, RESERVED_SLUGS};
 use crate::wiki_import::slugify;
 use chrono::Utc;
@@ -76,6 +77,8 @@ pub struct WikiWriteOutcome {
     pub path: String,
     /// Titles this page links to via `[[wikilink]]`.
     pub links: Vec<String>,
+    /// The written page's version, to pass as `if_version` next (#1487).
+    pub version: String,
 }
 
 /// The whole wiki, concatenated.
@@ -270,6 +273,32 @@ impl Wiki {
         content: &str,
         log_note: Option<&str>,
     ) -> Result<std::result::Result<WikiWriteOutcome, WikiDeleteOutcome>> {
+        self.write_page_if(store, title, content, log_note, None)
+    }
+
+    /// [`Wiki::write_page`] with a version precondition (#1487): written
+    /// only if the page's current file body still has the version `expect`
+    /// names, or, for [`Expect::Absent`], only if there is no page yet.
+    ///
+    /// Server writers are serialised by the store handle the caller holds,
+    /// so the check and the write cannot interleave with another server
+    /// write. A file has no transaction, though: an edit made in an editor
+    /// between the check and the rename is the one race left (pack D122).
+    /// The new body is written to a temporary file and renamed over the
+    /// page, so a reader never sees half a page.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Conflict`] when the precondition fails; nothing is
+    /// written then.
+    pub fn write_page_if(
+        &self,
+        store: &Store<'_>,
+        title: &str,
+        content: &str,
+        log_note: Option<&str>,
+        expect: Option<&Expect>,
+    ) -> Result<std::result::Result<WikiWriteOutcome, WikiDeleteOutcome>> {
         let slug = slugify(title);
         if RESERVED_SLUGS.contains(&slug.as_str()) {
             return Ok(Err(WikiDeleteOutcome::Reserved));
@@ -278,8 +307,12 @@ impl Wiki {
 
         let body = normalise_heading(title, content);
         let path = self.page_path(&slug);
-        let created = !path.exists();
-        std::fs::write(&path, &body).map_err(io_error)?;
+        let current = self.current_version(&path)?;
+        version::check(expect, current.as_deref())?;
+        let created = current.is_none();
+        let temp = path.with_extension("md.tmp");
+        std::fs::write(&temp, &body).map_err(io_error)?;
+        std::fs::rename(&temp, &path).map_err(io_error)?;
 
         self.index_page(store, &slug, &path)?;
         self.rebuild_index(store)?;
@@ -293,12 +326,22 @@ impl Wiki {
         }
 
         Ok(Ok(WikiWriteOutcome {
+            version: version::of_text(&body),
             slug,
             title: title.to_string(),
             created,
             path: path.display().to_string(),
             links: parse_wikilinks(&body).into_iter().map(|(_, t)| t).collect(),
         }))
+    }
+
+    /// The version of the page file at `path`, or `None` when there is none.
+    fn current_version(&self, path: &Path) -> Result<Option<String>> {
+        match std::fs::read_to_string(path) {
+            Ok(body) => Ok(Some(version::of_text(&body))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(io_error(e)),
+        }
     }
 
     /// Read a page by title or slug, reconciling first.

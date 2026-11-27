@@ -1293,7 +1293,7 @@ fn an_equal_text_tail_with_other_ids_is_kept_and_an_exact_retry_is_not() {
 }
 
 /// One flat `{role, content}` line, as the Hermes plugin sends a remote
-/// capture through `remind_me_capture_transcript` (D133 key, capture token).
+/// capture through `remind_me_capture_transcript` (D139 key, capture token).
 fn flat_line(role: &str, content: &str) -> String {
     serde_json::json!({ "role": role, "content": content }).to_string()
 }

@@ -790,6 +790,7 @@ fn apply_revalidates_each_row_against_the_store_at_write_time() {
             &store,
             &MemoryUpdateInput {
                 memory_id: id.into(),
+                if_version: None,
                 content: None,
                 category: None,
                 tags: None,

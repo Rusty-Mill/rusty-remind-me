@@ -59,12 +59,45 @@ fn digest_review(memory: &crate::models::Memory) -> DigestReview {
     }
 }
 
+/// The newest recent memories no mute covers, at most
+/// [`MAX_RECENT_MEMORIES`], and how many muted ones were passed over
+/// (card #1485). Mute records themselves are never listed. Reads at most
+/// twice the cap, so a heavily muted week can list fewer.
+fn unmuted_recent(
+    store: &Store<'_>,
+    stats: &crate::db::stats::StoreStats<'_>,
+    cutoff: &str,
+) -> Result<(Vec<crate::models::DigestRecentMemory>, usize)> {
+    let mutes = crate::mute::MuteSet::load(store, None, None)?;
+    let memories = crate::db::memories::Memories::new(store);
+    let mut kept = Vec::new();
+    let mut hidden = 0;
+    for recent in stats.shareable_since(cutoff, MAX_RECENT_MEMORIES * 2)? {
+        if kept.len() == MAX_RECENT_MEMORIES {
+            break;
+        }
+        if recent.category == crate::mute::CATEGORY {
+            continue;
+        }
+        if !mutes.is_empty()
+            && memories
+                .get_live(&recent.id)?
+                .is_some_and(|m| mutes.covers(&m))
+        {
+            hidden += 1;
+            continue;
+        }
+        kept.push(recent);
+    }
+    Ok((kept, hidden))
+}
+
 /// Assemble the digest's underlying data.
 pub fn build_digest(store: &Store<'_>, since_days: i64) -> Result<DigestData> {
     let cutoff = (chrono::Utc::now() - chrono::Duration::days(since_days)).to_rfc3339();
 
     let stats = crate::db::stats::StoreStats::new(store);
-    let recent_memories = stats.shareable_since(&cutoff, MAX_RECENT_MEMORIES)?;
+    let (recent_memories, muted_hidden) = unmuted_recent(store, &stats, &cutoff)?;
 
     // Counted rather than taken from the capped list, so the cap is visible
     // rather than silently making a busy week look like a quiet one.
@@ -97,6 +130,7 @@ pub fn build_digest(store: &Store<'_>, since_days: i64) -> Result<DigestData> {
             .iter()
             .map(digest_review)
             .collect(),
+        muted_hidden,
     })
 }
 
@@ -136,6 +170,13 @@ pub fn render_markdown(data: &DigestData) -> String {
             ));
         }
         out.push('\n');
+    }
+    if data.muted_hidden > 0 {
+        out.push_str(&format!(
+            "_{} muted memor{} left out._\n\n",
+            data.muted_hidden,
+            if data.muted_hidden == 1 { "y" } else { "ies" }
+        ));
     }
 
     let vitality = &data.vitality;
