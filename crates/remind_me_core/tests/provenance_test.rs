@@ -536,3 +536,38 @@ fn every_stamped_write_path_keeps_the_handshake_app() {
         assert_eq!(metadata_of(&store, id)["client_app"], "hermes/0.9", "{id}");
     }
 }
+
+#[test]
+fn a_continuation_keeps_the_handshake_app() {
+    use remind_me_core::transcript::{capture_transcript, TranscriptRequest};
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _ident = Ident::set();
+    set_handshake_client(Some("hermes/0.9".to_string()));
+    let db = db("continuation_app");
+    let store = db.store();
+    let line = |role: &str, text: &str| {
+        serde_json::json!({
+            "type": role, "sessionId": "s-app", "uuid": format!("u-{text}"),
+            "timestamp": "2026-11-21T10:00:00.000Z",
+            "message": {"role": role, "content": text}
+        })
+        .to_string()
+    };
+    let request = TranscriptRequest {
+        session_id: "s-app",
+        cwd: None,
+        reason: Some("stop"),
+        context: None,
+    };
+    let first = [line("user", "ask"), line("assistant", "reply")];
+    capture_transcript(&store, &first.join("\n"), &request).unwrap();
+    let grown = [first.join("\n"), line("user", "later")].join("\n");
+    capture_transcript(&store, &grown, &request).unwrap();
+
+    let continuation = remind_me_core::episodes::session_memories(&store, "s-app")
+        .unwrap()
+        .into_iter()
+        .find(|m| m.metadata["type"] == remind_me_core::transcript::CONTINUATION_TYPE)
+        .unwrap();
+    assert_eq!(continuation.metadata["client_app"], "hermes/0.9");
+}
