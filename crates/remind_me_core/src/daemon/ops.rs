@@ -118,6 +118,11 @@ pub enum Op {
         note: Option<String>,
     },
     Stats,
+    /// Check the dialog store against `memories`; see
+    /// [`crate::dialog_reconcile`]. `full` re-hashes every blob.
+    DialogsCheck {
+        full: bool,
+    },
     /// The session subcommands (`crate::session_ops`). Paths are absolute.
     SessionStart {
         session_id: String,
@@ -366,6 +371,14 @@ fn run(store: &Store<'_>, op: &Op) -> Result<Value, String> {
             note.as_deref(),
         )),
         Op::Stats => to_value(stats::collect(store)),
+        Op::DialogsCheck { full } => {
+            let depth = if *full {
+                crate::dialog_reconcile::Depth::Full
+            } else {
+                crate::dialog_reconcile::Depth::Quick
+            };
+            to_value(crate::dialog_reconcile::check(store, depth))
+        }
         Op::SessionStart {
             session_id,
             cwd,

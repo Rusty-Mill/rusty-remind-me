@@ -9,6 +9,7 @@ mod session;
 use daemon::Store;
 use remind_me_api::ApiServer;
 use remind_me_core::daemon::ops::{Op, TopicAction};
+use remind_me_core::dialog_reconcile::Report as DialogReport;
 use remind_me_core::entity::Entity;
 use remind_me_core::entity_duplicates::{self, DuplicateCandidate};
 use remind_me_core::models::{Memory, MemoryListResult, MemorySearchResult};
@@ -1221,6 +1222,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // `None` unless the store synced once: its outbox still fills and
         // nothing else drains it (ADR-0032).
         let pruner = remind_me_core::sync::retention::start_pruner_for(&db.store());
+        // One read-only pass over the dialog store, if there is one (D132);
+        // detached, since it never writes and must not hold up the server.
+        let _dialog_check = remind_me_core::dialog_reconcile::start_for(&db.store());
         let server = McpServer::new(db);
         let result = server.run_stdio_loop();
         // All joined before the database goes out of scope, so an in-flight
@@ -1746,8 +1750,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let stats: Stats = Store::open(&db_path)?.call(Op::Stats)?;
                 println!("{}", serde_json::to_string_pretty(&stats)?);
             }
+            "dialogs" => {
+                let full = match parse_dialogs_args(&args[2..]) {
+                    Ok(full) => full,
+                    Err(message) => {
+                        eprintln!("{message}");
+                        std::process::exit(1);
+                    }
+                };
+                let report: Option<DialogReport> =
+                    Store::open(&db_path)?.call(Op::DialogsCheck { full })?;
+                let Some(report) = report else {
+                    println!("no dialog store beside {}", db_path.display());
+                    return Ok(());
+                };
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                if report.findings() > 0 {
+                    std::process::exit(1);
+                }
+            }
             cmd => {
-                eprintln!("Unknown subcommand: {}. Available: configure, daemon, api, remote, admin, server, search, add, list, get, entity, entity-duplicates, wiki-write, wiki-read, wiki-import, wiki-compile, topics, routing, stats, resolve, session, capture-transcript, import-sessions, context, brief, impact-export, export, decisions", cmd);
+                eprintln!("Unknown subcommand: {}. Available: configure, daemon, api, remote, admin, server, search, add, list, get, entity, entity-duplicates, wiki-write, wiki-read, wiki-import, wiki-compile, topics, routing, stats, dialogs, resolve, session, capture-transcript, import-sessions, context, brief, impact-export, export, decisions", cmd);
                 std::process::exit(1);
             }
         }
@@ -1756,12 +1779,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+const DIALOGS_USAGE: &str = "usage: rusty-remind-me dialogs check [--full]";
+
+/// `dialogs check [--full]`: whether to re-hash every blob.
+fn parse_dialogs_args(args: &[String]) -> Result<bool, String> {
+    match args {
+        [check] if check == "check" => Ok(false),
+        [check, full] if check == "check" && full == "--full" => Ok(true),
+        _ => Err(DIALOGS_USAGE.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn args(raw: &[&str]) -> Vec<String> {
         raw.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn dialogs_check_takes_an_optional_full_flag() {
+        assert_eq!(parse_dialogs_args(&args(&["check"])), Ok(false));
+        assert_eq!(parse_dialogs_args(&args(&["check", "--full"])), Ok(true));
+        assert!(parse_dialogs_args(&args(&[])).is_err());
+        assert!(parse_dialogs_args(&args(&["check", "--fast"])).is_err());
+        assert!(parse_dialogs_args(&args(&["repair"])).is_err());
     }
 
     #[test]
