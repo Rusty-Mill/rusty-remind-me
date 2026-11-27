@@ -810,8 +810,7 @@ impl McpServer {
                 let req_id = id.unwrap_or(json!(1));
                 let params = req.get("params")?;
                 let tool_name = params.get("name")?.as_str()?;
-                let mut args = params.get("arguments").cloned().unwrap_or(json!({}));
-                apply_client_format(tool_name, &mut args);
+                let args = params.get("arguments").cloned().unwrap_or(json!({}));
                 // Read before `args` is moved into any tool's input model.
                 let format = requested_format(&args);
                 // Hidden means gone, not merely undocumented: a model that
@@ -848,7 +847,7 @@ impl McpServer {
                     }));
                 }
                 let store = self.db.store();
-                let surface::Route { handler, args } = match surface::route(tool_name, args) {
+                let surface::Route { handler, mut args } = match surface::route(tool_name, args) {
                     Ok(route) => route,
                     Err(why) => {
                         return Some(json!({
@@ -861,6 +860,9 @@ impl McpServer {
                         }));
                     }
                 };
+                // After routing: the handler that will run decides whether it
+                // takes a format (a reference search does not; get's history does).
+                apply_client_format(&handler, &mut args);
                 let mut span = remind_me_core::telemetry::maybe_span(&format!("tool.{tool_name}"));
                 // Started unconditionally: `record_tool_call` decides for
                 // itself whether metrics are on, the same way `maybe_span`
@@ -2785,7 +2787,7 @@ fn apply_client_format(tool: &str, args: &mut Value) {
     map.insert("response_format".to_string(), json!(value));
 }
 
-/// Whether `tool` (a handler name, or an alias of one) declares a
+/// Whether `tool` (a routed handler name) declares a
 /// `response_format` input. Read once from [`handler_table`].
 fn takes_response_format(tool: &str) -> bool {
     static NAMES: std::sync::OnceLock<std::collections::BTreeSet<String>> =
