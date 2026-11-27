@@ -132,6 +132,13 @@ pub struct MemorySearchResponse {
     /// caller gave none (card #63). The phrase was taken out of the query.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inferred_window: Option<crate::date_inference::InferredWindow>,
+    /// Dead ends the query repeats, outside the ranking and `limit` (card
+    /// #1484): at most three, within a quarter of the token budget.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<crate::dead_ends::Warning>,
+    /// Matching dead ends left out by the cap or the budget.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub warnings_omitted: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub related_via_entities: Option<Vec<RelatedMemory>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -311,4 +318,8 @@ pub fn expand_via_co_retrieval(
     }
 
     Ok(items)
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }

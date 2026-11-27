@@ -18,6 +18,20 @@ Dated entries, newest first. One entry per merged pull request.
 ### Tests
 - `minimal` lists exactly five tools and refuses core ones with the remedy; `minimal,wiki`, `minimal,core`, `minimal,standard`; a registered profile beats the env and its refusal names the registry; an unlisted client keeps the env profile; a registered format becomes search's default and an explicit one wins; a registered brief budget is the default and an explicit one wins; registry field validation.
 
+## 2026-11-27 — Dead ends that warn before they're repeated (Mill Board #1484, D115-D117, D123)
+
+### Added
+- `memory_type: dead_end`: an approach that was tried and failed. `metadata.tried` and `metadata.why_failed` are required (non-empty, at most 1,000 characters); `cost` is optional (positive minutes, or `low`/`medium`/`high`); `from` is optional and must name a live memory. Decay 0.03, type prior 1.1. Nothing existing is reclassified.
+- `warnings` and `warnings_omitted` on `remind_me_search` (MCP only; the REST search page is unchanged): up to 3 dead ends the query repeats, outside the ranking and `limit`, within a quarter of the token budget. Matching is lexical (at least half of the dead end's words, and at least 2, appear in the query; stopwords and words under 3 characters ignored), in the request's project or with none, never sensitive unless asked. A warned dead end is left out of that response's hits. Markdown shows a "Dead ends" block above the hits; compact JSON cuts `tried`/`why_failed` to 200 characters.
+- A `warnings` section first in the project and session briefs (the scope's dead ends plus projectless ones, newest first, up to 3; no longer repeated in activity) and in the prompt hook's brief (dead ends the prompt repeats in its project or with none, up to 2, inside the same 750-token budget; dead ends no longer take slots from the hook's ordinary hits; the hook script is unchanged). Warnings take the budget they need before the other sections share the rest, and a dead end that a stronger memory in its scope (its project or none) overrules is not shown.
+- `remind_me_resolve` with `abandoned` or `reverted` adds `dead_end_hint` (JSON) or a closing line (Markdown) suggesting a dead end with `from` set. Nothing is created automatically.
+
+### Not done
+- No PreToolUse blocking hook (D117: worth adding if repeats persist despite warnings, or once dead ends record an exact command or path). Semantic matching is Q29.
+
+### Tests
+- Field validation and `from`; match, no match, other project, sensitive, cap and `limit` on search; the project brief's section and its absence from activity; the prompt hook's match, miss and cap; a long warning in a tight budget; another project's dead end or fact not silencing ours; many dead ends not crowding ordinary hits out of the prompt hook; resolve's hint; MCP Markdown and compact JSON.
+
 ## 2026-11-27 — Client registry: who is calling, by a stable id (Mill Board #1552 PR A, ADR-0028 step 2, D106-D109)
 
 ### Added
