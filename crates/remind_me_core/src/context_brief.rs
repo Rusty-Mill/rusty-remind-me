@@ -687,62 +687,45 @@ fn persona_muted(store: &Store<'_>, mutes: &MuteSet, id: &str) -> Result<bool> {
     Ok(crate::db::queries::get_memory_by_id(store, id)?.is_some_and(|m| mutes.covers(&m)))
 }
 
-/// Reminders due by the horizon, soonest first, muted ones dropped before
-/// the cap so they cannot take its slots (card #1485).
+/// Reminders due by the horizon, soonest first, at most [`REMINDER_LIMIT`].
 ///
-/// Reads ordered pages that double from [`REMINDER_LIMIT`], and stops once
-/// the cap is filled, the reminders run out, or a page ends past the
-/// horizon. With no mutes the first page always settles it, so a brief
-/// costs the same single bounded read it did before mutes.
+/// With no mutes this is the single bounded read it always was. With mutes,
+/// muted and out-of-horizon reminders are rejected inside one pass over the
+/// window, before the cap, so they cannot take its slots (card #1485). The
+/// horizon is checked on the parsed time, not the stored text's order.
 fn reminders_draft(store: &Store<'_>, mutes: &MuteSet, now: DateTime<Utc>) -> Result<Draft> {
     let horizon = now + Duration::days(REMINDER_DAYS);
-    let mut limit = REMINDER_LIMIT;
-    loop {
-        let page = crate::reminders::list_reminders(
-            store,
-            ReminderWindow::All,
-            i64::try_from(limit).unwrap_or(i64::MAX),
-        )?;
-        let items = eligible_reminders(&page, mutes, horizon);
-        let settled = items.len() >= REMINDER_LIMIT
-            || page.len() < limit
-            || page.last().is_some_and(|m| due_after(m, horizon));
-        if settled {
-            return Ok(Draft {
-                name: "reminders",
-                weight: 10,
-                capped: 0,
-                items,
-            });
-        }
-        limit = limit.saturating_mul(2);
-    }
-}
-
-/// The unmuted reminders in `page` due by `horizon`, at most
-/// [`REMINDER_LIMIT`].
-fn eligible_reminders(page: &[Memory], mutes: &MuteSet, horizon: DateTime<Utc>) -> Vec<Item> {
-    page.iter()
-        .filter(|m| !mutes.covers(m))
+    let limit = i64::try_from(REMINDER_LIMIT).unwrap_or(i64::MAX);
+    let page = if mutes.is_empty() {
+        crate::reminders::list_reminders(store, ReminderWindow::All, limit)?
+    } else {
+        let keep = |m: &Memory| !mutes.covers(m) && due_by(m, horizon);
+        crate::reminders::list_reminders_where(store, ReminderWindow::All, limit, &keep)?
+    };
+    let items = page
+        .iter()
+        .filter(|m| due_by(m, horizon))
         .filter_map(|m| {
-            let due = m.remind_at.as_deref()?;
-            let in_horizon = DateTime::parse_from_rfc3339(due).is_ok_and(|t| t <= horizon);
-            in_horizon.then(|| Item {
-                at: due.to_string(),
+            Some(Item {
+                at: m.remind_at.clone()?,
                 ..item(m)
             })
         })
-        .take(REMINDER_LIMIT)
-        .collect()
+        .collect();
+    Ok(Draft {
+        name: "reminders",
+        weight: 10,
+        capped: 0,
+        items,
+    })
 }
 
-/// Whether `m` is due after `horizon`. Pages run soonest first, so every
-/// later reminder is past it too.
-fn due_after(m: &Memory, horizon: DateTime<Utc>) -> bool {
+/// Whether `m`'s reminder is due at or before `horizon`, by its parsed time.
+fn due_by(m: &Memory, horizon: DateTime<Utc>) -> bool {
     m.remind_at
         .as_deref()
         .and_then(|due| DateTime::parse_from_rfc3339(due).ok())
-        .is_some_and(|t| t > horizon)
+        .is_some_and(|t| t <= horizon)
 }
 
 /// Most pinned-question names the session brief lists (D90).

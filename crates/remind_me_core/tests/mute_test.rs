@@ -348,8 +348,62 @@ fn muted_reminders_do_not_crowd_an_eligible_one_out_of_the_session_brief() {
 }
 
 #[test]
-fn many_muted_reminders_take_more_than_one_page_and_still_leave_room() {
+fn more_muted_reminders_than_two_caps_still_leave_room() {
     assert_muted_reminders_leave_room(130);
+}
+
+#[test]
+fn a_reminder_stored_with_another_offset_is_judged_by_its_time_not_its_text() {
+    use remind_me_core::db::reminders::Reminders;
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let now = chrono::Utc::now();
+    let stamp = now.to_rfc3339();
+    let soon = |minutes: i64| (now + chrono::Duration::minutes(minutes)).to_rfc3339();
+    for i in 0..49 {
+        let id = add(&store, &format!("noise reminder {i}"), None, &["noise"]);
+        remind_me_core::reminders::set_reminder(&store, &id, Some(&soon(10 + i))).unwrap();
+    }
+    // Past the 7-day horizon, in UTC.
+    let late = add(&store, "next month's review", None, &[]);
+    let late_at = (now + chrono::Duration::days(7) + chrono::Duration::hours(1)).to_rfc3339();
+    Reminders::new(&store)
+        .set_remind_at(&late, Some(&late_at), &stamp)
+        .unwrap();
+    // Inside the horizon, but written at +14:00 so its text sorts after `late`.
+    let eligible = add(&store, "renew the passport", None, &[]);
+    let plus14 = chrono::FixedOffset::east_opt(14 * 3600).unwrap();
+    let eligible_at = (now + chrono::Duration::days(7) - chrono::Duration::hours(1))
+        .with_timezone(&plus14)
+        .to_rfc3339();
+    assert!(
+        eligible_at > late_at,
+        "{eligible_at} should sort after {late_at}"
+    );
+    Reminders::new(&store)
+        .set_remind_at(&eligible, Some(&eligible_at), &stamp)
+        .unwrap();
+    mute::mute(&store, Target::Tag, "noise", None).unwrap();
+
+    assert_eq!(session_reminders(&store), [eligible]);
+}
+
+/// The ids in the session brief's reminders section.
+fn session_reminders(store: &remind_me_core::db::Store<'_>) -> Vec<String> {
+    let request = ContextRequest {
+        mode: Mode::Session,
+        budget: 0,
+        ..ContextRequest::default()
+    };
+    let Outcome::Brief(brief) = context_brief::build(store, &request).unwrap() else {
+        panic!("expected a brief");
+    };
+    brief
+        .sections
+        .iter()
+        .filter(|s| s.name == "reminders")
+        .flat_map(|s| s.items.iter().map(|i| i.id.clone()))
+        .collect()
 }
 
 /// `noise` muted reminders due before one eligible reminder: the session
@@ -367,21 +421,7 @@ fn assert_muted_reminders_leave_room(noise: i64) {
     remind_me_core::reminders::set_reminder(&store, &eligible, Some(&soon(600 + noise))).unwrap();
     mute::mute(&store, Target::Tag, "noise", None).unwrap();
 
-    let request = ContextRequest {
-        mode: Mode::Session,
-        budget: 0,
-        ..ContextRequest::default()
-    };
-    let Outcome::Brief(brief) = context_brief::build(&store, &request).unwrap() else {
-        panic!("expected a brief");
-    };
-    let reminders: Vec<&str> = brief
-        .sections
-        .iter()
-        .filter(|s| s.name == "reminders")
-        .flat_map(|s| s.items.iter().map(|i| i.id.as_str()))
-        .collect();
-    assert_eq!(reminders, [eligible.as_str()]);
+    assert_eq!(session_reminders(&store), [eligible]);
 }
 
 #[test]
