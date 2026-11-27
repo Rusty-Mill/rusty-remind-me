@@ -1,7 +1,7 @@
 //! Reminders on SQLite: the [`ReminderStore`] adapter. `remind_at` is a
 //! memories column; deliveries are their own table.
 
-use super::memories::{rows_where, text};
+use super::memories::{first_rows_where, rows_where, text};
 use super::SqliteTables;
 use crate::db::derived::Origin;
 use crate::db::memories::MemoryStore;
@@ -15,6 +15,19 @@ CREATE TABLE IF NOT EXISTS reminder_deliveries (
     memory_id TEXT NOT NULL, remind_at TEXT NOT NULL, delivered_at TEXT NOT NULL,
     PRIMARY KEY (memory_id, remind_at)) WITHOUT ROWID;
 ";
+
+/// The `WHERE` clause for live memories with a reminder in `window`, with
+/// `now` bound as `?1`. Times compare as text.
+fn window_clause(window: ReminderWindow) -> String {
+    let overdue = "(remind_at <= ?1 AND NOT EXISTS (SELECT 1 FROM reminder_deliveries d \
+                   WHERE d.memory_id = memories.id AND d.remind_at = memories.remind_at))";
+    let due = match window {
+        ReminderWindow::Upcoming => "remind_at > ?1".to_string(),
+        ReminderWindow::Overdue => overdue.to_string(),
+        ReminderWindow::All => format!("(remind_at > ?1 OR {overdue})"),
+    };
+    format!("deleted_at IS NULL AND remind_at IS NOT NULL AND {due}")
+}
 
 impl ReminderStore for SqliteTables {
     fn is_live(&self, memory_id: &str) -> Result<bool> {
@@ -30,19 +43,30 @@ impl ReminderStore for SqliteTables {
     }
 
     fn in_window(&self, window: ReminderWindow, now: &str, limit: usize) -> Result<Vec<Memory>> {
-        let overdue = "(remind_at <= ?1 AND NOT EXISTS (SELECT 1 FROM reminder_deliveries d \
-                       WHERE d.memory_id = memories.id AND d.remind_at = memories.remind_at))";
-        let due = match window {
-            ReminderWindow::Upcoming => "remind_at > ?1".to_string(),
-            ReminderWindow::Overdue => overdue.to_string(),
-            ReminderWindow::All => format!("(remind_at > ?1 OR {overdue})"),
-        };
-        let clause = format!("deleted_at IS NULL AND remind_at IS NOT NULL AND {due}");
         let order = format!(
             "remind_at, id LIMIT {}",
             i64::try_from(limit).unwrap_or(i64::MAX)
         );
-        let rows = rows_where(&self.conn, &clause, &order, &[text(now)])?;
+        let rows = rows_where(&self.conn, &window_clause(window), &order, &[text(now)])?;
+        Ok(rows.iter().map(|r| r.to_memory()).collect())
+    }
+
+    /// Streams the window soonest first and stops at `limit` kept rows.
+    fn in_window_where(
+        &self,
+        window: ReminderWindow,
+        now: &str,
+        limit: usize,
+        keep: &dyn Fn(&Memory) -> bool,
+    ) -> Result<Vec<Memory>> {
+        let rows = first_rows_where(
+            &self.conn,
+            &window_clause(window),
+            "remind_at, id",
+            &[text(now)],
+            limit,
+            &|row| keep(&row.to_memory()),
+        )?;
         Ok(rows.iter().map(|r| r.to_memory()).collect())
     }
 

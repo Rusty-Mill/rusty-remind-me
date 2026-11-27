@@ -586,6 +586,16 @@ rusty-remind-me brief rusty_mux --since 2d --budget 1500
 ```
 The name resolves through the entity graph, so an alias works, and a memory is in scope when its project, its git remote's repository, a tag, its subject or object, or an entity link names the project. An unknown name is refused with the closest known names, never guessed. `--since` takes `7d` (the default), `12h`, an RFC 3339 time or a date phrase such as `yesterday` or `last week` (its start); `--budget` is in tokens (200 to 8,000) and bounds the returned text, JSON or Markdown, by the same bytes/4 estimate search uses; items that do not fit are dropped whole and counted, and a budget too small even for the header is refused with the size it needs. `--json` prints the brief's JSON instead of its Markdown. Sensitive, superseded and expired memories never appear, and never make a name known or suggested. The same brief is the MCP tool `remind_me_brief` (in the `core` profile, JSON by default) and `GET /api/brief`.
 
+#### Mutes
+Stop an entity, topic or tag from coming up unasked:
+```bash
+rusty-remind-me mute entity Gary            # every project
+rusty-remind-me mute tag offsite --project alpha
+rusty-remind-me unmute entity Gary
+rusty-remind-me mutes                       # every mute, on or off
+```
+A muted memory leaves the session and project briefs, the prompt hook, the digest (which counts what it left out) and dead-end warnings. An explicit search still finds it and marks the hit `"muted": true`. A mute is an ordinary `preference` memory in category `mute` with `metadata.mute = {target, value, on, project?}`, so it shows in history and can be written with `remind_me_add` too; the entity or topic must exist. Unmuting turns the record off rather than deleting it. A brief about a project never mutes that project's own entity.
+
 ### 9. Knowledge Graph Entity Management
 Upserts an entity with optional category/kind classification:
 ```bash
