@@ -1,4 +1,4 @@
-//! Version checks on writes (card #1487, pack D105-D108): a write that
+//! Version checks on writes (card #1487, pack D119-D122): a write that
 //! names the version it read lands only if nothing changed since; otherwise
 //! nothing is written and the error carries the current version.
 

@@ -315,7 +315,7 @@ pub fn update_memory_pausing(
     after_read: &dyn Fn(),
 ) -> Result<UpdateOutcome> {
     let expect = crate::version::Expect::parse(input.if_version.as_deref(), false)?;
-    // Read, check and write in one transaction (pack D108), so a writer
+    // Read, check and write in one transaction (pack D122), so a writer
     // holding the same version cannot land between the check and the edit.
     let written = store.atomically(|store| -> Result<UpdateOutcome> {
         let Some(stored) = get_memory_by_id(store, &input.memory_id)? else {

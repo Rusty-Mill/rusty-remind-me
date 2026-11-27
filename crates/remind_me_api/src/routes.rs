@@ -54,7 +54,7 @@ fn internal_err(e: impl std::fmt::Display) -> (u16, Body) {
 }
 
 /// 409 for a write refused by its `if_version` (#1487): the same body the
-/// MCP tools return (pack D107).
+/// MCP tools return (pack D121).
 fn conflict(current_version: &str, updated_at: Option<&str>, read_with: &str) -> (u16, Body) {
     (
         409,

@@ -283,7 +283,7 @@ impl Wiki {
     /// Server writers are serialised by the store handle the caller holds,
     /// so the check and the write cannot interleave with another server
     /// write. A file has no transaction, though: an edit made in an editor
-    /// between the check and the rename is the one race left (pack D108).
+    /// between the check and the rename is the one race left (pack D122).
     /// The new body is written to a temporary file and renamed over the
     /// page, so a reader never sees half a page.
     ///

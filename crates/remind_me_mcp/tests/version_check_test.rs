@@ -1,5 +1,5 @@
 //! `if_version` and `version` through `handle_request` (card #1487, pack
-//! D106-D107): reads return the version, a stale one refuses the write with
+//! D120-D121): reads return the version, a stale one refuses the write with
 //! the ADR-0028 `version_conflict` error and the current version.
 
 use remind_me_mcp::McpServer;

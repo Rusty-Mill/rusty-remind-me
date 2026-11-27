@@ -5,7 +5,7 @@
 //! meanwhile, nothing is written and [`StoreError::Conflict`] carries the
 //! current version. Leaving it out keeps last-write-wins.
 //!
-//! The token is computed on read and never stored (pack D105): `v1:` plus 16
+//! The token is computed on read and never stored (pack D119): `v1:` plus 16
 //! hex characters of SHA-256 over what the write could overwrite. It is not
 //! `updated_at`, which consolidation does not stamp and reminders stamp
 //! without an edit, and not the revision count, which five write paths skip.
@@ -13,7 +13,7 @@
 //! state the writer read loses nothing, so that is harmless.
 //!
 //! Pure: callers read the target under the transaction that writes it and
-//! pass it here (D108).
+//! pass it here (D122).
 
 use crate::db::{Result, StoreError};
 use crate::models::Memory;
@@ -134,7 +134,7 @@ pub fn check(expect: Option<&Expect>, current: Option<&str>) -> Result<()> {
     })
 }
 
-/// The body of a refused write, the same over MCP and REST (pack D107):
+/// The body of a refused write, the same over MCP and REST (pack D121):
 /// the ADR-0028 error shape plus the current version and, when the target
 /// has one, when it last changed. `read_with` names the read to repeat.
 pub fn conflict_body(current_version: &str, updated_at: Option<&str>, read_with: &str) -> Value {

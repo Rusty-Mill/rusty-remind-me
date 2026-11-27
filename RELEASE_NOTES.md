@@ -2,7 +2,7 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
-## 2026-11-27 — Version checks so clients can't overwrite each other (Mill Board #1487, D105-D108, D111)
+## 2026-11-27 — Version checks so clients can't overwrite each other (Mill Board #1487, D119-D122, D125)
 
 ### Added
 - `version` on reads: `remind_me_get`, the `remind_me_add` and `remind_me_update` replies, `remind_me_wiki_read` and the wiki write reply, `remind_me_project` `get`/`set`/`revert`, and their REST routes (`GET`/`PATCH /api/memories/{id}`, `GET /api/wiki/{slug}`, `POST /api/wiki`, `/api/projects`). It is `v1:` plus 16 hex characters of SHA-256 over what a write can change, computed on read and never stored: no schema or record change.

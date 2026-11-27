@@ -1,4 +1,4 @@
-//! `if_version` over REST (card #1487, pack D106-D107): reads carry
+//! `if_version` over REST (card #1487, pack D120-D121): reads carry
 //! `version`, a stale one answers 409 with the same body the MCP tools give.
 
 mod common;

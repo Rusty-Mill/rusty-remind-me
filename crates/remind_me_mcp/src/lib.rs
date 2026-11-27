@@ -3851,7 +3851,7 @@ fn contract_error(code: &str, message: &str, fix: &str, extra: Value) -> Value {
     json!({ "isError": true, "content": [{ "type": "text", "text": body.to_string() }] })
 }
 
-/// A write refused by its `if_version` (#1487, pack D107): nothing was
+/// A write refused by its `if_version` (#1487, pack D121): nothing was
 /// written. Carries the current version, and when the target has one, when
 /// it last changed, so the client can re-read with `read_with` and retry.
 fn version_conflict(current_version: &str, updated_at: Option<&str>, read_with: &str) -> Value {
