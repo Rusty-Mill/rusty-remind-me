@@ -900,6 +900,18 @@ pub fn search_memories_skipping(
     Ok(search_ranked(store, input, embedder, deadline, skip)?.results)
 }
 
+/// [`search_memories`] with dead ends left out of both ranking lanes, before
+/// their limits, so they never take a hit's place and the candidate pool
+/// stays the size `input` asks for. For a caller that shows dead ends apart,
+/// as warnings (card #1484). Kept as landed in #440; it is
+/// [`search_memories_skipping`] with [`crate::dead_ends::is_dead_end`].
+pub fn search_memories_without_dead_ends(
+    store: &Store<'_>,
+    input: &MemorySearchInput,
+) -> Result<Vec<MemorySearchResult>> {
+    search_memories_skipping(store, input, &crate::dead_ends::is_dead_end)
+}
+
 /// The search behind [`search_memories_deadlined`]. `skip` leaves memories
 /// out of both lanes, inside each before its limit.
 fn search_ranked(

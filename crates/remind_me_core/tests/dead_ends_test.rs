@@ -552,9 +552,7 @@ fn a_search_leaving_out_dead_ends_fills_its_own_limit_without_them() {
         limit: 10,
         ..MemorySearchInput::default()
     };
-    let hits =
-        queries::search_memories_skipping(&store, &input, &remind_me_core::dead_ends::is_dead_end)
-            .unwrap();
+    let hits = queries::search_memories_without_dead_ends(&store, &input).unwrap();
     assert_eq!(hits.len(), 10);
     assert!(hits.iter().all(|h| h.memory.id.starts_with('f')));
 }
@@ -580,9 +578,7 @@ fn a_window_listing_leaving_out_dead_ends_fills_its_limit_without_them() {
         window: TimeWindow::resolve(&raw, chrono::Utc::now()).unwrap(),
         ..MemorySearchInput::default()
     };
-    let hits =
-        queries::search_memories_skipping(&store, &input, &remind_me_core::dead_ends::is_dead_end)
-            .unwrap();
+    let hits = queries::search_memories_without_dead_ends(&store, &input).unwrap();
     let ids: Vec<&str> = hits.iter().map(|h| h.memory.id.as_str()).collect();
     assert_eq!(ids.len(), 5, "{ids:?}");
     assert!(ids.iter().all(|id| id.starts_with('f')), "{ids:?}");
