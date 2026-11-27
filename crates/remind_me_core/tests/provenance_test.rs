@@ -21,6 +21,7 @@
 #[path = "../src/test_env.rs"]
 mod test_env;
 
+use remind_me_core::clients::CLIENTS_FILE_ENV;
 use remind_me_core::db::Store;
 use remind_me_core::sync::{
     configured_client, memory_provenance, set_handshake_client, with_call_client, CLIENT_ENV,
@@ -43,6 +44,7 @@ impl Ident {
     fn set() -> Self {
         crate::test_env::set_var(NODE_ID_ENV, TEST_NODE);
         crate::test_env::set_var(CLIENT_ENV, TEST_CLIENT);
+        no_registry();
         set_handshake_client(None);
         Ident
     }
@@ -51,8 +53,23 @@ impl Drop for Ident {
     fn drop(&mut self) {
         crate::test_env::remove_var(NODE_ID_ENV);
         crate::test_env::remove_var(CLIENT_ENV);
+        no_registry();
         set_handshake_client(None);
     }
+}
+
+/// Point the client registry at a file that does not exist, so a real
+/// `~/.remind-me/clients.json` cannot change what these tests see.
+fn no_registry() {
+    let missing = std::env::temp_dir().join(format!("rrm_no_clients_{}.json", std::process::id()));
+    crate::test_env::set_var(CLIENTS_FILE_ENV, missing);
+}
+
+/// Write `json` as this test's client registry.
+fn registry(name: &str, json: &str) {
+    let file = std::env::temp_dir().join(format!("rrm_clients_{name}_{}.json", std::process::id()));
+    std::fs::write(&file, json).unwrap();
+    crate::test_env::set_var(CLIENTS_FILE_ENV, file);
 }
 
 fn db(name: &str) -> Database {
@@ -304,6 +321,7 @@ fn with_nothing_configured_the_client_is_unknown_and_the_node_is_empty() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     crate::test_env::remove_var(NODE_ID_ENV);
     crate::test_env::remove_var(CLIENT_ENV);
+    no_registry();
     set_handshake_client(None);
 
     // The default is still `unknown`; this change makes the column *consistent*,
@@ -393,4 +411,163 @@ fn a_continuation_row_is_stamped_and_keeps_its_session() {
     assert_eq!(continuation.project, dialog.project);
     assert_eq!(continuation.written_by, "hook");
     assert_eq!(continuation.capture_method, "auto");
+}
+
+#[test]
+fn a_registry_maps_the_handshake_alias_and_keeps_the_app_in_metadata() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _ident = Ident::set();
+    crate::test_env::remove_var(CLIENT_ENV);
+    registry(
+        "alias",
+        r#"{ "claude-code": { "aliases": ["claude-code"] } }"#,
+    );
+    set_handshake_client(Some("claude-code/2.1.0".to_string()));
+    assert_eq!(configured_client(), "claude-code");
+
+    let db = db("registry_alias");
+    let store = db.store();
+    let added = queries::add_memory(
+        &store,
+        serde_json::from_value(serde_json::json!({ "content": "a wombat fact" })).unwrap(),
+    )
+    .unwrap();
+    let id = added.id;
+    let client = remind_me_core::testing::memory_text(&store, &id, "client").unwrap();
+    assert_eq!(client.as_deref(), Some("claude-code"));
+    let metadata = remind_me_core::testing::memory_column(&store, &id, "metadata")
+        .unwrap()
+        .unwrap();
+    let metadata: serde_json::Value = match metadata {
+        serde_json::Value::String(raw) => serde_json::from_str(&raw).unwrap(),
+        other => other,
+    };
+    assert_eq!(metadata["client_app"], "claude-code/2.1.0");
+}
+
+#[test]
+fn with_a_registry_the_env_beats_the_handshake_and_strangers_are_unknown() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _ident = Ident::set();
+    registry("order", r#"{ "hermes-jarvis": {} }"#);
+    crate::test_env::set_var(CLIENT_ENV, "hermes-jarvis");
+    set_handshake_client(Some("mcp-python-sdk/1.2".to_string()));
+    assert_eq!(configured_client(), "hermes-jarvis");
+
+    crate::test_env::remove_var(CLIENT_ENV);
+    let before = remind_me_core::clients::status().unknown_writes;
+    // A lookup that writes nothing is not counted; each inserted row is.
+    assert_eq!(memory_provenance().1, DEFAULT_CLIENT);
+    assert_eq!(remind_me_core::clients::status().unknown_writes, before);
+    let db = db("unknown_count");
+    let store = db.store();
+    queries::add_memory(
+        &store,
+        serde_json::from_value(serde_json::json!({ "content": "a stranger's fact" })).unwrap(),
+    )
+    .unwrap();
+    let status = remind_me_core::clients::status();
+    assert_eq!((status.registry.as_str(), status.registered), ("ready", 1));
+    assert_eq!(status.unknown_writes, before + 1);
+}
+
+/// `metadata` as a JSON value, whichever way the backend returns it.
+fn metadata_of(store: &Store<'_>, id: &str) -> serde_json::Value {
+    match remind_me_core::testing::memory_column(store, id, "metadata").unwrap() {
+        Some(serde_json::Value::String(raw)) => serde_json::from_str(&raw).unwrap(),
+        Some(other) => other,
+        None => serde_json::Value::Null,
+    }
+}
+
+#[test]
+fn every_stamped_write_path_keeps_the_handshake_app() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _ident = Ident::set();
+    let db = db("client_app_paths");
+    let store = db.store();
+    let now = chrono::Utc::now().to_rfc3339();
+    // Written directly, so it carries no app: the one row not checked.
+    remind_me_core::db::memories::Memories::new(&store)
+        .insert(&remind_me_core::db::memories::NewMemory {
+            category: "scenario".to_string(),
+            ..remind_me_core::db::memories::NewMemory::new("mem_src", "scenario source", &now)
+        })
+        .unwrap();
+    set_handshake_client(Some("hermes/0.9".to_string()));
+
+    remind_me_core::promotion::promote(
+        &store,
+        &serde_json::from_value(serde_json::json!({
+            "rung": "scenario_to_persona",
+            "source_ids": ["mem_src"],
+            "content": "Ships small reversible changes.",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let capture = remind_me_core::capture::auto_capture(
+        &store,
+        &serde_json::from_value(serde_json::json!({
+            "conversation": "user: one\nassistant: two\nuser: three",
+            "summary": "a short exchange",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    remind_me_core::skeleton::write_skeleton(
+        &store,
+        &serde_json::from_value(serde_json::json!({
+            "capture_id": capture.capture_id,
+            "mermaid": "graph TD\n  n1[opening]",
+            "nodes": { "n1": [1, 2] },
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let ids = remind_me_core::testing::memory_ids(&store).unwrap();
+    assert_eq!(
+        ids.len(),
+        5,
+        "source, promoted, two capture halves, skeleton"
+    );
+    for id in ids.iter().filter(|id| id.as_str() != "mem_src") {
+        assert_eq!(metadata_of(&store, id)["client_app"], "hermes/0.9", "{id}");
+    }
+}
+
+#[test]
+fn a_continuation_keeps_the_handshake_app() {
+    use remind_me_core::transcript::{capture_transcript, TranscriptRequest};
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _ident = Ident::set();
+    set_handshake_client(Some("hermes/0.9".to_string()));
+    let db = db("continuation_app");
+    let store = db.store();
+    let line = |role: &str, text: &str| {
+        serde_json::json!({
+            "type": role, "sessionId": "s-app", "uuid": format!("u-{text}"),
+            "timestamp": "2026-11-21T10:00:00.000Z",
+            "message": {"role": role, "content": text}
+        })
+        .to_string()
+    };
+    let request = TranscriptRequest {
+        session_id: "s-app",
+        cwd: None,
+        reason: Some("stop"),
+        context: None,
+    };
+    let first = [line("user", "ask"), line("assistant", "reply")];
+    capture_transcript(&store, &first.join("\n"), &request).unwrap();
+    let grown = [first.join("\n"), line("user", "later")].join("\n");
+    capture_transcript(&store, &grown, &request).unwrap();
+
+    let continuation = remind_me_core::episodes::session_memories(&store, "s-app")
+        .unwrap()
+        .into_iter()
+        .find(|m| m.metadata["type"] == remind_me_core::transcript::CONTINUATION_TYPE)
+        .unwrap();
+    assert_eq!(continuation.metadata["client_app"], "hermes/0.9");
 }

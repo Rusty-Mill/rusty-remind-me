@@ -158,7 +158,7 @@ pub fn apply_normalizations(
             // The source's tags, carried over.
             tags,
             source: NORMALIZED_SOURCE.to_string(),
-            metadata,
+            metadata: provenance.metadata(metadata),
             doc_id,
             chunk_index,
             decay_rate,

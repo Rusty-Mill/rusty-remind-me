@@ -451,7 +451,7 @@ pub const CAPTURE_TOOL: &str = "remind_me_capture_transcript";
 /// The client name the remote gate gives every session opened with the
 /// capture-only credential (ADR-0036, D67): the mark on its writes, and the
 /// caller [`capture_caller_call`] lets reach [`CAPTURE_TOOL`].
-pub const CAPTURE_CLIENT: &str = "remind-me-capture-token";
+pub use remind_me_core::clients::CAPTURE_CLIENT;
 
 /// Whether this call is the capture-only caller calling [`CAPTURE_TOOL`],
 /// which it may do under any tool profile (D68). The tool stays out of
