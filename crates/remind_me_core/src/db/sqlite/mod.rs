@@ -33,7 +33,7 @@ use super::{Result, StoreError};
 use rusqlite::{Connection, OptionalExtension, Params, Row};
 use std::path::Path;
 
-pub use dialogs::SqliteDialogs;
+pub use dialogs::{SqliteDialogs, FILE as DIALOGS_FILE};
 
 /// The DDL of every group, run on open. `IF NOT EXISTS` throughout, so a
 /// reopen leaves existing tables alone.

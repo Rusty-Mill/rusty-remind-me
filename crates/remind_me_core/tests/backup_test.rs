@@ -2,7 +2,8 @@
 //! directory, taken while the tables are held, beside the database file.
 
 use remind_me_core::backup::{
-    backup_dir, create_backup, list_backups, BackupError, BACKUP_RETENTION_COUNT,
+    backup_dir, create_backup, list_backups, list_dialog_packages, BackupError, DialogPackage,
+    BACKUP_RETENTION_COUNT,
 };
 use remind_me_core::db::queries;
 use remind_me_core::db::Store;
@@ -274,4 +275,102 @@ fn a_partial_copy_left_by_a_crash_does_not_list_as_a_backup() {
     assert!(list_backups(&dir).unwrap().is_empty());
     let outcome = create_backup(&store, "manual").unwrap();
     assert_eq!(outcome.total_backups, 1);
+}
+
+/// Two dialogs in the dialog store beside `db`'s database file.
+fn seed_dialog_store(db_path: &Path) {
+    use remind_me_core::blobs::BlobStore;
+    use remind_me_core::db::dialogs::{dir_beside, DialogLog, NewDialog};
+    use remind_me_core::db::sqlite::SqliteDialogs;
+    let dir = dir_beside(db_path).unwrap();
+    let mut log = DialogLog::new(
+        SqliteDialogs::open(&dir).unwrap(),
+        BlobStore::new(dir.join("blobs")),
+    );
+    for (id, body) in [("mem_a", "hello"), ("mem_b", "world")] {
+        log.record(&NewDialog {
+            id,
+            capture_id: "cap_1",
+            session_id: None,
+            project: None,
+            created_at: "2026-11-27T00:00:00Z",
+            body,
+        })
+        .unwrap();
+    }
+}
+
+#[test]
+fn a_node_without_a_dialog_store_writes_no_package() {
+    let tmp = TempDir::new("nodialogs");
+    let db = Database::open(tmp.db_path()).unwrap();
+    let outcome = create_backup(&db.store(), "manual").unwrap();
+    assert_eq!(outcome.dialogs, DialogPackage::NoStore);
+    let json = serde_json::to_value(&outcome).unwrap();
+    assert!(json.get("dialogs").is_none(), "{json}");
+    assert!(list_dialog_packages(&tmp.0.join("backups"))
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn a_dialog_store_gets_its_own_verified_package_with_the_same_stem() {
+    let tmp = TempDir::new("dialogs");
+    let db = Database::open(tmp.db_path()).unwrap();
+    seed_dialog_store(&tmp.db_path());
+    let outcome = create_backup(&db.store(), "nightly").unwrap();
+    let DialogPackage::Written { path, dialogs } = &outcome.dialogs else {
+        panic!("expected a written package, got {:?}", outcome.dialogs);
+    };
+    assert_eq!(*dialogs, 2);
+    assert_eq!(
+        path.trim_end_matches(".dialogs"),
+        outcome.path.trim_end_matches(".engine"),
+        "the package shares the engine backup's label and timestamp"
+    );
+    assert_eq!(
+        remind_me_core::dialog_backup::verify(Path::new(path)).unwrap(),
+        2
+    );
+    // Engine listing and counts are unchanged by the package.
+    assert_eq!(outcome.total_backups, 1);
+    let json = serde_json::to_value(&outcome).unwrap();
+    assert_eq!(json["dialogs"]["status"], "written");
+}
+
+#[test]
+fn a_failed_dialog_package_is_reported_and_the_engine_backup_stands() {
+    let tmp = TempDir::new("dialogfail");
+    let db = Database::open(tmp.db_path()).unwrap();
+    seed_dialog_store(&tmp.db_path());
+    let dir = remind_me_core::db::dialogs::dir_beside(&tmp.db_path()).unwrap();
+    // A row whose body blob is gone cannot be packaged.
+    let blobs = remind_me_core::blobs::BlobStore::new(dir.join("blobs"));
+    std::fs::remove_file(blobs.path(&remind_me_core::blobs::content_key(b"world"))).unwrap();
+    let outcome = create_backup(&db.store(), "manual").unwrap();
+    assert!(
+        matches!(&outcome.dialogs, DialogPackage::Failed { error } if error.contains("missing")),
+        "{:?}",
+        outcome.dialogs
+    );
+    assert!(PathBuf::from(&outcome.path).is_dir());
+    assert!(list_dialog_packages(&tmp.0.join("backups"))
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn dialog_packages_are_pruned_to_the_retention_count() {
+    let tmp = TempDir::new("dialogprune");
+    let db = Database::open(tmp.db_path()).unwrap();
+    seed_dialog_store(&tmp.db_path());
+    for _ in 0..BACKUP_RETENTION_COUNT + 2 {
+        create_backup(&db.store(), "manual").unwrap();
+    }
+    let dir = tmp.0.join("backups");
+    assert_eq!(
+        list_dialog_packages(&dir).unwrap().len(),
+        BACKUP_RETENTION_COUNT
+    );
+    assert_eq!(list_backups(&dir).unwrap().len(), BACKUP_RETENTION_COUNT);
 }

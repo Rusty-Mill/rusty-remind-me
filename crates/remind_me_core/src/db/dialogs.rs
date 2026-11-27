@@ -21,6 +21,7 @@
 
 use crate::blobs::{content_key, BlobStore};
 use crate::db::{Result, StoreError};
+use std::path::{Path, PathBuf};
 
 /// Bytes of the body kept in the row, cut back to a UTF-8 boundary (D51).
 pub const HEAD_BYTES: usize = 512;
@@ -37,6 +38,35 @@ pub struct DialogRecord {
     /// Full sha256 hex of the body: its key in the blob store.
     pub body_hash: String,
     pub body_bytes: u64,
+}
+
+impl DialogRecord {
+    /// The sha256 of the row's identity (D77): id, capture, session,
+    /// project, time and body hash. Each field is length-prefixed and an
+    /// absent one is `-`, so no two rows encode alike. The head and size
+    /// are left out because both follow from the body.
+    pub fn canonical_hash(&self) -> String {
+        let field =
+            |v: Option<&str>| v.map_or_else(|| "-".to_owned(), |s| format!("{}:{s}", s.len()));
+        let encoded = [
+            field(Some(&self.id)),
+            field(Some(&self.capture_id)),
+            field(self.session_id.as_deref()),
+            field(self.project.as_deref()),
+            field(Some(&self.created_at)),
+            field(Some(&self.body_hash)),
+        ]
+        .join("|");
+        content_key(encoded.as_bytes())
+    }
+}
+
+/// The dialog store's directory for the database file `db`: its own name
+/// with `.dialogs` appended, so every database has its own store.
+pub fn dir_beside(db: &Path) -> Option<PathBuf> {
+    let mut name = db.file_name()?.to_os_string();
+    name.push(".dialogs");
+    Some(db.with_file_name(name))
 }
 
 /// What [`DialogStore::append`] did.
@@ -75,6 +105,13 @@ pub trait DialogStore {
     ///
     /// [`StoreError`] if the store cannot be read.
     fn count(&self) -> Result<u64>;
+    /// Visit every dialog, oldest first (ties by id). An error from `visit`
+    /// stops the scan and is returned.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] if the store cannot be read, or `visit`'s error.
+    fn scan(&self, visit: &mut dyn FnMut(DialogRecord) -> Result<()>) -> Result<()>;
 }
 
 /// The first [`HEAD_BYTES`] of `body`, ending on a character boundary.
@@ -216,6 +253,22 @@ pub mod conformance {
         assert_eq!(ids, ["a", "b"]);
         assert!(s.for_capture("none").unwrap().is_empty());
     }
+
+    pub fn scan_visits_every_row_oldest_first(s: &mut dyn DialogStore) {
+        s.append(&record("b", "c1", "2026-11-25T00:00:02Z", "2"))
+            .unwrap();
+        s.append(&record("a", "c2", "2026-11-25T00:00:01Z", "1"))
+            .unwrap();
+        let mut ids = Vec::new();
+        s.scan(&mut |r| {
+            ids.push(r.id);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(ids, ["a", "b"]);
+        let stopped = s.scan(&mut |_| Err(StoreError::Invalid("stop".into())));
+        assert!(matches!(stopped, Err(StoreError::Invalid(_))));
+    }
 }
 
 /// Runs the [`DialogStore`] conformance checks against `$make`, a
@@ -242,6 +295,10 @@ macro_rules! dialog_conformance {
         fn dialog_for_capture_is_oldest_first() {
             conformance::for_capture_is_oldest_first(&mut $make);
         }
+        #[test]
+        fn dialog_scan_visits_every_row_oldest_first() {
+            conformance::scan_visits_every_row_oldest_first(&mut $make);
+        }
     };
 }
 
@@ -257,5 +314,44 @@ mod tests {
         let odd = format!("a{}", "é".repeat(400)); // boundary at 511, not 512
         assert_eq!(head_of(&odd).len(), 511);
         assert_eq!(head_of("short"), "short");
+    }
+
+    #[test]
+    fn the_canonical_hash_tells_fields_apart() {
+        let r = conformance::record("d1", "c1", "2026-11-25T00:00:00Z", "hi");
+        let same = r.clone();
+        assert_eq!(r.canonical_hash(), same.canonical_hash());
+        let no_session = DialogRecord {
+            session_id: None,
+            ..r.clone()
+        };
+        let empty_session = DialogRecord {
+            session_id: Some(String::new()),
+            ..r.clone()
+        };
+        let moved = DialogRecord {
+            id: "d1c".into(),
+            capture_id: "1".into(),
+            ..r.clone()
+        };
+        let hashes = [&r, &no_session, &empty_session, &moved].map(DialogRecord::canonical_hash);
+        for (i, a) in hashes.iter().enumerate() {
+            assert!(hashes[i + 1..].iter().all(|b| a != b), "collision at {i}");
+        }
+        // The head is derived, so it does not change the identity.
+        let other_head = DialogRecord {
+            head: "x".into(),
+            ..r.clone()
+        };
+        assert_eq!(r.canonical_hash(), other_head.canonical_hash());
+    }
+
+    #[test]
+    fn the_store_dir_is_named_after_its_database_file() {
+        assert_eq!(
+            dir_beside(Path::new("/data/remind_me.db")),
+            Some(PathBuf::from("/data/remind_me.db.dialogs"))
+        );
+        assert_eq!(dir_beside(Path::new("/")), None);
     }
 }

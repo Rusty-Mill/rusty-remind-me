@@ -87,6 +87,24 @@ Dated entries, newest first. One entry per merged pull request.
 ### Tests
 - A pin survives supersession of all its sources; unpinning restores demotion; pinned first; the card caps at 40 with the true total; sourceless pins stand only when human-written; add refused for a model, unpinned or unknown kind; update refuses bad kind or pin and a model moving its memory into `persona`; a refresh never replaces a pin; brief line prefix.
 
+## 2026-11-27 — Dialog store backup package (Mill Board #528, D78)
+
+### Added
+- Each backup also packages the dialog store, when the node has one, as `backups/<label>-<timestamp>.dialogs` (same label and timestamp as the engine backup): `dialogs.sqlite3` copied by `VACUUM INTO` and synced, the body blob of every row in that copy, and `manifest.jsonl` with each row's canonical hash (D77) and body hash. Built in `.dialogs.partial` and renamed. Only blobs the copy's rows name are copied, so orphan blobs from a crashed write are left out.
+- `dialog_backup::verify` checks a package (every row matches the manifest, every blob its full sha256, counts equal) and `dialog_backup::restore` puts a verified package back as a new store directory, refusing an existing one, and checks the result again. No CLI or MCP surface yet; the restore drill before the migration uses these.
+- `BackupOutcome.dialogs`: `written` (path and dialog count) or `failed` (error); left out of the output when there is no dialog store, so existing backups look the same. A failed package is logged and never fails the backup, because the engine copy is still the record in this phase (D82).
+- `DialogStore::scan` (all rows, oldest first) with a conformance check; `DialogRecord::canonical_hash`; `SqliteDialogs::open_read_only` and `snapshot_into`; `db::dialogs::dir_beside` (moved from the shadow write).
+
+### Changed
+- Dialog packages are pruned to `BACKUP_RETENTION_COUNT` on their own count; `pruned` and `total_backups` still count engine backups only. Pruning is best effort: it lists packages without reading inside them, and a listing failure is logged and reported as `dialog_prune_warning` without failing the backup.
+
+### Not in this change
+- The cloud upload covers the engine backup only. Uploading the dialog package is a follow-up.
+- Reconcile on open, the rebuild check (D77) and the migration of existing dialog rows (D3, dry run first).
+
+### Tests
+- Package round trip through restore with a shared body and an orphan blob; empty store; missing blob fails and leaves nothing; existing destination refused for create and restore; tampered blob fails verify and restore; dropped, altered and extra manifest lines fail verify; snapshot keeps the triggers; read-only handle refuses appends. Through `create_backup`: no store means no package and no output field; a written package shares the stem and verifies; a failed package is reported while the engine backup stands; packages prune to the retention count.
+
 ## 2026-11-26 — Entity overlap ranking signal measured and dropped (Mill Board #64, D92)
 
 ### Added

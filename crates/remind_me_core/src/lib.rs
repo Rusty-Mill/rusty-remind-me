@@ -33,6 +33,7 @@ pub mod dead_ends;
 pub mod decisions_backfill;
 pub mod decisions_log;
 pub mod dialog;
+pub mod dialog_backup;
 pub mod dialog_shadow;
 pub mod digest;
 pub mod duplicates;
