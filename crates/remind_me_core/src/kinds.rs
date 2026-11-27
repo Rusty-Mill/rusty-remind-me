@@ -278,6 +278,97 @@ pub fn validate_basis(metadata: &Value) -> Result<(), KindError> {
     Ok(())
 }
 
+/// What a persona line is (`metadata.kind` on a `persona` memory, #1555).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersonaKind {
+    /// How the assistant should act.
+    Instruction,
+    /// How the person likes things done.
+    Preference,
+    /// Something stable about the person.
+    Trait,
+}
+
+impl PersonaKind {
+    pub const ALL: [PersonaKind; 3] = [Self::Instruction, Self::Preference, Self::Trait];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Instruction => "instruction",
+            Self::Preference => "preference",
+            Self::Trait => "trait",
+        }
+    }
+
+    /// The prefix a brief or card line carries, e.g. `INSTRUCTION`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Instruction => "INSTRUCTION",
+            Self::Preference => "PREFERENCE",
+            Self::Trait => "TRAIT",
+        }
+    }
+
+    /// The kind `metadata` records, if a valid one.
+    pub fn of(metadata: &Value) -> Option<Self> {
+        let raw = metadata.get("kind")?.as_str()?;
+        Self::ALL.into_iter().find(|k| k.as_str() == raw)
+    }
+}
+
+/// Whether a persona memory's `metadata.pinned` is `true` (#1555).
+pub fn is_pinned(metadata: &Value) -> bool {
+    metadata.get("pinned").and_then(Value::as_bool) == Some(true)
+}
+
+/// Whether a row is a pinned persona line, which consolidation never merges
+/// (pack D102). Unparseable metadata reads as unpinned.
+pub fn is_pinned_persona(category: &str, metadata: Option<&Value>) -> bool {
+    category == crate::models::PERSONA_CATEGORY && metadata.is_some_and(is_pinned)
+}
+
+/// Check a `persona` memory's `metadata.pinned` (a boolean) and
+/// `metadata.kind` (one of [`PersonaKind::ALL`]); both optional.
+pub fn validate_persona(metadata: &Value) -> Result<(), KindError> {
+    const K: &str = "persona";
+    match metadata.get("pinned") {
+        None | Some(Value::Null) | Some(Value::Bool(_)) => {}
+        Some(_) => return Err(bad(K, "pinned", "must be a boolean")),
+    }
+    if let Some(raw) = str_field(metadata, K, "kind")? {
+        if !PersonaKind::ALL.iter().any(|k| k.as_str() == raw) {
+            return Err(bad(
+                K,
+                "kind",
+                "must be one of instruction, preference, trait",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Check a new `persona` memory written outside promotion: it has no
+/// sources, so only a person may write one, and only pinned (pack D102).
+pub fn validate_new_persona(metadata: &Value, written_by: &str) -> Result<(), KindError> {
+    validate_persona(metadata)?;
+    if !is_pinned(metadata) {
+        return Err(bad(
+            "persona",
+            "pinned",
+            "must be true: a persona line written by hand is a pin; promoted lines come from remind_me_promote",
+        ));
+    }
+    if written_by != "human" {
+        return Err(bad(
+            "persona",
+            "pinned",
+            format!("can only be written by a person (written_by human), not {written_by}"),
+        ));
+    }
+    Ok(())
+}
+
 /// Check `metadata` against what `kind` requires. Unknown keys are allowed.
 pub fn validate_metadata(kind: MemoryKind, metadata: &Value) -> Result<(), KindError> {
     validate_basis(metadata)?;
@@ -944,5 +1035,30 @@ mod tests {
         assert_eq!(OccurredAt::of_json("not json"), None);
         assert_eq!(OccurredAt::of_json(r#"{"note":"occurred_at"}"#), None);
         assert!(OccurredAt::of_json(r#"{"occurred_at":"2026-10-03T00:00:00Z"}"#).is_some());
+    }
+
+    #[test]
+    fn persona_metadata_checks_pin_and_kind() {
+        assert!(validate_persona(&json!({})).is_ok());
+        assert!(validate_persona(&json!({"pinned": false, "kind": "instruction"})).is_ok());
+        assert!(validate_persona(&json!({"pinned": "true"})).is_err());
+        assert!(validate_persona(&json!({"kind": 3})).is_err());
+        assert!(validate_persona(&json!({"kind": "mood"})).is_err());
+        assert_eq!(
+            PersonaKind::of(&json!({"kind": "trait"})),
+            Some(PersonaKind::Trait)
+        );
+        assert_eq!(PersonaKind::of(&json!({"kind": "mood"})), None);
+        assert!(is_pinned(&json!({"pinned": true})));
+        assert!(!is_pinned(&json!({"pinned": "true"})));
+    }
+
+    #[test]
+    fn a_new_persona_line_must_be_a_pin_by_a_person() {
+        let pin = json!({"pinned": true});
+        assert!(validate_new_persona(&pin, "human").is_ok());
+        assert!(validate_new_persona(&pin, "model").is_err());
+        assert!(validate_new_persona(&pin, "model:claude").is_err());
+        assert!(validate_new_persona(&json!({}), "human").is_err());
     }
 }

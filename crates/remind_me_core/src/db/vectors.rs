@@ -85,6 +85,8 @@ pub trait VectorStore {
 
     /// Active, unsuperseded, live memories with a first chunk vector, of
     /// `category` when given, oldest first (ties by id), at most `limit`.
+    /// Dialogs, project claims and pinned persona lines (pack D102) are
+    /// never candidates.
     fn consolidation_candidates(
         &self,
         category: Option<&str>,
@@ -387,6 +389,35 @@ pub mod conformance {
         assert_eq!(store.any_embedding().unwrap(), None);
     }
 
+    pub fn a_pinned_persona_line_is_never_a_consolidation_candidate<
+        S: VectorStore + MemoryStore,
+    >(
+        store: &mut S,
+    ) {
+        let persona = |id: &str, metadata: serde_json::Value| NewMemory {
+            category: crate::models::PERSONA_CATEGORY.to_string(),
+            metadata,
+            accessed_at: Some(NOW.to_string()),
+            ..NewMemory::new(id, "terse replies", NOW)
+        };
+        MemoryStore::insert(
+            store,
+            &persona("pinned", serde_json::json!({"pinned": true})),
+        )
+        .unwrap();
+        MemoryStore::insert(store, &persona("plain", serde_json::json!({}))).unwrap();
+        store.put("pinned", 0, &[1, 0, 0, 0]).unwrap();
+        store.put("plain", 0, &[1, 0, 0, 0]).unwrap();
+
+        let ids: Vec<String> = store
+            .consolidation_candidates(None, 10)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(ids, vec!["plain"]);
+    }
+
     pub fn a_memory_with_a_chunk_is_not_unembedded<S: VectorStore + MemoryStore>(store: &mut S) {
         MemoryStore::insert(store, &NewMemory::new("a", "x", NOW)).unwrap();
         MemoryStore::insert(store, &NewMemory::new("b", "y", NOW)).unwrap();
@@ -417,6 +448,10 @@ macro_rules! vector_conformance {
         #[test]
         fn the_vector_tables_read_back_what_was_written() {
             conformance::the_vector_tables_read_back_what_was_written(&mut $make);
+        }
+        #[test]
+        fn a_pinned_persona_line_is_never_a_consolidation_candidate() {
+            conformance::a_pinned_persona_line_is_never_a_consolidation_candidate(&mut $make);
         }
         #[test]
         fn a_memory_with_a_chunk_is_not_unembedded() {
