@@ -293,3 +293,40 @@ mod conformance_tests {
     use super::SqliteTables;
     crate::db::curation::curation_conformance!(SqliteTables::open_in_memory().unwrap());
 }
+
+#[cfg(test)]
+mod tests {
+    use super::SqliteTables;
+    use crate::db::curation::CurationStore;
+    use crate::db::memories::{MemoryStore, NewMemory};
+
+    const OLD: &str = "2026-09-25T00:00:00+00:00";
+
+    /// The settled-capture count reads no `content` or `tags`: with both
+    /// columns turned into blobs no `String` decodes from, the full-row
+    /// listing fails while the count still answers.
+    #[test]
+    fn the_settled_count_reads_neither_content_nor_tags() {
+        let mut tables = SqliteTables::open_in_memory().unwrap();
+        for (id, cap) in [("d", "cap"), ("s", "cap"), ("o", "other")] {
+            MemoryStore::insert(
+                &mut tables,
+                &NewMemory {
+                    capture_id: Some(cap.to_string()),
+                    ..NewMemory::new(id, "x", OLD)
+                },
+            )
+            .unwrap();
+        }
+        tables
+            .conn
+            .execute("UPDATE memories SET content = X'00', tags = X'00'", [])
+            .unwrap();
+
+        assert!(CurationStore::undecomposed(&tables, 10, None).is_err());
+        assert_eq!(
+            CurationStore::count_settled_captures(&tables, None).unwrap(),
+            2
+        );
+    }
+}

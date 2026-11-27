@@ -346,6 +346,12 @@ impl CurationStore for EngineTables {
         ))
     }
 
+    /// Known gap: the engine store has no narrow read. Its records live in
+    /// memory and `get` returns an owned clone of the whole record, so each
+    /// row's content is still copied once before [`stamp`] drops it. Nothing
+    /// is sorted, collected whole or built into a `CaptureRow`. A projection
+    /// would need a borrowing accessor in `rusty_multimodal_db_engine`; SQLite
+    /// is the chosen backend (R4), so that is not added here.
     fn count_settled_captures(&self, settled_before: Option<&str>) -> Result<i64> {
         let (mut facts, mut captures) = (Vec::new(), Vec::new());
         for row in memories::rows(core_ref(self)?) {

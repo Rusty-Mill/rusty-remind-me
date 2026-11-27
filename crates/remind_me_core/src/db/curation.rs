@@ -85,8 +85,9 @@ pub trait CurationStore {
     fn count_undecomposed(&self, settled_before: Option<&str>) -> Result<i64>;
 
     /// How many distinct `capture_id`s [`CurationStore::undecomposed`]
-    /// would list rows for: sessions, not rows. A projection over ids and
-    /// times; it reads no bodies and builds no [`CaptureRow`].
+    /// would list rows for: sessions, not rows. It sorts nothing and builds
+    /// no [`CaptureRow`]; an adapter with a narrow read reads ids and times
+    /// only (the engine has none, see its implementation).
     fn count_settled_captures(&self, settled_before: Option<&str>) -> Result<i64>;
 
     /// How many distinct live captures there are, and the newest one's
