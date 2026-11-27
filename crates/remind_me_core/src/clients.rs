@@ -108,6 +108,39 @@ pub struct ClientEntry {
     /// Names (never the secrets) of REST API keys this client holds.
     #[serde(default)]
     pub api_keys: Vec<String>,
+    /// The tool profile this client sees (ADR-0028 §2), in the grammar of
+    /// `REMIND_ME_TOOL_PROFILE`; beats it. Stored normalised.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// The fallback response format, in place of
+    /// `REMIND_ME_DEFAULT_RESPONSE_FORMAT`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "format_any_case"
+    )]
+    pub format: Option<crate::models::ResponseFormat>,
+    /// `remind_me_brief`'s `token_budget` when the caller sends none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brief_budget: Option<usize>,
+}
+
+/// `format` in any case (`"JSON"`, `" Markdown "`), as D126 allows; any
+/// other value is still refused.
+fn format_any_case<'de, D>(de: D) -> Result<Option<crate::models::ResponseFormat>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use crate::models::ResponseFormat;
+    let raw = Option::<String>::deserialize(de)?;
+    raw.map(|v| match v.trim().to_ascii_lowercase().as_str() {
+        "markdown" => Ok(ResponseFormat::Markdown),
+        "json" => Ok(ResponseFormat::Json),
+        _ => Err(serde::de::Error::custom(format!(
+            "format must be markdown or json, not {v:?}"
+        ))),
+    })
+    .transpose()
 }
 
 /// The registry as last read.
@@ -191,6 +224,15 @@ impl Registry {
         by_alias.map_or_else(|| UNKNOWN.to_string(), |id| id.0.clone())
     }
 
+    /// The entry `caller` resolves to, when the registry is ready and lists it.
+    pub fn entry_for(&self, caller: &Caller) -> Option<&ClientEntry> {
+        let Self::Ready { clients, .. } = self else {
+            return None;
+        };
+        let id = ClientId::parse(&self.resolve(caller)).ok()?;
+        clients.get(&id)
+    }
+
     /// Number of registered clients (0 unless [`Registry::Ready`]).
     pub fn registered(&self) -> usize {
         match self {
@@ -260,8 +302,19 @@ fn parse(raw: &str) -> Result<BTreeMap<ClientId, ClientEntry>, String> {
         serde_json::from_str(raw).map_err(|e| format!("not a valid registry: {e}"))?;
     let mut clients = BTreeMap::new();
     let mut claimed: BTreeMap<String, ClientId> = BTreeMap::new();
-    for (raw_id, entry) in file {
+    for (raw_id, mut entry) in file {
         let id = ClientId::parse(&raw_id)?;
+        entry.profile = entry
+            .profile
+            .map(|raw| {
+                crate::tool_profiles::normalise(&raw)
+                    .ok_or_else(|| format!("client {raw_id:?} has an unknown profile {raw:?}"))
+            })
+            .transpose()?;
+        if let Some(budget) = entry.brief_budget {
+            crate::context_brief::check_token_budget(budget)
+                .map_err(|e| format!("client {raw_id:?} brief_budget: {e}"))?;
+        }
         let keys = entry
             .aliases
             .iter()
@@ -295,6 +348,14 @@ pub fn path() -> PathBuf {
         .filter(|p| !p.trim().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| crate::db::resolve_memory_dir_child(CLIENTS_FILE_NAME))
+}
+
+/// The registry entry of the current caller (see [`crate::sync::current_caller`]),
+/// when the registry is ready and lists the client it resolves to.
+pub fn current_entry() -> Option<ClientEntry> {
+    Registry::load()
+        .entry_for(&crate::sync::current_caller())
+        .cloned()
 }
 
 /// Memory rows inserted stamped `unknown` since [`COUNTING_SINCE`]. Counted
@@ -493,7 +554,10 @@ mod tests {
             ("[]", "not a valid registry"),
             (r#"{"Bad": {}}"#, "lowercase"),
             (r#"{"unknown": {}}"#, "reserved"),
-            (r#"{"a": {"profile": "core"}}"#, "unknown field"),
+            (r#"{"a": {"profle": "core"}}"#, "unknown field"),
+            (r#"{"a": {"profile": "cor"}}"#, "unknown profile"),
+            (r#"{"a": {"format": "xml"}}"#, "markdown or json"),
+            (r#"{"a": {"brief_budget": 5}}"#, "brief_budget"),
             (r#"{"a": {"aliases": [" "]}}"#, "blank alias"),
             (
                 r#"{"a": {"aliases": ["x"]}, "b": {"aliases": ["x"]}}"#,
@@ -503,6 +567,34 @@ mod tests {
             let err = parse(raw).expect_err(raw);
             assert!(err.contains(why), "{raw}: {err}");
         }
+    }
+
+    #[test]
+    fn profile_format_and_budget_are_read_per_client() {
+        let reg = ready(
+            r#"{
+            "hermes-jarvis": { "profile": " Minimal ", "format": "JSON", "brief_budget": 600 },
+            "claude-code": { "aliases": ["claude-code"], "format": " Markdown " }
+        }"#,
+        );
+        let jarvis = reg
+            .entry_for(&caller(None, Some("hermes-jarvis"), None))
+            .expect("listed");
+        assert_eq!(jarvis.profile.as_deref(), Some("minimal"));
+        assert_eq!(jarvis.format, Some(crate::models::ResponseFormat::Json));
+        assert_eq!(jarvis.brief_budget, Some(600));
+        let code = reg
+            .entry_for(&caller(None, None, Some("claude-code/2")))
+            .expect("alias");
+        assert_eq!(code.profile, None);
+        assert_eq!(code.format, Some(crate::models::ResponseFormat::Markdown));
+        assert!(reg.entry_for(&caller(None, Some("other"), None)).is_none());
+        let off = Registry::Off {
+            path: PathBuf::from("x"),
+        };
+        assert!(off
+            .entry_for(&caller(None, Some("hermes-jarvis"), None))
+            .is_none());
     }
 
     #[test]

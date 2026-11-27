@@ -8,7 +8,13 @@ use std::process::Command;
 
 /// Run `admin <args>` in `dir` and return `(stdout, stderr, ok)`.
 fn admin(dir: &Path, args: &[&str]) -> (String, String, bool) {
+    admin_as(dir, args, &[])
+}
+
+/// [`admin`] with extra environment.
+fn admin_as(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> (String, String, bool) {
     let out = Command::new(env!("CARGO_BIN_EXE_rusty-remind-me"))
+        .envs(env.iter().copied())
         .arg("admin")
         .args(args)
         .env("HOME", dir)
@@ -48,6 +54,22 @@ fn every_admin_verb_runs_against_a_temp_store_under_the_core_profile() {
         assert!(!stdout.trim().is_empty(), "{verb} printed nothing");
         assert!(!stdout.contains("not available under"), "{verb}: {stdout}");
     }
+}
+
+#[test]
+fn a_registered_client_profile_does_not_narrow_the_admin_cli() {
+    // The person's shell may inherit a bot's REMIND_ME_CLIENT; its registry
+    // profile governs that bot's MCP calls, not `admin`.
+    let dir = scratch("registry");
+    let clients = dir.join("clients.json");
+    std::fs::write(&clients, r#"{"hermes-jarvis":{"profile":"minimal"}}"#).unwrap();
+    let env = [
+        ("REMIND_ME_CLIENTS_FILE", clients.to_str().unwrap()),
+        ("REMIND_ME_CLIENT", "hermes-jarvis"),
+    ];
+    let (stdout, stderr, ok) = admin_as(&dir, &["backup"], &env);
+    assert!(ok, "backup failed: {stderr} {stdout}");
+    assert!(!stdout.contains("not available under"), "{stdout}");
 }
 
 #[test]

@@ -1,8 +1,10 @@
 # ADR-0028: One contract for every client
 
-Status: Accepted (2026-10-26); step 1 done, step 2 in part (registry, resolution,
-`client_app`, `unknown` counter, #1552; the `client` filter and OAuth client ids are
-still to do, D107-D108)
+Status: Accepted (2026-10-26); step 1 done; step 2 in part (registry, resolution,
+`client_app`, `unknown` counter; the `client` filter and OAuth client ids are still
+to do, D107-D108); step 3 in part (per-client `profile`, `format`, `brief_budget`
+and the `minimal` profile, #1552; the section 3 CI test is still to do with #52/#54,
+D130)
 Date: 2026-10-26
 
 ## Context
