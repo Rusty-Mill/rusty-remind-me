@@ -426,7 +426,7 @@ pub fn pull_dbs(
                     .to_string(),
                 tags: tags.clone(),
                 source: format!("dbs:{}", item.source_name),
-                metadata,
+                metadata: provenance.metadata(metadata),
                 // The item's own creation time, so a memory ages from when the
                 // thing happened rather than from when it was imported —
                 // vitality decay reads this column.

@@ -619,7 +619,7 @@ fn promote_in(
     Memories::new(store).insert(&NewMemory {
         category: category.to_string(),
         source: PROMOTION_SOURCE.to_string(),
-        metadata,
+        metadata: provenance.metadata(metadata),
         decay_rate,
         vitality,
         base_weight,
