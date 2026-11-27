@@ -1,4 +1,4 @@
-//! Person-confirmed entity merge and its revert (card #567, pack D101-D107):
+//! Person-confirmed entity merge and its revert (card #567, pack D110-D114):
 //! links, relations and names move to the survivor in one transaction, a
 //! repeat is a no-op, the record restores the absorbed entity exactly, and a
 //! later mention of the absorbed name lands on the survivor.

@@ -146,7 +146,7 @@ fn upsert_with(store: &Store<'_>, input: &EntityInput, lookup: Lookup) -> Result
 
 /// The stored entity a name with no row of its own already means: one
 /// whose stored name normalises to it, else one carrying it as an alias
-/// (card #567, pack D105). Ties go to the oldest, then the smaller id, so
+/// (card #567, pack D112). Ties go to the oldest, then the smaller id, so
 /// the same name always lands on the same entity. A miss costs one scan.
 fn by_name_or_alias(entities: &Entities<'_>, name: &str) -> Result<Option<Entity>> {
     let key = normalize_entity_name(name);
@@ -212,12 +212,27 @@ pub fn apply_entity_mentions(
         if input.name.trim().is_empty() || crate::topic::is_topic_name(&input.name) {
             continue;
         }
-        let entity = upsert_entity(store, input)?;
-        if link_memory_entity(store, memory_id, &entity.id)? {
+        if mention(store, memory_id, input)?.1 {
             linked += 1;
         }
     }
     Ok(linked)
+}
+
+/// Upsert `input` and link it to `memory_id` as one atomic step, so an
+/// entity merge (card #567) cannot delete the resolved entity between the
+/// two writes and leave the link dangling. Returns the entity and whether
+/// the link is new. Joins the caller's transaction when one is open.
+pub(crate) fn mention(
+    store: &Store<'_>,
+    memory_id: &str,
+    input: &EntityInput,
+) -> Result<(Entity, bool)> {
+    store.atomically(|store| {
+        let entity = upsert_entity(store, input)?;
+        let linked = link_memory_entity(store, memory_id, &entity.id)?;
+        Ok((entity, linked))
+    })
 }
 
 /// Fetch an entity by name, case- and whitespace-insensitively.

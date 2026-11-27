@@ -1,4 +1,4 @@
-//! Person-confirmed entity merge and its revert (card #567, pack D101/D103).
+//! Person-confirmed entity merge and its revert (card #567, pack D110/D111).
 //!
 //! Merging B into A moves B's memory links and relations to A, folds B's
 //! name and aliases into A's aliases, writes a merge-record memory that holds

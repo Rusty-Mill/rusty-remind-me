@@ -2,17 +2,17 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
-## 2026-11-27 — Person-confirmed entity merge, with undo (Mill Board #567, D101-D107)
+## 2026-11-27 — Person-confirmed entity merge, with undo (Mill Board #567, D110-D114)
 
 ### Added
-- `remind_me_entity_upsert` gains `merge_into`, `confirm` and `revert_merge` (D107, the D3 approval). `name` + `merge_into` previews: counts for both sides, links moved and shared, relations moved and dropped, aliases and kind A would gain; nothing is written. Adding `confirm: true` merges in one store transaction: B's links and relations move to A, B's name and aliases join A's aliases, A's kind is kept (B's fills a hole), the earlier `created_at` wins, a merge record is written and B is deleted. A repeat is a no-op naming the earlier merge.
-- The merge record is a fact memory (`B entity.merged_into A`, tag `entity-merge`, undo data in `metadata.entity_merge`). `revert_merge: <record id>` with `name` = B restores B exactly (row, links, relations, A's aliases, kind and `created_at`), keeps what A gained since, skips memories deleted since, and writes an `entity.merge_reverted` fact that supersedes the record (the #702 pattern, D106).
+- `remind_me_entity_upsert` gains `merge_into`, `confirm` and `revert_merge` (D114, the D3 approval). `name` + `merge_into` previews: counts for both sides, links moved and shared, relations moved and dropped, aliases and kind A would gain; nothing is written. Adding `confirm: true` merges in one store transaction: B's links and relations move to A, B's name and aliases join A's aliases, A's kind is kept (B's fills a hole), the earlier `created_at` wins, a merge record is written and B is deleted. A repeat is a no-op naming the earlier merge.
+- The merge record is a fact memory (`B entity.merged_into A`, tag `entity-merge`, undo data in `metadata.entity_merge`). `revert_merge: <record id>` with `name` = B restores B exactly (row, links, relations, A's aliases, kind and `created_at`), keeps what A gained since, skips memories deleted since, and writes an `entity.merge_reverted` fact that supersedes the record (the #702 pattern, D113).
 - Refused: merging an entity into itself, a topic on either side, and absorbing a project (kind `project` or the subject of project claims; a project may absorb). A repeat by B's name or id is a no-op; asking to merge an absorbed B into a different entity is refused.
 - A revert is refused while a later live merge into the same entity, or one that absorbed the other end of a restored relation, still stands (revert those first), and when a relation end no longer exists, so a revert never deletes rows a later merge relied on or writes a dangling relation.
 - `EntityStore::delete_relation`, on both backends, conformance-tested.
 
 ### Changed
-- `upsert_entity`: a name with no row of its own that matches an existing entity's stored name or alias now lands on that entity instead of creating a new one (D105), so a merge sticks when B's name is mentioned again. It adds the name's aliases there but never fills that entity's kind. Alias ties go to the oldest entity, and `resolve_entity` now breaks ties the same way, so lookups and writes agree. A miss costs one scan of the entity table. Restoring an export (`importer`) keeps exact ids through the new `upsert_entity_exact`; the dbs importer counts only truly new entities as created.
+- `upsert_entity`: a name with no row of its own that matches an existing entity's stored name or alias now lands on that entity instead of creating a new one (D112), so a merge sticks when B's name is mentioned again. It adds the name's aliases there but never fills that entity's kind. Alias ties go to the oldest entity, and `resolve_entity` now breaks ties the same way, so lookups and writes agree. A miss costs one scan of the entity table. Restoring an export (`importer`) keeps exact ids through the new `upsert_entity_exact`; the dbs importer counts only truly new entities as created.
 - Relations a merge moves are re-keyed under A's derived id. A B relation that would point A at itself, or whose triple A already has (under any id, since older stores keep pre-derivation ids), is dropped and A's row is left as it was.
 
 ### Tests

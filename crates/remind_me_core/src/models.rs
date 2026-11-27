@@ -73,7 +73,7 @@ pub struct EntityInput {
 
 /// `remind_me_entity_upsert`'s arguments: an entity to create or update, or,
 /// with `merge_into` or `revert_merge`, a person-confirmed merge or its undo
-/// (card #567, pack D107).
+/// (card #567, pack D114).
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct EntityUpsertInput {
     #[serde(flatten)]
