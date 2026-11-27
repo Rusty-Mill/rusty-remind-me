@@ -341,3 +341,62 @@ fn muted_matches_do_not_crowd_an_eligible_hit_out_of_the_prompt_hook() {
         .collect();
     assert_eq!(hits, [eligible.as_str()]);
 }
+
+#[test]
+fn muted_reminders_do_not_crowd_an_eligible_one_out_of_the_session_brief() {
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let soon =
+        |minutes: i64| (chrono::Utc::now() + chrono::Duration::minutes(minutes)).to_rfc3339();
+    for i in 0..60 {
+        let id = add(&store, &format!("noise reminder {i}"), None, &["noise"]);
+        remind_me_core::reminders::set_reminder(&store, &id, Some(&soon(10 + i))).unwrap();
+    }
+    let eligible = add(&store, "renew the passport", None, &[]);
+    remind_me_core::reminders::set_reminder(&store, &eligible, Some(&soon(600))).unwrap();
+    mute::mute(&store, Target::Tag, "noise", None).unwrap();
+
+    let request = ContextRequest {
+        mode: Mode::Session,
+        budget: 0,
+        ..ContextRequest::default()
+    };
+    let Outcome::Brief(brief) = context_brief::build(&store, &request).unwrap() else {
+        panic!("expected a brief");
+    };
+    let reminders: Vec<&str> = brief
+        .sections
+        .iter()
+        .filter(|s| s.name == "reminders")
+        .flat_map(|s| s.items.iter().map(|i| i.id.as_str()))
+        .collect();
+    assert_eq!(reminders, [eligible.as_str()]);
+}
+
+#[test]
+fn a_muted_persona_line_leaves_the_session_brief() {
+    use remind_me_core::db::memories::{Memories, NewMemory};
+    let db = Database::open_in_memory().unwrap();
+    let store = db.store();
+    let now = chrono::Utc::now().to_rfc3339();
+    for (id, tags) in [
+        ("mem_p_muted", vec!["noise".to_string()]),
+        ("mem_p_kept", vec![]),
+    ] {
+        Memories::new(&store)
+            .insert(&NewMemory {
+                category: remind_me_core::PERSONA_CATEGORY.to_string(),
+                metadata: json!({"pinned": true}),
+                written_by: "human".to_string(),
+                tags,
+                ..NewMemory::new(id, format!("line {id}"), &now)
+            })
+            .unwrap();
+    }
+    assert!(session_ids(&store).contains(&"mem_p_muted".to_string()));
+    mute::mute(&store, Target::Tag, "noise", None).unwrap();
+
+    let ids = session_ids(&store);
+    assert!(!ids.contains(&"mem_p_muted".to_string()), "{ids:?}");
+    assert!(ids.contains(&"mem_p_kept".to_string()), "{ids:?}");
+}

@@ -69,6 +69,8 @@ pub const REMINDER_DAYS: i64 = 7;
 
 /// Persona lines in the session brief, pinned first (pack D101).
 const PERSONA_LIMIT: usize = 10;
+/// Reminders in the session brief, soonest first.
+const REMINDER_LIMIT: usize = 50;
 const STATE_LIMIT: usize = 3;
 const OPEN_LIMIT: usize = 15;
 const ACTIVITY_LIMIT: usize = 20;
@@ -326,7 +328,7 @@ pub fn build(store: &Store<'_>, request: &ContextRequest<'_>) -> Result<Outcome>
         .filter(|m| !is_dead_end(m))
         .collect();
     if request.mode == Mode::Session {
-        drafts.push(persona_draft(store)?);
+        drafts.push(persona_draft(store, &mutes)?);
         drafts.push(reminders_draft(store, &mutes, now)?);
         drafts.push(pinned_draft(store, now));
         let shown: HashSet<&str> = rest.iter().map(|m| m.id.as_str()).collect();
@@ -651,17 +653,23 @@ fn persona_text(statement: &crate::models::PersonaStatement) -> String {
     }
 }
 
-fn persona_draft(store: &Store<'_>) -> Result<Draft> {
-    let items = crate::promotion::persona(store)?
-        .into_iter()
-        .take(PERSONA_LIMIT)
-        .map(|s| Item {
+fn persona_draft(store: &Store<'_>, mutes: &MuteSet) -> Result<Draft> {
+    let mut items = Vec::new();
+    // Mutes before the cap (card #1485): a muted line never takes a slot.
+    for s in crate::promotion::persona(store)? {
+        if items.len() == PERSONA_LIMIT {
+            break;
+        }
+        if persona_muted(store, mutes, &s.id)? {
+            continue;
+        }
+        items.push(Item {
             text: persona_text(&s),
             id: s.id,
             kind: crate::models::PERSONA_CATEGORY.to_string(),
             at: s.created_at,
-        })
-        .collect();
+        });
+    }
     Ok(Draft {
         name: "persona",
         weight: 15,
@@ -670,9 +678,20 @@ fn persona_draft(store: &Store<'_>) -> Result<Draft> {
     })
 }
 
+/// Whether the mutes cover the persona line `id`. Read only when a mute is
+/// in force, so a brief with none costs no extra reads.
+fn persona_muted(store: &Store<'_>, mutes: &MuteSet, id: &str) -> Result<bool> {
+    if mutes.is_empty() {
+        return Ok(false);
+    }
+    Ok(crate::db::queries::get_memory_by_id(store, id)?.is_some_and(|m| mutes.covers(&m)))
+}
+
 fn reminders_draft(store: &Store<'_>, mutes: &MuteSet, now: DateTime<Utc>) -> Result<Draft> {
     let horizon = now + Duration::days(REMINDER_DAYS);
-    let items = crate::reminders::list_reminders(store, ReminderWindow::All, 50)?
+    // Every reminder, soonest first, so muted ones are dropped before the
+    // cap rather than taking its slots (card #1485).
+    let items = crate::reminders::list_reminders(store, ReminderWindow::All, i64::MAX)?
         .iter()
         .filter(|m| !mutes.covers(m))
         .filter_map(|m| {
@@ -683,6 +702,7 @@ fn reminders_draft(store: &Store<'_>, mutes: &MuteSet, now: DateTime<Utc>) -> Re
                 ..item(m)
             })
         })
+        .take(REMINDER_LIMIT)
         .collect();
     Ok(Draft {
         name: "reminders",
