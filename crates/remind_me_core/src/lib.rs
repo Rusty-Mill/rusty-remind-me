@@ -57,6 +57,7 @@ pub mod maintenance;
 pub mod mempalace_import;
 pub mod metrics;
 pub mod models;
+pub mod mute;
 pub mod normalize;
 pub mod notifications;
 pub mod obsidian_import;

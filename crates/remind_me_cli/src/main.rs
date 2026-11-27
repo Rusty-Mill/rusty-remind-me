@@ -291,6 +291,48 @@ const ADD_USAGE: &str =
 const RESOLVE_USAGE: &str = "Usage: rusty-remind-me resolve <id> \
 (<done|abandoned|reverted|superseded> | --review <held|revised|reverted>) [--note TEXT]";
 
+const MUTE_USAGE: &str =
+    "Usage: rusty-remind-me <mute|unmute> <entity|topic|tag> <VALUE> [--project NAME]";
+
+/// Parsed form of `rusty-remind-me mute|unmute <target> <value> [--project NAME]`.
+#[derive(Debug, PartialEq)]
+struct MuteArgs {
+    target: String,
+    value: String,
+    project: Option<String>,
+}
+
+fn parse_mute_args(args: &[String]) -> Result<MuteArgs, String> {
+    let mut words: Vec<&String> = Vec::new();
+    let mut project = None;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--project" {
+            project = Some(flag_value(args, i, "--project", MUTE_USAGE)?);
+            i += 2;
+        } else if args[i].starts_with("--") {
+            return Err(format!(
+                "Error: unknown flag {:?}.\n{}",
+                args[i], MUTE_USAGE
+            ));
+        } else {
+            words.push(&args[i]);
+            i += 1;
+        }
+    }
+    match &words[..] {
+        [target, value] => {
+            check_one_of("target", target, &["entity", "topic", "tag"])?;
+            Ok(MuteArgs {
+                target: target.to_string(),
+                value: value.to_string(),
+                project,
+            })
+        }
+        _ => Err(MUTE_USAGE.to_string()),
+    }
+}
+
 const WIKI_COMPILE_USAGE: &str =
     "Usage: rusty-remind-me wiki-compile --auto [--max-batches N] [--allow-shrink]";
 
@@ -1709,6 +1751,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 }
             }
+            "mute" | "unmute" => {
+                let parsed = match parse_mute_args(&args[2..]) {
+                    Ok(parsed) => parsed,
+                    Err(message) => {
+                        eprintln!("{}", message);
+                        std::process::exit(1);
+                    }
+                };
+                let op = if args[1] == "mute" {
+                    Op::Mute {
+                        target: parsed.target,
+                        value: parsed.value.clone(),
+                        project: parsed.project,
+                    }
+                } else {
+                    Op::Unmute {
+                        target: parsed.target,
+                        value: parsed.value.clone(),
+                        project: parsed.project,
+                    }
+                };
+                let changed: serde_json::Value = Store::open(&db_path)?.call(op)?;
+                if changed.is_null() {
+                    eprintln!("Nothing mutes {}", parsed.value);
+                    std::process::exit(1);
+                }
+                println!("{}", serde_json::to_string_pretty(&changed)?);
+            }
+            "mutes" => {
+                let mutes: serde_json::Value = Store::open(&db_path)?.call(Op::Mutes)?;
+                println!("{}", serde_json::to_string_pretty(&mutes)?);
+            }
             "resolve" => {
                 let resolve = match parse_resolve_args(&args[2..]) {
                     Ok(parsed) => parsed,
@@ -1796,6 +1870,21 @@ mod tests {
 
     fn args(raw: &[&str]) -> Vec<String> {
         raw.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn mute_args_take_a_target_a_value_and_an_optional_project() {
+        assert_eq!(
+            parse_mute_args(&args(&["entity", "Gary", "--project", "alpha"])),
+            Ok(MuteArgs {
+                target: "entity".into(),
+                value: "Gary".into(),
+                project: Some("alpha".into()),
+            })
+        );
+        assert!(parse_mute_args(&args(&["person", "Gary"])).is_err());
+        assert!(parse_mute_args(&args(&["tag"])).is_err());
+        assert!(parse_mute_args(&args(&["tag", "x", "--loud"])).is_err());
     }
 
     #[test]

@@ -58,6 +58,12 @@ pub(crate) fn add_memory_reviewing(
 ) -> Result<Memory> {
     let supersedes = input.supersedes.clone();
     check_dead_end_source(store, fields.memory_type.as_deref(), &input.metadata)?;
+    crate::mute::check_write(
+        store,
+        &input.category,
+        fields.memory_type.as_deref(),
+        &input.metadata,
+    )?;
     let add = PreparedAdd::new(input, fields, review)?;
     // With `supersedes`, one transaction: the insert, its index and every
     // retirement land together or not at all, and each target is checked
@@ -420,6 +426,18 @@ fn write_update(
             .or(stored.memory_type.as_deref());
         check_dead_end_source(store, kind, metadata)?;
     }
+    // Filing a memory as a mute, or editing one, keeps it a valid mute
+    // (card #1485).
+    let category = input.category.as_deref().unwrap_or(&stored.category);
+    crate::mute::check_write(
+        store,
+        category,
+        fields
+            .memory_type
+            .as_deref()
+            .or(stored.memory_type.as_deref()),
+        metadata,
+    )?;
     // Only metadata this edit supplies: a stored value is never revalidated,
     // so an edit that leaves metadata alone cannot fail on it (pack D86).
     if let Some(supplied) = &client_metadata {
@@ -756,6 +774,14 @@ pub fn reclassify_memories(store: &Store<'_>, input: &ReclassifyInput) -> Result
             refused.push(classification.memory_id.clone());
             continue;
         }
+        // A mute stays a preference (card #1485): another kind would drop it
+        // from the mute list silently, with no unmute in its history.
+        if stored.category == crate::mute::CATEGORY
+            && classification.memory_type != crate::mute::KIND.as_str()
+        {
+            refused.push(classification.memory_id.clone());
+            continue;
+        }
         // Becoming a decision schedules its follow-up; staying one does not.
         let metadata = if stored.memory_type.as_deref() == Some("decision") {
             None
@@ -890,33 +916,47 @@ pub fn search_memories_deadlined(
     embedder: Option<&dyn crate::embedder::Embedder>,
     deadline: crate::retrieval::Deadline,
 ) -> Result<crate::retrieval::TrimOutcome> {
-    search_ranked(store, input, embedder, deadline, false)
+    search_ranked(store, input, embedder, deadline, &|_| false)
 }
 
-/// [`search_memories`] with dead ends left out of both ranking lanes, before
-/// their limits, so they never take a hit's place and the candidate pool
-/// stays the size `input` asks for. For a caller that shows dead ends apart,
-/// as warnings (card #1484).
-pub fn search_memories_without_dead_ends(
+/// [`search_memories`] with the memories `skip` matches left out of both
+/// ranking lanes, before their limits, so they never take a hit's place and
+/// the candidate pool stays the size `input` asks for. For a caller that
+/// shows some memories apart or not at all, as the prompt hook does dead ends
+/// (card #1484) and muted memories (card #1485).
+pub fn search_memories_skipping(
     store: &Store<'_>,
     input: &MemorySearchInput,
+    skip: &dyn Fn(&Memory) -> bool,
 ) -> Result<Vec<MemorySearchResult>> {
     let configured = crate::embedder::available_embedder();
     let embedder = configured
         .as_ref()
         .map(|e| &**e as &dyn crate::embedder::Embedder);
     let deadline = crate::retrieval::Deadline::from_env();
-    Ok(search_ranked(store, input, embedder, deadline, true)?.results)
+    Ok(search_ranked(store, input, embedder, deadline, skip)?.results)
 }
 
-/// The search behind [`search_memories_deadlined`]. `exclude_dead_ends`
-/// leaves dead ends out of both lanes, inside each before its limit.
+/// [`search_memories`] with dead ends left out of both ranking lanes, before
+/// their limits, so they never take a hit's place and the candidate pool
+/// stays the size `input` asks for. For a caller that shows dead ends apart,
+/// as warnings (card #1484). Kept as landed in #440; it is
+/// [`search_memories_skipping`] with [`crate::dead_ends::is_dead_end`].
+pub fn search_memories_without_dead_ends(
+    store: &Store<'_>,
+    input: &MemorySearchInput,
+) -> Result<Vec<MemorySearchResult>> {
+    search_memories_skipping(store, input, &crate::dead_ends::is_dead_end)
+}
+
+/// The search behind [`search_memories_deadlined`]. `skip` leaves memories
+/// out of both lanes, inside each before its limit.
 fn search_ranked(
     store: &Store<'_>,
     input: &MemorySearchInput,
     embedder: Option<&dyn crate::embedder::Embedder>,
     deadline: crate::retrieval::Deadline,
-    exclude_dead_ends: bool,
+    skip: &dyn Fn(&Memory) -> bool,
 ) -> Result<crate::retrieval::TrimOutcome> {
     let memories_repo = Memories::new(store);
     let mut timing = crate::retrieval::SearchTiming {
@@ -962,8 +1002,6 @@ fn search_ranked(
     // with no window either, nothing was searchable.
     // `limit` applies after `apply_validity`, so a dropped or demoted row
     // gives its place to an eligible one, as in the ranked path.
-    let skip = |m: &Memory| exclude_dead_ends && crate::dead_ends::is_dead_end(m);
-
     if phrases.is_empty() {
         let mut dormant_excluded = 0;
         let listed = if input.window.is_unbounded() {
@@ -994,7 +1032,7 @@ fn search_ranked(
             listed
         };
         if listed.is_empty() && filter.exclude_raw && !input.window.is_unbounded() {
-            return raw_fallback(store, input, embedder, deadline, timing, exclude_dead_ends);
+            return raw_fallback(store, input, embedder, deadline, timing, skip);
         }
         let mut outcome = trim_by_token_budget(listed, input.token_budget, input.detail);
         timing.elapsed_ms = deadline.elapsed_ms();
@@ -1172,7 +1210,7 @@ fn search_ranked(
     ranked.truncate(input.limit);
 
     if ranked.is_empty() && filter.exclude_raw {
-        return raw_fallback(store, input, embedder, deadline, timing, exclude_dead_ends);
+        return raw_fallback(store, input, embedder, deadline, timing, skip);
     }
 
     let mut outcome = trim_by_token_budget(ranked, input.token_budget, input.detail);
@@ -1246,13 +1284,13 @@ fn raw_fallback(
     embedder: Option<&dyn crate::embedder::Embedder>,
     deadline: crate::retrieval::Deadline,
     first: crate::retrieval::SearchTiming,
-    exclude_dead_ends: bool,
+    skip: &dyn Fn(&Memory) -> bool,
 ) -> Result<crate::retrieval::TrimOutcome> {
     let raw = MemorySearchInput {
         include_raw: true,
         ..input.clone()
     };
-    let mut outcome = search_ranked(store, &raw, embedder, deadline, exclude_dead_ends)?;
+    let mut outcome = search_ranked(store, &raw, embedder, deadline, skip)?;
     outcome.raw_fallback = !outcome.results.is_empty();
     for stage in first.skipped {
         if !outcome.timing.skipped.contains(&stage) {
@@ -1522,6 +1560,7 @@ pub fn search_with_expansions(
         inferred_window,
         warnings: found.warnings,
         warnings_omitted: found.omitted,
+        muted: muted_hits(store, input, &memories)?,
         memories,
         total_candidates: outcome.total_candidates,
         returned: outcome.returned,
@@ -1539,6 +1578,24 @@ pub fn search_with_expansions(
     crate::vitality::record_accesses(store, &ids)?;
 
     Ok(response)
+}
+
+/// The ids of `hits` a mute in force covers (card #1485): global mutes,
+/// and those of the search's project.
+fn muted_hits(
+    store: &Store<'_>,
+    input: &MemorySearchInput,
+    hits: &[MemorySearchResult],
+) -> Result<std::collections::HashSet<String>> {
+    if hits.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let mutes = crate::mute::MuteSet::load(store, input.scope.project.as_deref(), None)?;
+    Ok(hits
+        .iter()
+        .filter(|r| mutes.covers(&r.memory))
+        .map(|r| r.memory.id.clone())
+        .collect())
 }
 
 /// The ranked hits less any dead end already shown as a warning (card

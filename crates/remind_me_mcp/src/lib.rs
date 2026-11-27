@@ -1067,10 +1067,15 @@ impl McpServer {
                                                 .unwrap()
                                             }
                                             (ResponseFormat::Json, SearchDetail::Full) => {
-                                                serde_json::to_string_pretty(
-                                                    &references::search_json(&store, &res)
-                                                        .unwrap_or_else(|_| json!(res)),
-                                                )
+                                                serde_json::to_string_pretty(&{
+                                                    let mut value =
+                                                        references::search_json(&store, &res)
+                                                            .unwrap_or_else(|_| json!(res));
+                                                    remind_me_core::mute::mark_hits(
+                                                        &mut value, &res.muted,
+                                                    );
+                                                    value
+                                                })
                                                 .unwrap()
                                             }
                                             (ResponseFormat::Markdown, SearchDetail::Compact) => {

@@ -70,6 +70,30 @@ fn delivered(core: &CoreTables, memory_id: &str, remind_at: &str) -> bool {
         .is_some_and(|d| d.memory_id == memory_id && d.remind_at == remind_at)
 }
 
+/// Whether `row` is live with a reminder in `window` as of `now`. Text
+/// comparison, as SQLite's.
+fn in_window(core: &CoreTables, row: &MemoryRow, window: ReminderWindow, now: &str) -> bool {
+    if row.deleted_at.is_some() {
+        return false;
+    }
+    let Some(at) = row.remind_at.as_deref() else {
+        return false;
+    };
+    let upcoming = at > now;
+    let overdue = at <= now && !delivered(core, &row.id, at);
+    match window {
+        ReminderWindow::Upcoming => upcoming,
+        ReminderWindow::Overdue => overdue,
+        ReminderWindow::All => upcoming || overdue,
+    }
+}
+
+/// Sort `memories` soonest first (ties by id) and keep the first `limit`.
+fn first_by_due(memories: &mut Vec<Memory>, limit: usize) {
+    memories.sort_by(|a, b| (&a.remind_at, &a.id).cmp(&(&b.remind_at, &b.id)));
+    memories.truncate(limit);
+}
+
 impl ReminderStore for EngineTables {
     fn is_live(&self, memory_id: &str) -> Result<bool> {
         Ok(memories::get_live(self, memory_id)?.is_some())
@@ -87,21 +111,40 @@ impl ReminderStore for EngineTables {
     /// Text comparison, as SQLite's.
     fn in_window(&self, window: ReminderWindow, now: &str, limit: usize) -> Result<Vec<Memory>> {
         let core = core_ref(self)?;
-        let due = |row: &MemoryRow, at: &str| {
-            let upcoming = at > now;
-            let overdue = at <= now && !delivered(core, &row.id, at);
-            match window {
-                ReminderWindow::Upcoming => upcoming,
-                ReminderWindow::Overdue => overdue,
-                ReminderWindow::All => upcoming || overdue,
-            }
-        };
         let mut rows: Vec<MemoryRow> = memories::rows(core)
-            .filter(|row| row.deleted_at.is_none())
-            .filter(|row| row.remind_at.as_deref().is_some_and(|at| due(row, at)))
+            .filter(|row| in_window(core, row, window, now))
             .collect();
         rows.sort_by(|a, b| (&a.remind_at, &a.id).cmp(&(&b.remind_at, &b.id)));
         Ok(rows.iter().take(limit).map(MemoryRow::to_memory).collect())
+    }
+
+    /// One pass over the rows, keeping at most `2 * limit` of the accepted
+    /// memories between sorts.
+    fn in_window_where(
+        &self,
+        window: ReminderWindow,
+        now: &str,
+        limit: usize,
+        keep: &dyn Fn(&Memory) -> bool,
+    ) -> Result<Vec<Memory>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let core = core_ref(self)?;
+        let batch = limit.saturating_mul(2);
+        let mut kept: Vec<Memory> = Vec::new();
+        for row in memories::rows(core).filter(|row| in_window(core, row, window, now)) {
+            let memory = row.to_memory();
+            if !keep(&memory) {
+                continue;
+            }
+            kept.push(memory);
+            if kept.len() >= batch {
+                first_by_due(&mut kept, limit);
+            }
+        }
+        first_by_due(&mut kept, limit);
+        Ok(kept)
     }
 
     /// Unless one is recorded for the same reminder: `INSERT OR IGNORE` on
