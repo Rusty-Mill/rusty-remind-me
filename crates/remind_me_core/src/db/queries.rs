@@ -919,7 +919,26 @@ pub fn search_memories_deadlined(
     embedder: Option<&dyn crate::embedder::Embedder>,
     deadline: crate::retrieval::Deadline,
 ) -> Result<crate::retrieval::TrimOutcome> {
-    search_ranked(store, input, embedder, deadline, &|_| false)
+    search_ranked(
+        store,
+        input,
+        embedder,
+        deadline,
+        &|_| false,
+        Default::default(),
+    )
+}
+
+/// [`search_memories_deadlined`] with card #568's recency buckets (off
+/// unless the search tool's flag or the eval harness turns them on).
+pub fn search_memories_deadlined_with(
+    store: &Store<'_>,
+    input: &MemorySearchInput,
+    embedder: Option<&dyn crate::embedder::Embedder>,
+    deadline: crate::retrieval::Deadline,
+    time_buckets: crate::time_buckets::Mode,
+) -> Result<crate::retrieval::TrimOutcome> {
+    search_ranked(store, input, embedder, deadline, &|_| false, time_buckets)
 }
 
 /// [`search_memories`] with the memories `skip` matches left out of both
@@ -937,7 +956,7 @@ pub fn search_memories_skipping(
         .as_ref()
         .map(|e| &**e as &dyn crate::embedder::Embedder);
     let deadline = crate::retrieval::Deadline::from_env();
-    Ok(search_ranked(store, input, embedder, deadline, skip)?.results)
+    Ok(search_ranked(store, input, embedder, deadline, skip, Default::default())?.results)
 }
 
 /// [`search_memories`] with dead ends left out of both ranking lanes, before
@@ -953,13 +972,15 @@ pub fn search_memories_without_dead_ends(
 }
 
 /// The search behind [`search_memories_deadlined`]. `skip` leaves memories
-/// out of both lanes, inside each before its limit.
+/// out of both lanes, inside each before its limit; `time_buckets` is card
+/// #568's recency mode, applied to what is left before the cut.
 fn search_ranked(
     store: &Store<'_>,
     input: &MemorySearchInput,
     embedder: Option<&dyn crate::embedder::Embedder>,
     deadline: crate::retrieval::Deadline,
     skip: &dyn Fn(&Memory) -> bool,
+    time_buckets: crate::time_buckets::Mode,
 ) -> Result<crate::retrieval::TrimOutcome> {
     let memories_repo = Memories::new(store);
     let mut timing = crate::retrieval::SearchTiming {
@@ -1035,7 +1056,7 @@ fn search_ranked(
             listed
         };
         if listed.is_empty() && filter.exclude_raw && !input.window.is_unbounded() {
-            return raw_fallback(store, input, embedder, deadline, timing, skip);
+            return raw_fallback(store, input, embedder, deadline, timing, skip, time_buckets);
         }
         let mut outcome = trim_by_token_budget(listed, input.token_budget, input.detail);
         timing.elapsed_ms = deadline.elapsed_ms();
@@ -1189,7 +1210,15 @@ fn search_ranked(
     // cross-encoder does, which is promote a candidate from just past the
     // cutoff. Feedback runs first so its nudge perturbs the order feeding the
     // cross-encoder, leaving the cross-encoder with the final say.
-    ranked.truncate(crate::reranker::pool_size(input.limit));
+    // Recency (card #568) can lift a hit from past the pool, so it keeps the
+    // tail aside, unreranked, instead of dropping it here.
+    let pool = crate::reranker::pool_size(input.limit).min(ranked.len());
+    let mut tail = if time_buckets == crate::time_buckets::Mode::Off {
+        Vec::new()
+    } else {
+        ranked.split_off(pool)
+    };
+    ranked.truncate(pool);
     // Second gate. The reranker is in-process rather than networked, so this
     // is not about a hung daemon — it is about not spending cross-encoder CPU
     // reordering results for a caller who has already waited longer than they
@@ -1210,10 +1239,23 @@ fn search_ranked(
     } else {
         crate::reranker::maybe_rerank(&input.query, ranked)
     };
+    // Card #568 recency buckets, off unless the caller turns them on: on
+    // every candidate (the reranked head, then the tail in rank order), after
+    // every ranking stage and before the cut, so pages stay stable.
+    if time_buckets != crate::time_buckets::Mode::Off {
+        ranked.append(&mut tail);
+        ranked = crate::time_buckets::apply(
+            ranked,
+            time_buckets,
+            &input.window,
+            input.limit,
+            Utc::now(),
+        );
+    }
     ranked.truncate(input.limit);
 
     if ranked.is_empty() && filter.exclude_raw {
-        return raw_fallback(store, input, embedder, deadline, timing, skip);
+        return raw_fallback(store, input, embedder, deadline, timing, skip, time_buckets);
     }
 
     let mut outcome = trim_by_token_budget(ranked, input.token_budget, input.detail);
@@ -1288,12 +1330,14 @@ fn raw_fallback(
     deadline: crate::retrieval::Deadline,
     first: crate::retrieval::SearchTiming,
     skip: &dyn Fn(&Memory) -> bool,
+    time_buckets: crate::time_buckets::Mode,
 ) -> Result<crate::retrieval::TrimOutcome> {
     let raw = MemorySearchInput {
         include_raw: true,
         ..input.clone()
     };
-    let mut outcome = search_ranked(store, &raw, embedder, deadline, skip)?;
+    // The retry keeps the caller's skip and recency mode.
+    let mut outcome = search_ranked(store, &raw, embedder, deadline, skip, time_buckets)?;
     outcome.raw_fallback = !outcome.results.is_empty();
     for stage in first.skipped {
         if !outcome.timing.skipped.contains(&stage) {
@@ -1487,6 +1531,10 @@ pub fn search_with_expansions(
         None => (input, None),
     };
 
+    // Card #568: the search tool reads its setting here, like date phrases;
+    // the ranker itself only follows what it is passed.
+    let time_buckets = crate::time_buckets::Mode::from_env();
+
     let configured = crate::embedder::available_embedder();
 
     // The bootstrap is assembled first because it *spends* from the same
@@ -1527,7 +1575,7 @@ pub fn search_with_expansions(
     let embedder = configured
         .as_ref()
         .map(|e| &**e as &dyn crate::embedder::Embedder);
-    let outcome = hits_without_warned(store, hit_input, embedder, &found.warnings)?;
+    let outcome = hits_without_warned(store, hit_input, embedder, &found.warnings, time_buckets)?;
     let memories = outcome.results;
     let ids: Vec<String> = memories.iter().map(|r| r.memory.id.clone()).collect();
 
@@ -1602,36 +1650,20 @@ fn muted_hits(
 }
 
 /// The ranked hits less any dead end already shown as a warning (card
-/// #1484). The warned ids are dropped before `limit` and the token budget
-/// apply, so the remaining matches fill the page and the envelope counts only
-/// what is returned.
+/// #1484). The warned ids are left out of both lanes, before `limit`, the
+/// recency slots (card #568) and the token budget apply, so the remaining
+/// matches fill the page and the envelope counts only what is returned.
 fn hits_without_warned(
     store: &Store<'_>,
     input: &MemorySearchInput,
     embedder: Option<&dyn crate::embedder::Embedder>,
     warnings: &[crate::dead_ends::Warning],
+    time_buckets: crate::time_buckets::Mode,
 ) -> Result<crate::retrieval::TrimOutcome> {
-    if warnings.is_empty() {
-        return search_memories_budgeted(store, input, embedder);
-    }
     let warned: std::collections::HashSet<&str> = warnings.iter().map(|w| w.id.as_str()).collect();
-    let wide = MemorySearchInput {
-        limit: input.limit + warned.len(),
-        token_budget: 0,
-        ..input.clone()
-    };
-    let raw = search_memories_budgeted(store, &wide, embedder)?;
-    let mut kept: Vec<_> = raw
-        .results
-        .into_iter()
-        .filter(|r| !warned.contains(r.memory.id.as_str()))
-        .collect();
-    kept.truncate(input.limit);
-    let mut outcome = trim_by_token_budget(kept, input.token_budget, input.detail);
-    outcome.timing = raw.timing;
-    outcome.raw_fallback = raw.raw_fallback;
-    outcome.dormant_excluded = raw.dormant_excluded;
-    Ok(outcome)
+    let skip = |m: &Memory| warned.contains(m.id.as_str());
+    let deadline = crate::retrieval::Deadline::from_env();
+    search_ranked(store, input, embedder, deadline, &skip, time_buckets)
 }
 
 /// A search's dead-end warnings and the tokens they spend.
@@ -1704,4 +1736,133 @@ pub fn unannotated_batch(
         memories,
         total_unannotated,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::memories::NewMemory;
+
+    fn put(store: &Store<'_>, id: &str, content: &str, days: i64, hot: bool) {
+        let when = (Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+        let repo = Memories::new(store);
+        repo.insert(&NewMemory::new(id, content, &when)).unwrap();
+        if hot {
+            repo.record_access(id, &Utc::now().to_rfc3339(), 30, 3.0, "active")
+                .unwrap();
+        }
+    }
+
+    fn warning(id: &str) -> crate::dead_ends::Warning {
+        crate::dead_ends::Warning {
+            id: id.into(),
+            tried: "x".into(),
+            why_failed: "y".into(),
+            cost: None,
+            project: None,
+            created_at: Utc::now().to_rfc3339(),
+            score: 1.0,
+        }
+    }
+
+    #[test]
+    fn a_warned_hit_leaves_its_recency_slot_to_the_next_fresh_one() {
+        // Card #568 x #1484: the warned fresh hit is the newest bucket's best,
+        // so dropping it after the cut used to lose that bucket.
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let store = db.store();
+        for n in 0..3 {
+            put(
+                &store,
+                &format!("old{n}"),
+                "kestrel kestrel nest survey",
+                20,
+                true,
+            );
+        }
+        put(&store, "warned", "kestrel kestrel", 1, false);
+        put(
+            &store,
+            "fresh2",
+            "kestrel nest survey notes from the hide",
+            1,
+            false,
+        );
+        put(
+            &store,
+            "week",
+            "kestrel nest survey notes from the hide",
+            5,
+            false,
+        );
+        let input = MemorySearchInput {
+            query: "kestrel".into(),
+            limit: 3,
+            ..Default::default()
+        };
+
+        let outcome = hits_without_warned(
+            &store,
+            &input,
+            None,
+            &[warning("warned")],
+            crate::time_buckets::Mode::Recency,
+        )
+        .unwrap();
+
+        let ids: Vec<&str> = outcome
+            .results
+            .iter()
+            .map(|r| r.memory.id.as_str())
+            .collect();
+        assert_eq!(ids.len(), 3, "{ids:?}");
+        assert!(!ids.contains(&"warned"), "{ids:?}");
+        assert!(ids.contains(&"fresh2"), "{ids:?}");
+    }
+
+    #[test]
+    fn recency_reaches_past_the_rerank_pool_when_limit_fills_it() {
+        // Codex on #446: with limit >= the rerank pool (20), the pool cut left
+        // exactly `limit` rows, so no missing bucket could be lifted.
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let store = db.store();
+        let limit = crate::reranker::pool_size(1);
+        for n in 0..limit {
+            put(
+                &store,
+                &format!("old{n:02}"),
+                "kestrel kestrel nest survey",
+                20,
+                true,
+            );
+        }
+        put(
+            &store,
+            "fresh",
+            "kestrel nest survey notes from the hide",
+            1,
+            false,
+        );
+        let input = MemorySearchInput {
+            query: "kestrel".into(),
+            limit,
+            ..Default::default()
+        };
+        let ids = |mode| -> Vec<String> {
+            let deadline = crate::retrieval::Deadline::from_env();
+            search_ranked(&store, &input, None, deadline, &|_| false, mode)
+                .unwrap()
+                .results
+                .into_iter()
+                .map(|r| r.memory.id)
+                .collect()
+        };
+
+        let off = ids(crate::time_buckets::Mode::Off);
+        let recency = ids(crate::time_buckets::Mode::Recency);
+
+        assert!(!off.iter().any(|id| id == "fresh"), "{off:?}");
+        assert_eq!(recency.len(), limit, "{recency:?}");
+        assert!(recency.iter().any(|id| id == "fresh"), "{recency:?}");
+    }
 }

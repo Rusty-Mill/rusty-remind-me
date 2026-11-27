@@ -2,6 +2,15 @@
 
 Dated entries, newest first. One entry per merged pull request.
 
+## 2026-11-27 — Opt-in recency buckets for status questions (Mill Board #568, D135–D137)
+
+### Added
+- `REMIND_ME_TIME_BUCKETS=recency` (off by default): a search with no time window lifts the best hit of a bucket missing from the top `limit` (the last 2 days, the 5 days before, older; newest first) into the place of the lowest-ranked hit from a bucket that holds more than one slot there, so heavily read old rows cannot crowd the newest week out of "latest on X". No bucket gives up its last slot, so a bucket gets in only while `limit` has room: at `limit=1` the first hit stays, and at `limit=2` with all three buckets present only the newest missing bucket gets in. Everything else keeps rank order. It runs after rerank and before the cut, so pages stay stable. Unset, blank or any other value is off.
+- `docs/research/568-time-buckets-spike.md`: the spike write-up. On the #59 fixture recency moved no gated query and added no latency; on a generated status set it took hit@10 from 0.02 to 1.00 (hashed mode). It missed D136's 2-point temporal lift, so it ships opt-in only (D137).
+
+### Not merged
+- The `window` mode (spreading a wide window across equal buckets) lowered temporal MRR by 0.025 to 0.092 and was removed.
+
 ## 2026-11-27 — Hermes memory provider; `capture-transcript --format messages` (Mill Board #1552 PR C, ADR-0028 step 6, D105, D131, D138-D140)
 
 ### Added
